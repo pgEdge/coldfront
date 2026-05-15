@@ -23,11 +23,6 @@ the named relation.
 
 User-level setup and DML examples for both modes: **[USAGE.md](USAGE.md)**.
 
-**See it in action:** [`demo/DEMO.txt`](demo/DEMO.txt) (plain-text transcript) or
-`asciinema play demo/demo.cast` for the paced replay.  Walks through a plain
-partitioned table, installing the extensions, running the archiver, and
-using the tiered `events` table transparently for every DML verb.
-
 ## How It Works
 
 ```
@@ -405,8 +400,7 @@ pgedge-coldfront/
 ├── Makefile
 ├── USAGE.md                    ← user-level usage guide (both modes)
 ├── ARCHITECTURE.md             ← tiered architecture
-├── ARCHITECTURE_DECOUPLED.md   ← decoupled (iceberg-only) architecture
-└── bench.md                    ← OLAP bench: hot heap vs Iceberg/DuckDB
+└── ARCHITECTURE_DECOUPLED.md   ← decoupled (iceberg-only) architecture
 ```
 
 ## Dependencies
