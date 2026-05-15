@@ -1,0 +1,45 @@
+-- Regression: a literal containing the substring "$MTQ$" must not break the
+-- cold-path rewrite. The previous implementation wrapped the deparsed DML
+-- with a hardcoded $MTQ$...$MTQ$ dollar-quote tag; if the user's WHERE/SET
+-- value contained that exact substring, PG's lexer closed the dollar-quote
+-- early and the trailing text became a separate (malformed) statement.
+-- The fix uses quote_literal_cstr() so the inner DML is a proper, escaped
+-- single-quoted SQL string with no breakout vector.
+
+CREATE EXTENSION IF NOT EXISTS pg_duckdb;
+CREATE EXTENSION IF NOT EXISTS coldfront;
+
+SET TIME ZONE 'UTC';
+SET coldfront.warehouse = '';
+SET coldfront.lakekeeper_endpoint = '';
+
+CREATE TABLE public._events (id int, ts timestamptz, status text);
+CREATE VIEW public.events AS SELECT * FROM public._events;
+
+INSERT INTO coldfront.tiered_views(view_oid, hot_table, iceberg_table, partition_col)
+VALUES ('public.events'::regclass, 'public._events', 'ice.default.events', 'ts');
+INSERT INTO coldfront.archive_watermark(table_name, cutoff_time)
+VALUES ('events', '2026-03-01'::timestamptz);
+
+-- Cold path: SET value contains the exact dollar-quote tag the old code used.
+-- Without the fix, pg_parse_query would error on the rewritten SQL.
+EXPLAIN (COSTS OFF, VERBOSE)
+  UPDATE public.events SET status = 'has $MTQ$ inside'
+  WHERE ts = '2026-01-15 01:00:00+00';
+
+-- Cold path: WHERE literal contains the tag.
+EXPLAIN (COSTS OFF, VERBOSE)
+  UPDATE public.events SET status = 'updated'
+  WHERE ts = '2026-01-15 01:00:00+00' AND status = '$MTQ$';
+
+-- Dual (ambiguous) path: emit_dual uses the same $MTQ$ wrapping. Predicate
+-- with no ts constraint classifies as ambiguous; allow_mixed_writes is on
+-- by default so the dual-tier CTE is emitted.
+EXPLAIN (COSTS OFF, VERBOSE)
+  UPDATE public.events SET status = 'has $MTQ$ in dual' WHERE status = 'ok';
+
+-- Cleanup
+DROP VIEW public.events;
+DROP TABLE public._events;
+DELETE FROM coldfront.tiered_views;
+DELETE FROM coldfront.archive_watermark;

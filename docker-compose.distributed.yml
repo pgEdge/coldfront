@@ -1,0 +1,90 @@
+services:
+  db1:
+    image: coldfront-spock:latest
+    hostname: db1
+    environment:
+      PGDATA: /data/pgdata
+      MULTITIER_SNOWFLAKE_NODE: "691"  # hashtext('db1') & 1023
+    volumes: ["db1-data:/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "/usr/pgsql-17/bin/pg_isready -U coldfront -d coldfront"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  db2:
+    image: coldfront-spock:latest
+    hostname: db2
+    environment:
+      PGDATA: /data/pgdata
+      MULTITIER_SNOWFLAKE_NODE: "109"  # hashtext('db2') & 1023
+    volumes: ["db2-data:/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "/usr/pgsql-17/bin/pg_isready -U coldfront -d coldfront"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  db3:
+    image: coldfront-spock:latest
+    hostname: db3
+    environment:
+      PGDATA: /data/pgdata
+      MULTITIER_SNOWFLAKE_NODE: "672"  # hashtext('db3') & 1023
+    volumes: ["db3-data:/data"]
+    healthcheck:
+      test: ["CMD-SHELL", "/usr/pgsql-17/bin/pg_isready -U coldfront -d coldfront"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  seaweedfs:
+    image: chrislusf/seaweedfs:latest
+    command: "server -s3 -dir=/data -s3.config=/etc/seaweedfs/s3.json"
+    volumes:
+      - ./docker/seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro
+
+  lakekeeper-db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_DB: lakekeeper
+      POSTGRES_USER: lakekeeper
+      POSTGRES_PASSWORD: lakekeeper
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lakekeeper"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+
+  lakekeeper-migrate:
+    image: quay.io/lakekeeper/catalog:latest
+    command: migrate
+    depends_on:
+      lakekeeper-db:
+        condition: service_healthy
+    environment:
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgres://lakekeeper:lakekeeper@lakekeeper-db:5432/lakekeeper
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgres://lakekeeper:lakekeeper@lakekeeper-db:5432/lakekeeper
+      LAKEKEEPER__PG_ENCRYPTION_KEY: deadbeefdeadbeefdeadbeefdeadbeef
+
+  lakekeeper:
+    image: quay.io/lakekeeper/catalog:latest
+    command: serve
+    depends_on:
+      lakekeeper-migrate:
+        condition: service_completed_successfully
+    environment:
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgres://lakekeeper:lakekeeper@lakekeeper-db:5432/lakekeeper
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgres://lakekeeper:lakekeeper@lakekeeper-db:5432/lakekeeper
+      LAKEKEEPER__PG_ENCRYPTION_KEY: deadbeefdeadbeefdeadbeefdeadbeef
+      LAKEKEEPER__LISTEN_PORT: 8181
+    healthcheck:
+      test: ["CMD", "lakekeeper", "healthcheck"]
+      interval: 3s
+      timeout: 2s
+      retries: 10
+
+volumes:
+  db1-data:
+  db2-data:
+  db3-data:

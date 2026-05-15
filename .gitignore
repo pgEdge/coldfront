@@ -1,0 +1,31 @@
+bin/
+archiver
+*.log
+*.out
+coverage.html
+.env
+.claude/
+.tmp/
+*.pdf
+
+# pg_regress expected outputs — tracked; the global *.out would exclude them.
+!extension/coldfront/test/expected/*.out
+
+# TLC model-checker artefacts (created next to wherever tlc2.TLC is invoked).
+docs/formal/Bakery_TTrace_*
+docs/formal/Bakery.old
+states/
+
+# Scale test / bench scripts and demo (local only, not shipped)
+demo/
+scale-test/
+scale-test-*.sh
+bench-*.sh
+bench.md
+
+# E2E result docs (local only)
+E2E*.md
+SCALE_TEST_SETUP.md
+COMPARISON.md
+README.md
+USAGE.md

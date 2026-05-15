@@ -1,0 +1,26 @@
+postgres:
+  dsn: "host=localhost port=5432 dbname=mydb user=myuser password=mypass sslmode=disable"
+
+iceberg:
+  warehouse: "wh"                                        # Lakekeeper warehouse name
+  lakekeeper_endpoint: "http://lakekeeper:8181/catalog"  # Lakekeeper REST catalog
+  namespace: "default"                                   # optional, default: "default"
+
+s3:
+  endpoint: "seaweedfs:8333"    # S3 endpoint (no http://)
+  region: "us-east-1"           # optional, default: "us-east-1"
+  access_key: "admin"
+  secret_key: "adminsecret"
+
+archiver:
+  tables:
+    - source_table: "events"        # or "myschema.events"
+      partition_period: "monthly"   # "monthly" or "daily"
+      retention_period: "3 months"
+      # Optional (auto-detected or defaulted):
+      # partition_column: "ts"      # auto-detected from pg_catalog
+      # future_partitions: 3        # default: 3
+
+    # - source_table: "logs"
+    #   partition_period: "daily"
+    #   retention_period: "7 days"

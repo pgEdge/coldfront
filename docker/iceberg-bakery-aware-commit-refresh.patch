@@ -1,0 +1,261 @@
+# iceberg-bakery-aware-commit-refresh.patch
+#
+# Applies to: duckdb-iceberg @ ebe0dfaf (the "Bump to v1.4.3" commit on
+#             https://github.com/duckdb/duckdb-iceberg).
+#
+# What this fixes
+# ---------------
+# Upstream duckdb-iceberg stamps the new snapshot's parent_snapshot_id at
+# IcebergInsert::Finalize time from the session-cached IRCTableMetadata
+# (iceberg_transaction_data.cpp:115). When the multitier R-A bakery
+# decouples parquet upload (phase 1, no bakery — overlaps across writers)
+# from the commit POST (phase 2, bakery-serialised), the cached
+# parent_snapshot_id can be stale by the time it is this writer's turn to
+# POST: an earlier ticket-holder committed in between, but each writer's
+# session metadata was read BEFORE the bakery.
+#
+# The result is HTTP 409 CatalogCommitConflicts (assert-ref-snapshot-id
+# mismatch) on every loser of the bakery race. Without this patch, bench
+# C (3 cross-node writers × 30M rows each) aborts on first POST after
+# the first writer commits.
+#
+# What this patch does (minimum-line shape)
+# ------------------------------------------
+# 1. iceberg_transaction_data.cpp — STOP stamping parent_snapshot_id at
+#    Finalize. The IcebergSnapshot defaults (has_parent_snapshot = false,
+#    parent_snapshot_id = sentinel) hold until the commit-POST site.
+#
+# 2. irc_transaction.cpp — at the top of IRCTransaction::DoTableUpdates
+#    (which fires at PG PRE_COMMIT, inside the multitier bakery hold):
+#    for each dirty iceberg table that has at least one staged
+#    IcebergAddSnapshot AND is not being CREATEd in this same
+#    transaction, GET its current metadata from Lakekeeper and stamp
+#    each staged AddSnapshot's parent_snapshot_id (first in tx anchors
+#    to the freshly-read catalog head, subsequent chain off the
+#    predecessor) and sequence_number (monotonic from refreshed
+#    last_sequence_number).
+#
+# Net effect: parent_snapshot_id is read from Lakekeeper exactly once,
+# inside the bakery ticket, after the parquet upload phase is done.
+# Under R-A serialisation no other multitier writer can move the head
+# between our refresh and our POST, so the assert-ref precondition is
+# guaranteed to match. No 409s on the bench-C contended path.
+#
+# Empirical validation (3 × m6a.large EC2, 90M rows total, BATCH=1M):
+#   Bench A (1 writer):  T_A = 90.06s / 999k rows/s
+#   Bench C (3 writers): T_C = 34.35s / 2.62M rows/s, speedup 2.62× vs A
+#   Consistency:        db1 = db2 = db3 = 90,000,000 rows. 0 × 409.
+#
+# How to (re)build
+# ----------------
+#   1. docker pull quay.io/pypa/manylinux_2_28_x86_64    # bundled gcc-toolset-14
+#   2. docker run --restart=unless-stopped \
+#        --name iceberg-builder quay.io/pypa/manylinux_2_28_x86_64 sleep infinity
+#   3. docker exec iceberg-builder dnf install -y --setopt=install_weak_deps=False \
+#        ninja-build perl-IPC-Cmd ccache jq wget zip unzip tar autoconf libtool kernel-headers
+#   4. docker exec iceberg-builder bash -c '
+#        cd /build && \
+#        git clone --filter=blob:none --no-checkout https://github.com/duckdb/duckdb-iceberg && \
+#        cd duckdb-iceberg && git checkout ebe0dfaf && \
+#        git submodule update --init --recursive --depth 1 --jobs 8 && \
+#        git clone https://github.com/microsoft/vcpkg /build/vcpkg && \
+#        /build/vcpkg/bootstrap-vcpkg.sh'
+#   5. Apply this patch:
+#        docker cp iceberg-bakery-aware-commit-refresh.patch iceberg-builder:/tmp/
+#        docker exec iceberg-builder bash -c \
+#          'cd /build/duckdb-iceberg && git apply /tmp/iceberg-bakery-aware-commit-refresh.patch'
+#   6. Slim extension_config.cmake so the build only produces iceberg + avro
+#      (drop tpch / icu / ducklake / aws — irrelevant for the shipping artifact;
+#       also pin EXTENSION_VERSION v1.4.3 so the metadata footer matches what
+#       pg_duckdb expects):
+#        docker exec iceberg-builder bash -c 'cat > /build/duckdb-iceberg/extension_config.cmake <<CFG
+#        if (NOT EMSCRIPTEN)
+#        duckdb_extension_load(avro
+#                GIT_URL https://github.com/duckdb/duckdb-avro
+#                GIT_TAG 7b75062f6345d11c5342c09216a75c57342c2e82
+#                EXTENSION_VERSION v1.4.3
+#        )
+#        endif()
+#        duckdb_extension_load(iceberg
+#            SOURCE_DIR \${CMAKE_CURRENT_LIST_DIR}
+#            EXTENSION_VERSION v1.4.3
+#        )
+#        CFG'
+#   7. Build:
+#        docker exec -w /build/duckdb-iceberg \
+#          -e VCPKG_TOOLCHAIN_PATH=/build/vcpkg/scripts/buildsystems/vcpkg.cmake \
+#          -e VCPKG_ROOT=/build/vcpkg \
+#          -e VCPKG_TARGET_TRIPLET=x64-linux \
+#          -e VCPKG_HOST_TRIPLET=x64-linux \
+#          -e USE_MERGED_VCPKG_MANIFEST=1 \
+#          -e CMAKE_BUILD_PARALLEL_LEVEL=16 \
+#          -e MAKEFLAGS=-j16 \
+#          -e OVERRIDE_GIT_DESCRIBE=v1.4.3 \
+#          iceberg-builder make -j16 release
+#   8. Extract the binaries:
+#        docker cp iceberg-builder:/build/duckdb-iceberg/build/release/extension/iceberg/iceberg.duckdb_extension .
+#        docker cp iceberg-builder:/build/duckdb-iceberg/build/release/extension/avro/avro.duckdb_extension .
+#
+# How to deploy
+# -------------
+# Per db node, replace the auto-installed upstream binaries:
+#   scp -C iceberg.duckdb_extension avro.duckdb_extension admin@<db-host>:/tmp/
+#   ssh admin@<db-host> '
+#     sudo docker cp /tmp/iceberg.duckdb_extension <container>:/data/pgdata/pg_duckdb/extensions/v1.4.3/linux_amd64/iceberg.duckdb_extension
+#     sudo docker cp /tmp/avro.duckdb_extension    <container>:/data/pgdata/pg_duckdb/extensions/v1.4.3/linux_amd64/avro.duckdb_extension
+#     sudo docker exec <container> bash -c "rm -f /data/pgdata/pg_duckdb/extensions/v1.4.3/linux_amd64/iceberg.duckdb_extension.info /data/pgdata/pg_duckdb/extensions/v1.4.3/linux_amd64/avro.duckdb_extension.info"
+#     sudo docker restart <container>'
+#
+# The .info file deletion forces DuckDB to skip etag/signature verification
+# against the upstream catalog (the locally-built binary has different
+# bytes than what extensions.duckdb.org served). And on first session
+# after restart, set duckdb.allow_unsigned_extensions=on globally:
+#   ALTER SYSTEM SET duckdb.allow_unsigned_extensions = on;
+#   SELECT pg_reload_conf();
+#
+# Residual risks and follow-up bench coverage: see HARDENING_DECOUPLED.md.
+
+diff --git a/src/storage/iceberg_transaction_data.cpp b/src/storage/iceberg_transaction_data.cpp
+index 0abd4c51..5c6984e0 100644
+--- a/src/storage/iceberg_transaction_data.cpp
++++ b/src/storage/iceberg_transaction_data.cpp
+@@ -105,16 +105,13 @@ void IcebergTransactionData::AddSnapshot(IcebergSnapshotOperationType operation,
+ 	new_snapshot.operation = operation;
+ 	new_snapshot.timestamp_ms = Timestamp::GetEpochMs(Timestamp::GetCurrentTimestamp());
+ 
+-	new_snapshot.has_parent_snapshot = table_info.table_metadata.has_current_snapshot || !alters.empty();
+-	if (new_snapshot.has_parent_snapshot) {
+-		if (!alters.empty()) {
+-			auto &last_alter = alters.back().get();
+-			new_snapshot.parent_snapshot_id = last_alter.snapshot.snapshot_id;
+-		} else {
+-			D_ASSERT(table_info.table_metadata.has_current_snapshot);
+-			new_snapshot.parent_snapshot_id = table_info.table_metadata.current_snapshot_id;
+-		}
+-	}
++	// parent_snapshot_id is NOT stamped here. Multitier uploads parquet
++	// outside the R-A bakery and only takes the ticket for the commit
++	// POST, so cached table_metadata can be stale by POST time when
++	// writers overlap. IRCTransaction::DoTableUpdates reads the fresh
++	// catalog head from Lakekeeper inside the ticket and stamps
++	// parent_snapshot_id there for the first and only time. Until then
++	// the IcebergSnapshot defaults (has_parent_snapshot = false) hold.
+ 
+ 	auto manifest_content_type = IcebergManifestContentType::DATA;
+ 	switch (operation) {
+@@ -161,16 +158,13 @@ void IcebergTransactionData::AddUpdateSnapshot(vector<IcebergManifestEntry> &&de
+ 	new_snapshot.manifest_list = manifest_list_path;
+ 	new_snapshot.timestamp_ms = Timestamp::GetEpochMs(Timestamp::GetCurrentTimestamp());
+ 
+-	new_snapshot.has_parent_snapshot = table_info.table_metadata.has_current_snapshot || !alters.empty();
+-	if (new_snapshot.has_parent_snapshot) {
+-		if (!alters.empty()) {
+-			auto &last_alter = alters.back().get();
+-			new_snapshot.parent_snapshot_id = last_alter.snapshot.snapshot_id;
+-		} else {
+-			D_ASSERT(table_info.table_metadata.has_current_snapshot);
+-			new_snapshot.parent_snapshot_id = table_info.table_metadata.current_snapshot_id;
+-		}
+-	}
++	// parent_snapshot_id is NOT stamped here. Multitier uploads parquet
++	// outside the R-A bakery and only takes the ticket for the commit
++	// POST, so cached table_metadata can be stale by POST time when
++	// writers overlap. IRCTransaction::DoTableUpdates reads the fresh
++	// catalog head from Lakekeeper inside the ticket and stamps
++	// parent_snapshot_id there for the first and only time. Until then
++	// the IcebergSnapshot defaults (has_parent_snapshot = false) hold.
+ 
+ 	auto add_snapshot = make_uniq<IcebergAddSnapshot>(table_info, manifest_list_path, std::move(new_snapshot));
+ 	CreateManifestListEntry(*add_snapshot, table_metadata, IcebergManifestContentType::DELETE, std::move(delete_files));
+diff --git a/src/storage/irc_transaction.cpp b/src/storage/irc_transaction.cpp
+index 28853904..c14a1fea 100644
+--- a/src/storage/irc_transaction.cpp
++++ b/src/storage/irc_transaction.cpp
+@@ -338,6 +338,87 @@ void IRCTransaction::Commit() {
+ 
+ void IRCTransaction::DoTableUpdates(ClientContext &context) {
+ 	if (!dirty_tables.empty()) {
++		// Multitier bakery-aware first-time stamp of parent_snapshot_id.
++		//
++		// multitier._exec_iceberg_with_claim uploads parquet OUTSIDE the
++		// R-A bakery and only acquires the ticket for this commit POST.
++		// Reading the catalog head from session-cached table_metadata
++		// would be stale (an earlier ticket-holder may have committed
++		// since this writer started its INSERT). Read it from Lakekeeper
++		// now — we hold the ticket, so no other multitier writer can
++		// move the head until we release. This is the first and only
++		// time parent_snapshot_id is set on the staged
++		// IcebergAddSnapshots; the Finalize path leaves it at the
++		// IcebergSnapshot default (has_parent_snapshot = false).
++		for (auto &table : dirty_tables) {
++			if (!table->table_info.transaction_data) {
++				continue;
++			}
++			// Skip tables that have no AddSnapshot in this transaction (e.g.,
++			// CREATE TABLE only) — there is nothing to re-stamp, and the
++			// table likely does not exist in the catalog yet so GetTable
++			// would 404.
++			bool has_add_snapshot = false;
++			for (auto &update : table->table_info.transaction_data->updates) {
++				if (update->type == IcebergTableUpdateType::ADD_SNAPSHOT) {
++					has_add_snapshot = true;
++					break;
++				}
++			}
++			if (!has_add_snapshot) {
++				continue;
++			}
++			// Tables being CREATED in this same transaction (carry an
++			// AssertCreate requirement) do not exist in the catalog yet,
++			// so refreshing them would 404. The cached metadata is the
++			// authoritative initial state — leave it untouched and only
++			// run the in-transaction chain stamp below.
++			bool is_being_created = false;
++			for (auto &req : table->table_info.transaction_data->requirements) {
++				if (req->type == IcebergTableRequirementType::ASSERT_CREATE) {
++					is_being_created = true;
++					break;
++				}
++			}
++			if (!is_being_created) {
++				auto &schema_entry = table->ParentSchema().Cast<IRCSchemaEntry>();
++				auto refreshed = IRCAPI::GetTable(context, catalog, schema_entry, table->name);
++				if (refreshed.has_error) {
++					throw InvalidConfigurationException(
++					    "iceberg: pre-commit metadata read failed: " + refreshed.error_._error.message);
++				}
++				table->table_info.load_table_result = std::move(refreshed.result_);
++				table->table_info.table_metadata =
++				    IcebergTableMetadata::FromTableMetadata(table->table_info.load_table_result.metadata);
++			}
++
++			auto next_seq = table->table_info.table_metadata.last_sequence_number;
++			bool first_in_tx = true;
++			int64_t prev_snapshot_id = 0;
++			for (auto &update : table->table_info.transaction_data->updates) {
++				if (update->type != IcebergTableUpdateType::ADD_SNAPSHOT) {
++					continue;
++				}
++				auto &add = update->Cast<IcebergAddSnapshot>();
++				++next_seq;
++				add.snapshot.sequence_number = next_seq;
++				if (!first_in_tx) {
++					// Chain subsequent AddSnapshots in this same DuckDB
++					// transaction off the predecessor; only the head of
++					// the chain anchors to the freshly-read catalog head.
++					add.snapshot.has_parent_snapshot = true;
++					add.snapshot.parent_snapshot_id = prev_snapshot_id;
++				} else if (table->table_info.table_metadata.has_current_snapshot) {
++					add.snapshot.has_parent_snapshot = true;
++					add.snapshot.parent_snapshot_id = table->table_info.table_metadata.current_snapshot_id;
++				} else {
++					add.snapshot.has_parent_snapshot = false;
++				}
++				prev_snapshot_id = add.snapshot.snapshot_id;
++				first_in_tx = false;
++			}
++		}
++
+ 		auto transaction_info = GetTransactionRequest(context);
+ 		auto &transaction = transaction_info.request;
+ 
