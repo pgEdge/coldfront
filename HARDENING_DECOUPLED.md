@@ -130,7 +130,7 @@ stable) would be:
   e.g. `RefreshMetadataForPendingSnapshots()`, that does only the
   refresh + re-stamp for staged `IcebergAddSnapshot`s on existing
   tables.
-- Multitier calls it explicitly from `_exec_iceberg_with_claim`
+- ColdFront calls it explicitly from `_exec_iceberg_with_claim`
   after `_claim_iceberg_lock`, before letting the function return,
   so the refresh runs inside the bakery hold but is not entangled
   with the generic commit path.

@@ -5,13 +5,13 @@ PGBIN=/usr/pgsql-17/bin
 
 # Per-node snowflake id (required for the bakery protocol — multi-writer
 # commit serialisation on iceberg-only mode). Provided by docker-compose
-# via the MULTITIER_SNOWFLAKE_NODE env var. Distinct integer per node.
-SNOWFLAKE_NODE="${MULTITIER_SNOWFLAKE_NODE:-1}"
+# via the COLDFRONT_SNOWFLAKE_NODE env var. Distinct integer per node.
+SNOWFLAKE_NODE="${COLDFRONT_SNOWFLAKE_NODE:-1}"
 # Bakery reap requires snowflake.node = hashtext(spock_node_name) & 1023 on
 # every node; otherwise coldfront._claim_iceberg_lock's reap query can't map
 # snowflake.get_node(ticket) back to a peer in pg_stat_replication.
 # coldfront checks this at first claim and raises if misaligned. CI sets
-# MULTITIER_SNOWFLAKE_NODE in docker-compose to the derived value per node.
+# COLDFRONT_SNOWFLAKE_NODE in docker-compose to the derived value per node.
 
 if [ ! -f "$PGDATA/PG_VERSION" ]; then
     "$PGBIN/initdb" -D "$PGDATA" -U coldfront --auth=trust \

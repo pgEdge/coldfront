@@ -1,4 +1,4 @@
-# Minimal extension_config.cmake for the multitier patched-iceberg build.
+# Minimal extension_config.cmake for the coldfront patched-iceberg build.
 # Upstream duckdb-iceberg's extension_config.cmake also pulls in ducklake,
 # tpch, icu, and aws.  We want only iceberg (and its avro dep).  ducklake
 # in particular fails to compile cleanly against this pinned DuckDB submodule.

@@ -1,7 +1,7 @@
 ------------------------------ MODULE Bakery_v2 -----------------------------
 (***************************************************************************)
 (* v2 of the decoupled-mode bakery model.  Where v1 abstracted              *)
-(* `multitier.claims` as a globally-consistent set, v2 models the           *)
+(* `coldfront.claims` as a globally-consistent set, v2 models the           *)
 (* real-world asymmetry of Spock replication (each writer has its own       *)
 (* local view; INSERTs propagate via an explicit Apply step) AND adds the   *)
 (* Ricart-Agrawala (1981) optimisation of Lamport's 1978 distributed       *)
@@ -47,20 +47,20 @@ NoSnap   == 0
 variables
   next_ticket = 1,
 
-  \* Per-writer LOCAL view of multitier.claims.  Asymmetric apply is
+  \* Per-writer LOCAL view of coldfront.claims.  Asymmetric apply is
   \* the realistic spock behaviour; R-A's deferred-ack mechanism
   \* compensates by gating min-equivalent on per-peer acks.
   claims = [w \in Writers |-> {}],
 
   \* Acks received per ticket.  A pair <<t, p>> in `acks` means peer p
-  \* has acked the claim with ticket t.  Models multitier.claim_acks
+  \* has acked the claim with ticket t.  Models coldfront.claim_acks
   \* (on the originator side, fully populated via spock replication of
   \* peer-emitted ack rows).
   acks = {},
 
   \* Deferred acks: pair <<p, t>> means peer p has queued an ack-for-
   \* ticket-t that it'll fire when p releases its own pending claim.
-  \* Models multitier.deferred_acks on each peer.
+  \* Models coldfront.deferred_acks on each peer.
   deferred = {},
 
   iceberg = << [w |-> 0, t |-> 0, parent |-> 0, kind |-> "prime"] >>,

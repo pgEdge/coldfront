@@ -7,7 +7,7 @@
 # ---------------
 # Upstream duckdb-iceberg stamps the new snapshot's parent_snapshot_id at
 # IcebergInsert::Finalize time from the session-cached IRCTableMetadata
-# (iceberg_transaction_data.cpp:115). When the multitier R-A bakery
+# (iceberg_transaction_data.cpp:115). When the coldfront R-A bakery
 # decouples parquet upload (phase 1, no bakery — overlaps across writers)
 # from the commit POST (phase 2, bakery-serialised), the cached
 # parent_snapshot_id can be stale by the time it is this writer's turn to
@@ -26,7 +26,7 @@
 #    parent_snapshot_id = sentinel) hold until the commit-POST site.
 #
 # 2. irc_transaction.cpp — at the top of IRCTransaction::DoTableUpdates
-#    (which fires at PG PRE_COMMIT, inside the multitier bakery hold):
+#    (which fires at PG PRE_COMMIT, inside the coldfront bakery hold):
 #    for each dirty iceberg table that has at least one staged
 #    IcebergAddSnapshot AND is not being CREATEd in this same
 #    transaction, GET its current metadata from Lakekeeper and stamp
@@ -37,7 +37,7 @@
 #
 # Net effect: parent_snapshot_id is read from Lakekeeper exactly once,
 # inside the bakery ticket, after the parquet upload phase is done.
-# Under R-A serialisation no other multitier writer can move the head
+# Under R-A serialisation no other coldfront writer can move the head
 # between our refresh and our POST, so the assert-ref precondition is
 # guaranteed to match. No 409s on the bench-C contended path.
 #
@@ -133,7 +133,7 @@ index 0abd4c51..5c6984e0 100644
 -			new_snapshot.parent_snapshot_id = table_info.table_metadata.current_snapshot_id;
 -		}
 -	}
-+	// parent_snapshot_id is NOT stamped here. Multitier uploads parquet
++	// parent_snapshot_id is NOT stamped here. ColdFront uploads parquet
 +	// outside the R-A bakery and only takes the ticket for the commit
 +	// POST, so cached table_metadata can be stale by POST time when
 +	// writers overlap. IRCTransaction::DoTableUpdates reads the fresh
@@ -157,7 +157,7 @@ index 0abd4c51..5c6984e0 100644
 -			new_snapshot.parent_snapshot_id = table_info.table_metadata.current_snapshot_id;
 -		}
 -	}
-+	// parent_snapshot_id is NOT stamped here. Multitier uploads parquet
++	// parent_snapshot_id is NOT stamped here. ColdFront uploads parquet
 +	// outside the R-A bakery and only takes the ticket for the commit
 +	// POST, so cached table_metadata can be stale by POST time when
 +	// writers overlap. IRCTransaction::DoTableUpdates reads the fresh
@@ -175,14 +175,14 @@ index 28853904..c14a1fea 100644
  
  void IRCTransaction::DoTableUpdates(ClientContext &context) {
  	if (!dirty_tables.empty()) {
-+		// Multitier bakery-aware first-time stamp of parent_snapshot_id.
++		// ColdFront bakery-aware first-time stamp of parent_snapshot_id.
 +		//
-+		// multitier._exec_iceberg_with_claim uploads parquet OUTSIDE the
++		// coldfront._exec_iceberg_with_claim uploads parquet OUTSIDE the
 +		// R-A bakery and only acquires the ticket for this commit POST.
 +		// Reading the catalog head from session-cached table_metadata
 +		// would be stale (an earlier ticket-holder may have committed
 +		// since this writer started its INSERT). Read it from Lakekeeper
-+		// now — we hold the ticket, so no other multitier writer can
++		// now — we hold the ticket, so no other coldfront writer can
 +		// move the head until we release. This is the first and only
 +		// time parent_snapshot_id is set on the staged
 +		// IcebergAddSnapshots; the Finalize path leaves it at the

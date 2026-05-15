@@ -250,7 +250,7 @@ on `xmax` give predicate pushdown: files where every row has
   through `raw_query`. If not, this is the next upstream patch.
 
 **Phase 3 — vacuum / compaction worker:**
-- Multitier-side worker that periodically calls
+- ColdFront-side worker that periodically calls
   `duckdb.raw_query('CALL ice.system.rewrite_data_files(...)')`
   with the `xmax > min_active_reader_csn` filter.
 - Cluster-wide reader-CSN watermark via Spock-replicated registry.

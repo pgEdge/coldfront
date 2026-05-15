@@ -1,6 +1,6 @@
-# pgEdge MultiTier — Architecture
+# pgEdge ColdFront — Architecture
 
-Multitier supports two operating modes that share the same extension, the
+ColdFront supports two operating modes that share the same extension, the
 same docker stack, and the same SQL surface for applications. They differ
 in where the data lives and what runs:
 
@@ -385,7 +385,7 @@ tier-deterministic WHERE clause.
    cost-based hot-vs-cold split per predicate.  EDB PGAA's
    DirectScan / CompatScan pair adds a decision engine that picks
    full offload vs hybrid per query — more sophisticated, at the
-   cost of the Arrow Flight round-trip per query.  The MultiTier
+   cost of the Arrow Flight round-trip per query.  The ColdFront
    position is that hot-only queries should target `_events`
    directly (native PG, no `pg_duckdb` roundtrip) and queries that
    need cross-tier semantics go through the view; users or
@@ -597,7 +597,7 @@ into an attached Iceberg catalog. The four direct attempts:
 | Form | Failure |
 |---|---|
 | `INSERT INTO ice.default.x SELECT * FROM pg_table` (plain SQL) | PG parser rejects `ice.default.x` as cross-database before pg_duckdb's planner hook sees it. |
-| `INSERT INTO <wrapper-view> SELECT FROM pg_table` (planner-level) | pg_duckdb's planner doesn't take over the INSERT; only the SELECT side. Multitier sidesteps this with a `post_parse_analyze_hook` that rewrites the INSERT into one `duckdb.raw_query` reading from `pglocal.<schema>.<table>` (option 2 below) — set-based, single Iceberg snapshot per statement. The pg_duckdb-native form would be more efficient but isn't reachable from raw_query. |
+| `INSERT INTO <wrapper-view> SELECT FROM pg_table` (planner-level) | pg_duckdb's planner doesn't take over the INSERT; only the SELECT side. ColdFront sidesteps this with a `post_parse_analyze_hook` that rewrites the INSERT into one `duckdb.raw_query` reading from `pglocal.<schema>.<table>` (option 2 below) — set-based, single Iceberg snapshot per statement. The pg_duckdb-native form would be more efficient but isn't reachable from raw_query. |
 | `CREATE TABLE x (...) USING duckdb` against an Iceberg-attached catalog | Gated to MotherDuck/TEMP only: *"Only TEMP tables are supported in DuckDB if MotherDuck support is not enabled"* (`src/pgduckdb_ddl.cpp` on origin/main). |
 | `SELECT * FROM duckdb.query('INSERT …')` | `duckdb.query` table function rejects non-SELECT input. |
 
@@ -625,7 +625,7 @@ uses the native in-process reader:
    ```
    Pipelines source rows over libpq (loopback TCP to the same PG
    instance) → DuckDB executor → Iceberg writer → S3, single pass, **no
-   local materialisation**. Multitier uses this for INSERT-into-
+   local materialisation**. ColdFront uses this for INSERT-into-
    iceberg-only views, the cold side of tiered INSERTs (when no
    IDENTITY column is omitted), and delta replay
    ([`coldfront._apply_delta_batch`](extension/coldfront/coldfront--0.1.sql)

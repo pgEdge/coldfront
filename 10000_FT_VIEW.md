@@ -1,4 +1,4 @@
-# pgEdge MultiTier — 10,000-foot view
+# pgEdge ColdFront — 10,000-foot view
 
 ## The shape of the problem
 
@@ -19,7 +19,7 @@ Teams handle this in one of a few ways, none of them good:
   file format, different licence). Migrating off it later is its own
   project.
 
-The goal of pgEdge MultiTier is to keep the working set in native
+The goal of pgEdge ColdFront is to keep the working set in native
 PostgreSQL partitions, move the rest to an open file format on cheap
 object storage, and let applications keep using the same table name
 for all of it — reads and writes.
@@ -116,26 +116,26 @@ table name; the detailed breakdown is in [COMPARISON.md](COMPARISON.md).
 The closest commercial offering is therefore EDB PGAA (PG Analytical
 Accelerator).  The meaningful differences, in plain terms:
 
-- MultiTier runs on stock open-source PostgreSQL (no fork, no patched
+- ColdFront runs on stock open-source PostgreSQL (no fork, no patched
   build). PGAA is a paid add-on that runs inside EDB Postgres
   Distributed — a distinct distribution from community PostgreSQL with
   its own release cadence and licence.
-- MultiTier's cold tier is writable through the same table name — users
+- ColdFront's cold tier is writable through the same table name — users
   can update or delete archived rows without switching tools. PGAA's
   cold tier is read-only, so teams that need occasional corrections to
   old data end up rehydrating or bypassing the tiering.
-- MultiTier offers both writable cold (default) and strict read-only-cold
+- ColdFront offers both writable cold (default) and strict read-only-cold
   enforcement via a single GUC. Strict mode is the same
   read-only-cold guarantee PGAA provides, without giving up the option
   of writable cold for operators who want it.
-- MultiTier uses standard Apache Iceberg files on any S3-compatible
+- ColdFront uses standard Apache Iceberg files on any S3-compatible
   store. PGAA uses a proprietary table-access-method layer for cold
   data, and Seafowl as a separate process for the query engine.
-- MultiTier runs in a single PostgreSQL process plus a small catalog
+- ColdFront runs in a single PostgreSQL process plus a small catalog
   daemon. PGAA requires an EDB Postgres Distributed cluster (three
   nodes minimum) plus a separate Seafowl engine communicating over
   Arrow Flight RPC.
-- MultiTier is replication-compatible with pgEdge Spock. Hot-tier DML
+- ColdFront is replication-compatible with pgEdge Spock. Hot-tier DML
   goes through standard PostgreSQL and replicates normally; cold-tier
   writes go directly to Iceberg, which uses its own optimistic
   concurrency control, so they converge across Spock nodes without

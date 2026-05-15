@@ -1,4 +1,4 @@
-# pgEdge MultiTier
+# pgEdge ColdFront
 
 Tables in PostgreSQL, storage in Apache Iceberg (Parquet on S3-compatible
 storage). Two operating modes, both queried as ordinary PG relations:
@@ -8,10 +8,10 @@ storage). Two operating modes, both queried as ordinary PG relations:
   The archiver moves rows hot → cold on a cron.
 - **Decoupled (iceberg-only)** — the table lives entirely in Iceberg from
   row 1; PG holds a thin wrapper view and a registry row that arms the
-  multitier hook to handle every DML on the view. No archiver, no PG
+  coldfront hook to handle every DML on the view. No archiver, no PG
   storage for the data, no watermark. Scales out horizontally to N PG
   nodes pointing at one Lakekeeper + S3; the **bakery protocol** in
-  the multitier extension serializes iceberg commits PG-side via
+  the coldfront extension serializes iceberg commits PG-side via
   Spock-replicated snowflake tickets so concurrent writers never
   collide at the catalog. Implementation is Lamport-1978 + Ricart–
   Agrawala over Spock's per-origin FIFO apply; safety properties are
@@ -34,12 +34,12 @@ using the tiered `events` table transparently for every DML verb.
 Application
   │
   ├── SELECT * FROM events             ← reads hot + cold transparently
-  ├── INSERT INTO events ...            ← multitier rewrites: hot via PG, cold via raw_query
-  ├── UPDATE events SET ... WHERE ...   ← multitier rewrites to the right tier
-  └── DELETE FROM events WHERE ...      ← multitier rewrites to the right tier
+  ├── INSERT INTO events ...            ← coldfront rewrites: hot via PG, cold via raw_query
+  ├── UPDATE events SET ... WHERE ...   ← coldfront rewrites to the right tier
+  └── DELETE FROM events WHERE ...      ← coldfront rewrites to the right tier
          │
 ┌────────▼──────────────────────────────────────────────────┐
-│  PostgreSQL 17/18 + pg_duckdb + multitier extensions       │
+│  PostgreSQL 17/18 + pg_duckdb + coldfront extensions       │
 │                                                            │
 │  _events (renamed partitioned table, hot data)             │
 │  ├── p_2026_04  (hot, native PG)                           │
@@ -48,11 +48,11 @@ Application
 │                                                            │
 │  events  VIEW (replaces original table — hot + cold)       │
 │  + INSTEAD OF INSERT trigger (fallback only — bypassed     │
-│    when multitier is preloaded)                            │
+│    when coldfront is preloaded)                            │
 │  + archive_watermark table (cutoff boundary)               │
-│  + multitier.tiered_views catalog                          │
+│  + coldfront.tiered_views catalog                          │
 │                                                            │
-│  multitier extension: rewrites INSERT / UPDATE / DELETE    │
+│  coldfront extension: rewrites INSERT / UPDATE / DELETE    │
 │  on tiered views — hot side stays plain set-based PG,      │
 │  cold side becomes one duckdb.raw_query (or a plpgsql      │
 │  cursor loop when an IDENTITY column is omitted)           │
@@ -81,7 +81,7 @@ Application
 
 The walkthrough below covers **tiered mode**. For **decoupled (iceberg-only)** —
 one SQL call provisions a wrapper view over a fresh Iceberg table and
-arms the multitier hook to handle every DML on it; no archiver
+arms the coldfront hook to handle every DML on it; no archiver
 involved — see [USAGE.md → Mode 2](USAGE.md#mode-2--decoupled-iceberg-only)
 and [ARCHITECTURE_DECOUPLED.md](ARCHITECTURE_DECOUPLED.md).
 
@@ -106,7 +106,7 @@ The archiver automatically:
 - Renames `events` → `_events`
 - Creates a unified view named `events` (reads hot + cold transparently)
 - Archives expired partitions to Iceberg
-- Registers the view with multitier so the C hook handles every DML on it (an INSTEAD OF INSERT trigger is also installed as a defensive fallback)
+- Registers the view with coldfront so the C hook handles every DML on it (an INSTEAD OF INSERT trigger is also installed as a defensive fallback)
 
 Your application keeps using `events` — no code changes needed for reads.
 
@@ -138,9 +138,9 @@ No `_events`, no `duckdb.raw_query()` in application code.
 | Operation | Syntax | Notes |
 |---|---|---|
 | **SELECT** | `SELECT FROM events` | pg_duckdb UNION ALL across hot + cold |
-| **INSERT** | `INSERT INTO events (...)` | multitier hook splits hot/cold by `ts` vs the watermark; hot rows go set-based to `_events`, cold rows go through one bulk `duckdb.raw_query` (or a plpgsql cursor loop when an IDENTITY column is omitted) |
-| **UPDATE** | `UPDATE events SET ... WHERE ...` | multitier rewrites based on the WHERE clause (see below) |
-| **DELETE** | `DELETE FROM events WHERE ...` | multitier rewrites based on the WHERE clause (see below) |
+| **INSERT** | `INSERT INTO events (...)` | coldfront hook splits hot/cold by `ts` vs the watermark; hot rows go set-based to `_events`, cold rows go through one bulk `duckdb.raw_query` (or a plpgsql cursor loop when an IDENTITY column is omitted) |
+| **UPDATE** | `UPDATE events SET ... WHERE ...` | coldfront rewrites based on the WHERE clause (see below) |
+| **DELETE** | `DELETE FROM events WHERE ...` | coldfront rewrites based on the WHERE clause (see below) |
 
 ```sql
 -- Hot rows (ts >= watermark): plain PG UPDATE on _events
@@ -160,7 +160,7 @@ UPDATE events SET status = 'fixed' WHERE id = 123;
 
 #### Strict vs permissive modes
 
-`multitier.allow_mixed_writes` (bool, default `on`) controls what happens
+`coldfront.allow_mixed_writes` (bool, default `on`) controls what happens
 when the WHERE clause can't be proven to target a single tier:
 
 - **Permissive (`on`, default)**: a dual-tier CTE writes to both sides in
@@ -172,12 +172,12 @@ when the WHERE clause can't be proven to target a single tier:
   Recommended when you want every write attributable to exactly one tier.
 
 ```sql
-SET multitier.allow_mixed_writes = off;
+SET coldfront.allow_mixed_writes = off;
 UPDATE events SET status = 'x' WHERE id = 123;
 -- ERROR:  UPDATE/DELETE on tiered view "events" must include a
 -- WHERE condition on "ts" that targets one tier
 -- HINT:  Use "ts >= <value>" for hot-tier writes, "ts < <value>" for
--- cold-tier writes, or set multitier.allow_mixed_writes = on to permit
+-- cold-tier writes, or set coldfront.allow_mixed_writes = on to permit
 -- a non-atomic dual-tier rewrite.
 ```
 
@@ -194,8 +194,8 @@ available:
 -- Direct hot-side DML:
 UPDATE _events SET status = 'fixed' WHERE id = 123;
 
--- Direct cold-side DML (requires an ATTACH; multitier.ensure_attached()
--- handles it when multitier.warehouse / .lakekeeper_endpoint GUCs are set):
+-- Direct cold-side DML (requires an ATTACH; coldfront.ensure_attached()
+-- handles it when coldfront.warehouse / .lakekeeper_endpoint GUCs are set):
 SELECT duckdb.raw_query($$UPDATE ice.default.events
   SET status = 'fixed' WHERE id = 99$$);
 ```
@@ -223,13 +223,13 @@ make build               # 9MB static binary
 On the first run, the archiver atomically renames the source table
 (e.g. `events` → `_events`) and creates a view with the original name.
 The view combines hot data from `_events` with cold data via `iceberg_scan()`.
-The multitier C hook intercepts every DML on the view and routes it to
+The coldfront C hook intercepts every DML on the view and routes it to
 the correct tier (an INSTEAD OF INSERT trigger is installed as a
 defensive fallback for environments where the extension isn't preloaded).
 
 ### Watermark Strategy
 
-The archiver maintains a cutoff timestamp in `multitier.archive_watermark`:
+The archiver maintains a cutoff timestamp in `coldfront.archive_watermark`:
 - Data with `ts >= cutoff` lives in PostgreSQL (hot)
 - Data with `ts < cutoff` lives in Iceberg (cold)
 - Cutoff is derived from the partition's mathematical upper bound
@@ -333,33 +333,33 @@ CREATE TABLE p_2026_04 PARTITION OF events
 ```
 
 The archiver automatically creates:
-- The `multitier` schema and `archive_watermark` table
+- The `coldfront` schema and `archive_watermark` table
 - Future partitions
-- The unified view (replaces the source table name) and registers it with the multitier hook (plus an INSTEAD OF INSERT trigger as a fallback for non-preloaded environments)
+- The unified view (replaces the source table name) and registers it with the coldfront hook (plus an INSTEAD OF INSERT trigger as a fallback for non-preloaded environments)
 
 ### Per-session setup
 
-**None.** A LOGIN event trigger installed by the `multitier` extension
-(`multitier._login_session_init`, PG17+) calls
-`multitier.ensure_attached()` automatically at backend start, so both
+**None.** A LOGIN event trigger installed by the `coldfront` extension
+(`coldfront._login_session_init`, PG17+) calls
+`coldfront.ensure_attached()` automatically at backend start, so both
 cold reads (`iceberg_scan` through the unified view) and cold writes
 (`duckdb.raw_query` against `ice.default.<table>`) Just Work on a fresh
 psql session. No `ATTACH IF NOT EXISTS` needed in application code.
 
-The trigger is gated on a single row in `multitier.runtime_config` so it
+The trigger is gated on a single row in `coldfront.runtime_config` so it
 does nothing until the operator explicitly opts in — connections are
 never blocked if Lakekeeper happens to be down or the warehouse isn't
 provisioned yet. After bootstrapping the warehouse, arm the trigger
 once per database:
 
 ```sql
-SELECT multitier.arm_login_attach();
+SELECT coldfront.arm_login_attach();
 ```
 
-That helper is a plain `UPDATE` on `multitier.runtime_config` (no `ALTER
+That helper is a plain `UPDATE` on `coldfront.runtime_config` (no `ALTER
 SYSTEM`, no superuser required — just UPDATE privilege on the table).
 From that point, every new backend auto-attaches on login.
-`multitier.disarm_login_attach()` is the symmetric toggle for ops /
+`coldfront.disarm_login_attach()` is the symmetric toggle for ops /
 debugging.
 
 The login-time ATTACH also forces pg_duckdb's S3 secret to commit in a
@@ -375,18 +375,18 @@ Two test suites, both self-contained Docker stacks.
 
 **Single-node** — `./run-ci-local.sh`. Default CI path. Brings up one `pgduckdb/pgduckdb:18-v1.1.1` Postgres plus Lakekeeper + SeaweedFS, seeds 280 rows across four monthly partitions, runs the archiver, and asserts hot/cold behavior through the unified view (hot/cold INSERT/UPDATE/DELETE, dual-tier permissive-mode CTE, ROLLBACK). Fast; runs on every commit.
 
-**Distributed (3-node Spock)** — `./run-ci-distributed.sh`. Opt-in. Builds a one-off `multitier-spock:latest` image on `ghcr.io/pgedge/pgedge-postgres:17.9-spock5.0.7-standard` (Rocky 9 PG 17.9 with Spock 5.0.7 pre-installed) and source-builds pg_duckdb v1.1.1 + multitier against it; the builder stage is expensive (~20 min first time, seconds thereafter via Docker layer cache). Brings up 3 PG nodes in a full Spock mesh + shared Lakekeeper + SeaweedFS, mirrors the single-node assertions on db1, and adds:
+**Distributed (3-node Spock)** — `./run-ci-distributed.sh`. Opt-in. Builds a one-off `coldfront-spock:latest` image on `ghcr.io/pgedge/pgedge-postgres:17.9-spock5.0.7-standard` (Rocky 9 PG 17.9 with Spock 5.0.7 pre-installed) and source-builds pg_duckdb v1.1.1 + coldfront against it; the builder stage is expensive (~20 min first time, seconds thereafter via Docker layer cache). Brings up 3 PG nodes in a full Spock mesh + shared Lakekeeper + SeaweedFS, mirrors the single-node assertions on db1, and adds:
 
 - cross-node hot visibility (Spock replicates `_events` writes within seconds)
 - cross-node cold visibility (all 3 nodes read the shared Iceberg catalog via `iceberg_scan`)
 - Lakekeeper optimistic-concurrency characterization: parallel cold UPDATEs from db1 & db2 on disjoint rows of the same Iceberg table; records whether both landed, one aborted with an error, or one was silently dropped (the last is a known pg_duckdb v1.1.1 behavior — see `LK_CONCURRENCY_OUTCOME` in the run output)
 
-The distributed suite does not modify `run-ci-local.sh` or any existing files — it only adds `docker/multitier-spock.Dockerfile`, `docker/multitier-spock-entrypoint.sh`, `docker-compose.distributed.yml`, and the script.
+The distributed suite does not modify `run-ci-local.sh` or any existing files — it only adds `docker/coldfront-spock.Dockerfile`, `docker/coldfront-spock-entrypoint.sh`, `docker-compose.distributed.yml`, and the script.
 
 ## Project Structure
 
 ```
-pgedge-multitier/
+pgedge-coldfront/
 ├── cmd/archiver/
 │   ├── main.go                 ← entry point (pure Go, pgx only)
 │   └── main_test.go            ← retry, type mapping, interval tests

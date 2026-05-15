@@ -1,11 +1,11 @@
-# Using multitier
+# Using coldfront
 
 Two operating modes. Pick one per table; both can coexist in the same database.
 
 | | Tiered (hot + cold) | Decoupled (iceberg-only) |
 |---|---|---|
 | **Where rows live** | Hot in PG heap (recent), cold in Iceberg (archived) | Everything in Iceberg |
-| **Setup** | Create a partitioned table; let the archiver convert it on first run | One SQL call: `multitier.create_iceberg_table(...)` |
+| **Setup** | Create a partitioned table; let the archiver convert it on first run | One SQL call: `coldfront.create_iceberg_table(...)` |
 | **Archiver** | Required (cron, moves old partitions to cold) | Not used |
 | **Best when** | Workload has a recent-row OLTP part that benefits from PG indexes + transactional ergonomics | Pure analytic / append-mostly; you want zero PG storage and stateless compute |
 
@@ -13,7 +13,7 @@ Once the table exists, **the SQL surface is identical**: `SELECT`, `INSERT`, `UP
 
 ## Prerequisites (both modes)
 
-The stack must already be running with PG + pg_duckdb + multitier + Lakekeeper + S3-compatible storage. See [README.md → Infrastructure](README.md#infrastructure) for the docker-compose recipe and one-time bootstrap (`bootstrap`, `warehouse`, `arm_login_attach`).
+The stack must already be running with PG + pg_duckdb + coldfront + Lakekeeper + S3-compatible storage. See [README.md → Infrastructure](README.md#infrastructure) for the docker-compose recipe and one-time bootstrap (`bootstrap`, `warehouse`, `arm_login_attach`).
 
 ## Mode 1 — Tiered (hot + cold)
 
@@ -56,7 +56,7 @@ The first run renames `events` → `_events`, creates the unified view `events`,
 Single call:
 
 ```sql
-SELECT multitier.create_iceberg_table(
+SELECT coldfront.create_iceberg_table(
     p_schema  => 'public',
     p_table   => 'events',
     p_columns => '[
@@ -71,9 +71,9 @@ SELECT multitier.create_iceberg_table(
 That single statement provisions:
 - `ice.default.events` on the attached Iceberg catalog
 - a PG-side wrapper view `public.events` with proper PG-typed columns
-- a `multitier.tiered_views` registry row — every INSERT, UPDATE, and DELETE on the view is intercepted by the multitier C hook and rewritten to a single `duckdb.raw_query(...)` against `ice.default.events`
+- a `coldfront.tiered_views` registry row — every INSERT, UPDATE, and DELETE on the view is intercepted by the coldfront C hook and rewritten to a single `duckdb.raw_query(...)` against `ice.default.events`
 
-Spock's `ddl_sql` repset replicates the `CREATE VIEW` and the registry row, so the helper only needs to run on one node — peers pick up the wrapper view, the `multitier.tiered_views` row, and the `multitier.claims` repset registration automatically.
+Spock's `ddl_sql` repset replicates the `CREATE VIEW` and the registry row, so the helper only needs to run on one node — peers pick up the wrapper view, the `coldfront.tiered_views` row, and the `coldfront.claims` repset registration automatically.
 
 ## Reading + writing (identical for both modes)
 
@@ -82,7 +82,7 @@ Spock's `ddl_sql` repset replicates the `CREATE VIEW` and the registry row, so t
 SELECT count(*) FROM events;
 SELECT id, status, data->>'k' FROM events WHERE ts >= '2026-04-01';
 
--- Inserts, updates, and deletes all go through the multitier C hook,
+-- Inserts, updates, and deletes all go through the coldfront C hook,
 -- which rewrites the query into one PG-set-based statement (hot side)
 -- + one duckdb.raw_query (cold side). For iceberg-only mode every write
 -- goes cold; for tiered mode the hook splits by ts vs the watermark.
@@ -117,19 +117,19 @@ Anything else (unbounded `numeric`, `xml`, `tsvector`, range/multirange types, c
 - **`jsonb` reads**: surface as `json`, not `jsonb`. Most operators work; the binary-only ones don't.
 - **Cross-tier isolation**: a long-running `SELECT` that touches the Iceberg side multiple times within one transaction may see writes from other sessions interleaved between scans. PG's repeatable-read does not extend across the pg_duckdb boundary. Read-your-own-write *within* one tx works (verified) — it's only cross-statement consistency vs. concurrent writers that's weaker.
 - **Crash-mid-commit (decoupled mode)**: if a backend crashes between Iceberg snapshot commit and PG commit, S3 objects can be orphaned. Iceberg housekeeping reclaims them — not corrupting, but a real failure mode.
-- **Concurrent writes from multiple PG nodes (decoupled mode)**: serialized PG-side by the bakery protocol — every iceberg-only INSERT goes through `multitier._exec_iceberg_with_claim`, which holds a globally-ordered snowflake ticket and waits for its turn before committing to Lakekeeper. No 409 conflicts, no app-level retry. The protocol is Lamport-1978 mutex with the Ricart–Agrawala (1981) deferred-reply optimisation over Spock's per-origin FIFO apply (modelled in [docs/formal/Bakery_v2.tla](docs/formal/Bakery_v2.tla)). The bakery requires the `dblink` + `snowflake` extensions, the `multitier.dblink_self` GUC, and a one-time `SELECT multitier._ensure_claims_replicated()` call on every node after spock mesh setup; see [ARCHITECTURE_DECOUPLED.md](ARCHITECTURE_DECOUPLED.md#concurrency--horizontal-scaling--the-bakery-protocol). Sync-rep is **not** required. The throughput ceiling is Lakekeeper's commit rate, not the writer count.
+- **Concurrent writes from multiple PG nodes (decoupled mode)**: serialized PG-side by the bakery protocol — every iceberg-only INSERT goes through `coldfront._exec_iceberg_with_claim`, which holds a globally-ordered snowflake ticket and waits for its turn before committing to Lakekeeper. No 409 conflicts, no app-level retry. The protocol is Lamport-1978 mutex with the Ricart–Agrawala (1981) deferred-reply optimisation over Spock's per-origin FIFO apply (modelled in [docs/formal/Bakery_v2.tla](docs/formal/Bakery_v2.tla)). The bakery requires the `dblink` + `snowflake` extensions, the `coldfront.dblink_self` GUC, and a one-time `SELECT coldfront._ensure_claims_replicated()` call on every node after spock mesh setup; see [ARCHITECTURE_DECOUPLED.md](ARCHITECTURE_DECOUPLED.md#concurrency--horizontal-scaling--the-bakery-protocol). Sync-rep is **not** required. The throughput ceiling is Lakekeeper's commit rate, not the writer count.
 - **Direct table access**: `_events` is the hot heap (tiered mode only). `ice.default.<name>` is the Iceberg table — only addressable via `iceberg_scan(...)` or `duckdb.raw_query('… ice.… …')`, never via PG-native 3-part names.
 - **Tiered INSERT with omitted IDENTITY column** (e.g. `INSERT INTO events (ts, status, data) VALUES …` where `id` is `GENERATED ALWAYS AS IDENTITY`): the cold side falls back to a plpgsql cursor loop that calls `nextval()` per row so cold ids share the hot side's sequence. Correctness is full; throughput is lower than the set-based fast path. Either supply `id` explicitly in the INSERT, or use a partition-column predicate that proves the rows are all hot, to stay on the fast path. For very large historical seeds (mostly-cold), prefer iceberg-only mode where ids come from your source data.
 
 ## Distributed setup (3-node mesh, decoupled mode)
 
-For multi-writer iceberg workloads, run multitier on N PG nodes in a Spock mesh against the same Lakekeeper + S3. The bakery serializes commits PG-side so writers never collide at the catalog.
+For multi-writer iceberg workloads, run coldfront on N PG nodes in a Spock mesh against the same Lakekeeper + S3. The bakery serializes commits PG-side so writers never collide at the catalog.
 
 **Per-node `postgresql.conf`:**
 
 ```ini
 wal_level = logical
-shared_preload_libraries = 'snowflake,spock,pg_duckdb,multitier'
+shared_preload_libraries = 'snowflake,spock,pg_duckdb,coldfront'
 
 # Keep pg_stat_replication.reply_time fresh on every walsender.  PG
 # default is 10 s; with the bakery's 5 s liveness window that would
@@ -144,19 +144,19 @@ snowflake.node = 1
 
 # DSN used by the bakery's autonomous-tx claim INSERT/DELETE via dblink.
 # Unix socket avoids TCP overhead; `event_triggers=off` bypasses the
-# multitier LOGIN event trigger so the dblink session never enters DuckDB
+# coldfront LOGIN event trigger so the dblink session never enters DuckDB
 # territory (saves ~100ms per claim, avoids a libpq linker recursion).
-# application_name=multitier_dblink is a marker the trigger checks.
-multitier.dblink_self = 'host=/tmp dbname=multitier user=multitier application_name=multitier_dblink options=-cevent_triggers=off'
+# application_name=coldfront_dblink is a marker the trigger checks.
+coldfront.dblink_self = 'host=/tmp dbname=coldfront user=coldfront application_name=coldfront_dblink options=-cevent_triggers=off'
 
-multitier.warehouse = 'wh'
-multitier.lakekeeper_endpoint = 'http://lakekeeper:8181/catalog'
+coldfront.warehouse = 'wh'
+coldfront.lakekeeper_endpoint = 'http://lakekeeper:8181/catalog'
 ```
 
 The bakery has no peer-ack timeout. R-A's only failure mode is a
 dead peer (would wait forever), closed by a liveness check inside
 the wait-loop: a peer whose `pg_stat_replication.reply_time` is
-older than `multitier.peer_alive_window_ms` (default `5000`) is
+older than `coldfront.peer_alive_window_ms` (default `5000`) is
 implicitly treated as already-acked. Raise this on slow/lossy WAN
 links if false-positive dead-peer rulings become a problem. An
 alive peer that hasn't acked is either deferring legitimately
@@ -169,7 +169,7 @@ you want stronger durability for non-bakery writes, but it's no longer
 load-bearing for iceberg-commit serialisation.
 
 **One-time mesh setup** — must be done in this order on every node,
-because `multitier._ensure_claims_replicated()` calls `spock.repset_add_table`
+because `coldfront._ensure_claims_replicated()` calls `spock.repset_add_table`
 and so requires the local spock node to already exist:
 
 ```sql
@@ -180,34 +180,34 @@ CREATE EXTENSION IF NOT EXISTS dblink;
 CREATE EXTENSION IF NOT EXISTS snowflake;
 CREATE EXTENSION IF NOT EXISTS spock;
 CREATE EXTENSION IF NOT EXISTS pg_duckdb;
-CREATE EXTENSION IF NOT EXISTS multitier;
+CREATE EXTENSION IF NOT EXISTS coldfront;
 
 -- 2. Spock node + full-mesh subscriptions (each node has N-1 subs).
-SELECT spock.node_create('n<i>', 'host=<this_node_priv_ip> user=multitier dbname=multitier port=5432');
+SELECT spock.node_create('n<i>', 'host=<this_node_priv_ip> user=coldfront dbname=coldfront port=5432');
 
 -- on n1 (n2 and n3 symmetric):
-SELECT spock.sub_create('sub_n1_from_n2', 'host=<n2> user=multitier dbname=multitier port=5432',
+SELECT spock.sub_create('sub_n1_from_n2', 'host=<n2> user=coldfront dbname=coldfront port=5432',
                         ARRAY['default','default_insert_only','ddl_sql'],
                         false, false, '{}', '0', false);
-SELECT spock.sub_create('sub_n1_from_n3', 'host=<n3> user=multitier dbname=multitier port=5432',
+SELECT spock.sub_create('sub_n1_from_n3', 'host=<n3> user=coldfront dbname=coldfront port=5432',
                         ARRAY['default','default_insert_only','ddl_sql'],
                         false, false, '{}', '0', false);
 
 -- 3. **Required** on every node, after spock setup: register the R-A
--- bakery tables (multitier.claims + multitier.claim_acks) in the local
+-- bakery tables (coldfront.claims + coldfront.claim_acks) in the local
 -- node's default repset.  Without this on a peer, the peer's ack INSERTs
 -- never replicate back to the originating writer and every claim
 -- ack-waits to timeout.
-SELECT multitier._ensure_claims_replicated();
+SELECT coldfront._ensure_claims_replicated();
 ```
 
-`synchronize_structure := false, synchronize_data := false` — tables already exist on every node from the multitier extension; no initial copy needed.
+`synchronize_structure := false, synchronize_data := false` — tables already exist on every node from the coldfront extension; no initial copy needed.
 
 **Verify before benching** — insert a sentinel claim on each node and read it back from every other node. All N×(N-1) directions must show the row before traffic starts. `run-ci-distributed.sh` step 12b is a copyable reference.
 
 ## Tuning knobs
 
-- `multitier.allow_mixed_writes` (bool, default `on`) — controls what happens for tiered-mode UPDATE/DELETE whose WHERE can't be proven to target one tier. `on` emits a dual-tier CTE; `off` rejects with an error and a hint. Not relevant in decoupled mode (every write is single-tier by definition).
+- `coldfront.allow_mixed_writes` (bool, default `on`) — controls what happens for tiered-mode UPDATE/DELETE whose WHERE can't be proven to target one tier. `on` emits a dual-tier CTE; `off` rejects with an error and a hint. Not relevant in decoupled mode (every write is single-tier by definition).
 - `duckdb.force_execution` — bench it before flipping. See [bench.md](bench.md): on a mixed workload it helps `count(distinct)` and similar but regresses index lookups, top-K with PK ordering, and JSON access by 2× to 80,000×. **Default off.**
 
 ## Going deeper

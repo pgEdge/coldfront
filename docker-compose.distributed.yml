@@ -4,7 +4,7 @@ services:
     hostname: db1
     environment:
       PGDATA: /data/pgdata
-      MULTITIER_SNOWFLAKE_NODE: "691"  # hashtext('db1') & 1023
+      COLDFRONT_SNOWFLAKE_NODE: "691"  # hashtext('db1') & 1023
     volumes: ["db1-data:/data"]
     healthcheck:
       test: ["CMD-SHELL", "/usr/pgsql-17/bin/pg_isready -U coldfront -d coldfront"]
@@ -17,7 +17,7 @@ services:
     hostname: db2
     environment:
       PGDATA: /data/pgdata
-      MULTITIER_SNOWFLAKE_NODE: "109"  # hashtext('db2') & 1023
+      COLDFRONT_SNOWFLAKE_NODE: "109"  # hashtext('db2') & 1023
     volumes: ["db2-data:/data"]
     healthcheck:
       test: ["CMD-SHELL", "/usr/pgsql-17/bin/pg_isready -U coldfront -d coldfront"]
@@ -30,7 +30,7 @@ services:
     hostname: db3
     environment:
       PGDATA: /data/pgdata
-      MULTITIER_SNOWFLAKE_NODE: "672"  # hashtext('db3') & 1023
+      COLDFRONT_SNOWFLAKE_NODE: "672"  # hashtext('db3') & 1023
     volumes: ["db3-data:/data"]
     healthcheck:
       test: ["CMD-SHELL", "/usr/pgsql-17/bin/pg_isready -U coldfront -d coldfront"]

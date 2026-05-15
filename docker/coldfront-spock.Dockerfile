@@ -1,7 +1,7 @@
 ###
 ### STAGE 1 — base build env + stock pg_duckdb v1.1.1.
 ###
-### Multitier's own build is split into its own stage below so that
+### ColdFront's own build is split into its own stage below so that
 ### editing coldfront .c / .sql does NOT invalidate the (hot) base
 ### cache. iceberg + avro are NOT compiled here — they're downloaded
 ### per-session from extensions.duckdb.org by pg_duckdb via the

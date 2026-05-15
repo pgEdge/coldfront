@@ -1,23 +1,23 @@
 ------------------------------- MODULE Bakery -------------------------------
 (***************************************************************************)
-(* PlusCal model of the multitier decoupled-mode bakery protocol that      *)
+(* PlusCal model of the coldfront decoupled-mode bakery protocol that      *)
 (* serializes Iceberg commits across N PG nodes.                           *)
 (*                                                                         *)
 (* The protocol code lives in three places:                                *)
-(*   * extension/multitier/multitier--0.1.sql                              *)
+(*   * extension/coldfront/coldfront--0.1.sql                              *)
 (*       _claim_iceberg_lock, _release_iceberg_lock,                       *)
 (*       _exec_iceberg_with_claim, _enqueue_release.                       *)
-(*   * extension/multitier/src/multitier.c                                 *)
-(*       multitier_xact_callback (libpq drainer), multitier_enqueue_release*)
+(*   * extension/coldfront/src/coldfront.c                                 *)
+(*       coldfront_xact_callback (libpq drainer), coldfront_enqueue_release*)
 (*       (C bridge), wrap_cold_in_exec_with_claim (parse-analyze hook).    *)
-(*   * docker/multitier-spock-entrypoint.sh                                *)
+(*   * docker/coldfront-spock-entrypoint.sh                                *)
 (*       synchronous_standby_names = ANY 2 (star) + sync_commit = local + *)
 (*       loopback DSNs with event_triggers=off.                            *)
 (*                                                                         *)
 (* The model abstracts away PG/DuckDB internals and Lakekeeper REST,       *)
 (* keeping only the protocol-level state transitions:                      *)
 (*                                                                         *)
-(*   1. Claim:    sync-rep'd INSERT into multitier.claims (atomic in this  *)
+(*   1. Claim:    sync-rep'd INSERT into coldfront.claims (atomic in this  *)
 (*                model; see KNOWN ABSTRACTIONS below).                    *)
 (*   2. Bakery:   spin until OUR snowflake ticket is the global minimum.   *)
 (*                Reap blockers whose owner-node is currently dead — but   *)
@@ -97,7 +97,7 @@ variables
   \* unique by construction; we collapse it to a single shared counter.
   next_ticket = 1,
 
-  \* multitier.claims.  Modelled as a globally-consistent set: every
+  \* coldfront.claims.  Modelled as a globally-consistent set: every
   \* writer sees every other writer's INSERT atomically.  Reality
   \* relaxes this — synchronous_commit = remote_apply only proves
   \* peers have MY write, not that I have peers' writes (independent
@@ -114,7 +114,7 @@ variables
   claims = {},
 
   \* The iceberg table's snapshot history.  iceberg[1] is the prime
-  \* snapshot created by multitier.create_iceberg_table (NULL insert +
+  \* snapshot created by coldfront.create_iceberg_table (NULL insert +
   \* DELETE) so the table is non-empty before any user write.  Each
   \* later entry is [w |-> writer, t |-> ticket, parent |-> snap_id, kind |-> "commit"].
   \* The `t` field is the writer's snowflake ticket — kept on the
@@ -169,7 +169,7 @@ end define;
 (* Writer process: one per PG backend running INSERT/UPDATE/DELETE on    *)
 (* an iceberg-only wrapper view.  Each iteration of the outer Loop is    *)
 (* one user statement that the C parse-analyze hook rewrote to           *)
-(* multitier._exec_iceberg_with_claim(table, sql).                       *)
+(* coldfront._exec_iceberg_with_claim(table, sql).                       *)
 (*-----------------------------------------------------------------------*)
 fair process Writer \in Writers
 variables
@@ -189,7 +189,7 @@ begin
     claims := { x \in claims : x.n # self };
 
   BeginClaim:
-    \* snowflake.nextval() + INSERT INTO multitier.claims via the
+    \* snowflake.nextval() + INSERT INTO coldfront.claims via the
     \* dblink session.  Real-system implementation:
     \*
     \*    SET synchronous_commit = remote_apply;  -- session-level
@@ -224,7 +224,7 @@ begin
     claims := claims \cup {[w |-> self, t |-> my_ticket, n |-> self]};
 
   BakeryWait:
-    \* multitier._claim_iceberg_lock's poll loop.  Exits when our ticket
+    \* coldfront._claim_iceberg_lock's poll loop.  Exits when our ticket
     \* is the global minimum.  WHILE waiting, any claim from a node we
     \* believe is dead can be evicted — but ONLY claims with strictly-
     \* smaller tickets (the ones actually blocking us), and ONLY if at
@@ -258,12 +258,12 @@ begin
   Decide:
     \* Outer PG transaction commits or rolls back.  Both paths fire
     \* the C-level XactCallback chain at xact end (pg_duckdb's
-    \* first, multitier's second), so the claim release is
+    \* first, coldfront's second), so the claim release is
     \* unconditional.  The iceberg side is conditional on COMMIT.
     await Live(self);
     either
       \* COMMIT path: pg_duckdb XactCallback issues iceberg POST
-      \* (Lakekeeper CAS), then multitier XactCallback releases
+      \* (Lakekeeper CAS), then coldfront XactCallback releases
       \* the claim via libpq.  Modelled as one atomic step because in
       \* the model no other writer can interleave: their bakery is
       \* gated on our claim.
@@ -297,7 +297,7 @@ end process;
 (*-----------------------------------------------------------------------*)
 (* Crasher: a separate process that may crash up to MaxCrashes writers,  *)
 (* one at a time.  Models a backend dying mid-bakery.  When a writer is  *)
-(* crashed mid-claim the row stays in multitier.claims (orphan): the C   *)
+(* crashed mid-claim the row stays in coldfront.claims (orphan): the C   *)
 (* XactCallback that would DELETE it never fires.                        *)
 (*-----------------------------------------------------------------------*)
 fair process Crasher = "crasher"
