@@ -349,8 +349,8 @@ registry's `hot_table` — never by string, so it is schema-agnostic):
 | `ALTER TABLE _t RENAME COLUMN` | Mirror the rename to Iceberg; if the partition column was renamed, update `tiered_views.partition_col`; rebuild the view. |
 | `ALTER TABLE _t RENAME TO ...` | Update `tiered_views.hot_table`, rebuild the view. |
 | `ALTER VIEW v RENAME TO ...` | Migrate the name-keyed `archive_watermark` row to the new view name, then rebuild (otherwise the cutoff lookup misses and the cold UNION branch silently disappears). |
-| `DROP TABLE _t` / `DROP VIEW v` | **Blocked** — would orphan the Iceberg cold tier. Error points at `coldfront.untier_table()`. |
-| `TRUNCATE _t` | **Blocked** — cold-tier rows would remain visible. Error points at `coldfront.truncate_tiered()`. |
+| `DROP TABLE _t` / `DROP VIEW v` | **Blocked by design** — would orphan the Iceberg cold tier. Dismantling tiering is a deliberate operator action (unregister + drop each tier explicitly), never a one-shot call. |
+| `TRUNCATE _t` | **Blocked by design** — cold-tier rows would remain visible through the view. The operator truncates each tier explicitly. |
 
 The view rebuild always does `DROP VIEW` + `CREATE VIEW` (not
 `CREATE OR REPLACE VIEW`, which PG only allows for appending columns at

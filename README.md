@@ -198,14 +198,17 @@ Iceberg cold tier and the transparent view in sync automatically.
 ALTER TABLE _events ADD COLUMN payload jsonb;   -- view now projects payload
 ```
 
-`DROP TABLE` / `DROP VIEW` / `TRUNCATE` on a tiered table are **blocked**
-(they would orphan or hide cold data) with a hint pointing at the
-intended helper:
+`DROP TABLE` / `DROP VIEW` / `TRUNCATE` on a tiered table are **blocked by
+design** — they would orphan or hide cold data on a multi-tier, multi-node
+setup, so dismantling tiering is a deliberate operator action, never a
+one-shot call:
 
 ```sql
 DROP TABLE _events;
 -- ERROR:  coldfront: cannot DROP "public._events" — it has a cold tier in Iceberg
--- HINT:  Use coldfront.untier_table('public', '_events') to detach the cold tier first.
+-- HINT:  Blocked by design: the Iceberg cold tier would be orphaned. Removing a
+--        tiered table is a deliberate operation — unregister it from
+--        coldfront.tiered_views and drop each tier explicitly.
 ```
 
 The Iceberg mirror runs only when `coldfront.warehouse` is configured.

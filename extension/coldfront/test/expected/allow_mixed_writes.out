@@ -27,8 +27,8 @@ SHOW coldfront.allow_mixed_writes;
 SET coldfront.allow_mixed_writes = on;
 EXPLAIN (COSTS OFF, VERBOSE)
   UPDATE public.events SET status = 'x' WHERE id = 1;
-                                                   QUERY PLAN                                                    
------------------------------------------------------------------------------------------------------------------
+                                                                     QUERY PLAN                                                                      
+-----------------------------------------------------------------------------------------------------------------------------------------------------
  Nested Loop
    Output: h.id, h.ts, h.status
    CTE hot
@@ -39,9 +39,9 @@ EXPLAIN (COSTS OFF, VERBOSE)
                  Filter: (_events.id = 1)
    CTE cold
      ->  Result
-           Output: duckdb.raw_query('UPDATE ice.default.events SET status = ''x''::text   WHERE (id = 1)'::text)
+           Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET status = ''x''::text   WHERE (id = 1)'::text)
    ->  CTE Scan on cold c
-         Output: c.raw_query
+         Output: c._exec_iceberg_with_claim
    ->  CTE Scan on hot h
          Output: h.id, h.ts, h.status
 (15 rows)

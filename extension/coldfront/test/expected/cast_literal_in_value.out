@@ -26,20 +26,20 @@ VALUES ('events', '2026-03-01'::timestamptz);
 EXPLAIN (COSTS OFF, VERBOSE)
   UPDATE public.events SET status = 'cast::timestamp with time zone'
   WHERE ts < '2026-03-01'::timestamptz;
-                                                                                    QUERY PLAN                                                                                    
-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                      QUERY PLAN                                                                                                      
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
-   Output: duckdb.raw_query('UPDATE ice.default.events SET status = ''cast::timestamp with time zone''::text   WHERE (ts < ''Sun Mar 01 00:00:00 2026 UTC''::timestamptz)'::text)
+   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET status = ''cast::timestamp with time zone''::text   WHERE (ts < ''Sun Mar 01 00:00:00 2026 UTC''::timestamptz)'::text)
 (2 rows)
 
 -- Also exercise embedded single-quote escapes inside a cast-looking literal.
 EXPLAIN (COSTS OFF, VERBOSE)
   UPDATE public.events SET status = 'it''s a ::character varying value'
   WHERE ts < '2026-03-01'::timestamptz;
-                                                                                      QUERY PLAN                                                                                       
----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                        QUERY PLAN                                                                                                         
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
-   Output: duckdb.raw_query('UPDATE ice.default.events SET status = ''it''''s a ::character varying value''::text   WHERE (ts < ''Sun Mar 01 00:00:00 2026 UTC''::timestamptz)'::text)
+   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET status = ''it''''s a ::character varying value''::text   WHERE (ts < ''Sun Mar 01 00:00:00 2026 UTC''::timestamptz)'::text)
 (2 rows)
 
 -- Cleanup. Unregister before dropping: the DDL hook blocks DROP of a

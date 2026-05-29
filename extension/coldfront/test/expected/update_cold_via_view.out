@@ -22,10 +22,10 @@ VALUES ('events', '2026-03-01'::timestamptz);
 -- VERBOSE exposes the function argument so we can assert the generated SQL.
 EXPLAIN (COSTS OFF, VERBOSE)
   UPDATE public.events SET status = 'cold_upd' WHERE ts = '2026-01-15 01:00:00+00';
-                                                                         QUERY PLAN                                                                         
-------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                           QUERY PLAN                                                                                           
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
-   Output: duckdb.raw_query('UPDATE ice.default.events SET status = ''cold_upd''::text   WHERE (ts = ''Thu Jan 15 01:00:00 2026 UTC''::timestamptz)'::text)
+   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET status = ''cold_upd''::text   WHERE (ts = ''Thu Jan 15 01:00:00 2026 UTC''::timestamptz)'::text)
 (2 rows)
 
 -- Hot side must be untouched after this plan runs — we don't execute here,

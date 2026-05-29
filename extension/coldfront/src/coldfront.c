@@ -583,47 +583,24 @@ build_cold_dml(DeparseResult *dr, TieredViewInfo *info)
 }
 
 /*
- * Wrap a cold DML string in SELECT duckdb.raw_query($MTQ$...$MTQ$).  The
- * SELECT wrapper keeps the DuckDB DML off PG's command-ID counter, which
- * sidesteps pg_duckdb's mixed-write check at pre-commit in the single-tier
- * case.  $MTQ$ dollar-quoting passes the SQL verbatim to raw_query.
+ * Wrap a cold INSERT/UPDATE/DELETE in a call to
+ * coldfront._exec_iceberg_with_claim(table, sql) — the single serialization
+ * chokepoint for ALL cold-tier writes (tiered and iceberg-only). The plpgsql
+ * wrapper self-selects the cluster-wide R-A bakery (multi-node mesh) or a
+ * local advisory lock (vanilla single-node), runs the cold DML via
+ * duckdb.raw_query, and (mesh path) releases the claim after pg_duckdb's
+ * iceberg COMMIT lands via the C XactCallback. The SELECT wrapper also keeps
+ * the DuckDB DML off PG's command-ID counter, sidestepping pg_duckdb's
+ * mixed-write check. See the bakery comments in coldfront--0.1.sql.
  *
  * TODO: SERIOUS FLAW — when this hook fires inside a plpgsql function or
  * DO block, plpgsql has already replaced variable references with $N
- * parameter placeholders by the time post_parse_analyze runs.  The
- * deparsed SQL we hand to raw_query still references those $N, but the
- * DuckDB executor has no parameter values to bind, so it errors with
- * "Invalid Input Error: Expected N parameters, but none were supplied".
- * Workaround today: callers must materialise plpgsql vars into literal
- * SQL before reaching this path (e.g. generate the loop client-side).
- * Proper fix: walk the Query and substitute Param nodes with their
- * corresponding plpgsql expression values before deparsing.
- */
-static char *
-wrap_cold_in_raw_query(const char *cold_dml)
-{
-    StringInfoData buf;
-    initStringInfo(&buf);
-    /*
-     * quote_literal_cstr handles single-quote doubling and E'…' escape mode.
-     * Avoids a dollar-quote-tag breakout if cold_dml contains a literal that
-     * matches the wrapper tag.
-     */
-    appendStringInfo(&buf,
-        "SELECT duckdb.raw_query(%s)",
-        quote_literal_cstr(cold_dml));
-    return buf.data;
-}
-
-/*
- * Wrap a cold INSERT/UPDATE/DELETE for an iceberg-only table in a call
- * to coldfront._exec_iceberg_with_claim(table, sql).  The plpgsql wrapper
- * acquires the cluster-wide bakery (one writer per iceberg table at a time),
- * commits the iceberg DML through an autonomous dblink tx so pg_duckdb's
- * iceberg COMMIT lands before we release, then releases the claim.  See
- * bakery comments in coldfront--0.1.sql.  Tiered INSERT/UPDATE/DELETE go
- * through plain wrap_cold_in_raw_query (no cross-node serialisation needed —
- * the watermark splits each row to one tier deterministically).
+ * parameter placeholders by the time post_parse_analyze runs. The deparsed
+ * SQL we hand to raw_query still references those $N, but the DuckDB executor
+ * has no parameter values to bind, so it errors with "Expected N parameters,
+ * but none were supplied". Workaround today: callers must materialise plpgsql
+ * vars into literal SQL before reaching this path. Proper fix: substitute
+ * Param nodes with their values before deparsing.
  */
 static char *
 wrap_cold_in_exec_with_claim(const char *iceberg_table, const char *cold_dml)
@@ -846,16 +823,15 @@ emit_cold(Query *query, TieredViewInfo *info)
     if (query->commandType == CMD_INSERT)
         cold_dml = prefix_pg_tables_with_pglocal(query, cold_dml);
 
-    /* Iceberg-only writes (INSERT, UPDATE, DELETE) all need the
-     * bakery — every iceberg snapshot commit goes through the same
-     * Lakekeeper CAS, so concurrent writers from any direction can
-     * collide.  Tiered-mode INSERTs use a different code path
-     * (emit_tiered_insert) and aren't routed here.
-     */
-    if (info->is_iceberg_only)
-        return wrap_cold_in_exec_with_claim(info->iceberg_table, cold_dml);
-
-    return wrap_cold_in_raw_query(cold_dml);
+    /* ALL cold-tier writes — tiered and iceberg-only alike — go through the
+     * bakery wrapper. Every iceberg snapshot commit posts to the same
+     * Lakekeeper CAS, so two concurrent committers to the same table (a cold
+     * UPDATE on a peer, the archiver, another backend) would collide on a 409
+     * regardless of which rows they touch. _exec_iceberg_with_claim serializes
+     * them; it self-selects the R-A bakery (multi-node mesh) or a local
+     * advisory lock (vanilla single-node), so this is correct in every
+     * deployment. (Tiered INSERT uses a separate path, emit_tiered_insert.) */
+    return wrap_cold_in_exec_with_claim(info->iceberg_table, cold_dml);
 }
 
 /*
@@ -913,10 +889,11 @@ emit_dual(Query *query, TieredViewInfo *info)
     initStringInfo(&buf);
     appendStringInfo(&buf,
         "WITH hot AS (%s%s)"
-        ", cold AS (SELECT duckdb.raw_query(%s))"
+        ", cold AS (SELECT coldfront._exec_iceberg_with_claim(%s, %s))"
         " SELECT h.* FROM hot h CROSS JOIN cold c",
         hot_dml,
         has_returning ? "" : " RETURNING *",
+        quote_literal_cstr(info->iceberg_table),
         quote_literal_cstr(cold_dml));
     return buf.data;
 }
@@ -1247,10 +1224,11 @@ emit_tiered_insert(Query *query, TieredViewInfo *info)
         initStringInfo(&buf);
         appendStringInfo(&buf,
             "WITH hot_ins AS MATERIALIZED (%s RETURNING 1), "
-            "cold_call AS MATERIALIZED (SELECT duckdb.raw_query(%s)) "
+            "cold_call AS MATERIALIZED (SELECT coldfront._exec_iceberg_with_claim(%s, %s)) "
             "SELECT (SELECT count(*) FROM hot_ins) AS hot_rows, "
             "       (SELECT count(*) FROM cold_call) AS cold_rows",
             hot.data,
+            quote_literal_cstr(info->iceberg_table),
             quote_literal_cstr(cold_norm));
     }
 
@@ -1604,6 +1582,28 @@ typedef struct {
 } TieredDDLInfo;
 
 /*
+ * Is the coldfront registry present in THIS database? The ProcessUtility hook
+ * is registered cluster-wide via shared_preload_libraries, so it fires on DDL
+ * in every database and session — including ones where CREATE EXTENSION
+ * coldfront was never run (a co-located Lakekeeper catalog DB, template1, a
+ * database mid-bootstrap before the extension is created). In those there is
+ * nothing tiered to protect, and the SPI lookups below would error with
+ * "relation coldfront.tiered_views does not exist", aborting unrelated DDL.
+ *
+ * This is a pure catalog lookup (no SPI, no parse of a possibly-missing
+ * relation): resolve the coldfront schema, then the tiered_views relation
+ * within it. Cheap enough to call on every intercepted DDL.
+ */
+static bool
+coldfront_registry_present(void)
+{
+    Oid nsoid = get_namespace_oid("coldfront", true);
+    if (!OidIsValid(nsoid))
+        return false;
+    return OidIsValid(get_relname_relid("tiered_views", nsoid));
+}
+
+/*
  * Find the tiered registry row whose HOT table resolves to relid. Populates
  * *out (palloc'd in CurTransactionContext) and returns true on a match.
  *
@@ -1866,6 +1866,18 @@ coldfront_process_utility(PlannedStmt *pstmt, const char *queryString,
         return;
     }
 
+    /* No coldfront registry in this database → nothing tiered here. The hook
+     * is cluster-wide (shared_preload_libraries) but the extension may not be
+     * installed in this DB (e.g. a co-located Lakekeeper catalog, or a DB
+     * mid-bootstrap before CREATE EXTENSION). Skip all coldfront work so we
+     * never SPI-query a non-existent coldfront.tiered_views and abort
+     * unrelated DDL. */
+    if (!coldfront_registry_present())
+    {
+        COLDFRONT_CALL_THROUGH();
+        return;
+    }
+
     /* ---- DROP TABLE / DROP VIEW: block if any object is tiered. ---- */
     if (IsA(stmt, DropStmt))
     {
@@ -1886,8 +1898,9 @@ coldfront_process_utility(PlannedStmt *pstmt, const char *queryString,
                         (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                          errmsg("coldfront: cannot DROP \"%s.%s\" — it has a cold tier in Iceberg",
                                 ns, name),
-                         errhint("Use coldfront.untier_table('%s', '%s') to detach the cold tier first.",
-                                 ns, name)));
+                         errhint("Blocked by design: the Iceberg cold tier would be orphaned. "
+                                 "Removing a tiered table is a deliberate operation — unregister "
+                                 "it from coldfront.tiered_views and drop each tier explicitly.")));
                 }
             }
         }
@@ -1912,8 +1925,8 @@ coldfront_process_utility(PlannedStmt *pstmt, const char *queryString,
                     (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                      errmsg("coldfront: cannot TRUNCATE tiered table \"%s.%s\" — cold-tier rows would remain visible",
                             ns, name),
-                     errhint("Use coldfront.truncate_tiered('%s', '%s') to truncate both tiers.",
-                             ns, name)));
+                     errhint("Blocked by design: cold-tier rows live in Iceberg and would remain "
+                             "visible through the view. Truncate each tier explicitly.")));
             }
         }
         COLDFRONT_CALL_THROUGH();
@@ -1927,6 +1940,7 @@ coldfront_process_utility(PlannedStmt *pstmt, const char *queryString,
         Oid             relid = RangeVarGetRelid(at->relation, NoLock, true);
         TieredDDLInfo   info;
         bool            need_predrop = false;
+        bool            has_column_change = false;
         char           *view_schema = NULL;
         char           *view_name   = NULL;
         ListCell       *lc;
@@ -1937,19 +1951,36 @@ coldfront_process_utility(PlannedStmt *pstmt, const char *queryString,
             return;
         }
 
-        /* DROP COLUMN / ALTER COLUMN TYPE on the hot table are refused by PG
-         * while the transparent view depends on the column. We must drop the
-         * view BEFORE the real ALTER, then recreate it after. Detect whether
-         * any subcommand needs that. */
+        /* Classify the subcommands. Only column-shape changes (ADD/DROP COLUMN,
+         * ALTER COLUMN TYPE) concern coldfront — those are what must mirror to
+         * Iceberg and rebuild the view. DROP COLUMN / ALTER COLUMN TYPE also
+         * need the view pre-dropped (PG refuses them while the view depends on
+         * the column).
+         *
+         * Every OTHER ALTER subtype passes straight through untouched — most
+         * importantly ALTER TABLE ... DETACH/ATTACH PARTITION, which is the
+         * archiver's OWN cutover machinery (cutover_archive), plus storage
+         * params, SET STATISTICS, etc. The archiver already recreates the view
+         * itself at cutover; a coldfront rebuild here would be redundant and
+         * would bloat the archiver's ACCESS EXCLUSIVE lock window every cycle. */
         foreach(lc, at->cmds)
         {
             AlterTableCmd *cmd = (AlterTableCmd *) lfirst(lc);
+            if (cmd->subtype == AT_AddColumn ||
+                cmd->subtype == AT_DropColumn ||
+                cmd->subtype == AT_AlterColumnType)
+                has_column_change = true;
             if (cmd->subtype == AT_DropColumn ||
                 cmd->subtype == AT_AlterColumnType)
-            {
                 need_predrop = true;
-                break;
-            }
+        }
+
+        if (!has_column_change)
+        {
+            /* Partition management / storage params / etc. — not coldfront's
+             * business. Pass through (this is the archiver's DETACH path). */
+            COLDFRONT_CALL_THROUGH();
+            return;
         }
 
         /* Capture the view identity while view_oid is still live, then drop

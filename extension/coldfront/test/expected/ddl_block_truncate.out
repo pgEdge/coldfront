@@ -1,7 +1,7 @@
 -- TRUNCATE on a tiered hot table must be blocked: the per-row capture trigger
 -- does not fire on TRUNCATE, and cold-tier rows in Iceberg would remain
--- visible through the view. The error directs the operator to
--- coldfront.truncate_tiered() instead.
+-- visible through the view. The block is intentional; the operator must
+-- truncate each tier explicitly and deliberately.
 CREATE EXTENSION IF NOT EXISTS pg_duckdb;
 NOTICE:  extension "pg_duckdb" already exists, skipping
 CREATE EXTENSION IF NOT EXISTS coldfront;
@@ -17,7 +17,7 @@ VALUES ('public.events'::regclass, 'public._events', 'ice.default.events', 'ts')
 -- TRUNCATE of the hot table is blocked.
 TRUNCATE public._events;
 ERROR:  coldfront: cannot TRUNCATE tiered table "public._events" — cold-tier rows would remain visible
-HINT:  Use coldfront.truncate_tiered('public', '_events') to truncate both tiers.
+HINT:  Blocked by design: cold-tier rows live in Iceberg and would remain visible through the view. Truncate each tier explicitly.
 -- A non-tiered table truncates normally (control).
 CREATE TABLE public.plain (id int);
 INSERT INTO public.plain VALUES (1);

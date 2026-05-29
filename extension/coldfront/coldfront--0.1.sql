@@ -386,6 +386,9 @@ DECLARE
     batch_size      int  := 1000;
     i               int;
     col             text;
+    my_ticket       bigint;
+    v_armed         boolean := NULLIF(current_setting('snowflake.node', true), '') IS NOT NULL
+                           AND NULLIF(current_setting('coldfront.dblink_self', true), '') IS NOT NULL;
 BEGIN
     -- Mixed-tier writes inside one PG tx (PG hot INSERT plus DuckDB
     -- raw_query writes for cold) need pg_duckdb's mixed-write guard
@@ -413,6 +416,19 @@ BEGIN
     -- error of its own if the input is malformed.
     v_hot_schema  := (parse_ident(v_hot_table))[1];
     v_hot_relname := (parse_ident(v_hot_table))[2];
+
+    -- Serialise the whole cold-insert loop ONCE (it issues many batched
+    -- raw_query INSERTs in this single transaction; all commit together at
+    -- xact end). Same v_armed gate as _exec_iceberg_with_claim: multi-node →
+    -- one R-A claim (released by the C XactCallback at commit); single-node →
+    -- one local advisory xact lock. Taken before the loop so the whole batch
+    -- sequence commits under one serialization.
+    IF v_armed THEN
+        my_ticket := coldfront._claim_iceberg_lock(v_iceberg);
+        PERFORM coldfront._enqueue_release(my_ticket);
+    ELSE
+        PERFORM pg_advisory_xact_lock(hashtext('coldfront_iceberg:' || v_iceberg));
+    END IF;
 
     -- Identity column + its sequence (NULL if no IDENTITY column).
     SELECT a.attname,
@@ -632,7 +648,13 @@ BEGIN
         -- (via pg_duckdb's XactCallback); pglocal's libpq read tx commits
         -- with it, releasing the AccessShareLock it held on the scratch
         -- table.
-        PERFORM duckdb.raw_query(format(
+        --
+        -- Routed through _exec_iceberg_with_claim so this archiver batch
+        -- commit is serialized against concurrent cold writers on other nodes
+        -- (multi-node) or other local backends (single-node) — same no-409
+        -- guarantee as user-facing cold DML. The loop COMMITs per batch, so
+        -- the claim/lock is acquired and released per batch.
+        PERFORM coldfront._exec_iceberg_with_claim(p_iceberg_ref, format(
             'DELETE FROM %s WHERE (%s) IN (SELECT %s FROM pglocal.coldfront.%I);
              INSERT INTO %s SELECT %s FROM pglocal.coldfront.%I WHERE NOT coldfront_is_deleted',
             p_iceberg_ref, pk_list, pk_list, scratch_tbl,
@@ -1481,34 +1503,49 @@ CREATE FUNCTION coldfront._enqueue_release(p_ticket bigint)
 RETURNS void
 LANGUAGE c AS 'coldfront', 'coldfront_enqueue_release';
 
+-- Serialise one cold-tier Iceberg write so concurrent committers never hit a
+-- Lakekeeper 409 CatalogCommitConflict (duckdb-iceberg does not rebase → the
+-- loser's data is silently dropped). This is THE chokepoint every cold write
+-- routes through, in every deployment.
+--
+-- The serializer is fundamentally a per-Iceberg-table mutex that scales by
+-- deployment, chosen by the v_armed gate:
+--
+--   * Multi-node mesh (v_armed): the Ricart-Agrawala bakery. Stage the parquet
+--     first (phase 1, all writers overlap freely on S3 — no Lakekeeper
+--     contention yet), then claim the bakery (phase 2) just before pg_duckdb's
+--     deferred commit POST fires at PG PRE_COMMIT, and enqueue the release for
+--     the C XactCallback (which runs AFTER pg_duckdb's, so the bakery wraps
+--     exactly the commit POST). Claim is the LAST step, so a staging failure
+--     can't orphan a claim.
+--
+--   * Vanilla single-node / no mesh (NOT v_armed): a transaction-scoped LOCAL
+--     advisory lock is the same mutex without any Spock/snowflake/dblink
+--     dependency. Taken BEFORE staging so a second backend on this node blocks
+--     before it captures parent_snapshot_id (no stale-parent 409); auto-released
+--     at commit. This is the path for plain PostgreSQL tiered deployments, which
+--     have no snowflake.node / dblink_self configured.
+--
+-- v_armed probes the two GUCs the R-A bakery requires. current_setting(...,true)
+-- returns NULL for an unrecognised GUC, so the probe is safe with no snowflake
+-- extension loaded.
 CREATE FUNCTION coldfront._exec_iceberg_with_claim(
     p_iceberg_table text,
     p_sql           text
 ) RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
     my_ticket bigint;
+    v_armed   boolean := NULLIF(current_setting('snowflake.node', true), '') IS NOT NULL
+                     AND NULLIF(current_setting('coldfront.dblink_self', true), '') IS NOT NULL;
 BEGIN
-    -- Phase 1 — parquet write, NO bakery. PhysicalCopyToFile inside
-    -- pg_duckdb's iceberg INSERT plan uploads the parquet to S3 here,
-    -- eagerly (in-statement). pg_duckdb defers the catalog commit to
-    -- the outer xact's PRE_COMMIT XactCallback; the local IRCTransaction
-    -- holds the new manifest entries until then. All concurrent writers'
-    -- phase 1s overlap freely on S3 — no Lakekeeper contention yet.
-    PERFORM duckdb.raw_query(p_sql);
-
-    -- Phase 2 — acquire the bakery just before the catalog commit runs.
-    -- _enqueue_release queues the bakery release for AFTER pg_duckdb's
-    -- XactCallback at PG xact end, so the bakery wraps only the commit
-    -- POST. Inside duckdb-iceberg's IRCTransaction::DoTableUpdates
-    -- (patch: docker/iceberg-bakery-aware-commit-refresh.patch, see
-    -- HARDENING_DECOUPLED.md), table_metadata is refreshed from
-    -- Lakekeeper at this point and each pending IcebergAddSnapshot's
-    -- parent_snapshot_id is stamped for the first time from the
-    -- freshly-read catalog head — so the commit POST always asserts a
-    -- fresh parent_snapshot_id and the no-409 guarantee survives even
-    -- though phase 1s overlapped.
-    my_ticket := coldfront._claim_iceberg_lock(p_iceberg_table);
-    PERFORM coldfront._enqueue_release(my_ticket);
+    IF v_armed THEN
+        PERFORM duckdb.raw_query(p_sql);
+        my_ticket := coldfront._claim_iceberg_lock(p_iceberg_table);
+        PERFORM coldfront._enqueue_release(my_ticket);
+    ELSE
+        PERFORM pg_advisory_xact_lock(hashtext('coldfront_iceberg:' || p_iceberg_table));
+        PERFORM duckdb.raw_query(p_sql);
+    END IF;
 END;
 $$;
 

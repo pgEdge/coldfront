@@ -24,10 +24,10 @@ EXPLAIN (COSTS OFF, VERBOSE)
   UPDATE public.events SET status = 'normal'
   WHERE ts < '2026-03-01'::timestamptz
     AND status = 'bug RETURNING error';
-                                                                                               QUERY PLAN                                                                                                
----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                 QUERY PLAN                                                                                                                  
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
-   Output: duckdb.raw_query('UPDATE ice.default.events SET status = ''normal''::text   WHERE ((ts < ''Sun Mar 01 00:00:00 2026 UTC''::timestamptz) AND (status = ''bug RETURNING error''::text))'::text)
+   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET status = ''normal''::text   WHERE ((ts < ''Sun Mar 01 00:00:00 2026 UTC''::timestamptz) AND (status = ''bug RETURNING error''::text))'::text)
 (2 rows)
 
 -- Cleanup. Unregister before dropping: the DDL hook blocks DROP of a

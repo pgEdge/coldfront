@@ -1,6 +1,7 @@
 -- DROP TABLE on a tiered hot table, and DROP VIEW on the transparent view,
 -- must both be blocked: dropping either would orphan the Iceberg cold tier.
--- The error directs the operator to coldfront.untier_table() instead.
+-- The block is intentional; the error tells the operator to dismantle tiering
+-- deliberately (unregister + drop each tier explicitly), not via a one-shot helper.
 CREATE EXTENSION IF NOT EXISTS pg_duckdb;
 NOTICE:  extension "pg_duckdb" already exists, skipping
 CREATE EXTENSION IF NOT EXISTS coldfront;
@@ -16,11 +17,11 @@ VALUES ('public.events'::regclass, 'public._events', 'ice.default.events', 'ts')
 -- DROP of the hot table is blocked.
 DROP TABLE public._events;
 ERROR:  coldfront: cannot DROP "public._events" — it has a cold tier in Iceberg
-HINT:  Use coldfront.untier_table('public', '_events') to detach the cold tier first.
+HINT:  Blocked by design: the Iceberg cold tier would be orphaned. Removing a tiered table is a deliberate operation — unregister it from coldfront.tiered_views and drop each tier explicitly.
 -- DROP of the transparent view is blocked.
 DROP VIEW public.events;
 ERROR:  coldfront: cannot DROP "public.events" — it has a cold tier in Iceberg
-HINT:  Use coldfront.untier_table('public', 'events') to detach the cold tier first.
+HINT:  Blocked by design: the Iceberg cold tier would be orphaned. Removing a tiered table is a deliberate operation — unregister it from coldfront.tiered_views and drop each tier explicitly.
 -- A non-tiered table drops normally (control).
 CREATE TABLE public.plain (id int);
 DROP TABLE public.plain;

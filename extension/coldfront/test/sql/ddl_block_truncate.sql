@@ -1,7 +1,7 @@
 -- TRUNCATE on a tiered hot table must be blocked: the per-row capture trigger
 -- does not fire on TRUNCATE, and cold-tier rows in Iceberg would remain
--- visible through the view. The error directs the operator to
--- coldfront.truncate_tiered() instead.
+-- visible through the view. The block is intentional; the operator must
+-- truncate each tier explicitly and deliberately.
 
 CREATE EXTENSION IF NOT EXISTS pg_duckdb;
 CREATE EXTENSION IF NOT EXISTS coldfront;

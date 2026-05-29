@@ -19,7 +19,8 @@ REGRESS     = load_order update_unregistered_view update_heap_table \
               cast_in_dquoted_identifier \
               ddl_noop_unregistered ddl_block_drop ddl_block_truncate \
               ddl_add_column ddl_drop_column ddl_alter_column_type \
-              ddl_rename_column ddl_rename_table ddl_rename_view
+              ddl_rename_column ddl_rename_table ddl_rename_view \
+              ddl_partition_passthrough bakery_wraps_cold_writes
 REGRESS_OPTS = --inputdir=test --outputdir=test
 
 PG_CONFIG  ?= pg_config

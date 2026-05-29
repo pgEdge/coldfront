@@ -25,20 +25,20 @@ VALUES ('MixedEvents', '2026-03-01'::timestamptz);
 EXPLAIN (COSTS OFF, VERBOSE)
   UPDATE public."MixedEvents" SET status = 'cold_upd'
   WHERE ts = '2026-01-15 01:00:00+00';
-                                                                            QUERY PLAN                                                                             
--------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                  QUERY PLAN                                                                                                  
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
-   Output: duckdb.raw_query('UPDATE ice.default."MixedEvents" SET status = ''cold_upd''::text   WHERE (ts = ''Thu Jan 15 01:00:00 2026 UTC''::timestamptz)'::text)
+   Output: _exec_iceberg_with_claim('ice.default."MixedEvents"'::text, 'UPDATE ice.default."MixedEvents" SET status = ''cold_upd''::text   WHERE (ts = ''Thu Jan 15 01:00:00 2026 UTC''::timestamptz)'::text)
 (2 rows)
 
 -- Cold DELETE through the mixed-case view: must rewrite, not error.
 EXPLAIN (COSTS OFF, VERBOSE)
   DELETE FROM public."MixedEvents"
   WHERE ts = '2026-01-15 01:00:00+00';
-                                                               QUERY PLAN                                                               
-----------------------------------------------------------------------------------------------------------------------------------------
+                                                                                    QUERY PLAN                                                                                     
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
-   Output: duckdb.raw_query('DELETE FROM ice.default."MixedEvents"   WHERE (ts = ''Thu Jan 15 01:00:00 2026 UTC''::timestamptz)'::text)
+   Output: _exec_iceberg_with_claim('ice.default."MixedEvents"'::text, 'DELETE FROM ice.default."MixedEvents"   WHERE (ts = ''Thu Jan 15 01:00:00 2026 UTC''::timestamptz)'::text)
 (2 rows)
 
 -- Cleanup. Unregister before dropping: the DDL hook blocks DROP of a

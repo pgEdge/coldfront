@@ -23,20 +23,20 @@ VALUES ('events', '2026-03-01'::timestamptz);
 EXPLAIN (COSTS OFF, VERBOSE)
   UPDATE public.events SET status = 'has $MTQ$ inside'
   WHERE ts = '2026-01-15 01:00:00+00';
-                                                                             QUERY PLAN                                                                             
---------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                               QUERY PLAN                                                                                               
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
-   Output: duckdb.raw_query('UPDATE ice.default.events SET status = ''has $MTQ$ inside''::text   WHERE (ts = ''Thu Jan 15 01:00:00 2026 UTC''::timestamptz)'::text)
+   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET status = ''has $MTQ$ inside''::text   WHERE (ts = ''Thu Jan 15 01:00:00 2026 UTC''::timestamptz)'::text)
 (2 rows)
 
 -- Cold path: WHERE literal contains the tag.
 EXPLAIN (COSTS OFF, VERBOSE)
   UPDATE public.events SET status = 'updated'
   WHERE ts = '2026-01-15 01:00:00+00' AND status = '$MTQ$';
-                                                                                         QUERY PLAN                                                                                         
---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                           QUERY PLAN                                                                                                           
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
-   Output: duckdb.raw_query('UPDATE ice.default.events SET status = ''updated''::text   WHERE ((ts = ''Thu Jan 15 01:00:00 2026 UTC''::timestamptz) AND (status = ''$MTQ$''::text))'::text)
+   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET status = ''updated''::text   WHERE ((ts = ''Thu Jan 15 01:00:00 2026 UTC''::timestamptz) AND (status = ''$MTQ$''::text))'::text)
 (2 rows)
 
 -- Dual (ambiguous) path: emit_dual uses the same $MTQ$ wrapping. Predicate
@@ -44,8 +44,8 @@ EXPLAIN (COSTS OFF, VERBOSE)
 -- by default so the dual-tier CTE is emitted.
 EXPLAIN (COSTS OFF, VERBOSE)
   UPDATE public.events SET status = 'has $MTQ$ in dual' WHERE status = 'ok';
-                                                                   QUERY PLAN                                                                   
-------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                     QUERY PLAN                                                                                     
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Nested Loop
    Output: h.id, h.ts, h.status
    CTE hot
@@ -56,9 +56,9 @@ EXPLAIN (COSTS OFF, VERBOSE)
                  Filter: (_events.status = 'ok'::text)
    CTE cold
      ->  Result
-           Output: duckdb.raw_query('UPDATE ice.default.events SET status = ''has $MTQ$ in dual''::text   WHERE (status = ''ok''::text)'::text)
+           Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET status = ''has $MTQ$ in dual''::text   WHERE (status = ''ok''::text)'::text)
    ->  CTE Scan on cold c
-         Output: c.raw_query
+         Output: c._exec_iceberg_with_claim
    ->  CTE Scan on hot h
          Output: h.id, h.ts, h.status
 (15 rows)

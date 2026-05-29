@@ -1,6 +1,7 @@
 -- DROP TABLE on a tiered hot table, and DROP VIEW on the transparent view,
 -- must both be blocked: dropping either would orphan the Iceberg cold tier.
--- The error directs the operator to coldfront.untier_table() instead.
+-- The block is intentional; the error tells the operator to dismantle tiering
+-- deliberately (unregister + drop each tier explicitly), not via a one-shot helper.
 
 CREATE EXTENSION IF NOT EXISTS pg_duckdb;
 CREATE EXTENSION IF NOT EXISTS coldfront;

@@ -164,7 +164,7 @@ func detectPartitionColumns(ctx context.Context, db querier, schema, table strin
 			"multi-column partition keys are not supported on %s.%s (key: (%s)). "+
 				"The archiver maintains a single global watermark per table to represent "+
 				"the hot/cold boundary, which cannot express independent per-dimension "+
-				"archival state. Use a table partitioned by a single time/date column.",
+				"archival state. Use a table partitioned by a single time/date column",
 			schema, table, strings.Join(cols, ", "))
 	}
 	return cols, nil
@@ -201,7 +201,7 @@ func validateFlatPartitioning(ctx context.Context, db querier, schema, table str
 			"sub-partition as a separate entry in archiver.tables. "+
 			"Note: tiering a sub-partition converts it to a view, so it can no "+
 			"longer be accessed through the top-level parent — applications must "+
-			"query the sub-partition directly.",
+			"query the sub-partition directly",
 		schema, table, child, table)
 }
 
@@ -472,13 +472,19 @@ func archivePartition(ctx context.Context, pool *pgxpool.Pool, t *config.TableCo
 // previous archive cycle exported to Iceberg but crashed before cutover, so
 // the partition remained attached and will be re-exported this cycle.
 func wipeIcebergRange(ctx context.Context, pool *pgxpool.Pool, iceTable, partCol string, lower, upper time.Time) error {
-	sql := fmt.Sprintf(
-		`SELECT duckdb.raw_query($q$DELETE FROM %s WHERE %s >= '%s'::timestamptz AND %s < '%s'::timestamptz$q$)`,
+	// Route through coldfront._exec_iceberg_with_claim so this cold-tier write
+	// is serialized against concurrent committers (R-A bakery on a mesh, local
+	// advisory lock single-node) — same no-409 guarantee as every other cold
+	// write. The inner DELETE is dollar-quoted as the p_sql argument.
+	inner := fmt.Sprintf(
+		`DELETE FROM %s WHERE %s >= '%s'::timestamptz AND %s < '%s'::timestamptz`,
 		iceTable,
 		pgx.Identifier{partCol}.Sanitize(),
 		lower.UTC().Format("2006-01-02 15:04:05+00"),
 		pgx.Identifier{partCol}.Sanitize(),
 		upper.UTC().Format("2006-01-02 15:04:05+00"))
+	sql := fmt.Sprintf(`SELECT coldfront._exec_iceberg_with_claim(%s, $q$%s$q$)`,
+		sqlutil.Literal(iceTable), inner)
 	_, err := pool.Exec(ctx, sql)
 	return err
 }
@@ -519,8 +525,14 @@ func bulkExportWithSnapshot(ctx context.Context, pool *pgxpool.Pool, t *config.T
 	}
 	defer func() { _, _ = conn.Exec(ctx, "DROP TABLE IF EXISTS duck_stage") }()
 
+	// Route the bulk iceberg INSERT through the bakery wrapper (serialized:
+	// R-A on a mesh, local advisory lock single-node). Runs as an autocommit
+	// statement on this dedicated conn, so the claim/lock is released at this
+	// statement's commit. duck_stage was created on the same conn in the prior
+	// statement, so only one DuckDB-database write happens inside this tx.
 	if _, err := conn.Exec(ctx,
-		fmt.Sprintf("SELECT duckdb.raw_query($q$INSERT INTO %s SELECT * FROM pg_temp.duck_stage$q$)", iceTable),
+		fmt.Sprintf("SELECT coldfront._exec_iceberg_with_claim(%s, $q$INSERT INTO %s SELECT * FROM pg_temp.duck_stage$q$)",
+			sqlutil.Literal(iceTable), iceTable),
 	); err != nil {
 		return "", fmt.Errorf("iceberg insert: %w", err)
 	}
