@@ -5,9 +5,9 @@
 -- would bloat the archiver's ACCESS EXCLUSIVE lock window and churn the
 -- registry view_oid on every archive cycle.
 --
--- Regression guard: only ADD/DROP COLUMN and ALTER COLUMN TYPE (and RENAME)
--- trigger a rebuild. DETACH PARTITION, SET STATISTICS, storage params, etc.
--- are none of coldfront's business.
+-- DETACH PARTITION, SET STATISTICS, storage params, etc. pass straight
+-- through untouched (column-shape changes are blocked separately —
+-- ddl_block_column).
 
 CREATE EXTENSION IF NOT EXISTS pg_duckdb;
 CREATE EXTENSION IF NOT EXISTS coldfront;
@@ -39,13 +39,6 @@ SELECT ('public.events'::regclass::oid = :oid_before2) AS setstats_left_view_int
 
 -- (3) But a real column change DOES still rebuild (gate works both ways): the
 -- view OID changes because _rebuild_tiered_view DROP+CREATEs the view.
-SELECT 'public.events'::regclass::oid AS oid_before3 \gset
-ALTER TABLE public._events ADD COLUMN extra text;
-SELECT ('public.events'::regclass::oid <> :oid_before3) AS addcolumn_rebuilt_view;
-SELECT attname FROM pg_attribute
- WHERE attrelid = 'public.events'::regclass AND attnum > 0 AND NOT attisdropped
- ORDER BY attnum;
-
 -- Cleanup.
 DELETE FROM coldfront.tiered_views;
 DROP VIEW public.events;

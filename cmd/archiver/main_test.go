@@ -72,9 +72,9 @@ func TestPgFormatTypeToDuckDB(t *testing.T) {
 		// Storage matches surface — no view cast.
 		{pg: "bigint", wantStorage: "BIGINT"},
 		{pg: "integer", wantStorage: "INTEGER"},
-		{pg: "smallint", wantStorage: "SMALLINT"},
+		{pg: "smallint", wantStorage: "INTEGER"}, // Iceberg has no 16-bit int; widened
 		{pg: "real", wantStorage: "REAL"},
-		{pg: "double precision", wantStorage: "DOUBLE"},
+		{pg: "double precision", wantStorage: "DOUBLE", wantViewCastTyp: "double precision"}, // ::double is a PG shell type
 		{pg: "boolean", wantStorage: "BOOLEAN"},
 		{pg: "timestamp with time zone", wantStorage: "TIMESTAMPTZ"},
 		{pg: "timestamp without time zone", wantStorage: "TIMESTAMP"},

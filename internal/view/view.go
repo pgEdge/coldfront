@@ -195,7 +195,15 @@ func GenerateViewSQL(cfg ViewConfig) string {
 			// DuckDB type back to PG so the application sees the rich type
 			// (json/interval/inet/…) regardless of underlying string storage.
 			hotCols[i] = hotName + "::" + c.ViewCastType
-			coldCols[i] = fmt.Sprintf("r['%s']::%s", coldKey, c.ViewCastType)
+			// inet/cidr are VARCHAR-backed: pg_duckdb cannot cast its
+			// struct-field (unresolved) type straight to inet, so resolve to
+			// text first (r['col']::text::inet). jsonb→json and interval cast
+			// directly; double precision is DOUBLE-backed (handled in the else).
+			if c.ViewCastType == "inet" {
+				coldCols[i] = fmt.Sprintf("r['%s']::text::%s", coldKey, c.ViewCastType)
+			} else {
+				coldCols[i] = fmt.Sprintf("r['%s']::%s", coldKey, c.ViewCastType)
+			}
 		} else {
 			hotCols[i] = hotName
 			coldCols[i] = fmt.Sprintf("r['%s']::%s", coldKey, c.Type)

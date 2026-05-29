@@ -1,0 +1,310 @@
+#!/bin/bash
+# ci/journey.sh — THE canonical ColdFront user journey (the E2E spec).
+#
+# One ordered walk through every beta user story, parameterized by topology so
+# the SAME assertions run in every matrix cell. Run by ci/matrix.sh after a
+# topology is up (ci/topo/*.sh). Not -e: assertions must continue past a
+# failure so we see the full picture; the exit code comes from summary().
+#
+# Usage:
+#   ci/journey.sh --host <container> --db-ip <ip> --sw-ip <ip> --lk-ip <ip> \
+#                 --mode tiered|decoupled [--mesh --peers "<c2> <c3>"] \
+#                 [--standby <container>] [--archiver ./bin/archiver]
+#
+# Addresses: --host is the container name for in-DB psql (docker exec). The
+# *-ip args are container IPs the host-side archiver uses to reach PG / S3 /
+# Lakekeeper (the in-DB Iceberg attach uses the node's own GUCs).
+
+set -uo pipefail
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=ci/lib.sh
+source "$SCRIPT_DIR/lib.sh"
+
+HOST=""; MODE="tiered"; MESH=0; PEERS=""; STANDBY=""
+DB_IP=""; SW_IP=""; LK_IP=""; WAREHOUSE="wh"
+ARCHIVER="${ARCHIVER:-./bin/archiver}"
+while [ $# -gt 0 ]; do case "$1" in
+  --host) HOST="$2"; shift 2;;
+  --mode) MODE="$2"; shift 2;;
+  --mesh) MESH=1; shift;;
+  --peers) PEERS="$2"; shift 2;;
+  --standby) STANDBY="$2"; shift 2;;
+  --db-ip) DB_IP="$2"; shift 2;;
+  --sw-ip) SW_IP="$2"; shift 2;;
+  --lk-ip) LK_IP="$2"; shift 2;;
+  --warehouse) WAREHOUSE="$2"; shift 2;;
+  --archiver) ARCHIVER="$2"; shift 2;;
+  *) echo "journey.sh: unknown arg $1"; exit 2;;
+esac; done
+[ -n "$HOST" ] || { echo "journey.sh: --host required"; exit 2; }
+
+step "JOURNEY  host=$HOST  mode=$MODE  mesh=$MESH  standby=${STANDBY:-none}"
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story 1 — Setup: extensions, S3 secret, arm the login attach.
+# (GUCs warehouse/lakekeeper_endpoint live in the node's postgresql.conf; the
+#  topology brought up Lakekeeper + the warehouse already.)
+# ───────────────────────────────────────────────────────────────────────────
+story_setup() {
+    step "1. Setup (extensions, S3 secret, arm login-attach)"
+    qf "$HOST" <<EOSQL >/dev/null
+CREATE EXTENSION IF NOT EXISTS pg_duckdb;
+CREATE EXTENSION IF NOT EXISTS coldfront;
+SELECT duckdb.install_extension('iceberg');
+DROP SERVER IF EXISTS simple_s3_secret CASCADE;
+SELECT duckdb.create_simple_secret('s3','admin','adminsecret','','us-east-1','path','','${SW_IP}:8333','','','false');
+SELECT coldfront.arm_login_attach();
+EOSQL
+    local ext; ext=$(q "$HOST" "SELECT count(*) FROM pg_extension WHERE extname IN ('pg_duckdb','coldfront');")
+    assert_eq "extensions present" "2" "$ext"
+    local armed; armed=$(q "$HOST" "SELECT attach_on_login FROM coldfront.runtime_config LIMIT 1;")
+    assert_eq "login-attach armed" "t" "$armed"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story 2 — Provision (tiered): create a partitioned table, seed 280 rows,
+# run the archiver once (swap → view → register → archive Jan/Feb).
+# ───────────────────────────────────────────────────────────────────────────
+story_provision_tiered() {
+    step "2. Provision tiered table + seed + first archiver run"
+    qf "$HOST" <<'EOSQL' >/dev/null
+SET search_path = public;
+CREATE TABLE IF NOT EXISTS events (
+    id bigint GENERATED ALWAYS AS IDENTITY,
+    ts timestamptz NOT NULL,
+    status text,
+    data jsonb,
+    PRIMARY KEY (id, ts)
+) PARTITION BY RANGE (ts);
+CREATE TABLE IF NOT EXISTS p_2026_01 PARTITION OF events FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+CREATE TABLE IF NOT EXISTS p_2026_02 PARTITION OF events FOR VALUES FROM ('2026-02-01') TO ('2026-03-01');
+CREATE TABLE IF NOT EXISTS p_2026_03 PARTITION OF events FOR VALUES FROM ('2026-03-01') TO ('2026-04-01');
+CREATE TABLE IF NOT EXISTS p_2026_04 PARTITION OF events FOR VALUES FROM ('2026-04-01') TO ('2026-05-01');
+INSERT INTO events (ts, status, data) SELECT '2026-01-15'::timestamptz + (i*interval '1 hour'), 'ok', '{"m":"jan"}'::jsonb FROM generate_series(1,100) i;
+INSERT INTO events (ts, status, data) SELECT '2026-02-10'::timestamptz + (i*interval '1 hour'), 'ok', '{"m":"feb"}'::jsonb FROM generate_series(1,80) i;
+INSERT INTO events (ts, status, data) SELECT '2026-03-05'::timestamptz + (i*interval '1 hour'), 'ok', '{"m":"mar"}'::jsonb FROM generate_series(1,60) i;
+INSERT INTO events (ts, status, data) SELECT '2026-04-01'::timestamptz + (i*interval '1 hour'), 'ok', '{"m":"apr"}'::jsonb FROM generate_series(1,40) i;
+EOSQL
+    local seeded; seeded=$(q "$HOST" "SELECT count(*) FROM public.events;")
+    assert_eq "seeded 280 rows (pre-archive, plain table)" "280" "$seeded"
+
+    cat > /tmp/journey-archiver.yaml <<EOF
+postgres:
+  dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
+iceberg:
+  warehouse: "${WAREHOUSE}"
+  lakekeeper_endpoint: "http://${LK_IP}:8181/catalog"
+  namespace: "default"
+s3:
+  endpoint: "${SW_IP}:8333"
+  region: "us-east-1"
+  access_key: "admin"
+  secret_key: "adminsecret"
+archiver:
+  tables:
+    - source_table: events
+      partition_period: monthly
+      retention_period: "1 month"
+EOF
+    if "$ARCHIVER" --config /tmp/journey-archiver.yaml >/tmp/journey-archiver.log 2>&1; then
+        pass "archiver first run completed"
+    else
+        fail "archiver first run — see /tmp/journey-archiver.log"; tail -5 /tmp/journey-archiver.log
+    fi
+    local relkind; relkind=$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='events' AND relnamespace='public'::regnamespace;")
+    assert_eq "events is now a view" "v" "$relkind"
+    local wm; wm=$(q "$HOST" "SELECT count(*) FROM coldfront.archive_watermark WHERE table_name='events';")
+    assert_eq "watermark registered" "1" "$wm"
+}
+
+# Story 2 (decoupled) — single create_iceberg_table call. Scaffold; filled when
+# the decoupled cell is built.
+story_provision_decoupled() {
+    step "2. Provision decoupled (iceberg-only) table"
+    fail "decoupled provisioning not yet implemented in journey (TODO: matrix step 3)"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story 4 — Reads + jsonb surfacing (proven assertions from run-ci-local).
+# ───────────────────────────────────────────────────────────────────────────
+story_reads() {
+    step "4. Reads (hot/cold/cross-tier, jsonb surfacing)"
+    local O; O=$(qf "$HOST" <<'EOSQL'
+SELECT 'RO_TOTAL:' || count(*) FROM events;
+SELECT 'RO_HOT:'   || count(*) FROM events WHERE ts >= '2026-03-01';
+SELECT 'RO_COLD:'  || count(*) FROM events WHERE ts  < '2026-03-01';
+SELECT 'JSONB_TYPE:'   || pg_typeof(data)::text FROM events LIMIT 1;
+SELECT 'JSONB_COLD_M:' || (data->>'m') FROM events WHERE ts < '2026-03-01' AND status='ok' ORDER BY ts LIMIT 1;
+SELECT 'JSONB_HOT_M:'  || (data->>'m') FROM events WHERE ts >= '2026-03-01' AND status='ok' ORDER BY ts LIMIT 1;
+EOSQL
+)
+    assert_eq "total rows (hot+cold)" "280"  "$(extract RO_TOTAL "$O")"
+    assert_eq "hot rows"             "100"  "$(extract RO_HOT "$O")"
+    assert_eq "cold rows"            "180"  "$(extract RO_COLD "$O")"
+    assert_eq "data surfaces as json" "json" "$(extract JSONB_TYPE "$O")"
+    assert_eq "json cold round-trip"  "jan"  "$(extract JSONB_COLD_M "$O")"
+    assert_eq "json hot round-trip"   "mar"  "$(extract JSONB_HOT_M "$O")"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story 5 — Data-type matrix: round-trip every supported type through hot+cold.
+# A separate tiered table whose Jan partition is archived (cold) and Apr stays
+# hot; one representative value per type written to each tier and read back.
+# ───────────────────────────────────────────────────────────────────────────
+story_types() {
+    step "5. Data-type matrix round-trip (hot + cold)"
+    qf "$HOST" <<'EOSQL' >/dev/null
+SET search_path = public;
+CREATE TABLE IF NOT EXISTS typed (
+    id      bigint GENERATED ALWAYS AS IDENTITY,
+    ts      timestamptz NOT NULL,
+    c_int   integer, c_small smallint, c_real real, c_dbl double precision,
+    c_bool  boolean, c_date date, c_uuid uuid, c_txt text, c_vc varchar(8),
+    c_bytea bytea, c_num numeric(20,5), c_jsonb jsonb, c_inet inet,
+    PRIMARY KEY (id, ts)
+) PARTITION BY RANGE (ts);
+CREATE TABLE IF NOT EXISTS typed_2026_01 PARTITION OF typed FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+CREATE TABLE IF NOT EXISTS typed_2026_04 PARTITION OF typed FOR VALUES FROM ('2026-04-01') TO ('2026-05-01');
+-- inet is VARCHAR-backed in Iceberg: the bulk export casts it ::text (pg_duckdb
+-- can't scan inet natively), and the view casts r['c_inet']::inet on read.
+INSERT INTO typed (ts,c_int,c_small,c_real,c_dbl,c_bool,c_date,c_uuid,c_txt,c_vc,c_bytea,c_num,c_jsonb,c_inet)
+VALUES ('2026-01-10', 42, 7, 1.5, 2.5, true, '2026-01-10', '11111111-1111-1111-1111-111111111111','hi','abc','\xdeadbeef'::bytea, 123.45, '{"k":1}', '10.0.0.1');
+INSERT INTO typed (ts,c_int,c_small,c_real,c_dbl,c_bool,c_date,c_uuid,c_txt,c_vc,c_bytea,c_num,c_jsonb,c_inet)
+VALUES ('2026-04-10', 42, 7, 1.5, 2.5, true, '2026-01-10', '11111111-1111-1111-1111-111111111111','hi','abc','\xdeadbeef'::bytea, 123.45, '{"k":1}', '10.0.0.1');
+EOSQL
+    cat > /tmp/journey-typed.yaml <<EOF
+postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
+iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog", namespace: "default" }
+s3:       { endpoint: "${SW_IP}:8333", region: "us-east-1", access_key: "admin", secret_key: "adminsecret" }
+archiver: { tables: [ { source_table: typed, partition_period: monthly, retention_period: "1 month" } ] }
+EOF
+    "$ARCHIVER" --config /tmp/journey-typed.yaml >/tmp/journey-typed.log 2>&1 \
+        && pass "typed table archived (Jan → cold)" || { fail "typed archive — see /tmp/journey-typed.log"; tail -5 /tmp/journey-typed.log; }
+    local O; O=$(qf "$HOST" <<'EOSQL'
+SELECT 'COLD_NUM:'  || c_num::text   FROM typed WHERE ts < '2026-02-01';
+SELECT 'COLD_UUID:' || c_uuid::text  FROM typed WHERE ts < '2026-02-01';
+SELECT 'COLD_SMALL:'|| c_small::text FROM typed WHERE ts < '2026-02-01';
+SELECT 'COLD_BOOL:' || c_bool::text  FROM typed WHERE ts < '2026-02-01';
+SELECT 'COLD_BYTEA:'|| encode(c_bytea,'hex') FROM typed WHERE ts < '2026-02-01';
+SELECT 'COLD_INET:' || (c_inet::text) FROM typed WHERE ts < '2026-02-01';
+SELECT 'HOT_NUM:'   || c_num::text   FROM typed WHERE ts >= '2026-04-01';
+EOSQL
+)
+    assert_eq "cold numeric(20,5) round-trip" "123.45000" "$(extract COLD_NUM "$O")"
+    assert_eq "cold uuid round-trip"  "11111111-1111-1111-1111-111111111111" "$(extract COLD_UUID "$O")"
+    assert_eq "cold smallint round-trip (widened to int)" "7" "$(extract COLD_SMALL "$O")"
+    assert_eq "cold boolean round-trip" "true"   "$(extract COLD_BOOL "$O")"
+    assert_eq "cold bytea round-trip" "deadbeef" "$(extract COLD_BYTEA "$O")"
+    assert_contains "cold inet round-trip (text-backed, cast back)" "10.0.0.1" "$(extract COLD_INET "$O")"
+    assert_eq "hot numeric round-trip" "123.45000" "$(extract HOT_NUM "$O")"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story 6 — Writes via the view (proven assertions from run-ci-local).
+# ───────────────────────────────────────────────────────────────────────────
+story_writes() {
+    step "6. Writes via view (hot/cold INSERT-UPDATE-DELETE, dual-tier)"
+    local O; O=$(qf "$HOST" <<'EOSQL'
+INSERT INTO events (ts, status, data) VALUES ('2026-04-09 12:00+00','ci_hot_ins','{}');
+SELECT 'RW_HOT_INS:'  || count(*) FROM _events WHERE status='ci_hot_ins';
+INSERT INTO events (ts, status, data) VALUES ('2026-01-15 12:00+00','ci_cold_ins','{}');
+SELECT 'RW_COLD_INS:' || count(*) FROM events WHERE status='ci_cold_ins';
+UPDATE events SET status='ci_hot_upd' WHERE ts='2026-04-09 12:00:00+00' AND status='ci_hot_ins';
+SELECT 'RW_HOT_UPD:'  || status FROM _events WHERE ts='2026-04-09 12:00:00+00';
+UPDATE events SET status='ci_cold_upd' WHERE ts='2026-01-15 01:00:00+00';
+SELECT 'RW_COLD_UPD:' || count(*) FROM events WHERE status='ci_cold_upd';
+DELETE FROM events WHERE ts='2026-04-09 12:00:00+00' AND status='ci_hot_upd';
+SELECT 'RW_HOT_DEL:'  || count(*) FROM _events WHERE status='ci_hot_upd';
+DELETE FROM events WHERE ts='2026-01-15 01:00:00+00' AND status='ci_cold_upd';
+SELECT 'RW_COLD_DEL:' || count(*) FROM events WHERE status='ci_cold_upd';
+SELECT 'DUAL_TOTAL_PRE:' || count(*) FROM events WHERE status='ok';
+UPDATE events SET status='dual_upd' WHERE status='ok';
+SELECT 'DUAL_REMAINING_OK:' || count(*) FROM events WHERE status='ok';
+EOSQL
+)
+    assert_eq "hot insert via view"  "1" "$(extract RW_HOT_INS "$O")"
+    assert_eq "cold insert via view" "1" "$(extract RW_COLD_INS "$O")"
+    assert_eq "hot update via view"  "ci_hot_upd" "$(extract RW_HOT_UPD "$O")"
+    assert_eq "cold update via view" "1" "$(extract RW_COLD_UPD "$O")"
+    assert_eq "hot delete via view"  "0" "$(extract RW_HOT_DEL "$O")"
+    assert_eq "cold delete via view" "0" "$(extract RW_COLD_DEL "$O")"
+    assert_eq "dual update cleared all ok" "0" "$(extract DUAL_REMAINING_OK "$O")"
+    # Strict mode rejects an ambiguous predicate.
+    local e; e=$(q_may "$HOST" "SET coldfront.allow_mixed_writes=off; UPDATE events SET status='x' WHERE data->>'m'='nope';")
+    assert_err "strict mode rejects ambiguous predicate" "must include" "$e"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story 7 — Schema DDL. Column-shape changes are BLOCKED (duckdb-iceberg can't
+# ALTER an Iceberg table); RENAME TABLE/VIEW are supported (no Iceberg touch).
+# ───────────────────────────────────────────────────────────────────────────
+story_ddl() {
+    step "7. Schema DDL (column changes blocked; rename table/view supported)"
+    assert_err "ADD COLUMN blocked"     "cannot alter columns" "$(q_may "$HOST" "ALTER TABLE _events ADD COLUMN payload text;")"
+    assert_err "DROP COLUMN blocked"    "cannot alter columns" "$(q_may "$HOST" "ALTER TABLE _events DROP COLUMN status;")"
+    assert_err "ALTER TYPE blocked"     "cannot alter columns" "$(q_may "$HOST" "ALTER TABLE _events ALTER COLUMN id TYPE bigint;")"
+    assert_err "RENAME COLUMN blocked"  "cannot rename a column" "$(q_may "$HOST" "ALTER TABLE _events RENAME COLUMN status TO state;")"
+    # RENAME VIEW is supported and must migrate the watermark so the cold branch survives.
+    q "$HOST" "ALTER VIEW events RENAME TO events_v2;" >/dev/null
+    local cold; cold=$(q "$HOST" "SELECT count(*) FROM events_v2 WHERE ts < '2026-03-01';")
+    assert_gt "cold tier survives view rename" "0" "$cold"
+    q "$HOST" "ALTER VIEW events_v2 RENAME TO events;" >/dev/null
+    pass "view renamed back to events"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story 8 — Blocked operations.
+# ───────────────────────────────────────────────────────────────────────────
+story_blocks() {
+    step "8. DROP/TRUNCATE on a tiered relation are blocked"
+    assert_err "DROP TABLE blocked"  "cold tier" "$(q_may "$HOST" "DROP TABLE _events;")"
+    assert_err "DROP VIEW blocked"   "cold tier" "$(q_may "$HOST" "DROP VIEW events;")"
+    assert_err "TRUNCATE blocked"    "cold-tier" "$(q_may "$HOST" "TRUNCATE _events;")"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story 10 — Transactions: rollback undoes both tiers; archiver idempotent.
+# ───────────────────────────────────────────────────────────────────────────
+story_txn() {
+    step "10. Rollback undoes both tiers; archiver idempotent"
+    local O; O=$(qf "$HOST" <<'EOSQL'
+BEGIN;
+UPDATE events SET status='rollback_me' WHERE status='dual_upd';
+ROLLBACK;
+SELECT 'RB_TOTAL:' || count(*) FROM events WHERE status='rollback_me';
+EOSQL
+)
+    assert_eq "rollback undoes hot+cold" "0" "$(extract RB_TOTAL "$O")"
+    "$ARCHIVER" --config /tmp/journey-archiver.yaml >/tmp/journey-idem.log 2>&1 \
+        && assert_contains "archiver idempotent (re-run no-op)" "no expired" "$(cat /tmp/journey-idem.log)" \
+        || fail "archiver idempotent re-run errored"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story 11 — Coexistence: a second tiered table, no cross-talk.
+# ───────────────────────────────────────────────────────────────────────────
+story_coexist() {
+    step "11. Multiple tiered tables coexist"
+    local n; n=$(q "$HOST" "SELECT count(*) FROM coldfront.tiered_views;")
+    assert_gt "registry holds multiple tiered views (events + typed)" "1" "$n"
+}
+
+# Story 12 — mesh-only; built when the mesh cell is wired.
+story_mesh() { step "12. Mesh cross-node visibility + bakery"; fail "mesh stories not yet implemented (matrix step 3/mesh)"; }
+# Standby reads — built after the probe gate passes.
+story_standby_reads() { step "13. Standby reads"; fail "standby stories not yet implemented (matrix step 4)"; }
+
+# ── orchestrate ────────────────────────────────────────────────────────────
+story_setup
+if [ "$MODE" = "tiered" ]; then story_provision_tiered; else story_provision_decoupled; fi
+story_reads
+story_types
+story_writes
+story_ddl
+story_blocks
+story_txn
+story_coexist
+[ "$MESH" = 1 ]      && story_mesh
+[ -n "$STANDBY" ]    && story_standby_reads
+
+summary

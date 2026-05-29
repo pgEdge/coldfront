@@ -1,0 +1,61 @@
+-- Column-shape DDL on a tiered table is BLOCKED: duckdb-iceberg (pg_duckdb
+-- v1.1.1) implements no Iceberg ALTER TABLE, so the hot and cold tiers cannot
+-- be evolved together. ADD/DROP COLUMN, ALTER COLUMN TYPE, and RENAME COLUMN
+-- all error up front with an actionable hint (untier, alter, re-tier). The
+-- block fires on the subcommand type + registry match, before any Iceberg
+-- call, so warehouse='' is irrelevant. RENAME TABLE / RENAME VIEW are NOT
+-- blocked (they don't touch the Iceberg schema) — covered by ddl_rename_*.
+CREATE EXTENSION IF NOT EXISTS pg_duckdb;
+NOTICE:  extension "pg_duckdb" already exists, skipping
+CREATE EXTENSION IF NOT EXISTS coldfront;
+NOTICE:  extension "coldfront" already exists, skipping
+SET coldfront.warehouse = '';
+SET coldfront.lakekeeper_endpoint = '';
+SET coldfront.dblink_self = '';
+CREATE TABLE public._events (id int, ts timestamptz, status text);
+CREATE VIEW public.events AS SELECT * FROM public._events;
+INSERT INTO coldfront.tiered_views(view_oid, hot_table, iceberg_table, partition_col)
+VALUES ('public.events'::regclass, 'public._events', 'ice.default.events', 'ts');
+-- All four column-shape changes on the hot table are blocked.
+ALTER TABLE public._events ADD COLUMN payload text;
+ERROR:  coldfront: cannot alter columns of tiered table "public._events" — its cold tier in Iceberg cannot be altered
+HINT:  Blocked by design: duckdb-iceberg cannot ALTER an Iceberg table, so hot and cold tiers would diverge. To change the schema, untier the table (drain the cold tier back / re-provision), alter it, then re-tier.
+ALTER TABLE public._events DROP COLUMN status;
+ERROR:  coldfront: cannot alter columns of tiered table "public._events" — its cold tier in Iceberg cannot be altered
+HINT:  Blocked by design: duckdb-iceberg cannot ALTER an Iceberg table, so hot and cold tiers would diverge. To change the schema, untier the table (drain the cold tier back / re-provision), alter it, then re-tier.
+ALTER TABLE public._events ALTER COLUMN id TYPE bigint;
+ERROR:  coldfront: cannot alter columns of tiered table "public._events" — its cold tier in Iceberg cannot be altered
+HINT:  Blocked by design: duckdb-iceberg cannot ALTER an Iceberg table, so hot and cold tiers would diverge. To change the schema, untier the table (drain the cold tier back / re-provision), alter it, then re-tier.
+ALTER TABLE public._events RENAME COLUMN status TO state;
+ERROR:  coldfront: cannot rename a column of tiered relation "public._events" — its cold tier in Iceberg cannot be altered
+HINT:  Blocked by design: duckdb-iceberg cannot rename an Iceberg column. Untier, rename, then re-tier.
+-- The hot table is unchanged (every block aborted its ALTER).
+SELECT attname FROM pg_attribute
+ WHERE attrelid = 'public._events'::regclass AND attnum > 0 AND NOT attisdropped
+ ORDER BY attnum;
+ attname 
+---------
+ id
+ ts
+ status
+(3 rows)
+
+-- A non-tiered table's columns alter normally (control).
+CREATE TABLE public.plain (id int, val text);
+ALTER TABLE public.plain ADD COLUMN extra int;
+ALTER TABLE public.plain DROP COLUMN val;
+SELECT attname FROM pg_attribute
+ WHERE attrelid = 'public.plain'::regclass AND attnum > 0 AND NOT attisdropped
+ ORDER BY attnum;
+ attname 
+---------
+ id
+ extra
+(2 rows)
+
+DROP TABLE public.plain;
+-- Cleanup. Unregister before dropping: the DDL hook blocks DROP of a
+-- registered tiered table/view.
+DELETE FROM coldfront.tiered_views;
+DROP VIEW public.events;
+DROP TABLE public._events;

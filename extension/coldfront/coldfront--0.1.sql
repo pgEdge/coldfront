@@ -790,7 +790,9 @@ BEGIN
     -- Numeric / boolean
     IF t IN ('bigint', 'int8')             THEN RETURN 'BIGINT';   END IF;
     IF t IN ('integer', 'int', 'int4')     THEN RETURN 'INTEGER';  END IF;
-    IF t IN ('smallint', 'int2')           THEN RETURN 'SMALLINT'; END IF;
+    -- Iceberg has no 16-bit integer; widen smallint to INTEGER (lossless,
+    -- same principle as oid → BIGINT). duckdb-iceberg rejects SMALLINT outright.
+    IF t IN ('smallint', 'int2')           THEN RETURN 'INTEGER';  END IF;
     IF t IN ('real', 'float4')             THEN RETURN 'REAL';     END IF;
     IF t IN ('double precision', 'float8') THEN RETURN 'DOUBLE';   END IF;
     IF t IN ('boolean', 'bool')            THEN RETURN 'BOOLEAN';  END IF;
@@ -830,11 +832,15 @@ CREATE OR REPLACE FUNCTION coldfront._iceberg_view_cast_type(p_pg_type text)
 RETURNS text
 LANGUAGE sql IMMUTABLE STRICT AS $$
     SELECT CASE lower(trim(p_pg_type))
-        WHEN 'jsonb'    THEN 'json'      -- DuckDB has no jsonb, surface as json
-        WHEN 'json'     THEN 'json'
-        WHEN 'interval' THEN 'interval'
-        WHEN 'inet'     THEN 'inet'
-        WHEN 'cidr'     THEN 'inet'
+        WHEN 'jsonb'            THEN 'json'      -- DuckDB has no jsonb, surface as json
+        WHEN 'json'             THEN 'json'
+        WHEN 'interval'         THEN 'interval'
+        WHEN 'inet'             THEN 'inet'
+        WHEN 'cidr'             THEN 'inet'
+        -- PG has no bare "double" type, so the view's cold cast r['col']::DOUBLE
+        -- (the Iceberg storage name) won't parse. Surface via "double precision".
+        WHEN 'double precision' THEN 'double precision'
+        WHEN 'float8'           THEN 'double precision'
         ELSE ''
     END;
 $$;
@@ -908,8 +914,12 @@ BEGIN
 
         iceberg_cols := iceberg_cols || quote_ident(col_name) || ' ' || storage_type;
 
-        -- View projection: r['col']::<surface-type> AS col
-        IF cast_type <> '' THEN
+        -- View projection: r['col']::<surface-type> AS col. inet/cidr are
+        -- VARCHAR-backed and pg_duckdb can't cast its struct-field type
+        -- straight to inet, so resolve to text first (r['col']::text::inet).
+        IF cast_type = 'inet' THEN
+            view_proj := view_proj || format('r[%L]::text::%s AS %I', col_name, cast_type, col_name);
+        ELSIF cast_type <> '' THEN
             view_proj := view_proj || format('r[%L]::%s AS %I', col_name, cast_type, col_name);
         ELSE
             view_proj := view_proj || format('r[%L]::%s AS %I', col_name, pg_type, col_name);
@@ -1553,111 +1563,23 @@ $$;
 -- DDL synchronization for tiered tables.
 --
 -- The coldfront C extension's ProcessUtility_hook intercepts DDL on a
--- registered tiered table's HOT heap (ALTER TABLE ADD/DROP/ALTER COLUMN,
--- RENAME COLUMN, RENAME TABLE) and DROP/TRUNCATE on either the hot table or
--- the transparent view. The hook:
+-- registered tiered table's HOT heap / transparent view. The hook:
 --   1. resolves the DDL target's OID and matches it against the registry
 --      (by resolving tiered_views.hot_table / the view to OIDs — never by
 --      string match, so it is schema-agnostic);
---   2. blocks DROP TABLE / DROP VIEW / TRUNCATE with an actionable error;
---   3. for schema/rename DDL: lets the real PG DDL run, mirrors the
---      equivalent change to the Iceberg table (only when a warehouse is
---      configured), updates the registry for renames, and rebuilds the
---      transparent view + INSERT trigger from the post-DDL catalog state.
+--   2. BLOCKS, with an actionable error: DROP TABLE / DROP VIEW / TRUNCATE
+--      (would orphan/hide the cold tier) and any column-shape change —
+--      ADD/DROP COLUMN, ALTER COLUMN TYPE, RENAME COLUMN. Column DDL is
+--      blocked because duckdb-iceberg (pg_duckdb v1.1.1) implements no Iceberg
+--      ALTER TABLE, so the hot and cold tiers cannot be evolved together;
+--   3. SUPPORTS RENAME TABLE (hot heap) and RENAME VIEW — neither touches the
+--      Iceberg schema. It updates the registry and rebuilds the transparent
+--      view + INSERT trigger from the current catalog state.
 --
 -- The helpers below are the SQL side of that hook. They are driven entirely
--- from pg_catalog (post-DDL column list), so they never assume a schema name
--- and never hardcode a column list. No plpgsql EXCEPTION blocks — pg_duckdb
--- hard-rejects subtransactions.
+-- from pg_catalog, so they never assume a schema name and never hardcode a
+-- column list. No plpgsql EXCEPTION blocks — pg_duckdb hard-rejects subtxns.
 -- ============================================================================
-
--- Mirror a single-column schema change to the Iceberg table. The post-DDL
--- column type is read from the HOT table's pg_attribute by name (so typmods
--- like varchar(n)/numeric(p,s) survive) and mapped to the Iceberg storage
--- type via the existing _iceberg_storage_type(). p_op is 'ADD', 'DROP', or
--- 'ALTER_TYPE'; p_rename_to is set only for a column rename (p_op='RENAME').
---
--- No-op when coldfront.warehouse is empty (single-node / pg_regress): there
--- is no catalog to mirror to, and ensure_attached() would be a no-op anyway.
--- When a warehouse IS set, the Iceberg ALTER goes through the bakery so a
--- concurrent writer's commit POST can't race the schema change. The release is
--- enqueued right after the claim (before the error-prone raw_query) so an
--- Iceberg-ALTER failure can't orphan the claim; the C XactCallback does the
--- actual release at xact end on both commit and abort.
-CREATE FUNCTION coldfront._mirror_iceberg_column_ddl(
-    p_iceberg_table text,
-    p_hot_table     text,
-    p_op            text,
-    p_col           text,
-    p_rename_to     text DEFAULT NULL
-) RETURNS void LANGUAGE plpgsql AS $$
-DECLARE
-    wh           text := current_setting('coldfront.warehouse', true);
-    v_hot_schema text;
-    v_hot_rel    text;
-    v_pg_type    text;
-    v_storage    text;
-    v_fragment   text;
-    my_ticket    bigint;
-BEGIN
-    -- Skip the Iceberg side entirely when no warehouse is configured. The
-    -- PG-side view rebuild (done by the hook's _rebuild_tiered_view call)
-    -- still happens; only the cold-tier mirror is conditional.
-    IF wh IS NULL OR wh = '' THEN
-        RETURN;
-    END IF;
-
-    v_hot_schema := (parse_ident(p_hot_table))[1];
-    v_hot_rel    := (parse_ident(p_hot_table))[2];
-
-    IF p_op = 'ADD' OR p_op = 'ALTER_TYPE' THEN
-        -- Read the post-DDL canonical type from the catalog (the real ALTER
-        -- already ran), preserving typmod, then map to Iceberg storage.
-        SELECT format_type(a.atttypid, a.atttypmod)
-          INTO v_pg_type
-          FROM pg_attribute a
-          JOIN pg_class c     ON c.oid = a.attrelid
-          JOIN pg_namespace n ON n.oid = c.relnamespace
-         WHERE n.nspname = v_hot_schema AND c.relname = v_hot_rel
-           AND a.attname = p_col AND a.attnum > 0 AND NOT a.attisdropped;
-        IF v_pg_type IS NULL THEN
-            RAISE EXCEPTION 'coldfront._mirror_iceberg_column_ddl: column % not found on %.% after DDL',
-                p_col, v_hot_schema, v_hot_rel;
-        END IF;
-        v_storage := coldfront._iceberg_storage_type(v_pg_type);
-        IF p_op = 'ADD' THEN
-            v_fragment := format('ADD COLUMN %I %s', p_col, v_storage);
-        ELSE
-            v_fragment := format('ALTER COLUMN %I TYPE %s', p_col, v_storage);
-        END IF;
-    ELSIF p_op = 'DROP' THEN
-        v_fragment := format('DROP COLUMN %I', p_col);
-    ELSIF p_op = 'RENAME' THEN
-        v_fragment := format('RENAME COLUMN %I TO %I', p_col, p_rename_to);
-    ELSE
-        RAISE EXCEPTION 'coldfront._mirror_iceberg_column_ddl: unknown op %', p_op;
-    END IF;
-
-    PERFORM coldfront.ensure_attached();
-
-    -- Real PG DDL (a write) already ran in this xact; the Iceberg ALTER is a
-    -- DuckDB write. Relax pg_duckdb's mixed-write guard for this statement.
-    SET LOCAL duckdb.unsafe_allow_mixed_transactions = on;
-
-    -- Serialise the schema change against concurrent committers on this
-    -- iceberg table. Claim, then enqueue the release IMMEDIATELY (before the
-    -- failure-prone raw_query). _enqueue_release only appends the ticket to an
-    -- in-memory list; the actual DELETE still fires in the C XactCallback at
-    -- xact end (after pg_duckdb's commit POST, on BOTH commit and abort). If
-    -- the Iceberg ALTER below raises, the ticket is already queued, so the
-    -- abort-path XactCallback releases it — no orphaned claim wedging the
-    -- bakery. (Unlike _exec_iceberg_with_claim, the raw_query here is the
-    -- error-prone step, so enqueue must precede it, not follow it.)
-    my_ticket := coldfront._claim_iceberg_lock(p_iceberg_table);
-    PERFORM coldfront._enqueue_release(my_ticket);
-    PERFORM duckdb.raw_query(format('ALTER TABLE %s %s', p_iceberg_table, v_fragment));
-END;
-$$;
 
 -- Update the registry's hot_table after an ALTER TABLE ... RENAME of the hot
 -- heap. p_new_hot_table is the new quoted qualified name (built by the C hook
@@ -1668,16 +1590,6 @@ CREATE FUNCTION coldfront._update_tiered_hot_table(
 ) RETURNS void LANGUAGE sql AS $$
     UPDATE coldfront.tiered_views
        SET hot_table = p_new_hot_table
-     WHERE view_oid = p_view_oid;
-$$;
-
--- Update the registry's partition_col after RENAME COLUMN renamed the
--- partition column. Keyed on view_oid.
-CREATE FUNCTION coldfront._update_tiered_partition_col(
-    p_view_oid oid, p_new_partition_col text
-) RETURNS void LANGUAGE sql AS $$
-    UPDATE coldfront.tiered_views
-       SET partition_col = p_new_partition_col
      WHERE view_oid = p_view_oid;
 $$;
 
@@ -1697,42 +1609,12 @@ CREATE FUNCTION coldfront._rename_watermark(
      WHERE table_name = p_old_view_name;
 $$;
 
--- coldfront._predrop_tiered_view: drop the transparent view (and its INSTEAD
--- OF trigger, which goes with it) BEFORE the hot table's DROP COLUMN / ALTER
--- COLUMN TYPE runs. Those DDLs are refused by PG while a view depends on the
--- column ("cannot drop column ... because view ... depends on it"). The DDL
--- hook calls this pre-DDL for column drop/type-change, then runs the real
--- ALTER, then _rebuild_tiered_view re-creates the view from the new catalog
--- state. The registry row is left intact (still keyed on the OLD view_oid);
--- _rebuild_tiered_view re-points it to the freshly-created view's OID.
--- SET client_min_messages = warning (function attribute) quiets the
--- "view ... does not exist, skipping" NOTICE from the idempotent DROP IF
--- EXISTS; PG saves/restores the GUC around the call automatically.
-CREATE FUNCTION coldfront._predrop_tiered_view(p_view_oid oid)
-RETURNS void LANGUAGE plpgsql
-SET client_min_messages = warning AS $$
-DECLARE
-    v_schema    text;
-    v_view_name text;
-BEGIN
-    SELECT n.nspname, c.relname
-      INTO v_schema, v_view_name
-      FROM coldfront.tiered_views tv
-      JOIN pg_class c     ON c.oid = tv.view_oid
-      JOIN pg_namespace n ON n.oid = c.relnamespace
-     WHERE tv.view_oid = p_view_oid;
-    IF NOT FOUND THEN
-        RETURN;
-    END IF;
-    EXECUTE format('DROP VIEW IF EXISTS %I.%I CASCADE', v_schema, v_view_name);
-END;
-$$;
-
 -- coldfront._rebuild_tiered_view: regenerate the transparent UNION-ALL view
--- and its INSTEAD OF INSERT trigger after a schema DDL changed the hot
--- table's columns. Driven entirely from pg_catalog (post-DDL column list) so
--- it is the runtime equivalent of internal/view/view.go's GenerateViewSQL /
--- GenerateTriggerFuncSQL / GenerateTriggerSQL.
+-- and its INSTEAD OF INSERT trigger after a RENAME TABLE (hot heap) or RENAME
+-- VIEW. Driven entirely from pg_catalog so it is the runtime equivalent of
+-- internal/view/view.go's GenerateViewSQL / GenerateTriggerFuncSQL /
+-- GenerateTriggerSQL. (Column-shape DDL is blocked by the hook, so the view's
+-- column SET never changes here — only the hot-table name or the view name.)
 --
 -- Called by the coldfront DDL hook for tiered views (rows with a non-NULL
 -- hot_table). Iceberg-only views (is_iceberg_only = true, hot_table NULL) are
@@ -1860,7 +1742,12 @@ BEGIN
             v_cold_proj := v_cold_proj || ', ';
         END IF;
 
-        IF cast_type <> '' THEN
+        IF cast_type = 'inet' THEN
+            -- inet/cidr: VARCHAR-backed; pg_duckdb can't cast its struct-field
+            -- type straight to inet, so resolve to text first.
+            v_hot_proj  := v_hot_proj  || quote_ident(r.attname) || '::' || cast_type;
+            v_cold_proj := v_cold_proj || format('r[%L]::text::%s', r.attname, cast_type);
+        ELSIF cast_type <> '' THEN
             v_hot_proj  := v_hot_proj  || quote_ident(r.attname) || '::' || cast_type;
             v_cold_proj := v_cold_proj || format('r[%L]::%s', r.attname, cast_type);
         ELSE

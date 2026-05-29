@@ -42,7 +42,6 @@
 #include "nodes/parsenodes.h"
 #include "nodes/pg_list.h"
 #include "parser/analyze.h"
-#include "replication/logicalworker.h"
 #include "tcop/tcopprot.h"
 #include "tcop/utility.h"
 #include "utils/builtins.h"
@@ -1697,67 +1696,17 @@ spi_exec_void(const char *sql)
     }
 }
 
-/* Mirror one column DDL to Iceberg + (caller separately) rebuild the view. */
-static void
-mirror_column_ddl(const TieredDDLInfo *info, const char *op,
-                  const char *col, const char *rename_to)
-{
-    StringInfoData sql;
-    initStringInfo(&sql);
-    if (rename_to != NULL)
-        appendStringInfo(&sql,
-            "SELECT coldfront._mirror_iceberg_column_ddl(%s, %s, %s, %s, %s)",
-            quote_literal_cstr(info->iceberg_table),
-            quote_literal_cstr(info->hot_table),
-            quote_literal_cstr(op),
-            quote_literal_cstr(col),
-            quote_literal_cstr(rename_to));
-    else
-        appendStringInfo(&sql,
-            "SELECT coldfront._mirror_iceberg_column_ddl(%s, %s, %s, %s, NULL)",
-            quote_literal_cstr(info->iceberg_table),
-            quote_literal_cstr(info->hot_table),
-            quote_literal_cstr(op),
-            quote_literal_cstr(col));
-    spi_exec_void(sql.data);
-    pfree(sql.data);
-}
-
-/* Rebuild the transparent view + INSERT trigger from post-DDL catalog state.
- * view_oid still resolves (rename / add-column path). */
+/* Rebuild the transparent view + INSERT trigger from current catalog state.
+ * Used after a hot-table RENAME or a view RENAME (neither touches the Iceberg
+ * schema — only the PG-side view/registry). Column-shape DDL is BLOCKED (the
+ * cold tier can't be ALTERed on duckdb-iceberg v1.1.1), so there is no
+ * post-column-change rebuild path. */
 static void
 rebuild_tiered_view(Oid view_oid)
 {
     StringInfoData sql;
     initStringInfo(&sql);
     appendStringInfo(&sql, "SELECT coldfront._rebuild_tiered_view(%u)", view_oid);
-    spi_exec_void(sql.data);
-    pfree(sql.data);
-}
-
-/* Rebuild when the view was pre-dropped (DROP/ALTER-TYPE column path): the
- * old view_oid is dead, so pass the saved schema + view name explicitly. */
-static void
-rebuild_tiered_view_named(Oid view_oid, const char *schema, const char *vname)
-{
-    StringInfoData sql;
-    initStringInfo(&sql);
-    appendStringInfo(&sql,
-        "SELECT coldfront._rebuild_tiered_view(%u, %s, %s)",
-        view_oid, quote_literal_cstr(schema), quote_literal_cstr(vname));
-    spi_exec_void(sql.data);
-    pfree(sql.data);
-}
-
-/* Drop the transparent view BEFORE a hot-table DROP/ALTER-TYPE column, so the
- * view dependency doesn't block the real ALTER. Keyed on the (still-live) old
- * view_oid; the registry row is left intact for rebuild_tiered_view_named(). */
-static void
-predrop_tiered_view(Oid view_oid)
-{
-    StringInfoData sql;
-    initStringInfo(&sql);
-    appendStringInfo(&sql, "SELECT coldfront._predrop_tiered_view(%u)", view_oid);
     spi_exec_void(sql.data);
     pfree(sql.data);
 }
@@ -1771,19 +1720,6 @@ update_hot_table(Oid view_oid, const char *new_hot_quoted)
     appendStringInfo(&sql,
         "SELECT coldfront._update_tiered_hot_table(%u, %s)",
         view_oid, quote_literal_cstr(new_hot_quoted));
-    spi_exec_void(sql.data);
-    pfree(sql.data);
-}
-
-/* Update registry partition_col after the partition column was renamed. */
-static void
-update_partition_col(Oid view_oid, const char *new_partcol)
-{
-    StringInfoData sql;
-    initStringInfo(&sql);
-    appendStringInfo(&sql,
-        "SELECT coldfront._update_tiered_partition_col(%u, %s)",
-        view_oid, quote_literal_cstr(new_partcol));
     spi_exec_void(sql.data);
     pfree(sql.data);
 }
@@ -1827,8 +1763,7 @@ coldfront_process_utility(PlannedStmt *pstmt, const char *queryString,
                           ParamListInfo params, QueryEnvironment *queryEnv,
                           DestReceiver *dest, QueryCompletion *qc)
 {
-    Node *stmt     = pstmt->utilityStmt;
-    bool  is_apply = IsLogicalWorker();
+    Node *stmt = pstmt->utilityStmt;
 
 #define COLDFRONT_CALL_THROUGH() \
     do { \
@@ -1841,21 +1776,16 @@ coldfront_process_utility(PlannedStmt *pstmt, const char *queryString,
     } while (0)
 
     /*
-     * Spock apply worker. When spock.enable_ddl_replication is on, Spock
-     * replicates ONLY the top-level ALTER TABLE (not our SPI-issued view
-     * rebuild — that runs at PROCESS_UTILITY_QUERY context, which Spock's
-     * autoddl_can_proceed() filters out). So a peer receives the ALTER TABLE
-     * and re-issues it through spock.queue, landing here with
-     * IsLogicalWorker() == true.
-     *
-     * The peer MUST still rebuild its OWN local view + re-point its OWN local
-     * registry (view_oid is a LOCAL oid; the registry is not Spock-replicated),
-     * and must still block DROP/TRUNCATE locally. But it must NOT mirror the
-     * schema change to Iceberg again — the originator already did that to the
-     * shared Lakekeeper catalog; a second mirror would double-apply / contend
-     * on the bakery against a remote-held claim. So we do not pass through
-     * blindly here; instead we carry is_apply down and skip only the Iceberg
-     * mirror when on the apply worker.
+     * No special-casing of the Spock apply worker is needed. The only DDL the
+     * hook still ACTS on for a tiered table is DROP/TRUNCATE (blocked — never
+     * replicated, since they error on the originator), column DDL (blocked —
+     * likewise), and RENAME TABLE/VIEW. A RENAME replicates as a top-level
+     * statement; when a peer's apply worker re-issues it, the hook runs the
+     * peer's LOCAL registry update + view rebuild — which is exactly right,
+     * because the registry/view are per-node (not Spock-replicated). There is
+     * no Iceberg mirror anymore, so nothing to skip on the apply path. The
+     * SPI-issued rebuild DDL runs at non-top-level context, which Spock filters
+     * out, so it never re-replicates.
      */
 
     /* Re-entrant SPI-issued DDL (our own CREATE VIEW/TRIGGER): no coldfront
@@ -1933,16 +1863,20 @@ coldfront_process_utility(PlannedStmt *pstmt, const char *queryString,
         return;
     }
 
-    /* ---- ALTER TABLE: mirror ADD/DROP/ALTER COLUMN, rebuild view. ---- */
+    /* ---- ALTER TABLE: BLOCK column-shape changes on a tiered table. ----
+     *
+     * duckdb-iceberg (pg_duckdb v1.1.1) implements no Iceberg ALTER TABLE
+     * ("Not implemented: Alter Schema Entry"), so the cold tier's schema can't
+     * be evolved in place. Rather than mirror-then-fail (aborting the user's
+     * ALTER with an opaque error), we block ADD/DROP COLUMN and ALTER COLUMN
+     * TYPE up front with an actionable message. Every OTHER ALTER subtype —
+     * DETACH/ATTACH PARTITION (the archiver's own cutover machinery), storage
+     * params, SET STATISTICS — passes straight through untouched. */
     if (IsA(stmt, AlterTableStmt))
     {
         AlterTableStmt *at    = (AlterTableStmt *) stmt;
         Oid             relid = RangeVarGetRelid(at->relation, NoLock, true);
         TieredDDLInfo   info;
-        bool            need_predrop = false;
-        bool            has_column_change = false;
-        char           *view_schema = NULL;
-        char           *view_name   = NULL;
         ListCell       *lc;
 
         if (!lookup_tiered_by_hot_oid(relid, &info))
@@ -1950,103 +1884,28 @@ coldfront_process_utility(PlannedStmt *pstmt, const char *queryString,
             COLDFRONT_CALL_THROUGH();
             return;
         }
-
-        /* Classify the subcommands. Only column-shape changes (ADD/DROP COLUMN,
-         * ALTER COLUMN TYPE) concern coldfront — those are what must mirror to
-         * Iceberg and rebuild the view. DROP COLUMN / ALTER COLUMN TYPE also
-         * need the view pre-dropped (PG refuses them while the view depends on
-         * the column).
-         *
-         * Every OTHER ALTER subtype passes straight through untouched — most
-         * importantly ALTER TABLE ... DETACH/ATTACH PARTITION, which is the
-         * archiver's OWN cutover machinery (cutover_archive), plus storage
-         * params, SET STATISTICS, etc. The archiver already recreates the view
-         * itself at cutover; a coldfront rebuild here would be redundant and
-         * would bloat the archiver's ACCESS EXCLUSIVE lock window every cycle. */
         foreach(lc, at->cmds)
         {
             AlterTableCmd *cmd = (AlterTableCmd *) lfirst(lc);
             if (cmd->subtype == AT_AddColumn ||
                 cmd->subtype == AT_DropColumn ||
                 cmd->subtype == AT_AlterColumnType)
-                has_column_change = true;
-            if (cmd->subtype == AT_DropColumn ||
-                cmd->subtype == AT_AlterColumnType)
-                need_predrop = true;
-        }
-
-        if (!has_column_change)
-        {
-            /* Partition management / storage params / etc. — not coldfront's
-             * business. Pass through (this is the archiver's DETACH path). */
-            COLDFRONT_CALL_THROUGH();
-            return;
-        }
-
-        /* Capture the view identity while view_oid is still live, then drop
-         * the view so the ALTER isn't blocked by the dependency. Guard
-         * re-entry — predrop/rebuild issue DROP/CREATE VIEW via SPI. */
-        if (need_predrop)
-        {
-            view_schema = pstrdup(get_namespace_name(get_rel_namespace(info.view_oid)));
-            view_name   = pstrdup(get_rel_name(info.view_oid));
-            coldfront_in_utility = true;
-            PG_TRY();
             {
-                predrop_tiered_view(info.view_oid);
+                char *ns   = get_namespace_name(get_rel_namespace(relid));
+                char *name = get_rel_name(relid);
+                ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("coldfront: cannot alter columns of tiered table \"%s.%s\" — its cold tier in Iceberg cannot be altered",
+                            ns, name),
+                     errhint("Blocked by design: duckdb-iceberg cannot ALTER an Iceberg table, "
+                             "so hot and cold tiers would diverge. To change the schema, untier "
+                             "the table (drain the cold tier back / re-provision), alter it, then "
+                             "re-tier.")));
             }
-            PG_FINALLY();
-            {
-                coldfront_in_utility = false;
-            }
-            PG_END_TRY();
         }
-
-        /* Run the real DDL (only mirror what PG accepted). */
+        /* No column-shape change → partition management / storage params /
+         * the archiver's DETACH. Not coldfront's business. */
         COLDFRONT_CALL_THROUGH();
-
-        coldfront_in_utility = true;
-        PG_TRY();
-        {
-            /* Iceberg mirror: originator only. The apply worker's originator
-             * already mirrored to the shared Lakekeeper catalog. */
-            if (!is_apply)
-            {
-                foreach(lc, at->cmds)
-                {
-                    AlterTableCmd *cmd = (AlterTableCmd *) lfirst(lc);
-                    switch (cmd->subtype)
-                    {
-                    case AT_AddColumn:
-                    {
-                        ColumnDef *def = (ColumnDef *) cmd->def;
-                        mirror_column_ddl(&info, "ADD", def->colname, NULL);
-                        break;
-                    }
-                    case AT_DropColumn:
-                        mirror_column_ddl(&info, "DROP", cmd->name, NULL);
-                        break;
-                    case AT_AlterColumnType:
-                        mirror_column_ddl(&info, "ALTER_TYPE", cmd->name, NULL);
-                        break;
-                    default:
-                        break;
-                    }
-                }
-            }
-            /* View rebuild: every node, always — view_oid is local and the
-             * registry is not Spock-replicated. If we pre-dropped, the old
-             * view_oid is dead, so pass the saved schema + name. */
-            if (need_predrop)
-                rebuild_tiered_view_named(info.view_oid, view_schema, view_name);
-            else
-                rebuild_tiered_view(info.view_oid);
-        }
-        PG_FINALLY();
-        {
-            coldfront_in_utility = false;
-        }
-        PG_END_TRY();
         return;
     }
 
@@ -2109,6 +1968,23 @@ coldfront_process_utility(PlannedStmt *pstmt, const char *queryString,
             return;
         }
 
+        /* RENAME COLUMN is BLOCKED on a tiered table: it would require renaming
+         * the column in the Iceberg cold tier too, which duckdb-iceberg cannot
+         * do. RENAME TABLE (hot heap) and RENAME VIEW touch only the PG side
+         * (registry + view), never the Iceberg schema, so they are supported. */
+        if (rs->renameType == OBJECT_COLUMN)
+        {
+            Oid   r    = OidIsValid(hot_relid) ? hot_relid : view_relid;
+            char *ns   = get_namespace_name(get_rel_namespace(r));
+            char *name = get_rel_name(r);
+            ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("coldfront: cannot rename a column of tiered relation \"%s.%s\" — its cold tier in Iceberg cannot be altered",
+                        ns, name),
+                 errhint("Blocked by design: duckdb-iceberg cannot rename an Iceberg column. "
+                         "Untier, rename, then re-tier.")));
+        }
+
         /* For a VIEW rename, capture the OLD view name NOW (before the rename
          * executes) so we can migrate the name-keyed archive_watermark row. */
         if (rs->renameType == OBJECT_VIEW && OidIsValid(view_relid))
@@ -2119,20 +1995,7 @@ coldfront_process_utility(PlannedStmt *pstmt, const char *queryString,
         coldfront_in_utility = true;
         PG_TRY();
         {
-            if (rs->renameType == OBJECT_COLUMN)
-            {
-                /* Mirror the column rename to Iceberg (originator only), and if
-                 * the partition column was renamed, update the registry BEFORE
-                 * the rebuild (which reads partition_col for the WHERE clauses).
-                 * The registry update + rebuild run on every node. */
-                if (!is_apply)
-                    mirror_column_ddl(&info, "RENAME", rs->subname, rs->newname);
-                if (info.partition_col != NULL &&
-                    strcmp(info.partition_col, rs->subname) == 0)
-                    update_partition_col(info.view_oid, rs->newname);
-                rebuild_tiered_view(info.view_oid);
-            }
-            else if (rs->renameType == OBJECT_TABLE && OidIsValid(hot_relid))
+            if (rs->renameType == OBJECT_TABLE && OidIsValid(hot_relid))
             {
                 /* Hot heap renamed: registry hot_table follows (resolve the
                  * post-rename quoted qualified name), then rebuild. */

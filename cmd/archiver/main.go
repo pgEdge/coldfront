@@ -383,7 +383,7 @@ func archivePartition(ctx context.Context, pool *pgxpool.Pool, t *config.TableCo
 
 	// Phase 2
 	t0 = time.Now()
-	snapshotStr, err := bulkExportWithSnapshot(ctx, pool, t, part.Name, iceTable)
+	snapshotStr, err := bulkExportWithSnapshot(ctx, pool, t, part.Name, iceTable, columns)
 	if err != nil {
 		return fmt.Errorf("phase 2 (bulk export): %w", err)
 	}
@@ -505,7 +505,43 @@ func wipeIcebergRange(ctx context.Context, pool *pgxpool.Pool, iceTable, partCol
 // in S" → replayed. The replay is idempotent (DELETE+INSERT keyed on PK), so
 // the duplicate work is correct, just wasted. For typical workloads this
 // window is sub-millisecond.
-func bulkExportWithSnapshot(ctx context.Context, pool *pgxpool.Pool, t *config.TableConfig, partName, iceTable string) (string, error) {
+// stageSelectList builds the SELECT projection for the bulk export, casting
+// VARCHAR-backed columns (those with a ViewCastType — jsonb/interval/inet/cidr)
+// to ::text so pg_duckdb's PG reader can scan them (it rejects e.g. inet
+// natively). All other columns are projected as-is. The cast value lands as
+// VARCHAR in Iceberg and the transparent view casts it back on read.
+func stageSelectList(columns []view.Column) string {
+	if len(columns) == 0 {
+		return "*"
+	}
+	parts := make([]string, len(columns))
+	for i, c := range columns {
+		id := pgx.Identifier{c.Name}.Sanitize()
+		if c.ViewCastType != "" {
+			parts[i] = id + "::text AS " + id
+		} else {
+			parts[i] = id
+		}
+	}
+	return strings.Join(parts, ", ")
+}
+
+// needsPGTextStage reports whether the column set contains a type pg_duckdb's
+// PG reader cannot scan, requiring a PostgreSQL-side text-cast staging table
+// before the DuckDB stage. inet/cidr (ViewCastType "inet") are the known
+// offenders; jsonb (ViewCastType "json") scans fine, so it does NOT trigger the
+// detour. interval is included defensively (Iceberg-VARCHAR-backed, and not
+// worth a separate scan probe).
+func needsPGTextStage(columns []view.Column) bool {
+	for _, c := range columns {
+		if c.ViewCastType == "inet" || c.ViewCastType == "interval" {
+			return true
+		}
+	}
+	return false
+}
+
+func bulkExportWithSnapshot(ctx context.Context, pool *pgxpool.Pool, t *config.TableConfig, partName, iceTable string, columns []view.Column) (string, error) {
 	conn, err := pool.Acquire(ctx)
 	if err != nil {
 		return "", fmt.Errorf("acquire conn: %w", err)
@@ -517,9 +553,28 @@ func bulkExportWithSnapshot(ctx context.Context, pool *pgxpool.Pool, t *config.T
 		return "", fmt.Errorf("capture snapshot: %w", err)
 	}
 
+	// Stage the partition into a DuckDB-backed temp table for the Iceberg
+	// write. Some PG types pg_duckdb's reader cannot scan at all (notably inet
+	// /cidr, Oid=869) — and casting them ::text inside a `USING duckdb AS
+	// SELECT` doesn't help, because pg_duckdb plans (and rejects) the inet scan
+	// before any cast runs. So when such a column is present, PostgreSQL (not
+	// pg_duckdb) first materialises a text-cast copy in a plain temp table; then
+	// pg_duckdb scans that text-only table. The value lands as VARCHAR in
+	// Iceberg and the transparent view casts it back (r['col']::inet) on read.
+	// jsonb-only / plain tables skip the detour (single copy, fast path).
+	src := pgx.Identifier{t.SourceSchema, partName}.Sanitize()
+	if needsPGTextStage(columns) {
+		pgStageSQL := fmt.Sprintf(
+			"CREATE TEMP TABLE cf_pgstage AS SELECT %s FROM %s",
+			stageSelectList(columns), src)
+		if _, err := conn.Exec(ctx, pgStageSQL); err != nil {
+			return "", fmt.Errorf("pg text-stage: %w", err)
+		}
+		defer func() { _, _ = conn.Exec(ctx, "DROP TABLE IF EXISTS cf_pgstage") }()
+		src = "cf_pgstage"
+	}
 	stageSQL := fmt.Sprintf(
-		"CREATE TEMP TABLE duck_stage USING duckdb AS SELECT * FROM %s",
-		pgx.Identifier{t.SourceSchema, partName}.Sanitize())
+		"CREATE TEMP TABLE duck_stage USING duckdb AS SELECT * FROM %s", src)
 	if _, err := conn.Exec(ctx, stageSQL); err != nil {
 		return "", fmt.Errorf("stage: %w", err)
 	}
@@ -614,11 +669,18 @@ func pgFormatTypeToDuckDB(s string) (storage, viewCastType string, err error) {
 	case "integer":
 		return "INTEGER", "", nil
 	case "smallint":
-		return "SMALLINT", "", nil
+		// Iceberg has no 16-bit integer; widen to INTEGER (lossless, same as
+		// oid → BIGINT). duckdb-iceberg rejects SMALLINT at CREATE TABLE.
+		return "INTEGER", "", nil
 	case "real":
 		return "REAL", "", nil
 	case "double precision":
-		return "DOUBLE", "", nil
+		// Iceberg/DuckDB storage is DOUBLE, but PG has no bare type named
+		// "double" (it's a shell type), so the transparent view's cold cast
+		// r['col']::DOUBLE fails to PARSE when CREATE VIEW validates the body.
+		// Surface via the PG-spelled "double precision" cast (pg_duckdb maps it
+		// back to DOUBLE); both branches then parse and unify.
+		return "DOUBLE", "double precision", nil
 	case "boolean":
 		return "BOOLEAN", "", nil
 
