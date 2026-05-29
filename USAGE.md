@@ -106,11 +106,13 @@ SELECT status FROM events WHERE id = 1;     -- back to whatever it was
 
 ## Supported column types
 
-`bigint` · `integer` · `smallint` · `real` · `double precision` · `boolean` · `timestamp with time zone` · `timestamp without time zone` · `date` · `time without time zone` · `uuid` · `text` · `varchar(N)` · `char(N)` · `bytea` · `oid` · `numeric(P,S)` (P ≤ 38) · `jsonb` / `json` · `interval` · `inet` · `cidr`
+`bigint` · `integer` · `smallint` · `real` · `double precision` · `boolean` · `timestamp with time zone` · `timestamp without time zone` · `date` · `time without time zone` · `uuid` · `text` · `varchar(N)` · `char(N)` · `bytea` · `oid` · `numeric(P,S)` (P ≤ 38) · `jsonb` / `json` · `interval`
 
 Anything else (unbounded `numeric`, `xml`, `tsvector`, range/multirange types, custom enums, arrays, composite types) is rejected at table-creation time. We refuse silent fallback to `varchar` — losing precision/identity is worse than no support.
 
-`jsonb`, `interval`, `inet`/`cidr` are stored as `varchar` in Iceberg (no native primitive) and view-cast back to the rich PG type on read. Queries like `data->>'key'` work; jsonb-only operators (`?`, `@>`) need an explicit `data::jsonb` cast.
+`jsonb`, `json` and `interval` are stored as `varchar` in Iceberg (no native primitive) and view-cast back to the rich PG type on read. Queries like `data->>'key'` work; jsonb-only operators (`?`, `@>`) need an explicit `data::jsonb` cast.
+
+`inet`/`cidr` are **not supported**: pg_duckdb cannot process PG `inet` (Oid 869) in any Iceberg-backed query, and every cross-tier read is planned by pg_duckdb — so no cast makes them readable. Store IP data as `text` (you can still index/compare it; cast to `inet` in your own queries on the hot side only if needed).
 
 ## Gotchas
 

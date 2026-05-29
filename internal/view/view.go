@@ -34,18 +34,21 @@ type ViewConfig struct {
 //
 // Type is the **storage** type — what we declare to Iceberg via CREATE TABLE
 // (BIGINT, VARCHAR, DECIMAL(20,5), …). For PG types Iceberg can't represent
-// natively (jsonb/json, interval, inet/cidr), Type is the closest Iceberg
-// primitive (almost always VARCHAR) and ViewCastType carries the user-facing
-// type the view should expose by casting both UNION branches.
+// natively (jsonb/json, interval), Type is the closest Iceberg primitive
+// (VARCHAR) and ViewCastType carries the user-facing type the view exposes by
+// casting both UNION branches. ViewCastType is also set for native-storage
+// types whose storage name isn't PG-parseable (bytea → bytea on BLOB, double
+// precision → double precision on DOUBLE) so the hot-side cast spells a real
+// PG type.
 //
-// ViewCastType empty → view uses Type as-is (no cast).
+// ViewCastType empty → both branches cast to Type (the storage type).
 // ViewCastType non-empty → view emits `col::<ViewCastType>` on hot side and
-// `r['col']::<ViewCastType>` on cold side, so applications see the rich type
-// (json, interval, inet, …) regardless of the VARCHAR storage underneath.
+// `r['col']::<ViewCastType>` on cold side, so applications see the surface type
+// (json, interval, bytea, double precision) regardless of the storage form.
 type Column struct {
 	Name         string
 	Type         string // storage / DuckDB-CREATE-TABLE type, e.g. "BIGINT", "VARCHAR", "DECIMAL(20,5)"
-	ViewCastType string // optional surface-type cast emitted by the view, e.g. "JSON", "INTERVAL", "INET"
+	ViewCastType string // optional surface-type cast emitted by the view, e.g. "json", "interval", "bytea"
 	IsIdentity   bool   // pg_attribute.attidentity = 'a' (GENERATED ALWAYS) — skip from INSERT
 	IsPK         bool   // participates in primary key (pg_index.indisprimary)
 }
@@ -108,9 +111,22 @@ func (c ViewConfig) insertCols() (colList, valList string) {
 	return strings.Join(cols, ", "), strings.Join(vals, ", ")
 }
 
-// coldInsertVals returns the NEW."col" references for the cold INSERT via
-// duckdb.raw_query(format(...)). jsonb/json columns are cast to text since
-// DuckDB stores them as VARCHAR. Identity columns are excluded (same as hot).
+// coldInsertVals returns the format() args for the cold INSERT via
+// duckdb.raw_query(format(...)). Identity columns are excluded (same as hot).
+// Each arg pairs positionally with a %L placeholder from coldInsertPlaceholders.
+//
+//   - VARCHAR-backed rich types (jsonb/json/interval — Type=="VARCHAR" with a
+//     ViewCastType): serialised via ::text, since their Iceberg column is VARCHAR.
+//   - bytea (Type=="BLOB"): emitted as encode(NEW.col,'hex') and wrapped by a
+//     from_hex(%L) placeholder. The cold INSERT goes through %L, which renders a
+//     bytea as PG's '\xcafe' text — which DuckDB then MIS-parses into a BLOB
+//     (\xca → 1 byte, fe → 2 literal bytes = 3 bytes, corruption). Round-tripping
+//     the hex string through DuckDB's from_hex() rebuilds the exact bytes.
+//   - everything else (incl. double precision, whose '2.5' text round-trips
+//     cleanly through DuckDB): NEW.col as-is.
+//
+// This must stay consistent with the archiver's bulk-export path, which writes
+// bytea natively because pg_duckdb scans it directly (no %L stringification).
 func (c ViewConfig) coldInsertVals() string {
 	var vals []string
 	for _, col := range c.Columns {
@@ -118,13 +134,12 @@ func (c ViewConfig) coldInsertVals() string {
 			continue
 		}
 		q := pgx.Identifier{col.Name}.Sanitize()
-		// Columns with a ViewCastType (jsonb, interval, inet, …) are stored as
-		// VARCHAR in Iceberg; the trigger writes them via duckdb.raw_query, so
-		// we serialise NEW.col to text first. PG's ::text cast covers all the
-		// rich types we surface back via ViewCastType (json/interval/inet/...).
-		if col.ViewCastType != "" {
+		switch {
+		case col.Type == "BLOB":
+			vals = append(vals, "encode(NEW."+q+",'hex')")
+		case col.Type == "VARCHAR" && col.ViewCastType != "":
 			vals = append(vals, "NEW."+q+"::text")
-		} else {
+		default:
 			vals = append(vals, "NEW."+q)
 		}
 	}
@@ -133,15 +148,19 @@ func (c ViewConfig) coldInsertVals() string {
 
 // coldInsertPlaceholders returns positional value placeholders for the cold
 // INSERT via PG's format() call.  Identity columns use literal NULL (Iceberg
-// has no sequences); all other columns use %L so format() quotes them safely.
-// DuckDB/Iceberg does not support targeted inserts (INSERT INTO t(col) ...),
-// so we emit a positional INSERT INTO t VALUES (...) with all columns.
+// has no sequences); bytea uses from_hex(%L) so DuckDB reconstructs the exact
+// bytes from the hex string (see coldInsertVals); all other columns use %L so
+// format() quotes them safely. DuckDB/Iceberg does not support targeted inserts
+// (INSERT INTO t(col) ...), so we emit a positional INSERT INTO t VALUES (...).
 func (c ViewConfig) coldInsertPlaceholders() string {
 	var ph []string
 	for _, col := range c.Columns {
-		if col.IsIdentity {
+		switch {
+		case col.IsIdentity:
 			ph = append(ph, "NULL")
-		} else {
+		case col.Type == "BLOB":
+			ph = append(ph, "from_hex(%L)")
+		default:
 			ph = append(ph, "%L")
 		}
 	}
@@ -184,30 +203,31 @@ func GenerateViewSQL(cfg ViewConfig) string {
 	for i, c := range cfg.Columns {
 		hotName := pgx.Identifier{c.Name}.Sanitize()
 		coldKey := strings.ReplaceAll(c.Name, "'", "''")
+		// surface = the type the view exposes for this column, and the type
+		// BOTH UNION branches cast to. ViewCastType wins when the Iceberg
+		// storage type isn't the surface we want (DOUBLE→double precision,
+		// BLOB→bytea, VARCHAR→json/interval). Otherwise the storage type
+		// IS the surface — every storage type in this branch (BIGINT, INTEGER,
+		// VARCHAR, DECIMAL(P,S), TIMESTAMPTZ, …) is both PG-parseable and
+		// DuckDB-valid by construction.
+		//
+		// Casting BOTH branches to the surface is what keeps the view's column
+		// types identical at bootstrap (hot-only) and after cutover (UNION),
+		// satisfying CREATE OR REPLACE VIEW's "cannot change data type" rule.
+		// Without the hot-side cast, a native typmod (varchar(8)) would survive
+		// bootstrap but the UNION with the un-typmod'd cold cast would drop it,
+		// changing the column type on cutover.
+		//
+		// pg_duckdb takes over the whole query once iceberg_scan appears in the
+		// FROM, so the cast runs inside DuckDB on the cutover view; on the
+		// bootstrap (hot-only) view it runs in plain PG. The surface types are
+		// valid in both engines, so the resulting PG column type matches.
+		surface := c.Type
 		if c.ViewCastType != "" {
-			// pg_duckdb takes over the whole query when iceberg_scan appears
-			// in the FROM, so the union's column types are determined inside
-			// DuckDB. For PG types Iceberg can't store natively (jsonb,
-			// interval, inet, …) we store as VARCHAR but unify both UNION
-			// branches on a DuckDB-native rich type: hot side casts
-			// pg-native→cast-type (e.g. jsonb→json, interval→interval), cold
-			// side casts DuckDB VARCHAR→cast-type. pg_duckdb maps the
-			// DuckDB type back to PG so the application sees the rich type
-			// (json/interval/inet/…) regardless of underlying string storage.
-			hotCols[i] = hotName + "::" + c.ViewCastType
-			// inet/cidr are VARCHAR-backed: pg_duckdb cannot cast its
-			// struct-field (unresolved) type straight to inet, so resolve to
-			// text first (r['col']::text::inet). jsonb→json and interval cast
-			// directly; double precision is DOUBLE-backed (handled in the else).
-			if c.ViewCastType == "inet" {
-				coldCols[i] = fmt.Sprintf("r['%s']::text::%s", coldKey, c.ViewCastType)
-			} else {
-				coldCols[i] = fmt.Sprintf("r['%s']::%s", coldKey, c.ViewCastType)
-			}
-		} else {
-			hotCols[i] = hotName
-			coldCols[i] = fmt.Sprintf("r['%s']::%s", coldKey, c.Type)
+			surface = c.ViewCastType
 		}
+		hotCols[i] = hotName + "::" + surface
+		coldCols[i] = fmt.Sprintf("r['%s']::%s", coldKey, surface)
 	}
 
 	// Bootstrap path (no cutoff yet): hot-only, but cast columns to the

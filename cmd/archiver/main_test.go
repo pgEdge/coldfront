@@ -9,6 +9,8 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+
+	"github.com/vyruss/coldfront/internal/view"
 )
 
 // mockRow / mockRows / mockQuerier mirror the pattern in
@@ -72,7 +74,7 @@ func TestPgFormatTypeToDuckDB(t *testing.T) {
 		// Storage matches surface — no view cast.
 		{pg: "bigint", wantStorage: "BIGINT"},
 		{pg: "integer", wantStorage: "INTEGER"},
-		{pg: "smallint", wantStorage: "INTEGER"}, // Iceberg has no 16-bit int; widened
+		{pg: "smallint", wantStorage: "INTEGER"}, // widened; INTEGER is its own surface
 		{pg: "real", wantStorage: "REAL"},
 		{pg: "double precision", wantStorage: "DOUBLE", wantViewCastTyp: "double precision"}, // ::double is a PG shell type
 		{pg: "boolean", wantStorage: "BOOLEAN"},
@@ -85,8 +87,8 @@ func TestPgFormatTypeToDuckDB(t *testing.T) {
 		{pg: "character varying(255)", wantStorage: "VARCHAR"},
 		{pg: "character varying", wantStorage: "VARCHAR"},
 		{pg: "character(10)", wantStorage: "VARCHAR"},
-		{pg: "bytea", wantStorage: "BLOB"},
-		{pg: "oid", wantStorage: "BIGINT"}, // 4-byte unsigned → BIGINT for safety
+		{pg: "bytea", wantStorage: "BLOB", wantViewCastTyp: "bytea"}, // BLOB not PG-parseable
+		{pg: "oid", wantStorage: "BIGINT"},                           // widened; BIGINT is its own surface
 		{pg: "numeric(20,5)", wantStorage: "DECIMAL(20,5)"},
 		{pg: "numeric(38, 10)", wantStorage: "DECIMAL(38,10)"},
 
@@ -94,10 +96,12 @@ func TestPgFormatTypeToDuckDB(t *testing.T) {
 		{pg: "jsonb", wantStorage: "VARCHAR", wantViewCastTyp: "json"},
 		{pg: "json", wantStorage: "VARCHAR", wantViewCastTyp: "json"},
 		{pg: "interval", wantStorage: "VARCHAR", wantViewCastTyp: "interval"},
-		{pg: "inet", wantStorage: "VARCHAR", wantViewCastTyp: "inet"},
-		{pg: "cidr", wantStorage: "VARCHAR", wantViewCastTyp: "inet"},
 
-		// Errors.
+		// Errors. inet/cidr are rejected: pg_duckdb cannot process inet (Oid
+		// 869) in an Iceberg-backed query, and every tiered read is planned by
+		// pg_duckdb, so there is no cast that makes them readable.
+		{pg: "inet", wantErr: true},
+		{pg: "cidr", wantErr: true},
 		{pg: "numeric", wantErr: true},
 		{pg: "time with time zone", wantErr: true},
 		{pg: "tsvector", wantErr: true},
@@ -382,4 +386,38 @@ func TestGetColumns_PropagatesQueryError(t *testing.T) {
 	_, err := getColumns(context.Background(), db, "public", "events")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "relation missing")
+}
+
+// Only VARCHAR-backed rich types (Type=="VARCHAR" + a ViewCastType) are
+// ::text-cast for the export stage. bytea (BLOB) and double precision (DOUBLE)
+// carry a ViewCastType only for the view's hot-side cast; Iceberg stores them
+// natively, so they must export AS-IS — ::text-casting bytea would corrupt the
+// binary column.
+func TestStageSelectList(t *testing.T) {
+	cols := []view.Column{
+		{Name: "i", Type: "INTEGER"},
+		{Name: "j", Type: "VARCHAR", ViewCastType: "json"},
+		{Name: "iv", Type: "VARCHAR", ViewCastType: "interval"},
+		{Name: "b", Type: "BLOB", ViewCastType: "bytea"},
+		{Name: "d", Type: "DOUBLE", ViewCastType: "double precision"},
+	}
+	got := stageSelectList(cols)
+	assert.Equal(t, `"i", "j"::text AS "j", "iv"::text AS "iv", "b", "d"`, got)
+}
+
+func TestStageSelectList_Empty(t *testing.T) {
+	assert.Equal(t, "*", stageSelectList(nil))
+}
+
+// The PG text-stage detour is only needed for types pg_duckdb's reader cannot
+// scan natively — now just interval (kept defensively). bytea, jsonb and
+// double scan fine and must not trigger it.
+func TestNeedsPGTextStage(t *testing.T) {
+	assert.True(t, needsPGTextStage([]view.Column{{Name: "iv", Type: "VARCHAR", ViewCastType: "interval"}}))
+	assert.False(t, needsPGTextStage([]view.Column{
+		{Name: "j", Type: "VARCHAR", ViewCastType: "json"},
+		{Name: "b", Type: "BLOB", ViewCastType: "bytea"},
+		{Name: "d", Type: "DOUBLE", ViewCastType: "double precision"},
+	}))
+	assert.False(t, needsPGTextStage(nil))
 }

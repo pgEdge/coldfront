@@ -394,6 +394,9 @@ BEGIN
     -- raw_query writes for cold) need pg_duckdb's mixed-write guard
     -- relaxed.
     SET LOCAL duckdb.unsafe_allow_mixed_transactions = on;
+    -- Pin bytea text output to hex so to_jsonb(rec)->>bytea_col is a stable
+    -- '\xHEX' string that the per-row serialiser below rebuilds via from_hex().
+    SET LOCAL bytea_output = 'hex';
 
     -- Lookup view registry + watermark.
     SELECT tv.hot_table, tv.iceberg_table, tv.partition_col,
@@ -513,7 +516,16 @@ BEGIN
             ELSIF payload ? col AND (payload->col) IS NOT NULL
                   AND jsonb_typeof(payload->col) <> 'null' THEN
                 val_text := payload->>col;
-                row_lit := row_lit || quote_literal(val_text);
+                IF full_types[i] = 'bytea' THEN
+                    -- val_text is PG bytea text '\xHEX' (bytea_output pinned to
+                    -- hex above). DuckDB stores a BLOB, so rebuild the exact
+                    -- bytes from the hex digits via from_hex(). Passing the
+                    -- '\xHEX' string straight to a BLOB column would make DuckDB
+                    -- mis-parse the \x escapes and corrupt the value.
+                    row_lit := row_lit || format('from_hex(%L)', substr(val_text, 3));
+                ELSE
+                    row_lit := row_lit || quote_literal(val_text);
+                END IF;
             ELSE
                 row_lit := row_lit || 'NULL';
             END IF;
@@ -818,9 +830,13 @@ BEGIN
         RAISE EXCEPTION 'coldfront: unbounded numeric not supported in iceberg; use numeric(P,S) with P<=38';
     END IF;
     -- View-cast types: stored as VARCHAR, surfaced via wrapper view as native PG type
-    IF t IN ('jsonb', 'json', 'interval', 'inet', 'cidr') THEN RETURN 'VARCHAR'; END IF;
+    IF t IN ('jsonb', 'json', 'interval') THEN RETURN 'VARCHAR'; END IF;
+    -- inet/cidr are NOT supported: pg_duckdb rejects PG inet (Oid 869) in any
+    -- query it plans, and every Iceberg-backed view read is planned by
+    -- pg_duckdb, so there is no cast that makes them readable. Store IP data
+    -- as text instead.
 
-    RAISE EXCEPTION 'coldfront: PG type % has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, oid, numeric(P,S), jsonb, json, interval, inet, cidr', p_pg_type;
+    RAISE EXCEPTION 'coldfront: PG type % has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, oid, numeric(P,S), jsonb, json, interval. inet/cidr unsupported (store IP data as text)', p_pg_type;
 END;
 $$;
 
@@ -835,12 +851,16 @@ LANGUAGE sql IMMUTABLE STRICT AS $$
         WHEN 'jsonb'            THEN 'json'      -- DuckDB has no jsonb, surface as json
         WHEN 'json'             THEN 'json'
         WHEN 'interval'         THEN 'interval'
-        WHEN 'inet'             THEN 'inet'
-        WHEN 'cidr'             THEN 'inet'
         -- PG has no bare "double" type, so the view's cold cast r['col']::DOUBLE
         -- (the Iceberg storage name) won't parse. Surface via "double precision".
         WHEN 'double precision' THEN 'double precision'
         WHEN 'float8'           THEN 'double precision'
+        -- BLOB is not a PG-parseable cast name; surface bytea via "bytea".
+        WHEN 'bytea'            THEN 'bytea'
+        -- Everything else (incl. smallint→INTEGER, oid→BIGINT widening) has a
+        -- storage type that is itself a PG-parseable surface; the view casts
+        -- BOTH branches to that storage type, so no separate surface cast is
+        -- needed and bootstrap/post-cutover view column types still agree.
         ELSE ''
     END;
 $$;
@@ -857,7 +877,7 @@ $$;
 -- Effects:
 --   1. Creates the Iceberg table via duckdb.raw_query('CREATE TABLE ice...').
 --   2. Creates a PG view <p_schema>.<p_table> that wraps iceberg_scan() with
---      proper column projections (and view-cast for jsonb/interval/inet).
+--      proper column projections (and view-cast for jsonb/interval).
 --   3. Creates an INSTEAD OF INSERT trigger on the view that routes writes to
 --      duckdb.raw_query('INSERT INTO ice...').
 --   4. Registers the view in coldfront.tiered_views with is_iceberg_only=true,
@@ -914,24 +934,33 @@ BEGIN
 
         iceberg_cols := iceberg_cols || quote_ident(col_name) || ' ' || storage_type;
 
-        -- View projection: r['col']::<surface-type> AS col. inet/cidr are
-        -- VARCHAR-backed and pg_duckdb can't cast its struct-field type
-        -- straight to inet, so resolve to text first (r['col']::text::inet).
-        IF cast_type = 'inet' THEN
-            view_proj := view_proj || format('r[%L]::text::%s AS %I', col_name, cast_type, col_name);
-        ELSIF cast_type <> '' THEN
+        -- View projection: r['col']::<surface> AS col, where surface =
+        -- cast_type (json/interval/…) else the Iceberg storage type. Using the
+        -- storage type (not the raw pg_type) keeps this consistent with the
+        -- tiered generators (view.go / _rebuild_tiered_view) and matches the
+        -- actual Iceberg column type (e.g. smallint→INTEGER, char(10)→VARCHAR).
+        IF cast_type <> '' THEN
             view_proj := view_proj || format('r[%L]::%s AS %I', col_name, cast_type, col_name);
         ELSE
-            view_proj := view_proj || format('r[%L]::%s AS %I', col_name, pg_type, col_name);
+            view_proj := view_proj || format('r[%L]::%s AS %I', col_name, storage_type, col_name);
         END IF;
 
-        -- INSERT trigger: format('INSERT INTO ice... VALUES (%L, %L, ...)', NEW.col, ...)
-        placeholders := placeholders || '%L';
-        IF cast_type IN ('json', 'interval', 'inet') THEN
-            -- jsonb/interval/inet → text for VARCHAR-backed Iceberg storage
-            new_refs := new_refs || format('NEW.%I::text', col_name);
+        -- INSERT trigger: format('INSERT INTO ice... VALUES (<placeholders>)', <new_refs>).
+        --  * json/interval (VARCHAR-backed): NEW.col::text.
+        --  * bytea (BLOB): from_hex(%L) + encode(NEW.col,'hex') — %L renders a
+        --    bytea as PG's '\xcafe' text which DuckDB mis-parses into a BLOB;
+        --    round-tripping the hex through from_hex() rebuilds the exact bytes.
+        --  * everything else (incl. double, '2.5' text round-trips): NEW.col.
+        -- Mirrors _rebuild_tiered_view and the archiver export.
+        IF storage_type = 'BLOB' THEN
+            placeholders := placeholders || 'from_hex(%L)';
+            new_refs     := new_refs || format('encode(NEW.%I,%L)', col_name, 'hex');
+        ELSIF cast_type IN ('json', 'interval') THEN
+            placeholders := placeholders || '%L';
+            new_refs     := new_refs || format('NEW.%I::text', col_name);
         ELSE
-            new_refs := new_refs || format('NEW.%I', col_name);
+            placeholders := placeholders || '%L';
+            new_refs     := new_refs || format('NEW.%I', col_name);
         END IF;
     END LOOP;
 
@@ -1735,6 +1764,7 @@ BEGIN
         ORDER BY a.attnum
     LOOP
         cast_type := coldfront._iceberg_view_cast_type(r.pg_type);
+        cold_type := coldfront._iceberg_storage_type(r.pg_type);  -- Iceberg storage (BLOB, INTEGER, …)
 
         -- VIEW PROJECTIONS (view.go ~184-203).
         IF n > 0 THEN
@@ -1742,17 +1772,18 @@ BEGIN
             v_cold_proj := v_cold_proj || ', ';
         END IF;
 
-        IF cast_type = 'inet' THEN
-            -- inet/cidr: VARCHAR-backed; pg_duckdb can't cast its struct-field
-            -- type straight to inet, so resolve to text first.
-            v_hot_proj  := v_hot_proj  || quote_ident(r.attname) || '::' || cast_type;
-            v_cold_proj := v_cold_proj || format('r[%L]::text::%s', r.attname, cast_type);
-        ELSIF cast_type <> '' THEN
+        IF cast_type <> '' THEN
+            -- VARCHAR-backed rich types (json/interval): cast both branches to
+            -- the surface type so bootstrap and post-cutover views agree.
             v_hot_proj  := v_hot_proj  || quote_ident(r.attname) || '::' || cast_type;
             v_cold_proj := v_cold_proj || format('r[%L]::%s', r.attname, cast_type);
         ELSE
-            v_hot_proj  := v_hot_proj  || quote_ident(r.attname);
-            cold_type   := coldfront._iceberg_storage_type(r.pg_type);
+            -- No surface cast: the Iceberg storage type IS the surface. Cast
+            -- BOTH branches to it (not just cold) so a native typmod like
+            -- varchar(8) on the hot side does not survive bootstrap and then
+            -- get dropped by the UNION at cutover ("cannot change data type of
+            -- view column"). Storage types here are all PG-parseable.
+            v_hot_proj  := v_hot_proj  || quote_ident(r.attname) || '::' || cold_type;
             v_cold_proj := v_cold_proj || format('r[%L]::%s', r.attname, cold_type);
         END IF;
         n := n + 1;
@@ -1769,7 +1800,6 @@ BEGIN
         IF r.attidentity = 'a' THEN
             v_placeholders := v_placeholders || 'NULL';
         ELSE
-            v_placeholders := v_placeholders || '%L';
             IF v_col_list <> '' THEN
                 v_col_list := v_col_list || ', ';
                 v_hot_vals := v_hot_vals || ', ';
@@ -1777,10 +1807,24 @@ BEGIN
             END IF;
             v_col_list := v_col_list || quote_ident(r.attname);
             v_hot_vals := v_hot_vals || 'NEW.' || quote_ident(r.attname);
-            IF cast_type <> '' THEN
-                v_cold_vals := v_cold_vals || 'NEW.' || quote_ident(r.attname) || '::text';
+            -- Cold-INSERT value, serialised through format()'s %L:
+            --  * json/interval (VARCHAR-backed): NEW.col::text.
+            --  * bytea (BLOB): from_hex(%L) placeholder + encode(NEW.col,'hex')
+            --    value. %L renders a bytea as PG's '\xcafe' text, which DuckDB
+            --    MIS-parses into a BLOB; round-tripping the hex through DuckDB's
+            --    from_hex() rebuilds the exact bytes. (double precision round-
+            --    trips fine as '2.5' text, so it stays a plain %L.)
+            --  * everything else: NEW.col as-is.
+            -- Consistent with create_iceberg_table and the archiver export.
+            IF cold_type = 'BLOB' THEN
+                v_placeholders := v_placeholders || 'from_hex(%L)';
+                v_cold_vals    := v_cold_vals || format('encode(NEW.%I,%L)', r.attname, 'hex');
+            ELSIF cast_type IN ('json', 'interval') THEN
+                v_placeholders := v_placeholders || '%L';
+                v_cold_vals    := v_cold_vals || 'NEW.' || quote_ident(r.attname) || '::text';
             ELSE
-                v_cold_vals := v_cold_vals || 'NEW.' || quote_ident(r.attname);
+                v_placeholders := v_placeholders || '%L';
+                v_cold_vals    := v_cold_vals || 'NEW.' || quote_ident(r.attname);
             END IF;
         END IF;
     END LOOP;

@@ -113,11 +113,11 @@ list is rejected at table-creation time.
 | `numeric(P,S)` (P ≤ 38) | `DECIMAL(P,S)` | identical |
 | `jsonb` / `json` | `VARCHAR` | view-cast back to `json` (not `jsonb` — Iceberg has no JSON primitive) |
 | `interval` | `VARCHAR` | view-cast back to `interval` |
-| `inet` / `cidr` | `VARCHAR` | view-cast back to `inet` |
 
 Rejected (rather than silently downgraded to `VARCHAR` and losing
 precision/identity):
 
+- `inet` / `cidr` — pg_duckdb cannot process PG `inet` (Oid 869) in any query it plans, and every Iceberg-backed read is planned by pg_duckdb. No cast makes them readable; store IP data as `text`.
 - `numeric` without explicit `(P,S)` — Iceberg requires bounded decimals.
 - Custom enums, `xml`, `tsvector`/`tsquery`, range types, multirange types.
 - Composite types and arrays. (Arrays would map to Parquet `LIST<…>` only if the element type is itself supported; not yet implemented for decoupled mode.)
@@ -154,7 +154,7 @@ What the helper does:
 
 1. `duckdb.raw_query('CREATE SCHEMA IF NOT EXISTS ice."default"')` — idempotent namespace creation against Lakekeeper.
 2. `duckdb.raw_query('CREATE TABLE ice.default.<name> (col1 STORAGE_TYPE, …)')` — column types are validated by `coldfront._iceberg_storage_type()`, which mirrors the canonical map in `cmd/archiver/main.go pgFormatTypeToDuckDB`. Anything outside the supported set (see "Supported column types" above) raises before any DDL is issued.
-3. `CREATE OR REPLACE VIEW <schema>.<name> AS SELECT r['col']::pg_type AS col, … FROM duckdb.query('SELECT * FROM ice.default.<name>') AS t(r)` — projection wraps the struct accessor so applications see flat columns. View-cast types (`jsonb` → `json`, `interval`, `inet`) are surfaced via the appropriate cast. The view source is `duckdb.query()` rather than `iceberg_scan()` specifically to make read-your-own-write inside an explicit transaction work; pg_duckdb's planner folds it into the same `ICEBERG_SCAN` plan with identical Parquet predicate pushdown, so there's no perf cost (verified with `EXPLAIN ANALYZE`: both forms hit `Function: ICEBERG_SCAN, Filters: id=N, Total Files Read: 7`, ~14ms warm).
+3. `CREATE OR REPLACE VIEW <schema>.<name> AS SELECT r['col']::pg_type AS col, … FROM duckdb.query('SELECT * FROM ice.default.<name>') AS t(r)` — projection wraps the struct accessor so applications see flat columns. View-cast types (`jsonb` → `json`, `interval`) are surfaced via the appropriate cast. The view source is `duckdb.query()` rather than `iceberg_scan()` specifically to make read-your-own-write inside an explicit transaction work; pg_duckdb's planner folds it into the same `ICEBERG_SCAN` plan with identical Parquet predicate pushdown, so there's no perf cost (verified with `EXPLAIN ANALYZE`: both forms hit `Function: ICEBERG_SCAN, Filters: id=N, Total Files Read: 7`, ~14ms warm).
 4. Registers the row in `coldfront.tiered_views` with `is_iceberg_only = true`. The C-side `post_parse_analyze_hook` reads this flag and short-circuits `classify_tier()` to `TIER_COLD` for any INSERT/UPDATE/DELETE on the wrapper view, regardless of WHERE clause or watermark — so every write rewrites cleanly into a single `SELECT duckdb.raw_query('INSERT/UPDATE/DELETE ice.default.<name> …')`. INSERT in particular: the hook emits one bulk `raw_query` for the entire statement (VALUES list inlined for VALUES, source-table refs prefixed with `pglocal.<schema>.<table>` for `INSERT … SELECT FROM <pg_table>` so DuckDB's postgres extension streams source rows over libpq into the Iceberg writer in one pipeline). No INSTEAD OF INSERT trigger is created — the hook is the dispatch path.
 
 Verified end-to-end against a fresh scale-test stack:

@@ -506,10 +506,17 @@ func wipeIcebergRange(ctx context.Context, pool *pgxpool.Pool, iceTable, partCol
 // the duplicate work is correct, just wasted. For typical workloads this
 // window is sub-millisecond.
 // stageSelectList builds the SELECT projection for the bulk export, casting
-// VARCHAR-backed columns (those with a ViewCastType — jsonb/interval/inet/cidr)
-// to ::text so pg_duckdb's PG reader can scan them (it rejects e.g. inet
-// natively). All other columns are projected as-is. The cast value lands as
-// VARCHAR in Iceberg and the transparent view casts it back on read.
+// only the VARCHAR-backed rich types (jsonb/json/interval — Type=="VARCHAR"
+// with a surface ViewCastType) to ::text so they land as VARCHAR in Iceberg
+// and the transparent view casts them back on read.
+//
+// A ViewCastType alone does NOT mean text-backed: bytea (storage BLOB) and
+// double precision (storage DOUBLE) carry a ViewCastType only to give the view
+// a PG-parseable hot-side cast (`::bytea`/`::double precision` instead of the
+// non-PG `::BLOB`/`::DOUBLE`). Iceberg stores those natively (binary / double),
+// so they must be exported AS-IS — ::text-casting bytea would stringify the
+// bytes ('\xdeadbeef') and corrupt the BLOB column. Gating on Type=="VARCHAR"
+// selects exactly the text-backed types and leaves native ones untouched.
 func stageSelectList(columns []view.Column) string {
 	if len(columns) == 0 {
 		return "*"
@@ -517,7 +524,7 @@ func stageSelectList(columns []view.Column) string {
 	parts := make([]string, len(columns))
 	for i, c := range columns {
 		id := pgx.Identifier{c.Name}.Sanitize()
-		if c.ViewCastType != "" {
+		if c.Type == "VARCHAR" && c.ViewCastType != "" {
 			parts[i] = id + "::text AS " + id
 		} else {
 			parts[i] = id
@@ -528,13 +535,13 @@ func stageSelectList(columns []view.Column) string {
 
 // needsPGTextStage reports whether the column set contains a type pg_duckdb's
 // PG reader cannot scan, requiring a PostgreSQL-side text-cast staging table
-// before the DuckDB stage. inet/cidr (ViewCastType "inet") are the known
-// offenders; jsonb (ViewCastType "json") scans fine, so it does NOT trigger the
-// detour. interval is included defensively (Iceberg-VARCHAR-backed, and not
-// worth a separate scan probe).
+// before the DuckDB stage. jsonb (ViewCastType "json") scans fine, so it does
+// NOT trigger the detour. interval is included defensively (Iceberg-VARCHAR-
+// backed, and not worth a separate scan probe). inet/cidr were the original
+// offenders but are no longer supported (pg_duckdb rejects inet outright).
 func needsPGTextStage(columns []view.Column) bool {
 	for _, c := range columns {
-		if c.ViewCastType == "inet" || c.ViewCastType == "interval" {
+		if c.ViewCastType == "interval" {
 			return true
 		}
 	}
@@ -554,14 +561,13 @@ func bulkExportWithSnapshot(ctx context.Context, pool *pgxpool.Pool, t *config.T
 	}
 
 	// Stage the partition into a DuckDB-backed temp table for the Iceberg
-	// write. Some PG types pg_duckdb's reader cannot scan at all (notably inet
-	// /cidr, Oid=869) — and casting them ::text inside a `USING duckdb AS
-	// SELECT` doesn't help, because pg_duckdb plans (and rejects) the inet scan
-	// before any cast runs. So when such a column is present, PostgreSQL (not
-	// pg_duckdb) first materialises a text-cast copy in a plain temp table; then
-	// pg_duckdb scans that text-only table. The value lands as VARCHAR in
-	// Iceberg and the transparent view casts it back (r['col']::inet) on read.
-	// jsonb-only / plain tables skip the detour (single copy, fast path).
+	// write. A few VARCHAR-backed types pg_duckdb's reader prefers not to scan
+	// directly (interval) get a PostgreSQL-side text-cast copy in a plain temp
+	// table first; then pg_duckdb scans that text-only table. The value lands as
+	// VARCHAR in Iceberg and the transparent view casts it back on read.
+	// (inet/cidr were the original Oid-869 offenders that motivated this detour
+	// but are no longer supported — see pgFormatTypeToDuckDB.) jsonb-only /
+	// plain tables skip the detour (single copy, fast path).
 	src := pgx.Identifier{t.SourceSchema, partName}.Sanitize()
 	if needsPGTextStage(columns) {
 		pgStageSQL := fmt.Sprintf(
@@ -652,9 +658,11 @@ func registerTieredView(ctx context.Context, pool *pgxpool.Pool, schema, table, 
 //	               UNION branches. Empty for types whose storage form already
 //	               matches the surface type (BIGINT, TIMESTAMPTZ, DECIMAL(P,S),
 //	               …). Non-empty for types Iceberg cannot represent natively
-//	               (jsonb/json → JSON, interval → INTERVAL, inet/cidr → INET):
-//	               storage is VARCHAR, view casts to the rich DuckDB type so
-//	               applications see jsonb/interval/inet, not text.
+//	               (jsonb/json → json, interval → interval): storage is VARCHAR,
+//	               view casts to the rich type so applications see jsonb/interval,
+//	               not text. (Also bytea → bytea, double precision → double
+//	               precision: native storage BLOB/DOUBLE, cast only so the view's
+//	               hot-side spelling is PG-parseable.)
 //
 // Hard-errors on types with no Iceberg-compatible storage (unbounded numeric,
 // time-with-tz, custom enums, xml, tsvector, …) rather than silently falling
@@ -670,7 +678,10 @@ func pgFormatTypeToDuckDB(s string) (storage, viewCastType string, err error) {
 		return "INTEGER", "", nil
 	case "smallint":
 		// Iceberg has no 16-bit integer; widen to INTEGER (lossless, same as
-		// oid → BIGINT). duckdb-iceberg rejects SMALLINT at CREATE TABLE.
+		// oid → BIGINT). duckdb-iceberg rejects SMALLINT at CREATE TABLE. No
+		// view cast needed: INTEGER is itself a PG-parseable surface, and the
+		// view casts BOTH branches to the storage type, so bootstrap (hot-only)
+		// and post-cutover (hot+cold) views agree on the column type.
 		return "INTEGER", "", nil
 	case "real":
 		return "REAL", "", nil
@@ -700,18 +711,23 @@ func pgFormatTypeToDuckDB(s string) (storage, viewCastType string, err error) {
 	case "text":
 		return "VARCHAR", "", nil
 	case "bytea":
-		return "BLOB", "", nil
+		// Iceberg/DuckDB storage is BLOB, which is not a PG-parseable cast
+		// name; surface via the PG-spelled "bytea" on both branches.
+		return "BLOB", "bytea", nil
 
 	// PG `oid` is 4-byte unsigned (max 4_294_967_295). DuckDB INTEGER is
 	// signed 32-bit, so values above 2_147_483_647 would overflow. Use
 	// BIGINT for safe round-trip.
 	case "oid":
+		// oid widens to BIGINT (4-byte unsigned safe-widen). No view cast:
+		// BIGINT is a PG-parseable surface and the view casts both branches to
+		// the storage type, so bootstrap/cutover view types agree.
 		return "BIGINT", "", nil
 
 	// View-cast types use lowercase by convention — PG/DuckDB cast targets
-	// (`::json`, `::interval`, `::inet`) read more naturally than UPPERCASE.
-	// Storage types stay UPPERCASE because they're CREATE-TABLE column
-	// declarations (BIGINT, VARCHAR, …) where uppercase is conventional.
+	// (`::json`, `::interval`) read more naturally than UPPERCASE. Storage
+	// types stay UPPERCASE because they're CREATE-TABLE column declarations
+	// (BIGINT, VARCHAR, …) where uppercase is conventional.
 
 	// Iceberg has no JSON primitive — storage VARCHAR, surface json.
 	case "jsonb", "json":
@@ -724,10 +740,12 @@ func pgFormatTypeToDuckDB(s string) (storage, viewCastType string, err error) {
 	case "interval":
 		return "VARCHAR", "interval", nil
 
-	// Iceberg has no INET/CIDR — storage VARCHAR, surface inet. DuckDB has
-	// an INET type since 1.0; pg_duckdb maps it back to PG inet.
-	case "inet", "cidr":
-		return "VARCHAR", "inet", nil
+		// inet/cidr are NOT supported. pg_duckdb cannot represent PG inet (Oid
+		// 869) anywhere in a query it plans, and every read through an
+		// Iceberg-backed view is planned by pg_duckdb (the view embeds
+		// iceberg_scan). It rejects the column *reference* at plan time, before
+		// any cast — so "store as VARCHAR, cast back to inet" is impossible. Fall
+		// through to the unsupported-type error; users store IP data as text.
 	}
 
 	// VARCHAR(N) / CHAR(N) — PG's format_type emits "character varying(N)"
@@ -752,7 +770,8 @@ func pgFormatTypeToDuckDB(s string) (storage, viewCastType string, err error) {
 			"smallint, real, double precision, boolean, timestamp with/without time "+
 			"zone, date, time without time zone, uuid, text, character varying(N), "+
 			"character(N), bytea, numeric(P,S) with P<=38, json, jsonb, interval, "+
-			"inet, cidr, oid", s)
+			"oid. inet/cidr are not supported (pg_duckdb cannot process inet in "+
+			"Iceberg-backed queries); store IP data as text", s)
 }
 
 var numericTypeRe = regexp.MustCompile(`^numeric\((\d+),\s*(\d+)\)$`)
@@ -768,9 +787,10 @@ var numericTypeRe = regexp.MustCompile(`^numeric\((\d+),\s*(\d+)\)$`)
 // and losing precision/format/identity at write time).
 //
 // ViewCastType is set for PG types Iceberg can't represent natively
-// (jsonb/json → JSON, interval → INTERVAL, inet/cidr → INET). The view layer
-// then emits ::ViewCastType on both UNION branches so the application surface
-// stays the rich type, even though Iceberg storage is VARCHAR underneath.
+// (jsonb/json → json, interval → interval; storage VARCHAR), and for native
+// types whose storage name isn't PG-parseable (bytea → bytea, double precision
+// → double precision; storage BLOB/DOUBLE). The view layer emits ::ViewCastType
+// on both UNION branches so the application surface stays the right type.
 //
 // IsIdentity is attidentity = 'a' (GENERATED ALWAYS AS IDENTITY); IsPK is
 // participation in pg_index.indisprimary. Composite PKs handled transparently.

@@ -96,6 +96,67 @@ func TestGenerateTriggerFuncSQL_ColdInsertRoutesToRawQuery(t *testing.T) {
 	assert.Contains(t, sql, `NEW."data"::text`)
 }
 
+// nativeCfg has columns whose Iceberg storage is NATIVE (BLOB / DOUBLE) but
+// which carry a ViewCastType only for the view's PG-parseable hot-side cast.
+var nativeCfg = ViewConfig{
+	SourceSchema:    "public",
+	SourceTable:     "ev",
+	IcebergTable:    "ice.default.ev",
+	CutoffTime:      time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC),
+	PartitionColumn: "ts",
+	Columns: []Column{
+		{Name: "ts", Type: "TIMESTAMPTZ"},
+		{Name: "blob", Type: "BLOB", ViewCastType: "bytea"},
+		{Name: "amt", Type: "DOUBLE", ViewCastType: "double precision"},
+		{Name: "doc", Type: "VARCHAR", ViewCastType: "json"},
+	},
+}
+
+// Cold-INSERT serialises each value through format()'s %L. bytea must go
+// through from_hex(encode(NEW.col,'hex')) — %L renders a bytea as PG's '\xcafe'
+// text which DuckDB mis-parses into a BLOB; round-tripping the hex string
+// rebuilds the exact bytes. double precision round-trips fine as '2.5' text, so
+// it stays native (no ::text). Only VARCHAR-backed json is ::text-serialised.
+func TestGenerateTriggerFuncSQL_ColdInsertBlobViaFromHex(t *testing.T) {
+	sql := GenerateTriggerFuncSQL(nativeCfg)
+	assert.Contains(t, sql, "from_hex(%L)", "bytea placeholder rebuilds bytes in DuckDB")
+	assert.Contains(t, sql, `encode(NEW."blob",'hex')`, "bytea value is sent as hex")
+	assert.NotContains(t, sql, `NEW."blob"::text`, "bytea must not be ::text-stringified")
+	assert.Contains(t, sql, `NEW."amt"`, "double inserted as-is (text round-trips)")
+	assert.NotContains(t, sql, `NEW."amt"::text`, "double needs no ::text")
+	assert.Contains(t, sql, `NEW."doc"::text`, "json IS VARCHAR-backed; serialise to text")
+}
+
+// The view casts BLOB→bytea / DOUBLE→double precision on BOTH UNION branches
+// so the surface type is PG-parseable and the branches unify.
+func TestGenerateViewSQL_NativeSurfaceCast(t *testing.T) {
+	sql := GenerateViewSQL(nativeCfg)
+	assert.Contains(t, sql, `"blob"::bytea`, "hot side casts BLOB→bytea")
+	assert.Contains(t, sql, "r['blob']::bytea", "cold side casts to bytea")
+	assert.Contains(t, sql, `"amt"::double precision`, "hot side casts DOUBLE→double precision")
+	assert.Contains(t, sql, "r['amt']::double precision")
+	assert.NotContains(t, sql, "::BLOB", "BLOB is not a PG-parseable cast name")
+	assert.NotContains(t, sql, "::DOUBLE ", "bare ::DOUBLE is not a PG type")
+}
+
+// The central invariant of the surface-cast change: the bootstrap (no-cutoff,
+// hot-only) view applies the SAME hot-side casts as the post-cutover view, so
+// CREATE OR REPLACE VIEW never trips "cannot change data type of view column".
+func TestGenerateViewSQL_BootstrapMatchesCutoverHotCasts(t *testing.T) {
+	withCutoff := nativeCfg
+	bootstrap := nativeCfg
+	bootstrap.CutoffTime = time.Time{} // zero → no cold side
+
+	bsql := GenerateViewSQL(bootstrap)
+	assert.NotContains(t, bsql, "UNION ALL", "bootstrap is hot-only")
+	// Every surface cast present in the cutover view's hot branch must also be
+	// present in the bootstrap view.
+	for _, frag := range []string{`"blob"::bytea`, `"amt"::double precision`, `"doc"::json`, `"ts"::TIMESTAMPTZ`} {
+		assert.Contains(t, bsql, frag, "bootstrap hot cast must match cutover")
+		assert.Contains(t, GenerateViewSQL(withCutoff), frag, "cutover hot cast")
+	}
+}
+
 // Cold INSERT checks the watermark before routing.
 func TestGenerateTriggerFuncSQL_ColdInsertWatermarkCheck(t *testing.T) {
 	sql := GenerateTriggerFuncSQL(testCfg)
@@ -241,8 +302,10 @@ func TestGenerateViewSQL_ComplexIdentifiers(t *testing.T) {
 	assert.Contains(t, sql, `CREATE OR REPLACE VIEW "my-Schema"."Weird""Events"`)
 	assert.Contains(t, sql, `FROM "my-Schema"."_Weird""Events"`)
 
-	// Column identifiers on the hot side: quoted with embedded-quote doubling.
-	assert.Contains(t, sql, `"Id", "odd""name"`)
+	// Column identifiers on the hot side: quoted with embedded-quote doubling,
+	// each cast to its surface type (same cast as the cold side) so bootstrap
+	// and post-cutover view column types stay identical.
+	assert.Contains(t, sql, `"Id"::BIGINT, "odd""name"::VARCHAR`)
 
 	// Partition column on the hot side is a PG identifier.
 	assert.Contains(t, sql, `"Ts" >=`)
