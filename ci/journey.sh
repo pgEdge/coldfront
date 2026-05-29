@@ -160,17 +160,18 @@ CREATE TABLE IF NOT EXISTS typed (
     ts      timestamptz NOT NULL,
     c_int   integer, c_small smallint, c_real real, c_dbl double precision,
     c_bool  boolean, c_date date, c_uuid uuid, c_txt text, c_vc varchar(8),
-    c_bytea bytea, c_num numeric(20,5), c_jsonb jsonb, c_inet inet,
+    c_bytea bytea, c_num numeric(20,5), c_jsonb jsonb,
     PRIMARY KEY (id, ts)
 ) PARTITION BY RANGE (ts);
 CREATE TABLE IF NOT EXISTS typed_2026_01 PARTITION OF typed FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
 CREATE TABLE IF NOT EXISTS typed_2026_04 PARTITION OF typed FOR VALUES FROM ('2026-04-01') TO ('2026-05-01');
--- inet is VARCHAR-backed in Iceberg: the bulk export casts it ::text (pg_duckdb
--- can't scan inet natively), and the view casts r['c_inet']::inet on read.
-INSERT INTO typed (ts,c_int,c_small,c_real,c_dbl,c_bool,c_date,c_uuid,c_txt,c_vc,c_bytea,c_num,c_jsonb,c_inet)
-VALUES ('2026-01-10', 42, 7, 1.5, 2.5, true, '2026-01-10', '11111111-1111-1111-1111-111111111111','hi','abc','\xdeadbeef'::bytea, 123.45, '{"k":1}', '10.0.0.1');
-INSERT INTO typed (ts,c_int,c_small,c_real,c_dbl,c_bool,c_date,c_uuid,c_txt,c_vc,c_bytea,c_num,c_jsonb,c_inet)
-VALUES ('2026-04-10', 42, 7, 1.5, 2.5, true, '2026-01-10', '11111111-1111-1111-1111-111111111111','hi','abc','\xdeadbeef'::bytea, 123.45, '{"k":1}', '10.0.0.1');
+-- inet/cidr are intentionally absent: pg_duckdb cannot process inet (Oid 869)
+-- in an Iceberg-backed query, so they are rejected at provisioning (asserted
+-- below). IP data is stored as text instead.
+INSERT INTO typed (ts,c_int,c_small,c_real,c_dbl,c_bool,c_date,c_uuid,c_txt,c_vc,c_bytea,c_num,c_jsonb)
+VALUES ('2026-01-10', 42, 7, 1.5, 2.5, true, '2026-01-10', '11111111-1111-1111-1111-111111111111','hi','abc','\xdeadbeef'::bytea, 123.45, '{"k":1}');
+INSERT INTO typed (ts,c_int,c_small,c_real,c_dbl,c_bool,c_date,c_uuid,c_txt,c_vc,c_bytea,c_num,c_jsonb)
+VALUES ('2026-04-10', 42, 7, 1.5, 2.5, true, '2026-01-10', '11111111-1111-1111-1111-111111111111','hi','abc','\xdeadbeef'::bytea, 123.45, '{"k":1}');
 EOSQL
     cat > /tmp/journey-typed.yaml <<EOF
 postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
@@ -185,8 +186,13 @@ SELECT 'COLD_NUM:'  || c_num::text   FROM typed WHERE ts < '2026-02-01';
 SELECT 'COLD_UUID:' || c_uuid::text  FROM typed WHERE ts < '2026-02-01';
 SELECT 'COLD_SMALL:'|| c_small::text FROM typed WHERE ts < '2026-02-01';
 SELECT 'COLD_BOOL:' || c_bool::text  FROM typed WHERE ts < '2026-02-01';
-SELECT 'COLD_BYTEA:'|| encode(c_bytea,'hex') FROM typed WHERE ts < '2026-02-01';
-SELECT 'COLD_INET:' || (c_inet::text) FROM typed WHERE ts < '2026-02-01';
+-- bytea: encode()/hex() aren't exposed through pg_duckdb and its ::text render
+-- carries backslashes that the shell's echo mangles. Compare the cold value to
+-- the hot source value as a bool — backslash-free and verifies content fidelity.
+SELECT 'BYTEAEQ:' || (c_bytea = (SELECT c_bytea FROM typed WHERE ts >= '2026-04-01' LIMIT 1))::text FROM typed WHERE ts < '2026-02-01';
+-- Native byte count: '\xdeadbeef' is 4 bytes. A stringification bug would store
+-- the 10-char text '\xdeadbeef' (10 bytes). Independent of the equality check.
+SELECT 'BYTEALEN:' || octet_length(c_bytea)::text FROM typed WHERE ts < '2026-02-01';
 SELECT 'HOT_NUM:'   || c_num::text   FROM typed WHERE ts >= '2026-04-01';
 EOSQL
 )
@@ -194,9 +200,28 @@ EOSQL
     assert_eq "cold uuid round-trip"  "11111111-1111-1111-1111-111111111111" "$(extract COLD_UUID "$O")"
     assert_eq "cold smallint round-trip (widened to int)" "7" "$(extract COLD_SMALL "$O")"
     assert_eq "cold boolean round-trip" "true"   "$(extract COLD_BOOL "$O")"
-    assert_eq "cold bytea round-trip" "deadbeef" "$(extract COLD_BYTEA "$O")"
-    assert_contains "cold inet round-trip (text-backed, cast back)" "10.0.0.1" "$(extract COLD_INET "$O")"
+    assert_eq "cold bytea round-trip (cold == hot source)" "true" "$(extract BYTEAEQ "$O")"
+    assert_eq "cold bytea stored as 4 native bytes" "4" "$(extract BYTEALEN "$O")"
     assert_eq "hot numeric round-trip" "123.45000" "$(extract HOT_NUM "$O")"
+
+    # Cold INSERT via the view trigger (ts < cutoff) must store bytea NATIVELY,
+    # not ::text-stringified. '\xcafe' is 2 bytes; a stringification bug would
+    # store the 6-char text '\xcafe' (6 bytes). Exercises the trigger cold path,
+    # distinct from the archiver bulk-export path above.
+    local CI; CI=$(qf "$HOST" <<'EOSQL'
+INSERT INTO typed (ts,c_int,c_small,c_real,c_dbl,c_bool,c_date,c_uuid,c_txt,c_vc,c_bytea,c_num,c_jsonb)
+VALUES ('2026-01-20', 1,1,1,1,true,'2026-01-20','22222222-2222-2222-2222-222222222222','x','y','\xcafe'::bytea, 1.0, '{}');
+SELECT 'COLDINS_LEN:' || octet_length(c_bytea)::text FROM typed
+  WHERE c_uuid = '22222222-2222-2222-2222-222222222222' AND ts < '2026-02-01';
+EOSQL
+)
+    assert_eq "cold-INSERT-via-trigger bytea stored natively (2 bytes)" "2" "$(extract COLDINS_LEN "$CI")"
+
+    # inet/cidr are rejected at provisioning — no cast makes them readable
+    # through pg_duckdb once the table is Iceberg-backed. Match the specific
+    # rejection text, not just the type name (which the input itself contains).
+    local IE; IE=$(q_may "$HOST" "SELECT coldfront.create_iceberg_table('public','ip_reject','[{\"name\":\"a\",\"type\":\"inet\"}]'::jsonb);")
+    assert_contains "inet rejected at provisioning" "store IP data as text" "$IE"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -263,6 +288,51 @@ story_blocks() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# Story 9 — Concurrency / no-409: writes that race the archive cycle survive.
+# p_2026_04 is still hot after the first (1-month) cycle. A second cycle with
+# 1-day retention expires it; --debug-export-delay holds the capture window
+# open while concurrent UPDATE/DELETE/INSERT race into the delta trigger, which
+# the cold replay must apply. (Ported from run-ci-local.sh step 8b — the one
+# E2E behaviour the journey didn't yet cover.)
+# ───────────────────────────────────────────────────────────────────────────
+story_concurrency() {
+    step "9. Race window: writes during the archive cycle survive into cold"
+    qf "$HOST" <<'EOSQL' >/dev/null
+INSERT INTO events (ts, status, data) VALUES
+  ('2026-04-15 12:00+00','race_seed_a','{}'),
+  ('2026-04-16 12:00+00','race_seed_b','{}'),
+  ('2026-04-17 12:00+00','race_seed_c','{}'),
+  ('2026-04-18 12:00+00','race_will_delete','{}');
+EOSQL
+    cat > /tmp/journey-race.yaml <<EOF
+postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
+iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog", namespace: "default" }
+s3:       { endpoint: "${SW_IP}:8333", region: "us-east-1", access_key: "admin", secret_key: "adminsecret" }
+archiver: { tables: [ { source_table: events, partition_period: monthly, retention_period: "1 day" } ] }
+EOF
+    "$ARCHIVER" --config /tmp/journey-race.yaml --debug-export-delay 4s >/tmp/journey-race.log 2>&1 &
+    local apid=$!
+    local i
+    for i in $(seq 1 30); do
+        grep -q "debug-export-delay" /tmp/journey-race.log 2>/dev/null && break
+        sleep 1
+    done
+    # Concurrent writes land in the capture window: UPDATE 3 seeds, DELETE 1,
+    # INSERT 1 new — all must propagate to the cold tier via delta replay.
+    qf "$HOST" <<'EOSQL' >/dev/null 2>&1
+UPDATE events SET status='during_archive' WHERE status IN ('race_seed_a','race_seed_b','race_seed_c');
+DELETE FROM events WHERE status='race_will_delete';
+INSERT INTO events (ts, status, data) VALUES ('2026-04-19 12:00+00','during_archive_insert','{}');
+EOSQL
+    if wait "$apid"; then pass "archiver cycle 2 completed cleanly (no 409)"
+    else fail "archiver errored during race window"; tail -5 /tmp/journey-race.log; fi
+    assert_eq "race UPDATEs survived (3 retagged in cold)" "3" "$(q "$HOST" "SELECT count(*) FROM events WHERE status='during_archive';")"
+    assert_eq "race INSERT survived (1 new in cold)"       "1" "$(q "$HOST" "SELECT count(*) FROM events WHERE status='during_archive_insert';")"
+    assert_eq "race DELETE survived (0 remaining)"         "0" "$(q "$HOST" "SELECT count(*) FROM events WHERE status='race_will_delete';")"
+    assert_eq "no rows left in original race_seed status"  "0" "$(q "$HOST" "SELECT count(*) FROM events WHERE status IN ('race_seed_a','race_seed_b','race_seed_c');")"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Story 10 — Transactions: rollback undoes both tiers; archiver idempotent.
 # ───────────────────────────────────────────────────────────────────────────
 story_txn() {
@@ -302,6 +372,7 @@ story_types
 story_writes
 story_ddl
 story_blocks
+story_concurrency
 story_txn
 story_coexist
 [ "$MESH" = 1 ]      && story_mesh
