@@ -1,0 +1,25 @@
+-- DDL on tables NOT registered in coldfront.tiered_views must pass through
+-- untouched: no error, no view rebuild, no bakery acquisition. The hook only
+-- acts on registered tiered tables.
+CREATE EXTENSION IF NOT EXISTS pg_duckdb;
+NOTICE:  extension "pg_duckdb" already exists, skipping
+CREATE EXTENSION IF NOT EXISTS coldfront;
+NOTICE:  extension "coldfront" already exists, skipping
+SET coldfront.warehouse = '';
+SET coldfront.lakekeeper_endpoint = '';
+SET coldfront.dblink_self = '';
+-- A plain table with no registry entry.
+CREATE TABLE public.plain (id int, val text);
+INSERT INTO public.plain VALUES (1, 'a');
+-- All DDL forms pass straight through.
+ALTER TABLE public.plain ADD COLUMN extra int;
+ALTER TABLE public.plain DROP COLUMN val;
+ALTER TABLE public.plain RENAME COLUMN extra TO renamed;
+ALTER TABLE public.plain RENAME TO plain2;
+TRUNCATE public.plain2;
+DROP TABLE public.plain2;
+-- A non-tiered VIEW also passes through (it is not in tiered_views).
+CREATE TABLE public.base (id int);
+CREATE VIEW public.base_v AS SELECT * FROM public.base;
+DROP VIEW public.base_v;
+DROP TABLE public.base;

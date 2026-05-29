@@ -34,6 +34,7 @@
 
 #include "access/attnum.h"
 #include "access/xact.h"
+#include "catalog/namespace.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_type_d.h"
 #include "executor/spi.h"
@@ -41,7 +42,9 @@
 #include "nodes/parsenodes.h"
 #include "nodes/pg_list.h"
 #include "parser/analyze.h"
+#include "replication/logicalworker.h"
 #include "tcop/tcopprot.h"
+#include "tcop/utility.h"
 #include "utils/builtins.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
@@ -66,6 +69,18 @@ static bool coldfront_in_rewrite = false;
 static bool coldfront_allow_mixed_writes = true;
 
 static post_parse_analyze_hook_type prev_post_parse_analyze_hook = NULL;
+
+/* Previous ProcessUtility_hook (pg_duckdb's, since coldfront loads after it). */
+static ProcessUtility_hook_type prev_process_utility_hook = NULL;
+
+/*
+ * Re-entrancy guard for the DDL hook. _rebuild_tiered_view issues CREATE VIEW /
+ * CREATE TRIGGER via SPI; those utility statements re-enter ProcessUtility ->
+ * our hook. When this is true the hook must do NO coldfront work and just chain
+ * through to the real utility processor (mirrors coldfront_in_rewrite for the
+ * parse-analyze hook).
+ */
+static bool coldfront_in_utility = false;
 
 typedef struct {
     char        *hot_table;       /* e.g. "public._events"; NULL when is_iceberg_only */
@@ -1573,6 +1588,553 @@ coldfront_enqueue_release(PG_FUNCTION_ARGS)
     PG_RETURN_VOID();
 }
 
+/* ---------- DDL synchronization (ProcessUtility_hook) ----------------- */
+
+/*
+ * Registry row matched for a DDL target. We key on the HOT table's OID for
+ * ALTER/RENAME (DDL fires on the heap, not the view) and on EITHER the hot
+ * table or the view OID for DROP/TRUNCATE (both must be blocked). All matching
+ * is by resolved OID — never by string — so it is schema-agnostic.
+ */
+typedef struct {
+    Oid   view_oid;        /* registry key (the transparent view) */
+    char *hot_table;       /* quoted qualified, e.g. "public"."_events" */
+    char *iceberg_table;   /* DuckDB ref, e.g. ice.default.events */
+    char *partition_col;   /* the tier partition column */
+} TieredDDLInfo;
+
+/*
+ * Find the tiered registry row whose HOT table resolves to relid. Populates
+ * *out (palloc'd in CurTransactionContext) and returns true on a match.
+ *
+ * Matching is done in SQL: to_regclass(hot_table)::oid = relid. to_regclass
+ * resolves the stored quoted-qualified name schema-aware (never assumes a
+ * schema), so this is correct regardless of search_path or the incoming
+ * RangeVar's qualification. One query, no SPI_tuptable clobbering.
+ */
+static bool
+lookup_tiered_by_hot_oid(Oid relid, TieredDDLInfo *out)
+{
+    bool           found = false;
+    StringInfoData sql;
+
+    if (!OidIsValid(relid))
+        return false;
+    if (SPI_connect() != SPI_OK_CONNECT)
+        return false;
+
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+        "SELECT view_oid, hot_table, iceberg_table, partition_col "
+        "FROM coldfront.tiered_views "
+        "WHERE hot_table IS NOT NULL "
+        "  AND to_regclass(hot_table)::oid = %u "
+        "LIMIT 1",
+        relid);
+
+    if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed == 1)
+    {
+        MemoryContext oldcxt = MemoryContextSwitchTo(CurTransactionContext);
+        bool    isnull;
+        Datum   d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc,
+                                  1, &isnull);
+        char   *pc;
+        out->view_oid      = DatumGetObjectId(d);
+        out->hot_table     = pstrdup(SPI_getvalue(SPI_tuptable->vals[0],
+                                                  SPI_tuptable->tupdesc, 2));
+        out->iceberg_table = pstrdup(SPI_getvalue(SPI_tuptable->vals[0],
+                                                  SPI_tuptable->tupdesc, 3));
+        pc = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 4);
+        out->partition_col = pc ? pstrdup(pc) : NULL;
+        MemoryContextSwitchTo(oldcxt);
+        found = true;
+    }
+
+    pfree(sql.data);
+    SPI_finish();
+    return found;
+}
+
+/*
+ * Returns true if relid is a registered tiered relation — either the hot table
+ * or the transparent view. Used to block DROP/TRUNCATE on either side. Single
+ * query, schema-safe via to_regclass (see lookup_tiered_by_hot_oid).
+ */
+static bool
+relid_is_tiered(Oid relid)
+{
+    bool           found = false;
+    StringInfoData sql;
+
+    if (!OidIsValid(relid))
+        return false;
+    if (SPI_connect() != SPI_OK_CONNECT)
+        return false;
+
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+        "SELECT 1 FROM coldfront.tiered_views "
+        "WHERE view_oid = %u "
+        "   OR (hot_table IS NOT NULL AND to_regclass(hot_table)::oid = %u) "
+        "LIMIT 1",
+        relid, relid);
+    if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed == 1)
+        found = true;
+    pfree(sql.data);
+
+    SPI_finish();
+    return found;
+}
+
+/* Run one void-returning coldfront helper via SPI with up to two text args. */
+static void
+spi_exec_void(const char *sql)
+{
+    if (SPI_connect() == SPI_OK_CONNECT)
+    {
+        SPI_execute(sql, false, 0);
+        SPI_finish();
+    }
+}
+
+/* Mirror one column DDL to Iceberg + (caller separately) rebuild the view. */
+static void
+mirror_column_ddl(const TieredDDLInfo *info, const char *op,
+                  const char *col, const char *rename_to)
+{
+    StringInfoData sql;
+    initStringInfo(&sql);
+    if (rename_to != NULL)
+        appendStringInfo(&sql,
+            "SELECT coldfront._mirror_iceberg_column_ddl(%s, %s, %s, %s, %s)",
+            quote_literal_cstr(info->iceberg_table),
+            quote_literal_cstr(info->hot_table),
+            quote_literal_cstr(op),
+            quote_literal_cstr(col),
+            quote_literal_cstr(rename_to));
+    else
+        appendStringInfo(&sql,
+            "SELECT coldfront._mirror_iceberg_column_ddl(%s, %s, %s, %s, NULL)",
+            quote_literal_cstr(info->iceberg_table),
+            quote_literal_cstr(info->hot_table),
+            quote_literal_cstr(op),
+            quote_literal_cstr(col));
+    spi_exec_void(sql.data);
+    pfree(sql.data);
+}
+
+/* Rebuild the transparent view + INSERT trigger from post-DDL catalog state.
+ * view_oid still resolves (rename / add-column path). */
+static void
+rebuild_tiered_view(Oid view_oid)
+{
+    StringInfoData sql;
+    initStringInfo(&sql);
+    appendStringInfo(&sql, "SELECT coldfront._rebuild_tiered_view(%u)", view_oid);
+    spi_exec_void(sql.data);
+    pfree(sql.data);
+}
+
+/* Rebuild when the view was pre-dropped (DROP/ALTER-TYPE column path): the
+ * old view_oid is dead, so pass the saved schema + view name explicitly. */
+static void
+rebuild_tiered_view_named(Oid view_oid, const char *schema, const char *vname)
+{
+    StringInfoData sql;
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+        "SELECT coldfront._rebuild_tiered_view(%u, %s, %s)",
+        view_oid, quote_literal_cstr(schema), quote_literal_cstr(vname));
+    spi_exec_void(sql.data);
+    pfree(sql.data);
+}
+
+/* Drop the transparent view BEFORE a hot-table DROP/ALTER-TYPE column, so the
+ * view dependency doesn't block the real ALTER. Keyed on the (still-live) old
+ * view_oid; the registry row is left intact for rebuild_tiered_view_named(). */
+static void
+predrop_tiered_view(Oid view_oid)
+{
+    StringInfoData sql;
+    initStringInfo(&sql);
+    appendStringInfo(&sql, "SELECT coldfront._predrop_tiered_view(%u)", view_oid);
+    spi_exec_void(sql.data);
+    pfree(sql.data);
+}
+
+/* Update registry hot_table after a hot-heap rename. */
+static void
+update_hot_table(Oid view_oid, const char *new_hot_quoted)
+{
+    StringInfoData sql;
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+        "SELECT coldfront._update_tiered_hot_table(%u, %s)",
+        view_oid, quote_literal_cstr(new_hot_quoted));
+    spi_exec_void(sql.data);
+    pfree(sql.data);
+}
+
+/* Update registry partition_col after the partition column was renamed. */
+static void
+update_partition_col(Oid view_oid, const char *new_partcol)
+{
+    StringInfoData sql;
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+        "SELECT coldfront._update_tiered_partition_col(%u, %s)",
+        view_oid, quote_literal_cstr(new_partcol));
+    spi_exec_void(sql.data);
+    pfree(sql.data);
+}
+
+/* Migrate the archive_watermark row when the transparent view is renamed. The
+ * watermark is keyed on the bare view name; without this the rebuilt view
+ * loses its cold UNION branch. Idempotent (no-op if never archived). */
+static void
+rename_watermark(const char *old_view_name, const char *new_view_name)
+{
+    StringInfoData sql;
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+        "SELECT coldfront._rename_watermark(%s, %s)",
+        quote_literal_cstr(old_view_name), quote_literal_cstr(new_view_name));
+    spi_exec_void(sql.data);
+    pfree(sql.data);
+}
+
+/*
+ * Build the quoted-qualified name ("schema"."rel") for relid, as stored in
+ * coldfront.tiered_views.hot_table. Schema resolved at runtime — never assumes
+ * public. Returns palloc'd.
+ */
+static char *
+quoted_qualified_name(Oid relid)
+{
+    char *ns   = get_namespace_name(get_rel_namespace(relid));
+    char *name = get_rel_name(relid);
+    return psprintf("%s.%s", quote_identifier(ns), quote_identifier(name));
+}
+
+/*
+ * The coldfront ProcessUtility_hook. Intercepts DDL on registered tiered
+ * relations: blocks DROP/TRUNCATE, mirrors schema/rename DDL to Iceberg, and
+ * rebuilds the transparent view. Everything else passes straight through.
+ */
+static void
+coldfront_process_utility(PlannedStmt *pstmt, const char *queryString,
+                          bool readOnlyTree, ProcessUtilityContext context,
+                          ParamListInfo params, QueryEnvironment *queryEnv,
+                          DestReceiver *dest, QueryCompletion *qc)
+{
+    Node *stmt     = pstmt->utilityStmt;
+    bool  is_apply = IsLogicalWorker();
+
+#define COLDFRONT_CALL_THROUGH() \
+    do { \
+        if (prev_process_utility_hook) \
+            prev_process_utility_hook(pstmt, queryString, readOnlyTree, \
+                                      context, params, queryEnv, dest, qc); \
+        else \
+            standard_ProcessUtility(pstmt, queryString, readOnlyTree, \
+                                    context, params, queryEnv, dest, qc); \
+    } while (0)
+
+    /*
+     * Spock apply worker. When spock.enable_ddl_replication is on, Spock
+     * replicates ONLY the top-level ALTER TABLE (not our SPI-issued view
+     * rebuild — that runs at PROCESS_UTILITY_QUERY context, which Spock's
+     * autoddl_can_proceed() filters out). So a peer receives the ALTER TABLE
+     * and re-issues it through spock.queue, landing here with
+     * IsLogicalWorker() == true.
+     *
+     * The peer MUST still rebuild its OWN local view + re-point its OWN local
+     * registry (view_oid is a LOCAL oid; the registry is not Spock-replicated),
+     * and must still block DROP/TRUNCATE locally. But it must NOT mirror the
+     * schema change to Iceberg again — the originator already did that to the
+     * shared Lakekeeper catalog; a second mirror would double-apply / contend
+     * on the bakery against a remote-held claim. So we do not pass through
+     * blindly here; instead we carry is_apply down and skip only the Iceberg
+     * mirror when on the apply worker.
+     */
+
+    /* Re-entrant SPI-issued DDL (our own CREATE VIEW/TRIGGER): no coldfront
+     * work, just run it. */
+    if (coldfront_in_utility)
+    {
+        COLDFRONT_CALL_THROUGH();
+        return;
+    }
+
+    /* ---- DROP TABLE / DROP VIEW: block if any object is tiered. ---- */
+    if (IsA(stmt, DropStmt))
+    {
+        DropStmt *ds = (DropStmt *) stmt;
+        if (ds->removeType == OBJECT_TABLE || ds->removeType == OBJECT_VIEW)
+        {
+            ListCell *lc;
+            foreach(lc, ds->objects)
+            {
+                List     *names = (List *) lfirst(lc);
+                RangeVar *rv    = makeRangeVarFromNameList(names);
+                Oid       relid = RangeVarGetRelid(rv, NoLock, true);
+                if (relid_is_tiered(relid))
+                {
+                    char *ns   = get_namespace_name(get_rel_namespace(relid));
+                    char *name = get_rel_name(relid);
+                    ereport(ERROR,
+                        (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                         errmsg("coldfront: cannot DROP \"%s.%s\" — it has a cold tier in Iceberg",
+                                ns, name),
+                         errhint("Use coldfront.untier_table('%s', '%s') to detach the cold tier first.",
+                                 ns, name)));
+                }
+            }
+        }
+        COLDFRONT_CALL_THROUGH();
+        return;
+    }
+
+    /* ---- TRUNCATE: block if any relation is tiered. ---- */
+    if (IsA(stmt, TruncateStmt))
+    {
+        TruncateStmt *ts = (TruncateStmt *) stmt;
+        ListCell     *lc;
+        foreach(lc, ts->relations)
+        {
+            RangeVar *rv    = (RangeVar *) lfirst(lc);
+            Oid       relid = RangeVarGetRelid(rv, NoLock, true);
+            if (relid_is_tiered(relid))
+            {
+                char *ns   = get_namespace_name(get_rel_namespace(relid));
+                char *name = get_rel_name(relid);
+                ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("coldfront: cannot TRUNCATE tiered table \"%s.%s\" — cold-tier rows would remain visible",
+                            ns, name),
+                     errhint("Use coldfront.truncate_tiered('%s', '%s') to truncate both tiers.",
+                             ns, name)));
+            }
+        }
+        COLDFRONT_CALL_THROUGH();
+        return;
+    }
+
+    /* ---- ALTER TABLE: mirror ADD/DROP/ALTER COLUMN, rebuild view. ---- */
+    if (IsA(stmt, AlterTableStmt))
+    {
+        AlterTableStmt *at    = (AlterTableStmt *) stmt;
+        Oid             relid = RangeVarGetRelid(at->relation, NoLock, true);
+        TieredDDLInfo   info;
+        bool            need_predrop = false;
+        char           *view_schema = NULL;
+        char           *view_name   = NULL;
+        ListCell       *lc;
+
+        if (!lookup_tiered_by_hot_oid(relid, &info))
+        {
+            COLDFRONT_CALL_THROUGH();
+            return;
+        }
+
+        /* DROP COLUMN / ALTER COLUMN TYPE on the hot table are refused by PG
+         * while the transparent view depends on the column. We must drop the
+         * view BEFORE the real ALTER, then recreate it after. Detect whether
+         * any subcommand needs that. */
+        foreach(lc, at->cmds)
+        {
+            AlterTableCmd *cmd = (AlterTableCmd *) lfirst(lc);
+            if (cmd->subtype == AT_DropColumn ||
+                cmd->subtype == AT_AlterColumnType)
+            {
+                need_predrop = true;
+                break;
+            }
+        }
+
+        /* Capture the view identity while view_oid is still live, then drop
+         * the view so the ALTER isn't blocked by the dependency. Guard
+         * re-entry — predrop/rebuild issue DROP/CREATE VIEW via SPI. */
+        if (need_predrop)
+        {
+            view_schema = pstrdup(get_namespace_name(get_rel_namespace(info.view_oid)));
+            view_name   = pstrdup(get_rel_name(info.view_oid));
+            coldfront_in_utility = true;
+            PG_TRY();
+            {
+                predrop_tiered_view(info.view_oid);
+            }
+            PG_FINALLY();
+            {
+                coldfront_in_utility = false;
+            }
+            PG_END_TRY();
+        }
+
+        /* Run the real DDL (only mirror what PG accepted). */
+        COLDFRONT_CALL_THROUGH();
+
+        coldfront_in_utility = true;
+        PG_TRY();
+        {
+            /* Iceberg mirror: originator only. The apply worker's originator
+             * already mirrored to the shared Lakekeeper catalog. */
+            if (!is_apply)
+            {
+                foreach(lc, at->cmds)
+                {
+                    AlterTableCmd *cmd = (AlterTableCmd *) lfirst(lc);
+                    switch (cmd->subtype)
+                    {
+                    case AT_AddColumn:
+                    {
+                        ColumnDef *def = (ColumnDef *) cmd->def;
+                        mirror_column_ddl(&info, "ADD", def->colname, NULL);
+                        break;
+                    }
+                    case AT_DropColumn:
+                        mirror_column_ddl(&info, "DROP", cmd->name, NULL);
+                        break;
+                    case AT_AlterColumnType:
+                        mirror_column_ddl(&info, "ALTER_TYPE", cmd->name, NULL);
+                        break;
+                    default:
+                        break;
+                    }
+                }
+            }
+            /* View rebuild: every node, always — view_oid is local and the
+             * registry is not Spock-replicated. If we pre-dropped, the old
+             * view_oid is dead, so pass the saved schema + name. */
+            if (need_predrop)
+                rebuild_tiered_view_named(info.view_oid, view_schema, view_name);
+            else
+                rebuild_tiered_view(info.view_oid);
+        }
+        PG_FINALLY();
+        {
+            coldfront_in_utility = false;
+        }
+        PG_END_TRY();
+        return;
+    }
+
+    /* ---- RENAME: hot table, view, or column on a tiered relation. ---- */
+    if (IsA(stmt, RenameStmt))
+    {
+        RenameStmt   *rs = (RenameStmt *) stmt;
+        TieredDDLInfo info;
+        bool          matched = false;
+        Oid           hot_relid = InvalidOid;
+        Oid           view_relid = InvalidOid;
+        char         *old_view_name = NULL;   /* captured pre-rename for OBJECT_VIEW */
+
+        if (rs->renameType == OBJECT_TABLE || rs->renameType == OBJECT_COLUMN)
+        {
+            hot_relid = RangeVarGetRelid(rs->relation, NoLock, true);
+            matched   = lookup_tiered_by_hot_oid(hot_relid, &info);
+        }
+        if (!matched && (rs->renameType == OBJECT_VIEW ||
+                         rs->renameType == OBJECT_COLUMN))
+        {
+            /* Rename targeting the view itself (column rename on a view, or
+             * view rename). The view OID is the registry key directly. */
+            view_relid = RangeVarGetRelid(rs->relation, NoLock, true);
+            if (relid_is_tiered(view_relid))
+            {
+                /* Re-fetch the registry row by view OID. */
+                if (SPI_connect() == SPI_OK_CONNECT)
+                {
+                    StringInfoData q;
+                    initStringInfo(&q);
+                    appendStringInfo(&q,
+                        "SELECT view_oid, hot_table, iceberg_table, partition_col "
+                        "FROM coldfront.tiered_views WHERE view_oid = %u",
+                        view_relid);
+                    if (SPI_execute(q.data, true, 1) == SPI_OK_SELECT &&
+                        SPI_processed == 1)
+                    {
+                        MemoryContext oldcxt = MemoryContextSwitchTo(CurTransactionContext);
+                        char *s;
+                        info.view_oid      = view_relid;
+                        s = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2);
+                        info.hot_table     = s ? pstrdup(s) : NULL;
+                        info.iceberg_table = pstrdup(SPI_getvalue(SPI_tuptable->vals[0],
+                                                     SPI_tuptable->tupdesc, 3));
+                        s = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 4);
+                        info.partition_col = s ? pstrdup(s) : NULL;
+                        MemoryContextSwitchTo(oldcxt);
+                        matched = true;
+                    }
+                    pfree(q.data);
+                    SPI_finish();
+                }
+            }
+        }
+
+        if (!matched)
+        {
+            COLDFRONT_CALL_THROUGH();
+            return;
+        }
+
+        /* For a VIEW rename, capture the OLD view name NOW (before the rename
+         * executes) so we can migrate the name-keyed archive_watermark row. */
+        if (rs->renameType == OBJECT_VIEW && OidIsValid(view_relid))
+            old_view_name = pstrdup(get_rel_name(view_relid));
+
+        COLDFRONT_CALL_THROUGH();
+
+        coldfront_in_utility = true;
+        PG_TRY();
+        {
+            if (rs->renameType == OBJECT_COLUMN)
+            {
+                /* Mirror the column rename to Iceberg (originator only), and if
+                 * the partition column was renamed, update the registry BEFORE
+                 * the rebuild (which reads partition_col for the WHERE clauses).
+                 * The registry update + rebuild run on every node. */
+                if (!is_apply)
+                    mirror_column_ddl(&info, "RENAME", rs->subname, rs->newname);
+                if (info.partition_col != NULL &&
+                    strcmp(info.partition_col, rs->subname) == 0)
+                    update_partition_col(info.view_oid, rs->newname);
+                rebuild_tiered_view(info.view_oid);
+            }
+            else if (rs->renameType == OBJECT_TABLE && OidIsValid(hot_relid))
+            {
+                /* Hot heap renamed: registry hot_table follows (resolve the
+                 * post-rename quoted qualified name), then rebuild. */
+                char *new_hot = quoted_qualified_name(hot_relid);
+                update_hot_table(info.view_oid, new_hot);
+                rebuild_tiered_view(info.view_oid);
+            }
+            else
+            {
+                /* View renamed: migrate the name-keyed archive_watermark row to
+                 * the new name FIRST (the rebuild and the regenerated INSERT
+                 * trigger both look the cutoff up by the new name — without this
+                 * the rebuilt view would silently lose its cold UNION branch).
+                 * Then rebuild: regenerates trigger/func names from the new view
+                 * name and re-points the registry to the new OID. */
+                if (old_view_name != NULL &&
+                    strcmp(old_view_name, rs->newname) != 0)
+                    rename_watermark(old_view_name, rs->newname);
+                rebuild_tiered_view(info.view_oid);
+            }
+        }
+        PG_FINALLY();
+        {
+            coldfront_in_utility = false;
+        }
+        PG_END_TRY();
+        return;
+    }
+
+    COLDFRONT_CALL_THROUGH();
+#undef COLDFRONT_CALL_THROUGH
+}
+
 /* ---------- _PG_init -------------------------------------------------- */
 
 void _PG_init(void);
@@ -1598,6 +2160,11 @@ _PG_init(void)
 
     prev_post_parse_analyze_hook = post_parse_analyze_hook;
     post_parse_analyze_hook      = coldfront_post_parse_analyze;
+
+    /* DDL synchronization for tiered tables. Chains pg_duckdb's
+     * ProcessUtility_hook (coldfront loads later, so prev == pg_duckdb's). */
+    prev_process_utility_hook = ProcessUtility_hook;
+    ProcessUtility_hook       = coldfront_process_utility;
 
     /* Register the bakery release-deferral callback. Runs after pg_duckdb's
      * XactCallback (coldfront appears later in shared_preload_libraries, so

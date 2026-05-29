@@ -1511,3 +1511,454 @@ BEGIN
     PERFORM coldfront._enqueue_release(my_ticket);
 END;
 $$;
+
+-- ============================================================================
+-- DDL synchronization for tiered tables.
+--
+-- The coldfront C extension's ProcessUtility_hook intercepts DDL on a
+-- registered tiered table's HOT heap (ALTER TABLE ADD/DROP/ALTER COLUMN,
+-- RENAME COLUMN, RENAME TABLE) and DROP/TRUNCATE on either the hot table or
+-- the transparent view. The hook:
+--   1. resolves the DDL target's OID and matches it against the registry
+--      (by resolving tiered_views.hot_table / the view to OIDs — never by
+--      string match, so it is schema-agnostic);
+--   2. blocks DROP TABLE / DROP VIEW / TRUNCATE with an actionable error;
+--   3. for schema/rename DDL: lets the real PG DDL run, mirrors the
+--      equivalent change to the Iceberg table (only when a warehouse is
+--      configured), updates the registry for renames, and rebuilds the
+--      transparent view + INSERT trigger from the post-DDL catalog state.
+--
+-- The helpers below are the SQL side of that hook. They are driven entirely
+-- from pg_catalog (post-DDL column list), so they never assume a schema name
+-- and never hardcode a column list. No plpgsql EXCEPTION blocks — pg_duckdb
+-- hard-rejects subtransactions.
+-- ============================================================================
+
+-- Mirror a single-column schema change to the Iceberg table. The post-DDL
+-- column type is read from the HOT table's pg_attribute by name (so typmods
+-- like varchar(n)/numeric(p,s) survive) and mapped to the Iceberg storage
+-- type via the existing _iceberg_storage_type(). p_op is 'ADD', 'DROP', or
+-- 'ALTER_TYPE'; p_rename_to is set only for a column rename (p_op='RENAME').
+--
+-- No-op when coldfront.warehouse is empty (single-node / pg_regress): there
+-- is no catalog to mirror to, and ensure_attached() would be a no-op anyway.
+-- When a warehouse IS set, the Iceberg ALTER goes through the bakery so a
+-- concurrent writer's commit POST can't race the schema change. The release is
+-- enqueued right after the claim (before the error-prone raw_query) so an
+-- Iceberg-ALTER failure can't orphan the claim; the C XactCallback does the
+-- actual release at xact end on both commit and abort.
+CREATE FUNCTION coldfront._mirror_iceberg_column_ddl(
+    p_iceberg_table text,
+    p_hot_table     text,
+    p_op            text,
+    p_col           text,
+    p_rename_to     text DEFAULT NULL
+) RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+    wh           text := current_setting('coldfront.warehouse', true);
+    v_hot_schema text;
+    v_hot_rel    text;
+    v_pg_type    text;
+    v_storage    text;
+    v_fragment   text;
+    my_ticket    bigint;
+BEGIN
+    -- Skip the Iceberg side entirely when no warehouse is configured. The
+    -- PG-side view rebuild (done by the hook's _rebuild_tiered_view call)
+    -- still happens; only the cold-tier mirror is conditional.
+    IF wh IS NULL OR wh = '' THEN
+        RETURN;
+    END IF;
+
+    v_hot_schema := (parse_ident(p_hot_table))[1];
+    v_hot_rel    := (parse_ident(p_hot_table))[2];
+
+    IF p_op = 'ADD' OR p_op = 'ALTER_TYPE' THEN
+        -- Read the post-DDL canonical type from the catalog (the real ALTER
+        -- already ran), preserving typmod, then map to Iceberg storage.
+        SELECT format_type(a.atttypid, a.atttypmod)
+          INTO v_pg_type
+          FROM pg_attribute a
+          JOIN pg_class c     ON c.oid = a.attrelid
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = v_hot_schema AND c.relname = v_hot_rel
+           AND a.attname = p_col AND a.attnum > 0 AND NOT a.attisdropped;
+        IF v_pg_type IS NULL THEN
+            RAISE EXCEPTION 'coldfront._mirror_iceberg_column_ddl: column % not found on %.% after DDL',
+                p_col, v_hot_schema, v_hot_rel;
+        END IF;
+        v_storage := coldfront._iceberg_storage_type(v_pg_type);
+        IF p_op = 'ADD' THEN
+            v_fragment := format('ADD COLUMN %I %s', p_col, v_storage);
+        ELSE
+            v_fragment := format('ALTER COLUMN %I TYPE %s', p_col, v_storage);
+        END IF;
+    ELSIF p_op = 'DROP' THEN
+        v_fragment := format('DROP COLUMN %I', p_col);
+    ELSIF p_op = 'RENAME' THEN
+        v_fragment := format('RENAME COLUMN %I TO %I', p_col, p_rename_to);
+    ELSE
+        RAISE EXCEPTION 'coldfront._mirror_iceberg_column_ddl: unknown op %', p_op;
+    END IF;
+
+    PERFORM coldfront.ensure_attached();
+
+    -- Real PG DDL (a write) already ran in this xact; the Iceberg ALTER is a
+    -- DuckDB write. Relax pg_duckdb's mixed-write guard for this statement.
+    SET LOCAL duckdb.unsafe_allow_mixed_transactions = on;
+
+    -- Serialise the schema change against concurrent committers on this
+    -- iceberg table. Claim, then enqueue the release IMMEDIATELY (before the
+    -- failure-prone raw_query). _enqueue_release only appends the ticket to an
+    -- in-memory list; the actual DELETE still fires in the C XactCallback at
+    -- xact end (after pg_duckdb's commit POST, on BOTH commit and abort). If
+    -- the Iceberg ALTER below raises, the ticket is already queued, so the
+    -- abort-path XactCallback releases it — no orphaned claim wedging the
+    -- bakery. (Unlike _exec_iceberg_with_claim, the raw_query here is the
+    -- error-prone step, so enqueue must precede it, not follow it.)
+    my_ticket := coldfront._claim_iceberg_lock(p_iceberg_table);
+    PERFORM coldfront._enqueue_release(my_ticket);
+    PERFORM duckdb.raw_query(format('ALTER TABLE %s %s', p_iceberg_table, v_fragment));
+END;
+$$;
+
+-- Update the registry's hot_table after an ALTER TABLE ... RENAME of the hot
+-- heap. p_new_hot_table is the new quoted qualified name (built by the C hook
+-- from the post-rename catalog state). Keyed on view_oid, which is stable
+-- across a table rename (only the view rebuild changes the view OID).
+CREATE FUNCTION coldfront._update_tiered_hot_table(
+    p_view_oid oid, p_new_hot_table text
+) RETURNS void LANGUAGE sql AS $$
+    UPDATE coldfront.tiered_views
+       SET hot_table = p_new_hot_table
+     WHERE view_oid = p_view_oid;
+$$;
+
+-- Update the registry's partition_col after RENAME COLUMN renamed the
+-- partition column. Keyed on view_oid.
+CREATE FUNCTION coldfront._update_tiered_partition_col(
+    p_view_oid oid, p_new_partition_col text
+) RETURNS void LANGUAGE sql AS $$
+    UPDATE coldfront.tiered_views
+       SET partition_col = p_new_partition_col
+     WHERE view_oid = p_view_oid;
+$$;
+
+-- Migrate the archive_watermark row when the transparent VIEW is renamed.
+-- The watermark is keyed on the bare view name (== archiver SourceTable), and
+-- _rebuild_tiered_view + the regenerated INSERT trigger both look the cutoff up
+-- by the NEW name. Without this migration the lookup would miss, v_has_cutoff
+-- would be false, and the rebuilt view would drop its cold (Iceberg) UNION
+-- branch entirely — silently hiding all archived data. Called by the DDL hook's
+-- view-rename branch BEFORE the rebuild so the rebuild reads the migrated row.
+-- No-op (idempotent) if no watermark row exists yet (table never archived).
+CREATE FUNCTION coldfront._rename_watermark(
+    p_old_view_name text, p_new_view_name text
+) RETURNS void LANGUAGE sql AS $$
+    UPDATE coldfront.archive_watermark
+       SET table_name = p_new_view_name
+     WHERE table_name = p_old_view_name;
+$$;
+
+-- coldfront._predrop_tiered_view: drop the transparent view (and its INSTEAD
+-- OF trigger, which goes with it) BEFORE the hot table's DROP COLUMN / ALTER
+-- COLUMN TYPE runs. Those DDLs are refused by PG while a view depends on the
+-- column ("cannot drop column ... because view ... depends on it"). The DDL
+-- hook calls this pre-DDL for column drop/type-change, then runs the real
+-- ALTER, then _rebuild_tiered_view re-creates the view from the new catalog
+-- state. The registry row is left intact (still keyed on the OLD view_oid);
+-- _rebuild_tiered_view re-points it to the freshly-created view's OID.
+-- SET client_min_messages = warning (function attribute) quiets the
+-- "view ... does not exist, skipping" NOTICE from the idempotent DROP IF
+-- EXISTS; PG saves/restores the GUC around the call automatically.
+CREATE FUNCTION coldfront._predrop_tiered_view(p_view_oid oid)
+RETURNS void LANGUAGE plpgsql
+SET client_min_messages = warning AS $$
+DECLARE
+    v_schema    text;
+    v_view_name text;
+BEGIN
+    SELECT n.nspname, c.relname
+      INTO v_schema, v_view_name
+      FROM coldfront.tiered_views tv
+      JOIN pg_class c     ON c.oid = tv.view_oid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE tv.view_oid = p_view_oid;
+    IF NOT FOUND THEN
+        RETURN;
+    END IF;
+    EXECUTE format('DROP VIEW IF EXISTS %I.%I CASCADE', v_schema, v_view_name);
+END;
+$$;
+
+-- coldfront._rebuild_tiered_view: regenerate the transparent UNION-ALL view
+-- and its INSTEAD OF INSERT trigger after a schema DDL changed the hot
+-- table's columns. Driven entirely from pg_catalog (post-DDL column list) so
+-- it is the runtime equivalent of internal/view/view.go's GenerateViewSQL /
+-- GenerateTriggerFuncSQL / GenerateTriggerSQL.
+--
+-- Called by the coldfront DDL hook for tiered views (rows with a non-NULL
+-- hot_table). Iceberg-only views (is_iceberg_only = true, hot_table NULL) are
+-- OUT OF SCOPE and short-circuit to a no-op: their column shape is owned by
+-- create_iceberg_table(), not by a PG hot heap.
+--
+-- View strategy: DROP VIEW IF EXISTS ... CASCADE then CREATE VIEW (never
+-- CREATE OR REPLACE). PG only lets CREATE OR REPLACE VIEW append columns at
+-- the end; a DDL that drops/renames/reorders/retypes a column would fail it.
+-- DROP also removes the INSTEAD OF trigger (recreated below) and changes the
+-- view OID, so the registry row is re-pointed at the new OID before returning.
+-- p_schema / p_view_name: optional view identity. The DDL hook passes them for
+-- the DROP COLUMN / ALTER COLUMN TYPE path, where the view was already dropped
+-- (via _predrop_tiered_view) BEFORE the real ALTER ran — so the registry's
+-- view_oid now points to a dead pg_class entry and can't be resolved by JOIN.
+-- When omitted (renames, add-column), the identity is resolved from view_oid.
+CREATE FUNCTION coldfront._rebuild_tiered_view(
+    p_view_oid   oid,
+    p_schema     text DEFAULT NULL,
+    p_view_name  text DEFAULT NULL
+)
+RETURNS void
+LANGUAGE plpgsql
+SET client_min_messages = warning AS $$
+DECLARE
+    v_schema        text;
+    v_view_name     text;          -- bare relname == archiver SourceTable == watermark key
+    v_hot_table     text;          -- stored quoted, e.g. "public"."_events"
+    v_iceberg       text;          -- DuckDB ref, e.g. ice.default.events
+    v_partcol       text;
+    v_is_ice_only   boolean;
+    v_hot_schema    text;
+    v_hot_relname   text;
+    v_cutoff        timestamptz;
+    v_cutoff_lit    text;          -- UTC text literal of the cutoff (matches view.go)
+    v_has_cutoff    boolean;
+
+    v_hot_proj      text := '';     -- hot SELECT list
+    v_cold_proj     text := '';     -- cold SELECT list
+    v_col_list      text := '';     -- INSERT target columns (non-identity)
+    v_hot_vals      text := '';     -- NEW."col" refs (non-identity)
+    v_cold_vals     text := '';     -- NEW."col"[::text] refs (non-identity)
+    v_placeholders  text := '';     -- %L / NULL per column, positional
+
+    v_view_sql      text;
+    v_func_sql      text;
+    v_funcname      text;           -- coldfront."<view>_write"
+    v_trigname      text;           -- "<view>_write_trigger"
+    v_new_oid       oid;
+
+    r               record;
+    n               int := 0;       -- live-column counter for projections
+    cast_type       text;
+    cold_type       text;
+    iter            int := 0;       -- raw attribute counter (placeholder ordering)
+BEGIN
+    -- 1. Resolve registry columns from the (possibly now-dead) view_oid. The
+    -- registry row persists even after _predrop_tiered_view dropped the view.
+    SELECT tv.hot_table, tv.iceberg_table, tv.partition_col, tv.is_iceberg_only
+    INTO v_hot_table, v_iceberg, v_partcol, v_is_ice_only
+    FROM coldfront.tiered_views tv
+    WHERE tv.view_oid = p_view_oid;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'coldfront._rebuild_tiered_view: view oid % not registered', p_view_oid;
+    END IF;
+
+    -- View identity: from the caller (predrop path, OID now dead) or resolved
+    -- from the live view_oid (rename / add-column path).
+    IF p_schema IS NOT NULL AND p_view_name IS NOT NULL THEN
+        v_schema    := p_schema;
+        v_view_name := p_view_name;
+    ELSE
+        SELECT n.nspname, c.relname
+        INTO v_schema, v_view_name
+        FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.oid = p_view_oid;
+        IF NOT FOUND THEN
+            RAISE EXCEPTION 'coldfront._rebuild_tiered_view: view oid % no longer exists; pass p_schema/p_view_name', p_view_oid;
+        END IF;
+    END IF;
+
+    -- Iceberg-only views have no hot table to read columns from: NO-OP.
+    IF v_is_ice_only OR v_hot_table IS NULL OR v_partcol IS NULL THEN
+        RETURN;
+    END IF;
+
+    -- hot_table is stored as a quoted identifier ("public"."_events").
+    -- parse_ident handles the quoting/escaping (same pattern as
+    -- _tiered_insert_cold). No EXCEPTION wrapper — pg_duckdb forbids subtxns.
+    v_hot_schema  := (parse_ident(v_hot_table))[1];
+    v_hot_relname := (parse_ident(v_hot_table))[2];
+
+    -- 2. Watermark cutoff, keyed on the BARE view name (== SourceTable).
+    SELECT cutoff_time INTO v_cutoff
+    FROM coldfront.archive_watermark
+    WHERE table_name = v_view_name;
+    v_has_cutoff := (v_cutoff IS NOT NULL);
+    IF v_has_cutoff THEN
+        -- UTC text literal, matching internal/view/view.go cutoffLiteral().
+        v_cutoff_lit := to_char(v_cutoff AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS+00');
+    END IF;
+
+    -- 3. Post-DDL column list from the HOT table, attnum order, live columns.
+    --    Build hot/cold projections and trigger lists in one pass — mirrors
+    --    view.go's single loop over cfg.Columns.
+    FOR r IN
+        SELECT a.attname,
+               format_type(a.atttypid, a.atttypmod) AS pg_type,
+               a.attidentity
+        FROM pg_attribute a
+        JOIN pg_class c      ON c.oid = a.attrelid
+        JOIN pg_namespace nn ON nn.oid = c.relnamespace
+        WHERE nn.nspname = v_hot_schema
+          AND c.relname  = v_hot_relname
+          AND a.attnum > 0
+          AND NOT a.attisdropped
+        ORDER BY a.attnum
+    LOOP
+        cast_type := coldfront._iceberg_view_cast_type(r.pg_type);
+
+        -- VIEW PROJECTIONS (view.go ~184-203).
+        IF n > 0 THEN
+            v_hot_proj  := v_hot_proj  || ', ';
+            v_cold_proj := v_cold_proj || ', ';
+        END IF;
+
+        IF cast_type <> '' THEN
+            v_hot_proj  := v_hot_proj  || quote_ident(r.attname) || '::' || cast_type;
+            v_cold_proj := v_cold_proj || format('r[%L]::%s', r.attname, cast_type);
+        ELSE
+            v_hot_proj  := v_hot_proj  || quote_ident(r.attname);
+            cold_type   := coldfront._iceberg_storage_type(r.pg_type);
+            v_cold_proj := v_cold_proj || format('r[%L]::%s', r.attname, cold_type);
+        END IF;
+        n := n + 1;
+
+        -- TRIGGER LISTS (view.go insertCols / coldInsertVals /
+        -- coldInsertPlaceholders). Placeholders are positional over ALL
+        -- columns incl. identity (NULL for identity, %L otherwise) because
+        -- DuckDB/Iceberg has no targeted insert.
+        IF iter > 0 THEN
+            v_placeholders := v_placeholders || ', ';
+        END IF;
+        iter := iter + 1;
+
+        IF r.attidentity = 'a' THEN
+            v_placeholders := v_placeholders || 'NULL';
+        ELSE
+            v_placeholders := v_placeholders || '%L';
+            IF v_col_list <> '' THEN
+                v_col_list := v_col_list || ', ';
+                v_hot_vals := v_hot_vals || ', ';
+                v_cold_vals := v_cold_vals || ', ';
+            END IF;
+            v_col_list := v_col_list || quote_ident(r.attname);
+            v_hot_vals := v_hot_vals || 'NEW.' || quote_ident(r.attname);
+            IF cast_type <> '' THEN
+                v_cold_vals := v_cold_vals || 'NEW.' || quote_ident(r.attname) || '::text';
+            ELSE
+                v_cold_vals := v_cold_vals || 'NEW.' || quote_ident(r.attname);
+            END IF;
+        END IF;
+    END LOOP;
+
+    IF n = 0 THEN
+        RAISE EXCEPTION 'coldfront._rebuild_tiered_view: hot table %.% has no live columns',
+            v_hot_schema, v_hot_relname;
+    END IF;
+
+    -- 4. Build the view DDL (DROP + CREATE; see header).
+    IF NOT v_has_cutoff THEN
+        v_view_sql := format(
+            'CREATE VIEW %I.%I AS%s  SELECT %s FROM %I.%I',
+            v_schema, v_view_name, E'\n', v_hot_proj, v_hot_schema, v_hot_relname);
+    ELSE
+        v_view_sql := format(
+$ddl$CREATE VIEW %I.%I AS
+  SELECT %s FROM %I.%I
+  WHERE %I >= %L::timestamptz
+  UNION ALL
+  SELECT %s
+  FROM iceberg_scan(%L) r
+  WHERE r[%L] < %L::timestamptz$ddl$,
+            v_schema, v_view_name,
+            v_hot_proj, v_hot_schema, v_hot_relname,
+            v_partcol, v_cutoff_lit,
+            v_cold_proj,
+            v_iceberg,
+            v_partcol, v_cutoff_lit);
+    END IF;
+
+    EXECUTE format('DROP VIEW IF EXISTS %I.%I CASCADE', v_schema, v_view_name);
+    EXECUTE v_view_sql;
+
+    -- 5. Rebuild the INSTEAD OF INSERT trigger function + trigger.
+    v_funcname := format('coldfront.%I', v_view_name || '_write');
+    v_trigname := v_view_name || '_write_trigger';
+
+    -- Double-formatted: the outer format() builds the function body; the body
+    -- itself calls format(...) at trigger time to fill %L placeholders with
+    -- NEW values. The INSERT template, placeholders, and iceberg ref must
+    -- survive THIS format() literally — assembled by concatenation below.
+    v_func_sql := format(
+$fn$CREATE OR REPLACE FUNCTION %s() RETURNS trigger AS $body$
+DECLARE
+  cutoff timestamptz;
+BEGIN
+  SELECT cutoff_time INTO cutoff FROM coldfront.archive_watermark WHERE table_name = %L;
+  IF cutoff IS NULL THEN
+    cutoff := %s;
+  END IF;
+
+  IF TG_OP = 'INSERT' THEN
+    IF NEW.%I < cutoff THEN
+      PERFORM coldfront.ensure_attached();
+      PERFORM duckdb.raw_query(format(
+        %L,
+        %s
+      ));
+      RETURN NEW;
+    END IF;
+    INSERT INTO %I.%I (%s) VALUES (%s);
+    RETURN NEW;
+  END IF;
+  RETURN NULL;
+END;
+$body$ LANGUAGE plpgsql$fn$,
+        v_funcname,
+        v_view_name,                                            -- watermark key literal
+        CASE WHEN v_has_cutoff
+             THEN quote_literal(v_cutoff_lit) || '::timestamptz'
+             ELSE '''-infinity''::timestamptz' END,             -- default cutoff
+        v_partcol,                                              -- NEW.<partcol>
+        'INSERT INTO ' || v_iceberg || ' VALUES (' || v_placeholders || ')',
+        v_cold_vals,                                            -- args to inner format()
+        v_hot_schema, v_hot_relname, v_col_list, v_hot_vals);   -- hot INSERT
+
+    EXECUTE v_func_sql;
+
+    -- The view was just dropped + recreated fresh above, so no stale trigger
+    -- exists — create directly (no DROP TRIGGER IF EXISTS, which would only
+    -- emit a spurious NOTICE).
+    EXECUTE format(
+        'CREATE TRIGGER %I INSTEAD OF INSERT ON %I.%I FOR EACH ROW EXECUTE FUNCTION %s()',
+        v_trigname, v_schema, v_view_name, v_funcname);
+
+    -- 6. Re-point the registry row at the NEW view OID (DROP+CREATE minted a
+    --    new one). Carry hot_table / iceberg_table / partition_col forward.
+    SELECT c.oid INTO v_new_oid
+    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+    WHERE n.nspname = v_schema AND c.relname = v_view_name AND c.relkind = 'v';
+
+    IF v_new_oid IS DISTINCT FROM p_view_oid THEN
+        DELETE FROM coldfront.tiered_views WHERE view_oid = p_view_oid;
+        INSERT INTO coldfront.tiered_views
+            (view_oid, hot_table, iceberg_table, partition_col, is_iceberg_only)
+        VALUES (v_new_oid, v_hot_table, v_iceberg, v_partcol, false)
+        ON CONFLICT (view_oid) DO UPDATE SET
+            hot_table       = EXCLUDED.hot_table,
+            iceberg_table   = EXCLUDED.iceberg_table,
+            partition_col   = EXCLUDED.partition_col,
+            is_iceberg_only = false;
+    END IF;
+END;
+$$;

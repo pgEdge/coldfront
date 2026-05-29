@@ -41,8 +41,9 @@ EXPLAIN (COSTS OFF, VERBOSE)
    Output: duckdb.raw_query('DELETE FROM ice.default."MixedEvents"   WHERE (ts = ''Thu Jan 15 01:00:00 2026 UTC''::timestamptz)'::text)
 (2 rows)
 
--- Cleanup
-DROP VIEW public."MixedEvents";
-DROP TABLE public."_MixedEvents";
+-- Cleanup. Unregister before dropping: the DDL hook blocks DROP of a
+-- registered tiered table/view.
 DELETE FROM coldfront.tiered_views;
 DELETE FROM coldfront.archive_watermark;
+DROP VIEW public."MixedEvents";
+DROP TABLE public."_MixedEvents";

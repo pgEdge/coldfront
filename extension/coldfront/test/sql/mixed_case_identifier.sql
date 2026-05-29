@@ -34,8 +34,9 @@ EXPLAIN (COSTS OFF, VERBOSE)
   DELETE FROM public."MixedEvents"
   WHERE ts = '2026-01-15 01:00:00+00';
 
--- Cleanup
-DROP VIEW public."MixedEvents";
-DROP TABLE public."_MixedEvents";
+-- Cleanup. Unregister before dropping: the DDL hook blocks DROP of a
+-- registered tiered table/view.
 DELETE FROM coldfront.tiered_views;
 DELETE FROM coldfront.archive_watermark;
+DROP VIEW public."MixedEvents";
+DROP TABLE public."_MixedEvents";

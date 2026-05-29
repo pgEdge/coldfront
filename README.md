@@ -180,6 +180,39 @@ See [ARCHITECTURE.md](ARCHITECTURE.md) — "Transparent UPDATE/DELETE" section �
 the full rewrite rules, the classifier's predicate coverage, and the
 cosmetic regressions (command tag, cold RETURNING) in permissive mode.
 
+#### Schema changes (DDL)
+
+Run `ALTER TABLE` on the **hot heap** (`_events`); coldfront keeps the
+Iceberg cold tier and the transparent view in sync automatically.
+
+| DDL | What coldfront does |
+|---|---|
+| `ALTER TABLE _events ADD COLUMN x text` | Adds `x` to the Iceberg table, rebuilds the view so it projects `x`. |
+| `ALTER TABLE _events DROP COLUMN x` | Drops `x` from Iceberg, rebuilds the view without it. |
+| `ALTER TABLE _events ALTER COLUMN x TYPE bigint` | Mirrors the new type to Iceberg (must be a compatible widening), rebuilds the view. |
+| `ALTER TABLE _events RENAME COLUMN x TO y` | Renames in Iceberg, rebuilds the view; updates the registry if `x` is the partition column. |
+| `ALTER TABLE _events RENAME TO _events2` | Updates the registry, rebuilds the view. |
+| `ALTER VIEW events RENAME TO events2` | Migrates the watermark row to the new name, rebuilds the view (so the cold tier survives the rename). |
+
+```sql
+ALTER TABLE _events ADD COLUMN payload jsonb;   -- view now projects payload
+```
+
+`DROP TABLE` / `DROP VIEW` / `TRUNCATE` on a tiered table are **blocked**
+(they would orphan or hide cold data) with a hint pointing at the
+intended helper:
+
+```sql
+DROP TABLE _events;
+-- ERROR:  coldfront: cannot DROP "public._events" — it has a cold tier in Iceberg
+-- HINT:  Use coldfront.untier_table('public', '_events') to detach the cold tier first.
+```
+
+The Iceberg mirror runs only when `coldfront.warehouse` is configured.
+In an active-active Spock mesh each node rebuilds its own local view from
+the replicated `ALTER TABLE`; see
+[ARCHITECTURE.md](ARCHITECTURE.md) — "Transparent DDL" — for the details.
+
 #### Troubleshooting: direct access paths
 
 If you hit an edge case the classifier doesn't cover, these paths stay

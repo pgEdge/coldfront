@@ -30,8 +30,9 @@ EXPLAIN (COSTS OFF, VERBOSE)
 -- but verify _events pre-state for completeness.
 SELECT id, status FROM public._events ORDER BY id;
 
--- Cleanup
-DROP VIEW public.events;
-DROP TABLE public._events;
+-- Cleanup. Unregister before dropping: the DDL hook blocks DROP of a
+-- registered tiered table/view.
 DELETE FROM coldfront.tiered_views;
 DELETE FROM coldfront.archive_watermark;
+DROP VIEW public.events;
+DROP TABLE public._events;

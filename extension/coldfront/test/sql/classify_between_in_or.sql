@@ -73,8 +73,9 @@ UPDATE public.events SET status = 'x'
   WHERE ts = '2026-01-15 01:00:00+00'::timestamptz
      OR ts = '2026-04-15 01:00:00+00'::timestamptz;
 
--- Cleanup
-DROP VIEW public.events;
-DROP TABLE public._events;
+-- Cleanup. Unregister before dropping: the DDL hook blocks DROP of a
+-- registered tiered table/view.
 DELETE FROM coldfront.tiered_views;
 DELETE FROM coldfront.archive_watermark;
+DROP VIEW public.events;
+DROP TABLE public._events;

@@ -226,6 +226,8 @@ After conversion, applications use:
 | INSERT | `INSERT INTO events ...` | coldfront hook (see "Transparent INSERT" below) |
 | UPDATE | `UPDATE events ... WHERE ...` | coldfront hook (see "Transparent UPDATE/DELETE" below) |
 | DELETE | `DELETE FROM events WHERE ...` | coldfront hook (see "Transparent UPDATE/DELETE" below) |
+| DDL (ALTER/RENAME) | `ALTER TABLE _events ADD COLUMN ...` | coldfront `ProcessUtility_hook` (see "Transparent DDL" below) |
+| DROP / TRUNCATE | `DROP TABLE _events` | blocked by the hook (see "Transparent DDL" below) |
 
 With `duckdb.force_execution = true`, hot-side queries are also accelerated
 by DuckDB's vectorized columnar engine (10-100x faster for analytics).
@@ -331,6 +333,41 @@ tier-deterministic WHERE clause.
   no app-level retry. See
   [ARCHITECTURE_DECOUPLED.md → Concurrency](ARCHITECTURE_DECOUPLED.md#concurrency--horizontal-scaling--the-bakery-protocol)
   for the full design and benchmarks.
+
+### Transparent DDL via coldfront
+
+A `ProcessUtility_hook` in the coldfront extension intercepts DDL that
+targets a registered tiered table's hot heap (matched by resolving the
+DDL target relation to an OID and comparing against the OID of the
+registry's `hot_table` — never by string, so it is schema-agnostic):
+
+| DDL | Behaviour |
+|---|---|
+| `ALTER TABLE _t ADD COLUMN` | Mirror `ADD COLUMN` to the Iceberg table, rebuild the transparent view + INSERT trigger from the post-DDL catalog. |
+| `ALTER TABLE _t DROP COLUMN` | Drop the dependent view first (PG forbids dropping a column a view depends on), run the DROP, mirror to Iceberg, rebuild the view. |
+| `ALTER TABLE _t ALTER COLUMN ... TYPE` | Same pre-drop dance; mirror the new type to Iceberg (DuckDB enforces Iceberg's type-evolution rules). |
+| `ALTER TABLE _t RENAME COLUMN` | Mirror the rename to Iceberg; if the partition column was renamed, update `tiered_views.partition_col`; rebuild the view. |
+| `ALTER TABLE _t RENAME TO ...` | Update `tiered_views.hot_table`, rebuild the view. |
+| `ALTER VIEW v RENAME TO ...` | Migrate the name-keyed `archive_watermark` row to the new view name, then rebuild (otherwise the cutoff lookup misses and the cold UNION branch silently disappears). |
+| `DROP TABLE _t` / `DROP VIEW v` | **Blocked** — would orphan the Iceberg cold tier. Error points at `coldfront.untier_table()`. |
+| `TRUNCATE _t` | **Blocked** — cold-tier rows would remain visible. Error points at `coldfront.truncate_tiered()`. |
+
+The view rebuild always does `DROP VIEW` + `CREATE VIEW` (not
+`CREATE OR REPLACE VIEW`, which PG only allows for appending columns at
+the end), then re-points the registry's `view_oid` to the freshly-created
+view. The Iceberg mirror only runs when `coldfront.warehouse` is set; with
+it empty (single-node / tests) the PG-side view rebuild still happens.
+Concurrent schema changes are serialised by the same bakery as cold DML.
+
+**Active-active.** The hook is OID-and-registry-local by design:
+`coldfront.tiered_views` is **not** Spock-replicated and OIDs differ per
+node. Spock 5.0.8 replicates only the top-level `ALTER TABLE` (the
+hook's SPI-issued view-rebuild DDL runs at non-top-level context, which
+Spock's `autoddl_can_proceed()` filters out). A peer applies the
+replicated `ALTER TABLE` with `IsLogicalWorker() == true`; the hook then
+rebuilds **that peer's own** local view and re-points **that peer's own**
+registry, but skips the Iceberg mirror (the originator already wrote the
+shared Lakekeeper catalog). DROP/TRUNCATE are blocked on every node.
 
 ## Known Limitations
 
