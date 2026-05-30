@@ -416,6 +416,25 @@ EOSQL
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# Story 9b — Concurrency / no-409 (tiered): parallel COLD writers to one table
+# all land. By this point every partition is archived (cutoff past 2026-05-01),
+# so below-cutoff INSERTs route through the cold path (_tiered_insert_cold) and
+# the same advisory-lock bakery serializes them. Parity with the decoupled
+# probe — the standing multi-writer no-409 rule applies to both modes.
+# ───────────────────────────────────────────────────────────────────────────
+story_concurrent_writers() {
+    step "9b. Concurrency: parallel tiered COLD writers serialize via the bakery (no 409)"
+    local k pids=()
+    for k in 1 2 3 4 5 6 7 8; do
+        q "$HOST" "INSERT INTO events (ts,status,data) VALUES ('2026-04-2${k} 09:00:00+00','tconc','{}');" >/dev/null 2>&1 &
+        pids+=("$!")
+    done
+    local p; for p in "${pids[@]}"; do wait "$p" 2>/dev/null; done
+    assert_eq "8 concurrent tiered COLD writers all landed (no 409/loss)" "8" \
+        "$(q "$HOST" "SELECT count(*) FROM events WHERE status='tconc';")"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Story 10 — Transactions: rollback undoes both tiers; archiver idempotent.
 # ───────────────────────────────────────────────────────────────────────────
 story_txn() {
@@ -461,6 +480,7 @@ if [ "$MODE" = "tiered" ]; then
     story_ddl
     story_blocks
     story_concurrency
+    story_concurrent_writers
     story_txn
     story_coexist
 else
