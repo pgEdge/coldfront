@@ -1203,6 +1203,15 @@ $$ SELECT current_setting('coldfront.dblink_self', true) $$;
 CREATE FUNCTION coldfront._ensure_claims_replicated()
 RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
+    -- Claims replication is a Spock-mesh concern only. In a vanilla single-node
+    -- deployment there is no spock extension (and the bakery uses a local
+    -- advisory lock, not cross-node claim rows), so this is a no-op. Gating on
+    -- the spock extension's presence keeps create_iceberg_table working
+    -- identically in vanilla and mesh (single shared path).
+    IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'spock') THEN
+        RETURN;
+    END IF;
+
     -- coldfront.claims is replicated cluster-wide.
     PERFORM spock.repset_add_table('default', 'coldfront.claims'::regclass, false)
     WHERE NOT EXISTS (
