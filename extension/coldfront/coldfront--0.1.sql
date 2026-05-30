@@ -1559,13 +1559,19 @@ LANGUAGE c AS 'coldfront', 'coldfront_enqueue_release';
 -- The serializer is fundamentally a per-Iceberg-table mutex that scales by
 -- deployment, chosen by the v_armed gate:
 --
---   * Multi-node mesh (v_armed): the Ricart-Agrawala bakery. Stage the parquet
---     first (phase 1, all writers overlap freely on S3 — no Lakekeeper
---     contention yet), then claim the bakery (phase 2) just before pg_duckdb's
---     deferred commit POST fires at PG PRE_COMMIT, and enqueue the release for
---     the C XactCallback (which runs AFTER pg_duckdb's, so the bakery wraps
---     exactly the commit POST). Claim is the LAST step, so a staging failure
---     can't orphan a claim.
+--   * Multi-node mesh (v_armed): the Ricart-Agrawala bakery. The upload ordering
+--     adapts to the loaded duckdb-iceberg via coldfront.iceberg_async_parquet —
+--     NEVER a 409 either way, only overlap-vs-serialized upload:
+--       - patched iceberg (flag ON): stage the parquet FIRST (writers overlap
+--         freely on S3), then claim the bakery only to wrap pg_duckdb's deferred
+--         commit POST — the patch re-stamps parent_snapshot_id at that POST, so
+--         the overlap is safe.
+--       - stock iceberg (flag OFF, the default): claim the bakery FIRST, then
+--         stage+commit inside the held ticket — stock stamps parent_snapshot_id
+--         at stage time, so the upload must be serialized or a peer captures a
+--         stale parent and 409s.
+--     The release is enqueued for the C XactCallback (fires on COMMIT and ABORT),
+--     so an in-ticket staging failure can't orphan the claim.
 --
 --   * Vanilla single-node / no mesh (NOT v_armed): a transaction-scoped LOCAL
 --     advisory lock is the same mutex without any Spock/snowflake/dblink
@@ -1585,12 +1591,31 @@ DECLARE
     my_ticket bigint;
     v_armed   boolean := NULLIF(current_setting('snowflake.node', true), '') IS NOT NULL
                      AND NULLIF(current_setting('coldfront.dblink_self', true), '') IS NOT NULL;
+    -- Does the loaded duckdb-iceberg defer the catalog-commit parent stamp to PG
+    -- PRE_COMMIT (the bakery-aware-commit-refresh patch)? If so we may stage the
+    -- parquet OUTSIDE the claim (async upload; only the commit POST contended).
+    -- On stock iceberg the parent is stamped at stage time, so the claim must
+    -- wrap the upload too. Never a 409 either way — the flag only picks overlap
+    -- (patched) vs serialized upload (stock). Default false = correct on stock;
+    -- the patched image's entrypoint sets it on.
+    v_async   boolean := COALESCE(
+                   NULLIF(current_setting('coldfront.iceberg_async_parquet', true), '')::boolean,
+                   false);
 BEGIN
-    IF v_armed THEN
+    IF v_armed AND v_async THEN
+        -- Patched iceberg: upload parquet in the background, then take the bakery
+        -- only to wrap pg_duckdb's deferred commit POST.
         PERFORM duckdb.raw_query(p_sql);
         my_ticket := coldfront._claim_iceberg_lock(p_iceberg_table);
         PERFORM coldfront._enqueue_release(my_ticket);
+    ELSIF v_armed THEN
+        -- Stock iceberg: claim FIRST, then upload+commit inside the held ticket
+        -- so no peer can capture a stale parent_snapshot_id.
+        my_ticket := coldfront._claim_iceberg_lock(p_iceberg_table);
+        PERFORM coldfront._enqueue_release(my_ticket);
+        PERFORM duckdb.raw_query(p_sql);
     ELSE
+        -- Vanilla single-node: local advisory lock, taken before staging.
         PERFORM pg_advisory_xact_lock(hashtext('coldfront_iceberg:' || p_iceberg_table));
         PERFORM duckdb.raw_query(p_sql);
     END IF;
