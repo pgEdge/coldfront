@@ -169,6 +169,26 @@ EOSQL
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# Decoupled concurrency / no-409 — parallel cold writers to ONE iceberg-only
+# table must all land. Vanilla serializes them with the local advisory-lock
+# bakery (_exec_iceberg_with_claim, v_armed=false → pg_advisory_xact_lock);
+# without it, concurrent Iceberg commits race Lakekeeper's assert-ref-snapshot
+# precondition and 409 (CatalogCommitConflict), silently losing rows. (Standing
+# rule: multi-writer no-409 probe in vanilla. The bakery is essential.)
+# ───────────────────────────────────────────────────────────────────────────
+story_decoupled_concurrency() {
+    step "9. Concurrency: parallel cold writers serialize via the bakery (no 409)"
+    local k pids=()
+    for k in 1 2 3 4 5 6 7 8; do
+        q "$HOST" "INSERT INTO iceonly VALUES (${k}00,'2026-06-0${k} 10:00:00+00','conc','{}');" >/dev/null 2>&1 &
+        pids+=("$!")
+    done
+    local p; for p in "${pids[@]}"; do wait "$p" 2>/dev/null; done
+    assert_eq "8 concurrent cold writers all landed (no 409/loss)" "8" \
+        "$(q "$HOST" "SELECT count(*) FROM iceonly WHERE status='conc';")"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Decoupled read-your-own-write — the wrapper view sources duckdb.query (not
 # iceberg_scan), so an in-transaction SELECT sees the same tx's prior write,
 # and ROLLBACK undoes the Iceberg INSERT (pg_duckdb XactCallback ties the txns).
@@ -446,6 +466,7 @@ if [ "$MODE" = "tiered" ]; then
 else
     story_provision_decoupled
     story_decoupled_crud
+    story_decoupled_concurrency
     story_decoupled_ryw
 fi
 [ "$MESH" = 1 ]      && story_mesh
