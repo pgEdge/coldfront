@@ -3,15 +3,14 @@
 # bootstrap Lakekeeper + warehouse, run the journey against the primary, tear
 # down. Spock/snowflake are NOT loaded (vanilla = local advisory-lock bakery).
 #
-# Usage: ci/topo/vanilla.sh --mode tiered|decoupled [--compose <file>] [--keep] [--regress]
+# Usage: ci/topo/vanilla.sh --mode tiered|decoupled [--pg 16|17|18]
+#                           [--compose <file>] [--keep] [--regress]
 #
+# --pg selects the PG major; the stack builds the ONE parameterized image
+# (docker/Dockerfile, pgEdge minimal base, spock/snowflake left out → vanilla).
 # --regress runs the pg_regress installcheck (the unit layer) against the same
 # up stack before the journey — used by ci/matrix.sh so the unit + E2E layers
-# share one bring-up.
-#
-# For now this targets the existing docker-compose.test.yml (PG18 + pgduckdb).
-# When the parameterized image family lands (matrix step 2) the compose/image
-# become arguments; the journey + assertions do not change.
+# share one bring-up. The journey + assertions are identical across PG majors.
 
 set -uo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -19,9 +18,11 @@ ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # shellcheck source=ci/lib.sh
 source "$SCRIPT_DIR/../lib.sh"
 
-MODE="tiered"; COMPOSE_FILE="docker-compose.test.yml"; KEEP=0; REGRESS=0
+MODE="tiered"; COMPOSE_FILE="docker-compose.matrix.yml"; KEEP=0; REGRESS=0
+PG="${PG_MAJOR:-18}"
 while [ $# -gt 0 ]; do case "$1" in
   --mode) MODE="$2"; shift 2;;
+  --pg) PG="$2"; shift 2;;
   --compose) COMPOSE_FILE="$2"; shift 2;;
   --keep) KEEP=1; shift;;
   --regress) REGRESS=1; shift;;
@@ -29,6 +30,7 @@ while [ $# -gt 0 ]; do case "$1" in
 esac; done
 
 cd "$ROOT"
+export PG_MAJOR="$PG"           # consumed by docker-compose.matrix.yml build arg + entrypoint
 COMPOSE="docker compose -f $COMPOSE_FILE"
 DB=coldfront-db-1
 
@@ -69,16 +71,19 @@ echo "$WH" | grep -q "warehouse-id" || { echo "warehouse creation failed after r
 
 if [ "$REGRESS" = 1 ]; then
     step "vanilla: pg_regress installcheck (unit layer)"
-    # The db container has the PG dev headers + gcc/make from the image build.
-    # The fixtures set coldfront.warehouse/lakekeeper_endpoint to '' so
-    # ensure_attached() is a no-op and Lakekeeper isn't needed for this layer.
-    docker exec "$DB" rm -rf /tmp/coldfront 2>/dev/null || true
-    docker cp extension/coldfront "$DB":/tmp/coldfront >/dev/null
-    if docker exec -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" "$DB" \
-           bash -c 'cd /tmp/coldfront && make installcheck 2>&1' | tail -8; then
+    # The runtime image is lean (no make/pg_regress) — those would only bloat a
+    # deployment artifact. Run the unit layer from the BUILD stage (which has
+    # the toolchain + extension source) against the running db over the compose
+    # network. The fixtures set coldfront.warehouse/lakekeeper_endpoint to ''
+    # so ensure_attached() is a no-op and Lakekeeper isn't needed here.
+    BUILD_IMG="coldfront-build:pg${PG}"
+    docker build -f docker/Dockerfile --build-arg PG_MAJOR="$PG" --target build -t "$BUILD_IMG" . >/dev/null 2>&1
+    NET=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' "$DB")
+    if docker run --rm --network "$NET" \
+           -e PGHOST=db -e PGPORT=5432 -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" \
+           "$BUILD_IMG" bash -c 'cd /build/coldfront && make installcheck 2>&1; rc=$?; cat test/regression.diffs 2>/dev/null | head -60; exit $rc' | tail -12; then
         pass "pg_regress installcheck"
     else
-        docker exec "$DB" cat /tmp/coldfront/test/regression.diffs 2>/dev/null | head -80
         fail "pg_regress installcheck"
         exit 1
     fi

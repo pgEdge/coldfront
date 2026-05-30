@@ -593,15 +593,20 @@ S3-compatible store.  Both extensions must be in
 `shared_preload_libraries` — `coldfront` installs its hook in
 `_PG_init`, which fires at backend start.
 
+One parameterized image (`docker/Dockerfile`, `--build-arg PG_MAJOR=16|17|18`)
+serves every deployment: a pgEdge `*-spock5-minimal` base (bundles Spock +
+Snowflake) with pg_duckdb v1.1.1 compiled on top and coldfront installed. The
+same image plays both topology roles — vanilla leaves spock/snowflake out of
+`shared_preload_libraries`; mesh loads them (`MESH=on`, set by the entrypoint).
+
 ```yaml
 services:
   db:
-    # Base image is stock upstream pgduckdb/pgduckdb:18-v1.1.1, with
-    # coldfront built on top (see docker/coldfront.Dockerfile).
     build:
       context: .
-      dockerfile: docker/coldfront.Dockerfile
-    command: -c shared_preload_libraries=pg_duckdb,coldfront
+      dockerfile: docker/Dockerfile
+      args: { PG_MAJOR: 18 }
+    environment: { PG_MAJOR: 18, MESH: "off" }   # entrypoint configures preload + GUCs
   lakekeeper:
     image: quay.io/lakekeeper/catalog:latest
     command: serve
@@ -613,6 +618,15 @@ services:
 Lakekeeper needs: bootstrap (`POST /management/v1/bootstrap`) then
 warehouse creation (`POST /management/v1/warehouse`) with S3 credentials
 and `sts-enabled: false`, `remote-signing-enabled: false`.
+
+**Lakekeeper's metadata store.** Lakekeeper keeps its own catalog tables in a
+PostgreSQL database (and its schema migration needs the `uuid-ossp` contrib
+extension). It runs on its **own dedicated Postgres** — a separate
+`lakekeeper-db` container in the test stack, and a separate managed instance in
+production — **never co-located on a ColdFront data node.** Co-locating would
+couple the catalog's availability and load to a data node and would drag
+contrib into the ColdFront image for no reason; the dedicated store keeps the
+ColdFront image lean (core `uuid` type only, no uuid-ossp).
 
 ## Upstream Requests
 
