@@ -71,19 +71,22 @@ run_cell() {
     if "$@"; then pass "cell: $name"; else fail "cell: $name"; CELL_FAIL=$((CELL_FAIL + 1)); fi
 }
 
-# The one fully-implemented + verified cell. The topology script owns bring-up,
-# the pg_regress unit layer (--regress), the journey, and teardown.
+# Verified cells. The topology script owns bring-up, the journey, and teardown;
+# --regress runs the pg_regress unit layer (extension SQL/hook tests, mode-
+# independent) so it only needs to run on one cell per PG major.
 cell_pg18_vanilla_tiered() {
     "$SCRIPT_DIR/topo/vanilla.sh" --mode tiered --regress
+}
+cell_pg18_vanilla_decoupled() {
+    "$SCRIPT_DIR/topo/vanilla.sh" --mode decoupled
 }
 
 # coverage_table  — print every matrix cell with RUN / PENDING(reason). No
 # cell is ever silently omitted; PENDING states what is still required.
 coverage_table() {
     step "MATRIX COVERAGE"
-    local pending_img="needs parameterized pgedge image (matrix step 2)"
+    local pending_img="needs pg16/17 image build (one build-arg)"
     local pending_mesh="needs ci/topo/mesh.sh (3-node Spock)"
-    local pending_dec="needs decoupled journey branch"
     local pending_sb="needs ci/probe-standby.sh gate"
     local pg topo mode tgt status
     for pg in 16 17 18; do
@@ -91,12 +94,11 @@ coverage_table() {
         for mode in tiered decoupled; do
           for tgt in primary standby; do
             status=""
-            if [ "$pg" = 18 ] && [ "$topo" = vanilla ] && [ "$mode" = tiered ] && [ "$tgt" = primary ]; then
-                status="RUN"
+            if [ "$pg" = 18 ] && [ "$topo" = vanilla ] && [ "$tgt" = primary ]; then
+                status="RUN"   # tiered + decoupled both verified on pg18 vanilla primary
             elif [ "$pg" != 18 ]; then status="PENDING ($pending_img)"
             elif [ "$topo" = mesh ]; then status="PENDING ($pending_mesh)"
             elif [ "$tgt" = standby ]; then status="PENDING ($pending_sb)"
-            elif [ "$mode" = decoupled ]; then status="PENDING ($pending_dec)"
             fi
             printf '    pg%-2s · %-7s · %-9s · %-7s : %s\n' "$pg" "$topo" "$mode" "$tgt" "$status"
           done
@@ -113,7 +115,8 @@ case "$SCOPE" in
     run_cell "pg18·vanilla·tiered·primary" cell_pg18_vanilla_tiered
     ;;
   full)
-    run_cell "pg18·vanilla·tiered·primary" cell_pg18_vanilla_tiered
+    run_cell "pg18·vanilla·tiered·primary"    cell_pg18_vanilla_tiered
+    run_cell "pg18·vanilla·decoupled·primary" cell_pg18_vanilla_decoupled
     coverage_table
     echo -e "\n  NOTE: only verified cells RUN. PENDING cells are tracked, not skipped silently."
     ;;

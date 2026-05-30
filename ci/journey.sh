@@ -117,11 +117,74 @@ EOF
     assert_eq "watermark registered" "1" "$wm"
 }
 
-# Story 2 (decoupled) — single create_iceberg_table call. Scaffold; filled when
-# the decoupled cell is built.
+# ───────────────────────────────────────────────────────────────────────────
+# Story 2 (decoupled) — provision an all-Iceberg table via create_iceberg_table:
+# a shared Lakekeeper-stored Iceberg table + a PG wrapper view + an is_iceberg_
+# only registry row. No PG hot tier. The C hook routes all DML to Iceberg.
+# ───────────────────────────────────────────────────────────────────────────
 story_provision_decoupled() {
     step "2. Provision decoupled (iceberg-only) table"
-    fail "decoupled provisioning not yet implemented in journey (TODO: matrix step 3)"
+    # Retry the provision until the wrapper view exists: on a cold warehouse the
+    # CREATE SCHEMA (namespace) and the immediately-following CREATE TABLE can
+    # race in Lakekeeper (the table POST lands before the namespace resolves →
+    # 405), and create_iceberg_table is one transaction so it rolls back. The
+    # retry's CREATE SCHEMA IF NOT EXISTS finds the settled namespace.
+    local i
+    for i in 1 2 3 4 5; do
+        q_may "$HOST" "SELECT coldfront.create_iceberg_table('public','iceonly','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"ts\",\"type\":\"timestamptz\"},{\"name\":\"status\",\"type\":\"text\"},{\"name\":\"data\",\"type\":\"jsonb\"}]'::jsonb);" >/dev/null 2>&1
+        [ "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname='iceonly' AND relkind='v' AND relnamespace='public'::regnamespace;")" = "1" ] && break
+        sleep 2
+    done
+    assert_eq "iceonly wrapper view created" "v" "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='iceonly' AND relnamespace='public'::regnamespace;")"
+    assert_eq "iceberg-only registry row present" "1" "$(q "$HOST" "SELECT count(*) FROM coldfront.tiered_views WHERE is_iceberg_only AND iceberg_table='ice.default.iceonly';")"
+    assert_eq "no hot table for iceberg-only view" "" "$(q "$HOST" "SELECT hot_table FROM coldfront.tiered_views WHERE iceberg_table='ice.default.iceonly';")"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Decoupled CRUD — every DML on the wrapper view is rewritten by the C hook to
+# a single duckdb.raw_query against Iceberg (no INSTEAD OF trigger). Covers the
+# INSERT shapes, jsonb surfacing, UPDATE, DELETE.
+# ───────────────────────────────────────────────────────────────────────────
+story_decoupled_crud() {
+    step "6. Decoupled CRUD (INSERT/SELECT/UPDATE/DELETE → Iceberg via the hook)"
+    local O; O=$(qf "$HOST" <<'EOSQL'
+INSERT INTO iceonly VALUES (1,'2026-05-01 10:00:00+00','s1','{"a":1}'),(2,'2026-05-01 10:00:01+00','s2','{"a":2}');
+SELECT 'CNT:'||count(*) FROM iceonly;
+SELECT 'JSONTYPE:'||pg_typeof(data)::text FROM iceonly LIMIT 1;
+SELECT 'JSON:'||(data->>'a') FROM iceonly WHERE id=1;
+INSERT INTO iceonly VALUES (10,'2026-05-01 10:01:00+00','multi','{}'),(11,'2026-05-01 10:01:01+00','multi','{}'),(12,'2026-05-01 10:01:02+00','multi','{}');
+SELECT 'MULTI:'||count(*) FROM iceonly WHERE status='multi';
+UPDATE iceonly SET status='upd' WHERE id=1;
+SELECT 'UPD:'||status FROM iceonly WHERE id=1;
+DELETE FROM iceonly WHERE id=2;
+SELECT 'DEL:'||count(*) FROM iceonly WHERE id=2;
+EOSQL
+)
+    assert_eq "decoupled INSERT + read (2 rows)"        "2"    "$(extract CNT "$O")"
+    assert_eq "decoupled jsonb surfaces as json"        "json" "$(extract JSONTYPE "$O")"
+    assert_eq "decoupled jsonb round-trip (data->>a)"   "1"    "$(extract JSON "$O")"
+    assert_eq "decoupled multi-row INSERT (3 rows)"     "3"    "$(extract MULTI "$O")"
+    assert_eq "decoupled UPDATE visible"                "upd"  "$(extract UPD "$O")"
+    assert_eq "decoupled DELETE visible (0 of id=2)"    "0"    "$(extract DEL "$O")"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Decoupled read-your-own-write — the wrapper view sources duckdb.query (not
+# iceberg_scan), so an in-transaction SELECT sees the same tx's prior write,
+# and ROLLBACK undoes the Iceberg INSERT (pg_duckdb XactCallback ties the txns).
+# ───────────────────────────────────────────────────────────────────────────
+story_decoupled_ryw() {
+    step "10. Decoupled read-your-own-write + rollback"
+    local O; O=$(qf "$HOST" <<'EOSQL'
+BEGIN;
+INSERT INTO iceonly VALUES (99,'2026-05-01 11:00:00+00','in_tx','{}');
+SELECT 'INTX:'||count(*) FROM iceonly WHERE id=99;
+ROLLBACK;
+SELECT 'POSTRB:'||count(*) FROM iceonly WHERE id=99;
+EOSQL
+)
+    assert_eq "in-tx SELECT sees just-inserted iceberg row" "1" "$(extract INTX "$O")"
+    assert_eq "ROLLBACK undoes the iceberg INSERT"          "0" "$(extract POSTRB "$O")"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -365,16 +428,26 @@ story_mesh() { step "12. Mesh cross-node visibility + bakery"; fail "mesh storie
 story_standby_reads() { step "13. Standby reads"; fail "standby stories not yet implemented (matrix step 4)"; }
 
 # ── orchestrate ────────────────────────────────────────────────────────────
+# Setup is shared. The story set then branches on mode: tiered exercises the
+# hot+cold partitioned path; decoupled exercises the all-Iceberg wrapper. (The
+# tiered stories assume the partitioned `events` table and don't apply to an
+# iceberg-only relation, and vice-versa.)
 story_setup
-if [ "$MODE" = "tiered" ]; then story_provision_tiered; else story_provision_decoupled; fi
-story_reads
-story_types
-story_writes
-story_ddl
-story_blocks
-story_concurrency
-story_txn
-story_coexist
+if [ "$MODE" = "tiered" ]; then
+    story_provision_tiered
+    story_reads
+    story_types
+    story_writes
+    story_ddl
+    story_blocks
+    story_concurrency
+    story_txn
+    story_coexist
+else
+    story_provision_decoupled
+    story_decoupled_crud
+    story_decoupled_ryw
+fi
 [ "$MESH" = 1 ]      && story_mesh
 [ -n "$STANDBY" ]    && story_standby_reads
 
