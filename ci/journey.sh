@@ -325,8 +325,11 @@ DELETE FROM events WHERE ts='2026-04-09 12:00:00+00' AND status='ci_hot_upd';
 SELECT 'RW_HOT_DEL:'  || count(*) FROM _events WHERE status='ci_hot_upd';
 DELETE FROM events WHERE ts='2026-01-15 01:00:00+00' AND status='ci_cold_upd';
 SELECT 'RW_COLD_DEL:' || count(*) FROM events WHERE status='ci_cold_upd';
-SELECT 'DUAL_TOTAL_PRE:' || count(*) FROM events WHERE status='ok';
+SELECT 'DUAL_HOT_PRE:'    || count(*) FROM _events WHERE status='ok';
+SELECT 'DUAL_TOTAL_PRE:'  || count(*) FROM events  WHERE status='ok';
 UPDATE events SET status='dual_upd' WHERE status='ok';
+SELECT 'DUAL_HOT_POST:'   || count(*) FROM _events WHERE status='dual_upd';
+SELECT 'DUAL_TOTAL_POST:' || count(*) FROM events  WHERE status='dual_upd';
 SELECT 'DUAL_REMAINING_OK:' || count(*) FROM events WHERE status='ok';
 EOSQL
 )
@@ -336,10 +339,49 @@ EOSQL
     assert_eq "cold update via view" "1" "$(extract RW_COLD_UPD "$O")"
     assert_eq "hot delete via view"  "0" "$(extract RW_HOT_DEL "$O")"
     assert_eq "cold delete via view" "0" "$(extract RW_COLD_DEL "$O")"
+    # Mixed-tier (dual) write hit BOTH tiers: the hot count is preserved and the
+    # total (hot+cold) is preserved, and total>hot proves cold rows were in play.
+    local dhp dtp; dhp=$(extract DUAL_HOT_PRE "$O"); dtp=$(extract DUAL_TOTAL_PRE "$O")
+    assert_eq "mixed write updated the hot tier"        "$dhp" "$(extract DUAL_HOT_POST "$O")"
+    assert_eq "mixed write updated both tiers (total)"  "$dtp" "$(extract DUAL_TOTAL_POST "$O")"
+    assert_gt "mixed write genuinely spanned the cold tier" "$dhp" "$dtp"
     assert_eq "dual update cleared all ok" "0" "$(extract DUAL_REMAINING_OK "$O")"
     # Strict mode rejects an ambiguous predicate.
     local e; e=$(q_may "$HOST" "SET coldfront.allow_mixed_writes=off; UPDATE events SET status='x' WHERE data->>'m'='nope';")
     assert_err "strict mode rejects ambiguous predicate" "must include" "$e"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story 6b — Concurrency × mixed-tier: parallel dual-tier UPDATEs (each spanning
+# hot + cold via an ambiguous predicate) all land with no 409. The dual CTE's
+# cold leg is coldfront._exec_iceberg_with_claim (emit_dual), the same bakery as
+# single cold writes — so concurrent mixed writers serialize on the cold commit
+# (advisory lock in vanilla). Self-contained: seeds 4 groups, each 1 hot (Apr,
+# still hot here) + 1 cold (Jan) row, then updates the 4 groups concurrently.
+# Must run before the race-window story archives the last hot partition.
+# ───────────────────────────────────────────────────────────────────────────
+story_mixed_concurrency() {
+    step "6b. Concurrency: parallel MIXED-tier writers (dual CTE via bakery, no 409)"
+    qf "$HOST" <<'EOSQL' >/dev/null 2>&1
+INSERT INTO events (ts,status,data) VALUES
+ ('2026-04-05 00:00+00','mixseed0','{}'),('2026-01-05 00:00+00','mixseed0','{}'),
+ ('2026-04-06 00:00+00','mixseed1','{}'),('2026-01-06 00:00+00','mixseed1','{}'),
+ ('2026-04-07 00:00+00','mixseed2','{}'),('2026-01-07 00:00+00','mixseed2','{}'),
+ ('2026-04-08 00:00+00','mixseed3','{}'),('2026-01-08 00:00+00','mixseed3','{}');
+EOSQL
+    local k pids=()
+    for k in 0 1 2 3; do
+        # status-only predicate ⇒ TIER_AMBIGUOUS ⇒ dual-tier CTE (hot UPDATE +
+        # cold _exec_iceberg_with_claim). Disjoint groups ⇒ no hot-row lock
+        # contention; the cold legs contend on the bakery and serialize.
+        q "$HOST" "UPDATE events SET status='mixdone' WHERE status='mixseed${k}';" >/dev/null 2>&1 &
+        pids+=("$!")
+    done
+    local p; for p in "${pids[@]}"; do wait "$p" 2>/dev/null; done
+    assert_eq "4 concurrent mixed-tier writers all landed (no 409/loss)" "8" "$(q "$HOST" "SELECT count(*) FROM events WHERE status='mixdone';")"
+    assert_eq "no mixseed rows left"                                     "0" "$(q "$HOST" "SELECT count(*) FROM events WHERE status LIKE 'mixseed%';")"
+    assert_eq "concurrent mixed write updated the cold tier (4 Jan rows)" "4" "$(q "$HOST" "SELECT count(*) FROM events WHERE status='mixdone' AND ts < '2026-02-01';")"
+    assert_eq "concurrent mixed write updated the hot tier (4 Apr rows)"  "4" "$(q "$HOST" "SELECT count(*) FROM _events WHERE status='mixdone';")"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -477,6 +519,7 @@ if [ "$MODE" = "tiered" ]; then
     story_reads
     story_types
     story_writes
+    story_mixed_concurrency
     story_ddl
     story_blocks
     story_concurrency
