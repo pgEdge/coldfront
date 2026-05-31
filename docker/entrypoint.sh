@@ -38,11 +38,19 @@ if [ ! -f "$PGDATA/PG_VERSION" ]; then
 # ── ColdFront ($([ "$MESH" = on ] && echo mesh || echo vanilla), pg${PG_MAJOR}) ──
 listen_addresses = '*'
 shared_preload_libraries = '${PRELOAD}'
-# pg_duckdb ships these OFF; turn them ON so ATTACH (TYPE ICEBERG, ...) auto-
-# installs iceberg (and transitively avro) from extensions.duckdb.org. No
-# explicit duckdb.install_extension calls in coldfront code.
+# ColdFront ships its OWN patched duckdb-iceberg (bakery-aware commit refresh;
+# see PATCHED.md), placed into the extension cache below. autoinstall stays ON so
+# postgres_scanner + any non-bundled deps auto-install; it does NOT clobber the
+# pre-placed iceberg/avro (DuckDB skips install for extensions already present).
+# allow_unsigned ON so the locally-built (unsigned) extension loads; autoload ON
+# so ATTACH (TYPE ICEBERG, ...) lazily LOADs it; iceberg_async_parquet ON so the
+# mesh bakery uploads parquet in the background and serializes only the commit
+# POST (safe because the patch refreshes parent_snapshot_id at commit). Vanilla
+# ignores the flag (advisory lock, claim-first).
 duckdb.autoinstall_known_extensions = true
-duckdb.autoload_known_extensions   = true
+duckdb.autoload_known_extensions    = true
+duckdb.allow_unsigned_extensions    = true
+coldfront.iceberg_async_parquet     = on
 coldfront.warehouse = '${WAREHOUSE}'
 coldfront.lakekeeper_endpoint = '${LAKEKEEPER}'
 # Loopback DSN coldfront.ensure_pg_attached() uses to ATTACH this PG into
@@ -77,6 +85,17 @@ EOF
 host    all             all             0.0.0.0/0               trust
 host    replication     all             0.0.0.0/0               trust
 EOF
+
+    # Place the patched duckdb-iceberg + avro into DuckDB's per-data-dir
+    # extension cache so pg_duckdb loads them (autoinstall is off, allow_unsigned
+    # is on). The version/platform subpath is pinned in lockstep with the
+    # iceberg-builder's OVERRIDE_GIT_DESCRIBE. See PATCHED.md.
+    if [ -f /opt/coldfront/iceberg/iceberg.duckdb_extension ]; then
+        EXTDIR="$PGDATA/pg_duckdb/extensions/${COLDFRONT_DUCKDB_VERSION:-v1.4.3}/${COLDFRONT_DUCKDB_PLATFORM:-linux_amd64}"
+        mkdir -p "$EXTDIR"
+        cp /opt/coldfront/iceberg/iceberg.duckdb_extension "$EXTDIR/iceberg.duckdb_extension"
+        cp /opt/coldfront/iceberg/avro.duckdb_extension    "$EXTDIR/avro.duckdb_extension"
+    fi
 
     "$PGBIN/pg_ctl" -D "$PGDATA" -o "-c listen_addresses=''" -w start
     "$PGBIN/psql" -U coldfront -d postgres -c "CREATE DATABASE coldfront OWNER coldfront"

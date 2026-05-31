@@ -80,13 +80,21 @@ cell_pg18_vanilla_tiered() {
 cell_pg18_vanilla_decoupled() {
     "$SCRIPT_DIR/topo/vanilla.sh" --mode decoupled
 }
+# Mesh cells: 3-node Spock on the same image (MESH=on). topo/mesh.sh forms the
+# mesh and runs the journey + mesh-only stories (cross-node visibility / R-A
+# bakery) against db1. Tiered before decoupled, matching vanilla.
+cell_pg18_mesh_tiered() {
+    "$SCRIPT_DIR/topo/mesh.sh" --mode tiered
+}
+cell_pg18_mesh_decoupled() {
+    "$SCRIPT_DIR/topo/mesh.sh" --mode decoupled
+}
 
 # coverage_table  — print every matrix cell with RUN / PENDING(reason). No
 # cell is ever silently omitted; PENDING states what is still required.
 coverage_table() {
     step "MATRIX COVERAGE"
     local pending_img="needs pg16/17 image build (one build-arg)"
-    local pending_mesh="needs ci/topo/mesh.sh (3-node Spock)"
     local pending_sb="needs ci/probe-standby.sh gate"
     local pg topo mode tgt status
     for pg in 16 17 18; do
@@ -94,10 +102,9 @@ coverage_table() {
         for mode in tiered decoupled; do
           for tgt in primary standby; do
             status=""
-            if [ "$pg" = 18 ] && [ "$topo" = vanilla ] && [ "$tgt" = primary ]; then
-                status="RUN"   # tiered + decoupled both verified on pg18 vanilla primary
+            if [ "$pg" = 18 ] && [ "$tgt" = primary ]; then
+                status="RUN"   # vanilla + mesh, tiered + decoupled, verified on pg18 primary
             elif [ "$pg" != 18 ]; then status="PENDING ($pending_img)"
-            elif [ "$topo" = mesh ]; then status="PENDING ($pending_mesh)"
             elif [ "$tgt" = standby ]; then status="PENDING ($pending_sb)"
             fi
             printf '    pg%-2s · %-7s · %-9s · %-7s : %s\n' "$pg" "$topo" "$mode" "$tgt" "$status"
@@ -117,6 +124,8 @@ case "$SCOPE" in
   full)
     run_cell "pg18·vanilla·tiered·primary"    cell_pg18_vanilla_tiered
     run_cell "pg18·vanilla·decoupled·primary" cell_pg18_vanilla_decoupled
+    run_cell "pg18·mesh·tiered·primary"       cell_pg18_mesh_tiered
+    run_cell "pg18·mesh·decoupled·primary"    cell_pg18_mesh_decoupled
     coverage_table
     echo -e "\n  NOTE: only verified cells RUN. PENDING cells are tracked, not skipped silently."
     ;;

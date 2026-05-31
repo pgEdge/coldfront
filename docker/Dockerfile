@@ -61,19 +61,63 @@ RUN dnf install -y --setopt=install_weak_deps=False diffutils && dnf clean all
 COPY extension/coldfront /build/coldfront
 RUN DESTDIR=/out make -C /build/coldfront install with_llvm=no
 
+# ─── iceberg-builder stage: compile PATCHED duckdb-iceberg + avro ────────────
+# Separate toolchain (manylinux gcc-toolset-14 — sidesteps a GCC-11 avro bug;
+# see PATCHED.md). Builds the bakery-aware-commit-refresh patch ONLY — the
+# mvcc-fix patch breaks commit on pg_duckdb v1.1.1. Output is a DuckDB v1.4.3
+# ABI extension, copied into the runtime stage and loaded as unsigned so the
+# mesh bakery can overlap parquet uploads (coldfront.iceberg_async_parquet=on).
+FROM quay.io/pypa/manylinux_2_28_x86_64 AS iceberg-builder
+ARG ICEBERG_REF=ebe0dfaf
+RUN dnf install -y --setopt=install_weak_deps=False \
+        ninja-build perl-IPC-Cmd ccache jq wget zip unzip tar autoconf libtool kernel-headers cmake git make \
+    && dnf clean all
+WORKDIR /build
+RUN git clone --filter=blob:none --no-checkout https://github.com/duckdb/duckdb-iceberg \
+ && git -C duckdb-iceberg checkout ${ICEBERG_REF} \
+ && git -C duckdb-iceberg submodule update --init --recursive --depth 1 --jobs 8 \
+ && git clone https://github.com/microsoft/vcpkg /build/vcpkg \
+ && /build/vcpkg/bootstrap-vcpkg.sh
+# Slim build config + the bakery patch, COPY'd AFTER the heavy clone/vcpkg layer
+# so editing them doesn't bust it. git apply --check fails the build loudly on
+# patch rot instead of silently shipping a stock extension.
+COPY docker/iceberg-only-extension-config.cmake       /build/duckdb-iceberg/extension_config.cmake
+COPY docker/iceberg-bakery-aware-commit-refresh.patch /tmp/iceberg-bakery.patch
+RUN cd /build/duckdb-iceberg \
+ && git apply --check /tmp/iceberg-bakery.patch \
+ && git apply        /tmp/iceberg-bakery.patch
+RUN cd /build/duckdb-iceberg && bash -c 'source /opt/rh/gcc-toolset-*/enable 2>/dev/null; \
+    export VCPKG_TOOLCHAIN_PATH=/build/vcpkg/scripts/buildsystems/vcpkg.cmake VCPKG_ROOT=/build/vcpkg \
+           VCPKG_TARGET_TRIPLET=x64-linux VCPKG_HOST_TRIPLET=x64-linux USE_MERGED_VCPKG_MANIFEST=1 \
+           EXT_CONFIG=/build/duckdb-iceberg/extension_config.cmake OVERRIDE_GIT_DESCRIBE=v1.4.3 \
+           CMAKE_BUILD_PARALLEL_LEVEL=$(nproc); \
+    make -j$(nproc) release'
+
 # ─── runtime stage: minimal base + the compiled artifacts ────────────────────
 FROM ghcr.io/pgedge/pgedge-postgres:${PGEDGE_TAG}
 ARG PG_MAJOR
 USER root
-# Runtime shared libs pg_duckdb links (httpfs/curl, lz4). No contrib: ColdFront
-# uses the core `uuid` type (not uuid-ossp), and Lakekeeper runs its catalog on
-# its own dedicated Postgres (see docker-compose). The mesh role's dblink need
-# is handled when the mesh cell is built, not speculatively here.
-RUN dnf install -y --setopt=install_weak_deps=False --allowerasing libcurl lz4 \
+# Runtime shared libs pg_duckdb links (httpfs/curl, lz4) + contrib for dblink.
+# The mesh role's R-A bakery uses dblink for its autonomous claim/release
+# transaction, and dblink ships only in the contrib package. One image serves
+# both roles, so it carries dblink unconditionally (vanilla simply never loads
+# it). uuid-ossp also comes with contrib but is unused — ColdFront uses the core
+# `uuid` type and Lakekeeper runs its catalog on its own dedicated Postgres.
+RUN dnf install -y --setopt=install_weak_deps=False --allowerasing \
+        libcurl lz4 pgedge-postgresql${PG_MAJOR}-contrib \
     && dnf clean all
 
 COPY --from=build /out/usr/pgsql-${PG_MAJOR}/lib/             /usr/pgsql-${PG_MAJOR}/lib/
 COPY --from=build /out/usr/pgsql-${PG_MAJOR}/share/extension/ /usr/pgsql-${PG_MAJOR}/share/extension/
+
+# Patched duckdb-iceberg + avro (bakery-aware commit refresh), staged in the
+# image. The entrypoint copies these into $PGDATA/pg_duckdb/extensions/<ver>/
+# <platform>/ on first init and sets allow_unsigned + iceberg_async_parquet so
+# the mesh bakery overlaps parquet uploads. See PATCHED.md.
+COPY --from=iceberg-builder /build/duckdb-iceberg/build/release/extension/iceberg/iceberg.duckdb_extension /opt/coldfront/iceberg/iceberg.duckdb_extension
+COPY --from=iceberg-builder /build/duckdb-iceberg/build/release/extension/avro/avro.duckdb_extension       /opt/coldfront/iceberg/avro.duckdb_extension
+ENV COLDFRONT_DUCKDB_VERSION=v1.4.3 \
+    COLDFRONT_DUCKDB_PLATFORM=linux_amd64
 
 COPY docker/entrypoint.sh /usr/local/bin/coldfront-entrypoint.sh
 RUN chmod +x /usr/local/bin/coldfront-entrypoint.sh

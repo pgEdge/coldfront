@@ -1,0 +1,106 @@
+# 3-node Spock mesh stack for the CI matrix. Same parameterized image as
+# vanilla (docker/Dockerfile) but MESH=on, so the entrypoint loads
+# snowflake,spock,pg_duckdb,coldfront and writes the mesh GUCs (wal_level
+# logical, spock.*, snowflake.node, dblink_self). spock + snowflake + dblink
+# are bundled in the pgEdge base; pg_duckdb is compiled in; coldfront installed.
+#
+#   PG_MAJOR=18 docker compose -f docker-compose.mesh.yml up -d --build
+#
+# ci/topo/mesh.sh drives this: brings the nodes up, forms the Spock mesh
+# (node_create + 6 bidirectional subs), then runs the journey + mesh stories
+# against db1. Lakekeeper runs on its OWN dedicated Postgres (never a data node).
+#
+# snowflake.node MUST equal hashtext(<spock node name>) & 1023 — the bakery's
+# dead-peer reap maps snowflake.get_node(ticket) back to a pg_stat_replication
+# peer. db1→691, db2→109, db3→672 (hashtext('dbN') & 1023).
+services:
+  db1:
+    build: { context: ., dockerfile: docker/Dockerfile, args: { PG_MAJOR: "${PG_MAJOR:-18}" } }
+    hostname: db1
+    environment:
+      PG_MAJOR: "${PG_MAJOR:-18}"
+      MESH: "on"
+      COLDFRONT_SNOWFLAKE_NODE: "691"
+      COLDFRONT_WAREHOUSE: wh
+      COLDFRONT_LAKEKEEPER: http://lakekeeper:8181/catalog
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U coldfront -d coldfront"]
+      interval: 3s
+      timeout: 2s
+      retries: 25
+
+  db2:
+    build: { context: ., dockerfile: docker/Dockerfile, args: { PG_MAJOR: "${PG_MAJOR:-18}" } }
+    hostname: db2
+    environment:
+      PG_MAJOR: "${PG_MAJOR:-18}"
+      MESH: "on"
+      COLDFRONT_SNOWFLAKE_NODE: "109"
+      COLDFRONT_WAREHOUSE: wh
+      COLDFRONT_LAKEKEEPER: http://lakekeeper:8181/catalog
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U coldfront -d coldfront"]
+      interval: 3s
+      timeout: 2s
+      retries: 25
+
+  db3:
+    build: { context: ., dockerfile: docker/Dockerfile, args: { PG_MAJOR: "${PG_MAJOR:-18}" } }
+    hostname: db3
+    environment:
+      PG_MAJOR: "${PG_MAJOR:-18}"
+      MESH: "on"
+      COLDFRONT_SNOWFLAKE_NODE: "672"
+      COLDFRONT_WAREHOUSE: wh
+      COLDFRONT_LAKEKEEPER: http://lakekeeper:8181/catalog
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U coldfront -d coldfront"]
+      interval: 3s
+      timeout: 2s
+      retries: 25
+
+  seaweedfs:
+    image: chrislusf/seaweedfs:latest
+    command: "server -s3 -dir=/data -s3.config=/etc/seaweedfs/s3.json"
+    volumes:
+      - ./docker/seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro
+
+  lakekeeper-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: lakekeeper
+      POSTGRES_PASSWORD: lakekeeper
+      POSTGRES_DB: lakekeeper
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lakekeeper"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  lakekeeper-migrate:
+    image: quay.io/lakekeeper/catalog:latest
+    command: migrate
+    depends_on:
+      lakekeeper-db:
+        condition: service_healthy
+    environment:
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgres://lakekeeper:lakekeeper@lakekeeper-db:5432/lakekeeper
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgres://lakekeeper:lakekeeper@lakekeeper-db:5432/lakekeeper
+      LAKEKEEPER__PG_ENCRYPTION_KEY: deadbeefdeadbeefdeadbeefdeadbeef
+
+  lakekeeper:
+    image: quay.io/lakekeeper/catalog:latest
+    command: serve
+    depends_on:
+      lakekeeper-migrate:
+        condition: service_completed_successfully
+    environment:
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgres://lakekeeper:lakekeeper@lakekeeper-db:5432/lakekeeper
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgres://lakekeeper:lakekeeper@lakekeeper-db:5432/lakekeeper
+      LAKEKEEPER__PG_ENCRYPTION_KEY: deadbeefdeadbeefdeadbeefdeadbeef
+      LAKEKEEPER__LISTEN_PORT: 8181
+    healthcheck:
+      test: ["CMD", "lakekeeper", "healthcheck"]
+      interval: 3s
+      timeout: 2s
+      retries: 10

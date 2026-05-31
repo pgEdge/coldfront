@@ -50,7 +50,8 @@ story_setup() {
     qf "$HOST" <<EOSQL >/dev/null
 CREATE EXTENSION IF NOT EXISTS pg_duckdb;
 CREATE EXTENSION IF NOT EXISTS coldfront;
-SELECT duckdb.install_extension('iceberg');
+-- iceberg/avro: the patched binary is shipped in the image + autoloaded on
+-- ATTACH (TYPE ICEBERG) with allow_unsigned; no install_extension needed.
 DROP SERVER IF EXISTS simple_s3_secret CASCADE;
 SELECT duckdb.create_simple_secret('s3','admin','adminsecret','','us-east-1','path','','${SW_IP}:8333','','','false');
 SELECT coldfront.arm_login_attach();
@@ -88,6 +89,14 @@ EOSQL
     local seeded; seeded=$(q "$HOST" "SELECT count(*) FROM public.events;")
     assert_eq "seeded 280 rows (pre-archive, plain table)" "280" "$seeded"
 
+    # Pin the hot/cold cutoff to a FIXED date (2026-04-15) regardless of the wall
+    # clock. The archiver (correctly) computes cutoff = now − retention, so set
+    # retention = now − 2026-04-15: the Apr partition stays hot and Jan–Mar cold
+    # against the fixed seed dates above, deterministically, without touching the
+    # archiver. (A literal "1 month" drifts the cutoff across the Apr/May boundary
+    # as the clock advances — the day it crosses, Apr flips hot→cold and the
+    # hot-tier write assertions break.)
+    local ret_days=$(( ( $(date -u +%s) - $(date -u -d '2026-04-15' +%s) ) / 86400 ))
     cat > /tmp/journey-archiver.yaml <<EOF
 postgres:
   dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
@@ -104,7 +113,7 @@ archiver:
   tables:
     - source_table: events
       partition_period: monthly
-      retention_period: "1 month"
+      retention_period: "${ret_days} days"
 EOF
     if "$ARCHIVER" --config /tmp/journey-archiver.yaml >/tmp/journey-archiver.log 2>&1; then
         pass "archiver first run completed"
@@ -256,11 +265,14 @@ VALUES ('2026-01-10', 42, 7, 1.5, 2.5, true, '2026-01-10', '11111111-1111-1111-1
 INSERT INTO typed (ts,c_int,c_small,c_real,c_dbl,c_bool,c_date,c_uuid,c_txt,c_vc,c_bytea,c_num,c_jsonb)
 VALUES ('2026-04-10', 42, 7, 1.5, 2.5, true, '2026-01-10', '11111111-1111-1111-1111-111111111111','hi','abc','\xdeadbeef'::bytea, 123.45, '{"k":1}');
 EOSQL
+    # Same fixed-cutoff pin as events (cutoff = 2026-04-15): typed's Jan partition
+    # cold, Apr hot, deterministically.
+    local ret_days=$(( ( $(date -u +%s) - $(date -u -d '2026-04-15' +%s) ) / 86400 ))
     cat > /tmp/journey-typed.yaml <<EOF
 postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
 iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog", namespace: "default" }
 s3:       { endpoint: "${SW_IP}:8333", region: "us-east-1", access_key: "admin", secret_key: "adminsecret" }
-archiver: { tables: [ { source_table: typed, partition_period: monthly, retention_period: "1 month" } ] }
+archiver: { tables: [ { source_table: typed, partition_period: monthly, retention_period: "${ret_days} days" } ] }
 EOF
     "$ARCHIVER" --config /tmp/journey-typed.yaml >/tmp/journey-typed.log 2>&1 \
         && pass "typed table archived (Jan → cold)" || { fail "typed archive — see /tmp/journey-typed.log"; tail -5 /tmp/journey-typed.log; }
@@ -414,11 +426,11 @@ story_blocks() {
 
 # ───────────────────────────────────────────────────────────────────────────
 # Story 9 — Concurrency / no-409: writes that race the archive cycle survive.
-# p_2026_04 is still hot after the first (1-month) cycle. A second cycle with
-# 1-day retention expires it; --debug-export-delay holds the capture window
-# open while concurrent UPDATE/DELETE/INSERT race into the delta trigger, which
-# the cold replay must apply. (Ported from run-ci-local.sh step 8b — the one
-# E2E behaviour the journey didn't yet cover.)
+# p_2026_04 is still hot after the first cycle (cutoff 2026-04-15). A second
+# cycle with the cutoff pinned PAST 2026-05-01 expires it; --debug-export-delay
+# holds the capture window open while concurrent UPDATE/DELETE/INSERT race into
+# the delta trigger, which the cold replay must apply. (Ported from
+# run-ci-local.sh step 8b — the one E2E behaviour the journey didn't yet cover.)
 # ───────────────────────────────────────────────────────────────────────────
 story_concurrency() {
     step "9. Race window: writes during the archive cycle survive into cold"
@@ -429,11 +441,14 @@ INSERT INTO events (ts, status, data) VALUES
   ('2026-04-17 12:00+00','race_seed_c','{}'),
   ('2026-04-18 12:00+00','race_will_delete','{}');
 EOSQL
+    # Pin the race cutoff PAST 2026-05-01 (target 2026-05-15) so the Apr
+    # partition — the last hot one — is expired by this cycle, deterministically.
+    local ret_race=$(( ( $(date -u +%s) - $(date -u -d '2026-05-15' +%s) ) / 86400 ))
     cat > /tmp/journey-race.yaml <<EOF
 postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
 iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog", namespace: "default" }
 s3:       { endpoint: "${SW_IP}:8333", region: "us-east-1", access_key: "admin", secret_key: "adminsecret" }
-archiver: { tables: [ { source_table: events, partition_period: monthly, retention_period: "1 day" } ] }
+archiver: { tables: [ { source_table: events, partition_period: monthly, retention_period: "${ret_race} days" } ] }
 EOF
     "$ARCHIVER" --config /tmp/journey-race.yaml --debug-export-delay 4s >/tmp/journey-race.log 2>&1 &
     local apid=$!
@@ -504,7 +519,50 @@ story_coexist() {
 }
 
 # Story 12 — mesh-only; built when the mesh cell is wired.
-story_mesh() { step "12. Mesh cross-node visibility + bakery"; fail "mesh stories not yet implemented (matrix step 3/mesh)"; }
+# ───────────────────────────────────────────────────────────────────────────
+# Story 12 — Mesh-only (decoupled): cross-node visibility + the R-A bakery under
+# real multi-node contention. Runs against the iceberg-only `iceonly` table the
+# decoupled stories created on db1. The wrapper VIEW replicates to peers via
+# Spock DDL, but the coldfront.tiered_views registry is local-OID-keyed and NOT
+# replicated, so we re-register on each peer (create_iceberg_table is idempotent)
+# to arm the C hook there. Cold data itself is shared via Lakekeeper, not Spock.
+# ───────────────────────────────────────────────────────────────────────────
+story_mesh() {
+    step "12. Mesh: cross-node visibility + R-A bakery (decoupled, multi-node)"
+    if [ "$MODE" != "decoupled" ]; then
+        note "cross-node mesh stories are decoupled-only — skipped in tiered mode (a tiered-mesh cross-node story is a separate TODO)"; return
+    fi
+    local PARR; read -ra PARR <<< "$PEERS"
+    [ "${#PARR[@]}" -ge 1 ] || { fail "mesh: no --peers given"; return; }
+
+    # Re-register the iceberg-only view on each peer (local registry row).
+    local pc
+    for pc in "${PARR[@]}"; do
+        q_may "$pc" "SELECT coldfront.create_iceberg_table('public','iceonly','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"ts\",\"type\":\"timestamptz\"},{\"name\":\"status\",\"type\":\"text\"},{\"name\":\"data\",\"type\":\"jsonb\"}]'::jsonb);" >/dev/null 2>&1
+        assert_eq "iceberg-only registered on peer $pc" "1" "$(q "$pc" "SELECT count(*) FROM coldfront.tiered_views WHERE is_iceberg_only AND iceberg_table='ice.default.iceonly';")"
+    done
+
+    # Cross-node READ: every row db1 wrote to Iceberg is visible on each peer via
+    # the shared Lakekeeper catalog (no Spock involved on the cold path).
+    local d1; d1=$(q "$HOST" "SELECT count(*) FROM iceonly;")
+    for pc in "${PARR[@]}"; do
+        assert_eq "peer $pc sees db1's iceberg rows via shared Lakekeeper" "$d1" "$(q "$pc" "SELECT count(*) FROM iceonly;")"
+    done
+
+    # Cross-node WRITE: a write on a peer is visible on db1 (shared catalog).
+    local p1="${PARR[0]}"
+    q "$p1" "INSERT INTO iceonly VALUES (5001,'2026-07-01 10:00:00+00','from_peer','{}');" >/dev/null 2>&1
+    assert_eq "write from peer $p1 visible on db1" "1" "$(q "$HOST" "SELECT count(*) FROM iceonly WHERE status='from_peer';")"
+
+    # R-A bakery under multi-node contention: concurrent cold writers on db1 AND
+    # a peer to the SAME Iceberg table must both land. Here v_armed is true
+    # (snowflake.node + dblink_self set), so this exercises the Ricart-Agrawala
+    # claim protocol across nodes — not the local advisory lock — to avoid 409.
+    q "$HOST" "INSERT INTO iceonly VALUES (6001,'2026-07-02 10:00:00+00','ra','{}');" >/dev/null 2>&1 &
+    q "$p1"   "INSERT INTO iceonly VALUES (6002,'2026-07-02 10:00:01+00','ra','{}');" >/dev/null 2>&1 &
+    wait 2>/dev/null
+    assert_eq "concurrent cross-node cold writers both landed (R-A bakery, no 409)" "2" "$(q "$HOST" "SELECT count(*) FROM iceonly WHERE status='ra';")"
+}
 # Standby reads — built after the probe gate passes.
 story_standby_reads() { step "13. Standby reads"; fail "standby stories not yet implemented (matrix step 4)"; }
 

@@ -15,6 +15,9 @@ PASS=0; FAIL=0
 step() { echo -e "\n${YELLOW}=== $1 ===${NC}"; }
 pass() { echo -e "${GREEN}  PASS: $1${NC}"; PASS=$((PASS + 1)); }
 fail() { echo -e "${RED}  FAIL: $1${NC}"; FAIL=$((FAIL + 1)); }
+# note: a logged, uncounted line — for coverage that is intentionally skipped in
+# a given cell (so it's visible, never silent, but isn't a pass or a failure).
+note() { echo -e "${YELLOW}  NOTE: $1${NC}"; }
 
 assert_eq()       { if [ "$2" = "$3" ];        then pass "$1"; else fail "$1 — expected '$2', got '$3'"; fi; }
 assert_gt()       { if [ "$3" -gt "$2" ] 2>/dev/null; then pass "$1"; else fail "$1 — expected > $2, got '$3'"; fi; }
