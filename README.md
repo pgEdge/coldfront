@@ -183,20 +183,22 @@ RETURNING) in permissive mode.
 
 #### Schema changes (DDL)
 
-Run `ALTER TABLE` on the **hot heap** (`_events`); coldfront keeps the
-Iceberg cold tier and the transparent view in sync automatically.
+Column-shape changes on a tiered table are **blocked**: duckdb-iceberg
+(pg_duckdb v1.1.1) cannot `ALTER` an Iceberg table, so coldfront refuses
+`ADD`/`DROP COLUMN`, `ALTER COLUMN ... TYPE`, and `RENAME COLUMN` rather than
+let the hot and cold tiers diverge. Renaming the hot table or the view **is**
+supported (neither touches the Iceberg schema).
 
 | DDL | What coldfront does |
 |---|---|
-| `ALTER TABLE _events ADD COLUMN x text` | Adds `x` to the Iceberg table, rebuilds the view so it projects `x`. |
-| `ALTER TABLE _events DROP COLUMN x` | Drops `x` from Iceberg, rebuilds the view without it. |
-| `ALTER TABLE _events ALTER COLUMN x TYPE bigint` | Mirrors the new type to Iceberg (must be a compatible widening), rebuilds the view. |
-| `ALTER TABLE _events RENAME COLUMN x TO y` | Renames in Iceberg, rebuilds the view; updates the registry if `x` is the partition column. |
-| `ALTER TABLE _events RENAME TO _events2` | Updates the registry, rebuilds the view. |
-| `ALTER VIEW events RENAME TO events2` | Migrates the watermark row to the new name, rebuilds the view (so the cold tier survives the rename). |
+| `ALTER TABLE _events ADD/DROP COLUMN`, `ALTER COLUMN ... TYPE`, `RENAME COLUMN` | **Blocked** with an actionable error — to change the schema, untier the table, alter it, then re-tier. |
+| `ALTER TABLE _events RENAME TO _events2` | Supported — updates the registry's `hot_table`, rebuilds the view. |
+| `ALTER VIEW events RENAME TO events2` | Supported — migrates the name-keyed registry + watermark rows to the new name, rebuilds the view (so the cold tier survives the rename). |
 
 ```sql
-ALTER TABLE _events ADD COLUMN payload jsonb;   -- view now projects payload
+ALTER TABLE _events ADD COLUMN payload jsonb;
+-- ERROR:  coldfront: cannot alter columns of tiered table "public._events" —
+--         its cold tier in Iceberg cannot be altered
 ```
 
 `DROP TABLE` / `DROP VIEW` / `TRUNCATE` on a tiered table are **blocked by

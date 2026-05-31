@@ -188,13 +188,17 @@ EOSQL
 story_decoupled_concurrency() {
     step "9. Concurrency: parallel cold writers serialize via the bakery (no 409)"
     local k pids=()
+    rm -f /tmp/journey-conc.* 2>/dev/null
     for k in 1 2 3 4 5 6 7 8; do
-        q "$HOST" "INSERT INTO iceonly VALUES (${k}00,'2026-06-0${k} 10:00:00+00','conc','{}');" >/dev/null 2>&1 &
+        q "$HOST" "INSERT INTO iceonly VALUES (${k}00,'2026-06-0${k} 10:00:00+00','conc','{}');" >/tmp/journey-conc.$k 2>&1 &
         pids+=("$!")
     done
-    local p; for p in "${pids[@]}"; do wait "$p" 2>/dev/null; done
+    local p; for p in "${pids[@]}"; do wait "$p"; done
+    assert_eq "no concurrent cold writer errored (no 409/abort)" "0" \
+        "$(cat /tmp/journey-conc.* 2>/dev/null | grep -cEi 'error|conflict|409')"
     assert_eq "8 concurrent cold writers all landed (no 409/loss)" "8" \
         "$(q "$HOST" "SELECT count(*) FROM iceonly WHERE status='conc';")"
+    rm -f /tmp/journey-conc.* 2>/dev/null
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -230,9 +234,9 @@ SELECT 'JSONB_COLD_M:' || (data->>'m') FROM events WHERE ts < '2026-03-01' AND s
 SELECT 'JSONB_HOT_M:'  || (data->>'m') FROM events WHERE ts >= '2026-03-01' AND status='ok' ORDER BY ts LIMIT 1;
 EOSQL
 )
-    assert_eq "total rows (hot+cold)" "280"  "$(extract RO_TOTAL "$O")"
-    assert_eq "hot rows"             "100"  "$(extract RO_HOT "$O")"
-    assert_eq "cold rows"            "180"  "$(extract RO_COLD "$O")"
+    assert_eq "total rows (hot+cold via view)" "280"  "$(extract RO_TOTAL "$O")"
+    assert_eq "rows ts>=2026-03-01 (Mar cold + Apr hot)" "100" "$(extract RO_HOT "$O")"
+    assert_eq "cold rows ts<2026-03-01 (Jan+Feb, read from Iceberg)" "180" "$(extract RO_COLD "$O")"
     assert_eq "data surfaces as json" "json" "$(extract JSONB_TYPE "$O")"
     assert_eq "json cold round-trip"  "jan"  "$(extract JSONB_COLD_M "$O")"
     assert_eq "json hot round-trip"   "mar"  "$(extract JSONB_HOT_M "$O")"
@@ -382,14 +386,18 @@ INSERT INTO events (ts,status,data) VALUES
  ('2026-04-08 00:00+00','mixseed3','{}'),('2026-01-08 00:00+00','mixseed3','{}');
 EOSQL
     local k pids=()
+    rm -f /tmp/journey-mix.* 2>/dev/null
     for k in 0 1 2 3; do
         # status-only predicate ⇒ TIER_AMBIGUOUS ⇒ dual-tier CTE (hot UPDATE +
         # cold _exec_iceberg_with_claim). Disjoint groups ⇒ no hot-row lock
         # contention; the cold legs contend on the bakery and serialize.
-        q "$HOST" "UPDATE events SET status='mixdone' WHERE status='mixseed${k}';" >/dev/null 2>&1 &
+        q "$HOST" "UPDATE events SET status='mixdone' WHERE status='mixseed${k}';" >/tmp/journey-mix.$k 2>&1 &
         pids+=("$!")
     done
-    local p; for p in "${pids[@]}"; do wait "$p" 2>/dev/null; done
+    local p; for p in "${pids[@]}"; do wait "$p"; done
+    assert_eq "no concurrent mixed-tier writer errored (no 409/abort)" "0" \
+        "$(cat /tmp/journey-mix.* 2>/dev/null | grep -cEi 'error|conflict|409')"
+    rm -f /tmp/journey-mix.* 2>/dev/null
     assert_eq "4 concurrent mixed-tier writers all landed (no 409/loss)" "8" "$(q "$HOST" "SELECT count(*) FROM events WHERE status='mixdone';")"
     assert_eq "no mixseed rows left"                                     "0" "$(q "$HOST" "SELECT count(*) FROM events WHERE status LIKE 'mixseed%';")"
     assert_eq "concurrent mixed write updated the cold tier (4 Jan rows)" "4" "$(q "$HOST" "SELECT count(*) FROM events WHERE status='mixdone' AND ts < '2026-02-01';")"
@@ -482,13 +490,17 @@ EOSQL
 story_concurrent_writers() {
     step "9b. Concurrency: parallel tiered COLD writers serialize via the bakery (no 409)"
     local k pids=()
+    rm -f /tmp/journey-tconc.* 2>/dev/null
     for k in 1 2 3 4 5 6 7 8; do
-        q "$HOST" "INSERT INTO events (ts,status,data) VALUES ('2026-04-2${k} 09:00:00+00','tconc','{}');" >/dev/null 2>&1 &
+        q "$HOST" "INSERT INTO events (ts,status,data) VALUES ('2026-04-2${k} 09:00:00+00','tconc','{}');" >/tmp/journey-tconc.$k 2>&1 &
         pids+=("$!")
     done
-    local p; for p in "${pids[@]}"; do wait "$p" 2>/dev/null; done
+    local p; for p in "${pids[@]}"; do wait "$p"; done
+    assert_eq "no concurrent tiered COLD writer errored (no 409/abort)" "0" \
+        "$(cat /tmp/journey-tconc.* 2>/dev/null | grep -cEi 'error|conflict|409')"
     assert_eq "8 concurrent tiered COLD writers all landed (no 409/loss)" "8" \
         "$(q "$HOST" "SELECT count(*) FROM events WHERE status='tconc';")"
+    rm -f /tmp/journey-tconc.* 2>/dev/null
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -513,9 +525,18 @@ EOSQL
 # Story 11 — Coexistence: a second tiered table, no cross-talk.
 # ───────────────────────────────────────────────────────────────────────────
 story_coexist() {
-    step "11. Multiple tiered tables coexist"
-    local n; n=$(q "$HOST" "SELECT count(*) FROM coldfront.tiered_views;")
-    assert_gt "registry holds multiple tiered views (events + typed)" "1" "$n"
+    step "11. Multiple tiered tables coexist (no cross-talk)"
+    assert_gt "registry holds multiple tiered views (events + typed)" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.tiered_views;")"
+    # Both are independently queryable across their tiers.
+    assert_gt "events readable (hot+cold)" "0" "$(q "$HOST" "SELECT count(*) FROM events;")"
+    assert_gt "typed readable (hot+cold)"  "0" "$(q "$HOST" "SELECT count(*) FROM typed;")"
+    # A cold write to events must NOT touch typed, and must land only in events.
+    local typed_before; typed_before=$(q "$HOST" "SELECT count(*) FROM typed;")
+    q "$HOST" "INSERT INTO events (ts,status,data) VALUES ('2026-01-09 00:00+00','coexist_probe','{}');" >/dev/null 2>&1
+    assert_eq "write to events left typed unchanged (no cross-talk)" "$typed_before" "$(q "$HOST" "SELECT count(*) FROM typed;")"
+    assert_eq "the events write landed in events"                    "1"             "$(q "$HOST" "SELECT count(*) FROM events WHERE status='coexist_probe';")"
+    q "$HOST" "DELETE FROM events WHERE status='coexist_probe';" >/dev/null 2>&1
 }
 
 # Story 12 — mesh-only; built when the mesh cell is wired.
@@ -523,14 +544,15 @@ story_coexist() {
 # Story 12 — Mesh-only (decoupled): cross-node visibility + the R-A bakery under
 # real multi-node contention. Runs against the iceberg-only `iceonly` table the
 # decoupled stories created on db1. The wrapper VIEW replicates to peers via
-# Spock DDL, but the coldfront.tiered_views registry is local-OID-keyed and NOT
-# replicated, so we re-register on each peer (create_iceberg_table is idempotent)
-# to arm the C hook there. Cold data itself is shared via Lakekeeper, not Spock.
+# Spock DDL; the decoupled topo does not add coldfront.tiered_views to the repset
+# (that is tiered-only), so we re-register on each peer (create_iceberg_table is
+# idempotent, and the registry is name-keyed so every node's row is identical) to
+# arm the C hook there. Cold data itself is shared via Lakekeeper, not Spock.
 # ───────────────────────────────────────────────────────────────────────────
 story_mesh() {
     step "12. Mesh: cross-node visibility + R-A bakery (decoupled, multi-node)"
     if [ "$MODE" != "decoupled" ]; then
-        note "cross-node mesh stories are decoupled-only — skipped in tiered mode (a tiered-mesh cross-node story is a separate TODO)"; return
+        note "story_mesh is the decoupled cross-node story; tiered cross-node is covered by story_mesh_tiered (ran earlier)"; return
     fi
     local PARR; read -ra PARR <<< "$PEERS"
     [ "${#PARR[@]}" -ge 1 ] || { fail "mesh: no --peers given"; return; }
@@ -558,10 +580,14 @@ story_mesh() {
     # a peer to the SAME Iceberg table must both land. Here v_armed is true
     # (snowflake.node + dblink_self set), so this exercises the Ricart-Agrawala
     # claim protocol across nodes — not the local advisory lock — to avoid 409.
-    q "$HOST" "INSERT INTO iceonly VALUES (6001,'2026-07-02 10:00:00+00','ra','{}');" >/dev/null 2>&1 &
-    q "$p1"   "INSERT INTO iceonly VALUES (6002,'2026-07-02 10:00:01+00','ra','{}');" >/dev/null 2>&1 &
-    wait 2>/dev/null
+    rm -f /tmp/journey-ra.* 2>/dev/null
+    q "$HOST" "INSERT INTO iceonly VALUES (6001,'2026-07-02 10:00:00+00','ra','{}');" >/tmp/journey-ra.1 2>&1 &
+    q "$p1"   "INSERT INTO iceonly VALUES (6002,'2026-07-02 10:00:01+00','ra','{}');" >/tmp/journey-ra.2 2>&1 &
+    wait
+    assert_eq "no cross-node cold writer errored (R-A bakery, no 409)" "0" \
+        "$(cat /tmp/journey-ra.* 2>/dev/null | grep -cEi 'error|conflict|409')"
     assert_eq "concurrent cross-node cold writers both landed (R-A bakery, no 409)" "2" "$(q "$HOST" "SELECT count(*) FROM iceonly WHERE status='ra';")"
+    rm -f /tmp/journey-ra.* 2>/dev/null
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -569,9 +595,9 @@ story_mesh() {
 # is readable AND writable from peers. Hot rows arrive via Spock replication of
 # the _events partitions; cold rows via the shared Lakekeeper catalog; the
 # coldfront.tiered_views registry + archive_watermark are replicated via the
-# Spock repset, and each node resolves its OWN local view OID (which may match
-# or diverge across nodes), so the OID-keyed C hook recognises the view on peers
-# and routes their writes. Runs right after
+# Spock repset. Both are name-keyed (schema_name,relname / table_name), so each
+# row is copied verbatim and correct on every node, which arms the C hook to
+# recognise the view and route writes on peers. Runs right after
 # provision while hot+cold coexist; its one cross-node write is cleaned up so
 # the stories that follow still see the post-provision baseline.
 # ───────────────────────────────────────────────────────────────────────────
@@ -582,13 +608,13 @@ story_mesh_tiered() {
     local total; total=$(q "$HOST" "SELECT count(*) FROM events;")
     local pc
     for pc in "${PARR[@]}"; do
-        # Registry present on the peer, keyed on the peer's OWN events OID. The
-        # archiver recreates the view amid local OID-consuming work, so the
-        # events OID can diverge across nodes — but the registry is resolved
-        # per-node, so 'events'::regclass on the peer matches its own row. (That
-        # is what arms the C hook for cross-node UPDATE/DELETE + DDL-blocking.)
-        assert_eq "tiered registry present on $pc (per-node view_oid)" "1" \
-            "$(q "$pc" "SELECT count(*) FROM coldfront.tiered_views WHERE view_oid = 'events'::regclass AND NOT is_iceberg_only;")"
+        # Registry present on the peer. The registry is name-keyed
+        # (schema_name, relname), so the repset replicates the row verbatim and
+        # it is correct on every node (a name is node-independent — no per-node
+        # OID resolution). That is what arms the C hook for cross-node
+        # UPDATE/DELETE + DDL-blocking on the peer.
+        assert_eq "tiered registry present on $pc (name-keyed)" "1" \
+            "$(q "$pc" "SELECT count(*) FROM coldfront.tiered_views WHERE schema_name = 'public' AND relname = 'events' AND NOT is_iceberg_only;")"
         # Cross-node READ: peer sees the same hot+cold total as db1.
         assert_eq "$pc reads same hot+cold total as db1" "$total" "$(q "$pc" "SELECT count(*) FROM events;")"
         # Hot rows present on the peer via Spock-replicated _events partitions.

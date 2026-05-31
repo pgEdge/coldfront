@@ -254,21 +254,19 @@ the pieces arrive by different routes:
 
 So alongside the bakery substrate (`coldfront.claims` /
 `coldfront.claim_acks`), **both `coldfront.tiered_views` and
-`coldfront.archive_watermark` are added to the Spock replication set** when
-a mesh runs in tiered mode. This is verified necessary, not cosmetic: with
+`coldfront.archive_watermark` are added to the Spock replication set** when a
+mesh runs in tiered mode. This is verified necessary, not cosmetic: with
 `tiered_views` absent from the replication set, peers still read and INSERT,
-but the registry is missing there and UPDATE/DELETE/DDL-blocking stop
-recognising the view. Each node ends up with a registry row resolving to
-**its own** local view OID (a peer's `events` row carries the peer's OID,
-not the originator's), which keeps the OID-keyed hook correct per-node. The
-watermark is name-keyed (`table_name`) and replicates cleanly.
+but the registry row is missing there and UPDATE/DELETE/DDL-blocking stop
+recognising the view (the archiver runs on one node, so a peer never registers
+the view itself — it only gets the row by replication).
 
-> The precise interplay between replicating `tiered_views` and the per-node
-> re-registration is a Spock subtlety; what is empirically verified is the
-> requirement (both tables in the replication set) and the outcome (per-node
-> OID resolution). A name-keyed registry — see
-> [ARCHITECTURE.md → Why OID-keyed](ARCHITECTURE.md#why-oid-keyed-and-when-names-are-better)
-> — removes the dependence on OID behaviour entirely.
+Both tables are **name-keyed** — `tiered_views` by `(schema_name, relname)`,
+`archive_watermark` by `table_name` — so the replication set copies each row
+**verbatim and correct on every node**: a name is node-independent, unlike an
+OID. There is no per-node re-resolution and no OID divergence to reason about;
+the row a peer receives is exactly the row its hook needs. See
+[ARCHITECTURE.md → Registry keying](ARCHITECTURE.md#registry-keying-by-name-not-oid).
 
 ## Partition Scheme Compatibility
 

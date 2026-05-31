@@ -5,6 +5,7 @@ CREATE EXTENSION IF NOT EXISTS pg_duckdb;
 NOTICE:  extension "pg_duckdb" already exists, skipping
 CREATE EXTENSION IF NOT EXISTS coldfront;
 NOTICE:  extension "coldfront" already exists, skipping
+-- White-box: checks the hooks' SQL/DDL, not Iceberg I/O. Real cold I/O is ci/journey.sh; see README.md.
 SET coldfront.warehouse = '';
 SET coldfront.lakekeeper_endpoint = '';
 SET coldfront.dblink_self = '';

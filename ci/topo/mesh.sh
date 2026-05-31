@@ -76,15 +76,15 @@ subs=$(m db1 "SELECT count(*) FROM spock.subscription;")
 for n in $NODES; do m "$n" "SELECT coldfront._ensure_claims_replicated();" >/dev/null 2>&1; done
 # Tiered cross-node: replicate the registry + watermark alongside the bakery's
 # claims/claim_acks. Both are needed for a tiered table provisioned on db1 to be
-# fully usable on a peer: archive_watermark (name-keyed) gives the peer's write
-# hook the hot/cold cutoff, and tiered_views arms the OID-keyed hook to recognise
-# the view for UPDATE/DELETE + DDL-blocking. VERIFIED both ways: with both in the
-# repset each peer ends up with a registry row that resolves to its OWN events
-# view; drop the tiered_views entry and the registry is absent on peers (only
-# INSERT keeps working, via the replicated INSTEAD trigger). tiered_views is
-# OID-keyed and the archiver-recreated view's OID can diverge across nodes — a
-# name-keyed registry would be the cleaner design (see ARCHITECTURE_TIERED.md "Tiered
-# tables in a Spock mesh"). (Decoupled re-registers per-node, so this is tiered-only.)
+# fully usable on a peer: archive_watermark (keyed by table_name) gives the peer's
+# write hook the hot/cold cutoff, and tiered_views (keyed by schema_name,relname)
+# arms the hook to recognise the view for UPDATE/DELETE + DDL-blocking. Both are
+# name-keyed, so the repset copies each row verbatim and correct on every node (a
+# name is node-independent). VERIFIED necessary: drop the tiered_views entry and
+# the registry is absent on peers (only INSERT keeps working, via the replicated
+# INSTEAD trigger) — the archiver runs on db1 only, so a peer never registers the
+# view itself; it gets the row by replication. (See ARCHITECTURE_TIERED.md "Tiered
+# tables in a Spock mesh". Decoupled re-registers per-node, so this is tiered-only.)
 if [ "$MODE" = tiered ]; then
     for n in $NODES; do
         m "$n" "SELECT spock.repset_add_table('default','coldfront.tiered_views'::regclass, false);"    >/dev/null 2>&1

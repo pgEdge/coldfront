@@ -636,11 +636,9 @@ func ensureIcebergTable(ctx context.Context, pool *pgxpool.Pool, cfg *config.Con
 // rewrite UPDATE/DELETE into dual-tier CTEs. Called after every view recreate.
 func registerTieredView(ctx context.Context, pool *pgxpool.Pool, schema, table, hotTable, icebergTable, partitionCol string) error {
 	_, err := pool.Exec(ctx, `
-		INSERT INTO coldfront.tiered_views (view_oid, hot_table, iceberg_table, partition_col)
-		SELECT c.oid, $3, $4, $5
-		FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-		WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = 'v'
-		ON CONFLICT (view_oid) DO UPDATE
+		INSERT INTO coldfront.tiered_views (schema_name, relname, hot_table, iceberg_table, partition_col)
+		VALUES ($1, $2, $3, $4, $5)
+		ON CONFLICT (schema_name, relname) DO UPDATE
 		  SET hot_table     = EXCLUDED.hot_table,
 		      iceberg_table = EXCLUDED.iceberg_table,
 		      partition_col = EXCLUDED.partition_col`,

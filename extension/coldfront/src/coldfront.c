@@ -123,8 +123,10 @@ lookup_tiered_view(Oid relid, const char *vname, TieredViewInfo *info)
         "       tv.is_iceberg_only, aw.cutoff_time "
         "FROM coldfront.tiered_views tv "
         "LEFT JOIN coldfront.archive_watermark aw ON aw.table_name = %s "
-        "WHERE tv.view_oid = %u",
-        quote_literal_cstr(vname), relid);
+        "WHERE tv.schema_name = %s AND tv.relname = %s",
+        quote_literal_cstr(vname),
+        quote_literal_cstr(get_namespace_name(get_rel_namespace(relid))),
+        quote_literal_cstr(vname));
     ret = SPI_execute(sql.data, true, 1);
 
     if (ret == SPI_OK_SELECT && SPI_processed == 1)
@@ -1126,7 +1128,7 @@ emit_tiered_insert(Query *query, TieredViewInfo *info)
     DeparseResult  dr;
     StringInfoData buf, hot;
     char          *col_list, *cutoff_lit;
-    const char    *source, *vname;
+    const char    *source, *vname, *vschema;
     List          *saved_returning;
     bool           need_loop;
 
@@ -1142,7 +1144,8 @@ emit_tiered_insert(Query *query, TieredViewInfo *info)
     {
         RangeTblEntry *rte = (RangeTblEntry *) list_nth(query->rtable,
                                                         query->resultRelation - 1);
-        vname = get_rel_name(rte->relid);
+        vname   = get_rel_name(rte->relid);
+        vschema = get_namespace_name(get_rel_namespace(rte->relid));
     }
 
     need_loop = tiered_insert_needs_loop(query, info);
@@ -1180,10 +1183,11 @@ emit_tiered_insert(Query *query, TieredViewInfo *info)
         appendStringInfo(&buf,
             "WITH hot_ins AS MATERIALIZED (%s RETURNING 1), "
             "cold_call AS MATERIALIZED ("
-            "SELECT coldfront._tiered_insert_cold(%s, %s, %s) AS n) "
+            "SELECT coldfront._tiered_insert_cold(%s, %s, %s, %s) AS n) "
             "SELECT (SELECT count(*) FROM hot_ins) AS hot_rows, "
             "       (SELECT n FROM cold_call) AS cold_rows",
             hot.data,
+            quote_literal_cstr(vschema),
             quote_literal_cstr(vname),
             target_arr.data,
             quote_literal_cstr(source));
@@ -1568,13 +1572,13 @@ coldfront_enqueue_release(PG_FUNCTION_ARGS)
 /* ---------- DDL synchronization (ProcessUtility_hook) ----------------- */
 
 /*
- * Registry row matched for a DDL target. We key on the HOT table's OID for
- * ALTER/RENAME (DDL fires on the heap, not the view) and on EITHER the hot
- * table or the view OID for DROP/TRUNCATE (both must be blocked). All matching
- * is by resolved OID — never by string — so it is schema-agnostic.
+ * Registry row matched for a DDL target. The DDL fires on the hot heap (or the
+ * view); we match it by resolved OID, and the row carries the transparent
+ * view's (schema, relname) — the registry key — for the rebuild/update helpers.
  */
 typedef struct {
-    Oid   view_oid;        /* registry key (the transparent view) */
+    char *view_schema;     /* registry key part 1: the view's namespace */
+    char *view_relname;    /* registry key part 2: the view's name */
     char *hot_table;       /* quoted qualified, e.g. "public"."_events" */
     char *iceberg_table;   /* DuckDB ref, e.g. ice.default.events */
     char *partition_col;   /* the tier partition column */
@@ -1624,7 +1628,7 @@ lookup_tiered_by_hot_oid(Oid relid, TieredDDLInfo *out)
 
     initStringInfo(&sql);
     appendStringInfo(&sql,
-        "SELECT view_oid, hot_table, iceberg_table, partition_col "
+        "SELECT schema_name, relname, hot_table, iceberg_table, partition_col "
         "FROM coldfront.tiered_views "
         "WHERE hot_table IS NOT NULL "
         "  AND to_regclass(hot_table)::oid = %u "
@@ -1634,16 +1638,16 @@ lookup_tiered_by_hot_oid(Oid relid, TieredDDLInfo *out)
     if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed == 1)
     {
         MemoryContext oldcxt = MemoryContextSwitchTo(CurTransactionContext);
-        bool    isnull;
-        Datum   d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc,
-                                  1, &isnull);
         char   *pc;
-        out->view_oid      = DatumGetObjectId(d);
-        out->hot_table     = pstrdup(SPI_getvalue(SPI_tuptable->vals[0],
+        out->view_schema   = pstrdup(SPI_getvalue(SPI_tuptable->vals[0],
+                                                  SPI_tuptable->tupdesc, 1));
+        out->view_relname  = pstrdup(SPI_getvalue(SPI_tuptable->vals[0],
                                                   SPI_tuptable->tupdesc, 2));
-        out->iceberg_table = pstrdup(SPI_getvalue(SPI_tuptable->vals[0],
+        out->hot_table     = pstrdup(SPI_getvalue(SPI_tuptable->vals[0],
                                                   SPI_tuptable->tupdesc, 3));
-        pc = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 4);
+        out->iceberg_table = pstrdup(SPI_getvalue(SPI_tuptable->vals[0],
+                                                  SPI_tuptable->tupdesc, 4));
+        pc = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 5);
         out->partition_col = pc ? pstrdup(pc) : NULL;
         MemoryContextSwitchTo(oldcxt);
         found = true;
@@ -1673,10 +1677,12 @@ relid_is_tiered(Oid relid)
     initStringInfo(&sql);
     appendStringInfo(&sql,
         "SELECT 1 FROM coldfront.tiered_views "
-        "WHERE view_oid = %u "
+        "WHERE (schema_name = %s AND relname = %s) "
         "   OR (hot_table IS NOT NULL AND to_regclass(hot_table)::oid = %u) "
         "LIMIT 1",
-        relid, relid);
+        quote_literal_cstr(get_namespace_name(get_rel_namespace(relid))),
+        quote_literal_cstr(get_rel_name(relid)),
+        relid);
     if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed == 1)
         found = true;
     pfree(sql.data);
@@ -1702,39 +1708,43 @@ spi_exec_void(const char *sql)
  * cold tier can't be ALTERed on duckdb-iceberg v1.1.1), so there is no
  * post-column-change rebuild path. */
 static void
-rebuild_tiered_view(Oid view_oid)
+rebuild_tiered_view(const char *schema, const char *relname)
 {
     StringInfoData sql;
     initStringInfo(&sql);
-    appendStringInfo(&sql, "SELECT coldfront._rebuild_tiered_view(%u)", view_oid);
+    appendStringInfo(&sql, "SELECT coldfront._rebuild_tiered_view(%s, %s)",
+        quote_literal_cstr(schema), quote_literal_cstr(relname));
     spi_exec_void(sql.data);
     pfree(sql.data);
 }
 
 /* Update registry hot_table after a hot-heap rename. */
 static void
-update_hot_table(Oid view_oid, const char *new_hot_quoted)
+update_hot_table(const char *schema, const char *relname, const char *new_hot_quoted)
 {
     StringInfoData sql;
     initStringInfo(&sql);
     appendStringInfo(&sql,
-        "SELECT coldfront._update_tiered_hot_table(%u, %s)",
-        view_oid, quote_literal_cstr(new_hot_quoted));
+        "SELECT coldfront._update_tiered_hot_table(%s, %s, %s)",
+        quote_literal_cstr(schema), quote_literal_cstr(relname),
+        quote_literal_cstr(new_hot_quoted));
     spi_exec_void(sql.data);
     pfree(sql.data);
 }
 
-/* Migrate the archive_watermark row when the transparent view is renamed. The
- * watermark is keyed on the bare view name; without this the rebuilt view
- * loses its cold UNION branch. Idempotent (no-op if never archived). */
+/* Migrate the name-keyed registry + watermark rows when the transparent view is
+ * renamed. The registry is keyed on (schema, relname) and the watermark on the
+ * bare view name; without this the rebuilt view loses its cold UNION branch.
+ * Idempotent (no-op for whichever row doesn't exist yet). */
 static void
-rename_watermark(const char *old_view_name, const char *new_view_name)
+rename_tiered_view(const char *schema, const char *old_view_name, const char *new_view_name)
 {
     StringInfoData sql;
     initStringInfo(&sql);
     appendStringInfo(&sql,
-        "SELECT coldfront._rename_watermark(%s, %s)",
-        quote_literal_cstr(old_view_name), quote_literal_cstr(new_view_name));
+        "SELECT coldfront._rename_tiered_view(%s, %s, %s)",
+        quote_literal_cstr(schema), quote_literal_cstr(old_view_name),
+        quote_literal_cstr(new_view_name));
     spi_exec_void(sql.data);
     pfree(sql.data);
 }
@@ -1928,37 +1938,16 @@ coldfront_process_utility(PlannedStmt *pstmt, const char *queryString,
                          rs->renameType == OBJECT_COLUMN))
         {
             /* Rename targeting the view itself (column rename on a view, or
-             * view rename). The view OID is the registry key directly. */
+             * view rename). The registry is keyed by the view's (schema,
+             * relname), resolved from the view relid directly — no SPI. */
             view_relid = RangeVarGetRelid(rs->relation, NoLock, true);
             if (relid_is_tiered(view_relid))
             {
-                /* Re-fetch the registry row by view OID. */
-                if (SPI_connect() == SPI_OK_CONNECT)
-                {
-                    StringInfoData q;
-                    initStringInfo(&q);
-                    appendStringInfo(&q,
-                        "SELECT view_oid, hot_table, iceberg_table, partition_col "
-                        "FROM coldfront.tiered_views WHERE view_oid = %u",
-                        view_relid);
-                    if (SPI_execute(q.data, true, 1) == SPI_OK_SELECT &&
-                        SPI_processed == 1)
-                    {
-                        MemoryContext oldcxt = MemoryContextSwitchTo(CurTransactionContext);
-                        char *s;
-                        info.view_oid      = view_relid;
-                        s = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2);
-                        info.hot_table     = s ? pstrdup(s) : NULL;
-                        info.iceberg_table = pstrdup(SPI_getvalue(SPI_tuptable->vals[0],
-                                                     SPI_tuptable->tupdesc, 3));
-                        s = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 4);
-                        info.partition_col = s ? pstrdup(s) : NULL;
-                        MemoryContextSwitchTo(oldcxt);
-                        matched = true;
-                    }
-                    pfree(q.data);
-                    SPI_finish();
-                }
+                MemoryContext oldcxt = MemoryContextSwitchTo(CurTransactionContext);
+                info.view_schema  = get_namespace_name(get_rel_namespace(view_relid));
+                info.view_relname = get_rel_name(view_relid);
+                MemoryContextSwitchTo(oldcxt);
+                matched = true;
             }
         }
 
@@ -1997,24 +1986,23 @@ coldfront_process_utility(PlannedStmt *pstmt, const char *queryString,
         {
             if (rs->renameType == OBJECT_TABLE && OidIsValid(hot_relid))
             {
-                /* Hot heap renamed: registry hot_table follows (resolve the
-                 * post-rename quoted qualified name), then rebuild. */
+                /* Hot heap renamed: the view's name is unchanged, so the
+                 * registry key is stable — update hot_table, then rebuild. */
                 char *new_hot = quoted_qualified_name(hot_relid);
-                update_hot_table(info.view_oid, new_hot);
-                rebuild_tiered_view(info.view_oid);
+                update_hot_table(info.view_schema, info.view_relname, new_hot);
+                rebuild_tiered_view(info.view_schema, info.view_relname);
             }
             else
             {
-                /* View renamed: migrate the name-keyed archive_watermark row to
-                 * the new name FIRST (the rebuild and the regenerated INSERT
-                 * trigger both look the cutoff up by the new name — without this
-                 * the rebuilt view would silently lose its cold UNION branch).
-                 * Then rebuild: regenerates trigger/func names from the new view
-                 * name and re-points the registry to the new OID. */
+                /* View renamed: migrate the name-keyed registry + watermark rows
+                 * (old→new) FIRST so the rebuild — and the regenerated INSERT
+                 * trigger — resolve the row by the new name; without this the
+                 * rebuilt view would silently lose its cold UNION branch. Then
+                 * rebuild under the new name. */
                 if (old_view_name != NULL &&
                     strcmp(old_view_name, rs->newname) != 0)
-                    rename_watermark(old_view_name, rs->newname);
-                rebuild_tiered_view(info.view_oid);
+                    rename_tiered_view(info.view_schema, old_view_name, rs->newname);
+                rebuild_tiered_view(info.view_schema, rs->newname);
             }
         }
         PG_FINALLY();

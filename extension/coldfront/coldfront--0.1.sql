@@ -7,19 +7,24 @@ END $$;
 
 -- Registry of tiered views. Populated by the archiver on each table-swap,
 -- or by coldfront.create_iceberg_table() in decoupled (iceberg-only) mode.
--- The post_parse_analyze_hook looks up the target relation OID here to decide
--- whether to rewrite an UPDATE/DELETE into a dual-tier CTE.
+-- Keyed by the transparent view's (schema_name, relname). The name is stable
+-- across the DROP+CREATE the archiver / DDL-rebuild does each cycle (a view OID
+-- is not), and a name replicates cleanly across a Spock mesh (an OID is
+-- node-local). The post_parse_analyze_hook resolves the target relation's name
+-- here to decide whether to rewrite an UPDATE/DELETE into a dual-tier CTE.
 --
 -- hot_table and partition_col are NULLable: in iceberg-only mode there is no
 -- PG-side hot heap, so neither field applies. The C hook checks
 -- is_iceberg_only first and short-circuits to TIER_COLD without dereferencing
 -- those columns.
 CREATE TABLE coldfront.tiered_views (
-    view_oid        oid     PRIMARY KEY,
+    schema_name     text    NOT NULL,                  -- namespace of the transparent view
+    relname         text    NOT NULL,                  -- name of the transparent view
     hot_table       text,                              -- 'public._events' (tiered) or NULL (iceberg-only)
     iceberg_table   text    NOT NULL,                  -- DuckDB ref: 'ice.default.events'
     partition_col   text,                              -- 'ts' (tiered) or NULL (iceberg-only)
-    is_iceberg_only boolean NOT NULL DEFAULT false
+    is_iceberg_only boolean NOT NULL DEFAULT false,
+    PRIMARY KEY (schema_name, relname)
 );
 
 -- Archive watermark: one row per managed table, recording the cutoff time
@@ -356,6 +361,7 @@ $$;
 -- the user supplied it, their value flows through unchanged (and
 -- nextval is not called).
 CREATE OR REPLACE FUNCTION coldfront._tiered_insert_cold(
+    p_view_schema text,
     p_view_name   text,
     p_target_cols text[],
     p_source_sql  text
@@ -404,8 +410,7 @@ BEGIN
     INTO v_hot_table, v_iceberg, v_partcol, v_cutoff
     FROM coldfront.tiered_views tv
     LEFT JOIN coldfront.archive_watermark aw ON aw.table_name = p_view_name
-    JOIN pg_class c ON c.oid = tv.view_oid
-    WHERE c.relname = p_view_name;
+    WHERE tv.schema_name = p_view_schema AND tv.relname = p_view_name;
 
     IF v_hot_table IS NULL THEN
         RAISE EXCEPTION 'coldfront._tiered_insert_cold: view % is not registered or is iceberg-only',
@@ -1030,11 +1035,9 @@ BEGIN
 
     -- 4. Registry row — is_iceberg_only=true tells the C hook to short-circuit
     --    classify_tier to TIER_COLD for any INSERT/UPDATE/DELETE on this view.
-    INSERT INTO coldfront.tiered_views (view_oid, hot_table, iceberg_table, partition_col, is_iceberg_only)
-    SELECT c.oid, NULL, format('ice.default.%s', p_table), NULL, true
-    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE n.nspname = p_schema AND c.relname = p_table AND c.relkind = 'v'
-    ON CONFLICT (view_oid) DO UPDATE SET
+    INSERT INTO coldfront.tiered_views (schema_name, relname, hot_table, iceberg_table, partition_col, is_iceberg_only)
+    VALUES (p_schema, p_table, NULL, format('ice.default.%s', p_table), NULL, true)
+    ON CONFLICT (schema_name, relname) DO UPDATE SET
         hot_table       = NULL,
         iceberg_table   = EXCLUDED.iceberg_table,
         partition_col   = NULL,
@@ -1646,27 +1649,31 @@ $$;
 
 -- Update the registry's hot_table after an ALTER TABLE ... RENAME of the hot
 -- heap. p_new_hot_table is the new quoted qualified name (built by the C hook
--- from the post-rename catalog state). Keyed on view_oid, which is stable
--- across a table rename (only the view rebuild changes the view OID).
+-- from the post-rename catalog state). Keyed on the view's (schema, relname),
+-- which a hot-table rename does not change.
 CREATE FUNCTION coldfront._update_tiered_hot_table(
-    p_view_oid oid, p_new_hot_table text
+    p_schema text, p_view_name text, p_new_hot_table text
 ) RETURNS void LANGUAGE sql AS $$
     UPDATE coldfront.tiered_views
        SET hot_table = p_new_hot_table
-     WHERE view_oid = p_view_oid;
+     WHERE schema_name = p_schema AND relname = p_view_name;
 $$;
 
--- Migrate the archive_watermark row when the transparent VIEW is renamed.
--- The watermark is keyed on the bare view name (== archiver SourceTable), and
--- _rebuild_tiered_view + the regenerated INSERT trigger both look the cutoff up
--- by the NEW name. Without this migration the lookup would miss, v_has_cutoff
--- would be false, and the rebuilt view would drop its cold (Iceberg) UNION
--- branch entirely — silently hiding all archived data. Called by the DDL hook's
--- view-rename branch BEFORE the rebuild so the rebuild reads the migrated row.
--- No-op (idempotent) if no watermark row exists yet (table never archived).
-CREATE FUNCTION coldfront._rename_watermark(
-    p_old_view_name text, p_new_view_name text
+-- Migrate the name-keyed registry + watermark rows when the transparent VIEW is
+-- renamed. coldfront.tiered_views (keyed on schema+relname) and archive_watermark
+-- (keyed on the bare view name == archiver SourceTable) both follow the new name.
+-- _rebuild_tiered_view + the regenerated INSERT trigger look the registry/cutoff
+-- up by the NEW name; without this migration the rebuild would not find the row,
+-- v_has_cutoff would be false, and the rebuilt view would drop its cold (Iceberg)
+-- UNION branch entirely — silently hiding all archived data. Called by the DDL
+-- hook's view-rename branch BEFORE the rebuild so it reads the migrated rows.
+-- Idempotent (no-op for whichever row does not exist yet).
+CREATE FUNCTION coldfront._rename_tiered_view(
+    p_schema text, p_old_view_name text, p_new_view_name text
 ) RETURNS void LANGUAGE sql AS $$
+    UPDATE coldfront.tiered_views
+       SET relname = p_new_view_name
+     WHERE schema_name = p_schema AND relname = p_old_view_name;
     UPDATE coldfront.archive_watermark
        SET table_name = p_new_view_name
      WHERE table_name = p_old_view_name;
@@ -1688,16 +1695,13 @@ $$;
 -- CREATE OR REPLACE). PG only lets CREATE OR REPLACE VIEW append columns at
 -- the end; a DDL that drops/renames/reorders/retypes a column would fail it.
 -- DROP also removes the INSTEAD OF trigger (recreated below) and changes the
--- view OID, so the registry row is re-pointed at the new OID before returning.
--- p_schema / p_view_name: optional view identity. The DDL hook passes them for
--- the DROP COLUMN / ALTER COLUMN TYPE path, where the view was already dropped
--- (via _predrop_tiered_view) BEFORE the real ALTER ran — so the registry's
--- view_oid now points to a dead pg_class entry and can't be resolved by JOIN.
--- When omitted (renames, add-column), the identity is resolved from view_oid.
+-- view OID — but the registry is keyed by (schema, relname), which the
+-- DROP+CREATE leaves unchanged, so there is no row to re-point. On a VIEW
+-- rename the hook migrates the registry key (old→new name) BEFORE calling this,
+-- so p_view_name is always the current (post-rename) view name.
 CREATE FUNCTION coldfront._rebuild_tiered_view(
-    p_view_oid   oid,
-    p_schema     text DEFAULT NULL,
-    p_view_name  text DEFAULT NULL
+    p_schema     text,
+    p_view_name  text
 )
 RETURNS void
 LANGUAGE plpgsql
@@ -1726,7 +1730,6 @@ DECLARE
     v_func_sql      text;
     v_funcname      text;           -- coldfront."<view>_write"
     v_trigname      text;           -- "<view>_write_trigger"
-    v_new_oid       oid;
 
     r               record;
     n               int := 0;       -- live-column counter for projections
@@ -1734,30 +1737,19 @@ DECLARE
     cold_type       text;
     iter            int := 0;       -- raw attribute counter (placeholder ordering)
 BEGIN
-    -- 1. Resolve registry columns from the (possibly now-dead) view_oid. The
-    -- registry row persists even after _predrop_tiered_view dropped the view.
+    -- 1. View identity IS the registry key (schema, relname). Resolve the
+    -- registry columns by it; the row persists across the DROP+CREATE below
+    -- because the name does not change.
+    v_schema    := p_schema;
+    v_view_name := p_view_name;
+
     SELECT tv.hot_table, tv.iceberg_table, tv.partition_col, tv.is_iceberg_only
     INTO v_hot_table, v_iceberg, v_partcol, v_is_ice_only
     FROM coldfront.tiered_views tv
-    WHERE tv.view_oid = p_view_oid;
+    WHERE tv.schema_name = p_schema AND tv.relname = p_view_name;
 
     IF NOT FOUND THEN
-        RAISE EXCEPTION 'coldfront._rebuild_tiered_view: view oid % not registered', p_view_oid;
-    END IF;
-
-    -- View identity: from the caller (predrop path, OID now dead) or resolved
-    -- from the live view_oid (rename / add-column path).
-    IF p_schema IS NOT NULL AND p_view_name IS NOT NULL THEN
-        v_schema    := p_schema;
-        v_view_name := p_view_name;
-    ELSE
-        SELECT n.nspname, c.relname
-        INTO v_schema, v_view_name
-        FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-        WHERE c.oid = p_view_oid;
-        IF NOT FOUND THEN
-            RAISE EXCEPTION 'coldfront._rebuild_tiered_view: view oid % no longer exists; pass p_schema/p_view_name', p_view_oid;
-        END IF;
+        RAISE EXCEPTION 'coldfront._rebuild_tiered_view: view %.% not registered', p_schema, p_view_name;
     END IF;
 
     -- Iceberg-only views have no hot table to read columns from: NO-OP.
@@ -1945,22 +1937,7 @@ $body$ LANGUAGE plpgsql$fn$,
         'CREATE TRIGGER %I INSTEAD OF INSERT ON %I.%I FOR EACH ROW EXECUTE FUNCTION %s()',
         v_trigname, v_schema, v_view_name, v_funcname);
 
-    -- 6. Re-point the registry row at the NEW view OID (DROP+CREATE minted a
-    --    new one). Carry hot_table / iceberg_table / partition_col forward.
-    SELECT c.oid INTO v_new_oid
-    FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE n.nspname = v_schema AND c.relname = v_view_name AND c.relkind = 'v';
-
-    IF v_new_oid IS DISTINCT FROM p_view_oid THEN
-        DELETE FROM coldfront.tiered_views WHERE view_oid = p_view_oid;
-        INSERT INTO coldfront.tiered_views
-            (view_oid, hot_table, iceberg_table, partition_col, is_iceberg_only)
-        VALUES (v_new_oid, v_hot_table, v_iceberg, v_partcol, false)
-        ON CONFLICT (view_oid) DO UPDATE SET
-            hot_table       = EXCLUDED.hot_table,
-            iceberg_table   = EXCLUDED.iceberg_table,
-            partition_col   = EXCLUDED.partition_col,
-            is_iceberg_only = false;
-    END IF;
+    -- 6. The registry key (schema, relname) is unchanged by the DROP+CREATE
+    --    above (the view name is stable), so there is nothing to re-point.
 END;
 $$;

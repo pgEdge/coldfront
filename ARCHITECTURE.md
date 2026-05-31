@@ -150,7 +150,7 @@ WHERE r['ts'] < '2026-03-01'::timestamptz;
 Applications use the transparent view exactly like a table. A
 `post_parse_analyze_hook` in the coldfront extension intercepts
 INSERT/UPDATE/DELETE whose target is a registered relation — resolved in
-`coldfront.tiered_views` by OID — and rewrites the parsed `Query` so it lands
+`coldfront.tiered_views` by name (`schema_name`, `relname`) — and rewrites the parsed `Query` so it lands
 in the correct tier; cold-side writes funnel through the
 `_exec_iceberg_with_claim` chokepoint (see
 [Concurrency](#concurrency-and-pgedge-spock-deployments)). A
@@ -224,65 +224,62 @@ registry's `hot_table` — never by string, so it is schema-agnostic):
 
 | DDL | Behaviour |
 |---|---|
-| `ALTER TABLE _t ADD COLUMN` | Mirror `ADD COLUMN` to the Iceberg table, rebuild the transparent view + INSERT trigger from the post-DDL catalog. |
-| `ALTER TABLE _t DROP COLUMN` | Drop the dependent view first (PG forbids dropping a column a view depends on), run the DROP, mirror to Iceberg, rebuild the view. |
-| `ALTER TABLE _t ALTER COLUMN ... TYPE` | Same pre-drop dance; mirror the new type to Iceberg (DuckDB enforces Iceberg's type-evolution rules). |
-| `ALTER TABLE _t RENAME COLUMN` | Mirror the rename to Iceberg; if the partition column was renamed, update `tiered_views.partition_col`; rebuild the view. |
-| `ALTER TABLE _t RENAME TO ...` | Update `tiered_views.hot_table`, rebuild the view. |
-| `ALTER VIEW v RENAME TO ...` | Migrate the name-keyed `archive_watermark` row to the new view name, then rebuild (otherwise the cutoff lookup misses and the cold UNION branch silently disappears). |
+| `ALTER TABLE _t ADD/DROP COLUMN`, `ALTER COLUMN ... TYPE`, `RENAME COLUMN` | **Blocked by design** — duckdb-iceberg (pg_duckdb v1.1.1) cannot `ALTER` an Iceberg table, so the hot and cold tiers would diverge. The hook raises an actionable error; to change the schema, untier the table, alter it, then re-tier. |
+| `ALTER TABLE _t RENAME TO ...` | Supported (touches no Iceberg schema): update `tiered_views.hot_table`, rebuild the view. |
+| `ALTER VIEW v RENAME TO ...` | Supported: migrate the name-keyed registry + `archive_watermark` rows to the new view name, then rebuild (otherwise the lookups miss and the cold UNION branch silently disappears). |
 | `DROP TABLE _t` / `DROP VIEW v` | **Blocked by design** — would orphan the Iceberg cold tier. Dismantling tiering is a deliberate operator action (unregister + drop each tier explicitly), never a one-shot call. |
 | `TRUNCATE _t` | **Blocked by design** — cold-tier rows would remain visible through the view. The operator truncates each tier explicitly. |
 
 The view rebuild always does `DROP VIEW` + `CREATE VIEW` (not
 `CREATE OR REPLACE VIEW`, which PG only allows for appending columns at
-the end), then re-points the registry's `view_oid` to the freshly-created
-view. The Iceberg mirror only runs when `coldfront.warehouse` is set; with
-it empty (single-node / tests) the PG-side view rebuild still happens.
-Concurrent schema changes are serialised by the same bakery as cold DML.
+the end). The registry is keyed by the view's `(schema_name, relname)`,
+which the rebuild leaves unchanged, so there is nothing to re-point. The
+Iceberg mirror only runs when `coldfront.warehouse` is set; with it empty
+(single-node / tests) the PG-side view rebuild still happens. Concurrent
+schema changes are serialised by the same bakery as cold DML.
 
-**Active-active.** Schema changes propagate as DDL, not as registry rows.
-Spock 5.0.8 replicates the top-level `ALTER TABLE` (the hook's SPI-issued
-view-rebuild DDL runs at non-top-level context, which Spock's
-`autoddl_can_proceed()` filters out). A peer applies the replicated
+**Active-active.** Spock 5.0.8 replicates the top-level `ALTER TABLE` (the
+hook's SPI-issued view-rebuild DDL runs at non-top-level context, which
+Spock's `autoddl_can_proceed()` filters out). A peer applies the replicated
 `ALTER TABLE` with `IsLogicalWorker() == true`; the hook then rebuilds
-**that peer's own** local view and re-points **that peer's own** registry
-row, but skips the Iceberg mirror (the originator already wrote the shared
-Lakekeeper catalog). Because each node re-points its own row, the registry
-is **resolved per-node**: every `coldfront.tiered_views` row carries that
-node's *local* view OID, so the OID-keyed hook is correct whether OIDs match
-across nodes (lockstep creation) or diverge (local recreation). DROP and
-TRUNCATE are blocked on every node. What a tiered table additionally needs
-to be usable on a peer is covered next.
+**that peer's own** local view, but skips the Iceberg mirror (the originator
+already wrote the shared Lakekeeper catalog). Because the registry is keyed by
+`(schema_name, relname)` — node-independent — the row is identical on every
+node: the rebuild needs no re-pointing, and the registry replicates cleanly by
+value across the mesh (an OID could not). DROP and TRUNCATE are blocked on
+every node. What a tiered table additionally needs to be usable on a peer is
+covered next.
 
 The tiered-specific cross-node behaviour — what replicates so a tiered table
 is usable on every peer, and why both the registry and the watermark join the
 replication set — is in
 [ARCHITECTURE_TIERED.md → Tiered tables in a Spock mesh](ARCHITECTURE_TIERED.md#tiered-tables-in-a-spock-mesh).
 
-### Why OID-keyed (and when names are better)
+### Registry keying: by name, not OID
 
-`coldfront.tiered_views` is keyed by `view_oid oid`, and the hook resolves
-the registry with `WHERE view_oid = <relid>` on every parsed statement that
-targets a candidate relation. OID was chosen because:
+`coldfront.tiered_views` is keyed by `(schema_name, relname)` — the transparent
+view's qualified name. The C hook resolves it with
+`WHERE schema_name = … AND relname = …` on every parsed statement that targets a
+candidate relation; the hook already holds the target `relid`, from which the
+schema and name are a cheap syscache lookup.
 
-- **The hook already holds the OID, not a name.** `post_parse_analyze_hook`
-  receives the target relation as a `relid`; an integer-equality probe with
-  no name resolution is cheap on the hot path of every query.
-- **It is rename-stable.** `ALTER ... RENAME` changes a relation's name but
-  not its OID, so a rename cannot silently orphan the registry entry.
-- **It is unambiguous within a node** — no schema-qualification or
-  `search_path` ambiguity to resolve.
+The name is the right key because it is **stable across the churn the system
+actually produces**. The archiver and the DDL-rebuild path `DROP`+`CREATE` the
+view regularly, minting a new view OID each time, while the name is unchanged —
+an OID key would have to be re-pointed on every rebuild; a name key is not. The
+one event that *does* change the name, `ALTER VIEW … RENAME`, migrates the
+registry row and the watermark to the new name in a single step
+(`_rename_tiered_view`), exactly as the watermark has always been name-keyed.
 
-The cost surfaces only in a Spock mesh: an OID is **local to a node**, so
-the registry cannot simply be copied between nodes by value, and the design
-leans on each node re-registering its own view (above). The watermark
-sidesteps this by keying on `table_name` — and that is the template for the
-recommended hardening: **key the registry on `schema.relname` as well**,
-resolving to an OID only at the point the hook needs one. Names are stable
-across nodes, so a name-keyed registry would replicate by value with no
-per-node OID dependence and would survive divergent active-active DDL. The
-watermark already proves the pattern; moving `tiered_views` to a name key is
-the clean end state for multi-node robustness.
+The name also **replicates cleanly across a Spock mesh**: it is node-independent,
+so the registry row is identical on every node and the replication set copies it
+by value (an OID is node-local and could not be). That is what makes cross-node
+tiered tables work with no per-node re-resolution — see
+[ARCHITECTURE_TIERED.md → Tiered tables in a Spock mesh](ARCHITECTURE_TIERED.md#tiered-tables-in-a-spock-mesh).
+
+Lower-level operations that genuinely need an OID — catalog lookups, the DDL
+hook matching the hot heap — resolve name→OID via `to_regclass` / `get_rel_name`
+at the point of use: names everywhere, OIDs only where required.
 
 ## Known Limitations
 

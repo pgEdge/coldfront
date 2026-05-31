@@ -9,6 +9,7 @@ CREATE EXTENSION IF NOT EXISTS pg_duckdb;
 CREATE EXTENSION IF NOT EXISTS coldfront;
 
 SET TIME ZONE 'UTC';
+-- White-box: checks the hooks' SQL/DDL, not Iceberg I/O. Real cold I/O is ci/journey.sh; see README.md.
 SET coldfront.warehouse = '';
 SET coldfront.lakekeeper_endpoint = '';
 SET coldfront.dblink_self = '';
@@ -16,8 +17,8 @@ SET coldfront.dblink_self = '';
 CREATE TABLE public._events (id int, ts timestamptz, status text);
 CREATE VIEW public.events AS SELECT * FROM public._events;
 
-INSERT INTO coldfront.tiered_views(view_oid, hot_table, iceberg_table, partition_col)
-VALUES ('public.events'::regclass, 'public._events', 'ice.default.events', 'ts');
+INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
+VALUES ('public', 'events', 'public._events', 'ice.default.events', 'ts');
 -- A watermark exists, so the rebuilt view must keep its cold UNION branch.
 INSERT INTO coldfront.archive_watermark(table_name, cutoff_time)
 VALUES ('events', '2026-03-01'::timestamptz);
@@ -35,8 +36,8 @@ SELECT table_name FROM coldfront.archive_watermark ORDER BY table_name;
 -- (watermark lookup matched the new name).
 SELECT pg_get_viewdef('public.events_v2'::regclass) LIKE '%iceberg_scan%' AS has_cold_branch;
 
--- The registry re-pointed to the new view's OID and the new name resolves.
-SELECT (view_oid = 'public.events_v2'::regclass) AS registry_points_at_new_view,
+-- The registry relname migrated to the new view name (name-keyed).
+SELECT (schema_name = 'public' AND relname = 'events_v2') AS registry_points_at_new_view,
        hot_table, partition_col
   FROM coldfront.tiered_views;
 

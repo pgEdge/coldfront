@@ -7,8 +7,7 @@ CREATE EXTENSION IF NOT EXISTS pg_duckdb;
 CREATE EXTENSION IF NOT EXISTS coldfront;
 
 SET TIME ZONE 'UTC';
--- ensure_attached() is a no-op when these GUCs are empty, so the cold path
--- doesn't try to reach a live Lakekeeper during tests.
+-- White-box: checks the hooks' SQL/DDL, not Iceberg I/O. Real cold I/O is ci/journey.sh; see README.md.
 SET coldfront.warehouse = '';
 SET coldfront.lakekeeper_endpoint = '';
 
@@ -16,8 +15,8 @@ CREATE TABLE public._events (id int, ts timestamptz, status text);
 INSERT INTO public._events VALUES (1, '2026-04-01 12:00:00+00', 'hot_orig');
 CREATE VIEW public.events AS SELECT * FROM public._events;
 
-INSERT INTO coldfront.tiered_views(view_oid, hot_table, iceberg_table, partition_col)
-VALUES ('public.events'::regclass, 'public._events', 'ice.default.events', 'ts');
+INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
+VALUES ('public', 'events', 'public._events', 'ice.default.events', 'ts');
 INSERT INTO coldfront.archive_watermark(table_name, cutoff_time)
 VALUES ('events', '2026-03-01'::timestamptz);
 

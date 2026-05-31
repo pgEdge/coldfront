@@ -10,14 +10,15 @@ CREATE EXTENSION IF NOT EXISTS pg_duckdb;
 CREATE EXTENSION IF NOT EXISTS coldfront;
 
 SET TIME ZONE 'UTC';
+-- White-box: checks the hooks' SQL/DDL, not Iceberg I/O. Real cold I/O is ci/journey.sh; see README.md.
 SET coldfront.warehouse = '';
 SET coldfront.lakekeeper_endpoint = '';
 
 CREATE TABLE public."_MixedEvents" (id int, ts timestamptz, status text);
 CREATE VIEW public."MixedEvents" AS SELECT * FROM public."_MixedEvents";
 
-INSERT INTO coldfront.tiered_views(view_oid, hot_table, iceberg_table, partition_col)
-VALUES ('public."MixedEvents"'::regclass,
+INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
+VALUES ('public', 'MixedEvents',
         'public."_MixedEvents"',
         'ice.default."MixedEvents"',
         'ts');
