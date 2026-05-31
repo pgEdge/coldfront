@@ -563,6 +563,48 @@ story_mesh() {
     wait 2>/dev/null
     assert_eq "concurrent cross-node cold writers both landed (R-A bakery, no 409)" "2" "$(q "$HOST" "SELECT count(*) FROM iceonly WHERE status='ra';")"
 }
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story (mesh + tiered) — cross-node tiered: a tiered table provisioned on db1
+# is readable AND writable from peers. Hot rows arrive via Spock replication of
+# the _events partitions; cold rows via the shared Lakekeeper catalog; the
+# coldfront.tiered_views registry + archive_watermark are replicated via the
+# Spock repset, and each node resolves its OWN local view OID (which may match
+# or diverge across nodes), so the OID-keyed C hook recognises the view on peers
+# and routes their writes. Runs right after
+# provision while hot+cold coexist; its one cross-node write is cleaned up so
+# the stories that follow still see the post-provision baseline.
+# ───────────────────────────────────────────────────────────────────────────
+story_mesh_tiered() {
+    step "2c. Mesh: cross-node tiered (hot via Spock + cold via shared Lakekeeper)"
+    local PARR; read -ra PARR <<< "$PEERS"
+    [ "${#PARR[@]}" -ge 1 ] || { fail "mesh: no --peers given"; return; }
+    local total; total=$(q "$HOST" "SELECT count(*) FROM events;")
+    local pc
+    for pc in "${PARR[@]}"; do
+        # Registry present on the peer, keyed on the peer's OWN events OID. The
+        # archiver recreates the view amid local OID-consuming work, so the
+        # events OID can diverge across nodes — but the registry is resolved
+        # per-node, so 'events'::regclass on the peer matches its own row. (That
+        # is what arms the C hook for cross-node UPDATE/DELETE + DDL-blocking.)
+        assert_eq "tiered registry present on $pc (per-node view_oid)" "1" \
+            "$(q "$pc" "SELECT count(*) FROM coldfront.tiered_views WHERE view_oid = 'events'::regclass AND NOT is_iceberg_only;")"
+        # Cross-node READ: peer sees the same hot+cold total as db1.
+        assert_eq "$pc reads same hot+cold total as db1" "$total" "$(q "$pc" "SELECT count(*) FROM events;")"
+        # Hot rows present on the peer via Spock-replicated _events partitions.
+        assert_gt "$pc sees hot rows via Spock" "0" "$(q "$pc" "SELECT count(*) FROM _events;")"
+    done
+    # Cross-node WRITE: a cold-dated INSERT on a peer routes through its hook to
+    # the shared Iceberg table (R-A bakery) and is visible on db1. Then clean it
+    # up so the row count returns to baseline for the stories that follow.
+    local p1="${PARR[0]}"
+    q "$p1" "INSERT INTO events (ts,status,data) VALUES ('2026-01-25 09:00+00','xnode_cold','{}');" >/dev/null 2>&1
+    assert_eq "cold write from peer $p1 visible on db1 (shared Lakekeeper)" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM events WHERE status='xnode_cold';")"
+    q "$HOST" "DELETE FROM events WHERE status='xnode_cold';" >/dev/null 2>&1
+    assert_eq "cross-node row cleaned up (post-provision baseline restored)" "$total" "$(q "$HOST" "SELECT count(*) FROM events;")"
+}
+
 # Standby reads — built after the probe gate passes.
 story_standby_reads() { step "13. Standby reads"; fail "standby stories not yet implemented (matrix step 4)"; }
 
@@ -574,6 +616,7 @@ story_standby_reads() { step "13. Standby reads"; fail "standby stories not yet 
 story_setup
 if [ "$MODE" = "tiered" ]; then
     story_provision_tiered
+    [ "$MESH" = 1 ] && story_mesh_tiered    # cross-node tiered, while hot+cold coexist
     story_reads
     story_types
     story_writes
@@ -590,7 +633,7 @@ else
     story_decoupled_concurrency
     story_decoupled_ryw
 fi
-[ "$MESH" = 1 ]      && story_mesh
+[ "$MESH" = 1 ] && [ "$MODE" = decoupled ] && story_mesh   # tiered+mesh runs story_mesh_tiered (above)
 [ -n "$STANDBY" ]    && story_standby_reads
 
 summary
