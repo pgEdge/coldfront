@@ -15,12 +15,13 @@ ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # shellcheck source=ci/lib.sh
 source "$SCRIPT_DIR/../lib.sh"
 
-MODE="tiered"; COMPOSE_FILE="docker-compose.mesh.yml"; KEEP=0; PG="${PG_MAJOR:-18}"
+MODE="tiered"; COMPOSE_FILE="docker-compose.mesh.yml"; KEEP=0; PG="${PG_MAJOR:-18}"; STANDBY=0
 while [ $# -gt 0 ]; do case "$1" in
   --mode) MODE="$2"; shift 2;;
   --pg) PG="$2"; shift 2;;
   --compose) COMPOSE_FILE="$2"; shift 2;;
   --keep) KEEP=1; shift;;
+  --standby) STANDBY=1; shift;;
   *) echo "mesh.sh: unknown arg $1"; exit 2;;
 esac; done
 
@@ -31,8 +32,7 @@ NODES="db1 db2 db3"
 PRIMARY="coldfront-db1-1"
 PEERS="coldfront-db2-1 coldfront-db3-1"
 
-cleanup() { [ "$KEEP" = 1 ] || $COMPOSE down -v >/dev/null 2>&1 || true; }
-trap cleanup EXIT
+trap topo_teardown EXIT
 
 # In-mesh psql by spock node name (db1/db2/db3 → container coldfront-dbN-1).
 m() { local n="$1"; shift; docker exec -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" "coldfront-${n}-1" "$CF_PSQL" -tA -c "$*" 2>&1 | grep -avE 'NOTICE|result:|^BOOLEAN|Rows:|Success'; }
@@ -125,6 +125,8 @@ for n in $NODES; do m "$n" "SELECT coldfront.arm_login_attach();" >/dev/null 2>&
 step "mesh: build archiver"
 make -s build >/dev/null 2>&1 || go build -o bin/archiver ./cmd/archiver
 
-step "mesh: run journey (mode=$MODE) against db1 + mesh stories"
+topo_standby "$PRIMARY"
+
+step "mesh: run journey (mode=$MODE standby=$STANDBY) against db1 + mesh stories"
 "$SCRIPT_DIR/../journey.sh" --host "$PRIMARY" --db-ip "$DB1_IP" --sw-ip "$SW_IP" --lk-ip "$LK_IP" \
-    --mode "$MODE" --mesh --peers "$PEERS"
+    --mode "$MODE" --mesh --peers "$PEERS" "${STANDBY_ARG[@]}"

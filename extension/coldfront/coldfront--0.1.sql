@@ -1605,6 +1605,16 @@ DECLARE
                    NULLIF(current_setting('coldfront.iceberg_async_parquet', true), '')::boolean,
                    false);
 BEGIN
+    -- A physical standby is read-only. The vanilla path below takes only an
+    -- advisory lock (not a PG write), so without this guard a cold write on a
+    -- read replica would slip past PG's read-only protection and attempt a
+    -- DuckDB→S3 Iceberg write — an uncoordinated writer mutating the shared cold
+    -- tier. Every cold write funnels through here, so one recovery check fences
+    -- them all off cleanly. (A hot write hits a PG heap; PG rejects it natively.)
+    IF pg_is_in_recovery() THEN
+        RAISE EXCEPTION 'coldfront: cannot execute a cold (Iceberg) write on a read-only standby'
+            USING HINT = 'Standbys serve reads only; route writes to the primary.';
+    END IF;
     IF v_armed AND v_async THEN
         -- Patched iceberg: upload parquet in the background, then take the bakery
         -- only to wrap pg_duckdb's deferred commit POST.

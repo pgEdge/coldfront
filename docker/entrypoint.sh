@@ -23,7 +23,19 @@ WAREHOUSE="${COLDFRONT_WAREHOUSE:-wh}"
 LAKEKEEPER="${COLDFRONT_LAKEKEEPER:-http://lakekeeper:8181/catalog}"
 SNOWFLAKE_NODE="${COLDFRONT_SNOWFLAKE_NODE:-1}"
 
-if [ ! -f "$PGDATA/PG_VERSION" ]; then
+if [ ! -f "$PGDATA/PG_VERSION" ] && [ -n "${COLDFRONT_STANDBY_OF:-}" ]; then
+    # ── Physical standby: base-backup the primary instead of initdb. ──
+    # A base backup carries everything a hot standby needs to serve cross-tier
+    # reads: the data, the coldfront GUCs (they live in postgresql.conf, not
+    # ALTER SYSTEM, so they ride the backup), the patched duckdb-iceberg cache
+    # (it sits inside PGDATA), and the DuckDB S3 secret (a pg_foreign_server row,
+    # physically replicated). -R writes standby.signal + primary_conninfo;
+    # hot_standby defaults on, so the replica serves read queries.
+    mkdir -p "$PGDATA"; chmod 700 "$PGDATA"
+    echo "standby: waiting for primary ${COLDFRONT_STANDBY_OF} …"
+    until "$PGBIN/pg_isready" -h "$COLDFRONT_STANDBY_OF" -U coldfront -d coldfront >/dev/null 2>&1; do sleep 1; done
+    "$PGBIN/pg_basebackup" -h "$COLDFRONT_STANDBY_OF" -U coldfront -D "$PGDATA" -R -X stream -c fast -P
+elif [ ! -f "$PGDATA/PG_VERSION" ]; then
     mkdir -p "$PGDATA"
     "$PGBIN/initdb" -D "$PGDATA" -U coldfront --auth=trust --locale=C --encoding=UTF8
 

@@ -435,9 +435,11 @@ pgedge-coldfront/
 ├── extension/coldfront/        ← PGXS C extension (hooks, bakery, registry)
 ├── ci/
 │   ├── journey.sh              ← THE canonical user journey (the E2E spec)
-│   ├── matrix.sh               ← drives PG×topology×mode cells (--quick / --full)
+│   ├── matrix.sh               ← drives PG×topology×mode×target cells (--quick / --full)
+│   ├── probe-standby.sh        ← risk gate: iceberg_scan on a read-only hot standby
 │   ├── lib.sh                  ← shared step/assert/psql helpers
-│   └── topo/                   ← vanilla.sh (1 node) · mesh.sh (3-node Spock)
+│   ├── topo/                   ← vanilla.sh (1 node) · mesh.sh (3-node Spock)
+│   └── runbooks/               ← failover-patroni.md (failover delegated to Patroni)
 ├── docker/
 │   ├── Dockerfile              ← one parameterized image (ARG PG_MAJOR=16|17|18)
 │   ├── entrypoint.sh

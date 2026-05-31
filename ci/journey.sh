@@ -631,8 +631,78 @@ story_mesh_tiered() {
     assert_eq "cross-node row cleaned up (post-provision baseline restored)" "$total" "$(q "$HOST" "SELECT count(*) FROM events;")"
 }
 
-# Standby reads — built after the probe gate passes.
-story_standby_reads() { step "13. Standby reads"; fail "standby stories not yet implemented (matrix step 4)"; }
+# ───────────────────────────────────────────────────────────────────────────
+# Story 13 — Standby reads: a read-only physical replica serves cross-tier reads
+# (hot via physical replication, cold via iceberg_scan executed on the read-only
+# backend) and rejects writes cleanly. The coldfront catalog (registry,
+# watermark, runtime_config) and the DuckDB S3 secret arrive through the base
+# backup + WAL stream, so the replica is byte-identical to the primary (same
+# OIDs) with zero extra setup. Gated by --standby <container>; the topology
+# base-backed it before the journey, so it has streamed every story by now.
+# Verified-safe: ci/probe-standby.sh is the standalone gate for this surface.
+# ───────────────────────────────────────────────────────────────────────────
+story_standby_reads() {
+    step "13. Standby reads (read-only physical replica: $STANDBY)"
+    assert_eq "standby is read-only (in recovery)" "t" "$(q "$STANDBY" "SELECT pg_is_in_recovery();")"
+
+    # Wait until the replica has replayed up to the primary's current WAL
+    # position so the read comparisons reflect the same committed state
+    # (streaming replication is asynchronous).
+    local tgt caught=0 i d
+    tgt=$(q "$HOST" "SELECT pg_current_wal_lsn();")
+    for i in $(seq 1 30); do
+        d=$(q "$STANDBY" "SELECT pg_wal_lsn_diff(pg_last_wal_replay_lsn(), '$tgt')::bigint;")
+        if [ -n "$d" ] && [ "$d" -ge 0 ] 2>/dev/null; then caught=1; break; fi
+        sleep 1
+    done
+    assert_eq "standby caught up to primary's WAL position" "1" "$caught"
+
+    # Coldfront catalog arrived via physical replication — same content, same OIDs.
+    # Pin the journey's primary view (tiered: events / decoupled: iceonly), NOT
+    # LIMIT 1 — story_coexist adds a second registry row (typed) with a different
+    # column shape, which must not be what the write probe below targets.
+    local vn; [ "$MODE" = tiered ] && vn="public.events" || vn="public.iceonly"
+    assert_eq "tiered_views registry replicated" "$(q "$HOST" "SELECT count(*) FROM coldfront.tiered_views;")" "$(q "$STANDBY" "SELECT count(*) FROM coldfront.tiered_views;")"
+    assert_eq "runtime_config (login-attach) replicated" "t" "$(q "$STANDBY" "SELECT attach_on_login FROM coldfront.runtime_config LIMIT 1;")"
+    assert_eq "registered view OID identical (physical replication)" \
+        "$(q "$HOST" "SELECT '$vn'::regclass::oid;")" "$(q "$STANDBY" "SELECT '$vn'::regclass::oid;")"
+
+    # Reads MATCH the primary across tiers. The login trigger attaches 'ice' on
+    # connect; iceberg_scan then executes read-only on the replica.
+    assert_eq "standby cross-tier read == primary" "$(q "$HOST" "SELECT count(*) FROM $vn;")" "$(q "$STANDBY" "SELECT count(*) FROM $vn;")"
+    assert_eq "standby cold-side read (iceberg_scan on replica) == primary" \
+        "$(q "$HOST" "SELECT count(*) FROM $vn WHERE ts < '2026-04-01';")" \
+        "$(q "$STANDBY" "SELECT count(*) FROM $vn WHERE ts < '2026-04-01';")"
+
+    # tiered only: the watermark drives the hot/cold cutoff; it must replicate too.
+    [ "$MODE" = tiered ] && assert_eq "archive_watermark replicated" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.archive_watermark;")" "$(q "$STANDBY" "SELECT count(*) FROM coldfront.archive_watermark;")"
+
+    # A write through the view fails CLEANLY, not a coldfront crash. Use a COLD-
+    # dated row so it routes through coldfront's cold chokepoint
+    # (_exec_iceberg_with_claim) on BOTH modes, exercising the standby guard there
+    # — a hot write would be rejected by PG natively, never reaching coldfront.
+    local w; w=$(q_may "$STANDBY" "INSERT INTO $vn (ts,status,data) VALUES ('2026-01-20','x','{}'::jsonb);")
+    assert_err "cold write through view on standby → clean read-only rejection" "read-only" "$w"
+
+    # Mesh + tiered: the standby is a physical replica of db1 (HOST). A peer's HOT
+    # write reaches db1 via Spock (logical) and then the standby via physical
+    # replication — the property unique to a mesh-node read replica. Scoped to
+    # tiered deliberately: decoupled has no PG data path (all rows live in shared
+    # Lakekeeper, which the standby reads directly — already covered by the
+    # cold-side read assertion above), and an Iceberg targeted-column INSERT is
+    # unsupported, so there is no hot-tier peer write to route here anyway.
+    if [ "$MESH" = 1 ] && [ "$MODE" = tiered ] && [ -n "${PEERS:-}" ]; then
+        local PARR peer seen=0 j; read -ra PARR <<< "$PEERS"; peer="${PARR[0]}"
+        q "$peer" "INSERT INTO $vn (ts,status,data) VALUES ('2026-04-22 08:00+00','sb_xnode','{}'::jsonb);" >/dev/null 2>&1
+        for j in $(seq 1 30); do
+            [ "$(q "$STANDBY" "SELECT count(*) FROM $vn WHERE status='sb_xnode';")" = 1 ] && { seen=1; break; }
+            sleep 1
+        done
+        assert_eq "mesh: standby of db1 sees peer-originated hot row (origin $peer, via Spock→physical)" "1" "$seen"
+        q "$HOST" "DELETE FROM $vn WHERE status='sb_xnode';" >/dev/null 2>&1
+    fi
+}
 
 # ───────────────────────────────────────────────────────────────────────────
 # Story 1b — Mesh-only: the bakery substrate (coldfront.claims) must replicate

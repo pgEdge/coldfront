@@ -89,24 +89,38 @@ cell_pg18_mesh_tiered() {
 cell_pg18_mesh_decoupled() {
     "$SCRIPT_DIR/topo/mesh.sh" --mode decoupled
 }
+# Standby cells: topo --standby base-backs a read-only physical replica, then the
+# journey's story_standby_reads exercises cross-tier reads (iceberg_scan on the
+# replica), the catalog/secret/GUCs arriving via the base backup, and a clean
+# read-only cold-write rejection. Gated by ci/probe-standby.sh (verified green).
+# Mesh adds a standby of db1, where story_standby_reads also asserts a
+# peer-originated row surfaces on the replica (Spock → db1 → physical).
+cell_pg18_vanilla_tiered_standby() {
+    "$SCRIPT_DIR/topo/vanilla.sh" --mode tiered --standby
+}
+cell_pg18_vanilla_decoupled_standby() {
+    "$SCRIPT_DIR/topo/vanilla.sh" --mode decoupled --standby
+}
+cell_pg18_mesh_tiered_standby() {
+    "$SCRIPT_DIR/topo/mesh.sh" --mode tiered --standby
+}
+cell_pg18_mesh_decoupled_standby() {
+    "$SCRIPT_DIR/topo/mesh.sh" --mode decoupled --standby
+}
 
 # coverage_table  — print every matrix cell with RUN / PENDING(reason). No
 # cell is ever silently omitted; PENDING states what is still required.
 coverage_table() {
     step "MATRIX COVERAGE"
     local pending_img="needs pg16/17 image build (one build-arg)"
-    local pending_sb="needs ci/probe-standby.sh gate"
     local pg topo mode tgt status
     for pg in 16 17 18; do
       for topo in vanilla mesh; do
         for mode in tiered decoupled; do
           for tgt in primary standby; do
-            status=""
-            if [ "$pg" = 18 ] && [ "$tgt" = primary ]; then
-                status="RUN"   # vanilla + mesh, tiered + decoupled, verified on pg18 primary
-            elif [ "$pg" != 18 ]; then status="PENDING ($pending_img)"
-            elif [ "$tgt" = standby ]; then status="PENDING ($pending_sb)"
-            fi
+            # All pg18 cells run (primary + standby, vanilla + mesh); standby is
+            # gated by ci/probe-standby.sh, verified green. pg16/17 await an image.
+            if [ "$pg" != 18 ]; then status="PENDING ($pending_img)"; else status="RUN"; fi
             printf '    pg%-2s · %-7s · %-9s · %-7s : %s\n' "$pg" "$topo" "$mode" "$tgt" "$status"
           done
         done
@@ -126,6 +140,10 @@ case "$SCOPE" in
     run_cell "pg18·vanilla·decoupled·primary" cell_pg18_vanilla_decoupled
     run_cell "pg18·mesh·tiered·primary"       cell_pg18_mesh_tiered
     run_cell "pg18·mesh·decoupled·primary"    cell_pg18_mesh_decoupled
+    run_cell "pg18·vanilla·tiered·standby"    cell_pg18_vanilla_tiered_standby
+    run_cell "pg18·vanilla·decoupled·standby" cell_pg18_vanilla_decoupled_standby
+    run_cell "pg18·mesh·tiered·standby"       cell_pg18_mesh_tiered_standby
+    run_cell "pg18·mesh·decoupled·standby"    cell_pg18_mesh_decoupled_standby
     coverage_table
     echo -e "\n  NOTE: only verified cells RUN. PENDING cells are tracked, not skipped silently."
     ;;

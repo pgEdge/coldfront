@@ -18,7 +18,7 @@ ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 # shellcheck source=ci/lib.sh
 source "$SCRIPT_DIR/../lib.sh"
 
-MODE="tiered"; COMPOSE_FILE="docker-compose.matrix.yml"; KEEP=0; REGRESS=0
+MODE="tiered"; COMPOSE_FILE="docker-compose.matrix.yml"; KEEP=0; REGRESS=0; STANDBY=0
 PG="${PG_MAJOR:-18}"
 while [ $# -gt 0 ]; do case "$1" in
   --mode) MODE="$2"; shift 2;;
@@ -26,6 +26,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --compose) COMPOSE_FILE="$2"; shift 2;;
   --keep) KEEP=1; shift;;
   --regress) REGRESS=1; shift;;
+  --standby) STANDBY=1; shift;;
   *) echo "vanilla.sh: unknown arg $1"; exit 2;;
 esac; done
 
@@ -34,8 +35,7 @@ export PG_MAJOR="$PG"           # consumed by docker-compose.matrix.yml build ar
 COMPOSE="docker compose -f $COMPOSE_FILE"
 DB=coldfront-db-1
 
-cleanup() { [ "$KEEP" = 1 ] || $COMPOSE down -v >/dev/null 2>&1 || true; }
-trap cleanup EXIT
+trap topo_teardown EXIT
 
 step "vanilla: build + up ($COMPOSE_FILE)"
 $COMPOSE down -v >/dev/null 2>&1 || true
@@ -92,5 +92,7 @@ fi
 step "vanilla: build archiver"
 make -s build >/dev/null 2>&1 || go build -o bin/archiver ./cmd/archiver
 
-step "vanilla: run journey (mode=$MODE)"
-"$SCRIPT_DIR/../journey.sh" --host "$DB" --db-ip "$DB_IP" --sw-ip "$SW_IP" --lk-ip "$LK_IP" --mode "$MODE"
+topo_standby "$DB"
+
+step "vanilla: run journey (mode=$MODE standby=$STANDBY)"
+"$SCRIPT_DIR/../journey.sh" --host "$DB" --db-ip "$DB_IP" --sw-ip "$SW_IP" --lk-ip "$LK_IP" --mode "$MODE" "${STANDBY_ARG[@]}"

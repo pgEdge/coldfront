@@ -46,3 +46,50 @@ summary() {
     echo -e "\n  Passed: ${GREEN}${PASS}${NC}   Failed: ${RED}${FAIL}${NC}"
     [ "$FAIL" -eq 0 ]
 }
+
+# standby_up <primary-container> <standby-name>  — base-backup a read-only
+# physical standby of <primary-container> onto a fresh container of the SAME
+# image + network, via the entrypoint's COLDFRONT_STANDBY_OF branch, and wait
+# until it accepts connections. Returns nonzero (and dumps the standby log) if it
+# never comes up. Shared by ci/probe-standby.sh and the topology scripts (DRY).
+standby_up() {
+    local primary="$1" sb="$2" i db_ip net img
+    db_ip=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$primary")
+    net=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' "$primary")
+    img=$(docker inspect -f '{{.Config.Image}}' "$primary")
+    docker rm -f "$sb" >/dev/null 2>&1 || true
+    docker run -d --name "$sb" --network "$net" \
+        -e PG_MAJOR="${PG_MAJOR:-18}" -e COLDFRONT_STANDBY_OF="$db_ip" "$img" >/dev/null || return 1
+    for i in $(seq 1 45); do
+        docker exec "$sb" pg_isready -U "$CF_DBUSER" -d "$CF_DBNAME" >/dev/null 2>&1 && return 0
+        sleep 2
+    done
+    docker logs "$sb" 2>&1 | tail -20
+    return 1
+}
+
+# The single read-only-replica container name — shared by the probe and both topo
+# scripts (they never run concurrently, so one name is safe and avoids divergence).
+CF_STANDBY="${CF_STANDBY:-coldfront-standby}"
+
+# topo_standby <primary-container>  — when the topology was invoked with --standby
+# (STANDBY=1), base-backup a read-only physical replica of <primary-container> as
+# $CF_STANDBY and set STANDBY_ARG to the journey's --standby flag; otherwise
+# STANDBY_ARG stays empty. Exits the topology on bring-up failure. The ONE home
+# for topo standby bring-up — neither topo script duplicates it.
+STANDBY_ARG=()
+topo_standby() {
+    [ "${STANDBY:-0}" = 1 ] || return 0
+    step "base-backup a read-only standby of $1"
+    standby_up "$1" "$CF_STANDBY" || { echo "standby $CF_STANDBY did not come up"; exit 1; }
+    STANDBY_ARG=(--standby "$CF_STANDBY")
+}
+
+# topo_teardown  — the EXIT trap shared by topo/*.sh and the probe: unless --keep
+# (KEEP=1), remove the standby (if any) and tear the compose stack down. Reads the
+# caller's $KEEP and $COMPOSE.
+topo_teardown() {
+    [ "${KEEP:-0}" = 1 ] && return 0
+    docker rm -f "$CF_STANDBY" >/dev/null 2>&1 || true
+    $COMPOSE down -v >/dev/null 2>&1 || true
+}

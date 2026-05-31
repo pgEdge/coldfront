@@ -9,7 +9,7 @@ external query engine, no Go Iceberg libraries.
 
 ## Contents
 
-- [Operating modes and topologies](#operating-modes-and-topologies) — the three axes of a deployment
+- [Operating modes and topologies](#operating-modes-and-topologies) — the three axes + read target (primary / standby)
 - [System Overview](#system-overview) — the moving parts
 - [Core Mechanics: pg_duckdb](#core-mechanics-pg_duckdb) — how Iceberg I/O happens
 - [Application Interface](#application-interface) — the shared rewrite hook
@@ -41,6 +41,27 @@ mesh differ only in how that chokepoint serialises cold writes. This
 document covers the shared mechanics and the tiered path; see
 [ARCHITECTURE_DECOUPLED.md](ARCHITECTURE_DECOUPLED.md) for the decoupled
 mode's ACID model and distributed scaling story.
+
+### Read target: primary or physical standby
+
+Orthogonal to the three axes above, any ColdFront node — vanilla or a mesh
+member — can have one or more **physical (streaming) standbys that serve
+read-only cross-tier reads**. The hot tier arrives by physical replication; the
+cold tier is read by `iceberg_scan` executing on the read-only backend. A base
+backup carries everything a replica needs — the coldfront catalog
+(`tiered_views`, `archive_watermark`, `runtime_config`), the DuckDB S3 secret (a
+`pg_foreign_server` row), and the GUCs (in `postgresql.conf`, not `ALTER SYSTEM`)
+— so a replica is byte-identical to its primary (same OIDs) with zero extra
+setup. Cold **writes** are refused on a standby: every cold write funnels through
+`_exec_iceberg_with_claim`, which raises when `pg_is_in_recovery()`, so a read
+replica can never become an uncoordinated writer to the shared Iceberg table
+(hot writes hit a PG heap and PG rejects them natively).
+
+Standby reads are gated by [`ci/probe-standby.sh`](ci/probe-standby.sh) (the
+risk-first check that `iceberg_scan` runs on a read-only backend at all) and
+exercised in the journey by `story_standby_reads` (the `·standby` matrix cells).
+Failover/promotion is delegated to Patroni and is out of scope for the test
+matrix — see [ci/runbooks/failover-patroni.md](ci/runbooks/failover-patroni.md).
 
 ## System Overview
 
@@ -332,7 +353,13 @@ constraints, the empty cold-tier partition spec, autovacuum-vs-cutover) are in
    across nodes.  Replication (single- or multi-master via pgEdge
    Spock) is supported on the hot tier and transparent to the
    application; scaling read throughput requires more replicas
-   rather than parallelising one query.
+   rather than parallelising one query. Those replicas **do** serve
+   cross-tier reads — including read-only physical standbys, where
+   `iceberg_scan` runs on the recovery backend (verified by
+   [`ci/probe-standby.sh`](ci/probe-standby.sh)); a standby's cold reads
+   are snapshot-consistent, not linearizable with concurrent primary cold
+   writes (ordinary Iceberg snapshot isolation — see
+   [ci/runbooks/failover-patroni.md](ci/runbooks/failover-patroni.md)).
 
 6. **Iceberg only** — no Delta Lake support.  Adding Delta would
    require either a second writer path in `pg_duckdb`'s Iceberg
