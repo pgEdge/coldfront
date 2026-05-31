@@ -6,9 +6,11 @@ no hot tier, no archiver. PostgreSQL becomes a stateless compute
 front-end; storage is owned by Lakekeeper + the underlying S3-compatible
 object store.
 
-This mode shares the same codebase, docker stack and (mostly) the same
-extension as the tiered mode described in [ARCHITECTURE.md](ARCHITECTURE.md);
-it differs only in which parts of the stack engage at runtime.
+It shares the same codebase, docker stack and extension as tiered mode. The
+shared mechanics — pg_duckdb Iceberg I/O, the rewrite hook, the bakery
+protocol, the registry — are in [ARCHITECTURE.md](ARCHITECTURE.md); tiered
+mode is in [ARCHITECTURE_TIERED.md](ARCHITECTURE_TIERED.md). This document
+covers what is specific to decoupled mode.
 
 ## What "decoupled" means
 
@@ -49,17 +51,16 @@ coldfront.lakekeeper_endpoint = 'http://lakekeeper:8181/catalog'
 -- one-time, per database:
 CREATE EXTENSION pg_duckdb;
 CREATE EXTENSION coldfront;
-SELECT duckdb.create_simple_secret(...);   -- S3 creds, see scale-test/run.sh
+SELECT duckdb.create_simple_secret(...);   -- S3 creds
 SELECT coldfront.arm_login_attach();       -- enable login-time ATTACH
 ```
 
 After that, every new connection has `ice.default.*` available.
 
-## Verified interface (against the live scale-test stack)
+## Interface
 
-All of the following were exercised end-to-end on the `decoupled`
-branch against `scale-test-db-1` with coldfront extension loaded and
-`arm_login_attach()` armed.
+With the coldfront extension loaded and `arm_login_attach()` armed, the
+wrapper view supports:
 
 ### What works
 
@@ -157,7 +158,7 @@ What the helper does:
 3. `CREATE OR REPLACE VIEW <schema>.<name> AS SELECT r['col']::pg_type AS col, … FROM duckdb.query('SELECT * FROM ice.default.<name>') AS t(r)` — projection wraps the struct accessor so applications see flat columns. View-cast types (`jsonb` → `json`, `interval`) are surfaced via the appropriate cast. The view source is `duckdb.query()` rather than `iceberg_scan()` specifically to make read-your-own-write inside an explicit transaction work; pg_duckdb's planner folds it into the same `ICEBERG_SCAN` plan with identical Parquet predicate pushdown, so there's no perf cost (verified with `EXPLAIN ANALYZE`: both forms hit `Function: ICEBERG_SCAN, Filters: id=N, Total Files Read: 7`, ~14ms warm).
 4. Registers the row in `coldfront.tiered_views` with `is_iceberg_only = true`. The C-side `post_parse_analyze_hook` reads this flag and short-circuits `classify_tier()` to `TIER_COLD` for any INSERT/UPDATE/DELETE on the wrapper view, regardless of WHERE clause or watermark — so every write rewrites cleanly into a single `SELECT duckdb.raw_query('INSERT/UPDATE/DELETE ice.default.<name> …')`. INSERT in particular: the hook emits one bulk `raw_query` for the entire statement (VALUES list inlined for VALUES, source-table refs prefixed with `pglocal.<schema>.<table>` for `INSERT … SELECT FROM <pg_table>` so DuckDB's postgres extension streams source rows over libpq into the Iceberg writer in one pipeline). No INSTEAD OF INSERT trigger is created — the hook is the dispatch path.
 
-Verified end-to-end against a fresh scale-test stack:
+Write semantics through the wrapper view:
 
 - INSERT → row appears in Iceberg, fresh-session SELECT sees it.
 - UPDATE → row updates in Iceberg, fresh-session SELECT sees the new value.
@@ -426,8 +427,8 @@ reason to lean **toward** decoupled, not away from it.
   (the cold-tier numbers in [bench.md](bench.md) Group C show 1.4–22×
   speedups vs PG heap on shape-matched workloads).
 - Operational simplicity outweighs ergonomics: no archiver cron, no
-  watermark, no autovacuum-vs-cutover lock conflict (Known Limitation
-  §12 in ARCHITECTURE.md), no PK rebuild after bulk load, no
+  watermark, no autovacuum-vs-cutover lock conflict (see
+  ARCHITECTURE_TIERED.md → Tiered-specific limitations), no PK rebuild after bulk load, no
   partition-management script.
 - You can tolerate the isolation gap (cross-query snapshot
   consistency) and the verbose `iceberg_scan` / `raw_query` syntax.
@@ -444,16 +445,10 @@ reason to lean **toward** decoupled, not away from it.
   or `raw_query(...)`.
 - You need full PG ACID isolation across the whole table.
 
-## Open
+## Limitations
 
-- **Cross-call snapshot pinning.** PG-native isolation across
-  multiple `iceberg_scan` calls within one transaction would require
-  either upstream support in pg_duckdb (a "freeze the iceberg
-  snapshot at tx-start" knob) or a session-level lock. Out of scope
-  here.
-
-- **Distributed crash testing.** The crash-mid-commit
-  orphan-S3-files scenario is documented but has not been
-  deliberately exercised. A follow-up task would be to kill a PG
-  backend mid-`raw_query('INSERT …')` and verify Iceberg
-  housekeeping reclaims any orphans within the expected window.
+- **Cross-call snapshot pinning.** PG-native isolation across multiple
+  `iceberg_scan` calls within one transaction would require either upstream
+  support in pg_duckdb (a "freeze the iceberg snapshot at tx-start" knob) or
+  a session-level lock; neither is in place, so a long-running transaction
+  can observe a newer snapshot on a later scan.
