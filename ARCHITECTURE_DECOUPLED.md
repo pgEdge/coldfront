@@ -369,8 +369,8 @@ SELECT coldfront._ensure_claims_replicated();
 The helper is idempotent. Without it on a peer, that peer's ack
 INSERTs are local-only and never replicate back to the originating
 writer — every claim ack-waits to timeout. CI verifies this via the
-sentinel-claims-in-all-6-directions probe before any iceberg write
-(see `run-ci-distributed.sh` step 12b).
+sentinel-claims-in-all-directions probe before any iceberg write
+(see `ci/journey.sh` `story_mesh_substrate`).
 
 `coldfront.create_iceberg_table()` calls `_ensure_claims_replicated()`
 on the node it runs on, but that only registers the repset on *that*

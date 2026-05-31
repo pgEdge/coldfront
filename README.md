@@ -176,9 +176,10 @@ UPDATE events SET status = 'x' WHERE id = 123;
 -- a non-atomic dual-tier rewrite.
 ```
 
-See [ARCHITECTURE.md](ARCHITECTURE.md) — "Transparent UPDATE/DELETE" section — for
-the full rewrite rules, the classifier's predicate coverage, and the
-cosmetic regressions (command tag, cold RETURNING) in permissive mode.
+See [ARCHITECTURE_TIERED.md](ARCHITECTURE_TIERED.md) — "Transparent UPDATE/DELETE" —
+for the full rewrite rules and the classifier's predicate coverage, and its
+"Tiered-specific limitations" for the cosmetic regressions (command tag, cold
+RETURNING) in permissive mode.
 
 #### Schema changes (DDL)
 
@@ -400,19 +401,22 @@ commit-time I/O. See
 [ARCHITECTURE.md → Upstream Requests → duckdb-iceberg secret visibility](ARCHITECTURE.md#duckdb-iceberg-secret-visibility-under-fresh-transactions)
 for the mechanism. Requires PostgreSQL 17+.
 
-## Testing
+One canonical user journey ([ci/journey.sh](ci/journey.sh)) runs identically in
+every deployment cell; `ci/matrix.sh` drives the cells and `ci/topo/*.sh` brings
+up each topology. All cells share one parameterized image
+([docker/Dockerfile](docker/Dockerfile), `--build-arg PG_MAJOR=16|17|18`).
 
-Two test suites, both self-contained Docker stacks.
+**Pre-commit gate** — `./run-ci-local.sh` runs `ci/matrix.sh --quick`: gofmt,
+golangci-lint, unit tests, build, the pg_regress unit layer, and the full
+journey on one representative cell (PG18 · vanilla · tiered). Fast; runs on
+every commit. GitHub Actions must run the identical `ci/matrix.sh` steps.
 
-**Single-node** — `./run-ci-local.sh`. Default CI path. Brings up one `pgduckdb/pgduckdb:18-v1.1.1` Postgres plus Lakekeeper + SeaweedFS, seeds 280 rows across four monthly partitions, runs the archiver, and asserts hot/cold behavior through the unified view (hot/cold INSERT/UPDATE/DELETE, dual-tier permissive-mode CTE, ROLLBACK). Fast; runs on every commit.
-
-**Distributed (3-node Spock)** — `./run-ci-distributed.sh`. Opt-in. Builds a one-off `coldfront-spock:latest` image on `ghcr.io/pgedge/pgedge-postgres:17.9-spock5.0.7-standard` (Rocky 9 PG 17.9 with Spock 5.0.7 pre-installed) and source-builds pg_duckdb v1.1.1 + coldfront against it; the builder stage is expensive (~20 min first time, seconds thereafter via Docker layer cache). Brings up 3 PG nodes in a full Spock mesh + shared Lakekeeper + SeaweedFS, mirrors the single-node assertions on db1, and adds:
-
-- cross-node hot visibility (Spock replicates `_events` writes within seconds)
-- cross-node cold visibility (all 3 nodes read the shared Iceberg catalog via `iceberg_scan`)
-- Lakekeeper optimistic-concurrency characterization: parallel cold UPDATEs from db1 & db2 on disjoint rows of the same Iceberg table; records whether both landed, one aborted with an error, or one was silently dropped (the last is a known pg_duckdb v1.1.1 behavior — see `LK_CONCURRENCY_OUTCOME` in the run output)
-
-The distributed suite does not modify `run-ci-local.sh` or any existing files — it only adds `docker/coldfront-spock.Dockerfile`, `docker/coldfront-spock-entrypoint.sh`, `docker-compose.distributed.yml`, and the script.
+**Full matrix** — `ci/matrix.sh --full`, the beta gate: PG {16, 17, 18} ×
+{vanilla, mesh (3-node Spock)} × {tiered, decoupled}. The mesh cells add the
+cross-node stories — hot visibility via Spock, cold visibility via the shared
+Lakekeeper catalog, the R-A bakery serialising concurrent cold writers
+(same-node and cross-node) with no 409, and an N×(N-1) probe that the bakery's
+`coldfront.claims` table replicates in every direction.
 
 ## Project Structure
 
@@ -426,17 +430,25 @@ pgedge-coldfront/
 │   ├── watermark/              ← archive_watermark table CRUD
 │   ├── partition/              ← partition create/find/detach/drop
 │   └── view/                   ← unified view + trigger generation
+├── extension/coldfront/        ← PGXS C extension (hooks, bakery, registry)
+├── ci/
+│   ├── journey.sh              ← THE canonical user journey (the E2E spec)
+│   ├── matrix.sh               ← drives PG×topology×mode cells (--quick / --full)
+│   ├── lib.sh                  ← shared step/assert/psql helpers
+│   └── topo/                   ← vanilla.sh (1 node) · mesh.sh (3-node Spock)
 ├── docker/
+│   ├── Dockerfile              ← one parameterized image (ARG PG_MAJOR=16|17|18)
+│   ├── entrypoint.sh
 │   └── seaweedfs-s3.json       ← SeaweedFS S3 auth config (example)
-├── docker-compose.test.yml     ← PG + Lakekeeper + SeaweedFS
-├── docker-compose.distributed.yml ← 3 PG + Spock + Lakekeeper + SeaweedFS
-├── run-ci-local.sh             ← gofmt, lint, test, build, e2e
-├── run-ci-distributed.sh       ← opt-in 3-node Spock compat suite
+├── docker-compose.test.yml     ← single-node dev stack: PG + Lakekeeper + SeaweedFS
+├── docker-compose.mesh.yml     ← 3 PG + Spock + Lakekeeper + SeaweedFS
+├── run-ci-local.sh             ← pre-commit gate (ci/matrix.sh --quick)
 ├── config.example.yaml
 ├── Makefile
 ├── USAGE.md                    ← user-level usage guide (both modes)
-├── ARCHITECTURE.md             ← tiered architecture
-└── ARCHITECTURE_DECOUPLED.md   ← decoupled (iceberg-only) architecture
+├── ARCHITECTURE.md             ← common architecture (shared mechanics)
+├── ARCHITECTURE_TIERED.md      ← tiered (hot PG + cold Iceberg) mode
+└── ARCHITECTURE_DECOUPLED.md   ← decoupled (iceberg-only) mode
 ```
 
 ## Dependencies

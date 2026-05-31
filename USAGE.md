@@ -205,7 +205,7 @@ SELECT coldfront._ensure_claims_replicated();
 
 `synchronize_structure := false, synchronize_data := false` — tables already exist on every node from the coldfront extension; no initial copy needed.
 
-**Verify before benching** — insert a sentinel claim on each node and read it back from every other node. All N×(N-1) directions must show the row before traffic starts. `run-ci-distributed.sh` step 12b is a copyable reference.
+**Verify before benching** — insert a sentinel claim on each node and read it back from every other node. All N×(N-1) directions must show the row before traffic starts. `ci/journey.sh` `story_mesh_substrate` is a copyable reference.
 
 ## Tuning knobs
 

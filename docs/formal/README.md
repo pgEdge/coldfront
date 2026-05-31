@@ -4,8 +4,9 @@ This directory contains a formal model of the multi-writer Iceberg
 commit serialization protocol that lives in
 [../../extension/coldfront/coldfront--0.1.sql](../../extension/coldfront/coldfront--0.1.sql)
 and [../../extension/coldfront/src/coldfront.c](../../extension/coldfront/src/coldfront.c).
-The CI suites (`run-ci-distributed.sh` step 15 + 15b, `run-ci-local.sh`
-step 8b) test the protocol against a fixed mesh shape — three docker
+The CI journey (`ci/journey.sh` — `story_mesh` / `story_decoupled_concurrency` /
+`story_mesh_substrate`, driven by `ci/matrix.sh`) tests the protocol against a
+fixed mesh shape — three docker
 containers, single iceberg table, well-paced workload. The model
 exhaustively explores **every interleaving** of N writers within
 bounded depth, including failure injections that the CI can't easily
@@ -183,8 +184,9 @@ Error: Invariant NoLakekeeperConflict is violated.
 the asymmetric-apply race: two concurrent writers pass min-check
 on stale local views, both proceed to Lakekeeper, one POSTs first
 and wins, the other gets 409. This is the formal demonstration of
-the race we observed empirically in `run-ci-distributed.sh` step 15
-— and the reason application-level 409-retry is non-optional.
+the race we observed empirically in the mesh concurrency stories
+(`ci/journey.sh` `story_mesh`) — and the reason the bakery's claim
+protocol is non-optional.
 `NonCrashedProgress` is the right property to check here:
 the crashed writer itself can never decide (its plpgsql session is
 dead), but every live writer with a claim still progresses.

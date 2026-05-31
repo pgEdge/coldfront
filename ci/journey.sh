@@ -608,12 +608,46 @@ story_mesh_tiered() {
 # Standby reads — built after the probe gate passes.
 story_standby_reads() { step "13. Standby reads"; fail "standby stories not yet implemented (matrix step 4)"; }
 
+# ───────────────────────────────────────────────────────────────────────────
+# Story 1b — Mesh-only: the bakery substrate (coldfront.claims) must replicate
+# in all N×(N-1) directions, or the R-A bakery can't serialise cross-node
+# commits. story_mesh exercises only the two writers' directions; this probes
+# the full mesh per the standing multi-writer rule — a sentinel claim on every
+# node, read back from every node — then verifies the cleanup replicates too so
+# no stale claim lingers. Mode-agnostic: claims/claim_acks are bakery substrate,
+# armed by the topology on every node before the journey runs.
+# ───────────────────────────────────────────────────────────────────────────
+story_mesh_substrate() {
+    step "1b. Mesh: bakery substrate (coldfront.claims) replicates in all directions"
+    local PARR; read -ra PARR <<< "$PEERS"
+    [ "${#PARR[@]}" -ge 1 ] || { fail "mesh: no --peers given"; return; }
+    local nodes=("$HOST" "${PARR[@]}") want="$(( ${#PARR[@]} + 1 ))" n t=90
+    q "$HOST" "DELETE FROM coldfront.claims WHERE iceberg_table='bakery_probe';" >/dev/null 2>&1
+    for n in "${nodes[@]}"; do
+        t=$((t + 1))
+        q "$n" "INSERT INTO coldfront.claims (iceberg_table, ticket) VALUES ('bakery_probe', $t);" >/dev/null 2>&1
+    done
+    sleep 3
+    for n in "${nodes[@]}"; do
+        assert_eq "claims: $n sees all $want sentinels (every direction)" "$want" \
+            "$(q "$n" "SELECT count(*) FROM coldfront.claims WHERE iceberg_table='bakery_probe';")"
+    done
+    q "$HOST" "DELETE FROM coldfront.claims WHERE iceberg_table='bakery_probe';" >/dev/null 2>&1
+    sleep 2
+    local stale=0
+    for n in "${nodes[@]}"; do
+        [ "$(q "$n" "SELECT count(*) FROM coldfront.claims WHERE iceberg_table='bakery_probe';")" = "0" ] || stale=$((stale + 1))
+    done
+    assert_eq "claims sentinels cleared on all nodes (release replicates)" "0" "$stale"
+}
+
 # ── orchestrate ────────────────────────────────────────────────────────────
 # Setup is shared. The story set then branches on mode: tiered exercises the
 # hot+cold partitioned path; decoupled exercises the all-Iceberg wrapper. (The
 # tiered stories assume the partitioned `events` table and don't apply to an
 # iceberg-only relation, and vice-versa.)
 story_setup
+[ "$MESH" = 1 ] && story_mesh_substrate   # bakery substrate replicates in all directions
 if [ "$MODE" = "tiered" ]; then
     story_provision_tiered
     [ "$MESH" = 1 ] && story_mesh_tiered    # cross-node tiered, while hot+cold coexist
