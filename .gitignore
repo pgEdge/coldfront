@@ -1,5 +1,4 @@
 bin/
-archiver
 *.log
 *.out
 coverage.html
