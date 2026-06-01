@@ -98,12 +98,18 @@ func FuturePartitionDates(now time.Time, period string, count int) []time.Time {
 // EnsureFuture creates future partitions if they don't exist. The Boundary
 // renders the FROM/TO bound values, so the same time-stepped schedule serves a
 // time column (TimeBoundary) or a time-ordered id column (UUIDv7/Snowflake).
-func (m *Manager) EnsureFuture(ctx context.Context, parent, schema, column, period string, count int, now time.Time, b Boundary) error {
+// leafPrefix is prepended to each partition name; "" yields the flat single-level
+// names (p_2026_06), while a 2-level sub-tree passes its child name so leaves are
+// unique across siblings (events_eu_p_2026_06).
+func (m *Manager) EnsureFuture(ctx context.Context, parent, schema, column, period string, count int, now time.Time, b Boundary, leafPrefix string) error {
 	dates := FuturePartitionDates(now, period, count)
 	fqParent := pgx.Identifier{schema, parent}.Sanitize()
 
 	for _, d := range dates {
-		name := PartitionName(d, period)
+		name := leafPrefix + PartitionName(d, period)
+		if err := checkIdent(name); err != nil {
+			return err
+		}
 		_, upper := PartitionBounds(d, period)
 		fqName := pgx.Identifier{schema, name}.Sanitize()
 

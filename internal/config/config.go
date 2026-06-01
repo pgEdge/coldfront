@@ -60,6 +60,17 @@ type TableConfig struct {
 	// IDScheme names its encoding.
 	PartMode string `yaml:"part_mode"`
 	IDScheme string `yaml:"id_scheme"` // "uuidv7" | "snowflake" (id mode only)
+	// SubPartition, when set, makes this a 2-level LIST→RANGE table.
+	SubPartition *SubPartitionConfig `yaml:"sub_partition"`
+}
+
+// SubPartitionConfig turns a table into a 2-level LIST→RANGE tree. The table
+// must already be PARTITION BY LIST(<level-1 column>); ValuesSource is a SQL
+// query returning that column's current values (a single text column). The flat
+// partition_column / partition_period above describe the level-2 RANGE leaves
+// auto-maintained beneath each level-1 value.
+type SubPartitionConfig struct {
+	ValuesSource string `yaml:"values_source"`
 }
 
 // Load reads a YAML config file from path, applies defaults, and validates
@@ -165,6 +176,9 @@ func (c *Config) Validate() error {
 		// the valid set, so config and the partition core never drift.
 		if _, err := partition.BoundaryFor(t.PartMode, t.IDScheme); err != nil {
 			return fmt.Errorf("archiver.tables[%d]: %w", i, err)
+		}
+		if t.SubPartition != nil && t.SubPartition.ValuesSource == "" {
+			return fmt.Errorf("archiver.tables[%d].sub_partition.values_source is required", i)
 		}
 	}
 	return nil

@@ -158,7 +158,7 @@ func TestEnsureFuture(t *testing.T) {
 	db := &mockDB{}
 	m := NewManager(db)
 	now := time.Date(2026, 4, 8, 0, 0, 0, 0, time.UTC)
-	err := m.EnsureFuture(context.Background(), "events", "public", "time", "monthly", 2, now, TimeBoundary{})
+	err := m.EnsureFuture(context.Background(), "events", "public", "time", "monthly", 2, now, TimeBoundary{}, "")
 	require.NoError(t, err)
 	// 2 partitions × 1 statement each (CREATE TABLE ... PARTITION OF)
 	assert.Len(t, db.execSQL, 2)
@@ -205,7 +205,7 @@ func TestEnsureFuture_SnowflakeBounds(t *testing.T) {
 	db := &mockDB{}
 	m := NewManager(db)
 	now := time.Date(2026, 4, 8, 0, 0, 0, 0, time.UTC)
-	err := m.EnsureFuture(context.Background(), "events", "public", "id", "monthly", 1, now, SnowflakeBoundary{})
+	err := m.EnsureFuture(context.Background(), "events", "public", "id", "monthly", 1, now, SnowflakeBoundary{}, "")
 	require.NoError(t, err)
 	require.Len(t, db.execSQL, 1)
 	lo := MinSnowflakeBound(time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC))

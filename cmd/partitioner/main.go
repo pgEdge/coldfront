@@ -55,6 +55,21 @@ func main() {
 			failed++
 			continue
 		}
+		if t.SubPartition != nil {
+			values, err := mgr.ListValues(ctx, t.SubPartition.ValuesSource)
+			if err != nil {
+				log.Printf("[%s] values_source: %v", spec.Parent, err)
+				failed++
+				continue
+			}
+			if err := partition.RunReconcileTwoLevel(ctx, mgr, spec, values, now, nil); err != nil {
+				log.Printf("[%s] reconcile: %v", spec.Parent, err)
+				failed++
+				continue
+			}
+			log.Printf("[%s] reconciled %d sub-tree(s) (premake %d, retention %s)", spec.Parent, len(values), spec.Premake, t.RetentionPeriod)
+			continue
+		}
 		if err := partition.RunReconcile(ctx, mgr, spec, now, nil); err != nil {
 			log.Printf("[%s] reconcile: %v", spec.Parent, err)
 			failed++

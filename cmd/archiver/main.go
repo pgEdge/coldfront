@@ -235,7 +235,7 @@ func runCycle(ctx context.Context, cfg *config.Config, t *config.TableConfig, po
 	// 1. Create future partitions. The cold tier always partitions by time.
 	if err := partMgr.EnsureFuture(ctx, tableName, t.SourceSchema,
 		t.PartitionColumn, t.PartitionPeriod,
-		t.FuturePartitions, now, partition.TimeBoundary{}); err != nil {
+		t.FuturePartitions, now, partition.TimeBoundary{}, ""); err != nil {
 		return fmt.Errorf("ensure future partitions: %w", err)
 	}
 

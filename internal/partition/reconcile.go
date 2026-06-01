@@ -10,13 +10,14 @@ import (
 // pass needs. An upper layer (or a standalone manager) maps its own per-table
 // config onto this; the partition core stays agnostic about where it came from.
 type Spec struct {
-	Parent    string        // the partitioned table
-	Schema    string        // its schema
-	Column    string        // the RANGE key column
-	Period    string        // PeriodMonthly | PeriodDaily
-	Premake   int           // future partitions kept ahead of now
-	Retention time.Duration // detach+drop partitions whose upper bound is older than now-Retention
-	Boundary  Boundary      // how the RANGE key maps to time; nil means TimeBoundary
+	Parent     string        // the partitioned table
+	Schema     string        // its schema
+	Column     string        // the RANGE key column
+	Period     string        // PeriodMonthly | PeriodDaily
+	Premake    int           // future partitions kept ahead of now
+	Retention  time.Duration // detach+drop partitions whose upper bound is older than now-Retention
+	Boundary   Boundary      // how the RANGE key maps to time; nil means TimeBoundary
+	LeafPrefix string        // prepended to leaf names; "" for single-level (set per-child in 2-level)
 }
 
 // boundary returns the Spec's Boundary, defaulting to time-mode so a zero Spec
@@ -32,7 +33,7 @@ func (s Spec) boundary() Boundary {
 // an interface keeps RunReconcile unit-testable with a hand-written fake and
 // keeps this orchestration free of any concrete DB type.
 type Lifecycle interface {
-	EnsureFuture(ctx context.Context, parent, schema, column, period string, count int, now time.Time, b Boundary) error
+	EnsureFuture(ctx context.Context, parent, schema, column, period string, count int, now time.Time, b Boundary, leafPrefix string) error
 	FindExpired(ctx context.Context, parent, schema string, cutoff time.Time, b Boundary) ([]Info, error)
 	Detach(ctx context.Context, parent, schema, partName string) error
 	Drop(ctx context.Context, schema, partName string) error
@@ -59,7 +60,7 @@ type ExpireFunc func(ctx context.Context, p Info) error
 // run inside a transaction), so callers must pass a non-transactional handle.
 func RunReconcile(ctx context.Context, lc Lifecycle, s Spec, now time.Time, expire ExpireFunc) error {
 	b := s.boundary()
-	if err := lc.EnsureFuture(ctx, s.Parent, s.Schema, s.Column, s.Period, s.Premake, now, b); err != nil {
+	if err := lc.EnsureFuture(ctx, s.Parent, s.Schema, s.Column, s.Period, s.Premake, now, b, s.LeafPrefix); err != nil {
 		return fmt.Errorf("premake %s.%s: %w", s.Schema, s.Parent, err)
 	}
 	expired, err := lc.FindExpired(ctx, s.Parent, s.Schema, now.Add(-s.Retention), b)

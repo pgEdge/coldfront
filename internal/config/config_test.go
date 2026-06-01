@@ -294,6 +294,42 @@ archiver:
 	assert.Contains(t, err.Error(), "part_mode")
 }
 
+func TestValidate_SubPartitionOK(t *testing.T) {
+	cfg := `
+postgres:
+  dsn: "host=localhost dbname=mydb"
+archiver:
+  tables:
+    - source_table: "events"
+      partition_column: "ts"
+      partition_period: "monthly"
+      retention_period: "12 months"
+      sub_partition:
+        values_source: "SELECT code FROM regions"
+`
+	c, err := Load(writeConfig(t, cfg))
+	require.NoError(t, err)
+	require.NotNil(t, c.Archiver.Tables[0].SubPartition)
+	assert.Equal(t, "SELECT code FROM regions", c.Archiver.Tables[0].SubPartition.ValuesSource)
+}
+
+func TestValidate_SubPartitionRequiresValuesSource(t *testing.T) {
+	cfg := `
+postgres:
+  dsn: "host=localhost dbname=mydb"
+archiver:
+  tables:
+    - source_table: "events"
+      partition_column: "ts"
+      partition_period: "monthly"
+      retention_period: "12 months"
+      sub_partition: {}
+`
+	_, err := Load(writeConfig(t, cfg))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "values_source")
+}
+
 func TestValidate_PartialIcebergIsLoud(t *testing.T) {
 	// A warehouse but no endpoint/s3: a half-configured cold setup, which must
 	// fail loudly rather than be silently treated as partition-only.

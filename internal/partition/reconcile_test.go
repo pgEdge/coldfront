@@ -22,8 +22,16 @@ type fakeLifecycle struct {
 	dropErr   error
 }
 
-func (f *fakeLifecycle) EnsureFuture(_ context.Context, parent, schema, column, period string, count int, _ time.Time, _ Boundary) error {
-	f.log = append(f.log, fmt.Sprintf("ensure %s.%s col=%s %s x%d", schema, parent, column, period, count))
+func (f *fakeLifecycle) EnsureFuture(_ context.Context, parent, schema, column, period string, count int, _ time.Time, _ Boundary, leafPrefix string) error {
+	entry := fmt.Sprintf("ensure %s.%s col=%s %s x%d", schema, parent, column, period, count)
+	if leafPrefix != "" {
+		entry += " pfx=" + leafPrefix
+	}
+	f.log = append(f.log, entry)
+	return f.ensureErr
+}
+func (f *fakeLifecycle) EnsureListChild(_ context.Context, parent, schema, listValue, childName, rangeCol string) error {
+	f.log = append(f.log, fmt.Sprintf("listchild %s.%s in=%s range=%s", schema, childName, listValue, rangeCol))
 	return f.ensureErr
 }
 func (f *fakeLifecycle) FindExpired(_ context.Context, parent, schema string, cutoff time.Time, _ Boundary) ([]Info, error) {
