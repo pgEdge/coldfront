@@ -22,11 +22,11 @@ type fakeLifecycle struct {
 	dropErr   error
 }
 
-func (f *fakeLifecycle) EnsureFuture(_ context.Context, parent, schema, column, period string, count int, _ time.Time) error {
+func (f *fakeLifecycle) EnsureFuture(_ context.Context, parent, schema, column, period string, count int, _ time.Time, _ Boundary) error {
 	f.log = append(f.log, fmt.Sprintf("ensure %s.%s col=%s %s x%d", schema, parent, column, period, count))
 	return f.ensureErr
 }
-func (f *fakeLifecycle) FindExpired(_ context.Context, parent, schema string, cutoff time.Time) ([]Info, error) {
+func (f *fakeLifecycle) FindExpired(_ context.Context, parent, schema string, cutoff time.Time, _ Boundary) ([]Info, error) {
 	f.gotCutoff = cutoff
 	f.log = append(f.log, fmt.Sprintf("find %s.%s", schema, parent))
 	return f.expired, f.findErr

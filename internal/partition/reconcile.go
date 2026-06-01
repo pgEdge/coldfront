@@ -16,14 +16,24 @@ type Spec struct {
 	Period    string        // PeriodMonthly | PeriodDaily
 	Premake   int           // future partitions kept ahead of now
 	Retention time.Duration // detach+drop partitions whose upper bound is older than now-Retention
+	Boundary  Boundary      // how the RANGE key maps to time; nil means TimeBoundary
+}
+
+// boundary returns the Spec's Boundary, defaulting to time-mode so a zero Spec
+// (and every existing time-keyed caller) behaves exactly as before.
+func (s Spec) boundary() Boundary {
+	if s.Boundary == nil {
+		return TimeBoundary{}
+	}
+	return s.Boundary
 }
 
 // Lifecycle is the subset of *Manager that RunReconcile drives. Expressing it as
 // an interface keeps RunReconcile unit-testable with a hand-written fake and
 // keeps this orchestration free of any concrete DB type.
 type Lifecycle interface {
-	EnsureFuture(ctx context.Context, parent, schema, column, period string, count int, now time.Time) error
-	FindExpired(ctx context.Context, parent, schema string, cutoff time.Time) ([]Info, error)
+	EnsureFuture(ctx context.Context, parent, schema, column, period string, count int, now time.Time, b Boundary) error
+	FindExpired(ctx context.Context, parent, schema string, cutoff time.Time, b Boundary) ([]Info, error)
 	Detach(ctx context.Context, parent, schema, partName string) error
 	Drop(ctx context.Context, schema, partName string) error
 }
@@ -48,10 +58,11 @@ type ExpireFunc func(ctx context.Context, p Info) error
 // default path issues runs top-level on the pool (DETACH ... CONCURRENTLY cannot
 // run inside a transaction), so callers must pass a non-transactional handle.
 func RunReconcile(ctx context.Context, lc Lifecycle, s Spec, now time.Time, expire ExpireFunc) error {
-	if err := lc.EnsureFuture(ctx, s.Parent, s.Schema, s.Column, s.Period, s.Premake, now); err != nil {
+	b := s.boundary()
+	if err := lc.EnsureFuture(ctx, s.Parent, s.Schema, s.Column, s.Period, s.Premake, now, b); err != nil {
 		return fmt.Errorf("premake %s.%s: %w", s.Schema, s.Parent, err)
 	}
-	expired, err := lc.FindExpired(ctx, s.Parent, s.Schema, now.Add(-s.Retention))
+	expired, err := lc.FindExpired(ctx, s.Parent, s.Schema, now.Add(-s.Retention), b)
 	if err != nil {
 		return fmt.Errorf("find expired %s.%s: %w", s.Schema, s.Parent, err)
 	}

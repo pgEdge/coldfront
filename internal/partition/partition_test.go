@@ -2,6 +2,7 @@ package partition
 
 import (
 	"context"
+	"fmt"
 	"testing"
 	"time"
 
@@ -157,13 +158,15 @@ func TestEnsureFuture(t *testing.T) {
 	db := &mockDB{}
 	m := NewManager(db)
 	now := time.Date(2026, 4, 8, 0, 0, 0, 0, time.UTC)
-	err := m.EnsureFuture(context.Background(), "events", "public", "time", "monthly", 2, now)
+	err := m.EnsureFuture(context.Background(), "events", "public", "time", "monthly", 2, now, TimeBoundary{})
 	require.NoError(t, err)
 	// 2 partitions × 1 statement each (CREATE TABLE ... PARTITION OF)
 	assert.Len(t, db.execSQL, 2)
 	assert.Contains(t, db.execSQL[0], "CREATE TABLE IF NOT EXISTS")
 	assert.Contains(t, db.execSQL[0], "p_2026_05")
 	assert.Contains(t, db.execSQL[0], "PARTITION OF")
+	// Time-mode bounds stay single-quoted timestamps (byte-for-byte legacy SQL).
+	assert.Contains(t, db.execSQL[0], "FOR VALUES FROM ('2026-05-01 00:00:00+00') TO ('2026-06-01 00:00:00+00')")
 }
 
 func TestFindExpired(t *testing.T) {
@@ -187,12 +190,29 @@ func TestFindExpired(t *testing.T) {
 	}
 	m := NewManager(db)
 	cutoff := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
-	parts, err := m.FindExpired(context.Background(), "events", "public", cutoff)
+	parts, err := m.FindExpired(context.Background(), "events", "public", cutoff, TimeBoundary{})
 	require.NoError(t, err)
 	require.Len(t, parts, 2)
 	assert.Equal(t, "p_2025_11", parts[0].Name)
 	assert.Equal(t, time.Date(2025, 12, 1, 0, 0, 0, 0, time.UTC), parts[0].UpperBound)
 	assert.Equal(t, "p_2025_12", parts[1].Name)
+}
+
+// TestEnsureFuture_SnowflakeBounds locks that an id-mode (snowflake) premake
+// emits bare-integer RANGE bounds — and that those bounds decode back to the
+// expected month, so the partition really does hold that month's snowflakes.
+func TestEnsureFuture_SnowflakeBounds(t *testing.T) {
+	db := &mockDB{}
+	m := NewManager(db)
+	now := time.Date(2026, 4, 8, 0, 0, 0, 0, time.UTC)
+	err := m.EnsureFuture(context.Background(), "events", "public", "id", "monthly", 1, now, SnowflakeBoundary{})
+	require.NoError(t, err)
+	require.Len(t, db.execSQL, 1)
+	lo := MinSnowflakeBound(time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC))
+	hi := MinSnowflakeBound(time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC))
+	assert.Contains(t, db.execSQL[0], fmt.Sprintf("FOR VALUES FROM (%d) TO (%d)", lo, hi))
+	// No quotes around the integer bounds.
+	assert.NotContains(t, db.execSQL[0], fmt.Sprintf("'%d'", lo))
 }
 
 func TestDetach(t *testing.T) {

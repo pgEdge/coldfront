@@ -232,10 +232,10 @@ func runCycle(ctx context.Context, cfg *config.Config, t *config.TableConfig, po
 	// Resolve actual table name (_{source} after swap, {source} on first run)
 	tableName := resolveTableName(ctx, pool, t.SourceSchema, t.SourceTable)
 
-	// 1. Create future partitions
+	// 1. Create future partitions. The cold tier always partitions by time.
 	if err := partMgr.EnsureFuture(ctx, tableName, t.SourceSchema,
 		t.PartitionColumn, t.PartitionPeriod,
-		t.FuturePartitions, now); err != nil {
+		t.FuturePartitions, now, partition.TimeBoundary{}); err != nil {
 		return fmt.Errorf("ensure future partitions: %w", err)
 	}
 
@@ -244,7 +244,7 @@ func runCycle(ctx context.Context, cfg *config.Config, t *config.TableConfig, po
 	if err != nil {
 		return fmt.Errorf("parse retention: %w", err)
 	}
-	expired, err := partMgr.FindExpired(ctx, tableName, t.SourceSchema, now.Add(-retention))
+	expired, err := partMgr.FindExpired(ctx, tableName, t.SourceSchema, now.Add(-retention), partition.TimeBoundary{})
 	if err != nil {
 		return fmt.Errorf("find expired: %w", err)
 	}

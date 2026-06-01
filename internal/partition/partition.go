@@ -3,7 +3,6 @@ package partition
 import (
 	"context"
 	"fmt"
-	"regexp"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -41,24 +40,12 @@ func NewManager(db DBTX) *Manager {
 	return &Manager{db: db}
 }
 
-var boundRe = regexp.MustCompile(`FOR VALUES FROM \('([^']+)'\) TO \('([^']+)'\)`)
-
-// ParseBoundExpr extracts lower and upper bounds from a pg_get_expr(relpartbound) string.
+// ParseBoundExpr extracts lower and upper time bounds from a
+// pg_get_expr(relpartbound) string for a time-keyed partition. It is the
+// time-mode special case of parseBoundPair, kept as a package-level helper for
+// callers that only ever deal with time columns.
 func ParseBoundExpr(expr string) (lower, upper time.Time, err error) {
-	m := boundRe.FindStringSubmatch(expr)
-	if m == nil {
-		return time.Time{}, time.Time{}, fmt.Errorf("cannot parse partition bound: %q", expr)
-	}
-
-	lower, err = parseTimestamp(m[1])
-	if err != nil {
-		return time.Time{}, time.Time{}, fmt.Errorf("parse lower bound: %w", err)
-	}
-	upper, err = parseTimestamp(m[2])
-	if err != nil {
-		return time.Time{}, time.Time{}, fmt.Errorf("parse upper bound: %w", err)
-	}
-	return lower, upper, nil
+	return parseBoundPair(expr, TimeBoundary{})
 }
 
 // parseTimestamp parses a pg_get_expr-style bound value (the quoted string
@@ -108,8 +95,10 @@ func FuturePartitionDates(now time.Time, period string, count int) []time.Time {
 	return dates
 }
 
-// EnsureFuture creates future partitions if they don't exist.
-func (m *Manager) EnsureFuture(ctx context.Context, parent, schema, column, period string, count int, now time.Time) error {
+// EnsureFuture creates future partitions if they don't exist. The Boundary
+// renders the FROM/TO bound values, so the same time-stepped schedule serves a
+// time column (TimeBoundary) or a time-ordered id column (UUIDv7/Snowflake).
+func (m *Manager) EnsureFuture(ctx context.Context, parent, schema, column, period string, count int, now time.Time, b Boundary) error {
 	dates := FuturePartitionDates(now, period, count)
 	fqParent := pgx.Identifier{schema, parent}.Sanitize()
 
@@ -119,10 +108,8 @@ func (m *Manager) EnsureFuture(ctx context.Context, parent, schema, column, peri
 		fqName := pgx.Identifier{schema, name}.Sanitize()
 
 		sql := fmt.Sprintf(
-			`CREATE TABLE IF NOT EXISTS %s PARTITION OF %s FOR VALUES FROM ('%s') TO ('%s')`,
-			fqName, fqParent,
-			d.Format("2006-01-02 15:04:05+00"),
-			upper.Format("2006-01-02 15:04:05+00"))
+			`CREATE TABLE IF NOT EXISTS %s PARTITION OF %s FOR VALUES FROM (%s) TO (%s)`,
+			fqName, fqParent, b.Literal(d), b.Literal(upper))
 		if _, err := m.db.Exec(ctx, sql); err != nil {
 			return fmt.Errorf("create partition %s: %w", name, err)
 		}
@@ -131,7 +118,9 @@ func (m *Manager) EnsureFuture(ctx context.Context, parent, schema, column, peri
 }
 
 // FindExpired returns partitions whose upper bound is at or before the cutoff.
-func (m *Manager) FindExpired(ctx context.Context, parent, schema string, cutoff time.Time) ([]Info, error) {
+// The Boundary converts each partition's stored bound value back to time, so id
+// bounds compare against a time cutoff just like time bounds.
+func (m *Manager) FindExpired(ctx context.Context, parent, schema string, cutoff time.Time, b Boundary) ([]Info, error) {
 	query := `
 		SELECT c.relname, pg_get_expr(c.relpartbound, c.oid)
 		FROM pg_inherits i
@@ -153,7 +142,7 @@ func (m *Manager) FindExpired(ctx context.Context, parent, schema string, cutoff
 		if err := rows.Scan(&name, &boundExpr); err != nil {
 			return nil, fmt.Errorf("scan partition: %w", err)
 		}
-		lower, upper, err := ParseBoundExpr(boundExpr)
+		lower, upper, err := parseBoundPair(boundExpr, b)
 		if err != nil {
 			return nil, fmt.Errorf("parse bounds for %s: %w", name, err)
 		}
