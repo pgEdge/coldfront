@@ -34,3 +34,29 @@ func TestSpecFromTable_BadRetention(t *testing.T) {
 		t.Fatal("expected error for bad retention string")
 	}
 }
+
+func TestSpecFromTable_IdModeSnowflake(t *testing.T) {
+	got, err := specFromTable(config.TableConfig{
+		SourceTable: "events", SourceSchema: "public", PartitionColumn: "id",
+		PartitionPeriod: partition.PeriodMonthly, RetentionPeriod: "12 months",
+		FuturePartitions: 3, PartMode: partition.PartModeID, IDScheme: partition.IDSchemeSnowflake,
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := got.Boundary.(partition.SnowflakeBoundary); !ok {
+		t.Fatalf("Boundary = %T, want partition.SnowflakeBoundary", got.Boundary)
+	}
+}
+
+func TestSpecFromTable_TimestampDefaultBoundary(t *testing.T) {
+	got, err := specFromTable(config.TableConfig{
+		SourceTable: "events", PartitionPeriod: partition.PeriodMonthly, RetentionPeriod: "3 months",
+	})
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if _, ok := got.Boundary.(partition.TimeBoundary); !ok {
+		t.Fatalf("Boundary = %T, want partition.TimeBoundary", got.Boundary)
+	}
+}

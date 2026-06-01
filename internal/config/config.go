@@ -55,6 +55,11 @@ type TableConfig struct {
 	PartitionPeriod  string `yaml:"partition_period"`
 	RetentionPeriod  string `yaml:"retention_period"`
 	FuturePartitions int    `yaml:"future_partitions"`
+	// PartMode is "timestamp" (default) or "id". In id mode the partition
+	// column is a time-ordered id (so it can also be the primary key) and
+	// IDScheme names its encoding.
+	PartMode string `yaml:"part_mode"`
+	IDScheme string `yaml:"id_scheme"` // "uuidv7" | "snowflake" (id mode only)
 }
 
 // Load reads a YAML config file from path, applies defaults, and validates
@@ -155,6 +160,11 @@ func (c *Config) Validate() error {
 		}
 		if t.RetentionPeriod == "" {
 			return fmt.Errorf("archiver.tables[%d].retention_period is required", i)
+		}
+		// part_mode / id_scheme: reuse BoundaryFor as the single validator of
+		// the valid set, so config and the partition core never drift.
+		if _, err := partition.BoundaryFor(t.PartMode, t.IDScheme); err != nil {
+			return fmt.Errorf("archiver.tables[%d]: %w", i, err)
 		}
 	}
 	return nil

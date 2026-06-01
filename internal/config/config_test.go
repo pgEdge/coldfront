@@ -242,6 +242,58 @@ archiver:
 	assert.Equal(t, "events", c.Archiver.Tables[0].SourceTable)
 }
 
+func TestValidate_IdModeSnowflakeOK(t *testing.T) {
+	cfg := `
+postgres:
+  dsn: "host=localhost dbname=mydb"
+archiver:
+  tables:
+    - source_table: "events"
+      partition_column: "id"
+      partition_period: "monthly"
+      retention_period: "12 months"
+      part_mode: "id"
+      id_scheme: "snowflake"
+`
+	c, err := Load(writeConfig(t, cfg))
+	require.NoError(t, err)
+	assert.Equal(t, "id", c.Archiver.Tables[0].PartMode)
+	assert.Equal(t, "snowflake", c.Archiver.Tables[0].IDScheme)
+}
+
+func TestValidate_IdModeBadScheme(t *testing.T) {
+	cfg := `
+postgres:
+  dsn: "host=localhost dbname=mydb"
+archiver:
+  tables:
+    - source_table: "events"
+      partition_period: "monthly"
+      retention_period: "12 months"
+      part_mode: "id"
+      id_scheme: "bogus"
+`
+	_, err := Load(writeConfig(t, cfg))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "id_scheme")
+}
+
+func TestValidate_BadPartMode(t *testing.T) {
+	cfg := `
+postgres:
+  dsn: "host=localhost dbname=mydb"
+archiver:
+  tables:
+    - source_table: "events"
+      partition_period: "monthly"
+      retention_period: "12 months"
+      part_mode: "bogus"
+`
+	_, err := Load(writeConfig(t, cfg))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "part_mode")
+}
+
 func TestValidate_PartialIcebergIsLoud(t *testing.T) {
 	// A warehouse but no endpoint/s3: a half-configured cold setup, which must
 	// fail loudly rather than be silently treated as partition-only.

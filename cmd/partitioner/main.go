@@ -74,6 +74,10 @@ func specFromTable(t config.TableConfig) (partition.Spec, error) {
 	if err != nil {
 		return partition.Spec{}, err
 	}
+	boundary, err := partition.BoundaryFor(t.PartMode, t.IDScheme)
+	if err != nil {
+		return partition.Spec{}, err
+	}
 	return partition.Spec{
 		Parent:    t.SourceTable,
 		Schema:    t.SourceSchema,
@@ -81,6 +85,7 @@ func specFromTable(t config.TableConfig) (partition.Spec, error) {
 		Period:    t.PartitionPeriod,
 		Premake:   t.FuturePartitions,
 		Retention: retention,
+		Boundary:  boundary,
 	}, nil
 }
 
