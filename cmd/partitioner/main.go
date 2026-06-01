@@ -17,9 +17,9 @@ import (
 
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/vyruss/coldfront/internal/config"
-	"github.com/vyruss/coldfront/internal/partcfg"
-	"github.com/vyruss/coldfront/internal/partition"
+	"github.com/pgedge/coldfront/internal/config"
+	"github.com/pgedge/coldfront/internal/partcfg"
+	"github.com/pgedge/coldfront/internal/partition"
 )
 
 func main() {

@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/vyruss/coldfront/internal/view"
+	"github.com/pgedge/coldfront/internal/view"
 )
 
 // mockRow / mockRows / mockQuerier mirror the pattern in

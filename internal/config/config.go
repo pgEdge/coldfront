@@ -7,7 +7,7 @@ import (
 
 	"gopkg.in/yaml.v3"
 
-	"github.com/vyruss/coldfront/internal/partition"
+	"github.com/pgedge/coldfront/internal/partition"
 )
 
 // Config is the top-level archiver configuration parsed from YAML.

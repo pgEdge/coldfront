@@ -9,7 +9,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
-	"github.com/vyruss/coldfront/internal/sqlutil"
+	"github.com/pgedge/coldfront/internal/sqlutil"
 )
 
 // DBTX abstracts pgxpool.Pool and pgx.Tx for testability.

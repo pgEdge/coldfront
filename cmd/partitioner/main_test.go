@@ -4,8 +4,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/vyruss/coldfront/internal/config"
-	"github.com/vyruss/coldfront/internal/partition"
+	"github.com/pgedge/coldfront/internal/config"
+	"github.com/pgedge/coldfront/internal/partition"
 )
 
 func TestSpecFromTable(t *testing.T) {

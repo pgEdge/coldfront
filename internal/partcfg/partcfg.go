@@ -16,7 +16,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
-	"github.com/vyruss/coldfront/internal/config"
+	"github.com/pgedge/coldfront/internal/config"
 )
 
 // DBTX is the slice of pgxpool.Pool partcfg needs.

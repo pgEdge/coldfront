@@ -1,4 +1,4 @@
-module github.com/vyruss/coldfront
+module github.com/pgedge/coldfront
 
 go 1.26.0
 

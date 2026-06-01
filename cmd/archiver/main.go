@@ -17,12 +17,12 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
-	"github.com/vyruss/coldfront/internal/config"
-	"github.com/vyruss/coldfront/internal/partcfg"
-	"github.com/vyruss/coldfront/internal/partition"
-	"github.com/vyruss/coldfront/internal/sqlutil"
-	"github.com/vyruss/coldfront/internal/view"
-	"github.com/vyruss/coldfront/internal/watermark"
+	"github.com/pgedge/coldfront/internal/config"
+	"github.com/pgedge/coldfront/internal/partcfg"
+	"github.com/pgedge/coldfront/internal/partition"
+	"github.com/pgedge/coldfront/internal/sqlutil"
+	"github.com/pgedge/coldfront/internal/view"
+	"github.com/pgedge/coldfront/internal/watermark"
 )
 
 // querier is the subset of *pgxpool.Pool that the pg-catalog helpers below use.
