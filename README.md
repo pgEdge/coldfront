@@ -278,33 +278,80 @@ The watermark is the single source of truth. If the archiver crashes:
 
 ## Configuration
 
+ColdFront splits configuration into two kinds:
+
+**Connection — per node, YAML.** The Postgres DSN, and (tiered archiver only) the
+Iceberg/S3 connection. This stays in a small YAML and is never replicated:
+
 ```yaml
 postgres:
   dsn: "host=localhost dbname=mydb user=myuser password=mypass sslmode=disable"
-
+# tiered archiver only:
 iceberg:
   warehouse: "wh"
   lakekeeper_endpoint: "http://lakekeeper:8181/catalog"
-
 s3:
   endpoint: "seaweedfs:8333"
   access_key: "admin"
   secret_key: "adminsecret"
-
-archiver:
-  tables:
-    - source_table: "events"
-      partition_period: "monthly"
-      retention_period: "3 months"
-
-    - source_table: "logs"
-      partition_period: "daily"
-      retention_period: "7 days"
 ```
 
-Only `source_table`, `partition_period`, and `retention_period` are required per table.
-`partition_column` is auto-detected from `pg_catalog`. `source_schema` defaults
-to `public` (or use `"myschema.events"` syntax). `future_partitions` defaults to 3.
+**Per-table lifecycle — `coldfront.partition_config`.** Which tables are managed
+and their lifecycle live in a name-keyed table that replicates by value across a
+Spock mesh (like `tiered_views`/`archive_watermark`), so every node reads
+identical config — no per-node file syncing. Manage it with the CLI below
+(both `partitioner` and `archiver` expose these subcommands; with no subcommand
+they do their normal reconcile/archive run).
+
+### Managing partitioned tables (CLI)
+
+The data lifecycle is **hot PG → `hot_period` → cold Iceberg → `retention_period`
+→ dropped** (tiered) or **hot PG → `retention_period` → dropped** (partition-only).
+Setting `hot_period` makes a table tiered; omitting it makes it partition-only.
+
+| Command | Purpose |
+|---|---|
+| `register` | add/adopt a table — validates the PRIMARY KEY covers the partition key |
+| `list` | show managed tables and their lifecycle |
+| `set` | change fields, or `--disable`/`--enable` a table |
+| `remove` | stop managing a table (the table itself is left intact) |
+| `import` | seed `partition_config` from a YAML's `archiver.tables` (migration) |
+| `export` | dump to YAML or SQL — a git-reviewable copy (the config-as-code clawback) |
+
+```bash
+# Partition-only: keep 3 future partitions, drop those older than 12 months.
+partitioner register --config cf.yaml --table events --period monthly --retention "12 months"
+
+# Tiered: tier to cold Iceberg after 1 month, then drop cold data after 5 years.
+archiver register --config cf.yaml --table events --period monthly \
+    --hot-period "1 month" --retention "5 years"
+
+# id mode — a real single-column PRIMARY KEY (id) on a snowflake-keyed table.
+partitioner register --config cf.yaml --table events --period monthly \
+    --column id --part-mode id --id-scheme snowflake --retention "1 year"
+
+# 2-level LIST(region) → RANGE(ts), tiered; region values come from a table.
+archiver register --config cf.yaml --table regional --period monthly --column ts \
+    --hot-period "1 month" --sub-values-source "SELECT region FROM regions"
+
+partitioner list   --config cf.yaml                      # what's managed
+partitioner set    --config cf.yaml --table events --retention "24 months"
+partitioner set    --config cf.yaml --table events --disable   # pause (keeps the row)
+partitioner remove --config cf.yaml --table events       # unregister, keep the table
+partitioner import --config legacy.yaml                  # migrate a YAML's tables
+partitioner export --config cf.yaml > managed.yaml       # git-reviewable copy
+```
+
+Every subcommand has detailed `--help` with worked examples. The write commands
+accept `--print-sql` (emit the SQL without running it — review/commit it) and
+`--dry-run`. Per table, only the cadence and a destroy boundary are required;
+`partition_column` is auto-detected from `pg_catalog` for flat tables (required
+for 2-level). `register` writes a row whose `CHECK` constraints enforce the
+lifecycle rules at write time.
+
+**YAML `archiver.tables` still works** as a deprecation bridge: when
+`partition_config` is empty the binaries fall back to a YAML table list. Move off
+it with `import`.
 
 ## Infrastructure
 

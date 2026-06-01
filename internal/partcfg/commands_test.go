@@ -3,7 +3,43 @@ package partcfg
 import (
 	"strings"
 	"testing"
+
+	"github.com/pgedge/coldfront/internal/config"
 )
+
+func TestLit(t *testing.T) {
+	if got := lit(""); got != "NULL" {
+		t.Errorf("lit(\"\") = %q, want NULL", got)
+	}
+	if got := lit("monthly"); got != "'monthly'" {
+		t.Errorf("lit(monthly) = %q", got)
+	}
+	if got := lit("o'brien"); got != "'o''brien'" {
+		t.Errorf("lit escaping = %q", got)
+	}
+}
+
+func TestRowFrom_AppliesDefaults(t *testing.T) {
+	// A minimal TableConfig (as from YAML) gets the same defaults the loader applies.
+	r := rowFrom(config.TableConfig{SourceTable: "events", PartitionPeriod: "monthly", RetentionPeriod: "1 year"})
+	if r.schema != "public" || r.premake != 3 || r.partMode != "timestamp" {
+		t.Fatalf("defaults not applied: %+v", r)
+	}
+	if r.table != "events" || r.retention != "1 year" {
+		t.Fatalf("fields not mapped: %+v", r)
+	}
+}
+
+func TestRowFrom_SubPartition(t *testing.T) {
+	r := rowFrom(config.TableConfig{
+		SourceTable: "regional", PartitionPeriod: "monthly", PartitionColumn: "ts",
+		HotPeriod: "1 month", FuturePartitions: 5,
+		SubPartition: &config.SubPartitionConfig{ValuesSource: "SELECT region FROM regions"},
+	})
+	if r.subValues != "SELECT region FROM regions" || r.hot != "1 month" || r.premake != 5 {
+		t.Fatalf("2-level/tiered mapping wrong: %+v", r)
+	}
+}
 
 func TestIsCommand(t *testing.T) {
 	for _, c := range []string{"register", "list"} {

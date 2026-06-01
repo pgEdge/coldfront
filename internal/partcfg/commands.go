@@ -11,6 +11,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
+	"gopkg.in/yaml.v3"
 
 	"github.com/pgedge/coldfront/internal/config"
 )
@@ -22,6 +23,10 @@ import (
 var Commands = map[string]func(ctx context.Context, args []string) error{
 	"register": runRegister,
 	"list":     runList,
+	"set":      runSet,
+	"remove":   runRemove,
+	"import":   runImport,
+	"export":   runExport,
 }
 
 // IsCommand reports whether name is a management subcommand (so the binary
@@ -36,7 +41,7 @@ func Run(ctx context.Context, name string, args []string) error {
 
 // CommandNames returns the subcommand words, for the binary's top-level usage.
 func CommandNames() []string {
-	return []string{"register", "list"}
+	return []string{"register", "list", "set", "remove", "import", "export"}
 }
 
 // addConn registers the shared --dsn / --config connection flags on fs and
@@ -57,15 +62,7 @@ func addConn(fs *flag.FlagSet) func(context.Context) (*pgxpool.Pool, error) {
 		if d == "" {
 			return nil, fmt.Errorf("a connection is required: pass --dsn or --config")
 		}
-		pool, err := pgxpool.New(ctx, d)
-		if err != nil {
-			return nil, fmt.Errorf("connect: %w", err)
-		}
-		if err := pool.Ping(ctx); err != nil {
-			pool.Close()
-			return nil, fmt.Errorf("ping: %w", err)
-		}
-		return pool, nil
+		return openPool(ctx, d)
 	}
 }
 
@@ -246,18 +243,12 @@ type configRow struct {
 }
 
 func (r configRow) insertSQL() string {
-	col := func(s string) string {
-		if s == "" {
-			return "NULL"
-		}
-		return "'" + strings.ReplaceAll(s, "'", "''") + "'"
-	}
 	return fmt.Sprintf(`INSERT INTO coldfront.partition_config
   (schema_name, table_name, partition_period, partition_column, future_partitions,
    part_mode, id_scheme, hot_period, retention_period, sub_part_values_source)
 VALUES (%s, %s, %s, %s, %d, %s, %s, %s, %s, %s);`,
-		col(r.schema), col(r.table), col(r.period), col(r.column), r.premake,
-		col(r.partMode), col(r.idScheme), col(r.hot), col(r.retention), col(r.subValues))
+		lit(r.schema), lit(r.table), lit(r.period), lit(r.column), r.premake,
+		lit(r.partMode), lit(r.idScheme), lit(r.hot), lit(r.retention), lit(r.subValues))
 }
 
 // validatePKSuperset confirms the table's PRIMARY KEY covers the partition key.
@@ -352,4 +343,315 @@ func partKeyCols(def string) []string {
 		}
 	}
 	return out
+}
+
+// lit renders a SQL literal: NULL for empty, else a single-quoted, escaped string.
+func lit(s string) string {
+	if s == "" {
+		return "NULL"
+	}
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+// openPool connects and verifies the connection.
+func openPool(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
+	pool, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		return nil, fmt.Errorf("connect: %w", err)
+	}
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("ping: %w", err)
+	}
+	return pool, nil
+}
+
+// rowFrom maps a config.TableConfig (e.g. from a YAML being imported) onto a
+// configRow, applying the same defaults as the YAML loader so the INSERT is valid.
+func rowFrom(t config.TableConfig) configRow {
+	r := configRow{
+		schema: t.SourceSchema, table: t.SourceTable, period: t.PartitionPeriod,
+		column: t.PartitionColumn, premake: t.FuturePartitions, partMode: t.PartMode,
+		idScheme: t.IDScheme, hot: t.HotPeriod, retention: t.RetentionPeriod,
+	}
+	if t.SubPartition != nil {
+		r.subValues = t.SubPartition.ValuesSource
+	}
+	if r.schema == "" {
+		r.schema = "public"
+	}
+	if r.premake == 0 {
+		r.premake = 3
+	}
+	if r.partMode == "" {
+		r.partMode = "timestamp"
+	}
+	return r
+}
+
+// runSet updates lifecycle fields on a managed table (only the flags you pass),
+// or pauses/resumes it with --disable/--enable.
+func runSet(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("set", flag.ContinueOnError)
+	connect := addConn(fs)
+	schema := fs.String("schema", "public", "schema of the managed table")
+	table := fs.String("table", "", "name of the managed table (required)")
+	period := fs.String("period", "", "change cadence: monthly | daily")
+	column := fs.String("column", "", "change the partition column")
+	premake := fs.Int("premake", 0, "change the premake window")
+	hot := fs.String("hot-period", "", "change the tier-to-cold age (empty value clears it ⇒ partition-only)")
+	retention := fs.String("retention", "", "change the drop age (empty value clears it)")
+	subValues := fs.String("sub-values-source", "", "change the 2-level LIST values query")
+	enable := fs.Bool("enable", false, "resume managing this table")
+	disable := fs.Bool("disable", false, "pause managing this table (keeps the row)")
+	printSQL := fs.Bool("print-sql", false, "print the UPDATE instead of running it")
+	fs.Usage = simpleUsage(fs, "set", `set — change lifecycle fields on a managed table (only the flags you pass change).
+
+USAGE:
+  <binary> set --table <name> [field flags | --enable | --disable] (--dsn <dsn> | --config <yaml>)
+
+EXAMPLES:
+  partitioner set --config cf.yaml --table events --retention "24 months"   # change retention
+  archiver     set --config cf.yaml --table events --hot-period "2 weeks"    # change tier age
+  partitioner set --config cf.yaml --table events --disable                  # pause (keep the row)
+  partitioner set --config cf.yaml --table events --print-sql --premake 6    # review the UPDATE`)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *table == "" {
+		fs.Usage()
+		return fmt.Errorf("--table is required")
+	}
+	if *enable && *disable {
+		return fmt.Errorf("--enable and --disable are mutually exclusive")
+	}
+	var sets []string
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "period":
+			sets = append(sets, "partition_period="+lit(*period))
+		case "column":
+			sets = append(sets, "partition_column="+lit(*column))
+		case "premake":
+			sets = append(sets, fmt.Sprintf("future_partitions=%d", *premake))
+		case "hot-period":
+			sets = append(sets, "hot_period="+lit(*hot))
+		case "retention":
+			sets = append(sets, "retention_period="+lit(*retention))
+		case "sub-values-source":
+			sets = append(sets, "sub_part_values_source="+lit(*subValues))
+		case "enable":
+			sets = append(sets, "enabled=true")
+		case "disable":
+			sets = append(sets, "enabled=false")
+		}
+	})
+	if len(sets) == 0 {
+		return fmt.Errorf("nothing to change: pass a field flag or --enable/--disable")
+	}
+	sql := fmt.Sprintf("UPDATE coldfront.partition_config SET %s WHERE schema_name=%s AND table_name=%s;",
+		strings.Join(sets, ", "), lit(*schema), lit(*table))
+	if *printSQL {
+		fmt.Println(sql)
+		return nil
+	}
+	pool, err := connect(ctx)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	if err := EnsureTable(ctx, pool); err != nil {
+		return err
+	}
+	tag, err := pool.Exec(ctx, sql)
+	if err != nil {
+		return fmt.Errorf("set %s.%s: %w", *schema, *table, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("%s.%s is not managed (no partition_config row)", *schema, *table)
+	}
+	fmt.Printf("updated %s.%s\n", *schema, *table)
+	return nil
+}
+
+// runRemove unregisters a table (deletes its config row); the table itself is
+// left intact.
+func runRemove(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("remove", flag.ContinueOnError)
+	connect := addConn(fs)
+	schema := fs.String("schema", "public", "schema of the managed table")
+	table := fs.String("table", "", "name of the managed table (required)")
+	printSQL := fs.Bool("print-sql", false, "print the DELETE instead of running it")
+	fs.Usage = simpleUsage(fs, "remove", `remove — stop managing a table (delete its partition_config row).
+
+The partitioned table itself is NOT dropped — only its lifecycle registration is
+removed. Drop the table separately if you intend to destroy the data.
+
+USAGE:
+  <binary> remove --table <name> (--dsn <dsn> | --config <yaml>)
+
+EXAMPLE:
+  partitioner remove --config cf.yaml --table events`)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *table == "" {
+		fs.Usage()
+		return fmt.Errorf("--table is required")
+	}
+	sql := fmt.Sprintf("DELETE FROM coldfront.partition_config WHERE schema_name=%s AND table_name=%s;",
+		lit(*schema), lit(*table))
+	if *printSQL {
+		fmt.Println(sql)
+		return nil
+	}
+	pool, err := connect(ctx)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	if err := EnsureTable(ctx, pool); err != nil {
+		return err
+	}
+	tag, err := pool.Exec(ctx, sql)
+	if err != nil {
+		return fmt.Errorf("remove %s.%s: %w", *schema, *table, err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("%s.%s was not managed", *schema, *table)
+	}
+	fmt.Printf("unregistered %s.%s (the table itself is left intact)\n", *schema, *table)
+	return nil
+}
+
+// runImport seeds partition_config from a deployment YAML's archiver.tables —
+// the migration path off the YAML deprecation bridge.
+func runImport(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("import", flag.ContinueOnError)
+	cfgPath := fs.String("config", "", "deployment YAML to import: its archiver.tables become partition_config rows (required)")
+	dsn := fs.String("dsn", "", "connection DSN (default: postgres.dsn from --config)")
+	printSQL := fs.Bool("print-sql", false, "print the INSERTs instead of running them")
+	dryRun := fs.Bool("dry-run", false, "validate/parse but make no changes")
+	fs.Usage = simpleUsage(fs, "import", `import — load a deployment YAML's archiver.tables into coldfront.partition_config.
+
+The migration path off the YAML bridge: register every table from an existing
+config file in one shot. Connection config (DSN, iceberg/S3) is NOT imported —
+it stays per-node.
+
+USAGE:
+  <binary> import --config <yaml> [--dsn <dsn>]
+
+EXAMPLES:
+  partitioner import --config legacy.yaml                 # import its tables
+  partitioner import --config legacy.yaml --print-sql     # review the INSERTs first`)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *cfgPath == "" {
+		fs.Usage()
+		return fmt.Errorf("--config is required (the YAML to import)")
+	}
+	cfg, err := config.Load(*cfgPath)
+	if err != nil {
+		return fmt.Errorf("read --config: %w", err)
+	}
+	if len(cfg.Archiver.Tables) == 0 {
+		return fmt.Errorf("no archiver.tables in %s", *cfgPath)
+	}
+	stmts := make([]string, len(cfg.Archiver.Tables))
+	for i, t := range cfg.Archiver.Tables {
+		stmts[i] = rowFrom(t).insertSQL()
+	}
+	if *printSQL {
+		for _, s := range stmts {
+			fmt.Println(s)
+		}
+		return nil
+	}
+	d := *dsn
+	if d == "" {
+		d = cfg.Postgres.DSN
+	}
+	if d == "" {
+		return fmt.Errorf("no DSN: set postgres.dsn in --config or pass --dsn")
+	}
+	pool, err := openPool(ctx, d)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	if err := EnsureTable(ctx, pool); err != nil {
+		return err
+	}
+	if *dryRun {
+		fmt.Printf("dry-run OK: would import %d table(s)\n", len(stmts))
+		return nil
+	}
+	for i, s := range stmts {
+		if _, err := pool.Exec(ctx, s); err != nil {
+			return fmt.Errorf("import %s: %w", cfg.Archiver.Tables[i].SourceTable, err)
+		}
+	}
+	fmt.Printf("imported %d table(s) into coldfront.partition_config\n", len(stmts))
+	return nil
+}
+
+// runExport dumps the managed tables back to YAML (round-trippable config) or as
+// INSERT SQL — the GitOps clawback: keep a reviewable copy in git.
+func runExport(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("export", flag.ContinueOnError)
+	connect := addConn(fs)
+	format := fs.String("format", "yaml", "output format: yaml | sql")
+	fs.Usage = simpleUsage(fs, "export", `export — dump partition_config to reviewable config (yaml) or INSERT SQL.
+
+The GitOps clawback: commit the output to keep an auditable, version-controlled
+copy of what is being managed.
+
+USAGE:
+  <binary> export [--format yaml|sql] (--dsn <dsn> | --config <yaml>)
+
+EXAMPLES:
+  partitioner export --config cf.yaml > managed.yaml      # round-trippable YAML
+  partitioner export --config cf.yaml --format sql        # INSERT statements`)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	if *format != "yaml" && *format != "sql" {
+		return fmt.Errorf("--format must be yaml or sql")
+	}
+	pool, err := connect(ctx)
+	if err != nil {
+		return err
+	}
+	defer pool.Close()
+	if err := EnsureTable(ctx, pool); err != nil {
+		return err
+	}
+	tables, err := LoadTables(ctx, pool)
+	if err != nil {
+		return err
+	}
+	if *format == "sql" {
+		for _, t := range tables {
+			fmt.Println(rowFrom(t).insertSQL())
+		}
+		return nil
+	}
+	doc := struct {
+		Archiver config.ArchiverConfig `yaml:"archiver"`
+	}{Archiver: config.ArchiverConfig{Tables: tables}}
+	out, err := yaml.Marshal(doc)
+	if err != nil {
+		return fmt.Errorf("marshal yaml: %w", err)
+	}
+	fmt.Print(string(out))
+	return nil
+}
+
+// simpleUsage builds a FlagSet usage func that prints help text then the flags.
+func simpleUsage(fs *flag.FlagSet, _, help string) func() {
+	return func() {
+		_, _ = fmt.Fprint(fs.Output(), help+"\n\nFLAGS:\n")
+		fs.PrintDefaults()
+	}
 }
