@@ -353,7 +353,7 @@ func runCycle(ctx context.Context, cfg *config.Config, t *config.TableConfig, po
 		if err := dropColdBeforeRetention(ctx, pool, iceTable, t.PartitionColumn, cutoff); err != nil {
 			return fmt.Errorf("cold expiry: %w", err)
 		}
-		log.Printf("[%s] expired cold rows older than %s", t.SourceTable, cutoff.Format("2006-01-02"))
+		log.Printf("[%s] expired cold rows older than %s", t.SourceTable, cutoff.Format("2006-01-02 15:04:05Z"))
 	}
 
 	return nil

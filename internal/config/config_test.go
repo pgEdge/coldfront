@@ -249,6 +249,13 @@ func TestValidate_TieredRetentionMustExceedHot(t *testing.T) {
 	assert.Contains(t, err.Error(), "must exceed hot_period")
 }
 
+func TestValidate_TieredRejectsIdMode(t *testing.T) {
+	// id mode is a partition-only feature; the cold tier is time-only.
+	_, err := Load(writeConfig(t, tieredCfg("      hot_period: \"1 month\"\n      part_mode: id\n      id_scheme: snowflake")))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "part_mode")
+}
+
 func TestValidate_PartitionOnlyRejectsHotPeriod(t *testing.T) {
 	cfg := `
 postgres:

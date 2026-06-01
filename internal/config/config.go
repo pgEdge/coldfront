@@ -180,6 +180,13 @@ func (c *Config) Validate() error {
 		// must exceed hot_period. Partition-only: retention_period (drop the hot
 		// partition) is required; hot_period is meaningless without a cold tier.
 		if icebergMode {
+			// The cold tier is time-only (timestamp partition key, timestamptz
+			// Iceberg writes). id mode and 2-level sub-partitioning are
+			// partition-only features the tiered archiver cannot execute — reject
+			// them at config load rather than fail cryptically at runtime.
+			if t.PartMode != "" && t.PartMode != partition.PartModeTimestamp {
+				return fmt.Errorf("archiver.tables[%d].part_mode %q is only valid in partition-only mode; the cold tier is time-only", i, t.PartMode)
+			}
 			if t.HotPeriod == "" {
 				return fmt.Errorf("archiver.tables[%d].hot_period is required in tiered mode", i)
 			}
