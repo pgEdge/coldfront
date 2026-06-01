@@ -198,17 +198,21 @@ Remaining work:
 
 Remaining (pre-existing) partition-manager follow-ups:
 
-- **Optionally share `RunReconcile`'s premake/find primitives with the
-  archiver.** The two products genuinely share only *plumbing* — premake the
-  forward window, ensure the current period, find partitions past an age cutoff.
-  They do **not** share a *policy*: partition-only eviction is a stateless
-  `DROP`, whereas the archiver's tier-to-cold is a stateful boundary advance
-  (watermark + atomic cutover) that must not be modelled as "expiration". A
-  rewire should share the primitives and keep the boundary-crossing as the
-  archiver's own clearly-named operation (an `OnEvict`-style hook with `drop` vs
-  `tier` implementations) — *not* fold the whole archiver through an
-  `ExpireFunc` named for removal. Lower priority now that the lifecycle split has
-  removed the vocabulary conflation; the DRY win is small.
+- ~~Share `RunReconcile`'s premake/find primitives with the archiver.~~
+  **RESOLVED — not folding the archiver onto `RunReconcile`.** The worthwhile
+  half is already done: the archiver builds directly on the shared
+  `internal/partition` primitives (`EnsureFuture`/`EnsureCurrent`/`FindExpired`/
+  `EnsureListChild`/`Detach`/`Drop`) and references `RunReconcile` zero times;
+  there is no duplicated block left to extract. Folding the *driver* is declined
+  on two grounds: (1) the archiver's tier-to-cold is a stateful watermark/cutover
+  boundary advance, not the removal `RunReconcile`'s `ExpireFunc` is named for
+  (leaky abstraction, tiny DRY win); and (2) for 2-level it is structurally
+  impossible — `RunReconcileTwoLevel` iterates region-major / per-partition,
+  whereas the shipped Global tiering must go period-major *across* regions
+  (export every region's leaf for a ts period before the shared cutoff advances).
+  Routing through it would reintroduce the transient vanishing-rows bug that the
+  hand-rolled period-grouped `runCycleTwoLevel` eliminates. The orchestration
+  legitimately differs by policy over one shared primitive set.
 - **Scripted strip to a partition-only build.** The one-way dependency rule
   (iceberg → partition-core, enforced by `cmd/partitioner/arch_test.go`) makes a
   cut possible: a script that deletes the iceberg layer (C extension,
