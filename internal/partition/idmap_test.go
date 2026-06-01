@@ -60,6 +60,9 @@ func TestSnowflake_RoundTrip(t *testing.T) {
 func TestSnowflake_AgainstLiveSample(t *testing.T) {
 	// Anchored to a real snowflake from the pgEdge extension (probed live):
 	// id=451955560737148928, ts=2026-06-01T03:50:02.608Z, node=1, count=0.
+	// Cross-checked against the snowflake 2.4 extension's get_epoch across four
+	// literal ids: get_epoch returns SECONDS (numeric), and get_epoch*1000 equals
+	// (id>>22)+1672531200000 exactly — confirming the source-read epoch/shift.
 	const sampleID = int64(451955560737148928)
 	sampleTime := time.UnixMilli(1780285802608).UTC()
 
