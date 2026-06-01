@@ -1,7 +1,7 @@
 #!/bin/bash
 # ci/matrix.sh — the ColdFront CI gate.
 #
-# Runs the host-side preflight ONCE (gofmt, golangci-lint, unit tests, build),
+# Runs the host-side preflight ONCE (gofmt, go vet, golangci-lint, unit tests, build),
 # then exercises the canonical user journey (ci/journey.sh) across deployment
 # cells. The journey is the single spec; a "cell" is one
 # PG-major × topology × mode × target combination. Per-cell the topology script
@@ -44,7 +44,11 @@ preflight() {
     if [ -n "$(gofmt -l .)" ]; then gofmt -d .; fail "code is not formatted"; exit 1; fi
     pass "formatting ok"
 
-    step "preflight 2: golangci-lint"
+    step "preflight 2: go vet"
+    if ! go vet ./...; then fail "go vet found issues"; exit 1; fi
+    pass "vet clean"
+
+    step "preflight 3: golangci-lint"
     local linter="${GOLANGCI_LINT:-$(command -v golangci-lint || echo "$HOME/go/bin/golangci-lint")}"
     if [ ! -x "$linter" ]; then
         fail "golangci-lint not found (go install github.com/golangci/golangci-lint/cmd/golangci-lint@latest or set GOLANGCI_LINT)"
@@ -53,11 +57,11 @@ preflight() {
     if ! "$linter" run ./...; then fail "golangci-lint found issues"; exit 1; fi
     pass "lint clean"
 
-    step "preflight 3: unit tests"
+    step "preflight 4: unit tests"
     if ! make test 2>&1; then fail "unit tests"; exit 1; fi
     pass "unit tests"
 
-    step "preflight 4: build"
+    step "preflight 5: build"
     if ! make build 2>&1; then fail "build"; exit 1; fi
     pass "build ($(ls -lh bin/archiver 2>/dev/null | awk '{print $5}'))"
 }
