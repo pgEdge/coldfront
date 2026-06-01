@@ -789,6 +789,38 @@ story_mesh_substrate() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# Story — mesh: coldfront.partition_config replicates by value in all directions.
+# This is the auto-sync that motivates config-as-data: register on any node and
+# every peer reads the same lifecycle. N×(N-1) probe — a sentinel row per node,
+# seen everywhere; then cleared. Sentinels point at no real table (schema
+# 'cfprobe') and are removed here, so no reconcile ever processes them.
+# ───────────────────────────────────────────────────────────────────────────
+story_mesh_partition_config() {
+    step "1c. Mesh: coldfront.partition_config replicates in all directions"
+    local PARR; read -ra PARR <<< "$PEERS"
+    [ "${#PARR[@]}" -ge 1 ] || { fail "mesh: no --peers given"; return; }
+    local nodes=("$HOST" "${PARR[@]}") want="$(( ${#PARR[@]} + 1 ))" n i=0
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE schema_name='cfprobe';" >/dev/null 2>&1
+    sleep 2
+    for n in "${nodes[@]}"; do
+        i=$((i + 1))
+        q "$n" "INSERT INTO coldfront.partition_config (schema_name, table_name, partition_period, retention_period) VALUES ('cfprobe', 'n${i}', 'monthly', '1 day');" >/dev/null 2>&1
+    done
+    sleep 3
+    for n in "${nodes[@]}"; do
+        assert_eq "partition_config: $n sees all $want rows (every direction)" "$want" \
+            "$(q "$n" "SELECT count(*) FROM coldfront.partition_config WHERE schema_name='cfprobe';")"
+    done
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE schema_name='cfprobe';" >/dev/null 2>&1
+    sleep 2
+    local stale=0
+    for n in "${nodes[@]}"; do
+        [ "$(q "$n" "SELECT count(*) FROM coldfront.partition_config WHERE schema_name='cfprobe';")" = "0" ] || stale=$((stale + 1))
+    done
+    assert_eq "partition_config sentinels cleared on all nodes (delete replicates)" "0" "$stale"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Story — 2-level (LIST region → RANGE ts) tiering: the "upgrade a sub-partitioned
 # table to tiered" path. A region-agnostic single Iceberg table; leaves tier per
 # ts period across ALL regions before the shared cutoff advances. Uses its own
@@ -956,7 +988,8 @@ EOF
 # tiered stories assume the partitioned `events` table and don't apply to an
 # iceberg-only relation, and vice-versa.)
 story_setup
-[ "$MESH" = 1 ] && story_mesh_substrate   # bakery substrate replicates in all directions
+[ "$MESH" = 1 ] && story_mesh_substrate          # bakery substrate replicates in all directions
+[ "$MESH" = 1 ] && story_mesh_partition_config   # config table replicates in all directions
 if [ "$MODE" = "tiered" ]; then
     story_provision_tiered
     [ "$MESH" = 1 ] && story_mesh_tiered    # cross-node tiered, while hot+cold coexist
