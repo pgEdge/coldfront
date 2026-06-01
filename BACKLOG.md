@@ -166,7 +166,13 @@ LIST→RANGE, behind-detection. The data-lifecycle model is now explicit and
 un-conflated — **hot →`hot_period`→ cold →`retention_period`→ gone** (tiered);
 **hot →`retention_period`→ gone** (partition-only) — with the archiver tiering
 past `hot_period` and dropping cold Iceberg data past `retention_period`.
-Remaining work before/around merging it:
+
+The tiered archiver now also handles **2-level LIST→RANGE** tables (the
+partitioner→tiered upgrade path): `runCycleTwoLevel` premakes per region and
+tiers leaves a whole `ts` period at a time across all regions before advancing
+the shared watermark (Global boundary, no read gap), with a region-scoped Phase-0
+wipe. It already reuses the partition-core premake/find primitives
+(`EnsureListChild`/`EnsureFuture`/`EnsureCurrent`/`FindExpired`). Remaining work:
 
 - **Optionally share `RunReconcile`'s premake/find primitives with the
   archiver.** The two products genuinely share only *plumbing* — premake the

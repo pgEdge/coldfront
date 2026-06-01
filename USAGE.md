@@ -53,6 +53,22 @@ Run the archiver (typically via cron):
 
 The first run renames `events` → `_events`, creates the unified view `events`, and registers it. From then on every cycle (1) tiers partitions older than `hot_period` from hot PG to cold Iceberg and advances the watermark, and (2) if `retention_period` is set, drops cold Iceberg rows older than it. The data lifecycle is **hot → `hot_period` → cold → `retention_period` → gone**; omit `retention_period` to keep cold data forever.
 
+### 2-level (LIST → RANGE) tiered tables
+
+A table partitioned `LIST (region) → RANGE (ts)` can be tiered too — the same `sub_partition` block as the standalone partition manager (Mode 3), so a partition-manager-managed table can be "upgraded" to tiered by pointing the archiver at it:
+
+```yaml
+    - source_table: regional
+      partition_column: ts          # the RANGE (time) column — required for 2-level
+      partition_period: monthly
+      hot_period: 1 month
+      # retention_period: 5 years   # optional cold expiry (region-agnostic, by ts)
+      sub_partition:
+        values_source: "SELECT region FROM regions"
+```
+
+One Iceberg table holds every region (region is just a column); the archiver tiers leaves a whole `ts` period at a time across **all** regions before advancing the shared hot/cold watermark, so a period only becomes cold once it is cold for every region. `id` mode is not supported in tiered mode (the cold tier is time-keyed).
+
 ## Mode 2 — Decoupled (iceberg-only)
 
 Single call:
