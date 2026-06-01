@@ -71,3 +71,27 @@ func RunReconcile(ctx context.Context, lc Lifecycle, s Spec, now time.Time, expi
 	}
 	return nil
 }
+
+// ParseRetention parses a "N unit" string ("3 months", "7 days", "2 weeks",
+// "1 year") into a Duration, using approximate 30-day months and 365-day years.
+// Good enough for retention comparisons — the cutoff need only land safely
+// within the target period; exact PG interval arithmetic is not required.
+func ParseRetention(s string) (time.Duration, error) {
+	var n int
+	var unit string
+	if _, err := fmt.Sscanf(s, "%d %s", &n, &unit); err != nil {
+		return 0, fmt.Errorf("invalid interval %q: expected \"N unit\"", s)
+	}
+	switch unit {
+	case "day", "days":
+		return time.Duration(n) * 24 * time.Hour, nil
+	case "week", "weeks":
+		return time.Duration(n) * 7 * 24 * time.Hour, nil
+	case "month", "months":
+		return time.Duration(n) * 30 * 24 * time.Hour, nil
+	case "year", "years":
+		return time.Duration(n) * 365 * 24 * time.Hour, nil
+	default:
+		return 0, fmt.Errorf("unsupported interval unit %q", unit)
+	}
+}

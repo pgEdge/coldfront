@@ -240,7 +240,7 @@ func runCycle(ctx context.Context, cfg *config.Config, t *config.TableConfig, po
 	}
 
 	// 2. Find expired partitions
-	retention, err := parseInterval(t.RetentionPeriod)
+	retention, err := partition.ParseRetention(t.RetentionPeriod)
 	if err != nil {
 		return fmt.Errorf("parse retention: %w", err)
 	}
@@ -865,30 +865,6 @@ func getColumns(ctx context.Context, db querier, schema, tableName string) ([]vi
 		}
 	}
 	return cols, nil
-}
-
-// parseInterval parses a "N unit" string like "3 months" or "7 days" into
-// a time.Duration using approximate month/year lengths (30 / 365 days).
-// Good enough for retention comparisons; exact PG interval arithmetic is
-// not required.
-func parseInterval(s string) (time.Duration, error) {
-	var n int
-	var unit string
-	if _, err := fmt.Sscanf(s, "%d %s", &n, &unit); err != nil {
-		return 0, fmt.Errorf("invalid interval %q: expected \"N unit\"", s)
-	}
-	switch unit {
-	case "day", "days":
-		return time.Duration(n) * 24 * time.Hour, nil
-	case "week", "weeks":
-		return time.Duration(n) * 7 * 24 * time.Hour, nil
-	case "month", "months":
-		return time.Duration(n) * 30 * 24 * time.Hour, nil
-	case "year", "years":
-		return time.Duration(n) * 365 * 24 * time.Hour, nil
-	default:
-		return 0, fmt.Errorf("unsupported interval unit %q", unit)
-	}
 }
 
 // init configures the standard logger: UTC timestamps on stderr so cron

@@ -123,34 +123,6 @@ func TestPgFormatTypeToDuckDB(t *testing.T) {
 	}
 }
 
-func TestParseInterval(t *testing.T) {
-	tests := []struct {
-		input string
-		hours int
-		err   bool
-	}{
-		{"1 day", 24, false},
-		{"7 days", 168, false},
-		{"1 month", 720, false},
-		{"3 months", 2160, false},
-		{"1 year", 8760, false},
-		{"2 weeks", 336, false},
-		{"bad", 0, true},
-		{"1 fortnight", 0, true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			d, err := parseInterval(tt.input)
-			if tt.err {
-				require.Error(t, err)
-			} else {
-				require.NoError(t, err)
-				assert.Equal(t, tt.hours, int(d.Hours()))
-			}
-		})
-	}
-}
-
 func TestParsePartitionKeyDef(t *testing.T) {
 	tests := []struct {
 		name string

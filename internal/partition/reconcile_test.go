@@ -118,3 +118,37 @@ func TestRunReconcile_EnsureErrorStopsBeforeFind(t *testing.T) {
 		t.Fatalf("expected to stop after ensure, got %v", f.log)
 	}
 }
+
+func TestParseRetention(t *testing.T) {
+	tests := []struct {
+		input string
+		hours int
+		err   bool
+	}{
+		{"1 day", 24, false},
+		{"7 days", 168, false},
+		{"1 month", 720, false},
+		{"3 months", 2160, false},
+		{"1 year", 8760, false},
+		{"2 weeks", 336, false},
+		{"bad", 0, true},
+		{"1 fortnight", 0, true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.input, func(t *testing.T) {
+			d, err := ParseRetention(tt.input)
+			if tt.err {
+				if err == nil {
+					t.Fatalf("expected error for %q", tt.input)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if int(d.Hours()) != tt.hours {
+				t.Fatalf("%q: got %d hours, want %d", tt.input, int(d.Hours()), tt.hours)
+			}
+		})
+	}
+}
