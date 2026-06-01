@@ -37,6 +37,22 @@ type querier interface {
 // per configured table. Intended to be invoked from cron; exits non-zero on
 // any failure so the caller can alert.
 func main() {
+	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer cancel()
+
+	// Management subcommands (register/list/…) route to the shared CLI; with no
+	// subcommand the archiver does its default archive run.
+	if len(os.Args) >= 2 && !strings.HasPrefix(os.Args[1], "-") {
+		if partcfg.IsCommand(os.Args[1]) {
+			if err := partcfg.Run(ctx, os.Args[1], os.Args[2:]); err != nil {
+				log.Fatalf("%s: %v", os.Args[1], err)
+			}
+			return
+		}
+		log.Fatalf("unknown subcommand %q; expected one of: %s (or pass --config to run the archiver)",
+			os.Args[1], strings.Join(partcfg.CommandNames(), ", "))
+	}
+
 	configPath := flag.String("config", "config.yaml", "path to config file")
 	debugExportDelay := flag.Duration("debug-export-delay", 0,
 		"sleep this long after Phase 2 (capture+bulk-export) and before Phase 3 "+
@@ -48,9 +64,6 @@ func main() {
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
-
-	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
-	defer cancel()
 
 	pool, err := pgxpool.New(ctx, cfg.Postgres.DSN)
 	if err != nil {
