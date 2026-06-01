@@ -172,7 +172,31 @@ partitioner→tiered upgrade path): `runCycleTwoLevel` premakes per region and
 tiers leaves a whole `ts` period at a time across all regions before advancing
 the shared watermark (Global boundary, no read gap), with a region-scoped Phase-0
 wipe. It already reuses the partition-core premake/find primitives
-(`EnsureListChild`/`EnsureFuture`/`EnsureCurrent`/`FindExpired`). Remaining work:
+(`EnsureListChild`/`EnsureFuture`/`EnsureCurrent`/`FindExpired`).
+
+**Config is now an in-DB, Spock-replicated table, not YAML.** Per-table lifecycle
+lives in name-keyed `coldfront.partition_config` (`internal/partcfg`), auto-added
+to the default repset on a spock node so the mesh self-syncs (vanilla: a no-op
+local table). Both binaries read it (YAML `archiver.tables` is a fall-back
+deprecation bridge) and expose a management CLI — `register` (with PK + parse +
+retention>hot validation), `list`, `set`, `remove`, `import`, `export` — with
+verbose per-command help and `--print-sql`/`export` as the config-as-code
+clawback. Connection config (DSN, iceberg/S3) stays per-node and never
+replicates. Live-verified end-to-end on vanilla by `story_register_cli`.
+Remaining work:
+
+- **Mesh `partition_config` replication probe (N×(N-1)).** The repset auto-add
+  reuses the proven `_ensure_claims_replicated` mechanism and is confirmed a
+  clean no-op on vanilla, but cross-node replication of `partition_config` rows
+  is not yet exercised in CI (the quick gate is vanilla). Add a `--full` mesh-cell
+  assertion: `register` on one node, confirm the row appears on every peer.
+- **Optional: native `interval` columns for `hot_period`/`retention_period`.**
+  Currently text (matching `ParseRetention`); moving to `interval` makes the
+  cutoff calendar-aware and lets `retention > hot_period` become a table CHECK
+  rather than a register-time / run-time Go check (both already enforced, so this
+  is polish, not a correctness gap).
+
+Remaining (pre-existing) partition-manager follow-ups:
 
 - **Optionally share `RunReconcile`'s premake/find primitives with the
   archiver.** The two products genuinely share only *plumbing* — premake the
