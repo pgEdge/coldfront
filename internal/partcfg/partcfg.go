@@ -53,15 +53,39 @@ CREATE TABLE IF NOT EXISTS coldfront.partition_config (
     CONSTRAINT pc_2level_col    CHECK (sub_part_values_source IS NULL OR partition_column IS NOT NULL)
 )`
 
+// ensureReplicatedSQL adds partition_config to Spock's default replication set
+// so the per-table config replicates by value across the mesh — the same
+// spock-gated, idempotent pattern as coldfront._ensure_claims_replicated. It is
+// a no-op without the spock extension (vanilla single node), and is safe under
+// pg_duckdb (no EXCEPTION block ⇒ no subtransaction). The nested IFs ensure the
+// spock.* relations are only referenced when spock is actually installed.
+const ensureReplicatedSQL = `
+DO $$
+BEGIN
+  IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'spock') THEN
+    IF NOT EXISTS (
+      SELECT 1 FROM spock.replication_set rs
+        JOIN spock.replication_set_table rst ON rst.set_id = rs.set_id
+       WHERE rs.set_name = 'default'
+         AND rst.set_reloid = 'coldfront.partition_config'::regclass
+    ) THEN
+      PERFORM spock.repset_add_table('default', 'coldfront.partition_config'::regclass, false);
+    END IF;
+  END IF;
+END $$`
+
 // EnsureTable idempotently creates the coldfront schema and partition_config
-// table. Safe to call every run; a no-op once the extension (or a prior run)
-// created it.
+// table, and (on a Spock node) registers it for replication. Safe to call every
+// run; a no-op once the extension (or a prior run) created it.
 func EnsureTable(ctx context.Context, db DBTX) error {
 	if _, err := db.Exec(ctx, `CREATE SCHEMA IF NOT EXISTS coldfront`); err != nil {
 		return fmt.Errorf("create schema: %w", err)
 	}
 	if _, err := db.Exec(ctx, createTableSQL); err != nil {
 		return fmt.Errorf("create partition_config: %w", err)
+	}
+	if _, err := db.Exec(ctx, ensureReplicatedSQL); err != nil {
+		return fmt.Errorf("ensure partition_config replicated: %w", err)
 	}
 	return nil
 }

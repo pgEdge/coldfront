@@ -50,8 +50,8 @@ func TestEnsureTable(t *testing.T) {
 	if err := EnsureTable(context.Background(), db); err != nil {
 		t.Fatal(err)
 	}
-	if len(db.execSQL) != 2 {
-		t.Fatalf("expected schema + table DDL, got %d execs", len(db.execSQL))
+	if len(db.execSQL) != 3 {
+		t.Fatalf("expected schema + table DDL + repset, got %d execs", len(db.execSQL))
 	}
 	if !strings.Contains(db.execSQL[0], "CREATE SCHEMA IF NOT EXISTS coldfront") {
 		t.Errorf("missing schema DDL: %s", db.execSQL[0])
@@ -59,6 +59,11 @@ func TestEnsureTable(t *testing.T) {
 	if !strings.Contains(db.execSQL[1], "coldfront.partition_config") ||
 		!strings.Contains(db.execSQL[1], "CREATE TABLE IF NOT EXISTS") {
 		t.Errorf("missing table DDL: %s", db.execSQL[1])
+	}
+	// The replication step is spock-gated and idempotent.
+	if !strings.Contains(db.execSQL[2], "repset_add_table") ||
+		!strings.Contains(db.execSQL[2], "pg_extension WHERE extname = 'spock'") {
+		t.Errorf("missing spock-gated repset step: %s", db.execSQL[2])
 	}
 }
 

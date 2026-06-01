@@ -91,6 +91,11 @@ if [ "$MODE" = tiered ]; then
         m "$n" "SELECT spock.repset_add_table('default','coldfront.archive_watermark'::regclass, false);" >/dev/null 2>&1
     done
 fi
+# Per-table lifecycle config replicates by value in any mesh mode (the binaries
+# also self-register it via partcfg.EnsureTable; doing it here too is harmless).
+for n in $NODES; do
+    m "$n" "SELECT spock.repset_add_table('default','coldfront.partition_config'::regclass, false);" >/dev/null 2>&1
+done
 pass "spock mesh formed (6 subs) + bakery substrate armed on all nodes"
 
 step "mesh: bootstrap Lakekeeper + warehouse"
