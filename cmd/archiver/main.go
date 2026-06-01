@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vyruss/coldfront/internal/config"
+	"github.com/vyruss/coldfront/internal/partcfg"
 	"github.com/vyruss/coldfront/internal/partition"
 	"github.com/vyruss/coldfront/internal/sqlutil"
 	"github.com/vyruss/coldfront/internal/view"
@@ -64,6 +65,25 @@ func main() {
 	wmStore := watermark.NewStore(pool)
 	if err := wmStore.EnsureTable(ctx); err != nil {
 		log.Fatalf("ensure watermark table: %v", err)
+	}
+
+	// Resolve managed tables from the replicated coldfront.partition_config
+	// table, falling back to the YAML archiver.tables (deprecation bridge).
+	tables, fromYAML, err := partcfg.ResolveTables(ctx, pool, cfg.Archiver.Tables)
+	if err != nil {
+		log.Fatalf("resolve tables: %v", err)
+	}
+	if len(tables) == 0 {
+		log.Fatalf("no tables configured: coldfront.partition_config is empty and no archiver.tables in %s", *configPath)
+	}
+	if fromYAML {
+		log.Printf("no partition_config rows; using %d table(s) from YAML (deprecated — migrate with `register`/`import`)", len(tables))
+	} else {
+		log.Printf("loaded %d table(s) from coldfront.partition_config", len(tables))
+	}
+	cfg.Archiver.Tables = tables
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("config invalid: %v", err)
 	}
 
 	for i := range cfg.Archiver.Tables {

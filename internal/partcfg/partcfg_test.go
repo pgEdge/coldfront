@@ -7,6 +7,8 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/vyruss/coldfront/internal/config"
 )
 
 type mockRows struct {
@@ -57,6 +59,51 @@ func TestEnsureTable(t *testing.T) {
 	if !strings.Contains(db.execSQL[1], "coldfront.partition_config") ||
 		!strings.Contains(db.execSQL[1], "CREATE TABLE IF NOT EXISTS") {
 		t.Errorf("missing table DDL: %s", db.execSQL[1])
+	}
+}
+
+func emptyRows() (pgx.Rows, error) { return &mockRows{}, nil }
+
+func TestResolveTables_DBWins(t *testing.T) {
+	db := &mockDB{rowsFunc: func() (pgx.Rows, error) {
+		return &mockRows{rows: []func(dest ...any) error{
+			func(dest ...any) error {
+				*(dest[0].(*string)) = "public"
+				*(dest[1].(*string)) = "events"
+				*(dest[2].(*string)) = "monthly"
+				*(dest[3].(**string)) = sp("ts")
+				*(dest[4].(*int)) = 3
+				*(dest[5].(*string)) = "timestamp"
+				*(dest[8].(**string)) = sp("12 months")
+				return nil
+			},
+		}}, nil
+	}}
+	yaml := []config.TableConfig{{SourceTable: "from_yaml"}}
+	got, fromYAML, err := ResolveTables(context.Background(), db, yaml)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if fromYAML {
+		t.Fatal("expected DB rows to win, got YAML fallback")
+	}
+	if len(got) != 1 || got[0].SourceTable != "events" {
+		t.Fatalf("expected the DB row, got %+v", got)
+	}
+}
+
+func TestResolveTables_YAMLFallback(t *testing.T) {
+	db := &mockDB{rowsFunc: emptyRows} // no partition_config rows
+	yaml := []config.TableConfig{{SourceTable: "from_yaml"}}
+	got, fromYAML, err := ResolveTables(context.Background(), db, yaml)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fromYAML {
+		t.Fatal("expected YAML fallback when the table is empty")
+	}
+	if len(got) != 1 || got[0].SourceTable != "from_yaml" {
+		t.Fatalf("expected the YAML fallback, got %+v", got)
 	}
 }
 

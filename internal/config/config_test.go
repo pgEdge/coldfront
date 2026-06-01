@@ -183,7 +183,10 @@ archiver:
 	assert.Contains(t, err.Error(), "partition_period")
 }
 
-func TestValidate_NoTables(t *testing.T) {
+func TestValidate_ZeroTablesAllowed(t *testing.T) {
+	// Zero YAML tables now validates: the managed set may come from the
+	// replicated coldfront.partition_config table, resolved by the binaries at
+	// startup (which fail loud if BOTH sources are empty).
 	cfg := `
 postgres:
   dsn: "host=localhost"
@@ -198,8 +201,7 @@ archiver:
   tables: []
 `
 	_, err := Load(writeConfig(t, cfg))
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "at least one")
+	require.NoError(t, err)
 }
 
 func tieredCfg(tail string) string {

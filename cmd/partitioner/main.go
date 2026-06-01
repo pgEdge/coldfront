@@ -18,6 +18,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vyruss/coldfront/internal/config"
+	"github.com/vyruss/coldfront/internal/partcfg"
 	"github.com/vyruss/coldfront/internal/partition"
 )
 
@@ -43,6 +44,25 @@ func main() {
 	defer pool.Close()
 	if err := pool.Ping(ctx); err != nil {
 		log.Fatalf("ping: %v", err)
+	}
+
+	// Resolve managed tables from the replicated coldfront.partition_config
+	// table, falling back to the YAML archiver.tables (deprecation bridge).
+	tables, fromYAML, err := partcfg.ResolveTables(ctx, pool, cfg.Archiver.Tables)
+	if err != nil {
+		log.Fatalf("resolve tables: %v", err)
+	}
+	if len(tables) == 0 {
+		log.Fatalf("no tables configured: coldfront.partition_config is empty and no archiver.tables in %s", *cfgPath)
+	}
+	if fromYAML {
+		log.Printf("no partition_config rows; using %d table(s) from YAML (deprecated — migrate with `register`/`import`)", len(tables))
+	} else {
+		log.Printf("loaded %d table(s) from coldfront.partition_config", len(tables))
+	}
+	cfg.Archiver.Tables = tables
+	if err := cfg.Validate(); err != nil {
+		log.Fatalf("config invalid: %v", err)
 	}
 
 	mgr := partition.NewManager(pool)

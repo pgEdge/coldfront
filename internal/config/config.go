@@ -161,9 +161,9 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("s3.secret_key is required")
 		}
 	}
-	if len(c.Archiver.Tables) == 0 {
-		return fmt.Errorf("archiver.tables requires at least one entry")
-	}
+	// Zero tables is allowed here: the managed-table set may instead come from
+	// the replicated coldfront.partition_config table, resolved at startup. The
+	// binaries fail loud if BOTH the table and archiver.tables are empty.
 	for i, t := range c.Archiver.Tables {
 		if t.SourceTable == "" {
 			return fmt.Errorf("archiver.tables[%d].source_table is required", i)

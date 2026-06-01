@@ -66,6 +66,25 @@ func EnsureTable(ctx context.Context, db DBTX) error {
 	return nil
 }
 
+// ResolveTables returns the managed-table set: it ensures the table exists,
+// then returns the partition_config rows if there are any, else the supplied
+// YAML fallback (the deprecation bridge for not-yet-migrated deployments). The
+// bool is true when the YAML fallback was used. Callers fail loud if the result
+// is empty (both sources empty).
+func ResolveTables(ctx context.Context, db DBTX, yamlFallback []config.TableConfig) ([]config.TableConfig, bool, error) {
+	if err := EnsureTable(ctx, db); err != nil {
+		return nil, false, err
+	}
+	rows, err := LoadTables(ctx, db)
+	if err != nil {
+		return nil, false, err
+	}
+	if len(rows) > 0 {
+		return rows, false, nil
+	}
+	return yamlFallback, true, nil
+}
+
 // LoadTables reads the enabled partition_config rows into the existing
 // config.TableConfig shape, so every downstream consumer is unchanged.
 func LoadTables(ctx context.Context, db DBTX) ([]config.TableConfig, error) {
