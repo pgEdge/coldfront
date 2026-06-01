@@ -788,6 +788,89 @@ story_mesh_substrate() {
     assert_eq "claims sentinels cleared on all nodes (release replicates)" "0" "$stale"
 }
 
+# ───────────────────────────────────────────────────────────────────────────
+# Story — 2-level (LIST region → RANGE ts) tiering: the "upgrade a sub-partitioned
+# table to tiered" path. A region-agnostic single Iceberg table; leaves tier per
+# ts period across ALL regions before the shared cutoff advances. Uses its own
+# `regional` table, independent of the single-level `events` above.
+# ───────────────────────────────────────────────────────────────────────────
+story_tiered_twolevel() {
+    step "2-level tiering: LIST(region)→RANGE(ts) hot→cold across regions"
+    qf "$HOST" <<'EOSQL' >/dev/null
+SET search_path = public;
+CREATE TABLE IF NOT EXISTS regional (
+    id     bigint GENERATED ALWAYS AS IDENTITY,
+    region text NOT NULL,
+    ts     timestamptz NOT NULL,
+    status text,
+    data   jsonb,
+    PRIMARY KEY (id, region, ts)
+) PARTITION BY LIST (region);
+CREATE TABLE IF NOT EXISTS regional_eu PARTITION OF regional FOR VALUES IN ('eu') PARTITION BY RANGE (ts);
+CREATE TABLE IF NOT EXISTS regional_us PARTITION OF regional FOR VALUES IN ('us') PARTITION BY RANGE (ts);
+CREATE TABLE IF NOT EXISTS regional_eu_p_2026_01 PARTITION OF regional_eu FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+CREATE TABLE IF NOT EXISTS regional_eu_p_2026_02 PARTITION OF regional_eu FOR VALUES FROM ('2026-02-01') TO ('2026-03-01');
+CREATE TABLE IF NOT EXISTS regional_eu_p_2026_03 PARTITION OF regional_eu FOR VALUES FROM ('2026-03-01') TO ('2026-04-01');
+CREATE TABLE IF NOT EXISTS regional_eu_p_2026_04 PARTITION OF regional_eu FOR VALUES FROM ('2026-04-01') TO ('2026-05-01');
+CREATE TABLE IF NOT EXISTS regional_us_p_2026_01 PARTITION OF regional_us FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+CREATE TABLE IF NOT EXISTS regional_us_p_2026_02 PARTITION OF regional_us FOR VALUES FROM ('2026-02-01') TO ('2026-03-01');
+CREATE TABLE IF NOT EXISTS regional_us_p_2026_03 PARTITION OF regional_us FOR VALUES FROM ('2026-03-01') TO ('2026-04-01');
+CREATE TABLE IF NOT EXISTS regional_us_p_2026_04 PARTITION OF regional_us FOR VALUES FROM ('2026-04-01') TO ('2026-05-01');
+INSERT INTO regional (region, ts, status, data) SELECT 'eu', '2026-01-15'::timestamptz + (i*interval '1 hour'), 'ok', '{"r":"eu"}'::jsonb FROM generate_series(1,100) i;
+INSERT INTO regional (region, ts, status, data) SELECT 'eu', '2026-02-10'::timestamptz + (i*interval '1 hour'), 'ok', '{"r":"eu"}'::jsonb FROM generate_series(1,80) i;
+INSERT INTO regional (region, ts, status, data) SELECT 'eu', '2026-03-05'::timestamptz + (i*interval '1 hour'), 'ok', '{"r":"eu"}'::jsonb FROM generate_series(1,60) i;
+INSERT INTO regional (region, ts, status, data) SELECT 'eu', '2026-04-01'::timestamptz + (i*interval '1 hour'), 'ok', '{"r":"eu"}'::jsonb FROM generate_series(1,40) i;
+INSERT INTO regional (region, ts, status, data) SELECT 'us', '2026-01-20'::timestamptz + (i*interval '1 hour'), 'ok', '{"r":"us"}'::jsonb FROM generate_series(1,50) i;
+INSERT INTO regional (region, ts, status, data) SELECT 'us', '2026-02-12'::timestamptz + (i*interval '1 hour'), 'ok', '{"r":"us"}'::jsonb FROM generate_series(1,40) i;
+INSERT INTO regional (region, ts, status, data) SELECT 'us', '2026-03-08'::timestamptz + (i*interval '1 hour'), 'ok', '{"r":"us"}'::jsonb FROM generate_series(1,30) i;
+INSERT INTO regional (region, ts, status, data) SELECT 'us', '2026-04-02'::timestamptz + (i*interval '1 hour'), 'ok', '{"r":"us"}'::jsonb FROM generate_series(1,20) i;
+EOSQL
+    assert_eq "2-level seeded 420 rows" "420" "$(q "$HOST" "SELECT count(*) FROM public.regional;")"
+
+    local ret_days; ret_days=$(( ( $(date -u +%s) - $(date -u -d '2026-04-15' +%s) ) / 86400 ))  # cutoff 2026-04-15
+    cat > /tmp/journey-tl.yaml <<EOF
+postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
+iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog", namespace: "default" }
+s3:       { endpoint: "${SW_IP}:8333", region: "us-east-1", access_key: "admin", secret_key: "adminsecret" }
+archiver:
+  tables:
+    - source_table: regional
+      partition_column: ts
+      partition_period: monthly
+      hot_period: "${ret_days} days"
+      sub_partition: { values_source: "SELECT region FROM (VALUES ('eu'),('us')) r(region)" }
+EOF
+    if "$ARCHIVER" --config /tmp/journey-tl.yaml >/tmp/journey-tl.log 2>&1; then
+        pass "2-level archiver run completed (no flat-partitioning Fatal)"
+    else
+        fail "2-level archiver run — see /tmp/journey-tl.log"; tail -8 /tmp/journey-tl.log; return
+    fi
+
+    # Shape: the top becomes a view; the renamed hot table stays LIST-partitioned.
+    assert_eq "regional is now a view" "v" "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='regional';")"
+    assert_eq "_regional is the LIST hot table" "p" "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='_regional';")"
+
+    # Past-hot leaves (Jan-Mar) tiered away for BOTH regions; Apr leaves remain hot.
+    assert_eq "eu Jan leaf gone from hot"  "0" "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname='regional_eu_p_2026_01';")"
+    assert_eq "us Mar leaf gone from hot"  "0" "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname='regional_us_p_2026_03';")"
+    assert_eq "eu Apr leaf still hot"      "1" "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname='regional_eu_p_2026_04';")"
+    assert_eq "us Apr leaf still hot"      "1" "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname='regional_us_p_2026_04';")"
+
+    # Read correctness across the boundary (the view UNIONs hot + cold).
+    assert_eq "2-level total readable (hot+cold)" "420" "$(q "$HOST" "SELECT count(*) FROM regional;")"
+    assert_eq "eu total (240 cold + 40 hot)"      "280" "$(q "$HOST" "SELECT count(*) FROM regional WHERE region='eu';")"
+    assert_eq "us total (120 cold + 20 hot)"      "140" "$(q "$HOST" "SELECT count(*) FROM regional WHERE region='us';")"
+    # Cold side is region-usable: a region-filtered cold read returns that region only.
+    assert_eq "eu cold rows (Jan-Mar) present"    "240" "$(q "$HOST" "SELECT count(*) FROM regional WHERE region='eu' AND ts < '2026-04-01';")"
+    assert_eq "old eu Jan leaf rows live in cold" "100" "$(q "$HOST" "SELECT count(*) FROM regional WHERE region='eu' AND ts >= '2026-01-01' AND ts < '2026-02-01';")"
+
+    # Idempotency / cross-region wipe guard: a second run must NOT lose cold rows
+    # (a region-blind Phase-0 wipe would under-count here).
+    "$ARCHIVER" --config /tmp/journey-tl.yaml >/tmp/journey-tl2.log 2>&1
+    assert_eq "re-run keeps all cold rows (region-scoped wipe)" "420" "$(q "$HOST" "SELECT count(*) FROM regional;")"
+    assert_eq "re-run keeps eu cold rows" "240" "$(q "$HOST" "SELECT count(*) FROM regional WHERE region='eu' AND ts < '2026-04-01';")"
+}
+
 # ── orchestrate ────────────────────────────────────────────────────────────
 # Setup is shared. The story set then branches on mode: tiered exercises the
 # hot+cold partitioned path; decoupled exercises the all-Iceberg wrapper. (The
@@ -809,6 +892,7 @@ if [ "$MODE" = "tiered" ]; then
     story_txn
     story_coexist
     story_cold_retention
+    story_tiered_twolevel
 else
     story_provision_decoupled
     story_decoupled_crud

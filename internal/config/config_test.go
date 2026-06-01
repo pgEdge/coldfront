@@ -256,6 +256,23 @@ func TestValidate_TieredRejectsIdMode(t *testing.T) {
 	assert.Contains(t, err.Error(), "part_mode")
 }
 
+func TestValidate_SubPartitionRequiresColumn(t *testing.T) {
+	cfg := `
+postgres:
+  dsn: "host=localhost dbname=mydb"
+archiver:
+  tables:
+    - source_table: "events"
+      partition_period: "monthly"
+      retention_period: "12 months"
+      sub_partition:
+        values_source: "SELECT code FROM regions"
+`
+	_, err := Load(writeConfig(t, cfg))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "partition_column")
+}
+
 func TestValidate_PartitionOnlyRejectsHotPeriod(t *testing.T) {
 	cfg := `
 postgres:

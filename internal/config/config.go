@@ -180,10 +180,11 @@ func (c *Config) Validate() error {
 		// must exceed hot_period. Partition-only: retention_period (drop the hot
 		// partition) is required; hot_period is meaningless without a cold tier.
 		if icebergMode {
-			// The cold tier is time-only (timestamp partition key, timestamptz
-			// Iceberg writes). id mode and 2-level sub-partitioning are
-			// partition-only features the tiered archiver cannot execute — reject
-			// them at config load rather than fail cryptically at runtime.
+			// The cold tier is time-only (timestamp RANGE key, timestamptz Iceberg
+			// writes). id mode keys partitions on a non-time id, which the cold
+			// tier cannot express — reject it at config load rather than fail
+			// cryptically at runtime. (2-level LIST→RANGE is supported: the RANGE
+			// level is still time, region is just a column.)
 			if t.PartMode != "" && t.PartMode != partition.PartModeTimestamp {
 				return fmt.Errorf("archiver.tables[%d].part_mode %q is only valid in partition-only mode; the cold tier is time-only", i, t.PartMode)
 			}
@@ -217,8 +218,15 @@ func (c *Config) Validate() error {
 		if _, err := partition.BoundaryFor(t.PartMode, t.IDScheme); err != nil {
 			return fmt.Errorf("archiver.tables[%d]: %w", i, err)
 		}
-		if t.SubPartition != nil && t.SubPartition.ValuesSource == "" {
-			return fmt.Errorf("archiver.tables[%d].sub_partition.values_source is required", i)
+		if t.SubPartition != nil {
+			if t.SubPartition.ValuesSource == "" {
+				return fmt.Errorf("archiver.tables[%d].sub_partition.values_source is required", i)
+			}
+			// 2-level tables need the RANGE (time) column explicitly: on a first
+			// run no LIST child exists yet to auto-detect it from.
+			if t.PartitionColumn == "" {
+				return fmt.Errorf("archiver.tables[%d].partition_column is required for 2-level (sub_partition) tables", i)
+			}
 		}
 	}
 	return nil
