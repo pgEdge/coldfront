@@ -40,17 +40,25 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	// Management subcommands (register/list/…) route to the shared CLI; with no
-	// subcommand the archiver does its default archive run.
-	if len(os.Args) >= 2 && !strings.HasPrefix(os.Args[1], "-") {
+	const defaultDesc = "run one tiering/archive cycle"
+	// Top-level help / overview — no args, or help/-h/--help — lists the
+	// management subcommands so they are discoverable.
+	if len(os.Args) < 2 || os.Args[1] == "help" || os.Args[1] == "-h" || os.Args[1] == "--help" {
+		partcfg.PrintTopLevelUsage(os.Stdout, "archiver", defaultDesc)
+		return
+	}
+	// A management subcommand routes to the shared CLI; with no subcommand the
+	// archiver does its default archive run (--config below).
+	if !strings.HasPrefix(os.Args[1], "-") {
 		if partcfg.IsCommand(os.Args[1]) {
 			if err := partcfg.Run(ctx, os.Args[1], os.Args[2:]); err != nil {
 				log.Fatalf("%s: %v", os.Args[1], err)
 			}
 			return
 		}
-		log.Fatalf("unknown subcommand %q; expected one of: %s (or pass --config to run the archiver)",
-			os.Args[1], strings.Join(partcfg.CommandNames(), ", "))
+		fmt.Fprintf(os.Stderr, "unknown subcommand %q\n\n", os.Args[1])
+		partcfg.PrintTopLevelUsage(os.Stderr, "archiver", defaultDesc)
+		os.Exit(2)
 	}
 
 	configPath := flag.String("config", "config.yaml", "path to config file")

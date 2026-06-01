@@ -316,7 +316,7 @@ Setting `hot_period` makes a table tiered; omitting it makes it partition-only.
 | `set` | change fields, or `--disable`/`--enable` a table |
 | `remove` | stop managing a table (the table itself is left intact) |
 | `import` | seed `partition_config` from a YAML's `archiver.tables` (migration) |
-| `export` | dump to YAML or SQL — a git-reviewable copy (the config-as-code clawback) |
+| `export` | dump the **active (enabled)** config to YAML or SQL — a git-reviewable copy |
 
 ```bash
 # Partition-only: keep 3 future partitions, drop those older than 12 months.
@@ -339,15 +339,18 @@ partitioner set    --config cf.yaml --table events --retention "24 months"
 partitioner set    --config cf.yaml --table events --disable   # pause (keeps the row)
 partitioner remove --config cf.yaml --table events       # unregister, keep the table
 partitioner import --config legacy.yaml                  # migrate a YAML's tables
-partitioner export --config cf.yaml > managed.yaml       # git-reviewable copy
+partitioner export --config cf.yaml > managed.yaml       # active config, git-reviewable (--format sql for INSERTs)
 ```
 
-Every subcommand has detailed `--help` with worked examples. The write commands
-accept `--print-sql` (emit the SQL without running it — review/commit it) and
-`--dry-run`. Per table, only the cadence and a destroy boundary are required;
-`partition_column` is auto-detected from `pg_catalog` for flat tables (required
-for 2-level). `register` writes a row whose `CHECK` constraints enforce the
-lifecycle rules at write time.
+Run `partitioner` (or `archiver`) with no arguments, `help`, or `--help` for the
+command overview; every subcommand has detailed `--help` with worked examples.
+The write commands accept `--print-sql` (emit the SQL without running it —
+review/commit it) and `--dry-run`. `set --enable`/`--disable` (mutually
+exclusive) pause/resume a table without removing it; a disabled table is skipped
+by reconcile and omitted from `export`. Per table, only the cadence and a destroy
+boundary are required; `partition_column` is auto-detected from `pg_catalog` for
+flat tables (required for 2-level). `register` writes a row whose `CHECK`
+constraints enforce the lifecycle rules at write time.
 
 **YAML `archiver.tables` still works** as a deprecation bridge: when
 `partition_config` is empty the binaries fall back to a YAML table list. Move off

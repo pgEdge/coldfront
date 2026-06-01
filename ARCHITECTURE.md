@@ -248,7 +248,7 @@ registry's `hot_table` — never by string, so it is schema-agnostic):
 | `ALTER TABLE _t ADD/DROP COLUMN`, `ALTER COLUMN ... TYPE`, `RENAME COLUMN` | **Blocked by design** — duckdb-iceberg (pg_duckdb v1.1.1) cannot `ALTER` an Iceberg table, so the hot and cold tiers would diverge. The hook raises an actionable error; to change the schema, untier the table, alter it, then re-tier. |
 | `ALTER TABLE _t RENAME TO ...` | Supported (touches no Iceberg schema): update `tiered_views.hot_table`, rebuild the view. |
 | `ALTER VIEW v RENAME TO ...` | Supported: migrate the name-keyed registry + `archive_watermark` rows to the new view name, then rebuild (otherwise the lookups miss and the cold UNION branch silently disappears). |
-| `DROP TABLE _t` / `DROP VIEW v` | **Blocked by design** — would orphan the Iceberg cold tier. Dismantling tiering is a deliberate operator action (unregister + drop each tier explicitly), never a one-shot call. |
+| `DROP TABLE _t` / `DROP VIEW v` | **Blocked by design** — would orphan the Iceberg cold tier. Dismantling tiering is a deliberate operator action (unregister with `partitioner remove`/`archiver remove`, which deletes the `partition_config` row, then drop each tier explicitly), never a one-shot call. |
 | `TRUNCATE _t` | **Blocked by design** — cold-tier rows would remain visible through the view. The operator truncates each tier explicitly. |
 
 The view rebuild always does `DROP VIEW` + `CREATE VIEW` (not
@@ -301,6 +301,27 @@ tiered tables work with no per-node re-resolution — see
 Lower-level operations that genuinely need an OID — catalog lookups, the DDL
 hook matching the hot heap — resolve name→OID via `to_regclass` / `get_rel_name`
 at the point of use: names everywhere, OIDs only where required.
+
+### Per-table config: `coldfront.partition_config`
+
+Which tables are managed and their lifecycle (`hot_period`, `retention_period`,
+`partition_period`, premake, mode) live in `coldfront.partition_config` — like
+`tiered_views` and `archive_watermark` above, a **name-keyed** table that
+replicates **by value** across a Spock mesh. It is auto-added to the default
+replication set on a spock node (a no-op on vanilla, where there is one node), so
+every node reads identical config with no per-node file syncing — the same
+property that motivates name-keying everywhere else. `CHECK` constraints encode
+the lifecycle rules (a destroy boundary is required; `id` mode forbids a hot
+tier — the cold tier is time-only; 2-level needs an explicit RANGE column), so an
+invalid row is rejected at write time. The standalone partitioner
+self-materializes the table on stock PostgreSQL via `EnsureTable`, needing no
+extension. Connection config (DSN, Iceberg/S3 credentials) is deliberately **not**
+stored here — it is per-node and must never ride the replication stream.
+
+Both binaries read this table (the YAML `archiver.tables` list is a deprecation
+bridge, used only when the table is empty) and expose a management CLI —
+`register` / `list` / `set` / `remove` / `import` / `export` — documented in the
+[README](README.md#managing-partitioned-tables-cli).
 
 ## Known Limitations
 
@@ -407,7 +428,7 @@ couple the catalog's availability and load to a data node and would drag
 contrib into the ColdFront image for no reason; the dedicated store keeps the
 ColdFront image lean (core `uuid` type only, no uuid-ossp).
 
-## Upstream Requests
+## Upstream Requests (Potentially)
 
 Behaviours in upstream projects that ColdFront works around, kept as
 architectural notes: the gap, the workaround in use today, and the shape of

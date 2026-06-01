@@ -2,6 +2,7 @@ package partcfg
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"io"
@@ -18,32 +19,81 @@ import (
 	"github.com/pgedge/coldfront/internal/partition"
 )
 
-// Commands is the set of management subcommands both binaries expose. Each runs
-// against coldfront.partition_config (the replicated source of truth) and is a
-// thin, dependency-free SQL operation — so it works identically on a vanilla
-// stock-PG partitioner node and an iceberg-backed archiver node.
-var Commands = map[string]func(ctx context.Context, args []string) error{
-	"register": runRegister,
-	"list":     runList,
-	"set":      runSet,
-	"remove":   runRemove,
-	"import":   runImport,
-	"export":   runExport,
+// command is one management subcommand: its name, a one-line summary for the
+// top-level overview, and its handler. This slice is the SINGLE source for both
+// dispatch (Run/IsCommand) and the overview (PrintTopLevelUsage), so adding a
+// command in one place can't drift from the other. Each handler runs against
+// coldfront.partition_config (the replicated source of truth) as a thin,
+// dependency-free SQL operation — identical on a vanilla stock-PG partitioner
+// node and an iceberg-backed archiver node.
+type command struct {
+	name, summary string
+	run           func(ctx context.Context, args []string) error
+}
+
+var commands = []command{
+	{"register", "add or adopt a partitioned table (validates the PK covers the partition key)", runRegister},
+	{"list", "show the managed tables and their lifecycle", runList},
+	{"set", "change a managed table's fields, or --enable / --disable it", runSet},
+	{"remove", "stop managing a table (the table itself is left intact)", runRemove},
+	{"import", "seed the config table from a deployment YAML's archiver.tables", runImport},
+	{"export", "dump the active config to YAML or SQL (a git-reviewable copy)", runExport},
 }
 
 // IsCommand reports whether name is a management subcommand (so the binary
 // routes to it instead of its default reconcile/archive run).
-func IsCommand(name string) bool { _, ok := Commands[name]; return ok }
-
-// Run dispatches a management subcommand. args is everything after the
-// subcommand word.
-func Run(ctx context.Context, name string, args []string) error {
-	return Commands[name](ctx, args)
+func IsCommand(name string) bool {
+	for _, c := range commands {
+		if c.name == name {
+			return true
+		}
+	}
+	return false
 }
 
-// CommandNames returns the subcommand words, for the binary's top-level usage.
+// Run dispatches a management subcommand (args is everything after the
+// subcommand word). An explicit --help prints the subcommand's usage and is
+// treated as success (exit 0), not an error.
+func Run(ctx context.Context, name string, args []string) error {
+	for _, c := range commands {
+		if c.name == name {
+			err := c.run(ctx, args)
+			if errors.Is(err, flag.ErrHelp) {
+				return nil
+			}
+			return err
+		}
+	}
+	return fmt.Errorf("unknown command %q", name)
+}
+
+// CommandNames returns the subcommand words in order.
 func CommandNames() []string {
-	return []string{"register", "list", "set", "remove", "import", "export"}
+	names := make([]string, len(commands))
+	for i, c := range commands {
+		names[i] = c.name
+	}
+	return names
+}
+
+// PrintTopLevelUsage prints the program synopsis + the subcommand overview, so
+// the management commands are discoverable from `<binary>` / `<binary> --help`.
+// defaultDesc says what the binary does with no subcommand (its --config run).
+func PrintTopLevelUsage(w io.Writer, prog, defaultDesc string) {
+	_, _ = fmt.Fprintf(w, `%s — coldfront partition lifecycle management.
+
+USAGE:
+  %s --config <yaml>      %s
+  %s <command> [flags]    manage the partition_config table (any node; replicates on a mesh)
+
+COMMANDS:
+`, prog, prog, defaultDesc, prog)
+	tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
+	for _, c := range commands {
+		_, _ = fmt.Fprintf(tw, "  %s\t%s\n", c.name, c.summary)
+	}
+	_ = tw.Flush()
+	_, _ = fmt.Fprintf(w, "\nRun \"%s <command> --help\" for detailed help and examples.\n", prog)
 }
 
 // addConn registers the shared --dsn / --config connection flags on fs and
@@ -201,8 +251,9 @@ func runList(ctx context.Context, args []string) error {
 USAGE:
   <binary> list (--dsn <dsn> | --config <yaml>)
 
-EXAMPLE:
-  partitioner list --config cf.yaml
+EXAMPLES:
+  partitioner list --config cf.yaml             # connect via the deployment YAML's DSN
+  archiver     list --dsn "host=db dbname=app"  # or pass a DSN directly
 
 FLAGS:
 `)
@@ -513,8 +564,9 @@ removed. Drop the table separately if you intend to destroy the data.
 USAGE:
   <binary> remove --table <name> (--dsn <dsn> | --config <yaml>)
 
-EXAMPLE:
-  partitioner remove --config cf.yaml --table events`)
+EXAMPLES:
+  partitioner remove --config cf.yaml --table events              # unregister
+  partitioner remove --config cf.yaml --table events --print-sql  # review the DELETE first`)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -619,23 +671,26 @@ EXAMPLES:
 	return nil
 }
 
-// runExport dumps the managed tables back to YAML (round-trippable config) or as
-// INSERT SQL — the GitOps clawback: keep a reviewable copy in git.
+// runExport dumps the active (enabled) managed tables to YAML or INSERT SQL —
+// the GitOps clawback: keep a reviewable copy in git. Disabled tables (set
+// --disable) are not included; the disabled state is management-only and not
+// represented in the exported config.
 func runExport(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("export", flag.ContinueOnError)
 	connect := addConn(fs)
 	format := fs.String("format", "yaml", "output format: yaml | sql")
-	fs.Usage = simpleUsage(fs, "export", `export — dump partition_config to reviewable config (yaml) or INSERT SQL.
+	fs.Usage = simpleUsage(fs, "export", `export — dump the active (enabled) config to YAML or INSERT SQL.
 
 The GitOps clawback: commit the output to keep an auditable, version-controlled
-copy of what is being managed.
+copy of what is being managed. NOTE: only ENABLED tables are exported — a table
+paused with "set --disable" is omitted (its disabled state is not round-tripped).
 
 USAGE:
   <binary> export [--format yaml|sql] (--dsn <dsn> | --config <yaml>)
 
 EXAMPLES:
-  partitioner export --config cf.yaml > managed.yaml      # round-trippable YAML
-  partitioner export --config cf.yaml --format sql        # INSERT statements`)
+  partitioner export --config cf.yaml > managed.yaml      # active config as YAML
+  partitioner export --config cf.yaml --format sql        # active config as INSERT statements`)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}

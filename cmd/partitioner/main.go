@@ -9,6 +9,7 @@ package main
 import (
 	"context"
 	"flag"
+	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -27,17 +28,25 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	// Management subcommands (register/list/…) route to the shared CLI; with no
-	// subcommand the partitioner does its default reconcile run.
-	if len(os.Args) >= 2 && !strings.HasPrefix(os.Args[1], "-") {
+	const defaultDesc = "run one partition-maintenance reconcile pass"
+	// Top-level help / overview — no args, or help/-h/--help — lists the
+	// management subcommands so they are discoverable.
+	if len(os.Args) < 2 || os.Args[1] == "help" || os.Args[1] == "-h" || os.Args[1] == "--help" {
+		partcfg.PrintTopLevelUsage(os.Stdout, "partitioner", defaultDesc)
+		return
+	}
+	// A management subcommand routes to the shared CLI; with no subcommand the
+	// partitioner does its default reconcile run (--config below).
+	if !strings.HasPrefix(os.Args[1], "-") {
 		if partcfg.IsCommand(os.Args[1]) {
 			if err := partcfg.Run(ctx, os.Args[1], os.Args[2:]); err != nil {
 				log.Fatalf("%s: %v", os.Args[1], err)
 			}
 			return
 		}
-		log.Fatalf("unknown subcommand %q; expected one of: %s (or pass --config to reconcile)",
-			os.Args[1], strings.Join(partcfg.CommandNames(), ", "))
+		fmt.Fprintf(os.Stderr, "unknown subcommand %q\n\n", os.Args[1])
+		partcfg.PrintTopLevelUsage(os.Stderr, "partitioner", defaultDesc)
+		os.Exit(2)
 	}
 
 	cfgPath := flag.String("config", "", "path to the YAML config file")
