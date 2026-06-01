@@ -162,14 +162,23 @@ See also [ARCHITECTURE.md → Upstream Requests](ARCHITECTURE.md#upstream-reques
 
 The standalone partition manager (`cmd/partitioner`, `internal/partition`) is
 feature-complete and unit-tested: time/id modes (uuidv7, snowflake), 2-level
-LIST→RANGE, behind-detection. Remaining work before/around merging it:
+LIST→RANGE, behind-detection. The data-lifecycle model is now explicit and
+un-conflated — **hot →`hot_period`→ cold →`retention_period`→ gone** (tiered);
+**hot →`retention_period`→ gone** (partition-only) — with the archiver tiering
+past `hot_period` and dropping cold Iceberg data past `retention_period`.
+Remaining work before/around merging it:
 
-- **Rewire the cold-tier archiver onto `RunReconcile`.** `cmd/archiver`'s
-  `runCycle` still premakes / finds-expired by calling `Manager.EnsureFuture` /
-  `FindExpired` directly, with its own atomic-cutover detach inside
-  `archivePartition`. Fold it onto `RunReconcile` with an `ExpireFunc` that owns
-  the cutover (the seam already exists), so both products share one reconcile
-  path. Must stay byte-for-byte behaviour-preserving for the cold tier.
+- **Optionally share `RunReconcile`'s premake/find primitives with the
+  archiver.** The two products genuinely share only *plumbing* — premake the
+  forward window, ensure the current period, find partitions past an age cutoff.
+  They do **not** share a *policy*: partition-only eviction is a stateless
+  `DROP`, whereas the archiver's tier-to-cold is a stateful boundary advance
+  (watermark + atomic cutover) that must not be modelled as "expiration". A
+  rewire should share the primitives and keep the boundary-crossing as the
+  archiver's own clearly-named operation (an `OnEvict`-style hook with `drop` vs
+  `tier` implementations) — *not* fold the whole archiver through an
+  `ExpireFunc` named for removal. Lower priority now that the lifecycle split has
+  removed the vocabulary conflation; the DRY win is small.
 - **Scripted strip to a partition-only build.** The one-way dependency rule
   (iceberg → partition-core, enforced by `cmd/partitioner/arch_test.go`) makes a
   cut possible: a script that deletes the iceberg layer (C extension,

@@ -40,7 +40,9 @@ archiver:
   tables:
     - source_table: events
       partition_period: monthly
-      retention_period: 1 month
+      hot_period: 1 month          # tier hot PG → cold Iceberg past this age
+      # retention_period: 5 years  # optional: DROP cold data past this age
+      #                            # (must exceed hot_period; omit = keep forever)
 ```
 
 Run the archiver (typically via cron):
@@ -49,7 +51,7 @@ Run the archiver (typically via cron):
 ./bin/archiver --config config.yaml
 ```
 
-The first run renames `events` → `_events`, creates the unified view `events`, and registers it. From then on every cycle moves expired partitions hot → cold and updates the watermark.
+The first run renames `events` → `_events`, creates the unified view `events`, and registers it. From then on every cycle (1) tiers partitions older than `hot_period` from hot PG to cold Iceberg and advances the watermark, and (2) if `retention_period` is set, drops cold Iceberg rows older than it. The data lifecycle is **hot → `hot_period` → cold → `retention_period` → gone**; omit `retention_period` to keep cold data forever.
 
 ## Mode 2 — Decoupled (iceberg-only)
 

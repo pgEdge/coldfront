@@ -16,11 +16,14 @@ archiver:
   tables:
     - source_table: "events"        # or "myschema.events"
       partition_period: "monthly"   # "monthly" or "daily"
-      retention_period: "3 months"
+      hot_period: "3 months"        # tier hot PG → cold Iceberg past this age
+      # retention_period: "5 years" # optional: DROP cold Iceberg data past this
+      #                             # age (must exceed hot_period). Omit to keep
+      #                             # cold data forever.
       # Optional (auto-detected or defaulted):
       # partition_column: "ts"      # auto-detected from pg_catalog
       # future_partitions: 3        # default: 3
 
     # - source_table: "logs"
     #   partition_period: "daily"
-    #   retention_period: "7 days"
+    #   hot_period: "7 days"

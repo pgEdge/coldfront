@@ -26,7 +26,7 @@ archiver:
   tables:
     - source_table: "events"
       partition_period: "monthly"
-      retention_period: "3 months"
+      hot_period: "3 months"
 `
 
 func writeConfig(t *testing.T, content string) string {
@@ -73,10 +73,10 @@ archiver:
   tables:
     - source_table: "events"
       partition_period: "monthly"
-      retention_period: "3 months"
+      hot_period: "3 months"
     - source_table: "analytics.logs"
       partition_period: "daily"
-      retention_period: "7 days"
+      hot_period: "7 days"
 `
 	c, err := Load(writeConfig(t, cfg))
 	require.NoError(t, err)
@@ -202,8 +202,8 @@ archiver:
 	assert.Contains(t, err.Error(), "at least one")
 }
 
-func TestValidate_MissingRetentionPeriod(t *testing.T) {
-	cfg := `
+func tieredCfg(tail string) string {
+	return `
 postgres:
   dsn: "host=localhost"
 iceberg:
@@ -217,10 +217,52 @@ archiver:
   tables:
     - source_table: "t"
       partition_period: "monthly"
+` + tail
+}
+
+func TestValidate_TieredRequiresHotPeriod(t *testing.T) {
+	// Tiered mode: hot_period (tier-to-cold age) is mandatory; retention is not.
+	_, err := Load(writeConfig(t, tieredCfg("")))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "hot_period")
+}
+
+func TestValidate_TieredRetentionOptional(t *testing.T) {
+	// hot_period alone is valid — cold data is kept forever (no cold expiry).
+	c, err := Load(writeConfig(t, tieredCfg(`      hot_period: "1 month"`)))
+	require.NoError(t, err)
+	assert.Equal(t, "1 month", c.Archiver.Tables[0].HotPeriod)
+	assert.Empty(t, c.Archiver.Tables[0].RetentionPeriod)
+}
+
+func TestValidate_TieredColdRetentionOK(t *testing.T) {
+	c, err := Load(writeConfig(t, tieredCfg("      hot_period: \"1 month\"\n      retention_period: \"12 months\"")))
+	require.NoError(t, err)
+	assert.Equal(t, "1 month", c.Archiver.Tables[0].HotPeriod)
+	assert.Equal(t, "12 months", c.Archiver.Tables[0].RetentionPeriod)
+}
+
+func TestValidate_TieredRetentionMustExceedHot(t *testing.T) {
+	// retention_period <= hot_period would destroy data before it ever tiers.
+	_, err := Load(writeConfig(t, tieredCfg("      hot_period: \"3 months\"\n      retention_period: \"1 month\"")))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "must exceed hot_period")
+}
+
+func TestValidate_PartitionOnlyRejectsHotPeriod(t *testing.T) {
+	cfg := `
+postgres:
+  dsn: "host=localhost dbname=mydb"
+archiver:
+  tables:
+    - source_table: "events"
+      partition_period: "monthly"
+      retention_period: "12 months"
+      hot_period: "1 month"
 `
 	_, err := Load(writeConfig(t, cfg))
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "retention_period")
+	assert.Contains(t, err.Error(), "hot_period")
 }
 
 func TestValidate_PartitionOnly_NoIcebergOK(t *testing.T) {

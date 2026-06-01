@@ -112,7 +112,7 @@ archiver:
   tables:
     - source_table: events
       partition_period: monthly
-      retention_period: "${ret_days} days"
+      hot_period: "${ret_days} days"
 EOF
 make -s build >/dev/null 2>&1 || go build -o bin/archiver ./cmd/archiver
 if "$ARCHIVER" --config /tmp/probe-archiver.yaml >/tmp/probe-archiver.log 2>&1; then

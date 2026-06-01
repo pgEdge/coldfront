@@ -113,7 +113,7 @@ archiver:
   tables:
     - source_table: events
       partition_period: monthly
-      retention_period: "${ret_days} days"
+      hot_period: "${ret_days} days"
 EOF
     if "$ARCHIVER" --config /tmp/journey-archiver.yaml >/tmp/journey-archiver.log 2>&1; then
         pass "archiver first run completed"
@@ -124,6 +124,57 @@ EOF
     assert_eq "events is now a view" "v" "$relkind"
     local wm; wm=$(q "$HOST" "SELECT count(*) FROM coldfront.archive_watermark WHERE table_name='events';")
     assert_eq "watermark registered" "1" "$wm"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story — cold retention: a second archiver run with retention_period set drops
+# Iceberg data older than it (the destroy end of the lifecycle: hot →hot_period→
+# cold →retention_period→ gone). By now Jan–Mar are already cold and Apr is hot,
+# so nothing is past the hot window — this exercises the cold-expiry-only path.
+# The retention cutoff (2026-02-01) drops the Jan cold rows and keeps Feb/Mar.
+# Runs last so it doesn't perturb earlier stories' counts; jan_before is read
+# dynamically so the row-math holds regardless of what else landed in cold.
+# ───────────────────────────────────────────────────────────────────────────
+story_cold_retention() {
+    step "Cold retention: drop Iceberg data past retention_period"
+    local before jan_before
+    before=$(q "$HOST" "SELECT count(*) FROM events;")
+    jan_before=$(q "$HOST" "SELECT count(*) FROM events WHERE ts >= '2026-01-01' AND ts < '2026-02-01';")
+    assert_gt "Jan cold rows present before retention" "0" "$jan_before"
+
+    local ret_days ret_long
+    ret_days=$(( ( $(date -u +%s) - $(date -u -d '2026-04-15' +%s) ) / 86400 ))   # hot cutoff  = 2026-04-15
+    ret_long=$(( ( $(date -u +%s) - $(date -u -d '2026-02-01' +%s) ) / 86400 ))    # drop cutoff = 2026-02-01
+    cat > /tmp/journey-coldret.yaml <<EOF
+postgres:
+  dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
+iceberg:
+  warehouse: "${WAREHOUSE}"
+  lakekeeper_endpoint: "http://${LK_IP}:8181/catalog"
+  namespace: "default"
+s3:
+  endpoint: "${SW_IP}:8333"
+  region: "us-east-1"
+  access_key: "admin"
+  secret_key: "adminsecret"
+archiver:
+  tables:
+    - source_table: events
+      partition_period: monthly
+      hot_period: "${ret_days} days"
+      retention_period: "${ret_long} days"
+EOF
+    if "$ARCHIVER" --config /tmp/journey-coldret.yaml >/tmp/journey-coldret.log 2>&1; then
+        pass "archiver cold-retention run completed"
+    else
+        fail "archiver cold-retention run — see /tmp/journey-coldret.log"; tail -5 /tmp/journey-coldret.log
+    fi
+    assert_eq "Jan cold rows dropped by retention" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM events WHERE ts >= '2026-01-01' AND ts < '2026-02-01';")"
+    assert_gt "Feb cold rows retained" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM events WHERE ts >= '2026-02-01' AND ts < '2026-03-01';")"
+    assert_eq "exactly the past-retention rows were removed" "$((before - jan_before))" \
+        "$(q "$HOST" "SELECT count(*) FROM events;")"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -276,7 +327,7 @@ EOSQL
 postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
 iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog", namespace: "default" }
 s3:       { endpoint: "${SW_IP}:8333", region: "us-east-1", access_key: "admin", secret_key: "adminsecret" }
-archiver: { tables: [ { source_table: typed, partition_period: monthly, retention_period: "${ret_days} days" } ] }
+archiver: { tables: [ { source_table: typed, partition_period: monthly, hot_period: "${ret_days} days" } ] }
 EOF
     "$ARCHIVER" --config /tmp/journey-typed.yaml >/tmp/journey-typed.log 2>&1 \
         && pass "typed table archived (Jan → cold)" || { fail "typed archive — see /tmp/journey-typed.log"; tail -5 /tmp/journey-typed.log; }
@@ -456,7 +507,7 @@ EOSQL
 postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
 iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog", namespace: "default" }
 s3:       { endpoint: "${SW_IP}:8333", region: "us-east-1", access_key: "admin", secret_key: "adminsecret" }
-archiver: { tables: [ { source_table: events, partition_period: monthly, retention_period: "${ret_race} days" } ] }
+archiver: { tables: [ { source_table: events, partition_period: monthly, hot_period: "${ret_race} days" } ] }
 EOF
     "$ARCHIVER" --config /tmp/journey-race.yaml --debug-export-delay 4s >/tmp/journey-race.log 2>&1 &
     local apid=$!
@@ -517,7 +568,7 @@ EOSQL
 )
     assert_eq "rollback undoes hot+cold" "0" "$(extract RB_TOTAL "$O")"
     "$ARCHIVER" --config /tmp/journey-archiver.yaml >/tmp/journey-idem.log 2>&1 \
-        && assert_contains "archiver idempotent (re-run no-op)" "no expired" "$(cat /tmp/journey-idem.log)" \
+        && assert_contains "archiver idempotent (re-run no-op)" "nothing to tier or expire" "$(cat /tmp/journey-idem.log)" \
         || fail "archiver idempotent re-run errored"
 }
 
@@ -757,6 +808,7 @@ if [ "$MODE" = "tiered" ]; then
     story_concurrent_writers
     story_txn
     story_coexist
+    story_cold_retention
 else
     story_provision_decoupled
     story_decoupled_crud

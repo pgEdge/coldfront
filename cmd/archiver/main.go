@@ -239,107 +239,141 @@ func runCycle(ctx context.Context, cfg *config.Config, t *config.TableConfig, po
 		return fmt.Errorf("ensure future partitions: %w", err)
 	}
 
-	// 2. Find expired partitions
-	retention, err := partition.ParseRetention(t.RetentionPeriod)
+	// 2. Find partitions past the hot window — the tier-to-cold candidates.
+	hot, err := partition.ParseRetention(t.HotPeriod)
 	if err != nil {
-		return fmt.Errorf("parse retention: %w", err)
+		return fmt.Errorf("parse hot_period: %w", err)
 	}
-	expired, err := partMgr.FindExpired(ctx, tableName, t.SourceSchema, now.Add(-retention), partition.TimeBoundary{})
+	hotExpired, err := partMgr.FindExpired(ctx, tableName, t.SourceSchema, now.Add(-hot), partition.TimeBoundary{})
 	if err != nil {
 		return fmt.Errorf("find expired: %w", err)
 	}
-	if len(expired) == 0 {
-		log.Printf("[%s] no expired partitions", t.SourceTable)
+	// retention_period (optional) drops cold Iceberg data past its age — the
+	// destroy end of the lifecycle, distinct from the tier-to-cold above.
+	coldExpiry := t.RetentionPeriod != ""
+	if len(hotExpired) == 0 && !coldExpiry {
+		log.Printf("[%s] nothing to tier or expire", t.SourceTable)
 		return nil
 	}
-	log.Printf("[%s] found %d expired partition(s)", t.SourceTable, len(expired))
+	if len(hotExpired) > 0 {
+		log.Printf("[%s] found %d partition(s) past the hot window", t.SourceTable, len(hotExpired))
+	}
 
-	// 3. Attach Lakekeeper Iceberg catalog
+	// 3. Attach the Lakekeeper catalog and ensure the Iceberg table exists —
+	//    needed by both the tiering pass and the cold-expiry DELETE.
 	if err := attachIceberg(ctx, pool, cfg); err != nil {
 		return err
 	}
-
-	// 4. Ensure Iceberg namespace + table
 	if err := ensureIcebergTable(ctx, pool, cfg, t, iceTable); err != nil {
 		return fmt.Errorf("ensure iceberg table: %w", err)
 	}
 
-	// 5. Resolve columns once (used by every partition's cutover view DDL).
-	columns, err := getColumns(ctx, pool, t.SourceSchema, t.SourceTable)
-	if err != nil {
-		return fmt.Errorf("get columns: %w", err)
-	}
-	hasPK := false
-	for _, c := range columns {
-		if c.IsPK {
-			hasPK = true
-			break
+	// 4. Tiering pass: move each past-hot partition hot → cold.
+	if len(hotExpired) > 0 {
+		columns, err := getColumns(ctx, pool, t.SourceSchema, t.SourceTable)
+		if err != nil {
+			return fmt.Errorf("get columns: %w", err)
 		}
-	}
-	if !hasPK {
-		return fmt.Errorf(
-			"%s.%s has no primary key — required for race-safe archive (delta capture "+
-				"keys writes by source PK; without one we can't replay UPDATE/DELETE to Iceberg)",
-			t.SourceSchema, t.SourceTable)
-	}
-
-	// 6. First-cycle bootstrap: rename events → _events and create the unified
-	//    view with cutoff=zero (hot-only). Idempotent — the swap SQL no-ops if
-	//    the rename already happened. Runs once per first archive cycle.
-	wmCutoff, _, err := wmStore.Get(ctx, t.SourceTable)
-	if err != nil {
-		return fmt.Errorf("get watermark: %w", err)
-	}
-	bootstrapCfg := view.ViewConfig{
-		SourceSchema:    t.SourceSchema,
-		SourceTable:     t.SourceTable,
-		IcebergTable:    iceTable,
-		CutoffTime:      wmCutoff,
-		PartitionColumn: t.PartitionColumn,
-		Columns:         columns,
-	}
-	if err := viewGen.Recreate(ctx, bootstrapCfg); err != nil {
-		return fmt.Errorf("bootstrap view: %w", err)
-	}
-	hotTable := pgx.Identifier{t.SourceSchema, "_" + t.SourceTable}.Sanitize()
-	if err := registerTieredView(ctx, pool, t.SourceSchema, t.SourceTable,
-		hotTable, iceTable, t.PartitionColumn); err != nil {
-		return fmt.Errorf("register tiered view: %w", err)
-	}
-	tableName = resolveTableName(ctx, pool, t.SourceSchema, t.SourceTable)
-	_ = tableName // tableName resolution kept for any future use; archivePartition uses pg_inherits to find parent
-
-	// 7. Archive each expired partition via the 5-phase pipeline.
-	for _, part := range expired {
-		if err := ctx.Err(); err != nil {
-			return err
+		hasPK := false
+		for _, c := range columns {
+			if c.IsPK {
+				hasPK = true
+				break
+			}
+		}
+		if !hasPK {
+			return fmt.Errorf(
+				"%s.%s has no primary key — required for race-safe archive (delta capture "+
+					"keys writes by source PK; without one we can't replay UPDATE/DELETE to Iceberg)",
+				t.SourceSchema, t.SourceTable)
 		}
 
-		wmCutoff, found, err := wmStore.Get(ctx, t.SourceTable)
+		// First-cycle bootstrap: rename events → _events and create the unified
+		// view with cutoff=watermark. Idempotent — the swap SQL no-ops if the
+		// rename already happened.
+		wmCutoff, _, err := wmStore.Get(ctx, t.SourceTable)
 		if err != nil {
 			return fmt.Errorf("get watermark: %w", err)
 		}
-		if found && !part.UpperBound.After(wmCutoff) {
-			// Idempotent cleanup branch: partition was archived in a prior cycle,
-			// no race to worry about.
-			log.Printf("partition %s already archived, cleaning up", part.Name)
-			parent := resolveTableName(ctx, pool, t.SourceSchema, t.SourceTable)
-			if err := partMgr.Detach(ctx, parent, t.SourceSchema, part.Name); err != nil {
-				return fmt.Errorf("detach %s: %w", part.Name, err)
-			}
-			if err := partMgr.Drop(ctx, t.SourceSchema, part.Name); err != nil {
-				return fmt.Errorf("drop %s: %w", part.Name, err)
-			}
-			continue
+		bootstrapCfg := view.ViewConfig{
+			SourceSchema:    t.SourceSchema,
+			SourceTable:     t.SourceTable,
+			IcebergTable:    iceTable,
+			CutoffTime:      wmCutoff,
+			PartitionColumn: t.PartitionColumn,
+			Columns:         columns,
+		}
+		if err := viewGen.Recreate(ctx, bootstrapCfg); err != nil {
+			return fmt.Errorf("bootstrap view: %w", err)
+		}
+		hotTable := pgx.Identifier{t.SourceSchema, "_" + t.SourceTable}.Sanitize()
+		if err := registerTieredView(ctx, pool, t.SourceSchema, t.SourceTable,
+			hotTable, iceTable, t.PartitionColumn); err != nil {
+			return fmt.Errorf("register tiered view: %w", err)
 		}
 
-		if err := archivePartition(ctx, pool, t, part, iceTable, columns, debugExportDelay); err != nil {
-			return fmt.Errorf("archive %s: %w", part.Name, err)
+		// Archive each past-hot partition via the cutover pipeline.
+		for _, part := range hotExpired {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+
+			wmCutoff, found, err := wmStore.Get(ctx, t.SourceTable)
+			if err != nil {
+				return fmt.Errorf("get watermark: %w", err)
+			}
+			if found && !part.UpperBound.After(wmCutoff) {
+				// Idempotent cleanup branch: partition was archived in a prior cycle,
+				// no race to worry about.
+				log.Printf("partition %s already archived, cleaning up", part.Name)
+				parent := resolveTableName(ctx, pool, t.SourceSchema, t.SourceTable)
+				if err := partMgr.Detach(ctx, parent, t.SourceSchema, part.Name); err != nil {
+					return fmt.Errorf("detach %s: %w", part.Name, err)
+				}
+				if err := partMgr.Drop(ctx, t.SourceSchema, part.Name); err != nil {
+					return fmt.Errorf("drop %s: %w", part.Name, err)
+				}
+				continue
+			}
+
+			if err := archivePartition(ctx, pool, t, part, iceTable, columns, debugExportDelay); err != nil {
+				return fmt.Errorf("archive %s: %w", part.Name, err)
+			}
+			log.Printf("archived %s", part.Name)
 		}
-		log.Printf("archived %s", part.Name)
+	}
+
+	// 5. Cold-expiry pass: drop Iceberg data older than retention_period.
+	if coldExpiry {
+		retention, err := partition.ParseRetention(t.RetentionPeriod)
+		if err != nil {
+			return fmt.Errorf("parse retention_period: %w", err)
+		}
+		cutoff := now.Add(-retention)
+		if err := dropColdBeforeRetention(ctx, pool, iceTable, t.PartitionColumn, cutoff); err != nil {
+			return fmt.Errorf("cold expiry: %w", err)
+		}
+		log.Printf("[%s] expired cold rows older than %s", t.SourceTable, cutoff.Format("2006-01-02"))
 	}
 
 	return nil
+}
+
+// dropColdBeforeRetention deletes Iceberg rows whose partition column is older
+// than the retention cutoff — the destroy end of the tiered data lifecycle.
+// Routed through coldfront._exec_iceberg_with_claim so it serializes against
+// concurrent cold writers (R-A bakery on a mesh, advisory lock single-node),
+// the same no-409 guarantee as every other cold write.
+func dropColdBeforeRetention(ctx context.Context, pool *pgxpool.Pool, iceTable, partCol string, cutoff time.Time) error {
+	inner := fmt.Sprintf(
+		`DELETE FROM %s WHERE %s < '%s'::timestamptz`,
+		iceTable,
+		pgx.Identifier{partCol}.Sanitize(),
+		cutoff.UTC().Format("2006-01-02 15:04:05+00"))
+	sql := fmt.Sprintf(`SELECT coldfront._exec_iceberg_with_claim(%s, $q$%s$q$)`,
+		sqlutil.Literal(iceTable), inner)
+	_, err := pool.Exec(ctx, sql)
+	return err
 }
 
 // archivePartition runs the archive pipeline for one expired partition.

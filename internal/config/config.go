@@ -49,10 +49,16 @@ type ArchiverConfig struct {
 // its time column, the partition cadence, and how much history stays hot.
 // PartitionColumn is optional; if empty it is auto-detected from pg_catalog.
 type TableConfig struct {
-	SourceTable      string `yaml:"source_table"`
-	SourceSchema     string `yaml:"source_schema"`
-	PartitionColumn  string `yaml:"partition_column"`
-	PartitionPeriod  string `yaml:"partition_period"`
+	SourceTable     string `yaml:"source_table"`
+	SourceSchema    string `yaml:"source_schema"`
+	PartitionColumn string `yaml:"partition_column"`
+	PartitionPeriod string `yaml:"partition_period"`
+	// HotPeriod (tiered mode only) is the age at which a partition is tiered to
+	// cold Iceberg — data preserved, just relocated. RetentionPeriod is the age
+	// at which data is destroyed: in tiered mode it drops cold Iceberg rows past
+	// it (optional; omit = keep cold forever); in partition-only mode it drops
+	// the hot PG partition (required, no cold tier).
+	HotPeriod        string `yaml:"hot_period"`
 	RetentionPeriod  string `yaml:"retention_period"`
 	FuturePartitions int    `yaml:"future_partitions"`
 	// PartMode is "timestamp" (default) or "id". In id mode the partition
@@ -169,8 +175,35 @@ func (c *Config) Validate() error {
 			return fmt.Errorf("archiver.tables[%d].partition_period must be %q or %q",
 				i, partition.PeriodMonthly, partition.PeriodDaily)
 		}
-		if t.RetentionPeriod == "" {
-			return fmt.Errorf("archiver.tables[%d].retention_period is required", i)
+		// Lifecycle thresholds depend on mode. Tiered: hot_period (tier-to-cold
+		// age) is required; retention_period (drop cold data) is optional and
+		// must exceed hot_period. Partition-only: retention_period (drop the hot
+		// partition) is required; hot_period is meaningless without a cold tier.
+		if icebergMode {
+			if t.HotPeriod == "" {
+				return fmt.Errorf("archiver.tables[%d].hot_period is required in tiered mode", i)
+			}
+			hotDur, err := partition.ParseRetention(t.HotPeriod)
+			if err != nil {
+				return fmt.Errorf("archiver.tables[%d].hot_period: %w", i, err)
+			}
+			if t.RetentionPeriod != "" {
+				retDur, err := partition.ParseRetention(t.RetentionPeriod)
+				if err != nil {
+					return fmt.Errorf("archiver.tables[%d].retention_period: %w", i, err)
+				}
+				if retDur <= hotDur {
+					return fmt.Errorf("archiver.tables[%d].retention_period (%s) must exceed hot_period (%s)",
+						i, t.RetentionPeriod, t.HotPeriod)
+				}
+			}
+		} else {
+			if t.HotPeriod != "" {
+				return fmt.Errorf("archiver.tables[%d].hot_period is only valid in tiered mode (no iceberg/s3 configured)", i)
+			}
+			if t.RetentionPeriod == "" {
+				return fmt.Errorf("archiver.tables[%d].retention_period is required", i)
+			}
 		}
 		// part_mode / id_scheme: reuse BoundaryFor as the single validator of
 		// the valid set, so config and the partition core never drift.
