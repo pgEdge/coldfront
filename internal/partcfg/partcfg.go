@@ -1,0 +1,110 @@
+// Package partcfg is the in-DB store for per-table partition lifecycle config —
+// coldfront.partition_config, the unified source of truth that drives both the
+// standalone partitioner and the tiered archiver. On a Spock mesh the table is
+// replicated by value (name-keyed), so every node reads identical config; on
+// vanilla stock PG the partitioner self-materializes it via EnsureTable. Rows
+// map onto the existing config.TableConfig, so every downstream consumer
+// (runCycle, specFromTable) is unchanged. Connection config (DSN, iceberg/S3
+// creds) is deliberately NOT stored here — it is per-node and must never ride
+// the replication stream.
+package partcfg
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+
+	"github.com/vyruss/coldfront/internal/config"
+)
+
+// DBTX is the slice of pgxpool.Pool partcfg needs.
+type DBTX interface {
+	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
+	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
+}
+
+// createTableSQL mirrors the coldfront.partition_config DDL in the C extension
+// (coldfront--0.1.sql) so the vanilla partitioner — stock PG, no extension —
+// can self-materialize the same table. Keep the two in sync (same pattern as
+// archive_watermark / watermark.EnsureTable).
+const createTableSQL = `
+CREATE TABLE IF NOT EXISTS coldfront.partition_config (
+    schema_name            text    NOT NULL DEFAULT 'public',
+    table_name             text    NOT NULL,
+    partition_period       text    NOT NULL,
+    partition_column       text,
+    future_partitions      int     NOT NULL DEFAULT 3,
+    part_mode              text    NOT NULL DEFAULT 'timestamp',
+    id_scheme              text,
+    hot_period             text,
+    retention_period       text,
+    sub_part_values_source text,
+    enabled                boolean NOT NULL DEFAULT true,
+    PRIMARY KEY (schema_name, table_name),
+    CONSTRAINT pc_period_enum   CHECK (partition_period IN ('monthly','daily')),
+    CONSTRAINT pc_partmode_enum CHECK (part_mode IN ('timestamp','id')),
+    CONSTRAINT pc_id_scheme     CHECK ((part_mode = 'id') = (id_scheme IS NOT NULL)),
+    CONSTRAINT pc_scheme_enum   CHECK (id_scheme IS NULL OR id_scheme IN ('uuidv7','snowflake')),
+    CONSTRAINT pc_future_pos    CHECK (future_partitions >= 1),
+    CONSTRAINT pc_destroy       CHECK (hot_period IS NOT NULL OR retention_period IS NOT NULL),
+    CONSTRAINT pc_cold_timeonly CHECK (hot_period IS NULL OR part_mode = 'timestamp'),
+    CONSTRAINT pc_2level_col    CHECK (sub_part_values_source IS NULL OR partition_column IS NOT NULL)
+)`
+
+// EnsureTable idempotently creates the coldfront schema and partition_config
+// table. Safe to call every run; a no-op once the extension (or a prior run)
+// created it.
+func EnsureTable(ctx context.Context, db DBTX) error {
+	if _, err := db.Exec(ctx, `CREATE SCHEMA IF NOT EXISTS coldfront`); err != nil {
+		return fmt.Errorf("create schema: %w", err)
+	}
+	if _, err := db.Exec(ctx, createTableSQL); err != nil {
+		return fmt.Errorf("create partition_config: %w", err)
+	}
+	return nil
+}
+
+// LoadTables reads the enabled partition_config rows into the existing
+// config.TableConfig shape, so every downstream consumer is unchanged.
+func LoadTables(ctx context.Context, db DBTX) ([]config.TableConfig, error) {
+	rows, err := db.Query(ctx, `
+		SELECT schema_name, table_name, partition_period, partition_column,
+		       future_partitions, part_mode, id_scheme, hot_period,
+		       retention_period, sub_part_values_source
+		FROM coldfront.partition_config
+		WHERE enabled
+		ORDER BY schema_name, table_name`)
+	if err != nil {
+		return nil, fmt.Errorf("query partition_config: %w", err)
+	}
+	defer rows.Close()
+
+	var out []config.TableConfig
+	for rows.Next() {
+		var t config.TableConfig
+		var col, idScheme, hot, ret, subVals *string
+		if err := rows.Scan(&t.SourceSchema, &t.SourceTable, &t.PartitionPeriod, &col,
+			&t.FuturePartitions, &t.PartMode, &idScheme, &hot, &ret, &subVals); err != nil {
+			return nil, fmt.Errorf("scan partition_config: %w", err)
+		}
+		if col != nil {
+			t.PartitionColumn = *col
+		}
+		if idScheme != nil {
+			t.IDScheme = *idScheme
+		}
+		if hot != nil {
+			t.HotPeriod = *hot
+		}
+		if ret != nil {
+			t.RetentionPeriod = *ret
+		}
+		if subVals != nil {
+			t.SubPartition = &config.SubPartitionConfig{ValuesSource: *subVals}
+		}
+		out = append(out, t)
+	}
+	return out, rows.Err()
+}

@@ -58,6 +58,43 @@ CREATE TABLE IF NOT EXISTS coldfront.runtime_config (
 INSERT INTO coldfront.runtime_config (attach_on_login)
   SELECT false WHERE NOT EXISTS (SELECT 1 FROM coldfront.runtime_config);
 
+-- Per-table partition lifecycle config — the unified, name-keyed source of
+-- truth that drives BOTH the standalone partitioner (partition-only lifecycle:
+-- hot →retention_period→ dropped) and the tiered archiver (hot →hot_period→
+-- cold →retention_period→ dropped). hot_period presence is the per-ROW mode
+-- switch (NULL ⇒ partition-only). Name-keyed (schema,table — not OID, which
+-- diverges per node) so it replicates by value across a Spock mesh, exactly
+-- like coldfront.tiered_views / archive_watermark / claims. Connection config
+-- (DSN, iceberg/S3 creds) is NOT stored here — it is per-node and must never
+-- ride the replication stream. Mirrored by partcfg.EnsureTable so the vanilla
+-- partitioner (stock PG, no extension) can self-materialize it.
+--
+-- Period columns are text ('3 months') for now, matching ParseRetention;
+-- a later increment may migrate them to native interval. The retention>hot
+-- invariant therefore stays a code-side check (text comparison is meaningless).
+CREATE TABLE IF NOT EXISTS coldfront.partition_config (
+    schema_name            text    NOT NULL DEFAULT 'public',
+    table_name             text    NOT NULL,
+    partition_period       text    NOT NULL,
+    partition_column       text,                              -- NULL ⇒ auto-detect (flat only)
+    future_partitions      int     NOT NULL DEFAULT 3,
+    part_mode              text    NOT NULL DEFAULT 'timestamp',
+    id_scheme              text,
+    hot_period             text,                              -- NULL ⇒ partition-only; set ⇒ tiered
+    retention_period       text,
+    sub_part_values_source text,                              -- NULL ⇒ flat; set ⇒ 2-level LIST→RANGE
+    enabled                boolean NOT NULL DEFAULT true,
+    PRIMARY KEY (schema_name, table_name),
+    CONSTRAINT pc_period_enum   CHECK (partition_period IN ('monthly','daily')),
+    CONSTRAINT pc_partmode_enum CHECK (part_mode IN ('timestamp','id')),
+    CONSTRAINT pc_id_scheme     CHECK ((part_mode = 'id') = (id_scheme IS NOT NULL)),
+    CONSTRAINT pc_scheme_enum   CHECK (id_scheme IS NULL OR id_scheme IN ('uuidv7','snowflake')),
+    CONSTRAINT pc_future_pos    CHECK (future_partitions >= 1),
+    CONSTRAINT pc_destroy       CHECK (hot_period IS NOT NULL OR retention_period IS NOT NULL),
+    CONSTRAINT pc_cold_timeonly CHECK (hot_period IS NULL OR part_mode = 'timestamp'),
+    CONSTRAINT pc_2level_col    CHECK (sub_part_values_source IS NULL OR partition_column IS NOT NULL)
+);
+
 -- ensure_attached() issues ATTACH IF NOT EXISTS for the Lakekeeper catalog
 -- using the coldfront.warehouse and coldfront.lakekeeper_endpoint GUCs.
 -- Called at login by the coldfront_login_session_init event trigger below
