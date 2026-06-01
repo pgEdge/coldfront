@@ -115,20 +115,29 @@ func (c *Config) Validate() error {
 	if c.Postgres.DSN == "" {
 		return fmt.Errorf("postgres.dsn is required")
 	}
-	if c.Iceberg.Warehouse == "" {
-		return fmt.Errorf("iceberg.warehouse is required")
-	}
-	if c.Iceberg.LakekeeperEndpoint == "" {
-		return fmt.Errorf("iceberg.lakekeeper_endpoint is required")
-	}
-	if c.S3.Endpoint == "" {
-		return fmt.Errorf("s3.endpoint is required")
-	}
-	if c.S3.AccessKey == "" {
-		return fmt.Errorf("s3.access_key is required")
-	}
-	if c.S3.SecretKey == "" {
-		return fmt.Errorf("s3.secret_key is required")
+	// Iceberg/S3 are required only in iceberg mode. A config with no iceberg
+	// warehouse/endpoint and no S3 fields is a partition-only run (premake +
+	// retention, no cold-tier archival). If ANY iceberg/S3 field is supplied,
+	// every required one must be — a partial cold config fails loudly rather
+	// than silently running half-configured.
+	icebergMode := c.Iceberg.Warehouse != "" || c.Iceberg.LakekeeperEndpoint != "" ||
+		c.S3.Endpoint != "" || c.S3.AccessKey != "" || c.S3.SecretKey != ""
+	if icebergMode {
+		if c.Iceberg.Warehouse == "" {
+			return fmt.Errorf("iceberg.warehouse is required")
+		}
+		if c.Iceberg.LakekeeperEndpoint == "" {
+			return fmt.Errorf("iceberg.lakekeeper_endpoint is required")
+		}
+		if c.S3.Endpoint == "" {
+			return fmt.Errorf("s3.endpoint is required")
+		}
+		if c.S3.AccessKey == "" {
+			return fmt.Errorf("s3.access_key is required")
+		}
+		if c.S3.SecretKey == "" {
+			return fmt.Errorf("s3.secret_key is required")
+		}
 	}
 	if len(c.Archiver.Tables) == 0 {
 		return fmt.Errorf("archiver.tables requires at least one entry")

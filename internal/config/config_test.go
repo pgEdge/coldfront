@@ -222,3 +222,41 @@ archiver:
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "retention_period")
 }
+
+func TestValidate_PartitionOnly_NoIcebergOK(t *testing.T) {
+	// No iceberg/s3 sections at all: a partition-only run (premake + retention,
+	// no cold-tier archival). Must load and validate cleanly.
+	cfg := `
+postgres:
+  dsn: "host=localhost dbname=mydb"
+archiver:
+  tables:
+    - source_table: "events"
+      partition_period: "monthly"
+      retention_period: "12 months"
+`
+	c, err := Load(writeConfig(t, cfg))
+	require.NoError(t, err)
+	assert.Empty(t, c.Iceberg.Warehouse)
+	require.Len(t, c.Archiver.Tables, 1)
+	assert.Equal(t, "events", c.Archiver.Tables[0].SourceTable)
+}
+
+func TestValidate_PartialIcebergIsLoud(t *testing.T) {
+	// A warehouse but no endpoint/s3: a half-configured cold setup, which must
+	// fail loudly rather than be silently treated as partition-only.
+	cfg := `
+postgres:
+  dsn: "host=localhost"
+iceberg:
+  warehouse: "wh"
+archiver:
+  tables:
+    - source_table: "t"
+      partition_period: "monthly"
+      retention_period: "1 month"
+`
+	_, err := Load(writeConfig(t, cfg))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "lakekeeper_endpoint")
+}

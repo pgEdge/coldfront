@@ -1,0 +1,73 @@
+package partition
+
+import (
+	"context"
+	"fmt"
+	"time"
+)
+
+// Spec is one table's partition-lifecycle job — the inputs a single reconcile
+// pass needs. An upper layer (or a standalone manager) maps its own per-table
+// config onto this; the partition core stays agnostic about where it came from.
+type Spec struct {
+	Parent    string        // the partitioned table
+	Schema    string        // its schema
+	Column    string        // the RANGE key column
+	Period    string        // PeriodMonthly | PeriodDaily
+	Premake   int           // future partitions kept ahead of now
+	Retention time.Duration // detach+drop partitions whose upper bound is older than now-Retention
+}
+
+// Lifecycle is the subset of *Manager that RunReconcile drives. Expressing it as
+// an interface keeps RunReconcile unit-testable with a hand-written fake and
+// keeps this orchestration free of any concrete DB type.
+type Lifecycle interface {
+	EnsureFuture(ctx context.Context, parent, schema, column, period string, count int, now time.Time) error
+	FindExpired(ctx context.Context, parent, schema string, cutoff time.Time) ([]Info, error)
+	Detach(ctx context.Context, parent, schema, partName string) error
+	Drop(ctx context.Context, schema, partName string) error
+}
+
+// *Manager is the production Lifecycle; assert it at compile time so a signature
+// drift in either place is caught by the build, not at runtime.
+var _ Lifecycle = (*Manager)(nil)
+
+// ExpireFunc handles one expired partition end to end and OWNS its removal. The
+// default (a nil ExpireFunc) is Detach + Drop — the standalone partition
+// manager. An upper layer supplies one that does its own work and performs the
+// removal itself: e.g. a cold-storage export whose cutover issues the DETACH
+// atomically with its catalog/view update, so the core must NOT also detach.
+// This is the single seam by which retention is specialised WITHOUT the
+// partition core depending on that layer — the dependency points strictly down.
+type ExpireFunc func(ctx context.Context, p Info) error
+
+// RunReconcile brings one table's partitions to the desired state: premake the
+// forward window, then expire every partition past retention. Expiry runs the
+// ExpireFunc when one is supplied (it owns the removal), else the default
+// Detach + Drop. Unconditional — no external cutoff gate, no branch. The DDL the
+// default path issues runs top-level on the pool (DETACH ... CONCURRENTLY cannot
+// run inside a transaction), so callers must pass a non-transactional handle.
+func RunReconcile(ctx context.Context, lc Lifecycle, s Spec, now time.Time, expire ExpireFunc) error {
+	if err := lc.EnsureFuture(ctx, s.Parent, s.Schema, s.Column, s.Period, s.Premake, now); err != nil {
+		return fmt.Errorf("premake %s.%s: %w", s.Schema, s.Parent, err)
+	}
+	expired, err := lc.FindExpired(ctx, s.Parent, s.Schema, now.Add(-s.Retention))
+	if err != nil {
+		return fmt.Errorf("find expired %s.%s: %w", s.Schema, s.Parent, err)
+	}
+	for _, p := range expired {
+		if expire != nil {
+			if err := expire(ctx, p); err != nil {
+				return fmt.Errorf("expire %s: %w", p.Name, err)
+			}
+			continue
+		}
+		if err := lc.Detach(ctx, s.Parent, s.Schema, p.Name); err != nil {
+			return err
+		}
+		if err := lc.Drop(ctx, s.Schema, p.Name); err != nil {
+			return err
+		}
+	}
+	return nil
+}
