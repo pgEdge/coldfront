@@ -921,6 +921,14 @@ EOSQL
     assert_eq "no row written for the rejected table" "0" \
         "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='cli_nopk';")"
 
+    # retention must exceed hot-period — caught at register time, before any write.
+    if "$ARCHIVER" register --config /tmp/journey-archiver.yaml --table cli_events \
+            --period monthly --hot-period "3 months" --retention "1 month" >/tmp/journey-rethot.log 2>&1; then
+        fail "register should reject retention <= hot-period"
+    else
+        grep -qi "must exceed" /tmp/journey-rethot.log && pass "register rejects retention <= hot-period" || { fail "wrong reason"; tail -3 /tmp/journey-rethot.log; }
+    fi
+
     # Run the archiver with a connection-only YAML (NO archiver.tables): it must
     # drive entirely off coldfront.partition_config.
     cat > /tmp/journey-conn.yaml <<EOF

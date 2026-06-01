@@ -8,12 +8,14 @@ import (
 	"os"
 	"strings"
 	"text/tabwriter"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"gopkg.in/yaml.v3"
 
 	"github.com/pgedge/coldfront/internal/config"
+	"github.com/pgedge/coldfront/internal/partition"
 )
 
 // Commands is the set of management subcommands both binaries expose. Each runs
@@ -94,6 +96,27 @@ func runRegister(ctx context.Context, args []string) error {
 	}
 	if *retention == "" && *hot == "" {
 		return fmt.Errorf("set --retention (and/or --hot-period): a managed table needs a destroy boundary")
+	}
+	// Validate the period strings parse, and that retention outlives hot (the
+	// one lifecycle rule the text-column CHECKs can't express) — fail at register
+	// time rather than later at the archiver's run-time validation.
+	var hotDur, retDur time.Duration
+	if *hot != "" {
+		d, err := partition.ParseRetention(*hot)
+		if err != nil {
+			return fmt.Errorf("--hot-period: %w", err)
+		}
+		hotDur = d
+	}
+	if *retention != "" {
+		d, err := partition.ParseRetention(*retention)
+		if err != nil {
+			return fmt.Errorf("--retention: %w", err)
+		}
+		retDur = d
+	}
+	if *hot != "" && *retention != "" && retDur <= hotDur {
+		return fmt.Errorf("--retention (%s) must exceed --hot-period (%s)", *retention, *hot)
 	}
 
 	row := configRow{
