@@ -3,6 +3,7 @@ package partition
 import (
 	"context"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -167,6 +168,65 @@ func TestEnsureFuture(t *testing.T) {
 	assert.Contains(t, db.execSQL[0], "PARTITION OF")
 	// Time-mode bounds stay single-quoted timestamps (byte-for-byte legacy SQL).
 	assert.Contains(t, db.execSQL[0], "FOR VALUES FROM ('2026-05-01 00:00:00+00') TO ('2026-06-01 00:00:00+00')")
+}
+
+// partitionRows builds a mockDB.rowsFunc emitting (relname, relpartbound) pairs.
+func partitionRows(pairs ...[2]string) func(context.Context, string, ...any) (pgx.Rows, error) {
+	return func(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
+		rows := make([]func(dest ...any) error, len(pairs))
+		for i, p := range pairs {
+			p := p
+			rows[i] = func(dest ...any) error {
+				*(dest[0].(*string)) = p[0]
+				*(dest[1].(*string)) = p[1]
+				return nil
+			}
+		}
+		return &mockRows{rows: rows}, nil
+	}
+}
+
+func hasCreate(sqls []string) bool {
+	for _, s := range sqls {
+		if strings.Contains(s, "CREATE TABLE IF NOT EXISTS") {
+			return true
+		}
+	}
+	return false
+}
+
+func TestEnsureCurrent_FreshCreatesNotBehind(t *testing.T) {
+	db := &mockDB{rowsFunc: partitionRows()} // no existing partitions
+	m := NewManager(db)
+	now := time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC)
+	behind, err := m.EnsureCurrent(context.Background(), "events", "public", "monthly", now, TimeBoundary{}, "")
+	require.NoError(t, err)
+	assert.False(t, behind, "a fresh table is not behind")
+	assert.True(t, hasCreate(db.execSQL), "current partition must be created")
+}
+
+func TestEnsureCurrent_CoveredNoCreateNotBehind(t *testing.T) {
+	db := &mockDB{rowsFunc: partitionRows(
+		[2]string{"p_2026_06", "FOR VALUES FROM ('2026-06-01 00:00:00+00') TO ('2026-07-01 00:00:00+00')"},
+	)}
+	m := NewManager(db)
+	now := time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC)
+	behind, err := m.EnsureCurrent(context.Background(), "events", "public", "monthly", now, TimeBoundary{}, "")
+	require.NoError(t, err)
+	assert.False(t, behind)
+	assert.False(t, hasCreate(db.execSQL), "already covered: must not create")
+}
+
+func TestEnsureCurrent_GapIsBehindAndHeals(t *testing.T) {
+	db := &mockDB{rowsFunc: partitionRows(
+		[2]string{"p_2026_03", "FOR VALUES FROM ('2026-03-01 00:00:00+00') TO ('2026-04-01 00:00:00+00')"},
+	)}
+	m := NewManager(db)
+	now := time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC)
+	behind, err := m.EnsureCurrent(context.Background(), "events", "public", "monthly", now, TimeBoundary{}, "")
+	require.NoError(t, err)
+	assert.True(t, behind, "partitions exist but none covers now -> behind")
+	assert.True(t, hasCreate(db.execSQL), "must heal by creating the current partition")
 }
 
 func TestFindExpired(t *testing.T) {

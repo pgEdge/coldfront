@@ -99,9 +99,11 @@ func TestRunReconcileTwoLevel_ProvisionsEachSubtree(t *testing.T) {
 	want := []string{
 		"listchild public.events_eu in=eu range=ts",
 		"ensure public.events_eu col=ts monthly x3 pfx=events_eu_",
+		"current public.events_eu monthly pfx=events_eu_",
 		"find public.events_eu",
 		"listchild public.events_us in=us range=ts",
 		"ensure public.events_us col=ts monthly x3 pfx=events_us_",
+		"current public.events_us monthly pfx=events_us_",
 		"find public.events_us",
 	}
 	if got := strings.Join(f.log, "|"); got != strings.Join(want, "|") {

@@ -2,6 +2,7 @@ package partition
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"time"
@@ -98,6 +99,7 @@ var _ SubLifecycle = (*Manager)(nil)
 // sanitize to the same child name fail loud rather than clobber one sub-tree.
 func RunReconcileTwoLevel(ctx context.Context, lc SubLifecycle, s Spec, values []string, now time.Time, expire ExpireFunc) error {
 	seen := make(map[string]string, len(values))
+	var behind []string
 	for _, v := range values {
 		child, err := SubName(s.Parent, v)
 		if err != nil {
@@ -114,9 +116,19 @@ func RunReconcileTwoLevel(ctx context.Context, lc SubLifecycle, s Spec, values [
 		childSpec := s
 		childSpec.Parent = child
 		childSpec.LeafPrefix = child + "_"
+		// A behind sub-tree is healed in place; collect it and keep going so one
+		// lagging value never blocks provisioning the rest. Any other error is
+		// fatal for the pass.
 		if err := RunReconcile(ctx, lc, childSpec, now, expire); err != nil {
+			if errors.Is(err, ErrBehind) {
+				behind = append(behind, child)
+				continue
+			}
 			return fmt.Errorf("reconcile sub-tree %s: %w", child, err)
 		}
+	}
+	if len(behind) > 0 {
+		return fmt.Errorf("%w: sub-trees healed but lagging: %s", ErrBehind, strings.Join(behind, ", "))
 	}
 	return nil
 }

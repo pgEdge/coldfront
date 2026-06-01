@@ -2,9 +2,17 @@ package partition
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 )
+
+// ErrBehind reports that premake had fallen behind: the table's partitions
+// existed but none covered `now` when a reconcile pass began, so live inserts
+// had no home. RunReconcile heals it (creates the current partition) and then
+// returns an error wrapping ErrBehind, so the run exits loud while the table is
+// left correct. Callers distinguish it with errors.Is.
+var ErrBehind = errors.New("premake fell behind")
 
 // Spec is one table's partition-lifecycle job — the inputs a single reconcile
 // pass needs. An upper layer (or a standalone manager) maps its own per-table
@@ -34,6 +42,7 @@ func (s Spec) boundary() Boundary {
 // keeps this orchestration free of any concrete DB type.
 type Lifecycle interface {
 	EnsureFuture(ctx context.Context, parent, schema, column, period string, count int, now time.Time, b Boundary, leafPrefix string) error
+	EnsureCurrent(ctx context.Context, parent, schema, period string, now time.Time, b Boundary, leafPrefix string) (behind bool, err error)
 	FindExpired(ctx context.Context, parent, schema string, cutoff time.Time, b Boundary) ([]Info, error)
 	Detach(ctx context.Context, parent, schema, partName string) error
 	Drop(ctx context.Context, schema, partName string) error
@@ -63,6 +72,10 @@ func RunReconcile(ctx context.Context, lc Lifecycle, s Spec, now time.Time, expi
 	if err := lc.EnsureFuture(ctx, s.Parent, s.Schema, s.Column, s.Period, s.Premake, now, b, s.LeafPrefix); err != nil {
 		return fmt.Errorf("premake %s.%s: %w", s.Schema, s.Parent, err)
 	}
+	behind, err := lc.EnsureCurrent(ctx, s.Parent, s.Schema, s.Period, now, b, s.LeafPrefix)
+	if err != nil {
+		return fmt.Errorf("ensure current %s.%s: %w", s.Schema, s.Parent, err)
+	}
 	expired, err := lc.FindExpired(ctx, s.Parent, s.Schema, now.Add(-s.Retention), b)
 	if err != nil {
 		return fmt.Errorf("find expired %s.%s: %w", s.Schema, s.Parent, err)
@@ -80,6 +93,10 @@ func RunReconcile(ctx context.Context, lc Lifecycle, s Spec, now time.Time, expi
 		if err := lc.Drop(ctx, s.Schema, p.Name); err != nil {
 			return err
 		}
+	}
+	if behind {
+		return fmt.Errorf("%w for %s.%s: no partition covered %s at the start of the pass (created it now; widen premake=%d or run more often)",
+			ErrBehind, s.Schema, s.Parent, now.Format(time.RFC3339), s.Premake)
 	}
 	return nil
 }

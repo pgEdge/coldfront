@@ -102,32 +102,80 @@ func FuturePartitionDates(now time.Time, period string, count int) []time.Time {
 // names (p_2026_06), while a 2-level sub-tree passes its child name so leaves are
 // unique across siblings (events_eu_p_2026_06).
 func (m *Manager) EnsureFuture(ctx context.Context, parent, schema, column, period string, count int, now time.Time, b Boundary, leafPrefix string) error {
-	dates := FuturePartitionDates(now, period, count)
-	fqParent := pgx.Identifier{schema, parent}.Sanitize()
-
-	for _, d := range dates {
-		name := leafPrefix + PartitionName(d, period)
-		if err := checkIdent(name); err != nil {
+	for _, d := range FuturePartitionDates(now, period, count) {
+		if err := m.createPartition(ctx, parent, schema, period, d, b, leafPrefix); err != nil {
 			return err
-		}
-		_, upper := PartitionBounds(d, period)
-		fqName := pgx.Identifier{schema, name}.Sanitize()
-
-		sql := fmt.Sprintf(
-			`CREATE TABLE IF NOT EXISTS %s PARTITION OF %s FOR VALUES FROM (%s) TO (%s)`,
-			fqName, fqParent, b.Literal(d), b.Literal(upper))
-		if _, err := m.db.Exec(ctx, sql); err != nil {
-			return fmt.Errorf("create partition %s: %w", name, err)
 		}
 	}
 	return nil
 }
 
+// EnsureCurrent creates the partition covering `now` (idempotent) and reports
+// whether the table had already fallen behind: partitions exist, yet none
+// covered `now` when the pass began — meaning live inserts had no home and the
+// premake cadence is too slow for the configured window. A table with no
+// partitions yet (fresh, or a newly provisioned sub-tree) is NOT behind; its
+// current partition is simply created. Callers fail loud on a true return.
+func (m *Manager) EnsureCurrent(ctx context.Context, parent, schema, period string, now time.Time, b Boundary, leafPrefix string) (bool, error) {
+	parts, err := m.listPartitions(ctx, parent, schema, b)
+	if err != nil {
+		return false, err
+	}
+	covered := false
+	for _, p := range parts {
+		if !p.LowerBound.After(now) && p.UpperBound.After(now) {
+			covered = true
+			break
+		}
+	}
+	behind := len(parts) > 0 && !covered
+	if !covered {
+		if err := m.createPartition(ctx, parent, schema, period, now, b, leafPrefix); err != nil {
+			return behind, err
+		}
+	}
+	return behind, nil
+}
+
+// createPartition creates the single partition for the period containing d
+// (idempotent). Shared by EnsureFuture and EnsureCurrent so name, bound and
+// leaf-prefix handling live in one place.
+func (m *Manager) createPartition(ctx context.Context, parent, schema, period string, d time.Time, b Boundary, leafPrefix string) error {
+	lower, upper := PartitionBounds(d, period)
+	name := leafPrefix + PartitionName(lower, period)
+	if err := checkIdent(name); err != nil {
+		return err
+	}
+	sql := fmt.Sprintf(
+		`CREATE TABLE IF NOT EXISTS %s PARTITION OF %s FOR VALUES FROM (%s) TO (%s)`,
+		pgx.Identifier{schema, name}.Sanitize(),
+		pgx.Identifier{schema, parent}.Sanitize(),
+		b.Literal(lower), b.Literal(upper))
+	if _, err := m.db.Exec(ctx, sql); err != nil {
+		return fmt.Errorf("create partition %s: %w", name, err)
+	}
+	return nil
+}
+
 // FindExpired returns partitions whose upper bound is at or before the cutoff.
-// The Boundary converts each partition's stored bound value back to time, so id
-// bounds compare against a time cutoff just like time bounds.
 func (m *Manager) FindExpired(ctx context.Context, parent, schema string, cutoff time.Time, b Boundary) ([]Info, error) {
-	query := `
+	parts, err := m.listPartitions(ctx, parent, schema, b)
+	if err != nil {
+		return nil, err
+	}
+	var expired []Info
+	for _, p := range parts {
+		if !p.UpperBound.After(cutoff) {
+			expired = append(expired, p)
+		}
+	}
+	return expired, nil
+}
+
+// listPartitions enumerates every direct partition of parent with its bounds
+// decoded to time via the Boundary. Shared by FindExpired and EnsureCurrent.
+func (m *Manager) listPartitions(ctx context.Context, parent, schema string, b Boundary) ([]Info, error) {
+	const query = `
 		SELECT c.relname, pg_get_expr(c.relpartbound, c.oid)
 		FROM pg_inherits i
 		JOIN pg_class c ON c.oid = i.inhrelid
@@ -142,7 +190,7 @@ func (m *Manager) FindExpired(ctx context.Context, parent, schema string, cutoff
 	}
 	defer rows.Close()
 
-	var expired []Info
+	var parts []Info
 	for rows.Next() {
 		var name, boundExpr string
 		if err := rows.Scan(&name, &boundExpr); err != nil {
@@ -152,11 +200,9 @@ func (m *Manager) FindExpired(ctx context.Context, parent, schema string, cutoff
 		if err != nil {
 			return nil, fmt.Errorf("parse bounds for %s: %w", name, err)
 		}
-		if !upper.After(cutoff) {
-			expired = append(expired, Info{Name: name, LowerBound: lower, UpperBound: upper})
-		}
+		parts = append(parts, Info{Name: name, LowerBound: lower, UpperBound: upper})
 	}
-	return expired, rows.Err()
+	return parts, rows.Err()
 }
 
 // Detach detaches a partition from its parent concurrently.

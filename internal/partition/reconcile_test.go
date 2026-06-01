@@ -16,6 +16,7 @@ type fakeLifecycle struct {
 	log       []string
 	expired   []Info
 	gotCutoff time.Time
+	behind    bool // canned EnsureCurrent return
 	ensureErr error
 	findErr   error
 	detachErr error
@@ -29,6 +30,14 @@ func (f *fakeLifecycle) EnsureFuture(_ context.Context, parent, schema, column, 
 	}
 	f.log = append(f.log, entry)
 	return f.ensureErr
+}
+func (f *fakeLifecycle) EnsureCurrent(_ context.Context, parent, schema, period string, _ time.Time, _ Boundary, leafPrefix string) (bool, error) {
+	entry := fmt.Sprintf("current %s.%s %s", schema, parent, period)
+	if leafPrefix != "" {
+		entry += " pfx=" + leafPrefix
+	}
+	f.log = append(f.log, entry)
+	return f.behind, f.ensureErr
 }
 func (f *fakeLifecycle) EnsureListChild(_ context.Context, parent, schema, listValue, childName, rangeCol string) error {
 	f.log = append(f.log, fmt.Sprintf("listchild %s.%s in=%s range=%s", schema, childName, listValue, rangeCol))
@@ -65,6 +74,7 @@ func TestRunReconcile_CustomExpireOwnsRemoval(t *testing.T) {
 	}
 	want := []string{
 		"ensure public.events col=ts monthly x3",
+		"current public.events monthly",
 		"find public.events",
 		"expire p_2026_01",
 		"expire p_2026_02",
@@ -84,7 +94,7 @@ func TestRunReconcile_NilHookJustDetachDrops(t *testing.T) {
 	if err := RunReconcile(context.Background(), f, testSpec(), time.Now(), nil); err != nil {
 		t.Fatal(err)
 	}
-	want := []string{"ensure public.events col=ts monthly x3", "find public.events", "detach p_old", "drop p_old"}
+	want := []string{"ensure public.events col=ts monthly x3", "current public.events monthly", "find public.events", "detach p_old", "drop p_old"}
 	if got := strings.Join(f.log, "|"); got != strings.Join(want, "|") {
 		t.Fatalf("got %v want %v", f.log, want)
 	}
@@ -102,6 +112,38 @@ func TestRunReconcile_ExpireErrorStops(t *testing.T) {
 	for _, c := range f.log {
 		if strings.HasPrefix(c, "detach") || strings.HasPrefix(c, "drop") {
 			t.Fatalf("detach/drop ran despite expire error: %v", f.log)
+		}
+	}
+}
+
+func TestRunReconcile_FailsLoudWhenBehind(t *testing.T) {
+	f := &fakeLifecycle{behind: true, expired: []Info{{Name: "p_old"}}}
+	err := RunReconcile(context.Background(), f, testSpec(), time.Now(), nil)
+	if !errors.Is(err, ErrBehind) {
+		t.Fatalf("want ErrBehind wrapped, got %v", err)
+	}
+	// The pass still heals (EnsureCurrent) and runs retention before failing loud.
+	joined := strings.Join(f.log, "|")
+	for _, want := range []string{"current public.events", "detach p_old", "drop p_old"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("expected %q in log %v", want, f.log)
+		}
+	}
+}
+
+func TestRunReconcileTwoLevel_BehindSubtreeDoesNotBlockSiblings(t *testing.T) {
+	// behind=true makes every child report behind; both must still be provisioned
+	// (listchild + ensure for each) and the call must wrap ErrBehind, not abort.
+	f := &fakeLifecycle{behind: true}
+	s := Spec{Parent: "events", Schema: "public", Column: "ts", Period: PeriodMonthly, Premake: 1}
+	err := RunReconcileTwoLevel(context.Background(), f, s, []string{"eu", "us"}, time.Now(), nil)
+	if !errors.Is(err, ErrBehind) {
+		t.Fatalf("want ErrBehind, got %v", err)
+	}
+	joined := strings.Join(f.log, "|")
+	for _, want := range []string{"listchild public.events_eu", "listchild public.events_us"} {
+		if !strings.Contains(joined, want) {
+			t.Fatalf("sibling not provisioned: missing %q in %v", want, f.log)
 		}
 	}
 }
