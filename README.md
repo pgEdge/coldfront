@@ -1,3 +1,5 @@
+![pgEdge Labs](assets/pgEdge_labs_178px.png)
+
 # pgEdge ColdFront
 
 Tables in PostgreSQL, storage in Apache Iceberg (Parquet on S3-compatible
