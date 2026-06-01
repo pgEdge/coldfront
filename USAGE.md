@@ -75,6 +75,77 @@ That single statement provisions:
 
 Spock's `ddl_sql` repset replicates the `CREATE VIEW` and the registry row, so the helper only needs to run on one node — peers pick up the wrapper view, the `coldfront.tiered_views` row, and the `coldfront.claims` repset registration automatically.
 
+## Mode 3 — Standalone partition manager (no cold tier)
+
+If you only need automated PG partition maintenance — no Iceberg, no cold tier —
+run `bin/partitioner` against stock PostgreSQL (or a Spock mesh). Each invocation
+makes one reconcile pass per managed table: premake the forward window, ensure
+the partition covering *now* exists, and detach-then-drop partitions past
+retention (`DETACH ... CONCURRENTLY`, never a bare `DROP` of attached data).
+Build it with `make build` and run it from cron:
+
+```bash
+go build -o bin/partitioner ./cmd/partitioner   # or: make build
+./bin/partitioner --config config.yaml
+```
+
+A partition-only config omits the `iceberg:` and `s3:` sections entirely (supply
+either all of them or none — a half-filled cold config is rejected):
+
+```yaml
+postgres:
+  dsn: "host=localhost dbname=mydb"
+archiver:
+  tables:
+    - source_table: events
+      partition_column: ts
+      partition_period: monthly        # monthly | daily
+      retention_period: 12 months      # N days|weeks|months|years
+      future_partitions: 3             # premake window kept ahead of now
+```
+
+If a reconcile pass finds partitions exist but none covers *now* (the cron fell
+behind), it creates the current partition and then exits non-zero so monitoring
+notices — widen `future_partitions` or run more often.
+
+### Primary keys on time-partitioned tables (id mode)
+
+PostgreSQL requires a unique index to include the partition key, so a plain
+`PRIMARY KEY (id)` is impossible on a table partitioned by a separate `ts`
+column. Partition instead by RANGE on a **time-ordered id** and the partition
+key *is* the key — a single-column `PRIMARY KEY (id)`:
+
+```yaml
+    - source_table: events
+      partition_column: id
+      partition_period: monthly
+      retention_period: 12 months
+      part_mode: id
+      id_scheme: snowflake             # snowflake | uuidv7
+```
+
+`uuidv7` reads the RFC 9562 leading-millisecond timestamp; `snowflake` decodes
+the pgEdge snowflake extension's layout. Either way the manager computes the
+month/day partition bounds as id values, so id-order equals time-order and the
+forward/retention schedule is unchanged.
+
+### Two-level (LIST → RANGE) sub-partitioning
+
+For a table partitioned by `LIST (region)` whose children are themselves
+`RANGE`-partitioned by time, add a `sub_partition` block. `values_source` is a
+query returning the current level-1 values; the manager provisions and maintains
+a RANGE sub-tree under each, creating sub-trees for newly appearing values
+automatically:
+
+```yaml
+    - source_table: events
+      partition_column: ts             # the level-2 RANGE column
+      partition_period: monthly
+      retention_period: 12 months
+      sub_partition:
+        values_source: "SELECT code FROM regions"
+```
+
 ## Reading + writing (identical for both modes)
 
 ```sql

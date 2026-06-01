@@ -2,6 +2,7 @@
 
 build:
 	CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/archiver ./cmd/archiver
+	CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/partitioner ./cmd/partitioner
 
 test:
 	go test -race -v ./...

@@ -30,6 +30,7 @@ Design reference: [ARCHITECTURE.md](ARCHITECTURE.md). Failover is out of scope
 3. Login-trigger graceful degradation.
 4. Standby production-hardening (replication slot, replication role).
 5. Tracked upstream gaps (pg_duckdb / duckdb-iceberg).
+6. Partition manager — follow-ups (`feat/partition-manager` branch).
 
 ---
 
@@ -154,6 +155,34 @@ See also [ARCHITECTURE.md → Upstream Requests](ARCHITECTURE.md#upstream-reques
 - The three existing asks already written up in ARCHITECTURE.md: native
   PG-reader → Iceberg streaming (no libpq round-trip); secret visibility under
   fresh transactions; INSERT into a table that carries a partition spec.
+
+---
+
+## 6. Partition manager — follow-ups — *feat/partition-manager branch*
+
+The standalone partition manager (`cmd/partitioner`, `internal/partition`) is
+feature-complete and unit-tested: time/id modes (uuidv7, snowflake), 2-level
+LIST→RANGE, behind-detection. Remaining work before/around merging it:
+
+- **Rewire the cold-tier archiver onto `RunReconcile`.** `cmd/archiver`'s
+  `runCycle` still premakes / finds-expired by calling `Manager.EnsureFuture` /
+  `FindExpired` directly, with its own atomic-cutover detach inside
+  `archivePartition`. Fold it onto `RunReconcile` with an `ExpireFunc` that owns
+  the cutover (the seam already exists), so both products share one reconcile
+  path. Must stay byte-for-byte behaviour-preserving for the cold tier.
+- **Scripted strip to a partition-only build.** The one-way dependency rule
+  (iceberg → partition-core, enforced by `cmd/partitioner/arch_test.go`) makes a
+  cut possible: a script that deletes the iceberg layer (C extension,
+  `internal/view`, `internal/watermark`, the iceberg slice of `cmd/archiver`)
+  and leaves a working partition manager. Author + verify the strip.
+- **`ci/probe-snowflake.sh` + a partition-only matrix cell.** Make the live
+  snowflake `get_epoch` cross-check reproducible (spin a pgEdge container, assert
+  `get_epoch*1000 == (id>>22)+1672531200000`), and add an id-mode / 2-level
+  partitioner cell to the journey so the new code is exercised in CI, not only
+  in unit tests.
+- **Mesh N×(N-1) probe for the partitioner.** Before any mesh partitioner run,
+  confirm DDL (`CREATE/DETACH/DROP PARTITION`) and the registry replicate in
+  every direction, per the standing verify-before-bench rule.
 
 ---
 
