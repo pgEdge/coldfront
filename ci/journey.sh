@@ -871,6 +871,77 @@ EOF
     assert_eq "re-run keeps eu cold rows" "240" "$(q "$HOST" "SELECT count(*) FROM regional WHERE region='eu' AND ts < '2026-04-01';")"
 }
 
+# ───────────────────────────────────────────────────────────────────────────
+# Story — management CLI end-to-end: register a table via the subcommand (PK
+# validation), list it, reject a PK-less table, then run the archiver with NO
+# YAML tables so it drives entirely off coldfront.partition_config, and export.
+# ───────────────────────────────────────────────────────────────────────────
+story_register_cli() {
+    step "Management CLI: register / list / run-off-partition_config / export"
+    qf "$HOST" <<'EOSQL' >/dev/null
+SET search_path = public;
+CREATE TABLE IF NOT EXISTS cli_events (
+    id bigint GENERATED ALWAYS AS IDENTITY,
+    ts timestamptz NOT NULL,
+    v  int,
+    PRIMARY KEY (id, ts)
+) PARTITION BY RANGE (ts);
+CREATE TABLE IF NOT EXISTS cli_events_p_2026_02 PARTITION OF cli_events FOR VALUES FROM ('2026-02-01') TO ('2026-03-01');
+CREATE TABLE IF NOT EXISTS cli_events_p_2026_04 PARTITION OF cli_events FOR VALUES FROM ('2026-04-01') TO ('2026-05-01');
+INSERT INTO cli_events (ts, v) SELECT '2026-02-10'::timestamptz + (i*interval '1 hour'), i FROM generate_series(1,50) i;
+INSERT INTO cli_events (ts, v) SELECT '2026-04-05'::timestamptz + (i*interval '1 hour'), i FROM generate_series(1,30) i;
+-- A partitioned table with NO primary key: register must reject it (the cutover
+-- keys delta capture by the source PK). (PG itself forbids a PK that omits the
+-- partition key, so "PK doesn't cover the key" is impossible to construct.)
+CREATE TABLE IF NOT EXISTS cli_nopk (id bigint, ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
+EOSQL
+    local ret_days; ret_days=$(( ( $(date -u +%s) - $(date -u -d '2026-04-15' +%s) ) / 86400 ))  # tier Feb, keep Apr
+
+    # register (tiered) — validates the PK, INSERTs the row.
+    if "$ARCHIVER" register --config /tmp/journey-archiver.yaml --table cli_events \
+            --period monthly --hot-period "${ret_days} days" >/tmp/journey-reg.log 2>&1; then
+        pass "register cli_events (PK validated, row written)"
+    else
+        fail "register cli_events — see /tmp/journey-reg.log"; tail -5 /tmp/journey-reg.log
+    fi
+    assert_eq "partition_config row created" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='cli_events';")"
+
+    # list shows it.
+    "$ARCHIVER" list --config /tmp/journey-archiver.yaml >/tmp/journey-list.log 2>&1
+    grep -q "cli_events" /tmp/journey-list.log && pass "list shows cli_events" || { fail "list missing cli_events"; cat /tmp/journey-list.log; }
+
+    # register must reject the PK-less table (loud, before any row is written).
+    if "$ARCHIVER" register --config /tmp/journey-archiver.yaml --table cli_nopk \
+            --period monthly --hot-period "1 month" >/tmp/journey-nopk.log 2>&1; then
+        fail "register cli_nopk should have failed (no primary key)"
+    else
+        grep -qi "primary key" /tmp/journey-nopk.log && pass "register rejects the PK-less table" || { fail "wrong rejection reason"; tail -3 /tmp/journey-nopk.log; }
+    fi
+    assert_eq "no row written for the rejected table" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='cli_nopk';")"
+
+    # Run the archiver with a connection-only YAML (NO archiver.tables): it must
+    # drive entirely off coldfront.partition_config.
+    cat > /tmp/journey-conn.yaml <<EOF
+postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
+iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog", namespace: "default" }
+s3:       { endpoint: "${SW_IP}:8333", region: "us-east-1", access_key: "admin", secret_key: "adminsecret" }
+EOF
+    if "$ARCHIVER" --config /tmp/journey-conn.yaml >/tmp/journey-dbrun.log 2>&1; then
+        pass "archiver ran with no YAML tables"
+    else
+        fail "archiver DB-driven run — see /tmp/journey-dbrun.log"; tail -8 /tmp/journey-dbrun.log
+    fi
+    grep -q "from coldfront.partition_config" /tmp/journey-dbrun.log && pass "archiver drove off partition_config (not YAML)" || { fail "did not load from partition_config"; tail -3 /tmp/journey-dbrun.log; }
+    assert_eq "cli_events tiered via DB config (now a view)" "v" "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='cli_events';")"
+    assert_eq "cli_events readable hot+cold after DB-driven tiering" "80" "$(q "$HOST" "SELECT count(*) FROM cli_events;")"
+
+    # export round-trips the managed set to reviewable YAML.
+    "$ARCHIVER" export --config /tmp/journey-conn.yaml >/tmp/journey-export.log 2>&1
+    grep -q "source_table: cli_events" /tmp/journey-export.log && pass "export emits cli_events as YAML" || { fail "export missing cli_events"; tail -5 /tmp/journey-export.log; }
+}
+
 # ── orchestrate ────────────────────────────────────────────────────────────
 # Setup is shared. The story set then branches on mode: tiered exercises the
 # hot+cold partitioned path; decoupled exercises the all-Iceberg wrapper. (The
@@ -893,6 +964,7 @@ if [ "$MODE" = "tiered" ]; then
     story_coexist
     story_cold_retention
     story_tiered_twolevel
+    story_register_cli
 else
     story_provision_decoupled
     story_decoupled_crud
