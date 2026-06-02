@@ -17,7 +17,7 @@
 #                          skipped silently — so coverage is always explicit.
 #
 # Matrix dimensions (beta target):
-#   PG major : 17 · 18  (PG16 upstream-blocked — see coverage_table)
+#   PG major : 16 · 17 · 18
 #   topology : vanilla (single node) · mesh (3-node Spock)
 #   mode     : tiered (hot PG + cold Iceberg) · decoupled (all-Iceberg)
 #   target   : primary (read+write) · standby (read-only physical replica)
@@ -96,19 +96,15 @@ cell_mesh_decoupled_standby()    { "$SCRIPT_DIR/topo/mesh.sh"    --pg "$1" --mod
 # cell is ever silently omitted; PENDING states what is still required.
 coverage_table() {
     step "MATRIX COVERAGE"
-    # PG16 is blocked by an upstream gap, not an image: cold writes need the
-    # PG17+ LOGIN-trigger workaround for the duckdb-iceberg secret-visibility bug
-    # (a fresh-transaction commit can't see a secret registered in the same txn).
-    # See ARCHITECTURE.md → Upstream Requests → "duckdb-iceberg: secret
-    # visibility under fresh transactions". 17 and 18 both RUN.
-    local pending16="PENDING (PG16: no LOGIN event trigger — upstream secret-visibility workaround unavailable)"
-    local pg topo mode tgt status
-    for pg in 16 17 18; do
+    # All majors RUN: cold reads/writes resolve their S3 credential from a DuckDB
+    # persistent secret (coldfront.set_storage_secret), loaded at instance init,
+    # so the lazy first-touch attach works uniformly on 16/17/18 — no version gate.
+    local pg topo mode tgt
+    for pg in 18 17 16; do
       for topo in vanilla mesh; do
         for mode in tiered decoupled; do
           for tgt in primary standby; do
-            if [ "$pg" = 16 ]; then status="$pending16"; else status="RUN"; fi
-            printf '    pg%-2s · %-7s · %-9s · %-7s : %s\n' "$pg" "$topo" "$mode" "$tgt" "$status"
+            printf '    pg%-2s · %-7s · %-9s · %-7s : %s\n' "$pg" "$topo" "$mode" "$tgt" "RUN"
           done
         done
       done
@@ -123,9 +119,9 @@ case "$SCOPE" in
     run_cell "pg18·vanilla·tiered·primary" cell_vanilla_tiered 18
     ;;
   full)
-    # PG17 + PG18 (the supported floor; PG16 is upstream-blocked — see
-    # coverage_table). Same cell set per major; the journey is version-agnostic.
-    for pg in 17 18; do
+    # PG18 → PG17 → PG16 (reference major first). Same cell set per major; the
+    # journey is version-agnostic and the persistent-secret attach path is identical.
+    for pg in 18 17 16; do
       run_cell "pg${pg}·vanilla·tiered·primary"    cell_vanilla_tiered            "$pg"
       run_cell "pg${pg}·vanilla·decoupled·primary" cell_vanilla_decoupled         "$pg"
       run_cell "pg${pg}·mesh·tiered·primary"       cell_mesh_tiered               "$pg"
