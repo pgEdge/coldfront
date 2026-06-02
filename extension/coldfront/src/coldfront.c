@@ -59,6 +59,16 @@ PG_MODULE_MAGIC;
 static bool coldfront_in_rewrite = false;
 
 /*
+ * Once-per-session guard: the Iceberg 'ice' catalog is attached lazily on the
+ * first query that touches a registered tiered view (read OR write), via
+ * ensure_ice_attached_once().  The single, version-agnostic attach path
+ * (works on PG 16/17/18).  Reset on transaction
+ * ABORT (coldfront_xact_callback): a lazy ATTACH runs inside the user's
+ * transaction, so an abort rolls the DuckDB ATTACH back.
+ */
+static bool coldfront_ice_attached = false;
+
+/*
  * GUC: controls what happens when a WHERE clause cannot be proven to target
  * a single tier (TIER_AMBIGUOUS).  On (default): emit a dual-tier CTE that
  * writes to both sides in the same statement, enabling pg_duckdb's
@@ -71,6 +81,13 @@ static post_parse_analyze_hook_type prev_post_parse_analyze_hook = NULL;
 
 /* Previous ProcessUtility_hook (pg_duckdb's, since coldfront loads after it). */
 static ProcessUtility_hook_type prev_process_utility_hook = NULL;
+
+/*
+ * Forward decl (defined with the DDL hook below): "is CREATE EXTENSION coldfront
+ * present in THIS database?". The parse-analyze hook needs the same guard the
+ * DDL hook uses — both are registered cluster-wide.
+ */
+static bool coldfront_registry_present(void);
 
 /*
  * Re-entrancy guard for the DDL hook. _rebuild_tiered_view issues CREATE VIEW /
@@ -160,6 +177,34 @@ lookup_tiered_view(Oid relid, const char *vname, TieredViewInfo *info)
 
     SPI_finish();
     return found;
+}
+
+/*
+ * True if the query reads from a registered tiered/iceberg-only view — any
+ * RangeTblEntry that is a VIEW resolving in coldfront.tiered_views.  Used to
+ * lazily attach 'ice' before a plain SELECT against a tiered view executes:
+ * the view body's iceberg_scan('ice...') only resolves once the catalog is
+ * attached.  The cheap relkind syscache check gates the SPI lookup so plain
+ * table queries (the OLTP hot path) never pay for it.
+ */
+static bool
+query_reads_tiered_view(Query *query)
+{
+    ListCell *lc;
+
+    foreach(lc, query->rtable)
+    {
+        RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+        TieredViewInfo info;
+
+        if (rte->rtekind != RTE_RELATION)
+            continue;
+        if (get_rel_relkind(rte->relid) != RELKIND_VIEW)
+            continue;
+        if (lookup_tiered_view(rte->relid, get_rel_name(rte->relid), &info))
+            return true;
+    }
+    return false;
 }
 
 /* ---------- tier classification --------------------------------------- */
@@ -1253,6 +1298,23 @@ ensure_attached_via_spi(void)
 }
 
 /*
+ * Attach the Iceberg 'ice' catalog at most once per session.  The guard makes
+ * repeat calls free, so both the read path (first tiered-view SELECT) and the
+ * cold-DML path call it cheaply.  coldfront.ensure_attached() uses ATTACH IF
+ * NOT EXISTS and has NO plpgsql EXCEPTION clause, so this runs in the top
+ * transaction (pg_duckdb hard-rejects ATTACH inside a subtransaction).  Cleared
+ * on transaction abort (coldfront_xact_callback).
+ */
+static void
+ensure_ice_attached_once(void)
+{
+    if (coldfront_ice_attached)
+        return;
+    ensure_attached_via_spi();
+    coldfront_ice_attached = true;
+}
+
+/*
  * Call coldfront.ensure_pg_attached() via SPI. Used on the INSERT cold
  * path so raw_query can resolve `pglocal.<schema>.<table>` references in
  * INSERT … SELECT FROM pg_source statements via DuckDB's postgres
@@ -1290,6 +1352,20 @@ coldfront_post_parse_analyze(ParseState *pstate, Query *query,
     if (coldfront_in_rewrite)
         return;
 
+    /*
+     * The hook is registered cluster-wide via shared_preload_libraries, so it
+     * also fires in databases/sessions where CREATE EXTENSION coldfront was
+     * never run — including mid-bootstrap while ANOTHER extension is being
+     * created. Notably CREATE EXTENSION spock (>= 5.0.8) reads
+     * spock.channel_table_stats during its own setup; our lazy tiered-view
+     * lookup below would then SPI-query a non-existent coldfront.tiered_views
+     * and abort that unrelated statement ("relation coldfront.tiered_views does
+     * not exist"). With no coldfront registry there is nothing tiered to
+     * rewrite, so do nothing — the same guard the DDL hook already applies.
+     */
+    if (!coldfront_registry_present())
+        return;
+
     /* Intercept INSERT, UPDATE and DELETE on registered tiered views.
      * INSERT only goes through the bulk-rewrite path for iceberg-only
      * views — tiered views still use their per-row INSTEAD OF trigger
@@ -1297,7 +1373,19 @@ coldfront_post_parse_analyze(ParseState *pstate, Query *query,
     if (query->commandType != CMD_UPDATE &&
         query->commandType != CMD_DELETE &&
         query->commandType != CMD_INSERT)
+    {
+        /* Read path: lazily attach 'ice' on the first SELECT in this session
+         * that touches a registered tiered view, so the view body's
+         * iceberg_scan('ice...') resolves — the version-agnostic cold-read
+         * attach (PG 16/17/18).  Guarded
+         * once-per-session; the relkind check inside query_reads_tiered_view
+         * keeps plain queries off the SPI path. */
+        if (query->commandType == CMD_SELECT &&
+            !coldfront_ice_attached &&
+            query_reads_tiered_view(query))
+            ensure_ice_attached_once();
         return;
+    }
 
     if (query->resultRelation == 0)
         return;
@@ -1327,7 +1415,7 @@ coldfront_post_parse_analyze(ParseState *pstate, Query *query,
             }
             else
             {
-                ensure_attached_via_spi();
+                ensure_ice_attached_once();
                 /* The fast cold path streams source rows via pglocal —
                  * needs the postgres ATTACH. The plpgsql cold-loop fast
                  * path doesn't, but the call is cheap when not needed
@@ -1355,7 +1443,7 @@ coldfront_post_parse_analyze(ParseState *pstate, Query *query,
             break;
 
         case TIER_COLD:
-            ensure_attached_via_spi();
+            ensure_ice_attached_once();
             /* INSERT … SELECT FROM pg_source needs pglocal. Walk the
              * rtable; if any non-result RTE_RELATION is present, the
              * deparsed SELECT will reference it and DuckDB will need
@@ -1364,7 +1452,8 @@ coldfront_post_parse_analyze(ParseState *pstate, Query *query,
              * generate_series / read_parquet / etc., because those
              * work in pure DuckDB context and the ATTACH itself
              * triggers a libpq-linkage error on some pg_duckdb builds
-             * (see the comment on _login_session_init). */
+             * (the pglocal-loopback / postgres-extension recursion noted
+             * on coldfront.ensure_pg_attached). */
             if (query->commandType == CMD_INSERT &&
                 query_has_pg_source_table(query))
                 ensure_pg_attached_via_spi();
@@ -1391,7 +1480,7 @@ coldfront_post_parse_analyze(ParseState *pstate, Query *query,
                                      "on",
                                      PGC_USERSET, PGC_S_SESSION,
                                      GUC_ACTION_LOCAL, true, 0, false);
-            ensure_attached_via_spi();
+            ensure_ice_attached_once();
             new_sql = emit_dual(query, &info);
             break;
 
@@ -1513,6 +1602,14 @@ coldfront_xact_callback(XactEvent event, void *arg)
 
     if (event != XACT_EVENT_COMMIT && event != XACT_EVENT_ABORT)
         return;
+
+    /* A lazy 'ice' ATTACH runs inside the user's transaction, so an abort rolls
+     * the DuckDB ATTACH back.  Clear the once-per-session guard so the next
+     * tiered-view query re-attaches.  Before the pending-release early-return
+     * below (a read-only session has no releases queued). */
+    if (event == XACT_EVENT_ABORT)
+        coldfront_ice_attached = false;
+
     if (coldfront_pending_releases == NIL)
         return;
 

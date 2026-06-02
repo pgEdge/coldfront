@@ -36,7 +36,7 @@ Application
   └── DELETE FROM events WHERE ...      ← coldfront rewrites to the right tier
          │
 ┌────────▼──────────────────────────────────────────────────┐
-│  PostgreSQL 17/18 + pg_duckdb + coldfront extensions       │
+│  PostgreSQL 16/17/18 + pg_duckdb + coldfront extensions    │
 │                                                            │
 │  _events (renamed partitioned table, hot data)             │
 │  ├── p_2026_04  (hot, native PG)                           │
@@ -399,11 +399,11 @@ curl -X POST http://localhost:8181/management/v1/warehouse \
 CREATE EXTENSION IF NOT EXISTS pg_duckdb;
 SELECT duckdb.install_extension('iceberg');
 
--- Persistent S3 secret (auto-loads every session, survives restarts)
-SELECT duckdb.create_simple_secret(
-  's3', 'admin', 'adminsecret',
-  '', 'us-east-1', 'path', '', 'seaweedfs:8333', '', '', 'false'
-);
+-- Cold-tier S3 credentials, set once per database. Stored in the
+-- coldfront.storage_secret table (replicates across a Spock mesh,
+-- excluded from pg_dump) and materialized as a DuckDB PERSISTENT
+-- SECRET that loads at instance init.
+SELECT coldfront.set_storage_secret('admin', 'adminsecret', 'seaweedfs:8333');
 
 -- Create your partitioned table
 CREATE TABLE events (
@@ -425,35 +425,23 @@ The archiver automatically creates:
 
 ### Per-session setup
 
-**None.** A LOGIN event trigger installed by the `coldfront` extension
-(`coldfront._login_session_init`, PG17+) calls
-`coldfront.ensure_attached()` automatically at backend start, so both
-cold reads (`iceberg_scan` through the unified view) and cold writes
-(`duckdb.raw_query` against `ice.default.<table>`) Just Work on a fresh
-psql session. No `ATTACH IF NOT EXISTS` needed in application code.
-
-The trigger is gated on a single row in `coldfront.runtime_config` so it
-does nothing until the operator explicitly opts in — connections are
-never blocked if Lakekeeper happens to be down or the warehouse isn't
-provisioned yet. After bootstrapping the warehouse, arm the trigger
-once per database:
+**None.** Set the cold-tier S3 credentials once per database:
 
 ```sql
-SELECT coldfront.arm_login_attach();
+SELECT coldfront.set_storage_secret('admin', 'adminsecret', 'seaweedfs:8333');
 ```
 
-That helper is a plain `UPDATE` on `coldfront.runtime_config` (no `ALTER
-SYSTEM`, no superuser required — just UPDATE privilege on the table).
-From that point, every new backend auto-attaches on login.
-`coldfront.disarm_login_attach()` is the symmetric toggle for ops /
-debugging.
-
-The login-time ATTACH also forces pg_duckdb's S3 secret to commit in a
-DuckDB MetaTransaction before any user query runs — side-stepping a
-latent MVCC-visibility issue in the duckdb-iceberg extension's
-commit-time I/O. See
-[ARCHITECTURE.md → Upstream Requests → duckdb-iceberg secret visibility](ARCHITECTURE.md#duckdb-iceberg-secret-visibility-under-fresh-transactions)
-for the mechanism. Requires PostgreSQL 17+.
+This stores the secret in the `coldfront.storage_secret` table — an
+extension-member table (so its data is excluded from `pg_dump` by
+default) added to the Spock repset (so it replicates by value to every
+mesh node) — and materializes a DuckDB PERSISTENT SECRET that DuckDB
+loads at instance init. The Iceberg catalog `ice` is then attached
+**lazily** by the coldfront C extension hook on the first query that
+touches a tiered view (read or write), so both cold reads (`iceberg_scan`
+through the unified view) and cold writes (`duckdb.raw_query` against
+`ice.default.<table>`) Just Work on a fresh psql session. No
+`ATTACH IF NOT EXISTS` needed in application code and no connect-time
+setup. Works uniformly on PostgreSQL 16, 17, and 18.
 
 One canonical user journey ([ci/journey.sh](ci/journey.sh)) runs identically in
 every deployment cell; `ci/matrix.sh` drives the cells and `ci/topo/*.sh` brings
@@ -465,10 +453,8 @@ golangci-lint, unit tests, build, the pg_regress unit layer, and the full
 journey on one representative cell (PG18 · vanilla · tiered). Fast; runs on
 every commit. GitHub Actions must run the identical `ci/matrix.sh` steps.
 
-**Full matrix** — `ci/matrix.sh --full`, the beta gate: PG {17, 18} ×
-{vanilla, mesh (3-node Spock)} × {tiered, decoupled}. (PG 16 is upstream-blocked
-— it lacks the PG 17+ `ON login` event trigger that works around the
-duckdb-iceberg secret-visibility bug; see [ARCHITECTURE.md → Upstream Requests](ARCHITECTURE.md#upstream-requests).) The mesh cells add the
+**Full matrix** — `ci/matrix.sh --full`, the beta gate: PG {16, 17, 18} ×
+{vanilla, mesh (3-node Spock)} × {tiered, decoupled}. The mesh cells add the
 cross-node stories — hot visibility via Spock, cold visibility via the shared
 Lakekeeper catalog, the R-A bakery serialising concurrent cold writers
 (same-node and cross-node) with no 409, and an N×(N-1) probe that the bakery's
@@ -513,7 +499,7 @@ pgedge-coldfront/
 
 | Component | Version | Purpose |
 |-----------|---------|---------|
-| PostgreSQL | 17 or 18 | Database with native partitioning (stock upstream; no fork). PG 16 is upstream-blocked — see [Upstream Requests](ARCHITECTURE.md#upstream-requests) |
+| PostgreSQL | 16, 17, or 18 | Database with native partitioning (stock upstream; no fork) |
 | pg_duckdb | 1.1.1+ | Iceberg reads via DuckDB in-process |
 | Lakekeeper | latest | Iceberg REST catalog (Rust binary) |
 | S3-compatible store | any | AWS S3, SeaweedFS, MinIO, GCS, Azure Blob, etc. |

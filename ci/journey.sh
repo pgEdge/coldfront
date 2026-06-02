@@ -41,25 +41,26 @@ esac; done
 step "JOURNEY  host=$HOST  mode=$MODE  mesh=$MESH  standby=${STANDBY:-none}"
 
 # ───────────────────────────────────────────────────────────────────────────
-# Story 1 — Setup: extensions, S3 secret, arm the login attach.
+# Story 1 — Setup: extensions + the cold-tier S3 secret via set_storage_secret.
 # (GUCs warehouse/lakekeeper_endpoint live in the node's postgresql.conf; the
 #  topology brought up Lakekeeper + the warehouse already.)
 # ───────────────────────────────────────────────────────────────────────────
 story_setup() {
-    step "1. Setup (extensions, S3 secret, arm login-attach)"
+    step "1. Setup (extensions, storage secret)"
     qf "$HOST" <<EOSQL >/dev/null
 CREATE EXTENSION IF NOT EXISTS pg_duckdb;
 CREATE EXTENSION IF NOT EXISTS coldfront;
 -- iceberg/avro: the patched binary is shipped in the image + autoloaded on
 -- ATTACH (TYPE ICEBERG) with allow_unsigned; no install_extension needed.
-DROP SERVER IF EXISTS simple_s3_secret CASCADE;
-SELECT duckdb.create_simple_secret('s3','admin','adminsecret','','us-east-1','path','','${SW_IP}:8333','','','false');
-SELECT coldfront.arm_login_attach();
+-- set_storage_secret writes the in-DB row AND materializes a DuckDB PERSISTENT
+-- secret (loaded at init), so cold reads/writes resolve creds with no login
+-- trigger — the mechanism that works on PG 16/17/18.
+SELECT coldfront.set_storage_secret('admin','adminsecret','${SW_IP}:8333');
 EOSQL
     local ext; ext=$(q "$HOST" "SELECT count(*) FROM pg_extension WHERE extname IN ('pg_duckdb','coldfront');")
     assert_eq "extensions present" "2" "$ext"
-    local armed; armed=$(q "$HOST" "SELECT attach_on_login FROM coldfront.runtime_config LIMIT 1;")
-    assert_eq "login-attach armed" "t" "$armed"
+    local secret; secret=$(q "$HOST" "SELECT count(*) FROM coldfront.storage_secret;")
+    assert_eq "storage secret row written" "1" "$secret"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -686,7 +687,7 @@ story_mesh_tiered() {
 # Story 13 — Standby reads: a read-only physical replica serves cross-tier reads
 # (hot via physical replication, cold via iceberg_scan executed on the read-only
 # backend) and rejects writes cleanly. The coldfront catalog (registry,
-# watermark, runtime_config) and the DuckDB S3 secret arrive through the base
+# watermark, storage-secret row) arrives through the base
 # backup + WAL stream, so the replica is byte-identical to the primary (same
 # OIDs) with zero extra setup. Gated by --standby <container>; the topology
 # base-backed it before the journey, so it has streamed every story by now.
@@ -714,12 +715,19 @@ story_standby_reads() {
     # column shape, which must not be what the write probe below targets.
     local vn; [ "$MODE" = tiered ] && vn="public.events" || vn="public.iceonly"
     assert_eq "tiered_views registry replicated" "$(q "$HOST" "SELECT count(*) FROM coldfront.tiered_views;")" "$(q "$STANDBY" "SELECT count(*) FROM coldfront.tiered_views;")"
-    assert_eq "runtime_config (login-attach) replicated" "t" "$(q "$STANDBY" "SELECT attach_on_login FROM coldfront.runtime_config LIMIT 1;")"
+    assert_eq "storage_secret row replicated (physical)" "1" "$(q "$STANDBY" "SELECT count(*) FROM coldfront.storage_secret;")"
     assert_eq "registered view OID identical (physical replication)" \
         "$(q "$HOST" "SELECT '$vn'::regclass::oid;")" "$(q "$STANDBY" "SELECT '$vn'::regclass::oid;")"
 
-    # Reads MATCH the primary across tiers. The login trigger attaches 'ice' on
-    # connect; iceberg_scan then executes read-only on the replica.
+    # The persistent-secret FILE lives outside PGDATA, so it does not ride the
+    # base backup — materialize it on the replica from the (physically
+    # replicated) storage_secret row. SELECT + a DuckDB file write, no PG write,
+    # so it's allowed on a read-only standby.
+    q "$STANDBY" "SELECT coldfront.materialize_storage_secret();" >/dev/null 2>&1
+
+    # Reads MATCH the primary across tiers. The extension hook attaches 'ice'
+    # lazily on the first tiered-view query in this read-only session;
+    # iceberg_scan then executes read-only on the replica.
     assert_eq "standby cross-tier read == primary" "$(q "$HOST" "SELECT count(*) FROM $vn;")" "$(q "$STANDBY" "SELECT count(*) FROM $vn;")"
     assert_eq "standby cold-side read (iceberg_scan on replica) == primary" \
         "$(q "$HOST" "SELECT count(*) FROM $vn WHERE ts < '2026-04-01';")" \

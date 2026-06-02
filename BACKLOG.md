@@ -20,59 +20,46 @@ Design reference: [ARCHITECTURE.md](ARCHITECTURE.md). Failover is out of scope
   built from it.
 - All 8 **PG 18** cells green: {vanilla, mesh} × {tiered, decoupled} ×
   {primary, standby}.
+- **PG 16, 17, and 18 all supported.** The cold-tier S3 credential is a DuckDB
+  PERSISTENT SECRET (set once via `coldfront.set_storage_secret(...)`, loaded at
+  instance init) and the `ice` catalog is attached lazily by the C extension hook
+  on the first query touching a tiered view — a design that is uniform across PG
+  16/17/18 with no version gating.
 - Physical standby reads: probe gate, base-backup bring-up (`COLDFRONT_STANDBY_OF`),
   `story_standby_reads`, cold-write fencing on a replica (`pg_is_in_recovery()`
   guard in `_exec_iceberg_with_claim`), `failover-patroni.md` runbook.
 
 **Open** (this document)
-1. PG 16 matrix cells — *upstream-blocked* (PG 17 is now supported and RUN).
-2. Operational hardening (`ci/ops/`): privilege model, Lakekeeper-down, S3-down, dump/restore.
-3. Login-trigger graceful degradation.
-4. Standby production-hardening (replication slot, replication role).
-5. Tracked upstream gaps (pg_duckdb / duckdb-iceberg).
-6. Partition manager — follow-ups (`feat/partition-manager` branch).
+1. Operational hardening (`ci/ops/`): privilege model, Lakekeeper-down, S3-down, dump/restore.
+2. Standby production-hardening (replication slot, replication role).
+3. Tracked upstream gaps (pg_duckdb / duckdb-iceberg).
+4. Partition manager — follow-ups (`feat/partition-manager` branch).
 
 ---
 
-## 1. PG 16 matrix cells — *upstream-blocked*
+## PG 16/17/18 matrix cells — *done / supported*
 
-**Status.** **PG 17 is supported and RUN** — `ci/matrix.sh --full` drives both 17
-and 18 ({vanilla, mesh} × {tiered, decoupled} × {primary, standby}); pg_regress
-runs once per major. **PG 16 is blocked by an upstream bug**, not by tooling: the
-image builds fine on 16 (the base tag exists, pg_duckdb v1.1.1 and the PGXS
-extension both compile), but cold **writes** cannot work — see below.
+**Status. PG 16, 17, and 18 are all supported and RUN.** `ci/matrix.sh --full`
+drives all three majors ({vanilla, mesh} × {tiered, decoupled} × {primary,
+standby}); pg_regress runs once per major. The image builds on each (the base
+tags exist, pg_duckdb v1.1.1 and the PGXS extension compile), and cold reads
+**and** writes work uniformly.
 
-**⚠ PG 16 blocker — LOGIN event triggers are PG 17+, and they are the only fix
-for the duckdb-iceberg secret-visibility bug.** ColdFront's auto-attach
-(`coldfront._login_session_init`) is a **LOGIN event trigger**, which **does not
-exist before PG 17**. Its real job is not just convenience: per
-[ARCHITECTURE.md → Upstream Requests → "duckdb-iceberg: secret visibility under
-fresh transactions"](ARCHITECTURE.md#upstream-requests), a fresh DuckDB
-transaction (which `IRCTransaction::Commit` opens) cannot see an S3 secret
-registered in the *same, still-uncommitted* transaction — so a cold write's
-commit fails with `HTTP 403` against any non-AWS endpoint **unless a prior,
-committed DuckDB transaction loaded the secret first**. The login trigger's
-`ATTACH IF NOT EXISTS` is exactly that prior committed transaction.
-
-**Lazy attach was evaluated and does NOT work** (verified empirically, 2026-06).
-Calling `ensure_attached()` from `post_parse_analyze_hook` on the first query
-attaches inside the *write's own* transaction → the secret isn't yet committed
-when `IRCTransaction::Commit` looks it up → the same `403`. It fixes cold *reads*
-(no Iceberg commit) but not cold *writes*. There is no PG 16-compatible hook that
-runs in a *prior* transaction at session start (parse-analyze/executor hooks are
-all nested in the user's statement; `ClientAuthentication_hook` / `_PG_init`
-fire before any transaction exists). Patching pg_duckdb is out of scope (stock
-upstream, no fork).
-
-**Resolution.** PG 16 stays `PENDING` until the upstream fix lands (either
-`IRCTransaction::Commit` runs commit-time I/O under the caller's `ClientContext`,
-or pg_duckdb commits a synthesised secret's transaction before consumers look it
-up). Then PG 16 can use the lazy-attach path with no login trigger. Tracked as a
-[duckdb-iceberg upstream request](ARCHITECTURE.md#upstream-requests).
+**Why it is uniform across majors.** The cold-tier S3 credential is materialized
+as a DuckDB **PERSISTENT SECRET** — set once with
+`SELECT coldfront.set_storage_secret('<key>','<secret>','<endpoint>')`, which
+also stores the secret in the extension-member `coldfront.storage_secret` table
+(excluded from `pg_dump` by default, added to the Spock repset so it replicates
+by value to every mesh node). Because DuckDB loads the persistent secret at
+instance init, the secret is already committed and visible by the time any
+query runs. The `ice` Iceberg catalog is then attached **lazily** by the C
+extension hook on the first query that touches a tiered view (read or write).
+Nothing in this path depends on a PG 17+ feature, so the same path serves
+PG 16, 17, and 18.
 
 ---
 
-## 2. Operational hardening (`ci/ops/`) — *beta scope*
+## 1. Operational hardening (`ci/ops/`) — *beta scope*
 
 A new `ci/ops/` suite, run once per representative cell (not every cell).
 
@@ -83,43 +70,23 @@ A new `ci/ops/` suite, run once per representative cell (not every cell).
   set + an ops cell that runs the journey under it.
 - **Lakekeeper-down.** With the REST catalog unreachable: cold reads/writes fail
   with a clear error, while hot-tier access **and node connectability** survive
-  (tied to item 3). Assert no crash, no hang.
+  (the lazy attach happens inside the failing query, so a catalog outage degrades
+  only cold I/O — it never blocks connecting or reading hot data). Assert no
+  crash, no hang.
 - **S3-down.** Object store unreachable: same graceful-degradation bar (cold I/O
   fails cleanly; hot tier unaffected).
 - **`pg_dump` / restore.** Dump the PG side — wrapper views, `coldfront.tiered_views`,
-  `archive_watermark`, `runtime_config`, and the DuckDB S3 secret
-  (`pg_foreign_server`) — restore into a fresh PG, and confirm it re-attaches to
-  the **same** Iceberg tables and reads cold data. (No Iceberg data is in the
-  dump — only the PG-side wiring; the test proves the wiring survives a restore.)
+  `archive_watermark`, and the `coldfront.storage_secret` row — restore into a
+  fresh PG, and confirm the restored node re-materializes the DuckDB persistent
+  secret, attaches to the **same** Iceberg tables on first touch, and reads cold
+  data. (The `storage_secret` table is an extension member, so its data is
+  excluded from a default `pg_dump`; the restore test must therefore dump it
+  explicitly, or re-run `set_storage_secret` on the target, to prove the wiring
+  survives. No Iceberg data is in the dump — only the PG-side wiring.)
 
 ---
 
-## 3. Login-trigger graceful degradation — *robustness gap (beta scope)*
-
-**What.** `coldfront._login_session_init()` calls `ensure_attached()` with no
-error handling. After `arm_login_attach()`, if Lakekeeper/S3 is unreachable the
-`ATTACH … (TYPE ICEBERG …)` raises → the trigger raises → **login is rejected**.
-The node becomes unconnectable, unable even to read hot data. (The current
-comment frames the rejection as "the right signal for a broken setup" — too
-strict for an HA deployment, and the failure mode an ops Lakekeeper-down test
-will surface.)
-
-**Why.** A transient catalog/object-store outage must not lock operators out of
-an otherwise healthy node.
-
-**Approach.** Make login-time attach failure **non-fatal**: the session connects,
-`ice` is simply not attached, cold queries fail with a clear "catalog not
-attached" message, hot queries work. **Constraint:** pg_duckdb hard-rejects
-subtransactions, so this **cannot** be a `BEGIN … EXCEPTION WHEN …` block — it
-must be a **precondition check** (cheaply probe catalog reachability before the
-ATTACH) or a **GUC** (e.g. `coldfront.attach_on_login = 'try' | 'require'`)
-selecting fail-soft vs fail-hard. Driven by the `ci/ops/` Lakekeeper-down story
-(item 2). Note this also interacts with the PG 16 lazy-attach work (item 1): if
-attach moves into the DML hook, the same fail-soft policy applies there.
-
----
-
-## 4. Standby production-hardening — *near-term*
+## 2. Standby production-hardening — *near-term*
 
 The PG 18 standby cells prove the mechanism end-to-end; production deployments
 additionally want:
@@ -137,7 +104,7 @@ additionally want:
 
 ---
 
-## 5. Tracked upstream gaps — *not blocking; coldfront works around each*
+## 3. Tracked upstream gaps — *not blocking; coldfront works around each*
 
 See also [ARCHITECTURE.md → Upstream Requests](ARCHITECTURE.md#upstream-requests).
 
@@ -155,7 +122,7 @@ See also [ARCHITECTURE.md → Upstream Requests](ARCHITECTURE.md#upstream-reques
 
 ---
 
-## 6. Partition manager — follow-ups — *feat/partition-manager branch*
+## 4. Partition manager — follow-ups — *feat/partition-manager branch*
 
 The standalone partition manager (`cmd/partitioner`, `internal/partition`) is
 feature-complete and unit-tested: time/id modes (uuidv7, snowflake), 2-level

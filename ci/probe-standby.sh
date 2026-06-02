@@ -8,10 +8,11 @@
 # physical base backup into a standby container (entrypoint COLDFRONT_STANDBY_OF),
 # and on the STANDBY:
 #   - confirms it is a hot standby in recovery, caught up to the primary;
-#   - reads cross-tier via the LOGIN-trigger path (realistic: a user connects,
-#     the trigger ATTACHes 'ice', the events view UNIONs hot+cold);
-#   - reads cross-tier + cold-only via an EXPLICIT ensure_attached() with the
-#     login trigger suppressed (isolates iceberg_scan from the trigger);
+#   - reads cross-tier via the lazy-attach path (realistic: a fresh session
+#     SELECTs the tiered view, the extension hook ATTACHes 'ice', the events
+#     view UNIONs hot+cold);
+#   - reads cross-tier + cold-only via an EXPLICIT ensure_attached() (isolates
+#     iceberg_scan on the replica);
 #   - confirms a write through the view fails CLEANLY (read-only txn), not a crash.
 #
 # GREEN authorizes building the standby cells (matrix.sh step 4). RED keeps them
@@ -74,9 +75,7 @@ step "3. provision tiered events (extensions, secret, seed, archiver → Jan-Mar
 qf "$DB" <<EOSQL >/dev/null
 CREATE EXTENSION IF NOT EXISTS pg_duckdb;
 CREATE EXTENSION IF NOT EXISTS coldfront;
-DROP SERVER IF EXISTS simple_s3_secret CASCADE;
-SELECT duckdb.create_simple_secret('s3','admin','adminsecret','','us-east-1','path','','${SW_IP}:8333','','','false');
-SELECT coldfront.arm_login_attach();
+SELECT coldfront.set_storage_secret('admin','adminsecret','${SW_IP}:8333');
 EOSQL
 qf "$DB" <<'EOSQL' >/dev/null
 SET search_path = public;
@@ -132,27 +131,31 @@ assert_gt "primary actually has cold iceberg rows" "0" "$PRIMARY_COLD"
 step "4. base-backup a read-only standby of $DB"
 if standby_up "$DB" "$SB"; then pass "standby accepting connections"; else fail "standby never accepted connections"; exit 1; fi
 
-# psql on the standby with the LOGIN trigger SUPPRESSED — isolates iceberg_scan
-# (explicit ensure_attached) from the login-trigger path. Also used for pure-PG
-# infra checks so they don't depend on the trigger.
-sb_noet() { docker exec -i -e PGOPTIONS='-c event_triggers=off' -e PGUSER=coldfront -e PGDATABASE=coldfront "$SB" psql -tA "$@" 2>&1; }
+# psql on the standby for pure-PG infra checks and the explicit-attach gate.
+sb_psql() { docker exec -i -e PGUSER=coldfront -e PGDATABASE=coldfront "$SB" psql -tA "$@" 2>&1; }
 
-INREC=$(sb_noet -c "SELECT pg_is_in_recovery();")
+INREC=$(sb_psql -c "SELECT pg_is_in_recovery();")
 assert_eq "standby is in recovery (hot standby)" "t" "$INREC"
 
 # Wait for the hot partition to replicate (pure-PG, no iceberg dependency).
 for i in $(seq 1 30); do
-    [ "$(sb_noet -c 'SELECT count(*) FROM public.p_2026_04;')" = "$PRIMARY_HOT" ] && break
+    [ "$(sb_psql -c 'SELECT count(*) FROM public.p_2026_04;')" = "$PRIMARY_HOT" ] && break
     sleep 1
 done
-assert_eq "standby caught up (hot partition via physical replication)" "$PRIMARY_HOT" "$(sb_noet -c 'SELECT count(*) FROM public.p_2026_04;')"
+assert_eq "standby caught up (hot partition via physical replication)" "$PRIMARY_HOT" "$(sb_psql -c 'SELECT count(*) FROM public.p_2026_04;')"
+
+# The persistent-secret file is outside PGDATA, so it did not ride the base
+# backup — materialize it on the replica from the (physically replicated)
+# storage_secret row. SELECT + a DuckDB file write, no PG write, so it is
+# allowed on a read-only standby.
+sb_psql -c "SELECT coldfront.materialize_storage_secret();" >/dev/null 2>&1
 
 # ── 5. THE GATE — iceberg reads on the read-only standby ───────────────────
 step "5. GATE — pg_duckdb iceberg_scan on the read-only standby"
 
-# 5a. Explicit-attach path (login trigger suppressed): ensure_attached() + reads
-#     MUST run in ONE session (the ATTACH is session-local).
-GATE=$(sb_noet <<'EOSQL'
+# 5a. Explicit-attach path: ensure_attached() + reads MUST run in ONE session
+#     (the ATTACH is session-local).
+GATE=$(sb_psql <<'EOSQL'
 SELECT coldfront.ensure_attached();
 SELECT 'TOTAL:'||count(*) FROM public.events;
 SELECT 'COLD:'||count(*) FROM public.events WHERE ts < '2026-04-01';
@@ -163,16 +166,17 @@ if [ -z "$SB_TOTAL" ]; then note "explicit-attach gate raw output:"; echo "$GATE
 assert_eq "standby cross-tier read == primary (explicit attach, iceberg_scan works)" "$PRIMARY_TOTAL" "${SB_TOTAL:-MISSING}"
 assert_eq "standby cold-only read (pure iceberg_scan)" "$PRIMARY_COLD" "${SB_COLD:-MISSING}"
 
-# 5b. Login-trigger path (realistic: trigger fires on connect, attaches 'ice').
-# q_may captures stderr too, so the login-time duckdb ATTACH NOTICE rides along;
-# the count is the lone pure-numeric line (NOTICE/BOOLEAN/[Rows] lines are not).
-LOGIN=$(q_may "$SB" "SELECT count(*) FROM public.events;")
-LOGIN_NUM=$(echo "$LOGIN" | grep -E '^[0-9]+$' | tail -1)
-if [ -n "$LOGIN_NUM" ]; then
-    assert_eq "login-attach session reads cross-tier on standby (trigger attaches 'ice')" "$PRIMARY_TOTAL" "$LOGIN_NUM"
+# 5b. Lazy-attach path (realistic: a fresh session SELECTs the tiered view; the
+# extension hook attaches 'ice' on first touch — no explicit call). q_may
+# captures stderr too, so the duckdb ATTACH NOTICE rides along; the count is the
+# lone pure-numeric line (NOTICE/BOOLEAN/[Rows] lines are not).
+LAZY=$(q_may "$SB" "SELECT count(*) FROM public.events;")
+LAZY_NUM=$(echo "$LAZY" | grep -E '^[0-9]+$' | tail -1)
+if [ -n "$LAZY_NUM" ]; then
+    assert_eq "lazy-attach session reads cross-tier on standby (hook attaches 'ice')" "$PRIMARY_TOTAL" "$LAZY_NUM"
 else
-    note "login-trigger path returned: $LOGIN"
-    fail "login-attach not standby-safe (login rejected / errored on the read-only replica)"
+    note "lazy-attach path returned: $LAZY"
+    fail "lazy-attach not standby-safe (read errored on the read-only replica)"
 fi
 
 # ── 6. Writes through the view must fail CLEANLY (read-only), not crash ────

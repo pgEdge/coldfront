@@ -2,7 +2,7 @@
 
 ## TL;DR — KISS wins
 
-ColdFront is **stock upstream PostgreSQL 17/18 + two extensions + one
+ColdFront is **stock upstream PostgreSQL 16/17/18 + two extensions + one
 small Rust binary (Lakekeeper) + any S3**.  The archiver is a
 small static Go binary (~9 MB, no runtime, no CGO, no daemon) that
 runs from cron.  That is the entire stack.
@@ -35,7 +35,7 @@ Every competitor picks a heavier compromise:
 
 | | **ColdFront** | **EDB PGAA** | **Databricks Lakebase** | **Snowflake PG / `pg_lake`** |
 |---|---|---|---|---|
-| PostgreSQL | **Stock upstream PG 17/18** | EDB distribution | Databricks-managed Neon fork | Stock upstream PG 16/17/18 |
+| PostgreSQL | **Stock upstream PG 16/17/18** | EDB distribution | Databricks-managed Neon fork | Stock upstream PG 16/17/18 |
 | License | 100% OSS (PostgreSQL / MIT / Apache 2.0) | Proprietary (EDB subscription) | Service proprietary; [Neon](https://github.com/neondatabase/neon) Apache 2.0, [pg_mooncake](https://github.com/Mooncake-Labs/pg_mooncake) MIT | Service proprietary; [pg_lake](https://github.com/Snowflake-Labs/pg_lake) Apache 2.0 |
 | PG extensions required | **2** (`pg_duckdb`, `coldfront`) | `pgaa` TAM + PGD stack | Lakebase runtime + `pg_mooncake` + `pg_moonlink` | **15+** (`pg_lake_iceberg`, `pg_lake_table`, `pg_lake_copy`, `duckdb_pglake`, …) |
 | Separate services / daemons | Lakekeeper (~20 MB Rust binary) + S3 | Seafowl daemon + PGFS + PGD consensus + AutoPartition | Databricks workspace, Pageserver, Photon, Unity Catalog, Synced Tables / Lakehouse Sync | `pgduck_server` daemon + optional Polaris |
@@ -140,11 +140,12 @@ Limitations](ARCHITECTURE.md#known-limitations).
    `->`, `#>`) work unchanged; jsonb-only operators (`?`, `@>`,
    containment, de-dup) need an explicit `data::jsonb` in the
    caller's query.
-4. One-time arming after Lakekeeper bootstrap: an operator must
-   call `SELECT coldfront.arm_login_attach()` once per database for
-   the LOGIN event trigger to start auto-attaching Iceberg on every
-   new session. After that, session setup is fully automatic — no
-   per-query boilerplate. EDB's tiering has no equivalent arming
+4. One-time credential setup after Lakekeeper bootstrap: an operator
+   must call `SELECT coldfront.set_storage_secret(...)` once per
+   database to store the cold-tier S3 credentials. After that, the
+   Iceberg catalog is attached lazily by the C extension hook on the
+   first query that touches a tiered view — no per-query boilerplate,
+   no session arming. EDB's tiering has no equivalent credential
    step.
 5. Lifecycle is a cron-driven archiver — no state machine, no
    automatic restore.  EDB PGD AutoPartition is more turnkey.
@@ -162,7 +163,7 @@ Non-redundant differentiators, distilled:
 | | **ColdFront** | **EDB PGAA** | **Lakebase** | **Snowflake PG / `pg_lake`** |
 |---|---|---|---|---|
 | Licence | Open source (PostgreSQL / MIT / Apache) | Proprietary EDB subscription | Proprietary service (Neon Apache, Mooncake MIT) | Proprietary service (`pg_lake` Apache) |
-| Runs on | Stock upstream PG 17/18 | EDB PGD cluster (min. 3 nodes) | Databricks SaaS only | Snowflake SaaS or stock PG 16/17/18 |
+| Runs on | Stock upstream PG 16/17/18 | EDB PGD cluster (min. 3 nodes) | Databricks SaaS only | Snowflake SaaS or stock PG 16/17/18 |
 | Forks / distributions required | None | EDB Postgres distribution | Databricks-managed Neon fork | None for OSS pg_lake |
 | PG extensions | 2 | 1 (`pgaa`) + PGD stack | Lakebase runtime + 2 Mooncake extensions | 15+ |
 | Analytical engine | **In-process** DuckDB | Arrow Flight RPC to Seafowl daemon | Photon (Databricks-side only) | Local socket IPC to `pgduck_server` daemon |

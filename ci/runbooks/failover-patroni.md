@@ -22,12 +22,13 @@ backup and a promotion:
   to every replica and remain in force after promotion. Avoid `ALTER SYSTEM` for
   these: it works (`postgresql.auto.conf` also rides a base backup) but splitting
   config across two files is how nodes drift.
-- **The DuckDB S3 secret** is a `pg_foreign_server` row (created by
-  `duckdb.create_simple_secret`). It lives in the catalog, so it is **physically
-  replicated** to every standby and present immediately on promotion — no
-  re-creation step.
+- **The cold-tier S3 secret** is a row in the `coldfront.storage_secret` table
+  (set once via `coldfront.set_storage_secret`). It lives in the catalog, so it is
+  **physically replicated** to every standby and present immediately on promotion —
+  no re-creation step. (On promotion, DuckDB re-materializes its persistent secret
+  from this row at instance init.)
 - **The coldfront catalog** (`coldfront.tiered_views`, `coldfront.archive_watermark`,
-  `coldfront.runtime_config`) is ordinary table data → physically replicated,
+  `coldfront.storage_secret`) is ordinary table data → physically replicated,
   byte-identical (same OIDs) on every replica.
 
 A consequence (documented, not tested): a **vanilla** promotion "just works." The

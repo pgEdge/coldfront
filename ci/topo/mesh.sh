@@ -4,7 +4,7 @@
 # Brings up db1/db2/db3 on the ONE parameterized image (MESH=on → the entrypoint
 # loads snowflake,spock,pg_duckdb,coldfront and writes the mesh GUCs), forms the
 # Spock mesh (node_create + 6 bidirectional subs), bootstraps Lakekeeper +
-# warehouse, arms login-attach on every node, then runs the journey against db1
+# warehouse, sets the storage secret on every node, then runs the journey against db1
 # with --mesh so the mesh-only stories (cross-node visibility, bakery under
 # multi-node contention) run too. Lakekeeper is on its own dedicated Postgres.
 #
@@ -50,9 +50,17 @@ ip() { docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}
 DB1_IP=$(ip "$PRIMARY"); SW_IP=$(ip coldfront-seaweedfs-1); LK_IP=$(ip coldfront-lakekeeper-1)
 
 step "mesh: extensions on all nodes"
+# One CREATE EXTENSION per call with ON_ERROR_STOP, errors surfaced — never chain
+# them in a single psql -c (the first failure aborts the rest) and never hide them
+# behind /dev/null: a silent CREATE EXTENSION spock failure once let a dead mesh
+# masquerade as healthy for an entire matrix run.
 for n in $NODES; do
-    docker exec -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" "coldfront-${n}-1" "$CF_PSQL" -q -c \
-        "CREATE EXTENSION IF NOT EXISTS dblink; CREATE EXTENSION IF NOT EXISTS snowflake; CREATE EXTENSION IF NOT EXISTS spock; CREATE EXTENSION IF NOT EXISTS pg_duckdb; CREATE EXTENSION IF NOT EXISTS coldfront;" >/dev/null 2>&1
+    for ext in dblink snowflake spock pg_duckdb coldfront; do
+        if ! out=$(docker exec -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" "coldfront-${n}-1" \
+                   "$CF_PSQL" -v ON_ERROR_STOP=1 -qtAc "CREATE EXTENSION IF NOT EXISTS $ext;" 2>&1); then
+            echo "CREATE EXTENSION $ext on $n FAILED: $out"; exit 1
+        fi
+    done
 done
 
 step "mesh: Spock bootstrap (3 nodes, 6 subs)"
@@ -64,7 +72,7 @@ for a in $NODES; do for b in $NODES; do [ "$a" = "$b" ] && continue
 done; done
 for n in $NODES; do m "$n" "SELECT spock.sub_wait_for_sync(sub_name) FROM spock.subscription;" >/dev/null 2>&1; done
 subs=$(m db1 "SELECT count(*) FROM spock.subscription;")
-[ "$subs" = 2 ] || echo "  warning: db1 has $subs subs (expected 2)"
+[ "$subs" = 2 ] || { echo "spock bootstrap FAILED: db1 has '$subs' subscriptions (expected 2) — mesh not formed"; exit 1; }
 
 # Pre-arm the R-A bakery substrate on EVERY node: coldfront.claims/claim_acks
 # must be in each node's replication set BEFORE any cold write. A peer acks an
@@ -91,10 +99,12 @@ if [ "$MODE" = tiered ]; then
         m "$n" "SELECT spock.repset_add_table('default','coldfront.archive_watermark'::regclass, false);" >/dev/null 2>&1
     done
 fi
-# Per-table lifecycle config replicates by value in any mesh mode (the binaries
-# also self-register it via partcfg.EnsureTable; doing it here too is harmless).
+# Per-table lifecycle config + the cold-tier storage secret replicate by value
+# in any mesh mode (partition_config is also self-registered by the binaries via
+# partcfg.EnsureTable; doing it here too is harmless).
 for n in $NODES; do
     m "$n" "SELECT spock.repset_add_table('default','coldfront.partition_config'::regclass, false);" >/dev/null 2>&1
+    m "$n" "SELECT spock.repset_add_table('default','coldfront.storage_secret'::regclass, false);" >/dev/null 2>&1
 done
 pass "spock mesh formed (6 subs) + bakery substrate armed on all nodes"
 
@@ -114,18 +124,14 @@ for i in $(seq 1 15); do
 done
 echo "$WH" | grep -q "warehouse-id" || { echo "warehouse creation failed after retries: $WH"; exit 1; }
 
-step "mesh: install iceberg + S3 secret on all nodes"
-# Each node attaches Iceberg independently (the DuckDB iceberg extension is
-# per-node, and the S3 secret feeds the cold read/write path). The journey's
-# setup story does this for db1; peers need it too for cross-node cold reads.
-# Create the secret BEFORE arming so the first post-arm login attaches cleanly.
+step "mesh: set cold-tier storage secret on all nodes"
+# set_storage_secret writes the in-DB row (replicated via the repset above) and
+# materializes a DuckDB PERSISTENT secret on each node — loaded at init, so cold
+# reads/writes resolve creds with no connect-time setup. Run per node so every
+# node's secret file is materialized regardless of apply-trigger behavior.
 for n in $NODES; do
-    docker exec -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" "coldfront-${n}-1" "$CF_PSQL" -q -c \
-        "DROP SERVER IF EXISTS simple_s3_secret CASCADE; SELECT duckdb.create_simple_secret('s3','admin','adminsecret','','us-east-1','path','','${SW_IP}:8333','','','false');" >/dev/null 2>&1
+    m "$n" "SELECT coldfront.set_storage_secret('admin','adminsecret','${SW_IP}:8333');" >/dev/null 2>&1
 done
-
-step "mesh: arm login-attach on all nodes"
-for n in $NODES; do m "$n" "SELECT coldfront.arm_login_attach();" >/dev/null 2>&1; done
 
 step "mesh: build archiver"
 make -s build >/dev/null 2>&1 || go build -o bin/archiver ./cmd/archiver

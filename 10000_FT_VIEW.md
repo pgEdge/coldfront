@@ -44,13 +44,14 @@ is a property of the deployment, not of the application's SQL.
 
 ## What's under the hood
 
-- **PostgreSQL**: stock upstream open-source PostgreSQL 17 or 18.
+- **PostgreSQL**: stock upstream open-source PostgreSQL 16, 17, or 18.
   Not a fork, not a patched build. Installable from the usual
   packages, operable with the usual tools. The project adds
-  extensions on top; nothing below them is modified. PG 17 is the
-  minimum floor because the `coldfront` extension uses a LOGIN event
-  trigger to auto-attach the Iceberg catalog per session, and LOGIN
-  event triggers are a PG17 feature.
+  extensions on top; nothing below them is modified. The `coldfront`
+  extension attaches the Iceberg catalog lazily — a C extension hook
+  attaches it on the first query that touches a tiered view — so there
+  is no per-session setup step and no version gating; the same
+  mechanism works uniformly on PG 16, 17, and 18.
 - **Hot tier**: regular PostgreSQL range-partitioned tables. Same planner,
   same pg_dump, same backup story. Logical replication (including
   pgEdge's Spock, for multi-master and cross-region setups) treats the

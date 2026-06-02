@@ -174,18 +174,21 @@ cache. To load the **local, patched** build instead:
 ### GUC gotchas (learned the hard way)
 
 - The three `duckdb.*` GUCs are `PGC_SUSET` and read **once at DuckDB init**; the
-  check hook rejects changing them after init. The login trigger inits DuckDB on
-  connect, so set them from an **`event_triggers=off`** connection (skips the
-  login-attach), **one `ALTER SYSTEM` per statement** (two in one `psql -c` =
+  check hook rejects changing them after init. DuckDB inits the first time a
+  session touches it, so apply these via **`ALTER SYSTEM` + reload** before any
+  DuckDB use, **one `ALTER SYSTEM` per statement** (two in one `psql -c` =
   "cannot run inside a transaction block"). In `postgresql.conf` (the image path)
   they are present from first init, so this trap never arises.
-- **Login-attach is fatal if a bad/unsigned binary is in place with
-  `allow_unsigned` still off** — the login trigger's `ATTACH` raises and *every*
-  connection is refused; only `event_triggers=off` connections survive. Always
-  set `allow_unsigned=on` **before** any unsigned binary can load. (Independently
-  worth making login-attach non-fatal so a Lakekeeper/S3 outage can't make a node
-  unconnectable — a precondition guard, not an `EXCEPTION` block, since pg_duckdb
-  forbids subtransactions.)
+- **Set `allow_unsigned=on` before any unsigned binary can load.** If a
+  bad/unsigned iceberg binary is in place with `allow_unsigned` still off, the
+  catalog `ATTACH` raises the first time a tiered view is queried. The catalog is
+  attached **lazily** by the C extension hook on the first query that touches a
+  tiered view (read or write) — the attach is on demand, with no connect-time
+  setup, so a failed `ATTACH` only fails that query rather than refusing connections.
+  Always set `allow_unsigned=on` first so the local bytes load cleanly. (The
+  cold-tier S3 credentials are independent of these GUCs: they are a persistent
+  DuckDB secret materialized by `coldfront.set_storage_secret(...)`, loaded at
+  DuckDB init.)
 
 ## 7. RUNNING THE E2E (verify before any bench)
 

@@ -13,7 +13,7 @@ Once the table exists, **the SQL surface is identical**: `SELECT`, `INSERT`, `UP
 
 ## Prerequisites (both modes)
 
-The stack must already be running with PG + pg_duckdb + coldfront + Lakekeeper + S3-compatible storage. See [README.md → Infrastructure](README.md#infrastructure) for the docker-compose recipe and one-time bootstrap (`bootstrap`, `warehouse`, `arm_login_attach`).
+The stack must already be running with PG + pg_duckdb + coldfront + Lakekeeper + S3-compatible storage. See [README.md → Infrastructure](README.md#infrastructure) for the docker-compose recipe and one-time bootstrap (`bootstrap`, `warehouse`, `set_storage_secret`).
 
 ## Mode 1 — Tiered (hot + cold)
 
@@ -234,11 +234,12 @@ wal_receiver_status_interval = 1s
 snowflake.node = 1
 
 # DSN used by the bakery's autonomous-tx claim INSERT/DELETE via dblink.
-# Unix socket avoids TCP overhead; `event_triggers=off` bypasses the
-# coldfront LOGIN event trigger so the dblink session never enters DuckDB
-# territory (saves ~100ms per claim, avoids a libpq linker recursion).
-# application_name=coldfront_dblink is a marker the trigger checks.
-coldfront.dblink_self = 'host=/tmp dbname=coldfront user=coldfront application_name=coldfront_dblink options=-cevent_triggers=off'
+# Unix socket avoids TCP overhead. The claim session only touches the
+# coldfront.claims/claim_acks heap tables, so it never attaches the
+# Iceberg catalog (the lazy catalog-attach hook fires only on a tiered
+# view). application_name=coldfront_dblink marks the session as bakery
+# traffic.
+coldfront.dblink_self = 'host=/tmp dbname=coldfront user=coldfront application_name=coldfront_dblink'
 
 coldfront.warehouse = 'wh'
 coldfront.lakekeeper_endpoint = 'http://lakekeeper:8181/catalog'

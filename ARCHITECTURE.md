@@ -49,10 +49,10 @@ member — can have one or more **physical (streaming) standbys that serve
 read-only cross-tier reads**. The hot tier arrives by physical replication; the
 cold tier is read by `iceberg_scan` executing on the read-only backend. A base
 backup carries everything a replica needs — the coldfront catalog
-(`tiered_views`, `archive_watermark`, `runtime_config`), the DuckDB S3 secret (a
-`pg_foreign_server` row), and the GUCs (in `postgresql.conf`, not `ALTER SYSTEM`)
-— so a replica is byte-identical to its primary (same OIDs) with zero extra
-setup. Cold **writes** are refused on a standby: every cold write funnels through
+(`tiered_views`, `archive_watermark`, `storage_secret`), the DuckDB persistent
+S3 secret (loaded at instance init), and the GUCs (in `postgresql.conf`, not
+`ALTER SYSTEM`) — so a replica is byte-identical to its primary (same OIDs) with
+zero extra setup. Cold **writes** are refused on a standby: every cold write funnels through
 `_exec_iceberg_with_claim`, which raises when `pg_is_in_recovery()`, so a read
 replica can never become an uncoordinated writer to the shared Iceberg table
 (hot writes hit a PG heap and PG rejects them natively).
@@ -74,7 +74,8 @@ object store:
 │  PostgreSQL + pg_duckdb + coldfront                        │
 │  • one transparent view per managed table                  │
 │  • coldfront hooks: post_parse_analyze (DML rewrite),      │
-│    ProcessUtility (DDL), LOGIN (Iceberg auto-attach)       │
+│    ProcessUtility (DDL); the C hook lazily ATTACHes the    │
+│    Iceberg catalog on the first query touching a view      │
 │  • coldfront.tiered_views registry + bakery claims         │
 │  • pg_duckdb runs DuckDB in-process:                       │
 │      iceberg_scan() reads cold data, duckdb.raw_query()    │
@@ -94,9 +95,9 @@ object store:
 
 | Component | Role | License |
 |-----------|------|---------|
-| PostgreSQL 17+ | Heap storage; range partitioning for the tiered hot tier. 17+ because cold writes rely on the `ON login` event trigger (PG 17+) to work around the duckdb-iceberg secret-visibility bug — see [Upstream Requests](#upstream-requests). | PostgreSQL |
+| PostgreSQL 16+ | Heap storage; range partitioning for the tiered hot tier. Works uniformly on PG 16, 17, and 18 — the cold-tier secret is a DuckDB persistent secret loaded at instance init, with no version-gated mechanism. | PostgreSQL |
 | pg_duckdb | DuckDB in-process. Iceberg read + write. Analytics. Stock upstream `pgduckdb/pgduckdb:18-v1.1.1` (no fork). The bundled `duckdb-iceberg` carries one optional mesh-performance patch — async parquet overlap; see [Cold-write strategy](#cold-write-strategy-stock-vs-patched-duckdb-iceberg). | MIT |
-| coldfront | PGXS C extension. `post_parse_analyze_hook` rewrites INSERT/UPDATE/DELETE on registered views to the correct tier; `ProcessUtility_hook` handles DDL; a LOGIN trigger auto-attaches Iceberg. | PostgreSQL |
+| coldfront | PGXS C extension. `post_parse_analyze_hook` rewrites INSERT/UPDATE/DELETE on registered views to the correct tier; `ProcessUtility_hook` handles DDL; the hook lazily ATTACHes the Iceberg catalog on the first query touching a tiered view. | PostgreSQL |
 | Lakekeeper | Iceberg REST catalog. Single Rust binary. | Apache 2.0 |
 | S3-compatible store | Any: AWS S3, SeaweedFS, MinIO, GCS, Azure Blob, etc. | Varies |
 | Archiver (tiered mode) | Go binary, invoked by cron. Thin SQL orchestrator that moves rows hot→cold. | PostgreSQL |
@@ -115,33 +116,29 @@ catalog — Lakekeeper fills this role.
 
 ### Session setup
 
-**Persistent S3 secret** (created once per cluster, auto-loads every session
-via pg_duckdb's `FOREIGN SERVER` + `USER MAPPING` machinery):
+**Cold-tier S3 secret** (set once per cluster). A single call records the
+credentials and materializes a DuckDB persistent secret:
 
 ```sql
-SELECT duckdb.create_simple_secret('s3', 'key', 'secret', '',
-  'us-east-1', 'path', '', 'seaweedfs:8333', '', '', 'false');
+SELECT coldfront.set_storage_secret('<key>', '<secret>', '<endpoint>');
 ```
 
-**Iceberg catalog ATTACH** (session-scoped: each DuckDB cached connection
-needs its own `ATTACH`). The operator runs this **once per database** after
-the Lakekeeper warehouse is bootstrapped:
+This does two things. (1) It stores the secret in the
+`coldfront.storage_secret` table — an extension-member table, so its data is
+excluded from `pg_dump` by default, and it is added to the Spock replication
+set, so the secret replicates **by value** to every mesh node with no per-node
+file syncing. (2) It materializes a DuckDB **persistent secret**, which DuckDB
+loads automatically at instance init — so every backend, including the first
+fresh one, sees the secret at a committed timestamp before any query runs.
 
-```sql
-SELECT coldfront.arm_login_attach();
-```
-
-That helper flips one row in `coldfront.runtime_config` (a plain UPDATE,
-grantable per-role; no superuser / `ALTER SYSTEM` / `ALTER DATABASE`
-required). From that point, the `coldfront_login_session_init` LOGIN event
-trigger fires on every new backend, calls `coldfront.ensure_attached()`,
-and issues `ATTACH IF NOT EXISTS` against Lakekeeper using the cluster's
-`coldfront.warehouse` and `coldfront.lakekeeper_endpoint` GUCs — both
-reads (`iceberg_scan`) and writes (`duckdb.raw_query`) work on fresh psql
-sessions with no boilerplate in application code. Gating on the flag
-keeps pre-bootstrap connections from failing when Lakekeeper isn't up
-yet. `coldfront.disarm_login_attach()` is the symmetric toggle for
-debugging or maintenance windows.
+**Iceberg catalog ATTACH** is **lazy**: the coldfront C extension hook issues
+`ATTACH IF NOT EXISTS` against Lakekeeper — using the cluster's
+`coldfront.warehouse` and `coldfront.lakekeeper_endpoint` GUCs — on the **first
+query that touches a tiered view** (read or write), per DuckDB cached
+connection. There is no arming step and no per-session boilerplate: both reads
+(`iceberg_scan`) and writes (`duckdb.raw_query`) just work on a fresh psql
+session. Until a tiered view is touched no ATTACH is attempted, so a
+pre-bootstrap connection is never blocked by a missing warehouse.
 
 ### Temp table bridge: PG → Iceberg
 
@@ -330,13 +327,12 @@ dual-tier command tag, crash-safety of permissive writes, partition-scheme
 constraints, the empty cold-tier partition spec, autovacuum-vs-cutover) are in
 [ARCHITECTURE_TIERED.md → Tiered-specific limitations](ARCHITECTURE_TIERED.md#tiered-specific-limitations).
 
-1. **One-time arming after warehouse bootstrap** — the LOGIN event trigger
-   that auto-attaches Iceberg per session is gated on
-   `coldfront.runtime_config.attach_on_login` (default `false`). An operator
-   must call `SELECT coldfront.arm_login_attach()` once per database after
-   Lakekeeper is provisioned. This is a deliberate opt-in so pre-bootstrap
-   connections can't be blocked by a missing warehouse; once armed every
-   subsequent session auto-attaches without boilerplate.
+1. **One-time secret setup after warehouse bootstrap** — after Lakekeeper is
+   provisioned, an operator calls `SELECT coldfront.set_storage_secret(...)`
+   once per cluster to record the cold-tier S3 credentials and materialize the
+   DuckDB persistent secret. The Iceberg catalog ATTACH itself is lazy (on the
+   first query touching a tiered view), so no per-session arming is needed and
+   a pre-bootstrap connection can't be blocked by a missing warehouse.
 
 2. **`jsonb` surfaces as `json` through the view** — DuckDB has no
    native `jsonb`, and pg_duckdb takes over any query that references
@@ -503,14 +499,14 @@ in-process path would only shave off the libpq overhead.
 
 ### duckdb-iceberg: secret visibility under fresh transactions
 
-**Workaround today.** A LOGIN event trigger
-([coldfront.\_login\_session\_init](extension/coldfront/coldfront--0.1.sql))
-runs `coldfront.ensure_attached()` once per session — gated on the
-operator having armed the database via `coldfront.arm_login_attach()`.
-The trigger's `ATTACH IF NOT EXISTS` is itself a DuckDB statement that
-forces the session's first DuckDB transaction to commit, which is what
-the bug actually needs (see Mechanism below). After it runs the rest of
-the session sees secrets as expected.
+**Workaround today.** A DuckDB **persistent secret**, set via
+`coldfront.set_storage_secret(...)` and materialized into the
+`coldfront.storage_secret` table, is loaded by DuckDB automatically at
+instance init. Because it is persisted before any backend issues a query, it
+already sits at a committed timestamp (< `start_time`) when a fresh
+transaction looks it up (see Mechanism below) — so the secret is
+committed-visible to the very first cold-tier write, with no warmup step
+needed and no dependency on any per-session connect-time hook.
 
 **Symptom.** Without the warmup, a fresh PG backend's first cold-tier
 write fails with HTTP 403 against any non-AWS S3-compatible endpoint
@@ -532,9 +528,10 @@ or already-committed (`timestamp < start_time`). Neither holds for the
 caller's still-uncommitted secret. After any prior DuckDB
 `MetaTransaction::Commit` in the backend, the secret entry's timestamp
 flips to a committed value (< `TRANSACTION_ID_START`) and every
-subsequent fresh transaction satisfies the second rule. That's why "any
-prior DuckDB statement first" is an observable fix — and why our LOGIN
-trigger's `ATTACH IF NOT EXISTS` qualifies.
+subsequent fresh transaction satisfies the second rule. A DuckDB persistent
+secret achieves the same thing structurally: loaded at instance init, it is
+already at a committed timestamp before any backend's first cold-tier
+transaction looks it up, so the second rule holds from the start.
 
 **Reproducer (no coldfront required).**
 
@@ -559,9 +556,10 @@ INSERT INTO ice.default.t VALUES (...);
 I/O under the caller's `ClientContext` (rather than a freshly-opened
 Connection), or any extension that synthesises `CREATE SECRET` from external
 state commits that transaction explicitly, so the secret sits at a committed
-timestamp before a consumer's fresh transaction looks it up. Either obviates
-the LOGIN-trigger warmup; the warmup costs ~1 ms per session and is invisible
-to applications.
+timestamp before a consumer's fresh transaction looks it up. Either would let
+a per-session synthesized secret work without relying on the persistent-secret
+mechanism; today the persistent secret sidesteps the bug entirely at zero
+per-session cost.
 
 ### duckdb-iceberg: INSERT into a table with a partition spec
 

@@ -44,19 +44,27 @@ CREATE TABLE IF NOT EXISTS coldfront.archive_watermark (
     cutoff_time timestamptz NOT NULL
 );
 
--- Per-database runtime configuration. Single-row table (by convention;
--- no PK/index — cardinality is exactly one, seeded once at install time
--- and UPDATE-only thereafter). Using a table rather than a GUC so
--- operators can flip toggles via a plain UPDATE (grantable per-role)
--- without needing superuser (ALTER SYSTEM) or database-owner
--- (ALTER DATABASE) privileges.
-CREATE TABLE IF NOT EXISTS coldfront.runtime_config (
-    attach_on_login boolean NOT NULL DEFAULT false
+-- Cold-tier S3 credential — the in-DB source of truth, set via
+-- coldfront.set_storage_secret(). As an extension-member table its DATA is NOT
+-- carried by pg_dump (no pg_extension_config_dump), and it is added to the
+-- Spock repset so the row replicates by value to every mesh node — unlike an
+-- FDW user-mapping (which pg_dump DOES dump and which does not replicate).
+--
+-- The row is materialized into a DuckDB PERSISTENT SECRET (see
+-- coldfront.materialize_storage_secret); DuckDB loads that at instance init, so
+-- the credential is committed-visible BEFORE any query. That is what lets a
+-- cold-write commit — which pg_duckdb runs in a fresh DuckDB transaction that
+-- cannot see a secret registered in the still-open caller transaction — resolve
+-- the credential on every PG major.
+CREATE TABLE IF NOT EXISTS coldfront.storage_secret (
+    name      text    NOT NULL DEFAULT 'cf_storage' PRIMARY KEY,
+    key_id    text    NOT NULL,
+    secret    text    NOT NULL,
+    endpoint  text,                            -- NULL/'' ⇒ AWS default (vhost); set ⇒ path-style S3-compatible
+    region    text    NOT NULL DEFAULT 'us-east-1',
+    url_style text    NOT NULL DEFAULT 'path',
+    use_ssl   boolean NOT NULL DEFAULT false
 );
--- Idempotent seed: the install SQL may re-run against a DB that already
--- has the row (pg_regress fixtures, manual \i, extension-update paths).
-INSERT INTO coldfront.runtime_config (attach_on_login)
-  SELECT false WHERE NOT EXISTS (SELECT 1 FROM coldfront.runtime_config);
 
 -- Per-table partition lifecycle config — the unified, name-keyed source of
 -- truth that drives BOTH the standalone partitioner (partition-only lifecycle:
@@ -96,22 +104,23 @@ CREATE TABLE IF NOT EXISTS coldfront.partition_config (
 );
 
 -- ensure_attached() issues ATTACH IF NOT EXISTS for the Lakekeeper catalog
--- using the coldfront.warehouse and coldfront.lakekeeper_endpoint GUCs.
--- Called at login by the coldfront_login_session_init event trigger below
--- (when coldfront.runtime_config.attach_on_login is true) and on cold DML
--- paths from the extension hook. Safe to call repeatedly — ATTACH IF NOT
--- EXISTS is idempotent, so if the catalog is already attached in this
--- session the call is a cheap no-op.
+-- using the coldfront.warehouse and coldfront.lakekeeper_endpoint GUCs. Called
+-- lazily by the extension hook (coldfront.c) on the first query in a session
+-- that touches a registered tiered view — read OR write — so the catalog 'ice'
+-- resolves on PG 16/17/18 (a version-agnostic lazy attach). The S3
+-- credential it needs at commit time comes from the persistent secret
+-- (coldfront.set_storage_secret), not from this ATTACH. Safe to call repeatedly
+-- — ATTACH IF NOT EXISTS is idempotent.
 CREATE OR REPLACE FUNCTION coldfront.ensure_attached() RETURNS void AS $$
 DECLARE
   wh text := current_setting('coldfront.warehouse', true);
   ep text := current_setting('coldfront.lakekeeper_endpoint', true);
 BEGIN
   IF wh IS NOT NULL AND wh <> '' AND ep IS NOT NULL AND ep <> '' THEN
-    -- iceberg (and its avro dependency) auto-load per session via the
-    -- `duckdb.extensions` row that `duckdb.install_extension('iceberg')`
-    -- creates with `autoload=true`. install_extension is called once
-    -- from arm_login_attach() during setup; no per-session LOAD needed.
+    -- iceberg (and avro transitively) are auto-installed/auto-loaded by
+    -- pg_duckdb when this ATTACH (TYPE ICEBERG, ...) fires, gated by
+    -- duckdb.autoinstall_known_extensions / autoload_known_extensions. No
+    -- explicit install or per-session LOAD needed.
     PERFORM duckdb.raw_query(format(
       'ATTACH IF NOT EXISTS %L AS ice (TYPE ICEBERG, ENDPOINT %L, '
       'AUTHORIZATION_TYPE NONE, ACCESS_DELEGATION_MODE NONE)',
@@ -144,10 +153,10 @@ DECLARE
   dsn text := current_setting('coldfront.local_pg_dsn', true);
 BEGIN
   IF dsn IS NOT NULL AND dsn <> '' THEN
-    -- LOAD + ATTACH only. duckdb.install_extension('postgres') must run
-    -- once outside event-trigger context (we do it in arm_login_attach);
-    -- calling install here would hang in the LOGIN trigger because
-    -- pg_duckdb's GetConnection refuses subtransactions and install does I/O.
+    -- LOAD + ATTACH only. duckdb.install_extension('postgres') is run once at
+    -- setup by coldfront.set_storage_secret(); doing the install on this hot
+    -- path would do network I/O per session, and pg_duckdb's GetConnection
+    -- refuses to run inside a subtransaction.
     PERFORM duckdb.raw_query('LOAD postgres');
     PERFORM duckdb.raw_query(format(
       'ATTACH IF NOT EXISTS %L AS pglocal (TYPE postgres)',
@@ -157,90 +166,81 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- LOGIN event trigger: attach the Iceberg catalog once per backend so cold
--- reads (iceberg_scan in the events view) and cold writes both resolve 'ice'
--- without any user-visible warmup. Requires PostgreSQL 17+.
---
--- Gated on coldfront.runtime_config.attach_on_login. Default is false, so
--- pre-bootstrap connections (e.g. before Lakekeeper has a warehouse) succeed
--- cleanly. Operators flip the flag with coldfront.arm_login_attach() after
--- the warehouse is provisioned.
---
--- Language is plpgsql (not sql) because PG forbids SQL functions from
--- returning event_trigger. The body deliberately has no EXCEPTION WHEN
--- clause — that would create a subtransaction, and pg_duckdb's
--- GetConnection refuses to run inside one. If ensure_attached() errors,
--- the trigger errors, login is rejected — which is the right signal for
--- a broken Iceberg/Lakekeeper setup once the operator has armed.
-CREATE FUNCTION coldfront._login_session_init() RETURNS event_trigger
-LANGUAGE plpgsql SECURITY DEFINER AS $$
+-- materialize_storage_secret() writes the DuckDB PERSISTENT SECRET on THIS node
+-- from the stored row. DuckDB persists it to its secret directory and loads it
+-- at instance init, so every subsequent backend sees the credential committed
+-- before any query — the property that lets a cold-write commit resolve it on
+-- PG 16/17/18. Idempotent (CREATE OR REPLACE); no-op
+-- when no row is set. NO EXCEPTION clause — pg_duckdb forbids running ATTACH /
+-- secret DDL inside a subtransaction, and a plpgsql EXCEPTION block is one.
+CREATE OR REPLACE FUNCTION coldfront.materialize_storage_secret() RETURNS void
+LANGUAGE plpgsql AS $$
 DECLARE
-  arm boolean;
+  r    coldfront.storage_secret;
+  opts text;
 BEGIN
-  -- pglocal-loopback shortcut. When pg_duckdb's `postgres` extension
-  -- opens a libpq connection back to PG (via ensure_pg_attached() →
-  -- ATTACH (TYPE postgres)), the new server-side session lands here.
-  -- We must NOT recursively call ensure_attached() in that session: the
-  -- iceberg ATTACH transitively loads more DuckDB extensions, one of
-  -- which is the postgres-ext that opened *this* connection. The
-  -- nested load aborts with "libpq is incorrectly linked to backend
-  -- functions" on builds where pg_duckdb's libpq symbol-isolation
-  -- isn't tight (notably source-builds of v1.1.1).
-  --
-  -- The DSN configured by coldfront.dblink_self / .local_pg_dsn carries
-  -- application_name=coldfront_pglocal so we can identify and skip
-  -- those sessions here. They don't need iceberg attached — pglocal is
-  -- read-only PG-source for the OUTER session's writer; the loopback
-  -- session itself never issues iceberg DML.
-  IF current_setting('application_name', true) = 'coldfront_pglocal' THEN
-      RETURN;
+  SELECT * INTO r FROM coldfront.storage_secret LIMIT 1;
+  IF NOT FOUND THEN RETURN; END IF;
+  opts := format('TYPE s3, KEY_ID %L, SECRET %L, REGION %L', r.key_id, r.secret, r.region);
+  -- A set endpoint ⇒ S3-compatible store (SeaweedFS/MinIO): path-style + the
+  -- custom endpoint. No endpoint ⇒ AWS default (virtual-hosted).
+  IF r.endpoint IS NOT NULL AND r.endpoint <> '' THEN
+    opts := opts || format(', ENDPOINT %L, URL_STYLE %L, USE_SSL %s',
+                           r.endpoint, r.url_style,
+                           CASE WHEN r.use_ssl THEN 'true' ELSE 'false' END);
   END IF;
-
-  SELECT attach_on_login INTO arm FROM coldfront.runtime_config LIMIT 1;
-  IF arm THEN
-    PERFORM coldfront.ensure_attached();      -- Iceberg catalog → 'ice'
-    -- Lazy ensure_pg_attached() lives in the C hook (coldfront.c
-    -- ensure_pg_attached_via_spi) and only runs when a specific
-    -- INSERT … SELECT references a non-result PG table; the
-    -- application_name guard above keeps the libpq linker quirk from
-    -- recursing in pglocal-loopback sessions.
-  END IF;
+  PERFORM duckdb.raw_query(format('CREATE OR REPLACE PERSISTENT SECRET %I (%s)', r.name, opts));
 END;
 $$;
 
-CREATE EVENT TRIGGER coldfront_login_session_init ON login
-  EXECUTE FUNCTION coldfront._login_session_init();
+-- Re-materialize on every node when the row changes — including during Spock
+-- apply (which runs with session_replication_role = replica), hence
+-- ENABLE ALWAYS; FOR EACH ROW so it fires on the replicated row change. This is
+-- how a single set_storage_secret() call propagates to all mesh nodes: the row
+-- replicates by value and each node materializes its own persistent secret.
+CREATE FUNCTION coldfront._storage_secret_materialize_trg() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+  PERFORM coldfront.materialize_storage_secret();
+  RETURN NULL;
+END;
+$$;
+CREATE TRIGGER coldfront_storage_secret_materialize
+  AFTER INSERT OR UPDATE ON coldfront.storage_secret
+  FOR EACH ROW EXECUTE FUNCTION coldfront._storage_secret_materialize_trg();
+ALTER TABLE coldfront.storage_secret ENABLE ALWAYS TRIGGER coldfront_storage_secret_materialize;
 
--- Helper: arm the login-time ATTACH in this database. Meant to be called
--- once, after Lakekeeper's warehouse has been provisioned. Requires only
--- UPDATE on coldfront.runtime_config — no superuser, no ALTER SYSTEM.
---
--- Side effect: pre-installs DuckDB's `postgres` extension if a
--- coldfront.local_pg_dsn is configured. install_extension does I/O and
--- cannot run inside the LOGIN event trigger (pg_duckdb's subtransaction
--- guard would deadlock the connect), so we run it here, once, while the
--- caller is in a plain user transaction. Subsequent calls are cheap
--- no-ops (DuckDB's install is idempotent).
-CREATE OR REPLACE FUNCTION coldfront.arm_login_attach() RETURNS void
+-- set_storage_secret() — the one-call cold-tier setup that replaces the old
+-- duckdb.create_simple_secret setup. It writes the in-DB row (which
+-- fires the materialize trigger → DuckDB PERSISTENT SECRET on this node, and
+-- replicates the row to mesh peers) and pre-installs DuckDB's `postgres`
+-- extension for the pglocal write path when coldfront.local_pg_dsn is set
+-- (install does I/O, hoisted here once, out of the per-query hook). Requires no
+-- superuser / ALTER SYSTEM.
+CREATE OR REPLACE FUNCTION coldfront.set_storage_secret(
+    p_key_id    text,
+    p_secret    text,
+    p_endpoint  text    DEFAULT NULL,
+    p_region    text    DEFAULT 'us-east-1',
+    p_url_style text    DEFAULT 'path',
+    p_use_ssl   boolean DEFAULT false) RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
   dsn text := current_setting('coldfront.local_pg_dsn', true);
 BEGIN
+  INSERT INTO coldfront.storage_secret (name, key_id, secret, endpoint, region, url_style, use_ssl)
+       VALUES ('cf_storage', p_key_id, p_secret, p_endpoint, p_region, p_url_style, p_use_ssl)
+  ON CONFLICT (name) DO UPDATE SET
+       key_id    = EXCLUDED.key_id,
+       secret    = EXCLUDED.secret,
+       endpoint  = EXCLUDED.endpoint,
+       region    = EXCLUDED.region,
+       url_style = EXCLUDED.url_style,
+       use_ssl   = EXCLUDED.use_ssl;
   IF dsn IS NOT NULL AND dsn <> '' THEN
     PERFORM duckdb.install_extension('postgres');
   END IF;
-  -- iceberg (and avro transitively) are auto-installed by pg_duckdb when
-  -- ATTACH (TYPE ICEBERG, ...) fires in ensure_attached. Requires
-  -- duckdb.autoinstall_known_extensions = true and
-  -- duckdb.autoload_known_extensions = true (the upstream defaults).
-  UPDATE coldfront.runtime_config SET attach_on_login = true;
 END;
-$$;
-
--- And the symmetric disarm, for operations / debugging.
-CREATE FUNCTION coldfront.disarm_login_attach() RETURNS void
-LANGUAGE sql AS $$
-  UPDATE coldfront.runtime_config SET attach_on_login = false;
 $$;
 
 -- ============================================================================
@@ -1330,8 +1330,8 @@ BEGIN
         -- A direct INSERT here would inherit that origin tag and spock's
         -- loop-prevention would filter the row out of the stream back to
         -- the originator — they'd never see our ack.  dblink_self opens
-        -- a fresh libpq session (Unix-socket host=/tmp, event_triggers=off,
-        -- no replication origin set up) so the INSERT is tagged with
+        -- a fresh libpq session (its own connection, no replication origin
+        -- set up) so the INSERT is tagged with
         -- THIS node as origin and replicates normally cluster-wide
         -- including back to the originator.  Verified empirically — see
         -- the test in transcript/README.
@@ -1429,9 +1429,10 @@ BEGIN
     END IF;
 
     -- Persistent named dblink connection (sessionful, opened once).
-    -- coldfront_self DSN sets event_triggers=off so the dblink session
-    -- never enters DuckDB territory.  No sync-rep — R-A's ack barrier
-    -- replaces it; statement_timeout is the only safety net.
+    -- The dblink session only touches coldfront.claims (never a tiered view),
+    -- so the lazy 'ice' attach never fires and it never enters DuckDB territory.
+    -- No sync-rep — R-A's ack barrier replaces it; statement_timeout is the only
+    -- safety net.
     IF NOT 'coldfront_self' = ANY(COALESCE(public.dblink_get_connections(), '{}'::text[])) THEN
         PERFORM public.dblink_connect('coldfront_self', connstr);
         PERFORM public.dblink_exec('coldfront_self',

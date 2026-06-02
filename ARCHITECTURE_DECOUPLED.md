@@ -23,15 +23,18 @@ covers what is specific to decoupled mode.
 | `post_parse_analyze_hook` | Rewrites INSERT/UPDATE/DELETE per tier | Rewrites every INSERT/UPDATE/DELETE on the wrapper view to a single `duckdb.raw_query(...)` against the Iceberg ref |
 | Archiver | Moves rows hot → cold on cron | — (nothing to archive) |
 | `coldfront.tiered_views` row | Required per managed table | — (table is not "managed" in tiered sense) |
-| Required at runtime | `pg_duckdb`, `coldfront`, Lakekeeper, S3 | `pg_duckdb`, `coldfront` (for auto-ATTACH only), Lakekeeper, S3 |
+| Required at runtime | `pg_duckdb`, `coldfront`, Lakekeeper, S3 | `pg_duckdb`, `coldfront` (for lazy catalog ATTACH only), Lakekeeper, S3 |
 
 The coldfront extension stays loaded purely because it provides the
-session-bootstrap glue: the `coldfront_login_session_init` event
-trigger, on every new connection, calls `coldfront.ensure_attached()`,
-which issues `duckdb.raw_query('ATTACH IF NOT EXISTS ''wh'' AS ice
-(TYPE ICEBERG, ENDPOINT ...)')` against the GUCs `coldfront.warehouse`
-and `coldfront.lakekeeper_endpoint`. Without this, every new psql
-session would have to ATTACH the catalog manually before queries work.
+lazy catalog-attach glue: the C extension hook intercepts the first
+query that touches a tiered view (read or write) and, if the Iceberg
+catalog `ice` is not yet attached in this session, issues
+`duckdb.raw_query('ATTACH IF NOT EXISTS ''wh'' AS ice (TYPE ICEBERG,
+ENDPOINT ...)')` against the GUCs `coldfront.warehouse` and
+`coldfront.lakekeeper_endpoint`. There is no connect-time setup — the
+attach happens on demand, transparently, the first time a session
+actually queries Iceberg. Without this, every new psql session would
+have to ATTACH the catalog manually before queries work.
 
 For tables registered as iceberg-only via `coldfront.create_iceberg_table()`,
 the parse-analyze rewriter is the **primary** dispatch path: it
@@ -51,22 +54,29 @@ coldfront.lakekeeper_endpoint = 'http://lakekeeper:8181/catalog'
 -- one-time, per database:
 CREATE EXTENSION pg_duckdb;
 CREATE EXTENSION coldfront;
-SELECT duckdb.create_simple_secret(...);   -- S3 creds
-SELECT coldfront.arm_login_attach();       -- enable login-time ATTACH
+SELECT coldfront.set_storage_secret('<key>', '<secret>', '<endpoint>');  -- cold-tier S3 creds
 ```
 
-After that, every new connection has `ice.default.*` available.
+`set_storage_secret` stores the credentials in the
+`coldfront.storage_secret` table — an extension-member table (so its
+data is excluded from `pg_dump` by default) that is added to the Spock
+repset (so it replicates by value to every mesh node) — and
+materializes a DuckDB PERSISTENT SECRET, which DuckDB loads at instance
+init. It is set once; no per-session arming is needed.
+
+After that, the first query touching a tiered view in any session
+lazily attaches the catalog and `ice.default.*` becomes available.
 
 ## Interface
 
-With the coldfront extension loaded and `arm_login_attach()` armed, the
+With the coldfront extension loaded and the storage secret set, the
 wrapper view supports:
 
 ### What works
 
 | Operation | Path | Notes |
 |---|---|---|
-| Auto-ATTACH on session start | login event trigger → `ensure_attached()` | One round-trip on connect |
+| Lazy catalog ATTACH | C hook → `ensure_attached()` on first query touching a tiered view | One round-trip on first Iceberg query per session |
 | CREATE TABLE | `SELECT duckdb.raw_query('CREATE TABLE ice.<ns>.<name> (...)')` | DuckDB SQL, attached-catalog syntax |
 | INSERT | `INSERT INTO <view> [VALUES (…) | SELECT … FROM <pg_table> | SELECT … FROM generate_series(…)]` — the C hook rewrites this to one `SELECT duckdb.raw_query('INSERT INTO ice.<ns>.<name> …')`. Source-table refs get prefixed with `pglocal.<schema>.<table>` so DuckDB's postgres extension streams the source via libpq into the Iceberg writer | Single Iceberg snapshot per INSERT, regardless of row count |
 | UPDATE | `UPDATE <view> SET … WHERE …` — hook → `SELECT duckdb.raw_query('UPDATE ice.<ns>.<name> SET ... WHERE ...')` | Iceberg merge-on-read |
@@ -338,10 +348,12 @@ snowflake.node = 1     # db1
 # snowflake.node = 3   # db3
 
 # DSN used for the bakery's autonomous-tx claim/ack dblink calls.
-# Unix socket avoids TCP overhead; `event_triggers=off` bypasses the
-# coldfront login trigger so the dblink session never enters DuckDB
-# territory. application_name=coldfront_dblink is a marker for logs.
-coldfront.dblink_self = 'host=/tmp dbname=coldfront user=coldfront application_name=coldfront_dblink options=-cevent_triggers=off'
+# Unix socket avoids TCP overhead. The dblink session only touches the
+# plain `coldfront.claims` / `coldfront.claim_acks` tables, never a
+# tiered view, so the lazy catalog ATTACH never fires on it and the
+# session never enters DuckDB territory. application_name=coldfront_dblink
+# is a marker for logs.
+coldfront.dblink_self = 'host=/tmp dbname=coldfront user=coldfront application_name=coldfront_dblink'
 
 # Optional — peer-liveness window for R-A's dead-peer escape
 # (default 5000 ms, matches spock's default heartbeat cadence).

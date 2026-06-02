@@ -66,9 +66,9 @@ coldfront.iceberg_async_parquet     = on
 coldfront.warehouse = '${WAREHOUSE}'
 coldfront.lakekeeper_endpoint = '${LAKEKEEPER}'
 # Loopback DSN coldfront.ensure_pg_attached() uses to ATTACH this PG into
-# DuckDB as 'pglocal'. application_name=coldfront_pglocal + event_triggers=off
-# stop the login trigger recursing into an iceberg attach in that session.
-coldfront.local_pg_dsn = 'host=/var/run/postgresql dbname=coldfront user=coldfront application_name=coldfront_pglocal options=-cevent_triggers=off'
+# DuckDB as 'pglocal'. application_name tags the loopback session in
+# pg_stat_activity.
+coldfront.local_pg_dsn = 'host=/var/run/postgresql dbname=coldfront user=coldfront application_name=coldfront_pglocal'
 EOF
 
     if [ "$MESH" = "on" ]; then
@@ -87,9 +87,10 @@ spock.include_ddl_repset = on
 spock.exception_behaviour = transdiscard
 spock.save_resolutions = on
 snowflake.node = ${SNOWFLAKE_NODE}
-# dblink DSN for the R-A bakery's autonomous claim/release (unix socket, no
-# iceberg attach ever needed → suppress the login trigger).
-coldfront.dblink_self = 'host=/var/run/postgresql dbname=coldfront user=coldfront application_name=coldfront_dblink options=-cevent_triggers=off'
+# dblink DSN for the R-A bakery's autonomous claim/release (unix socket). The
+# bakery touches coldfront.claims only, never a tiered view, so the lazy 'ice'
+# attach never fires here.
+coldfront.dblink_self = 'host=/var/run/postgresql dbname=coldfront user=coldfront application_name=coldfront_dblink'
 EOF
     fi
 
