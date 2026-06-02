@@ -17,7 +17,7 @@
 #                          skipped silently — so coverage is always explicit.
 #
 # Matrix dimensions (beta target):
-#   PG major : 16 · 17 · 18
+#   PG major : 17 · 18  (PG16 upstream-blocked — see coverage_table)
 #   topology : vanilla (single node) · mesh (3-node Spock)
 #   mode     : tiered (hot PG + cold Iceberg) · decoupled (all-Iceberg)
 #   target   : primary (read+write) · standby (read-only physical replica)
@@ -75,56 +75,39 @@ run_cell() {
     if "$@"; then pass "cell: $name"; else fail "cell: $name"; CELL_FAIL=$((CELL_FAIL + 1)); fi
 }
 
-# Verified cells. The topology script owns bring-up, the journey, and teardown;
-# --regress runs the pg_regress unit layer (extension SQL/hook tests, mode-
-# independent) so it only needs to run on one cell per PG major.
-cell_pg18_vanilla_tiered() {
-    "$SCRIPT_DIR/topo/vanilla.sh" --mode tiered --regress
-}
-cell_pg18_vanilla_decoupled() {
-    "$SCRIPT_DIR/topo/vanilla.sh" --mode decoupled
-}
-# Mesh cells: 3-node Spock on the same image (MESH=on). topo/mesh.sh forms the
-# mesh and runs the journey + mesh-only stories (cross-node visibility / R-A
-# bakery) against db1. Tiered before decoupled, matching vanilla.
-cell_pg18_mesh_tiered() {
-    "$SCRIPT_DIR/topo/mesh.sh" --mode tiered
-}
-cell_pg18_mesh_decoupled() {
-    "$SCRIPT_DIR/topo/mesh.sh" --mode decoupled
-}
-# Standby cells: topo --standby base-backs a read-only physical replica, then the
-# journey's story_standby_reads exercises cross-tier reads (iceberg_scan on the
-# replica), the catalog/secret/GUCs arriving via the base backup, and a clean
-# read-only cold-write rejection. Gated by ci/probe-standby.sh (verified green).
-# Mesh adds a standby of db1, where story_standby_reads also asserts a
-# peer-originated row surfaces on the replica (Spock → db1 → physical).
-cell_pg18_vanilla_tiered_standby() {
-    "$SCRIPT_DIR/topo/vanilla.sh" --mode tiered --standby
-}
-cell_pg18_vanilla_decoupled_standby() {
-    "$SCRIPT_DIR/topo/vanilla.sh" --mode decoupled --standby
-}
-cell_pg18_mesh_tiered_standby() {
-    "$SCRIPT_DIR/topo/mesh.sh" --mode tiered --standby
-}
-cell_pg18_mesh_decoupled_standby() {
-    "$SCRIPT_DIR/topo/mesh.sh" --mode decoupled --standby
-}
+# Cells, parameterized by PG major ($1). The topology script owns bring-up, the
+# journey, and teardown; --regress runs the pg_regress unit layer (extension
+# SQL/hook tests, mode-independent) once per PG major, on the vanilla·tiered
+# cell. The journey + assertions are identical across PG majors. Mesh cells run
+# a 3-node Spock stack (MESH=on, same image) and add the mesh-only stories
+# (cross-node visibility / R-A bakery). Standby cells base-back a read-only
+# physical replica and exercise cross-tier reads + clean read-only write
+# rejection (gated by ci/probe-standby.sh).
+cell_vanilla_tiered()            { "$SCRIPT_DIR/topo/vanilla.sh" --pg "$1" --mode tiered --regress; }
+cell_vanilla_decoupled()         { "$SCRIPT_DIR/topo/vanilla.sh" --pg "$1" --mode decoupled; }
+cell_mesh_tiered()               { "$SCRIPT_DIR/topo/mesh.sh"    --pg "$1" --mode tiered; }
+cell_mesh_decoupled()            { "$SCRIPT_DIR/topo/mesh.sh"    --pg "$1" --mode decoupled; }
+cell_vanilla_tiered_standby()    { "$SCRIPT_DIR/topo/vanilla.sh" --pg "$1" --mode tiered --standby; }
+cell_vanilla_decoupled_standby() { "$SCRIPT_DIR/topo/vanilla.sh" --pg "$1" --mode decoupled --standby; }
+cell_mesh_tiered_standby()       { "$SCRIPT_DIR/topo/mesh.sh"    --pg "$1" --mode tiered --standby; }
+cell_mesh_decoupled_standby()    { "$SCRIPT_DIR/topo/mesh.sh"    --pg "$1" --mode decoupled --standby; }
 
 # coverage_table  — print every matrix cell with RUN / PENDING(reason). No
 # cell is ever silently omitted; PENDING states what is still required.
 coverage_table() {
     step "MATRIX COVERAGE"
-    local pending_img="needs pg16/17 image build (one build-arg)"
+    # PG16 is blocked by an upstream gap, not an image: cold writes need the
+    # PG17+ LOGIN-trigger workaround for the duckdb-iceberg secret-visibility bug
+    # (a fresh-transaction commit can't see a secret registered in the same txn).
+    # See ARCHITECTURE.md → Upstream Requests → "duckdb-iceberg: secret
+    # visibility under fresh transactions". 17 and 18 both RUN.
+    local pending16="PENDING (PG16: no LOGIN event trigger — upstream secret-visibility workaround unavailable)"
     local pg topo mode tgt status
     for pg in 16 17 18; do
       for topo in vanilla mesh; do
         for mode in tiered decoupled; do
           for tgt in primary standby; do
-            # All pg18 cells run (primary + standby, vanilla + mesh); standby is
-            # gated by ci/probe-standby.sh, verified green. pg16/17 await an image.
-            if [ "$pg" != 18 ]; then status="PENDING ($pending_img)"; else status="RUN"; fi
+            if [ "$pg" = 16 ]; then status="$pending16"; else status="RUN"; fi
             printf '    pg%-2s · %-7s · %-9s · %-7s : %s\n' "$pg" "$topo" "$mode" "$tgt" "$status"
           done
         done
@@ -137,17 +120,21 @@ preflight
 
 case "$SCOPE" in
   quick)
-    run_cell "pg18·vanilla·tiered·primary" cell_pg18_vanilla_tiered
+    run_cell "pg18·vanilla·tiered·primary" cell_vanilla_tiered 18
     ;;
   full)
-    run_cell "pg18·vanilla·tiered·primary"    cell_pg18_vanilla_tiered
-    run_cell "pg18·vanilla·decoupled·primary" cell_pg18_vanilla_decoupled
-    run_cell "pg18·mesh·tiered·primary"       cell_pg18_mesh_tiered
-    run_cell "pg18·mesh·decoupled·primary"    cell_pg18_mesh_decoupled
-    run_cell "pg18·vanilla·tiered·standby"    cell_pg18_vanilla_tiered_standby
-    run_cell "pg18·vanilla·decoupled·standby" cell_pg18_vanilla_decoupled_standby
-    run_cell "pg18·mesh·tiered·standby"       cell_pg18_mesh_tiered_standby
-    run_cell "pg18·mesh·decoupled·standby"    cell_pg18_mesh_decoupled_standby
+    # PG17 + PG18 (the supported floor; PG16 is upstream-blocked — see
+    # coverage_table). Same cell set per major; the journey is version-agnostic.
+    for pg in 17 18; do
+      run_cell "pg${pg}·vanilla·tiered·primary"    cell_vanilla_tiered            "$pg"
+      run_cell "pg${pg}·vanilla·decoupled·primary" cell_vanilla_decoupled         "$pg"
+      run_cell "pg${pg}·mesh·tiered·primary"       cell_mesh_tiered               "$pg"
+      run_cell "pg${pg}·mesh·decoupled·primary"    cell_mesh_decoupled            "$pg"
+      run_cell "pg${pg}·vanilla·tiered·standby"    cell_vanilla_tiered_standby    "$pg"
+      run_cell "pg${pg}·vanilla·decoupled·standby" cell_vanilla_decoupled_standby "$pg"
+      run_cell "pg${pg}·mesh·tiered·standby"       cell_mesh_tiered_standby       "$pg"
+      run_cell "pg${pg}·mesh·decoupled·standby"    cell_mesh_decoupled_standby    "$pg"
+    done
     coverage_table
     echo -e "\n  NOTE: only verified cells RUN. PENDING cells are tracked, not skipped silently."
     ;;

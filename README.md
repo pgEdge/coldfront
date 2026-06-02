@@ -465,8 +465,10 @@ golangci-lint, unit tests, build, the pg_regress unit layer, and the full
 journey on one representative cell (PG18 · vanilla · tiered). Fast; runs on
 every commit. GitHub Actions must run the identical `ci/matrix.sh` steps.
 
-**Full matrix** — `ci/matrix.sh --full`, the beta gate: PG {16, 17, 18} ×
-{vanilla, mesh (3-node Spock)} × {tiered, decoupled}. The mesh cells add the
+**Full matrix** — `ci/matrix.sh --full`, the beta gate: PG {17, 18} ×
+{vanilla, mesh (3-node Spock)} × {tiered, decoupled}. (PG 16 is upstream-blocked
+— it lacks the PG 17+ `ON login` event trigger that works around the
+duckdb-iceberg secret-visibility bug; see [ARCHITECTURE.md → Upstream Requests](ARCHITECTURE.md#upstream-requests).) The mesh cells add the
 cross-node stories — hot visibility via Spock, cold visibility via the shared
 Lakekeeper catalog, the R-A bakery serialising concurrent cold writers
 (same-node and cross-node) with no 409, and an N×(N-1) probe that the bakery's
@@ -511,7 +513,7 @@ pgedge-coldfront/
 
 | Component | Version | Purpose |
 |-----------|---------|---------|
-| PostgreSQL | 16, 17, or 18 | Database with native partitioning (stock upstream; no fork) |
+| PostgreSQL | 17 or 18 | Database with native partitioning (stock upstream; no fork). PG 16 is upstream-blocked — see [Upstream Requests](ARCHITECTURE.md#upstream-requests) |
 | pg_duckdb | 1.1.1+ | Iceberg reads via DuckDB in-process |
 | Lakekeeper | latest | Iceberg REST catalog (Rust binary) |
 | S3-compatible store | any | AWS S3, SeaweedFS, MinIO, GCS, Azure Blob, etc. |

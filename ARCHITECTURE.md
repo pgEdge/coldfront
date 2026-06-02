@@ -94,7 +94,7 @@ object store:
 
 | Component | Role | License |
 |-----------|------|---------|
-| PostgreSQL 16+ | Heap storage; range partitioning for the tiered hot tier | PostgreSQL |
+| PostgreSQL 17+ | Heap storage; range partitioning for the tiered hot tier. 17+ because cold writes rely on the `ON login` event trigger (PG 17+) to work around the duckdb-iceberg secret-visibility bug — see [Upstream Requests](#upstream-requests). | PostgreSQL |
 | pg_duckdb | DuckDB in-process. Iceberg read + write. Analytics. Stock upstream `pgduckdb/pgduckdb:18-v1.1.1` (no fork). The bundled `duckdb-iceberg` carries one optional mesh-performance patch — async parquet overlap; see [Cold-write strategy](#cold-write-strategy-stock-vs-patched-duckdb-iceberg). | MIT |
 | coldfront | PGXS C extension. `post_parse_analyze_hook` rewrites INSERT/UPDATE/DELETE on registered views to the correct tier; `ProcessUtility_hook` handles DDL; a LOGIN trigger auto-attaches Iceberg. | PostgreSQL |
 | Lakekeeper | Iceberg REST catalog. Single Rust binary. | Apache 2.0 |

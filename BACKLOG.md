@@ -25,7 +25,7 @@ Design reference: [ARCHITECTURE.md](ARCHITECTURE.md). Failover is out of scope
   guard in `_exec_iceberg_with_claim`), `failover-patroni.md` runbook.
 
 **Open** (this document)
-1. PG 16 / 17 matrix cells.
+1. PG 16 matrix cells — *upstream-blocked* (PG 17 is now supported and RUN).
 2. Operational hardening (`ci/ops/`): privilege model, Lakekeeper-down, S3-down, dump/restore.
 3. Login-trigger graceful degradation.
 4. Standby production-hardening (replication slot, replication role).
@@ -34,44 +34,41 @@ Design reference: [ARCHITECTURE.md](ARCHITECTURE.md). Failover is out of scope
 
 ---
 
-## 1. PG 16 / 17 matrix cells — *beta scope*
+## 1. PG 16 matrix cells — *upstream-blocked*
 
-**What.** The matrix RUNs only PG 18 today; `coverage_table` in `ci/matrix.sh`
-lists every PG 16 and PG 17 cell as `PENDING (needs pg16/17 image build)`. Bring
-up and green the full matrix on 16 and 17: {vanilla, mesh} × {tiered, decoupled}
-× {primary, standby} = 8 cells per major.
+**Status.** **PG 17 is supported and RUN** — `ci/matrix.sh --full` drives both 17
+and 18 ({vanilla, mesh} × {tiered, decoupled} × {primary, standby}); pg_regress
+runs once per major. **PG 16 is blocked by an upstream bug**, not by tooling: the
+image builds fine on 16 (the base tag exists, pg_duckdb v1.1.1 and the PGXS
+extension both compile), but cold **writes** cannot work — see below.
 
-**Why.** Beta targets PG 16, 17, 18 (stock upstream, no fork). The journey and
-its assertions are version-independent; only the image's `PG_MAJOR` differs.
+**⚠ PG 16 blocker — LOGIN event triggers are PG 17+, and they are the only fix
+for the duckdb-iceberg secret-visibility bug.** ColdFront's auto-attach
+(`coldfront._login_session_init`) is a **LOGIN event trigger**, which **does not
+exist before PG 17**. Its real job is not just convenience: per
+[ARCHITECTURE.md → Upstream Requests → "duckdb-iceberg: secret visibility under
+fresh transactions"](ARCHITECTURE.md#upstream-requests), a fresh DuckDB
+transaction (which `IRCTransaction::Commit` opens) cannot see an S3 secret
+registered in the *same, still-uncommitted* transaction — so a cold write's
+commit fails with `HTTP 403` against any non-AWS endpoint **unless a prior,
+committed DuckDB transaction loaded the secret first**. The login trigger's
+`ATTACH IF NOT EXISTS` is exactly that prior committed transaction.
 
-**Approach.**
-- Image is already parameterized: `docker build --build-arg PG_MAJOR=16 …` (and
-  17). `ci/topo/{vanilla,mesh}.sh` already accept `--pg`. Confirm the base
-  `ghcr.io/pgedge/pgedge-postgres:<pg>-spock5-minimal` tag exists for 16 and 17,
-  that pg_duckdb v1.1.1 compiles against each, and that the coldfront PGXS
-  extension builds against each.
-- Add `cell_pg{16,17}_*` functions to `ci/matrix.sh` mirroring the PG 18 set,
-  driving `topo/*.sh --pg <major>`; run them in `--full`.
-- Run pg_regress **once per major** (`--regress` on one cell per version, as PG 18
-  does today).
-- Flip the `coverage_table` 16/17 rows from PENDING to RUN as each major greens.
+**Lazy attach was evaluated and does NOT work** (verified empirically, 2026-06).
+Calling `ensure_attached()` from `post_parse_analyze_hook` on the first query
+attaches inside the *write's own* transaction → the secret isn't yet committed
+when `IRCTransaction::Commit` looks it up → the same `403`. It fixes cold *reads*
+(no Iceberg commit) but not cold *writes*. There is no PG 16-compatible hook that
+runs in a *prior* transaction at session start (parse-analyze/executor hooks are
+all nested in the user's statement; `ClientAuthentication_hook` / `_PG_init`
+fire before any transaction exists). Patching pg_duckdb is out of scope (stock
+upstream, no fork).
 
-**⚠ PG 16 blocker — LOGIN event triggers are PG 17+.** The auto-attach mechanism
-(`coldfront._login_session_init`, gated by `arm_login_attach()`) is a **LOGIN
-event trigger**, which **does not exist before PG 17** (the function comment says
-"Requires PostgreSQL 17+"). On PG 16 the catalog is therefore never auto-attached
-per session, so a transparent read through the view fails with
-"Catalog 'ice' does not exist" until something attaches it. Options to evaluate:
-- **Lazy attach in the DML/planner hook** — have `post_parse_analyze_hook` call
-  `ensure_attached()` the first time it sees a query on a registered view. Works
-  on all majors and removes the LOGIN-trigger dependency entirely (could then
-  supersede the trigger on 17/18 too). Preferred.
-- Require operators on PG 16 to `SELECT coldfront.ensure_attached()` per session
-  (documented limitation) — weaker, breaks "transparent".
-
-Until resolved, either gate PG 16 support on the lazy-attach work or document the
-manual-attach caveat. Other version-sensitive spots to check: partition pruning,
-identity/generated-column syntax, and any `pg_catalog` shape the hooks read.
+**Resolution.** PG 16 stays `PENDING` until the upstream fix lands (either
+`IRCTransaction::Commit` runs commit-time I/O under the caller's `ClientContext`,
+or pg_duckdb commits a synthesised secret's transaction before consumers look it
+up). Then PG 16 can use the lazy-attach path with no login trigger. Tracked as a
+[duckdb-iceberg upstream request](ARCHITECTURE.md#upstream-requests).
 
 ---
 
