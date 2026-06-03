@@ -78,6 +78,17 @@ Net: the parent is read from Lakekeeper once, inside the ticket, after the
 parquet phase — so under R-A serialization no other writer can move the head
 between the refresh and the POST.
 
+> **Baseline of record — never lose this.** The patch above
+> (`docker/iceberg-bakery-aware-commit-refresh.patch`, against duckdb-iceberg
+> **`ebe0dfaf`** / DuckDB **v1.4.3**, avro `7b75062f`, `EXTENSION_VERSION v1.4.3`)
+> is **committed** (`c18a99f`) and is the **known-good, revert-to baseline**;
+> `main` always carries this working state. The full code-level diff is §2 above
+> plus the committed `.patch`, and the from-scratch rebuild recipe is §5–§8 — so
+> the 1.4.3 patched extension is fully recoverable from this doc alone. Any
+> DuckDB-1.5.x port is authored as a **separate** patch file + pin set (e.g.
+> `iceberg-bakery-aware-commit-refresh-v1.5.patch`) and **does not overwrite this
+> one**.
+
 ## 3. CRITICAL: ship BAKERY-ONLY — do NOT apply the mvcc-fix patch
 
 `docker/iceberg-extension-mvcc-fix.patch` (rewrites `IRCTransaction::Commit()` to
@@ -165,11 +176,26 @@ cache. To load the **local, patched** build instead:
 3. **GUCs** (all four):
    - `duckdb.allow_unsigned_extensions = on` — required; the local bytes are
      unsigned.
-   - `duckdb.autoinstall_known_extensions = off` — required; else pg_duckdb
-     re-downloads stock and clobbers the local one.
+   - `duckdb.autoinstall_known_extensions` — shipped **on** (`docker/entrypoint.sh`).
+     Verified empirically (fresh PG 16 container): with the local file present,
+     autoinstall does **not** re-download or clobber it (patched iceberg sha identical
+     before/after a load) — it only fetches *missing* extensions. (The earlier "must
+     be off, else it clobbers the local one" was wrong.) Turning it off instead means
+     iceberg's required `avro` dependency — and `azure`, for an Azure cold tier —
+     won't auto-install and must be pre-placed (see the avro note below).
    - `duckdb.autoload_known_extensions = on` — keep; lazily LOADs on `ATTACH`.
    - **`coldfront.iceberg_async_parquet = on`** — enables the async-upload code
      path (safe only because the patch is present).
+
+> **avro is a HARD dependency of iceberg — pre-place BOTH (verified).** iceberg's
+> init (`iceberg_duckdb_cpp_init`) requires `avro` and tries to auto-install it at
+> load. With `autoinstall` **off** and `avro` absent, `LOAD iceberg` fails:
+> *"An error occurred while trying to automatically install the required extension
+> 'avro': … avro.duckdb_extension not found."* So whenever autoinstall is off, `avro`
+> MUST be pre-placed beside `iceberg` — and the same goes for any other extension a
+> feature needs offline (e.g. `azure` for an Azure cold tier). With autoinstall on
+> (the shipped default) a missing `avro` is fetched automatically; pre-placing it is
+> then belt-and-suspenders (offline/determinism), not strictly required.
 
 ### GUC gotchas (learned the hard way)
 
@@ -223,11 +249,14 @@ nodes, `loaded=true`, local `install_path`) + `iceberg_async_parquet=on` →
 2. **Runtime stage** — `COPY --from=iceberg-builder` the two artifacts to a
    staging path; `ENV COLDFRONT_DUCKDB_VERSION=v1.4.3 COLDFRONT_DUCKDB_PLATFORM=linux_amd64`.
 3. **`docker/entrypoint.sh`** (first-init block) — write to `postgresql.conf`:
-   `duckdb.allow_unsigned_extensions = on`, `duckdb.autoinstall_known_extensions = off`,
+   `duckdb.allow_unsigned_extensions = on`, `duckdb.autoinstall_known_extensions = on`
+   (the actual entrypoint value — `on` is safe per §6: it won't clobber the present
+   patched binary, and lets missing deps like `avro` auto-install),
    `duckdb.autoload_known_extensions = on`, **`coldfront.iceberg_async_parquet = on`**;
    then `mkdir -p "$PGDATA/pg_duckdb/extensions/$COLDFRONT_DUCKDB_VERSION/$COLDFRONT_DUCKDB_PLATFORM"`
    and copy the staged binaries in. (The stock/UNPATCHED build does none of this —
-   it leaves autoinstall on and the flag unset.)
+   no binary placement, `allow_unsigned` off, and the async flag unset; autoinstall
+   is on in both.)
 
 Build-cost note: a cold image build includes the ≈ 11 min iceberg compile;
 mitigate with BuildKit vcpkg/layer caching, or a separately-tagged

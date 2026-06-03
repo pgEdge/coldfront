@@ -460,6 +460,17 @@ Lakekeeper catalog, the R-A bakery serialising concurrent cold writers
 (same-node and cross-node) with no 409, and an N×(N-1) probe that the bakery's
 `coldfront.claims` table replicates in every direction.
 
+## Caveats
+
+- **Azure ADLS Gen2 cold tier requires Blob soft-delete and change feed to be
+  OFF.** Iceberg on Azure is accessed over the ADLS Gen2 (`abfss://` / `dfs`)
+  endpoint, which **rejects storage accounts that have Blob soft-delete, container
+  soft-delete, or change feed (blob events) enabled** — Lakekeeper warehouse
+  creation fails with HTTP 409 *"This endpoint does not support BlobStorageEvents
+  or SoftDelete."* Disable those features on the storage account before using it as
+  a cold tier. (Plain blob access via `az://` is unaffected — it is specifically the
+  ADLS Gen2 endpoint that Iceberg uses.)
+
 ## Project Structure
 
 ```
