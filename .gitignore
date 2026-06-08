@@ -11,6 +11,9 @@ coverage.html
 
 # pg_regress expected outputs — tracked; the global *.out would exclude them.
 !extension/coldfront/test/expected/*.out
+# pg_regress run artifacts (generated; never committed)
+extension/coldfront/test/results/
+extension/coldfront/test/regression.diffs
 
 # TLC model-checker artefacts (created next to wherever tlc2.TLC is invoked).
 docs/formal/Bakery_TTrace_*

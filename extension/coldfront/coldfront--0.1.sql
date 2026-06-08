@@ -56,14 +56,28 @@ CREATE TABLE IF NOT EXISTS coldfront.archive_watermark (
 -- cold-write commit — which pg_duckdb runs in a fresh DuckDB transaction that
 -- cannot see a secret registered in the still-open caller transaction — resolve
 -- the credential on every PG major.
+-- storage_type discriminates the cold-store backend: 's3' (AWS / any
+-- S3-compatible store) or 'azure' (ADLS Gen2 over the DuckDB azure extension).
+-- key_id/secret are the S3 access pair; connection_string carries the Azure
+-- CONFIG-provider connection string (AccountName=…;AccountKey=…;EndpointSuffix=…)
+-- — duckdb-azure has NO separate ACCOUNT_KEY param, so shared-key auth lives
+-- entirely inside the connection string. The CHECKs enforce the right columns
+-- per type (key_id/secret nullable so an azure row needs neither).
 CREATE TABLE IF NOT EXISTS coldfront.storage_secret (
-    name      text    NOT NULL DEFAULT 'cf_storage' PRIMARY KEY,
-    key_id    text    NOT NULL,
-    secret    text    NOT NULL,
-    endpoint  text,                            -- NULL/'' ⇒ AWS default (vhost); set ⇒ path-style S3-compatible
-    region    text    NOT NULL DEFAULT 'us-east-1',
-    url_style text    NOT NULL DEFAULT 'path',
-    use_ssl   boolean NOT NULL DEFAULT false
+    name              text    NOT NULL DEFAULT 'cf_storage' PRIMARY KEY,
+    storage_type      text    NOT NULL DEFAULT 's3',
+    key_id            text,                            -- s3 only (NOT NULL enforced by ss_s3_creds)
+    secret            text,                            -- s3 only
+    endpoint          text,                            -- s3: NULL/'' ⇒ AWS default (vhost); set ⇒ path-style S3-compatible
+    region            text    NOT NULL DEFAULT 'us-east-1',
+    url_style         text    NOT NULL DEFAULT 'path',
+    use_ssl           boolean NOT NULL DEFAULT false,
+    connection_string text,                            -- azure CONFIG provider: AccountName/AccountKey (shared key)
+    CONSTRAINT ss_type_enum  CHECK (storage_type IN ('s3','azure')),
+    CONSTRAINT ss_s3_creds   CHECK (storage_type <> 's3'
+                                     OR (key_id IS NOT NULL AND secret IS NOT NULL)),
+    CONSTRAINT ss_azure_conn CHECK (storage_type <> 'azure'
+                                     OR (connection_string IS NOT NULL AND connection_string <> ''))
 );
 
 -- Per-table partition lifecycle config — the unified, name-keyed source of
@@ -166,21 +180,24 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- materialize_storage_secret() writes the DuckDB PERSISTENT SECRET on THIS node
--- from the stored row. DuckDB persists it to its secret directory and loads it
--- at instance init, so every subsequent backend sees the credential committed
--- before any query — the property that lets a cold-write commit resolve it on
--- PG 16/17/18. Idempotent (CREATE OR REPLACE); no-op
--- when no row is set. NO EXCEPTION clause — pg_duckdb forbids running ATTACH /
--- secret DDL inside a subtransaction, and a plpgsql EXCEPTION block is one.
-CREATE OR REPLACE FUNCTION coldfront.materialize_storage_secret() RETURNS void
-LANGUAGE plpgsql AS $$
-DECLARE
-  r    coldfront.storage_secret;
-  opts text;
+-- _build_storage_secret_opts() — PURE: returns the body of the DuckDB
+-- CREATE PERSISTENT SECRET for the given row, branched on storage_type. It
+-- touches no tables and issues no DuckDB calls, so it is unit-testable in
+-- pg_regress (white-box, like the cold-DML rewrite helpers). Both branches
+-- feed the same emission path in materialize_storage_secret().
+CREATE OR REPLACE FUNCTION coldfront._build_storage_secret_opts(r coldfront.storage_secret)
+RETURNS text
+LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE opts text;
 BEGIN
-  SELECT * INTO r FROM coldfront.storage_secret LIMIT 1;
-  IF NOT FOUND THEN RETURN; END IF;
+  IF r.storage_type = 'azure' THEN
+    -- CONFIG provider (PROVIDER omitted ⇒ config). Shared-key auth: the access
+    -- key rides inside CONNECTION_STRING's AccountKey=… — duckdb-azure has no
+    -- separate ACCOUNT_KEY param. The same secret serves abfss:// (ADLS Gen2)
+    -- reads and writes.
+    RETURN format('TYPE azure, CONNECTION_STRING %L', r.connection_string);
+  END IF;
+  -- s3 (default)
   opts := format('TYPE s3, KEY_ID %L, SECRET %L, REGION %L', r.key_id, r.secret, r.region);
   -- A set endpoint ⇒ S3-compatible store (SeaweedFS/MinIO): path-style + the
   -- custom endpoint. No endpoint ⇒ AWS default (virtual-hosted).
@@ -189,7 +206,26 @@ BEGIN
                            r.endpoint, r.url_style,
                            CASE WHEN r.use_ssl THEN 'true' ELSE 'false' END);
   END IF;
-  PERFORM duckdb.raw_query(format('CREATE OR REPLACE PERSISTENT SECRET %I (%s)', r.name, opts));
+  RETURN opts;
+END;
+$$;
+
+-- materialize_storage_secret() writes the DuckDB PERSISTENT SECRET on THIS node
+-- from the stored row. DuckDB persists it to its secret directory and loads it
+-- at instance init, so every subsequent backend sees the credential committed
+-- before any query — the property that lets a cold-write commit resolve it on
+-- PG 16/17/18. Idempotent (CREATE OR REPLACE); no-op when no row is set. NO
+-- EXCEPTION clause — pg_duckdb forbids running ATTACH / secret DDL inside a
+-- subtransaction, and a plpgsql EXCEPTION block is one.
+CREATE OR REPLACE FUNCTION coldfront.materialize_storage_secret() RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+  r coldfront.storage_secret;
+BEGIN
+  SELECT * INTO r FROM coldfront.storage_secret LIMIT 1;
+  IF NOT FOUND THEN RETURN; END IF;
+  PERFORM duckdb.raw_query(format('CREATE OR REPLACE PERSISTENT SECRET %I (%s)',
+                                  r.name, coldfront._build_storage_secret_opts(r)));
 END;
 $$;
 
@@ -210,6 +246,39 @@ CREATE TRIGGER coldfront_storage_secret_materialize
   FOR EACH ROW EXECUTE FUNCTION coldfront._storage_secret_materialize_trg();
 ALTER TABLE coldfront.storage_secret ENABLE ALWAYS TRIGGER coldfront_storage_secret_materialize;
 
+-- _apply_storage_secret() — backend-NEUTRAL persist. Upserts the single
+-- cf_storage row (the materialize trigger then emits the matching DuckDB
+-- PERSISTENT SECRET, and the row replicates by value to mesh peers) and installs
+-- DuckDB's `postgres` extension when the pglocal write path is configured
+-- (coldfront.local_pg_dsn — install does I/O, hoisted out of the per-query hook).
+-- This function knows NOTHING about s3 vs azure: it writes whatever row it is
+-- given. The two typed setters below are the only backend-aware code — they
+-- shape the row; this applies it. NO EXCEPTION clause (pg_duckdb forbids secret
+-- DDL inside a subtransaction, and a plpgsql EXCEPTION block is one).
+CREATE OR REPLACE FUNCTION coldfront._apply_storage_secret(p coldfront.storage_secret)
+RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+  dsn text := current_setting('coldfront.local_pg_dsn', true);
+BEGIN
+  INSERT INTO coldfront.storage_secret
+       (name, storage_type, key_id, secret, endpoint, region, url_style, use_ssl, connection_string)
+       VALUES (p.name, p.storage_type, p.key_id, p.secret, p.endpoint,
+               p.region, p.url_style, p.use_ssl, p.connection_string)
+  ON CONFLICT (name) DO UPDATE SET
+       storage_type      = EXCLUDED.storage_type,
+       key_id            = EXCLUDED.key_id,
+       secret            = EXCLUDED.secret,
+       endpoint          = EXCLUDED.endpoint,
+       region            = EXCLUDED.region,
+       url_style         = EXCLUDED.url_style,
+       use_ssl           = EXCLUDED.use_ssl,
+       connection_string = EXCLUDED.connection_string;
+  IF dsn IS NOT NULL AND dsn <> '' THEN
+    PERFORM duckdb.install_extension('postgres');
+  END IF;
+END;
+$$;
+
 -- set_storage_secret() — the one-call cold-tier setup that replaces the old
 -- duckdb.create_simple_secret setup. It writes the in-DB row (which
 -- fires the materialize trigger → DuckDB PERSISTENT SECRET on this node, and
@@ -225,21 +294,36 @@ CREATE OR REPLACE FUNCTION coldfront.set_storage_secret(
     p_url_style text    DEFAULT 'path',
     p_use_ssl   boolean DEFAULT false) RETURNS void
 LANGUAGE plpgsql AS $$
-DECLARE
-  dsn text := current_setting('coldfront.local_pg_dsn', true);
 BEGIN
-  INSERT INTO coldfront.storage_secret (name, key_id, secret, endpoint, region, url_style, use_ssl)
-       VALUES ('cf_storage', p_key_id, p_secret, p_endpoint, p_region, p_url_style, p_use_ssl)
-  ON CONFLICT (name) DO UPDATE SET
-       key_id    = EXCLUDED.key_id,
-       secret    = EXCLUDED.secret,
-       endpoint  = EXCLUDED.endpoint,
-       region    = EXCLUDED.region,
-       url_style = EXCLUDED.url_style,
-       use_ssl   = EXCLUDED.use_ssl;
-  IF dsn IS NOT NULL AND dsn <> '' THEN
-    PERFORM duckdb.install_extension('postgres');
-  END IF;
+  -- Shape an s3 row; _apply_storage_secret does the (backend-neutral) persist.
+  PERFORM coldfront._apply_storage_secret(ROW(
+    'cf_storage', 's3', p_key_id, p_secret, p_endpoint,
+    p_region, p_url_style, p_use_ssl, NULL
+  )::coldfront.storage_secret);
+END;
+$$;
+
+-- set_storage_secret_azure() — cold-tier setup for Azure ADLS Gen2 over the
+-- DuckDB azure extension's CONFIG provider. p_connection_string carries
+-- AccountName/AccountKey (shared key) + EndpointSuffix; this is the only
+-- duckdb-azure path for access-key auth (it has no ACCOUNT_KEY param). Same
+-- emission/replication path as the s3 setter: it writes the row → the
+-- materialize trigger emits the PERSISTENT secret on every node. NO EXCEPTION
+-- clause (pg_duckdb forbids secret DDL in a subtransaction). Requires the
+-- DuckDB 1.5.x + azure extension stack to actually materialize (the azure
+-- secret type must be registered); on an azure-less build the trigger's
+-- raw_query raises, by design.
+CREATE OR REPLACE FUNCTION coldfront.set_storage_secret_azure(
+    p_connection_string text) RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+  -- Shape an azure row (region/url_style/use_ssl are s3-only — set to the column
+  -- defaults to satisfy NOT NULL; the opts builder ignores them for azure).
+  -- _apply_storage_secret does the (backend-neutral) persist.
+  PERFORM coldfront._apply_storage_secret(ROW(
+    'cf_storage', 'azure', NULL, NULL, NULL,
+    'us-east-1', 'path', false, p_connection_string
+  )::coldfront.storage_secret);
 END;
 $$;
 
@@ -752,15 +836,30 @@ $$;
 -- p_view_ddl is the full CREATE OR REPLACE VIEW statement built by the
 -- archiver from the source's column types. We pass it through rather than
 -- reconstructing it here because the column→DuckDB type mapping lives in Go.
--- cutover_archive: DML (UPDATE watermark) + LOCK + DDL (view + DETACH).
+-- cutover_archive: DML (UPDATE watermark) + BAKERY + LOCK + DDL (view + DETACH).
 -- Caller drains the delta via replay_archive_delta before AND after this.
+--
+-- p_iceberg_ref is the cold table this partition feeds. We take the SAME bakery
+-- serializer the cold-write path takes on that key BEFORE the ACCESS EXCLUSIVE,
+-- so the DETACH can never race a concurrent cold writer: an in-flight writer is
+-- waited out (its RowExclusive drops at commit) and new writers block. The
+-- bakery (B) is always acquired before the partition lock (A) — a global lock
+-- order that, with the lock_timeout circuit breaker on A, is deadlock-free.
 CREATE OR REPLACE PROCEDURE coldfront.cutover_archive(
     p_schema text, p_part text, p_source text,
-    p_new_cutoff timestamptz, p_view_ddl text,
+    p_new_cutoff timestamptz, p_view_ddl text, p_iceberg_ref text,
     p_lock_timeout_ms int DEFAULT 100
 )
 LANGUAGE plpgsql AS $$
-DECLARE parent_table text;
+DECLARE
+    parent_table text;
+    my_ticket    bigint;
+    -- Same gate the cold WRITE path uses (_exec_iceberg_with_claim): mesh takes
+    -- the R-A bakery claim, vanilla a local xact advisory lock — on the SAME
+    -- per-iceberg-table key. Acquiring it here serializes the cutover against
+    -- concurrent cold writers through their own mutex.
+    v_armed   boolean := NULLIF(current_setting('snowflake.node', true), '') IS NOT NULL
+                     AND NULLIF(current_setting('coldfront.dblink_self', true), '') IS NOT NULL;
 BEGIN
     SELECT format('%I.%I', n.nspname, c.relname) INTO parent_table
     FROM pg_inherits i
@@ -781,6 +880,27 @@ BEGIN
         VALUES (p_source, p_new_cutoff);
     END IF;
 
+    -- GLOBAL LOCK ORDER, step 1 — take the bakery (resource B) BEFORE any
+    -- partition ACCESS EXCLUSIVE (resource A). Every path that holds both
+    -- acquires B before A, so no wait-for cycle can form. Held to this proc's
+    -- COMMIT: mesh release is enqueued for the C XactCallback (fires after
+    -- pg_duckdb's, so the iceberg side is settled), vanilla advisory is
+    -- xact-scoped. Deliberately NO lock_timeout on this acquire — we WANT to
+    -- wait out an in-flight cold writer's full commit so its RowExclusive on the
+    -- partition is gone before we ask for ACCESS EXCLUSIVE.
+    IF v_armed THEN
+        my_ticket := coldfront._claim_iceberg_lock(p_iceberg_ref);
+        PERFORM coldfront._enqueue_release(my_ticket);
+    ELSE
+        PERFORM pg_advisory_xact_lock(hashtext('coldfront_iceberg:' || p_iceberg_ref));
+    END IF;
+
+    -- GLOBAL LOCK ORDER, step 2 — now A. lock_timeout is the circuit breaker on
+    -- the ACCESS EXCLUSIVE acquisition ONLY (not the bakery above): if a writer
+    -- still holds RowExclusive (took A before B — the dual-tier CTE order is
+    -- undefined), this proc aborts in p_lock_timeout_ms, frees B, and the Go
+    -- harness retries. lock_timeout (100ms) < deadlock_timeout (1s) so the
+    -- cutover, never the writer, yields first.
     EXECUTE format('SET LOCAL lock_timeout = %L', p_lock_timeout_ms || 'ms');
     EXECUTE format('LOCK TABLE %s IN ACCESS EXCLUSIVE MODE', parent_table);
     EXECUTE format('LOCK TABLE %I.%I IN ACCESS EXCLUSIVE MODE', p_schema, p_part);

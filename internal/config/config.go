@@ -15,6 +15,7 @@ type Config struct {
 	Postgres PostgresConfig `yaml:"postgres"`
 	Iceberg  IcebergConfig  `yaml:"iceberg"`
 	S3       S3Config       `yaml:"s3"`
+	Azure    AzureConfig    `yaml:"azure"`
 	Archiver ArchiverConfig `yaml:"archiver"`
 }
 
@@ -38,6 +39,16 @@ type S3Config struct {
 	Region    string `yaml:"region"`
 	AccessKey string `yaml:"access_key"`
 	SecretKey string `yaml:"secret_key"`
+}
+
+// AzureConfig holds the Azure ADLS Gen2 connection string for the cold tier.
+// When set, the cold backend is Azure (a TYPE azure secret) instead of S3 — and
+// s3.* must be left empty. The storage-account access key rides INSIDE the
+// connection string (DefaultEndpointsProtocol=…;AccountName=…;AccountKey=…;
+// EndpointSuffix=…); the DuckDB azure extension has no separate account-key
+// parameter. Requires the DuckDB 1.5.x stack (see DUCKDB_1.5.md).
+type AzureConfig struct {
+	ConnectionString string `yaml:"connection_string"`
 }
 
 // ArchiverConfig wraps the list of tables the archiver manages in a single run.
@@ -142,8 +153,9 @@ func (c *Config) Validate() error {
 	// retention, no cold-tier archival). If ANY iceberg/S3 field is supplied,
 	// every required one must be — a partial cold config fails loudly rather
 	// than silently running half-configured.
+	anyS3 := c.S3.Endpoint != "" || c.S3.AccessKey != "" || c.S3.SecretKey != ""
 	icebergMode := c.Iceberg.Warehouse != "" || c.Iceberg.LakekeeperEndpoint != "" ||
-		c.S3.Endpoint != "" || c.S3.AccessKey != "" || c.S3.SecretKey != ""
+		anyS3 || c.Azure.ConnectionString != ""
 	if icebergMode {
 		if c.Iceberg.Warehouse == "" {
 			return fmt.Errorf("iceberg.warehouse is required")
@@ -151,14 +163,22 @@ func (c *Config) Validate() error {
 		if c.Iceberg.LakekeeperEndpoint == "" {
 			return fmt.Errorf("iceberg.lakekeeper_endpoint is required")
 		}
-		if c.S3.Endpoint == "" {
-			return fmt.Errorf("s3.endpoint is required")
-		}
-		if c.S3.AccessKey == "" {
-			return fmt.Errorf("s3.access_key is required")
-		}
-		if c.S3.SecretKey == "" {
-			return fmt.Errorf("s3.secret_key is required")
+		// The cold backend is exactly one of S3 or Azure — selected by which is
+		// configured. Mixing is a config error.
+		if c.Azure.ConnectionString != "" {
+			if anyS3 {
+				return fmt.Errorf("set either s3.* or azure.connection_string, not both")
+			}
+		} else {
+			if c.S3.Endpoint == "" {
+				return fmt.Errorf("s3.endpoint is required")
+			}
+			if c.S3.AccessKey == "" {
+				return fmt.Errorf("s3.access_key is required")
+			}
+			if c.S3.SecretKey == "" {
+				return fmt.Errorf("s3.secret_key is required")
+			}
 		}
 	}
 	// Zero tables is allowed here: the managed-table set may instead come from

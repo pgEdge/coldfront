@@ -19,7 +19,8 @@ REGRESS     = load_order update_unregistered_view update_heap_table \
               cast_in_dquoted_identifier \
               ddl_noop_unregistered ddl_block_drop ddl_block_truncate \
               ddl_block_column ddl_rename_table ddl_rename_view \
-              ddl_partition_passthrough bakery_wraps_cold_writes
+              ddl_partition_passthrough bakery_wraps_cold_writes \
+              storage_secret_azure
 REGRESS_OPTS = --inputdir=test --outputdir=test
 
 PG_CONFIG  ?= pg_config

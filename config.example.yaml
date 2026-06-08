@@ -6,11 +6,19 @@ iceberg:
   lakekeeper_endpoint: "http://lakekeeper:8181/catalog"  # Lakekeeper REST catalog
   namespace: "default"                                   # optional, default: "default"
 
+# Cold-store backend: configure EXACTLY ONE of s3 or azure.
 s3:
   endpoint: "seaweedfs:8333"    # S3 endpoint (no http://)
   region: "us-east-1"           # optional, default: "us-east-1"
   access_key: "admin"
   secret_key: "adminsecret"
+
+# azure:                        # Azure ADLS Gen2 cold tier (requires the DuckDB
+#                               # 1.5.x build — see DUCKDB_1.5.md). The access
+#                               # key rides inside the connection string; there
+#                               # is no separate account-key field. Leave s3.*
+#                               # empty when using azure.
+#   connection_string: "DefaultEndpointsProtocol=https;AccountName=<account>;AccountKey=<key>;EndpointSuffix=core.windows.net"
 
 archiver:
   tables:

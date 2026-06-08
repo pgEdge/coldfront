@@ -22,6 +22,12 @@ source "$SCRIPT_DIR/lib.sh"
 
 HOST=""; MODE="tiered"; MESH=0; PEERS=""; STANDBY=""
 DB_IP=""; SW_IP=""; LK_IP=""; WAREHOUSE="wh"
+# Cold-store backend: s3 (default) or azure (ADLS Gen2, DuckDB 1.5.x stack). The
+# journey STORIES are storage-agnostic — only the secret call and the archiver
+# config block differ. Real azure creds come from env (never committed): the
+# connection string carries the shared key (AccountName=…;AccountKey=…).
+BACKEND="${COLDFRONT_BACKEND:-s3}"
+AZURE_CONN="${COLDFRONT_AZURE_CONNECTION_STRING:-}"
 ARCHIVER="${ARCHIVER:-./bin/archiver}"
 while [ $# -gt 0 ]; do case "$1" in
   --host) HOST="$2"; shift 2;;
@@ -33,10 +39,31 @@ while [ $# -gt 0 ]; do case "$1" in
   --sw-ip) SW_IP="$2"; shift 2;;
   --lk-ip) LK_IP="$2"; shift 2;;
   --warehouse) WAREHOUSE="$2"; shift 2;;
+  --backend) BACKEND="$2"; shift 2;;
+  --azure-conn) AZURE_CONN="$2"; shift 2;;
   --archiver) ARCHIVER="$2"; shift 2;;
   *) echo "journey.sh: unknown arg $1"; exit 2;;
 esac; done
 [ -n "$HOST" ] || { echo "journey.sh: --host required"; exit 2; }
+[ "$BACKEND" = azure ] && [ -z "$AZURE_CONN" ] && { echo "journey.sh: --backend azure needs --azure-conn / COLDFRONT_AZURE_CONNECTION_STRING"; exit 2; }
+
+# storage_secret_sql — the SQL that sets the cold-store credential, per backend.
+storage_secret_sql() {
+    if [ "$BACKEND" = azure ]; then
+        printf "SELECT coldfront.set_storage_secret_azure('%s');" "$AZURE_CONN"
+    else
+        printf "SELECT coldfront.set_storage_secret('admin','adminsecret','%s:8333');" "$SW_IP"
+    fi
+}
+
+# storage_yaml — the cold-store block for an archiver YAML config, per backend.
+storage_yaml() {
+    if [ "$BACKEND" = azure ]; then
+        printf 'azure:\n  connection_string: "%s"' "$AZURE_CONN"
+    else
+        printf 's3:\n  endpoint: "%s:8333"\n  region: "us-east-1"\n  access_key: "admin"\n  secret_key: "adminsecret"' "$SW_IP"
+    fi
+}
 
 step "JOURNEY  host=$HOST  mode=$MODE  mesh=$MESH  standby=${STANDBY:-none}"
 
@@ -55,7 +82,7 @@ CREATE EXTENSION IF NOT EXISTS coldfront;
 -- set_storage_secret writes the in-DB row AND materializes a DuckDB PERSISTENT
 -- secret (loaded at init), so cold reads/writes resolve creds with no login
 -- trigger — the mechanism that works on PG 16/17/18.
-SELECT coldfront.set_storage_secret('admin','adminsecret','${SW_IP}:8333');
+$(storage_secret_sql)
 EOSQL
     local ext; ext=$(q "$HOST" "SELECT count(*) FROM pg_extension WHERE extname IN ('pg_duckdb','coldfront');")
     assert_eq "extensions present" "2" "$ext"
@@ -105,11 +132,7 @@ iceberg:
   warehouse: "${WAREHOUSE}"
   lakekeeper_endpoint: "http://${LK_IP}:8181/catalog"
   namespace: "default"
-s3:
-  endpoint: "${SW_IP}:8333"
-  region: "us-east-1"
-  access_key: "admin"
-  secret_key: "adminsecret"
+$(storage_yaml)
 archiver:
   tables:
     - source_table: events
@@ -153,11 +176,7 @@ iceberg:
   warehouse: "${WAREHOUSE}"
   lakekeeper_endpoint: "http://${LK_IP}:8181/catalog"
   namespace: "default"
-s3:
-  endpoint: "${SW_IP}:8333"
-  region: "us-east-1"
-  access_key: "admin"
-  secret_key: "adminsecret"
+$(storage_yaml)
 archiver:
   tables:
     - source_table: events
@@ -327,7 +346,7 @@ EOSQL
     cat > /tmp/journey-typed.yaml <<EOF
 postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
 iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog", namespace: "default" }
-s3:       { endpoint: "${SW_IP}:8333", region: "us-east-1", access_key: "admin", secret_key: "adminsecret" }
+$(storage_yaml)
 archiver: { tables: [ { source_table: typed, partition_period: monthly, hot_period: "${ret_days} days" } ] }
 EOF
     "$ARCHIVER" --config /tmp/journey-typed.yaml >/tmp/journey-typed.log 2>&1 \
@@ -507,7 +526,7 @@ EOSQL
     cat > /tmp/journey-race.yaml <<EOF
 postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
 iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog", namespace: "default" }
-s3:       { endpoint: "${SW_IP}:8333", region: "us-east-1", access_key: "admin", secret_key: "adminsecret" }
+$(storage_yaml)
 archiver: { tables: [ { source_table: events, partition_period: monthly, hot_period: "${ret_race} days" } ] }
 EOF
     "$ARCHIVER" --config /tmp/journey-race.yaml --debug-export-delay 4s >/tmp/journey-race.log 2>&1 &
@@ -871,7 +890,7 @@ EOSQL
     cat > /tmp/journey-tl.yaml <<EOF
 postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
 iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog", namespace: "default" }
-s3:       { endpoint: "${SW_IP}:8333", region: "us-east-1", access_key: "admin", secret_key: "adminsecret" }
+$(storage_yaml)
 archiver:
   tables:
     - source_table: regional
@@ -974,7 +993,7 @@ EOSQL
     cat > /tmp/journey-conn.yaml <<EOF
 postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
 iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog", namespace: "default" }
-s3:       { endpoint: "${SW_IP}:8333", region: "us-east-1", access_key: "admin", secret_key: "adminsecret" }
+$(storage_yaml)
 EOF
     if "$ARCHIVER" --config /tmp/journey-conn.yaml >/tmp/journey-dbrun.log 2>&1; then
         pass "archiver ran with no YAML tables"

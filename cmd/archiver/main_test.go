@@ -10,8 +10,30 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/pgedge/coldfront/internal/config"
 	"github.com/pgedge/coldfront/internal/view"
 )
+
+func TestColdSecretSQL_S3(t *testing.T) {
+	cfg := &config.Config{S3: config.S3Config{
+		AccessKey: "admin", SecretKey: "adminsecret", Endpoint: "sw:8333", Region: "us-east-1",
+	}}
+	sql := coldSecretSQL(cfg)
+	assert.Contains(t, sql, "TYPE S3")
+	assert.Contains(t, sql, "KEY_ID 'admin'")
+	assert.Contains(t, sql, "ENDPOINT 'sw:8333'")
+	assert.NotContains(t, sql, "azure")
+}
+
+func TestColdSecretSQL_Azure(t *testing.T) {
+	cfg := &config.Config{Azure: config.AzureConfig{
+		ConnectionString: "DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=Zm9v;EndpointSuffix=core.windows.net",
+	}}
+	sql := coldSecretSQL(cfg)
+	assert.Contains(t, sql, "TYPE azure")
+	assert.Contains(t, sql, "CONNECTION_STRING 'DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=Zm9v;EndpointSuffix=core.windows.net'")
+	assert.NotContains(t, sql, "TYPE S3")
+}
 
 // mockRow / mockRows / mockQuerier mirror the pattern in
 // internal/partition/partition_test.go. Hand-written, no mock framework.

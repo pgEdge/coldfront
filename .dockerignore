@@ -1,0 +1,27 @@
+# Keep the docker build context free of secrets and bulk. docker uses THIS, not
+# .gitignore — without it, scale-test/ (which holds local cloud credentials)
+# would be sent to the build daemon.
+.git
+.dockerignore
+
+# local-only: credentials, bench/scale harnesses, demos (never in an image)
+scale-test/
+scale-test-*.sh
+bench-*.sh
+bench.md
+demo/
+
+# build outputs / caches / editor + agent state
+bin/
+/archiver
+.tmp/
+.claude/
+*.log
+*.pdf
+coverage.html
+
+# formal-methods + e2e artifacts
+docs/formal/states/
+docs/formal/Bakery_TTrace_*
+E2E*.md
+SCALE_TEST_SETUP.md

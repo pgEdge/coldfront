@@ -1,0 +1,219 @@
+# iceberg-bakery-aware-commit-refresh-v15.patch
+#
+# Applies to: duckdb-iceberg @ 0fad545a (branch v1.5-variegata), DuckDB v1.5.x.
+#
+# The DuckDB 1.5.x port of docker/iceberg-bakery-aware-commit-refresh.patch
+# (1.4.3 / ebe0dfaf). SEPARATE file; does NOT replace the 1.4.3 patch (the
+# revert-to baseline). Full rationale + side-by-side: DUCKDB_1.5.md.
+#
+# Same problem as 1.4.3: coldfront uploads parquet OUTSIDE the R-A bakery and
+# takes the ticket only for the commit POST, so a writer committing against
+# session-cached metadata fails assert-ref-snapshot-id (Lakekeeper 409) when a
+# peer advanced the head, and an append built from the stale cached manifest
+# list silently drops the peer's data.
+#
+# v1.5 derives the new snapshot's parent + sequence_number at COMMIT time from
+# table_metadata (unlike 1.4.3's eager Finalize stamping), so the fix is:
+# inside IcebergTransaction::DoTableUpdates (PG PRE_COMMIT, holding the ticket),
+# BEFORE GetTransactionRequest builds the commit, refresh each altered table's
+# table_metadata from Lakekeeper (IRCAPI::GetTable) AND re-read its source
+# manifest list, so both the asserted parent and the new manifest list reflect
+# the fresh head. v1.5's existing commit-time derivation does the rest.
+#
+# CRITICAL (the part that differs from a naive port, and why mixed-tier
+# concurrency was throwing "TransactionContext::ActiveTransaction called without
+# active transaction"): the manifest-list re-read is a read_avro table-function
+# SCAN, which needs a ClientContext with an ACTIVE transaction. It must run on
+# the fresh temp_con that IcebergTransaction::Commit opens (temp_con.BeginTransaction()),
+# NOT on IcebergTransactionData's stored context — that is the ORIGINAL/main
+# connection, which during the commit xact callback has no active transaction
+# (it is mid-commit). So CacheExistingManifestList / RefreshExistingManifestList
+# take an explicit scan_context: AddSnapshot/AddUpdateSnapshot pass the member
+# context (active during the INSERT); the commit-time refresh passes the
+# temp_con context (DoTableUpdates' `context`). Pure-cold (9b) happened to
+# survive the wrong context; the dual-CTE mixed-tier path (6b) did not.
+#
+# Verified: builds; ci/journey.sh 6b (4 concurrent mixed-tier writers) and 9b
+# (8 concurrent cold writers) over Azure ADLS land 8/8 and 8/8 with 0 errors,
+# 0 loss.
+#
+diff --git a/src/catalog/rest/transaction/iceberg_transaction.cpp b/src/catalog/rest/transaction/iceberg_transaction.cpp
+index 4047986d..5ed21955 100644
+--- a/src/catalog/rest/transaction/iceberg_transaction.cpp
++++ b/src/catalog/rest/transaction/iceberg_transaction.cpp
+@@ -7,6 +7,7 @@
+ #include "duckdb/storage/table/update_state.hpp"
+ #include "duckdb/parser/parsed_data/drop_info.hpp"
+ #include "duckdb/main/client_data.hpp"
++#include "duckdb/common/exception/http_exception.hpp"
+ #include "yyjson.hpp"
+ 
+ #include "planning/metadata_io/manifest/iceberg_manifest_reader.hpp"
+@@ -444,6 +445,72 @@ void IcebergTransaction::DoTableUpdates(IcebergTransactionAlterUpdate &alter_upd
+ 	if (!alter_update.HasUpdates()) {
+ 		return;
+ 	}
++
++	// ColdFront bakery-aware commit refresh.
++	//
++	// coldfront._exec_iceberg_with_claim uploads parquet OUTSIDE the R-A
++	// bakery and only acquires the ticket for this commit POST, which runs
++	// here at PG PRE_COMMIT. Every field of the new snapshot is derived at
++	// commit time from table_info.table_metadata: GetTransactionRequest reads
++	// the parent via GetLatestSnapshot() and emits the assert-ref-snapshot-id
++	// requirement from it, and IcebergCommitState seeds next_sequence_number
++	// from last_sequence_number. But that metadata was loaded from Lakekeeper
++	// BEFORE the bakery -- an earlier ticket-holder may have committed since,
++	// so the cached head is stale and the assert-ref precondition would 409.
++	//
++	// We hold the ticket now, so no other coldfront writer can move the head
++	// until we release. Re-read each altered table's metadata from Lakekeeper
++	// exactly once, here, before GetTransactionRequest builds the commit
++	// state. Everything downstream then derives from the fresh head: the
++	// asserted parent snapshot-id matches the catalog, parent_snapshot_id and
++	// the snapshot/manifest sequence_number are re-derived correctly (the
++	// temp sequence_number baked into the manifest file at AddSnapshot time is
++	// overwritten on commit by AddNewManifestFile, and ADDED entries inherit
++	// it), and the new manifest list is built on top of the peer's manifests
++	// instead of silently dropping them.
++	for (auto &updated_table : alter_update.updated_tables) {
++		if (alter_update.committed_tables.count(updated_table.first)) {
++			continue;
++		}
++		auto &table_info = updated_table.second;
++		if (!table_info.transaction_data) {
++			continue;
++		}
++		auto &transaction_data = *table_info.transaction_data;
++		// Nothing to refresh for a table without staged data (e.g. pure DDL):
++		// the assert-ref precondition only applies when we add a snapshot.
++		if (transaction_data.alters.empty()) {
++			continue;
++		}
++		// Tables CREATEd in this same transaction (carrying an ASSERT_CREATE
++		// requirement) do not exist in the catalog yet, so GetTable would 404.
++		// Their cached metadata is the authoritative initial state -- leave it.
++		bool is_being_created = false;
++		for (auto &requirement : transaction_data.requirements) {
++			if (requirement->type == IcebergTableRequirementType::ASSERT_CREATE) {
++				is_being_created = true;
++				break;
++			}
++		}
++		if (is_being_created) {
++			continue;
++		}
++		auto &schema = table_info.schema.Cast<IcebergSchemaEntry>();
++		auto refreshed = IRCAPI::GetTable(context, catalog, schema, table_info.name);
++		if (refreshed.has_error) {
++			throw HTTPException(
++			    StringUtil::Format("iceberg: pre-commit metadata refresh returned response code %s with message \"%s\"",
++			                       EnumUtil::ToString(refreshed.status_), refreshed.error_._error.message));
++		}
++		// initialize_schemas=false: schema versions are already populated and
++		// the cold-append path does not change the schema; this mirrors the
++		// cached-reinit path (iceberg_table_set.cpp / CreateMetadataFromLog).
++		table_info.InitializeFromLoadTableResult(*refreshed.result_, false);
++		// Re-read the source manifest list from the freshly-loaded head so the
++		// new manifest list is built on top of the peer's manifests.
++		transaction_data.RefreshExistingManifestList(context);
++	}
++
+ 	auto transaction_info = GetTransactionRequest(alter_update, context);
+ 	auto &transaction = transaction_info.request;
+ 
+diff --git a/src/catalog/rest/transaction/iceberg_transaction_data.cpp b/src/catalog/rest/transaction/iceberg_transaction_data.cpp
+index f3187e5f..b13cb6e8 100644
+--- a/src/catalog/rest/transaction/iceberg_transaction_data.cpp
++++ b/src/catalog/rest/transaction/iceberg_transaction_data.cpp
+@@ -24,11 +24,17 @@ IcebergTransactionData::IcebergTransactionData(ClientContext &context, const Ice
+ 	initial_schema_id = table_info.table_metadata.GetCurrentSchemaId();
+ }
+ 
+-void IcebergTransactionData::CacheExistingManifestList(lock_guard<mutex> &guard, const IcebergTableMetadata &metadata) {
+-	if (!alters.empty()) {
++void IcebergTransactionData::CacheExistingManifestList(lock_guard<mutex> &guard, const IcebergTableMetadata &metadata,
++                                                       ClientContext &scan_context, bool force) {
++	//! Normally the existing manifest list is cached exactly once, by the first
++	//! AddSnapshot. The ColdFront bakery-aware refresh passes force=true to
++	//! re-read it against the freshly-loaded catalog head (see
++	//! RefreshExistingManifestList): the cache it replaces was scanned from the
++	//! snapshot that was current BEFORE this writer took the bakery ticket.
++	if (!force && !alters.empty()) {
+ 		return;
+ 	}
+-
++	existing_manifest_list.clear();
+ 	auto current_snapshot = metadata.GetLatestSnapshot();
+ 	if (!current_snapshot) {
+ 		return;
+@@ -41,7 +47,7 @@ void IcebergTransactionData::CacheExistingManifestList(lock_guard<mutex> &guard,
+ 	auto &manifest_list_path = current_snapshot->manifest_list;
+ 	//! Read the manifest list
+ 	auto scan =
+-	    AvroScan::ScanManifestList(snapshot_info, metadata, context, manifest_list_path, existing_manifest_list);
++	    AvroScan::ScanManifestList(snapshot_info, metadata, scan_context, manifest_list_path, existing_manifest_list);
+ 	auto manifest_list_reader = make_uniq<manifest_list::ManifestListReader>(*scan);
+ 	while (!manifest_list_reader->Finished()) {
+ 		manifest_list_reader->Read();
+@@ -71,6 +77,22 @@ void IcebergTransactionData::CacheExistingManifestList(lock_guard<mutex> &guard,
+ 	}
+ }
+ 
++void IcebergTransactionData::RefreshExistingManifestList(ClientContext &scan_context) {
++	//! ColdFront bakery-aware refresh of the cached source manifest list.
++	//!
++	//! ColdFront uploads parquet OUTSIDE the R-A bakery and only takes the
++	//! ticket for the commit POST. The existing_manifest_list was scanned at
++	//! AddSnapshot time from the snapshot that was current then; an earlier
++	//! ticket-holder may have committed since, adding manifest files we have
++	//! not seen. If we built the new manifest list from the stale cache we
++	//! would silently drop the peer's data. We hold the ticket now, so the
++	//! refreshed table_metadata head is the value our commit will assert
++	//! against; re-read the manifest list from it. force=true is required
++	//! because 'alters' is already populated by this point.
++	lock_guard<mutex> guard(lock);
++	CacheExistingManifestList(guard, table_info.table_metadata, scan_context, true);
++}
++
+ void IcebergTransactionData::AddSnapshot(IcebergSnapshotOperationType operation,
+                                          vector<IcebergManifestEntry> &&data_files,
+                                          IcebergManifestDeletes &&altered_manifests) {
+@@ -79,7 +101,7 @@ void IcebergTransactionData::AddSnapshot(IcebergSnapshotOperationType operation,
+ 
+ 	//! Generate a new snapshot id
+ 	auto &table_metadata = table_info.table_metadata;
+-	CacheExistingManifestList(guard, table_metadata);
++	CacheExistingManifestList(guard, table_metadata, context);
+ 
+ 	IcebergManifestContentType manifest_content_type;
+ 	switch (operation) {
+@@ -123,7 +145,7 @@ void IcebergTransactionData::AddUpdateSnapshot(vector<IcebergManifestEntry> &&de
+ 	auto &table_metadata = table_info.table_metadata;
+ 	auto last_sequence_number = table_metadata.last_sequence_number;
+ 
+-	CacheExistingManifestList(guard, table_metadata);
++	CacheExistingManifestList(guard, table_metadata, context);
+ 
+ 	auto snapshot_id = IcebergSnapshot::NewSnapshotId();
+ 	const auto sequence_number = last_sequence_number + alters.size() + 1;
+diff --git a/src/include/catalog/rest/transaction/iceberg_transaction_data.hpp b/src/include/catalog/rest/transaction/iceberg_transaction_data.hpp
+index c48f5ea5..04232551 100644
+--- a/src/include/catalog/rest/transaction/iceberg_transaction_data.hpp
++++ b/src/include/catalog/rest/transaction/iceberg_transaction_data.hpp
+@@ -47,8 +47,14 @@ public:
+ 	void TableRemoveProperties(const vector<string> &properties);
+ 	void TableSetLocation();
+ 
++	//! ColdFront bakery-aware refresh: drop the manifest list that was cached
++	//! from the (possibly stale) snapshot at AddSnapshot time and re-read it
++	//! from the now-refreshed table_metadata head. Must be called AFTER
++	//! table_info.table_metadata has been refreshed from Lakekeeper.
++	void RefreshExistingManifestList(ClientContext &scan_context);
++
+ private:
+-	void CacheExistingManifestList(lock_guard<mutex> &guard, const IcebergTableMetadata &metadata);
++	void CacheExistingManifestList(lock_guard<mutex> &guard, const IcebergTableMetadata &metadata, ClientContext &scan_context, bool force = false);
+ 
+ public:
+ 	int32_t initial_schema_id;

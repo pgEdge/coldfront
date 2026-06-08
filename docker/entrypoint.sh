@@ -108,6 +108,16 @@ EOF
         mkdir -p "$EXTDIR"
         cp /opt/coldfront/iceberg/iceberg.duckdb_extension "$EXTDIR/iceberg.duckdb_extension"
         cp /opt/coldfront/iceberg/avro.duckdb_extension    "$EXTDIR/avro.duckdb_extension"
+        # azure ext present only in the DuckDB 1.5.x image (Azure ADLS cold tier).
+        # Conditional so this one entrypoint serves both the 1.4.3 and 1.5 images.
+        [ -f /opt/coldfront/iceberg/azure.duckdb_extension ] && \
+            cp /opt/coldfront/iceberg/azure.duckdb_extension "$EXTDIR/azure.duckdb_extension"
+        # postgres_scanner ('postgres' ext) — shipped in the 1.5.x image so
+        # install_extension('postgres') (pglocal write path) resolves it locally
+        # instead of downloading from extensions.duckdb.org. Conditional: the
+        # 1.4.3 image lacks it and still autoinstalls the released v1.4.3 build.
+        [ -f /opt/coldfront/iceberg/postgres_scanner.duckdb_extension ] && \
+            cp /opt/coldfront/iceberg/postgres_scanner.duckdb_extension "$EXTDIR/postgres_scanner.duckdb_extension"
     fi
 
     "$PGBIN/pg_ctl" -D "$PGDATA" -o "-c listen_addresses=''" -w start

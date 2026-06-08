@@ -145,13 +145,28 @@ func execDuckDB(ctx context.Context, pool *pgxpool.Pool, sql string) error {
 	return err
 }
 
-// attachIceberg sets up the per-connection DuckDB S3 secret and Lakekeeper catalog.
-func attachIceberg(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config) error {
-	if err := execDuckDB(ctx, pool, fmt.Sprintf(
+// coldSecretSQL builds the CREATE SECRET statement for the cold-store backend.
+// Azure (TYPE azure, CONNECTION_STRING — shared key inside the connection
+// string) when azure.connection_string is set, else S3. The choice mirrors the
+// extension-side coldfront._build_storage_secret_opts(). NOTE: this is a
+// session secret for the archiver's own export; the iceberg COMMIT resolves the
+// credential from the PERSISTENT secret (coldfront.set_storage_secret[_azure]).
+func coldSecretSQL(cfg *config.Config) string {
+	if cfg.Azure.ConnectionString != "" {
+		return fmt.Sprintf(
+			"CREATE SECRET IF NOT EXISTS cf_cold_secret (TYPE azure, CONNECTION_STRING %s)",
+			sqlutil.Literal(cfg.Azure.ConnectionString))
+	}
+	return fmt.Sprintf(
 		"CREATE SECRET IF NOT EXISTS s3_secret (TYPE S3, KEY_ID %s, SECRET %s, ENDPOINT %s, URL_STYLE 'path', USE_SSL false, REGION %s)",
 		sqlutil.Literal(cfg.S3.AccessKey), sqlutil.Literal(cfg.S3.SecretKey),
-		sqlutil.Literal(cfg.S3.Endpoint), sqlutil.Literal(cfg.S3.Region))); err != nil {
-		return fmt.Errorf("create s3 secret: %w", err)
+		sqlutil.Literal(cfg.S3.Endpoint), sqlutil.Literal(cfg.S3.Region))
+}
+
+// attachIceberg sets up the per-connection DuckDB cold-store secret and Lakekeeper catalog.
+func attachIceberg(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config) error {
+	if err := execDuckDB(ctx, pool, coldSecretSQL(cfg)); err != nil {
+		return fmt.Errorf("create cold-store secret: %w", err)
 	}
 
 	if err := execDuckDB(ctx, pool, fmt.Sprintf(
@@ -724,9 +739,9 @@ func archiveCutover(ctx context.Context, pool *pgxpool.Pool, t *config.TableConf
 
 		t4 := time.Now()
 		if _, err := pool.Exec(ctx,
-			"CALL coldfront.cutover_archive($1, $2, $3, $4, $5, $6)",
+			"CALL coldfront.cutover_archive($1, $2, $3, $4, $5, $6, $7)",
 			t.SourceSchema, part.Name, t.SourceTable,
-			part.UpperBound, viewDDL, 100); err == nil {
+			part.UpperBound, viewDDL, iceTable, 100); err == nil {
 			log.Printf("[%s] %s phase 4 attempt %d (cutover: lock + watermark + view + DETACH): %s",
 				t.SourceTable, part.Name, attempt, time.Since(t4).Round(time.Millisecond))
 			cutoverDone = true

@@ -276,3 +276,79 @@ No code change. Flip to stock: set `coldfront.iceberg_async_parquet = off` (the
 code falls back to claim-first), restore stock iceberg (delete the local binaries
 + `autoinstall = on`, or let autoinstall overwrite), set
 `allow_unsigned = off`. See `UNPATCHED.md`.
+
+## 11. FIXED — partition cutover now serializes through the bakery (was a cold-write race)
+
+**Fixed in `coldfront.cutover_archive` + `cmd/archiver/main.go`.** This was a
+ColdFront-SQL gap, independent of the iceberg bakery patch above and **identical
+in the 1.4.x and 1.5.x stacks** — so the same fix applies to the 1.4.x stack if
+it is ever revived. It was *latent under S3* and only surfaced by Azure ADLS's
+higher commit latency. "The bakery works flawlessly under S3" was true only by
+*timing luck*, not by design. The diagnosis is kept below as the recipe.
+
+**The gap (the bug).** The bakery (`coldfront_iceberg:<ref>` advisory-xact-lock
+in vanilla / R-A claim in mesh) serializes cold **writes** against each other —
+but the archiver's **phase-4 cutover** (`coldfront.cutover_archive`) did **not**
+take it. The proc went straight to `LOCK TABLE … ACCESS EXCLUSIVE` on the parent
++ partition (with `lock_timeout`, retried ~10× / ~102 s by the archiver). So the
+cutover was **not a bakery participant** and merely *raced* concurrent cold
+writers for the partition lock.
+
+**Symptom.** With a concurrent cold write to a partition being cut over (e.g.
+`ci/journey.sh` story 9's race window), the racing write holds the partition
+`RowExclusive` **for the full duration of its iceberg commit**. On S3 that
+commit is fast, so it finished inside the cutover's retry budget and the cutover
+won a retry — *looked flawless*. On a slow store (Azure) the commit took longer
+than ~102 s of retries, so all 10 cutover attempts failed with
+`ERROR: canceling statement due to lock timeout (SQLSTATE 55P03)`; the archiver
+logged `phase 4 (cutover) failed after 10 attempts; trigger+delta left for next
+cycle`. Data was never lost (export + write both landed; only the swap deferred),
+but the cycle did not complete. Lock graph captured on Azure: the racing
+`UPDATE` sat `state=active` holding `RowExclusive` while the archiver's
+`CALL cutover_archive` spun on the `ACCESS EXCLUSIVE` it could not get.
+
+**The fix.** `cutover_archive` gained a `p_iceberg_ref` parameter and now
+acquires the **same bakery** a cold write takes — same `v_armed` gate
+(`pg_advisory_xact_lock(hashtext('coldfront_iceberg:'||ref))` vanilla /
+`_claim_iceberg_lock(ref)` + `_enqueue_release` mesh), on the **same key** — *as
+its first lock, before* the `SET LOCAL lock_timeout` + `LOCK TABLE … ACCESS
+EXCLUSIVE`. The archiver passes the iceberg ref as the new 7th `CALL` argument
+(`cmd/archiver/main.go`); the cold-write path (`_exec_iceberg_with_claim`,
+`_claim_iceberg_lock`) is **unchanged**. Because the bakery acquire has **no**
+`lock_timeout`, the cutover now *waits out any in-flight cold writer's full
+commit* (which releases its partition `RowExclusive`) and blocks new writers,
+then takes the now-uncontended `ACCESS EXCLUSIVE`.
+
+**Why it is deadlock-free (and why the obvious "global lock order" does not
+hold).** Two resources: **A** = the partition heavyweight lock (writer's
+`RowExclusive`, cutover's `ACCESS EXCLUSIVE`); **B** = the bakery. The textbook
+fix would be a global order *B-before-A everywhere*. The **cutover** obeys it (B
+then A). The **dual-tier (TIER_AMBIGUOUS) writer cannot**: PostgreSQL locks a
+`ModifyTable`'s result relations (the hot partition `RowExclusive`, A) at
+**executor startup**, *before* any `WITH` CTE is evaluated — so no CTE
+data-dependency trick can make its cold-CTE bakery claim (B) run first. The
+writer is unavoidably **A-before-B**, i.e. a genuine lock-order inversion vs the
+cutover. (An adversarial review caught an earlier attempt to "pin" B-before-A
+via a leading claim CTE: it is *impossible* for this reason, and the text-append
+it required also corrupted the no-`WHERE` UPDATE/DELETE case — it was dropped.)
+
+Deadlock-freedom therefore comes from the **`lock_timeout` circuit breaker on
+A**, not from lock ordering: `cutover_archive`'s `LOCK TABLE` uses
+`lock_timeout = 100 ms`, which is `<` PostgreSQL's `deadlock_timeout` (1 s, and
+also `<` the R-A spin). So whenever the inversion forms (writer holds A, waits
+for B; cutover holds B, waits for A), the **cutover** is always the party that
+yields first — it errors out in 100 ms, frees B (vanilla: xact-scoped advisory
+auto-release; mesh: the C `XactCallback` drains the enqueued release at the
+proc's ABORT), the writer then gets B and commits, and the Go harness retries
+the whole cutover. The writer is **never** the victim. The common case — a
+writer *mid-commit*, already holding **both** A and B (the slow-Azure case) — is
+the win: the cutover's no-timeout wait on B blocks until that writer commits and
+drops A, then takes the free A on the first try.
+
+**Validated on Azure (vanilla):** `phase 4 attempt 1 (cutover): 1m26s` — the
+86 s was the cutover *patiently waiting on B* for the in-flight cold writer
+(blocking graph: cutover `Lock:advisory`, `blocked_by` the writer holding
+`coldfront_iceberg:"ice"."default"."events"`); it then succeeded on the **first**
+attempt, `archive cycle complete`, no 409, and **no cross-tier duplication**
+(`count(*) == count(distinct id)` for the raced rows). Contrast the pre-fix
+failure: `phase 4 (cutover) failed after 10 attempts`.

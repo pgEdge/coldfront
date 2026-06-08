@@ -443,6 +443,22 @@ through the unified view) and cold writes (`duckdb.raw_query` against
 `ATTACH IF NOT EXISTS` needed in application code and no connect-time
 setup. Works uniformly on PostgreSQL 16, 17, and 18.
 
+For an **Azure ADLS Gen2** cold tier, set the credential with
+`set_storage_secret_azure()` instead — it takes a CONFIG-provider connection
+string. The storage-account access key rides inside `AccountKey=…`; the DuckDB
+azure secret has no separate account-key parameter, so shared-key auth lives
+entirely in the connection string:
+
+```sql
+SELECT coldfront.set_storage_secret_azure(
+    'DefaultEndpointsProtocol=https;AccountName=<account>;AccountKey=<key>;EndpointSuffix=core.windows.net');
+```
+
+It writes the same `coldfront.storage_secret` row (replicated, `pg_dump`-excluded)
+and materializes a `TYPE azure` PERSISTENT SECRET. The Azure cold tier requires
+the DuckDB 1.5.x build (see [DUCKDB_1.5.md](DUCKDB_1.5.md)) and is subject to the
+soft-delete / change-feed restriction in [Caveats](#caveats).
+
 One canonical user journey ([ci/journey.sh](ci/journey.sh)) runs identically in
 every deployment cell; `ci/matrix.sh` drives the cells and `ci/topo/*.sh` brings
 up each topology. All cells share one parameterized image

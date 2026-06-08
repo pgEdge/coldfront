@@ -161,6 +161,53 @@ archiver:
 	assert.Contains(t, err.Error(), "iceberg.warehouse")
 }
 
+func TestValidate_AzureMode(t *testing.T) {
+	cfg := `
+postgres:
+  dsn: "host=localhost"
+iceberg:
+  warehouse: "wh-azure"
+  lakekeeper_endpoint: "http://lk:8181/catalog"
+azure:
+  connection_string: "DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=Zm9v;EndpointSuffix=core.windows.net"
+archiver:
+  tables:
+    - source_table: "t"
+      partition_period: "monthly"
+      hot_period: "1 month"
+      retention_period: "6 months"
+`
+	c, err := Load(writeConfig(t, cfg))
+	require.NoError(t, err)
+	assert.Equal(t,
+		"DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=Zm9v;EndpointSuffix=core.windows.net",
+		c.Azure.ConnectionString)
+}
+
+func TestValidate_RejectsS3AndAzure(t *testing.T) {
+	cfg := `
+postgres:
+  dsn: "host=localhost"
+iceberg:
+  warehouse: "wh"
+  lakekeeper_endpoint: "http://lk:8181/catalog"
+s3:
+  endpoint: "sw:8333"
+  access_key: "a"
+  secret_key: "s"
+azure:
+  connection_string: "AccountName=acct;AccountKey=Zm9v"
+archiver:
+  tables:
+    - source_table: "t"
+      partition_period: "monthly"
+      retention_period: "1 month"
+`
+	_, err := Load(writeConfig(t, cfg))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "azure")
+}
+
 func TestValidate_InvalidPartitionPeriod(t *testing.T) {
 	cfg := `
 postgres:
