@@ -41,6 +41,13 @@ if [ "$BACKEND" = azure ]; then
   : "${COLDFRONT_AZURE_KEY:?--backend azure needs COLDFRONT_AZURE_KEY}"
   : "${COLDFRONT_AZURE_CONNECTION_STRING:?--backend azure needs COLDFRONT_AZURE_CONNECTION_STRING}"
 fi
+# GCS is the s3 path pointed at the GCS S3-interop endpoint with an HMAC key pair
+# + a bucket (no separate backend; Lakekeeper uses an s3 profile @ storage.googleapis.com).
+if [ "$BACKEND" = gcs ]; then
+  : "${COLDFRONT_GCS_ACCESS_KEY:?--backend gcs needs COLDFRONT_GCS_ACCESS_KEY (HMAC)}"
+  : "${COLDFRONT_GCS_SECRET_KEY:?--backend gcs needs COLDFRONT_GCS_SECRET_KEY (HMAC)}"
+  : "${COLDFRONT_GCS_BUCKET:?--backend gcs needs COLDFRONT_GCS_BUCKET}"
+fi
 
 cd "$ROOT"
 export PG_MAJOR="$PG"           # consumed by docker-compose.matrix.yml build arg + entrypoint
@@ -60,8 +67,16 @@ done
 
 ip() { docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$1"; }
 DB_IP=$(ip "$DB"); LK_IP=$(ip coldfront-lakekeeper-1)
-# SeaweedFS only exists in the s3 backend; azure's cold store is real ADLS.
-if [ "$BACKEND" = azure ]; then SW_IP=""; WAREHOUSE=wh-azure; else SW_IP=$(ip coldfront-seaweedfs-1); WAREHOUSE=wh; fi
+# SeaweedFS only exists in the plain-s3 backend; azure's cold store is real ADLS
+# and gcs's is real GCS (both reached over the network, no local store container).
+# gcs reuses the stock matrix.yml image, whose COLDFRONT_WAREHOUSE GUC is "wh" —
+# so the gcs warehouse must also be named "wh" (only its storage profile differs:
+# s3 @ GCS). azure has its own image/compose with the wh-azure GUC.
+case "$BACKEND" in
+  azure) SW_IP=""; WAREHOUSE=wh-azure;;
+  gcs)   SW_IP=""; WAREHOUSE=wh;;
+  *)     SW_IP=$(ip coldfront-seaweedfs-1); WAREHOUSE=wh;;
+esac
 
 step "vanilla: bootstrap Lakekeeper + warehouse ($BACKEND)"
 curl -sf "http://$LK_IP:8181/management/v1/bootstrap" -X POST -H "Content-Type: application/json" \
@@ -74,6 +89,14 @@ if [ "$BACKEND" = azure ]; then
     \"warehouse-name\":\"wh-azure\",
     \"storage-profile\":{\"type\":\"adls\",\"filesystem\":\"${COLDFRONT_AZURE_FILESYSTEM}\",\"account-name\":\"${COLDFRONT_AZURE_ACCOUNT}\"},
     \"storage-credential\":{\"type\":\"az\",\"credential-type\":\"shared-access-key\",\"key\":\"${COLDFRONT_AZURE_KEY}\"}
+  }"
+elif [ "$BACKEND" = gcs ]; then
+  # GCS via S3-interop: lakekeeper s3 profile @ storage.googleapis.com, HMAC creds.
+  # Named "wh" to match the stock image's COLDFRONT_WAREHOUSE GUC (see above).
+  WH_BODY="{
+    \"warehouse-name\":\"wh\",
+    \"storage-profile\":{\"type\":\"s3\",\"bucket\":\"${COLDFRONT_GCS_BUCKET}\",\"key-prefix\":\"coldfront-ci-gcs\",\"region\":\"us-east-1\",\"endpoint\":\"https://storage.googleapis.com\",\"path-style-access\":true,\"flavor\":\"s3-compat\",\"sts-enabled\":false,\"remote-signing-enabled\":false},
+    \"storage-credential\":{\"type\":\"s3\",\"credential-type\":\"access-key\",\"aws-access-key-id\":\"${COLDFRONT_GCS_ACCESS_KEY}\",\"aws-secret-access-key\":\"${COLDFRONT_GCS_SECRET_KEY}\"}
   }"
 else
   WH_BODY="{

@@ -28,6 +28,11 @@ DB_IP=""; SW_IP=""; LK_IP=""; WAREHOUSE="wh"
 # connection string carries the shared key (AccountName=…;AccountKey=…).
 BACKEND="${COLDFRONT_BACKEND:-s3}"
 AZURE_CONN="${COLDFRONT_AZURE_CONNECTION_STRING:-}"
+# GCS is not a separate backend — it's the s3 path pointed at the GCS S3-interop
+# endpoint with an HMAC key pair. These feed the same set_storage_secret / s3
+# config block, just with the GCS endpoint + use_ssl.
+GCS_KEY="${COLDFRONT_GCS_ACCESS_KEY:-}"
+GCS_SECRET="${COLDFRONT_GCS_SECRET_KEY:-}"
 ARCHIVER="${ARCHIVER:-./bin/archiver}"
 while [ $# -gt 0 ]; do case "$1" in
   --host) HOST="$2"; shift 2;;
@@ -46,11 +51,15 @@ while [ $# -gt 0 ]; do case "$1" in
 esac; done
 [ -n "$HOST" ] || { echo "journey.sh: --host required"; exit 2; }
 [ "$BACKEND" = azure ] && [ -z "$AZURE_CONN" ] && { echo "journey.sh: --backend azure needs --azure-conn / COLDFRONT_AZURE_CONNECTION_STRING"; exit 2; }
+[ "$BACKEND" = gcs ] && { [ -z "$GCS_KEY" ] || [ -z "$GCS_SECRET" ]; } && { echo "journey.sh: --backend gcs needs COLDFRONT_GCS_ACCESS_KEY + COLDFRONT_GCS_SECRET_KEY (HMAC)"; exit 2; }
 
 # storage_secret_sql — the SQL that sets the cold-store credential, per backend.
 storage_secret_sql() {
     if [ "$BACKEND" = azure ]; then
         printf "SELECT coldfront.set_storage_secret_azure('%s');" "$AZURE_CONN"
+    elif [ "$BACKEND" = gcs ]; then
+        # GCS via S3-interop: same s3 setter, GCS endpoint + HMAC + TLS.
+        printf "SELECT coldfront.set_storage_secret('%s','%s','storage.googleapis.com','us-east-1','path',true);" "$GCS_KEY" "$GCS_SECRET"
     else
         printf "SELECT coldfront.set_storage_secret('admin','adminsecret','%s:8333');" "$SW_IP"
     fi
@@ -60,6 +69,9 @@ storage_secret_sql() {
 storage_yaml() {
     if [ "$BACKEND" = azure ]; then
         printf 'azure:\n  connection_string: "%s"' "$AZURE_CONN"
+    elif [ "$BACKEND" = gcs ]; then
+        # GCS = the s3 block pointed at the interop endpoint over TLS, HMAC creds.
+        printf 's3:\n  endpoint: "storage.googleapis.com"\n  region: "us-east-1"\n  access_key: "%s"\n  secret_key: "%s"\n  use_ssl: true' "$GCS_KEY" "$GCS_SECRET"
     else
         printf 's3:\n  endpoint: "%s:8333"\n  region: "us-east-1"\n  access_key: "admin"\n  secret_key: "adminsecret"' "$SW_IP"
     fi

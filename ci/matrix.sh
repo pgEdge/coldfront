@@ -101,6 +101,13 @@ cell_mesh_decoupled_standby()    { "$SCRIPT_DIR/topo/mesh.sh"    --pg "$1" --mod
 cell_vanilla_tiered_azure()      { "$SCRIPT_DIR/topo/vanilla.sh" --pg "$1" --mode tiered --backend azure --compose docker-compose.matrix-azure.yml; }
 cell_mesh_tiered_azure()         { "$SCRIPT_DIR/topo/mesh.sh"    --pg "$1" --mode tiered --backend azure --compose docker-compose.mesh-azure.yml; }
 
+# GCS = the s3 path @ storage.googleapis.com + HMAC (no new backend, no special
+# image — plain httpfs over the GCS S3-interop endpoint). Runs on the STOCK
+# image/compose; gated on COLDFRONT_GCS_* creds against the real bucket. The s3
+# code itself is already covered hermetically by the SeaweedFS cells; this smokes
+# the real GCS-interop endpoint (the one thing SeaweedFS can't exercise).
+cell_vanilla_tiered_gcs()        { "$SCRIPT_DIR/topo/vanilla.sh" --pg "$1" --mode tiered --backend gcs; }
+
 # coverage_table  — print every matrix cell with RUN / PENDING(reason). No
 # cell is ever silently omitted; PENDING states what is still required.
 coverage_table() {
@@ -128,6 +135,10 @@ coverage_table() {
     printf '    pg18 · %-7s · %-9s · %-7s · %-5s : %s\n' "vanilla" "tiered" "primary" "azure" "$az"
     printf '    pg18 · %-7s · %-9s · %-7s · %-5s : %s\n' "mesh"    "tiered" "primary" "azure" "$az"
     echo   '    (pg16/17-azure pend per-major 1.5.x image validation)'
+    local gc; gc="PENDING (needs COLDFRONT_GCS_* creds)"
+    [ -n "${COLDFRONT_GCS_ACCESS_KEY:-}" ] && gc="RUN"
+    printf '    pg18 · %-7s · %-9s · %-7s · %-5s : %s\n' "vanilla" "tiered" "primary" "gcs" "$gc"
+    echo   '    (gcs = s3-interop @ storage.googleapis.com; stock image, any PG major)'
 }
 
 # ── Drive ─────────────────────────────────────────────────────────────────────
@@ -160,6 +171,13 @@ case "$SCOPE" in
       step "STORAGE AXIS (azure) — PENDING"
       echo "    pg18 · vanilla · tiered · azure : PENDING (set COLDFRONT_AZURE_* creds to RUN)"
       echo "    pg18 · mesh    · tiered · azure : PENDING (set COLDFRONT_AZURE_* creds to RUN)"
+    fi
+    # GCS via s3-interop (stock image). Creds-gated against the real bucket.
+    if [ -n "${COLDFRONT_GCS_ACCESS_KEY:-}" ]; then
+      run_cell "pg18·vanilla·tiered·gcs" cell_vanilla_tiered_gcs 18
+    else
+      step "STORAGE AXIS (gcs) — PENDING"
+      echo "    pg18 · vanilla · tiered · gcs : PENDING (set COLDFRONT_GCS_ACCESS_KEY/SECRET_KEY/BUCKET to RUN)"
     fi
     coverage_table
     echo -e "\n  NOTE: only verified cells RUN. PENDING cells are tracked, not skipped silently."
