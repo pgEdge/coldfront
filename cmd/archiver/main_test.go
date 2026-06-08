@@ -22,7 +22,22 @@ func TestColdSecretSQL_S3(t *testing.T) {
 	assert.Contains(t, sql, "TYPE S3")
 	assert.Contains(t, sql, "KEY_ID 'admin'")
 	assert.Contains(t, sql, "ENDPOINT 'sw:8333'")
+	assert.Contains(t, sql, "USE_SSL false") // default: plain-http compat store (SeaweedFS)
 	assert.NotContains(t, sql, "azure")
+}
+
+// GCS is an S3-compatible store reached via its interop endpoint over TLS — no
+// separate backend, just the s3 path with a custom endpoint + use_ssl: true.
+func TestColdSecretSQL_S3_GCS(t *testing.T) {
+	cfg := &config.Config{S3: config.S3Config{
+		AccessKey: "GOOGHMAC", SecretKey: "hmacsecret",
+		Endpoint: "storage.googleapis.com", Region: "us-east-1", UseSSL: true,
+	}}
+	sql := coldSecretSQL(cfg)
+	assert.Contains(t, sql, "TYPE S3")
+	assert.Contains(t, sql, "ENDPOINT 'storage.googleapis.com'")
+	assert.Contains(t, sql, "USE_SSL true")
+	assert.NotContains(t, sql, "USE_SSL false")
 }
 
 func TestColdSecretSQL_Azure(t *testing.T) {

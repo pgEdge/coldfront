@@ -6,12 +6,27 @@ iceberg:
   lakekeeper_endpoint: "http://lakekeeper:8181/catalog"  # Lakekeeper REST catalog
   namespace: "default"                                   # optional, default: "default"
 
-# Cold-store backend: configure EXACTLY ONE of s3 or azure.
+# Cold-store backend: configure EXACTLY ONE of s3 or azure. Any S3-compatible
+# store works under s3 — SeaweedFS/MinIO, real AWS S3, OR Google Cloud Storage
+# via its S3-interoperability endpoint (see the gcs example below).
 s3:
   endpoint: "seaweedfs:8333"    # S3 endpoint (no http://)
   region: "us-east-1"           # optional, default: "us-east-1"
   access_key: "admin"
   secret_key: "adminsecret"
+  use_ssl: false                # true for a TLS endpoint (GCS, real AWS S3)
+
+# Google Cloud Storage = the s3 backend pointed at the GCS S3-interop endpoint
+# with an HMAC key pair (Console → Cloud Storage → Settings → Interoperability).
+# No separate gcs backend; Lakekeeper's warehouse must use an s3 profile with
+# endpoint https://storage.googleapis.com, flavor s3-compat, path-style. Verified
+# end-to-end (iceberg create/insert/read over GCS interop).
+# s3:
+#   endpoint: "storage.googleapis.com"
+#   region: "us-east-1"           # any region; GCS interop accepts the v4 sig
+#   access_key: "<GCS HMAC access id>"
+#   secret_key: "<GCS HMAC secret>"
+#   use_ssl: true
 
 # azure:                        # Azure ADLS Gen2 cold tier (requires the DuckDB
 #                               # 1.5.x build — see DUCKDB_1.5.md). The access

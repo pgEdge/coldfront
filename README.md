@@ -298,6 +298,22 @@ s3:
   secret_key: "adminsecret"
 ```
 
+#### Storage backends
+
+Configure **exactly one** cold-store backend:
+
+- **S3** (`s3:`) — AWS S3, or any S3-compatible store (SeaweedFS, MinIO). Set
+  `use_ssl: true` for a TLS endpoint.
+- **Google Cloud Storage** — *not a separate backend*: use `s3:` pointed at GCS's
+  S3-interoperability endpoint with an [HMAC key pair](https://cloud.google.com/storage/docs/authentication/hmackeys)
+  (`endpoint: storage.googleapis.com`, `use_ssl: true`, `access_key`/`secret_key`
+  = the HMAC id/secret). Lakekeeper's warehouse uses an `s3` profile (`flavor:
+  s3-compat`, `path-style`) at the same endpoint. Verified end-to-end (iceberg
+  read+write over interop). Lakekeeper's native `gcs` profile is service-account
+  only and is **not** used.
+- **Azure ADLS Gen2** (`azure:`) — requires the DuckDB 1.5.x build (see
+  `DUCKDB_1.5.md`); the access key rides inside `connection_string`.
+
 **Per-table lifecycle — `coldfront.partition_config`.** Which tables are managed
 and their lifecycle live in a name-keyed table that replicates by value across a
 Spock mesh (like `tiered_views`/`archive_watermark`), so every node reads

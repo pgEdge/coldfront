@@ -33,12 +33,20 @@ type IcebergConfig struct {
 }
 
 // S3Config holds credentials and endpoint for the object store backing the
-// Iceberg warehouse.
+// Iceberg warehouse. Any S3-compatible store works, including Google Cloud
+// Storage via its S3-interoperability endpoint (endpoint: storage.googleapis.com,
+// use_ssl: true, access_key/secret_key = a GCS HMAC key pair) — GCS needs no
+// separate backend, it IS an s3 store with a custom TLS endpoint.
 type S3Config struct {
-	Endpoint  string `yaml:"endpoint"` // e.g. seaweedfs:8333
+	Endpoint  string `yaml:"endpoint"` // e.g. seaweedfs:8333 (http) or storage.googleapis.com (GCS)
 	Region    string `yaml:"region"`
 	AccessKey string `yaml:"access_key"`
 	SecretKey string `yaml:"secret_key"`
+	// UseSSL toggles TLS on the session secret the archiver creates for its own
+	// export. Default false suits a plain-http compat store (SeaweedFS/MinIO);
+	// set true for a TLS endpoint (GCS, real AWS S3). Mirrors set_storage_secret's
+	// p_use_ssl, which already drives the persistent (cold-commit) secret.
+	UseSSL bool `yaml:"use_ssl"`
 }
 
 // AzureConfig holds the Azure ADLS Gen2 connection string for the cold tier.

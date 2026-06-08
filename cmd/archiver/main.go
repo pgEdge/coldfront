@@ -157,10 +157,14 @@ func coldSecretSQL(cfg *config.Config) string {
 			"CREATE SECRET IF NOT EXISTS cf_cold_secret (TYPE azure, CONNECTION_STRING %s)",
 			sqlutil.Literal(cfg.Azure.ConnectionString))
 	}
+	useSSL := "false"
+	if cfg.S3.UseSSL {
+		useSSL = "true"
+	}
 	return fmt.Sprintf(
-		"CREATE SECRET IF NOT EXISTS s3_secret (TYPE S3, KEY_ID %s, SECRET %s, ENDPOINT %s, URL_STYLE 'path', USE_SSL false, REGION %s)",
+		"CREATE SECRET IF NOT EXISTS s3_secret (TYPE S3, KEY_ID %s, SECRET %s, ENDPOINT %s, URL_STYLE 'path', USE_SSL %s, REGION %s)",
 		sqlutil.Literal(cfg.S3.AccessKey), sqlutil.Literal(cfg.S3.SecretKey),
-		sqlutil.Literal(cfg.S3.Endpoint), sqlutil.Literal(cfg.S3.Region))
+		sqlutil.Literal(cfg.S3.Endpoint), useSSL, sqlutil.Literal(cfg.S3.Region))
 }
 
 // attachIceberg sets up the per-connection DuckDB cold-store secret and Lakekeeper catalog.
