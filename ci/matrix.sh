@@ -92,6 +92,15 @@ cell_vanilla_decoupled_standby() { "$SCRIPT_DIR/topo/vanilla.sh" --pg "$1" --mod
 cell_mesh_tiered_standby()       { "$SCRIPT_DIR/topo/mesh.sh"    --pg "$1" --mode tiered --standby; }
 cell_mesh_decoupled_standby()    { "$SCRIPT_DIR/topo/mesh.sh"    --pg "$1" --mode decoupled --standby; }
 
+# Storage axis (azure, ADLS Gen2 on the DuckDB 1.5.x image) for the two tiered
+# cells. The journey assertions are IDENTICAL to s3 — this is the storage-
+# neutrality A/B: the same spec must pass on either backend (a deployment runs
+# exactly one). azure is pg18-only (the 1.5.x image is validated on pg18; 16/17-
+# azure pend per-major validation) and uses the real ADLS account via the
+# COLDFRONT_AZURE_* env (gated below). s3 stays the default for every other cell.
+cell_vanilla_tiered_azure()      { "$SCRIPT_DIR/topo/vanilla.sh" --pg "$1" --mode tiered --backend azure --compose docker-compose.matrix-azure.yml; }
+cell_mesh_tiered_azure()         { "$SCRIPT_DIR/topo/mesh.sh"    --pg "$1" --mode tiered --backend azure --compose docker-compose.mesh-azure.yml; }
+
 # coverage_table  — print every matrix cell with RUN / PENDING(reason). No
 # cell is ever silently omitted; PENDING states what is still required.
 coverage_table() {
@@ -104,11 +113,21 @@ coverage_table() {
       for topo in vanilla mesh; do
         for mode in tiered decoupled; do
           for tgt in primary standby; do
-            printf '    pg%-2s · %-7s · %-9s · %-7s : %s\n' "$pg" "$topo" "$mode" "$tgt" "RUN"
+            printf '    pg%-2s · %-7s · %-9s · %-7s · %-5s : %s\n' "$pg" "$topo" "$mode" "$tgt" "s3" "RUN"
           done
         done
       done
     done
+    # Storage axis: s3 (SeaweedFS) is the default for every cell above. azure
+    # (ADLS Gen2, 1.5.x image) adds the storage-neutrality A/B on the two tiered
+    # cells, pg18. Storage is orthogonal to pg-major/mode (the persistent-secret
+    # attach is identical) — only topology interacts (bakery × commit latency),
+    # so azure runs exactly vanilla·tiered + mesh·tiered, not a parallel matrix.
+    local az; az="PENDING (needs COLDFRONT_AZURE_* creds)"
+    [ -n "${COLDFRONT_AZURE_CONNECTION_STRING:-}" ] && az="RUN"
+    printf '    pg18 · %-7s · %-9s · %-7s · %-5s : %s\n' "vanilla" "tiered" "primary" "azure" "$az"
+    printf '    pg18 · %-7s · %-9s · %-7s · %-5s : %s\n' "mesh"    "tiered" "primary" "azure" "$az"
+    echo   '    (pg16/17-azure pend per-major 1.5.x image validation)'
 }
 
 # ── Drive ─────────────────────────────────────────────────────────────────────
@@ -131,6 +150,17 @@ case "$SCOPE" in
       run_cell "pg${pg}·mesh·tiered·standby"       cell_mesh_tiered_standby       "$pg"
       run_cell "pg${pg}·mesh·decoupled·standby"    cell_mesh_decoupled_standby    "$pg"
     done
+    # Storage axis: the two tiered cells also run against azure (ADLS Gen2). Gated
+    # on COLDFRONT_AZURE_* creds — RUN when present, else PENDING (never silently
+    # skipped). pg18-only (1.5.x image). Same journey assertions as s3.
+    if [ -n "${COLDFRONT_AZURE_CONNECTION_STRING:-}" ]; then
+      run_cell "pg18·vanilla·tiered·azure" cell_vanilla_tiered_azure 18
+      run_cell "pg18·mesh·tiered·azure"    cell_mesh_tiered_azure    18
+    else
+      step "STORAGE AXIS (azure) — PENDING"
+      echo "    pg18 · vanilla · tiered · azure : PENDING (set COLDFRONT_AZURE_* creds to RUN)"
+      echo "    pg18 · mesh    · tiered · azure : PENDING (set COLDFRONT_AZURE_* creds to RUN)"
+    fi
     coverage_table
     echo -e "\n  NOTE: only verified cells RUN. PENDING cells are tracked, not skipped silently."
     ;;

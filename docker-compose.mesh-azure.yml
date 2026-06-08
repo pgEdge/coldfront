@@ -1,0 +1,104 @@
+# 3-node Spock mesh on the DuckDB 1.5.x (Azure ADLS) image — the mesh counterpart
+# of docker-compose.matrix-azure.yml. Same topology as docker-compose.mesh.yml
+# (db1/db2/db3, MESH=on, snowflake nodes 691/109/672, Lakekeeper on its own PG)
+# but the cold store is Azure ADLS Gen2, so:
+#   - the db nodes use the pre-built coldfront-duckdb15:pg<major> image (azure +
+#     iceberg 1.5.x extensions), NOT the stock build: stage,
+#   - the warehouse is wh-azure (an adls storage profile — ci/topo/mesh.sh creates
+#     it against the real account from COLDFRONT_AZURE_* env),
+#   - there is NO seaweedfs (the cold store is real ADLS).
+# The Azure connection string is NEVER baked here; it rides the COLDFRONT_AZURE_*
+# env that ci/topo/mesh.sh passes to set_storage_secret_azure on each node.
+#
+#   PG_MAJOR=18 docker compose -f docker-compose.mesh-azure.yml up -d
+#
+# Build the image first: docker build -f docker/Dockerfile.duckdb15 \
+#   --build-arg PG_MAJOR=18 -t coldfront-duckdb15:pg18 .
+#
+# snowflake.node MUST equal hashtext(<spock node name>) & 1023 — db1→691,
+# db2→109, db3→672 (identical to docker-compose.mesh.yml; same hostnames).
+services:
+  db1:
+    image: coldfront-duckdb15:pg${PG_MAJOR:-18}
+    hostname: db1
+    environment:
+      PG_MAJOR: "${PG_MAJOR:-18}"
+      MESH: "on"
+      COLDFRONT_SNOWFLAKE_NODE: "691"
+      COLDFRONT_WAREHOUSE: wh-azure
+      COLDFRONT_LAKEKEEPER: http://lakekeeper:8181/catalog
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U coldfront -d coldfront"]
+      interval: 3s
+      timeout: 2s
+      retries: 25
+
+  db2:
+    image: coldfront-duckdb15:pg${PG_MAJOR:-18}
+    hostname: db2
+    environment:
+      PG_MAJOR: "${PG_MAJOR:-18}"
+      MESH: "on"
+      COLDFRONT_SNOWFLAKE_NODE: "109"
+      COLDFRONT_WAREHOUSE: wh-azure
+      COLDFRONT_LAKEKEEPER: http://lakekeeper:8181/catalog
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U coldfront -d coldfront"]
+      interval: 3s
+      timeout: 2s
+      retries: 25
+
+  db3:
+    image: coldfront-duckdb15:pg${PG_MAJOR:-18}
+    hostname: db3
+    environment:
+      PG_MAJOR: "${PG_MAJOR:-18}"
+      MESH: "on"
+      COLDFRONT_SNOWFLAKE_NODE: "672"
+      COLDFRONT_WAREHOUSE: wh-azure
+      COLDFRONT_LAKEKEEPER: http://lakekeeper:8181/catalog
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U coldfront -d coldfront"]
+      interval: 3s
+      timeout: 2s
+      retries: 25
+
+  lakekeeper-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: lakekeeper
+      POSTGRES_PASSWORD: lakekeeper
+      POSTGRES_DB: lakekeeper
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lakekeeper"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  lakekeeper-migrate:
+    image: quay.io/lakekeeper/catalog:latest
+    command: migrate
+    depends_on:
+      lakekeeper-db:
+        condition: service_healthy
+    environment:
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgres://lakekeeper:lakekeeper@lakekeeper-db:5432/lakekeeper
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgres://lakekeeper:lakekeeper@lakekeeper-db:5432/lakekeeper
+      LAKEKEEPER__PG_ENCRYPTION_KEY: deadbeefdeadbeefdeadbeefdeadbeef
+
+  lakekeeper:
+    image: quay.io/lakekeeper/catalog:latest
+    command: serve
+    depends_on:
+      lakekeeper-migrate:
+        condition: service_completed_successfully
+    environment:
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgres://lakekeeper:lakekeeper@lakekeeper-db:5432/lakekeeper
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgres://lakekeeper:lakekeeper@lakekeeper-db:5432/lakekeeper
+      LAKEKEEPER__PG_ENCRYPTION_KEY: deadbeefdeadbeefdeadbeefdeadbeef
+      LAKEKEEPER__LISTEN_PORT: 8181
+    healthcheck:
+      test: ["CMD", "lakekeeper", "healthcheck"]
+      interval: 3s
+      timeout: 2s
+      retries: 10

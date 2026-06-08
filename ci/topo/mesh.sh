@@ -16,14 +16,26 @@ ROOT="$(cd "$SCRIPT_DIR/../.." && pwd)"
 source "$SCRIPT_DIR/../lib.sh"
 
 MODE="tiered"; COMPOSE_FILE="docker-compose.mesh.yml"; KEEP=0; PG="${PG_MAJOR:-18}"; STANDBY=0
+# Cold-store backend: s3 (default, SeaweedFS) or azure (ADLS Gen2 on the DuckDB
+# 1.5.x image, via --compose docker-compose.mesh-azure.yml). azure reads its
+# identifiers + creds from env (never committed): COLDFRONT_AZURE_ACCOUNT,
+# _FILESYSTEM, _KEY (warehouse credential) and _CONNECTION_STRING (the secret).
+BACKEND="${COLDFRONT_BACKEND:-s3}"
 while [ $# -gt 0 ]; do case "$1" in
   --mode) MODE="$2"; shift 2;;
   --pg) PG="$2"; shift 2;;
   --compose) COMPOSE_FILE="$2"; shift 2;;
+  --backend) BACKEND="$2"; shift 2;;
   --keep) KEEP=1; shift;;
   --standby) STANDBY=1; shift;;
   *) echo "mesh.sh: unknown arg $1"; exit 2;;
 esac; done
+if [ "$BACKEND" = azure ]; then
+  : "${COLDFRONT_AZURE_ACCOUNT:?--backend azure needs COLDFRONT_AZURE_ACCOUNT}"
+  : "${COLDFRONT_AZURE_FILESYSTEM:?--backend azure needs COLDFRONT_AZURE_FILESYSTEM}"
+  : "${COLDFRONT_AZURE_KEY:?--backend azure needs COLDFRONT_AZURE_KEY}"
+  : "${COLDFRONT_AZURE_CONNECTION_STRING:?--backend azure needs COLDFRONT_AZURE_CONNECTION_STRING}"
+fi
 
 cd "$ROOT"
 export PG_MAJOR="$PG"
@@ -47,7 +59,9 @@ done
 [ "${h:-0}" = 3 ] || { echo "not all nodes healthy ($h/3)"; exit 1; }
 
 ip() { docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$1"; }
-DB1_IP=$(ip "$PRIMARY"); SW_IP=$(ip coldfront-seaweedfs-1); LK_IP=$(ip coldfront-lakekeeper-1)
+DB1_IP=$(ip "$PRIMARY"); LK_IP=$(ip coldfront-lakekeeper-1)
+# SeaweedFS only exists in the s3 backend; azure's cold store is real ADLS.
+if [ "$BACKEND" = azure ]; then SW_IP=""; WAREHOUSE=wh-azure; else SW_IP=$(ip coldfront-seaweedfs-1); WAREHOUSE=wh; fi
 
 step "mesh: extensions on all nodes"
 # One CREATE EXTENSION per call with ON_ERROR_STOP, errors surfaced — never chain
@@ -108,29 +122,46 @@ for n in $NODES; do
 done
 pass "spock mesh formed (6 subs) + bakery substrate armed on all nodes"
 
-step "mesh: bootstrap Lakekeeper + warehouse"
+step "mesh: bootstrap Lakekeeper + warehouse ($BACKEND)"
 curl -sf "http://$LK_IP:8181/management/v1/bootstrap" -X POST -H "Content-Type: application/json" \
      -d '{"accept-terms-of-use":true}' >/dev/null 2>&1 || true
-WH=""
-for i in $(seq 1 15); do
-  WH=$(curl -s "http://$LK_IP:8181/management/v1/warehouse" -X POST -H "Content-Type: application/json" -d "{
+# Backend-specific warehouse profile + credential (mirrors ci/topo/vanilla.sh):
+# azure → adls profile validated against the real account; s3 → SeaweedFS.
+if [ "$BACKEND" = azure ]; then
+  WH_BODY="{
+    \"warehouse-name\":\"wh-azure\",
+    \"storage-profile\":{\"type\":\"adls\",\"filesystem\":\"${COLDFRONT_AZURE_FILESYSTEM}\",\"account-name\":\"${COLDFRONT_AZURE_ACCOUNT}\"},
+    \"storage-credential\":{\"type\":\"az\",\"credential-type\":\"shared-access-key\",\"key\":\"${COLDFRONT_AZURE_KEY}\"}
+  }"
+else
+  WH_BODY="{
     \"warehouse-name\":\"wh\",
     \"storage-profile\":{\"type\":\"s3\",\"bucket\":\"iceberg\",\"region\":\"us-east-1\",\"endpoint\":\"http://${SW_IP}:8333\",\"path-style-access\":true,\"flavor\":\"s3-compat\",\"sts-enabled\":false,\"remote-signing-enabled\":false},
     \"storage-credential\":{\"type\":\"s3\",\"credential-type\":\"access-key\",\"aws-access-key-id\":\"admin\",\"aws-secret-access-key\":\"adminsecret\"}
-  }" 2>&1)
+  }"
+fi
+WH=""
+for i in $(seq 1 15); do
+  WH=$(curl -s "http://$LK_IP:8181/management/v1/warehouse" -X POST -H "Content-Type: application/json" -d "$WH_BODY" 2>&1)
   echo "$WH" | grep -q "warehouse-id" && break
   echo "$WH" | grep -qi "already exists" && { WH="warehouse-id (exists)"; break; }
   sleep 2
 done
 echo "$WH" | grep -q "warehouse-id" || { echo "warehouse creation failed after retries: $WH"; exit 1; }
 
-step "mesh: set cold-tier storage secret on all nodes"
-# set_storage_secret writes the in-DB row (replicated via the repset above) and
-# materializes a DuckDB PERSISTENT secret on each node — loaded at init, so cold
-# reads/writes resolve creds with no connect-time setup. Run per node so every
-# node's secret file is materialized regardless of apply-trigger behavior.
+step "mesh: set cold-tier storage secret on all nodes ($BACKEND)"
+# set_storage_secret[_azure] writes the in-DB row (replicated via the repset
+# above) and materializes a DuckDB PERSISTENT secret on each node — loaded at
+# init, so cold reads/writes resolve creds with no connect-time setup. Run per
+# node so every node's secret file is materialized regardless of apply-trigger
+# behavior. The azure connection string carries the shared key; it rides the
+# COLDFRONT_AZURE_CONNECTION_STRING env (never a committed value).
 for n in $NODES; do
-    m "$n" "SELECT coldfront.set_storage_secret('admin','adminsecret','${SW_IP}:8333');" >/dev/null 2>&1
+    if [ "$BACKEND" = azure ]; then
+        m "$n" "SELECT coldfront.set_storage_secret_azure('${COLDFRONT_AZURE_CONNECTION_STRING}');" >/dev/null 2>&1
+    else
+        m "$n" "SELECT coldfront.set_storage_secret('admin','adminsecret','${SW_IP}:8333');" >/dev/null 2>&1
+    fi
 done
 
 step "mesh: build archiver"
@@ -138,6 +169,6 @@ make -s build >/dev/null 2>&1 || go build -o bin/archiver ./cmd/archiver
 
 topo_standby "$PRIMARY"
 
-step "mesh: run journey (mode=$MODE standby=$STANDBY) against db1 + mesh stories"
+step "mesh: run journey (backend=$BACKEND mode=$MODE standby=$STANDBY) against db1 + mesh stories"
 "$SCRIPT_DIR/../journey.sh" --host "$PRIMARY" --db-ip "$DB1_IP" --sw-ip "$SW_IP" --lk-ip "$LK_IP" \
-    --mode "$MODE" --mesh --peers "$PEERS" "${STANDBY_ARG[@]}"
+    --mode "$MODE" --backend "$BACKEND" --warehouse "$WAREHOUSE" --mesh --peers "$PEERS" "${STANDBY_ARG[@]}"
