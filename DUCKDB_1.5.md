@@ -230,3 +230,44 @@ azure I/O works — that is gated on this whole 1.5.x stack + the e2e below.
 - [ ] Wire `docker/Dockerfile` (PR #1025 clone, curl 8.11, **libasan + perl-Time-Piece** in the iceberg-builder, iceberg-builder v1.5.3 + azure) + entrypoint (`COLDFRONT_DUCKDB_VERSION=v1.5.3`, pre-place all three).
 - [ ] Re-author the bakery patch for v1.5 (separate file) + mesh no-409 bench.
 - [ ] Full 24-cell matrix on the 1.5.3 stack; update PATCHED/ARCHITECTURE/README/CLAUDE.
+
+## CI coverage for the azure backend (why it's creds-gated, not hermetic)
+
+The journey is storage-agnostic, so storage-neutrality is an A/B: the *same*
+journey must pass under s3 and under azure (a deployment runs exactly one
+backend). `ci/matrix.sh` runs the two **tiered** cells under both backends —
+`vanilla·tiered` and `mesh·tiered` (the only cells where storage matters:
+storage is orthogonal to PG-major/mode; only topology interacts, via the
+bakery × commit-latency that surfaced the cutover race). Verified green over
+real ADLS: vanilla·tiered·azure **92/0**, mesh·tiered·azure **108/0**.
+
+**The s3 cells are hermetic (SeaweedFS); the azure cells are NOT — they need
+real ADLS, gated on `COLDFRONT_AZURE_*` (RUN when present, else PENDING, never
+silently skipped).**
+
+Root cause — why azure can't be hermetic when s3 trivially is: the requirement
+is **Lakekeeper's**, not DuckDB's or ours. S3 is itself a flat object API, so
+Lakekeeper's `s3` profile (and SeaweedFS) talk to it directly — no extra
+endpoint. Azure has two APIs: flat **Blob** (`az://`, the true S3 equivalent,
+which Azurite *does* emulate) and **ADLS Gen2 / DFS** (`abfss://`). DuckDB's
+azure extension speaks **both** — but **Lakekeeper's only Azure storage profile
+is `adls`** (no flat-Blob/`wasb` option at all; `host` defaults to
+`dfs.core.windows.net`). So the catalog emits `abfss://` table locations and the
+whole stack is forced onto the DFS endpoint, even though the data itself (flat
+parquet + avro objects) would sit fine on plain Blob. It is the DFS *endpoint*
+that's required, not hierarchical namespace per se — a flat (FNS) ADLS account
+also satisfies Lakekeeper; HNS just isn't needed.
+
+And there is no ADLS Gen2 emulator: Azurite ships **Blob/Queue/Table only** and
+explicitly **does not implement the DFS endpoint** (its own wiki lists DFS as
+"Phase I — not in Azurite", HNS as "Phase II"; tracking issue Azure/Azurite#553
+open since 2020). So the one Azure API Azurite *can* serve (Blob) is the one
+Lakekeeper *won't* use — a hermetic azure cell is unreachable without changing
+the catalog layer (or upstream Lakekeeper gaining a flat-Blob Azure profile).
+The practical
+"runs in CI" answer is a **scheduled/secret-injected job** that sets
+`COLDFRONT_AZURE_*` from CI secrets and runs those two cells periodically (not
+every PR). The storage-*divergent* code (secret rendering, config selection) is
+covered for both backends with **no creds** by the unit + pg_regress layer
+(`TestColdSecretSQL_S3/_Azure`, `TestValidate_AzureMode`,
+`storage_secret_azure.sql`), which runs on every PR.
