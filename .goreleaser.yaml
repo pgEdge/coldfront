@@ -1,0 +1,84 @@
+# GoReleaser configuration for pgEdge ColdFront.
+# https://goreleaser.com
+#
+# Both binaries are pure-Go (no cgo, no `import "C"` anywhere in the tree), so
+# every target is cross-compiled with CGO_ENABLED=0 on a single runner. The
+# resulting Linux ELFs are fully statically linked — no glibc/musl dependency —
+# so the same artifact runs on Ubuntu, Debian, RHEL, Alpine, etc. without the
+# "built on one distro, won't run on another" class of failures.
+version: 2
+
+project_name: coldfront
+
+builds:
+  - id: archiver
+    binary: archiver
+    main: ./cmd/archiver
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+  - id: partitioner
+    binary: partitioner
+    main: ./cmd/partitioner
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+# One tarball per platform containing both binaries — archiver and partitioner
+# are deployed together.
+archives:
+  - id: coldfront
+    ids:
+      - archiver
+      - partitioner
+    formats:
+      - tar.gz
+    name_template: >-
+      {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
+    files:
+      - README.md
+      - LICENSE
+      - config.example.yaml
+
+checksum:
+  name_template: checksums.txt
+  algorithm: sha256
+
+snapshot:
+  version_template: "{{ incpatch .Version }}-next"
+
+changelog:
+  use: github
+  sort: asc
+  filters:
+    exclude:
+      - "^test:"
+      - "^docs:"
+      - "^build:"
+      - "^Merge "
+
+release:
+  github:
+    owner: pgedge
+    name: coldfront
+  draft: false
+  prerelease: auto
