@@ -14,6 +14,11 @@ coverage.html
 # pg_regress run artifacts (generated; never committed)
 extension/coldfront/test/results/
 extension/coldfront/test/regression.diffs
+extension/coldfront/test/regression.out
+# compiled extension artifacts (built in Docker / by bare-metal `make`)
+extension/coldfront/*.so
+extension/coldfront/src/*.o
+extension/coldfront/src/*.bc
 
 # TLC model-checker artefacts (created next to wherever tlc2.TLC is invoked).
 docs/formal/Bakery_TTrace_*
