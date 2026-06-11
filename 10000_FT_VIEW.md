@@ -1,175 +1,106 @@
 # pgEdge ColdFront — 10,000-foot view
 
-## The shape of the problem
+## The problem, in business terms
 
-A long-lived PostgreSQL database keeps accumulating history. A year in,
-most of the rows are old and rarely read; a small working set at the head
-of the timeline carries almost all of the traffic. The storage bill, the
-VACUUM cost, the backup window, and the replica catch-up time all scale
-with the total row count, not with the part anyone actually touches.
+Every busy PostgreSQL database keeps growing. Within a year or two, most of
+the data is old and rarely touched — but you pay for all of it, every day:
+storage bills, longer backups, slower recovery, bigger and pricier
+replicas. Cost and operational risk scale with how much data you've
+*accumulated*, not with the small slice your application actually uses.
 
-Teams handle this in one of a few ways, none of them good:
+The usual answers are all bad: keep paying; delete the history and lose it;
+or move it to a separate system with different tools that breaks the
+queries your teams already rely on.
 
-- **Do nothing.** Costs keep growing, operational windows keep shrinking.
-- **Periodically delete or archive to flat files.** Queries that need the
-  old data now have to go somewhere else — different system, different
-  tools, different SQL.
-- **Buy a vendor-specific tiering add-on.** Cold data becomes tied to a
-  proprietary storage layer (different table access method, different
-  file format, different licence). Migrating off it later is its own
-  project.
+## What ColdFront does
 
-The goal of pgEdge ColdFront is to keep the working set in native
-PostgreSQL partitions, move the rest to an open file format on cheap
-object storage, and let applications keep using the same table name
-for all of it — reads and writes.
+ColdFront keeps your recent, active data in PostgreSQL — fast, exactly as
+today — and automatically moves the older data to low-cost cloud object
+storage (Amazon S3, Google Cloud Storage, or Azure) in an **open file
+format**. Applications keep querying one table, the same way, with no code
+changes. The full history stays available; the storage bill for the cold
+part drops by roughly 90%.
 
-## What the application sees
+No application rewrite, no separate analytics system, no proprietary
+lock-in — and it runs on the standard PostgreSQL your teams already use.
 
-Before adoption:
+## Who it's for
 
-```sql
-INSERT INTO events (ts, user_id, ...) VALUES (...);
-UPDATE events SET status = 'done' WHERE id = 42;
-SELECT count(*) FROM events WHERE ts > now() - interval '1 day';
-```
+ColdFront fits any system where a large, ever-growing PostgreSQL table has
+a busy recent edge and a long tail that's queried only occasionally:
 
-After adoption: exactly the same SQL.
+- **Observability & monitoring platforms.** A product monitoring thousands
+  of database or server instances generates billions of metric and event
+  rows. The last few weeks drive every dashboard and alert; years of history
+  must stay queryable for trends, capacity planning, and SLAs. ColdFront
+  keeps the recent window fast and the rest on cheap storage — one query
+  surface, a fraction of the cost.
+- **Financial & regulated industries.** 7–10+ year retention mandates where
+  data must stay *queryable*, not just archived — held in an open,
+  vendor-neutral format with no lock-in for the life of the obligation.
+- **IoT, telemetry & ad-tech.** Millions of events or sensor readings a day:
+  recent data powers alerting, history feeds reporting and models, and the
+  table stops growing without bound — nothing is lost.
+- **AI & analytics.** The full data history, queryable at analytical speed
+  for training, retrieval, and feature engineering, without copying it into
+  a separate warehouse or data lake.
+- **Global, multi-region SaaS.** Recent data replicates between regions; the
+  deep history lives once in shared cloud storage — readable from anywhere,
+  written safely from any region.
 
-The same four verbs (`SELECT`, `INSERT`, `UPDATE`, `DELETE`) continue to
-work against the same name (`events`). There is no parallel `events_cold`
-table, no `duckdb.raw_query('...')` in application code, no
-"please-use-this-hint-to-query-archived-data" special path. The tiering
-is a property of the deployment, not of the application's SQL.
+## Why it's different
 
-## What's under the hood
+- **Open, never locked in.** Cold data is stored in Apache Iceberg — the
+  industry-standard open format read by every major analytics tool. Stop
+  using ColdFront tomorrow and your data is still yours and still readable;
+  nothing proprietary at any layer.
+- **Standard PostgreSQL.** No proprietary fork, no special distribution, no
+  forced cluster — the database your teams already run, with existing
+  backups, monitoring, and operations unchanged. Adoption doesn't mean
+  re-platforming.
+- **No application changes.** Same table, same queries, same code; the
+  tiering is invisible to the application.
+- **Archived data stays editable.** Unlike most tiering products, old data
+  can still be corrected or deleted through the normal interface — important
+  for right-to-delete and data corrections. A strict read-only mode is
+  available when you want it.
+- **Scales with you.** Start on a single server; grow to a multi-region,
+  multi-writer deployment when you need it — with no change to the data
+  model or the application.
 
-- **PostgreSQL**: stock upstream open-source PostgreSQL 16, 17, or 18.
-  Not a fork, not a patched build. Installable from the usual
-  packages, operable with the usual tools. The project adds
-  extensions on top; nothing below them is modified. The `coldfront`
-  extension attaches the Iceberg catalog lazily — a C extension hook
-  attaches it on the first query that touches a tiered view — so there
-  is no per-session setup step and no version gating; the same
-  mechanism works uniformly on PG 16, 17, and 18.
-- **Hot tier**: regular PostgreSQL range-partitioned tables. Same planner,
-  same pg_dump, same backup story. Logical replication (including
-  pgEdge's Spock, for multi-master and cross-region setups) treats the
-  hot tier as plain PostgreSQL DML because that's what it is.
-- **Cold tier**: Apache Iceberg tables on any S3-compatible object store.
-  Iceberg is an open specification backed by the Apache Software
-  Foundation; files are plain Parquet plus metadata. Nothing on the cold
-  tier is proprietary or locked to this project.
-- **Catalog**: Lakekeeper, a small Apache-licensed binary that speaks the
-  standard Iceberg REST catalog protocol.
-- **Glue inside PostgreSQL**: two extensions. `pg_duckdb` (from the
-  DuckDB team, stock upstream, no fork) gives PostgreSQL the ability to
-  read Iceberg files in-process. `coldfront` (this project) is a
-  small C extension that rewrites `UPDATE`/`DELETE` on the tiered view so
-  the right rows end up on the right tier.
-- **Archiver**: a small static Go binary (~9 MB, no runtime, no CGO,
-  no daemon) that moves expired partitions off to Iceberg on a
-  schedule. No queue, no dependencies beyond the PostgreSQL driver —
-  invoked from cron.
+## The business case
 
-The total moving-parts count: stock PostgreSQL, two in-process
-extensions, one small Rust catalog binary, any S3. No engine sidecar,
-no cluster manager, no fork.
+- **~90% lower storage cost** on the cold tier — commodity object storage
+  instead of premium database storage.
+- **Smaller, faster, cheaper operations** — quicker backups and restores,
+  lighter replicas, shorter maintenance windows.
+- **No vendor lock-in** — open database, open format, your choice of cloud
+  storage. Walk away any time with your data intact.
+- **Compliance-friendly** — years of queryable history in an open format at
+  archive prices.
+- **AI-ready** — your complete history is accessible to whatever AI and
+  analytics stack you choose.
 
-## What you give up
+## How it compares (at a glance)
 
-- **Cold reads are slower than hot reads.** Iceberg on object storage is
-  not an in-memory heap. Queries that scan large cold ranges will feel
-  it; queries that hit the hot tier keep PostgreSQL's usual latency
-  characteristics.
-- **Cross-tier transactions are not crash-safe in the default mode.**
-  A single `UPDATE` whose `WHERE` clause hits rows in both tiers writes
-  to both together. Normal `ROLLBACK` undoes both sides (DuckDB's
-  transaction is tied to PostgreSQL's). A backend crash mid-commit can
-  leave orphaned object-storage files that Iceberg housekeeping later
-  reclaims, but no visible inconsistency. Teams that need stricter
-  guarantees flip a single setting to reject cross-tier writes outright
-  — they still get transparent single-tier UPDATE/DELETE.
-- **Not a sharded multi-node cluster.** This is a tiering story for a
-  single PostgreSQL instance (which can still be replicated by standard
-  PostgreSQL mechanisms, including pgEdge's Spock logical replication).
-  If you need multi-master or distributed query execution, you need a
-  different tool alongside it.
-- **Range-partitioned tables only.** The source table must already be
-  partitioned by a time-like column. Converting an unpartitioned table
-  is not in scope; it has to be partitioned first by the usual
-  PostgreSQL mechanisms.
+The closest alternatives — EDB, Databricks, Snowflake — each require *their*
+platform: a proprietary database, a managed service, or a minimum
+multi-node cluster, and most make archived data read-only. ColdFront runs on
+standard open-source PostgreSQL, keeps the cold tier writable and in an open
+format on storage you control, and works on a single server. You own your
+infrastructure, your data format, and your vendor choices at every tier.
 
-## How this compares
+## Where it fits — and where it doesn't
 
-Three other projects marry PostgreSQL to object-storage analytics,
-each with a different compromise.  Databricks **Lakebase** (née Neon,
-plus the Mooncake acquisition) has no user-visible tier at all —
-cold pages go to S3 in a proprietary chunked format, and open-format
-access is a one-way Delta/Iceberg mirror queried by Photon on the
-Databricks side.  Snowflake's **Postgres** service with the
-`pg_lake` extension family does support writable Iceberg, but
-through a separately-named table: the application has to know
-which table to address, and moving data between them is its job.
-Only EDB PGAA actually attempts transparent hot-plus-cold under one
-table name; the detailed breakdown is in [COMPARISON.md](COMPARISON.md).
+A fit when a PostgreSQL table grows continuously, a recent window carries
+the load, and the long tail is queried occasionally — and you want the
+archive to stay open and queryable, with no lock-in.
 
-The closest commercial offering is therefore EDB PGAA (PG Analytical
-Accelerator).  The meaningful differences, in plain terms:
+Less of a fit when *all* the data is hot and latency-critical (keep it in
+PostgreSQL), or the data has no natural time dimension to age on.
 
-- ColdFront runs on stock open-source PostgreSQL (no fork, no patched
-  build). PGAA is a paid add-on that runs inside EDB Postgres
-  Distributed — a distinct distribution from community PostgreSQL with
-  its own release cadence and licence.
-- ColdFront's cold tier is writable through the same table name — users
-  can update or delete archived rows without switching tools. PGAA's
-  cold tier is read-only, so teams that need occasional corrections to
-  old data end up rehydrating or bypassing the tiering.
-- ColdFront offers both writable cold (default) and strict read-only-cold
-  enforcement via a single GUC. Strict mode is the same
-  read-only-cold guarantee PGAA provides, without giving up the option
-  of writable cold for operators who want it.
-- ColdFront uses standard Apache Iceberg files on any S3-compatible
-  store. PGAA uses a proprietary table-access-method layer for cold
-  data, and Seafowl as a separate process for the query engine.
-- ColdFront runs in a single PostgreSQL process plus a small catalog
-  daemon. PGAA requires an EDB Postgres Distributed cluster (three
-  nodes minimum) plus a separate Seafowl engine communicating over
-  Arrow Flight RPC.
-- ColdFront is replication-compatible with pgEdge Spock. Hot-tier DML
-  goes through standard PostgreSQL and replicates normally; cold-tier
-  writes go directly to Iceberg, which uses its own optimistic
-  concurrency control, so they converge across Spock nodes without
-  conflicting with logical replication.
+## Availability
 
-## When this is a fit
-
-- The application is already on PostgreSQL and the table to tier is
-  partitioned by a time-like column (or can be).
-- A clearly bounded working set — "last N weeks / months of traffic" —
-  carries the bulk of the read/write load, with a long tail of older
-  data that's queried infrequently.
-- You want the archived data to remain in an open format on commodity
-  storage, queryable later without this project's tooling in the path.
-- You want application developers to keep writing standard SQL against a
-  single table name, and you want operations to keep using standard
-  PostgreSQL tooling (pg_dump, logical replication, monitoring, backups)
-  without special cases.
-
-## When it isn't
-
-- If the "cold" tier needs to serve sub-millisecond random reads at
-  high QPS, object storage won't meet that. Keep it all hot.
-- If the database doesn't have a monotonic time-like partition key and
-  can't be made to have one, the archiver has nothing to advance over.
-
-## Posture
-
-Everything is open source and publicly developed. The target is stock
-upstream PostgreSQL — installed from the normal distribution packages,
-without a forked build or carried patches. The archiver is a small
-pure-Go binary; the extension is a small C extension built with
-PostgreSQL's standard PGXS build system. The cold file format, the
-catalog protocol, and the query engine are all industry-standard open
-specs. Nothing on disk — hot or cold — requires this project's tooling
-to read after the fact.
+ColdFront is open source and runs on community PostgreSQL. It ships as part
+of **pgEdge Enterprise Postgres** with pre-built binaries, the multi-region
+distributed option, and enterprise support.
