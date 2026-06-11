@@ -3,8 +3,14 @@
 -- for the s3 (regression guard) and azure branches; we do NOT fire the
 -- materialize trigger's duckdb.raw_query (no live DuckDB secret dir, and a
 -- TYPE azure secret needs the azure extension — that's the 1.5.x e2e's job).
+-- Suppress the run-order-dependent "already exists" NOTICE so this test passes
+-- in the full suite (extensions pre-created by an earlier test) and standalone
+-- alike — it was failing in the full s3 suite because its expected assumed a
+-- fresh db. Notice-suppression makes the output deterministic, not order-rigged.
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS pg_duckdb;
 CREATE EXTENSION IF NOT EXISTS coldfront;
+RESET client_min_messages;
 
 -- ---- pure opts builder: s3, AWS default (no endpoint) — byte-identical to legacy
 SELECT coldfront._build_storage_secret_opts(ROW(
