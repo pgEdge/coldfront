@@ -119,7 +119,10 @@ archiver:
 	assert.Contains(t, err.Error(), "postgres.dsn")
 }
 
-func TestValidate_MissingS3Endpoint(t *testing.T) {
+// Real AWS S3: s3.endpoint is OPTIONAL (omit it so DuckDB uses its native
+// per-Region virtual-hosted + https endpoint — required for Regions launched
+// after 2019-03-20). A no-endpoint S3 config with creds + region is valid.
+func TestValidate_S3NoEndpoint(t *testing.T) {
 	cfg := `
 postgres:
   dsn: "host=localhost"
@@ -127,17 +130,42 @@ iceberg:
   warehouse: "wh"
   lakekeeper_endpoint: "http://lk:8181/catalog"
 s3:
+  region: "ap-south-2"
   access_key: "a"
   secret_key: "s"
 archiver:
   tables:
     - source_table: "t"
       partition_period: "monthly"
-      retention_period: "1 month"
+      hot_period: "1 month"
+`
+	c, err := Load(writeConfig(t, cfg))
+	require.NoError(t, err)
+	assert.Equal(t, "", c.S3.Endpoint)
+	assert.Equal(t, "ap-south-2", c.S3.Region)
+}
+
+func TestValidate_BadURLStyle(t *testing.T) {
+	cfg := `
+postgres:
+  dsn: "host=localhost"
+iceberg:
+  warehouse: "wh"
+  lakekeeper_endpoint: "http://lk:8181/catalog"
+s3:
+  endpoint: "minio:9000"
+  access_key: "a"
+  secret_key: "s"
+  url_style: "bogus"
+archiver:
+  tables:
+    - source_table: "t"
+      partition_period: "monthly"
+      hot_period: "1 month"
 `
 	_, err := Load(writeConfig(t, cfg))
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "s3.endpoint")
+	assert.Contains(t, err.Error(), "url_style")
 }
 
 func TestValidate_MissingWarehouse(t *testing.T) {

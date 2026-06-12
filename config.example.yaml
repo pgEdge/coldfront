@@ -10,11 +10,29 @@ iceberg:
 # store works under s3 — SeaweedFS/MinIO, real AWS S3, OR Google Cloud Storage
 # via its S3-interoperability endpoint (see the gcs example below).
 s3:
-  endpoint: "seaweedfs:8333"    # S3 endpoint (no http://)
+  endpoint: "seaweedfs:8333"    # S3-compatible store endpoint (no http://). OMIT
+                                # for real AWS S3 — see the AWS example below.
   region: "us-east-1"           # optional, default: "us-east-1"
   access_key: "admin"
   secret_key: "adminsecret"
   use_ssl: false                # true for a TLS endpoint (GCS, real AWS S3)
+  url_style: "path"             # "path" (default; SeaweedFS/MinIO/GCS) or "vhost".
+                                # IGNORED when endpoint is empty (real AWS S3 then
+                                # uses its native virtual-hosted addressing).
+
+# Real AWS S3 — OMIT endpoint so DuckDB uses AWS's native per-Region
+# virtual-hosted + HTTPS endpoint. This is REQUIRED for Regions launched after
+# 2019-03-20 (e.g. ap-south-2, eu-south-2): their DNS does not route path-style
+# requests and returns HTTP 400. Set region to your bucket's Region. The matching
+# persistent (cold-commit) secret must ALSO omit the endpoint:
+#   SELECT coldfront.set_storage_secret('<KEY>','<SECRET>', NULL, '<region>');
+# and the Lakekeeper warehouse storage-profile must be a real-AWS s3 profile
+# (path-style-access: false, no custom endpoint).
+# s3:
+#   region: "ap-south-2"          # your bucket's Region (no endpoint!)
+#   access_key: "<AWS access key id>"
+#   secret_key: "<AWS secret access key>"
+#   use_ssl: true                 # (ignored without an endpoint; AWS is always https)
 
 # Google Cloud Storage = the s3 backend pointed at the GCS S3-interop endpoint
 # with an HMAC key pair (Console → Cloud Storage → Settings → Interoperability).

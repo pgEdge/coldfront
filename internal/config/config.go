@@ -45,8 +45,16 @@ type S3Config struct {
 	// UseSSL toggles TLS on the session secret the archiver creates for its own
 	// export. Default false suits a plain-http compat store (SeaweedFS/MinIO);
 	// set true for a TLS endpoint (GCS, real AWS S3). Mirrors set_storage_secret's
-	// p_use_ssl, which already drives the persistent (cold-commit) secret.
+	// p_use_ssl, which already drives the persistent (cold-commit) secret. IGNORED
+	// when endpoint is empty: real AWS S3 then uses DuckDB's native https default.
 	UseSSL bool `yaml:"use_ssl"`
+	// URLStyle selects S3 addressing for the export secret: "path" (default;
+	// S3-compatible stores — SeaweedFS/MinIO/GCS-interop) or "vhost". IGNORED when
+	// endpoint is empty — real AWS S3 then uses DuckDB's native virtual-hosted
+	// addressing, which is REQUIRED for Regions launched after 2019-03-20 (e.g.
+	// ap-south-2): their DNS does not route path-style requests and returns HTTP
+	// 400. Mirrors set_storage_secret's p_url_style.
+	URLStyle string `yaml:"url_style"`
 }
 
 // AzureConfig holds the Azure ADLS Gen2 connection string for the cold tier.
@@ -178,14 +186,19 @@ func (c *Config) Validate() error {
 				return fmt.Errorf("set either s3.* or azure.connection_string, not both")
 			}
 		} else {
-			if c.S3.Endpoint == "" {
-				return fmt.Errorf("s3.endpoint is required")
-			}
+			// s3.endpoint is OPTIONAL. Empty = real AWS S3: DuckDB uses its native
+			// per-Region virtual-hosted + https endpoint (set s3.region). A non-empty
+			// endpoint = an S3-compatible store (SeaweedFS/MinIO/GCS-interop), reached
+			// path-style by default. Forcing an endpoint broke real AWS in Regions
+			// launched after 2019-03-20, which only route virtual-hosted requests.
 			if c.S3.AccessKey == "" {
 				return fmt.Errorf("s3.access_key is required")
 			}
 			if c.S3.SecretKey == "" {
 				return fmt.Errorf("s3.secret_key is required")
+			}
+			if c.S3.URLStyle != "" && c.S3.URLStyle != "path" && c.S3.URLStyle != "vhost" {
+				return fmt.Errorf("s3.url_style must be \"path\" or \"vhost\"")
 			}
 		}
 	}

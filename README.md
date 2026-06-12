@@ -302,8 +302,14 @@ s3:
 
 Configure **exactly one** cold-store backend:
 
-- **S3** (`s3:`) — AWS S3, or any S3-compatible store (SeaweedFS, MinIO). Set
-  `use_ssl: true` for a TLS endpoint.
+- **S3** (`s3:`) — any S3-compatible store (SeaweedFS, MinIO). Set `endpoint`,
+  `use_ssl: true` for a TLS endpoint, and `url_style: path` (default) or `vhost`.
+- **Real AWS S3** — **omit `endpoint`** (and the `endpoint` arg to
+  `set_storage_secret`) so DuckDB uses AWS's native per-Region virtual-hosted +
+  HTTPS addressing; just set `region` to your bucket's Region. This is **required**
+  for Regions launched after 2019-03-20 (e.g. `ap-south-2`), whose DNS does not
+  route path-style requests and returns HTTP 400. The Lakekeeper warehouse profile
+  must be a real-AWS `s3` profile (`path-style-access: false`, no custom endpoint).
 - **Google Cloud Storage** — *not a separate backend*: use `s3:` pointed at GCS's
   S3-interoperability endpoint with an [HMAC key pair](https://cloud.google.com/storage/docs/authentication/hmackeys)
   (`endpoint: storage.googleapis.com`, `use_ssl: true`, `access_key`/`secret_key`

@@ -22,8 +22,37 @@ func TestColdSecretSQL_S3(t *testing.T) {
 	assert.Contains(t, sql, "TYPE S3")
 	assert.Contains(t, sql, "KEY_ID 'admin'")
 	assert.Contains(t, sql, "ENDPOINT 'sw:8333'")
-	assert.Contains(t, sql, "USE_SSL false") // default: plain-http compat store (SeaweedFS)
+	assert.Contains(t, sql, "URL_STYLE 'path'") // default for a custom (compat) endpoint
+	assert.Contains(t, sql, "USE_SSL false")    // default: plain-http compat store (SeaweedFS)
 	assert.NotContains(t, sql, "azure")
+}
+
+// Real AWS S3: NO endpoint configured. The secret must OMIT ENDPOINT/URL_STYLE/
+// USE_SSL so DuckDB uses its native virtual-hosted + https endpoint for the
+// Region — REQUIRED for Regions launched after 2019-03-20 (e.g. ap-south-2),
+// whose DNS does not route path-style requests (HTTP 400).
+func TestColdSecretSQL_S3_AWSNoEndpoint(t *testing.T) {
+	cfg := &config.Config{S3: config.S3Config{
+		AccessKey: "AKIAEXAMPLE", SecretKey: "awssecret", Region: "ap-south-2",
+	}}
+	sql := coldSecretSQL(cfg)
+	assert.Contains(t, sql, "TYPE S3")
+	assert.Contains(t, sql, "REGION 'ap-south-2'")
+	assert.NotContains(t, sql, "ENDPOINT")
+	assert.NotContains(t, sql, "URL_STYLE")
+	assert.NotContains(t, sql, "USE_SSL")
+}
+
+// A custom endpoint that requires virtual-hosted addressing (s3.url_style: vhost).
+func TestColdSecretSQL_S3_VhostOverride(t *testing.T) {
+	cfg := &config.Config{S3: config.S3Config{
+		AccessKey: "k", SecretKey: "s", Endpoint: "minio.example.com",
+		Region: "us-east-1", URLStyle: "vhost", UseSSL: true,
+	}}
+	sql := coldSecretSQL(cfg)
+	assert.Contains(t, sql, "URL_STYLE 'vhost'")
+	assert.NotContains(t, sql, "URL_STYLE 'path'")
+	assert.Contains(t, sql, "USE_SSL true")
 }
 
 // GCS is an S3-compatible store reached via its interop endpoint over TLS — no

@@ -151,20 +151,38 @@ func execDuckDB(ctx context.Context, pool *pgxpool.Pool, sql string) error {
 // extension-side coldfront._build_storage_secret_opts(). NOTE: this is a
 // session secret for the archiver's own export; the iceberg COMMIT resolves the
 // credential from the PERSISTENT secret (coldfront.set_storage_secret[_azure]).
+//
+// For S3 we mirror _build_storage_secret_opts exactly: always emit TYPE/KEY_ID/
+// SECRET/REGION, and ONLY when an endpoint is configured append ENDPOINT/
+// URL_STYLE/USE_SSL. An empty endpoint = real AWS S3, where omitting them lets
+// DuckDB use its native virtual-hosted + https endpoint for the region — REQUIRED
+// for AWS Regions launched after 2019-03-20 (e.g. ap-south-2): their DNS does not
+// route path-style requests and returns HTTP 400. A non-empty endpoint = an
+// S3-compatible store (SeaweedFS/MinIO/GCS-interop), path-style by default
+// (override with s3.url_style: vhost).
 func coldSecretSQL(cfg *config.Config) string {
 	if cfg.Azure.ConnectionString != "" {
 		return fmt.Sprintf(
 			"CREATE SECRET IF NOT EXISTS cf_cold_secret (TYPE azure, CONNECTION_STRING %s)",
 			sqlutil.Literal(cfg.Azure.ConnectionString))
 	}
-	useSSL := "false"
-	if cfg.S3.UseSSL {
-		useSSL = "true"
-	}
-	return fmt.Sprintf(
-		"CREATE SECRET IF NOT EXISTS s3_secret (TYPE S3, KEY_ID %s, SECRET %s, ENDPOINT %s, URL_STYLE 'path', USE_SSL %s, REGION %s)",
+	s := fmt.Sprintf(
+		"CREATE SECRET IF NOT EXISTS s3_secret (TYPE S3, KEY_ID %s, SECRET %s, REGION %s",
 		sqlutil.Literal(cfg.S3.AccessKey), sqlutil.Literal(cfg.S3.SecretKey),
-		sqlutil.Literal(cfg.S3.Endpoint), useSSL, sqlutil.Literal(cfg.S3.Region))
+		sqlutil.Literal(cfg.S3.Region))
+	if cfg.S3.Endpoint != "" {
+		useSSL := "false"
+		if cfg.S3.UseSSL {
+			useSSL = "true"
+		}
+		urlStyle := cfg.S3.URLStyle
+		if urlStyle == "" {
+			urlStyle = "path"
+		}
+		s += fmt.Sprintf(", ENDPOINT %s, URL_STYLE %s, USE_SSL %s",
+			sqlutil.Literal(cfg.S3.Endpoint), sqlutil.Literal(urlStyle), useSSL)
+	}
+	return s + ")"
 }
 
 // attachIceberg sets up the per-connection DuckDB cold-store secret and Lakekeeper catalog.
