@@ -530,6 +530,18 @@ their credentials are present in the environment**, else they are reported
 In GitHub Actions these come from repo secrets; an unset secret arrives empty, so
 that backend stays `PENDING`. Fork PRs (no secret access) run SeaweedFS-only.
 
+**Image build (base + app split)** — the DuckDB 1.5.x stack is split so builds are
+fast and always test current source. The expensive, stable compiles (libcurl 8.11,
+pg_duckdb 1.5.3, patched duckdb-iceberg) live in a prebuilt **base** image
+([docker/Dockerfile.duckdb15-base](docker/Dockerfile.duckdb15-base)) published to
+`ghcr.io/pgedge/coldfront-duckdb-base:pg{16,17,18}`; the **app** build
+([docker/Dockerfile.duckdb15](docker/Dockerfile.duckdb15)) just `FROM`s it and
+compiles the coldfront extension (seconds). The base is **PRIVATE/INTERNAL** (it
+embeds the bakery patch — ColdFront IP), so building the app locally requires
+`docker login ghcr.io` first. Rebuild the base via the
+[base-image workflow](.github/workflows/base-image.yml) (`gh workflow run
+base-image.yml`) when its inputs change.
+
 ## Caveats
 
 - **Azure ADLS Gen2 cold tier requires Blob soft-delete and change feed to be
