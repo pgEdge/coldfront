@@ -25,8 +25,13 @@ docs/formal/Bakery_TTrace_*
 docs/formal/Bakery.old
 states/
 
-# Scale test / bench scripts and demo (local only, not shipped)
+# Scale test / bench scripts and demo (local only, not shipped — keep out of the
+# repo, especially before it goes public).
 demo/
+demo*.sh
+*.cast
+DEMO*.md
+DEMO*.txt
 scale-test/
 scale-test-*.sh
 bench-*.sh
@@ -35,4 +40,9 @@ bench.md
 # E2E result docs (local only)
 E2E*.md
 SCALE_TEST_SETUP.md
+
+# Internal / strategic docs — NOT for the (eventually public) repo. Kept locally.
+COMPARISON.md
+10000_FT_VIEW.md
+BACKLOG.md
 
