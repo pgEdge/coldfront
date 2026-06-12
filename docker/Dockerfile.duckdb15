@@ -30,8 +30,15 @@ RUN dnf install -y --setopt=install_weak_deps=False \
 ENV PATH=/usr/pgsql-${PG_MAJOR}/bin:$PATH
 ENV PG_CONFIG=/usr/pgsql-${PG_MAJOR}/bin/pg_config
 
-# libcurl 8.11 (DuckDB 1.5.3 httpfs needs CURLSSLOPT_AUTO_CLIENT_CERT, >= 7.77).
-# Installs over the base 7.76.1 into /usr (libdir=lib).
+# libcurl 8.11 — built ONLY to satisfy DuckDB 1.5.3 httpfs's COMPILE-TIME
+# dependency: its CMake does find_package(CURL REQUIRED) and curl_client.cpp
+# references CURLSSLOPT_AUTO_CLIENT_CERT (curl >= 7.77); the base ships 7.76.1.
+# At RUNTIME we do NOT use the libcurl client — coldfront forces DuckDB's BUNDLED
+# httplib/mbedtls client (httpfs_client_implementation='httplib', set in
+# coldfront.ensure_attached). The libcurl client's threaded DNS resolver calls
+# glibc getaddrinfo, whose IPv6 check_pf() netlink probe aborts the backend
+# (SIGABRT) under concurrent resolution of an object-store HOSTNAME (e.g. GCS);
+# the bundled client — what stock pg_duckdb 1.1.1 used — has no such failure.
 WORKDIR /curl
 RUN wget -q https://curl.se/download/curl-8.11.1.tar.gz && tar xf curl-8.11.1.tar.gz \
  && cd curl-8.11.1 \

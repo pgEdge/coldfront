@@ -175,6 +175,15 @@ BEGIN
       'AUTHORIZATION_TYPE NONE, ACCESS_DELEGATION_MODE NONE)',
       wh, ep
     ));
+    -- Use DuckDB's BUNDLED httpfs client (cpp-httplib + mbedtls), not the
+    -- system-libcurl one DuckDB 1.5 defaults to. The libcurl client's threaded
+    -- DNS resolver calls glibc getaddrinfo, whose IPv6 check_pf() netlink probe
+    -- aborts the backend (SIGABRT) under concurrent resolution of an object-store
+    -- HOSTNAME (e.g. GCS @ storage.googleapis.com) — bare-IP stores (SeaweedFS)
+    -- never hit it. The bundled client (what pg_duckdb 1.1.1 used) has no such
+    -- failure. Run AFTER the ATTACH so iceberg/httpfs are loaded and the setting
+    -- is registered; GLOBAL = this backend's DuckDB instance; idempotent.
+    PERFORM duckdb.raw_query($q$SET GLOBAL httpfs_client_implementation = 'httplib'$q$);
   END IF;
 END;
 $$ LANGUAGE plpgsql;
