@@ -83,62 +83,94 @@ run_cell() {
 # (cross-node visibility / R-A bakery). Standby cells base-back a read-only
 # physical replica and exercise cross-tier reads + clean read-only write
 # rejection (gated by ci/probe-standby.sh).
-cell_vanilla_tiered()            { "$SCRIPT_DIR/topo/vanilla.sh" --pg "$1" --mode tiered --regress; }
-cell_vanilla_decoupled()         { "$SCRIPT_DIR/topo/vanilla.sh" --pg "$1" --mode decoupled; }
-cell_mesh_tiered()               { "$SCRIPT_DIR/topo/mesh.sh"    --pg "$1" --mode tiered; }
-cell_mesh_decoupled()            { "$SCRIPT_DIR/topo/mesh.sh"    --pg "$1" --mode decoupled; }
-cell_vanilla_tiered_standby()    { "$SCRIPT_DIR/topo/vanilla.sh" --pg "$1" --mode tiered --standby; }
-cell_vanilla_decoupled_standby() { "$SCRIPT_DIR/topo/vanilla.sh" --pg "$1" --mode decoupled --standby; }
-cell_mesh_tiered_standby()       { "$SCRIPT_DIR/topo/mesh.sh"    --pg "$1" --mode tiered --standby; }
-cell_mesh_decoupled_standby()    { "$SCRIPT_DIR/topo/mesh.sh"    --pg "$1" --mode decoupled --standby; }
+# compose_for <topology> <backend>  — the compose file for a (topology, backend)
+# pair. azure has its own composes (the prebuilt coldfront-duckdb15:pg<major>
+# image + ADLS storage profile); s3 and gcs share the regular composes, which now
+# build docker/Dockerfile.duckdb15 inline — gcs is just the s3 path aimed at
+# storage.googleapis.com (HMAC), no image difference. Every cell is 1.5.x.
+compose_for() {
+    case "$1/$2" in
+        vanilla/azure) echo docker-compose.matrix-azure.yml;;
+        mesh/azure)    echo docker-compose.mesh-azure.yml;;
+        vanilla/*)     echo docker-compose.matrix.yml;;
+        mesh/*)        echo docker-compose.mesh.yml;;
+    esac
+}
 
-# Storage axis (azure, ADLS Gen2 on the DuckDB 1.5.x image) for the two tiered
-# cells. The journey assertions are IDENTICAL to s3 — this is the storage-
-# neutrality A/B: the same spec must pass on either backend (a deployment runs
-# exactly one). azure is pg18-only (the 1.5.x image is validated on pg18; 16/17-
-# azure pend per-major validation) and uses the real ADLS account via the
-# COLDFRONT_AZURE_* env (gated below). s3 stays the default for every other cell.
-cell_vanilla_tiered_azure()      { "$SCRIPT_DIR/topo/vanilla.sh" --pg "$1" --mode tiered --backend azure --compose docker-compose.matrix-azure.yml; }
-cell_mesh_tiered_azure()         { "$SCRIPT_DIR/topo/mesh.sh"    --pg "$1" --mode tiered --backend azure --compose docker-compose.mesh-azure.yml; }
+# prebuild_duckdb15 <pg>  — the azure composes reference a prebuilt image
+# (coldfront-duckdb15:pg<major>), not an inline build, so build it once per PG
+# major before any azure cell. Layers are shared with the regular composes' inline
+# duckdb15 build, so after the first this just retags. s3/gcs need no prebuild.
+prebuild_duckdb15() {
+    local pg="$1"
+    step "prebuild coldfront-duckdb15:pg${pg} (azure image)"
+    if docker build -f docker/Dockerfile.duckdb15 --build-arg PG_MAJOR="$pg" \
+           -t "coldfront-duckdb15:pg${pg}" . >/dev/null 2>&1; then
+        pass "image coldfront-duckdb15:pg${pg}"
+    else
+        fail "prebuild coldfront-duckdb15:pg${pg}"; return 1
+    fi
+}
 
-# GCS = the s3 path @ storage.googleapis.com + HMAC (no new backend, no special
-# image — plain httpfs over the GCS S3-interop endpoint). Runs on the STOCK
-# image/compose; gated on COLDFRONT_GCS_* creds against the real bucket. The s3
-# code itself is already covered hermetically by the SeaweedFS cells; this smokes
-# the real GCS-interop endpoint (the one thing SeaweedFS can't exercise).
-cell_vanilla_tiered_gcs()        { "$SCRIPT_DIR/topo/vanilla.sh" --pg "$1" --mode tiered --backend gcs; }
+# vcell <pg> <mode> <backend> <target> [regress]  — one vanilla (single-node) cell.
+# --regress runs the pg_regress unit layer on the same bring-up (used once per PG
+# major on s3·vanilla·tiered·primary). --standby base-backs a read-only replica.
+vcell() {
+    local pg="$1" mode="$2" be="$3" tgt="$4" reg="${5:-}"
+    local cf; cf="$(compose_for vanilla "$be")"
+    local a=(--pg "$pg" --mode "$mode" --backend "$be" --compose "$cf")
+    [ "$tgt" = standby ] && a+=(--standby)
+    [ "$reg" = regress ] && a+=(--regress)
+    "$SCRIPT_DIR/topo/vanilla.sh" "${a[@]}"
+}
 
-# coverage_table  — print every matrix cell with RUN / PENDING(reason). No
-# cell is ever silently omitted; PENDING states what is still required.
+# mcell <pg> <mode> <backend> <target>  — one mesh (3-node Spock) cell. Adds the
+# mesh-only stories (cross-node visibility, R-A bakery). --standby base-backs a
+# read-only physical replica of db1.
+mcell() {
+    local pg="$1" mode="$2" be="$3" tgt="$4"
+    local cf; cf="$(compose_for mesh "$be")"
+    local a=(--pg "$pg" --mode "$mode" --backend "$be" --compose "$cf")
+    [ "$tgt" = standby ] && a+=(--standby)
+    "$SCRIPT_DIR/topo/mesh.sh" "${a[@]}"
+}
+
+# backend_ready <backend>  — s3 is hermetic (SeaweedFS), always RUN. azure/gcs run
+# against real cloud stores and are gated on their creds being present in env.
+backend_ready() {
+    case "$1" in
+        s3)    return 0;;
+        azure) [ -n "${COLDFRONT_AZURE_CONNECTION_STRING:-}" ];;
+        gcs)   [ -n "${COLDFRONT_GCS_ACCESS_KEY:-}" ];;
+        *)     return 1;;
+    esac
+}
+
+# coverage_table  — print every matrix cell with RUN / PENDING(reason). No cell is
+# ever silently omitted; PENDING states what creds would flip it to RUN. The full
+# grid is PG{16,17,18} × {vanilla,mesh} × {tiered,decoupled} × {primary,standby} ×
+# {s3,azure,gcs} = 72 cells, every one on the DuckDB 1.5.x patched-iceberg image.
 coverage_table() {
-    step "MATRIX COVERAGE"
-    # All majors RUN: cold reads/writes resolve their S3 credential from a DuckDB
-    # persistent secret (coldfront.set_storage_secret), loaded at instance init,
-    # so the lazy first-touch attach works uniformly on 16/17/18 — no version gate.
-    local pg topo mode tgt
+    step "MATRIX COVERAGE (full grid = 72 cells, all on DuckDB 1.5.x)"
+    local pg topo mode tgt be st
     for pg in 18 17 16; do
-      for topo in vanilla mesh; do
-        for mode in tiered decoupled; do
-          for tgt in primary standby; do
-            printf '    pg%-2s · %-7s · %-9s · %-7s · %-5s : %s\n' "$pg" "$topo" "$mode" "$tgt" "s3" "RUN"
+      for be in s3 azure gcs; do
+        if backend_ready "$be"; then st="RUN"; else
+          case "$be" in
+            azure) st="PENDING (needs COLDFRONT_AZURE_* creds)";;
+            gcs)   st="PENDING (needs COLDFRONT_GCS_* creds)";;
+            *)     st="PENDING";;
+          esac
+        fi
+        for topo in vanilla mesh; do
+          for mode in tiered decoupled; do
+            for tgt in primary standby; do
+              printf '    pg%-2s · %-7s · %-9s · %-7s · %-5s : %s\n' "$pg" "$topo" "$mode" "$tgt" "$be" "$st"
+            done
           done
         done
       done
     done
-    # Storage axis: s3 (SeaweedFS) is the default for every cell above. azure
-    # (ADLS Gen2, 1.5.x image) adds the storage-neutrality A/B on the two tiered
-    # cells, pg18. Storage is orthogonal to pg-major/mode (the persistent-secret
-    # attach is identical) — only topology interacts (bakery × commit latency),
-    # so azure runs exactly vanilla·tiered + mesh·tiered, not a parallel matrix.
-    local az; az="PENDING (needs COLDFRONT_AZURE_* creds)"
-    [ -n "${COLDFRONT_AZURE_CONNECTION_STRING:-}" ] && az="RUN"
-    printf '    pg18 · %-7s · %-9s · %-7s · %-5s : %s\n' "vanilla" "tiered" "primary" "azure" "$az"
-    printf '    pg18 · %-7s · %-9s · %-7s · %-5s : %s\n' "mesh"    "tiered" "primary" "azure" "$az"
-    echo   '    (pg16/17-azure pend per-major 1.5.x image validation)'
-    local gc; gc="PENDING (needs COLDFRONT_GCS_* creds)"
-    [ -n "${COLDFRONT_GCS_ACCESS_KEY:-}" ] && gc="RUN"
-    printf '    pg18 · %-7s · %-9s · %-7s · %-5s : %s\n' "vanilla" "tiered" "primary" "gcs" "$gc"
-    echo   '    (gcs = s3-interop @ storage.googleapis.com; stock image, any PG major)'
 }
 
 # ── Drive ─────────────────────────────────────────────────────────────────────
@@ -146,41 +178,37 @@ preflight
 
 case "$SCOPE" in
   quick)
-    run_cell "pg18·vanilla·tiered·primary" cell_vanilla_tiered 18
+    run_cell "pg18·vanilla·tiered·primary·s3" vcell 18 tiered s3 primary regress
     ;;
   full)
-    # PG18 → PG17 → PG16 (reference major first). Same cell set per major; the
-    # journey is version-agnostic and the persistent-secret attach path is identical.
+    # The whole grid: PG{16,17,18} × {vanilla,mesh} × {tiered,decoupled} ×
+    # {primary,standby} × {s3,azure,gcs} = 72 cells, every one on the DuckDB 1.5.x
+    # patched-iceberg image. PG18 → 17 → 16 (reference major first); the journey is
+    # version-agnostic and the persistent-secret attach path is identical. s3 is
+    # hermetic (always RUN); azure/gcs are creds-gated — absent creds report the
+    # backend PENDING (never silently skipped). pg_regress (the unit layer) runs
+    # once per major on s3·vanilla·tiered·primary.
     for pg in 18 17 16; do
-      run_cell "pg${pg}·vanilla·tiered·primary"    cell_vanilla_tiered            "$pg"
-      run_cell "pg${pg}·vanilla·decoupled·primary" cell_vanilla_decoupled         "$pg"
-      run_cell "pg${pg}·mesh·tiered·primary"       cell_mesh_tiered               "$pg"
-      run_cell "pg${pg}·mesh·decoupled·primary"    cell_mesh_decoupled            "$pg"
-      run_cell "pg${pg}·vanilla·tiered·standby"    cell_vanilla_tiered_standby    "$pg"
-      run_cell "pg${pg}·vanilla·decoupled·standby" cell_vanilla_decoupled_standby "$pg"
-      run_cell "pg${pg}·mesh·tiered·standby"       cell_mesh_tiered_standby       "$pg"
-      run_cell "pg${pg}·mesh·decoupled·standby"    cell_mesh_decoupled_standby    "$pg"
+      # azure cells consume a prebuilt image; build it once per major (cheap after
+      # the regular composes' inline 1.5 build — shared layers).
+      backend_ready azure && { prebuild_duckdb15 "$pg" || CELL_FAIL=$((CELL_FAIL + 1)); }
+      for be in s3 azure gcs; do
+        if ! backend_ready "$be"; then
+          step "BACKEND $be (pg${pg}) — PENDING (creds absent; set its COLDFRONT_* env to RUN)"
+          continue
+        fi
+        for mode in tiered decoupled; do
+          for tgt in primary standby; do
+            reg=""
+            [ "$be" = s3 ] && [ "$mode" = tiered ] && [ "$tgt" = primary ] && reg=regress
+            run_cell "pg${pg}·vanilla·${mode}·${tgt}·${be}" vcell "$pg" "$mode" "$be" "$tgt" "$reg"
+            run_cell "pg${pg}·mesh·${mode}·${tgt}·${be}"     mcell "$pg" "$mode" "$be" "$tgt"
+          done
+        done
+      done
     done
-    # Storage axis: the two tiered cells also run against azure (ADLS Gen2). Gated
-    # on COLDFRONT_AZURE_* creds — RUN when present, else PENDING (never silently
-    # skipped). pg18-only (1.5.x image). Same journey assertions as s3.
-    if [ -n "${COLDFRONT_AZURE_CONNECTION_STRING:-}" ]; then
-      run_cell "pg18·vanilla·tiered·azure" cell_vanilla_tiered_azure 18
-      run_cell "pg18·mesh·tiered·azure"    cell_mesh_tiered_azure    18
-    else
-      step "STORAGE AXIS (azure) — PENDING"
-      echo "    pg18 · vanilla · tiered · azure : PENDING (set COLDFRONT_AZURE_* creds to RUN)"
-      echo "    pg18 · mesh    · tiered · azure : PENDING (set COLDFRONT_AZURE_* creds to RUN)"
-    fi
-    # GCS via s3-interop (stock image). Creds-gated against the real bucket.
-    if [ -n "${COLDFRONT_GCS_ACCESS_KEY:-}" ]; then
-      run_cell "pg18·vanilla·tiered·gcs" cell_vanilla_tiered_gcs 18
-    else
-      step "STORAGE AXIS (gcs) — PENDING"
-      echo "    pg18 · vanilla · tiered · gcs : PENDING (set COLDFRONT_GCS_ACCESS_KEY/SECRET_KEY/BUCKET to RUN)"
-    fi
     coverage_table
-    echo -e "\n  NOTE: only verified cells RUN. PENDING cells are tracked, not skipped silently."
+    echo -e "\n  NOTE: s3 is hermetic and always RUN; azure/gcs RUN when their creds are present, else PENDING (tracked, never skipped silently)."
     ;;
 esac
 

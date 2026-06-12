@@ -15,7 +15,7 @@
 # peer. db1→691, db2→109, db3→672 (hashtext('dbN') & 1023).
 services:
   db1:
-    build: { context: ., dockerfile: docker/Dockerfile, args: { PG_MAJOR: "${PG_MAJOR:-18}" } }
+    build: { context: ., dockerfile: docker/Dockerfile.duckdb15, args: { PG_MAJOR: "${PG_MAJOR:-18}" } }
     hostname: db1
     environment:
       PG_MAJOR: "${PG_MAJOR:-18}"
@@ -30,7 +30,7 @@ services:
       retries: 25
 
   db2:
-    build: { context: ., dockerfile: docker/Dockerfile, args: { PG_MAJOR: "${PG_MAJOR:-18}" } }
+    build: { context: ., dockerfile: docker/Dockerfile.duckdb15, args: { PG_MAJOR: "${PG_MAJOR:-18}" } }
     hostname: db2
     environment:
       PG_MAJOR: "${PG_MAJOR:-18}"
@@ -45,7 +45,7 @@ services:
       retries: 25
 
   db3:
-    build: { context: ., dockerfile: docker/Dockerfile, args: { PG_MAJOR: "${PG_MAJOR:-18}" } }
+    build: { context: ., dockerfile: docker/Dockerfile.duckdb15, args: { PG_MAJOR: "${PG_MAJOR:-18}" } }
     hostname: db3
     environment:
       PG_MAJOR: "${PG_MAJOR:-18}"

@@ -12,7 +12,7 @@ services:
   db:
     build:
       context: .
-      dockerfile: docker/Dockerfile
+      dockerfile: docker/Dockerfile.duckdb15
       args:
         PG_MAJOR: ${PG_MAJOR:-18}
     environment:

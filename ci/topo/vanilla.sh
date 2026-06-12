@@ -122,10 +122,12 @@ if [ "$REGRESS" = 1 ]; then
     # the toolchain + extension source) against the running db over the compose
     # network. The fixtures set coldfront.warehouse/lakekeeper_endpoint to ''
     # so ensure_attached() is a no-op and Lakekeeper isn't needed here.
-    # azure runs on the DuckDB 1.5.x image, so its build stage (pg_regress +
-    # extension source) comes from Dockerfile.duckdb15; s3 from Dockerfile.
-    if [ "$BACKEND" = azure ]; then REGRESS_DF=docker/Dockerfile.duckdb15; BUILD_IMG="coldfront-build-duckdb15:pg${PG}"; else REGRESS_DF=docker/Dockerfile; BUILD_IMG="coldfront-build:pg${PG}"; fi
-    docker build -f "$REGRESS_DF" --build-arg PG_MAJOR="$PG" --target build -t "$BUILD_IMG" . >/dev/null 2>&1
+    # Every backend now runs on the DuckDB 1.5.x patched-iceberg image, so the
+    # regress harness (pg_regress + extension source) comes from the SAME
+    # Dockerfile.duckdb15 build stage the compose already built — its layers are
+    # cached, so this retags rather than recompiles.
+    BUILD_IMG="coldfront-build-duckdb15:pg${PG}"
+    docker build -f docker/Dockerfile.duckdb15 --build-arg PG_MAJOR="$PG" --target build -t "$BUILD_IMG" . >/dev/null 2>&1
     NET=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' "$DB")
     if docker run --rm --network "$NET" \
            -e PGHOST=db -e PGPORT=5432 -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" \
