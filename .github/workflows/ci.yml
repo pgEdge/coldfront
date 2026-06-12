@@ -35,6 +35,11 @@ jobs:
   quick:
     name: quick (preflight + hermetic s3 cell)
     if: github.event_name == 'push' || github.event_name == 'pull_request'
+    # Rapid pushes to the same ref cancel their superseded quick run (so we don't
+    # burn runners cold-building DuckDB for commits that are already obsolete).
+    concurrency:
+      group: quick-${{ github.ref }}
+      cancel-in-progress: true
     runs-on: ubuntu-latest
     timeout-minutes: 90
     steps:
