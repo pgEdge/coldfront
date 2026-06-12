@@ -216,11 +216,13 @@ EOF
 # ───────────────────────────────────────────────────────────────────────────
 story_provision_decoupled() {
     step "2. Provision decoupled (iceberg-only) table"
-    # Retry the provision until the wrapper view exists: on a cold warehouse the
-    # CREATE SCHEMA (namespace) and the immediately-following CREATE TABLE can
-    # race in Lakekeeper (the table POST lands before the namespace resolves →
-    # 405), and create_iceberg_table is one transaction so it rolls back. The
-    # retry's CREATE SCHEMA IF NOT EXISTS finds the settled namespace.
+    # The Iceberg namespace is pre-seeded at warehouse provisioning (see
+    # ci/topo/*.sh): DuckDB 1.5.x defers an Iceberg CREATE SCHEMA to COMMIT but
+    # POSTs CREATE TABLE eagerly, so create_iceberg_table — which runs both in
+    # ONE plpgsql transaction — would 404 on a cold warehouse (the table POST
+    # references a namespace not yet committed). With the namespace already
+    # committed, its in-txn CREATE SCHEMA IF NOT EXISTS no-ops and CREATE TABLE
+    # succeeds. The loop is a thin safety net in case seeding raced the warehouse.
     local i
     for i in 1 2 3 4 5; do
         q_may "$HOST" "SELECT coldfront.create_iceberg_table('public','iceonly','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"ts\",\"type\":\"timestamptz\"},{\"name\":\"status\",\"type\":\"text\"},{\"name\":\"data\",\"type\":\"jsonb\"}]'::jsonb);" >/dev/null 2>&1

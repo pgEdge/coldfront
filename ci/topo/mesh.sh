@@ -160,6 +160,16 @@ for i in $(seq 1 15); do
 done
 echo "$WH" | grep -q "warehouse-id" || { echo "warehouse creation failed after retries: $WH"; exit 1; }
 
+# Seed the Iceberg namespace at provisioning time (see ci/topo/vanilla.sh for
+# the full rationale): DuckDB 1.5.x defers an Iceberg CREATE SCHEMA to COMMIT
+# while CREATE TABLE POSTs eagerly, so create_iceberg_table (one plpgsql txn)
+# 404s on a cold warehouse. A committed REST POST here makes the in-txn
+# CREATE SCHEMA IF NOT EXISTS a no-op so the CREATE TABLE succeeds.
+WID=$(echo "$WH" | grep -oE '"warehouse-id":"[^"]+"' | head -1 | cut -d'"' -f4)
+[ -z "$WID" ] && WID=$(curl -s "http://$LK_IP:8181/management/v1/warehouse" | grep -oE '"warehouse-id":"[^"]+"' | head -1 | cut -d'"' -f4)
+[ -n "$WID" ] && curl -s -X POST "http://$LK_IP:8181/catalog/v1/$WID/namespaces" \
+    -H "Content-Type: application/json" -d '{"namespace":["default"]}' >/dev/null 2>&1 || true
+
 step "mesh: set cold-tier storage secret on all nodes ($BACKEND)"
 # set_storage_secret[_azure] writes the in-DB row (replicated via the repset
 # above) and materializes a DuckDB PERSISTENT secret on each node — loaded at

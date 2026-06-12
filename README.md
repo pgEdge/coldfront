@@ -412,6 +412,19 @@ curl -X POST http://localhost:8181/management/v1/warehouse \
       "aws-access-key-id": "admin", "aws-secret-access-key": "adminsecret"
     }
   }'
+
+# 3. Create the Iceberg namespace in the new warehouse.
+#    REQUIRED for decoupled (iceberg-only) mode on DuckDB 1.5.x: that release
+#    defers an Iceberg CREATE SCHEMA to transaction COMMIT but POSTs CREATE
+#    TABLE eagerly, so coldfront.create_iceberg_table — which runs both in one
+#    transaction — would 404 against a cold warehouse. Pre-creating the
+#    namespace here (its own committed REST call) makes the function's in-txn
+#    CREATE SCHEMA IF NOT EXISTS a no-op so the table create succeeds. The
+#    archiver (tiered mode) creates the namespace itself and does not need this.
+WID=$(curl -s http://localhost:8181/management/v1/warehouse \
+  | grep -oE '"warehouse-id":"[^"]+"' | head -1 | cut -d'"' -f4)
+curl -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
+  -H "Content-Type: application/json" -d '{"namespace": ["default"]}'
 ```
 
 ### Database setup
