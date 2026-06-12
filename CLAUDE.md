@@ -7,6 +7,7 @@
 - Run `make test` after every change
 - MUST run `./run-ci-local.sh` before every commit — it runs gofmt, golangci-lint, tests, build, Docker integration tests
 - GitHub Actions CI (when added) must always be identical in steps to `run-ci-local.sh` — never let them diverge
+- MUST verify any mesh/distributed/bakery change in the TLA+ model FIRST — before the code change is committed. This covers the cold-write serialization protocol: the bakery functions in `extension/coldfront/coldfront--0.1.sql` (`_claim_iceberg_lock`, `_release_iceberg_lock`, `_exec_iceberg_with_claim`, `_enqueue_release`, `_on_claim_apply`, `_on_claim_release`, `_ensure_claims_replicated`), the C `XactCallback` in `extension/coldfront/src/coldfront.c` (`coldfront_xact_callback` + its `RegisterXactCallback` ordering), the `coldfront.iceberg_async_parquet` ordering, and the spock/`synchronous_*` GUCs gating claim replication. Update `docs/formal/Bakery_v2.tla` (and `Bakery.tla` if the abstraction shifts) to reflect the change, re-translate (`pcal.trans`), and re-check every config with TLC: all safe configs must report "No error has been found", and `Bakery_v2_race.cfg` must still violate `NoLakekeeperConflict` (the proof the bakery-aware patch stays mandatory). Treat the model as the spec — model the change, prove it safe, then implement. See `docs/formal/README.md`.
 - Update README.md as you implement functionality; update ARCHITECTURE.md in the same commit as the structural change it describes
 
 ## Git
