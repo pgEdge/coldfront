@@ -1,0 +1,142 @@
+# ColdFront DuckDB 1.5.x BASE image — the expensive, STABLE layer: libcurl 8.11 +
+# pg_duckdb (DuckDB 1.5.3, PR #1025) + the patched duckdb-iceberg extensions
+# (iceberg/avro/azure/postgres_scanner, v1.5-variegata + the bakery-aware
+# commit-refresh patch). It does NOT contain the coldfront extension — that thin,
+# fast-changing layer is added by docker/Dockerfile.duckdb15 (the "app" build)
+# which does `FROM` this image. Rebuilt only when the pg_duckdb PR ref, the
+# iceberg ref, or the bakery patch changes.
+#
+# ⚠ INTERNAL / PRIVATE — this image EMBEDS the bakery-aware-commit-refresh patch
+# (ColdFront IP, the no-409 guarantee). It is published to
+# ghcr.io/pgedge/coldfront-duckdb-base as a PRIVATE / INTERNAL package and MUST
+# NOT be made public. The base-image workflow (.github/workflows/base-image.yml)
+# builds and pushes it with the workflow GITHUB_TOKEN.
+#
+#   docker build -f docker/Dockerfile.duckdb15-base --build-arg PG_MAJOR=18 \
+#       -t ghcr.io/pgedge/coldfront-duckdb-base:pg18 .
+ARG PG_MAJOR=18
+ARG PGEDGE_TAG=${PG_MAJOR}-spock5-minimal
+
+# ─── build stage: libcurl 8.11 + pg_duckdb (DuckDB 1.5.3, PR #1025) ──────────────
+FROM ghcr.io/pgedge/pgedge-postgres:${PGEDGE_TAG} AS build
+ARG PG_MAJOR
+USER root
+RUN dnf install -y --setopt=install_weak_deps=False \
+        pgedge-postgresql${PG_MAJOR}-devel \
+        gcc gcc-c++ make cmake ninja-build git \
+        redhat-rpm-config \
+        openssl-devel libcurl-devel lz4-devel zlib-devel libicu-devel \
+        pkgconf-pkg-config python3 wget tar gzip \
+    && dnf clean all
+
+ENV PATH=/usr/pgsql-${PG_MAJOR}/bin:$PATH
+ENV PG_CONFIG=/usr/pgsql-${PG_MAJOR}/bin/pg_config
+
+# libcurl 8.11 — built ONLY to satisfy DuckDB 1.5.3 httpfs's COMPILE-TIME
+# dependency: its CMake does find_package(CURL REQUIRED) and curl_client.cpp
+# references CURLSSLOPT_AUTO_CLIENT_CERT (curl >= 7.77); the base ships 7.76.1.
+# At RUNTIME we do NOT use the libcurl client — coldfront forces DuckDB's BUNDLED
+# httplib/mbedtls client (httpfs_client_implementation='httplib', set in
+# coldfront.ensure_attached). The libcurl client's threaded DNS resolver calls
+# glibc getaddrinfo, whose IPv6 check_pf() netlink probe aborts the backend
+# (SIGABRT) under concurrent resolution of an object-store HOSTNAME (e.g. GCS);
+# the bundled client — what stock pg_duckdb 1.1.1 used — has no such failure.
+WORKDIR /curl
+RUN wget -q https://curl.se/download/curl-8.11.1.tar.gz && tar xf curl-8.11.1.tar.gz \
+ && cd curl-8.11.1 \
+ && ./configure --with-openssl --prefix=/usr --disable-static \
+        --without-libpsl --without-libssh2 --without-nghttp2 --without-brotli --without-zstd \
+ && make -j"$(nproc)" && make install && ldconfig
+
+# pg_duckdb from PR #1025 (DuckDB 1.5.3). No released tag carries 1.5.x.
+WORKDIR /build
+RUN git clone https://github.com/duckdb/pg_duckdb /build/pg_duckdb \
+ && cd /build/pg_duckdb \
+ && git fetch origin pull/1025/head && git checkout FETCH_HEAD \
+ && git submodule update --init --recursive
+
+# pgEdge propagates -fexcess-precision=standard into CXXFLAGS, which gcc rejects
+# for C++. Strip it after PGXS is included (no-op if absent).
+RUN printf '\noverride CXXFLAGS := $(filter-out -fexcess-precision=standard,$(CXXFLAGS))\n' \
+        >> /build/pg_duckdb/Makefile.global
+RUN make -C /build/pg_duckdb -j"$(nproc)" with_llvm=no \
+ && DESTDIR=/out make -C /build/pg_duckdb install with_llvm=no
+
+# ─── iceberg-builder stage: iceberg + avro + azure (DuckDB 1.5.x ABI, PATCHED) ──
+FROM quay.io/pypa/manylinux_2_28_x86_64 AS iceberg-builder
+ARG ICEBERG_REF=0fad545a
+# libasan/libubsan: the extension_configuration phase builds a Debug
+# duckdb_platform_binary that links AddressSanitizer. perl-Time-Piece:
+# openssl-from-source (vcpkg) Configure needs it. See DUCKDB_1.5.md.
+RUN dnf install -y --setopt=install_weak_deps=False \
+        ninja-build perl-IPC-Cmd perl-Time-Piece ccache jq wget zip unzip tar autoconf libtool \
+        kernel-headers cmake git make \
+        gcc-toolset-14-libasan-devel gcc-toolset-14-libubsan-devel \
+        flex bison \
+    && dnf clean all
+WORKDIR /build
+RUN git clone --filter=blob:none --no-checkout https://github.com/duckdb/duckdb-iceberg \
+ && git -C duckdb-iceberg fetch --depth 80 origin v1.5-variegata \
+ && git -C duckdb-iceberg checkout ${ICEBERG_REF} \
+ && git -C duckdb-iceberg submodule update --init --recursive --depth 1 --jobs 8 \
+ && git clone https://github.com/microsoft/vcpkg /build/vcpkg \
+ && /build/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+COPY docker/iceberg-azure-extension-config-v15.cmake /build/duckdb-iceberg/extension_config.cmake
+# The bakery-aware-commit-refresh patch (v1.5 port) — ESSENTIAL: coldfront's
+# no-409 guarantee for concurrent cold writers. git apply --check fails the
+# build loudly on patch rot instead of silently shipping stock iceberg (which
+# 409s under concurrency). See DUCKDB_1.5.md + the patch header.
+COPY docker/iceberg-bakery-aware-commit-refresh-v15.patch /tmp/iceberg-bakery-v15.patch
+RUN cd /build/duckdb-iceberg \
+ && git apply --check /tmp/iceberg-bakery-v15.patch \
+ && git apply        /tmp/iceberg-bakery-v15.patch
+RUN cd /build/duckdb-iceberg && bash -c 'source /opt/rh/gcc-toolset-*/enable 2>/dev/null; \
+    export VCPKG_TOOLCHAIN_PATH=/build/vcpkg/scripts/buildsystems/vcpkg.cmake VCPKG_ROOT=/build/vcpkg \
+           VCPKG_TARGET_TRIPLET=x64-linux VCPKG_HOST_TRIPLET=x64-linux USE_MERGED_VCPKG_MANIFEST=1 \
+           EXT_CONFIG=/build/duckdb-iceberg/extension_config.cmake OVERRIDE_GIT_DESCRIBE=v1.5.3 \
+           CMAKE_BUILD_PARALLEL_LEVEL=$(nproc); \
+    make -j$(nproc) release'
+
+# ─── base runtime stage (pg_duckdb + iceberg, NO coldfront) ──────────────────────
+FROM ghcr.io/pgedge/pgedge-postgres:${PGEDGE_TAG}
+ARG PG_MAJOR
+USER root
+RUN dnf install -y --setopt=install_weak_deps=False --allowerasing \
+        libcurl lz4 pgedge-postgresql${PG_MAJOR}-contrib openssl \
+    && dnf clean all
+
+# pg_duckdb 1.5.3 + bundled libduckdb 1.5.3 + extension SQL/control (NO coldfront)
+COPY --from=build /out/usr/pgsql-${PG_MAJOR}/lib/             /usr/pgsql-${PG_MAJOR}/lib/
+COPY --from=build /out/usr/pgsql-${PG_MAJOR}/share/extension/ /usr/pgsql-${PG_MAJOR}/share/extension/
+# libcurl 8.11 (DuckDB 1.5.3 httpfs); overwrite the base 7.76.1 so the newer SONAME wins.
+COPY --from=build /usr/lib/libcurl.so.4.8.0 /usr/lib64/libcurl.so.4.8.0
+RUN ln -sf libcurl.so.4.8.0 /usr/lib64/libcurl.so.4 && ln -sf libcurl.so.4 /usr/lib64/libcurl.so && ldconfig
+
+# iceberg + avro + azure (DuckDB 1.5.x); entrypoint places them under
+# $PGDATA/pg_duckdb/extensions/v1.5.3/<platform>/ (azure cp is conditional).
+COPY --from=iceberg-builder /build/duckdb-iceberg/build/release/extension/iceberg/iceberg.duckdb_extension                 /opt/coldfront/iceberg/iceberg.duckdb_extension
+COPY --from=iceberg-builder /build/duckdb-iceberg/build/release/extension/avro/avro.duckdb_extension                       /opt/coldfront/iceberg/avro.duckdb_extension
+COPY --from=iceberg-builder /build/duckdb-iceberg/build/release/extension/azure/azure.duckdb_extension                     /opt/coldfront/iceberg/azure.duckdb_extension
+# postgres_scanner (the 'postgres' ext) — shipped so install_extension('postgres')
+# resolves it locally; the terrible-link runtime download is removed entirely.
+COPY --from=iceberg-builder /build/duckdb-iceberg/build/release/extension/postgres_scanner/postgres_scanner.duckdb_extension /opt/coldfront/iceberg/postgres_scanner.duckdb_extension
+ENV COLDFRONT_DUCKDB_VERSION=v1.5.3 \
+    COLDFRONT_DUCKDB_PLATFORM=linux_amd64
+
+COPY docker/entrypoint.sh /usr/local/bin/coldfront-entrypoint.sh
+RUN chmod +x /usr/local/bin/coldfront-entrypoint.sh
+RUN mkdir -p /data && chown postgres:postgres /data
+
+ENV PG_MAJOR=${PG_MAJOR}
+
+# INTERNAL labelling — this image embeds ColdFront IP (the bakery patch). Keep the
+# ghcr.io/pgedge package PRIVATE/INTERNAL; do NOT publish.
+LABEL org.opencontainers.image.title="coldfront-duckdb-base" \
+      org.opencontainers.image.vendor="pgEdge" \
+      org.opencontainers.image.source="https://github.com/pgEdge/ColdFront" \
+      org.opencontainers.image.description="INTERNAL — ColdFront DuckDB 1.5.3 base (pg_duckdb PR#1025 + patched duckdb-iceberg with the bakery-aware commit-refresh patch). Embeds ColdFront IP; PRIVATE/INTERNAL only, do NOT make public." \
+      com.pgedge.visibility="internal" \
+      com.pgedge.internal="true"
+
+USER postgres
+ENTRYPOINT ["/usr/local/bin/coldfront-entrypoint.sh"]
