@@ -33,12 +33,22 @@ EXTENDS Naturals, Sequences, FiniteSets, TLC
 CONSTANTS Writers,
           MaxTickets,
           MaxIcebergLen,
-          MaxCrashes
+          MaxCrashes,
+          AsyncParquet,   \* coldfront.iceberg_async_parquet: TRUE stages the parquet
+                          \* OUTSIDE the claim (patched-iceberg upload overlap); FALSE
+                          \* stages it inside the claim (stock iceberg, the default).
+          RestampPatch    \* the bakery-aware-commit-refresh patch re-stamps
+                          \* parent_snapshot_id at the commit POST, UNDER the claim.
+                          \* TRUE = patched deployment. AsyncParquet=TRUE with
+                          \* RestampPatch=FALSE reproduces the pre-patch 409 race that
+                          \* makes the patch mandatory for the async ordering.
 
 ASSUME /\ Writers # {}
        /\ MaxTickets    \in Nat /\ MaxTickets    >= Cardinality(Writers)
        /\ MaxIcebergLen \in Nat /\ MaxIcebergLen >= 1
        /\ MaxCrashes    \in Nat /\ MaxCrashes    <= Cardinality(Writers)
+       /\ AsyncParquet  \in BOOLEAN
+       /\ RestampPatch  \in BOOLEAN
 
 NoTicket == 0
 NoSnap   == 0
@@ -114,10 +124,25 @@ end define;
 fair process Writer \in Writers
 variables
   my_ticket = NoTicket,
-  parent_seen = NoSnap;
+  parent_seen = NoSnap,
+  parent_staged = NoSnap;   \* tentative parent captured at the pre-claim parquet
+                            \* stage in the async (patched) path. Discarded by the
+                            \* under-claim re-stamp when RestampPatch; used as-is
+                            \* (and races) when the patch is absent.
 begin
   Start:
     await Live(self);
+
+  Stage:
+    \* Async (patched) ordering stages the parquet OUTSIDE the claim — writers
+    \* overlap freely on S3 — and captures a TENTATIVE parent at stage time.
+    \* The commit POST re-stamps it under the claim (Decide). The stock ordering
+    \* stages inside the claim, so it has no pre-claim stage (parent taken at
+    \* Prepare, already under the claim).
+    await Live(self);
+    if AsyncParquet then
+      parent_staged := IcebergHead;
+    end if;
 
   BeginClaim:
     \* Insert claim into my local view.  Async replication via Applier.
@@ -137,15 +162,31 @@ begin
     await Live(self) /\ AlivePeersHaveAcked(self, my_ticket);
 
   Prepare:
+    \* Capture the parent_snapshot_id the Lakekeeper CAS asserts against:
+    \*   - stock (AsyncParquet FALSE): stamped at stage time, which is UNDER the
+    \*     claim (we are past WaitAcks).
+    \*   - patched async (RestampPatch TRUE): the commit POST RE-STAMPS to the
+    \*     current head, also UNDER the claim. Catalog-identical to stock, so it
+    \*     reduces to the same "parent = head, taken under the claim".
+    \* Both are modelled at this first under-claim point. The Prepare->Decide gap
+    \* is the window a BROKEN bakery would let a peer's commit slip into (it would
+    \* surface as a CAS mismatch at Decide); R-A keeps that window empty — which is
+    \* what the stock/async configs actually verify, NOT vacuously.
+    \*   - async WITHOUT the patch (RestampPatch FALSE): the stale tentative parent
+    \*     from the pre-claim Stage is used instead — the pre-patch race.
     await Live(self);
-    parent_seen := IcebergHead;
+    if ~ AsyncParquet \/ RestampPatch then
+      parent_seen := IcebergHead;
+    else
+      parent_seen := parent_staged;
+    end if;
 
   Decide:
     await Live(self);
     either
-      \* COMMIT.  Under R-A, when all my acks are in, no other writer
-      \* with a smaller ticket is past their WaitAcks — so the iceberg
-      \* head can't have advanced since Prepare.  CAS always succeeds.
+      \* COMMIT.  Under R-A, when all my acks are in, no other writer with a
+      \* smaller ticket is past their WaitAcks — so under the claim the iceberg
+      \* head is stable from the (re-)stamp to the CAS.  CAS always succeeds.
       if IcebergHead = parent_seen then
         iceberg := Append(iceberg,
                           [w |-> self, t |-> my_ticket,
@@ -211,13 +252,20 @@ begin
 end process;
 
 end algorithm; *)
-\* BEGIN TRANSLATION (chksum(pcal) = "50a4031a" /\ chksum(tla) = "35334207")
+\* BEGIN TRANSLATION (chksum(pcal) = "9cbb63a1" /\ chksum(tla) = "9e24855d")
 VARIABLES pc, next_ticket, claims, acks, deferred, iceberg, decision, crashed, 
           crash_budget
 
 (* define statement *)
 Live(w)        == ~ crashed[w]
 IcebergHead    == Len(iceberg)
+
+
+
+
+
+
+
 
 
 AlivePeersHaveAcked(self, t) ==
@@ -249,10 +297,10 @@ TicketOrderPreserved ==
       /\ iceberg[j].kind = "commit" )
       => iceberg[i].t < iceberg[j].t
 
-VARIABLES my_ticket, parent_seen
+VARIABLES my_ticket, parent_seen, parent_staged
 
 vars == << pc, next_ticket, claims, acks, deferred, iceberg, decision, 
-           crashed, crash_budget, my_ticket, parent_seen >>
+           crashed, crash_budget, my_ticket, parent_seen, parent_staged >>
 
 ProcSet == (Writers) \cup {"applier"} \cup {"crasher"}
 
@@ -268,12 +316,24 @@ Init == (* Global variables *)
         (* Process Writer *)
         /\ my_ticket = [self \in Writers |-> NoTicket]
         /\ parent_seen = [self \in Writers |-> NoSnap]
+        /\ parent_staged = [self \in Writers |-> NoSnap]
         /\ pc = [self \in ProcSet |-> CASE self \in Writers -> "Start"
                                         [] self = "applier" -> "ApplyLoop"
                                         [] self = "crasher" -> "CrashLoop"]
 
 Start(self) == /\ pc[self] = "Start"
                /\ Live(self)
+               /\ pc' = [pc EXCEPT ![self] = "Stage"]
+               /\ UNCHANGED << next_ticket, claims, acks, deferred, iceberg, 
+                               decision, crashed, crash_budget, my_ticket, 
+                               parent_seen, parent_staged >>
+
+Stage(self) == /\ pc[self] = "Stage"
+               /\ Live(self)
+               /\ IF AsyncParquet
+                     THEN /\ parent_staged' = [parent_staged EXCEPT ![self] = IcebergHead]
+                     ELSE /\ TRUE
+                          /\ UNCHANGED parent_staged
                /\ pc' = [pc EXCEPT ![self] = "BeginClaim"]
                /\ UNCHANGED << next_ticket, claims, acks, deferred, iceberg, 
                                decision, crashed, crash_budget, my_ticket, 
@@ -288,21 +348,24 @@ BeginClaim(self) == /\ pc[self] = "BeginClaim"
                                                           {[w |-> self, t |-> my_ticket'[self], n |-> self]}]
                     /\ pc' = [pc EXCEPT ![self] = "WaitAcks"]
                     /\ UNCHANGED << acks, deferred, iceberg, decision, crashed, 
-                                    crash_budget, parent_seen >>
+                                    crash_budget, parent_seen, parent_staged >>
 
 WaitAcks(self) == /\ pc[self] = "WaitAcks"
                   /\ Live(self) /\ AlivePeersHaveAcked(self, my_ticket[self])
                   /\ pc' = [pc EXCEPT ![self] = "Prepare"]
                   /\ UNCHANGED << next_ticket, claims, acks, deferred, iceberg, 
                                   decision, crashed, crash_budget, my_ticket, 
-                                  parent_seen >>
+                                  parent_seen, parent_staged >>
 
 Prepare(self) == /\ pc[self] = "Prepare"
                  /\ Live(self)
-                 /\ parent_seen' = [parent_seen EXCEPT ![self] = IcebergHead]
+                 /\ IF ~ AsyncParquet \/ RestampPatch
+                       THEN /\ parent_seen' = [parent_seen EXCEPT ![self] = IcebergHead]
+                       ELSE /\ parent_seen' = [parent_seen EXCEPT ![self] = parent_staged[self]]
                  /\ pc' = [pc EXCEPT ![self] = "Decide"]
                  /\ UNCHANGED << next_ticket, claims, acks, deferred, iceberg, 
-                                 decision, crashed, crash_budget, my_ticket >>
+                                 decision, crashed, crash_budget, my_ticket, 
+                                 parent_staged >>
 
 Decide(self) == /\ pc[self] = "Decide"
                 /\ Live(self)
@@ -325,10 +388,10 @@ Decide(self) == /\ pc[self] = "Decide"
                       /\ UNCHANGED iceberg
                 /\ pc' = [pc EXCEPT ![self] = "Done"]
                 /\ UNCHANGED << next_ticket, crashed, crash_budget, my_ticket, 
-                                parent_seen >>
+                                parent_seen, parent_staged >>
 
-Writer(self) == Start(self) \/ BeginClaim(self) \/ WaitAcks(self)
-                   \/ Prepare(self) \/ Decide(self)
+Writer(self) == Start(self) \/ Stage(self) \/ BeginClaim(self)
+                   \/ WaitAcks(self) \/ Prepare(self) \/ Decide(self)
 
 ApplyLoop == /\ pc["applier"] = "ApplyLoop"
              /\ \E src \in Writers:
@@ -344,7 +407,8 @@ ApplyLoop == /\ pc["applier"] = "ApplyLoop"
                                     /\ UNCHANGED deferred
              /\ pc' = [pc EXCEPT !["applier"] = "ApplyLoop"]
              /\ UNCHANGED << next_ticket, iceberg, decision, crashed, 
-                             crash_budget, my_ticket, parent_seen >>
+                             crash_budget, my_ticket, parent_seen, 
+                             parent_staged >>
 
 Applier == ApplyLoop
 
@@ -360,7 +424,7 @@ CrashLoop == /\ pc["crasher"] = "CrashLoop"
                    ELSE /\ pc' = [pc EXCEPT !["crasher"] = "Done"]
                         /\ UNCHANGED << crashed, crash_budget >>
              /\ UNCHANGED << next_ticket, claims, acks, deferred, iceberg, 
-                             decision, my_ticket, parent_seen >>
+                             decision, my_ticket, parent_seen, parent_staged >>
 
 Crasher == CrashLoop
 

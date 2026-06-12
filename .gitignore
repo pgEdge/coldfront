@@ -21,8 +21,8 @@ extension/coldfront/src/*.o
 extension/coldfront/src/*.bc
 
 # TLC model-checker artefacts (created next to wherever tlc2.TLC is invoked).
-docs/formal/Bakery_TTrace_*
-docs/formal/Bakery.old
+docs/formal/*_TTrace_*
+docs/formal/*.old
 states/
 
 # Scale test / bench scripts and demo (local only, not shipped — keep out of the

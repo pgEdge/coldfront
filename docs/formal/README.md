@@ -30,9 +30,11 @@ levels of abstraction:
 
 | File | Role |
 |---|---|
-| `Bakery_v2.tla` | PlusCal source.  Models the real spock world: each writer has its OWN local `claims[w]` view, INSERTs propagate via an explicit `Applier`.  No `synchronous_commit = remote_apply`.  Coordination is Lamport's 1978 distributed mutual exclusion algorithm with Ricart-Agrawala's (1981) deferred-reply optimisation: peers ack each claim immediately unless they have a pending claim with smaller ticket, in which case they defer the ack until they release their own claim. |
-| `Bakery_v2.cfg` | TLC config: 3 writers, no crashes, all four safety invariants. **Default v2 config**.  Passes — R-A makes `NoLakekeeperConflict` and `TicketOrderPreserved` hold even with realistic asymmetric apply. |
-| `Bakery_v2_crash.cfg` | 3 writers, 1 crash budget.  Safety invariants still hold (a crashed peer's missing ack just leaves surviving writers blocked at `WaitAcks` — no incorrect commits). |
+| `Bakery_v2.tla` | PlusCal source.  Models the real spock world: each writer has its OWN local `claims[w]` view, INSERTs propagate via an explicit `Applier`.  No `synchronous_commit = remote_apply`.  Coordination is Lamport's 1978 distributed mutual exclusion algorithm with Ricart-Agrawala's (1981) deferred-reply optimisation: peers ack each claim immediately unless they have a pending claim with smaller ticket, in which case they defer the ack until they release their own claim.  Also models the `coldfront.iceberg_async_parquet` flag (constants `AsyncParquet`/`RestampPatch`): the `Stage` label stages parquet OUTSIDE the claim (async ordering); `Prepare` captures the `parent_snapshot_id` UNDER the claim (stock at stage time, patched async re-stamped at the commit POST); the `Decide` CAS asserts against it. |
+| `Bakery_v2.cfg` | TLC config: 3 writers, no crashes, all four safety invariants. **Stock ordering** (`AsyncParquet=FALSE` — the default; parquet staged inside the claim).  Passes — R-A makes `NoLakekeeperConflict` and `TicketOrderPreserved` hold even with realistic asymmetric apply. |
+| `Bakery_v2_async.cfg` | **Patched async ordering** (`AsyncParquet=TRUE, RestampPatch=TRUE`) — what the DuckDB 1.5.x (duckdb15) image runs: parquet staged outside the claim, `parent_snapshot_id` re-stamped at the commit POST under the claim by the bakery-aware patch.  All four safety invariants HOLD; the test is non-vacuous (shares the stock config's under-claim `Prepare→Decide` window, which R-A keeps empty). |
+| `Bakery_v2_race.cfg` | **Pre-patch async race** (`AsyncParquet=TRUE, RestampPatch=FALSE`) — async ordering WITHOUT the bakery-aware patch: the stale tentative parent from the pre-claim stage is used at the POST. **`NoLakekeeperConflict` is EXPECTED to be violated** — the formal proof that the patch is mandatory for the async ordering. |
+| `Bakery_v2_crash.cfg` | 3 writers, 1 crash budget (stock ordering — crash-safety is ordering-independent).  Safety invariants still hold (a crashed peer's missing ack just leaves surviving writers blocked at `WaitAcks` — no incorrect commits). |
 
 ## Properties
 
@@ -108,10 +110,17 @@ java -cp $TLA tlc2.TLC -workers auto -deadlock -config Bakery_SurvivorLiveness.c
 
 # --- v2 (asymmetric apply + Ricart-Agrawala) ---
 
-# v2.a Default: 3 writers, no crashes.  All safety invariants hold.
+# v2.a Stock ordering (AsyncParquet=FALSE): 3 writers, no crashes.  All hold.
 java -cp $TLA tlc2.TLC -workers auto -deadlock -config Bakery_v2.cfg Bakery_v2.tla
 
-# v2.b 1 crash budget.  Safety still holds (crashed peer's missing ack
+# v2.b Patched async ordering (the duckdb15 image's path).  All hold.
+java -cp $TLA tlc2.TLC -workers auto -deadlock -config Bakery_v2_async.cfg Bakery_v2.tla
+
+# v2.c Pre-patch async race.  EXPECTED FAILURE: NoLakekeeperConflict violated —
+#       the formal proof the bakery-aware patch is mandatory for the async path.
+java -cp $TLA tlc2.TLC -workers auto -deadlock -config Bakery_v2_race.cfg Bakery_v2.tla
+
+# v2.d 1 crash budget.  Safety still holds (crashed peer's missing ack
 #       leaves survivors blocked at WaitAcks — no incorrect commits).
 java -cp $TLA tlc2.TLC -workers auto -deadlock -config Bakery_v2_crash.cfg Bakery_v2.tla
 ```
@@ -159,43 +168,64 @@ its orphan claim is evicted by the next writer waiting at
 `BakeryWait` (as soon as that writer observes the crashed peer is
 heartbeat-stale). Surviving writers reach a terminal decision.
 
-### `Bakery_v2.cfg`
+### `Bakery_v2.cfg` (stock ordering)
 
 ```
 Model checking completed. No error has been found.
-747 states generated, 324 distinct states found, 0 states left on queue.
+2442 states generated, 702 distinct states found, 0 states left on queue.
 ```
 
-With per-writer local views, asymmetric Spock apply, and application-
-level 409-retry, `EventuallyCommittedOrRolledBack` holds: every
-`lk_409` is followed by a retry that converges to `committed` or
-`rolled_back` within `MaxRetries`.
+All four safety invariants hold for the stock ordering (parquet staged
+inside the claim; parent stamped under the claim). R-A makes
+`NoLakekeeperConflict` and `TicketOrderPreserved` hold despite asymmetric
+Spock apply.
 
-### `Bakery_v2_race.cfg`
+### `Bakery_v2_async.cfg` (patched async ordering)
+
+```
+Model checking completed. No error has been found.
+3361 states generated, 1084 distinct states found, 0 states left on queue.
+```
+
+The patched async ordering — parquet staged OUTSIDE the claim, parent
+re-stamped at the commit POST UNDER the claim — is safe: all four invariants
+hold. The check is non-vacuous: it shares the stock config's under-claim
+`Prepare → Decide` window, which R-A keeps empty (a peer with a smaller
+ticket defers its ack until it releases, so two writers never both clear
+`WaitAcks`). This is the ordering the DuckDB 1.5.x (duckdb15) image runs.
+
+### `Bakery_v2_race.cfg` (pre-patch async — EXPECTED FAILURE)
 
 ```
 Error: Invariant NoLakekeeperConflict is violated.
 …
-/\ decision = (w1 :> "lk_409" @@ w2 :> "committed")
-558 states generated, 240 distinct states found, 0 states left on queue.
+2898 states generated, 891 distinct states found, 44 states left on queue.
 ```
 
-**Failure expected.** TLC produces a counter-example trace showing
-the asymmetric-apply race: two concurrent writers pass min-check
-on stale local views, both proceed to Lakekeeper, one POSTs first
-and wins, the other gets 409. This is the formal demonstration of
-the race we observed empirically in the mesh concurrency stories
-(`ci/journey.sh` `story_mesh`) — and the reason the bakery's claim
-protocol is non-optional.
-`NonCrashedProgress` is the right property to check here:
-the crashed writer itself can never decide (its plpgsql session is
-dead), but every live writer with a claim still progresses.
+**Failure expected.** With the async ordering but WITHOUT the bakery-aware
+patch (`RestampPatch=FALSE`), a writer asserts the CAS against the stale
+tentative parent it captured at the pre-claim stage; a peer that committed
+while it awaited/held the claim has advanced the iceberg head, so the CAS
+mismatches → Lakekeeper 409. This is the formal proof that the patch is
+mandatory for the async ordering — the stock ordering (`Bakery_v2.cfg`)
+stamps the parent under the claim and needs no patch. (The asymmetric-apply
+race that motivates R-A itself — two writers passing a naive local min-check
+on stale views — is structurally prevented by the R-A ack barrier in this
+model, so it has no standalone config.)
 
 ## Model fidelity
 
 The model is a *protocol-level* abstraction. The following are
 represented faithfully because they affect protocol correctness:
 
+- The `coldfront.iceberg_async_parquet` flag's two mesh orderings in
+  [_exec_iceberg_with_claim](../../extension/coldfront/coldfront--0.1.sql):
+  stock (claim → stage+commit under the claim) and patched async (stage
+  parquet outside the claim → claim → re-stamp `parent_snapshot_id` at the
+  commit POST under the claim). The safety-critical invariant — the CAS
+  parent is taken UNDER the held claim — is captured at `Prepare` for both;
+  the `AsyncParquet`/`RestampPatch` constants select the ordering and whether
+  the bakery-aware patch is present.
 - The bakery's min-ticket spin in
   [_claim_iceberg_lock](../../extension/coldfront/coldfront--0.1.sql)
   (lines around 1180).
@@ -275,7 +305,12 @@ Any change to:
 
 - The bakery functions in `extension/coldfront/coldfront--0.1.sql`
   (`_claim_iceberg_lock`, `_release_iceberg_lock`,
-  `_exec_iceberg_with_claim`, `_enqueue_release`).
+  `_exec_iceberg_with_claim`, `_enqueue_release`, `_on_claim_apply`,
+  `_on_claim_release`).
+- The `_exec_iceberg_with_claim` ordering or the
+  `coldfront.iceberg_async_parquet` flag's meaning (which parquet-stage
+  point / where `parent_snapshot_id` is stamped relative to the claim) —
+  re-check `Bakery_v2.cfg` (stock) AND `Bakery_v2_async.cfg` (patched).
 - The C-level XactCallback in `extension/coldfront/src/coldfront.c`
   (`coldfront_xact_callback`, `RegisterXactCallback` ordering).
 - The `synchronous_*` GUCs that gate sync-rep on the claim INSERT.
@@ -283,7 +318,7 @@ Any change to:
 If the protocol-level shape changes (e.g. swapping the bakery for a
 different coordination primitive), update the PlusCal source first,
 re-translate, re-check. CI integration is a future task; for now,
-running the three configs by hand is the workflow.
+running the configs by hand is the workflow.
 
 ## Future work
 
