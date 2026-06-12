@@ -194,6 +194,58 @@ How the hook splits a write is mode-specific:
 - **Decoupled** always classifies `TIER_COLD`: every write is a single-tier
   Iceberg write. See [ARCHITECTURE_DECOUPLED.md](ARCHITECTURE_DECOUPLED.md).
 
+### Cold-tier DML from inside plpgsql (functions, DO blocks, triggers)
+
+Cold-tier `INSERT`/`UPDATE`/`DELETE` work as top-level statements *and* from
+inside a plpgsql function / `DO` block / trigger. The hook runs at parse-analyze
+(there is no executor hook), so parameter *values* are never reachable to it;
+making the in-plpgsql case work meant solving two independent problems.
+
+**Cause 1 — bound parameters (`$N`).** plpgsql compiles variable references —
+and any client using bind parameters / `PREPARE` / the extended protocol sends —
+into `$N` `PARAM_EXTERN` nodes whose values are unknown at parse-analyze time.
+The deparser emits those as literal `$N` text, so the cold SQL handed to
+`duckdb.raw_query` carried `$N` with nothing to bind (DuckDB: *"Expected N
+parameters, but none were supplied"*). **Fix:** keep the params live — emit the
+cold SQL as a runtime `format(<template>, $1, $2, …)` call (`cold_sql_arg`) and
+declare the param types on the re-parse (`parse_analyze_fixedparams`). PG binds
+the values at execution; DuckDB only ever sees finished literals. This applies
+everywhere (top level and plpgsql) and adds no object — a driver's parameterized
+cold `UPDATE` at the top level is exactly this case.
+
+**Cause 2 — statement shape.** The cold rewrite is a row-returning
+`SELECT coldfront._exec_iceberg_with_claim(...)`. At the top level the client
+discards the row, but plpgsql rejects a bare result-returning SELECT with no
+`INTO`/`PERFORM` (*"query has no destination for result data"*); it only accepts
+a statement whose command tag is a DML returning no rows. We cannot inject
+`INTO`/`PERFORM` (plpgsql source constructs, fixed before the hook runs), and the
+cold table is a DuckDB-attached object, not a PG relation, so PG cannot tag a
+real `UPDATE`/`DELETE` against it. **Fix (only where needed):** when — and only
+when — the statement is parsed inside plpgsql, wrap the cold call as a DML over a
+permanent single-row dummy carrier, `coldfront._dummy_dml_target`:
+
+```sql
+UPDATE coldfront._dummy_dml_target SET anchor = anchor
+ WHERE coldfront._exec_iceberg_with_claim(...) IS NULL
+```
+
+That is a DML (plpgsql accepts it). The cold call runs exactly once in the WHERE
+qual; because `_exec_iceberg_with_claim` returns `void` and `void IS NULL` is
+always false, **zero rows match — the table is never written: no dead rows, no
+WAL, no bloat, ever.** For dual-tier and tiered-INSERT the hot DML is the outer
+statement and this same UPDATE rides in a data-modifying `WITH`-CTE (PostgreSQL
+always runs those to completion, even unreferenced). At the top level nothing
+changes — the SELECT shape is kept byte-for-byte.
+
+**Detecting "inside plpgsql".** When plpgsql parses one of its statements it
+installs `p_post_columnref_hook` on the `ParseState` (to resolve identifiers as
+plpgsql variables); a top-level statement — including a parameterized one, which
+sets only `p_paramref_hook` — never does. So the hook reads
+`pstate->p_post_columnref_hook != NULL` as a precise, stateless,
+side-effect-free "in plpgsql" signal — no PL/pgSQL plugin (which would collide
+with the single global `PLpgSQL_plugin` slot that debuggers/profilers use), no
+global counter, nothing that can interfere with other tooling.
+
 ## Concurrency and pgEdge Spock Deployments
 
 - The archiver runs on **one node only** (via cron). Catalog conflicts

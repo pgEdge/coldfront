@@ -40,6 +40,7 @@
 #include "executor/spi.h"
 #include "lib/stringinfo.h"
 #include "nodes/parsenodes.h"
+#include "nodes/nodeFuncs.h"
 #include "nodes/pg_list.h"
 #include "parser/analyze.h"
 #include "tcop/tcopprot.h"
@@ -57,6 +58,107 @@ PG_MODULE_MAGIC;
 
 /* Re-entrancy guard: parse_analyze_fixedparams fires the hook again */
 static bool coldfront_in_rewrite = false;
+
+/* ===========================================================================
+ * Cold-tier DML from inside plpgsql — the two problems and how this file
+ * solves them. (Background for the param + dummy-table machinery below.)
+ *
+ * Cold DML works fine as a top-level statement but used to fail when issued
+ * from inside a plpgsql function / DO block / trigger, for TWO independent
+ * reasons:
+ *
+ *   (1) Bound parameters. plpgsql (and any client using bind params / PREPARE
+ *       / the extended protocol) compiles variable references into $N
+ *       PARAM_EXTERN nodes whose VALUES are unknown at parse-analyze time —
+ *       which is exactly when this hook runs (there is no executor hook). The
+ *       deparser emits those $N as literal text, so the cold SQL handed to
+ *       duckdb.raw_query carried "$N" with nothing to bind -> DuckDB error
+ *       "Expected N parameters, but none were supplied". FIX: keep the params
+ *       LIVE — emit the cold SQL as a runtime format(<template>, $1, $2, ...)
+ *       call (cold_sql_arg) and declare the param types on the re-parse, so PG
+ *       binds the values at execution and DuckDB only ever sees finished
+ *       literals. This applies EVERYWHERE (top level and plpgsql) and needs no
+ *       table.
+ *
+ *   (2) Statement shape. The cold rewrite is a row-returning
+ *       `SELECT coldfront._exec_iceberg_with_claim(...)`. At top level the
+ *       client discards the row; but plpgsql rejects a bare result-returning
+ *       SELECT with no INTO/PERFORM ("query has no destination for result
+ *       data"). plpgsql only accepts a statement whose command tag is a DML
+ *       (INSERT/UPDATE/DELETE) returning no rows. We can't add INTO/PERFORM
+ *       (those are plpgsql source constructs, fixed before this hook runs and
+ *       unreachable from it), and the cold "table" is a DuckDB-attached object,
+ *       not a PG relation, so PG can't tag a real UPDATE/DELETE against it.
+ *       FIX (only where needed): when — and only when — this statement is being
+ *       parsed inside plpgsql, wrap the cold call as a DML over the dummy
+ *       carrier coldfront._dummy_dml_target (see cold_anchor_update + that
+ *       table's comment in coldfront--0.1.sql). At top level we keep today's
+ *       SELECT shape byte-for-byte, so nothing there changes.
+ *
+ * Detecting "are we inside plpgsql?" without interfering with anything: when
+ * plpgsql parses one of its statements it installs p_post_columnref_hook on the
+ * ParseState (to resolve identifiers as plpgsql variables). A top-level
+ * statement — including a parameterized one, which sets only p_paramref_hook —
+ * never has it. So `pstate->p_post_columnref_hook != NULL` is a precise,
+ * stateless, side-effect-free "in plpgsql" signal (cold_in_plpgsql), read off
+ * the ParseState the hook already receives. No plugin, no global counter,
+ * nothing that could collide with a debugger/profiler.
+ * ===========================================================================
+ */
+
+/*
+ * Bound params ($N) a cold rewrite carries when issued from plpgsql / a DO
+ * block / PREPARE / the extended protocol. Their VALUES are unknown at
+ * parse-analyze (they bind only at execution), so the cold SQL keeps the $N
+ * live and renders them via format() at run time (see cold_sql_arg). maxid==0
+ * means there are none (the path is then byte-identical to the old literal).
+ */
+#define COLDFRONT_MAX_PARAMS 1024       /* plpgsql dno+1; far above any real arity */
+typedef struct ColdParamSet
+{
+    int  maxid;                         /* highest $N seen (0 = no params)        */
+    Oid  types[COLDFRONT_MAX_PARAMS];   /* types[id-1] = $id's type OID           */
+    bool seen[COLDFRONT_MAX_PARAMS];    /* which paramids actually occur (sparse) */
+} ColdParamSet;
+
+static bool
+collect_params_walker(Node *node, void *ctx)
+{
+    ColdParamSet *ps = (ColdParamSet *) ctx;
+
+    if (node == NULL)
+        return false;
+    if (IsA(node, Param))
+    {
+        Param *p = (Param *) node;
+        if (p->paramkind == PARAM_EXTERN && p->paramid >= 1)
+        {
+            /* Hard-fail rather than silently drop: a dropped param would be
+             * copied through as a literal $N the re-parse can't bind — exactly
+             * the unbound-$N failure this path exists to prevent. The cap is
+             * far above any real plpgsql datum count. */
+            if (p->paramid > COLDFRONT_MAX_PARAMS)
+                ereport(ERROR,
+                        (errcode(ERRCODE_TOO_MANY_ARGUMENTS),
+                         errmsg("cold-tier DML references parameter $%d, above coldfront's limit of %d",
+                                p->paramid, COLDFRONT_MAX_PARAMS)));
+            if (p->paramid > ps->maxid)
+                ps->maxid = p->paramid;
+            ps->types[p->paramid - 1] = p->paramtype;
+            ps->seen[p->paramid - 1]  = true;
+        }
+        return false;
+    }
+    return expression_tree_walker(node, collect_params_walker, ctx);
+}
+
+/* Gather every PARAM_EXTERN in the Query (targetlist, quals, VALUES, sub-RTEs). */
+static void
+collect_cold_params(Query *query, ColdParamSet *ps)
+{
+    memset(ps, 0, sizeof(*ps));
+    query_tree_walker(query, collect_params_walker, (void *) ps, 0);
+}
 
 /*
  * Once-per-session guard: the Iceberg 'ice' catalog is attached lazily on the
@@ -629,34 +731,155 @@ build_cold_dml(DeparseResult *dr, TieredViewInfo *info)
 }
 
 /*
- * Wrap a cold INSERT/UPDATE/DELETE in a call to
- * coldfront._exec_iceberg_with_claim(table, sql) — the single serialization
- * chokepoint for ALL cold-tier writes (tiered and iceberg-only). The plpgsql
- * wrapper self-selects the cluster-wide R-A bakery (multi-node mesh) or a
- * local advisory lock (vanilla single-node), runs the cold DML via
- * duckdb.raw_query, and (mesh path) releases the claim after pg_duckdb's
- * iceberg COMMIT lands via the C XactCallback. The SELECT wrapper also keeps
- * the DuckDB DML off PG's command-ID counter, sidestepping pg_duckdb's
- * mixed-write check. See the bakery comments in coldfront--0.1.sql.
+ * Render a deparsed cold DML string as the SQL-text argument that
+ * coldfront._exec_iceberg_with_claim(table, sql) — or _tiered_insert_cold's
+ * source — receives.
  *
- * TODO: SERIOUS FLAW — when this hook fires inside a plpgsql function or
- * DO block, plpgsql has already replaced variable references with $N
- * parameter placeholders by the time post_parse_analyze runs. The deparsed
- * SQL we hand to raw_query still references those $N, but the DuckDB executor
- * has no parameter values to bind, so it errors with "Expected N parameters,
- * but none were supplied". Workaround today: callers must materialise plpgsql
- * vars into literal SQL before reaching this path. Proper fix: substitute
- * Param nodes with their values before deparsing.
+ * With no bound params (maxid==0) it is a plain quoted literal — BYTE-IDENTICAL
+ * to the old behaviour, so the top-level/literal path is unchanged. With params
+ * it is a format(<template>, $1, $2, ...) call: each out-of-literal $N becomes a
+ * positional %P$L spec and stays LIVE as a format() arg, so PG binds the value
+ * at execution and DuckDB only ever sees a finished literal. That is what lets
+ * cold DML carry plpgsql / PREPARE / extended-protocol $N (Cause 1).
+ *
+ * Quote-aware (mirrors normalize_casts_for_duckdb): a '$N' inside a string
+ * literal is user data, left alone; a literal '%' is doubled so format() passes
+ * it through.
+ *
+ * duckdb_target selects value rendering. true: the string reaches
+ * duckdb.raw_query (emit_cold / emit_dual / the fast tiered-INSERT path), so it
+ * mirrors the INSTEAD-OF trigger's DuckDB literals — bytea -> from_hex(%P$L) /
+ * encode($K,'hex'); json/jsonb/interval -> %P$L / $K::text; else %P$L / $K.
+ * false: the string is embedded in a PostgreSQL cursor by
+ * coldfront._tiered_insert_cold (the slow IDENTITY-omit path), executed by PG
+ * not DuckDB. Most params render as plain %P$L / $K (PG coerces by the column
+ * type); bytea renders as decode(%P$L,'hex') / encode($K,'hex') so the projected
+ * cursor column is a real bytea independent of the caller's bytea_output GUC (a
+ * plain %L would quote it under the session bytea_output and corrupt under
+ * 'escape'). from_hex (DuckDB-only) would be wrong here — PG has no from_hex().
  */
 static char *
-wrap_cold_in_exec_with_claim(const char *iceberg_table, const char *cold_dml)
+cold_sql_arg(const char *cold_dml, ColdParamSet *ps, bool duckdb_target)
+{
+    StringInfoData tmpl, args, out;
+    const char    *p = cold_dml;
+    bool           in_quote = false, in_dquote = false;
+    int            pos_of_id[COLDFRONT_MAX_PARAMS] = {0};
+    int            next_pos = 1;
+
+    if (ps->maxid == 0)
+        return quote_literal_cstr(cold_dml);
+
+    initStringInfo(&tmpl);
+    initStringInfo(&args);
+    while (*p)
+    {
+        if (*p == '\'' && !in_dquote)
+        {
+            if (in_quote && *(p + 1) == '\'')
+            { appendStringInfoString(&tmpl, "''"); p += 2; continue; }
+            in_quote = !in_quote;
+            appendStringInfoChar(&tmpl, *p++);
+            continue;
+        }
+        if (*p == '"' && !in_quote)
+        {
+            if (in_dquote && *(p + 1) == '"')
+            { appendStringInfoString(&tmpl, "\"\""); p += 2; continue; }
+            in_dquote = !in_dquote;
+            appendStringInfoChar(&tmpl, *p++);
+            continue;
+        }
+        if (*p == '%')                              /* format() metachar */
+        { appendStringInfoString(&tmpl, "%%"); p++; continue; }
+        if (*p == '$' && !in_quote && !in_dquote &&
+            *(p + 1) >= '0' && *(p + 1) <= '9')
+        {
+            int         id = 0;
+            const char *q  = p + 1;
+            Oid         t;
+
+            while (*q >= '0' && *q <= '9')
+                id = id * 10 + (*q++ - '0');
+            if (id >= 1 && id <= ps->maxid && ps->seen[id - 1])
+            {
+                t = ps->types[id - 1];
+                if (pos_of_id[id - 1] == 0)         /* first sight: assign pos + arg */
+                {
+                    pos_of_id[id - 1] = next_pos++;
+                    if (t == BYTEAOID)
+                        /* hex string — GUC-independent (the caller's bytea_output
+                         * is irrelevant); both targets reconstruct the exact
+                         * bytes: DuckDB via from_hex, PG via decode. */
+                        appendStringInfo(&args, ", encode($%d,'hex')", id);
+                    else if (duckdb_target &&
+                             (t == JSONOID || t == JSONBOID || t == INTERVALOID))
+                        appendStringInfo(&args, ", $%d::text", id);
+                    else
+                        appendStringInfo(&args, ", $%d", id);
+                }
+                if (t == BYTEAOID && duckdb_target)
+                    appendStringInfo(&tmpl, "from_hex(%%%d$L)", pos_of_id[id - 1]);
+                else if (t == BYTEAOID)
+                    /* native PG (the _tiered_insert_cold cursor): rebuild a real
+                     * bytea from the hex arg so the projected column is bytea
+                     * regardless of the caller's bytea_output. */
+                    appendStringInfo(&tmpl, "decode(%%%d$L,'hex')", pos_of_id[id - 1]);
+                else
+                    appendStringInfo(&tmpl, "%%%d$L", pos_of_id[id - 1]);
+                p = q;
+                continue;
+            }
+        }
+        appendStringInfoChar(&tmpl, *p++);
+    }
+
+    initStringInfo(&out);
+    appendStringInfo(&out, "format(%s%s)",
+                     quote_literal_cstr(tmpl.data), args.data);
+    return out.data;
+}
+
+/*
+ * The cold serialization call expression:
+ * coldfront._exec_iceberg_with_claim(<table>, <arg_sql>), where arg_sql is
+ * cold_sql_arg() output. This is the single chokepoint for ALL cold-tier writes
+ * (tiered and iceberg-only): its plpgsql wrapper self-selects the cluster-wide
+ * R-A bakery (mesh) or a local advisory lock (vanilla), runs the cold DML via
+ * duckdb.raw_query, and releases the claim after pg_duckdb's iceberg COMMIT via
+ * the C XactCallback. Callers wrap it in a SELECT (top level) or in
+ * cold_anchor_update() (in plpgsql).
+ */
+static char *
+cold_exec_call(const char *iceberg_table, const char *arg_sql)
+{
+    StringInfoData buf;
+    initStringInfo(&buf);
+    appendStringInfo(&buf, "coldfront._exec_iceberg_with_claim(%s, %s)",
+                     quote_literal_cstr(iceberg_table), arg_sql);
+    return buf.data;
+}
+
+/*
+ * Cause-2 carrier (in-plpgsql only): turn a cold call expression into a
+ * DML-tagged statement plpgsql accepts (a bare SELECT would raise "query has no
+ * destination for result data" inside a function / DO block). The call runs
+ * exactly once in the WHERE qual, evaluated against the single row of
+ * coldfront._dummy_dml_target; because _exec_iceberg_with_claim returns void and
+ * `void IS NULL` is always false, zero rows match and the table is NEVER written
+ * (no dead rows, no WAL, no bloat). Used standalone for pure-cold, and as the
+ * data-modifying WITH-CTE body for the dual / tiered-INSERT cases (a
+ * data-modifying CTE always runs to completion, even unreferenced). See the
+ * full rationale on the table in coldfront--0.1.sql.
+ */
+static char *
+cold_anchor_update(const char *cold_call_expr)
 {
     StringInfoData buf;
     initStringInfo(&buf);
     appendStringInfo(&buf,
-        "SELECT coldfront._exec_iceberg_with_claim(%s, %s)",
-        quote_literal_cstr(iceberg_table),
-        quote_literal_cstr(cold_dml));
+        "UPDATE coldfront._dummy_dml_target SET anchor = anchor WHERE %s IS NULL",
+        cold_call_expr);
     return buf.data;
 }
 
@@ -833,11 +1056,11 @@ emit_hot(Query *query, TieredViewInfo *info)
 }
 
 static char *
-emit_cold(Query *query, TieredViewInfo *info)
+emit_cold(Query *query, TieredViewInfo *info, ColdParamSet *ps, bool in_plpgsql)
 {
     DeparseResult  dr;
     List          *saved_returning;
-    char          *cold_dml;
+    char          *cold_dml, *call;
 
     /*
      * Save / NIL / restore the returningList around deparse instead of
@@ -877,7 +1100,18 @@ emit_cold(Query *query, TieredViewInfo *info)
      * them; it self-selects the R-A bakery (multi-node mesh) or a local
      * advisory lock (vanilla single-node), so this is correct in every
      * deployment. (Tiered INSERT uses a separate path, emit_tiered_insert.) */
-    return wrap_cold_in_exec_with_claim(info->iceberg_table, cold_dml);
+    call = cold_exec_call(info->iceberg_table, cold_sql_arg(cold_dml, ps, true));
+
+    /* Cause 2: inside plpgsql the statement must be a DML (cold_anchor_update);
+     * at top level keep the byte-identical SELECT shape. */
+    if (in_plpgsql)
+        return cold_anchor_update(call);
+    {
+        StringInfoData buf;
+        initStringInfo(&buf);
+        appendStringInfo(&buf, "SELECT %s", call);
+        return buf.data;
+    }
 }
 
 /*
@@ -898,10 +1132,10 @@ emit_cold(Query *query, TieredViewInfo *info)
  * in v0.1, so the outer SELECT only ever shows hot rows.
  */
 static char *
-emit_dual(Query *query, TieredViewInfo *info)
+emit_dual(Query *query, TieredViewInfo *info, ColdParamSet *ps, bool in_plpgsql)
 {
     DeparseResult  dr_hot, dr_cold;
-    char          *hot_dml, *cold_dml;
+    char          *hot_dml, *cold_dml, *call;
     bool           has_returning = (query->returningList != NIL);
     StringInfoData buf;
     List          *saved_returning;
@@ -922,25 +1156,34 @@ emit_dual(Query *query, TieredViewInfo *info)
     deparse_and_find_prefix(query, &dr_cold);
     query->returningList = saved_returning;
     cold_dml = build_cold_dml(&dr_cold, info);
+    call = cold_exec_call(info->iceberg_table, cold_sql_arg(cold_dml, ps, true));
 
-    /*
-     * The cold CTE is a SELECT (not DML from PG's perspective), so PG's
-     * planner would prune it as unreferenced unless we force a dependency
-     * from the outer SELECT.  MATERIALIZED alone is NOT enough — it only
-     * prevents inlining.  A CROSS JOIN with cold in the outer SELECT forces
-     * its execution while keeping the row set equal to hot (cold returns a
-     * single boolean row).  The hot CTE is DML, which PG always runs to
-     * completion regardless of outer references.
-     */
     initStringInfo(&buf);
-    appendStringInfo(&buf,
-        "WITH hot AS (%s%s)"
-        ", cold AS (SELECT coldfront._exec_iceberg_with_claim(%s, %s))"
-        " SELECT h.* FROM hot h CROSS JOIN cold c",
-        hot_dml,
-        has_returning ? "" : " RETURNING *",
-        quote_literal_cstr(info->iceberg_table),
-        quote_literal_cstr(cold_dml));
+    if (in_plpgsql)
+    {
+        /* Cause 2: the hot UPDATE/DELETE is the OUTER statement (DML tag ->
+         * plpgsql accepts it); the cold call rides in a data-modifying WITH-CTE
+         * (cold_anchor_update), which PG always runs to completion regardless of
+         * references, so the cold write still happens when the hot side matches
+         * no rows. We keep the user's RETURNING if any; cold RETURNING is not
+         * supported in v0.1. */
+        appendStringInfo(&buf, "WITH cold AS (%s) %s",
+                         cold_anchor_update(call), hot_dml);
+    }
+    else
+    {
+        /* Top level (unchanged): the cold CTE is a SELECT, which PG would prune
+         * as unreferenced — MATERIALIZED only prevents inlining — so a CROSS
+         * JOIN with cold in the outer SELECT forces its execution while keeping
+         * the row set equal to hot. The hot CTE is DML and always runs. */
+        appendStringInfo(&buf,
+            "WITH hot AS (%s%s)"
+            ", cold AS (SELECT %s)"
+            " SELECT h.* FROM hot h CROSS JOIN cold c",
+            hot_dml,
+            has_returning ? "" : " RETURNING *",
+            call);
+    }
     return buf.data;
 }
 
@@ -1168,11 +1411,11 @@ tiered_insert_needs_loop(Query *query, TieredViewInfo *info)
  * statement reports (hot_count, cold_count).
  */
 static char *
-emit_tiered_insert(Query *query, TieredViewInfo *info)
+emit_tiered_insert(Query *query, TieredViewInfo *info, ColdParamSet *ps, bool in_plpgsql)
 {
     DeparseResult  dr;
     StringInfoData buf, hot;
-    char          *col_list, *cutoff_lit;
+    char          *col_list, *cutoff_lit, *call;
     const char    *source, *vname, *vschema;
     List          *saved_returning;
     bool           need_loop;
@@ -1224,18 +1467,21 @@ emit_tiered_insert(Query *query, TieredViewInfo *info)
         }
         appendStringInfoString(&target_arr, "]::text[]");
 
-        initStringInfo(&buf);
-        appendStringInfo(&buf,
-            "WITH hot_ins AS MATERIALIZED (%s RETURNING 1), "
-            "cold_call AS MATERIALIZED ("
-            "SELECT coldfront._tiered_insert_cold(%s, %s, %s, %s) AS n) "
-            "SELECT (SELECT count(*) FROM hot_ins) AS hot_rows, "
-            "       (SELECT n FROM cold_call) AS cold_rows",
-            hot.data,
-            quote_literal_cstr(vschema),
-            quote_literal_cstr(vname),
-            target_arr.data,
-            quote_literal_cstr(source));
+        /* _tiered_insert_cold embeds its source SQL in a PG cursor (executed by
+         * PG, not DuckDB), so render params as NATIVE PG (duckdb_target=false):
+         * no from_hex/::text — PG coerces the literals by the projected column
+         * types. Its bigint result is never NULL, so the anchor matches 0 rows. */
+        {
+            StringInfoData callbuf;
+            initStringInfo(&callbuf);
+            appendStringInfo(&callbuf,
+                "coldfront._tiered_insert_cold(%s, %s, %s, %s)",
+                quote_literal_cstr(vschema),
+                quote_literal_cstr(vname),
+                target_arr.data,
+                cold_sql_arg(source, ps, false));
+            call = callbuf.data;
+        }
     }
     else
     {
@@ -1269,16 +1515,32 @@ emit_tiered_insert(Query *query, TieredViewInfo *info)
         cold_pfx  = prefix_pg_tables_with_pglocal(query, cold.data);
         cold_norm = normalize_casts_for_duckdb(cold_pfx);
 
-        initStringInfo(&buf);
+        call = cold_exec_call(info->iceberg_table, cold_sql_arg(cold_norm, ps, true));
+    }
+
+    /* Cause 2: in plpgsql the hot INSERT is the OUTER DML (plpgsql accepts it)
+     * and the cold call rides in a data-modifying CTE that always runs to
+     * completion; the old (hot_rows, cold_rows) report isn't available in that
+     * shape. At top level keep the existing count-reporting shape unchanged
+     * (fast/slow read the cold count differently). */
+    initStringInfo(&buf);
+    if (in_plpgsql)
+        appendStringInfo(&buf, "WITH cold_call AS (%s) %s",
+                         cold_anchor_update(call), hot.data);
+    else if (need_loop)
         appendStringInfo(&buf,
             "WITH hot_ins AS MATERIALIZED (%s RETURNING 1), "
-            "cold_call AS MATERIALIZED (SELECT coldfront._exec_iceberg_with_claim(%s, %s)) "
+            "cold_call AS MATERIALIZED (SELECT %s AS n) "
+            "SELECT (SELECT count(*) FROM hot_ins) AS hot_rows, "
+            "       (SELECT n FROM cold_call) AS cold_rows",
+            hot.data, call);
+    else
+        appendStringInfo(&buf,
+            "WITH hot_ins AS MATERIALIZED (%s RETURNING 1), "
+            "cold_call AS MATERIALIZED (SELECT %s) "
             "SELECT (SELECT count(*) FROM hot_ins) AS hot_rows, "
             "       (SELECT count(*) FROM cold_call) AS cold_rows",
-            hot.data,
-            quote_literal_cstr(info->iceberg_table),
-            quote_literal_cstr(cold_norm));
-    }
+            hot.data, call);
 
     return buf.data;
 }
@@ -1343,6 +1605,8 @@ coldfront_post_parse_analyze(ParseState *pstate, Query *query,
     RawStmt        *raw;
     Query          *rewritten;
     RangeTblEntry  *rte;
+    ColdParamSet    ps;
+    bool            in_plpgsql;
 
     /* Chain to any previous hook first */
     if (prev_post_parse_analyze_hook)
@@ -1402,6 +1666,15 @@ coldfront_post_parse_analyze(ParseState *pstate, Query *query,
         if (!lookup_tiered_view(rte->relid, vname, &info))
             return;
 
+        /* Bound params ($N) from a plpgsql / DO / PREPARE / extended-protocol
+         * caller, collected once (Cause 1). in_plpgsql gates the Cause-2
+         * statement shape — plpgsql installs p_post_columnref_hook on the
+         * ParseState; top-level (even parameterized) does not. See the
+         * architecture block at the top of this file and the
+         * coldfront._dummy_dml_target comment in coldfront--0.1.sql. */
+        collect_cold_params(query, &ps);
+        in_plpgsql = (pstate->p_post_columnref_hook != NULL);
+
         /* Tiered-view INSERT: bulk split-by-watermark via emit_tiered_insert.
          * Iceberg-only INSERT falls through to the unconditional cold path
          * (classify_tier short-circuits to TIER_COLD for iceberg-only).
@@ -1429,7 +1702,7 @@ coldfront_post_parse_analyze(ParseState *pstate, Query *query,
                                          "on",
                                          PGC_USERSET, PGC_S_SESSION,
                                          GUC_ACTION_LOCAL, true, 0, false);
-                new_sql = emit_tiered_insert(query, &info);
+                new_sql = emit_tiered_insert(query, &info, &ps, in_plpgsql);
             }
             goto rewrite;
         }
@@ -1457,7 +1730,7 @@ coldfront_post_parse_analyze(ParseState *pstate, Query *query,
             if (query->commandType == CMD_INSERT &&
                 query_has_pg_source_table(query))
                 ensure_pg_attached_via_spi();
-            new_sql = emit_cold(query, &info);
+            new_sql = emit_cold(query, &info, &ps, in_plpgsql);
             break;
 
         case TIER_AMBIGUOUS:
@@ -1481,7 +1754,7 @@ coldfront_post_parse_analyze(ParseState *pstate, Query *query,
                                      PGC_USERSET, PGC_S_SESSION,
                                      GUC_ACTION_LOCAL, true, 0, false);
             ensure_ice_attached_once();
-            new_sql = emit_dual(query, &info);
+            new_sql = emit_dual(query, &info, &ps, in_plpgsql);
             break;
 
         default:
@@ -1501,7 +1774,19 @@ rewrite:
                  "coldfront: unexpected parse result for rewritten query");
 
         raw       = linitial_node(RawStmt, parsetree_list);
-        rewritten = parse_analyze_fixedparams(raw, new_sql, NULL, 0, NULL);
+        /* Declare the bound-param types so the rewritten SQL's live $N (Cause 1's
+         * format() args, plus the native $N the hot/dual legs keep) re-bind at
+         * execution; unseen ids in a sparse set default to text. */
+        if (ps.maxid > 0)
+        {
+            Oid *ptypes = (Oid *) palloc(sizeof(Oid) * ps.maxid);
+            int  i;
+            for (i = 0; i < ps.maxid; i++)
+                ptypes[i] = ps.seen[i] ? ps.types[i] : TEXTOID;
+            rewritten = parse_analyze_fixedparams(raw, new_sql, ptypes, ps.maxid, NULL);
+        }
+        else
+            rewritten = parse_analyze_fixedparams(raw, new_sql, NULL, 0, NULL);
 
         /* Replace the original Query in-place */
         memcpy(query, rewritten, sizeof(Query));

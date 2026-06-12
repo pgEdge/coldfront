@@ -44,6 +44,41 @@ CREATE TABLE IF NOT EXISTS coldfront.archive_watermark (
     cutoff_time timestamptz NOT NULL
 );
 
+-- coldfront._dummy_dml_target — a permanent, single-row DUMMY table whose data is
+-- meaningless and which is NEVER written to. It exists for exactly one structural
+-- reason, used ONLY in a narrow case:
+--
+-- Cold-tier DML is rewritten (in the parse-analyze hook) into a call to
+-- coldfront._exec_iceberg_with_claim(...). At the top level that call is wrapped
+-- in a plain SELECT — fine, the client discards the row. But inside a plpgsql
+-- function / DO block / trigger, plpgsql rejects a bare result-returning SELECT
+-- ("query has no destination for result data"); it only accepts a statement
+-- whose command tag is a DML (INSERT/UPDATE/DELETE) returning no rows. So ONLY
+-- when the hook detects it is running inside plpgsql, it wraps the cold call as a
+-- DML over this table:
+--
+--   UPDATE coldfront._dummy_dml_target SET anchor = anchor
+--    WHERE coldfront._exec_iceberg_with_claim(...) IS NULL
+--
+-- That is a DML (plpgsql accepts it), and the cold call runs exactly once — in
+-- the WHERE qual, evaluated against the single row. _exec_iceberg_with_claim
+-- returns VOID, and `void IS NULL` is ALWAYS false, so the WHERE matches zero
+-- rows: the row is never updated -> no new tuple version, no dead tuple, no WAL,
+-- no bloat, no vacuum, EVER. The table is a pure command-tag carrier. (In
+-- dual-tier and tiered-INSERT rewrites the same UPDATE rides in a data-modifying
+-- WITH-CTE, which PostgreSQL always runs to completion even when unreferenced.)
+--
+-- LOGGED on purpose: on a read-only standby an in-plpgsql cold write is then
+-- rejected cleanly at executor start ("cannot execute UPDATE in a read-only
+-- transaction") BEFORE the cold function runs — no stray Iceberg write from a
+-- replica. The 0-row UPDATE writes no WAL, so LOGGED costs nothing here.
+--
+-- Node-local: each node's CREATE EXTENSION seeds its own single row; it is never
+-- added to a replication set. Referenced ONLY by the in-plpgsql rewrite branch —
+-- top-level cold DML never names it.
+CREATE TABLE coldfront._dummy_dml_target (anchor boolean NOT NULL DEFAULT true);
+INSERT INTO coldfront._dummy_dml_target DEFAULT VALUES;
+
 -- Cold-tier S3 credential — the in-DB source of truth, set via
 -- coldfront.set_storage_secret(). As an extension-member table its DATA is NOT
 -- carried by pg_dump (no pg_extension_config_dump), and it is added to the

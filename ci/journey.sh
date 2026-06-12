@@ -261,6 +261,34 @@ EOSQL
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# Story 6b' — Decoupled CRUD from INSIDE plpgsql (a DO block). Every iceonly DML
+# is cold (emit_tiered_insert / emit_cold); a plpgsql var ⇒ a $N kept live via
+# format() (Cause 1), and inside plpgsql the rewrite is the DML-tagged carrier
+# shape (Cause 2). RED before / GREEN after. Exercises the jsonb param branch.
+# ───────────────────────────────────────────────────────────────────────────
+story_decoupled_plpgsql() {
+    step "6b'. Decoupled CRUD from inside plpgsql (DO block, bound params)"
+    local O; O=$(qf "$HOST" <<'EOSQL'
+DO $$
+DECLARE v_id int := 500; v_st text := 'pp_ins'; v_data jsonb := '{"k":1}';
+BEGIN INSERT INTO iceonly VALUES (v_id,'2026-05-02 10:00:00+00',v_st,v_data); END $$;
+SELECT 'PP_INS:' || count(*) FROM iceonly WHERE id=500;
+DO $$
+DECLARE v_id int := 500; v_new text := 'pp_upd';
+BEGIN UPDATE iceonly SET status = v_new WHERE id = v_id; END $$;
+SELECT 'PP_UPD:' || coalesce(max(status),'<none>') FROM iceonly WHERE id=500;
+DO $$
+DECLARE v_id int := 500;
+BEGIN DELETE FROM iceonly WHERE id = v_id; END $$;
+SELECT 'PP_DEL:' || count(*) FROM iceonly WHERE id=500;
+EOSQL
+)
+    assert_eq "decoupled plpgsql INSERT (var values incl. jsonb)" "1"      "$(extract PP_INS "$O")"
+    assert_eq "decoupled plpgsql UPDATE (var SET+WHERE)"          "pp_upd" "$(extract PP_UPD "$O")"
+    assert_eq "decoupled plpgsql DELETE (var WHERE)"              "0"      "$(extract PP_DEL "$O")"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Decoupled concurrency / no-409 — parallel cold writers to ONE iceberg-only
 # table must all land. Vanilla serializes them with the local advisory-lock
 # bakery (_exec_iceberg_with_claim, v_armed=false → pg_advisory_xact_lock);
@@ -448,6 +476,56 @@ EOSQL
     # Strict mode rejects an ambiguous predicate.
     local e; e=$(q_may "$HOST" "SET coldfront.allow_mixed_writes=off; UPDATE events SET status='x' WHERE data->>'m'='nope';")
     assert_err "strict mode rejects ambiguous predicate" "must include" "$e"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story 6c — Cold + dual-tier DML issued from INSIDE plpgsql (a DO block). This
+# is the end-to-end test of BOTH fixes: plpgsql variable refs become $N bound
+# params (Cause 1, kept live via format()), and the rewrite must be a DML-tagged
+# statement plpgsql accepts rather than a bare SELECT (Cause 2, the
+# coldfront._dummy_dml_target carrier — only used here, in the in-plpgsql case).
+# RED before the fix (DuckDB param error, then "query has no destination"),
+# GREEN after, on every backend+topology. Cold = Jan (< the 2026-04-15 cutoff).
+# ───────────────────────────────────────────────────────────────────────────
+story_writes_plpgsql() {
+    step "6c. Cold + dual-tier DML from inside plpgsql (DO block, bound params)"
+    local O; O=$(qf "$HOST" <<'EOSQL'
+INSERT INTO events (ts,status,data) VALUES
+  ('2026-01-22 04:00+00','pp_upd_seed','{}'),('2026-01-23 04:00+00','pp_del_seed','{}');
+-- cold UPDATE from plpgsql: var in SET and WHERE
+DO $$
+DECLARE v_new text := 'pp_upd_done'; v_old text := 'pp_upd_seed';
+BEGIN UPDATE events SET status = v_new WHERE status = v_old AND ts < '2026-02-01'; END $$;
+SELECT 'PP_UPD:' || count(*) FROM events WHERE status='pp_upd_done';
+-- cold DELETE from plpgsql: var in WHERE
+DO $$
+DECLARE v_st text := 'pp_del_seed';
+BEGIN DELETE FROM events WHERE status = v_st AND ts < '2026-02-01'; END $$;
+SELECT 'PP_DEL:' || count(*) FROM events WHERE status='pp_del_seed';
+-- dual-tier UPDATE from plpgsql: ambiguous (status-only) predicate ⇒ dual CTE
+-- (hot leg keeps native $N, cold leg goes through format()).
+INSERT INTO events (ts,status,data) VALUES
+  ('2026-04-24 05:00+00','pp_dual','{}'),('2026-01-24 05:00+00','pp_dual','{}');
+DO $$
+DECLARE v_new text := 'pp_dual_done';
+BEGIN UPDATE events SET status = v_new WHERE status = 'pp_dual'; END $$;
+SELECT 'PP_DUAL_HOT:'   || count(*) FROM _events WHERE status='pp_dual_done';
+SELECT 'PP_DUAL_TOTAL:' || count(*) FROM events  WHERE status='pp_dual_done';
+-- cold INSERT from plpgsql: events.id is GENERATED ALWAYS AS IDENTITY, so the
+-- INSERT must omit it → the slow tiered-INSERT loop (coldfront._tiered_insert_cold,
+-- whose source SQL runs in a PG cursor). The jsonb var exercises the native-PG
+-- arg rendering (not the DuckDB from_hex/::text used on the raw_query paths).
+DO $$
+DECLARE v_st text := 'pp_ins'; v_data jsonb := '{"k":9}';
+BEGIN INSERT INTO events (ts, status, data) VALUES ('2026-01-25 06:00+00', v_st, v_data); END $$;
+SELECT 'PP_INS:' || count(*) FROM events WHERE status='pp_ins' AND ts < '2026-02-01';
+EOSQL
+)
+    assert_eq "plpgsql cold UPDATE (var SET+WHERE) hit the cold tier" "1" "$(extract PP_UPD "$O")"
+    assert_eq "plpgsql cold DELETE (var WHERE) removed the cold row"  "0" "$(extract PP_DEL "$O")"
+    assert_eq "plpgsql dual UPDATE updated the hot tier"              "1" "$(extract PP_DUAL_HOT "$O")"
+    assert_eq "plpgsql dual UPDATE updated both tiers (hot+cold)"     "2" "$(extract PP_DUAL_TOTAL "$O")"
+    assert_eq "plpgsql cold INSERT (IDENTITY-omit slow path, jsonb var)" "1" "$(extract PP_INS "$O")"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -1035,6 +1113,7 @@ if [ "$MODE" = "tiered" ]; then
     story_reads
     story_types
     story_writes
+    story_writes_plpgsql
     story_mixed_concurrency
     story_ddl
     story_blocks
@@ -1048,6 +1127,7 @@ if [ "$MODE" = "tiered" ]; then
 else
     story_provision_decoupled
     story_decoupled_crud
+    story_decoupled_plpgsql
     story_decoupled_concurrency
     story_decoupled_ryw
 fi
