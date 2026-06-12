@@ -46,3 +46,9 @@ COMPARISON.md
 10000_FT_VIEW.md
 BACKLOG.md
 
+# Local secrets — NEVER commit. (One-off GHCR push token; revoke after use.)
+github_token_do_not_merge.txt
+*.token
+*-token.txt
+*_token*.txt
+
