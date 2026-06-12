@@ -151,17 +151,16 @@ WID=$(echo "$WH" | grep -oE '"warehouse-id":"[^"]+"' | head -1 | cut -d'"' -f4)
 
 if [ "$REGRESS" = 1 ]; then
     step "vanilla: pg_regress installcheck (unit layer)"
-    # The runtime image is lean (no make/pg_regress) — those would only bloat a
-    # deployment artifact. Run the unit layer from the BUILD stage (which has
-    # the toolchain + extension source) against the running db over the compose
-    # network. The fixtures set coldfront.warehouse/lakekeeper_endpoint to ''
-    # so ensure_attached() is a no-op and Lakekeeper isn't needed here.
-    # Every backend now runs on the DuckDB 1.5.x patched-iceberg image, so the
-    # regress harness (pg_regress + extension source) comes from the SAME
-    # Dockerfile.duckdb15 build stage the compose already built — its layers are
-    # cached, so this retags rather than recompiles.
-    BUILD_IMG="coldfront-build-duckdb15:pg${PG}"
-    docker build -f docker/Dockerfile.duckdb15 --build-arg PG_MAJOR="$PG" --target build -t "$BUILD_IMG" . >/dev/null 2>&1
+    # The runtime image is lean (no make/pg_regress). Run the unit layer from the
+    # app Dockerfile's cf-build stage — it has the PG devel toolchain, pg_regress,
+    # and the coldfront extension source at /build/coldfront, and builds in seconds
+    # FROM the pgEdge base. It needs NO pg_duckdb / no private base image: pg_regress
+    # only drives SQL against the RUNNING db (built from the app image, which already
+    # has pg_duckdb + coldfront) over the compose network. The fixtures set
+    # coldfront.warehouse/lakekeeper_endpoint to '' so ensure_attached() is a no-op
+    # and Lakekeeper isn't needed here.
+    BUILD_IMG="coldfront-regress:pg${PG}"
+    docker build -f docker/Dockerfile.duckdb15 --build-arg PG_MAJOR="$PG" --target cf-build -t "$BUILD_IMG" . >/dev/null 2>&1
     NET=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' "$DB")
     if docker run --rm --network "$NET" \
            -e PGHOST=db -e PGPORT=5432 -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" \
