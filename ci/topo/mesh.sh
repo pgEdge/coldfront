@@ -41,6 +41,13 @@ if [ "$BACKEND" = gcs ]; then
   : "${COLDFRONT_GCS_SECRET_KEY:?--backend gcs needs COLDFRONT_GCS_SECRET_KEY (HMAC)}"
   : "${COLDFRONT_GCS_BUCKET:?--backend gcs needs COLDFRONT_GCS_BUCKET}"
 fi
+# aws = REAL AWS S3 (native vhost+HTTPS, no endpoint); creds/bucket/region from env.
+if [ "$BACKEND" = aws ]; then
+  : "${COLDFRONT_AWS_ACCESS_KEY:?--backend aws needs COLDFRONT_AWS_ACCESS_KEY}"
+  : "${COLDFRONT_AWS_SECRET_KEY:?--backend aws needs COLDFRONT_AWS_SECRET_KEY}"
+  : "${COLDFRONT_AWS_BUCKET:?--backend aws needs COLDFRONT_AWS_BUCKET}"
+  : "${COLDFRONT_AWS_REGION:?--backend aws needs COLDFRONT_AWS_REGION}"
+fi
 
 cd "$ROOT"
 export PG_MAJOR="$PG"
@@ -66,7 +73,7 @@ done
 ip() { docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$1"; }
 DB1_IP=$(ip "$PRIMARY"); LK_IP=$(ip coldfront-lakekeeper-1)
 # SeaweedFS only exists in the s3 backend; azure's cold store is real ADLS.
-if [ "$BACKEND" = azure ]; then SW_IP=""; WAREHOUSE=wh-azure; elif [ "$BACKEND" = gcs ]; then SW_IP=""; WAREHOUSE=wh; else SW_IP=$(ip coldfront-seaweedfs-1); WAREHOUSE=wh; fi
+if [ "$BACKEND" = azure ]; then SW_IP=""; WAREHOUSE=wh-azure; elif [ "$BACKEND" = gcs ] || [ "$BACKEND" = aws ]; then SW_IP=""; WAREHOUSE=wh; else SW_IP=$(ip coldfront-seaweedfs-1); WAREHOUSE=wh; fi
 
 step "mesh: extensions on all nodes"
 # One CREATE EXTENSION per call with ON_ERROR_STOP, errors surfaced — never chain
@@ -144,6 +151,13 @@ elif [ "$BACKEND" = gcs ]; then
     \"storage-profile\":{\"type\":\"s3\",\"bucket\":\"${COLDFRONT_GCS_BUCKET}\",\"key-prefix\":\"coldfront-ci-gcs\",\"region\":\"us-east-1\",\"endpoint\":\"https://storage.googleapis.com\",\"path-style-access\":true,\"flavor\":\"s3-compat\",\"sts-enabled\":false,\"remote-signing-enabled\":false},
     \"storage-credential\":{\"type\":\"s3\",\"credential-type\":\"access-key\",\"aws-access-key-id\":\"${COLDFRONT_GCS_ACCESS_KEY}\",\"aws-secret-access-key\":\"${COLDFRONT_GCS_SECRET_KEY}\"}
   }"
+elif [ "$BACKEND" = aws ]; then
+  # REAL AWS S3: native s3 profile (no endpoint, path-style-access:false, flavor:aws).
+  WH_BODY="{
+    \"warehouse-name\":\"wh\",
+    \"storage-profile\":{\"type\":\"s3\",\"bucket\":\"${COLDFRONT_AWS_BUCKET}\",\"key-prefix\":\"coldfront-ci-aws\",\"region\":\"${COLDFRONT_AWS_REGION}\",\"path-style-access\":false,\"flavor\":\"aws\",\"sts-enabled\":false,\"remote-signing-enabled\":false},
+    \"storage-credential\":{\"type\":\"s3\",\"credential-type\":\"access-key\",\"aws-access-key-id\":\"${COLDFRONT_AWS_ACCESS_KEY}\",\"aws-secret-access-key\":\"${COLDFRONT_AWS_SECRET_KEY}\"}
+  }"
 else
   WH_BODY="{
     \"warehouse-name\":\"wh\",
@@ -182,6 +196,10 @@ for n in $NODES; do
         m "$n" "SELECT coldfront.set_storage_secret_azure('${COLDFRONT_AZURE_CONNECTION_STRING}');" >/dev/null 2>&1
     elif [ "$BACKEND" = gcs ]; then
         m "$n" "SELECT coldfront.set_storage_secret('${COLDFRONT_GCS_ACCESS_KEY}','${COLDFRONT_GCS_SECRET_KEY}','storage.googleapis.com','us-east-1','path',true);" >/dev/null 2>&1
+    elif [ "$BACKEND" = aws ]; then
+        # REAL AWS S3: NULL endpoint ⇒ DuckDB omits ENDPOINT/URL_STYLE/USE_SSL and
+        # uses AWS-native vhost+HTTPS (region carries the per-Region host).
+        m "$n" "SELECT coldfront.set_storage_secret('${COLDFRONT_AWS_ACCESS_KEY}','${COLDFRONT_AWS_SECRET_KEY}',NULL,'${COLDFRONT_AWS_REGION}');" >/dev/null 2>&1
     else
         m "$n" "SELECT coldfront.set_storage_secret('admin','adminsecret','${SW_IP}:8333');" >/dev/null 2>&1
     fi

@@ -1,0 +1,102 @@
+name: CI
+
+# ColdFront CI — runs the SAME harness as run-ci-local.sh (ci/matrix.sh); the
+# steps never diverge from local (per CLAUDE.md). Two jobs:
+#
+#   quick — every push + PR. ci/matrix.sh --quick = preflight (gofmt/vet/lint/
+#           unit tests/build) + ONE hermetic cell (PG18 · vanilla · tiered ·
+#           primary · s3) on SeaweedFS + the pg_regress unit layer. No cloud
+#           creds, no real cloud calls. This is the fast gate and is exactly
+#           what run-ci-local.sh runs.
+#
+#   full  — nightly + on-demand (workflow_dispatch). ci/matrix.sh --full across
+#           PG{16,17,18} (fanned over parallel runners via PG_ONLY) ×
+#           {vanilla,mesh} × {tiered,decoupled} × {primary,standby}.
+#
+# GATING POLICY (identical here and locally, enforced by ci/matrix.sh
+# backend_ready): the hermetic SeaweedFS-as-S3 backend ALWAYS runs — that is the
+# default coverage. The real cloud stores — real AWS S3 (aws), Azure ADLS
+# (azure), GCS (gcs) — run ONLY when their COLDFRONT_* credentials are present.
+# They are wired here from repo secrets; a secret that is not configured arrives
+# as an empty string, so backend_ready reports that backend PENDING and it never
+# runs. A fork PR (no secret access) therefore exercises SeaweedFS-only.
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: '0 3 * * *'   # nightly full matrix (UTC)
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quick:
+    name: quick (preflight + hermetic s3 cell)
+    if: github.event_name == 'push' || github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install golangci-lint
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
+            | sh -s -- -b "$(go env GOPATH)/bin"
+
+      # SeaweedFS-only: --quick never touches a cloud backend, so this job is
+      # given no cloud credentials by design.
+      - name: ci/matrix.sh --quick
+        run: ci/matrix.sh --quick
+
+  full:
+    name: full matrix (PG ${{ matrix.pg }})
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ['18', '17', '16']
+    env:
+      # Restrict the matrix drive loop to this runner's PG major (fan-out).
+      PG_ONLY: ${{ matrix.pg }}
+      # Cloud creds from repo secrets. Each is EMPTY when the secret is not
+      # configured ⇒ ci/matrix.sh backend_ready() marks that backend PENDING and
+      # it does not run. With all three sets absent, only SeaweedFS-as-S3 runs.
+      COLDFRONT_AWS_ACCESS_KEY: ${{ secrets.COLDFRONT_AWS_ACCESS_KEY }}
+      COLDFRONT_AWS_SECRET_KEY: ${{ secrets.COLDFRONT_AWS_SECRET_KEY }}
+      COLDFRONT_AWS_BUCKET: ${{ secrets.COLDFRONT_AWS_BUCKET }}
+      COLDFRONT_AWS_REGION: ${{ secrets.COLDFRONT_AWS_REGION }}
+      COLDFRONT_AZURE_ACCOUNT: ${{ secrets.COLDFRONT_AZURE_ACCOUNT }}
+      COLDFRONT_AZURE_FILESYSTEM: ${{ secrets.COLDFRONT_AZURE_FILESYSTEM }}
+      COLDFRONT_AZURE_KEY: ${{ secrets.COLDFRONT_AZURE_KEY }}
+      COLDFRONT_AZURE_CONNECTION_STRING: ${{ secrets.COLDFRONT_AZURE_CONNECTION_STRING }}
+      COLDFRONT_GCS_ACCESS_KEY: ${{ secrets.COLDFRONT_GCS_ACCESS_KEY }}
+      COLDFRONT_GCS_SECRET_KEY: ${{ secrets.COLDFRONT_GCS_SECRET_KEY }}
+      COLDFRONT_GCS_BUCKET: ${{ secrets.COLDFRONT_GCS_BUCKET }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+
+      - name: Set up Go
+        uses: actions/setup-go@40f1582b2485089dde7abd97c1529aa768e1baff # v5
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install golangci-lint
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
+            | sh -s -- -b "$(go env GOPATH)/bin"
+
+      - name: ci/matrix.sh --full
+        run: ci/matrix.sh --full

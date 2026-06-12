@@ -501,15 +501,34 @@ up each topology. All cells share one parameterized image
 
 **Pre-commit gate** — `./run-ci-local.sh` runs `ci/matrix.sh --quick`: gofmt,
 golangci-lint, unit tests, build, the pg_regress unit layer, and the full
-journey on one representative cell (PG18 · vanilla · tiered). Fast; runs on
-every commit. GitHub Actions must run the identical `ci/matrix.sh` steps.
+journey on one representative cell (PG18 · vanilla · tiered · s3). Fast; runs on
+every commit. GitHub Actions ([.github/workflows/ci.yml](.github/workflows/ci.yml))
+runs the identical `ci/matrix.sh` harness — `--quick` on every push/PR, `--full`
+nightly and on demand — so local and CI never diverge.
 
 **Full matrix** — `ci/matrix.sh --full`, the beta gate: PG {16, 17, 18} ×
-{vanilla, mesh (3-node Spock)} × {tiered, decoupled}. The mesh cells add the
-cross-node stories — hot visibility via Spock, cold visibility via the shared
-Lakekeeper catalog, the R-A bakery serialising concurrent cold writers
-(same-node and cross-node) with no 409, and an N×(N-1) probe that the bakery's
-`coldfront.claims` table replicates in every direction.
+{vanilla, mesh (3-node Spock)} × {tiered, decoupled} × {primary, standby} ×
+{s3, aws, azure, gcs}. The mesh cells add the cross-node stories — hot
+visibility via Spock, cold visibility via the shared Lakekeeper catalog, the R-A
+bakery serialising concurrent cold writers (same-node and cross-node) with no
+409, and an N×(N-1) probe that the bakery's `coldfront.claims` table replicates
+in every direction.
+
+**Storage-backend gating** — the same policy applies locally and in GitHub CI:
+the hermetic **SeaweedFS-as-S3** backend (`s3`) always runs — that is the
+default coverage with no credentials. The real cloud stores run **only when
+their credentials are present in the environment**, else they are reported
+`PENDING` and never invoked (no real cloud calls without explicit creds):
+
+| Backend | Store | Gating env vars |
+|---|---|---|
+| `s3`    | SeaweedFS (in-compose, hermetic) | — always runs |
+| `aws`   | real AWS S3 (native vhost+HTTPS) | `COLDFRONT_AWS_ACCESS_KEY`, `_SECRET_KEY`, `_BUCKET`, `_REGION` |
+| `azure` | real Azure ADLS Gen2             | `COLDFRONT_AZURE_ACCOUNT`, `_FILESYSTEM`, `_KEY`, `_CONNECTION_STRING` |
+| `gcs`   | real GCS via S3-interop (HMAC)   | `COLDFRONT_GCS_ACCESS_KEY`, `_SECRET_KEY`, `_BUCKET` |
+
+In GitHub Actions these come from repo secrets; an unset secret arrives empty, so
+that backend stays `PENDING`. Fork PRs (no secret access) run SeaweedFS-only.
 
 ## Caveats
 

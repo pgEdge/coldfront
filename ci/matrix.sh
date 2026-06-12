@@ -135,11 +135,16 @@ mcell() {
     "$SCRIPT_DIR/topo/mesh.sh" "${a[@]}"
 }
 
-# backend_ready <backend>  — s3 is hermetic (SeaweedFS), always RUN. azure/gcs run
-# against real cloud stores and are gated on their creds being present in env.
+# backend_ready <backend>  — THE gating policy (identical here and in GitHub CI):
+# s3 is hermetic (SeaweedFS in-compose), so it ALWAYS runs — that is the default
+# coverage when no cloud creds are present. The real cloud stores — real AWS S3
+# (aws), Azure ADLS (azure), and GCS (gcs) — run ONLY when their credential env
+# vars are present; absent, they are reported PENDING and never run (no real
+# cloud calls without explicit creds).
 backend_ready() {
     case "$1" in
         s3)    return 0;;
+        aws)   [ -n "${COLDFRONT_AWS_ACCESS_KEY:-}" ];;
         azure) [ -n "${COLDFRONT_AZURE_CONNECTION_STRING:-}" ];;
         gcs)   [ -n "${COLDFRONT_GCS_ACCESS_KEY:-}" ];;
         *)     return 1;;
@@ -149,14 +154,15 @@ backend_ready() {
 # coverage_table  — print every matrix cell with RUN / PENDING(reason). No cell is
 # ever silently omitted; PENDING states what creds would flip it to RUN. The full
 # grid is PG{16,17,18} × {vanilla,mesh} × {tiered,decoupled} × {primary,standby} ×
-# {s3,azure,gcs} = 72 cells, every one on the DuckDB 1.5.x patched-iceberg image.
+# {s3,aws,azure,gcs} = 96 cells, every one on the DuckDB 1.5.x patched-iceberg image.
 coverage_table() {
-    step "MATRIX COVERAGE (full grid = 72 cells, all on DuckDB 1.5.x)"
+    step "MATRIX COVERAGE (full grid = 96 cells, all on DuckDB 1.5.x)"
     local pg topo mode tgt be st
     for pg in 18 17 16; do
-      for be in s3 azure gcs; do
+      for be in s3 aws azure gcs; do
         if backend_ready "$be"; then st="RUN"; else
           case "$be" in
+            aws)   st="PENDING (needs COLDFRONT_AWS_* creds)";;
             azure) st="PENDING (needs COLDFRONT_AZURE_* creds)";;
             gcs)   st="PENDING (needs COLDFRONT_GCS_* creds)";;
             *)     st="PENDING";;
@@ -182,17 +188,21 @@ case "$SCOPE" in
     ;;
   full)
     # The whole grid: PG{16,17,18} × {vanilla,mesh} × {tiered,decoupled} ×
-    # {primary,standby} × {s3,azure,gcs} = 72 cells, every one on the DuckDB 1.5.x
-    # patched-iceberg image. PG18 → 17 → 16 (reference major first); the journey is
-    # version-agnostic and the persistent-secret attach path is identical. s3 is
-    # hermetic (always RUN); azure/gcs are creds-gated — absent creds report the
-    # backend PENDING (never silently skipped). pg_regress (the unit layer) runs
-    # once per major on s3·vanilla·tiered·primary.
-    for pg in 18 17 16; do
+    # {primary,standby} × {s3,aws,azure,gcs} = 96 cells, every one on the DuckDB
+    # 1.5.x patched-iceberg image. PG18 → 17 → 16 (reference major first); the
+    # journey is version-agnostic and the persistent-secret attach path is identical.
+    # s3 (SeaweedFS) is hermetic and ALWAYS runs — the default coverage. The real
+    # cloud stores aws/azure/gcs are creds-gated: absent their COLDFRONT_* creds
+    # they report PENDING and never run (never silently skipped). pg_regress (the
+    # unit layer) runs once per major on s3·vanilla·tiered·primary.
+    # PG_ONLY restricts the drive loop to a subset of majors (e.g. PG_ONLY="18")
+    # so GitHub CI can fan the majors across parallel runners; default = all three.
+    for pg in ${PG_ONLY:-18 17 16}; do
       # azure cells consume a prebuilt image; build it once per major (cheap after
-      # the regular composes' inline 1.5 build — shared layers).
+      # the regular composes' inline 1.5 build — shared layers). aws/gcs reuse the
+      # inline-build composes (real cloud store, no local container), like s3.
       backend_ready azure && { prebuild_duckdb15 "$pg" || CELL_FAIL=$((CELL_FAIL + 1)); }
-      for be in s3 azure gcs; do
+      for be in s3 aws azure gcs; do
         if ! backend_ready "$be"; then
           step "BACKEND $be (pg${pg}) — PENDING (creds absent; set its COLDFRONT_* env to RUN)"
           continue
@@ -208,7 +218,7 @@ case "$SCOPE" in
       done
     done
     coverage_table
-    echo -e "\n  NOTE: s3 is hermetic and always RUN; azure/gcs RUN when their creds are present, else PENDING (tracked, never skipped silently)."
+    echo -e "\n  NOTE: s3 (SeaweedFS) is hermetic and always RUN; the real cloud stores aws/azure/gcs RUN only when their COLDFRONT_* creds are present, else PENDING (tracked, never skipped silently)."
     ;;
 esac
 

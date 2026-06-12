@@ -48,6 +48,16 @@ if [ "$BACKEND" = gcs ]; then
   : "${COLDFRONT_GCS_SECRET_KEY:?--backend gcs needs COLDFRONT_GCS_SECRET_KEY (HMAC)}"
   : "${COLDFRONT_GCS_BUCKET:?--backend gcs needs COLDFRONT_GCS_BUCKET}"
 fi
+# aws is REAL AWS S3 (no local store): a Lakekeeper s3 profile with NO endpoint,
+# path-style-access:false, flavor:aws — so DuckDB and Lakekeeper both use AWS's
+# native per-Region virtual-hosted + HTTPS addressing (required for Regions
+# launched after 2019-03-20). Creds + bucket + region from env (never committed).
+if [ "$BACKEND" = aws ]; then
+  : "${COLDFRONT_AWS_ACCESS_KEY:?--backend aws needs COLDFRONT_AWS_ACCESS_KEY}"
+  : "${COLDFRONT_AWS_SECRET_KEY:?--backend aws needs COLDFRONT_AWS_SECRET_KEY}"
+  : "${COLDFRONT_AWS_BUCKET:?--backend aws needs COLDFRONT_AWS_BUCKET}"
+  : "${COLDFRONT_AWS_REGION:?--backend aws needs COLDFRONT_AWS_REGION}"
+fi
 
 cd "$ROOT"
 export PG_MAJOR="$PG"           # consumed by docker-compose.matrix.yml build arg + entrypoint
@@ -75,6 +85,7 @@ DB_IP=$(ip "$DB"); LK_IP=$(ip coldfront-lakekeeper-1)
 case "$BACKEND" in
   azure) SW_IP=""; WAREHOUSE=wh-azure;;
   gcs)   SW_IP=""; WAREHOUSE=wh;;
+  aws)   SW_IP=""; WAREHOUSE=wh;;
   *)     SW_IP=$(ip coldfront-seaweedfs-1); WAREHOUSE=wh;;
 esac
 
@@ -97,6 +108,15 @@ elif [ "$BACKEND" = gcs ]; then
     \"warehouse-name\":\"wh\",
     \"storage-profile\":{\"type\":\"s3\",\"bucket\":\"${COLDFRONT_GCS_BUCKET}\",\"key-prefix\":\"coldfront-ci-gcs\",\"region\":\"us-east-1\",\"endpoint\":\"https://storage.googleapis.com\",\"path-style-access\":true,\"flavor\":\"s3-compat\",\"sts-enabled\":false,\"remote-signing-enabled\":false},
     \"storage-credential\":{\"type\":\"s3\",\"credential-type\":\"access-key\",\"aws-access-key-id\":\"${COLDFRONT_GCS_ACCESS_KEY}\",\"aws-secret-access-key\":\"${COLDFRONT_GCS_SECRET_KEY}\"}
+  }"
+elif [ "$BACKEND" = aws ]; then
+  # REAL AWS S3: native s3 profile — NO endpoint, path-style-access:false,
+  # flavor:aws ⇒ AWS per-Region virtual-hosted + HTTPS (the addressing post-2019
+  # Regions require). Bucket/Region/creds from COLDFRONT_AWS_*. Named "wh".
+  WH_BODY="{
+    \"warehouse-name\":\"wh\",
+    \"storage-profile\":{\"type\":\"s3\",\"bucket\":\"${COLDFRONT_AWS_BUCKET}\",\"key-prefix\":\"coldfront-ci-aws\",\"region\":\"${COLDFRONT_AWS_REGION}\",\"path-style-access\":false,\"flavor\":\"aws\",\"sts-enabled\":false,\"remote-signing-enabled\":false},
+    \"storage-credential\":{\"type\":\"s3\",\"credential-type\":\"access-key\",\"aws-access-key-id\":\"${COLDFRONT_AWS_ACCESS_KEY}\",\"aws-secret-access-key\":\"${COLDFRONT_AWS_SECRET_KEY}\"}
   }"
 else
   WH_BODY="{

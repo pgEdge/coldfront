@@ -33,6 +33,11 @@ AZURE_CONN="${COLDFRONT_AZURE_CONNECTION_STRING:-}"
 # config block, just with the GCS endpoint + use_ssl.
 GCS_KEY="${COLDFRONT_GCS_ACCESS_KEY:-}"
 GCS_SECRET="${COLDFRONT_GCS_SECRET_KEY:-}"
+# aws = REAL AWS S3 — the same s3 path with NO endpoint (DuckDB uses AWS-native
+# vhost+HTTPS) and the bucket's real Region. Creds/Region from env (never committed).
+AWS_KEY="${COLDFRONT_AWS_ACCESS_KEY:-}"
+AWS_SECRET="${COLDFRONT_AWS_SECRET_KEY:-}"
+AWS_REGION="${COLDFRONT_AWS_REGION:-}"
 ARCHIVER="${ARCHIVER:-./bin/archiver}"
 while [ $# -gt 0 ]; do case "$1" in
   --host) HOST="$2"; shift 2;;
@@ -52,6 +57,7 @@ esac; done
 [ -n "$HOST" ] || { echo "journey.sh: --host required"; exit 2; }
 [ "$BACKEND" = azure ] && [ -z "$AZURE_CONN" ] && { echo "journey.sh: --backend azure needs --azure-conn / COLDFRONT_AZURE_CONNECTION_STRING"; exit 2; }
 [ "$BACKEND" = gcs ] && { [ -z "$GCS_KEY" ] || [ -z "$GCS_SECRET" ]; } && { echo "journey.sh: --backend gcs needs COLDFRONT_GCS_ACCESS_KEY + COLDFRONT_GCS_SECRET_KEY (HMAC)"; exit 2; }
+[ "$BACKEND" = aws ] && { [ -z "$AWS_KEY" ] || [ -z "$AWS_SECRET" ] || [ -z "$AWS_REGION" ]; } && { echo "journey.sh: --backend aws needs COLDFRONT_AWS_ACCESS_KEY + COLDFRONT_AWS_SECRET_KEY + COLDFRONT_AWS_REGION"; exit 2; }
 
 # storage_secret_sql — the SQL that sets the cold-store credential, per backend.
 storage_secret_sql() {
@@ -60,6 +66,10 @@ storage_secret_sql() {
     elif [ "$BACKEND" = gcs ]; then
         # GCS via S3-interop: same s3 setter, GCS endpoint + HMAC + TLS.
         printf "SELECT coldfront.set_storage_secret('%s','%s','storage.googleapis.com','us-east-1','path',true);" "$GCS_KEY" "$GCS_SECRET"
+    elif [ "$BACKEND" = aws ]; then
+        # REAL AWS S3: NULL endpoint ⇒ omit ENDPOINT/URL_STYLE/USE_SSL, AWS-native
+        # vhost+HTTPS. Region is the bucket's real Region (drives the per-Region host).
+        printf "SELECT coldfront.set_storage_secret('%s','%s',NULL,'%s');" "$AWS_KEY" "$AWS_SECRET" "$AWS_REGION"
     else
         printf "SELECT coldfront.set_storage_secret('admin','adminsecret','%s:8333');" "$SW_IP"
     fi
@@ -72,6 +82,10 @@ storage_yaml() {
     elif [ "$BACKEND" = gcs ]; then
         # GCS = the s3 block pointed at the interop endpoint over TLS, HMAC creds.
         printf 's3:\n  endpoint: "storage.googleapis.com"\n  region: "us-east-1"\n  access_key: "%s"\n  secret_key: "%s"\n  use_ssl: true' "$GCS_KEY" "$GCS_SECRET"
+    elif [ "$BACKEND" = aws ]; then
+        # REAL AWS S3 = the s3 block with NO endpoint ⇒ archiver uses AWS-native
+        # vhost+HTTPS (region = the bucket's real Region).
+        printf 's3:\n  region: "%s"\n  access_key: "%s"\n  secret_key: "%s"' "$AWS_REGION" "$AWS_KEY" "$AWS_SECRET"
     else
         printf 's3:\n  endpoint: "%s:8333"\n  region: "us-east-1"\n  access_key: "admin"\n  secret_key: "adminsecret"' "$SW_IP"
     fi
