@@ -2,8 +2,8 @@
 
 > **Most users should install from packages** — see
 > [Installation](README.md#installation) in the README. This document is the
-> **build-from-source** path: for contributors, for building the patched stack
-> yourself, and as the interim route until the Beta-GA packages are published.
+> **build-from-source** workflow: build the patched DuckDB-1.5.x stack yourself,
+> in Docker or bare-metal.
 
 ColdFront runs on a **DuckDB 1.5.x** stack: PostgreSQL + pg_duckdb (DuckDB 1.5.3)
 and a **patched** duckdb-iceberg that carries ColdFront's bakery-aware
@@ -24,8 +24,9 @@ applies our patch, and compiles:
 | **bakery-aware commit-refresh patch** | `docker/iceberg-bakery-aware-commit-refresh-v15.patch` **(in this repo)** | ships in-repo |
 
 The build `git apply --check`s the patch first, so it fails loudly on patch rot
-rather than silently shipping stock iceberg (which 409s under concurrency). Patch
-+ build internals: [PATCHED.md](PATCHED.md) and [DUCKDB_1.5.md](DUCKDB_1.5.md).
+rather than silently shipping stock iceberg (which 409s under concurrency). The
+canonical recipe — every source pin and compile step — is
+[`docker/Dockerfile.duckdb15-base`](docker/Dockerfile.duckdb15-base) itself.
 
 ## Build the image (Docker)
 
@@ -40,16 +41,17 @@ docker build -f docker/Dockerfile.duckdb15-base --build-arg PG_MAJOR=18 \
 
 # 2. Build the thin coldfront app layer + bring up the stack (seconds — it only
 #    compiles the coldfront extension on top of the base).
-docker compose -f docker-compose.matrix.yml up -d --build      # single node
-# or: docker compose -f docker-compose.mesh.yml up -d --build   # 3-node Spock mesh
+docker compose up -d --build      # end-user single-node stack (ports published)
+# (CI uses docker-compose.matrix.yml / docker-compose.mesh.yml — NOT for end-user setup)
 ```
 
 Then follow the README [Infrastructure](README.md#infrastructure) setup
 (bootstrap Lakekeeper → create a table → tier → verify).
 
-> **GA caveat — pin pg_duckdb.** The base pins pg_duckdb to `pull/1025/head` (a
-> moving, unreleased PR ref). For reproducible/GA builds, pin it to a specific
-> commit SHA (or the eventual DuckDB-1.5.x release) instead of the live PR head.
+> **Pin pg_duckdb for reproducible builds.** The base pins pg_duckdb to
+> `pull/1025/head` (a moving, unreleased PR ref). For reproducible builds, pin it
+> to a specific commit SHA (or the eventual DuckDB-1.5.x release) instead of the
+> live PR head.
 >
 > **Base foundation.** The base is `FROM ghcr.io/pgedge/pgedge-postgres:<pg>-spock5-minimal`;
 > you need pull access to that image (or substitute an equivalent PostgreSQL base
@@ -73,8 +75,8 @@ make && make install        # needs pg_config + PG server dev headers on PATH
 ```
 
 You separately need pg_duckdb (DuckDB 1.5.3) and the **patched** iceberg DuckDB
-extension installed in your PostgreSQL — build them per
-[DUCKDB_1.5.md](DUCKDB_1.5.md) / [PATCHED.md](PATCHED.md) — plus, in
+extension installed in your PostgreSQL — follow the compile steps in
+[`docker/Dockerfile.duckdb15-base`](docker/Dockerfile.duckdb15-base) — plus, in
 `postgresql.conf`:
 
 ```

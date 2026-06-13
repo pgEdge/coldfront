@@ -76,23 +76,27 @@ Application
 
 ## Installation
 
-> ### 📦 Packages — coming at Beta GA
+> ### 📦 Packages — coming with the Beta release
 >
-> At Beta general availability, ColdFront installs from **pgEdge package
+> With the Beta release, ColdFront installs from **pgEdge package
 > repositories**: the PostgreSQL `coldfront` extension (with its pg_duckdb +
 > patched-iceberg dependencies) and the `archiver` binary, via your platform's
 > package manager. This section will carry the exact repo setup + install
 > commands once the packages are published.
 >
-> <!-- STUB — fill in at Beta GA once packages are published:
+> <!-- STUB — fill in once the Beta packages are published:
 >   RHEL / Rocky:      dnf install coldfront           (package names + repo TBD)
 >   Debian / Ubuntu:   apt install coldfront
->   Container image:   docker pull ghcr.io/pgedge/coldfront:<pg>   (public GA image TBD)
+>   Container image:   docker pull ghcr.io/pgedge/coldfront:<pg>   (public image TBD)
 > -->
 
-**Until the packages land**, build from source: see **[INSTALL.md](INSTALL.md)**
-(build the DuckDB-1.5.x base + the coldfront layer with one `docker build`, or
-install bare-metal). Then continue with the Quickstart below.
+**Build from source** — the full build workflow lives in
+**[INSTALL.md](INSTALL.md)**: build the DuckDB-1.5.x base + the coldfront layer
+with one `docker build`, or install bare-metal. Then continue with the
+Quickstart below.
+
+**On AWS S3?** Once the image is built, the **[AWS S3 walkthrough](AWS_S3.md)**
+takes you from an empty bucket to a working cold tier end-to-end.
 
 ## Quickstart
 
@@ -338,7 +342,7 @@ Configure **exactly one** cold-store backend:
   read+write over interop). Lakekeeper's native `gcs` profile is service-account
   only and is **not** used.
 - **Azure ADLS Gen2** (`azure:`) — requires the DuckDB 1.5.x build (see
-  `DUCKDB_1.5.md`); the access key rides inside `connection_string`.
+  [INSTALL.md](INSTALL.md)); the access key rides inside `connection_string`.
 
 **Per-table lifecycle — `coldfront.partition_config`.** Which tables are managed
 and their lifecycle live in a name-keyed table that replicates by value across a
@@ -407,8 +411,9 @@ object store (SeaweedFS, MinIO, AWS S3, GCS, etc.).
 
 ```bash
 # Build the image first (DuckDB 1.5.x stack) — see INSTALL.md — then start the
-# stack (example uses SeaweedFS):
-docker compose -f docker-compose.matrix.yml up -d --build
+# end-user stack (example uses SeaweedFS; host ports are published so the
+# localhost commands below work directly):
+docker compose up -d --build
 ```
 
 ### One-time setup
@@ -451,9 +456,10 @@ curl -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
 ### Database setup
 
 ```sql
--- Install pg_duckdb extension
+-- Install the extensions. coldfront is preloaded by the image but must still be
+-- created in your database (otherwise: schema "coldfront" does not exist).
 CREATE EXTENSION IF NOT EXISTS pg_duckdb;
-SELECT duckdb.install_extension('iceberg');
+CREATE EXTENSION IF NOT EXISTS coldfront;
 
 -- Cold-tier S3 credentials, set once per database. Stored in the
 -- coldfront.storage_secret table (replicates across a Spock mesh,
@@ -512,7 +518,7 @@ SELECT coldfront.set_storage_secret_azure(
 
 It writes the same `coldfront.storage_secret` row (replicated, `pg_dump`-excluded)
 and materializes a `TYPE azure` PERSISTENT SECRET. The Azure cold tier requires
-the DuckDB 1.5.x build (see [DUCKDB_1.5.md](DUCKDB_1.5.md)) and is subject to the
+the DuckDB 1.5.x build (see [INSTALL.md](INSTALL.md)) and is subject to the
 soft-delete / change-feed restriction in [Caveats](#caveats).
 
 One canonical user journey ([ci/journey.sh](ci/journey.sh)) runs identically in
@@ -662,8 +668,9 @@ pgedge-coldfront/
 │   ├── Dockerfile.duckdb15-base ← DuckDB 1.5.x base (pg_duckdb 1.5.3 + patched iceberg) — PRIVATE
 │   ├── entrypoint.sh
 │   └── seaweedfs-s3.json       ← SeaweedFS S3 auth config (example)
-├── docker-compose.matrix.yml   ← single-node stack: PG + Lakekeeper + SeaweedFS
-├── docker-compose.mesh.yml     ← 3 PG + Spock + Lakekeeper + SeaweedFS
+├── docker-compose.yml          ← END-USER single-node stack (ports published)
+├── docker-compose.matrix.yml   ← CI only: single-node vanilla matrix
+├── docker-compose.mesh.yml     ← CI only: 3-node Spock mesh
 ├── run-ci-local.sh             ← pre-commit gate (ci/matrix.sh --quick)
 ├── config.example.yaml
 ├── Makefile
