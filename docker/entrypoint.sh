@@ -22,6 +22,11 @@ MESH="${MESH:-off}"
 WAREHOUSE="${COLDFRONT_WAREHOUSE:-wh}"
 LAKEKEEPER="${COLDFRONT_LAKEKEEPER:-http://lakekeeper:8181/catalog}"
 SNOWFLAKE_NODE="${COLDFRONT_SNOWFLAKE_NODE:-1}"
+# Role that pg_duckdb gates DuckDB execution on (duckdb.postgres_role). Defaulting
+# it (and creating the NOLOGIN role) makes non-superuser cold access turnkey: an
+# operator just runs SELECT coldfront.grant_app_access('alice'). Set
+# COLDFRONT_DUCKDB_ROLE='' to keep pg_duckdb's stock superuser-only behaviour.
+DUCKDB_ROLE="${COLDFRONT_DUCKDB_ROLE-coldfront_duckdb}"
 
 if [ ! -f "$PGDATA/PG_VERSION" ] && [ -n "${COLDFRONT_STANDBY_OF:-}" ]; then
     # ── Physical standby: base-backup the primary instead of initdb. ──
@@ -79,6 +84,14 @@ coldfront.lakekeeper_endpoint = '${LAKEKEEPER}'
 coldfront.local_pg_dsn = 'host=/var/run/postgresql dbname=coldfront user=coldfront application_name=coldfront_pglocal'
 EOF
 
+    # pg_duckdb gates DuckDB execution on membership of duckdb.postgres_role
+    # (PGC_POSTMASTER). Setting it here (role created below) lets members run
+    # DuckDB; superusers always can. Omitted when COLDFRONT_DUCKDB_ROLE='' so
+    # pg_duckdb keeps its stock superuser-only default.
+    if [ -n "$DUCKDB_ROLE" ]; then
+        echo "duckdb.postgres_role = '${DUCKDB_ROLE}'" >> "$PGDATA/postgresql.conf"
+    fi
+
     if [ "$MESH" = "on" ]; then
         cat >> "$PGDATA/postgresql.conf" <<EOF
 wal_level = logical
@@ -130,6 +143,10 @@ EOF
 
     "$PGBIN/pg_ctl" -D "$PGDATA" -o "-c listen_addresses=''" -w start
     "$PGBIN/psql" -U coldfront -d postgres -c "CREATE DATABASE coldfront OWNER coldfront"
+    # NOLOGIN group role pg_duckdb gates DuckDB on. Members (granted via
+    # coldfront.grant_app_access) run the cold path as non-superusers.
+    [ -n "$DUCKDB_ROLE" ] && "$PGBIN/psql" -U coldfront -d postgres \
+        -c "CREATE ROLE \"${DUCKDB_ROLE}\" NOLOGIN" 2>/dev/null || true
     "$PGBIN/pg_ctl" -D "$PGDATA" -m fast -w stop
 fi
 

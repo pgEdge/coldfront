@@ -9,11 +9,17 @@
 #      query (coldfront.ensure_attached), so a catalog outage degrades only cold
 #      I/O — it never blocks connecting or reading hot data.
 #   2. S3-down: the object store is unreachable → same graceful-degradation bar.
+#   3. Privilege model: a NON-superuser app role, onboarded in one call
+#      (coldfront.grant_app_access), does transparent cold read+write — with no
+#      superuser, no server-file roles — and the boundary holds (it cannot
+#      redirect the elevated ATTACH endpoint, cannot self-grant, and an
+#      un-onboarded role is cleanly denied). Turnkey because the image defaults
+#      duckdb.postgres_role + creates the role (entrypoint).
 #
-# Both also assert RECOVERY: once the dependency returns, a fresh session
+# Checks 1 & 2 also assert RECOVERY: once the dependency returns, a fresh session
 # re-attaches and cold I/O works again.
 #
-# (Privilege model + pg_dump/restore checks are added in follow-up increments.)
+# (pg_dump/restore check is added in a follow-up increment.)
 #
 # Usage: ci/ops.sh [--pg 16|17|18] [--keep]
 set -uo pipefail
@@ -89,15 +95,54 @@ docker start "$LK" >/dev/null 2>&1
 cold_recovers "cold read recovers after Lakekeeper returns"
 
 # ── Check 2: S3-down ──────────────────────────────────────────────────────────
+# We PAUSE (SIGSTOP) SeaweedFS rather than stop it: a transient S3 outage is
+# modelled by the endpoint going unreachable, not by killing the store. (An
+# abrupt `docker stop` SIGKILLs SeaweedFS, which loses its volume registration —
+# a SeaweedFS durability property, not a ColdFront one — so reads would never
+# recover. pause/unpause has no such confound and is the faithful outage model.)
+# Paused = connections hang → statement_timeout='25s' turns it into a clean ERROR.
 step "ops 2: S3-down — cold I/O fails cleanly; node + hot tier survive"
-docker stop "$SW" >/dev/null 2>&1
+docker pause "$SW" >/dev/null 2>&1
 assert_eq "node still accepts connections (S3 down)" "1" "$(q "$DB" "SELECT 1;" 2>/dev/null)"
 assert_eq "hot read unaffected (S3 down)"            "1" "$(q "$DB" "SELECT count(*) FROM hot1;" 2>/dev/null)"
 s3_cold=$(q_may "$DB" "SET statement_timeout='25s'; SELECT count(*) FROM cold1;")
 assert_contains "cold read fails with a clean error, no hang (S3 down)"  "ERROR" "$s3_cold"
 s3_write=$(q_may "$DB" "SET statement_timeout='25s'; INSERT INTO cold1 VALUES (2);")
 assert_contains "cold write fails with a clean error, no hang (S3 down)" "ERROR" "$s3_write"
-docker start "$SW" >/dev/null 2>&1
+docker unpause "$SW" >/dev/null 2>&1
 cold_recovers "cold read recovers after S3 returns"
+
+# ── Check 3: enterprise privilege model — non-superuser cold I/O, one-call onboard ──
+step "ops 3: privilege model — grant_app_access onboards a NON-superuser; boundary holds"
+# qas <role> <sql>  — run <sql> as a NON-superuser via SET ROLE and return only the
+# final result line (psql echoes the "SET" command tag, which we drop).
+qas() { q "$DB" "SET ROLE $1; $2" 2>/dev/null | tail -1; }
+# Turnkey: the image defaults duckdb.postgres_role + creates the NOLOGIN role.
+assert_eq  "image defaults duckdb.postgres_role (turnkey)" "coldfront_duckdb" "$(q "$DB" "SHOW duckdb.postgres_role;")"
+q "$DB" "CREATE ROLE cfapp NOSUPERUSER LOGIN PASSWORD 'x';"    >/dev/null 2>&1
+q "$DB" "CREATE ROLE cfnobody NOSUPERUSER LOGIN PASSWORD 'x';" >/dev/null 2>&1
+# ONE call onboards the app role (idempotent; derives schemas/views from the registry).
+onboard=$(q_may "$DB" "SELECT coldfront.grant_app_access('cfapp');")
+assert_eq "grant_app_access('cfapp') succeeds — one-call onboarding" "" "$(echo "$onboard" | grep -iE 'error' || true)"
+
+# The app role is a plain NON-superuser with NO server-file roles.
+assert_eq "app role is NOT a superuser"          "off" "$(qas cfapp "SELECT current_setting('is_superuser');")"
+assert_eq "app role lacks pg_read_server_files"  "f"   "$(q "$DB" "SELECT pg_has_role('cfapp','pg_read_server_files','MEMBER');")"
+assert_eq "app role lacks pg_write_server_files" "f"   "$(q "$DB" "SELECT pg_has_role('cfapp','pg_write_server_files','MEMBER');")"
+
+# Transparent cold I/O works as the non-superuser: read + single + multi-row INSERT.
+assert_gt "app role: transparent cold read" "0" "$(qas cfapp "SELECT count(*) FROM public.cold1;")"
+q "$DB" "SET ROLE cfapp; INSERT INTO public.cold1 VALUES (101);"          >/dev/null 2>&1
+q "$DB" "SET ROLE cfapp; INSERT INTO public.cold1 VALUES (102),(103);"    >/dev/null 2>&1
+assert_eq "app role: transparent cold writes landed (read-your-write)" "3" \
+    "$(qas cfapp "SELECT count(*) FROM public.cold1 WHERE id IN (101,102,103);")"
+
+# The boundary holds — three negatives:
+deny_set=$(q_may "$DB" "SET ROLE cfapp; SET coldfront.lakekeeper_endpoint='http://attacker.example/evil';")
+assert_contains "app role CANNOT redirect the elevated ATTACH endpoint (SUSET GUC)" "permission denied" "$deny_set"
+deny_self=$(q_may "$DB" "SET ROLE cfapp; SELECT coldfront.grant_app_access('cfapp');")
+assert_contains "app role CANNOT self-grant (grant_app_access not PUBLIC-executable)" "permission denied" "$deny_self"
+deny_bare=$(q_may "$DB" "SET ROLE cfnobody; SELECT count(*) FROM public.cold1;")
+assert_contains "un-onboarded role is cleanly DENIED cold access" "ERROR" "$deny_bare"
 
 summary

@@ -186,7 +186,16 @@ BEGIN
     PERFORM duckdb.raw_query($q$SET GLOBAL httpfs_client_implementation = 'httplib'$q$);
   END IF;
 END;
-$$ LANGUAGE plpgsql;
+-- SECURITY DEFINER: this must run elevated. pg_duckdb force-disables DuckDB's
+-- LocalFileSystem for non-superusers, which blocks the side-loaded iceberg
+-- extension's load-on-ATTACH. Running as the (superuser) extension owner loads
+-- iceberg + ATTACHes 'ice' while the FS is enabled; the per-backend DuckDB
+-- instance keeps it loaded, so the outer scan/commit then runs as the
+-- (non-superuser) app role over S3/httpfs — no server-file roles needed. Inputs
+-- are operator-trusted: warehouse/lakekeeper_endpoint are PGC_SUSET (a
+-- non-superuser cannot redirect this ATTACH). search_path pinned per SECURITY
+-- DEFINER hardening; the body references only pg_catalog + schema-qualified duckdb.
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog;
 
 -- ensure_pg_attached() loads DuckDB's `postgres` extension and ATTACHes the
 -- *local* PG instance as `pglocal`, so DuckDB-side SQL inside `raw_query` can
@@ -222,7 +231,110 @@ BEGIN
     ));
   END IF;
 END;
-$$ LANGUAGE plpgsql;
+-- SECURITY DEFINER for the same reason as ensure_attached(): LOAD postgres reads
+-- the locally-installed extension file, which the non-superuser LocalFileSystem
+-- block forbids. Elevated load + ATTACH lets a non-superuser's streaming
+-- INSERT…SELECT (pglocal) write path work without server-file roles. local_pg_dsn
+-- is PGC_SUSET + GUC_SUPERUSER_ONLY, so the DSN cannot be set or read by a
+-- non-superuser. search_path pinned per SECURITY DEFINER hardening.
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog;
+
+-- grant_app_access(target_role) — ONE-CALL onboarding for a NON-superuser app
+-- role. Grants exactly the minimal privileges the transparent cold path needs
+-- and nothing more: duckdb.postgres_role membership (DuckDB execution), USAGE on
+-- coldfront + every schema holding a registered view, SELECT on the registry,
+-- DML on the dual-write anchor + every registered tiered/decoupled view, and
+-- EXECUTE on the runtime cold-path functions. No server-file roles, no
+-- superuser, no admin/DDL functions (set_storage_secret, create_iceberg_table,
+-- the *_tiered_view DDL helpers, grant_app_access itself) — those stay
+-- operator-only. Idempotent; re-run after registering new tables to extend
+-- coverage. Schema/view/sequence lists are DERIVED from the registry (never
+-- hardcoded); the function-EXECUTE list is an explicit allow-list mirroring the
+-- runtime callsites in coldfront.c (ensure_attached/ensure_pg_attached via SPI,
+-- _exec_iceberg_with_claim/_tiered_insert_cold emitted into rewrites,
+-- _enqueue_release + the R-A bakery _claim/_release_iceberg_lock on the cold-write
+-- path). Allow-list = fail safe: a missing entry breaks the app path loudly
+-- (the journey's story_app_privilege + ci/ops.sh check 3 are the tripwires), it
+-- never silently over-grants.
+--
+-- Spock mesh: CREATE ROLE and these GRANTs replicate via Spock DDL, so create the
+-- app role + run this ONCE on any one node — both propagate to the whole mesh.
+-- Do NOT repeat per-node (a repeated CREATE ROLE is a harmless local error).
+--
+-- SECURITY INVOKER + EXECUTE revoked from PUBLIC: only an operator/superuser may
+-- run it, so an app role can never self-grant (that would be an escalation).
+CREATE OR REPLACE FUNCTION coldfront.grant_app_access(target_role regrole)
+RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+  duckrole text := current_setting('duckdb.postgres_role', true);
+  tgt      text := target_role::text;     -- regrole::text is an already-quoted identifier
+  r        record;
+BEGIN
+  IF duckrole IS NULL OR duckrole = '' THEN
+    RAISE EXCEPTION 'duckdb.postgres_role is unset; set it in postgresql.conf and re-run (without it only superusers can run DuckDB, so no non-superuser cold path exists)';
+  END IF;
+
+  -- DuckDB execution: pg_duckdb gates on membership of duckdb.postgres_role.
+  EXECUTE format('GRANT %I TO %s', duckrole, tgt);
+
+  -- coldfront schema + registry read + the dual-write anchor table.
+  EXECUTE format('GRANT USAGE ON SCHEMA coldfront TO %s', tgt);
+  EXECUTE format('GRANT SELECT ON coldfront.tiered_views, coldfront.archive_watermark TO %s', tgt);
+  EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON coldfront._dummy_dml_target TO %s', tgt);
+
+  -- EXECUTE on the runtime cold-path functions only (allow-list mirrors coldfront.c).
+  FOR r IN
+    SELECT p.oid::regprocedure AS sig
+    FROM pg_proc p
+    WHERE p.pronamespace = 'coldfront'::regnamespace
+      AND p.proname IN ('ensure_attached', 'ensure_pg_attached',
+                        '_exec_iceberg_with_claim', '_tiered_insert_cold',
+                        '_enqueue_release',
+                        -- R-A bakery coordination (mesh cold writes); SECURITY
+                        -- DEFINER, so the app role just needs EXECUTE — the
+                        -- spock/dblink/pg_stat_replication access happens as owner.
+                        '_claim_iceberg_lock', '_release_iceberg_lock')
+  LOOP
+    EXECUTE format('GRANT EXECUTE ON FUNCTION %s TO %s', r.sig::text, tgt);
+  END LOOP;
+
+  -- USAGE on each schema holding a registered view + DML on the views themselves,
+  -- AND on the hot heap behind a tiered view. pg_duckdb's custom scan checks the
+  -- INVOKER's privilege on the underlying hot table (not the view owner's), so a
+  -- tiered read/write touching the hot tier needs DML on hot_table too — granting
+  -- the view alone yields "permission denied for table <hot_table>". Iceberg-only
+  -- (decoupled) rows have no hot heap (hot_table NULL), so they are skipped.
+  -- hot_table is a ready-to-use (possibly schema-qualified, possibly quoted)
+  -- relation reference, so it is substituted with %s, not %I.
+  FOR r IN SELECT DISTINCT schema_name FROM coldfront.tiered_views LOOP
+    EXECUTE format('GRANT USAGE ON SCHEMA %I TO %s', r.schema_name, tgt);
+  END LOOP;
+  FOR r IN SELECT schema_name, relname, hot_table, is_iceberg_only FROM coldfront.tiered_views LOOP
+    EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON %I.%I TO %s',
+                   r.schema_name, r.relname, tgt);
+    IF NOT r.is_iceberg_only AND r.hot_table IS NOT NULL AND r.hot_table <> '' THEN
+      EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON %s TO %s', r.hot_table, tgt);
+    END IF;
+  END LOOP;
+
+  -- USAGE on the IDENTITY/serial sequences behind tiered hot tables: the cold
+  -- INSERT path (coldfront._tiered_insert_cold) shares the hot side's sequence
+  -- via nextval() AS THE INVOKER, so the app role needs USAGE on it. Derived from
+  -- pg_depend (sequences owned-by 'a'/'i' of each registered hot table) — not
+  -- hardcoded; to_regclass tolerates NULL/iceberg-only hot_table (-> no row).
+  FOR r IN
+    SELECT DISTINCT d.objid::regclass AS seq
+    FROM coldfront.tiered_views tv
+    JOIN pg_depend d ON d.refobjid = to_regclass(tv.hot_table) AND d.deptype IN ('a','i')
+    JOIN pg_class s ON s.oid = d.objid AND s.relkind = 'S'
+    WHERE NOT tv.is_iceberg_only
+  LOOP
+    EXECUTE format('GRANT USAGE, SELECT ON SEQUENCE %s TO %s', r.seq, tgt);
+  END LOOP;
+END;
+$$;
+REVOKE EXECUTE ON FUNCTION coldfront.grant_app_access(regrole) FROM PUBLIC;
 
 -- _build_storage_secret_opts() — PURE: returns the body of the DuckDB
 -- CREATE PERSISTENT SECRET for the given row, branched on storage_type. It
@@ -1551,9 +1663,17 @@ CREATE TRIGGER coldfront_claim_release
 -- Protocol: Lamport's 1978 distributed mutual exclusion algorithm with
 -- the Ricart-Agrawala (1981) deferred-reply optimisation.
 -- Modelled in docs/formal/Bakery_v2.tla.
+-- SECURITY DEFINER (search_path pinned; body is fully schema-qualified) so a
+-- NON-superuser writer drives the R-A bakery with superuser privilege: the
+-- pg_stat_replication alive-check sees every walsender (an INVOKER non-superuser
+-- would see none → rule all peers dead → skip acks → the race this serializer
+-- exists to prevent), and the spock.* reads + dblink claim-INSERT succeed. This
+-- only changes the PG execution privilege, not the claim/ack/lock/ticket protocol
+-- (TLA+-verified protocol-neutral; see docs/formal/Bakery_v2.tla). The cold DML
+-- itself still runs as the caller — _exec_iceberg_with_claim stays INVOKER.
 CREATE FUNCTION coldfront._claim_iceberg_lock(
     p_iceberg_table text
-) RETURNS bigint LANGUAGE plpgsql AS $$
+) RETURNS bigint LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
 DECLARE
     connstr           text     := coldfront._dblink_self_connstr();
     my_node           int      := current_setting('snowflake.node')::int;
@@ -1717,8 +1837,13 @@ $$;
 -- can call this from the trigger before the iceberg POST, with the documented
 -- race that the next writer may briefly proceed while our iceberg commit is
 -- still in flight.)
+-- SECURITY DEFINER for the same reason as _claim_iceberg_lock (dblink DELETE of
+-- the claim row; fully schema-qualified, search_path pinned). In production this
+-- runs from the C XactCallback's libpq loopback as the coldfront owner already;
+-- SD also covers any synchronous (bootstrap) caller so a non-superuser release
+-- never fails. Protocol-neutral (docs/formal/Bakery_v2.tla).
 CREATE FUNCTION coldfront._release_iceberg_lock(p_ticket bigint)
-RETURNS void LANGUAGE plpgsql AS $$
+RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
 DECLARE
     connstr text := coldfront._dblink_self_connstr();
 BEGIN

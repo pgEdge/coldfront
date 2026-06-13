@@ -140,6 +140,45 @@ connection. There is no arming step and no per-session boilerplate: both reads
 session. Until a tiered view is touched no ATTACH is attempted, so a
 pre-bootstrap connection is never blocked by a missing warehouse.
 
+### Non-superuser app roles (least privilege)
+
+pg_duckdb force-disables DuckDB's `LocalFileSystem` for non-superusers (see
+[Upstream Requests](#pg_duckdb-non-superuser-localfilesystem-blocks-side-loaded-extensions)),
+which would block the side-loaded iceberg/postgres DuckDB extensions from loading
+on `ATTACH`. So `coldfront.ensure_attached()` / `ensure_pg_attached()` are
+`SECURITY DEFINER` with a pinned `search_path`: the extension load + `ATTACH` run
+elevated (gates key off `GetUserId()`, the effective user), and because the
+DuckDB instance is per-backend the attach persists for the session — every
+subsequent `iceberg_scan` / `_exec_iceberg_with_claim` then runs as the **app
+role** over S3/httpfs, never touching `LocalFileSystem`. The app role needs only
+`duckdb.postgres_role` membership + object grants; **no superuser, no
+`pg_{read,write}_server_files`**.
+
+Because the attach helpers run elevated, the deployment-config GUCs they consume
+(`coldfront.warehouse`, `coldfront.lakekeeper_endpoint`, `coldfront.local_pg_dsn`)
+are registered `PGC_SUSET` (the last also `GUC_SUPERUSER_ONLY`) in `_PG_init`, so
+a non-superuser cannot redirect the elevated `ATTACH` at an attacker endpoint.
+Onboarding is one operator call, `coldfront.grant_app_access(role)` — idempotent,
+registry-derived (schemas, views, the hot heap + its identity sequence, the
+cold-path function EXECUTE allow-list), not `PUBLIC`-executable. The image defaults
+`duckdb.postgres_role = coldfront_duckdb` (env `COLDFRONT_DUCKDB_ROLE`) and creates
+the role, so the path is turnkey.
+
+In a **Spock mesh** the role and its grants replicate via Spock DDL — onboard once
+on any node. Mesh cold *writes* route through the R-A bakery; its coordination
+functions `_claim_iceberg_lock` / `_release_iceberg_lock` are themselves
+`SECURITY DEFINER` (search_path-pinned, fully schema-qualified) so a non-superuser
+drives the cross-node serialization (`pg_stat_replication` liveness + the dblink
+claim) with the privilege it requires. `_exec_iceberg_with_claim` deliberately
+stays `SECURITY INVOKER` — it runs the caller's cold DML, which must execute as the
+caller. The bakery SD is **protocol-neutral**: it changes the PG execution
+privilege, not the claim/ack/lock/ticket protocol, re-verified against
+[the TLA+ model](formal/Bakery_v2.tla) (all safe configs pass; the race config
+still violates `NoLakekeeperConflict`).
+
+See README "Security"; asserted by the journey's `story_app_privilege`, `ci/ops.sh`
+check 3, and the `privilege_model` pg_regress test.
+
 ### Temp table bridge: PG → Iceberg
 
 `duckdb.raw_query()` cannot see PG tables directly. The bridge is a
@@ -481,6 +520,30 @@ ColdFront image lean (core `uuid` type only, no uuid-ossp).
 Behaviours in upstream projects that ColdFront works around, kept as
 architectural notes: the gap, the workaround in use today, and the shape of
 the upstream capability that would let us drop the workaround.
+
+### pg_duckdb: non-superuser LocalFileSystem blocks side-loaded extensions
+
+pg_duckdb force-disables DuckDB's `LocalFileSystem` for any role that is not a
+member of both `pg_read_server_files` and `pg_write_server_files`
+(`AllowRawFileAccess()` → `RefreshConnectionState`, keyed off `GetUserId()`).
+That is correct hardening for raw file access, but it also blocks **loading a
+locally-installed DuckDB extension** — and ColdFront side-loads a patched
+`iceberg` (and `postgres`) extension from disk, which DuckDB lazily loads on
+`ATTACH`. So a non-superuser's first cold query fails at the elevated load step.
+
+**Workaround today:** `coldfront.ensure_attached()` / `ensure_pg_attached()` are
+`SECURITY DEFINER`, so the load + `ATTACH` run as the (privileged) extension
+owner once per backend; the per-backend DuckDB instance then keeps the extension
+loaded, and subsequent scans/commits run unprivileged over S3 (no
+`LocalFileSystem`). The config GUCs the elevated path consumes are `PGC_SUSET` so
+the privilege can't be abused to redirect the `ATTACH`.
+
+**Upstream shape that would drop it:** either a way to mark specific
+locally-installed extensions as loadable without `LocalFileSystem` access, or
+distinguishing extension-load file access from user-initiated raw file access in
+the non-superuser sandbox — so a non-superuser member of `duckdb.postgres_role`
+could `ATTACH (TYPE ICEBERG, …)` directly, without ColdFront's `SECURITY DEFINER`
+shim.
 
 ### pg_duckdb: native PG-reader → Iceberg streaming (no libpq round-trip)
 

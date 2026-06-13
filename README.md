@@ -542,6 +542,68 @@ embeds the bakery patch — ColdFront IP), so building the app locally requires
 [base-image workflow](.github/workflows/base-image.yml) (`gh workflow run
 base-image.yml`) when its inputs change.
 
+## Security — non-superuser app roles
+
+The setup snippets above run as a superuser for brevity, but ColdFront supports a
+genuinely **least-privilege** model for enterprise use: application roles need
+**no superuser and no server-file access**, yet read and write the cold tier
+through the same transparent view. Onboarding is one call.
+
+```sql
+-- As an operator/superuser, once per application role:
+SELECT coldfront.grant_app_access('alice');
+-- 'alice' (a plain NOSUPERUSER role) can now SELECT/INSERT/UPDATE/DELETE through
+-- every registered tiered/decoupled view — hot and cold — exactly as before.
+```
+
+`grant_app_access` grants only the minimum the cold path needs — membership in
+`duckdb.postgres_role`, `USAGE` on the relevant schemas, `SELECT` on the registry,
+DML on every registered view (plus the hot heap and its identity sequence behind a
+tiered view, which pg_duckdb's scan touches as the invoker), and `EXECUTE` on the
+runtime cold-path functions — all **derived from the registry**, never hardcoded.
+It is idempotent (re-run after registering new tables) and is **not executable by
+`PUBLIC`** (an app role can never self-grant). The app role is **not** granted
+`pg_read_server_files` / `pg_write_server_files`, so it has no host-file access.
+
+**How a non-superuser reaches Iceberg.** pg_duckdb force-disables DuckDB's
+`LocalFileSystem` for non-superusers, which would block the side-loaded
+iceberg/postgres DuckDB extensions from loading on `ATTACH`. ColdFront's attach
+helpers `coldfront.ensure_attached()` / `ensure_pg_attached()` are therefore
+`SECURITY DEFINER` (with a pinned `search_path`): the extension load + `ATTACH`
+run elevated once per session, and because the DuckDB instance is per-backend the
+attach persists, so every subsequent read (`iceberg_scan`) and write
+(`_exec_iceberg_with_claim`) runs as the **app role** over S3/httpfs — no
+`LocalFileSystem`, no elevation.
+
+**Hardening.** Because the attach helpers run elevated, the deployment-config GUCs
+they consume — `coldfront.warehouse`, `coldfront.lakekeeper_endpoint`,
+`coldfront.local_pg_dsn` — are registered `PGC_SUSET` (superuser-set-only), so a
+non-superuser cannot redirect the elevated `ATTACH` at an attacker endpoint;
+`local_pg_dsn` is additionally `GUC_SUPERUSER_ONLY` (it may carry credentials).
+Operators set these in `postgresql.conf` as before.
+
+**Turnkey.** The image defaults `duckdb.postgres_role = coldfront_duckdb` and
+creates that NOLOGIN role at init, so the non-superuser path works out of the box
+— `grant_app_access` is the only step. Set `COLDFRONT_DUCKDB_ROLE=''` to keep
+pg_duckdb's stock superuser-only behaviour. Superusers are unaffected either way.
+
+**Spock mesh.** `CREATE ROLE` and `GRANT` both replicate via Spock DDL, so create
+the role + run `grant_app_access` **once on any one node** — the role and every
+grant propagate to the whole mesh. Don't repeat them per-node (a repeated
+`CREATE ROLE` is a harmless local "already exists" error, just unnecessary). Mesh
+cold *writes* route through the Ricart-Agrawala bakery, whose coordination
+functions (`_claim_iceberg_lock` / `_release_iceberg_lock`) are `SECURITY DEFINER`
+so a non-superuser drives the cross-node serialization (reading
+`pg_stat_replication` liveness + dblinking the claim) with the right privilege —
+verified **protocol-neutral** against the TLA+ model (`docs/formal/`). Least
+privilege therefore holds for writes in a mesh too, not just single-node.
+
+The whole boundary is asserted end-to-end by the journey's `story_app_privilege`
+(non-superuser tiered read+write; in a mesh, cross-node read + a SECURITY
+DEFINER-bakery cold write from a peer), by `ci/ops.sh` check 3 (the role cannot
+redirect the endpoint, cannot self-grant, and an un-onboarded role is cleanly
+denied), and at the catalog level by the `privilege_model` pg_regress test.
+
 ## Caveats
 
 - **Azure ADLS Gen2 cold tier requires Blob soft-delete and change feed to be
