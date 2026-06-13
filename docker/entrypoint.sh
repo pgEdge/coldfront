@@ -59,10 +59,18 @@ shared_preload_libraries = '${PRELOAD}'
 # mesh bakery uploads parquet in the background and serializes only the commit
 # POST (safe because the patch refreshes parent_snapshot_id at commit). Vanilla
 # ignores the flag (advisory lock, claim-first).
+#
+# iceberg_bakery_patch = on ASSERTS that the duckdb-iceberg in THIS image carries
+# the bakery-aware-commit-refresh patch (it does — the Dockerfile git-applies it).
+# coldfront._iceberg_async_active() gates the async ordering on BOTH GUCs, so async
+# only ever runs on a genuinely patched binary. Do NOT set this in an image/host
+# whose duckdb-iceberg is stock — coldfront would then fail safe to the stock
+# ordering and warn (never silent 409). The two GUCs are deliberately set together.
 duckdb.autoinstall_known_extensions = true
 duckdb.autoload_known_extensions    = true
 duckdb.allow_unsigned_extensions    = true
 coldfront.iceberg_async_parquet     = on
+coldfront.iceberg_bakery_patch      = on
 coldfront.warehouse = '${WAREHOUSE}'
 coldfront.lakekeeper_endpoint = '${LAKEKEEPER}'
 # Loopback DSN coldfront.ensure_pg_attached() uses to ATTACH this PG into

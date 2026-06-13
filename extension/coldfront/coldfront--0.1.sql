@@ -1756,6 +1756,24 @@ CREATE FUNCTION coldfront._enqueue_release(p_ticket bigint)
 RETURNS void
 LANGUAGE c AS 'coldfront', 'coldfront_enqueue_release';
 
+-- Is the async-parquet upload ordering BOTH requested AND safe to use?
+-- coldfront.iceberg_async_parquet asks to stage parquet OUTSIDE the bakery claim
+-- (writers overlap on S3); that is correct ONLY when the loaded duckdb-iceberg
+-- carries the bakery-aware-commit-refresh patch, which re-stamps
+-- parent_snapshot_id at the commit POST under the claim. coldfront.iceberg_bakery_patch
+-- asserts that patched binary is present — the coldfront patched images set BOTH
+-- GUCs together in postgresql.conf (see docker/entrypoint.sh). Async requested
+-- WITHOUT the patch asserted returns FALSE here, so _exec_iceberg_with_claim
+-- falls back to the always-safe stock ordering instead of silently risking a
+-- Lakekeeper 409 / commit loss. Formal basis: docs/formal — Bakery_v2_race.cfg
+-- (async WITHOUT the patch) violates NoLakekeeperConflict; Bakery_v2_async.cfg
+-- (async WITH the patch) is safe. STABLE so the planner can fold it.
+CREATE FUNCTION coldfront._iceberg_async_active() RETURNS boolean
+LANGUAGE sql STABLE AS $$
+  SELECT COALESCE(NULLIF(current_setting('coldfront.iceberg_async_parquet', true), '')::boolean, false)
+     AND COALESCE(NULLIF(current_setting('coldfront.iceberg_bakery_patch',   true), '')::boolean, false)
+$$;
+
 -- Serialise one cold-tier Iceberg write so concurrent committers never hit a
 -- Lakekeeper 409 CatalogCommitConflict (duckdb-iceberg does not rebase → the
 -- loser's data is silently dropped). This is THE chokepoint every cold write
@@ -1767,14 +1785,18 @@ LANGUAGE c AS 'coldfront', 'coldfront_enqueue_release';
 --   * Multi-node mesh (v_armed): the Ricart-Agrawala bakery. The upload ordering
 --     adapts to the loaded duckdb-iceberg via coldfront.iceberg_async_parquet —
 --     NEVER a 409 either way, only overlap-vs-serialized upload:
---       - patched iceberg (flag ON): stage the parquet FIRST (writers overlap
---         freely on S3), then claim the bakery only to wrap pg_duckdb's deferred
---         commit POST — the patch re-stamps parent_snapshot_id at that POST, so
---         the overlap is safe.
---       - stock iceberg (flag OFF, the default): claim the bakery FIRST, then
---         stage+commit inside the held ticket — stock stamps parent_snapshot_id
---         at stage time, so the upload must be serialized or a peer captures a
---         stale parent and 409s.
+--       - patched iceberg (coldfront.iceberg_async_parquet ON AND the build
+--         marker coldfront.iceberg_bakery_patch ON): stage the parquet FIRST
+--         (writers overlap freely on S3), then claim the bakery only to wrap
+--         pg_duckdb's deferred commit POST — the patch re-stamps parent_snapshot_id
+--         at that POST, so the overlap is safe.
+--       - stock iceberg (the default — OR async REQUESTED without the
+--         iceberg_bakery_patch marker, which fails safe to here): claim the bakery
+--         FIRST, then stage+commit inside the held ticket — stock stamps
+--         parent_snapshot_id at stage time, so the upload must be serialized or a
+--         peer captures a stale parent and 409s. _iceberg_async_active() gates the
+--         async path on BOTH GUCs, so an unpatched deployment that flips only the
+--         async flag can never silently 409 — it lands here and warns once.
 --     The release is enqueued for the C XactCallback (fires on COMMIT and ABORT),
 --     so an in-ticket staging failure can't orphan the claim.
 --
@@ -1796,16 +1818,14 @@ DECLARE
     my_ticket bigint;
     v_armed   boolean := NULLIF(current_setting('snowflake.node', true), '') IS NOT NULL
                      AND NULLIF(current_setting('coldfront.dblink_self', true), '') IS NOT NULL;
-    -- Does the loaded duckdb-iceberg defer the catalog-commit parent stamp to PG
-    -- PRE_COMMIT (the bakery-aware-commit-refresh patch)? If so we may stage the
-    -- parquet OUTSIDE the claim (async upload; only the commit POST contended).
-    -- On stock iceberg the parent is stamped at stage time, so the claim must
-    -- wrap the upload too. Never a 409 either way — the flag only picks overlap
-    -- (patched) vs serialized upload (stock). Default false = correct on stock;
-    -- the patched image's entrypoint sets it on.
-    v_async   boolean := COALESCE(
-                   NULLIF(current_setting('coldfront.iceberg_async_parquet', true), '')::boolean,
-                   false);
+    -- Async-parquet upload ordering: stage the parquet OUTSIDE the claim (writers
+    -- overlap on S3), then take the claim only to wrap pg_duckdb's deferred commit
+    -- POST. Correct ONLY on the bakery-aware duckdb-iceberg build (it re-stamps
+    -- parent_snapshot_id at the POST, under the claim). _iceberg_async_active() is
+    -- TRUE only when BOTH coldfront.iceberg_async_parquet AND the build marker
+    -- coldfront.iceberg_bakery_patch are on; otherwise the stock ordering below is
+    -- used (always safe). Never a 409 either way.
+    v_async   boolean := coldfront._iceberg_async_active();
 BEGIN
     -- A physical standby is read-only. The vanilla path below takes only an
     -- advisory lock (not a PG write), so without this guard a cold write on a
@@ -1816,6 +1836,19 @@ BEGIN
     IF pg_is_in_recovery() THEN
         RAISE EXCEPTION 'coldfront: cannot execute a cold (Iceberg) write on a read-only standby'
             USING HINT = 'Standbys serve reads only; route writes to the primary.';
+    END IF;
+    -- Fail-safe, not fail-silent: if async was REQUESTED but the bakery-aware
+    -- patch is not asserted, we use the stock ordering (always safe) and note it
+    -- ONCE per session. Running async on stock iceberg would let a peer capture a
+    -- stale parent and conflict → silent commit loss (docs/formal Bakery_v2_race.cfg).
+    -- RAISE LOG, not WARNING: this is a deployment-config advisory that belongs in
+    -- the server log; it must NOT reach the client (a per-statement client message
+    -- here would pollute output and break tools that scan write output for errors).
+    IF NOT v_async
+       AND COALESCE(NULLIF(current_setting('coldfront.iceberg_async_parquet', true), '')::boolean, false)
+       AND current_setting('coldfront._async_downgrade_warned', true) IS DISTINCT FROM 'true' THEN
+        RAISE LOG 'coldfront: iceberg_async_parquet is on but iceberg_bakery_patch is not set — the loaded duckdb-iceberg is not the bakery-aware build; using the SAFE stock upload ordering instead of async. Set coldfront.iceberg_bakery_patch=on ONLY where duckdb-iceberg carries the bakery-aware-commit-refresh patch (the coldfront patched images set both GUCs).';
+        PERFORM set_config('coldfront._async_downgrade_warned', 'true', false);
     END IF;
     IF v_armed AND v_async THEN
         -- Patched iceberg: upload parquet in the background, then take the bakery
