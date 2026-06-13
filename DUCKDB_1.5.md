@@ -221,15 +221,63 @@ azure)` raw_query is NOT exercised in pg_regress — it needs the azure extensio
 staged, i.e. the 1.5.x image). **Beware:** a green pg_regress run does NOT mean
 azure I/O works — that is gated on this whole 1.5.x stack + the e2e below.
 
-## Remaining
+## Status (shipped to `main`)
 
-- [x] Confirm iceberg+avro+azure builds (all 3, `make rc=0`, v1.5.3 footer; azure `v1.5-variegata`).
-- [x] Assemble the 1.5.3 stack (pg_duckdb.so + 3 exts) and verify the **Azure abfss read+write e2e** (headline) — **PROVEN** (see status banner). Stock iceberg, UNPATCHED mode.
-- [ ] Coldfront tiered flow over azure (archiver → view read) — existing logic over the now-proven azure layer; part of the matrix.
-- [x] `TYPE azure` branch in `materialize_storage_secret()` + `storage_secret` schema (TDD) — done; `.out` to be generated+hand-verified on a rebuilt coldfront image, then registered in the Makefile REGRESS list.
-- [ ] Wire `docker/Dockerfile` (PR #1025 clone, curl 8.11, **libasan + perl-Time-Piece** in the iceberg-builder, iceberg-builder v1.5.3 + azure) + entrypoint (`COLDFRONT_DUCKDB_VERSION=v1.5.3`, pre-place all three).
-- [ ] Re-author the bakery patch for v1.5 (separate file) + mesh no-409 bench.
-- [ ] Full 24-cell matrix on the 1.5.3 stack; update PATCHED/ARCHITECTURE/README/CLAUDE.
+The 1.5.x stack is the default stack on `main`. All of the original "remaining"
+work is done:
+
+- [x] iceberg+avro+azure built (all 3, v1.5.3 footer; azure `v1.5-variegata`).
+- [x] 1.5.3 stack assembled + **Azure abfss read+write e2e PROVEN** (status banner).
+- [x] Coldfront tiered flow over azure (archiver → view read) — matrix azure cells
+      green (vanilla·tiered·azure 92/0, mesh·tiered·azure 108/0).
+- [x] `TYPE azure` in `materialize_storage_secret()` + `storage_secret` schema +
+      `storage_secret_azure.sql` regress test (registered in the Makefile).
+- [x] **Image wiring — now a base/app split** (see "Image build" below):
+      `docker/Dockerfile.duckdb15-base` (pg_duckdb 1.5.3 + patched iceberg) →
+      private GHCR base; `docker/Dockerfile.duckdb15` (thin coldfront app) `FROM`s it;
+      `docker/entrypoint.sh` sets `COLDFRONT_DUCKDB_VERSION=v1.5.3`, pre-places the
+      extensions, and sets `iceberg_async_parquet` **and** `iceberg_bakery_patch`.
+- [x] Bakery patch re-authored for v1.5 (`docker/iceberg-bakery-aware-commit-refresh-v15.patch`)
+      and **formally verified** — `docs/formal/Bakery_v2.tla` models the async ordering;
+      `Bakery_v2_async.cfg` (patched) holds `NoLakekeeperConflict`, `Bakery_v2_race.cfg`
+      (async without the patch) violates it. The runtime guard
+      (`coldfront._iceberg_async_active()`, gated on `iceberg_bakery_patch`) enforces it.
+- [x] Full matrix on the 1.5.x image: s3 cells green (PG16/17/18 × {vanilla,mesh} ×
+      {tiered,decoupled} × {primary,standby} = 24, **29/0**); aws/azure/gcs creds-gated.
+- [x] PATCHED / README / CLAUDE updated (CLAUDE.md now mandates TLA+-first for any
+      mesh/bakery change).
+
+## Image build (base/app split + the bakery-patch marker)
+
+The expensive, **stable** compiles (libcurl 8.11, pg_duckdb 1.5.3 from PR #1025,
+the patched duckdb-iceberg/avro/azure/postgres_scanner) are built once into a
+**base** image and published **PRIVATE/INTERNAL** to
+`ghcr.io/pgedge/coldfront-duckdb-base:pg{16,17,18}` (it embeds the bakery patch —
+ColdFront IP). The **app** image is a thin layer that only compiles the coldfront
+extension on top — so CI and local builds are fast (~minutes, not the cold
+~30–60 min iceberg compile) and always test the current source.
+
+| File | Role |
+|---|---|
+| `docker/Dockerfile.duckdb15-base` | base: §"PROVEN foundation" + §"iceberg extensions" build, **plus** the bakery patch git-applied; runtime stage = pg_duckdb + the 4 extensions + entrypoint, **no coldfront**. |
+| `docker/Dockerfile.duckdb15` | app: a `cf-build` stage compiles coldfront (PG devel only — coldfront links libpq, not pg_duckdb), then `FROM ${COLDFRONT_BASE}` copies the coldfront `.so`/SQL on top. |
+| `.github/workflows/base-image.yml` | builds + pushes the private base via `GITHUB_TOKEN` (workflow_dispatch; base rebuilds are rare). |
+
+Building the app locally needs `docker login ghcr.io` (read:packages) to pull the
+private base, or a locally-built base tagged `ghcr.io/pgedge/coldfront-duckdb-base:pg<major>`.
+
+**The `iceberg_bakery_patch` marker (the async safety gate).** The async upload
+ordering (stage parquet outside the claim, re-stamp `parent_snapshot_id` at the
+commit POST) is correct **only** on the patched binary. The entrypoint of the
+patched base therefore sets BOTH `coldfront.iceberg_async_parquet = on` AND
+`coldfront.iceberg_bakery_patch = on`. `coldfront._iceberg_async_active()` returns
+true only when both are on; otherwise `_exec_iceberg_with_claim` **fails safe to
+the stock ordering** (claim-first, serialized upload — never a 409) and logs a
+one-time server-log advisory. So flipping only the async flag on a stock/bare-metal
+deployment can never silently 409 — verified by `Bakery_v2_race.cfg` and the
+`async_requires_patch` pg_regress test. Rebuild + republish the base (via
+`base-image.yml` or a locally-built push) whenever the entrypoint or patch changes,
+or async silently downgrades to stock.
 
 ## CI coverage for the azure backend (why it's creds-gated, not hermetic)
 

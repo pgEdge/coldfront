@@ -2,13 +2,17 @@
 
 > ColdFront has **one agnostic code path** for cold writes — it never 409s on any
 > binary. The two deployment modes differ only by **(a) which duckdb-iceberg
-> binary is loaded** and **(b) the `coldfront.iceberg_async_parquet` flag** — not
-> by any code change:
+> binary is loaded** and **(b) the `coldfront.iceberg_async_parquet` +
+> `coldfront.iceberg_bakery_patch` GUCs** (the gate `_iceberg_async_active()`
+> needs BOTH on for async; the patched image sets both) — not by any code change:
 >
-> | mode | binary | `iceberg_async_parquet` | bakery wraps | uploads |
+> | mode | binary | `async_parquet` / `bakery_patch` | bakery wraps | uploads |
 > |---|---|---|---|---|
-> | **PATCHED** (this doc) | patched | `on` | only the commit POST | overlap (async) |
-> | **UNPATCHED** (`UNPATCHED.md`) | stock | `off` (default) | upload **+** commit | serialized |
+> | **PATCHED** (this doc) | patched | `on` / `on` | only the commit POST | overlap (async) |
+> | **UNPATCHED** (`UNPATCHED.md`) | stock | `off` / `off` (default) | upload **+** commit | serialized |
+>
+> An unpatched deployment that sets only `async_parquet=on` (without the marker)
+> **fails safe to UNPATCHED** — the gate is false, so it claim-firsts; never a 409.
 >
 > Both are **no-409**. PATCHED buys contended throughput (concurrent parquet
 > uploads overlap; only the Lakekeeper commit is serialized) at the cost of
@@ -24,11 +28,12 @@ It picks its strategy at runtime; the SQL is the same whichever iceberg binary i
 installed:
 
 ```sql
-IF v_armed AND v_async THEN          -- PATCHED: patched binary + flag ON
+IF v_armed AND v_async THEN          -- PATCHED: patched binary + BOTH GUCs on
+                                     -- (v_async := coldfront._iceberg_async_active())
     PERFORM duckdb.raw_query(p_sql);                  -- upload parquet in the background (OUTSIDE the claim)
     my_ticket := coldfront._claim_iceberg_lock(...);  -- claim only to wrap the deferred commit POST
     PERFORM coldfront._enqueue_release(my_ticket);
-ELSIF v_armed THEN                   -- UNPATCHED: stock binary + flag OFF (default)
+ELSIF v_armed THEN                   -- UNPATCHED (or async requested w/o the marker): claim-first
     my_ticket := coldfront._claim_iceberg_lock(...);  -- claim FIRST
     PERFORM coldfront._enqueue_release(my_ticket);
     PERFORM duckdb.raw_query(p_sql);                  -- upload+commit INSIDE the held ticket
@@ -38,12 +43,15 @@ ELSE                                 -- vanilla single-node: local advisory lock
 END IF;
 ```
 
-- `coldfront.iceberg_async_parquet` is a **placeholder GUC**, default `false`
-  (read with `current_setting(..., true)`, same pattern as
-  `coldfront.peer_alive_window_ms`). No C definition / no recompile.
-- **PATCHED deployments set it `on`** — the patched binary re-stamps
-  `parent_snapshot_id` at the deferred commit POST, so the background upload is
-  safe. Stock leaves it off → claim-first → also safe.
+- `coldfront.iceberg_async_parquet` and `coldfront.iceberg_bakery_patch` are
+  **placeholder GUCs**, default `false` (read with `current_setting(..., true)`,
+  same pattern as `coldfront.peer_alive_window_ms`). No C definition / no recompile.
+- **PATCHED deployments set BOTH `on`** (the image entrypoint) — the patched binary
+  re-stamps `parent_snapshot_id` at the deferred commit POST, so the background
+  upload is safe, and the `iceberg_bakery_patch` marker tells
+  `coldfront._iceberg_async_active()` the patch is present. Stock leaves both off →
+  claim-first → also safe. Async-requested-without-the-marker → gate false →
+  claim-first (fail-safe), never a 409.
 - **409 is impossible in either branch.** The flag only trades upload *overlap*
   (patched) for *serialized* upload (stock). `_tiered_insert_cold` is always
   claim-first (it claims before its batch loop), so tiered INSERTs are unaffected
@@ -184,8 +192,16 @@ cache. To load the **local, patched** build instead:
      iceberg's required `avro` dependency — and `azure`, for an Azure cold tier —
      won't auto-install and must be pre-placed (see the avro note below).
    - `duckdb.autoload_known_extensions = on` — keep; lazily LOADs on `ATTACH`.
-   - **`coldfront.iceberg_async_parquet = on`** — enables the async-upload code
+   - **`coldfront.iceberg_async_parquet = on`** — requests the async-upload code
      path (safe only because the patch is present).
+   - **`coldfront.iceberg_bakery_patch = on`** — ASSERTS the loaded duckdb-iceberg
+     is the bakery-aware build. `coldfront._iceberg_async_active()` enables the
+     async ordering ONLY when BOTH GUCs are on; with the patch present this image
+     sets both (entrypoint). On a stock/bare-metal deployment that flips only the
+     async flag, the gate is false → `_exec_iceberg_with_claim` fails safe to the
+     stock claim-first ordering (never a 409; one-time server-log advisory). The
+     patched images set both together; do NOT set `iceberg_bakery_patch` on a stock
+     binary.
 
 > **avro is a HARD dependency of iceberg — pre-place BOTH (verified).** iceberg's
 > init (`iceberg_duckdb_cpp_init`) requires `avro` and tries to auto-install it at
@@ -252,11 +268,14 @@ nodes, `loaded=true`, local `install_path`) + `iceberg_async_parquet=on` →
    `duckdb.allow_unsigned_extensions = on`, `duckdb.autoinstall_known_extensions = on`
    (the actual entrypoint value — `on` is safe per §6: it won't clobber the present
    patched binary, and lets missing deps like `avro` auto-install),
-   `duckdb.autoload_known_extensions = on`, **`coldfront.iceberg_async_parquet = on`**;
+   `duckdb.autoload_known_extensions = on`, **`coldfront.iceberg_async_parquet = on`**,
+   **`coldfront.iceberg_bakery_patch = on`** (the marker that asserts this image's
+   iceberg is patched — both are set together so `_iceberg_async_active()` enables
+   async; see §6);
    then `mkdir -p "$PGDATA/pg_duckdb/extensions/$COLDFRONT_DUCKDB_VERSION/$COLDFRONT_DUCKDB_PLATFORM"`
    and copy the staged binaries in. (The stock/UNPATCHED build does none of this —
-   no binary placement, `allow_unsigned` off, and the async flag unset; autoinstall
-   is on in both.)
+   no binary placement, `allow_unsigned` off, and **neither** the async flag nor the
+   bakery-patch marker set; autoinstall is on in both.)
 
 Build-cost note: a cold image build includes the ≈ 11 min iceberg compile;
 mitigate with BuildKit vcpkg/layer caching, or a separately-tagged
@@ -272,9 +291,11 @@ mitigate with BuildKit vcpkg/layer caching, or a separately-tagged
 
 ## 10. Reverting to UNPATCHED
 
-No code change. Flip to stock: set `coldfront.iceberg_async_parquet = off` (the
-code falls back to claim-first), restore stock iceberg (delete the local binaries
-+ `autoinstall = on`, or let autoinstall overwrite), set
+No code change. Flip to stock: unset `coldfront.iceberg_bakery_patch` — with the
+marker off, `_iceberg_async_active()` is false, so the code falls back to
+claim-first even if the async flag is left on (or also set
+`coldfront.iceberg_async_parquet = off`). Restore stock iceberg (delete the local
+binaries + `autoinstall = on`, or let autoinstall overwrite), set
 `allow_unsigned = off`. See `UNPATCHED.md`.
 
 ## 11. FIXED — partition cutover now serializes through the bakery (was a cold-write race)
