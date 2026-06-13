@@ -1,9 +1,13 @@
-# Get ColdFront running on AWS S3
+# Get ColdFront running on S3
 
-This walkthrough takes you from an empty AWS S3 bucket to a working ColdFront cold
+This walkthrough takes you from an empty S3 bucket to a working ColdFront cold
 tier in one sitting. You stand up the ColdFront stack (PostgreSQL + the Lakekeeper
 Iceberg catalog) with Docker, point it at your bucket, and write rows that land as
 Apache Iceberg tables in S3 — readable straight back through Postgres.
+
+It targets a real cloud S3 service that uses virtual-hosted addressing. For a
+path-style S3-compatible store (MinIO, SeaweedFS) or GCS, see
+[USAGE.md → Storage backends](USAGE.md#storage-backends) instead.
 
 No prior ColdFront knowledge assumed. Copy-paste top to bottom. Placeholders used
 throughout: bucket `my-iceberg-bucket`, region `eu-west-1`, key `AKIAEXAMPLE...`,
@@ -15,14 +19,15 @@ secret `<your-secret-key>` — substitute your own.
 
 - **An S3 bucket** — `my-iceberg-bucket` below.
 - **Its region** — `eu-west-1` below. Use your bucket's real region.
-- **A long-term IAM access key** — an access key id (`AKIAEXAMPLE...`) and secret
+- **A long-term access key** — an access key id (`AKIAEXAMPLE...`) and secret
   (`<your-secret-key>`).
 
-  > **Long-term IAM keys only.** Lakekeeper's warehouse credential has no field for
-  > an STS session token, so AWS SSO logins and `assume-role` temporary credentials
-  > do **not** work here. Use a plain IAM user access key with no expiry.
+  > **Long-term keys only.** Lakekeeper's warehouse credential has no field for a
+  > session token, so single sign-on (SSO) or temporary session-token credentials
+  > do **not** work here. Use a permanent access-key pair with no expiry.
 
-- **An IAM policy** on that key granting read/write/list on the bucket:
+- **Permissions** — the key needs read/write/list on the bucket (`GetObject` /
+  `PutObject` / `DeleteObject` / `ListBucket`). Example policy:
 
   ```json
   {
@@ -55,8 +60,8 @@ docker compose up -d --build
 This starts **Postgres** (with `pg_duckdb` and `coldfront` preloaded), **Lakekeeper**
 (the Iceberg REST catalog), Lakekeeper's **own catalog Postgres**, and a one-shot
 **migrate** job. It does **not** start the bundled SeaweedFS — that is gated behind
-the `local-store` profile for credential-free local eval. For AWS you talk to S3
-directly, so you don't need it.
+the `local-store` profile for credential-free local eval. For cloud S3 you talk to
+the bucket directly, so you don't need it.
 
 If a local Postgres already owns port 5432, pick another host port:
 
@@ -85,15 +90,16 @@ curl -X POST http://localhost:8181/management/v1/bootstrap \
   -d '{"accept-terms-of-use":true}'
 ```
 
-### 3b. Create the AWS S3 warehouse
+### 3b. Create the S3 warehouse
 
 A warehouse tells Lakekeeper where on S3 your Iceberg tables live and which
-credential to use. This is the **real-AWS** profile — these flags matter:
+credential to use. This is the **virtual-hosted cloud-S3** profile — these flags
+matter:
 
-- `endpoint` **omitted** ⇒ AWS-native per-Region virtual-hosted + HTTPS addressing.
-- `path-style-access: false` — required for AWS; path-style fails on any Region
-  launched after 2019.
-- `flavor: "aws"` — not `s3-compat`.
+- `endpoint` **omitted** ⇒ native per-Region virtual-hosted + HTTPS addressing.
+- `path-style-access: false` — required for virtual-hosted S3; path-style fails on
+  any Region launched after 2019.
+- `flavor: "aws"` — the Lakekeeper profile for virtual-hosted S3, not `s3-compat`.
 - `sts-enabled: false` and `remote-signing-enabled: false` — long-term access key.
 
 ```bash
@@ -172,11 +178,11 @@ Set the cold-tier S3 credential once. The signature is
 SELECT coldfront.set_storage_secret('AKIAEXAMPLE...', '<your-secret-key>', NULL, 'eu-west-1');
 ```
 
-> **The 3rd argument (endpoint) must be `NULL` for real AWS** — that selects
-> DuckDB's native per-Region virtual-hosted + HTTPS addressing (required for
-> Regions launched after 2019). The 4th argument is your bucket's region. The
+> **The 3rd argument (endpoint) must be `NULL` for a cloud S3 endpoint** — that
+> selects DuckDB's native per-Region virtual-hosted + HTTPS addressing (required
+> for Regions launched after 2019). The 4th argument is your bucket's region. The
 > SeaweedFS form you may have seen elsewhere passes a non-NULL endpoint and no
-> region — do **not** use that shape for AWS.
+> region — do **not** use that shape for cloud S3.
 
 ---
 
@@ -188,17 +194,17 @@ relation. Quickest way to prove the whole path works:
 
 ```sql
 SELECT coldfront.create_iceberg_table(
-  'public', 'aws_demo',
+  'public', 's3_demo',
   '[
     {"name": "id",   "type": "bigint"},
     {"name": "ts",   "type": "timestamptz"},
     {"name": "note", "type": "text"}
   ]'::jsonb);
 
-INSERT INTO public.aws_demo VALUES (1, now(), 'hello from AWS S3');
-INSERT INTO public.aws_demo VALUES (2, now(), 'second row');
+INSERT INTO public.s3_demo VALUES (1, now(), 'hello from S3');
+INSERT INTO public.s3_demo VALUES (2, now(), 'second row');
 
-SELECT count(*) AS n, max(note) AS last FROM public.aws_demo;
+SELECT count(*) AS n, max(note) AS last FROM public.s3_demo;
 -- => n = 2, last = 'second row'
 ```
 
@@ -214,14 +220,14 @@ Postgres data with cold S3 data and writes route to the correct tier.
 
 You drive it with the `archiver` binary against a small YAML config (Postgres DSN,
 the `wh` warehouse, your S3 region/keys, and per-table retention windows). The
-credential and warehouse you set up above are exactly what it needs. See the
-archiver section of [README.md](README.md) for the config schema.
+credential and warehouse you set up above are exactly what it needs. See
+[USAGE.md](USAGE.md) for the archiver config and the partition CLI.
 
 ---
 
 ## 6. Verify in S3 and troubleshoot
 
-Confirm objects physically landed (AWS CLI configured, region exported):
+Confirm objects physically landed (an S3 client such as the `aws` CLI, region exported):
 
 ```bash
 export AWS_DEFAULT_REGION=eu-west-1
@@ -231,16 +237,16 @@ aws s3 ls s3://my-iceberg-bucket/coldfront/ --recursive
 Iceberg stores objects under `coldfront/<namespace-uuid>/<table-uuid>/` with a
 `data/` directory (parquet) and a `metadata/` directory (metadata JSON, `*.avro`
 manifests, snapshot files) — UUID paths, not your table name. "Where did
-`aws_demo` go?" → look under the UUID path beneath your `key-prefix`.
+`s3_demo` go?" → look under the UUID path beneath your `key-prefix`.
 
 Checklist if something failed:
 
 1. **`CREATE EXTENSION coldfront`** — ran it once in your database? Preloading is
    not the same as creating the extension. Symptom: `schema "coldfront" does not
    exist`.
-2. **`set_storage_secret(..., NULL, 'eu-west-1')`** — 3rd arg `NULL` (native AWS
+2. **`set_storage_secret(..., NULL, 'eu-west-1')`** — 3rd arg `NULL` (native
    vhost+HTTPS), 4th arg your real region? A non-NULL endpoint forces path-style
    and breaks modern Regions (HTTP 400).
 3. **Namespace `default` pre-created** in Lakekeeper before `create_iceberg_table`?
    Without it the decoupled create 404s on DuckDB 1.5.x.
-4. **Long-term IAM key** — not an SSO/STS session-token credential.
+4. **Long-term key** — not an SSO / temporary session-token credential.

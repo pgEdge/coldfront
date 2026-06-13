@@ -88,7 +88,7 @@ object store:
 └──────────────┬───────────────────────────────────────────┘
                │
 ┌──────────────▼───────────────────────────────────────────┐
-│  S3-compatible object store (AWS S3, SeaweedFS, MinIO, …)  │
+│  S3-compatible object store (SeaweedFS, MinIO, GCS, …)     │
 │  Parquet data files + Iceberg metadata files               │
 └────────────────────────────────────────────────────────────┘
 ```
@@ -99,7 +99,7 @@ object store:
 | pg_duckdb | DuckDB in-process. Iceberg read + write. Analytics. pg_duckdb 1.5.3 (PR #1025; no released 1.5.x tag yet). The `duckdb-iceberg` carries the bakery-aware commit-refresh patch (async parquet overlap, no 409); see [Cold-write strategy](#cold-write-strategy-stock-vs-patched-duckdb-iceberg). | MIT |
 | coldfront | PGXS C extension. `post_parse_analyze_hook` rewrites INSERT/UPDATE/DELETE on registered views to the correct tier; `ProcessUtility_hook` handles DDL; the hook lazily ATTACHes the Iceberg catalog on the first query touching a tiered view. | PostgreSQL |
 | Lakekeeper | Iceberg REST catalog. Single Rust binary. | Apache 2.0 |
-| S3-compatible store | Any: AWS S3, SeaweedFS, MinIO, GCS, Azure Blob, etc. | Varies |
+| S3-compatible store | Any: SeaweedFS, MinIO, GCS, Azure Blob, etc. | Varies |
 | Archiver (tiered mode) | Go binary, invoked by cron. Thin SQL orchestrator that moves rows hot→cold. | PostgreSQL |
 
 How rows move through this depends on the storage mode: the tiered hot heap +
@@ -408,8 +408,8 @@ stored here — it is per-node and must never ride the replication stream.
 
 Both binaries read this table (the YAML `archiver.tables` list is a deprecation
 bridge, used only when the table is empty) and expose a management CLI —
-`register` / `list` / `set` / `remove` / `import` / `export` — documented in the
-[README](README.md#managing-partitioned-tables-cli).
+`register` / `list` / `set` / `remove` / `import` / `export` — documented in
+[USAGE.md](USAGE.md#managing-partitioned-tables-cli).
 
 ## Known Limitations
 

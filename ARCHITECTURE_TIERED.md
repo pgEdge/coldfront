@@ -59,7 +59,7 @@ the all-Iceberg alternative is
 └──────────────┬───────────────────────────────────────────┘
                │
 ┌──────────────▼───────────────────────────────────────────┐
-│  S3-compatible object store (AWS S3, SeaweedFS, MinIO, etc.)│
+│  S3-compatible object store (SeaweedFS, MinIO, GCS, etc.)   │
 │  Stores Parquet data files + Iceberg metadata files       │
 └──────────────────────────────────────────────────────────┘
                │
