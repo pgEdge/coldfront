@@ -1,13 +1,12 @@
 # ColdFront image on the DuckDB 1.5.x stack — the THIN coldfront layer on top of
 # the prebuilt coldfront-duckdb-base. The base (docker/Dockerfile.duckdb15-base)
-# carries the expensive, STABLE compiles — libcurl 8.11, pg_duckdb 1.5.3 (PR
-# #1025), and the patched duckdb-iceberg extensions (iceberg/avro/azure/
-# postgres_scanner, v1.5-variegata + the bakery-aware commit-refresh patch). This
-# build only compiles the coldfront C extension (seconds), so CI and local builds
-# are fast and always test the CURRENT coldfront source.
+# carries the expensive, STABLE compiles — pg_duckdb 1.5.3 (PR #1025) and the
+# patched duckdb-iceberg extensions (iceberg/avro/azure/postgres_scanner,
+# v1.5-variegata + the bakery-aware commit-refresh patch). This build only
+# compiles the coldfront C extension (seconds), so CI and local builds are fast
+# and always test the CURRENT coldfront source.
 #
-# This is a SEPARATE stack from docker/Dockerfile (the DuckDB 1.4.3 patched
-# stack); it does NOT replace it. All proven in DUCKDB_1.5.md.
+# This is the canonical ColdFront app layer. All proven in DUCKDB_1.5.md.
 #
 # ⚠ COLDFRONT_BASE is a PRIVATE/INTERNAL ghcr.io/pgedge image (it embeds the
 # bakery patch — ColdFront IP). Before building, either `docker login ghcr.io`

@@ -1,5 +1,5 @@
 # 3-node Spock mesh stack for the CI matrix. Same parameterized image as
-# vanilla (docker/Dockerfile) but MESH=on, so the entrypoint loads
+# vanilla (docker/Dockerfile.duckdb15) but MESH=on, so the entrypoint loads
 # snowflake,spock,pg_duckdb,coldfront and writes the mesh GUCs (wal_level
 # logical, spock.*, snowflake.node, dblink_self). spock + snowflake + dblink
 # are bundled in the pgEdge base; pg_duckdb is compiled in; coldfront installed.

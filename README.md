@@ -74,6 +74,26 @@ Application
 └───────────────────────────────────────────────────────────┘
 ```
 
+## Installation
+
+> ### 📦 Packages — coming at Beta GA
+>
+> At Beta general availability, ColdFront installs from **pgEdge package
+> repositories**: the PostgreSQL `coldfront` extension (with its pg_duckdb +
+> patched-iceberg dependencies) and the `archiver` binary, via your platform's
+> package manager. This section will carry the exact repo setup + install
+> commands once the packages are published.
+>
+> <!-- STUB — fill in at Beta GA once packages are published:
+>   RHEL / Rocky:      dnf install coldfront           (package names + repo TBD)
+>   Debian / Ubuntu:   apt install coldfront
+>   Container image:   docker pull ghcr.io/pgedge/coldfront:<pg>   (public GA image TBD)
+> -->
+
+**Until the packages land**, build from source: see **[INSTALL.md](INSTALL.md)**
+(build the DuckDB-1.5.x base + the coldfront layer with one `docker build`, or
+install bare-metal). Then continue with the Quickstart below.
+
 ## Quickstart
 
 The walkthrough below covers **tiered mode**. For **decoupled (iceberg-only)** —
@@ -186,7 +206,7 @@ RETURNING) in permissive mode.
 #### Schema changes (DDL)
 
 Column-shape changes on a tiered table are **blocked**: duckdb-iceberg
-(pg_duckdb v1.1.1) cannot `ALTER` an Iceberg table, so coldfront refuses
+cannot `ALTER` an Iceberg table, so coldfront refuses
 `ADD`/`DROP COLUMN`, `ALTER COLUMN ... TYPE`, and `RENAME COLUMN` rather than
 let the hot and cold tiers diverge. Renaming the hot table or the view **is**
 supported (neither touches the Iceberg schema).
@@ -386,8 +406,9 @@ Three services: PostgreSQL + pg_duckdb, Lakekeeper, and any S3-compatible
 object store (SeaweedFS, MinIO, AWS S3, GCS, etc.).
 
 ```bash
-# Start the stack (example uses SeaweedFS)
-docker compose -f docker-compose.test.yml up -d
+# Build the image first (DuckDB 1.5.x stack) — see INSTALL.md — then start the
+# stack (example uses SeaweedFS):
+docker compose -f docker-compose.matrix.yml up -d --build
 ```
 
 ### One-time setup
@@ -496,8 +517,9 @@ soft-delete / change-feed restriction in [Caveats](#caveats).
 
 One canonical user journey ([ci/journey.sh](ci/journey.sh)) runs identically in
 every deployment cell; `ci/matrix.sh` drives the cells and `ci/topo/*.sh` brings
-up each topology. All cells share one parameterized image
-([docker/Dockerfile](docker/Dockerfile), `--build-arg PG_MAJOR=16|17|18`).
+up each topology. All cells share the DuckDB 1.5.x app image
+([docker/Dockerfile.duckdb15](docker/Dockerfile.duckdb15), built on the prebuilt
+[base](docker/Dockerfile.duckdb15-base); `--build-arg PG_MAJOR=16|17|18`).
 
 **Pre-commit gate** — `./run-ci-local.sh` runs `ci/matrix.sh --quick`: gofmt,
 golangci-lint, unit tests, build, the pg_regress unit layer, and the full
@@ -636,10 +658,11 @@ pgedge-coldfront/
 │   ├── topo/                   ← vanilla.sh (1 node) · mesh.sh (3-node Spock)
 │   └── runbooks/               ← failover-patroni.md (failover delegated to Patroni)
 ├── docker/
-│   ├── Dockerfile              ← one parameterized image (ARG PG_MAJOR=16|17|18)
+│   ├── Dockerfile.duckdb15      ← thin coldfront app layer (ARG PG_MAJOR=16|17|18)
+│   ├── Dockerfile.duckdb15-base ← DuckDB 1.5.x base (pg_duckdb 1.5.3 + patched iceberg) — PRIVATE
 │   ├── entrypoint.sh
 │   └── seaweedfs-s3.json       ← SeaweedFS S3 auth config (example)
-├── docker-compose.test.yml     ← single-node dev stack: PG + Lakekeeper + SeaweedFS
+├── docker-compose.matrix.yml   ← single-node stack: PG + Lakekeeper + SeaweedFS
 ├── docker-compose.mesh.yml     ← 3 PG + Spock + Lakekeeper + SeaweedFS
 ├── run-ci-local.sh             ← pre-commit gate (ci/matrix.sh --quick)
 ├── config.example.yaml
@@ -655,7 +678,7 @@ pgedge-coldfront/
 | Component | Version | Purpose |
 |-----------|---------|---------|
 | PostgreSQL | 16, 17, or 18 | Database with native partitioning (stock upstream; no fork) |
-| pg_duckdb | 1.1.1+ | Iceberg reads via DuckDB in-process |
+| pg_duckdb | 1.5.3 (PR #1025) | Iceberg reads + writes via DuckDB in-process |
 | Lakekeeper | latest | Iceberg REST catalog (Rust binary) |
 | S3-compatible store | any | AWS S3, SeaweedFS, MinIO, GCS, Azure Blob, etc. |
 | Go | 1.24+ | Archiver binary (pure Go, no CGO) |

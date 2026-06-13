@@ -1,6 +1,6 @@
-# Parameterized single-node ("vanilla") stack for the CI matrix. Same services
-# as the legacy docker-compose.test.yml, but the db builds the ONE parameterized
-# image (docker/Dockerfile) for any PG major and configures itself via env
+# Parameterized single-node ("vanilla") stack for the CI matrix. The db builds the
+# DuckDB 1.5.x app image (docker/Dockerfile.duckdb15, FROM the prebuilt
+# coldfront-duckdb-base) for any PG major and configures itself via env
 # (entrypoint), not -c flags. Select the PG major with the PG_MAJOR env var:
 #
 #   PG_MAJOR=17 docker compose -f docker-compose.matrix.yml up -d --build

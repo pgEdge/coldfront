@@ -6,8 +6,8 @@
 # Usage: ci/topo/vanilla.sh --mode tiered|decoupled [--pg 16|17|18]
 #                           [--compose <file>] [--keep] [--regress]
 #
-# --pg selects the PG major; the stack builds the ONE parameterized image
-# (docker/Dockerfile, pgEdge minimal base, spock/snowflake left out → vanilla).
+# --pg selects the PG major; the stack builds the DuckDB 1.5.x image
+# (docker/Dockerfile.duckdb15, spock/snowflake left out → vanilla).
 # --regress runs the pg_regress installcheck (the unit layer) against the same
 # up stack before the journey — used by ci/matrix.sh so the unit + E2E layers
 # share one bring-up. The journey + assertions are identical across PG majors.

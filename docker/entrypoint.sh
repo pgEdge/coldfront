@@ -125,18 +125,17 @@ EOF
     # is on). The version/platform subpath is pinned in lockstep with the
     # iceberg-builder's OVERRIDE_GIT_DESCRIBE. See PATCHED.md.
     if [ -f /opt/coldfront/iceberg/iceberg.duckdb_extension ]; then
-        EXTDIR="$PGDATA/pg_duckdb/extensions/${COLDFRONT_DUCKDB_VERSION:-v1.4.3}/${COLDFRONT_DUCKDB_PLATFORM:-linux_amd64}"
+        EXTDIR="$PGDATA/pg_duckdb/extensions/${COLDFRONT_DUCKDB_VERSION:-v1.5.3}/${COLDFRONT_DUCKDB_PLATFORM:-linux_amd64}"
         mkdir -p "$EXTDIR"
         cp /opt/coldfront/iceberg/iceberg.duckdb_extension "$EXTDIR/iceberg.duckdb_extension"
         cp /opt/coldfront/iceberg/avro.duckdb_extension    "$EXTDIR/avro.duckdb_extension"
-        # azure ext present only in the DuckDB 1.5.x image (Azure ADLS cold tier).
-        # Conditional so this one entrypoint serves both the 1.4.3 and 1.5 images.
+        # azure ext (Azure ADLS cold tier) ships in the 1.5.x image. The [ -f ]
+        # guard is defensive (kept harmless even though it is always present now).
         [ -f /opt/coldfront/iceberg/azure.duckdb_extension ] && \
             cp /opt/coldfront/iceberg/azure.duckdb_extension "$EXTDIR/azure.duckdb_extension"
         # postgres_scanner ('postgres' ext) — shipped in the 1.5.x image so
         # install_extension('postgres') (pglocal write path) resolves it locally
-        # instead of downloading from extensions.duckdb.org. Conditional: the
-        # 1.4.3 image lacks it and still autoinstalls the released v1.4.3 build.
+        # instead of downloading from extensions.duckdb.org.
         [ -f /opt/coldfront/iceberg/postgres_scanner.duckdb_extension ] && \
             cp /opt/coldfront/iceberg/postgres_scanner.duckdb_extension "$EXTDIR/postgres_scanner.duckdb_extension"
     fi

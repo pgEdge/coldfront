@@ -96,7 +96,7 @@ object store:
 | Component | Role | License |
 |-----------|------|---------|
 | PostgreSQL 16+ | Heap storage; range partitioning for the tiered hot tier. Works uniformly on PG 16, 17, and 18 — the cold-tier secret is a DuckDB persistent secret loaded at instance init, with no version-gated mechanism. | PostgreSQL |
-| pg_duckdb | DuckDB in-process. Iceberg read + write. Analytics. Stock upstream `pgduckdb/pgduckdb:18-v1.1.1` (no fork). The bundled `duckdb-iceberg` carries one optional mesh-performance patch — async parquet overlap; see [Cold-write strategy](#cold-write-strategy-stock-vs-patched-duckdb-iceberg). | MIT |
+| pg_duckdb | DuckDB in-process. Iceberg read + write. Analytics. pg_duckdb 1.5.3 (PR #1025; no released 1.5.x tag yet). The `duckdb-iceberg` carries the bakery-aware commit-refresh patch (async parquet overlap, no 409); see [Cold-write strategy](#cold-write-strategy-stock-vs-patched-duckdb-iceberg). | MIT |
 | coldfront | PGXS C extension. `post_parse_analyze_hook` rewrites INSERT/UPDATE/DELETE on registered views to the correct tier; `ProcessUtility_hook` handles DDL; the hook lazily ATTACHes the Iceberg catalog on the first query touching a tiered view. | PostgreSQL |
 | Lakekeeper | Iceberg REST catalog. Single Rust binary. | Apache 2.0 |
 | S3-compatible store | Any: AWS S3, SeaweedFS, MinIO, GCS, Azure Blob, etc. | Varies |
@@ -310,7 +310,7 @@ held, selected by `coldfront.iceberg_async_parquet` (default `off`):
 | `iceberg_async_parquet` | duckdb-iceberg | Behaviour |
 |---|---|---|
 | `off` (default) | **stock** upstream | Claim-first: take the bakery ticket, *then* upload parquet **and** commit inside the ticket. Correct on an unpatched binary, but the whole parquet upload happens under the lock, so concurrent writers serialise on upload + commit. |
-| `on` | **patched** (`iceberg-bakery-aware-commit-refresh.patch`) | Overlap: upload parquet in the background *first*, then take the ticket only for the Lakekeeper commit. Concurrent writers' uploads overlap; only the short commit POST is serialised. |
+| `on` | **patched** (`iceberg-bakery-aware-commit-refresh-v15.patch`) | Overlap: upload parquet in the background *first*, then take the ticket only for the Lakekeeper commit. Concurrent writers' uploads overlap; only the short commit POST is serialised. |
 
 The code path is identical and the application-visible behaviour is
 identical — one transactional write, no 409, no app-level retry — so the
@@ -333,7 +333,7 @@ registry's `hot_table` — never by string, so it is schema-agnostic):
 
 | DDL | Behaviour |
 |---|---|
-| `ALTER TABLE _t ADD/DROP COLUMN`, `ALTER COLUMN ... TYPE`, `RENAME COLUMN` | **Blocked by design** — duckdb-iceberg (pg_duckdb v1.1.1) cannot `ALTER` an Iceberg table, so the hot and cold tiers would diverge. The hook raises an actionable error; to change the schema, untier the table, alter it, then re-tier. |
+| `ALTER TABLE _t ADD/DROP COLUMN`, `ALTER COLUMN ... TYPE`, `RENAME COLUMN` | **Blocked by design** — duckdb-iceberg cannot `ALTER` an Iceberg table, so the hot and cold tiers would diverge. The hook raises an actionable error; to change the schema, untier the table, alter it, then re-tier. |
 | `ALTER TABLE _t RENAME TO ...` | Supported (touches no Iceberg schema): update `tiered_views.hot_table`, rebuild the view. |
 | `ALTER VIEW v RENAME TO ...` | Supported: migrate the name-keyed registry + `archive_watermark` rows to the new view name, then rebuild (otherwise the lookups miss and the cold UNION branch silently disappears). |
 | `DROP TABLE _t` / `DROP VIEW v` | **Blocked by design** — would orphan the Iceberg cold tier. Dismantling tiering is a deliberate operator action (unregister with `partitioner remove`/`archiver remove`, which deletes the `partition_config` row, then drop each tier explicitly), never a one-shot call. |
@@ -480,10 +480,12 @@ S3-compatible store.  Both extensions must be in
 `shared_preload_libraries` — `coldfront` installs its hook in
 `_PG_init`, which fires at backend start.
 
-One parameterized image (`docker/Dockerfile`, `--build-arg PG_MAJOR=16|17|18`)
-serves every deployment: a pgEdge `*-spock5-minimal` base (bundles Spock +
-Snowflake) with pg_duckdb v1.1.1 compiled on top and coldfront installed. The
-same image plays both topology roles — vanilla leaves spock/snowflake out of
+A two-layer image serves every deployment: a prebuilt **base**
+(`docker/Dockerfile.duckdb15-base`) carrying pg_duckdb 1.5.3 (PR #1025) + the
+patched duckdb-iceberg on a pgEdge `*-spock5-minimal` base (Spock + Snowflake),
+and a thin **app** layer (`docker/Dockerfile.duckdb15`, `--build-arg
+PG_MAJOR=16|17|18`) that compiles coldfront on top. The same image plays both
+topology roles — vanilla leaves spock/snowflake out of
 `shared_preload_libraries`; mesh loads them (`MESH=on`, set by the entrypoint).
 
 ```yaml
@@ -491,7 +493,7 @@ services:
   db:
     build:
       context: .
-      dockerfile: docker/Dockerfile
+      dockerfile: docker/Dockerfile.duckdb15
       args: { PG_MAJOR: 18 }
     environment: { PG_MAJOR: 18, MESH: "off" }   # entrypoint configures preload + GUCs
   lakekeeper:

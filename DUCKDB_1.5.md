@@ -14,10 +14,10 @@
 > 1.5.x). There is **no official pg_duckdb release bundling DuckDB 1.5** — so we "wing it"
 > off the open pg_duckdb PR. This file records the build method **that actually works**.
 >
-> **Safety:** the working **DuckDB 1.4.3** patched-iceberg is the committed baseline-of-record
-> (see PATCHED.md, `docker/iceberg-bakery-aware-commit-refresh.patch`, commit `c18a99f`);
-> `main` is the revert target. All 1.5 work is on `feat/azure-duckdb-1.5` and never overwrites
-> the 1.4.3 artifacts.
+> **History:** the predecessor **DuckDB 1.4.3** patched-iceberg stack (its
+> `docker/Dockerfile` + 1.4.3 patches) was **retired** when 1.5.x became canonical.
+> It remains recoverable from git history (commit `c18a99f` and the pre-cutover
+> commits); PATCHED.md/UNPATCHED.md document its build for reference.
 
 ## Version pins (resolved from real source)
 
@@ -133,9 +133,9 @@ All three must be built against **DuckDB v1.5.x** (extension-API-compatible with
 The bakery is **essential and non-optional**: it is ColdFront's no-409 guarantee for
 concurrent cold writers, and the Azure (1.5) image must carry it exactly like the S3 (1.4.3)
 image does — *everything is identical except the storage backend*. The patch is a **separate
-file** — `docker/iceberg-bakery-aware-commit-refresh-v15.patch` — and does **not** overwrite
-the committed 1.4.3 patch (`docker/iceberg-bakery-aware-commit-refresh.patch`), which remains
-the revert-to baseline.
+file** — `docker/iceberg-bakery-aware-commit-refresh-v15.patch` — the current bakery
+patch. (The predecessor 1.4.3 patch was retired with the rest of the 1.4.3 stack;
+see git history.)
 
 **The problem is the same in both versions.** ColdFront uploads parquet *outside* the R-A
 bakery and takes the ticket only for the commit POST. By POST time a peer ticket-holder may

@@ -1,5 +1,12 @@
 # PATCHED — duckdb-iceberg with the bakery-aware commit-refresh patch
 
+> **⚠ Build superseded.** The build commands below target the **retired DuckDB 1.4.3**
+> stack (`docker/Dockerfile` + the 1.4.3 patches, removed in the 1.5 cutover —
+> recoverable from git history). The current patched build is
+> `docker/Dockerfile.duckdb15-base` (`iceberg-bakery-aware-commit-refresh-v15.patch`);
+> see [DUCKDB_1.5.md](DUCKDB_1.5.md) and [INSTALL.md](INSTALL.md). The patch
+> **rationale** below still applies to the v1.5 patch.
+
 > ColdFront has **one agnostic code path** for cold writes — it never 409s on any
 > binary. The two deployment modes differ only by **(a) which duckdb-iceberg
 > binary is loaded** and **(b) the `coldfront.iceberg_async_parquet` +
