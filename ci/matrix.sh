@@ -217,6 +217,14 @@ case "$SCOPE" in
         done
       done
     done
+    # Operational-hardening checks (ci/ops.sh) — run ONCE on a representative
+    # pg18·vanilla·tiered·s3 cell, not per matrix cell. Gated to the pg18 slice so a
+    # per-major fan-out (PG_ONLY) still runs it exactly once. Covers graceful
+    # degradation under a Lakekeeper or S3 outage (node + hot tier survive; cold
+    # I/O fails cleanly and recovers).
+    case " ${PG_ONLY:-18 17 16} " in
+      *" 18 "*) run_cell "ops-hardening (lakekeeper-down, s3-down)" bash "$SCRIPT_DIR/ops.sh" --pg 18 ;;
+    esac
     coverage_table
     echo -e "\n  NOTE: s3 (SeaweedFS) is hermetic and always RUN; the real cloud stores aws/azure/gcs RUN only when their COLDFRONT_* creds are present, else PENDING (tracked, never skipped silently)."
     ;;

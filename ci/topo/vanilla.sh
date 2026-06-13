@@ -125,29 +125,7 @@ else
     \"storage-credential\":{\"type\":\"s3\",\"credential-type\":\"access-key\",\"aws-access-key-id\":\"admin\",\"aws-secret-access-key\":\"adminsecret\"}
   }"
 fi
-WH=""
-for i in $(seq 1 15); do
-  WH=$(curl -s "http://$LK_IP:8181/management/v1/warehouse" -X POST -H "Content-Type: application/json" -d "$WH_BODY" 2>&1)
-  echo "$WH" | grep -q "warehouse-id" && break
-  # Already created on a prior attempt? Treat as success.
-  echo "$WH" | grep -qi "already exists" && { WH="warehouse-id (exists)"; break; }
-  sleep 2
-done
-echo "$WH" | grep -q "warehouse-id" || { echo "warehouse creation failed after retries: $WH"; exit 1; }
-
-# Seed the Iceberg namespace at provisioning time (deployment layer, alongside
-# warehouse creation). DuckDB 1.5.x defers an Iceberg CREATE SCHEMA to
-# transaction COMMIT while CREATE TABLE POSTs to the catalog eagerly, so
-# create_iceberg_table (decoupled mode) — which runs both in ONE plpgsql
-# transaction — 404s on a cold warehouse: the table POST references a namespace
-# Lakekeeper has not committed yet. The archiver (tiered) issues them as two
-# separate autocommitted statements and is unaffected. Creating the namespace
-# here, as its own committed REST POST, makes create_iceberg_table's in-txn
-# CREATE SCHEMA IF NOT EXISTS a no-op so the CREATE TABLE succeeds. See README.
-WID=$(echo "$WH" | grep -oE '"warehouse-id":"[^"]+"' | head -1 | cut -d'"' -f4)
-[ -z "$WID" ] && WID=$(curl -s "http://$LK_IP:8181/management/v1/warehouse" | grep -oE '"warehouse-id":"[^"]+"' | head -1 | cut -d'"' -f4)
-[ -n "$WID" ] && curl -s -X POST "http://$LK_IP:8181/catalog/v1/$WID/namespaces" \
-    -H "Content-Type: application/json" -d '{"namespace":["default"]}' >/dev/null 2>&1 || true
+create_warehouse_and_seed "$LK_IP" "$WH_BODY"   # POST warehouse + seed 'default' namespace (ci/lib.sh)
 
 if [ "$REGRESS" = 1 ]; then
     step "vanilla: pg_regress installcheck (unit layer)"

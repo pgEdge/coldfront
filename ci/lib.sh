@@ -93,3 +93,25 @@ topo_teardown() {
     docker rm -f "$CF_STANDBY" >/dev/null 2>&1 || true
     $COMPOSE down -v >/dev/null 2>&1 || true
 }
+
+# create_warehouse_and_seed <lk_ip> <wh_body>  — POST the (backend-specific) Lakekeeper
+# warehouse with retry, then seed the 'default' Iceberg namespace. The seed is REQUIRED:
+# DuckDB 1.5.x defers an Iceberg CREATE SCHEMA to transaction COMMIT while CREATE TABLE
+# POSTs eagerly, so coldfront.create_iceberg_table (decoupled, one txn) 404s on a cold
+# warehouse unless the namespace is pre-committed here as its own REST call. Exits the
+# caller on warehouse-create failure. The ONE home for this — topo/vanilla.sh,
+# topo/mesh.sh and ops.sh all call it (callers build the backend-specific <wh_body>).
+create_warehouse_and_seed() {
+    local lk_ip="$1" wh_body="$2" wh="" wid i
+    for i in $(seq 1 15); do
+        wh=$(curl -s "http://$lk_ip:8181/management/v1/warehouse" -X POST -H "Content-Type: application/json" -d "$wh_body" 2>&1)
+        echo "$wh" | grep -q "warehouse-id" && break
+        echo "$wh" | grep -qi "already exists" && { wh="warehouse-id (exists)"; break; }
+        sleep 2
+    done
+    echo "$wh" | grep -q "warehouse-id" || { echo "warehouse creation failed after retries: $wh"; exit 1; }
+    wid=$(echo "$wh" | grep -oE '"warehouse-id":"[^"]+"' | head -1 | cut -d'"' -f4)
+    [ -z "$wid" ] && wid=$(curl -s "http://$lk_ip:8181/management/v1/warehouse" | grep -oE '"warehouse-id":"[^"]+"' | head -1 | cut -d'"' -f4)
+    [ -n "$wid" ] && curl -s -X POST "http://$lk_ip:8181/catalog/v1/$wid/namespaces" \
+        -H "Content-Type: application/json" -d '{"namespace":["default"]}' >/dev/null 2>&1 || true
+}
