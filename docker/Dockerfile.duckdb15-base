@@ -6,11 +6,10 @@
 # which does `FROM` this image. Rebuilt only when the pg_duckdb PR ref, the
 # iceberg ref, or the bakery patch changes.
 #
-# ⚠ INTERNAL / PRIVATE — this image EMBEDS the bakery-aware-commit-refresh patch
-# (ColdFront IP, the no-409 guarantee). It is published to
-# ghcr.io/pgedge/coldfront-duckdb-base as a PRIVATE / INTERNAL package and MUST
-# NOT be made public. The base-image workflow (.github/workflows/base-image.yml)
-# builds and pushes it with the workflow GITHUB_TOKEN.
+# This is the prebuilt, stable layer; the thin coldfront app
+# (docker/Dockerfile.duckdb15) does FROM it. The base-image workflow
+# (.github/workflows/base-image.yml) builds and pushes it to
+# ghcr.io/pgedge/coldfront-duckdb-base with the workflow GITHUB_TOKEN.
 #
 #   docker build -f docker/Dockerfile.duckdb15-base --build-arg PG_MAJOR=18 \
 #       -t ghcr.io/pgedge/coldfront-duckdb-base:pg18 .
@@ -67,7 +66,7 @@ FROM quay.io/pypa/manylinux_2_28_x86_64 AS iceberg-builder
 ARG ICEBERG_REF=0fad545a
 # libasan/libubsan: the extension_configuration phase builds a Debug
 # duckdb_platform_binary that links AddressSanitizer. perl-Time-Piece:
-# openssl-from-source (vcpkg) Configure needs it. See DUCKDB_1.5.md.
+# openssl-from-source (vcpkg) Configure needs it. See DUCKDB_1.5_PATCHED.md.
 RUN dnf install -y --setopt=install_weak_deps=False \
         ninja-build perl-IPC-Cmd perl-Time-Piece ccache jq wget zip unzip tar autoconf libtool \
         kernel-headers cmake git make \
@@ -85,12 +84,12 @@ COPY docker/iceberg-azure-extension-config-v15.cmake /build/duckdb-iceberg/exten
 # The bakery-aware-commit-refresh patch (v1.5 port) — ESSENTIAL: coldfront's
 # no-409 guarantee for concurrent cold writers. git apply --check fails the
 # build loudly on patch rot instead of silently shipping stock iceberg (which
-# 409s under concurrency). See DUCKDB_1.5.md + the patch header.
+# 409s under concurrency). See DUCKDB_1.5_PATCHED.md + the patch header.
 COPY docker/iceberg-bakery-aware-commit-refresh-v15.patch /tmp/iceberg-bakery-v15.patch
 # The manifest-list format-version interop patch — adds the (spec-optional)
 # "format-version" key to the manifest-list Avro metadata so strict Apache
 # readers (iceberg-go, the coldfront compactor) parse the entries as v2 instead
-# of defaulting to v1 and rejecting the v2 manifest files. NOT IP — upstreamable.
+# of defaulting to v1 and rejecting the v2 manifest files. Upstreamable.
 # Inert to pg_duckdb reads (its ManifestListReader takes the version from table
 # metadata, not this key). See the patch header + COMPACTOR.md.
 COPY docker/iceberg-manifest-list-format-version-v15.patch /tmp/iceberg-mlist-fmtver-v15.patch
@@ -152,14 +151,10 @@ RUN mkdir -p /data && chown postgres:postgres /data
 
 ENV PG_MAJOR=${PG_MAJOR}
 
-# INTERNAL labelling — this image embeds ColdFront IP (the bakery patch). Keep the
-# ghcr.io/pgedge package PRIVATE/INTERNAL; do NOT publish.
 LABEL org.opencontainers.image.title="coldfront-duckdb-base" \
       org.opencontainers.image.vendor="pgEdge" \
       org.opencontainers.image.source="https://github.com/pgEdge/ColdFront" \
-      org.opencontainers.image.description="INTERNAL — ColdFront DuckDB 1.5.3 base (pg_duckdb PR#1025 + patched duckdb-iceberg with the bakery-aware commit-refresh patch). Embeds ColdFront IP; PRIVATE/INTERNAL only, do NOT make public." \
-      com.pgedge.visibility="internal" \
-      com.pgedge.internal="true"
+      org.opencontainers.image.description="ColdFront DuckDB 1.5.3 base (pg_duckdb PR#1025 + patched duckdb-iceberg with the bakery-aware commit-refresh patch)."
 
 USER postgres
 ENTRYPOINT ["/usr/local/bin/coldfront-entrypoint.sh"]

@@ -1,7 +1,7 @@
 # extension_config.cmake for the DuckDB 1.5.x ColdFront build (Azure ADLS cold
 # tier). Builds iceberg + avro + azure against ONE DuckDB (iceberg's
 # v1.5-variegata submodule) so all three .duckdb_extension files share one ABI
-# and load together in pg_duckdb 1.5.3. See DUCKDB_1.5.md for the why.
+# and load together in pg_duckdb 1.5.3. See DUCKDB_1.5_PATCHED.md for the why.
 #
 # This config only SELECTS which extensions to build; the bakery-aware-commit-
 # refresh patch is applied separately by docker/Dockerfile.duckdb15-base

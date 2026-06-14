@@ -2,18 +2,17 @@
 #
 # Applies to: duckdb-iceberg @ 0fad545a (branch v1.5-variegata), DuckDB v1.5.x.
 #
-# The DuckDB 1.5.x port of docker/iceberg-bakery-aware-commit-refresh.patch
-# (1.4.3 / ebe0dfaf). SEPARATE file; does NOT replace the 1.4.3 patch (the
-# revert-to baseline). Full rationale + side-by-side: DUCKDB_1.5.md.
+# The bakery-aware commit-refresh patch for duckdb-iceberg v1.5-variegata. Full
+# rationale: DUCKDB_1.5_PATCHED.md.
 #
-# Same problem as 1.4.3: coldfront uploads parquet OUTSIDE the R-A bakery and
+# The problem: coldfront uploads parquet OUTSIDE the R-A bakery and
 # takes the ticket only for the commit POST, so a writer committing against
 # session-cached metadata fails assert-ref-snapshot-id (Lakekeeper 409) when a
 # peer advanced the head, and an append built from the stale cached manifest
 # list silently drops the peer's data.
 #
 # v1.5 derives the new snapshot's parent + sequence_number at COMMIT time from
-# table_metadata (unlike 1.4.3's eager Finalize stamping), so the fix is:
+# table_metadata, so the fix is:
 # inside IcebergTransaction::DoTableUpdates (PG PRE_COMMIT, holding the ticket),
 # BEFORE GetTransactionRequest builds the commit, refresh each altered table's
 # table_metadata from Lakekeeper (IRCAPI::GetTable) AND re-read its source

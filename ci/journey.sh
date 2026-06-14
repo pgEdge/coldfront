@@ -547,6 +547,73 @@ EOSQL
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# Story 6e — Maintenance: reclaim the snapshot + small-file bloat compaction leaves
+# behind, via iceberg-go's ExpireSnapshots + DeleteOrphanFiles (cmd/compactor),
+# bakery-serialized through the SAME claim cold writes take (coldfront._claim_iceberg_
+# external; stock-ordering claimant, formally cleared in docs/formal). Lakekeeper is a
+# catalog and does NOT do Iceberg snapshot/orphan maintenance — this is the go-native
+# path. The chain is natural (no synthetic files): after 6d's compaction the pre-compaction
+# snapshots still pin the superseded small files; --expire-keep-files drops those snapshots
+# (metadata) but leaves their files, which the --orphans pass then reclaims. The compactor's
+# own --dry-run is the oracle (snapshot count, orphan count), as in 6d.
+# ───────────────────────────────────────────────────────────────────────────
+story_maintenance() {
+    step "6e. Maintenance: expire old snapshots + reclaim orphan files (iceberg-go, bakery-serialized)"
+    local rows_before; rows_before=$(q "$HOST" "SELECT count(*) FROM events;")
+
+    local snaps; snaps=$("$COMPACTOR" --config /tmp/journey-archiver.yaml --table events --expire-snapshots --dry-run 2>&1)
+    local nsnap; nsnap=$(echo "$snaps" | grep -oE '[0-9]+ snapshot' | head -1 | grep -oE '[0-9]+')
+    if [ "${nsnap:-0}" -gt 1 ]; then
+        pass "expire sees >1 snapshot (compaction + cold writes left $nsnap)"
+    else
+        fail "expire --dry-run shows nothing to expire: $snaps"; return
+    fi
+
+    # Expire metadata, KEEP files — leaves the superseded smalls as real orphans for --orphans.
+    # --expire-older-than 0s: Iceberg expiry is age-driven, so expire all but the current
+    # snapshot now (the freshly-created test snapshots are only seconds old).
+    if "$COMPACTOR" --config /tmp/journey-archiver.yaml --table events \
+         --expire-snapshots --expire-older-than 0s --expire-retain-last 1 --expire-keep-files >/tmp/journey-expire.log 2>&1; then
+        pass "snapshots expired (bakery-serialized, no 409)"
+    else
+        fail "expire failed — see /tmp/journey-expire.log"; tail -8 /tmp/journey-expire.log; return
+    fi
+
+    local after; after=$("$COMPACTOR" --config /tmp/journey-archiver.yaml --table events --expire-snapshots --dry-run 2>&1)
+    local nafter; nafter=$(echo "$after" | grep -oE '[0-9]+ snapshot' | head -1 | grep -oE '[0-9]+')
+    if [ "${nafter:-0}" -eq 1 ]; then
+        pass "expired down to the retain-last target (1 snapshot)"
+    else
+        fail "snapshot count not at retain target after expire: $after"
+    fi
+
+    # The files those expired snapshots alone pinned are now orphans (referenced by nothing).
+    local orph; orph=$("$COMPACTOR" --config /tmp/journey-archiver.yaml --table events --orphans --orphan-age 0s --dry-run 2>&1)
+    local norph; norph=$(echo "$orph" | grep -oE '[0-9]+ orphan' | head -1 | grep -oE '[0-9]+')
+    if [ "${norph:-0}" -gt 0 ]; then
+        pass "orphan scan finds the freed files ($norph; real backend, no prefix-mismatch)"
+    else
+        fail "no orphans detected after expire-keep-files: $orph"; return
+    fi
+
+    if "$COMPACTOR" --config /tmp/journey-archiver.yaml --table events --orphans --orphan-age 0s >/tmp/journey-orphans.log 2>&1; then
+        pass "orphan files deleted (bakery-serialized)"
+    else
+        fail "orphan deletion failed — see /tmp/journey-orphans.log"; tail -8 /tmp/journey-orphans.log; return
+    fi
+
+    local orph2; orph2=$("$COMPACTOR" --config /tmp/journey-archiver.yaml --table events --orphans --orphan-age 0s --dry-run 2>&1)
+    local norph2; norph2=$(echo "$orph2" | grep -oE '[0-9]+ orphan' | head -1 | grep -oE '[0-9]+')
+    if [ "${norph2:-1}" -eq 0 ]; then
+        pass "no orphans remain (reclaimed)"
+    else
+        fail "orphans remain after deletion: $orph2"
+    fi
+
+    assert_eq "maintenance preserved all rows" "$rows_before" "$(q "$HOST" "SELECT count(*) FROM events;")"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Story 6c — Cold + dual-tier DML issued from INSIDE plpgsql (a DO block). This
 # is the end-to-end test of BOTH fixes: plpgsql variable refs become $N bound
 # params (Cause 1, kept live via format()), and the rewrite must be a DML-tagged
@@ -1219,6 +1286,8 @@ if [ "$MODE" = "tiered" ]; then
     story_compaction        # iceberg-go RewriteDataFiles, now that the manifest-list
                             # format-version interop patch makes the cold tier's
                             # manifests iceberg-go-readable
+    story_maintenance       # iceberg-go ExpireSnapshots + DeleteOrphanFiles — reclaim the
+                            # snapshot/small-file bloat compaction leaves (Lakekeeper can't)
     story_writes_plpgsql
     story_app_privilege          # non-superuser onboarding + cold I/O (mesh: cross-node + SD bakery)
     story_mixed_concurrency

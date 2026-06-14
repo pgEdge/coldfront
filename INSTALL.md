@@ -52,9 +52,8 @@ in the prebuilt **base**, published to
 ([`docker/Dockerfile.duckdb15`](docker/Dockerfile.duckdb15)) just `FROM`s it and
 compiles the coldfront extension in seconds. If you build the base yourself
 (step 1) the app layer `FROM`s your local image. To `FROM` the published base
-instead of recompiling, note it is **PRIVATE/INTERNAL** — it embeds the bakery
-patch (ColdFront IP) — so building the app layer against it requires
-`docker login ghcr.io` first. Rebuild the published base via the
+instead of recompiling requires `docker login ghcr.io` while it is not yet
+published publicly (pre-Beta). Rebuild the published base via the
 [base-image workflow](.github/workflows/base-image.yml) (`gh workflow run
 base-image.yml`) when its inputs change.
 

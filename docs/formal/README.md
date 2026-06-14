@@ -249,16 +249,27 @@ represented faithfully because they affect protocol correctness:
   reply-fresh peers must have flushed our LSN, partition-alone bail
   via RAISE).
 
-### Compaction commits (`cmd/compactor`)
+### Compactor commits (`cmd/compactor`)
 
-The Go compactor (`cmd/compactor`, apache/iceberg-go `RewriteDataFiles`) is a
-bakery claimant **indistinguishable from a cold writer at the protocol level**:
-it acquires a claim via `_claim_iceberg_lock` on the node it connects to,
-captures the parent snapshot under the held claim, issues one Lakekeeper CAS
-POST — a *replace* (drop small data files, add the rewritten one), which has the
+The Go compactor (`cmd/compactor`, apache/iceberg-go) is a bakery claimant
+**indistinguishable from a cold writer at the protocol level**: it acquires a
+claim via `_claim_iceberg_lock` on the node it connects to, captures the parent
+snapshot under the held claim, issues one Lakekeeper CAS POST — a *replace*
+(`RewriteDataFiles`: drop small data files, add the rewritten one), which has the
 same parent-CAS conflict shape as the append modelled at `Decide` — then
 releases. It adds no new protocol primitive, so it is covered by the existing
 proof as the **stock-ordering writer** (`AsyncParquet = FALSE`, `Bakery_v2.cfg`).
+
+Its two maintenance operations are the **same claimant**, so they need no new
+model: **`ExpireSnapshots`** issues another CAS commit (drop old snapshots —
+identical conflict shape) under the held claim, covered exactly like
+`RewriteDataFiles`; **`DeleteOrphanFiles`** holds the claim but makes **no
+Lakekeeper commit** (it only deletes unreferenced files), so it cannot cause a
+catalog conflict at all — strictly weaker than a committing claimant, hence
+trivially within `NoLakekeeperConflict`. All three reuse the existing
+`coldfront._claim_iceberg_external`; the protocol is unchanged, so the model and
+every config result are unchanged. (Lakekeeper itself does no Iceberg
+snapshot/orphan maintenance — it is a catalog — so this is the go-native path.)
 
 Binding constraint: iceberg-go carries **no bakery-aware re-stamp patch** (that
 patch lives only in the duckdb-iceberg commit path), so the compactor MUST hold

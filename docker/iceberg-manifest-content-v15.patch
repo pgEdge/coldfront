@@ -2,7 +2,7 @@
 #
 # Applies to: duckdb-iceberg @ 0fad545a (branch v1.5-variegata), DuckDB v1.5.x.
 #
-# Cross-engine interop fix (NOT IP — upstreamable to duckdb-iceberg). Companion
+# Cross-engine interop fix — upstreamable to duckdb-iceberg. Companion
 # to iceberg-manifest-list-format-version-v15.patch; same class of bug.
 #
 # Problem: the manifest FILE Avro writer (manifest::WriteToFile) hardcodes the

@@ -47,7 +47,7 @@ s3:
 #   use_ssl: true
 
 # azure:                        # Azure ADLS Gen2 cold tier (requires the DuckDB
-#                               # 1.5.x build — see DUCKDB_1.5.md). The access
+#                               # 1.5.x build — see DUCKDB_1.5_PATCHED.md). The access
 #                               # key rides inside the connection string; there
 #                               # is no separate account-key field. Leave s3.*
 #                               # empty when using azure.

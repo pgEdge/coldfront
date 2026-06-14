@@ -56,7 +56,7 @@ elif [ ! -f "$PGDATA/PG_VERSION" ]; then
 listen_addresses = '*'
 shared_preload_libraries = '${PRELOAD}'
 # ColdFront ships its OWN patched duckdb-iceberg (bakery-aware commit refresh;
-# see PATCHED.md), placed into the extension cache below. autoinstall stays ON so
+# see DUCKDB_1.5_PATCHED.md), placed into the extension cache below. autoinstall stays ON so
 # postgres_scanner + any non-bundled deps auto-install; it does NOT clobber the
 # pre-placed iceberg/avro (DuckDB skips install for extensions already present).
 # allow_unsigned ON so the locally-built (unsigned) extension loads; autoload ON
@@ -123,7 +123,7 @@ EOF
     # Place the patched duckdb-iceberg + avro into DuckDB's per-data-dir
     # extension cache so pg_duckdb loads them (autoinstall is off, allow_unsigned
     # is on). The version/platform subpath is pinned in lockstep with the
-    # iceberg-builder's OVERRIDE_GIT_DESCRIBE. See PATCHED.md.
+    # iceberg-builder's OVERRIDE_GIT_DESCRIBE. See DUCKDB_1.5_PATCHED.md.
     if [ -f /opt/coldfront/iceberg/iceberg.duckdb_extension ]; then
         EXTDIR="$PGDATA/pg_duckdb/extensions/${COLDFRONT_DUCKDB_VERSION:-v1.5.3}/${COLDFRONT_DUCKDB_PLATFORM:-linux_amd64}"
         mkdir -p "$EXTDIR"

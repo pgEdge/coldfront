@@ -6,12 +6,12 @@
 # compiles the coldfront C extension (seconds), so CI and local builds are fast
 # and always test the CURRENT coldfront source.
 #
-# This is the canonical ColdFront app layer. All proven in DUCKDB_1.5.md.
+# This is the canonical ColdFront app layer. All proven in DUCKDB_1.5_PATCHED.md.
 #
-# ⚠ COLDFRONT_BASE is a PRIVATE/INTERNAL ghcr.io/pgedge image (it embeds the
-# bakery patch — ColdFront IP). Before building, either `docker login ghcr.io`
-# (read:packages) to pull it, or build it locally first and it will be used from
-# the local image cache:
+# COLDFRONT_BASE is the prebuilt ghcr.io/pgedge base image. Before building, either
+# `docker login ghcr.io` (read:packages) to pull it — while it is not yet published
+# publicly (pre-Beta) — or build it locally first and it will be used from the local
+# image cache:
 #   docker build -f docker/Dockerfile.duckdb15-base --build-arg PG_MAJOR=18 \
 #       -t ghcr.io/pgedge/coldfront-duckdb-base:pg18 .
 #

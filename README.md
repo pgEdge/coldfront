@@ -139,6 +139,7 @@ Both modes in depth, the partition CLI, supported types, and mesh setup are in
 | **[USAGE.md](USAGE.md)** | Day-to-day use — both modes plus the standalone partition manager, one-time setup, reading/writing, supported types, the partition CLI, storage backends, distributed (mesh) setup, tuning |
 | **[INSTALL.md](INSTALL.md)** | Build from source (Docker or bare-metal); Testing & CI |
 | **[S3_HOWTO.md](S3_HOWTO.md)** | Get ColdFront running on cloud S3 (virtual-hosted), end-to-end |
+| **[COMPACTOR.md](COMPACTOR.md)** | Cold-tier table maintenance — compaction, snapshot expiry, orphan-file removal |
 | **[ARCHITECTURE.md](ARCHITECTURE.md)** | Shared architecture and core mechanics |
 | **[ARCHITECTURE_TIERED.md](ARCHITECTURE_TIERED.md)** | Tiered (hot PG + cold Iceberg) deep dive |
 | **[ARCHITECTURE_DECOUPLED.md](ARCHITECTURE_DECOUPLED.md)** | Decoupled (iceberg-only) deep dive |
@@ -220,35 +221,45 @@ denied), and at the catalog level by the `privilege_model` pg_regress test.
 
 ```
 pgedge-coldfront/
-├── cmd/archiver/
-│   ├── main.go                 ← entry point (pure Go, pgx only)
-│   └── main_test.go            ← retry, type mapping, interval tests
+├── cmd/
+│   ├── archiver/               ← tiering daemon: moves expired PG partitions → Iceberg (pure Go, pgx)
+│   ├── partitioner/            ← standalone partition-manager CLI (time/id modes, 2-level)
+│   └── compactor/              ← cold-tier maintenance: compaction, snapshot expiry, orphan removal (iceberg-go)
 ├── internal/
 │   ├── config/                 ← YAML config loading + validation
-│   ├── watermark/              ← archive_watermark table CRUD
-│   ├── partition/              ← partition create/find/detach/drop
-│   └── view/                   ← unified view + trigger generation
-├── extension/coldfront/        ← PGXS C extension (hooks, bakery, registry)
+│   ├── partcfg/                ← in-DB, Spock-replicated per-table lifecycle config
+│   ├── partition/              ← partition create/find/detach/drop (time + id modes)
+│   ├── sqlutil/                ← shared SQL helpers
+│   ├── view/                   ← unified view + trigger generation
+│   └── watermark/              ← archive_watermark table CRUD
+├── extension/coldfront/        ← PGXS C extension (DML hooks, bakery, registry, SQL)
 ├── ci/
 │   ├── journey.sh              ← THE canonical user journey (the E2E spec)
 │   ├── matrix.sh               ← drives PG×topology×mode×target cells (--quick / --full)
+│   ├── ops.sh                  ← operational checks (privilege model, Lakekeeper-down, S3-down)
 │   ├── probe-standby.sh        ← risk gate: iceberg_scan on a read-only hot standby
 │   ├── lib.sh                  ← shared step/assert/psql helpers
 │   ├── topo/                   ← vanilla.sh (1 node) · mesh.sh (3-node Spock)
 │   └── runbooks/               ← failover-patroni.md (failover delegated to Patroni)
 ├── docker/
+│   ├── Dockerfile.duckdb15-base ← DuckDB 1.5.x base (pg_duckdb 1.5.3 + patched iceberg)
 │   ├── Dockerfile.duckdb15      ← thin coldfront app layer (ARG PG_MAJOR=16|17|18)
-│   ├── Dockerfile.duckdb15-base ← DuckDB 1.5.x base (pg_duckdb 1.5.3 + patched iceberg) — PRIVATE
+│   ├── iceberg-*.patch          ← duckdb-iceberg patches (bakery commit-refresh + strict-reader interop)
 │   ├── entrypoint.sh
-│   └── seaweedfs-s3.json       ← SeaweedFS S3 auth config (example)
+│   └── seaweedfs-s3.json        ← SeaweedFS S3 auth config (example)
+├── docs/formal/                ← TLA+ model of the bakery protocol (Bakery_v2.tla)
 ├── docker-compose.yml          ← END-USER single-node stack (ports published)
 ├── docker-compose.matrix.yml   ← CI only: single-node vanilla matrix
 ├── docker-compose.mesh.yml     ← CI only: 3-node Spock mesh
 ├── run-ci-local.sh             ← pre-commit gate (ci/matrix.sh --quick)
-├── config.example.yaml
-├── Makefile
-├── USAGE.md                    ← user-level usage guide (both modes + partition manager)
-├── ARCHITECTURE.md             ← common architecture (shared mechanics)
+├── config.example.yaml · Makefile
+├── USAGE.md                    ← user guide (both modes + partition manager)
+├── INSTALL.md                  ← build from source (Docker / bare-metal)
+├── COMPACTOR.md                ← cold-tier table maintenance (compaction / expiry / orphans)
+├── S3_HOWTO.md                 ← cloud-S3 cold tier, end-to-end
+├── DUCKDB_1.5_PATCHED.md       ← the patched DuckDB 1.5 base: what's patched + how it's built
+├── DUCKDB_1.5_UNPATCHED.md     ← building the base unpatched, and the consequences
+├── ARCHITECTURE.md             ← shared architecture (core mechanics)
 ├── ARCHITECTURE_TIERED.md      ← tiered (hot PG + cold Iceberg) mode
 └── ARCHITECTURE_DECOUPLED.md   ← decoupled (iceberg-only) mode
 ```

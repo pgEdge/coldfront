@@ -2,7 +2,7 @@
 #
 # Applies to: duckdb-iceberg @ 0fad545a (branch v1.5-variegata), DuckDB v1.5.x.
 #
-# Cross-engine interop fix (NOT ColdFront IP — upstreamable to duckdb-iceberg).
+# Cross-engine interop fix — upstreamable to duckdb-iceberg.
 #
 # Problem: the manifest-list Avro writer (manifest_list::WriteToFile) emits v2
 # manifest_file entries (content/sequence_number/min_sequence_number columns)

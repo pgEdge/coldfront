@@ -321,7 +321,7 @@ into PG's pre-commit phase (inside the bakery ticket, against a
 freshly-fetched table), making the upload safe to overlap. The Docker image
 ships the patched binary with `iceberg_async_parquet = on`; bare-metal users
 on a stock binary leave it `off` and lose only the upload overlap. See
-[PATCHED.md](PATCHED.md) and [UNPATCHED.md](UNPATCHED.md) for the build and
+[DUCKDB_1.5_PATCHED.md](DUCKDB_1.5_PATCHED.md) and [DUCKDB_1.5_UNPATCHED.md](DUCKDB_1.5_UNPATCHED.md) for the build and
 the full rationale.
 
 ### Transparent DDL via coldfront
@@ -634,23 +634,25 @@ through to AWS virtual-hosted-style defaults
 (`<bucket>.s3.amazonaws.com`) because `SecretManager::LookupSecret` returns
 empty.
 
-**Mechanism (verified by reading
-[duckdb-iceberg/src/storage/irc_transaction.cpp:317](https://github.com/duckdb/duckdb-iceberg/blob/ebe0dfaf/src/storage/irc_transaction.cpp#L317)
-and the DuckDB v1.4.3 catalog\_set / secret\_manager source).**
-`IRCTransaction::Commit` opens a fresh `Connection` and `BeginTransaction`
-to do its commit-time I/O. That fresh transaction has its own
-`transaction_id`/`start_time` and cannot see `SecretManager` `CatalogEntry`
-items registered by the caller's still-active transaction —
-[`CatalogSet::UseTimestamp`](https://github.com/duckdb/duckdb/blob/v1.4.3/src/catalog/catalog_set.cpp#L503)'s
-visibility rules require either same-tx (`timestamp == transaction_id`)
-or already-committed (`timestamp < start_time`). Neither holds for the
-caller's still-uncommitted secret. After any prior DuckDB
-`MetaTransaction::Commit` in the backend, the secret entry's timestamp
-flips to a committed value (< `TRANSACTION_ID_START`) and every
-subsequent fresh transaction satisfies the second rule. A DuckDB persistent
-secret achieves the same thing structurally: loaded at instance init, it is
+**Mechanism (verified against duckdb-iceberg `v1.5-variegata` @ `0fad545a`
+`IcebergTransaction::Commit` and DuckDB's `CatalogSet` / `SecretManager`
+source).** `IcebergTransaction::Commit` opens a fresh `Connection` +
+`BeginTransaction` for its commit-time I/O and **copies the caller's
+`ClientConfig`** into it (`temp_con_context->config = context->config` — so
+`SET`-style settings such as `s3_access_key_id` *are* available). But a secret
+created with `CREATE SECRET` does **not** live in `ClientConfig` — it is a
+`CatalogEntry` in the `SecretManager` catalog, which `config` does not carry. So
+the fresh transaction still cannot see a secret registered by the caller's
+still-active transaction: `CatalogSet::UseTimestamp`'s visibility rules require
+either same-tx (`timestamp == transaction_id`) or already-committed
+(`timestamp < start_time`), and neither holds for the caller's still-uncommitted
+secret. After any prior DuckDB `MetaTransaction::Commit` in the backend the
+secret entry's timestamp flips to a committed value (< `TRANSACTION_ID_START`)
+and every subsequent fresh transaction satisfies the second rule. A DuckDB
+**persistent** secret achieves this structurally: loaded at instance init, it is
 already at a committed timestamp before any backend's first cold-tier
-transaction looks it up, so the second rule holds from the start.
+transaction looks it up — so the persistent-secret design still holds on v1.5
+and is still required for a synthesized (non-`SET`) credential.
 
 **Reproducer (no coldfront required).**
 
@@ -671,7 +673,7 @@ INSERT INTO ice.default.t VALUES (...);
 -- → commits cleanly via the secret's endpoint
 ```
 
-**Desired end-state.** Either `IRCTransaction::Commit` runs its commit-time
+**Desired end-state.** Either `IcebergTransaction::Commit` runs its commit-time
 I/O under the caller's `ClientContext` (rather than a freshly-opened
 Connection), or any extension that synthesises `CREATE SECRET` from external
 state commits that transaction explicitly, so the secret sits at a committed
@@ -695,7 +697,7 @@ without consulting per-file stats. Robust against any future archiver
 change that might break the one-snapshot-per-partition invariant.
 
 **Why it doesn't work today.** Verified empirically against
-`duckdb-iceberg` at commit `ebe0dfaf` (v1.4.3):
+`duckdb-iceberg`:
 
 ```
 1. CREATE TABLE ice."default".x (id BIGINT, ts TIMESTAMPTZ) — succeeds, empty spec

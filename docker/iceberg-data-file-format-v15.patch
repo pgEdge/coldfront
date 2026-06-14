@@ -2,7 +2,7 @@
 #
 # Applies to: duckdb-iceberg @ 0fad545a (branch v1.5-variegata), DuckDB v1.5.x.
 #
-# Cross-engine interop fix (NOT IP — upstreamable to duckdb-iceberg). Third in the
+# Cross-engine interop fix — upstreamable to duckdb-iceberg. Third in the
 # strict-reader interop set, with iceberg-manifest-list-format-version-v15.patch
 # and iceberg-manifest-content-v15.patch.
 #

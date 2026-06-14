@@ -62,7 +62,7 @@ type S3Config struct {
 // s3.* must be left empty. The storage-account access key rides INSIDE the
 // connection string (DefaultEndpointsProtocol=…;AccountName=…;AccountKey=…;
 // EndpointSuffix=…); the DuckDB azure extension has no separate account-key
-// parameter. Requires the DuckDB 1.5.x stack (see DUCKDB_1.5.md).
+// parameter. Requires the DuckDB 1.5.x stack (see DUCKDB_1.5_PATCHED.md).
 type AzureConfig struct {
 	ConnectionString string `yaml:"connection_string"`
 }
