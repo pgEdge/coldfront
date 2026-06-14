@@ -15,7 +15,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/pgedge/coldfront/internal/config"
 	"github.com/pgedge/coldfront/internal/partcfg"
@@ -25,8 +24,8 @@ import (
 	"github.com/pgedge/coldfront/internal/watermark"
 )
 
-// querier is the subset of *pgxpool.Pool that the pg-catalog helpers below use.
-// Defined for testability — *pgxpool.Pool satisfies it directly.
+// querier is the subset of *pgx.Conn that the pg-catalog helpers below use.
+// Defined for testability — *pgx.Conn satisfies it directly.
 type querier interface {
 	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
@@ -73,24 +72,24 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
-	pool, err := pgxpool.New(ctx, cfg.Postgres.DSN)
+	conn, err := pgx.Connect(ctx, cfg.Postgres.DSN)
 	if err != nil {
 		log.Fatalf("connect pg: %v", err)
 	}
-	defer pool.Close()
+	defer func() { _ = conn.Close(ctx) }()
 
-	if err := pool.Ping(ctx); err != nil {
+	if err := conn.Ping(ctx); err != nil {
 		log.Fatalf("ping pg: %v", err)
 	}
 
-	wmStore := watermark.NewStore(pool)
+	wmStore := watermark.NewStore(conn)
 	if err := wmStore.EnsureTable(ctx); err != nil {
 		log.Fatalf("ensure watermark table: %v", err)
 	}
 
 	// Resolve managed tables from the replicated coldfront.partition_config
 	// table, falling back to the YAML archiver.tables (deprecation bridge).
-	tables, fromYAML, err := partcfg.ResolveTables(ctx, pool, cfg.Archiver.Tables)
+	tables, fromYAML, err := partcfg.ResolveTables(ctx, conn, cfg.Archiver.Tables)
 	if err != nil {
 		log.Fatalf("resolve tables: %v", err)
 	}
@@ -115,11 +114,11 @@ func main() {
 		// and carry an explicit partition_column (the RANGE/time key), required
 		// by config — on a first run no LIST child exists yet to detect it from.
 		if t.SubPartition == nil {
-			if err := validateFlatPartitioning(ctx, pool, t.SourceSchema, t.SourceTable); err != nil {
+			if err := validateFlatPartitioning(ctx, conn, t.SourceSchema, t.SourceTable); err != nil {
 				log.Fatalf("[%s] %v", t.SourceTable, err)
 			}
 			if t.PartitionColumn == "" {
-				cols, err := detectPartitionColumns(ctx, pool, t.SourceSchema, t.SourceTable)
+				cols, err := detectPartitionColumns(ctx, conn, t.SourceSchema, t.SourceTable)
 				if err != nil {
 					log.Fatalf("auto-detect partition column for %s: %v", t.SourceTable, err)
 				}
@@ -132,7 +131,7 @@ func main() {
 		}
 
 		log.Printf("[%s] starting archive cycle", t.SourceTable)
-		if err := runCycle(ctx, cfg, t, pool, wmStore, *debugExportDelay); err != nil {
+		if err := runCycle(ctx, cfg, t, conn, wmStore, *debugExportDelay); err != nil {
 			log.Fatalf("[%s] archive cycle: %v", t.SourceTable, err)
 		}
 		log.Printf("[%s] archive cycle complete", t.SourceTable)
@@ -140,8 +139,8 @@ func main() {
 }
 
 // execDuckDB executes a DuckDB SQL statement via duckdb.raw_query().
-func execDuckDB(ctx context.Context, pool *pgxpool.Pool, sql string) error {
-	_, err := pool.Exec(ctx, fmt.Sprintf(`SELECT duckdb.raw_query($q$%s$q$)`, sql))
+func execDuckDB(ctx context.Context, conn *pgx.Conn, sql string) error {
+	_, err := conn.Exec(ctx, fmt.Sprintf(`SELECT duckdb.raw_query($q$%s$q$)`, sql))
 	return err
 }
 
@@ -186,12 +185,12 @@ func coldSecretSQL(cfg *config.Config) string {
 }
 
 // attachIceberg sets up the per-connection DuckDB cold-store secret and Lakekeeper catalog.
-func attachIceberg(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config) error {
-	if err := execDuckDB(ctx, pool, coldSecretSQL(cfg)); err != nil {
+func attachIceberg(ctx context.Context, conn *pgx.Conn, cfg *config.Config) error {
+	if err := execDuckDB(ctx, conn, coldSecretSQL(cfg)); err != nil {
 		return fmt.Errorf("create cold-store secret: %w", err)
 	}
 
-	if err := execDuckDB(ctx, pool, fmt.Sprintf(
+	if err := execDuckDB(ctx, conn, fmt.Sprintf(
 		"ATTACH IF NOT EXISTS %s AS ice (TYPE ICEBERG, ENDPOINT %s, AUTHORIZATION_TYPE NONE, ACCESS_DELEGATION_MODE NONE)",
 		sqlutil.Literal(cfg.Iceberg.Warehouse), sqlutil.Literal(cfg.Iceberg.LakekeeperEndpoint))); err != nil {
 		return fmt.Errorf("attach iceberg catalog: %w", err)
@@ -305,17 +304,17 @@ func resolveTableName(ctx context.Context, db querier, schema, source string) st
 // partitions, finds expired ones, archives each (capture trigger + bulk
 // export + delta replay + atomic cutover), and drops archived PG partitions.
 // Safe to re-run — every phase is idempotent.
-func runCycle(ctx context.Context, cfg *config.Config, t *config.TableConfig, pool *pgxpool.Pool, wmStore *watermark.Store, debugExportDelay time.Duration) error {
+func runCycle(ctx context.Context, cfg *config.Config, t *config.TableConfig, conn *pgx.Conn, wmStore *watermark.Store, debugExportDelay time.Duration) error {
 	now := time.Now().UTC()
 	if t.SubPartition != nil {
-		return runCycleTwoLevel(ctx, cfg, t, pool, wmStore, debugExportDelay, now)
+		return runCycleTwoLevel(ctx, cfg, t, conn, wmStore, debugExportDelay, now)
 	}
-	partMgr := partition.NewManager(pool)
-	viewGen := view.NewGenerator(pool)
+	partMgr := partition.NewManager(conn)
+	viewGen := view.NewGenerator(conn)
 	iceTable := pgx.Identifier{"ice", cfg.Iceberg.Namespace, t.SourceTable}.Sanitize()
 
 	// Resolve actual table name (_{source} after swap, {source} on first run)
-	tableName := resolveTableName(ctx, pool, t.SourceSchema, t.SourceTable)
+	tableName := resolveTableName(ctx, conn, t.SourceSchema, t.SourceTable)
 
 	// 1. Create future partitions. The cold tier always partitions by time.
 	if err := partMgr.EnsureFuture(ctx, tableName, t.SourceSchema,
@@ -346,16 +345,16 @@ func runCycle(ctx context.Context, cfg *config.Config, t *config.TableConfig, po
 
 	// 3. Attach the Lakekeeper catalog and ensure the Iceberg table exists —
 	//    needed by both the tiering pass and the cold-expiry DELETE.
-	if err := attachIceberg(ctx, pool, cfg); err != nil {
+	if err := attachIceberg(ctx, conn, cfg); err != nil {
 		return err
 	}
-	if err := ensureIcebergTable(ctx, pool, cfg, t, iceTable); err != nil {
+	if err := ensureIcebergTable(ctx, conn, cfg, t, iceTable); err != nil {
 		return fmt.Errorf("ensure iceberg table: %w", err)
 	}
 
 	// 4. Tiering pass: move each past-hot partition hot → cold.
 	if len(hotExpired) > 0 {
-		columns, err := getColumns(ctx, pool, t.SourceSchema, t.SourceTable)
+		columns, err := getColumns(ctx, conn, t.SourceSchema, t.SourceTable)
 		if err != nil {
 			return fmt.Errorf("get columns: %w", err)
 		}
@@ -392,7 +391,7 @@ func runCycle(ctx context.Context, cfg *config.Config, t *config.TableConfig, po
 			return fmt.Errorf("bootstrap view: %w", err)
 		}
 		hotTable := pgx.Identifier{t.SourceSchema, "_" + t.SourceTable}.Sanitize()
-		if err := registerTieredView(ctx, pool, t.SourceSchema, t.SourceTable,
+		if err := registerTieredView(ctx, conn, t.SourceSchema, t.SourceTable,
 			hotTable, iceTable, t.PartitionColumn); err != nil {
 			return fmt.Errorf("register tiered view: %w", err)
 		}
@@ -411,7 +410,7 @@ func runCycle(ctx context.Context, cfg *config.Config, t *config.TableConfig, po
 				// Idempotent cleanup branch: partition was archived in a prior cycle,
 				// no race to worry about.
 				log.Printf("partition %s already archived, cleaning up", part.Name)
-				parent := resolveTableName(ctx, pool, t.SourceSchema, t.SourceTable)
+				parent := resolveTableName(ctx, conn, t.SourceSchema, t.SourceTable)
 				if err := partMgr.Detach(ctx, parent, t.SourceSchema, part.Name); err != nil {
 					return fmt.Errorf("detach %s: %w", part.Name, err)
 				}
@@ -421,7 +420,7 @@ func runCycle(ctx context.Context, cfg *config.Config, t *config.TableConfig, po
 				continue
 			}
 
-			if err := archivePartition(ctx, pool, t, part, iceTable, columns, debugExportDelay); err != nil {
+			if err := archivePartition(ctx, conn, t, part, iceTable, columns, debugExportDelay); err != nil {
 				return fmt.Errorf("archive %s: %w", part.Name, err)
 			}
 			log.Printf("archived %s", part.Name)
@@ -435,7 +434,7 @@ func runCycle(ctx context.Context, cfg *config.Config, t *config.TableConfig, po
 			return fmt.Errorf("parse retention_period: %w", err)
 		}
 		cutoff := now.Add(-retention)
-		if err := dropColdBeforeRetention(ctx, pool, iceTable, t.PartitionColumn, cutoff); err != nil {
+		if err := dropColdBeforeRetention(ctx, conn, iceTable, t.PartitionColumn, cutoff); err != nil {
 			return fmt.Errorf("cold expiry: %w", err)
 		}
 		log.Printf("[%s] expired cold rows older than %s", t.SourceTable, cutoff.Format("2006-01-02 15:04:05Z"))
@@ -454,9 +453,9 @@ func runCycle(ctx context.Context, cfg *config.Config, t *config.TableConfig, po
 // region-agnostic view mid-cycle. The child name uses the stable configured name
 // (t.SourceTable) so it matches the partitioner's naming across the bootstrap
 // rename of the physical hot table.
-func runCycleTwoLevel(ctx context.Context, cfg *config.Config, t *config.TableConfig, pool *pgxpool.Pool, wmStore *watermark.Store, debugExportDelay time.Duration, now time.Time) error {
-	partMgr := partition.NewManager(pool)
-	viewGen := view.NewGenerator(pool)
+func runCycleTwoLevel(ctx context.Context, cfg *config.Config, t *config.TableConfig, conn *pgx.Conn, wmStore *watermark.Store, debugExportDelay time.Duration, now time.Time) error {
+	partMgr := partition.NewManager(conn)
+	viewGen := view.NewGenerator(conn)
 	iceTable := pgx.Identifier{"ice", cfg.Iceberg.Namespace, t.SourceTable}.Sanitize()
 
 	hot, err := partition.ParseRetention(t.HotPeriod)
@@ -467,7 +466,7 @@ func runCycleTwoLevel(ctx context.Context, cfg *config.Config, t *config.TableCo
 	if err != nil {
 		return fmt.Errorf("values_source: %w", err)
 	}
-	parent := resolveTableName(ctx, pool, t.SourceSchema, t.SourceTable) // physical top (_events after swap)
+	parent := resolveTableName(ctx, conn, t.SourceSchema, t.SourceTable) // physical top (_events after swap)
 
 	// 1. Premake per region: ensure the LIST child exists (attached to the
 	//    physical top, named by the stable source name) and its forward window.
@@ -520,16 +519,16 @@ func runCycleTwoLevel(ctx context.Context, cfg *config.Config, t *config.TableCo
 	}
 
 	// 3. Attach the catalog + ensure the (single) Iceberg table.
-	if err := attachIceberg(ctx, pool, cfg); err != nil {
+	if err := attachIceberg(ctx, conn, cfg); err != nil {
 		return err
 	}
-	if err := ensureIcebergTable(ctx, pool, cfg, t, iceTable); err != nil {
+	if err := ensureIcebergTable(ctx, conn, cfg, t, iceTable); err != nil {
 		return fmt.Errorf("ensure iceberg table: %w", err)
 	}
 
 	// 4. Tier the past-hot leaves, grouped by ts period (oldest first).
 	if len(leaves) > 0 {
-		columns, err := getColumns(ctx, pool, t.SourceSchema, t.SourceTable)
+		columns, err := getColumns(ctx, conn, t.SourceSchema, t.SourceTable)
 		if err != nil {
 			return fmt.Errorf("get columns: %w", err)
 		}
@@ -546,7 +545,7 @@ func runCycleTwoLevel(ctx context.Context, cfg *config.Config, t *config.TableCo
 					"keys writes by source PK)", t.SourceSchema, t.SourceTable)
 		}
 		// The LIST (region) column, for the region-scoped Phase-0 wipe.
-		listCols, err := detectPartitionColumns(ctx, pool, t.SourceSchema, t.SourceTable)
+		listCols, err := detectPartitionColumns(ctx, conn, t.SourceSchema, t.SourceTable)
 		if err != nil {
 			return fmt.Errorf("detect list column: %w", err)
 		}
@@ -569,7 +568,7 @@ func runCycleTwoLevel(ctx context.Context, cfg *config.Config, t *config.TableCo
 			return fmt.Errorf("bootstrap view: %w", err)
 		}
 		hotTable := pgx.Identifier{t.SourceSchema, "_" + t.SourceTable}.Sanitize()
-		if err := registerTieredView(ctx, pool, t.SourceSchema, t.SourceTable,
+		if err := registerTieredView(ctx, conn, t.SourceSchema, t.SourceTable,
 			hotTable, iceTable, t.PartitionColumn); err != nil {
 			return fmt.Errorf("register tiered view: %w", err)
 		}
@@ -598,7 +597,7 @@ func runCycleTwoLevel(ctx context.Context, cfg *config.Config, t *config.TableCo
 			}
 			var done []exported
 			for _, lf := range grp {
-				snap, err := archiveExport(ctx, pool, t, lf.info, iceTable, columns, regionCol, lf.region, debugExportDelay)
+				snap, err := archiveExport(ctx, conn, t, lf.info, iceTable, columns, regionCol, lf.region, debugExportDelay)
 				if err != nil {
 					return fmt.Errorf("export %s: %w", lf.info.Name, err)
 				}
@@ -607,7 +606,7 @@ func runCycleTwoLevel(ctx context.Context, cfg *config.Config, t *config.TableCo
 			// Then cut them over: the first advances the shared cutoff to p, the
 			// rest re-set it idempotently and detach their (now-excluded) leaf.
 			for _, e := range done {
-				if err := archiveCutover(ctx, pool, t, e.lf.info, iceTable, e.snap, columns); err != nil {
+				if err := archiveCutover(ctx, conn, t, e.lf.info, iceTable, e.snap, columns); err != nil {
 					return fmt.Errorf("cutover %s: %w", e.lf.info.Name, err)
 				}
 				log.Printf("tiered %s (region %s)", e.lf.info.Name, e.lf.region)
@@ -622,7 +621,7 @@ func runCycleTwoLevel(ctx context.Context, cfg *config.Config, t *config.TableCo
 			return fmt.Errorf("parse retention_period: %w", err)
 		}
 		cExp := now.Add(-retention)
-		if err := dropColdBeforeRetention(ctx, pool, iceTable, t.PartitionColumn, cExp); err != nil {
+		if err := dropColdBeforeRetention(ctx, conn, iceTable, t.PartitionColumn, cExp); err != nil {
 			return fmt.Errorf("cold expiry: %w", err)
 		}
 		log.Printf("[%s] expired cold rows older than %s", t.SourceTable, cExp.Format("2006-01-02 15:04:05Z"))
@@ -635,7 +634,7 @@ func runCycleTwoLevel(ctx context.Context, cfg *config.Config, t *config.TableCo
 // Routed through coldfront._exec_iceberg_with_claim so it serializes against
 // concurrent cold writers (R-A bakery on a mesh, advisory lock single-node),
 // the same no-409 guarantee as every other cold write.
-func dropColdBeforeRetention(ctx context.Context, pool *pgxpool.Pool, iceTable, partCol string, cutoff time.Time) error {
+func dropColdBeforeRetention(ctx context.Context, conn *pgx.Conn, iceTable, partCol string, cutoff time.Time) error {
 	inner := fmt.Sprintf(
 		`DELETE FROM %s WHERE %s < '%s'::timestamptz`,
 		iceTable,
@@ -643,7 +642,7 @@ func dropColdBeforeRetention(ctx context.Context, pool *pgxpool.Pool, iceTable, 
 		cutoff.UTC().Format("2006-01-02 15:04:05+00"))
 	sql := fmt.Sprintf(`SELECT coldfront._exec_iceberg_with_claim(%s, $q$%s$q$)`,
 		sqlutil.Literal(iceTable), inner)
-	_, err := pool.Exec(ctx, sql)
+	_, err := conn.Exec(ctx, sql)
 	return err
 }
 
@@ -663,14 +662,14 @@ func dropColdBeforeRetention(ctx context.Context, pool *pgxpool.Pool, iceTable, 
 // On Phase 4 failure, retry Phase 3 + Phase 4 with exponential backoff up
 // to 10 attempts (~102s total budget). Phase 3 is idempotent so retries are
 // safe; Phase 4 either commits everything atomically or rolls back cleanly.
-func archivePartition(ctx context.Context, pool *pgxpool.Pool, t *config.TableConfig,
+func archivePartition(ctx context.Context, conn *pgx.Conn, t *config.TableConfig,
 	part partition.Info, iceTable string, columns []view.Column, debugExportDelay time.Duration,
 ) error {
-	snapshot, err := archiveExport(ctx, pool, t, part, iceTable, columns, "", "", debugExportDelay)
+	snapshot, err := archiveExport(ctx, conn, t, part, iceTable, columns, "", "", debugExportDelay)
 	if err != nil {
 		return err
 	}
-	return archiveCutover(ctx, pool, t, part, iceTable, snapshot, columns)
+	return archiveCutover(ctx, conn, t, part, iceTable, snapshot, columns)
 }
 
 // archiveExport runs Phases 0-2 for one partition: the idempotent Iceberg-range
@@ -682,7 +681,7 @@ func archivePartition(ctx context.Context, pool *pgxpool.Pool, t *config.TableCo
 // Splitting export from cutover lets the 2-level path export EVERY region's leaf
 // for a ts period before the shared cutoff advances, so no region's rows vanish
 // from the view mid-cycle.
-func archiveExport(ctx context.Context, pool *pgxpool.Pool, t *config.TableConfig,
+func archiveExport(ctx context.Context, conn *pgx.Conn, t *config.TableConfig,
 	part partition.Info, iceTable string, columns []view.Column,
 	regionCol, regionVal string, debugExportDelay time.Duration,
 ) (string, error) {
@@ -690,7 +689,7 @@ func archiveExport(ctx context.Context, pool *pgxpool.Pool, t *config.TableConfi
 
 	// Phase 0
 	t0 := time.Now()
-	if err := wipeIcebergRange(ctx, pool, iceTable, t.PartitionColumn, part.LowerBound, part.UpperBound, regionCol, regionVal); err != nil {
+	if err := wipeIcebergRange(ctx, conn, iceTable, t.PartitionColumn, part.LowerBound, part.UpperBound, regionCol, regionVal); err != nil {
 		return "", fmt.Errorf("phase 0 (idempotent prep): %w", err)
 	}
 	log.Printf("[%s] %s phase 0 (idempotent iceberg-range wipe): %s",
@@ -698,7 +697,7 @@ func archiveExport(ctx context.Context, pool *pgxpool.Pool, t *config.TableConfi
 
 	// Phase 1
 	t0 = time.Now()
-	if _, err := pool.Exec(ctx, "SELECT coldfront.install_archive_capture($1, $2)",
+	if _, err := conn.Exec(ctx, "SELECT coldfront.install_archive_capture($1, $2)",
 		t.SourceSchema, part.Name); err != nil {
 		return "", fmt.Errorf("phase 1 (install capture): %w", err)
 	}
@@ -707,7 +706,7 @@ func archiveExport(ctx context.Context, pool *pgxpool.Pool, t *config.TableConfi
 
 	// Phase 2
 	t0 = time.Now()
-	snapshotStr, err := bulkExportWithSnapshot(ctx, pool, t, part.Name, iceTable, columns)
+	snapshotStr, err := bulkExportWithSnapshot(ctx, conn, t, part.Name, iceTable, columns)
 	if err != nil {
 		return "", fmt.Errorf("phase 2 (bulk export): %w", err)
 	}
@@ -731,7 +730,7 @@ func archiveExport(ctx context.Context, pool *pgxpool.Pool, t *config.TableConfi
 // invoking it across the several leaves of one ts period re-sets the same cutoff
 // harmlessly — the first call advances it; the rest just detach their (now
 // cutoff-excluded) leaf.
-func archiveCutover(ctx context.Context, pool *pgxpool.Pool, t *config.TableConfig,
+func archiveCutover(ctx context.Context, conn *pgx.Conn, t *config.TableConfig,
 	part partition.Info, iceTable, snapshotStr string, columns []view.Column,
 ) error {
 	viewCfg := view.ViewConfig{
@@ -751,7 +750,7 @@ func archiveCutover(ctx context.Context, pool *pgxpool.Pool, t *config.TableConf
 	cutoverDone := false
 	for attempt := 1; attempt <= 10; attempt++ {
 		t3 := time.Now()
-		if _, err := pool.Exec(ctx,
+		if _, err := conn.Exec(ctx,
 			"CALL coldfront.replay_archive_delta($1, $2, $3, $4)",
 			t.SourceSchema, part.Name, snapshotStr, iceTable); err != nil {
 			return fmt.Errorf("phase 3 attempt %d: %w", attempt, err)
@@ -760,7 +759,7 @@ func archiveCutover(ctx context.Context, pool *pgxpool.Pool, t *config.TableConf
 			t.SourceTable, part.Name, attempt, time.Since(t3).Round(time.Millisecond))
 
 		t4 := time.Now()
-		if _, err := pool.Exec(ctx,
+		if _, err := conn.Exec(ctx,
 			"CALL coldfront.cutover_archive($1, $2, $3, $4, $5, $6, $7)",
 			t.SourceSchema, part.Name, t.SourceTable,
 			part.UpperBound, viewDDL, iceTable, 100); err == nil {
@@ -789,7 +788,7 @@ func archiveCutover(ctx context.Context, pool *pgxpool.Pool, t *config.TableConf
 	// internally drains stragglers from the lock-acquisition window and then
 	// drops the detached partition, capture trigger, and delta table.
 	t5 := time.Now()
-	if _, err := pool.Exec(ctx,
+	if _, err := conn.Exec(ctx,
 		"CALL coldfront.cutover_cleanup($1, $2, $3, $4)",
 		t.SourceSchema, part.Name, snapshotStr, iceTable); err != nil {
 		return fmt.Errorf("phase 5 (cleanup): %w", err)
@@ -806,7 +805,7 @@ func archiveCutover(ctx context.Context, pool *pgxpool.Pool, t *config.TableConf
 // 2-level leaf (regionVal != "") the delete is scoped to that region so
 // re-exporting one region's leaf cannot wipe another region's already-cold rows
 // in the same ts range (they share one Iceberg table).
-func wipeIcebergRange(ctx context.Context, pool *pgxpool.Pool, iceTable, partCol string, lower, upper time.Time, regionCol, regionVal string) error {
+func wipeIcebergRange(ctx context.Context, conn *pgx.Conn, iceTable, partCol string, lower, upper time.Time, regionCol, regionVal string) error {
 	regionPred := ""
 	if regionVal != "" {
 		regionPred = fmt.Sprintf(" AND %s = '%s'",
@@ -826,7 +825,7 @@ func wipeIcebergRange(ctx context.Context, pool *pgxpool.Pool, iceTable, partCol
 		regionPred)
 	sql := fmt.Sprintf(`SELECT coldfront._exec_iceberg_with_claim(%s, $q$%s$q$)`,
 		sqlutil.Literal(iceTable), inner)
-	_, err := pool.Exec(ctx, sql)
+	_, err := conn.Exec(ctx, sql)
 	return err
 }
 
@@ -889,13 +888,7 @@ func needsPGTextStage(columns []view.Column) bool {
 	return false
 }
 
-func bulkExportWithSnapshot(ctx context.Context, pool *pgxpool.Pool, t *config.TableConfig, partName, iceTable string, columns []view.Column) (string, error) {
-	conn, err := pool.Acquire(ctx)
-	if err != nil {
-		return "", fmt.Errorf("acquire conn: %w", err)
-	}
-	defer conn.Release()
-
+func bulkExportWithSnapshot(ctx context.Context, conn *pgx.Conn, t *config.TableConfig, partName, iceTable string, columns []view.Column) (string, error) {
 	var snapshotStr string
 	if err := conn.QueryRow(ctx, "SELECT pg_current_snapshot()::text").Scan(&snapshotStr); err != nil {
 		return "", fmt.Errorf("capture snapshot: %w", err)
@@ -948,13 +941,13 @@ func bulkExportWithSnapshot(ctx context.Context, pool *pgxpool.Pool, t *config.T
 
 // ensureIcebergTable creates the Iceberg namespace and table (matching the
 // PG source schema) if they don't already exist. Safe to call every run.
-func ensureIcebergTable(ctx context.Context, pool *pgxpool.Pool, cfg *config.Config, t *config.TableConfig, iceTable string) error {
-	if err := execDuckDB(ctx, pool, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s",
+func ensureIcebergTable(ctx context.Context, conn *pgx.Conn, cfg *config.Config, t *config.TableConfig, iceTable string) error {
+	if err := execDuckDB(ctx, conn, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s",
 		pgx.Identifier{"ice", cfg.Iceberg.Namespace}.Sanitize())); err != nil {
 		return fmt.Errorf("create namespace: %w", err)
 	}
 
-	columns, err := getColumns(ctx, pool, t.SourceSchema, t.SourceTable)
+	columns, err := getColumns(ctx, conn, t.SourceSchema, t.SourceTable)
 	if err != nil {
 		return fmt.Errorf("get columns: %w", err)
 	}
@@ -966,7 +959,7 @@ func ensureIcebergTable(ctx context.Context, pool *pgxpool.Pool, cfg *config.Con
 		colDefs += fmt.Sprintf("%s %s", pgx.Identifier{c.Name}.Sanitize(), c.Type)
 	}
 
-	if err := execDuckDB(ctx, pool, fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (%s)", iceTable, colDefs)); err != nil {
+	if err := execDuckDB(ctx, conn, fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (%s)", iceTable, colDefs)); err != nil {
 		return fmt.Errorf("create iceberg table: %w", err)
 	}
 	return nil
@@ -975,8 +968,8 @@ func ensureIcebergTable(ctx context.Context, pool *pgxpool.Pool, cfg *config.Con
 // registerTieredView upserts a row in coldfront.tiered_views so the
 // coldfront C extension can identify this view as a tiered target and
 // rewrite UPDATE/DELETE into dual-tier CTEs. Called after every view recreate.
-func registerTieredView(ctx context.Context, pool *pgxpool.Pool, schema, table, hotTable, icebergTable, partitionCol string) error {
-	_, err := pool.Exec(ctx, `
+func registerTieredView(ctx context.Context, conn *pgx.Conn, schema, table, hotTable, icebergTable, partitionCol string) error {
+	_, err := conn.Exec(ctx, `
 		INSERT INTO coldfront.tiered_views (schema_name, relname, hot_table, iceberg_table, partition_col)
 		VALUES ($1, $2, $3, $4, $5)
 		ON CONFLICT (schema_name, relname) DO UPDATE

@@ -12,7 +12,7 @@ import (
 	"github.com/pgedge/coldfront/internal/sqlutil"
 )
 
-// DBTX abstracts pgxpool.Pool and pgx.Tx for testability.
+// DBTX abstracts *pgx.Conn and pgx.Tx for testability.
 type DBTX interface {
 	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row

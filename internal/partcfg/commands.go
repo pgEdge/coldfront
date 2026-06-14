@@ -12,7 +12,6 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgxpool"
 	"gopkg.in/yaml.v3"
 
 	"github.com/pgedge/coldfront/internal/config"
@@ -99,10 +98,10 @@ COMMANDS:
 // addConn registers the shared --dsn / --config connection flags on fs and
 // returns accessors. Management commands connect with --dsn directly, or read
 // the DSN from the same --config YAML the runtime uses.
-func addConn(fs *flag.FlagSet) func(context.Context) (*pgxpool.Pool, error) {
+func addConn(fs *flag.FlagSet) func(context.Context) (*pgx.Conn, error) {
 	dsn := fs.String("dsn", "", "PostgreSQL connection string (or use --config)")
 	cfgPath := fs.String("config", "", "path to the deployment YAML; its postgres.dsn is used if --dsn is unset")
-	return func(ctx context.Context) (*pgxpool.Pool, error) {
+	return func(ctx context.Context) (*pgx.Conn, error) {
 		d := *dsn
 		if d == "" && *cfgPath != "" {
 			cfg, err := config.Load(*cfgPath)
@@ -114,7 +113,7 @@ func addConn(fs *flag.FlagSet) func(context.Context) (*pgxpool.Pool, error) {
 		if d == "" {
 			return nil, fmt.Errorf("a connection is required: pass --dsn or --config")
 		}
-		return openPool(ctx, d)
+		return openConn(ctx, d)
 	}
 }
 
@@ -180,25 +179,25 @@ func runRegister(ctx context.Context, args []string) error {
 		return nil
 	}
 
-	pool, err := connect(ctx)
+	conn, err := connect(ctx)
 	if err != nil {
 		return err
 	}
-	defer pool.Close()
-	if err := EnsureTable(ctx, pool); err != nil {
+	defer func() { _ = conn.Close(ctx) }()
+	if err := EnsureTable(ctx, conn); err != nil {
 		return err
 	}
 	// PK-superset validation: the cutover keys delta capture by the source PK,
 	// so the PK must cover the partition key column(s). 2-level adds the RANGE
 	// column (the LIST column comes from the catalog).
-	if err := validatePKSuperset(ctx, pool, *schema, *table, *column, *subValues != ""); err != nil {
+	if err := validatePKSuperset(ctx, conn, *schema, *table, *column, *subValues != ""); err != nil {
 		return err
 	}
 	if *dryRun {
 		fmt.Printf("dry-run OK: %s.%s validates; would run:\n%s\n", *schema, *table, insertSQL)
 		return nil
 	}
-	if _, err := pool.Exec(ctx, insertSQL); err != nil {
+	if _, err := conn.Exec(ctx, insertSQL); err != nil {
 		return fmt.Errorf("register %s.%s: %w", *schema, *table, err)
 	}
 	fmt.Printf("registered %s.%s\n", *schema, *table)
@@ -262,15 +261,15 @@ FLAGS:
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	pool, err := connect(ctx)
+	conn, err := connect(ctx)
 	if err != nil {
 		return err
 	}
-	defer pool.Close()
-	if err := EnsureTable(ctx, pool); err != nil {
+	defer func() { _ = conn.Close(ctx) }()
+	if err := EnsureTable(ctx, conn); err != nil {
 		return err
 	}
-	rows, err := pool.Query(ctx, `
+	rows, err := conn.Query(ctx, `
 		SELECT schema_name, table_name, partition_period,
 		       COALESCE(hot_period,'-'), COALESCE(retention_period,'-'),
 		       CASE WHEN hot_period IS NULL THEN 'partition-only' ELSE 'tiered' END,
@@ -427,17 +426,17 @@ func lit(s string) string {
 	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
 
-// openPool connects and verifies the connection.
-func openPool(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
-	pool, err := pgxpool.New(ctx, dsn)
+// openConn connects and verifies the connection.
+func openConn(ctx context.Context, dsn string) (*pgx.Conn, error) {
+	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
 		return nil, fmt.Errorf("connect: %w", err)
 	}
-	if err := pool.Ping(ctx); err != nil {
-		pool.Close()
+	if err := conn.Ping(ctx); err != nil {
+		_ = conn.Close(ctx)
 		return nil, fmt.Errorf("ping: %w", err)
 	}
-	return pool, nil
+	return conn, nil
 }
 
 // rowFrom maps a config.TableConfig (e.g. from a YAML being imported) onto a
@@ -529,15 +528,15 @@ EXAMPLES:
 		fmt.Println(sql)
 		return nil
 	}
-	pool, err := connect(ctx)
+	conn, err := connect(ctx)
 	if err != nil {
 		return err
 	}
-	defer pool.Close()
-	if err := EnsureTable(ctx, pool); err != nil {
+	defer func() { _ = conn.Close(ctx) }()
+	if err := EnsureTable(ctx, conn); err != nil {
 		return err
 	}
-	tag, err := pool.Exec(ctx, sql)
+	tag, err := conn.Exec(ctx, sql)
 	if err != nil {
 		return fmt.Errorf("set %s.%s: %w", *schema, *table, err)
 	}
@@ -580,15 +579,15 @@ EXAMPLES:
 		fmt.Println(sql)
 		return nil
 	}
-	pool, err := connect(ctx)
+	conn, err := connect(ctx)
 	if err != nil {
 		return err
 	}
-	defer pool.Close()
-	if err := EnsureTable(ctx, pool); err != nil {
+	defer func() { _ = conn.Close(ctx) }()
+	if err := EnsureTable(ctx, conn); err != nil {
 		return err
 	}
-	tag, err := pool.Exec(ctx, sql)
+	tag, err := conn.Exec(ctx, sql)
 	if err != nil {
 		return fmt.Errorf("remove %s.%s: %w", *schema, *table, err)
 	}
@@ -650,12 +649,12 @@ EXAMPLES:
 	if d == "" {
 		return fmt.Errorf("no DSN: set postgres.dsn in --config or pass --dsn")
 	}
-	pool, err := openPool(ctx, d)
+	conn, err := openConn(ctx, d)
 	if err != nil {
 		return err
 	}
-	defer pool.Close()
-	if err := EnsureTable(ctx, pool); err != nil {
+	defer func() { _ = conn.Close(ctx) }()
+	if err := EnsureTable(ctx, conn); err != nil {
 		return err
 	}
 	if *dryRun {
@@ -663,7 +662,7 @@ EXAMPLES:
 		return nil
 	}
 	for i, s := range stmts {
-		if _, err := pool.Exec(ctx, s); err != nil {
+		if _, err := conn.Exec(ctx, s); err != nil {
 			return fmt.Errorf("import %s: %w", cfg.Archiver.Tables[i].SourceTable, err)
 		}
 	}
@@ -697,15 +696,15 @@ EXAMPLES:
 	if *format != "yaml" && *format != "sql" {
 		return fmt.Errorf("--format must be yaml or sql")
 	}
-	pool, err := connect(ctx)
+	conn, err := connect(ctx)
 	if err != nil {
 		return err
 	}
-	defer pool.Close()
-	if err := EnsureTable(ctx, pool); err != nil {
+	defer func() { _ = conn.Close(ctx) }()
+	if err := EnsureTable(ctx, conn); err != nil {
 		return err
 	}
-	tables, err := LoadTables(ctx, pool)
+	tables, err := LoadTables(ctx, conn)
 	if err != nil {
 		return err
 	}

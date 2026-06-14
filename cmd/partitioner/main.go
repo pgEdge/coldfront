@@ -17,7 +17,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/pgedge/coldfront/internal/config"
 	"github.com/pgedge/coldfront/internal/partcfg"
@@ -60,18 +60,18 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
-	pool, err := pgxpool.New(ctx, cfg.Postgres.DSN)
+	conn, err := pgx.Connect(ctx, cfg.Postgres.DSN)
 	if err != nil {
 		log.Fatalf("connect: %v", err)
 	}
-	defer pool.Close()
-	if err := pool.Ping(ctx); err != nil {
+	defer func() { _ = conn.Close(ctx) }()
+	if err := conn.Ping(ctx); err != nil {
 		log.Fatalf("ping: %v", err)
 	}
 
 	// Resolve managed tables from the replicated coldfront.partition_config
 	// table, falling back to the YAML archiver.tables (deprecation bridge).
-	tables, fromYAML, err := partcfg.ResolveTables(ctx, pool, cfg.Archiver.Tables)
+	tables, fromYAML, err := partcfg.ResolveTables(ctx, conn, cfg.Archiver.Tables)
 	if err != nil {
 		log.Fatalf("resolve tables: %v", err)
 	}
@@ -88,7 +88,7 @@ func main() {
 		log.Fatalf("config invalid: %v", err)
 	}
 
-	mgr := partition.NewManager(pool)
+	mgr := partition.NewManager(conn)
 	now := time.Now().UTC()
 	failed := 0
 	for _, t := range cfg.Archiver.Tables {
@@ -126,7 +126,7 @@ func main() {
 }
 
 // specFromTable maps one configured table onto a partition.Spec, parsing the
-// retention string. Kept pure + table-tested; main() only wires config + pool.
+// retention string. Kept pure + table-tested; main() only wires config + conn.
 func specFromTable(t config.TableConfig) (partition.Spec, error) {
 	retention, err := partition.ParseRetention(t.RetentionPeriod)
 	if err != nil {

@@ -19,7 +19,7 @@ import (
 	"github.com/pgedge/coldfront/internal/config"
 )
 
-// DBTX is the slice of pgxpool.Pool partcfg needs.
+// DBTX is the slice of *pgx.Conn partcfg needs.
 type DBTX interface {
 	Exec(ctx context.Context, sql string, args ...any) (pgconn.CommandTag, error)
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
