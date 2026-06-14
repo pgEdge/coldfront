@@ -669,7 +669,11 @@ DECLARE
     cold_buf        text := '';
     cold_count      int  := 0;
     total           bigint := 0;
-    batch_size      int  := 1000;
+    -- Rows accumulated per Iceberg append (one snapshot / Parquet file per flush).
+    -- Larger ⇒ far fewer, larger files; the only cost is the in-memory VALUES
+    -- string per flush. The sub-threshold remainder is always flushed after the
+    -- loop (see below), so a small write is one file and is never lost.
+    batch_size      int  := 10000;
     i               int;
     col             text;
     my_ticket       bigint;
