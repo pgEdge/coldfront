@@ -64,6 +64,10 @@ preflight() {
     step "preflight 5: build"
     if ! make build 2>&1; then fail "build"; exit 1; fi
     pass "build ($(ls -lh bin/archiver 2>/dev/null | awk '{print $5}'))"
+
+    step "preflight 6: compactor module (separate go.mod — iceberg-go)"
+    if ! make compactor GOLANGCI="$linter" 2>&1; then fail "compactor module"; exit 1; fi
+    pass "compactor (vet, lint, test, build $(ls -lh bin/compactor 2>/dev/null | awk '{print $5}'))"
 }
 
 # ── Cells ────────────────────────────────────────────────────────────────────

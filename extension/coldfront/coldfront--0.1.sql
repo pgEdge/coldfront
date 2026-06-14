@@ -2002,6 +2002,40 @@ BEGIN
 END;
 $$;
 
+-- _claim_iceberg_external acquires the bakery claim for an EXTERNAL committer —
+-- the Go compactor (cmd/compactor), which rewrites small Iceberg data files into
+-- fewer large ones and commits straight to Lakekeeper via apache/iceberg-go,
+-- NOT through duckdb.raw_query. It takes the SAME claim _exec_iceberg_with_claim
+-- takes — Ricart-Agrawala on a mesh (then arms the deferred release), or a local
+-- advisory xact lock on vanilla — but runs no SQL: the caller performs its
+-- iceberg-go RewriteDataFiles + commit WHILE the claim is held, then COMMITs its
+-- PG transaction, which fires coldfront's C XactCallback to release the claim
+-- (vanilla: the advisory lock auto-releases at xact end). The claim is thus held
+-- across the whole external read->rewrite->commit. There is intentionally NO
+-- async branch: iceberg-go has no bakery-aware re-stamp patch, so the compactor
+-- must use the stock ordering (parent stamped under the claim). Formally cleared
+-- in docs/formal — the compactor maps onto the stock-ordering writer
+-- (Bakery_v2.cfg); the patchless-async shortcut it must avoid is Bakery_v2_race.
+CREATE FUNCTION coldfront._claim_iceberg_external(p_iceberg_table text)
+RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+    my_ticket bigint;
+    v_armed   boolean := NULLIF(current_setting('snowflake.node', true), '') IS NOT NULL
+                     AND NULLIF(current_setting('coldfront.dblink_self', true), '') IS NOT NULL;
+BEGIN
+    IF pg_is_in_recovery() THEN
+        RAISE EXCEPTION 'coldfront: cannot compact (Iceberg write) on a read-only standby'
+            USING HINT = 'Standbys serve reads only; run the compactor against the primary.';
+    END IF;
+    IF v_armed THEN
+        my_ticket := coldfront._claim_iceberg_lock(p_iceberg_table);
+        PERFORM coldfront._enqueue_release(my_ticket);
+    ELSE
+        PERFORM pg_advisory_xact_lock(hashtext('coldfront_iceberg:' || p_iceberg_table));
+    END IF;
+END;
+$$;
+
 -- ============================================================================
 -- DDL synchronization for tiered tables.
 --

@@ -249,6 +249,26 @@ represented faithfully because they affect protocol correctness:
   reply-fresh peers must have flushed our LSN, partition-alone bail
   via RAISE).
 
+### Compaction commits (`cmd/compactor`)
+
+The Go compactor (`cmd/compactor`, apache/iceberg-go `RewriteDataFiles`) is a
+bakery claimant **indistinguishable from a cold writer at the protocol level**:
+it acquires a claim via `_claim_iceberg_lock` on the node it connects to,
+captures the parent snapshot under the held claim, issues one Lakekeeper CAS
+POST — a *replace* (drop small data files, add the rewritten one), which has the
+same parent-CAS conflict shape as the append modelled at `Decide` — then
+releases. It adds no new protocol primitive, so it is covered by the existing
+proof as the **stock-ordering writer** (`AsyncParquet = FALSE`, `Bakery_v2.cfg`).
+
+Binding constraint: iceberg-go carries **no bakery-aware re-stamp patch** (that
+patch lives only in the duckdb-iceberg commit path), so the compactor MUST hold
+the claim across the whole read → rewrite → commit and stamp the CAS parent
+under the claim. `Bakery_v2_race.cfg` is the proof that the patchless-async
+shortcut 409s — the compactor is therefore forbidden the async-parquet path.
+Commit-then-release matches the cold-write shape the model already abstracts as
+the atomic `Decide` step (commit iceberg, then DELETE the claim). The model is
+unchanged; re-running every config confirms the invariants still hold.
+
 ### Known abstractions (model deviates from reality)
 
 - **`claims` as globally-consistent set.** The model treats every
@@ -314,6 +334,9 @@ Any change to:
 - The C-level XactCallback in `extension/coldfront/src/coldfront.c`
   (`coldfront_xact_callback`, `RegisterXactCallback` ordering).
 - The `synchronous_*` GUCs that gate sync-rep on the claim INSERT.
+- The `cmd/compactor` bakery wrapper — the claim/release that brackets its
+  iceberg-go `RewriteDataFiles` commit (it must stay stock-ordering: claim held
+  across read → rewrite → commit; no async-parquet shortcut).
 
 If the protocol-level shape changes (e.g. swapping the bakery for a
 different coordination primitive), update the PlusCal source first,
