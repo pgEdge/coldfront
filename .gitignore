@@ -5,7 +5,8 @@ dist/
 *.out
 coverage.html
 .env
-.claude/
+.claude/*
+!.claude/agents/
 CLAUDE.local.md
 THIRD_PARTY_GO.txt
 REPO_READY_AUDIT.md
