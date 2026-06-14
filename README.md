@@ -43,41 +43,41 @@ Application
   └── DELETE FROM events WHERE ...      ← coldfront rewrites to the right tier
          │
 ┌────────▼──────────────────────────────────────────────────┐
-│  PostgreSQL 16/17/18 + pg_duckdb + coldfront extensions    │
-│                                                            │
-│  _events (renamed partitioned table, hot data)             │
-│  ├── p_2026_04  (hot, native PG)                           │
-│  ├── p_2026_05  (hot, native PG)                           │
-│  └── ...                                                   │
-│                                                            │
-│  events  VIEW (replaces original table — hot + cold)       │
-│  + INSTEAD OF INSERT trigger (fallback only — bypassed     │
-│    when coldfront is preloaded)                            │
-│  + archive_watermark table (cutoff boundary)               │
-│  + coldfront.tiered_views catalog                          │
-│                                                            │
-│  coldfront extension: rewrites INSERT / UPDATE / DELETE    │
-│  on tiered views — hot side stays plain set-based PG,      │
-│  cold side becomes one duckdb.raw_query (or a plpgsql      │
-│  cursor loop when an IDENTITY column is omitted)           │
-│                                                            │
-│  pg_duckdb: intercepts iceberg_scan() queries,             │
-│  handles Iceberg reads via DuckDB engine in-process        │
+│  PostgreSQL 16/17/18 + pg_duckdb + coldfront extensions   │
+│                                                           │
+│  _events (renamed partitioned table, hot data)            │
+│  ├── p_2026_04  (hot, native PG)                          │
+│  ├── p_2026_05  (hot, native PG)                          │
+│  └── ...                                                  │
+│                                                           │
+│  events  VIEW (replaces original table — hot + cold)      │
+│  + INSTEAD OF INSERT trigger (fallback only — bypassed    │
+│    when coldfront is preloaded)                           │
+│  + archive_watermark table (cutoff boundary)              │
+│  + coldfront.tiered_views catalog                         │
+│                                                           │
+│  coldfront extension: rewrites INSERT / UPDATE / DELETE   │
+│  on tiered views — hot side stays plain set-based PG,     │
+│  cold side becomes one duckdb.raw_query (or a plpgsql     │
+│  cursor loop when an IDENTITY column is omitted)          │
+│                                                           │
+│  pg_duckdb: intercepts iceberg_scan() queries,            │
+│  handles Iceberg reads via DuckDB engine in-process       │
 └────────┬──────────────────────────────────────────────────┘
          │
 ┌────────▼──────────────────────────────────────────────────┐
-│  Lakekeeper (Iceberg REST catalog, single Rust binary)     │
-│  Backed by same PostgreSQL instance                        │
+│  Lakekeeper (Iceberg REST catalog, single Rust binary)    │
+│  Backed by same PostgreSQL instance                       │
 └────────┬──────────────────────────────────────────────────┘
          │
 ┌────────▼──────────────────────────────────────────────────┐
-│  S3-compatible object store (SeaweedFS, MinIO, GCS, etc.)    │
-│  Parquet data files + Iceberg metadata                     │
+│  S3-compatible object store (SeaweedFS, MinIO, GCS, etc.) │
+│  Parquet data files + Iceberg metadata                    │
 └───────────────────────────────────────────────────────────┘
          │
 ┌────────▼──────────────────────────────────────────────────┐
-│  Archiver (~9 MB static Go binary, no CGO, runs via cron)  │
-│  Moves expired PG partitions → Iceberg, updates watermark  │
+│  Archiver (~9 MB static Go binary, no CGO, runs via cron) │
+│  Moves expired PG partitions → Iceberg, updates watermark │
 └───────────────────────────────────────────────────────────┘
 ```
 
