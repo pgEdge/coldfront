@@ -6,8 +6,14 @@ dist/
 coverage.html
 .env
 .claude/
+CLAUDE.md
+CLAUDE.local.md
 .tmp/
 *.pdf
+
+# IDE / editor directories
+.idea/
+.vscode/
 
 # pg_regress expected outputs — tracked; the global *.out would exclude them.
 !extension/coldfront/test/expected/*.out

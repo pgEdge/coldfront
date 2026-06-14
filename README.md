@@ -7,6 +7,8 @@
 
 # pgEdge ColdFront
 
+[![CI](https://github.com/pgEdge/ColdFront/actions/workflows/ci.yml/badge.svg)](https://github.com/pgEdge/ColdFront/actions/workflows/ci.yml)
+
 Tables in PostgreSQL, storage in Apache Iceberg (Parquet on S3-compatible
 storage). Two operating modes, both queried as ordinary PG relations:
 
@@ -262,6 +264,11 @@ pgedge-coldfront/
 | Go | 1.24+ | Archiver binary (pure Go, no CGO) |
 | pgx/v5 | 5.8.0 | PostgreSQL driver (only Go dependency) |
 
+## Author
+
+Created by Jimmy Angelakos.
+
 ## License
 
-PostgreSQL License. See [LICENSE](LICENSE).
+PostgreSQL License. See [LICENSE.md](LICENSE.md). Redistributed third-party
+components and their notices: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
