@@ -8,6 +8,7 @@ coverage.html
 .claude/
 CLAUDE.md
 CLAUDE.local.md
+THIRD_PARTY_GO.txt
 .tmp/
 *.pdf
 

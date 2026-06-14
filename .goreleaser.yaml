@@ -10,6 +10,13 @@ version: 2
 
 project_name: coldfront
 
+# Generate the Go-dependency license notice (THIRD_PARTY_GO.txt) bundled into each
+# archive. Pure-Go deps only; --ignore drops our own (PostgreSQL-licensed) packages.
+before:
+  hooks:
+    - go install github.com/google/go-licenses@latest
+    - sh -c '$(go env GOPATH)/bin/go-licenses report ./cmd/archiver ./cmd/partitioner --ignore github.com/pgedge/coldfront > THIRD_PARTY_GO.txt'
+
 builds:
   - id: archiver
     binary: archiver
@@ -56,7 +63,9 @@ archives:
       {{ .ProjectName }}_{{ .Version }}_{{ .Os }}_{{ .Arch }}
     files:
       - README.md
-      - LICENSE
+      - LICENSE.md
+      - THIRD_PARTY_NOTICES.md
+      - THIRD_PARTY_GO.txt
       - config.example.yaml
 
 checksum:

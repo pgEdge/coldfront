@@ -1,0 +1,9 @@
+# Local pre-commit hooks. Install once: pip install pre-commit && pre-commit install
+# Run on demand: pre-commit run --all-files
+# CI runs the same gitleaks scan server-side (.github/workflows/ci.yml), so this is
+# a fast local pre-check, not the enforced gate.
+repos:
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks   # scans staged changes for secrets before commit

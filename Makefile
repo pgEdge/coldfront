@@ -1,4 +1,4 @@
-.PHONY: build test test-cover lint ci-local clean
+.PHONY: build test test-cover lint licenses ci-local clean
 
 build:
 	CGO_ENABLED=0 go build -ldflags="-s -w" -o bin/archiver ./cmd/archiver
@@ -13,6 +13,12 @@ test-cover:
 
 lint:
 	~/go/bin/golangci-lint run --timeout=5m
+
+licenses:
+	go install github.com/google/go-licenses@latest
+	"$$(go env GOPATH)/bin/go-licenses" check ./cmd/... ./internal/... --ignore github.com/pgedge/coldfront
+	"$$(go env GOPATH)/bin/go-licenses" report ./cmd/archiver ./cmd/partitioner --ignore github.com/pgedge/coldfront > THIRD_PARTY_GO.txt
+	@echo "wrote THIRD_PARTY_GO.txt"
 
 ci-local:
 	./run-ci-local.sh
