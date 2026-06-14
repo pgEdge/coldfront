@@ -1,0 +1,54 @@
+# iceberg-manifest-list-format-version-v15.patch
+#
+# Applies to: duckdb-iceberg @ 0fad545a (branch v1.5-variegata), DuckDB v1.5.x.
+#
+# Cross-engine interop fix (NOT ColdFront IP — upstreamable to duckdb-iceberg).
+#
+# Problem: the manifest-list Avro writer (manifest_list::WriteToFile) emits v2
+# manifest_file entries (content/sequence_number/min_sequence_number columns)
+# but does NOT tag the Avro file with a "format-version" metadata key. The
+# manifest FILE writer (iceberg_manifest.cpp) DOES tag its files
+# format-version=2. Strict Apache readers (iceberg-go, PyIceberg, Spark) decide
+# a manifest list's version from that key and default to v1 when it is absent,
+# then cross-check it against the v2 manifest files and reject the table:
+#   "manifest file's 'format-version' metadata indicates version 2, but entry
+#    from manifest list indicates version 1"  (iceberg-go manifest.go:629).
+# This blocks the ColdFront compactor (cmd/compactor, apache/iceberg-go) from
+# reading tables that pg_duckdb/duckdb-iceberg wrote.
+#
+# Fix: add the (spec-optional) "format-version" key to the manifest list Avro
+# metadata, sourced from table_metadata.iceberg_version (already a parameter of
+# WriteToFile, so no signature/caller change). Both write paths — the COPY/INSERT
+# operator (iceberg_copy.cpp) and the add-snapshot path (iceberg_add_snapshot.cpp)
+# — already pass table_metadata, so this single writer edit covers both.
+#
+# SAFE — does not change anything that works today: duckdb-iceberg's own
+# ManifestListReader (planning/metadata_io/manifest_list/iceberg_manifest_list_reader.cpp)
+# takes iceberg_version from table metadata (via AvroScan::ScanManifestList), NOT
+# from this Avro key — nothing on the read path consumes it (verified: grep finds
+# zero read-path readers of the manifest-list "format-version" key). Emitting it
+# is therefore inert to pg_duckdb reads and only enables cross-engine readers.
+#
+diff --git a/src/core/metadata/manifest/iceberg_manifest_list.cpp b/src/core/metadata/manifest/iceberg_manifest_list.cpp
+index 45293cae..536a8e12 100644
+--- a/src/core/metadata/manifest/iceberg_manifest_list.cpp
++++ b/src/core/metadata/manifest/iceberg_manifest_list.cpp
+@@ -454,6 +454,18 @@ void WriteToFile(const IcebergTableMetadata &table_metadata, const IcebergManife
+ 	copy_info.options["root_name"].push_back(Value("manifest_file"));
+ 	copy_info.options["field_ids"].push_back(Value::STRUCT(metadata.field_ids));
+
++	//! Tag the manifest list Avro file with the table's format-version. The key
++	//! is optional per the Iceberg spec, but strict Apache readers (iceberg-go,
++	//! PyIceberg, Spark) use it to decide whether to parse the entries as v1 or
++	//! v2/v3; absent, they assume v1 and then reject the v2 manifest files this
++	//! writer produces (iceberg_manifest.cpp tags those with format-version).
++	//! duckdb-iceberg's own ManifestListReader ignores this key (it takes the
++	//! version from table metadata), so emitting it is inert to our read path
++	//! and only fixes cross-engine interop.
++	child_list_t<Value> avro_metadata;
++	avro_metadata.emplace_back("format-version", std::to_string(table_metadata.iceberg_version));
++	copy_info.options["metadata"].push_back(Value::STRUCT(std::move(avro_metadata)));
++
+ 	CopyFunctionBindInput input(copy_info);
+ 	input.file_extension = "avro";
+

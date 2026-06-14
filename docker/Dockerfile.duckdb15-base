@@ -87,9 +87,32 @@ COPY docker/iceberg-azure-extension-config-v15.cmake /build/duckdb-iceberg/exten
 # build loudly on patch rot instead of silently shipping stock iceberg (which
 # 409s under concurrency). See DUCKDB_1.5.md + the patch header.
 COPY docker/iceberg-bakery-aware-commit-refresh-v15.patch /tmp/iceberg-bakery-v15.patch
+# The manifest-list format-version interop patch — adds the (spec-optional)
+# "format-version" key to the manifest-list Avro metadata so strict Apache
+# readers (iceberg-go, the coldfront compactor) parse the entries as v2 instead
+# of defaulting to v1 and rejecting the v2 manifest files. NOT IP — upstreamable.
+# Inert to pg_duckdb reads (its ManifestListReader takes the version from table
+# metadata, not this key). See the patch header + COMPACTOR.md.
+COPY docker/iceberg-manifest-list-format-version-v15.patch /tmp/iceberg-mlist-fmtver-v15.patch
+# Companion interop patch — the manifest FILE writer hardcodes content="data";
+# fix it to emit the manifest's real content (data/deletes) so strict readers
+# (iceberg-go, the compactor) don't reject delete manifests. Same class as the
+# format-version patch; inert to pg_duckdb reads. See the patch header.
+COPY docker/iceberg-manifest-content-v15.patch /tmp/iceberg-mcontent-v15.patch
+# Third interop patch — upper-case the data-file 'file_format' in the manifest
+# (spec enum is PARQUET, duckdb writes lowercase "parquet"); strict readers
+# (iceberg-go's compaction scan) match it case-sensitively. Inert to pg_duckdb
+# reads (reader stores verbatim; ducklake lowercases). See the patch header.
+COPY docker/iceberg-data-file-format-v15.patch /tmp/iceberg-fileformat-v15.patch
 RUN cd /build/duckdb-iceberg \
  && git apply --check /tmp/iceberg-bakery-v15.patch \
- && git apply        /tmp/iceberg-bakery-v15.patch
+ && git apply        /tmp/iceberg-bakery-v15.patch \
+ && git apply --check /tmp/iceberg-mlist-fmtver-v15.patch \
+ && git apply        /tmp/iceberg-mlist-fmtver-v15.patch \
+ && git apply --check /tmp/iceberg-mcontent-v15.patch \
+ && git apply        /tmp/iceberg-mcontent-v15.patch \
+ && git apply --check /tmp/iceberg-fileformat-v15.patch \
+ && git apply        /tmp/iceberg-fileformat-v15.patch
 RUN cd /build/duckdb-iceberg && bash -c 'source /opt/rh/gcc-toolset-*/enable 2>/dev/null; \
     export VCPKG_TOOLCHAIN_PATH=/build/vcpkg/scripts/buildsystems/vcpkg.cmake VCPKG_ROOT=/build/vcpkg \
            VCPKG_TARGET_TRIPLET=x64-linux VCPKG_HOST_TRIPLET=x64-linux USE_MERGED_VCPKG_MANIFEST=1 \

@@ -1,0 +1,52 @@
+# iceberg-data-file-format-v15.patch
+#
+# Applies to: duckdb-iceberg @ 0fad545a (branch v1.5-variegata), DuckDB v1.5.x.
+#
+# Cross-engine interop fix (NOT IP — upstreamable to duckdb-iceberg). Third in the
+# strict-reader interop set, with iceberg-manifest-list-format-version-v15.patch
+# and iceberg-manifest-content-v15.patch.
+#
+# Problem: duckdb-iceberg records the data-file 'file_format' lowercase ("parquet")
+# in the manifest entry's data_file struct — the same string doubles as the DuckDB
+# copy-function name and the file extension, which must stay lowercase. But the
+# Iceberg spec's file-format enum is UPPERCASE (AVRO/ORC/PARQUET/PUFFIN), and strict
+# Apache readers match it case-sensitively. iceberg-go's compaction read fails:
+#   "not implemented: only parquet format is implemented, got parquet"
+# (table/internal/interfaces.go:46 — switch on FileFormat, case "PARQUET").
+# This was the THIRD interop blocker the compactor hit, after the manifests became
+# readable (format-version + content patches) and it reached the data-file scan.
+#
+# Fix: upper-case 'file_format' at the SINGLE serialization point, IcebergDataFile::
+# ToValue, so the manifest carries the spec value while all internal lowercase uses
+# (copy function, file extension) are untouched. Covers data, positional/equality
+# delete, and puffin files in one spot.
+#
+# SAFE — does not change anything that works today: duckdb-iceberg's own manifest
+# reader stores file_format verbatim and never compares it; the ducklake conversion
+# path lowercases before comparing (StringUtil::Lower in DuckLakeDeleteFile). So
+# emitting the uppercase spec value is inert to every pg_duckdb/duckdb-iceberg read
+# path and only enables cross-engine readers. StringUtil is already in scope.
+#
+diff --git a/src/core/metadata/manifest/iceberg_manifest.cpp b/src/core/metadata/manifest/iceberg_manifest.cpp
+index b8fdaee3..c47f3962 100644
+--- a/src/core/metadata/manifest/iceberg_manifest.cpp
++++ b/src/core/metadata/manifest/iceberg_manifest.cpp
+@@ -222,8 +222,16 @@ Value IcebergDataFile::ToValue(const IcebergTableMetadata &table_metadata, const
+ 	children.push_back(Value::INTEGER(static_cast<int32_t>(content)));
+ 	// file_path: string
+ 	children.push_back(Value(file_path));
+-	// file_format: string
+-	children.push_back(Value(file_format));
++	// file_format: string — UPPERCASE per the Iceberg spec enum (PARQUET/PUFFIN/
++	// ORC/AVRO). duckdb-iceberg sets file_format lowercase internally (it doubles
++	// as the DuckDB copy-function name + file extension), but strict Apache readers
++	// (iceberg-go, PyIceberg, Spark) match the data-file format case-sensitively
++	// against the uppercase enum and refuse a lowercase "parquet" (iceberg-go:
++	// "only parquet format is implemented, got parquet"). Upper-casing only the
++	// serialized value keeps the internal lowercase usage intact; duckdb-iceberg's
++	// own reader stores this verbatim (no compare) and the ducklake path lowercases
++	// before comparing, so this is inert to our read path and only fixes interop.
++	children.push_back(Value(StringUtil::Upper(file_format)));
+ 	// partition: struct(...)
+ 	if (partition_info.empty()) {
+ 		//! NOTE: Spark does *not* like it when this column is NULL, so we populate it with an empty struct value

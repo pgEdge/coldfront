@@ -39,6 +39,7 @@ AWS_KEY="${COLDFRONT_AWS_ACCESS_KEY:-}"
 AWS_SECRET="${COLDFRONT_AWS_SECRET_KEY:-}"
 AWS_REGION="${COLDFRONT_AWS_REGION:-}"
 ARCHIVER="${ARCHIVER:-./bin/archiver}"
+COMPACTOR="${COMPACTOR:-./bin/compactor}"
 while [ $# -gt 0 ]; do case "$1" in
   --host) HOST="$2"; shift 2;;
   --mode) MODE="$2"; shift 2;;
@@ -52,6 +53,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --backend) BACKEND="$2"; shift 2;;
   --azure-conn) AZURE_CONN="$2"; shift 2;;
   --archiver) ARCHIVER="$2"; shift 2;;
+  --compactor) COMPACTOR="$2"; shift 2;;
   *) echo "journey.sh: unknown arg $1"; exit 2;;
 esac; done
 [ -n "$HOST" ] || { echo "journey.sh: --host required"; exit 2; }
@@ -492,6 +494,56 @@ EOSQL
     # Strict mode rejects an ambiguous predicate.
     local e; e=$(q_may "$HOST" "SET coldfront.allow_mixed_writes=off; UPDATE events SET status='x' WHERE data->>'m'='nope';")
     assert_err "strict mode rejects ambiguous predicate" "must include" "$e"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story 6d — Compaction: the standalone Go compactor (cmd/compactor) consolidates
+# the cold tier's many small Parquet files into fewer large ones via
+# apache/iceberg-go RewriteDataFiles, serialized through the bakery (the SAME
+# claim cold writes take — coldfront._claim_iceberg_external, formally cleared in
+# docs/formal). The compactor reads the SAME deployment YAML the archiver does
+# (/tmp/journey-archiver.yaml). We use the compactor's own --dry-run as the
+# file-count oracle: it reports group(s) before, "nothing to compact" after, and
+# all rows survive. Six same-day cold INSERTs guarantee >= MinInputFiles (5) small
+# files in one group regardless of prior stories.
+# ───────────────────────────────────────────────────────────────────────────
+story_compaction() {
+    # The manifest-list format-version interop patch (docker/iceberg-manifest-list-
+    # format-version-v15.patch) tags the manifest list Avro with the table's
+    # format-version, so apache/iceberg-go reads the (v2) manifests instead of
+    # defaulting to v1 and rejecting them at PlanFiles (manifest.go:629). This live
+    # story validates that fix end-to-end.
+    step "6d. Compaction: iceberg-go RewriteDataFiles consolidates small cold files (bakery-serialized)"
+    qf "$HOST" <<'EOSQL'
+INSERT INTO events (ts, status, data) VALUES ('2026-01-02 00:00+00','cmp1','{}');
+INSERT INTO events (ts, status, data) VALUES ('2026-01-02 01:00+00','cmp2','{}');
+INSERT INTO events (ts, status, data) VALUES ('2026-01-02 02:00+00','cmp3','{}');
+INSERT INTO events (ts, status, data) VALUES ('2026-01-02 03:00+00','cmp4','{}');
+INSERT INTO events (ts, status, data) VALUES ('2026-01-02 04:00+00','cmp5','{}');
+INSERT INTO events (ts, status, data) VALUES ('2026-01-02 05:00+00','cmp6','{}');
+EOSQL
+    local rows_before; rows_before=$(q "$HOST" "SELECT count(*) FROM events;")
+
+    local before; before=$("$COMPACTOR" --config /tmp/journey-archiver.yaml --table events --dry-run 2>&1)
+    if echo "$before" | grep -q "group(s)"; then
+        pass "compactor sees small cold files to compact"
+    else
+        fail "compactor --dry-run found nothing to compact: $before"; return
+    fi
+
+    if "$COMPACTOR" --config /tmp/journey-archiver.yaml --table events >/tmp/journey-compact.log 2>&1; then
+        pass "compaction ran (bakery-serialized, no 409)"
+    else
+        fail "compaction failed — see /tmp/journey-compact.log"; tail -8 /tmp/journey-compact.log; return
+    fi
+
+    local after; after=$("$COMPACTOR" --config /tmp/journey-archiver.yaml --table events --dry-run 2>&1)
+    if echo "$after" | grep -q "nothing to compact"; then
+        pass "small files consolidated (none left below target)"
+    else
+        fail "files still below target after compaction: $after"
+    fi
+    assert_eq "compaction preserved all rows" "$rows_before" "$(q "$HOST" "SELECT count(*) FROM events;")"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -1164,6 +1216,9 @@ if [ "$MODE" = "tiered" ]; then
     story_reads
     story_types
     story_writes
+    story_compaction        # iceberg-go RewriteDataFiles, now that the manifest-list
+                            # format-version interop patch makes the cold tier's
+                            # manifests iceberg-go-readable
     story_writes_plpgsql
     story_app_privilege          # non-superuser onboarding + cold I/O (mesh: cross-node + SD bakery)
     story_mixed_concurrency
