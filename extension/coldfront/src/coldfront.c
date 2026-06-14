@@ -179,6 +179,24 @@ static bool coldfront_ice_attached = false;
  */
 static bool coldfront_allow_mixed_writes = true;
 
+/*
+ * GUCs: the deployment-config endpoint/DSN strings that ensure_attached() /
+ * ensure_pg_attached() feed to DuckDB's ATTACH. Those helpers are SECURITY
+ * DEFINER (they must run elevated so the side-loaded iceberg/postgres
+ * extensions load past pg_duckdb's non-superuser LocalFileSystem block), so a
+ * non-superuser must NOT be able to redirect the elevated ATTACH at an
+ * attacker endpoint. Defining these formally as PGC_SUSET (vs. the bare
+ * placeholders they used to be) makes them settable only by superusers / roles
+ * granted SET on them — operators still set them in postgresql.conf, where they
+ * ride physical replication unchanged. local_pg_dsn is GUC_SUPERUSER_ONLY too:
+ * it can carry libpq credentials, so non-superusers must not read it back.
+ * The values are read SQL-side via current_setting(); these backing vars exist
+ * only to anchor the GUC definitions.
+ */
+static char *coldfront_warehouse          = NULL;
+static char *coldfront_lakekeeper_endpoint = NULL;
+static char *coldfront_local_pg_dsn       = NULL;
+
 static post_parse_analyze_hook_type prev_post_parse_analyze_hook = NULL;
 
 /* Previous ProcessUtility_hook (pg_duckdb's, since coldfront loads after it). */
@@ -2420,6 +2438,43 @@ _PG_init(void)
         true,           /* boot_val: permissive by default */
         PGC_USERSET,
         0,              /* flags */
+        NULL, NULL, NULL);
+
+    /*
+     * Deployment-config endpoint/DSN GUCs. PGC_SUSET so a non-superuser cannot
+     * redirect the SECURITY DEFINER ensure_attached()/ensure_pg_attached()
+     * ATTACH at an attacker endpoint. boot_val "" preserves the prior
+     * placeholder behaviour (unset => the attach helpers are a no-op).
+     */
+    DefineCustomStringVariable(
+        "coldfront.warehouse",
+        "Lakekeeper warehouse name the Iceberg catalog 'ice' attaches to.",
+        NULL,
+        &coldfront_warehouse,
+        "",
+        PGC_SUSET,
+        0,
+        NULL, NULL, NULL);
+
+    DefineCustomStringVariable(
+        "coldfront.lakekeeper_endpoint",
+        "Iceberg REST catalog (Lakekeeper) endpoint URL.",
+        NULL,
+        &coldfront_lakekeeper_endpoint,
+        "",
+        PGC_SUSET,
+        0,
+        NULL, NULL, NULL);
+
+    DefineCustomStringVariable(
+        "coldfront.local_pg_dsn",
+        "libpq DSN DuckDB's postgres extension attaches as 'pglocal' to stream "
+        "PG-source rows into Iceberg. May carry credentials.",
+        NULL,
+        &coldfront_local_pg_dsn,
+        "",
+        PGC_SUSET,
+        GUC_SUPERUSER_ONLY,
         NULL, NULL, NULL);
 
     prev_post_parse_analyze_hook = post_parse_analyze_hook;

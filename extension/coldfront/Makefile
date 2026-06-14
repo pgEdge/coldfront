@@ -21,7 +21,7 @@ REGRESS     = load_order update_unregistered_view update_heap_table \
               ddl_block_column ddl_rename_table ddl_rename_view \
               ddl_partition_passthrough bakery_wraps_cold_writes \
               param_cold_via_plpgsql async_requires_patch \
-              storage_secret_azure
+              storage_secret_azure privilege_model
 REGRESS_OPTS = --inputdir=test --outputdir=test
 
 PG_CONFIG  ?= pg_config

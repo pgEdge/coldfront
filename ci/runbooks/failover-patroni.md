@@ -48,7 +48,7 @@ cold writes.
 
 ## Limitation 2 — split-brain cold writes during a network partition
 
-The Ricart–Agrawala bakery that serialises mesh cold writes has a **dead-peer
+The Ricart-Agrawala bakery that serialises mesh cold writes has a **dead-peer
 escape**: if a peer is unreachable, a writer proceeds rather than block forever
 (availability over a hard stall). During a genuine **network partition** both
 sides can therefore each consider the other dead and **both write the same

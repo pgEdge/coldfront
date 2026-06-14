@@ -1115,6 +1115,41 @@ EOF
     grep -q "source_table: cli_events" /tmp/journey-export.log && pass "export emits cli_events as YAML" || { fail "export missing cli_events"; tail -5 /tmp/journey-export.log; }
 }
 
+# ───────────────────────────────────────────────────────────────────────────
+# Story — Enterprise privilege model: a NON-superuser app role, onboarded with a
+# single coldfront.grant_app_access() call, reads AND writes the tiered view
+# transparently — no superuser, no pg_*_server_files, no per-session setup.
+# Vanilla exercises the hot-heap + identity-sequence grants (pg_duckdb checks the
+# INVOKER's privilege on the hot heap) and the advisory-lock cold write. --mesh
+# adds cross-node read + a cold write driven through the SECURITY DEFINER R-A
+# bakery FROM A PEER — the role and its grants replicate via Spock DDL, so
+# onboarding runs ONCE on one node and the whole mesh inherits it.
+# ───────────────────────────────────────────────────────────────────────────
+story_app_privilege() {
+    step "App privilege: non-superuser cold I/O via one-call grant_app_access"
+    local total; total=$(q "$HOST" "SELECT count(*) FROM events;")
+    q "$HOST" "CREATE ROLE japp NOSUPERUSER LOGIN PASSWORD 'x';" >/dev/null 2>&1
+    local onboard; onboard=$(q_may "$HOST" "SELECT coldfront.grant_app_access('japp');")
+    assert_eq "grant_app_access('japp') succeeds (one call)" "" "$(echo "$onboard" | grep -iE 'error' || true)"
+    assert_eq "app role is NOT a superuser"           "off" "$(q "$HOST" "SET ROLE japp; SELECT current_setting('is_superuser');" | tail -1)"
+    assert_eq "app role lacks pg_read_server_files"   "f"   "$(q "$HOST" "SELECT pg_has_role('japp','pg_read_server_files','MEMBER');")"
+    assert_eq "app role reads tiered hot+cold (== superuser)" "$total" "$(q "$HOST" "SET ROLE japp; SELECT count(*) FROM events;" | tail -1)"
+    q "$HOST" "SET ROLE japp; INSERT INTO events (ts,status,data) VALUES ('2026-01-18 09:00+00','japp_priv','{}');" >/dev/null 2>&1
+    assert_eq "app role cold write landed (read-your-write)" "1" "$(q "$HOST" "SELECT count(*) FROM events WHERE status='japp_priv';")"
+    q "$HOST" "DELETE FROM events WHERE status='japp_priv';" >/dev/null 2>&1
+
+    if [ "$MESH" = 1 ] && [ -n "${PEERS:-}" ]; then
+        local PARR p1; read -ra PARR <<< "$PEERS"; p1="${PARR[0]}"
+        assert_eq "app role + grants replicated to peer $p1 (Spock DDL, onboarded once)" "t" \
+            "$(q "$p1" "SELECT (rolname IS NOT NULL AND pg_has_role('japp','coldfront_duckdb','MEMBER')) FROM pg_roles WHERE rolname='japp';" | tail -1)"
+        assert_eq "peer $p1: non-superuser reads tiered hot+cold cross-node" "$total" "$(q "$p1" "SET ROLE japp; SELECT count(*) FROM events;" | tail -1)"
+        q "$p1" "SET ROLE japp; INSERT INTO events (ts,status,data) VALUES ('2026-01-19 09:00+00','japp_mesh','{}');" >/dev/null 2>&1
+        assert_eq "peer $p1: non-superuser mesh cold write (SECURITY DEFINER R-A bakery) visible on db1" "1" \
+            "$(q "$HOST" "SELECT count(*) FROM events WHERE status='japp_mesh';")"
+        q "$HOST" "DELETE FROM events WHERE status='japp_mesh';" >/dev/null 2>&1
+    fi
+}
+
 # ── orchestrate ────────────────────────────────────────────────────────────
 # Setup is shared. The story set then branches on mode: tiered exercises the
 # hot+cold partitioned path; decoupled exercises the all-Iceberg wrapper. (The
@@ -1130,6 +1165,7 @@ if [ "$MODE" = "tiered" ]; then
     story_types
     story_writes
     story_writes_plpgsql
+    story_app_privilege          # non-superuser onboarding + cold I/O (mesh: cross-node + SD bakery)
     story_mixed_concurrency
     story_ddl
     story_blocks

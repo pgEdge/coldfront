@@ -3,11 +3,9 @@
 # v1.5-variegata submodule) so all three .duckdb_extension files share one ABI
 # and load together in pg_duckdb 1.5.3. See DUCKDB_1.5.md for the why.
 #
-# This is the STOCK 1.5 build — the bakery-aware-commit-refresh patch is NOT
-# applied here (it is a v1.5 re-design, a follow-on). The DuckDB 1.4.3 patched
-# build (docker/Dockerfile + iceberg-only-extension-config.cmake +
-# iceberg-bakery-aware-commit-refresh.patch) is untouched and remains the
-# revert-to baseline.
+# This config only SELECTS which extensions to build; the bakery-aware-commit-
+# refresh patch is applied separately by docker/Dockerfile.duckdb15-base
+# (iceberg-bakery-aware-commit-refresh-v15.patch).
 if (NOT EMSCRIPTEN)
 duckdb_extension_load(avro
     GIT_URL https://github.com/duckdb/duckdb-avro

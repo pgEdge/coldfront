@@ -1,4 +1,9 @@
-# UNPATCHED — stock duckdb-iceberg (the default)
+# UNPATCHED — stock duckdb-iceberg
+
+> **⚠ Historical.** This documents the stock-binary mode on the **retired DuckDB
+> 1.4.3** stack. The current build is the patched DuckDB 1.5.x base
+> (`docker/Dockerfile.duckdb15-base`); see [DUCKDB_1.5.md](DUCKDB_1.5.md). The
+> stock-vs-patched concepts below still apply.
 
 > ColdFront has **one agnostic code path** for cold writes — it never 409s on any
 > binary. The two deployment modes differ only by **(a) which duckdb-iceberg

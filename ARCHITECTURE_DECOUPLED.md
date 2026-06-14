@@ -214,11 +214,17 @@ PG nodes pointing at the same Lakekeeper endpoint and S3 bucket.
 
 - **Writes are serialized PG-side by the bakery protocol** so they
   never collide at Lakekeeper. The implementation is Lamport's 1978
-  distributed mutual exclusion with the Ricart–Agrawala (1981)
-  deferred-reply optimisation, riding on Spock's per-origin FIFO
-  apply ordering as the message-delivery primitive. Modelled in
-  [docs/formal/Bakery_v2.tla](docs/formal/Bakery_v2.tla); the
-  TLC-checked safety properties live in `Bakery_v2.cfg`.
+  distributed mutual exclusion with the Ricart-Agrawala (1981)
+  deferred-reply optimisation. Claims and acks travel as Spock-replicated
+  rows (the two repset tables below); a writer commits only when it holds
+  the minimum outstanding ticket and every live peer has acked (a peer
+  defers its ack while it holds a smaller ticket). This stays safe under
+  Spock's *asymmetric* apply — each node applies peers' rows on its own
+  independent queue, so it never assumes a peer has applied its concurrent
+  claim; the snowflake-ticket total order and the ack barrier serialize
+  commits, not any global apply ordering. Modelled in
+  [docs/formal/Bakery_v2.tla](docs/formal/Bakery_v2.tla); the safety
+  properties are verified via TLA+ (`Bakery_v2.cfg`).
 
   Two tables, both in Spock's `default` repset:
 

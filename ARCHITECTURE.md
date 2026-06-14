@@ -88,7 +88,7 @@ object store:
 └──────────────┬───────────────────────────────────────────┘
                │
 ┌──────────────▼───────────────────────────────────────────┐
-│  S3-compatible object store (AWS S3, SeaweedFS, MinIO, …)  │
+│  S3-compatible object store (SeaweedFS, MinIO, GCS, …)     │
 │  Parquet data files + Iceberg metadata files               │
 └────────────────────────────────────────────────────────────┘
 ```
@@ -96,10 +96,10 @@ object store:
 | Component | Role | License |
 |-----------|------|---------|
 | PostgreSQL 16+ | Heap storage; range partitioning for the tiered hot tier. Works uniformly on PG 16, 17, and 18 — the cold-tier secret is a DuckDB persistent secret loaded at instance init, with no version-gated mechanism. | PostgreSQL |
-| pg_duckdb | DuckDB in-process. Iceberg read + write. Analytics. Stock upstream `pgduckdb/pgduckdb:18-v1.1.1` (no fork). The bundled `duckdb-iceberg` carries one optional mesh-performance patch — async parquet overlap; see [Cold-write strategy](#cold-write-strategy-stock-vs-patched-duckdb-iceberg). | MIT |
+| pg_duckdb | DuckDB in-process. Iceberg read + write. Analytics. pg_duckdb 1.5.3 (PR #1025; no released 1.5.x tag yet). The `duckdb-iceberg` carries the bakery-aware commit-refresh patch (async parquet overlap, no 409); see [Cold-write strategy](#cold-write-strategy-stock-vs-patched-duckdb-iceberg). | MIT |
 | coldfront | PGXS C extension. `post_parse_analyze_hook` rewrites INSERT/UPDATE/DELETE on registered views to the correct tier; `ProcessUtility_hook` handles DDL; the hook lazily ATTACHes the Iceberg catalog on the first query touching a tiered view. | PostgreSQL |
 | Lakekeeper | Iceberg REST catalog. Single Rust binary. | Apache 2.0 |
-| S3-compatible store | Any: AWS S3, SeaweedFS, MinIO, GCS, Azure Blob, etc. | Varies |
+| S3-compatible store | Any: SeaweedFS, MinIO, GCS, Azure Blob, etc. | Varies |
 | Archiver (tiered mode) | Go binary, invoked by cron. Thin SQL orchestrator that moves rows hot→cold. | PostgreSQL |
 
 How rows move through this depends on the storage mode: the tiered hot heap +
@@ -139,6 +139,45 @@ connection. There is no arming step and no per-session boilerplate: both reads
 (`iceberg_scan`) and writes (`duckdb.raw_query`) just work on a fresh psql
 session. Until a tiered view is touched no ATTACH is attempted, so a
 pre-bootstrap connection is never blocked by a missing warehouse.
+
+### Non-superuser app roles (least privilege)
+
+pg_duckdb force-disables DuckDB's `LocalFileSystem` for non-superusers (see
+[Upstream Requests](#pg_duckdb-non-superuser-localfilesystem-blocks-side-loaded-extensions)),
+which would block the side-loaded iceberg/postgres DuckDB extensions from loading
+on `ATTACH`. So `coldfront.ensure_attached()` / `ensure_pg_attached()` are
+`SECURITY DEFINER` with a pinned `search_path`: the extension load + `ATTACH` run
+elevated (gates key off `GetUserId()`, the effective user), and because the
+DuckDB instance is per-backend the attach persists for the session — every
+subsequent `iceberg_scan` / `_exec_iceberg_with_claim` then runs as the **app
+role** over S3/httpfs, never touching `LocalFileSystem`. The app role needs only
+`duckdb.postgres_role` membership + object grants; **no superuser, no
+`pg_{read,write}_server_files`**.
+
+Because the attach helpers run elevated, the deployment-config GUCs they consume
+(`coldfront.warehouse`, `coldfront.lakekeeper_endpoint`, `coldfront.local_pg_dsn`)
+are registered `PGC_SUSET` (the last also `GUC_SUPERUSER_ONLY`) in `_PG_init`, so
+a non-superuser cannot redirect the elevated `ATTACH` at an attacker endpoint.
+Onboarding is one operator call, `coldfront.grant_app_access(role)` — idempotent,
+registry-derived (schemas, views, the hot heap + its identity sequence, the
+cold-path function EXECUTE allow-list), not `PUBLIC`-executable. The image defaults
+`duckdb.postgres_role = coldfront_duckdb` (env `COLDFRONT_DUCKDB_ROLE`) and creates
+the role, so the path is turnkey.
+
+In a **Spock mesh** the role and its grants replicate via Spock DDL — onboard once
+on any node. Mesh cold *writes* route through the R-A bakery; its coordination
+functions `_claim_iceberg_lock` / `_release_iceberg_lock` are themselves
+`SECURITY DEFINER` (search_path-pinned, fully schema-qualified) so a non-superuser
+drives the cross-node serialization (`pg_stat_replication` liveness + the dblink
+claim) with the privilege it requires. `_exec_iceberg_with_claim` deliberately
+stays `SECURITY INVOKER` — it runs the caller's cold DML, which must execute as the
+caller. The bakery SD is **protocol-neutral**: it changes the PG execution
+privilege, not the claim/ack/lock/ticket protocol, re-verified against
+[the TLA+ model](formal/Bakery_v2.tla) (all safe configs pass; the race config
+still violates `NoLakekeeperConflict`).
+
+See README "Security"; asserted by the journey's `story_app_privilege`, `ci/ops.sh`
+check 3, and the `privilege_model` pg_regress test.
 
 ### Temp table bridge: PG → Iceberg
 
@@ -271,7 +310,7 @@ held, selected by `coldfront.iceberg_async_parquet` (default `off`):
 | `iceberg_async_parquet` | duckdb-iceberg | Behaviour |
 |---|---|---|
 | `off` (default) | **stock** upstream | Claim-first: take the bakery ticket, *then* upload parquet **and** commit inside the ticket. Correct on an unpatched binary, but the whole parquet upload happens under the lock, so concurrent writers serialise on upload + commit. |
-| `on` | **patched** (`iceberg-bakery-aware-commit-refresh.patch`) | Overlap: upload parquet in the background *first*, then take the ticket only for the Lakekeeper commit. Concurrent writers' uploads overlap; only the short commit POST is serialised. |
+| `on` | **patched** (`iceberg-bakery-aware-commit-refresh-v15.patch`) | Overlap: upload parquet in the background *first*, then take the ticket only for the Lakekeeper commit. Concurrent writers' uploads overlap; only the short commit POST is serialised. |
 
 The code path is identical and the application-visible behaviour is
 identical — one transactional write, no 409, no app-level retry — so the
@@ -294,7 +333,7 @@ registry's `hot_table` — never by string, so it is schema-agnostic):
 
 | DDL | Behaviour |
 |---|---|
-| `ALTER TABLE _t ADD/DROP COLUMN`, `ALTER COLUMN ... TYPE`, `RENAME COLUMN` | **Blocked by design** — duckdb-iceberg (pg_duckdb v1.1.1) cannot `ALTER` an Iceberg table, so the hot and cold tiers would diverge. The hook raises an actionable error; to change the schema, untier the table, alter it, then re-tier. |
+| `ALTER TABLE _t ADD/DROP COLUMN`, `ALTER COLUMN ... TYPE`, `RENAME COLUMN` | **Blocked by design** — duckdb-iceberg cannot `ALTER` an Iceberg table, so the hot and cold tiers would diverge. The hook raises an actionable error; to change the schema, untier the table, alter it, then re-tier. |
 | `ALTER TABLE _t RENAME TO ...` | Supported (touches no Iceberg schema): update `tiered_views.hot_table`, rebuild the view. |
 | `ALTER VIEW v RENAME TO ...` | Supported: migrate the name-keyed registry + `archive_watermark` rows to the new view name, then rebuild (otherwise the lookups miss and the cold UNION branch silently disappears). |
 | `DROP TABLE _t` / `DROP VIEW v` | **Blocked by design** — would orphan the Iceberg cold tier. Dismantling tiering is a deliberate operator action (unregister with `partitioner remove`/`archiver remove`, which deletes the `partition_config` row, then drop each tier explicitly), never a one-shot call. |
@@ -369,8 +408,8 @@ stored here — it is per-node and must never ride the replication stream.
 
 Both binaries read this table (the YAML `archiver.tables` list is a deprecation
 bridge, used only when the table is empty) and expose a management CLI —
-`register` / `list` / `set` / `remove` / `import` / `export` — documented in the
-[README](README.md#managing-partitioned-tables-cli).
+`register` / `list` / `set` / `remove` / `import` / `export` — documented in
+[USAGE.md](USAGE.md#managing-partitioned-tables-cli).
 
 ## Known Limitations
 
@@ -441,10 +480,12 @@ S3-compatible store.  Both extensions must be in
 `shared_preload_libraries` — `coldfront` installs its hook in
 `_PG_init`, which fires at backend start.
 
-One parameterized image (`docker/Dockerfile`, `--build-arg PG_MAJOR=16|17|18`)
-serves every deployment: a pgEdge `*-spock5-minimal` base (bundles Spock +
-Snowflake) with pg_duckdb v1.1.1 compiled on top and coldfront installed. The
-same image plays both topology roles — vanilla leaves spock/snowflake out of
+A two-layer image serves every deployment: a prebuilt **base**
+(`docker/Dockerfile.duckdb15-base`) carrying pg_duckdb 1.5.3 (PR #1025) + the
+patched duckdb-iceberg on a pgEdge `*-spock5-minimal` base (Spock + Snowflake),
+and a thin **app** layer (`docker/Dockerfile.duckdb15`, `--build-arg
+PG_MAJOR=16|17|18`) that compiles coldfront on top. The same image plays both
+topology roles — vanilla leaves spock/snowflake out of
 `shared_preload_libraries`; mesh loads them (`MESH=on`, set by the entrypoint).
 
 ```yaml
@@ -452,7 +493,7 @@ services:
   db:
     build:
       context: .
-      dockerfile: docker/Dockerfile
+      dockerfile: docker/Dockerfile.duckdb15
       args: { PG_MAJOR: 18 }
     environment: { PG_MAJOR: 18, MESH: "off" }   # entrypoint configures preload + GUCs
   lakekeeper:
@@ -481,6 +522,30 @@ ColdFront image lean (core `uuid` type only, no uuid-ossp).
 Behaviours in upstream projects that ColdFront works around, kept as
 architectural notes: the gap, the workaround in use today, and the shape of
 the upstream capability that would let us drop the workaround.
+
+### pg_duckdb: non-superuser LocalFileSystem blocks side-loaded extensions
+
+pg_duckdb force-disables DuckDB's `LocalFileSystem` for any role that is not a
+member of both `pg_read_server_files` and `pg_write_server_files`
+(`AllowRawFileAccess()` → `RefreshConnectionState`, keyed off `GetUserId()`).
+That is correct hardening for raw file access, but it also blocks **loading a
+locally-installed DuckDB extension** — and ColdFront side-loads a patched
+`iceberg` (and `postgres`) extension from disk, which DuckDB lazily loads on
+`ATTACH`. So a non-superuser's first cold query fails at the elevated load step.
+
+**Workaround today:** `coldfront.ensure_attached()` / `ensure_pg_attached()` are
+`SECURITY DEFINER`, so the load + `ATTACH` run as the (privileged) extension
+owner once per backend; the per-backend DuckDB instance then keeps the extension
+loaded, and subsequent scans/commits run unprivileged over S3 (no
+`LocalFileSystem`). The config GUCs the elevated path consumes are `PGC_SUSET` so
+the privilege can't be abused to redirect the `ATTACH`.
+
+**Upstream shape that would drop it:** either a way to mark specific
+locally-installed extensions as loadable without `LocalFileSystem` access, or
+distinguishing extension-load file access from user-initiated raw file access in
+the non-superuser sandbox — so a non-superuser member of `duckdb.postgres_role`
+could `ATTACH (TYPE ICEBERG, …)` directly, without ColdFront's `SECURITY DEFINER`
+shim.
 
 ### pg_duckdb: native PG-reader → Iceberg streaming (no libpq round-trip)
 
