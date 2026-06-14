@@ -54,5 +54,8 @@ COPY --from=cf-build /out/usr/pgsql-${PG_MAJOR}/lib/             /usr/pgsql-${PG
 COPY --from=cf-build /out/usr/pgsql-${PG_MAJOR}/share/extension/ /usr/pgsql-${PG_MAJOR}/share/extension/
 COPY docker/entrypoint.sh /usr/local/bin/coldfront-entrypoint.sh
 RUN chmod +x /usr/local/bin/coldfront-entrypoint.sh
+# License + third-party notices travel with the binaries we redistribute (DuckDB
+# family is MIT — the notice must accompany the distributed Software).
+COPY THIRD_PARTY_NOTICES.md LICENSE.md /usr/share/doc/coldfront/
 USER postgres
 ENTRYPOINT ["/usr/local/bin/coldfront-entrypoint.sh"]
