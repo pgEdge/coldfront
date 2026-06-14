@@ -1,0 +1,29 @@
+# golangci-lint v2 config. ci/matrix.sh runs `golangci-lint run`, so this is the
+# single source of truth for what lints locally and in CI (they must not diverge).
+version: "2"
+
+linters:
+  default: standard   # errcheck, govet, ineffassign, staticcheck, unused
+  enable:
+    - gosec
+    - misspell
+  exclusions:
+    rules:
+      # gosec on test files: test code is not a runtime security surface.
+      - path: _test\.go$
+        linters: [gosec]
+      # G706 (log injection): the CLIs log their own subcommand name (os.Args[1])
+      # on a fatal error — operator-controlled, not untrusted input.
+      - path: cmd/.*/main\.go$
+        linters: [gosec]
+        text: "G706"
+      # G304 (file inclusion): the config loader reads the operator-supplied
+      # --config path by design.
+      - path: internal/config/config\.go$
+        linters: [gosec]
+        text: "G304"
+      # G115 (integer overflow): intentional bit-packing truncation in the
+      # snowflake / UUIDv7 id-to-partition-bound encoding.
+      - path: internal/partition/idmap\.go$
+        linters: [gosec]
+        text: "G115"

@@ -2311,3 +2311,17 @@ $body$ LANGUAGE plpgsql$fn$,
     --    above (the view name is stable), so there is nothing to re-point.
 END;
 $$;
+
+-- ── Catalog documentation ────────────────────────────────────────────────────
+-- Schema-level docs so `\d+ coldfront.*` / pg_description carry the same intent
+-- the inline comments above describe. Tables exist by now (created above), so
+-- these run cleanly at CREATE EXTENSION.
+COMMENT ON SCHEMA coldfront IS 'pgEdge ColdFront: transparent PostgreSQL to Apache Iceberg tiering, plus decoupled iceberg-only tables.';
+COMMENT ON TABLE coldfront.tiered_views IS 'Registry (keyed by schema, relname) of views the coldfront DML hook handles — tiered (hot+cold) and decoupled (iceberg-only).';
+COMMENT ON TABLE coldfront.archive_watermark IS 'Per-tiered-table hot/cold cutoff: ts >= cutoff is hot (PG), ts < cutoff is cold (Iceberg).';
+COMMENT ON TABLE coldfront.storage_secret IS 'Cold-store credential; materialized as a DuckDB PERSISTENT SECRET, replicated by value across a Spock mesh, excluded from pg_dump.';
+COMMENT ON TABLE coldfront.partition_config IS 'Name-keyed per-table partition/tiering lifecycle config (period, hot_period, retention); replicates by value so every mesh node reads identical config.';
+COMMENT ON TABLE coldfront.claims IS 'Ricart-Agrawala bakery: a writer''s outstanding iceberg-commit claim (iceberg_table, snowflake ticket); deleted on release.';
+COMMENT ON TABLE coldfront.claim_acks IS 'Ricart-Agrawala bakery: per-peer acknowledgements of a claim, replicated back to the originating writer.';
+COMMENT ON TABLE coldfront.deferred_acks IS 'Ricart-Agrawala bakery: acks a peer defers (it holds a smaller-ticket claim) until it releases its own.';
+COMMENT ON TABLE coldfront._dummy_dml_target IS 'Internal: anchor relation for the DML rewrite hook; holds no user data.';
