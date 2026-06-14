@@ -323,6 +323,24 @@ func runCycle(ctx context.Context, cfg *config.Config, t *config.TableConfig, co
 		return fmt.Errorf("ensure future partitions: %w", err)
 	}
 
+	// 1b. Self-heal: ensure the partition covering now exists, so an actively
+	//     written table whose cron lagged past the premade window doesn't get an
+	//     insert-outage hole. We deliberately do NOT abort on EnsureCurrent's
+	//     "behind" flag (unlike the standalone partitioner): the archiver
+	//     legitimately tiers historical tables whose newest partition is already in
+	//     the past, so "no current partition" is normal here, not necessarily a
+	//     lagging cron — it cannot be distinguished without per-table state. But we
+	//     DO log it (non-fatal) so a genuine lag is visible. Matches the 2-level path.
+	behind, err := partMgr.EnsureCurrent(ctx, tableName, t.SourceSchema,
+		t.PartitionPeriod, now, partition.TimeBoundary{}, "")
+	if err != nil {
+		return fmt.Errorf("ensure current partition: %w", err)
+	}
+	if behind {
+		log.Printf("[%s] no hot partition covered %s — created it; if this table is actively written, widen future_partitions (=%d) or run more often",
+			t.SourceTable, now.Format("2006-01-02"), t.FuturePartitions)
+	}
+
 	// 2. Find partitions past the hot window — the tier-to-cold candidates.
 	hot, err := partition.ParseRetention(t.HotPeriod)
 	if err != nil {
@@ -472,6 +490,7 @@ func runCycleTwoLevel(ctx context.Context, cfg *config.Config, t *config.TableCo
 	//    physical top, named by the stable source name) and its forward window.
 	type childRef struct{ name, region string }
 	var children []childRef
+	anyBehind := false
 	for _, v := range values {
 		child, err := partition.SubName(t.SourceTable, v)
 		if err != nil {
@@ -485,10 +504,16 @@ func runCycleTwoLevel(ctx context.Context, cfg *config.Config, t *config.TableCo
 			t.PartitionPeriod, t.FuturePartitions, now, partition.TimeBoundary{}, prefix); err != nil {
 			return fmt.Errorf("premake %s: %w", child, err)
 		}
-		if _, err := partMgr.EnsureCurrent(ctx, child, t.SourceSchema, t.PartitionPeriod, now, partition.TimeBoundary{}, prefix); err != nil {
+		b, err := partMgr.EnsureCurrent(ctx, child, t.SourceSchema, t.PartitionPeriod, now, partition.TimeBoundary{}, prefix)
+		if err != nil {
 			return fmt.Errorf("ensure current %s: %w", child, err)
 		}
+		anyBehind = anyBehind || b
 		children = append(children, childRef{child, v})
+	}
+	if anyBehind {
+		log.Printf("[%s] a region had no hot partition covering %s — created it; if this table is actively written, widen future_partitions (=%d) or run more often",
+			t.SourceTable, now.Format("2006-01-02"), t.FuturePartitions)
 	}
 
 	// 2. Enumerate past-hot RANGE leaves under each region child.

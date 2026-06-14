@@ -136,7 +136,7 @@ Both modes in depth, the partition CLI, supported types, and mesh setup are in
 
 | Doc | Contents |
 |---|---|
-| **[USAGE.md](USAGE.md)** | Day-to-day use — both modes, one-time setup, reading/writing, supported types, the partition CLI, storage backends, distributed (mesh) setup, tuning |
+| **[USAGE.md](USAGE.md)** | Day-to-day use — both modes plus the standalone partition manager, one-time setup, reading/writing, supported types, the partition CLI, storage backends, distributed (mesh) setup, tuning |
 | **[INSTALL.md](INSTALL.md)** | Build from source (Docker or bare-metal); Testing & CI |
 | **[S3_HOWTO.md](S3_HOWTO.md)** | Get ColdFront running on cloud S3 (virtual-hosted), end-to-end |
 | **[ARCHITECTURE.md](ARCHITECTURE.md)** | Shared architecture and core mechanics |
@@ -247,7 +247,7 @@ pgedge-coldfront/
 ├── run-ci-local.sh             ← pre-commit gate (ci/matrix.sh --quick)
 ├── config.example.yaml
 ├── Makefile
-├── USAGE.md                    ← user-level usage guide (both modes)
+├── USAGE.md                    ← user-level usage guide (both modes + partition manager)
 ├── ARCHITECTURE.md             ← common architecture (shared mechanics)
 ├── ARCHITECTURE_TIERED.md      ← tiered (hot PG + cold Iceberg) mode
 └── ARCHITECTURE_DECOUPLED.md   ← decoupled (iceberg-only) mode

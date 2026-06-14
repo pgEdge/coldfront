@@ -16,6 +16,14 @@ const (
 	PeriodDaily   = "daily"
 )
 
+// Retention strategies for a partition past its retention window (standalone
+// partitioner only; the tiered archiver always drops after exporting to cold).
+// The valid set lives here so config validation references one source.
+const (
+	StrategyDrop   = "drop"   // DETACH CONCURRENTLY + DROP TABLE — destroy (default)
+	StrategyDetach = "detach" // DETACH CONCURRENTLY only — preserve as a standalone table
+)
+
 // DBTX abstracts *pgx.Conn and pgx.Tx for testability.
 type DBTX interface {
 	Exec(ctx context.Context, sql string, arguments ...any) (pgconn.CommandTag, error)
@@ -111,24 +119,33 @@ func (m *Manager) EnsureFuture(ctx context.Context, parent, schema, column, peri
 }
 
 // EnsureCurrent creates the partition covering `now` (idempotent) and reports
-// whether the table had already fallen behind: partitions exist, yet none
-// covered `now` when the pass began — meaning live inserts had no home and the
-// premake cadence is too slow for the configured window. A table with no
-// partitions yet (fresh, or a newly provisioned sub-tree) is NOT behind; its
-// current partition is simply created. Callers fail loud on a true return.
+// whether the table had already fallen behind: a PAST partition exists, yet none
+// covers `now` — meaning the table has been in use but live inserts now have no
+// home, so the premake cadence is too slow. The past-partition test matters
+// because RunReconcile premakes the forward window (EnsureFuture) BEFORE this
+// check, so a fresh table always has future partitions by now; keying "behind"
+// off `len(parts) > 0` would spuriously fire on a freshly-bootstrapped table.
+// Only future partitions present (a fresh table, or a newly provisioned sub-tree)
+// is NOT behind; its current partition is simply created. Callers fail loud on a
+// true return.
 func (m *Manager) EnsureCurrent(ctx context.Context, parent, schema, period string, now time.Time, b Boundary, leafPrefix string) (bool, error) {
 	parts, err := m.listPartitions(ctx, parent, schema, b)
 	if err != nil {
 		return false, err
 	}
 	covered := false
+	hasPast := false
 	for _, p := range parts {
-		if !p.LowerBound.After(now) && p.UpperBound.After(now) {
-			covered = true
+		if p.LowerBound.After(now) {
+			continue // future partition: irrelevant to coverage or to "behind"
+		}
+		if p.UpperBound.After(now) {
+			covered = true // lower <= now < upper: covers now
 			break
 		}
+		hasPast = true // lower <= now and upper <= now: a fully-past partition
 	}
-	behind := len(parts) > 0 && !covered
+	behind := hasPast && !covered
 	if !covered {
 		if err := m.createPartition(ctx, parent, schema, period, now, b, leafPrefix); err != nil {
 			return behind, err

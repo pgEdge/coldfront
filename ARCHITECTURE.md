@@ -393,14 +393,16 @@ at the point of use: names everywhere, OIDs only where required.
 ### Per-table config: `coldfront.partition_config`
 
 Which tables are managed and their lifecycle (`hot_period`, `retention_period`,
-`partition_period`, premake, mode) live in `coldfront.partition_config` — like
-`tiered_views` and `archive_watermark` above, a **name-keyed** table that
-replicates **by value** across a Spock mesh. It is auto-added to the default
-replication set on a spock node (a no-op on vanilla, where there is one node), so
-every node reads identical config with no per-node file syncing — the same
-property that motivates name-keying everywhere else. `CHECK` constraints encode
-the lifecycle rules (a destroy boundary is required; `id` mode forbids a hot
-tier — the cold tier is time-only; 2-level needs an explicit RANGE column), so an
+`partition_period`, premake, mode, `expiration_strategy`) live in
+`coldfront.partition_config` — like `tiered_views` and `archive_watermark` above,
+a **name-keyed** table that replicates **by value** across a Spock mesh. It is
+auto-added to the default replication set on a spock node (a no-op on vanilla,
+where there is one node), so every node reads identical config with no per-node
+file syncing — the same property that motivates name-keying everywhere else.
+`CHECK` constraints encode the lifecycle rules (a destroy boundary is required;
+`id` mode forbids a hot tier — the cold tier is time-only; 2-level needs an
+explicit RANGE column; `expiration_strategy` is `drop`|`detach`, and `detach` —
+expire by detaching only, not dropping — is allowed partition-only), so an
 invalid row is rejected at write time. The standalone partitioner
 self-materializes the table on stock PostgreSQL via `EnsureTable`, needing no
 extension. Connection config (DSN, Iceberg/S3 credentials) is deliberately **not**

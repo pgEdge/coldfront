@@ -153,12 +153,15 @@ Spock's `ddl_sql` repset replicates the `CREATE VIEW` and the registry row, so t
 
 ## Mode 3 — Standalone partition manager (no cold tier)
 
-If you only need automated PG partition maintenance — no Iceberg, no cold tier —
-run `bin/partitioner` against stock PostgreSQL (or a Spock mesh). Each invocation
-makes one reconcile pass per managed table: premake the forward window, ensure
-the partition covering *now* exists, and detach-then-drop partitions past
-retention (`DETACH ... CONCURRENTLY`, never a bare `DROP` of attached data).
-Build it with `make build` and run it from cron:
+**You don't need Iceberg at all.** If automated PostgreSQL partition maintenance
+is all you want — declarative time- or id-based RANGE partitioning with a
+premade forward window and automatic age-out of old partitions — ColdFront's
+`partitioner` binary is the whole product: stock PostgreSQL (or a Spock mesh),
+no cold tier, no DuckDB, no Iceberg, nothing to preload. Each invocation makes
+one reconcile pass per managed table: premake the forward window, ensure the
+partition covering *now* exists, and detach-then-drop partitions past retention
+(`DETACH ... CONCURRENTLY`, never a bare `DROP` of attached data). Build it with
+`make build` and run it from cron:
 
 ```bash
 go build -o bin/partitioner ./cmd/partitioner   # or: make build
@@ -178,11 +181,38 @@ archiver:
       partition_period: monthly        # monthly | daily
       retention_period: 12 months      # N days|weeks|months|years
       future_partitions: 3             # premake window kept ahead of now
+      expiration_strategy: drop         # drop (DETACH+DROP, destroy; default)
+                                       #   | detach (DETACH only, keep as a
+                                       #     standalone table — data preserved)
 ```
 
-If a reconcile pass finds partitions exist but none covers *now* (the cron fell
-behind), it creates the current partition and then exits non-zero so monitoring
-notices — widen `future_partitions` or run more often.
+### Operating it
+
+Schedule one pass per period or more often — a cron line, or a systemd `oneshot`
+service plus timer (a failed pass then surfaces as a failed unit, so alerting is
+free):
+
+```cron
+17 * * * * postgres /usr/local/bin/partitioner --config /etc/coldfront/partitioner.yaml >> /var/log/coldfront-partitioner.log 2>&1
+```
+
+- **Exit codes.** `0` = every table reconciled; non-zero = at least one table
+  failed or fell behind (`N table(s) failed`), each logged with its
+  `[schema.table]` prefix. Alert on non-zero.
+- **Behind-detection.** If the table already has a *past* partition but none
+  covers *now* at the start of a pass (a lagging cron — live inserts had no home),
+  the pass heals it (creates the current partition) and *then* exits non-zero so
+  monitoring notices — widen `future_partitions` or run more often. A fresh table
+  (only just-premade future partitions) is **not** behind: its first reconcile
+  succeeds cleanly.
+- **Retention strategy.** With the default `expiration_strategy: drop`, expiry is
+  `DETACH CONCURRENTLY` + `DROP TABLE` — the data is **gone**, so back up before
+  shrinking `retention_period`. Set `expiration_strategy: detach` to instead leave
+  the expired partition as a standalone table (detached from the parent, data
+  preserved) and reclaim it yourself. A partition is expired only once its
+  *entire* range is older than `now − retention_period` (months/years are
+  approximate: 30/365 days). `detach` is partition-only — the tiered archiver
+  always drops after exporting to cold.
 
 ### Primary keys on time-partitioned tables (id mode)
 
@@ -249,6 +279,10 @@ Setting `hot_period` makes a table tiered; omitting it makes it partition-only.
 ```bash
 # Partition-only: keep 3 future partitions, drop those older than 12 months.
 partitioner register --config cf.yaml --table events --period monthly --retention "12 months"
+
+# Partition-only, but DETACH (preserve) expired partitions instead of dropping them.
+partitioner register --config cf.yaml --table events --period monthly \
+    --retention "12 months" --strategy detach
 
 # Tiered: tier to cold Iceberg after 1 month, then drop cold data after 5 years.
 archiver register --config cf.yaml --table events --period monthly \

@@ -385,6 +385,62 @@ archiver:
 	assert.Equal(t, "events", c.Archiver.Tables[0].SourceTable)
 }
 
+func TestValidate_ExpirationStrategyDefaultsToDrop(t *testing.T) {
+	cfg := `
+postgres:
+  dsn: "host=localhost dbname=mydb"
+archiver:
+  tables:
+    - source_table: "events"
+      partition_period: "monthly"
+      retention_period: "12 months"
+`
+	c, err := Load(writeConfig(t, cfg))
+	require.NoError(t, err)
+	require.Len(t, c.Archiver.Tables, 1)
+	assert.Equal(t, "drop", c.Archiver.Tables[0].ExpirationStrategy, "omitted strategy must default to drop")
+}
+
+func TestValidate_PartitionOnlyDetachOK(t *testing.T) {
+	cfg := `
+postgres:
+  dsn: "host=localhost dbname=mydb"
+archiver:
+  tables:
+    - source_table: "events"
+      partition_period: "monthly"
+      retention_period: "12 months"
+      expiration_strategy: "detach"
+`
+	c, err := Load(writeConfig(t, cfg))
+	require.NoError(t, err)
+	assert.Equal(t, "detach", c.Archiver.Tables[0].ExpirationStrategy)
+}
+
+func TestValidate_BadExpirationStrategy(t *testing.T) {
+	cfg := `
+postgres:
+  dsn: "host=localhost dbname=mydb"
+archiver:
+  tables:
+    - source_table: "events"
+      partition_period: "monthly"
+      retention_period: "12 months"
+      expiration_strategy: "archive"
+`
+	_, err := Load(writeConfig(t, cfg))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "expiration_strategy")
+}
+
+func TestValidate_TieredRejectsDetach(t *testing.T) {
+	// detach is partition-only: the tiered archiver drops after exporting to cold,
+	// so detach on a tiered table would be a silent no-op — reject it.
+	_, err := Load(writeConfig(t, tieredCfg("      hot_period: \"1 month\"\n      expiration_strategy: \"detach\"")))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "partition-only")
+}
+
 func TestValidate_IdModeSnowflakeOK(t *testing.T) {
 	cfg := `
 postgres:

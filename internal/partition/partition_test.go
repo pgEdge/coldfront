@@ -229,6 +229,25 @@ func TestEnsureCurrent_GapIsBehindAndHeals(t *testing.T) {
 	assert.True(t, hasCreate(db.execSQL), "must heal by creating the current partition")
 }
 
+func TestEnsureCurrent_FutureOnlyNotBehind(t *testing.T) {
+	// After EnsureFuture premakes the forward window on a FRESH table, the only
+	// partitions present are future ones: none covers now, but the table never had
+	// a current/past partition, so this is bootstrap — NOT a lagging cron. This is
+	// the real-flow ordering (EnsureFuture before EnsureCurrent) that made a fresh
+	// table's first reconcile spuriously report ErrBehind.
+	db := &mockDB{rowsFunc: partitionRows(
+		[2]string{"p_2026_07", "FOR VALUES FROM ('2026-07-01 00:00:00+00') TO ('2026-08-01 00:00:00+00')"},
+		[2]string{"p_2026_08", "FOR VALUES FROM ('2026-08-01 00:00:00+00') TO ('2026-09-01 00:00:00+00')"},
+		[2]string{"p_2026_09", "FOR VALUES FROM ('2026-09-01 00:00:00+00') TO ('2026-10-01 00:00:00+00')"},
+	)}
+	m := NewManager(db)
+	now := time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC)
+	behind, err := m.EnsureCurrent(context.Background(), "events", "public", "monthly", now, TimeBoundary{}, "")
+	require.NoError(t, err)
+	assert.False(t, behind, "only future partitions exist (fresh bootstrap) -> not behind")
+	assert.True(t, hasCreate(db.execSQL), "current partition must still be created")
+}
+
 func TestFindExpired(t *testing.T) {
 	db := &mockDB{
 		rowsFunc: func(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {

@@ -88,6 +88,12 @@ type TableConfig struct {
 	HotPeriod        string `yaml:"hot_period"`
 	RetentionPeriod  string `yaml:"retention_period"`
 	FuturePartitions int    `yaml:"future_partitions"`
+	// ExpirationStrategy decides what happens to a partition past the retention
+	// window in the standalone partitioner: "drop" (default — DETACH + DROP,
+	// destroy) or "detach" (DETACH only, leave it as a standalone table). The
+	// tiered archiver ignores it (it always drops after exporting to cold), so
+	// "detach" is valid only in partition-only mode.
+	ExpirationStrategy string `yaml:"expiration_strategy"`
 	// PartMode is "timestamp" (default) or "id". In id mode the partition
 	// column is a time-ordered id (so it can also be the primary key) and
 	// IDScheme names its encoding.
@@ -153,6 +159,9 @@ func applyDefaults(cfg *Config) {
 		}
 		if t.FuturePartitions == 0 {
 			t.FuturePartitions = 3
+		}
+		if t.ExpirationStrategy == "" {
+			t.ExpirationStrategy = partition.StrategyDrop
 		}
 	}
 }
@@ -258,6 +267,19 @@ func (c *Config) Validate() error {
 		// the valid set, so config and the partition core never drift.
 		if _, err := partition.BoundaryFor(t.PartMode, t.IDScheme); err != nil {
 			return fmt.Errorf("archiver.tables[%d]: %w", i, err)
+		}
+		// expiration_strategy: enum, and "detach" only makes sense partition-only
+		// (the tiered archiver drops after exporting to cold, so it would be a
+		// silent no-op).
+		switch t.ExpirationStrategy {
+		case "", partition.StrategyDrop, partition.StrategyDetach:
+		default:
+			return fmt.Errorf("archiver.tables[%d].expiration_strategy %q must be %q or %q",
+				i, t.ExpirationStrategy, partition.StrategyDetach, partition.StrategyDrop)
+		}
+		if icebergMode && t.ExpirationStrategy == partition.StrategyDetach {
+			return fmt.Errorf("archiver.tables[%d].expiration_strategy %q is only valid in partition-only mode",
+				i, partition.StrategyDetach)
 		}
 		if t.SubPartition != nil {
 			if t.SubPartition.ValuesSource == "" {

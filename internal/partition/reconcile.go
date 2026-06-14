@@ -7,11 +7,12 @@ import (
 	"time"
 )
 
-// ErrBehind reports that premake had fallen behind: the table's partitions
-// existed but none covered `now` when a reconcile pass began, so live inserts
-// had no home. RunReconcile heals it (creates the current partition) and then
-// returns an error wrapping ErrBehind, so the run exits loud while the table is
-// left correct. Callers distinguish it with errors.Is.
+// ErrBehind reports that premake had fallen behind: the table already had a
+// past partition but none covered `now` when a reconcile pass began, so live
+// inserts had no home. (A fresh table with only just-premade future partitions
+// is NOT behind — see EnsureCurrent.) RunReconcile heals it (creates the current
+// partition) and then returns an error wrapping ErrBehind, so the run exits loud
+// while the table is left correct. Callers distinguish it with errors.Is.
 var ErrBehind = errors.New("premake fell behind")
 
 // Spec is one table's partition-lifecycle job — the inputs a single reconcile
@@ -23,9 +24,10 @@ type Spec struct {
 	Column     string        // the RANGE key column
 	Period     string        // PeriodMonthly | PeriodDaily
 	Premake    int           // future partitions kept ahead of now
-	Retention  time.Duration // detach+drop partitions whose upper bound is older than now-Retention
+	Retention  time.Duration // expire partitions whose upper bound is older than now-Retention
 	Boundary   Boundary      // how the RANGE key maps to time; nil means TimeBoundary
 	LeafPrefix string        // prepended to leaf names; "" for single-level (set per-child in 2-level)
+	Strategy   string        // StrategyDrop (default, ""⇒drop) or StrategyDetach; default-path expiry only
 }
 
 // boundary returns the Spec's Boundary, defaulting to time-mode so a zero Spec
@@ -89,6 +91,11 @@ func RunReconcile(ctx context.Context, lc Lifecycle, s Spec, now time.Time, expi
 		}
 		if err := lc.Detach(ctx, s.Parent, s.Schema, p.Name); err != nil {
 			return err
+		}
+		// StrategyDetach leaves the detached partition in place as a standalone
+		// table (data preserved); the default (StrategyDrop / "") destroys it.
+		if s.Strategy == StrategyDetach {
+			continue
 		}
 		if err := lc.Drop(ctx, s.Schema, p.Name); err != nil {
 			return err

@@ -100,6 +100,24 @@ func TestRunReconcile_NilHookJustDetachDrops(t *testing.T) {
 	}
 }
 
+func TestRunReconcile_DetachOnlyDoesNotDrop(t *testing.T) {
+	f := &fakeLifecycle{expired: []Info{{Name: "p_old"}}}
+	s := testSpec()
+	s.Strategy = StrategyDetach
+	if err := RunReconcile(context.Background(), f, s, time.Now(), nil); err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"ensure public.events col=ts monthly x3", "current public.events monthly", "find public.events", "detach p_old"}
+	if got := strings.Join(f.log, "|"); got != strings.Join(want, "|") {
+		t.Fatalf("got %v want %v", f.log, want)
+	}
+	for _, c := range f.log {
+		if strings.HasPrefix(c, "drop") {
+			t.Fatalf("detach-only strategy must NOT drop: %v", f.log)
+		}
+	}
+}
+
 func TestRunReconcile_ExpireErrorStops(t *testing.T) {
 	f := &fakeLifecycle{expired: []Info{{Name: "p1"}}}
 	boom := errors.New("export failed")

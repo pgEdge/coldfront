@@ -41,6 +41,7 @@ CREATE TABLE IF NOT EXISTS coldfront.partition_config (
     hot_period             text,
     retention_period       text,
     sub_part_values_source text,
+    expiration_strategy     text    NOT NULL DEFAULT 'drop',
     enabled                boolean NOT NULL DEFAULT true,
     PRIMARY KEY (schema_name, table_name),
     CONSTRAINT pc_period_enum   CHECK (partition_period IN ('monthly','daily')),
@@ -50,8 +51,18 @@ CREATE TABLE IF NOT EXISTS coldfront.partition_config (
     CONSTRAINT pc_future_pos    CHECK (future_partitions >= 1),
     CONSTRAINT pc_destroy       CHECK (hot_period IS NOT NULL OR retention_period IS NOT NULL),
     CONSTRAINT pc_cold_timeonly CHECK (hot_period IS NULL OR part_mode = 'timestamp'),
-    CONSTRAINT pc_2level_col    CHECK (sub_part_values_source IS NULL OR partition_column IS NOT NULL)
+    CONSTRAINT pc_2level_col    CHECK (sub_part_values_source IS NULL OR partition_column IS NOT NULL),
+    CONSTRAINT pc_strategy_enum CHECK (expiration_strategy IN ('drop','detach')),
+    CONSTRAINT pc_strategy_part CHECK (expiration_strategy = 'drop' OR hot_period IS NULL)
 )`
+
+// addColumnsSQL idempotently brings an existing partition_config table (created
+// by an older version, before expiration_strategy existed) up to date. CREATE
+// TABLE IF NOT EXISTS skips an existing table, so a new column needs an explicit
+// ADD COLUMN IF NOT EXISTS — otherwise LoadTables' SELECT would fail on upgrade.
+const addColumnsSQL = `
+ALTER TABLE coldfront.partition_config
+    ADD COLUMN IF NOT EXISTS expiration_strategy text NOT NULL DEFAULT 'drop'`
 
 // ensureReplicatedSQL adds partition_config to Spock's default replication set
 // so the per-table config replicates by value across the mesh — the same
@@ -84,6 +95,9 @@ func EnsureTable(ctx context.Context, db DBTX) error {
 	if _, err := db.Exec(ctx, createTableSQL); err != nil {
 		return fmt.Errorf("create partition_config: %w", err)
 	}
+	if _, err := db.Exec(ctx, addColumnsSQL); err != nil {
+		return fmt.Errorf("upgrade partition_config columns: %w", err)
+	}
 	if _, err := db.Exec(ctx, ensureReplicatedSQL); err != nil {
 		return fmt.Errorf("ensure partition_config replicated: %w", err)
 	}
@@ -115,7 +129,7 @@ func LoadTables(ctx context.Context, db DBTX) ([]config.TableConfig, error) {
 	rows, err := db.Query(ctx, `
 		SELECT schema_name, table_name, partition_period, partition_column,
 		       future_partitions, part_mode, id_scheme, hot_period,
-		       retention_period, sub_part_values_source
+		       retention_period, sub_part_values_source, expiration_strategy
 		FROM coldfront.partition_config
 		WHERE enabled
 		ORDER BY schema_name, table_name`)
@@ -129,7 +143,7 @@ func LoadTables(ctx context.Context, db DBTX) ([]config.TableConfig, error) {
 		var t config.TableConfig
 		var col, idScheme, hot, ret, subVals *string
 		if err := rows.Scan(&t.SourceSchema, &t.SourceTable, &t.PartitionPeriod, &col,
-			&t.FuturePartitions, &t.PartMode, &idScheme, &hot, &ret, &subVals); err != nil {
+			&t.FuturePartitions, &t.PartMode, &idScheme, &hot, &ret, &subVals, &t.ExpirationStrategy); err != nil {
 			return nil, fmt.Errorf("scan partition_config: %w", err)
 		}
 		if col != nil {

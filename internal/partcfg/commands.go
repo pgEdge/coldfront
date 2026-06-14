@@ -133,6 +133,7 @@ func runRegister(ctx context.Context, args []string) error {
 	partMode := fs.String("part-mode", "timestamp", "timestamp | id (id = RANGE on a time-ordered id, partition-only)")
 	idScheme := fs.String("id-scheme", "", "uuidv7 | snowflake (required with --part-mode id)")
 	subValues := fs.String("sub-values-source", "", "2-level only: SQL returning the LIST (level-1) values, e.g. \"SELECT region FROM regions\"")
+	strategy := fs.String("strategy", "drop", "partition-only expiry past retention: drop (DETACH+DROP, destroy) | detach (DETACH only, keep as a standalone table)")
 	printSQL := fs.Bool("print-sql", false, "print the INSERT (and any DDL) instead of running it — for git/audit")
 	dryRun := fs.Bool("dry-run", false, "validate everything but make no changes")
 	fs.Usage = registerUsage(fs)
@@ -167,11 +168,20 @@ func runRegister(ctx context.Context, args []string) error {
 	if *hot != "" && *retention != "" && retDur <= hotDur {
 		return fmt.Errorf("--retention (%s) must exceed --hot-period (%s)", *retention, *hot)
 	}
+	switch *strategy {
+	case partition.StrategyDrop, partition.StrategyDetach:
+	default:
+		return fmt.Errorf("--strategy %q must be %q or %q", *strategy, partition.StrategyDetach, partition.StrategyDrop)
+	}
+	if *strategy == partition.StrategyDetach && *hot != "" {
+		return fmt.Errorf("--strategy detach is only valid in partition-only mode (no --hot-period)")
+	}
 
 	row := configRow{
 		schema: *schema, table: *table, period: *period, column: *column,
 		premake: *premake, partMode: *partMode, idScheme: *idScheme,
 		hot: *hot, retention: *retention, subValues: *subValues,
+		strategy: *strategy,
 	}
 	insertSQL := row.insertSQL()
 	if *printSQL {
@@ -274,7 +284,7 @@ FLAGS:
 		       COALESCE(hot_period,'-'), COALESCE(retention_period,'-'),
 		       CASE WHEN hot_period IS NULL THEN 'partition-only' ELSE 'tiered' END,
 		       CASE WHEN sub_part_values_source IS NULL THEN 'flat' ELSE '2-level' END,
-		       enabled
+		       expiration_strategy, enabled
 		FROM coldfront.partition_config ORDER BY schema_name, table_name`)
 	if err != nil {
 		return fmt.Errorf("query partition_config: %w", err)
@@ -285,15 +295,15 @@ FLAGS:
 
 func printList(w io.Writer, rows pgx.Rows) error {
 	tw := tabwriter.NewWriter(w, 0, 2, 2, ' ', 0)
-	_, _ = fmt.Fprintln(tw, "TABLE\tPERIOD\tHOT\tRETENTION\tMODE\tSHAPE\tENABLED")
+	_, _ = fmt.Fprintln(tw, "TABLE\tPERIOD\tHOT\tRETENTION\tMODE\tSHAPE\tEXPIRY\tENABLED")
 	n := 0
 	for rows.Next() {
-		var schema, table, period, hot, ret, mode, shape string
+		var schema, table, period, hot, ret, mode, shape, strategy string
 		var enabled bool
-		if err := rows.Scan(&schema, &table, &period, &hot, &ret, &mode, &shape, &enabled); err != nil {
+		if err := rows.Scan(&schema, &table, &period, &hot, &ret, &mode, &shape, &strategy, &enabled); err != nil {
 			return err
 		}
-		_, _ = fmt.Fprintf(tw, "%s.%s\t%s\t%s\t%s\t%s\t%s\t%t\n", schema, table, period, hot, ret, mode, shape, enabled)
+		_, _ = fmt.Fprintf(tw, "%s.%s\t%s\t%s\t%s\t%s\t%s\t%s\t%t\n", schema, table, period, hot, ret, mode, shape, strategy, enabled)
 		n++
 	}
 	if err := rows.Err(); err != nil {
@@ -313,15 +323,16 @@ type configRow struct {
 	premake                       int
 	partMode, idScheme            string
 	hot, retention, subValues     string
+	strategy                      string
 }
 
 func (r configRow) insertSQL() string {
 	return fmt.Sprintf(`INSERT INTO coldfront.partition_config
   (schema_name, table_name, partition_period, partition_column, future_partitions,
-   part_mode, id_scheme, hot_period, retention_period, sub_part_values_source)
-VALUES (%s, %s, %s, %s, %d, %s, %s, %s, %s, %s);`,
+   part_mode, id_scheme, hot_period, retention_period, sub_part_values_source, expiration_strategy)
+VALUES (%s, %s, %s, %s, %d, %s, %s, %s, %s, %s, %s);`,
 		lit(r.schema), lit(r.table), lit(r.period), lit(r.column), r.premake,
-		lit(r.partMode), lit(r.idScheme), lit(r.hot), lit(r.retention), lit(r.subValues))
+		lit(r.partMode), lit(r.idScheme), lit(r.hot), lit(r.retention), lit(r.subValues), lit(r.strategy))
 }
 
 // validatePKSuperset confirms the table's PRIMARY KEY covers the partition key.
@@ -446,6 +457,7 @@ func rowFrom(t config.TableConfig) configRow {
 		schema: t.SourceSchema, table: t.SourceTable, period: t.PartitionPeriod,
 		column: t.PartitionColumn, premake: t.FuturePartitions, partMode: t.PartMode,
 		idScheme: t.IDScheme, hot: t.HotPeriod, retention: t.RetentionPeriod,
+		strategy: t.ExpirationStrategy,
 	}
 	if t.SubPartition != nil {
 		r.subValues = t.SubPartition.ValuesSource
@@ -458,6 +470,9 @@ func rowFrom(t config.TableConfig) configRow {
 	}
 	if r.partMode == "" {
 		r.partMode = "timestamp"
+	}
+	if r.strategy == "" {
+		r.strategy = partition.StrategyDrop
 	}
 	return r
 }
@@ -475,6 +490,7 @@ func runSet(ctx context.Context, args []string) error {
 	hot := fs.String("hot-period", "", "change the tier-to-cold age (empty value clears it ⇒ partition-only)")
 	retention := fs.String("retention", "", "change the drop age (empty value clears it)")
 	subValues := fs.String("sub-values-source", "", "change the 2-level LIST values query")
+	strategy := fs.String("strategy", "", "change expiry strategy: drop | detach (partition-only)")
 	enable := fs.Bool("enable", false, "resume managing this table")
 	disable := fs.Bool("disable", false, "pause managing this table (keeps the row)")
 	printSQL := fs.Bool("print-sql", false, "print the UPDATE instead of running it")
@@ -513,6 +529,8 @@ EXAMPLES:
 			sets = append(sets, "retention_period="+lit(*retention))
 		case "sub-values-source":
 			sets = append(sets, "sub_part_values_source="+lit(*subValues))
+		case "strategy":
+			sets = append(sets, "expiration_strategy="+lit(*strategy))
 		case "enable":
 			sets = append(sets, "enabled=true")
 		case "disable":

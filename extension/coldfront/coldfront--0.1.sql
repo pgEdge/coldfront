@@ -140,6 +140,7 @@ CREATE TABLE IF NOT EXISTS coldfront.partition_config (
     hot_period             text,                              -- NULL ⇒ partition-only; set ⇒ tiered
     retention_period       text,
     sub_part_values_source text,                              -- NULL ⇒ flat; set ⇒ 2-level LIST→RANGE
+    expiration_strategy     text    NOT NULL DEFAULT 'drop',   -- partitioner expiry: 'drop' (destroy) | 'detach' (preserve)
     enabled                boolean NOT NULL DEFAULT true,
     PRIMARY KEY (schema_name, table_name),
     CONSTRAINT pc_period_enum   CHECK (partition_period IN ('monthly','daily')),
@@ -149,7 +150,9 @@ CREATE TABLE IF NOT EXISTS coldfront.partition_config (
     CONSTRAINT pc_future_pos    CHECK (future_partitions >= 1),
     CONSTRAINT pc_destroy       CHECK (hot_period IS NOT NULL OR retention_period IS NOT NULL),
     CONSTRAINT pc_cold_timeonly CHECK (hot_period IS NULL OR part_mode = 'timestamp'),
-    CONSTRAINT pc_2level_col    CHECK (sub_part_values_source IS NULL OR partition_column IS NOT NULL)
+    CONSTRAINT pc_2level_col    CHECK (sub_part_values_source IS NULL OR partition_column IS NOT NULL),
+    CONSTRAINT pc_strategy_enum CHECK (expiration_strategy IN ('drop','detach')),
+    CONSTRAINT pc_strategy_part CHECK (expiration_strategy = 'drop' OR hot_period IS NULL)  -- 'detach' is partition-only
 );
 
 -- ensure_attached() issues ATTACH IF NOT EXISTS for the Lakekeeper catalog

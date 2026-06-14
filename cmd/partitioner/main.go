@@ -144,6 +144,7 @@ func specFromTable(t config.TableConfig) (partition.Spec, error) {
 		Premake:   t.FuturePartitions,
 		Retention: retention,
 		Boundary:  boundary,
+		Strategy:  t.ExpirationStrategy,
 	}, nil
 }
 
