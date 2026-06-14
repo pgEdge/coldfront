@@ -6,9 +6,9 @@ dist/
 coverage.html
 .env
 .claude/
-CLAUDE.md
 CLAUDE.local.md
 THIRD_PARTY_GO.txt
+REPO_READY_AUDIT.md
 .tmp/
 *.pdf
 
