@@ -68,8 +68,6 @@ License**:
 
 ## Other build / runtime dependencies
 
-- **libcurl** — https://curl.se — curl license (MIT/X-style). Built from source
-  (8.11.x) in the base image for DuckDB 1.5.3 httpfs.
 - **vcpkg** — https://github.com/microsoft/vcpkg — MIT (build-time only; not
   redistributed).
 - DuckDB's vendored third-party libraries (re2, zstd, utf8proc, fast_float,

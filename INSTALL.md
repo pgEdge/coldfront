@@ -46,8 +46,8 @@ docker compose up -d --build      # end-user single-node stack (ports published)
 ```
 
 The split keeps app builds fast and always testing current source: the
-expensive, stable compiles (libcurl 8.11, pg_duckdb 1.5.3, patched
-duckdb-iceberg) live in the prebuilt **base**, published to
+expensive, stable compiles (pg_duckdb 1.5.3 + the patched duckdb-iceberg) live
+in the prebuilt **base**, published to
 `ghcr.io/pgedge/coldfront-duckdb-base:pg{16,17,18}`; the **app** build
 ([`docker/Dockerfile.duckdb15`](docker/Dockerfile.duckdb15)) just `FROM`s it and
 compiles the coldfront extension in seconds. If you build the base yourself
@@ -74,7 +74,7 @@ Then follow [USAGE.md → One-time setup](USAGE.md#one-time-setup)
 
 | For | You need |
 |---|---|
-| Docker build (above) | Docker; network access (GitHub / curl.se / quay.io); ~a few GB disk + RAM and 30–60 min for the base compile |
+| Docker build (above) | Docker; network access (GitHub / quay.io); ~a few GB disk + RAM and 30–60 min for the base compile |
 | The archiver (all paths) | Go 1.24+, `make` (`make build` → `./bin/archiver`) |
 | Bare metal (below) | `pg_config`, PostgreSQL server dev headers, `make`, `gcc` |
 
