@@ -268,6 +268,12 @@ The data lifecycle is **hot PG → `hot_period` → cold Iceberg → `retention_
 → dropped** (tiered) or **hot PG → `retention_period` → dropped** (partition-only).
 Setting `hot_period` makes a table tiered; omitting it makes it partition-only.
 
+`hot_period` and `retention_period` are native PostgreSQL `interval`s — use any
+interval syntax (`1 month`, `90 days`, `1 year 2 mons`, `5 years`). Expiry
+boundaries are computed with calendar-accurate interval arithmetic (`now() -
+period`: real months, leap years), and `retention_period` must exceed
+`hot_period` (validated at `register`/`set` time).
+
 | Command | Purpose |
 |---|---|
 | `register` | add/adopt a table — validates the PRIMARY KEY covers the partition key |
