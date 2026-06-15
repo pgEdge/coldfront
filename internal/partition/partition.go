@@ -3,6 +3,7 @@ package partition
 import (
 	"context"
 	"fmt"
+	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -106,9 +107,10 @@ func FuturePartitionDates(now time.Time, period string, count int) []time.Time {
 // EnsureFuture creates future partitions if they don't exist. The Boundary
 // renders the FROM/TO bound values, so the same time-stepped schedule serves a
 // time column (TimeBoundary) or a time-ordered id column (UUIDv7/Snowflake).
-// leafPrefix is prepended to each partition name; "" yields the flat single-level
-// names (p_2026_06), while a 2-level sub-tree passes its child name so leaves are
-// unique across siblings (events_eu_p_2026_06).
+// leafPrefix is prepended to each partition name. "" means "scope to the parent
+// table" (createPartition defaults it to parent_, e.g. events_p_2026_06), so two
+// flat tables in one schema never collide; a 2-level sub-tree passes its child
+// name so leaves are unique across siblings (events_eu_p_2026_06).
 func (m *Manager) EnsureFuture(ctx context.Context, parent, schema, column, period string, count int, now time.Time, b Boundary, leafPrefix string) error {
 	for _, d := range FuturePartitionDates(now, period, count) {
 		if err := m.createPartition(ctx, parent, schema, period, d, b, leafPrefix); err != nil {
@@ -159,17 +161,44 @@ func (m *Manager) EnsureCurrent(ctx context.Context, parent, schema, period stri
 // leaf-prefix handling live in one place.
 func (m *Manager) createPartition(ctx context.Context, parent, schema, period string, d time.Time, b Boundary, leafPrefix string) error {
 	lower, upper := PartitionBounds(d, period)
+	// Table-scope the leaf name. The date suffix alone (p_2026_06) is not unique
+	// within a schema, so two flat tables in the same schema would generate the
+	// SAME partition name and the second's CREATE … IF NOT EXISTS would silently
+	// no-op (issue #11). Prefixing with the parent table makes every leaf unique
+	// per schema — the same scheme the 2-level path already uses (child_p_2026_06).
+	// The leading "_" of a tiered hot table is stripped so the prefix is STABLE
+	// across the archiver's events→_events rename: premake (pre-swap, parent
+	// "events") and a later run (post-swap, parent "_events") must produce the
+	// SAME leaf name, or the second run overlaps the first. "events" and "_events"
+	// are one logical table, so they correctly share a partition namespace.
+	if leafPrefix == "" {
+		leafPrefix = strings.TrimPrefix(parent, "_") + "_"
+	}
 	name := leafPrefix + PartitionName(lower, period)
 	if err := checkIdent(name); err != nil {
 		return err
 	}
+	qname := pgx.Identifier{schema, name}.Sanitize()
+	qparent := pgx.Identifier{schema, parent}.Sanitize()
 	sql := fmt.Sprintf(
 		`CREATE TABLE IF NOT EXISTS %s PARTITION OF %s FOR VALUES FROM (%s) TO (%s)`,
-		pgx.Identifier{schema, name}.Sanitize(),
-		pgx.Identifier{schema, parent}.Sanitize(),
-		b.Literal(lower), b.Literal(upper))
+		qname, qparent, b.Literal(lower), b.Literal(upper))
 	if _, err := m.db.Exec(ctx, sql); err != nil {
 		return fmt.Errorf("create partition %s: %w", name, err)
+	}
+	// CREATE … IF NOT EXISTS no-ops if a relation with this name already exists —
+	// even one attached to a DIFFERENT parent (a name collision, or identifier
+	// truncation). Verify the partition is actually attached to OUR parent, so a
+	// collision fails loud instead of silently leaving the table partition-less
+	// and the run reporting success (issue #11, bug 2).
+	var attached bool
+	if err := m.db.QueryRow(ctx,
+		`SELECT EXISTS(SELECT 1 FROM pg_inherits WHERE inhrelid = to_regclass($1) AND inhparent = to_regclass($2))`,
+		qname, qparent).Scan(&attached); err != nil {
+		return fmt.Errorf("verify partition %s attached to %s.%s: %w", name, schema, parent, err)
+	}
+	if !attached {
+		return fmt.Errorf("partition %q is not attached to %s.%s — a relation with that name already exists under a different parent; partition names must be unique within a schema", name, schema, parent)
 	}
 	return nil
 }

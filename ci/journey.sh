@@ -135,26 +135,35 @@ CREATE TABLE IF NOT EXISTS events (
     data jsonb,
     PRIMARY KEY (id, ts)
 ) PARTITION BY RANGE (ts);
-CREATE TABLE IF NOT EXISTS p_2026_01 PARTITION OF events FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
-CREATE TABLE IF NOT EXISTS p_2026_02 PARTITION OF events FOR VALUES FROM ('2026-02-01') TO ('2026-03-01');
-CREATE TABLE IF NOT EXISTS p_2026_03 PARTITION OF events FOR VALUES FROM ('2026-03-01') TO ('2026-04-01');
-CREATE TABLE IF NOT EXISTS p_2026_04 PARTITION OF events FOR VALUES FROM ('2026-04-01') TO ('2026-05-01');
-INSERT INTO events (ts, status, data) SELECT '2026-01-15'::timestamptz + (i*interval '1 hour'), 'ok', '{"m":"jan"}'::jsonb FROM generate_series(1,100) i;
-INSERT INTO events (ts, status, data) SELECT '2026-02-10'::timestamptz + (i*interval '1 hour'), 'ok', '{"m":"feb"}'::jsonb FROM generate_series(1,80) i;
-INSERT INTO events (ts, status, data) SELECT '2026-03-05'::timestamptz + (i*interval '1 hour'), 'ok', '{"m":"mar"}'::jsonb FROM generate_series(1,60) i;
-INSERT INTO events (ts, status, data) SELECT '2026-04-01'::timestamptz + (i*interval '1 hour'), 'ok', '{"m":"apr"}'::jsonb FROM generate_series(1,40) i;
+-- Fake historical data over the 4 months BEFORE the current one, all derived
+-- from now() (never invented calendar literals), so the hot/cold split is
+-- correct under any wall clock. Months, oldest→newest: m4 m3 m2 (cold) and m1
+-- (the most recent — stays hot after the cutoff below). Partitions are pre-made
+-- with the partitioner's own table-scoped names (events_p_YYYY_MM) derived from
+-- those months; the archiver premakes current/future and does the conversion.
+DO $do$
+DECLARE m date;
+BEGIN
+  FOR i IN 1..4 LOOP                                       -- now-4mo .. now-1mo
+    m := (date_trunc('month', now()) - make_interval(months => 5 - i))::date;
+    EXECUTE format('CREATE TABLE IF NOT EXISTS %I PARTITION OF events FOR VALUES FROM (%L) TO (%L)',
+                   'events_p_' || to_char(m, 'YYYY_MM'), m, (m + interval '1 month'));
+  END LOOP;
+END $do$;
+INSERT INTO events (ts, status, data) SELECT date_trunc('month',now()) - interval '4 months' + interval '14 days' + (i*interval '1 hour'), 'ok', '{"m":"m4"}'::jsonb FROM generate_series(1,100) i;
+INSERT INTO events (ts, status, data) SELECT date_trunc('month',now()) - interval '3 months' + interval '9 days'  + (i*interval '1 hour'), 'ok', '{"m":"m3"}'::jsonb FROM generate_series(1,80) i;
+INSERT INTO events (ts, status, data) SELECT date_trunc('month',now()) - interval '2 months' + interval '4 days'  + (i*interval '1 hour'), 'ok', '{"m":"m2"}'::jsonb FROM generate_series(1,60) i;
+INSERT INTO events (ts, status, data) SELECT date_trunc('month',now()) - interval '1 months'                      + (i*interval '1 hour'), 'ok', '{"m":"m1"}'::jsonb FROM generate_series(1,40) i;
 EOSQL
     local seeded; seeded=$(q "$HOST" "SELECT count(*) FROM public.events;")
     assert_eq "seeded 280 rows (pre-archive, plain table)" "280" "$seeded"
 
-    # Pin the hot/cold cutoff to a FIXED date (2026-04-15) regardless of the wall
-    # clock. The archiver (correctly) computes cutoff = now − retention, so set
-    # retention = now − 2026-04-15: the Apr partition stays hot and Jan–Mar cold
-    # against the fixed seed dates above, deterministically, without touching the
-    # archiver. (A literal "1 month" drifts the cutoff across the Apr/May boundary
-    # as the clock advances — the day it crosses, Apr flips hot→cold and the
-    # hot-tier write assertions break.)
-    local ret_days=$(( ( $(date -u +%s) - $(date -u -d '2026-04-15' +%s) ) / 86400 ))
+    # Cutoff = the START of the most-recent seeded month (now-1mo). The archiver
+    # computes cutoff = now − hot_period, so hot_period (in days) = now − that
+    # month start: the m4/m3/m2 partitions are fully past it (→ cold) and m1 stays
+    # hot. Anchored to now(), so this holds under any wall clock — no invented date.
+    local cutoff_date; cutoff_date=$(date -u -d "$(date -u +%Y-%m-01) -1 month" +%Y-%m-%d)
+    local ret_days=$(( ( $(date -u +%s) - $(date -u -d "$cutoff_date" +%s) ) / 86400 ))
     cat > /tmp/journey-archiver.yaml <<EOF
 postgres:
   dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
@@ -185,7 +194,7 @@ EOF
 # Iceberg data older than it (the destroy end of the lifecycle: hot →hot_period→
 # cold →retention_period→ gone). By now Jan–Mar are already cold and Apr is hot,
 # so nothing is past the hot window — this exercises the cold-expiry-only path.
-# The retention cutoff (2026-02-01) drops the Jan cold rows and keeps Feb/Mar.
+# The retention cutoff (start of now-3mo, = m4 boundary) drops the m4 cold rows and keeps m3/m2.
 # Runs last so it doesn't perturb earlier stories' counts; jan_before is read
 # dynamically so the row-math holds regardless of what else landed in cold.
 # ───────────────────────────────────────────────────────────────────────────
@@ -193,12 +202,14 @@ story_cold_retention() {
     step "Cold retention: drop Iceberg data past retention_period"
     local before jan_before
     before=$(q "$HOST" "SELECT count(*) FROM events;")
-    jan_before=$(q "$HOST" "SELECT count(*) FROM events WHERE ts >= '2026-01-01' AND ts < '2026-02-01';")
-    assert_gt "Jan cold rows present before retention" "0" "$jan_before"
+    jan_before=$(q "$HOST" "SELECT count(*) FROM events WHERE ts >= date_trunc('month',now()) - interval '4 months' AND ts < date_trunc('month',now()) - interval '3 months';")
+    assert_gt "m4 cold rows present before retention" "0" "$jan_before"
 
-    local ret_days ret_long
-    ret_days=$(( ( $(date -u +%s) - $(date -u -d '2026-04-15' +%s) ) / 86400 ))   # hot cutoff  = 2026-04-15
-    ret_long=$(( ( $(date -u +%s) - $(date -u -d '2026-02-01' +%s) ) / 86400 ))    # drop cutoff = 2026-02-01
+    local ret_days ret_long hot_date drop_date
+    hot_date=$(date -u -d "$(date -u +%Y-%m-01) -1 month" +%Y-%m-%d)              # hot cutoff  = start of now-1mo
+    drop_date=$(date -u -d "$(date -u +%Y-%m-01) -3 month" +%Y-%m-%d)             # drop cutoff = start of now-3mo (m4 boundary)
+    ret_days=$(( ( $(date -u +%s) - $(date -u -d "$hot_date" +%s) ) / 86400 ))
+    ret_long=$(( ( $(date -u +%s) - $(date -u -d "$drop_date" +%s) ) / 86400 ))
     cat > /tmp/journey-coldret.yaml <<EOF
 postgres:
   dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
@@ -219,10 +230,10 @@ EOF
     else
         fail "archiver cold-retention run — see /tmp/journey-coldret.log"; tail -5 /tmp/journey-coldret.log
     fi
-    assert_eq "Jan cold rows dropped by retention" "0" \
-        "$(q "$HOST" "SELECT count(*) FROM events WHERE ts >= '2026-01-01' AND ts < '2026-02-01';")"
-    assert_gt "Feb cold rows retained" "0" \
-        "$(q "$HOST" "SELECT count(*) FROM events WHERE ts >= '2026-02-01' AND ts < '2026-03-01';")"
+    assert_eq "m4 cold rows dropped by retention" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM events WHERE ts >= date_trunc('month',now()) - interval '4 months' AND ts < date_trunc('month',now()) - interval '3 months';")"
+    assert_gt "m3 cold rows retained" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM events WHERE ts >= date_trunc('month',now()) - interval '3 months' AND ts < date_trunc('month',now()) - interval '2 months';")"
     assert_eq "exactly the past-retention rows were removed" "$((before - jan_before))" \
         "$(q "$HOST" "SELECT count(*) FROM events;")"
 }
@@ -260,11 +271,11 @@ story_provision_decoupled() {
 story_decoupled_crud() {
     step "6. Decoupled CRUD (INSERT/SELECT/UPDATE/DELETE → Iceberg via the hook)"
     local O; O=$(qf "$HOST" <<'EOSQL'
-INSERT INTO iceonly VALUES (1,'2026-05-01 10:00:00+00','s1','{"a":1}'),(2,'2026-05-01 10:00:01+00','s2','{"a":2}');
+INSERT INTO iceonly VALUES (1,date_trunc('month',now()) + interval '10 hours 0 minutes 0 seconds','s1','{"a":1}'),(2,date_trunc('month',now()) + interval '10 hours 0 minutes 1 seconds','s2','{"a":2}');
 SELECT 'CNT:'||count(*) FROM iceonly;
 SELECT 'JSONTYPE:'||pg_typeof(data)::text FROM iceonly LIMIT 1;
 SELECT 'JSON:'||(data->>'a') FROM iceonly WHERE id=1;
-INSERT INTO iceonly VALUES (10,'2026-05-01 10:01:00+00','multi','{}'),(11,'2026-05-01 10:01:01+00','multi','{}'),(12,'2026-05-01 10:01:02+00','multi','{}');
+INSERT INTO iceonly VALUES (10,date_trunc('month',now()) + interval '10 hours 1 minutes 0 seconds','multi','{}'),(11,date_trunc('month',now()) + interval '10 hours 1 minutes 1 seconds','multi','{}'),(12,date_trunc('month',now()) + interval '10 hours 1 minutes 2 seconds','multi','{}');
 SELECT 'MULTI:'||count(*) FROM iceonly WHERE status='multi';
 UPDATE iceonly SET status='upd' WHERE id=1;
 SELECT 'UPD:'||status FROM iceonly WHERE id=1;
@@ -291,7 +302,7 @@ story_decoupled_plpgsql() {
     local O; O=$(qf "$HOST" <<'EOSQL'
 DO $$
 DECLARE v_id int := 500; v_st text := 'pp_ins'; v_data jsonb := '{"k":1}';
-BEGIN INSERT INTO iceonly VALUES (v_id,'2026-05-02 10:00:00+00',v_st,v_data); END $$;
+BEGIN INSERT INTO iceonly VALUES (v_id,date_trunc('month',now()) + interval '1 days' + interval '10 hours 0 minutes 0 seconds',v_st,v_data); END $$;
 SELECT 'PP_INS:' || count(*) FROM iceonly WHERE id=500;
 DO $$
 DECLARE v_id int := 500; v_new text := 'pp_upd';
@@ -321,7 +332,7 @@ story_decoupled_concurrency() {
     local k pids=()
     rm -f /tmp/journey-conc.* 2>/dev/null
     for k in 1 2 3 4 5 6 7 8; do
-        q "$HOST" "INSERT INTO iceonly VALUES (${k}00,'2026-06-0${k} 10:00:00+00','conc','{}');" >/tmp/journey-conc.$k 2>&1 &
+        q "$HOST" "INSERT INTO iceonly VALUES (${k}00,date_trunc('month',now()) + interval '1 month' + interval '$((k-1)) days' + interval '10 hours','conc','{}');" >/tmp/journey-conc.$k 2>&1 &
         pids+=("$!")
     done
     local p; for p in "${pids[@]}"; do wait "$p"; done
@@ -341,7 +352,7 @@ story_decoupled_ryw() {
     step "10. Decoupled read-your-own-write + rollback"
     local O; O=$(qf "$HOST" <<'EOSQL'
 BEGIN;
-INSERT INTO iceonly VALUES (99,'2026-05-01 11:00:00+00','in_tx','{}');
+INSERT INTO iceonly VALUES (99,date_trunc('month',now()) + interval '11 hours 0 minutes 0 seconds','in_tx','{}');
 SELECT 'INTX:'||count(*) FROM iceonly WHERE id=99;
 ROLLBACK;
 SELECT 'POSTRB:'||count(*) FROM iceonly WHERE id=99;
@@ -358,19 +369,19 @@ story_reads() {
     step "4. Reads (hot/cold/cross-tier, jsonb surfacing)"
     local O; O=$(qf "$HOST" <<'EOSQL'
 SELECT 'RO_TOTAL:' || count(*) FROM events;
-SELECT 'RO_HOT:'   || count(*) FROM events WHERE ts >= '2026-03-01';
-SELECT 'RO_COLD:'  || count(*) FROM events WHERE ts  < '2026-03-01';
+SELECT 'RO_HOT:'   || count(*) FROM events WHERE ts >= date_trunc('month',now()) - interval '2 months';
+SELECT 'RO_COLD:'  || count(*) FROM events WHERE ts  < date_trunc('month',now()) - interval '2 months';
 SELECT 'JSONB_TYPE:'   || pg_typeof(data)::text FROM events LIMIT 1;
-SELECT 'JSONB_COLD_M:' || (data->>'m') FROM events WHERE ts < '2026-03-01' AND status='ok' ORDER BY ts LIMIT 1;
-SELECT 'JSONB_HOT_M:'  || (data->>'m') FROM events WHERE ts >= '2026-03-01' AND status='ok' ORDER BY ts LIMIT 1;
+SELECT 'JSONB_COLD_M:' || (data->>'m') FROM events WHERE ts < date_trunc('month',now()) - interval '2 months' AND status='ok' ORDER BY ts LIMIT 1;
+SELECT 'JSONB_HOT_M:'  || (data->>'m') FROM events WHERE ts >= date_trunc('month',now()) - interval '2 months' AND status='ok' ORDER BY ts LIMIT 1;
 EOSQL
 )
     assert_eq "total rows (hot+cold via view)" "280"  "$(extract RO_TOTAL "$O")"
-    assert_eq "rows ts>=2026-03-01 (Mar cold + Apr hot)" "100" "$(extract RO_HOT "$O")"
-    assert_eq "cold rows ts<2026-03-01 (Jan+Feb, read from Iceberg)" "180" "$(extract RO_COLD "$O")"
+    assert_eq "rows ts>=now-2mo (m2 cold + m1 hot)" "100" "$(extract RO_HOT "$O")"
+    assert_eq "cold rows ts<now-2mo (m4+m3, read from Iceberg)" "180" "$(extract RO_COLD "$O")"
     assert_eq "data surfaces as json" "json" "$(extract JSONB_TYPE "$O")"
-    assert_eq "json cold round-trip"  "jan"  "$(extract JSONB_COLD_M "$O")"
-    assert_eq "json hot round-trip"   "mar"  "$(extract JSONB_HOT_M "$O")"
+    assert_eq "json cold round-trip"  "m4"  "$(extract JSONB_COLD_M "$O")"
+    assert_eq "json hot round-trip"   "m2"  "$(extract JSONB_HOT_M "$O")"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -390,19 +401,28 @@ CREATE TABLE IF NOT EXISTS typed (
     c_bytea bytea, c_num numeric(20,5), c_jsonb jsonb,
     PRIMARY KEY (id, ts)
 ) PARTITION BY RANGE (ts);
-CREATE TABLE IF NOT EXISTS typed_2026_01 PARTITION OF typed FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
-CREATE TABLE IF NOT EXISTS typed_2026_04 PARTITION OF typed FOR VALUES FROM ('2026-04-01') TO ('2026-05-01');
+-- Partitions for the m4 (cold) and m1 (hot) months, table-scoped names derived
+-- from now()-relative months (never invented calendar literals).
+DO $do$
+DECLARE m date;
+BEGIN
+  FOREACH m IN ARRAY ARRAY[(date_trunc('month',now()) - interval '4 months')::date,
+                           (date_trunc('month',now()) - interval '1 month')::date] LOOP
+    EXECUTE format('CREATE TABLE IF NOT EXISTS %I PARTITION OF typed FOR VALUES FROM (%L) TO (%L)',
+                   'typed_p_' || to_char(m, 'YYYY_MM'), m, (m + interval '1 month'));
+  END LOOP;
+END $do$;
 -- inet/cidr are intentionally absent: pg_duckdb cannot process inet (Oid 869)
 -- in an Iceberg-backed query, so they are rejected at provisioning (asserted
 -- below). IP data is stored as text instead.
 INSERT INTO typed (ts,c_int,c_small,c_real,c_dbl,c_bool,c_date,c_uuid,c_txt,c_vc,c_bytea,c_num,c_jsonb)
-VALUES ('2026-01-10', 42, 7, 1.5, 2.5, true, '2026-01-10', '11111111-1111-1111-1111-111111111111','hi','abc','\xdeadbeef'::bytea, 123.45, '{"k":1}');
+VALUES (date_trunc('month',now()) - interval '4 months' + interval '9 days', 42, 7, 1.5, 2.5, true, (date_trunc('month',now()) - interval '4 months' + interval '9 days')::date, '11111111-1111-1111-1111-111111111111','hi','abc','\xdeadbeef'::bytea, 123.45, '{"k":1}');
 INSERT INTO typed (ts,c_int,c_small,c_real,c_dbl,c_bool,c_date,c_uuid,c_txt,c_vc,c_bytea,c_num,c_jsonb)
-VALUES ('2026-04-10', 42, 7, 1.5, 2.5, true, '2026-01-10', '11111111-1111-1111-1111-111111111111','hi','abc','\xdeadbeef'::bytea, 123.45, '{"k":1}');
+VALUES (date_trunc('month',now()) - interval '1 month' + interval '9 days', 42, 7, 1.5, 2.5, true, (date_trunc('month',now()) - interval '4 months' + interval '9 days')::date, '11111111-1111-1111-1111-111111111111','hi','abc','\xdeadbeef'::bytea, 123.45, '{"k":1}');
 EOSQL
-    # Same fixed-cutoff pin as events (cutoff = 2026-04-15): typed's Jan partition
-    # cold, Apr hot, deterministically.
-    local ret_days=$(( ( $(date -u +%s) - $(date -u -d '2026-04-15' +%s) ) / 86400 ))
+    # Same fixed-cutoff pin as events (cutoff = start of now-1mo): typed's m4
+    # partition cold, m1 hot, deterministically.
+    local ret_days=$(( ( $(date -u +%s) - $(date -u -d "$(date -u +%Y-%m-01) -1 month" +%s) ) / 86400 ))
     cat > /tmp/journey-typed.yaml <<EOF
 postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
 iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog", namespace: "default" }
@@ -412,18 +432,18 @@ EOF
     "$ARCHIVER" --config /tmp/journey-typed.yaml >/tmp/journey-typed.log 2>&1 \
         && pass "typed table archived (Jan → cold)" || { fail "typed archive — see /tmp/journey-typed.log"; tail -5 /tmp/journey-typed.log; }
     local O; O=$(qf "$HOST" <<'EOSQL'
-SELECT 'COLD_NUM:'  || c_num::text   FROM typed WHERE ts < '2026-02-01';
-SELECT 'COLD_UUID:' || c_uuid::text  FROM typed WHERE ts < '2026-02-01';
-SELECT 'COLD_SMALL:'|| c_small::text FROM typed WHERE ts < '2026-02-01';
-SELECT 'COLD_BOOL:' || c_bool::text  FROM typed WHERE ts < '2026-02-01';
+SELECT 'COLD_NUM:'  || c_num::text   FROM typed WHERE ts < date_trunc('month',now()) - interval '3 months';
+SELECT 'COLD_UUID:' || c_uuid::text  FROM typed WHERE ts < date_trunc('month',now()) - interval '3 months';
+SELECT 'COLD_SMALL:'|| c_small::text FROM typed WHERE ts < date_trunc('month',now()) - interval '3 months';
+SELECT 'COLD_BOOL:' || c_bool::text  FROM typed WHERE ts < date_trunc('month',now()) - interval '3 months';
 -- bytea: encode()/hex() aren't exposed through pg_duckdb and its ::text render
 -- carries backslashes that the shell's echo mangles. Compare the cold value to
 -- the hot source value as a bool — backslash-free and verifies content fidelity.
-SELECT 'BYTEAEQ:' || (c_bytea = (SELECT c_bytea FROM typed WHERE ts >= '2026-04-01' LIMIT 1))::text FROM typed WHERE ts < '2026-02-01';
+SELECT 'BYTEAEQ:' || (c_bytea = (SELECT c_bytea FROM typed WHERE ts >= date_trunc('month',now()) - interval '1 month' LIMIT 1))::text FROM typed WHERE ts < date_trunc('month',now()) - interval '3 months';
 -- Native byte count: '\xdeadbeef' is 4 bytes. A stringification bug would store
 -- the 10-char text '\xdeadbeef' (10 bytes). Independent of the equality check.
-SELECT 'BYTEALEN:' || octet_length(c_bytea)::text FROM typed WHERE ts < '2026-02-01';
-SELECT 'HOT_NUM:'   || c_num::text   FROM typed WHERE ts >= '2026-04-01';
+SELECT 'BYTEALEN:' || octet_length(c_bytea)::text FROM typed WHERE ts < date_trunc('month',now()) - interval '3 months';
+SELECT 'HOT_NUM:'   || c_num::text   FROM typed WHERE ts >= date_trunc('month',now()) - interval '1 month';
 EOSQL
 )
     assert_eq "cold numeric(20,5) round-trip" "123.45000" "$(extract COLD_NUM "$O")"
@@ -440,9 +460,9 @@ EOSQL
     # distinct from the archiver bulk-export path above.
     local CI; CI=$(qf "$HOST" <<'EOSQL'
 INSERT INTO typed (ts,c_int,c_small,c_real,c_dbl,c_bool,c_date,c_uuid,c_txt,c_vc,c_bytea,c_num,c_jsonb)
-VALUES ('2026-01-20', 1,1,1,1,true,'2026-01-20','22222222-2222-2222-2222-222222222222','x','y','\xcafe'::bytea, 1.0, '{}');
+VALUES (date_trunc('month',now()) - interval '4 months' + interval '19 days', 1,1,1,1,true,(date_trunc('month',now()) - interval '4 months' + interval '19 days')::date,'22222222-2222-2222-2222-222222222222','x','y','\xcafe'::bytea, 1.0, '{}');
 SELECT 'COLDINS_LEN:' || octet_length(c_bytea)::text FROM typed
-  WHERE c_uuid = '22222222-2222-2222-2222-222222222222' AND ts < '2026-02-01';
+  WHERE c_uuid = '22222222-2222-2222-2222-222222222222' AND ts < date_trunc('month',now()) - interval '3 months';
 EOSQL
 )
     assert_eq "cold-INSERT-via-trigger bytea stored natively (2 bytes)" "2" "$(extract COLDINS_LEN "$CI")"
@@ -460,17 +480,17 @@ EOSQL
 story_writes() {
     step "6. Writes via view (hot/cold INSERT-UPDATE-DELETE, dual-tier)"
     local O; O=$(qf "$HOST" <<'EOSQL'
-INSERT INTO events (ts, status, data) VALUES ('2026-04-09 12:00+00','ci_hot_ins','{}');
+INSERT INTO events (ts, status, data) VALUES (date_trunc('month',now()) - interval '1 month' + interval '8 days' + interval '12 hours','ci_hot_ins','{}');
 SELECT 'RW_HOT_INS:'  || count(*) FROM _events WHERE status='ci_hot_ins';
-INSERT INTO events (ts, status, data) VALUES ('2026-01-15 12:00+00','ci_cold_ins','{}');
+INSERT INTO events (ts, status, data) VALUES (date_trunc('month',now()) - interval '4 months' + interval '14 days' + interval '12 hours','ci_cold_ins','{}');
 SELECT 'RW_COLD_INS:' || count(*) FROM events WHERE status='ci_cold_ins';
-UPDATE events SET status='ci_hot_upd' WHERE ts='2026-04-09 12:00:00+00' AND status='ci_hot_ins';
-SELECT 'RW_HOT_UPD:'  || status FROM _events WHERE ts='2026-04-09 12:00:00+00';
-UPDATE events SET status='ci_cold_upd' WHERE ts='2026-01-15 01:00:00+00';
+UPDATE events SET status='ci_hot_upd' WHERE ts=date_trunc('month',now()) - interval '1 month' + interval '8 days' + interval '12 hours' AND status='ci_hot_ins';
+SELECT 'RW_HOT_UPD:'  || status FROM _events WHERE ts=date_trunc('month',now()) - interval '1 month' + interval '8 days' + interval '12 hours';
+UPDATE events SET status='ci_cold_upd' WHERE ts=date_trunc('month',now()) - interval '4 months' + interval '14 days' + interval '1 hour';
 SELECT 'RW_COLD_UPD:' || count(*) FROM events WHERE status='ci_cold_upd';
-DELETE FROM events WHERE ts='2026-04-09 12:00:00+00' AND status='ci_hot_upd';
+DELETE FROM events WHERE ts=date_trunc('month',now()) - interval '1 month' + interval '8 days' + interval '12 hours' AND status='ci_hot_upd';
 SELECT 'RW_HOT_DEL:'  || count(*) FROM _events WHERE status='ci_hot_upd';
-DELETE FROM events WHERE ts='2026-01-15 01:00:00+00' AND status='ci_cold_upd';
+DELETE FROM events WHERE ts=date_trunc('month',now()) - interval '4 months' + interval '14 days' + interval '1 hour' AND status='ci_cold_upd';
 SELECT 'RW_COLD_DEL:' || count(*) FROM events WHERE status='ci_cold_upd';
 SELECT 'DUAL_HOT_PRE:'    || count(*) FROM _events WHERE status='ok';
 SELECT 'DUAL_TOTAL_PRE:'  || count(*) FROM events  WHERE status='ok';
@@ -502,7 +522,7 @@ EOSQL
     assert_err "self-join on a tiered view rejected" "more than once" "$sj"
     # RETURNING that touches the cold tier is rejected (duckdb-iceberg can't return
     # rows) rather than silently returning a partial/void result.
-    local cr; cr=$(q_may "$HOST" "UPDATE events SET status='x' WHERE ts < '2026-02-01' RETURNING id;")
+    local cr; cr=$(q_may "$HOST" "UPDATE events SET status='x' WHERE ts < date_trunc('month',now()) - interval '3 months' RETURNING id;")
     assert_err "cold-tier RETURNING rejected" "cold tier" "$cr"
 }
 
@@ -525,12 +545,12 @@ story_compaction() {
     # story validates that fix end-to-end.
     step "6d. Compaction: iceberg-go RewriteDataFiles consolidates small cold files (bakery-serialized)"
     qf "$HOST" <<'EOSQL'
-INSERT INTO events (ts, status, data) VALUES ('2026-01-02 00:00+00','cmp1','{}');
-INSERT INTO events (ts, status, data) VALUES ('2026-01-02 01:00+00','cmp2','{}');
-INSERT INTO events (ts, status, data) VALUES ('2026-01-02 02:00+00','cmp3','{}');
-INSERT INTO events (ts, status, data) VALUES ('2026-01-02 03:00+00','cmp4','{}');
-INSERT INTO events (ts, status, data) VALUES ('2026-01-02 04:00+00','cmp5','{}');
-INSERT INTO events (ts, status, data) VALUES ('2026-01-02 05:00+00','cmp6','{}');
+INSERT INTO events (ts, status, data) VALUES (date_trunc('month',now()) - interval '4 months' + interval '1 days' + interval '0 hours','cmp1','{}');
+INSERT INTO events (ts, status, data) VALUES (date_trunc('month',now()) - interval '4 months' + interval '1 days' + interval '1 hours','cmp2','{}');
+INSERT INTO events (ts, status, data) VALUES (date_trunc('month',now()) - interval '4 months' + interval '1 days' + interval '2 hours','cmp3','{}');
+INSERT INTO events (ts, status, data) VALUES (date_trunc('month',now()) - interval '4 months' + interval '1 days' + interval '3 hours','cmp4','{}');
+INSERT INTO events (ts, status, data) VALUES (date_trunc('month',now()) - interval '4 months' + interval '1 days' + interval '4 hours','cmp5','{}');
+INSERT INTO events (ts, status, data) VALUES (date_trunc('month',now()) - interval '4 months' + interval '1 days' + interval '5 hours','cmp6','{}');
 EOSQL
     local rows_before; rows_before=$(q "$HOST" "SELECT count(*) FROM events;")
 
@@ -630,27 +650,27 @@ story_maintenance() {
 # statement plpgsql accepts rather than a bare SELECT (Cause 2, the
 # coldfront._dummy_dml_target carrier — only used here, in the in-plpgsql case).
 # RED before the fix (DuckDB param error, then "query has no destination"),
-# GREEN after, on every backend+topology. Cold = Jan (< the 2026-04-15 cutoff).
+# GREEN after, on every backend+topology. Cold = m4 (< the start-of-now-1mo cutoff).
 # ───────────────────────────────────────────────────────────────────────────
 story_writes_plpgsql() {
     step "6c. Cold + dual-tier DML from inside plpgsql (DO block, bound params)"
     local O; O=$(qf "$HOST" <<'EOSQL'
 INSERT INTO events (ts,status,data) VALUES
-  ('2026-01-22 04:00+00','pp_upd_seed','{}'),('2026-01-23 04:00+00','pp_del_seed','{}');
+  (date_trunc('month',now()) - interval '4 months' + interval '21 days' + interval '4 hours','pp_upd_seed','{}'),(date_trunc('month',now()) - interval '4 months' + interval '22 days' + interval '4 hours','pp_del_seed','{}');
 -- cold UPDATE from plpgsql: var in SET and WHERE
 DO $$
 DECLARE v_new text := 'pp_upd_done'; v_old text := 'pp_upd_seed';
-BEGIN UPDATE events SET status = v_new WHERE status = v_old AND ts < '2026-02-01'; END $$;
+BEGIN UPDATE events SET status = v_new WHERE status = v_old AND ts < date_trunc('month',now()) - interval '3 months'; END $$;
 SELECT 'PP_UPD:' || count(*) FROM events WHERE status='pp_upd_done';
 -- cold DELETE from plpgsql: var in WHERE
 DO $$
 DECLARE v_st text := 'pp_del_seed';
-BEGIN DELETE FROM events WHERE status = v_st AND ts < '2026-02-01'; END $$;
+BEGIN DELETE FROM events WHERE status = v_st AND ts < date_trunc('month',now()) - interval '3 months'; END $$;
 SELECT 'PP_DEL:' || count(*) FROM events WHERE status='pp_del_seed';
 -- dual-tier UPDATE from plpgsql: ambiguous (status-only) predicate ⇒ dual CTE
 -- (hot leg keeps native $N, cold leg goes through format()).
 INSERT INTO events (ts,status,data) VALUES
-  ('2026-04-24 05:00+00','pp_dual','{}'),('2026-01-24 05:00+00','pp_dual','{}');
+  (date_trunc('month',now()) - interval '1 month' + interval '23 days' + interval '5 hours','pp_dual','{}'),(date_trunc('month',now()) - interval '4 months' + interval '23 days' + interval '5 hours','pp_dual','{}');
 DO $$
 DECLARE v_new text := 'pp_dual_done';
 BEGIN UPDATE events SET status = v_new WHERE status = 'pp_dual'; END $$;
@@ -662,8 +682,8 @@ SELECT 'PP_DUAL_TOTAL:' || count(*) FROM events  WHERE status='pp_dual_done';
 -- arg rendering (not the DuckDB from_hex/::text used on the raw_query paths).
 DO $$
 DECLARE v_st text := 'pp_ins'; v_data jsonb := '{"k":9}';
-BEGIN INSERT INTO events (ts, status, data) VALUES ('2026-01-25 06:00+00', v_st, v_data); END $$;
-SELECT 'PP_INS:' || count(*) FROM events WHERE status='pp_ins' AND ts < '2026-02-01';
+BEGIN INSERT INTO events (ts, status, data) VALUES (date_trunc('month',now()) - interval '4 months' + interval '24 days' + interval '6 hours', v_st, v_data); END $$;
+SELECT 'PP_INS:' || count(*) FROM events WHERE status='pp_ins' AND ts < date_trunc('month',now()) - interval '3 months';
 EOSQL
 )
     assert_eq "plpgsql cold UPDATE (var SET+WHERE) hit the cold tier" "1" "$(extract PP_UPD "$O")"
@@ -686,10 +706,10 @@ story_mixed_concurrency() {
     step "6b. Concurrency: parallel MIXED-tier writers (dual CTE via bakery, no 409)"
     qf "$HOST" <<'EOSQL' >/dev/null 2>&1
 INSERT INTO events (ts,status,data) VALUES
- ('2026-04-05 00:00+00','mixseed0','{}'),('2026-01-05 00:00+00','mixseed0','{}'),
- ('2026-04-06 00:00+00','mixseed1','{}'),('2026-01-06 00:00+00','mixseed1','{}'),
- ('2026-04-07 00:00+00','mixseed2','{}'),('2026-01-07 00:00+00','mixseed2','{}'),
- ('2026-04-08 00:00+00','mixseed3','{}'),('2026-01-08 00:00+00','mixseed3','{}');
+ (date_trunc('month',now()) - interval '1 month' + interval '4 days','mixseed0','{}'),(date_trunc('month',now()) - interval '4 months' + interval '4 days','mixseed0','{}'),
+ (date_trunc('month',now()) - interval '1 month' + interval '5 days','mixseed1','{}'),(date_trunc('month',now()) - interval '4 months' + interval '5 days','mixseed1','{}'),
+ (date_trunc('month',now()) - interval '1 month' + interval '6 days','mixseed2','{}'),(date_trunc('month',now()) - interval '4 months' + interval '6 days','mixseed2','{}'),
+ (date_trunc('month',now()) - interval '1 month' + interval '7 days','mixseed3','{}'),(date_trunc('month',now()) - interval '4 months' + interval '7 days','mixseed3','{}');
 EOSQL
     local k pids=()
     rm -f /tmp/journey-mix.* 2>/dev/null
@@ -706,8 +726,8 @@ EOSQL
     rm -f /tmp/journey-mix.* 2>/dev/null
     assert_eq "4 concurrent mixed-tier writers all landed (no 409/loss)" "8" "$(q "$HOST" "SELECT count(*) FROM events WHERE status='mixdone';")"
     assert_eq "no mixseed rows left"                                     "0" "$(q "$HOST" "SELECT count(*) FROM events WHERE status LIKE 'mixseed%';")"
-    assert_eq "concurrent mixed write updated the cold tier (4 Jan rows)" "4" "$(q "$HOST" "SELECT count(*) FROM events WHERE status='mixdone' AND ts < '2026-02-01';")"
-    assert_eq "concurrent mixed write updated the hot tier (4 Apr rows)"  "4" "$(q "$HOST" "SELECT count(*) FROM _events WHERE status='mixdone';")"
+    assert_eq "concurrent mixed write updated the cold tier (4 m4 rows)" "4" "$(q "$HOST" "SELECT count(*) FROM events WHERE status='mixdone' AND ts < date_trunc('month',now()) - interval '3 months';")"
+    assert_eq "concurrent mixed write updated the hot tier (4 m1 rows)"  "4" "$(q "$HOST" "SELECT count(*) FROM _events WHERE status='mixdone';")"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -720,35 +740,35 @@ EOSQL
 # ───────────────────────────────────────────────────────────────────────────
 story_ddl() {
     step "7. Schema DDL mirrored to Iceberg (ADD/DROP/ALTER TYPE/RENAME COLUMN); rename table/view"
-    local cutoff="2026-03-01"
+    local cutoff="date_trunc('month',now()) - interval '2 months'"   # m2 boundary
 
     # ADD COLUMN → mirrored; the cold UNION branch now projects it.
     q "$HOST" "ALTER TABLE _events ADD COLUMN cnt integer;" >/dev/null
-    assert_gt "cold tier readable after ADD COLUMN (mirrored to Iceberg)" "0" "$(q "$HOST" "SELECT count(*) FROM events WHERE ts < '$cutoff';")"
+    assert_gt "cold tier readable after ADD COLUMN (mirrored to Iceberg)" "0" "$(q "$HOST" "SELECT count(*) FROM events WHERE ts < $cutoff;")"
     assert_eq "view exposes the added column" "cnt" "$(q "$HOST" "SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='events' AND column_name='cnt';")"
-    assert_eq "added column is NULL on historical cold rows" "" "$(q "$HOST" "SELECT cnt FROM events WHERE ts < '$cutoff' ORDER BY ts LIMIT 1;")"
+    assert_eq "added column is NULL on historical cold rows" "" "$(q "$HOST" "SELECT cnt FROM events WHERE ts < $cutoff ORDER BY ts LIMIT 1;")"
 
     # ALTER COLUMN TYPE → mirrored safe promotion (INTEGER -> BIGINT).
     q "$HOST" "ALTER TABLE _events ALTER COLUMN cnt TYPE bigint;" >/dev/null
-    assert_gt "cold tier readable after ALTER COLUMN TYPE" "0" "$(q "$HOST" "SELECT count(*) FROM events WHERE ts < '$cutoff';")"
+    assert_gt "cold tier readable after ALTER COLUMN TYPE" "0" "$(q "$HOST" "SELECT count(*) FROM events WHERE ts < $cutoff;")"
 
     # RENAME COLUMN → Iceberg column renamed too, or the rebuilt cold branch
     # (r['ctr']) could not resolve against the old Iceberg name.
     q "$HOST" "ALTER TABLE _events RENAME COLUMN cnt TO ctr;" >/dev/null
-    assert_gt "cold tier readable after RENAME COLUMN (Iceberg col renamed)" "0" "$(q "$HOST" "SELECT count(*) FROM events WHERE ts < '$cutoff';")"
+    assert_gt "cold tier readable after RENAME COLUMN (Iceberg col renamed)" "0" "$(q "$HOST" "SELECT count(*) FROM events WHERE ts < $cutoff;")"
     assert_eq "renamed column visible on the view" "ctr" "$(q "$HOST" "SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='events' AND column_name='ctr';")"
 
     # DROP COLUMN → mirrored; restores the original shape for later stories.
     q "$HOST" "ALTER TABLE _events DROP COLUMN ctr;" >/dev/null
     assert_eq "scratch column dropped from the view" "0" "$(q "$HOST" "SELECT count(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='events' AND column_name IN ('cnt','ctr');")"
-    assert_gt "cold tier readable after DROP COLUMN" "0" "$(q "$HOST" "SELECT count(*) FROM events WHERE ts < '$cutoff';")"
+    assert_gt "cold tier readable after DROP COLUMN" "0" "$(q "$HOST" "SELECT count(*) FROM events WHERE ts < $cutoff;")"
 
     # Data-type correspondence is enforced: an unsupported type is rejected up front.
     assert_err "ADD COLUMN inet rejected (no Iceberg mapping)" "no Iceberg-compatible mapping" "$(q_may "$HOST" "ALTER TABLE _events ADD COLUMN ip inet;")"
 
     # RENAME VIEW is supported and must migrate the watermark so the cold branch survives.
     q "$HOST" "ALTER VIEW events RENAME TO events_v2;" >/dev/null
-    assert_gt "cold tier survives view rename" "0" "$(q "$HOST" "SELECT count(*) FROM events_v2 WHERE ts < '$cutoff';")"
+    assert_gt "cold tier survives view rename" "0" "$(q "$HOST" "SELECT count(*) FROM events_v2 WHERE ts < $cutoff;")"
     q "$HOST" "ALTER VIEW events_v2 RENAME TO events;" >/dev/null
     pass "view renamed back to events"
 }
@@ -765,8 +785,9 @@ story_blocks() {
 
 # ───────────────────────────────────────────────────────────────────────────
 # Story 9 — Concurrency / no-409: writes that race the archive cycle survive.
-# p_2026_04 is still hot after the first cycle (cutoff 2026-04-15). A second
-# cycle with the cutoff pinned PAST 2026-05-01 expires it; --debug-export-delay
+# The m1 (now-1mo) partition is still hot after the first cycle (cutoff = start
+# of now-1mo). A second cycle with the cutoff pinned PAST the start of the
+# current month expires it; --debug-export-delay
 # holds the capture window open while concurrent UPDATE/DELETE/INSERT race into
 # the delta trigger, which the cold replay must apply. (Ported from
 # run-ci-local.sh step 8b — the one E2E behaviour the journey didn't yet cover.)
@@ -775,14 +796,15 @@ story_concurrency() {
     step "9. Race window: writes during the archive cycle survive into cold"
     qf "$HOST" <<'EOSQL' >/dev/null
 INSERT INTO events (ts, status, data) VALUES
-  ('2026-04-15 12:00+00','race_seed_a','{}'),
-  ('2026-04-16 12:00+00','race_seed_b','{}'),
-  ('2026-04-17 12:00+00','race_seed_c','{}'),
-  ('2026-04-18 12:00+00','race_will_delete','{}');
+  (date_trunc('month',now()) - interval '1 month' + interval '14 days' + interval '12 hours','race_seed_a','{}'),
+  (date_trunc('month',now()) - interval '1 month' + interval '15 days' + interval '12 hours','race_seed_b','{}'),
+  (date_trunc('month',now()) - interval '1 month' + interval '16 days' + interval '12 hours','race_seed_c','{}'),
+  (date_trunc('month',now()) - interval '1 month' + interval '17 days' + interval '12 hours','race_will_delete','{}');
 EOSQL
-    # Pin the race cutoff PAST 2026-05-01 (target 2026-05-15) so the Apr
-    # partition — the last hot one — is expired by this cycle, deterministically.
-    local ret_race=$(( ( $(date -u +%s) - $(date -u -d '2026-05-15' +%s) ) / 86400 ))
+    # Pin the race cutoff PAST the start of the current month (target = start of
+    # now + 14 days) so the m1 partition — the last hot one — is expired by this
+    # cycle, deterministically.
+    local ret_race=$(( ( $(date -u +%s) - $(date -u -d "$(date -u +%Y-%m-01) +14 days" +%s) ) / 86400 ))
     cat > /tmp/journey-race.yaml <<EOF
 postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
 iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog", namespace: "default" }
@@ -801,7 +823,7 @@ EOF
     qf "$HOST" <<'EOSQL' >/dev/null 2>&1
 UPDATE events SET status='during_archive' WHERE status IN ('race_seed_a','race_seed_b','race_seed_c');
 DELETE FROM events WHERE status='race_will_delete';
-INSERT INTO events (ts, status, data) VALUES ('2026-04-19 12:00+00','during_archive_insert','{}');
+INSERT INTO events (ts, status, data) VALUES (date_trunc('month',now()) - interval '1 month' + interval '18 days' + interval '12 hours','during_archive_insert','{}');
 EOSQL
     if wait "$apid"; then pass "archiver cycle 2 completed cleanly (no 409)"
     else fail "archiver errored during race window"; tail -5 /tmp/journey-race.log; fi
@@ -813,9 +835,10 @@ EOSQL
 
 # ───────────────────────────────────────────────────────────────────────────
 # Story 9b — Concurrency / no-409 (tiered): parallel COLD writers to one table
-# all land. By this point every partition is archived (cutoff past 2026-05-01),
-# so below-cutoff INSERTs route through the cold path (_tiered_insert_cold) and
-# the same advisory-lock bakery serializes them. Parity with the decoupled
+# all land. By this point every partition is archived (cutoff past the start of
+# the current month), so below-cutoff INSERTs route through the cold path
+# (_tiered_insert_cold) and the same advisory-lock bakery serializes them.
+# Parity with the decoupled
 # probe — the standing multi-writer no-409 rule applies to both modes.
 # ───────────────────────────────────────────────────────────────────────────
 story_concurrent_writers() {
@@ -823,7 +846,7 @@ story_concurrent_writers() {
     local k pids=()
     rm -f /tmp/journey-tconc.* 2>/dev/null
     for k in 1 2 3 4 5 6 7 8; do
-        q "$HOST" "INSERT INTO events (ts,status,data) VALUES ('2026-04-2${k} 09:00:00+00','tconc','{}');" >/tmp/journey-tconc.$k 2>&1 &
+        q "$HOST" "INSERT INTO events (ts,status,data) VALUES (date_trunc('month',now()) - interval '1 month' + interval '$((19+k)) days' + interval '9 hours','tconc','{}');" >/tmp/journey-tconc.$k 2>&1 &
         pids+=("$!")
     done
     local p; for p in "${pids[@]}"; do wait "$p"; done
@@ -864,7 +887,7 @@ story_coexist() {
     assert_gt "typed readable (hot+cold)"  "0" "$(q "$HOST" "SELECT count(*) FROM typed;")"
     # A cold write to events must NOT touch typed, and must land only in events.
     local typed_before; typed_before=$(q "$HOST" "SELECT count(*) FROM typed;")
-    q "$HOST" "INSERT INTO events (ts,status,data) VALUES ('2026-01-09 00:00+00','coexist_probe','{}');" >/dev/null 2>&1
+    q "$HOST" "INSERT INTO events (ts,status,data) VALUES (date_trunc('month',now()) - interval '4 months' + interval '8 days','coexist_probe','{}');" >/dev/null 2>&1
     assert_eq "write to events left typed unchanged (no cross-talk)" "$typed_before" "$(q "$HOST" "SELECT count(*) FROM typed;")"
     assert_eq "the events write landed in events"                    "1"             "$(q "$HOST" "SELECT count(*) FROM events WHERE status='coexist_probe';")"
     q "$HOST" "DELETE FROM events WHERE status='coexist_probe';" >/dev/null 2>&1
@@ -904,7 +927,7 @@ story_mesh() {
 
     # Cross-node WRITE: a write on a peer is visible on db1 (shared catalog).
     local p1="${PARR[0]}"
-    q "$p1" "INSERT INTO iceonly VALUES (5001,'2026-07-01 10:00:00+00','from_peer','{}');" >/dev/null 2>&1
+    q "$p1" "INSERT INTO iceonly VALUES (5001,date_trunc('month',now()) + interval '2 months' + interval '10 hours','from_peer','{}');" >/dev/null 2>&1
     assert_eq "write from peer $p1 visible on db1" "1" "$(q "$HOST" "SELECT count(*) FROM iceonly WHERE status='from_peer';")"
 
     # R-A bakery under multi-node contention: concurrent cold writers on db1 AND
@@ -912,8 +935,8 @@ story_mesh() {
     # (snowflake.node + dblink_self set), so this exercises the Ricart-Agrawala
     # claim protocol across nodes — not the local advisory lock — to avoid 409.
     rm -f /tmp/journey-ra.* 2>/dev/null
-    q "$HOST" "INSERT INTO iceonly VALUES (6001,'2026-07-02 10:00:00+00','ra','{}');" >/tmp/journey-ra.1 2>&1 &
-    q "$p1"   "INSERT INTO iceonly VALUES (6002,'2026-07-02 10:00:01+00','ra','{}');" >/tmp/journey-ra.2 2>&1 &
+    q "$HOST" "INSERT INTO iceonly VALUES (6001,date_trunc('month',now()) + interval '2 months' + interval '1 days' + interval '10 hours 0 minutes 0 seconds','ra','{}');" >/tmp/journey-ra.1 2>&1 &
+    q "$p1"   "INSERT INTO iceonly VALUES (6002,date_trunc('month',now()) + interval '2 months' + interval '1 days' + interval '10 hours 0 minutes 1 seconds','ra','{}');" >/tmp/journey-ra.2 2>&1 &
     wait
     assert_eq "no cross-node cold writer errored (R-A bakery, no 409)" "0" \
         "$(cat /tmp/journey-ra.* 2>/dev/null | grep -cEi 'error|conflict|409')"
@@ -955,7 +978,7 @@ story_mesh_tiered() {
     # the shared Iceberg table (R-A bakery) and is visible on db1. Then clean it
     # up so the row count returns to baseline for the stories that follow.
     local p1="${PARR[0]}"
-    q "$p1" "INSERT INTO events (ts,status,data) VALUES ('2026-01-25 09:00+00','xnode_cold','{}');" >/dev/null 2>&1
+    q "$p1" "INSERT INTO events (ts,status,data) VALUES (date_trunc('month',now()) - interval '4 months' + interval '24 days' + interval '9 hours','xnode_cold','{}');" >/dev/null 2>&1
     assert_eq "cold write from peer $p1 visible on db1 (shared Lakekeeper)" "1" \
         "$(q "$HOST" "SELECT count(*) FROM events WHERE status='xnode_cold';")"
     q "$HOST" "DELETE FROM events WHERE status='xnode_cold';" >/dev/null 2>&1
@@ -1009,8 +1032,8 @@ story_standby_reads() {
     # iceberg_scan then executes read-only on the replica.
     assert_eq "standby cross-tier read == primary" "$(q "$HOST" "SELECT count(*) FROM $vn;")" "$(q "$STANDBY" "SELECT count(*) FROM $vn;")"
     assert_eq "standby cold-side read (iceberg_scan on replica) == primary" \
-        "$(q "$HOST" "SELECT count(*) FROM $vn WHERE ts < '2026-04-01';")" \
-        "$(q "$STANDBY" "SELECT count(*) FROM $vn WHERE ts < '2026-04-01';")"
+        "$(q "$HOST" "SELECT count(*) FROM $vn WHERE ts < date_trunc('month',now()) - interval '1 month';")" \
+        "$(q "$STANDBY" "SELECT count(*) FROM $vn WHERE ts < date_trunc('month',now()) - interval '1 month';")"
 
     # tiered only: the watermark drives the hot/cold cutoff; it must replicate too.
     [ "$MODE" = tiered ] && assert_eq "archive_watermark replicated" \
@@ -1020,7 +1043,7 @@ story_standby_reads() {
     # dated row so it routes through coldfront's cold chokepoint
     # (_exec_iceberg_with_claim) on BOTH modes, exercising the standby guard there
     # — a hot write would be rejected by PG natively, never reaching coldfront.
-    local w; w=$(q_may "$STANDBY" "INSERT INTO $vn (ts,status,data) VALUES ('2026-01-20','x','{}'::jsonb);")
+    local w; w=$(q_may "$STANDBY" "INSERT INTO $vn (ts,status,data) VALUES (date_trunc('month',now()) - interval '4 months' + interval '19 days','x','{}'::jsonb);")
     assert_err "cold write through view on standby → clean read-only rejection" "read-only" "$w"
 
     # Mesh + tiered: the standby is a physical replica of db1 (HOST). A peer's HOT
@@ -1032,7 +1055,7 @@ story_standby_reads() {
     # unsupported, so there is no hot-tier peer write to route here anyway.
     if [ "$MESH" = 1 ] && [ "$MODE" = tiered ] && [ -n "${PEERS:-}" ]; then
         local PARR peer seen=0 j; read -ra PARR <<< "$PEERS"; peer="${PARR[0]}"
-        q "$peer" "INSERT INTO $vn (ts,status,data) VALUES ('2026-04-22 08:00+00','sb_xnode','{}'::jsonb);" >/dev/null 2>&1
+        q "$peer" "INSERT INTO $vn (ts,status,data) VALUES (date_trunc('month',now()) - interval '1 month' + interval '21 days' + interval '8 hours','sb_xnode','{}'::jsonb);" >/dev/null 2>&1
         for j in $(seq 1 30); do
             [ "$(q "$STANDBY" "SELECT count(*) FROM $vn WHERE status='sb_xnode';")" = 1 ] && { seen=1; break; }
             sleep 1
@@ -1193,26 +1216,32 @@ CREATE TABLE IF NOT EXISTS regional (
 ) PARTITION BY LIST (region);
 CREATE TABLE IF NOT EXISTS regional_eu PARTITION OF regional FOR VALUES IN ('eu') PARTITION BY RANGE (ts);
 CREATE TABLE IF NOT EXISTS regional_us PARTITION OF regional FOR VALUES IN ('us') PARTITION BY RANGE (ts);
-CREATE TABLE IF NOT EXISTS regional_eu_p_2026_01 PARTITION OF regional_eu FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
-CREATE TABLE IF NOT EXISTS regional_eu_p_2026_02 PARTITION OF regional_eu FOR VALUES FROM ('2026-02-01') TO ('2026-03-01');
-CREATE TABLE IF NOT EXISTS regional_eu_p_2026_03 PARTITION OF regional_eu FOR VALUES FROM ('2026-03-01') TO ('2026-04-01');
-CREATE TABLE IF NOT EXISTS regional_eu_p_2026_04 PARTITION OF regional_eu FOR VALUES FROM ('2026-04-01') TO ('2026-05-01');
-CREATE TABLE IF NOT EXISTS regional_us_p_2026_01 PARTITION OF regional_us FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
-CREATE TABLE IF NOT EXISTS regional_us_p_2026_02 PARTITION OF regional_us FOR VALUES FROM ('2026-02-01') TO ('2026-03-01');
-CREATE TABLE IF NOT EXISTS regional_us_p_2026_03 PARTITION OF regional_us FOR VALUES FROM ('2026-03-01') TO ('2026-04-01');
-CREATE TABLE IF NOT EXISTS regional_us_p_2026_04 PARTITION OF regional_us FOR VALUES FROM ('2026-04-01') TO ('2026-05-01');
-INSERT INTO regional (region, ts, status, data) SELECT 'eu', '2026-01-15'::timestamptz + (i*interval '1 hour'), 'ok', '{"r":"eu"}'::jsonb FROM generate_series(1,100) i;
-INSERT INTO regional (region, ts, status, data) SELECT 'eu', '2026-02-10'::timestamptz + (i*interval '1 hour'), 'ok', '{"r":"eu"}'::jsonb FROM generate_series(1,80) i;
-INSERT INTO regional (region, ts, status, data) SELECT 'eu', '2026-03-05'::timestamptz + (i*interval '1 hour'), 'ok', '{"r":"eu"}'::jsonb FROM generate_series(1,60) i;
-INSERT INTO regional (region, ts, status, data) SELECT 'eu', '2026-04-01'::timestamptz + (i*interval '1 hour'), 'ok', '{"r":"eu"}'::jsonb FROM generate_series(1,40) i;
-INSERT INTO regional (region, ts, status, data) SELECT 'us', '2026-01-20'::timestamptz + (i*interval '1 hour'), 'ok', '{"r":"us"}'::jsonb FROM generate_series(1,50) i;
-INSERT INTO regional (region, ts, status, data) SELECT 'us', '2026-02-12'::timestamptz + (i*interval '1 hour'), 'ok', '{"r":"us"}'::jsonb FROM generate_series(1,40) i;
-INSERT INTO regional (region, ts, status, data) SELECT 'us', '2026-03-08'::timestamptz + (i*interval '1 hour'), 'ok', '{"r":"us"}'::jsonb FROM generate_series(1,30) i;
-INSERT INTO regional (region, ts, status, data) SELECT 'us', '2026-04-02'::timestamptz + (i*interval '1 hour'), 'ok', '{"r":"us"}'::jsonb FROM generate_series(1,20) i;
+-- RANGE leaves for the m4 m3 m2 (cold) and m1 (hot) months, table-scoped names
+-- derived from now()-relative months, per LIST child (eu, us). Never invented
+-- calendar literals so the hot/cold split holds under any wall clock.
+DO $do$
+DECLARE child text; m date; off int;
+BEGIN
+  FOREACH child IN ARRAY ARRAY['regional_eu','regional_us'] LOOP
+    FOR off IN 1..4 LOOP                                   -- now-4mo .. now-1mo
+      m := (date_trunc('month', now()) - make_interval(months => 5 - off))::date;
+      EXECUTE format('CREATE TABLE IF NOT EXISTS %I PARTITION OF %I FOR VALUES FROM (%L) TO (%L)',
+                     child || '_p_' || to_char(m, 'YYYY_MM'), child, m, (m + interval '1 month'));
+    END LOOP;
+  END LOOP;
+END $do$;
+INSERT INTO regional (region, ts, status, data) SELECT 'eu', date_trunc('month',now()) - interval '4 months' + interval '14 days' + (i*interval '1 hour'), 'ok', '{"r":"eu"}'::jsonb FROM generate_series(1,100) i;
+INSERT INTO regional (region, ts, status, data) SELECT 'eu', date_trunc('month',now()) - interval '3 months' + interval '9 days'  + (i*interval '1 hour'), 'ok', '{"r":"eu"}'::jsonb FROM generate_series(1,80) i;
+INSERT INTO regional (region, ts, status, data) SELECT 'eu', date_trunc('month',now()) - interval '2 months' + interval '4 days'  + (i*interval '1 hour'), 'ok', '{"r":"eu"}'::jsonb FROM generate_series(1,60) i;
+INSERT INTO regional (region, ts, status, data) SELECT 'eu', date_trunc('month',now()) - interval '1 month'                       + (i*interval '1 hour'), 'ok', '{"r":"eu"}'::jsonb FROM generate_series(1,40) i;
+INSERT INTO regional (region, ts, status, data) SELECT 'us', date_trunc('month',now()) - interval '4 months' + interval '19 days' + (i*interval '1 hour'), 'ok', '{"r":"us"}'::jsonb FROM generate_series(1,50) i;
+INSERT INTO regional (region, ts, status, data) SELECT 'us', date_trunc('month',now()) - interval '3 months' + interval '11 days' + (i*interval '1 hour'), 'ok', '{"r":"us"}'::jsonb FROM generate_series(1,40) i;
+INSERT INTO regional (region, ts, status, data) SELECT 'us', date_trunc('month',now()) - interval '2 months' + interval '7 days'  + (i*interval '1 hour'), 'ok', '{"r":"us"}'::jsonb FROM generate_series(1,30) i;
+INSERT INTO regional (region, ts, status, data) SELECT 'us', date_trunc('month',now()) - interval '1 month'  + interval '1 days'  + (i*interval '1 hour'), 'ok', '{"r":"us"}'::jsonb FROM generate_series(1,20) i;
 EOSQL
     assert_eq "2-level seeded 420 rows" "420" "$(q "$HOST" "SELECT count(*) FROM public.regional;")"
 
-    local ret_days; ret_days=$(( ( $(date -u +%s) - $(date -u -d '2026-04-15' +%s) ) / 86400 ))  # cutoff 2026-04-15
+    local ret_days; ret_days=$(( ( $(date -u +%s) - $(date -u -d "$(date -u +%Y-%m-01) -1 month" +%s) ) / 86400 ))  # cutoff = start of now-1mo
     cat > /tmp/journey-tl.yaml <<EOF
 postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
 iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog", namespace: "default" }
@@ -1235,25 +1264,25 @@ EOF
     assert_eq "regional is now a view" "v" "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='regional';")"
     assert_eq "_regional is the LIST hot table" "p" "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='_regional';")"
 
-    # Past-hot leaves (Jan-Mar) tiered away for BOTH regions; Apr leaves remain hot.
-    assert_eq "eu Jan leaf gone from hot"  "0" "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname='regional_eu_p_2026_01';")"
-    assert_eq "us Mar leaf gone from hot"  "0" "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname='regional_us_p_2026_03';")"
-    assert_eq "eu Apr leaf still hot"      "1" "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname='regional_eu_p_2026_04';")"
-    assert_eq "us Apr leaf still hot"      "1" "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname='regional_us_p_2026_04';")"
+    # Past-hot leaves (m4-m2) tiered away for BOTH regions; m1 leaves remain hot.
+    assert_eq "eu m4 leaf gone from hot"  "0" "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname = 'regional_eu_p_' || to_char(date_trunc('month',now()) - interval '4 months','YYYY_MM');")"
+    assert_eq "us m2 leaf gone from hot"  "0" "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname = 'regional_us_p_' || to_char(date_trunc('month',now()) - interval '2 months','YYYY_MM');")"
+    assert_eq "eu m1 leaf still hot"      "1" "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname = 'regional_eu_p_' || to_char(date_trunc('month',now()) - interval '1 month','YYYY_MM');")"
+    assert_eq "us m1 leaf still hot"      "1" "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname = 'regional_us_p_' || to_char(date_trunc('month',now()) - interval '1 month','YYYY_MM');")"
 
     # Read correctness across the boundary (the view UNIONs hot + cold).
     assert_eq "2-level total readable (hot+cold)" "420" "$(q "$HOST" "SELECT count(*) FROM regional;")"
     assert_eq "eu total (240 cold + 40 hot)"      "280" "$(q "$HOST" "SELECT count(*) FROM regional WHERE region='eu';")"
     assert_eq "us total (120 cold + 20 hot)"      "140" "$(q "$HOST" "SELECT count(*) FROM regional WHERE region='us';")"
     # Cold side is region-usable: a region-filtered cold read returns that region only.
-    assert_eq "eu cold rows (Jan-Mar) present"    "240" "$(q "$HOST" "SELECT count(*) FROM regional WHERE region='eu' AND ts < '2026-04-01';")"
-    assert_eq "old eu Jan leaf rows live in cold" "100" "$(q "$HOST" "SELECT count(*) FROM regional WHERE region='eu' AND ts >= '2026-01-01' AND ts < '2026-02-01';")"
+    assert_eq "eu cold rows (m4-m2) present"      "240" "$(q "$HOST" "SELECT count(*) FROM regional WHERE region='eu' AND ts < date_trunc('month',now()) - interval '1 month';")"
+    assert_eq "old eu m4 leaf rows live in cold"  "100" "$(q "$HOST" "SELECT count(*) FROM regional WHERE region='eu' AND ts >= date_trunc('month',now()) - interval '4 months' AND ts < date_trunc('month',now()) - interval '3 months';")"
 
     # Idempotency / cross-region wipe guard: a second run must NOT lose cold rows
     # (a region-blind Phase-0 wipe would under-count here).
     "$ARCHIVER" --config /tmp/journey-tl.yaml >/tmp/journey-tl2.log 2>&1
     assert_eq "re-run keeps all cold rows (region-scoped wipe)" "420" "$(q "$HOST" "SELECT count(*) FROM regional;")"
-    assert_eq "re-run keeps eu cold rows" "240" "$(q "$HOST" "SELECT count(*) FROM regional WHERE region='eu' AND ts < '2026-04-01';")"
+    assert_eq "re-run keeps eu cold rows" "240" "$(q "$HOST" "SELECT count(*) FROM regional WHERE region='eu' AND ts < date_trunc('month',now()) - interval '1 month';")"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -1271,16 +1300,25 @@ CREATE TABLE IF NOT EXISTS cli_events (
     v  int,
     PRIMARY KEY (id, ts)
 ) PARTITION BY RANGE (ts);
-CREATE TABLE IF NOT EXISTS cli_events_p_2026_02 PARTITION OF cli_events FOR VALUES FROM ('2026-02-01') TO ('2026-03-01');
-CREATE TABLE IF NOT EXISTS cli_events_p_2026_04 PARTITION OF cli_events FOR VALUES FROM ('2026-04-01') TO ('2026-05-01');
-INSERT INTO cli_events (ts, v) SELECT '2026-02-10'::timestamptz + (i*interval '1 hour'), i FROM generate_series(1,50) i;
-INSERT INTO cli_events (ts, v) SELECT '2026-04-05'::timestamptz + (i*interval '1 hour'), i FROM generate_series(1,30) i;
+-- RANGE leaves for the m3 (cold) and m1 (hot) months, table-scoped names derived
+-- from now()-relative months (never invented calendar literals).
+DO $do$
+DECLARE m date;
+BEGIN
+  FOREACH m IN ARRAY ARRAY[(date_trunc('month',now()) - interval '3 months')::date,
+                           (date_trunc('month',now()) - interval '1 month')::date] LOOP
+    EXECUTE format('CREATE TABLE IF NOT EXISTS %I PARTITION OF cli_events FOR VALUES FROM (%L) TO (%L)',
+                   'cli_events_p_' || to_char(m, 'YYYY_MM'), m, (m + interval '1 month'));
+  END LOOP;
+END $do$;
+INSERT INTO cli_events (ts, v) SELECT date_trunc('month',now()) - interval '3 months' + interval '9 days' + (i*interval '1 hour'), i FROM generate_series(1,50) i;
+INSERT INTO cli_events (ts, v) SELECT date_trunc('month',now()) - interval '1 month'  + interval '4 days' + (i*interval '1 hour'), i FROM generate_series(1,30) i;
 -- A partitioned table with NO primary key: register must reject it (the cutover
 -- keys delta capture by the source PK). (PG itself forbids a PK that omits the
 -- partition key, so "PK doesn't cover the key" is impossible to construct.)
 CREATE TABLE IF NOT EXISTS cli_nopk (id bigint, ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
 EOSQL
-    local ret_days; ret_days=$(( ( $(date -u +%s) - $(date -u -d '2026-04-15' +%s) ) / 86400 ))  # tier Feb, keep Apr
+    local ret_days; ret_days=$(( ( $(date -u +%s) - $(date -u -d "$(date -u +%Y-%m-01) -1 month" +%s) ) / 86400 ))  # tier m3, keep m1
 
     # register (tiered) — validates the PK, INSERTs the row.
     if "$ARCHIVER" register --config /tmp/journey-archiver.yaml --table cli_events \
@@ -1406,6 +1444,44 @@ story_partitioner_idmode() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# Story — partitioner: TWO independent flat tables in the SAME schema (the real-
+# world case — issue #11). Before the table-scoped-naming fix both tables
+# generated the same leaf names (p_YYYY_MM); the second's CREATE … IF NOT EXISTS
+# silently no-op'd, leaving it partition-less while the run still reported
+# success. Assert BOTH tables get their own (table-scoped) partitions, the leaf
+# names are prefixed per table, and a fresh row lands in each.
+# ───────────────────────────────────────────────────────────────────────────
+story_partitioner_multitable() {
+    step "Partitioner multi-table: two flat tables, one schema, both partitioned (issue #11)"
+    local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
+    printf 'postgres: { dsn: "%s" }\n' "$dsn" > /tmp/journey-mt.yaml
+    q "$HOST" "CREATE SCHEMA IF NOT EXISTS mt;
+               CREATE TABLE IF NOT EXISTS mt.orders    (id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL, PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);
+               CREATE TABLE IF NOT EXISTS mt.shipments (id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL, PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);" >/dev/null
+    local t
+    for t in orders shipments; do
+        if ! "$PARTITIONER" register --dsn "$dsn" --schema mt --table "$t" --period monthly --retention "60 months" >"/tmp/journey-mt-$t-reg.log" 2>&1; then
+            fail "multi-table: register mt.$t failed"; tail -5 "/tmp/journey-mt-$t-reg.log"; return
+        fi
+    done
+    if ! "$PARTITIONER" --config /tmp/journey-mt.yaml >/tmp/journey-mt-run.log 2>&1; then
+        fail "multi-table: partitioner run failed"; tail -8 /tmp/journey-mt-run.log; return
+    fi
+    # BOTH tables get partitions — the collision bug left the second with zero.
+    assert_gt "multi-table: mt.orders has partitions"    "1" "$(q "$HOST" "SELECT count(*) FROM pg_inherits WHERE inhparent='mt.orders'::regclass;")"
+    assert_gt "multi-table: mt.shipments has partitions" "1" "$(q "$HOST" "SELECT count(*) FROM pg_inherits WHERE inhparent='mt.shipments'::regclass;")"
+    # Leaf names are table-scoped (orders_p_… / shipments_p_…), so they never collide.
+    assert_gt "multi-table: orders leaves are table-scoped" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM pg_inherits i JOIN pg_class c ON c.oid=i.inhrelid WHERE i.inhparent='mt.orders'::regclass AND starts_with(c.relname,'orders_p_');")"
+    # A fresh row lands in each (a live partition covers now in BOTH tables).
+    q "$HOST" "INSERT INTO mt.orders (ts) VALUES (now()); INSERT INTO mt.shipments (ts) VALUES (now());" >/dev/null 2>&1
+    assert_eq "multi-table: row landed in mt.orders"    "1" "$(q "$HOST" "SELECT count(*) FROM mt.orders;")"
+    assert_eq "multi-table: row landed in mt.shipments" "1" "$(q "$HOST" "SELECT count(*) FROM mt.shipments;")"
+    # Clean up so the SHARED coldfront.partition_config stays clean for later stories.
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE schema_name='mt'; DROP SCHEMA mt CASCADE;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Story — Enterprise privilege model: a NON-superuser app role, onboarded with a
 # single coldfront.grant_app_access() call, reads AND writes the tiered view
 # transparently — no superuser, no pg_*_server_files, no per-session setup.
@@ -1424,7 +1500,7 @@ story_app_privilege() {
     assert_eq "app role is NOT a superuser"           "off" "$(q "$HOST" "SET ROLE japp; SELECT current_setting('is_superuser');" | tail -1)"
     assert_eq "app role lacks pg_read_server_files"   "f"   "$(q "$HOST" "SELECT pg_has_role('japp','pg_read_server_files','MEMBER');")"
     assert_eq "app role reads tiered hot+cold (== superuser)" "$total" "$(q "$HOST" "SET ROLE japp; SELECT count(*) FROM events;" | tail -1)"
-    q "$HOST" "SET ROLE japp; INSERT INTO events (ts,status,data) VALUES ('2026-01-18 09:00+00','japp_priv','{}');" >/dev/null 2>&1
+    q "$HOST" "SET ROLE japp; INSERT INTO events (ts,status,data) VALUES (date_trunc('month',now()) - interval '4 months' + interval '17 days' + interval '9 hours','japp_priv','{}');" >/dev/null 2>&1
     assert_eq "app role cold write landed (read-your-write)" "1" "$(q "$HOST" "SELECT count(*) FROM events WHERE status='japp_priv';")"
     q "$HOST" "DELETE FROM events WHERE status='japp_priv';" >/dev/null 2>&1
 
@@ -1433,7 +1509,7 @@ story_app_privilege() {
         assert_eq "app role + grants replicated to peer $p1 (Spock DDL, onboarded once)" "t" \
             "$(q "$p1" "SELECT (rolname IS NOT NULL AND pg_has_role('japp','coldfront_duckdb','MEMBER')) FROM pg_roles WHERE rolname='japp';" | tail -1)"
         assert_eq "peer $p1: non-superuser reads tiered hot+cold cross-node" "$total" "$(q "$p1" "SET ROLE japp; SELECT count(*) FROM events;" | tail -1)"
-        q "$p1" "SET ROLE japp; INSERT INTO events (ts,status,data) VALUES ('2026-01-19 09:00+00','japp_mesh','{}');" >/dev/null 2>&1
+        q "$p1" "SET ROLE japp; INSERT INTO events (ts,status,data) VALUES (date_trunc('month',now()) - interval '4 months' + interval '18 days' + interval '9 hours','japp_mesh','{}');" >/dev/null 2>&1
         assert_eq "peer $p1: non-superuser mesh cold write (SECURITY DEFINER R-A bakery) visible on db1" "1" \
             "$(q "$HOST" "SELECT count(*) FROM events WHERE status='japp_mesh';")"
         q "$HOST" "DELETE FROM events WHERE status='japp_mesh';" >/dev/null 2>&1
@@ -1472,6 +1548,7 @@ if [ "$MODE" = "tiered" ]; then
     story_cold_retention
     story_tiered_twolevel
     story_partitioner_idmode
+    story_partitioner_multitable
     story_register_cli
 else
     story_provision_decoupled
