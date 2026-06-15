@@ -701,19 +701,44 @@ EOSQL
 }
 
 # ───────────────────────────────────────────────────────────────────────────
-# Story 7 — Schema DDL. Column-shape changes are BLOCKED (duckdb-iceberg can't
-# ALTER an Iceberg table); RENAME TABLE/VIEW are supported (no Iceberg touch).
+# Story 7 — Schema DDL. Column-shape changes (ADD/DROP/ALTER-TYPE/RENAME COLUMN)
+# are MIRRORED onto the Iceberg cold tier and the transparent view is rebuilt;
+# an unsupported column type is rejected up front. RENAME TABLE/VIEW touch only
+# the PG side. Exercised on a scratch column so the table shape is restored for
+# later stories. Each cross-tier read after a change only succeeds if the Iceberg
+# schema actually followed it (else the rebuilt cold branch fails to resolve).
 # ───────────────────────────────────────────────────────────────────────────
 story_ddl() {
-    step "7. Schema DDL (column changes blocked; rename table/view supported)"
-    assert_err "ADD COLUMN blocked"     "cannot alter columns" "$(q_may "$HOST" "ALTER TABLE _events ADD COLUMN payload text;")"
-    assert_err "DROP COLUMN blocked"    "cannot alter columns" "$(q_may "$HOST" "ALTER TABLE _events DROP COLUMN status;")"
-    assert_err "ALTER TYPE blocked"     "cannot alter columns" "$(q_may "$HOST" "ALTER TABLE _events ALTER COLUMN id TYPE bigint;")"
-    assert_err "RENAME COLUMN blocked"  "cannot rename a column" "$(q_may "$HOST" "ALTER TABLE _events RENAME COLUMN status TO state;")"
+    step "7. Schema DDL mirrored to Iceberg (ADD/DROP/ALTER TYPE/RENAME COLUMN); rename table/view"
+    local cutoff="2026-03-01"
+
+    # ADD COLUMN → mirrored; the cold UNION branch now projects it.
+    q "$HOST" "ALTER TABLE _events ADD COLUMN cnt integer;" >/dev/null
+    assert_gt "cold tier readable after ADD COLUMN (mirrored to Iceberg)" "0" "$(q "$HOST" "SELECT count(*) FROM events WHERE ts < '$cutoff';")"
+    assert_eq "view exposes the added column" "cnt" "$(q "$HOST" "SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='events' AND column_name='cnt';")"
+    assert_eq "added column is NULL on historical cold rows" "" "$(q "$HOST" "SELECT cnt FROM events WHERE ts < '$cutoff' ORDER BY ts LIMIT 1;")"
+
+    # ALTER COLUMN TYPE → mirrored safe promotion (INTEGER -> BIGINT).
+    q "$HOST" "ALTER TABLE _events ALTER COLUMN cnt TYPE bigint;" >/dev/null
+    assert_gt "cold tier readable after ALTER COLUMN TYPE" "0" "$(q "$HOST" "SELECT count(*) FROM events WHERE ts < '$cutoff';")"
+
+    # RENAME COLUMN → Iceberg column renamed too, or the rebuilt cold branch
+    # (r['ctr']) could not resolve against the old Iceberg name.
+    q "$HOST" "ALTER TABLE _events RENAME COLUMN cnt TO ctr;" >/dev/null
+    assert_gt "cold tier readable after RENAME COLUMN (Iceberg col renamed)" "0" "$(q "$HOST" "SELECT count(*) FROM events WHERE ts < '$cutoff';")"
+    assert_eq "renamed column visible on the view" "ctr" "$(q "$HOST" "SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='events' AND column_name='ctr';")"
+
+    # DROP COLUMN → mirrored; restores the original shape for later stories.
+    q "$HOST" "ALTER TABLE _events DROP COLUMN ctr;" >/dev/null
+    assert_eq "scratch column dropped from the view" "0" "$(q "$HOST" "SELECT count(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='events' AND column_name IN ('cnt','ctr');")"
+    assert_gt "cold tier readable after DROP COLUMN" "0" "$(q "$HOST" "SELECT count(*) FROM events WHERE ts < '$cutoff';")"
+
+    # Data-type correspondence is enforced: an unsupported type is rejected up front.
+    assert_err "ADD COLUMN inet rejected (no Iceberg mapping)" "no Iceberg-compatible mapping" "$(q_may "$HOST" "ALTER TABLE _events ADD COLUMN ip inet;")"
+
     # RENAME VIEW is supported and must migrate the watermark so the cold branch survives.
     q "$HOST" "ALTER VIEW events RENAME TO events_v2;" >/dev/null
-    local cold; cold=$(q "$HOST" "SELECT count(*) FROM events_v2 WHERE ts < '2026-03-01';")
-    assert_gt "cold tier survives view rename" "0" "$cold"
+    assert_gt "cold tier survives view rename" "0" "$(q "$HOST" "SELECT count(*) FROM events_v2 WHERE ts < '$cutoff';")"
     q "$HOST" "ALTER VIEW events_v2 RENAME TO events;" >/dev/null
     pass "view renamed back to events"
 }

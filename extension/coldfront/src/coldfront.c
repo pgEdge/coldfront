@@ -2103,10 +2103,10 @@ spi_exec_void(const char *sql)
 }
 
 /* Rebuild the transparent view + INSERT trigger from current catalog state.
- * Used after a hot-table RENAME or a view RENAME (neither touches the Iceberg
- * schema — only the PG-side view/registry). Column-shape DDL is BLOCKED (the
- * cold tier can't be ALTERed on duckdb-iceberg v1.1.1), so there is no
- * post-column-change rebuild path. */
+ * Used after a column-shape change (ADD/DROP/ALTER-TYPE/RENAME COLUMN, mirrored
+ * onto Iceberg by mirror_and_rebuild) and after a hot-table or view RENAME. The
+ * view's columns/types are derived from the hot heap, so it always reflects the
+ * post-DDL shape. */
 static void
 rebuild_tiered_view(const char *schema, const char *relname)
 {
@@ -2115,6 +2115,31 @@ rebuild_tiered_view(const char *schema, const char *relname)
     appendStringInfo(&sql, "SELECT coldfront._rebuild_tiered_view(%s, %s)",
         quote_literal_cstr(schema), quote_literal_cstr(relname));
     spi_exec_void(sql.data);
+    pfree(sql.data);
+}
+
+/* Drop the transparent view (mirror_and_rebuild recreates it). Issued BEFORE a
+ * hot-side column DROP / ALTER TYPE: PG refuses to drop or retype a column that a
+ * view projects ("used by a view or rule"). Runs under the re-entrancy guard so
+ * the DROP VIEW is not itself caught by the DROP-of-tiered-relation block, and is
+ * part of the user statement's transaction, so any later failure rolls it back. */
+static void
+drop_tiered_view(const char *schema, const char *relname)
+{
+    StringInfoData sql;
+    initStringInfo(&sql);
+    appendStringInfo(&sql, "DROP VIEW IF EXISTS %s.%s CASCADE",
+        quote_identifier(schema), quote_identifier(relname));
+    coldfront_in_utility = true;
+    PG_TRY();
+    {
+        spi_exec_void(sql.data);
+    }
+    PG_FINALLY();
+    {
+        coldfront_in_utility = false;
+    }
+    PG_END_TRY();
     pfree(sql.data);
 }
 
@@ -2163,6 +2188,41 @@ quoted_qualified_name(Oid relid)
 }
 
 /*
+ * Mirror collected column DDL onto the Iceberg cold tier — one bakery-serialized,
+ * claim-first catalog change via coldfront._mirror_iceberg_alter (a no-op on a
+ * Spock apply worker, where the originator already evolved the SHARED catalog) —
+ * then rebuild the per-node transparent view to the new column set. `actions` is
+ * the body of a jsonb_build_array(...) call: comma-separated jsonb_build_object()
+ * terms, each {op, col[, newcol]}. Runs under the re-entrancy guard so the
+ * SPI-issued DDL does not re-enter this hook. Any unsupported type raises inside
+ * the mirror, rolling the whole statement (hot tier included) back atomically.
+ */
+static void
+mirror_and_rebuild(const TieredDDLInfo *info, const char *actions)
+{
+    StringInfoData sql;
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+        "SELECT coldfront._mirror_iceberg_alter(%s, %s, jsonb_build_array(%s))",
+        quote_literal_cstr(info->iceberg_table),
+        quote_literal_cstr(info->hot_table),
+        actions);
+
+    coldfront_in_utility = true;
+    PG_TRY();
+    {
+        spi_exec_void(sql.data);
+        rebuild_tiered_view(info->view_schema, info->view_relname);
+    }
+    PG_FINALLY();
+    {
+        coldfront_in_utility = false;
+    }
+    PG_END_TRY();
+    pfree(sql.data);
+}
+
+/*
  * The coldfront ProcessUtility_hook. Intercepts DDL on registered tiered
  * relations: blocks DROP/TRUNCATE, mirrors schema/rename DDL to Iceberg, and
  * rebuilds the transparent view. Everything else passes straight through.
@@ -2186,16 +2246,18 @@ coldfront_process_utility(PlannedStmt *pstmt, const char *queryString,
     } while (0)
 
     /*
-     * No special-casing of the Spock apply worker is needed. The only DDL the
-     * hook still ACTS on for a tiered table is DROP/TRUNCATE (blocked — never
-     * replicated, since they error on the originator), column DDL (blocked —
-     * likewise), and RENAME TABLE/VIEW. A RENAME replicates as a top-level
-     * statement; when a peer's apply worker re-issues it, the hook runs the
-     * peer's LOCAL registry update + view rebuild — which is exactly right,
-     * because the registry/view are per-node (not Spock-replicated). There is
-     * no Iceberg mirror anymore, so nothing to skip on the apply path. The
-     * SPI-issued rebuild DDL runs at non-top-level context, which Spock filters
-     * out, so it never re-replicates.
+     * Spock apply worker: the DDL the hook ACTS on for a tiered table is
+     * DROP/TRUNCATE (blocked — never replicated, they error on the originator),
+     * column DDL (ADD/DROP/ALTER-TYPE/RENAME COLUMN — mirrored to Iceberg), and
+     * RENAME TABLE/VIEW. A replicated statement re-runs in the peer's apply
+     * worker; the hook then does the peer's LOCAL registry update + view
+     * rebuild, which is exactly right because the registry/view are per-node
+     * (not Spock-replicated). The Iceberg cold tier, by contrast, is SHARED
+     * (one Lakekeeper), so its column DDL must run exactly once: the mirror
+     * (coldfront._mirror_iceberg_alter) self-skips when
+     * session_replication_role = replica, leaving the apply worker to rebuild
+     * its local view only. The SPI-issued mirror/rebuild DDL runs at
+     * non-top-level context, which Spock filters out, so it never re-replicates.
      */
 
     /* Re-entrant SPI-issued DDL (our own CREATE VIEW/TRIGGER): no coldfront
@@ -2273,49 +2335,82 @@ coldfront_process_utility(PlannedStmt *pstmt, const char *queryString,
         return;
     }
 
-    /* ---- ALTER TABLE: BLOCK column-shape changes on a tiered table. ----
+    /* ---- ALTER TABLE: MIRROR column-shape changes onto the cold tier. ----
      *
-     * duckdb-iceberg (pg_duckdb v1.1.1) implements no Iceberg ALTER TABLE
-     * ("Not implemented: Alter Schema Entry"), so the cold tier's schema can't
-     * be evolved in place. Rather than mirror-then-fail (aborting the user's
-     * ALTER with an opaque error), we block ADD/DROP COLUMN and ALTER COLUMN
-     * TYPE up front with an actionable message. Every OTHER ALTER subtype —
-     * DETACH/ATTACH PARTITION (the archiver's own cutover machinery), storage
-     * params, SET STATISTICS — passes straight through untouched. */
+     * duckdb-iceberg (v1.5) implements Iceberg ALTER TABLE, so ADD/DROP COLUMN
+     * and ALTER COLUMN TYPE evolve both tiers in one statement: PG runs the
+     * hot-side ALTER, then coldfront._mirror_iceberg_alter issues the matching
+     * Iceberg DDL (one bakery-serialized, claim-first catalog CAS) and the view
+     * is rebuilt to the new column set. Every OTHER ALTER subtype — DETACH/ATTACH
+     * PARTITION (the archiver's own cutover machinery), storage params, SET
+     * STATISTICS, constraint / NOT NULL toggles — is PG-side only and passes
+     * straight through untouched. */
     if (IsA(stmt, AlterTableStmt))
     {
         AlterTableStmt *at    = (AlterTableStmt *) stmt;
         Oid             relid = RangeVarGetRelid(at->relation, NoLock, true);
         TieredDDLInfo   info;
         ListCell       *lc;
+        StringInfoData  actions;
+        int             nacts = 0;
 
         if (!lookup_tiered_by_hot_oid(relid, &info))
         {
             COLDFRONT_CALL_THROUGH();
             return;
         }
+
+        /* Collect the column-shape subcommands to mirror; ignore the rest. */
+        initStringInfo(&actions);
         foreach(lc, at->cmds)
         {
             AlterTableCmd *cmd = (AlterTableCmd *) lfirst(lc);
-            if (cmd->subtype == AT_AddColumn ||
-                cmd->subtype == AT_DropColumn ||
-                cmd->subtype == AT_AlterColumnType)
+            const char    *op  = NULL;
+            const char    *col = NULL;
+
+            if (cmd->subtype == AT_AddColumn)
             {
-                char *ns   = get_namespace_name(get_rel_namespace(relid));
-                char *name = get_rel_name(relid);
-                ereport(ERROR,
-                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                     errmsg("coldfront: cannot alter columns of tiered table \"%s.%s\" — its cold tier in Iceberg cannot be altered",
-                            ns, name),
-                     errhint("Blocked by design: duckdb-iceberg cannot ALTER an Iceberg table, "
-                             "so hot and cold tiers would diverge. To change the schema, untier "
-                             "the table (drain the cold tier back / re-provision), alter it, then "
-                             "re-tier.")));
+                op  = "add";
+                col = castNode(ColumnDef, cmd->def)->colname;
             }
+            else if (cmd->subtype == AT_DropColumn)
+            {
+                op  = "drop";
+                col = cmd->name;
+            }
+            else if (cmd->subtype == AT_AlterColumnType)
+            {
+                op  = "type";
+                col = cmd->name;
+            }
+            if (op == NULL)
+                continue;
+
+            appendStringInfo(&actions, "%sjsonb_build_object('op', %s, 'col', %s)",
+                             nacts > 0 ? ", " : "",
+                             quote_literal_cstr(op), quote_literal_cstr(col));
+            nacts++;
         }
-        /* No column-shape change → partition management / storage params /
-         * the archiver's DETACH. Not coldfront's business. */
+
+        if (nacts == 0)
+        {
+            /* No column-shape change → partition management / storage params /
+             * the archiver's DETACH. Not coldfront's business. */
+            pfree(actions.data);
+            COLDFRONT_CALL_THROUGH();
+            return;
+        }
+
+        /* The transparent view projects the hot columns, so PG blocks a hot-side
+         * DROP COLUMN / ALTER COLUMN TYPE of a projected column ("used by a
+         * view"). Drop the view first, run the hot ALTER, then mirror the change
+         * onto Iceberg and rebuild the view. One transaction: an unsupported
+         * column type (or any failure) raises inside the mirror and rolls the
+         * whole statement — view drop and hot change included — back atomically. */
+        drop_tiered_view(info.view_schema, info.view_relname);
         COLDFRONT_CALL_THROUGH();
+        mirror_and_rebuild(&info, actions.data);
+        pfree(actions.data);
         return;
     }
 
@@ -2325,6 +2420,7 @@ coldfront_process_utility(PlannedStmt *pstmt, const char *queryString,
         RenameStmt   *rs = (RenameStmt *) stmt;
         TieredDDLInfo info;
         bool          matched = false;
+        bool          via_hot = false;        /* matched via the hot table (info fully populated) */
         Oid           hot_relid = InvalidOid;
         Oid           view_relid = InvalidOid;
         char         *old_view_name = NULL;   /* captured pre-rename for OBJECT_VIEW */
@@ -2332,7 +2428,8 @@ coldfront_process_utility(PlannedStmt *pstmt, const char *queryString,
         if (rs->renameType == OBJECT_TABLE || rs->renameType == OBJECT_COLUMN)
         {
             hot_relid = RangeVarGetRelid(rs->relation, NoLock, true);
-            matched   = lookup_tiered_by_hot_oid(hot_relid, &info);
+            if (lookup_tiered_by_hot_oid(hot_relid, &info))
+                matched = via_hot = true;
         }
         if (!matched && (rs->renameType == OBJECT_VIEW ||
                          rs->renameType == OBJECT_COLUMN))
@@ -2357,21 +2454,35 @@ coldfront_process_utility(PlannedStmt *pstmt, const char *queryString,
             return;
         }
 
-        /* RENAME COLUMN is BLOCKED on a tiered table: it would require renaming
-         * the column in the Iceberg cold tier too, which duckdb-iceberg cannot
-         * do. RENAME TABLE (hot heap) and RENAME VIEW touch only the PG side
-         * (registry + view), never the Iceberg schema, so they are supported. */
+        /* RENAME COLUMN on the HOT table is mirrored onto the Iceberg column so
+         * cold reads keep resolving it by name. A column rename targeting the
+         * generated VIEW is meaningless (the rebuild owns the view's column
+         * names) and is rejected. RENAME TABLE (hot heap) and RENAME VIEW touch
+         * only the PG side (registry + view), never the Iceberg schema. */
         if (rs->renameType == OBJECT_COLUMN)
         {
-            Oid   r    = OidIsValid(hot_relid) ? hot_relid : view_relid;
-            char *ns   = get_namespace_name(get_rel_namespace(r));
-            char *name = get_rel_name(r);
-            ereport(ERROR,
-                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                 errmsg("coldfront: cannot rename a column of tiered relation \"%s.%s\" — its cold tier in Iceberg cannot be altered",
-                        ns, name),
-                 errhint("Blocked by design: duckdb-iceberg cannot rename an Iceberg column. "
-                         "Untier, rename, then re-tier.")));
+            StringInfoData acts;
+
+            if (!via_hot)
+            {
+                char *ns   = get_namespace_name(get_rel_namespace(view_relid));
+                char *name = get_rel_name(view_relid);
+                ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("coldfront: cannot rename a column of the generated view \"%s.%s\"",
+                            ns, name),
+                     errhint("Rename the column on the hot table instead; coldfront mirrors "
+                             "that onto the Iceberg cold tier and rebuilds the view.")));
+            }
+
+            COLDFRONT_CALL_THROUGH();   /* PG renames the hot column */
+            initStringInfo(&acts);
+            appendStringInfo(&acts,
+                "jsonb_build_object('op', 'rename', 'col', %s, 'newcol', %s)",
+                quote_literal_cstr(rs->subname), quote_literal_cstr(rs->newname));
+            mirror_and_rebuild(&info, acts.data);
+            pfree(acts.data);
+            return;
         }
 
         /* For a VIEW rename, capture the OLD view name NOW (before the rename

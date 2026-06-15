@@ -280,6 +280,25 @@ Commit-then-release matches the cold-write shape the model already abstracts as
 the atomic `Decide` step (commit iceberg, then DELETE the claim). The model is
 unchanged; re-running every config confirms the invariants still hold.
 
+### DDL mirroring (`ALTER TABLE`)
+
+Tiered-table column DDL (ADD/DROP/ALTER-TYPE/RENAME COLUMN) is mirrored onto the
+shared Iceberg tier by `coldfront._mirror_iceberg_alter`, which routes the Iceberg
+ALTER through the **unchanged** `_exec_iceberg_with_claim`. It is therefore the
+**same stock-ordering claimant** the cold writer is: one metadata-only CAS commit
+(the schema change — identical parent-CAS conflict shape to the append modelled at
+`Decide`) under the held claim, then release. It forces the claim-first ordering
+(`SET LOCAL coldfront.iceberg_async_parquet = off`): an ALTER stages no parquet, so
+there is nothing to overlap, and `AsyncParquet = FALSE` (`Bakery_v2.cfg`) is the
+config the model already proves safe. No new protocol primitive is added, so the
+model and every config result are unchanged.
+
+In a mesh the user's ALTER replicates as a top-level statement and re-runs in each
+peer's apply worker; the mirror self-skips there (`session_replication_role =
+replica`) because the SHARED catalog was already evolved by the originator. The
+single-commit shape thus holds — the catalog is altered exactly once, by one
+claimant — and peers only rebuild their per-node view.
+
 ### Known abstractions (model deviates from reality)
 
 - **`claims` as globally-consistent set.** The model treats every

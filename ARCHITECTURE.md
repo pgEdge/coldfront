@@ -333,7 +333,7 @@ registry's `hot_table` — never by string, so it is schema-agnostic):
 
 | DDL | Behaviour |
 |---|---|
-| `ALTER TABLE _t ADD/DROP COLUMN`, `ALTER COLUMN ... TYPE`, `RENAME COLUMN` | **Blocked by design** — duckdb-iceberg cannot `ALTER` an Iceberg table, so the hot and cold tiers would diverge. The hook raises an actionable error; to change the schema, untier the table, alter it, then re-tier. |
+| `ALTER TABLE _t ADD/DROP COLUMN`, `ALTER COLUMN ... TYPE`, `RENAME COLUMN` | **Mirrored to Iceberg** — the hook drops the view, runs the hot-side change, then `coldfront._mirror_iceberg_alter` issues the matching Iceberg `ALTER` (one bakery-serialized, claim-first catalog change) and rebuilds the view, so both tiers evolve in one statement. Column types map through `coldfront._iceberg_storage_type`, so an unsupported type (e.g. `inet`) is rejected up front; `ALTER COLUMN TYPE` is limited to the safe promotions duckdb-iceberg accepts (int→bigint, float→double, date→timestamp, decimal-widen). |
 | `ALTER TABLE _t RENAME TO ...` | Supported (touches no Iceberg schema): update `tiered_views.hot_table`, rebuild the view. |
 | `ALTER VIEW v RENAME TO ...` | Supported: migrate the name-keyed registry + `archive_watermark` rows to the new view name, then rebuild (otherwise the lookups miss and the cold UNION branch silently disappears). |
 | `DROP TABLE _t` / `DROP VIEW v` | **Blocked by design** — would orphan the Iceberg cold tier. Dismantling tiering is a deliberate operator action (unregister with `partitioner remove`/`archiver remove`, which deletes the `partition_config` row, then drop each tier explicitly), never a one-shot call. |
@@ -342,17 +342,19 @@ registry's `hot_table` — never by string, so it is schema-agnostic):
 The view rebuild always does `DROP VIEW` + `CREATE VIEW` (not
 `CREATE OR REPLACE VIEW`, which PG only allows for appending columns at
 the end). The registry is keyed by the view's `(schema_name, relname)`,
-which the rebuild leaves unchanged, so there is nothing to re-point. The
-Iceberg mirror only runs when `coldfront.warehouse` is set; with it empty
-(single-node / tests) the PG-side view rebuild still happens. Concurrent
-schema changes are serialised by the same bakery as cold DML.
+which the rebuild leaves unchanged, so there is nothing to re-point. A column
+change is mirrored to Iceberg through `ensure_attached()` + the bakery, so it
+requires a configured `coldfront.warehouse`; a RENAME TABLE/VIEW touches no
+Iceberg schema and rebuilds the view regardless. Concurrent schema changes are
+serialised by the same bakery as cold DML.
 
 **Active-active.** Spock 5.0.8 replicates the top-level `ALTER TABLE` (the
-hook's SPI-issued view-rebuild DDL runs at non-top-level context, which
-Spock's `autoddl_can_proceed()` filters out). A peer applies the replicated
-`ALTER TABLE` with `IsLogicalWorker() == true`; the hook then rebuilds
-**that peer's own** local view, but skips the Iceberg mirror (the originator
-already wrote the shared Lakekeeper catalog). Because the registry is keyed by
+hook's SPI-issued mirror/rebuild DDL runs at non-top-level context, which
+Spock's `autoddl_can_proceed()` filters out). A peer's apply worker re-runs the
+replicated `ALTER TABLE`; the hook rebuilds **that peer's own** local view, but
+`coldfront._mirror_iceberg_alter` skips the Iceberg `ALTER` there (it runs under
+`session_replication_role = replica`) because the originator already evolved the
+shared Lakekeeper catalog. Because the registry is keyed by
 `(schema_name, relname)` — node-independent — the row is identical on every
 node: the rebuild needs no re-pointing, and the registry replicates cleanly by
 value across the mesh (an OID could not). DROP and TRUNCATE are blocked on

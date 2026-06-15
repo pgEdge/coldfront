@@ -2094,8 +2094,8 @@ $$;
 -- and its INSTEAD OF INSERT trigger after a RENAME TABLE (hot heap) or RENAME
 -- VIEW. Driven entirely from pg_catalog so it is the runtime equivalent of
 -- internal/view/view.go's GenerateViewSQL / GenerateTriggerFuncSQL /
--- GenerateTriggerSQL. (Column-shape DDL is blocked by the hook, so the view's
--- column SET never changes here — only the hot-table name or the view name.)
+-- GenerateTriggerSQL. (Also rebuilt after a mirrored column-shape change, so the
+-- view's column set follows the hot heap; and after a hot-table or view rename.)
 --
 -- Called by the coldfront DDL hook for tiered views (rows with a non-NULL
 -- hot_table). Iceberg-only views (is_iceberg_only = true, hot_table NULL) are
@@ -2350,6 +2350,96 @@ $body$ LANGUAGE plpgsql$fn$,
 
     -- 6. The registry key (schema, relname) is unchanged by the DROP+CREATE
     --    above (the view name is stable), so there is nothing to re-point.
+END;
+$$;
+
+-- coldfront._mirror_iceberg_alter: mirror a hot-table column DDL onto the cold
+-- Iceberg tier — the ProcessUtility hook's write-side counterpart to
+-- _rebuild_tiered_view. Called AFTER PG has executed the ALTER on the hot heap,
+-- so ADD/ALTER-TYPE columns are already in pg_catalog and we read their
+-- post-change type there (one source of truth, the same lookup
+-- _rebuild_tiered_view uses). p_actions is a jsonb array of {op, col [, newcol]}
+-- with op in 'add' | 'drop' | 'type' | 'rename'. Every type name maps through
+-- coldfront._iceberg_storage_type, so hot and cold stay in correspondence
+-- (smallint->INTEGER, jsonb->VARCHAR, numeric(P,S)->DECIMAL(P,S), bytea->BLOB,
+-- inet -> rejected up front, …) — identical to create_iceberg_table.
+--
+-- The change serialises through the bakery via _exec_iceberg_with_claim with the
+-- async-parquet ordering forced OFF: an ALTER is a metadata-only catalog CAS with
+-- no parquet to overlap, so the claim-first (stock) ordering — the configuration
+-- the TLA+ model proves safe — is both sufficient and the conservative choice.
+--
+-- On a Spock apply worker (session_replication_role = replica) the SHARED Iceberg
+-- table was already evolved by the originator, so this is a NO-OP; the caller
+-- still rebuilds the per-node view.
+CREATE FUNCTION coldfront._mirror_iceberg_alter(
+    p_iceberg_table text,
+    p_hot_table     text,
+    p_actions       jsonb
+) RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_hot_schema  text := (parse_ident(p_hot_table))[1];
+    v_hot_relname text := (parse_ident(p_hot_table))[2];
+    act           jsonb;
+    op            text;
+    col           text;
+    pg_type       text;
+    ddl           text := '';
+BEGIN
+    -- Apply worker: the shared catalog was already evolved by the originator.
+    IF current_setting('session_replication_role') = 'replica' THEN
+        RETURN;
+    END IF;
+
+    FOR act IN SELECT * FROM jsonb_array_elements(p_actions) LOOP
+        op  := act->>'op';
+        col := act->>'col';
+        IF ddl <> '' THEN ddl := ddl || '; '; END IF;
+
+        IF op IN ('add', 'type') THEN
+            -- Post-ALTER column type from the hot heap (the same pg_catalog
+            -- lookup _rebuild_tiered_view uses), mapped to its Iceberg storage
+            -- type. _iceberg_storage_type RAISES for any unsupported PG type,
+            -- which rolls the whole ALTER back atomically (hot tier included).
+            SELECT format_type(a.atttypid, a.atttypmod) INTO pg_type
+            FROM pg_attribute a
+            JOIN pg_class c      ON c.oid = a.attrelid
+            JOIN pg_namespace nn ON nn.oid = c.relnamespace
+            WHERE nn.nspname = v_hot_schema AND c.relname = v_hot_relname
+              AND a.attname = col AND a.attnum > 0 AND NOT a.attisdropped;
+            IF pg_type IS NULL THEN
+                RAISE EXCEPTION 'coldfront: column "%" not found on hot table % after ALTER', col, p_hot_table;
+            END IF;
+            IF op = 'add' THEN
+                ddl := ddl || format('ALTER TABLE %s ADD COLUMN IF NOT EXISTS %I %s',
+                    p_iceberg_table, col, coldfront._iceberg_storage_type(pg_type));
+            ELSE
+                ddl := ddl || format('ALTER TABLE %s ALTER COLUMN %I TYPE %s',
+                    p_iceberg_table, col, coldfront._iceberg_storage_type(pg_type));
+            END IF;
+        ELSIF op = 'drop' THEN
+            ddl := ddl || format('ALTER TABLE %s DROP COLUMN IF EXISTS %I', p_iceberg_table, col);
+        ELSIF op = 'rename' THEN
+            ddl := ddl || format('ALTER TABLE %s RENAME COLUMN %I TO %I',
+                p_iceberg_table, col, act->>'newcol');
+        ELSE
+            RAISE EXCEPTION 'coldfront._mirror_iceberg_alter: unknown op "%"', op;
+        END IF;
+    END LOOP;
+
+    IF ddl = '' THEN RETURN; END IF;
+
+    -- Mixed PG (the hot ALTER already ran) + DuckDB (this Iceberg ALTER) tx, the
+    -- same allowance create_iceberg_table needs. Force the proven claim-first
+    -- bakery ordering: metadata-only, nothing to overlap.
+    SET LOCAL duckdb.unsafe_allow_mixed_transactions = on;
+    SET LOCAL coldfront.iceberg_async_parquet = off;
+    -- Attach the Iceberg catalog in THIS backend before the ALTER references it.
+    -- A pure-DDL backend may not have 'ice' attached yet; create_iceberg_table and
+    -- the INSERT trigger ensure_attached() before their duckdb.raw_query likewise.
+    PERFORM coldfront.ensure_attached();
+    PERFORM coldfront._exec_iceberg_with_claim(p_iceberg_table, ddl);
 END;
 $$;
 
