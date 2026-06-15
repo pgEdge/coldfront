@@ -1653,6 +1653,27 @@ ensure_pg_attached_via_spi(void)
     }
 }
 
+/*
+ * Refuse a RETURNING clause on any write that touches the cold tier.  The cold
+ * tier cannot return affected rows: duckdb-iceberg's binder rejects RETURNING on
+ * Iceberg writes ("not yet supported for updates of a Iceberg table"), and
+ * pg_duckdb's only row-returning entry point (duckdb.query) is SELECT-only.
+ * Erroring here is honest — the alternative is silently returning hot rows only
+ * (dual), a void internal row (cold), or nothing (tiered INSERT).  Hot-only DML
+ * keeps RETURNING (it is plain PG DML); this is called only on the cold/dual
+ * paths.  Revisit when duckdb-iceberg adds RETURNING on writes (see BACKLOG §4).
+ */
+static void
+reject_cold_returning(Query *query, const char *vname)
+{
+    if (query->returningList != NIL)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("RETURNING is not supported for writes to the cold tier of \"%s\"", vname),
+                 errhint("The cold tier (Iceberg) cannot return affected rows — duckdb-iceberg "
+                         "does not support RETURNING on writes. Re-run without RETURNING.")));
+}
+
 /* ---------- hook -------------------------------------------------------- */
 
 static void
@@ -1766,6 +1787,9 @@ coldfront_post_parse_analyze(ParseState *pstate, Query *query,
             }
             else
             {
+                /* A watermark-split INSERT sends some rows to the cold tier,
+                 * which cannot return them — refuse RETURNING rather than drop it. */
+                reject_cold_returning(query, vname);
                 ensure_ice_attached_once();
                 /* The fast cold path streams source rows via pglocal —
                  * needs the postgres ATTACH. The plpgsql cold-loop fast
@@ -1794,6 +1818,7 @@ coldfront_post_parse_analyze(ParseState *pstate, Query *query,
             break;
 
         case TIER_COLD:
+            reject_cold_returning(query, vname);
             ensure_ice_attached_once();
             /* INSERT … SELECT FROM pg_source needs pglocal. Walk the
              * rtable; if any non-result RTE_RELATION is present, the
@@ -1823,6 +1848,10 @@ coldfront_post_parse_analyze(ParseState *pstate, Query *query,
                                  "coldfront.allow_mixed_writes = on to permit a "
                                  "non-atomic dual-tier rewrite.",
                                  info.partition_col, info.partition_col)));
+
+            /* A dual-tier rewrite returns only hot rows; refuse RETURNING rather
+             * than silently return a partial result set. */
+            reject_cold_returning(query, vname);
 
             /* Permissive: clear pg_duckdb's mixed-write guard for this
              * transaction (GUC_ACTION_LOCAL resets it at tx end) and emit

@@ -357,9 +357,14 @@ planner-level takeover, jsonb-as-json, single-node execution, S3
 compatibility, login arming) are in
 [ARCHITECTURE.md → Known Limitations](ARCHITECTURE.md#known-limitations).
 
-1. **Cold RETURNING** — the dual-tier rewrite's cold CTE does not support
-   RETURNING, so `UPDATE events ... RETURNING *` on an ambiguous predicate
-   shows only the hot rows.
+1. **Cold RETURNING** — any write that touches the cold tier (a cold-only
+   UPDATE/DELETE, a permissive dual-tier UPDATE/DELETE, or a watermark-split
+   INSERT) **rejects `RETURNING` with a clear error** rather than returning a
+   partial result.  The cold tier genuinely cannot return affected rows:
+   duckdb-iceberg's binder refuses `RETURNING` on Iceberg writes (*"not yet
+   supported for updates of a Iceberg table"*) and pg_duckdb's row-returning
+   entry point is SELECT-only.  Hot-only DML keeps `RETURNING` (it is plain PG
+   DML).  Revisit when duckdb-iceberg adds write-`RETURNING` upstream.
 
 2. **Command tag** — an ambiguous dual-tier UPDATE returns `SELECT n`
    rather than `UPDATE n`, because the rewrite produces a SELECT wrapper

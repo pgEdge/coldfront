@@ -500,6 +500,10 @@ EOSQL
     # rewrite retargets only the leading reference — see ARCHITECTURE_TIERED).
     local sj; sj=$(q_may "$HOST" "UPDATE events SET status='x' FROM events e2 WHERE events.ts=e2.ts;")
     assert_err "self-join on a tiered view rejected" "more than once" "$sj"
+    # RETURNING that touches the cold tier is rejected (duckdb-iceberg can't return
+    # rows) rather than silently returning a partial/void result.
+    local cr; cr=$(q_may "$HOST" "UPDATE events SET status='x' WHERE ts < '2026-02-01' RETURNING id;")
+    assert_err "cold-tier RETURNING rejected" "cold tier" "$cr"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
