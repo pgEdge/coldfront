@@ -1,12 +1,27 @@
 package main
 
 import (
+	"errors"
+	"fmt"
 	"testing"
 	"time"
 
 	"github.com/pgedge/coldfront/internal/config"
 	"github.com/pgedge/coldfront/internal/partition"
 )
+
+func TestReconcileFailed_BehindIsNonFatalWarning(t *testing.T) {
+	// Behind is self-healed by RunReconcile (the partition covering now is
+	// created during the pass), so it is a non-fatal WARNING — consistent with
+	// the archiver — not a run failure.
+	behind := fmt.Errorf("%w: created it now", partition.ErrBehind)
+	if reconcileFailed("public.events", behind) {
+		t.Fatal("ErrBehind must be a non-fatal warning, not a fatal failure")
+	}
+	if !reconcileFailed("public.events", errors.New("connection refused")) {
+		t.Fatal("a non-behind reconcile error must be fatal")
+	}
+}
 
 func TestSpecFromTable(t *testing.T) {
 	got, err := specFromTable(config.TableConfig{

@@ -8,6 +8,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -23,6 +24,20 @@ import (
 	"github.com/pgedge/coldfront/internal/partcfg"
 	"github.com/pgedge/coldfront/internal/partition"
 )
+
+// reconcileFailed logs a reconcile error and reports whether it should fail the
+// run. A "behind" condition is self-healed by RunReconcile (the partition
+// covering now is created during the pass), so — consistent with the archiver,
+// which logs the same condition non-fatally — it is a WARNING and NOT fatal.
+// Any other reconcile error is fatal.
+func reconcileFailed(parent string, err error) bool {
+	if errors.Is(err, partition.ErrBehind) {
+		log.Printf("[%s] WARNING (self-healed): %v", parent, err)
+		return false
+	}
+	log.Printf("[%s] reconcile: %v", parent, err)
+	return true
+}
 
 func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
@@ -106,16 +121,18 @@ func main() {
 				continue
 			}
 			if err := partition.RunReconcileTwoLevel(ctx, mgr, spec, values, now, nil); err != nil {
-				log.Printf("[%s] reconcile: %v", spec.Parent, err)
-				failed++
+				if reconcileFailed(spec.Parent, err) {
+					failed++
+				}
 				continue
 			}
 			log.Printf("[%s] reconciled %d sub-tree(s) (premake %d, retention %s)", spec.Parent, len(values), spec.Premake, t.RetentionPeriod)
 			continue
 		}
 		if err := partition.RunReconcile(ctx, mgr, spec, now, nil); err != nil {
-			log.Printf("[%s] reconcile: %v", spec.Parent, err)
-			failed++
+			if reconcileFailed(spec.Parent, err) {
+				failed++
+			}
 			continue
 		}
 		log.Printf("[%s] reconciled (premake %d, retention %s)", spec.Parent, spec.Premake, t.RetentionPeriod)
