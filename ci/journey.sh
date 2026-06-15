@@ -40,6 +40,7 @@ AWS_SECRET="${COLDFRONT_AWS_SECRET_KEY:-}"
 AWS_REGION="${COLDFRONT_AWS_REGION:-}"
 ARCHIVER="${ARCHIVER:-./bin/archiver}"
 COMPACTOR="${COMPACTOR:-./bin/compactor}"
+PARTITIONER="${PARTITIONER:-./bin/partitioner}"
 while [ $# -gt 0 ]; do case "$1" in
   --host) HOST="$2"; shift 2;;
   --mode) MODE="$2"; shift 2;;
@@ -54,6 +55,7 @@ while [ $# -gt 0 ]; do case "$1" in
   --azure-conn) AZURE_CONN="$2"; shift 2;;
   --archiver) ARCHIVER="$2"; shift 2;;
   --compactor) COMPACTOR="$2"; shift 2;;
+  --partitioner) PARTITIONER="$2"; shift 2;;
   *) echo "journey.sh: unknown arg $1"; exit 2;;
 esac; done
 [ -n "$HOST" ] || { echo "journey.sh: --host required"; exit 2; }
@@ -1259,6 +1261,58 @@ EOF
     grep -q "source_table: cli_events" /tmp/journey-export.log && pass "export emits cli_events as YAML" || { fail "export missing cli_events"; tail -5 /tmp/journey-export.log; }
 }
 
+# idmode_check <label> <table> <coltype> <id-default> <id-scheme> — provision a
+# partition-only RANGE(id) table, register it id-mode, run the partitioner, then
+# assert it premade id-partitions and a freshly-generated id lands in a live one.
+idmode_check() {
+    local label="$1" tbl="$2" coltype="$3" iddef="$4" scheme="$5"
+    local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
+    printf 'postgres: { dsn: "%s" }\n' "$dsn" > /tmp/journey-part.yaml
+    # Dedicated schema: the partitioner names flat partitions p_YYYY_MM (not
+    # table-scoped), so an id-mode table in public would collide with the events
+    # table's archiver-premade public.p_YYYY_MM (CREATE ... IF NOT EXISTS then
+    # silently skips → 0 children). A private schema keeps idmode.p_YYYY_MM distinct.
+    q "$HOST" "CREATE SCHEMA IF NOT EXISTS idmode; CREATE TABLE IF NOT EXISTS idmode.$tbl (id $coltype NOT NULL DEFAULT $iddef, payload text, PRIMARY KEY (id)) PARTITION BY RANGE (id);" >/dev/null
+    if ! "$PARTITIONER" register --dsn "$dsn" --schema idmode --table "$tbl" --period monthly \
+            --part-mode id --id-scheme "$scheme" --retention "60 months" >"/tmp/journey-$tbl-reg.log" 2>&1; then
+        fail "$label id-mode: register failed"; tail -5 "/tmp/journey-$tbl-reg.log"; return
+    fi
+    if ! "$PARTITIONER" --config /tmp/journey-part.yaml >"/tmp/journey-$tbl-run.log" 2>&1; then
+        fail "$label id-mode: partitioner run failed"; tail -8 "/tmp/journey-$tbl-run.log"; return
+    fi
+    assert_gt "$label id-mode: partitioner premade RANGE(id) partitions" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM pg_inherits WHERE inhparent='idmode.$tbl'::regclass;")"
+    q "$HOST" "INSERT INTO idmode.$tbl (payload) VALUES ('live');" >/dev/null 2>&1
+    assert_eq "$label id-mode: a freshly-generated id landed in a live partition" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM idmode.$tbl WHERE payload='live';")"
+    # Clean up so the SHARED coldfront.partition_config (the partitioner's all-rows
+    # load) stays clean for later stories.
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE schema_name='idmode' AND table_name='$tbl'; DROP TABLE IF EXISTS idmode.$tbl CASCADE;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story — partitioner id-mode (partition-only): RANGE on a time-ordered id.
+# uuidv7() is a PG18 built-in (absent on PG16/17), so the uuidv7 leg runs only
+# where the function exists; snowflake needs the snowflake extension, so it runs
+# only on mesh cells. The partitioner's id-decode is the same Go on every PG
+# version, so the two legs together cover it (PG16/17 vanilla has neither
+# generator and is left uncovered — noted, not silent). probe-snowflake.sh
+# separately cross-checks the snowflake id↔epoch math against the live extension.
+# ───────────────────────────────────────────────────────────────────────────
+story_partitioner_idmode() {
+    local have_uuidv7 schemes=""
+    have_uuidv7=$(q "$HOST" "SELECT count(*) FROM pg_proc WHERE proname='uuidv7' AND pronargs=0;")
+    [ "$have_uuidv7" = 1 ] && schemes="uuidv7"
+    [ "$MESH" = 1 ] && schemes="${schemes:+$schemes + }snowflake"
+    step "Partitioner id-mode: premake RANGE(id), fresh id lands (${schemes:-none on this cell})"
+    if [ "$have_uuidv7" = 1 ]; then
+        idmode_check "uuidv7"    idv7 uuid   "uuidv7()"            uuidv7
+    else
+        note "uuidv7 id-mode: skipped — uuidv7() is a PG18 built-in, absent on this server"
+    fi
+    [ "$MESH" = 1 ] && idmode_check "snowflake" idsf bigint "snowflake.nextval()" snowflake
+}
+
 # ───────────────────────────────────────────────────────────────────────────
 # Story — Enterprise privilege model: a NON-superuser app role, onboarded with a
 # single coldfront.grant_app_access() call, reads AND writes the tiered view
@@ -1324,6 +1378,7 @@ if [ "$MODE" = "tiered" ]; then
     story_coexist
     story_cold_retention
     story_tiered_twolevel
+    story_partitioner_idmode
     story_register_cli
 else
     story_provision_decoupled

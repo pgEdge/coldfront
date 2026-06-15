@@ -227,7 +227,12 @@ case "$SCOPE" in
     # degradation under a Lakekeeper or S3 outage (node + hot tier survive; cold
     # I/O fails cleanly and recovers).
     case " ${PG_ONLY:-18 17 16} " in
-      *" 18 "*) run_cell "ops-hardening (lakekeeper-down, s3-down)" bash "$SCRIPT_DIR/ops.sh" --pg 18 ;;
+      *" 18 "*)
+        run_cell "ops-hardening (lakekeeper-down, s3-down)" bash "$SCRIPT_DIR/ops.sh" --pg 18
+        # Reproducible cross-check of the snowflake id↔epoch math (idmap.go) vs the
+        # live extension — once on pg18 (snowflake is version-agnostic).
+        run_cell "probe-snowflake (id↔epoch cross-check)" bash "$SCRIPT_DIR/probe-snowflake.sh" --pg 18
+        ;;
     esac
     coverage_table
     echo -e "\n  NOTE: s3 (SeaweedFS) is hermetic and always RUN; the real cloud stores aws/azure/gcs RUN only when their COLDFRONT_* creds are present, else PENDING (tracked, never skipped silently)."
