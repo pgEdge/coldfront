@@ -39,16 +39,22 @@ type Boundary interface {
 // byte-for-byte.
 type TimeBoundary struct{}
 
+// Literal renders t as a quoted timestamptz bound.
 func (TimeBoundary) Literal(t time.Time) string {
 	return "'" + t.Format("2006-01-02 15:04:05+00") + "'"
 }
+
+// Parse reads a (possibly quoted) timestamp bound back to its time.
 func (TimeBoundary) Parse(lit string) (time.Time, error) { return parseTimestamp(unquote(lit)) }
 
 // UUIDv7Boundary partitions by RANGE on a uuid column holding UUIDv7 values; the
 // bound is the canonical uuid that lower-bounds every v7 generated at t.
 type UUIDv7Boundary struct{}
 
-func (UUIDv7Boundary) Literal(t time.Time) string          { return "'" + MinUUIDv7Bound(t) + "'" }
+// Literal renders the lowest UUIDv7 generated at t as a quoted uuid bound.
+func (UUIDv7Boundary) Literal(t time.Time) string { return "'" + MinUUIDv7Bound(t) + "'" }
+
+// Parse recovers the time embedded in a (possibly quoted) UUIDv7 bound.
 func (UUIDv7Boundary) Parse(lit string) (time.Time, error) { return TimeFromUUIDv7(unquote(lit)) }
 
 // SnowflakeBoundary partitions by RANGE on a bigint column holding pgEdge
@@ -56,9 +62,12 @@ func (UUIDv7Boundary) Parse(lit string) (time.Time, error) { return TimeFromUUID
 // integer literal.
 type SnowflakeBoundary struct{}
 
+// Literal renders the smallest snowflake at t as a bare integer bound.
 func (SnowflakeBoundary) Literal(t time.Time) string {
 	return strconv.FormatInt(MinSnowflakeBound(t), 10)
 }
+
+// Parse recovers the time from a (possibly quoted) snowflake integer bound.
 func (SnowflakeBoundary) Parse(lit string) (time.Time, error) {
 	v, err := strconv.ParseInt(unquote(lit), 10, 64)
 	if err != nil {
