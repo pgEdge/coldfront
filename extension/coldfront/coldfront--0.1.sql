@@ -192,14 +192,18 @@ BEGIN
       'AUTHORIZATION_TYPE NONE, ACCESS_DELEGATION_MODE NONE)',
       wh, ep
     ));
-    -- Use DuckDB's BUNDLED httpfs client (cpp-httplib + mbedtls), not the
-    -- system-libcurl one DuckDB 1.5 defaults to. The libcurl client's threaded
-    -- DNS resolver calls glibc getaddrinfo, whose IPv6 check_pf() netlink probe
-    -- aborts the backend (SIGABRT) under concurrent resolution of an object-store
-    -- HOSTNAME (e.g. GCS @ storage.googleapis.com) — bare-IP stores (SeaweedFS)
-    -- never hit it. The bundled client (what pg_duckdb 1.1.1 used) has no such
-    -- failure. Run AFTER the ATTACH so iceberg/httpfs are loaded and the setting
-    -- is registered; GLOBAL = this backend's DuckDB instance; idempotent.
+    -- Pin DuckDB's BUNDLED httpfs client (cpp-httplib + mbedtls), not the system
+    -- libcurl DuckDB 1.5 defaults to. DuckDB 1.5 links system libcurl 8.11.1, which
+    -- carries CVE-2025-0665: the threaded resolver double-closes an fd after a name
+    -- resolve. Under a copy-on-write Iceberg DELETE's concurrent S3 connections that
+    -- stray close lands on the netlink fd a sibling getaddrinfo (glibc check_pf,
+    -- AI_ADDRCONFIG) just opened → EBADF → glibc aborts the whole backend (SIGABRT).
+    -- Only against an object-store HOSTNAME (AWS S3, GCS); bare-IP stores (SeaweedFS)
+    -- skip getaddrinfo, which is why CI never hit it. httplib resolves in-thread (no
+    -- resolver-thread churn) so DuckDB stays fully parallel. This SET is the SINGLE
+    -- home of the httplib pin — cmd/archiver calls ensure_attached() to reuse it.
+    -- Why: https://curl.se/docs/CVE-2025-0665.html
+    -- Run AFTER the ATTACH (httpfs loaded); GLOBAL = this backend's instance; idempotent.
     PERFORM duckdb.raw_query($q$SET GLOBAL httpfs_client_implementation = 'httplib'$q$);
   END IF;
 END;
