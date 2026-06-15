@@ -178,6 +178,7 @@ static bool coldfront_ice_attached = false;
  * Off: ereport(ERROR) and force the caller to narrow the predicate.
  */
 static bool coldfront_allow_mixed_writes = true;
+static int  coldfront_cold_write_batch_size = 10000;
 
 /*
  * GUCs: the deployment-config endpoint/DSN strings that ensure_attached() /
@@ -2549,6 +2550,20 @@ _PG_init(void)
         true,           /* boot_val: permissive by default */
         PGC_USERSET,
         0,              /* flags */
+        NULL, NULL, NULL);
+
+    DefineCustomIntVariable(
+        "coldfront.cold_write_batch_size",
+        "Rows per cold-tier Iceberg flush batch in coldfront._tiered_insert_cold.",
+        "Each batch_size rows the tiered INSERT flushes one duckdb.raw_query — one "
+        "Iceberg append / Parquet file. Larger means fewer, bigger files; the "
+        "trailing remainder always flushes, so a small write stays a single file.",
+        &coldfront_cold_write_batch_size,
+        10000,              /* boot_val */
+        1,                  /* min */
+        PG_INT32_MAX,       /* max */
+        PGC_USERSET,
+        0,
         NULL, NULL, NULL);
 
     /*

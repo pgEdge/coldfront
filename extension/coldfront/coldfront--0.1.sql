@@ -684,7 +684,7 @@ DECLARE
     -- Larger ⇒ far fewer, larger files; the only cost is the in-memory VALUES
     -- string per flush. The sub-threshold remainder is always flushed after the
     -- loop (see below), so a small write is one file and is never lost.
-    batch_size      int  := 10000;
+    batch_size      int  := current_setting('coldfront.cold_write_batch_size')::int;  -- GUC, default 10000
     i               int;
     col             text;
     my_ticket       bigint;
