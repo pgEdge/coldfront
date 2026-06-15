@@ -241,20 +241,10 @@ func (c *Config) Validate() error {
 			if t.HotPeriod == "" {
 				return fmt.Errorf("archiver.tables[%d].hot_period is required in tiered mode", i)
 			}
-			hotDur, err := partition.ParseRetention(t.HotPeriod)
-			if err != nil {
-				return fmt.Errorf("archiver.tables[%d].hot_period: %w", i, err)
-			}
-			if t.RetentionPeriod != "" {
-				retDur, err := partition.ParseRetention(t.RetentionPeriod)
-				if err != nil {
-					return fmt.Errorf("archiver.tables[%d].retention_period: %w", i, err)
-				}
-				if retDur <= hotDur {
-					return fmt.Errorf("archiver.tables[%d].retention_period (%s) must exceed hot_period (%s)",
-						i, t.RetentionPeriod, t.HotPeriod)
-				}
-			}
+			// Interval syntax and the retention>hot ordering are PostgreSQL interval
+			// semantics (calendar-aware), so they're validated against a live
+			// connection — partition.ValidatePeriods, run at register time and at
+			// binary startup. config.Load has no DB, so it only enforces presence.
 		} else {
 			if t.HotPeriod != "" {
 				return fmt.Errorf("archiver.tables[%d].hot_period is only valid in tiered mode (no iceberg/s3 configured)", i)

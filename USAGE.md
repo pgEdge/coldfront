@@ -179,7 +179,7 @@ archiver:
     - source_table: events
       partition_column: ts
       partition_period: monthly        # monthly | daily
-      retention_period: 12 months      # N days|weeks|months|years
+      retention_period: 12 months      # any PostgreSQL interval (12 months, 90 days, 1 year)
       future_partitions: 3             # premake window kept ahead of now
       expiration_strategy: drop         # drop (DETACH+DROP, destroy; default)
                                        #   | detach (DETACH only, keep as a
@@ -210,9 +210,10 @@ free):
   shrinking `retention_period`. Set `expiration_strategy: detach` to instead leave
   the expired partition as a standalone table (detached from the parent, data
   preserved) and reclaim it yourself. A partition is expired only once its
-  *entire* range is older than `now − retention_period` (months/years are
-  approximate: 30/365 days). `detach` is partition-only — the tiered archiver
-  always drops after exporting to cold.
+  *entire* range is older than `now − retention_period`, computed with
+  calendar-accurate PostgreSQL interval arithmetic (a real month, leap years
+  correct). `detach` is partition-only — the tiered archiver always drops after
+  exporting to cold.
 
 ### Primary keys on time-partitioned tables (id mode)
 

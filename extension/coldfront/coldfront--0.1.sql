@@ -126,19 +126,22 @@ CREATE TABLE IF NOT EXISTS coldfront.storage_secret (
 -- ride the replication stream. Mirrored by partcfg.EnsureTable so the vanilla
 -- partitioner (stock PG, no extension) can self-materialize it.
 --
--- Period columns are text ('3 months') for now, matching ParseRetention;
--- a later increment may migrate them to native interval. The retention>hot
--- invariant therefore stays a code-side check (text comparison is meaningless).
+-- hot_period/retention_period are native PostgreSQL `interval` columns: the
+-- column type validates the value on write, and cutoffs are computed in-DB with
+-- calendar-accurate interval arithmetic (now() - period). The retention>hot
+-- invariant is operator-config policy, enforced at the register/CLI boundary
+-- (partition.ValidatePeriods), not a CHECK — see partition_period below, which
+-- stays text because it is a cadence enum, not a duration.
 CREATE TABLE IF NOT EXISTS coldfront.partition_config (
-    schema_name            text    NOT NULL DEFAULT 'public',
-    table_name             text    NOT NULL,
-    partition_period       text    NOT NULL,
+    schema_name            text     NOT NULL DEFAULT 'public',
+    table_name             text     NOT NULL,
+    partition_period       text     NOT NULL,                 -- cadence enum ('monthly'/'daily'), NOT a duration
     partition_column       text,                              -- NULL ⇒ auto-detect (flat only)
-    future_partitions      int     NOT NULL DEFAULT 3,
-    part_mode              text    NOT NULL DEFAULT 'timestamp',
+    future_partitions      int      NOT NULL DEFAULT 3,
+    part_mode              text     NOT NULL DEFAULT 'timestamp',
     id_scheme              text,
-    hot_period             text,                              -- NULL ⇒ partition-only; set ⇒ tiered
-    retention_period       text,
+    hot_period             interval,                          -- NULL ⇒ partition-only; set ⇒ tiered
+    retention_period       interval,
     sub_part_values_source text,                              -- NULL ⇒ flat; set ⇒ 2-level LIST→RANGE
     expiration_strategy     text    NOT NULL DEFAULT 'drop',   -- partitioner expiry: 'drop' (destroy) | 'detach' (preserve)
     enabled                boolean NOT NULL DEFAULT true,

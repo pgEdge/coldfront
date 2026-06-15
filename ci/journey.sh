@@ -1306,6 +1306,24 @@ EOSQL
         grep -qi "must exceed" /tmp/journey-rethot.log && pass "register rejects retention <= hot-period" || { fail "wrong reason"; tail -3 /tmp/journey-rethot.log; }
     fi
 
+    # Periods are native PG intervals: a compound form the old "N unit" parser
+    # could never accept now validates (proves the textual parser is gone). --dry-run
+    # runs the full conn-backed validation (interval cast) but writes no row.
+    if "$ARCHIVER" register --config /tmp/journey-archiver.yaml --table cli_events \
+            --period monthly --retention "1 year 2 mons" --dry-run >/tmp/journey-iv.log 2>&1; then
+        pass "register accepts a native PG interval (\"1 year 2 mons\")"
+    else
+        fail "register rejected a valid PG interval"; tail -3 /tmp/journey-iv.log
+    fi
+    # A non-interval value is rejected by the interval validation (the column type
+    # is the write-time backstop; ValidatePeriods gives the clean error first).
+    if "$ARCHIVER" register --config /tmp/journey-archiver.yaml --table cli_events \
+            --period monthly --retention "banana" --dry-run >/tmp/journey-badiv.log 2>&1; then
+        fail "register should reject a non-interval retention"
+    else
+        grep -qi "interval" /tmp/journey-badiv.log && pass "register rejects a non-interval period" || { fail "wrong reason"; tail -3 /tmp/journey-badiv.log; }
+    fi
+
     # Run the archiver with a connection-only YAML (NO archiver.tables): it must
     # drive entirely off coldfront.partition_config.
     cat > /tmp/journey-conn.yaml <<EOF

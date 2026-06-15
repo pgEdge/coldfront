@@ -242,6 +242,17 @@ func (m *Manager) Detach(ctx context.Context, parent, schema, partName string) e
 	return nil
 }
 
+// ExpiryCutoff resolves now - interval in Postgres so calendar months/years are
+// exact (a real month, leap days, DST). The interval is a bound parameter, never
+// concatenated. Returns the instant before which a partition has expired.
+func (m *Manager) ExpiryCutoff(ctx context.Context, now time.Time, interval string) (time.Time, error) {
+	var cutoff time.Time
+	if err := m.db.QueryRow(ctx, `SELECT $1::timestamptz - $2::interval`, now, interval).Scan(&cutoff); err != nil {
+		return time.Time{}, fmt.Errorf("resolve cutoff (now - %q): %w", interval, err)
+	}
+	return cutoff, nil
+}
+
 // Drop drops a partition table.
 func (m *Manager) Drop(ctx context.Context, schema, partName string) error {
 	sql := fmt.Sprintf(`DROP TABLE IF EXISTS %s`,

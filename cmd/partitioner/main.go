@@ -102,6 +102,13 @@ func main() {
 	if err := cfg.Validate(); err != nil {
 		log.Fatalf("config invalid: %v", err)
 	}
+	// Period syntax + retention>hot ordering are PostgreSQL interval semantics,
+	// so they're validated here against the live connection (config.Load can't).
+	for _, t := range cfg.Archiver.Tables {
+		if err := partition.ValidatePeriods(ctx, conn, t.HotPeriod, t.RetentionPeriod); err != nil {
+			log.Fatalf("[%s] %v", t.SourceTable, err)
+		}
+	}
 
 	mgr := partition.NewManager(conn)
 	now := time.Now().UTC()
@@ -142,26 +149,25 @@ func main() {
 	}
 }
 
-// specFromTable maps one configured table onto a partition.Spec, parsing the
-// retention string. Kept pure + table-tested; main() only wires config + conn.
+// specFromTable maps one configured table onto a partition.Spec. The retention
+// period is carried verbatim as a PostgreSQL interval literal; the cutoff is
+// resolved later in Postgres (Manager.ExpiryCutoff), and interval validity is
+// enforced against a live connection (partition.ValidatePeriods), so there is no
+// Go-side parsing here. Kept pure + table-tested; main() only wires config + conn.
 func specFromTable(t config.TableConfig) (partition.Spec, error) {
-	retention, err := partition.ParseRetention(t.RetentionPeriod)
-	if err != nil {
-		return partition.Spec{}, err
-	}
 	boundary, err := partition.BoundaryFor(t.PartMode, t.IDScheme)
 	if err != nil {
 		return partition.Spec{}, err
 	}
 	return partition.Spec{
-		Parent:    t.SourceTable,
-		Schema:    t.SourceSchema,
-		Column:    t.PartitionColumn,
-		Period:    t.PartitionPeriod,
-		Premake:   t.FuturePartitions,
-		Retention: retention,
-		Boundary:  boundary,
-		Strategy:  t.ExpirationStrategy,
+		Parent:            t.SourceTable,
+		Schema:            t.SourceSchema,
+		Column:            t.PartitionColumn,
+		Period:            t.PartitionPeriod,
+		Premake:           t.FuturePartitions,
+		RetentionInterval: t.RetentionPeriod,
+		Boundary:          boundary,
+		Strategy:          t.ExpirationStrategy,
 	}, nil
 }
 

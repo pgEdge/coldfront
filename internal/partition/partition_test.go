@@ -317,6 +317,32 @@ func TestDrop(t *testing.T) {
 	assert.Contains(t, db.execSQL[0], `"public"."p_2025_11"`)
 }
 
+// ExpiryCutoff resolves the cutoff in Postgres (now - interval) so calendar
+// months/years are exact — never Go duration math. White-box: assert the SQL
+// shape, that the interval is a bound parameter (not concatenated), and that the
+// scanned timestamptz is returned. (Calendar correctness itself is PostgreSQL's,
+// exercised live in ci/journey.sh.)
+func TestExpiryCutoff(t *testing.T) {
+	want := time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC)
+	var gotSQL string
+	var gotArgs []any
+	db := &mockDB{rowFunc: func(_ context.Context, sql string, args ...any) pgx.Row {
+		gotSQL = sql
+		gotArgs = args
+		return &mockRow{scanFunc: func(dest ...any) error { *(dest[0].(*time.Time)) = want; return nil }}
+	}}
+	m := NewManager(db)
+	now := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
+	got, err := m.ExpiryCutoff(context.Background(), now, "3 months")
+	require.NoError(t, err)
+	assert.True(t, got.Equal(want), "cutoff = %v, want %v", got, want)
+	assert.Contains(t, gotSQL, "::timestamptz")
+	assert.Contains(t, gotSQL, "::interval")
+	require.Len(t, gotArgs, 2)
+	assert.Equal(t, now, gotArgs[0])
+	assert.Equal(t, "3 months", gotArgs[1]) // interval is parameterized, not concatenated
+}
+
 // Complex identifiers: hyphens in schema / partition name must be quoted;
 // locks in the contract that partition.Manager uses pgx.Identifier end-to-end.
 func TestDrop_ComplexIdentifiers(t *testing.T) {

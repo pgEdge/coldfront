@@ -4,7 +4,6 @@ import (
 	"errors"
 	"fmt"
 	"testing"
-	"time"
 
 	"github.com/pgedge/coldfront/internal/config"
 	"github.com/pgedge/coldfront/internal/partition"
@@ -39,14 +38,13 @@ func TestSpecFromTable(t *testing.T) {
 		got.Period != partition.PeriodMonthly || got.Premake != 3 {
 		t.Fatalf("unexpected spec: %+v", got)
 	}
-	if want := 12 * 30 * 24 * time.Hour; got.Retention != want {
-		t.Fatalf("retention = %v, want %v", got.Retention, want)
-	}
-}
-
-func TestSpecFromTable_BadRetention(t *testing.T) {
-	if _, err := specFromTable(config.TableConfig{RetentionPeriod: "soon"}); err == nil {
-		t.Fatal("expected error for bad retention string")
+	// specFromTable no longer parses the period — it carries the raw PG interval
+	// literal onto the Spec verbatim; the cutoff is resolved later in Postgres
+	// (Manager.ExpiryCutoff). Interval *validity* is Postgres's call, enforced at
+	// register/startup (partition.ValidatePeriods) and exercised in ci/journey.sh,
+	// so there is no Go-side "bad retention string" rejection here anymore.
+	if got.RetentionInterval != "12 months" {
+		t.Fatalf("retention interval = %q, want %q", got.RetentionInterval, "12 months")
 	}
 }
 

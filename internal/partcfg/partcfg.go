@@ -38,8 +38,8 @@ CREATE TABLE IF NOT EXISTS coldfront.partition_config (
     future_partitions      int     NOT NULL DEFAULT 3,
     part_mode              text    NOT NULL DEFAULT 'timestamp',
     id_scheme              text,
-    hot_period             text,
-    retention_period       text,
+    hot_period             interval,
+    retention_period       interval,
     sub_part_values_source text,
     expiration_strategy     text    NOT NULL DEFAULT 'drop',
     enabled                boolean NOT NULL DEFAULT true,
@@ -128,8 +128,8 @@ func ResolveTables(ctx context.Context, db DBTX, yamlFallback []config.TableConf
 func LoadTables(ctx context.Context, db DBTX) ([]config.TableConfig, error) {
 	rows, err := db.Query(ctx, `
 		SELECT schema_name, table_name, partition_period, partition_column,
-		       future_partitions, part_mode, id_scheme, hot_period,
-		       retention_period, sub_part_values_source, expiration_strategy
+		       future_partitions, part_mode, id_scheme, hot_period::text,
+		       retention_period::text, sub_part_values_source, expiration_strategy
 		FROM coldfront.partition_config
 		WHERE enabled
 		ORDER BY schema_name, table_name`)

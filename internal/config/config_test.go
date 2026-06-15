@@ -319,12 +319,10 @@ func TestValidate_TieredColdRetentionOK(t *testing.T) {
 	assert.Equal(t, "12 months", c.Archiver.Tables[0].RetentionPeriod)
 }
 
-func TestValidate_TieredRetentionMustExceedHot(t *testing.T) {
-	// retention_period <= hot_period would destroy data before it ever tiers.
-	_, err := Load(writeConfig(t, tieredCfg("      hot_period: \"3 months\"\n      retention_period: \"1 month\"")))
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "must exceed hot_period")
-}
+// retention_period > hot_period is a PostgreSQL interval comparison now
+// (calendar-aware), so it can't be checked in config.Load (no DB connection). It
+// moves to partition.ValidatePeriods, run against a live conn at register time
+// and at binary startup — exercised end-to-end in ci/journey.sh.
 
 func TestValidate_TieredRejectsIdMode(t *testing.T) {
 	// id mode is a partition-only feature; the cold tier is time-only.

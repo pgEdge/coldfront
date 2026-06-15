@@ -13,14 +13,17 @@ import (
 // the ordered sequence of lifecycle calls RunReconcile makes, and can inject
 // errors and a canned expired set.
 type fakeLifecycle struct {
-	log       []string
-	expired   []Info
-	gotCutoff time.Time
-	behind    bool // canned EnsureCurrent return
-	ensureErr error
-	findErr   error
-	detachErr error
-	dropErr   error
+	log          []string
+	expired      []Info
+	gotCutoff    time.Time
+	gotInterval  string    // interval RunReconcile passed to ExpiryCutoff
+	cutoffReturn time.Time // what ExpiryCutoff hands back (the resolved cutoff)
+	cutoffErr    error
+	behind       bool // canned EnsureCurrent return
+	ensureErr    error
+	findErr      error
+	detachErr    error
+	dropErr      error
 }
 
 func (f *fakeLifecycle) EnsureFuture(_ context.Context, parent, schema, column, period string, count int, _ time.Time, _ Boundary, leafPrefix string) error {
@@ -43,6 +46,12 @@ func (f *fakeLifecycle) EnsureListChild(_ context.Context, parent, schema, listV
 	f.log = append(f.log, fmt.Sprintf("listchild %s.%s in=%s range=%s", schema, childName, listValue, rangeCol))
 	return f.ensureErr
 }
+func (f *fakeLifecycle) ExpiryCutoff(_ context.Context, _ time.Time, interval string) (time.Time, error) {
+	// Records the interval RunReconcile resolved and hands back a canned cutoff —
+	// the calendar arithmetic itself is PostgreSQL's (covered live in ci/journey.sh).
+	f.gotInterval = interval
+	return f.cutoffReturn, f.cutoffErr
+}
 func (f *fakeLifecycle) FindExpired(_ context.Context, parent, schema string, cutoff time.Time, _ Boundary) ([]Info, error) {
 	f.gotCutoff = cutoff
 	f.log = append(f.log, fmt.Sprintf("find %s.%s", schema, parent))
@@ -60,7 +69,7 @@ func (f *fakeLifecycle) Drop(_ context.Context, _, partName string) error {
 func testSpec() Spec {
 	return Spec{
 		Parent: "events", Schema: "public", Column: "ts",
-		Period: PeriodMonthly, Premake: 3, Retention: 90 * 24 * time.Hour,
+		Period: PeriodMonthly, Premake: 3, RetentionInterval: "90 days",
 	}
 }
 
@@ -166,14 +175,43 @@ func TestRunReconcileTwoLevel_BehindSubtreeDoesNotBlockSiblings(t *testing.T) {
 	}
 }
 
-func TestRunReconcile_CutoffIsNowMinusRetention(t *testing.T) {
-	f := &fakeLifecycle{}
+// RunReconcile must resolve the expiry cutoff through ExpiryCutoff (PostgreSQL
+// interval arithmetic) using Spec.RetentionInterval, and feed THAT result to
+// FindExpired — never compute now-duration in Go. We assert the wiring: the
+// interval flows to ExpiryCutoff, and ExpiryCutoff's return reaches FindExpired.
+func TestRunReconcile_CutoffFromExpiryInterval(t *testing.T) {
+	resolved := time.Date(2026, 3, 3, 0, 0, 0, 0, time.UTC)
+	f := &fakeLifecycle{cutoffReturn: resolved}
 	now := time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)
 	if err := RunReconcile(context.Background(), f, testSpec(), now, nil); err != nil {
 		t.Fatal(err)
 	}
-	if want := now.Add(-90 * 24 * time.Hour); !f.gotCutoff.Equal(want) {
-		t.Fatalf("cutoff = %v, want %v", f.gotCutoff, want)
+	if f.gotInterval != "90 days" {
+		t.Fatalf("ExpiryCutoff interval = %q, want %q", f.gotInterval, "90 days")
+	}
+	if !f.gotCutoff.Equal(resolved) {
+		t.Fatalf("FindExpired cutoff = %v, want ExpiryCutoff's return %v", f.gotCutoff, resolved)
+	}
+}
+
+// An empty RetentionInterval (no destroy boundary on this spec) must skip the
+// whole expiry path: no cutoff resolution, no FindExpired, no detach/drop. (A
+// real partitioner table always sets retention; this guards the zero case and
+// avoids handing ”::interval to Postgres.)
+func TestRunReconcile_NoRetentionSkipsExpiry(t *testing.T) {
+	f := &fakeLifecycle{expired: []Info{{Name: "p_old"}}}
+	s := testSpec()
+	s.RetentionInterval = ""
+	if err := RunReconcile(context.Background(), f, s, time.Now(), nil); err != nil {
+		t.Fatal(err)
+	}
+	if f.gotInterval != "" {
+		t.Fatalf("ExpiryCutoff must not be called for empty retention, got interval %q", f.gotInterval)
+	}
+	for _, c := range f.log {
+		if strings.HasPrefix(c, "find") || strings.HasPrefix(c, "detach") || strings.HasPrefix(c, "drop") {
+			t.Fatalf("empty retention must skip expiry, got %v", f.log)
+		}
 	}
 }
 
@@ -184,39 +222,5 @@ func TestRunReconcile_EnsureErrorStopsBeforeFind(t *testing.T) {
 	}
 	if len(f.log) != 1 {
 		t.Fatalf("expected to stop after ensure, got %v", f.log)
-	}
-}
-
-func TestParseRetention(t *testing.T) {
-	tests := []struct {
-		input string
-		hours int
-		err   bool
-	}{
-		{"1 day", 24, false},
-		{"7 days", 168, false},
-		{"1 month", 720, false},
-		{"3 months", 2160, false},
-		{"1 year", 8760, false},
-		{"2 weeks", 336, false},
-		{"bad", 0, true},
-		{"1 fortnight", 0, true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.input, func(t *testing.T) {
-			d, err := ParseRetention(tt.input)
-			if tt.err {
-				if err == nil {
-					t.Fatalf("expected error for %q", tt.input)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatalf("unexpected error: %v", err)
-			}
-			if int(d.Hours()) != tt.hours {
-				t.Fatalf("%q: got %d hours, want %d", tt.input, int(d.Hours()), tt.hours)
-			}
-		})
 	}
 }

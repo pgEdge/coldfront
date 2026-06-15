@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"time"
+
+	"github.com/jackc/pgx/v5"
 )
 
 // ErrBehind reports that premake had fallen behind: the table already had a
@@ -19,15 +21,15 @@ var ErrBehind = errors.New("premake fell behind")
 // pass needs. An upper layer (or a standalone manager) maps its own per-table
 // config onto this; the partition core stays agnostic about where it came from.
 type Spec struct {
-	Parent     string        // the partitioned table
-	Schema     string        // its schema
-	Column     string        // the RANGE key column
-	Period     string        // PeriodMonthly | PeriodDaily
-	Premake    int           // future partitions kept ahead of now
-	Retention  time.Duration // expire partitions whose upper bound is older than now-Retention
-	Boundary   Boundary      // how the RANGE key maps to time; nil means TimeBoundary
-	LeafPrefix string        // prepended to leaf names; "" for single-level (set per-child in 2-level)
-	Strategy   string        // StrategyDrop (default, ""⇒drop) or StrategyDetach; default-path expiry only
+	Parent            string   // the partitioned table
+	Schema            string   // its schema
+	Column            string   // the RANGE key column
+	Period            string   // PeriodMonthly | PeriodDaily
+	Premake           int      // future partitions kept ahead of now
+	RetentionInterval string   // a PostgreSQL interval ("90 days", "1 year"); expire partitions older than now - this. "" ⇒ no expiry.
+	Boundary          Boundary // how the RANGE key maps to time; nil means TimeBoundary
+	LeafPrefix        string   // prepended to leaf names; "" for single-level (set per-child in 2-level)
+	Strategy          string   // StrategyDrop (default, ""⇒drop) or StrategyDetach; default-path expiry only
 }
 
 // boundary returns the Spec's Boundary, defaulting to time-mode so a zero Spec
@@ -45,6 +47,11 @@ func (s Spec) boundary() Boundary {
 type Lifecycle interface {
 	EnsureFuture(ctx context.Context, parent, schema, column, period string, count int, now time.Time, b Boundary, leafPrefix string) error
 	EnsureCurrent(ctx context.Context, parent, schema, period string, now time.Time, b Boundary, leafPrefix string) (behind bool, err error)
+	// ExpiryCutoff resolves now - interval using PostgreSQL interval arithmetic
+	// (calendar-accurate: real months/years, leap days), returning the instant
+	// before which partitions have expired. Done in the DB, never in Go, so a
+	// free-form PG interval never has to round-trip through a time.Duration.
+	ExpiryCutoff(ctx context.Context, now time.Time, interval string) (time.Time, error)
 	FindExpired(ctx context.Context, parent, schema string, cutoff time.Time, b Boundary) ([]Info, error)
 	Detach(ctx context.Context, parent, schema, partName string) error
 	Drop(ctx context.Context, schema, partName string) error
@@ -78,9 +85,19 @@ func RunReconcile(ctx context.Context, lc Lifecycle, s Spec, now time.Time, expi
 	if err != nil {
 		return fmt.Errorf("ensure current %s.%s: %w", s.Schema, s.Parent, err)
 	}
-	expired, err := lc.FindExpired(ctx, s.Parent, s.Schema, now.Add(-s.Retention), b)
-	if err != nil {
-		return fmt.Errorf("find expired %s.%s: %w", s.Schema, s.Parent, err)
+	// Resolve the expiry cutoff in Postgres (calendar-accurate now - interval).
+	// An empty interval means no destroy boundary on this spec: skip expiry
+	// entirely (and never hand ''::interval to Postgres).
+	var expired []Info
+	if s.RetentionInterval != "" {
+		cutoff, err := lc.ExpiryCutoff(ctx, now, s.RetentionInterval)
+		if err != nil {
+			return fmt.Errorf("retention cutoff %s.%s: %w", s.Schema, s.Parent, err)
+		}
+		expired, err = lc.FindExpired(ctx, s.Parent, s.Schema, cutoff, b)
+		if err != nil {
+			return fmt.Errorf("find expired %s.%s: %w", s.Schema, s.Parent, err)
+		}
 	}
 	for _, p := range expired {
 		if expire != nil {
@@ -108,26 +125,50 @@ func RunReconcile(ctx context.Context, lc Lifecycle, s Spec, now time.Time, expi
 	return nil
 }
 
-// ParseRetention parses a "N unit" string ("3 months", "7 days", "2 weeks",
-// "1 year") into a Duration, using approximate 30-day months and 365-day years.
-// Good enough for retention comparisons — the cutoff need only land safely
-// within the target period; exact PG interval arithmetic is not required.
-func ParseRetention(s string) (time.Duration, error) {
-	var n int
-	var unit string
-	if _, err := fmt.Sscanf(s, "%d %s", &n, &unit); err != nil {
-		return 0, fmt.Errorf("invalid interval %q: expected \"N unit\"", s)
+// RowQuerier is the one-row query surface ValidatePeriods needs — satisfied by
+// *pgx.Conn, a pool, and partition.DBTX. Keeps the validator usable from both
+// the CLI (a bare conn) and the binaries (the Manager's handle) without dragging
+// in a concrete DB type.
+type RowQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// ValidatePeriods enforces the lifecycle-period rules that are PostgreSQL
+// interval semantics, not Go's: each non-empty value must be a valid PG interval
+// ("1 mon", "90 days", "1 year 2 mons", …), and when both are set retention must
+// strictly exceed hot (a retention shorter than the hot window would destroy
+// data before it ever tiers). Both checks run in one round-trip — the casts
+// validate syntax and the comparison validates ordering. Empty means "unset".
+// This is the single home for period validation (register, set, binary startup);
+// the interval column type is the backstop for any write that bypasses it.
+func ValidatePeriods(ctx context.Context, q RowQuerier, hot, retention string) error {
+	switch {
+	case hot != "" && retention != "":
+		var ok bool
+		if err := q.QueryRow(ctx, `SELECT $1::interval > $2::interval`, retention, hot).Scan(&ok); err != nil {
+			return fmt.Errorf("invalid hot_period (%q) or retention_period (%q): %w", hot, retention, err)
+		}
+		if !ok {
+			return fmt.Errorf("retention_period (%s) must exceed hot_period (%s)", retention, hot)
+		}
+	case hot != "":
+		if err := validInterval(ctx, q, "hot_period", hot); err != nil {
+			return err
+		}
+	case retention != "":
+		if err := validInterval(ctx, q, "retention_period", retention); err != nil {
+			return err
+		}
 	}
-	switch unit {
-	case "day", "days":
-		return time.Duration(n) * 24 * time.Hour, nil
-	case "week", "weeks":
-		return time.Duration(n) * 7 * 24 * time.Hour, nil
-	case "month", "months":
-		return time.Duration(n) * 30 * 24 * time.Hour, nil
-	case "year", "years":
-		return time.Duration(n) * 365 * 24 * time.Hour, nil
-	default:
-		return 0, fmt.Errorf("unsupported interval unit %q", unit)
+	return nil
+}
+
+// validInterval confirms v parses as a PostgreSQL interval (the ::interval cast
+// raises otherwise), naming the field in the error.
+func validInterval(ctx context.Context, q RowQuerier, field, v string) error {
+	var ok bool
+	if err := q.QueryRow(ctx, `SELECT ($1::interval) IS NOT NULL`, v).Scan(&ok); err != nil {
+		return fmt.Errorf("invalid %s interval %q: %w", field, v, err)
 	}
+	return nil
 }

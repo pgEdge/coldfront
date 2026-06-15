@@ -109,6 +109,13 @@ func main() {
 	for i := range cfg.Archiver.Tables {
 		t := &cfg.Archiver.Tables[i]
 
+		// Period syntax + retention>hot ordering are PostgreSQL interval semantics
+		// (calendar-aware), so they're validated here against the live connection —
+		// config.Load (no DB) only checks presence.
+		if err := partition.ValidatePeriods(ctx, conn, t.HotPeriod, t.RetentionPeriod); err != nil {
+			log.Fatalf("[%s] %v", t.SourceTable, err)
+		}
+
 		// Flat single-level tables: reject sub-partitioning and auto-detect the
 		// time column. 2-level (sub_partition) tables are LIST→RANGE by design
 		// and carry an explicit partition_column (the RANGE/time key), required
@@ -342,11 +349,11 @@ func runCycle(ctx context.Context, cfg *config.Config, t *config.TableConfig, co
 	}
 
 	// 2. Find partitions past the hot window — the tier-to-cold candidates.
-	hot, err := partition.ParseRetention(t.HotPeriod)
+	hotCutoff, err := partMgr.ExpiryCutoff(ctx, now, t.HotPeriod)
 	if err != nil {
-		return fmt.Errorf("parse hot_period: %w", err)
+		return fmt.Errorf("hot cutoff: %w", err)
 	}
-	hotExpired, err := partMgr.FindExpired(ctx, tableName, t.SourceSchema, now.Add(-hot), partition.TimeBoundary{})
+	hotExpired, err := partMgr.FindExpired(ctx, tableName, t.SourceSchema, hotCutoff, partition.TimeBoundary{})
 	if err != nil {
 		return fmt.Errorf("find expired: %w", err)
 	}
@@ -447,11 +454,10 @@ func runCycle(ctx context.Context, cfg *config.Config, t *config.TableConfig, co
 
 	// 5. Cold-expiry pass: drop Iceberg data older than retention_period.
 	if coldExpiry {
-		retention, err := partition.ParseRetention(t.RetentionPeriod)
+		cutoff, err := partMgr.ExpiryCutoff(ctx, now, t.RetentionPeriod)
 		if err != nil {
-			return fmt.Errorf("parse retention_period: %w", err)
+			return fmt.Errorf("cold cutoff: %w", err)
 		}
-		cutoff := now.Add(-retention)
 		if err := dropColdBeforeRetention(ctx, conn, iceTable, t.PartitionColumn, cutoff); err != nil {
 			return fmt.Errorf("cold expiry: %w", err)
 		}
@@ -476,10 +482,6 @@ func runCycleTwoLevel(ctx context.Context, cfg *config.Config, t *config.TableCo
 	viewGen := view.NewGenerator(conn)
 	iceTable := pgx.Identifier{"ice", cfg.Iceberg.Namespace, t.SourceTable}.Sanitize()
 
-	hot, err := partition.ParseRetention(t.HotPeriod)
-	if err != nil {
-		return fmt.Errorf("parse hot_period: %w", err)
-	}
 	values, err := partMgr.ListValues(ctx, t.SubPartition.ValuesSource)
 	if err != nil {
 		return fmt.Errorf("values_source: %w", err)
@@ -522,7 +524,10 @@ func runCycleTwoLevel(ctx context.Context, cfg *config.Config, t *config.TableCo
 		info          partition.Info
 	}
 	var leaves []leafRef
-	hotCutoff := now.Add(-hot)
+	hotCutoff, err := partMgr.ExpiryCutoff(ctx, now, t.HotPeriod)
+	if err != nil {
+		return fmt.Errorf("hot cutoff: %w", err)
+	}
 	for _, c := range children {
 		exp, err := partMgr.FindExpired(ctx, c.name, t.SourceSchema, hotCutoff, partition.TimeBoundary{})
 		if err != nil {
@@ -641,11 +646,10 @@ func runCycleTwoLevel(ctx context.Context, cfg *config.Config, t *config.TableCo
 
 	// 5. Cold-expiry: drop Iceberg data older than retention_period (region-agnostic).
 	if coldExpiry {
-		retention, err := partition.ParseRetention(t.RetentionPeriod)
+		cExp, err := partMgr.ExpiryCutoff(ctx, now, t.RetentionPeriod)
 		if err != nil {
-			return fmt.Errorf("parse retention_period: %w", err)
+			return fmt.Errorf("cold cutoff: %w", err)
 		}
-		cExp := now.Add(-retention)
 		if err := dropColdBeforeRetention(ctx, conn, iceTable, t.PartitionColumn, cExp); err != nil {
 			return fmt.Errorf("cold expiry: %w", err)
 		}

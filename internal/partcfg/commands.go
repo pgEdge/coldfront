@@ -9,7 +9,6 @@ import (
 	"os"
 	"strings"
 	"text/tabwriter"
-	"time"
 
 	"github.com/jackc/pgx/v5"
 	"gopkg.in/yaml.v3"
@@ -147,27 +146,6 @@ func runRegister(ctx context.Context, args []string) error {
 	if *retention == "" && *hot == "" {
 		return fmt.Errorf("set --retention (and/or --hot-period): a managed table needs a destroy boundary")
 	}
-	// Validate the period strings parse, and that retention outlives hot (the
-	// one lifecycle rule the text-column CHECKs can't express) — fail at register
-	// time rather than later at the archiver's run-time validation.
-	var hotDur, retDur time.Duration
-	if *hot != "" {
-		d, err := partition.ParseRetention(*hot)
-		if err != nil {
-			return fmt.Errorf("--hot-period: %w", err)
-		}
-		hotDur = d
-	}
-	if *retention != "" {
-		d, err := partition.ParseRetention(*retention)
-		if err != nil {
-			return fmt.Errorf("--retention: %w", err)
-		}
-		retDur = d
-	}
-	if *hot != "" && *retention != "" && retDur <= hotDur {
-		return fmt.Errorf("--retention (%s) must exceed --hot-period (%s)", *retention, *hot)
-	}
 	switch *strategy {
 	case partition.StrategyDrop, partition.StrategyDetach:
 	default:
@@ -203,6 +181,12 @@ func runRegister(ctx context.Context, args []string) error {
 	if err := validatePKSuperset(ctx, conn, *schema, *table, *column, *subValues != ""); err != nil {
 		return err
 	}
+	// Period validity + retention>hot ordering are PostgreSQL interval semantics,
+	// so they're checked against the connection (fail fast at register time; the
+	// interval column type is the backstop for any direct write).
+	if err := partition.ValidatePeriods(ctx, conn, *hot, *retention); err != nil {
+		return err
+	}
 	if *dryRun {
 		fmt.Printf("dry-run OK: %s.%s validates; would run:\n%s\n", *schema, *table, insertSQL)
 		return nil
@@ -220,7 +204,10 @@ func registerUsage(fs *flag.FlagSet) func() {
 
 Validates the table is partitioned and that its PRIMARY KEY covers the partition
 key (required for race-safe cutover), then writes a coldfront.partition_config
-row. The row's CHECK constraints enforce the lifecycle rules at write time.
+row. Lifecycle rules are enforced at write time — structural rules by CHECK
+constraints, period syntax by the interval column type, and retention > hot-period
+by a calendar-aware interval comparison. --hot-period / --retention accept any
+PostgreSQL interval (e.g. "1 month", "90 days", "1 year 2 mons").
 
 USAGE:
   <binary> register --table <name> --period <monthly|daily> [lifecycle flags] (--dsn <dsn> | --config <yaml>)
@@ -281,7 +268,7 @@ FLAGS:
 	}
 	rows, err := conn.Query(ctx, `
 		SELECT schema_name, table_name, partition_period,
-		       COALESCE(hot_period,'-'), COALESCE(retention_period,'-'),
+		       COALESCE(hot_period::text,'-'), COALESCE(retention_period::text,'-'),
 		       CASE WHEN hot_period IS NULL THEN 'partition-only' ELSE 'tiered' END,
 		       CASE WHEN sub_part_values_source IS NULL THEN 'flat' ELSE '2-level' END,
 		       expiration_strategy, enabled

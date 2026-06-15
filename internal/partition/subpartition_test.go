@@ -92,7 +92,7 @@ func TestListValues(t *testing.T) {
 
 func TestRunReconcileTwoLevel_ProvisionsEachSubtree(t *testing.T) {
 	f := &fakeLifecycle{}
-	s := Spec{Parent: "events", Schema: "public", Column: "ts", Period: PeriodMonthly, Premake: 3, Retention: 90 * 24 * time.Hour}
+	s := Spec{Parent: "events", Schema: "public", Column: "ts", Period: PeriodMonthly, Premake: 3, RetentionInterval: "90 days"}
 	if err := RunReconcileTwoLevel(context.Background(), f, s, []string{"eu", "us"}, time.Now(), nil); err != nil {
 		t.Fatal(err)
 	}
