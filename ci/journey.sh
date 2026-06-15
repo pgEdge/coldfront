@@ -1100,6 +1100,72 @@ story_mesh_partition_config() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# Story — mesh: the partitioner's STRUCTURAL partition DDL replicates in every
+# direction. partition_config is data (probed above by value); the partition
+# lifecycle is DDL — Spock must carry it via spock.enable_ddl_replication, or the
+# partitioned shape diverges across nodes and cross-node reads/writes break.
+# Verify-before-bench: exercise the EXACT three shapes the manager emits
+# (internal/partition/partition.go) and assert each lands on every node:
+#   CREATE TABLE … PARTITION OF … FOR VALUES FROM … TO …   (:167, premake)
+#   ALTER TABLE … DETACH PARTITION … CONCURRENTLY          (:227, expire — the
+#       risky one: runs top-level, NOT in a txn)
+#   DROP TABLE IF EXISTS …                                 (:238, expire/drop)
+# Children are parent-prefixed (mddlprobe_pN), so no flat-name collision; the
+# parent lives in public (present on every node) so no CREATE SCHEMA confounder.
+# ───────────────────────────────────────────────────────────────────────────
+story_mesh_partition_ddl() {
+    step "1d. Mesh: partition lifecycle DDL (CREATE / DETACH CONCURRENTLY / DROP) replicates in all directions"
+    local PARR; read -ra PARR <<< "$PEERS"
+    [ "${#PARR[@]}" -ge 1 ] || { fail "mesh: no --peers given"; return; }
+    local nodes=("$HOST" "${PARR[@]}") want="$(( ${#PARR[@]} + 1 ))" n i=0
+
+    # Fresh RANGE(id) parent on HOST; the partitioned parent itself must replicate.
+    q "$HOST" "DROP TABLE IF EXISTS public.mddlprobe CASCADE; CREATE TABLE public.mddlprobe (id bigint NOT NULL, PRIMARY KEY (id)) PARTITION BY RANGE (id);" >/dev/null 2>&1
+    sleep 3
+    local pmiss=0
+    for n in "${nodes[@]}"; do
+        [ "$(q "$n" "SELECT count(*) FROM pg_class WHERE relname='mddlprobe' AND relkind='p';")" = "1" ] || pmiss=$((pmiss + 1))
+    done
+    assert_eq "parent partitioned table replicated to all $want nodes" "0" "$pmiss"
+
+    # (a) CREATE PARTITION from EACH node (every direction), disjoint id ranges.
+    for n in "${nodes[@]}"; do
+        q "$n" "CREATE TABLE IF NOT EXISTS public.mddlprobe_p$i PARTITION OF public.mddlprobe FOR VALUES FROM ($((i * 1000))) TO ($(((i + 1) * 1000)));" >/dev/null 2>&1
+        i=$((i + 1))
+    done
+    sleep 3
+    for n in "${nodes[@]}"; do
+        assert_eq "CREATE PARTITION: $n sees all $want children (every direction)" "$want" \
+            "$(q "$n" "SELECT count(*) FROM pg_inherits WHERE inhparent='public.mddlprobe'::regclass;")"
+    done
+
+    # (b) DETACH the partition the way the partition manager does on a mesh
+    #     (internal/partition Manager.Detach): a local top-level CONCURRENTLY detach,
+    #     then coldfront._detach_partition_peers fans the SAME concurrent detach to
+    #     every peer — Spock cannot replicate DETACH … CONCURRENTLY (non-txn), so a
+    #     bare detach would leave p0 attached on peers. The detached table is kept.
+    q "$HOST" "ALTER TABLE public.mddlprobe DETACH PARTITION public.mddlprobe_p0 CONCURRENTLY;" >/dev/null 2>&1
+    q "$HOST" "SELECT coldfront._detach_partition_peers('public.mddlprobe', 'public.mddlprobe_p0');" >/dev/null 2>&1
+    sleep 2
+    local det=0
+    for n in "${nodes[@]}"; do
+        [ "$(q "$n" "SELECT count(*) FROM pg_inherits WHERE inhparent='public.mddlprobe'::regclass AND inhrelid='public.mddlprobe_p0'::regclass;")" = "0" ] || det=$((det + 1))
+    done
+    assert_eq "DETACH PARTITION CONCURRENTLY on every node (local + peer fan-out)" "0" "$det"
+
+    # (c) DROP the detached standalone table from HOST; assert gone on EVERY node.
+    q "$HOST" "DROP TABLE IF EXISTS public.mddlprobe_p0;" >/dev/null 2>&1
+    sleep 3
+    local drp=0
+    for n in "${nodes[@]}"; do
+        [ "$(q "$n" "SELECT count(*) FROM pg_class WHERE relname='mddlprobe_p0';")" = "0" ] || drp=$((drp + 1))
+    done
+    assert_eq "DROP TABLE replicated to all nodes (detached p0 gone everywhere)" "0" "$drp"
+
+    q "$HOST" "DROP TABLE IF EXISTS public.mddlprobe CASCADE;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Story — 2-level (LIST region → RANGE ts) tiering: the "upgrade a sub-partitioned
 # table to tiered" path. A region-agnostic single Iceberg table; leaves tier per
 # ts period across ALL regions before the shared cutoff advances. Uses its own
@@ -1356,6 +1422,7 @@ story_app_privilege() {
 story_setup
 [ "$MESH" = 1 ] && story_mesh_substrate          # bakery substrate replicates in all directions
 [ "$MESH" = 1 ] && story_mesh_partition_config   # config table replicates in all directions
+[ "$MESH" = 1 ] && story_mesh_partition_ddl      # partition lifecycle DDL replicates (verify-before-bench)
 if [ "$MODE" = "tiered" ]; then
     story_provision_tiered
     [ "$MESH" = 1 ] && story_mesh_tiered    # cross-node tiered, while hot+cold coexist

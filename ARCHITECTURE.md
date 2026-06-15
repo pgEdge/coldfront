@@ -421,6 +421,22 @@ self-materializes the table on stock PostgreSQL via `EnsureTable`, needing no
 extension. Connection config (DSN, Iceberg/S3 credentials) is deliberately **not**
 stored here — it is per-node and must never ride the replication stream.
 
+The *config* replicates by value; the partition **lifecycle DDL** must also reach
+every node. `CREATE … PARTITION OF …` and `DROP TABLE` are ordinary transactional
+DDL, so Spock's DDL replication carries them automatically. The retention
+`DETACH PARTITION … CONCURRENTLY` is the exception: `CONCURRENTLY` cannot run in a
+transaction block, so Spock skips it (`WARNING: This DDL statement will not be
+replicated`) — left alone, a partition would stay attached on every peer while the
+origin detaches it. The partition manager therefore detaches locally (top-level,
+non-blocking) and then fans the **identical** concurrent detach to each peer via
+`coldfront._detach_partition_peers`, which runs it in each peer's own autocommit
+session over a dblink to that node's Spock interface DSN (a no-op off-mesh). The
+archiver's cold-tiering cutover instead uses a plain, transactional `DETACH` inside
+its atomic watermark+view+detach commit, so that one replicates on its own. This is
+verified before any mesh partitioner run by `story_mesh_partition_ddl` in
+`ci/journey.sh` (an N×(N-1) probe: create from every node, detach, drop, asserting
+each lands on all nodes).
+
 Both binaries read this table (the YAML `archiver.tables` list is a deprecation
 bridge, used only when the table is empty) and expose a management CLI —
 `register` / `list` / `set` / `remove` / `import` / `export` — documented in

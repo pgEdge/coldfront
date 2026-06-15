@@ -299,9 +299,11 @@ func TestDetach(t *testing.T) {
 	m := NewManager(db)
 	err := m.Detach(context.Background(), "events", "public", "p_2025_11")
 	require.NoError(t, err)
-	require.Len(t, db.execSQL, 1)
+	// Local concurrent detach, then the mesh fan-out to peers (a no-op off-mesh).
+	require.Len(t, db.execSQL, 2)
 	assert.Contains(t, db.execSQL[0], "DETACH PARTITION")
 	assert.Contains(t, db.execSQL[0], "CONCURRENTLY")
+	assert.Contains(t, db.execSQL[1], "_detach_partition_peers")
 }
 
 func TestDrop(t *testing.T) {

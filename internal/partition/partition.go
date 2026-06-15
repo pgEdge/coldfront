@@ -222,13 +222,22 @@ func (m *Manager) listPartitions(ctx context.Context, parent, schema string, b B
 	return parts, rows.Err()
 }
 
-// Detach detaches a partition from its parent concurrently.
+// Detach detaches a partition from its parent concurrently. CONCURRENTLY avoids
+// an ACCESS EXCLUSIVE lock on the parent, but it cannot run in a transaction
+// block, so Spock's DDL replication silently skips it — on a mesh the partition
+// would stay attached on every peer. We therefore detach locally (top-level on
+// the pool, autocommit) and then fan the identical concurrent detach to each
+// peer via coldfront._detach_partition_peers (a no-op on a non-mesh node).
 func (m *Manager) Detach(ctx context.Context, parent, schema, partName string) error {
-	sql := fmt.Sprintf(`ALTER TABLE %s DETACH PARTITION %s CONCURRENTLY`,
-		pgx.Identifier{schema, parent}.Sanitize(),
-		pgx.Identifier{schema, partName}.Sanitize())
-	if _, err := m.db.Exec(ctx, sql); err != nil {
+	qParent := pgx.Identifier{schema, parent}.Sanitize()
+	qPart := pgx.Identifier{schema, partName}.Sanitize()
+	if _, err := m.db.Exec(ctx, fmt.Sprintf(`ALTER TABLE %s DETACH PARTITION %s CONCURRENTLY`, qParent, qPart)); err != nil {
 		return fmt.Errorf("detach partition %s: %w", partName, err)
+	}
+	// Mesh fan-out: replicate the concurrent detach to every other node. Spock
+	// cannot carry DETACH … CONCURRENTLY itself (it is non-transactional).
+	if _, err := m.db.Exec(ctx, `SELECT coldfront._detach_partition_peers($1, $2)`, qParent, qPart); err != nil {
+		return fmt.Errorf("detach partition %s on peers: %w", partName, err)
 	}
 	return nil
 }
