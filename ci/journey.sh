@@ -496,6 +496,10 @@ EOSQL
     # Strict mode rejects an ambiguous predicate.
     local e; e=$(q_may "$HOST" "SET coldfront.allow_mixed_writes=off; UPDATE events SET status='x' WHERE data->>'m'='nope';")
     assert_err "strict mode rejects ambiguous predicate" "must include" "$e"
+    # A self-join / second reference to the tiered view is rejected cleanly (the
+    # rewrite retargets only the leading reference — see ARCHITECTURE_TIERED).
+    local sj; sj=$(q_may "$HOST" "UPDATE events SET status='x' FROM events e2 WHERE events.ts=e2.ts;")
+    assert_err "self-join on a tiered view rejected" "more than once" "$sj"
 }
 
 # ───────────────────────────────────────────────────────────────────────────

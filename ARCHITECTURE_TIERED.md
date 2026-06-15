@@ -365,17 +365,24 @@ compatibility, login arming) are in
    rather than `UPDATE n`, because the rewrite produces a SELECT wrapper
    around a DML CTE.  The row count reflects hot rows only.
 
-3. **Crash-safety of permissive writes** — DuckDB's transaction is tied to
+3. **Self-join / multiple references** — an UPDATE/DELETE that references
+   the same tiered view more than once — a self-join (`UPDATE events ... FROM
+   events e2`), `DELETE ... USING events`, or a sub-select (`... WHERE id IN
+   (SELECT ... FROM events)`) — is rejected with a clear error.  The rewrite
+   swaps only the leading result-relation reference, so a second one cannot be
+   retargeted; reference the view once.
+
+4. **Crash-safety of permissive writes** — DuckDB's transaction is tied to
    PG's via `XactCallback`, so `ROLLBACK` undoes both tiers.  If the
    backend *crashes* mid-commit, the Iceberg write may have produced S3
    objects referenced by a snapshot that was never committed; Iceberg
    housekeeping (orphan-file expiry) reclaims them.  Strict mode avoids
    this path entirely.
 
-4. **Partitioned tables only** — the source table must already be partitioned
+5. **Partitioned tables only** — the source table must already be partitioned
    by range. Unpartitioned table conversion is not yet supported.
 
-5. **No Iceberg partition spec on the cold tier** — Iceberg tables
+6. **No Iceberg partition spec on the cold tier** — Iceberg tables
    are created without a `partition-spec` (`partition-specs[0].fields = []`).
    Cold-tier predicate pruning therefore relies on **per-file manifest
    min/max statistics**, which DuckDB-iceberg uses to skip data files

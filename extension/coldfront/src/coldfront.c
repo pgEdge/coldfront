@@ -328,6 +328,48 @@ query_reads_tiered_view(Query *query)
     return false;
 }
 
+/*
+ * Count references to one relation OID anywhere in the query tree — the result
+ * relation plus any self-join FROM/USING entry, sub-select, or CTE that resolves
+ * to the same view.  QTW_EXAMINE_RTES_BEFORE makes the walker fire on each
+ * RangeTblEntry; recursion into sub-Querys (RTE_SUBQUERY and SubLink subselects)
+ * goes through the Query arm.  Used to reject DML that names a tiered view more
+ * than once: the deparse rewrite only swaps the leading result-relation token,
+ * so a second reference would be copied through verbatim and fail confusingly.
+ */
+typedef struct { Oid relid; int count; } ViewRefCount;
+
+static bool
+count_view_refs_walker(Node *node, void *ctx)
+{
+    ViewRefCount *vrc = (ViewRefCount *) ctx;
+
+    if (node == NULL)
+        return false;
+    if (IsA(node, RangeTblEntry))
+    {
+        RangeTblEntry *rte = (RangeTblEntry *) node;
+        if (rte->rtekind == RTE_RELATION && rte->relid == vrc->relid)
+            vrc->count++;
+        /* let the default range-table walk recurse into a subquery RTE */
+        return false;
+    }
+    if (IsA(node, Query))
+        return query_tree_walker((Query *) node, count_view_refs_walker, ctx,
+                                 QTW_EXAMINE_RTES_BEFORE);
+    return expression_tree_walker(node, count_view_refs_walker, ctx);
+}
+
+static int
+count_tiered_view_refs(Query *query, Oid view_oid)
+{
+    ViewRefCount vrc = { .relid = view_oid, .count = 0 };
+
+    query_tree_walker(query, count_view_refs_walker, (void *) &vrc,
+                      QTW_EXAMINE_RTES_BEFORE);
+    return vrc.count;
+}
+
 /* ---------- tier classification --------------------------------------- */
 
 /*
@@ -1693,6 +1735,23 @@ coldfront_post_parse_analyze(ParseState *pstate, Query *query,
          * coldfront._dummy_dml_target comment in coldfront--0.1.sql. */
         collect_cold_params(query, &ps);
         in_plpgsql = (pstate->p_post_columnref_hook != NULL);
+
+        /* The deparse-and-swap rewrite substitutes only the leading
+         * result-relation reference. A second reference to the SAME tiered view
+         * — a self-join (UPDATE … FROM v), DELETE … USING v, or a sub-select
+         * (… WHERE id IN (SELECT … FROM v)) — would be copied through verbatim
+         * and then fail confusingly (PG cannot scan the iceberg_scan view;
+         * DuckDB does not know it). Reject it cleanly here; a structural
+         * multi-reference rewrite is out of scope. (INSERT … SELECT routing is
+         * handled separately by emit_tiered_insert.) */
+        if ((query->commandType == CMD_UPDATE || query->commandType == CMD_DELETE) &&
+            count_tiered_view_refs(query, rte->relid) > 1)
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("UPDATE/DELETE on tiered view \"%s\" cannot reference it more than once",
+                            get_rel_name(rte->relid)),
+                     errhint("Self-joins, USING, and sub-selects over the same tiered view "
+                             "are not supported; reference it once.")));
 
         /* Tiered-view INSERT: bulk split-by-watermark via emit_tiered_insert.
          * Iceberg-only INSERT falls through to the unconditional cold path
