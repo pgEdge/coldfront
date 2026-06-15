@@ -155,6 +155,17 @@ CREATE TABLE IF NOT EXISTS coldfront.partition_config (
     CONSTRAINT pc_strategy_part CHECK (expiration_strategy = 'drop' OR hot_period IS NULL)  -- 'detach' is partition-only
 );
 
+-- Carry the durable tiering metadata across pg_dump/restore so a restored node
+-- re-attaches to the same Iceberg cold tier with no re-provisioning. These are
+-- extension-member tables, whose data pg_dump would otherwise omit;
+-- pg_extension_config_dump marks their contents to be dumped. Deliberately NOT
+-- carried: coldfront.storage_secret (a credential — re-establish after restore
+-- with coldfront.set_storage_secret) and the bakery's claims / claim_acks /
+-- deferred_acks (transient, per-node mesh state).
+SELECT pg_extension_config_dump('coldfront.tiered_views', '');
+SELECT pg_extension_config_dump('coldfront.archive_watermark', '');
+SELECT pg_extension_config_dump('coldfront.partition_config', '');
+
 -- ensure_attached() issues ATTACH IF NOT EXISTS for the Lakekeeper catalog
 -- using the coldfront.warehouse and coldfront.lakekeeper_endpoint GUCs. Called
 -- lazily by the extension hook (coldfront.c) on the first query in a session

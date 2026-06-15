@@ -131,6 +131,17 @@ file syncing. (2) It materializes a DuckDB **persistent secret**, which DuckDB
 loads automatically at instance init — so every backend, including the first
 fresh one, sees the secret at a committed timestamp before any query runs.
 
+**Backup / restore (`pg_dump`).** The durable tiering metadata —
+`coldfront.tiered_views` (registry), `archive_watermark` (cutoffs) and
+`partition_config` — is marked with `pg_extension_config_dump`, so a logical
+`pg_dump` carries it and a restore re-attaches to the **same** Iceberg cold tier
+with no re-provisioning. Two things are deliberately **not** dumped: the
+credential (`coldfront.storage_secret` above — re-run `set_storage_secret` once
+after restoring into a fresh instance) and the bakery's transient claim tables
+(`claims` / `claim_acks` / `deferred_acks`, per-node mesh state). Until the
+credential is re-established a restored node serves hot reads but fails cold I/O
+cleanly. `ci/ops.sh` Check 4 exercises exactly this.
+
 **Iceberg catalog ATTACH** is **lazy**: the coldfront C extension hook issues
 `ATTACH IF NOT EXISTS` against Lakekeeper — using the cluster's
 `coldfront.warehouse` and `coldfront.lakekeeper_endpoint` GUCs — on the **first

@@ -19,7 +19,12 @@
 # Checks 1 & 2 also assert RECOVERY: once the dependency returns, a fresh session
 # re-attaches and cold I/O works again.
 #
-# (pg_dump/restore check is added in a follow-up increment.)
+#   4. pg_dump/restore: a logical dump restored into a FRESH instance of the image
+#      carries the tiering metadata — registry / watermarks / partition config, via
+#      pg_extension_config_dump — but NOT the cold-store credential (excluded by
+#      design) nor the transient bakery claim tables. The fresh instance fails cold
+#      I/O cleanly until set_storage_secret is re-run, after which it re-attaches to
+#      the SAME Iceberg cold tier.
 #
 # Usage: ci/ops.sh [--pg 16|17|18] [--keep]
 set -uo pipefail
@@ -39,7 +44,8 @@ export PG_MAJOR="$PG"
 COMPOSE_FILE="docker-compose.matrix.yml"
 COMPOSE="docker compose -f $COMPOSE_FILE"
 DB=coldfront-db-1; LK=coldfront-lakekeeper-1; SW=coldfront-seaweedfs-1
-trap topo_teardown EXIT
+RESTORE=coldfront-restore
+trap 'docker rm -f "$RESTORE" >/dev/null 2>&1 || true; topo_teardown' EXIT
 
 ip() { docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$1"; }
 
@@ -49,6 +55,7 @@ $COMPOSE up -d --build >/dev/null 2>&1
 for i in $(seq 1 30); do [ "$(docker inspect -f '{{.State.Health.Status}}' "$DB" 2>/dev/null)" = "healthy" ] && break; sleep 2; done
 [ "$(docker inspect -f '{{.State.Health.Status}}' "$DB" 2>/dev/null)" = "healthy" ] || { echo "db not healthy"; exit 1; }
 LK_IP=$(ip "$LK"); SW_IP=$(ip "$SW")
+NET=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' "$DB")
 
 step "ops: bootstrap Lakekeeper + warehouse + namespace (s3)"
 curl -sf "http://$LK_IP:8181/management/v1/bootstrap" -X POST -H "Content-Type: application/json" \
@@ -144,5 +151,45 @@ deny_self=$(q_may "$DB" "SET ROLE cfapp; SELECT coldfront.grant_app_access('cfap
 assert_contains "app role CANNOT self-grant (grant_app_access not PUBLIC-executable)" "permission denied" "$deny_self"
 deny_bare=$(q_may "$DB" "SET ROLE cfnobody; SELECT count(*) FROM public.cold1;")
 assert_contains "un-onboarded role is cleanly DENIED cold access" "ERROR" "$deny_bare"
+
+# ── Check 4: pg_dump/restore re-attaches to the same Iceberg ───────────────────
+# Real DR: restore the logical dump into a FRESH instance of the same image — same
+# catalog config (env), but a fresh DuckDB secret store and no data — and confirm
+# the tiering metadata survived and the node re-attaches to the SAME Iceberg.
+step "ops 4: pg_dump/restore — metadata survives, credential re-set, cold tier re-attaches"
+cold_before=$(q "$DB" "SELECT count(*) FROM cold1;")
+IMG=$(docker inspect -f '{{.Config.Image}}' "$DB")
+docker rm -f "$RESTORE" >/dev/null 2>&1 || true
+docker run -d --name "$RESTORE" --network "$NET" \
+    -e PG_MAJOR="$PG" -e MESH=off \
+    -e COLDFRONT_WAREHOUSE=wh -e COLDFRONT_LAKEKEEPER=http://lakekeeper:8181/catalog \
+    "$IMG" >/dev/null 2>&1
+for i in $(seq 1 40); do [ "$(docker inspect -f '{{.State.Health.Status}}' "$RESTORE" 2>/dev/null)" = "healthy" ] && break; sleep 2; done
+# Logical dump of the live coldfront DB → restore into the fresh instance's empty
+# coldfront DB (the dump's CREATE EXTENSION + config-dumped data rebuild it).
+docker exec "$DB" pg_dump -U coldfront -d coldfront 2>/dev/null \
+  | docker exec -i "$RESTORE" psql -U coldfront -d coldfront -q >/tmp/cf_restore.log 2>&1 || true
+
+# 1. Durable tiering metadata survived the dump (pg_extension_config_dump).
+assert_eq "registry (tiered_views) survived pg_dump/restore" "1" \
+    "$(q "$RESTORE" "SELECT count(*) FROM coldfront.tiered_views WHERE relname='cold1';")"
+assert_eq "hot heap + data survived pg_dump/restore" "1" \
+    "$(q "$RESTORE" "SELECT count(*) FROM hot1;")"
+# 2. The cold-store credential is deliberately NOT carried by pg_dump.
+assert_eq "storage secret NOT carried by pg_dump (excluded by design)" "0" \
+    "$(q "$RESTORE" "SELECT count(*) FROM coldfront.storage_secret;")"
+# 3. A fresh instance has no credential → cold read fails cleanly (no crash/hang).
+no_secret=$(q_may "$RESTORE" "SET statement_timeout='25s'; SELECT count(*) FROM cold1;")
+assert_contains "cold read fails cleanly on the restore until the secret is re-set" "ERROR" "$no_secret"
+# 4. Re-establish the credential → cold tier re-attaches to the SAME Iceberg.
+q "$RESTORE" "SELECT coldfront.set_storage_secret('admin','adminsecret','${SW_IP}:8333');" >/dev/null 2>&1
+restored=""
+for i in $(seq 1 25); do restored=$(q "$RESTORE" "SELECT count(*) FROM cold1;" 2>/dev/null); [ "$restored" = "$cold_before" ] && break; sleep 2; done
+assert_eq "cold tier re-attaches to the same Iceberg after set_storage_secret" "$cold_before" "$restored"
+# 5. Registry-driven routing works post-restore: an UPDATE through the decoupled
+#    view is recognised by the hook (only possible if the registry survived).
+upd=$(q_may "$RESTORE" "UPDATE cold1 SET id=id WHERE id=1;")
+assert_eq "registry-routed cold UPDATE works post-restore" "" "$(echo "$upd" | grep -iE 'error' || true)"
+docker rm -f "$RESTORE" >/dev/null 2>&1 || true
 
 summary
