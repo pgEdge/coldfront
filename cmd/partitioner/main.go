@@ -114,39 +114,43 @@ func main() {
 	now := time.Now().UTC()
 	failed := 0
 	for _, t := range cfg.Archiver.Tables {
-		spec, err := specFromTable(t)
-		if err != nil {
-			log.Printf("[%s] config: %v", t.SourceTable, err)
+		if !reconcileTable(ctx, mgr, t, now) {
 			failed++
-			continue
 		}
-		if t.SubPartition != nil {
-			values, err := mgr.ListValues(ctx, t.SubPartition.ValuesSource)
-			if err != nil {
-				log.Printf("[%s] values_source: %v", spec.Parent, err)
-				failed++
-				continue
-			}
-			if err := partition.RunReconcileTwoLevel(ctx, mgr, spec, values, now, nil); err != nil {
-				if reconcileFailed(spec.Parent, err) {
-					failed++
-				}
-				continue
-			}
-			log.Printf("[%s] reconciled %d sub-tree(s) (premake %d, retention %s)", spec.Parent, len(values), spec.Premake, t.RetentionPeriod)
-			continue
-		}
-		if err := partition.RunReconcile(ctx, mgr, spec, now, nil); err != nil {
-			if reconcileFailed(spec.Parent, err) {
-				failed++
-			}
-			continue
-		}
-		log.Printf("[%s] reconciled (premake %d, retention %s)", spec.Parent, spec.Premake, t.RetentionPeriod)
 	}
 	if failed > 0 {
 		log.Fatalf("%d table(s) failed", failed)
 	}
+}
+
+// reconcileTable runs one reconcile pass for a single configured table and
+// reports whether it succeeded (true) or should count toward the run's failure
+// total (false). It selects the single-level vs two-level path off
+// t.SubPartition; the ErrBehind self-heal stays a non-fatal WARNING via
+// reconcileFailed. main() only sums the failures.
+func reconcileTable(ctx context.Context, mgr *partition.Manager, t config.TableConfig, now time.Time) bool {
+	spec, err := specFromTable(t)
+	if err != nil {
+		log.Printf("[%s] config: %v", t.SourceTable, err)
+		return false
+	}
+	if t.SubPartition != nil {
+		values, err := mgr.ListValues(ctx, t.SubPartition.ValuesSource)
+		if err != nil {
+			log.Printf("[%s] values_source: %v", spec.Parent, err)
+			return false
+		}
+		if err := partition.RunReconcileTwoLevel(ctx, mgr, spec, values, now, nil); err != nil {
+			return !reconcileFailed(spec.Parent, err)
+		}
+		log.Printf("[%s] reconciled %d sub-tree(s) (premake %d, retention %s)", spec.Parent, len(values), spec.Premake, t.RetentionPeriod)
+		return true
+	}
+	if err := partition.RunReconcile(ctx, mgr, spec, now, nil); err != nil {
+		return !reconcileFailed(spec.Parent, err)
+	}
+	log.Printf("[%s] reconciled (premake %d, retention %s)", spec.Parent, spec.Premake, t.RetentionPeriod)
+	return true
 }
 
 // specFromTable maps one configured table onto a partition.Spec. The retention

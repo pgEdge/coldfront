@@ -109,42 +109,48 @@ func main() {
 	}
 
 	for i := range cfg.Archiver.Tables {
-		t := &cfg.Archiver.Tables[i]
+		prepareAndRunTable(ctx, cfg, &cfg.Archiver.Tables[i], conn, wmStore, *debugExportDelay)
+	}
+}
 
-		// Period syntax + retention>hot ordering are PostgreSQL interval semantics
-		// (calendar-aware), so they're validated here against the live connection —
-		// config.Load (no DB) only checks presence.
-		if err := partition.ValidatePeriods(ctx, conn, t.HotPeriod, t.RetentionPeriod); err != nil {
+// prepareAndRunTable validates one table's periods/partitioning (against the
+// live connection), auto-detects the partition column for flat tables, then
+// runs a single archive cycle. Any failure log.Fatalf's — this is the cron
+// body, where the first table error must abort the whole run non-zero.
+func prepareAndRunTable(ctx context.Context, cfg *config.Config, t *config.TableConfig, conn *pgx.Conn, wmStore *watermark.Store, debugExportDelay time.Duration) {
+	// Period syntax + retention>hot ordering are PostgreSQL interval semantics
+	// (calendar-aware), so they're validated here against the live connection —
+	// config.Load (no DB) only checks presence.
+	if err := partition.ValidatePeriods(ctx, conn, t.HotPeriod, t.RetentionPeriod); err != nil {
+		log.Fatalf("[%s] %v", t.SourceTable, err)
+	}
+
+	// Flat single-level tables: reject sub-partitioning and auto-detect the
+	// time column. 2-level (sub_partition) tables are LIST→RANGE by design
+	// and carry an explicit partition_column (the RANGE/time key), required
+	// by config — on a first run no LIST child exists yet to detect it from.
+	if t.SubPartition == nil {
+		if err := validateFlatPartitioning(ctx, conn, t.SourceSchema, t.SourceTable); err != nil {
 			log.Fatalf("[%s] %v", t.SourceTable, err)
 		}
-
-		// Flat single-level tables: reject sub-partitioning and auto-detect the
-		// time column. 2-level (sub_partition) tables are LIST→RANGE by design
-		// and carry an explicit partition_column (the RANGE/time key), required
-		// by config — on a first run no LIST child exists yet to detect it from.
-		if t.SubPartition == nil {
-			if err := validateFlatPartitioning(ctx, conn, t.SourceSchema, t.SourceTable); err != nil {
-				log.Fatalf("[%s] %v", t.SourceTable, err)
+		if t.PartitionColumn == "" {
+			cols, err := detectPartitionColumns(ctx, conn, t.SourceSchema, t.SourceTable)
+			if err != nil {
+				log.Fatalf("auto-detect partition column for %s: %v", t.SourceTable, err)
 			}
-			if t.PartitionColumn == "" {
-				cols, err := detectPartitionColumns(ctx, conn, t.SourceSchema, t.SourceTable)
-				if err != nil {
-					log.Fatalf("auto-detect partition column for %s: %v", t.SourceTable, err)
-				}
-				if len(cols) == 0 {
-					log.Fatalf("[%s] no partition column detected", t.SourceTable)
-				}
-				t.PartitionColumn = cols[0]
-				log.Printf("[%s] auto-detected partition column: %s", t.SourceTable, cols[0])
+			if len(cols) == 0 {
+				log.Fatalf("[%s] no partition column detected", t.SourceTable)
 			}
+			t.PartitionColumn = cols[0]
+			log.Printf("[%s] auto-detected partition column: %s", t.SourceTable, cols[0])
 		}
-
-		log.Printf("[%s] starting archive cycle", t.SourceTable)
-		if err := runCycle(ctx, cfg, t, conn, wmStore, *debugExportDelay); err != nil {
-			log.Fatalf("[%s] archive cycle: %v", t.SourceTable, err)
-		}
-		log.Printf("[%s] archive cycle complete", t.SourceTable)
 	}
+
+	log.Printf("[%s] starting archive cycle", t.SourceTable)
+	if err := runCycle(ctx, cfg, t, conn, wmStore, debugExportDelay); err != nil {
+		log.Fatalf("[%s] archive cycle: %v", t.SourceTable, err)
+	}
+	log.Printf("[%s] archive cycle complete", t.SourceTable)
 }
 
 // dollarQuote wraps s as a PostgreSQL dollar-quoted literal using a randomized
@@ -1081,83 +1087,22 @@ func registerTieredView(ctx context.Context, conn *pgx.Conn, schema, table, hotT
 // numeric(20,5) financial columns who would discover the precision loss
 // months later when querying the cold tier.
 func pgFormatTypeToDuckDB(s string) (storage, viewCastType string, err error) {
-	switch s {
-	// Numeric / boolean — storage matches surface; no cast needed.
-	case "bigint":
-		return "BIGINT", "", nil
-	case "integer":
-		return "INTEGER", "", nil
-	case "smallint":
-		// Iceberg has no 16-bit integer; widen to INTEGER (lossless, same as
-		// oid → BIGINT). duckdb-iceberg rejects SMALLINT at CREATE TABLE. No
-		// view cast needed: INTEGER is itself a PG-parseable surface, and the
-		// view casts BOTH branches to the storage type, so bootstrap (hot-only)
-		// and post-cutover (hot+cold) views agree on the column type.
-		return "INTEGER", "", nil
-	case "real":
-		return "REAL", "", nil
-	case "double precision":
-		// Iceberg/DuckDB storage is DOUBLE, but PG has no bare type named
-		// "double" (it's a shell type), so the transparent view's cold cast
-		// r['col']::DOUBLE fails to PARSE when CREATE VIEW validates the body.
-		// Surface via the PG-spelled "double precision" cast (pg_duckdb maps it
-		// back to DOUBLE); both branches then parse and unify.
-		return "DOUBLE", "double precision", nil
-	case "boolean":
-		return "BOOLEAN", "", nil
-
-	// Temporal — storage matches surface; no cast needed.
-	case "timestamp with time zone":
-		return "TIMESTAMPTZ", "", nil
-	case "timestamp without time zone":
-		return "TIMESTAMP", "", nil
-	case "date":
-		return "DATE", "", nil
-	case "time without time zone":
-		return "TIME", "", nil
-
-	// Identifiers / strings / binary — storage matches surface.
-	case "uuid":
-		return "UUID", "", nil
-	case "text":
-		return "VARCHAR", "", nil
-	case "bytea":
-		// Iceberg/DuckDB storage is BLOB, which is not a PG-parseable cast
-		// name; surface via the PG-spelled "bytea" on both branches.
-		return "BLOB", "bytea", nil
-
-	// PG `oid` is 4-byte unsigned (max 4_294_967_295). DuckDB INTEGER is
-	// signed 32-bit, so values above 2_147_483_647 would overflow. Use
-	// BIGINT for safe round-trip.
-	case "oid":
-		// oid widens to BIGINT (4-byte unsigned safe-widen). No view cast:
-		// BIGINT is a PG-parseable surface and the view casts both branches to
-		// the storage type, so bootstrap/cutover view types agree.
-		return "BIGINT", "", nil
-
-	// View-cast types use lowercase by convention — PG/DuckDB cast targets
-	// (`::json`, `::interval`) read more naturally than UPPERCASE. Storage
-	// types stay UPPERCASE because they're CREATE-TABLE column declarations
-	// (BIGINT, VARCHAR, …) where uppercase is conventional.
-
-	// Iceberg has no JSON primitive — storage VARCHAR, surface json.
-	case "jsonb", "json":
-		return "VARCHAR", "json", nil
-
-	// Iceberg has no INTERVAL — storage VARCHAR, surface interval.
-	// PG interval ↔ text is round-trip-clean (e.g. "1 day 02:00:00"), and
-	// DuckDB INTERVAL parses the same text. pg_duckdb maps DuckDB INTERVAL
-	// back to PG interval.
-	case "interval":
-		return "VARCHAR", "interval", nil
-
-		// inet/cidr are NOT supported. pg_duckdb cannot represent PG inet (Oid
-		// 869) anywhere in a query it plans, and every read through an
-		// Iceberg-backed view is planned by pg_duckdb (the view embeds
-		// iceberg_scan). It rejects the column *reference* at plan time, before
-		// any cast — so "store as VARCHAR, cast back to inet" is impossible. Fall
-		// through to the unsupported-type error; users store IP data as text.
+	// 1:1 mappings: format_type output → (storage, viewCastType). Most types'
+	// storage matches their PG surface so viewCastType is empty; the few rows
+	// with a non-empty viewCastType are documented inline. View-cast types use
+	// lowercase by convention (PG/DuckDB cast targets `::json`/`::interval` read
+	// more naturally than UPPERCASE); storage types stay UPPERCASE because
+	// they're CREATE-TABLE column declarations (BIGINT, VARCHAR, …).
+	if m, ok := pgTypeMap[s]; ok {
+		return m.storage, m.viewCast, nil
 	}
+
+	// inet/cidr are NOT supported. pg_duckdb cannot represent PG inet (Oid 869)
+	// anywhere in a query it plans, and every read through an Iceberg-backed view
+	// is planned by pg_duckdb (the view embeds iceberg_scan). It rejects the
+	// column *reference* at plan time, before any cast — so "store as VARCHAR,
+	// cast back to inet" is impossible. They fall through to the unsupported-type
+	// error below; users store IP data as text.
 
 	// VARCHAR(N) / CHAR(N) — PG's format_type emits "character varying(N)"
 	// or "character(N)". Iceberg/DuckDB don't enforce length anyway.
@@ -1183,6 +1128,58 @@ func pgFormatTypeToDuckDB(s string) (storage, viewCastType string, err error) {
 			"character(N), bytea, numeric(P,S) with P<=38, json, jsonb, interval, "+
 			"oid. inet/cidr are not supported (pg_duckdb cannot process inet in "+
 			"Iceberg-backed queries); store IP data as text", s)
+}
+
+// pgTypeMap holds the 1:1 PG-format_type → (storage, viewCast) mappings used by
+// pgFormatTypeToDuckDB. Non-trivial-mapping types (character varying(N),
+// numeric(P,S)) are handled by the suffix/regex logic in that function instead.
+var pgTypeMap = map[string]struct{ storage, viewCast string }{
+	// Numeric / boolean — storage matches surface; no cast needed.
+	"bigint":  {"BIGINT", ""},
+	"integer": {"INTEGER", ""},
+	// Iceberg has no 16-bit integer; widen to INTEGER (lossless, same as oid →
+	// BIGINT). duckdb-iceberg rejects SMALLINT at CREATE TABLE. No view cast
+	// needed: INTEGER is itself a PG-parseable surface, and the view casts BOTH
+	// branches to the storage type, so bootstrap (hot-only) and post-cutover
+	// (hot+cold) views agree on the column type.
+	"smallint": {"INTEGER", ""},
+	"real":     {"REAL", ""},
+	// Iceberg/DuckDB storage is DOUBLE, but PG has no bare type named "double"
+	// (it's a shell type), so the transparent view's cold cast r['col']::DOUBLE
+	// fails to PARSE when CREATE VIEW validates the body. Surface via the
+	// PG-spelled "double precision" cast (pg_duckdb maps it back to DOUBLE); both
+	// branches then parse and unify.
+	"double precision": {"DOUBLE", "double precision"},
+	"boolean":          {"BOOLEAN", ""},
+
+	// Temporal — storage matches surface; no cast needed.
+	"timestamp with time zone":    {"TIMESTAMPTZ", ""},
+	"timestamp without time zone": {"TIMESTAMP", ""},
+	"date":                        {"DATE", ""},
+	"time without time zone":      {"TIME", ""},
+
+	// Identifiers / strings / binary — storage matches surface.
+	"uuid": {"UUID", ""},
+	"text": {"VARCHAR", ""},
+	// Iceberg/DuckDB storage is BLOB, which is not a PG-parseable cast name;
+	// surface via the PG-spelled "bytea" on both branches.
+	"bytea": {"BLOB", "bytea"},
+
+	// PG `oid` is 4-byte unsigned (max 4_294_967_295). DuckDB INTEGER is signed
+	// 32-bit, so values above 2_147_483_647 would overflow; widen to BIGINT for
+	// safe round-trip. No view cast: BIGINT is a PG-parseable surface and the
+	// view casts both branches to the storage type, so bootstrap/cutover view
+	// types agree.
+	"oid": {"BIGINT", ""},
+
+	// Iceberg has no JSON primitive — storage VARCHAR, surface json.
+	"jsonb": {"VARCHAR", "json"},
+	"json":  {"VARCHAR", "json"},
+
+	// Iceberg has no INTERVAL — storage VARCHAR, surface interval. PG interval ↔
+	// text is round-trip-clean (e.g. "1 day 02:00:00"), and DuckDB INTERVAL
+	// parses the same text. pg_duckdb maps DuckDB INTERVAL back to PG interval.
+	"interval": {"VARCHAR", "interval"},
 }
 
 var numericTypeRe = regexp.MustCompile(`^numeric\((\d+),\s*(\d+)\)$`)
