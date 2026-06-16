@@ -19,6 +19,9 @@ REPO_READY_AUDIT.md
 .idea/
 .vscode/
 
+# MkDocs build output
+site/
+
 # pg_regress expected outputs — tracked; the global *.out would exclude them.
 !extension/coldfront/test/expected/*.out
 # pg_regress run artifacts (generated; never committed)
