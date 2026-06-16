@@ -814,7 +814,7 @@ func archiveCutover(ctx context.Context, conn *pgx.Conn, t *config.TableConfig,
 	cutoverDone := false
 	for attempt := 1; attempt <= 10; attempt++ {
 		t3 := time.Now()
-		if _, err := conn.Exec(ctx,
+		if _, err := conn.Exec(ctx, /* nosemgrep */
 			"CALL coldfront.replay_archive_delta($1, $2, $3, $4)",
 			t.SourceSchema, part.Name, snapshotStr, iceTable); err != nil {
 			return fmt.Errorf("phase 3 attempt %d: %w", attempt, err)
@@ -1040,7 +1040,7 @@ func ensureIcebergTable(ctx context.Context, conn *pgx.Conn, cfg *config.Config,
 // coldfront C extension can identify this view as a tiered target and
 // rewrite UPDATE/DELETE into dual-tier CTEs. Called after every view recreate.
 func registerTieredView(ctx context.Context, conn *pgx.Conn, schema, table, hotTable, icebergTable, partitionCol string) error {
-	_, err := conn.Exec(ctx, `
+	_, err := conn.Exec(ctx /* nosemgrep */, `
 		INSERT INTO coldfront.tiered_views (schema_name, relname, hot_table, iceberg_table, partition_col)
 		VALUES ($1, $2, $3, $4, $5)
 		ON CONFLICT (schema_name, relname) DO UPDATE

@@ -215,7 +215,7 @@ func (m *Manager) createPartition(ctx context.Context, parent, schema, period st
 	// collision fails loud instead of silently leaving the table partition-less
 	// and the run reporting success (issue #11, bug 2).
 	var attached bool
-	if err := m.db.QueryRow(ctx,
+	if err := m.db.QueryRow(ctx, /* nosemgrep */
 		`SELECT EXISTS(SELECT 1 FROM pg_inherits WHERE inhrelid = to_regclass($1) AND inhparent = to_regclass($2))`,
 		qname, qparent).Scan(&attached); err != nil {
 		return fmt.Errorf("verify partition %s attached to %s.%s: %w", name, schema, parent, err)

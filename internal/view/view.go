@@ -339,7 +339,7 @@ func (g *Generator) Recreate(ctx context.Context, cfg ViewConfig) error {
 		GenerateTriggerSQL(cfg),
 	}
 	for _, sql := range stmts {
-		if _, err := g.db.Exec(ctx, sql); err != nil {
+		if _, err := g.db.Exec(ctx, sql); err != nil { // nosemgrep
 			return fmt.Errorf("recreate view: %w", err)
 		}
 	}

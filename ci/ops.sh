@@ -52,7 +52,7 @@ ip() { docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}
 step "ops: build + up ($COMPOSE_FILE, pg$PG)"
 $COMPOSE down -v >/dev/null 2>&1 || true
 $COMPOSE up -d --build >/dev/null 2>&1
-for i in $(seq 1 30); do [ "$(docker inspect -f '{{.State.Health.Status}}' "$DB" 2>/dev/null)" = "healthy" ] && break; sleep 2; done
+for _ in $(seq 1 30); do [ "$(docker inspect -f '{{.State.Health.Status}}' "$DB" 2>/dev/null)" = "healthy" ] && break; sleep 2; done
 [ "$(docker inspect -f '{{.State.Health.Status}}' "$DB" 2>/dev/null)" = "healthy" ] || { echo "db not healthy"; exit 1; }
 LK_IP=$(ip "$LK"); SW_IP=$(ip "$SW")
 NET=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' "$DB")
@@ -82,8 +82,8 @@ assert_eq "baseline: cold read" "1" "$(q "$DB" "SELECT count(*) FROM cold1;")"
 # cold_recovers <label>  — retry the cold read until it returns 1 (a fresh session
 # re-attaches once the dependency is back). Bounded so a never-recovering case fails.
 cold_recovers() {
-    local out i
-    for i in $(seq 1 25); do
+    local out
+    for _ in $(seq 1 25); do
         out=$(q "$DB" "SELECT count(*) FROM cold1;" 2>/dev/null)
         [ "$out" = "1" ] && break
         sleep 2
@@ -164,7 +164,7 @@ docker run -d --name "$RESTORE" --network "$NET" \
     -e PG_MAJOR="$PG" -e MESH=off \
     -e COLDFRONT_WAREHOUSE=wh -e COLDFRONT_LAKEKEEPER=http://lakekeeper:8181/catalog \
     "$IMG" >/dev/null 2>&1
-for i in $(seq 1 40); do [ "$(docker inspect -f '{{.State.Health.Status}}' "$RESTORE" 2>/dev/null)" = "healthy" ] && break; sleep 2; done
+for _ in $(seq 1 40); do [ "$(docker inspect -f '{{.State.Health.Status}}' "$RESTORE" 2>/dev/null)" = "healthy" ] && break; sleep 2; done
 # Logical dump of the live coldfront DB → restore into the fresh instance's empty
 # coldfront DB (the dump's CREATE EXTENSION + config-dumped data rebuild it).
 docker exec "$DB" pg_dump -U coldfront -d coldfront 2>/dev/null \
@@ -184,7 +184,7 @@ assert_contains "cold read fails cleanly on the restore until the secret is re-s
 # 4. Re-establish the credential → cold tier re-attaches to the SAME Iceberg.
 q "$RESTORE" "SELECT coldfront.set_storage_secret('admin','adminsecret','${SW_IP}:8333');" >/dev/null 2>&1
 restored=""
-for i in $(seq 1 25); do restored=$(q "$RESTORE" "SELECT count(*) FROM cold1;" 2>/dev/null); [ "$restored" = "$cold_before" ] && break; sleep 2; done
+for _ in $(seq 1 25); do restored=$(q "$RESTORE" "SELECT count(*) FROM cold1;" 2>/dev/null); [ "$restored" = "$cold_before" ] && break; sleep 2; done
 assert_eq "cold tier re-attaches to the same Iceberg after set_storage_secret" "$cold_before" "$restored"
 # 5. Registry-driven routing works post-restore: an UPDATE through the decoupled
 #    view is recognised by the hook (only possible if the registry survived).

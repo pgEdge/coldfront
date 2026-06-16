@@ -429,8 +429,11 @@ iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:818
 $(storage_yaml)
 archiver: { tables: [ { source_table: typed, partition_period: monthly, hot_period: "${ret_days} days" } ] }
 EOF
-    "$ARCHIVER" --config /tmp/journey-typed.yaml >/tmp/journey-typed.log 2>&1 \
-        && pass "typed table archived (Jan → cold)" || { fail "typed archive — see /tmp/journey-typed.log"; tail -5 /tmp/journey-typed.log; }
+    if "$ARCHIVER" --config /tmp/journey-typed.yaml >/tmp/journey-typed.log 2>&1; then
+        pass "typed table archived (Jan → cold)"
+    else
+        fail "typed archive — see /tmp/journey-typed.log"; tail -5 /tmp/journey-typed.log
+    fi
     local O; O=$(qf "$HOST" <<'EOSQL'
 SELECT 'COLD_NUM:'  || c_num::text   FROM typed WHERE ts < date_trunc('month',now()) - interval '3 months';
 SELECT 'COLD_UUID:' || c_uuid::text  FROM typed WHERE ts < date_trunc('month',now()) - interval '3 months';
@@ -870,9 +873,11 @@ SELECT 'RB_TOTAL:' || count(*) FROM events WHERE status='rollback_me';
 EOSQL
 )
     assert_eq "rollback undoes hot+cold" "0" "$(extract RB_TOTAL "$O")"
-    "$ARCHIVER" --config /tmp/journey-archiver.yaml >/tmp/journey-idem.log 2>&1 \
-        && assert_contains "archiver idempotent (re-run no-op)" "nothing to tier or expire" "$(cat /tmp/journey-idem.log)" \
-        || fail "archiver idempotent re-run errored"
+    if "$ARCHIVER" --config /tmp/journey-archiver.yaml >/tmp/journey-idem.log 2>&1; then
+        assert_contains "archiver idempotent (re-run no-op)" "nothing to tier or expire" "$(cat /tmp/journey-idem.log)"
+    else
+        fail "archiver idempotent re-run errored"
+    fi
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -1054,9 +1059,9 @@ story_standby_reads() {
     # cold-side read assertion above), and an Iceberg targeted-column INSERT is
     # unsupported, so there is no hot-tier peer write to route here anyway.
     if [ "$MESH" = 1 ] && [ "$MODE" = tiered ] && [ -n "${PEERS:-}" ]; then
-        local PARR peer seen=0 j; read -ra PARR <<< "$PEERS"; peer="${PARR[0]}"
+        local PARR peer seen=0; read -ra PARR <<< "$PEERS"; peer="${PARR[0]}"
         q "$peer" "INSERT INTO $vn (ts,status,data) VALUES (date_trunc('month',now()) - interval '1 month' + interval '21 days' + interval '8 hours','sb_xnode','{}'::jsonb);" >/dev/null 2>&1
-        for j in $(seq 1 30); do
+        for _ in $(seq 1 30); do
             [ "$(q "$STANDBY" "SELECT count(*) FROM $vn WHERE status='sb_xnode';")" = 1 ] && { seen=1; break; }
             sleep 1
         done
@@ -1338,14 +1343,14 @@ EOSQL
 
     # list shows it.
     "$ARCHIVER" list --config /tmp/journey-archiver.yaml >/tmp/journey-list.log 2>&1
-    grep -q "cli_events" /tmp/journey-list.log && pass "list shows cli_events" || { fail "list missing cli_events"; cat /tmp/journey-list.log; }
+    if grep -q "cli_events" /tmp/journey-list.log; then pass "list shows cli_events"; else fail "list missing cli_events"; cat /tmp/journey-list.log; fi
 
     # register must reject the PK-less table (loud, before any row is written).
     if "$ARCHIVER" register --config /tmp/journey-archiver.yaml --table cli_nopk \
             --period monthly --hot-period "1 month" >/tmp/journey-nopk.log 2>&1; then
         fail "register cli_nopk should have failed (no primary key)"
     else
-        grep -qi "primary key" /tmp/journey-nopk.log && pass "register rejects the PK-less table" || { fail "wrong rejection reason"; tail -3 /tmp/journey-nopk.log; }
+        if grep -qi "primary key" /tmp/journey-nopk.log; then pass "register rejects the PK-less table"; else fail "wrong rejection reason"; tail -3 /tmp/journey-nopk.log; fi
     fi
     assert_eq "no row written for the rejected table" "0" \
         "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='cli_nopk';")"
@@ -1355,7 +1360,7 @@ EOSQL
             --period monthly --hot-period "3 months" --retention "1 month" >/tmp/journey-rethot.log 2>&1; then
         fail "register should reject retention <= hot-period"
     else
-        grep -qi "must exceed" /tmp/journey-rethot.log && pass "register rejects retention <= hot-period" || { fail "wrong reason"; tail -3 /tmp/journey-rethot.log; }
+        if grep -qi "must exceed" /tmp/journey-rethot.log; then pass "register rejects retention <= hot-period"; else fail "wrong reason"; tail -3 /tmp/journey-rethot.log; fi
     fi
 
     # Periods are native PG intervals: a compound form the old "N unit" parser
@@ -1373,7 +1378,7 @@ EOSQL
             --period monthly --retention "banana" --dry-run >/tmp/journey-badiv.log 2>&1; then
         fail "register should reject a non-interval retention"
     else
-        grep -qi "interval" /tmp/journey-badiv.log && pass "register rejects a non-interval period" || { fail "wrong reason"; tail -3 /tmp/journey-badiv.log; }
+        if grep -qi "interval" /tmp/journey-badiv.log; then pass "register rejects a non-interval period"; else fail "wrong reason"; tail -3 /tmp/journey-badiv.log; fi
     fi
 
     # Run the archiver with a connection-only YAML (NO archiver.tables): it must
@@ -1388,13 +1393,13 @@ EOF
     else
         fail "archiver DB-driven run — see /tmp/journey-dbrun.log"; tail -8 /tmp/journey-dbrun.log
     fi
-    grep -q "from coldfront.partition_config" /tmp/journey-dbrun.log && pass "archiver drove off partition_config (not YAML)" || { fail "did not load from partition_config"; tail -3 /tmp/journey-dbrun.log; }
+    if grep -q "from coldfront.partition_config" /tmp/journey-dbrun.log; then pass "archiver drove off partition_config (not YAML)"; else fail "did not load from partition_config"; tail -3 /tmp/journey-dbrun.log; fi
     assert_eq "cli_events tiered via DB config (now a view)" "v" "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='cli_events';")"
     assert_eq "cli_events readable hot+cold after DB-driven tiering" "80" "$(q "$HOST" "SELECT count(*) FROM cli_events;")"
 
     # export round-trips the managed set to reviewable YAML.
     "$ARCHIVER" export --config /tmp/journey-conn.yaml >/tmp/journey-export.log 2>&1
-    grep -q "source_table: cli_events" /tmp/journey-export.log && pass "export emits cli_events as YAML" || { fail "export missing cli_events"; tail -5 /tmp/journey-export.log; }
+    if grep -q "source_table: cli_events" /tmp/journey-export.log; then pass "export emits cli_events as YAML"; else fail "export missing cli_events"; tail -5 /tmp/journey-export.log; fi
 }
 
 # idmode_check <label> <table> <coltype> <id-default> <id-scheme> — provision a
@@ -1521,9 +1526,11 @@ EOF
         fail "issue #12: partitioner run failed (pre-fix it targets the view)"; tail -8 /tmp/journey-issue12.log; return
     fi
     # The fix resolves events → _events, so the reconcile is logged against _events.
-    grep -q "\[_events\] reconciled" /tmp/journey-issue12.log \
-        && pass "issue #12: partitioner reconciled _events (resolved past the view)" \
-        || { fail "issue #12: reconcile did not target _events"; tail -8 /tmp/journey-issue12.log; }
+    if grep -q "\[_events\] reconciled" /tmp/journey-issue12.log; then
+        pass "issue #12: partitioner reconciled _events (resolved past the view)"
+    else
+        fail "issue #12: reconcile did not target _events"; tail -8 /tmp/journey-issue12.log
+    fi
     # And it never trips the verify-attach guard that the pre-fix view target hits.
     if grep -q "different parent" /tmp/journey-issue12.log; then
         fail "issue #12: partitioner tripped the verify-attach guard (still targeting the view)"; tail -8 /tmp/journey-issue12.log
