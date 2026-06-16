@@ -69,7 +69,7 @@ trap topo_teardown EXIT
 step "vanilla: build + up ($COMPOSE_FILE)"
 $COMPOSE down -v >/dev/null 2>&1 || true
 $COMPOSE up -d --build >/dev/null 2>&1
-for i in $(seq 1 30); do
+for _ in $(seq 1 30); do
     [ "$(docker inspect -f '{{.State.Health.Status}}' "$DB" 2>/dev/null)" = "healthy" ] && break
     sleep 2
 done

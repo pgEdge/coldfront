@@ -53,14 +53,14 @@ summary() {
 # until it accepts connections. Returns nonzero (and dumps the standby log) if it
 # never comes up. Shared by ci/probe-standby.sh and the topology scripts (DRY).
 standby_up() {
-    local primary="$1" sb="$2" i db_ip net img
+    local primary="$1" sb="$2" db_ip net img
     db_ip=$(docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$primary")
     net=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' "$primary")
     img=$(docker inspect -f '{{.Config.Image}}' "$primary")
     docker rm -f "$sb" >/dev/null 2>&1 || true
     docker run -d --name "$sb" --network "$net" \
         -e PG_MAJOR="${PG_MAJOR:-18}" -e COLDFRONT_STANDBY_OF="$db_ip" "$img" >/dev/null || return 1
-    for i in $(seq 1 45); do
+    for _ in $(seq 1 45); do
         docker exec "$sb" pg_isready -U "$CF_DBUSER" -d "$CF_DBNAME" >/dev/null 2>&1 && return 0
         sleep 2
     done
@@ -82,6 +82,7 @@ topo_standby() {
     [ "${STANDBY:-0}" = 1 ] || return 0
     step "base-backup a read-only standby of $1"
     standby_up "$1" "$CF_STANDBY" || { echo "standby $CF_STANDBY did not come up"; exit 1; }
+    # shellcheck disable=SC2034  # consumed as "${STANDBY_ARG[@]}" by topo/{vanilla,mesh}.sh, which source this file
     STANDBY_ARG=(--standby "$CF_STANDBY")
 }
 
@@ -102,8 +103,8 @@ topo_teardown() {
 # caller on warehouse-create failure. The ONE home for this — topo/vanilla.sh,
 # topo/mesh.sh and ops.sh all call it (callers build the backend-specific <wh_body>).
 create_warehouse_and_seed() {
-    local lk_ip="$1" wh_body="$2" wh="" wid i
-    for i in $(seq 1 15); do
+    local lk_ip="$1" wh_body="$2" wh="" wid
+    for _ in $(seq 1 15); do
         wh=$(curl -s "http://$lk_ip:8181/management/v1/warehouse" -X POST -H "Content-Type: application/json" -d "$wh_body" 2>&1)
         echo "$wh" | grep -q "warehouse-id" && break
         echo "$wh" | grep -qi "already exists" && { wh="warehouse-id (exists)"; break; }
@@ -112,6 +113,8 @@ create_warehouse_and_seed() {
     echo "$wh" | grep -q "warehouse-id" || { echo "warehouse creation failed after retries: $wh"; exit 1; }
     wid=$(echo "$wh" | grep -oE '"warehouse-id":"[^"]+"' | head -1 | cut -d'"' -f4)
     [ -z "$wid" ] && wid=$(curl -s "http://$lk_ip:8181/management/v1/warehouse" | grep -oE '"warehouse-id":"[^"]+"' | head -1 | cut -d'"' -f4)
-    [ -n "$wid" ] && curl -s -X POST "http://$lk_ip:8181/catalog/v1/$wid/namespaces" \
-        -H "Content-Type: application/json" -d '{"namespace":["default"]}' >/dev/null 2>&1 || true
+    if [ -n "$wid" ]; then
+        curl -s -X POST "http://$lk_ip:8181/catalog/v1/$wid/namespaces" \
+            -H "Content-Type: application/json" -d '{"namespace":["default"]}' >/dev/null 2>&1 || true
+    fi
 }

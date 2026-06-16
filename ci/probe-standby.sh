@@ -47,7 +47,7 @@ step "1. build + up primary stack"
 docker rm -f "$SB" >/dev/null 2>&1 || true
 $COMPOSE down -v >/dev/null 2>&1 || true
 $COMPOSE up -d --build >/dev/null 2>&1
-for i in $(seq 1 30); do
+for _ in $(seq 1 30); do
     [ "$(docker inspect -f '{{.State.Health.Status}}' "$DB" 2>/dev/null)" = healthy ] && break
     sleep 2
 done
@@ -59,7 +59,7 @@ DB_IP=$(ip "$DB"); SW_IP=$(ip coldfront-seaweedfs-1); LK_IP=$(ip coldfront-lakek
 step "2. bootstrap Lakekeeper + warehouse"
 curl -sf "http://$LK_IP:8181/management/v1/bootstrap" -X POST -H "Content-Type: application/json" \
      -d '{"accept-terms-of-use":true}' >/dev/null 2>&1 || true
-for i in $(seq 1 15); do
+for _ in $(seq 1 15); do
     WH=$(curl -s "http://$LK_IP:8181/management/v1/warehouse" -X POST -H "Content-Type: application/json" -d "{
       \"warehouse-name\":\"wh\",
       \"storage-profile\":{\"type\":\"s3\",\"bucket\":\"iceberg\",\"region\":\"us-east-1\",\"endpoint\":\"http://${SW_IP}:8333\",\"path-style-access\":true,\"flavor\":\"s3-compat\",\"sts-enabled\":false,\"remote-signing-enabled\":false},
@@ -138,7 +138,7 @@ INREC=$(sb_psql -c "SELECT pg_is_in_recovery();")
 assert_eq "standby is in recovery (hot standby)" "t" "$INREC"
 
 # Wait for the hot partition to replicate (pure-PG, no iceberg dependency).
-for i in $(seq 1 30); do
+for _ in $(seq 1 30); do
     [ "$(sb_psql -c 'SELECT count(*) FROM public.p_2026_04;')" = "$PRIMARY_HOT" ] && break
     sleep 1
 done

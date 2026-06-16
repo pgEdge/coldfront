@@ -42,7 +42,7 @@ docker run -d --name "$SF" -e PG_MAJOR="$PG" -e MESH=on "$IMG" >/dev/null 2>&1 |
 # `docker run` never reports a health status. Wait on real connectivity to the
 # coldfront DB via the same docker-exec psql transport the rest of the probe uses
 # — this also confirms the entrypoint finished creating the role+database.
-for i in $(seq 1 60); do q "$SF" "SELECT 1" >/dev/null 2>&1 && break; sleep 2; done
+for _ in $(seq 1 60); do q "$SF" "SELECT 1" >/dev/null 2>&1 && break; sleep 2; done
 q "$SF" "SELECT 1" >/dev/null 2>&1 || { fail "snowflake node never accepted connections"; docker logs --tail 30 "$SF" 2>&1 | sed 's/^/    /'; exit 1; }
 q "$SF" "CREATE EXTENSION IF NOT EXISTS snowflake;" >/dev/null 2>&1
 

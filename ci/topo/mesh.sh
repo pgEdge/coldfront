@@ -64,7 +64,7 @@ m() { local n="$1"; shift; docker exec -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF
 step "mesh: build + up ($COMPOSE_FILE, pg$PG)"
 $COMPOSE down -v >/dev/null 2>&1 || true
 $COMPOSE up -d --build >/dev/null 2>&1
-for i in $(seq 1 60); do
+for _ in $(seq 1 60); do
     h=0; for n in $NODES; do [ "$(docker inspect -f '{{.State.Health.Status}}' "coldfront-${n}-1" 2>/dev/null)" = "healthy" ] && h=$((h+1)); done
     [ "$h" = 3 ] && break; sleep 2
 done

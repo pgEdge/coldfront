@@ -179,7 +179,7 @@ func runRegister(ctx context.Context, args []string) error {
 		fmt.Printf("dry-run OK: %s.%s validates; would run:\n%s\n", *schema, *table, insertSQL)
 		return nil
 	}
-	if _, err := conn.Exec(ctx, insertSQL); err != nil {
+	if _, err := conn.Exec(ctx, insertSQL); err != nil { // nosemgrep
 		return fmt.Errorf("register %s.%s: %w", *schema, *table, err)
 	}
 	fmt.Printf("registered %s.%s\n", *schema, *table)

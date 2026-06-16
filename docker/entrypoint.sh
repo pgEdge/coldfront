@@ -144,8 +144,10 @@ EOF
     "$PGBIN/psql" -U coldfront -d postgres -c "CREATE DATABASE coldfront OWNER coldfront"
     # NOLOGIN group role pg_duckdb gates DuckDB on. Members (granted via
     # coldfront.grant_app_access) run the cold path as non-superusers.
-    [ -n "$DUCKDB_ROLE" ] && "$PGBIN/psql" -U coldfront -d postgres \
-        -c "CREATE ROLE \"${DUCKDB_ROLE}\" NOLOGIN" 2>/dev/null || true
+    if [ -n "$DUCKDB_ROLE" ]; then
+        "$PGBIN/psql" -U coldfront -d postgres \
+            -c "CREATE ROLE \"${DUCKDB_ROLE}\" NOLOGIN" 2>/dev/null || true
+    fi
     "$PGBIN/pg_ctl" -D "$PGDATA" -m fast -w stop
 fi
 
