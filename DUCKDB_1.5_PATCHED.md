@@ -1,12 +1,12 @@
 # PATCHED — duckdb-iceberg patches & build (DuckDB 1.5.x)
 
-ColdFront runs on a **privately-built DuckDB 1.5.3 base image** that carries a
+ColdFront runs on a **custom-built DuckDB 1.5.3 base image** that carries a
 small set of patches against `duckdb-iceberg` `v1.5-variegata`. This is the one
 home for *what* we patch, *why*, *how the base is built*, and *how it is wired
 and verified*. The cold-tier compactor's own story (and the three interop
 patches' details) lives in [COMPACTOR.md](COMPACTOR.md).
 
-> **Why a private build at all?** There is no released pg_duckdb bundling
+> **Why a custom build at all?** There is no released pg_duckdb bundling
 > DuckDB 1.5.x, so the stack is assembled off pg_duckdb PR #1025 + the
 > `v1.5-variegata` extension branch. DuckDB 1.5.x is required for Azure ADLS
 > `abfss://` Iceberg **reads** (`read_avro` on `abfss`); the base then layers
@@ -201,9 +201,9 @@ GUCs the patched-base entrypoint writes to `postgresql.conf`:
 > (and `azure` for an Azure cold tier) must be pre-placed beside `iceberg` or
 > `LOAD iceberg` fails. The shipped image pre-places all four, so this is moot.
 
-Building the app locally needs `docker login ghcr.io` (read:packages) to pull the
-base while it is not yet published publicly (pre-Beta), or a locally-built base
-tagged `ghcr.io/pgedge/coldfront-duckdb-base:pg<major>`.
+Building the app locally pulls the published base
+`ghcr.io/pgedge/coldfront-duckdb-base:pg<major>`, or uses a locally-built
+base tagged the same.
 
 ## 8. v1.5 architecture notes (verified against source)
 

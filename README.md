@@ -88,22 +88,9 @@ Application
 
 ## Installation
 
-> ### Packages - coming with the Beta release
->
-> With the Beta release, ColdFront installs from **pgEdge package
-> repositories**: the PostgreSQL `coldfront` extension (with its pg_duckdb +
-> patched-iceberg dependencies) and the `archiver` binary, via your platform's
-> package manager. This section will carry the exact repo setup + install
-> commands once the packages are published.
->
-> <!-- STUB - fill in once the Beta packages are published:
->   RHEL / Rocky:      dnf install coldfront           (package names + repo TBD)
->   Debian / Ubuntu:   apt install coldfront
->   Container image:   docker pull ghcr.io/pgedge/coldfront:<pg>   (public image TBD)
-> -->
-
-**Build from source** - the full build workflow lives in
-**[INSTALL.md](docs/installation.md)**: build the DuckDB-1.5.x base + the
+ColdFront is open source under the PostgreSQL License and runs on stock
+PostgreSQL 16, 17, and 18. The full build workflow lives in
+**[INSTALL.md](docs/installation.md)**: build the DuckDB 1.5.x base and the
 coldfront layer with one `docker build`, or install bare-metal. Then
 continue with the Quickstart below.
 

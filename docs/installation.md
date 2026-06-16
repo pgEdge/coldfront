@@ -55,10 +55,9 @@ live in the prebuilt **base**, published to
 `ghcr.io/pgedge/coldfront-duckdb-base:pg{16,17,18}`; the **app** build
 ([`docker/Dockerfile.duckdb15`](https://github.com/pgEdge/ColdFront/blob/main/docker/Dockerfile.duckdb15)) just `FROM`s it and
 compiles the coldfront extension in seconds. If you build the base
-yourself (step 1) the app layer `FROM`s your local image. To `FROM` the
-published base instead of recompiling requires `docker login ghcr.io`
-while it is not yet published publicly (pre-Beta). Rebuild the published
-base via the
+yourself (step 1) the app layer `FROM`s your local image; otherwise it
+`FROM`s the published `ghcr.io/pgedge/coldfront-duckdb-base:pg<major>`.
+Rebuild the published base via the
 [base-image workflow](https://github.com/pgEdge/ColdFront/blob/main/.github/workflows/base-image.yml) (`gh workflow run
 base-image.yml`) when its inputs change.
 
