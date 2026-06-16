@@ -512,14 +512,14 @@ func runCycle(ctx context.Context, cfg *config.Config, t *config.TableConfig, co
 	return nil
 }
 
-// runCycleTwoLevel tiers a 2-level LIST(region)→RANGE(time) table. It premakes
-// the forward window of RANGE leaves under each region's LIST child, then tiers
-// past-hot leaves to the single cold Iceberg table (region is just a column),
-// then runs the region-agnostic cold-expiry. Leaves are tiered grouped by ts
-// period, oldest first, and within a period EVERY region's leaf is exported to
-// cold before any cutover advances the shared watermark — so a period only goes
-// cold once it is cold for all regions, and no region's rows vanish from the
-// region-agnostic view mid-cycle. The child name uses the stable configured name
+// runCycleTwoLevel tiers a 2-level LIST(key)→RANGE(time) table. It premakes
+// the forward window of RANGE leaves under each LIST value's child, then tiers
+// past-hot leaves to the single cold Iceberg table (the LIST key is just a
+// column), then runs the list-agnostic cold-expiry. Leaves are tiered grouped by
+// ts period, oldest first, and within a period EVERY LIST value's leaf is exported
+// to cold before any cutover advances the shared watermark — so a period only goes
+// cold once it is cold for all LIST values, and no LIST value's rows vanish from
+// the list-agnostic view mid-cycle. The child name uses the stable configured name
 // (t.SourceTable) so it matches the partitioner's naming across the bootstrap
 // rename of the physical hot table.
 func runCycleTwoLevel(ctx context.Context, cfg *config.Config, t *config.TableConfig, conn *pgx.Conn, wmStore *watermark.Store, debugExportDelay time.Duration, now time.Time) error {
@@ -533,9 +533,9 @@ func runCycleTwoLevel(ctx context.Context, cfg *config.Config, t *config.TableCo
 	}
 	parent := resolveTableName(ctx, conn, t.SourceSchema, t.SourceTable) // physical top (_events after swap)
 
-	// 1. Premake per region: ensure the LIST child exists (attached to the
+	// 1. Premake per LIST value: ensure the LIST child exists (attached to the
 	//    physical top, named by the stable source name) and its forward window.
-	type childRef struct{ name, region string }
+	type childRef struct{ name, listVal string }
 	var children []childRef
 	anyBehind := false
 	for _, v := range values {
@@ -559,14 +559,14 @@ func runCycleTwoLevel(ctx context.Context, cfg *config.Config, t *config.TableCo
 		children = append(children, childRef{child, v})
 	}
 	if anyBehind {
-		log.Printf("[%s] a region had no hot partition covering %s — created it; if this table is actively written, widen future_partitions (=%d) or run more often",
+		log.Printf("[%s] a LIST value had no hot partition covering %s — created it; if this table is actively written, widen future_partitions (=%d) or run more often",
 			t.SourceTable, now.Format("2006-01-02"), t.FuturePartitions)
 	}
 
-	// 2. Enumerate past-hot RANGE leaves under each region child.
+	// 2. Enumerate past-hot RANGE leaves under each LIST-value child.
 	type leafRef struct {
-		child, region string
-		info          partition.Info
+		child, listVal string
+		info           partition.Info
 	}
 	var leaves []leafRef
 	hotCutoff, err := partMgr.ExpiryCutoff(ctx, now, t.HotPeriod)
@@ -579,7 +579,7 @@ func runCycleTwoLevel(ctx context.Context, cfg *config.Config, t *config.TableCo
 			return fmt.Errorf("find expired %s: %w", c.name, err)
 		}
 		for _, info := range exp {
-			leaves = append(leaves, leafRef{c.name, c.region, info})
+			leaves = append(leaves, leafRef{c.name, c.listVal, info})
 		}
 	}
 
@@ -589,7 +589,7 @@ func runCycleTwoLevel(ctx context.Context, cfg *config.Config, t *config.TableCo
 		return nil
 	}
 	if len(leaves) > 0 {
-		log.Printf("[%s] found %d leaf partition(s) past the hot window across %d region(s)",
+		log.Printf("[%s] found %d leaf partition(s) past the hot window across %d LIST value(s)",
 			t.SourceTable, len(leaves), len(children))
 	}
 
@@ -619,12 +619,12 @@ func runCycleTwoLevel(ctx context.Context, cfg *config.Config, t *config.TableCo
 				"%s.%s has no primary key — required for race-safe archive (delta capture "+
 					"keys writes by source PK)", t.SourceSchema, t.SourceTable)
 		}
-		// The LIST (region) column, for the region-scoped Phase-0 wipe.
+		// The LIST (level-1) column, for the LIST-value-scoped Phase-0 wipe.
 		listCols, err := detectPartitionColumns(ctx, conn, t.SourceSchema, t.SourceTable)
 		if err != nil {
 			return fmt.Errorf("detect list column: %w", err)
 		}
-		regionCol := listCols[0]
+		listCol := listCols[0]
 
 		// First-cycle bootstrap: rename top→_top + unified view + register.
 		wmCutoff, _, err := wmStore.Get(ctx, t.SourceTable)
@@ -664,7 +664,7 @@ func runCycleTwoLevel(ctx context.Context, cfg *config.Config, t *config.TableCo
 				return err
 			}
 			grp := byPeriod[p]
-			// Export EVERY region's leaf for this period first (no detach, cutoff
+			// Export EVERY LIST value's leaf for this period first (no detach, cutoff
 			// unchanged) so all of the period is in cold before it advances.
 			type exported struct {
 				lf   leafRef
@@ -672,7 +672,7 @@ func runCycleTwoLevel(ctx context.Context, cfg *config.Config, t *config.TableCo
 			}
 			var done []exported
 			for _, lf := range grp {
-				snap, err := archiveExport(ctx, conn, t, lf.info, iceTable, columns, regionCol, lf.region, debugExportDelay)
+				snap, err := archiveExport(ctx, conn, t, lf.info, iceTable, columns, listCol, lf.listVal, debugExportDelay)
 				if err != nil {
 					return fmt.Errorf("export %s: %w", lf.info.Name, err)
 				}
@@ -684,12 +684,12 @@ func runCycleTwoLevel(ctx context.Context, cfg *config.Config, t *config.TableCo
 				if err := archiveCutover(ctx, conn, t, e.lf.info, iceTable, e.snap, columns); err != nil {
 					return fmt.Errorf("cutover %s: %w", e.lf.info.Name, err)
 				}
-				log.Printf("tiered %s (region %s)", e.lf.info.Name, e.lf.region)
+				log.Printf("tiered %s (list value %s)", e.lf.info.Name, e.lf.listVal)
 			}
 		}
 	}
 
-	// 5. Cold-expiry: drop Iceberg data older than retention_period (region-agnostic).
+	// 5. Cold-expiry: drop Iceberg data older than retention_period (list-agnostic).
 	if coldExpiry {
 		cExp, err := partMgr.ExpiryCutoff(ctx, now, t.RetentionPeriod)
 		if err != nil {
@@ -753,21 +753,21 @@ func archivePartition(ctx context.Context, conn *pgx.Conn, t *config.TableConfig
 // archiveExport runs Phases 0-2 for one partition: the idempotent Iceberg-range
 // wipe, install of the capture trigger + delta table, and the bulk PG→Iceberg
 // export under a captured snapshot. It returns the snapshot string the cutover's
-// delta replay needs. (regionCol, regionVal) scopes the Phase-0 wipe for a
-// 2-level leaf so re-exporting one region's leaf cannot wipe another region's
-// already-cold rows in the same ts range; pass "","" for the single-level path.
-// Splitting export from cutover lets the 2-level path export EVERY region's leaf
-// for a ts period before the shared cutoff advances, so no region's rows vanish
-// from the view mid-cycle.
+// delta replay needs. (listCol, listVal) scopes the Phase-0 wipe for a
+// 2-level leaf so re-exporting one LIST value's leaf cannot wipe another LIST
+// value's already-cold rows in the same ts range; pass "","" for the single-level
+// path. Splitting export from cutover lets the 2-level path export EVERY LIST
+// value's leaf for a ts period before the shared cutoff advances, so no LIST
+// value's rows vanish from the view mid-cycle.
 func archiveExport(ctx context.Context, conn *pgx.Conn, t *config.TableConfig,
 	part partition.Info, iceTable string, columns []view.Column,
-	regionCol, regionVal string, debugExportDelay time.Duration,
+	listCol, listVal string, debugExportDelay time.Duration,
 ) (string, error) {
 	log.Printf("[%s] exporting %s (%s to %s)", t.SourceTable, part.Name, part.LowerBound, part.UpperBound)
 
 	// Phase 0
 	t0 := time.Now()
-	if err := wipeIcebergRange(ctx, conn, iceTable, t.PartitionColumn, part.LowerBound, part.UpperBound, regionCol, regionVal); err != nil {
+	if err := wipeIcebergRange(ctx, conn, iceTable, t.PartitionColumn, part.LowerBound, part.UpperBound, listCol, listVal); err != nil {
 		return "", fmt.Errorf("phase 0 (idempotent prep): %w", err)
 	}
 	log.Printf("[%s] %s phase 0 (idempotent iceberg-range wipe): %s",
@@ -880,14 +880,14 @@ func archiveCutover(ctx context.Context, conn *pgx.Conn, t *config.TableConfig,
 // falls inside [lower, upper). Phase 0 of archive — handles the case where a
 // previous archive cycle exported to Iceberg but crashed before cutover, so
 // the partition remained attached and will be re-exported this cycle. For a
-// 2-level leaf (regionVal != "") the delete is scoped to that region so
-// re-exporting one region's leaf cannot wipe another region's already-cold rows
+// 2-level leaf (listVal != "") the delete is scoped to that LIST value so
+// re-exporting one LIST value's leaf cannot wipe another's already-cold rows
 // in the same ts range (they share one Iceberg table).
-func wipeIcebergRange(ctx context.Context, conn *pgx.Conn, iceTable, partCol string, lower, upper time.Time, regionCol, regionVal string) error {
-	regionPred := ""
-	if regionVal != "" {
-		regionPred = fmt.Sprintf(" AND %s = '%s'",
-			pgx.Identifier{regionCol}.Sanitize(), strings.ReplaceAll(regionVal, "'", "''"))
+func wipeIcebergRange(ctx context.Context, conn *pgx.Conn, iceTable, partCol string, lower, upper time.Time, listCol, listVal string) error {
+	listPred := ""
+	if listVal != "" {
+		listPred = fmt.Sprintf(" AND %s = '%s'",
+			pgx.Identifier{listCol}.Sanitize(), strings.ReplaceAll(listVal, "'", "''"))
 	}
 	// Route through coldfront._exec_iceberg_with_claim so this cold-tier write
 	// is serialized against concurrent committers (R-A bakery on a mesh, local
@@ -900,7 +900,7 @@ func wipeIcebergRange(ctx context.Context, conn *pgx.Conn, iceTable, partCol str
 		lower.UTC().Format("2006-01-02 15:04:05+00"),
 		pgx.Identifier{partCol}.Sanitize(),
 		upper.UTC().Format("2006-01-02 15:04:05+00"),
-		regionPred)
+		listPred)
 	q, err := dollarQuote(inner)
 	if err != nil {
 		return err
