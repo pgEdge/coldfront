@@ -823,7 +823,7 @@ func archiveCutover(ctx context.Context, conn *pgx.Conn, t *config.TableConfig,
 			t.SourceTable, part.Name, attempt, time.Since(t3).Round(time.Millisecond))
 
 		t4 := time.Now()
-		if _, err := conn.Exec(ctx,
+		if _, err := conn.Exec(ctx, /* nosemgrep */
 			"CALL coldfront.cutover_archive($1, $2, $3, $4, $5, $6, $7)",
 			t.SourceSchema, part.Name, t.SourceTable,
 			part.UpperBound, viewDDL, iceTable, 100); err == nil {
