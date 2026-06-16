@@ -85,20 +85,43 @@ func RunReconcile(ctx context.Context, lc Lifecycle, s Spec, now time.Time, expi
 	if err != nil {
 		return fmt.Errorf("ensure current %s.%s: %w", s.Schema, s.Parent, err)
 	}
-	// Resolve the expiry cutoff in Postgres (calendar-accurate now - interval).
-	// An empty interval means no destroy boundary on this spec: skip expiry
-	// entirely (and never hand ''::interval to Postgres).
-	var expired []Info
-	if s.RetentionInterval != "" {
-		cutoff, err := lc.ExpiryCutoff(ctx, now, s.RetentionInterval)
-		if err != nil {
-			return fmt.Errorf("retention cutoff %s.%s: %w", s.Schema, s.Parent, err)
-		}
-		expired, err = lc.FindExpired(ctx, s.Parent, s.Schema, cutoff, b)
-		if err != nil {
-			return fmt.Errorf("find expired %s.%s: %w", s.Schema, s.Parent, err)
-		}
+	expired, err := resolveExpired(ctx, lc, s, now, b)
+	if err != nil {
+		return err
 	}
+	if err := expireAll(ctx, lc, s, expired, expire); err != nil {
+		return err
+	}
+	if behind {
+		return fmt.Errorf("%w for %s.%s: no partition covered %s at the start of the pass (created it now; widen premake=%d or run more often)",
+			ErrBehind, s.Schema, s.Parent, now.Format(time.RFC3339), s.Premake)
+	}
+	return nil
+}
+
+// resolveExpired resolves the expiry cutoff in Postgres (calendar-accurate
+// now - interval) and finds the partitions past it. An empty interval means no
+// destroy boundary on this spec: skip expiry entirely (and never hand
+// ”::interval to Postgres), returning no partitions.
+func resolveExpired(ctx context.Context, lc Lifecycle, s Spec, now time.Time, b Boundary) ([]Info, error) {
+	if s.RetentionInterval == "" {
+		return nil, nil
+	}
+	cutoff, err := lc.ExpiryCutoff(ctx, now, s.RetentionInterval)
+	if err != nil {
+		return nil, fmt.Errorf("retention cutoff %s.%s: %w", s.Schema, s.Parent, err)
+	}
+	expired, err := lc.FindExpired(ctx, s.Parent, s.Schema, cutoff, b)
+	if err != nil {
+		return nil, fmt.Errorf("find expired %s.%s: %w", s.Schema, s.Parent, err)
+	}
+	return expired, nil
+}
+
+// expireAll removes every expired partition. A non-nil ExpireFunc owns the
+// removal end to end; otherwise the default path detaches and (unless
+// StrategyDetach leaves it in place as a standalone table) drops it.
+func expireAll(ctx context.Context, lc Lifecycle, s Spec, expired []Info, expire ExpireFunc) error {
 	for _, p := range expired {
 		if expire != nil {
 			if err := expire(ctx, p); err != nil {
@@ -117,10 +140,6 @@ func RunReconcile(ctx context.Context, lc Lifecycle, s Spec, now time.Time, expi
 		if err := lc.Drop(ctx, s.Schema, p.Name); err != nil {
 			return err
 		}
-	}
-	if behind {
-		return fmt.Errorf("%w for %s.%s: no partition covered %s at the start of the pass (created it now; widen premake=%d or run more often)",
-			ErrBehind, s.Schema, s.Parent, now.Format(time.RFC3339), s.Premake)
 	}
 	return nil
 }
@@ -144,13 +163,7 @@ type RowQuerier interface {
 func ValidatePeriods(ctx context.Context, q RowQuerier, hot, retention string) error {
 	switch {
 	case hot != "" && retention != "":
-		var ok bool
-		if err := q.QueryRow(ctx, `SELECT $1::interval > $2::interval`, retention, hot).Scan(&ok); err != nil {
-			return fmt.Errorf("invalid hot_period (%q) or retention_period (%q): %w", hot, retention, err)
-		}
-		if !ok {
-			return fmt.Errorf("retention_period (%s) must exceed hot_period (%s)", retention, hot)
-		}
+		return validateOrdering(ctx, q, hot, retention)
 	case hot != "":
 		if err := validInterval(ctx, q, "hot_period", hot); err != nil {
 			return err
@@ -159,6 +172,21 @@ func ValidatePeriods(ctx context.Context, q RowQuerier, hot, retention string) e
 		if err := validInterval(ctx, q, "retention_period", retention); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+// validateOrdering checks (in one round-trip) that retention strictly exceeds
+// hot when both are set: the casts validate syntax and the comparison validates
+// ordering. A retention shorter than the hot window would destroy data before
+// it ever tiers.
+func validateOrdering(ctx context.Context, q RowQuerier, hot, retention string) error {
+	var ok bool
+	if err := q.QueryRow(ctx, `SELECT $1::interval > $2::interval`, retention, hot).Scan(&ok); err != nil {
+		return fmt.Errorf("invalid hot_period (%q) or retention_period (%q): %w", hot, retention, err)
+	}
+	if !ok {
+		return fmt.Errorf("retention_period (%s) must exceed hot_period (%s)", retention, hot)
 	}
 	return nil
 }

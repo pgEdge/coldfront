@@ -94,6 +94,42 @@ func TestInsertSQL_EscapesQuotes(t *testing.T) {
 	}
 }
 
+func TestSetClauses(t *testing.T) {
+	vals := setVals{
+		period: "monthly", column: "ts", premake: 6,
+		hot: "1 month", retention: "5 years",
+		subValues: "SELECT region FROM regions", strategy: "detach",
+	}
+	cases := []struct {
+		flag string
+		want string
+	}{
+		{"period", "partition_period='monthly'"},
+		{"column", "partition_column='ts'"},
+		{"premake", "future_partitions=6"},
+		{"hot-period", "hot_period='1 month'"},
+		{"retention", "retention_period='5 years'"},
+		{"sub-values-source", "sub_part_values_source='SELECT region FROM regions'"},
+		{"strategy", "expiration_strategy='detach'"},
+		{"enable", "enabled=true"},
+		{"disable", "enabled=false"},
+	}
+	for _, c := range cases {
+		clause, ok := setClauses[c.flag]
+		if !ok {
+			t.Errorf("setClauses missing %q", c.flag)
+			continue
+		}
+		if got := clause(vals); got != c.want {
+			t.Errorf("setClauses[%q] = %q, want %q", c.flag, got, c.want)
+		}
+	}
+	// An empty value clears the column (NULL), which is how --hot-period "" works.
+	if got := setClauses["hot-period"](setVals{}); got != "hot_period=NULL" {
+		t.Errorf("empty hot-period = %q, want hot_period=NULL", got)
+	}
+}
+
 func TestPartKeyCols(t *testing.T) {
 	cases := []struct {
 		def  string

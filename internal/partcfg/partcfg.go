@@ -140,28 +140,38 @@ func LoadTables(ctx context.Context, db DBTX) ([]config.TableConfig, error) {
 
 	var out []config.TableConfig
 	for rows.Next() {
-		var t config.TableConfig
-		var col, idScheme, hot, ret, subVals *string
-		if err := rows.Scan(&t.SourceSchema, &t.SourceTable, &t.PartitionPeriod, &col,
-			&t.FuturePartitions, &t.PartMode, &idScheme, &hot, &ret, &subVals, &t.ExpirationStrategy); err != nil {
-			return nil, fmt.Errorf("scan partition_config: %w", err)
-		}
-		if col != nil {
-			t.PartitionColumn = *col
-		}
-		if idScheme != nil {
-			t.IDScheme = *idScheme
-		}
-		if hot != nil {
-			t.HotPeriod = *hot
-		}
-		if ret != nil {
-			t.RetentionPeriod = *ret
-		}
-		if subVals != nil {
-			t.SubPartition = &config.SubPartitionConfig{ValuesSource: *subVals}
+		t, err := scanTableConfig(rows)
+		if err != nil {
+			return nil, err
 		}
 		out = append(out, t)
 	}
 	return out, rows.Err()
+}
+
+// scanTableConfig maps one partition_config row onto config.TableConfig,
+// dereferencing the nullable columns onto their zero-value or pointer fields.
+func scanTableConfig(rows pgx.Rows) (config.TableConfig, error) {
+	var t config.TableConfig
+	var col, idScheme, hot, ret, subVals *string
+	if err := rows.Scan(&t.SourceSchema, &t.SourceTable, &t.PartitionPeriod, &col,
+		&t.FuturePartitions, &t.PartMode, &idScheme, &hot, &ret, &subVals, &t.ExpirationStrategy); err != nil {
+		return t, fmt.Errorf("scan partition_config: %w", err)
+	}
+	if col != nil {
+		t.PartitionColumn = *col
+	}
+	if idScheme != nil {
+		t.IDScheme = *idScheme
+	}
+	if hot != nil {
+		t.HotPeriod = *hot
+	}
+	if ret != nil {
+		t.RetentionPeriod = *ret
+	}
+	if subVals != nil {
+		t.SubPartition = &config.SubPartitionConfig{ValuesSource: *subVals}
+	}
+	return t, nil
 }

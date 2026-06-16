@@ -146,23 +146,29 @@ func applyDefaults(cfg *Config) {
 		cfg.S3.Region = "us-east-1"
 	}
 	for i := range cfg.Archiver.Tables {
-		t := &cfg.Archiver.Tables[i]
-		if strings.Contains(t.SourceTable, ".") {
-			parts := strings.SplitN(t.SourceTable, ".", 2)
-			if t.SourceSchema == "" {
-				t.SourceSchema = parts[0]
-			}
-			t.SourceTable = parts[1]
-		}
+		applyTableDefaults(&cfg.Archiver.Tables[i])
+	}
+}
+
+// applyTableDefaults fills in defaults for one table entry and parses any
+// `schema.table` syntax in SourceTable into SourceSchema/SourceTable. It
+// mutates t in place.
+func applyTableDefaults(t *TableConfig) {
+	if strings.Contains(t.SourceTable, ".") {
+		parts := strings.SplitN(t.SourceTable, ".", 2)
 		if t.SourceSchema == "" {
-			t.SourceSchema = "public"
+			t.SourceSchema = parts[0]
 		}
-		if t.FuturePartitions == 0 {
-			t.FuturePartitions = 3
-		}
-		if t.ExpirationStrategy == "" {
-			t.ExpirationStrategy = partition.StrategyDrop
-		}
+		t.SourceTable = parts[1]
+	}
+	if t.SourceSchema == "" {
+		t.SourceSchema = "public"
+	}
+	if t.FuturePartitions == 0 {
+		t.FuturePartitions = 3
+	}
+	if t.ExpirationStrategy == "" {
+		t.ExpirationStrategy = partition.StrategyDrop
 	}
 }
 
@@ -173,22 +179,33 @@ func (c *Config) Validate() error {
 	if c.Postgres.DSN == "" {
 		return fmt.Errorf("postgres.dsn is required")
 	}
-	// Iceberg/S3 are required only in iceberg mode. A config with no iceberg
-	// warehouse/endpoint and no S3 fields is a partition-only run (premake +
-	// retention, no cold-tier archival). If ANY iceberg/S3 field is supplied,
-	// every required one must be — a partial cold config fails loudly rather
-	// than silently running half-configured.
-	anyS3 := c.S3.Endpoint != "" || c.S3.AccessKey != "" || c.S3.SecretKey != ""
-	icebergMode := c.Iceberg.Warehouse != "" || c.Iceberg.LakekeeperEndpoint != "" ||
-		anyS3 || c.Azure.ConnectionString != ""
+	icebergMode, anyS3 := c.coldTierMode()
 	if icebergMode {
 		if err := c.validateColdBackend(anyS3); err != nil {
 			return err
 		}
 	}
-	// Zero tables is allowed here: the managed-table set may instead come from
-	// the replicated coldfront.partition_config table, resolved at startup. The
-	// binaries fail loud if BOTH the table and archiver.tables are empty.
+	return c.validateTables(icebergMode)
+}
+
+// coldTierMode reports whether any cold-tier field is configured (icebergMode)
+// and, separately, whether any s3.* field is set (anyS3). A config with no
+// iceberg warehouse/endpoint and no S3 fields is a partition-only run (premake
+// + retention, no cold-tier archival). If ANY iceberg/S3 field is supplied,
+// every required one must be — a partial cold config fails loudly rather than
+// silently running half-configured.
+func (c *Config) coldTierMode() (icebergMode, anyS3 bool) {
+	anyS3 = c.S3.Endpoint != "" || c.S3.AccessKey != "" || c.S3.SecretKey != ""
+	icebergMode = c.Iceberg.Warehouse != "" || c.Iceberg.LakekeeperEndpoint != "" ||
+		anyS3 || c.Azure.ConnectionString != ""
+	return icebergMode, anyS3
+}
+
+// validateTables checks every table entry, returning the first violation.
+// Zero tables is allowed here: the managed-table set may instead come from the
+// replicated coldfront.partition_config table, resolved at startup. The
+// binaries fail loud if BOTH the table and archiver.tables are empty.
+func (c *Config) validateTables(icebergMode bool) error {
 	for i, t := range c.Archiver.Tables {
 		if err := validateTable(t, i, icebergMode); err != nil {
 			return err
@@ -200,25 +217,52 @@ func (c *Config) Validate() error {
 // validateColdBackend checks the iceberg/S3/Azure fields required when any
 // cold-tier field is configured. anyS3 reports whether any s3.* field is set.
 func (c *Config) validateColdBackend(anyS3 bool) error {
+	if err := c.validateIcebergCatalog(); err != nil {
+		return err
+	}
+	azureConfigured, err := c.validateBackendExclusivity(anyS3)
+	if err != nil {
+		return err
+	}
+	if azureConfigured {
+		return nil
+	}
+	return c.validateS3Fields()
+}
+
+// validateIcebergCatalog checks the Iceberg REST catalog fields required for
+// any cold-tier backend.
+func (c *Config) validateIcebergCatalog() error {
 	if c.Iceberg.Warehouse == "" {
 		return fmt.Errorf("iceberg.warehouse is required")
 	}
 	if c.Iceberg.LakekeeperEndpoint == "" {
 		return fmt.Errorf("iceberg.lakekeeper_endpoint is required")
 	}
-	// The cold backend is exactly one of S3 or Azure — selected by which is
-	// configured. Mixing is a config error.
+	return nil
+}
+
+// validateBackendExclusivity enforces that the cold backend is exactly one of
+// S3 or Azure — selected by which is configured. Mixing is a config error.
+// azureConfigured reports whether Azure is the selected backend (in which case
+// the S3 field checks are short-circuited).
+func (c *Config) validateBackendExclusivity(anyS3 bool) (azureConfigured bool, err error) {
 	if c.Azure.ConnectionString != "" {
 		if anyS3 {
-			return fmt.Errorf("set either s3.* or azure.connection_string, not both")
+			return false, fmt.Errorf("set either s3.* or azure.connection_string, not both")
 		}
-		return nil
+		return true, nil
 	}
-	// s3.endpoint is OPTIONAL. Empty = real AWS S3: DuckDB uses its native
-	// per-Region virtual-hosted + https endpoint (set s3.region). A non-empty
-	// endpoint = an S3-compatible store (SeaweedFS/MinIO/GCS-interop), reached
-	// path-style by default. Forcing an endpoint broke real AWS in Regions
-	// launched after 2019-03-20, which only route virtual-hosted requests.
+	return false, nil
+}
+
+// validateS3Fields checks the s3.* fields required for an S3 cold backend.
+// s3.endpoint is OPTIONAL. Empty = real AWS S3: DuckDB uses its native
+// per-Region virtual-hosted + https endpoint (set s3.region). A non-empty
+// endpoint = an S3-compatible store (SeaweedFS/MinIO/GCS-interop), reached
+// path-style by default. Forcing an endpoint broke real AWS in Regions
+// launched after 2019-03-20, which only route virtual-hosted requests.
+func (c *Config) validateS3Fields() error {
 	if c.S3.AccessKey == "" {
 		return fmt.Errorf("s3.access_key is required")
 	}
@@ -238,12 +282,8 @@ func validateTable(t TableConfig, i int, icebergMode bool) error {
 	if t.SourceTable == "" {
 		return fmt.Errorf("archiver.tables[%d].source_table is required", i)
 	}
-	if t.PartitionPeriod == "" {
-		return fmt.Errorf("archiver.tables[%d].partition_period is required", i)
-	}
-	if t.PartitionPeriod != partition.PeriodMonthly && t.PartitionPeriod != partition.PeriodDaily {
-		return fmt.Errorf("archiver.tables[%d].partition_period must be %q or %q",
-			i, partition.PeriodMonthly, partition.PeriodDaily)
+	if err := validateTablePartitionPeriod(t, i); err != nil {
+		return err
 	}
 	if err := validateTableLifecycle(t, i, icebergMode); err != nil {
 		return err
@@ -256,15 +296,35 @@ func validateTable(t TableConfig, i int, icebergMode bool) error {
 	if err := validateTableExpiration(t, i, icebergMode); err != nil {
 		return err
 	}
-	if t.SubPartition != nil {
-		if t.SubPartition.ValuesSource == "" {
-			return fmt.Errorf("archiver.tables[%d].sub_partition.values_source is required", i)
-		}
-		// 2-level tables need the RANGE (time) column explicitly: on a first
-		// run no LIST child exists yet to auto-detect it from.
-		if t.PartitionColumn == "" {
-			return fmt.Errorf("archiver.tables[%d].partition_column is required for 2-level (sub_partition) tables", i)
-		}
+	return validateTableSubPartition(t, i)
+}
+
+// validateTablePartitionPeriod enforces that partition_period is set and is one
+// of the allowed cadences.
+func validateTablePartitionPeriod(t TableConfig, i int) error {
+	if t.PartitionPeriod == "" {
+		return fmt.Errorf("archiver.tables[%d].partition_period is required", i)
+	}
+	if t.PartitionPeriod != partition.PeriodMonthly && t.PartitionPeriod != partition.PeriodDaily {
+		return fmt.Errorf("archiver.tables[%d].partition_period must be %q or %q",
+			i, partition.PeriodMonthly, partition.PeriodDaily)
+	}
+	return nil
+}
+
+// validateTableSubPartition checks the fields a 2-level LIST→RANGE table
+// requires. A nil SubPartition is a flat table and passes.
+func validateTableSubPartition(t TableConfig, i int) error {
+	if t.SubPartition == nil {
+		return nil
+	}
+	if t.SubPartition.ValuesSource == "" {
+		return fmt.Errorf("archiver.tables[%d].sub_partition.values_source is required", i)
+	}
+	// 2-level tables need the RANGE (time) column explicitly: on a first
+	// run no LIST child exists yet to auto-detect it from.
+	if t.PartitionColumn == "" {
+		return fmt.Errorf("archiver.tables[%d].partition_column is required for 2-level (sub_partition) tables", i)
 	}
 	return nil
 }

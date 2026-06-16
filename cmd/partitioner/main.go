@@ -43,25 +43,8 @@ func main() {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 
-	const defaultDesc = "run one partition-maintenance reconcile pass"
-	// Top-level help / overview — no args, or help/-h/--help — lists the
-	// management subcommands so they are discoverable.
-	if len(os.Args) < 2 || os.Args[1] == "help" || os.Args[1] == "-h" || os.Args[1] == "--help" {
-		partcfg.PrintTopLevelUsage(os.Stdout, "partitioner", defaultDesc)
+	if dispatchSubcommand(ctx) {
 		return
-	}
-	// A management subcommand routes to the shared CLI; with no subcommand the
-	// partitioner does its default reconcile run (--config below).
-	if !strings.HasPrefix(os.Args[1], "-") {
-		if partcfg.IsCommand(os.Args[1]) {
-			if err := partcfg.Run(ctx, os.Args[1], os.Args[2:]); err != nil {
-				log.Fatalf("%s: %v", os.Args[1], err)
-			}
-			return
-		}
-		fmt.Fprintf(os.Stderr, "unknown subcommand %q\n\n", os.Args[1])
-		partcfg.PrintTopLevelUsage(os.Stderr, "partitioner", defaultDesc)
-		os.Exit(2)
 	}
 
 	cfgPath := flag.String("config", "", "path to the YAML config file")
@@ -84,6 +67,45 @@ func main() {
 		log.Fatalf("ping: %v", err)
 	}
 
+	loadAndResolve(ctx, conn, cfg, *cfgPath)
+	validateTablePeriods(ctx, conn, cfg)
+	runReconcilePass(ctx, conn, cfg)
+}
+
+// dispatchSubcommand handles the top-level help/overview and management
+// subcommands, routing the latter to the shared CLI. It returns true when the
+// invocation was fully handled (main should return); false means main should
+// fall through to its default reconcile run (--config). Preserves the
+// os.Exit(2)-for-unknown-subcommand vs log.Fatalf split and the Stdout/Stderr
+// usage destinations.
+func dispatchSubcommand(ctx context.Context) bool {
+	const defaultDesc = "run one partition-maintenance reconcile pass"
+	// Top-level help / overview — no args, or help/-h/--help — lists the
+	// management subcommands so they are discoverable.
+	if len(os.Args) < 2 || os.Args[1] == "help" || os.Args[1] == "-h" || os.Args[1] == "--help" {
+		partcfg.PrintTopLevelUsage(os.Stdout, "partitioner", defaultDesc)
+		return true
+	}
+	// A management subcommand routes to the shared CLI; with no subcommand the
+	// partitioner does its default reconcile run (--config below).
+	if !strings.HasPrefix(os.Args[1], "-") {
+		if partcfg.IsCommand(os.Args[1]) {
+			if err := partcfg.Run(ctx, os.Args[1], os.Args[2:]); err != nil {
+				log.Fatalf("%s: %v", os.Args[1], err)
+			}
+			return true
+		}
+		fmt.Fprintf(os.Stderr, "unknown subcommand %q\n\n", os.Args[1])
+		partcfg.PrintTopLevelUsage(os.Stderr, "partitioner", defaultDesc)
+		os.Exit(2)
+	}
+	return false
+}
+
+// loadAndResolve resolves the managed tables from the replicated
+// coldfront.partition_config table (falling back to the YAML archiver.tables
+// deprecation bridge), writes them back onto cfg, and validates the config.
+func loadAndResolve(ctx context.Context, conn *pgx.Conn, cfg *config.Config, cfgPath string) {
 	// Resolve managed tables from the replicated coldfront.partition_config
 	// table, falling back to the YAML archiver.tables (deprecation bridge).
 	tables, fromYAML, err := partcfg.ResolveTables(ctx, conn, cfg.Archiver.Tables)
@@ -91,7 +113,7 @@ func main() {
 		log.Fatalf("resolve tables: %v", err)
 	}
 	if len(tables) == 0 {
-		log.Fatalf("no tables configured: coldfront.partition_config is empty and no archiver.tables in %s", *cfgPath)
+		log.Fatalf("no tables configured: coldfront.partition_config is empty and no archiver.tables in %s", cfgPath)
 	}
 	if fromYAML {
 		log.Printf("no partition_config rows; using %d table(s) from YAML (deprecated — migrate with `register`/`import`)", len(tables))
@@ -102,14 +124,22 @@ func main() {
 	if err := cfg.Validate(); err != nil {
 		log.Fatalf("config invalid: %v", err)
 	}
-	// Period syntax + retention>hot ordering are PostgreSQL interval semantics,
-	// so they're validated here against the live connection (config.Load can't).
+}
+
+// validateTablePeriods checks each table's period syntax + retention>hot
+// ordering. Those are PostgreSQL interval semantics, so they're validated
+// against the live connection (config.Load can't).
+func validateTablePeriods(ctx context.Context, conn *pgx.Conn, cfg *config.Config) {
 	for _, t := range cfg.Archiver.Tables {
 		if err := partition.ValidatePeriods(ctx, conn, t.HotPeriod, t.RetentionPeriod); err != nil {
 			log.Fatalf("[%s] %v", t.SourceTable, err)
 		}
 	}
+}
 
+// runReconcilePass runs one reconcile pass over every configured table and
+// fails the run if any table failed.
+func runReconcilePass(ctx context.Context, conn *pgx.Conn, cfg *config.Config) {
 	mgr := partition.NewManager(conn)
 	now := time.Now().UTC()
 	failed := 0
