@@ -139,20 +139,8 @@ func runRegister(ctx context.Context, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *table == "" || *period == "" {
-		fs.Usage()
-		return fmt.Errorf("--table and --period are required")
-	}
-	if *retention == "" && *hot == "" {
-		return fmt.Errorf("set --retention (and/or --hot-period): a managed table needs a destroy boundary")
-	}
-	switch *strategy {
-	case partition.StrategyDrop, partition.StrategyDetach:
-	default:
-		return fmt.Errorf("--strategy %q must be %q or %q", *strategy, partition.StrategyDetach, partition.StrategyDrop)
-	}
-	if *strategy == partition.StrategyDetach && *hot != "" {
-		return fmt.Errorf("--strategy detach is only valid in partition-only mode (no --hot-period)")
+	if err := validateRegisterFlags(fs, *table, *period, *hot, *retention, *strategy); err != nil {
+		return err
 	}
 
 	row := configRow{
@@ -195,6 +183,29 @@ func runRegister(ctx context.Context, args []string) error {
 		return fmt.Errorf("register %s.%s: %w", *schema, *table, err)
 	}
 	fmt.Printf("registered %s.%s\n", *schema, *table)
+	return nil
+}
+
+// validateRegisterFlags checks the register flag combination before any DB work:
+// required flags are present, a destroy boundary is set, and --strategy is valid
+// (detach is partition-only). It prints usage on the required-flag failure, matching
+// the flag package's own convention.
+func validateRegisterFlags(fs *flag.FlagSet, table, period, hot, retention, strategy string) error {
+	if table == "" || period == "" {
+		fs.Usage()
+		return fmt.Errorf("--table and --period are required")
+	}
+	if retention == "" && hot == "" {
+		return fmt.Errorf("set --retention (and/or --hot-period): a managed table needs a destroy boundary")
+	}
+	switch strategy {
+	case partition.StrategyDrop, partition.StrategyDetach:
+	default:
+		return fmt.Errorf("--strategy %q must be %q or %q", strategy, partition.StrategyDetach, partition.StrategyDrop)
+	}
+	if strategy == partition.StrategyDetach && hot != "" {
+		return fmt.Errorf("--strategy detach is only valid in partition-only mode (no --hot-period)")
+	}
 	return nil
 }
 

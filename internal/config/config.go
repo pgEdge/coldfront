@@ -182,105 +182,139 @@ func (c *Config) Validate() error {
 	icebergMode := c.Iceberg.Warehouse != "" || c.Iceberg.LakekeeperEndpoint != "" ||
 		anyS3 || c.Azure.ConnectionString != ""
 	if icebergMode {
-		if c.Iceberg.Warehouse == "" {
-			return fmt.Errorf("iceberg.warehouse is required")
-		}
-		if c.Iceberg.LakekeeperEndpoint == "" {
-			return fmt.Errorf("iceberg.lakekeeper_endpoint is required")
-		}
-		// The cold backend is exactly one of S3 or Azure — selected by which is
-		// configured. Mixing is a config error.
-		if c.Azure.ConnectionString != "" {
-			if anyS3 {
-				return fmt.Errorf("set either s3.* or azure.connection_string, not both")
-			}
-		} else {
-			// s3.endpoint is OPTIONAL. Empty = real AWS S3: DuckDB uses its native
-			// per-Region virtual-hosted + https endpoint (set s3.region). A non-empty
-			// endpoint = an S3-compatible store (SeaweedFS/MinIO/GCS-interop), reached
-			// path-style by default. Forcing an endpoint broke real AWS in Regions
-			// launched after 2019-03-20, which only route virtual-hosted requests.
-			if c.S3.AccessKey == "" {
-				return fmt.Errorf("s3.access_key is required")
-			}
-			if c.S3.SecretKey == "" {
-				return fmt.Errorf("s3.secret_key is required")
-			}
-			if c.S3.URLStyle != "" && c.S3.URLStyle != "path" && c.S3.URLStyle != "vhost" {
-				return fmt.Errorf("s3.url_style must be \"path\" or \"vhost\"")
-			}
+		if err := c.validateColdBackend(anyS3); err != nil {
+			return err
 		}
 	}
 	// Zero tables is allowed here: the managed-table set may instead come from
 	// the replicated coldfront.partition_config table, resolved at startup. The
 	// binaries fail loud if BOTH the table and archiver.tables are empty.
 	for i, t := range c.Archiver.Tables {
-		if t.SourceTable == "" {
-			return fmt.Errorf("archiver.tables[%d].source_table is required", i)
+		if err := validateTable(t, i, icebergMode); err != nil {
+			return err
 		}
-		if t.PartitionPeriod == "" {
-			return fmt.Errorf("archiver.tables[%d].partition_period is required", i)
+	}
+	return nil
+}
+
+// validateColdBackend checks the iceberg/S3/Azure fields required when any
+// cold-tier field is configured. anyS3 reports whether any s3.* field is set.
+func (c *Config) validateColdBackend(anyS3 bool) error {
+	if c.Iceberg.Warehouse == "" {
+		return fmt.Errorf("iceberg.warehouse is required")
+	}
+	if c.Iceberg.LakekeeperEndpoint == "" {
+		return fmt.Errorf("iceberg.lakekeeper_endpoint is required")
+	}
+	// The cold backend is exactly one of S3 or Azure — selected by which is
+	// configured. Mixing is a config error.
+	if c.Azure.ConnectionString != "" {
+		if anyS3 {
+			return fmt.Errorf("set either s3.* or azure.connection_string, not both")
 		}
-		if t.PartitionPeriod != partition.PeriodMonthly && t.PartitionPeriod != partition.PeriodDaily {
-			return fmt.Errorf("archiver.tables[%d].partition_period must be %q or %q",
-				i, partition.PeriodMonthly, partition.PeriodDaily)
+		return nil
+	}
+	// s3.endpoint is OPTIONAL. Empty = real AWS S3: DuckDB uses its native
+	// per-Region virtual-hosted + https endpoint (set s3.region). A non-empty
+	// endpoint = an S3-compatible store (SeaweedFS/MinIO/GCS-interop), reached
+	// path-style by default. Forcing an endpoint broke real AWS in Regions
+	// launched after 2019-03-20, which only route virtual-hosted requests.
+	if c.S3.AccessKey == "" {
+		return fmt.Errorf("s3.access_key is required")
+	}
+	if c.S3.SecretKey == "" {
+		return fmt.Errorf("s3.secret_key is required")
+	}
+	if c.S3.URLStyle != "" && c.S3.URLStyle != "path" && c.S3.URLStyle != "vhost" {
+		return fmt.Errorf("s3.url_style must be \"path\" or \"vhost\"")
+	}
+	return nil
+}
+
+// validateTable checks one table entry (index i) against the validation rules,
+// returning the first violation. icebergMode selects tiered vs partition-only
+// lifecycle semantics.
+func validateTable(t TableConfig, i int, icebergMode bool) error {
+	if t.SourceTable == "" {
+		return fmt.Errorf("archiver.tables[%d].source_table is required", i)
+	}
+	if t.PartitionPeriod == "" {
+		return fmt.Errorf("archiver.tables[%d].partition_period is required", i)
+	}
+	if t.PartitionPeriod != partition.PeriodMonthly && t.PartitionPeriod != partition.PeriodDaily {
+		return fmt.Errorf("archiver.tables[%d].partition_period must be %q or %q",
+			i, partition.PeriodMonthly, partition.PeriodDaily)
+	}
+	if err := validateTableLifecycle(t, i, icebergMode); err != nil {
+		return err
+	}
+	// part_mode / id_scheme: reuse BoundaryFor as the single validator of
+	// the valid set, so config and the partition core never drift.
+	if _, err := partition.BoundaryFor(t.PartMode, t.IDScheme); err != nil {
+		return fmt.Errorf("archiver.tables[%d]: %w", i, err)
+	}
+	if err := validateTableExpiration(t, i, icebergMode); err != nil {
+		return err
+	}
+	if t.SubPartition != nil {
+		if t.SubPartition.ValuesSource == "" {
+			return fmt.Errorf("archiver.tables[%d].sub_partition.values_source is required", i)
 		}
-		// Lifecycle thresholds depend on mode. Tiered: hot_period (tier-to-cold
-		// age) is required; retention_period (drop cold data) is optional and
-		// must exceed hot_period. Partition-only: retention_period (drop the hot
-		// partition) is required; hot_period is meaningless without a cold tier.
-		if icebergMode {
-			// The cold tier is time-only (timestamp RANGE key, timestamptz Iceberg
-			// writes). id mode keys partitions on a non-time id, which the cold
-			// tier cannot express — reject it at config load rather than fail
-			// cryptically at runtime. (2-level LIST→RANGE is supported: the RANGE
-			// level is still time, region is just a column.)
-			if t.PartMode != "" && t.PartMode != partition.PartModeTimestamp {
-				return fmt.Errorf("archiver.tables[%d].part_mode %q is only valid in partition-only mode; the cold tier is time-only", i, t.PartMode)
-			}
-			if t.HotPeriod == "" {
-				return fmt.Errorf("archiver.tables[%d].hot_period is required in tiered mode", i)
-			}
-			// Interval syntax and the retention>hot ordering are PostgreSQL interval
-			// semantics (calendar-aware), so they're validated against a live
-			// connection — partition.ValidatePeriods, run at register time and at
-			// binary startup. config.Load has no DB, so it only enforces presence.
-		} else {
-			if t.HotPeriod != "" {
-				return fmt.Errorf("archiver.tables[%d].hot_period is only valid in tiered mode (no iceberg/s3 configured)", i)
-			}
-			if t.RetentionPeriod == "" {
-				return fmt.Errorf("archiver.tables[%d].retention_period is required", i)
-			}
+		// 2-level tables need the RANGE (time) column explicitly: on a first
+		// run no LIST child exists yet to auto-detect it from.
+		if t.PartitionColumn == "" {
+			return fmt.Errorf("archiver.tables[%d].partition_column is required for 2-level (sub_partition) tables", i)
 		}
-		// part_mode / id_scheme: reuse BoundaryFor as the single validator of
-		// the valid set, so config and the partition core never drift.
-		if _, err := partition.BoundaryFor(t.PartMode, t.IDScheme); err != nil {
-			return fmt.Errorf("archiver.tables[%d]: %w", i, err)
+	}
+	return nil
+}
+
+// validateTableLifecycle enforces the mode-dependent lifecycle thresholds.
+// Tiered: hot_period (tier-to-cold age) is required; retention_period (drop
+// cold data) is optional and must exceed hot_period. Partition-only:
+// retention_period (drop the hot partition) is required; hot_period is
+// meaningless without a cold tier.
+func validateTableLifecycle(t TableConfig, i int, icebergMode bool) error {
+	if icebergMode {
+		// The cold tier is time-only (timestamp RANGE key, timestamptz Iceberg
+		// writes). id mode keys partitions on a non-time id, which the cold
+		// tier cannot express — reject it at config load rather than fail
+		// cryptically at runtime. (2-level LIST→RANGE is supported: the RANGE
+		// level is still time, region is just a column.)
+		if t.PartMode != "" && t.PartMode != partition.PartModeTimestamp {
+			return fmt.Errorf("archiver.tables[%d].part_mode %q is only valid in partition-only mode; the cold tier is time-only", i, t.PartMode)
 		}
-		// expiration_strategy: enum, and "detach" only makes sense partition-only
-		// (the tiered archiver drops after exporting to cold, so it would be a
-		// silent no-op).
-		switch t.ExpirationStrategy {
-		case "", partition.StrategyDrop, partition.StrategyDetach:
-		default:
-			return fmt.Errorf("archiver.tables[%d].expiration_strategy %q must be %q or %q",
-				i, t.ExpirationStrategy, partition.StrategyDetach, partition.StrategyDrop)
+		if t.HotPeriod == "" {
+			return fmt.Errorf("archiver.tables[%d].hot_period is required in tiered mode", i)
 		}
-		if icebergMode && t.ExpirationStrategy == partition.StrategyDetach {
-			return fmt.Errorf("archiver.tables[%d].expiration_strategy %q is only valid in partition-only mode",
-				i, partition.StrategyDetach)
-		}
-		if t.SubPartition != nil {
-			if t.SubPartition.ValuesSource == "" {
-				return fmt.Errorf("archiver.tables[%d].sub_partition.values_source is required", i)
-			}
-			// 2-level tables need the RANGE (time) column explicitly: on a first
-			// run no LIST child exists yet to auto-detect it from.
-			if t.PartitionColumn == "" {
-				return fmt.Errorf("archiver.tables[%d].partition_column is required for 2-level (sub_partition) tables", i)
-			}
-		}
+		// Interval syntax and the retention>hot ordering are PostgreSQL interval
+		// semantics (calendar-aware), so they're validated against a live
+		// connection — partition.ValidatePeriods, run at register time and at
+		// binary startup. config.Load has no DB, so it only enforces presence.
+		return nil
+	}
+	if t.HotPeriod != "" {
+		return fmt.Errorf("archiver.tables[%d].hot_period is only valid in tiered mode (no iceberg/s3 configured)", i)
+	}
+	if t.RetentionPeriod == "" {
+		return fmt.Errorf("archiver.tables[%d].retention_period is required", i)
+	}
+	return nil
+}
+
+// validateTableExpiration enforces the expiration_strategy enum and the rule
+// that "detach" only makes sense partition-only (the tiered archiver drops
+// after exporting to cold, so it would be a silent no-op).
+func validateTableExpiration(t TableConfig, i int, icebergMode bool) error {
+	switch t.ExpirationStrategy {
+	case "", partition.StrategyDrop, partition.StrategyDetach:
+	default:
+		return fmt.Errorf("archiver.tables[%d].expiration_strategy %q must be %q or %q",
+			i, t.ExpirationStrategy, partition.StrategyDetach, partition.StrategyDrop)
+	}
+	if icebergMode && t.ExpirationStrategy == partition.StrategyDetach {
+		return fmt.Errorf("archiver.tables[%d].expiration_strategy %q is only valid in partition-only mode",
+			i, partition.StrategyDetach)
 	}
 	return nil
 }
