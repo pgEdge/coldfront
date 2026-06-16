@@ -161,10 +161,10 @@ curl -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
   -d '{"namespace": ["default"]}'
 ```
 
-> **Why this step is required (decoupled mode on DuckDB 1.5.x).**
+> **Why this step is required (decoupled mode).**
 > `coldfront.create_iceberg_table()` (Section 5) runs `CREATE SCHEMA`
-> and `CREATE TABLE` in one transaction. DuckDB 1.5.x defers the schema
-> create to COMMIT but POSTs the table create eagerly, so against a
+> and `CREATE TABLE` in one transaction. The schema create is deferred
+> to COMMIT but the table create is POSTed eagerly, so against a
 > namespace-less warehouse it 404s. Pre-creating `default` makes the
 > in-transaction `CREATE SCHEMA IF NOT EXISTS` a no-op. (Tiered mode's
 > archiver creates the namespace itself, so this is only needed for the
@@ -278,6 +278,5 @@ Work through this checklist if something failed:
    (native vhost+HTTPS), 4th arg your real region? A non-NULL endpoint
    forces path-style and breaks modern Regions (HTTP 400).
 3. **Namespace `default` pre-created** in Lakekeeper before
-   `create_iceberg_table`? Without it the decoupled create 404s on
-   DuckDB 1.5.x.
+   `create_iceberg_table`? Without it the decoupled create 404s.
 4. **Long-term key** - not an SSO / temporary session-token credential.

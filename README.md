@@ -264,7 +264,7 @@ pgedge-coldfront/
 ├── run-ci-local.sh             ← pre-commit gate (ci/matrix.sh --quick)
 ├── config.example.yaml · Makefile · mkdocs.yml
 ├── DUCKDB_1.5_PATCHED.md       ← the patched DuckDB 1.5 base: what's patched + how it's built
-└── DUCKDB_1.5_UNPATCHED.md     ← building the base unpatched, and the consequences
+└── DUCKDB_1.5_UNPATCHED.md     ← building/running the base unpatched, and the consequences
 ```
 
 ## Dependencies

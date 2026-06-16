@@ -57,9 +57,9 @@ curl -X POST http://localhost:8181/management/v1/warehouse \
   }'
 
 # 3. Create the Iceberg namespace in the new warehouse.
-#    REQUIRED for decoupled (iceberg-only) mode on DuckDB 1.5.x: that release
-#    defers an Iceberg CREATE SCHEMA to transaction COMMIT but POSTs CREATE
-#    TABLE eagerly, so coldfront.create_iceberg_table — which runs both in one
+#    REQUIRED for decoupled (iceberg-only) mode: the Iceberg CREATE SCHEMA is
+#    deferred to transaction COMMIT but CREATE TABLE is POSTed eagerly, so
+#    coldfront.create_iceberg_table — which runs both in one
 #    transaction — would 404 against a cold warehouse. Pre-creating the
 #    namespace here (its own committed REST call) makes the function's in-txn
 #    CREATE SCHEMA IF NOT EXISTS a no-op so the table create succeeds. The
@@ -394,8 +394,8 @@ Configure **exactly one** cold-store backend:
   endpoint. Verified end-to-end (iceberg read+write over interop).
   Lakekeeper's native `gcs` profile is service-account only and is
   **not** used.
-- **Azure ADLS Gen2** - requires the DuckDB 1.5.x build (see
-  [installation.md](installation.md)); the access key rides inside `connection_string`.
+- **Azure ADLS Gen2** - a supported cold-store backend; the access key
+  rides inside `connection_string`.
 
 For an **Azure ADLS Gen2** cold tier, set the credential with
 `set_storage_secret_azure()` instead of `set_storage_secret()` - it takes
@@ -411,9 +411,8 @@ SELECT coldfront.set_storage_secret_azure(
 
 It writes the same `coldfront.storage_secret` row (replicated,
 `pg_dump`-excluded) and materializes a `TYPE azure` PERSISTENT SECRET.
-The Azure cold tier requires the DuckDB 1.5.x build (see
-[installation.md](installation.md)) and is subject to the soft-delete /
-change-feed restriction in [Gotchas](#gotchas).
+The Azure cold tier is subject to the soft-delete / change-feed
+restriction in [Gotchas](#gotchas).
 
 ## Reading + writing (identical for both modes)
 

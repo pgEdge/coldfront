@@ -91,8 +91,5 @@ or orphan maintenance.
 
 ## Requirements
 
-The cold tier must run on ColdFront's DuckDB 1.5 base image, which
-carries the patches that make duckdb-iceberg's manifests readable by
-other Iceberg engines
-(see [DUCKDB_1.5_PATCHED.md](https://github.com/pgEdge/ColdFront/blob/main/DUCKDB_1.5_PATCHED.md)). Build the binary with
-`make compactor`.
+The compactor (`cmd/compactor`, apache/iceberg-go) reads the cold-tier
+Iceberg tables directly. Build the binary with `make compactor`.

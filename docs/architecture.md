@@ -342,7 +342,9 @@ ticket, against a freshly-fetched table), so overlapping uploads can't
 commit a stale parent. The Docker image ships the patched binary with
 `iceberg_async_parquet = on`; bare-metal users on a stock binary leave it
 `off` and lose only the upload overlap. See
-[DUCKDB_1.5_PATCHED.md](https://github.com/pgEdge/ColdFront/blob/main/DUCKDB_1.5_PATCHED.md) and [DUCKDB_1.5_UNPATCHED.md](https://github.com/pgEdge/ColdFront/blob/main/DUCKDB_1.5_UNPATCHED.md)
+[DUCKDB_1.5_PATCHED.md](https://github.com/pgEdge/ColdFront/blob/main/DUCKDB_1.5_PATCHED.md)
+and
+[DUCKDB_1.5_UNPATCHED.md](https://github.com/pgEdge/ColdFront/blob/main/DUCKDB_1.5_UNPATCHED.md)
 for the build and the full rationale.
 
 ### Transparent DDL via coldfront
