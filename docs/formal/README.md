@@ -347,14 +347,15 @@ already evolved by the originator. The single-commit shape thus holds -
 the catalog is altered exactly once, by one claimant - and peers only
 rebuild their per-node view.
 
-### Partition detach fan-out (`_detach_partition_peers`)
+### Partition detach fan-out
 
 The retention path detaches expired partitions with
 `DETACH PARTITION … CONCURRENTLY`, which Spock cannot replicate (it is
 non-transactional), so the partition manager re-runs the same concurrent
-detach on each peer over a dblink
-(`coldfront._detach_partition_peers`). This is **outside the modelled
-protocol entirely**: it touches no Iceberg catalog, takes no claim, and
+detach on each peer itself, over its own connection to each Spock node
+(gated on Spock being present; a no-op on a vanilla single node). This is
+**outside the modelled protocol entirely**: it touches no Iceberg catalog,
+takes no claim, and
 POSTs nothing to Lakekeeper - it is pure PostgreSQL partition
 maintenance on the hot tier. It adds no claimant, no CAS commit, and no
 new ordering, so `Bakery_v2` and every config result are unaffected.

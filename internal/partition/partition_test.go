@@ -330,16 +330,55 @@ func TestEnsureFuture_SnowflakeBounds(t *testing.T) {
 	assert.NotContains(t, db.execSQL[0], fmt.Sprintf("'%d'", lo))
 }
 
-func TestDetach(t *testing.T) {
-	db := &mockDB{}
+// boolRow returns a rowFunc that scans a single bool (the Spock-presence probe).
+func boolRow(v bool) func(context.Context, string, ...any) pgx.Row {
+	return func(_ context.Context, _ string, _ ...any) pgx.Row {
+		return &mockRow{scanFunc: func(dest ...any) error {
+			*(dest[0].(*bool)) = v
+			return nil
+		}}
+	}
+}
+
+// On vanilla single-node PostgreSQL (no Spock) Detach does the local concurrent
+// detach and then SKIPS the peer fan-out entirely — so the binary needs neither
+// Spock nor the coldfront extension. This is the no-dependency path.
+func TestDetach_VanillaNoSpock(t *testing.T) {
+	db := &mockDB{rowFunc: boolRow(false)} // pg_extension probe: spock absent
 	m := NewManager(db)
 	err := m.Detach(context.Background(), "events", "public", "p_2025_11")
 	require.NoError(t, err)
-	// Local concurrent detach, then the mesh fan-out to peers (a no-op off-mesh).
+	// [0] local concurrent detach, [1] the Spock probe — and nothing else.
 	require.Len(t, db.execSQL, 2)
 	assert.Contains(t, db.execSQL[0], "DETACH PARTITION")
 	assert.Contains(t, db.execSQL[0], "CONCURRENTLY")
-	assert.Contains(t, db.execSQL[1], "_detach_partition_peers")
+	assert.Contains(t, db.execSQL[1], "pg_extension")
+	assert.Contains(t, db.execSQL[1], "spock")
+	for _, sql := range db.execSQL {
+		assert.NotContains(t, sql, "_detach_partition_peers",
+			"the binary must not depend on the coldfront extension")
+	}
+}
+
+// On a Spock node Detach does the local detach, probes Spock, then enumerates
+// peers from spock.node to fan the concurrent detach out itself. (Zero peers
+// here keeps it connection-free; real peer fan-out is covered by the live mesh
+// test.) No coldfront extension is ever referenced.
+func TestDetach_SpockEnumeratesPeers(t *testing.T) {
+	db := &mockDB{
+		rowFunc:  boolRow(true),                                                                       // spock present
+		rowsFunc: func(context.Context, string, ...any) (pgx.Rows, error) { return &mockRows{}, nil }, // no peers
+	}
+	m := NewManager(db)
+	err := m.Detach(context.Background(), "events", "public", "p_2025_11")
+	require.NoError(t, err)
+	// [0] local detach, [1] Spock probe, [2] peer enumeration over spock.node.
+	require.Len(t, db.execSQL, 3)
+	assert.Contains(t, db.execSQL[0], "DETACH PARTITION")
+	assert.Contains(t, db.execSQL[2], "spock.node")
+	for _, sql := range db.execSQL {
+		assert.NotContains(t, sql, "_detach_partition_peers")
+	}
 }
 
 func TestDrop(t *testing.T) {

@@ -458,9 +458,11 @@ skips it (`WARNING: This DDL statement will not be replicated`) - left
 alone, a partition would stay attached on every peer while the origin
 detaches it. The partition manager therefore detaches locally
 (top-level, non-blocking) and then fans the **identical** concurrent
-detach to each peer via `coldfront._detach_partition_peers`, which runs
-it in each peer's own autocommit session over a dblink to that node's
-Spock interface DSN (a no-op off-mesh). The archiver's cold-tiering
+detach to each peer itself: it enumerates the Spock nodes and re-runs the
+detach on each peer's own connection (skipping any node where the
+partition is already detached). The fan-out is gated on Spock being
+present, so on vanilla single-node PostgreSQL it is skipped entirely and
+the manager needs no extension. The archiver's cold-tiering
 cutover instead uses a plain, transactional `DETACH` inside its atomic
 watermark+view+detach commit, so that one replicates on its own. This is
 verified before any mesh partitioner run by `story_mesh_partition_ddl` in

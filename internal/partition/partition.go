@@ -255,18 +255,93 @@ func (m *Manager) listPartitions(ctx context.Context, parent, schema string, b B
 // an ACCESS EXCLUSIVE lock on the parent, but it cannot run in a transaction
 // block, so Spock's DDL replication silently skips it — on a mesh the partition
 // would stay attached on every peer. We therefore detach locally (top-level on
-// the pool, autocommit) and then fan the identical concurrent detach to each
-// peer via coldfront._detach_partition_peers (a no-op on a non-mesh node).
+// the pool, autocommit) and then, ONLY when Spock is present, fan the identical
+// concurrent detach out to each peer ourselves. The fan-out is gated on Spock,
+// so on vanilla single-node PostgreSQL it is skipped entirely — the binary
+// depends on neither Spock nor the coldfront extension.
 func (m *Manager) Detach(ctx context.Context, parent, schema, partName string) error {
 	qParent := pgx.Identifier{schema, parent}.Sanitize()
 	qPart := pgx.Identifier{schema, partName}.Sanitize()
 	if _, err := m.db.Exec(ctx, fmt.Sprintf(`ALTER TABLE %s DETACH PARTITION %s CONCURRENTLY`, qParent, qPart)); err != nil {
 		return fmt.Errorf("detach partition %s: %w", partName, err)
 	}
-	// Mesh fan-out: replicate the concurrent detach to every other node. Spock
-	// cannot carry DETACH … CONCURRENTLY itself (it is non-transactional).
-	if _, err := m.db.Exec(ctx, `SELECT coldfront._detach_partition_peers($1, $2)`, qParent, qPart); err != nil {
+	if err := m.detachOnPeers(ctx, qParent, qPart); err != nil {
 		return fmt.Errorf("detach partition %s on peers: %w", partName, err)
+	}
+	return nil
+}
+
+// detachOnPeers re-runs the concurrent detach on every OTHER Spock node. Spock
+// cannot replicate DETACH … CONCURRENTLY (non-transactional), so the retention
+// detach is fanned out here, natively over a fresh autocommit connection per
+// peer — no coldfront extension or dblink required. It is a no-op without Spock
+// (vanilla single node has no peers) and idempotent: a peer where the partition
+// is already detached or gone is skipped, so a re-run after a partial fan-out
+// neither errors nor double-detaches.
+func (m *Manager) detachOnPeers(ctx context.Context, qParent, qPart string) error {
+	var hasSpock bool
+	if err := m.db.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'spock')`).Scan(&hasSpock); err != nil {
+		return fmt.Errorf("probe spock: %w", err)
+	}
+	if !hasSpock {
+		return nil // vanilla single node — no peers, nothing to fan out
+	}
+	rows, err := m.db.Query(ctx, `
+		SELECT nd.node_name, ni.if_dsn
+		  FROM spock.node nd
+		  JOIN spock.node_interface ni ON ni.if_nodeid = nd.node_id
+		 WHERE nd.node_id <> (SELECT node_id FROM spock.local_node)`)
+	if err != nil {
+		return fmt.Errorf("enumerate spock peers: %w", err)
+	}
+	type peer struct{ name, dsn string }
+	var peers []peer
+	for rows.Next() {
+		var p peer
+		if err := rows.Scan(&p.name, &p.dsn); err != nil {
+			rows.Close()
+			return fmt.Errorf("scan spock peer: %w", err)
+		}
+		peers = append(peers, p)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return fmt.Errorf("enumerate spock peers: %w", err)
+	}
+	for _, p := range peers {
+		// Reference the peer by node name, never the DSN (it may carry a secret).
+		if err := detachOnPeer(ctx, p.dsn, qParent, qPart); err != nil {
+			return fmt.Errorf("peer %q: %w", p.name, err)
+		}
+	}
+	return nil
+}
+
+// detachOnPeer opens a fresh autocommit connection to one peer and runs the
+// concurrent detach there, but only if the partition is still attached on that
+// peer (to_regclass yields NULL for an already-detached/dropped partition, so
+// the check returns 0 and the detach is skipped — keeping the fan-out
+// idempotent). The DSN is never logged.
+func detachOnPeer(ctx context.Context, dsn, qParent, qPart string) error {
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		return fmt.Errorf("connect: %w", err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+	var attached int
+	if err := conn.QueryRow(ctx,
+		`SELECT count(*) FROM pg_inherits
+		   WHERE inhparent = to_regclass($1) AND inhrelid = to_regclass($2)`,
+		qParent, qPart).Scan(&attached); err != nil {
+		return fmt.Errorf("check attach: %w", err)
+	}
+	if attached == 0 {
+		return nil // already detached or gone on this peer
+	}
+	if _, err := conn.Exec(ctx,
+		fmt.Sprintf(`ALTER TABLE %s DETACH PARTITION %s CONCURRENTLY`, qParent, qPart)); err != nil {
+		return fmt.Errorf("detach: %w", err)
 	}
 	return nil
 }

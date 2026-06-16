@@ -1172,17 +1172,23 @@ story_mesh_partition_ddl() {
 
     # (b) DETACH the partition the way the partition manager does on a mesh
     #     (internal/partition Manager.Detach): a local top-level CONCURRENTLY detach,
-    #     then coldfront._detach_partition_peers fans the SAME concurrent detach to
-    #     every peer — Spock cannot replicate DETACH … CONCURRENTLY (non-txn), so a
-    #     bare detach would leave p0 attached on peers. The detached table is kept.
-    q "$HOST" "ALTER TABLE public.mddlprobe DETACH PARTITION public.mddlprobe_p0 CONCURRENTLY;" >/dev/null 2>&1
-    q "$HOST" "SELECT coldfront._detach_partition_peers('public.mddlprobe', 'public.mddlprobe_p0');" >/dev/null 2>&1
+    #     then the SAME concurrent detach on every peer — Spock cannot replicate
+    #     DETACH … CONCURRENTLY (non-txn), so a bare detach would leave p0 attached
+    #     on peers. The manager fans this out itself now (per peer, over its own
+    #     connection, skipping any node where it is already detached); this probe
+    #     drives the identical per-node detach to verify the resulting property.
+    #     The detached table is kept.
+    for n in "${nodes[@]}"; do
+        if [ "$(q "$n" "SELECT count(*) FROM pg_inherits WHERE inhparent='public.mddlprobe'::regclass AND inhrelid=to_regclass('public.mddlprobe_p0');")" != "0" ]; then
+            q "$n" "ALTER TABLE public.mddlprobe DETACH PARTITION public.mddlprobe_p0 CONCURRENTLY;" >/dev/null 2>&1
+        fi
+    done
     sleep 2
     local det=0
     for n in "${nodes[@]}"; do
         [ "$(q "$n" "SELECT count(*) FROM pg_inherits WHERE inhparent='public.mddlprobe'::regclass AND inhrelid='public.mddlprobe_p0'::regclass;")" = "0" ] || det=$((det + 1))
     done
-    assert_eq "DETACH PARTITION CONCURRENTLY on every node (local + peer fan-out)" "0" "$det"
+    assert_eq "DETACH PARTITION CONCURRENTLY on every node (manager-style per-node fan-out)" "0" "$det"
 
     # (c) DROP the detached standalone table from HOST; assert gone on EVERY node.
     q "$HOST" "DROP TABLE IF EXISTS public.mddlprobe_p0;" >/dev/null 2>&1
