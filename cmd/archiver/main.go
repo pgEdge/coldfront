@@ -41,25 +41,8 @@ func main() {
 	ctx, cancel := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer cancel()
 
-	const defaultDesc = "run one tiering/archive cycle"
-	// Top-level help / overview — no args, or help/-h/--help — lists the
-	// management subcommands so they are discoverable.
-	if len(os.Args) < 2 || os.Args[1] == "help" || os.Args[1] == "-h" || os.Args[1] == "--help" {
-		partcfg.PrintTopLevelUsage(os.Stdout, "archiver", defaultDesc)
+	if dispatchCLI(ctx) {
 		return
-	}
-	// A management subcommand routes to the shared CLI; with no subcommand the
-	// archiver does its default archive run (--config below).
-	if !strings.HasPrefix(os.Args[1], "-") {
-		if partcfg.IsCommand(os.Args[1]) {
-			if err := partcfg.Run(ctx, os.Args[1], os.Args[2:]); err != nil {
-				log.Fatalf("%s: %v", os.Args[1], err)
-			}
-			return
-		}
-		fmt.Fprintf(os.Stderr, "unknown subcommand %q\n\n", os.Args[1])
-		partcfg.PrintTopLevelUsage(os.Stderr, "archiver", defaultDesc)
-		os.Exit(2)
 	}
 
 	configPath := flag.String("config", "config.yaml", "path to config file")
@@ -74,11 +57,52 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
+	conn, wmStore := setupConnection(ctx, cfg)
+	defer func() { _ = conn.Close(ctx) }()
+
+	resolveAndValidateTables(ctx, cfg, conn, *configPath)
+
+	for i := range cfg.Archiver.Tables {
+		prepareAndRunTable(ctx, cfg, &cfg.Archiver.Tables[i], conn, wmStore, *debugExportDelay)
+	}
+}
+
+// dispatchCLI handles the non-archive-run invocations: the top-level help
+// overview (no args, or help/-h/--help) and the management subcommands routed
+// through the shared CLI. Returns true when it fully handled the invocation so
+// main should return; false when this is a default archive run (leading "-"
+// flag) that main proceeds with.
+func dispatchCLI(ctx context.Context) bool {
+	const defaultDesc = "run one tiering/archive cycle"
+	// Top-level help / overview — no args, or help/-h/--help — lists the
+	// management subcommands so they are discoverable.
+	if len(os.Args) < 2 || os.Args[1] == "help" || os.Args[1] == "-h" || os.Args[1] == "--help" {
+		partcfg.PrintTopLevelUsage(os.Stdout, "archiver", defaultDesc)
+		return true
+	}
+	// A management subcommand routes to the shared CLI; with no subcommand the
+	// archiver does its default archive run (--config below).
+	if !strings.HasPrefix(os.Args[1], "-") {
+		if partcfg.IsCommand(os.Args[1]) {
+			if err := partcfg.Run(ctx, os.Args[1], os.Args[2:]); err != nil {
+				log.Fatalf("%s: %v", os.Args[1], err)
+			}
+			return true
+		}
+		fmt.Fprintf(os.Stderr, "unknown subcommand %q\n\n", os.Args[1])
+		partcfg.PrintTopLevelUsage(os.Stderr, "archiver", defaultDesc)
+		os.Exit(2)
+	}
+	return false
+}
+
+// setupConnection connects to PostgreSQL, verifies the connection, and ensures
+// the watermark table exists. Any failure log.Fatalf's — this is the cron body.
+func setupConnection(ctx context.Context, cfg *config.Config) (*pgx.Conn, *watermark.Store) {
 	conn, err := pgx.Connect(ctx, cfg.Postgres.DSN)
 	if err != nil {
 		log.Fatalf("connect pg: %v", err)
 	}
-	defer func() { _ = conn.Close(ctx) }()
 
 	if err := conn.Ping(ctx); err != nil {
 		log.Fatalf("ping pg: %v", err)
@@ -88,7 +112,13 @@ func main() {
 	if err := wmStore.EnsureTable(ctx); err != nil {
 		log.Fatalf("ensure watermark table: %v", err)
 	}
+	return conn, wmStore
+}
 
+// resolveAndValidateTables resolves managed tables from the replicated
+// coldfront.partition_config table (falling back to YAML archiver.tables),
+// assigns them onto cfg, and validates the config. Any failure log.Fatalf's.
+func resolveAndValidateTables(ctx context.Context, cfg *config.Config, conn *pgx.Conn, configPath string) {
 	// Resolve managed tables from the replicated coldfront.partition_config
 	// table, falling back to the YAML archiver.tables (deprecation bridge).
 	tables, fromYAML, err := partcfg.ResolveTables(ctx, conn, cfg.Archiver.Tables)
@@ -96,7 +126,7 @@ func main() {
 		log.Fatalf("resolve tables: %v", err)
 	}
 	if len(tables) == 0 {
-		log.Fatalf("no tables configured: coldfront.partition_config is empty and no archiver.tables in %s", *configPath)
+		log.Fatalf("no tables configured: coldfront.partition_config is empty and no archiver.tables in %s", configPath)
 	}
 	if fromYAML {
 		log.Printf("no partition_config rows; using %d table(s) from YAML (deprecated — migrate with `register`/`import`)", len(tables))
@@ -106,10 +136,6 @@ func main() {
 	cfg.Archiver.Tables = tables
 	if err := cfg.Validate(); err != nil {
 		log.Fatalf("config invalid: %v", err)
-	}
-
-	for i := range cfg.Archiver.Tables {
-		prepareAndRunTable(ctx, cfg, &cfg.Archiver.Tables[i], conn, wmStore, *debugExportDelay)
 	}
 }
 
@@ -354,6 +380,81 @@ func runCycle(ctx context.Context, cfg *config.Config, t *config.TableConfig, co
 	// Resolve actual table name (_{source} after swap, {source} on first run)
 	tableName := partition.ResolveSourceTable(ctx, conn, t.SourceSchema, t.SourceTable)
 
+	// 1 + 1b. Create future partitions and self-heal the current one.
+	if err := ensureSingleLevelPartitions(ctx, t, partMgr, tableName, now); err != nil {
+		return err
+	}
+
+	// 2. Find partitions past the hot window — the tier-to-cold candidates.
+	hotExpired, err := findSingleLevelExpired(ctx, t, partMgr, tableName, now)
+	if err != nil {
+		return err
+	}
+	// retention_period (optional) drops cold Iceberg data past its age — the
+	// destroy end of the lifecycle, distinct from the tier-to-cold above.
+	coldExpiry := t.RetentionPeriod != ""
+	if len(hotExpired) == 0 && !coldExpiry {
+		log.Printf("[%s] nothing to tier or expire", t.SourceTable)
+		return nil
+	}
+	if len(hotExpired) > 0 {
+		log.Printf("[%s] found %d partition(s) past the hot window", t.SourceTable, len(hotExpired))
+	}
+
+	// 3-5. Attach the catalog + ensure the Iceberg table, tier the past-hot
+	//      partitions, then run the cold-expiry pass.
+	return tierAndExpireSingleLevel(ctx, conn, cfg, t, wmStore, partMgr, viewGen, iceTable, hotExpired, coldExpiry, now, debugExportDelay)
+}
+
+// tierAndExpireSingleLevel is steps 3-5 of runCycle: attach the catalog + ensure
+// the Iceberg table, tier each past-hot partition (when any), then run the
+// optional cold-expiry pass.
+func tierAndExpireSingleLevel(ctx context.Context, conn *pgx.Conn, cfg *config.Config,
+	t *config.TableConfig, wmStore *watermark.Store, partMgr *partition.Manager,
+	viewGen *view.Generator, iceTable string, hotExpired []partition.Info,
+	coldExpiry bool, now time.Time, debugExportDelay time.Duration,
+) error {
+	// 3. Attach the Lakekeeper catalog and ensure the Iceberg table exists —
+	//    needed by both the tiering pass and the cold-expiry DELETE.
+	if err := attachAndEnsureTable(ctx, conn, cfg, t, iceTable); err != nil {
+		return err
+	}
+
+	// 4. Tiering pass: move each past-hot partition hot → cold.
+	if len(hotExpired) > 0 {
+		if err := tierExpiredPartitions(ctx, conn, t, wmStore, partMgr, viewGen, iceTable, hotExpired, debugExportDelay); err != nil {
+			return err
+		}
+	}
+
+	// 5. Cold-expiry pass: drop Iceberg data older than retention_period.
+	if coldExpiry {
+		if err := expireColdTier(ctx, conn, t, partMgr, iceTable, now); err != nil {
+			return err
+		}
+	}
+
+	return nil
+}
+
+// attachAndEnsureTable is step 3 shared by both cycles: attach the Lakekeeper
+// catalog and ensure the (single) Iceberg table exists — needed by both the
+// tiering pass and the cold-expiry DELETE.
+func attachAndEnsureTable(ctx context.Context, conn *pgx.Conn, cfg *config.Config, t *config.TableConfig, iceTable string) error {
+	if err := attachIceberg(ctx, conn, cfg); err != nil {
+		return err
+	}
+	if err := ensureIcebergTable(ctx, conn, cfg, t, iceTable); err != nil {
+		return fmt.Errorf("ensure iceberg table: %w", err)
+	}
+	return nil
+}
+
+// ensureSingleLevelPartitions is phases 1 + 1b of runCycle: create the forward
+// window of future partitions, then self-heal the partition covering now.
+func ensureSingleLevelPartitions(ctx context.Context, t *config.TableConfig,
+	partMgr *partition.Manager, tableName string, now time.Time,
+) error {
 	// 1. Create future partitions. The cold tier always partitions by time.
 	if err := partMgr.EnsureFuture(ctx, tableName, t.SourceSchema,
 		t.PartitionColumn, t.PartitionPeriod,
@@ -378,123 +479,156 @@ func runCycle(ctx context.Context, cfg *config.Config, t *config.TableConfig, co
 		log.Printf("[%s] no hot partition covered %s — created it; if this table is actively written, widen future_partitions (=%d) or run more often",
 			t.SourceTable, now.Format("2006-01-02"), t.FuturePartitions)
 	}
+	return nil
+}
 
-	// 2. Find partitions past the hot window — the tier-to-cold candidates.
+// findSingleLevelExpired is phase 2 of runCycle: find the partitions past the
+// hot window (the tier-to-cold candidates).
+func findSingleLevelExpired(ctx context.Context, t *config.TableConfig,
+	partMgr *partition.Manager, tableName string, now time.Time,
+) ([]partition.Info, error) {
 	hotCutoff, err := partMgr.ExpiryCutoff(ctx, now, t.HotPeriod)
 	if err != nil {
-		return fmt.Errorf("hot cutoff: %w", err)
+		return nil, fmt.Errorf("hot cutoff: %w", err)
 	}
 	hotExpired, err := partMgr.FindExpired(ctx, tableName, t.SourceSchema, hotCutoff, partition.TimeBoundary{})
 	if err != nil {
-		return fmt.Errorf("find expired: %w", err)
+		return nil, fmt.Errorf("find expired: %w", err)
 	}
-	// retention_period (optional) drops cold Iceberg data past its age — the
-	// destroy end of the lifecycle, distinct from the tier-to-cold above.
-	coldExpiry := t.RetentionPeriod != ""
-	if len(hotExpired) == 0 && !coldExpiry {
-		log.Printf("[%s] nothing to tier or expire", t.SourceTable)
-		return nil
-	}
-	if len(hotExpired) > 0 {
-		log.Printf("[%s] found %d partition(s) past the hot window", t.SourceTable, len(hotExpired))
-	}
+	return hotExpired, nil
+}
 
-	// 3. Attach the Lakekeeper catalog and ensure the Iceberg table exists —
-	//    needed by both the tiering pass and the cold-expiry DELETE.
-	if err := attachIceberg(ctx, conn, cfg); err != nil {
+// requirePK errors with the caller-supplied message when no column in columns
+// participates in the primary key. The race-safe archive pipeline keys delta
+// capture by source PK, so a PK is mandatory. The message differs slightly
+// between the single-level and 2-level callers, so it is passed in.
+func requirePK(columns []view.Column, msg string) error {
+	for _, c := range columns {
+		if c.IsPK {
+			return nil
+		}
+	}
+	return fmt.Errorf("%s", msg)
+}
+
+// tierExpiredPartitions is step 4 of runCycle: get columns, require a PK,
+// bootstrap the unified view + register it (ONCE), then archive each past-hot
+// partition through the cutover pipeline (with idempotent cleanup of any that a
+// prior cycle already archived).
+func tierExpiredPartitions(ctx context.Context, conn *pgx.Conn, t *config.TableConfig,
+	wmStore *watermark.Store, partMgr *partition.Manager, viewGen *view.Generator,
+	iceTable string, hotExpired []partition.Info, debugExportDelay time.Duration,
+) error {
+	columns, err := getColumns(ctx, conn, t.SourceSchema, t.SourceTable)
+	if err != nil {
+		return fmt.Errorf("get columns: %w", err)
+	}
+	if err := requirePK(columns, fmt.Sprintf(
+		"%s.%s has no primary key — required for race-safe archive (delta capture "+
+			"keys writes by source PK; without one we can't replay UPDATE/DELETE to Iceberg)",
+		t.SourceSchema, t.SourceTable)); err != nil {
 		return err
 	}
-	if err := ensureIcebergTable(ctx, conn, cfg, t, iceTable); err != nil {
-		return fmt.Errorf("ensure iceberg table: %w", err)
+
+	if err := bootstrapTieredView(ctx, conn, t, wmStore, viewGen, iceTable, columns); err != nil {
+		return err
 	}
 
-	// 4. Tiering pass: move each past-hot partition hot → cold.
-	if len(hotExpired) > 0 {
-		columns, err := getColumns(ctx, conn, t.SourceSchema, t.SourceTable)
-		if err != nil {
-			return fmt.Errorf("get columns: %w", err)
+	// Archive each past-hot partition via the cutover pipeline.
+	for _, part := range hotExpired {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		hasPK := false
-		for _, c := range columns {
-			if c.IsPK {
-				hasPK = true
-				break
-			}
-		}
-		if !hasPK {
-			return fmt.Errorf(
-				"%s.%s has no primary key — required for race-safe archive (delta capture "+
-					"keys writes by source PK; without one we can't replay UPDATE/DELETE to Iceberg)",
-				t.SourceSchema, t.SourceTable)
-		}
-
-		// First-cycle bootstrap: rename events → _events and create the unified
-		// view with cutoff=watermark. Idempotent — the swap SQL no-ops if the
-		// rename already happened.
-		wmCutoff, _, err := wmStore.Get(ctx, t.SourceTable)
-		if err != nil {
-			return fmt.Errorf("get watermark: %w", err)
-		}
-		bootstrapCfg := view.ViewConfig{
-			SourceSchema:    t.SourceSchema,
-			SourceTable:     t.SourceTable,
-			IcebergTable:    iceTable,
-			CutoffTime:      wmCutoff,
-			PartitionColumn: t.PartitionColumn,
-			Columns:         columns,
-		}
-		if err := viewGen.Recreate(ctx, bootstrapCfg); err != nil {
-			return fmt.Errorf("bootstrap view: %w", err)
-		}
-		hotTable := pgx.Identifier{t.SourceSchema, "_" + t.SourceTable}.Sanitize()
-		if err := registerTieredView(ctx, conn, t.SourceSchema, t.SourceTable,
-			hotTable, iceTable, t.PartitionColumn); err != nil {
-			return fmt.Errorf("register tiered view: %w", err)
-		}
-
-		// Archive each past-hot partition via the cutover pipeline.
-		for _, part := range hotExpired {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-
-			wmCutoff, found, err := wmStore.Get(ctx, t.SourceTable)
-			if err != nil {
-				return fmt.Errorf("get watermark: %w", err)
-			}
-			if found && !part.UpperBound.After(wmCutoff) {
-				// Idempotent cleanup branch: partition was archived in a prior cycle,
-				// no race to worry about.
-				log.Printf("partition %s already archived, cleaning up", part.Name)
-				parent := partition.ResolveSourceTable(ctx, conn, t.SourceSchema, t.SourceTable)
-				if err := partMgr.Detach(ctx, parent, t.SourceSchema, part.Name); err != nil {
-					return fmt.Errorf("detach %s: %w", part.Name, err)
-				}
-				if err := partMgr.Drop(ctx, t.SourceSchema, part.Name); err != nil {
-					return fmt.Errorf("drop %s: %w", part.Name, err)
-				}
-				continue
-			}
-
-			if err := archivePartition(ctx, conn, t, part, iceTable, columns, debugExportDelay); err != nil {
-				return fmt.Errorf("archive %s: %w", part.Name, err)
-			}
-			log.Printf("archived %s", part.Name)
+		if err := archiveOnePartition(ctx, conn, t, wmStore, partMgr, iceTable, part, columns, debugExportDelay); err != nil {
+			return err
 		}
 	}
+	return nil
+}
 
-	// 5. Cold-expiry pass: drop Iceberg data older than retention_period.
-	if coldExpiry {
-		cutoff, err := partMgr.ExpiryCutoff(ctx, now, t.RetentionPeriod)
-		if err != nil {
-			return fmt.Errorf("cold cutoff: %w", err)
-		}
-		if err := dropColdBeforeRetention(ctx, conn, iceTable, t.PartitionColumn, cutoff); err != nil {
-			return fmt.Errorf("cold expiry: %w", err)
-		}
-		log.Printf("[%s] expired cold rows older than %s", t.SourceTable, cutoff.Format("2006-01-02 15:04:05Z"))
+// archiveOnePartition tiers one past-hot partition: if the watermark is already
+// past its upper bound it was archived in a prior cycle, so just detach + drop
+// (idempotent cleanup, no race); otherwise run the full archive pipeline.
+func archiveOnePartition(ctx context.Context, conn *pgx.Conn, t *config.TableConfig,
+	wmStore *watermark.Store, partMgr *partition.Manager, iceTable string,
+	part partition.Info, columns []view.Column, debugExportDelay time.Duration,
+) error {
+	wmCutoff, found, err := wmStore.Get(ctx, t.SourceTable)
+	if err != nil {
+		return fmt.Errorf("get watermark: %w", err)
+	}
+	if found && !part.UpperBound.After(wmCutoff) {
+		return cleanupAlreadyArchived(ctx, conn, t, partMgr, part)
 	}
 
+	if err := archivePartition(ctx, conn, t, part, iceTable, columns, debugExportDelay); err != nil {
+		return fmt.Errorf("archive %s: %w", part.Name, err)
+	}
+	log.Printf("archived %s", part.Name)
+	return nil
+}
+
+// bootstrapTieredView is the first-cycle bootstrap shared by both tiering
+// passes: read the watermark, rename {source} → _{source} and (re)create the
+// unified view with cutoff=watermark, then register the tiered view. Idempotent
+// — the swap SQL no-ops if the rename already happened. Called ONCE before the
+// per-partition / per-period loop, never inside it.
+func bootstrapTieredView(ctx context.Context, conn *pgx.Conn, t *config.TableConfig,
+	wmStore *watermark.Store, viewGen *view.Generator, iceTable string, columns []view.Column,
+) error {
+	wmCutoff, _, err := wmStore.Get(ctx, t.SourceTable)
+	if err != nil {
+		return fmt.Errorf("get watermark: %w", err)
+	}
+	bootstrapCfg := view.ViewConfig{
+		SourceSchema:    t.SourceSchema,
+		SourceTable:     t.SourceTable,
+		IcebergTable:    iceTable,
+		CutoffTime:      wmCutoff,
+		PartitionColumn: t.PartitionColumn,
+		Columns:         columns,
+	}
+	if err := viewGen.Recreate(ctx, bootstrapCfg); err != nil {
+		return fmt.Errorf("bootstrap view: %w", err)
+	}
+	hotTable := pgx.Identifier{t.SourceSchema, "_" + t.SourceTable}.Sanitize()
+	if err := registerTieredView(ctx, conn, t.SourceSchema, t.SourceTable,
+		hotTable, iceTable, t.PartitionColumn); err != nil {
+		return fmt.Errorf("register tiered view: %w", err)
+	}
+	return nil
+}
+
+// cleanupAlreadyArchived is the idempotent cleanup branch: the partition was
+// archived in a prior cycle (watermark already past its upper bound), so there
+// is no race — just detach + drop the stale PG partition.
+func cleanupAlreadyArchived(ctx context.Context, conn *pgx.Conn, t *config.TableConfig,
+	partMgr *partition.Manager, part partition.Info,
+) error {
+	log.Printf("partition %s already archived, cleaning up", part.Name)
+	parent := partition.ResolveSourceTable(ctx, conn, t.SourceSchema, t.SourceTable)
+	if err := partMgr.Detach(ctx, parent, t.SourceSchema, part.Name); err != nil {
+		return fmt.Errorf("detach %s: %w", part.Name, err)
+	}
+	if err := partMgr.Drop(ctx, t.SourceSchema, part.Name); err != nil {
+		return fmt.Errorf("drop %s: %w", part.Name, err)
+	}
+	return nil
+}
+
+// expireColdTier is the step-5 cold-expiry pass: drop Iceberg data older than
+// retention_period. Shared by the single-level and 2-level cycles.
+func expireColdTier(ctx context.Context, conn *pgx.Conn, t *config.TableConfig,
+	partMgr *partition.Manager, iceTable string, now time.Time,
+) error {
+	cutoff, err := partMgr.ExpiryCutoff(ctx, now, t.RetentionPeriod)
+	if err != nil {
+		return fmt.Errorf("cold cutoff: %w", err)
+	}
+	if err := dropColdBeforeRetention(ctx, conn, iceTable, t.PartitionColumn, cutoff); err != nil {
+		return fmt.Errorf("cold expiry: %w", err)
+	}
+	log.Printf("[%s] expired cold rows older than %s", t.SourceTable, cutoff.Format("2006-01-02 15:04:05Z"))
 	return nil
 }
 
@@ -508,6 +642,24 @@ func runCycle(ctx context.Context, cfg *config.Config, t *config.TableConfig, co
 // the list-agnostic view mid-cycle. The child name uses the stable configured name
 // (t.SourceTable) so it matches the partitioner's naming across the bootstrap
 // rename of the physical hot table.
+// childRef is one LIST-value child: its physical name and the LIST value it
+// holds. Built in step 1 of the 2-level cycle, consumed when enumerating leaves.
+type childRef struct{ name, listVal string }
+
+// leafRef is one past-hot RANGE leaf under a LIST-value child, carrying enough
+// context (child, listVal) for the LIST-value-scoped Phase-0 wipe at export.
+type leafRef struct {
+	child, listVal string
+	info           partition.Info
+}
+
+// exported pairs a tiered leaf with the snapshot string its cutover needs, so
+// the per-period export-all pass can hand off to the cutover-all pass.
+type exported struct {
+	lf   leafRef
+	snap string
+}
+
 func runCycleTwoLevel(ctx context.Context, cfg *config.Config, t *config.TableConfig, conn *pgx.Conn, wmStore *watermark.Store, debugExportDelay time.Duration, now time.Time) error {
 	partMgr := partition.NewManager(conn)
 	viewGen := view.NewGenerator(conn)
@@ -521,52 +673,15 @@ func runCycleTwoLevel(ctx context.Context, cfg *config.Config, t *config.TableCo
 
 	// 1. Premake per LIST value: ensure the LIST child exists (attached to the
 	//    physical top, named by the stable source name) and its forward window.
-	type childRef struct{ name, listVal string }
-	var children []childRef
-	anyBehind := false
-	for _, v := range values {
-		child, err := partition.SubName(t.SourceTable, v)
-		if err != nil {
-			return fmt.Errorf("sub-partition name for %q: %w", v, err)
-		}
-		if err := partMgr.EnsureListChild(ctx, parent, t.SourceSchema, v, child, t.PartitionColumn); err != nil {
-			return err
-		}
-		prefix := child + "_"
-		if err := partMgr.EnsureFuture(ctx, child, t.SourceSchema, t.PartitionColumn,
-			t.PartitionPeriod, t.FuturePartitions, now, partition.TimeBoundary{}, prefix); err != nil {
-			return fmt.Errorf("premake %s: %w", child, err)
-		}
-		b, err := partMgr.EnsureCurrent(ctx, child, t.SourceSchema, t.PartitionPeriod, now, partition.TimeBoundary{}, prefix)
-		if err != nil {
-			return fmt.Errorf("ensure current %s: %w", child, err)
-		}
-		anyBehind = anyBehind || b
-		children = append(children, childRef{child, v})
-	}
-	if anyBehind {
-		log.Printf("[%s] a LIST value had no hot partition covering %s — created it; if this table is actively written, widen future_partitions (=%d) or run more often",
-			t.SourceTable, now.Format("2006-01-02"), t.FuturePartitions)
+	children, err := premakeListChildren(ctx, t, partMgr, parent, values, now)
+	if err != nil {
+		return err
 	}
 
 	// 2. Enumerate past-hot RANGE leaves under each LIST-value child.
-	type leafRef struct {
-		child, listVal string
-		info           partition.Info
-	}
-	var leaves []leafRef
-	hotCutoff, err := partMgr.ExpiryCutoff(ctx, now, t.HotPeriod)
+	leaves, err := findExpiredLeaves(ctx, t, partMgr, children, now)
 	if err != nil {
-		return fmt.Errorf("hot cutoff: %w", err)
-	}
-	for _, c := range children {
-		exp, err := partMgr.FindExpired(ctx, c.name, t.SourceSchema, hotCutoff, partition.TimeBoundary{})
-		if err != nil {
-			return fmt.Errorf("find expired %s: %w", c.name, err)
-		}
-		for _, info := range exp {
-			leaves = append(leaves, leafRef{c.name, c.listVal, info})
-		}
+		return err
 	}
 
 	coldExpiry := t.RetentionPeriod != ""
@@ -579,112 +694,182 @@ func runCycleTwoLevel(ctx context.Context, cfg *config.Config, t *config.TableCo
 			t.SourceTable, len(leaves), len(children))
 	}
 
+	// 3-5. Attach the catalog + ensure the Iceberg table, tier the past-hot
+	//      leaves grouped by period, then run the list-agnostic cold-expiry.
+	return tierAndExpireTwoLevel(ctx, conn, cfg, t, wmStore, partMgr, viewGen, iceTable, leaves, coldExpiry, now, debugExportDelay)
+}
+
+// tierAndExpireTwoLevel is steps 3-5 of runCycleTwoLevel: attach the catalog +
+// ensure the (single) Iceberg table, tier the past-hot leaves grouped by ts
+// period (when any), then run the optional list-agnostic cold-expiry pass.
+func tierAndExpireTwoLevel(ctx context.Context, conn *pgx.Conn, cfg *config.Config,
+	t *config.TableConfig, wmStore *watermark.Store, partMgr *partition.Manager,
+	viewGen *view.Generator, iceTable string, leaves []leafRef,
+	coldExpiry bool, now time.Time, debugExportDelay time.Duration,
+) error {
 	// 3. Attach the catalog + ensure the (single) Iceberg table.
-	if err := attachIceberg(ctx, conn, cfg); err != nil {
+	if err := attachAndEnsureTable(ctx, conn, cfg, t, iceTable); err != nil {
 		return err
-	}
-	if err := ensureIcebergTable(ctx, conn, cfg, t, iceTable); err != nil {
-		return fmt.Errorf("ensure iceberg table: %w", err)
 	}
 
 	// 4. Tier the past-hot leaves, grouped by ts period (oldest first).
 	if len(leaves) > 0 {
-		columns, err := getColumns(ctx, conn, t.SourceSchema, t.SourceTable)
-		if err != nil {
-			return fmt.Errorf("get columns: %w", err)
-		}
-		hasPK := false
-		for _, c := range columns {
-			if c.IsPK {
-				hasPK = true
-				break
-			}
-		}
-		if !hasPK {
-			return fmt.Errorf(
-				"%s.%s has no primary key — required for race-safe archive (delta capture "+
-					"keys writes by source PK)", t.SourceSchema, t.SourceTable)
-		}
-		// The LIST (level-1) column, for the LIST-value-scoped Phase-0 wipe.
-		listCols, err := detectPartitionColumns(ctx, conn, t.SourceSchema, t.SourceTable)
-		if err != nil {
-			return fmt.Errorf("detect list column: %w", err)
-		}
-		listCol := listCols[0]
-
-		// First-cycle bootstrap: rename top→_top + unified view + register.
-		wmCutoff, _, err := wmStore.Get(ctx, t.SourceTable)
-		if err != nil {
-			return fmt.Errorf("get watermark: %w", err)
-		}
-		bootstrapCfg := view.ViewConfig{
-			SourceSchema:    t.SourceSchema,
-			SourceTable:     t.SourceTable,
-			IcebergTable:    iceTable,
-			CutoffTime:      wmCutoff,
-			PartitionColumn: t.PartitionColumn,
-			Columns:         columns,
-		}
-		if err := viewGen.Recreate(ctx, bootstrapCfg); err != nil {
-			return fmt.Errorf("bootstrap view: %w", err)
-		}
-		hotTable := pgx.Identifier{t.SourceSchema, "_" + t.SourceTable}.Sanitize()
-		if err := registerTieredView(ctx, conn, t.SourceSchema, t.SourceTable,
-			hotTable, iceTable, t.PartitionColumn); err != nil {
-			return fmt.Errorf("register tiered view: %w", err)
-		}
-
-		// Group by period (UpperBound); process oldest-first.
-		byPeriod := map[time.Time][]leafRef{}
-		for _, lf := range leaves {
-			byPeriod[lf.info.UpperBound] = append(byPeriod[lf.info.UpperBound], lf)
-		}
-		periods := make([]time.Time, 0, len(byPeriod))
-		for p := range byPeriod {
-			periods = append(periods, p)
-		}
-		sort.Slice(periods, func(i, j int) bool { return periods[i].Before(periods[j]) })
-
-		for _, p := range periods {
-			if err := ctx.Err(); err != nil {
-				return err
-			}
-			grp := byPeriod[p]
-			// Export EVERY LIST value's leaf for this period first (no detach, cutoff
-			// unchanged) so all of the period is in cold before it advances.
-			type exported struct {
-				lf   leafRef
-				snap string
-			}
-			var done []exported
-			for _, lf := range grp {
-				snap, err := archiveExport(ctx, conn, t, lf.info, iceTable, columns, listCol, lf.listVal, debugExportDelay)
-				if err != nil {
-					return fmt.Errorf("export %s: %w", lf.info.Name, err)
-				}
-				done = append(done, exported{lf, snap})
-			}
-			// Then cut them over: the first advances the shared cutoff to p, the
-			// rest re-set it idempotently and detach their (now-excluded) leaf.
-			for _, e := range done {
-				if err := archiveCutover(ctx, conn, t, e.lf.info, iceTable, e.snap, columns); err != nil {
-					return fmt.Errorf("cutover %s: %w", e.lf.info.Name, err)
-				}
-				log.Printf("tiered %s (list value %s)", e.lf.info.Name, e.lf.listVal)
-			}
+		if err := tierLeavesByPeriod(ctx, conn, t, wmStore, viewGen, iceTable, leaves, debugExportDelay); err != nil {
+			return err
 		}
 	}
 
 	// 5. Cold-expiry: drop Iceberg data older than retention_period (list-agnostic).
 	if coldExpiry {
-		cExp, err := partMgr.ExpiryCutoff(ctx, now, t.RetentionPeriod)
+		if err := expireColdTier(ctx, conn, t, partMgr, iceTable, now); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// premakeListChildren is step 1 of the 2-level cycle: for each LIST value ensure
+// its child (attached to the physical top, named by the stable source name) and
+// its forward window + current partition exist, logging once if any was behind.
+func premakeListChildren(ctx context.Context, t *config.TableConfig, partMgr *partition.Manager,
+	parent string, values []string, now time.Time,
+) ([]childRef, error) {
+	var children []childRef
+	anyBehind := false
+	for _, v := range values {
+		child, err := partition.SubName(t.SourceTable, v)
 		if err != nil {
-			return fmt.Errorf("cold cutoff: %w", err)
+			return nil, fmt.Errorf("sub-partition name for %q: %w", v, err)
 		}
-		if err := dropColdBeforeRetention(ctx, conn, iceTable, t.PartitionColumn, cExp); err != nil {
-			return fmt.Errorf("cold expiry: %w", err)
+		if err := partMgr.EnsureListChild(ctx, parent, t.SourceSchema, v, child, t.PartitionColumn); err != nil {
+			return nil, err
 		}
-		log.Printf("[%s] expired cold rows older than %s", t.SourceTable, cExp.Format("2006-01-02 15:04:05Z"))
+		prefix := child + "_"
+		if err := partMgr.EnsureFuture(ctx, child, t.SourceSchema, t.PartitionColumn,
+			t.PartitionPeriod, t.FuturePartitions, now, partition.TimeBoundary{}, prefix); err != nil {
+			return nil, fmt.Errorf("premake %s: %w", child, err)
+		}
+		b, err := partMgr.EnsureCurrent(ctx, child, t.SourceSchema, t.PartitionPeriod, now, partition.TimeBoundary{}, prefix)
+		if err != nil {
+			return nil, fmt.Errorf("ensure current %s: %w", child, err)
+		}
+		anyBehind = anyBehind || b
+		children = append(children, childRef{child, v})
+	}
+	if anyBehind {
+		log.Printf("[%s] a LIST value had no hot partition covering %s — created it; if this table is actively written, widen future_partitions (=%d) or run more often",
+			t.SourceTable, now.Format("2006-01-02"), t.FuturePartitions)
+	}
+	return children, nil
+}
+
+// findExpiredLeaves is step 2 of the 2-level cycle: enumerate the past-hot RANGE
+// leaves under each LIST-value child.
+func findExpiredLeaves(ctx context.Context, t *config.TableConfig, partMgr *partition.Manager,
+	children []childRef, now time.Time,
+) ([]leafRef, error) {
+	var leaves []leafRef
+	hotCutoff, err := partMgr.ExpiryCutoff(ctx, now, t.HotPeriod)
+	if err != nil {
+		return nil, fmt.Errorf("hot cutoff: %w", err)
+	}
+	for _, c := range children {
+		exp, err := partMgr.FindExpired(ctx, c.name, t.SourceSchema, hotCutoff, partition.TimeBoundary{})
+		if err != nil {
+			return nil, fmt.Errorf("find expired %s: %w", c.name, err)
+		}
+		for _, info := range exp {
+			leaves = append(leaves, leafRef{c.name, c.listVal, info})
+		}
+	}
+	return leaves, nil
+}
+
+// tierLeavesByPeriod is step 4 of the 2-level cycle: get columns, require a PK,
+// detect the LIST column, bootstrap the unified view + register it (ONCE), then
+// group the leaves by ts period and tier them oldest-first.
+func tierLeavesByPeriod(ctx context.Context, conn *pgx.Conn, t *config.TableConfig,
+	wmStore *watermark.Store, viewGen *view.Generator, iceTable string,
+	leaves []leafRef, debugExportDelay time.Duration,
+) error {
+	columns, err := getColumns(ctx, conn, t.SourceSchema, t.SourceTable)
+	if err != nil {
+		return fmt.Errorf("get columns: %w", err)
+	}
+	if err := requirePK(columns, fmt.Sprintf(
+		"%s.%s has no primary key — required for race-safe archive (delta capture "+
+			"keys writes by source PK)", t.SourceSchema, t.SourceTable)); err != nil {
+		return err
+	}
+	// The LIST (level-1) column, for the LIST-value-scoped Phase-0 wipe.
+	listCols, err := detectPartitionColumns(ctx, conn, t.SourceSchema, t.SourceTable)
+	if err != nil {
+		return fmt.Errorf("detect list column: %w", err)
+	}
+	listCol := listCols[0]
+
+	if err := bootstrapTieredView(ctx, conn, t, wmStore, viewGen, iceTable, columns); err != nil {
+		return err
+	}
+
+	// Group by period (UpperBound); process oldest-first.
+	for _, grp := range groupLeavesByPeriod(leaves) {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		if err := tierOnePeriod(ctx, conn, t, iceTable, columns, listCol, grp, debugExportDelay); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// groupLeavesByPeriod groups leaves by their ts period (UpperBound) and returns
+// the per-period leaf slices ordered oldest-first — so the caller tiers each
+// period's leaves together, advancing the shared cutoff one period at a time.
+func groupLeavesByPeriod(leaves []leafRef) [][]leafRef {
+	byPeriod := map[time.Time][]leafRef{}
+	for _, lf := range leaves {
+		byPeriod[lf.info.UpperBound] = append(byPeriod[lf.info.UpperBound], lf)
+	}
+	periods := make([]time.Time, 0, len(byPeriod))
+	for p := range byPeriod {
+		periods = append(periods, p)
+	}
+	sort.Slice(periods, func(i, j int) bool { return periods[i].Before(periods[j]) })
+
+	groups := make([][]leafRef, 0, len(periods))
+	for _, p := range periods {
+		groups = append(groups, byPeriod[p])
+	}
+	return groups
+}
+
+// tierOnePeriod tiers one ts period's leaves: it exports EVERY LIST value's leaf
+// for the period FIRST (no detach, cutoff unchanged) so the whole period is in
+// cold before the shared cutoff advances, then cuts them all over (the first
+// advances the cutoff to p, the rest re-set it idempotently and detach their
+// now-excluded leaf). The two loops must stay sequential — never interleaved.
+func tierOnePeriod(ctx context.Context, conn *pgx.Conn, t *config.TableConfig,
+	iceTable string, columns []view.Column, listCol string, grp []leafRef, debugExportDelay time.Duration,
+) error {
+	// Export EVERY LIST value's leaf for this period first (no detach, cutoff
+	// unchanged) so all of the period is in cold before it advances.
+	var done []exported
+	for _, lf := range grp {
+		snap, err := archiveExport(ctx, conn, t, lf.info, iceTable, columns, listCol, lf.listVal, debugExportDelay)
+		if err != nil {
+			return fmt.Errorf("export %s: %w", lf.info.Name, err)
+		}
+		done = append(done, exported{lf, snap})
+	}
+	// Then cut them over: the first advances the shared cutoff to p, the
+	// rest re-set it idempotently and detach their (now-excluded) leaf.
+	for _, e := range done {
+		if err := archiveCutover(ctx, conn, t, e.lf.info, iceTable, e.snap, columns); err != nil {
+			return fmt.Errorf("cutover %s: %w", e.lf.info.Name, err)
+		}
+		log.Printf("tiered %s (list value %s)", e.lf.info.Name, e.lf.listVal)
 	}
 	return nil
 }
@@ -807,8 +992,33 @@ func archiveCutover(ctx context.Context, conn *pgx.Conn, t *config.TableConfig,
 	}
 	viewDDL := view.GenerateViewSQL(viewCfg)
 
-	// Phase 3 + 4 with retry harness. Each attempt's wall-clock is logged
-	// so the per-phase totals are visible even when retries fire.
+	if err := runCutoverWithRetry(ctx, conn, t, part, iceTable, snapshotStr, viewDDL); err != nil {
+		return err
+	}
+
+	// Phase 5: post-cutover drain + drop. Single CALL: cutover_cleanup
+	// internally drains stragglers from the lock-acquisition window and then
+	// drops the detached partition, capture trigger, and delta table.
+	t5 := time.Now()
+	if _, err := conn.Exec(ctx, /* nosemgrep */
+		"CALL coldfront.cutover_cleanup($1, $2, $3, $4)",
+		t.SourceSchema, part.Name, snapshotStr, iceTable); err != nil {
+		return fmt.Errorf("phase 5 (cleanup): %w", err)
+	}
+	log.Printf("[%s] %s phase 5 (cleanup: drain stragglers + drop partition + trigger + delta): %s",
+		t.SourceTable, part.Name, time.Since(t5).Round(time.Millisecond))
+	return nil
+}
+
+// runCutoverWithRetry runs Phase 3 (delta replay) + Phase 4 (atomic cutover)
+// under a 10-attempt retry harness with exponential backoff (100ms → 51.2s).
+// Phase 3 is idempotent so retries are safe; Phase 4 either commits everything
+// atomically or rolls back cleanly. Each attempt's wall-clock is logged so the
+// per-phase totals are visible even when retries fire. Returns nil only after a
+// successful cutover (so the caller's Phase 5 runs ONLY then).
+func runCutoverWithRetry(ctx context.Context, conn *pgx.Conn, t *config.TableConfig,
+	part partition.Info, iceTable, snapshotStr, viewDDL string,
+) error {
 	backoff := 100 * time.Millisecond
 	var lastErr error
 	cutoverDone := false
@@ -847,18 +1057,6 @@ func archiveCutover(ctx context.Context, conn *pgx.Conn, t *config.TableConfig,
 	if !cutoverDone {
 		return fmt.Errorf("phase 4 (cutover) failed after 10 attempts; trigger+delta left for next cycle: %w", lastErr)
 	}
-
-	// Phase 5: post-cutover drain + drop. Single CALL: cutover_cleanup
-	// internally drains stragglers from the lock-acquisition window and then
-	// drops the detached partition, capture trigger, and delta table.
-	t5 := time.Now()
-	if _, err := conn.Exec(ctx,
-		"CALL coldfront.cutover_cleanup($1, $2, $3, $4)",
-		t.SourceSchema, part.Name, snapshotStr, iceTable); err != nil {
-		return fmt.Errorf("phase 5 (cleanup): %w", err)
-	}
-	log.Printf("[%s] %s phase 5 (cleanup: drain stragglers + drop partition + trigger + delta): %s",
-		t.SourceTable, part.Name, time.Since(t5).Round(time.Millisecond))
 	return nil
 }
 
@@ -1191,6 +1389,27 @@ var numericTypeRe = regexp.MustCompile(`^numeric\((\d+),\s*(\d+)\)$`)
 func getColumns(ctx context.Context, db querier, schema, tableName string) ([]view.Column, error) {
 	actualName := partition.ResolveSourceTable(ctx, db, schema, tableName)
 
+	cols, err := scanColumns(ctx, db, schema, actualName)
+	if err != nil {
+		return nil, err
+	}
+
+	pkSet, err := scanPrimaryKeys(ctx, db, schema, actualName)
+	if err != nil {
+		return nil, err
+	}
+
+	for i := range cols {
+		if pkSet[cols[i].Name] {
+			cols[i].IsPK = true
+		}
+	}
+	return cols, nil
+}
+
+// scanColumns runs the column-metadata query (the FIRST of getColumns' two
+// queries) and maps each PG format_type to its DuckDB storage/view-cast form.
+func scanColumns(ctx context.Context, db querier, schema, actualName string) ([]view.Column, error) {
 	// format_type carries the typmod-decoded form (numeric(P,S), character
 	// varying(N), timestamp with time zone, …). attidentity is PG internal
 	// type "char"; cast to text for pgx compatibility.
@@ -1226,10 +1445,12 @@ func getColumns(ctx context.Context, db querier, schema, tableName string) ([]vi
 			IsIdentity:   attidentity == "a",
 		})
 	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
+	return cols, rows.Err()
+}
 
+// scanPrimaryKeys runs the primary-key query (the SECOND of getColumns' two
+// queries) and returns the set of PK column names — single-column and composite.
+func scanPrimaryKeys(ctx context.Context, db querier, schema, actualName string) (map[string]bool, error) {
 	// Primary key column names — works for single-column and composite PKs.
 	pkRows, err := db.Query(ctx, `
 		SELECT a.attname
@@ -1251,16 +1472,7 @@ func getColumns(ctx context.Context, db querier, schema, tableName string) ([]vi
 		}
 		pkSet[name] = true
 	}
-	if err := pkRows.Err(); err != nil {
-		return nil, err
-	}
-
-	for i := range cols {
-		if pkSet[cols[i].Name] {
-			cols[i].IsPK = true
-		}
-	}
-	return cols, nil
+	return pkSet, pkRows.Err()
 }
 
 // init configures the standard logger: UTC timestamps on stderr so cron
