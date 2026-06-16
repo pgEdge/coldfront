@@ -235,15 +235,18 @@ unit, so alerting is free):
 
 Keep the following operational behaviour in mind when scheduling it:
 
-- **Exit codes.** `0` = every table reconciled; non-zero = at least one
-  table failed or fell behind (`N table(s) failed`), each logged with its
-  `[schema.table]` prefix. Alert on non-zero.
+- **Exit codes.** `0` = every table reconciled (a self-healed *behind*
+  condition still exits `0`); non-zero = at least one table failed
+  (`N table(s) failed`), each logged with its `[schema.table]` prefix.
+  Alert on non-zero.
 - **Behind-detection.** If the table already has a *past* partition but
   none covers *now* at the start of a pass (a lagging cron - live inserts
-  had no home), the pass heals it (creates the current partition) and
-  *then* exits non-zero so monitoring notices - widen `future_partitions`
-  or run more often. A fresh table (only just-premade future partitions)
-  is **not** behind: its first reconcile succeeds cleanly.
+  had no home), the pass heals it (creates the current partition), logs a
+  `WARNING (self-healed)` line, and still exits `0`. Monitor for that
+  warning in the log rather than via the exit code, and widen
+  `future_partitions` or run more often. A fresh table (only just-premade
+  future partitions) is **not** behind: its first reconcile succeeds
+  cleanly.
 - **Retention strategy.** With the default `expiration_strategy: drop`,
   expiry is `DETACH CONCURRENTLY` + `DROP TABLE` - the data is **gone**,
   so back up before shrinking `retention_period`. Set
