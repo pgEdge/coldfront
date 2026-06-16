@@ -1,9 +1,11 @@
 # pgEdge ColdFront
 
-ColdFront stores PostgreSQL tables in Apache Iceberg (Parquet on
-S3-compatible storage) while the application queries them as ordinary
-PostgreSQL relations. ColdFront offers two operating modes, and both
-present the same standard SQL surface.
+ColdFront keeps tables in PostgreSQL and cold data in Apache Iceberg
+(Parquet on S3-compatible, Azure, or GCS storage), and the cold tier is
+both readable and writable through the same SQL with no application
+changes. The application queries every table as an ordinary PostgreSQL
+relation, and both operating modes present the same standard SQL
+surface.
 
 ColdFront provides two operating modes:
 
@@ -108,6 +110,8 @@ Disable those features on the storage account before using it as a cold
 tier.
 
 ## Next Steps
+
+To go further with ColdFront, consult the following guides:
 
 - The [Installation](installation.md) guide covers building ColdFront
   and bringing up the stack.
