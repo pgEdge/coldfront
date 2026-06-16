@@ -1488,6 +1488,56 @@ story_partitioner_multitable() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# Story — issue #12: after the archiver's first-run swap (events → _events, with
+# a unified view left in events' place) the standalone partitioner must premake
+# against the real partitioned table (_events), not the view. The configured /
+# registered source name is still "events"; reconcileTable resolves it to the
+# "_"+name partitioned relation before building the spec. Pre-fix the partitioner
+# targeted the view and aborted on the issue #11 verify-attach guard ("not
+# attached … different parent"); post-fix it premakes the forward window straight
+# onto _events.
+# ───────────────────────────────────────────────────────────────────────────
+story_partitioner_after_swap() {
+    step "Partitioner after first-run swap: premakes onto _events, not the view (issue #12)"
+    # Precondition (set up by story_provision_tiered): events is a VIEW now and
+    # _events is the partitioned hot table.
+    assert_eq "issue #12: precondition — events is a view"       "v" "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='events'  AND relnamespace='public'::regnamespace;")"
+    assert_eq "issue #12: precondition — _events is partitioned" "p" "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='_events' AND relnamespace='public'::regnamespace;")"
+    local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
+    # Drive the partitioner off the post-swap source name "events" with a wide
+    # future window (6) so it premakes months the archiver (premake 3) did not —
+    # proving it acted on _events. retention 60 months drops nothing.
+    cat > /tmp/journey-issue12.yaml <<EOF
+postgres:
+  dsn: "${dsn}"
+archiver:
+  tables:
+    - source_table: events
+      partition_period: monthly
+      retention_period: "60 months"
+      future_partitions: 6
+EOF
+    if ! "$PARTITIONER" --config /tmp/journey-issue12.yaml >/tmp/journey-issue12.log 2>&1; then
+        fail "issue #12: partitioner run failed (pre-fix it targets the view)"; tail -8 /tmp/journey-issue12.log; return
+    fi
+    # The fix resolves events → _events, so the reconcile is logged against _events.
+    grep -q "\[_events\] reconciled" /tmp/journey-issue12.log \
+        && pass "issue #12: partitioner reconciled _events (resolved past the view)" \
+        || { fail "issue #12: reconcile did not target _events"; tail -8 /tmp/journey-issue12.log; }
+    # And it never trips the verify-attach guard that the pre-fix view target hits.
+    if grep -q "different parent" /tmp/journey-issue12.log; then
+        fail "issue #12: partitioner tripped the verify-attach guard (still targeting the view)"; tail -8 /tmp/journey-issue12.log
+    else
+        pass "issue #12: no verify-attach error (did not touch the view)"
+    fi
+    # Behavioral proof: the +5-month leaf (beyond the archiver's premake window) is
+    # attached to _events, the real partitioned table — not orphaned or erroring.
+    local fut; fut="events_p_$(date -u -d "$(date -u +%Y-%m-01) +5 months" +%Y_%m)"
+    assert_eq "issue #12: +5mo leaf $fut premade onto _events" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM pg_inherits i JOIN pg_class c ON c.oid=i.inhrelid WHERE i.inhparent='public._events'::regclass AND c.relname='$fut';")"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Story — Enterprise privilege model: a NON-superuser app role, onboarded with a
 # single coldfront.grant_app_access() call, reads AND writes the tiered view
 # transparently — no superuser, no pg_*_server_files, no per-session setup.
@@ -1555,6 +1605,7 @@ if [ "$MODE" = "tiered" ]; then
     story_tiered_twolevel
     story_partitioner_idmode
     story_partitioner_multitable
+    story_partitioner_after_swap
     story_register_cli
 else
     story_provision_decoupled

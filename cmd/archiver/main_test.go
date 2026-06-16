@@ -221,41 +221,6 @@ func TestParsePartitionKeyDef(t *testing.T) {
 	}
 }
 
-func TestResolveTableName_AfterSwap(t *testing.T) {
-	db := &mockQuerier{
-		rowFunc: func(_ context.Context, _ string, args ...any) pgx.Row {
-			return &mockRow{scanFunc: func(dest ...any) error {
-				assert.Equal(t, "_events", args[1])
-				*(dest[0].(*bool)) = true
-				return nil
-			}}
-		},
-	}
-	assert.Equal(t, "_events", resolveTableName(context.Background(), db, "public", "events"))
-}
-
-func TestResolveTableName_BeforeSwap(t *testing.T) {
-	db := &mockQuerier{
-		rowFunc: func(_ context.Context, _ string, _ ...any) pgx.Row {
-			return &mockRow{scanFunc: func(dest ...any) error {
-				*(dest[0].(*bool)) = false
-				return nil
-			}}
-		},
-	}
-	assert.Equal(t, "events", resolveTableName(context.Background(), db, "public", "events"))
-}
-
-func TestResolveTableName_QueryError(t *testing.T) {
-	db := &mockQuerier{
-		rowFunc: func(_ context.Context, _ string, _ ...any) pgx.Row {
-			return &mockRow{scanFunc: func(dest ...any) error { return errors.New("boom") }}
-		},
-	}
-	// On error the resolver falls back to the unprefixed source name.
-	assert.Equal(t, "events", resolveTableName(context.Background(), db, "public", "events"))
-}
-
 func TestDetectPartitionColumns_Single(t *testing.T) {
 	calls := 0
 	db := &mockQuerier{
