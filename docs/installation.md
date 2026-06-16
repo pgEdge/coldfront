@@ -1,7 +1,7 @@
 # Building ColdFront from source
 
 > **Most users should install from packages** — see
-> [Installation](README.md#installation) in the README. This document is the
+> [Installation](https://github.com/pgEdge/ColdFront/blob/main/README.md#installation) in the README. This document is the
 > **build-from-source** workflow: build the patched DuckDB-1.5.x stack yourself,
 > in Docker or bare-metal.
 
@@ -26,7 +26,7 @@ applies our patch, and compiles:
 The build `git apply --check`s the patch first, so it fails loudly on patch rot
 rather than silently shipping stock iceberg (which 409s under concurrency). The
 canonical recipe — every source pin and compile step — is
-[`docker/Dockerfile.duckdb15-base`](docker/Dockerfile.duckdb15-base) itself.
+[`docker/Dockerfile.duckdb15-base`](https://github.com/pgEdge/ColdFront/blob/main/docker/Dockerfile.duckdb15-base) itself.
 
 ## Build the image (Docker)
 
@@ -49,15 +49,15 @@ The split keeps app builds fast and always testing current source: the
 expensive, stable compiles (pg_duckdb 1.5.3 + the patched duckdb-iceberg) live
 in the prebuilt **base**, published to
 `ghcr.io/pgedge/coldfront-duckdb-base:pg{16,17,18}`; the **app** build
-([`docker/Dockerfile.duckdb15`](docker/Dockerfile.duckdb15)) just `FROM`s it and
+([`docker/Dockerfile.duckdb15`](https://github.com/pgEdge/ColdFront/blob/main/docker/Dockerfile.duckdb15)) just `FROM`s it and
 compiles the coldfront extension in seconds. If you build the base yourself
 (step 1) the app layer `FROM`s your local image. To `FROM` the published base
 instead of recompiling requires `docker login ghcr.io` while it is not yet
 published publicly (pre-Beta). Rebuild the published base via the
-[base-image workflow](.github/workflows/base-image.yml) (`gh workflow run
+[base-image workflow](https://github.com/pgEdge/ColdFront/blob/main/.github/workflows/base-image.yml) (`gh workflow run
 base-image.yml`) when its inputs change.
 
-Then follow [USAGE.md → One-time setup](USAGE.md#one-time-setup)
+Then follow [usage.md → One-time setup](usage.md#one-time-setup)
 (bootstrap Lakekeeper → create a table → tier → verify).
 
 > **Pin pg_duckdb for reproducible builds.** The base pins pg_duckdb to
@@ -88,7 +88,7 @@ make && make install        # needs pg_config + PG server dev headers on PATH
 
 You separately need pg_duckdb (DuckDB 1.5.3) and the **patched** iceberg DuckDB
 extension installed in your PostgreSQL — follow the compile steps in
-[`docker/Dockerfile.duckdb15-base`](docker/Dockerfile.duckdb15-base) — plus, in
+[`docker/Dockerfile.duckdb15-base`](https://github.com/pgEdge/ColdFront/blob/main/docker/Dockerfile.duckdb15-base) — plus, in
 `postgresql.conf`:
 
 ```
@@ -102,16 +102,16 @@ coldfront.local_pg_dsn        = 'host=/var/run/postgresql dbname=<db> user=<role
 
 ## Testing & CI
 
-One canonical user journey ([ci/journey.sh](ci/journey.sh)) runs identically in
+One canonical user journey ([ci/journey.sh](https://github.com/pgEdge/ColdFront/blob/main/ci/journey.sh)) runs identically in
 every deployment cell; `ci/matrix.sh` drives the cells and `ci/topo/*.sh` brings
 up each topology. All cells share the DuckDB 1.5.x app image
-([docker/Dockerfile.duckdb15](docker/Dockerfile.duckdb15), built on the prebuilt
-[base](docker/Dockerfile.duckdb15-base); `--build-arg PG_MAJOR=16|17|18`).
+([docker/Dockerfile.duckdb15](https://github.com/pgEdge/ColdFront/blob/main/docker/Dockerfile.duckdb15), built on the prebuilt
+[base](https://github.com/pgEdge/ColdFront/blob/main/docker/Dockerfile.duckdb15-base); `--build-arg PG_MAJOR=16|17|18`).
 
 **Pre-commit gate** — `./run-ci-local.sh` runs `ci/matrix.sh --quick`: gofmt,
 golangci-lint, unit tests, build, the pg_regress unit layer, and the full
 journey on one representative cell (PG18 · vanilla · tiered · s3). Fast; runs on
-every commit. GitHub Actions ([.github/workflows/ci.yml](.github/workflows/ci.yml))
+every commit. GitHub Actions ([.github/workflows/ci.yml](https://github.com/pgEdge/ColdFront/blob/main/.github/workflows/ci.yml))
 runs the identical `ci/matrix.sh` harness — `--quick` on every push/PR, `--full`
 nightly and on demand — so local and CI never diverge.
 

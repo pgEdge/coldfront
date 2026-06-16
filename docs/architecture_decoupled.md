@@ -8,8 +8,8 @@ object store.
 
 It shares the same codebase, docker stack and extension as tiered mode. The
 shared mechanics — pg_duckdb Iceberg I/O, the rewrite hook, the bakery
-protocol, the registry — are in [ARCHITECTURE.md](ARCHITECTURE.md); tiered
-mode is in [ARCHITECTURE_TIERED.md](ARCHITECTURE_TIERED.md). This document
+protocol, the registry — are in [architecture.md](architecture.md); tiered
+mode is in [architecture_tiered.md](architecture_tiered.md). This document
 covers what is specific to decoupled mode.
 
 ## What "decoupled" means
@@ -104,7 +104,7 @@ gap of decoupled mode without a PG-side wrapper view.
 The supported column types are exactly the set that already
 round-trips cleanly between PG and Iceberg in the existing tiered mode
 (see `pgFormatTypeToDuckDB` in
-[cmd/archiver/main.go](cmd/archiver/main.go)). Anything outside this
+[cmd/archiver/main.go](https://github.com/pgEdge/ColdFront/blob/main/cmd/archiver/main.go)). Anything outside this
 list is rejected at table-creation time.
 
 | PG type | Iceberg/Parquet storage | Round-trip surface |
@@ -181,7 +181,7 @@ The helper doesn't add capability over raw_query — it composes the existing pr
 
 ## ACID model
 
-(Summarises material from [ARCHITECTURE.md](ARCHITECTURE.md) §Concurrency
+(Summarises material from [architecture.md](architecture.md) §Concurrency
 and §Known Limitations applied to the decoupled scenario.)
 
 | Property | Status |
@@ -212,7 +212,7 @@ PG nodes pointing at the same Lakekeeper endpoint and S3 bucket.
   independent queue, so it never assumes a peer has applied its concurrent
   claim; the snowflake-ticket total order and the ack barrier serialize
   commits, not any global apply ordering. Modelled in
-  [docs/formal/Bakery_v2.tla](docs/formal/Bakery_v2.tla); the safety
+  [docs/formal/Bakery_v2.tla](https://github.com/pgEdge/ColdFront/blob/main/docs/formal/Bakery_v2.tla); the safety
   properties are verified via TLA+ (`Bakery_v2.cfg`).
 
   Two tables, both in Spock's `default` repset:
@@ -269,12 +269,12 @@ PG nodes pointing at the same Lakekeeper endpoint and S3 bucket.
   correct. Local same-node backends are trusted; a crashed local
   writer's claim is released by PG's xact rollback via the C
   XactCallback in
-  [extension/coldfront/src/coldfront.c](extension/coldfront/src/coldfront.c).
+  [extension/coldfront/src/coldfront.c](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/src/coldfront.c).
 
-  The mechanics live in [extension/coldfront/coldfront--0.1.sql](extension/coldfront/coldfront--0.1.sql)
+  The mechanics live in [extension/coldfront/coldfront--0.1.sql](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/coldfront--0.1.sql)
   (`_claim_iceberg_lock`, `_release_iceberg_lock`,
   `_on_claim_apply`, `_on_claim_release`, `_exec_iceberg_with_claim`)
-  and the C-side rewrite in [extension/coldfront/src/coldfront.c](extension/coldfront/src/coldfront.c)
+  and the C-side rewrite in [extension/coldfront/src/coldfront.c](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/src/coldfront.c)
   (`wrap_cold_in_exec_with_claim`).
 
   Because every commit is uncontested, the duckdb-iceberg writer
@@ -291,7 +291,7 @@ PG nodes pointing at the same Lakekeeper endpoint and S3 bucket.
 
 The commit-rate ceiling sits at Lakekeeper, not at the PG side, so
 scale throughput with larger per-INSERT batches or by partitioning the
-Iceberg table; see [bench.md](bench.md) for numbers.
+Iceberg table.
 
 ### Required configuration on every PG node
 
@@ -355,11 +355,11 @@ is mandatory in any multi-node setup.
 **Decoupled (iceberg-only) is the right choice when:**
 
 - The application's read path is dominated by analytic OLAP queries
-  (the cold-tier numbers in [bench.md](bench.md) Group C show 1.4–22×
-  speedups vs PG heap on shape-matched workloads).
+  (cold-tier analytic reads run substantially faster than PG heap
+  on shape-matched workloads).
 - Operational simplicity outweighs ergonomics: no archiver cron, no
   watermark, no autovacuum-vs-cutover lock conflict (see
-  ARCHITECTURE_TIERED.md → Tiered-specific limitations), no PK rebuild after bulk load, no
+  architecture_tiered.md → Tiered-specific limitations), no PK rebuild after bulk load, no
   partition-management script.
 - You can tolerate the isolation gap (cross-query snapshot
   consistency) and the verbose `iceberg_scan` / `raw_query` syntax.

@@ -58,6 +58,8 @@ SCALE_TEST_SETUP.md
 COMPARISON.md
 10000_FT_VIEW.md
 BACKLOG.md
+EXPERIMENTAL_MVCC.md
+HARDENING_DECOUPLED.md
 
 # Local secrets — NEVER commit. (One-off GHCR push token; revoke after use.)
 github_token_do_not_merge.txt

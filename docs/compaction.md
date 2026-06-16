@@ -77,5 +77,5 @@ catalog's: Lakekeeper does no Iceberg snapshot or orphan maintenance.
 
 The cold tier must run on ColdFront's DuckDB 1.5 base image, which carries the
 patches that make duckdb-iceberg's manifests readable by other Iceberg engines
-(see [DUCKDB_1.5_PATCHED.md](DUCKDB_1.5_PATCHED.md)). Build the binary with
+(see [DUCKDB_1.5_PATCHED.md](https://github.com/pgEdge/ColdFront/blob/main/DUCKDB_1.5_PATCHED.md)). Build the binary with
 `make compactor`.

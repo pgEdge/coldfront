@@ -60,3 +60,9 @@
 - Lakekeeper provides the Iceberg REST catalog
 - Any S3-compatible object store (SeaweedFS, MinIO, AWS S3, GCS, etc.)
 - The archiver is a thin SQL orchestrator — no DuckDB/Iceberg/Arrow Go libraries
+
+## Documentation
+- User docs live in `docs/` as a MkDocs site (pgEdge MkDocs structure); `README.md` is the GitHub landing/TOC. Build with `mkdocs build --strict` — it must pass with no warnings.
+- Keep `README.md` and `docs/index.md` near-identical, EXCEPT `docs/index.md` is user-facing and omits the developer-specific content that belongs only in a GitHub README: CI badges, build-from-source internals, the project-structure tree, dependency/build tables, and author/contributor info.
+- Internal/scratch docs (bench, experimental, hardening, comparison, backlog, scale-test, E2E) are gitignored and NEVER pushed to GitHub; never reference them from published docs.
+- ARCHITECTURE docs are reference material, not work logs: brief, present-tense, no history ("we used to…", version churn), no rejected-alternative narration. Keep the *why* (rationale that explains the design); cut the journey.

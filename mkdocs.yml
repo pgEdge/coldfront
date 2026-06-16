@@ -53,6 +53,16 @@ repo_url: https://github.com/pgEdge/ColdFront
 nav:
   - Getting Started:
       - Introduction: index.md
+      - Installation: installation.md
+      - Object Store Setup: object_store.md
+
+  - Architecture:
+      - Overview: architecture.md
+      - Tiered Mode: architecture_tiered.md
+      - Decoupled Mode: architecture_decoupled.md
+
+  - Using ColdFront: usage.md
+  - Compaction: compaction.md
 
   - Developer Resources:
       - Formal Verification: formal/README.md

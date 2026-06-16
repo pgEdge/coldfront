@@ -18,7 +18,7 @@ external query engine, no Go Iceberg libraries.
 - [Infrastructure (Docker)](#infrastructure-docker)
 - [Upstream Requests](#upstream-requests) — open asks to pg_duckdb / duckdb-iceberg
 
-**Mode-specific design:** [ARCHITECTURE_TIERED.md](ARCHITECTURE_TIERED.md) (hot PG + cold Iceberg) · [ARCHITECTURE_DECOUPLED.md](ARCHITECTURE_DECOUPLED.md) (all-Iceberg)
+**Mode-specific design:** [architecture_tiered.md](architecture_tiered.md) (hot PG + cold Iceberg) · [architecture_decoupled.md](architecture_decoupled.md) (all-Iceberg)
 
 ## Operating modes and topologies
 
@@ -34,12 +34,12 @@ freely — e.g. tiered + mesh + permissive writes:
 Both storage modes coexist in one database and share **one** code path: the
 transparent view and read rewriter, the INSERT/UPDATE/DELETE hook
 (`emit_cold` / `emit_hot` / `emit_dual_cte` in
-[`extension/coldfront/src/coldfront.c`](extension/coldfront/src/coldfront.c)),
+[`extension/coldfront/src/coldfront.c`](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/src/coldfront.c)),
 and the `_exec_iceberg_with_claim` write chokepoint. Decoupled mode simply
 always classifies as `TIER_COLD` and never reaches `emit_hot`; vanilla and
 mesh differ only in how that chokepoint serialises cold writes. This
 document covers the shared mechanics and the tiered path; see
-[ARCHITECTURE_DECOUPLED.md](ARCHITECTURE_DECOUPLED.md) for the decoupled
+[architecture_decoupled.md](architecture_decoupled.md) for the decoupled
 mode's ACID model and distributed scaling story.
 
 ### Read target: primary or physical standby
@@ -57,11 +57,11 @@ zero extra setup. Cold **writes** are refused on a standby: every cold write fun
 replica can never become an uncoordinated writer to the shared Iceberg table
 (hot writes hit a PG heap and PG rejects them natively).
 
-Standby reads are gated by [`ci/probe-standby.sh`](ci/probe-standby.sh) (the
+Standby reads are gated by [`ci/probe-standby.sh`](https://github.com/pgEdge/ColdFront/blob/main/ci/probe-standby.sh) (the
 risk-first check that `iceberg_scan` runs on a read-only backend at all) and
 exercised in the journey by `story_standby_reads` (the `·standby` matrix cells).
 Failover/promotion is delegated to Patroni and is out of scope for the test
-matrix — see [ci/runbooks/failover-patroni.md](ci/runbooks/failover-patroni.md).
+matrix — see [ci/runbooks/failover-patroni.md](https://github.com/pgEdge/ColdFront/blob/main/ci/runbooks/failover-patroni.md).
 
 ## System Overview
 
@@ -104,9 +104,9 @@ object store:
 
 How rows move through this depends on the storage mode: the tiered hot heap +
 archiver + `UNION ALL` data-flow is in
-[ARCHITECTURE_TIERED.md → Data flow](ARCHITECTURE_TIERED.md#data-flow); the
+[architecture_tiered.md → Data flow](architecture_tiered.md#data-flow); the
 all-Iceberg flow is in
-[ARCHITECTURE_DECOUPLED.md](ARCHITECTURE_DECOUPLED.md).
+[architecture_decoupled.md](architecture_decoupled.md).
 
 ## Core Mechanics: pg_duckdb
 
@@ -239,10 +239,10 @@ How the hook splits a write is mode-specific:
 
 - **Tiered** routes by the partition-column watermark — hot heap vs cold
   Iceberg, with dual-tier writes for ambiguous predicates. See
-  [ARCHITECTURE_TIERED.md → Transparent INSERT](ARCHITECTURE_TIERED.md#transparent-insert)
-  and [→ UPDATE/DELETE](ARCHITECTURE_TIERED.md#transparent-updatedelete).
+  [architecture_tiered.md → Transparent INSERT](architecture_tiered.md#transparent-insert)
+  and [→ UPDATE/DELETE](architecture_tiered.md#transparent-updatedelete).
 - **Decoupled** always classifies `TIER_COLD`: every write is a single-tier
-  Iceberg write. See [ARCHITECTURE_DECOUPLED.md](ARCHITECTURE_DECOUPLED.md).
+  Iceberg write. See [architecture_decoupled.md](architecture_decoupled.md).
 
 ### Cold-tier DML from inside plpgsql (functions, DO blocks, triggers)
 
@@ -291,7 +291,7 @@ side-effect-free signal that touches no PL/pgSQL plugin slot.
   snowflake ticket via the Spock-replicated `coldfront.claims` table
   and waits for its turn before issuing the iceberg commit. No 409s,
   no app-level retry. See
-  [ARCHITECTURE_DECOUPLED.md → Concurrency](ARCHITECTURE_DECOUPLED.md#concurrency--horizontal-scaling--the-bakery-protocol)
+  [architecture_decoupled.md → Concurrency](architecture_decoupled.md#concurrency--horizontal-scaling--the-bakery-protocol)
   for the full design and benchmarks.
 
 ### Cold-write strategy: stock vs patched duckdb-iceberg
@@ -312,7 +312,7 @@ freshly-fetched table), so overlapping uploads can't commit a stale parent. The
 Docker image ships the patched binary with `iceberg_async_parquet = on`;
 bare-metal users on a stock binary leave it `off` and lose only the upload
 overlap. See
-[DUCKDB_1.5_PATCHED.md](DUCKDB_1.5_PATCHED.md) and [DUCKDB_1.5_UNPATCHED.md](DUCKDB_1.5_UNPATCHED.md) for the build and
+[DUCKDB_1.5_PATCHED.md](https://github.com/pgEdge/ColdFront/blob/main/DUCKDB_1.5_PATCHED.md) and [DUCKDB_1.5_UNPATCHED.md](https://github.com/pgEdge/ColdFront/blob/main/DUCKDB_1.5_UNPATCHED.md) for the build and
 the full rationale.
 
 ### Transparent DDL via coldfront
@@ -354,7 +354,7 @@ covered next.
 The tiered-specific cross-node behaviour — what replicates so a tiered table
 is usable on every peer, and why both the registry and the watermark join the
 replication set — is in
-[ARCHITECTURE_TIERED.md → Tiered tables in a Spock mesh](ARCHITECTURE_TIERED.md#tiered-tables-in-a-spock-mesh).
+[architecture_tiered.md → Tiered tables in a Spock mesh](architecture_tiered.md#tiered-tables-in-a-spock-mesh).
 
 ### Registry keying: by name, not OID
 
@@ -376,7 +376,7 @@ The name also **replicates cleanly across a Spock mesh**: it is node-independent
 so the registry row is identical on every node and the replication set copies it
 by value (an OID is node-local and could not be). That is what makes cross-node
 tiered tables work with no per-node re-resolution — see
-[ARCHITECTURE_TIERED.md → Tiered tables in a Spock mesh](ARCHITECTURE_TIERED.md#tiered-tables-in-a-spock-mesh).
+[architecture_tiered.md → Tiered tables in a Spock mesh](architecture_tiered.md#tiered-tables-in-a-spock-mesh).
 
 Lower-level operations that genuinely need an OID — catalog lookups, the DDL
 hook matching the hot heap — resolve name→OID via `to_regclass` / `get_rel_name`
@@ -427,14 +427,14 @@ each lands on all nodes).
 Both binaries read this table (falling back to the YAML `archiver.tables` list
 only when the table is empty) and expose a management CLI —
 `register` / `list` / `set` / `remove` / `import` / `export` — documented in
-[USAGE.md](USAGE.md#managing-partitioned-tables-cli).
+[usage.md](usage.md#managing-partitioned-tables-cli).
 
 ## Known Limitations
 
 These apply to both storage modes. Tiered-only limitations (cold RETURNING,
 dual-tier command tag, crash-safety of permissive writes, partition-scheme
 constraints, the empty cold-tier partition spec, autovacuum-vs-cutover) are in
-[ARCHITECTURE_TIERED.md → Tiered-specific limitations](ARCHITECTURE_TIERED.md#tiered-specific-limitations).
+[architecture_tiered.md → Tiered-specific limitations](architecture_tiered.md#tiered-specific-limitations).
 
 1. **One-time secret setup after warehouse bootstrap** — after Lakekeeper is
    provisioned, an operator calls `SELECT coldfront.set_storage_secret(...)`
@@ -601,7 +601,7 @@ is not possible.
 
 **Workaround today:** none — Iceberg tables created by coldfront have an empty
 partition spec; cold-tier pruning relies on per-file manifest min/max stats. See
-[ARCHITECTURE_TIERED.md → Tiered-specific limitations](ARCHITECTURE_TIERED.md#tiered-specific-limitations).
+[architecture_tiered.md → Tiered-specific limitations](architecture_tiered.md#tiered-specific-limitations).
 
 **Desired end-state.** INSERT/MERGE into a partitioned Iceberg table —
 DuckDB writes data files into the appropriate partition directories based on

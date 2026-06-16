@@ -17,7 +17,7 @@ The stack must already be running with PG + pg_duckdb + coldfront + Lakekeeper +
 
 ## One-time setup
 
-Bring up the end-user stack (the example uses SeaweedFS; host ports are published so the `localhost` commands below work directly). For the image build itself, see [INSTALL.md](INSTALL.md):
+Bring up the end-user stack (the example uses SeaweedFS; host ports are published so the `localhost` commands below work directly). For the image build itself, see [installation.md](installation.md):
 
 ```bash
 docker compose up -d --build
@@ -71,7 +71,7 @@ SELECT coldfront.set_storage_secret('admin', 'adminsecret', 'seaweedfs:8333');
 
 The secret is stored in the `coldfront.storage_secret` table (excluded from `pg_dump`, replicated by value across a Spock mesh) and materialized as a DuckDB PERSISTENT SECRET that loads at instance init. There is **no per-session setup**: the Iceberg catalog `ice` attaches **lazily** by the coldfront C hook on the first query that touches a tiered/decoupled view (read or write).
 
-For a real cloud-S3 setup, see [S3_HOWTO.md](S3_HOWTO.md).
+For a real cloud-S3 setup, see [object_store.md](object_store.md).
 
 ## Mode 1 — Tiered (hot + cold)
 
@@ -338,7 +338,7 @@ Configure **exactly one** cold-store backend:
   `ap-south-2`), whose DNS does not route path-style requests and returns HTTP 400.
   The Lakekeeper warehouse profile must be a virtual-hosted `s3` profile
   (`flavor: aws`, `path-style-access: false`, no custom endpoint); the full
-  walkthrough is [S3_HOWTO.md](S3_HOWTO.md).
+  walkthrough is [object_store.md](object_store.md).
 - **Google Cloud Storage** — *not a separate backend*: use `s3:` pointed at GCS's
   S3-interoperability endpoint with an [HMAC key pair](https://cloud.google.com/storage/docs/authentication/hmackeys)
   (`endpoint: storage.googleapis.com`, `use_ssl: true`, `access_key`/`secret_key`
@@ -347,7 +347,7 @@ Configure **exactly one** cold-store backend:
   read+write over interop). Lakekeeper's native `gcs` profile is service-account
   only and is **not** used.
 - **Azure ADLS Gen2** — requires the DuckDB 1.5.x build (see
-  [INSTALL.md](INSTALL.md)); the access key rides inside `connection_string`.
+  [installation.md](installation.md)); the access key rides inside `connection_string`.
 
 For an **Azure ADLS Gen2** cold tier, set the credential with
 `set_storage_secret_azure()` instead of `set_storage_secret()` — it takes a
@@ -362,7 +362,7 @@ SELECT coldfront.set_storage_secret_azure(
 
 It writes the same `coldfront.storage_secret` row (replicated, `pg_dump`-excluded)
 and materializes a `TYPE azure` PERSISTENT SECRET. The Azure cold tier requires
-the DuckDB 1.5.x build (see [INSTALL.md](INSTALL.md)) and is subject to the
+the DuckDB 1.5.x build (see [installation.md](installation.md)) and is subject to the
 soft-delete / change-feed restriction in [Gotchas](#gotchas).
 
 ## Reading + writing (identical for both modes)
@@ -409,7 +409,7 @@ Anything else (unbounded `numeric`, `xml`, `tsvector`, range/multirange types, c
 - **`jsonb` reads**: surface as `json`, not `jsonb`. Most operators work; the binary-only ones don't.
 - **Cross-tier isolation**: a long-running `SELECT` that touches the Iceberg side multiple times within one transaction may see writes from other sessions interleaved between scans. PG's repeatable-read does not extend across the pg_duckdb boundary. Read-your-own-write *within* one tx works (verified) — it's only cross-statement consistency vs. concurrent writers that's weaker.
 - **Crash-mid-commit (decoupled mode)**: if a backend crashes between Iceberg snapshot commit and PG commit, S3 objects can be orphaned. Iceberg housekeeping reclaims them — not corrupting, but a real failure mode.
-- **Concurrent writes from multiple PG nodes (decoupled mode)**: serialized PG-side by the bakery protocol — every iceberg-only INSERT goes through `coldfront._exec_iceberg_with_claim`, which holds a globally-ordered snowflake ticket and waits for its turn before committing to Lakekeeper. No 409 conflicts, no app-level retry. The protocol is Lamport-1978 mutex with the Ricart-Agrawala (1981) deferred-reply optimisation; claims and acks replicate as Spock rows and it stays safe under Spock's asymmetric apply (modelled in [docs/formal/Bakery_v2.tla](docs/formal/Bakery_v2.tla)). The bakery requires the `dblink` + `snowflake` extensions, the `coldfront.dblink_self` GUC, and a one-time `SELECT coldfront._ensure_claims_replicated()` call on every node after spock mesh setup; see [ARCHITECTURE_DECOUPLED.md](ARCHITECTURE_DECOUPLED.md#concurrency--horizontal-scaling--the-bakery-protocol). Sync-rep is **not** required. The throughput ceiling is Lakekeeper's commit rate, not the writer count.
+- **Concurrent writes from multiple PG nodes (decoupled mode)**: serialized PG-side by the bakery protocol — every iceberg-only INSERT goes through `coldfront._exec_iceberg_with_claim`, which holds a globally-ordered snowflake ticket and waits for its turn before committing to Lakekeeper. No 409 conflicts, no app-level retry. The protocol is Lamport-1978 mutex with the Ricart-Agrawala (1981) deferred-reply optimisation; claims and acks replicate as Spock rows and it stays safe under Spock's asymmetric apply (modelled in [docs/formal/Bakery_v2.tla](https://github.com/pgEdge/ColdFront/blob/main/docs/formal/Bakery_v2.tla)). The bakery requires the `dblink` + `snowflake` extensions, the `coldfront.dblink_self` GUC, and a one-time `SELECT coldfront._ensure_claims_replicated()` call on every node after spock mesh setup; see [architecture_decoupled.md](architecture_decoupled.md#concurrency--horizontal-scaling--the-bakery-protocol). Sync-rep is **not** required. The throughput ceiling is Lakekeeper's commit rate, not the writer count.
 - **Direct table access**: `_events` is the hot heap (tiered mode only). `ice.default.<name>` is the Iceberg table — only addressable via `iceberg_scan(...)` or `duckdb.raw_query('… ice.… …')`, never via PG-native 3-part names.
 - **Tiered INSERT with omitted IDENTITY column** (e.g. `INSERT INTO events (ts, status, data) VALUES …` where `id` is `GENERATED ALWAYS AS IDENTITY`): the cold side falls back to a plpgsql cursor loop that calls `nextval()` per row so cold ids share the hot side's sequence. Correctness is full; throughput is lower than the set-based fast path. Either supply `id` explicitly in the INSERT, or use a partition-column predicate that proves the rows are all hot, to stay on the fast path. For very large historical seeds (mostly-cold), prefer iceberg-only mode where ids come from your source data.
 
@@ -501,10 +501,9 @@ SELECT coldfront._ensure_claims_replicated();
 ## Tuning knobs
 
 - `coldfront.allow_mixed_writes` (bool, default `on`) — controls what happens for tiered-mode UPDATE/DELETE whose WHERE can't be proven to target one tier. `on` emits a dual-tier CTE; `off` rejects with an error and a hint. Not relevant in decoupled mode (every write is single-tier by definition).
-- `duckdb.force_execution` — bench it before flipping. See [bench.md](bench.md): on a mixed workload it helps `count(distinct)` and similar but regresses index lookups, top-K with PK ordering, and JSON access by 2× to 80,000×. **Default off.**
+- `duckdb.force_execution` — bench it before flipping: on a mixed workload it helps `count(distinct)` and similar but regresses index lookups, top-K with PK ordering, and JSON access. **Default off.**
 
 ## Going deeper
 
-- Tiered architecture, watermark, archiver, transparent UPDATE/DELETE, concurrency: [ARCHITECTURE.md](ARCHITECTURE.md).
-- Decoupled mode internals, ACID model, distributed scaling: [ARCHITECTURE_DECOUPLED.md](ARCHITECTURE_DECOUPLED.md).
-- Benchmark numbers (hot heap vs Iceberg/DuckDB at matched 250 M rows): [bench.md](bench.md).
+- Tiered architecture, watermark, archiver, transparent UPDATE/DELETE, concurrency: [architecture.md](architecture.md).
+- Decoupled mode internals, ACID model, distributed scaling: [architecture_decoupled.md](architecture_decoupled.md).

@@ -7,7 +7,7 @@ Apache Iceberg tables in S3 — readable straight back through Postgres.
 
 It targets a real cloud S3 service that uses virtual-hosted addressing. For a
 path-style S3-compatible store (MinIO, SeaweedFS) or GCS, see
-[USAGE.md → Storage backends](USAGE.md#storage-backends) instead.
+[usage.md → Storage backends](usage.md#storage-backends) instead.
 
 No prior ColdFront knowledge assumed. Copy-paste top to bottom. Placeholders used
 throughout: bucket `my-iceberg-bucket`, region `eu-west-1`, key `AKIAEXAMPLE...`,
@@ -46,7 +46,7 @@ secret `<your-secret-key>` — substitute your own.
   ```
 
 - **The ColdFront image, built once.** Build it by following
-  [INSTALL.md](INSTALL.md) (it notes the registry access the base image needs).
+  [installation.md](installation.md) (it notes the registry access the base image needs).
   Run the commands below from the repo root.
 
 ---
@@ -221,7 +221,7 @@ Postgres data with cold S3 data and writes route to the correct tier.
 You drive it with the `archiver` binary against a small YAML config (Postgres DSN,
 the `wh` warehouse, your S3 region/keys, and per-table retention windows). The
 credential and warehouse you set up above are exactly what it needs. See
-[USAGE.md](USAGE.md) for the archiver config and the partition CLI.
+[usage.md](usage.md) for the archiver config and the partition CLI.
 
 ---
 

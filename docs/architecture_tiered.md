@@ -6,9 +6,9 @@ An archiver moves rows hot→cold on a cron.
 
 This document covers the **tiered-specific** design. The shared mechanics —
 pg_duckdb Iceberg I/O, the rewrite hook, the bakery protocol, the registry,
-DDL handling, infrastructure — live in [ARCHITECTURE.md](ARCHITECTURE.md);
+DDL handling, infrastructure — live in [architecture.md](architecture.md);
 the all-Iceberg alternative is
-[ARCHITECTURE_DECOUPLED.md](ARCHITECTURE_DECOUPLED.md).
+[architecture_decoupled.md](architecture_decoupled.md).
 
 ## Contents
 
@@ -75,13 +75,13 @@ Single Go binary, runs via cron. Converts an existing partitioned table
 into a tiered table on first run, then manages ongoing lifecycle. The
 archiver is a thin SQL orchestrator — no DuckDB/Iceberg/Arrow Go libraries;
 all Iceberg I/O goes through `pg_duckdb` (see
-[ARCHITECTURE.md → Core Mechanics](ARCHITECTURE.md#core-mechanics-pg_duckdb)).
+[architecture.md → Core Mechanics](architecture.md#core-mechanics-pg_duckdb)).
 
 ### Prerequisites
 
 1. PostgreSQL 17+ with pg_duckdb, Lakekeeper bootstrapped with a warehouse
 2. Persistent S3 secret configured (see
-   [ARCHITECTURE.md → Session setup](ARCHITECTURE.md#session-setup))
+   [architecture.md → Session setup](architecture.md#session-setup))
 3. An existing range-partitioned table
 
 ### First run: conversion
@@ -92,7 +92,7 @@ and column types from `information_schema.columns`.
 For each expired partition (older than `retention_period`):
 
 **1. Export to Iceberg** — using the temp table bridge (see
-[ARCHITECTURE.md → Temp table bridge](ARCHITECTURE.md#temp-table-bridge-pg--iceberg)).
+[architecture.md → Temp table bridge](architecture.md#temp-table-bridge-pg--iceberg)).
 On the very first export, creates the Iceberg namespace and table. Catalog
 conflicts from concurrent writes are retried with linear backoff (1s, 2s, 3s).
 
@@ -149,7 +149,7 @@ The watermark is the single source of truth:
 ## Transparent INSERT
 
 The `post_parse_analyze_hook` (see
-[ARCHITECTURE.md → Application Interface](ARCHITECTURE.md#application-interface))
+[architecture.md → Application Interface](architecture.md#application-interface))
 intercepts INSERT on a registered tiered view and rewrites it into a single
 statement that splits the input by the partition-column watermark:
 
@@ -234,7 +234,7 @@ tier-deterministic WHERE clause.
 ## Tiered tables in a Spock mesh
 
 The bakery protocol that serialises cold writes cluster-wide is described in
-[ARCHITECTURE.md → Concurrency](ARCHITECTURE.md#concurrency-and-pgedge-spock-deployments).
+[architecture.md → Concurrency](architecture.md#concurrency-and-pgedge-spock-deployments).
 This section covers what is specific to a *tiered* table across a mesh.
 
 A tiered table provisioned on one node becomes usable on every peer, but
@@ -257,7 +257,7 @@ but UPDATE/DELETE/DDL-blocking stop recognising the view.
 Both tables are **name-keyed** — `tiered_views` by `(schema_name, relname)`,
 `archive_watermark` by `table_name` — so each row replicates verbatim and
 correct on every node, with no OID divergence to reason about. See
-[ARCHITECTURE.md → Registry keying](ARCHITECTURE.md#registry-keying-by-name-not-oid).
+[architecture.md → Registry keying](architecture.md#registry-keying-by-name-not-oid).
 
 ## Partition Scheme Compatibility
 
@@ -335,7 +335,7 @@ This is a read-path detail; writes are unaffected.
 These are specific to the dual-tier model. Cross-cutting limitations (the
 planner-level takeover, jsonb-as-json, single-node execution, S3
 compatibility, login arming) are in
-[ARCHITECTURE.md → Known Limitations](ARCHITECTURE.md#known-limitations).
+[architecture.md → Known Limitations](architecture.md#known-limitations).
 
 1. **Cold RETURNING** — any write that touches the cold tier (a cold-only
    UPDATE/DELETE, a permissive dual-tier UPDATE/DELETE, or a watermark-split

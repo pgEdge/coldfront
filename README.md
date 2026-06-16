@@ -30,7 +30,7 @@ Both modes coexist per-database, picked per-table at creation time. SQL
 surface is identical for both: standard SELECT/INSERT/UPDATE/DELETE on
 the named relation.
 
-User-level setup and DML examples for both modes: **[USAGE.md](USAGE.md)**.
+User-level setup and DML examples for both modes: **[USAGE.md](docs/usage.md)**.
 
 ## How It Works
 
@@ -98,12 +98,12 @@ Application
 > -->
 
 **Build from source** — the full build workflow lives in
-**[INSTALL.md](INSTALL.md)**: build the DuckDB-1.5.x base + the coldfront layer
+**[INSTALL.md](docs/installation.md)**: build the DuckDB-1.5.x base + the coldfront layer
 with one `docker build`, or install bare-metal. Then continue with the
 Quickstart below.
 
 **Setting up on cloud S3?** Once the image is built, the
-**[S3 setup guide](S3_HOWTO.md)** takes you from an empty bucket to a working cold
+**[S3 setup guide](docs/object_store.md)** takes you from an empty bucket to a working cold
 tier end-to-end.
 
 ## Quickstart
@@ -114,7 +114,7 @@ docker compose up -d --build
 ```
 
 Bootstrap Lakekeeper and create a warehouse — see
-[USAGE.md → One-time setup](USAGE.md#one-time-setup) — then, in psql:
+[USAGE.md → One-time setup](docs/usage.md#one-time-setup) — then, in psql:
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS pg_duckdb;
@@ -129,20 +129,20 @@ SELECT count(*) FROM events;        -- read back through Iceberg
 ```
 
 Both modes in depth, the partition CLI, supported types, and mesh setup are in
-**[USAGE.md](USAGE.md)**. For a real cloud-S3 cold tier end-to-end, see
-**[S3_HOWTO.md](S3_HOWTO.md)**.
+**[USAGE.md](docs/usage.md)**. For a real cloud-S3 cold tier end-to-end, see
+**[S3_HOWTO.md](docs/object_store.md)**.
 
 ## Documentation
 
 | Doc | Contents |
 |---|---|
-| **[USAGE.md](USAGE.md)** | Day-to-day use — both modes plus the standalone partition manager, one-time setup, reading/writing, supported types, the partition CLI, storage backends, distributed (mesh) setup, tuning |
-| **[INSTALL.md](INSTALL.md)** | Build from source (Docker or bare-metal); Testing & CI |
-| **[S3_HOWTO.md](S3_HOWTO.md)** | Get ColdFront running on cloud S3 (virtual-hosted), end-to-end |
-| **[COMPACTOR.md](COMPACTOR.md)** | Cold-tier table maintenance — compaction, snapshot expiry, orphan-file removal |
-| **[ARCHITECTURE.md](ARCHITECTURE.md)** | Shared architecture and core mechanics |
-| **[ARCHITECTURE_TIERED.md](ARCHITECTURE_TIERED.md)** | Tiered (hot PG + cold Iceberg) deep dive |
-| **[ARCHITECTURE_DECOUPLED.md](ARCHITECTURE_DECOUPLED.md)** | Decoupled (iceberg-only) deep dive |
+| **[USAGE.md](docs/usage.md)** | Day-to-day use — both modes plus the standalone partition manager, one-time setup, reading/writing, supported types, the partition CLI, storage backends, distributed (mesh) setup, tuning |
+| **[INSTALL.md](docs/installation.md)** | Build from source (Docker or bare-metal); Testing & CI |
+| **[S3_HOWTO.md](docs/object_store.md)** | Get ColdFront running on cloud S3 (virtual-hosted), end-to-end |
+| **[COMPACTOR.md](docs/compaction.md)** | Cold-tier table maintenance — compaction, snapshot expiry, orphan-file removal |
+| **[ARCHITECTURE.md](docs/architecture.md)** | Shared architecture and core mechanics |
+| **[ARCHITECTURE_TIERED.md](docs/architecture_tiered.md)** | Tiered (hot PG + cold Iceberg) deep dive |
+| **[ARCHITECTURE_DECOUPLED.md](docs/architecture_decoupled.md)** | Decoupled (iceberg-only) deep dive |
 
 ## Security — non-superuser app roles
 
@@ -247,21 +247,17 @@ pgedge-coldfront/
 │   ├── iceberg-*.patch          ← duckdb-iceberg patches (bakery commit-refresh + strict-reader interop)
 │   ├── entrypoint.sh
 │   └── seaweedfs-s3.json        ← SeaweedFS S3 auth config (example)
-├── docs/formal/                ← TLA+ model of the bakery protocol (Bakery_v2.tla)
+├── docs/                       ← MkDocs site (user docs; mkdocs.yml at repo root)
+│   ├── index.md · installation.md · object_store.md · usage.md · compaction.md
+│   ├── architecture.md · architecture_tiered.md · architecture_decoupled.md
+│   └── formal/                 ← TLA+ model of the bakery protocol (Bakery_v2.tla)
 ├── docker-compose.yml          ← END-USER single-node stack (ports published)
 ├── docker-compose.matrix.yml   ← CI only: single-node vanilla matrix
 ├── docker-compose.mesh.yml     ← CI only: 3-node Spock mesh
 ├── run-ci-local.sh             ← pre-commit gate (ci/matrix.sh --quick)
-├── config.example.yaml · Makefile
-├── USAGE.md                    ← user guide (both modes + partition manager)
-├── INSTALL.md                  ← build from source (Docker / bare-metal)
-├── COMPACTOR.md                ← cold-tier table maintenance (compaction / expiry / orphans)
-├── S3_HOWTO.md                 ← cloud-S3 cold tier, end-to-end
+├── config.example.yaml · Makefile · mkdocs.yml
 ├── DUCKDB_1.5_PATCHED.md       ← the patched DuckDB 1.5 base: what's patched + how it's built
-├── DUCKDB_1.5_UNPATCHED.md     ← building the base unpatched, and the consequences
-├── ARCHITECTURE.md             ← shared architecture (core mechanics)
-├── ARCHITECTURE_TIERED.md      ← tiered (hot PG + cold Iceberg) mode
-└── ARCHITECTURE_DECOUPLED.md   ← decoupled (iceberg-only) mode
+└── DUCKDB_1.5_UNPATCHED.md     ← building the base unpatched, and the consequences
 ```
 
 ## Dependencies
