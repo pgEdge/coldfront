@@ -1,6 +1,6 @@
 name: Base image (DuckDB 1.5.x)
 
-# Builds + publishes the coldfront-duckdb-base image (libcurl 8.11 + pg_duckdb
+# Builds + publishes the coldfront-duckdb-base image (libcurl 8.12 + pg_duckdb
 # 1.5.3 + patched duckdb-iceberg) to ghcr.io/pgedge for PG 16/17/18. The app image
 # (docker/Dockerfile.duckdb15) does `FROM` this; CI and local builds pull it.
 #

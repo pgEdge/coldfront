@@ -8,10 +8,9 @@
 #
 # This is the canonical ColdFront app layer. All proven in DUCKDB_1.5_PATCHED.md.
 #
-# COLDFRONT_BASE is the prebuilt ghcr.io/pgedge base image. Before building, either
-# `docker login ghcr.io` (read:packages) to pull it — while it is not yet published
-# publicly (pre-Beta) — or build it locally first and it will be used from the local
-# image cache:
+# COLDFRONT_BASE is the prebuilt ghcr.io/pgedge base image. Before building,
+# either pull it from ghcr.io/pgedge/coldfront-duckdb-base or build it locally
+# first (it is then used from the local image cache):
 #   docker build -f docker/Dockerfile.duckdb15-base --build-arg PG_MAJOR=18 \
 #       -t ghcr.io/pgedge/coldfront-duckdb-base:pg18 .
 #
@@ -37,7 +36,7 @@ RUN DESTDIR=/out make -C /build/coldfront install with_llvm=no
 
 # ─── app runtime: coldfront extension on top of the base ─────────────────────────
 # pg_duckdb 1.5.3, the iceberg/avro/azure/postgres_scanner extensions, libcurl
-# 8.11, COLDFRONT_DUCKDB_* env and /data are inherited from the base. This stage
+# 8.12, COLDFRONT_DUCKDB_* env and /data are inherited from the base. This stage
 # adds coldfront's .so + SQL/control (distinct filenames — no overwrite of
 # pg_duckdb) AND refreshes the entrypoint from the CURRENT branch.
 #

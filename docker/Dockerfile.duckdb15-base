@@ -1,4 +1,4 @@
-# ColdFront DuckDB 1.5.x BASE image — the expensive, STABLE layer: libcurl 8.11 +
+# ColdFront DuckDB 1.5.x BASE image — the expensive, STABLE layer: libcurl 8.12 +
 # pg_duckdb (DuckDB 1.5.3, PR #1025) + the patched duckdb-iceberg extensions
 # (iceberg/avro/azure/postgres_scanner, v1.5-variegata + the bakery-aware
 # commit-refresh patch). It does NOT contain the coldfront extension — that thin,
@@ -16,7 +16,7 @@
 ARG PG_MAJOR=18
 ARG PGEDGE_TAG=${PG_MAJOR}-spock5-minimal
 
-# ─── build stage: libcurl 8.11 + pg_duckdb (DuckDB 1.5.3, PR #1025) ──────────────
+# ─── build stage: libcurl 8.12 + pg_duckdb (DuckDB 1.5.3, PR #1025) ──────────────
 FROM ghcr.io/pgedge/pgedge-postgres:${PGEDGE_TAG} AS build
 ARG PG_MAJOR
 USER root
@@ -31,18 +31,19 @@ RUN dnf install -y --setopt=install_weak_deps=False \
 ENV PATH=/usr/pgsql-${PG_MAJOR}/bin:$PATH
 ENV PG_CONFIG=/usr/pgsql-${PG_MAJOR}/bin/pg_config
 
-# libcurl 8.11 — built ONLY to satisfy DuckDB 1.5.3 httpfs's COMPILE-TIME
+# libcurl 8.12.0 — built ONLY to satisfy DuckDB 1.5.3 httpfs's COMPILE-TIME
 # dependency: its CMake does find_package(CURL REQUIRED) and curl_client.cpp
 # references CURLSSLOPT_AUTO_CLIENT_CERT (curl >= 7.77); the base ships 7.76.1.
-# At RUNTIME we do NOT use the libcurl client — coldfront forces DuckDB's BUNDLED
-# httplib/mbedtls client (httpfs_client_implementation='httplib', set in
-# coldfront.ensure_attached). The libcurl client's threaded DNS resolver calls
-# glibc getaddrinfo, whose IPv6 check_pf() netlink probe aborts the backend
-# (SIGABRT) under concurrent resolution of an object-store HOSTNAME (e.g. GCS);
-# the bundled client — what stock pg_duckdb 1.1.1 used — has no such failure.
+# 8.12.0 fixes CVE-2025-0665 (the 8.11.1 threaded resolver double-closed an fd
+# after a name resolve, racing glibc getaddrinfo's netlink fd → SIGABRT). At
+# RUNTIME we STILL force DuckDB's BUNDLED httplib/mbedtls client anyway
+# (httpfs_client_implementation='httplib', set in coldfront.ensure_attached) —
+# httplib resolves in-thread (no resolver-thread churn) and is what stock
+# pg_duckdb 1.1.1 used; keeping the libcurl client out of the cold path is
+# belt-and-suspenders now that the linked curl is the CVE-fixed release.
 WORKDIR /curl
-RUN wget -q https://curl.se/download/curl-8.11.1.tar.gz && tar xf curl-8.11.1.tar.gz \
- && cd curl-8.11.1 \
+RUN wget -q https://curl.se/download/curl-8.12.0.tar.gz && tar xf curl-8.12.0.tar.gz \
+ && cd curl-8.12.0 \
  && ./configure --with-openssl --prefix=/usr --disable-static \
         --without-libpsl --without-libssh2 --without-nghttp2 --without-brotli --without-zstd \
  && make -j"$(nproc)" && make install && ldconfig
@@ -130,9 +131,14 @@ RUN dnf install -y --setopt=install_weak_deps=False --allowerasing \
 # pg_duckdb 1.5.3 + bundled libduckdb 1.5.3 + extension SQL/control (NO coldfront)
 COPY --from=build /out/usr/pgsql-${PG_MAJOR}/lib/             /usr/pgsql-${PG_MAJOR}/lib/
 COPY --from=build /out/usr/pgsql-${PG_MAJOR}/share/extension/ /usr/pgsql-${PG_MAJOR}/share/extension/
-# libcurl 8.11 (DuckDB 1.5.3 httpfs); overwrite the base 7.76.1 so the newer SONAME wins.
-COPY --from=build /usr/lib/libcurl.so.4.8.0 /usr/lib64/libcurl.so.4.8.0
-RUN ln -sf libcurl.so.4.8.0 /usr/lib64/libcurl.so.4 && ln -sf libcurl.so.4 /usr/lib64/libcurl.so && ldconfig
+# libcurl 8.12 (DuckDB 1.5.3 httpfs); overwrite the base 7.76.1 so the newer SONAME
+# wins. Stage into a clean dir first so the .so.4.x.y glob can't collide with the
+# base's pre-existing libcurl.so.4.* (its minor version tracks curl's libtool
+# version-info, not the release), then install the resolved real file + symlinks.
+COPY --from=build /usr/lib/libcurl.so.4.* /tmp/curl/
+RUN realname=$(basename /tmp/curl/libcurl.so.4.*) \
+ && cp -f "/tmp/curl/$realname" "/usr/lib64/$realname" && rm -rf /tmp/curl \
+ && ln -sf "$realname" /usr/lib64/libcurl.so.4 && ln -sf libcurl.so.4 /usr/lib64/libcurl.so && ldconfig
 
 # iceberg + avro + azure (DuckDB 1.5.x); entrypoint places them under
 # $PGDATA/pg_duckdb/extensions/v1.5.3/<platform>/ (azure cp is conditional).

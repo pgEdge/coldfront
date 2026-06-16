@@ -206,13 +206,13 @@ func attachIceberg(ctx context.Context, conn *pgx.Conn, cfg *config.Config) erro
 	// Opt this backend's DuckDB instance onto the bundled httplib HTTP client — the
 	// ONE definition of that SET lives in coldfront.ensure_attached() (the same place
 	// the interactive cold path uses); the archiver just calls it rather than
-	// repeating the literal. Required: the system libcurl client DuckDB 1.5 defaults
-	// to is 8.11.1 (CVE-2025-0665), whose threaded resolver double-closes an fd after
-	// a name resolve and races glibc's getaddrinfo netlink fd → SIGABRTs the whole
-	// backend under a copy-on-write Iceberg DELETE against an object-store hostname
-	// (never a bare-IP store, which is why CI on SeaweedFS never hit it). httplib
-	// resolves in-thread, so DuckDB stays fully parallel. ensure_attached re-ATTACHes
-	// ice (no-op — done above) and runs the SET, autoloading httpfs as needed.
+	// repeating the literal. The system libcurl client DuckDB 1.5 defaults to uses a
+	// threaded resolver that races glibc's getaddrinfo netlink fd under a copy-on-write
+	// Iceberg DELETE against an object-store hostname (never a bare-IP store, which is
+	// why CI on SeaweedFS never hit it); curl 8.11.1 made that a hard SIGABRT via
+	// CVE-2025-0665. The base now builds curl 8.12.0 (CVE-fixed), but httplib stays
+	// pinned: it resolves in-thread, so DuckDB stays fully parallel. ensure_attached
+	// re-ATTACHes ice (no-op — done above) and runs the SET, autoloading httpfs.
 	if _, err := conn.Exec(ctx, "SELECT coldfront.ensure_attached()"); err != nil {
 		return fmt.Errorf("pin httplib via ensure_attached: %w", err)
 	}

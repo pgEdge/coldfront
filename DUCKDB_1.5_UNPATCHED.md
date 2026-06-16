@@ -7,7 +7,7 @@ build story is [DUCKDB_1.5_PATCHED.md](DUCKDB_1.5_PATCHED.md).
 ## What "unpatched 1.5" is
 
 The *same* 1.5.x stack — pg_duckdb PR #1025 + `duckdb-iceberg` `v1.5-variegata`
-@ `0fad545a` + avro/azure/postgres_scanner, libcurl 8.11, the same vcpkg/libasan
+@ `0fad545a` + avro/azure/postgres_scanner, libcurl 8.12, the same vcpkg/libasan
 toolchain and version pins — built with the four ColdFront patches **omitted**.
 It is still a locally-built (unsigned) extension; there is no signed upstream
 1.5.x iceberg to auto-install (no released pg_duckdb bundles DuckDB 1.5).
