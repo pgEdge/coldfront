@@ -24,12 +24,9 @@ Thanks for your interest in improving ColdFront.
 ## Commits & pull requests
 
 - Short, imperative, one-line commit messages — `fix:` / `feat:` / `build:` /
-  `deps:` / `refactor:` / `test:` / `docs:`, or a plain verb. **No AI attribution.**
+  `deps:` / `refactor:` / `test:` / `docs:`, or a plain verb.
 - Open the PR against `main` and complete the
   [pull-request checklist](.github/PULL_REQUEST_TEMPLATE.md).
-- **Never** put real hostnames, database/table/schema/role names, file paths, IPs,
-  or credentials in code, tests, docs, or commit messages — use generic
-  placeholders (`mydb`, `localhost`, `events`, …).
 
 ## Licensing
 
