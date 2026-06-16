@@ -270,7 +270,7 @@ func attachIceberg(ctx context.Context, conn *pgx.Conn, cfg *config.Config) erro
 	// CVE-2025-0665. The base now builds curl 8.12.0 (CVE-fixed), but httplib stays
 	// pinned: it resolves in-thread, so DuckDB stays fully parallel. ensure_attached
 	// re-ATTACHes ice (no-op — done above) and runs the SET, autoloading httpfs.
-	if _, err := conn.Exec(ctx, "SELECT coldfront.ensure_attached()"); err != nil {
+	if _, err := conn.Exec(ctx, "SELECT coldfront.ensure_attached()"); err != nil { // nosemgrep
 		return fmt.Errorf("pin httplib via ensure_attached: %w", err)
 	}
 
@@ -306,7 +306,7 @@ func parsePartitionKeyDef(def string) ([]string, error) {
 func detectPartitionColumns(ctx context.Context, db querier, schema, table string) ([]string, error) {
 	name := partition.ResolveSourceTable(ctx, db, schema, table)
 	var def string
-	err := db.QueryRow(ctx, `
+	err := db.QueryRow(ctx /* nosemgrep */, `
 		SELECT pg_get_partkeydef(c.oid)
 		FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 		WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = 'p'`,
@@ -335,7 +335,7 @@ func detectPartitionColumns(ctx context.Context, db querier, schema, table strin
 func validateFlatPartitioning(ctx context.Context, db querier, schema, table string) error {
 	name := partition.ResolveSourceTable(ctx, db, schema, table)
 	var child string
-	err := db.QueryRow(ctx, `
+	err := db.QueryRow(ctx /* nosemgrep */, `
 		SELECT c.relname
 		FROM pg_inherits i
 		JOIN pg_class p ON p.oid = i.inhparent
@@ -946,7 +946,7 @@ func archiveExport(ctx context.Context, conn *pgx.Conn, t *config.TableConfig,
 
 	// Phase 1
 	t0 = time.Now()
-	if _, err := conn.Exec(ctx, "SELECT coldfront.install_archive_capture($1, $2)",
+	if _, err := conn.Exec(ctx /* nosemgrep */, "SELECT coldfront.install_archive_capture($1, $2)",
 		t.SourceSchema, part.Name); err != nil {
 		return "", fmt.Errorf("phase 1 (install capture): %w", err)
 	}
@@ -1156,7 +1156,7 @@ func needsPGTextStage(columns []view.Column) bool {
 
 func bulkExportWithSnapshot(ctx context.Context, conn *pgx.Conn, t *config.TableConfig, partName, iceTable string, columns []view.Column) (string, error) {
 	var snapshotStr string
-	if err := conn.QueryRow(ctx, "SELECT pg_current_snapshot()::text").Scan(&snapshotStr); err != nil {
+	if err := conn.QueryRow(ctx, "SELECT pg_current_snapshot()::text").Scan(&snapshotStr); err != nil { // nosemgrep
 		return "", fmt.Errorf("capture snapshot: %w", err)
 	}
 
@@ -1176,7 +1176,7 @@ func bulkExportWithSnapshot(ctx context.Context, conn *pgx.Conn, t *config.Table
 		if _, err := conn.Exec(ctx, pgStageSQL); err != nil { // nosemgrep
 			return "", fmt.Errorf("pg text-stage: %w", err)
 		}
-		defer func() { _, _ = conn.Exec(ctx, "DROP TABLE IF EXISTS cf_pgstage") }()
+		defer func() { _, _ = conn.Exec(ctx, "DROP TABLE IF EXISTS cf_pgstage") }() // nosemgrep
 		src = "cf_pgstage"
 	}
 	stageSQL := fmt.Sprintf(
@@ -1184,7 +1184,7 @@ func bulkExportWithSnapshot(ctx context.Context, conn *pgx.Conn, t *config.Table
 	if _, err := conn.Exec(ctx, stageSQL); err != nil { // nosemgrep
 		return "", fmt.Errorf("stage: %w", err)
 	}
-	defer func() { _, _ = conn.Exec(ctx, "DROP TABLE IF EXISTS duck_stage") }()
+	defer func() { _, _ = conn.Exec(ctx, "DROP TABLE IF EXISTS duck_stage") }() // nosemgrep
 
 	// Route the bulk iceberg INSERT through the bakery wrapper (serialized:
 	// R-A on a mesh, local advisory lock single-node). Runs as an autocommit
@@ -1413,7 +1413,7 @@ func scanColumns(ctx context.Context, db querier, schema, actualName string) ([]
 	// format_type carries the typmod-decoded form (numeric(P,S), character
 	// varying(N), timestamp with time zone, …). attidentity is PG internal
 	// type "char"; cast to text for pgx compatibility.
-	rows, err := db.Query(ctx, `
+	rows, err := db.Query(ctx /* nosemgrep */, `
 		SELECT a.attname,
 		       format_type(a.atttypid, a.atttypmod),
 		       a.attidentity::text
@@ -1452,7 +1452,7 @@ func scanColumns(ctx context.Context, db querier, schema, actualName string) ([]
 // queries) and returns the set of PK column names — single-column and composite.
 func scanPrimaryKeys(ctx context.Context, db querier, schema, actualName string) (map[string]bool, error) {
 	// Primary key column names — works for single-column and composite PKs.
-	pkRows, err := db.Query(ctx, `
+	pkRows, err := db.Query(ctx /* nosemgrep */, `
 		SELECT a.attname
 		FROM pg_index i
 		JOIN pg_class c ON c.oid = i.indrelid
