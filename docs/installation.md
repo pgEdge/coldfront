@@ -7,27 +7,52 @@
 
 ColdFront runs on a **DuckDB 1.5.x** stack: PostgreSQL + pg_duckdb
 (DuckDB 1.5.3) and a **patched** duckdb-iceberg that carries ColdFront's
-bakery-aware commit-refresh patch (the no-409 guarantee for concurrent
-cold-tier writers). No released pg_duckdb tag carries DuckDB 1.5.x yet,
-so the stack is built from a pinned upstream PR plus our patch - all
-from sources you can fetch.
+four patches - the bakery-aware commit-refresh patch (the no-409
+guarantee for concurrent cold-tier writers) and three strict-reader
+interop patches (so apache/iceberg-go, the cold-tier compactor, can read
+the manifests duckdb-iceberg writes). The patch internals are in
+[DUCKDB_1.5_PATCHED.md](https://github.com/pgEdge/ColdFront/blob/main/DUCKDB_1.5_PATCHED.md).
+No released pg_duckdb tag carries DuckDB 1.5.x yet, so the stack is built
+from a pinned upstream PR plus our patches - all from sources you can
+fetch.
 
 ## What gets built
 
 `docker/Dockerfile.duckdb15-base` is the recipe; it fetches the
-requirements, applies our patch, and compiles the following components:
+requirements, applies our patches, and compiles the following
+components:
 
-| Component | Source | Public? |
-|---|---|---|
-| pg_duckdb (DuckDB 1.5.3) | `github.com/duckdb/pg_duckdb`, **PR #1025** | yes |
-| duckdb-iceberg | `github.com/duckdb/duckdb-iceberg`, `v1.5-variegata` | yes |
-| vcpkg | `github.com/microsoft/vcpkg` | yes |
-| **bakery-aware commit-refresh patch** | `docker/iceberg-bakery-aware-commit-refresh-v15.patch` **(in this repo)** | ships in-repo |
+| Component | Source |
+|---|---|
+| libcurl 8.12.0 | `curl.se`, built from source (compile-time dep of DuckDB 1.5.3 httpfs; needs curl >= 7.77, the pgEdge base ships 7.76.1) |
+| pg_duckdb (DuckDB 1.5.3) | `github.com/duckdb/pg_duckdb`, PR #1025 |
+| duckdb-iceberg | `github.com/duckdb/duckdb-iceberg`, `v1.5-variegata` @ `0fad545a` |
+| vcpkg | `github.com/microsoft/vcpkg` |
 
-The build `git apply --check`s the patch first, so it fails loudly on
-patch rot rather than silently shipping stock iceberg (which 409s under
-concurrency). The canonical recipe - every source pin and compile step -
-is
+The base build runs as three Docker stages: the first builds libcurl and
+pg_duckdb; the second clones duckdb-iceberg at the pinned ref, applies
+ColdFront's four patches, and compiles the iceberg, avro, azure, and
+postgres_scanner extensions under vcpkg; the third assembles the runtime.
+The build `git apply --check`s each patch before applying it, so it fails
+loudly on patch rot rather than silently shipping stock iceberg (which
+409s under concurrency and writes manifests strict Apache readers reject).
+
+ColdFront applies the following four patches to duckdb-iceberg; the full
+rationale is in
+[DUCKDB_1.5_PATCHED.md](https://github.com/pgEdge/ColdFront/blob/main/DUCKDB_1.5_PATCHED.md):
+
+| Patch | What it does |
+|---|---|
+| `iceberg-bakery-aware-commit-refresh-v15` | Re-stamps the parent snapshot at the commit POST so concurrent cold writers never get a Lakekeeper 409 (the no-409 guarantee). |
+| `iceberg-manifest-list-format-version-v15` | Adds the spec-optional `format-version` key to the manifest-list metadata so strict Apache readers parse the entries as v2. |
+| `iceberg-manifest-content-v15` | Writes the manifest's real content type instead of a hardcoded value, so strict readers accept delete manifests. |
+| `iceberg-data-file-format-v15` | Upper-cases the data-file format in the manifest to match the spec enum strict readers check case-sensitively. |
+
+The bakery patch is mandatory for the no-409 guarantee. The other three
+are interop patches so the manifests duckdb-iceberg writes are readable
+by strict Apache readers such as apache/iceberg-go, the cold-tier
+compactor; they are inert to pg_duckdb's own reads. The canonical recipe
+- every source pin and compile step - is
 [`docker/Dockerfile.duckdb15-base`](https://github.com/pgEdge/ColdFront/blob/main/docker/Dockerfile.duckdb15-base) itself.
 
 ## Build the image (Docker)
@@ -37,7 +62,7 @@ Build the stack in two stages, the prebuilt base and the thin app layer:
 ```bash
 git clone <coldfront-repo> && cd coldfront
 
-# 1. Build the base (fetches the deps above, applies our patch, compiles
+# 1. Build the base (fetches the deps above, applies our patches, compiles
 #    pg_duckdb 1.5.3 + the patched duckdb-iceberg). ~30–60 min,
 #    needs network + a few GB of disk/RAM. Repeat with =16 / =17 for those majors.
 docker build -f docker/Dockerfile.duckdb15-base --build-arg PG_MAJOR=18 \
@@ -73,6 +98,64 @@ Then follow [usage.md → One-time setup](usage.md#one-time-setup)
 > `FROM ghcr.io/pgedge/pgedge-postgres:<pg>-spock5-minimal`; you need pull
 > access to that image (or substitute an equivalent PostgreSQL base with
 > the same layout).
+
+## Verify the build
+
+A self-contained smoke test confirms the freshly built stack works end
+to end: pg_duckdb, the patched duckdb-iceberg, Lakekeeper, and the object
+store. The fastest path needs no cloud credentials; bring the stack up
+with the in-compose SeaweedFS S3 emulator under the `local-store`
+profile:
+
+```bash
+docker compose --profile local-store up -d --build
+```
+
+Bootstrap Lakekeeper, create the `wh` warehouse against the SeaweedFS
+credentials in
+[`docker/seaweedfs-s3.json`](https://github.com/pgEdge/ColdFront/blob/main/docker/seaweedfs-s3.json),
+and seed the `default` namespace:
+
+```bash
+curl -sf -X POST http://localhost:8181/management/v1/bootstrap \
+  -H 'Content-Type: application/json' -d '{"accept-terms-of-use":true}'
+
+curl -s -X POST http://localhost:8181/management/v1/warehouse \
+  -H 'Content-Type: application/json' -d '{
+    "warehouse-name":"wh",
+    "storage-profile":{"type":"s3","bucket":"iceberg","region":"us-east-1",
+      "endpoint":"http://seaweedfs:8333","path-style-access":true,
+      "flavor":"s3-compat","sts-enabled":false,"remote-signing-enabled":false},
+    "storage-credential":{"type":"s3","credential-type":"access-key",
+      "aws-access-key-id":"admin","aws-secret-access-key":"adminsecret"}
+  }'
+
+WID=$(curl -s http://localhost:8181/management/v1/warehouse \
+  | grep -oE '"warehouse-id":"[^"]+"' | head -1 | cut -d'"' -f4)
+curl -s -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
+  -H 'Content-Type: application/json' -d '{"namespace":["default"]}'
+```
+
+Create the extensions, set the cold-store secret, create a decoupled
+table, insert a row, and read it back through Iceberg:
+
+```bash
+psql -h localhost -U coldfront -d coldfront <<'SQL'
+CREATE EXTENSION IF NOT EXISTS pg_duckdb;
+CREATE EXTENSION IF NOT EXISTS coldfront;
+SELECT coldfront.set_storage_secret('admin', 'adminsecret', 'seaweedfs:8333');
+SELECT coldfront.create_iceberg_table('public', 'events',
+  '[{"name":"id","type":"bigint"},{"name":"ts","type":"timestamptz"},{"name":"note","type":"text"}]'::jsonb);
+INSERT INTO events VALUES (1, now(), 'hello');
+SELECT count(*) FROM events;
+SQL
+```
+
+A row count of 1 read back through Iceberg confirms the full path. For a
+real cloud store, drop the `local-store` profile, point the warehouse at
+your own bucket, and follow
+[usage.md → One-time setup](usage.md#one-time-setup) for the full
+tier-and-verify journey.
 
 ## Build prerequisites
 
