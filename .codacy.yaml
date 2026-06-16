@@ -1,0 +1,13 @@
+# Codacy configuration. Paths below are excluded from analysis because they
+# are not first-party source: agent/instruction files, example config,
+# vendored patches, generated notices, pg_regress fixtures, and the TLA+
+# formal-model artifacts. All Go, C, SQL, shell, Dockerfile, compose, and
+# user-doc source stays in scope.
+exclude_paths:
+  - ".claude/**"
+  - "CLAUDE.md"
+  - "config.example.yaml"
+  - "THIRD_PARTY_NOTICES.md"
+  - "docker/*.patch"
+  - "docs/formal/**"
+  - "extension/coldfront/test/**"
