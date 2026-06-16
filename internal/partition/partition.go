@@ -49,6 +49,29 @@ func NewManager(db DBTX) *Manager {
 	return &Manager{db: db}
 }
 
+// ResolveSourceTable returns the real partitioned table for a registered source
+// name: "_"+source once the archiver's first-run hot-table swap has happened
+// (source is then a unified VIEW over "_"+source), else source unchanged. Both
+// the archiver and the standalone partitioner use this so they premake against
+// the actual partitioned table rather than the post-swap view. A query failure
+// falls back to source (treated as not-yet-swapped).
+func ResolveSourceTable(ctx context.Context, db DBTX, schema, source string) string {
+	var exists bool
+	err := db.QueryRow(ctx /* nosemgrep */, `SELECT EXISTS (
+		SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
+		WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = 'p')`,
+		schema, "_"+source).Scan(&exists)
+	if err == nil && exists {
+		return "_" + source
+	}
+	return source
+}
+
+// ResolveSourceTable resolves source against the Manager's connection.
+func (m *Manager) ResolveSourceTable(ctx context.Context, schema, source string) string {
+	return ResolveSourceTable(ctx, m.db, schema, source)
+}
+
 // ParseBoundExpr extracts lower and upper time bounds from a
 // pg_get_expr(relpartbound) string for a time-keyed partition. It is the
 // time-mode special case of parseBoundPair, kept as a package-level helper for

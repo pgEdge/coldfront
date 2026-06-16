@@ -278,7 +278,7 @@ func parsePartitionKeyDef(def string) ([]string, error) {
 // single-watermark retention model only supports single-column time-based
 // partition keys.
 func detectPartitionColumns(ctx context.Context, db querier, schema, table string) ([]string, error) {
-	name := resolveTableName(ctx, db, schema, table)
+	name := partition.ResolveSourceTable(ctx, db, schema, table)
 	var def string
 	err := db.QueryRow(ctx, `
 		SELECT pg_get_partkeydef(c.oid)
@@ -307,7 +307,7 @@ func detectPartitionColumns(ctx context.Context, db querier, schema, table strin
 // child (i.e. a child that is itself a partitioned table). The archiver's
 // retention model assumes a flat, single-level partition scheme.
 func validateFlatPartitioning(ctx context.Context, db querier, schema, table string) error {
-	name := resolveTableName(ctx, db, schema, table)
+	name := partition.ResolveSourceTable(ctx, db, schema, table)
 	var child string
 	err := db.QueryRow(ctx, `
 		SELECT c.relname
@@ -338,20 +338,6 @@ func validateFlatPartitioning(ctx context.Context, db querier, schema, table str
 		schema, table, child, table)
 }
 
-// resolveTableName returns the actual partitioned table name: _{source} if swap already
-// happened, or {source} if this is the first run.
-func resolveTableName(ctx context.Context, db querier, schema, source string) string {
-	var exists bool
-	err := db.QueryRow(ctx /* nosemgrep */, `SELECT EXISTS (
-		SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
-		WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = 'p')`,
-		schema, "_"+source).Scan(&exists)
-	if err == nil && exists {
-		return "_" + source
-	}
-	return source
-}
-
 // runCycle performs one archive pass for a single table: ensures future
 // partitions, finds expired ones, archives each (capture trigger + bulk
 // export + delta replay + atomic cutover), and drops archived PG partitions.
@@ -366,7 +352,7 @@ func runCycle(ctx context.Context, cfg *config.Config, t *config.TableConfig, co
 	iceTable := pgx.Identifier{"ice", cfg.Iceberg.Namespace, t.SourceTable}.Sanitize()
 
 	// Resolve actual table name (_{source} after swap, {source} on first run)
-	tableName := resolveTableName(ctx, conn, t.SourceSchema, t.SourceTable)
+	tableName := partition.ResolveSourceTable(ctx, conn, t.SourceSchema, t.SourceTable)
 
 	// 1. Create future partitions. The cold tier always partitions by time.
 	if err := partMgr.EnsureFuture(ctx, tableName, t.SourceSchema,
@@ -480,7 +466,7 @@ func runCycle(ctx context.Context, cfg *config.Config, t *config.TableConfig, co
 				// Idempotent cleanup branch: partition was archived in a prior cycle,
 				// no race to worry about.
 				log.Printf("partition %s already archived, cleaning up", part.Name)
-				parent := resolveTableName(ctx, conn, t.SourceSchema, t.SourceTable)
+				parent := partition.ResolveSourceTable(ctx, conn, t.SourceSchema, t.SourceTable)
 				if err := partMgr.Detach(ctx, parent, t.SourceSchema, part.Name); err != nil {
 					return fmt.Errorf("detach %s: %w", part.Name, err)
 				}
@@ -531,7 +517,7 @@ func runCycleTwoLevel(ctx context.Context, cfg *config.Config, t *config.TableCo
 	if err != nil {
 		return fmt.Errorf("values_source: %w", err)
 	}
-	parent := resolveTableName(ctx, conn, t.SourceSchema, t.SourceTable) // physical top (_events after swap)
+	parent := partition.ResolveSourceTable(ctx, conn, t.SourceSchema, t.SourceTable) // physical top (_events after swap)
 
 	// 1. Premake per LIST value: ensure the LIST child exists (attached to the
 	//    physical top, named by the stable source name) and its forward window.
@@ -1203,7 +1189,7 @@ var numericTypeRe = regexp.MustCompile(`^numeric\((\d+),\s*(\d+)\)$`)
 // IsIdentity is attidentity = 'a' (GENERATED ALWAYS AS IDENTITY); IsPK is
 // participation in pg_index.indisprimary. Composite PKs handled transparently.
 func getColumns(ctx context.Context, db querier, schema, tableName string) ([]view.Column, error) {
-	actualName := resolveTableName(ctx, db, schema, tableName)
+	actualName := partition.ResolveSourceTable(ctx, db, schema, tableName)
 
 	// format_type carries the typmod-decoded form (numeric(P,S), character
 	// varying(N), timestamp with time zone, …). attidentity is PG internal

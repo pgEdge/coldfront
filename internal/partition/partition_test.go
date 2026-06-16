@@ -2,6 +2,7 @@ package partition
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"testing"
@@ -338,6 +339,40 @@ func boolRow(v bool) func(context.Context, string, ...any) pgx.Row {
 			return nil
 		}}
 	}
+}
+
+// After the archiver's first-run swap "_events" is the partitioned table and
+// "events" is a view over it; ResolveSourceTable probes for the "_"+source
+// partitioned relation and returns it. It also confirms the EXISTS probe is run
+// against the prefixed name.
+func TestResolveSourceTable_AfterSwap(t *testing.T) {
+	db := &mockDB{
+		rowFunc: func(_ context.Context, _ string, args ...any) pgx.Row {
+			assert.Equal(t, "_events", args[1])
+			return &mockRow{scanFunc: func(dest ...any) error {
+				*(dest[0].(*bool)) = true
+				return nil
+			}}
+		},
+	}
+	assert.Equal(t, "_events", ResolveSourceTable(context.Background(), db, "public", "events"))
+}
+
+// Before any swap (or for a partition-only table) the "_"+source relation does
+// not exist, so the source name is returned unchanged.
+func TestResolveSourceTable_BeforeSwap(t *testing.T) {
+	db := &mockDB{rowFunc: boolRow(false)}
+	assert.Equal(t, "events", ResolveSourceTable(context.Background(), db, "public", "events"))
+}
+
+// A probe failure is treated as not-yet-swapped: fall back to the source name.
+func TestResolveSourceTable_QueryError(t *testing.T) {
+	db := &mockDB{
+		rowFunc: func(_ context.Context, _ string, _ ...any) pgx.Row {
+			return &mockRow{scanFunc: func(_ ...any) error { return errors.New("boom") }}
+		},
+	}
+	assert.Equal(t, "events", ResolveSourceTable(context.Background(), db, "public", "events"))
 }
 
 // On vanilla single-node PostgreSQL (no Spock) Detach does the local concurrent
