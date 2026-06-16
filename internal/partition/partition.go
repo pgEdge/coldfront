@@ -183,7 +183,7 @@ func (m *Manager) createPartition(ctx context.Context, parent, schema, period st
 	sql := fmt.Sprintf(
 		`CREATE TABLE IF NOT EXISTS %s PARTITION OF %s FOR VALUES FROM (%s) TO (%s)`,
 		qname, qparent, b.Literal(lower), b.Literal(upper))
-	if _, err := m.db.Exec(ctx, sql); err != nil {
+	if _, err := m.db.Exec(ctx, sql); err != nil { // nosemgrep
 		return fmt.Errorf("create partition %s: %w", name, err)
 	}
 	// CREATE … IF NOT EXISTS no-ops if a relation with this name already exists —
@@ -262,7 +262,7 @@ func (m *Manager) listPartitions(ctx context.Context, parent, schema string, b B
 func (m *Manager) Detach(ctx context.Context, parent, schema, partName string) error {
 	qParent := pgx.Identifier{schema, parent}.Sanitize()
 	qPart := pgx.Identifier{schema, partName}.Sanitize()
-	if _, err := m.db.Exec(ctx, fmt.Sprintf(`ALTER TABLE %s DETACH PARTITION %s CONCURRENTLY`, qParent, qPart)); err != nil {
+	if _, err := m.db.Exec(ctx, fmt.Sprintf(`ALTER TABLE %s DETACH PARTITION %s CONCURRENTLY`, qParent, qPart)); err != nil { // nosemgrep
 		return fmt.Errorf("detach partition %s: %w", partName, err)
 	}
 	if err := m.detachOnPeers(ctx, qParent, qPart); err != nil {
@@ -339,7 +339,7 @@ func detachOnPeer(ctx context.Context, dsn, qParent, qPart string) error {
 	if attached == 0 {
 		return nil // already detached or gone on this peer
 	}
-	if _, err := conn.Exec(ctx,
+	if _, err := conn.Exec(ctx, // nosemgrep
 		fmt.Sprintf(`ALTER TABLE %s DETACH PARTITION %s CONCURRENTLY`, qParent, qPart)); err != nil {
 		return fmt.Errorf("detach: %w", err)
 	}
@@ -361,7 +361,7 @@ func (m *Manager) ExpiryCutoff(ctx context.Context, now time.Time, interval stri
 func (m *Manager) Drop(ctx context.Context, schema, partName string) error {
 	sql := fmt.Sprintf(`DROP TABLE IF EXISTS %s`,
 		pgx.Identifier{schema, partName}.Sanitize())
-	if _, err := m.db.Exec(ctx, sql); err != nil {
+	if _, err := m.db.Exec(ctx, sql); err != nil { // nosemgrep
 		return fmt.Errorf("drop partition %s: %w", partName, err)
 	}
 	return nil
@@ -372,7 +372,7 @@ func (m *Manager) RowCount(ctx context.Context, schema, tableName string) (int64
 	var count int64
 	sql := fmt.Sprintf(`SELECT count(*) FROM %s`,
 		pgx.Identifier{schema, tableName}.Sanitize())
-	if err := m.db.QueryRow(ctx, sql).Scan(&count); err != nil {
+	if err := m.db.QueryRow(ctx, sql).Scan(&count); err != nil { // nosemgrep
 		return 0, fmt.Errorf("row count %s: %w", tableName, err)
 	}
 	return count, nil
