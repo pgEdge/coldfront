@@ -1,0 +1,41 @@
+language: "en-US"
+
+reviews:
+  auto_review:
+    enabled: true
+    incremental: true
+  drafts: false
+  high_level_summary: false
+  poem: false
+  sequence_diagrams: false
+  related_issues: false
+  related_prs: false
+  # Noise reduction: review first-party source only. Skip MkDocs build output
+  # and minified search JS (generated/vendored, never hand-edited).
+  path_filters:
+    - "!site/**"
+    - "!**/*.min.js"
+
+chat:
+  auto_reply: true
+
+tools:
+  # Secret scanning — same gate as the gitleaks pre-commit hook / CI.
+  gitleaks:
+    enabled: true
+  # Languages actually present in ColdFront: Go, shell, YAML, Markdown,
+  # Dockerfile. (No Python/JS/IaC, so ruff/eslint/biome/checkov are omitted.)
+  golangci-lint:
+    enabled: true
+  shellcheck:
+    enabled: true
+  yamllint:
+    enabled: true
+  markdownlint:
+    enabled: true
+  hadolint:
+    enabled: true
+  # General static analysis — covers the C extension and the SQL surface that
+  # have no dedicated linter above (mirrors the opengrep/semgrep Codacy tool).
+  semgrep:
+    enabled: true
