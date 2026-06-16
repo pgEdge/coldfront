@@ -96,7 +96,7 @@ object store:
 | Component | Role | License |
 |-----------|------|---------|
 | PostgreSQL 16+ | Heap storage; range partitioning for the tiered hot tier. Works uniformly on PG 16, 17, and 18 — the cold-tier secret is a DuckDB persistent secret loaded at instance init, with no version-gated mechanism. | PostgreSQL |
-| pg_duckdb | DuckDB in-process. Iceberg read + write. Analytics. pg_duckdb 1.5.3 (PR #1025; no released 1.5.x tag yet). The `duckdb-iceberg` carries the bakery-aware commit-refresh patch (async parquet overlap, no 409); see [Cold-write strategy](#cold-write-strategy-stock-vs-patched-duckdb-iceberg). | MIT |
+| pg_duckdb | DuckDB in-process. Iceberg read + write. Analytics. pg_duckdb 1.5.3 (PR #1025). The `duckdb-iceberg` carries the bakery-aware commit-refresh patch (async parquet overlap, no 409); see [Cold-write strategy](#cold-write-strategy-stock-vs-patched-duckdb-iceberg). | MIT |
 | coldfront | PGXS C extension. `post_parse_analyze_hook` rewrites INSERT/UPDATE/DELETE on registered views to the correct tier; `ProcessUtility_hook` handles DDL; the hook lazily ATTACHes the Iceberg catalog on the first query touching a tiered view. | PostgreSQL |
 | Lakekeeper | Iceberg REST catalog. Single Rust binary. | Apache 2.0 |
 | S3-compatible store | Any: SeaweedFS, MinIO, GCS, Azure Blob, etc. | Varies |
@@ -247,54 +247,37 @@ How the hook splits a write is mode-specific:
 ### Cold-tier DML from inside plpgsql (functions, DO blocks, triggers)
 
 Cold-tier `INSERT`/`UPDATE`/`DELETE` work as top-level statements *and* from
-inside a plpgsql function / `DO` block / trigger. The hook runs at parse-analyze
-(there is no executor hook), so parameter *values* are never reachable to it;
-making the in-plpgsql case work meant solving two independent problems.
+inside a plpgsql function / `DO` block / trigger, via two mechanisms:
 
-**Cause 1 — bound parameters (`$N`).** plpgsql compiles variable references —
-and any client using bind parameters / `PREPARE` / the extended protocol sends —
-into `$N` `PARAM_EXTERN` nodes whose values are unknown at parse-analyze time.
-The deparser emits those as literal `$N` text, so the cold SQL handed to
-`duckdb.raw_query` carried `$N` with nothing to bind (DuckDB: *"Expected N
-parameters, but none were supplied"*). **Fix:** keep the params live — emit the
-cold SQL as a runtime `format(<template>, $1, $2, …)` call (`cold_sql_arg`) and
-declare the param types on the re-parse (`parse_analyze_fixedparams`). PG binds
-the values at execution; DuckDB only ever sees finished literals. This applies
-everywhere (top level and plpgsql) and adds no object — a driver's parameterized
-cold `UPDATE` at the top level is exactly this case.
+1. **Parameters are emitted as a runtime `format(<template>, $1, $2, …)` call**
+   (`cold_sql_arg`), with the param types declared on the re-parse
+   (`parse_analyze_fixedparams`). PG binds the values at execution, so DuckDB
+   only ever sees finished literals. This applies everywhere — a driver's
+   parameterized cold `UPDATE` at the top level is the same case.
 
-**Cause 2 — statement shape.** The cold rewrite is a row-returning
-`SELECT coldfront._exec_iceberg_with_claim(...)`. At the top level the client
-discards the row, but plpgsql rejects a bare result-returning SELECT with no
-`INTO`/`PERFORM` (*"query has no destination for result data"*); it only accepts
-a statement whose command tag is a DML returning no rows. We cannot inject
-`INTO`/`PERFORM` (plpgsql source constructs, fixed before the hook runs), and the
-cold table is a DuckDB-attached object, not a PG relation, so PG cannot tag a
-real `UPDATE`/`DELETE` against it. **Fix (only where needed):** when — and only
-when — the statement is parsed inside plpgsql, wrap the cold call as a DML over a
-permanent single-row dummy carrier, `coldfront._dummy_dml_target`:
+2. **A cold call parsed inside plpgsql is wrapped as a DML over a permanent
+   single-row carrier, `coldfront._dummy_dml_target`.** plpgsql rejects a bare
+   result-returning `SELECT` with no `INTO`/`PERFORM` ("query has no destination
+   for result data") and the cold target is a DuckDB-attached object PG cannot
+   tag a real DML against, so the call is reshaped as a no-row DML:
 
-```sql
-UPDATE coldfront._dummy_dml_target SET anchor = anchor
- WHERE coldfront._exec_iceberg_with_claim(...) IS NULL
-```
+   ```sql
+   UPDATE coldfront._dummy_dml_target SET anchor = anchor
+    WHERE coldfront._exec_iceberg_with_claim(...) IS NULL
+   ```
 
-That is a DML (plpgsql accepts it). The cold call runs exactly once in the WHERE
-qual; because `_exec_iceberg_with_claim` returns `void` and `void IS NULL` is
-always false, **zero rows match — the table is never written: no dead rows, no
-WAL, no bloat, ever.** For dual-tier and tiered-INSERT the hot DML is the outer
-statement and this same UPDATE rides in a data-modifying `WITH`-CTE (PostgreSQL
-always runs those to completion, even unreferenced). At the top level nothing
-changes — the SELECT shape is kept byte-for-byte.
+   The cold call runs exactly once in the WHERE qual; because
+   `_exec_iceberg_with_claim` returns `void` and `void IS NULL` is always false,
+   **zero rows match — the carrier is never written: no dead rows, no WAL, no
+   bloat.** For dual-tier and tiered-INSERT the hot DML is the outer statement
+   and this same UPDATE rides in a data-modifying `WITH`-CTE. At the top level
+   the rewrite keeps the plain `SELECT coldfront._exec_iceberg_with_claim(...)`
+   shape.
 
-**Detecting "inside plpgsql".** When plpgsql parses one of its statements it
-installs `p_post_columnref_hook` on the `ParseState` (to resolve identifiers as
-plpgsql variables); a top-level statement — including a parameterized one, which
-sets only `p_paramref_hook` — never does. So the hook reads
-`pstate->p_post_columnref_hook != NULL` as a precise, stateless,
-side-effect-free "in plpgsql" signal — no PL/pgSQL plugin (which would collide
-with the single global `PLpgSQL_plugin` slot that debuggers/profilers use), no
-global counter, nothing that can interfere with other tooling.
+"Inside plpgsql" is detected via `pstate->p_post_columnref_hook != NULL` (plpgsql
+installs that hook to resolve identifiers as variables; a top-level statement,
+including a parameterized one, never does) — a precise, stateless,
+side-effect-free signal that touches no PL/pgSQL plugin slot.
 
 ## Concurrency and pgEdge Spock Deployments
 
@@ -314,8 +297,7 @@ global counter, nothing that can interfere with other tooling.
 ### Cold-write strategy: stock vs patched duckdb-iceberg
 
 Every cold write runs through the same `_exec_iceberg_with_claim`
-chokepoint, which **never returns a 409** to the application regardless of
-the duckdb-iceberg binary. What differs is *when* the bakery ticket is
+chokepoint. What differs is *when* the bakery ticket is
 held, selected by `coldfront.iceberg_async_parquet` (default `off`):
 
 | `iceberg_async_parquet` | duckdb-iceberg | Behaviour |
@@ -323,15 +305,13 @@ held, selected by `coldfront.iceberg_async_parquet` (default `off`):
 | `off` (default) | **stock** upstream | Claim-first: take the bakery ticket, *then* upload parquet **and** commit inside the ticket. Correct on an unpatched binary, but the whole parquet upload happens under the lock, so concurrent writers serialise on upload + commit. |
 | `on` | **patched** (`iceberg-bakery-aware-commit-refresh-v15.patch`) | Overlap: upload parquet in the background *first*, then take the ticket only for the Lakekeeper commit. Concurrent writers' uploads overlap; only the short commit POST is serialised. |
 
-The code path is identical and the application-visible behaviour is
-identical — one transactional write, no 409, no app-level retry — so the
-GUC is purely a performance knob. The patch is needed only because stock
-duckdb-iceberg stamps the parent snapshot id at *upload* time; overlapping
-uploads would then commit a stale parent. The patch relocates that stamping
-into PG's pre-commit phase (inside the bakery ticket, against a
-freshly-fetched table), making the upload safe to overlap. The Docker image
-ships the patched binary with `iceberg_async_parquet = on`; bare-metal users
-on a stock binary leave it `off` and lose only the upload overlap. See
+The code path and the application-visible behaviour are identical, so the
+GUC is purely a performance knob. The patch relocates parent-snapshot stamping
+from upload time into PG's pre-commit phase (inside the bakery ticket, against a
+freshly-fetched table), so overlapping uploads can't commit a stale parent. The
+Docker image ships the patched binary with `iceberg_async_parquet = on`;
+bare-metal users on a stock binary leave it `off` and lose only the upload
+overlap. See
 [DUCKDB_1.5_PATCHED.md](DUCKDB_1.5_PATCHED.md) and [DUCKDB_1.5_UNPATCHED.md](DUCKDB_1.5_UNPATCHED.md) for the build and
 the full rationale.
 
@@ -365,10 +345,9 @@ Spock's `autoddl_can_proceed()` filters out). A peer's apply worker re-runs the
 replicated `ALTER TABLE`; the hook rebuilds **that peer's own** local view, but
 `coldfront._mirror_iceberg_alter` skips the Iceberg `ALTER` there (it runs under
 `session_replication_role = replica`) because the originator already evolved the
-shared Lakekeeper catalog. Because the registry is keyed by
-`(schema_name, relname)` — node-independent — the row is identical on every
-node: the rebuild needs no re-pointing, and the registry replicates cleanly by
-value across the mesh (an OID could not). DROP and TRUNCATE are blocked on
+shared Lakekeeper catalog. Because the registry is name-keyed (see
+[Registry keying](#registry-keying-by-name-not-oid)), the row is identical on
+every node: the rebuild needs no re-pointing. DROP and TRUNCATE are blocked on
 every node. What a tiered table additionally needs to be usable on a peer is
 covered next.
 
@@ -391,7 +370,7 @@ view regularly, minting a new view OID each time, while the name is unchanged �
 an OID key would have to be re-pointed on every rebuild; a name key is not. The
 one event that *does* change the name, `ALTER VIEW … RENAME`, migrates the
 registry row and the watermark to the new name in a single step
-(`_rename_tiered_view`), exactly as the watermark has always been name-keyed.
+(`_rename_tiered_view`), exactly as the watermark is name-keyed.
 
 The name also **replicates cleanly across a Spock mesh**: it is node-independent,
 so the registry row is identical on every node and the replication set copies it
@@ -407,11 +386,11 @@ at the point of use: names everywhere, OIDs only where required.
 
 Which tables are managed and their lifecycle (`hot_period`, `retention_period`,
 `partition_period`, premake, mode, `expiration_strategy`) live in
-`coldfront.partition_config` — like `tiered_views` and `archive_watermark` above,
-a **name-keyed** table that replicates **by value** across a Spock mesh. It is
+`coldfront.partition_config` — like `tiered_views` and `archive_watermark`, a
+name-keyed table (see [Registry keying](#registry-keying-by-name-not-oid)). It is
 auto-added to the default replication set on a spock node (a no-op on vanilla,
 where there is one node), so every node reads identical config with no per-node
-file syncing — the same property that motivates name-keying everywhere else.
+file syncing.
 `hot_period` and `retention_period` are native PostgreSQL `interval` columns —
 the column type validates each value on write, and expiry cutoffs are computed
 in-DB with calendar-accurate interval arithmetic (`now() - period`: real months,
@@ -445,8 +424,8 @@ verified before any mesh partitioner run by `story_mesh_partition_ddl` in
 `ci/journey.sh` (an N×(N-1) probe: create from every node, detach, drop, asserting
 each lands on all nodes).
 
-Both binaries read this table (the YAML `archiver.tables` list is a deprecation
-bridge, used only when the table is empty) and expose a management CLI —
+Both binaries read this table (falling back to the YAML `archiver.tables` list
+only when the table is empty) and expose a management CLI —
 `register` / `list` / `set` / `remove` / `import` / `export` — documented in
 [USAGE.md](USAGE.md#managing-partitioned-tables-cli).
 
@@ -459,10 +438,8 @@ constraints, the empty cold-tier partition spec, autovacuum-vs-cutover) are in
 
 1. **One-time secret setup after warehouse bootstrap** — after Lakekeeper is
    provisioned, an operator calls `SELECT coldfront.set_storage_secret(...)`
-   once per cluster to record the cold-tier S3 credentials and materialize the
-   DuckDB persistent secret. The Iceberg catalog ATTACH itself is lazy (on the
-   first query touching a tiered view), so no per-session arming is needed and
-   a pre-bootstrap connection can't be blocked by a missing warehouse.
+   once per cluster; the catalog ATTACH itself is lazy, so there is no
+   per-session arming (see [Session setup](#session-setup)).
 
 2. **`jsonb` surfaces as `json` through the view** — DuckDB has no
    native `jsonb`, and pg_duckdb takes over any query that references
@@ -486,27 +463,18 @@ constraints, the empty cold-tier partition spec, autovacuum-vs-cutover) are in
    parse tree for signals (references to `iceberg_scan`, the
    `duckdb.force_execution` GUC, DuckDB-only functions).  Once it
    takes over, the whole statement runs in DuckDB; there is no
-   cost-based hot-vs-cold split per predicate.  EDB PGAA's
-   DirectScan / CompatScan pair adds a decision engine that picks
-   full offload vs hybrid per query — more sophisticated, at the
-   cost of the Arrow Flight round-trip per query.  The ColdFront
-   position is that hot-only queries should target `_events`
-   directly (native PG, no `pg_duckdb` roundtrip) and queries that
-   need cross-tier semantics go through the view; users or
-   application layers make the choice, not a planner heuristic.
+   cost-based hot-vs-cold split per predicate.  Hot-only queries can
+   target `_events` directly (native PG, no `pg_duckdb` roundtrip);
+   queries that need cross-tier semantics go through the view.
 
 5. **Single-node query execution** — a query runs on the PG backend
    it landed on.  `pg_duckdb` does not distribute the DuckDB plan
    across nodes.  Replication (single- or multi-master via pgEdge
    Spock) is supported on the hot tier and transparent to the
    application; scaling read throughput requires more replicas
-   rather than parallelising one query. Those replicas **do** serve
-   cross-tier reads — including read-only physical standbys, where
-   `iceberg_scan` runs on the recovery backend (verified by
-   [`ci/probe-standby.sh`](ci/probe-standby.sh)); a standby's cold reads
-   are snapshot-consistent, not linearizable with concurrent primary cold
-   writes (ordinary Iceberg snapshot isolation — see
-   [ci/runbooks/failover-patroni.md](ci/runbooks/failover-patroni.md)).
+   rather than parallelising one query. Those replicas, including
+   read-only physical standbys, serve cross-tier reads (see
+   [Read target](#read-target-primary-or-physical-standby)).
 
 6. **Iceberg only** — no Delta Lake support.  Adding Delta would
    require either a second writer path in `pg_duckdb`'s Iceberg
@@ -556,7 +524,7 @@ couple the catalog's availability and load to a data node and would drag
 contrib into the ColdFront image for no reason; the dedicated store keeps the
 ColdFront image lean (core `uuid` type only, no uuid-ossp).
 
-## Upstream Requests (Potentially)
+## Upstream Requests
 
 Behaviours in upstream projects that ColdFront works around, kept as
 architectural notes: the gap, the workaround in use today, and the shape of
@@ -564,20 +532,14 @@ the upstream capability that would let us drop the workaround.
 
 ### pg_duckdb: non-superuser LocalFileSystem blocks side-loaded extensions
 
-pg_duckdb force-disables DuckDB's `LocalFileSystem` for any role that is not a
-member of both `pg_read_server_files` and `pg_write_server_files`
-(`AllowRawFileAccess()` → `RefreshConnectionState`, keyed off `GetUserId()`).
-That is correct hardening for raw file access, but it also blocks **loading a
-locally-installed DuckDB extension** — and ColdFront side-loads a patched
-`iceberg` (and `postgres`) extension from disk, which DuckDB lazily loads on
-`ATTACH`. So a non-superuser's first cold query fails at the elevated load step.
+pg_duckdb force-disables DuckDB's `LocalFileSystem` for non-superusers, which
+also blocks **loading a locally-installed DuckDB extension** — and ColdFront
+side-loads a patched `iceberg` (and `postgres`) extension from disk, which DuckDB
+lazily loads on `ATTACH`, so a non-superuser's first cold query fails at the
+elevated load step.
 
-**Workaround today:** `coldfront.ensure_attached()` / `ensure_pg_attached()` are
-`SECURITY DEFINER`, so the load + `ATTACH` run as the (privileged) extension
-owner once per backend; the per-backend DuckDB instance then keeps the extension
-loaded, and subsequent scans/commits run unprivileged over S3 (no
-`LocalFileSystem`). The config GUCs the elevated path consumes are `PGC_SUSET` so
-the privilege can't be abused to redirect the `ATTACH`.
+**Workaround today:** the `SECURITY DEFINER` attach helpers described under
+[Non-superuser app roles](#non-superuser-app-roles-least-privilege).
 
 **Upstream shape that would drop it:** either a way to mark specific
 locally-installed extensions as loadable without `LocalFileSystem` access, or
@@ -588,57 +550,16 @@ shim.
 
 ### pg_duckdb: native PG-reader → Iceberg streaming (no libpq round-trip)
 
-pg_duckdb already has a fully-native, in-process Postgres-table reader —
-that's how it does analytics on PG heap data. When you `SELECT count(*)
-FROM pg_table` and pg_duckdb takes over the plan, rows come straight from
-PG's heap via the project's own access-method integration, fed as vectors
-to DuckDB's executor. No libpq, no extra connection.
+pg_duckdb has a fully-native, in-process Postgres-table reader for analytics on
+PG heap data, but that machinery is **not reachable** from the write path into an
+attached Iceberg catalog.
 
-That same machinery is **not currently reachable** from the write path
-into an attached Iceberg catalog. The four direct attempts:
-
-| Form | Failure |
-|---|---|
-| `INSERT INTO ice.default.x SELECT * FROM pg_table` (plain SQL) | PG parser rejects `ice.default.x` as cross-database before pg_duckdb's planner hook sees it. |
-| `INSERT INTO <wrapper-view> SELECT FROM pg_table` (planner-level) | pg_duckdb's planner doesn't take over the INSERT; only the SELECT side. ColdFront sidesteps this with a `post_parse_analyze_hook` that rewrites the INSERT into one `duckdb.raw_query` reading from `pglocal.<schema>.<table>` (option 2 below) — set-based, single Iceberg snapshot per statement. The pg_duckdb-native form would be more efficient but isn't reachable from raw_query. |
-| `CREATE TABLE x (...) USING duckdb` against an Iceberg-attached catalog | Gated to MotherDuck/TEMP only: *"Only TEMP tables are supported in DuckDB if MotherDuck support is not enabled"* (`src/pgduckdb_ddl.cpp` on origin/main). |
-| `SELECT * FROM duckdb.query('INSERT …')` | `duckdb.query` table function rejects non-SELECT input. |
-
-**Working workarounds today**, both shipped in pg_duckdb v1.1.1 — neither
-uses the native in-process reader:
-
-1. **Staging-temp via `USING duckdb`** (the archiver's pattern in
-   [`exportPartition`](cmd/archiver/main.go)): `CREATE TEMP TABLE
-   duck_stage USING duckdb AS SELECT * FROM <pg_partition>; INSERT INTO
-   ice.… SELECT * FROM duck_stage`. Materialises rows into DuckDB local
-   storage first, then re-reads to write Iceberg. **Bounded by available
-   local DuckDB temp-disk** — a ~5 TB load needs ~5 TB scratch. Suitable
-   per-partition in tiered mode; not for arbitrary-size single inserts.
-
-2. **DuckDB `postgres` extension + ATTACH** (verified on the running
-   stack — both `ATTACH '<dsn>' AS pglocal (TYPE postgres)` and
-   `postgres_scan('<dsn>', '<schema>', '<table>')` work fine in current
-   pg_duckdb, despite earlier reports of a libpq-linkage clash that no
-   longer reproduces). With this loaded:
-   ```sql
-   SELECT duckdb.raw_query($$
-     INSERT INTO ice.default.events
-     SELECT * FROM pglocal.public.source
-   $$);
-   ```
-   Pipelines source rows over libpq (loopback TCP to the same PG
-   instance) → DuckDB executor → Iceberg writer → S3, single pass, **no
-   local materialisation**. ColdFront uses this for INSERT-into-
-   iceberg-only views, the cold side of tiered INSERTs (when no
-   IDENTITY column is omitted), and delta replay
-   ([`coldfront._apply_delta_batch`](extension/coldfront/coldfront--0.1.sql)
-   stages eligible delta rows into a scratch table that pglocal then
-   reads, replacing the previous per-row `_apply_delta_row` flow).
-
-The cost of (2) is the libpq round-trip per row batch. Sub-millisecond
-on loopback, but real, and dwarfed by the Iceberg commit work for any
-realistic batch — but still wasteful given pg_duckdb already has the
-in-process reader.
+**Workaround today:** ColdFront's hook rewrites the INSERT into one
+`duckdb.raw_query` that reads through the DuckDB `postgres` extension's
+`pglocal.<schema>.<table>` ATTACH, pipelining rows over libpq (loopback) → DuckDB
+executor → Iceberg writer → S3 in a single pass, no local materialisation. The
+cost is the libpq round-trip per row batch — real, but dwarfed by the Iceberg
+commit work for any realistic batch.
 
 **Desired end-state.** A way to drive the native in-process reader straight
 into the Iceberg writer — e.g. a `COPY` form:
@@ -649,66 +570,19 @@ COPY (SELECT * FROM public.events_partition) TO ICEBERG 'ice.default.events';
 
 That would make pg_duckdb the only place in the data path that touches the
 rows: PG executor (heap reader) → pg_duckdb vector format → Iceberg writer,
-**one pass, in-process**, with no libpq loopback and no temp-disk. The
-`pglocal` ATTACH path covers the streaming case adequately at our sizes; the
-in-process path would only shave off the libpq overhead.
+**one pass, in-process**, with no libpq loopback and no temp-disk.
 
 ### duckdb-iceberg: secret visibility under fresh transactions
 
-**Workaround today.** A DuckDB **persistent secret**, set via
-`coldfront.set_storage_secret(...)` and materialized into the
-`coldfront.storage_secret` table, is loaded by DuckDB automatically at
-instance init. Because it is persisted before any backend issues a query, it
-already sits at a committed timestamp (< `start_time`) when a fresh
-transaction looks it up (see Mechanism below) — so the secret is
-committed-visible to the very first cold-tier write, with no warmup step
-needed and no dependency on any per-session connect-time hook.
+A secret created with `CREATE SECRET` from a caller's still-active transaction is
+not visible to the fresh transaction `duckdb-iceberg` opens for its commit-time
+I/O, so a fresh PG backend's first cold-tier write would fail with HTTP 403
+against any non-AWS S3-compatible endpoint.
 
-**Symptom.** Without the warmup, a fresh PG backend's first cold-tier
-write fails with HTTP 403 against any non-AWS S3-compatible endpoint
-(SeaweedFS, MinIO, path-style GCS, on-prem S3). DuckDB's httpfs falls
-through to AWS virtual-hosted-style defaults
-(`<bucket>.s3.amazonaws.com`) because `SecretManager::LookupSecret` returns
-empty.
-
-**Mechanism (verified against duckdb-iceberg `v1.5-variegata` @ `0fad545a`
-`IcebergTransaction::Commit` and DuckDB's `CatalogSet` / `SecretManager`
-source).** `IcebergTransaction::Commit` opens a fresh `Connection` +
-`BeginTransaction` for its commit-time I/O and **copies the caller's
-`ClientConfig`** into it (`temp_con_context->config = context->config` — so
-`SET`-style settings such as `s3_access_key_id` *are* available). But a secret
-created with `CREATE SECRET` does **not** live in `ClientConfig` — it is a
-`CatalogEntry` in the `SecretManager` catalog, which `config` does not carry. So
-the fresh transaction still cannot see a secret registered by the caller's
-still-active transaction: `CatalogSet::UseTimestamp`'s visibility rules require
-either same-tx (`timestamp == transaction_id`) or already-committed
-(`timestamp < start_time`), and neither holds for the caller's still-uncommitted
-secret. After any prior DuckDB `MetaTransaction::Commit` in the backend the
-secret entry's timestamp flips to a committed value (< `TRANSACTION_ID_START`)
-and every subsequent fresh transaction satisfies the second rule. A DuckDB
-**persistent** secret achieves this structurally: loaded at instance init, it is
-already at a committed timestamp before any backend's first cold-tier
-transaction looks it up — so the persistent-secret design still holds on v1.5
-and is still required for a synthesized (non-`SET`) credential.
-
-**Reproducer (no coldfront required).**
-
-```sql
--- FRESH DuckDB process; warehouse pre-provisioned at minio:9000
-CREATE SECRET s (TYPE s3, endpoint 'minio:9000', key_id 'admin',
-                 secret 'password', url_style 'path', use_ssl false);
-ATTACH 'wh' AS ice (TYPE ICEBERG, ENDPOINT 'http://lakekeeper:8181/catalog',
-                    AUTHORIZATION_TYPE NONE, ACCESS_DELEGATION_MODE NONE);
-INSERT INTO ice.default.t VALUES (...);
--- → commit-time HTTPException, HTTP GET 403 against <bucket>.s3.amazonaws.com
-
--- FRESH DuckDB process, with one prior committed transaction
-SELECT 1;
-CREATE SECRET s (TYPE s3, endpoint 'minio:9000', ...);
-ATTACH 'wh' AS ice (TYPE ICEBERG, ENDPOINT 'http://...', ...);
-INSERT INTO ice.default.t VALUES (...);
--- → commits cleanly via the secret's endpoint
-```
+**Workaround today:** the DuckDB **persistent secret** materialized by
+`coldfront.set_storage_secret(...)` (see
+[Session setup](#session-setup)) — loaded at instance init, it already sits at a
+committed timestamp before any backend's first cold-tier write looks it up.
 
 **Desired end-state.** Either `IcebergTransaction::Commit` runs its commit-time
 I/O under the caller's `ClientContext` (rather than a freshly-opened
@@ -716,41 +590,18 @@ Connection), or any extension that synthesises `CREATE SECRET` from external
 state commits that transaction explicitly, so the secret sits at a committed
 timestamp before a consumer's fresh transaction looks it up. Either would let
 a per-session synthesized secret work without relying on the persistent-secret
-mechanism; today the persistent secret sidesteps the bug entirely at zero
-per-session cost.
+mechanism.
 
 ### duckdb-iceberg: INSERT into a table with a partition spec
 
-**Workaround today.** None. Iceberg tables created by coldfront have an
-empty partition spec; cold-tier pruning relies on per-file manifest
-min/max stats. See
+duckdb-iceberg refuses to INSERT into an Iceberg table that has a non-empty
+partition spec (*"INSERT into a partitioned table is not supported yet"*), so
+setting `month(ts)` to make predicate pruning structural rather than statistical
+is not possible.
+
+**Workaround today:** none — Iceberg tables created by coldfront have an empty
+partition spec; cold-tier pruning relies on per-file manifest min/max stats. See
 [ARCHITECTURE_TIERED.md → Tiered-specific limitations](ARCHITECTURE_TIERED.md#tiered-specific-limitations).
-
-**Why we want the API.** Setting `month(ts)` (or whatever transform
-mirrors the hot-tier partition period) at the Iceberg level makes
-predicate pruning structural rather than statistical. Files live under
-`ts_month=2026-01/` directories; the reader skips entire directories
-without consulting per-file stats. Robust against any future archiver
-change that might break the one-snapshot-per-partition invariant.
-
-**Why it doesn't work today.** Verified empirically against
-`duckdb-iceberg`:
-
-```
-1. CREATE TABLE ice."default".x (id BIGINT, ts TIMESTAMPTZ) — succeeds, empty spec
-2. POST /catalog/v1/{prefix}/namespaces/default/tables/x with body
-   {requirements:[{type:"assert-table-uuid",uuid:...}],
-    updates:[{action:"add-spec",spec:{...,fields:[{name:"ts_month",
-              source-id:2,field-id:1000,transform:"month"}]}},
-             {action:"set-default-spec",spec-id:1}]}
-   — Lakekeeper accepts, GET confirms default-spec-id flips to 1
-3. INSERT INTO ice."default".x VALUES (...) from a fresh session
-   — ERROR: Not implemented Error: INSERT into a partitioned table
-     is not supported yet
-```
-
-So setting the spec via the catalog is what *causes* the writer to
-refuse. The writer code path checks for non-empty default spec and bails.
 
 **Desired end-state.** INSERT/MERGE into a partitioned Iceberg table —
 DuckDB writes data files into the appropriate partition directories based on

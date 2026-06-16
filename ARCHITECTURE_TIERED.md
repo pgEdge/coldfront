@@ -114,14 +114,11 @@ CREATE OR REPLACE VIEW events AS
   WHERE r['ts'] < '2026-03-01'::timestamptz;
 ```
 
-An INSTEAD OF INSERT trigger is also installed as a defensive fallback —
-when coldfront is preloaded the C hook intercepts every INSERT on the
-view before view-rewrite kicks in, so the trigger never fires; only when
-the extension is *not* loaded (e.g. on a recovery instance or a node
-without `shared_preload_libraries=coldfront`) does PG fall back to
-running the trigger, which routes per-row to `_events` (hot) or
-`duckdb.raw_query` (cold). The hook path is the production path.
-On subsequent runs, the view and trigger are recreated with the updated cutoff.
+An INSTEAD OF INSERT trigger is also installed as a defensive fallback: it
+routes per-row to `_events` (hot) or `duckdb.raw_query` (cold), and fires only
+when the extension is *not* loaded (the C hook is the production path and
+intercepts INSERTs before view-rewrite when coldfront is preloaded). On
+subsequent runs, the view and trigger are recreated with the updated cutoff.
 
 **4. Detach and drop** — `ALTER TABLE _events DETACH PARTITION ... CONCURRENTLY`
 then `DROP TABLE`.
@@ -184,10 +181,8 @@ SELECT (SELECT count(*) FROM hot_ins) AS hot_rows,
 
 The hot half is always plain set-based `INSERT INTO _events` — IDENTITY auto-allocates server-side, full PG speed regardless of row count.
 
-INSERT-with-RETURNING is not preserved through the rewrite; the
-rewritten statement reports `(hot_rows, cold_rows)` instead. Hot
-RETURNING would need per-tier projection at runtime, which the rewrite
-does not implement.
+A watermark-split INSERT cannot use `RETURNING` — see
+[Tiered-specific limitations](#tiered-specific-limitations) #1.
 
 ## Transparent UPDATE/DELETE
 
@@ -255,17 +250,13 @@ the pieces arrive by different routes:
 So alongside the bakery substrate (`coldfront.claims` /
 `coldfront.claim_acks`), **both `coldfront.tiered_views` and
 `coldfront.archive_watermark` are added to the Spock replication set** when a
-mesh runs in tiered mode. This is verified necessary, not cosmetic: with
-`tiered_views` absent from the replication set, peers still read and INSERT,
-but the registry row is missing there and UPDATE/DELETE/DDL-blocking stop
-recognising the view (the archiver runs on one node, so a peer never registers
-the view itself — it only gets the row by replication).
+mesh runs in tiered mode. The archiver runs on one node, so a peer only gets
+these rows by replication; without `tiered_views` a peer can read and INSERT
+but UPDATE/DELETE/DDL-blocking stop recognising the view.
 
 Both tables are **name-keyed** — `tiered_views` by `(schema_name, relname)`,
-`archive_watermark` by `table_name` — so the replication set copies each row
-**verbatim and correct on every node**: a name is node-independent, unlike an
-OID. There is no per-node re-resolution and no OID divergence to reason about;
-the row a peer receives is exactly the row its hook needs. See
+`archive_watermark` by `table_name` — so each row replicates verbatim and
+correct on every node, with no OID divergence to reason about. See
 [ARCHITECTURE.md → Registry keying](ARCHITECTURE.md#registry-keying-by-name-not-oid).
 
 ## Partition Scheme Compatibility
@@ -322,23 +313,12 @@ applications query the branch views directly rather than the top-level
 
 ### Performance note: partition pruning after the swap
 
-Native PG partition pruning still works on `_events` (the renamed hot
-table), but the query routes through pg_duckdb's takeover path:
-
-1. PG rewriter expands the `events` view and pushes the user's
-   predicate through the UNION ALL into both branches.
-2. Because `iceberg_scan` is present, pg_duckdb intercepts and
-   converts the whole query to DuckDB SQL.
-3. DuckDB issues a `postgres_scan` on `_events` for the hot branch —
-   which is itself a regular PG query, and PG applies partition
-   pruning natively when planning it.
-4. DuckDB's optimizer may prune the cold branch at plan time when the
-   predicate is provably unsatisfiable (version-dependent).
-
-Pruning works, but hot-only queries pay pg_duckdb's roundtrip
-overhead. Users who know their query hits only hot data can query
-`_events` directly — fully native PG, no pg_duckdb involvement,
-identical performance to pre-tiering:
+A query through the `events` view routes via pg_duckdb's takeover path
+(`iceberg_scan` is present, so pg_duckdb converts the whole query to DuckDB
+SQL, which issues a `postgres_scan` on `_events` where PG applies partition
+pruning natively). Pruning works, but hot-only queries pay pg_duckdb's
+roundtrip overhead; users who know their query hits only hot data can query
+`_events` directly for fully native PG with no pg_duckdb involvement:
 
 ```sql
 -- Transparent (hot + cold via pg_duckdb):
@@ -361,10 +341,9 @@ compatibility, login arming) are in
    UPDATE/DELETE, a permissive dual-tier UPDATE/DELETE, or a watermark-split
    INSERT) **rejects `RETURNING` with a clear error** rather than returning a
    partial result.  The cold tier genuinely cannot return affected rows:
-   duckdb-iceberg's binder refuses `RETURNING` on Iceberg writes (*"not yet
-   supported for updates of a Iceberg table"*) and pg_duckdb's row-returning
-   entry point is SELECT-only.  Hot-only DML keeps `RETURNING` (it is plain PG
-   DML).  Revisit when duckdb-iceberg adds write-`RETURNING` upstream.
+   duckdb-iceberg's binder refuses `RETURNING` on Iceberg writes and
+   pg_duckdb's row-returning entry point is SELECT-only.  Hot-only DML keeps
+   `RETURNING` (it is plain PG DML).
 
 2. **Command tag** — an ambiguous dual-tier UPDATE returns `SELECT n`
    rather than `UPDATE n`, because the rewrite produces a SELECT wrapper
@@ -377,77 +356,31 @@ compatibility, login arming) are in
    swaps only the leading result-relation reference, so a second one cannot be
    retargeted; reference the view once.
 
-4. **Crash-safety of permissive writes** — DuckDB's transaction is tied to
-   PG's via `XactCallback`, so `ROLLBACK` undoes both tiers.  If the
-   backend *crashes* mid-commit, the Iceberg write may have produced S3
-   objects referenced by a snapshot that was never committed; Iceberg
-   housekeeping (orphan-file expiry) reclaims them.  Strict mode avoids
-   this path entirely.
+4. **Crash-safety of permissive writes** — a backend crash mid-commit can
+   leave orphaned S3 objects; see
+   [Write modes](#write-modes-strict-vs-permissive-allow_mixed_writes).
 
-5. **Partitioned tables only** — the source table must already be partitioned
-   by range. Unpartitioned table conversion is not yet supported.
+5. **Partitioned tables only** — the source table must already be
+   range-partitioned.
 
 6. **No Iceberg partition spec on the cold tier** — Iceberg tables
-   are created without a `partition-spec` (`partition-specs[0].fields = []`).
-   Cold-tier predicate pruning therefore relies on **per-file manifest
-   min/max statistics**, which DuckDB-iceberg uses to skip data files
-   whose range doesn't intersect a query's WHERE clause.
+   are created without a `partition-spec` (`partition-specs[0].fields = []`),
+   because duckdb-iceberg rejects writes to a partitioned table.  Cold-tier
+   predicate pruning therefore relies on **per-file manifest min/max
+   statistics**, which DuckDB-iceberg uses to skip data files whose range
+   doesn't intersect a query's WHERE clause.  Writing one Iceberg snapshot
+   per source partition keeps each file's `min(ts)/max(ts)` tight, which is
+   what makes that pruning effective.
 
-   This works correctly **as long as the archiver writes one Iceberg
-   snapshot per source partition** — the existing flow does, because
-   each `archivePartition` call performs a single bulk INSERT
-   (one snapshot, tight `min(ts)/max(ts)` per file) followed by
-   batched delta replay via `coldfront._apply_delta_batch` (each
-   batch is one Iceberg snapshot streamed from a scratch table over
-   pglocal, also tight).
-
-   Anyone modifying [archivePartition](cmd/archiver/main.go) must
-   preserve the one-snapshot-per-source-partition invariant. If a
-   future change interleaves rows across snapshots (e.g. coalescing
-   multiple PG partitions into one Iceberg INSERT), file-level min/max
-   widens, files stop being prune-skippable, cold reads degrade toward
-   full-scan.
-
-   Setting a real partition spec via Lakekeeper REST is feasible
-   (verified empirically), but DuckDB-iceberg v1.4.x then refuses every
-   INSERT with `Not implemented Error: INSERT into a partitioned table
-   is not supported yet`. So the spec stays empty until upstream ships
-   partition-write — see
-   [ARCHITECTURE.md → Upstream Requests](ARCHITECTURE.md#upstream-requests).
-
-6. **Cutover blocked by autovacuum on freshly-loaded partitions** —
+7. **Cutover blocked by autovacuum on freshly-loaded partitions** —
    Phase 4 of `archivePartition` takes `ACCESS EXCLUSIVE` on the
-   partition under a 100 ms `lock_timeout` circuit breaker. PostgreSQL's
-   autovacuum (`VACUUM ANALYZE`) holds `SHARE UPDATE EXCLUSIVE` on the
-   partition for the duration of the vacuum, which conflicts with our
-   request and is throttled by `autovacuum_vacuum_cost_delay` /
-   `autovacuum_vacuum_cost_limit` to take *minutes per gigabyte* on
-   default settings. On a freshly-loaded 30 GB partition the autovac
-   run can run for an hour. The cutover's 10-attempt exponential
-   backoff (~102 s total budget) cannot squeeze through; the archive
-   cycle fails cleanly with `ERROR: canceling statement due to lock
-   timeout` and leaves the trigger + delta in place for the next
-   cycle to retry.
+   partition under a 100 ms `lock_timeout` circuit breaker. Autovacuum's
+   `SHARE UPDATE EXCLUSIVE` on the partition conflicts with that request,
+   so when a vacuum is running the cutover fails cleanly with `ERROR:
+   canceling statement due to lock timeout` and leaves the trigger +
+   delta in place for the next cycle to retry.
 
-   This isn't a bug in the cutover — `lock_timeout` did its job:
-   refusing to queue behind a multi-minute lock holder. But it does
-   mean the **archive cycle should not race a recently-completed bulk
-   load** of the partition being archived.
-
-   Mitigations for operators:
-
-   - **Disable autovacuum on the soon-to-be-archived partition** before
-     running the archiver:
-     `ALTER TABLE <part> SET (autovacuum_enabled = false);`. After the
-     cycle the partition is detached and dropped; the setting goes with
-     it. For predictable production scheduling, leave autovacuum on but
-     time the archive cycle so partitions have already settled.
-   - **Or wait for autovacuum to finish** before invoking the archiver.
-     Check `pg_stat_activity` for active autovacuum workers on any
-     managed partition; defer until clear.
-   - **Tuning autovacuum to be faster** (`autovacuum_vacuum_cost_delay
-     = 0`, `autovacuum_vacuum_cost_limit = 10000`) helps if the
-     installation can absorb the I/O cost during normal operation.
-   - **The archiver's failure mode is safe**: no partial cutover, no
-     data loss, the next cycle picks up the same partition once locks
-     clear.
+   Mitigation: disable autovacuum on the soon-to-be-archived partition
+   (`ALTER TABLE <part> SET (autovacuum_enabled = false);` — the setting
+   goes with the partition when it is detached and dropped), or schedule
+   the archive cycle so partitions have already settled.

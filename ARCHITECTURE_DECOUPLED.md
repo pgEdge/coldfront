@@ -25,22 +25,21 @@ covers what is specific to decoupled mode.
 | `coldfront.tiered_views` row | Required per managed table | — (table is not "managed" in tiered sense) |
 | Required at runtime | `pg_duckdb`, `coldfront`, Lakekeeper, S3 | `pg_duckdb`, `coldfront` (for lazy catalog ATTACH only), Lakekeeper, S3 |
 
-The coldfront extension stays loaded purely because it provides the
-lazy catalog-attach glue: the C extension hook intercepts the first
-query that touches a tiered view (read or write) and, if the Iceberg
-catalog `ice` is not yet attached in this session, issues
+The coldfront extension provides the lazy catalog-attach glue: the C
+extension hook intercepts the first query that touches a tiered view
+(read or write) and, if the Iceberg catalog `ice` is not yet attached
+in this session, issues
 `duckdb.raw_query('ATTACH IF NOT EXISTS ''wh'' AS ice (TYPE ICEBERG,
 ENDPOINT ...)')` against the GUCs `coldfront.warehouse` and
 `coldfront.lakekeeper_endpoint`. There is no connect-time setup — the
 attach happens on demand, transparently, the first time a session
-actually queries Iceberg. Without this, every new psql session would
-have to ATTACH the catalog manually before queries work.
+actually queries Iceberg.
 
 For tables registered as iceberg-only via `coldfront.create_iceberg_table()`,
 the parse-analyze rewriter is the **primary** dispatch path: it
 intercepts every INSERT/UPDATE/DELETE on the wrapper view and emits one
 `SELECT duckdb.raw_query('…')` that targets the Iceberg ref directly —
-single Iceberg snapshot per statement, no INSTEAD OF trigger involved.
+a single Iceberg snapshot per statement.
 Tables that don't appear in `coldfront.tiered_views` are invisible to
 the hook (`lookup_tiered_view` returns null → fast path-out).
 
@@ -83,7 +82,7 @@ wrapper view supports:
 | DELETE | `DELETE FROM <view> WHERE …` — hook → `SELECT duckdb.raw_query('DELETE FROM ice.<ns>.<name> WHERE ...')` | Iceberg position-delete files |
 | SELECT (function-call form) | `SELECT … FROM iceberg_scan('ice.<ns>.<name>') r WHERE r['col'] = …` | Columns must use `r['col']` accessor |
 | SELECT (raw-query form) | `SELECT duckdb.raw_query('SELECT ... FROM ice.<ns>.<name> WHERE ...')` | Returns scalar/text result via pg_duckdb's NOTICE channel |
-| ROLLBACK of writes | `BEGIN; raw_query(...); ROLLBACK;` | pg_duckdb's `XactCallback` ties DuckDB↔PG tx — verified |
+| ROLLBACK of writes | `BEGIN; raw_query(...); ROLLBACK;` | pg_duckdb's `XactCallback` ties DuckDB↔PG tx, so ROLLBACK undoes pending Iceberg writes |
 | DROP TABLE | `SELECT duckdb.raw_query('DROP TABLE ice.<ns>.<name>')` | |
 
 ### What does not work
@@ -102,10 +101,9 @@ gap of decoupled mode without a PG-side wrapper view.
 
 ## Supported column types
 
-Decoupled mode is not vanilla PostgreSQL — it is a service that
-PostgreSQL fronts. The supported column types are exactly the set
-that already round-trips cleanly between PG and Iceberg in the
-existing tiered mode (see `pgFormatTypeToDuckDB` in
+The supported column types are exactly the set that already
+round-trips cleanly between PG and Iceberg in the existing tiered mode
+(see `pgFormatTypeToDuckDB` in
 [cmd/archiver/main.go](cmd/archiver/main.go)). Anything outside this
 list is rejected at table-creation time.
 
@@ -135,10 +133,8 @@ precision/identity):
 - Any type not enumerated above.
 
 The narrowing is deliberate: a type that cannot round-trip exactly is
-worse than no support, because the data appears to be stored but
-silently changes shape on read. The single source of truth for what
-coldfront accepts is the function above; both decoupled mode and
-tiered mode share it.
+rejected rather than silently downgraded, because data that appears
+stored but changes shape on read is worse than no support.
 
 ## Wrapper helper: `coldfront.create_iceberg_table()`
 
@@ -165,8 +161,8 @@ What the helper does:
 
 1. `duckdb.raw_query('CREATE SCHEMA IF NOT EXISTS ice."default"')` — idempotent namespace creation against Lakekeeper.
 2. `duckdb.raw_query('CREATE TABLE ice.default.<name> (col1 STORAGE_TYPE, …)')` — column types are validated by `coldfront._iceberg_storage_type()`, which mirrors the canonical map in `cmd/archiver/main.go pgFormatTypeToDuckDB`. Anything outside the supported set (see "Supported column types" above) raises before any DDL is issued.
-3. `CREATE OR REPLACE VIEW <schema>.<name> AS SELECT r['col']::pg_type AS col, … FROM duckdb.query('SELECT * FROM ice.default.<name>') AS t(r)` — projection wraps the struct accessor so applications see flat columns. View-cast types (`jsonb` → `json`, `interval`) are surfaced via the appropriate cast. The view source is `duckdb.query()` rather than `iceberg_scan()` specifically to make read-your-own-write inside an explicit transaction work; pg_duckdb's planner folds it into the same `ICEBERG_SCAN` plan with identical Parquet predicate pushdown, so there's no perf cost (verified with `EXPLAIN ANALYZE`: both forms hit `Function: ICEBERG_SCAN, Filters: id=N, Total Files Read: 7`, ~14ms warm).
-4. Registers the row in `coldfront.tiered_views` with `is_iceberg_only = true`. The C-side `post_parse_analyze_hook` reads this flag and short-circuits `classify_tier()` to `TIER_COLD` for any INSERT/UPDATE/DELETE on the wrapper view, regardless of WHERE clause or watermark — so every write rewrites cleanly into a single `SELECT duckdb.raw_query('INSERT/UPDATE/DELETE ice.default.<name> …')`. INSERT in particular: the hook emits one bulk `raw_query` for the entire statement (VALUES list inlined for VALUES, source-table refs prefixed with `pglocal.<schema>.<table>` for `INSERT … SELECT FROM <pg_table>` so DuckDB's postgres extension streams source rows over libpq into the Iceberg writer in one pipeline). No INSTEAD OF INSERT trigger is created — the hook is the dispatch path.
+3. `CREATE OR REPLACE VIEW <schema>.<name> AS SELECT r['col']::pg_type AS col, … FROM duckdb.query('SELECT * FROM ice.default.<name>') AS t(r)` — projection wraps the struct accessor so applications see flat columns. View-cast types (`jsonb` → `json`, `interval`) are surfaced via the appropriate cast. The view reads via `duckdb.query()` so read-your-own-write inside an explicit transaction works; pg_duckdb's planner folds it into the same `ICEBERG_SCAN` plan with identical Parquet predicate pushdown, so there's no perf cost.
+4. Registers the row in `coldfront.tiered_views` with `is_iceberg_only = true`. The C-side `post_parse_analyze_hook` reads this flag and short-circuits `classify_tier()` to `TIER_COLD` for any INSERT/UPDATE/DELETE on the wrapper view, regardless of WHERE clause or watermark — so every write rewrites cleanly into a single `SELECT duckdb.raw_query('INSERT/UPDATE/DELETE ice.default.<name> …')`. No INSTEAD OF INSERT trigger is created — the hook is the dispatch path.
 
 Write semantics through the wrapper view:
 
@@ -178,8 +174,7 @@ Write semantics through the wrapper view:
 
 Limits the helper inherits from the platform:
 
-- **No partition spec at CREATE.** `p_partition_cols` is accepted as a parameter but currently ignored — pg_duckdb v1.1.1 + duckdb-iceberg do not yet expose Iceberg partition specs at CREATE TABLE time. Predicate pushdown still works via Parquet row-group statistics.
-- **Cross-session snapshot consistency.** Within one tx, multiple SELECT statements may observe writes from *other* sessions interleaved with their own scans — pg_duckdb has no equivalent of PG's repeatable-read snapshot pin across iceberg_scan invocations. (Read-your-own-write within the same tx *does* work via the duckdb.query() wrapper — see point 3 above.)
+- **No partition spec at CREATE.** `p_partition_cols` is accepted as a parameter but currently ignored — pg_duckdb and duckdb-iceberg do not expose Iceberg partition specs at CREATE TABLE time. Predicate pushdown still works via Parquet row-group statistics.
 - **Mixed-write guard relaxed.** The helper sets `duckdb.unsafe_allow_mixed_transactions = on` LOCAL during provisioning (Iceberg DDL + coldfront registry row both happen). The hook does the same for each rewritten DML so PG-side parse-analyze + DuckDB-side raw_query coexist in one tx. ROLLBACK still works via XactCallback; the flag only bypasses the pre-commit guard.
 
 The helper doesn't add capability over raw_query — it composes the existing primitives into a single call so applications get a normal-looking PG table.
@@ -192,17 +187,11 @@ and §Known Limitations applied to the decoupled scenario.)
 | Property | Status |
 |---|---|
 | Atomicity (single statement) | **Yes.** One `duckdb.raw_query('INSERT/UPDATE/DELETE …')` is one DuckDB transaction → one Iceberg snapshot commit. |
-| Atomicity (multi-statement tx, graceful) | **Yes.** pg_duckdb's `XactCallback` ties the DuckDB transaction to PG's, so PG `ROLLBACK` undoes pending Iceberg writes. Verified end-to-end (`BEGIN; INSERT; ROLLBACK;` → row count unchanged). |
+| Atomicity (multi-statement tx, graceful) | **Yes.** pg_duckdb's `XactCallback` ties the DuckDB transaction to PG's, so PG `ROLLBACK` undoes pending Iceberg writes. |
 | Atomicity (multi-statement tx, backend crash) | **Partial.** A backend crash between Iceberg snapshot commit and PG commit can leave S3 objects orphaned. Iceberg housekeeping (orphan-file expiry) reclaims them; not corrupting, but a real failure mode for very-strict ACID requirements. |
 | Consistency | **Yes** within a snapshot — Iceberg's serializable model + Lakekeeper optimistic concurrency. |
-| Isolation | **Read-your-own-write within a tx works** when the wrapper view uses `duckdb.query('SELECT * FROM ice.…')` as its read path (the helper does this by default). Verified end-to-end: `BEGIN; INSERT (10, …); SELECT WHERE id=10;` returns the row; `BEGIN; UPDATE id=1 SET status='x'; SELECT WHERE id=1;` returns the new status. The plain `iceberg_scan('ice.…')` form is *not* tx-aware (it re-resolves the table from Lakekeeper each call), but pg_duckdb's planner folds `duckdb.query('SELECT * FROM ice.…')` into the same `ICEBERG_SCAN` plan with identical predicate pushdown, so we get tx visibility for free. **Cross-call snapshot consistency is still weaker** than PG-native: a long-running SELECT that touches the table from multiple statements within one tx may observe writes from *other* sessions interleaved with its own scans — pg_duckdb has no equivalent of PG's repeatable-read snapshot pin across iceberg_scan invocations. |
+| Isolation | **Read-your-own-write within a tx works** when the wrapper view uses `duckdb.query('SELECT * FROM ice.…')` as its read path (the helper does this by default). The plain `iceberg_scan('ice.…')` form is *not* tx-aware (it re-resolves the table from Lakekeeper each call), but pg_duckdb's planner folds `duckdb.query('SELECT * FROM ice.…')` into the same `ICEBERG_SCAN` plan with identical predicate pushdown, so we get tx visibility for free. Cross-call snapshot consistency is weaker than PG-native (see Limitations). |
 | Durability | **Yes** — Iceberg commits are durable on the object store once Lakekeeper acknowledges. Stronger than PG WAL on local disk for many production setups. |
-
-The headline restriction is the isolation gap. A long-running analytic
-read that touches the same Iceberg table multiple times within one PG
-transaction may observe writes from other sessions interleaved with
-its own scans — behaviour that does not match PG's MVCC for native
-heap. Document loudly to applications.
 
 ## Concurrency / horizontal scaling — the bakery protocol
 
@@ -262,13 +251,6 @@ PG nodes pointing at the same Lakekeeper endpoint and S3 bucket.
     via dblink, so the row is tagged with the local node as origin
     and Spock replicates it back to the originator).
 
-  The deferral rule is exactly what makes R-A safe over an
-  asymmetric-apply substrate like Spock: an originator only proceeds
-  once it has heard from every alive peer, and a peer cannot say
-  "go ahead" while it still has an earlier-ticketed claim of its
-  own pending — that closes the local-view race the naïve
-  `min(ticket)` polling left open.
-
   The protocol works across **any number of writers per node** —
   each call holds its own unique ticket; release deletes by ticket
   only, so concurrent backends on the same node coexist cleanly.
@@ -307,21 +289,9 @@ PG nodes pointing at the same Lakekeeper endpoint and S3 bucket.
 
 ### Throughput characterisation
 
-Validated end-to-end on 3-node EC2 + Lakekeeper + S3 (eu-west-2),
-matched 90 M-row totals (3 workers × 300 INSERTs × 100 K rows):
-
-| Layout | Wall | Aggregate | Per-writer | Snapshots |
-|---|---:|---:|---:|---:|
-| 1 PG node, 3 concurrent workers | 119 s | 756 k/s | 252 k/s | 902 |
-| 3 PG nodes, 1 worker each | 119 s | 756 k/s | 252 k/s | 902 |
-
-Identical wall time in both layouts confirms the **commit-rate
-ceiling sits at Lakekeeper, not at the PG side** — adding writers
-(local or distributed) doesn't speed commits beyond that ceiling.
-Throughput improves by either using **bigger per-INSERT batches**
-(fewer commits move the same rows) or partitioning the Iceberg
-table along a dimension that lets writers commit to disjoint table
-versions.
+The commit-rate ceiling sits at Lakekeeper, not at the PG side, so
+scale throughput with larger per-INSERT batches or by partitioning the
+Iceberg table; see [bench.md](bench.md) for numbers.
 
 ### Required configuration on every PG node
 
@@ -330,41 +300,27 @@ versions.
 wal_level = logical
 shared_preload_libraries = 'snowflake,spock,pg_duckdb,coldfront'
 
-# Receiver-side: how often a wal receiver sends spontaneous status
-# updates to its upstream walsender.  This is what keeps
-# pg_stat_replication.reply_time fresh on the sender, which the
-# bakery's dead-peer liveness check consults.  PG default is 10 s; the
-# bakery's liveness window (coldfront.peer_alive_window_ms, default
-# 5 s) would otherwise false-positive every idle peer as "dead" on the
-# first claim after a quiet period.  1 s leaves comfortable margin.
+# Keeps pg_stat_replication.reply_time fresh for the bakery's dead-peer
+# liveness check (PG default 10s would false-positive idle peers as dead).
 wal_receiver_status_interval = 1s
 
-# Sync-rep is NOT required by the bakery — R-A's ack barrier replaces
-# it.  You can still enable it cluster-wide for stronger non-bakery
-# durability, but it's not load-bearing for iceberg-commit ordering.
+# Sync-rep is NOT required by the bakery — R-A's ack barrier replaces it.
 ```
 
 ```ini
-# postgresql.conf — per-node.  snowflake.node MUST equal
-# (hashtext(<spock node_name>) & 1023) — the bakery raises at first
-# claim if these disagree (it maps peers' tickets back to a spock
-# node_name via the same hash for dead-peer detection).
-snowflake.node = 1     # db1
-# snowflake.node = 2   # db2
-# snowflake.node = 3   # db3
+# postgresql.conf — per-node. snowflake.node MUST equal
+# (hashtext(<spock node_name>) & 1023) or the bakery raises at first claim:
+# it maps each ticket back to a spock node_name via the same hash for
+# dead-peer detection.
+snowflake.node = 1     # node1
+# snowflake.node = 2   # node2
+# snowflake.node = 3   # node3
 
-# DSN used for the bakery's autonomous-tx claim/ack dblink calls.
-# Unix socket avoids TCP overhead. The dblink session only touches the
-# plain `coldfront.claims` / `coldfront.claim_acks` tables, never a
-# tiered view, so the lazy catalog ATTACH never fires on it and the
-# session never enters DuckDB territory. application_name=coldfront_dblink
-# is a marker for logs.
+# DSN for the bakery's autonomous-tx claim/ack dblink calls (unix socket).
 coldfront.dblink_self = 'host=/tmp dbname=coldfront user=coldfront application_name=coldfront_dblink'
 
-# Optional — peer-liveness window for R-A's dead-peer escape
-# (default 5000 ms, matches spock's default heartbeat cadence).
-# A peer whose pg_stat_replication.reply_time is older than this is
-# treated as already-acked. Raise on slow/lossy WAN links.
+# Optional — peer-liveness window for R-A's dead-peer escape; a peer
+# whose reply_time is older than this is treated as already-acked.
 coldfront.peer_alive_window_ms = 5000
 ```
 
@@ -386,56 +342,13 @@ SELECT coldfront._ensure_claims_replicated();
 
 The helper is idempotent. Without it on a peer, that peer's ack
 INSERTs are local-only and never replicate back to the originating
-writer — every claim ack-waits to timeout. CI verifies this via the
-sentinel-claims-in-all-directions probe before any iceberg write
-(see `ci/journey.sh` `story_mesh_substrate`).
+writer — every claim ack-waits to timeout.
 
 `coldfront.create_iceberg_table()` calls `_ensure_claims_replicated()`
 on the node it runs on, but that only registers the repset on *that*
 node. Peers receive the wrapper-view DDL via Spock's `ddl_sql` repset
 but do *not* re-run the helper — so the explicit per-node call above
 is mandatory in any multi-node setup.
-
-## Interaction with the tiered-mode archiver (and why decoupled
-sidesteps a known pg_duckdb libpq linker bug)
-
-Decoupled mode never invokes the archiver. The archiver only exists for
-tiered mode, where it moves rows hot → cold on a watermark cutover.
-Phase 3 of an archive cycle (delta replay) needs to read PG-side rows
-from a capture/scratch table and stream them into Iceberg in one
-`duckdb.raw_query`. The fast path uses DuckDB's `postgres` extension
-(ATTACH-ed as `pglocal` via [coldfront.ensure_pg_attached()](extension/coldfront/coldfront--0.1.sql)),
-which can crash with
-
-```
-IO Error: Unable to connect to Postgres at "...":
-libpq is incorrectly linked to backend functions
-```
-
-depending on how `pg_duckdb` was built. Symbol-rename handling differs
-between upstream `pgduckdb/pgduckdb:18-v1.1.1` binaries and
-some source-built variants — when DuckDB's libpq tries to open a
-loopback connection from inside a PG backend, the linker can resolve a
-backend-internal symbol instead of the libpq one and abort. The
-single-node CI's archiver race-window test (`run-ci-local.sh` step 8b)
-exercises this path and consequently fails on builds that hit the bug.
-
-**Decoupled mode does not call `ensure_pg_attached()` on its write path.**
-The bakery (`_claim_iceberg_lock` / `_release_iceberg_lock` /
-`_exec_iceberg_with_claim`) coordinates entirely through dblink loopback
-(plain libpq) and Spock-replicated `coldfront.claims` rows. Iceberg
-writes use `duckdb.raw_query('INSERT/UPDATE/DELETE ice.…')` with
-inlined VALUES literals or DuckDB-side-only sources (`generate_series`,
-attached Iceberg tables) — never `pglocal.<schema>.<table>`. So
-decoupled mode is unaffected by the libpq linker conflict regardless of
-how `pg_duckdb` was built.
-
-**Implication for distributed deployments:** if your build of
-`pg_duckdb` exhibits the libpq conflict, you can still run
-coldfront in decoupled mode at full performance; only tiered mode's
-archiver Phase 3 is impacted. The ergonomic-loss-vs-OLTP-needs decision
-in the next section is the right framing — the libpq quirk is a
-reason to lean **toward** decoupled, not away from it.
 
 ## When to use decoupled vs tiered
 
