@@ -1,6 +1,6 @@
 module github.com/pgedge/coldfront/cmd/compactor
 
-go 1.25.5
+go 1.26.4
 
 require (
 	github.com/apache/iceberg-go v0.6.0
