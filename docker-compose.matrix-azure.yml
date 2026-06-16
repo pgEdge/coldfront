@@ -1,0 +1,63 @@
+# Azure ADLS Gen2 backend variant of docker-compose.matrix.yml. Identical
+# Lakekeeper stack, but:
+#   - db runs the pre-built DuckDB 1.5.x image (coldfront-duckdb15:pg${PG_MAJOR},
+#     built from docker/Dockerfile.duckdb15) — Azure read needs DuckDB 1.5.x.
+#   - no SeaweedFS: the cold store is real ADLS Gen2.
+#   - warehouse is wh-azure (ci/topo/vanilla.sh --backend azure creates it as an
+#     ADLS warehouse from COLDFRONT_AZURE_* env — real creds never committed).
+#
+#   ci/topo/vanilla.sh --pg 18 --mode tiered --backend azure \
+#       --compose docker-compose.matrix-azure.yml
+services:
+  db:
+    image: coldfront-duckdb15:pg${PG_MAJOR:-18}
+    environment:
+      PG_MAJOR: ${PG_MAJOR:-18}
+      MESH: "off"
+      COLDFRONT_WAREHOUSE: wh-azure
+      COLDFRONT_LAKEKEEPER: http://lakekeeper:8181/catalog
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U coldfront"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  lakekeeper-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: lakekeeper
+      POSTGRES_PASSWORD: lakekeeper
+      POSTGRES_DB: lakekeeper
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lakekeeper"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  lakekeeper-migrate:
+    image: quay.io/lakekeeper/catalog:latest
+    command: migrate
+    depends_on:
+      lakekeeper-db:
+        condition: service_healthy
+    environment:
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgres://lakekeeper:lakekeeper@lakekeeper-db:5432/lakekeeper
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgres://lakekeeper:lakekeeper@lakekeeper-db:5432/lakekeeper
+      LAKEKEEPER__PG_ENCRYPTION_KEY: deadbeefdeadbeefdeadbeefdeadbeef
+
+  lakekeeper:
+    image: quay.io/lakekeeper/catalog:latest
+    command: serve
+    depends_on:
+      lakekeeper-migrate:
+        condition: service_completed_successfully
+    environment:
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgres://lakekeeper:lakekeeper@lakekeeper-db:5432/lakekeeper
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgres://lakekeeper:lakekeeper@lakekeeper-db:5432/lakekeeper
+      LAKEKEEPER__PG_ENCRYPTION_KEY: deadbeefdeadbeefdeadbeefdeadbeef
+      LAKEKEEPER__LISTEN_PORT: 8181
+    healthcheck:
+      test: ["CMD", "lakekeeper", "healthcheck"]
+      interval: 3s
+      timeout: 2s
+      retries: 10

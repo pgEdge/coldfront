@@ -1,0 +1,71 @@
+name: Release
+
+# Tag-driven releases. Push a v* tag (e.g. v0.1.0) to cut a release; the
+# workflow_dispatch entry builds a snapshot (no GitHub release) for dry runs.
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  goreleaser:
+    name: Build and release
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0
+
+      - name: Fetch tags
+        run: git fetch --force --tags
+
+      - name: Set up Go
+        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      # Both binaries are pure-Go (CGO_ENABLED=0); all four targets
+      # (linux/darwin x amd64/arm64) cross-compile cleanly on this one runner.
+      - name: Vet
+        run: go vet ./...
+
+      - name: Run GoReleaser
+        uses: goreleaser/goreleaser-action@9a127d869fb706213d29cdf8eef3a4ea2b869415 # v7
+        with:
+          distribution: goreleaser
+          version: "~> v2"
+          args: release --clean ${{ github.ref_type != 'tag' && '--snapshot' || '' }}
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify Linux binaries are statically linked
+        run: |
+          set -euo pipefail
+          for tarball in dist/coldfront_*_linux_*.tar.gz; do
+            echo "== $tarball =="
+            tmp="$(mktemp -d)"
+            tar xzf "$tarball" -C "$tmp"
+            for bin in archiver partitioner; do
+              if ! file "$tmp/$bin" | grep -q "statically linked"; then
+                echo "ERROR: $bin in $tarball is not statically linked" >&2
+                file "$tmp/$bin" >&2
+                exit 1
+              fi
+              echo "OK: $bin statically linked"
+            done
+          done
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-artifacts
+          path: |
+            dist/*.tar.gz
+            dist/checksums.txt
+          retention-days: 30

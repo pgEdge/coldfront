@@ -1,0 +1,60 @@
+# ColdFront image on the DuckDB 1.5.x stack — the THIN coldfront layer on top of
+# the prebuilt coldfront-duckdb-base. The base (docker/Dockerfile.duckdb15-base)
+# carries the expensive, STABLE compiles — pg_duckdb 1.5.3 (PR #1025) and the
+# patched duckdb-iceberg extensions (iceberg/avro/azure/postgres_scanner,
+# v1.5-variegata + the bakery-aware commit-refresh patch). This build only
+# compiles the coldfront C extension (seconds), so CI and local builds are fast
+# and always test the CURRENT coldfront source.
+#
+# This is the canonical ColdFront app layer. All proven in DUCKDB_1.5_PATCHED.md.
+#
+# COLDFRONT_BASE is the prebuilt ghcr.io/pgedge base image. Before building,
+# either pull it from ghcr.io/pgedge/coldfront-duckdb-base or build it locally
+# first (it is then used from the local image cache):
+#   docker build -f docker/Dockerfile.duckdb15-base --build-arg PG_MAJOR=18 \
+#       -t ghcr.io/pgedge/coldfront-duckdb-base:pg18 .
+#
+#   docker build -f docker/Dockerfile.duckdb15 --build-arg PG_MAJOR=18 -t coldfront-duckdb15:pg18 .
+ARG PG_MAJOR=18
+ARG PGEDGE_TAG=${PG_MAJOR}-spock5-minimal
+ARG COLDFRONT_BASE=ghcr.io/pgedge/coldfront-duckdb-base:pg${PG_MAJOR}
+
+# ─── coldfront compile stage: PG devel headers only (no pg_duckdb linkage) ───────
+# coldfront.c includes only PostgreSQL server headers + libpq-fe.h and links -lpq;
+# it does NOT link pg_duckdb, so this stage needs just the PG devel toolchain and
+# builds in seconds (the heavy pg_duckdb/iceberg compiles live in the base).
+FROM ghcr.io/pgedge/pgedge-postgres:${PGEDGE_TAG} AS cf-build
+ARG PG_MAJOR
+USER root
+RUN dnf install -y --setopt=install_weak_deps=False \
+        pgedge-postgresql${PG_MAJOR}-devel gcc make redhat-rpm-config diffutils \
+    && dnf clean all
+ENV PATH=/usr/pgsql-${PG_MAJOR}/bin:$PATH
+ENV PG_CONFIG=/usr/pgsql-${PG_MAJOR}/bin/pg_config
+COPY extension/coldfront /build/coldfront
+RUN DESTDIR=/out make -C /build/coldfront install with_llvm=no
+
+# ─── app runtime: coldfront extension on top of the base ─────────────────────────
+# pg_duckdb 1.5.3, the iceberg/avro/azure/postgres_scanner extensions, libcurl
+# 8.12, COLDFRONT_DUCKDB_* env and /data are inherited from the base. This stage
+# adds coldfront's .so + SQL/control (distinct filenames — no overwrite of
+# pg_duckdb) AND refreshes the entrypoint from the CURRENT branch.
+#
+# entrypoint.sh carries frequently-changing runtime config (e.g. the
+# duckdb.postgres_role default). Baking it ONLY into the slow, separately-published
+# base lets a stale published base (what GitHub CI pulls) diverge from a local
+# rebuild — which is exactly how a real failure once slipped past local CI. Copying
+# it in the fast app layer means every build — local pre-commit and GitHub CI alike
+# — runs the branch's current entrypoint, regardless of base age. (CI parity.)
+FROM ${COLDFRONT_BASE}
+ARG PG_MAJOR
+USER root
+COPY --from=cf-build /out/usr/pgsql-${PG_MAJOR}/lib/             /usr/pgsql-${PG_MAJOR}/lib/
+COPY --from=cf-build /out/usr/pgsql-${PG_MAJOR}/share/extension/ /usr/pgsql-${PG_MAJOR}/share/extension/
+COPY docker/entrypoint.sh /usr/local/bin/coldfront-entrypoint.sh
+RUN chmod +x /usr/local/bin/coldfront-entrypoint.sh
+# License + third-party notices travel with the binaries we redistribute (DuckDB
+# family is MIT — the notice must accompany the distributed Software).
+COPY THIRD_PARTY_NOTICES.md LICENSE.md /usr/share/doc/coldfront/
+USER postgres
+ENTRYPOINT ["/usr/local/bin/coldfront-entrypoint.sh"]

@@ -1,0 +1,46 @@
+-- Enterprise privilege model (white-box; catalog introspection only — no live
+-- Iceberg I/O. The e2e non-superuser cold-path proof, and the runtime
+-- "non-superuser cannot redirect the elevated ATTACH" check, live in
+-- ci/ops.sh check 3, where PG-version error-text skew doesn't reach a shared .out.
+--
+-- Three invariants let cold I/O work for a NON-superuser app role that holds only
+-- duckdb.postgres_role membership + coldfront object grants (no pg_*_server_files,
+-- no superuser), and make onboarding one line:
+--   (1) ensure_attached()/ensure_pg_attached() are SECURITY DEFINER with a pinned
+--       search_path. They run elevated so the side-loaded iceberg/postgres DuckDB
+--       extensions load (pg_duckdb force-disables LocalFileSystem for non-superusers)
+--       while the outer scan/commit runs as the app role over S3 (httpfs).
+--   (2) The deployment-config endpoint/DSN GUCs are PGC_SUSET, so a non-superuser
+--       cannot redirect the elevated ATTACH to an attacker-controlled endpoint.
+--   (3) grant_app_access() is the one-call onboarding helper, and it is NOT
+--       executable by PUBLIC — an app role must never be able to self-grant.
+CREATE EXTENSION IF NOT EXISTS pg_duckdb;
+CREATE EXTENSION IF NOT EXISTS coldfront;
+
+-- (1) the elevated helpers are SECURITY DEFINER + search_path-pinned: the attach
+--     helpers (load the side-loaded iceberg/postgres extensions past the
+--     non-superuser LocalFileSystem block) and the R-A bakery coordination
+--     functions (read spock.* / pg_stat_replication + dblink the claim, so a
+--     non-superuser writer drives the mesh serializer with the right privilege).
+--     _exec_iceberg_with_claim is deliberately ABSENT — it stays INVOKER (it runs
+--     caller-provided cold DML, which must execute with the caller's privileges).
+SELECT proname, prosecdef, array_to_string(proconfig, ', ') AS proconfig
+FROM pg_proc
+WHERE pronamespace = 'coldfront'::regnamespace
+  AND proname IN ('ensure_attached', 'ensure_pg_attached',
+                  '_claim_iceberg_lock', '_release_iceberg_lock',
+                  '_exec_iceberg_with_claim')
+ORDER BY proname;
+
+-- (2) the endpoint/DSN GUCs the elevated helpers trust are superuser-set-only.
+SELECT name, context
+FROM pg_settings
+WHERE name IN ('coldfront.warehouse', 'coldfront.lakekeeper_endpoint', 'coldfront.local_pg_dsn')
+ORDER BY name;
+
+-- (3) the onboarding helper exists and PUBLIC cannot execute it (no self-grant).
+CREATE ROLE cf_priv_check NOSUPERUSER;
+SELECT has_function_privilege('cf_priv_check',
+                              'coldfront.grant_app_access(regrole)'::regprocedure,
+                              'execute') AS app_can_self_grant;
+DROP ROLE cf_priv_check;

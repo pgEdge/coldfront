@@ -1,0 +1,69 @@
+-- RENAME of the transparent VIEW must migrate every name-keyed reference:
+--   * coldfront.archive_watermark.table_name (keyed on the bare view name)
+--   * the regenerated INSERT trigger function/trigger names
+-- Without the watermark migration the rebuilt view would silently lose its
+-- cold (Iceberg) UNION branch — the watermark lookup would miss, v_has_cutoff
+-- would be false, and only the hot branch would remain.
+CREATE EXTENSION IF NOT EXISTS pg_duckdb;
+NOTICE:  extension "pg_duckdb" already exists, skipping
+CREATE EXTENSION IF NOT EXISTS coldfront;
+NOTICE:  extension "coldfront" already exists, skipping
+SET TIME ZONE 'UTC';
+-- White-box: checks the hooks' SQL/DDL, not Iceberg I/O. Real cold I/O is ci/journey.sh; see README.md.
+SET coldfront.warehouse = '';
+SET coldfront.lakekeeper_endpoint = '';
+SET coldfront.dblink_self = '';
+CREATE TABLE public._events (id int, ts timestamptz, status text);
+CREATE VIEW public.events AS SELECT * FROM public._events;
+INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
+VALUES ('public', 'events', 'public._events', 'ice.default.events', 'ts');
+-- A watermark exists, so the rebuilt view must keep its cold UNION branch.
+INSERT INTO coldfront.archive_watermark(table_name, cutoff_time)
+VALUES ('events', '2026-03-01'::timestamptz);
+-- Before: view definition has the cold iceberg_scan branch.
+SELECT pg_get_viewdef('public.events'::regclass) LIKE '%iceberg_scan%' AS has_cold_branch;
+ has_cold_branch 
+-----------------
+ f
+(1 row)
+
+-- Rename the view.
+ALTER VIEW public.events RENAME TO events_v2;
+-- The watermark row followed the rename (keyed on the new bare view name).
+SELECT table_name FROM coldfront.archive_watermark ORDER BY table_name;
+ table_name 
+------------
+ events_v2
+(1 row)
+
+-- The rebuilt view under the new name STILL has the cold UNION branch
+-- (watermark lookup matched the new name).
+SELECT pg_get_viewdef('public.events_v2'::regclass) LIKE '%iceberg_scan%' AS has_cold_branch;
+ has_cold_branch 
+-----------------
+ t
+(1 row)
+
+-- The registry relname migrated to the new view name (name-keyed).
+SELECT (schema_name = 'public' AND relname = 'events_v2') AS registry_points_at_new_view,
+       hot_table, partition_col
+  FROM coldfront.tiered_views;
+ registry_points_at_new_view |   hot_table    | partition_col 
+-----------------------------+----------------+---------------
+ t                           | public._events | ts
+(1 row)
+
+-- The INSERT trigger was regenerated under the new view name.
+SELECT tgname FROM pg_trigger
+ WHERE tgrelid = 'public.events_v2'::regclass AND NOT tgisinternal
+ ORDER BY tgname;
+         tgname          
+-------------------------
+ events_v2_write_trigger
+(1 row)
+
+-- Cleanup.
+DELETE FROM coldfront.tiered_views;
+DELETE FROM coldfront.archive_watermark;
+DROP VIEW public.events_v2;
+DROP TABLE public._events;

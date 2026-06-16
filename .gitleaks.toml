@@ -1,0 +1,10 @@
+# gitleaks configuration for ColdFront.
+#
+# Extends the full default ruleset; adds one narrowly-scoped allowlist for a
+# known unit-test fixture. There are no real secrets in this repository.
+[extend]
+useDefault = true
+
+[[allowlists]]
+description = "cmd/compactor/config_test.go uses fake credentials only — e.g. a base64-of-\"keypadding\" Azure AccountKey in the storage-config parse test. Unit-test fixtures, not real secrets."
+paths = ['''cmd/compactor/config_test\.go''']

@@ -1,0 +1,76 @@
+# Parameterized single-node ("vanilla") stack for the CI matrix. The db builds the
+# DuckDB 1.5.x app image (docker/Dockerfile.duckdb15, FROM the prebuilt
+# coldfront-duckdb-base) for any PG major and configures itself via env
+# (entrypoint), not -c flags. Select the PG major with the PG_MAJOR env var:
+#
+#   PG_MAJOR=17 docker compose -f docker-compose.matrix.yml up -d --build
+#
+# ci/topo/vanilla.sh drives this with --compose docker-compose.matrix.yml.
+# MESH stays off here (vanilla, local advisory-lock bakery); the mesh stack is
+# a separate compose wired by ci/topo/mesh.sh.
+services:
+  db:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.duckdb15
+      args:
+        PG_MAJOR: ${PG_MAJOR:-18}
+    environment:
+      PG_MAJOR: ${PG_MAJOR:-18}
+      MESH: "off"
+      COLDFRONT_WAREHOUSE: wh
+      COLDFRONT_LAKEKEEPER: http://lakekeeper:8181/catalog
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U coldfront"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  seaweedfs:
+    image: chrislusf/seaweedfs:latest
+    command: "server -s3 -dir=/data -s3.config=/etc/seaweedfs/s3.json"
+    volumes:
+      - ./docker/seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro
+
+  # Lakekeeper keeps its catalog in its OWN dedicated Postgres — never on a
+  # ColdFront data node. Stock postgres ships the contrib uuid-ossp Lakekeeper's
+  # migration needs, so the ColdFront image carries no extra packages for it.
+  lakekeeper-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: lakekeeper
+      POSTGRES_PASSWORD: lakekeeper
+      POSTGRES_DB: lakekeeper
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lakekeeper"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  lakekeeper-migrate:
+    image: quay.io/lakekeeper/catalog:latest
+    command: migrate
+    depends_on:
+      lakekeeper-db:
+        condition: service_healthy
+    environment:
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgres://lakekeeper:lakekeeper@lakekeeper-db:5432/lakekeeper
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgres://lakekeeper:lakekeeper@lakekeeper-db:5432/lakekeeper
+      LAKEKEEPER__PG_ENCRYPTION_KEY: deadbeefdeadbeefdeadbeefdeadbeef
+
+  lakekeeper:
+    image: quay.io/lakekeeper/catalog:latest
+    command: serve
+    depends_on:
+      lakekeeper-migrate:
+        condition: service_completed_successfully
+    environment:
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgres://lakekeeper:lakekeeper@lakekeeper-db:5432/lakekeeper
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgres://lakekeeper:lakekeeper@lakekeeper-db:5432/lakekeeper
+      LAKEKEEPER__PG_ENCRYPTION_KEY: deadbeefdeadbeefdeadbeefdeadbeef
+      LAKEKEEPER__LISTEN_PORT: 8181
+    healthcheck:
+      test: ["CMD", "lakekeeper", "healthcheck"]
+      interval: 3s
+      timeout: 2s
+      retries: 10

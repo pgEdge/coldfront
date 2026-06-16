@@ -1,0 +1,69 @@
+bin/
+/archiver
+dist/
+*.log
+*.out
+coverage.html
+.env
+.claude/*
+!.claude/agents/
+!.claude/specs/
+!.claude/plans/
+CLAUDE.local.md
+THIRD_PARTY_GO.txt
+REPO_READY_AUDIT.md
+.tmp/
+*.pdf
+
+# IDE / editor directories
+.idea/
+.vscode/
+
+# MkDocs build output
+site/
+
+# pg_regress expected outputs — tracked; the global *.out would exclude them.
+!extension/coldfront/test/expected/*.out
+# pg_regress run artifacts (generated; never committed)
+extension/coldfront/test/results/
+extension/coldfront/test/regression.diffs
+extension/coldfront/test/regression.out
+# compiled extension artifacts (built in Docker / by bare-metal `make`)
+extension/coldfront/*.so
+extension/coldfront/src/*.o
+extension/coldfront/src/*.bc
+
+# TLC model-checker artefacts (created next to wherever tlc2.TLC is invoked).
+docs/formal/*_TTrace_*
+docs/formal/*.old
+states/
+
+# Scale test / bench scripts and demo (local only, not shipped — keep out of the
+# repo, especially before it goes public).
+demo/
+demo*.sh
+*.cast
+DEMO*.md
+DEMO*.txt
+scale-test/
+scale-test-*.sh
+bench-*.sh
+bench.md
+
+# E2E result docs (local only)
+E2E*.md
+SCALE_TEST_SETUP.md
+
+# Internal / strategic docs — NOT for the (eventually public) repo. Kept locally.
+COMPARISON.md
+10000_FT_VIEW.md
+BACKLOG.md
+EXPERIMENTAL_MVCC.md
+HARDENING_DECOUPLED.md
+
+# Local secrets — NEVER commit. (One-off GHCR push token; revoke after use.)
+github_token_do_not_merge.txt
+*.token
+*-token.txt
+*_token*.txt
+

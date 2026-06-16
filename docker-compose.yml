@@ -1,0 +1,102 @@
+# ColdFront — end-user / evaluation stack (single node, DuckDB 1.5.x).
+#
+# Your cold store is whatever you already have. Pick ONE:
+#
+#   # A) Real cloud store (AWS S3 / Azure ADLS / GCS) — the common case.
+#   #    Brings up ONLY Postgres + Lakekeeper. You create the warehouse against
+#   #    your own bucket and call coldfront.set_storage_secret(...) with your
+#   #    cloud credentials (see README "Storage backends"). No local S3 emulator.
+#   docker compose up -d --build
+#
+#   # B) Zero-credential LOCAL eval — adds an in-compose SeaweedFS S3 emulator.
+#   docker compose --profile local-store up -d --build
+#
+# Host ports are PUBLISHED (Postgres 5432, Lakekeeper 8181, + SeaweedFS 8333 under
+# the profile) so the documented setup (`curl localhost:8181/...`, `psql -h
+# localhost`) works directly from your machine. Reuses the same 1.5.x app image as
+# CI (docker/Dockerfile.duckdb15) but is otherwise independent.
+#
+# NB: for a cloud warehouse credential, use long-term S3 keys — SSO/temporary
+# creds (with a session token) are NOT supported by Lakekeeper's warehouse cred.
+#
+# ⚠ NOT for CI. The CI matrix uses docker-compose.matrix.yml (vanilla) and
+# docker-compose.mesh.yml (3-node Spock) — those address services by container IP
+# and publish no host ports. Do not use them for an end-user setup, and do not
+# point end-user docs at them.
+services:
+  db:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile.duckdb15
+      args:
+        PG_MAJOR: ${PG_MAJOR:-18}
+    environment:
+      PG_MAJOR: ${PG_MAJOR:-18}
+      MESH: "off"
+      COLDFRONT_WAREHOUSE: wh
+      COLDFRONT_LAKEKEEPER: http://lakekeeper:8181/catalog
+    ports:
+      # Host port is overridable so a local Postgres on 5432 doesn't collide:
+      #   COLDFRONT_PG_PORT=55432 docker compose up -d --build
+      - "${COLDFRONT_PG_PORT:-5432}:5432"   # psql -h localhost -p $COLDFRONT_PG_PORT -U coldfront -d coldfront
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U coldfront"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  seaweedfs:                   # local S3-compatible store (zero-cred local eval)
+    # Gated behind the 'local-store' profile: plain `docker compose up` does NOT
+    # start it (cloud-store users talk to AWS/Azure/GCS directly). Enable it for
+    # local eval with: docker compose --profile local-store up -d --build
+    profiles: ["local-store"]
+    image: chrislusf/seaweedfs:latest
+    command: "server -s3 -dir=/data -s3.config=/etc/seaweedfs/s3.json"
+    volumes:
+      - ./docker/seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro
+    ports:
+      - "${COLDFRONT_S3_PORT:-8333}:8333"    # S3 API
+
+  # Lakekeeper keeps its catalog in its OWN Postgres — never on the ColdFront data
+  # node (see ARCHITECTURE.md). One small container; keeps the data node clean.
+  lakekeeper-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: lakekeeper
+      POSTGRES_PASSWORD: lakekeeper
+      POSTGRES_DB: lakekeeper
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U lakekeeper"]
+      interval: 3s
+      timeout: 2s
+      retries: 20
+
+  lakekeeper-migrate:
+    image: quay.io/lakekeeper/catalog:latest
+    command: migrate
+    depends_on:
+      lakekeeper-db:
+        condition: service_healthy
+    environment:
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgres://lakekeeper:lakekeeper@lakekeeper-db:5432/lakekeeper
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgres://lakekeeper:lakekeeper@lakekeeper-db:5432/lakekeeper
+      LAKEKEEPER__PG_ENCRYPTION_KEY: deadbeefdeadbeefdeadbeefdeadbeef
+
+  lakekeeper:
+    image: quay.io/lakekeeper/catalog:latest
+    command: serve
+    depends_on:
+      lakekeeper-migrate:
+        condition: service_completed_successfully
+    environment:
+      LAKEKEEPER__PG_DATABASE_URL_READ: postgres://lakekeeper:lakekeeper@lakekeeper-db:5432/lakekeeper
+      LAKEKEEPER__PG_DATABASE_URL_WRITE: postgres://lakekeeper:lakekeeper@lakekeeper-db:5432/lakekeeper
+      LAKEKEEPER__PG_ENCRYPTION_KEY: deadbeefdeadbeefdeadbeefdeadbeef
+      LAKEKEEPER__LISTEN_PORT: 8181
+    ports:
+      - "${COLDFRONT_LK_PORT:-8181}:8181"    # REST catalog + management API (bootstrap/warehouse)
+    healthcheck:
+      test: ["CMD", "lakekeeper", "healthcheck"]
+      interval: 3s
+      timeout: 2s
+      retries: 10

@@ -1,0 +1,4 @@
+comment = 'Transparent tiered storage: route DML on tiered views across hot (PG) and cold (Iceberg) tiers'
+default_version = '0.1'
+relocatable = false
+schema = coldfront

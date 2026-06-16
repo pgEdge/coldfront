@@ -1,0 +1,45 @@
+name: Base image (DuckDB 1.5.x)
+
+# Builds + publishes the coldfront-duckdb-base image (libcurl 8.12 + pg_duckdb
+# 1.5.3 + patched duckdb-iceberg) to ghcr.io/pgedge for PG 16/17/18. The app image
+# (docker/Dockerfile.duckdb15) does `FROM` this; CI and local builds pull it.
+#
+# Rebuilt only when the base inputs change (Dockerfile / iceberg patch / config)
+# or on manual dispatch — NOT on every push. The build is a cold ~30–60 min
+# DuckDB/iceberg compile per major; that's fine for an infrequent base rebuild.
+
+# Manual-only: a cold DuckDB + duckdb-iceberg + vcpkg compile on a free GitHub
+# runner is long (and risks the job timeout), so base rebuilds are deliberate.
+# Trigger from the Actions tab (or `gh workflow run base-image.yml`) when the base
+# inputs change (Dockerfile.duckdb15-base / the iceberg patch / config). For an
+# initial publish, pushing a locally-built base is faster — see DUCKDB_1.5_PATCHED.md.
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write   # GITHUB_TOKEN pushes to ghcr.io/pgedge
+
+jobs:
+  base:
+    name: base pg${{ matrix.pg }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ['18', '17', '16']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+
+      - name: Build + push base image
+        run: |
+          set -euo pipefail
+          IMG=ghcr.io/pgedge/coldfront-duckdb-base:pg${{ matrix.pg }}
+          docker build -f docker/Dockerfile.duckdb15-base --build-arg PG_MAJOR=${{ matrix.pg }} -t "$IMG" .
+          docker push "$IMG"
+          echo "Pushed $IMG"
