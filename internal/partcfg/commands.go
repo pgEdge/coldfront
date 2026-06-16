@@ -154,7 +154,13 @@ func runRegister(ctx context.Context, args []string) error {
 		fmt.Println(insertSQL)
 		return nil
 	}
+	return registerToDB(ctx, connect, *schema, *table, *column, *hot, *retention, *subValues != "", *dryRun, insertSQL)
+}
 
+// registerToDB runs the connect-and-validate tail of register: it connects,
+// ensures the config table, validates the PK covers the partition key, checks
+// the interval semantics, then INSERTs the row (or prints the dry-run summary).
+func registerToDB(ctx context.Context, connect func(context.Context) (*pgx.Conn, error), schema, table, column, hot, retention string, twoLevel, dryRun bool, insertSQL string) error {
 	conn, err := connect(ctx)
 	if err != nil {
 		return err
@@ -166,23 +172,23 @@ func runRegister(ctx context.Context, args []string) error {
 	// PK-superset validation: the cutover keys delta capture by the source PK,
 	// so the PK must cover the partition key column(s). 2-level adds the RANGE
 	// column (the LIST column comes from the catalog).
-	if err := validatePKSuperset(ctx, conn, *schema, *table, *column, *subValues != ""); err != nil {
+	if err := validatePKSuperset(ctx, conn, schema, table, column, twoLevel); err != nil {
 		return err
 	}
 	// Period validity + retention>hot ordering are PostgreSQL interval semantics,
 	// so they're checked against the connection (fail fast at register time; the
 	// interval column type is the backstop for any direct write).
-	if err := partition.ValidatePeriods(ctx, conn, *hot, *retention); err != nil {
+	if err := partition.ValidatePeriods(ctx, conn, hot, retention); err != nil {
 		return err
 	}
-	if *dryRun {
-		fmt.Printf("dry-run OK: %s.%s validates; would run:\n%s\n", *schema, *table, insertSQL)
+	if dryRun {
+		fmt.Printf("dry-run OK: %s.%s validates; would run:\n%s\n", schema, table, insertSQL)
 		return nil
 	}
 	if _, err := conn.Exec(ctx, insertSQL); err != nil { // nosemgrep
-		return fmt.Errorf("register %s.%s: %w", *schema, *table, err)
+		return fmt.Errorf("register %s.%s: %w", schema, table, err)
 	}
-	fmt.Printf("registered %s.%s\n", *schema, *table)
+	fmt.Printf("registered %s.%s\n", schema, table)
 	return nil
 }
 
@@ -337,27 +343,45 @@ VALUES (%s, %s, %s, %s, %d, %s, %s, %s, %s, %s, %s);`,
 // requiredCols = the parent's partition-key column(s); for a 2-level table the
 // parent's key is the LIST column and the RANGE column (rangeCol) is added.
 func validatePKSuperset(ctx context.Context, db DBTX, schema, table, rangeCol string, twoLevel bool) error {
+	required, err := requiredPartKeyCols(ctx, db, schema, table, rangeCol, twoLevel)
+	if err != nil {
+		return err
+	}
+	return checkPKCovers(ctx, db, schema, table, required)
+}
+
+// requiredPartKeyCols reads the parent's partition key and returns the column
+// set the PK must cover: the parent's key column(s) plus the RANGE column for a
+// 2-level table. The first query's rows are closed explicitly (not deferred) so
+// it does not overlap the PK query on the same connection.
+func requiredPartKeyCols(ctx context.Context, db DBTX, schema, table, rangeCol string, twoLevel bool) (map[string]bool, error) {
 	prows, err := db.Query(ctx, `
 		SELECT pg_get_partkeydef(c.oid)
 		FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 		WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = 'p'`, schema, table)
 	if err != nil {
-		return fmt.Errorf("read partition key for %s.%s: %w", schema, table, err)
+		return nil, fmt.Errorf("read partition key for %s.%s: %w", schema, table, err)
 	}
 	var partkeydef string
 	for prows.Next() {
 		if err := prows.Scan(&partkeydef); err != nil {
 			prows.Close()
-			return err
+			return nil, err
 		}
 	}
 	prows.Close()
 	if err := prows.Err(); err != nil {
-		return err
+		return nil, err
 	}
 	if partkeydef == "" {
-		return fmt.Errorf("%s.%s is not a partitioned table (or does not exist)", schema, table)
+		return nil, fmt.Errorf("%s.%s is not a partitioned table (or does not exist)", schema, table)
 	}
+	return requiredColsFromPartKey(partkeydef, rangeCol, twoLevel), nil
+}
+
+// requiredColsFromPartKey parses a pg_get_partkeydef string into the set of
+// partition-key columns, adding the explicit 2-level RANGE column when present.
+func requiredColsFromPartKey(partkeydef, rangeCol string, twoLevel bool) map[string]bool {
 	required := map[string]bool{}
 	for _, c := range partKeyCols(partkeydef) {
 		required[c] = true
@@ -365,7 +389,12 @@ func validatePKSuperset(ctx context.Context, db DBTX, schema, table, rangeCol st
 	if twoLevel && rangeCol != "" {
 		required[rangeCol] = true
 	}
+	return required
+}
 
+// checkPKCovers reads the table's PRIMARY KEY and confirms it covers every
+// required partition-key column.
+func checkPKCovers(ctx context.Context, db DBTX, schema, table string, required map[string]bool) error {
 	pkCols, err := primaryKeyCols(ctx, db, schema, table)
 	if err != nil {
 		return err
@@ -475,6 +504,31 @@ func rowFrom(t config.TableConfig) configRow {
 	return r
 }
 
+// setVals holds the set-command flag values a clause builder may read.
+type setVals struct {
+	period, column            string
+	premake                   int
+	hot, retention, subValues string
+	strategy                  string
+}
+
+// setClauses maps each set flag name to the UPDATE clause it emits. Only flags
+// the user actually passed (via fs.Visit) are looked up here, so an unset flag
+// never emits a clause — this is what lets --hot-period "" clear the column
+// while an omitted --hot-period leaves it untouched. --enable/--disable ignore
+// vals and emit a constant.
+var setClauses = map[string]func(setVals) string{
+	"period":            func(v setVals) string { return "partition_period=" + lit(v.period) },
+	"column":            func(v setVals) string { return "partition_column=" + lit(v.column) },
+	"premake":           func(v setVals) string { return fmt.Sprintf("future_partitions=%d", v.premake) },
+	"hot-period":        func(v setVals) string { return "hot_period=" + lit(v.hot) },
+	"retention":         func(v setVals) string { return "retention_period=" + lit(v.retention) },
+	"sub-values-source": func(v setVals) string { return "sub_part_values_source=" + lit(v.subValues) },
+	"strategy":          func(v setVals) string { return "expiration_strategy=" + lit(v.strategy) },
+	"enable":            func(setVals) string { return "enabled=true" },
+	"disable":           func(setVals) string { return "enabled=false" },
+}
+
 // runSet updates lifecycle fields on a managed table (only the flags you pass),
 // or pauses/resumes it with --disable/--enable.
 func runSet(ctx context.Context, args []string) error {
@@ -512,29 +566,8 @@ EXAMPLES:
 	if *enable && *disable {
 		return fmt.Errorf("--enable and --disable are mutually exclusive")
 	}
-	var sets []string
-	fs.Visit(func(f *flag.Flag) {
-		switch f.Name {
-		case "period":
-			sets = append(sets, "partition_period="+lit(*period))
-		case "column":
-			sets = append(sets, "partition_column="+lit(*column))
-		case "premake":
-			sets = append(sets, fmt.Sprintf("future_partitions=%d", *premake))
-		case "hot-period":
-			sets = append(sets, "hot_period="+lit(*hot))
-		case "retention":
-			sets = append(sets, "retention_period="+lit(*retention))
-		case "sub-values-source":
-			sets = append(sets, "sub_part_values_source="+lit(*subValues))
-		case "strategy":
-			sets = append(sets, "expiration_strategy="+lit(*strategy))
-		case "enable":
-			sets = append(sets, "enabled=true")
-		case "disable":
-			sets = append(sets, "enabled=false")
-		}
-	})
+	vals := setVals{period: *period, column: *column, premake: *premake, hot: *hot, retention: *retention, subValues: *subValues, strategy: *strategy}
+	sets := collectSetClauses(fs, vals)
 	if len(sets) == 0 {
 		return fmt.Errorf("nothing to change: pass a field flag or --enable/--disable")
 	}
@@ -544,6 +577,24 @@ EXAMPLES:
 		fmt.Println(sql)
 		return nil
 	}
+	return execSet(ctx, connect, *schema, *table, sql)
+}
+
+// collectSetClauses walks the flags the user actually set (fs.Visit) and returns
+// the SET clauses for the recognised field flags, in flag-declaration order.
+func collectSetClauses(fs *flag.FlagSet, vals setVals) []string {
+	var sets []string
+	fs.Visit(func(f *flag.Flag) {
+		if clause, ok := setClauses[f.Name]; ok {
+			sets = append(sets, clause(vals))
+		}
+	})
+	return sets
+}
+
+// execSet connects, ensures the config table, and runs the UPDATE; a zero
+// row-count means the table isn't managed.
+func execSet(ctx context.Context, connect func(context.Context) (*pgx.Conn, error), schema, table, sql string) error {
 	conn, err := connect(ctx)
 	if err != nil {
 		return err
@@ -554,12 +605,12 @@ EXAMPLES:
 	}
 	tag, err := conn.Exec(ctx, sql) // nosemgrep
 	if err != nil {
-		return fmt.Errorf("set %s.%s: %w", *schema, *table, err)
+		return fmt.Errorf("set %s.%s: %w", schema, table, err)
 	}
 	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("%s.%s is not managed (no partition_config row)", *schema, *table)
+		return fmt.Errorf("%s.%s is not managed (no partition_config row)", schema, table)
 	}
-	fmt.Printf("updated %s.%s\n", *schema, *table)
+	fmt.Printf("updated %s.%s\n", schema, table)
 	return nil
 }
 
@@ -648,14 +699,9 @@ EXAMPLES:
 	if len(cfg.Archiver.Tables) == 0 {
 		return fmt.Errorf("no archiver.tables in %s", *cfgPath)
 	}
-	stmts := make([]string, len(cfg.Archiver.Tables))
-	for i, t := range cfg.Archiver.Tables {
-		stmts[i] = rowFrom(t).insertSQL()
-	}
+	stmts := buildImportStmts(cfg.Archiver.Tables)
 	if *printSQL {
-		for _, s := range stmts {
-			fmt.Println(s)
-		}
+		printStmts(stmts)
 		return nil
 	}
 	d := *dsn
@@ -665,7 +711,30 @@ EXAMPLES:
 	if d == "" {
 		return fmt.Errorf("no DSN: set postgres.dsn in --config or pass --dsn")
 	}
-	conn, err := openConn(ctx, d)
+	return applyImport(ctx, d, cfg.Archiver.Tables, stmts, *dryRun)
+}
+
+// buildImportStmts renders one INSERT per table, index-aligned with tables so
+// the exec loop can name the failing table by the same index.
+func buildImportStmts(tables []config.TableConfig) []string {
+	stmts := make([]string, len(tables))
+	for i, t := range tables {
+		stmts[i] = rowFrom(t).insertSQL()
+	}
+	return stmts
+}
+
+func printStmts(stmts []string) {
+	for _, s := range stmts {
+		fmt.Println(s)
+	}
+}
+
+// applyImport connects, ensures the config table, then runs the import INSERTs
+// (or prints the dry-run summary). tables and stmts must stay index-aligned so a
+// failure names the right table.
+func applyImport(ctx context.Context, dsn string, tables []config.TableConfig, stmts []string, dryRun bool) error {
+	conn, err := openConn(ctx, dsn)
 	if err != nil {
 		return err
 	}
@@ -673,13 +742,13 @@ EXAMPLES:
 	if err := EnsureTable(ctx, conn); err != nil {
 		return err
 	}
-	if *dryRun {
+	if dryRun {
 		fmt.Printf("dry-run OK: would import %d table(s)\n", len(stmts))
 		return nil
 	}
 	for i, s := range stmts {
 		if _, err := conn.Exec(ctx, s); err != nil {
-			return fmt.Errorf("import %s: %w", cfg.Archiver.Tables[i].SourceTable, err)
+			return fmt.Errorf("import %s: %w", tables[i].SourceTable, err)
 		}
 	}
 	fmt.Printf("imported %d table(s) into coldfront.partition_config\n", len(stmts))
@@ -725,11 +794,21 @@ EXAMPLES:
 		return err
 	}
 	if *format == "sql" {
-		for _, t := range tables {
-			fmt.Println(rowFrom(t).insertSQL())
-		}
-		return nil
+		return exportSQL(tables)
 	}
+	return exportYAML(tables)
+}
+
+// exportSQL prints one INSERT statement per table.
+func exportSQL(tables []config.TableConfig) error {
+	for _, t := range tables {
+		fmt.Println(rowFrom(t).insertSQL())
+	}
+	return nil
+}
+
+// exportYAML marshals the tables under an archiver: key and prints the document.
+func exportYAML(tables []config.TableConfig) error {
 	doc := struct {
 		Archiver config.ArchiverConfig `yaml:"archiver"`
 	}{Archiver: config.ArchiverConfig{Tables: tables}}

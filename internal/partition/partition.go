@@ -310,27 +310,9 @@ func (m *Manager) detachOnPeers(ctx context.Context, qParent, qPart string) erro
 	if !hasSpock {
 		return nil // vanilla single node — no peers, nothing to fan out
 	}
-	rows, err := m.db.Query(ctx, `
-		SELECT nd.node_name, ni.if_dsn
-		  FROM spock.node nd
-		  JOIN spock.node_interface ni ON ni.if_nodeid = nd.node_id
-		 WHERE nd.node_id <> (SELECT node_id FROM spock.local_node)`)
+	peers, err := enumerateSpockPeers(ctx, m.db)
 	if err != nil {
-		return fmt.Errorf("enumerate spock peers: %w", err)
-	}
-	type peer struct{ name, dsn string }
-	var peers []peer
-	for rows.Next() {
-		var p peer
-		if err := rows.Scan(&p.name, &p.dsn); err != nil {
-			rows.Close()
-			return fmt.Errorf("scan spock peer: %w", err)
-		}
-		peers = append(peers, p)
-	}
-	rows.Close()
-	if err := rows.Err(); err != nil {
-		return fmt.Errorf("enumerate spock peers: %w", err)
+		return err
 	}
 	for _, p := range peers {
 		// Reference the peer by node name, never the DSN (it may carry a secret).
@@ -339,6 +321,37 @@ func (m *Manager) detachOnPeers(ctx context.Context, qParent, qPart string) erro
 		}
 	}
 	return nil
+}
+
+// peer is one OTHER Spock node: its node name (safe to log) and its interface
+// DSN (may carry a secret — never log it).
+type peer struct{ name, dsn string }
+
+// enumerateSpockPeers returns every Spock node other than the local one. It
+// owns the result-set lifecycle, closing rows before returning.
+func enumerateSpockPeers(ctx context.Context, db DBTX) ([]peer, error) {
+	rows, err := db.Query(ctx, `
+		SELECT nd.node_name, ni.if_dsn
+		  FROM spock.node nd
+		  JOIN spock.node_interface ni ON ni.if_nodeid = nd.node_id
+		 WHERE nd.node_id <> (SELECT node_id FROM spock.local_node)`)
+	if err != nil {
+		return nil, fmt.Errorf("enumerate spock peers: %w", err)
+	}
+	var peers []peer
+	for rows.Next() {
+		var p peer
+		if err := rows.Scan(&p.name, &p.dsn); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan spock peer: %w", err)
+		}
+		peers = append(peers, p)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("enumerate spock peers: %w", err)
+	}
+	return peers, nil
 }
 
 // detachOnPeer opens a fresh autocommit connection to one peer and runs the
