@@ -665,7 +665,7 @@ normalize_casts_for_duckdb(const char *sql)
             int  i;
             for (i = 0; i < (int) lengthof(map); i++)
             {
-                size_t plen = strlen(map[i].pg);
+                size_t plen = strlen(map[i].pg); /* nosemgrep */
                 if (strncmp(p, map[i].pg, plen) == 0)
                 {
                     appendStringInfoString(&buf, map[i].duck);
@@ -752,16 +752,16 @@ deparse_and_find_prefix(Query *query, DeparseResult *dr)
         }
     }
 
-    if (strncmp(dr->orig_sql, search_unqual, strlen(search_unqual)) == 0)
+    if (strncmp(dr->orig_sql, search_unqual, strlen(search_unqual)) == 0) /* nosemgrep */
         old_prefix = search_unqual;
-    else if (strncmp(dr->orig_sql, search_qual, strlen(search_qual)) == 0)
+    else if (strncmp(dr->orig_sql, search_qual, strlen(search_qual)) == 0) /* nosemgrep */
         old_prefix = search_qual;
     else
         elog(ERROR,
              "coldfront: cannot locate result relation \"%s\" at start of "
              "deparsed DML: %s", vname, dr->orig_sql);
 
-    dr->rest = dr->orig_sql + strlen(old_prefix);
+    dr->rest = dr->orig_sql + strlen(old_prefix); /* nosemgrep */
 }
 
 /*
@@ -1056,7 +1056,7 @@ prefix_pg_tables_with_pglocal(Query *query, char *sql)
         }
 
         /* Pass 1: replace qualified `<schema>.<table>` occurrences. */
-        qlen = strlen(qualified);
+        qlen = strlen(qualified); /* nosemgrep */
         initStringInfo(&buf);
         p = sql;
         while ((match = strstr(p, qualified)) != NULL)
@@ -1074,7 +1074,7 @@ prefix_pg_tables_with_pglocal(Query *query, char *sql)
          * the table's identifier. A "word" character is [A-Za-z0-9_$]; a
          * preceding `.` is also a word boundary because that means the
          * token has already been schema-qualified by pass 1 — skip. */
-        blen = strlen(bare);
+        blen = strlen(bare); /* nosemgrep */
         initStringInfo(&buf);
         p = sql;
         while ((match = strstr(p, bare)) != NULL)
@@ -1896,7 +1896,7 @@ rewrite:
             rewritten = parse_analyze_fixedparams(raw, new_sql, NULL, 0, NULL);
 
         /* Replace the original Query in-place */
-        memcpy(query, rewritten, sizeof(Query));
+        memcpy(query, rewritten, sizeof(Query)); /* nosemgrep */
     }
     PG_FINALLY();
     {

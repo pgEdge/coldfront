@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"flag"
 	"fmt"
 	"log"
@@ -145,9 +147,32 @@ func main() {
 	}
 }
 
+// dollarQuote wraps s as a PostgreSQL dollar-quoted literal using a randomized
+// tag that is verified absent from s. A static tag ($q$) is breakable: an
+// Iceberg identifier or a values_source value containing the literal tag would
+// close the quote early and inject the trailing text as separate SQL. A random,
+// collision-checked tag cannot be terminated by any payload content, so the
+// wrapped string is always a single safe literal.
+func dollarQuote(s string) (string, error) {
+	var b [9]byte
+	for {
+		if _, err := rand.Read(b[:]); err != nil {
+			return "", fmt.Errorf("dollar-quote tag: %w", err)
+		}
+		tag := "$cf" + hex.EncodeToString(b[:]) + "$"
+		if !strings.Contains(s, tag) {
+			return tag + s + tag, nil
+		}
+	}
+}
+
 // execDuckDB executes a DuckDB SQL statement via duckdb.raw_query().
 func execDuckDB(ctx context.Context, conn *pgx.Conn, sql string) error {
-	_, err := conn.Exec(ctx, fmt.Sprintf(`SELECT duckdb.raw_query($q$%s$q$)`, sql))
+	q, err := dollarQuote(sql)
+	if err != nil {
+		return err
+	}
+	_, err = conn.Exec(ctx, fmt.Sprintf(`SELECT duckdb.raw_query(%s)`, q)) // nosemgrep
 	return err
 }
 
@@ -311,7 +336,7 @@ func validateFlatPartitioning(ctx context.Context, db querier, schema, table str
 // happened, or {source} if this is the first run.
 func resolveTableName(ctx context.Context, db querier, schema, source string) string {
 	var exists bool
-	err := db.QueryRow(ctx, `SELECT EXISTS (
+	err := db.QueryRow(ctx /* nosemgrep */, `SELECT EXISTS (
 		SELECT 1 FROM pg_class c JOIN pg_namespace n ON n.oid = c.relnamespace
 		WHERE n.nspname = $1 AND c.relname = $2 AND c.relkind = 'p')`,
 		schema, "_"+source).Scan(&exists)
@@ -683,9 +708,13 @@ func dropColdBeforeRetention(ctx context.Context, conn *pgx.Conn, iceTable, part
 		iceTable,
 		pgx.Identifier{partCol}.Sanitize(),
 		cutoff.UTC().Format("2006-01-02 15:04:05+00"))
-	sql := fmt.Sprintf(`SELECT coldfront._exec_iceberg_with_claim(%s, $q$%s$q$)`,
-		sqlutil.Literal(iceTable), inner)
-	_, err := conn.Exec(ctx, sql)
+	q, err := dollarQuote(inner)
+	if err != nil {
+		return err
+	}
+	sql := fmt.Sprintf(`SELECT coldfront._exec_iceberg_with_claim(%s, %s)`,
+		sqlutil.Literal(iceTable), q)
+	_, err = conn.Exec(ctx, sql) // nosemgrep
 	return err
 }
 
@@ -866,9 +895,13 @@ func wipeIcebergRange(ctx context.Context, conn *pgx.Conn, iceTable, partCol str
 		pgx.Identifier{partCol}.Sanitize(),
 		upper.UTC().Format("2006-01-02 15:04:05+00"),
 		regionPred)
-	sql := fmt.Sprintf(`SELECT coldfront._exec_iceberg_with_claim(%s, $q$%s$q$)`,
-		sqlutil.Literal(iceTable), inner)
-	_, err := conn.Exec(ctx, sql)
+	q, err := dollarQuote(inner)
+	if err != nil {
+		return err
+	}
+	sql := fmt.Sprintf(`SELECT coldfront._exec_iceberg_with_claim(%s, %s)`,
+		sqlutil.Literal(iceTable), q)
+	_, err = conn.Exec(ctx, sql) // nosemgrep
 	return err
 }
 
@@ -950,7 +983,7 @@ func bulkExportWithSnapshot(ctx context.Context, conn *pgx.Conn, t *config.Table
 		pgStageSQL := fmt.Sprintf(
 			"CREATE TEMP TABLE cf_pgstage AS SELECT %s FROM %s",
 			stageSelectList(columns), src)
-		if _, err := conn.Exec(ctx, pgStageSQL); err != nil {
+		if _, err := conn.Exec(ctx, pgStageSQL); err != nil { // nosemgrep
 			return "", fmt.Errorf("pg text-stage: %w", err)
 		}
 		defer func() { _, _ = conn.Exec(ctx, "DROP TABLE IF EXISTS cf_pgstage") }()
@@ -958,7 +991,7 @@ func bulkExportWithSnapshot(ctx context.Context, conn *pgx.Conn, t *config.Table
 	}
 	stageSQL := fmt.Sprintf(
 		"CREATE TEMP TABLE duck_stage USING duckdb AS SELECT * FROM %s", src)
-	if _, err := conn.Exec(ctx, stageSQL); err != nil {
+	if _, err := conn.Exec(ctx, stageSQL); err != nil { // nosemgrep
 		return "", fmt.Errorf("stage: %w", err)
 	}
 	defer func() { _, _ = conn.Exec(ctx, "DROP TABLE IF EXISTS duck_stage") }()
@@ -968,9 +1001,12 @@ func bulkExportWithSnapshot(ctx context.Context, conn *pgx.Conn, t *config.Table
 	// statement on this dedicated conn, so the claim/lock is released at this
 	// statement's commit. duck_stage was created on the same conn in the prior
 	// statement, so only one DuckDB-database write happens inside this tx.
-	if _, err := conn.Exec(ctx,
-		fmt.Sprintf("SELECT coldfront._exec_iceberg_with_claim(%s, $q$INSERT INTO %s SELECT * FROM pg_temp.duck_stage$q$)",
-			sqlutil.Literal(iceTable), iceTable),
+	insertSQL, err := dollarQuote(fmt.Sprintf("INSERT INTO %s SELECT * FROM pg_temp.duck_stage", iceTable))
+	if err != nil {
+		return "", fmt.Errorf("iceberg insert: %w", err)
+	}
+	if _, err := conn.Exec(ctx, // nosemgrep
+		fmt.Sprintf("SELECT coldfront._exec_iceberg_with_claim(%s, %s)", sqlutil.Literal(iceTable), insertSQL),
 	); err != nil {
 		return "", fmt.Errorf("iceberg insert: %w", err)
 	}

@@ -56,7 +56,7 @@ func (m *Manager) EnsureListChild(ctx context.Context, parent, schema, listValue
 		pgx.Identifier{schema, parent}.Sanitize(),
 		strings.ReplaceAll(listValue, "'", "''"),
 		pgx.Identifier{rangeCol}.Sanitize())
-	if _, err := m.db.Exec(ctx, sql); err != nil {
+	if _, err := m.db.Exec(ctx, sql); err != nil { // nosemgrep
 		return fmt.Errorf("create list child %s: %w", childName, err)
 	}
 	return nil

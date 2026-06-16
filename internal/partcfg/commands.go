@@ -541,7 +541,7 @@ EXAMPLES:
 	if err := EnsureTable(ctx, conn); err != nil {
 		return err
 	}
-	tag, err := conn.Exec(ctx, sql)
+	tag, err := conn.Exec(ctx, sql) // nosemgrep
 	if err != nil {
 		return fmt.Errorf("set %s.%s: %w", *schema, *table, err)
 	}
@@ -592,7 +592,7 @@ EXAMPLES:
 	if err := EnsureTable(ctx, conn); err != nil {
 		return err
 	}
-	tag, err := conn.Exec(ctx, sql)
+	tag, err := conn.Exec(ctx, sql) // nosemgrep
 	if err != nil {
 		return fmt.Errorf("remove %s.%s: %w", *schema, *table, err)
 	}

@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 
 	"github.com/jackc/pgx/v5"
@@ -458,4 +459,30 @@ func TestNeedsPGTextStage(t *testing.T) {
 		{Name: "d", Type: "DOUBLE", ViewCastType: "double precision"},
 	}))
 	assert.False(t, needsPGTextStage(nil))
+}
+
+// TestDollarQuote proves the dollar-quote wrapper cannot be broken out of by any
+// payload content: the chosen tag is always verified absent from the inner SQL,
+// so a payload carrying a static-style tag ("$q$") or even a "$cf…$" lookalike
+// can never terminate the quote early. This is the fix for the config-gated
+// breakout where an Iceberg identifier or values_source value containing the
+// static "$q$" tag would close the quote and inject trailing SQL.
+func TestDollarQuote(t *testing.T) {
+	cases := []string{
+		"",
+		`INSERT INTO "ice"."ns"."events" SELECT * FROM pg_temp.duck_stage`,
+		`DELETE FROM x WHERE c < '2026-01-01'::timestamptz`,
+		`evil$q$); DROP TABLE bar; --`,            // classic static-tag breakout attempt
+		`a $cf$ b $cfdeadbeef$ c`,                 // payload mimicking our tag prefix
+		strings.Repeat("$cf0000000000000000$", 4), // payload full of cf-style tags
+	}
+	for _, s := range cases {
+		q, err := dollarQuote(s)
+		require.NoError(t, err)
+		require.GreaterOrEqual(t, len(q), 2)
+		tag := q[:strings.IndexByte(q[1:], '$')+2] // opening tag: start .. second '$'
+		assert.Equal(t, tag+s+tag, q, "must be tag+payload+tag")
+		assert.False(t, strings.Contains(s, tag), "tag must be absent from the payload (unbreakable)")
+		assert.True(t, strings.HasPrefix(tag, "$cf") && strings.HasSuffix(tag, "$"), "tag shape $cf…$")
+	}
 }
