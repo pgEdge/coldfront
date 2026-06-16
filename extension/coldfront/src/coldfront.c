@@ -1752,204 +1752,104 @@ reject_cold_returning(Query *query, const char *vname)
                          "does not support RETURNING on writes. Re-run without RETURNING.")));
 }
 
-/* ---------- hook -------------------------------------------------------- */
-
-static void
-coldfront_post_parse_analyze(ParseState *pstate, Query *query,
-                              JumbleState *jstate)
+/*
+ * Build the rewritten SQL for a tiered-view INSERT (bulk split-by-watermark).
+ * Tiered without a watermark yet (no archive run): everything is hot; emit a
+ * plain hot INSERT. With a watermark, some rows go cold (cannot RETURN them).
+ */
+static char *
+cf_emit_tiered_insert_path(Query *query, TieredViewInfo *info, ColdParamSet *ps,
+                           bool in_plpgsql, const char *vname)
 {
-    TieredViewInfo  info;
-    TierClass       tier;
-    char           *new_sql;
-    List           *parsetree_list;
-    RawStmt        *raw;
-    Query          *rewritten;
-    RangeTblEntry  *rte;
-    ColdParamSet    ps;
-    bool            in_plpgsql;
+    if (!info->has_cutoff)
+        return emit_hot(query, info);
 
-    /* Chain to any previous hook first */
-    if (prev_post_parse_analyze_hook)
-        prev_post_parse_analyze_hook(pstate, query, jstate);
+    /* A watermark-split INSERT sends some rows to the cold tier,
+     * which cannot return them — refuse RETURNING rather than drop it. */
+    reject_cold_returning(query, vname);
+    ensure_ice_attached_once();
+    /* The fast cold path streams source rows via pglocal —
+     * needs the postgres ATTACH. The plpgsql cold-loop fast
+     * path doesn't, but the call is cheap when not needed
+     * (and a no-op if coldfront.local_pg_dsn is unset). */
+    if (query_has_pg_source_table(query))
+        ensure_pg_attached_via_spi();
+    /* Mixed-tier writes inside one PG tx (PG INSERT into _events
+     * plus DuckDB raw_query for ice) need pg_duckdb's mixed-
+     * write guard relaxed. */
+    (void) set_config_option("duckdb.unsafe_allow_mixed_transactions",
+                             "on",
+                             PGC_USERSET, PGC_S_SESSION,
+                             GUC_ACTION_LOCAL, true, 0, false);
+    return emit_tiered_insert(query, info, ps, in_plpgsql);
+}
 
-    /* Re-entrancy guard */
-    if (coldfront_in_rewrite)
-        return;
+/* Build the rewritten SQL for a cold-tier UPDATE/DELETE/INSERT (TIER_COLD). */
+static char *
+cf_emit_cold_path(Query *query, TieredViewInfo *info, ColdParamSet *ps,
+                  bool in_plpgsql, const char *vname)
+{
+    reject_cold_returning(query, vname);
+    ensure_ice_attached_once();
+    /* INSERT … SELECT FROM pg_source needs pglocal. Walk the
+     * rtable; if any non-result RTE_RELATION is present, the
+     * deparsed SELECT will reference it and DuckDB will need
+     * pglocal to resolve it. We skip the ATTACH call entirely
+     * for VALUES inserts and for INSERT … SELECT from
+     * generate_series / read_parquet / etc., because those
+     * work in pure DuckDB context and the ATTACH itself
+     * triggers a libpq-linkage error on some pg_duckdb builds
+     * (the pglocal-loopback / postgres-extension recursion noted
+     * on coldfront.ensure_pg_attached). */
+    if (query->commandType == CMD_INSERT &&
+        query_has_pg_source_table(query))
+        ensure_pg_attached_via_spi();
+    return emit_cold(query, info, ps, in_plpgsql);
+}
 
-    /*
-     * The hook is registered cluster-wide via shared_preload_libraries, so it
-     * also fires in databases/sessions where CREATE EXTENSION coldfront was
-     * never run — including mid-bootstrap while ANOTHER extension is being
-     * created. Notably CREATE EXTENSION spock (>= 5.0.8) reads
-     * spock.channel_table_stats during its own setup; our lazy tiered-view
-     * lookup below would then SPI-query a non-existent coldfront.tiered_views
-     * and abort that unrelated statement ("relation coldfront.tiered_views does
-     * not exist"). With no coldfront registry there is nothing tiered to
-     * rewrite, so do nothing — the same guard the DDL hook already applies.
-     */
-    if (!coldfront_registry_present())
-        return;
+/* Build the rewritten SQL for a dual-tier UPDATE/DELETE (TIER_AMBIGUOUS, only
+ * when coldfront.allow_mixed_writes is on). */
+static char *
+cf_emit_dual_path(Query *query, TieredViewInfo *info, ColdParamSet *ps,
+                  bool in_plpgsql, const char *vname)
+{
+    if (!coldfront_allow_mixed_writes)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("UPDATE/DELETE on tiered view \"%s\" must include "
+                        "a WHERE condition on \"%s\" that targets one tier",
+                        vname, info->partition_col),
+                 errhint("Use \"%s >= <value>\" for hot-tier writes, "
+                         "\"%s < <value>\" for cold-tier writes, or set "
+                         "coldfront.allow_mixed_writes = on to permit a "
+                         "non-atomic dual-tier rewrite.",
+                         info->partition_col, info->partition_col)));
 
-    /* Intercept INSERT, UPDATE and DELETE on registered tiered views.
-     * INSERT only goes through the bulk-rewrite path for iceberg-only
-     * views — tiered views still use their per-row INSTEAD OF trigger
-     * because INSERT has no WHERE clause to classify by tier. */
-    if (query->commandType != CMD_UPDATE &&
-        query->commandType != CMD_DELETE &&
-        query->commandType != CMD_INSERT)
-    {
-        /* Read path: lazily attach 'ice' on the first SELECT in this session
-         * that touches a registered tiered view, so the view body's
-         * iceberg_scan('ice...') resolves — the version-agnostic cold-read
-         * attach (PG 16/17/18).  Guarded
-         * once-per-session; the relkind check inside query_reads_tiered_view
-         * keeps plain queries off the SPI path. */
-        if (query->commandType == CMD_SELECT &&
-            !coldfront_ice_attached &&
-            query_reads_tiered_view(query))
-            ensure_ice_attached_once();
-        return;
-    }
+    /* A dual-tier rewrite returns only hot rows; refuse RETURNING rather
+     * than silently return a partial result set. */
+    reject_cold_returning(query, vname);
 
-    if (query->resultRelation == 0)
-        return;
+    /* Permissive: clear pg_duckdb's mixed-write guard for this
+     * transaction (GUC_ACTION_LOCAL resets it at tx end) and emit
+     * a dual-tier CTE. */
+    (void) set_config_option("duckdb.unsafe_allow_mixed_transactions",
+                             "on",
+                             PGC_USERSET, PGC_S_SESSION,
+                             GUC_ACTION_LOCAL, true, 0, false);
+    ensure_ice_attached_once();
+    return emit_dual(query, info, ps, in_plpgsql);
+}
 
-    rte = (RangeTblEntry *) list_nth(query->rtable, query->resultRelation - 1);
-    if (rte->rtekind != RTE_RELATION)
-        return;
-    if (get_rel_relkind(rte->relid) != RELKIND_VIEW)
-        return;
+/* Parse and analyze the rewritten SQL, guarded against re-entry, and replace
+ * the original Query in place. The bound-param types declared so the rewritten
+ * SQL's live $N re-bind at execution (unseen ids default to text). */
+static void
+cf_reparse_and_replace(Query *query, const char *new_sql, ColdParamSet *ps)
+{
+    List    *parsetree_list;
+    RawStmt *raw;
+    Query   *rewritten;
 
-    /* Check the catalog — only rewrite registered tiered views */
-    {
-        const char *vname = get_rel_name(rte->relid);
-        if (!lookup_tiered_view(rte->relid, vname, &info))
-            return;
-
-        /* Bound params ($N) from a plpgsql / DO / PREPARE / extended-protocol
-         * caller, collected once (Cause 1). in_plpgsql gates the Cause-2
-         * statement shape — plpgsql installs p_post_columnref_hook on the
-         * ParseState; top-level (even parameterized) does not. See the
-         * architecture block at the top of this file and the
-         * coldfront._dummy_dml_target comment in coldfront--0.1.sql. */
-        collect_cold_params(query, &ps);
-        in_plpgsql = (pstate->p_post_columnref_hook != NULL);
-
-        /* The deparse-and-swap rewrite substitutes only the leading
-         * result-relation reference. A second reference to the SAME tiered view
-         * — a self-join (UPDATE … FROM v), DELETE … USING v, or a sub-select
-         * (… WHERE id IN (SELECT … FROM v)) — would be copied through verbatim
-         * and then fail confusingly (PG cannot scan the iceberg_scan view;
-         * DuckDB does not know it). Reject it cleanly here; a structural
-         * multi-reference rewrite is out of scope. (INSERT … SELECT routing is
-         * handled separately by emit_tiered_insert.) */
-        if ((query->commandType == CMD_UPDATE || query->commandType == CMD_DELETE) &&
-            count_tiered_view_refs(query, rte->relid) > 1)
-            ereport(ERROR,
-                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                     errmsg("UPDATE/DELETE on tiered view \"%s\" cannot reference it more than once",
-                            get_rel_name(rte->relid)),
-                     errhint("Self-joins, USING, and sub-selects over the same tiered view "
-                             "are not supported; reference it once.")));
-
-        /* Tiered-view INSERT: bulk split-by-watermark via emit_tiered_insert.
-         * Iceberg-only INSERT falls through to the unconditional cold path
-         * (classify_tier short-circuits to TIER_COLD for iceberg-only).
-         * Tiered without a watermark yet (no archive run): everything is
-         * hot; emit a plain hot INSERT. */
-        if (query->commandType == CMD_INSERT && !info.is_iceberg_only)
-        {
-            if (!info.has_cutoff)
-            {
-                new_sql = emit_hot(query, &info);
-            }
-            else
-            {
-                /* A watermark-split INSERT sends some rows to the cold tier,
-                 * which cannot return them — refuse RETURNING rather than drop it. */
-                reject_cold_returning(query, vname);
-                ensure_ice_attached_once();
-                /* The fast cold path streams source rows via pglocal —
-                 * needs the postgres ATTACH. The plpgsql cold-loop fast
-                 * path doesn't, but the call is cheap when not needed
-                 * (and a no-op if coldfront.local_pg_dsn is unset). */
-                if (query_has_pg_source_table(query))
-                    ensure_pg_attached_via_spi();
-                /* Mixed-tier writes inside one PG tx (PG INSERT into _events
-                 * plus DuckDB raw_query for ice) need pg_duckdb's mixed-
-                 * write guard relaxed. */
-                (void) set_config_option("duckdb.unsafe_allow_mixed_transactions",
-                                         "on",
-                                         PGC_USERSET, PGC_S_SESSION,
-                                         GUC_ACTION_LOCAL, true, 0, false);
-                new_sql = emit_tiered_insert(query, &info, &ps, in_plpgsql);
-            }
-            goto rewrite;
-        }
-
-        tier = classify_tier(query, &info);
-
-        switch (tier)
-        {
-        case TIER_HOT:
-            new_sql = emit_hot(query, &info);
-            break;
-
-        case TIER_COLD:
-            reject_cold_returning(query, vname);
-            ensure_ice_attached_once();
-            /* INSERT … SELECT FROM pg_source needs pglocal. Walk the
-             * rtable; if any non-result RTE_RELATION is present, the
-             * deparsed SELECT will reference it and DuckDB will need
-             * pglocal to resolve it. We skip the ATTACH call entirely
-             * for VALUES inserts and for INSERT … SELECT from
-             * generate_series / read_parquet / etc., because those
-             * work in pure DuckDB context and the ATTACH itself
-             * triggers a libpq-linkage error on some pg_duckdb builds
-             * (the pglocal-loopback / postgres-extension recursion noted
-             * on coldfront.ensure_pg_attached). */
-            if (query->commandType == CMD_INSERT &&
-                query_has_pg_source_table(query))
-                ensure_pg_attached_via_spi();
-            new_sql = emit_cold(query, &info, &ps, in_plpgsql);
-            break;
-
-        case TIER_AMBIGUOUS:
-            if (!coldfront_allow_mixed_writes)
-                ereport(ERROR,
-                        (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                         errmsg("UPDATE/DELETE on tiered view \"%s\" must include "
-                                "a WHERE condition on \"%s\" that targets one tier",
-                                vname, info.partition_col),
-                         errhint("Use \"%s >= <value>\" for hot-tier writes, "
-                                 "\"%s < <value>\" for cold-tier writes, or set "
-                                 "coldfront.allow_mixed_writes = on to permit a "
-                                 "non-atomic dual-tier rewrite.",
-                                 info.partition_col, info.partition_col)));
-
-            /* A dual-tier rewrite returns only hot rows; refuse RETURNING rather
-             * than silently return a partial result set. */
-            reject_cold_returning(query, vname);
-
-            /* Permissive: clear pg_duckdb's mixed-write guard for this
-             * transaction (GUC_ACTION_LOCAL resets it at tx end) and emit
-             * a dual-tier CTE. */
-            (void) set_config_option("duckdb.unsafe_allow_mixed_transactions",
-                                     "on",
-                                     PGC_USERSET, PGC_S_SESSION,
-                                     GUC_ACTION_LOCAL, true, 0, false);
-            ensure_ice_attached_once();
-            new_sql = emit_dual(query, &info, &ps, in_plpgsql);
-            break;
-
-        default:
-            /* unreachable */
-            return;
-        }
-    }
-
-rewrite:
-    /* Parse and analyze the rewritten SQL, guarded against re-entry */
     coldfront_in_rewrite = true;
     PG_TRY();
     {
@@ -1962,13 +1862,13 @@ rewrite:
         /* Declare the bound-param types so the rewritten SQL's live $N (Cause 1's
          * format() args, plus the native $N the hot/dual legs keep) re-bind at
          * execution; unseen ids in a sparse set default to text. */
-        if (ps.maxid > 0)
+        if (ps->maxid > 0)
         {
-            Oid *ptypes = (Oid *) palloc(sizeof(Oid) * ps.maxid);
+            Oid *ptypes = (Oid *) palloc(sizeof(Oid) * ps->maxid);
             int  i;
-            for (i = 0; i < ps.maxid; i++)
-                ptypes[i] = ps.seen[i] ? ps.types[i] : TEXTOID;
-            rewritten = parse_analyze_fixedparams(raw, new_sql, ptypes, ps.maxid, NULL);
+            for (i = 0; i < ps->maxid; i++)
+                ptypes[i] = ps->seen[i] ? ps->types[i] : TEXTOID;
+            rewritten = parse_analyze_fixedparams(raw, new_sql, ptypes, ps->maxid, NULL);
         }
         else
             rewritten = parse_analyze_fixedparams(raw, new_sql, NULL, 0, NULL);
@@ -1981,6 +1881,173 @@ rewrite:
         coldfront_in_rewrite = false;
     }
     PG_END_TRY();
+}
+
+/*
+ * Read path: lazily attach 'ice' on the first SELECT in this session that
+ * touches a registered tiered view, so the view body's iceberg_scan('ice...')
+ * resolves — the version-agnostic cold-read attach (PG 16/17/18). Guarded
+ * once-per-session; the relkind check inside query_reads_tiered_view keeps
+ * plain queries off the SPI path.
+ */
+static void
+cf_maybe_attach_for_read(Query *query)
+{
+    if (query->commandType == CMD_SELECT &&
+        !coldfront_ice_attached &&
+        query_reads_tiered_view(query))
+        ensure_ice_attached_once();
+}
+
+/*
+ * Resolve the DML target: decide whether `query` is an INSERT/UPDATE/DELETE on
+ * a registered tiered view that this hook should rewrite. On the read path
+ * (SELECT touching a tiered view) it lazily attaches 'ice' and returns false.
+ * Returns true with *rte and *info populated when a rewrite is warranted.
+ */
+static bool
+cf_resolve_tiered_dml_target(Query *query, RangeTblEntry **rte,
+                             TieredViewInfo *info)
+{
+    /* Intercept INSERT, UPDATE and DELETE on registered tiered views.
+     * INSERT only goes through the bulk-rewrite path for iceberg-only
+     * views — tiered views still use their per-row INSTEAD OF trigger
+     * because INSERT has no WHERE clause to classify by tier. */
+    if (query->commandType != CMD_UPDATE &&
+        query->commandType != CMD_DELETE &&
+        query->commandType != CMD_INSERT)
+    {
+        cf_maybe_attach_for_read(query);
+        return false;
+    }
+
+    if (query->resultRelation == 0)
+        return false;
+
+    *rte = (RangeTblEntry *) list_nth(query->rtable, query->resultRelation - 1);
+    if ((*rte)->rtekind != RTE_RELATION)
+        return false;
+    if (get_rel_relkind((*rte)->relid) != RELKIND_VIEW)
+        return false;
+
+    /* Check the catalog — only rewrite registered tiered views */
+    if (!lookup_tiered_view((*rte)->relid, get_rel_name((*rte)->relid), info))
+        return false;
+
+    return true;
+}
+
+/*
+ * Reject a multi-reference UPDATE/DELETE on a tiered view. The deparse-and-swap
+ * rewrite substitutes only the leading result-relation reference. A second
+ * reference to the SAME tiered view — a self-join (UPDATE … FROM v), DELETE …
+ * USING v, or a sub-select (… WHERE id IN (SELECT … FROM v)) — would be copied
+ * through verbatim and then fail confusingly (PG cannot scan the iceberg_scan
+ * view; DuckDB does not know it). Reject it cleanly here; a structural
+ * multi-reference rewrite is out of scope. (INSERT … SELECT routing is handled
+ * separately by emit_tiered_insert.)
+ */
+static void
+cf_reject_multi_reference(Query *query, RangeTblEntry *rte)
+{
+    if ((query->commandType == CMD_UPDATE || query->commandType == CMD_DELETE) &&
+        count_tiered_view_refs(query, rte->relid) > 1)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("UPDATE/DELETE on tiered view \"%s\" cannot reference it more than once",
+                        get_rel_name(rte->relid)),
+                 errhint("Self-joins, USING, and sub-selects over the same tiered view "
+                         "are not supported; reference it once.")));
+}
+
+/*
+ * Reject a multi-reference UPDATE/DELETE on a tiered view, then pick the emit
+ * path (tiered-INSERT split, hot, cold, or dual) and return the rewritten SQL.
+ * Returns NULL on the unreachable default tier (caller treats as a no-op).
+ */
+static char *
+cf_dispatch_emit(Query *query, RangeTblEntry *rte, TieredViewInfo *info,
+                 ColdParamSet *ps, bool in_plpgsql, const char *vname)
+{
+    TierClass tier;
+
+    cf_reject_multi_reference(query, rte);
+
+    /* Tiered-view INSERT: bulk split-by-watermark via emit_tiered_insert.
+     * Iceberg-only INSERT falls through to the unconditional cold path
+     * (classify_tier short-circuits to TIER_COLD for iceberg-only). */
+    if (query->commandType == CMD_INSERT && !info->is_iceberg_only)
+        return cf_emit_tiered_insert_path(query, info, ps, in_plpgsql, vname);
+
+    tier = classify_tier(query, info);
+
+    if (tier == TIER_HOT)
+        return emit_hot(query, info);
+    if (tier == TIER_COLD)
+        return cf_emit_cold_path(query, info, ps, in_plpgsql, vname);
+    if (tier == TIER_AMBIGUOUS)
+        return cf_emit_dual_path(query, info, ps, in_plpgsql, vname);
+    return NULL;        /* unreachable */
+}
+
+/* ---------- hook -------------------------------------------------------- */
+
+/*
+ * The coldfront post-parse-analyze hook: rewrite INSERT/UPDATE/DELETE on a
+ * registered tiered view to the hot/cold/dual emit path.
+ *
+ * The hook is registered cluster-wide via shared_preload_libraries, so it
+ * also fires in databases/sessions where CREATE EXTENSION coldfront was
+ * never run — including mid-bootstrap while ANOTHER extension is being
+ * created. Notably CREATE EXTENSION spock (>= 5.0.8) reads
+ * spock.channel_table_stats during its own setup; our lazy tiered-view
+ * lookup below would then SPI-query a non-existent coldfront.tiered_views
+ * and abort that unrelated statement ("relation coldfront.tiered_views does
+ * not exist"). With no coldfront registry there is nothing tiered to
+ * rewrite, so do nothing — the same guard the DDL hook already applies.
+ */
+static void
+coldfront_post_parse_analyze(ParseState *pstate, Query *query,
+                              JumbleState *jstate)
+{
+    TieredViewInfo  info;
+    char           *new_sql;
+    RangeTblEntry  *rte;
+    ColdParamSet    ps;
+    bool            in_plpgsql;
+    const char     *vname;
+
+    /* Chain to any previous hook first */
+    if (prev_post_parse_analyze_hook)
+        prev_post_parse_analyze_hook(pstate, query, jstate);
+
+    /* Re-entrancy guard */
+    if (coldfront_in_rewrite)
+        return;
+
+    if (!coldfront_registry_present())
+        return;
+
+    if (!cf_resolve_tiered_dml_target(query, &rte, &info))
+        return;
+
+    vname = get_rel_name(rte->relid);
+
+    /* Bound params ($N) from a plpgsql / DO / PREPARE / extended-protocol
+     * caller, collected once (Cause 1). in_plpgsql gates the Cause-2
+     * statement shape — plpgsql installs p_post_columnref_hook on the
+     * ParseState; top-level (even parameterized) does not. See the
+     * architecture block at the top of this file and the
+     * coldfront._dummy_dml_target comment in coldfront--0.1.sql. */
+    collect_cold_params(query, &ps);
+    in_plpgsql = (pstate->p_post_columnref_hook != NULL);
+
+    new_sql = cf_dispatch_emit(query, rte, &info, &ps, in_plpgsql, vname);
+    if (new_sql == NULL)
+        return;     /* unreachable default tier */
+
+    /* Parse and analyze the rewritten SQL, guarded against re-entry */
+    cf_reparse_and_replace(query, new_sql, &ps);
 }
 
 /* ---------- Bakery release deferral via XactCallback ------------------ */
@@ -2064,6 +2131,31 @@ coldfront_release_get_conn(void)
  * committed"). libpq runs over its own TCP/loopback session and doesn't
  * touch the calling backend's xact state.
  */
+/* cf_release_one_ticket runs one queued claim release over the libpq loopback:
+ * an idempotent DELETE-by-ticket; a failure is a WARNING (not ERROR — we are
+ * mid-finalize). Split out of coldfront_xact_callback to keep it readable. */
+static void
+cf_release_one_ticket(PGconn *conn, int64 ticket)
+{
+    char        query[160];
+    PGresult   *res;
+
+    snprintf(query, sizeof(query),
+             "DELETE FROM coldfront.claims WHERE ticket = %lld",
+             (long long) ticket);
+
+    res = PQexec(conn, query);
+    if (res == NULL ||
+        (PQresultStatus(res) != PGRES_COMMAND_OK &&
+         PQresultStatus(res) != PGRES_TUPLES_OK))
+        elog(WARNING,
+             "coldfront: release of ticket %lld via libpq failed: %s",
+             (long long) ticket,
+             res ? PQresultErrorMessage(res) : PQerrorMessage(conn));
+    if (res != NULL)
+        PQclear(res);
+}
+
 static void
 coldfront_xact_callback(XactEvent event, void *arg)
 {
@@ -2094,26 +2186,7 @@ coldfront_xact_callback(XactEvent event, void *arg)
     }
 
     foreach(lc, coldfront_pending_releases)
-    {
-        int64       ticket = *((int64 *) lfirst(lc));
-        char        query[160];
-        PGresult   *res;
-
-        snprintf(query, sizeof(query),
-                 "DELETE FROM coldfront.claims WHERE ticket = %lld",
-                 (long long) ticket);
-
-        res = PQexec(conn, query);
-        if (res == NULL ||
-            (PQresultStatus(res) != PGRES_COMMAND_OK &&
-             PQresultStatus(res) != PGRES_TUPLES_OK))
-            elog(WARNING,
-                 "coldfront: release of ticket %lld via libpq failed: %s",
-                 (long long) ticket,
-                 res ? PQresultErrorMessage(res) : PQerrorMessage(conn));
-        if (res != NULL)
-            PQclear(res);
-    }
+        cf_release_one_ticket(conn, *((int64 *) lfirst(lc)));
 
     list_free_deep(coldfront_pending_releases);
     coldfront_pending_releases = NIL;
@@ -2390,9 +2463,332 @@ mirror_and_rebuild(const TieredDDLInfo *info, const char *actions)
 }
 
 /*
+ * The eight ProcessUtility_hook arguments, bundled so the arm helpers below can
+ * both inspect the statement and pass the full argument set straight to the
+ * previous/standard utility processor without each carrying nine parameters.
+ */
+typedef struct {
+    PlannedStmt           *pstmt;
+    const char            *queryString;
+    bool                   readOnlyTree;
+    ProcessUtilityContext  context;
+    ParamListInfo          params;
+    QueryEnvironment      *queryEnv;
+    DestReceiver          *dest;
+    QueryCompletion       *qc;
+} CfUtilityCtx;
+
+/* Run the previous/standard ProcessUtility — the call-through every arm ends
+ * in. Centralizes the prev-hook-or-standard dispatch. */
+static void
+cf_call_through(const CfUtilityCtx *u)
+{
+    if (prev_process_utility_hook)
+        prev_process_utility_hook(u->pstmt, u->queryString, u->readOnlyTree,
+                                  u->context, u->params, u->queryEnv, u->dest, u->qc);
+    else
+        standard_ProcessUtility(u->pstmt, u->queryString, u->readOnlyTree,
+                                u->context, u->params, u->queryEnv, u->dest, u->qc);
+}
+
+/* ---- DROP TABLE / DROP VIEW: block if any object is tiered. ---- */
+static void
+cf_handle_drop(const CfUtilityCtx *u, DropStmt *ds)
+{
+    if (ds->removeType == OBJECT_TABLE || ds->removeType == OBJECT_VIEW)
+    {
+        ListCell *lc;
+        foreach(lc, ds->objects)
+        {
+            List     *names = (List *) lfirst(lc);
+            RangeVar *rv    = makeRangeVarFromNameList(names);
+            Oid       relid = RangeVarGetRelid(rv, NoLock, true);
+            if (relid_is_tiered(relid))
+            {
+                char *ns   = get_namespace_name(get_rel_namespace(relid));
+                char *name = get_rel_name(relid);
+                ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("coldfront: cannot DROP \"%s.%s\" — it has a cold tier in Iceberg",
+                            ns, name),
+                     errhint("Blocked by design: the Iceberg cold tier would be orphaned. "
+                             "Removing a tiered table is a deliberate operation — unregister "
+                             "it from coldfront.tiered_views and drop each tier explicitly.")));
+            }
+        }
+    }
+    cf_call_through(u);
+}
+
+/* ---- TRUNCATE: block if any relation is tiered. ---- */
+static void
+cf_handle_truncate(const CfUtilityCtx *u, TruncateStmt *ts)
+{
+    ListCell *lc;
+    foreach(lc, ts->relations)
+    {
+        RangeVar *rv    = (RangeVar *) lfirst(lc);
+        Oid       relid = RangeVarGetRelid(rv, NoLock, true);
+        if (relid_is_tiered(relid))
+        {
+            char *ns   = get_namespace_name(get_rel_namespace(relid));
+            char *name = get_rel_name(relid);
+            ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("coldfront: cannot TRUNCATE tiered table \"%s.%s\" — cold-tier rows would remain visible",
+                        ns, name),
+                 errhint("Blocked by design: cold-tier rows live in Iceberg and would remain "
+                         "visible through the view. Truncate each tier explicitly.")));
+        }
+    }
+    cf_call_through(u);
+}
+
+/* Collect the column-shape subcommands to mirror into *actions (the body of a
+ * jsonb_build_array(...) call); ignore the rest. Returns the count collected. */
+static int
+cf_collect_alter_actions(AlterTableStmt *at, StringInfoData *actions)
+{
+    ListCell *lc;
+    int       nacts = 0;
+
+    initStringInfo(actions);
+    foreach(lc, at->cmds)
+    {
+        AlterTableCmd *cmd = (AlterTableCmd *) lfirst(lc);
+        const char    *op  = NULL;
+        const char    *col = NULL;
+
+        if (cmd->subtype == AT_AddColumn)
+        {
+            op  = "add";
+            col = castNode(ColumnDef, cmd->def)->colname;
+        }
+        else if (cmd->subtype == AT_DropColumn)
+        {
+            op  = "drop";
+            col = cmd->name;
+        }
+        else if (cmd->subtype == AT_AlterColumnType)
+        {
+            op  = "type";
+            col = cmd->name;
+        }
+        if (op == NULL)
+            continue;
+
+        appendStringInfo(actions, "%sjsonb_build_object('op', %s, 'col', %s)",
+                         nacts > 0 ? ", " : "",
+                         quote_literal_cstr(op), quote_literal_cstr(col));
+        nacts++;
+    }
+    return nacts;
+}
+
+/* ---- ALTER TABLE: MIRROR column-shape changes onto the cold tier. ----
+ *
+ * duckdb-iceberg (v1.5) implements Iceberg ALTER TABLE, so ADD/DROP COLUMN
+ * and ALTER COLUMN TYPE evolve both tiers in one statement: PG runs the
+ * hot-side ALTER, then coldfront._mirror_iceberg_alter issues the matching
+ * Iceberg DDL (one bakery-serialized, claim-first catalog CAS) and the view
+ * is rebuilt to the new column set. Every OTHER ALTER subtype — DETACH/ATTACH
+ * PARTITION (the archiver's own cutover machinery), storage params, SET
+ * STATISTICS, constraint / NOT NULL toggles — is PG-side only and passes
+ * straight through untouched. */
+static void
+cf_handle_alter_table(const CfUtilityCtx *u, AlterTableStmt *at)
+{
+    Oid             relid = RangeVarGetRelid(at->relation, NoLock, true);
+    TieredDDLInfo   info;
+    StringInfoData  actions;
+    int             nacts;
+
+    if (!lookup_tiered_by_hot_oid(relid, &info))
+    {
+        cf_call_through(u);
+        return;
+    }
+
+    nacts = cf_collect_alter_actions(at, &actions);
+
+    if (nacts == 0)
+    {
+        /* No column-shape change → partition management / storage params /
+         * the archiver's DETACH. Not coldfront's business. */
+        pfree(actions.data);
+        cf_call_through(u);
+        return;
+    }
+
+    /* The transparent view projects the hot columns, so PG blocks a hot-side
+     * DROP COLUMN / ALTER COLUMN TYPE of a projected column ("used by a
+     * view"). Drop the view first, run the hot ALTER, then mirror the change
+     * onto Iceberg and rebuild the view. One transaction: an unsupported
+     * column type (or any failure) raises inside the mirror and rolls the
+     * whole statement — view drop and hot change included — back atomically. */
+    drop_tiered_view(info.view_schema, info.view_relname);
+    cf_call_through(u);
+    mirror_and_rebuild(&info, actions.data);
+    pfree(actions.data);
+}
+
+/*
+ * Resolve a RENAME against the registry. Sets *info (fully via the hot table,
+ * or just view_schema/view_relname via the view), *via_hot, *hot_relid and
+ * *view_relid. Returns true when the rename targets a tiered relation.
+ */
+static bool
+cf_match_rename_target(RenameStmt *rs, TieredDDLInfo *info, bool *via_hot,
+                       Oid *hot_relid, Oid *view_relid)
+{
+    bool matched = false;
+
+    *via_hot    = false;
+    *hot_relid  = InvalidOid;
+    *view_relid = InvalidOid;
+
+    if (rs->renameType == OBJECT_TABLE || rs->renameType == OBJECT_COLUMN)
+    {
+        *hot_relid = RangeVarGetRelid(rs->relation, NoLock, true);
+        if (lookup_tiered_by_hot_oid(*hot_relid, info))
+            matched = *via_hot = true;
+    }
+    if (!matched && (rs->renameType == OBJECT_VIEW ||
+                     rs->renameType == OBJECT_COLUMN))
+    {
+        /* Rename targeting the view itself (column rename on a view, or
+         * view rename). The registry is keyed by the view's (schema,
+         * relname), resolved from the view relid directly — no SPI. */
+        *view_relid = RangeVarGetRelid(rs->relation, NoLock, true);
+        if (relid_is_tiered(*view_relid))
+        {
+            MemoryContext oldcxt = MemoryContextSwitchTo(CurTransactionContext);
+            info->view_schema  = get_namespace_name(get_rel_namespace(*view_relid));
+            info->view_relname = get_rel_name(*view_relid);
+            MemoryContextSwitchTo(oldcxt);
+            matched = true;
+        }
+    }
+    return matched;
+}
+
+/* RENAME COLUMN on the HOT table is mirrored onto the Iceberg column so cold
+ * reads keep resolving it by name. A column rename targeting the generated VIEW
+ * is meaningless (the rebuild owns the view's column names) and is rejected. */
+static void
+cf_handle_rename_column(const CfUtilityCtx *u, RenameStmt *rs,
+                        TieredDDLInfo *info, bool via_hot, Oid view_relid)
+{
+    StringInfoData acts;
+
+    if (!via_hot)
+    {
+        char *ns   = get_namespace_name(get_rel_namespace(view_relid));
+        char *name = get_rel_name(view_relid);
+        ereport(ERROR,
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+             errmsg("coldfront: cannot rename a column of the generated view \"%s.%s\"",
+                    ns, name),
+             errhint("Rename the column on the hot table instead; coldfront mirrors "
+                     "that onto the Iceberg cold tier and rebuilds the view.")));
+    }
+
+    cf_call_through(u);   /* PG renames the hot column */
+    initStringInfo(&acts);
+    appendStringInfo(&acts,
+        "jsonb_build_object('op', 'rename', 'col', %s, 'newcol', %s)",
+        quote_literal_cstr(rs->subname), quote_literal_cstr(rs->newname));
+    mirror_and_rebuild(info, acts.data);
+    pfree(acts.data);
+}
+
+/*
+ * RENAME of the hot heap or the transparent view. Touches only the PG side
+ * (registry + view), never the Iceberg schema. Captures old_view_name BEFORE
+ * the call-through so the name-keyed watermark row can be migrated.
+ */
+static void
+cf_handle_rename_relation(const CfUtilityCtx *u, RenameStmt *rs,
+                          TieredDDLInfo *info, Oid hot_relid, Oid view_relid)
+{
+    char *old_view_name = NULL;   /* captured pre-rename for OBJECT_VIEW */
+
+    /* For a VIEW rename, capture the OLD view name NOW (before the rename
+     * executes) so we can migrate the name-keyed archive_watermark row. */
+    if (rs->renameType == OBJECT_VIEW && OidIsValid(view_relid))
+        old_view_name = pstrdup(get_rel_name(view_relid));
+
+    cf_call_through(u);
+
+    coldfront_in_utility = true;
+    PG_TRY();
+    {
+        if (rs->renameType == OBJECT_TABLE && OidIsValid(hot_relid))
+        {
+            /* Hot heap renamed: the view's name is unchanged, so the
+             * registry key is stable — update hot_table, then rebuild. */
+            char *new_hot = quoted_qualified_name(hot_relid);
+            update_hot_table(info->view_schema, info->view_relname, new_hot);
+            rebuild_tiered_view(info->view_schema, info->view_relname);
+        }
+        else
+        {
+            /* View renamed: migrate the name-keyed registry + watermark rows
+             * (old→new) FIRST so the rebuild — and the regenerated INSERT
+             * trigger — resolve the row by the new name; without this the
+             * rebuilt view would silently lose its cold UNION branch. Then
+             * rebuild under the new name. */
+            if (old_view_name != NULL &&
+                strcmp(old_view_name, rs->newname) != 0)
+                rename_tiered_view(info->view_schema, old_view_name, rs->newname);
+            rebuild_tiered_view(info->view_schema, rs->newname);
+        }
+    }
+    PG_FINALLY();
+    {
+        coldfront_in_utility = false;
+    }
+    PG_END_TRY();
+}
+
+/* ---- RENAME: hot table, view, or column on a tiered relation. ---- */
+static void
+cf_handle_rename(const CfUtilityCtx *u, RenameStmt *rs)
+{
+    TieredDDLInfo info;
+    bool          via_hot;
+    Oid           hot_relid;
+    Oid           view_relid;
+
+    if (!cf_match_rename_target(rs, &info, &via_hot, &hot_relid, &view_relid))
+    {
+        cf_call_through(u);
+        return;
+    }
+
+    if (rs->renameType == OBJECT_COLUMN)
+        cf_handle_rename_column(u, rs, &info, via_hot, view_relid);
+    else
+        cf_handle_rename_relation(u, rs, &info, hot_relid, view_relid);
+}
+
+/*
  * The coldfront ProcessUtility_hook. Intercepts DDL on registered tiered
  * relations: blocks DROP/TRUNCATE, mirrors schema/rename DDL to Iceberg, and
  * rebuilds the transparent view. Everything else passes straight through.
+ *
+ * Spock apply worker: the DDL the hook ACTS on for a tiered table is
+ * DROP/TRUNCATE (blocked — never replicated, they error on the originator),
+ * column DDL (ADD/DROP/ALTER-TYPE/RENAME COLUMN — mirrored to Iceberg), and
+ * RENAME TABLE/VIEW. A replicated statement re-runs in the peer's apply
+ * worker; the hook then does the peer's LOCAL registry update + view
+ * rebuild, which is exactly right because the registry/view are per-node
+ * (not Spock-replicated). The Iceberg cold tier, by contrast, is SHARED
+ * (one Lakekeeper), so its column DDL must run exactly once: the mirror
+ * (coldfront._mirror_iceberg_alter) self-skips when
+ * session_replication_role = replica, leaving the apply worker to rebuild
+ * its local view only. The SPI-issued mirror/rebuild DDL runs at
+ * non-top-level context, which Spock filters out, so it never re-replicates.
  */
 static void
 coldfront_process_utility(PlannedStmt *pstmt, const char *queryString,
@@ -2400,38 +2796,15 @@ coldfront_process_utility(PlannedStmt *pstmt, const char *queryString,
                           ParamListInfo params, QueryEnvironment *queryEnv,
                           DestReceiver *dest, QueryCompletion *qc)
 {
-    Node *stmt = pstmt->utilityStmt;
-
-#define COLDFRONT_CALL_THROUGH() \
-    do { \
-        if (prev_process_utility_hook) \
-            prev_process_utility_hook(pstmt, queryString, readOnlyTree, \
-                                      context, params, queryEnv, dest, qc); \
-        else \
-            standard_ProcessUtility(pstmt, queryString, readOnlyTree, \
-                                    context, params, queryEnv, dest, qc); \
-    } while (0)
-
-    /*
-     * Spock apply worker: the DDL the hook ACTS on for a tiered table is
-     * DROP/TRUNCATE (blocked — never replicated, they error on the originator),
-     * column DDL (ADD/DROP/ALTER-TYPE/RENAME COLUMN — mirrored to Iceberg), and
-     * RENAME TABLE/VIEW. A replicated statement re-runs in the peer's apply
-     * worker; the hook then does the peer's LOCAL registry update + view
-     * rebuild, which is exactly right because the registry/view are per-node
-     * (not Spock-replicated). The Iceberg cold tier, by contrast, is SHARED
-     * (one Lakekeeper), so its column DDL must run exactly once: the mirror
-     * (coldfront._mirror_iceberg_alter) self-skips when
-     * session_replication_role = replica, leaving the apply worker to rebuild
-     * its local view only. The SPI-issued mirror/rebuild DDL runs at
-     * non-top-level context, which Spock filters out, so it never re-replicates.
-     */
+    Node         *stmt = pstmt->utilityStmt;
+    CfUtilityCtx  u    = { pstmt, queryString, readOnlyTree, context,
+                           params, queryEnv, dest, qc };
 
     /* Re-entrant SPI-issued DDL (our own CREATE VIEW/TRIGGER): no coldfront
      * work, just run it. */
     if (coldfront_in_utility)
     {
-        COLDFRONT_CALL_THROUGH();
+        cf_call_through(&u);
         return;
     }
 
@@ -2443,256 +2816,20 @@ coldfront_process_utility(PlannedStmt *pstmt, const char *queryString,
      * unrelated DDL. */
     if (!coldfront_registry_present())
     {
-        COLDFRONT_CALL_THROUGH();
+        cf_call_through(&u);
         return;
     }
 
-    /* ---- DROP TABLE / DROP VIEW: block if any object is tiered. ---- */
     if (IsA(stmt, DropStmt))
-    {
-        DropStmt *ds = (DropStmt *) stmt;
-        if (ds->removeType == OBJECT_TABLE || ds->removeType == OBJECT_VIEW)
-        {
-            ListCell *lc;
-            foreach(lc, ds->objects)
-            {
-                List     *names = (List *) lfirst(lc);
-                RangeVar *rv    = makeRangeVarFromNameList(names);
-                Oid       relid = RangeVarGetRelid(rv, NoLock, true);
-                if (relid_is_tiered(relid))
-                {
-                    char *ns   = get_namespace_name(get_rel_namespace(relid));
-                    char *name = get_rel_name(relid);
-                    ereport(ERROR,
-                        (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                         errmsg("coldfront: cannot DROP \"%s.%s\" — it has a cold tier in Iceberg",
-                                ns, name),
-                         errhint("Blocked by design: the Iceberg cold tier would be orphaned. "
-                                 "Removing a tiered table is a deliberate operation — unregister "
-                                 "it from coldfront.tiered_views and drop each tier explicitly.")));
-                }
-            }
-        }
-        COLDFRONT_CALL_THROUGH();
-        return;
-    }
-
-    /* ---- TRUNCATE: block if any relation is tiered. ---- */
-    if (IsA(stmt, TruncateStmt))
-    {
-        TruncateStmt *ts = (TruncateStmt *) stmt;
-        ListCell     *lc;
-        foreach(lc, ts->relations)
-        {
-            RangeVar *rv    = (RangeVar *) lfirst(lc);
-            Oid       relid = RangeVarGetRelid(rv, NoLock, true);
-            if (relid_is_tiered(relid))
-            {
-                char *ns   = get_namespace_name(get_rel_namespace(relid));
-                char *name = get_rel_name(relid);
-                ereport(ERROR,
-                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                     errmsg("coldfront: cannot TRUNCATE tiered table \"%s.%s\" — cold-tier rows would remain visible",
-                            ns, name),
-                     errhint("Blocked by design: cold-tier rows live in Iceberg and would remain "
-                             "visible through the view. Truncate each tier explicitly.")));
-            }
-        }
-        COLDFRONT_CALL_THROUGH();
-        return;
-    }
-
-    /* ---- ALTER TABLE: MIRROR column-shape changes onto the cold tier. ----
-     *
-     * duckdb-iceberg (v1.5) implements Iceberg ALTER TABLE, so ADD/DROP COLUMN
-     * and ALTER COLUMN TYPE evolve both tiers in one statement: PG runs the
-     * hot-side ALTER, then coldfront._mirror_iceberg_alter issues the matching
-     * Iceberg DDL (one bakery-serialized, claim-first catalog CAS) and the view
-     * is rebuilt to the new column set. Every OTHER ALTER subtype — DETACH/ATTACH
-     * PARTITION (the archiver's own cutover machinery), storage params, SET
-     * STATISTICS, constraint / NOT NULL toggles — is PG-side only and passes
-     * straight through untouched. */
-    if (IsA(stmt, AlterTableStmt))
-    {
-        AlterTableStmt *at    = (AlterTableStmt *) stmt;
-        Oid             relid = RangeVarGetRelid(at->relation, NoLock, true);
-        TieredDDLInfo   info;
-        ListCell       *lc;
-        StringInfoData  actions;
-        int             nacts = 0;
-
-        if (!lookup_tiered_by_hot_oid(relid, &info))
-        {
-            COLDFRONT_CALL_THROUGH();
-            return;
-        }
-
-        /* Collect the column-shape subcommands to mirror; ignore the rest. */
-        initStringInfo(&actions);
-        foreach(lc, at->cmds)
-        {
-            AlterTableCmd *cmd = (AlterTableCmd *) lfirst(lc);
-            const char    *op  = NULL;
-            const char    *col = NULL;
-
-            if (cmd->subtype == AT_AddColumn)
-            {
-                op  = "add";
-                col = castNode(ColumnDef, cmd->def)->colname;
-            }
-            else if (cmd->subtype == AT_DropColumn)
-            {
-                op  = "drop";
-                col = cmd->name;
-            }
-            else if (cmd->subtype == AT_AlterColumnType)
-            {
-                op  = "type";
-                col = cmd->name;
-            }
-            if (op == NULL)
-                continue;
-
-            appendStringInfo(&actions, "%sjsonb_build_object('op', %s, 'col', %s)",
-                             nacts > 0 ? ", " : "",
-                             quote_literal_cstr(op), quote_literal_cstr(col));
-            nacts++;
-        }
-
-        if (nacts == 0)
-        {
-            /* No column-shape change → partition management / storage params /
-             * the archiver's DETACH. Not coldfront's business. */
-            pfree(actions.data);
-            COLDFRONT_CALL_THROUGH();
-            return;
-        }
-
-        /* The transparent view projects the hot columns, so PG blocks a hot-side
-         * DROP COLUMN / ALTER COLUMN TYPE of a projected column ("used by a
-         * view"). Drop the view first, run the hot ALTER, then mirror the change
-         * onto Iceberg and rebuild the view. One transaction: an unsupported
-         * column type (or any failure) raises inside the mirror and rolls the
-         * whole statement — view drop and hot change included — back atomically. */
-        drop_tiered_view(info.view_schema, info.view_relname);
-        COLDFRONT_CALL_THROUGH();
-        mirror_and_rebuild(&info, actions.data);
-        pfree(actions.data);
-        return;
-    }
-
-    /* ---- RENAME: hot table, view, or column on a tiered relation. ---- */
-    if (IsA(stmt, RenameStmt))
-    {
-        RenameStmt   *rs = (RenameStmt *) stmt;
-        TieredDDLInfo info;
-        bool          matched = false;
-        bool          via_hot = false;        /* matched via the hot table (info fully populated) */
-        Oid           hot_relid = InvalidOid;
-        Oid           view_relid = InvalidOid;
-        char         *old_view_name = NULL;   /* captured pre-rename for OBJECT_VIEW */
-
-        if (rs->renameType == OBJECT_TABLE || rs->renameType == OBJECT_COLUMN)
-        {
-            hot_relid = RangeVarGetRelid(rs->relation, NoLock, true);
-            if (lookup_tiered_by_hot_oid(hot_relid, &info))
-                matched = via_hot = true;
-        }
-        if (!matched && (rs->renameType == OBJECT_VIEW ||
-                         rs->renameType == OBJECT_COLUMN))
-        {
-            /* Rename targeting the view itself (column rename on a view, or
-             * view rename). The registry is keyed by the view's (schema,
-             * relname), resolved from the view relid directly — no SPI. */
-            view_relid = RangeVarGetRelid(rs->relation, NoLock, true);
-            if (relid_is_tiered(view_relid))
-            {
-                MemoryContext oldcxt = MemoryContextSwitchTo(CurTransactionContext);
-                info.view_schema  = get_namespace_name(get_rel_namespace(view_relid));
-                info.view_relname = get_rel_name(view_relid);
-                MemoryContextSwitchTo(oldcxt);
-                matched = true;
-            }
-        }
-
-        if (!matched)
-        {
-            COLDFRONT_CALL_THROUGH();
-            return;
-        }
-
-        /* RENAME COLUMN on the HOT table is mirrored onto the Iceberg column so
-         * cold reads keep resolving it by name. A column rename targeting the
-         * generated VIEW is meaningless (the rebuild owns the view's column
-         * names) and is rejected. RENAME TABLE (hot heap) and RENAME VIEW touch
-         * only the PG side (registry + view), never the Iceberg schema. */
-        if (rs->renameType == OBJECT_COLUMN)
-        {
-            StringInfoData acts;
-
-            if (!via_hot)
-            {
-                char *ns   = get_namespace_name(get_rel_namespace(view_relid));
-                char *name = get_rel_name(view_relid);
-                ereport(ERROR,
-                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                     errmsg("coldfront: cannot rename a column of the generated view \"%s.%s\"",
-                            ns, name),
-                     errhint("Rename the column on the hot table instead; coldfront mirrors "
-                             "that onto the Iceberg cold tier and rebuilds the view.")));
-            }
-
-            COLDFRONT_CALL_THROUGH();   /* PG renames the hot column */
-            initStringInfo(&acts);
-            appendStringInfo(&acts,
-                "jsonb_build_object('op', 'rename', 'col', %s, 'newcol', %s)",
-                quote_literal_cstr(rs->subname), quote_literal_cstr(rs->newname));
-            mirror_and_rebuild(&info, acts.data);
-            pfree(acts.data);
-            return;
-        }
-
-        /* For a VIEW rename, capture the OLD view name NOW (before the rename
-         * executes) so we can migrate the name-keyed archive_watermark row. */
-        if (rs->renameType == OBJECT_VIEW && OidIsValid(view_relid))
-            old_view_name = pstrdup(get_rel_name(view_relid));
-
-        COLDFRONT_CALL_THROUGH();
-
-        coldfront_in_utility = true;
-        PG_TRY();
-        {
-            if (rs->renameType == OBJECT_TABLE && OidIsValid(hot_relid))
-            {
-                /* Hot heap renamed: the view's name is unchanged, so the
-                 * registry key is stable — update hot_table, then rebuild. */
-                char *new_hot = quoted_qualified_name(hot_relid);
-                update_hot_table(info.view_schema, info.view_relname, new_hot);
-                rebuild_tiered_view(info.view_schema, info.view_relname);
-            }
-            else
-            {
-                /* View renamed: migrate the name-keyed registry + watermark rows
-                 * (old→new) FIRST so the rebuild — and the regenerated INSERT
-                 * trigger — resolve the row by the new name; without this the
-                 * rebuilt view would silently lose its cold UNION branch. Then
-                 * rebuild under the new name. */
-                if (old_view_name != NULL &&
-                    strcmp(old_view_name, rs->newname) != 0)
-                    rename_tiered_view(info.view_schema, old_view_name, rs->newname);
-                rebuild_tiered_view(info.view_schema, rs->newname);
-            }
-        }
-        PG_FINALLY();
-        {
-            coldfront_in_utility = false;
-        }
-        PG_END_TRY();
-        return;
-    }
-
-    COLDFRONT_CALL_THROUGH();
-#undef COLDFRONT_CALL_THROUGH
+        cf_handle_drop(&u, (DropStmt *) stmt);
+    else if (IsA(stmt, TruncateStmt))
+        cf_handle_truncate(&u, (TruncateStmt *) stmt);
+    else if (IsA(stmt, AlterTableStmt))
+        cf_handle_alter_table(&u, (AlterTableStmt *) stmt);
+    else if (IsA(stmt, RenameStmt))
+        cf_handle_rename(&u, (RenameStmt *) stmt);
+    else
+        cf_call_through(&u);
 }
 
 /* ---------- _PG_init -------------------------------------------------- */
