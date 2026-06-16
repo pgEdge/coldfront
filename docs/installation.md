@@ -164,7 +164,7 @@ The following table lists the prerequisites for each build path:
 | For | You need |
 |---|---|
 | Docker build (above) | Docker; network access (GitHub / quay.io); ~a few GB disk + RAM and 30-60 min for the base compile |
-| The archiver (all paths) | Go 1.24+, `make` (`make build` → `./bin/archiver`) |
+| The archiver (all paths) | Go 1.26.4+ (pinned in [go.mod](https://github.com/pgEdge/ColdFront/blob/main/go.mod)), `make` (`make build` → `./bin/archiver`) |
 | Bare metal (below) | `pg_config`, PostgreSQL server dev headers, `make`, `gcc` |
 
 ## Bare metal (no Docker)
