@@ -1,7 +1,7 @@
 name: CI
 
 # ColdFront CI — runs the SAME harness as run-ci-local.sh (ci/matrix.sh); the
-# steps never diverge from local (per CLAUDE.md). Two jobs:
+# steps never diverge from local. Two jobs:
 #
 #   quick — every push + PR. ci/matrix.sh --quick = preflight (gofmt/vet/lint/
 #           unit tests/build) + ONE hermetic cell (PG18 · vanilla · tiered ·
