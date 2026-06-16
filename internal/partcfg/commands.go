@@ -149,18 +149,19 @@ func runRegister(ctx context.Context, args []string) error {
 		hot: *hot, retention: *retention, subValues: *subValues,
 		strategy: *strategy,
 	}
-	insertSQL := row.insertSQL()
 	if *printSQL {
-		fmt.Println(insertSQL)
+		fmt.Println(row.insertSQL())
 		return nil
 	}
-	return registerToDB(ctx, connect, *schema, *table, *column, *hot, *retention, *subValues != "", *dryRun, insertSQL)
+	return registerToDB(ctx, connect, row, *dryRun)
 }
 
 // registerToDB runs the connect-and-validate tail of register: it connects,
 // ensures the config table, validates the PK covers the partition key, checks
 // the interval semantics, then INSERTs the row (or prints the dry-run summary).
-func registerToDB(ctx context.Context, connect func(context.Context) (*pgx.Conn, error), schema, table, column, hot, retention string, twoLevel, dryRun bool, insertSQL string) error {
+func registerToDB(ctx context.Context, connect func(context.Context) (*pgx.Conn, error), row configRow, dryRun bool) error {
+	twoLevel := row.subValues != ""
+	insertSQL := row.insertSQL()
 	conn, err := connect(ctx)
 	if err != nil {
 		return err
@@ -172,23 +173,23 @@ func registerToDB(ctx context.Context, connect func(context.Context) (*pgx.Conn,
 	// PK-superset validation: the cutover keys delta capture by the source PK,
 	// so the PK must cover the partition key column(s). 2-level adds the RANGE
 	// column (the LIST column comes from the catalog).
-	if err := validatePKSuperset(ctx, conn, schema, table, column, twoLevel); err != nil {
+	if err := validatePKSuperset(ctx, conn, row.schema, row.table, row.column, twoLevel); err != nil {
 		return err
 	}
 	// Period validity + retention>hot ordering are PostgreSQL interval semantics,
 	// so they're checked against the connection (fail fast at register time; the
 	// interval column type is the backstop for any direct write).
-	if err := partition.ValidatePeriods(ctx, conn, hot, retention); err != nil {
+	if err := partition.ValidatePeriods(ctx, conn, row.hot, row.retention); err != nil {
 		return err
 	}
 	if dryRun {
-		fmt.Printf("dry-run OK: %s.%s validates; would run:\n%s\n", schema, table, insertSQL)
+		fmt.Printf("dry-run OK: %s.%s validates; would run:\n%s\n", row.schema, row.table, insertSQL)
 		return nil
 	}
 	if _, err := conn.Exec(ctx, insertSQL); err != nil { // nosemgrep
-		return fmt.Errorf("register %s.%s: %w", schema, table, err)
+		return fmt.Errorf("register %s.%s: %w", row.schema, row.table, err)
 	}
-	fmt.Printf("registered %s.%s\n", schema, table)
+	fmt.Printf("registered %s.%s\n", row.schema, row.table)
 	return nil
 }
 
