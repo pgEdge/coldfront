@@ -269,16 +269,23 @@ pgedge-coldfront/
 
 ## Dependencies
 
-The following table lists the components ColdFront depends on:
+The following table lists the services and components ColdFront runs
+against:
 
 | Component | Version | Purpose |
 |-----------|---------|---------|
 | PostgreSQL | 16, 17, or 18 | Database with native partitioning (stock upstream; no fork) |
 | pg_duckdb | 1.5.3 (PR #1025) | Iceberg reads + writes via DuckDB in-process |
+| duckdb-iceberg | `v1.5-variegata` @ `0fad545a`, patched | Iceberg catalog/IO for DuckDB; carries ColdFront's four patches (see [DUCKDB_1.5_PATCHED.md](DUCKDB_1.5_PATCHED.md)) |
 | Lakekeeper | latest | Iceberg REST catalog (Rust binary) |
 | S3-compatible store | any | SeaweedFS, MinIO, GCS, Azure Blob, etc. |
-| Go | 1.24+ | Archiver binary (pure Go, no CGO) |
-| pgx/v5 | 5.8.0 | PostgreSQL driver (only Go dependency) |
+
+Building from source needs the Go toolchain (the version is pinned in
+[go.mod](go.mod)). The Go module dependencies are the source of truth in
+[go.mod](go.mod) / [go.sum](go.sum); the archiver and partitioner build
+as static, CGO-free binaries on `pgx/v5`, and the compactor is a separate
+module ([cmd/compactor/go.mod](cmd/compactor/go.mod)) built on
+`apache/iceberg-go`.
 
 ## Author
 
