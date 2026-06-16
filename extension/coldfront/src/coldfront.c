@@ -702,6 +702,26 @@ typedef struct {
     const char *verb;       /* "UPDATE " or "DELETE FROM "             */
 } DeparseResult;
 
+/*
+ * Run the deparsed-DML prefix-match ladder: try the unqualified prefix first,
+ * then the schema-qualified one. Returns the matched prefix, or elogs the same
+ * ERROR as before on no match.
+ */
+static const char *
+find_dml_prefix(const char *orig_sql, const char *search_unqual,
+                const char *search_qual, const char *vname)
+{
+    if (strncmp(orig_sql, search_unqual, strlen(search_unqual)) == 0) /* nosemgrep */
+        return search_unqual;
+    else if (strncmp(orig_sql, search_qual, strlen(search_qual)) == 0) /* nosemgrep */
+        return search_qual;
+
+    elog(ERROR,
+         "coldfront: cannot locate result relation \"%s\" at start of "
+         "deparsed DML: %s", vname, orig_sql);
+    return NULL; /* unreachable */
+}
+
 static void
 deparse_and_find_prefix(Query *query, DeparseResult *dr)
 {
@@ -752,14 +772,7 @@ deparse_and_find_prefix(Query *query, DeparseResult *dr)
         }
     }
 
-    if (strncmp(dr->orig_sql, search_unqual, strlen(search_unqual)) == 0) /* nosemgrep */
-        old_prefix = search_unqual;
-    else if (strncmp(dr->orig_sql, search_qual, strlen(search_qual)) == 0) /* nosemgrep */
-        old_prefix = search_qual;
-    else
-        elog(ERROR,
-             "coldfront: cannot locate result relation \"%s\" at start of "
-             "deparsed DML: %s", vname, dr->orig_sql);
+    old_prefix = find_dml_prefix(dr->orig_sql, search_unqual, search_qual, vname);
 
     dr->rest = dr->orig_sql + strlen(old_prefix); /* nosemgrep */
 }
@@ -1315,6 +1328,38 @@ skip_leading_collist(const char *rest)
  * '"public"."_events"'). `targeted` is the user's targetList resnames.
  * Returns palloc'd CSV.
  */
+/*
+ * Returns true iff `attname` matches (by string) any resname in `targeted`.
+ */
+static bool
+name_in_list(List *targeted, const char *attname)
+{
+    ListCell *lc;
+    foreach(lc, targeted)
+    {
+        char *name = (char *) lfirst(lc);
+        if (strcmp(name, attname) == 0) return true;
+    }
+    return false;
+}
+
+/*
+ * Append one cold-SELECT projection element to `sel`: the bare identifier when
+ * the column is in the user's targetList, else the inlined DEFAULT expression,
+ * else NULL::<type>.
+ */
+static void
+append_cold_projection(StringInfo sel, bool in_target, const char *attname,
+                       const char *atttype, const char *default_expr)
+{
+    if (in_target)
+        appendStringInfoString(sel, quote_identifier(attname));
+    else if (default_expr != NULL)
+        appendStringInfo(sel, "(%s)", default_expr);
+    else
+        appendStringInfo(sel, "NULL::%s", atttype);
+}
+
 static char *
 build_cold_select_list(const char *hot_qualified, List *targeted)
 {
@@ -1351,20 +1396,10 @@ build_cold_select_list(const char *hot_qualified, List *targeted)
                                              SPI_tuptable->tupdesc, 2);
                 char *default_expr = SPI_getvalue(SPI_tuptable->vals[i],
                                                   SPI_tuptable->tupdesc, 3);
-                bool      in_target = false;
-                ListCell *lc;
-                foreach(lc, targeted)
-                {
-                    char *name = (char *) lfirst(lc);
-                    if (strcmp(name, attname) == 0) { in_target = true; break; }
-                }
+                bool  in_target = name_in_list(targeted, attname);
                 if (!first) appendStringInfoString(&sel, ", ");
-                if (in_target)
-                    appendStringInfoString(&sel, quote_identifier(attname));
-                else if (default_expr != NULL)
-                    appendStringInfo(&sel, "(%s)", default_expr);
-                else
-                    appendStringInfo(&sel, "NULL::%s", atttype);
+                append_cold_projection(&sel, in_target, attname, atttype,
+                                       default_expr);
                 first = false;
             }
             MemoryContextSwitchTo(oldcxt);
@@ -1445,6 +1480,145 @@ tiered_insert_needs_loop(Query *query, TieredViewInfo *info)
 }
 
 /*
+ * Build the hot-half DML: a full set-based PG INSERT into the hot table with
+ * the hot filter (partition_col >= cutoff). Returns palloc'd.
+ */
+static char *
+build_tiered_hot_dml(const char *hot_table, const char *col_list,
+                     const char *source, const char *partition_col,
+                     const char *cutoff_lit)
+{
+    StringInfoData hot;
+    initStringInfo(&hot);
+    appendStringInfo(&hot,
+        "INSERT INTO %s (%s) "
+        "SELECT %s FROM (%s) AS coldfront_src(%s) "
+        "WHERE %s >= %s",
+        hot_table, col_list,
+        col_list, source, col_list,
+        quote_identifier(partition_col), cutoff_lit);
+    return hot.data;
+}
+
+/*
+ * Build the slow-path cold call (IDENTITY-omitted case): the target-name
+ * ARRAY[...] plus the coldfront._tiered_insert_cold(...) call. Its source SQL
+ * runs in a PG cursor (executed by PG, not DuckDB), so params render as NATIVE
+ * PG (duckdb_target=false): no from_hex/::text — PG coerces the literals by the
+ * projected column types. Returns palloc'd.
+ */
+static char *
+build_cold_loop_call(Query *query, const char *vschema, const char *vname,
+                     const char *source, ColdParamSet *ps)
+{
+    StringInfoData target_arr;
+    ListCell      *lc;
+    bool           first = true;
+
+    initStringInfo(&target_arr);
+    appendStringInfoString(&target_arr, "ARRAY[");
+    foreach(lc, query->targetList)
+    {
+        TargetEntry *tle = (TargetEntry *) lfirst(lc);
+        if (tle->resjunk || tle->resname == NULL) continue;
+        if (!first) appendStringInfoString(&target_arr, ", ");
+        appendStringInfoString(&target_arr, quote_literal_cstr(tle->resname));
+        first = false;
+    }
+    appendStringInfoString(&target_arr, "]::text[]");
+
+    /* _tiered_insert_cold embeds its source SQL in a PG cursor (executed by
+     * PG, not DuckDB), so render params as NATIVE PG (duckdb_target=false):
+     * no from_hex/::text — PG coerces the literals by the projected column
+     * types. Its bigint result is never NULL, so the anchor matches 0 rows. */
+    {
+        StringInfoData callbuf;
+        initStringInfo(&callbuf);
+        appendStringInfo(&callbuf,
+            "coldfront._tiered_insert_cold(%s, %s, %s, %s)",
+            quote_literal_cstr(vschema),
+            quote_literal_cstr(vname),
+            target_arr.data,
+            cold_sql_arg(source, ps, false));
+        return callbuf.data;
+    }
+}
+
+/*
+ * Build the fast-path cold call (bulk pglocal stream). DuckDB-iceberg INSERT is
+ * positional with no column list, so the cold SELECT projects every underlying
+ * column in attnum order — NULL::<type> for any column the user omitted.
+ * tiered_insert_needs_loop() routed all IDENTITY/DEFAULT-omission cases to the
+ * slow path already, so this NULL-padding is honest. Returns palloc'd.
+ */
+static char *
+build_cold_bulk_call(Query *query, TieredViewInfo *info, const char *source,
+                     const char *col_list, const char *cutoff_lit,
+                     ColdParamSet *ps)
+{
+    StringInfoData cold;
+    char          *cold_select, *cold_pfx, *cold_norm;
+    List          *targeted_names = NIL;
+    ListCell      *lc;
+
+    foreach(lc, query->targetList)
+    {
+        TargetEntry *tle = (TargetEntry *) lfirst(lc);
+        if (!tle->resjunk && tle->resname != NULL)
+            targeted_names = lappend(targeted_names, tle->resname);
+    }
+    cold_select = build_cold_select_list(info->hot_table, targeted_names);
+
+    initStringInfo(&cold);
+    appendStringInfo(&cold,
+        "INSERT INTO %s "
+        "SELECT %s FROM (%s) AS coldfront_src(%s) "
+        "WHERE %s < %s",
+        info->iceberg_table,
+        cold_select, source, col_list,
+        quote_identifier(info->partition_col), cutoff_lit);
+    cold_pfx  = prefix_pg_tables_with_pglocal(query, cold.data);
+    cold_norm = normalize_casts_for_duckdb(cold_pfx);
+
+    return cold_exec_call(info->iceberg_table, cold_sql_arg(cold_norm, ps, true));
+}
+
+/*
+ * Wrap the hot DML and cold call into the final rewritten statement.
+ *
+ * Cause 2: in plpgsql the hot INSERT is the OUTER DML (plpgsql accepts it)
+ * and the cold call rides in a data-modifying CTE that always runs to
+ * completion; the old (hot_rows, cold_rows) report isn't available in that
+ * shape. At top level keep the existing count-reporting shape unchanged
+ * (fast/slow read the cold count differently). Returns palloc'd.
+ */
+static char *
+wrap_tiered_result(bool in_plpgsql, bool need_loop, const char *hot_dml,
+                   const char *call)
+{
+    StringInfoData buf;
+    initStringInfo(&buf);
+    if (in_plpgsql)
+        appendStringInfo(&buf, "WITH cold_call AS (%s) %s",
+                         cold_anchor_update(call), hot_dml);
+    else if (need_loop)
+        appendStringInfo(&buf,
+            "WITH hot_ins AS MATERIALIZED (%s RETURNING 1), "
+            "cold_call AS MATERIALIZED (SELECT %s AS n) "
+            "SELECT (SELECT count(*) FROM hot_ins) AS hot_rows, "
+            "       (SELECT n FROM cold_call) AS cold_rows",
+            hot_dml, call);
+    else
+        appendStringInfo(&buf,
+            "WITH hot_ins AS MATERIALIZED (%s RETURNING 1), "
+            "cold_call AS MATERIALIZED (SELECT %s) "
+            "SELECT (SELECT count(*) FROM hot_ins) AS hot_rows, "
+            "       (SELECT count(*) FROM cold_call) AS cold_rows",
+            hot_dml, call);
+    return buf.data;
+}
+
+/*
  * emit_tiered_insert rewrites a tiered-view INSERT into a single SQL
  * statement that splits hot/cold by the partition-column watermark.
  *
@@ -1475,8 +1649,7 @@ static char *
 emit_tiered_insert(Query *query, TieredViewInfo *info, ColdParamSet *ps, bool in_plpgsql)
 {
     DeparseResult  dr;
-    StringInfoData buf, hot;
-    char          *col_list, *cutoff_lit, *call;
+    char          *col_list, *cutoff_lit, *hot_dml, *call;
     const char    *source, *vname, *vschema;
     List          *saved_returning;
     bool           need_loop;
@@ -1499,111 +1672,16 @@ emit_tiered_insert(Query *query, TieredViewInfo *info, ColdParamSet *ps, bool in
 
     need_loop = tiered_insert_needs_loop(query, info);
 
-    /* Hot DML: full set-based PG INSERT into _events with the hot filter. */
-    initStringInfo(&hot);
-    appendStringInfo(&hot,
-        "INSERT INTO %s (%s) "
-        "SELECT %s FROM (%s) AS coldfront_src(%s) "
-        "WHERE %s >= %s",
-        info->hot_table, col_list,
-        col_list, source, col_list,
-        quote_identifier(info->partition_col), cutoff_lit);
+    hot_dml = build_tiered_hot_dml(info->hot_table, col_list, source,
+                                   info->partition_col, cutoff_lit);
 
     if (need_loop)
-    {
-        /* Slow path: cold-loop helper for IDENTITY-omitted case. */
-        StringInfoData target_arr;
-        ListCell      *lc;
-        bool           first = true;
-
-        initStringInfo(&target_arr);
-        appendStringInfoString(&target_arr, "ARRAY[");
-        foreach(lc, query->targetList)
-        {
-            TargetEntry *tle = (TargetEntry *) lfirst(lc);
-            if (tle->resjunk || tle->resname == NULL) continue;
-            if (!first) appendStringInfoString(&target_arr, ", ");
-            appendStringInfoString(&target_arr, quote_literal_cstr(tle->resname));
-            first = false;
-        }
-        appendStringInfoString(&target_arr, "]::text[]");
-
-        /* _tiered_insert_cold embeds its source SQL in a PG cursor (executed by
-         * PG, not DuckDB), so render params as NATIVE PG (duckdb_target=false):
-         * no from_hex/::text — PG coerces the literals by the projected column
-         * types. Its bigint result is never NULL, so the anchor matches 0 rows. */
-        {
-            StringInfoData callbuf;
-            initStringInfo(&callbuf);
-            appendStringInfo(&callbuf,
-                "coldfront._tiered_insert_cold(%s, %s, %s, %s)",
-                quote_literal_cstr(vschema),
-                quote_literal_cstr(vname),
-                target_arr.data,
-                cold_sql_arg(source, ps, false));
-            call = callbuf.data;
-        }
-    }
+        call = build_cold_loop_call(query, vschema, vname, source, ps);
     else
-    {
-        /* Fast path: bulk pglocal stream. DuckDB-iceberg INSERT is
-         * positional with no column list, so the cold SELECT projects
-         * every underlying column in attnum order — NULL::<type> for
-         * any column the user omitted. tiered_insert_needs_loop()
-         * routed all IDENTITY/DEFAULT-omission cases to the slow path
-         * already, so this NULL-padding is honest. */
-        StringInfoData cold;
-        char          *cold_select, *cold_pfx, *cold_norm;
-        List          *targeted_names = NIL;
-        ListCell      *lc;
+        call = build_cold_bulk_call(query, info, source, col_list,
+                                    cutoff_lit, ps);
 
-        foreach(lc, query->targetList)
-        {
-            TargetEntry *tle = (TargetEntry *) lfirst(lc);
-            if (!tle->resjunk && tle->resname != NULL)
-                targeted_names = lappend(targeted_names, tle->resname);
-        }
-        cold_select = build_cold_select_list(info->hot_table, targeted_names);
-
-        initStringInfo(&cold);
-        appendStringInfo(&cold,
-            "INSERT INTO %s "
-            "SELECT %s FROM (%s) AS coldfront_src(%s) "
-            "WHERE %s < %s",
-            info->iceberg_table,
-            cold_select, source, col_list,
-            quote_identifier(info->partition_col), cutoff_lit);
-        cold_pfx  = prefix_pg_tables_with_pglocal(query, cold.data);
-        cold_norm = normalize_casts_for_duckdb(cold_pfx);
-
-        call = cold_exec_call(info->iceberg_table, cold_sql_arg(cold_norm, ps, true));
-    }
-
-    /* Cause 2: in plpgsql the hot INSERT is the OUTER DML (plpgsql accepts it)
-     * and the cold call rides in a data-modifying CTE that always runs to
-     * completion; the old (hot_rows, cold_rows) report isn't available in that
-     * shape. At top level keep the existing count-reporting shape unchanged
-     * (fast/slow read the cold count differently). */
-    initStringInfo(&buf);
-    if (in_plpgsql)
-        appendStringInfo(&buf, "WITH cold_call AS (%s) %s",
-                         cold_anchor_update(call), hot.data);
-    else if (need_loop)
-        appendStringInfo(&buf,
-            "WITH hot_ins AS MATERIALIZED (%s RETURNING 1), "
-            "cold_call AS MATERIALIZED (SELECT %s AS n) "
-            "SELECT (SELECT count(*) FROM hot_ins) AS hot_rows, "
-            "       (SELECT n FROM cold_call) AS cold_rows",
-            hot.data, call);
-    else
-        appendStringInfo(&buf,
-            "WITH hot_ins AS MATERIALIZED (%s RETURNING 1), "
-            "cold_call AS MATERIALIZED (SELECT %s) "
-            "SELECT (SELECT count(*) FROM hot_ins) AS hot_rows, "
-            "       (SELECT count(*) FROM cold_call) AS cold_rows",
-            hot.data, call);
-
-    return buf.data;
+    return wrap_tiered_result(in_plpgsql, need_loop, hot_dml, call);
 }
 
 /*
@@ -2621,8 +2699,10 @@ coldfront_process_utility(PlannedStmt *pstmt, const char *queryString,
 
 void _PG_init(void);
 
-void
-_PG_init(void)
+/* register_gucs defines coldfront's custom GUCs. Split out of _PG_init so the
+ * init function stays a short, readable list of GUC + hook installs. */
+static void
+register_gucs(void)
 {
     DefineCustomBoolVariable(
         "coldfront.allow_mixed_writes",
@@ -2690,6 +2770,12 @@ _PG_init(void)
         PGC_SUSET,
         GUC_SUPERUSER_ONLY,
         NULL, NULL, NULL);
+}
+
+void
+_PG_init(void)
+{
+    register_gucs();
 
     prev_post_parse_analyze_hook = post_parse_analyze_hook;
     post_parse_analyze_hook      = coldfront_post_parse_analyze;
