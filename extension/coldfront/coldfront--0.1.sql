@@ -1607,6 +1607,24 @@ BEGIN
     -- The SELECT below then sees the in-flight local claim and defers
     -- correctly. Held only across the SELECT so the trigger doesn't
     -- block other apply work needlessly.
+    --
+    -- FOR UPDATE closes the defer/drain race: it locks the smaller-ticket
+    -- CLAIM ROW we are about to defer behind. The release path's `DELETE FROM
+    -- coldfront.claims` (which fires _on_claim_release's forward+delete drain)
+    -- locks/removes that SAME row, so the two serialize on it:
+    --   • we lock first  -> our deferred_acks INSERT below commits before the
+    --     drain, which then forwards it (the ack reaches the requester);
+    --   • release wins    -> this FOR UPDATE re-read returns NULL (claim gone)
+    --     so smaller_pending IS NULL and we ACK immediately (R-A's own rule,
+    --     re-evaluated) instead of deferring into an already-drained bucket.
+    -- Without FOR UPDATE the deferral can be written behind a released claim and
+    -- deleted-unforwarded (or orphaned) — a silently dropped ack that strands the
+    -- min-ticket holder at the WaitAcks barrier forever (the bakery wedge).
+    -- It MUST lock the claim row, NOT deferred_acks: at the drain's forward-SELECT
+    -- the lost deferral row does not exist yet (a phantom), so FOR UPDATE there
+    -- cannot lock it. Modelled + proven in docs/formal/Bakery_v2.tla (SafeAcks):
+    -- SafeAcks=FALSE violates EventualProgress (the wedge); SafeAcks=TRUE holds it
+    -- while every safety invariant still holds.
     PERFORM pg_advisory_lock_shared(my_lock_key);
     SELECT ticket INTO smaller_pending
       FROM coldfront.claims
@@ -1614,7 +1632,8 @@ BEGIN
        AND iceberg_table = NEW.iceberg_table
        AND ticket < NEW.ticket
      ORDER BY ticket
-     LIMIT 1;
+     LIMIT 1
+     FOR UPDATE;
     PERFORM pg_advisory_unlock_shared(my_lock_key);
 
     IF smaller_pending IS NOT NULL THEN
