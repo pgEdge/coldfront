@@ -39,11 +39,13 @@ describes its files and their roles:
 
 | File | Role |
 |---|---|
-| `Bakery_v2.tla` | PlusCal source.  Models the real spock world: each writer has its OWN local `claims[w]` view, INSERTs propagate via an explicit `Applier`.  No `synchronous_commit = remote_apply`.  Coordination is Lamport's 1978 distributed mutual exclusion algorithm with Ricart-Agrawala's (1981) deferred-reply optimisation: peers ack each claim immediately unless they have a pending claim with smaller ticket, in which case they defer the ack until they release their own claim.  Also models the `coldfront.iceberg_async_parquet` flag (constants `AsyncParquet`/`RestampPatch`): the `Stage` label stages parquet OUTSIDE the claim (async ordering); `Prepare` captures the `parent_snapshot_id` UNDER the claim (stock at stage time, patched async re-stamped at the commit POST); the `Decide` CAS asserts against it. |
+| `Bakery_v2.tla` | PlusCal source.  Models the real spock world: each writer has its OWN local `claims[w]` view, INSERTs propagate via an explicit `Applier`.  No `synchronous_commit = remote_apply`.  Coordination is Lamport's 1978 distributed mutual exclusion algorithm with Ricart-Agrawala's (1981) deferred-reply optimisation: peers ack each claim immediately unless they have a pending claim with smaller ticket, in which case they defer the ack until they release their own claim.  Also models the `coldfront.iceberg_async_parquet` flag (constants `AsyncParquet`/`RestampPatch`): the `Stage` label stages parquet OUTSIDE the claim (async ordering); `Prepare` captures the `parent_snapshot_id` UNDER the claim (stock at stage time, patched async re-stamped at the commit POST); the `Decide` CAS asserts against it.  **Defer/drain atomicity** is modelled too (constant `SafeAcks`): the apply-time defer DECISION and its WRITE (`ApplyDecide`/`ApplyEmit`), and the release drain's FORWARD and DELETE (`DrainForward`/`DrainDelete`), are SEPARATE steps — faithful to the non-atomic SQL.  `SafeAcks=FALSE` lets them race (a deferral written behind a just-released claim is deleted unforwarded / orphaned — a dropped ack); `SafeAcks=TRUE` is the safe implementation: an atomic re-check of R-A's own defer rule against the claim, i.e. `SELECT … FOR UPDATE` on the claim row in `coldfront._on_claim_apply`. |
 | `Bakery_v2.cfg` | TLC config: 3 writers, no crashes, all four safety invariants. **Stock ordering** (`AsyncParquet=FALSE` - the default; parquet staged inside the claim).  Passes - R-A makes `NoLakekeeperConflict` and `TicketOrderPreserved` hold even with realistic asymmetric apply. |
 | `Bakery_v2_async.cfg` | **Patched async ordering** (`AsyncParquet=TRUE, RestampPatch=TRUE`) - what the DuckDB 1.5.x (duckdb15) image runs: parquet staged outside the claim, `parent_snapshot_id` re-stamped at the commit POST under the claim by the bakery-aware patch.  All four safety invariants HOLD; the test is non-vacuous (shares the stock config's under-claim `Prepare→Decide` window, which R-A keeps empty). |
 | `Bakery_v2_race.cfg` | **Pre-patch async race** (`AsyncParquet=TRUE, RestampPatch=FALSE`) - async ordering WITHOUT the bakery-aware patch: the stale tentative parent from the pre-claim stage is used at the POST. **`NoLakekeeperConflict` is EXPECTED to be violated** - the formal proof that the patch is mandatory for the async ordering. |
 | `Bakery_v2_crash.cfg` | 3 writers, 1 crash budget (stock ordering - crash-safety is ordering-independent).  Safety invariants still hold (a crashed peer's missing ack just leaves surviving writers blocked at `WaitAcks` - no incorrect commits). |
+| `Bakery_v2_live.cfg` | **The defer/drain race** (`SafeAcks=FALSE`) - the non-atomic implementation. **`EventualProgress` is EXPECTED to be VIOLATED**: a deferred ack written behind a just-released claim is dropped, stranding the min-ticket holder at `WaitAcks` forever - the N-writer production wedge, reproduced in the model. The four safety invariants still HOLD (a dropped ack is a liveness failure, not a wrong commit). No `SYMMETRY` (unsound with liveness checking). |
+| `Bakery_v2_fixed.cfg` | **The fix** (`SafeAcks=TRUE`) - the atomic defer/drain (`FOR UPDATE` on the claim row). `EventualProgress` HOLDS *and* all four safety invariants hold: the formal proof the fix restores liveness without weakening safety. |
 
 ## Properties
 
@@ -75,10 +77,14 @@ These properties must hold; TLC checks them as `INVARIANTS`:
 TLC checks these properties as `PROPERTIES`:
 
 - `EventualProgress` - every writer that begins a claim eventually
-  reaches a terminal `decision` (`committed` or `rolled_back`).
-  Holds when no crashes; vacuously fails for writers that themselves
-  crash mid-bakery (they can never decide). Use `NonCrashedProgress`
-  when checking crash scenarios.
+  reaches a terminal `decision` (`committed`, `rolled_back`, or
+  `lk_409`). Holds when no crashes; vacuously fails for writers that
+  themselves crash mid-bakery (they can never decide). Use
+  `NonCrashedProgress` when checking crash scenarios. In v2 this is
+  ALSO the defer/drain race check: `Bakery_v2_fixed.cfg`
+  (`SafeAcks=TRUE`) HOLDS it; `Bakery_v2_live.cfg` (`SafeAcks=FALSE`)
+  VIOLATES it - the dropped-ack wedge that strands the min-ticket
+  holder at `WaitAcks` forever.
 - `NonCrashedProgress` - every *live* writer with a claim eventually
   decides, or dies. The in-bakery reap (a writer at `BakeryWait`
   evicts the claim of a peer it deems dead) ensures surviving
@@ -141,6 +147,14 @@ java -cp $TLA tlc2.TLC -workers auto -deadlock -config Bakery_v2_race.cfg Bakery
 # v2.d 1 crash budget.  Safety still holds (crashed peer's missing ack
 #       leaves survivors blocked at WaitAcks — no incorrect commits).
 java -cp $TLA tlc2.TLC -workers auto -deadlock -config Bakery_v2_crash.cfg Bakery_v2.tla
+
+# v2.e Defer/drain race (SafeAcks=FALSE).  EXPECTED FAILURE: EventualProgress
+#       violated — the dropped-ack wedge reproduced in the model.
+java -cp $TLA tlc2.TLC -workers auto -deadlock -config Bakery_v2_live.cfg Bakery_v2.tla
+
+# v2.f The fix (SafeAcks=TRUE — FOR UPDATE on the claim row).  All hold:
+#       EventualProgress AND the four safety invariants.
+java -cp $TLA tlc2.TLC -workers auto -deadlock -config Bakery_v2_fixed.cfg Bakery_v2.tla
 ```
 
 The `-deadlock` flag tells TLC not to flag final stuttering states as

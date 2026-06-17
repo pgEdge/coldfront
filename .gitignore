@@ -56,7 +56,7 @@ bench.md
 
 # E2E result docs (local only)
 E2E*.md
-SCALE_TEST_SETUP.md
+SCALE_TEST*.md
 
 # Internal / strategic docs — NOT for the (eventually public) repo. Kept locally.
 COMPARISON.md
@@ -64,6 +64,7 @@ COMPARISON.md
 BACKLOG.md
 EXPERIMENTAL_MVCC.md
 HARDENING_DECOUPLED.md
+ICEBERG_LAZY_REFRESH.md
 
 # Local secrets — NEVER commit. (One-off GHCR push token; revoke after use.)
 github_token_do_not_merge.txt
