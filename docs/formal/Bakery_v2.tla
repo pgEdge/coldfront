@@ -88,11 +88,19 @@ CONSTANTS Writers,
           AsyncParquet,   \* coldfront.iceberg_async_parquet: TRUE stages the parquet
                           \* OUTSIDE the claim (patched-iceberg upload overlap); FALSE
                           \* stages it inside the claim (stock iceberg, the default).
-          RestampPatch    \* the bakery-aware-commit-refresh patch re-stamps
+          RestampPatch,   \* the bakery-aware-commit-refresh patch re-stamps
                           \* parent_snapshot_id at the commit POST, UNDER the claim.
                           \* TRUE = patched deployment. AsyncParquet=TRUE with
                           \* RestampPatch=FALSE reproduces the pre-patch 409 race that
                           \* makes the patch mandatory for the async ordering.
+          SafeAcks        \* TRUE = the SAFE implementation of R-A's defer/ack: the
+                          \* defer is written atomically with a re-check of R-A's own
+                          \* rule (the smaller-ticket claim must STILL be held), so a
+                          \* deferral is never written behind a released claim, and the
+                          \* drain can't drop it. FALSE = the non-atomic implementation
+                          \* (decide, then separately write) that drops acks — the bug.
+                          \* The PROTOCOL (R-A) is identical either way; only the
+                          \* implementation's atomicity differs.
 
 ASSUME /\ Writers # {}
        /\ MaxTickets    \in Nat /\ MaxTickets    >= Cardinality(Writers)
@@ -100,6 +108,7 @@ ASSUME /\ Writers # {}
        /\ MaxCrashes    \in Nat /\ MaxCrashes    <= Cardinality(Writers)
        /\ AsyncParquet  \in BOOLEAN
        /\ RestampPatch  \in BOOLEAN
+       /\ SafeAcks      \in BOOLEAN
 
 NoTicket == 0
 NoSnap   == 0
@@ -170,6 +179,16 @@ define
         /\ iceberg[i].kind = "commit"
         /\ iceberg[j].kind = "commit" )
         => iceberg[i].t < iceberg[j].t
+
+  \* LIVENESS — every writer eventually reaches a terminal decision.  A writer
+  \* whose ack is dropped by the non-atomic defer/drain race is stranded at
+  \* WaitAcks forever: AlivePeersHaveAcked can NEVER become true because the
+  \* dropped ack can never be produced (its deferral was deleted unforwarded /
+  \* orphaned).  The OLD atomic Applier+drain could not expose this; the faithful
+  \* split below can.  Expected to be VIOLATED in Bakery_v2_live.cfg (the bug),
+  \* and to HOLD again once the fix re-atomises defer vs drain.
+  EventualProgress ==
+    \A w \in Writers : <>(decision[w] \in {"committed", "rolled_back", "lk_409"})
 end define;
 
 fair process Writer \in Writers
@@ -233,6 +252,7 @@ begin
     end if;
 
   Decide:
+    \* The CAS, UNDER the still-held claim (released only at Release below).
     await Live(self);
     either
       \* COMMIT.  Under R-A, when all my acks are in, no other writer with a
@@ -246,19 +266,29 @@ begin
       else
         decision[self] := "lk_409";
       end if;
-      \* Release: remove my claim from every local view AND drain my
-      \* deferred acks.  R-A's "send queued REPLYs on exit."
-      claims := [p \in Writers |->
-                  claims[p] \ {[w |-> self, t |-> my_ticket, n |-> self]}];
-      acks := acks \cup { <<t, self>> : t \in MyDeferredTickets(self) };
-      deferred := { x \in deferred : x[1] # self };
     or
       decision[self] := "rolled_back";
-      claims := [p \in Writers |->
-                  claims[p] \ {[w |-> self, t |-> my_ticket, n |-> self]}];
-      acks := acks \cup { <<t, self>> : t \in MyDeferredTickets(self) };
-      deferred := { x \in deferred : x[1] # self };
     end either;
+
+  Release:
+    \* The C XactCallback's claim DELETE: remove my claim from every local view.
+    await Live(self);
+    claims := [p \in Writers |->
+                claims[p] \ {[w |-> self, t |-> my_ticket, n |-> self]}];
+
+  DrainForward:
+    \* _on_claim_release step 1 (forward): INSERT claim_acks SELECT … FROM
+    \* deferred_acks WHERE pending = my ticket.  A deferral the Applier writes
+    \* AFTER this read but BEFORE DrainDelete is NOT seen here.
+    await Live(self);
+    acks := acks \cup { <<t, self>> : t \in MyDeferredTickets(self) };
+
+  DrainDelete:
+    \* _on_claim_release step 2 (the SEPARATE DELETE): delete my deferrals —
+    \* including any inserted in the DrainForward→here window, which were never
+    \* forwarded.  Non-atomic forward-then-delete = the silently dropped ack.
+    await Live(self);
+    deferred := { x \in deferred : x[1] # self };
 end process;
 
 (*-----------------------------------------------------------------------*)
@@ -266,23 +296,44 @@ end process;
 (* At apply time, the R-A defer-or-ack decision is made.                 *)
 (*-----------------------------------------------------------------------*)
 fair process Applier = "applier"
+variables ap_dst = NoTicket, ap_ct = NoTicket, ap_defer = FALSE;
 begin
   ApplyLoop:
     while TRUE do
+      \* ApplyDecide — apply one claim into dst's local view and DECIDE, under the
+      \* read snapshot, whether to defer or ack.  Mirrors _on_claim_apply reading
+      \* coldfront.claims (the shared advisory lock is dropped after this SELECT)
+      \* and CHOOSING defer-vs-ack — but NOT yet writing it.
       with src \in Writers, dst \in Writers do
         await dst # src /\ Live(dst);
         with c \in { x \in claims[src] : x \notin claims[dst] /\ x.w = src } do
           claims[dst] := claims[dst] \cup { c };
-          \* R-A defer rule.
-          if \E own \in claims[dst] :
-                own.w = dst /\ own.t < c.t
-          then
-            deferred := deferred \cup { <<dst, c.t>> };
-          else
-            acks := acks \cup { <<c.t, dst>> };
-          end if;
+          ap_dst   := dst;
+          ap_ct    := c.t;
+          ap_defer := \E own \in claims[dst] : own.w = dst /\ own.t < c.t;
         end with;
       end with;
+
+    ApplyEmit:
+      \* The defer/ack write.
+      \*   ~SafeAcks: write the STALE ApplyDecide verdict.  The holder may have
+      \*     released since, so the deferral is written behind a gone claim and is
+      \*     deleted-unforwarded / orphaned — the dropped-ack bug.  Models today's
+      \*     non-atomic "decide (lock dropped) then separately INSERT".
+      \*   SafeAcks: re-evaluate R-A's defer rule ATOMICALLY against the CURRENT
+      \*     claim and write in the same step.  In SQL this is a single
+      \*     `SELECT smaller_pending … FOR UPDATE` on the holder's CLAIM ROW (the
+      \*     same row the release's DELETE locks) plus the conditional defer/ack:
+      \*     holder's claim still held -> defer; gone -> ack.  R-A's rule unchanged,
+      \*     made atomic, so a deferral is never written behind a released claim.
+      if (IF SafeAcks
+            THEN \E own \in claims[ap_dst] : own.w = ap_dst /\ own.t < ap_ct
+            ELSE ap_defer)
+      then
+        deferred := deferred \cup { <<ap_dst, ap_ct>> };
+      else
+        acks := acks \cup { <<ap_ct, ap_dst>> };
+      end if;
     end while;
 end process;
 
@@ -303,7 +354,7 @@ begin
 end process;
 
 end algorithm; *)
-\* BEGIN TRANSLATION (chksum(pcal) = "9cbb63a1" /\ chksum(tla) = "9e24855d")
+\* BEGIN TRANSLATION (chksum(pcal) = "14190c1" /\ chksum(tla) = "a5729adc")
 VARIABLES pc, next_ticket, claims, acks, deferred, iceberg, decision, crashed, 
           crash_budget
 
@@ -348,10 +399,21 @@ TicketOrderPreserved ==
       /\ iceberg[j].kind = "commit" )
       => iceberg[i].t < iceberg[j].t
 
-VARIABLES my_ticket, parent_seen, parent_staged
+
+
+
+
+
+
+
+EventualProgress ==
+  \A w \in Writers : <>(decision[w] \in {"committed", "rolled_back", "lk_409"})
+
+VARIABLES my_ticket, parent_seen, parent_staged, ap_dst, ap_ct, ap_defer
 
 vars == << pc, next_ticket, claims, acks, deferred, iceberg, decision, 
-           crashed, crash_budget, my_ticket, parent_seen, parent_staged >>
+           crashed, crash_budget, my_ticket, parent_seen, parent_staged, 
+           ap_dst, ap_ct, ap_defer >>
 
 ProcSet == (Writers) \cup {"applier"} \cup {"crasher"}
 
@@ -368,6 +430,10 @@ Init == (* Global variables *)
         /\ my_ticket = [self \in Writers |-> NoTicket]
         /\ parent_seen = [self \in Writers |-> NoSnap]
         /\ parent_staged = [self \in Writers |-> NoSnap]
+        (* Process Applier *)
+        /\ ap_dst = NoTicket
+        /\ ap_ct = NoTicket
+        /\ ap_defer = FALSE
         /\ pc = [self \in ProcSet |-> CASE self \in Writers -> "Start"
                                         [] self = "applier" -> "ApplyLoop"
                                         [] self = "crasher" -> "CrashLoop"]
@@ -377,7 +443,8 @@ Start(self) == /\ pc[self] = "Start"
                /\ pc' = [pc EXCEPT ![self] = "Stage"]
                /\ UNCHANGED << next_ticket, claims, acks, deferred, iceberg, 
                                decision, crashed, crash_budget, my_ticket, 
-                               parent_seen, parent_staged >>
+                               parent_seen, parent_staged, ap_dst, ap_ct, 
+                               ap_defer >>
 
 Stage(self) == /\ pc[self] = "Stage"
                /\ Live(self)
@@ -388,7 +455,7 @@ Stage(self) == /\ pc[self] = "Stage"
                /\ pc' = [pc EXCEPT ![self] = "BeginClaim"]
                /\ UNCHANGED << next_ticket, claims, acks, deferred, iceberg, 
                                decision, crashed, crash_budget, my_ticket, 
-                               parent_seen >>
+                               parent_seen, ap_dst, ap_ct, ap_defer >>
 
 BeginClaim(self) == /\ pc[self] = "BeginClaim"
                     /\ Live(self) /\ \E p \in Writers : p # self /\ Live(p)
@@ -399,14 +466,16 @@ BeginClaim(self) == /\ pc[self] = "BeginClaim"
                                                           {[w |-> self, t |-> my_ticket'[self], n |-> self]}]
                     /\ pc' = [pc EXCEPT ![self] = "WaitAcks"]
                     /\ UNCHANGED << acks, deferred, iceberg, decision, crashed, 
-                                    crash_budget, parent_seen, parent_staged >>
+                                    crash_budget, parent_seen, parent_staged, 
+                                    ap_dst, ap_ct, ap_defer >>
 
 WaitAcks(self) == /\ pc[self] = "WaitAcks"
                   /\ Live(self) /\ AlivePeersHaveAcked(self, my_ticket[self])
                   /\ pc' = [pc EXCEPT ![self] = "Prepare"]
                   /\ UNCHANGED << next_ticket, claims, acks, deferred, iceberg, 
                                   decision, crashed, crash_budget, my_ticket, 
-                                  parent_seen, parent_staged >>
+                                  parent_seen, parent_staged, ap_dst, ap_ct, 
+                                  ap_defer >>
 
 Prepare(self) == /\ pc[self] = "Prepare"
                  /\ Live(self)
@@ -416,7 +485,7 @@ Prepare(self) == /\ pc[self] = "Prepare"
                  /\ pc' = [pc EXCEPT ![self] = "Decide"]
                  /\ UNCHANGED << next_ticket, claims, acks, deferred, iceberg, 
                                  decision, crashed, crash_budget, my_ticket, 
-                                 parent_staged >>
+                                 parent_staged, ap_dst, ap_ct, ap_defer >>
 
 Decide(self) == /\ pc[self] = "Decide"
                 /\ Live(self)
@@ -427,22 +496,45 @@ Decide(self) == /\ pc[self] = "Decide"
                                  /\ decision' = [decision EXCEPT ![self] = "committed"]
                             ELSE /\ decision' = [decision EXCEPT ![self] = "lk_409"]
                                  /\ UNCHANGED iceberg
-                      /\ claims' = [p \in Writers |->
-                                     claims[p] \ {[w |-> self, t |-> my_ticket[self], n |-> self]}]
-                      /\ acks' = (acks \cup { <<t, self>> : t \in MyDeferredTickets(self) })
-                      /\ deferred' = { x \in deferred : x[1] # self }
                    \/ /\ decision' = [decision EXCEPT ![self] = "rolled_back"]
-                      /\ claims' = [p \in Writers |->
-                                     claims[p] \ {[w |-> self, t |-> my_ticket[self], n |-> self]}]
-                      /\ acks' = (acks \cup { <<t, self>> : t \in MyDeferredTickets(self) })
-                      /\ deferred' = { x \in deferred : x[1] # self }
                       /\ UNCHANGED iceberg
-                /\ pc' = [pc EXCEPT ![self] = "Done"]
-                /\ UNCHANGED << next_ticket, crashed, crash_budget, my_ticket, 
-                                parent_seen, parent_staged >>
+                /\ pc' = [pc EXCEPT ![self] = "Release"]
+                /\ UNCHANGED << next_ticket, claims, acks, deferred, crashed, 
+                                crash_budget, my_ticket, parent_seen, 
+                                parent_staged, ap_dst, ap_ct, ap_defer >>
+
+Release(self) == /\ pc[self] = "Release"
+                 /\ Live(self)
+                 /\ claims' = [p \in Writers |->
+                                claims[p] \ {[w |-> self, t |-> my_ticket[self], n |-> self]}]
+                 /\ pc' = [pc EXCEPT ![self] = "DrainForward"]
+                 /\ UNCHANGED << next_ticket, acks, deferred, iceberg, 
+                                 decision, crashed, crash_budget, my_ticket, 
+                                 parent_seen, parent_staged, ap_dst, ap_ct, 
+                                 ap_defer >>
+
+DrainForward(self) == /\ pc[self] = "DrainForward"
+                      /\ Live(self)
+                      /\ acks' = (acks \cup { <<t, self>> : t \in MyDeferredTickets(self) })
+                      /\ pc' = [pc EXCEPT ![self] = "DrainDelete"]
+                      /\ UNCHANGED << next_ticket, claims, deferred, iceberg, 
+                                      decision, crashed, crash_budget, 
+                                      my_ticket, parent_seen, parent_staged, 
+                                      ap_dst, ap_ct, ap_defer >>
+
+DrainDelete(self) == /\ pc[self] = "DrainDelete"
+                     /\ Live(self)
+                     /\ deferred' = { x \in deferred : x[1] # self }
+                     /\ pc' = [pc EXCEPT ![self] = "Done"]
+                     /\ UNCHANGED << next_ticket, claims, acks, iceberg, 
+                                     decision, crashed, crash_budget, 
+                                     my_ticket, parent_seen, parent_staged, 
+                                     ap_dst, ap_ct, ap_defer >>
 
 Writer(self) == Start(self) \/ Stage(self) \/ BeginClaim(self)
                    \/ WaitAcks(self) \/ Prepare(self) \/ Decide(self)
+                   \/ Release(self) \/ DrainForward(self)
+                   \/ DrainDelete(self)
 
 ApplyLoop == /\ pc["applier"] = "ApplyLoop"
              /\ \E src \in Writers:
@@ -450,18 +542,28 @@ ApplyLoop == /\ pc["applier"] = "ApplyLoop"
                     /\ dst # src /\ Live(dst)
                     /\ \E c \in { x \in claims[src] : x \notin claims[dst] /\ x.w = src }:
                          /\ claims' = [claims EXCEPT ![dst] = claims[dst] \cup { c }]
-                         /\ IF \E own \in claims'[dst] :
-                                  own.w = dst /\ own.t < c.t
-                               THEN /\ deferred' = (deferred \cup { <<dst, c.t>> })
-                                    /\ acks' = acks
-                               ELSE /\ acks' = (acks \cup { <<c.t, dst>> })
-                                    /\ UNCHANGED deferred
-             /\ pc' = [pc EXCEPT !["applier"] = "ApplyLoop"]
-             /\ UNCHANGED << next_ticket, iceberg, decision, crashed, 
-                             crash_budget, my_ticket, parent_seen, 
+                         /\ ap_dst' = dst
+                         /\ ap_ct' = c.t
+                         /\ ap_defer' = (\E own \in claims'[dst] : own.w = dst /\ own.t < c.t)
+             /\ pc' = [pc EXCEPT !["applier"] = "ApplyEmit"]
+             /\ UNCHANGED << next_ticket, acks, deferred, iceberg, decision, 
+                             crashed, crash_budget, my_ticket, parent_seen, 
                              parent_staged >>
 
-Applier == ApplyLoop
+ApplyEmit == /\ pc["applier"] = "ApplyEmit"
+             /\ IF (IF SafeAcks
+                      THEN \E own \in claims[ap_dst] : own.w = ap_dst /\ own.t < ap_ct
+                      ELSE ap_defer)
+                   THEN /\ deferred' = (deferred \cup { <<ap_dst, ap_ct>> })
+                        /\ acks' = acks
+                   ELSE /\ acks' = (acks \cup { <<ap_ct, ap_dst>> })
+                        /\ UNCHANGED deferred
+             /\ pc' = [pc EXCEPT !["applier"] = "ApplyLoop"]
+             /\ UNCHANGED << next_ticket, claims, iceberg, decision, crashed, 
+                             crash_budget, my_ticket, parent_seen, 
+                             parent_staged, ap_dst, ap_ct, ap_defer >>
+
+Applier == ApplyLoop \/ ApplyEmit
 
 CrashLoop == /\ pc["crasher"] = "CrashLoop"
              /\ IF crash_budget > 0
@@ -475,7 +577,8 @@ CrashLoop == /\ pc["crasher"] = "CrashLoop"
                    ELSE /\ pc' = [pc EXCEPT !["crasher"] = "Done"]
                         /\ UNCHANGED << crashed, crash_budget >>
              /\ UNCHANGED << next_ticket, claims, acks, deferred, iceberg, 
-                             decision, my_ticket, parent_seen, parent_staged >>
+                             decision, my_ticket, parent_seen, parent_staged, 
+                             ap_dst, ap_ct, ap_defer >>
 
 Crasher == CrashLoop
 
