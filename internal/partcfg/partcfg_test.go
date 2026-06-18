@@ -31,15 +31,18 @@ func (r *mockRows) RawValues() [][]byte                          { return nil }
 func (r *mockRows) Conn() *pgx.Conn                              { return nil }
 
 type mockDB struct {
-	execSQL  []string
-	rowsFunc func() (pgx.Rows, error)
+	execSQL   []string
+	rowsFunc  func() (pgx.Rows, error)
+	querySQL  string // last Query SQL — lets tests assert the ownership filter
+	queryArgs []any  // last Query args — $1 is the owner selector
 }
 
 func (m *mockDB) Exec(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
 	m.execSQL = append(m.execSQL, sql)
 	return pgconn.NewCommandTag("OK"), nil
 }
-func (m *mockDB) Query(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
+func (m *mockDB) Query(_ context.Context, sql string, args ...any) (pgx.Rows, error) {
+	m.querySQL, m.queryArgs = sql, args
 	return m.rowsFunc()
 }
 
@@ -89,7 +92,8 @@ func TestResolveTables_DBWins(t *testing.T) {
 		}}, nil
 	}}
 	yaml := []config.TableConfig{{SourceTable: "from_yaml"}}
-	got, fromYAML, err := ResolveTables(context.Background(), db, yaml)
+	// The row is partition-only (hot NULL), so the partitioner owns it.
+	got, fromYAML, err := ResolveTables(context.Background(), db, yaml, PartitionOnly)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -104,7 +108,7 @@ func TestResolveTables_DBWins(t *testing.T) {
 func TestResolveTables_YAMLFallback(t *testing.T) {
 	db := &mockDB{rowsFunc: emptyRows} // no partition_config rows
 	yaml := []config.TableConfig{{SourceTable: "from_yaml"}}
-	got, fromYAML, err := ResolveTables(context.Background(), db, yaml)
+	got, fromYAML, err := ResolveTables(context.Background(), db, yaml, PartitionOnly)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -148,7 +152,7 @@ func TestLoadTables(t *testing.T) {
 		}}, nil
 	}}
 
-	got, err := LoadTables(context.Background(), db)
+	got, err := LoadTables(context.Background(), db, AllOwners)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -176,5 +180,51 @@ func TestLoadTables(t *testing.T) {
 	}
 	if b.HotPeriod != "" {
 		t.Fatalf("row 1 hot_period should be empty (partition-only), got %q", b.HotPeriod)
+	}
+}
+
+// TestLoadTables_PassesOwnerFilter pins issue #14: each binary must scope its
+// load by ownership. The mock ignores the WHERE clause itself, so we assert the
+// owner selector reaches the query as $1 (the real Postgres filter is proven
+// end-to-end in ci/journey.sh). int(owner): AllOwners=0, Tiered=1, PartitionOnly=2.
+func TestLoadTables_PassesOwnerFilter(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		own  owner
+		want int
+	}{
+		{"export loads all", AllOwners, 0},
+		{"archiver loads tiered", Tiered, 1},
+		{"partitioner loads partition-only", PartitionOnly, 2},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			db := &mockDB{rowsFunc: emptyRows}
+			if _, err := LoadTables(context.Background(), db, tc.own); err != nil {
+				t.Fatal(err)
+			}
+			if len(db.queryArgs) != 1 {
+				t.Fatalf("expected 1 query arg (the owner selector), got %v", db.queryArgs)
+			}
+			if got, ok := db.queryArgs[0].(int); !ok || got != tc.want {
+				t.Fatalf("owner selector $1 = %v, want %d", db.queryArgs[0], tc.want)
+			}
+		})
+	}
+}
+
+// TestResolveTables_NoRowsFallsBackToYAML — when the binary's filtered query
+// returns nothing (an empty table, or only rows owned by the other binary),
+// ResolveTables falls back to the deprecated YAML bridge, exactly as it does for
+// an empty table today. The filter runs in SQL, so an empty result is
+// indistinguishable from an empty table here.
+func TestResolveTables_NoRowsFallsBackToYAML(t *testing.T) {
+	db := &mockDB{rowsFunc: emptyRows}
+	yaml := []config.TableConfig{{SourceTable: "from_yaml"}}
+	got, fromYAML, err := ResolveTables(context.Background(), db, yaml, Tiered)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fromYAML || len(got) != 1 || got[0].SourceTable != "from_yaml" {
+		t.Fatalf("expected YAML fallback when the filtered query is empty, got fromYAML=%v %+v", fromYAML, got)
 	}
 }
