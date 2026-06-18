@@ -28,6 +28,17 @@ Thanks for your interest in improving ColdFront.
 - Open the PR against `main` and complete the
   [pull-request checklist](.github/PULL_REQUEST_TEMPLATE.md).
 
+## Versioning
+
+ColdFront uses two independent version numbers. Release tags follow
+three-part [Semantic Versioning](https://semver.org)
+(`vMAJOR.MINOR.PATCH`, for example `v1.0.0`); three parts are required
+because ColdFront is a Go module and the toolchain treats only full
+`vX.Y.Z` tags as releases. The PostgreSQL extension uses the conventional
+two-part version in its control file (`default_version`) and
+upgrade-script names (`coldfront--1.0--1.1.sql`). Extension `1.0` ships
+inside release `v1.0.0`.
+
 ## Licensing
 
 ColdFront is under the PostgreSQL License ([LICENSE.md](LICENSE.md)). By

@@ -250,6 +250,28 @@ as static, CGO-free binaries on `pgx/v5`, and the compactor is a separate
 module ([cmd/compactor/go.mod](cmd/compactor/go.mod)) built on
 `apache/iceberg-go`.
 
+## Versioning
+
+ColdFront carries two independent version numbers, each following its own
+convention:
+
+- Release tags use three-part
+  [Semantic Versioning](https://semver.org) (`vMAJOR.MINOR.PATCH`, for
+  example `v1.0.0`); Git tags, GitHub releases, container image tags, and
+  the changelog all use this form. Three parts are required because
+  ColdFront is a Go module, and the toolchain recognises only full `vX.Y.Z`
+  tags as releases. The patch field keeps a bugfix-only release (`v1.0.1`)
+  distinct from a feature release (`v1.1.0`), which matters for a
+  data-writing extension where "same behaviour, one safety fix" is worth
+  stating plainly.
+- The PostgreSQL extension uses the conventional two-part version in its
+  control file (`default_version = '1.0'`) and upgrade-script filenames
+  (`coldfront--1.0--1.1.sql`), as is standard for PostgreSQL extensions.
+
+The two map cleanly: extension `1.0` ships inside release `v1.0.0`, and a
+patch release may carry the same extension version or bump it with an
+upgrade script when the SQL changes.
+
 ## Author
 
 Created by Jimmy Angelakos.
