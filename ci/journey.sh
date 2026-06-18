@@ -530,6 +530,17 @@ EOSQL
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# require_compactor — stories 6d/6e drive the standalone Go compactor (cmd/compactor,
+# a separate iceberg-go module). Assert its binary is present before they run: a missing
+# "$COMPACTOR" otherwise gets captured into the dry-run output as "No such file or
+# directory" and reported as "nothing to compact", masking the real cause (issue #17 —
+# 6d/6e ran against a vanilla.sh that never built the compactor).
+require_compactor() {
+    [ -x "$COMPACTOR" ] && return 0
+    fail "compactor binary not found/executable at $COMPACTOR — build it with 'make compactor'; stories 6d/6e require it"
+    return 1
+}
+
 # Story 6d — Compaction: the standalone Go compactor (cmd/compactor) consolidates
 # the cold tier's many small Parquet files into fewer large ones via
 # apache/iceberg-go RewriteDataFiles, serialized through the bakery (the SAME
@@ -547,6 +558,7 @@ story_compaction() {
     # defaulting to v1 and rejecting them at PlanFiles (manifest.go:629). This live
     # story validates that fix end-to-end.
     step "6d. Compaction: iceberg-go RewriteDataFiles consolidates small cold files (bakery-serialized)"
+    require_compactor || return
     qf "$HOST" <<'EOSQL'
 INSERT INTO events (ts, status, data) VALUES (date_trunc('month',now()) - interval '4 months' + interval '1 days' + interval '0 hours','cmp1','{}');
 INSERT INTO events (ts, status, data) VALUES (date_trunc('month',now()) - interval '4 months' + interval '1 days' + interval '1 hours','cmp2','{}');
@@ -592,6 +604,7 @@ EOSQL
 # ───────────────────────────────────────────────────────────────────────────
 story_maintenance() {
     step "6e. Maintenance: expire old snapshots + reclaim orphan files (iceberg-go, bakery-serialized)"
+    require_compactor || return
     local rows_before; rows_before=$(q "$HOST" "SELECT count(*) FROM events;")
 
     local snaps; snaps=$("$COMPACTOR" --config /tmp/journey-archiver.yaml --table events --expire-snapshots --dry-run 2>&1)
