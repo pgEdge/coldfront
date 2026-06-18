@@ -13,33 +13,93 @@ name: Base image (DuckDB 1.5.x)
 # Trigger from the Actions tab (or `gh workflow run base-image.yml`) when the base
 # inputs change (Dockerfile.duckdb15-base / the iceberg patch / config). For an
 # initial publish, pushing a locally-built base is faster — see DUCKDB_1.5_PATCHED.md.
+#
+# The arch/pg inputs scope a single one-off build (e.g. an arm64 smoke test on a
+# native ubuntu-24.04-arm runner, free for public repos). Left at defaults it
+# builds all three PG majors for amd64. Smoke builds default to NO push.
 on:
   workflow_dispatch:
+    inputs:
+      arch:
+        description: 'Target arch'
+        type: choice
+        default: amd64
+        options: [amd64, arm64]
+      pg:
+        description: 'PG major (single), or "all" for 16/17/18'
+        type: choice
+        default: all
+        options: [all, '18', '17', '16']
+      push:
+        description: 'Push to GHCR (off for smoke tests)'
+        type: boolean
+        default: false
 
 permissions:
   contents: read
   packages: write   # GITHUB_TOKEN pushes to ghcr.io/pgedge
 
 jobs:
-  base:
-    name: base pg${{ matrix.pg }}
+  # Resolve the dispatch inputs into a runner label and a PG-major matrix so the
+  # build job stays a plain matrix. amd64→ubuntu-latest, arm64→ubuntu-24.04-arm
+  # (native arm64, free for public repos — no QEMU). pg=all→[18,17,16].
+  setup:
     runs-on: ubuntu-latest
+    outputs:
+      runner: ${{ steps.r.outputs.runner }}
+      platform: ${{ steps.r.outputs.platform }}
+      pgs: ${{ steps.r.outputs.pgs }}
+    steps:
+      - id: r
+        run: |
+          set -euo pipefail
+          case "${{ inputs.arch }}" in
+            amd64) echo "runner=ubuntu-latest"   >> "$GITHUB_OUTPUT"
+                   echo "platform=linux/amd64"   >> "$GITHUB_OUTPUT" ;;
+            arm64) echo "runner=ubuntu-24.04-arm" >> "$GITHUB_OUTPUT"
+                   echo "platform=linux/arm64"   >> "$GITHUB_OUTPUT" ;;
+          esac
+          if [ "${{ inputs.pg }}" = "all" ]; then
+            echo 'pgs=["18","17","16"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'pgs=["${{ inputs.pg }}"]' >> "$GITHUB_OUTPUT"
+          fi
+
+  base:
+    needs: setup
+    name: base pg${{ matrix.pg }} (${{ inputs.arch }})
+    runs-on: ${{ needs.setup.outputs.runner }}
     timeout-minutes: 300
     strategy:
       fail-fast: false
       matrix:
-        pg: ['18', '17', '16']
+        pg: ${{ fromJSON(needs.setup.outputs.pgs) }}
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
 
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@v3
+
       - name: Log in to GHCR
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
 
-      - name: Build + push base image
+      - name: Build base image (${{ needs.setup.outputs.platform }})
         run: |
           set -euo pipefail
-          IMG=ghcr.io/pgedge/coldfront-duckdb-base:pg${{ matrix.pg }}
-          docker build -f docker/Dockerfile.duckdb15-base --build-arg PG_MAJOR=${{ matrix.pg }} -t "$IMG" .
+          IMG=ghcr.io/pgedge/coldfront-duckdb-base:pg${{ matrix.pg }}-${{ inputs.arch }}
+          docker buildx build \
+            --platform ${{ needs.setup.outputs.platform }} \
+            -f docker/Dockerfile.duckdb15-base \
+            --build-arg PG_MAJOR=${{ matrix.pg }} \
+            -t "$IMG" \
+            --load .
+          echo "Built $IMG"
+
+      - name: Push base image
+        if: ${{ inputs.push }}
+        run: |
+          set -euo pipefail
+          IMG=ghcr.io/pgedge/coldfront-duckdb-base:pg${{ matrix.pg }}-${{ inputs.arch }}
           docker push "$IMG"
           echo "Pushed $IMG"

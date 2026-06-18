@@ -125,7 +125,15 @@ EOF
     # is on). The version/platform subpath is pinned in lockstep with the
     # iceberg-builder's OVERRIDE_GIT_DESCRIBE. See DUCKDB_1.5_PATCHED.md.
     if [ -f /opt/coldfront/iceberg/iceberg.duckdb_extension ]; then
-        EXTDIR="$PGDATA/pg_duckdb/extensions/${COLDFRONT_DUCKDB_VERSION:-v1.5.3}/${COLDFRONT_DUCKDB_PLATFORM:-linux_amd64}"
+        # COLDFRONT_DUCKDB_PLATFORM is baked into the image (linux_<arch>). The
+        # fallback derives it from the running arch so it never silently points at
+        # the wrong-arch dir: x86_64→linux_amd64, aarch64→linux_arm64.
+        case "$(uname -m)" in
+            x86_64)  _cf_default_platform=linux_amd64 ;;
+            aarch64) _cf_default_platform=linux_arm64 ;;
+            *)       _cf_default_platform="linux_$(uname -m)" ;;
+        esac
+        EXTDIR="$PGDATA/pg_duckdb/extensions/${COLDFRONT_DUCKDB_VERSION:-v1.5.3}/${COLDFRONT_DUCKDB_PLATFORM:-$_cf_default_platform}"
         mkdir -p "$EXTDIR"
         cp /opt/coldfront/iceberg/iceberg.duckdb_extension "$EXTDIR/iceberg.duckdb_extension"
         cp /opt/coldfront/iceberg/avro.duckdb_extension    "$EXTDIR/avro.duckdb_extension"
