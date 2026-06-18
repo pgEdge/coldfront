@@ -95,7 +95,7 @@ func run(cfgPath, tableName string, o runOpts) error {
 	// The bakery claim key MUST be byte-identical to the cold-write path's so every
 	// mutating step mutually-excludes with concurrent cold writers. The archiver and
 	// hook build it as pgx.Identifier{"ice", namespace, table}.Sanitize()
-	// (cmd/archiver/main.go iceTable; coldfront--0.1.sql tiered_views.iceberg_table).
+	// (cmd/archiver/main.go iceTable; coldfront--1.0.sql tiered_views.iceberg_table).
 	icebergRef := pgx.Identifier{"ice", ns, tableName}.Sanitize()
 
 	// One PG connection, shared across each step's bakery claim, opened lazily — a

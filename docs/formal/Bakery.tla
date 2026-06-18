@@ -4,7 +4,7 @@
 (* serializes Iceberg commits across N PG nodes.                           *)
 (*                                                                         *)
 (* The protocol code lives in three places:                                *)
-(*   * extension/coldfront/coldfront--0.1.sql                              *)
+(*   * extension/coldfront/coldfront--1.0.sql                              *)
 (*       _claim_iceberg_lock, _release_iceberg_lock,                       *)
 (*       _exec_iceberg_with_claim, _enqueue_release.                       *)
 (*   * extension/coldfront/src/coldfront.c                                 *)

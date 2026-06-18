@@ -333,7 +333,7 @@ PG nodes pointing at the same Lakekeeper endpoint and S3 bucket.
   XactCallback in
   [extension/coldfront/src/coldfront.c](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/src/coldfront.c).
 
-  The mechanics live in [extension/coldfront/coldfront--0.1.sql](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/coldfront--0.1.sql)
+  The mechanics live in [extension/coldfront/coldfront--1.0.sql](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/coldfront--1.0.sql)
   (`_claim_iceberg_lock`, `_release_iceberg_lock`,
   `_on_claim_apply`, `_on_claim_release`, `_exec_iceberg_with_claim`)
   and the C-side rewrite in [extension/coldfront/src/coldfront.c](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/src/coldfront.c)

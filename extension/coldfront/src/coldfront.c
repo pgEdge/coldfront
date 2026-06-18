@@ -27,7 +27,7 @@
  * current session before cold DML fires.  The hook calls
  * coldfront.ensure_attached() via SPI on the cold path; it reads the
  * coldfront.warehouse / coldfront.lakekeeper_endpoint GUCs and issues
- * ATTACH IF NOT EXISTS.  The helper is installed by coldfront--0.1.sql.
+ * ATTACH IF NOT EXISTS.  The helper is installed by coldfront--1.0.sql.
  */
 
 #include "postgres.h"
@@ -92,7 +92,7 @@ static bool coldfront_in_rewrite = false;
  *       FIX (only where needed): when — and only when — this statement is being
  *       parsed inside plpgsql, wrap the cold call as a DML over the dummy
  *       carrier coldfront._dummy_dml_target (see cold_anchor_update + that
- *       table's comment in coldfront--0.1.sql). At top level we keep today's
+ *       table's comment in coldfront--1.0.sql). At top level we keep today's
  *       SELECT shape byte-for-byte, so nothing there changes.
  *
  * Detecting "are we inside plpgsql?" without interfering with anything: when
@@ -944,7 +944,7 @@ cold_exec_call(const char *iceberg_table, const char *arg_sql)
  * (no dead rows, no WAL, no bloat). Used standalone for pure-cold, and as the
  * data-modifying WITH-CTE body for the dual / tiered-INSERT cases (a
  * data-modifying CTE always runs to completion, even unreferenced). See the
- * full rationale on the table in coldfront--0.1.sql.
+ * full rationale on the table in coldfront--1.0.sql.
  */
 static char *
 cold_anchor_update(const char *cold_call_expr)
@@ -2038,7 +2038,7 @@ coldfront_post_parse_analyze(ParseState *pstate, Query *query,
      * statement shape — plpgsql installs p_post_columnref_hook on the
      * ParseState; top-level (even parameterized) does not. See the
      * architecture block at the top of this file and the
-     * coldfront._dummy_dml_target comment in coldfront--0.1.sql. */
+     * coldfront._dummy_dml_target comment in coldfront--1.0.sql. */
     collect_cold_params(query, &ps);
     in_plpgsql = (pstate->p_post_columnref_hook != NULL);
 

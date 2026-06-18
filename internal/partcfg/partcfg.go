@@ -26,7 +26,7 @@ type DBTX interface {
 }
 
 // createTableSQL mirrors the coldfront.partition_config DDL in the C extension
-// (coldfront--0.1.sql) so the vanilla partitioner — stock PG, no extension —
+// (coldfront--1.0.sql) so the vanilla partitioner — stock PG, no extension —
 // can self-materialize the same table. Keep the two in sync (same pattern as
 // archive_watermark / watermark.EnsureTable).
 const createTableSQL = `

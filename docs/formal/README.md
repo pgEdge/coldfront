@@ -2,7 +2,7 @@
 
 This directory contains a formal model of the multi-writer Iceberg
 commit serialization protocol that lives in
-[extension/coldfront/coldfront--0.1.sql](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/coldfront--0.1.sql)
+[extension/coldfront/coldfront--1.0.sql](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/coldfront--1.0.sql)
 and
 [extension/coldfront/src/coldfront.c](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/src/coldfront.c).
 The CI journey (`ci/journey.sh` - `story_mesh` /
@@ -272,7 +272,7 @@ The model is a *protocol-level* abstraction. The following are
 represented faithfully because they affect protocol correctness:
 
 - The `coldfront.iceberg_async_parquet` flag's two mesh orderings in
-  [_exec_iceberg_with_claim](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/coldfront--0.1.sql):
+  [_exec_iceberg_with_claim](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/coldfront--1.0.sql):
   stock (claim → stage+commit under the claim) and patched async
   (stage parquet outside the claim → claim → re-stamp
   `parent_snapshot_id` at the commit POST under the claim). The
@@ -281,7 +281,7 @@ represented faithfully because they affect protocol correctness:
   `AsyncParquet`/`RestampPatch` constants select the ordering and
   whether the bakery-aware patch is present.
 - The bakery's min-ticket spin in
-  [_claim_iceberg_lock](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/coldfront--0.1.sql)
+  [_claim_iceberg_lock](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/coldfront--1.0.sql)
   (lines around 1180).
 - The deferred release: pg_duckdb's XactCallback commits iceberg
   first, then coldfront's XactCallback (registered after, runs after
@@ -436,7 +436,7 @@ larger bounds are interesting only if a regression is suspected.
 Re-run the model whenever the protocol it abstracts is touched. Any change
 to:
 
-- The bakery functions in `extension/coldfront/coldfront--0.1.sql`
+- The bakery functions in `extension/coldfront/coldfront--1.0.sql`
   (`_claim_iceberg_lock`, `_release_iceberg_lock`,
   `_exec_iceberg_with_claim`, `_enqueue_release`, `_on_claim_apply`,
   `_on_claim_release`).

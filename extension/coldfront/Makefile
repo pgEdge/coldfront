@@ -10,7 +10,7 @@ PG_CPPFLAGS = -I$(shell $(PG_CONFIG) --includedir)
 SHLIB_LINK  = -lpq
 
 EXTENSION   = coldfront
-DATA        = coldfront--0.1.sql
+DATA        = coldfront--1.0.sql coldfront--0.1--1.0.sql
 REGRESS     = load_order update_unregistered_view update_heap_table \
               update_hot_via_view update_cold_via_view update_ambiguous_rejected \
               returning_literal_in_where cast_literal_in_value \
