@@ -1,11 +1,9 @@
-<div align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="docs/img/pgedge-labs-dark.png">
-    <img alt="pgEdge Labs" src="docs/img/pgedge-labs-light.png" width="320">
-  </picture>
-</div>
-
 # pgEdge ColdFront
+
+> [!WARNING]
+> ColdFront is pre-release beta software under active development. Do
+> not use it in production. Interfaces, on-disk formats, and behaviour
+> may change without notice, and data loss is possible.
 
 [![CI](https://github.com/pgEdge/ColdFront/actions/workflows/ci.yml/badge.svg)](https://github.com/pgEdge/ColdFront/actions/workflows/ci.yml)
 
