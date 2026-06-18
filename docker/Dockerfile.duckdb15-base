@@ -11,10 +11,30 @@
 # (.github/workflows/base-image.yml) builds and pushes it to
 # ghcr.io/pgedge/coldfront-duckdb-base with the workflow GITHUB_TOKEN.
 #
+# The image is arch-aware: it builds natively for the host arch (amd64 on x86_64,
+# arm64 on aarch64). The manylinux base, vcpkg triplet, and DuckDB extension dir
+# are all derived from the target arch — no manual edits to switch arches.
+#
+#   # native (host arch):
 #   docker build -f docker/Dockerfile.duckdb15-base --build-arg PG_MAJOR=18 \
 #       -t ghcr.io/pgedge/coldfront-duckdb-base:pg18 .
+#
+#   # cross-build arm64 under emulation on an x86_64 host (needs buildx + QEMU:
+#   #   docker run --privileged --rm tonistiigi/binfmt --install arm64):
+#   docker buildx build --platform linux/arm64 -f docker/Dockerfile.duckdb15-base \
+#       --build-arg PG_MAJOR=18 -t coldfront-duckdb-base:pg18-arm64 --load .
 ARG PG_MAJOR=18
 ARG PGEDGE_TAG=${PG_MAJOR}-spock5-minimal
+
+# Target arch, auto-detected by buildx (amd64 on x86_64 hosts, arm64 on aarch64).
+# TARGETARCH is a built-in buildx ARG, populated for free from --platform / the
+# build host. The iceberg-builder FROM needs the manylinux image suffix resolved
+# BEFORE the stage starts (FROM can't run shell), so the manylinux-resolve stage
+# below maps amd64→x86_64 / arm64→aarch64 and pins iceberg-builder's base to it.
+# The vcpkg triplet and the DuckDB platform string are derived from `uname -m`
+# inside their own RUN steps. Override --build-arg TARGETARCH=arm64 to
+# cross-build under emulation on an x86_64 host.
+ARG TARGETARCH=amd64
 
 # ─── build stage: libcurl 8.12 + pg_duckdb (DuckDB 1.5.3, PR #1025) ──────────────
 FROM ghcr.io/pgedge/pgedge-postgres:${PGEDGE_TAG} AS build
@@ -62,8 +82,17 @@ RUN printf '\noverride CXXFLAGS := $(filter-out -fexcess-precision=standard,$(CX
 RUN make -C /build/pg_duckdb -j"$(nproc)" with_llvm=no \
  && DESTDIR=/out make -C /build/pg_duckdb install with_llvm=no
 
+# ─── manylinux base selection (arch-resolved) ───────────────────────────────────
+# Alias each manylinux arch image, then pick one by TARGETARCH. This indirection
+# is needed because Dockerfile FROM cannot nest ARG expansion (no ${VAR_${VAR}});
+# the unused alias is never pulled or built.
+FROM --platform=linux/amd64 quay.io/pypa/manylinux_2_28_x86_64  AS manylinux-amd64
+FROM --platform=linux/arm64 quay.io/pypa/manylinux_2_28_aarch64 AS manylinux-arm64
+ARG TARGETARCH
+FROM manylinux-${TARGETARCH} AS manylinux-base
+
 # ─── iceberg-builder stage: iceberg + avro + azure (DuckDB 1.5.x ABI, PATCHED) ──
-FROM quay.io/pypa/manylinux_2_28_x86_64 AS iceberg-builder
+FROM manylinux-base AS iceberg-builder
 ARG ICEBERG_REF=0fad545a
 # libasan/libubsan: the extension_configuration phase builds a Debug
 # duckdb_platform_binary that links AddressSanitizer. perl-Time-Piece:
@@ -113,9 +142,17 @@ RUN cd /build/duckdb-iceberg \
  && git apply        /tmp/iceberg-mcontent-v15.patch \
  && git apply --check /tmp/iceberg-fileformat-v15.patch \
  && git apply        /tmp/iceberg-fileformat-v15.patch
+# vcpkg triplet is derived from the build arch (uname -m): x86_64→x64-linux,
+# aarch64→arm64-linux. Host and target match here (the stage runs on the target
+# arch, native or emulated), so HOST and TARGET triplets are the same value.
 RUN cd /build/duckdb-iceberg && bash -c 'source /opt/rh/gcc-toolset-*/enable 2>/dev/null; \
+    case "$(uname -m)" in \
+      x86_64)  VCPKG_TRIPLET=x64-linux ;; \
+      aarch64) VCPKG_TRIPLET=arm64-linux ;; \
+      *) echo "unsupported build arch: $(uname -m)" >&2; exit 1 ;; \
+    esac; \
     export VCPKG_TOOLCHAIN_PATH=/build/vcpkg/scripts/buildsystems/vcpkg.cmake VCPKG_ROOT=/build/vcpkg \
-           VCPKG_TARGET_TRIPLET=x64-linux VCPKG_HOST_TRIPLET=x64-linux USE_MERGED_VCPKG_MANIFEST=1 \
+           VCPKG_TARGET_TRIPLET=$VCPKG_TRIPLET VCPKG_HOST_TRIPLET=$VCPKG_TRIPLET USE_MERGED_VCPKG_MANIFEST=1 \
            EXT_CONFIG=/build/duckdb-iceberg/extension_config.cmake OVERRIDE_GIT_DESCRIBE=v1.5.3 \
            CMAKE_BUILD_PARALLEL_LEVEL=$(nproc); \
     make -j$(nproc) release'
@@ -123,6 +160,7 @@ RUN cd /build/duckdb-iceberg && bash -c 'source /opt/rh/gcc-toolset-*/enable 2>/
 # ─── base runtime stage (pg_duckdb + iceberg, NO coldfront) ──────────────────────
 FROM ghcr.io/pgedge/pgedge-postgres:${PGEDGE_TAG}
 ARG PG_MAJOR
+ARG TARGETARCH
 USER root
 RUN dnf install -y --setopt=install_weak_deps=False --allowerasing \
         libcurl lz4 pgedge-postgresql${PG_MAJOR}-contrib openssl \
@@ -148,8 +186,11 @@ COPY --from=iceberg-builder /build/duckdb-iceberg/build/release/extension/azure/
 # postgres_scanner (the 'postgres' ext) — shipped so install_extension('postgres')
 # resolves it locally; the terrible-link runtime download is removed entirely.
 COPY --from=iceberg-builder /build/duckdb-iceberg/build/release/extension/postgres_scanner/postgres_scanner.duckdb_extension /opt/coldfront/iceberg/postgres_scanner.duckdb_extension
+# DuckDB's platform string is linux_<arch> with the SAME arch tokens buildx uses
+# (amd64/arm64), so the extension dir is just linux_${TARGETARCH}. The entrypoint
+# places the iceberg/avro/azure extensions under .../v1.5.3/$COLDFRONT_DUCKDB_PLATFORM.
 ENV COLDFRONT_DUCKDB_VERSION=v1.5.3 \
-    COLDFRONT_DUCKDB_PLATFORM=linux_amd64
+    COLDFRONT_DUCKDB_PLATFORM=linux_${TARGETARCH}
 
 COPY docker/entrypoint.sh /usr/local/bin/coldfront-entrypoint.sh
 RUN chmod +x /usr/local/bin/coldfront-entrypoint.sh
