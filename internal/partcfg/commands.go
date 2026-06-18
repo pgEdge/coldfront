@@ -790,7 +790,7 @@ EXAMPLES:
 	if err := EnsureTable(ctx, conn); err != nil {
 		return err
 	}
-	tables, err := LoadTables(ctx, conn)
+	tables, err := LoadTables(ctx, conn, AllOwners) // export is ownership-agnostic
 	if err != nil {
 		return err
 	}

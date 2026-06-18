@@ -1545,6 +1545,73 @@ EOF
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# Story — issue #14: coldfront.partition_config is ONE shared table holding both
+# archiver-owned (tiered: hot_period set) and partitioner-owned (partition-only:
+# hot_period NULL) rows. Each binary must load only the rows it owns, scoped in
+# SQL by hot_period. Pre-fix the shared loader took every enabled row, so the
+# archiver choked on the partition-only row ("hot_period is required in tiered
+# mode") and the partitioner on the tiered row ("only valid in tiered mode").
+# Mirrors the issue's repro: one of each in a private schema, run each binary,
+# assert it logs "loaded 1 table(s)" and the validation errors are absent. A
+# private schema keeps the p_YYYY_MM leaves clear of public.events (see
+# idmode_check) and the cleanup keeps the shared config clean for later stories.
+# ───────────────────────────────────────────────────────────────────────────
+story_partition_config_ownership() {
+    step "Shared partition_config: each binary loads only the rows it owns (issue #14)"
+    local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
+    q "$HOST" "CREATE SCHEMA IF NOT EXISTS own;
+               CREATE TABLE IF NOT EXISTS own.po  (id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL, PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);
+               CREATE TABLE IF NOT EXISTS own.tier(id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL, PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);" >/dev/null
+
+    # own.po → partition-only (partitioner, hot_period NULL); own.tier → tiered
+    # (archiver, hot_period set). Both land in the one shared partition_config
+    # (which also still holds earlier stories' tiered rows: events, cli_events —
+    # so we assert per-table ownership, NOT an absolute "loaded N" count).
+    "$PARTITIONER" register --dsn "$dsn" --schema own --table po   --period monthly --retention "60 months" >/tmp/journey-own-po-reg.log   2>&1
+    "$ARCHIVER"    register --dsn "$dsn" --schema own --table tier --period monthly --hot-period "1 month" --retention "60 months" >/tmp/journey-own-tier-reg.log 2>&1
+    assert_eq "issue #14: partition-only row owned by partitioner (hot_period NULL)" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE schema_name='own' AND table_name='po'   AND hot_period IS NULL;")"
+    assert_eq "issue #14: tiered row owned by archiver (hot_period set)"             "1" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE schema_name='own' AND table_name='tier' AND hot_period IS NOT NULL;")"
+
+    # Archiver run: processes its tiered row (own.tier), never the partitioner's
+    # partition-only row (own.po), and no longer aborts on a foreign row.
+    "$ARCHIVER" --config /tmp/journey-archiver.yaml >/tmp/journey-own-arch.log 2>&1 || true
+    if grep -q "hot_period is required in tiered mode" /tmp/journey-own-arch.log; then
+        fail "issue #14: archiver still choked on the partition-only row"; tail -5 /tmp/journey-own-arch.log
+    else
+        pass "issue #14: archiver did not choke on the partition-only row"
+    fi
+    # Per-table logs use the bare source-table name ([tier] / [po]); own.tier and
+    # own.po are unique here so the substrings are unambiguous.
+    assert_contains "issue #14: archiver processed its own tiered table" "[tier]" "$(cat /tmp/journey-own-arch.log)"
+    if grep -q "\[po\]" /tmp/journey-own-arch.log; then
+        fail "issue #14: archiver touched the partitioner's row (po)"; tail -5 /tmp/journey-own-arch.log
+    else
+        pass "issue #14: archiver ignored the partitioner's row (po)"
+    fi
+
+    # Partitioner run: reconciles its partition-only row (own.po), never the
+    # archiver's tiered row (own.tier), and no longer aborts on a foreign row.
+    printf 'postgres: { dsn: "%s" }\n' "$dsn" > /tmp/journey-own-part.yaml
+    "$PARTITIONER" --config /tmp/journey-own-part.yaml >/tmp/journey-own-part.log 2>&1 || true
+    if grep -q "only valid in tiered mode" /tmp/journey-own-part.log; then
+        fail "issue #14: partitioner still choked on the tiered row"; tail -5 /tmp/journey-own-part.log
+    else
+        pass "issue #14: partitioner did not choke on the tiered row"
+    fi
+    assert_contains "issue #14: partitioner reconciled its own partition-only table" "[po] reconciled" "$(cat /tmp/journey-own-part.log)"
+    if grep -q "\[tier\]" /tmp/journey-own-part.log; then
+        fail "issue #14: partitioner touched the archiver's row (tier)"; tail -5 /tmp/journey-own-part.log
+    else
+        pass "issue #14: partitioner ignored the archiver's row (tier)"
+    fi
+
+    # Clean up so the SHARED coldfront.partition_config stays clean for later stories.
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE schema_name='own'; DROP SCHEMA own CASCADE;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Story — Enterprise privilege model: a NON-superuser app role, onboarded with a
 # single coldfront.grant_app_access() call, reads AND writes the tiered view
 # transparently — no superuser, no pg_*_server_files, no per-session setup.
@@ -1614,6 +1681,7 @@ if [ "$MODE" = "tiered" ]; then
     story_partitioner_multitable
     story_partitioner_after_swap
     story_register_cli
+    story_partition_config_ownership   # issue #14: each binary loads only its own rows
 else
     story_provision_decoupled
     story_decoupled_crud

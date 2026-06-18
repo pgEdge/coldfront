@@ -104,16 +104,29 @@ func EnsureTable(ctx context.Context, db DBTX) error {
 	return nil
 }
 
-// ResolveTables returns the managed-table set: it ensures the table exists,
-// then returns the partition_config rows if there are any, else the supplied
-// YAML fallback (the deprecation bridge for not-yet-migrated deployments). The
-// bool is true when the YAML fallback was used. Callers fail loud if the result
-// is empty (both sources empty).
-func ResolveTables(ctx context.Context, db DBTX, yamlFallback []config.TableConfig) ([]config.TableConfig, bool, error) {
+// owner selects which partition_config rows to load, by the hot_period mode
+// switch that already distinguishes the two binaries' tables: tiered rows
+// (hot_period set) belong to the archiver, partition-only rows (hot_period NULL)
+// to the partitioner. AllOwners is the ownership-agnostic path (export/list).
+// The int values are the $1 selector in LoadTables' SQL — do not reorder.
+type owner int
+
+const (
+	AllOwners     owner = iota // every enabled row (export, list)
+	Tiered                     // archiver    — hot_period IS NOT NULL
+	PartitionOnly              // partitioner — hot_period IS NULL
+)
+
+// ResolveTables returns the managed-table set the caller owns: it ensures the
+// table exists, then returns the partition_config rows matching own if there are
+// any, else the supplied YAML fallback (the deprecation bridge for not-yet-
+// migrated deployments). The bool is true when the YAML fallback was used.
+// Callers fail loud if the result is empty (both sources empty).
+func ResolveTables(ctx context.Context, db DBTX, yamlFallback []config.TableConfig, own owner) ([]config.TableConfig, bool, error) {
 	if err := EnsureTable(ctx, db); err != nil {
 		return nil, false, err
 	}
-	rows, err := LoadTables(ctx, db)
+	rows, err := LoadTables(ctx, db, own)
 	if err != nil {
 		return nil, false, err
 	}
@@ -123,16 +136,22 @@ func ResolveTables(ctx context.Context, db DBTX, yamlFallback []config.TableConf
 	return yamlFallback, true, nil
 }
 
-// LoadTables reads the enabled partition_config rows into the existing
-// config.TableConfig shape, so every downstream consumer is unchanged.
-func LoadTables(ctx context.Context, db DBTX) ([]config.TableConfig, error) {
+// LoadTables reads the enabled partition_config rows the caller owns into the
+// existing config.TableConfig shape, so every downstream consumer is unchanged.
+// own filters by the hot_period ownership switch (see owner); AllOwners loads all.
+func LoadTables(ctx context.Context, db DBTX, own owner) ([]config.TableConfig, error) {
 	rows, err := db.Query(ctx, `
 		SELECT schema_name, table_name, partition_period, partition_column,
 		       future_partitions, part_mode, id_scheme, hot_period::text,
 		       retention_period::text, sub_part_values_source, expiration_strategy
 		FROM coldfront.partition_config
 		WHERE enabled
-		ORDER BY schema_name, table_name`)
+		  AND CASE $1::int
+		        WHEN 1 THEN hot_period IS NOT NULL   -- Tiered (archiver)
+		        WHEN 2 THEN hot_period IS NULL       -- PartitionOnly (partitioner)
+		        ELSE true                            -- AllOwners
+		      END
+		ORDER BY schema_name, table_name`, int(own))
 	if err != nil {
 		return nil, fmt.Errorf("query partition_config: %w", err)
 	}

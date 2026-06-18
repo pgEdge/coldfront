@@ -108,7 +108,7 @@ func dispatchSubcommand(ctx context.Context) bool {
 func loadAndResolve(ctx context.Context, conn *pgx.Conn, cfg *config.Config, cfgPath string) {
 	// Resolve managed tables from the replicated coldfront.partition_config
 	// table, falling back to the YAML archiver.tables (deprecation bridge).
-	tables, fromYAML, err := partcfg.ResolveTables(ctx, conn, cfg.Archiver.Tables)
+	tables, fromYAML, err := partcfg.ResolveTables(ctx, conn, cfg.Archiver.Tables, partcfg.PartitionOnly)
 	if err != nil {
 		log.Fatalf("resolve tables: %v", err)
 	}
