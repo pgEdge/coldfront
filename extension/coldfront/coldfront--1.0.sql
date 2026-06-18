@@ -206,6 +206,13 @@ BEGIN
     -- Background: https://curl.se/docs/CVE-2025-0665.html
     -- Run AFTER the ATTACH (httpfs loaded); GLOBAL = this backend's instance; idempotent.
     PERFORM duckdb.raw_query($q$SET GLOBAL httpfs_client_implementation = 'httplib'$q$);
+    -- httpfs (s3) already loaded as a side-effect of the ATTACH above; azure does
+    -- not, so its lazy autoload would otherwise fire later as the non-superuser
+    -- app role and hit pg_duckdb's LocalFileSystem block (issue #17). Pre-load it
+    -- here, while still in this SECURITY DEFINER (elevated) context.
+    IF EXISTS (SELECT 1 FROM coldfront.storage_secret WHERE storage_type = 'azure') THEN
+      PERFORM duckdb.raw_query('LOAD azure');
+    END IF;
   END IF;
 END;
 -- SECURITY DEFINER: this must run elevated. pg_duckdb force-disables DuckDB's
