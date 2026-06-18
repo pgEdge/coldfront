@@ -23,6 +23,7 @@ name: CI
 
 on:
   push:
+    branches: [main]   # branch work is gated via its PR; main covers merges + direct pushes
   pull_request:
   schedule:
     - cron: '0 3 * * *'   # nightly full matrix (UTC)
