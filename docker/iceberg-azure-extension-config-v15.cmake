@@ -1,7 +1,7 @@
 # extension_config.cmake for the DuckDB 1.5.x ColdFront build (Azure ADLS cold
 # tier). Builds iceberg + avro + azure against ONE DuckDB (iceberg's
 # v1.5-variegata submodule) so all three .duckdb_extension files share one ABI
-# and load together in pg_duckdb 1.5.3. See DUCKDB_1.5_PATCHED.md for the why.
+# and load together in pg_duckdb 1.5.4. See DUCKDB_1.5_PATCHED.md for the why.
 #
 # This config only SELECTS which extensions to build; the bakery-aware-commit-
 # refresh patch is applied separately by docker/Dockerfile.duckdb15-base
@@ -23,7 +23,7 @@ duckdb_extension_load(postgres_scanner
     GIT_URL https://github.com/duckdb/duckdb-postgres
     # The 'postgres' extension (pglocal write path: DuckDB reads PG tables to
     # stream into Iceberg). Built here so it is SHIPPED in the image and never
-    # downloaded at runtime — extensions.duckdb.org has no reliably-cached v1.5.3
+    # downloaded at runtime — extensions.duckdb.org has no reliably-cached v1.5.4
     # build, and install_extension would block on the network. This is the EXACT
     # commit + submodule DuckDB 14eca11b pins for postgres_scanner
     # (duckdb/.github/config/extensions/postgres_scanner.cmake) — guaranteed

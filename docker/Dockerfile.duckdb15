@@ -1,6 +1,6 @@
 # ColdFront image on the DuckDB 1.5.x stack — the THIN coldfront layer on top of
 # the prebuilt coldfront-duckdb-base. The base (docker/Dockerfile.duckdb15-base)
-# carries the expensive, STABLE compiles — pg_duckdb 1.5.3 (PR #1025) and the
+# carries the expensive, STABLE compiles — pg_duckdb 1.5.4 (PR #1025) and the
 # patched duckdb-iceberg extensions (iceberg/avro/azure/postgres_scanner,
 # v1.5-variegata + the bakery-aware commit-refresh patch). This build only
 # compiles the coldfront C extension (seconds), so CI and local builds are fast
@@ -35,7 +35,7 @@ COPY extension/coldfront /build/coldfront
 RUN DESTDIR=/out make -C /build/coldfront install with_llvm=no
 
 # ─── app runtime: coldfront extension on top of the base ─────────────────────────
-# pg_duckdb 1.5.3, the iceberg/avro/azure/postgres_scanner extensions, libcurl
+# pg_duckdb 1.5.4, the iceberg/avro/azure/postgres_scanner extensions, libcurl
 # 8.12, COLDFRONT_DUCKDB_* env and /data are inherited from the base. This stage
 # adds coldfront's .so + SQL/control (distinct filenames — no overwrite of
 # pg_duckdb) AND refreshes the entrypoint from the CURRENT branch.

@@ -1,6 +1,6 @@
 # PATCHED — duckdb-iceberg patches & build (DuckDB 1.5.x)
 
-ColdFront runs on a **custom-built DuckDB 1.5.3 base image** that carries a
+ColdFront runs on a **custom-built DuckDB 1.5.4 base image** that carries a
 small set of patches against `duckdb-iceberg` `v1.5-variegata`. This is the one
 home for *what* we patch, *why*, *how the base is built*, and *how it is wired
 and verified*. The cold-tier compactor's own story (and the three interop
@@ -131,13 +131,13 @@ patches only.
 
 | Component | Pin | Notes |
 |---|---|---|
-| pg_duckdb | **PR #1025 head** (`9c9fbcd`) | no released tag carries 1.5.x; `git fetch origin pull/1025/head`. Sets `DUCKDB_VERSION=v1.5.3`. |
-| DuckDB | **v1.5.3** (submodule `9a64d338`) | the `duckdb.*` GUCs + PRE_COMMIT iceberg-commit deferral ColdFront relies on are unchanged by the PR. |
-| duckdb-iceberg | **`v1.5-variegata` @ `0fad545a`** | transaction code lives in `src/catalog/rest/transaction/`; the four patches apply here. |
+| pg_duckdb | **merged PR #1025** (`c04e6a2`) | no released tag carries 1.5.x; `git checkout c04e6a2`. Its duckdb submodule is the v1.5.4 tag (`08e34c4`). |
+| DuckDB | **v1.5.4 tag** (`08e34c4`) | pinned by pg_duckdb @ `c04e6a2`; the iceberg build re-pins ITS duckdb submodule to the same tag so the extension ABI matches the engine. The `duckdb.*` GUCs + PRE_COMMIT iceberg-commit deferral ColdFront relies on are unchanged. |
+| duckdb-iceberg | **`v1.5-variegata` @ `0fad545a`** | extension code the four patches target — kept fixed, so the patches apply unchanged. The build re-pins its duckdb submodule to the v1.5.4 tag (the branch tracks duckdb `main`, which drifts off the release). Transaction code lives in `src/catalog/rest/transaction/`. |
 | avro | **`7f423d69`** | the pin `v1.5-variegata` uses. |
 | azure | **`v1.5-variegata` @ `563589b2`** | the ABI-matched sibling of iceberg's branch. **NOT `main`** — azure `main` collides at link (`multiple definition of duckdb::FileFlags::FILE_FLAGS_NULL_IF_NOT_EXISTS`). |
-| postgres_scanner | duckdb-postgres **`main` @ `916d862b`** | the `postgres` ext; built bundled (ABI-matched, stamped v1.5.3), **shipped** in the image (never downloaded). Its vcpkg `libpq` build needs **flex** + **bison**. |
-| libcurl | **build 8.12.0** (≥ 7.77) | **REQUIRED** — DuckDB 1.5.3 httpfs uses `CURLSSLOPT_AUTO_CLIENT_CERT` (≥ 7.77); the pgEdge base ships 7.76.1. 8.12.0 fixes CVE-2025-0665 (the 8.11.1 resolver SIGABRT); runtime still pins httplib regardless. |
+| postgres_scanner | duckdb-postgres **`6b2b12ca`** | the `postgres` ext; built bundled (ABI-matched, stamped v1.5.4), **shipped** in the image (never downloaded). Its vcpkg `libpq` build needs **flex** + **bison**. |
+| libcurl | **build 8.12.0** (≥ 7.77) | **REQUIRED** — DuckDB 1.5.4 httpfs uses `CURLSSLOPT_AUTO_CLIENT_CERT` (≥ 7.77); the pgEdge base ships 7.76.1. 8.12.0 fixes CVE-2025-0665 (the 8.11.1 resolver SIGABRT); runtime still pins httplib regardless. |
 
 ## 6. Build — `docker/Dockerfile.duckdb15-base`
 
@@ -155,7 +155,7 @@ requirements (each a real build failure if missing):
 - **`flex` + `bison`** for the `postgres_scanner` vcpkg `libpq` build.
 - **azure pinned `v1.5-variegata` (`563589b2`), not `main`** (link collision).
 - iceberg/avro/azure/postgres_scanner are built **bundled** against one DuckDB
-  (`make release`, `OVERRIDE_GIT_DESCRIBE=v1.5.3`) so they are ABI-safe; build
+  (`make release`, `OVERRIDE_GIT_DESCRIBE=v1.5.4`) so they are ABI-safe; build
   config is `docker/iceberg-azure-extension-config-v15.cmake`.
 - The bakery + three interop patches are `COPY`'d in and `git apply --check`'d
   then applied (see the Dockerfile's patch block).
@@ -172,9 +172,9 @@ current source.
 
 | File | Role |
 |---|---|
-| `docker/Dockerfile.duckdb15-base` | base: pg_duckdb 1.5.3 (PR #1025) + libcurl 8.12 + patched iceberg/avro/azure/postgres_scanner; runtime stage = the 4 extensions + entrypoint, **no coldfront**. |
+| `docker/Dockerfile.duckdb15-base` | base: pg_duckdb 1.5.4 (PR #1025) + libcurl 8.12 + patched iceberg/avro/azure/postgres_scanner; runtime stage = the 4 extensions + entrypoint, **no coldfront**. |
 | `docker/Dockerfile.duckdb15` | app: a `cf-build` stage compiles coldfront (PG devel only — coldfront links libpq, not pg_duckdb), then `FROM ${COLDFRONT_BASE}` copies the `.so`/SQL on top. |
-| `docker/entrypoint.sh` | first-init: sets `COLDFRONT_DUCKDB_VERSION=v1.5.3`, pre-places the extensions under `$PGDATA/pg_duckdb/extensions/v1.5.3/<platform>/`, writes the GUCs. |
+| `docker/entrypoint.sh` | first-init: sets `COLDFRONT_DUCKDB_VERSION=v1.5.4`, pre-places the extensions under `$PGDATA/pg_duckdb/extensions/v1.5.4/<platform>/`, writes the GUCs. |
 | `docker/iceberg-azure-extension-config-v15.cmake` | the bundled-build extension config (iceberg + avro + azure + postgres_scanner). |
 | `.github/workflows/base-image.yml` | builds + pushes the base via `GITHUB_TOKEN` (base rebuilds are rare). |
 

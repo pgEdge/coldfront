@@ -44,7 +44,7 @@
 - github.com/jackc/pgx/v5 (PostgreSQL driver — use pgxpool directly)
 - gopkg.in/yaml.v3 (config)
 - github.com/stretchr/testify (test assertions only)
-- pg_duckdb 1.5.3 (PR #1025, DuckDB 1.5.3) + patched duckdb-iceberg, prebuilt into the `coldfront-duckdb-base` image — see [DUCKDB_1.5_PATCHED.md](DUCKDB_1.5_PATCHED.md)
+- pg_duckdb 1.5.4 (PR #1025, DuckDB 1.5.4) + patched duckdb-iceberg, prebuilt into the `coldfront-duckdb-base` image — see [DUCKDB_1.5_PATCHED.md](DUCKDB_1.5_PATCHED.md)
 - `cmd/compactor/` is a separate Go module (apache/iceberg-go) — its heavy deps are quarantined from the lean archiver
 - `extension/coldfront/` — PGXS C extension. Requires `pg_config` and PG dev headers. Built inside the Docker image; users on bare-metal install with `make && make install`.
 

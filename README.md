@@ -212,7 +212,7 @@ pgedge-coldfront/
 │   ├── topo/                   ← vanilla.sh (1 node) · mesh.sh (3-node Spock)
 │   └── runbooks/               ← failover-patroni.md (failover delegated to Patroni)
 ├── docker/
-│   ├── Dockerfile.duckdb15-base ← DuckDB 1.5.x base (pg_duckdb 1.5.3 + patched iceberg)
+│   ├── Dockerfile.duckdb15-base ← DuckDB 1.5.x base (pg_duckdb 1.5.4 + patched iceberg)
 │   ├── Dockerfile.duckdb15      ← thin coldfront app layer (ARG PG_MAJOR=16|17|18)
 │   ├── iceberg-*.patch          ← duckdb-iceberg patches (bakery commit-refresh + strict-reader interop)
 │   ├── entrypoint.sh
@@ -238,7 +238,7 @@ against:
 | Component | Version | Purpose |
 |-----------|---------|---------|
 | PostgreSQL | 16, 17, or 18 | Database with native partitioning (stock upstream; no fork) |
-| pg_duckdb | 1.5.3 (PR #1025) | Iceberg reads + writes via DuckDB in-process |
+| pg_duckdb | 1.5.4 (PR #1025) | Iceberg reads + writes via DuckDB in-process |
 | duckdb-iceberg | `v1.5-variegata` @ `0fad545a`, patched | Iceberg catalog/IO for DuckDB; carries ColdFront's four patches (see [DUCKDB_1.5_PATCHED.md](DUCKDB_1.5_PATCHED.md)) |
 | Lakekeeper | latest | Iceberg REST catalog (Rust binary) |
 | S3-compatible store | any | SeaweedFS, MinIO, GCS, Azure Blob, etc. |
