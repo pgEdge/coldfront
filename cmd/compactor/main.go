@@ -194,6 +194,14 @@ func doOrphans(ctx context.Context, cat *rest.Catalog, ns, tableName string, o r
 	if err != nil {
 		return err
 	}
+	// Walk the table location with a flat object list: an object at exactly a
+	// directory path (e.g. .../data) otherwise collides with that prefix and
+	// iceberg-go's hierarchical walk dies with "readdir: not implemented" on
+	// object stores. See flatwalk.go.
+	tbl, err = withFlatWalk(ctx, tbl)
+	if err != nil {
+		return err
+	}
 	if o.dryRun {
 		n, derr := deleteOrphans(ctx, tbl, o.orphanAge, true)
 		if derr != nil {
