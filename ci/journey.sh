@@ -527,6 +527,16 @@ EOSQL
     # rows) rather than silently returning a partial/void result.
     local cr; cr=$(q_may "$HOST" "UPDATE events SET status='x' WHERE ts < date_trunc('month',now()) - interval '3 months' RETURNING id;")
     assert_err "cold-tier RETURNING rejected" "cold tier" "$cr"
+    # An UPDATE that assigns the partition column is rejected before any tier write,
+    # so a cross-cutoff move can't silently lose the row (#20) and a hot→archived-
+    # range move can't leak the internal _events partition-routing error (#21). Both
+    # directions error the same way regardless of which tier the WHERE selects.
+    local pkc; pkc=$(q_may "$HOST" "UPDATE events SET ts=date_trunc('month',now()) - interval '1 month' WHERE ts < date_trunc('month',now()) - interval '3 months';")
+    assert_err "partition-key UPDATE rejected (cold→hot, #20)" "partition column" "$pkc"
+    local pkh; pkh=$(q_may "$HOST" "UPDATE events SET ts=date_trunc('month',now()) - interval '4 months' WHERE status='dual_upd';")
+    assert_err "partition-key UPDATE rejected (hot→archived, #21)" "partition column" "$pkh"
+    # The #21 leak specifically: the internal _events name must NOT appear in the error.
+    case "$pkh" in *_events*) fail "#21: internal _events name leaked in error: $pkh";; *) pass "#21: internal _events name not leaked";; esac
 }
 
 # ───────────────────────────────────────────────────────────────────────────
