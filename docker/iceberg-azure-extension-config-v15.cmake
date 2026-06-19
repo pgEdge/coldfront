@@ -24,11 +24,8 @@ duckdb_extension_load(postgres_scanner
     # The 'postgres' extension (pglocal write path: DuckDB reads PG tables to
     # stream into Iceberg). Built here so it is SHIPPED in the image and never
     # downloaded at runtime — extensions.duckdb.org has no reliably-cached v1.5.4
-    # build, and install_extension would block on the network. This is the EXACT
-    # commit + submodule DuckDB 14eca11b pins for postgres_scanner
-    # (duckdb/.github/config/extensions/postgres_scanner.cmake) — guaranteed
-    # API+ABI-compatible. NOT main (main needs a newer database-connector that
-    # breaks against this DuckDB: "dbconnector/pool.hpp: No such file").
+    # build, and install_extension would block on the network. Pinned to a fixed
+    # commit, validated against DuckDB v1.5.4 in CI.
     GIT_TAG 6b2b12cad3afef61e8a4637e714e8a88895fed1a
     SUBMODULES database-connector)
 endif()
