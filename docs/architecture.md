@@ -320,7 +320,7 @@ ColdFront coordinates concurrent writes across the cluster as follows:
   snowflake ticket via the Spock-replicated `coldfront.claims` table and
   waits for its turn before issuing the iceberg commit. No 409s, no
   app-level retry. See
-  [architecture_decoupled.md → Concurrency](architecture_decoupled.md#concurrency--horizontal-scaling--the-bakery-protocol)
+  [architecture_decoupled.md → Concurrency](architecture_decoupled.md#concurrency-horizontal-scaling-the-bakery-protocol)
   for the full design and benchmarks.
 
 ### Cold-write strategy: stock vs patched duckdb-iceberg

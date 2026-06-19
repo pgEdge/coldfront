@@ -501,7 +501,7 @@ Keep the following caveats in mind when running either mode:
   and it stays safe under Spock's asymmetric apply (modelled in [docs/formal/Bakery_v2.tla](https://github.com/pgEdge/ColdFront/blob/main/docs/formal/Bakery_v2.tla)). The bakery requires the `dblink` + `snowflake`
   extensions, the `coldfront.dblink_self` GUC, and a one-time `SELECT
   coldfront._ensure_claims_replicated()` call on every node after spock
-  mesh setup; see [architecture_decoupled.md](architecture_decoupled.md#concurrency--horizontal-scaling--the-bakery-protocol). Sync-rep is **not** required.
+  mesh setup; see [architecture_decoupled.md](architecture_decoupled.md#concurrency-horizontal-scaling-the-bakery-protocol). Sync-rep is **not** required.
   The throughput ceiling is Lakekeeper's commit rate, not the writer
   count.
 - **Direct table access**: `_events` is the hot heap (tiered mode only).

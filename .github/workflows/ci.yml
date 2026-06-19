@@ -59,6 +59,9 @@ jobs:
           curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
             | sh -s -- -b "$(go env GOPATH)/bin"
 
+      - name: Install mkdocs (for docs --strict preflight)
+        run: pipx install mkdocs && pipx inject mkdocs mkdocs-material
+
       # SeaweedFS-only: --quick never touches a cloud STORAGE backend, so this job
       # gets no cloud storage credentials by design. It still logs in to GHCR —
       # only to PULL the coldfront-duckdb-base image the app builds FROM.
@@ -107,6 +110,9 @@ jobs:
         run: |
           curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
             | sh -s -- -b "$(go env GOPATH)/bin"
+
+      - name: Install mkdocs (for docs --strict preflight)
+        run: pipx install mkdocs && pipx inject mkdocs mkdocs-material
 
       - name: Log in to GHCR (pull base image)
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin

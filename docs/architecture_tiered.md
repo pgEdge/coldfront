@@ -102,7 +102,7 @@ The archiver processes each expired partition (older than
 `retention_period`) through the following steps:
 
 **1. Export to Iceberg** - using the temp table bridge (see
-[architecture.md → Temp table bridge](architecture.md#temp-table-bridge-pg--iceberg)).
+[architecture.md → Temp table bridge](architecture.md#temp-table-bridge-pg-iceberg)).
 On the very first export, creates the Iceberg namespace and table.
 Catalog conflicts from concurrent writes are retried with linear
 backoff (1s, 2s, 3s).

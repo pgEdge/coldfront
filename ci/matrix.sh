@@ -68,6 +68,13 @@ preflight() {
     step "preflight 6: compactor module (separate go.mod — iceberg-go)"
     if ! make compactor GOLANGCI="$linter" 2>&1; then fail "compactor module"; exit 1; fi
     pass "compactor (vet, lint, test, build $(ls -lh bin/compactor 2>/dev/null | awk '{print $5}'))"
+
+    step "preflight 7: docs (mkdocs build --strict)"
+    if ! command -v mkdocs >/dev/null 2>&1; then
+        fail "mkdocs not found (pip install mkdocs-material)"; exit 1
+    fi
+    if ! mkdocs build --strict 2>&1; then fail "mkdocs build --strict"; exit 1; fi
+    pass "docs build --strict"
 }
 
 # ── Cells ────────────────────────────────────────────────────────────────────

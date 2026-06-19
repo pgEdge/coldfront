@@ -12,6 +12,10 @@ markdown_extensions:
 plugins:
   - search
 
+validation:
+  links:
+    anchors: warn
+
 theme:
   name: material
   custom_dir: docs/overrides
