@@ -226,6 +226,14 @@ AND of those, OR of those when all arms prove the same tier, BETWEEN
 Subqueries, UDF calls, and expressions on the partition column are
 AMBIGUOUS.
 
+The tier classification above applies to the WHERE clause. The SET
+clause carries a separate rule: an `UPDATE` that assigns the partition
+column itself is rejected, regardless of `coldfront.allow_mixed_writes`.
+Changing the partition column can move a row across the cutoff, and the
+in-place rewrite would leave the row in its old tier where the view's
+tier predicate then hides it. To change the partition column, delete the
+row and re-insert it with the new value.
+
 ## Write modes: strict vs permissive (`allow_mixed_writes`)
 
 When the predicate is AMBIGUOUS the hook picks one of two behaviours

@@ -1961,6 +1961,52 @@ cf_reject_multi_reference(Query *query, RangeTblEntry *rte)
 }
 
 /*
+ * Reject an UPDATE that assigns the partition column of a tiered view. Changing
+ * the partition column can move the row across the hot/cold cutoff; the in-place
+ * rewrite (hot, cold, or dual) updates the row where it already lives, so a moved
+ * row stays physically in its old tier while the view's tier predicate
+ * (ts >= cutoff / r[ts] < cutoff) filters it out — a silent disappearance
+ * (GitHub #20). Relocating the row across tiers is a separate, unimplemented
+ * feature; until then the partition column is read-only through the view. The
+ * targetList here is post-parse-analyze, so it holds exactly the SET-assigned
+ * columns (plus resjunk entries we skip) — not the full row. Blocks any assignment
+ * regardless of the new value's tier or coldfront.allow_mixed_writes: with no move
+ * to permit, allowing it would just reinstate the loss.
+ */
+static void
+cf_reject_partition_col_update(Query *query, RangeTblEntry *rte,
+                               TieredViewInfo *info)
+{
+    AttrNumber  partcol_attno;
+    ListCell   *lc;
+
+    if (query->commandType != CMD_UPDATE || info->partition_col == NULL)
+        return;
+
+    partcol_attno = get_attnum(rte->relid, info->partition_col);
+    if (partcol_attno == InvalidAttrNumber)
+        return;
+
+    foreach(lc, query->targetList)
+    {
+        TargetEntry *tle = (TargetEntry *) lfirst(lc);
+
+        if (tle->resjunk)
+            continue;
+        if (tle->resno == partcol_attno)
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("UPDATE of partition column \"%s\" on tiered view \"%s\" is not supported",
+                            info->partition_col, get_rel_name(rte->relid)),
+                     errhint("Changing \"%s\" can move the row across the hot/cold "
+                             "boundary; that relocation is not yet supported. To "
+                             "change \"%s\", delete the row and re-insert it with "
+                             "the new value.",
+                             info->partition_col, info->partition_col)));
+    }
+}
+
+/*
  * Reject a multi-reference UPDATE/DELETE on a tiered view, then pick the emit
  * path (tiered-INSERT split, hot, cold, or dual) and return the rewritten SQL.
  * Returns NULL on the unreachable default tier (caller treats as a no-op).
@@ -1972,6 +2018,7 @@ cf_dispatch_emit(Query *query, RangeTblEntry *rte, TieredViewInfo *info,
     TierClass tier;
 
     cf_reject_multi_reference(query, rte);
+    cf_reject_partition_col_update(query, rte, info);
 
     /* Tiered-view INSERT: bulk split-by-watermark via emit_tiered_insert.
      * Iceberg-only INSERT falls through to the unconditional cold path
