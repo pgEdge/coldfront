@@ -6,7 +6,7 @@
 > yourself, in Docker or bare-metal.
 
 ColdFront runs on a **DuckDB 1.5.x** stack: PostgreSQL + pg_duckdb
-(DuckDB 1.5.3) and a **patched** duckdb-iceberg that carries ColdFront's
+(DuckDB 1.5.4) and a **patched** duckdb-iceberg that carries ColdFront's
 four patches - the bakery-aware commit-refresh patch (the no-409
 guarantee for concurrent cold-tier writers) and three strict-reader
 interop patches (so apache/iceberg-go, the cold-tier compactor, can read
@@ -24,8 +24,8 @@ components:
 
 | Component | Source |
 |---|---|
-| libcurl 8.12.0 | `curl.se`, built from source (compile-time dep of DuckDB 1.5.3 httpfs; needs curl >= 7.77, the pgEdge base ships 7.76.1) |
-| pg_duckdb (DuckDB 1.5.3) | `github.com/duckdb/pg_duckdb`, PR #1025 |
+| libcurl 8.12.0 | `curl.se`, built from source (compile-time dep of DuckDB 1.5.4 httpfs; needs curl >= 7.77, the pgEdge base ships 7.76.1) |
+| pg_duckdb (DuckDB 1.5.4) | `github.com/duckdb/pg_duckdb`, PR #1025 |
 | duckdb-iceberg | `github.com/duckdb/duckdb-iceberg`, `v1.5-variegata` @ `0fad545a` |
 | vcpkg | `github.com/microsoft/vcpkg` |
 
@@ -63,7 +63,7 @@ Build the stack in two stages, the prebuilt base and the thin app layer:
 git clone <coldfront-repo> && cd coldfront
 
 # 1. Build the base (fetches the deps above, applies our patches, compiles
-#    pg_duckdb 1.5.3 + the patched duckdb-iceberg). ~30–60 min,
+#    pg_duckdb 1.5.4 + the patched duckdb-iceberg). ~30–60 min,
 #    needs network + a few GB of disk/RAM. Repeat with =16 / =17 for those majors.
 docker build -f docker/Dockerfile.duckdb15-base --build-arg PG_MAJOR=18 \
   -t ghcr.io/pgedge/coldfront-duckdb-base:pg18 .
@@ -75,7 +75,7 @@ docker compose up -d --build      # end-user single-node stack (ports published)
 ```
 
 The split keeps app builds fast and always testing current source: the
-expensive, stable compiles (pg_duckdb 1.5.3 + the patched duckdb-iceberg)
+expensive, stable compiles (pg_duckdb 1.5.4 + the patched duckdb-iceberg)
 live in the prebuilt **base**, published to
 `ghcr.io/pgedge/coldfront-duckdb-base:pg{16,17,18}`; the **app** build
 ([`docker/Dockerfile.duckdb15`](https://github.com/pgEdge/ColdFront/blob/main/docker/Dockerfile.duckdb15)) just `FROM`s it and
@@ -89,10 +89,9 @@ base-image.yml`) when its inputs change.
 Then follow [usage.md → One-time setup](usage.md#one-time-setup)
 (bootstrap Lakekeeper → create a table → tier → verify).
 
-> **Pin pg_duckdb for reproducible builds.** The base pins pg_duckdb to
-> `pull/1025/head` (a moving, unreleased PR ref). For reproducible
-> builds, pin it to a specific commit SHA (or the eventual DuckDB-1.5.x
-> release) instead of the live PR head.
+> **pg_duckdb pin.** The base pins pg_duckdb to the merged PR #1025 commit
+> `c04e6a2` (DuckDB 1.5.4 — its duckdb submodule is the v1.5.4 tag), a fixed
+> commit for reproducible builds rather than a moving PR head.
 >
 > **Base foundation.** The base is
 > `FROM ghcr.io/pgedge/pgedge-postgres:<pg>-spock5-minimal`; you need pull
@@ -176,7 +175,7 @@ cd extension/coldfront
 make && make install        # needs pg_config + PG server dev headers on PATH
 ```
 
-You separately need pg_duckdb (DuckDB 1.5.3) and the **patched** iceberg
+You separately need pg_duckdb (DuckDB 1.5.4) and the **patched** iceberg
 DuckDB extension installed in your PostgreSQL - follow the compile steps
 in
 [`docker/Dockerfile.duckdb15-base`](https://github.com/pgEdge/ColdFront/blob/main/docker/Dockerfile.duckdb15-base) - plus, in

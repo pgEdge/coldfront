@@ -1,5 +1,5 @@
 # ColdFront DuckDB 1.5.x BASE image — the expensive, STABLE layer: libcurl 8.12 +
-# pg_duckdb (DuckDB 1.5.3, PR #1025) + the patched duckdb-iceberg extensions
+# pg_duckdb (DuckDB 1.5.4, PR #1025) + the patched duckdb-iceberg extensions
 # (iceberg/avro/azure/postgres_scanner, v1.5-variegata + the bakery-aware
 # commit-refresh patch). It does NOT contain the coldfront extension — that thin,
 # fast-changing layer is added by docker/Dockerfile.duckdb15 (the "app" build)
@@ -36,7 +36,7 @@ ARG PGEDGE_TAG=${PG_MAJOR}-spock5-minimal
 # cross-build under emulation on an x86_64 host.
 ARG TARGETARCH=amd64
 
-# ─── build stage: libcurl 8.12 + pg_duckdb (DuckDB 1.5.3, PR #1025) ──────────────
+# ─── build stage: libcurl 8.12 + pg_duckdb (DuckDB 1.5.4, PR #1025) ──────────────
 FROM ghcr.io/pgedge/pgedge-postgres:${PGEDGE_TAG} AS build
 ARG PG_MAJOR
 USER root
@@ -51,7 +51,7 @@ RUN dnf install -y --setopt=install_weak_deps=False \
 ENV PATH=/usr/pgsql-${PG_MAJOR}/bin:$PATH
 ENV PG_CONFIG=/usr/pgsql-${PG_MAJOR}/bin/pg_config
 
-# libcurl 8.12.0 — built ONLY to satisfy DuckDB 1.5.3 httpfs's COMPILE-TIME
+# libcurl 8.12.0 — built ONLY to satisfy DuckDB 1.5.4 httpfs's COMPILE-TIME
 # dependency: its CMake does find_package(CURL REQUIRED) and curl_client.cpp
 # references CURLSSLOPT_AUTO_CLIENT_CERT (curl >= 7.77); the base ships 7.76.1.
 # 8.12.0 fixes CVE-2025-0665 (the 8.11.1 threaded resolver double-closed an fd
@@ -68,11 +68,12 @@ RUN wget -q https://curl.se/download/curl-8.12.0.tar.gz && tar xf curl-8.12.0.ta
         --without-libpsl --without-libssh2 --without-nghttp2 --without-brotli --without-zstd \
  && make -j"$(nproc)" && make install && ldconfig
 
-# pg_duckdb from PR #1025 (DuckDB 1.5.3). No released tag carries 1.5.x.
+# pg_duckdb at the merged PR #1025 commit (DuckDB 1.5.4). No released pg_duckdb
+# tag carries 1.5.x; this commit pins its duckdb submodule to the v1.5.4 tag.
 WORKDIR /build
 RUN git clone https://github.com/duckdb/pg_duckdb /build/pg_duckdb \
  && cd /build/pg_duckdb \
- && git fetch origin pull/1025/head && git checkout FETCH_HEAD \
+ && git checkout c04e6a2dcf4e999abb921da1ba2f8335dad644e0 \
  && git submodule update --init --recursive
 
 # pgEdge propagates -fexcess-precision=standard into CXXFLAGS, which gcc rejects
@@ -104,10 +105,16 @@ RUN dnf install -y --setopt=install_weak_deps=False \
         flex bison \
     && dnf clean all
 WORKDIR /build
+# ICEBERG_REF is the extension code the four patches target (kept fixed so they
+# apply unchanged). Its duckdb submodule tracks duckdb main, which drifts off the
+# release, so after init we pin that submodule to the v1.5.4 TAG — the same engine
+# pg_duckdb links — and build the extension against it.
 RUN git clone --filter=blob:none --no-checkout https://github.com/duckdb/duckdb-iceberg \
  && git -C duckdb-iceberg fetch --depth 80 origin v1.5-variegata \
  && git -C duckdb-iceberg checkout ${ICEBERG_REF} \
  && git -C duckdb-iceberg submodule update --init --recursive --depth 1 --jobs 8 \
+ && rm -rf duckdb-iceberg/duckdb \
+ && git clone --depth 1 --branch v1.5.4 --recurse-submodules https://github.com/duckdb/duckdb duckdb-iceberg/duckdb \
  && git clone https://github.com/microsoft/vcpkg /build/vcpkg \
  && /build/vcpkg/bootstrap-vcpkg.sh -disableMetrics
 COPY docker/iceberg-azure-extension-config-v15.cmake /build/duckdb-iceberg/extension_config.cmake
@@ -153,7 +160,7 @@ RUN cd /build/duckdb-iceberg && bash -c 'source /opt/rh/gcc-toolset-*/enable 2>/
     esac; \
     export VCPKG_TOOLCHAIN_PATH=/build/vcpkg/scripts/buildsystems/vcpkg.cmake VCPKG_ROOT=/build/vcpkg \
            VCPKG_TARGET_TRIPLET=$VCPKG_TRIPLET VCPKG_HOST_TRIPLET=$VCPKG_TRIPLET USE_MERGED_VCPKG_MANIFEST=1 \
-           EXT_CONFIG=/build/duckdb-iceberg/extension_config.cmake OVERRIDE_GIT_DESCRIBE=v1.5.3 \
+           EXT_CONFIG=/build/duckdb-iceberg/extension_config.cmake OVERRIDE_GIT_DESCRIBE=v1.5.4 \
            CMAKE_BUILD_PARALLEL_LEVEL=$(nproc); \
     make -j$(nproc) release'
 
@@ -166,10 +173,10 @@ RUN dnf install -y --setopt=install_weak_deps=False --allowerasing \
         libcurl lz4 pgedge-postgresql${PG_MAJOR}-contrib openssl \
     && dnf clean all
 
-# pg_duckdb 1.5.3 + bundled libduckdb 1.5.3 + extension SQL/control (NO coldfront)
+# pg_duckdb 1.5.4 + bundled libduckdb 1.5.4 + extension SQL/control (NO coldfront)
 COPY --from=build /out/usr/pgsql-${PG_MAJOR}/lib/             /usr/pgsql-${PG_MAJOR}/lib/
 COPY --from=build /out/usr/pgsql-${PG_MAJOR}/share/extension/ /usr/pgsql-${PG_MAJOR}/share/extension/
-# libcurl 8.12 (DuckDB 1.5.3 httpfs); overwrite the base 7.76.1 so the newer SONAME
+# libcurl 8.12 (DuckDB 1.5.4 httpfs); overwrite the base 7.76.1 so the newer SONAME
 # wins. Stage into a clean dir first so the .so.4.x.y glob can't collide with the
 # base's pre-existing libcurl.so.4.* (its minor version tracks curl's libtool
 # version-info, not the release), then install the resolved real file + symlinks.
@@ -179,7 +186,7 @@ RUN realname=$(basename /tmp/curl/libcurl.so.4.*) \
  && ln -sf "$realname" /usr/lib64/libcurl.so.4 && ln -sf libcurl.so.4 /usr/lib64/libcurl.so && ldconfig
 
 # iceberg + avro + azure (DuckDB 1.5.x); entrypoint places them under
-# $PGDATA/pg_duckdb/extensions/v1.5.3/<platform>/ (azure cp is conditional).
+# $PGDATA/pg_duckdb/extensions/v1.5.4/<platform>/ (azure cp is conditional).
 COPY --from=iceberg-builder /build/duckdb-iceberg/build/release/extension/iceberg/iceberg.duckdb_extension                 /opt/coldfront/iceberg/iceberg.duckdb_extension
 COPY --from=iceberg-builder /build/duckdb-iceberg/build/release/extension/avro/avro.duckdb_extension                       /opt/coldfront/iceberg/avro.duckdb_extension
 COPY --from=iceberg-builder /build/duckdb-iceberg/build/release/extension/azure/azure.duckdb_extension                     /opt/coldfront/iceberg/azure.duckdb_extension
@@ -188,8 +195,8 @@ COPY --from=iceberg-builder /build/duckdb-iceberg/build/release/extension/azure/
 COPY --from=iceberg-builder /build/duckdb-iceberg/build/release/extension/postgres_scanner/postgres_scanner.duckdb_extension /opt/coldfront/iceberg/postgres_scanner.duckdb_extension
 # DuckDB's platform string is linux_<arch> with the SAME arch tokens buildx uses
 # (amd64/arm64), so the extension dir is just linux_${TARGETARCH}. The entrypoint
-# places the iceberg/avro/azure extensions under .../v1.5.3/$COLDFRONT_DUCKDB_PLATFORM.
-ENV COLDFRONT_DUCKDB_VERSION=v1.5.3 \
+# places the iceberg/avro/azure extensions under .../v1.5.4/$COLDFRONT_DUCKDB_PLATFORM.
+ENV COLDFRONT_DUCKDB_VERSION=v1.5.4 \
     COLDFRONT_DUCKDB_PLATFORM=linux_${TARGETARCH}
 
 COPY docker/entrypoint.sh /usr/local/bin/coldfront-entrypoint.sh
@@ -201,7 +208,7 @@ ENV PG_MAJOR=${PG_MAJOR}
 LABEL org.opencontainers.image.title="coldfront-duckdb-base" \
       org.opencontainers.image.vendor="pgEdge" \
       org.opencontainers.image.source="https://github.com/pgEdge/ColdFront" \
-      org.opencontainers.image.description="ColdFront DuckDB 1.5.3 base (pg_duckdb PR#1025 + patched duckdb-iceberg with the bakery-aware commit-refresh patch)."
+      org.opencontainers.image.description="ColdFront DuckDB 1.5.4 base (pg_duckdb PR#1025 + patched duckdb-iceberg with the bakery-aware commit-refresh patch)."
 
 USER postgres
 ENTRYPOINT ["/usr/local/bin/coldfront-entrypoint.sh"]

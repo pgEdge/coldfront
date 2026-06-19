@@ -133,7 +133,7 @@ EOF
             aarch64) _cf_default_platform=linux_arm64 ;;
             *)       _cf_default_platform="linux_$(uname -m)" ;;
         esac
-        EXTDIR="$PGDATA/pg_duckdb/extensions/${COLDFRONT_DUCKDB_VERSION:-v1.5.3}/${COLDFRONT_DUCKDB_PLATFORM:-$_cf_default_platform}"
+        EXTDIR="$PGDATA/pg_duckdb/extensions/${COLDFRONT_DUCKDB_VERSION:-v1.5.4}/${COLDFRONT_DUCKDB_PLATFORM:-$_cf_default_platform}"
         mkdir -p "$EXTDIR"
         cp /opt/coldfront/iceberg/iceberg.duckdb_extension "$EXTDIR/iceberg.duckdb_extension"
         cp /opt/coldfront/iceberg/avro.duckdb_extension    "$EXTDIR/avro.duckdb_extension"
