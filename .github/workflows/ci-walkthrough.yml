@@ -1,0 +1,16 @@
+name: CI - Walkthrough
+on:
+  push:
+    paths: ['examples/walkthrough/**', '.devcontainer/walkthrough/**', 'docs/walkthrough.md', '.github/workflows/ci-walkthrough.yml']
+  pull_request:
+    paths: ['examples/walkthrough/**', '.devcontainer/walkthrough/**', 'docs/walkthrough.md', '.github/workflows/ci-walkthrough.yml']
+  workflow_dispatch:
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run ShellCheck
+        run: shellcheck -x --source-path=examples/walkthrough examples/walkthrough/*.sh
