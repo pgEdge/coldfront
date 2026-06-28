@@ -37,6 +37,7 @@
 #include "catalog/namespace.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_type_d.h"
+#include "executor/executor.h"
 #include "executor/spi.h"
 #include "lib/stringinfo.h"
 #include "nodes/parsenodes.h"
@@ -372,13 +373,73 @@ count_tiered_view_refs(Query *query, Oid view_oid)
 
 /* ---------- tier classification --------------------------------------- */
 
+/* True if `node` contains a Param or SubLink — neither can be evaluated as a
+ * standalone scalar, so eval_partition_bound declines such operands. */
+static bool
+bound_noneval_walker(Node *node, void *ctx)
+{
+    if (node == NULL)
+        return false;
+    if (IsA(node, Param) || IsA(node, SubLink))
+    {
+        *((bool *) ctx) = true;
+        return true;
+    }
+    return expression_tree_walker(node, bound_noneval_walker, ctx);
+}
+
+/*
+ * Resolve a partition-bound operand to a timestamptz value known at parse time.
+ * A literal Const yields its value directly. A non-Const operand is evaluated only
+ * when it is a self-contained, stable timestamptz expression — no Vars, params,
+ * sublinks, or volatile functions — so now()/CURRENT_* arithmetic (e.g.
+ * now() - interval '1 hour') folds to its transaction-fixed value and the
+ * predicate classifies to a single tier. Returns false (the caller treats it as
+ * TIER_AMBIGUOUS) for anything not pinnable now. timestamptz is pass-by-value, so
+ * the result outlives the throwaway executor state. The original expression stays
+ * in the Query for execution; only the tier decision reads this value.
+ */
+static bool
+eval_partition_bound(Node *node, TimestampTz *out)
+{
+    EState    *estate;
+    ExprState *exprstate;
+    Datum      d;
+    bool       isnull, bad = false;
+
+    if (IsA(node, Const))
+    {
+        Const *c = (Const *) node;
+        if (c->consttype != TIMESTAMPTZOID || c->constisnull)
+            return false;
+        *out = DatumGetTimestampTz(c->constvalue);
+        return true;
+    }
+
+    if (exprType(node) != TIMESTAMPTZOID || contain_var_clause(node) ||
+        contain_volatile_functions(node))
+        return false;
+    (void) bound_noneval_walker(node, &bad);
+    if (bad)
+        return false;
+
+    estate    = CreateExecutorState();
+    exprstate = ExecPrepareExpr((Expr *) node, estate);
+    d         = ExecEvalExprSwitchContext(exprstate,
+                                          GetPerTupleExprContext(estate), &isnull);
+    FreeExecutorState(estate);
+    if (isnull)
+        return false;
+    *out = DatumGetTimestampTz(d);
+    return true;
+}
+
 /*
  * Walk a qual node and return which tier the matching rows belong to.
  *
- * We handle direct comparisons of the partition column Var against a
- * timestamptz Const, and AND combinations thereof.  Anything else is
- * TIER_AMBIGUOUS — the hook errors on that rather than splitting a write
- * across tiers non-atomically.
+ * We handle direct comparisons of the partition column Var against a timestamptz
+ * value — a literal Const or a stable expression resolved by eval_partition_bound
+ * — and AND/OR combinations thereof.  Anything else is TIER_AMBIGUOUS.
  *
  * Tier boundary:  ts <  cutoff → cold,  ts >= cutoff → hot.
  */
@@ -387,9 +448,8 @@ classify_qual(Node *qual, Index result_rel, AttrNumber partcol_attno,
               TimestampTz cutoff)
 {
     OpExpr     *op;
-    Node       *a, *b;
+    Node       *a, *b, *other;
     Var        *var;
-    Const      *con;
     bool        var_left;
     char       *opname;
     TimestampTz val;
@@ -500,13 +560,13 @@ classify_qual(Node *qual, Index result_rel, AttrNumber partcol_attno,
     a = (Node *) linitial(op->args);
     b = (Node *) lsecond(op->args);
 
-    if (IsA(a, Var) && IsA(b, Const))
+    if (IsA(a, Var))
     {
-        var = (Var *) a; con = (Const *) b; var_left = true;
+        var = (Var *) a; other = b; var_left = true;
     }
-    else if (IsA(a, Const) && IsA(b, Var))
+    else if (IsA(b, Var))
     {
-        con = (Const *) a; var = (Var *) b; var_left = false;
+        var = (Var *) b; other = a; var_left = false;
     }
     else
         return TIER_AMBIGUOUS;
@@ -514,10 +574,13 @@ classify_qual(Node *qual, Index result_rel, AttrNumber partcol_attno,
     /* Only the partition column of the target relation matters */
     if ((Index) var->varno != result_rel || var->varattno != partcol_attno)
         return TIER_AMBIGUOUS;
-    if (con->consttype != TIMESTAMPTZOID || con->constisnull)
+
+    /* The bound must be a timestamptz value known now: a literal, or a stable
+     * expression (e.g. now() - interval '1 hour') we evaluate to its
+     * transaction-fixed value. Anything else stays TIER_AMBIGUOUS. */
+    if (!eval_partition_bound(other, &val))
         return TIER_AMBIGUOUS;
 
-    val    = DatumGetTimestampTz(con->constvalue);
     opname = get_opname(op->opno);
     if (!opname)
         return TIER_AMBIGUOUS;
