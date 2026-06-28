@@ -577,44 +577,38 @@ classify_tier(Query *query, TieredViewInfo *info)
 
 /* ---------- string helpers -------------------------------------------- */
 
+typedef struct { const char *pg; const char *duck; } CfSubst;
+
 /*
- * Rewrite PG-specific spellings in a deparsed SQL string into the
- * DuckDB-compatible equivalents that DuckDB will accept inside a
- * `duckdb.raw_query()` argument.  Two flavours of substitution:
- *
- *   1. Type casts.  PG's deparser emits "::timestamp with time zone",
- *      "::character varying", "::jsonb" etc., which DuckDB rejects.
- *      Map them to DuckDB's single-word names. `::jsonb` → `::json`
- *      because DuckDB has no jsonb type — coldfront's iceberg storage
- *      for jsonb columns is VARCHAR anyway, and the wrapper view casts
- *      back to json on read.
- *
- *   2. Function names.  PG's jsonb_* family doesn't exist in DuckDB,
- *      but the json_* family is the direct equivalent. Match the
- *      function name plus the opening "(" so a column or alias that
- *      happens to share a prefix doesn't false-match.
- *
- * Returns a palloc'd result. Quote-aware: skips substitution while
- * inside a single-quoted string literal or a double-quoted identifier,
- * so user text and identifiers are preserved verbatim. Embedded ''
- * and "" escapes inside a literal/identifier stay inside it.
+ * Cold-WRITE substitutions. The deparsed cold DML is handed to DuckDB inside a
+ * duckdb.raw_query() string, so DuckDB-only spellings are fine. Multi-word PG
+ * casts map to DuckDB's single-word names, and the boundary-aware jsonb→json
+ * catch-all (cf_apply_subst's jsonb_catchall arm) maps every other jsonb token —
+ * ::jsonb, jsonb_set, jsonb_extract_path, … — to its json_<rest> form. The few
+ * whose DuckDB name is not json_<rest> are listed here, matched with the opening
+ * paren so a column prefix can't false-match. A result DuckDB lacks (e.g.
+ * json_set) errors in DuckDB — its boundary, not a rewrite coldfront withholds.
+ */
+static const CfSubst cf_write_subst[] = {
+    { "::timestamp with time zone",    "::timestamptz" },
+    { "::timestamp without time zone", "::timestamp"   },
+    { "::character varying",           "::varchar"     },
+    { "::double precision",            "::double"      },
+    { "jsonb_build_object(",           "json_object("  },
+    { "jsonb_build_array(",            "json_array("   },
+    { "to_jsonb(",                     "to_json("      },
+};
+
+/*
+ * Rewrite a deparsed SQL string token-by-token using `map`, optionally followed by
+ * the boundary-aware jsonb→json catch-all. Returns a palloc'd result. Quote-aware:
+ * skips substitution inside a single-quoted literal or double-quoted identifier, so
+ * user text and identifiers are preserved verbatim; embedded '' and "" escapes stay
+ * inside their literal/identifier.
  */
 static char *
-normalize_casts_for_duckdb(const char *sql)
+cf_apply_subst(const char *sql, const CfSubst *map, int map_len, bool jsonb_catchall)
 {
-    static const struct { const char *pg; const char *duck; } map[] = {
-        /* type casts */
-        { "::timestamp with time zone",    "::timestamptz" },
-        { "::timestamp without time zone", "::timestamp"   },
-        { "::character varying",           "::varchar"     },
-        { "::double precision",            "::double"      },
-        { "::jsonb",                       "::json"        },
-        /* function-name spellings (matched with opening paren so a
-         * column/alias prefix can't false-match) */
-        { "jsonb_build_object(",           "json_object("  },
-        { "jsonb_build_array(",            "json_array("   },
-        { "to_jsonb(",                     "to_json("      },
-    };
     StringInfoData buf;
     const char    *p         = sql;
     bool           in_quote  = false;
@@ -658,12 +652,12 @@ normalize_casts_for_duckdb(const char *sql)
             continue;
         }
 
-        /* Outside any quotes: look for a PG cast spelling to normalise. */
+        /* Outside any quotes: look for a spelling to substitute. */
         if (!in_quote && !in_dquote)
         {
             bool replaced = false;
             int  i;
-            for (i = 0; i < (int) lengthof(map); i++)
+            for (i = 0; i < map_len; i++)
             {
                 size_t plen = strlen(map[i].pg); /* nosemgrep */
                 if (strncmp(p, map[i].pg, plen) == 0)
@@ -676,11 +670,40 @@ normalize_casts_for_duckdb(const char *sql)
             }
             if (replaced)
                 continue;
+
+            /* Catch-all jsonb → json at an identifier boundary: rewrite the
+             * `jsonb` token when it is preceded by a non-identifier char and not
+             * followed by a letter/digit, so the cast and jsonb_* function names
+             * map while an embedded identifier (my_jsonb_col) is left intact. */
+            if (jsonb_catchall && strncmp(p, "jsonb", 5) == 0) /* nosemgrep */
+            {
+                char prev = (p == sql) ? ' ' : p[-1];
+                char next = p[5];
+                bool prev_boundary =
+                    !((prev >= 'A' && prev <= 'Z') || (prev >= 'a' && prev <= 'z') ||
+                      (prev >= '0' && prev <= '9') || prev == '_');
+                bool next_ok =
+                    !((next >= 'A' && next <= 'Z') || (next >= 'a' && next <= 'z') ||
+                      (next >= '0' && next <= '9'));
+                if (prev_boundary && next_ok)
+                {
+                    appendStringInfoString(&buf, "json");
+                    p += 5;
+                    continue;
+                }
+            }
         }
 
         appendStringInfoChar(&buf, *p++);
     }
     return buf.data;
+}
+
+/* Cold-write path: full cast map + blanket jsonb→json (output goes to DuckDB). */
+static char *
+normalize_casts_for_duckdb(const char *sql)
+{
+    return cf_apply_subst(sql, cf_write_subst, lengthof(cf_write_subst), true);
 }
 
 /* ---------- SQL builder ----------------------------------------------- */
