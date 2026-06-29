@@ -30,6 +30,7 @@
 - Explicit error handling, no panic
 - No speculative abstractions, no backwards-compatibility shims for scenarios that can't happen, no hypothetical-future configurability
 - Don't hardcode lists that can be derived at runtime (e.g. column names from pg_catalog). Every hardcoded value is a future bug.
+- Comments document only the CURRENT code — never changelog narration ("previously", "used to", "this changed", "now does", "FIX:"). History lives in git, not in the source.
 
 ## Working Style
 - Before making changes that span multiple files, mentally trace the FULL end-to-end path: data origin → what the code does with it → where it lands → how the query pipeline sees it

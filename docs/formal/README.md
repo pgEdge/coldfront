@@ -361,6 +361,26 @@ already evolved by the originator. The single-commit shape thus holds -
 the catalog is altered exactly once, by one claimant - and peers only
 rebuild their per-node view.
 
+### Cross-tier move (partition-column UPDATE)
+
+A partition-column `UPDATE` that crosses the cutoff is rewritten to
+`coldfront._cross_tier_move`, which relocates rows between tiers.
+Its hot-tier work is plain PostgreSQL (heap INSERT/UPDATE/DELETE - no
+Iceberg, no claim). Its cold-tier work is **one** `duckdb.raw_query`
+issued through the **unchanged** path: a single DELETE-set plus
+INSERT-set in one DuckDB MetaTransaction - one Iceberg snapshot, one
+Lakekeeper CAS POST - under **one** `_claim_iceberg_lock` held to
+transaction end (released by the C `XactCallback`). It is therefore the
+**same stock-ordering single claimant** the cold writer is: one CAS
+commit (identical parent-CAS conflict shape to the append modelled at
+`Decide`) under the held claim. It forces `iceberg_async_parquet = off`
+(`AsyncParquet = FALSE`, `Bakery_v2.cfg`) - the DELETE+INSERT bundle is
+not pg_duckdb's single deferred POST that the async re-stamp patch wraps.
+Exactly **one** claim per move (a second `_claim_iceberg_lock` on the
+same table in one txn would self-deadlock at the min-ticket gate), so the
+move never holds two tickets. No new protocol primitive is added, so the
+model and every config result are unchanged.
+
 ### Partition detach fan-out
 
 The retention path detaches expired partitions with

@@ -45,6 +45,7 @@
 #include "nodes/parsenodes.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/pg_list.h"
+#include "optimizer/optimizer.h"
 #include "parser/analyze.h"
 #include "tcop/tcopprot.h"
 #include "tcop/utility.h"
@@ -67,9 +68,8 @@ static bool coldfront_in_rewrite = false;
  * Cold-tier DML from inside plpgsql — the two problems and how this file
  * solves them. (Background for the param + dummy-table machinery below.)
  *
- * Cold DML works fine as a top-level statement but used to fail when issued
- * from inside a plpgsql function / DO block / trigger, for TWO independent
- * reasons:
+ * Cold DML works as a top-level statement, but from inside a plpgsql function /
+ * DO block / trigger it faces TWO independent problems:
  *
  *   (1) Bound parameters. plpgsql (and any client using bind params / PREPARE
  *       / the extended protocol) compiles variable references into $N
@@ -77,12 +77,12 @@ static bool coldfront_in_rewrite = false;
  *       which is exactly when this hook runs (there is no executor hook). The
  *       deparser emits those $N as literal text, so the cold SQL handed to
  *       duckdb.raw_query carried "$N" with nothing to bind -> DuckDB error
- *       "Expected N parameters, but none were supplied". FIX: keep the params
- *       LIVE — emit the cold SQL as a runtime format(<template>, $1, $2, ...)
- *       call (cold_sql_arg) and declare the param types on the re-parse, so PG
- *       binds the values at execution and DuckDB only ever sees finished
- *       literals. This applies EVERYWHERE (top level and plpgsql) and needs no
- *       table.
+ *       "Expected N parameters, but none were supplied". The hook keeps the
+ *       params LIVE — it emits the cold SQL as a runtime
+ *       format(<template>, $1, $2, ...) call (cold_sql_arg) and declares the
+ *       param types on the re-parse, so PG binds the values at execution and
+ *       DuckDB only ever sees finished literals. This applies EVERYWHERE (top
+ *       level and plpgsql) and needs no table.
  *
  *   (2) Statement shape. The cold rewrite is a row-returning
  *       `SELECT coldfront._exec_iceberg_with_claim(...)`. At top level the
@@ -93,11 +93,11 @@ static bool coldfront_in_rewrite = false;
  *       (those are plpgsql source constructs, fixed before this hook runs and
  *       unreachable from it), and the cold "table" is a DuckDB-attached object,
  *       not a PG relation, so PG can't tag a real UPDATE/DELETE against it.
- *       FIX (only where needed): when — and only when — this statement is being
- *       parsed inside plpgsql, wrap the cold call as a DML over the dummy
- *       carrier coldfront._dummy_dml_target (see cold_anchor_update + that
- *       table's comment in coldfront--1.0.sql). At top level we keep today's
- *       SELECT shape byte-for-byte, so nothing there changes.
+ *       Handled only where needed: when — and only when — this statement is
+ *       parsed inside plpgsql, the hook wraps the cold call as a DML over the
+ *       dummy carrier coldfront._dummy_dml_target (see cold_anchor_update + that
+ *       table's comment in coldfront--1.0.sql). At top level the SELECT shape is
+ *       kept byte-for-byte.
  *
  * Detecting "are we inside plpgsql?" without interfering with anything: when
  * plpgsql parses one of its statements it installs p_post_columnref_hook on the
@@ -115,7 +115,7 @@ static bool coldfront_in_rewrite = false;
  * block / PREPARE / the extended protocol. Their VALUES are unknown at
  * parse-analyze (they bind only at execution), so the cold SQL keeps the $N
  * live and renders them via format() at run time (see cold_sql_arg). maxid==0
- * means there are none (the path is then byte-identical to the old literal).
+ * means there are none (the path is then byte-identical to the plain literal path).
  */
 #define COLDFRONT_MAX_PARAMS 1024       /* plpgsql dno+1; far above any real arity */
 typedef struct ColdParamSet
@@ -190,9 +190,9 @@ static int  coldfront_cold_write_batch_size = 10000;
  * DEFINER (they must run elevated so the side-loaded iceberg/postgres
  * extensions load past pg_duckdb's non-superuser LocalFileSystem block), so a
  * non-superuser must NOT be able to redirect the elevated ATTACH at an
- * attacker endpoint. Defining these formally as PGC_SUSET (vs. the bare
- * placeholders they used to be) makes them settable only by superusers / roles
- * granted SET on them — operators still set them in postgresql.conf, where they
+ * attacker endpoint. Defining these formally as PGC_SUSET makes them settable
+ * only by superusers / roles granted SET on them — operators still set them in
+ * postgresql.conf, where they
  * ride physical replication unchanged. local_pg_dsn is GUC_SUPERUSER_ONLY too:
  * it can carry libpq credentials, so non-superusers must not read it back.
  * The values are read SQL-side via current_setting(); these backing vars exist
@@ -1142,12 +1142,13 @@ query_has_pg_source_table(Query *query)
  * with no local materialisation.
  *
  * We walk the Query's rtable, build the qualified `<schema>.<table>`
- * string for each non-result RTE_RELATION, and substitute every literal
+ * string for each non-result RTE_RELATION, and substitute every
  * occurrence in sql with `pglocal.<schema>.<table>`. The substitution is
- * textual; quote_identifier matches what pg_get_querydef emits, so the
- * search patterns line up exactly. False positives are theoretically
- * possible if a column or alias happens to match the qualified-name
- * literal — vanishingly rare in practice and we accept the risk.
+ * quote-aware: an occurrence inside a single-quoted string literal is user
+ * data, not a table reference, and is left untouched; a word-boundary check
+ * keeps a column or alias that merely shares the table's identifier from
+ * being rewritten. quote_identifier matches what pg_get_querydef emits, so
+ * the search patterns line up exactly.
  */
 /* Walk an rtable and collect every PG-table relid, recursing into
  * RTE_SUBQUERY (INSERT … SELECT wraps the SELECT side in a subquery). */
@@ -2238,49 +2239,212 @@ cf_reject_multi_reference(Query *query, RangeTblEntry *rte)
 }
 
 /*
- * Reject an UPDATE that assigns the partition column of a tiered view. Changing
- * the partition column can move the row across the hot/cold cutoff; the in-place
- * rewrite (hot, cold, or dual) updates the row where it already lives, so a moved
- * row stays physically in its old tier while the view's tier predicate
- * (ts >= cutoff / r[ts] < cutoff) filters it out — a silent disappearance
- * (GitHub #20). Relocating the row across tiers is a separate, unimplemented
- * feature; until then the partition column is read-only through the view. The
- * targetList here is post-parse-analyze, so it holds exactly the SET-assigned
- * columns (plus resjunk entries we skip) — not the full row. Blocks any assignment
- * regardless of the new value's tier or coldfront.allow_mixed_writes: with no move
- * to permit, allowing it would just reinstate the loss.
+ * The SET assignment for the partition column, if this UPDATE assigns it; else
+ * NULL. Changing the partition column can move the row across the hot/cold
+ * cutoff, so it gets special handling: a cross-tier MOVE when mixed writes are
+ * on, a clean rejection when off (the in-place rewrite would otherwise strand
+ * the row in its old tier where the view's tier predicate hides it). The
+ * targetList here is post-parse-analyze, so it holds exactly the
+ * SET-assigned columns (plus resjunk entries we skip) — not the full row.
  */
-static void
-cf_reject_partition_col_update(Query *query, RangeTblEntry *rte,
-                               TieredViewInfo *info)
+static TargetEntry *
+partcol_set_target(Query *query, RangeTblEntry *rte, TieredViewInfo *info)
 {
     AttrNumber  partcol_attno;
     ListCell   *lc;
 
     if (query->commandType != CMD_UPDATE || info->partition_col == NULL)
-        return;
+        return NULL;
 
     partcol_attno = get_attnum(rte->relid, info->partition_col);
     if (partcol_attno == InvalidAttrNumber)
-        return;
+        return NULL;
 
     foreach(lc, query->targetList)
     {
         TargetEntry *tle = (TargetEntry *) lfirst(lc);
+        if (!tle->resjunk && tle->resno == partcol_attno)
+            return tle;
+    }
+    return NULL;
+}
 
-        if (tle->resjunk)
-            continue;
-        if (tle->resno == partcol_attno)
+/*
+ * Strict-mode (coldfront.allow_mixed_writes = off) rejection of a partition-
+ * column SET: with mixed writes off there is no atomic cross-tier relocation to
+ * fall back on, so reject rather than strand the row. Message/hint are stable
+ * (golden: update_partition_key_blocked).
+ */
+static void
+reject_partition_col_update(TieredViewInfo *info, const char *vname)
+{
+    ereport(ERROR,
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+             errmsg("UPDATE of partition column \"%s\" on tiered view \"%s\" is not supported",
+                    info->partition_col, vname),
+             errhint("Changing \"%s\" can move the row across the hot/cold "
+                     "boundary; that relocation is not yet supported. To "
+                     "change \"%s\", delete the row and re-insert it with "
+                     "the new value.",
+                     info->partition_col, info->partition_col)));
+}
+
+/*
+ * Walker context: true if any Var references a column OTHER than the partition
+ * column (or a different range-table entry). The cross-tier move re-evaluates
+ * the new partition-column expression e in three places (the PG hot legs and the
+ * DuckDB cold legs) over different column spellings, so v1 supports only an e
+ * that references the partition column or constants — anything else is rejected
+ * cleanly upstream rather than mis-evaluated.
+ */
+typedef struct { Index result_rel; AttrNumber partcol_attno; bool other; } VarRefCtx;
+
+static bool
+expr_refs_other_col_walker(Node *node, void *ctx)
+{
+    VarRefCtx *c = (VarRefCtx *) ctx;
+    if (node == NULL)
+        return false;
+    if (IsA(node, Var))
+    {
+        Var *v = (Var *) node;
+        if ((Index) v->varno != c->result_rel || v->varattno != c->partcol_attno)
+            c->other = true;
+        return false;
+    }
+    return expression_tree_walker(node, expr_refs_other_col_walker, ctx);
+}
+
+
+/*
+ * Reject the cross-tier-move shapes v1 does not support, each with a stable
+ * message: cold RETURNING; a WHERE referencing other tables or sub-queries (the
+ * cold tier is read through DuckDB, which can't correlate with Postgres tables);
+ * bound params (e and WHERE are deparsed to literal text at parse-analyze, where
+ * a param's value is not yet known); a multi-column SET; a VOLATILE e; an e that
+ * references other columns; a bare-NULL e. (in_plpgsql is rejected by the caller
+ * — the move's iceberg_scan read can't run nested inside a function/DO.)
+ */
+static void
+cf_reject_unsupported_move(Query *query, RangeTblEntry *rte,
+                           TieredViewInfo *info, ColdParamSet *ps,
+                           TargetEntry *pc_tle, const char *vname)
+{
+    Node     *e = (Node *) pc_tle->expr;
+    ListCell *lc;
+
+    reject_cold_returning(query, vname);
+
+    /* The move replays the deparsed WHERE against one relation at a time (the hot
+     * heap, and iceberg_scan for the cold tier), so it cannot reference other
+     * tables: the cold tier is read through DuckDB, which can't correlate with
+     * Postgres tables. Reject UPDATE ... FROM and sub-query predicates with a clear
+     * message rather than the opaque "missing FROM-clause entry" they fail with. */
+    if (query->hasSubLinks || list_length(query->rtable) > 1)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("a cross-tier move on tiered view \"%s\" cannot reference other tables or sub-queries", vname),
+                 errhint("The cold tier is read through DuckDB, which can't join other Postgres tables; the WHERE may use only \"%s\"'s own columns (no UPDATE ... FROM, no sub-select).", vname)));
+
+    if (ps->maxid > 0)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("a cross-tier move on tiered view \"%s\" cannot use bound parameters", vname),
+                 errhint("Run the UPDATE with literal values for the partition column and WHERE clause.")));
+
+    /* Only the partition column may be SET in a move (v1). A second SET target
+     * would have to be re-projected across all four legs; defer that. */
+    foreach(lc, query->targetList)
+    {
+        TargetEntry *tle = (TargetEntry *) lfirst(lc);
+        if (!tle->resjunk && tle != pc_tle)
             ereport(ERROR,
                     (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                     errmsg("UPDATE of partition column \"%s\" on tiered view \"%s\" is not supported",
-                            info->partition_col, get_rel_name(rte->relid)),
-                     errhint("Changing \"%s\" can move the row across the hot/cold "
-                             "boundary; that relocation is not yet supported. To "
-                             "change \"%s\", delete the row and re-insert it with "
-                             "the new value.",
+                     errmsg("a cross-tier move on tiered view \"%s\" cannot also set other columns", vname),
+                     errhint("Move the row by setting only \"%s\"; update other columns in a separate statement.",
+                             info->partition_col)));
+    }
+
+    /* Reject VOLATILE — never STABLE. clock_timestamp()/random()/nextval() evaluate
+     * differently per call, so they could classify a row into different tiers
+     * across the move's legs. STABLE expressions (e.g. timestamptz + interval,
+     * which depends on the session timezone) evaluate consistently within this
+     * one transaction, so the legs agree; they are the intended row-dependent
+     * move (SET ts = ts + interval '1 month'). */
+    if (contain_volatile_functions(e))
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("the new value for partition column \"%s\" on tiered view \"%s\" must not be VOLATILE",
+                        info->partition_col, vname),
+                 errhint("clock_timestamp()/random()/nextval() can classify a row into different tiers across the move's legs; use a constant or a stable expression over \"%s\" only.",
+                         info->partition_col)));
+
+    {
+        VarRefCtx vc = { (Index) query->resultRelation,
+                         get_attnum(rte->relid, info->partition_col), false };
+        if (expr_refs_other_col_walker(e, &vc) || vc.other)
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("the new value for partition column \"%s\" on tiered view \"%s\" may reference only \"%s\"",
+                            info->partition_col, vname, info->partition_col),
+                     errhint("A cross-tier move supports a constant or an expression over \"%s\" (e.g. \"%s + interval '1 month'\").",
                              info->partition_col, info->partition_col)));
     }
+
+    /* A NULL new value matches no tier and the NOT-NULL partition column would
+     * error mid-move; reject when the expression is provably NULL (a bare NULL
+     * constant). Non-constant NULLs are caught at execution by the column's
+     * NOT NULL constraint on the hot legs. */
+    if (IsA(e, Const) && ((Const *) e)->constisnull)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("the new value for partition column \"%s\" on tiered view \"%s\" cannot be NULL",
+                        info->partition_col, vname)));
+}
+
+/*
+ * Permissive-mode (coldfront.allow_mixed_writes = on) cross-tier move path.
+ * Validates the move (cf_reject_unsupported_move), then deparses the user WHERE
+ * and the new partition-column expression e over the VIEW's column names and
+ * returns the rewrite "SELECT coldfront._cross_tier_move(schema, view, where, e)".
+ * That function does the relocation: it arms its own GUCs, attaches 'ice', and
+ * routes matched rows into the four tier cases. The work lives there (not in a
+ * hook-installed Query) because cold→hot rows are read with iceberg_scan, which
+ * pg_duckdb runs in DuckDB only as a standalone read — not as the modifying Query
+ * the hook installs — and only inside a function with the unsafe-execution GUC.
+ */
+static char *
+cf_emit_cross_tier_move_path(Query *query, RangeTblEntry *rte,
+                             TieredViewInfo *info, ColdParamSet *ps,
+                             TargetEntry *pc_tle, const char *vname)
+{
+    List          *dpcontext;
+    char          *e_text, *where_text;
+    const char    *ns;
+    StringInfoData buf;
+
+    cf_reject_unsupported_move(query, rte, info, ps, pc_tle, vname);
+
+    /* cf_reject_multi_reference guarantees a single base reference, so the result
+     * relation is the sole rangetable entry (varno 1) and the deparse context maps
+     * the view's columns by it. Defensive: fall back to the strict rejection on an
+     * unexpected shape rather than emit a wrong rewrite. */
+    if (query->resultRelation != 1)
+        reject_partition_col_update(info, vname);
+
+    dpcontext  = deparse_context_for(get_rel_name(rte->relid), rte->relid);
+    e_text     = deparse_expression((Node *) pc_tle->expr, dpcontext, false, false);
+    where_text = (query->jointree && query->jointree->quals)
+                 ? deparse_expression((Node *) query->jointree->quals, dpcontext, false, false)
+                 : pstrdup("true");
+    ns = get_namespace_name(get_rel_namespace(rte->relid));
+
+    initStringInfo(&buf);
+    appendStringInfo(&buf,
+        "SELECT coldfront._cross_tier_move(%s, %s, %s, %s)",
+        quote_literal_cstr(ns), quote_literal_cstr(vname),
+        quote_literal_cstr(where_text), quote_literal_cstr(e_text));
+    return buf.data;
 }
 
 /*
@@ -2292,10 +2456,34 @@ static char *
 cf_dispatch_emit(Query *query, RangeTblEntry *rte, TieredViewInfo *info,
                  ColdParamSet *ps, bool in_plpgsql, const char *vname)
 {
-    TierClass tier;
+    TierClass    tier;
+    TargetEntry *pc_tle;
 
     cf_reject_multi_reference(query, rte);
-    cf_reject_partition_col_update(query, rte, info);
+
+    /* A partition-column SET can move the row across the hot/cold cutoff — but
+     * only once something is archived. With a cutoff: mixed writes off → reject;
+     * on → cross-tier move: rewrite to
+     * SELECT coldfront._cross_tier_move(...). Without a cutoff every row is hot, so
+     * a partition-column UPDATE is a plain hot UPDATE — fall through to the normal
+     * classification (emit_hot). Also falls through when the partition column is not
+     * in the SET targetlist. */
+    pc_tle = partcol_set_target(query, rte, info);
+    if (pc_tle != NULL && info->has_cutoff)
+    {
+        if (!coldfront_allow_mixed_writes)
+            reject_partition_col_update(info, vname);
+        /* The rewrite is a row-returning SELECT (the function returns void); inside
+         * a plpgsql function/DO a bare SELECT has no destination. Reject there for
+         * v1 (the top-level form is the supported path). */
+        if (in_plpgsql)
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("a cross-tier move of partition column \"%s\" on tiered view \"%s\" is not supported inside a function or DO block",
+                            info->partition_col, vname),
+                     errhint("Run the partition-column UPDATE as a top-level statement.")));
+        return cf_emit_cross_tier_move_path(query, rte, info, ps, pc_tle, vname);
+    }
 
     /* Tiered-view INSERT: bulk split-by-watermark via emit_tiered_insert.
      * Iceberg-only INSERT falls through to the unconditional cold path
