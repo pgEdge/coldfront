@@ -464,10 +464,11 @@ types, custom enums, arrays, composite types) is rejected at
 table-creation time. We refuse silent fallback to `varchar` - losing
 precision/identity is worse than no support.
 
-`jsonb`, `json` and `interval` are stored as `varchar` in Iceberg (no
-native primitive) and view-cast back to the rich PG type on read.
-Iceberg-backed reads run entirely in DuckDB, whose `json` type is the
-equivalent of PG's `jsonb`. Queries like `data->>'key'` and `data->'key'`
+`json`, `jsonb` and `interval` are stored as `varchar` in Iceberg (no
+native primitive). On read, `interval` is view-cast back to the rich PG
+type; `json` and `jsonb` surface as DuckDB's `json` (the equivalent of
+PG's `jsonb`), not the rich PG `jsonb` type, because Iceberg-backed reads
+run entirely in DuckDB. Queries like `data->>'key'` and `data->'key'`
 work, and ColdFront translates the `::jsonb` cast and `jsonb_array_length`
 on read. The jsonb-only operators (`?`, `@>`, `<@`, `#>`, `#>>`) and most
 jsonb functions (`jsonb_typeof`, `jsonb_extract_path`,
