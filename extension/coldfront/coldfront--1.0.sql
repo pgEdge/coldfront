@@ -319,6 +319,10 @@ BEGIN
     WHERE p.pronamespace = 'coldfront'::regnamespace
       AND p.proname IN ('ensure_attached', 'ensure_pg_attached',
                         '_exec_iceberg_with_claim', '_tiered_insert_cold',
+                        -- cross-tier move: the hook rewrites a partition-column
+                        -- UPDATE to SELECT _cross_tier_move(...), which serialises
+                        -- cold rows via _move_row_literal.
+                        '_cross_tier_move', '_move_row_literal', '_move_pg_row_literal',
                         '_enqueue_release',
                         -- R-A bakery coordination (mesh cold writes); SECURITY
                         -- DEFINER, so the app role just needs EXECUTE — the
@@ -870,6 +874,309 @@ BEGIN
 END;
 $$;
 
+-- coldfront._cross_tier_move: execute a partition-column UPDATE that crosses the
+-- hot/cold cutoff, relocating the matched rows between tiers. The C post-parse-
+-- analyze hook detects the move (partition column in
+-- SET, cutoff present, coldfront.allow_mixed_writes on), deparses the user WHERE
+-- (p_where) and the new partition-column value e (p_newpc) over the VIEW's columns,
+-- and installs `SELECT coldfront._cross_tier_move(schema, view, where, e)` as the
+-- statement — so this runs at top level, in the user's one transaction.
+--
+-- It is the mixed-tier-update shape (hot tier = plain PG, cold tier = one
+-- duckdb.raw_query under one bakery claim), with rows routed by (current tier,
+-- e vs cutoff) into four disjoint cases handled separately:
+--   stay-hot  hot,  e>=cut : in-place UPDATE of the hot heap.
+--   hot→cold  hot,  e<cut  : the row leaves the heap (DELETE) and is added to
+--                            Iceberg (INSERT).
+--   cold→hot  cold, e>=cut : the row is read from Iceberg into the heap (INSERT
+--                            … FROM iceberg_scan) and removed from Iceberg.
+--   stay-cold cold, e<cut  : removed from Iceberg and re-added with the new ts.
+-- Same-tier changes are in-place; crossings write the OTHER tier and remove from
+-- the origin (different relations) — no same-relation overlap.
+--
+-- Cold tier: ONE raw_query (DELETE-set + INSERT-set = one MetaTransaction = one
+-- snapshot, the replay_archive_delta idiom; the single delete-bearing op pg_duckdb
+-- allows per table per tx) under ONE claim (never per-row tickets). cold→hot reads
+-- Iceberg with iceberg_scan, which pg_duckdb permits inside a function only with
+-- duckdb.unsafe_allow_execution_inside_functions — the move needs it because the
+-- legs are deparsed and run together here. The cold rows destined to stay/return
+-- cold are serialised by VALUE from an iceberg_scan cursor (so no uncommitted-
+-- staging visibility problem and no second claim); hot→cold rows are serialised
+-- from a heap cursor. DELETE is by the OLD primary key; old/new keys differ (the
+-- partition column changed) so it never hits a just-inserted row.
+CREATE FUNCTION coldfront._cross_tier_move(
+    p_view_schema text, p_view_name text, p_where text, p_newpc text
+) RETURNS void
+LANGUAGE plpgsql AS $fn$
+DECLARE
+    v_hot_table   text;
+    v_iceberg     text;
+    v_partcol     text;
+    v_cutoff      timestamptz;
+    v_hot_schema  text;
+    v_hot_relname text;
+    v_cut_lit     text;          -- 'YYYY-…'::timestamptz of the cutoff
+    v_pc          text;          -- quoted partition column
+    v_cols        text;          -- heap col list (all live cols), quoted
+    v_cold_read   text;          -- iceberg_scan surface projection: r[col]::cast AS col
+    v_has_ident   boolean;
+    v_inner       text;          -- "SELECT v_cold_read FROM iceberg_scan(ice) r WHERE r[pc] < cut"
+    full_cols     text[];
+    full_types    text[];
+    pk_names      text[];
+    pk_types      text[];          -- Iceberg storage type per PK column (for DELETE casts)
+    v_pk_list     text;
+    cur           refcursor;
+    rec           record;
+    payload       jsonb;
+    pk_lit        text;
+    ins_arr       text[] := '{}'; -- cold-destined Iceberg VALUES tuples (DuckDB literals)
+    heap_arr      text[] := '{}'; -- cold→hot heap VALUES tuples (PG literals)
+    del_arr       text[] := '{}'; -- OLD primary-key tuples to DELETE from Iceberg
+    cold_sql      text := '';
+    v_targets     timestamptz[];
+    v_hot_targets timestamptz[];
+    v_uncovered   bigint;
+    my_ticket     bigint;
+    v_armed       boolean := NULLIF(current_setting('snowflake.node', true), '') IS NOT NULL
+                         AND NULLIF(current_setting('coldfront.dblink_self', true), '') IS NOT NULL;
+BEGIN
+    SET LOCAL duckdb.unsafe_allow_execution_inside_functions = on;
+    SET LOCAL duckdb.unsafe_allow_mixed_transactions = on;
+    SET LOCAL coldfront.iceberg_async_parquet = off;
+    SET LOCAL bytea_output = 'hex';
+
+    SELECT tv.hot_table, tv.iceberg_table, tv.partition_col, aw.cutoff_time
+    INTO v_hot_table, v_iceberg, v_partcol, v_cutoff
+    FROM coldfront.tiered_views tv
+    LEFT JOIN coldfront.archive_watermark aw ON aw.table_name = p_view_name
+    WHERE tv.schema_name = p_view_schema AND tv.relname = p_view_name;
+    IF v_hot_table IS NULL OR v_cutoff IS NULL THEN
+        RAISE EXCEPTION 'coldfront: cross-tier move on %.% requires a tiered view with a cutoff',
+            p_view_schema, p_view_name;
+    END IF;
+
+    v_hot_schema  := (parse_ident(v_hot_table))[1];
+    v_hot_relname := (parse_ident(v_hot_table))[2];
+    v_pc          := quote_ident(v_partcol);
+    v_cut_lit     := quote_literal(to_char(v_cutoff AT TIME ZONE 'UTC',
+                                           'YYYY-MM-DD HH24:MI:SS.US+00')) || '::timestamptz';
+
+    -- All live heap columns in attnum order — names, types, and whether any is an
+    -- identity column — in ONE catalog scan. v_cols (quoted list) and v_cold_read
+    -- (the iceberg_scan surface projection r[col]::cast AS col) derive from the
+    -- arrays, mirroring _rebuild_tiered_view's casts (one source of truth via
+    -- _iceberg_view_cast_type / _iceberg_storage_type; view cast, else storage).
+    SELECT array_agg(a.attname ORDER BY a.attnum),
+           array_agg(format_type(a.atttypid, a.atttypmod) ORDER BY a.attnum),
+           bool_or(a.attidentity <> '')
+    INTO full_cols, full_types, v_has_ident
+    FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
+    JOIN pg_namespace nn ON nn.oid = c.relnamespace
+    WHERE nn.nspname = v_hot_schema AND c.relname = v_hot_relname
+      AND a.attnum > 0 AND NOT a.attisdropped;
+    SELECT string_agg(quote_ident(col), ', ' ORDER BY ord),
+           string_agg(format('r[%L]::%s AS %I', col,
+                             COALESCE(NULLIF(coldfront._iceberg_view_cast_type(typ), ''),
+                                      coldfront._iceberg_storage_type(typ)), col),
+                      ', ' ORDER BY ord)
+    INTO v_cols, v_cold_read
+    FROM unnest(full_cols, full_types) WITH ORDINALITY AS u(col, typ, ord);
+    SELECT array_agg(a.attname ORDER BY x.ord),
+           array_agg(coldfront._iceberg_storage_type(format_type(a.atttypid, a.atttypmod)) ORDER BY x.ord)
+    INTO pk_names, pk_types
+    FROM pg_index idx JOIN pg_class c ON c.oid = idx.indrelid
+    JOIN pg_namespace nn ON nn.oid = c.relnamespace
+    JOIN unnest(idx.indkey) WITH ORDINALITY AS x(attnum, ord) ON true
+    JOIN pg_attribute a ON a.attrelid = idx.indrelid AND a.attnum = x.attnum
+    WHERE nn.nspname = v_hot_schema AND c.relname = v_hot_relname AND idx.indisprimary;
+    IF pk_names IS NULL THEN
+        RAISE EXCEPTION 'coldfront: cross-tier move on view "%" requires a primary key on the hot table', p_view_name;
+    END IF;
+    SELECT string_agg(quote_ident(nm), ', ' ORDER BY ord) INTO v_pk_list
+    FROM unnest(pk_names) WITH ORDINALITY AS u(nm, ord);
+
+    v_inner := format('SELECT %s FROM iceberg_scan(%L) r WHERE r[%L] < %s',
+                      v_cold_read, v_iceberg, v_partcol, v_cut_lit);
+    PERFORM coldfront.ensure_attached();
+
+    -- Reject a cold→hot target with no covering hot partition, naming the VIEW
+    -- (never the internal heap name): the heap is RANGE-partitioned with no default
+    -- partition, so a row LANDING hot (cold→hot, or stay-hot whose new ts crosses a
+    -- hot-partition boundary) would otherwise raise PG's "no partition of relation
+    -- _events". Collect the distinct new-ts values of all hot-landing rows from both
+    -- tiers — cold via iceberg_scan, hot via the heap — kept in SEPARATE queries so
+    -- one never mixes iceberg_scan (DuckDB) with pg_catalog (which pg_duckdb cannot
+    -- read), then check coverage against pg_inherits leaf bounds (split_part on the
+    -- single-key FOR VALUES FROM ('lo') TO ('hi') rendering; no regex).
+    EXECUTE format(
+        'SELECT array_agg(DISTINCT (%2$s)::timestamptz) FROM ( %1$s ) s WHERE (%3$s) AND (%2$s) >= %4$s',
+        v_inner, p_newpc, p_where, v_cut_lit) INTO v_targets;
+    EXECUTE format(
+        'SELECT array_agg(DISTINCT (%6$s)::timestamptz) FROM %1$I.%2$I WHERE (%5$s) AND %3$s >= %4$s AND (%6$s) >= %4$s',
+        v_hot_schema, v_hot_relname, v_pc, v_cut_lit, p_where, p_newpc) INTO v_hot_targets;
+    v_targets := COALESCE(v_targets, '{}'::timestamptz[]) || COALESCE(v_hot_targets, '{}'::timestamptz[]);
+    IF array_length(v_targets, 1) > 0 THEN
+        SELECT count(*) INTO v_uncovered
+        FROM unnest(v_targets) AS tv
+        WHERE NOT EXISTS (
+            SELECT 1 FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid,
+            LATERAL pg_get_expr(c.relpartbound, c.oid) AS b
+            WHERE i.inhparent = format('%I.%I', v_hot_schema, v_hot_relname)::regclass
+              AND b LIKE 'FOR VALUES FROM %'
+              AND tv >= split_part(b, '''', 2)::timestamptz
+              AND tv <  split_part(b, '''', 4)::timestamptz);
+        IF v_uncovered > 0 THEN
+            RAISE EXCEPTION 'coldfront: cross-tier move on view "%" targets a hot partition that does not exist',
+                p_view_name
+                USING HINT = 'The new partition-column value falls outside the pre-made hot partitions; create the covering partition first, or choose a value within an existing one.';
+        END IF;
+    END IF;
+
+    -- One claim for the whole move (released at xact end by the C XactCallback);
+    -- mesh → R-A bakery, vanilla → local advisory xact lock.
+    IF v_armed THEN
+        my_ticket := coldfront._claim_iceberg_lock(v_iceberg);
+        PERFORM coldfront._enqueue_release(my_ticket);
+    ELSE
+        PERFORM pg_advisory_xact_lock(hashtext('coldfront_iceberg:' || v_iceberg));
+    END IF;
+
+    -- ── Capture the moved rows by VALUE (no iceberg_scan in any modifying stmt) ──
+    -- Affected COLD rows are read with a SELECT cursor over iceberg_scan (a pure
+    -- read, which pg_duckdb runs in DuckDB — a modifying INSERT…FROM iceberg_scan
+    -- would instead trip pg_duckdb's "cannot modify a Postgres table" path). Each
+    -- affected cold row is DELETEd from Iceberg by its OLD pk; rows staying cold are
+    -- re-added to Iceberg with the new ts; rows crossing to hot are added to the
+    -- heap. cf_new_ts is computed in the cursor so e is evaluated once per row.
+    OPEN cur FOR EXECUTE format(
+        'SELECT s.*, (%2$s) AS cf_new_ts FROM ( %1$s ) s WHERE (%3$s)',
+        v_inner, p_newpc, p_where);
+    LOOP
+        FETCH cur INTO rec;
+        EXIT WHEN NOT FOUND;
+        payload := to_jsonb(rec);
+        -- OLD primary key, each part cast to its Iceberg storage type so DuckDB's
+        -- row IN matches the typed columns (a bare string literal would not coerce).
+        SELECT string_agg(quote_literal(payload->>nm) || '::' || typ, ', ' ORDER BY ord)
+        INTO pk_lit
+        FROM unnest(pk_names, pk_types) WITH ORDINALITY AS u(nm, typ, ord);
+        del_arr := del_arr || ('(' || pk_lit || ')');
+
+        IF (payload->>'cf_new_ts')::timestamptz < v_cutoff THEN
+            -- stay-cold: re-add to Iceberg (DuckDB literal tuple).
+            ins_arr := ins_arr || ('(' || coldfront._move_row_literal(payload, full_cols, full_types, v_partcol) || ')');
+        ELSE
+            -- cold→hot: add to the heap (PG literal tuple, partition column = e).
+            heap_arr := heap_arr || ('(' || coldfront._move_pg_row_literal(payload, full_cols, v_partcol) || ')');
+        END IF;
+    END LOOP;
+    CLOSE cur;
+
+    -- hot→cold: remove the crossing rows from the heap and capture them for the
+    -- Iceberg insert in ONE atomic DELETE ... RETURNING, so there is no
+    -- read-then-delete window for a concurrent heap writer to race. cf_new_ts is
+    -- computed over the deleted row, exactly as the cold cursor above does.
+    FOR rec IN EXECUTE format(
+        'DELETE FROM %1$I.%2$I h WHERE (%5$s) AND %3$s >= %4$s AND (%6$s) < %4$s RETURNING h.*, (%6$s) AS cf_new_ts',
+        v_hot_schema, v_hot_relname, v_pc, v_cut_lit, p_where, p_newpc)
+    LOOP
+        payload := to_jsonb(rec);
+        ins_arr := ins_arr || ('(' || coldfront._move_row_literal(payload, full_cols, full_types, v_partcol) || ')');
+    END LOOP;
+
+    -- ── Hot heap (plain PG) ───────────────────────────────────────────────────
+    -- stay-hot: in-place ts change. Runs BEFORE the cold→hot INSERT so a
+    -- row-dependent new value (e.g. ts + interval) is never applied a second time
+    -- to a row this same statement just inserted.
+    EXECUTE format(
+        'UPDATE %1$I.%2$I SET %3$s = (%6$s) WHERE (%5$s) AND %3$s >= %4$s AND (%6$s) >= %4$s',
+        v_hot_schema, v_hot_relname, v_pc, v_cut_lit, p_where, p_newpc);
+    -- cold→hot: INSERT the captured rows (carrying the existing identity).
+    IF array_length(heap_arr, 1) > 0 THEN
+        EXECUTE format('INSERT INTO %1$I.%2$I (%3$s) %4$s VALUES %5$s',
+            v_hot_schema, v_hot_relname, v_cols,
+            CASE WHEN v_has_ident THEN 'OVERRIDING SYSTEM VALUE' ELSE '' END,
+            array_to_string(heap_arr, ', '));
+    END IF;
+
+    -- ── Cold tier: ONE raw_query (DELETE old keys + INSERT cold-destined) ────────
+    IF array_length(del_arr, 1) > 0 THEN
+        cold_sql := format('DELETE FROM %s WHERE (%s) IN (%s)', v_iceberg, v_pk_list, array_to_string(del_arr, ', '));
+    END IF;
+    IF array_length(ins_arr, 1) > 0 THEN
+        IF cold_sql <> '' THEN cold_sql := cold_sql || '; '; END IF;
+        cold_sql := cold_sql || format('INSERT INTO %s VALUES %s', v_iceberg, array_to_string(ins_arr, ', '));
+    END IF;
+    IF cold_sql <> '' THEN
+        PERFORM duckdb.raw_query(cold_sql);
+    END IF;
+END;
+$fn$;
+
+-- coldfront._move_row_literal: render one captured row (jsonb of surface values +
+-- cf_new_ts) as a DuckDB positional VALUES tuple for the Iceberg INSERT, in attnum
+-- order: the partition column takes cf_new_ts; bytea is rebuilt with from_hex on the
+-- hex text (bytea_output is pinned to hex by the caller); a NULL is NULL; everything
+-- else is a quoted literal DuckDB coerces to the storage type. Mirrors
+-- _tiered_insert_cold's per-row serialiser.
+CREATE FUNCTION coldfront._move_row_literal(
+    p_payload jsonb, p_cols text[], p_types text[], p_partcol text
+) RETURNS text
+LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+    row_lit  text := '';
+    col      text;
+    val_text text;
+    i        int;
+BEGIN
+    FOR i IN 1 .. array_length(p_cols, 1) LOOP
+        col := p_cols[i];
+        IF i > 1 THEN row_lit := row_lit || ', '; END IF;
+        IF col = p_partcol THEN
+            row_lit := row_lit || quote_literal(p_payload->>'cf_new_ts');
+        ELSIF p_payload ? col AND jsonb_typeof(p_payload->col) <> 'null' THEN
+            val_text := p_payload->>col;
+            IF p_types[i] = 'bytea' THEN
+                row_lit := row_lit || format('from_hex(%L)', substr(val_text, 3));
+            ELSE
+                row_lit := row_lit || quote_literal(val_text);
+            END IF;
+        ELSE
+            row_lit := row_lit || 'NULL';
+        END IF;
+    END LOOP;
+    RETURN row_lit;
+END;
+$$;
+
+-- coldfront._move_pg_row_literal: the cold→hot counterpart of _move_row_literal —
+-- render a captured row as a positional VALUES tuple for the PG heap INSERT. The
+-- partition column takes cf_new_ts; every other value is an unknown-typed literal
+-- (quote_nullable) that PG coerces to the heap column type on INSERT (so bytea hex
+-- and jsonb text round-trip with no per-type handling). NULL stays NULL.
+CREATE FUNCTION coldfront._move_pg_row_literal(
+    p_payload jsonb, p_cols text[], p_partcol text
+) RETURNS text
+LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+    row_lit text := '';
+    col     text;
+    i       int;
+BEGIN
+    FOR i IN 1 .. array_length(p_cols, 1) LOOP
+        col := p_cols[i];
+        IF i > 1 THEN row_lit := row_lit || ', '; END IF;
+        IF col = p_partcol THEN
+            row_lit := row_lit || quote_nullable(p_payload->>'cf_new_ts');
+        ELSE
+            row_lit := row_lit || quote_nullable(p_payload->>col);
+        END IF;
+    END LOOP;
+    RETURN row_lit;
+END;
+$$;
+
 
 -- replay_archive_delta: drains delta rows whose xid is NOT visible in the
 -- bulk-copy snapshot, applying DELETE-then-INSERT to Iceberg per source PK.
@@ -1354,27 +1661,18 @@ BEGIN
         format('SELECT * FROM ice.default.%s', p_table)
     );
 
-    -- 3. INSTEAD OF INSERT trigger — DROPPED in this version. The C
-    --    post_parse_analyze hook now intercepts INSERT INTO <iceberg-only-view>
-    --    statements (see coldfront.c emit_cold / prefix_pg_tables_with_pglocal)
-    --    and rewrites them into a single bulk
-    --    SELECT duckdb.raw_query('INSERT INTO ice.… VALUES/SELECT …'),
-    --    one Iceberg snapshot for the whole statement, regardless of how many
-    --    rows. INSERT … SELECT FROM <pg_source> gets each PG-table
-    --    reference prefixed with `pglocal.` so DuckDB's postgres extension
-    --    streams source rows over libpq with no local materialisation.
-    --
-    --    Earlier revisions generated a FOR EACH ROW trigger here that did one
-    --    raw_query per row. Bench measured ~50 rows/s under that path and the
-    --    parallel-INSERT case hit 409 CatalogCommitConflicts at every row;
-    --    the hook-rewrite path collapses N row-commits into one.
-    --
-    --    For backwards-compatibility / belt-and-suspenders against future
-    --    coldfront extension being unloaded mid-session, the placeholders /
-    --    new_refs / insert_fmt / trig_fn locals are no longer used and have
-    --    been removed.
+    -- 3. No INSTEAD OF INSERT trigger: the C post_parse_analyze hook intercepts
+    --    INSERT INTO <iceberg-only-view> (see coldfront.c emit_cold /
+    --    prefix_pg_tables_with_pglocal) and rewrites it into a single bulk
+    --    SELECT duckdb.raw_query('INSERT INTO ice.… VALUES/SELECT …') — one
+    --    Iceberg snapshot for the whole statement regardless of row count, so a
+    --    multi-row or parallel INSERT cannot incur per-row 409
+    --    CatalogCommitConflicts. INSERT … SELECT FROM <pg_source> gets each
+    --    PG-table reference prefixed with `pglocal.` so DuckDB's postgres
+    --    extension streams source rows over libpq with no local materialisation.
 
-    -- Drop any leftover trigger from older revisions.
+    -- Drop a per-row insert trigger if one is present (e.g. left by an upgrade);
+    -- this view uses the hook-rewrite path above, not a trigger.
     EXECUTE format(
         'DROP TRIGGER IF EXISTS coldfront_iceonly_insert ON %I.%I',
         p_schema, p_table);
@@ -2394,7 +2692,9 @@ $body$ LANGUAGE plpgsql$fn$,
         v_trigname, v_schema, v_view_name, v_funcname);
 
     -- 6. The registry key (schema, relname) is unchanged by the DROP+CREATE
-    --    above (the view name is stable), so there is nothing to re-point.
+    --    above (the view name is stable), so there is nothing to re-point. The
+    --    cross-tier-move path is the post_parse_analyze hook + coldfront._cross_tier_move;
+    --    it needs no per-view object here.
 END;
 $$;
 

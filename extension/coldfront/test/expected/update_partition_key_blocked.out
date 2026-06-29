@@ -1,9 +1,10 @@
--- An UPDATE that assigns the partition column of a tiered view is blocked: such
--- a SET can move the row across the hot/cold cutoff, which the in-place rewrite
--- would lose silently (GitHub #20). The hook must ereport(ERROR) with SQLSTATE
--- 0A000 (ERRCODE_FEATURE_NOT_SUPPORTED) regardless of coldfront.allow_mixed_writes
--- and regardless of which tier the WHERE selects. Relocating the row is a separate
--- feature; until then the partition column is read-only via the view.
+-- STRICT mode (coldfront.allow_mixed_writes = off): an UPDATE that assigns the
+-- partition column of a tiered view is rejected. Such a SET can move the row
+-- across the hot/cold cutoff; with mixed writes off there is no atomic relocation
+-- to fall back on, so the hook must ereport(ERROR) with SQLSTATE 0A000
+-- (ERRCODE_FEATURE_NOT_SUPPORTED) regardless of which tier the WHERE selects.
+-- The permissive-mode counterpart (the actual cross-tier move) is covered by
+-- update_partition_key_move.sql; the live round-trip is ci/journey.sh.
 CREATE EXTENSION IF NOT EXISTS pg_duckdb;
 NOTICE:  extension "pg_duckdb" already exists, skipping
 CREATE EXTENSION IF NOT EXISTS coldfront;
@@ -19,36 +20,31 @@ INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_tabl
 VALUES ('public', 'events', 'public._events', 'ice.default.events', 'ts');
 INSERT INTO coldfront.archive_watermark(table_name, cutoff_time)
 VALUES ('events', '2026-03-01'::timestamptz);
--- Permissive mode (default): a partition-column SET is still blocked, because
--- the move is not implemented and the dual-tier rewrite would lose the row.
-SET coldfront.allow_mixed_writes = on;
--- Cold→hot crossing (the #20 repro): blocked.
+-- Strict mode: no cross-tier move, so every partition-column SET is rejected.
+SET coldfront.allow_mixed_writes = off;
+-- Cold→hot crossing: rejected.
 UPDATE public.events SET ts = '2026-06-18 10:00:00+00' WHERE status = 'hot_orig';
 ERROR:  UPDATE of partition column "ts" on tiered view "events" is not supported
 HINT:  Changing "ts" can move the row across the hot/cold boundary; that relocation is not yet supported. To change "ts", delete the row and re-insert it with the new value.
--- Hot→cold crossing: blocked too (symmetric loss).
+-- Hot→cold crossing: rejected too (symmetric loss).
 UPDATE public.events SET ts = '2026-01-05 10:00:00+00' WHERE ts = '2026-04-01 12:00:00+00';
 ERROR:  UPDATE of partition column "ts" on tiered view "events" is not supported
 HINT:  Changing "ts" can move the row across the hot/cold boundary; that relocation is not yet supported. To change "ts", delete the row and re-insert it with the new value.
--- Same-tier constant SET is also blocked (blunt block; no per-value proof).
+-- Same-tier constant SET is also rejected (blunt block; no per-value proof).
 UPDATE public.events SET ts = '2026-04-02 12:00:00+00' WHERE ts = '2026-04-01 12:00:00+00';
 ERROR:  UPDATE of partition column "ts" on tiered view "events" is not supported
 HINT:  Changing "ts" can move the row across the hot/cold boundary; that relocation is not yet supported. To change "ts", delete the row and re-insert it with the new value.
--- Non-constant partition-column SET (could cross per-row): blocked.
+-- Non-constant partition-column SET (could cross per-row): rejected.
 UPDATE public.events SET ts = ts + interval '6 months' WHERE id = 1;
 ERROR:  UPDATE of partition column "ts" on tiered view "events" is not supported
 HINT:  Changing "ts" can move the row across the hot/cold boundary; that relocation is not yet supported. To change "ts", delete the row and re-insert it with the new value.
--- A tier-deterministic WHERE does not rescue a partition-column SET: blocked.
+-- A tier-deterministic WHERE does not rescue a partition-column SET: rejected.
 UPDATE public.events SET ts = '2026-06-18 10:00:00+00' WHERE ts = '2026-01-15 01:00:00+00';
 ERROR:  UPDATE of partition column "ts" on tiered view "events" is not supported
 HINT:  Changing "ts" can move the row across the hot/cold boundary; that relocation is not yet supported. To change "ts", delete the row and re-insert it with the new value.
--- Strict mode: same block.
-SET coldfront.allow_mixed_writes = off;
-UPDATE public.events SET ts = '2026-06-18 10:00:00+00' WHERE status = 'hot_orig';
-ERROR:  UPDATE of partition column "ts" on tiered view "events" is not supported
-HINT:  Changing "ts" can move the row across the hot/cold boundary; that relocation is not yet supported. To change "ts", delete the row and re-insert it with the new value.
 -- A SET that does NOT touch the partition column is unaffected (still routes by
--- WHERE tier — here hot, plain PG).
+-- WHERE tier — here hot, plain PG). This guards that the strict gate did not
+-- over-broaden into ordinary updates.
 UPDATE public.events SET status = 'ok' WHERE ts = '2026-04-01 12:00:00+00';
 -- _events: only the status update applied; every ts-changing statement errored.
 SELECT id, ts, status FROM public._events ORDER BY id;

@@ -558,16 +558,72 @@ EOSQL
     # rows) rather than silently returning a partial/void result.
     local cr; cr=$(q_may "$HOST" "UPDATE events SET status='x' WHERE ts < date_trunc('month',now()) - interval '3 months' RETURNING id;")
     assert_err "cold-tier RETURNING rejected" "cold tier" "$cr"
-    # An UPDATE that assigns the partition column is rejected before any tier write,
-    # so a cross-cutoff move can't silently lose the row (#20) and a hot→archived-
-    # range move can't leak the internal _events partition-routing error (#21). Both
-    # directions error the same way regardless of which tier the WHERE selects.
-    local pkc; pkc=$(q_may "$HOST" "UPDATE events SET ts=date_trunc('month',now()) - interval '1 month' WHERE ts < date_trunc('month',now()) - interval '3 months';")
-    assert_err "partition-key UPDATE rejected (cold→hot, #20)" "partition column" "$pkc"
-    local pkh; pkh=$(q_may "$HOST" "UPDATE events SET ts=date_trunc('month',now()) - interval '4 months' WHERE status='dual_upd';")
-    assert_err "partition-key UPDATE rejected (hot→archived, #21)" "partition column" "$pkh"
-    # The #21 leak specifically: the internal _events name must NOT appear in the error.
-    case "$pkh" in *_events*) fail "#21: internal _events name leaked in error: $pkh";; *) pass "#21: internal _events name not leaked";; esac
+    story_cross_tier_move
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story 6c — Cross-tier move: an UPDATE whose SET changes the partition column
+# across the hot/cold cutoff relocates the row between tiers. Permissive mode
+# (coldfront.allow_mixed_writes, default
+# on) performs the move; strict mode rejects it. Each scenario seeds its own
+# rows with a distinct status marker so the counts are independent of prior
+# stories. "Hot" is membership in the _events heap; total is the view.
+#  - HOT ts that has a pre-made partition: now-1mo + 10d (m1, seeded hot above).
+#  - COLD ts: now-4mo + 10d (m4, archived).
+# ───────────────────────────────────────────────────────────────────────────
+story_cross_tier_move() {
+    step "6c. Cross-tier move (partition-key UPDATE relocates the row)"
+    local O; O=$(qf "$HOST" <<'EOSQL'
+-- cold→hot: seed one cold row, then move its ts into the hot range.
+INSERT INTO events (ts, status, data) VALUES (date_trunc('month',now()) - interval '4 months' + interval '10 days','move_c2h','{}');
+UPDATE events SET ts = date_trunc('month',now()) - interval '1 month' + interval '10 days' WHERE status='move_c2h';
+SELECT 'C2H_TOTAL:' || count(*) FROM events  WHERE status='move_c2h';
+SELECT 'C2H_HOT:'   || count(*) FROM _events WHERE status='move_c2h';
+-- hot→cold: seed one hot row, then move its ts into the cold range.
+INSERT INTO events (ts, status, data) VALUES (date_trunc('month',now()) - interval '1 month' + interval '10 days','move_h2c','{}');
+UPDATE events SET ts = date_trunc('month',now()) - interval '4 months' + interval '10 days' WHERE status='move_h2c';
+SELECT 'H2C_TOTAL:' || count(*) FROM events  WHERE status='move_h2c';
+SELECT 'H2C_HOT:'   || count(*) FROM _events WHERE status='move_h2c';
+-- row-dependent SET that moves only SOME rows: one cold row crosses into hot
+-- (cold + 4mo lands in m1 hot), one stays cold (m4 + 1mo = m3, still cold).
+INSERT INTO events (ts, status, data) VALUES (date_trunc('month',now()) - interval '3 months' + interval '10 days','move_mix','{}');
+INSERT INTO events (ts, status, data) VALUES (date_trunc('month',now()) - interval '4 months' + interval '10 days','move_mix','{}');
+SELECT 'MIX_TOTAL_PRE:' || count(*) FROM events WHERE status='move_mix';
+UPDATE events SET ts = ts + interval '2 months' WHERE status='move_mix';
+SELECT 'MIX_TOTAL_POST:' || count(*) FROM events  WHERE status='move_mix';
+SELECT 'MIX_HOT_POST:'   || count(*) FROM _events WHERE status='move_mix';
+-- A row-dependent SET with a value-independent WHERE must apply the new value
+-- exactly once: the cold→hot row, once inserted into the heap, must not be
+-- updated a second time by the in-place stay-hot UPDATE. m3+10d + 2mo = m1+10d.
+INSERT INTO events (ts, status, data) VALUES (date_trunc('month',now()) - interval '3 months' + interval '10 days','move_dbl','{}');
+UPDATE events SET ts = ts + interval '2 months' WHERE status='move_dbl';
+SELECT 'DBL_ONCE:' || (ts = date_trunc('month',now()) - interval '1 month' + interval '10 days')::text FROM events WHERE status='move_dbl';
+EOSQL
+)
+    assert_eq "cold→hot move: row preserved (total)" "1" "$(extract C2H_TOTAL "$O")"
+    assert_eq "cold→hot move: row now in the hot heap" "1" "$(extract C2H_HOT "$O")"
+    assert_eq "hot→cold move: row preserved (total)" "1" "$(extract H2C_TOTAL "$O")"
+    assert_eq "hot→cold move: row no longer in the hot heap" "0" "$(extract H2C_HOT "$O")"
+    # A row-dependent SET moves only the rows whose new ts crosses the cutoff; no
+    # row is lost and the partial split lands in the right tiers.
+    local mp; mp=$(extract MIX_TOTAL_PRE "$O")
+    assert_eq "row-dependent move: no row lost (total preserved)" "$mp" "$(extract MIX_TOTAL_POST "$O")"
+    assert_eq "row-dependent move: exactly the crossing row went hot" "1" "$(extract MIX_HOT_POST "$O")"
+    # The crossing row's new value is applied exactly once, not re-applied by the
+    # in-place stay-hot UPDATE after it is inserted into the heap.
+    assert_eq "row-dependent cold→hot move applies the new value exactly once" "true" "$(extract DBL_ONCE "$O")"
+    # A move whose target hot ts has no pre-made partition is rejected cleanly,
+    # naming the view, and must not leak the internal _events heap name in any form.
+    local np; np=$(q_may "$HOST" "UPDATE events SET ts = now() + interval '20 years' WHERE status='move_c2h';")
+    assert_err "move to a ts with no hot partition rejected" "events" "$np"
+    case "$np" in
+        *"no partition of relation"*) fail "raw partition-routing error leaked: $np";;
+        *_events*)                    fail "internal _events name leaked: $np";;
+        *)                            pass "no raw partition error or _events name leaked";;
+    esac
+    # Strict mode still rejects any partition-key SET (no atomic move to fall back on).
+    local sm; sm=$(q_may "$HOST" "SET coldfront.allow_mixed_writes=off; UPDATE events SET ts = date_trunc('month',now()) - interval '4 months' + interval '10 days' WHERE status='move_c2h';")
+    assert_err "strict mode rejects the cross-tier move" "partition column" "$sm"
 }
 
 # ───────────────────────────────────────────────────────────────────────────

@@ -227,12 +227,30 @@ Subqueries, UDF calls, and expressions on the partition column are
 AMBIGUOUS.
 
 The tier classification above applies to the WHERE clause. The SET
-clause carries a separate rule: an `UPDATE` that assigns the partition
-column itself is rejected, regardless of `coldfront.allow_mixed_writes`.
-Changing the partition column can move a row across the cutoff, and the
-in-place rewrite would leave the row in its old tier where the view's
-tier predicate then hides it. To change the partition column, delete the
-row and re-insert it with the new value.
+clause carries a separate rule for the partition column itself, because
+changing it can move a row across the cutoff. An in-place per-tier
+rewrite would leave such a row in its old tier where the view's tier
+predicate then hides it, so the hook handles a partition-column SET
+separately by the `coldfront.allow_mixed_writes` GUC:
+
+- Permissive (on, default): the hook rewrites the UPDATE to
+  `SELECT coldfront._cross_tier_move(...)`, which RELOCATES each matched
+  row between tiers. The function reads the affected rows once, then
+  applies four disjoint cases by current tier and new value: stay-hot
+  (in-place heap UPDATE), stay-cold (re-add to Iceberg with the new
+  value), hot to cold (heap DELETE plus Iceberg INSERT), and cold to hot
+  (heap INSERT plus Iceberg DELETE). The hot side is plain PG; the cold
+  side is one `duckdb.raw_query` (DELETE plus INSERT, one Iceberg
+  snapshot) under one bakery claim. A target value with no covering hot
+  partition is rejected naming the view; the move is not supported inside
+  a function or DO block, with bound parameters, with a VOLATILE new
+  value, with a bare NULL new value, with a new value referencing other
+  columns, or alongside a SET of other columns.
+- Strict (off): the hook rejects the partition-column SET. To change the
+  partition column, delete the row and re-insert it with the new value.
+
+Before anything is archived (no cutoff) every row is hot, so a
+partition-column UPDATE is a plain hot UPDATE in either mode.
 
 ## Write modes: strict vs permissive (`allow_mixed_writes`)
 
