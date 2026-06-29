@@ -809,27 +809,49 @@ normalize_jsonb_for_read(const char *sql)
  */
 typedef struct {
     char       *orig_sql;   /* normalised, leading-whitespace-stripped */
+    size_t      head_len;   /* bytes before the verb: a leading WITH clause, else 0 */
     const char *rest;       /* points into orig_sql, past the prefix   */
-    const char *verb;       /* "UPDATE " or "DELETE FROM "             */
+    const char *verb;       /* "UPDATE " / "DELETE FROM " / "INSERT INTO " */
 } DeparseResult;
 
 /*
- * Run the deparsed-DML prefix-match ladder: try the unqualified prefix first,
- * then the schema-qualified one. Returns the matched prefix, or elogs the same
- * ERROR as before on no match.
+ * Locate the "VERB <relation> " prefix in the deparsed DML: the first occurrence
+ * outside any single-quoted string literal. A leading WITH clause puts the verb
+ * past offset 0, so this scans rather than anchoring at the start; the bytes
+ * before the match are that WITH preamble, which the builders carry through
+ * verbatim. cf_reject_multi_reference guarantees the result relation is named
+ * once, so the first out-of-literal hit is the statement's own target. Only one
+ * of the unqualified / schema-qualified spellings can match (the deparser emits
+ * one form). Returns the match start and sets *matched to the spelling found;
+ * elogs if neither is present.
  */
 static const char *
 find_dml_prefix(const char *orig_sql, const char *search_unqual,
-                const char *search_qual, const char *vname)
+                const char *search_qual, const char *vname,
+                const char **matched)
 {
-    if (strncmp(orig_sql, search_unqual, strlen(search_unqual)) == 0) /* nosemgrep */
-        return search_unqual;
-    else if (strncmp(orig_sql, search_qual, strlen(search_qual)) == 0) /* nosemgrep */
-        return search_qual;
+    size_t      lu = strlen(search_unqual); /* nosemgrep */
+    size_t      lq = strlen(search_qual);   /* nosemgrep */
+    const char *p;
+    bool        in_squote = false;
+
+    for (p = orig_sql; *p; p++)
+    {
+        if (*p == '\'')
+        {
+            in_squote = !in_squote;
+            continue;
+        }
+        if (in_squote)
+            continue;
+        if (strncmp(p, search_unqual, lu) == 0) { *matched = search_unqual; return p; } /* nosemgrep */
+        if (strncmp(p, search_qual,   lq) == 0) { *matched = search_qual;   return p; } /* nosemgrep */
+    }
 
     elog(ERROR,
-         "coldfront: cannot locate result relation \"%s\" at start of "
-         "deparsed DML: %s", vname, orig_sql);
+         "coldfront: cannot locate result relation \"%s\" in deparsed DML: %s",
+         vname, orig_sql);
+    *matched = NULL;
     return NULL; /* unreachable */
 }
 
@@ -839,7 +861,7 @@ deparse_and_find_prefix(Query *query, DeparseResult *dr)
     RangeTblEntry *rte;
     char          *vname, *ns;
     char           search_unqual[256], search_qual[256];
-    const char    *old_prefix;
+    const char    *matched, *at;
 
     dr->orig_sql = pg_get_querydef(query, false);
     {
@@ -883,9 +905,10 @@ deparse_and_find_prefix(Query *query, DeparseResult *dr)
         }
     }
 
-    old_prefix = find_dml_prefix(dr->orig_sql, search_unqual, search_qual, vname);
+    at = find_dml_prefix(dr->orig_sql, search_unqual, search_qual, vname, &matched);
 
-    dr->rest = dr->orig_sql + strlen(old_prefix); /* nosemgrep */
+    dr->head_len = (size_t) (at - dr->orig_sql);
+    dr->rest     = at + strlen(matched); /* nosemgrep */
 }
 
 /*
@@ -896,6 +919,7 @@ build_hot_dml(DeparseResult *dr, TieredViewInfo *info)
 {
     StringInfoData buf;
     initStringInfo(&buf);
+    appendBinaryStringInfo(&buf, dr->orig_sql, dr->head_len);  /* leading WITH, if any */
     appendStringInfo(&buf, "%s%s %s", dr->verb, info->hot_table, dr->rest);
     return buf.data;
 }
@@ -911,6 +935,7 @@ build_cold_dml(DeparseResult *dr, TieredViewInfo *info)
 {
     StringInfoData buf;
     initStringInfo(&buf);
+    appendBinaryStringInfo(&buf, dr->orig_sql, dr->head_len);  /* leading WITH, if any */
     appendStringInfo(&buf, "%s%s %s", dr->verb, info->iceberg_table, dr->rest);
     return normalize_casts_for_duckdb(buf.data);
 }
@@ -920,9 +945,8 @@ build_cold_dml(DeparseResult *dr, TieredViewInfo *info)
  * coldfront._exec_iceberg_with_claim(table, sql) — or _tiered_insert_cold's
  * source — receives.
  *
- * With no bound params (maxid==0) it is a plain quoted literal — BYTE-IDENTICAL
- * to the old behaviour, so the top-level/literal path is unchanged. With params
- * it is a format(<template>, $1, $2, ...) call: each out-of-literal $N becomes a
+ * With no bound params (maxid==0) it is a plain quoted literal. With params it
+ * is a format(<template>, $1, $2, ...) call: each out-of-literal $N becomes a
  * positional %P$L spec and stays LIVE as a format() arg, so PG binds the value
  * at execution and DuckDB only ever sees a finished literal. That is what lets
  * cold DML carry plpgsql / PREPARE / extended-protocol $N (Cause 1).
@@ -1798,6 +1822,19 @@ emit_tiered_insert(Query *query, TieredViewInfo *info, ColdParamSet *ps, bool in
     col_list   = insert_targetlist_collist(query);
     source     = skip_leading_collist(dr.rest);
     cutoff_lit = format_timestamptz_literal(info->cutoff);
+
+    /* A leading WITH clause (dr.head_len bytes, before "INSERT INTO <view> ") must
+     * reach both halves, which each read `source` inside a parenthesised derived
+     * table. Fold it into source so its CTEs scope to that subquery on each engine
+     * (PG hot, DuckDB cold) — no top-level WITH to merge. */
+    if (dr.head_len > 0)
+    {
+        StringInfoData sb;
+        initStringInfo(&sb);
+        appendBinaryStringInfo(&sb, dr.orig_sql, dr.head_len);
+        appendStringInfoString(&sb, source);
+        source = sb.data;
+    }
 
     {
         RangeTblEntry *rte = (RangeTblEntry *) list_nth(query->rtable,
