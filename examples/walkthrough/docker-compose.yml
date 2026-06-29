@@ -77,6 +77,17 @@ services:
             timeout: 2s
             retries: 10
 
+    archiver:
+        profiles: ["tools"]
+        build:
+            context: ../..
+            dockerfile: examples/walkthrough/Dockerfile.archiver
+        volumes:
+            - ./config:/config:ro
+        depends_on:
+            db:
+                condition: service_healthy
+
 volumes:
     pgdata:
     s3data:
