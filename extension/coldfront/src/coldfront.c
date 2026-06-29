@@ -32,11 +32,14 @@
 
 #include "postgres.h"
 
+#include <ctype.h>
+
 #include "access/attnum.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_type_d.h"
+#include "executor/executor.h"
 #include "executor/spi.h"
 #include "lib/stringinfo.h"
 #include "nodes/parsenodes.h"
@@ -49,6 +52,7 @@
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/regproc.h"
 #include "utils/ruleutils.h"
 #include "utils/timestamp.h"
 #include "fmgr.h"
@@ -372,13 +376,73 @@ count_tiered_view_refs(Query *query, Oid view_oid)
 
 /* ---------- tier classification --------------------------------------- */
 
+/* True if `node` contains a Param or SubLink — neither can be evaluated as a
+ * standalone scalar, so eval_partition_bound declines such operands. */
+static bool
+bound_noneval_walker(Node *node, void *ctx)
+{
+    if (node == NULL)
+        return false;
+    if (IsA(node, Param) || IsA(node, SubLink))
+    {
+        *((bool *) ctx) = true;
+        return true;
+    }
+    return expression_tree_walker(node, bound_noneval_walker, ctx);
+}
+
+/*
+ * Resolve a partition-bound operand to a timestamptz value known at parse time.
+ * A literal Const yields its value directly. A non-Const operand is evaluated only
+ * when it is a self-contained, stable timestamptz expression — no Vars, params,
+ * sublinks, or volatile functions — so now()/CURRENT_* arithmetic (e.g.
+ * now() - interval '1 hour') folds to its transaction-fixed value and the
+ * predicate classifies to a single tier. Returns false (the caller treats it as
+ * TIER_AMBIGUOUS) for anything not pinnable now. timestamptz is pass-by-value, so
+ * the result outlives the throwaway executor state. The original expression stays
+ * in the Query for execution; only the tier decision reads this value.
+ */
+static bool
+eval_partition_bound(Node *node, TimestampTz *out)
+{
+    EState    *estate;
+    ExprState *exprstate;
+    Datum      d;
+    bool       isnull, bad = false;
+
+    if (IsA(node, Const))
+    {
+        Const *c = (Const *) node;
+        if (c->consttype != TIMESTAMPTZOID || c->constisnull)
+            return false;
+        *out = DatumGetTimestampTz(c->constvalue);
+        return true;
+    }
+
+    if (exprType(node) != TIMESTAMPTZOID || contain_var_clause(node) ||
+        contain_volatile_functions(node))
+        return false;
+    (void) bound_noneval_walker(node, &bad);
+    if (bad)
+        return false;
+
+    estate    = CreateExecutorState();
+    exprstate = ExecPrepareExpr((Expr *) node, estate);
+    d         = ExecEvalExprSwitchContext(exprstate,
+                                          GetPerTupleExprContext(estate), &isnull);
+    FreeExecutorState(estate);
+    if (isnull)
+        return false;
+    *out = DatumGetTimestampTz(d);
+    return true;
+}
+
 /*
  * Walk a qual node and return which tier the matching rows belong to.
  *
- * We handle direct comparisons of the partition column Var against a
- * timestamptz Const, and AND combinations thereof.  Anything else is
- * TIER_AMBIGUOUS — the hook errors on that rather than splitting a write
- * across tiers non-atomically.
+ * We handle direct comparisons of the partition column Var against a timestamptz
+ * value — a literal Const or a stable expression resolved by eval_partition_bound
+ * — and AND/OR combinations thereof.  Anything else is TIER_AMBIGUOUS.
  *
  * Tier boundary:  ts <  cutoff → cold,  ts >= cutoff → hot.
  */
@@ -387,9 +451,8 @@ classify_qual(Node *qual, Index result_rel, AttrNumber partcol_attno,
               TimestampTz cutoff)
 {
     OpExpr     *op;
-    Node       *a, *b;
+    Node       *a, *b, *other;
     Var        *var;
-    Const      *con;
     bool        var_left;
     char       *opname;
     TimestampTz val;
@@ -500,13 +563,13 @@ classify_qual(Node *qual, Index result_rel, AttrNumber partcol_attno,
     a = (Node *) linitial(op->args);
     b = (Node *) lsecond(op->args);
 
-    if (IsA(a, Var) && IsA(b, Const))
+    if (IsA(a, Var))
     {
-        var = (Var *) a; con = (Const *) b; var_left = true;
+        var = (Var *) a; other = b; var_left = true;
     }
-    else if (IsA(a, Const) && IsA(b, Var))
+    else if (IsA(b, Var))
     {
-        con = (Const *) a; var = (Var *) b; var_left = false;
+        var = (Var *) b; other = a; var_left = false;
     }
     else
         return TIER_AMBIGUOUS;
@@ -514,10 +577,13 @@ classify_qual(Node *qual, Index result_rel, AttrNumber partcol_attno,
     /* Only the partition column of the target relation matters */
     if ((Index) var->varno != result_rel || var->varattno != partcol_attno)
         return TIER_AMBIGUOUS;
-    if (con->consttype != TIMESTAMPTZOID || con->constisnull)
+
+    /* The bound must be a timestamptz value known now: a literal, or a stable
+     * expression (e.g. now() - interval '1 hour') we evaluate to its
+     * transaction-fixed value. Anything else stays TIER_AMBIGUOUS. */
+    if (!eval_partition_bound(other, &val))
         return TIER_AMBIGUOUS;
 
-    val    = DatumGetTimestampTz(con->constvalue);
     opname = get_opname(op->opno);
     if (!opname)
         return TIER_AMBIGUOUS;
@@ -577,44 +643,55 @@ classify_tier(Query *query, TieredViewInfo *info)
 
 /* ---------- string helpers -------------------------------------------- */
 
+typedef struct { const char *pg; const char *duck; } CfSubst;
+
 /*
- * Rewrite PG-specific spellings in a deparsed SQL string into the
- * DuckDB-compatible equivalents that DuckDB will accept inside a
- * `duckdb.raw_query()` argument.  Two flavours of substitution:
- *
- *   1. Type casts.  PG's deparser emits "::timestamp with time zone",
- *      "::character varying", "::jsonb" etc., which DuckDB rejects.
- *      Map them to DuckDB's single-word names. `::jsonb` → `::json`
- *      because DuckDB has no jsonb type — coldfront's iceberg storage
- *      for jsonb columns is VARCHAR anyway, and the wrapper view casts
- *      back to json on read.
- *
- *   2. Function names.  PG's jsonb_* family doesn't exist in DuckDB,
- *      but the json_* family is the direct equivalent. Match the
- *      function name plus the opening "(" so a column or alias that
- *      happens to share a prefix doesn't false-match.
- *
- * Returns a palloc'd result. Quote-aware: skips substitution while
- * inside a single-quoted string literal or a double-quoted identifier,
- * so user text and identifiers are preserved verbatim. Embedded ''
- * and "" escapes inside a literal/identifier stay inside it.
+ * Cold-WRITE substitutions. The deparsed cold DML is handed to DuckDB inside a
+ * duckdb.raw_query() string, so DuckDB-only spellings are fine. Multi-word PG
+ * casts map to DuckDB's single-word names, and the boundary-aware jsonb→json
+ * catch-all (cf_apply_subst's jsonb_catchall arm) maps every other jsonb token —
+ * ::jsonb, jsonb_set, jsonb_extract_path, … — to its json_<rest> form. The few
+ * whose DuckDB name is not json_<rest> are listed here, matched with the opening
+ * paren so a column prefix can't false-match. A result DuckDB lacks (e.g.
+ * json_set) errors in DuckDB — its boundary, not a rewrite coldfront withholds.
+ */
+static const CfSubst cf_write_subst[] = {
+    { "::timestamp with time zone",    "::timestamptz" },
+    { "::timestamp without time zone", "::timestamp"   },
+    { "::character varying",           "::varchar"     },
+    { "::double precision",            "::double"      },
+    { "jsonb_build_object(",           "json_object("  },
+    { "jsonb_build_array(",            "json_array("   },
+    { "to_jsonb(",                     "to_json("      },
+};
+
+/*
+ * Tiered-READ substitutions. A rewritten SELECT is reparsed by PG and then planned
+ * by DuckDB, so a translation must be valid in BOTH engines — which rules out the
+ * write path's blanket catch-all. Only the jsonb type cast and the functions
+ * verified identical in PG and DuckDB are translated; every other jsonb spelling is
+ * left untouched, so DuckDB rejects it with a clear "… does not exist" (a documented
+ * read limitation). Blanket-mapping would break two ways: jsonb_path_query →
+ * json_path_query fails PG reparse (PG has no json_path_query), and
+ * json_extract_path_text / json_type are signature- or vocabulary-incompatible in
+ * DuckDB (array result; UBIGINT/VARCHAR vs number/string). json_array_length is
+ * verified identical ([10,20,30]→3, []→0) and exists in both.
+ */
+static const CfSubst cf_read_subst[] = {
+    { "::jsonb",             "::json"             },
+    { "jsonb_array_length(", "json_array_length(" },
+};
+
+/*
+ * Rewrite a deparsed SQL string token-by-token using `map`, optionally followed by
+ * the boundary-aware jsonb→json catch-all. Returns a palloc'd result. Quote-aware:
+ * skips substitution inside a single-quoted literal or double-quoted identifier, so
+ * user text and identifiers are preserved verbatim; embedded '' and "" escapes stay
+ * inside their literal/identifier.
  */
 static char *
-normalize_casts_for_duckdb(const char *sql)
+cf_apply_subst(const char *sql, const CfSubst *map, int map_len, bool jsonb_catchall)
 {
-    static const struct { const char *pg; const char *duck; } map[] = {
-        /* type casts */
-        { "::timestamp with time zone",    "::timestamptz" },
-        { "::timestamp without time zone", "::timestamp"   },
-        { "::character varying",           "::varchar"     },
-        { "::double precision",            "::double"      },
-        { "::jsonb",                       "::json"        },
-        /* function-name spellings (matched with opening paren so a
-         * column/alias prefix can't false-match) */
-        { "jsonb_build_object(",           "json_object("  },
-        { "jsonb_build_array(",            "json_array("   },
-        { "to_jsonb(",                     "to_json("      },
-    };
     StringInfoData buf;
     const char    *p         = sql;
     bool           in_quote  = false;
@@ -658,12 +735,12 @@ normalize_casts_for_duckdb(const char *sql)
             continue;
         }
 
-        /* Outside any quotes: look for a PG cast spelling to normalise. */
+        /* Outside any quotes: look for a spelling to substitute. */
         if (!in_quote && !in_dquote)
         {
             bool replaced = false;
             int  i;
-            for (i = 0; i < (int) lengthof(map); i++)
+            for (i = 0; i < map_len; i++)
             {
                 size_t plen = strlen(map[i].pg); /* nosemgrep */
                 if (strncmp(p, map[i].pg, plen) == 0)
@@ -676,11 +753,44 @@ normalize_casts_for_duckdb(const char *sql)
             }
             if (replaced)
                 continue;
+
+            /* Catch-all jsonb → json at an identifier boundary: rewrite the
+             * `jsonb` token when it is preceded by a non-identifier char and not
+             * followed by a letter/digit, so the cast and jsonb_* function names
+             * map while an embedded identifier (my_jsonb_col) is left intact. */
+            if (jsonb_catchall && strncmp(p, "jsonb", 5) == 0) /* nosemgrep */
+            {
+                char prev = (p == sql) ? ' ' : p[-1];
+                char next = p[5];
+                /* left edge not part of an identifier; right edge not a letter/
+                 * digit ('_' allowed, so jsonb_set maps to json_set). */
+                if (!(isalnum((unsigned char) prev) || prev == '_') &&
+                    !isalnum((unsigned char) next))
+                {
+                    appendStringInfoString(&buf, "json");
+                    p += 5;
+                    continue;
+                }
+            }
         }
 
         appendStringInfoChar(&buf, *p++);
     }
     return buf.data;
+}
+
+/* Cold-write path: full cast map + blanket jsonb→json (output goes to DuckDB). */
+static char *
+normalize_casts_for_duckdb(const char *sql)
+{
+    return cf_apply_subst(sql, cf_write_subst, lengthof(cf_write_subst), true);
+}
+
+/* Tiered-read path: whitelist only (output is reparsed by PG, then run by DuckDB). */
+static char *
+normalize_jsonb_for_read(const char *sql)
+{
+    return cf_apply_subst(sql, cf_read_subst, lengthof(cf_read_subst), false);
 }
 
 /* ---------- SQL builder ----------------------------------------------- */
@@ -698,27 +808,49 @@ normalize_casts_for_duckdb(const char *sql)
  */
 typedef struct {
     char       *orig_sql;   /* normalised, leading-whitespace-stripped */
+    size_t      head_len;   /* bytes before the verb: a leading WITH clause, else 0 */
     const char *rest;       /* points into orig_sql, past the prefix   */
-    const char *verb;       /* "UPDATE " or "DELETE FROM "             */
+    const char *verb;       /* "UPDATE " / "DELETE FROM " / "INSERT INTO " */
 } DeparseResult;
 
 /*
- * Run the deparsed-DML prefix-match ladder: try the unqualified prefix first,
- * then the schema-qualified one. Returns the matched prefix, or elogs the same
- * ERROR as before on no match.
+ * Locate the "VERB <relation> " prefix in the deparsed DML: the first occurrence
+ * outside any single-quoted string literal. A leading WITH clause puts the verb
+ * past offset 0, so this scans rather than anchoring at the start; the bytes
+ * before the match are that WITH preamble, which the builders carry through
+ * verbatim. cf_reject_multi_reference guarantees the result relation is named
+ * once, so the first out-of-literal hit is the statement's own target. Only one
+ * of the unqualified / schema-qualified spellings can match (the deparser emits
+ * one form). Returns the match start and sets *matched to the spelling found;
+ * elogs if neither is present.
  */
 static const char *
 find_dml_prefix(const char *orig_sql, const char *search_unqual,
-                const char *search_qual, const char *vname)
+                const char *search_qual, const char *vname,
+                const char **matched)
 {
-    if (strncmp(orig_sql, search_unqual, strlen(search_unqual)) == 0) /* nosemgrep */
-        return search_unqual;
-    else if (strncmp(orig_sql, search_qual, strlen(search_qual)) == 0) /* nosemgrep */
-        return search_qual;
+    size_t      lu = strlen(search_unqual); /* nosemgrep */
+    size_t      lq = strlen(search_qual);   /* nosemgrep */
+    const char *p;
+    bool        in_squote = false;
+
+    for (p = orig_sql; *p; p++)
+    {
+        if (*p == '\'')
+        {
+            in_squote = !in_squote;
+            continue;
+        }
+        if (in_squote)
+            continue;
+        if (strncmp(p, search_unqual, lu) == 0) { *matched = search_unqual; return p; } /* nosemgrep */
+        if (strncmp(p, search_qual,   lq) == 0) { *matched = search_qual;   return p; } /* nosemgrep */
+    }
 
     elog(ERROR,
-         "coldfront: cannot locate result relation \"%s\" at start of "
-         "deparsed DML: %s", vname, orig_sql);
+         "coldfront: cannot locate result relation \"%s\" in deparsed DML: %s",
+         vname, orig_sql);
+    *matched = NULL;
     return NULL; /* unreachable */
 }
 
@@ -728,7 +860,7 @@ deparse_and_find_prefix(Query *query, DeparseResult *dr)
     RangeTblEntry *rte;
     char          *vname, *ns;
     char           search_unqual[256], search_qual[256];
-    const char    *old_prefix;
+    const char    *matched, *at;
 
     dr->orig_sql = pg_get_querydef(query, false);
     {
@@ -772,9 +904,10 @@ deparse_and_find_prefix(Query *query, DeparseResult *dr)
         }
     }
 
-    old_prefix = find_dml_prefix(dr->orig_sql, search_unqual, search_qual, vname);
+    at = find_dml_prefix(dr->orig_sql, search_unqual, search_qual, vname, &matched);
 
-    dr->rest = dr->orig_sql + strlen(old_prefix); /* nosemgrep */
+    dr->head_len = (size_t) (at - dr->orig_sql);
+    dr->rest     = at + strlen(matched); /* nosemgrep */
 }
 
 /*
@@ -785,6 +918,7 @@ build_hot_dml(DeparseResult *dr, TieredViewInfo *info)
 {
     StringInfoData buf;
     initStringInfo(&buf);
+    appendBinaryStringInfo(&buf, dr->orig_sql, dr->head_len);  /* leading WITH, if any */
     appendStringInfo(&buf, "%s%s %s", dr->verb, info->hot_table, dr->rest);
     return buf.data;
 }
@@ -800,6 +934,7 @@ build_cold_dml(DeparseResult *dr, TieredViewInfo *info)
 {
     StringInfoData buf;
     initStringInfo(&buf);
+    appendBinaryStringInfo(&buf, dr->orig_sql, dr->head_len);  /* leading WITH, if any */
     appendStringInfo(&buf, "%s%s %s", dr->verb, info->iceberg_table, dr->rest);
     return normalize_casts_for_duckdb(buf.data);
 }
@@ -809,9 +944,8 @@ build_cold_dml(DeparseResult *dr, TieredViewInfo *info)
  * coldfront._exec_iceberg_with_claim(table, sql) — or _tiered_insert_cold's
  * source — receives.
  *
- * With no bound params (maxid==0) it is a plain quoted literal — BYTE-IDENTICAL
- * to the old behaviour, so the top-level/literal path is unchanged. With params
- * it is a format(<template>, $1, $2, ...) call: each out-of-literal $N becomes a
+ * With no bound params (maxid==0) it is a plain quoted literal. With params it
+ * is a format(<template>, $1, $2, ...) call: each out-of-literal $N becomes a
  * positional %P$L spec and stays LIVE as a format() arg, so PG binds the value
  * at execution and DuckDB only ever sees a finished literal. That is what lets
  * cold DML carry plpgsql / PREPARE / extended-protocol $N (Cause 1).
@@ -1041,6 +1175,21 @@ collect_pg_source_relids(List *rtable, int result_rel_idx, List *acc)
     return acc;
 }
 
+/* Track single-quote string-literal state across a copied span: each ' toggles it.
+ * A '' escape toggles twice (net no change), and no replacement target can sit
+ * between the two quotes of '', so the state is exact at every match position.
+ * Lets prefix_pg_tables_with_pglocal leave occurrences inside string literals
+ * untouched while still rewriting double-quoted table identifiers. */
+static bool
+span_toggles_squote(const char *from, const char *to, bool in_squote)
+{
+    const char *c;
+    for (c = from; c < to; c++)
+        if (*c == '\'')
+            in_squote = !in_squote;
+    return in_squote;
+}
+
 static char *
 prefix_pg_tables_with_pglocal(Query *query, char *sql)
 {
@@ -1055,6 +1204,7 @@ prefix_pg_tables_with_pglocal(Query *query, char *sql)
         StringInfoData buf;
         const char    *p, *match;
         size_t         qlen, blen;
+        bool           in_squote;
         char          *bare = NULL;
         const char    *q_n, *q_ns;
 
@@ -1068,14 +1218,21 @@ prefix_pg_tables_with_pglocal(Query *query, char *sql)
             bare = pstrdup(q_n);
         }
 
-        /* Pass 1: replace qualified `<schema>.<table>` occurrences. */
+        /* Pass 1: replace qualified `<schema>.<table>` occurrences that fall
+         * outside any single-quoted string literal (a qualified name inside a
+         * literal is user data, not a table reference). */
         qlen = strlen(qualified); /* nosemgrep */
         initStringInfo(&buf);
         p = sql;
+        in_squote = false;
         while ((match = strstr(p, qualified)) != NULL)
         {
+            in_squote = span_toggles_squote(p, match, in_squote);
             appendBinaryStringInfo(&buf, p, match - p);
-            appendStringInfoString(&buf, replacement);
+            if (in_squote)
+                appendBinaryStringInfo(&buf, match, qlen);  /* inside a literal — leave verbatim */
+            else
+                appendStringInfoString(&buf, replacement);
             p = match + qlen;
         }
         appendStringInfoString(&buf, p);
@@ -1090,6 +1247,7 @@ prefix_pg_tables_with_pglocal(Query *query, char *sql)
         blen = strlen(bare); /* nosemgrep */
         initStringInfo(&buf);
         p = sql;
+        in_squote = false;
         while ((match = strstr(p, bare)) != NULL)
         {
             char before = (match == sql) ? ' ' : match[-1];
@@ -1106,8 +1264,9 @@ prefix_pg_tables_with_pglocal(Query *query, char *sql)
                   (after  >= '0' && after  <= '9') ||
                   after  == '_' || after  == '$' ||
                   after  == '"');
+            in_squote = span_toggles_squote(p, match, in_squote);
             appendBinaryStringInfo(&buf, p, match - p);
-            if (wb_before && wb_after)
+            if (!in_squote && wb_before && wb_after)
                 appendStringInfoString(&buf, replacement);
             else
                 appendBinaryStringInfo(&buf, match, blen);
@@ -1663,6 +1822,19 @@ emit_tiered_insert(Query *query, TieredViewInfo *info, ColdParamSet *ps, bool in
     source     = skip_leading_collist(dr.rest);
     cutoff_lit = format_timestamptz_literal(info->cutoff);
 
+    /* A leading WITH clause (dr.head_len bytes, before "INSERT INTO <view> ") must
+     * reach both halves, which each read `source` inside a parenthesised derived
+     * table. Fold it into source so its CTEs scope to that subquery on each engine
+     * (PG hot, DuckDB cold) — no top-level WITH to merge. */
+    if (dr.head_len > 0)
+    {
+        StringInfoData sb;
+        initStringInfo(&sb);
+        appendBinaryStringInfo(&sb, dr.orig_sql, dr.head_len);
+        appendStringInfoString(&sb, source);
+        source = sb.data;
+    }
+
     {
         RangeTblEntry *rte = (RangeTblEntry *) list_nth(query->rtable,
                                                         query->resultRelation - 1);
@@ -1884,19 +2056,124 @@ cf_reparse_and_replace(Query *query, const char *new_sql, ColdParamSet *ps)
 }
 
 /*
- * Read path: lazily attach 'ice' on the first SELECT in this session that
- * touches a registered tiered view, so the view body's iceberg_scan('ice...')
- * resolves — the version-agnostic cold-read attach (PG 16/17/18). Guarded
- * once-per-session; the relkind check inside query_reads_tiered_view keeps
- * plain queries off the SPI path.
+ * Hot-tier read routing. When a SELECT's WHERE provably restricts to the hot tier
+ * (classify_qual → TIER_HOT: the predicate proves ts >= cutoff, and cold rows all
+ * have ts < cutoff), the rows it can return are exactly those the hot heap already
+ * holds. Re-point the tiered-view reference at that heap and reparse: the read then
+ * runs in plain PostgreSQL — full jsonb, no DuckDB round-trip — instead of pg_duckdb
+ * planning the whole iceberg_scan UNION in DuckDB. The reparse re-resolves column
+ * types (the view casts data::json; the heap is native jsonb).
+ *
+ * Conservative by construction — only the simple single-relation shape (no join, CTE,
+ * set-op, sub-link, or row-mark) and only a proven-HOT predicate reroute; anything
+ * spanning tiers or ambiguous keeps the view, so cold rows can never be dropped.
+ * Returns true if it rerouted (and replaced *query in place).
+ */
+static bool
+cf_try_reroute_hot_read(Query *query)
+{
+    RangeTblEntry *view_rte;
+    TieredViewInfo info;
+    AttrNumber     partcol_attno;
+    Oid            hot_oid;
+    char           hot_relkind;
+    Node          *quals;
+    Query         *clone;
+    RangeTblEntry *crte;
+    char          *sql;
+    ColdParamSet   ps;
+    RangeVar      *rv;
+    List          *names;
+
+    if (query->cteList || query->setOperations || query->hasSubLinks ||
+        query->rowMarks || list_length(query->rtable) != 1)
+        return false;
+
+    view_rte = (RangeTblEntry *) linitial(query->rtable);
+    if (view_rte->rtekind != RTE_RELATION ||
+        get_rel_relkind(view_rte->relid) != RELKIND_VIEW)
+        return false;
+    if (!lookup_tiered_view(view_rte->relid, get_rel_name(view_rte->relid), &info))
+        return false;
+    if (info.is_iceberg_only || !info.hot_table || !info.partition_col ||
+        !info.has_cutoff)
+        return false;
+
+    /* The predicate must prove the read touches only the hot tier. */
+    partcol_attno = get_attnum(view_rte->relid, info.partition_col);
+    if (partcol_attno == InvalidAttrNumber)
+        return false;
+    quals = (query->jointree) ? query->jointree->quals : NULL;
+    if (classify_qual(quals, 1, partcol_attno, info.cutoff) != TIER_HOT)
+        return false;
+
+    /* Resolve the hot heap (relname is a ready-to-use, possibly-quoted SQL name). */
+    names = stringToQualifiedNameList(info.hot_table
+#if PG_VERSION_NUM >= 160000
+                                      , NULL
+#endif
+                                      );
+    rv          = makeRangeVarFromNameList(names);
+    hot_oid     = RangeVarGetRelid(rv, NoLock, true);
+    hot_relkind = OidIsValid(hot_oid) ? get_rel_relkind(hot_oid) : '\0';
+    if (hot_relkind != RELKIND_RELATION && hot_relkind != RELKIND_PARTITIONED_TABLE)
+        return false;
+
+    /* Re-point the relation at the heap, deparse, and reparse in place so column
+     * types re-resolve and the query plans in plain PG. */
+    clone = copyObject(query);
+    crte  = (RangeTblEntry *) linitial(clone->rtable);
+    crte->relid       = hot_oid;
+    crte->relkind     = hot_relkind;
+    crte->rellockmode = AccessShareLock;
+    sql = pg_get_querydef(clone, false);
+
+    collect_cold_params(query, &ps);
+    cf_reparse_and_replace(query, sql, &ps);
+    return true;
+}
+
+/*
+ * jsonb → json on the read path. A query against a tiered / iceberg-only view runs
+ * entirely in DuckDB (the view body is an iceberg_scan UNION), and DuckDB has no
+ * jsonb type. Deparse, apply the read whitelist (normalize_jsonb_for_read: the
+ * ::jsonb cast and the functions verified equivalent in both engines), reparse in
+ * place. No whitelisted token ⇒ strcmp matches and the query is left untouched (the
+ * common case — ->>/-> operators and plain reads never reparse). jsonb spellings
+ * outside the whitelist pass through and DuckDB rejects them clearly (documented).
+ */
+static void
+cf_normalize_read_jsonb(Query *query)
+{
+    char         *sql  = pg_get_querydef(query, false);
+    char         *norm = normalize_jsonb_for_read(sql);
+    ColdParamSet  ps;
+
+    if (strcmp(sql, norm) == 0)  /* nosemgrep */
+        return;
+    collect_cold_params(query, &ps);
+    cf_reparse_and_replace(query, norm, &ps);
+}
+
+/*
+ * Read path for a SELECT that touches a registered tiered view. First try to
+ * reroute a provably-hot read to the heap (runs in plain PG). Otherwise the read
+ * spans the cold tier: lazily attach 'ice' (once per session) so the view body's
+ * iceberg_scan('ice...') resolves — the version-agnostic cold-read attach (PG
+ * 16/17/18) — and normalize the whitelisted jsonb spellings so DuckDB (which runs
+ * the whole view query) accepts them. The relkind check inside
+ * query_reads_tiered_view keeps plain queries off the SPI path.
  */
 static void
 cf_maybe_attach_for_read(Query *query)
 {
-    if (query->commandType == CMD_SELECT &&
-        !coldfront_ice_attached &&
-        query_reads_tiered_view(query))
+    if (query->commandType != CMD_SELECT || !query_reads_tiered_view(query))
+        return;
+    if (cf_try_reroute_hot_read(query))
+        return;   /* rewritten to the hot heap; runs in plain PostgreSQL */
+    if (!coldfront_ice_attached)
         ensure_ice_attached_once();
+    cf_normalize_read_jsonb(query);
 }
 
 /*

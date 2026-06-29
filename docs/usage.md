@@ -464,10 +464,32 @@ types, custom enums, arrays, composite types) is rejected at
 table-creation time. We refuse silent fallback to `varchar` - losing
 precision/identity is worse than no support.
 
-`jsonb`, `json` and `interval` are stored as `varchar` in Iceberg (no
-native primitive) and view-cast back to the rich PG type on read. Queries
-like `data->>'key'` work; jsonb-only operators (`?`, `@>`) need an
-explicit `data::jsonb` cast.
+`json`, `jsonb` and `interval` are stored as `varchar` in Iceberg (no
+native primitive). On read, `interval` is view-cast back to the rich PG
+type; `json` and `jsonb` surface as DuckDB's `json` (the equivalent of
+PG's `jsonb`), not the rich PG `jsonb` type, because Iceberg-backed reads
+run entirely in DuckDB. Queries like `data->>'key'` and `data->'key'`
+work, and ColdFront translates the `::jsonb` cast and `jsonb_array_length`
+on read. The jsonb-only operators (`?`, `@>`, `<@`, `#>`, `#>>`) and most
+jsonb functions (`jsonb_typeof`, `jsonb_extract_path`,
+`jsonb_extract_path_text`, `jsonb_set`, `jsonb_path_*`, `jsonb_each`,
+`jsonb_object_keys`) are not supported on tiered or decoupled data:
+DuckDB either lacks them or its same-named function differs in signature
+or result. Reach into the document with `->`/`->>`.
+
+These limits apply only to reads that go through a tiered or
+iceberg-only view, which pg_duckdb plans entirely in DuckDB. Ordinary
+(non-tiered) PostgreSQL tables are untouched by ColdFront and keep full
+jsonb support, as does the hot partition table itself.
+
+A hot-only read is the exception. When a `SELECT` reads a tiered view
+directly (no join, CTE, or sub-query) and its `WHERE` provably restricts
+to the hot tier, ColdFront rewrites it to read the hot partition table in
+plain PostgreSQL: the full jsonb operator and function set works, and the
+query skips DuckDB entirely. Such a read surfaces `data` as native
+`jsonb` rather than the view's `json`. Reads that span tiers, are
+cold-only, or reach the view through a join or sub-query stay in DuckDB,
+where the limits above apply.
 
 `inet`/`cidr` are **not supported**: pg_duckdb cannot process PG `inet`
 (Oid 869) in any Iceberg-backed query, and every cross-tier read is
@@ -479,8 +501,11 @@ queries on the hot side only if needed).
 
 Keep the following caveats in mind when running either mode:
 
-- **`jsonb` reads**: surface as `json`, not `jsonb`. Most operators
-  work; the binary-only ones don't.
+- **`jsonb` reads**: surface as `json`. The `->`/`->>` operators work,
+  and ColdFront translates the `::jsonb` cast and `jsonb_array_length`;
+  other jsonb operators and functions are unsupported on cold or
+  cross-tier reads. A hot-only read of the view runs in PostgreSQL with
+  full jsonb (see Supported column types).
 - **Cross-tier isolation**: a long-running `SELECT` that touches the
   Iceberg side multiple times within one transaction may see writes from
   other sessions interleaved between scans. PG's repeatable-read does not
