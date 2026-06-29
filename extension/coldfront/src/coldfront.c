@@ -32,6 +32,8 @@
 
 #include "postgres.h"
 
+#include <ctype.h>
+
 #include "access/attnum.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
@@ -760,13 +762,10 @@ cf_apply_subst(const char *sql, const CfSubst *map, int map_len, bool jsonb_catc
             {
                 char prev = (p == sql) ? ' ' : p[-1];
                 char next = p[5];
-                bool prev_boundary =
-                    !((prev >= 'A' && prev <= 'Z') || (prev >= 'a' && prev <= 'z') ||
-                      (prev >= '0' && prev <= '9') || prev == '_');
-                bool next_ok =
-                    !((next >= 'A' && next <= 'Z') || (next >= 'a' && next <= 'z') ||
-                      (next >= '0' && next <= '9'));
-                if (prev_boundary && next_ok)
+                /* left edge not part of an identifier; right edge not a letter/
+                 * digit ('_' allowed, so jsonb_set maps to json_set). */
+                if (!(isalnum((unsigned char) prev) || prev == '_') &&
+                    !isalnum((unsigned char) next))
                 {
                     appendStringInfoString(&buf, "json");
                     p += 5;
