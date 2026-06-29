@@ -1,0 +1,41 @@
+-- Regression guard for the cold-tier INSERT … SELECT rewrite (pglocal prefixing):
+-- when a source-table name also appears as text inside a string literal, the
+-- prefixing step must rewrite ONLY the real FROM reference, never the occurrence
+-- inside the literal. Source table "Bad Tablename" is spelled so its quoted
+-- identifier appears verbatim inside a column literal below.
+-- White-box: EXPLAIN VERBOSE shows the rewritten cold SQL; we do NOT execute
+-- (no Iceberg attached under pg_regress — see update_cold_via_view.sql).
+
+CREATE EXTENSION IF NOT EXISTS pg_duckdb;
+CREATE EXTENSION IF NOT EXISTS coldfront;
+
+SET TIME ZONE 'UTC';
+-- White-box: checks the hook's SQL, not Iceberg I/O. Real cold I/O is ci/journey.sh.
+SET coldfront.warehouse = '';
+SET coldfront.lakekeeper_endpoint = '';
+SET coldfront.local_pg_dsn = '';
+
+-- iceberg-only view: every DML routes to the cold tier. A real backing table keeps
+-- the view auto-updatable; the hook rewrites the INSERT before the rewriter ever
+-- consults the view body.
+CREATE TABLE public._ice_base (id int, ts timestamptz, note text);
+CREATE VIEW public.iceonly AS SELECT * FROM public._ice_base;
+INSERT INTO coldfront.tiered_views(schema_name, relname, iceberg_table, is_iceberg_only)
+VALUES ('public', 'iceonly', 'ice.default.iceonly', true);
+
+-- Source table whose quoted name ("Bad Tablename") is embedded in the literal below.
+CREATE TABLE public."Bad Tablename" (id int, ts timestamptz, note text);
+
+-- The cold INSERT … SELECT streams source rows into Iceberg via pglocal. The FROM
+-- reference must become pglocal.public."Bad Tablename"; the string literal
+-- 'imported from "Bad Tablename"' must be left byte-for-byte intact.
+EXPLAIN (COSTS OFF, VERBOSE)
+  INSERT INTO public.iceonly
+  SELECT id, ts, 'imported from "Bad Tablename"' FROM public."Bad Tablename";
+
+-- Cleanup. Unregister before dropping: the DDL hook blocks DROP of a registered
+-- tiered relation.
+DELETE FROM coldfront.tiered_views;
+DROP VIEW public.iceonly;
+DROP TABLE public._ice_base;
+DROP TABLE public."Bad Tablename";

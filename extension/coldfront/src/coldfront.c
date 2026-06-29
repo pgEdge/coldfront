@@ -1152,6 +1152,21 @@ collect_pg_source_relids(List *rtable, int result_rel_idx, List *acc)
     return acc;
 }
 
+/* Track single-quote string-literal state across a copied span: each ' toggles it.
+ * A '' escape toggles twice (net no change), and no replacement target can sit
+ * between the two quotes of '', so the state is exact at every match position.
+ * Lets prefix_pg_tables_with_pglocal leave occurrences inside string literals
+ * untouched while still rewriting double-quoted table identifiers. */
+static bool
+span_toggles_squote(const char *from, const char *to, bool in_squote)
+{
+    const char *c;
+    for (c = from; c < to; c++)
+        if (*c == '\'')
+            in_squote = !in_squote;
+    return in_squote;
+}
+
 static char *
 prefix_pg_tables_with_pglocal(Query *query, char *sql)
 {
@@ -1166,6 +1181,7 @@ prefix_pg_tables_with_pglocal(Query *query, char *sql)
         StringInfoData buf;
         const char    *p, *match;
         size_t         qlen, blen;
+        bool           in_squote;
         char          *bare = NULL;
         const char    *q_n, *q_ns;
 
@@ -1179,14 +1195,21 @@ prefix_pg_tables_with_pglocal(Query *query, char *sql)
             bare = pstrdup(q_n);
         }
 
-        /* Pass 1: replace qualified `<schema>.<table>` occurrences. */
+        /* Pass 1: replace qualified `<schema>.<table>` occurrences that fall
+         * outside any single-quoted string literal (a qualified name inside a
+         * literal is user data, not a table reference). */
         qlen = strlen(qualified); /* nosemgrep */
         initStringInfo(&buf);
         p = sql;
+        in_squote = false;
         while ((match = strstr(p, qualified)) != NULL)
         {
+            in_squote = span_toggles_squote(p, match, in_squote);
             appendBinaryStringInfo(&buf, p, match - p);
-            appendStringInfoString(&buf, replacement);
+            if (in_squote)
+                appendBinaryStringInfo(&buf, match, qlen);  /* inside a literal — leave verbatim */
+            else
+                appendStringInfoString(&buf, replacement);
             p = match + qlen;
         }
         appendStringInfoString(&buf, p);
@@ -1201,6 +1224,7 @@ prefix_pg_tables_with_pglocal(Query *query, char *sql)
         blen = strlen(bare); /* nosemgrep */
         initStringInfo(&buf);
         p = sql;
+        in_squote = false;
         while ((match = strstr(p, bare)) != NULL)
         {
             char before = (match == sql) ? ' ' : match[-1];
@@ -1217,8 +1241,9 @@ prefix_pg_tables_with_pglocal(Query *query, char *sql)
                   (after  >= '0' && after  <= '9') ||
                   after  == '_' || after  == '$' ||
                   after  == '"');
+            in_squote = span_toggles_squote(p, match, in_squote);
             appendBinaryStringInfo(&buf, p, match - p);
-            if (wb_before && wb_after)
+            if (!in_squote && wb_before && wb_after)
                 appendStringInfoString(&buf, replacement);
             else
                 appendBinaryStringInfo(&buf, match, blen);
