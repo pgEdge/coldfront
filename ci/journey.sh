@@ -374,6 +374,13 @@ SELECT 'RO_COLD:'  || count(*) FROM events WHERE ts  < date_trunc('month',now())
 SELECT 'JSONB_TYPE:'   || pg_typeof(data)::text FROM events LIMIT 1;
 SELECT 'JSONB_COLD_M:' || (data->>'m') FROM events WHERE ts < date_trunc('month',now()) - interval '2 months' AND status='ok' ORDER BY ts LIMIT 1;
 SELECT 'JSONB_HOT_M:'  || (data->>'m') FROM events WHERE ts >= date_trunc('month',now()) - interval '2 months' AND status='ok' ORDER BY ts LIMIT 1;
+-- Read-path jsonb→json whitelist. The whole view query runs in DuckDB; the hook
+-- translates the ::jsonb cast (so an explicit cast does not hit DuckDB's missing
+-- jsonb type) and jsonb_array_length (verified identical in both engines). Cold and
+-- hot, on real Iceberg data.
+SELECT 'CAST_COLD:' || ((data::jsonb)->>'m') FROM events WHERE ts < date_trunc('month',now()) - interval '2 months' AND status='ok' ORDER BY ts LIMIT 1;
+SELECT 'CAST_HOT:'  || ((data::jsonb)->>'m') FROM events WHERE ts >= date_trunc('month',now()) - interval '2 months' AND status='ok' ORDER BY ts LIMIT 1;
+SELECT 'ALEN_COLD:' || jsonb_array_length('[10,20,30]'::jsonb) FROM events WHERE ts < date_trunc('month',now()) - interval '2 months' AND status='ok' ORDER BY ts LIMIT 1;
 EOSQL
 )
     assert_eq "total rows (hot+cold via view)" "280"  "$(extract RO_TOTAL "$O")"
@@ -382,6 +389,30 @@ EOSQL
     assert_eq "data surfaces as json" "json" "$(extract JSONB_TYPE "$O")"
     assert_eq "json cold round-trip"  "m4"  "$(extract JSONB_COLD_M "$O")"
     assert_eq "json hot round-trip"   "m2"  "$(extract JSONB_HOT_M "$O")"
+    assert_eq "::jsonb cast translated, cold" "m4" "$(extract CAST_COLD "$O")"
+    assert_eq "::jsonb cast translated, hot"  "m2" "$(extract CAST_HOT "$O")"
+    assert_eq "jsonb_array_length→json_array_length" "3" "$(extract ALEN_COLD "$O")"
+
+    # Hot-tier read routing: a read whose WHERE provably restricts to the hot tier
+    # (ts >= the watermark) is rewritten to the hot heap and runs in plain PostgreSQL,
+    # so jsonb operators/functions DuckDB lacks (jsonb_typeof, @>) work. m1..m4 all
+    # predate the watermark (date_trunc('month',now())), so insert a now() row (hot),
+    # exercise it, then delete it — the row counts asserted above stay intact.
+    qf "$HOST" >/dev/null <<'EOSQL'
+INSERT INTO events (ts, status, data) VALUES (now(), 'ok', '{"m":"hotjson","arr":[1,2,3]}'::jsonb);
+EOSQL
+    local HR; HR=$(qf "$HOST" <<'EOSQL'
+SELECT 'HOT_TYPEOF:'  || jsonb_typeof(data::jsonb)                         FROM events WHERE ts >= date_trunc('month',now()) AND data->>'m'='hotjson';
+SELECT 'HOT_CONTAIN:' || ((data::jsonb) @> '{"m":"hotjson"}'::jsonb)::text FROM events WHERE ts >= date_trunc('month',now()) AND data->>'m'='hotjson';
+SELECT 'HOT_HASKEY:' || ((data::jsonb) ? 'arr')::text                     FROM events WHERE ts >= date_trunc('month',now()) AND data->>'m'='hotjson';
+EOSQL
+)
+    qf "$HOST" >/dev/null <<'EOSQL'
+DELETE FROM events WHERE ts >= date_trunc('month',now()) AND data->>'m'='hotjson';
+EOSQL
+    assert_eq "hot read routes to PG: jsonb_typeof (DuckDB lacks it)"   "object" "$(extract HOT_TYPEOF "$HR")"
+    assert_eq "hot read routes to PG: @> containment (DuckDB lacks it)" "true"   "$(extract HOT_CONTAIN "$HR")"
+    assert_eq "hot read routes to PG: ? key-exists (DuckDB lacks it)"   "true"   "$(extract HOT_HASKEY "$HR")"
 }
 
 # ───────────────────────────────────────────────────────────────────────────

@@ -50,6 +50,7 @@
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/regproc.h"
 #include "utils/ruleutils.h"
 #include "utils/timestamp.h"
 #include "fmgr.h"
@@ -663,6 +664,23 @@ static const CfSubst cf_write_subst[] = {
 };
 
 /*
+ * Tiered-READ substitutions. A rewritten SELECT is reparsed by PG and then planned
+ * by DuckDB, so a translation must be valid in BOTH engines — which rules out the
+ * write path's blanket catch-all. Only the jsonb type cast and the functions
+ * verified identical in PG and DuckDB are translated; every other jsonb spelling is
+ * left untouched, so DuckDB rejects it with a clear "… does not exist" (a documented
+ * read limitation). Blanket-mapping would break two ways: jsonb_path_query →
+ * json_path_query fails PG reparse (PG has no json_path_query), and
+ * json_extract_path_text / json_type are signature- or vocabulary-incompatible in
+ * DuckDB (array result; UBIGINT/VARCHAR vs number/string). json_array_length is
+ * verified identical ([10,20,30]→3, []→0) and exists in both.
+ */
+static const CfSubst cf_read_subst[] = {
+    { "::jsonb",             "::json"             },
+    { "jsonb_array_length(", "json_array_length(" },
+};
+
+/*
  * Rewrite a deparsed SQL string token-by-token using `map`, optionally followed by
  * the boundary-aware jsonb→json catch-all. Returns a palloc'd result. Quote-aware:
  * skips substitution inside a single-quoted literal or double-quoted identifier, so
@@ -767,6 +785,13 @@ static char *
 normalize_casts_for_duckdb(const char *sql)
 {
     return cf_apply_subst(sql, cf_write_subst, lengthof(cf_write_subst), true);
+}
+
+/* Tiered-read path: whitelist only (output is reparsed by PG, then run by DuckDB). */
+static char *
+normalize_jsonb_for_read(const char *sql)
+{
+    return cf_apply_subst(sql, cf_read_subst, lengthof(cf_read_subst), false);
 }
 
 /* ---------- SQL builder ----------------------------------------------- */
@@ -1970,19 +1995,124 @@ cf_reparse_and_replace(Query *query, const char *new_sql, ColdParamSet *ps)
 }
 
 /*
- * Read path: lazily attach 'ice' on the first SELECT in this session that
- * touches a registered tiered view, so the view body's iceberg_scan('ice...')
- * resolves — the version-agnostic cold-read attach (PG 16/17/18). Guarded
- * once-per-session; the relkind check inside query_reads_tiered_view keeps
- * plain queries off the SPI path.
+ * Hot-tier read routing. When a SELECT's WHERE provably restricts to the hot tier
+ * (classify_qual → TIER_HOT: the predicate proves ts >= cutoff, and cold rows all
+ * have ts < cutoff), the rows it can return are exactly those the hot heap already
+ * holds. Re-point the tiered-view reference at that heap and reparse: the read then
+ * runs in plain PostgreSQL — full jsonb, no DuckDB round-trip — instead of pg_duckdb
+ * planning the whole iceberg_scan UNION in DuckDB. The reparse re-resolves column
+ * types (the view casts data::json; the heap is native jsonb).
+ *
+ * Conservative by construction — only the simple single-relation shape (no join, CTE,
+ * set-op, sub-link, or row-mark) and only a proven-HOT predicate reroute; anything
+ * spanning tiers or ambiguous keeps the view, so cold rows can never be dropped.
+ * Returns true if it rerouted (and replaced *query in place).
+ */
+static bool
+cf_try_reroute_hot_read(Query *query)
+{
+    RangeTblEntry *view_rte;
+    TieredViewInfo info;
+    AttrNumber     partcol_attno;
+    Oid            hot_oid;
+    char           hot_relkind;
+    Node          *quals;
+    Query         *clone;
+    RangeTblEntry *crte;
+    char          *sql;
+    ColdParamSet   ps;
+    RangeVar      *rv;
+    List          *names;
+
+    if (query->cteList || query->setOperations || query->hasSubLinks ||
+        query->rowMarks || list_length(query->rtable) != 1)
+        return false;
+
+    view_rte = (RangeTblEntry *) linitial(query->rtable);
+    if (view_rte->rtekind != RTE_RELATION ||
+        get_rel_relkind(view_rte->relid) != RELKIND_VIEW)
+        return false;
+    if (!lookup_tiered_view(view_rte->relid, get_rel_name(view_rte->relid), &info))
+        return false;
+    if (info.is_iceberg_only || !info.hot_table || !info.partition_col ||
+        !info.has_cutoff)
+        return false;
+
+    /* The predicate must prove the read touches only the hot tier. */
+    partcol_attno = get_attnum(view_rte->relid, info.partition_col);
+    if (partcol_attno == InvalidAttrNumber)
+        return false;
+    quals = (query->jointree) ? query->jointree->quals : NULL;
+    if (classify_qual(quals, 1, partcol_attno, info.cutoff) != TIER_HOT)
+        return false;
+
+    /* Resolve the hot heap (relname is a ready-to-use, possibly-quoted SQL name). */
+    names = stringToQualifiedNameList(info.hot_table
+#if PG_VERSION_NUM >= 160000
+                                      , NULL
+#endif
+                                      );
+    rv          = makeRangeVarFromNameList(names);
+    hot_oid     = RangeVarGetRelid(rv, NoLock, true);
+    hot_relkind = OidIsValid(hot_oid) ? get_rel_relkind(hot_oid) : '\0';
+    if (hot_relkind != RELKIND_RELATION && hot_relkind != RELKIND_PARTITIONED_TABLE)
+        return false;
+
+    /* Re-point the relation at the heap, deparse, and reparse in place so column
+     * types re-resolve and the query plans in plain PG. */
+    clone = copyObject(query);
+    crte  = (RangeTblEntry *) linitial(clone->rtable);
+    crte->relid       = hot_oid;
+    crte->relkind     = hot_relkind;
+    crte->rellockmode = AccessShareLock;
+    sql = pg_get_querydef(clone, false);
+
+    collect_cold_params(query, &ps);
+    cf_reparse_and_replace(query, sql, &ps);
+    return true;
+}
+
+/*
+ * jsonb → json on the read path. A query against a tiered / iceberg-only view runs
+ * entirely in DuckDB (the view body is an iceberg_scan UNION), and DuckDB has no
+ * jsonb type. Deparse, apply the read whitelist (normalize_jsonb_for_read: the
+ * ::jsonb cast and the functions verified equivalent in both engines), reparse in
+ * place. No whitelisted token ⇒ strcmp matches and the query is left untouched (the
+ * common case — ->>/-> operators and plain reads never reparse). jsonb spellings
+ * outside the whitelist pass through and DuckDB rejects them clearly (documented).
+ */
+static void
+cf_normalize_read_jsonb(Query *query)
+{
+    char         *sql  = pg_get_querydef(query, false);
+    char         *norm = normalize_jsonb_for_read(sql);
+    ColdParamSet  ps;
+
+    if (strcmp(sql, norm) == 0)  /* nosemgrep */
+        return;
+    collect_cold_params(query, &ps);
+    cf_reparse_and_replace(query, norm, &ps);
+}
+
+/*
+ * Read path for a SELECT that touches a registered tiered view. First try to
+ * reroute a provably-hot read to the heap (runs in plain PG). Otherwise the read
+ * spans the cold tier: lazily attach 'ice' (once per session) so the view body's
+ * iceberg_scan('ice...') resolves — the version-agnostic cold-read attach (PG
+ * 16/17/18) — and normalize the whitelisted jsonb spellings so DuckDB (which runs
+ * the whole view query) accepts them. The relkind check inside
+ * query_reads_tiered_view keeps plain queries off the SPI path.
  */
 static void
 cf_maybe_attach_for_read(Query *query)
 {
-    if (query->commandType == CMD_SELECT &&
-        !coldfront_ice_attached &&
-        query_reads_tiered_view(query))
+    if (query->commandType != CMD_SELECT || !query_reads_tiered_view(query))
+        return;
+    if (cf_try_reroute_hot_read(query))
+        return;   /* rewritten to the hot heap; runs in plain PostgreSQL */
+    if (!coldfront_ice_attached)
         ensure_ice_attached_once();
+    cf_normalize_read_jsonb(query);
 }
 
 /*
