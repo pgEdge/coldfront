@@ -16,3 +16,37 @@ jobs:
         run: shellcheck -x --source-path=examples/walkthrough examples/walkthrough/*.sh
       - name: Validate Docker Compose
         run: docker compose -f examples/walkthrough/docker-compose.yml config --quiet
+
+  smoke:
+    name: Smoke Test
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install prerequisites
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client jq iproute2
+      - name: Run setup + Tiered demo non-interactively
+        working-directory: examples/walkthrough
+        env:
+          WALKTHROUGH_NONINTERACTIVE: "1"
+          WALKTHROUGH_DEMO: tiered
+          WALKTHROUGH_ROWS: "200000"
+        run: bash guide.sh
+      - name: Assert tiering proof
+        run: |
+          export PGPASSWORD=coldfront
+          relk=$(psql -h localhost -U coldfront -d coldfront -tAc "SELECT relkind FROM pg_class WHERE relname='events';")
+          wm=$(psql -h localhost -U coldfront -d coldfront -tAc "SELECT count(*) FROM coldfront.archive_watermark WHERE table_name='events';")
+          [ "$relk" = "v" ] || { echo "events not a view (relkind=$relk)"; exit 1; }
+          [ "$wm" = "1" ] || { echo "no watermark row"; exit 1; }
+          echo "Tiering proof OK"
+      - name: Dump logs on failure
+        if: failure()
+        working-directory: examples/walkthrough
+        run: docker compose logs
