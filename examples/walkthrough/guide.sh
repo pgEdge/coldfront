@@ -16,12 +16,24 @@ NONINTERACTIVE="${WALKTHROUGH_NONINTERACTIVE:-0}"
 GEN_ROWS=1000000
 
 export PGPASSWORD=coldfront
+# Silence pg_duckdb's "NOTICE: result: Success" chatter on every cross-tier query
+# so the walkthrough output stays clean. Applies to all psql invocations below.
+export PGOPTIONS='-c client_min_messages=warning'
 
 cleanup() { stop_spinner; }
 trap cleanup EXIT
 
 pg()       { PGPASSWORD=coldfront psql -h localhost -p "$PG_PORT" -U coldfront -d coldfront -tAX -c "$1"; }
 psql_file(){ PGPASSWORD=coldfront psql -h localhost -p "$PG_PORT" -U coldfront -d coldfront -v ON_ERROR_STOP=1; }
+
+# show_query — run a SELECT and print it as an aligned psql table, framed, for the
+# viewer to read. Use this for anything shown on screen. (pg() stays -tAX, only for
+# values captured into shell variables.)
+show_query() {
+    echo -e "${DIM}─── result ─────────────────────────────────────────────────${RESET}"
+    PGPASSWORD=coldfront psql -h localhost -p "$PG_PORT" -U coldfront -d coldfront -c "$1"
+    echo -e "${DIM}────────────────────────────────────────────────────────────${RESET}"
+}
 
 # ── Port detection ───────────────────────────────────────────────────────────
 
