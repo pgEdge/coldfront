@@ -897,6 +897,26 @@ story_blocks() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# Story — Extension dependency (#32). coldfront.control declares
+# requires = 'pg_duckdb', so on a database without pg_duckdb, CREATE EXTENSION
+# coldfront is rejected up front ("required extension ... is not installed")
+# instead of failing later at runtime with schema "duckdb" not existing. Use a
+# throwaway database and drop pg_duckdb to guarantee its absence regardless of
+# what template1 carries.
+# ───────────────────────────────────────────────────────────────────────────
+story_ext_requires() {
+    step "Extension dependency: CREATE EXTENSION coldfront without pg_duckdb is rejected (#32)"
+    q "$HOST" "DROP DATABASE IF EXISTS cf_dep_check;"
+    q "$HOST" "CREATE DATABASE cf_dep_check;"
+    docker exec -e PGUSER="$CF_DBUSER" -e PGDATABASE=cf_dep_check "$HOST" "$CF_PSQL" -tA \
+        -c "DROP EXTENSION IF EXISTS pg_duckdb CASCADE;" >/dev/null 2>&1 || true
+    assert_err "missing pg_duckdb rejected at CREATE EXTENSION" "required extension" \
+        "$(docker exec -e PGUSER="$CF_DBUSER" -e PGDATABASE=cf_dep_check "$HOST" "$CF_PSQL" -tA \
+            -c "CREATE EXTENSION coldfront;" 2>&1 || true)"
+    q "$HOST" "DROP DATABASE cf_dep_check;"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Story 9 — Concurrency / no-409: writes that race the archive cycle survive.
 # The m1 (now-1mo) partition is still hot after the first cycle (cutoff = start
 # of now-1mo). A second cycle with the cutoff pinned PAST the start of the
@@ -1781,6 +1801,7 @@ if [ "$MODE" = "tiered" ]; then
     story_mixed_concurrency
     story_ddl
     story_blocks
+    story_ext_requires
     story_concurrency
     story_concurrent_writers
     story_txn
