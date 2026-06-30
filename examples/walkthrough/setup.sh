@@ -63,11 +63,5 @@ fi
 info "Docker daemon is running."
 echo ""
 
-# Apple Silicon note: the published base may be amd64-only (see plan Task 1).
-if [[ "$OS" == "Darwin" && "$(uname -m)" == "arm64" ]]; then
-  warn "Apple Silicon detected. If the coldfront base image has no arm64 build,"
-  warn "it runs under emulation (functional, slower). The walkthrough still works."
-  echo ""
-fi
 
 info "All prerequisites satisfied."

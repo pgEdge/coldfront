@@ -24,10 +24,8 @@ The walkthrough requires the following:
   recommended for the standard data volume).
 - `curl`, `bash`, and `psql` on the host (the psql commands connect to
   the published port).
-- Apple Silicon (M1/M2/M3): the PostgreSQL image runs as
-  `linux/amd64` via Rosetta 2 emulation. Enable it in Docker Desktop
-  under Settings > General > "Use Rosetta for x86/amd64 emulation on
-  Apple Silicon".
+- Apple Silicon (M1/M2/M3): the base image is multi-arch, so the
+  walkthrough runs natively — no Rosetta emulation required.
 
 ## Run it
 

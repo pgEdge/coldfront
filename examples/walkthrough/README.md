@@ -179,9 +179,5 @@ bash examples/walkthrough/guide.sh
 
 ## Apple Silicon Note
 
-The `db` service is pinned to `platform: linux/amd64` in
-`docker-compose.yml` because the `coldfront-duckdb-base` image is built
-for amd64. On Apple Silicon (M1/M2/M3) Docker Desktop runs this under
-Rosetta 2 emulation — the walkthrough is fully functional, but image
-pull and the initial build take longer than on a native amd64 host. If
-you see a slow `docker build` on first run, this is expected.
+The `coldfront-duckdb-base` image is multi-arch (amd64 + arm64), so
+the walkthrough runs natively on Apple Silicon and amd64 alike.
