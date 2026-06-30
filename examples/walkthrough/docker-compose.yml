@@ -5,7 +5,7 @@
 name: coldfront-walkthrough
 services:
     db:
-        platform: linux/amd64
+        platform: linux/amd64  # Pinned: coldfront-duckdb-base is amd64-only (pgEdge/coldfront#27). Remove when the multi-arch base ships (else this forces emulation on arm64).
         build:
             context: ../..
             dockerfile: docker/Dockerfile.duckdb15
@@ -19,7 +19,7 @@ services:
         ports:
             - "${COLDFRONT_PG_PORT:-5432}:5432"
         volumes:
-            - pgdata:/var/lib/pgsql/18/data
+            - pgdata:/var/lib/pgsql/18/data  # Tracks PG_MAJOR=18 (the default). If you override PG_MAJOR, update this path to match $PGDATA.
         healthcheck:
             test: ["CMD-SHELL", "pg_isready -U coldfront"]
             interval: 3s

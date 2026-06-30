@@ -8,8 +8,6 @@ source "$SCRIPT_DIR/runner.sh"
 COMPOSE="docker compose -f $SCRIPT_DIR/docker-compose.yml"
 PG_PORT="${COLDFRONT_PG_PORT:-5432}"
 LK_PORT="${COLDFRONT_LK_PORT:-8181}"
-# shellcheck disable=SC2034  # consumed by Phase B+ tasks
-S3_PORT="${COLDFRONT_S3_PORT:-8333}"
 LK_URL="http://localhost:${LK_PORT}"
 # shellcheck disable=SC2034  # consumed by Phase B+ tasks
 NONINTERACTIVE="${WALKTHROUGH_NONINTERACTIVE:-0}"
