@@ -917,6 +917,64 @@ story_ext_requires() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# Story — Packaging: load the bundled .duckdb_extension files from a custom
+# duckdb.extension_directory. The Docker image places them under the DEFAULT
+# dir ($PGDATA/pg_duckdb/extensions); an RPM/DEB can't write PGDATA, so it
+# installs them under <dir>/<ver>/<platform>/ and points the GUC at <dir>.
+# This proves pg_duckdb honours that GUC (so the packaging path is supported),
+# with an empty-dir negative control so it can't pass via the default dir.
+# ───────────────────────────────────────────────────────────────────────────
+story_ext_directory_guc() {
+    step "Packaging: pg_duckdb loads extensions from a custom duckdb.extension_directory"
+    # duckdb.extension_directory is read at server start, so this applies it via a
+    # restart. Skip in mesh, where a mid-journey node restart would churn spock;
+    # the GUC behaviour is mode-independent, so the single-node run covers it.
+    if [ "$MESH" = 1 ]; then pass "extension_directory check skipped in mesh (single-node)"; return; fi
+    # Build the package-style layout in a writable, restart-persistent place
+    # (under the data dir, postgres-owned) by cloning the working default
+    # extension tree — it already has the correct <version>/<platform> subdirs.
+    # cfpkg = populated (the "package installed it here" case), cfpkg-empty =
+    # negative control.
+    local pgdata
+    pgdata="$(q "$HOST" "SHOW data_directory;" | tail -1)"
+    docker exec "$HOST" bash -c "rm -rf '$pgdata/cfpkg' '$pgdata/cfpkg-empty'; cp -a '$pgdata/pg_duckdb/extensions' '$pgdata/cfpkg'; mkdir -p '$pgdata/cfpkg-empty'"
+
+    _cf_wait_pg() {
+        local i=0
+        until docker exec -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" "$HOST" "$CF_PSQL" -tAc 'SELECT 1' >/dev/null 2>&1; do
+            i=$((i + 1)); [ "$i" -gt 60 ] && { fail "postgres did not come back after restart"; return 1; }; sleep 1
+        done
+    }
+
+    # Disable autoinstall: with it on, an empty dir is masked by DuckDB
+    # downloading the (unpatched) upstream extension. A package must ship our
+    # patched files and not silently fetch upstream, so the test mirrors that.
+    q "$HOST" "ALTER SYSTEM SET duckdb.autoinstall_known_extensions = false;"
+    # Negative control: empty package dir -> LOAD iceberg must FAIL, proving the
+    # GUC actually redirects (the default dir is not used as a fallback).
+    q "$HOST" "ALTER SYSTEM SET duckdb.extension_directory = '$pgdata/cfpkg-empty';"
+    docker restart "$HOST" >/dev/null; _cf_wait_pg || return
+    case "$(q_may "$HOST" "SELECT duckdb.raw_query('LOAD iceberg');")" in
+        *Success*) fail "empty extension_directory: LOAD iceberg unexpectedly succeeded" ;;
+        *)         pass "empty extension_directory: LOAD iceberg fails (GUC redirects; no autoinstall)" ;;
+    esac
+
+    # Positive: populated package dir -> LOAD iceberg must succeed.
+    q "$HOST" "ALTER SYSTEM SET duckdb.extension_directory = '$pgdata/cfpkg';"
+    docker restart "$HOST" >/dev/null; _cf_wait_pg || return
+    local out; out="$(q_may "$HOST" "SELECT duckdb.raw_query('LOAD iceberg');")"
+    case "$out" in
+        *Success*) pass "populated extension_directory: LOAD iceberg succeeds" ;;
+        *)         fail "populated extension_directory: LOAD iceberg did not succeed — $out" ;;
+    esac
+
+    # Restore image defaults so later stories load from $PGDATA as usual.
+    q "$HOST" "ALTER SYSTEM RESET duckdb.extension_directory;"
+    q "$HOST" "ALTER SYSTEM RESET duckdb.autoinstall_known_extensions;"
+    docker restart "$HOST" >/dev/null; _cf_wait_pg || return
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Story 9 — Concurrency / no-409: writes that race the archive cycle survive.
 # The m1 (now-1mo) partition is still hot after the first cycle (cutoff = start
 # of now-1mo). A second cycle with the cutoff pinned PAST the start of the
@@ -1802,6 +1860,7 @@ if [ "$MODE" = "tiered" ]; then
     story_ddl
     story_blocks
     story_ext_requires
+    story_ext_directory_guc
     story_concurrency
     story_concurrent_writers
     story_txn
