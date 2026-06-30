@@ -86,7 +86,7 @@ jobs:
         id: ver
         run: |
           set -euo pipefail
-          V=$(git describe --tags --exact-match 2>/dev/null || git rev-parse --short=12 HEAD)
+          V=$(git describe --tags --exact-match 2>/dev/null || git rev-parse --short=8 HEAD)
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "Version suffix: $V"
 
