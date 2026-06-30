@@ -21,17 +21,17 @@ on:
   workflow_dispatch:
     inputs:
       arch:
-        description: 'Target arch'
+        description: 'Target arch(es)'
         type: choice
-        default: amd64
-        options: [amd64, arm64]
+        default: both
+        options: [both, amd64, arm64]
       pg:
         description: 'PG major (single), or "all" for 16/17/18'
         type: choice
         default: all
         options: [all, '18', '17', '16']
       push:
-        description: 'Push to GHCR (off for smoke tests)'
+        description: 'Push to GHCR (off = smoke; on = per-arch + multi-arch + floating)'
         type: boolean
         default: false
 
@@ -39,82 +39,108 @@ permissions:
   contents: read
   packages: write   # GITHUB_TOKEN pushes to ghcr.io/pgedge
 
+env:
+  REPO: ghcr.io/pgedge/coldfront-duckdb-base
+
 jobs:
-  # Resolve the dispatch inputs into a runner label and a PG-major matrix so the
-  # build job stays a plain matrix. amd64→ubuntu-latest, arm64→ubuntu-24.04-arm
-  # (native arm64, free for public repos — no QEMU). pg=all→[18,17,16].
+  # Resolve inputs into a PG-major matrix, an arch matrix, and the version suffix
+  # (exact tag if HEAD is tagged, else the 8-char commit), shared by every build
+  # cell and the manifest stitch so all tags agree.
   setup:
     runs-on: ubuntu-latest
     outputs:
-      runner: ${{ steps.r.outputs.runner }}
-      platform: ${{ steps.r.outputs.platform }}
       pgs: ${{ steps.r.outputs.pgs }}
-    steps:
-      - id: r
-        run: |
-          set -euo pipefail
-          case "${{ inputs.arch }}" in
-            amd64) echo "runner=ubuntu-latest"   >> "$GITHUB_OUTPUT"
-                   echo "platform=linux/amd64"   >> "$GITHUB_OUTPUT" ;;
-            arm64) echo "runner=ubuntu-24.04-arm" >> "$GITHUB_OUTPUT"
-                   echo "platform=linux/arm64"   >> "$GITHUB_OUTPUT" ;;
-          esac
-          if [ "${{ inputs.pg }}" = "all" ]; then
-            echo 'pgs=["18","17","16"]' >> "$GITHUB_OUTPUT"
-          else
-            echo 'pgs=["${{ inputs.pg }}"]' >> "$GITHUB_OUTPUT"
-          fi
-
-  base:
-    needs: setup
-    name: base pg${{ matrix.pg }} (${{ inputs.arch }})
-    runs-on: ${{ needs.setup.outputs.runner }}
-    timeout-minutes: 300
-    env:
-      REPO: ghcr.io/pgedge/coldfront-duckdb-base
-    strategy:
-      fail-fast: false
-      matrix:
-        pg: ${{ fromJSON(needs.setup.outputs.pgs) }}
+      arches: ${{ steps.r.outputs.arches }}
+      version: ${{ steps.v.outputs.version }}
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
         with:
           fetch-depth: 0   # full history + tags so git describe sees release tags
-
       - name: Compute version suffix
-        id: ver
+        id: v
         run: |
           set -euo pipefail
           V=$(git describe --tags --exact-match 2>/dev/null || git rev-parse --short=8 HEAD)
           echo "version=$V" >> "$GITHUB_OUTPUT"
           echo "Version suffix: $V"
-
-      - name: Set up Buildx
-        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
-
-      - name: Log in to GHCR
-        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
-
-      - name: Build base image (${{ needs.setup.outputs.platform }})
+      - id: r
         run: |
           set -euo pipefail
-          VTAG=pg${{ matrix.pg }}-${{ inputs.arch }}-${{ steps.ver.outputs.version }}
+          if [ "${{ inputs.pg }}" = "all" ]; then
+            echo 'pgs=["18","17","16"]' >> "$GITHUB_OUTPUT"
+          else
+            echo 'pgs=["${{ inputs.pg }}"]' >> "$GITHUB_OUTPUT"
+          fi
+          case "${{ inputs.arch }}" in
+            both) echo 'arches=["amd64","arm64"]' >> "$GITHUB_OUTPUT" ;;
+            *)    echo 'arches=["${{ inputs.arch }}"]' >> "$GITHUB_OUTPUT" ;;
+          esac
+
+  # Build each (major, arch) natively: amd64 on ubuntu-latest, arm64 on the
+  # native ubuntu-24.04-arm runner (no QEMU). Pushes ONLY the immutable,
+  # version-suffixed per-arch tag, and only when push=true.
+  build:
+    needs: setup
+    name: base pg${{ matrix.pg }} (${{ matrix.arch }})
+    runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+    timeout-minutes: 300
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ${{ fromJSON(needs.setup.outputs.pgs) }}
+        arch: ${{ fromJSON(needs.setup.outputs.arches) }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Build base image (linux/${{ matrix.arch }})
+        run: |
+          set -euo pipefail
+          VTAG=pg${{ matrix.pg }}-${{ matrix.arch }}-${{ needs.setup.outputs.version }}
           docker buildx build \
-            --platform ${{ needs.setup.outputs.platform }} \
-            --build-arg TARGETARCH=${{ inputs.arch }} \
+            --platform linux/${{ matrix.arch }} \
+            --build-arg TARGETARCH=${{ matrix.arch }} \
             --build-arg PG_MAJOR=${{ matrix.pg }} \
             -f docker/Dockerfile.duckdb15-base \
             -t "$REPO:$VTAG" \
             --load .
           echo "Built $REPO:$VTAG"
-
-      # Push ONLY the immutable, version-suffixed tag. The floating pg<maj>-<arch>
-      # tag is deliberately never pushed from CI.
-      - name: Push base image
+      - name: Push per-arch image
         if: ${{ inputs.push }}
         run: |
           set -euo pipefail
-          VTAG=pg${{ matrix.pg }}-${{ inputs.arch }}-${{ steps.ver.outputs.version }}
+          VTAG=pg${{ matrix.pg }}-${{ matrix.arch }}-${{ needs.setup.outputs.version }}
           docker push "$REPO:$VTAG"
           echo "Pushed $REPO:$VTAG"
+
+  # Stitch the per-arch images into multi-arch manifest lists and publish the
+  # floating tags. Runs ONLY when both arches were built AND push=true, so a
+  # default run (push off) or a single-arch run never publishes a floating tag.
+  manifest:
+    needs: [setup, build]
+    if: ${{ inputs.push && inputs.arch == 'both' }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        pg: ${{ fromJSON(needs.setup.outputs.pgs) }}
+    steps:
+      - name: Set up Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
+      - name: Log in to GHCR
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: Publish multi-arch + floating tags for pg${{ matrix.pg }}
+        run: |
+          set -euo pipefail
+          V=${{ needs.setup.outputs.version }}
+          AMD=$REPO:pg${{ matrix.pg }}-amd64-$V
+          ARM=$REPO:pg${{ matrix.pg }}-arm64-$V
+          docker buildx imagetools create -t $REPO:pg${{ matrix.pg }}    "$AMD" "$ARM"
+          docker buildx imagetools create -t $REPO:pg${{ matrix.pg }}-$V "$AMD" "$ARM"
+          docker buildx imagetools create -t $REPO:pg${{ matrix.pg }}-amd64 "$AMD"
+          docker buildx imagetools create -t $REPO:pg${{ matrix.pg }}-arm64 "$ARM"
+          echo "Published pg${{ matrix.pg }} (multi-arch + floating)"
