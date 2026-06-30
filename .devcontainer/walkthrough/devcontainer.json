@@ -1,0 +1,12 @@
+{
+  "name": "ColdFront Walkthrough",
+  "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+  "features": {
+    "ghcr.io/devcontainers/features/docker-in-docker:2": {}
+  },
+  "postCreateCommand": "bash .devcontainer/walkthrough/post-create.sh",
+  "postAttachCommand": "bash examples/walkthrough/guide.sh",
+  "customizations": {
+    "vscode": { "extensions": ["stateful.runme"] }
+  }
+}
