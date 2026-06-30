@@ -97,17 +97,29 @@ run_sql_shown() {
     [ -n "$why" ] && explain "  ${DIM}$why${RESET}"
 }
 
-phase_b_setup() {
-    header "ColdFront setup"
-    explain "These are the ColdFront-specific steps — the 'how to set it up' part."
-    echo ""
+# coldfront_installed — true once both extensions exist in this database.
+coldfront_installed() {
+    [ "$(pg "SELECT count(*) FROM pg_extension WHERE extname IN ('pg_duckdb','coldfront');")" = "2" ]
+}
 
-    run_sql_shown "CREATE EXTENSION IF NOT EXISTS pg_duckdb; CREATE EXTENSION IF NOT EXISTS coldfront;" \
-        "pg_duckdb gives Postgres an in-process engine to read Iceberg; coldfront is the routing/rewrite layer."
-
-    run_sql_shown "SELECT coldfront.set_storage_secret('admin','adminsecret','seaweedfs:8333');" \
-        "Throwaway creds for the LOCAL SeaweedFS emulator. In production you pass your real bucket's keys + endpoint here — nothing in your application SQL changes."
-    echo ""
+# ensure_coldfront_setup [shown] — idempotently install ColdFront onto the running
+# database: the two extensions + the cold-store secret. Pass "shown" to narrate each
+# command (the tiered demo does this as Steps 4-5); omit to run silently (the other
+# demos just need ColdFront present). Safe to call repeatedly.
+ensure_coldfront_setup() {
+    local mode="${1:-silent}"
+    if [ "$mode" = shown ]; then
+        run_sql_shown "CREATE EXTENSION IF NOT EXISTS pg_duckdb; CREATE EXTENSION IF NOT EXISTS coldfront;" \
+            "pg_duckdb adds an in-process engine that reads Parquet in object storage; coldfront routes queries to the right tier and rewrites writes. No migration — installed onto the running database."
+        run_sql_shown "SELECT coldfront.set_storage_secret('admin','adminsecret','seaweedfs:8333');" \
+            "Tells ColdFront where cold data goes. Throwaway local creds; in production you pass your real bucket's key/secret/endpoint here — application SQL is unchanged."
+    else
+        pg "CREATE EXTENSION IF NOT EXISTS pg_duckdb; CREATE EXTENSION IF NOT EXISTS coldfront;" >/dev/null 2>&1
+        # set the secret only if not already present (idempotent)
+        if [ "$(pg "SELECT count(*) FROM coldfront.storage_secret;" 2>/dev/null)" != "1" ]; then
+            pg "SELECT coldfront.set_storage_secret('admin','adminsecret','seaweedfs:8333');" >/dev/null 2>&1
+        fi
+    fi
 }
 
 phase_a_bringup() {
@@ -237,6 +249,7 @@ EOSQL
 }
 
 demo_tiered() {
+    ensure_coldfront_setup        # silent — ColdFront may not be installed yet if this demo ran first
     header "Tiered storage — the bytes move, the table does not"
 
     # Idempotent teardown: events may be a table OR a view from a prior run.
@@ -336,6 +349,7 @@ EOSQL
     fi
 }
 demo_decoupled() {
+    ensure_coldfront_setup        # silent — ColdFront may not be installed yet if this demo ran first
     header "Decoupled — Postgres as a front-end to the lake"
     explain "A different on-ramp: if data belongs in the lake from day one, skip"
     explain "tiering entirely. One call provisions an Iceberg table fronted by a"
@@ -388,6 +402,7 @@ EOSQL
     fi
 }
 demo_partitioner() {
+    ensure_coldfront_setup        # silent — ColdFront may not be installed yet if this demo ran first
     header "Standalone partitioner — automated partitioning, no cold tier"
     explain "Only want automated PostgreSQL partition maintenance? The partitioner"
     explain "binary alone is the whole product — no Iceberg, no DuckDB, no cold tier."
@@ -495,7 +510,6 @@ if [ "${NONINTERACTIVE:-0}" != 1 ] && [ -n "$($COMPOSE ps --status running -q 2>
 fi
 
 phase_a_bringup
-phase_b_setup
 if [ "$NONINTERACTIVE" = 1 ]; then
     case "${WALKTHROUGH_DEMO:-tiered}" in
         tiered) demo_tiered;; decoupled) demo_decoupled;; partitioner) demo_partitioner;;
