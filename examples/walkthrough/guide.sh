@@ -26,6 +26,17 @@ trap cleanup EXIT
 pg()       { PGPASSWORD=coldfront psql -h localhost -p "$PG_PORT" -U coldfront -d coldfront -tAX -c "$1"; }
 psql_file(){ PGPASSWORD=coldfront psql -h localhost -p "$PG_PORT" -U coldfront -d coldfront -v ON_ERROR_STOP=1; }
 
+# heap_size <relname> — pretty total heap of a relation INCLUDING its partitions.
+# pg_total_relation_size() on a partitioned parent counts only the (empty) parent,
+# so for `events`/`_events` (range-partitioned) it reports 0; sum the partition
+# tree instead. Works for plain tables too (the tree subquery is then empty).
+heap_size() {
+    pg "SELECT pg_size_pretty(
+            pg_total_relation_size('$1') +
+            COALESCE((SELECT sum(pg_total_relation_size(relid))
+                      FROM pg_partition_tree('$1') WHERE relid <> '$1'::regclass), 0));"
+}
+
 # show_query — run a SELECT and print it as an aligned psql table, framed, for the
 # viewer to read. Use this for anything shown on screen. (pg() stays -tAX, only for
 # values captured into shell variables.)
@@ -111,8 +122,13 @@ ensure_coldfront_setup() {
     if [ "$mode" = shown ]; then
         run_sql_shown "CREATE EXTENSION IF NOT EXISTS pg_duckdb; CREATE EXTENSION IF NOT EXISTS coldfront;" \
             "pg_duckdb adds an in-process engine that reads Parquet in object storage; coldfront routes queries to the right tier and rewrites writes. No migration — installed onto the running database."
-        run_sql_shown "SELECT coldfront.set_storage_secret('admin','adminsecret','seaweedfs:8333');" \
-            "Tells ColdFront where cold data goes. Throwaway local creds; in production you pass your real bucket's key/secret/endpoint here — application SQL is unchanged."
+        # set the secret only if not already present (idempotent — mirrors silent branch)
+        if [ "$(pg "SELECT count(*) FROM coldfront.storage_secret;" 2>/dev/null)" != "1" ]; then
+            run_sql_shown "SELECT coldfront.set_storage_secret('admin','adminsecret','seaweedfs:8333');" \
+                "Tells ColdFront where cold data goes. Throwaway local creds; in production you pass your real bucket's key/secret/endpoint here — application SQL is unchanged."
+        else
+            explain "  ${DIM}Cold-store secret already set — skipping (idempotent).${RESET}"
+        fi
     else
         pg "CREATE EXTENSION IF NOT EXISTS pg_duckdb; CREATE EXTENSION IF NOT EXISTS coldfront;" >/dev/null 2>&1
         # set the secret only if not already present (idempotent)
@@ -249,8 +265,7 @@ EOSQL
 }
 
 demo_tiered() {
-    ensure_coldfront_setup        # silent — ColdFront may not be installed yet if this demo ran first
-    header "Tiered storage — the bytes move, the table does not"
+    header "Tiered storage — start with a Postgres DB you already have"
 
     # Idempotent teardown: events may be a table OR a view from a prior run.
     pg "DROP TABLE IF EXISTS events CASCADE; DROP VIEW IF EXISTS events CASCADE;
@@ -258,8 +273,9 @@ demo_tiered() {
         DELETE FROM coldfront.tiered_views WHERE relname='events';
         DELETE FROM coldfront.archive_watermark WHERE table_name='events';" >/dev/null 2>&1 || true
 
-    # Shown: create the partitioned table + now()-relative monthly partitions.
-    explain "First, a normal partitioned PostgreSQL table:"
+    # ── Part 1: you already have this — a data-laden plain Postgres table ──────────
+    explain "Step 1 — Your existing database: an ordinary partitioned Postgres table"
+    explain "  ${DIM}This stands in for the live DB you already run — no ColdFront yet.${RESET}"
     if [ "$NONINTERACTIVE" != 1 ]; then prompt_continue; fi
     # generate_events seeds rows across now-150d .. now (~5 months). RANGE
     # partitioning REJECTS any insert with no covering partition, so we create
@@ -286,14 +302,11 @@ BEGIN
   END LOOP;
 END $do$;
 EOSQL
-    explain "  ${DIM}Monthly partitions covering the full data window: the older months go cold, the current one stays hot.${RESET}"
-    echo ""
-
-    explain "The archiver config (config/archiver.yaml) tiers anything older than 30 days:"
-    if [ "$NONINTERACTIVE" != 1 ]; then show_cmd "cat config/archiver.yaml"; sed 's/^/    /' "$SCRIPT_DIR/config/archiver.yaml"; prompt_continue; fi
+    explain "  ${DIM}Monthly partitions covering the full data window — nothing ColdFront-specific yet.${RESET}"
 
     choose_volume
     disk_preflight "$GEN_ROWS" || { warn "Skipping tiered demo."; return; }
+    explain "Loading ~6 months of history into the table (your accumulated data):"
     generate_events "$GEN_ROWS"
 
     # Correctness gate: every generated row must have landed (no partition gaps).
@@ -302,45 +315,111 @@ EOSQL
         error "Row-count mismatch: generated ${GEN_ROWS} but events has ${before} — a partition gap dropped rows."
         return
     fi
-    local hot_before; hot_before=$(pg "SELECT pg_size_pretty(sum(pg_total_relation_size(c.oid))) FROM pg_inherits i JOIN pg_class c ON c.oid=i.inhrelid WHERE i.inhparent='events'::regclass;")
-    info "Before tiering: ${before} rows, hot heap ${hot_before}"
 
-    explain "Now run the archiver — it moves the cold partitions to Iceberg/S3:"
+    # Step "see the problem": how much hot storage, and it's ALL hot. Shown from
+    # captured values (count alone via pg(); size summed over partitions via
+    # heap_size): pg_duckdb's preloaded planner hook mishandles a count+size SELECT
+    # over a partitioned parent, so we render the numbers rather than re-run it.
+    local hot_before; hot_before=$(heap_size events)
+    explain "See the problem — how much Postgres (hot) storage this takes, and it only grows:"
+    echo -e "${DIM}─── result ─────────────────────────────────────────────────${RESET}"
+    printf "  %12s   %s\n" "Rows" "Postgres heap"
+    printf "  %12s   %s\n" "----" "-------------"
+    printf "  %12s   %s\n" "$before" "$hot_before"
+    echo -e "${DIM}────────────────────────────────────────────────────────────${RESET}"
+    info "All ${before} rows are on hot, expensive storage (${hot_before}); nothing in object storage yet."
+    if [ "$NONINTERACTIVE" != 1 ]; then prompt_continue; fi
+
+    # ── Part 2: add ColdFront to the existing database (shown, AFTER the data load) ─
+    header "Add ColdFront to that database"
+    ensure_coldfront_setup shown
+    if [ "$NONINTERACTIVE" != 1 ]; then prompt_continue; fi
+
+    # ── Part 3: tier it, and prove it ──────────────────────────────────────────────
+    header "Tier it — relocate the cold data, prove it moved"
+    explain "The archiver policy tiers anything older than 30 days to object storage:"
+    if [ "$NONINTERACTIVE" != 1 ]; then show_cmd "cat config/archiver.yaml"; sed 's/^/    /' "$SCRIPT_DIR/config/archiver.yaml"; prompt_continue; fi
+
+    explain "Run the archiver — it moves old partitions PG → Parquet in S3 and rebuilds events as a unified view:"
     start_spinner "Archiving cold partitions to object storage"
     $COMPOSE run --rm archiver --config /config/archiver.yaml >/tmp/wt-archiver.log 2>&1
     local rc=$?
     stop_spinner
     [ "$rc" = 0 ] || { error "archiver failed"; tail -10 /tmp/wt-archiver.log; return; }
 
-    local after; after=$(pg "SELECT count(*) FROM events;")
+    # Proof (a): it's really Parquet in S3. iceberg_metadata() lists the data files
+    # of a table, but pg_duckdb's table-function form resolves its argument as a
+    # filesystem path — a REST-catalog-managed table can't be addressed by name
+    # there. So we ask the catalog for the table's metadata.json location (warehouse
+    # UUID → loadTable), then point iceberg_metadata at that explicit S3 path. Run as
+    # a native pg_duckdb table function (NOT duckdb.raw_query, which returns void for
+    # SELECTs) so the rows reach the viewer. All values derived at runtime.
+    explain "Proof it really moved — the cold rows are now Parquet files in object storage:"
+    local wh_id meta_loc
+    wh_id=$(curl -s "${LK_URL}/management/v1/warehouse" \
+        | grep -o '"warehouse-id":"[^"]*"' | head -1 | cut -d'"' -f4)
+    meta_loc=$(curl -s "${LK_URL}/catalog/v1/${wh_id}/namespaces/default/tables/events" \
+        -H 'accept: application/json' \
+        | grep -o '"metadata-location":"[^"]*"' | head -1 | cut -d'"' -f4)
+    if [ -n "$meta_loc" ]; then
+        show_query "SELECT file_path FROM iceberg_metadata('${meta_loc}')
+                     WHERE file_path LIKE '%.parquet' LIMIT 3;"
+        info "Real .parquet objects in the bucket — the cold rows aren't in Postgres anymore."
+    else
+        warn "Could not resolve the Iceberg metadata location from the catalog; skipping the Parquet listing."
+    fi
+
+    # Proof (b): events is now a view.
     local relkind; relkind=$(pg "SELECT relkind FROM pg_class WHERE relname='events' AND relnamespace='public'::regnamespace;")
-    local hot_after; hot_after=$(pg "SELECT pg_size_pretty(pg_total_relation_size('_events'));")
-    info "After tiering: ${after} rows (unchanged), hot heap now ${hot_after}"
-    [ "$relkind" = "v" ] && info "events is now a unified view over hot + cold."
+    [ "$relkind" = "v" ] && info "events is now a unified VIEW over hot + cold; _events holds only the hot remainder."
 
-    explain "The same table still returns everything — hot and cold, one query:"
-    pg "SELECT count(*) AS total FROM events;"
-    pg "SELECT count(*) AS cold_rows FROM events WHERE ts < date_trunc('month',now());"
+    # Step 8 — the hot/cold accounting (the payoff vs the 'see the problem' baseline).
+    header "Where the data lives now — hot vs cold"
+    local hot_rows total cold_rows hot_after
+    hot_rows=$(pg "SELECT count(*) FROM _events;")
+    total=$(pg "SELECT count(*) FROM events;")
+    cold_rows=$((total - hot_rows))
+    hot_after=$(heap_size _events)
+    printf "  %-22s %12s   %s\n" "Tier" "Rows" "Postgres heap"
+    printf "  %-22s %12s   %s\n" "----" "----" "-------------"
+    printf "  %-22s %12s   %s\n" "Hot  (Postgres)"      "$hot_rows"  "$hot_after"
+    printf "  %-22s %12s   %s\n" "Cold (Parquet in S3)" "$cold_rows" "0 bytes in PG"
+    printf "  %-22s %12s\n"      "Total"                "$total"
+    info "Before: ${before} rows, ${hot_before}, all hot. Now: ${hot_rows} rows (${hot_after}) hot; ${cold_rows} in object storage — same total, a fraction of the hot footprint."
+    if [ "$NONINTERACTIVE" != 1 ]; then prompt_continue; fi
 
-    explain "And cold data is WRITEABLE — update an archived row through the same table:"
-    # Pick a cold row's id first, then UPDATE by that id. The id must come from a
-    # SEPARATE query: a sub-select over the same tiered view inside the UPDATE is
-    # rejected (a tiered view can only be referenced once per DML — the rewrite
-    # retargets the leading reference).
+    # Step 9 — query across tiers.
+    explain "One query spans both tiers — the app can't tell hot from cold:"
+    show_query "SELECT id, ts, status FROM events
+                 WHERE ts < date_trunc('month', now()) - interval '3 months'
+                 ORDER BY ts LIMIT 3;"
+    info "Those rows came from Parquet in S3 through the same events table."
+
+    # Step 10 — write to cold data (the differentiator).
+    header "Write to cold data — no rehydration, no separate tool"
+    # Capture cold_id in a SEPARATE query: a sub-select over the same tiered view
+    # inside the UPDATE is rejected (the rewrite retargets the leading reference).
     local cold_id; cold_id=$(pg "SELECT id FROM events WHERE ts < date_trunc('month',now()) - interval '2 months' ORDER BY ts LIMIT 1;")
-    pg "UPDATE events SET status='corrected' WHERE id=${cold_id};"
-    pg "SELECT count(*) AS corrected FROM events WHERE status='corrected';"
-    info "An archived row was updated through the same SQL — no app change."
+    explain "Here is an archived row, living in object storage:"
+    show_query "SELECT id, ts, status FROM events WHERE id=${cold_id};"
+    explain "Update it through the same table — one line of plain SQL, straight to the cold tier:"
+    pg "UPDATE events SET status='corrected' WHERE id=${cold_id};" >/dev/null
+    show_query "SELECT id, ts, status FROM events WHERE id=${cold_id};"
+    info "No rehydration, no restore job, no second tool — that row is still in S3, now corrected."
 
-    explain "Cold data is also DELETABLE through the same table:"
-    pg "DELETE FROM events WHERE id=${cold_id};"
-    pg "SELECT count(*) AS total_after_delete FROM events;"
-    info "An archived row was deleted through the same SQL."
-    echo ""
+    # Step 11 — prove it stuck (fresh connection).
+    header "Prove it stuck — it's real, not a session trick"
+    explain "Reconnect (fresh session) and re-check the row, the total, and the hot heap:"
+    show_query "SELECT id, status FROM events WHERE id=${cold_id};"
+    show_query "SELECT count(*) AS total_rows FROM events;"
+    local hot_final; hot_final=$(heap_size _events)
+    info "Archived row still 'corrected', all ${total} rows present, hot heap still ${hot_final} — the data never came back to Postgres. That is ColdFront: cheaper storage that's still writeable."
 
-    # Exit cleanup is interactive-only: CI runs non-interactively and asserts on
-    # the post-run state (events is a view, watermark row present), so we MUST
-    # leave events/_events/watermark intact when NONINTERACTIVE=1.
+    # No DELETE here — keeps the final count clean. (A DELETE works identically;
+    # the script notes it only as an aside.) Exit cleanup is interactive-only: CI
+    # runs non-interactively and asserts on the post-run state (events is a view,
+    # watermark row present), so we MUST leave events/_events/watermark intact when
+    # NONINTERACTIVE=1.
     if [ "$NONINTERACTIVE" != 1 ]; then
         read -rp "Drop this demo's data to reclaim disk before returning to the menu? [Y/n]: " a </dev/tty
         [[ "$a" =~ ^[Nn]$ ]] || pg "DROP TABLE IF EXISTS _events CASCADE; DROP VIEW IF EXISTS events CASCADE;
