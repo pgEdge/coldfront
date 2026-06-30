@@ -13,6 +13,8 @@ S3_PORT="${COLDFRONT_S3_PORT:-8333}"
 LK_URL="http://localhost:${LK_PORT}"
 # shellcheck disable=SC2034  # consumed by Phase B+ tasks
 NONINTERACTIVE="${WALKTHROUGH_NONINTERACTIVE:-0}"
+# shellcheck disable=SC2034  # set by choose_volume, consumed by Task-9 demos
+GEN_ROWS=1000000
 
 export PGPASSWORD=coldfront
 
@@ -96,6 +98,69 @@ phase_a_bringup() {
         -H 'Content-Type: application/json' -d '{"namespace":["default"]}' >/dev/null 2>&1 || true
     stop_spinner; info "[4/4] Warehouse 'wh' + namespace 'default' ready"
     echo ""
+}
+
+# choose_volume — sets GEN_ROWS. The only feature-relevant prompt in the guide.
+choose_volume() {
+  if [ "$NONINTERACTIVE" = 1 ]; then GEN_ROWS="${WALKTHROUGH_ROWS:-1000000}"; return; fi
+  header "How much data should we generate?"
+  explain "  The more you generate, the more storage visibly relocates to object"
+  explain "  storage when we tier. Peak is the hot-heap size BEFORE tiering."
+  echo ""
+  explain "  1) Quick     ~1M rows   (~150 MB, seconds)         [default]"
+  explain "  2) Standard  ~10M rows  (~1.5 GB, ~1 min)"
+  explain "  3) Big       ~50M rows  (~7 GB, a few min)"
+  explain "  4) Custom    enter a row count"
+  echo ""
+  read -rp "Choose [1/2/3/4]: " v </dev/tty
+  # shellcheck disable=SC2034  # GEN_ROWS consumed by Task-9 demo functions
+  case "$v" in
+    2) GEN_ROWS=10000000;;
+    3) GEN_ROWS=50000000;;
+    4) read -rp "Rows: " GEN_ROWS </dev/tty;;
+    *) GEN_ROWS=1000000;;
+  esac
+}
+
+# disk_preflight — rough guard: ~150 bytes/row peak (heap+WAL+temp). Compares to
+# Docker's available space. Aborts a tier that clearly won't fit.
+disk_preflight() {
+  local rows="$1"
+  local need_mb=$(( rows * 150 / 1024 / 1024 ))
+  # Available space on Docker's data root, probed from inside a throwaway container.
+  local avail_mb
+  avail_mb=$(docker run --rm alpine:3.20 sh -c "df -m / | awk 'NR==2{print \$4}'" 2>/dev/null || echo 0)
+  explain "  Estimated peak: ~${need_mb} MB; Docker has ~${avail_mb} MB free."
+  if [ "$avail_mb" -gt 0 ] && [ "$need_mb" -gt "$avail_mb" ]; then
+    warn "This volume may not fit in Docker's disk allocation."
+    if [[ "$(uname -s)" == "Darwin" ]]; then
+      warn "On macOS, raise Docker Desktop > Settings > Resources > Virtual disk limit,"
+      warn "or pick a smaller volume / run 'R) Reset' first."
+    fi
+    if [ "$NONINTERACTIVE" = 1 ]; then return 0; fi
+    read -rp "Continue anyway? [y/N]: " a </dev/tty
+    [[ "$a" =~ ^[Yy]$ ]] || return 1
+  fi
+  return 0
+}
+
+# generate_events — seed `events` across 4 historical months + the current one,
+# all derived from now() (never invented literals). Explicit id keeps inserts
+# on the fast set-based path. Spread <rows> over ~5 months by 'spacing'.
+generate_events() {
+  local rows="$1"
+  start_spinner "Generating ${rows} rows"
+  psql_file >/dev/null 2>&1 <<EOSQL
+SET search_path = public;
+-- Spread evenly across now-4mo .. now, two-minute spacing scaled to row count.
+INSERT INTO events (id, ts, status, data)
+SELECT i,
+       now() - ((${rows} - i) * (interval '150 days' / ${rows})),
+       (ARRAY['ok','warn','error'])[1 + i % 3],
+       '{}'::jsonb
+FROM generate_series(1, ${rows}) i;
+EOSQL
+  stop_spinner; info "Generated ${rows} rows."
 }
 
 demo_tiered()      { info "[tiered demo placeholder]"; }
