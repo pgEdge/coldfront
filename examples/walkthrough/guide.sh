@@ -14,11 +14,37 @@ LK_URL="http://localhost:${LK_PORT}"
 # shellcheck disable=SC2034  # consumed by Phase B+ tasks
 NONINTERACTIVE="${WALKTHROUGH_NONINTERACTIVE:-0}"
 
+export PGPASSWORD=coldfront
+
 cleanup() { stop_spinner; }
 trap cleanup EXIT
 
 pg()       { PGPASSWORD=coldfront psql -h localhost -p "$PG_PORT" -U coldfront -d coldfront -tAX -c "$1"; }
 psql_file(){ PGPASSWORD=coldfront psql -h localhost -p "$PG_PORT" -U coldfront -d coldfront -v ON_ERROR_STOP=1; }
+
+# run_sql_shown — interactively show+run a SQL command; non-interactively just run it.
+run_sql_shown() {
+    local sql="$1" why="$2"
+    if [ "$NONINTERACTIVE" = 1 ]; then
+        pg "$sql" >/dev/null || { error "step failed: $sql"; exit 1; }
+    else
+        prompt_run "psql -h localhost -p $PG_PORT -U coldfront -d coldfront -c \"$sql\""
+    fi
+    [ -n "$why" ] && explain "  ${DIM}$why${RESET}"
+}
+
+phase_b_setup() {
+    header "ColdFront setup"
+    explain "These are the ColdFront-specific steps — the 'how to set it up' part."
+    echo ""
+
+    run_sql_shown "CREATE EXTENSION IF NOT EXISTS pg_duckdb; CREATE EXTENSION IF NOT EXISTS coldfront;" \
+        "pg_duckdb gives Postgres an in-process engine to read Iceberg; coldfront is the routing/rewrite layer."
+
+    run_sql_shown "SELECT coldfront.set_storage_secret('admin','adminsecret','seaweedfs:8333');" \
+        "Throwaway creds for the LOCAL SeaweedFS emulator. In production you pass your real bucket's keys + endpoint here — nothing in your application SQL changes."
+    echo ""
+}
 
 phase_a_bringup() {
     header "Getting the environment ready"
@@ -72,4 +98,4 @@ phase_a_bringup() {
     echo ""
 }
 
-bash "$SCRIPT_DIR/setup.sh" && phase_a_bringup
+bash "$SCRIPT_DIR/setup.sh" && phase_a_bringup && phase_b_setup
