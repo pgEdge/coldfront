@@ -98,4 +98,56 @@ phase_a_bringup() {
     echo ""
 }
 
-bash "$SCRIPT_DIR/setup.sh" && phase_a_bringup && phase_b_setup
+demo_tiered()      { info "[tiered demo placeholder]"; }
+demo_decoupled()   { info "[decoupled demo placeholder]"; }
+demo_partitioner() { info "[partitioner demo placeholder]"; }
+
+reset_demos() {
+    pg "DROP TABLE IF EXISTS events CASCADE; DROP TABLE IF EXISTS _events CASCADE;
+        DROP VIEW  IF EXISTS events_lake CASCADE;
+        DROP TABLE IF EXISTS part_demo CASCADE;
+        DELETE FROM coldfront.tiered_views WHERE relname IN ('events','events_lake');
+        DELETE FROM coldfront.archive_watermark WHERE table_name='events';" >/dev/null 2>&1 || true
+    info "Demo tables dropped."
+}
+
+quit_walkthrough() {
+    echo ""
+    if [ "$NONINTERACTIVE" = 1 ]; then exit 0; fi
+    read -rp "Remove the whole stack now (docker compose down -v)? [y/N]: " a </dev/tty
+    [[ "$a" =~ ^[Yy]$ ]] && $COMPOSE down -v
+    exit 0
+}
+
+main_menu() {
+    while true; do
+        header "ColdFront — what would you like to see?"
+        explain "  1) Tiered storage   — relocate cold data to object storage, same table, still writeable"
+        explain "  2) Decoupled        — Postgres as a front-end to the lake (data in Iceberg from day one)"
+        explain "  3) Partitioner      — automated PG range-partitioning, no cold tier"
+        explain "  R) Reset            — drop demo tables / reclaim disk"
+        explain "  Q) Quit             — (offers docker compose down -v)"
+        echo ""
+        read -rp "Choose [1/2/3/R/Q]: " c </dev/tty
+        case "$c" in
+            1) demo_tiered;;
+            2) demo_decoupled;;
+            3) demo_partitioner;;
+            [Rr]) reset_demos;;
+            [Qq]) quit_walkthrough;;
+            *) warn "Pick 1, 2, 3, R, or Q.";;
+        esac
+    done
+}
+
+# main
+bash "$SCRIPT_DIR/setup.sh"
+phase_a_bringup
+phase_b_setup
+if [ "$NONINTERACTIVE" = 1 ]; then
+    case "${WALKTHROUGH_DEMO:-tiered}" in
+        tiered) demo_tiered;; decoupled) demo_decoupled;; partitioner) demo_partitioner;;
+    esac
+    exit 0
+fi
+main_menu
