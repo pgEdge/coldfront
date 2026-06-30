@@ -63,5 +63,20 @@ fi
 info "Docker daemon is running."
 echo ""
 
+explain "Checking Docker Compose v2..."
+if docker compose version &>/dev/null; then
+  info "Docker Compose v2 is available ($(docker compose version --short 2>/dev/null || echo 'ok'))"
+else
+  echo ""
+  error "Docker Compose v2 is not available."
+  explain ""
+  explain "The walkthrough requires 'docker compose' (v2 plugin), not legacy 'docker-compose'."
+  explain "Install hints:"
+  explain "  Docker Desktop (macOS/Windows) — includes Compose v2 by default."
+  explain "  Linux — https://docs.docker.com/compose/install/"
+  echo ""
+  exit 1
+fi
+echo ""
 
 info "All prerequisites satisfied."

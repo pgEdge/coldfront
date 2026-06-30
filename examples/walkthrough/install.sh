@@ -22,8 +22,12 @@ echo "  ============================"
 echo ""
 echo "  Downloading walkthrough files..."
 
-# All eight walkthrough files tracked under examples/walkthrough/ plus the
-# Dockerfile needed by the db service build context (docker/Dockerfile.duckdb15).
+mkdir -p "${WORK_DIR}/examples/walkthrough/config"
+mkdir -p "${WORK_DIR}/docs"
+
+# All walkthrough files tracked under examples/walkthrough/, the
+# Dockerfile needed by the db service build context, and the published
+# tour document so curl-pipe users can open it in an editor.
 FILES=(
     examples/walkthrough/guide.sh
     examples/walkthrough/runner.sh
@@ -34,15 +38,24 @@ FILES=(
     examples/walkthrough/config/archiver.yaml
     examples/walkthrough/config/partitioner.yaml
     docker/Dockerfile.duckdb15
+    docs/walkthrough.md
 )
 
+FAILED=0
 for f in "${FILES[@]}"; do
     mkdir -p "${WORK_DIR}/$(dirname "$f")"
     if ! curl -fsSL "${RAW}/${f}" -o "${WORK_DIR}/${f}"; then
-        echo "  Error: failed to download ${f}" >&2
-        exit 1
+        echo "  Warning: failed to download ${f}" >&2
+        FAILED=$((FAILED + 1))
     fi
 done
+
+if [[ $FAILED -gt 0 ]]; then
+    echo ""
+    echo "  Error: ${FAILED} file(s) failed to download — check your network/branch." >&2
+    echo ""
+    exit 1
+fi
 
 # The db service (docker-compose.yml context: ../..) and archiver service both
 # build from source at $WORK_DIR. Fetch a tarball subset from GitHub — no git
@@ -69,7 +82,31 @@ chmod +x "${WORK_DIR}/examples/walkthrough/guide.sh" \
          "${WORK_DIR}/examples/walkthrough/setup.sh" \
          "${WORK_DIR}/examples/walkthrough/runner.sh"
 
-echo "  Starting the walkthrough..."
-echo ""
 cd "${WORK_DIR}"
-exec bash examples/walkthrough/guide.sh
+
+# --- Run setup (prerequisites only) ---
+
+bash examples/walkthrough/setup.sh
+
+# --- Choose how to continue ---
+
+echo ""
+echo "  Setup complete! How would you like to continue?"
+echo ""
+echo "    1) Interactive Guide — step-by-step in this terminal  [default]"
+echo "    2) Exit — I'll open the walkthrough in my editor"
+echo ""
+read -rp "  Choose [1/2]: " choice </dev/tty
+
+case "$choice" in
+    2)
+        echo ""
+        echo "  Open this file in your editor and run the commands in this terminal:"
+        echo "    $(pwd)/docs/walkthrough.md"
+        echo ""
+        ;;
+    *)
+        echo ""
+        exec bash examples/walkthrough/guide.sh
+        ;;
+esac
