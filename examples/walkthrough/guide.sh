@@ -6,6 +6,7 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 source "$SCRIPT_DIR/runner.sh"
 
 COMPOSE="docker compose -f $SCRIPT_DIR/docker-compose.yml"
+OS="$(uname -s)"
 PG_PORT="${COLDFRONT_PG_PORT:-5432}"
 LK_PORT="${COLDFRONT_LK_PORT:-8181}"
 LK_URL="http://localhost:${LK_PORT}"
@@ -21,6 +22,57 @@ trap cleanup EXIT
 
 pg()       { PGPASSWORD=coldfront psql -h localhost -p "$PG_PORT" -U coldfront -d coldfront -tAX -c "$1"; }
 psql_file(){ PGPASSWORD=coldfront psql -h localhost -p "$PG_PORT" -U coldfront -d coldfront -v ON_ERROR_STOP=1; }
+
+# ── Port detection ───────────────────────────────────────────────────────────
+
+port_in_use() {
+    if [[ "$OS" == "Darwin" ]]; then
+        lsof -iTCP:"$1" -sTCP:LISTEN >/dev/null 2>&1
+    else
+        ss -tln 2>/dev/null | grep -q ":${1} "
+    fi
+}
+
+pick_port() {
+    local p="$1"
+    while port_in_use "$p"; do
+        p=$(( p + 1 ))
+        if [[ "$p" -gt 65535 ]]; then
+            error "Could not find a free port scanning from $1."
+            exit 1
+        fi
+    done
+    echo "$p"
+}
+
+detect_ports() {
+    local pg_default="${COLDFRONT_PG_PORT:-5432}"
+    local lk_default="${COLDFRONT_LK_PORT:-8181}"
+    local s3_default="${COLDFRONT_S3_PORT:-8333}"
+
+    local pg_picked lk_picked s3_picked
+    pg_picked=$(pick_port "$pg_default")
+    lk_picked=$(pick_port "$lk_default")
+    s3_picked=$(pick_port "$s3_default")
+
+    if [[ "$pg_picked" != "$pg_default" ]]; then
+        warn "Postgres port ${pg_default} in use → using ${pg_picked}"
+    fi
+    if [[ "$lk_picked" != "$lk_default" ]]; then
+        warn "Lakekeeper port ${lk_default} in use → using ${lk_picked}"
+    fi
+    if [[ "$s3_picked" != "$s3_default" ]]; then
+        warn "SeaweedFS port ${s3_default} in use → using ${s3_picked}"
+    fi
+
+    export COLDFRONT_PG_PORT="$pg_picked"
+    export COLDFRONT_LK_PORT="$lk_picked"
+    export COLDFRONT_S3_PORT="$s3_picked"
+
+    PG_PORT="$pg_picked"
+    LK_PORT="$lk_picked"
+    LK_URL="http://localhost:${lk_picked}"
+}
 
 # run_sql_shown — interactively show+run a SQL command; non-interactively just run it.
 run_sql_shown() {
@@ -400,6 +452,7 @@ main_menu() {
 
 # main
 bash "$SCRIPT_DIR/setup.sh"
+detect_ports
 phase_a_bringup
 phase_b_setup
 if [ "$NONINTERACTIVE" = 1 ]; then
