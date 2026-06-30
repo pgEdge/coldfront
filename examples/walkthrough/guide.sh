@@ -325,7 +325,42 @@ EOSQL
         [[ "$a" =~ ^[Nn]$ ]] || pg "DROP VIEW IF EXISTS events_lake CASCADE; DELETE FROM coldfront.tiered_views WHERE relname='events_lake';" >/dev/null 2>&1
     fi
 }
-demo_partitioner() { info "[partitioner demo placeholder]"; }
+demo_partitioner() {
+    header "Standalone partitioner — automated partitioning, no cold tier"
+    explain "Only want automated PostgreSQL partition maintenance? The partitioner"
+    explain "binary alone is the whole product — no Iceberg, no DuckDB, no cold tier."
+    echo ""
+
+    pg "DROP TABLE IF EXISTS part_demo CASCADE;" >/dev/null 2>&1 || true
+    psql_file >/dev/null <<'EOSQL'
+SET search_path = public;
+CREATE TABLE part_demo (
+    id bigint GENERATED ALWAYS AS IDENTITY,
+    ts timestamptz NOT NULL,
+    note text,
+    PRIMARY KEY (id, ts)
+) PARTITION BY RANGE (ts);
+EOSQL
+
+    explain "Register it with the partitioner (monthly, 12-month retention):"
+    start_spinner "Registering + reconciling partitions"
+    $COMPOSE run --rm --entrypoint partitioner archiver \
+        register --config /config/partitioner.yaml --table part_demo \
+        --period monthly --retention "12 months" >/tmp/wt-part.log 2>&1
+    $COMPOSE run --rm --entrypoint partitioner archiver --config /config/partitioner.yaml >>/tmp/wt-part.log 2>&1
+    stop_spinner
+
+    explain "Partitions auto-created for the forward window:"
+    pg "SELECT count(*) AS partitions FROM pg_inherits WHERE inhparent='part_demo'::regclass;"
+    echo ""
+
+    # Exit cleanup is interactive-only: a NONINTERACTIVE / CI run asserts on the
+    # post-run partition count, so part_demo MUST be left intact in that mode.
+    if [ "$NONINTERACTIVE" != 1 ]; then
+        read -rp "Drop part_demo before returning to the menu? [Y/n]: " a </dev/tty
+        [[ "$a" =~ ^[Nn]$ ]] || pg "DROP TABLE IF EXISTS part_demo CASCADE;" >/dev/null 2>&1
+    fi
+}
 
 reset_demos() {
     pg "DROP TABLE IF EXISTS events CASCADE; DROP TABLE IF EXISTS _events CASCADE;

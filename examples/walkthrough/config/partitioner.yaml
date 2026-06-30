@@ -1,0 +1,15 @@
+# ColdFront walkthrough partitioner config — Demo 3 (standalone partitioner).
+#
+# PARTITION-ONLY: just postgres + archiver.tables. No iceberg/s3 — this demo is
+# the "you don't need the cold tier" story: automated PostgreSQL range-partition
+# maintenance against stock Postgres. Runs INSIDE the compose network
+# (docker compose run --rm --entrypoint partitioner archiver), so the host is the
+# compose SERVICE NAME (db), not localhost.
+postgres:
+    dsn: "host=db port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
+archiver:
+    tables:
+        - source_table: part_demo
+          partition_column: ts
+          partition_period: monthly
+          retention_period: 12 months

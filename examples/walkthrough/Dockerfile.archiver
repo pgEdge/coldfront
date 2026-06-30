@@ -1,13 +1,17 @@
-# Builds the ColdFront archiver (CGO-free static Go binary) for the walkthrough.
-# Build context is the repo root (see compose). Lean: only the archiver module.
+# Builds the ColdFront archiver + partitioner (CGO-free static Go binaries) for
+# the walkthrough. Build context is the repo root (see compose). Lean: only the
+# two thin SQL-orchestrator commands and the shared internal packages.
 FROM golang:1.26-alpine AS build
 WORKDIR /src
 COPY go.mod go.sum ./
 RUN go mod download
 COPY cmd/archiver ./cmd/archiver
+COPY cmd/partitioner ./cmd/partitioner
 COPY internal ./internal
 RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/archiver ./cmd/archiver
+RUN CGO_ENABLED=0 go build -ldflags="-s -w" -o /out/partitioner ./cmd/partitioner
 
 FROM alpine:3.20
 COPY --from=build /out/archiver /usr/local/bin/archiver
+COPY --from=build /out/partitioner /usr/local/bin/partitioner
 ENTRYPOINT ["/usr/local/bin/archiver"]
