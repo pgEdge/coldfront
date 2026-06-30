@@ -453,6 +453,35 @@ main_menu() {
 # main
 bash "$SCRIPT_DIR/setup.sh"
 detect_ports
+
+# ── Detect an existing stack ────────────────────────────────────────────────
+if [ "${NONINTERACTIVE:-0}" != 1 ] && [ -n "$($COMPOSE ps --status running -q 2>/dev/null)" ]; then
+    echo ""
+    warn "An existing ColdFront walkthrough stack is already running."
+    echo ""
+    explain "  1) Tear down and start fresh"
+    explain "  2) Keep it running and continue"
+    explain "  3) Cancel"
+    echo ""
+    read -rp "  Choose [1/2/3]: " _stack_choice </dev/tty
+    case "$_stack_choice" in
+        1)
+            info "Tearing down existing stack..."
+            $COMPOSE down -v
+            info "Done. Starting fresh..."
+            echo ""
+            ;;
+        3)
+            info "Cancelled."
+            exit 0
+            ;;
+        *)
+            info "Keeping the stack running and continuing..."
+            echo ""
+            ;;
+    esac
+fi
+
 phase_a_bringup
 phase_b_setup
 if [ "$NONINTERACTIVE" = 1 ]; then
