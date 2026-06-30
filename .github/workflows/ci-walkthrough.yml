@@ -6,6 +6,10 @@ on:
     paths: ['examples/walkthrough/**', '.devcontainer/walkthrough/**', 'docs/walkthrough.md', '.github/workflows/ci-walkthrough.yml']
   workflow_dispatch:
 
+concurrency:
+  group: '${{ github.workflow }} @ ${{ github.event.pull_request.head.label || github.head_ref || github.ref }}'
+  cancel-in-progress: true
+
 jobs:
   validate:
     name: Validate
@@ -19,6 +23,7 @@ jobs:
 
   smoke:
     name: Smoke Test
+    needs: [validate]
     runs-on: ubuntu-latest
     timeout-minutes: 25
     steps:
@@ -46,7 +51,20 @@ jobs:
           [ "$relk" = "v" ] || { echo "events not a view (relkind=$relk)"; exit 1; }
           [ "$wm" = "1" ] || { echo "no watermark row"; exit 1; }
           echo "Tiering proof OK"
+      - name: Check no services have exited
+        run: |
+          echo "=== Service Status ==="
+          docker compose -f examples/walkthrough/docker-compose.yml ps
+          if docker compose -f examples/walkthrough/docker-compose.yml ps | grep -E "Exit|exited"; then
+            echo "ERROR: Some services have exited"
+            docker compose -f examples/walkthrough/docker-compose.yml logs
+            exit 1
+          fi
+          echo "All services are running"
       - name: Dump logs on failure
         if: failure()
         working-directory: examples/walkthrough
         run: docker compose logs
+      - name: Cleanup
+        if: always()
+        run: docker compose -f examples/walkthrough/docker-compose.yml down -v

@@ -9,6 +9,6 @@ sudo apt-get install -y postgresql-client jq
 # Note: If the published base image is awkward to pull in CI/Codespaces,
 # set COLDFRONT_BASE to build the base locally:
 # export COLDFRONT_BASE=local && bash examples/walkthrough/setup.sh
-bash examples/walkthrough/setup.sh || true
+bash examples/walkthrough/setup.sh
 
 echo "Setup checked. Run: bash examples/walkthrough/guide.sh"
