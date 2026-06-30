@@ -117,6 +117,9 @@ tier.
 
 ## Next Steps
 
+New here? Run the [guided walkthrough](walkthrough.md) to see all
+three modes in action with copy-pasteable commands.
+
 To go further with ColdFront, consult the following guides:
 
 - The [Installation](installation.md) guide covers building ColdFront
