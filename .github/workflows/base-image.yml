@@ -70,6 +70,8 @@ jobs:
     name: base pg${{ matrix.pg }} (${{ inputs.arch }})
     runs-on: ${{ needs.setup.outputs.runner }}
     timeout-minutes: 300
+    env:
+      REPO: ghcr.io/pgedge/coldfront-duckdb-base
     strategy:
       fail-fast: false
       matrix:
@@ -77,6 +79,16 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
+        with:
+          fetch-depth: 0   # full history + tags so git describe sees release tags
+
+      - name: Compute version suffix
+        id: ver
+        run: |
+          set -euo pipefail
+          V=$(git describe --tags --exact-match 2>/dev/null || git rev-parse --short=12 HEAD)
+          echo "version=$V" >> "$GITHUB_OUTPUT"
+          echo "Version suffix: $V"
 
       - name: Set up Buildx
         uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
@@ -87,19 +99,22 @@ jobs:
       - name: Build base image (${{ needs.setup.outputs.platform }})
         run: |
           set -euo pipefail
-          IMG=ghcr.io/pgedge/coldfront-duckdb-base:pg${{ matrix.pg }}-${{ inputs.arch }}
+          VTAG=pg${{ matrix.pg }}-${{ inputs.arch }}-${{ steps.ver.outputs.version }}
           docker buildx build \
             --platform ${{ needs.setup.outputs.platform }} \
-            -f docker/Dockerfile.duckdb15-base \
+            --build-arg TARGETARCH=${{ inputs.arch }} \
             --build-arg PG_MAJOR=${{ matrix.pg }} \
-            -t "$IMG" \
+            -f docker/Dockerfile.duckdb15-base \
+            -t "$REPO:$VTAG" \
             --load .
-          echo "Built $IMG"
+          echo "Built $REPO:$VTAG"
 
+      # Push ONLY the immutable, version-suffixed tag. The floating pg<maj>-<arch>
+      # tag is deliberately never pushed from CI.
       - name: Push base image
         if: ${{ inputs.push }}
         run: |
           set -euo pipefail
-          IMG=ghcr.io/pgedge/coldfront-duckdb-base:pg${{ matrix.pg }}-${{ inputs.arch }}
-          docker push "$IMG"
-          echo "Pushed $IMG"
+          VTAG=pg${{ matrix.pg }}-${{ inputs.arch }}-${{ steps.ver.outputs.version }}
+          docker push "$REPO:$VTAG"
+          echo "Pushed $REPO:$VTAG"
