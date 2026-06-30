@@ -273,7 +273,58 @@ EOSQL
             DELETE FROM coldfront.archive_watermark WHERE table_name='events';" >/dev/null 2>&1
     fi
 }
-demo_decoupled()   { info "[decoupled demo placeholder]"; }
+demo_decoupled() {
+    header "Decoupled — Postgres as a front-end to the lake"
+    explain "A different on-ramp: if data belongs in the lake from day one, skip"
+    explain "tiering entirely. One call provisions an Iceberg table fronted by a"
+    explain "Postgres view. (This is a fresh table — there is no migration from the"
+    explain "tiered demo; the two modes are distinct.)"
+    echo ""
+
+    # Idempotent teardown: events_lake may be a leftover view + registry row.
+    pg "DROP VIEW IF EXISTS events_lake CASCADE;
+        DELETE FROM coldfront.tiered_views WHERE relname='events_lake';" >/dev/null 2>&1 || true
+
+    explain "Create an Iceberg-only table in one call:"
+    # The Iceberg namespace is pre-seeded in Phase A. DuckDB 1.5.x defers an
+    # Iceberg CREATE SCHEMA to COMMIT but POSTs CREATE TABLE eagerly, so
+    # create_iceberg_table — both in ONE plpgsql txn — would 404 on a cold
+    # warehouse. With the namespace already committed this no-ops; the loop is a
+    # thin safety net in case seeding raced the warehouse.
+    local i ok=0
+    for i in 1 2 3 4 5; do
+        pg "SELECT coldfront.create_iceberg_table('public','events_lake','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"ts\",\"type\":\"timestamptz\"},{\"name\":\"status\",\"type\":\"text\"},{\"name\":\"data\",\"type\":\"jsonb\"}]'::jsonb);" >/dev/null 2>&1
+        if [ "$(pg "SELECT count(*) FROM pg_class WHERE relname='events_lake' AND relkind='v';")" = "1" ]; then ok=1; break; fi
+        sleep 2
+    done
+    if [ "$ok" = 1 ]; then
+        info "events_lake created (a view; every row lives in Iceberg)."
+    else
+        error "create_iceberg_table did not succeed"
+        return
+    fi
+
+    explain "It reads and writes like any Postgres table — but it is all in the lake:"
+    psql_file <<'EOSQL'
+INSERT INTO events_lake VALUES
+  (1, now(), 'ok',  '{"a":1}'),
+  (2, now(), 'ok',  '{"a":2}');
+SELECT count(*) AS rows_in_lake FROM events_lake;
+UPDATE events_lake SET status='upd' WHERE id=1;
+SELECT id, status FROM events_lake ORDER BY id;
+DELETE FROM events_lake WHERE id=2;
+SELECT count(*) AS after_delete FROM events_lake;
+EOSQL
+    echo ""
+
+    # Exit cleanup is interactive-only: CI / NONINTERACTIVE runs assert on the
+    # post-run state (events_lake is a view + iceberg-only registry row), so we
+    # MUST leave it intact when NONINTERACTIVE=1.
+    if [ "$NONINTERACTIVE" != 1 ]; then
+        read -rp "Drop events_lake before returning to the menu? [Y/n]: " a </dev/tty
+        [[ "$a" =~ ^[Nn]$ ]] || pg "DROP VIEW IF EXISTS events_lake CASCADE; DELETE FROM coldfront.tiered_views WHERE relname='events_lake';" >/dev/null 2>&1
+    fi
+}
 demo_partitioner() { info "[partitioner demo placeholder]"; }
 
 reset_demos() {
