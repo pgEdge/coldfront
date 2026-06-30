@@ -58,7 +58,9 @@ if ! curl -fsSL "https://codeload.github.com/pgEdge/coldfront/tar.gz/${BRANCH}" 
         "coldfront-${BRANCH}/internal" \
         "coldfront-${BRANCH}/go.mod" \
         "coldfront-${BRANCH}/go.sum" \
-        "coldfront-${BRANCH}/docker"; then
+        "coldfront-${BRANCH}/docker" \
+        "coldfront-${BRANCH}/THIRD_PARTY_NOTICES.md" \
+        "coldfront-${BRANCH}/LICENSE.md"; then
     echo "  Error: failed to fetch build sources" >&2
     exit 1
 fi

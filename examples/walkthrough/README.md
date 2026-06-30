@@ -117,7 +117,7 @@ This file is standalone and could be reused for other interactive guides.
 
 ### docker-compose.yml
 
-Defines five services:
+Defines six services (five start by default; `archiver` is profile-gated):
 
 - `db` — PostgreSQL with the `coldfront` extension, built from source
 - `seaweedfs` — local S3-compatible object store (stands in for AWS S3,
