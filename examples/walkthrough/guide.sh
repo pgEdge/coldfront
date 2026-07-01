@@ -606,18 +606,20 @@ EOSQL
 }
 demo_decoupled() {
     ensure_coldfront_setup        # silent — ColdFront may not be installed yet if this demo ran first
-    header "Decoupled — Postgres as a front-end to the lake"
-    explain "A different on-ramp: if data belongs in the lake from day one, skip"
-    explain "tiering entirely. One call provisions an Iceberg table fronted by a"
-    explain "Postgres view. (This is a fresh table — there is no migration from the"
-    explain "tiered demo; the two modes are distinct.)"
+    header "Decoupled — a table whose data lives in the lake, not in Postgres"
+
+    explain "\"I want a table whose data lives in the lake from day one — full SQL,"
+    explain " none of the Postgres storage cost.\" That's decoupled mode."
+    explain "  ${DIM}Unlike tiered, the data is never in a Postgres heap — it starts in the lake.${RESET}"
     echo ""
 
     # Idempotent teardown: events_lake may be a leftover view + registry row.
     pg "DROP VIEW IF EXISTS events_lake CASCADE;
         DELETE FROM coldfront.tiered_views WHERE relname='events_lake';" >/dev/null 2>&1 || true
 
-    explain "Create an Iceberg-only table in one call:"
+    # Step 2 — create the lake-native table (one call).
+    explain "Create a lake-native table in one call — it makes a view + registry row, no Postgres heap:"
+    if [ "$NONINTERACTIVE" != 1 ]; then prompt_continue; fi
     # The Iceberg namespace is pre-seeded in Phase A. DuckDB 1.5.x defers an
     # Iceberg CREATE SCHEMA to COMMIT but POSTs CREATE TABLE eagerly, so
     # create_iceberg_table — both in ONE plpgsql txn — would 404 on a cold
@@ -629,24 +631,54 @@ demo_decoupled() {
         if [ "$(pg "SELECT count(*) FROM pg_class WHERE relname='events_lake' AND relkind='v';")" = "1" ]; then ok=1; break; fi
         sleep 2
     done
-    if [ "$ok" = 1 ]; then
-        info "events_lake created (a view; every row lives in Iceberg)."
-    else
-        error "create_iceberg_table did not succeed"
-        return
-    fi
+    [ "$ok" = 1 ] || { error "create_iceberg_table did not succeed"; return; }
+    show_query "SELECT relkind FROM pg_class WHERE relname='events_lake';"
+    info "relkind = v — events_lake is a VIEW, no heap table was created. The data has nowhere to live but the lake."
 
-    explain "It reads and writes like any Postgres table — but it is all in the lake:"
+    # Step 3 — registry proof (iceberg-only, no hot table).
+    explain "The registry confirms it's iceberg-only, with no Postgres hot table behind it:"
+    show_query "SELECT relname, is_iceberg_only, hot_table FROM coldfront.tiered_views WHERE relname='events_lake';"
+    info "is_iceberg_only = t, hot_table = NULL — nothing in Postgres holds these rows."
+
+    # Step 4 — use it like any Postgres table.
+    header "Use it like any Postgres table"
+    explain "Insert, read, update, delete — ordinary SQL; every write goes to Iceberg:"
     psql_file <<'EOSQL'
 INSERT INTO events_lake VALUES
-  (1, now(), 'ok',  '{"a":1}'),
-  (2, now(), 'ok',  '{"a":2}');
-SELECT count(*) AS rows_in_lake FROM events_lake;
-UPDATE events_lake SET status='upd' WHERE id=1;
-SELECT id, status FROM events_lake ORDER BY id;
-DELETE FROM events_lake WHERE id=2;
-SELECT count(*) AS after_delete FROM events_lake;
+  (1, now(), 'ok',   '{"k":1}'),
+  (2, now(), 'ok',   '{"k":2}'),
+  (3, now(), 'warn', '{"k":3}');
 EOSQL
+    show_query "SELECT id, status, data->>'k' AS k FROM events_lake ORDER BY id;"
+    pg "UPDATE events_lake SET status='corrected' WHERE id=1;" >/dev/null
+    pg "DELETE FROM events_lake WHERE id=3;" >/dev/null
+    show_query "SELECT id, status FROM events_lake ORDER BY id;"
+    info "Full read/write SQL — your application code is identical to any Postgres table."
+
+    # Step 5 — prove the data isn't in Postgres (the climax).
+    header "Prove the data isn't in Postgres"
+    explain "events_lake is a view (views store no rows), and there's no heap table behind it:"
+    show_query "SELECT relkind, pg_size_pretty(pg_relation_size(c.oid)) AS pg_bytes
+                FROM pg_class c WHERE c.relname='events_lake';"
+    show_query "SELECT count(*) AS heap_tables_named_events_lake
+                FROM pg_class WHERE relname LIKE 'events_lake%' AND relkind='r';"
+    explain "Yet the rows are really there — as Parquet files in object storage:"
+    show_parquet_files events_lake || true
+    info "A fully queryable, writeable SQL table with real rows — and Postgres stores 0 bytes of that data."
+
+    # Durability — fresh connection.
+    explain "And it's durable — a brand-new connection sees every row, still 0 bytes in Postgres:"
+    show_query "SELECT count(*) AS rows FROM events_lake;"
+    show_query "SELECT pg_size_pretty(pg_relation_size('events_lake')) AS pg_bytes;"
+
+    # Step 6 — scale-out bridge (narrative only, no commands).
+    header "Where this goes next: scale compute, not storage"
+    explain "Because the data lives in the lake — not in THIS node — you can point more"
+    explain "Postgres nodes at the very same data: pure added compute over one shared copy,"
+    explain "no data to replicate. ColdFront serializes their writes so they never collide"
+    explain "(a Spock-replicated, TLA+-verified protocol)."
+    explain "  ${DIM}Seeing that live — write on node A, read on node B, concurrent writes with no${RESET}"
+    explain "  ${DIM}conflicts — is its own story: the Distributed walkthrough (coming as #4).${RESET}"
     echo ""
 
     # Exit cleanup is interactive-only: CI / NONINTERACTIVE runs assert on the
