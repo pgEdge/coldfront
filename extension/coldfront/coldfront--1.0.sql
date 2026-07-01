@@ -208,7 +208,7 @@ BEGIN
     PERFORM duckdb.raw_query($q$SET GLOBAL httpfs_client_implementation = 'httplib'$q$);
     -- httpfs (s3) already loaded as a side-effect of the ATTACH above; azure does
     -- not, so its lazy autoload would otherwise fire later as the non-superuser
-    -- app role and hit pg_duckdb's LocalFileSystem block (issue #17). Pre-load it
+    -- app role and hit pg_duckdb's LocalFileSystem block. Pre-load it
     -- here, while still in this SECURITY DEFINER (elevated) context.
     IF EXISTS (SELECT 1 FROM coldfront.storage_secret WHERE storage_type = 'azure') THEN
       PERFORM duckdb.raw_query('LOAD azure');
@@ -2061,6 +2061,15 @@ BEGIN
     IF connstr IS NULL OR connstr = '' THEN
         RAISE EXCEPTION 'coldfront: configure GUC coldfront.dblink_self with a libpq connstr (e.g. ''host=/var/run/postgresql dbname=coldfront user=coldfront'')';
     END IF;
+
+    -- Same-node serialization: hold a node-local advisory xact lock for this
+    -- iceberg table across the whole claim+commit, so at most ONE cold writer
+    -- per node is in the bakery at once. That keeps per-node concurrency at 1
+    -- (the topology Bakery_v2 proves safe), so the cross-node Ricart-Agrawala
+    -- ack/defer only ever arbitrates a single same-node claim. Cross-node
+    -- writers are unaffected (advisory locks are instance-local); in the async
+    -- path this runs after the parquet upload, so same-node uploads pipeline.
+    PERFORM pg_advisory_xact_lock(hashtext('coldfront_iceberg:' || p_iceberg_table));
 
     -- Persistent named dblink connection (sessionful, opened once).
     -- The dblink session only touches coldfront.claims (never a tiered view),

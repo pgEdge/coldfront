@@ -46,6 +46,8 @@ describes its files and their roles:
 | `Bakery_v2_crash.cfg` | 3 writers, 1 crash budget (stock ordering - crash-safety is ordering-independent).  Safety invariants still hold (a crashed peer's missing ack just leaves surviving writers blocked at `WaitAcks` - no incorrect commits). |
 | `Bakery_v2_live.cfg` | **The defer/drain race** (`SafeAcks=FALSE`) - the non-atomic implementation. **`EventualProgress` is EXPECTED to be VIOLATED**: a deferred ack written behind a just-released claim is dropped, stranding the min-ticket holder at `WaitAcks` forever - the N-writer production wedge, reproduced in the model. The four safety invariants still HOLD (a dropped ack is a liveness failure, not a wrong commit). No `SYMMETRY` (unsound with liveness checking). |
 | `Bakery_v2_fixed.cfg` | **The fix** (`SafeAcks=TRUE`) - the atomic defer/drain (`FOR UPDATE` on the claim row). `EventualProgress` HOLDS *and* all four safety invariants hold: the formal proof the fix restores liveness without weakening safety. |
+| `Bakery_v2_samenode_race.cfg` | **Multiple cold writers per node, no same-node lock** (`NodeParts={{a1,a2},{b1}}`, `SameNodeLock=FALSE`). Two same-node claims `a1<a2` below a peer's `b1`: the node defers `b1` behind its smallest same-node claim `a1` and, on `a1`'s release, forwards the ack for `b1` without re-deferring behind `a2` (still held, still `< b1`), so `a2` and `b1` both clear the bakery. **`NoLakekeeperConflict` is EXPECTED to be violated** - the multi-writer-per-node race, reproduced in the model. |
+| `Bakery_v2_samenode.cfg` | **The fix** (`SameNodeLock=TRUE`) - `coldfront._claim_iceberg_lock`'s node-local advisory xact lock, so at most one same-node writer is in the bakery at a time. `a1` and `a2` never coexist; the topology collapses to one active claim per node and all four safety invariants HOLD: the formal proof the node-local lock is mandatory for multi-writer-per-node cold writes. |
 
 ## Properties
 
@@ -155,6 +157,14 @@ java -cp $TLA tlc2.TLC -workers auto -deadlock -config Bakery_v2_live.cfg Bakery
 # v2.f The fix (SafeAcks=TRUE — FOR UPDATE on the claim row).  All hold:
 #       EventualProgress AND the four safety invariants.
 java -cp $TLA tlc2.TLC -workers auto -deadlock -config Bakery_v2_fixed.cfg Bakery_v2.tla
+
+# v2.g Multiple cold writers per node, NO same-node lock (SameNodeLock=FALSE).
+#      EXPECTED to violate NoLakekeeperConflict — the multi-writer-per-node race.
+java -cp $TLA tlc2.TLC -workers auto -deadlock -config Bakery_v2_samenode_race.cfg Bakery_v2.tla
+
+# v2.h Same topology WITH the node-local advisory lock (SameNodeLock=TRUE).
+#      All four safety invariants HOLD — the lock restores safety.
+java -cp $TLA tlc2.TLC -workers auto -deadlock -config Bakery_v2_samenode.cfg Bakery_v2.tla
 ```
 
 The `-deadlock` flag tells TLC not to flag final stuttering states as
@@ -265,6 +275,44 @@ needs no patch. (The asymmetric-apply race that motivates R-A itself -
 two writers passing a naive local min-check on stale views - is
 structurally prevented by the R-A ack barrier in this model, so it has
 no standalone config.)
+
+### `Bakery_v2_samenode_race.cfg` (multi-writer-per-node - EXPECTED FAILURE)
+
+The no-same-node-lock config is expected to fail the check, reporting
+the following output:
+
+```text
+Error: Invariant NoLakekeeperConflict is violated.
+…
+62256 states generated, 20448 distinct states found, 2595 states left on queue.
+```
+
+**Failure expected.** With two cold writers `a1 < a2` on one node and
+`b1` on a peer (`NodeParts={{a1,a2},{b1}}`, `SameNodeLock=FALSE`), the
+node defers `b1` behind its smallest same-node claim `a1`; when `a1`
+releases, it forwards the ack for `b1` without re-deferring behind `a2`
+(still held, still `< b1`). So `a2` (already acked by the peer, since
+`a2 < b1`) and `b1` (now acked) both clear the bakery and race the CAS →
+Lakekeeper 409. This reproduces the multi-writer-per-node race in the
+model, isolated from the async race (`AsyncParquet=FALSE`) and the
+ack-atomicity race (`SafeAcks=TRUE`).
+
+### `Bakery_v2_samenode.cfg` (node-local lock)
+
+The same-node-lock config reports a clean check with the following
+output:
+
+```text
+Model checking completed. No error has been found.
+71617 states generated, 24076 distinct states found, 0 states left on queue.
+```
+
+`SameNodeLock=TRUE` models `coldfront._claim_iceberg_lock`'s node-local
+advisory xact lock: at most one same-node writer is in the bakery at a
+time. `a1` and `a2` never coexist, so the ack-forward never clears `b1`
+while `a2` still holds; the topology collapses to one active claim per
+node and all four safety invariants hold. This is the formal proof that
+the node-local lock is mandatory for multi-writer-per-node cold writes.
 
 ## Model fidelity
 
