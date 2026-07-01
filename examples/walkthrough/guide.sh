@@ -119,15 +119,17 @@ detect_ports() {
     LK_URL="http://localhost:${lk_picked}"
 }
 
-# run_sql_shown — interactively show+run a SQL command; non-interactively just run it.
+# run_sql_shown — explain what the command does FIRST, then show + run it.
+# The "why" MUST print before the command/output so the viewer knows what they're
+# about to run before hitting Enter — never after.
 run_sql_shown() {
     local sql="$1" why="$2"
+    [ -n "$why" ] && explain "  ${DIM}$why${RESET}"
     if [ "$NONINTERACTIVE" = 1 ]; then
         pg "$sql" >/dev/null || { error "step failed: $sql"; exit 1; }
     else
         prompt_run "psql -h localhost -p $PG_PORT -U coldfront -d coldfront -c \"$sql\""
     fi
-    [ -n "$why" ] && explain "  ${DIM}$why${RESET}"
 }
 
 # coldfront_installed — true once both extensions exist in this database.
