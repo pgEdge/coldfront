@@ -96,7 +96,8 @@ services:
     ports:
       - "${COLDFRONT_LK_PORT:-8181}:8181"    # REST catalog + management API (bootstrap/warehouse)
     healthcheck:
-      test: ["CMD", "lakekeeper", "healthcheck"]
-      interval: 3s
-      timeout: 2s
-      retries: 10
+      test: ["CMD", "/home/nonroot/lakekeeper", "healthcheck"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s
