@@ -499,15 +499,40 @@ EOSQL
 
     # ── Part 3: tier it, and prove it ──────────────────────────────────────────────
     header "Tier it — relocate the cold data, prove it moved"
-    explain "The archiver policy tiers anything older than 30 days to object storage:"
-    if [ "$NONINTERACTIVE" != 1 ]; then show_cmd "cat config/archiver.yaml"; sed 's/^/    /' "$SCRIPT_DIR/config/archiver.yaml"; prompt_continue; fi
+    # Concise policy summary (the meaningful rule), NOT the whole YAML: the archiver
+    # config also carries dsn/iceberg/s3 plumbing that only clutters the story here.
+    explain "The archiver reads a small policy from config/archiver.yaml:"
+    echo -e "  ${DIM}Policy: table=events, monthly partitions, hot_period=30 days${RESET}"
+    echo -e "  ${DIM}        → partitions older than 30 days move to object storage.${RESET}"
+    if [ "$NONINTERACTIVE" != 1 ]; then prompt_continue; fi
 
+    # Own explain → prompt → run beat: the "what it does" line MUST print before the
+    # Enter that triggers the archiver, so the viewer knows what is about to happen.
     explain "Run the archiver — it moves old partitions PG → Parquet in S3 and rebuilds events as a unified view:"
+    if [ "$NONINTERACTIVE" != 1 ]; then
+        show_cmd "docker compose run --rm --no-deps archiver --config /config/archiver.yaml"
+        echo ""
+        read -rp "Press Enter to run the archiver..." </dev/tty
+        echo ""
+    fi
     start_spinner "Archiving cold partitions to object storage"
-    $COMPOSE run --rm archiver --config /config/archiver.yaml >/tmp/wt-archiver.log 2>&1
+    # --no-deps: use the already-running, data-populated db over the shared compose
+    # network. Without it, `compose run` re-evaluates depends_on:db and can RECREATE
+    # the db from its config hash — replacing the loaded db with a fresh one, so the
+    # archiver's host=db then finds no `events` table.
+    $COMPOSE run --rm --no-deps archiver --config /config/archiver.yaml >/tmp/wt-archiver.log 2>&1
     local rc=$?
     stop_spinner
-    [ "$rc" = 0 ] || { error "archiver failed"; tail -10 /tmp/wt-archiver.log; return; }
+    if [ "$rc" != 0 ]; then
+        # Clean failure: one-line reason + the last few RELEVANT log lines (drop the
+        # compose container-lifecycle noise), then return to the menu cleanly.
+        local reason
+        reason=$(grep -iE 'error|fatal|panic|does not exist|not found' /tmp/wt-archiver.log | tail -1)
+        [ -n "$reason" ] || reason="see /tmp/wt-archiver.log for details"
+        error "The archiver failed — ${reason}"
+        grep -vE '^ Container ' /tmp/wt-archiver.log | tail -5 | sed 's/^/    /'
+        return
+    fi
 
     # Proof (a): it's really Parquet in S3. iceberg_metadata() lists the data files
     # of a table, but pg_duckdb's table-function form resolves its argument as a
@@ -652,10 +677,12 @@ EOSQL
 
     explain "Register it with the partitioner (monthly, 12-month retention):"
     start_spinner "Registering + reconciling partitions"
-    $COMPOSE run --rm --entrypoint partitioner archiver \
+    # --no-deps: reuse the already-running db (see the archiver note above) — a plain
+    # `compose run` can recreate the db from its config hash and wipe the loaded data.
+    $COMPOSE run --rm --no-deps --entrypoint partitioner archiver \
         register --config /config/partitioner.yaml --table part_demo \
         --period monthly --retention "12 months" >/tmp/wt-part.log 2>&1
-    $COMPOSE run --rm --entrypoint partitioner archiver --config /config/partitioner.yaml >>/tmp/wt-part.log 2>&1
+    $COMPOSE run --rm --no-deps --entrypoint partitioner archiver --config /config/partitioner.yaml >>/tmp/wt-part.log 2>&1
     stop_spinner
 
     explain "Partitions auto-created for the forward window:"
