@@ -289,8 +289,36 @@ choose_volume() {
   echo ""
 
   # shellcheck disable=SC2034  # GEN_ROWS consumed by Task-9 demo functions
+
+  # If even the floored Suggested size doesn't fit, free disk is critically low.
+  # Do NOT present a fitting-looking default — show an explicit message and
+  # fall back to Custom-only so the user must type a row count they know fits,
+  # or free space and re-run.
+  if [ "$free_mb" -gt 0 ] && ! fits "$sugg" "$free_mb"; then
+    warn "Free Docker disk (~${free_mb} MB) is too low even for the minimum"
+    warn "suggested size (~${sugg} rows, needs ~$(peak_mb "$sugg") MB peak)."
+    warn "Free space first:"
+    warn "    docker system prune -af --volumes"
+    warn "Or raise the Docker Desktop disk limit, then re-run the walkthrough."
+    warn "If you still want to proceed, enter a custom row count (e.g. 10000)."
+    echo ""
+    while true; do
+      printf "  C) Custom     enter a row count\n"
+      echo ""
+      read -rp "Rows (or Q to quit): " v </dev/tty
+      case "$v" in
+        [Qq]*) exit 0;;
+        *)
+          if ! [[ "$v" =~ ^[0-9]+$ ]] || [ "$v" -le 0 ]; then
+            warn "Enter a positive whole number."; echo ""; continue
+          fi
+          GEN_ROWS="$v"; return;;
+      esac
+    done
+  fi
+
   while true; do
-    printf "  S) Suggested  ~%s rows   (fits your Docker's ~%s MB free, with headroom)   [default]\n" "$sugg" "$free_mb"
+    printf "  S) Suggested  ~%s rows   %s   [default]\n" "$sugg" "$(fit_note "$sugg" "$free_mb")"
     printf "  1) Quick      ~1M rows    %s\n"  "$(fit_note 1000000 "$free_mb")"
     printf "  2) Standard   ~10M rows   %s\n"  "$(fit_note 10000000 "$free_mb")"
     printf "  3) Big        ~50M rows   %s\n"  "$(fit_note 50000000 "$free_mb")"
@@ -648,9 +676,15 @@ quit_walkthrough() {
 main_menu() {
     while true; do
         header "ColdFront — what would you like to see?"
+        explain "  ${DIM}\"My Postgres database is getting expensive.\"${RESET}"
         explain "  1) Tiered storage   — relocate cold data to object storage, same table, still writeable"
+        echo ""
+        explain "  ${DIM}\"I want a table whose data lives in the lake from day one.\"${RESET}"
         explain "  2) Decoupled        — Postgres as a front-end to the lake (data in Iceberg from day one)"
+        echo ""
+        explain "  ${DIM}\"I just want automated partition maintenance.\"${RESET}"
         explain "  3) Partitioner      — automated PG range-partitioning, no cold tier"
+        echo ""
         explain "  R) Reset            — drop demo tables / reclaim disk"
         explain "  Q) Quit             — (offers docker compose down -v)"
         echo ""
