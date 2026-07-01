@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"flag"
 	"fmt"
 	"log"
@@ -1010,6 +1011,32 @@ func archiveCutover(ctx context.Context, conn *pgx.Conn, t *config.TableConfig,
 	return nil
 }
 
+// isRetryableCutover reports whether a Phase-4 (cutover_archive) failure is
+// worth retrying. cutover_archive's only transient failure by design is its
+// lock_timeout circuit breaker on the ACCESS EXCLUSIVE acquisition, which raises
+// lock_not_available (55P03) when a cold writer still holds the partition; the
+// lock_timeout is kept below deadlock_timeout so the cutover always yields that
+// way. Every other error is permanent (e.g. an inbound FK blocking DETACH,
+// 23503) — retrying only burns the backoff budget, so fail fast.
+func isRetryableCutover(err error) bool {
+	var pg *pgconn.PgError
+	return errors.As(err, &pg) && pg.Code == "55P03"
+}
+
+// cutoverFailHint returns actionable guidance for the well-known permanent
+// cutover failures. An inbound foreign key blocks DETACH (23503) because
+// archiving physically removes the rows from PostgreSQL (export to Iceberg,
+// then DETACH + DROP) and PG cannot enforce a foreign key against the cold tier.
+func cutoverFailHint(err error) string {
+	var pg *pgconn.PgError
+	if errors.As(err, &pg) && pg.Code == "23503" {
+		return fmt.Sprintf(" — inbound foreign key %q blocks the partition DETACH; "+
+			"archiving removes these rows from PostgreSQL, so the foreign key must be "+
+			"dropped before this table can be archived", pg.ConstraintName)
+	}
+	return ""
+}
+
 // runCutoverWithRetry runs Phase 3 (delta replay) + Phase 4 (atomic cutover)
 // under a 10-attempt retry harness with exponential backoff (100ms → 51.2s).
 // Phase 3 is idempotent so retries are safe; Phase 4 either commits everything
@@ -1045,6 +1072,12 @@ func runCutoverWithRetry(ctx context.Context, conn *pgx.Conn, t *config.TableCon
 			lastErr = err
 		}
 
+		// Only the lock-contention timeout (55P03) is transient. Anything else is
+		// permanent — fail fast instead of burning the ~51s backoff budget.
+		if !isRetryableCutover(lastErr) {
+			return fmt.Errorf("cutover %s failed (permanent, not retried): %w%s",
+				part.Name, lastErr, cutoverFailHint(lastErr))
+		}
 		log.Printf("cutover %s attempt %d failed after %s: %v (retry in %s)",
 			part.Name, attempt, time.Since(t4).Round(time.Millisecond), lastErr, backoff)
 		select {

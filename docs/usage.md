@@ -133,6 +133,30 @@ Iceberg rows older than it. The data lifecycle is **hot → `hot_period` →
 cold → `retention_period` → gone**; omit `retention_period` to keep cold
 data forever.
 
+### Inbound foreign keys
+
+A tiered table cannot be the target of an enforced foreign key from
+another table over its archivable range. Archiving physically removes
+the rows from PostgreSQL (export to Iceberg, then `DETACH` + `DROP` the
+partition), and PostgreSQL cannot enforce a foreign key against the cold
+tier. So the `DETACH` is refused (SQLSTATE 23503) and the archiver fails
+fast, naming the blocking constraint.
+
+This is inherent, not an edge case: referencing rows rarely have a
+hot-only lifecycle. They usually outlive the partition they point at, so
+the foreign key still pins those rows in PostgreSQL by the time the
+partition ages into the cold tier.
+
+The foreign key is fundamentally incompatible with archiving the rows it
+references, so before archiving such a table, drop it:
+
+```sql
+ALTER TABLE event_logs DROP CONSTRAINT event_logs_events_fkey;
+```
+
+Better still, do not point an enforced foreign key at a tiered table over
+its archivable range in the first place.
+
 ### 2-level (LIST → RANGE) tiered tables
 
 A table partitioned `LIST (region) → RANGE (ts)` can be tiered too - the
