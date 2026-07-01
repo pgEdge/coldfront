@@ -374,6 +374,13 @@ SELECT 'RO_COLD:'  || count(*) FROM events WHERE ts  < date_trunc('month',now())
 SELECT 'JSONB_TYPE:'   || pg_typeof(data)::text FROM events LIMIT 1;
 SELECT 'JSONB_COLD_M:' || (data->>'m') FROM events WHERE ts < date_trunc('month',now()) - interval '2 months' AND status='ok' ORDER BY ts LIMIT 1;
 SELECT 'JSONB_HOT_M:'  || (data->>'m') FROM events WHERE ts >= date_trunc('month',now()) - interval '2 months' AND status='ok' ORDER BY ts LIMIT 1;
+-- Read-path jsonb→json whitelist. The whole view query runs in DuckDB; the hook
+-- translates the ::jsonb cast (so an explicit cast does not hit DuckDB's missing
+-- jsonb type) and jsonb_array_length (verified identical in both engines). Cold and
+-- hot, on real Iceberg data.
+SELECT 'CAST_COLD:' || ((data::jsonb)->>'m') FROM events WHERE ts < date_trunc('month',now()) - interval '2 months' AND status='ok' ORDER BY ts LIMIT 1;
+SELECT 'CAST_HOT:'  || ((data::jsonb)->>'m') FROM events WHERE ts >= date_trunc('month',now()) - interval '2 months' AND status='ok' ORDER BY ts LIMIT 1;
+SELECT 'ALEN_COLD:' || jsonb_array_length('[10,20,30]'::jsonb) FROM events WHERE ts < date_trunc('month',now()) - interval '2 months' AND status='ok' ORDER BY ts LIMIT 1;
 EOSQL
 )
     assert_eq "total rows (hot+cold via view)" "280"  "$(extract RO_TOTAL "$O")"
@@ -382,6 +389,30 @@ EOSQL
     assert_eq "data surfaces as json" "json" "$(extract JSONB_TYPE "$O")"
     assert_eq "json cold round-trip"  "m4"  "$(extract JSONB_COLD_M "$O")"
     assert_eq "json hot round-trip"   "m2"  "$(extract JSONB_HOT_M "$O")"
+    assert_eq "::jsonb cast translated, cold" "m4" "$(extract CAST_COLD "$O")"
+    assert_eq "::jsonb cast translated, hot"  "m2" "$(extract CAST_HOT "$O")"
+    assert_eq "jsonb_array_length→json_array_length" "3" "$(extract ALEN_COLD "$O")"
+
+    # Hot-tier read routing: a read whose WHERE provably restricts to the hot tier
+    # (ts >= the watermark) is rewritten to the hot heap and runs in plain PostgreSQL,
+    # so jsonb operators/functions DuckDB lacks (jsonb_typeof, @>) work. m1..m4 all
+    # predate the watermark (date_trunc('month',now())), so insert a now() row (hot),
+    # exercise it, then delete it — the row counts asserted above stay intact.
+    qf "$HOST" >/dev/null <<'EOSQL'
+INSERT INTO events (ts, status, data) VALUES (now(), 'ok', '{"m":"hotjson","arr":[1,2,3]}'::jsonb);
+EOSQL
+    local HR; HR=$(qf "$HOST" <<'EOSQL'
+SELECT 'HOT_TYPEOF:'  || jsonb_typeof(data::jsonb)                         FROM events WHERE ts >= date_trunc('month',now()) AND data->>'m'='hotjson';
+SELECT 'HOT_CONTAIN:' || ((data::jsonb) @> '{"m":"hotjson"}'::jsonb)::text FROM events WHERE ts >= date_trunc('month',now()) AND data->>'m'='hotjson';
+SELECT 'HOT_HASKEY:' || ((data::jsonb) ? 'arr')::text                     FROM events WHERE ts >= date_trunc('month',now()) AND data->>'m'='hotjson';
+EOSQL
+)
+    qf "$HOST" >/dev/null <<'EOSQL'
+DELETE FROM events WHERE ts >= date_trunc('month',now()) AND data->>'m'='hotjson';
+EOSQL
+    assert_eq "hot read routes to PG: jsonb_typeof (DuckDB lacks it)"   "object" "$(extract HOT_TYPEOF "$HR")"
+    assert_eq "hot read routes to PG: @> containment (DuckDB lacks it)" "true"   "$(extract HOT_CONTAIN "$HR")"
+    assert_eq "hot read routes to PG: ? key-exists (DuckDB lacks it)"   "true"   "$(extract HOT_HASKEY "$HR")"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -527,24 +558,80 @@ EOSQL
     # rows) rather than silently returning a partial/void result.
     local cr; cr=$(q_may "$HOST" "UPDATE events SET status='x' WHERE ts < date_trunc('month',now()) - interval '3 months' RETURNING id;")
     assert_err "cold-tier RETURNING rejected" "cold tier" "$cr"
-    # An UPDATE that assigns the partition column is rejected before any tier write,
-    # so a cross-cutoff move can't silently lose the row (#20) and a hot→archived-
-    # range move can't leak the internal _events partition-routing error (#21). Both
-    # directions error the same way regardless of which tier the WHERE selects.
-    local pkc; pkc=$(q_may "$HOST" "UPDATE events SET ts=date_trunc('month',now()) - interval '1 month' WHERE ts < date_trunc('month',now()) - interval '3 months';")
-    assert_err "partition-key UPDATE rejected (cold→hot, #20)" "partition column" "$pkc"
-    local pkh; pkh=$(q_may "$HOST" "UPDATE events SET ts=date_trunc('month',now()) - interval '4 months' WHERE status='dual_upd';")
-    assert_err "partition-key UPDATE rejected (hot→archived, #21)" "partition column" "$pkh"
-    # The #21 leak specifically: the internal _events name must NOT appear in the error.
-    case "$pkh" in *_events*) fail "#21: internal _events name leaked in error: $pkh";; *) pass "#21: internal _events name not leaked";; esac
+    story_cross_tier_move
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story 6c — Cross-tier move: an UPDATE whose SET changes the partition column
+# across the hot/cold cutoff relocates the row between tiers. Permissive mode
+# (coldfront.allow_mixed_writes, default
+# on) performs the move; strict mode rejects it. Each scenario seeds its own
+# rows with a distinct status marker so the counts are independent of prior
+# stories. "Hot" is membership in the _events heap; total is the view.
+#  - HOT ts that has a pre-made partition: now-1mo + 10d (m1, seeded hot above).
+#  - COLD ts: now-4mo + 10d (m4, archived).
+# ───────────────────────────────────────────────────────────────────────────
+story_cross_tier_move() {
+    step "6c. Cross-tier move (partition-key UPDATE relocates the row)"
+    local O; O=$(qf "$HOST" <<'EOSQL'
+-- cold→hot: seed one cold row, then move its ts into the hot range.
+INSERT INTO events (ts, status, data) VALUES (date_trunc('month',now()) - interval '4 months' + interval '10 days','move_c2h','{}');
+UPDATE events SET ts = date_trunc('month',now()) - interval '1 month' + interval '10 days' WHERE status='move_c2h';
+SELECT 'C2H_TOTAL:' || count(*) FROM events  WHERE status='move_c2h';
+SELECT 'C2H_HOT:'   || count(*) FROM _events WHERE status='move_c2h';
+-- hot→cold: seed one hot row, then move its ts into the cold range.
+INSERT INTO events (ts, status, data) VALUES (date_trunc('month',now()) - interval '1 month' + interval '10 days','move_h2c','{}');
+UPDATE events SET ts = date_trunc('month',now()) - interval '4 months' + interval '10 days' WHERE status='move_h2c';
+SELECT 'H2C_TOTAL:' || count(*) FROM events  WHERE status='move_h2c';
+SELECT 'H2C_HOT:'   || count(*) FROM _events WHERE status='move_h2c';
+-- row-dependent SET that moves only SOME rows: one cold row crosses into hot
+-- (cold + 4mo lands in m1 hot), one stays cold (m4 + 1mo = m3, still cold).
+INSERT INTO events (ts, status, data) VALUES (date_trunc('month',now()) - interval '3 months' + interval '10 days','move_mix','{}');
+INSERT INTO events (ts, status, data) VALUES (date_trunc('month',now()) - interval '4 months' + interval '10 days','move_mix','{}');
+SELECT 'MIX_TOTAL_PRE:' || count(*) FROM events WHERE status='move_mix';
+UPDATE events SET ts = ts + interval '2 months' WHERE status='move_mix';
+SELECT 'MIX_TOTAL_POST:' || count(*) FROM events  WHERE status='move_mix';
+SELECT 'MIX_HOT_POST:'   || count(*) FROM _events WHERE status='move_mix';
+-- A row-dependent SET with a value-independent WHERE must apply the new value
+-- exactly once: the cold→hot row, once inserted into the heap, must not be
+-- updated a second time by the in-place stay-hot UPDATE. m3+10d + 2mo = m1+10d.
+INSERT INTO events (ts, status, data) VALUES (date_trunc('month',now()) - interval '3 months' + interval '10 days','move_dbl','{}');
+UPDATE events SET ts = ts + interval '2 months' WHERE status='move_dbl';
+SELECT 'DBL_ONCE:' || (ts = date_trunc('month',now()) - interval '1 month' + interval '10 days')::text FROM events WHERE status='move_dbl';
+EOSQL
+)
+    assert_eq "cold→hot move: row preserved (total)" "1" "$(extract C2H_TOTAL "$O")"
+    assert_eq "cold→hot move: row now in the hot heap" "1" "$(extract C2H_HOT "$O")"
+    assert_eq "hot→cold move: row preserved (total)" "1" "$(extract H2C_TOTAL "$O")"
+    assert_eq "hot→cold move: row no longer in the hot heap" "0" "$(extract H2C_HOT "$O")"
+    # A row-dependent SET moves only the rows whose new ts crosses the cutoff; no
+    # row is lost and the partial split lands in the right tiers.
+    local mp; mp=$(extract MIX_TOTAL_PRE "$O")
+    assert_eq "row-dependent move: no row lost (total preserved)" "$mp" "$(extract MIX_TOTAL_POST "$O")"
+    assert_eq "row-dependent move: exactly the crossing row went hot" "1" "$(extract MIX_HOT_POST "$O")"
+    # The crossing row's new value is applied exactly once, not re-applied by the
+    # in-place stay-hot UPDATE after it is inserted into the heap.
+    assert_eq "row-dependent cold→hot move applies the new value exactly once" "true" "$(extract DBL_ONCE "$O")"
+    # A move whose target hot ts has no pre-made partition is rejected cleanly,
+    # naming the view, and must not leak the internal _events heap name in any form.
+    local np; np=$(q_may "$HOST" "UPDATE events SET ts = now() + interval '20 years' WHERE status='move_c2h';")
+    assert_err "move to a ts with no hot partition rejected" "events" "$np"
+    case "$np" in
+        *"no partition of relation"*) fail "raw partition-routing error leaked: $np";;
+        *_events*)                    fail "internal _events name leaked: $np";;
+        *)                            pass "no raw partition error or _events name leaked";;
+    esac
+    # Strict mode still rejects any partition-key SET (no atomic move to fall back on).
+    local sm; sm=$(q_may "$HOST" "SET coldfront.allow_mixed_writes=off; UPDATE events SET ts = date_trunc('month',now()) - interval '4 months' + interval '10 days' WHERE status='move_c2h';")
+    assert_err "strict mode rejects the cross-tier move" "partition column" "$sm"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
 # require_compactor — stories 6d/6e drive the standalone Go compactor (cmd/compactor,
 # a separate iceberg-go module). Assert its binary is present before they run: a missing
 # "$COMPACTOR" otherwise gets captured into the dry-run output as "No such file or
-# directory" and reported as "nothing to compact", masking the real cause (issue #17 —
-# 6d/6e ran against a vanilla.sh that never built the compactor).
+# directory" and reported as "nothing to compact", masking the real cause:
+# 6d/6e ran against a vanilla.sh that never built the compactor.
 require_compactor() {
     [ -x "$COMPACTOR" ] && return 0
     fail "compactor binary not found/executable at $COMPACTOR — build it with 'make compactor'; stories 6d/6e require it"
@@ -810,6 +897,84 @@ story_blocks() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# Story — Extension dependency. coldfront.control declares
+# requires = 'pg_duckdb', so on a database without pg_duckdb, CREATE EXTENSION
+# coldfront is rejected up front ("required extension ... is not installed")
+# instead of failing later at runtime with schema "duckdb" not existing. Use a
+# throwaway database and drop pg_duckdb to guarantee its absence regardless of
+# what template1 carries.
+# ───────────────────────────────────────────────────────────────────────────
+story_ext_requires() {
+    step "Extension dependency: CREATE EXTENSION coldfront without pg_duckdb is rejected"
+    q "$HOST" "DROP DATABASE IF EXISTS cf_dep_check;"
+    q "$HOST" "CREATE DATABASE cf_dep_check;"
+    docker exec -e PGUSER="$CF_DBUSER" -e PGDATABASE=cf_dep_check "$HOST" "$CF_PSQL" -tA \
+        -c "DROP EXTENSION IF EXISTS pg_duckdb CASCADE;" >/dev/null 2>&1 || true
+    assert_err "missing pg_duckdb rejected at CREATE EXTENSION" "required extension" \
+        "$(docker exec -e PGUSER="$CF_DBUSER" -e PGDATABASE=cf_dep_check "$HOST" "$CF_PSQL" -tA \
+            -c "CREATE EXTENSION coldfront;" 2>&1 || true)"
+    q "$HOST" "DROP DATABASE cf_dep_check;"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story — Packaging: load the bundled .duckdb_extension files from a custom
+# duckdb.extension_directory. The Docker image places them under the DEFAULT
+# dir ($PGDATA/pg_duckdb/extensions); an RPM/DEB can't write PGDATA, so it
+# installs them under <dir>/<ver>/<platform>/ and points the GUC at <dir>.
+# This proves pg_duckdb honours that GUC (so the packaging path is supported),
+# with an empty-dir negative control so it can't pass via the default dir.
+# ───────────────────────────────────────────────────────────────────────────
+story_ext_directory_guc() {
+    step "Packaging: pg_duckdb loads extensions from a custom duckdb.extension_directory"
+    # duckdb.extension_directory is read at server start, so this applies it via a
+    # restart. Skip in mesh, where a mid-journey node restart would churn spock;
+    # the GUC behaviour is mode-independent, so the single-node run covers it.
+    if [ "$MESH" = 1 ]; then pass "extension_directory check skipped in mesh (single-node)"; return; fi
+    # Build the package-style layout in a writable, restart-persistent place
+    # (under the data dir, postgres-owned) by cloning the working default
+    # extension tree — it already has the correct <version>/<platform> subdirs.
+    # cfpkg = populated (the "package installed it here" case), cfpkg-empty =
+    # negative control.
+    local pgdata
+    pgdata="$(q "$HOST" "SHOW data_directory;" | tail -1)"
+    docker exec "$HOST" bash -c "rm -rf '$pgdata/cfpkg' '$pgdata/cfpkg-empty'; cp -a '$pgdata/pg_duckdb/extensions' '$pgdata/cfpkg'; mkdir -p '$pgdata/cfpkg-empty'"
+
+    _cf_wait_pg() {
+        local i=0
+        until docker exec -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" "$HOST" "$CF_PSQL" -tAc 'SELECT 1' >/dev/null 2>&1; do
+            i=$((i + 1)); [ "$i" -gt 60 ] && { fail "postgres did not come back after restart"; return 1; }; sleep 1
+        done
+    }
+
+    # Disable autoinstall: with it on, an empty dir is masked by DuckDB
+    # downloading the (unpatched) upstream extension. A package must ship our
+    # patched files and not silently fetch upstream, so the test mirrors that.
+    q "$HOST" "ALTER SYSTEM SET duckdb.autoinstall_known_extensions = false;"
+    # Negative control: empty package dir -> LOAD iceberg must FAIL, proving the
+    # GUC actually redirects (the default dir is not used as a fallback).
+    q "$HOST" "ALTER SYSTEM SET duckdb.extension_directory = '$pgdata/cfpkg-empty';"
+    docker restart "$HOST" >/dev/null; _cf_wait_pg || return
+    case "$(q_may "$HOST" "SELECT duckdb.raw_query('LOAD iceberg');")" in
+        *Success*) fail "empty extension_directory: LOAD iceberg unexpectedly succeeded" ;;
+        *)         pass "empty extension_directory: LOAD iceberg fails (GUC redirects; no autoinstall)" ;;
+    esac
+
+    # Positive: populated package dir -> LOAD iceberg must succeed.
+    q "$HOST" "ALTER SYSTEM SET duckdb.extension_directory = '$pgdata/cfpkg';"
+    docker restart "$HOST" >/dev/null; _cf_wait_pg || return
+    local out; out="$(q_may "$HOST" "SELECT duckdb.raw_query('LOAD iceberg');")"
+    case "$out" in
+        *Success*) pass "populated extension_directory: LOAD iceberg succeeds" ;;
+        *)         fail "populated extension_directory: LOAD iceberg did not succeed — $out" ;;
+    esac
+
+    # Restore image defaults so later stories load from $PGDATA as usual.
+    q "$HOST" "ALTER SYSTEM RESET duckdb.extension_directory;"
+    q "$HOST" "ALTER SYSTEM RESET duckdb.autoinstall_known_extensions;"
+    docker restart "$HOST" >/dev/null; _cf_wait_pg || return
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Story 9 — Concurrency / no-409: writes that race the archive cycle survive.
 # The m1 (now-1mo) partition is still hot after the first cycle (cutoff = start
 # of now-1mo). A second cycle with the cutoff pinned PAST the start of the
@@ -970,6 +1135,45 @@ story_mesh() {
         "$(cat /tmp/journey-ra.* 2>/dev/null | grep -cEi 'error|conflict|409')"
     assert_eq "concurrent cross-node cold writers both landed (R-A bakery, no 409)" "2" "$(q "$HOST" "SELECT count(*) FROM iceonly WHERE status='ra';")"
     rm -f /tmp/journey-ra.* 2>/dev/null
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story 12b — MULTIPLE concurrent cold writers PER NODE, on >=2 nodes, to the
+# SAME iceberg table. Unlike story_mesh (1 writer/node), this leaves >1
+# same-node claim outstanding per node at once; the node-local advisory lock in
+# _claim_iceberg_lock serializes them so the cross-node bakery sees one claim
+# per node and no commit hits a Lakekeeper 409.
+# ───────────────────────────────────────────────────────────────────────────
+story_mesh_multiwriter() {
+    step "12b. Mesh: multiple cold writers PER NODE, cross-node, same table"
+    local PARR; read -ra PARR <<< "$PEERS"
+    [ "${#PARR[@]}" -ge 1 ] || { fail "mesh: no --peers given"; return; }
+    local p1="${PARR[0]}" N=5 k pids=() tbl
+    [ "$MODE" = tiered ] && tbl=events || tbl=iceonly
+    rm -f /tmp/journey-mw.* 2>/dev/null
+    # Fire N writers on db1 AND N on the peer, all at once, all cold-routed to the
+    # same table: decoupled writes straight to iceonly, tiered writes a cold-dated
+    # row to events (ts before the cutoff, so it lands in the cold tier).
+    for k in $(seq 1 "$N"); do
+        local a b
+        if [ "$MODE" = tiered ]; then
+            a="INSERT INTO events (ts,status,data) VALUES (date_trunc('month',now()) - interval '4 months' + interval '$k days','mw','{}');"
+            b="INSERT INTO events (ts,status,data) VALUES (date_trunc('month',now()) - interval '4 months' + interval '$k days 12 hours','mw','{}');"
+        else
+            a="INSERT INTO iceonly VALUES ($((7000+k)),date_trunc('month',now()) + interval '3 months' + interval '$k hours','mw','{}');"
+            b="INSERT INTO iceonly VALUES ($((8000+k)),date_trunc('month',now()) + interval '3 months' + interval '$k hours 30 minutes','mw','{}');"
+        fi
+        q "$HOST" "$a" >"/tmp/journey-mw.a$k" 2>&1 &
+        pids+=("$!")
+        q "$p1"   "$b" >"/tmp/journey-mw.b$k" 2>&1 &
+        pids+=("$!")
+    done
+    for k in "${pids[@]}"; do wait "$k"; done
+    assert_eq "no multi-writer-per-node cross-node cold writer errored (no 409)" "0" \
+        "$(cat /tmp/journey-mw.* 2>/dev/null | grep -cEi 'error|conflict|409')"
+    assert_eq "all $((2 * N)) multi-writer-per-node cross-node cold writes landed" "$((2 * N))" \
+        "$(q "$HOST" "SELECT count(*) FROM $tbl WHERE status='mw';")"
+    rm -f /tmp/journey-mw.* 2>/dev/null
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -1479,14 +1683,14 @@ story_partitioner_idmode() {
 
 # ───────────────────────────────────────────────────────────────────────────
 # Story — partitioner: TWO independent flat tables in the SAME schema (the real-
-# world case — issue #11). Before the table-scoped-naming fix both tables
+# world case). Before the table-scoped-naming fix both tables
 # generated the same leaf names (p_YYYY_MM); the second's CREATE … IF NOT EXISTS
 # silently no-op'd, leaving it partition-less while the run still reported
 # success. Assert BOTH tables get their own (table-scoped) partitions, the leaf
 # names are prefixed per table, and a fresh row lands in each.
 # ───────────────────────────────────────────────────────────────────────────
 story_partitioner_multitable() {
-    step "Partitioner multi-table: two flat tables, one schema, both partitioned (issue #11)"
+    step "Partitioner multi-table: two flat tables, one schema, both partitioned"
     local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
     printf 'postgres: { dsn: "%s" }\n' "$dsn" > /tmp/journey-mt.yaml
     q "$HOST" "CREATE SCHEMA IF NOT EXISTS mt;
@@ -1516,26 +1720,26 @@ story_partitioner_multitable() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────
-# Story — issue #12: after the archiver's first-run swap (events → _events, with
+# Story — after the archiver's first-run swap (events → _events, with
 # a unified view left in events' place) the standalone partitioner must premake
 # against the real partitioned table (_events), not the view. The configured /
 # registered source name is still "events"; reconcileTable resolves it to the
 # "_"+name partitioned relation before building the spec. Pre-fix the partitioner
-# targeted the view and aborted on the issue #11 verify-attach guard ("not
+# targeted the view and aborted on the verify-attach guard ("not
 # attached … different parent"); post-fix it premakes the forward window straight
 # onto _events.
 # ───────────────────────────────────────────────────────────────────────────
 story_partitioner_after_swap() {
-    step "Partitioner after first-run swap: premakes onto _events, not the view (issue #12)"
+    step "Partitioner after first-run swap: premakes onto _events, not the view"
     # Precondition (set up by story_provision_tiered): events is a VIEW now and
     # _events is the partitioned hot table.
-    assert_eq "issue #12: precondition — events is a view"       "v" "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='events'  AND relnamespace='public'::regnamespace;")"
-    assert_eq "issue #12: precondition — _events is partitioned" "p" "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='_events' AND relnamespace='public'::regnamespace;")"
+    assert_eq "precondition — events is a view"       "v" "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='events'  AND relnamespace='public'::regnamespace;")"
+    assert_eq "precondition — _events is partitioned" "p" "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='_events' AND relnamespace='public'::regnamespace;")"
     local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
     # Drive the partitioner off the post-swap source name "events" with a wide
     # future window (6) so it premakes months the archiver (premake 3) did not —
     # proving it acted on _events. retention 60 months drops nothing.
-    cat > /tmp/journey-issue12.yaml <<EOF
+    cat > /tmp/journey-partitioner.yaml <<EOF
 postgres:
   dsn: "${dsn}"
 archiver:
@@ -1545,30 +1749,30 @@ archiver:
       retention_period: "60 months"
       future_partitions: 6
 EOF
-    if ! "$PARTITIONER" --config /tmp/journey-issue12.yaml >/tmp/journey-issue12.log 2>&1; then
-        fail "issue #12: partitioner run failed (pre-fix it targets the view)"; tail -8 /tmp/journey-issue12.log; return
+    if ! "$PARTITIONER" --config /tmp/journey-partitioner.yaml >/tmp/journey-partitioner.log 2>&1; then
+        fail "partitioner run failed"; tail -8 /tmp/journey-partitioner.log; return
     fi
-    # The fix resolves events → _events, so the reconcile is logged against _events.
-    if grep -q "\[_events\] reconciled" /tmp/journey-issue12.log; then
-        pass "issue #12: partitioner reconciled _events (resolved past the view)"
+    # The partitioner resolves events → _events, so the reconcile is logged against _events.
+    if grep -q "\[_events\] reconciled" /tmp/journey-partitioner.log; then
+        pass "partitioner reconciled _events (resolved past the view)"
     else
-        fail "issue #12: reconcile did not target _events"; tail -8 /tmp/journey-issue12.log
+        fail "reconcile did not target _events"; tail -8 /tmp/journey-partitioner.log
     fi
-    # And it never trips the verify-attach guard that the pre-fix view target hits.
-    if grep -q "different parent" /tmp/journey-issue12.log; then
-        fail "issue #12: partitioner tripped the verify-attach guard (still targeting the view)"; tail -8 /tmp/journey-issue12.log
+    # And it never trips the verify-attach guard that targeting the view would hit.
+    if grep -q "different parent" /tmp/journey-partitioner.log; then
+        fail "partitioner tripped the verify-attach guard (still targeting the view)"; tail -8 /tmp/journey-partitioner.log
     else
-        pass "issue #12: no verify-attach error (did not touch the view)"
+        pass "no verify-attach error (did not touch the view)"
     fi
     # Behavioral proof: the +5-month leaf (beyond the archiver's premake window) is
     # attached to _events, the real partitioned table — not orphaned or erroring.
     local fut; fut="events_p_$(date -u -d "$(date -u +%Y-%m-01) +5 months" +%Y_%m)"
-    assert_eq "issue #12: +5mo leaf $fut premade onto _events" "1" \
+    assert_eq "+5mo leaf $fut premade onto _events" "1" \
         "$(q "$HOST" "SELECT count(*) FROM pg_inherits i JOIN pg_class c ON c.oid=i.inhrelid WHERE i.inhparent='public._events'::regclass AND c.relname='$fut';")"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
-# Story — issue #14: coldfront.partition_config is ONE shared table holding both
+# Story — coldfront.partition_config is ONE shared table holding both
 # archiver-owned (tiered: hot_period set) and partitioner-owned (partition-only:
 # hot_period NULL) rows. Each binary must load only the rows it owns, scoped in
 # SQL by hot_period. Pre-fix the shared loader took every enabled row, so the
@@ -1580,7 +1784,7 @@ EOF
 # idmode_check) and the cleanup keeps the shared config clean for later stories.
 # ───────────────────────────────────────────────────────────────────────────
 story_partition_config_ownership() {
-    step "Shared partition_config: each binary loads only the rows it owns (issue #14)"
+    step "Shared partition_config: each binary loads only the rows it owns"
     local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
     q "$HOST" "CREATE SCHEMA IF NOT EXISTS own;
                CREATE TABLE IF NOT EXISTS own.po  (id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL, PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);
@@ -1592,26 +1796,26 @@ story_partition_config_ownership() {
     # so we assert per-table ownership, NOT an absolute "loaded N" count).
     "$PARTITIONER" register --dsn "$dsn" --schema own --table po   --period monthly --retention "60 months" >/tmp/journey-own-po-reg.log   2>&1
     "$ARCHIVER"    register --dsn "$dsn" --schema own --table tier --period monthly --hot-period "1 month" --retention "60 months" >/tmp/journey-own-tier-reg.log 2>&1
-    assert_eq "issue #14: partition-only row owned by partitioner (hot_period NULL)" "1" \
+    assert_eq "partition-only row owned by partitioner (hot_period NULL)" "1" \
         "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE schema_name='own' AND table_name='po'   AND hot_period IS NULL;")"
-    assert_eq "issue #14: tiered row owned by archiver (hot_period set)"             "1" \
+    assert_eq "tiered row owned by archiver (hot_period set)"             "1" \
         "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE schema_name='own' AND table_name='tier' AND hot_period IS NOT NULL;")"
 
     # Archiver run: processes its tiered row (own.tier), never the partitioner's
     # partition-only row (own.po), and no longer aborts on a foreign row.
     "$ARCHIVER" --config /tmp/journey-archiver.yaml >/tmp/journey-own-arch.log 2>&1 || true
     if grep -q "hot_period is required in tiered mode" /tmp/journey-own-arch.log; then
-        fail "issue #14: archiver still choked on the partition-only row"; tail -5 /tmp/journey-own-arch.log
+        fail "archiver still choked on the partition-only row"; tail -5 /tmp/journey-own-arch.log
     else
-        pass "issue #14: archiver did not choke on the partition-only row"
+        pass "archiver did not choke on the partition-only row"
     fi
     # Per-table logs use the bare source-table name ([tier] / [po]); own.tier and
     # own.po are unique here so the substrings are unambiguous.
-    assert_contains "issue #14: archiver processed its own tiered table" "[tier]" "$(cat /tmp/journey-own-arch.log)"
+    assert_contains "archiver processed its own tiered table" "[tier]" "$(cat /tmp/journey-own-arch.log)"
     if grep -q "\[po\]" /tmp/journey-own-arch.log; then
-        fail "issue #14: archiver touched the partitioner's row (po)"; tail -5 /tmp/journey-own-arch.log
+        fail "archiver touched the partitioner's row (po)"; tail -5 /tmp/journey-own-arch.log
     else
-        pass "issue #14: archiver ignored the partitioner's row (po)"
+        pass "archiver ignored the partitioner's row (po)"
     fi
 
     # Partitioner run: reconciles its partition-only row (own.po), never the
@@ -1619,15 +1823,15 @@ story_partition_config_ownership() {
     printf 'postgres: { dsn: "%s" }\n' "$dsn" > /tmp/journey-own-part.yaml
     "$PARTITIONER" --config /tmp/journey-own-part.yaml >/tmp/journey-own-part.log 2>&1 || true
     if grep -q "only valid in tiered mode" /tmp/journey-own-part.log; then
-        fail "issue #14: partitioner still choked on the tiered row"; tail -5 /tmp/journey-own-part.log
+        fail "partitioner still choked on the tiered row"; tail -5 /tmp/journey-own-part.log
     else
-        pass "issue #14: partitioner did not choke on the tiered row"
+        pass "partitioner did not choke on the tiered row"
     fi
-    assert_contains "issue #14: partitioner reconciled its own partition-only table" "[po] reconciled" "$(cat /tmp/journey-own-part.log)"
+    assert_contains "partitioner reconciled its own partition-only table" "[po] reconciled" "$(cat /tmp/journey-own-part.log)"
     if grep -q "\[tier\]" /tmp/journey-own-part.log; then
-        fail "issue #14: partitioner touched the archiver's row (tier)"; tail -5 /tmp/journey-own-part.log
+        fail "partitioner touched the archiver's row (tier)"; tail -5 /tmp/journey-own-part.log
     else
-        pass "issue #14: partitioner ignored the archiver's row (tier)"
+        pass "partitioner ignored the archiver's row (tier)"
     fi
 
     # Clean up so the SHARED coldfront.partition_config stays clean for later stories.
@@ -1694,6 +1898,8 @@ if [ "$MODE" = "tiered" ]; then
     story_mixed_concurrency
     story_ddl
     story_blocks
+    story_ext_requires
+    story_ext_directory_guc
     story_concurrency
     story_concurrent_writers
     story_txn
@@ -1704,7 +1910,7 @@ if [ "$MODE" = "tiered" ]; then
     story_partitioner_multitable
     story_partitioner_after_swap
     story_register_cli
-    story_partition_config_ownership   # issue #14: each binary loads only its own rows
+    story_partition_config_ownership   # each binary loads only its own rows
 else
     story_provision_decoupled
     story_decoupled_crud
@@ -1713,6 +1919,7 @@ else
     story_decoupled_ryw
 fi
 [ "$MESH" = 1 ] && [ "$MODE" = decoupled ] && story_mesh   # tiered+mesh runs story_mesh_tiered (above)
+[ "$MESH" = 1 ] && story_mesh_multiwriter   # >1 cold writer/node cross-node (tiered: events, decoupled: iceonly)
 [ -n "$STANDBY" ]    && story_standby_reads
 
 summary

@@ -32,16 +32,20 @@
 
 #include "postgres.h"
 
+#include <ctype.h>
+
 #include "access/attnum.h"
 #include "access/xact.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_type_d.h"
+#include "executor/executor.h"
 #include "executor/spi.h"
 #include "lib/stringinfo.h"
 #include "nodes/parsenodes.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/pg_list.h"
+#include "optimizer/optimizer.h"
 #include "parser/analyze.h"
 #include "tcop/tcopprot.h"
 #include "tcop/utility.h"
@@ -49,6 +53,7 @@
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/regproc.h"
 #include "utils/ruleutils.h"
 #include "utils/timestamp.h"
 #include "fmgr.h"
@@ -63,9 +68,8 @@ static bool coldfront_in_rewrite = false;
  * Cold-tier DML from inside plpgsql — the two problems and how this file
  * solves them. (Background for the param + dummy-table machinery below.)
  *
- * Cold DML works fine as a top-level statement but used to fail when issued
- * from inside a plpgsql function / DO block / trigger, for TWO independent
- * reasons:
+ * Cold DML works as a top-level statement, but from inside a plpgsql function /
+ * DO block / trigger it faces TWO independent problems:
  *
  *   (1) Bound parameters. plpgsql (and any client using bind params / PREPARE
  *       / the extended protocol) compiles variable references into $N
@@ -73,12 +77,12 @@ static bool coldfront_in_rewrite = false;
  *       which is exactly when this hook runs (there is no executor hook). The
  *       deparser emits those $N as literal text, so the cold SQL handed to
  *       duckdb.raw_query carried "$N" with nothing to bind -> DuckDB error
- *       "Expected N parameters, but none were supplied". FIX: keep the params
- *       LIVE — emit the cold SQL as a runtime format(<template>, $1, $2, ...)
- *       call (cold_sql_arg) and declare the param types on the re-parse, so PG
- *       binds the values at execution and DuckDB only ever sees finished
- *       literals. This applies EVERYWHERE (top level and plpgsql) and needs no
- *       table.
+ *       "Expected N parameters, but none were supplied". The hook keeps the
+ *       params LIVE — it emits the cold SQL as a runtime
+ *       format(<template>, $1, $2, ...) call (cold_sql_arg) and declares the
+ *       param types on the re-parse, so PG binds the values at execution and
+ *       DuckDB only ever sees finished literals. This applies EVERYWHERE (top
+ *       level and plpgsql) and needs no table.
  *
  *   (2) Statement shape. The cold rewrite is a row-returning
  *       `SELECT coldfront._exec_iceberg_with_claim(...)`. At top level the
@@ -89,11 +93,11 @@ static bool coldfront_in_rewrite = false;
  *       (those are plpgsql source constructs, fixed before this hook runs and
  *       unreachable from it), and the cold "table" is a DuckDB-attached object,
  *       not a PG relation, so PG can't tag a real UPDATE/DELETE against it.
- *       FIX (only where needed): when — and only when — this statement is being
- *       parsed inside plpgsql, wrap the cold call as a DML over the dummy
- *       carrier coldfront._dummy_dml_target (see cold_anchor_update + that
- *       table's comment in coldfront--1.0.sql). At top level we keep today's
- *       SELECT shape byte-for-byte, so nothing there changes.
+ *       Handled only where needed: when — and only when — this statement is
+ *       parsed inside plpgsql, the hook wraps the cold call as a DML over the
+ *       dummy carrier coldfront._dummy_dml_target (see cold_anchor_update + that
+ *       table's comment in coldfront--1.0.sql). At top level the SELECT shape is
+ *       kept byte-for-byte.
  *
  * Detecting "are we inside plpgsql?" without interfering with anything: when
  * plpgsql parses one of its statements it installs p_post_columnref_hook on the
@@ -111,7 +115,7 @@ static bool coldfront_in_rewrite = false;
  * block / PREPARE / the extended protocol. Their VALUES are unknown at
  * parse-analyze (they bind only at execution), so the cold SQL keeps the $N
  * live and renders them via format() at run time (see cold_sql_arg). maxid==0
- * means there are none (the path is then byte-identical to the old literal).
+ * means there are none (the path is then byte-identical to the plain literal path).
  */
 #define COLDFRONT_MAX_PARAMS 1024       /* plpgsql dno+1; far above any real arity */
 typedef struct ColdParamSet
@@ -186,9 +190,9 @@ static int  coldfront_cold_write_batch_size = 10000;
  * DEFINER (they must run elevated so the side-loaded iceberg/postgres
  * extensions load past pg_duckdb's non-superuser LocalFileSystem block), so a
  * non-superuser must NOT be able to redirect the elevated ATTACH at an
- * attacker endpoint. Defining these formally as PGC_SUSET (vs. the bare
- * placeholders they used to be) makes them settable only by superusers / roles
- * granted SET on them — operators still set them in postgresql.conf, where they
+ * attacker endpoint. Defining these formally as PGC_SUSET makes them settable
+ * only by superusers / roles granted SET on them — operators still set them in
+ * postgresql.conf, where they
  * ride physical replication unchanged. local_pg_dsn is GUC_SUPERUSER_ONLY too:
  * it can carry libpq credentials, so non-superusers must not read it back.
  * The values are read SQL-side via current_setting(); these backing vars exist
@@ -372,13 +376,73 @@ count_tiered_view_refs(Query *query, Oid view_oid)
 
 /* ---------- tier classification --------------------------------------- */
 
+/* True if `node` contains a Param or SubLink — neither can be evaluated as a
+ * standalone scalar, so eval_partition_bound declines such operands. */
+static bool
+bound_noneval_walker(Node *node, void *ctx)
+{
+    if (node == NULL)
+        return false;
+    if (IsA(node, Param) || IsA(node, SubLink))
+    {
+        *((bool *) ctx) = true;
+        return true;
+    }
+    return expression_tree_walker(node, bound_noneval_walker, ctx);
+}
+
+/*
+ * Resolve a partition-bound operand to a timestamptz value known at parse time.
+ * A literal Const yields its value directly. A non-Const operand is evaluated only
+ * when it is a self-contained, stable timestamptz expression — no Vars, params,
+ * sublinks, or volatile functions — so now()/CURRENT_* arithmetic (e.g.
+ * now() - interval '1 hour') folds to its transaction-fixed value and the
+ * predicate classifies to a single tier. Returns false (the caller treats it as
+ * TIER_AMBIGUOUS) for anything not pinnable now. timestamptz is pass-by-value, so
+ * the result outlives the throwaway executor state. The original expression stays
+ * in the Query for execution; only the tier decision reads this value.
+ */
+static bool
+eval_partition_bound(Node *node, TimestampTz *out)
+{
+    EState    *estate;
+    ExprState *exprstate;
+    Datum      d;
+    bool       isnull, bad = false;
+
+    if (IsA(node, Const))
+    {
+        Const *c = (Const *) node;
+        if (c->consttype != TIMESTAMPTZOID || c->constisnull)
+            return false;
+        *out = DatumGetTimestampTz(c->constvalue);
+        return true;
+    }
+
+    if (exprType(node) != TIMESTAMPTZOID || contain_var_clause(node) ||
+        contain_volatile_functions(node))
+        return false;
+    (void) bound_noneval_walker(node, &bad);
+    if (bad)
+        return false;
+
+    estate    = CreateExecutorState();
+    exprstate = ExecPrepareExpr((Expr *) node, estate);
+    d         = ExecEvalExprSwitchContext(exprstate,
+                                          GetPerTupleExprContext(estate), &isnull);
+    FreeExecutorState(estate);
+    if (isnull)
+        return false;
+    *out = DatumGetTimestampTz(d);
+    return true;
+}
+
 /*
  * Walk a qual node and return which tier the matching rows belong to.
  *
- * We handle direct comparisons of the partition column Var against a
- * timestamptz Const, and AND combinations thereof.  Anything else is
- * TIER_AMBIGUOUS — the hook errors on that rather than splitting a write
- * across tiers non-atomically.
+ * We handle direct comparisons of the partition column Var against a timestamptz
+ * value — a literal Const or a stable expression resolved by eval_partition_bound
+ * — and AND/OR combinations thereof.  Anything else is TIER_AMBIGUOUS.
  *
  * Tier boundary:  ts <  cutoff → cold,  ts >= cutoff → hot.
  */
@@ -387,9 +451,8 @@ classify_qual(Node *qual, Index result_rel, AttrNumber partcol_attno,
               TimestampTz cutoff)
 {
     OpExpr     *op;
-    Node       *a, *b;
+    Node       *a, *b, *other;
     Var        *var;
-    Const      *con;
     bool        var_left;
     char       *opname;
     TimestampTz val;
@@ -500,13 +563,13 @@ classify_qual(Node *qual, Index result_rel, AttrNumber partcol_attno,
     a = (Node *) linitial(op->args);
     b = (Node *) lsecond(op->args);
 
-    if (IsA(a, Var) && IsA(b, Const))
+    if (IsA(a, Var))
     {
-        var = (Var *) a; con = (Const *) b; var_left = true;
+        var = (Var *) a; other = b; var_left = true;
     }
-    else if (IsA(a, Const) && IsA(b, Var))
+    else if (IsA(b, Var))
     {
-        con = (Const *) a; var = (Var *) b; var_left = false;
+        var = (Var *) b; other = a; var_left = false;
     }
     else
         return TIER_AMBIGUOUS;
@@ -514,10 +577,13 @@ classify_qual(Node *qual, Index result_rel, AttrNumber partcol_attno,
     /* Only the partition column of the target relation matters */
     if ((Index) var->varno != result_rel || var->varattno != partcol_attno)
         return TIER_AMBIGUOUS;
-    if (con->consttype != TIMESTAMPTZOID || con->constisnull)
+
+    /* The bound must be a timestamptz value known now: a literal, or a stable
+     * expression (e.g. now() - interval '1 hour') we evaluate to its
+     * transaction-fixed value. Anything else stays TIER_AMBIGUOUS. */
+    if (!eval_partition_bound(other, &val))
         return TIER_AMBIGUOUS;
 
-    val    = DatumGetTimestampTz(con->constvalue);
     opname = get_opname(op->opno);
     if (!opname)
         return TIER_AMBIGUOUS;
@@ -577,44 +643,55 @@ classify_tier(Query *query, TieredViewInfo *info)
 
 /* ---------- string helpers -------------------------------------------- */
 
+typedef struct { const char *pg; const char *duck; } CfSubst;
+
 /*
- * Rewrite PG-specific spellings in a deparsed SQL string into the
- * DuckDB-compatible equivalents that DuckDB will accept inside a
- * `duckdb.raw_query()` argument.  Two flavours of substitution:
- *
- *   1. Type casts.  PG's deparser emits "::timestamp with time zone",
- *      "::character varying", "::jsonb" etc., which DuckDB rejects.
- *      Map them to DuckDB's single-word names. `::jsonb` → `::json`
- *      because DuckDB has no jsonb type — coldfront's iceberg storage
- *      for jsonb columns is VARCHAR anyway, and the wrapper view casts
- *      back to json on read.
- *
- *   2. Function names.  PG's jsonb_* family doesn't exist in DuckDB,
- *      but the json_* family is the direct equivalent. Match the
- *      function name plus the opening "(" so a column or alias that
- *      happens to share a prefix doesn't false-match.
- *
- * Returns a palloc'd result. Quote-aware: skips substitution while
- * inside a single-quoted string literal or a double-quoted identifier,
- * so user text and identifiers are preserved verbatim. Embedded ''
- * and "" escapes inside a literal/identifier stay inside it.
+ * Cold-WRITE substitutions. The deparsed cold DML is handed to DuckDB inside a
+ * duckdb.raw_query() string, so DuckDB-only spellings are fine. Multi-word PG
+ * casts map to DuckDB's single-word names, and the boundary-aware jsonb→json
+ * catch-all (cf_apply_subst's jsonb_catchall arm) maps every other jsonb token —
+ * ::jsonb, jsonb_set, jsonb_extract_path, … — to its json_<rest> form. The few
+ * whose DuckDB name is not json_<rest> are listed here, matched with the opening
+ * paren so a column prefix can't false-match. A result DuckDB lacks (e.g.
+ * json_set) errors in DuckDB — its boundary, not a rewrite coldfront withholds.
+ */
+static const CfSubst cf_write_subst[] = {
+    { "::timestamp with time zone",    "::timestamptz" },
+    { "::timestamp without time zone", "::timestamp"   },
+    { "::character varying",           "::varchar"     },
+    { "::double precision",            "::double"      },
+    { "jsonb_build_object(",           "json_object("  },
+    { "jsonb_build_array(",            "json_array("   },
+    { "to_jsonb(",                     "to_json("      },
+};
+
+/*
+ * Tiered-READ substitutions. A rewritten SELECT is reparsed by PG and then planned
+ * by DuckDB, so a translation must be valid in BOTH engines — which rules out the
+ * write path's blanket catch-all. Only the jsonb type cast and the functions
+ * verified identical in PG and DuckDB are translated; every other jsonb spelling is
+ * left untouched, so DuckDB rejects it with a clear "… does not exist" (a documented
+ * read limitation). Blanket-mapping would break two ways: jsonb_path_query →
+ * json_path_query fails PG reparse (PG has no json_path_query), and
+ * json_extract_path_text / json_type are signature- or vocabulary-incompatible in
+ * DuckDB (array result; UBIGINT/VARCHAR vs number/string). json_array_length is
+ * verified identical ([10,20,30]→3, []→0) and exists in both.
+ */
+static const CfSubst cf_read_subst[] = {
+    { "::jsonb",             "::json"             },
+    { "jsonb_array_length(", "json_array_length(" },
+};
+
+/*
+ * Rewrite a deparsed SQL string token-by-token using `map`, optionally followed by
+ * the boundary-aware jsonb→json catch-all. Returns a palloc'd result. Quote-aware:
+ * skips substitution inside a single-quoted literal or double-quoted identifier, so
+ * user text and identifiers are preserved verbatim; embedded '' and "" escapes stay
+ * inside their literal/identifier.
  */
 static char *
-normalize_casts_for_duckdb(const char *sql)
+cf_apply_subst(const char *sql, const CfSubst *map, int map_len, bool jsonb_catchall)
 {
-    static const struct { const char *pg; const char *duck; } map[] = {
-        /* type casts */
-        { "::timestamp with time zone",    "::timestamptz" },
-        { "::timestamp without time zone", "::timestamp"   },
-        { "::character varying",           "::varchar"     },
-        { "::double precision",            "::double"      },
-        { "::jsonb",                       "::json"        },
-        /* function-name spellings (matched with opening paren so a
-         * column/alias prefix can't false-match) */
-        { "jsonb_build_object(",           "json_object("  },
-        { "jsonb_build_array(",            "json_array("   },
-        { "to_jsonb(",                     "to_json("      },
-    };
     StringInfoData buf;
     const char    *p         = sql;
     bool           in_quote  = false;
@@ -658,12 +735,12 @@ normalize_casts_for_duckdb(const char *sql)
             continue;
         }
 
-        /* Outside any quotes: look for a PG cast spelling to normalise. */
+        /* Outside any quotes: look for a spelling to substitute. */
         if (!in_quote && !in_dquote)
         {
             bool replaced = false;
             int  i;
-            for (i = 0; i < (int) lengthof(map); i++)
+            for (i = 0; i < map_len; i++)
             {
                 size_t plen = strlen(map[i].pg); /* nosemgrep */
                 if (strncmp(p, map[i].pg, plen) == 0)
@@ -676,11 +753,44 @@ normalize_casts_for_duckdb(const char *sql)
             }
             if (replaced)
                 continue;
+
+            /* Catch-all jsonb → json at an identifier boundary: rewrite the
+             * `jsonb` token when it is preceded by a non-identifier char and not
+             * followed by a letter/digit, so the cast and jsonb_* function names
+             * map while an embedded identifier (my_jsonb_col) is left intact. */
+            if (jsonb_catchall && strncmp(p, "jsonb", 5) == 0) /* nosemgrep */
+            {
+                char prev = (p == sql) ? ' ' : p[-1];
+                char next = p[5];
+                /* left edge not part of an identifier; right edge not a letter/
+                 * digit ('_' allowed, so jsonb_set maps to json_set). */
+                if (!(isalnum((unsigned char) prev) || prev == '_') &&
+                    !isalnum((unsigned char) next))
+                {
+                    appendStringInfoString(&buf, "json");
+                    p += 5;
+                    continue;
+                }
+            }
         }
 
         appendStringInfoChar(&buf, *p++);
     }
     return buf.data;
+}
+
+/* Cold-write path: full cast map + blanket jsonb→json (output goes to DuckDB). */
+static char *
+normalize_casts_for_duckdb(const char *sql)
+{
+    return cf_apply_subst(sql, cf_write_subst, lengthof(cf_write_subst), true);
+}
+
+/* Tiered-read path: whitelist only (output is reparsed by PG, then run by DuckDB). */
+static char *
+normalize_jsonb_for_read(const char *sql)
+{
+    return cf_apply_subst(sql, cf_read_subst, lengthof(cf_read_subst), false);
 }
 
 /* ---------- SQL builder ----------------------------------------------- */
@@ -698,27 +808,49 @@ normalize_casts_for_duckdb(const char *sql)
  */
 typedef struct {
     char       *orig_sql;   /* normalised, leading-whitespace-stripped */
+    size_t      head_len;   /* bytes before the verb: a leading WITH clause, else 0 */
     const char *rest;       /* points into orig_sql, past the prefix   */
-    const char *verb;       /* "UPDATE " or "DELETE FROM "             */
+    const char *verb;       /* "UPDATE " / "DELETE FROM " / "INSERT INTO " */
 } DeparseResult;
 
 /*
- * Run the deparsed-DML prefix-match ladder: try the unqualified prefix first,
- * then the schema-qualified one. Returns the matched prefix, or elogs the same
- * ERROR as before on no match.
+ * Locate the "VERB <relation> " prefix in the deparsed DML: the first occurrence
+ * outside any single-quoted string literal. A leading WITH clause puts the verb
+ * past offset 0, so this scans rather than anchoring at the start; the bytes
+ * before the match are that WITH preamble, which the builders carry through
+ * verbatim. cf_reject_multi_reference guarantees the result relation is named
+ * once, so the first out-of-literal hit is the statement's own target. Only one
+ * of the unqualified / schema-qualified spellings can match (the deparser emits
+ * one form). Returns the match start and sets *matched to the spelling found;
+ * elogs if neither is present.
  */
 static const char *
 find_dml_prefix(const char *orig_sql, const char *search_unqual,
-                const char *search_qual, const char *vname)
+                const char *search_qual, const char *vname,
+                const char **matched)
 {
-    if (strncmp(orig_sql, search_unqual, strlen(search_unqual)) == 0) /* nosemgrep */
-        return search_unqual;
-    else if (strncmp(orig_sql, search_qual, strlen(search_qual)) == 0) /* nosemgrep */
-        return search_qual;
+    size_t      lu = strlen(search_unqual); /* nosemgrep */
+    size_t      lq = strlen(search_qual);   /* nosemgrep */
+    const char *p;
+    bool        in_squote = false;
+
+    for (p = orig_sql; *p; p++)
+    {
+        if (*p == '\'')
+        {
+            in_squote = !in_squote;
+            continue;
+        }
+        if (in_squote)
+            continue;
+        if (strncmp(p, search_unqual, lu) == 0) { *matched = search_unqual; return p; } /* nosemgrep */
+        if (strncmp(p, search_qual,   lq) == 0) { *matched = search_qual;   return p; } /* nosemgrep */
+    }
 
     elog(ERROR,
-         "coldfront: cannot locate result relation \"%s\" at start of "
-         "deparsed DML: %s", vname, orig_sql);
+         "coldfront: cannot locate result relation \"%s\" in deparsed DML: %s",
+         vname, orig_sql);
+    *matched = NULL;
     return NULL; /* unreachable */
 }
 
@@ -728,7 +860,7 @@ deparse_and_find_prefix(Query *query, DeparseResult *dr)
     RangeTblEntry *rte;
     char          *vname, *ns;
     char           search_unqual[256], search_qual[256];
-    const char    *old_prefix;
+    const char    *matched, *at;
 
     dr->orig_sql = pg_get_querydef(query, false);
     {
@@ -772,9 +904,10 @@ deparse_and_find_prefix(Query *query, DeparseResult *dr)
         }
     }
 
-    old_prefix = find_dml_prefix(dr->orig_sql, search_unqual, search_qual, vname);
+    at = find_dml_prefix(dr->orig_sql, search_unqual, search_qual, vname, &matched);
 
-    dr->rest = dr->orig_sql + strlen(old_prefix); /* nosemgrep */
+    dr->head_len = (size_t) (at - dr->orig_sql);
+    dr->rest     = at + strlen(matched); /* nosemgrep */
 }
 
 /*
@@ -785,6 +918,7 @@ build_hot_dml(DeparseResult *dr, TieredViewInfo *info)
 {
     StringInfoData buf;
     initStringInfo(&buf);
+    appendBinaryStringInfo(&buf, dr->orig_sql, dr->head_len);  /* leading WITH, if any */
     appendStringInfo(&buf, "%s%s %s", dr->verb, info->hot_table, dr->rest);
     return buf.data;
 }
@@ -800,6 +934,7 @@ build_cold_dml(DeparseResult *dr, TieredViewInfo *info)
 {
     StringInfoData buf;
     initStringInfo(&buf);
+    appendBinaryStringInfo(&buf, dr->orig_sql, dr->head_len);  /* leading WITH, if any */
     appendStringInfo(&buf, "%s%s %s", dr->verb, info->iceberg_table, dr->rest);
     return normalize_casts_for_duckdb(buf.data);
 }
@@ -809,9 +944,8 @@ build_cold_dml(DeparseResult *dr, TieredViewInfo *info)
  * coldfront._exec_iceberg_with_claim(table, sql) — or _tiered_insert_cold's
  * source — receives.
  *
- * With no bound params (maxid==0) it is a plain quoted literal — BYTE-IDENTICAL
- * to the old behaviour, so the top-level/literal path is unchanged. With params
- * it is a format(<template>, $1, $2, ...) call: each out-of-literal $N becomes a
+ * With no bound params (maxid==0) it is a plain quoted literal. With params it
+ * is a format(<template>, $1, $2, ...) call: each out-of-literal $N becomes a
  * positional %P$L spec and stays LIVE as a format() arg, so PG binds the value
  * at execution and DuckDB only ever sees a finished literal. That is what lets
  * cold DML carry plpgsql / PREPARE / extended-protocol $N (Cause 1).
@@ -1008,12 +1142,13 @@ query_has_pg_source_table(Query *query)
  * with no local materialisation.
  *
  * We walk the Query's rtable, build the qualified `<schema>.<table>`
- * string for each non-result RTE_RELATION, and substitute every literal
+ * string for each non-result RTE_RELATION, and substitute every
  * occurrence in sql with `pglocal.<schema>.<table>`. The substitution is
- * textual; quote_identifier matches what pg_get_querydef emits, so the
- * search patterns line up exactly. False positives are theoretically
- * possible if a column or alias happens to match the qualified-name
- * literal — vanishingly rare in practice and we accept the risk.
+ * quote-aware: an occurrence inside a single-quoted string literal is user
+ * data, not a table reference, and is left untouched; a word-boundary check
+ * keeps a column or alias that merely shares the table's identifier from
+ * being rewritten. quote_identifier matches what pg_get_querydef emits, so
+ * the search patterns line up exactly.
  */
 /* Walk an rtable and collect every PG-table relid, recursing into
  * RTE_SUBQUERY (INSERT … SELECT wraps the SELECT side in a subquery). */
@@ -1041,6 +1176,21 @@ collect_pg_source_relids(List *rtable, int result_rel_idx, List *acc)
     return acc;
 }
 
+/* Track single-quote string-literal state across a copied span: each ' toggles it.
+ * A '' escape toggles twice (net no change), and no replacement target can sit
+ * between the two quotes of '', so the state is exact at every match position.
+ * Lets prefix_pg_tables_with_pglocal leave occurrences inside string literals
+ * untouched while still rewriting double-quoted table identifiers. */
+static bool
+span_toggles_squote(const char *from, const char *to, bool in_squote)
+{
+    const char *c;
+    for (c = from; c < to; c++)
+        if (*c == '\'')
+            in_squote = !in_squote;
+    return in_squote;
+}
+
 static char *
 prefix_pg_tables_with_pglocal(Query *query, char *sql)
 {
@@ -1055,6 +1205,7 @@ prefix_pg_tables_with_pglocal(Query *query, char *sql)
         StringInfoData buf;
         const char    *p, *match;
         size_t         qlen, blen;
+        bool           in_squote;
         char          *bare = NULL;
         const char    *q_n, *q_ns;
 
@@ -1068,14 +1219,21 @@ prefix_pg_tables_with_pglocal(Query *query, char *sql)
             bare = pstrdup(q_n);
         }
 
-        /* Pass 1: replace qualified `<schema>.<table>` occurrences. */
+        /* Pass 1: replace qualified `<schema>.<table>` occurrences that fall
+         * outside any single-quoted string literal (a qualified name inside a
+         * literal is user data, not a table reference). */
         qlen = strlen(qualified); /* nosemgrep */
         initStringInfo(&buf);
         p = sql;
+        in_squote = false;
         while ((match = strstr(p, qualified)) != NULL)
         {
+            in_squote = span_toggles_squote(p, match, in_squote);
             appendBinaryStringInfo(&buf, p, match - p);
-            appendStringInfoString(&buf, replacement);
+            if (in_squote)
+                appendBinaryStringInfo(&buf, match, qlen);  /* inside a literal — leave verbatim */
+            else
+                appendStringInfoString(&buf, replacement);
             p = match + qlen;
         }
         appendStringInfoString(&buf, p);
@@ -1090,6 +1248,7 @@ prefix_pg_tables_with_pglocal(Query *query, char *sql)
         blen = strlen(bare); /* nosemgrep */
         initStringInfo(&buf);
         p = sql;
+        in_squote = false;
         while ((match = strstr(p, bare)) != NULL)
         {
             char before = (match == sql) ? ' ' : match[-1];
@@ -1106,8 +1265,9 @@ prefix_pg_tables_with_pglocal(Query *query, char *sql)
                   (after  >= '0' && after  <= '9') ||
                   after  == '_' || after  == '$' ||
                   after  == '"');
+            in_squote = span_toggles_squote(p, match, in_squote);
             appendBinaryStringInfo(&buf, p, match - p);
-            if (wb_before && wb_after)
+            if (!in_squote && wb_before && wb_after)
                 appendStringInfoString(&buf, replacement);
             else
                 appendBinaryStringInfo(&buf, match, blen);
@@ -1663,6 +1823,19 @@ emit_tiered_insert(Query *query, TieredViewInfo *info, ColdParamSet *ps, bool in
     source     = skip_leading_collist(dr.rest);
     cutoff_lit = format_timestamptz_literal(info->cutoff);
 
+    /* A leading WITH clause (dr.head_len bytes, before "INSERT INTO <view> ") must
+     * reach both halves, which each read `source` inside a parenthesised derived
+     * table. Fold it into source so its CTEs scope to that subquery on each engine
+     * (PG hot, DuckDB cold) — no top-level WITH to merge. */
+    if (dr.head_len > 0)
+    {
+        StringInfoData sb;
+        initStringInfo(&sb);
+        appendBinaryStringInfo(&sb, dr.orig_sql, dr.head_len);
+        appendStringInfoString(&sb, source);
+        source = sb.data;
+    }
+
     {
         RangeTblEntry *rte = (RangeTblEntry *) list_nth(query->rtable,
                                                         query->resultRelation - 1);
@@ -1884,19 +2057,124 @@ cf_reparse_and_replace(Query *query, const char *new_sql, ColdParamSet *ps)
 }
 
 /*
- * Read path: lazily attach 'ice' on the first SELECT in this session that
- * touches a registered tiered view, so the view body's iceberg_scan('ice...')
- * resolves — the version-agnostic cold-read attach (PG 16/17/18). Guarded
- * once-per-session; the relkind check inside query_reads_tiered_view keeps
- * plain queries off the SPI path.
+ * Hot-tier read routing. When a SELECT's WHERE provably restricts to the hot tier
+ * (classify_qual → TIER_HOT: the predicate proves ts >= cutoff, and cold rows all
+ * have ts < cutoff), the rows it can return are exactly those the hot heap already
+ * holds. Re-point the tiered-view reference at that heap and reparse: the read then
+ * runs in plain PostgreSQL — full jsonb, no DuckDB round-trip — instead of pg_duckdb
+ * planning the whole iceberg_scan UNION in DuckDB. The reparse re-resolves column
+ * types (the view casts data::json; the heap is native jsonb).
+ *
+ * Conservative by construction — only the simple single-relation shape (no join, CTE,
+ * set-op, sub-link, or row-mark) and only a proven-HOT predicate reroute; anything
+ * spanning tiers or ambiguous keeps the view, so cold rows can never be dropped.
+ * Returns true if it rerouted (and replaced *query in place).
+ */
+static bool
+cf_try_reroute_hot_read(Query *query)
+{
+    RangeTblEntry *view_rte;
+    TieredViewInfo info;
+    AttrNumber     partcol_attno;
+    Oid            hot_oid;
+    char           hot_relkind;
+    Node          *quals;
+    Query         *clone;
+    RangeTblEntry *crte;
+    char          *sql;
+    ColdParamSet   ps;
+    RangeVar      *rv;
+    List          *names;
+
+    if (query->cteList || query->setOperations || query->hasSubLinks ||
+        query->rowMarks || list_length(query->rtable) != 1)
+        return false;
+
+    view_rte = (RangeTblEntry *) linitial(query->rtable);
+    if (view_rte->rtekind != RTE_RELATION ||
+        get_rel_relkind(view_rte->relid) != RELKIND_VIEW)
+        return false;
+    if (!lookup_tiered_view(view_rte->relid, get_rel_name(view_rte->relid), &info))
+        return false;
+    if (info.is_iceberg_only || !info.hot_table || !info.partition_col ||
+        !info.has_cutoff)
+        return false;
+
+    /* The predicate must prove the read touches only the hot tier. */
+    partcol_attno = get_attnum(view_rte->relid, info.partition_col);
+    if (partcol_attno == InvalidAttrNumber)
+        return false;
+    quals = (query->jointree) ? query->jointree->quals : NULL;
+    if (classify_qual(quals, 1, partcol_attno, info.cutoff) != TIER_HOT)
+        return false;
+
+    /* Resolve the hot heap (relname is a ready-to-use, possibly-quoted SQL name). */
+    names = stringToQualifiedNameList(info.hot_table
+#if PG_VERSION_NUM >= 160000
+                                      , NULL
+#endif
+                                      );
+    rv          = makeRangeVarFromNameList(names);
+    hot_oid     = RangeVarGetRelid(rv, NoLock, true);
+    hot_relkind = OidIsValid(hot_oid) ? get_rel_relkind(hot_oid) : '\0';
+    if (hot_relkind != RELKIND_RELATION && hot_relkind != RELKIND_PARTITIONED_TABLE)
+        return false;
+
+    /* Re-point the relation at the heap, deparse, and reparse in place so column
+     * types re-resolve and the query plans in plain PG. */
+    clone = copyObject(query);
+    crte  = (RangeTblEntry *) linitial(clone->rtable);
+    crte->relid       = hot_oid;
+    crte->relkind     = hot_relkind;
+    crte->rellockmode = AccessShareLock;
+    sql = pg_get_querydef(clone, false);
+
+    collect_cold_params(query, &ps);
+    cf_reparse_and_replace(query, sql, &ps);
+    return true;
+}
+
+/*
+ * jsonb → json on the read path. A query against a tiered / iceberg-only view runs
+ * entirely in DuckDB (the view body is an iceberg_scan UNION), and DuckDB has no
+ * jsonb type. Deparse, apply the read whitelist (normalize_jsonb_for_read: the
+ * ::jsonb cast and the functions verified equivalent in both engines), reparse in
+ * place. No whitelisted token ⇒ strcmp matches and the query is left untouched (the
+ * common case — ->>/-> operators and plain reads never reparse). jsonb spellings
+ * outside the whitelist pass through and DuckDB rejects them clearly (documented).
+ */
+static void
+cf_normalize_read_jsonb(Query *query)
+{
+    char         *sql  = pg_get_querydef(query, false);
+    char         *norm = normalize_jsonb_for_read(sql);
+    ColdParamSet  ps;
+
+    if (strcmp(sql, norm) == 0)  /* nosemgrep */
+        return;
+    collect_cold_params(query, &ps);
+    cf_reparse_and_replace(query, norm, &ps);
+}
+
+/*
+ * Read path for a SELECT that touches a registered tiered view. First try to
+ * reroute a provably-hot read to the heap (runs in plain PG). Otherwise the read
+ * spans the cold tier: lazily attach 'ice' (once per session) so the view body's
+ * iceberg_scan('ice...') resolves — the version-agnostic cold-read attach (PG
+ * 16/17/18) — and normalize the whitelisted jsonb spellings so DuckDB (which runs
+ * the whole view query) accepts them. The relkind check inside
+ * query_reads_tiered_view keeps plain queries off the SPI path.
  */
 static void
 cf_maybe_attach_for_read(Query *query)
 {
-    if (query->commandType == CMD_SELECT &&
-        !coldfront_ice_attached &&
-        query_reads_tiered_view(query))
+    if (query->commandType != CMD_SELECT || !query_reads_tiered_view(query))
+        return;
+    if (cf_try_reroute_hot_read(query))
+        return;   /* rewritten to the hot heap; runs in plain PostgreSQL */
+    if (!coldfront_ice_attached)
         ensure_ice_attached_once();
+    cf_normalize_read_jsonb(query);
 }
 
 /*
@@ -1961,49 +2239,212 @@ cf_reject_multi_reference(Query *query, RangeTblEntry *rte)
 }
 
 /*
- * Reject an UPDATE that assigns the partition column of a tiered view. Changing
- * the partition column can move the row across the hot/cold cutoff; the in-place
- * rewrite (hot, cold, or dual) updates the row where it already lives, so a moved
- * row stays physically in its old tier while the view's tier predicate
- * (ts >= cutoff / r[ts] < cutoff) filters it out — a silent disappearance
- * (GitHub #20). Relocating the row across tiers is a separate, unimplemented
- * feature; until then the partition column is read-only through the view. The
- * targetList here is post-parse-analyze, so it holds exactly the SET-assigned
- * columns (plus resjunk entries we skip) — not the full row. Blocks any assignment
- * regardless of the new value's tier or coldfront.allow_mixed_writes: with no move
- * to permit, allowing it would just reinstate the loss.
+ * The SET assignment for the partition column, if this UPDATE assigns it; else
+ * NULL. Changing the partition column can move the row across the hot/cold
+ * cutoff, so it gets special handling: a cross-tier MOVE when mixed writes are
+ * on, a clean rejection when off (the in-place rewrite would otherwise strand
+ * the row in its old tier where the view's tier predicate hides it). The
+ * targetList here is post-parse-analyze, so it holds exactly the
+ * SET-assigned columns (plus resjunk entries we skip) — not the full row.
  */
-static void
-cf_reject_partition_col_update(Query *query, RangeTblEntry *rte,
-                               TieredViewInfo *info)
+static TargetEntry *
+partcol_set_target(Query *query, RangeTblEntry *rte, TieredViewInfo *info)
 {
     AttrNumber  partcol_attno;
     ListCell   *lc;
 
     if (query->commandType != CMD_UPDATE || info->partition_col == NULL)
-        return;
+        return NULL;
 
     partcol_attno = get_attnum(rte->relid, info->partition_col);
     if (partcol_attno == InvalidAttrNumber)
-        return;
+        return NULL;
 
     foreach(lc, query->targetList)
     {
         TargetEntry *tle = (TargetEntry *) lfirst(lc);
+        if (!tle->resjunk && tle->resno == partcol_attno)
+            return tle;
+    }
+    return NULL;
+}
 
-        if (tle->resjunk)
-            continue;
-        if (tle->resno == partcol_attno)
+/*
+ * Strict-mode (coldfront.allow_mixed_writes = off) rejection of a partition-
+ * column SET: with mixed writes off there is no atomic cross-tier relocation to
+ * fall back on, so reject rather than strand the row. Message/hint are stable
+ * (golden: update_partition_key_blocked).
+ */
+static void
+reject_partition_col_update(TieredViewInfo *info, const char *vname)
+{
+    ereport(ERROR,
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+             errmsg("UPDATE of partition column \"%s\" on tiered view \"%s\" is not supported",
+                    info->partition_col, vname),
+             errhint("Changing \"%s\" can move the row across the hot/cold "
+                     "boundary; that relocation is not yet supported. To "
+                     "change \"%s\", delete the row and re-insert it with "
+                     "the new value.",
+                     info->partition_col, info->partition_col)));
+}
+
+/*
+ * Walker context: true if any Var references a column OTHER than the partition
+ * column (or a different range-table entry). The cross-tier move re-evaluates
+ * the new partition-column expression e in three places (the PG hot legs and the
+ * DuckDB cold legs) over different column spellings, so v1 supports only an e
+ * that references the partition column or constants — anything else is rejected
+ * cleanly upstream rather than mis-evaluated.
+ */
+typedef struct { Index result_rel; AttrNumber partcol_attno; bool other; } VarRefCtx;
+
+static bool
+expr_refs_other_col_walker(Node *node, void *ctx)
+{
+    VarRefCtx *c = (VarRefCtx *) ctx;
+    if (node == NULL)
+        return false;
+    if (IsA(node, Var))
+    {
+        Var *v = (Var *) node;
+        if ((Index) v->varno != c->result_rel || v->varattno != c->partcol_attno)
+            c->other = true;
+        return false;
+    }
+    return expression_tree_walker(node, expr_refs_other_col_walker, ctx);
+}
+
+
+/*
+ * Reject the cross-tier-move shapes v1 does not support, each with a stable
+ * message: cold RETURNING; a WHERE referencing other tables or sub-queries (the
+ * cold tier is read through DuckDB, which can't correlate with Postgres tables);
+ * bound params (e and WHERE are deparsed to literal text at parse-analyze, where
+ * a param's value is not yet known); a multi-column SET; a VOLATILE e; an e that
+ * references other columns; a bare-NULL e. (in_plpgsql is rejected by the caller
+ * — the move's iceberg_scan read can't run nested inside a function/DO.)
+ */
+static void
+cf_reject_unsupported_move(Query *query, RangeTblEntry *rte,
+                           TieredViewInfo *info, ColdParamSet *ps,
+                           TargetEntry *pc_tle, const char *vname)
+{
+    Node     *e = (Node *) pc_tle->expr;
+    ListCell *lc;
+
+    reject_cold_returning(query, vname);
+
+    /* The move replays the deparsed WHERE against one relation at a time (the hot
+     * heap, and iceberg_scan for the cold tier), so it cannot reference other
+     * tables: the cold tier is read through DuckDB, which can't correlate with
+     * Postgres tables. Reject UPDATE ... FROM and sub-query predicates with a clear
+     * message rather than the opaque "missing FROM-clause entry" they fail with. */
+    if (query->hasSubLinks || list_length(query->rtable) > 1)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("a cross-tier move on tiered view \"%s\" cannot reference other tables or sub-queries", vname),
+                 errhint("The cold tier is read through DuckDB, which can't join other Postgres tables; the WHERE may use only \"%s\"'s own columns (no UPDATE ... FROM, no sub-select).", vname)));
+
+    if (ps->maxid > 0)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("a cross-tier move on tiered view \"%s\" cannot use bound parameters", vname),
+                 errhint("Run the UPDATE with literal values for the partition column and WHERE clause.")));
+
+    /* Only the partition column may be SET in a move (v1). A second SET target
+     * would have to be re-projected across all four legs; defer that. */
+    foreach(lc, query->targetList)
+    {
+        TargetEntry *tle = (TargetEntry *) lfirst(lc);
+        if (!tle->resjunk && tle != pc_tle)
             ereport(ERROR,
                     (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                     errmsg("UPDATE of partition column \"%s\" on tiered view \"%s\" is not supported",
-                            info->partition_col, get_rel_name(rte->relid)),
-                     errhint("Changing \"%s\" can move the row across the hot/cold "
-                             "boundary; that relocation is not yet supported. To "
-                             "change \"%s\", delete the row and re-insert it with "
-                             "the new value.",
+                     errmsg("a cross-tier move on tiered view \"%s\" cannot also set other columns", vname),
+                     errhint("Move the row by setting only \"%s\"; update other columns in a separate statement.",
+                             info->partition_col)));
+    }
+
+    /* Reject VOLATILE — never STABLE. clock_timestamp()/random()/nextval() evaluate
+     * differently per call, so they could classify a row into different tiers
+     * across the move's legs. STABLE expressions (e.g. timestamptz + interval,
+     * which depends on the session timezone) evaluate consistently within this
+     * one transaction, so the legs agree; they are the intended row-dependent
+     * move (SET ts = ts + interval '1 month'). */
+    if (contain_volatile_functions(e))
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("the new value for partition column \"%s\" on tiered view \"%s\" must not be VOLATILE",
+                        info->partition_col, vname),
+                 errhint("clock_timestamp()/random()/nextval() can classify a row into different tiers across the move's legs; use a constant or a stable expression over \"%s\" only.",
+                         info->partition_col)));
+
+    {
+        VarRefCtx vc = { (Index) query->resultRelation,
+                         get_attnum(rte->relid, info->partition_col), false };
+        if (expr_refs_other_col_walker(e, &vc) || vc.other)
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("the new value for partition column \"%s\" on tiered view \"%s\" may reference only \"%s\"",
+                            info->partition_col, vname, info->partition_col),
+                     errhint("A cross-tier move supports a constant or an expression over \"%s\" (e.g. \"%s + interval '1 month'\").",
                              info->partition_col, info->partition_col)));
     }
+
+    /* A NULL new value matches no tier and the NOT-NULL partition column would
+     * error mid-move; reject when the expression is provably NULL (a bare NULL
+     * constant). Non-constant NULLs are caught at execution by the column's
+     * NOT NULL constraint on the hot legs. */
+    if (IsA(e, Const) && ((Const *) e)->constisnull)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("the new value for partition column \"%s\" on tiered view \"%s\" cannot be NULL",
+                        info->partition_col, vname)));
+}
+
+/*
+ * Permissive-mode (coldfront.allow_mixed_writes = on) cross-tier move path.
+ * Validates the move (cf_reject_unsupported_move), then deparses the user WHERE
+ * and the new partition-column expression e over the VIEW's column names and
+ * returns the rewrite "SELECT coldfront._cross_tier_move(schema, view, where, e)".
+ * That function does the relocation: it arms its own GUCs, attaches 'ice', and
+ * routes matched rows into the four tier cases. The work lives there (not in a
+ * hook-installed Query) because cold→hot rows are read with iceberg_scan, which
+ * pg_duckdb runs in DuckDB only as a standalone read — not as the modifying Query
+ * the hook installs — and only inside a function with the unsafe-execution GUC.
+ */
+static char *
+cf_emit_cross_tier_move_path(Query *query, RangeTblEntry *rte,
+                             TieredViewInfo *info, ColdParamSet *ps,
+                             TargetEntry *pc_tle, const char *vname)
+{
+    List          *dpcontext;
+    char          *e_text, *where_text;
+    const char    *ns;
+    StringInfoData buf;
+
+    cf_reject_unsupported_move(query, rte, info, ps, pc_tle, vname);
+
+    /* cf_reject_multi_reference guarantees a single base reference, so the result
+     * relation is the sole rangetable entry (varno 1) and the deparse context maps
+     * the view's columns by it. Defensive: fall back to the strict rejection on an
+     * unexpected shape rather than emit a wrong rewrite. */
+    if (query->resultRelation != 1)
+        reject_partition_col_update(info, vname);
+
+    dpcontext  = deparse_context_for(get_rel_name(rte->relid), rte->relid);
+    e_text     = deparse_expression((Node *) pc_tle->expr, dpcontext, false, false);
+    where_text = (query->jointree && query->jointree->quals)
+                 ? deparse_expression((Node *) query->jointree->quals, dpcontext, false, false)
+                 : pstrdup("true");
+    ns = get_namespace_name(get_rel_namespace(rte->relid));
+
+    initStringInfo(&buf);
+    appendStringInfo(&buf,
+        "SELECT coldfront._cross_tier_move(%s, %s, %s, %s)",
+        quote_literal_cstr(ns), quote_literal_cstr(vname),
+        quote_literal_cstr(where_text), quote_literal_cstr(e_text));
+    return buf.data;
 }
 
 /*
@@ -2015,10 +2456,34 @@ static char *
 cf_dispatch_emit(Query *query, RangeTblEntry *rte, TieredViewInfo *info,
                  ColdParamSet *ps, bool in_plpgsql, const char *vname)
 {
-    TierClass tier;
+    TierClass    tier;
+    TargetEntry *pc_tle;
 
     cf_reject_multi_reference(query, rte);
-    cf_reject_partition_col_update(query, rte, info);
+
+    /* A partition-column SET can move the row across the hot/cold cutoff — but
+     * only once something is archived. With a cutoff: mixed writes off → reject;
+     * on → cross-tier move: rewrite to
+     * SELECT coldfront._cross_tier_move(...). Without a cutoff every row is hot, so
+     * a partition-column UPDATE is a plain hot UPDATE — fall through to the normal
+     * classification (emit_hot). Also falls through when the partition column is not
+     * in the SET targetlist. */
+    pc_tle = partcol_set_target(query, rte, info);
+    if (pc_tle != NULL && info->has_cutoff)
+    {
+        if (!coldfront_allow_mixed_writes)
+            reject_partition_col_update(info, vname);
+        /* The rewrite is a row-returning SELECT (the function returns void); inside
+         * a plpgsql function/DO a bare SELECT has no destination. Reject there for
+         * v1 (the top-level form is the supported path). */
+        if (in_plpgsql)
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("a cross-tier move of partition column \"%s\" on tiered view \"%s\" is not supported inside a function or DO block",
+                            info->partition_col, vname),
+                     errhint("Run the partition-column UPDATE as a top-level statement.")));
+        return cf_emit_cross_tier_move_path(query, rte, info, ps, pc_tle, vname);
+    }
 
     /* Tiered-view INSERT: bulk split-by-watermark via emit_tiered_insert.
      * Iceberg-only INSERT falls through to the unconditional cold path

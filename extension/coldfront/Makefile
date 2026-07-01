@@ -13,11 +13,11 @@ EXTENSION   = coldfront
 DATA        = coldfront--1.0.sql coldfront--0.1--1.0.sql
 REGRESS     = load_order update_unregistered_view update_heap_table \
               update_hot_via_view update_cold_via_view update_ambiguous_rejected \
-              update_partition_key_blocked \
+              update_partition_key_blocked update_partition_key_move \
               returning_literal_in_where cast_literal_in_value \
-              classify_between_in_or allow_mixed_writes cold_write_batch_size_guc \
+              classify_between_in_or classify_now allow_mixed_writes cold_write_batch_size_guc \
               dollar_quote_in_value mixed_case_identifier \
-              cast_in_dquoted_identifier \
+              cast_in_dquoted_identifier cast_normalize bad_tablename cte_on_dml cte_on_insert \
               ddl_noop_unregistered ddl_block_drop ddl_block_truncate \
               ddl_alter_column ddl_rename_table ddl_rename_view \
               ddl_partition_passthrough bakery_wraps_cold_writes \

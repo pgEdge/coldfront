@@ -8,13 +8,13 @@
 (* mutual exclusion algorithm to compensate for that asymmetry.            *)
 (*                                                                         *)
 (* Protocol (Ricart-Agrawala):                                             *)
-(*   1. Writer inserts claim into its own claims[w].  Replicates via Apply *)
-(*      (async).                                                            *)
-(*   2. Each peer, on applying my claim, DECIDES then WRITES (two steps,   *)
-(*      faithful to the non-atomic SQL -- see SafeAcks):                   *)
+(*   1. Writer inserts claim into its NODE's claims view.  Replicates via  *)
+(*      Apply (async).                                                     *)
+(*   2. Each peer node, on applying the claim, DECIDES then WRITES (two    *)
+(*      steps, faithful to the non-atomic SQL -- see SafeAcks):            *)
 (*       - own pending claim with SMALLER ticket -> DEFER the ack          *)
 (*         (queue in `deferred`); otherwise ack immediately.               *)
-(*   3. Writer waits until every alive peer has acked.                     *)
+(*   3. Writer waits until every alive peer node has acked.                *)
 (*   4. Writer proceeds to Decide (the CAS, under the held claim).         *)
 (*   5. On release: FORWARD the deferred acks (deferred -> acks) then      *)
 (*      DELETE them -- also two steps.                                     *)
@@ -29,6 +29,19 @@
 (*   SELECT ... FOR UPDATE on the claim row in coldfront._on_claim_apply,  *)
 (*   so it never defers behind a released claim.  R-A is unchanged; only   *)
 (*   the implementation's atomicity differs.                              *)
+(*                                                                         *)
+(* SAME-NODE SERIALIZATION -- modelled directly by NodeParts + SameNodeLock.*)
+(* NodeParts partitions writers into nodes (many writers MAY share one), so *)
+(* claims are keyed by NODE and a writer clears the bakery only when BOTH   *)
+(* smallest active claim on its own node (clause a) AND acked by every peer *)
+(* node (clause b, Ricart-Agrawala). SameNodeLock models                   *)
+(* coldfront._claim_iceberg_lock: TRUE holds a node-local advisory xact     *)
+(* lock so at most one same-node writer is in the bakery at a time. With it *)
+(* FALSE, two same-node claims a1<a2 below a peer's b1 coexist and the      *)
+(* ack-forward on a1's Release clears b1 while a2 still holds -- a and b     *)
+(* both commit, racing the CAS. Bakery_v2_samenode_race.cfg proves that     *)
+(* violates NoLakekeeperConflict; Bakery_v2_samenode.cfg proves the lock    *)
+(* restores safety by collapsing it to the one-claim-per-node topology.     *)
 (*                                                                         *)
 (* Properties:                                                             *)
 (*   SAFETY (hold under both SafeAcks values):                            *)
@@ -94,6 +107,10 @@
 EXTENDS Naturals, Sequences, FiniteSets, TLC
 
 CONSTANTS Writers,
+          NodeParts,      \* partition of Writers into nodes -- each element is the
+                          \* set of writers on one node (a PG instance runs many
+                          \* concurrent cold sessions). All-singletons (one writer
+                          \* per node) reduces to v1's topology.
           MaxTickets,
           MaxIcebergLen,
           MaxCrashes,
@@ -105,7 +122,7 @@ CONSTANTS Writers,
                           \* TRUE = patched deployment. AsyncParquet=TRUE with
                           \* RestampPatch=FALSE reproduces the pre-patch 409 race that
                           \* makes the patch mandatory for the async ordering.
-          SafeAcks        \* TRUE = the SAFE implementation of R-A's defer/ack: the
+          SafeAcks,       \* TRUE = the SAFE implementation of R-A's defer/ack: the
                           \* defer is written atomically with a re-check of R-A's own
                           \* rule (the smaller-ticket claim must STILL be held), so a
                           \* deferral is never written behind a released claim, and the
@@ -113,36 +130,53 @@ CONSTANTS Writers,
                           \* (decide, then separately write) that drops acks — the bug.
                           \* The PROTOCOL (R-A) is identical either way; only the
                           \* implementation's atomicity differs.
+          SameNodeLock    \* coldfront._claim_iceberg_lock's node-local advisory xact
+                          \* lock: TRUE = at most ONE cold writer per node is in the
+                          \* bakery at a time (the deployment fix). FALSE = same-node
+                          \* writers race; with two same-node claims a1<a2 both below a
+                          \* peer's b1, node A defers b1 behind its SMALLEST same-node
+                          \* claim (a1) and, on a1's Release, forwards A's ack for b1
+                          \* WITHOUT re-deferring behind a2 (still held, still < b1) —
+                          \* so a2 and b1 both clear the bakery and race the CAS.
 
 ASSUME /\ Writers # {}
+       /\ Writers = UNION NodeParts
+       /\ \A S, T \in NodeParts : S = T \/ S \cap T = {}
        /\ MaxTickets    \in Nat /\ MaxTickets    >= Cardinality(Writers)
        /\ MaxIcebergLen \in Nat /\ MaxIcebergLen >= 1
        /\ MaxCrashes    \in Nat /\ MaxCrashes    <= Cardinality(Writers)
        /\ AsyncParquet  \in BOOLEAN
        /\ RestampPatch  \in BOOLEAN
        /\ SafeAcks      \in BOOLEAN
+       /\ SameNodeLock  \in BOOLEAN
 
 NoTicket == 0
 NoSnap   == 0
+Nodes    == NodeParts
+Nd(w)    == CHOOSE nd \in NodeParts : w \in nd
+MinT(S)  == CHOOSE m \in S : \A x \in S : m <= x
 
 (*--algorithm Bakery_v2
 variables
   next_ticket = 1,
 
-  \* Per-writer LOCAL view of coldfront.claims.  Asymmetric apply is
-  \* the realistic spock behaviour; R-A's deferred-ack mechanism
-  \* compensates by gating min-equivalent on per-peer acks.
-  claims = [w \in Writers |-> {}],
+  \* Per-NODE LOCAL view of coldfront.claims.  Writers on the same node
+  \* share one view (one PG instance, one claims table); asymmetric apply
+  \* across nodes is the realistic spock behaviour, and R-A's deferred-ack
+  \* mechanism compensates by gating min-equivalent on per-peer-node acks.
+  claims = [nd \in Nodes |-> {}],
 
-  \* Acks received per ticket.  A pair <<t, p>> in `acks` means peer p
-  \* has acked the claim with ticket t.  Models coldfront.claim_acks
+  \* Acks received per ticket.  A pair <<t, nd>> in `acks` means peer NODE
+  \* nd has acked the claim with ticket t.  Models coldfront.claim_acks
   \* (on the originator side, fully populated via spock replication of
   \* peer-emitted ack rows).
   acks = {},
 
-  \* Deferred acks: pair <<p, t>> means peer p has queued an ack-for-
-  \* ticket-t that it'll fire when p releases its own pending claim.
-  \* Models coldfront.deferred_acks on each peer.
+  \* Deferred acks: a triple <<nd, t, behind>> means node nd queued an
+  \* ack-for-ticket-t that it fires when the same-node claim `behind` is
+  \* released.  Models coldfront.deferred_acks: the code keys the deferral
+  \* to the SMALLEST same-node pending claim, so a `behind` that releases
+  \* while a larger same-node claim below t still holds forwards too early.
   deferred = {},
 
   iceberg = << [w |-> 0, t |-> 0, parent |-> 0, kind |-> "prime"] >>,
@@ -155,21 +189,32 @@ define
   Live(w)        == ~ crashed[w]
   IcebergHead    == Len(iceberg)
 
-  \* All alive peers (excluding self) have acked ticket t.  The
-  \* `~ Live(p)` shortcut is the failure-detector clause: a crashed
-  \* peer's missing ack does not block progress.  In the real system
-  \* this is implemented by combining the claim_acks table with a
-  \* heartbeat-staleness check (pg_stat_replication.reply_time) so
-  \* dead peers are treated as already-acked.  This closes the
-  \* classic R-A weakness where a crashed peer's deferred ack would
-  \* strand survivors forever.
-  AlivePeersHaveAcked(self, t) ==
-    \A p \in Writers :
-      p = self \/ ~ Live(p) \/ <<t, p>> \in acks
+  \* A node is alive if any of its writers is alive (a node is one PG
+  \* instance; its concurrent cold sessions crash with it).  A node `nd` is
+  \* the set of its writers.
+  NodeLive(nd)   == \E w \in nd : ~ crashed[w]
 
-  \* Tickets this writer has queued deferred acks for.
-  MyDeferredTickets(self) ==
-    { t : <<p, t>> \in {x \in deferred : x[1] = self} }
+  \* Clause (b) of R-A: every alive peer NODE (excluding my own) has acked
+  \* ticket t.  The `~ NodeLive(nd)` shortcut is the failure-detector
+  \* clause: a crashed node's missing ack does not block progress.  In the
+  \* real system this combines claim_acks with a heartbeat-staleness check
+  \* (pg_stat_replication.reply_time) so dead nodes are treated as
+  \* already-acked -- closing the classic R-A weakness where a crashed
+  \* peer's deferred ack would strand survivors forever.
+  AllPeerNodesAcked(self, t) ==
+    \A nd \in Nodes :
+      nd = Nd(self) \/ ~ NodeLive(nd) \/ <<t, nd>> \in acks
+
+  \* Clause (a): no OTHER active claim on my own node has a smaller ticket
+  \* -- same-node writers commit smallest-ticket-first.  Vacuous when one
+  \* writer per node (there is no other same-node claim).
+  SmallestOnMyNode(self, t) ==
+    ~ \E x \in claims[Nd(self)] : x.n = Nd(self) /\ x.w # self /\ x.t < t
+
+  \* Peer-node deferrals queued BEHIND my claim (ticket t) that my Release
+  \* forwards into acks.
+  MyForwardable(self, t) ==
+    { d \in deferred : d[1] = Nd(self) /\ d[3] = t }
 
   \* Safety properties (all HOLD in v2).
   NoLakekeeperConflict ==
@@ -181,7 +226,7 @@ define
         ~ \E i \in 1..Len(iceberg) : iceberg[i].w = w
 
   UniqueTickets ==
-    \A p, q \in Writers :
+    \A p, q \in Nodes :
       \A x \in claims[p], y \in claims[q] :
         x.t = y.t => x.w = y.w
 
@@ -227,21 +272,28 @@ begin
     end if;
 
   BeginClaim:
-    \* Insert claim into my local view.  Async replication via Applier.
-    \* No sync rep — R-A's ack barrier replaces it.
+    \* Insert claim into my NODE's local view.  Async replication via Applier.
+    \* No sync rep — R-A's ack barrier replaces it.  The SameNodeLock guard is
+    \* coldfront._claim_iceberg_lock's node-local advisory xact lock: block
+    \* while another writer on my node is mid-claim, so at most one same-node
+    \* claim is in the bakery at a time (node-local, so instant/synchronous).
     await Live(self) /\ \E p \in Writers : p # self /\ Live(p);
     await next_ticket <= MaxTickets;
+    await (~ SameNodeLock)
+          \/ ~ \E x \in claims[Nd(self)] : x.n = Nd(self) /\ x.w # self;
     my_ticket := next_ticket;
     next_ticket := next_ticket + 1;
-    claims[self] := claims[self] \cup
-                    {[w |-> self, t |-> my_ticket, n |-> self]};
+    claims[Nd(self)] := claims[Nd(self)] \cup
+                        {[w |-> self, t |-> my_ticket, n |-> Nd(self)]};
 
   WaitAcks:
-    \* Wait for every alive peer to ack.  Peers ack either immediately
-    \* (no smaller-ticket pending claim there) or via the deferred-drain
-    \* fired by the smaller-ticket holder at its Release.  Either way,
-    \* "all acks in" == "I'm at the head of the line."  No min-spin.
-    await Live(self) /\ AlivePeersHaveAcked(self, my_ticket);
+    \* Clear the bakery when I am BOTH the smallest active claim on my own node
+    \* (clause a) AND acked by every alive peer node (clause b).  Peer nodes ack
+    \* either immediately (no smaller-ticket pending claim there) or via the
+    \* deferred-drain fired by the smaller-ticket holder at its Release.
+    await Live(self)
+          /\ SmallestOnMyNode(self, my_ticket)
+          /\ AllPeerNodesAcked(self, my_ticket);
 
   Prepare:
     \* Capture the parent_snapshot_id the Lakekeeper CAS asserts against:
@@ -283,24 +335,27 @@ begin
     end either;
 
   Release:
-    \* The C XactCallback's claim DELETE: remove my claim from every local view.
+    \* The C XactCallback's claim DELETE: remove my claim from every node view.
     await Live(self);
-    claims := [p \in Writers |->
-                claims[p] \ {[w |-> self, t |-> my_ticket, n |-> self]}];
+    claims := [nd \in Nodes |->
+                claims[nd] \ {[w |-> self, t |-> my_ticket, n |-> Nd(self)]}];
 
   DrainForward:
     \* _on_claim_release step 1 (forward): INSERT claim_acks SELECT … FROM
-    \* deferred_acks WHERE pending = my ticket.  A deferral the Applier writes
-    \* AFTER this read but BEFORE DrainDelete is NOT seen here.
+    \* deferred_acks WHERE pending = my ticket — forward the peer-node acks
+    \* queued behind MY claim.  A deferral the Applier writes AFTER this read
+    \* but BEFORE DrainDelete is NOT seen here.  With SameNodeLock FALSE this
+    \* is the same-node race: if a same-node claim below the deferred ticket
+    \* still holds, forwarding here clears that peer node too early.
     await Live(self);
-    acks := acks \cup { <<t, self>> : t \in MyDeferredTickets(self) };
+    acks := acks \cup { <<d[2], Nd(self)>> : d \in MyForwardable(self, my_ticket) };
 
   DrainDelete:
-    \* _on_claim_release step 2 (the SEPARATE DELETE): delete my deferrals —
-    \* including any inserted in the DrainForward→here window, which were never
-    \* forwarded.  Non-atomic forward-then-delete = the silently dropped ack.
+    \* _on_claim_release step 2 (the SEPARATE DELETE): delete the deferrals I
+    \* forwarded — including any inserted in the DrainForward→here window, which
+    \* were never forwarded.  Non-atomic forward-then-delete = the dropped ack.
     await Live(self);
-    deferred := { x \in deferred : x[1] # self };
+    deferred := { x \in deferred : ~ (x[1] = Nd(self) /\ x[3] = my_ticket) };
 end process;
 
 (*-----------------------------------------------------------------------*)
@@ -308,21 +363,28 @@ end process;
 (* At apply time, the R-A defer-or-ack decision is made.                 *)
 (*-----------------------------------------------------------------------*)
 fair process Applier = "applier"
-variables ap_dst = NoTicket, ap_ct = NoTicket, ap_defer = FALSE;
+variables ap_dst = NoTicket, ap_ct = NoTicket, ap_defer = FALSE,
+          ap_behind = NoTicket;
 begin
   ApplyLoop:
     while TRUE do
-      \* ApplyDecide — apply one claim into dst's local view and DECIDE, under the
-      \* read snapshot, whether to defer or ack.  Mirrors _on_claim_apply reading
-      \* coldfront.claims (the shared advisory lock is dropped after this SELECT)
-      \* and CHOOSING defer-vs-ack — but NOT yet writing it.
-      with src \in Writers, dst \in Writers do
-        await dst # src /\ Live(dst);
-        with c \in { x \in claims[src] : x \notin claims[dst] /\ x.w = src } do
+      \* ApplyDecide — apply one claim from a src NODE into a dst NODE's local
+      \* view and DECIDE, under the read snapshot, whether to defer or ack.
+      \* Mirrors _on_claim_apply reading coldfront.claims (the shared advisory
+      \* lock is dropped after this SELECT) and CHOOSING defer-vs-ack — but NOT
+      \* yet writing it.  ap_behind is the smallest same-node pending claim the
+      \* deferral keys to (ORDER BY ticket LIMIT 1 in the SQL).
+      with src \in Nodes, dst \in Nodes do
+        await dst # src /\ NodeLive(dst);
+        with c \in { x \in claims[src] : x \notin claims[dst] /\ x.n = src } do
           claims[dst] := claims[dst] \cup { c };
           ap_dst   := dst;
           ap_ct    := c.t;
-          ap_defer := \E own \in claims[dst] : own.w = dst /\ own.t < c.t;
+          ap_defer := \E own \in claims[dst] : own.n = dst /\ own.t < c.t;
+          ap_behind := IF \E own \in claims[dst] : own.n = dst /\ own.t < c.t
+                         THEN MinT({ own.t : own \in
+                               {y \in claims[dst] : y.n = dst /\ y.t < c.t} })
+                         ELSE NoTicket;
         end with;
       end with;
 
@@ -339,10 +401,10 @@ begin
       \*     holder's claim still held -> defer; gone -> ack.  R-A's rule unchanged,
       \*     made atomic, so a deferral is never written behind a released claim.
       if (IF SafeAcks
-            THEN \E own \in claims[ap_dst] : own.w = ap_dst /\ own.t < ap_ct
+            THEN \E own \in claims[ap_dst] : own.n = ap_dst /\ own.t < ap_ct
             ELSE ap_defer)
       then
-        deferred := deferred \cup { <<ap_dst, ap_ct>> };
+        deferred := deferred \cup { <<ap_dst, ap_ct, ap_behind>> };
       else
         acks := acks \cup { <<ap_ct, ap_dst>> };
       end if;
@@ -366,7 +428,7 @@ begin
 end process;
 
 end algorithm; *)
-\* BEGIN TRANSLATION (chksum(pcal) = "14190c1" /\ chksum(tla) = "a5729adc")
+\* BEGIN TRANSLATION (chksum(pcal) = "31d6d69e" /\ chksum(tla) = "3f1a640d")
 VARIABLES pc, next_ticket, claims, acks, deferred, iceberg, decision, crashed, 
           crash_budget
 
@@ -377,18 +439,29 @@ IcebergHead    == Len(iceberg)
 
 
 
+NodeLive(nd)   == \E w \in nd : ~ crashed[w]
 
 
 
 
 
-AlivePeersHaveAcked(self, t) ==
-  \A p \in Writers :
-    p = self \/ ~ Live(p) \/ <<t, p>> \in acks
 
 
-MyDeferredTickets(self) ==
-  { t : <<p, t>> \in {x \in deferred : x[1] = self} }
+
+AllPeerNodesAcked(self, t) ==
+  \A nd \in Nodes :
+    nd = Nd(self) \/ ~ NodeLive(nd) \/ <<t, nd>> \in acks
+
+
+
+
+SmallestOnMyNode(self, t) ==
+  ~ \E x \in claims[Nd(self)] : x.n = Nd(self) /\ x.w # self /\ x.t < t
+
+
+
+MyForwardable(self, t) ==
+  { d \in deferred : d[1] = Nd(self) /\ d[3] = t }
 
 
 NoLakekeeperConflict ==
@@ -400,7 +473,7 @@ RollbackNoIceberg ==
       ~ \E i \in 1..Len(iceberg) : iceberg[i].w = w
 
 UniqueTickets ==
-  \A p, q \in Writers :
+  \A p, q \in Nodes :
     \A x \in claims[p], y \in claims[q] :
       x.t = y.t => x.w = y.w
 
@@ -421,17 +494,18 @@ TicketOrderPreserved ==
 EventualProgress ==
   \A w \in Writers : <>(decision[w] \in {"committed", "rolled_back", "lk_409"})
 
-VARIABLES my_ticket, parent_seen, parent_staged, ap_dst, ap_ct, ap_defer
+VARIABLES my_ticket, parent_seen, parent_staged, ap_dst, ap_ct, ap_defer, 
+          ap_behind
 
 vars == << pc, next_ticket, claims, acks, deferred, iceberg, decision, 
            crashed, crash_budget, my_ticket, parent_seen, parent_staged, 
-           ap_dst, ap_ct, ap_defer >>
+           ap_dst, ap_ct, ap_defer, ap_behind >>
 
 ProcSet == (Writers) \cup {"applier"} \cup {"crasher"}
 
 Init == (* Global variables *)
         /\ next_ticket = 1
-        /\ claims = [w \in Writers |-> {}]
+        /\ claims = [nd \in Nodes |-> {}]
         /\ acks = {}
         /\ deferred = {}
         /\ iceberg = << [w |-> 0, t |-> 0, parent |-> 0, kind |-> "prime"] >>
@@ -446,6 +520,7 @@ Init == (* Global variables *)
         /\ ap_dst = NoTicket
         /\ ap_ct = NoTicket
         /\ ap_defer = FALSE
+        /\ ap_behind = NoTicket
         /\ pc = [self \in ProcSet |-> CASE self \in Writers -> "Start"
                                         [] self = "applier" -> "ApplyLoop"
                                         [] self = "crasher" -> "CrashLoop"]
@@ -456,7 +531,7 @@ Start(self) == /\ pc[self] = "Start"
                /\ UNCHANGED << next_ticket, claims, acks, deferred, iceberg, 
                                decision, crashed, crash_budget, my_ticket, 
                                parent_seen, parent_staged, ap_dst, ap_ct, 
-                               ap_defer >>
+                               ap_defer, ap_behind >>
 
 Stage(self) == /\ pc[self] = "Stage"
                /\ Live(self)
@@ -467,27 +542,31 @@ Stage(self) == /\ pc[self] = "Stage"
                /\ pc' = [pc EXCEPT ![self] = "BeginClaim"]
                /\ UNCHANGED << next_ticket, claims, acks, deferred, iceberg, 
                                decision, crashed, crash_budget, my_ticket, 
-                               parent_seen, ap_dst, ap_ct, ap_defer >>
+                               parent_seen, ap_dst, ap_ct, ap_defer, ap_behind >>
 
 BeginClaim(self) == /\ pc[self] = "BeginClaim"
                     /\ Live(self) /\ \E p \in Writers : p # self /\ Live(p)
                     /\ next_ticket <= MaxTickets
+                    /\ (~ SameNodeLock)
+                       \/ ~ \E x \in claims[Nd(self)] : x.n = Nd(self) /\ x.w # self
                     /\ my_ticket' = [my_ticket EXCEPT ![self] = next_ticket]
                     /\ next_ticket' = next_ticket + 1
-                    /\ claims' = [claims EXCEPT ![self] = claims[self] \cup
-                                                          {[w |-> self, t |-> my_ticket'[self], n |-> self]}]
+                    /\ claims' = [claims EXCEPT ![Nd(self)] = claims[Nd(self)] \cup
+                                                              {[w |-> self, t |-> my_ticket'[self], n |-> Nd(self)]}]
                     /\ pc' = [pc EXCEPT ![self] = "WaitAcks"]
                     /\ UNCHANGED << acks, deferred, iceberg, decision, crashed, 
                                     crash_budget, parent_seen, parent_staged, 
-                                    ap_dst, ap_ct, ap_defer >>
+                                    ap_dst, ap_ct, ap_defer, ap_behind >>
 
 WaitAcks(self) == /\ pc[self] = "WaitAcks"
-                  /\ Live(self) /\ AlivePeersHaveAcked(self, my_ticket[self])
+                  /\ Live(self)
+                     /\ SmallestOnMyNode(self, my_ticket[self])
+                     /\ AllPeerNodesAcked(self, my_ticket[self])
                   /\ pc' = [pc EXCEPT ![self] = "Prepare"]
                   /\ UNCHANGED << next_ticket, claims, acks, deferred, iceberg, 
                                   decision, crashed, crash_budget, my_ticket, 
                                   parent_seen, parent_staged, ap_dst, ap_ct, 
-                                  ap_defer >>
+                                  ap_defer, ap_behind >>
 
 Prepare(self) == /\ pc[self] = "Prepare"
                  /\ Live(self)
@@ -497,7 +576,8 @@ Prepare(self) == /\ pc[self] = "Prepare"
                  /\ pc' = [pc EXCEPT ![self] = "Decide"]
                  /\ UNCHANGED << next_ticket, claims, acks, deferred, iceberg, 
                                  decision, crashed, crash_budget, my_ticket, 
-                                 parent_staged, ap_dst, ap_ct, ap_defer >>
+                                 parent_staged, ap_dst, ap_ct, ap_defer, 
+                                 ap_behind >>
 
 Decide(self) == /\ pc[self] = "Decide"
                 /\ Live(self)
@@ -513,35 +593,36 @@ Decide(self) == /\ pc[self] = "Decide"
                 /\ pc' = [pc EXCEPT ![self] = "Release"]
                 /\ UNCHANGED << next_ticket, claims, acks, deferred, crashed, 
                                 crash_budget, my_ticket, parent_seen, 
-                                parent_staged, ap_dst, ap_ct, ap_defer >>
+                                parent_staged, ap_dst, ap_ct, ap_defer, 
+                                ap_behind >>
 
 Release(self) == /\ pc[self] = "Release"
                  /\ Live(self)
-                 /\ claims' = [p \in Writers |->
-                                claims[p] \ {[w |-> self, t |-> my_ticket[self], n |-> self]}]
+                 /\ claims' = [nd \in Nodes |->
+                                claims[nd] \ {[w |-> self, t |-> my_ticket[self], n |-> Nd(self)]}]
                  /\ pc' = [pc EXCEPT ![self] = "DrainForward"]
                  /\ UNCHANGED << next_ticket, acks, deferred, iceberg, 
                                  decision, crashed, crash_budget, my_ticket, 
                                  parent_seen, parent_staged, ap_dst, ap_ct, 
-                                 ap_defer >>
+                                 ap_defer, ap_behind >>
 
 DrainForward(self) == /\ pc[self] = "DrainForward"
                       /\ Live(self)
-                      /\ acks' = (acks \cup { <<t, self>> : t \in MyDeferredTickets(self) })
+                      /\ acks' = (acks \cup { <<d[2], Nd(self)>> : d \in MyForwardable(self, my_ticket[self]) })
                       /\ pc' = [pc EXCEPT ![self] = "DrainDelete"]
                       /\ UNCHANGED << next_ticket, claims, deferred, iceberg, 
                                       decision, crashed, crash_budget, 
                                       my_ticket, parent_seen, parent_staged, 
-                                      ap_dst, ap_ct, ap_defer >>
+                                      ap_dst, ap_ct, ap_defer, ap_behind >>
 
 DrainDelete(self) == /\ pc[self] = "DrainDelete"
                      /\ Live(self)
-                     /\ deferred' = { x \in deferred : x[1] # self }
+                     /\ deferred' = { x \in deferred : ~ (x[1] = Nd(self) /\ x[3] = my_ticket[self]) }
                      /\ pc' = [pc EXCEPT ![self] = "Done"]
                      /\ UNCHANGED << next_ticket, claims, acks, iceberg, 
                                      decision, crashed, crash_budget, 
                                      my_ticket, parent_seen, parent_staged, 
-                                     ap_dst, ap_ct, ap_defer >>
+                                     ap_dst, ap_ct, ap_defer, ap_behind >>
 
 Writer(self) == Start(self) \/ Stage(self) \/ BeginClaim(self)
                    \/ WaitAcks(self) \/ Prepare(self) \/ Decide(self)
@@ -549,14 +630,18 @@ Writer(self) == Start(self) \/ Stage(self) \/ BeginClaim(self)
                    \/ DrainDelete(self)
 
 ApplyLoop == /\ pc["applier"] = "ApplyLoop"
-             /\ \E src \in Writers:
-                  \E dst \in Writers:
-                    /\ dst # src /\ Live(dst)
-                    /\ \E c \in { x \in claims[src] : x \notin claims[dst] /\ x.w = src }:
+             /\ \E src \in Nodes:
+                  \E dst \in Nodes:
+                    /\ dst # src /\ NodeLive(dst)
+                    /\ \E c \in { x \in claims[src] : x \notin claims[dst] /\ x.n = src }:
                          /\ claims' = [claims EXCEPT ![dst] = claims[dst] \cup { c }]
                          /\ ap_dst' = dst
                          /\ ap_ct' = c.t
-                         /\ ap_defer' = (\E own \in claims'[dst] : own.w = dst /\ own.t < c.t)
+                         /\ ap_defer' = (\E own \in claims'[dst] : own.n = dst /\ own.t < c.t)
+                         /\ ap_behind' = (IF \E own \in claims'[dst] : own.n = dst /\ own.t < c.t
+                                            THEN MinT({ own.t : own \in
+                                                  {y \in claims'[dst] : y.n = dst /\ y.t < c.t} })
+                                            ELSE NoTicket)
              /\ pc' = [pc EXCEPT !["applier"] = "ApplyEmit"]
              /\ UNCHANGED << next_ticket, acks, deferred, iceberg, decision, 
                              crashed, crash_budget, my_ticket, parent_seen, 
@@ -564,16 +649,16 @@ ApplyLoop == /\ pc["applier"] = "ApplyLoop"
 
 ApplyEmit == /\ pc["applier"] = "ApplyEmit"
              /\ IF (IF SafeAcks
-                      THEN \E own \in claims[ap_dst] : own.w = ap_dst /\ own.t < ap_ct
+                      THEN \E own \in claims[ap_dst] : own.n = ap_dst /\ own.t < ap_ct
                       ELSE ap_defer)
-                   THEN /\ deferred' = (deferred \cup { <<ap_dst, ap_ct>> })
+                   THEN /\ deferred' = (deferred \cup { <<ap_dst, ap_ct, ap_behind>> })
                         /\ acks' = acks
                    ELSE /\ acks' = (acks \cup { <<ap_ct, ap_dst>> })
                         /\ UNCHANGED deferred
              /\ pc' = [pc EXCEPT !["applier"] = "ApplyLoop"]
              /\ UNCHANGED << next_ticket, claims, iceberg, decision, crashed, 
                              crash_budget, my_ticket, parent_seen, 
-                             parent_staged, ap_dst, ap_ct, ap_defer >>
+                             parent_staged, ap_dst, ap_ct, ap_defer, ap_behind >>
 
 Applier == ApplyLoop \/ ApplyEmit
 
@@ -590,7 +675,7 @@ CrashLoop == /\ pc["crasher"] = "CrashLoop"
                         /\ UNCHANGED << crashed, crash_budget >>
              /\ UNCHANGED << next_ticket, claims, acks, deferred, iceberg, 
                              decision, my_ticket, parent_seen, parent_staged, 
-                             ap_dst, ap_ct, ap_defer >>
+                             ap_dst, ap_ct, ap_defer, ap_behind >>
 
 Crasher == CrashLoop
 

@@ -1,0 +1,50 @@
+-- Regression guard: a tier predicate against a STABLE now()-relative expression
+-- (e.g. ts < now() - interval) is folded to its transaction-fixed value for tier
+-- classification, so it resolves to a single tier instead of forcing a dual write.
+-- A VOLATILE bound (clock_timestamp()) is NOT folded and stays ambiguous.
+-- allow_mixed_writes = off makes the ambiguous case a clean error. White-box.
+CREATE EXTENSION IF NOT EXISTS pg_duckdb;
+NOTICE:  extension "pg_duckdb" already exists, skipping
+CREATE EXTENSION IF NOT EXISTS coldfront;
+NOTICE:  extension "coldfront" already exists, skipping
+SET TIME ZONE 'UTC';
+SET coldfront.warehouse = '';
+SET coldfront.lakekeeper_endpoint = '';
+SET coldfront.allow_mixed_writes = off;
+CREATE TABLE public._events (id int, ts timestamptz, status text);
+CREATE VIEW public.events AS SELECT * FROM public._events;
+INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
+VALUES ('public', 'events', 'public._events', 'ice.default.events', 'ts');
+INSERT INTO coldfront.archive_watermark(table_name, cutoff_time)
+VALUES ('events', '2026-03-01'::timestamptz);
+-- Stable, far in the past (< cutoff) → COLD: rewritten to a single cold _exec,
+-- NOT a dual write. The original now()-expression is preserved for execution.
+EXPLAIN (COSTS OFF, VERBOSE)
+  UPDATE public.events SET status = 'x' WHERE ts < now() - interval '100 years';
+                                                                                  QUERY PLAN                                                                                   
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result
+   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET status = ''x''::text   WHERE (ts < (now() - ''@ 100 years''::interval))'::text)
+(2 rows)
+
+-- Stable, recent (>= cutoff) → HOT: rewritten to a plain UPDATE on the hot heap.
+-- (ts < now() - '1 hour' would instead span both tiers → ambiguous, correctly.)
+EXPLAIN (COSTS OFF, VERBOSE)
+  UPDATE public.events SET status = 'x' WHERE ts >= now() - interval '1 hour';
+                           QUERY PLAN                           
+----------------------------------------------------------------
+ Update on public._events
+   ->  Seq Scan on public._events
+         Output: 'x'::text, ctid
+         Filter: (_events.ts >= (now() - '@ 1 hour'::interval))
+(4 rows)
+
+-- Volatile bound → not folded → AMBIGUOUS → clean rejection (mixed writes off).
+UPDATE public.events SET status = 'x' WHERE ts < clock_timestamp();
+ERROR:  UPDATE/DELETE on tiered view "events" must include a WHERE condition on "ts" that targets one tier
+HINT:  Use "ts >= <value>" for hot-tier writes, "ts < <value>" for cold-tier writes, or set coldfront.allow_mixed_writes = on to permit a non-atomic dual-tier rewrite.
+-- Cleanup.
+DELETE FROM coldfront.tiered_views;
+DELETE FROM coldfront.archive_watermark;
+DROP VIEW public.events;
+DROP TABLE public._events;

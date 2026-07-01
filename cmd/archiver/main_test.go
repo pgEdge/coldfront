@@ -451,3 +451,34 @@ func TestDollarQuote(t *testing.T) {
 		assert.True(t, strings.HasPrefix(tag, "$cf") && strings.HasSuffix(tag, "$"), "tag shape $cf…$")
 	}
 }
+
+// TestIsRetryableCutover verifies that only the transient lock-timeout (55P03)
+// is retried and every other error (permanent, or non-Postgres) fails fast.
+func TestIsRetryableCutover(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"lock_not_available (55P03) is transient", &pgconn.PgError{Code: "55P03"}, true},
+		{"fk violation (23503) is permanent", &pgconn.PgError{Code: "23503"}, false},
+		{"deadlock (40P01) not retried — design yields via 55P03 first", &pgconn.PgError{Code: "40P01"}, false},
+		{"raise_exception (P0001) is permanent", &pgconn.PgError{Code: "P0001"}, false},
+		{"non-Postgres error fails fast", errors.New("boom"), false},
+		{"nil fails fast", nil, false},
+	}
+	for _, c := range cases {
+		assert.Equal(t, c.want, isRetryableCutover(c.err), c.name)
+	}
+}
+
+// TestCutoverFailHint verifies the 23503 hint names the blocking constraint and
+// that no hint is emitted for the transient timeout or non-Postgres errors.
+func TestCutoverFailHint(t *testing.T) {
+	fk := &pgconn.PgError{Code: "23503", ConstraintName: "event_logs_event_id_event_ts_fkey_1"}
+	h := cutoverFailHint(fk)
+	assert.Contains(t, h, "event_logs_event_id_event_ts_fkey_1", "names the blocking constraint")
+	assert.Contains(t, h, "must be dropped", "gives actionable guidance")
+	assert.Empty(t, cutoverFailHint(&pgconn.PgError{Code: "55P03"}), "no hint for the transient lock timeout")
+	assert.Empty(t, cutoverFailHint(errors.New("boom")), "no hint for non-Postgres errors")
+}
