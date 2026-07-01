@@ -119,16 +119,57 @@ detect_ports() {
     LK_URL="http://localhost:${lk_picked}"
 }
 
+# db_unreachable_msg — print the standard "database is unreachable" diagnostic.
+# Used whenever a shown step or the liveness probe can't reach Postgres, so a
+# dead/unreachable db surfaces as clear guidance instead of a raw psql
+# "connection refused" that the user would otherwise Enter straight past.
+db_unreachable_msg() {
+    error "The database is unreachable — the walkthrough can't continue."
+    warn  "  Check that:"
+    warn  "    - Docker is running"
+    warn  "    - the stack is up and healthy:      docker compose ps"
+    warn  "    - you are not out of Docker disk:   docker system prune -af --volumes"
+    warn  "  Then re-run the walkthrough."
+}
+
+# require_db_reachable — lightweight liveness gate: a short bounded wait for
+# Postgres to answer SELECT 1. Returns 0 if it answers within the window, else
+# prints the unreachable diagnostic and returns 1 so callers return to the menu
+# instead of marching into raw connection-refused errors. ~10s max (5 x 2s).
+require_db_reachable() {
+    local i
+    for i in 1 2 3 4 5; do
+        if pg "SELECT 1" >/dev/null 2>&1; then return 0; fi
+        sleep 2
+    done
+    db_unreachable_msg
+    return 1
+}
+
 # run_sql_shown — explain what the command does FIRST, then show + run it.
 # The "why" MUST print before the command/output so the viewer knows what they're
-# about to run before hitting Enter — never after.
+# about to run before hitting Enter — never after. Returns non-zero if the SQL
+# fails (e.g. the db went away mid-demo): callers MUST check and stop rather than
+# let the user Enter-through a failed step into raw connection-refused noise.
 run_sql_shown() {
     local sql="$1" why="$2"
     [ -n "$why" ] && explain "  ${DIM}$why${RESET}"
     if [ "$NONINTERACTIVE" = 1 ]; then
         pg "$sql" >/dev/null || { error "step failed: $sql"; exit 1; }
     else
-        prompt_run "psql -h localhost -p $PG_PORT -U coldfront -d coldfront -c \"$sql\""
+        show_cmd "psql -h localhost -p $PG_PORT -U coldfront -d coldfront -c \"$sql\""
+        echo ""
+        read -rp "Press Enter to run..." </dev/tty
+        echo ""
+        echo -e "${DIM}─── Output ─────────────────────────────────────────────────${RESET}"
+        pg "$sql"
+        local rc=$?
+        echo -e "${DIM}────────────────────────────────────────────────────────────${RESET}"
+        echo ""
+        if [ "$rc" != 0 ]; then
+            db_unreachable_msg
+            return 1
+        fi
     fi
 }
 
@@ -144,12 +185,17 @@ coldfront_installed() {
 ensure_coldfront_setup() {
     local mode="${1:-silent}"
     if [ "$mode" = shown ]; then
+        # Liveness gate: confirm the db is reachable before the shown steps so a
+        # dead/unreachable stack yields a clear diagnostic, not raw psql errors.
+        require_db_reachable || return 1
         run_sql_shown "CREATE EXTENSION IF NOT EXISTS pg_duckdb; CREATE EXTENSION IF NOT EXISTS coldfront;" \
-            "pg_duckdb adds an in-process engine that reads Parquet in object storage; coldfront routes queries to the right tier and rewrites writes. No migration — installed onto the running database."
+            "Now we install ColdFront onto your running database — two extensions: pg_duckdb (an in-process engine so Postgres can read Parquet in object storage) and coldfront (routes each query to the right tier and rewrites writes). No migration, no new database." \
+            || return 1
         # set the secret only if not already present (idempotent — mirrors silent branch)
         if [ "$(pg "SELECT count(*) FROM coldfront.storage_secret;" 2>/dev/null)" != "1" ]; then
             run_sql_shown "SELECT coldfront.set_storage_secret('admin','adminsecret','seaweedfs:8333');" \
-                "Tells ColdFront where cold data goes. Throwaway local creds; in production you pass your real bucket's key/secret/endpoint here — application SQL is unchanged."
+                "Now we tell ColdFront where the cold data lives. In production you'd pass your real bucket's key, secret, and endpoint here; for this walkthrough we point it at the local SeaweedFS emulator with throwaway creds. Either way, your application SQL doesn't change." \
+                || return 1
         else
             explain "  ${DIM}Cold-store secret already set — skipping (idempotent).${RESET}"
         fi
@@ -417,9 +463,9 @@ demo_tiered() {
         DELETE FROM coldfront.archive_watermark WHERE table_name='events';" >/dev/null 2>&1 || true
 
     # ── Part 1: you already have this — a data-laden plain Postgres table ──────────
-    explain "Step 1 — Creating the database table: an ordinary partitioned Postgres table"
-    explain "  ${DIM}We create a range-partitioned Postgres table standing in for the live${RESET}"
-    explain "  ${DIM}DB you already run — no ColdFront yet.${RESET}"
+    explain "Step 1 — Create the database table: an ordinary partitioned Postgres table"
+    explain "  ${DIM}Now we create a range-partitioned Postgres table, standing in for the${RESET}"
+    explain "  ${DIM}live DB you already run — no ColdFront yet.${RESET}"
     if [ "$NONINTERACTIVE" != 1 ]; then prompt_continue; fi
     # generate_events seeds rows across now-150d .. now (~5 months). RANGE
     # partitioning REJECTS any insert with no covering partition, so we create
@@ -446,7 +492,7 @@ BEGIN
   END LOOP;
 END $do$;
 EOSQL
-    explain "  ${DIM}Monthly partitions covering the full data window — nothing ColdFront-specific yet.${RESET}"
+    explain "  ${DIM}That also added monthly partitions covering the full data window — still nothing ColdFront-specific.${RESET}"
 
     # Load loop: pick a size, load, verify. On a failed/short load, loop back to
     # choose_volume so the user can pick smaller (choose_volume itself already
@@ -494,7 +540,10 @@ EOSQL
 
     # ── Part 2: add ColdFront to the existing database (shown, AFTER the data load) ─
     header "Add ColdFront to that database"
-    ensure_coldfront_setup shown
+    # If the db went unreachable mid-demo, ensure_coldfront_setup prints the
+    # diagnostic and returns non-zero — stop here and return to the menu rather
+    # than pressing on into more connection-refused errors.
+    ensure_coldfront_setup shown || return
     if [ "$NONINTERACTIVE" != 1 ]; then prompt_continue; fi
 
     # ── Part 3: tier it, and prove it ──────────────────────────────────────────────
