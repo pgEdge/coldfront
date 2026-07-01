@@ -46,6 +46,28 @@ show_query() {
     echo -e "${DIM}────────────────────────────────────────────────────────────${RESET}"
 }
 
+# show_parquet_files <table_name> — resolve the table's metadata.json S3 path from
+# the Lakekeeper catalog (warehouse id → GET …/catalog/v1/<wh_id>/namespaces/default/tables/<table_name>
+# → metadata-location), then list its .parquet data files via iceberg_metadata().
+# On a failed resolution (empty metadata-location), prints a warn and returns non-zero
+# (non-fatal — callers continue). Consumes LK_URL, show_query, warn.
+show_parquet_files() {
+    local table_name="$1"
+    local wh_id meta_loc
+    wh_id=$(curl -s "${LK_URL}/management/v1/warehouse" \
+        | grep -o '"warehouse-id":"[^"]*"' | head -1 | cut -d'"' -f4)
+    meta_loc=$(curl -s "${LK_URL}/catalog/v1/${wh_id}/namespaces/default/tables/${table_name}" \
+        -H 'accept: application/json' \
+        | grep -o '"metadata-location":"[^"]*"' | head -1 | cut -d'"' -f4)
+    if [ -n "$meta_loc" ]; then
+        show_query "SELECT file_path FROM iceberg_metadata('${meta_loc}')
+                     WHERE file_path LIKE '%.parquet' LIMIT 3;"
+    else
+        warn "Could not resolve the Iceberg metadata location from the catalog; skipping the Parquet listing."
+        return 1
+    fi
+}
+
 # ── Port detection ───────────────────────────────────────────────────────────
 
 port_in_use() {
@@ -493,18 +515,8 @@ EOSQL
     # a native pg_duckdb table function (NOT duckdb.raw_query, which returns void for
     # SELECTs) so the rows reach the viewer. All values derived at runtime.
     explain "Proof it really moved — the cold rows are now Parquet files in object storage:"
-    local wh_id meta_loc
-    wh_id=$(curl -s "${LK_URL}/management/v1/warehouse" \
-        | grep -o '"warehouse-id":"[^"]*"' | head -1 | cut -d'"' -f4)
-    meta_loc=$(curl -s "${LK_URL}/catalog/v1/${wh_id}/namespaces/default/tables/events" \
-        -H 'accept: application/json' \
-        | grep -o '"metadata-location":"[^"]*"' | head -1 | cut -d'"' -f4)
-    if [ -n "$meta_loc" ]; then
-        show_query "SELECT file_path FROM iceberg_metadata('${meta_loc}')
-                     WHERE file_path LIKE '%.parquet' LIMIT 3;"
+    if show_parquet_files events; then
         info "Real .parquet objects in the bucket — the cold rows aren't in Postgres anymore."
-    else
-        warn "Could not resolve the Iceberg metadata location from the catalog; skipping the Parquet listing."
     fi
 
     # Proof (b): events is now a view.
