@@ -201,48 +201,125 @@ phase_a_bringup() {
     echo ""
 }
 
-# choose_volume — sets GEN_ROWS. The only feature-relevant prompt in the guide.
-choose_volume() {
-  if [ "$NONINTERACTIVE" = 1 ]; then GEN_ROWS="${WALKTHROUGH_ROWS:-1000000}"; return; fi
-  header "How much data should we generate?"
-  explain "  The more you generate, the more storage visibly relocates to object"
-  explain "  storage when we tier. Peak is the hot-heap size BEFORE tiering."
-  echo ""
-  explain "  1) Quick     ~1M rows   (~150 MB, seconds)         [default]"
-  explain "  2) Standard  ~10M rows  (~1.5 GB, ~1 min)"
-  explain "  3) Big       ~50M rows  (~7 GB, a few min)"
-  explain "  4) Custom    enter a row count"
-  echo ""
-  read -rp "Choose [1/2/3/4]: " v </dev/tty
-  # shellcheck disable=SC2034  # GEN_ROWS consumed by Task-9 demo functions
-  case "$v" in
-    2) GEN_ROWS=10000000;;
-    3) GEN_ROWS=50000000;;
-    4) read -rp "Rows: " GEN_ROWS </dev/tty;;
-    *) GEN_ROWS=1000000;;
-  esac
+# ── Disk / sizing estimate ─────────────────────────────────────────────────
+#
+# Peak footprint is the transient high-water mark of a load, NOT the final
+# heap size: it includes the composite PK index (id, ts) built alongside the
+# heap, WAL for the INSERT, any temp/sort spill, AND the archiver's later
+# Parquet write. Empirical calibration point: a 1M-row load FAILED at ~795 MB
+# free (Docker disk-full), so the real peak is well above the old 150 B/row
+# guess — > ~0.8 KB/row. We therefore use a conservative >=1 KB/row peak and
+# require ~2x headroom: a size only "fits" when rows*1KB <= free/2. These
+# constants are a starting estimate calibrated against that single data point;
+# revisit PER_ROW_PEAK_KB / HEADROOM_DIV if loads still fail (or waste space).
+PER_ROW_PEAK_KB=1        # conservative peak per row, in KB (heap+PK index+WAL+temp+Parquet)
+HEADROOM_DIV=2           # require free/HEADROOM_DIV to cover the peak (~2x headroom)
+
+# docker_free_mb — free MB on Docker's data root, probed from a throwaway
+# container. Echoes 0 if Docker is unreachable.
+docker_free_mb() {
+  docker run --rm alpine:3.20 sh -c "df -m / | awk 'NR==2{print \$4}'" 2>/dev/null || echo 0
 }
 
-# disk_preflight — rough guard: ~150 bytes/row peak (heap+WAL+temp). Compares to
-# Docker's available space. Aborts a tier that clearly won't fit.
-disk_preflight() {
-  local rows="$1"
-  local need_mb=$(( rows * 150 / 1024 / 1024 ))
-  # Available space on Docker's data root, probed from inside a throwaway container.
-  local avail_mb
-  avail_mb=$(docker run --rm alpine:3.20 sh -c "df -m / | awk 'NR==2{print \$4}'" 2>/dev/null || echo 0)
-  explain "  Estimated peak: ~${need_mb} MB; Docker has ~${avail_mb} MB free."
-  if [ "$avail_mb" -gt 0 ] && [ "$need_mb" -gt "$avail_mb" ]; then
-    warn "This volume may not fit in Docker's disk allocation."
-    if [[ "$(uname -s)" == "Darwin" ]]; then
-      warn "On macOS, raise Docker Desktop > Settings > Resources > Virtual disk limit,"
-      warn "or pick a smaller volume / run 'R) Reset' first."
-    fi
-    if [ "$NONINTERACTIVE" = 1 ]; then return 0; fi
-    read -rp "Continue anyway? [y/N]: " a </dev/tty
-    [[ "$a" =~ ^[Yy]$ ]] || return 1
+# peak_mb <rows> — estimated peak footprint in MB for a row count.
+peak_mb() {
+  echo $(( $1 * PER_ROW_PEAK_KB / 1024 ))
+}
+
+# fits <rows> <free_mb> — 0 (true) if the row count fits with headroom.
+fits() {
+  local rows="$1" free_mb="$2"
+  [ "$free_mb" -le 0 ] && return 0           # probe failed → don't block
+  [ "$(peak_mb "$rows")" -le $(( free_mb / HEADROOM_DIV )) ]
+}
+
+# suggested_rows <free_mb> — largest "nice" round row count that fits with
+# headroom. rows_max = free_mb*1024 / PER_ROW_PEAK / HEADROOM_DIV; with the
+# defaults that is free_mb*512. Rounded down to a nice power-of-ten step, floor
+# 50k so we always offer something runnable.
+suggested_rows() {
+  local free_mb="$1"
+  if [ "$free_mb" -le 0 ]; then echo 1000000; return; fi
+  local raw=$(( free_mb * 1024 / PER_ROW_PEAK_KB / HEADROOM_DIV ))
+  local step=1000000
+  if   [ "$raw" -lt 500000 ];  then step=50000
+  elif [ "$raw" -lt 5000000 ]; then step=100000
   fi
-  return 0
+  local rounded=$(( raw / step * step ))
+  [ "$rounded" -lt 50000 ] && rounded=50000
+  echo "$rounded"
+}
+
+# fit_note <rows> <free_mb> — human "does it fit" annotation for the menu.
+fit_note() {
+  local rows="$1" free_mb="$2" need
+  [ "$free_mb" -le 0 ] && { echo ""; return; }
+  need=$(peak_mb "$rows")
+  if fits "$rows" "$free_mb"; then
+    echo "(fits)"
+  elif [ "$need" -ge 1024 ]; then
+    echo "(needs ~$(( need / 1024 )) GB — more than your ~${free_mb} MB free)"
+  else
+    echo "(needs ~${need} MB — more than your ~${free_mb} MB free)"
+  fi
+}
+
+# choose_volume — sets GEN_ROWS. The only feature-relevant prompt in the guide.
+# Probes Docker's free disk FIRST, computes a Suggested row count that fits with
+# headroom, and re-prompts if the user picks a fixed/custom size that won't fit
+# (rather than proceeding into a load that will disk-full and roll back).
+choose_volume() {
+  if [ "$NONINTERACTIVE" = 1 ]; then GEN_ROWS="${WALKTHROUGH_ROWS:-1000000}"; return; fi
+
+  local free_mb sugg
+  start_spinner "Checking Docker's free disk"
+  free_mb=$(docker_free_mb)
+  stop_spinner
+  sugg=$(suggested_rows "$free_mb")
+
+  header "How much data should we generate?"
+  explain "  The more you generate, the more storage visibly relocates to object"
+  explain "  storage when we tier. Peak is the transient hot-heap high-water mark"
+  explain "  BEFORE tiering (heap + PK index + WAL + temp + the Parquet write)."
+  if [ "$free_mb" -gt 0 ]; then
+    explain "  ${DIM}Docker has ~${free_mb} MB free on its data root.${RESET}"
+  else
+    warn "  Could not probe Docker's free disk — fit checks disabled."
+  fi
+  echo ""
+
+  # shellcheck disable=SC2034  # GEN_ROWS consumed by Task-9 demo functions
+  while true; do
+    printf "  S) Suggested  ~%s rows   (fits your Docker's ~%s MB free, with headroom)   [default]\n" "$sugg" "$free_mb"
+    printf "  1) Quick      ~1M rows    %s\n"  "$(fit_note 1000000 "$free_mb")"
+    printf "  2) Standard   ~10M rows   %s\n"  "$(fit_note 10000000 "$free_mb")"
+    printf "  3) Big        ~50M rows   %s\n"  "$(fit_note 50000000 "$free_mb")"
+    printf "  4) Custom     enter a row count\n"
+    echo ""
+    read -rp "Choose [S/1/2/3/4]: " v </dev/tty
+
+    local pick=""
+    case "$v" in
+      ""|[Ss]) GEN_ROWS="$sugg"; return;;
+      1) pick=1000000;;
+      2) pick=10000000;;
+      3) pick=50000000;;
+      4) read -rp "Rows: " pick </dev/tty
+         if ! [[ "$pick" =~ ^[0-9]+$ ]] || [ "$pick" -le 0 ]; then
+             warn "Enter a positive whole number."; echo ""; continue
+         fi
+         ;;
+      *) warn "Pick S, 1, 2, 3, or 4."; echo ""; continue;;
+    esac
+
+    if fits "$pick" "$free_mb"; then
+      GEN_ROWS="$pick"; return
+    fi
+    warn "That size needs ~$(peak_mb "$pick") MB, you have ~${free_mb} MB free —"
+    warn "pick a smaller size (Suggested is ~${sugg} rows), or free Docker disk with:"
+    warn "    docker system prune -af --volumes"
+    echo ""
+  done
 }
 
 # generate_events — seed `events` across 4 historical months + the current one,
@@ -250,8 +327,13 @@ disk_preflight() {
 # on the fast set-based path. Spread <rows> over ~5 months by 'spacing'.
 generate_events() {
   local rows="$1"
+  local out; out=$(mktemp)
   start_spinner "Generating ${rows} rows"
-  psql_file >/dev/null 2>&1 <<EOSQL
+  # psql_file uses ON_ERROR_STOP=1, so a disk-full (or any) INSERT error makes
+  # psql exit non-zero. Capture stdout+stderr and check the exit code — never
+  # report success unconditionally (a swallowed failure previously masqueraded
+  # as "Generated N rows" while the txn had rolled back to 0 rows).
+  psql_file >"$out" 2>&1 <<EOSQL
 SET search_path = public;
 -- Spread evenly across now-4mo .. now, two-minute spacing scaled to row count.
 INSERT INTO events (id, ts, status, data)
@@ -261,7 +343,16 @@ SELECT i,
        '{}'::jsonb
 FROM generate_series(1, ${rows}) i;
 EOSQL
-  stop_spinner; info "Generated ${rows} rows."
+  local rc=$?
+  stop_spinner
+  if [ "$rc" -ne 0 ]; then
+    error "Load failed — the INSERT did not complete (rows rolled back):"
+    tail -5 "$out" | sed 's/^/    /'
+    rm -f "$out"
+    return 1
+  fi
+  rm -f "$out"
+  info "Loaded ${rows} rows."
 }
 
 demo_tiered() {
@@ -274,8 +365,9 @@ demo_tiered() {
         DELETE FROM coldfront.archive_watermark WHERE table_name='events';" >/dev/null 2>&1 || true
 
     # ── Part 1: you already have this — a data-laden plain Postgres table ──────────
-    explain "Step 1 — Your existing database: an ordinary partitioned Postgres table"
-    explain "  ${DIM}This stands in for the live DB you already run — no ColdFront yet.${RESET}"
+    explain "Step 1 — Creating the database table: an ordinary partitioned Postgres table"
+    explain "  ${DIM}We create a range-partitioned Postgres table standing in for the live${RESET}"
+    explain "  ${DIM}DB you already run — no ColdFront yet.${RESET}"
     if [ "$NONINTERACTIVE" != 1 ]; then prompt_continue; fi
     # generate_events seeds rows across now-150d .. now (~5 months). RANGE
     # partitioning REJECTS any insert with no covering partition, so we create
@@ -304,17 +396,35 @@ END $do$;
 EOSQL
     explain "  ${DIM}Monthly partitions covering the full data window — nothing ColdFront-specific yet.${RESET}"
 
-    choose_volume
-    disk_preflight "$GEN_ROWS" || { warn "Skipping tiered demo."; return; }
-    explain "Loading ~6 months of history into the table (your accumulated data):"
-    generate_events "$GEN_ROWS"
-
-    # Correctness gate: every generated row must have landed (no partition gaps).
-    local before; before=$(pg "SELECT count(*) FROM events;")
-    if [ "$before" != "$GEN_ROWS" ]; then
-        error "Row-count mismatch: generated ${GEN_ROWS} but events has ${before} — a partition gap dropped rows."
-        return
-    fi
+    # Load loop: pick a size, load, verify. On a failed/short load, loop back to
+    # choose_volume so the user can pick smaller (choose_volume itself already
+    # blocks a too-big fixed/custom pick). generate_events surfaces the real
+    # error (e.g. disk-full) and returns non-zero — the primary failure signal;
+    # the row-count check below is belt-and-suspenders for a silent short load.
+    # NON-INTERACTIVE never loops: on failure it errors and returns (CI must not
+    # hang), and empties the partial table first so a rolled-back load can't be
+    # mistaken for a valid post-run state.
+    local before
+    while true; do
+        choose_volume
+        explain "Loading ~6 months of history into the table (your accumulated data):"
+        if ! generate_events "$GEN_ROWS"; then
+            if [ "$NONINTERACTIVE" = 1 ]; then
+                pg "TRUNCATE events;" >/dev/null 2>&1
+                return
+            fi
+            warn "Load did not complete — pick a smaller size, or free Docker disk, and try again."
+            pg "TRUNCATE events;" >/dev/null 2>&1   # clear any partial state before retry
+            continue
+        fi
+        # Correctness gate: every generated row must have landed (no partition gaps).
+        before=$(pg "SELECT count(*) FROM events;")
+        if [ "$before" = "$GEN_ROWS" ]; then break; fi
+        error "Row-count mismatch: generated ${GEN_ROWS} but events has ${before}."
+        if [ "$NONINTERACTIVE" = 1 ]; then pg "TRUNCATE events;" >/dev/null 2>&1; return; fi
+        warn "Short load — pick a smaller size and try again."
+        pg "TRUNCATE events;" >/dev/null 2>&1
+    done
 
     # Step "see the problem": how much hot storage, and it's ALL hot. Shown from
     # captured values (count alone via pg(); size summed over partitions via
