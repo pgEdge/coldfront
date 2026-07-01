@@ -3,9 +3,10 @@
 New here? Run the guided walkthrough.
 
 The walkthrough is a self-contained, step-by-step tour of ColdFront's
-three operating modes: tiered storage (hot PostgreSQL + cold Iceberg),
+three operating modes - tiered storage (hot PostgreSQL + cold Iceberg),
 decoupled mode (Iceberg-only from the first row), and the standalone
-partitioner. This page mirrors the interactive guide as copy-pasteable
+partitioner - plus a distributed demo that runs two nodes over one
+shared lake. This page mirrors the interactive guide as copy-pasteable
 commands for reference.
 
 !!! warning "Pre-release beta software"
@@ -784,6 +785,133 @@ FROM pg_inherits
 WHERE inhparent = 'part_demo'::regclass;
 ```
 
+## Demo 4: distributed
+
+Distributed mode points two or more PostgreSQL nodes at the *same*
+lake. The nodes form an active-active
+[Spock](https://github.com/pgEdge/spock) mesh; the table data lives
+once, in Iceberg, and each node adds query and write capacity over that
+one shared copy. A write on one node is readable on the other with
+nothing copied between them, and concurrent cold writes from different
+nodes are serialized cluster-wide so they never collide.
+
+This demo uses a different stack from the single-node walkthrough - two
+`MESH=on` nodes (`db1`, `db2`) plus a shared Lakekeeper and object
+store. The interactive guide automates the whole switch (it stops the
+single-node stack first, since a laptop rarely has room for both):
+
+```bash
+bash examples/walkthrough/guide.sh   # then choose: 4) Distributed
+```
+
+The sections below show what that option does, so you can follow along
+or reproduce it by hand.
+
+### Bring up the two-node mesh
+
+Start the mesh stack, then form the Spock mesh - create a node on each
+member, subscribe each to the other, and arm the cold-write
+coordination substrate on both:
+
+```bash
+docker compose -f examples/walkthrough/docker-compose.mesh.yml up -d
+```
+
+```sql
+-- On db1:
+SELECT spock.node_create('db1', 'host=db1 user=coldfront dbname=coldfront port=5432');
+SELECT spock.sub_create('sub_db1_from_db2', 'host=db2 user=coldfront dbname=coldfront port=5432');
+-- On db2:
+SELECT spock.node_create('db2', 'host=db2 user=coldfront dbname=coldfront port=5432');
+SELECT spock.sub_create('sub_db2_from_db1', 'host=db1 user=coldfront dbname=coldfront port=5432');
+
+-- On BOTH nodes - replicate the bakery's claim tables and set the cold-store
+-- secret, before any cold write:
+SELECT coldfront._ensure_claims_replicated();
+SELECT coldfront.set_storage_secret('admin', 'adminsecret', 'seaweedfs:8333');
+```
+
+The nodes reach each other over the Compose network (service names
+`db1`/`db2`, port 5432). The bakery replicates only small coordination
+metadata between nodes - never the table data, which stays in the lake. The
+`set_storage_secret` call is what lets each node's DuckDB write Parquet to the
+shared object store; without it, cold writes fail to authenticate.
+
+### See the mesh
+
+Both nodes are present, each subscribed to the other:
+
+```sql
+SELECT node_name FROM spock.node ORDER BY node_name;   -- db1, db2
+SELECT sub_name  FROM spock.subscription;              -- one per node
+```
+
+### Write on one node, read on the other
+
+Create a lake-native table on `db1` and register it on `db2` as well
+(the call is idempotent and the registry is keyed by name, so each node
+ends up with an identical local view):
+
+```sql
+-- On db1, then on db2 - same call:
+SELECT coldfront.create_iceberg_table(
+  'public', 'events_lake',
+  '[{"name":"id","type":"bigint"},{"name":"ts","type":"timestamptz"},
+    {"name":"status","type":"text"},{"name":"data","type":"jsonb"}]'::jsonb
+);
+```
+
+Write three rows on `db1`, then read them back on `db2`:
+
+```sql
+-- db1:
+INSERT INTO events_lake VALUES
+  (1, now(), 'ok',   '{"n":"db1"}'),
+  (2, now(), 'ok',   '{"n":"db1"}'),
+  (3, now(), 'warn', '{"n":"db1"}');
+
+-- db2 - a different node, which stored none of this data:
+SELECT id, status, data->>'n' AS written_by FROM events_lake ORDER BY id;
+SELECT relkind, pg_size_pretty(pg_relation_size('events_lake')) AS pg_bytes
+FROM pg_class WHERE relname = 'events_lake';   -- v, 0 bytes
+```
+
+`db2` returns every row `db1` wrote and stores zero bytes for the table
+- it reads straight from the shared lake. That is the point of
+distributed mode: add a node for compute over one copy of the data,
+with no storage to replicate.
+
+### Concurrent writes serialize (the bakery)
+
+Two nodes committing the same Iceberg table at once would normally
+collide - the catalog rejects the second commit with a `409 Conflict`
+and the application has to retry. ColdFront's bakery protocol prevents
+that: each cold write takes a globally-ordered ticket (replicated via
+Spock, verified in the TLA+ model under `docs/formal/`) and waits its
+turn. Fire many writers at once - several on each node, on both nodes,
+all into the same table:
+
+```sql
+-- concurrently, on BOTH nodes at the same instant:
+INSERT INTO events_lake VALUES (101, now(), 'storm', '{"n":"db1"}');   -- db1
+INSERT INTO events_lake VALUES (201, now(), 'storm', '{"n":"db2"}');   -- db2
+-- ...5 concurrent on db1 (101-105) and 5 on db2 (201-205)
+```
+
+Every write lands, with no conflicts and no application-level retry.
+Two layers serialize them: a node-local advisory lock keeps one cold
+writer per node in the bakery at a time, and the cross-node
+Ricart-Agrawala claim protocol orders writers across nodes. The durable
+proof is the claim ledger - each ticket, the node that issued it, and
+the peer that acknowledged it before the commit:
+
+```sql
+SELECT ticket,
+       snowflake.get_node(ticket) AS issued_by,
+       ack_from_node              AS acked_by
+FROM coldfront.claim_acks ORDER BY ticket;
+```
+
 ## Teardown
 
 To stop the stack and remove all data volumes, run the following
@@ -797,6 +925,14 @@ docker compose \
 
 The `-v` flag removes the named volumes (`pgdata` and `s3data`). Omit
 it to keep the data for a later session.
+
+If you ran the distributed demo, tear down its separate mesh stack too:
+
+```bash
+docker compose \
+  -f examples/walkthrough/docker-compose.mesh.yml \
+  down -v
+```
 
 ## Next Steps
 
