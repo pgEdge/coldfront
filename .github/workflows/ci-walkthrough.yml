@@ -1,0 +1,70 @@
+name: CI - Walkthrough
+on:
+  push:
+    paths: ['examples/walkthrough/**', '.devcontainer/**', 'docs/walkthrough.md', '.github/workflows/ci-walkthrough.yml']
+  pull_request:
+    paths: ['examples/walkthrough/**', '.devcontainer/**', 'docs/walkthrough.md', '.github/workflows/ci-walkthrough.yml']
+  workflow_dispatch:
+
+concurrency:
+  group: '${{ github.workflow }} @ ${{ github.event.pull_request.head.label || github.head_ref || github.ref }}'
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run ShellCheck
+        run: shellcheck -x --source-path=examples/walkthrough examples/walkthrough/*.sh
+      - name: Validate Docker Compose
+        run: docker compose -f examples/walkthrough/docker-compose.yml config --quiet
+
+  smoke:
+    name: Smoke Test
+    needs: [validate]
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9  # v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Install prerequisites
+        run: sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client jq iproute2
+      - name: Run setup + Tiered demo non-interactively
+        working-directory: examples/walkthrough
+        env:
+          WALKTHROUGH_NONINTERACTIVE: "1"
+          WALKTHROUGH_DEMO: tiered
+          WALKTHROUGH_ROWS: "200000"
+        run: bash guide.sh
+      - name: Assert tiering proof
+        run: |
+          export PGPASSWORD=coldfront
+          relk=$(psql -h localhost -U coldfront -d coldfront -tAc "SELECT relkind FROM pg_class WHERE relname='events';")
+          wm=$(psql -h localhost -U coldfront -d coldfront -tAc "SELECT count(*) FROM coldfront.archive_watermark WHERE table_name='events';")
+          [ "$relk" = "v" ] || { echo "events not a view (relkind=$relk)"; exit 1; }
+          [ "$wm" = "1" ] || { echo "no watermark row"; exit 1; }
+          echo "Tiering proof OK"
+      - name: Check no services have exited
+        run: |
+          echo "=== Service Status ==="
+          docker compose -f examples/walkthrough/docker-compose.yml ps
+          if docker compose -f examples/walkthrough/docker-compose.yml ps | grep -E "Exit|exited"; then
+            echo "ERROR: Some services have exited"
+            docker compose -f examples/walkthrough/docker-compose.yml logs
+            exit 1
+          fi
+          echo "All services are running"
+      - name: Dump logs on failure
+        if: failure()
+        working-directory: examples/walkthrough
+        run: docker compose logs
+      - name: Cleanup
+        if: always()
+        run: docker compose -f examples/walkthrough/docker-compose.yml down -v

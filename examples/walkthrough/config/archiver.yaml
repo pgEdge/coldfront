@@ -1,0 +1,24 @@
+# ColdFront walkthrough archiver config — Demo 1 (tiered).
+#
+# Runs INSIDE the compose network (docker compose run --rm archiver), so every
+# endpoint is a compose SERVICE NAME, not localhost. hot_period "30 days" keeps
+# the current month hot and tiers the older months to Iceberg/S3 — deterministic
+# because the walkthrough seeds now()-relative timestamps.
+postgres:
+    dsn: "host=db port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
+iceberg:
+    warehouse: "wh"
+    lakekeeper_endpoint: "http://lakekeeper:8181/catalog"
+    namespace: "default"
+s3:
+    endpoint: "seaweedfs:8333"
+    region: "us-east-1"
+    access_key: "admin"
+    secret_key: "adminsecret"
+    use_ssl: false
+    url_style: "path"
+archiver:
+    tables:
+        - source_table: events
+          partition_period: monthly
+          hot_period: "30 days"
