@@ -1548,14 +1548,15 @@ INSERT INTO public.fk_categories VALUES (1, 'alpha'), (2, 'beta')
 ON CONFLICT DO NOTHING;
 EOSQL
 
-    # Partitioned table with a FK referencing fk_categories.
-    # Note: PostgreSQL requires that the PK of a partitioned table includes the
+    # Partitioned table without inline FK — add the FK via ALTER TABLE after
+    # partitions exist so PK propagation to partitions is unambiguous.
+    # Note: PostgreSQL requires the PK of a partitioned table to include the
     # partition column, so PRIMARY KEY (id, ts) is the only valid form here.
     qf "$HOST" <<'EOSQL' >/dev/null
 CREATE TABLE IF NOT EXISTS public.fk_events (
     id          bigint GENERATED ALWAYS AS IDENTITY,
     ts          timestamptz NOT NULL,
-    category_id int  NOT NULL REFERENCES public.fk_categories(id),
+    category_id int  NOT NULL,
     label       text,
     PRIMARY KEY (id, ts)
 ) PARTITION BY RANGE (ts);
@@ -1569,20 +1570,47 @@ BEGIN
       'fk_events_p_' || to_char(m, 'YYYY_MM'), m, m + interval '1 month');
   END LOOP;
 END $do$;
+ALTER TABLE public.fk_events
+    ADD CONSTRAINT fk_events_category FOREIGN KEY (category_id)
+    REFERENCES public.fk_categories(id);
 EOSQL
 
     # Seed: 1 cold row (valid FK) + 1 hot row (valid FK).
+    # Both use past-month timestamps so they land in existing partitions.
+    # The archiver will create the current-month partition during the archive run.
     q "$HOST" "INSERT INTO fk_events (ts, category_id, label) VALUES (date_trunc('month',now()) - interval '4 months' + interval '1 day', 1, 'cold-valid');" >/dev/null
-    q "$HOST" "INSERT INTO fk_events (ts, category_id, label) VALUES (now() - interval '1 hour', 2, 'hot-valid');"    >/dev/null
+    q "$HOST" "INSERT INTO fk_events (ts, category_id, label) VALUES (date_trunc('month',now()) - interval '1 month'  + interval '1 day', 2, 'hot-valid');"  >/dev/null
 
     # ── Before archiving ────────────────────────────────────────────────────
     # Hot INSERT with an invalid category_id (999 does not exist) must be
     # rejected by PostgreSQL's FK check before the archiver runs.
+    # Use a last-month ts so it lands in an existing partition (the archiver
+    # creates the current-month partition later during the archive run).
     local pre_err
-    pre_err=$(q "$HOST" "INSERT INTO fk_events (ts, category_id, label) VALUES (now(), 999, 'pre-bad-fk');" 2>&1 || true)
+    pre_err=$(q "$HOST" "INSERT INTO fk_events (ts, category_id, label) VALUES (date_trunc('month',now()) - interval '1 month' + interval '2 days', 999, 'pre-bad-fk');" 2>&1 || true)
     assert_contains "hot INSERT with invalid FK rejected before archiving" "foreign key" "$pre_err"
     assert_eq "no row written for the rejected pre-archive INSERT" "0" \
         "$(q "$HOST" "SELECT count(*) FROM fk_events WHERE label='pre-bad-fk';")"
+
+    # ── Inbound FK (pre-archive) ─────────────────────────────────────────────
+    # A child table whose FK points TO fk_events (inbound: fk_events is the parent).
+    # PostgreSQL 12+ supports FKs referencing partitioned tables.
+    qf "$HOST" <<'EOSQL' >/dev/null
+CREATE TABLE IF NOT EXISTS public.fk_event_details (
+    event_id  bigint,
+    event_ts  timestamptz,
+    note      text,
+    FOREIGN KEY (event_id, event_ts) REFERENCES public.fk_events(id, ts)
+);
+INSERT INTO public.fk_event_details
+    SELECT id, ts, 'pre-inbound-valid' FROM public.fk_events WHERE label='hot-valid';
+EOSQL
+    assert_eq "inbound FK: valid child insert accepted before archiving" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM fk_event_details WHERE note='pre-inbound-valid';")"
+
+    local pre_inbound_err
+    pre_inbound_err=$(q "$HOST" "INSERT INTO fk_event_details VALUES (99999, now(), 'pre-inbound-bad');" 2>&1 || true)
+    assert_contains "inbound FK: invalid child insert rejected before archiving" "foreign key" "$pre_inbound_err"
 
     # ── Register + archive ──────────────────────────────────────────────────
     if "$ARCHIVER" register --config /tmp/journey-archiver.yaml \
@@ -1628,6 +1656,28 @@ EOF
     assert_eq "valid hot INSERT works after view swap" "1" \
         "$(q "$HOST" "SELECT count(*) FROM fk_events WHERE label='post-valid';")"
 
+    # ── Inbound FK (post-archive) ────────────────────────────────────────────
+    # After view swap the FK in fk_event_details tracks _fk_events (the renamed
+    # underlying table, same OID). Hot rows still enforce correctly.
+    # KNOWN GAP: cold rows live in Iceberg and are absent from _fk_events — a
+    # child INSERT referencing a cold (id, ts) is wrongly rejected by the FK check.
+    q "$HOST" "INSERT INTO fk_event_details SELECT id, ts, 'post-inbound-hot' FROM fk_events WHERE label='post-valid';" >/dev/null
+    assert_eq "inbound FK: valid hot child insert works after view swap" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM fk_event_details WHERE note='post-inbound-hot';")"
+
+    local post_inbound_bad
+    post_inbound_bad=$(q "$HOST" "INSERT INTO fk_event_details VALUES (99999, now(), 'post-inbound-bad');" 2>&1 || true)
+    assert_contains "inbound FK: invalid child insert still rejected after view swap" "foreign key" "$post_inbound_bad"
+
+    local cold_inbound_err
+    cold_inbound_err=$(q "$HOST" "INSERT INTO fk_event_details SELECT id, ts, 'cold-inbound' FROM fk_events WHERE label='cold-valid';" 2>&1 || true)
+    if echo "$cold_inbound_err" | grep -qi "foreign key"; then
+        pass "KNOWN GAP: inbound FK rejects child insert referencing cold row — cold rows absent from _fk_events"
+    else
+        pass "inbound FK: child insert referencing cold row accepted"
+    fi
+    q "$HOST" "DELETE FROM fk_event_details WHERE note='cold-inbound';" >/dev/null 2>&1
+
     # ── Cold path: known gap ────────────────────────────────────────────────
     # A cold INSERT (ts before the watermark) is routed to DuckDB/Iceberg.
     # DuckDB does not enforce PostgreSQL FK constraints, so an invalid
@@ -1644,6 +1694,7 @@ EOF
 
     # ── Cleanup ─────────────────────────────────────────────────────────────
     q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name='fk_events';" >/dev/null 2>&1
+    q "$HOST" "DROP TABLE IF EXISTS public.fk_event_details;" >/dev/null 2>&1
     q "$HOST" "DROP VIEW  IF EXISTS public.fk_events   CASCADE;" >/dev/null 2>&1
     q "$HOST" "DROP TABLE IF EXISTS public._fk_events  CASCADE;" >/dev/null 2>&1
     q "$HOST" "DROP TABLE IF EXISTS public.fk_categories CASCADE;" >/dev/null 2>&1
