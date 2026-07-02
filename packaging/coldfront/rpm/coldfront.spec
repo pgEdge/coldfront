@@ -19,6 +19,7 @@ Requires:	pgedge-postgresql%{pgmajorversion}-server
 # coldfront drives DuckDB through pg_duckdb (shared_preload_libraries +
 # duckdb.raw_query); it is non-functional without it.
 Requires:	pgedge-pg-duckdb_%{pgmajorversion}
+Requires:	pgedge-coldfront-duckdb-extensions
 Provides:	%{sname}_%{pgmajorversion}
 
 %description

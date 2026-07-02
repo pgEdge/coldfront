@@ -18,6 +18,7 @@ Depends:
  ${shlibs:Depends},
  pgedge-postgresql-PG_MAJOR_VERSION,
  pgedge-postgresql-PG_MAJOR_VERSION-pg-duckdb,
+ pgedge-coldfront-duckdb-extensions,
 Description: Transparent tiered storage for PostgreSQL (hot PG + cold Iceberg)
  ColdFront routes DML on tiered views across a hot tier (PostgreSQL) and a
  cold tier (Apache Iceberg over object storage), with cold reads/writes served
