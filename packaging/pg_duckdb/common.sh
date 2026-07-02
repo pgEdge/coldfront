@@ -1,5 +1,12 @@
 #!/usr/bin/env bash
 # common.sh - Common environment variables for the ColdFront pg_duckdb package.
+#
+# NOTE (disk): this package compiles all of DuckDB + extensions with LTO and is
+# the heaviest build here — it can exhaust a hosted runner's disk. The release
+# workflow frees ~25-30GB before pg_duckdb cells; if that ever still hits "No
+# space left on device", the next lever is to move Docker's storage to the
+# runner's /mnt (~70GB) disk. See the "Free up disk space" step in
+# .github/workflows/release.yml for the ready-to-use snippet.
 
 # Build once per PostgreSQL major version (fan-out across the matrix).
 PER_PG_VERSION=true
