@@ -7,7 +7,7 @@
   "features": {
     "ghcr.io/devcontainers/features/docker-in-docker:2": {}
   },
-  "postCreateCommand": "bash .devcontainer/walkthrough/post-create.sh",
+  "postCreateCommand": "bash .devcontainer/post-create.sh",
   "customizations": {
     "codespaces": {
       "openFiles": [

@@ -16,7 +16,7 @@ commands for reference.
 
     Every code block in this walkthrough is executable. Open the
     walkthrough in
-    [GitHub Codespaces](https://github.com/codespaces/new?repo=pgEdge/coldfront&devcontainer_path=.devcontainer/walkthrough/devcontainer.json)
+    [GitHub Codespaces](https://github.com/codespaces/new?repo=pgEdge/coldfront)
     for a ready-to-go environment, or install the
     [Runme extension](https://marketplace.visualstudio.com/items?itemName=stateful.runme)
     in VS Code to run commands directly from the markdown.

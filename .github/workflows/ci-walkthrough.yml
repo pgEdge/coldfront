@@ -1,9 +1,9 @@
 name: CI - Walkthrough
 on:
   push:
-    paths: ['examples/walkthrough/**', '.devcontainer/walkthrough/**', 'docs/walkthrough.md', '.github/workflows/ci-walkthrough.yml']
+    paths: ['examples/walkthrough/**', '.devcontainer/**', 'docs/walkthrough.md', '.github/workflows/ci-walkthrough.yml']
   pull_request:
-    paths: ['examples/walkthrough/**', '.devcontainer/walkthrough/**', 'docs/walkthrough.md', '.github/workflows/ci-walkthrough.yml']
+    paths: ['examples/walkthrough/**', '.devcontainer/**', 'docs/walkthrough.md', '.github/workflows/ci-walkthrough.yml']
   workflow_dispatch:
 
 concurrency:
