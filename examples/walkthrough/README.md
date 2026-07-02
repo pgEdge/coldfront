@@ -18,8 +18,11 @@ depend on git. There are two primary entrypoints:
    then launches the interactive guide. Requires Docker and curl.
 
 2. GitHub Codespaces — opens a pre-configured environment with Docker-in-
-   Docker and all tools pre-installed. The devcontainer runs setup during
-   creation and launches the guide automatically.
+   Docker and all tools pre-installed. The devcontainer checks
+   prerequisites during creation and opens `docs/walkthrough.md` on
+   attach — every code block in it is executable via the pre-installed
+   Runme extension. The interactive guide is the terminal alternative:
+   `bash examples/walkthrough/guide.sh`.
 
 If a user runs the `curl ... | bash` install inside Codespaces,
 `install.sh` detects the `$CODESPACES` environment variable and exits as
@@ -159,9 +162,12 @@ What happens:
 ### GitHub Codespaces
 
 Open a Codespace from the repository and select the walkthrough
-devcontainer when prompted. The devcontainer handles prerequisites and
-opens the guide automatically. Running `curl ... | bash` inside
-Codespaces is a no-op — `install.sh` detects `$CODESPACES` and exits.
+devcontainer when prompted. The devcontainer handles prerequisites
+during creation and opens `docs/walkthrough.md` on attach, with the
+Runme extension installed so its code blocks run in place. For the
+interactive guide instead, run `bash examples/walkthrough/guide.sh` in
+the terminal. Running `curl ... | bash` inside Codespaces is a no-op —
+`install.sh` detects `$CODESPACES` and exits.
 
 ### From a cloned repo
 

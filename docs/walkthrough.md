@@ -1,3 +1,6 @@
+---
+cwd: ../
+---
 # ColdFront guided walkthrough
 
 New here? Run the guided walkthrough.
@@ -8,6 +11,15 @@ decoupled mode (Iceberg-only from the first row), and the standalone
 partitioner - plus a distributed demo that runs two nodes over one
 shared lake. This page mirrors the interactive guide as copy-pasteable
 commands for reference.
+
+!!! tip "Run the commands as you read"
+
+    Every code block in this walkthrough is executable. Open the
+    walkthrough in
+    [GitHub Codespaces](https://github.com/codespaces/new?repo=pgEdge/coldfront&devcontainer_path=.devcontainer/walkthrough/devcontainer.json)
+    for a ready-to-go environment, or install the
+    [Runme extension](https://marketplace.visualstudio.com/items?itemName=stateful.runme)
+    in VS Code to run commands directly from the markdown.
 
 !!! warning "Pre-release beta software"
 
@@ -42,6 +54,14 @@ If you already have the repository cloned, run the guide directly:
 ```bash
 bash examples/walkthrough/guide.sh
 ```
+
+!!! note "Codespaces users"
+
+    Prerequisites are already installed and checked - skip the
+    one-liner (it detects Codespaces and exits without doing
+    anything). Run the code blocks in this page as you read, or run
+    `bash examples/walkthrough/guide.sh` in the terminal for the
+    interactive guide.
 
 The guide builds the Docker images on first run (two to five minutes
 for the base compile), brings up the stack, and walks through each
@@ -135,10 +155,6 @@ Tiered storage is a brownfield retrofit: you begin with a plain
 PostgreSQL database full of data, add ColdFront to it, and let the
 archiver relocate the cold majority to object storage - without
 migrating to a new database or changing a line of application SQL.
-
-> **Run the commands as you read.** In Codespaces (or with the Runme
-> VS Code extension) every code block in this page is an executable
-> cell - click *Run* on each. Or follow along in your own terminal.
 
 The following table shows the eleven steps this demo covers:
 

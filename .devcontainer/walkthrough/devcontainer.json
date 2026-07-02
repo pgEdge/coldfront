@@ -1,12 +1,23 @@
 {
   "name": "ColdFront Walkthrough",
   "image": "mcr.microsoft.com/devcontainers/base:ubuntu",
+  "hostRequirements": {
+    "cpus": 4
+  },
   "features": {
     "ghcr.io/devcontainers/features/docker-in-docker:2": {}
   },
   "postCreateCommand": "bash .devcontainer/walkthrough/post-create.sh",
-  "postAttachCommand": "bash examples/walkthrough/guide.sh",
   "customizations": {
-    "vscode": { "extensions": ["stateful.runme"] }
-  }
+    "vscode": {
+      "settings": {
+        "terminal.integrated.defaultProfile.linux": "bash",
+        "workbench.startupEditor": "none"
+      },
+      "extensions": [
+        "stateful.runme"
+      ]
+    }
+  },
+  "postAttachCommand": "code docs/walkthrough.md 2>/dev/null || true"
 }
