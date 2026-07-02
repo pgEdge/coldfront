@@ -9,6 +9,11 @@
   },
   "postCreateCommand": "bash .devcontainer/walkthrough/post-create.sh",
   "customizations": {
+    "codespaces": {
+      "openFiles": [
+        "docs/walkthrough.md"
+      ]
+    },
     "vscode": {
       "settings": {
         "terminal.integrated.defaultProfile.linux": "bash",
