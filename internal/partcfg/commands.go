@@ -160,34 +160,62 @@ func runRegister(ctx context.Context, args []string) error {
 // ensures the config table, validates the PK covers the partition key, checks
 // the interval semantics, then INSERTs the row (or prints the dry-run summary).
 func registerToDB(ctx context.Context, connect func(context.Context) (*pgx.Conn, error), row configRow, dryRun bool) error {
-	twoLevel := row.subValues != ""
-	insertSQL := row.insertSQL()
 	conn, err := connect(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = conn.Close(ctx) }()
-	if err := EnsureTable(ctx, conn); err != nil {
+	// dry-run is side-effect free: skip the config-table DDL, just validate.
+	if !dryRun {
+		if err := EnsureTable(ctx, conn); err != nil {
+			return err
+		}
+	}
+	return writeRow(ctx, conn, row, dryRun)
+}
+
+// validateDB is a *pgx.Conn or pgx.Tx: the union of the query methods the row
+// validators need (Exec/Query via DBTX, QueryRow via RowQuerier).
+type validateDB interface {
+	DBTX
+	partition.RowQuerier
+}
+
+// validateRow is the ONE validation gate every partition_config write passes:
+// register, import, and set all run it, so no command can persist a row the
+// others would reject.
+//   - PK-superset: the cutover keys delta capture by the source PK, so the PK
+//     must cover the partition key column(s). 2-level adds the RANGE column (the
+//     LIST column comes from the catalog).
+//   - period validity + retention>hot ordering: PostgreSQL interval semantics,
+//     checked against the connection (the interval column type is the backstop).
+func validateRow(ctx context.Context, db validateDB, row configRow) error {
+	// After the archiver's first-run swap the source is a VIEW over "_"+name, so
+	// validate the PK / partition key against the real partitioned table. register
+	// runs pre-swap and resolves to the source unchanged, so every writer (register
+	// pre-swap, import/set post-swap) validates the same underlying table.
+	base := partition.ResolveSourceTable(ctx, db, row.schema, row.table)
+	if err := validatePKSuperset(ctx, db, row.schema, base, row.column, row.subValues != ""); err != nil {
 		return err
 	}
-	// PK-superset validation: the cutover keys delta capture by the source PK,
-	// so the PK must cover the partition key column(s). 2-level adds the RANGE
-	// column (the LIST column comes from the catalog).
-	if err := validatePKSuperset(ctx, conn, row.schema, row.table, row.column, twoLevel); err != nil {
+	return partition.ValidatePeriods(ctx, db, row.hot, row.retention)
+}
+
+// writeRow validates then inserts one table. register and import both call it
+// (import over a transaction, so a bulk import is all-or-nothing), so an imported
+// table is checked exactly as a singly-registered one. The caller has already
+// ensured the config table exists (skipped under dryRun, which writes nothing).
+func writeRow(ctx context.Context, db validateDB, row configRow, dryRun bool) error {
+	if err := validateRow(ctx, db, row); err != nil {
 		return err
 	}
-	// Period validity + retention>hot ordering are PostgreSQL interval semantics,
-	// so they're checked against the connection (fail fast at register time; the
-	// interval column type is the backstop for any direct write).
-	if err := partition.ValidatePeriods(ctx, conn, row.hot, row.retention); err != nil {
-		return err
-	}
+	insertSQL := row.insertSQL()
 	if dryRun {
 		fmt.Printf("dry-run OK: %s.%s validates; would run:\n%s\n", row.schema, row.table, insertSQL)
 		return nil
 	}
-	if _, err := conn.Exec(ctx, insertSQL); err != nil { // nosemgrep
-		return fmt.Errorf("register %s.%s: %w", row.schema, row.table, err)
+	if _, err := db.Exec(ctx, insertSQL); err != nil { // nosemgrep
+		return fmt.Errorf("write %s.%s: %w", row.schema, row.table, err)
 	}
 	fmt.Printf("registered %s.%s\n", row.schema, row.table)
 	return nil
@@ -578,7 +606,22 @@ EXAMPLES:
 		fmt.Println(sql)
 		return nil
 	}
-	return execSet(ctx, connect, *schema, *table, sql)
+	return execSet(ctx, connect, *schema, *table, sql, setTouchesValidatedField(fs))
+}
+
+// setTouchesValidatedField reports whether the `set` invocation changed a field
+// the shared validation covers (partition key, tier/drop ages, or the 2-level
+// source), so execSet knows to re-validate the resulting row rather than trust
+// the DB CHECK constraints alone.
+func setTouchesValidatedField(fs *flag.FlagSet) bool {
+	touched := false
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "column", "hot-period", "retention", "sub-values-source":
+			touched = true
+		}
+	})
+	return touched
 }
 
 // collectSetClauses walks the flags the user actually set (fs.Visit) and returns
@@ -595,7 +638,7 @@ func collectSetClauses(fs *flag.FlagSet, vals setVals) []string {
 
 // execSet connects, ensures the config table, and runs the UPDATE; a zero
 // row-count means the table isn't managed.
-func execSet(ctx context.Context, connect func(context.Context) (*pgx.Conn, error), schema, table, sql string) error {
+func execSet(ctx context.Context, connect func(context.Context) (*pgx.Conn, error), schema, table, sql string, validate bool) error {
 	conn, err := connect(ctx)
 	if err != nil {
 		return err
@@ -604,14 +647,54 @@ func execSet(ctx context.Context, connect func(context.Context) (*pgx.Conn, erro
 	if err := EnsureTable(ctx, conn); err != nil {
 		return err
 	}
-	tag, err := conn.Exec(ctx, sql) // nosemgrep
+	if validate {
+		return execSetValidated(ctx, conn, schema, table, sql)
+	}
+	if err := execUpdate(ctx, conn, schema, table, sql); err != nil {
+		return err
+	}
+	fmt.Printf("updated %s.%s\n", schema, table)
+	return nil
+}
+
+// execSetValidated applies the UPDATE in a transaction, re-reads the resulting
+// row, and runs the shared validation; a change that would leave the row invalid
+// rolls back.
+func execSetValidated(ctx context.Context, conn *pgx.Conn, schema, table, sql string) error {
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := execUpdate(ctx, tx, schema, table, sql); err != nil {
+		return err
+	}
+	row, found, err := loadRow(ctx, tx, schema, table)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("%s.%s is not managed (no partition_config row)", schema, table)
+	}
+	if err := validateRow(ctx, tx, rowFrom(row)); err != nil {
+		return err
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	fmt.Printf("updated %s.%s\n", schema, table)
+	return nil
+}
+
+// execUpdate runs the SET UPDATE and errors if no managed row matched.
+func execUpdate(ctx context.Context, db DBTX, schema, table, sql string) error {
+	tag, err := db.Exec(ctx, sql) // nosemgrep
 	if err != nil {
 		return fmt.Errorf("set %s.%s: %w", schema, table, err)
 	}
 	if tag.RowsAffected() == 0 {
 		return fmt.Errorf("%s.%s is not managed (no partition_config row)", schema, table)
 	}
-	fmt.Printf("updated %s.%s\n", schema, table)
 	return nil
 }
 
@@ -666,8 +749,7 @@ EXAMPLES:
 	return nil
 }
 
-// runImport seeds partition_config from a deployment YAML's archiver.tables —
-// the migration path off the YAML deprecation bridge.
+// runImport seeds partition_config from a deployment YAML's archiver.tables list.
 func runImport(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("import", flag.ContinueOnError)
 	cfgPath := fs.String("config", "", "deployment YAML to import: its archiver.tables become partition_config rows (required)")
@@ -676,16 +758,17 @@ func runImport(ctx context.Context, args []string) error {
 	dryRun := fs.Bool("dry-run", false, "validate/parse but make no changes")
 	fs.Usage = simpleUsage(fs, "import", `import — load a deployment YAML's archiver.tables into coldfront.partition_config.
 
-The migration path off the YAML bridge: register every table from an existing
-config file in one shot. Connection config (DSN, iceberg/S3) is NOT imported —
-it stays per-node.
+Register every table in a config file in one shot, each validated exactly as
+`+"`register`"+` validates a single table (PK covers the partition key; retention
+exceeds hot-period). Connection config (DSN, iceberg/S3) is NOT imported — it
+stays per-node.
 
 USAGE:
   <binary> import --config <yaml> [--dsn <dsn>]
 
 EXAMPLES:
-  partitioner import --config legacy.yaml                 # import its tables
-  partitioner import --config legacy.yaml --print-sql     # review the INSERTs first`)
+  partitioner import --config tables.yaml                 # import its tables
+  partitioner import --config tables.yaml --print-sql     # review the INSERTs first`)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -700,9 +783,10 @@ EXAMPLES:
 	if len(cfg.Archiver.Tables) == 0 {
 		return fmt.Errorf("no archiver.tables in %s", *cfgPath)
 	}
-	stmts := buildImportStmts(cfg.Archiver.Tables)
 	if *printSQL {
-		printStmts(stmts)
+		for _, t := range cfg.Archiver.Tables {
+			fmt.Println(rowFrom(t).insertSQL())
+		}
 		return nil
 	}
 	d := *dsn
@@ -712,47 +796,48 @@ EXAMPLES:
 	if d == "" {
 		return fmt.Errorf("no DSN: set postgres.dsn in --config or pass --dsn")
 	}
-	return applyImport(ctx, d, cfg.Archiver.Tables, stmts, *dryRun)
+	return applyImport(ctx, d, cfg.Archiver.Tables, *dryRun)
 }
 
-// buildImportStmts renders one INSERT per table, index-aligned with tables so
-// the exec loop can name the failing table by the same index.
-func buildImportStmts(tables []config.TableConfig) []string {
-	stmts := make([]string, len(tables))
-	for i, t := range tables {
-		stmts[i] = rowFrom(t).insertSQL()
-	}
-	return stmts
-}
-
-func printStmts(stmts []string) {
-	for _, s := range stmts {
-		fmt.Println(s)
-	}
-}
-
-// applyImport connects, ensures the config table, then runs the import INSERTs
-// (or prints the dry-run summary). tables and stmts must stay index-aligned so a
-// failure names the right table.
-func applyImport(ctx context.Context, dsn string, tables []config.TableConfig, stmts []string, dryRun bool) error {
+// applyImport connects, ensures the config table, then writes every table
+// through writeRow — the same validated path `register` uses, so an imported
+// table is checked exactly as a singly-registered one (PK superset, retention
+// > hot). A failure names the offending table and stops the import.
+func applyImport(ctx context.Context, dsn string, tables []config.TableConfig, dryRun bool) error {
 	conn, err := openConn(ctx, dsn)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = conn.Close(ctx) }()
+	// dry-run is side-effect free: validate every table, touch nothing.
+	if dryRun {
+		for _, t := range tables {
+			if err := writeRow(ctx, conn, rowFrom(t), true); err != nil {
+				return fmt.Errorf("import %s: %w", t.SourceTable, err)
+			}
+		}
+		fmt.Printf("dry-run OK: would import %d table(s) into coldfront.partition_config\n", len(tables))
+		return nil
+	}
 	if err := EnsureTable(ctx, conn); err != nil {
 		return err
 	}
-	if dryRun {
-		fmt.Printf("dry-run OK: would import %d table(s)\n", len(stmts))
-		return nil
+	// One transaction for the whole import: a failure on any table rolls back the
+	// earlier inserts, so a bulk import never leaves partial config behind.
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		return err
 	}
-	for i, s := range stmts {
-		if _, err := conn.Exec(ctx, s); err != nil {
-			return fmt.Errorf("import %s: %w", tables[i].SourceTable, err)
+	defer func() { _ = tx.Rollback(ctx) }()
+	for _, t := range tables {
+		if err := writeRow(ctx, tx, rowFrom(t), false); err != nil {
+			return fmt.Errorf("import %s: %w", t.SourceTable, err)
 		}
 	}
-	fmt.Printf("imported %d table(s) into coldfront.partition_config\n", len(stmts))
+	if err := tx.Commit(ctx); err != nil {
+		return err
+	}
+	fmt.Printf("imported %d table(s) into coldfront.partition_config\n", len(tables))
 	return nil
 }
 
