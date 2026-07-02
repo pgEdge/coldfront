@@ -1,0 +1,45 @@
+Source: pgedge-pg-duckdb
+Section: database
+Priority: optional
+Maintainer: pgEdge Build Team <support@pgedge.com>
+Build-Depends:
+ debhelper-compat (= 13),
+ pgedge-postgresql-all <!nocheck>,
+ pgedge-postgresql-server-dev-PG_MAJOR_VERSION,
+ pgedge-postgresql-server-dev-all,
+ cmake,
+ ninja-build,
+ g++,
+ pkg-config,
+ libssl-dev,
+ liblz4-dev,
+ zlib1g-dev,
+ libicu-dev,
+ libcurl4-openssl-dev,
+ git,
+ wget,
+ ca-certificates,
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+Homepage: https://github.com/duckdb/pg_duckdb
+
+Package: pgedge-postgresql-PG_MAJOR_VERSION-pg-duckdb
+Architecture: any
+Depends:
+ ${misc:Depends},
+ ${shlibs:Depends},
+ pgedge-postgresql-PG_MAJOR_VERSION,
+ libcurl4,
+Conflicts:
+ postgresql-PG_MAJOR_VERSION-pg-duckdb,
+Provides:
+ postgresql-PG_MAJOR_VERSION-pg-duckdb,
+Replaces:
+ postgresql-PG_MAJOR_VERSION-pg-duckdb,
+Breaks:
+ postgresql-PG_MAJOR_VERSION-pg-duckdb,
+Description: DuckDB analytics engine embedded in PostgreSQL
+ pg_duckdb embeds DuckDB's columnar-vectorized analytics engine into
+ PostgreSQL, enabling fast analytical queries and direct access to data
+ lakes and external file formats (Parquet, CSV, Iceberg, object storage)
+ from within Postgres.

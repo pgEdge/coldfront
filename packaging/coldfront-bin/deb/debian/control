@@ -1,0 +1,20 @@
+Source: pgedge-coldfront
+Section: database
+Priority: optional
+Maintainer: pgEdge Build Team <support@pgedge.com>
+Build-Depends:
+ debhelper-compat (= 13),
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+Homepage: https://github.com/pgEdge/ColdFront
+
+Package: pgedge-coldfront
+Architecture: any
+Depends:
+ ${misc:Depends},
+ ${shlibs:Depends},
+Description: ColdFront tiered-storage command-line tools
+ ColdFront provides transparent tiered storage for PostgreSQL (hot PG + cold
+ Iceberg over object storage). This package contains the ColdFront tools:
+ archiver (cold-tier writer), partitioner, and compactor (Iceberg
+ maintenance) — PostgreSQL-version-independent, statically linked binaries.

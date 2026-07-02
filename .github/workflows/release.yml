@@ -1,71 +1,685 @@
+# -------------------------------------------------------------------------
+#
+# pgEdge ColdFront — release pipeline (in-repo packaging)
+#
+# Tag-driven. A pushed v* tag builds and publishes, in one GitHub Actions run:
+#   1. GoReleaser: the Go binaries (archiver, partitioner, compactor) + the
+#      GitHub release, and uploads the linux tarballs as a workflow artifact.
+#   2. Native RPM/DEB packages for three components, across PG 16/17/18 and
+#      el9/el10 + jammy/noble/bullseye/bookworm/trixie, amd64 + arm64:
+#        * packaging/coldfront-bin  — the Go tools (PG-independent, per-arch)
+#        * packaging/coldfront      — the coldfront PG extension (per PG major)
+#        * packaging/pg_duckdb                  — pg_duckdb 1.5.4 (per PG major)
+#        * packaging/coldfront-duckdb-extensions — patched iceberg/avro/azure/
+#          postgres_scanner .duckdb_extension (PG-independent, per distro/arch)
+#      pg_duckdb + duckdb-extensions keep their own version (1.5.4); coldfront-bin
+#      + the extension track the release tag.
+#   3. Push RPMs to dnf.pgedge.com and DEBs to apt.pgedge.com, back up to S3,
+#      and publish a promotion manifest + Slack notification.
+#
+# common-functions.sh is supplied by pgedge-builder-action at build time.
+# -------------------------------------------------------------------------
+
 name: Release
 
-# Tag-driven releases. Push a v* tag (e.g. v0.1.0) to cut a release; the
-# workflow_dispatch entry builds a snapshot (no GitHub release) for dry runs.
 on:
-  push:
-    tags:
-      - 'v*'
-  workflow_dispatch:
+    push:
+        tags:
+            - 'v*'
+    workflow_dispatch:
+        inputs:
+            simulate_tag:
+                description: 'Pretend a v* tag was pushed (e.g. "v1.0.0-test1") to exercise the pipeline on a branch (GoReleaser --snapshot, no live release/repos).'
+                required: false
+                default: ''
+            force_push:
+                description: 'Publish RPMs/DEBs even if some matrix cells failed. Only honored on real tag pushes.'
+                required: false
+                default: 'false'
 
 permissions:
-  contents: write
+    contents: read
+
+concurrency:
+    group: release-${{ github.ref_name }}
+    cancel-in-progress: false
+
+env:
+    # Umbrella name for the backup/manifest grouping; per-component identity
+    # lives in the manifest cells[].
+    COMPONENT_NAME: ${{ github.event.repository.name }}
 
 jobs:
-  goreleaser:
-    name: Build and release
-    runs-on: ubuntu-latest
-    steps:
-      - name: Checkout
-        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6.0.3
-        with:
-          fetch-depth: 0
+    # =========================================================================
+    # Tag parsing → (repo_type, version, buildnum).
+    # =========================================================================
+    determine-repo-type:
+        name: Determine repo routing
+        runs-on: ubuntu-latest
+        if: github.ref_type == 'tag' || github.event.inputs.simulate_tag != ''
+        outputs:
+            repo-type:          ${{ steps.route.outputs.repo_type }}
+            component-version:  ${{ steps.parse.outputs.version }}
+            component-buildnum: ${{ steps.parse.outputs.buildnum }}
+            effective-tag:      ${{ steps.parse.outputs.effective_tag }}
+            simulated:          ${{ steps.parse.outputs.simulated }}
+        steps:
+            - name: Checkout pgedge-parse-release-tag
+              env:
+                  TOKEN: ${{ secrets.PGEDGE_BUILDER_TOKEN }}
+              run: |
+                  set -euo pipefail
+                  mkdir -p .github/actions
+                  git clone --depth 1 \
+                      "https://x-access-token:${TOKEN}@github.com/pgEdge/pgedge-parse-release-tag.git" \
+                      ".github/actions/pgedge-parse-release-tag"
+            - name: Parse release tag
+              id: parse
+              uses: ./.github/actions/pgedge-parse-release-tag
+              with:
+                  simulate_tag: ${{ github.event.inputs.simulate_tag }}
+            - name: Route suffix → repo_type
+              id: route
+              env:
+                  SUFFIX:        ${{ steps.parse.outputs.suffix }}
+                  EFFECTIVE_TAG: ${{ steps.parse.outputs.effective_tag }}
+              run: |
+                  set -euo pipefail
+                  case "$SUFFIX" in
+                      test*|dev*)            repo_type=daily   ;;
+                      rc*|beta*|alpha*|"")   repo_type=staging ;;
+                      *)
+                          echo "::error::Unsupported suffix '$SUFFIX' (effective tag: $EFFECTIVE_TAG)"
+                          exit 1
+                          ;;
+                  esac
+                  echo "repo_type=$repo_type" >> "$GITHUB_OUTPUT"
+                  echo "Routed suffix '$SUFFIX' → repo_type=$repo_type"
 
-      - name: Fetch tags
-        run: git fetch --force --tags
+    # =========================================================================
+    # GoReleaser — builds archiver/partitioner/compactor, publishes the GitHub
+    # release (real tag) or a snapshot (branch dispatch), and uploads the linux
+    # tarballs as the release-artifacts the binaries package cells consume.
+    # =========================================================================
+    build:
+        name: Build (GoReleaser)
+        runs-on: ubuntu-latest
+        permissions:
+            contents: write
+        steps:
+            - name: Checkout
+              uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+              with:
+                  fetch-depth: 0
+            - name: Fetch tags
+              run: git fetch --force --tags
+            - name: Set up Go
+              uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+              with:
+                  go-version-file: go.mod
+                  cache: true
+            - name: Vet
+              run: go vet ./...
+            - name: Run GoReleaser
+              uses: goreleaser/goreleaser-action@9a127d869fb706213d29cdf8eef3a4ea2b869415 # v7
+              with:
+                  distribution: goreleaser
+                  version: "~> v2"
+                  args: release --clean ${{ (github.event_name == 'workflow_dispatch' && github.ref_type != 'tag') && '--snapshot' || '' }}
+              env:
+                  GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            - name: Verify Linux binaries are statically linked
+              run: |
+                  set -euo pipefail
+                  for tarball in dist/coldfront_*_linux_*.tar.gz; do
+                    echo "== $tarball =="
+                    tmp="$(mktemp -d)"
+                    tar xzf "$tarball" -C "$tmp"
+                    for bin in archiver partitioner compactor; do
+                      if ! file "$tmp/$bin" | grep -q "statically linked"; then
+                        echo "ERROR: $bin in $tarball is not statically linked" >&2
+                        file "$tmp/$bin" >&2
+                        exit 1
+                      fi
+                      echo "OK: $bin statically linked"
+                    done
+                  done
+            - name: Upload release artifacts (for packaging)
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              with:
+                  name: release-artifacts
+                  path: dist/*.tar.gz
+                  retention-days: 1
 
-      - name: Set up Go
-        uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6.4.0
-        with:
-          go-version-file: go.mod
-          cache: true
+    # =========================================================================
+    # Build matrix — detect per component, then merge into one combined matrix
+    # whose cells carry component_name / pg_version / component_version.
+    # =========================================================================
+    detect-matrix:
+        name: Detect build matrix
+        runs-on: ubuntu-latest
+        needs: [determine-repo-type]
+        outputs:
+            rpm_matrix: ${{ steps.merge.outputs.rpm_matrix }}
+            deb_matrix: ${{ steps.merge.outputs.deb_matrix }}
+            has_rpm:    ${{ steps.merge.outputs.has_rpm }}
+            has_deb:    ${{ steps.merge.outputs.has_deb }}
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+            - name: Checkout pgedge-detect-build-matrix
+              env:
+                  TOKEN: ${{ secrets.PGEDGE_BUILDER_TOKEN }}
+              run: |
+                  set -euo pipefail
+                  mkdir -p .github/actions
+                  git clone --depth 1 \
+                      "https://x-access-token:${TOKEN}@github.com/pgEdge/pgedge-detect-build-matrix.git" \
+                      ".github/actions/pgedge-detect-build-matrix"
+            - name: Detect — pg_duckdb (PG 16/17/18)
+              id: pgduckdb
+              uses: ./.github/actions/pgedge-detect-build-matrix
+              with:
+                  component_name: packaging/pg_duckdb
+                  pg_versions: '16,17,18'
+                  archs: '["amd64","arm64"]'
+                  rpm_images: '["almalinux:9","almalinux:10"]'
+                  deb_images: '["ubuntu:jammy","ubuntu:noble","debian:bullseye","debian:bookworm","debian:trixie"]'
+            - name: Detect — coldfront extension (PG 16/17/18)
+              id: coldfront
+              uses: ./.github/actions/pgedge-detect-build-matrix
+              with:
+                  component_name: packaging/coldfront
+                  pg_versions: '16,17,18'
+                  archs: '["amd64","arm64"]'
+                  rpm_images: '["almalinux:9","almalinux:10"]'
+                  deb_images: '["ubuntu:jammy","ubuntu:noble","debian:bullseye","debian:bookworm","debian:trixie"]'
+            - name: Detect — coldfront binaries (PG-independent)
+              id: bin
+              uses: ./.github/actions/pgedge-detect-build-matrix
+              with:
+                  component_name: packaging/coldfront-bin
+                  archs: '["amd64","arm64"]'
+                  rpm_images: '["almalinux:9","almalinux:10"]'
+                  deb_images: '["ubuntu:jammy","ubuntu:noble","debian:bullseye","debian:bookworm","debian:trixie"]'
+            - name: Detect — coldfront duckdb-extensions (PG-independent)
+              id: duckdbext
+              uses: ./.github/actions/pgedge-detect-build-matrix
+              with:
+                  component_name: packaging/coldfront-duckdb-extensions
+                  archs: '["amd64","arm64"]'
+                  rpm_images: '["almalinux:9","almalinux:10"]'
+                  deb_images: '["ubuntu:jammy","ubuntu:noble","debian:bullseye","debian:bookworm","debian:trixie"]'
+            - name: Merge component matrices
+              id: merge
+              env:
+                  TAG_VERSION: ${{ needs.determine-repo-type.outputs.component-version }}
+                  RPM_PGD: ${{ steps.pgduckdb.outputs.rpm_matrix }}
+                  DEB_PGD: ${{ steps.pgduckdb.outputs.deb_matrix }}
+                  RPM_CF:  ${{ steps.coldfront.outputs.rpm_matrix }}
+                  DEB_CF:  ${{ steps.coldfront.outputs.deb_matrix }}
+                  RPM_BIN: ${{ steps.bin.outputs.rpm_matrix }}
+                  DEB_BIN: ${{ steps.bin.outputs.deb_matrix }}
+                  RPM_DUX: ${{ steps.duckdbext.outputs.rpm_matrix }}
+                  DEB_DUX: ${{ steps.duckdbext.outputs.deb_matrix }}
+              run: |
+                  set -euo pipefail
+                  # Tag a component's cells with component_name + component_version.
+                  # pg_duckdb + duckdb-extensions keep their own version (empty ->
+                  # common.sh default, the DuckDB version); coldfront-bin + the
+                  # extension take the release tag.
+                  tag_cells() {  # <matrix-json> <component_name> <version>
+                      jq -c --arg c "$2" --arg v "$3" \
+                        '[.include[] | . + {component_name:$c, component_version:$v}]' <<<"$1"
+                  }
+                  rpm_inc="$(jq -c -n \
+                      --argjson a "$(tag_cells "$RPM_PGD" packaging/pg_duckdb '')" \
+                      --argjson b "$(tag_cells "$RPM_CF"  packaging/coldfront "$TAG_VERSION")" \
+                      --argjson d "$(tag_cells "$RPM_BIN" packaging/coldfront-bin "$TAG_VERSION")" \
+                      --argjson e "$(tag_cells "$RPM_DUX" packaging/coldfront-duckdb-extensions '')" \
+                      '$a + $b + $d + $e')"
+                  deb_inc="$(jq -c -n \
+                      --argjson a "$(tag_cells "$DEB_PGD" packaging/pg_duckdb '')" \
+                      --argjson b "$(tag_cells "$DEB_CF"  packaging/coldfront "$TAG_VERSION")" \
+                      --argjson d "$(tag_cells "$DEB_BIN" packaging/coldfront-bin "$TAG_VERSION")" \
+                      --argjson e "$(tag_cells "$DEB_DUX" packaging/coldfront-duckdb-extensions '')" \
+                      '$a + $b + $d + $e')"
+                  echo "rpm_matrix={\"include\":$rpm_inc}" >> "$GITHUB_OUTPUT"
+                  echo "deb_matrix={\"include\":$deb_inc}" >> "$GITHUB_OUTPUT"
+                  echo "has_rpm=$( [ "$(jq 'length' <<<"$rpm_inc")" -gt 0 ] && echo true || echo false )" >> "$GITHUB_OUTPUT"
+                  echo "has_deb=$( [ "$(jq 'length' <<<"$deb_inc")" -gt 0 ] && echo true || echo false )" >> "$GITHUB_OUTPUT"
 
-      # Both binaries are pure-Go (CGO_ENABLED=0); all four targets
-      # (linux/darwin x amd64/arm64) cross-compile cleanly on this one runner.
-      - name: Vet
-        run: go vet ./...
-
-      - name: Run GoReleaser
-        uses: goreleaser/goreleaser-action@9a127d869fb706213d29cdf8eef3a4ea2b869415 # v7
-        with:
-          distribution: goreleaser
-          version: "~> v2"
-          args: release --clean ${{ github.ref_type != 'tag' && '--snapshot' || '' }}
+    # =========================================================================
+    # RPM build matrix — one cell per (component, PG major, EL major, arch).
+    # =========================================================================
+    package-rpm:
+        name: RPM ${{ matrix.component_name }} ${{ matrix.image }} pg${{ matrix.pg_version }} ${{ matrix.arch }}
+        needs: [determine-repo-type, build, detect-matrix]
+        if: |
+            always() &&
+            needs.determine-repo-type.result == 'success' &&
+            needs.detect-matrix.result == 'success' &&
+            needs.build.result == 'success' &&
+            needs.detect-matrix.outputs.has_rpm == 'true'
+        runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+        strategy:
+            fail-fast: false
+            matrix: ${{ fromJSON(needs.detect-matrix.outputs.rpm_matrix) }}
         env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+            REPO_TYPE:          ${{ needs.determine-repo-type.outputs.repo-type }}
+            COMPONENT_BUILDNUM: ${{ needs.determine-repo-type.outputs.component-buildnum }}
+            COMPONENT_BRANCH:   ${{ needs.determine-repo-type.outputs.effective-tag }}
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+            - name: Derive os_version / safe component
+              id: cell
+              env:
+                  IMAGE: ${{ matrix.image }}
+                  COMP: ${{ matrix.component_name }}
+              run: |
+                  set -euo pipefail
+                  echo "os_version=${IMAGE##*:}" >> "$GITHUB_OUTPUT"
+                  echo "safe_comp=${COMP##*/}" >> "$GITHUB_OUTPUT"
+            - name: Stage binaries tarball (coldfront-bin only)
+              if: matrix.component_name == 'packaging/coldfront-bin'
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              with:
+                  name: release-artifacts
+                  path: go-dist
+            - name: Prepare release-artifacts/ (coldfront-bin only)
+              if: matrix.component_name == 'packaging/coldfront-bin'
+              env:
+                  ARCH: ${{ matrix.arch }}
+              run: |
+                  set -euo pipefail
+                  mkdir -p release-artifacts
+                  cp go-dist/coldfront_*_linux_${ARCH}.tar.gz release-artifacts/coldfront.tar.gz
+                  rm -rf go-dist
+            - name: Checkout pgedge-builder-action
+              env:
+                  TOKEN: ${{ secrets.PGEDGE_BUILDER_TOKEN }}
+              run: |
+                  set -euo pipefail
+                  mkdir -p .github/actions
+                  git clone --depth 1 \
+                      "https://x-access-token:${TOKEN}@github.com/pgEdge/pgedge-builder-action.git" \
+                      ".github/actions/pgedge-builder-action"
+            - name: Build RPM
+              uses: ./.github/actions/pgedge-builder-action
+              with:
+                  image: ${{ matrix.image }}
+                  arch: ${{ matrix.arch }}
+                  component_name: ${{ matrix.component_name }}
+                  pg_version: ${{ matrix.pg_version }}
+                  component_branch: ${{ env.COMPONENT_BRANCH }}
+                  component_version: ${{ matrix.component_version }}
+                  component_buildnum: ${{ env.COMPONENT_BUILDNUM }}
+                  repo_type: ${{ env.REPO_TYPE }}
+                  gpg_private_key: ${{ secrets.GPG_FIPS_RPM_PRIVATE_KEY }}
+                  gpg_public_key: ${{ secrets.GPG_FIPS_RPM_PUBLIC_KEY }}
+                  pgedge_builder_token: ${{ secrets.PGEDGE_BUILDER_TOKEN }}
+            - name: Upload RPM cell artifact
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              with:
+                  name: rpm__${{ steps.cell.outputs.safe_comp }}__el-${{ steps.cell.outputs.os_version }}__pg${{ matrix.pg_version }}__${{ matrix.arch }}
+                  path: output/el${{ steps.cell.outputs.os_version }}-${{ matrix.arch }}/
+                  retention-days: 7
 
-      - name: Verify Linux binaries are statically linked
-        run: |
-          set -euo pipefail
-          for tarball in dist/coldfront_*_linux_*.tar.gz; do
-            echo "== $tarball =="
-            tmp="$(mktemp -d)"
-            tar xzf "$tarball" -C "$tmp"
-            for bin in archiver partitioner; do
-              if ! file "$tmp/$bin" | grep -q "statically linked"; then
-                echo "ERROR: $bin in $tarball is not statically linked" >&2
-                file "$tmp/$bin" >&2
-                exit 1
-              fi
-              echo "OK: $bin statically linked"
-            done
-          done
+    # =========================================================================
+    # DEB build matrix — one cell per (component, PG major, distro, arch).
+    # =========================================================================
+    package-deb:
+        name: DEB ${{ matrix.component_name }} ${{ matrix.image }} pg${{ matrix.pg_version }} ${{ matrix.arch }}
+        needs: [determine-repo-type, build, detect-matrix]
+        if: |
+            always() &&
+            needs.determine-repo-type.result == 'success' &&
+            needs.detect-matrix.result == 'success' &&
+            needs.build.result == 'success' &&
+            needs.detect-matrix.outputs.has_deb == 'true'
+        runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+        strategy:
+            fail-fast: false
+            matrix: ${{ fromJSON(needs.detect-matrix.outputs.deb_matrix) }}
+        env:
+            REPO_TYPE:          ${{ needs.determine-repo-type.outputs.repo-type }}
+            COMPONENT_BUILDNUM: ${{ needs.determine-repo-type.outputs.component-buildnum }}
+            COMPONENT_BRANCH:   ${{ needs.determine-repo-type.outputs.effective-tag }}
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+            - name: Derive distro / safe component
+              id: cell
+              env:
+                  IMAGE: ${{ matrix.image }}
+                  COMP: ${{ matrix.component_name }}
+              run: |
+                  set -euo pipefail
+                  echo "distro=${IMAGE##*:}" >> "$GITHUB_OUTPUT"
+                  echo "safe_comp=${COMP##*/}" >> "$GITHUB_OUTPUT"
+            - name: Stage binaries tarball (coldfront-bin only)
+              if: matrix.component_name == 'packaging/coldfront-bin'
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              with:
+                  name: release-artifacts
+                  path: go-dist
+            - name: Prepare release-artifacts/ (coldfront-bin only)
+              if: matrix.component_name == 'packaging/coldfront-bin'
+              env:
+                  ARCH: ${{ matrix.arch }}
+              run: |
+                  set -euo pipefail
+                  mkdir -p release-artifacts
+                  cp go-dist/coldfront_*_linux_${ARCH}.tar.gz release-artifacts/coldfront.tar.gz
+                  rm -rf go-dist
+            - name: Checkout pgedge-builder-action
+              env:
+                  TOKEN: ${{ secrets.PGEDGE_BUILDER_TOKEN }}
+              run: |
+                  set -euo pipefail
+                  mkdir -p .github/actions
+                  git clone --depth 1 \
+                      "https://x-access-token:${TOKEN}@github.com/pgEdge/pgedge-builder-action.git" \
+                      ".github/actions/pgedge-builder-action"
+            - name: Build DEB
+              uses: ./.github/actions/pgedge-builder-action
+              with:
+                  image: ${{ matrix.image }}
+                  arch: ${{ matrix.arch }}
+                  component_name: ${{ matrix.component_name }}
+                  pg_version: ${{ matrix.pg_version }}
+                  component_branch: ${{ env.COMPONENT_BRANCH }}
+                  component_version: ${{ matrix.component_version }}
+                  component_buildnum: ${{ env.COMPONENT_BUILDNUM }}
+                  repo_type: ${{ env.REPO_TYPE }}
+                  gpg_private_key: ${{ secrets.GPG_FIPS_DEB_PRIVATE_KEY }}
+                  gpg_public_key: ${{ secrets.GPG_FIPS_DEB_PUBLIC_KEY }}
+                  pgedge_builder_token: ${{ secrets.PGEDGE_BUILDER_TOKEN }}
+            - name: Upload DEB cell artifact
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              with:
+                  name: deb__${{ steps.cell.outputs.safe_comp }}__${{ steps.cell.outputs.distro }}__pg${{ matrix.pg_version }}__${{ matrix.arch }}
+                  path: output/${{ steps.cell.outputs.distro }}-${{ matrix.arch }}/
+                  retention-days: 7
 
-      - name: Upload artifacts
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
-        with:
-          name: release-artifacts
-          path: |
-            dist/*.tar.gz
-            dist/checksums.txt
-          retention-days: 30
+    # =========================================================================
+    # Push RPMs → dnf.pgedge.com (all components, batched per EL major) + S3 backup.
+    # =========================================================================
+    push-dnf:
+        name: Push DNF (all components, batched)
+        needs: [determine-repo-type, detect-matrix, package-rpm]
+        if: |
+            always() && github.ref_type == 'tag' &&
+            (needs.package-rpm.result == 'success' ||
+             (github.event.inputs.force_push == 'true' && needs.package-rpm.result != 'cancelled'))
+        runs-on: ubuntu-latest
+        concurrency:
+            group: dnf-push-${{ needs.determine-repo-type.outputs.repo-type }}
+            cancel-in-progress: false
+        outputs:
+            timestamp: ${{ steps.ts.outputs.dnf_ts }}
+        env:
+            REPO_TYPE:         ${{ needs.determine-repo-type.outputs.repo-type }}
+            COMPONENT_VERSION: ${{ needs.determine-repo-type.outputs.component-version }}
+            RPM_MATRIX:        ${{ needs.detect-matrix.outputs.rpm_matrix }}
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+            - name: Timestamp
+              id: ts
+              run: echo "dnf_ts=$(date -u +'%Y%m%d-%H%M%S')" >> "$GITHUB_OUTPUT"
+            - name: Download all RPM cell artifacts
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              with:
+                  pattern: rpm__*
+                  path: rpm-artifacts
+                  merge-multiple: false
+            - name: Organize RPMs by EL major + build targets
+              id: targets
+              run: |
+                  set -euo pipefail
+                  # Each cell artifact dir holds el<os>-<arch> rpms for one
+                  # (component, pg, arch); merge them all by EL major.
+                  os_versions=$(echo "$RPM_MATRIX" | jq -r '[.include[].image | split(":")[1]] | unique | .[]')
+                  for os in $os_versions; do
+                      dest="rpms-el${os}"; mkdir -p "$dest"
+                      find rpm-artifacts -type f -name "*.el${os}.*.rpm" -exec mv -v {} "$dest/" \; 2>/dev/null || true
+                      echo "EL${os}: $(find "$dest" -maxdepth 1 -name '*.rpm' | wc -l) rpms"
+                  done
+                  rm -rf rpm-artifacts
+                  push="$(echo "$os_versions" | jq -R . | jq -cs 'map({"os-version": ., "rpm-dir": ("rpms-el" + .)})')"
+                  echo "push=$push" >> "$GITHUB_OUTPUT"
+                  echo "backup=$(echo "$push" | jq -c 'map({"os-version": .["os-version"], "output-dir": .["rpm-dir"]})')" >> "$GITHUB_OUTPUT"
+            - name: Checkout pgEdge action repos @multi-target
+              env:
+                  TOKEN: ${{ secrets.PGEDGE_BUILDER_TOKEN }}
+              run: |
+                  set -euo pipefail
+                  mkdir -p .github/actions
+                  for repo in pgedge-dnf-repo-builder pgedge-backup-artifacts; do
+                      git clone --depth 1 --branch multi-target \
+                          "https://x-access-token:${TOKEN}@github.com/pgEdge/${repo}.git" ".github/actions/${repo}"
+                  done
+            - name: Push RPMs to yum repo
+              uses: ./.github/actions/pgedge-dnf-repo-builder
+              with:
+                  s3-bucket: ${{ secrets.S3_BUCKET_NAME }}
+                  cf-distribution: ${{ secrets.CLOUDFRONT_DISTRIBUTION }}
+                  repo-type: ${{ env.REPO_TYPE }}
+                  targets: ${{ steps.targets.outputs.push }}
+                  lock-bucket: ${{ secrets.S3_BACKUP_BUCKET_NAME }}
+                  aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+                  aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+            - name: Back up RPMs to S3
+              uses: ./.github/actions/pgedge-backup-artifacts
+              with:
+                  s3-backup-bucket: ${{ secrets.S3_BACKUP_BUCKET_NAME }}
+                  repo-type: ${{ env.REPO_TYPE }}
+                  component-name: ${{ env.COMPONENT_NAME }}
+                  component-version: ${{ env.COMPONENT_VERSION }}
+                  timestamp: ${{ steps.ts.outputs.dnf_ts }}
+                  targets: ${{ steps.targets.outputs.backup }}
+                  aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+                  aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+    # =========================================================================
+    # Push DEBs → apt.pgedge.com (all components, batched per distro) + S3 backup.
+    # =========================================================================
+    push-apt:
+        name: Push APT (all components, batched)
+        needs: [determine-repo-type, detect-matrix, package-deb]
+        if: |
+            always() && github.ref_type == 'tag' &&
+            (needs.package-deb.result == 'success' ||
+             (github.event.inputs.force_push == 'true' && needs.package-deb.result != 'cancelled'))
+        runs-on: ubuntu-latest
+        concurrency:
+            group: apt-push-${{ needs.determine-repo-type.outputs.repo-type }}
+            cancel-in-progress: false
+        outputs:
+            timestamp: ${{ steps.ts.outputs.apt_ts }}
+        env:
+            REPO_TYPE:         ${{ needs.determine-repo-type.outputs.repo-type }}
+            COMPONENT_VERSION: ${{ needs.determine-repo-type.outputs.component-version }}
+            DEB_MATRIX:        ${{ needs.detect-matrix.outputs.deb_matrix }}
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+            - name: Timestamp
+              id: ts
+              run: echo "apt_ts=$(date -u +'%Y%m%d-%H%M%S')" >> "$GITHUB_OUTPUT"
+            - name: Download all DEB cell artifacts
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              with:
+                  pattern: deb__*
+                  path: deb-artifacts
+                  merge-multiple: false
+            - name: Organize DEBs by distro + build targets
+              id: targets
+              run: |
+                  set -euo pipefail
+                  unique_images=$(echo "$DEB_MATRIX" | jq -c '[.include[].image] | unique')
+                  push='[]'
+                  for image in $(echo "$unique_images" | jq -r '.[]'); do
+                      distro="${image##*:}"; dest="debs-${distro}"; mkdir -p "$dest"
+                      find deb-artifacts -type f -name "*.${distro}_*.deb" -exec mv -v {} "$dest/" \; 2>/dev/null || true
+                      echo "${distro}: $(find "$dest" -maxdepth 1 -name '*.deb' | wc -l) debs"
+                      push="$(jq -c --arg n "$image" --arg d "$dest" '. + [{"os-name":$n,"deb-dir":$d}]' <<<"$push")"
+                  done
+                  rm -rf deb-artifacts
+                  echo "push=$push" >> "$GITHUB_OUTPUT"
+                  echo "backup=$(echo "$push" | jq -c 'map({"os-version": (.["os-name"] | split(":")[1]), "output-dir": .["deb-dir"]})')" >> "$GITHUB_OUTPUT"
+            - name: Checkout pgEdge action repos @multi-target
+              env:
+                  TOKEN: ${{ secrets.PGEDGE_BUILDER_TOKEN }}
+              run: |
+                  set -euo pipefail
+                  mkdir -p .github/actions
+                  for repo in pgedge-apt-repo-builder pgedge-backup-artifacts; do
+                      git clone --depth 1 --branch multi-target \
+                          "https://x-access-token:${TOKEN}@github.com/pgEdge/${repo}.git" ".github/actions/${repo}"
+                  done
+            - name: Push DEBs to apt repo
+              uses: ./.github/actions/pgedge-apt-repo-builder
+              with:
+                  s3-bucket: ${{ secrets.APT_S3_BUCKET_NAME }}
+                  cf-distribution: ${{ secrets.APT_CLOUDFRONT_DISTRIBUTION }}
+                  repo-type: ${{ env.REPO_TYPE }}
+                  targets: ${{ steps.targets.outputs.push }}
+                  lock-bucket: ${{ secrets.S3_BACKUP_BUCKET_NAME }}
+                  gpg-private-key: ${{ secrets.GPG_FIPS_DEB_PRIVATE_KEY }}
+                  aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+                  aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+            - name: Back up DEBs to S3
+              uses: ./.github/actions/pgedge-backup-artifacts
+              with:
+                  s3-backup-bucket: ${{ secrets.S3_BACKUP_BUCKET_NAME }}
+                  repo-type: ${{ env.REPO_TYPE }}
+                  component-name: ${{ env.COMPONENT_NAME }}
+                  component-version: ${{ env.COMPONENT_VERSION }}
+                  timestamp: ${{ steps.ts.outputs.apt_ts }}
+                  targets: ${{ steps.targets.outputs.backup }}
+                  aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+                  aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+
+    # =========================================================================
+    # Aggregated manifest (per-component cells) + Slack.
+    # =========================================================================
+    publish-manifest:
+        name: Publish aggregated backup manifest
+        needs: [determine-repo-type, detect-matrix, push-dnf, push-apt]
+        if: always() && needs.determine-repo-type.result == 'success'
+        runs-on: ubuntu-latest
+        steps:
+            - name: Install jq + awscli
+              run: |
+                  set -euo pipefail
+                  sudo apt-get update
+                  sudo apt-get install -y python3-pip jq
+                  pip3 install --user awscli
+                  echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+            - name: Build manifest (cells[] for qa-certify/promote)
+              id: build_manifest
+              env:
+                  REPO_TYPE:        ${{ needs.determine-repo-type.outputs.repo-type }}
+                  CV:               ${{ needs.determine-repo-type.outputs.component-version }}
+                  CBN:              ${{ needs.determine-repo-type.outputs.component-buildnum }}
+                  EFFECTIVE_TAG:    ${{ needs.determine-repo-type.outputs.effective-tag }}
+                  SIMULATED:        ${{ needs.determine-repo-type.outputs.simulated }}
+                  PUSH_DNF_RESULT:  ${{ needs.push-dnf.result }}
+                  PUSH_APT_RESULT:  ${{ needs.push-apt.result }}
+                  DNF_TS:           ${{ needs.push-dnf.outputs.timestamp }}
+                  APT_TS:           ${{ needs.push-apt.outputs.timestamp }}
+                  RPM_MATRIX:       ${{ needs.detect-matrix.outputs.rpm_matrix }}
+                  DEB_MATRIX:       ${{ needs.detect-matrix.outputs.deb_matrix }}
+              run: |
+                  set -euo pipefail
+                  mkdir -p aggregated
+                  cells='[]'
+                  if [ "${PUSH_DNF_RESULT}" = "success" ] && [ -n "${DNF_TS}" ]; then
+                      while IFS=$'\t' read -r comp cver image os arch; do
+                          path="${REPO_TYPE}/${COMPONENT_NAME}/${CV}/${DNF_TS}/dnf/${os}/"
+                          cell="$(jq -nc --arg fam rpm --arg comp "$comp" --arg cv "$cver" --arg img "$image" --arg ver "$os" --arg arch "$arch" --arg bp "$path" --arg ts "$DNF_TS" --arg rt "$REPO_TYPE" '{family:$fam,component:$comp,component_version:$cv,image:$img,arch:$arch,os_version:$ver,backup_path:$bp,timestamp:$ts,repo_type:$rt}')"
+                          cells="$(jq -c --argjson c "$cell" '. + [$c]' <<<"$cells")"
+                      done < <(echo "$RPM_MATRIX" | jq -r '.include[] | [.component_name, .component_version, .image, (.image|split(":")[1]), .arch] | @tsv')
+                  fi
+                  if [ "${PUSH_APT_RESULT}" = "success" ] && [ -n "${APT_TS}" ]; then
+                      while IFS=$'\t' read -r comp cver image distro arch; do
+                          path="${REPO_TYPE}/${COMPONENT_NAME}/${CV}/${APT_TS}/apt/${distro}/"
+                          cell="$(jq -nc --arg fam deb --arg comp "$comp" --arg cv "$cver" --arg img "$image" --arg distro "$distro" --arg arch "$arch" --arg bp "$path" --arg ts "$APT_TS" --arg rt "$REPO_TYPE" '{family:$fam,component:$comp,component_version:$cv,image:$img,arch:$arch,distro:$distro,backup_path:$bp,timestamp:$ts,repo_type:$rt}')"
+                          cells="$(jq -c --argjson c "$cell" '. + [$c]' <<<"$cells")"
+                      done < <(echo "$DEB_MATRIX" | jq -r '.include[] | [.component_name, .component_version, .image, (.image|split(":")[1]), .arch] | @tsv')
+                  fi
+                  jq -n \
+                      --arg run_id "${GITHUB_RUN_ID}" --arg run_attempt "${GITHUB_RUN_ATTEMPT}" \
+                      --arg repo "${GITHUB_REPOSITORY}" --arg tag "${EFFECTIVE_TAG}" \
+                      --argjson simulated "${SIMULATED}" --arg commit_sha "${GITHUB_SHA}" \
+                      --arg component_name "${COMPONENT_NAME}" --arg component_version "${CV}" \
+                      --arg component_buildnum "${CBN}" --arg repo_type "${REPO_TYPE}" \
+                      --arg dnf_timestamp "${DNF_TS}" --arg apt_timestamp "${APT_TS}" \
+                      --arg push_dnf_outcome "${PUSH_DNF_RESULT}" --arg push_apt_outcome "${PUSH_APT_RESULT}" \
+                      --argjson cells "${cells}" \
+                      '{run_id:$run_id, run_attempt:$run_attempt, repo:$repo, tag:$tag, simulated:$simulated, commit_sha:$commit_sha, component_name:$component_name, component_version:$component_version, component_buildnum:$component_buildnum, repo_type:$repo_type, timestamps:{dnf:$dnf_timestamp, apt:$apt_timestamp}, push_results:{dnf:$push_dnf_outcome, apt:$push_apt_outcome}, cells:$cells}' \
+                      > aggregated/manifest.json
+                  cat aggregated/manifest.json
+                  { echo "manifest_json<<__EOF__"; jq -c '.' aggregated/manifest.json; echo "__EOF__"; } >> "$GITHUB_OUTPUT"
+            - name: Checkout pgedge-build-publisher
+              env:
+                  TOKEN: ${{ secrets.PGEDGE_BUILDER_TOKEN }}
+              run: |
+                  set -euo pipefail
+                  mkdir -p .github/actions
+                  git clone --depth 1 \
+                      "https://x-access-token:${TOKEN}@github.com/pgEdge/pgedge-build-publisher.git" \
+                      ".github/actions/pgedge-build-publisher"
+            - name: Compose Slack fields
+              id: compose_slack
+              env:
+                  CV:               ${{ needs.determine-repo-type.outputs.component-version }}
+                  CBN:              ${{ needs.determine-repo-type.outputs.component-buildnum }}
+                  EFFECTIVE_TAG:    ${{ needs.determine-repo-type.outputs.effective-tag }}
+                  REPO_TYPE:        ${{ needs.determine-repo-type.outputs.repo-type }}
+                  PUSH_DNF_RESULT:  ${{ needs.push-dnf.result }}
+                  PUSH_APT_RESULT:  ${{ needs.push-apt.result }}
+                  ACTOR:            ${{ github.actor }}
+                  REPO_URL:         ${{ github.server_url }}/${{ github.repository }}
+              run: |
+                  set -euo pipefail
+                  unix_ts="$(date -u +%s)"; fallback_ts="$(date -u +'%Y-%m-%d %H:%M UTC')"
+                  subject="${COMPONENT_NAME} <${REPO_URL}/releases/tag/${EFFECTIVE_TAG}|${EFFECTIVE_TAG}>"
+                  s=0; f=0; k=0
+                  for r in "${PUSH_DNF_RESULT}" "${PUSH_APT_RESULT}"; do
+                      case "$r" in success) s=$((s+1));; skipped) k=$((k+1));; *) f=$((f+1));; esac
+                  done
+                  total=$((s+f+k))
+                  if [ "$f" -eq 0 ] && [ "$k" -eq 0 ]; then status="Success"; elif [ "$s" -gt 0 ]; then status="Partial"; elif [ "$k" -eq "$total" ]; then status="Skipped"; else status="Failed"; fi
+                  archs="—"
+                  if [ -f aggregated/manifest.json ]; then a=$(jq -r '(.cells // []) | map(.arch) | unique | join(", ")' aggregated/manifest.json); [ -n "$a" ] && archs="$a"; fi
+                  fields=$(jq -nc --arg channel "${REPO_TYPE}" --arg version "${CV}" --arg buildnum "${CBN}" --arg archs "${archs}" --arg actor "${ACTOR}" --arg unix_ts "${unix_ts}" --arg fallback_ts "${fallback_ts}" '[{title:"Channel",value:("`"+$channel+"`")},{title:"Version",value:("`"+$version+"`")},{title:"Build #",value:("`"+$buildnum+"`")},{title:"Archs",value:("`"+$archs+"`")},{title:"Triggered by",value:$actor},{title:"When",value:("<!date^"+$unix_ts+"^{date_short_pretty} at {time}|"+$fallback_ts+">")}]')
+                  result_fields=$(jq -nc --arg dnf "${PUSH_DNF_RESULT}" --arg apt "${PUSH_APT_RESULT}" '[{title:"Push DNF",value:("`"+$dnf+"`")},{title:"Push APT",value:("`"+$apt+"`")}]')
+                  { echo "status=${status}"; echo "subject<<__S__"; echo "${subject}"; echo "__S__"; echo "fields<<__F__"; echo "${fields}"; echo "__F__"; echo "result_fields<<__RF__"; echo "${result_fields}"; echo "__RF__"; } >> "$GITHUB_OUTPUT"
+            - name: Publish manifest + Slack notification
+              uses: ./.github/actions/pgedge-build-publisher
+              with:
+                  manifest_json:    ${{ steps.build_manifest.outputs.manifest_json }}
+                  s3_backup_bucket: ${{ secrets.S3_BACKUP_BUCKET_NAME }}
+                  repo_type:        ${{ needs.determine-repo-type.outputs.repo-type }}
+                  component_name:   ${{ env.COMPONENT_NAME }}
+                  skip_publish: ${{ needs.determine-repo-type.outputs.simulated == 'true' || (needs.push-dnf.result != 'success' && needs.push-apt.result != 'success') }}
+                  status: ${{ steps.compose_slack.outputs.status }}
+                  push_dnf_result: ${{ needs.push-dnf.result }}
+                  push_apt_result: ${{ needs.push-apt.result }}
+                  slack_webhook:   ${{ secrets.SLACK_CHANNEL_URL }}
+                  subject:            ${{ steps.compose_slack.outputs.subject }}
+                  fields_json:        ${{ steps.compose_slack.outputs.fields }}
+                  result_fields_json: ${{ steps.compose_slack.outputs.result_fields }}
+                  tagline: "pgEdge ColdFront release pipeline"
+                  aws_access_key_id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+                  aws_secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+            - name: Upload aggregated manifest as workflow artifact
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              with:
+                  name: aggregated-manifest
+                  path: aggregated/manifest.json
+                  retention-days: 90

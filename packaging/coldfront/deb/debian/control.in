@@ -1,0 +1,25 @@
+Source: pgedge-coldfront
+Section: database
+Priority: optional
+Maintainer: pgEdge Build Team <support@pgedge.com>
+Build-Depends:
+ debhelper-compat (= 13),
+ pgedge-postgresql-all <!nocheck>,
+ pgedge-postgresql-server-dev-PG_MAJOR_VERSION,
+ pgedge-postgresql-server-dev-all,
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+Homepage: https://github.com/pgEdge/ColdFront
+
+Package: pgedge-postgresql-PG_MAJOR_VERSION-coldfront
+Architecture: any
+Depends:
+ ${misc:Depends},
+ ${shlibs:Depends},
+ pgedge-postgresql-PG_MAJOR_VERSION,
+ pgedge-postgresql-PG_MAJOR_VERSION-pg-duckdb,
+Description: Transparent tiered storage for PostgreSQL (hot PG + cold Iceberg)
+ ColdFront routes DML on tiered views across a hot tier (PostgreSQL) and a
+ cold tier (Apache Iceberg over object storage), with cold reads/writes served
+ through pg_duckdb. This package contains the coldfront PostgreSQL extension
+ (server module + SQL).
