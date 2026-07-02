@@ -1536,10 +1536,9 @@ $$;
 --   1. Creates the Iceberg table via duckdb.raw_query('CREATE TABLE ice...').
 --   2. Creates a PG view <p_schema>.<p_table> that wraps iceberg_scan() with
 --      proper column projections (and view-cast for jsonb/interval).
---   3. Creates an INSTEAD OF INSERT trigger on the view that routes writes to
---      duckdb.raw_query('INSERT INTO ice...').
---   4. Registers the view in coldfront.tiered_views with is_iceberg_only=true,
---      so the post_parse_analyze hook routes UPDATE/DELETE to the cold path.
+--   3. Registers the view in coldfront.tiered_views with is_iceberg_only=true;
+--      the C post_parse_analyze hook then rewrites INSERT/UPDATE/DELETE on the
+--      view into cold-path duckdb.raw_query(...) DML.
 CREATE OR REPLACE FUNCTION coldfront.create_iceberg_table(
     p_schema         text,
     p_table          text,
@@ -1553,9 +1552,6 @@ DECLARE
     view_proj        text := '';
     placeholders     text := '';
     new_refs         text := '';
-    partition_clause text := '';
-    insert_fmt       text;
-    trig_fn          text;
     n                int  := 0;
     col              jsonb;
     col_name         text;
@@ -1661,21 +1657,15 @@ BEGIN
         format('SELECT * FROM ice.default.%s', p_table)
     );
 
-    -- 3. No INSTEAD OF INSERT trigger: the C post_parse_analyze hook intercepts
-    --    INSERT INTO <iceberg-only-view> (see coldfront.c emit_cold /
-    --    prefix_pg_tables_with_pglocal) and rewrites it into a single bulk
-    --    SELECT duckdb.raw_query('INSERT INTO ice.… VALUES/SELECT …') — one
-    --    Iceberg snapshot for the whole statement regardless of row count, so a
-    --    multi-row or parallel INSERT cannot incur per-row 409
-    --    CatalogCommitConflicts. INSERT … SELECT FROM <pg_source> gets each
-    --    PG-table reference prefixed with `pglocal.` so DuckDB's postgres
-    --    extension streams source rows over libpq with no local materialisation.
-
-    -- Drop a per-row insert trigger if one is present (e.g. left by an upgrade);
-    -- this view uses the hook-rewrite path above, not a trigger.
-    EXECUTE format(
-        'DROP TRIGGER IF EXISTS coldfront_iceonly_insert ON %I.%I',
-        p_schema, p_table);
+    -- 3. The C post_parse_analyze hook intercepts INSERT INTO the iceberg-only
+    --    view (see coldfront.c emit_cold / prefix_pg_tables_with_pglocal) and
+    --    rewrites it into a single bulk duckdb.raw_query('INSERT INTO ice.…
+    --    VALUES/SELECT …') — one Iceberg snapshot for the whole statement
+    --    regardless of row count, so a multi-row or parallel INSERT cannot incur
+    --    per-row 409 CatalogCommitConflicts. INSERT … SELECT FROM <pg_source>
+    --    gets each PG-table reference prefixed with `pglocal.` so DuckDB's
+    --    postgres extension streams source rows over libpq with no local
+    --    materialisation.
 
     -- 4. Registry row — is_iceberg_only=true tells the C hook to short-circuit
     --    classify_tier to TIER_COLD for any INSERT/UPDATE/DELETE on this view.
