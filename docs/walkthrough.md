@@ -25,8 +25,6 @@ The walkthrough requires the following:
   recommended for the standard data volume).
 - `curl`, `bash`, and `psql` on the host (the psql commands connect to
   the published port).
-- Apple Silicon (M1/M2/M3): the base image is multi-arch, so the
-  walkthrough runs natively.
 
 ## Run it
 
