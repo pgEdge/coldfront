@@ -22,3 +22,10 @@ execute_before_dh_install:
 
 override_dh_installdocs:
 	dh_installdocs --all README.*
+
+execute_after_dh_install:
+	# Ship the example deployment config as the default config file, renamed to
+	# config.yaml. The tools take `-config <path>`; point them at this. It lands
+	# under /etc and debian/pgedge-coldfront.conffiles marks it a conffile, so an
+	# admin's edited copy survives upgrades.
+	install -D -m 0644 config.example.yaml debian/pgedge-coldfront/etc/coldfront/config.yaml

@@ -1,5 +1,9 @@
 %global sname coldfront
 
+# Prebuilt, fully-stripped static Go binaries — there is no debug info or source
+# to extract, so disable the (empty) debuginfo/debugsource subpackages.
+%global debug_package %{nil}
+
 Name:		pgedge-%{sname}
 Version:	%{coldfront_version}
 Release:	%{coldfront_buildnum}%{?dist}
@@ -36,6 +40,10 @@ gpg --armor --detach-sign --local-user "$KEY_ID" --output %{_builddir}/%{sname}-
 install -D -m 0755 archiver    %{buildroot}%{_bindir}/archiver
 install -D -m 0755 partitioner %{buildroot}%{_bindir}/partitioner
 install -D -m 0755 compactor   %{buildroot}%{_bindir}/compactor
+# Ship the example deployment config as the default config file. The tools take
+# `-config <path>`; point them at this. Installed %config(noreplace) so an admin's
+# edited copy survives upgrades (a new default lands as config.yaml.rpmnew).
+install -D -m 0644 config.example.yaml %{buildroot}%{_sysconfdir}/coldfront/config.yaml
 install -D -m 0644 %{sname}-sbom.json     %{buildroot}%{_datadir}/pgedge-%{sname}/%{sname}-sbom.json
 install -D -m 0644 %{sname}-sbom.json.asc %{buildroot}%{_datadir}/pgedge-%{sname}/%{sname}-sbom.json.asc
 
@@ -45,9 +53,11 @@ install -D -m 0644 %{sname}-sbom.json.asc %{buildroot}%{_datadir}/pgedge-%{sname
 %{_bindir}/archiver
 %{_bindir}/partitioner
 %{_bindir}/compactor
+%dir %{_sysconfdir}/coldfront
+%config(noreplace) %{_sysconfdir}/coldfront/config.yaml
 %{_datadir}/pgedge-%{sname}/%{sname}-sbom.json
 %{_datadir}/pgedge-%{sname}/%{sname}-sbom.json.asc
 
 %changelog
-* Mon Jun 30 2026 Muhammad Aqeel <muhammad.aqeel@pgedge.com> - 1.0.0-1
+* Tue Jun 30 2026 Muhammad Aqeel <muhammad.aqeel@pgedge.com> - 1.0.0-1
 - Initial build of the pgEdge ColdFront tools (archiver, partitioner, compactor)

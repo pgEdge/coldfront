@@ -5,15 +5,21 @@
 # Tag-driven. A pushed v* tag builds and publishes, in one GitHub Actions run:
 #   1. GoReleaser: the Go binaries (archiver, partitioner, compactor) + the
 #      GitHub release, and uploads the linux tarballs as a workflow artifact.
-#   2. Native RPM/DEB packages for three components, across PG 16/17/18 and
+#   2. Native RPM/DEB packages for four components, across PG 16/17/18 and
 #      el9/el10 + jammy/noble/bullseye/bookworm/trixie, amd64 + arm64:
 #        * packaging/coldfront-bin  — the Go tools (PG-independent, per-arch)
 #        * packaging/coldfront      — the coldfront PG extension (per PG major)
 #        * packaging/pg_duckdb                  — pg_duckdb 1.5.4 (per PG major)
 #        * packaging/coldfront-duckdb-extensions — patched iceberg/avro/azure/
-#          postgres_scanner .duckdb_extension (PG-independent, per distro/arch)
+#          postgres_scanner .duckdb_extension.
 #      pg_duckdb + duckdb-extensions keep their own version (1.5.4); coldfront-bin
 #      + the extension track the release tag.
+#
+#      The duckdb-extensions are BUILD-ONCE per arch: build-duckdb-ext compiles
+#      them a single time on manylinux_2_28 (glibc 2.28 baseline → portable to
+#      every supported distro), verify-duckdb-ext then LOADs all four in the real
+#      DuckDB engine on every distro as a gate, and the per-distro package-ext-*
+#      cells only repackage those verified binaries (no recompile).
 #   3. Push RPMs to dnf.pgedge.com and DEBs to apt.pgedge.com, back up to S3,
 #      and publish a promotion manifest + Slack notification.
 #
@@ -160,10 +166,19 @@ jobs:
         runs-on: ubuntu-latest
         needs: [determine-repo-type]
         outputs:
+            # Source-built components (pg_duckdb, coldfront, coldfront-bin).
             rpm_matrix: ${{ steps.merge.outputs.rpm_matrix }}
             deb_matrix: ${{ steps.merge.outputs.deb_matrix }}
             has_rpm:    ${{ steps.merge.outputs.has_rpm }}
             has_deb:    ${{ steps.merge.outputs.has_deb }}
+            # duckdb-extensions only (build-once → repackage per distro).
+            ext_rpm_matrix: ${{ steps.merge.outputs.ext_rpm_matrix }}
+            ext_deb_matrix: ${{ steps.merge.outputs.ext_deb_matrix }}
+            has_ext_rpm:    ${{ steps.merge.outputs.has_ext_rpm }}
+            has_ext_deb:    ${{ steps.merge.outputs.has_ext_deb }}
+            # All components merged — used by push + manifest to enumerate cells.
+            all_rpm_matrix: ${{ steps.merge.outputs.all_rpm_matrix }}
+            all_deb_matrix: ${{ steps.merge.outputs.all_deb_matrix }}
         steps:
             - name: Checkout code
               uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -232,22 +247,140 @@ jobs:
                       jq -c --arg c "$2" --arg v "$3" \
                         '[.include[] | . + {component_name:$c, component_version:$v}]' <<<"$1"
                   }
+                  emit() {  # <name> <include-json>
+                      echo "$1={\"include\":$2}" >> "$GITHUB_OUTPUT"
+                  }
+                  # Source-built components (their cells compile in-container).
                   rpm_inc="$(jq -c -n \
                       --argjson a "$(tag_cells "$RPM_PGD" packaging/pg_duckdb '')" \
                       --argjson b "$(tag_cells "$RPM_CF"  packaging/coldfront "$TAG_VERSION")" \
                       --argjson d "$(tag_cells "$RPM_BIN" packaging/coldfront-bin "$TAG_VERSION")" \
-                      --argjson e "$(tag_cells "$RPM_DUX" packaging/coldfront-duckdb-extensions '')" \
-                      '$a + $b + $d + $e')"
+                      '$a + $b + $d')"
                   deb_inc="$(jq -c -n \
                       --argjson a "$(tag_cells "$DEB_PGD" packaging/pg_duckdb '')" \
                       --argjson b "$(tag_cells "$DEB_CF"  packaging/coldfront "$TAG_VERSION")" \
                       --argjson d "$(tag_cells "$DEB_BIN" packaging/coldfront-bin "$TAG_VERSION")" \
-                      --argjson e "$(tag_cells "$DEB_DUX" packaging/coldfront-duckdb-extensions '')" \
-                      '$a + $b + $d + $e')"
-                  echo "rpm_matrix={\"include\":$rpm_inc}" >> "$GITHUB_OUTPUT"
-                  echo "deb_matrix={\"include\":$deb_inc}" >> "$GITHUB_OUTPUT"
-                  echo "has_rpm=$( [ "$(jq 'length' <<<"$rpm_inc")" -gt 0 ] && echo true || echo false )" >> "$GITHUB_OUTPUT"
-                  echo "has_deb=$( [ "$(jq 'length' <<<"$deb_inc")" -gt 0 ] && echo true || echo false )" >> "$GITHUB_OUTPUT"
+                      '$a + $b + $d')"
+                  # duckdb-extensions: build-once, repackaged per distro/arch.
+                  ext_rpm_inc="$(tag_cells "$RPM_DUX" packaging/coldfront-duckdb-extensions '')"
+                  ext_deb_inc="$(tag_cells "$DEB_DUX" packaging/coldfront-duckdb-extensions '')"
+                  emit rpm_matrix "$rpm_inc"
+                  emit deb_matrix "$deb_inc"
+                  emit ext_rpm_matrix "$ext_rpm_inc"
+                  emit ext_deb_matrix "$ext_deb_inc"
+                  emit all_rpm_matrix "$(jq -c -n --argjson x "$rpm_inc" --argjson y "$ext_rpm_inc" '$x + $y')"
+                  emit all_deb_matrix "$(jq -c -n --argjson x "$deb_inc" --argjson y "$ext_deb_inc" '$x + $y')"
+                  gt0() { [ "$(jq 'length' <<<"$1")" -gt 0 ] && echo true || echo false; }
+                  {
+                      echo "has_rpm=$(gt0 "$rpm_inc")"
+                      echo "has_deb=$(gt0 "$deb_inc")"
+                      echo "has_ext_rpm=$(gt0 "$ext_rpm_inc")"
+                      echo "has_ext_deb=$(gt0 "$ext_deb_inc")"
+                  } >> "$GITHUB_OUTPUT"
+
+    # =========================================================================
+    # BUILD-ONCE: compile the patched DuckDB extensions a single time per arch on
+    # manylinux_2_28 (glibc 2.28 baseline). The resulting .duckdb_extension
+    # binaries are portable to every supported distro; the per-distro package-ext-*
+    # cells repackage them without recompiling.
+    # =========================================================================
+    build-duckdb-ext:
+        name: Build DuckDB extensions (${{ matrix.arch }}, manylinux)
+        needs: [determine-repo-type]
+        if: github.ref_type == 'tag' || github.event.inputs.simulate_tag != ''
+        runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+        strategy:
+            fail-fast: false
+            matrix:
+                arch: [amd64, arm64]
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+            - name: Build extensions in manylinux_2_28
+              env:
+                  ML_ARCH: ${{ matrix.arch == 'arm64' && 'aarch64' || 'x86_64' }}
+              run: |
+                  set -euo pipefail
+                  mkdir -p ext-out
+                  # Native-arch runner → native-arch manylinux container (no emulation).
+                  # gcc-toolset-14 is pre-baked in manylinux_2_28; install the rest.
+                  docker run --rm -v "$PWD":/src -w /src "quay.io/pypa/manylinux_2_28_${ML_ARCH}" bash -c '
+                      set -euo pipefail
+                      dnf install -y --setopt=install_weak_deps=False \
+                          ninja-build perl-IPC-Cmd perl-Time-Piece ccache jq wget zip unzip tar \
+                          autoconf libtool kernel-headers cmake git make flex bison \
+                          gcc-toolset-14-libasan-devel gcc-toolset-14-libubsan-devel
+                      export COMPONENT_NAME=packaging/coldfront-duckdb-extensions
+                      # shellcheck disable=SC1091
+                      source packaging/coldfront-duckdb-extensions/common.sh
+                      bash packaging/coldfront-duckdb-extensions/build-extensions.sh /src/ext-out
+                  '
+                  ls -la ext-out/
+            - name: Upload built extensions
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              with:
+                  name: duckdb-ext-${{ matrix.arch }}
+                  path: ext-out/*.duckdb_extension
+                  retention-days: 7
+
+    # =========================================================================
+    # GATE: load all four extensions in the real DuckDB engine on EVERY supported
+    # distro (per arch). A clean LOAD proves every dependency — system libs and the
+    # DuckDB ABI — resolves. Packaging waits on this; if any distro fails to load,
+    # the extensions are not published.
+    # =========================================================================
+    verify-duckdb-ext:
+        name: Verify extensions load (${{ matrix.arch }})
+        needs: [build-duckdb-ext]
+        if: needs.build-duckdb-ext.result == 'success'
+        runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+        strategy:
+            fail-fast: false
+            matrix:
+                arch: [amd64, arm64]
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+            - name: Resolve DUCKDB_VERSION
+              id: duckdb
+              run: |
+                  set -euo pipefail
+                  # shellcheck disable=SC1091
+                  source packaging/coldfront-duckdb-extensions/common.sh
+                  echo "version=${DUCKDB_VERSION}" >> "$GITHUB_OUTPUT"
+            - name: Download built extensions
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              with:
+                  name: duckdb-ext-${{ matrix.arch }}
+                  path: ext
+            - name: Load-test on every distro
+              env:
+                  DUCKDB_VERSION: ${{ steps.duckdb.outputs.version }}
+                  CLI_ARCH: ${{ matrix.arch == 'arm64' && 'arm64' || 'amd64' }}
+              run: |
+                  set -uo pipefail
+                  CLI_URL="https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb_cli-linux-${CLI_ARCH}.zip"
+                  echo "Engine CLI: $CLI_URL"
+                  pass=0; fail=0
+                  for img in almalinux:9 almalinux:10 ubuntu:jammy ubuntu:noble debian:bullseye debian:bookworm debian:trixie; do
+                      echo "###### $img ######"
+                      cid=$(docker run -d -v "$PWD/ext:/ext:ro" "$img" sleep 600) || { echo "  run failed"; fail=$((fail+1)); continue; }
+                      docker exec "$cid" bash -c '
+                          if command -v dnf >/dev/null 2>&1; then dnf install -y --setopt=install_weak_deps=False libstdc++ unzip tar >/dev/null 2>&1;
+                          else export DEBIAN_FRONTEND=noninteractive; apt-get update >/dev/null 2>&1; apt-get install -y libstdc++6 unzip ca-certificates curl >/dev/null 2>&1; fi'
+                      docker exec -e CLI_URL="$CLI_URL" "$cid" bash -c '
+                          cd /root
+                          curl -sSL -o cli.zip "$CLI_URL" && unzip -o -q cli.zip && chmod +x ./duckdb || { echo "  CLI fetch failed"; exit 3; }
+                          # allow_unsigned_extensions is a STARTUP setting -> -unsigned flag.
+                          # Load in dependency order (iceberg needs avro registered first).
+                          out=$(./duckdb -unsigned -c "LOAD '"'"'/ext/avro.duckdb_extension'"'"'; LOAD '"'"'/ext/iceberg.duckdb_extension'"'"'; LOAD '"'"'/ext/azure.duckdb_extension'"'"'; LOAD '"'"'/ext/postgres_scanner.duckdb_extension'"'"'; SELECT '"'"'ALL_LOADED'"'"';" 2>&1)
+                          if echo "$out" | grep -q ALL_LOADED; then echo "  ==> all 4 loaded"; exit 0
+                          else echo "  ==> LOAD FAILED"; echo "$out" | sed "s/^/      /" | head -10; exit 1; fi
+                      ' && { echo "  PASS: $img"; pass=$((pass+1)); } || { echo "  FAIL: $img"; fail=$((fail+1)); }
+                      docker rm -f "$cid" >/dev/null 2>&1
+                  done
+                  echo "=== load-test (${CLI_ARCH}): $pass passed, $fail failed ==="
+                  [ "$fail" -eq 0 ]
 
     # =========================================================================
     # RPM build matrix — one cell per (component, PG major, EL major, arch).
@@ -404,15 +537,144 @@ jobs:
                   retention-days: 7
 
     # =========================================================================
+    # Repackage the build-once extensions into RPMs per (EL major, arch). Each
+    # cell just stages the verified prebuilt binaries and runs the packaging —
+    # no recompile. Gated on verify-duckdb-ext.
+    # =========================================================================
+    package-ext-rpm:
+        name: RPM ext ${{ matrix.image }} ${{ matrix.arch }}
+        needs: [determine-repo-type, detect-matrix, verify-duckdb-ext]
+        if: |
+            always() &&
+            needs.determine-repo-type.result == 'success' &&
+            needs.detect-matrix.result == 'success' &&
+            needs.verify-duckdb-ext.result == 'success' &&
+            needs.detect-matrix.outputs.has_ext_rpm == 'true'
+        runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+        strategy:
+            fail-fast: false
+            matrix: ${{ fromJSON(needs.detect-matrix.outputs.ext_rpm_matrix) }}
+        env:
+            REPO_TYPE:          ${{ needs.determine-repo-type.outputs.repo-type }}
+            COMPONENT_BUILDNUM: ${{ needs.determine-repo-type.outputs.component-buildnum }}
+            COMPONENT_BRANCH:   ${{ needs.determine-repo-type.outputs.effective-tag }}
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+            - name: Derive os_version
+              id: cell
+              env:
+                  IMAGE: ${{ matrix.image }}
+              run: echo "os_version=${IMAGE##*:}" >> "$GITHUB_OUTPUT"
+            - name: Stage prebuilt extensions (${{ matrix.arch }})
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              with:
+                  name: duckdb-ext-${{ matrix.arch }}
+                  path: release-artifacts/duckdb-extensions
+            - name: Checkout pgedge-builder-action
+              env:
+                  TOKEN: ${{ secrets.PGEDGE_BUILDER_TOKEN }}
+              run: |
+                  set -euo pipefail
+                  mkdir -p .github/actions
+                  git clone --depth 1 \
+                      "https://x-access-token:${TOKEN}@github.com/pgEdge/pgedge-builder-action.git" \
+                      ".github/actions/pgedge-builder-action"
+            - name: Build RPM
+              uses: ./.github/actions/pgedge-builder-action
+              with:
+                  image: ${{ matrix.image }}
+                  arch: ${{ matrix.arch }}
+                  component_name: ${{ matrix.component_name }}
+                  pg_version: ${{ matrix.pg_version }}
+                  component_branch: ${{ env.COMPONENT_BRANCH }}
+                  component_version: ${{ matrix.component_version }}
+                  component_buildnum: ${{ env.COMPONENT_BUILDNUM }}
+                  repo_type: ${{ env.REPO_TYPE }}
+                  gpg_private_key: ${{ secrets.GPG_FIPS_RPM_PRIVATE_KEY }}
+                  gpg_public_key: ${{ secrets.GPG_FIPS_RPM_PUBLIC_KEY }}
+                  pgedge_builder_token: ${{ secrets.PGEDGE_BUILDER_TOKEN }}
+            - name: Upload RPM cell artifact
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              with:
+                  name: rpm__coldfront-duckdb-extensions__el-${{ steps.cell.outputs.os_version }}__${{ matrix.arch }}
+                  path: output/el${{ steps.cell.outputs.os_version }}-${{ matrix.arch }}/
+                  retention-days: 7
+
+    # =========================================================================
+    # Repackage the build-once extensions into DEBs per (distro, arch).
+    # =========================================================================
+    package-ext-deb:
+        name: DEB ext ${{ matrix.image }} ${{ matrix.arch }}
+        needs: [determine-repo-type, detect-matrix, verify-duckdb-ext]
+        if: |
+            always() &&
+            needs.determine-repo-type.result == 'success' &&
+            needs.detect-matrix.result == 'success' &&
+            needs.verify-duckdb-ext.result == 'success' &&
+            needs.detect-matrix.outputs.has_ext_deb == 'true'
+        runs-on: ${{ matrix.arch == 'arm64' && 'ubuntu-24.04-arm' || 'ubuntu-latest' }}
+        strategy:
+            fail-fast: false
+            matrix: ${{ fromJSON(needs.detect-matrix.outputs.ext_deb_matrix) }}
+        env:
+            REPO_TYPE:          ${{ needs.determine-repo-type.outputs.repo-type }}
+            COMPONENT_BUILDNUM: ${{ needs.determine-repo-type.outputs.component-buildnum }}
+            COMPONENT_BRANCH:   ${{ needs.determine-repo-type.outputs.effective-tag }}
+        steps:
+            - name: Checkout code
+              uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+            - name: Derive distro
+              id: cell
+              env:
+                  IMAGE: ${{ matrix.image }}
+              run: echo "distro=${IMAGE##*:}" >> "$GITHUB_OUTPUT"
+            - name: Stage prebuilt extensions (${{ matrix.arch }})
+              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              with:
+                  name: duckdb-ext-${{ matrix.arch }}
+                  path: release-artifacts/duckdb-extensions
+            - name: Checkout pgedge-builder-action
+              env:
+                  TOKEN: ${{ secrets.PGEDGE_BUILDER_TOKEN }}
+              run: |
+                  set -euo pipefail
+                  mkdir -p .github/actions
+                  git clone --depth 1 \
+                      "https://x-access-token:${TOKEN}@github.com/pgEdge/pgedge-builder-action.git" \
+                      ".github/actions/pgedge-builder-action"
+            - name: Build DEB
+              uses: ./.github/actions/pgedge-builder-action
+              with:
+                  image: ${{ matrix.image }}
+                  arch: ${{ matrix.arch }}
+                  component_name: ${{ matrix.component_name }}
+                  pg_version: ${{ matrix.pg_version }}
+                  component_branch: ${{ env.COMPONENT_BRANCH }}
+                  component_version: ${{ matrix.component_version }}
+                  component_buildnum: ${{ env.COMPONENT_BUILDNUM }}
+                  repo_type: ${{ env.REPO_TYPE }}
+                  gpg_private_key: ${{ secrets.GPG_FIPS_DEB_PRIVATE_KEY }}
+                  gpg_public_key: ${{ secrets.GPG_FIPS_DEB_PUBLIC_KEY }}
+                  pgedge_builder_token: ${{ secrets.PGEDGE_BUILDER_TOKEN }}
+            - name: Upload DEB cell artifact
+              uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+              with:
+                  name: deb__coldfront-duckdb-extensions__${{ steps.cell.outputs.distro }}__${{ matrix.arch }}
+                  path: output/${{ steps.cell.outputs.distro }}-${{ matrix.arch }}/
+                  retention-days: 7
+
+    # =========================================================================
     # Push RPMs → dnf.pgedge.com (all components, batched per EL major) + S3 backup.
     # =========================================================================
     push-dnf:
         name: Push DNF (all components, batched)
-        needs: [determine-repo-type, detect-matrix, package-rpm]
+        needs: [determine-repo-type, detect-matrix, package-rpm, package-ext-rpm]
         if: |
             always() && github.ref_type == 'tag' &&
-            (needs.package-rpm.result == 'success' ||
-             (github.event.inputs.force_push == 'true' && needs.package-rpm.result != 'cancelled'))
+            ((needs.package-rpm.result == 'success' && needs.package-ext-rpm.result == 'success') ||
+             (github.event.inputs.force_push == 'true' &&
+              needs.package-rpm.result != 'cancelled' && needs.package-ext-rpm.result != 'cancelled'))
         runs-on: ubuntu-latest
         concurrency:
             group: dnf-push-${{ needs.determine-repo-type.outputs.repo-type }}
@@ -422,7 +684,7 @@ jobs:
         env:
             REPO_TYPE:         ${{ needs.determine-repo-type.outputs.repo-type }}
             COMPONENT_VERSION: ${{ needs.determine-repo-type.outputs.component-version }}
-            RPM_MATRIX:        ${{ needs.detect-matrix.outputs.rpm_matrix }}
+            RPM_MATRIX:        ${{ needs.detect-matrix.outputs.all_rpm_matrix }}
         steps:
             - name: Checkout code
               uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -488,11 +750,12 @@ jobs:
     # =========================================================================
     push-apt:
         name: Push APT (all components, batched)
-        needs: [determine-repo-type, detect-matrix, package-deb]
+        needs: [determine-repo-type, detect-matrix, package-deb, package-ext-deb]
         if: |
             always() && github.ref_type == 'tag' &&
-            (needs.package-deb.result == 'success' ||
-             (github.event.inputs.force_push == 'true' && needs.package-deb.result != 'cancelled'))
+            ((needs.package-deb.result == 'success' && needs.package-ext-deb.result == 'success') ||
+             (github.event.inputs.force_push == 'true' &&
+              needs.package-deb.result != 'cancelled' && needs.package-ext-deb.result != 'cancelled'))
         runs-on: ubuntu-latest
         concurrency:
             group: apt-push-${{ needs.determine-repo-type.outputs.repo-type }}
@@ -502,7 +765,7 @@ jobs:
         env:
             REPO_TYPE:         ${{ needs.determine-repo-type.outputs.repo-type }}
             COMPONENT_VERSION: ${{ needs.determine-repo-type.outputs.component-version }}
-            DEB_MATRIX:        ${{ needs.detect-matrix.outputs.deb_matrix }}
+            DEB_MATRIX:        ${{ needs.detect-matrix.outputs.all_deb_matrix }}
         steps:
             - name: Checkout code
               uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
@@ -591,8 +854,8 @@ jobs:
                   PUSH_APT_RESULT:  ${{ needs.push-apt.result }}
                   DNF_TS:           ${{ needs.push-dnf.outputs.timestamp }}
                   APT_TS:           ${{ needs.push-apt.outputs.timestamp }}
-                  RPM_MATRIX:       ${{ needs.detect-matrix.outputs.rpm_matrix }}
-                  DEB_MATRIX:       ${{ needs.detect-matrix.outputs.deb_matrix }}
+                  RPM_MATRIX:       ${{ needs.detect-matrix.outputs.all_rpm_matrix }}
+                  DEB_MATRIX:       ${{ needs.detect-matrix.outputs.all_deb_matrix }}
               run: |
                   set -euo pipefail
                   mkdir -p aggregated

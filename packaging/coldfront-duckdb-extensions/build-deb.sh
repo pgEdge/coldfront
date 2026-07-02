@@ -5,14 +5,15 @@ CWD="$(pwd)"
 export DEBIAN_FRONTEND=noninteractive
 ARCH=$(dpkg --print-architecture)      # amd64 | arm64 (== GoReleaser/DuckDB arch)
 case "$ARCH" in
-  amd64) DUCKDB_PLATFORM=linux_amd64; VCPKG_TRIPLET=x64-linux ;;
-  arm64) DUCKDB_PLATFORM=linux_arm64; VCPKG_TRIPLET=arm64-linux ;;
+  amd64) DUCKDB_PLATFORM=linux_amd64 ;;
+  arm64) DUCKDB_PLATFORM=linux_arm64 ;;
   *) echo "unsupported arch: $ARCH" >&2; exit 1 ;;
 esac
 
-BUILD_ROOT="/tmp/cf-duckdb-ext-build"
-ICE="${BUILD_ROOT}/duckdb-iceberg"
 SRC_DIR="/tmp/pg_deb_build/coldfront-duckdb-extensions-${DUCKDB_EXT_VERSION}"
+# CI stages the build-once artifacts here (per-arch, from build-duckdb-ext); when
+# present we just repackage them — no compile in the per-distro cell.
+PREBUILT="${PREBUILT:-${CWD}/release-artifacts/duckdb-extensions}"
 
 prepare() {
 
@@ -21,50 +22,22 @@ prepare() {
   # This function is for debugging purpose if you have your own keys. GH workflow does not need it.
   #import_gpg_keys
 
-  echo "Installing duckdb-iceberg build toolchain..."
-  sudo apt-get install -y \
-      build-essential cmake ninja-build git ccache jq wget zip unzip \
-      tar autoconf libtool flex bison pkg-config perl
-
-  echo "Cloning + patching duckdb-iceberg (against DuckDB v${DUCKDB_VERSION})..."
-  rm -rf "$BUILD_ROOT"; mkdir -p "$BUILD_ROOT"
-  git clone --filter=blob:none --no-checkout "${ICEBERG_REPO}" "$ICE"
-  git -C "$ICE" fetch --depth 80 origin "${ICEBERG_BRANCH}"
-  git -C "$ICE" checkout "${ICEBERG_REF}"
-  git -C "$ICE" submodule update --init --recursive --depth 1 --jobs 8
-  rm -rf "$ICE/duckdb"
-  git clone --depth 1 --branch "v${DUCKDB_VERSION}" --recurse-submodules "${DUCKDB_REPO}" "$ICE/duckdb"
-  git clone "${VCPKG_REPO}" "${BUILD_ROOT}/vcpkg"
-  "${BUILD_ROOT}/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
-
-  cp "${CWD}/docker/iceberg-azure-extension-config-v15.cmake" "$ICE/extension_config.cmake"
-  for p in iceberg-bakery-aware-commit-refresh-v15 \
-           iceberg-manifest-list-format-version-v15 \
-           iceberg-manifest-content-v15 \
-           iceberg-data-file-format-v15; do
-    git -C "$ICE" apply --check "${CWD}/docker/${p}.patch"
-    git -C "$ICE" apply         "${CWD}/docker/${p}.patch"
-  done
-
-  echo "Building extensions (make release)..."
-  (
-    cd "$ICE"
-    export VCPKG_TOOLCHAIN_PATH="${BUILD_ROOT}/vcpkg/scripts/buildsystems/vcpkg.cmake"
-    export VCPKG_ROOT="${BUILD_ROOT}/vcpkg"
-    export VCPKG_TARGET_TRIPLET="$VCPKG_TRIPLET" VCPKG_HOST_TRIPLET="$VCPKG_TRIPLET"
-    export USE_MERGED_VCPKG_MANIFEST=1
-    export EXT_CONFIG="${ICE}/extension_config.cmake"
-    export OVERRIDE_GIT_DESCRIBE="v${DUCKDB_VERSION}"
-    # Cap parallelism to bound peak memory (DuckDB can OOM at high -j).
-    export CMAKE_BUILD_PARALLEL_LEVEL=4
-    make -j4 release
-  )
-
-  echo "Staging built extensions + docs + debian packaging..."
+  echo "Staging extensions + docs + debian packaging..."
   rm -rf "$SRC_DIR"; mkdir -p "$SRC_DIR"
-  for e in iceberg avro azure postgres_scanner; do
-    cp "${ICE}/build/release/extension/${e}/${e}.duckdb_extension" "$SRC_DIR/"
-  done
+
+  if compgen -G "${PREBUILT}/*.duckdb_extension" >/dev/null; then
+    # ---- build-once path: reuse the manylinux-built, load-tested binaries ----
+    echo "Using prebuilt extensions from ${PREBUILT} (build-once)"
+    cp "${PREBUILT}"/*.duckdb_extension "$SRC_DIR/"
+  else
+    # ---- local / fallback path: build from source in this container ----
+    echo "No prebuilt extensions staged — building from source in-cell."
+    sudo apt-get install -y \
+        build-essential cmake ninja-build git ccache jq wget zip unzip \
+        tar autoconf libtool flex bison pkg-config perl
+    bash "${CWD}/${COMPONENT_NAME}/build-extensions.sh" "$SRC_DIR"
+  fi
+
   cp "${COMPONENT_NAME}/config/coldfront-duckdb-extensions.conf.sample" "$SRC_DIR/"
   cp "${CWD}/LICENSE.md" "${CWD}/README.md" "$SRC_DIR/"
   cp -rp "${CWD}/${COMPONENT_NAME}/deb/debian" "$SRC_DIR/"
