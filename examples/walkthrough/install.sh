@@ -60,20 +60,22 @@ fi
 # The db service (docker-compose.yml context: ../..) and archiver service both
 # build from source at $WORK_DIR. Fetch a tarball subset from GitHub — no git
 # clone needed. The top-level directory inside the archive is coldfront-<branch>/
-# (confirmed: coldfront-main/ for branch=main), so --strip-components=1 lands
-# everything directly in $WORK_DIR.
+# with slashes in the branch name flattened to dashes (coldfront-main/,
+# coldfront-feat-walkthrough/), so --strip-components=1 lands everything
+# directly in $WORK_DIR.
+TAR_DIR="coldfront-${BRANCH//\//-}"
 echo "  Fetching build sources..."
 if ! curl -fsSL "https://codeload.github.com/pgEdge/coldfront/tar.gz/${BRANCH}" \
     | tar -xz -C "${WORK_DIR}" --strip-components=1 \
-        "coldfront-${BRANCH}/extension" \
-        "coldfront-${BRANCH}/cmd/archiver" \
-        "coldfront-${BRANCH}/cmd/partitioner" \
-        "coldfront-${BRANCH}/internal" \
-        "coldfront-${BRANCH}/go.mod" \
-        "coldfront-${BRANCH}/go.sum" \
-        "coldfront-${BRANCH}/docker" \
-        "coldfront-${BRANCH}/THIRD_PARTY_NOTICES.md" \
-        "coldfront-${BRANCH}/LICENSE.md"; then
+        "${TAR_DIR}/extension" \
+        "${TAR_DIR}/cmd/archiver" \
+        "${TAR_DIR}/cmd/partitioner" \
+        "${TAR_DIR}/internal" \
+        "${TAR_DIR}/go.mod" \
+        "${TAR_DIR}/go.sum" \
+        "${TAR_DIR}/docker" \
+        "${TAR_DIR}/THIRD_PARTY_NOTICES.md" \
+        "${TAR_DIR}/LICENSE.md"; then
     echo "  Error: failed to fetch build sources" >&2
     exit 1
 fi
