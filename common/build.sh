@@ -8,8 +8,10 @@ set -euo pipefail
 COMPONENT_NAME=$1
 source "$(dirname "$0")/../${COMPONENT_NAME}/common.sh"
 
-# common-functions.sh is copied into common/ by the workflow (builder-action)
-# from the shared private repo; not committed here.
+# common-functions.sh is a committed copy of the shared pgEdge build helpers
+# (from pgedge-enterprise-packages/common/). The builder-action mounts the repo
+# and runs this script but does not supply it, so it must live in the repo —
+# same pattern as ai-dba-workbench's packaging/scripts/common-functions.sh.
 COMMON_FILE="$(dirname "$0")/common-functions.sh"
 if [ -f "$COMMON_FILE" ]; then
   source "$COMMON_FILE"
