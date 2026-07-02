@@ -202,9 +202,10 @@ func (c *Config) coldTierMode() (icebergMode, anyS3 bool) {
 }
 
 // validateTables checks every table entry, returning the first violation.
-// Zero tables is allowed here: the managed-table set may instead come from the
-// replicated coldfront.partition_config table, resolved at startup. The
-// binaries fail loud if BOTH the table and archiver.tables are empty.
+// Zero tables is allowed here: the managed-table set is resolved at startup from
+// the replicated coldfront.partition_config table, so a connection-only config
+// (no archiver.tables) is valid. archiver.tables is only an input to `import`;
+// the binaries fail loud when partition_config yields no rows.
 func (c *Config) validateTables(icebergMode bool) error {
 	for i, t := range c.Archiver.Tables {
 		if err := validateTable(t, i, icebergMode); err != nil {

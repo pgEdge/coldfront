@@ -117,33 +117,47 @@ const (
 	PartitionOnly              // partitioner — hot_period IS NULL
 )
 
-// ResolveTables returns the managed-table set the caller owns: it ensures the
-// table exists, then returns the partition_config rows matching own if there are
-// any, else the supplied YAML fallback (the deprecation bridge for not-yet-
-// migrated deployments). The bool is true when the YAML fallback was used.
-// Callers fail loud if the result is empty (both sources empty).
-func ResolveTables(ctx context.Context, db DBTX, yamlFallback []config.TableConfig, own owner) ([]config.TableConfig, bool, error) {
+// ResolveTables returns the enabled managed tables the caller owns from the
+// replicated coldfront.partition_config table, the single source of truth for
+// the managed-table set. Provision it with `register` (one table) or `import`
+// (a YAML archiver.tables list); both write it through the same validation.
+// Returns an empty slice when nothing matches; callers fail loud.
+func ResolveTables(ctx context.Context, db DBTX, own owner) ([]config.TableConfig, error) {
 	if err := EnsureTable(ctx, db); err != nil {
-		return nil, false, err
+		return nil, err
 	}
-	rows, err := LoadTables(ctx, db, own)
+	return LoadTables(ctx, db, own)
+}
+
+// tableConfigColumns is the partition_config projection scanned by
+// scanTableConfig, shared by LoadTables and loadRow so the column order stays
+// in lockstep with the scan.
+const tableConfigColumns = `schema_name, table_name, partition_period, partition_column,
+	future_partitions, part_mode, id_scheme, hot_period::text,
+	retention_period::text, sub_part_values_source, expiration_strategy`
+
+// loadRow returns the single partition_config row for schema.table, with
+// found=false when no such row exists. Ownership-agnostic (used to re-read a row
+// mid-transaction for validation).
+func loadRow(ctx context.Context, db DBTX, schema, table string) (config.TableConfig, bool, error) {
+	rows, err := db.Query(ctx, `SELECT `+tableConfigColumns+`
+		FROM coldfront.partition_config WHERE schema_name=$1 AND table_name=$2`, schema, table)
 	if err != nil {
-		return nil, false, err
+		return config.TableConfig{}, false, fmt.Errorf("query partition_config: %w", err)
 	}
-	if len(rows) > 0 {
-		return rows, false, nil
+	defer rows.Close()
+	if !rows.Next() {
+		return config.TableConfig{}, false, rows.Err()
 	}
-	return yamlFallback, true, nil
+	t, err := scanTableConfig(rows)
+	return t, err == nil, err
 }
 
 // LoadTables reads the enabled partition_config rows the caller owns into the
 // existing config.TableConfig shape, so every downstream consumer is unchanged.
 // own filters by the hot_period ownership switch (see owner); AllOwners loads all.
 func LoadTables(ctx context.Context, db DBTX, own owner) ([]config.TableConfig, error) {
-	rows, err := db.Query(ctx, `
-		SELECT schema_name, table_name, partition_period, partition_column,
-		       future_partitions, part_mode, id_scheme, hot_period::text,
-		       retention_period::text, sub_part_values_source, expiration_strategy
+	rows, err := db.Query(ctx, `SELECT `+tableConfigColumns+`
 		FROM coldfront.partition_config
 		WHERE enabled
 		  AND CASE $1::int

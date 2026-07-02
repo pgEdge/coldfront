@@ -7,8 +7,6 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
-
-	"github.com/pgedge/coldfront/internal/config"
 )
 
 type mockRows struct {
@@ -76,7 +74,7 @@ func TestEnsureTable(t *testing.T) {
 
 func emptyRows() (pgx.Rows, error) { return &mockRows{}, nil }
 
-func TestResolveTables_DBWins(t *testing.T) {
+func TestResolveTables_ReturnsDBRows(t *testing.T) {
 	db := &mockDB{rowsFunc: func() (pgx.Rows, error) {
 		return &mockRows{rows: []func(dest ...any) error{
 			func(dest ...any) error {
@@ -91,32 +89,13 @@ func TestResolveTables_DBWins(t *testing.T) {
 			},
 		}}, nil
 	}}
-	yaml := []config.TableConfig{{SourceTable: "from_yaml"}}
 	// The row is partition-only (hot NULL), so the partitioner owns it.
-	got, fromYAML, err := ResolveTables(context.Background(), db, yaml, PartitionOnly)
+	got, err := ResolveTables(context.Background(), db, PartitionOnly)
 	if err != nil {
 		t.Fatal(err)
-	}
-	if fromYAML {
-		t.Fatal("expected DB rows to win, got YAML fallback")
 	}
 	if len(got) != 1 || got[0].SourceTable != "events" {
 		t.Fatalf("expected the DB row, got %+v", got)
-	}
-}
-
-func TestResolveTables_YAMLFallback(t *testing.T) {
-	db := &mockDB{rowsFunc: emptyRows} // no partition_config rows
-	yaml := []config.TableConfig{{SourceTable: "from_yaml"}}
-	got, fromYAML, err := ResolveTables(context.Background(), db, yaml, PartitionOnly)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !fromYAML {
-		t.Fatal("expected YAML fallback when the table is empty")
-	}
-	if len(got) != 1 || got[0].SourceTable != "from_yaml" {
-		t.Fatalf("expected the YAML fallback, got %+v", got)
 	}
 }
 
@@ -212,19 +191,16 @@ func TestLoadTables_PassesOwnerFilter(t *testing.T) {
 	}
 }
 
-// TestResolveTables_NoRowsFallsBackToYAML — when the binary's filtered query
-// returns nothing (an empty table, or only rows owned by the other binary),
-// ResolveTables falls back to the deprecated YAML bridge, exactly as it does for
-// an empty table today. The filter runs in SQL, so an empty result is
-// indistinguishable from an empty table here.
-func TestResolveTables_NoRowsFallsBackToYAML(t *testing.T) {
+// TestResolveTables_EmptyWhenNoRows — partition_config is the only source: an
+// empty table (or a result the owner filter empties out, indistinguishable in
+// SQL) yields an empty slice and no error. Callers fail loud on empty.
+func TestResolveTables_EmptyWhenNoRows(t *testing.T) {
 	db := &mockDB{rowsFunc: emptyRows}
-	yaml := []config.TableConfig{{SourceTable: "from_yaml"}}
-	got, fromYAML, err := ResolveTables(context.Background(), db, yaml, Tiered)
+	got, err := ResolveTables(context.Background(), db, Tiered)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !fromYAML || len(got) != 1 || got[0].SourceTable != "from_yaml" {
-		t.Fatalf("expected YAML fallback when the filtered query is empty, got fromYAML=%v %+v", fromYAML, got)
+	if len(got) != 0 {
+		t.Fatalf("expected empty result when partition_config has no rows, got %+v", got)
 	}
 }

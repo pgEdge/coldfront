@@ -332,6 +332,14 @@ that replicates by value across a Spock mesh (like
 `partitioner` and `archiver` expose these subcommands; with no subcommand
 they do their normal reconcile/archive run).
 
+`register` is the primary way to manage tables: one command adds or adopts
+one table, validated on the spot. `import` and `export` are bulk helpers
+for (re)configuring a machine - seed a fresh node from a YAML, or dump the
+live config to git and replay it on another node - not the day-to-day
+path. Every write (`register`, `import`, `set`) goes through the same
+validation, so no command can leave `partition_config` in a state another
+command would reject.
+
 The data lifecycle is **hot PG → `hot_period` → cold Iceberg →
 `retention_period` → dropped** (tiered) or **hot PG → `retention_period`
 → dropped** (partition-only). Setting `hot_period` makes a table tiered;
@@ -352,8 +360,8 @@ The CLI exposes the following subcommands:
 | `list` | show managed tables and their lifecycle |
 | `set` | change fields, or `--disable`/`--enable` a table |
 | `remove` | stop managing a table (the table itself is left intact) |
-| `import` | seed `partition_config` from a YAML's `archiver.tables` (migration) |
-| `export` | dump the **active (enabled)** config to YAML or SQL - a git-reviewable copy |
+| `import` | bulk-load a machine's tables from a YAML's `archiver.tables` (provision/restore; each table validated as `register` does) |
+| `export` | dump the **active (enabled)** config to YAML or SQL - a git-reviewable backup to replay on another node |
 
 ```bash
 # Partition-only: keep 3 future partitions, drop those older than 12 months.
@@ -379,7 +387,7 @@ partitioner list   --config cf.yaml                      # what's managed
 partitioner set    --config cf.yaml --table events --retention "24 months"
 partitioner set    --config cf.yaml --table events --disable   # pause (keeps the row)
 partitioner remove --config cf.yaml --table events       # unregister, keep the table
-partitioner import --config legacy.yaml                  # migrate a YAML's tables
+partitioner import --config tables.yaml                  # register every table in a YAML at once
 partitioner export --config cf.yaml > managed.yaml       # active config, git-reviewable (--format sql for INSERTs)
 ```
 
@@ -394,9 +402,13 @@ required; `partition_column` is auto-detected from `pg_catalog` for flat
 tables (required for 2-level). `register` writes a row whose `CHECK`
 constraints enforce the lifecycle rules at write time.
 
-**YAML `archiver.tables` still works** as a deprecation bridge: when
-`partition_config` is empty the binaries fall back to a YAML table list.
-Move off it with `import`.
+**Managing tables:** the archiver and partitioner read the managed set
+only from `coldfront.partition_config`. `register` adds one table;
+`import` adds every table in a YAML `archiver.tables` list. Both write
+through the same validation (the PK must cover the partition key;
+`retention` must exceed `hot_period`), so an imported table is checked
+exactly as a registered one. `export` dumps the active rows back to YAML
+or SQL for git.
 
 ## Storage backends
 

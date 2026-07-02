@@ -102,24 +102,18 @@ func dispatchSubcommand(ctx context.Context) bool {
 	return false
 }
 
-// loadAndResolve resolves the managed tables from the replicated
-// coldfront.partition_config table (falling back to the YAML archiver.tables
-// deprecation bridge), writes them back onto cfg, and validates the config.
+// loadAndResolve loads the managed tables from the replicated
+// coldfront.partition_config table, writes them back onto cfg, and validates
+// the config.
 func loadAndResolve(ctx context.Context, conn *pgx.Conn, cfg *config.Config, cfgPath string) {
-	// Resolve managed tables from the replicated coldfront.partition_config
-	// table, falling back to the YAML archiver.tables (deprecation bridge).
-	tables, fromYAML, err := partcfg.ResolveTables(ctx, conn, cfg.Archiver.Tables, partcfg.PartitionOnly)
+	tables, err := partcfg.ResolveTables(ctx, conn, partcfg.PartitionOnly)
 	if err != nil {
 		log.Fatalf("resolve tables: %v", err)
 	}
 	if len(tables) == 0 {
-		log.Fatalf("no tables configured: coldfront.partition_config is empty and no archiver.tables in %s", cfgPath)
+		log.Fatalf("no tables in coldfront.partition_config; add one with `partitioner register` or seed a YAML with `partitioner import --config %s`", cfgPath)
 	}
-	if fromYAML {
-		log.Printf("no partition_config rows; using %d table(s) from YAML (deprecated — migrate with `register`/`import`)", len(tables))
-	} else {
-		log.Printf("loaded %d table(s) from coldfront.partition_config", len(tables))
-	}
+	log.Printf("loaded %d table(s) from coldfront.partition_config", len(tables))
 	cfg.Archiver.Tables = tables
 	if err := cfg.Validate(); err != nil {
 		log.Fatalf("config invalid: %v", err)

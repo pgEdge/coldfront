@@ -178,7 +178,11 @@ archiver:
       partition_period: monthly
       hot_period: "${ret_days} days"
 EOF
-    if "$ARCHIVER" --config /tmp/journey-archiver.yaml >/tmp/journey-archiver.log 2>&1; then
+    # Managed tables live in coldfront.partition_config; seed events from the YAML.
+    if ! "$ARCHIVER" import --config /tmp/journey-archiver.yaml >/tmp/journey-archiver.log 2>&1; then
+        fail "import events into partition_config — see /tmp/journey-archiver.log"; tail -5 /tmp/journey-archiver.log; return
+    fi
+    if "$ARCHIVER" --config /tmp/journey-archiver.yaml >>/tmp/journey-archiver.log 2>&1; then
         pass "archiver first run completed"
     else
         fail "archiver first run — see /tmp/journey-archiver.log"; tail -5 /tmp/journey-archiver.log
@@ -225,7 +229,11 @@ archiver:
       hot_period: "${ret_days} days"
       retention_period: "${ret_long} days"
 EOF
-    if "$ARCHIVER" --config /tmp/journey-coldret.yaml >/tmp/journey-coldret.log 2>&1; then
+    # events is already managed (tiered); add the drop boundary via set.
+    if ! "$ARCHIVER" set --config /tmp/journey-coldret.yaml --table events --retention "${ret_long} days" >/tmp/journey-coldret.log 2>&1; then
+        fail "set retention on events — see /tmp/journey-coldret.log"; tail -5 /tmp/journey-coldret.log; return
+    fi
+    if "$ARCHIVER" --config /tmp/journey-coldret.yaml >>/tmp/journey-coldret.log 2>&1; then
         pass "archiver cold-retention run completed"
     else
         fail "archiver cold-retention run — see /tmp/journey-coldret.log"; tail -5 /tmp/journey-coldret.log
@@ -460,7 +468,10 @@ iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:818
 $(storage_yaml)
 archiver: { tables: [ { source_table: typed, partition_period: monthly, hot_period: "${ret_days} days" } ] }
 EOF
-    if "$ARCHIVER" --config /tmp/journey-typed.yaml >/tmp/journey-typed.log 2>&1; then
+    if ! "$ARCHIVER" import --config /tmp/journey-typed.yaml >/tmp/journey-typed.log 2>&1; then
+        fail "import typed into partition_config — see /tmp/journey-typed.log"; tail -5 /tmp/journey-typed.log; return
+    fi
+    if "$ARCHIVER" --config /tmp/journey-typed.yaml >>/tmp/journey-typed.log 2>&1; then
         pass "typed table archived (Jan → cold)"
     else
         fail "typed archive — see /tmp/journey-typed.log"; tail -5 /tmp/journey-typed.log
@@ -1002,7 +1013,13 @@ iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:818
 $(storage_yaml)
 archiver: { tables: [ { source_table: events, partition_period: monthly, hot_period: "${ret_race} days" } ] }
 EOF
-    "$ARCHIVER" --config /tmp/journey-race.yaml --debug-export-delay 4s >/tmp/journey-race.log 2>&1 &
+    # Widen events' hot window for this run so m1 expires now; restore it after
+    # the run (one shared partition_config row) so later stories keep events' config.
+    local prev_hot; prev_hot=$(q "$HOST" "SELECT hot_period::text FROM coldfront.partition_config WHERE schema_name='public' AND table_name='events';")
+    if ! "$ARCHIVER" set --config /tmp/journey-race.yaml --table events --hot-period "${ret_race} days" >/tmp/journey-race.log 2>&1; then
+        fail "set race hot-period on events — see /tmp/journey-race.log"; tail -5 /tmp/journey-race.log; return
+    fi
+    "$ARCHIVER" --config /tmp/journey-race.yaml --debug-export-delay 4s >>/tmp/journey-race.log 2>&1 &
     local apid=$!
     local i
     for i in $(seq 1 30); do
@@ -1018,6 +1035,10 @@ INSERT INTO events (ts, status, data) VALUES (date_trunc('month',now()) - interv
 EOSQL
     if wait "$apid"; then pass "archiver cycle 2 completed cleanly (no 409)"
     else fail "archiver errored during race window"; tail -5 /tmp/journey-race.log; fi
+    # Restore events' hot_period (shared partition_config row) so later stories see
+    # its original config; a failed restore would corrupt them, so fail loud.
+    "$ARCHIVER" set --config /tmp/journey-race.yaml --table events --hot-period "$prev_hot" >/dev/null 2>&1 \
+        || fail "restore events hot_period after race window"
     assert_eq "race UPDATEs survived (3 retagged in cold)" "3" "$(q "$HOST" "SELECT count(*) FROM events WHERE status='during_archive';")"
     assert_eq "race INSERT survived (1 new in cold)"       "1" "$(q "$HOST" "SELECT count(*) FROM events WHERE status='during_archive_insert';")"
     assert_eq "race DELETE survived (0 remaining)"         "0" "$(q "$HOST" "SELECT count(*) FROM events WHERE status='race_will_delete';")"
@@ -1492,7 +1513,10 @@ archiver:
       hot_period: "${ret_days} days"
       sub_partition: { values_source: "SELECT region FROM (VALUES ('eu'),('us')) r(region)" }
 EOF
-    if "$ARCHIVER" --config /tmp/journey-tl.yaml >/tmp/journey-tl.log 2>&1; then
+    if ! "$ARCHIVER" import --config /tmp/journey-tl.yaml >/tmp/journey-tl.log 2>&1; then
+        fail "import regional (2-level) into partition_config — see /tmp/journey-tl.log"; tail -8 /tmp/journey-tl.log; return
+    fi
+    if "$ARCHIVER" --config /tmp/journey-tl.yaml >>/tmp/journey-tl.log 2>&1; then
         pass "2-level archiver run completed (no flat-partitioning Fatal)"
     else
         fail "2-level archiver run — see /tmp/journey-tl.log"; tail -8 /tmp/journey-tl.log; return
@@ -1580,6 +1604,22 @@ EOSQL
         if grep -qi "primary key" /tmp/journey-nopk.log; then pass "register rejects the PK-less table"; else fail "wrong rejection reason"; tail -3 /tmp/journey-nopk.log; fi
     fi
     assert_eq "no row written for the rejected table" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='cli_nopk';")"
+
+    # Parity: import must reject the SAME PK-less table register rejects — every
+    # write to partition_config goes through one validation gate.
+    # Partition-only (retention, no hot_period) so the config needs no cold backend;
+    # the PK-superset check still fires and must reject the PK-less table.
+    cat > /tmp/journey-nopk.yaml <<EOF
+postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
+archiver: { tables: [ { source_table: cli_nopk, partition_period: monthly, retention_period: "60 months" } ] }
+EOF
+    if "$ARCHIVER" import --config /tmp/journey-nopk.yaml >/tmp/journey-nopk-imp.log 2>&1; then
+        fail "import cli_nopk should have failed (no primary key)"
+    else
+        if grep -qi "primary key" /tmp/journey-nopk-imp.log; then pass "import rejects the PK-less table (parity with register)"; else fail "wrong import rejection reason"; tail -3 /tmp/journey-nopk-imp.log; fi
+    fi
+    assert_eq "import wrote no row for the rejected table" "0" \
         "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='cli_nopk';")"
 
     # retention must exceed hot-period — caught at register time, before any write.
@@ -1724,10 +1764,9 @@ story_partitioner_multitable() {
 # a unified view left in events' place) the standalone partitioner must premake
 # against the real partitioned table (_events), not the view. The configured /
 # registered source name is still "events"; reconcileTable resolves it to the
-# "_"+name partitioned relation before building the spec. Pre-fix the partitioner
-# targeted the view and aborted on the verify-attach guard ("not
-# attached … different parent"); post-fix it premakes the forward window straight
-# onto _events.
+# "_"+name partitioned relation before building the spec, so it premakes the
+# forward window straight onto _events and never touches the view (which would
+# trip the verify-attach guard: "not attached … different parent").
 # ───────────────────────────────────────────────────────────────────────────
 story_partitioner_after_swap() {
     step "Partitioner after first-run swap: premakes onto _events, not the view"
@@ -1736,21 +1775,22 @@ story_partitioner_after_swap() {
     assert_eq "precondition — events is a view"       "v" "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='events'  AND relnamespace='public'::regnamespace;")"
     assert_eq "precondition — _events is partitioned" "p" "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='_events' AND relnamespace='public'::regnamespace;")"
     local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
-    # Drive the partitioner off the post-swap source name "events" with a wide
-    # future window (6) so it premakes months the archiver (premake 3) did not —
-    # proving it acted on _events. retention 60 months drops nothing.
-    cat > /tmp/journey-partitioner.yaml <<EOF
-postgres:
-  dsn: "${dsn}"
-archiver:
-  tables:
-    - source_table: events
-      partition_period: monthly
-      retention_period: "60 months"
-      future_partitions: 6
-EOF
-    if ! "$PARTITIONER" --config /tmp/journey-partitioner.yaml >/tmp/journey-partitioner.log 2>&1; then
-        fail "partitioner run failed"; tail -8 /tmp/journey-partitioner.log; return
+    printf 'postgres: { dsn: "%s" }\n' "$dsn" > /tmp/journey-partitioner.yaml
+    # events is archiver-owned (tiered). Temporarily make it partition-only so the
+    # standalone partitioner manages it and premakes a wide future window (6, vs the
+    # archiver's 3) — proving it resolves the events VIEW to the real _events table
+    # — then restore the tiered config for later stories. retention 60mo drops nothing.
+    local prev_hot prev_ret prev_pre
+    prev_hot=$(q "$HOST" "SELECT hot_period::text       FROM coldfront.partition_config WHERE schema_name='public' AND table_name='events';")
+    prev_ret=$(q "$HOST" "SELECT retention_period::text FROM coldfront.partition_config WHERE schema_name='public' AND table_name='events';")
+    prev_pre=$(q "$HOST" "SELECT future_partitions      FROM coldfront.partition_config WHERE schema_name='public' AND table_name='events';")
+    if ! "$PARTITIONER" set --config /tmp/journey-partitioner.yaml --table events --hot-period "" --retention "60 months" --premake 6 >/tmp/journey-partitioner.log 2>&1; then
+        fail "set events partition-only — see /tmp/journey-partitioner.log"; tail -5 /tmp/journey-partitioner.log; return
+    fi
+    if "$PARTITIONER" --config /tmp/journey-partitioner.yaml >>/tmp/journey-partitioner.log 2>&1; then
+        pass "partitioner ran off partition_config (events temporarily partition-only)"
+    else
+        fail "partitioner run failed"; tail -8 /tmp/journey-partitioner.log
     fi
     # The partitioner resolves events → _events, so the reconcile is logged against _events.
     if grep -q "\[_events\] reconciled" /tmp/journey-partitioner.log; then
@@ -1769,6 +1809,10 @@ EOF
     local fut; fut="events_p_$(date -u -d "$(date -u +%Y-%m-01) +5 months" +%Y_%m)"
     assert_eq "+5mo leaf $fut premade onto _events" "1" \
         "$(q "$HOST" "SELECT count(*) FROM pg_inherits i JOIN pg_class c ON c.oid=i.inhrelid WHERE i.inhparent='public._events'::regclass AND c.relname='$fut';")"
+    # Restore events' tiered config so later stories see it as the archiver owns it;
+    # a failed restore would corrupt them, so fail loud.
+    "$ARCHIVER" set --config /tmp/journey-partitioner.yaml --table events --hot-period "$prev_hot" --retention "$prev_ret" --premake "$prev_pre" >/dev/null 2>&1 \
+        || fail "restore events tiered config after partitioner-after-swap test"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
