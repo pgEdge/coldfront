@@ -28,4 +28,4 @@ execute_after_dh_install:
 	# config.yaml. The tools take `-config <path>`; point them at this. It lands
 	# under /etc and debian/pgedge-coldfront.conffiles marks it a conffile, so an
 	# admin's edited copy survives upgrades.
-	install -D -m 0644 config.example.yaml debian/pgedge-coldfront/etc/coldfront/config.yaml
+	install -D -m 0644 config.example.yaml debian/pgedge-coldfront/etc/pgedge/coldfront/config.yaml

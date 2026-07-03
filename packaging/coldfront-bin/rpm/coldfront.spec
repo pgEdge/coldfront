@@ -43,7 +43,7 @@ install -D -m 0755 compactor   %{buildroot}%{_bindir}/compactor
 # Ship the example deployment config as the default config file. The tools take
 # `-config <path>`; point them at this. Installed %config(noreplace) so an admin's
 # edited copy survives upgrades (a new default lands as config.yaml.rpmnew).
-install -D -m 0644 config.example.yaml %{buildroot}%{_sysconfdir}/coldfront/config.yaml
+install -D -m 0644 config.example.yaml %{buildroot}%{_sysconfdir}/pgedge/coldfront/config.yaml
 install -D -m 0644 %{sname}-sbom.json     %{buildroot}%{_datadir}/pgedge-%{sname}/%{sname}-sbom.json
 install -D -m 0644 %{sname}-sbom.json.asc %{buildroot}%{_datadir}/pgedge-%{sname}/%{sname}-sbom.json.asc
 
@@ -53,8 +53,9 @@ install -D -m 0644 %{sname}-sbom.json.asc %{buildroot}%{_datadir}/pgedge-%{sname
 %{_bindir}/archiver
 %{_bindir}/partitioner
 %{_bindir}/compactor
-%dir %{_sysconfdir}/coldfront
-%config(noreplace) %{_sysconfdir}/coldfront/config.yaml
+%dir %{_sysconfdir}/pgedge
+%dir %{_sysconfdir}/pgedge/coldfront
+%config(noreplace) %{_sysconfdir}/pgedge/coldfront/config.yaml
 %{_datadir}/pgedge-%{sname}/%{sname}-sbom.json
 %{_datadir}/pgedge-%{sname}/%{sname}-sbom.json.asc
 
