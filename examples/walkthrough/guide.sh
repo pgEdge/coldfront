@@ -507,8 +507,8 @@ mesh_bringup() {
 # heap size: it includes the composite PK index (id, ts) built alongside the
 # heap, WAL for the INSERT, any temp/sort spill, AND the archiver's later
 # Parquet write. Empirical calibration point: a 1M-row load FAILED at ~795 MB
-# free (Docker disk-full), so the real peak is well above the old 150 B/row
-# guess — > ~0.8 KB/row. We therefore use a conservative >=1 KB/row peak and
+# free (Docker disk-full), so the real peak is well above ~0.8 KB/row.
+# We therefore use a conservative >=1 KB/row peak and
 # require ~2x headroom: a size only "fits" when rows*1KB <= free/2. These
 # constants are a starting estimate calibrated against that single data point;
 # revisit PER_ROW_PEAK_KB / HEADROOM_DIV if loads still fail (or waste space).
@@ -659,8 +659,8 @@ generate_events() {
   start_spinner "Generating ${rows} rows"
   # psql_file uses ON_ERROR_STOP=1, so a disk-full (or any) INSERT error makes
   # psql exit non-zero. Capture stdout+stderr and check the exit code — never
-  # report success unconditionally (a swallowed failure previously masqueraded
-  # as "Generated N rows" while the txn had rolled back to 0 rows).
+  # report success unconditionally: a swallowed failure would misreport it
+  # as "Generated N rows" when the txn had actually rolled back to 0 rows.
   psql_file >"$out" 2>&1 <<EOSQL
 SET search_path = public;
 -- Spread evenly across now-4mo .. now, two-minute spacing scaled to row count.
@@ -828,6 +828,13 @@ EOSQL
     explain "systemd timer fires one pass per period, on a single node. Here we run that"
     explain "same binary once, by hand, so you can watch the move happen:"
     explain "  ${DIM}It moves partitions older than 30 days PG → Parquet in S3, and rebuilds events as a unified hot+cold view.${RESET}"
+    # The archiver reads its managed-table set from coldfront.partition_config, not
+    # from the YAML at run time; seed it once from the YAML's archiver.tables block.
+    if ! $COMPOSE run --rm --no-deps archiver import --config /config/archiver.yaml >/tmp/wt-archiver.log 2>&1; then
+        error "Registering the table failed (archiver import) — see /tmp/wt-archiver.log"
+        grep -vE '^ Container ' /tmp/wt-archiver.log | tail -5 | sed 's/^/    /'
+        return 1
+    fi
     if [ "$NONINTERACTIVE" != 1 ]; then
         show_cmd "docker compose run --rm --no-deps archiver --config /config/archiver.yaml"
         echo ""
@@ -839,7 +846,7 @@ EOSQL
     # network. Without it, `compose run` re-evaluates depends_on:db and can RECREATE
     # the db from its config hash — replacing the loaded db with a fresh one, so the
     # archiver's host=db then finds no `events` table.
-    $COMPOSE run --rm --no-deps archiver --config /config/archiver.yaml >/tmp/wt-archiver.log 2>&1
+    $COMPOSE run --rm --no-deps archiver --config /config/archiver.yaml >>/tmp/wt-archiver.log 2>&1
     local rc=$?
     stop_spinner
     if [ "$rc" != 0 ]; then
@@ -850,7 +857,7 @@ EOSQL
         [ -n "$reason" ] || reason="see /tmp/wt-archiver.log for details"
         error "The archiver failed — ${reason}"
         grep -vE '^ Container ' /tmp/wt-archiver.log | tail -5 | sed 's/^/    /'
-        return
+        return 1
     fi
 
     # Proof (a): it's really Parquet in S3. iceberg_metadata() lists the data files
@@ -987,7 +994,7 @@ demo_decoupled() {
         if [ "$(pg "SELECT count(*) FROM pg_class WHERE relname='events_lake' AND relkind='v';")" = "1" ]; then ok=1; break; fi
         sleep 2
     done
-    [ "$ok" = 1 ] || { error "create_iceberg_table did not succeed"; return; }
+    [ "$ok" = 1 ] || { error "create_iceberg_table did not succeed"; return 1; }
     explain "Confirm what it created — events_lake is a VIEW (relkind = v), not a table:"
     show_query "SELECT relkind FROM pg_class WHERE relname='events_lake';"
     info "relkind = v — events_lake is a VIEW, no heap table was created. The data has nowhere to live but the lake."
@@ -1093,7 +1100,7 @@ EOSQL
     if [ "$rc" != 0 ]; then
         error "Registration failed — see /tmp/wt-part.log"
         grep -vE '^ Container ' /tmp/wt-part.log | tail -5 | sed 's/^/    /'
-        return
+        return 1
     fi
     info "Policy registered."
 
@@ -1118,7 +1125,7 @@ EOSQL
     if [ "$rc" != 0 ]; then
         error "Reconcile failed — see /tmp/wt-part.log"
         grep -vE '^ Container ' /tmp/wt-part.log | tail -5 | sed 's/^/    /'
-        return
+        return 1
     fi
 
     # Step 4 — see the result: the forward window, built automatically.
@@ -1212,7 +1219,7 @@ demo_distributed() {
         if [ "$(mpg "$MESH_PG1_PORT" "SELECT count(*) FROM pg_class WHERE relname='events_lake' AND relkind='v';")" = "1" ]; then ok=1; break; fi
         sleep 2
     done
-    [ "$ok" = 1 ] || { error "create_iceberg_table did not succeed on db1"; return; }
+    [ "$ok" = 1 ] || { error "create_iceberg_table did not succeed on db1"; return 1; }
     info "events_lake created on db1 — a VIEW over the shared Iceberg table, no Postgres heap."
 
     explain "Now register the same table on db2 so that node can read AND write it. The"
@@ -1224,7 +1231,7 @@ demo_distributed() {
         if [ "$(mpg "$MESH_PG2_PORT" "SELECT count(*) FROM coldfront.tiered_views WHERE relname='events_lake' AND is_iceberg_only;")" = "1" ]; then ok=1; break; fi
         sleep 2
     done
-    [ "$ok" = 1 ] || { error "could not register events_lake on db2"; return; }
+    [ "$ok" = 1 ] || { error "could not register events_lake on db2"; return 1; }
     mshow db2 "$MESH_PG2_PORT" "SELECT relname, is_iceberg_only, hot_table FROM coldfront.tiered_views WHERE relname='events_lake';"
     info "Registered on db2 — is_iceberg_only = t, hot_table = NULL. Both nodes now front the one shared lake table."
     if [ "$NONINTERACTIVE" != 1 ]; then prompt_continue; fi
@@ -1427,7 +1434,8 @@ phase_a_bringup
 ACTIVE_STACK=single
 if [ "$NONINTERACTIVE" = 1 ]; then
     case "${WALKTHROUGH_DEMO:-tiered}" in
-        tiered) demo_tiered;; decoupled) demo_decoupled;; partitioner) demo_partitioner;;
+        tiered) demo_tiered || exit 1;; decoupled) demo_decoupled || exit 1;; partitioner) demo_partitioner || exit 1;;
+        *) error "unknown WALKTHROUGH_DEMO: ${WALKTHROUGH_DEMO:-}"; exit 2;;
     esac
     exit 0
 fi

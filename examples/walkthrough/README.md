@@ -28,7 +28,7 @@ If a user runs the `curl ... | bash` install inside Codespaces,
 `install.sh` detects the `$CODESPACES` environment variable and exits as
 a no-op — the devcontainer has already handled setup.
 
-Both paths walk through the same three demos:
+Both paths walk through the same four demos:
 
 1. **Tiered storage** — relocate cold partitions to Iceberg/S3 while the
    table stays fully SQL-accessible and writeable
@@ -36,16 +36,19 @@ Both paths walk through the same three demos:
    Postgres view (data in object storage from day one)
 3. **Standalone partitioner** — automated range-partition maintenance
    with no cold tier or Iceberg involvement
+4. **Distributed** — a 2-node Spock mesh over one shared lake: cross-node
+   visibility and conflict-free concurrent cold writes
 
 ## File Overview
 
 ```
 examples/walkthrough/
 ├── install.sh              # Curl-pipe entry point (downloads files + sources)
-├── guide.sh                # Interactive guide (three demos + menu)
+├── guide.sh                # Interactive guide (four demos + menu)
 ├── setup.sh                # Prerequisites checker
 ├── runner.sh               # Terminal UX framework (sourced, not executed)
 ├── docker-compose.yml      # Full stack: db, archiver, Lakekeeper, SeaweedFS
+├── docker-compose.mesh.yml # 2-node Spock mesh stack for the Distributed demo
 ├── Dockerfile.archiver     # Archiver + partitioner image (builds from source)
 ├── seaweedfs-s3.json       # SeaweedFS S3 gateway credentials
 └── config/
@@ -84,7 +87,7 @@ met.
 
 The interactive guide. Sources `runner.sh` for terminal UX, brings up
 the Docker Compose stack, runs ColdFront setup SQL, then presents a
-menu for the three demos.
+menu for the four demos.
 
 Key behaviors:
 
@@ -113,7 +116,7 @@ Environment variables:
 
 Reusable terminal UX framework, sourced by `guide.sh`. Provides brand
 colors (teal and orange from the pgEdge palette), `header`, `explain`,
-`info`, `warn`, `error`, `show_cmd`, `prompt_run`, `prompt_continue`,
+`info`, `warn`, `error`, `show_cmd`, `prompt_continue`,
 and `start_spinner`/`stop_spinner`.
 
 This file is standalone and could be reused for other interactive guides.

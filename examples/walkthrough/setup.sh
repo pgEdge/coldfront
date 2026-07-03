@@ -11,7 +11,7 @@ header "ColdFront Walkthrough -- Prerequisites Check"
 explain "Checking that required tools are installed..."
 echo ""
 
-REQUIRED_CMDS=(docker curl jq psql)
+REQUIRED_CMDS=(docker curl psql)
 if [[ "$OS" == "Darwin" ]]; then REQUIRED_CMDS+=(lsof); else REQUIRED_CMDS+=(ss); fi
 MISSING=()
 for cmd in "${REQUIRED_CMDS[@]}"; do
@@ -30,7 +30,6 @@ if [[ ${#MISSING[@]} -gt 0 ]]; then
     case "$cmd" in
       docker) explain "  docker  -- https://docs.docker.com/get-docker/";;
       curl)   explain "  curl    -- https://curl.se/download.html";;
-      jq)     explain "  jq      -- https://jqlang.github.io/jq/download/";;
       psql)
         if [[ "$OS" == "Darwin" ]]; then
           explain "  psql    -- brew install libpq && brew link --force libpq"

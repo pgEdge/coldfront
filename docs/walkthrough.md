@@ -395,19 +395,28 @@ The `hot_period: 30 days` value is the hot/cold line. Any partition
 whose data is entirely older than 30 days will move to object storage
 when the archiver runs.
 
-### Step 7 - Run the archiver
+### Step 7 - Register the table, then run the archiver
 
-The archiver moves every partition older than 30 days out of the
-PostgreSQL heap and into Parquet files in object storage, then rebuilds
+The archiver reads its managed-table set from `coldfront.partition_config`,
+not from the YAML at run time. Seed that table once from the YAML's
+`archiver.tables` block with `import` (equivalently, register one table by
+hand), then run the archiver: it moves every partition older than 30 days
+out of the PostgreSQL heap into Parquet files in object storage and rebuilds
 `events` as a unified view over the hot remainder and the cold data.
-
-Run the archiver container against the stack:
 
 ```bash
 docker compose \
   -f examples/walkthrough/docker-compose.yml \
-  run --rm archiver --config /config/archiver.yaml
+  run --rm --no-deps archiver import --config /config/archiver.yaml
+
+docker compose \
+  -f examples/walkthrough/docker-compose.yml \
+  run --rm --no-deps archiver --config /config/archiver.yaml
 ```
+
+The `--no-deps` flag reuses the already-running, data-loaded `db` container;
+without it, `docker compose run` re-evaluates `depends_on` and can recreate
+`db` from its config hash, wiping the rows you just loaded.
 
 The archiver connects inside the Compose network (service name `db`,
 not `localhost`), detaches the partitions older than 30 days from
@@ -667,7 +676,7 @@ SELECT pg_size_pretty(
 Fresh connection: the archived row is still `corrected`, all one
 million rows are present, and the hot heap is still small. The data
 never came back to PostgreSQL. Approximately 90% of the original
-storage now lives at a fraction of the cost, and that data is still a
+storage now lives in object storage as Parquet, and that data is still a
 normal, writeable part of the table - corrected in place, no
 rehydration, no separate system.
 
@@ -757,7 +766,7 @@ Compose network against service name `db`:
 # Register the table.
 docker compose \
   -f examples/walkthrough/docker-compose.yml \
-  run --rm --entrypoint partitioner archiver \
+  run --rm --no-deps --entrypoint partitioner archiver \
   register \
   --config /config/partitioner.yaml \
   --table part_demo \
@@ -767,7 +776,7 @@ docker compose \
 # Run a reconcile pass to premake forward partitions.
 docker compose \
   -f examples/walkthrough/docker-compose.yml \
-  run --rm --entrypoint partitioner archiver \
+  run --rm --no-deps --entrypoint partitioner archiver \
   --config /config/partitioner.yaml
 ```
 
@@ -832,6 +841,15 @@ docker compose -f examples/walkthrough/docker-compose.mesh.yml up -d
 ```
 
 ```sql
+-- On BOTH nodes - create the extensions. The container preloads the libraries
+-- (shared_preload_libraries) but does not run CREATE EXTENSION, so the SQL
+-- objects (the spock schema, coldfront functions) do not exist until you do:
+CREATE EXTENSION IF NOT EXISTS dblink;
+CREATE EXTENSION IF NOT EXISTS snowflake;
+CREATE EXTENSION IF NOT EXISTS spock;
+CREATE EXTENSION IF NOT EXISTS pg_duckdb;
+CREATE EXTENSION IF NOT EXISTS coldfront;
+
 -- On db1:
 SELECT spock.node_create('db1', 'host=db1 user=coldfront dbname=coldfront port=5432');
 SELECT spock.sub_create('sub_db1_from_db2', 'host=db2 user=coldfront dbname=coldfront port=5432');
@@ -839,9 +857,12 @@ SELECT spock.sub_create('sub_db1_from_db2', 'host=db2 user=coldfront dbname=cold
 SELECT spock.node_create('db2', 'host=db2 user=coldfront dbname=coldfront port=5432');
 SELECT spock.sub_create('sub_db2_from_db1', 'host=db1 user=coldfront dbname=coldfront port=5432');
 
--- On BOTH nodes - replicate the bakery's claim tables and set the cold-store
--- secret, before any cold write:
+-- On BOTH nodes - wait for the subscription to sync, then replicate the bakery's
+-- claim + config tables and set the cold-store secret, before any cold write:
+SELECT spock.sub_wait_for_sync(sub_name) FROM spock.subscription;
 SELECT coldfront._ensure_claims_replicated();
+SELECT spock.repset_add_table('default', 'coldfront.partition_config'::regclass, false);
+SELECT spock.repset_add_table('default', 'coldfront.storage_secret'::regclass, false);
 SELECT coldfront.set_storage_secret('admin', 'adminsecret', 'seaweedfs:8333');
 ```
 

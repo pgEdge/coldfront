@@ -33,6 +33,7 @@ FILES=(
     examples/walkthrough/runner.sh
     examples/walkthrough/setup.sh
     examples/walkthrough/docker-compose.yml
+    examples/walkthrough/docker-compose.mesh.yml
     examples/walkthrough/Dockerfile.archiver
     examples/walkthrough/seaweedfs-s3.json
     examples/walkthrough/config/archiver.yaml

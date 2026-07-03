@@ -54,13 +54,17 @@ jobs:
       - name: Check no services have exited
         run: |
           echo "=== Service Status ==="
-          docker compose -f examples/walkthrough/docker-compose.yml ps
-          if docker compose -f examples/walkthrough/docker-compose.yml ps | grep -E "Exit|exited"; then
-            echo "ERROR: Some services have exited"
+          docker compose -f examples/walkthrough/docker-compose.yml ps -a
+          # -a is required: plain `ps` hides stopped containers, so the grep could
+          # never match. lakekeeper-migrate is a one-shot that exits 0 by design;
+          # any OTHER exited container is a real crash.
+          if docker compose -f examples/walkthrough/docker-compose.yml ps -a \
+               | grep -iE 'exit' | grep -v lakekeeper-migrate; then
+            echo "ERROR: a service crashed"
             docker compose -f examples/walkthrough/docker-compose.yml logs
             exit 1
           fi
-          echo "All services are running"
+          echo "All services running (aside from the by-design migrate one-shot)"
       - name: Dump logs on failure
         if: failure()
         working-directory: examples/walkthrough

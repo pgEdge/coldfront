@@ -56,31 +56,6 @@ prompt_continue() {
   echo ""
 }
 
-prompt_run() {
-  local cmd="$1"
-  local slow="${2:-}"
-  show_cmd "$cmd"
-  echo ""
-  read -rp "Press Enter to run..." </dev/tty
-  echo ""
-  if [[ -n "$slow" ]]; then
-    local tmpfile
-    tmpfile=$(mktemp)
-    start_spinner "$slow"
-    eval "$cmd" > "$tmpfile" 2> >(grep -v "Unable to use a TTY" >&2)
-    stop_spinner
-    echo -e "${DIM}─── Output ─────────────────────────────────────────────────${RESET}"
-    cat "$tmpfile"
-    echo -e "${DIM}────────────────────────────────────────────────────────────${RESET}"
-    rm -f "$tmpfile"
-  else
-    echo -e "${DIM}─── Output ─────────────────────────────────────────────────${RESET}"
-    eval "$cmd" 2> >(grep -v "Unable to use a TTY" >&2)
-    echo -e "${DIM}────────────────────────────────────────────────────────────${RESET}"
-  fi
-  echo ""
-}
-
 # --- Spinner ---
 
 SPINNER_PID=""
