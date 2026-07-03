@@ -281,9 +281,9 @@ PG nodes pointing at the same Lakekeeper endpoint and S3 bucket.
 
   - `coldfront.claims` - each writer inserts `(iceberg_table, ticket)`
     here; deleted on release.
-  - `coldfront.claim_acks` - peers insert `(ticket, ack_from_node,
-    iceberg_table)` to acknowledge an originator's claim. Replicates
-    back to the originator.
+  - `coldfront.claim_acks` - peers insert `(ticket, ack_from_name,
+    iceberg_table)` to acknowledge an originator's claim, keyed by the
+    acker's spock node name. Replicates back to the originator.
 
   Locally on every node, `coldfront.deferred_acks` queues acks the
   node has *deferred* because it has its own pending claim with a
@@ -373,10 +373,10 @@ wal_receiver_status_interval = 1s
 ```
 
 ```ini
-# postgresql.conf — per-node. snowflake.node MUST equal
-# (hashtext(<spock node_name>) & 1023) or the bakery raises at first claim:
-# it maps each ticket back to a spock node_name via the same hash for
-# dead-peer detection.
+# postgresql.conf — per-node. snowflake.node is any integer 1..1023, unique per
+# node; the value is otherwise arbitrary. The bakery matches acks by spock node
+# name (dead-peer detection joins claim_acks.ack_from_name to spock.node), so it
+# imposes no relationship between snowflake.node and the node name.
 snowflake.node = 1     # node1
 # snowflake.node = 2   # node2
 # snowflake.node = 3   # node3
