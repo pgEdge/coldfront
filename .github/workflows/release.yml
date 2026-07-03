@@ -901,21 +901,36 @@ jobs:
               run: |
                   set -euo pipefail
                   mkdir -p aggregated
-                  cells='[]'
+                  # Build cells entirely in jq (NOT a bash `read` loop): several
+                  # components carry an empty component_version, and reading @tsv
+                  # with IFS=tab collapses that empty field — shifting every later
+                  # column and corrupting os_version/arch/backup_path. jq is immune.
+                  # backup_path mirrors pgedge-backup-artifacts exactly:
+                  #   <repo_type>/<umbrella>/<version>/<ts>/<dnf|apt>/<os_version>/
+                  # where os_version is the EL major (dnf) or distro codename (apt);
+                  # the arch is a subdir INSIDE that prefix, so it's not in the path.
+                  rpm_cells='[]'; deb_cells='[]'; dnf_paths='[]'; apt_paths='[]'
                   if [ "${PUSH_DNF_RESULT}" = "success" ] && [ -n "${DNF_TS}" ]; then
-                      while IFS=$'\t' read -r comp cver image os arch; do
-                          path="${REPO_TYPE}/${COMPONENT_NAME}/${CV}/${DNF_TS}/dnf/${os}/"
-                          cell="$(jq -nc --arg fam rpm --arg comp "$comp" --arg cv "$cver" --arg img "$image" --arg ver "$os" --arg arch "$arch" --arg bp "$path" --arg ts "$DNF_TS" --arg rt "$REPO_TYPE" '{family:$fam,component:$comp,component_version:$cv,image:$img,arch:$arch,os_version:$ver,backup_path:$bp,timestamp:$ts,repo_type:$rt}')"
-                          cells="$(jq -c --argjson c "$cell" '. + [$c]' <<<"$cells")"
-                      done < <(echo "$RPM_MATRIX" | jq -r '.include[] | [.component_name, .component_version, .image, (.image|split(":")[1]), .arch] | @tsv')
+                      rpm_cells="$(echo "$RPM_MATRIX" | jq -c \
+                          --arg rt "$REPO_TYPE" --arg cn "$COMPONENT_NAME" --arg cv "$CV" --arg ts "$DNF_TS" '
+                          [ .include[] | (.image | split(":")[1]) as $os | {
+                              family:"rpm", component:.component_name, component_version:.component_version,
+                              image:.image, arch:.arch, os_version:$os,
+                              backup_path:($rt+"/"+$cn+"/"+$cv+"/"+$ts+"/dnf/"+$os+"/"),
+                              timestamp:$ts, repo_type:$rt } ]')"
+                      dnf_paths="$(jq -c '[.[].backup_path] | unique' <<<"$rpm_cells")"
                   fi
                   if [ "${PUSH_APT_RESULT}" = "success" ] && [ -n "${APT_TS}" ]; then
-                      while IFS=$'\t' read -r comp cver image distro arch; do
-                          path="${REPO_TYPE}/${COMPONENT_NAME}/${CV}/${APT_TS}/apt/${distro}/"
-                          cell="$(jq -nc --arg fam deb --arg comp "$comp" --arg cv "$cver" --arg img "$image" --arg distro "$distro" --arg arch "$arch" --arg bp "$path" --arg ts "$APT_TS" --arg rt "$REPO_TYPE" '{family:$fam,component:$comp,component_version:$cv,image:$img,arch:$arch,distro:$distro,backup_path:$bp,timestamp:$ts,repo_type:$rt}')"
-                          cells="$(jq -c --argjson c "$cell" '. + [$c]' <<<"$cells")"
-                      done < <(echo "$DEB_MATRIX" | jq -r '.include[] | [.component_name, .component_version, .image, (.image|split(":")[1]), .arch] | @tsv')
+                      deb_cells="$(echo "$DEB_MATRIX" | jq -c \
+                          --arg rt "$REPO_TYPE" --arg cn "$COMPONENT_NAME" --arg cv "$CV" --arg ts "$APT_TS" '
+                          [ .include[] | (.image | split(":")[1]) as $distro | {
+                              family:"deb", component:.component_name, component_version:.component_version,
+                              image:.image, arch:.arch, distro:$distro,
+                              backup_path:($rt+"/"+$cn+"/"+$cv+"/"+$ts+"/apt/"+$distro+"/"),
+                              timestamp:$ts, repo_type:$rt } ]')"
+                      apt_paths="$(jq -c '[.[].backup_path] | unique' <<<"$deb_cells")"
                   fi
+                  cells="$(jq -c -n --argjson r "$rpm_cells" --argjson d "$deb_cells" '$r + $d')"
                   jq -n \
                       --arg run_id "${GITHUB_RUN_ID}" --arg run_attempt "${GITHUB_RUN_ATTEMPT}" \
                       --arg repo "${GITHUB_REPOSITORY}" --arg tag "${EFFECTIVE_TAG}" \
@@ -925,7 +940,8 @@ jobs:
                       --arg dnf_timestamp "${DNF_TS}" --arg apt_timestamp "${APT_TS}" \
                       --arg push_dnf_outcome "${PUSH_DNF_RESULT}" --arg push_apt_outcome "${PUSH_APT_RESULT}" \
                       --argjson cells "${cells}" \
-                      '{run_id:$run_id, run_attempt:$run_attempt, repo:$repo, tag:$tag, simulated:$simulated, commit_sha:$commit_sha, component_name:$component_name, component_version:$component_version, component_buildnum:$component_buildnum, repo_type:$repo_type, timestamps:{dnf:$dnf_timestamp, apt:$apt_timestamp}, push_results:{dnf:$push_dnf_outcome, apt:$push_apt_outcome}, cells:$cells}' \
+                      --argjson dnf_paths "${dnf_paths}" --argjson apt_paths "${apt_paths}" \
+                      '{run_id:$run_id, run_attempt:$run_attempt, repo:$repo, tag:$tag, simulated:$simulated, commit_sha:$commit_sha, component_name:$component_name, component_version:$component_version, component_buildnum:$component_buildnum, repo_type:$repo_type, timestamps:{dnf:$dnf_timestamp, apt:$apt_timestamp}, push_results:{dnf:$push_dnf_outcome, apt:$push_apt_outcome}, backups:{dnf:$dnf_paths, apt:$apt_paths}, cells:$cells}' \
                       > aggregated/manifest.json
                   cat aggregated/manifest.json
                   { echo "manifest_json<<__EOF__"; jq -c '.' aggregated/manifest.json; echo "__EOF__"; } >> "$GITHUB_OUTPUT"
@@ -963,7 +979,13 @@ jobs:
                   if [ -f aggregated/manifest.json ]; then a=$(jq -r '(.cells // []) | map(.arch) | unique | join(", ")' aggregated/manifest.json); [ -n "$a" ] && archs="$a"; fi
                   fields=$(jq -nc --arg channel "${REPO_TYPE}" --arg version "${CV}" --arg buildnum "${CBN}" --arg archs "${archs}" --arg actor "${ACTOR}" --arg unix_ts "${unix_ts}" --arg fallback_ts "${fallback_ts}" '[{title:"Channel",value:("`"+$channel+"`")},{title:"Version",value:("`"+$version+"`")},{title:"Build #",value:("`"+$buildnum+"`")},{title:"Archs",value:("`"+$archs+"`")},{title:"Triggered by",value:$actor},{title:"When",value:("<!date^"+$unix_ts+"^{date_short_pretty} at {time}|"+$fallback_ts+">")}]')
                   result_fields=$(jq -nc --arg dnf "${PUSH_DNF_RESULT}" --arg apt "${PUSH_APT_RESULT}" '[{title:"Push DNF",value:("`"+$dnf+"`")},{title:"Push APT",value:("`"+$apt+"`")}]')
-                  { echo "status=${status}"; echo "subject<<__S__"; echo "${subject}"; echo "__S__"; echo "fields<<__F__"; echo "${fields}"; echo "__F__"; echo "result_fields<<__RF__"; echo "${result_fields}"; echo "__RF__"; } >> "$GITHUB_OUTPUT"
+                  # Backup paths as code blocks (one per OS major / distro; arch is a
+                  # subdir inside). Publisher elides a section whose lines[] is empty,
+                  # so a skipped push simply shows nothing.
+                  dnf_paths=$(jq -c '.backups.dnf // []' aggregated/manifest.json)
+                  apt_paths=$(jq -c '.backups.apt // []' aggregated/manifest.json)
+                  code_sections=$(jq -nc --argjson dnf "${dnf_paths}" --argjson apt "${apt_paths}" '[{title:"DNF backup paths",lines:$dnf},{title:"APT backup paths",lines:$apt}]')
+                  { echo "status=${status}"; echo "subject<<__S__"; echo "${subject}"; echo "__S__"; echo "fields<<__F__"; echo "${fields}"; echo "__F__"; echo "result_fields<<__RF__"; echo "${result_fields}"; echo "__RF__"; echo "code_sections<<__CS__"; echo "${code_sections}"; echo "__CS__"; } >> "$GITHUB_OUTPUT"
             - name: Publish manifest + Slack notification
               uses: ./.github/actions/pgedge-build-publisher
               with:
@@ -979,6 +1001,7 @@ jobs:
                   subject:            ${{ steps.compose_slack.outputs.subject }}
                   fields_json:        ${{ steps.compose_slack.outputs.fields }}
                   result_fields_json: ${{ steps.compose_slack.outputs.result_fields }}
+                  code_sections_json: ${{ steps.compose_slack.outputs.code_sections }}
                   tagline: "pgEdge ColdFront release pipeline"
                   aws_access_key_id: ${{ secrets.AWS_ACCESS_KEY_ID }}
                   aws_secret_access_key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
