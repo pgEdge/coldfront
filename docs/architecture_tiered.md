@@ -118,11 +118,12 @@ CREATE OR REPLACE VIEW events AS
 
 The rename is conditional, so it converts the table on the first run
 and no-ops afterwards; the `CREATE OR REPLACE VIEW` keeps the view's
-OID across runs. An INSTEAD OF INSERT trigger is also installed as a
-defensive fallback: it routes per-row to `_events` (hot) or
-`duckdb.raw_query` (cold), and fires only when the extension is *not*
-loaded (the C hook is the production path and intercepts INSERTs
-before view-rewrite when coldfront is preloaded).
+OID across runs. With the extension loaded, the C hook rewrites an
+INSERT on the view by the watermark cutoff, into a hot INSERT of the
+at/after-cutoff rows into `_events` and a cold `duckdb.raw_query`
+INSERT of the older rows. The view also carries an INSTEAD OF INSERT
+trigger that does the same routing; it is the fallback that fires only
+when the extension is not loaded.
 
 ### The archive pipeline
 
