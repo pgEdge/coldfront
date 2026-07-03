@@ -599,9 +599,8 @@ shared_preload_libraries = 'snowflake,spock,pg_duckdb,coldfront'
 # quiet period.  1 s leaves comfortable margin.
 wal_receiver_status_interval = 1s
 
-# Per-node — distinct integer 1..1023.  MUST equal
-# (hashtext(<spock node_name>) & 1023); the bakery alignment check raises
-# at first claim if these disagree.
+# Per-node — any distinct integer 1..1023 (must be unique per node; the value
+# is otherwise arbitrary — the bakery matches acks by spock node name, not by id).
 snowflake.node = 1
 
 # DSN used by the bakery's autonomous-tx claim INSERT/DELETE via dblink.

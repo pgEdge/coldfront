@@ -1728,6 +1728,28 @@ CREATE FUNCTION coldfront.node_id() RETURNS int
 LANGUAGE sql STABLE AS
 $$ SELECT current_setting('snowflake.node')::int $$;
 
+-- The local node's spock node name — the bakery's cross-node identity (acks are
+-- keyed by it). spock.local_node has only node_id + node_local_interface (no
+-- node_name column), and an unqualified node_name in a subquery against it
+-- silently resolves to an OUTER query's column, so we join to spock.node to read
+-- the local name explicitly. plpgsql (not sql) so the spock references resolve at
+-- call time: CREATE EXTENSION succeeds on a vanilla (spock-absent) install, where
+-- the bakery is never armed and this is never called.
+CREATE FUNCTION coldfront._my_spock_node_name() RETURNS name
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    v_name name;
+BEGIN
+    -- STRICT: fail clearly here if the local spock node is not configured
+    -- (no row) or ambiguous (more than one), rather than returning NULL and
+    -- surfacing later as an opaque claim_acks NOT NULL violation. No EXCEPTION
+    -- block, so no subtransaction (pg_duckdb rejects those).
+    SELECT ln.node_name INTO STRICT v_name
+      FROM spock.local_node l
+      JOIN spock.node ln ON ln.node_id = l.node_id;
+    RETURN v_name;
+END $$;
+
 -- ============================================================================
 -- Multi-writer commit serialisation (bakery protocol).
 --
@@ -1792,16 +1814,17 @@ CREATE TABLE coldfront.claims (
 );
 
 -- Acks for the bakery's Ricart-Agrawala layer.  A row here means
--- "peer ack_from_node has acknowledged ticket on iceberg_table."  The
+-- "peer ack_from_name (its spock node name) has acknowledged ticket on
+-- iceberg_table."  The
 -- originator polls this table waiting for one row per live peer before
 -- entering the iceberg-commit phase.  Spock-replicated so peers'
 -- ack-INSERTs (from the peer-side trigger on coldfront.claims) reach
 -- the originator.
 CREATE TABLE coldfront.claim_acks (
     ticket          bigint NOT NULL,
-    ack_from_node   int    NOT NULL,
+    ack_from_name   name   NOT NULL,
     iceberg_table   text   NOT NULL,
-    PRIMARY KEY (ticket, ack_from_node)
+    PRIMARY KEY (ticket, ack_from_name)
 );
 
 -- Deferred acks queue, LOCAL to each node (NOT replicated).  When a peer
@@ -1883,6 +1906,7 @@ CREATE FUNCTION coldfront._on_claim_apply() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE
     my_node         int    := current_setting('snowflake.node')::int;
+    my_name         name   := coldfront._my_spock_node_name();
     connstr         text   := coldfront._dblink_self_connstr();
     -- Per-table advisory lock key. Pairs with the exclusive lock that
     -- _claim_iceberg_lock takes around its dblink-INSERT. Shared mode
@@ -1955,9 +1979,9 @@ BEGIN
             PERFORM public.dblink_connect('coldfront_self', connstr);
         END IF;
         PERFORM public.dblink_exec('coldfront_self', format(
-            'INSERT INTO coldfront.claim_acks (ticket, ack_from_node, iceberg_table) '
-            'VALUES (%s, %s, %L) ON CONFLICT DO NOTHING',
-            NEW.ticket, my_node, NEW.iceberg_table));
+            'INSERT INTO coldfront.claim_acks (ticket, ack_from_name, iceberg_table) '
+            'VALUES (%s, %L, %L) ON CONFLICT DO NOTHING',
+            NEW.ticket, my_name, NEW.iceberg_table));
     END IF;
     RETURN NULL;
 END $$;
@@ -1978,13 +2002,14 @@ CREATE FUNCTION coldfront._on_claim_release() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE
     my_node int := current_setting('snowflake.node')::int;
+    my_name name := coldfront._my_spock_node_name();
 BEGIN
     IF snowflake.get_node(OLD.ticket) <> my_node THEN
         RETURN NULL;
     END IF;
 
-    INSERT INTO coldfront.claim_acks (ticket, ack_from_node, iceberg_table)
-    SELECT ack_for_ticket, my_node, iceberg_table
+    INSERT INTO coldfront.claim_acks (ticket, ack_from_name, iceberg_table)
+    SELECT ack_for_ticket, my_name, iceberg_table
       FROM coldfront.deferred_acks
      WHERE pending_ticket = OLD.ticket
     ON CONFLICT DO NOTHING;
@@ -2017,18 +2042,9 @@ CREATE FUNCTION coldfront._claim_iceberg_lock(
 DECLARE
     connstr           text     := coldfront._dblink_self_connstr();
     my_node           int      := current_setting('snowflake.node')::int;
-    -- Real local spock node name. spock.local_node has only node_id +
-    -- node_local_interface (no node_name column) — an unqualified
-    -- node_name in a subquery against it silently resolves to the
-    -- OUTER query's column (e.g. n.node_name in the alive-check below),
-    -- so we explicitly join to spock.node to read the local name.
-    -- Without this fix the alive-check generates slot names with the
-    -- peer's node as "local", never matching any walsender, and every
-    -- peer is treated as dead → bakery skips required acks → race.
-    my_node_name      name     := (
-        SELECT ln.node_name FROM spock.local_node l
-          JOIN spock.node ln ON ln.node_id = l.node_id
-    );
+    -- Local spock node name, used for the ack-wait join and the liveness
+    -- slot-name computation (see coldfront._my_spock_node_name).
+    my_node_name      name     := coldfront._my_spock_node_name();
     my_ticket         bigint;
     -- Per-table advisory lock key (pairs with the shared lock taken in
     -- _on_claim_apply). Held EXCLUSIVELY in THIS session ONLY across
@@ -2072,20 +2088,6 @@ BEGIN
             'SET statement_timeout = ''30s''');
     END IF;
 
-    -- Alignment precondition: snowflake.node = hashtext(spock node name)
-    -- & 1023.  Needed because the dead-peer detection in the ack-wait
-    -- loop maps each peer's snowflake.node back to a spock.node_name
-    -- via the same hash.  Cached per-session.
-    IF current_setting('coldfront._snowflake_aligned', true) IS DISTINCT FROM 'true' THEN
-        PERFORM 1
-           FROM spock.local_node l JOIN spock.node n ON n.node_id = l.node_id
-          WHERE (hashtext(n.node_name::text) & 1023) = my_node;
-        IF NOT FOUND THEN
-            RAISE EXCEPTION 'coldfront: snowflake.node = % does not match hashtext(local spock node name) & 1023; reconfigure snowflake.node in postgresql.conf and restart',
-                            my_node;
-        END IF;
-        PERFORM set_config('coldfront._snowflake_aligned', 'true', false);
-    END IF;
 
     -- NodeStartup self-cleanup of pre-restart orphans.  Cheap when no
     -- orphans exist (gated on a local EXISTS).
@@ -2150,7 +2152,7 @@ BEGIN
                AND NOT EXISTS (
                  SELECT 1 FROM coldfront.claim_acks a
                   WHERE a.ticket = my_ticket
-                    AND a.ack_from_node = (hashtext(n.node_name) & 1023)
+                    AND a.ack_from_name = n.node_name
                )
                AND EXISTS (
                  -- Per-peer alive check: match the walsender on us serving

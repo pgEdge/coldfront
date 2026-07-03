@@ -169,7 +169,10 @@ variables
   \* Acks received per ticket.  A pair <<t, nd>> in `acks` means peer NODE
   \* nd has acked the claim with ticket t.  Models coldfront.claim_acks
   \* (on the originator side, fully populated via spock replication of
-  \* peer-emitted ack rows).
+  \* peer-emitted ack rows).  `nd` is the node's identity: the concrete
+  \* claim_acks row carries the acker's spock node NAME (unique per node),
+  \* so the ack-wait match is a direct name equality with no id/name or
+  \* hash resolution — the model's abstract node identity realised exactly.
   acks = {},
 
   \* Deferred acks: a triple <<nd, t, behind>> means node nd queued an
