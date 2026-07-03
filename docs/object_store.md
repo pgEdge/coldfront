@@ -196,7 +196,9 @@ CREATE EXTENSION IF NOT EXISTS coldfront;
 > with `schema "coldfront" does not exist`.
 
 Set the cold-tier S3 credential once. The signature is
-`set_storage_secret(key_id, secret, endpoint, region)`:
+`set_storage_secret(key_id, secret, endpoint, region, url_style,
+use_ssl)`; the last four default to `NULL`, `'us-east-1'`, `'path'`,
+`false`:
 
 ```sql
 SELECT coldfront.set_storage_secret('AKIAEXAMPLE...', '<your-secret-key>', NULL, 'eu-west-1');
@@ -246,9 +248,9 @@ reads transparently union live Postgres data with cold S3 data and
 writes route to the correct tier.
 
 You drive it with the `archiver` binary against a small YAML config
-(Postgres DSN, the `wh` warehouse, your S3 region/keys, and per-table
-retention windows). The credential and warehouse you set up above are
-exactly what it needs. See
+(Postgres DSN, the `wh` warehouse, your S3 region/keys); each table's
+lifecycle is registered with `archiver register`. The credential and
+warehouse you set up above are exactly what it needs. See
 [usage.md](usage.md) for the archiver config and the partition CLI.
 
 ---

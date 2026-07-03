@@ -2389,11 +2389,12 @@ $$;
 --      (by resolving tiered_views.hot_table / the view to OIDs — never by
 --      string match, so it is schema-agnostic);
 --   2. BLOCKS, with an actionable error: DROP TABLE / DROP VIEW / TRUNCATE
---      (would orphan/hide the cold tier) and any column-shape change —
---      ADD/DROP COLUMN, ALTER COLUMN TYPE, RENAME COLUMN. Column DDL is
---      blocked because duckdb-iceberg (pg_duckdb v1.1.1) implements no Iceberg
---      ALTER TABLE, so the hot and cold tiers cannot be evolved together;
---   3. SUPPORTS RENAME TABLE (hot heap) and RENAME VIEW — neither touches the
+--      (would orphan/hide the cold tier) and column changes whose type has
+--      no Iceberg mapping;
+--   3. MIRRORS column-shape changes - ADD/DROP COLUMN, ALTER COLUMN TYPE,
+--      RENAME COLUMN - onto the cold Iceberg tier through the bakery
+--      (_mirror_iceberg_alter), so both tiers evolve together;
+--   4. SUPPORTS RENAME TABLE (hot heap) and RENAME VIEW - neither touches the
 --      Iceberg schema. It updates the registry and rebuilds the transparent
 --      view + INSERT trigger from the current catalog state.
 --

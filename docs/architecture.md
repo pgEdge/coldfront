@@ -36,13 +36,13 @@ writes:
 
 | Axis | Values | Selected by |
 |---|---|---|
-| **Storage mode** | **Tiered** - hot PG heap + cold Iceberg, unified by a `UNION ALL` view; an archiver moves rows hot→cold on a cron. · **Decoupled** - the table lives entirely in Iceberg; PG holds only a wrapper view + `INSTEAD OF` trigger + a registry row (no archiver, no PG storage, no watermark). | Per relation at creation, via the `is_iceberg_only` flag on `coldfront.tiered_views` (short-circuited in the hook's `classify_tier()`). |
+| **Storage mode** | **Tiered** - hot PG heap + cold Iceberg, unified by a `UNION ALL` view; an archiver moves rows hot→cold on a cron. · **Decoupled** - the table lives entirely in Iceberg; PG holds only a wrapper view + a registry row (no archiver, no PG storage, no watermark). | Per relation at creation, via the `is_iceberg_only` flag on `coldfront.tiered_views` (short-circuited in the hook's `classify_tier()`). |
 | **Topology** | **Vanilla** - single node; `spock`/`snowflake` not loaded; cold writes serialise on a local advisory lock. · **Mesh** - 3-node pgEdge Spock active-active; cold writes serialise cluster-wide via the bakery protocol. | Whether `spock`/`snowflake` are in `shared_preload_libraries`. One image and one SQL surface serve both; the `_exec_iceberg_with_claim` chokepoint self-selects via its `v_armed` gate. |
 | **Write mode** | **Permissive** (default) - an ambiguous cross-tier `UPDATE`/`DELETE` writes both tiers. · **Strict** - it is rejected with a hint. | `coldfront.allow_mixed_writes` (USERSET). |
 
 Both storage modes coexist in one database and share **one** code path:
 the transparent view and read rewriter, the INSERT/UPDATE/DELETE hook
-(`emit_cold` / `emit_hot` / `emit_dual_cte` in
+(`emit_cold` / `emit_hot` / `emit_dual` in
 [`extension/coldfront/src/coldfront.c`](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/src/coldfront.c)),
 and the `_exec_iceberg_with_claim` write chokepoint. Decoupled mode
 simply always classifies as `TIER_COLD` and never reaches `emit_hot`;
@@ -310,8 +310,11 @@ plugin slot.
 
 ColdFront coordinates concurrent writes across the cluster as follows:
 
-- The archiver runs on **one node only** (via cron). Catalog conflicts
-  are auto-retried (up to 3 attempts).
+- The archiver runs on **one node only** (via cron). Its cold writes
+  route through the same bakery claim as any other cold write, so
+  catalog conflicts are prevented up front rather than retried; the
+  only retry is the cutover's lock acquisition (10 attempts,
+  exponential backoff from 100 ms to 51.2 s).
 - Hot writes are replicated by Spock normally (standard PG DML).
 - Cold writes via `duckdb.raw_query()` from multiple nodes are
   serialised PG-side by the **bakery protocol** in the coldfront
@@ -326,21 +329,26 @@ ColdFront coordinates concurrent writes across the cluster as follows:
 ### Cold-write strategy: stock vs patched duckdb-iceberg
 
 Every cold write runs through the same `_exec_iceberg_with_claim`
-chokepoint. What differs is *when* the bakery ticket is held, selected by
-`coldfront.iceberg_async_parquet` (default `off`), as the following table
-shows:
+chokepoint. What differs is *when* the bakery ticket is held. The async
+ordering is active only when **both** `coldfront.iceberg_async_parquet`
+(default `off`) and the build marker `coldfront.iceberg_bakery_patch`
+(asserting the loaded duckdb-iceberg carries the patch) are on
+(`coldfront._iceberg_async_active()`), as the following table shows:
 
-| `iceberg_async_parquet` | duckdb-iceberg | Behaviour |
+| Ordering | duckdb-iceberg | Behaviour |
 |---|---|---|
-| `off` (default) | **stock** upstream | Claim-first: take the bakery ticket, *then* upload parquet **and** commit inside the ticket. Correct on an unpatched binary, but the whole parquet upload happens under the lock, so concurrent writers serialise on upload + commit. |
-| `on` | **patched** (`iceberg-bakery-aware-commit-refresh-v15.patch`) | Overlap: upload parquet in the background *first*, then take the ticket only for the Lakekeeper commit. Concurrent writers' uploads overlap; only the short commit POST is serialised. |
+| stock (default) | **stock** upstream | Claim-first: take the bakery ticket, *then* upload parquet **and** commit inside the ticket. Correct on an unpatched binary, but the whole parquet upload happens under the lock, so concurrent writers serialise on upload + commit. |
+| async (both GUCs `on`) | **patched** (`iceberg-bakery-aware-commit-refresh-v15.patch`) | Overlap: upload parquet in the background *first*, then take the ticket only for the Lakekeeper commit. Concurrent writers' uploads overlap; only the short commit POST is serialised. |
 
 The code path and the application-visible behaviour are identical, so
-the GUC is purely a performance knob. The patch relocates parent-snapshot
-stamping from upload time into PG's pre-commit phase (inside the bakery
-ticket, against a freshly-fetched table), so overlapping uploads can't
-commit a stale parent. The Docker image ships the patched binary with
-`iceberg_async_parquet = on`; bare-metal users on a stock binary leave it
+the GUCs are purely a performance knob. The patch relocates
+parent-snapshot stamping from upload time into PG's pre-commit phase
+(inside the bakery ticket, against a freshly-fetched table), so
+overlapping uploads can't commit a stale parent. Async requested
+without the build marker downgrades safely to the stock ordering, noted
+once per session with a server LOG line - never a silent 409. The
+Docker image ships the patched binary and sets both GUCs on
+(`docker/entrypoint.sh`); bare-metal users on a stock binary leave both
 `off` and lose only the upload overlap. See
 [DUCKDB_1.5_PATCHED.md](https://github.com/pgEdge/ColdFront/blob/main/DUCKDB_1.5_PATCHED.md)
 and
@@ -363,16 +371,18 @@ the following table summarizes:
 | `DROP TABLE _t` / `DROP VIEW v` | **Blocked by design** - would orphan the Iceberg cold tier. Dismantling tiering is a deliberate operator action (unregister with `partitioner remove`/`archiver remove`, which deletes the `partition_config` row, then drop each tier explicitly), never a one-shot call. |
 | `TRUNCATE _t` | **Blocked by design** - cold-tier rows would remain visible through the view. The operator truncates each tier explicitly. |
 
-The view rebuild always does `DROP VIEW` + `CREATE VIEW` (not
+The hook's view rebuild does `DROP VIEW` + `CREATE VIEW` (not
 `CREATE OR REPLACE VIEW`, which PG only allows for appending columns at
-the end). The registry is keyed by the view's `(schema_name, relname)`,
-which the rebuild leaves unchanged, so there is nothing to re-point. A
-column change is mirrored to Iceberg through `ensure_attached()` + the
-bakery, so it requires a configured `coldfront.warehouse`; a RENAME
-TABLE/VIEW touches no Iceberg schema and rebuilds the view regardless.
+the end); the archiver's cutover, which only moves the cutoff, instead
+uses `CREATE OR REPLACE VIEW` and keeps the view OID. The registry is
+keyed by the view's `(schema_name, relname)`, which either rebuild
+leaves unchanged, so there is nothing to re-point. A column change is
+mirrored to Iceberg through `ensure_attached()` + the bakery, so it
+requires a configured `coldfront.warehouse`; a RENAME TABLE/VIEW
+touches no Iceberg schema and rebuilds the view regardless.
 Concurrent schema changes are serialised by the same bakery as cold DML.
 
-In active-active deployments, Spock 5.0.8 replicates the top-level
+In active-active deployments, Spock replicates the top-level
 `ALTER TABLE` (the hook's SPI-issued mirror/rebuild DDL runs at
 non-top-level context, which Spock's `autoddl_can_proceed()` filters
 out). A peer's apply worker re-runs the replicated `ALTER TABLE`; the
@@ -399,10 +409,11 @@ targets a candidate relation; the hook already holds the target `relid`,
 from which the schema and name are a cheap syscache lookup.
 
 The name is the right key because it is **stable across the churn the
-system actually produces**. The archiver and the DDL-rebuild path
-`DROP`+`CREATE` the view regularly, minting a new view OID each time,
-while the name is unchanged - an OID key would have to be re-pointed on
-every rebuild; a name key is not. The one event that *does* change the
+system actually produces**. The DDL-rebuild path does `DROP`+`CREATE`
+on the view, minting a new view OID each time, and the archiver's
+cutover replaces it with `CREATE OR REPLACE VIEW` (same OID) - in both
+cases the name is unchanged. An OID key would have to be re-pointed on
+every DDL rebuild; a name key is not. The one event that *does* change the
 name, `ALTER VIEW … RENAME`, migrates the registry row and the watermark
 to the new name in a single step (`_rename_tiered_view`), exactly as the
 watermark is name-keyed.
@@ -469,8 +480,9 @@ verified before any mesh partitioner run by `story_mesh_partition_ddl` in
 `ci/journey.sh` (an N×(N-1) probe: create from every node, detach, drop,
 asserting each lands on all nodes).
 
-Both binaries read this table (falling back to the YAML `archiver.tables`
-list only when the table is empty) and expose a management CLI -
+Both binaries read this table and exit with an error when it is empty;
+tables enter it via `register`, or from a YAML `archiver.tables` list
+fed to `import`. Both expose a management CLI -
 `register` / `list` / `set` / `remove` / `import` / `export` - documented
 in [usage.md](usage.md#managing-partitioned-tables-cli).
 

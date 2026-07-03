@@ -3,8 +3,8 @@
 ColdFront runs on a **custom-built DuckDB 1.5.4 base image** that carries a
 small set of patches against `duckdb-iceberg` `v1.5-variegata`. This is the one
 home for *what* we patch, *why*, *how the base is built*, and *how it is wired
-and verified*. The cold-tier compactor's own story (and the three interop
-patches' details) lives in [COMPACTOR.md](COMPACTOR.md).
+and verified*. The cold-tier compactor's own story lives in
+[docs/compaction.md](docs/compaction.md).
 
 > **Why a custom build at all?** There is no released pg_duckdb bundling
 > DuckDB 1.5.x, so the stack is assembled off pg_duckdb PR #1025 + the
@@ -17,7 +17,7 @@ patches' details) lives in [COMPACTOR.md](COMPACTOR.md).
 | Patch family | Files | Purpose | Without it |
 |---|---|---|---|
 | **Bakery-aware commit-refresh** | `docker/iceberg-bakery-aware-commit-refresh-v15.patch` | makes the async parquet-upload ordering safe → the **no-409** guarantee for concurrent cold writers, at contended-upload throughput | cold writes still work and still never 409 — they fall back to serialized (claim-first) uploads (see [DUCKDB_1.5_UNPATCHED.md](DUCKDB_1.5_UNPATCHED.md)) |
-| **Strict-reader interop** (upstreamable) | `docker/iceberg-manifest-list-format-version-v15.patch`, `docker/iceberg-manifest-content-v15.patch`, `docker/iceberg-data-file-format-v15.patch` | make the manifests duckdb-iceberg *writes* readable by strict Apache readers (apache/iceberg-go) | the cold-tier **compactor cannot read the table** — see [COMPACTOR.md](COMPACTOR.md). pg_duckdb's own reads/writes are unaffected. |
+| **Strict-reader interop** (upstreamable) | `docker/iceberg-manifest-list-format-version-v15.patch`, `docker/iceberg-manifest-content-v15.patch`, `docker/iceberg-data-file-format-v15.patch` | make the manifests duckdb-iceberg *writes* readable by strict Apache readers (apache/iceberg-go) | the cold-tier **compactor cannot read the table** - see [docs/compaction.md](docs/compaction.md). pg_duckdb's own reads/writes are unaffected. |
 
 All four patches apply cleanly to a **pristine** `duckdb-iceberg` @ `0fad545a`
 (branch `v1.5-variegata`); `docker/Dockerfile.duckdb15-base` `git apply --check`s
@@ -65,8 +65,10 @@ END IF;
 
 ## 2. What the bakery patch does (v1.5)
 
-`docker/iceberg-bakery-aware-commit-refresh-v15.patch`, three files in
-`src/catalog/rest/transaction/` (no signature change). The problem: ColdFront
+`docker/iceberg-bakery-aware-commit-refresh-v15.patch`, three files across
+`src/catalog/rest/transaction/` and `src/include/catalog/rest/transaction/`
+(no public API/ABI change; the internal cache/refresh helpers gain an explicit
+`scan_context`). The problem: ColdFront
 uploads parquet *outside* the R-A bakery and takes the ticket only for the commit
 POST, so by POST time a peer may have advanced the catalog head — a commit
 against *session-cached* metadata fails `assert-ref-snapshot-id` (HTTP **409**),
@@ -112,14 +114,16 @@ pg_duckdb's own reads — make the manifests cross-engine-readable:
 - `iceberg-manifest-content-v15.patch` — write the manifest file's real `content` (`data`/`deletes`), not a hardcoded `"data"`.
 - `iceberg-data-file-format-v15.patch` — upper-case the data-file `file_format` to the spec enum (`PARQUET`).
 
-Full rationale, the iceberg-go errors each one fixes, and the safety argument are
-in [COMPACTOR.md §4](COMPACTOR.md). They are independent of the bakery patch.
+The compactor itself (usage, backends, maintenance steps) is documented in
+[docs/compaction.md](docs/compaction.md). The three patches are independent of
+the bakery patch.
 
 ## 4. NOT shipped — no `Commit(ClientContext&)` rewrite
 
 v1.5's `IcebergTransaction::Commit` already copies the caller's `ClientConfig`
-into its commit-time connection, so `s3_access_key_id` etc. are available — the
-non-AWS-S3 commit-time 403 that the old "mvcc-fix" targeted does not arise. Do
+into its commit-time connection, so `s3_access_key_id` etc. are available; a
+commit-time 403 from missing storage credentials on the commit connection does
+not arise in v1.5. Do
 **not** rewrite `Commit` to run under the caller's `ClientContext`: on the
 deferred `PRE_COMMIT` callback that context has no active transaction and throws
 `ActiveTransaction called without active transaction`. Build the bakery + interop
@@ -174,7 +178,7 @@ current source.
 |---|---|
 | `docker/Dockerfile.duckdb15-base` | base: pg_duckdb 1.5.4 (PR #1025) + libcurl 8.12 + patched iceberg/avro/azure/postgres_scanner; runtime stage = the 4 extensions + entrypoint, **no coldfront**. |
 | `docker/Dockerfile.duckdb15` | app: a `cf-build` stage compiles coldfront (PG devel only — coldfront links libpq, not pg_duckdb), then `FROM ${COLDFRONT_BASE}` copies the `.so`/SQL on top. |
-| `docker/entrypoint.sh` | first-init: sets `COLDFRONT_DUCKDB_VERSION=v1.5.4`, pre-places the extensions under `$PGDATA/pg_duckdb/extensions/v1.5.4/<platform>/`, writes the GUCs. |
+| `docker/entrypoint.sh` | first-init: reads `COLDFRONT_DUCKDB_VERSION` (v1.5.4, set by the base image), pre-places the extensions under `$PGDATA/pg_duckdb/extensions/<version>/<platform>/`, writes the GUCs. |
 | `docker/iceberg-azure-extension-config-v15.cmake` | the bundled-build extension config (iceberg + avro + azure + postgres_scanner). |
 | `.github/workflows/base-image.yml` | builds + pushes the base via `GITHUB_TOKEN` (base rebuilds are rare). |
 
@@ -217,9 +221,9 @@ base tagged the same.
   (parent + `AssertRefSnapshotId` from the session-cached `current_snapshot`) —
   the bakery-refresh injection site.
 - v1.5 bakes the snapshot `sequence_number` into the manifest at *parquet-write*
-  time (outside the bakery ticket in async mode) — which is why the bakery patch
-  is a re-design, not a port, and why its no-409 correctness is proven by the
-  3-node bench, not assumed.
+  time (outside the bakery ticket in async mode), which is why the bakery patch
+  works by refreshing metadata at commit time rather than re-stamping fields,
+  and why its no-409 correctness is proven by the 3-node bench, not assumed.
 
 ## 9. Azure secret (`TYPE azure`)
 
@@ -246,10 +250,9 @@ pg_regress — a green regress run does **not** prove azure I/O).
 ## 10. CI coverage — why azure is creds-gated, not hermetic
 
 `ci/matrix.sh` runs the same storage-agnostic journey under s3 (hermetic,
-SeaweedFS) and azure on the two **tiered** cells (`vanilla·tiered`,
-`mesh·tiered` — the only cells where storage interacts, via bakery × commit
-latency). Verified green over real ADLS: vanilla·tiered·azure 92/0,
-mesh·tiered·azure 108/0. Azure **cannot be hermetic**: Lakekeeper's only Azure
+SeaweedFS, always) and under azure (creds-gated) across the full grid: both
+topologies (vanilla, mesh), both modes (tiered, decoupled), both targets
+(primary, standby). Azure **cannot be hermetic**: Lakekeeper's only Azure
 storage profile is `adls` (forces the `abfss://`/DFS endpoint), and Azurite
 implements Blob/Queue/Table but **not** the DFS endpoint (Azure/Azurite#553).
 So the azure cells are gated on `COLDFRONT_AZURE_*` (RUN when present, else
@@ -257,35 +260,25 @@ PENDING — never silently skipped); the storage-divergent code (secret renderin
 config selection) is covered with no creds by the unit + pg_regress layer on
 every PR.
 
-## 11. Cutover-vs-cold-write race — FIXED (version-agnostic)
+## 11. Cutover vs cold-write serialization
 
-A separate, pre-existing gap (not a 409 issue, not in any iceberg patch),
-surfaced over Azure by `ci/journey.sh` story 9. `coldfront.cutover_archive` took
-`LOCK … ACCESS EXCLUSIVE` on the partition **without going through the bakery**,
-so it merely *raced* a concurrent cold write for the partition lock. On fast S3
-the racing commit finished inside the cutover's ~102 s lock-retry budget — it
-*looked* flawless; on slow Azure the commit outlasted the budget and all 10
-cutover attempts failed with `lock timeout (SQLSTATE 55P03)` (no data lost, but
-the cycle deferred). "Flawless on S3" was timing luck.
-
-**Fix:** `cutover_archive` gained a `p_iceberg_ref` parameter and now acquires
-the **same bakery** the cold-write path takes (same `v_armed` gate, same
-`coldfront_iceberg:<ref>` key), as its **first** lock, before `LOCK TABLE …
-ACCESS EXCLUSIVE`. The archiver passes the ref as a new `CALL` argument
-(`cmd/archiver/main.go`); the cold-write path is unchanged. Because the bakery
-acquire has no `lock_timeout`, the cutover waits out any in-flight writer's full
-commit, then takes the uncontended `ACCESS EXCLUSIVE`.
+`coldfront.cutover_archive` acquires the **same bakery** the cold-write path
+takes (same `v_armed` gate, same `coldfront_iceberg:<ref>` key) on its
+`p_iceberg_ref` parameter, as its **first** lock, before `LOCK TABLE …
+ACCESS EXCLUSIVE` on the partition; the archiver passes the ref as a `CALL`
+argument (`cmd/archiver/main.go`). The bakery acquire has no `lock_timeout`, so
+the cutover waits out any in-flight cold writer's full commit, then takes the
+uncontended `ACCESS EXCLUSIVE`.
 
 **Deadlock-freedom** comes from the `lock_timeout = 100 ms` (< `deadlock_timeout`)
-circuit breaker on the partition lock, **not** a global lock order — which is
-impossible because PostgreSQL locks a `ModifyTable`'s result relations at
+circuit breaker on the partition lock plus the archiver's retry harness
+(`runCutoverWithRetry`, 10 attempts, exponential backoff), **not** a global lock
+order (impossible: PostgreSQL locks a `ModifyTable`'s result relations at
 executor startup, before any CTE runs, so a dual-tier writer is unavoidably
-`RowExclusive`-before-bakery (an inversion vs the cutover). Whenever the inversion
-forms, the **cutover** yields first (100 ms), frees the bakery, the writer
-commits, and the harness retries the cutover — the writer is never the victim.
-**Validated** over Azure (vanilla): `phase 4 attempt 1 (cutover): 1m26s` (the
-cutover patiently waiting on the bakery for the in-flight writer), first-attempt
-success, no 409, no cross-tier duplication (`count == count(distinct id)`).
+`RowExclusive`-before-bakery, an inversion vs the cutover). Whenever the
+inversion forms, the **cutover** yields first (100 ms), frees the bakery, the
+writer commits, and the harness retries the cutover; the writer is never the
+victim.
 
 ## 12. Reverting to UNPATCHED
 

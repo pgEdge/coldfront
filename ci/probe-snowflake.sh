@@ -3,9 +3,9 @@
 # id↔epoch math against the LIVE pgEdge snowflake extension.
 #
 # internal/partition/idmap.go decodes a snowflake's time as
-# (id >> 22) + 1672531200000 ms (SNOWFLAKE_MSEC_SHIFT=22, epoch 2023-01-01). That
-# relationship was previously checked only against a hardcoded literal in
-# TestSnowflake_AgainstLiveSample. This probe makes it reproducible: it stands up
+# (id >> 22) + 1672531200000 ms (SNOWFLAKE_MSEC_SHIFT=22, epoch 2023-01-01).
+# TestSnowflake_AgainstLiveSample checks that relationship against a hardcoded
+# literal; this probe checks it against the LIVE extension: it stands up
 # a snowflake-capable node, generates real snowflakes via snowflake.nextval(), and
 # asserts snowflake.get_epoch(id) * 1000 == (id >> 22) + 1672531200000 for each.
 # get_epoch returns SECONDS, so *1000 yields the same milliseconds idmap.go uses.
