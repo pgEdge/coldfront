@@ -5,15 +5,17 @@
 # Tag-driven. A pushed v* tag builds and publishes, in one GitHub Actions run:
 #   1. GoReleaser: the Go binaries (archiver, partitioner, compactor) + the
 #      GitHub release, and uploads the linux tarballs as a workflow artifact.
-#   2. Native RPM/DEB packages for four components, across PG 16/17/18 and
-#      el9/el10 + jammy/noble/bullseye/bookworm/trixie, amd64 + arm64:
+#   2. Native RPM/DEB packages for five components, across PG 16/17/18 and
+#      el9/el10 + jammy/noble/bookworm/trixie, amd64 + arm64:
 #        * packaging/coldfront-bin  — the Go tools (PG-independent, per-arch)
 #        * packaging/coldfront      — the coldfront PG extension (per PG major)
 #        * packaging/pg_duckdb                  — pg_duckdb 1.5.4 (per PG major)
 #        * packaging/coldfront-duckdb-extensions — patched iceberg/avro/azure/
 #          postgres_scanner .duckdb_extension.
-#      pg_duckdb + duckdb-extensions keep their own version (1.5.4); coldfront-bin
-#      + the extension track the release tag.
+#        * packaging/lakekeeper — Apache Iceberg REST Catalog, prebuilt binary
+#          (PG-independent, per-arch; needs glibc >= 2.34).
+#      pg_duckdb + duckdb-extensions keep their own version (1.5.4), lakekeeper
+#      its own (0.13.1); coldfront-bin + the extension track the release tag.
 #
 #      The duckdb-extensions are BUILD-ONCE per arch: build-duckdb-ext compiles
 #      them a single time on manylinux_2_28 (glibc 2.28 baseline → portable to
@@ -199,7 +201,7 @@ jobs:
                   pg_versions: '16,17,18'
                   archs: '["amd64","arm64"]'
                   rpm_images: '["almalinux:9","almalinux:10"]'
-                  deb_images: '["ubuntu:jammy","ubuntu:noble","debian:bullseye","debian:bookworm","debian:trixie"]'
+                  deb_images: '["ubuntu:jammy","ubuntu:noble","debian:bookworm","debian:trixie"]'
             - name: Detect — coldfront extension (PG 16/17/18)
               id: coldfront
               uses: ./.github/actions/pgedge-detect-build-matrix
@@ -208,7 +210,7 @@ jobs:
                   pg_versions: '16,17,18'
                   archs: '["amd64","arm64"]'
                   rpm_images: '["almalinux:9","almalinux:10"]'
-                  deb_images: '["ubuntu:jammy","ubuntu:noble","debian:bullseye","debian:bookworm","debian:trixie"]'
+                  deb_images: '["ubuntu:jammy","ubuntu:noble","debian:bookworm","debian:trixie"]'
             - name: Detect — coldfront binaries (PG-independent)
               id: bin
               uses: ./.github/actions/pgedge-detect-build-matrix
@@ -216,7 +218,7 @@ jobs:
                   component_name: packaging/coldfront-bin
                   archs: '["amd64","arm64"]'
                   rpm_images: '["almalinux:9","almalinux:10"]'
-                  deb_images: '["ubuntu:jammy","ubuntu:noble","debian:bullseye","debian:bookworm","debian:trixie"]'
+                  deb_images: '["ubuntu:jammy","ubuntu:noble","debian:bookworm","debian:trixie"]'
             - name: Detect — coldfront duckdb-extensions (PG-independent)
               id: duckdbext
               uses: ./.github/actions/pgedge-detect-build-matrix
@@ -224,7 +226,15 @@ jobs:
                   component_name: packaging/coldfront-duckdb-extensions
                   archs: '["amd64","arm64"]'
                   rpm_images: '["almalinux:9","almalinux:10"]'
-                  deb_images: '["ubuntu:jammy","ubuntu:noble","debian:bullseye","debian:bookworm","debian:trixie"]'
+                  deb_images: '["ubuntu:jammy","ubuntu:noble","debian:bookworm","debian:trixie"]'
+            - name: Detect — lakekeeper (PG-independent; prebuilt binary, needs glibc >= 2.34)
+              id: lakekeeper
+              uses: ./.github/actions/pgedge-detect-build-matrix
+              with:
+                  component_name: packaging/lakekeeper
+                  archs: '["amd64","arm64"]'
+                  rpm_images: '["almalinux:9","almalinux:10"]'
+                  deb_images: '["ubuntu:jammy","ubuntu:noble","debian:bookworm","debian:trixie"]'
             - name: Merge component matrices
               id: merge
               env:
@@ -237,6 +247,8 @@ jobs:
                   DEB_BIN: ${{ steps.bin.outputs.deb_matrix }}
                   RPM_DUX: ${{ steps.duckdbext.outputs.rpm_matrix }}
                   DEB_DUX: ${{ steps.duckdbext.outputs.deb_matrix }}
+                  RPM_LK:  ${{ steps.lakekeeper.outputs.rpm_matrix }}
+                  DEB_LK:  ${{ steps.lakekeeper.outputs.deb_matrix }}
               run: |
                   set -euo pipefail
                   # Tag a component's cells with component_name + component_version.
@@ -251,16 +263,20 @@ jobs:
                       echo "$1={\"include\":$2}" >> "$GITHUB_OUTPUT"
                   }
                   # Source-built components (their cells compile in-container).
+                  # lakekeeper keeps its own version (empty -> common.sh default,
+                  # 0.13.1), like pg_duckdb + duckdb-extensions.
                   rpm_inc="$(jq -c -n \
                       --argjson a "$(tag_cells "$RPM_PGD" packaging/pg_duckdb '')" \
                       --argjson b "$(tag_cells "$RPM_CF"  packaging/coldfront "$TAG_VERSION")" \
                       --argjson d "$(tag_cells "$RPM_BIN" packaging/coldfront-bin "$TAG_VERSION")" \
-                      '$a + $b + $d')"
+                      --argjson e "$(tag_cells "$RPM_LK"  packaging/lakekeeper '')" \
+                      '$a + $b + $d + $e')"
                   deb_inc="$(jq -c -n \
                       --argjson a "$(tag_cells "$DEB_PGD" packaging/pg_duckdb '')" \
                       --argjson b "$(tag_cells "$DEB_CF"  packaging/coldfront "$TAG_VERSION")" \
                       --argjson d "$(tag_cells "$DEB_BIN" packaging/coldfront-bin "$TAG_VERSION")" \
-                      '$a + $b + $d')"
+                      --argjson e "$(tag_cells "$DEB_LK"  packaging/lakekeeper '')" \
+                      '$a + $b + $d + $e')"
                   # duckdb-extensions: build-once, repackaged per distro/arch.
                   ext_rpm_inc="$(tag_cells "$RPM_DUX" packaging/coldfront-duckdb-extensions '')"
                   ext_deb_inc="$(tag_cells "$DEB_DUX" packaging/coldfront-duckdb-extensions '')"
@@ -362,7 +378,7 @@ jobs:
                   CLI_URL="https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb_cli-linux-${CLI_ARCH}.zip"
                   echo "Engine CLI: $CLI_URL"
                   pass=0; fail=0
-                  for img in almalinux:9 almalinux:10 ubuntu:jammy ubuntu:noble debian:bullseye debian:bookworm debian:trixie; do
+                  for img in almalinux:9 almalinux:10 ubuntu:jammy ubuntu:noble debian:bookworm debian:trixie; do
                       echo "###### $img ######"
                       cid=$(docker run -d -v "$PWD/ext:/ext:ro" "$img" sleep 600) || { echo "  run failed"; fail=$((fail+1)); continue; }
                       docker exec "$cid" bash -c '
