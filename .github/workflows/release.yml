@@ -56,6 +56,11 @@ env:
     # Umbrella name for the backup/manifest grouping; per-component identity
     # lives in the manifest cells[].
     COMPONENT_NAME: ${{ github.event.repository.name }}
+    # Single source of truth for the build/target distros — consumed by every
+    # detect-matrix step (rpm_images / deb_images inputs) AND the duckdb-ext
+    # load-test loop. Add/remove a distro in ONE place.
+    RPM_IMAGES: '["almalinux:9","almalinux:10"]'
+    DEB_IMAGES: '["ubuntu:jammy","ubuntu:noble","ubuntu:resolute","debian:bookworm","debian:trixie"]'
 
 jobs:
     # =========================================================================
@@ -200,8 +205,8 @@ jobs:
                   component_name: packaging/pg_duckdb
                   pg_versions: '16,17,18'
                   archs: '["amd64","arm64"]'
-                  rpm_images: '["almalinux:9","almalinux:10"]'
-                  deb_images: '["ubuntu:jammy","ubuntu:noble","debian:bookworm","debian:trixie"]'
+                  rpm_images: ${{ env.RPM_IMAGES }}
+                  deb_images: ${{ env.DEB_IMAGES }}
             - name: Detect — coldfront extension (PG 16/17/18)
               id: coldfront
               uses: ./.github/actions/pgedge-detect-build-matrix
@@ -209,32 +214,32 @@ jobs:
                   component_name: packaging/coldfront
                   pg_versions: '16,17,18'
                   archs: '["amd64","arm64"]'
-                  rpm_images: '["almalinux:9","almalinux:10"]'
-                  deb_images: '["ubuntu:jammy","ubuntu:noble","debian:bookworm","debian:trixie"]'
+                  rpm_images: ${{ env.RPM_IMAGES }}
+                  deb_images: ${{ env.DEB_IMAGES }}
             - name: Detect — coldfront binaries (PG-independent)
               id: bin
               uses: ./.github/actions/pgedge-detect-build-matrix
               with:
                   component_name: packaging/coldfront-bin
                   archs: '["amd64","arm64"]'
-                  rpm_images: '["almalinux:9","almalinux:10"]'
-                  deb_images: '["ubuntu:jammy","ubuntu:noble","debian:bookworm","debian:trixie"]'
+                  rpm_images: ${{ env.RPM_IMAGES }}
+                  deb_images: ${{ env.DEB_IMAGES }}
             - name: Detect — coldfront duckdb-extensions (PG-independent)
               id: duckdbext
               uses: ./.github/actions/pgedge-detect-build-matrix
               with:
                   component_name: packaging/coldfront-duckdb-extensions
                   archs: '["amd64","arm64"]'
-                  rpm_images: '["almalinux:9","almalinux:10"]'
-                  deb_images: '["ubuntu:jammy","ubuntu:noble","debian:bookworm","debian:trixie"]'
+                  rpm_images: ${{ env.RPM_IMAGES }}
+                  deb_images: ${{ env.DEB_IMAGES }}
             - name: Detect — lakekeeper (PG-independent; prebuilt binary, needs glibc >= 2.34)
               id: lakekeeper
               uses: ./.github/actions/pgedge-detect-build-matrix
               with:
                   component_name: packaging/lakekeeper
                   archs: '["amd64","arm64"]'
-                  rpm_images: '["almalinux:9","almalinux:10"]'
-                  deb_images: '["ubuntu:jammy","ubuntu:noble","debian:bookworm","debian:trixie"]'
+                  rpm_images: ${{ env.RPM_IMAGES }}
+                  deb_images: ${{ env.DEB_IMAGES }}
             - name: Merge component matrices
               id: merge
               env:
@@ -378,7 +383,7 @@ jobs:
                   CLI_URL="https://github.com/duckdb/duckdb/releases/download/v${DUCKDB_VERSION}/duckdb_cli-linux-${CLI_ARCH}.zip"
                   echo "Engine CLI: $CLI_URL"
                   pass=0; fail=0
-                  for img in almalinux:9 almalinux:10 ubuntu:jammy ubuntu:noble debian:bookworm debian:trixie; do
+                  for img in $(jq -r '.[]' <<<"$RPM_IMAGES") $(jq -r '.[]' <<<"$DEB_IMAGES"); do
                       echo "###### $img ######"
                       cid=$(docker run -d -v "$PWD/ext:/ext:ro" "$img" sleep 600) || { echo "  run failed"; fail=$((fail+1)); continue; }
                       docker exec "$cid" bash -c '
