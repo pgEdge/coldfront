@@ -15,8 +15,11 @@ case "$DEB_ARCH" in
   *) echo "unsupported arch: $DEB_ARCH" >&2; exit 1 ;;
 esac
 
-RELEASE_URL="https://github.com/lakekeeper/lakekeeper/releases/download/v${LAKEKEEPER_VERSION}"
-REPO_RAW="https://raw.githubusercontent.com/lakekeeper/lakekeeper/v${LAKEKEEPER_VERSION}"
+# Strip any '~pretag' for the release tag/URL: LAKEKEEPER_VERSION carries it for
+# the deb package version (e.g. 0.13.1~test1), but the GitHub release tag is the
+# clean upstream version (v0.13.1).
+RELEASE_URL="https://github.com/lakekeeper/lakekeeper/releases/download/v${LAKEKEEPER_VERSION%%~*}"
+REPO_RAW="https://raw.githubusercontent.com/lakekeeper/lakekeeper/v${LAKEKEEPER_VERSION%%~*}"
 
 prepare() {
   setup_apt_build_env
@@ -24,7 +27,7 @@ prepare() {
   # This function is for debugging purpose if you have your own keys. GH workflow does not need it.
   #import_gpg_keys
 
-  echo "Downloading lakekeeper ${LAKEKEEPER_VERSION} binary (${UNAME_ARCH})..."
+  echo "Downloading lakekeeper ${LAKEKEEPER_VERSION%%~*} binary (${UNAME_ARCH})..."
   rm -rf "$BUILD_DIR"
   mkdir -p "$SRC_DIR"
   local tarball="lakekeeper-${UNAME_ARCH}-unknown-linux-gnu.tar.gz"
