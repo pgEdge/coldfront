@@ -195,7 +195,7 @@ PGOPTIONS='-c client_min_messages=warning' \
 Create the partitioned table with seven monthly partitions covering a
 six-month historical window plus the current month:
 
-```sql
+```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SET search_path = public;
 
 CREATE TABLE events (
@@ -233,7 +233,7 @@ month stays hot.
 Insert approximately one million rows spread evenly across the
 partition window (roughly 150 days from `now()`):
 
-```sql
+```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 INSERT INTO events (id, ts, status, data)
 SELECT i,
        now() - ((1000000 - i) * (interval '150 days' / 1000000)),
@@ -244,7 +244,7 @@ FROM generate_series(1, 1000000) i;
 
 Confirm all rows landed:
 
-```sql
+```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT count(*) FROM events;
 ```
 
@@ -267,7 +267,7 @@ you will compare against after tiering in Step 8.
 empty parent itself and reports zero. Sum across `pg_partition_tree`
 to get the true heap size:
 
-```sql
+```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT pg_size_pretty(
     pg_total_relation_size('events') +
     COALESCE((
@@ -298,14 +298,14 @@ new database - these install onto the running one.
 
 Run the following SQL to create both extensions:
 
-```sql
+```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 CREATE EXTENSION IF NOT EXISTS pg_duckdb;
 CREATE EXTENSION IF NOT EXISTS coldfront;
 ```
 
 Confirm both are installed:
 
-```sql
+```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 \dx
 ```
 
@@ -328,7 +328,7 @@ and endpoint here - application SQL is unchanged when you swap stores.
 
 Register the local SeaweedFS credentials:
 
-```sql
+```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT coldfront.set_storage_secret(
   'admin', 'adminsecret', 'seaweedfs:8333'
 );
@@ -439,7 +439,7 @@ s3://iceberg/wh/.../metadata/00001-....metadata.json
 
 Query the Parquet data files registered in that Iceberg snapshot:
 
-```sql
+```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT file_path
 FROM iceberg_metadata('<paste META_LOC here>')
 WHERE file_path LIKE '%.parquet'
@@ -459,14 +459,14 @@ in PostgreSQL - they are objects in object storage.
 
 **Proof (b) - the table changed shape.** Inspect the relation type:
 
-```sql
+```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 \d events
 ```
 
 `events` is now a view. The `_events` table holds only the hot
 remainder. Run the following query to see the recorded hot/cold cutoff:
 
-```sql
+```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT * FROM coldfront.archive_watermark;
 ```
 
@@ -479,13 +479,13 @@ baseline.
 
 Count the hot rows still in the PostgreSQL heap:
 
-```sql
+```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT count(*) AS hot_rows FROM _events;
 ```
 
 Measure the hot heap size (sum over the partition tree, as in Step 3):
 
-```sql
+```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT pg_size_pretty(
     pg_total_relation_size('_events') +
     COALESCE((
@@ -498,7 +498,7 @@ SELECT pg_size_pretty(
 
 Count the total rows across both tiers and derive the cold count:
 
-```sql
+```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT count(*) AS total_rows FROM events;
 ```
 
@@ -528,19 +528,19 @@ came from object storage.
 
 Query the whole table - hot and cold together:
 
-```sql
+```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT count(*) AS total FROM events;
 ```
 
 Query only the hot heap:
 
-```sql
+```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT count(*) AS hot FROM _events;
 ```
 
 Retrieve specific rows from a cold month:
 
-```sql
+```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT id, ts, status
 FROM events
 WHERE ts < date_trunc('month', now()) - interval '3 months'
@@ -569,7 +569,7 @@ Capture a cold row's id in a separate query. A sub-select over the
 tiered view inside the same DML statement is rejected by the extension,
 because the rewrite retargets the leading reference:
 
-```sql
+```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT id, ts, status
 FROM events
 WHERE ts < date_trunc('month', now()) - interval '2 months'
@@ -585,13 +585,13 @@ LIMIT 1;
 
 Update the archived row through the same table using the captured id:
 
-```sql
+```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 UPDATE events SET status = 'corrected' WHERE id = 1;
 ```
 
 Read the row back immediately:
 
-```sql
+```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT id, ts, status FROM events WHERE id = 1;
 ```
 
@@ -623,7 +623,7 @@ PGOPTIONS='-c client_min_messages=warning' \
 
 Confirm the archived row is still `corrected`:
 
-```sql
+```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT id, status FROM events WHERE id = 1;
 ```
 
@@ -635,7 +635,7 @@ SELECT id, status FROM events WHERE id = 1;
 
 Confirm the total row count is unchanged:
 
-```sql
+```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT count(*) AS total_rows FROM events;
 ```
 
@@ -647,7 +647,7 @@ SELECT count(*) AS total_rows FROM events;
 
 Confirm the hot heap is still small (the data did not rehydrate):
 
-```sql
+```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT pg_size_pretty(
     pg_total_relation_size('_events') +
     COALESCE((
@@ -685,7 +685,7 @@ One SQL call provisions the Iceberg table and the PostgreSQL view. The
 steps in a single transaction. A short retry loop guards against a
 timing edge where the warehouse is still warming up:
 
-```sql
+```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT coldfront.create_iceberg_table(
   'public',
   'events_lake',
@@ -705,7 +705,7 @@ Iceberg on S3.
 
 `events_lake` behaves like any PostgreSQL table:
 
-```sql
+```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 INSERT INTO events_lake VALUES
   (1, now(), 'ok',  '{"a":1}'),
   (2, now(), 'ok',  '{"a":2}');
@@ -736,7 +736,7 @@ DuckDB, no archiver cold path.
 
 Create a partitioned table with no existing partitions:
 
-```sql
+```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SET search_path = public;
 
 CREATE TABLE part_demo (
@@ -793,7 +793,7 @@ Each reconcile pass premakes the next three monthly partitions ahead
 of now and ensures a partition covering today always exists. It also
 drops any partition older than the retention period:
 
-```sql
+```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT count(*) AS partitions
 FROM pg_inherits
 WHERE inhparent = 'part_demo'::regclass;
