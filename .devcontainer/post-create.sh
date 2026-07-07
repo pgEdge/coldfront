@@ -17,5 +17,5 @@ bash examples/walkthrough/setup.sh
 
 echo ""
 echo "Setup complete!"
-echo "  Interactive Guide: bash examples/walkthrough/guide.sh"
-echo "  Walkthrough:       Open docs/walkthrough.md (Runme extension installed)"
+echo "  Walkthrough:       docs/walkthrough.md is open - click 'Run' on each cell as you read"
+echo "  Interactive Guide: bash examples/walkthrough/guide.sh (terminal alternative)"
