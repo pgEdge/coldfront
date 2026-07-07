@@ -1548,6 +1548,163 @@ EOF
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# Story - FK: foreign key on a tiered partitioned table. Asserts:
+#   1. The archiver registers and archives a table that has a FK constraint.
+#   2. PostgreSQL enforces the FK on the hot tier before and after the view
+#      swap, outbound (fk_events references another table) and inbound (a
+#      table references fk_events).
+#   3. FK enforcement is a PostgreSQL feature that lives only on the hot tier.
+#      Iceberg has no foreign keys, so a row in the cold tier is outside FK
+#      enforcement by construction: a cold INSERT is not FK-checked, and an
+#      inbound FK reference to an archived row is rejected (the row has left
+#      _fk_events). See docs/usage.md "Inbound foreign keys". Not a defect to be
+#      "fixed" - a consequence of the storage model, asserted so a change in
+#      behavior is caught.
+# ───────────────────────────────────────────────────────────────────────────
+story_fk_constraint() {
+    step "FK: PostgreSQL enforces on the hot tier; the cold tier has no FKs"
+
+    local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
+    local ret_days; ret_days=$(( ( $(date -u +%s) - $(date -u -d "$(date -u +%Y-%m-01) -1 month" +%s) ) / 86400 ))
+
+    # Reference table + a partitioned table whose PK is (id, ts) (the partition
+    # column must be in the PK) plus an outbound FK on category_id. The FK is
+    # added after the partitions exist so PK propagation is unambiguous.
+    # SET search_path = public so the unqualified partition names in the DO
+    # block land in public (the archiver resolves partitions in the parent's
+    # schema); without it they land in the coldfront schema, since the session
+    # user is "coldfront" and a coldfront schema exists.
+    qf "$HOST" <<'EOSQL' >/dev/null
+SET search_path = public;
+CREATE TABLE IF NOT EXISTS public.fk_categories (id int PRIMARY KEY, name text NOT NULL);
+INSERT INTO public.fk_categories VALUES (1,'alpha'),(2,'beta') ON CONFLICT DO NOTHING;
+CREATE TABLE IF NOT EXISTS public.fk_events (
+    id          bigint GENERATED ALWAYS AS IDENTITY,
+    ts          timestamptz NOT NULL,
+    category_id int NOT NULL,
+    label       text,
+    PRIMARY KEY (id, ts)
+) PARTITION BY RANGE (ts);
+DO $do$
+DECLARE m date;
+BEGIN
+  FOR i IN 1..4 LOOP
+    m := (date_trunc('month', now()) - make_interval(months => 5 - i))::date;
+    EXECUTE format('CREATE TABLE IF NOT EXISTS %I PARTITION OF fk_events FOR VALUES FROM (%L) TO (%L)',
+      'fk_events_p_' || to_char(m,'YYYY_MM'), m, m + interval '1 month');
+  END LOOP;
+END $do$;
+ALTER TABLE public.fk_events ADD CONSTRAINT fk_events_category
+    FOREIGN KEY (category_id) REFERENCES public.fk_categories(id);
+EOSQL
+
+    # Seed one cold (4 months old) + one hot (1 month old) row, both valid.
+    q "$HOST" "INSERT INTO fk_events (ts,category_id,label) VALUES (date_trunc('month',now()) - interval '4 months' + interval '1 day', 1, 'cold-valid');" >/dev/null
+    q "$HOST" "INSERT INTO fk_events (ts,category_id,label) VALUES (date_trunc('month',now()) - interval '1 month'  + interval '1 day', 2, 'hot-valid');"  >/dev/null
+
+    # Outbound FK, before archiving: PG enforces on the raw partitioned table.
+    local pre_err
+    pre_err=$(q "$HOST" "INSERT INTO fk_events (ts,category_id,label) VALUES (date_trunc('month',now()) - interval '1 month' + interval '2 days', 999, 'pre-bad-fk');" 2>&1 || true)
+    assert_contains "hot INSERT with invalid FK rejected before archiving" "foreign key" "$pre_err"
+    assert_eq "no row written for the rejected pre-archive INSERT" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM fk_events WHERE label='pre-bad-fk';")"
+
+    # Inbound FK, before archiving: fk_event_details references fk_events(id, ts).
+    qf "$HOST" <<'EOSQL' >/dev/null
+CREATE TABLE IF NOT EXISTS public.fk_event_details (
+    event_id bigint, event_ts timestamptz, note text,
+    FOREIGN KEY (event_id, event_ts) REFERENCES public.fk_events(id, ts));
+INSERT INTO public.fk_event_details SELECT id, ts, 'pre-inbound-valid' FROM public.fk_events WHERE label='hot-valid';
+EOSQL
+    assert_eq "inbound FK: valid referencing row accepted before archiving" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM fk_event_details WHERE note='pre-inbound-valid';")"
+    local pre_inbound_err
+    pre_inbound_err=$(q "$HOST" "INSERT INTO fk_event_details VALUES (99999, now(), 'pre-inbound-bad');" 2>&1 || true)
+    assert_contains "inbound FK: invalid referencing row rejected before archiving" "foreign key" "$pre_inbound_err"
+
+    # Register + archive. Both must succeed: the (id, ts) PK is valid, so an
+    # outbound FK must NOT defeat PK detection / delta capture. A regression
+    # there (archiver bailing with "no primary key") fails this story loudly.
+    if "$ARCHIVER" register --config /tmp/journey-archiver.yaml --table fk_events \
+            --period monthly --hot-period "${ret_days} days" >/tmp/journey-fk-reg.log 2>&1; then
+        pass "fk_events registered (FK does not block registration)"
+    else
+        fail "fk_events register failed"; tail -5 /tmp/journey-fk-reg.log
+    fi
+    assert_eq "partition_config row written for fk_events" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='fk_events';")"
+
+    cat > /tmp/journey-fk.yaml <<EOF
+postgres: { dsn: "${dsn}" }
+iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog", namespace: "default" }
+$(storage_yaml)
+EOF
+    if "$ARCHIVER" --config /tmp/journey-fk.yaml >/tmp/journey-fk-arch.log 2>&1; then
+        pass "archiver completed on FK-constrained table"
+    else
+        fail "archiver failed on FK-constrained table"; tail -8 /tmp/journey-fk-arch.log
+    fi
+
+    # View swap happened and the cold row genuinely moved to Iceberg (gone from
+    # _fk_events, still visible through the unified view).
+    assert_eq "fk_events is a view after archival" "v" \
+        "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='fk_events' AND relnamespace='public'::regnamespace;")"
+    assert_eq "cold row archived out of _fk_events (the hot PG table)" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM _fk_events WHERE label='cold-valid';")"
+    assert_eq "cold row still visible via the unified view" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM fk_events WHERE label='cold-valid';")"
+
+    # Outbound FK still enforced on the hot tier after the swap.
+    local post_err
+    post_err=$(q "$HOST" "INSERT INTO fk_events (ts,category_id,label) VALUES (now(), 999, 'post-bad-fk');" 2>&1 || true)
+    assert_contains "hot INSERT with invalid FK still rejected after view swap" "foreign key" "$post_err"
+    assert_eq "no row written for the rejected post-swap INSERT" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM fk_events WHERE label='post-bad-fk';")"
+    q "$HOST" "INSERT INTO fk_events (ts,category_id,label) VALUES (now(), 1, 'post-valid');" >/dev/null
+    assert_eq "valid hot INSERT works after view swap" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM fk_events WHERE label='post-valid';")"
+
+    # Inbound FK after the swap: enforces against hot rows (the FK tracks the
+    # renamed _fk_events, same OID). Read the hot (id, ts) straight from
+    # _fk_events; reading it from the view and INSERT..SELECT-ing would route
+    # the whole statement through pg_duckdb, which cannot write a PG table.
+    q "$HOST" "INSERT INTO fk_event_details SELECT id, ts, 'post-inbound-hot' FROM _fk_events WHERE label='post-valid';" >/dev/null
+    assert_eq "inbound FK: valid referencing row (hot) works after view swap" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM fk_event_details WHERE note='post-inbound-hot';")"
+    local post_inbound_bad
+    post_inbound_bad=$(q "$HOST" "INSERT INTO fk_event_details VALUES (99999, now(), 'post-inbound-bad');" 2>&1 || true)
+    assert_contains "inbound FK: invalid referencing row still rejected after view swap" "foreign key" "$post_inbound_bad"
+
+    # An inbound FK references _fk_events (the hot PG table). Once a row is
+    # archived it leaves _fk_events, so PostgreSQL rejects a referencing row
+    # that points at an archived (cold) row - the FK domain is the hot tier
+    # only. Inherent to tiering (see docs/usage.md "Inbound foreign keys"),
+    # asserted so a change in behavior is caught. The cold (id, ts) is read
+    # once (plain SELECT), then referenced as literals so the INSERT is a plain
+    # PG write and the FK check (not a pg_duckdb takeover) is what rejects it.
+    local cold_id cold_inbound_err
+    cold_id=$(q "$HOST" "SELECT id FROM fk_events WHERE label='cold-valid';")
+    cold_inbound_err=$(q "$HOST" "INSERT INTO fk_event_details VALUES (${cold_id}, date_trunc('month',now()) - interval '4 months' + interval '1 day', 'cold-inbound');" 2>&1 || true)
+    assert_contains "inbound FK reference to an archived (cold) row is rejected (cold rows are outside PG FK enforcement)" "foreign key" "$cold_inbound_err"
+    q "$HOST" "DELETE FROM fk_event_details WHERE note='cold-inbound';" >/dev/null 2>&1
+
+    # A cold INSERT is written to Iceberg, which has no foreign keys, so it is
+    # not FK-checked and an invalid category_id is accepted. This is by
+    # construction, not a bypassed check: FK enforcement exists only on the hot
+    # tier. Asserted so a change in behavior is caught.
+    q "$HOST" "INSERT INTO fk_events (ts,category_id,label) VALUES (date_trunc('month',now()) - interval '4 months' + interval '2 days', 999, 'cold-bad-fk');" >/dev/null 2>&1 || true
+    assert_eq "cold INSERT is not FK-checked (Iceberg has no foreign keys)" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM fk_events WHERE label='cold-bad-fk';")"
+
+    # Cleanup.
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name='fk_events';" >/dev/null 2>&1
+    q "$HOST" "DROP TABLE IF EXISTS public.fk_event_details;" >/dev/null 2>&1
+    q "$HOST" "DROP VIEW  IF EXISTS public.fk_events CASCADE;" >/dev/null 2>&1
+    q "$HOST" "DROP TABLE IF EXISTS public._fk_events CASCADE;" >/dev/null 2>&1
+    q "$HOST" "DROP TABLE IF EXISTS public.fk_categories CASCADE;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Story — management CLI end-to-end: register a table via the subcommand (PK
 # validation), list it, reject a PK-less table, then run the archiver with NO
 # YAML tables so it drives entirely off coldfront.partition_config, and export.
@@ -1953,6 +2110,7 @@ if [ "$MODE" = "tiered" ]; then
     story_partitioner_idmode
     story_partitioner_multitable
     story_partitioner_after_swap
+    story_fk_constraint
     story_register_cli
     story_partition_config_ownership   # each binary loads only its own rows
 else
