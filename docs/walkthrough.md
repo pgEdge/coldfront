@@ -339,11 +339,11 @@ stack pre-created (`wh`) is reachable:
 
 ```bash
 curl -s localhost:8181/management/v1/warehouse \
-  | grep -o '"warehouse-name":"wh"'
+  | grep -o '"name":"wh"'
 ```
 
 ```text {"ignore":"true"}
-"warehouse-name":"wh"
+"name":"wh"
 ```
 
 ### Step 6 - Show the archiver policy
