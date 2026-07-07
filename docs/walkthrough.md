@@ -9,41 +9,36 @@ The walkthrough is a self-contained, step-by-step tour of ColdFront's
 three operating modes - tiered storage (hot PostgreSQL + cold Iceberg),
 decoupled mode (Iceberg-only from the first row), and the standalone
 partitioner - plus a distributed demo that runs two nodes over one
-shared lake. This page mirrors the interactive guide as copy-pasteable
-commands for reference.
+shared lake. Every command on this page is real: click it to run in
+Codespaces, or copy it into a local shell.
 
-!!! tip "Run the commands as you read"
+> **Pre-release beta software** - ColdFront is pre-release beta software
+> under active development. Do not use it in production. Interfaces,
+> on-disk formats, and behaviour may change without notice, and data
+> loss is possible.
 
-    Every code block in this walkthrough is executable. Open the
-    walkthrough in
-    [GitHub Codespaces](https://github.com/codespaces/new?repo=pgEdge/coldfront)
-    for a ready-to-go environment, or install the
-    [Runme extension](https://marketplace.visualstudio.com/items?itemName=stateful.runme)
-    in VS Code to run commands directly from the markdown.
+## ▶ In GitHub Codespaces
 
-!!! warning "Pre-release beta software"
+[Open this repo in a Codespace](https://github.com/codespaces/new?repo=pgEdge/coldfront)
+and everything is preinstalled - Docker, psql, and the
+[Runme extension](https://marketplace.visualstudio.com/items?itemName=stateful.runme)
+that turns each code block below into a runnable cell. Click **Run** on
+each cell as you read. The first cell builds the Docker images (two to
+five minutes); everything after it is quick.
 
-    ColdFront is pre-release beta software under active development. Do
-    not use it in production. Interfaces, on-disk formats, and behaviour
-    may change without notice, and data loss is possible.
+Prefer a terminal? `bash examples/walkthrough/guide.sh` runs the same
+demos as an interactive guide.
 
-## Prerequisites
+## 💻 On your own machine
 
-The walkthrough requires the following:
-
-- Docker 24+ with Docker Compose V2 (the `docker compose` plugin, not
-  the legacy `docker-compose` binary).
-- At least 500 MB of free disk inside Docker's virtual disk (1.5 GB
-  recommended for the standard data volume).
-- `curl`, `bash`, and `psql` on the host (the psql commands connect to
-  the published port).
-
-## Run it
+You need Docker 24+ with Compose V2 (the `docker compose` plugin, not
+the legacy `docker-compose` binary), roughly 1.5 GB of free disk inside
+Docker's virtual disk, and `curl`, `bash`, and `psql` on the host.
 
 The fastest path is the one-liner, which downloads the walkthrough
 files and launches the interactive guide:
 
-```bash
+```bash {"ignore":"true"}
 curl -fsSL \
   https://raw.githubusercontent.com/pgEdge/ColdFront/main/examples/walkthrough/install.sh \
   | bash
@@ -51,22 +46,14 @@ curl -fsSL \
 
 If you already have the repository cloned, run the guide directly:
 
-```bash
+```bash {"ignore":"true"}
 bash examples/walkthrough/guide.sh
 ```
 
-!!! note "Codespaces users"
-
-    Prerequisites are already installed and checked - skip the
-    one-liner (it detects Codespaces and exits without doing
-    anything). Run the code blocks in this page as you read, or run
-    `bash examples/walkthrough/guide.sh` in the terminal for the
-    interactive guide.
-
-The guide builds the Docker images on first run (two to five minutes
-for the base compile), brings up the stack, and walks through each
-demo interactively. The rest of this page covers the same steps as
-copy-pasteable commands.
+Either way, the guide builds the Docker images on first run, brings up
+the stack, and walks through each demo interactively. The rest of this
+page covers the same steps - run them from the doc or paste them into
+your shell.
 
 ## What setup does
 
