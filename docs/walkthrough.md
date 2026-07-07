@@ -431,22 +431,20 @@ META_LOC=$(curl -s \
   | head -1 | cut -d'"' -f4)
 
 echo "$META_LOC"
+
+# Query the Parquet data files registered in that Iceberg snapshot.
+psql "postgresql://coldfront@localhost:5432/coldfront" \
+  -v ON_ERROR_STOP=1 -P pager=off <<SQL
+SELECT file_path
+FROM iceberg_metadata('${META_LOC}')
+WHERE file_path LIKE '%.parquet'
+LIMIT 3;
+SQL
 ```
 
 ```text {"ignore":"true"}
 s3://iceberg/wh/.../metadata/00001-....metadata.json
-```
 
-Query the Parquet data files registered in that Iceberg snapshot:
-
-```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
-SELECT file_path
-FROM iceberg_metadata('<paste META_LOC here>')
-WHERE file_path LIKE '%.parquet'
-LIMIT 3;
-```
-
-```text {"ignore":"true"}
  file_path
 ----------------------------------------------------------
  s3://iceberg/.../data/019eb6d0-....parquet
