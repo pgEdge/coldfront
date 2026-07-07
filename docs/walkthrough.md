@@ -812,7 +812,12 @@ This demo uses a different stack from the single-node walkthrough - two
 store. The interactive guide automates the whole switch (it stops the
 single-node stack first, since a laptop rarely has room for both):
 
-```bash
+> **This demo is not click-runnable.** It needs a different two-node
+> stack and separate psql sessions against each node (`db1` on port
+> 5442, `db2` on 5443), so the blocks below are shown for reading and
+> hand-pasting. The easiest way to run it is the interactive guide:
+
+```bash {"ignore":"true"}
 bash examples/walkthrough/guide.sh   # then choose: 4) Distributed
 ```
 
@@ -825,11 +830,11 @@ Start the mesh stack, then form the Spock mesh - create a node on each
 member, subscribe each to the other, and arm the cold-write
 coordination substrate on both:
 
-```bash
+```bash {"ignore":"true"}
 docker compose -f examples/walkthrough/docker-compose.mesh.yml up -d
 ```
 
-```sql
+```sql {"ignore":"true"}
 -- On BOTH nodes - create the extensions. The container preloads the libraries
 -- (shared_preload_libraries) but does not run CREATE EXTENSION, so the SQL
 -- objects (the spock schema, coldfront functions) do not exist until you do:
@@ -865,7 +870,7 @@ shared object store; without it, cold writes fail to authenticate.
 
 Both nodes are present, each subscribed to the other:
 
-```sql
+```sql {"ignore":"true"}
 SELECT node_name FROM spock.node ORDER BY node_name;   -- db1, db2
 SELECT sub_name  FROM spock.subscription;              -- one per node
 ```
@@ -876,7 +881,7 @@ Create a lake-native table on `db1` and register it on `db2` as well
 (the call is idempotent and the registry is keyed by name, so each node
 ends up with an identical local view):
 
-```sql
+```sql {"ignore":"true"}
 -- On db1, then on db2 - same call:
 SELECT coldfront.create_iceberg_table(
   'public', 'events_lake',
@@ -887,7 +892,7 @@ SELECT coldfront.create_iceberg_table(
 
 Write three rows on `db1`, then read them back on `db2`:
 
-```sql
+```sql {"ignore":"true"}
 -- db1:
 INSERT INTO events_lake VALUES
   (1, now(), 'ok',   '{"n":"db1"}'),
@@ -915,7 +920,7 @@ Spock, verified in the TLA+ model under `docs/formal/`) and waits its
 turn. Fire many writers at once - several on each node, on both nodes,
 all into the same table:
 
-```sql
+```sql {"ignore":"true"}
 -- concurrently, on BOTH nodes at the same instant:
 INSERT INTO events_lake VALUES (101, now(), 'storm', '{"n":"db1"}');   -- db1
 INSERT INTO events_lake VALUES (201, now(), 'storm', '{"n":"db2"}');   -- db2
@@ -929,7 +934,7 @@ Ricart-Agrawala claim protocol orders writers across nodes. The durable
 proof is the claim ledger - each ticket, the node that issued it, and
 the peer that acknowledged it before the commit:
 
-```sql
+```sql {"ignore":"true"}
 SELECT ticket,
        snowflake.get_node(ticket) AS issued_by,
        ack_from_node              AS acked_by
