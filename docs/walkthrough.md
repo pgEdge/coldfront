@@ -182,10 +182,12 @@ This step stands in for the database you already run: an ordinary
 range-partitioned PostgreSQL table, filled with months of accumulated
 data. Nothing here is ColdFront-specific.
 
-Connect to PostgreSQL with the walkthrough credentials and suppress
-pg_duckdb's informational notices so the output stays clean:
+Running the cells from this page? Skip ahead - every SQL cell below
+opens its own connection. Following along in a local shell instead,
+connect once with the walkthrough credentials (notices suppressed so
+the output stays clean) and paste each SQL block into the session:
 
-```bash
+```bash {"ignore":"true"}
 PGOPTIONS='-c client_min_messages=warning' \
   psql -h localhost -p 5432 -U coldfront -d coldfront
 ```
@@ -246,7 +248,7 @@ Confirm all rows landed:
 SELECT count(*) FROM events;
 ```
 
-```
+```text {"ignore":"true"}
   count
 ---------
  1000000
@@ -276,7 +278,7 @@ SELECT pg_size_pretty(
 ) AS hot_size;
 ```
 
-```
+```text {"ignore":"true"}
  hot_size
 ----------
  150 MB
@@ -307,7 +309,7 @@ Confirm both are installed:
 \dx
 ```
 
-```
+```text {"ignore":"true"}
    Name    | Version |   Schema   |            Description
 -----------+---------+------------+------------------------------------
  coldfront | 1.0     | coldfront  | transparent PG <-> Iceberg tiering
@@ -340,7 +342,7 @@ curl -s localhost:8181/management/v1/warehouse \
   | grep -o '"warehouse-name":"wh"'
 ```
 
-```
+```text {"ignore":"true"}
 "warehouse-name":"wh"
 ```
 
@@ -356,7 +358,7 @@ Inspect the archiver configuration:
 cat examples/walkthrough/config/archiver.yaml
 ```
 
-```yaml
+```yaml {"ignore":"true"}
 postgres:
     dsn: "host=db port=5432 dbname=coldfront user=coldfront
           password=coldfront sslmode=disable"
@@ -431,7 +433,7 @@ META_LOC=$(curl -s \
 echo "$META_LOC"
 ```
 
-```
+```text {"ignore":"true"}
 s3://iceberg/wh/.../metadata/00001-....metadata.json
 ```
 
@@ -444,7 +446,7 @@ WHERE file_path LIKE '%.parquet'
 LIMIT 3;
 ```
 
-```
+```text {"ignore":"true"}
  file_path
 ----------------------------------------------------------
  s3://iceberg/.../data/019eb6d0-....parquet
@@ -503,7 +505,7 @@ SELECT count(*) AS total_rows FROM events;
 The interactive guide renders the result as an explicit hot/cold
 summary:
 
-```
+```text {"ignore":"true"}
   Tier                    Rows         Postgres heap
   ----------------------  -----------  ----------------
   Hot  (Postgres)             ~85,000  ~12 MB
@@ -546,7 +548,7 @@ ORDER BY ts
 LIMIT 3;
 ```
 
-```
+```text {"ignore":"true"}
   id  |           ts            | status
 ------+-------------------------+--------
     1 | 2025-12-...             | ok
@@ -575,7 +577,7 @@ ORDER BY ts
 LIMIT 1;
 ```
 
-```
+```text {"ignore":"true"}
   id |           ts            | status
 -----+-------------------------+--------
    1 | 2025-12-...             | ok
@@ -593,7 +595,7 @@ Read the row back immediately:
 SELECT id, ts, status FROM events WHERE id = 1;
 ```
 
-```
+```text {"ignore":"true"}
   id |           ts            |  status
 -----+-------------------------+-----------
    1 | 2025-12-...             | corrected
@@ -610,9 +612,11 @@ and the hot heap size. This confirms that the cold edit is durable
 persistent state and that the data did not quietly return to PostgreSQL
 to make the edit possible.
 
-Open a new terminal and connect with a fresh session:
+Each runnable cell on this page already opens a fresh connection, so
+cell-runners can simply run the checks below. In a local shell, open a
+new terminal and connect with a fresh session first:
 
-```bash
+```bash {"ignore":"true"}
 PGOPTIONS='-c client_min_messages=warning' \
   psql -h localhost -p 5432 -U coldfront -d coldfront
 ```
@@ -623,7 +627,7 @@ Confirm the archived row is still `corrected`:
 SELECT id, status FROM events WHERE id = 1;
 ```
 
-```
+```text {"ignore":"true"}
   id |  status
 -----+-----------
    1 | corrected
@@ -635,7 +639,7 @@ Confirm the total row count is unchanged:
 SELECT count(*) AS total_rows FROM events;
 ```
 
-```
+```text {"ignore":"true"}
  total_rows
 ------------
     1000000
@@ -654,7 +658,7 @@ SELECT pg_size_pretty(
 ) AS hot_size;
 ```
 
-```
+```text {"ignore":"true"}
  hot_size
 ----------
  ~12 MB
@@ -771,7 +775,7 @@ The partitioner config at
 `examples/walkthrough/config/partitioner.yaml` uses a partition-only
 configuration with no `iceberg` or `s3` sections:
 
-```yaml
+```yaml {"ignore":"true"}
 postgres:
     dsn: "host=db port=5432 dbname=coldfront user=coldfront
           password=coldfront sslmode=disable"
