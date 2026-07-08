@@ -2,12 +2,27 @@
 
 install_syft(){
 
-  # Pin the installer to a tagged ref (not mutable main) AND pin the installed
-  # version, so release builds are reproducible and not exposed to upstream
-  # changes on syft's main branch. Override SYFT_VERSION to bump.
+  # Install syft from its pinned release tarball and verify it against the
+  # published checksums before installing — avoids piping a remote installer
+  # script straight into a root shell. Override SYFT_VERSION to bump.
   SYFT_VERSION="${SYFT_VERSION:-v1.45.1}"
-  echo "Installing syft ${SYFT_VERSION}..."
-  curl -sSfL "https://raw.githubusercontent.com/anchore/syft/${SYFT_VERSION}/install.sh" | sudo sh -s -- -b /usr/local/bin "${SYFT_VERSION}"
+  local ver="${SYFT_VERSION#v}" arch
+  case "$(uname -m)" in
+    x86_64)  arch=amd64 ;;
+    aarch64) arch=arm64 ;;
+    *) echo "unsupported arch for syft: $(uname -m)" >&2; return 1 ;;
+  esac
+  local tgz="syft_${ver}_linux_${arch}.tar.gz"
+  local base="https://github.com/anchore/syft/releases/download/v${ver}"
+  local tmp; tmp="$(mktemp -d)"
+  echo "Installing syft ${SYFT_VERSION} (${arch})..."
+  curl -sSfL "${base}/${tgz}" -o "${tmp}/${tgz}"
+  curl -sSfL "${base}/syft_${ver}_checksums.txt" -o "${tmp}/checksums.txt"
+  ( cd "${tmp}" && grep " ${tgz}\$" checksums.txt | sha256sum -c - )
+  tar -xzf "${tmp}/${tgz}" -C "${tmp}" syft
+  sudo install -m 0755 "${tmp}/syft" /usr/local/bin/syft
+  rm -rf "${tmp}"
+  syft version
 }
 
 setup_dnf_build_env(){
