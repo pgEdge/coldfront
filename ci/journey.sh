@@ -1792,6 +1792,13 @@ EOF
 story_partitioner_fk_drop() {
     step "Partitioner rollback: inbound FK blocks expired partition drop → self-heals after FK removed"
 
+    # Mesh topology propagates partition detach to peers; peer DNS is not
+    # available in the single-node journey config, so skip in mesh mode.
+    if [ "$MESH" = 1 ]; then
+        note "skipping partitioner FK drop rollback in mesh mode (peer propagation requires mesh config)"
+        return
+    fi
+
     local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
     printf 'postgres: { dsn: "%s" }\n' "$dsn" > /tmp/journey-pfk.yaml
 
