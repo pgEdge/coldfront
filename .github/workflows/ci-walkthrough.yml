@@ -10,6 +10,10 @@ concurrency:
   group: '${{ github.workflow }} @ ${{ github.event.pull_request.head.label || github.head_ref || github.ref }}'
   cancel-in-progress: true
 
+permissions:
+  contents: read
+  packages: read   # pull the private coldfront-duckdb-base image the app builds FROM
+
 jobs:
   validate:
     name: Validate
@@ -19,7 +23,9 @@ jobs:
       - name: Run ShellCheck
         run: shellcheck -x --source-path=examples/walkthrough examples/walkthrough/*.sh
       - name: Validate Docker Compose
-        run: docker compose -f examples/walkthrough/docker-compose.yml config --quiet
+        run: |
+          docker compose -f examples/walkthrough/docker-compose.yml config --quiet
+          docker compose -f examples/walkthrough/docker-compose.mesh.yml config --quiet
 
   smoke:
     name: Smoke Test

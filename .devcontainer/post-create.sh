@@ -3,10 +3,10 @@ set -euo pipefail
 
 echo "=== ColdFront Walkthrough — Codespaces Setup ==="
 
-# Install PostgreSQL client and jq
-echo "Installing jq and the PostgreSQL client..."
+# Install PostgreSQL client, jq, and iproute2 (setup.sh needs `ss`)
+echo "Installing jq, iproute2, and the PostgreSQL client..."
 sudo apt-get update -qq
-sudo apt-get install -y -qq postgresql-client jq
+sudo apt-get install -y -qq postgresql-client jq iproute2
 
 # Run the prerequisites check
 # Note: If the published base image is awkward to pull in CI/Codespaces,
