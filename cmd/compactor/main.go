@@ -87,6 +87,14 @@ func run(cfgPath, tableName string, o runOpts) error {
 	}
 	ns := cfg.Iceberg.Namespace
 
+	// Keep Accept-Encoding out of SigV4 signing for a TLS S3-compatible cold
+	// store (GCS rejects it); a no-op otherwise. Rides the context into every
+	// iceberg-go read/commit below.
+	ctx, err = withColdStoreSigning(ctx, cfg)
+	if err != nil {
+		return fmt.Errorf("configure cold-store signing: %w", err)
+	}
+
 	cat, err := openCatalog(ctx, cfg)
 	if err != nil {
 		return fmt.Errorf("connect lakekeeper: %w", err)

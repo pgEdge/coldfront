@@ -4,9 +4,9 @@ Thanks for your interest in improving ColdFront.
 
 ## Getting started
 
-- Build and run the stack: [INSTALL.md](INSTALL.md).
-- Day-to-day usage and the two operating modes: [USAGE.md](USAGE.md).
-- Architecture: [ARCHITECTURE.md](ARCHITECTURE.md) (plus the tiered/decoupled deep dives).
+- Build and run the stack: [Installation](docs/installation.md).
+- Day-to-day usage and the two operating modes: [Usage](docs/usage.md).
+- Architecture: [Architecture](docs/architecture.md) (plus the tiered/decoupled deep dives).
 
 ## Development workflow
 

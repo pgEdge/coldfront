@@ -30,7 +30,7 @@ Iceberg catalog, the object store, and the archiver:
 
 ```text
 ┌──────────────────────────────────────────────────────────┐
-│  PostgreSQL 17/18 + pg_duckdb + coldfront extensions      │
+│  PostgreSQL 16/17/18 + pg_duckdb + coldfront extensions   │
 │                                                           │
 │  _events (renamed partitioned table, hot data)            │
 │  ├── p_2026_03  (hot, native heap)                        │
@@ -59,7 +59,7 @@ Iceberg catalog, the object store, and the archiver:
                │
 ┌──────────────▼───────────────────────────────────────────┐
 │  Lakekeeper (Rust binary, REST catalog on :8181)          │
-│  Backed by same PostgreSQL instance                       │
+│  Backed by its own dedicated PostgreSQL instance          │
 │  Manages Iceberg metadata, snapshots, concurrency         │
 └──────────────┬───────────────────────────────────────────┘
                │
@@ -87,7 +87,7 @@ DuckDB/Iceberg/Arrow Go libraries; all Iceberg I/O goes through
 
 The archiver requires the following before its first run:
 
-1. PostgreSQL 17+ with pg_duckdb, Lakekeeper bootstrapped with a warehouse
+1. PostgreSQL 16+ with pg_duckdb, Lakekeeper bootstrapped with a warehouse
 2. Persistent S3 secret configured (see
    [architecture.md → Session setup](architecture.md#session-setup))
 3. An existing range-partitioned table
@@ -98,20 +98,11 @@ The archiver auto-detects the partition column from
 `pg_get_partkeydef()` and column types from
 `information_schema.columns`.
 
-The archiver processes each expired partition (older than
-`retention_period`) through the following steps:
-
-**1. Export to Iceberg** - using the temp table bridge (see
-[architecture.md → Temp table bridge](architecture.md#temp-table-bridge-pg-iceberg)).
-On the very first export, creates the Iceberg namespace and table.
-Catalog conflicts from concurrent writes are retried with linear
-backoff (1s, 2s, 3s).
-
-**2. Update watermark** - upserts `coldfront.archive_watermark` with
-the partition's upper bound (derived from `pg_catalog`, not `MAX(ts)`).
-
-**3. Table swap (first run only)** - atomically renames the source
-table and creates the unified view:
+A run that finds partitions past the hot window (older than
+`hot_period`) starts with an idempotent bootstrap, executed once before
+the per-partition loop: rename the source table, recreate the unified
+view with the current watermark as its cutoff, and register the view in
+`coldfront.tiered_views`:
 
 ```sql
 ALTER TABLE events RENAME TO _events;
@@ -125,42 +116,80 @@ CREATE OR REPLACE VIEW events AS
   WHERE r['ts'] < '2026-03-01'::timestamptz;
 ```
 
-An INSTEAD OF INSERT trigger is also installed as a defensive
-fallback: it routes per-row to `_events` (hot) or `duckdb.raw_query`
-(cold), and fires only when the extension is *not* loaded (the C hook
-is the production path and intercepts INSERTs before view-rewrite when
-coldfront is preloaded). On subsequent runs, the view and trigger are
-recreated with the updated cutoff.
+The rename is conditional, so it converts the table on the first run
+and no-ops afterwards; the `CREATE OR REPLACE VIEW` keeps the view's
+OID across runs. With the extension loaded, the C hook rewrites an
+INSERT on the view by the watermark cutoff, into a hot INSERT of the
+at/after-cutoff rows into `_events` and a cold `duckdb.raw_query`
+INSERT of the older rows. The view also carries an INSTEAD OF INSERT
+trigger that does the same routing; it is the fallback that fires only
+when the extension is not loaded.
 
-**4. Detach and drop** - `ALTER TABLE _events DETACH PARTITION ...
-CONCURRENTLY` then `DROP TABLE`.
+### The archive pipeline
 
-The archiver also creates future partitions (default: 3) on every run,
-before checking for expired partitions.
+Each partition past the hot window then moves to Iceberg through a
+six-phase pipeline:
+
+**0. Idempotent Iceberg-range wipe** - deletes any Iceberg rows already
+in the partition's range (a previous cycle may have exported without
+cutting over), so the re-export cannot duplicate rows.
+
+**1. Install capture** - installs a capture trigger and an UNLOGGED
+delta table on the partition, so writes that land during the export are
+recorded for replay.
+
+**2. Bulk export** - exports the partition PG → Iceberg under a
+captured snapshot, using the temp table bridge (see
+[architecture.md → Temp table bridge](architecture.md#temp-table-bridge-pg-iceberg))
+and a single bakery-claimed Iceberg INSERT. On the very first export,
+creates the Iceberg namespace and table.
+
+**3. Delta replay** - applies the delta rows the export snapshot did
+not see to Iceberg in batched commits, with no lock on the partition -
+concurrent writers keep going and keep adding to the delta.
+
+**4. Atomic cutover** (`cutover_archive`) - a single transaction
+updates `coldfront.archive_watermark` to the partition's upper bound
+(derived from `pg_catalog`, not `MAX(ts)`), takes the bakery claim on
+the Iceberg table, takes `ACCESS EXCLUSIVE` on the parent and the
+partition under a 100 ms `lock_timeout` circuit breaker, re-issues the
+view DDL with the new cutoff, and detaches the partition with a plain
+transactional `DETACH PARTITION` - all of it commits atomically or
+rolls back whole. On a lock timeout, phases 3-4 are retried (10
+attempts, exponential backoff from 100 ms to 51.2 s); any other error
+fails the cycle immediately.
+
+**5. Cleanup** (`cutover_cleanup`) - drains stragglers that landed
+between phase 3's last commit and phase 4's lock, then drops the
+detached partition, the capture trigger, and the delta table.
 
 ### Subsequent runs
 
-On every run after the first conversion, the archiver performs the
-following steps in order:
+Every run executes the same cycle - the conversion above is just the
+first cycle's bootstrap actually renaming the table. In order:
 
-1. Create future partitions
-2. Export newly expired partitions to Iceberg
-3. Update watermark and view cutoff
-4. Detach and drop archived partitions
+1. Create future partitions (default: 3) and self-heal the partition
+   covering now
+2. Run the bootstrap, then the six-phase pipeline for each partition
+   past the hot window
+3. Delete cold rows older than `retention_period` (when configured)
 
-If no partitions are expired, it's a no-op.
+A run with nothing past the hot window and no `retention_period` set
+is a no-op.
 
 ### Crash recovery
 
-The watermark is the single source of truth. The following table shows
-how the archiver recovers from a crash at each point in the workflow:
+The watermark is the single source of truth, and phase 4 is the only
+step that changes it - the watermark, view, and DETACH commit together
+or not at all, so no intermediate state between them can exist. The
+following table shows how the archiver recovers from a crash at each
+point in the pipeline:
 
 | Crash point | Recovery |
 |---|---|
-| After Iceberg write, before watermark update | Next run re-exports (idempotent) |
-| After watermark update, before view recreate | Next run recreates view |
-| After view recreate, before detach | Partition excluded by cutoff, next run detaches |
-| After detach, before drop | Next run drops orphaned table |
+| During phases 0-3 (wipe, capture, export, replay) | Watermark unchanged, partition still attached; the next cycle re-runs the pipeline - the phase-0 range wipe and the delta replay are idempotent, so no duplicates |
+| During phase 4 (cutover) | The transaction rolls back whole: watermark unchanged, view unchanged, partition still attached; lock timeouts are retried in-run, anything else leaves the trigger + delta for the next cycle to retry |
+| Between phase 4 and phase 5 | The cutover is already committed (watermark, view, and DETACH all in place); the detached partition and its now-inert capture trigger + delta table are left behind for the operator to drop |
 
 ## Transparent INSERT
 
@@ -197,7 +226,7 @@ applies, and its cost:
 | Cold side | When | Cost |
 |---|---|---|
 | **Bulk pglocal stream** (single `raw_query`, source streamed via libpq through DuckDB's postgres extension into the Iceberg writer in one pipeline) | Default. Used whenever the user's INSERT either (a) has no IDENTITY column on `_events`, or (b) supplies an explicit value for the IDENTITY column. DEFAULT clauses on omitted columns are inlined into the cold SELECT so DuckDB evaluates them per row. | Same as iceberg-only INSERT - one Iceberg snapshot for the whole cold subset, no per-row PG/DuckDB round-trip. |
-| **plpgsql cold-loop** (`coldfront._tiered_insert_cold` - a PG cursor over the cold subset, calls `nextval()` on the IDENTITY sequence per row, accumulates VALUES, flushes one `raw_query` per 1000 rows) | Fallback. Only triggered when the table has an IDENTITY column AND the user's INSERT omits it - the only case that requires PG-side `nextval()` per row to keep cold ids coherent with hot. | Bounded by plpgsql per-row iteration speed (~10-50k rows/s). For very large mostly-cold seeds, prefer iceberg-only mode where ids come from the source data. |
+| **plpgsql cold-loop** (`coldfront._tiered_insert_cold` - a PG cursor over the cold subset, calls `nextval()` on the IDENTITY sequence per row, accumulates VALUES, flushes one `raw_query` per `coldfront.cold_write_batch_size` rows, default 10000) | Fallback. Only triggered when the table has an IDENTITY column AND the user's INSERT omits it - the only case that requires PG-side `nextval()` per row to keep cold ids coherent with hot. | Bounded by plpgsql per-row iteration speed (~10-50k rows/s). For very large mostly-cold seeds, prefer iceberg-only mode where ids come from the source data. |
 
 The hot half is always plain set-based `INSERT INTO _events` -
 IDENTITY auto-allocates server-side, full PG speed regardless of row
@@ -355,17 +384,14 @@ CREATE TABLE events_branch_1 PARTITION OF events
 ```
 
 A multi-level top table cannot be archived directly. The workaround is
-to tier each sub-partition independently:
+to tier each sub-partition independently - one `register` call per
+branch (or the equivalent YAML list fed to `archiver import`):
 
-```yaml
-archiver:
-  tables:
-    - source_table: events_branch_1
-      partition_period: monthly
-      retention_period: "3 months"
-    - source_table: events_branch_2
-      partition_period: monthly
-      retention_period: "3 months"
+```sh
+archiver register --config cf.yaml --table events_branch_1 \
+    --period monthly --hot-period "1 month" --retention "3 months"
+archiver register --config cf.yaml --table events_branch_2 \
+    --period monthly --hot-period "1 month" --retention "3 months"
 ```
 
 Each `events_branch_N` is a valid single-level range-partitioned table
@@ -397,7 +423,7 @@ This is a read-path detail; writes are unaffected.
 
 These are specific to the dual-tier model. Cross-cutting limitations
 (the planner-level takeover, jsonb-as-json, single-node execution, S3
-compatibility, login arming) are in
+compatibility, one-time secret setup) are in
 [architecture.md → Known Limitations](architecture.md#known-limitations).
 
 The dual-tier model carries the following limitations:

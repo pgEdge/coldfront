@@ -4,6 +4,8 @@ go 1.26.4
 
 require (
 	github.com/apache/iceberg-go v0.6.0
+	github.com/aws/aws-sdk-go-v2 v1.41.7
+	github.com/aws/smithy-go v1.25.1
 	github.com/jackc/pgx/v5 v5.10.0
 	gocloud.dev v0.45.0
 	gopkg.in/yaml.v3 v3.0.1
@@ -35,7 +37,6 @@ require (
 	github.com/antlr4-go/antlr/v4 v4.13.1 // indirect
 	github.com/apache/arrow-go/v18 v18.6.0 // indirect
 	github.com/apache/thrift v0.23.0 // indirect
-	github.com/aws/aws-sdk-go-v2 v1.41.7 // indirect
 	github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.7.10 // indirect
 	github.com/aws/aws-sdk-go-v2/config v1.32.17 // indirect
 	github.com/aws/aws-sdk-go-v2/credentials v1.19.16 // indirect
@@ -53,7 +54,6 @@ require (
 	github.com/aws/aws-sdk-go-v2/service/sso v1.30.17 // indirect
 	github.com/aws/aws-sdk-go-v2/service/ssooidc v1.35.21 // indirect
 	github.com/aws/aws-sdk-go-v2/service/sts v1.42.1 // indirect
-	github.com/aws/smithy-go v1.25.1 // indirect
 	github.com/cespare/xxhash/v2 v2.3.0 // indirect
 	github.com/clipperhouse/uax29/v2 v2.7.0 // indirect
 	github.com/cncf/xds/go v0.0.0-20251210132809-ee656c7534f5 // indirect

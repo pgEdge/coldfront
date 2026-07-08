@@ -121,13 +121,13 @@ jobs:
             contents: write
         steps:
             - name: Checkout
-              uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+              uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
               with:
                   fetch-depth: 0
             - name: Fetch tags
               run: git fetch --force --tags
             - name: Set up Go
-              uses: actions/setup-go@4a3601121dd01d1626a1e23e37211e3254c1c06c # v6
+              uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
               with:
                   go-version-file: go.mod
                   cache: true
@@ -188,7 +188,7 @@ jobs:
             all_deb_matrix: ${{ steps.merge.outputs.all_deb_matrix }}
         steps:
             - name: Checkout code
-              uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+              uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
             - name: Checkout pgedge-detect-build-matrix
               env:
                   TOKEN: ${{ secrets.PGEDGE_BUILDER_TOKEN }}
@@ -316,7 +316,7 @@ jobs:
                 arch: [amd64, arm64]
         steps:
             - name: Checkout code
-              uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+              uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
             - name: Build extensions in manylinux_2_28
               env:
                   ML_ARCH: ${{ matrix.arch == 'arm64' && 'aarch64' || 'x86_64' }}
@@ -361,7 +361,7 @@ jobs:
                 arch: [amd64, arm64]
         steps:
             - name: Checkout code
-              uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+              uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
             - name: Resolve DUCKDB_VERSION
               id: duckdb
               run: |
@@ -425,7 +425,7 @@ jobs:
             COMPONENT_BRANCH:   ${{ needs.determine-repo-type.outputs.effective-tag }}
         steps:
             - name: Checkout code
-              uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+              uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
             - name: Derive os_version / safe component
               id: cell
               env:
@@ -523,7 +523,7 @@ jobs:
             COMPONENT_BRANCH:   ${{ needs.determine-repo-type.outputs.effective-tag }}
         steps:
             - name: Checkout code
-              uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+              uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
             - name: Derive distro / safe component
               id: cell
               env:
@@ -623,7 +623,7 @@ jobs:
             COMPONENT_BRANCH:   ${{ needs.determine-repo-type.outputs.effective-tag }}
         steps:
             - name: Checkout code
-              uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+              uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
             - name: Derive os_version
               id: cell
               env:
@@ -686,7 +686,7 @@ jobs:
             COMPONENT_BRANCH:   ${{ needs.determine-repo-type.outputs.effective-tag }}
         steps:
             - name: Checkout code
-              uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+              uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
             - name: Derive distro
               id: cell
               env:
@@ -750,7 +750,7 @@ jobs:
             RPM_MATRIX:        ${{ needs.detect-matrix.outputs.all_rpm_matrix }}
         steps:
             - name: Checkout code
-              uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+              uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
             - name: Timestamp
               id: ts
               run: echo "dnf_ts=$(date -u +'%Y%m%d-%H%M%S')" >> "$GITHUB_OUTPUT"
@@ -831,7 +831,7 @@ jobs:
             DEB_MATRIX:        ${{ needs.detect-matrix.outputs.all_deb_matrix }}
         steps:
             - name: Checkout code
-              uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+              uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
             - name: Timestamp
               id: ts
               run: echo "apt_ts=$(date -u +'%Y%m%d-%H%M%S')" >> "$GITHUB_OUTPUT"

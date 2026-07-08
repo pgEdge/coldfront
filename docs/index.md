@@ -96,15 +96,22 @@ Onboarding an application role is a single call:
 SELECT coldfront.grant_app_access('alice');
 ```
 
-grant_app_access grants only the minimum the cold path needs, all
-derived from the registry rather than hardcoded: membership in
-duckdb.postgres_role, schema USAGE, SELECT on the registry, DML on every
-registered view, and EXECUTE on the runtime cold-path functions. The
+grant_app_access grants only the minimum the cold path needs: membership
+in duckdb.postgres_role, schema USAGE, SELECT on the registry, DML on
+every registered view and the hot table and sequences behind it (all
+derived from the registry, not hardcoded), plus EXECUTE on a fixed
+allow-list of runtime cold-path functions. The
 call is idempotent and is not executable by PUBLIC, so an application
 role can never self-grant. The role is never granted
 pg_read_server_files or pg_write_server_files, so it has no host-file
 access. CREATE ROLE and GRANT both replicate over Spock, so you onboard
 a role once on any node and it propagates across the mesh.
+
+For how the non-superuser path works under the hood - the `SECURITY
+DEFINER` attach helpers, the `PGC_SUSET` / `GUC_SUPERUSER_ONLY` config
+hardening, the turnkey `duckdb.postgres_role` default, and how least
+privilege holds across a Spock mesh - see [Architecture: non-superuser
+app roles](architecture.md#non-superuser-app-roles-least-privilege).
 
 ## Caveats
 

@@ -1,6 +1,6 @@
 # 3-node Spock mesh on the DuckDB 1.5.x (Azure ADLS) image — the mesh counterpart
 # of docker-compose.matrix-azure.yml. Same topology as docker-compose.mesh.yml
-# (db1/db2/db3, MESH=on, snowflake nodes 691/109/672, Lakekeeper on its own PG)
+# (db1/db2/db3, MESH=on, snowflake nodes 1/2/3, Lakekeeper on its own PG)
 # but the cold store is Azure ADLS Gen2, so:
 #   - the db nodes use the pre-built coldfront-duckdb15:pg<major> image (azure +
 #     iceberg 1.5.x extensions), NOT the stock build: stage,
@@ -15,8 +15,9 @@
 # Build the image first: docker build -f docker/Dockerfile.duckdb15 \
 #   --build-arg PG_MAJOR=18 -t coldfront-duckdb15:pg18 .
 #
-# snowflake.node MUST equal hashtext(<spock node name>) & 1023 — db1→691,
-# db2→109, db3→672 (identical to docker-compose.mesh.yml; same hostnames).
+# COLDFRONT_SNOWFLAKE_NODE is any per-node UNIQUE integer 1..1023 (uniqueness
+# required, value otherwise arbitrary — the bakery matches acks by spock node
+# name, not by id); identical to docker-compose.mesh.yml.
 services:
   db1:
     image: coldfront-duckdb15:pg${PG_MAJOR:-18}
@@ -24,7 +25,7 @@ services:
     environment:
       PG_MAJOR: "${PG_MAJOR:-18}"
       MESH: "on"
-      COLDFRONT_SNOWFLAKE_NODE: "691"
+      COLDFRONT_SNOWFLAKE_NODE: "1"
       COLDFRONT_WAREHOUSE: wh-azure
       COLDFRONT_LAKEKEEPER: http://lakekeeper:8181/catalog
     healthcheck:
@@ -39,7 +40,7 @@ services:
     environment:
       PG_MAJOR: "${PG_MAJOR:-18}"
       MESH: "on"
-      COLDFRONT_SNOWFLAKE_NODE: "109"
+      COLDFRONT_SNOWFLAKE_NODE: "2"
       COLDFRONT_WAREHOUSE: wh-azure
       COLDFRONT_LAKEKEEPER: http://lakekeeper:8181/catalog
     healthcheck:
@@ -54,7 +55,7 @@ services:
     environment:
       PG_MAJOR: "${PG_MAJOR:-18}"
       MESH: "on"
-      COLDFRONT_SNOWFLAKE_NODE: "672"
+      COLDFRONT_SNOWFLAKE_NODE: "3"
       COLDFRONT_WAREHOUSE: wh-azure
       COLDFRONT_LAKEKEEPER: http://lakekeeper:8181/catalog
     healthcheck:
@@ -98,7 +99,8 @@ services:
       LAKEKEEPER__PG_ENCRYPTION_KEY: deadbeefdeadbeefdeadbeefdeadbeef
       LAKEKEEPER__LISTEN_PORT: 8181
     healthcheck:
-      test: ["CMD", "lakekeeper", "healthcheck"]
-      interval: 3s
-      timeout: 2s
-      retries: 10
+      test: ["CMD", "/home/nonroot/lakekeeper", "healthcheck"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s

@@ -178,7 +178,11 @@ archiver:
       partition_period: monthly
       hot_period: "${ret_days} days"
 EOF
-    if "$ARCHIVER" --config /tmp/journey-archiver.yaml >/tmp/journey-archiver.log 2>&1; then
+    # Managed tables live in coldfront.partition_config; seed events from the YAML.
+    if ! "$ARCHIVER" import --config /tmp/journey-archiver.yaml >/tmp/journey-archiver.log 2>&1; then
+        fail "import events into partition_config — see /tmp/journey-archiver.log"; tail -5 /tmp/journey-archiver.log; return
+    fi
+    if "$ARCHIVER" --config /tmp/journey-archiver.yaml >>/tmp/journey-archiver.log 2>&1; then
         pass "archiver first run completed"
     else
         fail "archiver first run — see /tmp/journey-archiver.log"; tail -5 /tmp/journey-archiver.log
@@ -225,7 +229,11 @@ archiver:
       hot_period: "${ret_days} days"
       retention_period: "${ret_long} days"
 EOF
-    if "$ARCHIVER" --config /tmp/journey-coldret.yaml >/tmp/journey-coldret.log 2>&1; then
+    # events is already managed (tiered); add the drop boundary via set.
+    if ! "$ARCHIVER" set --config /tmp/journey-coldret.yaml --table events --retention "${ret_long} days" >/tmp/journey-coldret.log 2>&1; then
+        fail "set retention on events — see /tmp/journey-coldret.log"; tail -5 /tmp/journey-coldret.log; return
+    fi
+    if "$ARCHIVER" --config /tmp/journey-coldret.yaml >>/tmp/journey-coldret.log 2>&1; then
         pass "archiver cold-retention run completed"
     else
         fail "archiver cold-retention run — see /tmp/journey-coldret.log"; tail -5 /tmp/journey-coldret.log
@@ -460,7 +468,10 @@ iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:818
 $(storage_yaml)
 archiver: { tables: [ { source_table: typed, partition_period: monthly, hot_period: "${ret_days} days" } ] }
 EOF
-    if "$ARCHIVER" --config /tmp/journey-typed.yaml >/tmp/journey-typed.log 2>&1; then
+    if ! "$ARCHIVER" import --config /tmp/journey-typed.yaml >/tmp/journey-typed.log 2>&1; then
+        fail "import typed into partition_config — see /tmp/journey-typed.log"; tail -5 /tmp/journey-typed.log; return
+    fi
+    if "$ARCHIVER" --config /tmp/journey-typed.yaml >>/tmp/journey-typed.log 2>&1; then
         pass "typed table archived (Jan → cold)"
     else
         fail "typed archive — see /tmp/journey-typed.log"; tail -5 /tmp/journey-typed.log
@@ -630,8 +641,8 @@ EOSQL
 # require_compactor — stories 6d/6e drive the standalone Go compactor (cmd/compactor,
 # a separate iceberg-go module). Assert its binary is present before they run: a missing
 # "$COMPACTOR" otherwise gets captured into the dry-run output as "No such file or
-# directory" and reported as "nothing to compact", masking the real cause (issue #17 —
-# 6d/6e ran against a vanilla.sh that never built the compactor).
+# directory" and reported as "nothing to compact", masking the real cause:
+# 6d/6e ran against a vanilla.sh that never built the compactor.
 require_compactor() {
     [ -x "$COMPACTOR" ] && return 0
     fail "compactor binary not found/executable at $COMPACTOR — build it with 'make compactor'; stories 6d/6e require it"
@@ -897,6 +908,84 @@ story_blocks() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# Story — Extension dependency. coldfront.control declares
+# requires = 'pg_duckdb', so on a database without pg_duckdb, CREATE EXTENSION
+# coldfront is rejected up front ("required extension ... is not installed")
+# instead of failing later at runtime with schema "duckdb" not existing. Use a
+# throwaway database and drop pg_duckdb to guarantee its absence regardless of
+# what template1 carries.
+# ───────────────────────────────────────────────────────────────────────────
+story_ext_requires() {
+    step "Extension dependency: CREATE EXTENSION coldfront without pg_duckdb is rejected"
+    q "$HOST" "DROP DATABASE IF EXISTS cf_dep_check;"
+    q "$HOST" "CREATE DATABASE cf_dep_check;"
+    docker exec -e PGUSER="$CF_DBUSER" -e PGDATABASE=cf_dep_check "$HOST" "$CF_PSQL" -tA \
+        -c "DROP EXTENSION IF EXISTS pg_duckdb CASCADE;" >/dev/null 2>&1 || true
+    assert_err "missing pg_duckdb rejected at CREATE EXTENSION" "required extension" \
+        "$(docker exec -e PGUSER="$CF_DBUSER" -e PGDATABASE=cf_dep_check "$HOST" "$CF_PSQL" -tA \
+            -c "CREATE EXTENSION coldfront;" 2>&1 || true)"
+    q "$HOST" "DROP DATABASE cf_dep_check;"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story — Packaging: load the bundled .duckdb_extension files from a custom
+# duckdb.extension_directory. The Docker image places them under the DEFAULT
+# dir ($PGDATA/pg_duckdb/extensions); an RPM/DEB can't write PGDATA, so it
+# installs them under <dir>/<ver>/<platform>/ and points the GUC at <dir>.
+# This proves pg_duckdb honours that GUC (so the packaging path is supported),
+# with an empty-dir negative control so it can't pass via the default dir.
+# ───────────────────────────────────────────────────────────────────────────
+story_ext_directory_guc() {
+    step "Packaging: pg_duckdb loads extensions from a custom duckdb.extension_directory"
+    # duckdb.extension_directory is read at server start, so this applies it via a
+    # restart. Skip in mesh, where a mid-journey node restart would churn spock;
+    # the GUC behaviour is mode-independent, so the single-node run covers it.
+    if [ "$MESH" = 1 ]; then pass "extension_directory check skipped in mesh (single-node)"; return; fi
+    # Build the package-style layout in a writable, restart-persistent place
+    # (under the data dir, postgres-owned) by cloning the working default
+    # extension tree — it already has the correct <version>/<platform> subdirs.
+    # cfpkg = populated (the "package installed it here" case), cfpkg-empty =
+    # negative control.
+    local pgdata
+    pgdata="$(q "$HOST" "SHOW data_directory;" | tail -1)"
+    docker exec "$HOST" bash -c "rm -rf '$pgdata/cfpkg' '$pgdata/cfpkg-empty'; cp -a '$pgdata/pg_duckdb/extensions' '$pgdata/cfpkg'; mkdir -p '$pgdata/cfpkg-empty'"
+
+    _cf_wait_pg() {
+        local i=0
+        until docker exec -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" "$HOST" "$CF_PSQL" -tAc 'SELECT 1' >/dev/null 2>&1; do
+            i=$((i + 1)); [ "$i" -gt 60 ] && { fail "postgres did not come back after restart"; return 1; }; sleep 1
+        done
+    }
+
+    # Disable autoinstall: with it on, an empty dir is masked by DuckDB
+    # downloading the (unpatched) upstream extension. A package must ship our
+    # patched files and not silently fetch upstream, so the test mirrors that.
+    q "$HOST" "ALTER SYSTEM SET duckdb.autoinstall_known_extensions = false;"
+    # Negative control: empty package dir -> LOAD iceberg must FAIL, proving the
+    # GUC actually redirects (the default dir is not used as a fallback).
+    q "$HOST" "ALTER SYSTEM SET duckdb.extension_directory = '$pgdata/cfpkg-empty';"
+    docker restart "$HOST" >/dev/null; _cf_wait_pg || return
+    case "$(q_may "$HOST" "SELECT duckdb.raw_query('LOAD iceberg');")" in
+        *Success*) fail "empty extension_directory: LOAD iceberg unexpectedly succeeded" ;;
+        *)         pass "empty extension_directory: LOAD iceberg fails (GUC redirects; no autoinstall)" ;;
+    esac
+
+    # Positive: populated package dir -> LOAD iceberg must succeed.
+    q "$HOST" "ALTER SYSTEM SET duckdb.extension_directory = '$pgdata/cfpkg';"
+    docker restart "$HOST" >/dev/null; _cf_wait_pg || return
+    local out; out="$(q_may "$HOST" "SELECT duckdb.raw_query('LOAD iceberg');")"
+    case "$out" in
+        *Success*) pass "populated extension_directory: LOAD iceberg succeeds" ;;
+        *)         fail "populated extension_directory: LOAD iceberg did not succeed — $out" ;;
+    esac
+
+    # Restore image defaults so later stories load from $PGDATA as usual.
+    q "$HOST" "ALTER SYSTEM RESET duckdb.extension_directory;"
+    q "$HOST" "ALTER SYSTEM RESET duckdb.autoinstall_known_extensions;"
+    docker restart "$HOST" >/dev/null; _cf_wait_pg || return
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Story 9 — Concurrency / no-409: writes that race the archive cycle survive.
 # The m1 (now-1mo) partition is still hot after the first cycle (cutoff = start
 # of now-1mo). A second cycle with the cutoff pinned PAST the start of the
@@ -924,7 +1013,13 @@ iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:818
 $(storage_yaml)
 archiver: { tables: [ { source_table: events, partition_period: monthly, hot_period: "${ret_race} days" } ] }
 EOF
-    "$ARCHIVER" --config /tmp/journey-race.yaml --debug-export-delay 4s >/tmp/journey-race.log 2>&1 &
+    # Widen events' hot window for this run so m1 expires now; restore it after
+    # the run (one shared partition_config row) so later stories keep events' config.
+    local prev_hot; prev_hot=$(q "$HOST" "SELECT hot_period::text FROM coldfront.partition_config WHERE schema_name='public' AND table_name='events';")
+    if ! "$ARCHIVER" set --config /tmp/journey-race.yaml --table events --hot-period "${ret_race} days" >/tmp/journey-race.log 2>&1; then
+        fail "set race hot-period on events — see /tmp/journey-race.log"; tail -5 /tmp/journey-race.log; return
+    fi
+    "$ARCHIVER" --config /tmp/journey-race.yaml --debug-export-delay 4s >>/tmp/journey-race.log 2>&1 &
     local apid=$!
     local i
     for i in $(seq 1 30); do
@@ -940,6 +1035,10 @@ INSERT INTO events (ts, status, data) VALUES (date_trunc('month',now()) - interv
 EOSQL
     if wait "$apid"; then pass "archiver cycle 2 completed cleanly (no 409)"
     else fail "archiver errored during race window"; tail -5 /tmp/journey-race.log; fi
+    # Restore events' hot_period (shared partition_config row) so later stories see
+    # its original config; a failed restore would corrupt them, so fail loud.
+    "$ARCHIVER" set --config /tmp/journey-race.yaml --table events --hot-period "$prev_hot" >/dev/null 2>&1 \
+        || fail "restore events hot_period after race window"
     assert_eq "race UPDATEs survived (3 retagged in cold)" "3" "$(q "$HOST" "SELECT count(*) FROM events WHERE status='during_archive';")"
     assert_eq "race INSERT survived (1 new in cold)"       "1" "$(q "$HOST" "SELECT count(*) FROM events WHERE status='during_archive_insert';")"
     assert_eq "race DELETE survived (0 remaining)"         "0" "$(q "$HOST" "SELECT count(*) FROM events WHERE status='race_will_delete';")"
@@ -1057,6 +1156,45 @@ story_mesh() {
         "$(cat /tmp/journey-ra.* 2>/dev/null | grep -cEi 'error|conflict|409')"
     assert_eq "concurrent cross-node cold writers both landed (R-A bakery, no 409)" "2" "$(q "$HOST" "SELECT count(*) FROM iceonly WHERE status='ra';")"
     rm -f /tmp/journey-ra.* 2>/dev/null
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story 12b — MULTIPLE concurrent cold writers PER NODE, on >=2 nodes, to the
+# SAME iceberg table. Unlike story_mesh (1 writer/node), this leaves >1
+# same-node claim outstanding per node at once; the node-local advisory lock in
+# _claim_iceberg_lock serializes them so the cross-node bakery sees one claim
+# per node and no commit hits a Lakekeeper 409.
+# ───────────────────────────────────────────────────────────────────────────
+story_mesh_multiwriter() {
+    step "12b. Mesh: multiple cold writers PER NODE, cross-node, same table"
+    local PARR; read -ra PARR <<< "$PEERS"
+    [ "${#PARR[@]}" -ge 1 ] || { fail "mesh: no --peers given"; return; }
+    local p1="${PARR[0]}" N=5 k pids=() tbl
+    [ "$MODE" = tiered ] && tbl=events || tbl=iceonly
+    rm -f /tmp/journey-mw.* 2>/dev/null
+    # Fire N writers on db1 AND N on the peer, all at once, all cold-routed to the
+    # same table: decoupled writes straight to iceonly, tiered writes a cold-dated
+    # row to events (ts before the cutoff, so it lands in the cold tier).
+    for k in $(seq 1 "$N"); do
+        local a b
+        if [ "$MODE" = tiered ]; then
+            a="INSERT INTO events (ts,status,data) VALUES (date_trunc('month',now()) - interval '4 months' + interval '$k days','mw','{}');"
+            b="INSERT INTO events (ts,status,data) VALUES (date_trunc('month',now()) - interval '4 months' + interval '$k days 12 hours','mw','{}');"
+        else
+            a="INSERT INTO iceonly VALUES ($((7000+k)),date_trunc('month',now()) + interval '3 months' + interval '$k hours','mw','{}');"
+            b="INSERT INTO iceonly VALUES ($((8000+k)),date_trunc('month',now()) + interval '3 months' + interval '$k hours 30 minutes','mw','{}');"
+        fi
+        q "$HOST" "$a" >"/tmp/journey-mw.a$k" 2>&1 &
+        pids+=("$!")
+        q "$p1"   "$b" >"/tmp/journey-mw.b$k" 2>&1 &
+        pids+=("$!")
+    done
+    for k in "${pids[@]}"; do wait "$k"; done
+    assert_eq "no multi-writer-per-node cross-node cold writer errored (no 409)" "0" \
+        "$(cat /tmp/journey-mw.* 2>/dev/null | grep -cEi 'error|conflict|409')"
+    assert_eq "all $((2 * N)) multi-writer-per-node cross-node cold writes landed" "$((2 * N))" \
+        "$(q "$HOST" "SELECT count(*) FROM $tbl WHERE status='mw';")"
+    rm -f /tmp/journey-mw.* 2>/dev/null
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -1375,7 +1513,10 @@ archiver:
       hot_period: "${ret_days} days"
       sub_partition: { values_source: "SELECT region FROM (VALUES ('eu'),('us')) r(region)" }
 EOF
-    if "$ARCHIVER" --config /tmp/journey-tl.yaml >/tmp/journey-tl.log 2>&1; then
+    if ! "$ARCHIVER" import --config /tmp/journey-tl.yaml >/tmp/journey-tl.log 2>&1; then
+        fail "import regional (2-level) into partition_config — see /tmp/journey-tl.log"; tail -8 /tmp/journey-tl.log; return
+    fi
+    if "$ARCHIVER" --config /tmp/journey-tl.yaml >>/tmp/journey-tl.log 2>&1; then
         pass "2-level archiver run completed (no flat-partitioning Fatal)"
     else
         fail "2-level archiver run — see /tmp/journey-tl.log"; tail -8 /tmp/journey-tl.log; return
@@ -1404,6 +1545,163 @@ EOF
     "$ARCHIVER" --config /tmp/journey-tl.yaml >/tmp/journey-tl2.log 2>&1
     assert_eq "re-run keeps all cold rows (region-scoped wipe)" "420" "$(q "$HOST" "SELECT count(*) FROM regional;")"
     assert_eq "re-run keeps eu cold rows" "240" "$(q "$HOST" "SELECT count(*) FROM regional WHERE region='eu' AND ts < date_trunc('month',now()) - interval '1 month';")"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story - FK: foreign key on a tiered partitioned table. Asserts:
+#   1. The archiver registers and archives a table that has a FK constraint.
+#   2. PostgreSQL enforces the FK on the hot tier before and after the view
+#      swap, outbound (fk_events references another table) and inbound (a
+#      table references fk_events).
+#   3. FK enforcement is a PostgreSQL feature that lives only on the hot tier.
+#      Iceberg has no foreign keys, so a row in the cold tier is outside FK
+#      enforcement by construction: a cold INSERT is not FK-checked, and an
+#      inbound FK reference to an archived row is rejected (the row has left
+#      _fk_events). See docs/usage.md "Inbound foreign keys". Not a defect to be
+#      "fixed" - a consequence of the storage model, asserted so a change in
+#      behavior is caught.
+# ───────────────────────────────────────────────────────────────────────────
+story_fk_constraint() {
+    step "FK: PostgreSQL enforces on the hot tier; the cold tier has no FKs"
+
+    local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
+    local ret_days; ret_days=$(( ( $(date -u +%s) - $(date -u -d "$(date -u +%Y-%m-01) -1 month" +%s) ) / 86400 ))
+
+    # Reference table + a partitioned table whose PK is (id, ts) (the partition
+    # column must be in the PK) plus an outbound FK on category_id. The FK is
+    # added after the partitions exist so PK propagation is unambiguous.
+    # SET search_path = public so the unqualified partition names in the DO
+    # block land in public (the archiver resolves partitions in the parent's
+    # schema); without it they land in the coldfront schema, since the session
+    # user is "coldfront" and a coldfront schema exists.
+    qf "$HOST" <<'EOSQL' >/dev/null
+SET search_path = public;
+CREATE TABLE IF NOT EXISTS public.fk_categories (id int PRIMARY KEY, name text NOT NULL);
+INSERT INTO public.fk_categories VALUES (1,'alpha'),(2,'beta') ON CONFLICT DO NOTHING;
+CREATE TABLE IF NOT EXISTS public.fk_events (
+    id          bigint GENERATED ALWAYS AS IDENTITY,
+    ts          timestamptz NOT NULL,
+    category_id int NOT NULL,
+    label       text,
+    PRIMARY KEY (id, ts)
+) PARTITION BY RANGE (ts);
+DO $do$
+DECLARE m date;
+BEGIN
+  FOR i IN 1..4 LOOP
+    m := (date_trunc('month', now()) - make_interval(months => 5 - i))::date;
+    EXECUTE format('CREATE TABLE IF NOT EXISTS %I PARTITION OF fk_events FOR VALUES FROM (%L) TO (%L)',
+      'fk_events_p_' || to_char(m,'YYYY_MM'), m, m + interval '1 month');
+  END LOOP;
+END $do$;
+ALTER TABLE public.fk_events ADD CONSTRAINT fk_events_category
+    FOREIGN KEY (category_id) REFERENCES public.fk_categories(id);
+EOSQL
+
+    # Seed one cold (4 months old) + one hot (1 month old) row, both valid.
+    q "$HOST" "INSERT INTO fk_events (ts,category_id,label) VALUES (date_trunc('month',now()) - interval '4 months' + interval '1 day', 1, 'cold-valid');" >/dev/null
+    q "$HOST" "INSERT INTO fk_events (ts,category_id,label) VALUES (date_trunc('month',now()) - interval '1 month'  + interval '1 day', 2, 'hot-valid');"  >/dev/null
+
+    # Outbound FK, before archiving: PG enforces on the raw partitioned table.
+    local pre_err
+    pre_err=$(q "$HOST" "INSERT INTO fk_events (ts,category_id,label) VALUES (date_trunc('month',now()) - interval '1 month' + interval '2 days', 999, 'pre-bad-fk');" 2>&1 || true)
+    assert_contains "hot INSERT with invalid FK rejected before archiving" "foreign key" "$pre_err"
+    assert_eq "no row written for the rejected pre-archive INSERT" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM fk_events WHERE label='pre-bad-fk';")"
+
+    # Inbound FK, before archiving: fk_event_details references fk_events(id, ts).
+    qf "$HOST" <<'EOSQL' >/dev/null
+CREATE TABLE IF NOT EXISTS public.fk_event_details (
+    event_id bigint, event_ts timestamptz, note text,
+    FOREIGN KEY (event_id, event_ts) REFERENCES public.fk_events(id, ts));
+INSERT INTO public.fk_event_details SELECT id, ts, 'pre-inbound-valid' FROM public.fk_events WHERE label='hot-valid';
+EOSQL
+    assert_eq "inbound FK: valid referencing row accepted before archiving" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM fk_event_details WHERE note='pre-inbound-valid';")"
+    local pre_inbound_err
+    pre_inbound_err=$(q "$HOST" "INSERT INTO fk_event_details VALUES (99999, now(), 'pre-inbound-bad');" 2>&1 || true)
+    assert_contains "inbound FK: invalid referencing row rejected before archiving" "foreign key" "$pre_inbound_err"
+
+    # Register + archive. Both must succeed: the (id, ts) PK is valid, so an
+    # outbound FK must NOT defeat PK detection / delta capture. A regression
+    # there (archiver bailing with "no primary key") fails this story loudly.
+    if "$ARCHIVER" register --config /tmp/journey-archiver.yaml --table fk_events \
+            --period monthly --hot-period "${ret_days} days" >/tmp/journey-fk-reg.log 2>&1; then
+        pass "fk_events registered (FK does not block registration)"
+    else
+        fail "fk_events register failed"; tail -5 /tmp/journey-fk-reg.log
+    fi
+    assert_eq "partition_config row written for fk_events" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='fk_events';")"
+
+    cat > /tmp/journey-fk.yaml <<EOF
+postgres: { dsn: "${dsn}" }
+iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog", namespace: "default" }
+$(storage_yaml)
+EOF
+    if "$ARCHIVER" --config /tmp/journey-fk.yaml >/tmp/journey-fk-arch.log 2>&1; then
+        pass "archiver completed on FK-constrained table"
+    else
+        fail "archiver failed on FK-constrained table"; tail -8 /tmp/journey-fk-arch.log
+    fi
+
+    # View swap happened and the cold row genuinely moved to Iceberg (gone from
+    # _fk_events, still visible through the unified view).
+    assert_eq "fk_events is a view after archival" "v" \
+        "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='fk_events' AND relnamespace='public'::regnamespace;")"
+    assert_eq "cold row archived out of _fk_events (the hot PG table)" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM _fk_events WHERE label='cold-valid';")"
+    assert_eq "cold row still visible via the unified view" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM fk_events WHERE label='cold-valid';")"
+
+    # Outbound FK still enforced on the hot tier after the swap.
+    local post_err
+    post_err=$(q "$HOST" "INSERT INTO fk_events (ts,category_id,label) VALUES (now(), 999, 'post-bad-fk');" 2>&1 || true)
+    assert_contains "hot INSERT with invalid FK still rejected after view swap" "foreign key" "$post_err"
+    assert_eq "no row written for the rejected post-swap INSERT" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM fk_events WHERE label='post-bad-fk';")"
+    q "$HOST" "INSERT INTO fk_events (ts,category_id,label) VALUES (now(), 1, 'post-valid');" >/dev/null
+    assert_eq "valid hot INSERT works after view swap" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM fk_events WHERE label='post-valid';")"
+
+    # Inbound FK after the swap: enforces against hot rows (the FK tracks the
+    # renamed _fk_events, same OID). Read the hot (id, ts) straight from
+    # _fk_events; reading it from the view and INSERT..SELECT-ing would route
+    # the whole statement through pg_duckdb, which cannot write a PG table.
+    q "$HOST" "INSERT INTO fk_event_details SELECT id, ts, 'post-inbound-hot' FROM _fk_events WHERE label='post-valid';" >/dev/null
+    assert_eq "inbound FK: valid referencing row (hot) works after view swap" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM fk_event_details WHERE note='post-inbound-hot';")"
+    local post_inbound_bad
+    post_inbound_bad=$(q "$HOST" "INSERT INTO fk_event_details VALUES (99999, now(), 'post-inbound-bad');" 2>&1 || true)
+    assert_contains "inbound FK: invalid referencing row still rejected after view swap" "foreign key" "$post_inbound_bad"
+
+    # An inbound FK references _fk_events (the hot PG table). Once a row is
+    # archived it leaves _fk_events, so PostgreSQL rejects a referencing row
+    # that points at an archived (cold) row - the FK domain is the hot tier
+    # only. Inherent to tiering (see docs/usage.md "Inbound foreign keys"),
+    # asserted so a change in behavior is caught. The cold (id, ts) is read
+    # once (plain SELECT), then referenced as literals so the INSERT is a plain
+    # PG write and the FK check (not a pg_duckdb takeover) is what rejects it.
+    local cold_id cold_inbound_err
+    cold_id=$(q "$HOST" "SELECT id FROM fk_events WHERE label='cold-valid';")
+    cold_inbound_err=$(q "$HOST" "INSERT INTO fk_event_details VALUES (${cold_id}, date_trunc('month',now()) - interval '4 months' + interval '1 day', 'cold-inbound');" 2>&1 || true)
+    assert_contains "inbound FK reference to an archived (cold) row is rejected (cold rows are outside PG FK enforcement)" "foreign key" "$cold_inbound_err"
+    q "$HOST" "DELETE FROM fk_event_details WHERE note='cold-inbound';" >/dev/null 2>&1
+
+    # A cold INSERT is written to Iceberg, which has no foreign keys, so it is
+    # not FK-checked and an invalid category_id is accepted. This is by
+    # construction, not a bypassed check: FK enforcement exists only on the hot
+    # tier. Asserted so a change in behavior is caught.
+    q "$HOST" "INSERT INTO fk_events (ts,category_id,label) VALUES (date_trunc('month',now()) - interval '4 months' + interval '2 days', 999, 'cold-bad-fk');" >/dev/null 2>&1 || true
+    assert_eq "cold INSERT is not FK-checked (Iceberg has no foreign keys)" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM fk_events WHERE label='cold-bad-fk';")"
+
+    # Cleanup.
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name='fk_events';" >/dev/null 2>&1
+    q "$HOST" "DROP TABLE IF EXISTS public.fk_event_details;" >/dev/null 2>&1
+    q "$HOST" "DROP VIEW  IF EXISTS public.fk_events CASCADE;" >/dev/null 2>&1
+    q "$HOST" "DROP TABLE IF EXISTS public._fk_events CASCADE;" >/dev/null 2>&1
+    q "$HOST" "DROP TABLE IF EXISTS public.fk_categories CASCADE;" >/dev/null 2>&1
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -1463,6 +1761,22 @@ EOSQL
         if grep -qi "primary key" /tmp/journey-nopk.log; then pass "register rejects the PK-less table"; else fail "wrong rejection reason"; tail -3 /tmp/journey-nopk.log; fi
     fi
     assert_eq "no row written for the rejected table" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='cli_nopk';")"
+
+    # Parity: import must reject the SAME PK-less table register rejects — every
+    # write to partition_config goes through one validation gate.
+    # Partition-only (retention, no hot_period) so the config needs no cold backend;
+    # the PK-superset check still fires and must reject the PK-less table.
+    cat > /tmp/journey-nopk.yaml <<EOF
+postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
+archiver: { tables: [ { source_table: cli_nopk, partition_period: monthly, retention_period: "60 months" } ] }
+EOF
+    if "$ARCHIVER" import --config /tmp/journey-nopk.yaml >/tmp/journey-nopk-imp.log 2>&1; then
+        fail "import cli_nopk should have failed (no primary key)"
+    else
+        if grep -qi "primary key" /tmp/journey-nopk-imp.log; then pass "import rejects the PK-less table (parity with register)"; else fail "wrong import rejection reason"; tail -3 /tmp/journey-nopk-imp.log; fi
+    fi
+    assert_eq "import wrote no row for the rejected table" "0" \
         "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='cli_nopk';")"
 
     # retention must exceed hot-period — caught at register time, before any write.
@@ -1566,14 +1880,14 @@ story_partitioner_idmode() {
 
 # ───────────────────────────────────────────────────────────────────────────
 # Story — partitioner: TWO independent flat tables in the SAME schema (the real-
-# world case — issue #11). Before the table-scoped-naming fix both tables
+# world case). Before the table-scoped-naming fix both tables
 # generated the same leaf names (p_YYYY_MM); the second's CREATE … IF NOT EXISTS
 # silently no-op'd, leaving it partition-less while the run still reported
 # success. Assert BOTH tables get their own (table-scoped) partitions, the leaf
 # names are prefixed per table, and a fresh row lands in each.
 # ───────────────────────────────────────────────────────────────────────────
 story_partitioner_multitable() {
-    step "Partitioner multi-table: two flat tables, one schema, both partitioned (issue #11)"
+    step "Partitioner multi-table: two flat tables, one schema, both partitioned"
     local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
     printf 'postgres: { dsn: "%s" }\n' "$dsn" > /tmp/journey-mt.yaml
     q "$HOST" "CREATE SCHEMA IF NOT EXISTS mt;
@@ -1603,59 +1917,63 @@ story_partitioner_multitable() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────
-# Story — issue #12: after the archiver's first-run swap (events → _events, with
+# Story — after the archiver's first-run swap (events → _events, with
 # a unified view left in events' place) the standalone partitioner must premake
 # against the real partitioned table (_events), not the view. The configured /
 # registered source name is still "events"; reconcileTable resolves it to the
-# "_"+name partitioned relation before building the spec. Pre-fix the partitioner
-# targeted the view and aborted on the issue #11 verify-attach guard ("not
-# attached … different parent"); post-fix it premakes the forward window straight
-# onto _events.
+# "_"+name partitioned relation before building the spec, so it premakes the
+# forward window straight onto _events and never touches the view (which would
+# trip the verify-attach guard: "not attached … different parent").
 # ───────────────────────────────────────────────────────────────────────────
 story_partitioner_after_swap() {
-    step "Partitioner after first-run swap: premakes onto _events, not the view (issue #12)"
+    step "Partitioner after first-run swap: premakes onto _events, not the view"
     # Precondition (set up by story_provision_tiered): events is a VIEW now and
     # _events is the partitioned hot table.
-    assert_eq "issue #12: precondition — events is a view"       "v" "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='events'  AND relnamespace='public'::regnamespace;")"
-    assert_eq "issue #12: precondition — _events is partitioned" "p" "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='_events' AND relnamespace='public'::regnamespace;")"
+    assert_eq "precondition — events is a view"       "v" "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='events'  AND relnamespace='public'::regnamespace;")"
+    assert_eq "precondition — _events is partitioned" "p" "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='_events' AND relnamespace='public'::regnamespace;")"
     local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
-    # Drive the partitioner off the post-swap source name "events" with a wide
-    # future window (6) so it premakes months the archiver (premake 3) did not —
-    # proving it acted on _events. retention 60 months drops nothing.
-    cat > /tmp/journey-issue12.yaml <<EOF
-postgres:
-  dsn: "${dsn}"
-archiver:
-  tables:
-    - source_table: events
-      partition_period: monthly
-      retention_period: "60 months"
-      future_partitions: 6
-EOF
-    if ! "$PARTITIONER" --config /tmp/journey-issue12.yaml >/tmp/journey-issue12.log 2>&1; then
-        fail "issue #12: partitioner run failed (pre-fix it targets the view)"; tail -8 /tmp/journey-issue12.log; return
+    printf 'postgres: { dsn: "%s" }\n' "$dsn" > /tmp/journey-partitioner.yaml
+    # events is archiver-owned (tiered). Temporarily make it partition-only so the
+    # standalone partitioner manages it and premakes a wide future window (6, vs the
+    # archiver's 3) — proving it resolves the events VIEW to the real _events table
+    # — then restore the tiered config for later stories. retention 60mo drops nothing.
+    local prev_hot prev_ret prev_pre
+    prev_hot=$(q "$HOST" "SELECT hot_period::text       FROM coldfront.partition_config WHERE schema_name='public' AND table_name='events';")
+    prev_ret=$(q "$HOST" "SELECT retention_period::text FROM coldfront.partition_config WHERE schema_name='public' AND table_name='events';")
+    prev_pre=$(q "$HOST" "SELECT future_partitions      FROM coldfront.partition_config WHERE schema_name='public' AND table_name='events';")
+    if ! "$PARTITIONER" set --config /tmp/journey-partitioner.yaml --table events --hot-period "" --retention "60 months" --premake 6 >/tmp/journey-partitioner.log 2>&1; then
+        fail "set events partition-only — see /tmp/journey-partitioner.log"; tail -5 /tmp/journey-partitioner.log; return
     fi
-    # The fix resolves events → _events, so the reconcile is logged against _events.
-    if grep -q "\[_events\] reconciled" /tmp/journey-issue12.log; then
-        pass "issue #12: partitioner reconciled _events (resolved past the view)"
+    if "$PARTITIONER" --config /tmp/journey-partitioner.yaml >>/tmp/journey-partitioner.log 2>&1; then
+        pass "partitioner ran off partition_config (events temporarily partition-only)"
     else
-        fail "issue #12: reconcile did not target _events"; tail -8 /tmp/journey-issue12.log
+        fail "partitioner run failed"; tail -8 /tmp/journey-partitioner.log
     fi
-    # And it never trips the verify-attach guard that the pre-fix view target hits.
-    if grep -q "different parent" /tmp/journey-issue12.log; then
-        fail "issue #12: partitioner tripped the verify-attach guard (still targeting the view)"; tail -8 /tmp/journey-issue12.log
+    # The partitioner resolves events → _events, so the reconcile is logged against _events.
+    if grep -q "\[_events\] reconciled" /tmp/journey-partitioner.log; then
+        pass "partitioner reconciled _events (resolved past the view)"
     else
-        pass "issue #12: no verify-attach error (did not touch the view)"
+        fail "reconcile did not target _events"; tail -8 /tmp/journey-partitioner.log
+    fi
+    # And it never trips the verify-attach guard that targeting the view would hit.
+    if grep -q "different parent" /tmp/journey-partitioner.log; then
+        fail "partitioner tripped the verify-attach guard (still targeting the view)"; tail -8 /tmp/journey-partitioner.log
+    else
+        pass "no verify-attach error (did not touch the view)"
     fi
     # Behavioral proof: the +5-month leaf (beyond the archiver's premake window) is
     # attached to _events, the real partitioned table — not orphaned or erroring.
     local fut; fut="events_p_$(date -u -d "$(date -u +%Y-%m-01) +5 months" +%Y_%m)"
-    assert_eq "issue #12: +5mo leaf $fut premade onto _events" "1" \
+    assert_eq "+5mo leaf $fut premade onto _events" "1" \
         "$(q "$HOST" "SELECT count(*) FROM pg_inherits i JOIN pg_class c ON c.oid=i.inhrelid WHERE i.inhparent='public._events'::regclass AND c.relname='$fut';")"
+    # Restore events' tiered config so later stories see it as the archiver owns it;
+    # a failed restore would corrupt them, so fail loud.
+    "$ARCHIVER" set --config /tmp/journey-partitioner.yaml --table events --hot-period "$prev_hot" --retention "$prev_ret" --premake "$prev_pre" >/dev/null 2>&1 \
+        || fail "restore events tiered config after partitioner-after-swap test"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
-# Story — issue #14: coldfront.partition_config is ONE shared table holding both
+# Story — coldfront.partition_config is ONE shared table holding both
 # archiver-owned (tiered: hot_period set) and partitioner-owned (partition-only:
 # hot_period NULL) rows. Each binary must load only the rows it owns, scoped in
 # SQL by hot_period. Pre-fix the shared loader took every enabled row, so the
@@ -1667,7 +1985,7 @@ EOF
 # idmode_check) and the cleanup keeps the shared config clean for later stories.
 # ───────────────────────────────────────────────────────────────────────────
 story_partition_config_ownership() {
-    step "Shared partition_config: each binary loads only the rows it owns (issue #14)"
+    step "Shared partition_config: each binary loads only the rows it owns"
     local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
     q "$HOST" "CREATE SCHEMA IF NOT EXISTS own;
                CREATE TABLE IF NOT EXISTS own.po  (id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL, PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);
@@ -1679,26 +1997,26 @@ story_partition_config_ownership() {
     # so we assert per-table ownership, NOT an absolute "loaded N" count).
     "$PARTITIONER" register --dsn "$dsn" --schema own --table po   --period monthly --retention "60 months" >/tmp/journey-own-po-reg.log   2>&1
     "$ARCHIVER"    register --dsn "$dsn" --schema own --table tier --period monthly --hot-period "1 month" --retention "60 months" >/tmp/journey-own-tier-reg.log 2>&1
-    assert_eq "issue #14: partition-only row owned by partitioner (hot_period NULL)" "1" \
+    assert_eq "partition-only row owned by partitioner (hot_period NULL)" "1" \
         "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE schema_name='own' AND table_name='po'   AND hot_period IS NULL;")"
-    assert_eq "issue #14: tiered row owned by archiver (hot_period set)"             "1" \
+    assert_eq "tiered row owned by archiver (hot_period set)"             "1" \
         "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE schema_name='own' AND table_name='tier' AND hot_period IS NOT NULL;")"
 
     # Archiver run: processes its tiered row (own.tier), never the partitioner's
     # partition-only row (own.po), and no longer aborts on a foreign row.
     "$ARCHIVER" --config /tmp/journey-archiver.yaml >/tmp/journey-own-arch.log 2>&1 || true
     if grep -q "hot_period is required in tiered mode" /tmp/journey-own-arch.log; then
-        fail "issue #14: archiver still choked on the partition-only row"; tail -5 /tmp/journey-own-arch.log
+        fail "archiver still choked on the partition-only row"; tail -5 /tmp/journey-own-arch.log
     else
-        pass "issue #14: archiver did not choke on the partition-only row"
+        pass "archiver did not choke on the partition-only row"
     fi
     # Per-table logs use the bare source-table name ([tier] / [po]); own.tier and
     # own.po are unique here so the substrings are unambiguous.
-    assert_contains "issue #14: archiver processed its own tiered table" "[tier]" "$(cat /tmp/journey-own-arch.log)"
+    assert_contains "archiver processed its own tiered table" "[tier]" "$(cat /tmp/journey-own-arch.log)"
     if grep -q "\[po\]" /tmp/journey-own-arch.log; then
-        fail "issue #14: archiver touched the partitioner's row (po)"; tail -5 /tmp/journey-own-arch.log
+        fail "archiver touched the partitioner's row (po)"; tail -5 /tmp/journey-own-arch.log
     else
-        pass "issue #14: archiver ignored the partitioner's row (po)"
+        pass "archiver ignored the partitioner's row (po)"
     fi
 
     # Partitioner run: reconciles its partition-only row (own.po), never the
@@ -1706,15 +2024,15 @@ story_partition_config_ownership() {
     printf 'postgres: { dsn: "%s" }\n' "$dsn" > /tmp/journey-own-part.yaml
     "$PARTITIONER" --config /tmp/journey-own-part.yaml >/tmp/journey-own-part.log 2>&1 || true
     if grep -q "only valid in tiered mode" /tmp/journey-own-part.log; then
-        fail "issue #14: partitioner still choked on the tiered row"; tail -5 /tmp/journey-own-part.log
+        fail "partitioner still choked on the tiered row"; tail -5 /tmp/journey-own-part.log
     else
-        pass "issue #14: partitioner did not choke on the tiered row"
+        pass "partitioner did not choke on the tiered row"
     fi
-    assert_contains "issue #14: partitioner reconciled its own partition-only table" "[po] reconciled" "$(cat /tmp/journey-own-part.log)"
+    assert_contains "partitioner reconciled its own partition-only table" "[po] reconciled" "$(cat /tmp/journey-own-part.log)"
     if grep -q "\[tier\]" /tmp/journey-own-part.log; then
-        fail "issue #14: partitioner touched the archiver's row (tier)"; tail -5 /tmp/journey-own-part.log
+        fail "partitioner touched the archiver's row (tier)"; tail -5 /tmp/journey-own-part.log
     else
-        pass "issue #14: partitioner ignored the archiver's row (tier)"
+        pass "partitioner ignored the archiver's row (tier)"
     fi
 
     # Clean up so the SHARED coldfront.partition_config stays clean for later stories.
@@ -1781,6 +2099,8 @@ if [ "$MODE" = "tiered" ]; then
     story_mixed_concurrency
     story_ddl
     story_blocks
+    story_ext_requires
+    story_ext_directory_guc
     story_concurrency
     story_concurrent_writers
     story_txn
@@ -1790,8 +2110,9 @@ if [ "$MODE" = "tiered" ]; then
     story_partitioner_idmode
     story_partitioner_multitable
     story_partitioner_after_swap
+    story_fk_constraint
     story_register_cli
-    story_partition_config_ownership   # issue #14: each binary loads only its own rows
+    story_partition_config_ownership   # each binary loads only its own rows
 else
     story_provision_decoupled
     story_decoupled_crud
@@ -1800,6 +2121,7 @@ else
     story_decoupled_ryw
 fi
 [ "$MESH" = 1 ] && [ "$MODE" = decoupled ] && story_mesh   # tiered+mesh runs story_mesh_tiered (above)
+[ "$MESH" = 1 ] && story_mesh_multiwriter   # >1 cold writer/node cross-node (tiered: events, decoupled: iceonly)
 [ -n "$STANDBY" ]    && story_standby_reads
 
 summary

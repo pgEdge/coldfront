@@ -59,7 +59,7 @@ strict reader checks. So iceberg-go rejects the manifests at:
 consolidates the cold tier** — at scale, tens of thousands of small Parquet files
 accumulate with no go-native compaction path. The three interop patches (carried
 in the patched base) are exactly what make the compactor work; see
-[COMPACTOR.md](COMPACTOR.md) and [DUCKDB_1.5_PATCHED.md §3](DUCKDB_1.5_PATCHED.md).
+[docs/compaction.md](docs/compaction.md) and [DUCKDB_1.5_PATCHED.md §3](DUCKDB_1.5_PATCHED.md).
 
 **pg_duckdb's own reads and writes of the cold tier are unaffected** — it derives
 version/content/format from table metadata, never from the Avro keys iceberg-go
@@ -81,6 +81,6 @@ the default.
 - **Cold writes no-409:** a 3-way overlapping decoupled `INSERT` into one Iceberg
   table (same-node and cross-node) → 3/3, no 409 — claim-first serializes the
   uploads, so each writer reads a fresh catalog head.
-- **Compactor blocked (the documented consequence):** `compactor --table <t>
-  --dry-run` errors at `PlanFiles` on the format-version / content / file_format
-  cross-check.
+- **Compactor blocked (the documented consequence):** `compactor --config <yaml>
+  --table <t> --dry-run` errors at `PlanFiles` on the format-version / content /
+  file_format cross-check.

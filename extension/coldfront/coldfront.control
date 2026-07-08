@@ -1,4 +1,5 @@
 comment = 'Transparent tiered storage: route DML on tiered views across hot (PG) and cold (Iceberg) tiers'
 default_version = '1.0'
+requires = 'pg_duckdb'
 relocatable = false
 schema = coldfront

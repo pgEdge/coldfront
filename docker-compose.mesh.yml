@@ -10,9 +10,9 @@
 # (node_create + 6 bidirectional subs), then runs the journey + mesh stories
 # against db1. Lakekeeper runs on its OWN dedicated Postgres (never a data node).
 #
-# snowflake.node MUST equal hashtext(<spock node name>) & 1023 — the bakery's
-# dead-peer reap maps snowflake.get_node(ticket) back to a pg_stat_replication
-# peer. db1→691, db2→109, db3→672 (hashtext('dbN') & 1023).
+# COLDFRONT_SNOWFLAKE_NODE is any per-node UNIQUE integer 1..1023. Uniqueness is
+# required (snowflake ids and the bakery's per-node identity); the value is
+# otherwise arbitrary — the bakery matches acks by spock node name, not by id.
 services:
   db1:
     build: { context: ., dockerfile: docker/Dockerfile.duckdb15, args: { PG_MAJOR: "${PG_MAJOR:-18}" } }
@@ -20,7 +20,7 @@ services:
     environment:
       PG_MAJOR: "${PG_MAJOR:-18}"
       MESH: "on"
-      COLDFRONT_SNOWFLAKE_NODE: "691"
+      COLDFRONT_SNOWFLAKE_NODE: "1"
       COLDFRONT_WAREHOUSE: wh
       COLDFRONT_LAKEKEEPER: http://lakekeeper:8181/catalog
     healthcheck:
@@ -35,7 +35,7 @@ services:
     environment:
       PG_MAJOR: "${PG_MAJOR:-18}"
       MESH: "on"
-      COLDFRONT_SNOWFLAKE_NODE: "109"
+      COLDFRONT_SNOWFLAKE_NODE: "2"
       COLDFRONT_WAREHOUSE: wh
       COLDFRONT_LAKEKEEPER: http://lakekeeper:8181/catalog
     healthcheck:
@@ -50,7 +50,7 @@ services:
     environment:
       PG_MAJOR: "${PG_MAJOR:-18}"
       MESH: "on"
-      COLDFRONT_SNOWFLAKE_NODE: "672"
+      COLDFRONT_SNOWFLAKE_NODE: "3"
       COLDFRONT_WAREHOUSE: wh
       COLDFRONT_LAKEKEEPER: http://lakekeeper:8181/catalog
     healthcheck:
@@ -100,7 +100,8 @@ services:
       LAKEKEEPER__PG_ENCRYPTION_KEY: deadbeefdeadbeefdeadbeefdeadbeef
       LAKEKEEPER__LISTEN_PORT: 8181
     healthcheck:
-      test: ["CMD", "lakekeeper", "healthcheck"]
-      interval: 3s
-      timeout: 2s
-      retries: 10
+      test: ["CMD", "/home/nonroot/lakekeeper", "healthcheck"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 30s

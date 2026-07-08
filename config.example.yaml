@@ -54,6 +54,12 @@ s3:
 #   connection_string: "DefaultEndpointsProtocol=https;AccountName=<account>;AccountKey=<key>;EndpointSuffix=core.windows.net"
 
 archiver:
+  # Tiered tables live in coldfront.partition_config (replicated across a mesh);
+  # the archiver and partitioner read ONLY that table. Populate it with
+  # ./bin/archiver register (one table) or ./bin/archiver import --config <this
+  # file> (every table below, each validated exactly as register validates one).
+  # This tables: list is the import input and the export output format; it is not
+  # read at archive/partition time.
   tables:
     - source_table: "events"        # or "myschema.events"
       partition_period: "monthly"   # "monthly" or "daily"

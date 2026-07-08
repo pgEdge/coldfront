@@ -208,7 +208,7 @@ BEGIN
     PERFORM duckdb.raw_query($q$SET GLOBAL httpfs_client_implementation = 'httplib'$q$);
     -- httpfs (s3) already loaded as a side-effect of the ATTACH above; azure does
     -- not, so its lazy autoload would otherwise fire later as the non-superuser
-    -- app role and hit pg_duckdb's LocalFileSystem block (issue #17). Pre-load it
+    -- app role and hit pg_duckdb's LocalFileSystem block. Pre-load it
     -- here, while still in this SECURITY DEFINER (elevated) context.
     IF EXISTS (SELECT 1 FROM coldfront.storage_secret WHERE storage_type = 'azure') THEN
       PERFORM duckdb.raw_query('LOAD azure');
@@ -1536,10 +1536,9 @@ $$;
 --   1. Creates the Iceberg table via duckdb.raw_query('CREATE TABLE ice...').
 --   2. Creates a PG view <p_schema>.<p_table> that wraps iceberg_scan() with
 --      proper column projections (and view-cast for jsonb/interval).
---   3. Creates an INSTEAD OF INSERT trigger on the view that routes writes to
---      duckdb.raw_query('INSERT INTO ice...').
---   4. Registers the view in coldfront.tiered_views with is_iceberg_only=true,
---      so the post_parse_analyze hook routes UPDATE/DELETE to the cold path.
+--   3. Registers the view in coldfront.tiered_views with is_iceberg_only=true;
+--      the C post_parse_analyze hook then rewrites INSERT/UPDATE/DELETE on the
+--      view into cold-path duckdb.raw_query(...) DML.
 CREATE OR REPLACE FUNCTION coldfront.create_iceberg_table(
     p_schema         text,
     p_table          text,
@@ -1553,9 +1552,6 @@ DECLARE
     view_proj        text := '';
     placeholders     text := '';
     new_refs         text := '';
-    partition_clause text := '';
-    insert_fmt       text;
-    trig_fn          text;
     n                int  := 0;
     col              jsonb;
     col_name         text;
@@ -1661,21 +1657,15 @@ BEGIN
         format('SELECT * FROM ice.default.%s', p_table)
     );
 
-    -- 3. No INSTEAD OF INSERT trigger: the C post_parse_analyze hook intercepts
-    --    INSERT INTO <iceberg-only-view> (see coldfront.c emit_cold /
-    --    prefix_pg_tables_with_pglocal) and rewrites it into a single bulk
-    --    SELECT duckdb.raw_query('INSERT INTO ice.… VALUES/SELECT …') — one
-    --    Iceberg snapshot for the whole statement regardless of row count, so a
-    --    multi-row or parallel INSERT cannot incur per-row 409
-    --    CatalogCommitConflicts. INSERT … SELECT FROM <pg_source> gets each
-    --    PG-table reference prefixed with `pglocal.` so DuckDB's postgres
-    --    extension streams source rows over libpq with no local materialisation.
-
-    -- Drop a per-row insert trigger if one is present (e.g. left by an upgrade);
-    -- this view uses the hook-rewrite path above, not a trigger.
-    EXECUTE format(
-        'DROP TRIGGER IF EXISTS coldfront_iceonly_insert ON %I.%I',
-        p_schema, p_table);
+    -- 3. The C post_parse_analyze hook intercepts INSERT INTO the iceberg-only
+    --    view (see coldfront.c emit_cold / prefix_pg_tables_with_pglocal) and
+    --    rewrites it into a single bulk duckdb.raw_query('INSERT INTO ice.…
+    --    VALUES/SELECT …') — one Iceberg snapshot for the whole statement
+    --    regardless of row count, so a multi-row or parallel INSERT cannot incur
+    --    per-row 409 CatalogCommitConflicts. INSERT … SELECT FROM <pg_source>
+    --    gets each PG-table reference prefixed with `pglocal.` so DuckDB's
+    --    postgres extension streams source rows over libpq with no local
+    --    materialisation.
 
     -- 4. Registry row — is_iceberg_only=true tells the C hook to short-circuit
     --    classify_tier to TIER_COLD for any INSERT/UPDATE/DELETE on this view.
@@ -1737,6 +1727,28 @@ END $$;
 CREATE FUNCTION coldfront.node_id() RETURNS int
 LANGUAGE sql STABLE AS
 $$ SELECT current_setting('snowflake.node')::int $$;
+
+-- The local node's spock node name — the bakery's cross-node identity (acks are
+-- keyed by it). spock.local_node has only node_id + node_local_interface (no
+-- node_name column), and an unqualified node_name in a subquery against it
+-- silently resolves to an OUTER query's column, so we join to spock.node to read
+-- the local name explicitly. plpgsql (not sql) so the spock references resolve at
+-- call time: CREATE EXTENSION succeeds on a vanilla (spock-absent) install, where
+-- the bakery is never armed and this is never called.
+CREATE FUNCTION coldfront._my_spock_node_name() RETURNS name
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    v_name name;
+BEGIN
+    -- STRICT: fail clearly here if the local spock node is not configured
+    -- (no row) or ambiguous (more than one), rather than returning NULL and
+    -- surfacing later as an opaque claim_acks NOT NULL violation. No EXCEPTION
+    -- block, so no subtransaction (pg_duckdb rejects those).
+    SELECT ln.node_name INTO STRICT v_name
+      FROM spock.local_node l
+      JOIN spock.node ln ON ln.node_id = l.node_id;
+    RETURN v_name;
+END $$;
 
 -- ============================================================================
 -- Multi-writer commit serialisation (bakery protocol).
@@ -1802,16 +1814,17 @@ CREATE TABLE coldfront.claims (
 );
 
 -- Acks for the bakery's Ricart-Agrawala layer.  A row here means
--- "peer ack_from_node has acknowledged ticket on iceberg_table."  The
+-- "peer ack_from_name (its spock node name) has acknowledged ticket on
+-- iceberg_table."  The
 -- originator polls this table waiting for one row per live peer before
 -- entering the iceberg-commit phase.  Spock-replicated so peers'
 -- ack-INSERTs (from the peer-side trigger on coldfront.claims) reach
 -- the originator.
 CREATE TABLE coldfront.claim_acks (
     ticket          bigint NOT NULL,
-    ack_from_node   int    NOT NULL,
+    ack_from_name   name   NOT NULL,
     iceberg_table   text   NOT NULL,
-    PRIMARY KEY (ticket, ack_from_node)
+    PRIMARY KEY (ticket, ack_from_name)
 );
 
 -- Deferred acks queue, LOCAL to each node (NOT replicated).  When a peer
@@ -1893,6 +1906,7 @@ CREATE FUNCTION coldfront._on_claim_apply() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE
     my_node         int    := current_setting('snowflake.node')::int;
+    my_name         name   := coldfront._my_spock_node_name();
     connstr         text   := coldfront._dblink_self_connstr();
     -- Per-table advisory lock key. Pairs with the exclusive lock that
     -- _claim_iceberg_lock takes around its dblink-INSERT. Shared mode
@@ -1965,9 +1979,9 @@ BEGIN
             PERFORM public.dblink_connect('coldfront_self', connstr);
         END IF;
         PERFORM public.dblink_exec('coldfront_self', format(
-            'INSERT INTO coldfront.claim_acks (ticket, ack_from_node, iceberg_table) '
-            'VALUES (%s, %s, %L) ON CONFLICT DO NOTHING',
-            NEW.ticket, my_node, NEW.iceberg_table));
+            'INSERT INTO coldfront.claim_acks (ticket, ack_from_name, iceberg_table) '
+            'VALUES (%s, %L, %L) ON CONFLICT DO NOTHING',
+            NEW.ticket, my_name, NEW.iceberg_table));
     END IF;
     RETURN NULL;
 END $$;
@@ -1988,13 +2002,14 @@ CREATE FUNCTION coldfront._on_claim_release() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE
     my_node int := current_setting('snowflake.node')::int;
+    my_name name := coldfront._my_spock_node_name();
 BEGIN
     IF snowflake.get_node(OLD.ticket) <> my_node THEN
         RETURN NULL;
     END IF;
 
-    INSERT INTO coldfront.claim_acks (ticket, ack_from_node, iceberg_table)
-    SELECT ack_for_ticket, my_node, iceberg_table
+    INSERT INTO coldfront.claim_acks (ticket, ack_from_name, iceberg_table)
+    SELECT ack_for_ticket, my_name, iceberg_table
       FROM coldfront.deferred_acks
      WHERE pending_ticket = OLD.ticket
     ON CONFLICT DO NOTHING;
@@ -2027,18 +2042,9 @@ CREATE FUNCTION coldfront._claim_iceberg_lock(
 DECLARE
     connstr           text     := coldfront._dblink_self_connstr();
     my_node           int      := current_setting('snowflake.node')::int;
-    -- Real local spock node name. spock.local_node has only node_id +
-    -- node_local_interface (no node_name column) — an unqualified
-    -- node_name in a subquery against it silently resolves to the
-    -- OUTER query's column (e.g. n.node_name in the alive-check below),
-    -- so we explicitly join to spock.node to read the local name.
-    -- Without this fix the alive-check generates slot names with the
-    -- peer's node as "local", never matching any walsender, and every
-    -- peer is treated as dead → bakery skips required acks → race.
-    my_node_name      name     := (
-        SELECT ln.node_name FROM spock.local_node l
-          JOIN spock.node ln ON ln.node_id = l.node_id
-    );
+    -- Local spock node name, used for the ack-wait join and the liveness
+    -- slot-name computation (see coldfront._my_spock_node_name).
+    my_node_name      name     := coldfront._my_spock_node_name();
     my_ticket         bigint;
     -- Per-table advisory lock key (pairs with the shared lock taken in
     -- _on_claim_apply). Held EXCLUSIVELY in THIS session ONLY across
@@ -2062,6 +2068,15 @@ BEGIN
         RAISE EXCEPTION 'coldfront: configure GUC coldfront.dblink_self with a libpq connstr (e.g. ''host=/var/run/postgresql dbname=coldfront user=coldfront'')';
     END IF;
 
+    -- Same-node serialization: hold a node-local advisory xact lock for this
+    -- iceberg table across the whole claim+commit, so at most ONE cold writer
+    -- per node is in the bakery at once. That keeps per-node concurrency at 1
+    -- (the topology Bakery_v2 proves safe), so the cross-node Ricart-Agrawala
+    -- ack/defer only ever arbitrates a single same-node claim. Cross-node
+    -- writers are unaffected (advisory locks are instance-local); in the async
+    -- path this runs after the parquet upload, so same-node uploads pipeline.
+    PERFORM pg_advisory_xact_lock(hashtext('coldfront_iceberg:' || p_iceberg_table));
+
     -- Persistent named dblink connection (sessionful, opened once).
     -- The dblink session only touches coldfront.claims (never a tiered view),
     -- so the lazy 'ice' attach never fires and it never enters DuckDB territory.
@@ -2073,20 +2088,6 @@ BEGIN
             'SET statement_timeout = ''30s''');
     END IF;
 
-    -- Alignment precondition: snowflake.node = hashtext(spock node name)
-    -- & 1023.  Needed because the dead-peer detection in the ack-wait
-    -- loop maps each peer's snowflake.node back to a spock.node_name
-    -- via the same hash.  Cached per-session.
-    IF current_setting('coldfront._snowflake_aligned', true) IS DISTINCT FROM 'true' THEN
-        PERFORM 1
-           FROM spock.local_node l JOIN spock.node n ON n.node_id = l.node_id
-          WHERE (hashtext(n.node_name::text) & 1023) = my_node;
-        IF NOT FOUND THEN
-            RAISE EXCEPTION 'coldfront: snowflake.node = % does not match hashtext(local spock node name) & 1023; reconfigure snowflake.node in postgresql.conf and restart',
-                            my_node;
-        END IF;
-        PERFORM set_config('coldfront._snowflake_aligned', 'true', false);
-    END IF;
 
     -- NodeStartup self-cleanup of pre-restart orphans.  Cheap when no
     -- orphans exist (gated on a local EXISTS).
@@ -2151,7 +2152,7 @@ BEGIN
                AND NOT EXISTS (
                  SELECT 1 FROM coldfront.claim_acks a
                   WHERE a.ticket = my_ticket
-                    AND a.ack_from_node = (hashtext(n.node_name) & 1023)
+                    AND a.ack_from_name = n.node_name
                )
                AND EXISTS (
                  -- Per-peer alive check: match the walsender on us serving
@@ -2388,11 +2389,12 @@ $$;
 --      (by resolving tiered_views.hot_table / the view to OIDs — never by
 --      string match, so it is schema-agnostic);
 --   2. BLOCKS, with an actionable error: DROP TABLE / DROP VIEW / TRUNCATE
---      (would orphan/hide the cold tier) and any column-shape change —
---      ADD/DROP COLUMN, ALTER COLUMN TYPE, RENAME COLUMN. Column DDL is
---      blocked because duckdb-iceberg (pg_duckdb v1.1.1) implements no Iceberg
---      ALTER TABLE, so the hot and cold tiers cannot be evolved together;
---   3. SUPPORTS RENAME TABLE (hot heap) and RENAME VIEW — neither touches the
+--      (would orphan/hide the cold tier) and column changes whose type has
+--      no Iceberg mapping;
+--   3. MIRRORS column-shape changes - ADD/DROP COLUMN, ALTER COLUMN TYPE,
+--      RENAME COLUMN - onto the cold Iceberg tier through the bakery
+--      (_mirror_iceberg_alter), so both tiers evolve together;
+--   4. SUPPORTS RENAME TABLE (hot heap) and RENAME VIEW - neither touches the
 --      Iceberg schema. It updates the registry and rebuilds the transparent
 --      view + INSERT trigger from the current catalog state.
 --

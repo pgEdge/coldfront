@@ -1,9 +1,11 @@
 package main
 
 import (
+	"context"
 	"testing"
 
 	iceio "github.com/apache/iceberg-go/io"
+	"github.com/apache/iceberg-go/utils"
 )
 
 func TestStorageProps_S3Compat(t *testing.T) {
@@ -84,5 +86,59 @@ func TestStorageProps_AzureMalformed(t *testing.T) {
 	c.Azure.ConnectionString = "DefaultEndpointsProtocol=https;EndpointSuffix=core.windows.net"
 	if _, err := c.storageProps(); err == nil {
 		t.Fatal("expected error for connection string missing AccountName/AccountKey")
+	}
+}
+
+func TestWithColdStoreSigning_GCS(t *testing.T) {
+	// TLS S3-compatible endpoint (GCS interop): an aws.Config carrying the
+	// signing adjustments must ride the context.
+	c := &Config{}
+	c.S3.Endpoint = "storage.googleapis.com"
+	c.S3.UseSSL = true
+	c.S3.AccessKey = "GOOGTESTHMAC"
+	c.S3.SecretKey = "secret"
+	ctx, err := withColdStoreSigning(context.Background(), c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	awscfg := utils.GetAwsConfig(ctx)
+	if awscfg == nil {
+		t.Fatal("expected an aws.Config on the context for a TLS S3 endpoint")
+	}
+	if len(awscfg.APIOptions) == 0 {
+		t.Fatal("expected the signing-exclusion middleware in APIOptions")
+	}
+}
+
+func TestWithColdStoreSigning_NoOverride(t *testing.T) {
+	// Plain-http S3 (SeaweedFS/MinIO), no-endpoint AWS native, and Azure stay
+	// on SDK defaults: context returned unchanged.
+	cases := map[string]func(*Config){
+		"seaweedfs-http": func(c *Config) {
+			c.S3.Endpoint = "seaweedfs:8333"
+			c.S3.AccessKey = "admin"
+			c.S3.SecretKey = "adminsecret"
+		},
+		"aws-native-no-endpoint": func(c *Config) {
+			c.S3.Region = "eu-west-1"
+			c.S3.AccessKey = "AKIA"
+			c.S3.SecretKey = "secret"
+		},
+		"azure": func(c *Config) {
+			c.Azure.ConnectionString = "DefaultEndpointsProtocol=https;AccountName=a;AccountKey=a2V5;EndpointSuffix=core.windows.net"
+		},
+	}
+	for name, setup := range cases {
+		t.Run(name, func(t *testing.T) {
+			c := &Config{}
+			setup(c)
+			ctx, err := withColdStoreSigning(context.Background(), c)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if utils.GetAwsConfig(ctx) != nil {
+				t.Fatalf("%s must not adjust signing (GCS-only)", name)
+			}
+		})
 	}
 }

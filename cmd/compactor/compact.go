@@ -3,11 +3,18 @@ package main
 import (
 	"context"
 	"fmt"
+	"strings"
 
 	"github.com/apache/iceberg-go/catalog"
 	"github.com/apache/iceberg-go/catalog/rest"
+	iceio "github.com/apache/iceberg-go/io"
+	"github.com/apache/iceberg-go/io/gocloud"
 	"github.com/apache/iceberg-go/table"
 	"github.com/apache/iceberg-go/table/compaction"
+	"github.com/apache/iceberg-go/utils"
+	"github.com/aws/aws-sdk-go-v2/aws"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 // openCatalog connects to the Lakekeeper REST catalog for the deployment's
@@ -21,6 +28,79 @@ func openCatalog(ctx context.Context, cfg *Config) (*rest.Catalog, error) {
 	return rest.NewCatalog(ctx, "lakekeeper", cfg.Iceberg.LakekeeperEndpoint,
 		rest.WithWarehouseLocation(cfg.Iceberg.Warehouse),
 		rest.WithAdditionalProps(props))
+}
+
+// withColdStoreSigning adapts SigV4 signing for an S3-compatible cold store
+// reached over TLS (GCS via its S3-interop endpoint), which requires:
+//   - Accept-Encoding NOT covered by the signature (Google's frontend rewrites
+//     the header before verifying, so a signed value never matches), and
+//   - no CRC32 upload checksum (it rides an aws-chunked streaming body the
+//     endpoint does not accept); WhenRequired computes checksums only for
+//     operations that mandate one.
+//
+// SeaweedFS/MinIO (plain http) and real AWS S3 (no custom endpoint) verify the
+// SDK defaults correctly and are left alone; Azure is not S3. The adapted
+// aws.Config rides the context: iceberg-go's gocloud backend prefers a
+// caller-supplied config (utils.GetAwsConfig) over building its own, and the
+// table's file IO is created lazily with the call-site context, so every
+// downstream read/commit inherits it.
+func withColdStoreSigning(ctx context.Context, cfg *Config) (context.Context, error) {
+	props, err := cfg.storageProps()
+	if err != nil {
+		return nil, err
+	}
+	if !strings.HasPrefix(props[iceio.S3EndpointURL], "https://") {
+		return ctx, nil
+	}
+	awscfg, err := gocloud.ParseAWSConfig(ctx, props)
+	if err != nil {
+		return nil, err
+	}
+	awscfg.APIOptions = append(awscfg.APIOptions, excludeFromSigning("Accept-Encoding"))
+	awscfg.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
+	return utils.WithAwsConfig(ctx, awscfg), nil
+}
+
+type ignoredHeadersKey struct{}
+
+// excludeFromSigning returns a middleware installer that hides the named
+// headers from the SigV4 signer: removed immediately before the "Signing"
+// finalize step, restored immediately after, so they go on the wire unsigned.
+func excludeFromSigning(headers ...string) func(*middleware.Stack) error {
+	return func(stack *middleware.Stack) error {
+		drop := middleware.FinalizeMiddlewareFunc("ExcludeFromSigning",
+			func(ctx context.Context, in middleware.FinalizeInput, next middleware.FinalizeHandler) (middleware.FinalizeOutput, middleware.Metadata, error) {
+				req, ok := in.Request.(*smithyhttp.Request)
+				if !ok {
+					return next.HandleFinalize(ctx, in)
+				}
+				ignored := make(map[string][]string, len(headers))
+				for _, h := range headers {
+					if v, present := req.Header[h]; present {
+						ignored[h] = v
+						req.Header.Del(h)
+					}
+				}
+				ctx = middleware.WithStackValue(ctx, ignoredHeadersKey{}, ignored)
+				return next.HandleFinalize(ctx, in)
+			})
+		restore := middleware.FinalizeMiddlewareFunc("RestoreExcludedFromSigning",
+			func(ctx context.Context, in middleware.FinalizeInput, next middleware.FinalizeHandler) (middleware.FinalizeOutput, middleware.Metadata, error) {
+				req, ok := in.Request.(*smithyhttp.Request)
+				if !ok {
+					return next.HandleFinalize(ctx, in)
+				}
+				ignored, _ := middleware.GetStackValue(ctx, ignoredHeadersKey{}).(map[string][]string)
+				for h, v := range ignored {
+					req.Header[h] = v
+				}
+				return next.HandleFinalize(ctx, in)
+			})
+		if err := stack.Finalize.Insert(drop, "Signing", middleware.Before); err != nil {
+			return err
+		}
+		return stack.Finalize.Insert(restore, "Signing", middleware.After)
+	}
 }
 
 // planResult bundles the rewrite groups with the planner's summary (for logging

@@ -1,4 +1,6 @@
--- Verify the extension loads and its catalog table exists.
+-- Verify the extension loads and its catalog table exists. coldfront requires
+-- pg_duckdb (coldfront.control), so install it first.
+CREATE EXTENSION IF NOT EXISTS pg_duckdb;
 CREATE EXTENSION IF NOT EXISTS coldfront;
 
 SELECT count(*) FROM coldfront.tiered_views;

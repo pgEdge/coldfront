@@ -48,7 +48,7 @@ compactor --config deploy.yaml --table events --expire-snapshots --orphans
 ```
 
 The config is the same deployment YAML the archiver reads - `postgres.dsn`
-(used to take the bakery claim),
+(for the bakery claim),
 `iceberg.{warehouse, lakekeeper_endpoint, namespace}`, and exactly one
 cold-store stanza.
 

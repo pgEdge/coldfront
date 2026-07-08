@@ -14,10 +14,10 @@ covers what is specific to decoupled mode.
 
 ## What "decoupled" means
 
-The table below contrasts each concern between the existing tiered mode
-and the decoupled mode described in this document:
+The table below contrasts each concern between tiered mode and
+decoupled mode described in this document:
 
-| Concern | Tiered mode (existing) | Decoupled mode (this doc) |
+| Concern | Tiered mode | Decoupled mode (this doc) |
 |---|---|---|
 | Hot rows | PG heap (`_events` partitioned) | - (no hot rows) |
 | Cold rows | Iceberg via Lakekeeper | All rows in Iceberg |
@@ -25,8 +25,8 @@ and the decoupled mode described in this document:
 | INSTEAD-OF trigger | Bypassed when coldfront is preloaded; remains as fallback when it isn't | - (none) |
 | `post_parse_analyze_hook` | Rewrites INSERT/UPDATE/DELETE per tier | Rewrites every INSERT/UPDATE/DELETE on the wrapper view to a single `duckdb.raw_query(...)` against the Iceberg ref |
 | Archiver | Moves rows hot → cold on cron | - (nothing to archive) |
-| `coldfront.tiered_views` row | Required per managed table | - (table is not "managed" in tiered sense) |
-| Required at runtime | `pg_duckdb`, `coldfront`, Lakekeeper, S3 | `pg_duckdb`, `coldfront` (for lazy catalog ATTACH only), Lakekeeper, S3 |
+| `coldfront.tiered_views` row | Required per managed table | Required (with `is_iceberg_only = true`); registered by `create_iceberg_table()` |
+| Required at runtime | `pg_duckdb`, `coldfront`, Lakekeeper, S3 | `pg_duckdb`, `coldfront` (lazy catalog ATTACH + DML rewrite + write serialization), Lakekeeper, S3 |
 
 The coldfront extension provides the lazy catalog-attach glue: the C
 extension hook intercepts the first query that touches a tiered view
@@ -112,9 +112,9 @@ gap of decoupled mode without a PG-side wrapper view.
 
 ## Supported column types
 
-The supported column types are exactly the set that already
-round-trips cleanly between PG and Iceberg in the existing tiered mode
-(see `pgFormatTypeToDuckDB` in
+The supported column types are exactly the set that round-trips
+cleanly between PG and Iceberg (shared with tiered mode; see
+`pgFormatTypeToDuckDB` in
 [cmd/archiver/main.go](https://github.com/pgEdge/ColdFront/blob/main/cmd/archiver/main.go)). Anything outside this
 list is rejected at table-creation time.
 
@@ -281,9 +281,9 @@ PG nodes pointing at the same Lakekeeper endpoint and S3 bucket.
 
   - `coldfront.claims` - each writer inserts `(iceberg_table, ticket)`
     here; deleted on release.
-  - `coldfront.claim_acks` - peers insert `(ticket, ack_from_node,
-    iceberg_table)` to acknowledge an originator's claim. Replicates
-    back to the originator.
+  - `coldfront.claim_acks` - peers insert `(ticket, ack_from_name,
+    iceberg_table)` to acknowledge an originator's claim, keyed by the
+    acker's spock node name. Replicates back to the originator.
 
   Locally on every node, `coldfront.deferred_acks` queues acks the
   node has *deferred* because it has its own pending claim with a
@@ -299,9 +299,13 @@ PG nodes pointing at the same Lakekeeper endpoint and S3 bucket.
      ticket (its row appears in `coldfront.claim_acks`).
   4. Issue the iceberg `duckdb.raw_query(...)` write - exactly one
      uncontested commit at Lakekeeper.
-  5. Delete the claim by ticket (autonomous dblink). The release
-     trigger drains `coldfront.deferred_acks` for that ticket,
-     emitting any acks the node had been holding back.
+  5. Release at PG outer-transaction end (COMMIT or ABORT): the
+     ticket is enqueued at claim time (`_enqueue_release`) and the
+     C `XactCallback` deletes the claim over a loopback connection,
+     running after pg_duckdb's callback so the Iceberg snapshot has
+     already committed (or rolled back). The release trigger drains
+     `coldfront.deferred_acks` for that ticket, emitting any acks
+     the node had been holding back.
 
   Peer-side, when Spock applies an incoming claim INSERT, an
   `ENABLE REPLICA` trigger (`coldfront._on_claim_apply`) decides:
@@ -316,9 +320,13 @@ PG nodes pointing at the same Lakekeeper endpoint and S3 bucket.
   The protocol works across **any number of writers per node** -
   each call holds its own unique ticket; release deletes by ticket
   only, so concurrent backends on the same node coexist cleanly.
-  Same-node writers serialise on a local read of `coldfront.claims`
-  (snowflake tickets are per-node monotonic + timestamped, so a
-  smaller ticket means `nextval` was called earlier on this node).
+  Same-node writers serialise on a node-local advisory transaction
+  lock per Iceberg table, held across the whole claim + commit, so
+  at most one same-node writer is inside the bakery at a time; the
+  wait loop also requires that no same-node claim with a smaller
+  ticket exists on the table (snowflake tickets are per-node
+  monotonic + timestamped, so a smaller ticket means `nextval` was
+  called earlier on this node).
 
   The wait phase has no explicit timeout. R-A's only failure mode
   is a dead peer (would block forever), and we close it via a
@@ -337,7 +345,7 @@ PG nodes pointing at the same Lakekeeper endpoint and S3 bucket.
   (`_claim_iceberg_lock`, `_release_iceberg_lock`,
   `_on_claim_apply`, `_on_claim_release`, `_exec_iceberg_with_claim`)
   and the C-side rewrite in [extension/coldfront/src/coldfront.c](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/src/coldfront.c)
-  (`wrap_cold_in_exec_with_claim`).
+  (`cold_exec_call`).
 
   Because every commit is uncontested, the duckdb-iceberg writer
   never has to deal with a 409 - no rebase-retry loop needed at
@@ -345,9 +353,10 @@ PG nodes pointing at the same Lakekeeper endpoint and S3 bucket.
   bakery sidesteps the requirement.)
 
 - **DDL replication.** Spock's `ddl_sql` repset replicates
-  `CREATE/ALTER/DROP` of the wrapper view + `coldfront.tiered_views`
-  registry rows, so a `coldfront.create_iceberg_table()` call on one
-  node propagates to peers automatically.
+  `CREATE/ALTER/DROP` of the wrapper view, but the
+  `coldfront.tiered_views` registry row does not replicate - run
+  `coldfront.create_iceberg_table()` (idempotent, name-keyed) on
+  each node to arm the hook there.
 
 ### Throughput characterisation
 
@@ -373,10 +382,10 @@ wal_receiver_status_interval = 1s
 ```
 
 ```ini
-# postgresql.conf — per-node. snowflake.node MUST equal
-# (hashtext(<spock node_name>) & 1023) or the bakery raises at first claim:
-# it maps each ticket back to a spock node_name via the same hash for
-# dead-peer detection.
+# postgresql.conf — per-node. snowflake.node is any integer 1..1023, unique per
+# node; the value is otherwise arbitrary. The bakery matches acks by spock node
+# name (dead-peer detection joins claim_acks.ack_from_name to spock.node), so it
+# imposes no relationship between snowflake.node and the node name.
 snowflake.node = 1     # node1
 # snowflake.node = 2   # node2
 # snowflake.node = 3   # node3
@@ -407,7 +416,8 @@ SELECT coldfront._ensure_claims_replicated();
 
 The helper is idempotent. Without it on a peer, that peer's ack
 INSERTs are local-only and never replicate back to the originating
-writer - every claim ack-waits to timeout.
+writer: every claim on the originator waits forever at the ack
+barrier.
 
 `coldfront.create_iceberg_table()` calls `_ensure_claims_replicated()`
 on the node it runs on, but that only registers the repset on *that*
@@ -430,18 +440,22 @@ Decoupled (iceberg-only) is the right choice when:
   architecture_tiered.md → Tiered-specific limitations), no PK rebuild
   after bulk load, no partition-management script.
 - You can tolerate the isolation gap (cross-query snapshot
-  consistency) and the verbose `iceberg_scan` / `raw_query` syntax.
+  consistency). Tables created via `create_iceberg_table()` are
+  queried with plain SQL through the wrapper view; the verbose
+  `iceberg_scan` / `raw_query` syntax applies only to tables used
+  without the helper.
 - You want true storage/compute decoupling - adding compute = `docker
   run` a new PG node, no data sync.
 
-Tiered (existing default) remains the right choice when:
+Tiered (the default) is the right choice when:
 
 - The workload has a strong recent-row OLTP component that needs
   PG-native point lookups, indexes, and transactional UPDATE/DELETE
   ergonomics.
-- The application queries through a stable named relation (`events`)
-  and you don't want to refactor every query to use `iceberg_scan(...)`
-  or `raw_query(...)`.
+- The application queries through a stable named relation (`events`).
+  Decoupled tables created via `create_iceberg_table()` also provide
+  this through the wrapper view; only tables used without the helper
+  need the `iceberg_scan(...)` or `raw_query(...)` forms.
 - You need full PG ACID isolation across the whole table.
 
 ## Limitations

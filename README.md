@@ -66,10 +66,10 @@ Application
 ## Installation
 
 ColdFront is open source under the PostgreSQL License and runs on stock
-PostgreSQL 16, 17, and 18. The full build workflow lives in
-**[INSTALL.md](docs/installation.md)**: build the DuckDB 1.5.x base and the
-coldfront layer with one `docker build`, or install bare-metal. Then
-continue with the Quickstart below.
+PostgreSQL 16, 17, and 18. The full build workflow lives in the
+**[Installation guide](docs/installation.md)**: build the thin coldfront
+layer on top of the published DuckDB 1.5.x base image (or build the base
+yourself), or install bare-metal. Then continue with the Quickstart below.
 
 **Setting up on cloud S3?** Once the image is built, the
 **[S3 setup guide](docs/object_store.md)** takes you from an empty bucket to
@@ -105,13 +105,13 @@ The following table lists the ColdFront guides and what each one covers:
 
 | Doc | Contents |
 |---|---|
-| **[USAGE.md](docs/usage.md)** | Day-to-day use - both modes plus the standalone partition manager, one-time setup, reading/writing, supported types, the partition CLI, storage backends, distributed (mesh) setup, tuning |
-| **[INSTALL.md](docs/installation.md)** | Build from source (Docker or bare-metal); Testing & CI |
-| **[S3_HOWTO.md](docs/object_store.md)** | Get ColdFront running on cloud S3 (virtual-hosted), end-to-end |
-| **[COMPACTOR.md](docs/compaction.md)** | Cold-tier table maintenance - compaction, snapshot expiry, orphan-file removal |
-| **[ARCHITECTURE.md](docs/architecture.md)** | Shared architecture and core mechanics |
-| **[ARCHITECTURE_TIERED.md](docs/architecture_tiered.md)** | Tiered (hot PG + cold Iceberg) deep dive |
-| **[ARCHITECTURE_DECOUPLED.md](docs/architecture_decoupled.md)** | Decoupled (iceberg-only) deep dive |
+| **[Usage](docs/usage.md)** | Day-to-day use - both modes plus the standalone partition manager, one-time setup, reading/writing, supported types, the partition CLI, storage backends, distributed (mesh) setup, tuning |
+| **[Installation](docs/installation.md)** | Build from source (Docker or bare-metal); Testing & CI |
+| **[Object store setup](docs/object_store.md)** | Get ColdFront running on cloud S3 (virtual-hosted), end-to-end |
+| **[Compaction](docs/compaction.md)** | Cold-tier table maintenance - compaction, snapshot expiry, orphan-file removal |
+| **[Architecture](docs/architecture.md)** | Shared architecture and core mechanics |
+| **[Architecture: tiered](docs/architecture_tiered.md)** | Tiered (hot PG + cold Iceberg) deep dive |
+| **[Architecture: decoupled](docs/architecture_decoupled.md)** | Decoupled (iceberg-only) deep dive |
 
 ## Least-privilege application roles
 
@@ -123,58 +123,22 @@ Onboarding an application role is a single call:
 SELECT coldfront.grant_app_access('alice');
 ```
 
-grant_app_access grants only the minimum the cold path needs, all
-derived from the registry rather than hardcoded: membership in
-duckdb.postgres_role, schema USAGE, SELECT on the registry, DML on every
-registered view, and EXECUTE on the runtime cold-path functions. The
+grant_app_access grants only the minimum the cold path needs: membership
+in duckdb.postgres_role, schema USAGE, SELECT on the registry, DML on
+every registered view and the hot table and sequences behind it (all
+derived from the registry, not hardcoded), plus EXECUTE on a fixed
+allow-list of runtime cold-path functions. The
 call is idempotent and is not executable by PUBLIC, so an application
 role can never self-grant. The role is never granted
 pg_read_server_files or pg_write_server_files, so it has no host-file
 access. CREATE ROLE and GRANT both replicate over Spock, so you onboard
 a role once on any node and it propagates across the mesh.
 
-**How a non-superuser reaches Iceberg.** pg_duckdb force-disables DuckDB's
-`LocalFileSystem` for non-superusers, which would block the side-loaded
-iceberg/postgres DuckDB extensions from loading on `ATTACH`. ColdFront's
-attach helpers `coldfront.ensure_attached()` / `ensure_pg_attached()` are
-therefore `SECURITY DEFINER` (with a pinned `search_path`): the extension
-load + `ATTACH` run elevated once per session, and because the DuckDB
-instance is per-backend the attach persists, so every subsequent read
-(`iceberg_scan`) and write (`_exec_iceberg_with_claim`) runs as the **app
-role** over S3/httpfs - no `LocalFileSystem`, no elevation.
-
-**Hardening.** Because the attach helpers run elevated, the
-deployment-config GUCs they consume - `coldfront.warehouse`,
-`coldfront.lakekeeper_endpoint`, `coldfront.local_pg_dsn` - are registered
-`PGC_SUSET` (superuser-set-only), so a non-superuser cannot redirect the
-elevated `ATTACH` at an attacker endpoint; `local_pg_dsn` is additionally
-`GUC_SUPERUSER_ONLY` (it may carry credentials). Operators set these in
-`postgresql.conf` as before.
-
-**Turnkey.** The image defaults `duckdb.postgres_role = coldfront_duckdb`
-and creates that NOLOGIN role at init, so the non-superuser path works out
-of the box - `grant_app_access` is the only step. Set
-`COLDFRONT_DUCKDB_ROLE=''` to keep pg_duckdb's stock superuser-only
-behaviour. Superusers are unaffected either way.
-
-**Spock mesh.** `CREATE ROLE` and `GRANT` both replicate via Spock DDL, so
-create the role + run `grant_app_access` **once on any one node** - the role
-and every grant propagate to the whole mesh. Don't repeat them per-node (a
-repeated `CREATE ROLE` is a harmless local "already exists" error, just
-unnecessary). Mesh cold *writes* route through the Ricart-Agrawala bakery,
-whose coordination functions (`_claim_iceberg_lock` /
-`_release_iceberg_lock`) are `SECURITY DEFINER` so a non-superuser drives the
-cross-node serialization (reading `pg_stat_replication` liveness + dblinking
-the claim) with the right privilege - verified **protocol-neutral** against
-the TLA+ model (`docs/formal/`). Least privilege therefore holds for writes
-in a mesh too, not just single-node.
-
-The whole boundary is asserted end-to-end by the journey's
-`story_app_privilege` (non-superuser tiered read+write; in a mesh,
-cross-node read + a SECURITY DEFINER-bakery cold write from a peer), by
-`ci/ops.sh` check 3 (the role cannot redirect the endpoint, cannot
-self-grant, and an un-onboarded role is cleanly denied), and at the catalog
-level by the `privilege_model` pg_regress test.
+For how the non-superuser path works under the hood - the `SECURITY
+DEFINER` attach helpers, the `PGC_SUSET` / `GUC_SUPERUSER_ONLY` config
+hardening, the turnkey `duckdb.postgres_role` default, and how least
+privilege holds across a Spock mesh - see [Architecture: non-superuser
+app roles](docs/architecture.md#non-superuser-app-roles-least-privilege).
 
 ## Caveats
 
@@ -208,6 +172,7 @@ pgedge-coldfront/
 │   ├── matrix.sh               ← drives PG×topology×mode×target cells (--quick / --full)
 │   ├── ops.sh                  ← operational checks (privilege model, Lakekeeper-down, S3-down)
 │   ├── probe-standby.sh        ← risk gate: iceberg_scan on a read-only hot standby
+│   ├── probe-snowflake.sh      ← risk gate: snowflake id↔epoch math vs the live extension
 │   ├── lib.sh                  ← shared step/assert/psql helpers
 │   ├── topo/                   ← vanilla.sh (1 node) · mesh.sh (3-node Spock)
 │   └── runbooks/               ← failover-patroni.md (failover delegated to Patroni)
@@ -215,15 +180,18 @@ pgedge-coldfront/
 │   ├── Dockerfile.duckdb15-base ← DuckDB 1.5.x base (pg_duckdb 1.5.4 + patched iceberg)
 │   ├── Dockerfile.duckdb15      ← thin coldfront app layer (ARG PG_MAJOR=16|17|18)
 │   ├── iceberg-*.patch          ← duckdb-iceberg patches (bakery commit-refresh + strict-reader interop)
+│   ├── iceberg-azure-extension-config-v15.cmake ← Azure ADLS extension build config
 │   ├── entrypoint.sh
 │   └── seaweedfs-s3.json        ← SeaweedFS S3 auth config (example)
 ├── docs/                       ← MkDocs site (user docs; mkdocs.yml at repo root)
 │   ├── index.md · installation.md · object_store.md · usage.md · compaction.md
-│   ├── architecture.md · architecture_tiered.md · architecture_decoupled.md
+│   ├── architecture.md · architecture_tiered.md · architecture_decoupled.md · changelog.md
 │   └── formal/                 ← TLA+ model of the bakery protocol (Bakery_v2.tla)
 ├── docker-compose.yml          ← END-USER single-node stack (ports published)
 ├── docker-compose.matrix.yml   ← CI only: single-node vanilla matrix
+├── docker-compose.matrix-azure.yml ← CI only: vanilla matrix on Azure ADLS
 ├── docker-compose.mesh.yml     ← CI only: 3-node Spock mesh
+├── docker-compose.mesh-azure.yml ← CI only: 3-node Spock mesh on Azure ADLS
 ├── run-ci-local.sh             ← pre-commit gate (ci/matrix.sh --quick)
 ├── config.example.yaml · Makefile · mkdocs.yml
 ├── DUCKDB_1.5_PATCHED.md       ← the patched DuckDB 1.5 base: what's patched + how it's built
