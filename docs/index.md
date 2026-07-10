@@ -42,24 +42,27 @@ ColdFront runs inside PostgreSQL and rewrites each statement to the
 correct tier, so the application sees one relation:
 
 ```text
-Application
-  |
-  |-- SELECT * FROM events            reads hot + cold transparently
-  |-- INSERT INTO events ...          hot via PG, cold via raw_query
-  |-- UPDATE events SET ... WHERE ... rewritten to the right tier
-  |-- DELETE FROM events WHERE ...    rewritten to the right tier
-         |
-  PostgreSQL 16/17/18 + pg_duckdb + coldfront
-    _events (partitioned hot data, native PG)
-    events  VIEW (hot + cold, replaces the original table)
-    coldfront extension (rewrites DML to the right tier)
-    pg_duckdb (Iceberg reads + writes via DuckDB, in-process)
-         |
-  Lakekeeper (Iceberg REST catalog)
-         |
-  S3-compatible object store (Parquet data + Iceberg metadata)
-         |
-  Archiver (Go binary, cron) moves expired PG partitions to Iceberg
+                       Application
+                            │
+              SELECT / INSERT / UPDATE / DELETE
+              against one relation: "events"
+                            │
+                 PostgreSQL 16 / 17 / 18
+        events VIEW: reads union hot + cold
+        coldfront extension: rewrites writes to the right tier
+              ┌─────────────┴───────────────┐
+              │                             │
+          hot tier                      cold tier
+      _events: native PG            pg_duckdb: in-process
+      range partitions              DuckDB, Iceberg reads + writes
+              │                             │
+              │                   Lakekeeper (Iceberg REST catalog)
+              │                             │
+              │                   object store, S3 / Azure / GCS
+              │                   (Parquet data + Iceberg metadata)
+              │                             ▲
+              └──── Archiver (Go, cron) ────┘
+                    moves partitions past the hot window: hot → cold
 ```
 
 ## Quickstart
