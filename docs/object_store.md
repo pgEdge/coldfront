@@ -30,6 +30,12 @@ Before you begin, gather the following:
   > field for a session token, so single sign-on (SSO) or temporary
   > session-token credentials do **not** work here. Use a permanent
   > access-key pair with no expiry.
+  >
+  > This applies to the warehouse's own credential. A deployment that
+  > must not store any object-store credential in the database can use
+  > vended credentials instead, where the warehouse mints short-lived
+  > per-table credentials at access time; see
+  > [usage.md](usage.md#vended-minted-credentials).
 
 - **Permissions** - the key needs read/write/list on the bucket
   (`GetObject` / `PutObject` / `DeleteObject` / `ListBucket`). Example
@@ -146,6 +152,53 @@ curl -X POST http://localhost:8181/management/v1/warehouse \
 
 The `key-prefix` is an arbitrary path inside the bucket; `coldfront` is
 just an example.
+
+**Vended-credentials variant.** To run ColdFront with no stored
+credential ([usage.md](usage.md#vended-minted-credentials)), the
+warehouse mints per-table STS credentials instead of handing the client
+a static key. Two things change from the warehouse above.
+
+First, an IAM role scoped to the bucket. Lakekeeper assumes it per table
+and vends the resulting short-lived key, secret, and session token to
+ColdFront. Its permission policy grants `GetObject` / `PutObject` /
+`DeleteObject` / `ListBucket` (plus the multipart actions) on the bucket
+and `arn:aws:s3:::my-iceberg-bucket/*`. Its trust policy lets the
+warehouse credential's own IAM identity assume it, gated by an
+`ExternalId` that Lakekeeper must present (confused-deputy protection):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {"AWS": "arn:aws:iam::<account-id>:user/<warehouse-iam-user>"},
+    "Action": "sts:AssumeRole",
+    "Condition": {"StringEquals": {"sts:ExternalId": "<shared-secret>"}}
+  }]
+}
+```
+
+Second, the warehouse: set `sts-enabled: true` and `assume-role-arn` in
+the `storage-profile`, and add the matching `external-id` to the
+`storage-credential` (which stays the warehouse's own long-term key):
+
+```json
+"storage-profile": {
+  "...": "...(bucket, region, path-style-access:false, flavor:aws as above)",
+  "sts-enabled": true,
+  "assume-role-arn": "arn:aws:iam::<account-id>:role/<role-that-scopes-the-bucket>"
+},
+"storage-credential": {
+  "type": "s3", "credential-type": "access-key",
+  "aws-access-key-id": "AKIAEXAMPLE...", "aws-secret-access-key": "<your-secret-key>",
+  "external-id": "<shared-secret>"
+}
+```
+
+An `external-id` is **required** with `assume-role-arn`; the `<shared-secret>`
+in the warehouse and in the role's trust condition must match. On the
+database side, replace the `set_storage_secret(...)` call in Section 4
+with `SELECT coldfront.set_storage_secret_vended();`.
 
 ### 3c. Pre-create the `default` namespace
 

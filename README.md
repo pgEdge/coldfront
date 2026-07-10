@@ -99,6 +99,11 @@ INSERT INTO events VALUES (1, now(), 'hello');
 SELECT count(*) FROM events;
 ```
 
+For compliance environments that cannot store an object-store credential,
+`coldfront.set_storage_secret_vended()` runs with no credential in the
+database: Lakekeeper mints short-lived per-table credentials at access
+time. See [Vended credentials](docs/usage.md#vended-minted-credentials).
+
 ## Documentation
 
 The following table lists the ColdFront guides and what each one covers:
@@ -207,7 +212,7 @@ against:
 |-----------|---------|---------|
 | PostgreSQL | 16, 17, or 18 | Database with native partitioning (stock upstream; no fork) |
 | pg_duckdb | 1.5.4 (PR #1025) | Iceberg reads + writes via DuckDB in-process |
-| duckdb-iceberg | `v1.5-variegata` @ `0fad545a`, patched | Iceberg catalog/IO for DuckDB; carries ColdFront's four patches (see [DUCKDB_1.5_PATCHED.md](DUCKDB_1.5_PATCHED.md)) |
+| duckdb-iceberg | `v1.5-variegata` @ `5edc45f0`, patched | Iceberg catalog/IO for DuckDB; carries ColdFront's three patches (see [DUCKDB_1.5_PATCHED.md](DUCKDB_1.5_PATCHED.md)) |
 | Lakekeeper | latest | Iceberg REST catalog (Rust binary) |
 | S3-compatible store | any | SeaweedFS, MinIO, GCS, Azure Blob, etc. |
 

@@ -86,6 +86,11 @@ INSERT INTO events VALUES (1, now(), 'hello');
 SELECT count(*) FROM events;
 ```
 
+For compliance environments that cannot store an object-store credential,
+`coldfront.set_storage_secret_vended()` runs with no credential in the
+database: Lakekeeper mints short-lived per-table credentials at access
+time. See [Vended credentials](usage.md#vended-minted-credentials).
+
 ## Least-privilege application roles
 
 Application roles need no superuser and no server-file access, yet they

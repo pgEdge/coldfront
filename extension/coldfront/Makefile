@@ -22,7 +22,7 @@ REGRESS     = load_order update_unregistered_view update_heap_table \
               ddl_alter_column ddl_rename_table ddl_rename_view \
               ddl_partition_passthrough bakery_wraps_cold_writes \
               param_cold_via_plpgsql async_requires_patch \
-              storage_secret_azure privilege_model \
+              storage_secret_azure storage_secret_vended privilege_model \
               partition_config_interval self_join_rejected returning_cold_rejected
 REGRESS_OPTS = --inputdir=test --outputdir=test
 

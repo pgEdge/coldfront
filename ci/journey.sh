@@ -65,7 +65,11 @@ esac; done
 
 # storage_secret_sql — the SQL that sets the cold-store credential, per backend.
 storage_secret_sql() {
-    if [ "$BACKEND" = azure ]; then
+    if [ "$BACKEND" = vended ]; then
+        # Vended (minted) creds: no credential stored. Lakekeeper mints per-table
+        # STS creds and ensure_attached() uses ACCESS_DELEGATION_MODE VENDED_CREDENTIALS.
+        printf "SELECT coldfront.set_storage_secret_vended();"
+    elif [ "$BACKEND" = azure ]; then
         printf "SELECT coldfront.set_storage_secret_azure('%s');" "$AZURE_CONN"
     elif [ "$BACKEND" = gcs ]; then
         # GCS via S3-interop: same s3 setter, GCS endpoint + HMAC + TLS.
@@ -81,7 +85,11 @@ storage_secret_sql() {
 
 # storage_yaml — the cold-store block for an archiver YAML config, per backend.
 storage_yaml() {
-    if [ "$BACKEND" = azure ]; then
+    if [ "$BACKEND" = vended ]; then
+        # Vended: the YAML carries NO storage block. The archiver reads
+        # coldfront.storage_secret.vended and attaches with credential vending.
+        printf ''
+    elif [ "$BACKEND" = azure ]; then
         printf 'azure:\n  connection_string: "%s"' "$AZURE_CONN"
     elif [ "$BACKEND" = gcs ]; then
         # GCS = the s3 block pointed at the interop endpoint over TLS, HMAC creds.
@@ -118,6 +126,10 @@ EOSQL
     assert_eq "extensions present" "2" "$ext"
     local secret; secret=$(q "$HOST" "SELECT count(*) FROM coldfront.storage_secret;")
     assert_eq "storage secret row written" "1" "$secret"
+    if [ "$BACKEND" = vended ]; then
+        assert_eq "storage secret is vended (no credential stored)" "t" \
+            "$(q "$HOST" "SELECT vended FROM coldfront.storage_secret LIMIT 1;")"
+    fi
 }
 
 # ───────────────────────────────────────────────────────────────────────────

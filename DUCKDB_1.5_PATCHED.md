@@ -17,9 +17,9 @@ and verified*. The cold-tier compactor's own story lives in
 | Patch family | Files | Purpose | Without it |
 |---|---|---|---|
 | **Bakery-aware commit-refresh** | `docker/iceberg-bakery-aware-commit-refresh-v15.patch` | makes the async parquet-upload ordering safe → the **no-409** guarantee for concurrent cold writers, at contended-upload throughput | cold writes still work and still never 409 — they fall back to serialized (claim-first) uploads (see [DUCKDB_1.5_UNPATCHED.md](DUCKDB_1.5_UNPATCHED.md)) |
-| **Strict-reader interop** (upstreamable) | `docker/iceberg-manifest-list-format-version-v15.patch`, `docker/iceberg-manifest-content-v15.patch`, `docker/iceberg-data-file-format-v15.patch` | make the manifests duckdb-iceberg *writes* readable by strict Apache readers (apache/iceberg-go) | the cold-tier **compactor cannot read the table** - see [docs/compaction.md](docs/compaction.md). pg_duckdb's own reads/writes are unaffected. |
+| **Strict-reader interop** (upstreamable) | `docker/iceberg-manifest-list-format-version-v15.patch`, `docker/iceberg-data-file-format-v15.patch` | make the manifests duckdb-iceberg *writes* readable by strict Apache readers (apache/iceberg-go) | the cold-tier **compactor cannot read the table** - see [docs/compaction.md](docs/compaction.md). pg_duckdb's own reads/writes are unaffected. |
 
-All four patches apply cleanly to a **pristine** `duckdb-iceberg` @ `0fad545a`
+All three patches apply cleanly to a **pristine** `duckdb-iceberg` @ `5edc45f0`
 (branch `v1.5-variegata`); `docker/Dockerfile.duckdb15-base` `git apply --check`s
 each before applying, failing the build loudly on patch rot.
 
@@ -82,12 +82,19 @@ the ticket is held):
    single refresh yields the correct values automatically — **zero manual
    re-stamping**: the patch just refreshes, and v1.5's existing lazy derivation
    produces the correct parent + sequence number + assert-ref.
-2. Call `RefreshExistingManifestList()` to re-read the source manifest list that
+2. (Re)create the table's storage secret in the commit context
+   (`PrepareIcebergScanFromEntry`) before the manifest-list re-read touches
+   object storage: the same idiom stock uses inside `GetTransactionRequest`.
+   The commit runs on a fresh connection with no secret, and under catalog
+   credential vending (`ACCESS_DELEGATION_MODE VENDED_CREDENTIALS`) there is no
+   persistent secret to fall back on; without this the re-read has no
+   credential and fails 403. No-op with delegation `NONE` (static credentials).
+3. Call `RefreshExistingManifestList()` to re-read the source manifest list that
    was cached at `AddSnapshot` time from the *stale* head — so the new list is
    built on the peer's manifests instead of dropping them. **Skipping it = silent
    peer-manifest loss** (verified: a no-refresh build lost 3 of 4 concurrent cold
    writes).
-3. **The subtle part:** `RefreshExistingManifestList` is a `read_avro` table
+4. **The subtle part:** `RefreshExistingManifestList` is a `read_avro` table
    scan, which needs a `ClientContext` with an **active transaction**. It must
    run on the fresh `temp_con` that `IcebergTransaction::Commit` opens —
    **not** `IcebergTransactionData`'s stored (main) context, which has no active
@@ -102,20 +109,22 @@ violates it — the standing proof the patch is mandatory for async. **Validated
 over Azure ADLS: journey 6b (4 concurrent mixed-tier writers → 8/8, 0 loss) and
 9b (8 concurrent cold writers → 8/8).
 
-## 3. The three strict-reader interop patches
+## 3. Strict-reader interop (two patches + one upstream fix)
 
 duckdb-iceberg's write path only ever round-trips through its **own** reader,
 which derives version/content/format from table metadata and ignores the Avro
 metadata keys a strict Apache reader needs. iceberg-go (the compactor) *is*
-strict. Three small, **upstreamable** patches — each verified inert to
+strict. Two small, **upstreamable** patches — each verified inert to
 pg_duckdb's own reads — make the manifests cross-engine-readable:
 
 - `iceberg-manifest-list-format-version-v15.patch` — declare the manifest-list `format-version`.
-- `iceberg-manifest-content-v15.patch` — write the manifest file's real `content` (`data`/`deletes`), not a hardcoded `"data"`.
 - `iceberg-data-file-format-v15.patch` — upper-case the data-file `file_format` to the spec enum (`PARQUET`).
 
+(A third fix of this class, the manifest file's `content` key (`data`/`deletes`),
+is upstream at the pinned ref, so ColdFront carries no patch for it.)
+
 The compactor itself (usage, backends, maintenance steps) is documented in
-[docs/compaction.md](docs/compaction.md). The three patches are independent of
+[docs/compaction.md](docs/compaction.md). The interop patches are independent of
 the bakery patch.
 
 ## 4. NOT shipped — no `Commit(ClientContext&)` rewrite
@@ -137,7 +146,7 @@ patches only.
 |---|---|---|
 | pg_duckdb | **merged PR #1025** (`c04e6a2`) | no released tag carries 1.5.x; `git checkout c04e6a2`. Its duckdb submodule is the v1.5.4 tag (`08e34c4`). |
 | DuckDB | **v1.5.4 tag** (`08e34c4`) | pinned by pg_duckdb @ `c04e6a2`; the iceberg build re-pins ITS duckdb submodule to the same tag so the extension ABI matches the engine. The `duckdb.*` GUCs + PRE_COMMIT iceberg-commit deferral ColdFront relies on are unchanged. |
-| duckdb-iceberg | **`v1.5-variegata` @ `0fad545a`** | extension code the four patches target — kept fixed, so the patches apply unchanged. The build re-pins its duckdb submodule to the v1.5.4 tag (the branch tracks duckdb `main`, which drifts off the release). Transaction code lives in `src/catalog/rest/transaction/`. |
+| duckdb-iceberg | **`v1.5-variegata` @ `5edc45f0`** | extension code the three patches target — kept fixed, so the patches apply unchanged. The build re-pins its duckdb submodule to the v1.5.4 tag (the branch tracks duckdb `main`, which drifts off the release; verified: `5edc45f0` compiles clean against v1.5.4). Transaction code lives in `src/catalog/rest/transaction/`. |
 | avro | **`7f423d69`** | the pin `v1.5-variegata` uses. |
 | azure | **`v1.5-variegata` @ `563589b2`** | the ABI-matched sibling of iceberg's branch. **NOT `main`** — azure `main` collides at link (`multiple definition of duckdb::FileFlags::FILE_FLAGS_NULL_IF_NOT_EXISTS`). |
 | postgres_scanner | duckdb-postgres **`6b2b12ca`** | the `postgres` ext; built bundled (ABI-matched, stamped v1.5.4), **shipped** in the image (never downloaded). Its vcpkg `libpq` build needs **flex** + **bison**. |
@@ -161,7 +170,7 @@ requirements (each a real build failure if missing):
 - iceberg/avro/azure/postgres_scanner are built **bundled** against one DuckDB
   (`make release`, `OVERRIDE_GIT_DESCRIBE=v1.5.4`) so they are ABI-safe; build
   config is `docker/iceberg-azure-extension-config-v15.cmake`.
-- The bakery + three interop patches are `COPY`'d in and `git apply --check`'d
+- The bakery + two interop patches are `COPY`'d in and `git apply --check`'d
   then applied (see the Dockerfile's patch block).
 
 Cold base build is ~30–60 min (vcpkg compiles the Azure SDK + libpq from source);

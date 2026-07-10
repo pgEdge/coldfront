@@ -7,8 +7,8 @@
 
 ColdFront runs on a **DuckDB 1.5.x** stack: PostgreSQL + pg_duckdb
 (DuckDB 1.5.4) and a **patched** duckdb-iceberg that carries ColdFront's
-four patches - the bakery-aware commit-refresh patch (the no-409
-guarantee for concurrent cold-tier writers) and three strict-reader
+three patches - the bakery-aware commit-refresh patch (the no-409
+guarantee for concurrent cold-tier writers) and two strict-reader
 interop patches (so apache/iceberg-go, the cold-tier compactor, can read
 the manifests duckdb-iceberg writes). The patch internals are in
 [DUCKDB_1.5_PATCHED.md](https://github.com/pgEdge/ColdFront/blob/main/DUCKDB_1.5_PATCHED.md).
@@ -26,29 +26,28 @@ components:
 |---|---|
 | libcurl 8.12.0 | `curl.se`, built from source (compile-time dep of DuckDB 1.5.4 httpfs; needs curl >= 7.77, the pgEdge base ships 7.76.1) |
 | pg_duckdb (DuckDB 1.5.4) | `github.com/duckdb/pg_duckdb`, PR #1025 |
-| duckdb-iceberg | `github.com/duckdb/duckdb-iceberg`, `v1.5-variegata` @ `0fad545a` |
+| duckdb-iceberg | `github.com/duckdb/duckdb-iceberg`, `v1.5-variegata` @ `5edc45f0` |
 | vcpkg | `github.com/microsoft/vcpkg` |
 
 The base build runs as three Docker stages: the first builds libcurl and
 pg_duckdb; the second clones duckdb-iceberg at the pinned ref, applies
-ColdFront's four patches, and compiles the iceberg, avro, azure, and
+ColdFront's three patches, and compiles the iceberg, avro, azure, and
 postgres_scanner extensions under vcpkg; the third assembles the runtime.
 The build `git apply --check`s each patch before applying it, so it fails
 loudly on patch rot rather than silently shipping stock iceberg (which
 409s under concurrency and writes manifests strict Apache readers reject).
 
-ColdFront applies the following four patches to duckdb-iceberg; the full
+ColdFront applies the following three patches to duckdb-iceberg; the full
 rationale is in
 [DUCKDB_1.5_PATCHED.md](https://github.com/pgEdge/ColdFront/blob/main/DUCKDB_1.5_PATCHED.md):
 
 | Patch | What it does |
 |---|---|
-| `iceberg-bakery-aware-commit-refresh-v15` | Re-stamps the parent snapshot at the commit POST so concurrent cold writers never get a Lakekeeper 409 (the no-409 guarantee). |
+| `iceberg-bakery-aware-commit-refresh-v15` | Refreshes the table head at the commit POST (and re-creates the table's storage secret in the commit context, needed under catalog credential vending) so concurrent cold writers never get a Lakekeeper 409 (the no-409 guarantee). |
 | `iceberg-manifest-list-format-version-v15` | Adds the spec-optional `format-version` key to the manifest-list metadata so strict Apache readers parse the entries as v2. |
-| `iceberg-manifest-content-v15` | Writes the manifest's real content type instead of a hardcoded value, so strict readers accept delete manifests. |
 | `iceberg-data-file-format-v15` | Upper-cases the data-file format in the manifest to match the spec enum strict readers check case-sensitively. |
 
-The bakery patch is mandatory for the no-409 guarantee. The other three
+The bakery patch is mandatory for the no-409 guarantee. The other two
 are interop patches so the manifests duckdb-iceberg writes are readable
 by strict Apache readers such as apache/iceberg-go, the cold-tier
 compactor; they are inert to pg_duckdb's own reads. The canonical recipe
