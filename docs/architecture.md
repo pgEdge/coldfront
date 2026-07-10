@@ -145,13 +145,26 @@ node with no per-node file syncing. (2) It materializes a DuckDB
 init - so every backend, including the first fresh one, sees the secret
 at a committed timestamp before any query runs.
 
+For deployments that must not store a credential at all,
+`coldfront.set_storage_secret_vended()` records a vended
+`coldfront.storage_secret` row that holds no credential and materializes
+no secret. The row's `vended` flag drives `coldfront._attach_delegation_mode()`,
+so `ensure_attached()` attaches the catalog with
+`ACCESS_DELEGATION_MODE VENDED_CREDENTIALS`: Lakekeeper mints short-lived
+per-table credentials (S3 STS, or Azure SAS) that `duckdb-iceberg`
+consumes directly. A static row attaches with `ACCESS_DELEGATION_MODE
+NONE` (the persistent secret supplies the credential); the vended path
+sidesteps the fresh-transaction limitation below because `duckdb-iceberg`
+re-creates the per-table secret inside the commit transaction.
+
 For backup and restore (`pg_dump`), the durable tiering metadata -
 `coldfront.tiered_views` (registry), `archive_watermark` (cutoffs) and
 `partition_config` - is marked with `pg_extension_config_dump`, so a
 logical `pg_dump` carries it and a restore re-attaches to the **same**
 Iceberg cold tier with no re-provisioning. Two things are deliberately
 **not** dumped: the credential (`coldfront.storage_secret` above - re-run
-`set_storage_secret` once after restoring into a fresh instance) and the
+`set_storage_secret` (or `set_storage_secret_vended`) once after
+restoring into a fresh instance) and the
 bakery's transient claim tables (`claims` / `claim_acks` /
 `deferred_acks`, per-node mesh state). Until the credential is
 re-established a restored node serves hot reads but fails cold I/O
