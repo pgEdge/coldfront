@@ -83,11 +83,28 @@ DB_IP=$(ip "$DB"); LK_IP=$(ip coldfront-lakekeeper-1)
 # so the gcs warehouse must also be named "wh" (only its storage profile differs:
 # s3 @ GCS). azure has its own image/compose with the wh-azure GUC.
 case "$BACKEND" in
-  azure) SW_IP=""; WAREHOUSE=wh-azure;;
-  gcs)   SW_IP=""; WAREHOUSE=wh;;
-  aws)   SW_IP=""; WAREHOUSE=wh;;
-  *)     SW_IP=$(ip coldfront-seaweedfs-1); WAREHOUSE=wh;;
+  azure)  SW_IP=""; WAREHOUSE=wh-azure;;
+  gcs)    SW_IP=""; WAREHOUSE=wh;;
+  aws)    SW_IP=""; WAREHOUSE=wh;;
+  *)      SW_IP=$(ip coldfront-seaweedfs-1); WAREHOUSE=wh;;   # s3 (static) + vended
 esac
+
+# SeaweedFS backends: pre-create the bucket, matching every real backend (the
+# aws/gcs/azure lanes all point at a pre-provisioned bucket; Lakekeeper never
+# creates it). SeaweedFS auto-creates on first write only for the static-identity
+# path; the vended lane's STS write path does not, so the bucket must exist first.
+if [ -n "$SW_IP" ]; then
+  # `weed shell bucket.create` exits 0 even before the master is ready, so verify
+  # the bucket actually appears in bucket.list; retry until it does (SeaweedFS may
+  # still be warming up right after compose up).
+  created=0
+  for _ in $(seq 1 15); do
+    docker exec coldfront-seaweedfs-1 sh -c "echo 's3.bucket.create -name iceberg' | weed shell" >/dev/null 2>&1
+    if docker exec coldfront-seaweedfs-1 sh -c "echo 's3.bucket.list' | weed shell" 2>/dev/null | grep -q ' iceberg'; then created=1; break; fi
+    sleep 2
+  done
+  [ "$created" = 1 ] || { echo "FATAL: SeaweedFS bucket 'iceberg' not created after retries"; exit 1; }
+fi
 
 step "vanilla: bootstrap Lakekeeper + warehouse ($BACKEND)"
 curl -sf "http://$LK_IP:8181/management/v1/bootstrap" -X POST -H "Content-Type: application/json" \
@@ -117,6 +134,17 @@ elif [ "$BACKEND" = aws ]; then
     \"warehouse-name\":\"wh\",
     \"storage-profile\":{\"type\":\"s3\",\"bucket\":\"${COLDFRONT_AWS_BUCKET}\",\"key-prefix\":\"coldfront-ci-aws\",\"region\":\"${COLDFRONT_AWS_REGION}\",\"path-style-access\":false,\"flavor\":\"aws\",\"sts-enabled\":false,\"remote-signing-enabled\":false},
     \"storage-credential\":{\"type\":\"s3\",\"credential-type\":\"access-key\",\"aws-access-key-id\":\"${COLDFRONT_AWS_ACCESS_KEY}\",\"aws-secret-access-key\":\"${COLDFRONT_AWS_SECRET_KEY}\"}
+  }"
+elif [ "$BACKEND" = vended ]; then
+  # Vended: SeaweedFS mints per-table STS creds. sts-enabled + assume-role-arn
+  # (the role/trust-policy in docker/seaweedfs-iam.json); sts-endpoint = the S3
+  # endpoint. The warehouse's OWN credential stays the long-term admin access-key
+  # (vending changes only the client plane). Lakekeeper delivers the temp creds in
+  # LoadTable, which duckdb-iceberg (ACCESS_DELEGATION_MODE VENDED_CREDENTIALS) uses.
+  WH_BODY="{
+    \"warehouse-name\":\"wh\",
+    \"storage-profile\":{\"type\":\"s3\",\"bucket\":\"iceberg\",\"region\":\"us-east-1\",\"endpoint\":\"http://${SW_IP}:8333\",\"path-style-access\":true,\"flavor\":\"s3-compat\",\"sts-enabled\":true,\"sts-endpoint\":\"http://${SW_IP}:8333\",\"assume-role-arn\":\"arn:aws:iam::000000000000:role/coldfront\"},
+    \"storage-credential\":{\"type\":\"s3\",\"credential-type\":\"access-key\",\"aws-access-key-id\":\"admin\",\"aws-secret-access-key\":\"adminsecret\"}
   }"
 else
   WH_BODY="{

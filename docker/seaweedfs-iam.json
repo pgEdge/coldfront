@@ -1,0 +1,40 @@
+{
+  "sts": {
+    "tokenDuration": "3600s",
+    "maxSessionLength": "43200s",
+    "issuer": "seaweedfs-sts",
+    "signingKey": "aG1hYy1zaWduaW5nLWtleS0zMmJ5dGVzLWxvbmctZGV2"
+  },
+  "policies": [
+    {
+      "name": "coldfront-rw",
+      "document": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Action": ["s3:*"],
+            "Resource": ["arn:aws:s3:::*", "arn:aws:s3:::*/*"]
+          }
+        ]
+      }
+    }
+  ],
+  "roles": [
+    {
+      "roleName": "coldfront",
+      "roleArn": "arn:aws:iam::000000000000:role/coldfront",
+      "attachedPolicies": ["coldfront-rw"],
+      "trustPolicy": {
+        "Version": "2012-10-17",
+        "Statement": [
+          {
+            "Effect": "Allow",
+            "Principal": {"AWS": ["*"]},
+            "Action": ["sts:AssumeRole"]
+          }
+        ]
+      }
+    }
+  ]
+}
