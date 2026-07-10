@@ -94,7 +94,7 @@ FROM manylinux-${TARGETARCH} AS manylinux-base
 
 # ─── iceberg-builder stage: iceberg + avro + azure (DuckDB 1.5.x ABI, PATCHED) ──
 FROM manylinux-base AS iceberg-builder
-ARG ICEBERG_REF=0fad545a
+ARG ICEBERG_REF=5edc45f0
 # libasan/libubsan: the extension_configuration phase builds a Debug
 # duckdb_platform_binary that links AddressSanitizer. perl-Time-Piece:
 # openssl-from-source (vcpkg) Configure needs it. See DUCKDB_1.5_PATCHED.md.
@@ -105,7 +105,7 @@ RUN dnf install -y --setopt=install_weak_deps=False \
         flex bison \
     && dnf clean all
 WORKDIR /build
-# ICEBERG_REF is the extension code the four patches target (kept fixed so they
+# ICEBERG_REF is the extension code the three patches target (kept fixed so they
 # apply unchanged). Its duckdb submodule tracks duckdb main, which drifts off the
 # release, so after init we pin that submodule to the v1.5.4 TAG — the same engine
 # pg_duckdb links — and build the extension against it.
@@ -130,12 +130,10 @@ COPY docker/iceberg-bakery-aware-commit-refresh-v15.patch /tmp/iceberg-bakery-v1
 # Inert to pg_duckdb reads (its ManifestListReader takes the version from table
 # metadata, not this key). See the patch header + COMPACTOR.md.
 COPY docker/iceberg-manifest-list-format-version-v15.patch /tmp/iceberg-mlist-fmtver-v15.patch
-# Companion interop patch — the manifest FILE writer hardcodes content="data";
-# fix it to emit the manifest's real content (data/deletes) so strict readers
-# (iceberg-go, the compactor) don't reject delete manifests. Same class as the
-# format-version patch; inert to pg_duckdb reads. See the patch header.
-COPY docker/iceberg-manifest-content-v15.patch /tmp/iceberg-mcontent-v15.patch
-# Third interop patch — upper-case the data-file 'file_format' in the manifest
+# (The manifest-FILE content="data"/"deletes" interop fix is upstream as of this
+# ICEBERG_REF (commit f343c518, "Write delete manifests with content='deletes'
+# file metadata"), so ColdFront no longer carries a patch for it.)
+# Data-file 'file_format' interop patch: upper-case the data-file 'file_format' in the manifest
 # (spec enum is PARQUET, duckdb writes lowercase "parquet"); strict readers
 # (iceberg-go's compaction scan) match it case-sensitively. Inert to pg_duckdb
 # reads (reader stores verbatim; ducklake lowercases). See the patch header.
@@ -145,8 +143,6 @@ RUN cd /build/duckdb-iceberg \
  && git apply        /tmp/iceberg-bakery-v15.patch \
  && git apply --check /tmp/iceberg-mlist-fmtver-v15.patch \
  && git apply        /tmp/iceberg-mlist-fmtver-v15.patch \
- && git apply --check /tmp/iceberg-mcontent-v15.patch \
- && git apply        /tmp/iceberg-mcontent-v15.patch \
  && git apply --check /tmp/iceberg-fileformat-v15.patch \
  && git apply        /tmp/iceberg-fileformat-v15.patch
 # vcpkg triplet is derived from the build arch (uname -m): x86_64→x64-linux,
