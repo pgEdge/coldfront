@@ -108,10 +108,11 @@ CREATE TABLE IF NOT EXISTS coldfront.storage_secret (
     url_style         text    NOT NULL DEFAULT 'path',
     use_ssl           boolean NOT NULL DEFAULT false,
     connection_string text,                            -- azure CONFIG provider: AccountName/AccountKey (shared key)
+    vended            boolean NOT NULL DEFAULT false,   -- true ⇒ Lakekeeper mints per-table creds; this row stores none
     CONSTRAINT ss_type_enum  CHECK (storage_type IN ('s3','azure')),
-    CONSTRAINT ss_s3_creds   CHECK (storage_type <> 's3'
+    CONSTRAINT ss_s3_creds   CHECK (vended OR storage_type <> 's3'
                                      OR (key_id IS NOT NULL AND secret IS NOT NULL)),
-    CONSTRAINT ss_azure_conn CHECK (storage_type <> 'azure'
+    CONSTRAINT ss_azure_conn CHECK (vended OR storage_type <> 'azure'
                                      OR (connection_string IS NOT NULL AND connection_string <> ''))
 );
 
@@ -179,18 +180,21 @@ SELECT pg_extension_config_dump('coldfront.partition_config', '');
 -- — ATTACH IF NOT EXISTS is idempotent.
 CREATE OR REPLACE FUNCTION coldfront.ensure_attached() RETURNS void AS $$
 DECLARE
-  wh text := current_setting('coldfront.warehouse', true);
-  ep text := current_setting('coldfront.lakekeeper_endpoint', true);
+  wh   text := current_setting('coldfront.warehouse', true);
+  ep   text := current_setting('coldfront.lakekeeper_endpoint', true);
+  mode text := coldfront._attach_delegation_mode();
 BEGIN
   IF wh IS NOT NULL AND wh <> '' AND ep IS NOT NULL AND ep <> '' THEN
     -- iceberg (and avro transitively) are auto-installed/auto-loaded by
     -- pg_duckdb when this ATTACH (TYPE ICEBERG, ...) fires, gated by
     -- duckdb.autoinstall_known_extensions / autoload_known_extensions. No
-    -- explicit install or per-session LOAD needed.
+    -- explicit install or per-session LOAD needed. ACCESS_DELEGATION_MODE is
+    -- VENDED_CREDENTIALS for a vended cold store (Lakekeeper mints per-table
+    -- creds), else NONE (the persistent secret supplies them).
     PERFORM duckdb.raw_query(format(
       'ATTACH IF NOT EXISTS %L AS ice (TYPE ICEBERG, ENDPOINT %L, '
-      'AUTHORIZATION_TYPE NONE, ACCESS_DELEGATION_MODE NONE)',
-      wh, ep
+      'AUTHORIZATION_TYPE NONE, ACCESS_DELEGATION_MODE %s)',
+      wh, ep, mode
     ));
     -- Pin DuckDB's BUNDLED httpfs client (cpp-httplib + mbedtls), not the system
     -- libcurl DuckDB 1.5 defaults to. The libcurl client's threaded resolver calls
@@ -206,6 +210,16 @@ BEGIN
     -- Background: https://curl.se/docs/CVE-2025-0665.html
     -- Run AFTER the ATTACH (httpfs loaded); GLOBAL = this backend's instance; idempotent.
     PERFORM duckdb.raw_query($q$SET GLOBAL httpfs_client_implementation = 'httplib'$q$);
+    -- Skip the metadata-log time-travel read at table load. When a table's
+    -- metadata is newer than the transaction start (guaranteed for every
+    -- bakery-serialized writer that waited on a peer's commit), duckdb-iceberg
+    -- reconstructs as-of-start metadata by fetching a previous metadata.json
+    -- from object storage. That fetch happens BEFORE the table's credentials
+    -- exist in the session, so under vended credentials it fails (403); with
+    -- false, the fallback rewinds the snapshot pointer in the already-loaded
+    -- metadata with no storage read. Also saves one GET per conflicting
+    -- statement under static credentials. GLOBAL = this backend's instance.
+    PERFORM duckdb.raw_query($q$SET GLOBAL iceberg_use_metadata_log = false$q$);
     -- httpfs (s3) already loaded as a side-effect of the ATTACH above; azure does
     -- not, so its lazy autoload would otherwise fire later as the non-superuser
     -- app role and hit pg_duckdb's LocalFileSystem block. Pre-load it
@@ -379,6 +393,12 @@ RETURNS text
 LANGUAGE plpgsql IMMUTABLE AS $$
 DECLARE opts text;
 BEGIN
+  -- Vended rows carry no credentials: Lakekeeper mints per-table creds and
+  -- duckdb-iceberg creates the DuckDB secret from them, so there is nothing to
+  -- materialize here.
+  IF r.vended THEN
+    RETURN NULL;
+  END IF;
   IF r.storage_type = 'azure' THEN
     -- CONFIG provider (PROVIDER omitted ⇒ config). Shared-key auth: the access
     -- key rides inside CONNECTION_STRING's AccountKey=… — duckdb-azure has no
@@ -409,12 +429,20 @@ $$;
 CREATE OR REPLACE FUNCTION coldfront.materialize_storage_secret() RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
-  r coldfront.storage_secret;
+  r    coldfront.storage_secret;
+  opts text;
 BEGIN
   SELECT * INTO r FROM coldfront.storage_secret LIMIT 1;
   IF NOT FOUND THEN RETURN; END IF;
+  opts := coldfront._build_storage_secret_opts(r);
+  -- Vended row ⇒ no secret body; drop any secret a prior static row left behind
+  -- so a static→vended switch cannot keep serving the old credential.
+  IF opts IS NULL THEN
+    PERFORM duckdb.raw_query(format('DROP PERSISTENT SECRET IF EXISTS %I', r.name));
+    RETURN;
+  END IF;
   PERFORM duckdb.raw_query(format('CREATE OR REPLACE PERSISTENT SECRET %I (%s)',
-                                  r.name, coldfront._build_storage_secret_opts(r)));
+                                  r.name, opts));
 END;
 $$;
 
@@ -450,9 +478,9 @@ DECLARE
   dsn text := current_setting('coldfront.local_pg_dsn', true);
 BEGIN
   INSERT INTO coldfront.storage_secret
-       (name, storage_type, key_id, secret, endpoint, region, url_style, use_ssl, connection_string)
+       (name, storage_type, key_id, secret, endpoint, region, url_style, use_ssl, connection_string, vended)
        VALUES (p.name, p.storage_type, p.key_id, p.secret, p.endpoint,
-               p.region, p.url_style, p.use_ssl, p.connection_string)
+               p.region, p.url_style, p.use_ssl, p.connection_string, p.vended)
   ON CONFLICT (name) DO UPDATE SET
        storage_type      = EXCLUDED.storage_type,
        key_id            = EXCLUDED.key_id,
@@ -461,7 +489,8 @@ BEGIN
        region            = EXCLUDED.region,
        url_style         = EXCLUDED.url_style,
        use_ssl           = EXCLUDED.use_ssl,
-       connection_string = EXCLUDED.connection_string;
+       connection_string = EXCLUDED.connection_string,
+       vended            = EXCLUDED.vended;
   IF dsn IS NOT NULL AND dsn <> '' THEN
     PERFORM duckdb.install_extension('postgres');
   END IF;
@@ -487,7 +516,7 @@ BEGIN
   -- Shape an s3 row; _apply_storage_secret does the (backend-neutral) persist.
   PERFORM coldfront._apply_storage_secret(ROW(
     'cf_storage', 's3', p_key_id, p_secret, p_endpoint,
-    p_region, p_url_style, p_use_ssl, NULL
+    p_region, p_url_style, p_use_ssl, NULL, false
   )::coldfront.storage_secret);
 END;
 $$;
@@ -511,9 +540,45 @@ BEGIN
   -- _apply_storage_secret does the (backend-neutral) persist.
   PERFORM coldfront._apply_storage_secret(ROW(
     'cf_storage', 'azure', NULL, NULL, NULL,
-    'us-east-1', 'path', false, p_connection_string
+    'us-east-1', 'path', false, p_connection_string, false
   )::coldfront.storage_secret);
 END;
+$$;
+
+-- set_storage_secret_vended(): cold-tier setup for compliance deployments that
+-- must not store object-store credentials. It writes a credential-less row
+-- (vended = true) so nothing is materialized as a DuckDB secret; instead
+-- ensure_attached() turns on Iceberg REST credential vending and Lakekeeper
+-- mints short-lived per-table credentials at read/write time. The Lakekeeper
+-- warehouse keeps its own long-term credential (the client plane holds none).
+-- p_storage_type selects s3 (default; AWS + S3-compatible) or azure (so
+-- ensure_attached still LOADs the azure extension for the vended SAS). Same
+-- emission/replication path as the static setters.
+CREATE OR REPLACE FUNCTION coldfront.set_storage_secret_vended(
+    p_storage_type text DEFAULT 's3') RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF p_storage_type NOT IN ('s3', 'azure') THEN
+    RAISE EXCEPTION 'storage_type must be ''s3'' or ''azure'', got: %', p_storage_type;
+  END IF;
+  PERFORM coldfront._apply_storage_secret(ROW(
+    'cf_storage', p_storage_type, NULL, NULL, NULL,
+    'us-east-1', 'path', false, NULL, true
+  )::coldfront.storage_secret);
+END;
+$$;
+
+-- _attach_delegation_mode(): the DuckDB ICEBERG ATTACH access-delegation mode
+-- for this node. VENDED_CREDENTIALS when the stored row is vended (Lakekeeper
+-- mints per-table creds), else NONE (the persistent secret supplies them).
+-- Absent row ⇒ NONE (no cold store configured yet).
+CREATE OR REPLACE FUNCTION coldfront._attach_delegation_mode() RETURNS text
+LANGUAGE sql STABLE AS $$
+  SELECT CASE
+           WHEN COALESCE((SELECT vended FROM coldfront.storage_secret LIMIT 1), false)
+             THEN 'VENDED_CREDENTIALS'
+           ELSE 'NONE'
+         END;
 $$;
 
 -- ============================================================================
@@ -2797,7 +2862,7 @@ $$;
 COMMENT ON SCHEMA coldfront IS 'pgEdge ColdFront: transparent PostgreSQL to Apache Iceberg tiering, plus decoupled iceberg-only tables.';
 COMMENT ON TABLE coldfront.tiered_views IS 'Registry (keyed by schema, relname) of views the coldfront DML hook handles — tiered (hot+cold) and decoupled (iceberg-only).';
 COMMENT ON TABLE coldfront.archive_watermark IS 'Per-tiered-table hot/cold cutoff: ts >= cutoff is hot (PG), ts < cutoff is cold (Iceberg).';
-COMMENT ON TABLE coldfront.storage_secret IS 'Cold-store credential; materialized as a DuckDB PERSISTENT SECRET, replicated by value across a Spock mesh, excluded from pg_dump.';
+COMMENT ON TABLE coldfront.storage_secret IS 'Cold-store credential; materialized as a DuckDB PERSISTENT SECRET, replicated by value across a Spock mesh, excluded from pg_dump. A vended row stores no credential and materializes nothing: Lakekeeper mints per-table creds and ensure_attached uses ACCESS_DELEGATION_MODE VENDED_CREDENTIALS.';
 COMMENT ON TABLE coldfront.partition_config IS 'Name-keyed per-table partition/tiering lifecycle config (period, hot_period, retention); replicates by value so every mesh node reads identical config.';
 COMMENT ON TABLE coldfront.claims IS 'Ricart-Agrawala bakery: a writer''s outstanding iceberg-commit claim (iceberg_table, snowflake ticket); deleted on release.';
 COMMENT ON TABLE coldfront.claim_acks IS 'Ricart-Agrawala bakery: per-peer acknowledgements of a claim, replicated back to the originating writer.';

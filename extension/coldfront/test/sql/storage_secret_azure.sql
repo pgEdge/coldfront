@@ -14,19 +14,19 @@ RESET client_min_messages;
 
 -- ---- pure opts builder: s3, AWS default (no endpoint) — byte-identical to legacy
 SELECT coldfront._build_storage_secret_opts(ROW(
-    'cf_storage','s3','admin','adminsecret',NULL,'us-east-1','path',false,NULL
+    'cf_storage','s3','admin','adminsecret',NULL,'us-east-1','path',false,NULL,false
 )::coldfront.storage_secret);
 
 -- ---- pure opts builder: s3, S3-compatible (endpoint set → path-style + USE_SSL)
 SELECT coldfront._build_storage_secret_opts(ROW(
-    'cf_storage','s3','admin','adminsecret','seaweedfs:8333','us-east-1','path',true,NULL
+    'cf_storage','s3','admin','adminsecret','seaweedfs:8333','us-east-1','path',true,NULL,false
 )::coldfront.storage_secret);
 
 -- ---- pure opts builder: azure CONFIG provider via CONNECTION_STRING (shared key
 -- rides inside AccountKey=… — duckdb-azure has no ACCOUNT_KEY param)
 SELECT coldfront._build_storage_secret_opts(ROW(
     'cf_storage','azure',NULL,NULL,NULL,'us-east-1','path',false,
-    'DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=Zm9v;EndpointSuffix=core.windows.net'
+    'DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=Zm9v;EndpointSuffix=core.windows.net',false
 )::coldfront.storage_secret);
 
 -- ---- CHECK guards: a bad row is rejected BEFORE the AFTER trigger fires
