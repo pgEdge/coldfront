@@ -65,6 +65,28 @@ func TestStorageProps_AWSNative(t *testing.T) {
 	}
 }
 
+func TestStorageProps_VendedEmptyConfig(t *testing.T) {
+	// Vended deployment: no s3/azure creds in YAML. storageProps must set NO
+	// credential keys, so iceberg-go's vended storage-credentials (merged last)
+	// are not shadowed by empty static keys, and its Azure shared-key branch does
+	// not preempt a vended SAS.
+	c := &Config{}
+	c.Iceberg.Warehouse = "wh"
+	c.Iceberg.LakekeeperEndpoint = "http://lk:8181/catalog"
+	p, err := c.storageProps()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{
+		iceio.S3AccessKeyID, iceio.S3SecretAccessKey,
+		iceio.ADLSSharedKeyAccountName, iceio.ADLSSharedKeyAccountKey,
+	} {
+		if _, ok := p[k]; ok {
+			t.Fatalf("vended config must not set %q, got %q", k, p[k])
+		}
+	}
+}
+
 func TestStorageProps_Azure(t *testing.T) {
 	c := &Config{}
 	c.Azure.ConnectionString = "DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=a2V5cGFkZGluZw==;EndpointSuffix=core.windows.net"

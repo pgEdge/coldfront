@@ -80,6 +80,19 @@ func TestColdSecretSQL_Azure(t *testing.T) {
 	assert.NotContains(t, sql, "TYPE S3")
 }
 
+func TestStaticCredsConfigured(t *testing.T) {
+	s3 := &config.Config{S3: config.S3Config{AccessKey: "a", SecretKey: "s"}}
+	assert.True(t, staticCredsConfigured(s3), "s3 access key ⇒ static")
+
+	azure := &config.Config{Azure: config.AzureConfig{
+		ConnectionString: "AccountName=acct;AccountKey=Zm9v"}}
+	assert.True(t, staticCredsConfigured(azure), "azure connection string ⇒ static")
+
+	vended := &config.Config{Iceberg: config.IcebergConfig{
+		Warehouse: "wh", LakekeeperEndpoint: "http://lk:8181/catalog"}}
+	assert.False(t, staticCredsConfigured(vended), "no creds ⇒ vended")
+}
+
 // mockRow / mockRows / mockQuerier mirror the pattern in
 // internal/partition/partition_test.go. Hand-written, no mock framework.
 type mockRow struct {

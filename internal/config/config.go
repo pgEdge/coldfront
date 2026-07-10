@@ -228,6 +228,14 @@ func (c *Config) validateColdBackend(anyS3 bool) error {
 	if azureConfigured {
 		return nil
 	}
+	// Neither S3 nor Azure credentials configured: they are vended by the
+	// Iceberg catalog (Lakekeeper) at read/write time (coldfront.storage_secret
+	// is vended). The warehouse + endpoint validated above are all the config
+	// needs; the archiver enforces the vended row when it attaches. A PARTIAL
+	// s3.* config (anyS3) still falls through to validateS3Fields and fails loud.
+	if !anyS3 {
+		return nil
+	}
 	return c.validateS3Fields()
 }
 
