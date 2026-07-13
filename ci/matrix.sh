@@ -102,6 +102,7 @@ run_cell() {
 compose_for() {
     case "$1/$2" in
         vanilla/azure) echo docker-compose.matrix-azure.yml;;
+        vanilla/azure-vended) echo docker-compose.matrix-azure.yml;;
         mesh/azure)    echo docker-compose.mesh-azure.yml;;
         vanilla/*)     echo docker-compose.matrix.yml;;
         mesh/*)        echo docker-compose.mesh.yml;;
@@ -158,6 +159,7 @@ backend_ready() {
         vended) return 0;;   # hermetic: SeaweedFS STS in-compose, no cloud creds
         aws)    [ -n "${COLDFRONT_AWS_ACCESS_KEY:-}" ];;
         azure)  [ -n "${COLDFRONT_AZURE_CONNECTION_STRING:-}" ];;
+        azure-vended) [ -n "${COLDFRONT_AZURE_KEY:-}" ];;
         gcs)    [ -n "${COLDFRONT_GCS_ACCESS_KEY:-}" ];;
         *)      return 1;;
     esac
@@ -167,16 +169,18 @@ backend_ready() {
 # ever silently omitted; PENDING states what creds would flip it to RUN. The full
 # grid is PG{16,17,18} × {vanilla,mesh} × {tiered,decoupled} × {primary,standby} ×
 # {s3,aws,azure,gcs} = 96 cells, every one on the DuckDB 1.5.x patched-iceberg
-# image, plus the vended lane (S3 STS credential vending) vanilla-only: +12 cells.
+# image, plus the vended lanes (S3 STS + Azure SAS credential vending)
+# vanilla-only: +24 cells.
 coverage_table() {
     step "MATRIX COVERAGE (full grid = 96 cells, all on DuckDB 1.5.x)"
     local pg topo mode tgt be st cell_st
     for pg in 18 17 16; do
-      for be in s3 aws azure gcs vended; do
+      for be in s3 aws azure gcs vended azure-vended; do
         if backend_ready "$be"; then st="RUN"; else
           case "$be" in
             aws)   st="PENDING (needs COLDFRONT_AWS_* creds)";;
             azure) st="PENDING (needs COLDFRONT_AZURE_* creds)";;
+            azure-vended) st="PENDING (needs COLDFRONT_AZURE_* creds)";;
             gcs)   st="PENDING (needs COLDFRONT_GCS_* creds)";;
             *)     st="PENDING";;
           esac
@@ -185,8 +189,8 @@ coverage_table() {
           for mode in tiered decoupled; do
             for tgt in primary standby; do
               cell_st="$st"
-              # vended is vanilla-only; its mesh cells are deferred (row/flag replicates by value).
-              [ "$be" = vended ] && [ "$topo" = mesh ] && cell_st="DEFERRED (vanilla-only)"
+              # vended + azure-vended are vanilla-only; their mesh cells are deferred (row/flag replicates by value).
+              { [ "$be" = vended ] || [ "$be" = azure-vended ]; } && [ "$topo" = mesh ] && cell_st="DEFERRED (vanilla-only)"
               printf '    pg%-2s · %-7s · %-9s · %-7s · %-6s : %s\n' "$pg" "$topo" "$mode" "$tgt" "$be" "$cell_st"
             done
           done
@@ -217,11 +221,12 @@ case "$SCOPE" in
       # azure cells consume a prebuilt image; build it once per major (cheap after
       # the regular composes' inline 1.5 build — shared layers). aws/gcs reuse the
       # inline-build composes (real cloud store, no local container), like s3.
-      backend_ready azure && { prebuild_duckdb15 "$pg" || CELL_FAIL=$((CELL_FAIL + 1)); }
-      # vended = SeaweedFS STS credential vending (hermetic, S3 STS). Vanilla only:
-      # the mesh vended cell is deferred: the storage_secret row (incl. its vended
-      # flag) replicates by value, so the static mesh cells already cover that path.
-      for be in s3 aws azure gcs vended; do
+      { backend_ready azure || backend_ready azure-vended; } && { prebuild_duckdb15 "$pg" || CELL_FAIL=$((CELL_FAIL + 1)); }
+      # vended = SeaweedFS STS credential vending (hermetic, S3 STS); azure-vended =
+      # Azure SAS vending (creds-gated). Both vanilla only: their mesh cells are
+      # deferred: the storage_secret row (incl. its vended flag) replicates by
+      # value, so the static mesh cells already cover that path.
+      for be in s3 aws azure gcs vended azure-vended; do
         if ! backend_ready "$be"; then
           step "BACKEND $be (pg${pg}) — PENDING (creds absent; set its COLDFRONT_* env to RUN)"
           continue
@@ -231,9 +236,9 @@ case "$SCOPE" in
             reg=""
             [ "$be" = s3 ] && [ "$mode" = tiered ] && [ "$tgt" = primary ] && reg=regress
             run_cell "pg${pg}·vanilla·${mode}·${tgt}·${be}" vcell "$pg" "$mode" "$be" "$tgt" "$reg"
-            if [ "$be" = vended ]; then
+            if [ "$be" = vended ] || [ "$be" = azure-vended ]; then
               [ "$mode" = tiered ] && [ "$tgt" = primary ] && \
-                step "pg${pg}·mesh·*·*·vended DEFERRED (vanilla-only; static mesh cells cover storage_secret row/flag replication)"
+                step "pg${pg}·mesh·*·*·${be} DEFERRED (vanilla-only; static mesh cells cover storage_secret row/flag replication)"
             else
               run_cell "pg${pg}·mesh·${mode}·${tgt}·${be}"     mcell "$pg" "$mode" "$be" "$tgt"
             fi
@@ -255,7 +260,7 @@ case "$SCOPE" in
         ;;
     esac
     coverage_table
-    echo -e "\n  NOTE: s3 and vended (both SeaweedFS-backed) are hermetic and always RUN; vended (S3 STS credential vending) is vanilla-only, its mesh cells deferred. The real cloud stores aws/azure/gcs RUN only when their COLDFRONT_* creds are present, else PENDING (tracked, never skipped silently)."
+    echo -e "\n  NOTE: s3 and vended (both SeaweedFS-backed) are hermetic and always RUN; vended (S3 STS credential vending) is vanilla-only, its mesh cells deferred. The real cloud stores aws/azure/gcs (and azure-vended, Azure SAS vending) RUN only when their COLDFRONT_* creds are present, else PENDING (tracked, never skipped silently)."
     ;;
 esac
 

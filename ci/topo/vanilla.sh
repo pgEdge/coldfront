@@ -35,10 +35,12 @@ while [ $# -gt 0 ]; do case "$1" in
   --standby) STANDBY=1; shift;;
   *) echo "vanilla.sh: unknown arg $1"; exit 2;;
 esac; done
-if [ "$BACKEND" = azure ]; then
+if [ "$BACKEND" = azure ] || [ "$BACKEND" = azure-vended ]; then
   : "${COLDFRONT_AZURE_ACCOUNT:?--backend azure needs COLDFRONT_AZURE_ACCOUNT}"
   : "${COLDFRONT_AZURE_FILESYSTEM:?--backend azure needs COLDFRONT_AZURE_FILESYSTEM}"
   : "${COLDFRONT_AZURE_KEY:?--backend azure needs COLDFRONT_AZURE_KEY}"
+fi
+if [ "$BACKEND" = azure ]; then
   : "${COLDFRONT_AZURE_CONNECTION_STRING:?--backend azure needs COLDFRONT_AZURE_CONNECTION_STRING}"
 fi
 # GCS is the s3 path pointed at the GCS S3-interop endpoint with an HMAC key pair
@@ -84,6 +86,7 @@ DB_IP=$(ip "$DB"); LK_IP=$(ip coldfront-lakekeeper-1)
 # s3 @ GCS). azure has its own image/compose with the wh-azure GUC.
 case "$BACKEND" in
   azure)  SW_IP=""; WAREHOUSE=wh-azure;;
+  azure-vended) SW_IP=""; WAREHOUSE=wh-azure;;
   gcs)    SW_IP=""; WAREHOUSE=wh;;
   aws)    SW_IP=""; WAREHOUSE=wh;;
   *)      SW_IP=$(ip coldfront-seaweedfs-1); WAREHOUSE=wh;;   # s3 (static) + vended
@@ -112,7 +115,7 @@ curl -sf "http://$LK_IP:8181/management/v1/bootstrap" -X POST -H "Content-Type: 
 # Backend-specific warehouse profile + credential. s3 validates by writing a
 # probe object (SeaweedFS may still be warming up → retry); azure (ADLS Gen2)
 # validates against the real account (identifiers + key from COLDFRONT_AZURE_*).
-if [ "$BACKEND" = azure ]; then
+if [ "$BACKEND" = azure ] || [ "$BACKEND" = azure-vended ]; then
   WH_BODY="{
     \"warehouse-name\":\"wh-azure\",
     \"storage-profile\":{\"type\":\"adls\",\"filesystem\":\"${COLDFRONT_AZURE_FILESYSTEM}\",\"account-name\":\"${COLDFRONT_AZURE_ACCOUNT}\"},
