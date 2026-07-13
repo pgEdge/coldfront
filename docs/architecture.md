@@ -690,3 +690,30 @@ on the catalog's current spec, with no new SQL surface (existing
 transform). Until then the spec stays empty and pruning relies on
 manifest statistics.
 
+### duckdb-iceberg: append to the manifest list instead of rebuilding it
+
+At commit, duckdb-iceberg (v1.5) rebuilds the new snapshot's manifest
+list from every entry of the existing one (`CreateFromEntries` plus
+`IcebergAddSnapshot`), so the commit reads the whole existing manifest
+list. Under ColdFront's serialized cold-write protocol that read happens
+while the writer holds the bakery ticket, and its cost grows with the
+manifest-list length, so it inflates the serialized critical section
+(compaction only partly offsets it).
+
+**Workaround today:** the `iceberg-bakery-aware-commit-refresh` patch
+re-reads the manifest list from the freshly-loaded catalog head inside
+the ticket (`RefreshExistingManifestList`). This is correct - it folds
+in any peer manifests committed since this writer staged its parquet -
+but it pays the full re-scan of the manifest list under the lock.
+
+**Upstream shape that would drop it:** a manifest-list commit that
+appends the new manifest to the existing manifest-list file, referenced
+by path from the current catalog head, instead of rebuilding from all
+scanned entries. That keeps peer inclusion (the fresh head already points
+at peers' manifests) while removing the full re-scan from the commit, so
+the serialized section no longer grows with manifest-list length. It is
+correctness-sensitive (manifest-list integrity, commit conflicts, silent
+data loss) and its throughput value is unmeasured and workload dependent,
+so it belongs upstream with fleet benchmarking rather than as a
+ColdFront-carried patch.
+
