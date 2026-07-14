@@ -338,6 +338,11 @@ BEGIN
                         -- cold rows via _move_row_literal.
                         '_cross_tier_move', '_move_row_literal', '_move_pg_row_literal',
                         '_enqueue_release',
+                        -- cold-write serializer gate wrappers (armed-predicate +
+                        -- the claim-or-advisory acquire); app-role cold paths call
+                        -- these SECURITY INVOKER wrappers, which delegate to the
+                        -- DEFINER primitives below.
+                        '_bakery_armed', '_take_iceberg_claim',
                         -- R-A bakery coordination (mesh cold writes); SECURITY
                         -- DEFINER, so the app role just needs EXECUTE — the
                         -- spock/dblink/pg_stat_replication access happens as owner.
@@ -771,9 +776,6 @@ DECLARE
     batch_size      int  := current_setting('coldfront.cold_write_batch_size')::int;  -- GUC, default 10000
     i               int;
     col             text;
-    my_ticket       bigint;
-    v_armed         boolean := NULLIF(current_setting('snowflake.node', true), '') IS NOT NULL
-                           AND NULLIF(current_setting('coldfront.dblink_self', true), '') IS NOT NULL;
 BEGIN
     -- Mixed-tier writes inside one PG tx (PG hot INSERT plus DuckDB
     -- raw_query writes for cold) need pg_duckdb's mixed-write guard
@@ -806,16 +808,11 @@ BEGIN
 
     -- Serialise the whole cold-insert loop ONCE (it issues many batched
     -- raw_query INSERTs in this single transaction; all commit together at
-    -- xact end). Same v_armed gate as _exec_iceberg_with_claim: multi-node →
-    -- one R-A claim (released by the C XactCallback at commit); single-node →
-    -- one local advisory xact lock. Taken before the loop so the whole batch
-    -- sequence commits under one serialization.
-    IF v_armed THEN
-        my_ticket := coldfront._claim_iceberg_lock(v_iceberg);
-        PERFORM coldfront._enqueue_release(my_ticket);
-    ELSE
-        PERFORM pg_advisory_xact_lock(hashtext('coldfront_iceberg:' || v_iceberg));
-    END IF;
+    -- xact end). Same gate as _exec_iceberg_with_claim: mesh takes one R-A
+    -- claim (released by the C XactCallback at commit), vanilla one local
+    -- advisory xact lock. Taken before the loop so the whole batch sequence
+    -- commits under one serialization.
+    PERFORM coldfront._take_iceberg_claim(v_iceberg);
 
     -- Identity column + its sequence (NULL if no IDENTITY column).
     SELECT a.attname,
@@ -1002,9 +999,6 @@ DECLARE
     v_targets     timestamptz[];
     v_hot_targets timestamptz[];
     v_uncovered   bigint;
-    my_ticket     bigint;
-    v_armed       boolean := NULLIF(current_setting('snowflake.node', true), '') IS NOT NULL
-                         AND NULLIF(current_setting('coldfront.dblink_self', true), '') IS NOT NULL;
 BEGIN
     SET LOCAL duckdb.unsafe_allow_execution_inside_functions = on;
     SET LOCAL duckdb.unsafe_allow_mixed_transactions = on;
@@ -1099,13 +1093,8 @@ BEGIN
     END IF;
 
     -- One claim for the whole move (released at xact end by the C XactCallback);
-    -- mesh → R-A bakery, vanilla → local advisory xact lock.
-    IF v_armed THEN
-        my_ticket := coldfront._claim_iceberg_lock(v_iceberg);
-        PERFORM coldfront._enqueue_release(my_ticket);
-    ELSE
-        PERFORM pg_advisory_xact_lock(hashtext('coldfront_iceberg:' || v_iceberg));
-    END IF;
+    -- mesh takes the R-A bakery, vanilla a local advisory xact lock.
+    PERFORM coldfront._take_iceberg_claim(v_iceberg);
 
     -- ── Capture the moved rows by VALUE (no iceberg_scan in any modifying stmt) ──
     -- Affected COLD rows are read with a SELECT cursor over iceberg_scan (a pure
@@ -1414,13 +1403,6 @@ CREATE OR REPLACE PROCEDURE coldfront.cutover_archive(
 LANGUAGE plpgsql AS $$
 DECLARE
     parent_table text;
-    my_ticket    bigint;
-    -- Same gate the cold WRITE path uses (_exec_iceberg_with_claim): mesh takes
-    -- the R-A bakery claim, vanilla a local xact advisory lock — on the SAME
-    -- per-iceberg-table key. Acquiring it here serializes the cutover against
-    -- concurrent cold writers through their own mutex.
-    v_armed   boolean := NULLIF(current_setting('snowflake.node', true), '') IS NOT NULL
-                     AND NULLIF(current_setting('coldfront.dblink_self', true), '') IS NOT NULL;
 BEGIN
     SELECT format('%I.%I', n.nspname, c.relname) INTO parent_table
     FROM pg_inherits i
@@ -1449,12 +1431,10 @@ BEGIN
     -- xact-scoped. Deliberately NO lock_timeout on this acquire — we WANT to
     -- wait out an in-flight cold writer's full commit so its RowExclusive on the
     -- partition is gone before we ask for ACCESS EXCLUSIVE.
-    IF v_armed THEN
-        my_ticket := coldfront._claim_iceberg_lock(p_iceberg_ref);
-        PERFORM coldfront._enqueue_release(my_ticket);
-    ELSE
-        PERFORM pg_advisory_xact_lock(hashtext('coldfront_iceberg:' || p_iceberg_ref));
-    END IF;
+    -- Same per-iceberg-table mutex the cold WRITE path takes, on the SAME key,
+    -- so the cutover serializes against concurrent cold writers (mesh R-A claim,
+    -- vanilla advisory). No lock_timeout here (deliberate; see above).
+    PERFORM coldfront._take_iceberg_claim(p_iceberg_ref);
 
     -- GLOBAL LOCK ORDER, step 2 — now A. lock_timeout is the circuit breaker on
     -- the ACCESS EXCLUSIVE acquisition ONLY (not the bakery above): if a writer
@@ -2297,6 +2277,33 @@ CREATE FUNCTION coldfront._enqueue_release(p_ticket bigint)
 RETURNS void
 LANGUAGE c AS 'coldfront', 'coldfront_enqueue_release';
 
+-- coldfront._bakery_armed: TRUE when this node is configured for the multi-writer
+-- Ricart-Agrawala bakery (both GUCs the protocol needs are set). FALSE means
+-- vanilla single-node, which serializes cold writes with a local advisory xact
+-- lock. The single source of truth for the gate.
+CREATE FUNCTION coldfront._bakery_armed() RETURNS boolean
+LANGUAGE sql STABLE AS $$
+    SELECT NULLIF(current_setting('snowflake.node', true), '') IS NOT NULL
+       AND NULLIF(current_setting('coldfront.dblink_self', true), '') IS NOT NULL
+$$;
+
+-- coldfront._take_iceberg_claim: acquire the per-iceberg-table cold-write mutex,
+-- held to transaction end. Mesh (_bakery_armed): take the R-A bakery claim and
+-- enqueue its release for the C XactCallback. Vanilla: a transaction-scoped local
+-- advisory lock (auto-released at xact end). Callers decide WHEN to call it
+-- relative to their own work; it deliberately omits the standby
+-- (pg_is_in_recovery) guard and any lock ordering, which stay in callers.
+CREATE FUNCTION coldfront._take_iceberg_claim(p_iceberg_ref text) RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF coldfront._bakery_armed() THEN
+        PERFORM coldfront._enqueue_release(coldfront._claim_iceberg_lock(p_iceberg_ref));
+    ELSE
+        PERFORM pg_advisory_xact_lock(hashtext('coldfront_iceberg:' || p_iceberg_ref));
+    END IF;
+END;
+$$;
+
 -- Is the async-parquet upload ordering BOTH requested AND safe to use?
 -- coldfront.iceberg_async_parquet asks to stage parquet OUTSIDE the bakery claim
 -- (writers overlap on S3); that is correct ONLY when the loaded duckdb-iceberg
@@ -2348,7 +2355,7 @@ $$;
 --     at commit. This is the path for plain PostgreSQL tiered deployments, which
 --     have no snowflake.node / dblink_self configured.
 --
--- v_armed probes the two GUCs the R-A bakery requires. current_setting(...,true)
+-- _bakery_armed() probes the two GUCs the R-A bakery requires. current_setting(...,true)
 -- returns NULL for an unrecognised GUC, so the probe is safe with no snowflake
 -- extension loaded.
 CREATE FUNCTION coldfront._exec_iceberg_with_claim(
@@ -2356,9 +2363,9 @@ CREATE FUNCTION coldfront._exec_iceberg_with_claim(
     p_sql           text
 ) RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
-    my_ticket bigint;
-    v_armed   boolean := NULLIF(current_setting('snowflake.node', true), '') IS NOT NULL
-                     AND NULLIF(current_setting('coldfront.dblink_self', true), '') IS NOT NULL;
+    -- v_armed drives BOTH the acquire (via _take_iceberg_claim) and the async
+    -- vs stock upload ordering below, so it stays a local here.
+    v_armed   boolean := coldfront._bakery_armed();
     -- Async-parquet upload ordering: stage the parquet OUTSIDE the claim (writers
     -- overlap on S3), then take the claim only to wrap pg_duckdb's deferred commit
     -- POST. Correct ONLY on the bakery-aware duckdb-iceberg build (it re-stamps
@@ -2392,20 +2399,15 @@ BEGIN
         PERFORM set_config('coldfront._async_downgrade_warned', 'true', false);
     END IF;
     IF v_armed AND v_async THEN
-        -- Patched iceberg: upload parquet in the background, then take the bakery
+        -- Patched iceberg: upload parquet in the background, then take the claim
         -- only to wrap pg_duckdb's deferred commit POST.
         PERFORM duckdb.raw_query(p_sql);
-        my_ticket := coldfront._claim_iceberg_lock(p_iceberg_table);
-        PERFORM coldfront._enqueue_release(my_ticket);
-    ELSIF v_armed THEN
-        -- Stock iceberg: claim FIRST, then upload+commit inside the held ticket
-        -- so no peer can capture a stale parent_snapshot_id.
-        my_ticket := coldfront._claim_iceberg_lock(p_iceberg_table);
-        PERFORM coldfront._enqueue_release(my_ticket);
-        PERFORM duckdb.raw_query(p_sql);
+        PERFORM coldfront._take_iceberg_claim(p_iceberg_table);
     ELSE
-        -- Vanilla single-node: local advisory lock, taken before staging.
-        PERFORM pg_advisory_xact_lock(hashtext('coldfront_iceberg:' || p_iceberg_table));
+        -- Stock (armed) or vanilla: acquire FIRST (mesh R-A claim or local
+        -- advisory, chosen inside the helper), then upload+commit inside it so no
+        -- peer can capture a stale parent_snapshot_id.
+        PERFORM coldfront._take_iceberg_claim(p_iceberg_table);
         PERFORM duckdb.raw_query(p_sql);
     END IF;
 END;
@@ -2427,21 +2429,12 @@ $$;
 -- (Bakery_v2.cfg); the patchless-async shortcut it must avoid is Bakery_v2_race.
 CREATE FUNCTION coldfront._claim_iceberg_external(p_iceberg_table text)
 RETURNS void LANGUAGE plpgsql AS $$
-DECLARE
-    my_ticket bigint;
-    v_armed   boolean := NULLIF(current_setting('snowflake.node', true), '') IS NOT NULL
-                     AND NULLIF(current_setting('coldfront.dblink_self', true), '') IS NOT NULL;
 BEGIN
     IF pg_is_in_recovery() THEN
         RAISE EXCEPTION 'coldfront: cannot compact (Iceberg write) on a read-only standby'
             USING HINT = 'Standbys serve reads only; run the compactor against the primary.';
     END IF;
-    IF v_armed THEN
-        my_ticket := coldfront._claim_iceberg_lock(p_iceberg_table);
-        PERFORM coldfront._enqueue_release(my_ticket);
-    ELSE
-        PERFORM pg_advisory_xact_lock(hashtext('coldfront_iceberg:' || p_iceberg_table));
-    END IF;
+    PERFORM coldfront._take_iceberg_claim(p_iceberg_table);
 END;
 $$;
 
