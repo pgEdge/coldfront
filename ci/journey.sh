@@ -2028,6 +2028,73 @@ EOF
     # export round-trips the managed set to reviewable YAML.
     "$ARCHIVER" export --config /tmp/journey-conn.yaml >/tmp/journey-export.log 2>&1
     if grep -q "source_table: cli_events" /tmp/journey-export.log; then pass "export emits cli_events as YAML"; else fail "export missing cli_events"; tail -5 /tmp/journey-export.log; fi
+
+    # TC-118: archiver.tables in YAML is ignored at runtime — the archiver always
+    # resolves its table set from coldfront.partition_config regardless of what
+    # archiver.tables says in the config file.
+    cat > /tmp/journey-yaml-tables.yaml <<EOYAML
+postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
+iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog", namespace: "default" }
+$(storage_yaml)
+archiver:
+  tables:
+    - source_table: bogus_table_yaml
+      partition_period: monthly
+      hot_period: "1 month"
+      retention_period: "2 years"
+EOYAML
+    if "$ARCHIVER" --config /tmp/journey-yaml-tables.yaml >/tmp/journey-yaml-tables.log 2>&1; then
+        pass "TC-118: archiver ran with stale archiver.tables block in YAML"
+    else
+        fail "TC-118: archiver failed — see /tmp/journey-yaml-tables.log"; tail -8 /tmp/journey-yaml-tables.log
+    fi
+    if grep -q "from coldfront.partition_config" /tmp/journey-yaml-tables.log; then
+        pass "TC-118: archiver drove off partition_config (YAML archiver.tables ignored)"
+    else
+        fail "TC-118: archiver did not load from partition_config"; tail -5 /tmp/journey-yaml-tables.log
+    fi
+    if grep -qi "bogus_table_yaml" /tmp/journey-yaml-tables.log; then
+        fail "TC-118: archiver processed the YAML-only table (should be ignored)"
+    else
+        pass "TC-118: YAML archiver.tables block was not processed"
+    fi
+
+    # TC-119: export → delete row → import restores the partition_config entry.
+    # Build a complete import YAML by prepending the connection config to the
+    # exported archiver.tables (export emits only the archiver: section).
+    cp /tmp/journey-conn.yaml /tmp/journey-roundtrip.yaml
+    "$ARCHIVER" export --config /tmp/journey-conn.yaml >> /tmp/journey-roundtrip.yaml 2>/dev/null
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE schema_name='public' AND table_name='cli_events';" >/dev/null
+    assert_eq "TC-119: cli_events deleted from partition_config" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='cli_events';")"
+    if "$ARCHIVER" import --config /tmp/journey-roundtrip.yaml >/tmp/journey-roundtrip.log 2>&1; then
+        pass "TC-119: import from exported YAML succeeded"
+    else
+        fail "TC-119: import failed — see /tmp/journey-roundtrip.log"; tail -5 /tmp/journey-roundtrip.log
+    fi
+    assert_eq "TC-119: cli_events row restored in partition_config" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='cli_events';")"
+
+    # TC-120: set writes to partition_config only — the YAML config file is never
+    # touched. Capture a checksum before, run set, then verify both the DB
+    # change and the unchanged file.
+    local yaml_cksum; yaml_cksum=$(md5sum /tmp/journey-conn.yaml | awk '{print $1}')
+    if "$ARCHIVER" set --config /tmp/journey-conn.yaml --table cli_events --hot-period "45 days" >/tmp/journey-setf.log 2>&1; then
+        pass "TC-120: set --hot-period succeeded"
+    else
+        fail "TC-120: set failed — see /tmp/journey-setf.log"; tail -3 /tmp/journey-setf.log
+    fi
+    local hot_val; hot_val=$(q "$HOST" "SELECT hot_period FROM coldfront.partition_config WHERE schema_name='public' AND table_name='cli_events';")
+    if echo "$hot_val" | grep -qi "45"; then
+        pass "TC-120: partition_config.hot_period updated to 45 days"
+    else
+        fail "TC-120: partition_config.hot_period not updated (got: $hot_val)"
+    fi
+    if [ "$(md5sum /tmp/journey-conn.yaml | awk '{print $1}')" = "$yaml_cksum" ]; then
+        pass "TC-120: YAML file unchanged by set"
+    else
+        fail "TC-120: set modified the YAML file (it must not)"
+    fi
 }
 
 # idmode_check <label> <table> <coltype> <id-default> <id-scheme> — provision a
@@ -2572,6 +2639,47 @@ story_partitioner_remove() {
     q "$HOST" "DROP SCHEMA rmtest CASCADE;" >/dev/null 2>&1
 }
 
+# ───────────────────────────────────────────────────────────────────────────
+# Story — TC-071: a PARTITION BY RANGE (col1, col2) table is rejected at
+# archive time with a clear error. The PK check at register time passes (the
+# PK covers every partition-key column), but the archiver's single scalar
+# watermark cannot express independent per-dimension thresholds, so it rejects
+# composite partition keys before attempting any Iceberg work.
+# ───────────────────────────────────────────────────────────────────────────
+story_composite_key_rejected() {
+    step "TC-071: composite partition key RANGE (region, ts) rejected at archive time"
+    q "$HOST" "CREATE TABLE IF NOT EXISTS public.composite_part (
+        id bigint, region text NOT NULL, ts timestamptz NOT NULL,
+        PRIMARY KEY (id, region, ts)
+    ) PARTITION BY RANGE (region, ts);" >/dev/null
+    # register succeeds: validatePKSuperset passes because the PK covers all
+    # partition-key columns. The composite-key guard fires later in the archiver.
+    if "$ARCHIVER" register --config /tmp/journey-archiver.yaml --table composite_part \
+            --period monthly --hot-period "1 month" --retention "5 years" >/tmp/journey-cp-reg.log 2>&1; then
+        pass "TC-071: register composite_part succeeded (PK covers partition key)"
+    else
+        fail "TC-071: register composite_part failed unexpectedly — see /tmp/journey-cp-reg.log"
+        tail -3 /tmp/journey-cp-reg.log
+        q "$HOST" "DROP TABLE IF EXISTS public.composite_part;" >/dev/null 2>&1; return
+    fi
+    assert_eq "TC-071: composite_part row written to partition_config" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='composite_part';")"
+    # Archive run: detectPartitionColumns sees two columns and exits non-zero
+    # before any Iceberg or S3 work is attempted.
+    if "$ARCHIVER" --config /tmp/journey-archiver.yaml >/tmp/journey-cp.log 2>&1; then
+        fail "TC-071: archiver should have rejected the composite partition key"
+    else
+        if grep -qi "multi-column partition keys are not supported" /tmp/journey-cp.log; then
+            pass "TC-071: archiver rejects composite partition key (multi-column guard)"
+        else
+            fail "TC-071: archiver failed but wrong reason"; tail -5 /tmp/journey-cp.log
+        fi
+    fi
+    # Clean up so partition_config stays tidy for any subsequent stories.
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name='composite_part';" >/dev/null 2>&1
+    q "$HOST" "DROP TABLE IF EXISTS public.composite_part;" >/dev/null 2>&1
+}
+
 # ── orchestrate ────────────────────────────────────────────────────────────
 # Setup is shared. The story set then branches on mode: tiered exercises the
 # hot+cold partitioned path; decoupled exercises the all-Iceberg wrapper. (The
@@ -2620,6 +2728,7 @@ if [ "$MODE" = "tiered" ]; then
     story_partitioner_set_retention    # TC-052: set --retention updates partition_config
     story_partitioner_disable_enable   # TC-053: disable silently excludes; enable restores
     story_partitioner_remove           # TC-054: remove unregisters; table intact
+    story_composite_key_rejected       # TC-071: RANGE (col1, col2) rejected at archive time
 else
     story_provision_decoupled
     story_decoupled_crud
