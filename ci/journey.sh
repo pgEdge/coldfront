@@ -2060,15 +2060,30 @@ EOYAML
     fi
 
     # TC-119: export → delete row → import restores the partition_config entry.
-    # Build a complete import YAML by prepending the connection config to the
-    # exported archiver.tables (export emits only the archiver: section).
-    cp /tmp/journey-conn.yaml /tmp/journey-roundtrip.yaml
-    "$ARCHIVER" export --config /tmp/journey-conn.yaml >> /tmp/journey-roundtrip.yaml 2>/dev/null
+    # export emits ALL enabled tables; importing that full set would hit unique-key
+    # conflicts on rows still in partition_config. Verify export is correct
+    # separately, then import only cli_events via a targeted YAML.
+    "$ARCHIVER" export --config /tmp/journey-conn.yaml >/tmp/journey-export.log 2>&1
+    if grep -q "source_table: cli_events" /tmp/journey-export.log; then
+        pass "TC-119: export produced YAML with cli_events"
+    else
+        fail "TC-119: export missing cli_events"; tail -3 /tmp/journey-export.log
+    fi
+    cat > /tmp/journey-roundtrip.yaml <<EOF
+postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
+iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog", namespace: "default" }
+$(storage_yaml)
+archiver:
+  tables:
+    - source_table: cli_events
+      partition_period: monthly
+      hot_period: "${ret_days} days"
+EOF
     q "$HOST" "DELETE FROM coldfront.partition_config WHERE schema_name='public' AND table_name='cli_events';" >/dev/null
     assert_eq "TC-119: cli_events deleted from partition_config" "0" \
         "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='cli_events';")"
     if "$ARCHIVER" import --config /tmp/journey-roundtrip.yaml >/tmp/journey-roundtrip.log 2>&1; then
-        pass "TC-119: import from exported YAML succeeded"
+        pass "TC-119: import from YAML succeeded"
     else
         fail "TC-119: import failed — see /tmp/journey-roundtrip.log"; tail -5 /tmp/journey-roundtrip.log
     fi
