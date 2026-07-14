@@ -1713,6 +1713,18 @@ EOF
 story_archiver_rollback() {
     step "Archiver rollback: mid-archive crash → Phase 0 self-heals on re-run"
 
+    # Tear down the temp table + its config/watermark rows on EVERY exit path,
+    # including the early failure returns below, so a failed run cannot leak
+    # rb_events (or its partition_config row) into later config-driven stories.
+    _rb_cleanup() {
+        q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name='rb_events';" >/dev/null 2>&1
+        q "$HOST" "DELETE FROM coldfront.archive_watermark WHERE table_name='rb_events';" >/dev/null 2>&1
+        q "$HOST" "DROP VIEW  IF EXISTS public.rb_events CASCADE;" >/dev/null 2>&1
+        q "$HOST" "DROP TABLE IF EXISTS public._rb_events CASCADE;" >/dev/null 2>&1
+        q "$HOST" "DROP TABLE IF EXISTS public.rb_events CASCADE;" >/dev/null 2>&1
+    }
+    trap _rb_cleanup RETURN
+
     local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
     local ret_days; ret_days=$(( ( $(date -u +%s) - $(date -u -d "$(date -u +%Y-%m-01) -1 month" +%s) ) / 86400 ))
 
@@ -1752,10 +1764,25 @@ iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:818
 $(storage_yaml)
 EOF
 
-    # Run with a 60s debug delay so Phase 2 completes before we kill.
+    # Hold the window open AFTER Phase 2 (bulk export+commit) and BEFORE Phase 3
+    # (replay+cutover). Wait for the archiver to actually reach that hold (its log
+    # marker) before killing, so the crash lands with cold rows already in Iceberg
+    # but the partition not yet cut over -- the partial state Phase 0 must
+    # self-heal. Fail loudly if it never gets there (else the test proves nothing).
     "$ARCHIVER" --config /tmp/journey-rb.yaml --debug-export-delay 60s >/tmp/journey-rb-crash.log 2>&1 &
     local arch_pid=$!
-    sleep 10
+    local reached=0
+    for _ in $(seq 1 60); do
+        grep -q "debug-export-delay" /tmp/journey-rb-crash.log 2>/dev/null && { reached=1; break; }
+        kill -0 "$arch_pid" 2>/dev/null || break   # archiver exited early (error)
+        sleep 1
+    done
+    if [ "$reached" != 1 ]; then
+        fail "archiver never reached the post-Phase-2 hold (nothing to crash-test)"
+        tail -8 /tmp/journey-rb-crash.log
+        kill "$arch_pid" 2>/dev/null || true; wait "$arch_pid" 2>/dev/null || true
+        return
+    fi
     kill "$arch_pid" 2>/dev/null || true
     wait "$arch_pid" 2>/dev/null || true
 
@@ -1774,13 +1801,7 @@ EOF
         "$(q "$HOST" "SELECT count(*) FROM coldfront.archive_watermark WHERE table_name='rb_events';")"
     assert_eq "both rows visible via unified view after re-run" "2" \
         "$(q "$HOST" "SELECT count(*) FROM public.rb_events;")"
-
-    # Cleanup.
-    q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name='rb_events';" >/dev/null 2>&1
-    q "$HOST" "DELETE FROM coldfront.archive_watermark WHERE table_name='rb_events';" >/dev/null 2>&1
-    q "$HOST" "DROP VIEW  IF EXISTS public.rb_events CASCADE;" >/dev/null 2>&1
-    q "$HOST" "DROP TABLE IF EXISTS public._rb_events CASCADE;" >/dev/null 2>&1
-    q "$HOST" "DROP TABLE IF EXISTS public.rb_events CASCADE;" >/dev/null 2>&1
+    # cleanup is handled by the RETURN trap set at the top (covers early returns)
 }
 
 # ───────────────────────────────────────────────────────────────────────────
