@@ -2385,8 +2385,10 @@ story_rename_hot_table() {
     local hot_renamed; hot_renamed=$(q "$HOST" "SELECT hot_table FROM coldfront.tiered_views WHERE schema_name='public' AND relname='events';")
     assert_contains "TC-040: tiered_views.hot_table updated to _events_renamed" "_events_renamed" "$hot_renamed"
 
-    # INSERT via the view must route to the renamed hot table.
-    q "$HOST" "INSERT INTO events (ts, status, data) VALUES (date_trunc('month',now()) - interval '1 month' + interval '2 hours', 'rename_chk', '{}');" >/dev/null
+    # INSERT via the view must route to the renamed hot table. Use a timestamp
+    # in the CURRENT month (5 days in) — this partition was premade by
+    # story_partitioner_after_swap and is unambiguously above any cutoff.
+    q "$HOST" "INSERT INTO events (ts, status, data) VALUES (date_trunc('month',now()) + interval '5 days', 'rename_chk', '{}');" >/dev/null
     assert_eq "TC-040: row landed in _events_renamed after hot table rename" "1" \
         "$(q "$HOST" "SELECT count(*) FROM public._events_renamed WHERE status='rename_chk';")"
     q "$HOST" "DELETE FROM public._events_renamed WHERE status='rename_chk';" >/dev/null
@@ -2394,7 +2396,7 @@ story_rename_hot_table() {
     # Rename back so later stories find _events as expected.
     q "$HOST" "ALTER TABLE public._events_renamed RENAME TO _events;" >/dev/null
     local hot_restored; hot_restored=$(q "$HOST" "SELECT hot_table FROM coldfront.tiered_views WHERE schema_name='public' AND relname='events';")
-    assert_contains "TC-040: tiered_views.hot_table restored to _events" '"_events"' "$hot_restored"
+    assert_eq "TC-040: tiered_views.hot_table restored to _events" "public._events" "$hot_restored"
     pass "TC-040: hot table renamed and restored, registry updated both ways"
 }
 
