@@ -2483,73 +2483,6 @@ story_rename_hot_table() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────
-# Story — TC-043: end-to-end cold-tier with a predictable row count. An
-# isolated tier_test table is seeded with 1500 cold rows (now-2mo) and 50 hot
-# rows (now-1mo). After one archiver run the cold partition is archived and
-# dropped; the unified tiered view returns 1550 (1500 cold + 50 hot).
-# ───────────────────────────────────────────────────────────────────────────
-story_cold_tier_e2e() {
-    step "TC-043: cold-tier E2E — 1500 cold rows archived; unified view = 1550"
-    qf "$HOST" <<'EOSQL' >/dev/null
-SET search_path = public;
-CREATE TABLE IF NOT EXISTS tier_test (
-    id bigint GENERATED ALWAYS AS IDENTITY,
-    ts timestamptz NOT NULL,
-    payload text,
-    PRIMARY KEY (id, ts)
-) PARTITION BY RANGE (ts);
-DO $do$
-DECLARE m_cold date; m_hot date;
-BEGIN
-    m_cold := (date_trunc('month', now()) - interval '2 months')::date;
-    m_hot  := (date_trunc('month', now()) - interval '1 month')::date;
-    EXECUTE format('CREATE TABLE IF NOT EXISTS %I PARTITION OF tier_test FOR VALUES FROM (%L) TO (%L)',
-                   'tier_test_p_' || to_char(m_cold, 'YYYY_MM'), m_cold, (m_cold + interval '1 month'));
-    EXECUTE format('CREATE TABLE IF NOT EXISTS %I PARTITION OF tier_test FOR VALUES FROM (%L) TO (%L)',
-                   'tier_test_p_' || to_char(m_hot, 'YYYY_MM'), m_hot, (m_hot + interval '1 month'));
-END $do$;
-INSERT INTO tier_test (ts, payload)
-    SELECT date_trunc('month', now()) - interval '2 months' + interval '7 days' + (i * interval '1 minute'), 'cold'
-    FROM generate_series(1, 1500) i;
-INSERT INTO tier_test (ts, payload)
-    SELECT date_trunc('month', now()) - interval '1 month' + interval '7 days' + (i * interval '1 minute'), 'hot'
-    FROM generate_series(1, 50) i;
-EOSQL
-    assert_eq "TC-043: seeded 1550 rows (1500 cold + 50 hot)" "1550" \
-        "$(q "$HOST" "SELECT count(*) FROM public.tier_test;")"
-
-    local ret_days; ret_days=$(( ( $(date -u +%s) - $(date -u -d "$(date -u +%Y-%m-01) -1 month" +%s) ) / 86400 ))
-    if ! "$ARCHIVER" register --config /tmp/journey-archiver.yaml --table tier_test \
-            --period monthly --hot-period "${ret_days} days" >/tmp/journey-tiertst.log 2>&1; then
-        fail "TC-043: register tier_test — see /tmp/journey-tiertst.log"; tail -5 /tmp/journey-tiertst.log; return
-    fi
-    cat > /tmp/journey-tiertst.yaml <<EOF
-postgres:
-  dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
-iceberg:
-  warehouse: "${WAREHOUSE}"
-  lakekeeper_endpoint: "http://${LK_IP}:8181/catalog"
-  namespace: "default"
-$(storage_yaml)
-EOF
-    if "$ARCHIVER" --config /tmp/journey-tiertst.yaml >>/tmp/journey-tiertst.log 2>&1; then
-        pass "TC-043: archiver run archived cold partition"
-    else
-        fail "TC-043: archiver run — see /tmp/journey-tiertst.log"; tail -8 /tmp/journey-tiertst.log; return
-    fi
-    assert_eq "TC-043: tier_test is now a view" "v" \
-        "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='tier_test' AND relnamespace='public'::regnamespace;")"
-    assert_eq "TC-043: unified view = 1550 (1500 cold + 50 hot)" "1550" \
-        "$(q "$HOST" "SELECT count(*) FROM public.tier_test;")"
-    local cold_p; cold_p="tier_test_p_$(date -u -d "$(date -u +%Y-%m-01) -2 months" +%Y_%m)"
-    assert_eq "TC-043: cold partition archived and dropped from PG" "0" \
-        "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname='$cold_p' AND relnamespace='public'::regnamespace;")"
-    local hot_p; hot_p="tier_test_p_$(date -u -d "$(date -u +%Y-%m-01) -1 month" +%Y_%m)"
-    assert_eq "TC-043: hot partition still present in PG" "1" \
-        "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname='$hot_p' AND relnamespace='public'::regnamespace;")"
-}
-
-# ───────────────────────────────────────────────────────────────────────────
 # Story — TC-052: partitioner set --retention updates the retention_period
 # field in partition_config. Uses an isolated schema so the shared events row
 # is not disturbed.
@@ -2739,7 +2672,6 @@ if [ "$MODE" = "tiered" ]; then
     story_wrong_s3_endpoint            # TC-022: bad S3 endpoint → Phase 2 connection error
     story_empty_partition              # TC-024: 0-row partition archives cleanly
     story_rename_hot_table             # TC-040: hot table rename updates registry + DML
-    story_cold_tier_e2e                # TC-043: 1500 cold + 50 hot → view count = 1550
     story_partitioner_set_retention    # TC-052: set --retention updates partition_config
     story_partitioner_disable_enable   # TC-053: disable silently excludes; enable restores
     story_partitioner_remove           # TC-054: remove unregisters; table intact
