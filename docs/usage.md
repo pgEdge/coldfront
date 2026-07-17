@@ -557,6 +557,13 @@ types, custom enums, arrays, composite types) is rejected at
 table-creation time. We refuse silent fallback to `varchar` - losing
 precision/identity is worse than no support.
 
+`char(N)` is stored and read as `varchar`. The data round-trips
+losslessly: values, comparisons, and `length()` match a hot PG table,
+where `length()` already ignores `char(N)` trailing padding. The only
+difference is cosmetic: a cold `char(N)` column reads back unpadded with
+`pg_typeof varchar`, because pg_duckdb has no fixed-length `char` type.
+Use `text` or `varchar` if blank-padded display matters.
+
 `json`, `jsonb` and `interval` are stored as `varchar` in Iceberg (no
 native primitive). On read, `interval` is view-cast back to the rich PG
 type; `json` and `jsonb` surface as DuckDB's `json` (the equivalent of

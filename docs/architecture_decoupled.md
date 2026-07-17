@@ -132,7 +132,7 @@ surface are:
 | `uuid` | `UUID` | identical |
 | `bytea` | `BLOB` | identical |
 | `oid` | `BIGINT` (signed-safe widen) | identical |
-| `text` / `varchar(N)` / `char(N)` | `VARCHAR` | unbounded; declared length not enforced |
+| `text` / `varchar(N)` / `char(N)` | `VARCHAR` | unbounded; declared length not enforced; `char(N)` returns unpadded (`pg_typeof varchar`) |
 | `numeric(P,S)` (P ≤ 38) | `DECIMAL(P,S)` | identical |
 | `jsonb` / `json` | `VARCHAR` | view-cast back to `json` (not `jsonb` - Iceberg has no JSON primitive) |
 | `interval` | `VARCHAR` | view-cast back to `interval` |
