@@ -650,9 +650,9 @@ choose_volume() {
   done
 }
 
-# generate_events — seed `events` across 4 historical months + the current one,
+# generate_events — seed `events` across ~24 months of history,
 # all derived from now() (never invented literals). Explicit id keeps inserts
-# on the fast set-based path. Spread <rows> over ~5 months by 'spacing'.
+# on the fast set-based path. Spread <rows> over ~24 months by 'spacing'.
 generate_events() {
   local rows="$1"
   local out; out=$(mktemp)
@@ -663,12 +663,13 @@ generate_events() {
   # as "Generated N rows" when the txn had actually rolled back to 0 rows.
   psql_file >"$out" 2>&1 <<EOSQL
 SET search_path = public;
--- Spread evenly across now-4mo .. now, two-minute spacing scaled to row count.
+-- Spread evenly across now-24mo .. now, spacing scaled to row count.
 INSERT INTO events (id, ts, status, data)
 SELECT i,
-       now() - ((${rows} - i) * (interval '150 days' / ${rows})),
+       now() - ((${rows} - i) * (interval '730 days' / ${rows})),
        (ARRAY['ok','warn','error'])[1 + i % 3],
-       '{}'::jsonb
+       jsonb_build_object('level', (ARRAY['info','warn','error'])[1 + i % 3],
+                          'region', 'us-east-1', 'latency_ms', (i % 500))
 FROM generate_series(1, ${rows}) i;
 EOSQL
   local rc=$?
@@ -731,12 +732,12 @@ demo_tiered() {
     explain "  ${DIM}Now we create a range-partitioned Postgres table and its monthly${RESET}"
     explain "  ${DIM}partitions — standing in for the live DB you already run. No ColdFront yet.${RESET}"
     if [ "$NONINTERACTIVE" != 1 ]; then prompt_continue; fi
-    # generate_events seeds rows across now-150d .. now (~5 months). RANGE
+    # generate_events seeds rows across now-730d .. now (~24 months). RANGE
     # partitioning REJECTS any insert with no covering partition, so we create
-    # monthly partitions from now-6mo through the current month — that fully
-    # covers the ~150-day window with margin (6 months > 150 days) under any
-    # wall clock. Everything older than 30 days tiers to cold; the current month
-    # stays hot.
+    # monthly partitions from now-24mo through the current month, which fully
+    # covers the ~730-day window with margin (25 months > 730 days) under any
+    # wall clock. Everything older than 30 days tiers to cold; the last month
+    # or two stays hot.
     psql_file >/dev/null <<'EOSQL' || { error "Could not create the demo table — a previous run's 'events' may still exist. Try 'Reset demos' from the menu, then re-run."; return 1; }
 SET search_path = public;
 CREATE TABLE events (
@@ -749,8 +750,8 @@ CREATE TABLE events (
 DO $do$
 DECLARE m date;
 BEGIN
-  FOR i IN 0..6 LOOP
-    m := (date_trunc('month', now()) - make_interval(months => 6 - i))::date;
+  FOR i IN 0..24 LOOP
+    m := (date_trunc('month', now()) - make_interval(months => 24 - i))::date;
     EXECUTE format('CREATE TABLE IF NOT EXISTS %I PARTITION OF events FOR VALUES FROM (%L) TO (%L)',
                    'events_p_' || to_char(m, 'YYYY_MM'), m, (m + interval '1 month'));
   END LOOP;
@@ -768,7 +769,7 @@ EOSQL
     local before
     while true; do
         choose_volume
-        explain "Loading ~6 months of history into the table (your accumulated data):"
+        explain "Loading ~2 years of history into the table (your accumulated data):"
         if ! generate_events "$GEN_ROWS"; then
             if [ "$NONINTERACTIVE" = 1 ]; then
                 pg "TRUNCATE events;" >/dev/null 2>&1

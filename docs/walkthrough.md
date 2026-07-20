@@ -74,6 +74,10 @@ docker compose -f examples/walkthrough/docker-compose.yml \
   up -d --build
 ```
 
+If port 5432, 8181, or 8333 is already in use on your host, set
+`COLDFRONT_PG_PORT`, `COLDFRONT_LK_PORT`, or `COLDFRONT_S3_PORT` before `up`
+(and if you remap the PG port, match it in the `psql` commands below).
+
 Bootstrap Lakekeeper, create the `wh` warehouse backed by SeaweedFS,
 and seed the `default` namespace. The warehouse POST retries until
 SeaweedFS is ready, and the namespace creation is idempotent:
@@ -192,8 +196,8 @@ PGOPTIONS='-c client_min_messages=warning' \
   psql -h localhost -p 5432 -U coldfront -d coldfront
 ```
 
-Create the partitioned table with seven monthly partitions covering a
-six-month historical window plus the current month:
+Create the partitioned table with 25 monthly partitions covering about
+two years of history plus the current month:
 
 ```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SET search_path = public;
@@ -209,10 +213,10 @@ CREATE TABLE events (
 DO $do$
 DECLARE m date;
 BEGIN
-  FOR i IN 0..6 LOOP
+  FOR i IN 0..24 LOOP
     m := (
       date_trunc('month', now())
-      - make_interval(months => 6 - i)
+      - make_interval(months => 24 - i)
     )::date;
     EXECUTE format(
       'CREATE TABLE IF NOT EXISTS %I'
@@ -226,19 +230,19 @@ BEGIN
 END $do$;
 ```
 
-The loop creates seven monthly partitions: six historical months plus
-the current month. The older months will tier to cold; the current
-month stays hot.
+The loop creates 25 monthly partitions spanning about two years. Months
+older than 30 days will tier to cold; the last month or two stays hot.
 
 Insert approximately one million rows spread evenly across the
-partition window (roughly 150 days from `now()`):
+partition window (roughly two years, 730 days, from `now()`):
 
 ```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 INSERT INTO events (id, ts, status, data)
 SELECT i,
-       now() - ((1000000 - i) * (interval '150 days' / 1000000)),
+       now() - ((1000000 - i) * (interval '730 days' / 1000000)),
        (ARRAY['ok','warn','error'])[1 + i % 3],
-       '{}'::jsonb
+       jsonb_build_object('level', (ARRAY['info','warn','error'])[1 + i % 3],
+                          'region', 'us-east-1', 'latency_ms', (i % 500))
 FROM generate_series(1, 1000000) i;
 ```
 
@@ -281,7 +285,7 @@ SELECT pg_size_pretty(
 ```text {"ignore":"true"}
  hot_size
 ----------
- 150 MB
+ 152 MB
 ```
 
 Every row - all one million - occupies hot, expensive primary storage,
@@ -313,7 +317,7 @@ Confirm both are installed:
    Name    | Version |   Schema   |            Description
 -----------+---------+------------+------------------------------------
  coldfront | 1.0     | coldfront  | transparent PG <-> Iceberg tiering
- pg_duckdb | 1.5.x   | public     | DuckDB engine inside PostgreSQL
+ pg_duckdb | 1.1.x   | public     | DuckDB engine inside PostgreSQL
 ```
 
 Two extensions - that is the entire ColdFront install. No sidecar, no
@@ -349,8 +353,8 @@ curl -s localhost:8181/management/v1/warehouse \
 ### Step 6 - Show the archiver policy
 
 The archiver policy is one rule in a YAML file: data older than 30
-days belongs in cheap object storage; the current month stays hot in
-PostgreSQL. Nothing moves yet - this step just shows the boundary.
+days belongs in cheap object storage; the most recent data stays hot
+in PostgreSQL. Nothing moves yet - this step just shows the boundary.
 
 Inspect the archiver configuration:
 
@@ -506,16 +510,16 @@ summary:
 ```text {"ignore":"true"}
   Tier                    Rows         Postgres heap
   ----------------------  -----------  ----------------
-  Hot  (Postgres)             ~85,000  ~12 MB
-  Cold (Parquet in S3)       ~915,000  0 bytes in PG
+  Hot  (Postgres)             ~68,000  ~10 MB
+  Cold (Parquet in S3)       ~932,000  0 bytes in PG
   ----------------------  -----------  ----------------
   Total                     1,000,000
 ```
 
 Before tiering (Step 3): one million rows, all hot, approximately
-150 MB of Postgres heap. After tiering: only the current month's
-rows remain in PostgreSQL; roughly 90% of the hot storage is gone
-while the total row count is unchanged.
+152 MB of Postgres heap. After tiering: only the last month or two
+remains in PostgreSQL; over 90% of the hot storage is gone while
+the total row count is unchanged.
 
 ### Step 9 - Query across tiers
 
@@ -659,12 +663,12 @@ SELECT pg_size_pretty(
 ```text {"ignore":"true"}
  hot_size
 ----------
- ~12 MB
+ ~10 MB
 ```
 
 Fresh connection: the archived row is still `corrected`, all one
 million rows are present, and the hot heap is still small. The data
-never came back to PostgreSQL. Approximately 90% of the original
+never came back to PostgreSQL. Over 90% of the original
 storage now lives in object storage as Parquet, and that data is still a
 normal, writeable part of the table - corrected in place, no
 rehydration, no separate system.
@@ -844,11 +848,17 @@ CREATE EXTENSION IF NOT EXISTS spock;
 CREATE EXTENSION IF NOT EXISTS pg_duckdb;
 CREATE EXTENSION IF NOT EXISTS coldfront;
 
+-- Create BOTH nodes first: a subscription can only be created once its
+-- provider is already a spock node, so both node_create calls must run
+-- before either sub_create.
 -- On db1:
 SELECT spock.node_create('db1', 'host=db1 user=coldfront dbname=coldfront port=5432');
-SELECT spock.sub_create('sub_db1_from_db2', 'host=db2 user=coldfront dbname=coldfront port=5432');
 -- On db2:
 SELECT spock.node_create('db2', 'host=db2 user=coldfront dbname=coldfront port=5432');
+-- Then subscribe each node to the other (order between these two does not matter):
+-- On db1:
+SELECT spock.sub_create('sub_db1_from_db2', 'host=db2 user=coldfront dbname=coldfront port=5432');
+-- On db2:
 SELECT spock.sub_create('sub_db2_from_db1', 'host=db1 user=coldfront dbname=coldfront port=5432');
 
 -- On BOTH nodes - wait for the subscription to sync, then replicate the bakery's
