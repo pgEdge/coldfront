@@ -16,8 +16,8 @@ CREATE TABLE public._events (id int, ts timestamptz, status text);
 CREATE VIEW public.events AS SELECT * FROM public._events;
 INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
 VALUES ('public', 'events', 'public._events', 'ice.default.events', 'ts');
-INSERT INTO coldfront.archive_watermark(table_name, cutoff_time)
-VALUES ('events', '2026-03-01'::timestamptz);
+INSERT INTO coldfront.archive_watermark(schema_name, table_name, cutoff_time)
+VALUES ('public', 'events', '2026-03-01'::timestamptz);
 
 -- Stable, far in the past (< cutoff) → COLD: rewritten to a single cold _exec,
 -- NOT a dual write. The original now()-expression is preserved for execution.

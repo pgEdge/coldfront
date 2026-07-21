@@ -22,7 +22,7 @@ type DBTX interface {
 type ViewConfig struct {
 	SourceSchema    string
 	SourceTable     string // original table name — becomes the view name after swap
-	IcebergTable    string // attached catalog ref, e.g. ice.default.events
+	IcebergTable    string // attached catalog ref, e.g. ice.myapp.events
 	CutoffTime      time.Time
 	PartitionColumn string
 	Columns         []Column
@@ -286,7 +286,7 @@ func GenerateTriggerFuncSQL(cfg ViewConfig) string {
 DECLARE
   cutoff timestamptz;
 BEGIN
-  SELECT cutoff_time INTO cutoff FROM coldfront.archive_watermark WHERE table_name = %s;
+  SELECT cutoff_time INTO cutoff FROM coldfront.archive_watermark WHERE schema_name = %s AND table_name = %s;
   IF cutoff IS NULL THEN
     cutoff := %s;
   END IF;
@@ -307,7 +307,7 @@ BEGIN
 END;
 $fn$ LANGUAGE plpgsql`,
 		funcName,
-		sqlutil.Literal(cfg.SourceTable),
+		sqlutil.Literal(cfg.SourceSchema), sqlutil.Literal(cfg.SourceTable),
 		cutoff,
 		col,
 		iceRef, coldPlaceholders, coldVals,

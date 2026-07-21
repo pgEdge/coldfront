@@ -29,7 +29,6 @@ type PostgresConfig struct {
 type IcebergConfig struct {
 	Warehouse          string `yaml:"warehouse"`           // Lakekeeper warehouse name
 	LakekeeperEndpoint string `yaml:"lakekeeper_endpoint"` // e.g. http://lakekeeper:8181/catalog
-	Namespace          string `yaml:"namespace"`
 }
 
 // S3Config holds credentials and endpoint for the object store backing the
@@ -139,9 +138,6 @@ func Load(path string) (*Config, error) {
 // any `schema.table` syntax in SourceTable into separate SourceSchema and
 // SourceTable components.
 func applyDefaults(cfg *Config) {
-	if cfg.Iceberg.Namespace == "" {
-		cfg.Iceberg.Namespace = "default"
-	}
 	if cfg.S3.Region == "" {
 		cfg.S3.Region = "us-east-1"
 	}

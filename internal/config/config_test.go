@@ -52,7 +52,6 @@ func TestLoad_ValidConfig(t *testing.T) {
 func TestLoad_Defaults(t *testing.T) {
 	cfg, err := Load(writeConfig(t, validConfig))
 	require.NoError(t, err)
-	assert.Equal(t, "default", cfg.Iceberg.Namespace)
 	assert.Equal(t, "us-east-1", cfg.S3.Region)
 	assert.Equal(t, "public", cfg.Archiver.Tables[0].SourceSchema)
 	assert.Equal(t, 3, cfg.Archiver.Tables[0].FuturePartitions)

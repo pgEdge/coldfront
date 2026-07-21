@@ -79,7 +79,7 @@ If port 5432, 8181, or 8333 is already in use on your host, set
 (and if you remap the PG port, match it in the `psql` commands below).
 
 Bootstrap Lakekeeper, create the `wh` warehouse backed by SeaweedFS,
-and seed the `default` namespace. The warehouse POST retries until
+and seed the `public` namespace. The warehouse POST retries until
 SeaweedFS is ready, and the namespace creation is idempotent:
 
 ```bash
@@ -111,14 +111,14 @@ curl -sf -X POST http://localhost:8181/management/v1/warehouse \
     }
   }'
 
-# Seed the default namespace
+# Seed the public namespace
 WID=$(curl -s http://localhost:8181/management/v1/warehouse \
   | grep -oE '"warehouse-id":"[^"]+"' \
   | head -1 | cut -d'"' -f4)
 curl -sf -X POST \
   "http://localhost:8181/catalog/v1/${WID}/namespaces" \
   -H 'Content-Type: application/json' \
-  -d '{"namespace":["default"]}'
+  -d '{"namespace":["public"]}'
 ```
 
 ### Using a cloud object store
@@ -369,7 +369,6 @@ postgres:
 iceberg:
     warehouse: "wh"
     lakekeeper_endpoint: "http://lakekeeper:8181/catalog"
-    namespace: "default"
 s3:
     endpoint: "seaweedfs:8333"
     region: "us-east-1"
@@ -429,7 +428,7 @@ WH_ID=$(curl -s http://localhost:8181/management/v1/warehouse \
   | head -1 | cut -d'"' -f4)
 
 META_LOC=$(curl -s \
-  "http://localhost:8181/catalog/v1/${WH_ID}/namespaces/default/tables/events" \
+  "http://localhost:8181/catalog/v1/${WH_ID}/namespaces/public/tables/events" \
   -H 'accept: application/json' \
   | grep -o '"metadata-location":"[^"]*"' \
   | head -1 | cut -d'"' -f4)
@@ -683,7 +682,7 @@ modes are independent.
 ### Create an Iceberg-only table
 
 One SQL call provisions the Iceberg table and the PostgreSQL view. The
-`default` namespace was seeded during setup, and the call wraps both
+`public` namespace was seeded during setup, and the call wraps both
 steps in a single transaction. A short retry loop guards against a
 timing edge where the warehouse is still warming up:
 

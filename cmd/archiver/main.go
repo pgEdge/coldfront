@@ -412,7 +412,7 @@ func runCycle(ctx context.Context, cfg *config.Config, t *config.TableConfig, co
 		cfg: cfg, t: t, conn: conn, wmStore: wmStore,
 		partMgr:  partition.NewManager(conn),
 		viewGen:  view.NewGenerator(conn),
-		iceTable: pgx.Identifier{"ice", cfg.Iceberg.Namespace, t.SourceTable}.Sanitize(),
+		iceTable: icebergRef(t.SourceSchema, t.SourceTable),
 		now:      now, debugExportDelay: debugExportDelay,
 	}
 
@@ -479,7 +479,7 @@ func (ac *archiveCycle) attachAndEnsureTable(ctx context.Context) error {
 	if err := attachIceberg(ctx, ac.conn, ac.cfg); err != nil {
 		return err
 	}
-	if err := ensureIcebergTable(ctx, ac.conn, ac.cfg, ac.t, ac.iceTable); err != nil {
+	if err := ensureIcebergTable(ctx, ac.conn, ac.t, ac.iceTable); err != nil {
 		return fmt.Errorf("ensure iceberg table: %w", err)
 	}
 	return nil
@@ -582,7 +582,7 @@ func (ac *archiveCycle) tierExpiredPartitions(ctx context.Context, hotExpired []
 // (idempotent cleanup, no race); otherwise run the full archive pipeline.
 func (ac *archiveCycle) archiveOnePartition(ctx context.Context, part partition.Info, columns []view.Column) error {
 	t := ac.t
-	wmCutoff, found, err := ac.wmStore.Get(ctx, t.SourceTable)
+	wmCutoff, found, err := ac.wmStore.Get(ctx, t.SourceSchema, t.SourceTable)
 	if err != nil {
 		return fmt.Errorf("get watermark: %w", err)
 	}
@@ -604,7 +604,7 @@ func (ac *archiveCycle) archiveOnePartition(ctx context.Context, part partition.
 // per-partition / per-period loop, never inside it.
 func (ac *archiveCycle) bootstrapTieredView(ctx context.Context, columns []view.Column) error {
 	t, iceTable := ac.t, ac.iceTable
-	wmCutoff, _, err := ac.wmStore.Get(ctx, t.SourceTable)
+	wmCutoff, _, err := ac.wmStore.Get(ctx, t.SourceSchema, t.SourceTable)
 	if err != nil {
 		return fmt.Errorf("get watermark: %w", err)
 	}
@@ -691,7 +691,7 @@ func runCycleTwoLevel(ctx context.Context, cfg *config.Config, t *config.TableCo
 		cfg: cfg, t: t, conn: conn, wmStore: wmStore,
 		partMgr:  partition.NewManager(conn),
 		viewGen:  view.NewGenerator(conn),
-		iceTable: pgx.Identifier{"ice", cfg.Iceberg.Namespace, t.SourceTable}.Sanitize(),
+		iceTable: icebergRef(t.SourceSchema, t.SourceTable),
 		now:      now, debugExportDelay: debugExportDelay,
 	}
 
@@ -1261,11 +1261,18 @@ func bulkExportWithSnapshot(ctx context.Context, conn *pgx.Conn, t *config.Table
 // bulk export is one autocommit DuckDB transaction; if Iceberg rejects it,
 // the whole archive cycle errors out and cron retries.)
 
+// icebergRef is the DuckDB reference for a source table's cold Iceberg table.
+// The PG schema is the Iceberg namespace, so the ref is ice.<schema>.<table>
+// and same-named tables in different PG schemas resolve to distinct tables.
+func icebergRef(schema, table string) string {
+	return pgx.Identifier{"ice", schema, table}.Sanitize()
+}
+
 // ensureIcebergTable creates the Iceberg namespace and table (matching the
 // PG source schema) if they don't already exist. Safe to call every run.
-func ensureIcebergTable(ctx context.Context, conn *pgx.Conn, cfg *config.Config, t *config.TableConfig, iceTable string) error {
+func ensureIcebergTable(ctx context.Context, conn *pgx.Conn, t *config.TableConfig, iceTable string) error {
 	if err := execDuckDB(ctx, conn, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s",
-		pgx.Identifier{"ice", cfg.Iceberg.Namespace}.Sanitize())); err != nil {
+		pgx.Identifier{"ice", t.SourceSchema}.Sanitize())); err != nil {
 		return fmt.Errorf("create namespace: %w", err)
 	}
 

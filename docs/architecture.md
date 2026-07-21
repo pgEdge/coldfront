@@ -232,7 +232,7 @@ DuckDB temp table:
 ```sql
 CREATE TEMP TABLE duck_stage USING duckdb AS
   SELECT * FROM public.p_2026_01;
-SELECT duckdb.raw_query($$INSERT INTO ice.default.events
+SELECT duckdb.raw_query($$INSERT INTO ice.public.events
   SELECT * FROM pg_temp.duck_stage$$);
 DROP TABLE duck_stage;
 ```
@@ -243,7 +243,7 @@ DROP TABLE duck_stage;
 
 ```sql
 SELECT r['id']::bigint, r['ts']::timestamptz, r['status']::text
-FROM iceberg_scan('ice.default.events') r
+FROM iceberg_scan('ice.public.events') r
 WHERE r['ts'] < '2026-03-01'::timestamptz;
 ```
 
@@ -641,7 +641,7 @@ but dwarfed by the Iceberg commit work for any realistic batch.
 straight into the Iceberg writer - e.g. a `COPY` form:
 
 ```sql
-COPY (SELECT * FROM public.events_partition) TO ICEBERG 'ice.default.events';
+COPY (SELECT * FROM public.events_partition) TO ICEBERG 'ice.public.events';
 ```
 
 That would make pg_duckdb the only place in the data path that touches

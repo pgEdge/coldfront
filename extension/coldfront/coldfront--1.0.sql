@@ -21,27 +21,29 @@ CREATE TABLE coldfront.tiered_views (
     schema_name     text    NOT NULL,                  -- namespace of the transparent view
     relname         text    NOT NULL,                  -- name of the transparent view
     hot_table       text,                              -- 'public._events' (tiered) or NULL (iceberg-only)
-    iceberg_table   text    NOT NULL,                  -- DuckDB ref: 'ice.default.events'
+    iceberg_table   text    NOT NULL,                  -- DuckDB ref, e.g. 'ice.myapp.events'
     partition_col   text,                              -- 'ts' (tiered) or NULL (iceberg-only)
     is_iceberg_only boolean NOT NULL DEFAULT false,
     PRIMARY KEY (schema_name, relname)
 );
 
--- Archive watermark: one row per managed table, recording the cutoff time
+-- Archive watermark: one row per managed (schema, table), recording the cutoff time
 -- that divides the hot tier (rows with partition_col >= cutoff_time, living
 -- in the PG heap as _<table>) from the cold tier (rows older than cutoff,
--- living in Iceberg as ice.default.<table>). Written by the archiver at the
+-- living in Iceberg as ice.<schema>.<table>). Written by the archiver at the
 -- end of each archive cycle; read by the generated tiered view's hot/cold
 -- UNION (internal/view/view.go) and by the coldfront rewriter's tier
 -- classifier when deciding whether a predicate proves hot-only or cold-only.
 --
--- PK on table_name because the archiver upserts this row every cycle via
--- ON CONFLICT (table_name) DO UPDATE (internal/watermark/watermark.go:Set).
+-- Composite PK on (schema_name, table_name) because the archiver upserts this row every cycle via
+-- ON CONFLICT (schema_name, table_name) DO UPDATE (internal/watermark/watermark.go:Set).
 -- Created with IF NOT EXISTS because the archiver can also materialize it
 -- on first run before CREATE EXTENSION runs against the DB.
 CREATE TABLE IF NOT EXISTS coldfront.archive_watermark (
-    table_name  text        PRIMARY KEY,
-    cutoff_time timestamptz NOT NULL
+    schema_name text        NOT NULL,
+    table_name  text        NOT NULL,
+    cutoff_time timestamptz NOT NULL,
+    PRIMARY KEY (schema_name, table_name)
 );
 
 -- coldfront._dummy_dml_target — a permanent, single-row DUMMY table whose data is
@@ -790,7 +792,7 @@ BEGIN
            COALESCE(aw.cutoff_time, '-infinity'::timestamptz)
     INTO v_hot_table, v_iceberg, v_partcol, v_cutoff
     FROM coldfront.tiered_views tv
-    LEFT JOIN coldfront.archive_watermark aw ON aw.table_name = p_view_name
+    LEFT JOIN coldfront.archive_watermark aw ON aw.schema_name = p_view_schema AND aw.table_name = p_view_name
     WHERE tv.schema_name = p_view_schema AND tv.relname = p_view_name;
 
     IF v_hot_table IS NULL THEN
@@ -1008,7 +1010,7 @@ BEGIN
     SELECT tv.hot_table, tv.iceberg_table, tv.partition_col, aw.cutoff_time
     INTO v_hot_table, v_iceberg, v_partcol, v_cutoff
     FROM coldfront.tiered_views tv
-    LEFT JOIN coldfront.archive_watermark aw ON aw.table_name = p_view_name
+    LEFT JOIN coldfront.archive_watermark aw ON aw.schema_name = p_view_schema AND aw.table_name = p_view_name
     WHERE tv.schema_name = p_view_schema AND tv.relname = p_view_name;
     IF v_hot_table IS NULL OR v_cutoff IS NULL THEN
         RAISE EXCEPTION 'coldfront: cross-tier move on %.% requires a tiered view with a cutoff',
@@ -1417,10 +1419,10 @@ BEGIN
 
     UPDATE coldfront.archive_watermark
        SET cutoff_time = p_new_cutoff
-     WHERE table_name = p_source;
+     WHERE schema_name = p_schema AND table_name = p_source;
     IF NOT FOUND THEN
-        INSERT INTO coldfront.archive_watermark (table_name, cutoff_time)
-        VALUES (p_source, p_new_cutoff);
+        INSERT INTO coldfront.archive_watermark (schema_name, table_name, cutoff_time)
+        VALUES (p_schema, p_source, p_new_cutoff);
     END IF;
 
     -- GLOBAL LOCK ORDER, step 1 — take the bakery (resource B) BEFORE any
@@ -1572,7 +1574,7 @@ $$;
 --
 --   p_schema         PG schema for the wrapper view (e.g. 'public').
 --   p_table          relation/view name (e.g. 'events'). Iceberg table is
---                    created at ice.default.<p_table>.
+--                    created at ice.<p_schema>.<p_table>.
 --   p_columns        jsonb array of {name, type} entries. Type is a PG type
 --                    name from the supported set; see _iceberg_storage_type.
 --   p_partition_cols array of column names for Iceberg partitioning, or NULL.
@@ -1592,7 +1594,7 @@ CREATE OR REPLACE FUNCTION coldfront.create_iceberg_table(
 ) RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
-    ice_ref          text := format('ice."default".%I', p_table);
+    ice_ref          text := format('ice.%I.%I', p_schema, p_table);
     iceberg_cols     text := '';
     view_proj        text := '';
     placeholders     text := '';
@@ -1679,7 +1681,7 @@ BEGIN
     -- against an existing table — useful for distributed setups where each
     -- node registers the same shared Iceberg table independently.
     PERFORM coldfront.ensure_attached();
-    PERFORM duckdb.raw_query('CREATE SCHEMA IF NOT EXISTS ice."default"');
+    PERFORM duckdb.raw_query(format('CREATE SCHEMA IF NOT EXISTS ice.%I', p_schema));
     PERFORM duckdb.raw_query(format(
         'CREATE TABLE IF NOT EXISTS %s (%s)',
         ice_ref, iceberg_cols
@@ -1699,7 +1701,7 @@ BEGIN
     EXECUTE format(
         'CREATE OR REPLACE VIEW %I.%I AS SELECT %s FROM duckdb.query(%L) AS t(r)',
         p_schema, p_table, view_proj,
-        format('SELECT * FROM ice.default.%s', p_table)
+        format('SELECT * FROM ice.%I.%I', p_schema, p_table)
     );
 
     -- 3. The C post_parse_analyze hook intercepts INSERT INTO the iceberg-only
@@ -1715,7 +1717,7 @@ BEGIN
     -- 4. Registry row — is_iceberg_only=true tells the C hook to short-circuit
     --    classify_tier to TIER_COLD for any INSERT/UPDATE/DELETE on this view.
     INSERT INTO coldfront.tiered_views (schema_name, relname, hot_table, iceberg_table, partition_col, is_iceberg_only)
-    VALUES (p_schema, p_table, NULL, format('ice.default.%s', p_table), NULL, true)
+    VALUES (p_schema, p_table, NULL, ice_ref, NULL, true)
     ON CONFLICT (schema_name, relname) DO UPDATE SET
         hot_table       = NULL,
         iceberg_table   = EXCLUDED.iceberg_table,
@@ -2475,7 +2477,7 @@ $$;
 
 -- Migrate the name-keyed registry + watermark rows when the transparent VIEW is
 -- renamed. coldfront.tiered_views (keyed on schema+relname) and archive_watermark
--- (keyed on the bare view name == archiver SourceTable) both follow the new name.
+-- (keyed on schema + bare view name == archiver SourceTable) both follow the new name.
 -- _rebuild_tiered_view + the regenerated INSERT trigger look the registry/cutoff
 -- up by the NEW name; without this migration the rebuild would not find the row,
 -- v_has_cutoff would be false, and the rebuilt view would drop its cold (Iceberg)
@@ -2490,7 +2492,7 @@ CREATE FUNCTION coldfront._rename_tiered_view(
      WHERE schema_name = p_schema AND relname = p_old_view_name;
     UPDATE coldfront.archive_watermark
        SET table_name = p_new_view_name
-     WHERE table_name = p_old_view_name;
+     WHERE schema_name = p_schema AND table_name = p_old_view_name;
 $$;
 
 -- coldfront._rebuild_tiered_view: regenerate the transparent UNION-ALL view
@@ -2522,9 +2524,9 @@ LANGUAGE plpgsql
 SET client_min_messages = warning AS $$
 DECLARE
     v_schema        text;
-    v_view_name     text;          -- bare relname == archiver SourceTable == watermark key
+    v_view_name     text;          -- bare relname == archiver SourceTable == watermark table_name
     v_hot_table     text;          -- stored quoted, e.g. "public"."_events"
-    v_iceberg       text;          -- DuckDB ref, e.g. ice.default.events
+    v_iceberg       text;          -- DuckDB ref, e.g. ice.myapp.events
     v_partcol       text;
     v_is_ice_only   boolean;
     v_hot_schema    text;
@@ -2577,10 +2579,10 @@ BEGIN
     v_hot_schema  := (parse_ident(v_hot_table))[1];
     v_hot_relname := (parse_ident(v_hot_table))[2];
 
-    -- 2. Watermark cutoff, keyed on the BARE view name (== SourceTable).
+    -- 2. Watermark cutoff, keyed on (schema, bare view name == SourceTable).
     SELECT cutoff_time INTO v_cutoff
     FROM coldfront.archive_watermark
-    WHERE table_name = v_view_name;
+    WHERE schema_name = v_schema AND table_name = v_view_name;
     v_has_cutoff := (v_cutoff IS NOT NULL);
     IF v_has_cutoff THEN
         -- UTC text literal, matching internal/view/view.go cutoffLiteral().
@@ -2712,7 +2714,7 @@ $fn$CREATE OR REPLACE FUNCTION %s() RETURNS trigger AS $body$
 DECLARE
   cutoff timestamptz;
 BEGIN
-  SELECT cutoff_time INTO cutoff FROM coldfront.archive_watermark WHERE table_name = %L;
+  SELECT cutoff_time INTO cutoff FROM coldfront.archive_watermark WHERE schema_name = %L AND table_name = %L;
   IF cutoff IS NULL THEN
     cutoff := %s;
   END IF;
@@ -2733,7 +2735,7 @@ BEGIN
 END;
 $body$ LANGUAGE plpgsql$fn$,
         v_funcname,
-        v_view_name,                                            -- watermark key literal
+        v_schema, v_view_name,                                  -- watermark key literals (schema, name)
         CASE WHEN v_has_cutoff
              THEN quote_literal(v_cutoff_lit) || '::timestamptz'
              ELSE '''-infinity''::timestamptz' END,             -- default cutoff
@@ -2854,7 +2856,7 @@ $$;
 -- these run cleanly at CREATE EXTENSION.
 COMMENT ON SCHEMA coldfront IS 'pgEdge ColdFront: transparent PostgreSQL to Apache Iceberg tiering, plus decoupled iceberg-only tables.';
 COMMENT ON TABLE coldfront.tiered_views IS 'Registry (keyed by schema, relname) of views the coldfront DML hook handles — tiered (hot+cold) and decoupled (iceberg-only).';
-COMMENT ON TABLE coldfront.archive_watermark IS 'Per-tiered-table hot/cold cutoff: ts >= cutoff is hot (PG), ts < cutoff is cold (Iceberg).';
+COMMENT ON TABLE coldfront.archive_watermark IS 'Per-tiered-table (schema, table) hot/cold cutoff: ts >= cutoff is hot (PG), ts < cutoff is cold (Iceberg).';
 COMMENT ON TABLE coldfront.storage_secret IS 'Cold-store credential; materialized as a DuckDB PERSISTENT SECRET, replicated by value across a Spock mesh, excluded from pg_dump. A vended row stores no credential and materializes nothing: Lakekeeper mints per-table creds and ensure_attached uses ACCESS_DELEGATION_MODE VENDED_CREDENTIALS.';
 COMMENT ON TABLE coldfront.partition_config IS 'Name-keyed per-table partition/tiering lifecycle config (period, hot_period, retention); replicates by value so every mesh node reads identical config.';
 COMMENT ON TABLE coldfront.claims IS 'Ricart-Agrawala bakery: a writer''s outstanding iceberg-commit claim (iceberg_table, snowflake ticket); deleted on release.';

@@ -32,8 +32,8 @@ CREATE VIEW public.events AS SELECT * FROM public._events;
 
 INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
 VALUES ('public', 'events', 'public._events', 'ice.default.events', 'ts');
-INSERT INTO coldfront.archive_watermark(table_name, cutoff_time)
-VALUES ('events', '2026-03-01'::timestamptz);
+INSERT INTO coldfront.archive_watermark(schema_name, table_name, cutoff_time)
+VALUES ('public', 'events', '2026-03-01'::timestamptz);
 
 -- (1) pure-cold UPDATE (literal cold predicate), param in SET: the cold call's
 -- SQL arg must be a format(...) call with a %N$L spec + a LIVE $1 arg, NOT a
@@ -85,8 +85,8 @@ CREATE TABLE public._eid (id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz
 CREATE VIEW public.eid AS SELECT * FROM public._eid;
 INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
 VALUES ('public', 'eid', 'public._eid', 'ice.default.eid', 'ts');
-INSERT INTO coldfront.archive_watermark(table_name, cutoff_time)
-VALUES ('eid', '2026-03-01'::timestamptz);
+INSERT INTO coldfront.archive_watermark(schema_name, table_name, cutoff_time)
+VALUES ('public', 'eid', '2026-03-01'::timestamptz);
 PREPARE eid_ins(timestamptz, bytea) AS INSERT INTO public.eid (ts, data) VALUES ($1, $2);
 EXPLAIN (COSTS OFF, VERBOSE) EXECUTE eid_ins('2026-01-10 00:00+00', '\xcafe'::bytea);
 

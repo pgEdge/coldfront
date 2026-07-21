@@ -68,7 +68,7 @@ curl -X POST http://localhost:8181/management/v1/warehouse \
 WID=$(curl -s http://localhost:8181/management/v1/warehouse \
   | grep -oE '"warehouse-id":"[^"]+"' | head -1 | cut -d'"' -f4)
 curl -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
-  -H "Content-Type: application/json" -d '{"namespace": ["default"]}'
+  -H "Content-Type: application/json" -d '{"namespace":["public"]}'
 ```
 
 Then install the extensions and set the cold-tier credentials, once per
@@ -198,11 +198,11 @@ SELECT coldfront.create_iceberg_table(
 
 That single statement provisions:
 
-- `ice.default.events` on the attached Iceberg catalog
+- `ice.public.events` on the attached Iceberg catalog
 - a PG-side wrapper view `public.events` with proper PG-typed columns
 - a `coldfront.tiered_views` registry row - every INSERT, UPDATE, and
   DELETE on the view is intercepted by the coldfront C hook and rewritten
-  to a single `duckdb.raw_query(...)` against `ice.default.events`
+  to a single `duckdb.raw_query(...)` against `ice.public.events`
 
 Spock's `ddl_sql` repset replicates the `CREATE VIEW`, but the registry
 row does not propagate with it: run `create_iceberg_table()` (idempotent,
@@ -630,7 +630,7 @@ Keep the following caveats in mind when running either mode:
   The throughput ceiling is Lakekeeper's commit rate, not the writer
   count.
 - **Direct table access**: `_events` is the hot heap (tiered mode only).
-  `ice.default.<name>` is the Iceberg table - only addressable via
+  `ice.public.<name>` is the Iceberg table - only addressable via
   `iceberg_scan(...)` or `duckdb.raw_query('… ice.… …')`, never via
   PG-native 3-part names.
 - **Tiered INSERT with omitted IDENTITY column** (e.g. `INSERT INTO

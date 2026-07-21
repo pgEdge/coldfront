@@ -200,9 +200,9 @@ in the warehouse and in the role's trust condition must match. On the
 database side, replace the `set_storage_secret(...)` call in Section 4
 with `SELECT coldfront.set_storage_secret_vended();`.
 
-### 3c. Pre-create the `default` namespace
+### 3c. Pre-create the `public` namespace
 
-Resolve the warehouse id, then create the `default` namespace under it:
+Resolve the warehouse id, then create the `public` namespace under it:
 
 ```bash
 WID=$(curl -s http://localhost:8181/management/v1/warehouse \
@@ -211,14 +211,14 @@ WID=$(curl -s http://localhost:8181/management/v1/warehouse \
 
 curl -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
   -H "Content-Type: application/json" \
-  -d '{"namespace": ["default"]}'
+  -d '{"namespace":["public"]}'
 ```
 
 > **Why this step is required (decoupled mode).**
 > `coldfront.create_iceberg_table()` (Section 5) runs `CREATE SCHEMA`
 > and `CREATE TABLE` in one transaction. The schema create is deferred
 > to COMMIT but the table create is POSTed eagerly, so against a
-> namespace-less warehouse it 404s. Pre-creating `default` makes the
+> namespace-less warehouse it 404s. Pre-creating `public` makes the
 > in-transaction `CREATE SCHEMA IF NOT EXISTS` a no-op. (Tiered mode's
 > archiver creates the namespace itself, so this is only needed for the
 > decoupled demo below.)
@@ -332,6 +332,6 @@ Work through this checklist if something failed:
 2. **`set_storage_secret(..., NULL, 'eu-west-1')`** - 3rd arg `NULL`
    (native vhost+HTTPS), 4th arg your real region? A non-NULL endpoint
    forces path-style and breaks modern Regions (HTTP 400).
-3. **Namespace `default` pre-created** in Lakekeeper before
+3. **Namespace `public` pre-created** in Lakekeeper before
    `create_iceberg_table`? Without it the decoupled create 404s.
 4. **Long-term key** - not an SSO / temporary session-token credential.

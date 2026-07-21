@@ -112,7 +112,7 @@ docker compose --profile local-store up -d --build
 Bootstrap Lakekeeper, create the `wh` warehouse against the SeaweedFS
 credentials in
 [`docker/seaweedfs-s3.json`](https://github.com/pgEdge/ColdFront/blob/main/docker/seaweedfs-s3.json),
-and seed the `default` namespace:
+and seed the `public` namespace:
 
 ```bash
 curl -sf -X POST http://localhost:8181/management/v1/bootstrap \
@@ -131,7 +131,7 @@ curl -s -X POST http://localhost:8181/management/v1/warehouse \
 WID=$(curl -s http://localhost:8181/management/v1/warehouse \
   | grep -oE '"warehouse-id":"[^"]+"' | head -1 | cut -d'"' -f4)
 curl -s -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
-  -H 'Content-Type: application/json' -d '{"namespace":["default"]}'
+  -H 'Content-Type: application/json' -d '{"namespace":["public"]}'
 ```
 
 Create the extensions, set the cold-store secret, create a decoupled
