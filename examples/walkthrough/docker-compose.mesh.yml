@@ -1,0 +1,119 @@
+# ColdFront walkthrough — 2-node Spock mesh stack (Demo 4, Distributed).
+# Same image as the single-node walkthrough (docker/Dockerfile.duckdb15) but
+# MESH=on, so the entrypoint loads snowflake,spock,pg_duckdb,coldfront and writes
+# the mesh GUCs (wal_level logical, spock.*, snowflake.node, dblink_self). Both
+# data nodes point at ONE shared Lakekeeper + SeaweedFS: the lake is the single
+# shared copy; only the bakery's claim metadata replicates node-to-node via Spock.
+#
+# A SEPARATE compose project from the single-node stack (docker-compose.yml,
+# project coldfront-walkthrough) so guide.sh can switch between them. The two are
+# never up at once — a laptop can't hold both — so demo 4 tears the single-node
+# stack down before bringing this up. guide.sh drives the nodes over the published
+# host ports; the nodes talk to each other over the compose network (host=db1/db2).
+#
+# snowflake.node MUST equal hashtext(<spock node name>) & 1023 — the bakery's
+# dead-peer reap maps snowflake.get_node(ticket) back to a pg_stat_replication
+# peer. db1→691, db2→109 (hashtext('dbN') & 1023).
+name: coldfront-walkthrough-mesh
+services:
+    db1:
+        build:
+            context: ../..
+            dockerfile: docker/Dockerfile.duckdb15
+            args:
+                PG_MAJOR: ${PG_MAJOR:-18}
+        hostname: db1
+        environment:
+            PG_MAJOR: ${PG_MAJOR:-18}
+            MESH: "on"
+            COLDFRONT_SNOWFLAKE_NODE: "691"
+            COLDFRONT_WAREHOUSE: wh
+            COLDFRONT_LAKEKEEPER: http://lakekeeper:8181/catalog
+        ports:
+            - "${COLDFRONT_MESH_PG1_PORT:-5442}:5432"
+        volumes:
+            - pgdata1:/var/lib/pgsql/18/data  # Tracks PG_MAJOR=18. If you override PG_MAJOR, update this path to match $PGDATA.
+        healthcheck:
+            test: ["CMD-SHELL", "pg_isready -U coldfront -d coldfront"]
+            interval: 3s
+            timeout: 2s
+            retries: 25
+
+    db2:
+        build:
+            context: ../..
+            dockerfile: docker/Dockerfile.duckdb15
+            args:
+                PG_MAJOR: ${PG_MAJOR:-18}
+        hostname: db2
+        environment:
+            PG_MAJOR: ${PG_MAJOR:-18}
+            MESH: "on"
+            COLDFRONT_SNOWFLAKE_NODE: "109"
+            COLDFRONT_WAREHOUSE: wh
+            COLDFRONT_LAKEKEEPER: http://lakekeeper:8181/catalog
+        ports:
+            - "${COLDFRONT_MESH_PG2_PORT:-5443}:5432"
+        volumes:
+            - pgdata2:/var/lib/pgsql/18/data  # Tracks PG_MAJOR=18. If you override PG_MAJOR, update this path to match $PGDATA.
+        healthcheck:
+            test: ["CMD-SHELL", "pg_isready -U coldfront -d coldfront"]
+            interval: 3s
+            timeout: 2s
+            retries: 25
+
+    seaweedfs:
+        image: chrislusf/seaweedfs:latest
+        command: "server -s3 -dir=/data -s3.config=/etc/seaweedfs/s3.json"
+        volumes:
+            - ./seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro
+            - s3data:/data
+        ports:
+            - "${COLDFRONT_MESH_S3_PORT:-8343}:8333"
+
+    lakekeeper-db:
+        image: postgres:16-alpine
+        environment:
+            POSTGRES_USER: lakekeeper
+            POSTGRES_PASSWORD: lakekeeper
+            POSTGRES_DB: lakekeeper
+        healthcheck:
+            test: ["CMD-SHELL", "pg_isready -U lakekeeper"]
+            interval: 3s
+            timeout: 2s
+            retries: 20
+
+    lakekeeper-migrate:
+        image: quay.io/lakekeeper/catalog:latest
+        command: migrate
+        depends_on:
+            lakekeeper-db:
+                condition: service_healthy
+        environment:
+            LAKEKEEPER__PG_DATABASE_URL_READ: postgres://lakekeeper:lakekeeper@lakekeeper-db:5432/lakekeeper
+            LAKEKEEPER__PG_DATABASE_URL_WRITE: postgres://lakekeeper:lakekeeper@lakekeeper-db:5432/lakekeeper
+            LAKEKEEPER__PG_ENCRYPTION_KEY: deadbeefdeadbeefdeadbeefdeadbeef
+
+    lakekeeper:
+        image: quay.io/lakekeeper/catalog:latest
+        command: serve
+        depends_on:
+            lakekeeper-migrate:
+                condition: service_completed_successfully
+        environment:
+            LAKEKEEPER__PG_DATABASE_URL_READ: postgres://lakekeeper:lakekeeper@lakekeeper-db:5432/lakekeeper
+            LAKEKEEPER__PG_DATABASE_URL_WRITE: postgres://lakekeeper:lakekeeper@lakekeeper-db:5432/lakekeeper
+            LAKEKEEPER__PG_ENCRYPTION_KEY: deadbeefdeadbeefdeadbeefdeadbeef
+            LAKEKEEPER__LISTEN_PORT: 8181
+        ports:
+            - "${COLDFRONT_MESH_LK_PORT:-8191}:8181"
+        healthcheck:
+            test: ["CMD", "/home/nonroot/lakekeeper", "healthcheck"]  # full path (see #31)
+            interval: 3s
+            timeout: 2s
+            retries: 10
+
+volumes:
+    pgdata1:
+    pgdata2:
+    s3data:

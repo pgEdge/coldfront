@@ -68,6 +68,9 @@ correct tier, so the application sees one relation:
 
 ## Installation
 
+New here? Run the [guided walkthrough](docs/walkthrough.md) to see all
+three modes in action with copy-pasteable commands.
+
 ColdFront is open source under the PostgreSQL License and runs on stock
 PostgreSQL 16, 17, and 18. The full build workflow lives in the
 **[Installation guide](docs/installation.md)**: build the thin coldfront
