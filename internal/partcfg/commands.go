@@ -363,7 +363,13 @@ func (r configRow) insertSQL() string {
 	return fmt.Sprintf(`INSERT INTO coldfront.partition_config
   (schema_name, table_name, partition_period, partition_column, future_partitions,
    part_mode, id_scheme, hot_period, retention_period, sub_part_values_source, expiration_strategy)
-VALUES (%s, %s, %s, %s, %d, %s, %s, %s, %s, %s, %s);`,
+VALUES (%s, %s, %s, %s, %d, %s, %s, %s, %s, %s, %s)
+ON CONFLICT (schema_name, table_name) DO UPDATE SET
+  partition_period = EXCLUDED.partition_period, partition_column = EXCLUDED.partition_column,
+  future_partitions = EXCLUDED.future_partitions, part_mode = EXCLUDED.part_mode,
+  id_scheme = EXCLUDED.id_scheme, hot_period = EXCLUDED.hot_period,
+  retention_period = EXCLUDED.retention_period, sub_part_values_source = EXCLUDED.sub_part_values_source,
+  expiration_strategy = EXCLUDED.expiration_strategy;`,
 		lit(r.schema), lit(r.table), lit(r.period), lit(r.column), r.premake,
 		lit(r.partMode), lit(r.idScheme), lit(r.hot), lit(r.retention), lit(r.subValues), lit(r.strategy))
 }
