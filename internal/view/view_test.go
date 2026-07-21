@@ -161,6 +161,7 @@ func TestGenerateViewSQL_BootstrapMatchesCutoverHotCasts(t *testing.T) {
 func TestGenerateTriggerFuncSQL_ColdInsertWatermarkCheck(t *testing.T) {
 	sql := GenerateTriggerFuncSQL(testCfg)
 	assert.Contains(t, sql, "archive_watermark")
+	assert.Contains(t, sql, "schema_name = 'public'") // watermark lookup is schema-scoped
 	assert.Contains(t, sql, `NEW."ts" < cutoff`)
 }
 

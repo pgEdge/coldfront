@@ -43,7 +43,7 @@ type runOpts struct {
 
 func main() {
 	cfgPath := flag.String("config", "", "deployment YAML: DSN + iceberg/S3/azure storage creds")
-	tableName := flag.String("table", "", "table in the configured iceberg namespace (required)")
+	tableName := flag.String("table", "", "[schema.]table to maintain; schema (default public) maps to the Iceberg namespace (required)")
 	targetMB := flag.Int64("target-size-mb", 128, "compaction: target output Parquet file size in MiB")
 	dryRun := flag.Bool("dry-run", false, "plan only — report what would change, change nothing")
 	expire := flag.Bool("expire-snapshots", false, "also expire old snapshots and reclaim the files they alone pinned")
@@ -85,7 +85,6 @@ func run(cfgPath, tableName string, o runOpts) error {
 	if err != nil {
 		return err
 	}
-	ns := cfg.Iceberg.Namespace
 
 	// Keep Accept-Encoding out of SigV4 signing for a TLS S3-compatible cold
 	// store (GCS rejects it); a no-op otherwise. Rides the context into every
@@ -102,9 +101,11 @@ func run(cfgPath, tableName string, o runOpts) error {
 
 	// The bakery claim key MUST be byte-identical to the cold-write path's so every
 	// mutating step mutually-excludes with concurrent cold writers. The archiver and
-	// hook build it as pgx.Identifier{"ice", namespace, table}.Sanitize()
-	// (cmd/archiver/main.go iceTable; coldfront--1.0.sql tiered_views.iceberg_table).
-	icebergRef := pgx.Identifier{"ice", ns, tableName}.Sanitize()
+	// hook build it as pgx.Identifier{"ice", schema, table}.Sanitize() with the PG
+	// schema as the Iceberg namespace (cmd/archiver/main.go icebergRef;
+	// coldfront--1.0.sql tiered_views.iceberg_table).
+	schema, table := splitSchemaTable(tableName)
+	icebergRef := pgx.Identifier{"ice", schema, table}.Sanitize()
 
 	// One PG connection, shared across each step's bakery claim, opened lazily — a
 	// pure dry-run never needs it.
@@ -125,16 +126,16 @@ func run(cfgPath, tableName string, o runOpts) error {
 		return withBakeryClaim(ctx, conn, icebergRef, fn)
 	}
 
-	if err := doCompaction(ctx, cat, ns, tableName, o, claim); err != nil {
+	if err := doCompaction(ctx, cat, schema, table, o, claim); err != nil {
 		return err
 	}
 	if o.expire {
-		if err := doExpire(ctx, cat, ns, tableName, o, claim); err != nil {
+		if err := doExpire(ctx, cat, schema, table, o, claim); err != nil {
 			return err
 		}
 	}
 	if o.orphans {
-		if err := doOrphans(ctx, cat, ns, tableName, o, claim); err != nil {
+		if err := doOrphans(ctx, cat, schema, table, o, claim); err != nil {
 			return err
 		}
 	}

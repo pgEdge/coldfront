@@ -8,6 +8,20 @@ import (
 	"github.com/apache/iceberg-go/utils"
 )
 
+func TestSplitSchemaTable(t *testing.T) {
+	cases := []struct{ arg, schema, table string }{
+		{"events", "public", "events"},
+		{"myapp.events", "myapp", "events"},
+		{"analytics.events", "analytics", "events"},
+	}
+	for _, c := range cases {
+		s, tbl := splitSchemaTable(c.arg)
+		if s != c.schema || tbl != c.table {
+			t.Errorf("splitSchemaTable(%q) = (%q, %q); want (%q, %q)", c.arg, s, tbl, c.schema, c.table)
+		}
+	}
+}
+
 func TestStorageProps_S3Compat(t *testing.T) {
 	// SeaweedFS/MinIO: explicit http endpoint, path-style addressing.
 	c := &Config{}

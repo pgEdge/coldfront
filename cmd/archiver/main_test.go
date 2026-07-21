@@ -495,3 +495,14 @@ func TestCutoverFailHint(t *testing.T) {
 	assert.Empty(t, cutoverFailHint(&pgconn.PgError{Code: "55P03"}), "no hint for the transient lock timeout")
 	assert.Empty(t, cutoverFailHint(errors.New("boom")), "no hint for non-Postgres errors")
 }
+
+// Two tables sharing a name in different PG schemas map to distinct Iceberg
+// tables, since the PG schema is the Iceberg namespace (ice.<schema>.<table>).
+func TestIcebergRef_SchemaScoped(t *testing.T) {
+	a := icebergRef("myapp", "events")
+	b := icebergRef("analytics", "events")
+	assert.NotEqual(t, a, b, "distinct schemas yield distinct iceberg refs")
+	assert.Contains(t, a, "myapp")
+	assert.Contains(t, a, "events")
+	assert.Contains(t, b, "analytics")
+}

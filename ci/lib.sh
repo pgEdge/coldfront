@@ -115,6 +115,6 @@ create_warehouse_and_seed() {
     [ -z "$wid" ] && wid=$(curl -s "http://$lk_ip:8181/management/v1/warehouse" | grep -oE '"warehouse-id":"[^"]+"' | head -1 | cut -d'"' -f4)
     if [ -n "$wid" ]; then
         curl -s -X POST "http://$lk_ip:8181/catalog/v1/$wid/namespaces" \
-            -H "Content-Type: application/json" -d '{"namespace":["default"]}' >/dev/null 2>&1 || true
+            -H "Content-Type: application/json" -d '{"namespace":["public"]}' >/dev/null 2>&1 || true
     fi
 }

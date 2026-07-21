@@ -184,7 +184,6 @@ postgres:
 iceberg:
   warehouse: "${WAREHOUSE}"
   lakekeeper_endpoint: "http://${LK_IP}:8181/catalog"
-  namespace: "default"
 $(storage_yaml)
 archiver:
   tables:
@@ -234,7 +233,6 @@ postgres:
 iceberg:
   warehouse: "${WAREHOUSE}"
   lakekeeper_endpoint: "http://${LK_IP}:8181/catalog"
-  namespace: "default"
 $(storage_yaml)
 archiver:
   tables:
@@ -281,8 +279,8 @@ story_provision_decoupled() {
         sleep 2
     done
     assert_eq "iceonly wrapper view created" "v" "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='iceonly' AND relnamespace='public'::regnamespace;")"
-    assert_eq "iceberg-only registry row present" "1" "$(q "$HOST" "SELECT count(*) FROM coldfront.tiered_views WHERE is_iceberg_only AND iceberg_table='ice.default.iceonly';")"
-    assert_eq "no hot table for iceberg-only view" "" "$(q "$HOST" "SELECT hot_table FROM coldfront.tiered_views WHERE iceberg_table='ice.default.iceonly';")"
+    assert_eq "iceberg-only registry row present" "1" "$(q "$HOST" "SELECT count(*) FROM coldfront.tiered_views WHERE is_iceberg_only AND iceberg_table='ice.public.iceonly';")"
+    assert_eq "no hot table for iceberg-only view" "" "$(q "$HOST" "SELECT hot_table FROM coldfront.tiered_views WHERE iceberg_table='ice.public.iceonly';")"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -478,7 +476,7 @@ EOSQL
     local ret_days=$(( ( $(date -u +%s) - $(date -u -d "$(date -u +%Y-%m-01) -1 month" +%s) ) / 86400 ))
     cat > /tmp/journey-typed.yaml <<EOF
 postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
-iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog", namespace: "default" }
+iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog" }
 $(storage_yaml)
 archiver: { tables: [ { source_table: typed, partition_period: monthly, hot_period: "${ret_days} days" } ] }
 EOF
@@ -1023,7 +1021,7 @@ EOSQL
     local ret_race=$(( ( $(date -u +%s) - $(date -u -d "$(date -u +%Y-%m-01) +14 days" +%s) ) / 86400 ))
     cat > /tmp/journey-race.yaml <<EOF
 postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
-iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog", namespace: "default" }
+iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog" }
 $(storage_yaml)
 archiver: { tables: [ { source_table: events, partition_period: monthly, hot_period: "${ret_race} days" } ] }
 EOF
@@ -1143,7 +1141,7 @@ story_mesh() {
     local pc
     for pc in "${PARR[@]}"; do
         q_may "$pc" "SELECT coldfront.create_iceberg_table('public','iceonly','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"ts\",\"type\":\"timestamptz\"},{\"name\":\"status\",\"type\":\"text\"},{\"name\":\"data\",\"type\":\"jsonb\"}]'::jsonb);" >/dev/null 2>&1
-        assert_eq "iceberg-only registered on peer $pc" "1" "$(q "$pc" "SELECT count(*) FROM coldfront.tiered_views WHERE is_iceberg_only AND iceberg_table='ice.default.iceonly';")"
+        assert_eq "iceberg-only registered on peer $pc" "1" "$(q "$pc" "SELECT count(*) FROM coldfront.tiered_views WHERE is_iceberg_only AND iceberg_table='ice.public.iceonly';")"
     done
 
     # Cross-node READ: every row db1 wrote to Iceberg is visible on each peer via
@@ -1517,7 +1515,7 @@ EOSQL
     local ret_days; ret_days=$(( ( $(date -u +%s) - $(date -u -d "$(date -u +%Y-%m-01) -1 month" +%s) ) / 86400 ))  # cutoff = start of now-1mo
     cat > /tmp/journey-tl.yaml <<EOF
 postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
-iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog", namespace: "default" }
+iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog" }
 $(storage_yaml)
 archiver:
   tables:
@@ -1650,7 +1648,7 @@ EOSQL
 
     cat > /tmp/journey-fk.yaml <<EOF
 postgres: { dsn: "${dsn}" }
-iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog", namespace: "default" }
+iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog" }
 $(storage_yaml)
 EOF
     if "$ARCHIVER" --config /tmp/journey-fk.yaml >/tmp/journey-fk-arch.log 2>&1; then
@@ -1774,7 +1772,7 @@ EOSQL
 
     cat > /tmp/journey-rb.yaml <<EOF
 postgres: { dsn: "${dsn}" }
-iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog", namespace: "default" }
+iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog" }
 $(storage_yaml)
 EOF
 
@@ -2011,7 +2009,7 @@ EOF
     # drive entirely off coldfront.partition_config.
     cat > /tmp/journey-conn.yaml <<EOF
 postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
-iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog", namespace: "default" }
+iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog" }
 $(storage_yaml)
 EOF
     if "$ARCHIVER" --config /tmp/journey-conn.yaml >/tmp/journey-dbrun.log 2>&1; then

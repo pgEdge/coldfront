@@ -1,5 +1,5 @@
 -- RENAME of the transparent VIEW must migrate every name-keyed reference:
---   * coldfront.archive_watermark.table_name (keyed on the bare view name)
+--   * coldfront.archive_watermark.table_name (the bare view name in its (schema, table) key)
 --   * the regenerated INSERT trigger function/trigger names
 -- Without the watermark migration the rebuilt view would silently lose its
 -- cold (Iceberg) UNION branch — the watermark lookup would miss, v_has_cutoff
@@ -18,8 +18,8 @@ CREATE VIEW public.events AS SELECT * FROM public._events;
 INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
 VALUES ('public', 'events', 'public._events', 'ice.default.events', 'ts');
 -- A watermark exists, so the rebuilt view must keep its cold UNION branch.
-INSERT INTO coldfront.archive_watermark(table_name, cutoff_time)
-VALUES ('events', '2026-03-01'::timestamptz);
+INSERT INTO coldfront.archive_watermark(schema_name, table_name, cutoff_time)
+VALUES ('public', 'events', '2026-03-01'::timestamptz);
 -- Before: view definition has the cold iceberg_scan branch.
 SELECT pg_get_viewdef('public.events'::regclass) LIKE '%iceberg_scan%' AS has_cold_branch;
  has_cold_branch 
@@ -29,7 +29,7 @@ SELECT pg_get_viewdef('public.events'::regclass) LIKE '%iceberg_scan%' AS has_co
 
 -- Rename the view.
 ALTER VIEW public.events RENAME TO events_v2;
--- The watermark row followed the rename (keyed on the new bare view name).
+-- The watermark row followed the rename (its table_name is the new bare view name).
 SELECT table_name FROM coldfront.archive_watermark ORDER BY table_name;
  table_name 
 ------------

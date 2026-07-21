@@ -101,7 +101,6 @@ postgres:
 iceberg:
   warehouse: "${WAREHOUSE}"
   lakekeeper_endpoint: "http://${LK_IP}:8181/catalog"
-  namespace: "default"
 s3:
   endpoint: "${SW_IP}:8333"
   region: "us-east-1"

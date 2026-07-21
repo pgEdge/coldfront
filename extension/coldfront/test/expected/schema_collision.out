@@ -1,0 +1,68 @@
+-- Two tables sharing a name in DIFFERENT PG schemas map to DISTINCT Iceberg
+-- tables (ice.<schema>.<table>) and keep DISTINCT watermarks, so archiving one
+-- does not clobber the other's cold data. White-box: EXPLAIN VERBOSE shows each
+-- cold DML is rewritten against its own per-schema iceberg ref; real cold I/O is
+-- ci/journey.sh (pg_regress has no Iceberg attached). Exercises both the iceberg
+-- ref (naming) and the (schema, table) archive_watermark key.
+CREATE EXTENSION IF NOT EXISTS pg_duckdb;
+NOTICE:  extension "pg_duckdb" already exists, skipping
+CREATE EXTENSION IF NOT EXISTS coldfront;
+NOTICE:  extension "coldfront" already exists, skipping
+SET TIME ZONE 'UTC';
+-- White-box: checks the hook's SQL, not Iceberg I/O. Real cold I/O is ci/journey.sh.
+SET coldfront.warehouse = '';
+SET coldfront.lakekeeper_endpoint = '';
+CREATE SCHEMA myapp;
+CREATE SCHEMA analytics;
+CREATE TABLE myapp._events     (id int, ts timestamptz, status text);
+CREATE TABLE analytics._events (id int, ts timestamptz, status text);
+CREATE VIEW myapp.events     AS SELECT * FROM myapp._events;
+CREATE VIEW analytics.events AS SELECT * FROM analytics._events;
+-- Same relname 'events', different schema -> DISTINCT iceberg tables.
+INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
+VALUES ('myapp',     'events', 'myapp._events',     'ice.myapp.events',     'ts'),
+       ('analytics', 'events', 'analytics._events', 'ice.analytics.events', 'ts');
+-- Two watermark rows: same bare name, different schema + cutoff. The composite
+-- (schema, table) key keeps both distinct.
+INSERT INTO coldfront.archive_watermark(schema_name, table_name, cutoff_time)
+VALUES ('myapp',     'events', '2026-03-01'::timestamptz),
+       ('analytics', 'events', '2026-06-01'::timestamptz);
+-- Cold UPDATE on analytics.events (ts < 2026-06-01) -> rewritten against
+-- ice.analytics.events.
+EXPLAIN (COSTS OFF, VERBOSE)
+  UPDATE analytics.events SET status = 'x' WHERE ts = '2026-01-15 00:00:00+00';
+                                                                                         QUERY PLAN                                                                                          
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result
+   Output: _exec_iceberg_with_claim('ice.analytics.events'::text, 'UPDATE ice.analytics.events SET status = ''x''::text   WHERE (ts = ''Thu Jan 15 00:00:00 2026 UTC''::timestamptz)'::text)
+(2 rows)
+
+-- Cold UPDATE on myapp.events (ts < 2026-03-01) -> rewritten against
+-- ice.myapp.events, its OWN table, never analytics'.
+EXPLAIN (COSTS OFF, VERBOSE)
+  UPDATE myapp.events SET status = 'x' WHERE ts = '2026-01-15 00:00:00+00';
+                                                                                     QUERY PLAN                                                                                      
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result
+   Output: _exec_iceberg_with_claim('ice.myapp.events'::text, 'UPDATE ice.myapp.events SET status = ''x''::text   WHERE (ts = ''Thu Jan 15 00:00:00 2026 UTC''::timestamptz)'::text)
+(2 rows)
+
+-- Both watermarks coexist, one row per (schema, table).
+SELECT schema_name, table_name, cutoff_time
+FROM coldfront.archive_watermark ORDER BY schema_name;
+ schema_name | table_name |         cutoff_time          
+-------------+------------+------------------------------
+ analytics   | events     | Mon Jun 01 00:00:00 2026 UTC
+ myapp       | events     | Sun Mar 01 00:00:00 2026 UTC
+(2 rows)
+
+-- Cleanup. Unregister before dropping: the DDL hook blocks DROP of a registered
+-- tiered relation.
+DELETE FROM coldfront.tiered_views;
+DELETE FROM coldfront.archive_watermark;
+DROP VIEW myapp.events;
+DROP VIEW analytics.events;
+DROP TABLE myapp._events;
+DROP TABLE analytics._events;
+DROP SCHEMA myapp;
+DROP SCHEMA analytics;

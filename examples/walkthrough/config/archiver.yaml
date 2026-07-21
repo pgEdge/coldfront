@@ -9,7 +9,6 @@ postgres:
 iceberg:
     warehouse: "wh"
     lakekeeper_endpoint: "http://lakekeeper:8181/catalog"
-    namespace: "default"
 s3:
     endpoint: "seaweedfs:8333"
     region: "us-east-1"

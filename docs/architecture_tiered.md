@@ -112,7 +112,7 @@ CREATE OR REPLACE VIEW events AS
   WHERE "ts" >= '2026-03-01'::timestamptz
   UNION ALL
   SELECT r['id']::bigint, r['ts']::timestamptz, r['status']::text, r['data']::text
-  FROM iceberg_scan('ice.default.events') r
+  FROM iceberg_scan('ice.public.events') r
   WHERE r['ts'] < '2026-03-01'::timestamptz;
 ```
 
@@ -211,7 +211,7 @@ WITH hot_ins AS MATERIALIZED (
 ),
 cold_call AS MATERIALIZED (
   SELECT duckdb.raw_query(
-    'INSERT INTO ice.default.events
+    'INSERT INTO ice.public.events
      SELECT id, ts, status, data FROM (<source-pglocal-prefixed>) ...
      WHERE ts < ''<cutoff>'''
   )
@@ -246,7 +246,7 @@ tier and rewrite:
 | Predicate shape | Tier | Rewrite |
 |---|---|---|
 | WHERE proves all matching rows have `ts >= cutoff` (equality, `>=`, `>`, BETWEEN, IN, OR all in hot range) | HOT | `UPDATE _events SET ... WHERE ...` - plain PG DML, preserves RETURNING |
-| WHERE proves all matching rows have `ts <  cutoff` | COLD | `SELECT duckdb.raw_query('UPDATE ice.default.events SET ... WHERE ...')` - DuckDB DML wrapped as a standard SQL literal (via `quote_literal_cstr`); the SELECT envelope keeps it off PG's command-ID counter so there's no mixed-write tripwire |
+| WHERE proves all matching rows have `ts <  cutoff` | COLD | `SELECT duckdb.raw_query('UPDATE ice.public.events SET ... WHERE ...')` - DuckDB DML wrapped as a standard SQL literal (via `quote_literal_cstr`); the SELECT envelope keeps it off PG's command-ID counter so there's no mixed-write tripwire |
 | WHERE cannot be proven to target one tier | AMBIGUOUS | depends on `coldfront.allow_mixed_writes` - see next section |
 
 The classifier understands `Var <op> Const` (both operand orders),
@@ -290,7 +290,7 @@ from the `coldfront.allow_mixed_writes` GUC (USERSET, default `on`).
 
 ```sql
 WITH hot AS (UPDATE _events SET ... WHERE ... RETURNING *)
-   , cold AS (SELECT duckdb.raw_query('UPDATE ice.default.events SET ... WHERE ...'))
+   , cold AS (SELECT duckdb.raw_query('UPDATE ice.public.events SET ... WHERE ...'))
 SELECT h.* FROM hot h CROSS JOIN cold c;
 ```
 

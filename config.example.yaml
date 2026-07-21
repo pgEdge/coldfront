@@ -4,7 +4,6 @@ postgres:
 iceberg:
   warehouse: "wh"                                        # Lakekeeper warehouse name
   lakekeeper_endpoint: "http://lakekeeper:8181/catalog"  # Lakekeeper REST catalog
-  namespace: "default"                                   # optional, default: "default"
 
 # Cold-store backend: configure EXACTLY ONE of s3 or azure. Any S3-compatible
 # store works under s3 — SeaweedFS/MinIO, real AWS S3, OR Google Cloud Storage

@@ -23,7 +23,6 @@ type Config struct {
 	Iceberg struct {
 		Warehouse          string `yaml:"warehouse"`
 		LakekeeperEndpoint string `yaml:"lakekeeper_endpoint"`
-		Namespace          string `yaml:"namespace"`
 	} `yaml:"iceberg"`
 	S3 struct {
 		Endpoint  string `yaml:"endpoint"`
@@ -48,10 +47,18 @@ func LoadConfig(path string) (*Config, error) {
 	if err := yaml.Unmarshal(data, &c); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
-	if c.Iceberg.Namespace == "" {
-		c.Iceberg.Namespace = "default"
-	}
 	return &c, nil
+}
+
+// splitSchemaTable parses a "schema.table" CLI argument into its parts; a bare
+// name defaults to the "public" schema, matching the archiver's default source
+// schema. The PG schema is the Iceberg namespace, so same-named tables in
+// different schemas resolve to distinct Iceberg tables.
+func splitSchemaTable(arg string) (schema, table string) {
+	if s, t, found := strings.Cut(arg, "."); found {
+		return s, t
+	}
+	return "public", arg
 }
 
 // storageProps builds the iceberg-go fileio credential properties for whichever
