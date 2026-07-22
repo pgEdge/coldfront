@@ -1,0 +1,38 @@
+#!/usr/bin/make -f
+
+export DH_VERBOSE = 1
+
+%:
+	dh $@
+
+# Prebuilt binary — nothing to compile or test.
+override_dh_auto_build:
+
+override_dh_auto_test:
+
+override_dh_builddeb:
+	dh_builddeb -- -Zgzip
+
+# ~155MB prebuilt Rust binary: strip in place with no -dbgsym package, and skip
+# dwz (its DIE handling chokes on a binary this size).
+override_dh_dwz:
+
+override_dh_strip:
+	dh_strip --no-automatic-dbgsym
+
+override_dh_installsystemd:
+	dh_installsystemd --no-enable --no-start --name=lakekeeper
+
+execute_before_dh_install:
+	# --- SBOM generation and signing (per-format DEB key) ---
+	mkdir -p debian/tmp/sbom
+	syft dir:$(CURDIR) -o cyclonedx-json > debian/tmp/sbom/lakekeeper-sbom.json || exit 1
+	KEY_ID=$$(gpg --list-secret-keys --with-colons | awk -F: '/^sec/{print $$5}' | head -n 1); \
+	gpg --armor --detach-sign --local-user "$$KEY_ID" \
+		--output debian/tmp/sbom/lakekeeper-sbom.json.asc \
+		debian/tmp/sbom/lakekeeper-sbom.json || exit 1
+
+execute_after_dh_install:
+	# The env file carries secrets (DB URL, encryption key); install it 0640 and
+	# let postinst set the group to lakekeeper.
+	install -D -m 0640 debian/lakekeeper.env debian/pgedge-lakekeeper/etc/lakekeeper/lakekeeper.env

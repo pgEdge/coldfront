@@ -1,0 +1,21 @@
+Source: pgedge-coldfront-duckdb-extensions
+Section: database
+Priority: optional
+Maintainer: pgEdge Build Team <support@pgedge.com>
+Build-Depends:
+ debhelper-compat (= 13),
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+Homepage: https://github.com/pgEdge/ColdFront
+
+Package: pgedge-coldfront-duckdb-extensions
+Architecture: any
+Depends:
+ ${misc:Depends},
+ ${shlibs:Depends},
+Description: Patched DuckDB extensions for ColdFront tiered storage
+ The patched DuckDB extensions ColdFront's cold tier needs — iceberg, avro,
+ azure, and postgres_scanner — carrying ColdFront's bakery-aware-commit-refresh
+ and interop patches. They are loaded by pg_duckdb; point
+ duckdb.extension_directory at the install dir (see the installed config sample)
+ so pg_duckdb loads these instead of downloading the unpatched upstream builds.

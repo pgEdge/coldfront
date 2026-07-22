@@ -1,0 +1,2 @@
+lakekeeper usr/bin/
+debian/tmp/sbom/* usr/share/pgedge-lakekeeper/
