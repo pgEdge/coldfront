@@ -80,20 +80,50 @@ func ParseBoundExpr(expr string) (lower, upper time.Time, err error) {
 	return parseBoundPair(expr, TimeBoundary{})
 }
 
-// parseTimestamp parses a pg_get_expr-style bound value (the quoted string
-// inside FOR VALUES FROM/TO) into a UTC time. Accepts the common layouts
-// PostgreSQL emits.
+// parseTimestamp parses a pg_get_expr bound value (the quoted string inside
+// FOR VALUES FROM/TO) into a UTC time. PostgreSQL renders bounds ISO-style but
+// not as strict ISO 8601 (space separator, bare +00 offset), so time.RFC3339
+// does not apply. The layouts are the stdlib time.DateTime (timestamp without
+// time zone) and time.DateOnly (date), plus a numeric-offset layout for
+// timestamptz; time.Parse consumes any trailing fractional second on its own.
+// Callers pin the session (PinSessionForBounds) so the render stays in this set.
 func parseTimestamp(s string) (time.Time, error) {
 	for _, layout := range []string{
-		"2006-01-02 15:04:05+00",
 		"2006-01-02 15:04:05-07",
-		"2006-01-02",
+		time.DateTime,
+		time.DateOnly,
 	} {
 		if t, err := time.Parse(layout, s); err == nil {
 			return t.UTC(), nil
 		}
 	}
 	return time.Time{}, fmt.Errorf("unrecognized timestamp format: %q", s)
+}
+
+// boundConnConfig parses dsn and pins DateStyle and TimeZone as connection
+// runtime params, so pg_get_expr(relpartbound) renders partition bounds
+// deterministically (ISO date order, UTC) and parseTimestamp's layout set stays
+// complete regardless of the server's defaults. The params ride the startup
+// packet, so they apply to the connection (and any reconnect) without a SET.
+func boundConnConfig(dsn string) (*pgx.ConnConfig, error) {
+	cfg, err := pgx.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("parse dsn: %w", err)
+	}
+	cfg.RuntimeParams["datestyle"] = "ISO, YMD"
+	cfg.RuntimeParams["timezone"] = "UTC"
+	return cfg, nil
+}
+
+// Connect opens a pgx connection with the bound-rendering params pinned (see
+// boundConnConfig). Both the archiver and the partitioner read partition bounds,
+// so both connect through here.
+func Connect(ctx context.Context, dsn string) (*pgx.Conn, error) {
+	cfg, err := boundConnConfig(dsn)
+	if err != nil {
+		return nil, err
+	}
+	return pgx.ConnectConfig(ctx, cfg)
 }
 
 // PartitionName generates a partition table name for the given date and period.

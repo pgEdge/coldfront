@@ -107,6 +107,30 @@ func TestParseBoundExpr(t *testing.T) {
 			wantHigh: time.Date(2025, 12, 1, 0, 0, 0, 0, time.UTC),
 		},
 		{
+			name:     "timestamp without time zone (no offset)",
+			expr:     "FOR VALUES FROM ('2026-04-01 00:00:00') TO ('2026-05-01 00:00:00')",
+			wantLow:  time.Date(2026, 4, 1, 0, 0, 0, 0, time.UTC),
+			wantHigh: time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			name:     "timestamp without time zone, fractional seconds",
+			expr:     "FOR VALUES FROM ('2026-04-01 00:00:00.123456') TO ('2026-05-01 00:00:00')",
+			wantLow:  time.Date(2026, 4, 1, 0, 0, 0, 123456000, time.UTC),
+			wantHigh: time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC),
+		},
+		{
+			name:     "timestamptz non-UTC offset",
+			expr:     "FOR VALUES FROM ('2026-04-01 00:00:00-07') TO ('2026-05-01 00:00:00-07')",
+			wantLow:  time.Date(2026, 4, 1, 7, 0, 0, 0, time.UTC),
+			wantHigh: time.Date(2026, 5, 1, 7, 0, 0, 0, time.UTC),
+		},
+		{
+			name:     "timestamptz fractional seconds with offset",
+			expr:     "FOR VALUES FROM ('2026-04-01 00:00:00.123456+00') TO ('2026-05-01 00:00:00+00')",
+			wantLow:  time.Date(2026, 4, 1, 0, 0, 0, 123456000, time.UTC),
+			wantHigh: time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC),
+		},
+		{
 			name:    "invalid format",
 			expr:    "not a valid expression",
 			wantErr: true,
@@ -125,6 +149,13 @@ func TestParseBoundExpr(t *testing.T) {
 			assert.Equal(t, tt.wantHigh, high)
 		})
 	}
+}
+
+func TestBoundConnConfig(t *testing.T) {
+	cfg, err := boundConnConfig("postgres://u@localhost:5432/db")
+	require.NoError(t, err)
+	assert.Equal(t, "ISO, YMD", cfg.RuntimeParams["datestyle"])
+	assert.Equal(t, "UTC", cfg.RuntimeParams["timezone"])
 }
 
 func TestPartitionName(t *testing.T) {
