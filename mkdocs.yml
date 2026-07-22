@@ -57,6 +57,7 @@ repo_url: https://github.com/pgEdge/ColdFront
 nav:
   - Getting Started:
       - Introduction: index.md
+      - Walkthrough: walkthrough.md
       - Installation: installation.md
       - Object Store Setup: object_store.md
 

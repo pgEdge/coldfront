@@ -68,7 +68,7 @@ curl -X POST http://localhost:8181/management/v1/warehouse \
 WID=$(curl -s http://localhost:8181/management/v1/warehouse \
   | grep -oE '"warehouse-id":"[^"]+"' | head -1 | cut -d'"' -f4)
 curl -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
-  -H "Content-Type: application/json" -d '{"namespace": ["default"]}'
+  -H "Content-Type: application/json" -d '{"namespace":["public"]}'
 ```
 
 Then install the extensions and set the cold-tier credentials, once per
@@ -198,11 +198,11 @@ SELECT coldfront.create_iceberg_table(
 
 That single statement provisions:
 
-- `ice.default.events` on the attached Iceberg catalog
+- `ice.public.events` on the attached Iceberg catalog
 - a PG-side wrapper view `public.events` with proper PG-typed columns
 - a `coldfront.tiered_views` registry row - every INSERT, UPDATE, and
   DELETE on the view is intercepted by the coldfront C hook and rewritten
-  to a single `duckdb.raw_query(...)` against `ice.default.events`
+  to a single `duckdb.raw_query(...)` against `ice.public.events`
 
 Spock's `ddl_sql` repset replicates the `CREATE VIEW`, but the registry
 row does not propagate with it: run `create_iceberg_table()` (idempotent,
@@ -455,6 +455,61 @@ It writes the same `coldfront.storage_secret` row (replicated,
 The Azure cold tier is subject to the soft-delete / change-feed
 restriction in [Gotchas](#gotchas).
 
+## Vended (minted) credentials
+
+Vended credentials let a deployment run with no object-store credential
+stored in the database, in a DuckDB secret file, or in an archiver
+config; this suits compliance environments that forbid persisting
+long-term keys. Lakekeeper mints a short-lived, per-table credential
+(an S3 STS access key, secret, and session token) at read and write
+time, and ColdFront uses it directly. The long-term credential lives
+only in the Lakekeeper warehouse.
+
+Enable it with a single call that stores no credential:
+
+```sql
+SELECT coldfront.set_storage_secret_vended();
+```
+
+This writes a `coldfront.storage_secret` row marked as vended, so
+nothing is materialized as a DuckDB secret; `ensure_attached()` then
+attaches the catalog with credential vending turned on. The archiver
+reads the same row and skips its own credential setup, so a vended
+deployment omits the `s3:`/`azure:` block from the archiver config
+entirely. The compactor likewise needs no credential in its config.
+
+Vended mode targets the two clouds that mint scoped credentials: AWS S3
+(STS) and Azure ADLS Gen2 (SAS). The `set_storage_secret_vended()` call
+above enables AWS S3; the same call with `'azure'` enables Azure through
+the identical path:
+
+```sql
+SELECT coldfront.set_storage_secret_vended('azure');
+```
+
+Vending requires a Lakekeeper warehouse configured to mint credentials:
+
+- AWS S3: `flavor: aws` with `sts-enabled: true`, an `assume-role-arn`
+  for a bucket-scoped IAM role, and an `external-id` on the warehouse
+  credential that the role's trust policy also requires. The full
+  warehouse and IAM-role setup is in
+  [object_store.md](object_store.md#3b-create-the-s3-warehouse).
+- Azure ADLS Gen2: an `adls` warehouse with `sas-enabled` (on by
+  default). Lakekeeper vends a per-container SAS token; the warehouse
+  credential can be a `shared-access-key`, `client-credentials`, or
+  `azure-system-identity`.
+
+Google Cloud Storage over the S3-interoperability endpoint has no STS to
+mint against, so GCS stays on static HMAC credentials.
+
+The compactor runs fully under vended credentials: compaction, snapshot
+expiry, and orphan-file reclaim all use the minted per-table credentials.
+
+Switching a running deployment between static and vended credentials
+changes the attach mode, which is fixed per PostgreSQL backend at attach
+time; open a new session (or restart the archiver and compactor, which
+are short-lived processes) so the new mode takes effect.
+
 ## Reading + writing (identical for both modes)
 
 The same SQL works against the relation name in either mode, as the
@@ -501,6 +556,13 @@ Anything else (unbounded `numeric`, `xml`, `tsvector`, range/multirange
 types, custom enums, arrays, composite types) is rejected at
 table-creation time. We refuse silent fallback to `varchar` - losing
 precision/identity is worse than no support.
+
+`char(N)` is stored and read as `varchar`. The data round-trips
+losslessly: values, comparisons, and `length()` match a hot PG table,
+where `length()` already ignores `char(N)` trailing padding. The only
+difference is cosmetic: a cold `char(N)` column reads back unpadded with
+`pg_typeof varchar`, because pg_duckdb has no fixed-length `char` type.
+Use `text` or `varchar` if blank-padded display matters.
 
 `json`, `jsonb` and `interval` are stored as `varchar` in Iceberg (no
 native primitive). On read, `interval` is view-cast back to the rich PG
@@ -568,7 +630,7 @@ Keep the following caveats in mind when running either mode:
   The throughput ceiling is Lakekeeper's commit rate, not the writer
   count.
 - **Direct table access**: `_events` is the hot heap (tiered mode only).
-  `ice.default.<name>` is the Iceberg table - only addressable via
+  `ice.public.<name>` is the Iceberg table - only addressable via
   `iceberg_scan(...)` or `duckdb.raw_query('… ice.… …')`, never via
   PG-native 3-part names.
 - **Tiered INSERT with omitted IDENTITY column** (e.g. `INSERT INTO

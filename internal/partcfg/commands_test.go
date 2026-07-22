@@ -94,6 +94,25 @@ func TestInsertSQL_EscapesQuotes(t *testing.T) {
 	}
 }
 
+// Re-registering an existing (schema, table) upserts: the INSERT carries an
+// ON CONFLICT (schema_name, table_name) DO UPDATE clause.
+func TestInsertSQL_Upsert(t *testing.T) {
+	got := configRow{
+		schema: "myapp", table: "events", period: "monthly",
+		premake: 3, partMode: "timestamp", hot: "30 days",
+	}.insertSQL()
+	for _, want := range []string{
+		"ON CONFLICT (schema_name, table_name) DO UPDATE SET",
+		"partition_period = EXCLUDED.partition_period",
+		"hot_period = EXCLUDED.hot_period",
+		"retention_period = EXCLUDED.retention_period",
+	} {
+		if !strings.Contains(got, want) {
+			t.Errorf("insertSQL missing %q:\n%s", want, got)
+		}
+	}
+}
+
 func TestSetClauses(t *testing.T) {
 	vals := setVals{
 		period: "monthly", column: "ts", premake: 6,

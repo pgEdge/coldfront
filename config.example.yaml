@@ -4,7 +4,6 @@ postgres:
 iceberg:
   warehouse: "wh"                                        # Lakekeeper warehouse name
   lakekeeper_endpoint: "http://lakekeeper:8181/catalog"  # Lakekeeper REST catalog
-  namespace: "default"                                   # optional, default: "default"
 
 # Cold-store backend: configure EXACTLY ONE of s3 or azure. Any S3-compatible
 # store works under s3 — SeaweedFS/MinIO, real AWS S3, OR Google Cloud Storage
@@ -52,6 +51,12 @@ s3:
 #                               # is no separate account-key field. Leave s3.*
 #                               # empty when using azure.
 #   connection_string: "DefaultEndpointsProtocol=https;AccountName=<account>;AccountKey=<key>;EndpointSuffix=core.windows.net"
+
+# Vended (minted) credentials: OMIT both s3 and azure entirely. When the cold
+# store is vended (SELECT coldfront.set_storage_secret_vended();), Lakekeeper
+# mints short-lived per-table credentials at access time, so no credential lives
+# in this file, the database, or a DuckDB secret. Keep only the iceberg section
+# above. See docs/usage.md#vended-minted-credentials.
 
 archiver:
   # Tiered tables live in coldfront.partition_config (replicated across a mesh);

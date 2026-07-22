@@ -21,27 +21,29 @@ CREATE TABLE coldfront.tiered_views (
     schema_name     text    NOT NULL,                  -- namespace of the transparent view
     relname         text    NOT NULL,                  -- name of the transparent view
     hot_table       text,                              -- 'public._events' (tiered) or NULL (iceberg-only)
-    iceberg_table   text    NOT NULL,                  -- DuckDB ref: 'ice.default.events'
+    iceberg_table   text    NOT NULL,                  -- DuckDB ref, e.g. 'ice.myapp.events'
     partition_col   text,                              -- 'ts' (tiered) or NULL (iceberg-only)
     is_iceberg_only boolean NOT NULL DEFAULT false,
     PRIMARY KEY (schema_name, relname)
 );
 
--- Archive watermark: one row per managed table, recording the cutoff time
+-- Archive watermark: one row per managed (schema, table), recording the cutoff time
 -- that divides the hot tier (rows with partition_col >= cutoff_time, living
 -- in the PG heap as _<table>) from the cold tier (rows older than cutoff,
--- living in Iceberg as ice.default.<table>). Written by the archiver at the
+-- living in Iceberg as ice.<schema>.<table>). Written by the archiver at the
 -- end of each archive cycle; read by the generated tiered view's hot/cold
 -- UNION (internal/view/view.go) and by the coldfront rewriter's tier
 -- classifier when deciding whether a predicate proves hot-only or cold-only.
 --
--- PK on table_name because the archiver upserts this row every cycle via
--- ON CONFLICT (table_name) DO UPDATE (internal/watermark/watermark.go:Set).
+-- Composite PK on (schema_name, table_name) because the archiver upserts this row every cycle via
+-- ON CONFLICT (schema_name, table_name) DO UPDATE (internal/watermark/watermark.go:Set).
 -- Created with IF NOT EXISTS because the archiver can also materialize it
 -- on first run before CREATE EXTENSION runs against the DB.
 CREATE TABLE IF NOT EXISTS coldfront.archive_watermark (
-    table_name  text        PRIMARY KEY,
-    cutoff_time timestamptz NOT NULL
+    schema_name text        NOT NULL,
+    table_name  text        NOT NULL,
+    cutoff_time timestamptz NOT NULL,
+    PRIMARY KEY (schema_name, table_name)
 );
 
 -- coldfront._dummy_dml_target — a permanent, single-row DUMMY table whose data is
@@ -108,10 +110,11 @@ CREATE TABLE IF NOT EXISTS coldfront.storage_secret (
     url_style         text    NOT NULL DEFAULT 'path',
     use_ssl           boolean NOT NULL DEFAULT false,
     connection_string text,                            -- azure CONFIG provider: AccountName/AccountKey (shared key)
+    vended            boolean NOT NULL DEFAULT false,   -- true ⇒ Lakekeeper mints per-table creds; this row stores none
     CONSTRAINT ss_type_enum  CHECK (storage_type IN ('s3','azure')),
-    CONSTRAINT ss_s3_creds   CHECK (storage_type <> 's3'
+    CONSTRAINT ss_s3_creds   CHECK (vended OR storage_type <> 's3'
                                      OR (key_id IS NOT NULL AND secret IS NOT NULL)),
-    CONSTRAINT ss_azure_conn CHECK (storage_type <> 'azure'
+    CONSTRAINT ss_azure_conn CHECK (vended OR storage_type <> 'azure'
                                      OR (connection_string IS NOT NULL AND connection_string <> ''))
 );
 
@@ -179,18 +182,21 @@ SELECT pg_extension_config_dump('coldfront.partition_config', '');
 -- — ATTACH IF NOT EXISTS is idempotent.
 CREATE OR REPLACE FUNCTION coldfront.ensure_attached() RETURNS void AS $$
 DECLARE
-  wh text := current_setting('coldfront.warehouse', true);
-  ep text := current_setting('coldfront.lakekeeper_endpoint', true);
+  wh   text := current_setting('coldfront.warehouse', true);
+  ep   text := current_setting('coldfront.lakekeeper_endpoint', true);
+  mode text := coldfront._attach_delegation_mode();
 BEGIN
   IF wh IS NOT NULL AND wh <> '' AND ep IS NOT NULL AND ep <> '' THEN
     -- iceberg (and avro transitively) are auto-installed/auto-loaded by
     -- pg_duckdb when this ATTACH (TYPE ICEBERG, ...) fires, gated by
     -- duckdb.autoinstall_known_extensions / autoload_known_extensions. No
-    -- explicit install or per-session LOAD needed.
+    -- explicit install or per-session LOAD needed. ACCESS_DELEGATION_MODE is
+    -- VENDED_CREDENTIALS for a vended cold store (Lakekeeper mints per-table
+    -- creds), else NONE (the persistent secret supplies them).
     PERFORM duckdb.raw_query(format(
       'ATTACH IF NOT EXISTS %L AS ice (TYPE ICEBERG, ENDPOINT %L, '
-      'AUTHORIZATION_TYPE NONE, ACCESS_DELEGATION_MODE NONE)',
-      wh, ep
+      'AUTHORIZATION_TYPE NONE, ACCESS_DELEGATION_MODE %s)',
+      wh, ep, mode
     ));
     -- Pin DuckDB's BUNDLED httpfs client (cpp-httplib + mbedtls), not the system
     -- libcurl DuckDB 1.5 defaults to. The libcurl client's threaded resolver calls
@@ -206,6 +212,16 @@ BEGIN
     -- Background: https://curl.se/docs/CVE-2025-0665.html
     -- Run AFTER the ATTACH (httpfs loaded); GLOBAL = this backend's instance; idempotent.
     PERFORM duckdb.raw_query($q$SET GLOBAL httpfs_client_implementation = 'httplib'$q$);
+    -- Skip the metadata-log time-travel read at table load. When a table's
+    -- metadata is newer than the transaction start (guaranteed for every
+    -- bakery-serialized writer that waited on a peer's commit), duckdb-iceberg
+    -- reconstructs as-of-start metadata by fetching a previous metadata.json
+    -- from object storage. That fetch happens BEFORE the table's credentials
+    -- exist in the session, so under vended credentials it fails (403); with
+    -- false, the fallback rewinds the snapshot pointer in the already-loaded
+    -- metadata with no storage read. Also saves one GET per conflicting
+    -- statement under static credentials. GLOBAL = this backend's instance.
+    PERFORM duckdb.raw_query($q$SET GLOBAL iceberg_use_metadata_log = false$q$);
     -- httpfs (s3) already loaded as a side-effect of the ATTACH above; azure does
     -- not, so its lazy autoload would otherwise fire later as the non-superuser
     -- app role and hit pg_duckdb's LocalFileSystem block. Pre-load it
@@ -324,6 +340,11 @@ BEGIN
                         -- cold rows via _move_row_literal.
                         '_cross_tier_move', '_move_row_literal', '_move_pg_row_literal',
                         '_enqueue_release',
+                        -- cold-write serializer gate wrappers (armed-predicate +
+                        -- the claim-or-advisory acquire); app-role cold paths call
+                        -- these SECURITY INVOKER wrappers, which delegate to the
+                        -- DEFINER primitives below.
+                        '_bakery_armed', '_take_iceberg_claim',
                         -- R-A bakery coordination (mesh cold writes); SECURITY
                         -- DEFINER, so the app role just needs EXECUTE — the
                         -- spock/dblink/pg_stat_replication access happens as owner.
@@ -379,6 +400,12 @@ RETURNS text
 LANGUAGE plpgsql IMMUTABLE AS $$
 DECLARE opts text;
 BEGIN
+  -- Vended rows carry no credentials: Lakekeeper mints per-table creds and
+  -- duckdb-iceberg creates the DuckDB secret from them, so there is nothing to
+  -- materialize here.
+  IF r.vended THEN
+    RETURN NULL;
+  END IF;
   IF r.storage_type = 'azure' THEN
     -- CONFIG provider (PROVIDER omitted ⇒ config). Shared-key auth: the access
     -- key rides inside CONNECTION_STRING's AccountKey=… — duckdb-azure has no
@@ -409,12 +436,20 @@ $$;
 CREATE OR REPLACE FUNCTION coldfront.materialize_storage_secret() RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
-  r coldfront.storage_secret;
+  r    coldfront.storage_secret;
+  opts text;
 BEGIN
   SELECT * INTO r FROM coldfront.storage_secret LIMIT 1;
   IF NOT FOUND THEN RETURN; END IF;
+  opts := coldfront._build_storage_secret_opts(r);
+  -- Vended row ⇒ no secret body; drop any secret a prior static row left behind
+  -- so a static→vended switch cannot keep serving the old credential.
+  IF opts IS NULL THEN
+    PERFORM duckdb.raw_query(format('DROP PERSISTENT SECRET IF EXISTS %I', r.name));
+    RETURN;
+  END IF;
   PERFORM duckdb.raw_query(format('CREATE OR REPLACE PERSISTENT SECRET %I (%s)',
-                                  r.name, coldfront._build_storage_secret_opts(r)));
+                                  r.name, opts));
 END;
 $$;
 
@@ -450,9 +485,9 @@ DECLARE
   dsn text := current_setting('coldfront.local_pg_dsn', true);
 BEGIN
   INSERT INTO coldfront.storage_secret
-       (name, storage_type, key_id, secret, endpoint, region, url_style, use_ssl, connection_string)
+       (name, storage_type, key_id, secret, endpoint, region, url_style, use_ssl, connection_string, vended)
        VALUES (p.name, p.storage_type, p.key_id, p.secret, p.endpoint,
-               p.region, p.url_style, p.use_ssl, p.connection_string)
+               p.region, p.url_style, p.use_ssl, p.connection_string, p.vended)
   ON CONFLICT (name) DO UPDATE SET
        storage_type      = EXCLUDED.storage_type,
        key_id            = EXCLUDED.key_id,
@@ -461,7 +496,8 @@ BEGIN
        region            = EXCLUDED.region,
        url_style         = EXCLUDED.url_style,
        use_ssl           = EXCLUDED.use_ssl,
-       connection_string = EXCLUDED.connection_string;
+       connection_string = EXCLUDED.connection_string,
+       vended            = EXCLUDED.vended;
   IF dsn IS NOT NULL AND dsn <> '' THEN
     PERFORM duckdb.install_extension('postgres');
   END IF;
@@ -487,7 +523,7 @@ BEGIN
   -- Shape an s3 row; _apply_storage_secret does the (backend-neutral) persist.
   PERFORM coldfront._apply_storage_secret(ROW(
     'cf_storage', 's3', p_key_id, p_secret, p_endpoint,
-    p_region, p_url_style, p_use_ssl, NULL
+    p_region, p_url_style, p_use_ssl, NULL, false
   )::coldfront.storage_secret);
 END;
 $$;
@@ -511,9 +547,45 @@ BEGIN
   -- _apply_storage_secret does the (backend-neutral) persist.
   PERFORM coldfront._apply_storage_secret(ROW(
     'cf_storage', 'azure', NULL, NULL, NULL,
-    'us-east-1', 'path', false, p_connection_string
+    'us-east-1', 'path', false, p_connection_string, false
   )::coldfront.storage_secret);
 END;
+$$;
+
+-- set_storage_secret_vended(): cold-tier setup for compliance deployments that
+-- must not store object-store credentials. It writes a credential-less row
+-- (vended = true) so nothing is materialized as a DuckDB secret; instead
+-- ensure_attached() turns on Iceberg REST credential vending and Lakekeeper
+-- mints short-lived per-table credentials at read/write time. The Lakekeeper
+-- warehouse keeps its own long-term credential (the client plane holds none).
+-- p_storage_type selects s3 (default; AWS + S3-compatible) or azure (so
+-- ensure_attached still LOADs the azure extension for the vended SAS). Same
+-- emission/replication path as the static setters.
+CREATE OR REPLACE FUNCTION coldfront.set_storage_secret_vended(
+    p_storage_type text DEFAULT 's3') RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+  IF p_storage_type NOT IN ('s3', 'azure') THEN
+    RAISE EXCEPTION 'storage_type must be ''s3'' or ''azure'', got: %', p_storage_type;
+  END IF;
+  PERFORM coldfront._apply_storage_secret(ROW(
+    'cf_storage', p_storage_type, NULL, NULL, NULL,
+    'us-east-1', 'path', false, NULL, true
+  )::coldfront.storage_secret);
+END;
+$$;
+
+-- _attach_delegation_mode(): the DuckDB ICEBERG ATTACH access-delegation mode
+-- for this node. VENDED_CREDENTIALS when the stored row is vended (Lakekeeper
+-- mints per-table creds), else NONE (the persistent secret supplies them).
+-- Absent row ⇒ NONE (no cold store configured yet).
+CREATE OR REPLACE FUNCTION coldfront._attach_delegation_mode() RETURNS text
+LANGUAGE sql STABLE AS $$
+  SELECT CASE
+           WHEN COALESCE((SELECT vended FROM coldfront.storage_secret LIMIT 1), false)
+             THEN 'VENDED_CREDENTIALS'
+           ELSE 'NONE'
+         END;
 $$;
 
 -- ============================================================================
@@ -706,9 +778,6 @@ DECLARE
     batch_size      int  := current_setting('coldfront.cold_write_batch_size')::int;  -- GUC, default 10000
     i               int;
     col             text;
-    my_ticket       bigint;
-    v_armed         boolean := NULLIF(current_setting('snowflake.node', true), '') IS NOT NULL
-                           AND NULLIF(current_setting('coldfront.dblink_self', true), '') IS NOT NULL;
 BEGIN
     -- Mixed-tier writes inside one PG tx (PG hot INSERT plus DuckDB
     -- raw_query writes for cold) need pg_duckdb's mixed-write guard
@@ -723,7 +792,7 @@ BEGIN
            COALESCE(aw.cutoff_time, '-infinity'::timestamptz)
     INTO v_hot_table, v_iceberg, v_partcol, v_cutoff
     FROM coldfront.tiered_views tv
-    LEFT JOIN coldfront.archive_watermark aw ON aw.table_name = p_view_name
+    LEFT JOIN coldfront.archive_watermark aw ON aw.schema_name = p_view_schema AND aw.table_name = p_view_name
     WHERE tv.schema_name = p_view_schema AND tv.relname = p_view_name;
 
     IF v_hot_table IS NULL THEN
@@ -741,16 +810,11 @@ BEGIN
 
     -- Serialise the whole cold-insert loop ONCE (it issues many batched
     -- raw_query INSERTs in this single transaction; all commit together at
-    -- xact end). Same v_armed gate as _exec_iceberg_with_claim: multi-node →
-    -- one R-A claim (released by the C XactCallback at commit); single-node →
-    -- one local advisory xact lock. Taken before the loop so the whole batch
-    -- sequence commits under one serialization.
-    IF v_armed THEN
-        my_ticket := coldfront._claim_iceberg_lock(v_iceberg);
-        PERFORM coldfront._enqueue_release(my_ticket);
-    ELSE
-        PERFORM pg_advisory_xact_lock(hashtext('coldfront_iceberg:' || v_iceberg));
-    END IF;
+    -- xact end). Same gate as _exec_iceberg_with_claim: mesh takes one R-A
+    -- claim (released by the C XactCallback at commit), vanilla one local
+    -- advisory xact lock. Taken before the loop so the whole batch sequence
+    -- commits under one serialization.
+    PERFORM coldfront._take_iceberg_claim(v_iceberg);
 
     -- Identity column + its sequence (NULL if no IDENTITY column).
     SELECT a.attname,
@@ -937,9 +1001,6 @@ DECLARE
     v_targets     timestamptz[];
     v_hot_targets timestamptz[];
     v_uncovered   bigint;
-    my_ticket     bigint;
-    v_armed       boolean := NULLIF(current_setting('snowflake.node', true), '') IS NOT NULL
-                         AND NULLIF(current_setting('coldfront.dblink_self', true), '') IS NOT NULL;
 BEGIN
     SET LOCAL duckdb.unsafe_allow_execution_inside_functions = on;
     SET LOCAL duckdb.unsafe_allow_mixed_transactions = on;
@@ -949,7 +1010,7 @@ BEGIN
     SELECT tv.hot_table, tv.iceberg_table, tv.partition_col, aw.cutoff_time
     INTO v_hot_table, v_iceberg, v_partcol, v_cutoff
     FROM coldfront.tiered_views tv
-    LEFT JOIN coldfront.archive_watermark aw ON aw.table_name = p_view_name
+    LEFT JOIN coldfront.archive_watermark aw ON aw.schema_name = p_view_schema AND aw.table_name = p_view_name
     WHERE tv.schema_name = p_view_schema AND tv.relname = p_view_name;
     IF v_hot_table IS NULL OR v_cutoff IS NULL THEN
         RAISE EXCEPTION 'coldfront: cross-tier move on %.% requires a tiered view with a cutoff',
@@ -1034,13 +1095,8 @@ BEGIN
     END IF;
 
     -- One claim for the whole move (released at xact end by the C XactCallback);
-    -- mesh → R-A bakery, vanilla → local advisory xact lock.
-    IF v_armed THEN
-        my_ticket := coldfront._claim_iceberg_lock(v_iceberg);
-        PERFORM coldfront._enqueue_release(my_ticket);
-    ELSE
-        PERFORM pg_advisory_xact_lock(hashtext('coldfront_iceberg:' || v_iceberg));
-    END IF;
+    -- mesh takes the R-A bakery, vanilla a local advisory xact lock.
+    PERFORM coldfront._take_iceberg_claim(v_iceberg);
 
     -- ── Capture the moved rows by VALUE (no iceberg_scan in any modifying stmt) ──
     -- Affected COLD rows are read with a SELECT cursor over iceberg_scan (a pure
@@ -1349,13 +1405,6 @@ CREATE OR REPLACE PROCEDURE coldfront.cutover_archive(
 LANGUAGE plpgsql AS $$
 DECLARE
     parent_table text;
-    my_ticket    bigint;
-    -- Same gate the cold WRITE path uses (_exec_iceberg_with_claim): mesh takes
-    -- the R-A bakery claim, vanilla a local xact advisory lock — on the SAME
-    -- per-iceberg-table key. Acquiring it here serializes the cutover against
-    -- concurrent cold writers through their own mutex.
-    v_armed   boolean := NULLIF(current_setting('snowflake.node', true), '') IS NOT NULL
-                     AND NULLIF(current_setting('coldfront.dblink_self', true), '') IS NOT NULL;
 BEGIN
     SELECT format('%I.%I', n.nspname, c.relname) INTO parent_table
     FROM pg_inherits i
@@ -1370,10 +1419,10 @@ BEGIN
 
     UPDATE coldfront.archive_watermark
        SET cutoff_time = p_new_cutoff
-     WHERE table_name = p_source;
+     WHERE schema_name = p_schema AND table_name = p_source;
     IF NOT FOUND THEN
-        INSERT INTO coldfront.archive_watermark (table_name, cutoff_time)
-        VALUES (p_source, p_new_cutoff);
+        INSERT INTO coldfront.archive_watermark (schema_name, table_name, cutoff_time)
+        VALUES (p_schema, p_source, p_new_cutoff);
     END IF;
 
     -- GLOBAL LOCK ORDER, step 1 — take the bakery (resource B) BEFORE any
@@ -1384,12 +1433,10 @@ BEGIN
     -- xact-scoped. Deliberately NO lock_timeout on this acquire — we WANT to
     -- wait out an in-flight cold writer's full commit so its RowExclusive on the
     -- partition is gone before we ask for ACCESS EXCLUSIVE.
-    IF v_armed THEN
-        my_ticket := coldfront._claim_iceberg_lock(p_iceberg_ref);
-        PERFORM coldfront._enqueue_release(my_ticket);
-    ELSE
-        PERFORM pg_advisory_xact_lock(hashtext('coldfront_iceberg:' || p_iceberg_ref));
-    END IF;
+    -- Same per-iceberg-table mutex the cold WRITE path takes, on the SAME key,
+    -- so the cutover serializes against concurrent cold writers (mesh R-A claim,
+    -- vanilla advisory). No lock_timeout here (deliberate; see above).
+    PERFORM coldfront._take_iceberg_claim(p_iceberg_ref);
 
     -- GLOBAL LOCK ORDER, step 2 — now A. lock_timeout is the circuit breaker on
     -- the ACCESS EXCLUSIVE acquisition ONLY (not the bakery above): if a writer
@@ -1527,7 +1574,7 @@ $$;
 --
 --   p_schema         PG schema for the wrapper view (e.g. 'public').
 --   p_table          relation/view name (e.g. 'events'). Iceberg table is
---                    created at ice.default.<p_table>.
+--                    created at ice.<p_schema>.<p_table>.
 --   p_columns        jsonb array of {name, type} entries. Type is a PG type
 --                    name from the supported set; see _iceberg_storage_type.
 --   p_partition_cols array of column names for Iceberg partitioning, or NULL.
@@ -1547,7 +1594,7 @@ CREATE OR REPLACE FUNCTION coldfront.create_iceberg_table(
 ) RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
-    ice_ref          text := format('ice."default".%I', p_table);
+    ice_ref          text := format('ice.%I.%I', p_schema, p_table);
     iceberg_cols     text := '';
     view_proj        text := '';
     placeholders     text := '';
@@ -1634,7 +1681,7 @@ BEGIN
     -- against an existing table — useful for distributed setups where each
     -- node registers the same shared Iceberg table independently.
     PERFORM coldfront.ensure_attached();
-    PERFORM duckdb.raw_query('CREATE SCHEMA IF NOT EXISTS ice."default"');
+    PERFORM duckdb.raw_query(format('CREATE SCHEMA IF NOT EXISTS ice.%I', p_schema));
     PERFORM duckdb.raw_query(format(
         'CREATE TABLE IF NOT EXISTS %s (%s)',
         ice_ref, iceberg_cols
@@ -1654,7 +1701,7 @@ BEGIN
     EXECUTE format(
         'CREATE OR REPLACE VIEW %I.%I AS SELECT %s FROM duckdb.query(%L) AS t(r)',
         p_schema, p_table, view_proj,
-        format('SELECT * FROM ice.default.%s', p_table)
+        format('SELECT * FROM ice.%I.%I', p_schema, p_table)
     );
 
     -- 3. The C post_parse_analyze hook intercepts INSERT INTO the iceberg-only
@@ -1670,7 +1717,7 @@ BEGIN
     -- 4. Registry row — is_iceberg_only=true tells the C hook to short-circuit
     --    classify_tier to TIER_COLD for any INSERT/UPDATE/DELETE on this view.
     INSERT INTO coldfront.tiered_views (schema_name, relname, hot_table, iceberg_table, partition_col, is_iceberg_only)
-    VALUES (p_schema, p_table, NULL, format('ice.default.%s', p_table), NULL, true)
+    VALUES (p_schema, p_table, NULL, ice_ref, NULL, true)
     ON CONFLICT (schema_name, relname) DO UPDATE SET
         hot_table       = NULL,
         iceberg_table   = EXCLUDED.iceberg_table,
@@ -2232,6 +2279,33 @@ CREATE FUNCTION coldfront._enqueue_release(p_ticket bigint)
 RETURNS void
 LANGUAGE c AS 'coldfront', 'coldfront_enqueue_release';
 
+-- coldfront._bakery_armed: TRUE when this node is configured for the multi-writer
+-- Ricart-Agrawala bakery (both GUCs the protocol needs are set). FALSE means
+-- vanilla single-node, which serializes cold writes with a local advisory xact
+-- lock. The single source of truth for the gate.
+CREATE FUNCTION coldfront._bakery_armed() RETURNS boolean
+LANGUAGE sql STABLE AS $$
+    SELECT NULLIF(current_setting('snowflake.node', true), '') IS NOT NULL
+       AND NULLIF(current_setting('coldfront.dblink_self', true), '') IS NOT NULL
+$$;
+
+-- coldfront._take_iceberg_claim: acquire the per-iceberg-table cold-write mutex,
+-- held to transaction end. Mesh (_bakery_armed): take the R-A bakery claim and
+-- enqueue its release for the C XactCallback. Vanilla: a transaction-scoped local
+-- advisory lock (auto-released at xact end). Callers decide WHEN to call it
+-- relative to their own work; it deliberately omits the standby
+-- (pg_is_in_recovery) guard and any lock ordering, which stay in callers.
+CREATE FUNCTION coldfront._take_iceberg_claim(p_iceberg_ref text) RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF coldfront._bakery_armed() THEN
+        PERFORM coldfront._enqueue_release(coldfront._claim_iceberg_lock(p_iceberg_ref));
+    ELSE
+        PERFORM pg_advisory_xact_lock(hashtext('coldfront_iceberg:' || p_iceberg_ref));
+    END IF;
+END;
+$$;
+
 -- Is the async-parquet upload ordering BOTH requested AND safe to use?
 -- coldfront.iceberg_async_parquet asks to stage parquet OUTSIDE the bakery claim
 -- (writers overlap on S3); that is correct ONLY when the loaded duckdb-iceberg
@@ -2283,7 +2357,7 @@ $$;
 --     at commit. This is the path for plain PostgreSQL tiered deployments, which
 --     have no snowflake.node / dblink_self configured.
 --
--- v_armed probes the two GUCs the R-A bakery requires. current_setting(...,true)
+-- _bakery_armed() probes the two GUCs the R-A bakery requires. current_setting(...,true)
 -- returns NULL for an unrecognised GUC, so the probe is safe with no snowflake
 -- extension loaded.
 CREATE FUNCTION coldfront._exec_iceberg_with_claim(
@@ -2291,9 +2365,9 @@ CREATE FUNCTION coldfront._exec_iceberg_with_claim(
     p_sql           text
 ) RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
-    my_ticket bigint;
-    v_armed   boolean := NULLIF(current_setting('snowflake.node', true), '') IS NOT NULL
-                     AND NULLIF(current_setting('coldfront.dblink_self', true), '') IS NOT NULL;
+    -- v_armed drives BOTH the acquire (via _take_iceberg_claim) and the async
+    -- vs stock upload ordering below, so it stays a local here.
+    v_armed   boolean := coldfront._bakery_armed();
     -- Async-parquet upload ordering: stage the parquet OUTSIDE the claim (writers
     -- overlap on S3), then take the claim only to wrap pg_duckdb's deferred commit
     -- POST. Correct ONLY on the bakery-aware duckdb-iceberg build (it re-stamps
@@ -2327,20 +2401,15 @@ BEGIN
         PERFORM set_config('coldfront._async_downgrade_warned', 'true', false);
     END IF;
     IF v_armed AND v_async THEN
-        -- Patched iceberg: upload parquet in the background, then take the bakery
+        -- Patched iceberg: upload parquet in the background, then take the claim
         -- only to wrap pg_duckdb's deferred commit POST.
         PERFORM duckdb.raw_query(p_sql);
-        my_ticket := coldfront._claim_iceberg_lock(p_iceberg_table);
-        PERFORM coldfront._enqueue_release(my_ticket);
-    ELSIF v_armed THEN
-        -- Stock iceberg: claim FIRST, then upload+commit inside the held ticket
-        -- so no peer can capture a stale parent_snapshot_id.
-        my_ticket := coldfront._claim_iceberg_lock(p_iceberg_table);
-        PERFORM coldfront._enqueue_release(my_ticket);
-        PERFORM duckdb.raw_query(p_sql);
+        PERFORM coldfront._take_iceberg_claim(p_iceberg_table);
     ELSE
-        -- Vanilla single-node: local advisory lock, taken before staging.
-        PERFORM pg_advisory_xact_lock(hashtext('coldfront_iceberg:' || p_iceberg_table));
+        -- Stock (armed) or vanilla: acquire FIRST (mesh R-A claim or local
+        -- advisory, chosen inside the helper), then upload+commit inside it so no
+        -- peer can capture a stale parent_snapshot_id.
+        PERFORM coldfront._take_iceberg_claim(p_iceberg_table);
         PERFORM duckdb.raw_query(p_sql);
     END IF;
 END;
@@ -2362,21 +2431,12 @@ $$;
 -- (Bakery_v2.cfg); the patchless-async shortcut it must avoid is Bakery_v2_race.
 CREATE FUNCTION coldfront._claim_iceberg_external(p_iceberg_table text)
 RETURNS void LANGUAGE plpgsql AS $$
-DECLARE
-    my_ticket bigint;
-    v_armed   boolean := NULLIF(current_setting('snowflake.node', true), '') IS NOT NULL
-                     AND NULLIF(current_setting('coldfront.dblink_self', true), '') IS NOT NULL;
 BEGIN
     IF pg_is_in_recovery() THEN
         RAISE EXCEPTION 'coldfront: cannot compact (Iceberg write) on a read-only standby'
             USING HINT = 'Standbys serve reads only; run the compactor against the primary.';
     END IF;
-    IF v_armed THEN
-        my_ticket := coldfront._claim_iceberg_lock(p_iceberg_table);
-        PERFORM coldfront._enqueue_release(my_ticket);
-    ELSE
-        PERFORM pg_advisory_xact_lock(hashtext('coldfront_iceberg:' || p_iceberg_table));
-    END IF;
+    PERFORM coldfront._take_iceberg_claim(p_iceberg_table);
 END;
 $$;
 
@@ -2417,7 +2477,7 @@ $$;
 
 -- Migrate the name-keyed registry + watermark rows when the transparent VIEW is
 -- renamed. coldfront.tiered_views (keyed on schema+relname) and archive_watermark
--- (keyed on the bare view name == archiver SourceTable) both follow the new name.
+-- (keyed on schema + bare view name == archiver SourceTable) both follow the new name.
 -- _rebuild_tiered_view + the regenerated INSERT trigger look the registry/cutoff
 -- up by the NEW name; without this migration the rebuild would not find the row,
 -- v_has_cutoff would be false, and the rebuilt view would drop its cold (Iceberg)
@@ -2432,7 +2492,7 @@ CREATE FUNCTION coldfront._rename_tiered_view(
      WHERE schema_name = p_schema AND relname = p_old_view_name;
     UPDATE coldfront.archive_watermark
        SET table_name = p_new_view_name
-     WHERE table_name = p_old_view_name;
+     WHERE schema_name = p_schema AND table_name = p_old_view_name;
 $$;
 
 -- coldfront._rebuild_tiered_view: regenerate the transparent UNION-ALL view
@@ -2464,9 +2524,9 @@ LANGUAGE plpgsql
 SET client_min_messages = warning AS $$
 DECLARE
     v_schema        text;
-    v_view_name     text;          -- bare relname == archiver SourceTable == watermark key
+    v_view_name     text;          -- bare relname == archiver SourceTable == watermark table_name
     v_hot_table     text;          -- stored quoted, e.g. "public"."_events"
-    v_iceberg       text;          -- DuckDB ref, e.g. ice.default.events
+    v_iceberg       text;          -- DuckDB ref, e.g. ice.myapp.events
     v_partcol       text;
     v_is_ice_only   boolean;
     v_hot_schema    text;
@@ -2519,10 +2579,10 @@ BEGIN
     v_hot_schema  := (parse_ident(v_hot_table))[1];
     v_hot_relname := (parse_ident(v_hot_table))[2];
 
-    -- 2. Watermark cutoff, keyed on the BARE view name (== SourceTable).
+    -- 2. Watermark cutoff, keyed on (schema, bare view name == SourceTable).
     SELECT cutoff_time INTO v_cutoff
     FROM coldfront.archive_watermark
-    WHERE table_name = v_view_name;
+    WHERE schema_name = v_schema AND table_name = v_view_name;
     v_has_cutoff := (v_cutoff IS NOT NULL);
     IF v_has_cutoff THEN
         -- UTC text literal, matching internal/view/view.go cutoffLiteral().
@@ -2654,7 +2714,7 @@ $fn$CREATE OR REPLACE FUNCTION %s() RETURNS trigger AS $body$
 DECLARE
   cutoff timestamptz;
 BEGIN
-  SELECT cutoff_time INTO cutoff FROM coldfront.archive_watermark WHERE table_name = %L;
+  SELECT cutoff_time INTO cutoff FROM coldfront.archive_watermark WHERE schema_name = %L AND table_name = %L;
   IF cutoff IS NULL THEN
     cutoff := %s;
   END IF;
@@ -2675,7 +2735,7 @@ BEGIN
 END;
 $body$ LANGUAGE plpgsql$fn$,
         v_funcname,
-        v_view_name,                                            -- watermark key literal
+        v_schema, v_view_name,                                  -- watermark key literals (schema, name)
         CASE WHEN v_has_cutoff
              THEN quote_literal(v_cutoff_lit) || '::timestamptz'
              ELSE '''-infinity''::timestamptz' END,             -- default cutoff
@@ -2796,8 +2856,8 @@ $$;
 -- these run cleanly at CREATE EXTENSION.
 COMMENT ON SCHEMA coldfront IS 'pgEdge ColdFront: transparent PostgreSQL to Apache Iceberg tiering, plus decoupled iceberg-only tables.';
 COMMENT ON TABLE coldfront.tiered_views IS 'Registry (keyed by schema, relname) of views the coldfront DML hook handles — tiered (hot+cold) and decoupled (iceberg-only).';
-COMMENT ON TABLE coldfront.archive_watermark IS 'Per-tiered-table hot/cold cutoff: ts >= cutoff is hot (PG), ts < cutoff is cold (Iceberg).';
-COMMENT ON TABLE coldfront.storage_secret IS 'Cold-store credential; materialized as a DuckDB PERSISTENT SECRET, replicated by value across a Spock mesh, excluded from pg_dump.';
+COMMENT ON TABLE coldfront.archive_watermark IS 'Per-tiered-table (schema, table) hot/cold cutoff: ts >= cutoff is hot (PG), ts < cutoff is cold (Iceberg).';
+COMMENT ON TABLE coldfront.storage_secret IS 'Cold-store credential; materialized as a DuckDB PERSISTENT SECRET, replicated by value across a Spock mesh, excluded from pg_dump. A vended row stores no credential and materializes nothing: Lakekeeper mints per-table creds and ensure_attached uses ACCESS_DELEGATION_MODE VENDED_CREDENTIALS.';
 COMMENT ON TABLE coldfront.partition_config IS 'Name-keyed per-table partition/tiering lifecycle config (period, hot_period, retention); replicates by value so every mesh node reads identical config.';
 COMMENT ON TABLE coldfront.claims IS 'Ricart-Agrawala bakery: a writer''s outstanding iceberg-commit claim (iceberg_table, snowflake ticket); deleted on release.';
 COMMENT ON TABLE coldfront.claim_acks IS 'Ricart-Agrawala bakery: per-peer acknowledgements of a claim, replicated back to the originating writer.';

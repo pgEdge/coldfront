@@ -80,6 +80,19 @@ func TestColdSecretSQL_Azure(t *testing.T) {
 	assert.NotContains(t, sql, "TYPE S3")
 }
 
+func TestStaticCredsConfigured(t *testing.T) {
+	s3 := &config.Config{S3: config.S3Config{AccessKey: "a", SecretKey: "s"}}
+	assert.True(t, staticCredsConfigured(s3), "s3 access key ⇒ static")
+
+	azure := &config.Config{Azure: config.AzureConfig{
+		ConnectionString: "AccountName=acct;AccountKey=Zm9v"}}
+	assert.True(t, staticCredsConfigured(azure), "azure connection string ⇒ static")
+
+	vended := &config.Config{Iceberg: config.IcebergConfig{
+		Warehouse: "wh", LakekeeperEndpoint: "http://lk:8181/catalog"}}
+	assert.False(t, staticCredsConfigured(vended), "no creds ⇒ vended")
+}
+
 // mockRow / mockRows / mockQuerier mirror the pattern in
 // internal/partition/partition_test.go. Hand-written, no mock framework.
 type mockRow struct {
@@ -481,4 +494,15 @@ func TestCutoverFailHint(t *testing.T) {
 	assert.Contains(t, h, "must be dropped", "gives actionable guidance")
 	assert.Empty(t, cutoverFailHint(&pgconn.PgError{Code: "55P03"}), "no hint for the transient lock timeout")
 	assert.Empty(t, cutoverFailHint(errors.New("boom")), "no hint for non-Postgres errors")
+}
+
+// Two tables sharing a name in different PG schemas map to distinct Iceberg
+// tables, since the PG schema is the Iceberg namespace (ice.<schema>.<table>).
+func TestIcebergRef_SchemaScoped(t *testing.T) {
+	a := icebergRef("myapp", "events")
+	b := icebergRef("analytics", "events")
+	assert.NotEqual(t, a, b, "distinct schemas yield distinct iceberg refs")
+	assert.Contains(t, a, "myapp")
+	assert.Contains(t, a, "events")
+	assert.Contains(t, b, "analytics")
 }

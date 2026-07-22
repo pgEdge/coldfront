@@ -8,6 +8,20 @@ import (
 	"github.com/apache/iceberg-go/utils"
 )
 
+func TestSplitSchemaTable(t *testing.T) {
+	cases := []struct{ arg, schema, table string }{
+		{"events", "public", "events"},
+		{"myapp.events", "myapp", "events"},
+		{"analytics.events", "analytics", "events"},
+	}
+	for _, c := range cases {
+		s, tbl := splitSchemaTable(c.arg)
+		if s != c.schema || tbl != c.table {
+			t.Errorf("splitSchemaTable(%q) = (%q, %q); want (%q, %q)", c.arg, s, tbl, c.schema, c.table)
+		}
+	}
+}
+
 func TestStorageProps_S3Compat(t *testing.T) {
 	// SeaweedFS/MinIO: explicit http endpoint, path-style addressing.
 	c := &Config{}
@@ -62,6 +76,28 @@ func TestStorageProps_AWSNative(t *testing.T) {
 	}
 	if p[iceio.S3Region] != "ap-south-2" {
 		t.Fatalf("region = %q", p[iceio.S3Region])
+	}
+}
+
+func TestStorageProps_VendedEmptyConfig(t *testing.T) {
+	// Vended deployment: no s3/azure creds in YAML. storageProps must set NO
+	// credential keys, so iceberg-go's vended storage-credentials (merged last)
+	// are not shadowed by empty static keys, and its Azure shared-key branch does
+	// not preempt a vended SAS.
+	c := &Config{}
+	c.Iceberg.Warehouse = "wh"
+	c.Iceberg.LakekeeperEndpoint = "http://lk:8181/catalog"
+	p, err := c.storageProps()
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, k := range []string{
+		iceio.S3AccessKeyID, iceio.S3SecretAccessKey,
+		iceio.ADLSSharedKeyAccountName, iceio.ADLSSharedKeyAccountKey,
+	} {
+		if _, ok := p[k]; ok {
+			t.Fatalf("vended config must not set %q, got %q", k, p[k])
+		}
 	}
 }
 

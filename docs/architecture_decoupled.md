@@ -70,7 +70,7 @@ materializes a DuckDB PERSISTENT SECRET, which DuckDB loads at instance
 init. It is set once; no per-session arming is needed.
 
 After that, the first query touching a tiered view in any session
-lazily attaches the catalog and `ice.default.*` becomes available.
+lazily attaches the catalog and `ice.public.*` becomes available.
 
 ## Interface
 
@@ -100,8 +100,8 @@ The following attempts fail, with the reason for each:
 
 | Attempt | Failure |
 |---|---|
-| `SELECT * FROM ice.default.events` | PG parser rejects: `cross-database references are not implemented`. PG sees the 3-part name as `database.schema.table` and refuses. There is no "ice is an attached duckdb catalog" handling at the PG parser level. |
-| `INSERT INTO ice.default.events VALUES (...)` (PG-native DML on the 3-part name) | Same parser rejection. |
+| `SELECT * FROM ice.public.events` | PG parser rejects: `cross-database references are not implemented`. PG sees the 3-part name as `database.schema.table` and refuses. There is no "ice is an attached duckdb catalog" handling at the PG parser level. |
+| `INSERT INTO ice.public.events VALUES (...)` (PG-native DML on the 3-part name) | Same parser rejection. |
 | Bare-column predicates on `iceberg_scan(...)` | `iceberg_scan` returns a single-column row of struct; columns must be accessed via `r['col']`. Bare `WHERE col = …` fails with "column does not exist". |
 
 The net effect: every read or write of an Iceberg-only table either
@@ -132,7 +132,7 @@ surface are:
 | `uuid` | `UUID` | identical |
 | `bytea` | `BLOB` | identical |
 | `oid` | `BIGINT` (signed-safe widen) | identical |
-| `text` / `varchar(N)` / `char(N)` | `VARCHAR` | unbounded; declared length not enforced |
+| `text` / `varchar(N)` / `char(N)` | `VARCHAR` | unbounded; declared length not enforced; `char(N)` returns unpadded (`pg_typeof varchar`) |
 | `numeric(P,S)` (P ≤ 38) | `DECIMAL(P,S)` | identical |
 | `jsonb` / `json` | `VARCHAR` | view-cast back to `json` (not `jsonb` - Iceberg has no JSON primitive) |
 | `interval` | `VARCHAR` | view-cast back to `interval` |
@@ -183,16 +183,16 @@ DELETE FROM events WHERE id = 1;
 
 What the helper does:
 
-1. `duckdb.raw_query('CREATE SCHEMA IF NOT EXISTS ice."default"')` -
+1. `duckdb.raw_query('CREATE SCHEMA IF NOT EXISTS ice."public"')` -
    idempotent namespace creation against Lakekeeper.
-2. `duckdb.raw_query('CREATE TABLE ice.default.<name> (col1
+2. `duckdb.raw_query('CREATE TABLE ice.public.<name> (col1
    STORAGE_TYPE, …)')` - column types are validated by
    `coldfront._iceberg_storage_type()`, which mirrors the canonical
    map in `cmd/archiver/main.go pgFormatTypeToDuckDB`. Anything outside
    the supported set (see "Supported column types" above) raises before
    any DDL is issued.
 3. `CREATE OR REPLACE VIEW <schema>.<name> AS SELECT r['col']::pg_type
-   AS col, … FROM duckdb.query('SELECT * FROM ice.default.<name>') AS
+   AS col, … FROM duckdb.query('SELECT * FROM ice.public.<name>') AS
    t(r)` - projection wraps the struct accessor so applications see
    flat columns. View-cast types (`jsonb` → `json`, `interval`) are
    surfaced via the appropriate cast. The view reads via
@@ -205,7 +205,7 @@ What the helper does:
    this flag and short-circuits `classify_tier()` to `TIER_COLD` for
    any INSERT/UPDATE/DELETE on the wrapper view, regardless of WHERE
    clause or watermark - so every write rewrites cleanly into a single
-   `SELECT duckdb.raw_query('INSERT/UPDATE/DELETE ice.default.<name>
+   `SELECT duckdb.raw_query('INSERT/UPDATE/DELETE ice.public.<name>
    …')`. No INSTEAD OF INSERT trigger is created - the hook is the
    dispatch path.
 

@@ -243,30 +243,56 @@ func coldSecretSQL(cfg *config.Config) string {
 	return s + ")"
 }
 
-// attachIceberg sets up the per-connection DuckDB cold-store secret and Lakekeeper catalog.
+// staticCredsConfigured reports whether the config carries static object-store
+// credentials to build a DuckDB secret from (an S3 access key or an Azure
+// connection string). False means a vended deployment: the YAML carries no
+// credentials and Lakekeeper mints them per table. (Config validation has
+// already rejected a partial s3.* config by the time we get here.)
+func staticCredsConfigured(cfg *config.Config) bool {
+	return cfg.S3.AccessKey != "" || cfg.Azure.ConnectionString != ""
+}
+
+// storageSecretVended reports whether the cold store uses vended (minted)
+// credentials: coldfront.storage_secret.vended is true. A missing row reads as
+// false (no cold store configured yet).
+func storageSecretVended(ctx context.Context, conn *pgx.Conn) (bool, error) {
+	var vended bool
+	err := conn.QueryRow(ctx,
+		"SELECT COALESCE((SELECT vended FROM coldfront.storage_secret LIMIT 1), false)").Scan(&vended)
+	return vended, err
+}
+
+// attachIceberg sets up the per-connection DuckDB cold-store credential (unless
+// it is vended) and attaches the Lakekeeper catalog. coldfront.ensure_attached()
+// is the sole ATTACH: it derives the access-delegation mode from the stored
+// storage_secret row (VENDED_CREDENTIALS when vended, else NONE) and pins the
+// bundled httplib HTTP client. The system libcurl client DuckDB 1.5 defaults to
+// uses a threaded resolver that races glibc's getaddrinfo netlink fd under a
+// copy-on-write Iceberg DELETE against an object-store hostname (never a bare-IP
+// store, which is why CI on SeaweedFS never hit it); curl 8.11.1 made that a hard
+// SIGABRT via CVE-2025-0665. The base now builds curl 8.12.0 (CVE-fixed), but
+// httplib stays pinned: it resolves in-thread, so DuckDB stays fully parallel.
 func attachIceberg(ctx context.Context, conn *pgx.Conn, cfg *config.Config) error {
-	if err := execDuckDB(ctx, conn, coldSecretSQL(cfg)); err != nil {
-		return fmt.Errorf("create cold-store secret: %w", err)
+	vended, err := storageSecretVended(ctx, conn)
+	if err != nil {
+		return fmt.Errorf("read storage_secret vended flag: %w", err)
+	}
+	static := staticCredsConfigured(cfg)
+	switch {
+	case !static && !vended:
+		return fmt.Errorf("no static s3/azure credentials configured and " +
+			"coldfront.storage_secret is not vended; run coldfront.set_storage_secret[_azure]() " +
+			"or coldfront.set_storage_secret_vended()")
+	case static && vended:
+		log.Printf("coldfront.storage_secret is vended; ignoring static s3/azure credentials in config")
+	case static && !vended:
+		if err := execDuckDB(ctx, conn, coldSecretSQL(cfg)); err != nil {
+			return fmt.Errorf("create cold-store secret: %w", err)
+		}
 	}
 
-	if err := execDuckDB(ctx, conn, fmt.Sprintf(
-		"ATTACH IF NOT EXISTS %s AS ice (TYPE ICEBERG, ENDPOINT %s, AUTHORIZATION_TYPE NONE, ACCESS_DELEGATION_MODE NONE)",
-		sqlutil.Literal(cfg.Iceberg.Warehouse), sqlutil.Literal(cfg.Iceberg.LakekeeperEndpoint))); err != nil {
-		return fmt.Errorf("attach iceberg catalog: %w", err)
-	}
-
-	// Opt this backend's DuckDB instance onto the bundled httplib HTTP client — the
-	// ONE definition of that SET lives in coldfront.ensure_attached() (the same place
-	// the interactive cold path uses); the archiver just calls it rather than
-	// repeating the literal. The system libcurl client DuckDB 1.5 defaults to uses a
-	// threaded resolver that races glibc's getaddrinfo netlink fd under a copy-on-write
-	// Iceberg DELETE against an object-store hostname (never a bare-IP store, which is
-	// why CI on SeaweedFS never hit it); curl 8.11.1 made that a hard SIGABRT via
-	// CVE-2025-0665. The base now builds curl 8.12.0 (CVE-fixed), but httplib stays
-	// pinned: it resolves in-thread, so DuckDB stays fully parallel. ensure_attached
-	// re-ATTACHes ice (no-op — done above) and runs the SET, autoloading httpfs.
 	if _, err := conn.Exec(ctx, "SELECT coldfront.ensure_attached()"); err != nil { // nosemgrep
-		return fmt.Errorf("pin httplib via ensure_attached: %w", err)
+		return fmt.Errorf("attach iceberg catalog via ensure_attached: %w", err)
 	}
 
 	return nil
@@ -386,7 +412,7 @@ func runCycle(ctx context.Context, cfg *config.Config, t *config.TableConfig, co
 		cfg: cfg, t: t, conn: conn, wmStore: wmStore,
 		partMgr:  partition.NewManager(conn),
 		viewGen:  view.NewGenerator(conn),
-		iceTable: pgx.Identifier{"ice", cfg.Iceberg.Namespace, t.SourceTable}.Sanitize(),
+		iceTable: icebergRef(t.SourceSchema, t.SourceTable),
 		now:      now, debugExportDelay: debugExportDelay,
 	}
 
@@ -453,7 +479,7 @@ func (ac *archiveCycle) attachAndEnsureTable(ctx context.Context) error {
 	if err := attachIceberg(ctx, ac.conn, ac.cfg); err != nil {
 		return err
 	}
-	if err := ensureIcebergTable(ctx, ac.conn, ac.cfg, ac.t, ac.iceTable); err != nil {
+	if err := ensureIcebergTable(ctx, ac.conn, ac.t, ac.iceTable); err != nil {
 		return fmt.Errorf("ensure iceberg table: %w", err)
 	}
 	return nil
@@ -556,7 +582,7 @@ func (ac *archiveCycle) tierExpiredPartitions(ctx context.Context, hotExpired []
 // (idempotent cleanup, no race); otherwise run the full archive pipeline.
 func (ac *archiveCycle) archiveOnePartition(ctx context.Context, part partition.Info, columns []view.Column) error {
 	t := ac.t
-	wmCutoff, found, err := ac.wmStore.Get(ctx, t.SourceTable)
+	wmCutoff, found, err := ac.wmStore.Get(ctx, t.SourceSchema, t.SourceTable)
 	if err != nil {
 		return fmt.Errorf("get watermark: %w", err)
 	}
@@ -578,7 +604,7 @@ func (ac *archiveCycle) archiveOnePartition(ctx context.Context, part partition.
 // per-partition / per-period loop, never inside it.
 func (ac *archiveCycle) bootstrapTieredView(ctx context.Context, columns []view.Column) error {
 	t, iceTable := ac.t, ac.iceTable
-	wmCutoff, _, err := ac.wmStore.Get(ctx, t.SourceTable)
+	wmCutoff, _, err := ac.wmStore.Get(ctx, t.SourceSchema, t.SourceTable)
 	if err != nil {
 		return fmt.Errorf("get watermark: %w", err)
 	}
@@ -665,7 +691,7 @@ func runCycleTwoLevel(ctx context.Context, cfg *config.Config, t *config.TableCo
 		cfg: cfg, t: t, conn: conn, wmStore: wmStore,
 		partMgr:  partition.NewManager(conn),
 		viewGen:  view.NewGenerator(conn),
-		iceTable: pgx.Identifier{"ice", cfg.Iceberg.Namespace, t.SourceTable}.Sanitize(),
+		iceTable: icebergRef(t.SourceSchema, t.SourceTable),
 		now:      now, debugExportDelay: debugExportDelay,
 	}
 
@@ -1235,11 +1261,18 @@ func bulkExportWithSnapshot(ctx context.Context, conn *pgx.Conn, t *config.Table
 // bulk export is one autocommit DuckDB transaction; if Iceberg rejects it,
 // the whole archive cycle errors out and cron retries.)
 
+// icebergRef is the DuckDB reference for a source table's cold Iceberg table.
+// The PG schema is the Iceberg namespace, so the ref is ice.<schema>.<table>
+// and same-named tables in different PG schemas resolve to distinct tables.
+func icebergRef(schema, table string) string {
+	return pgx.Identifier{"ice", schema, table}.Sanitize()
+}
+
 // ensureIcebergTable creates the Iceberg namespace and table (matching the
 // PG source schema) if they don't already exist. Safe to call every run.
-func ensureIcebergTable(ctx context.Context, conn *pgx.Conn, cfg *config.Config, t *config.TableConfig, iceTable string) error {
+func ensureIcebergTable(ctx context.Context, conn *pgx.Conn, t *config.TableConfig, iceTable string) error {
 	if err := execDuckDB(ctx, conn, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s",
-		pgx.Identifier{"ice", cfg.Iceberg.Namespace}.Sanitize())); err != nil {
+		pgx.Identifier{"ice", t.SourceSchema}.Sanitize())); err != nil {
 		return fmt.Errorf("create namespace: %w", err)
 	}
 

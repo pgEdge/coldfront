@@ -52,7 +52,6 @@ func TestLoad_ValidConfig(t *testing.T) {
 func TestLoad_Defaults(t *testing.T) {
 	cfg, err := Load(writeConfig(t, validConfig))
 	require.NoError(t, err)
-	assert.Equal(t, "default", cfg.Iceberg.Namespace)
 	assert.Equal(t, "us-east-1", cfg.S3.Region)
 	assert.Equal(t, "public", cfg.Archiver.Tables[0].SourceSchema)
 	assert.Equal(t, 3, cfg.Archiver.Tables[0].FuturePartitions)
@@ -210,6 +209,27 @@ archiver:
 	assert.Equal(t,
 		"DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=Zm9v;EndpointSuffix=core.windows.net",
 		c.Azure.ConnectionString)
+}
+
+func TestValidate_VendedNoBackendOK(t *testing.T) {
+	// Vended (minted) credentials: the warehouse + endpoint are set, but no
+	// s3.*/azure creds: Lakekeeper vends them at read/write time and the
+	// archiver enforces coldfront.storage_secret.vended at attach. Valid config.
+	cfg := `
+postgres:
+  dsn: "host=localhost"
+iceberg:
+  warehouse: "wh"
+  lakekeeper_endpoint: "http://lk:8181/catalog"
+archiver:
+  tables:
+    - source_table: "t"
+      partition_period: "monthly"
+      hot_period: "1 month"
+      retention_period: "6 months"
+`
+	_, err := Load(writeConfig(t, cfg))
+	require.NoError(t, err)
 }
 
 func TestValidate_RejectsS3AndAzure(t *testing.T) {

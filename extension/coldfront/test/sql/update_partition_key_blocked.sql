@@ -20,8 +20,8 @@ CREATE VIEW public.events AS SELECT * FROM public._events;
 
 INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
 VALUES ('public', 'events', 'public._events', 'ice.default.events', 'ts');
-INSERT INTO coldfront.archive_watermark(table_name, cutoff_time)
-VALUES ('events', '2026-03-01'::timestamptz);
+INSERT INTO coldfront.archive_watermark(schema_name, table_name, cutoff_time)
+VALUES ('public', 'events', '2026-03-01'::timestamptz);
 
 -- Strict mode: no cross-tier move, so every partition-column SET is rejected.
 SET coldfront.allow_mixed_writes = off;

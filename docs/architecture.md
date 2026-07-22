@@ -145,13 +145,26 @@ node with no per-node file syncing. (2) It materializes a DuckDB
 init - so every backend, including the first fresh one, sees the secret
 at a committed timestamp before any query runs.
 
+For deployments that must not store a credential at all,
+`coldfront.set_storage_secret_vended()` records a vended
+`coldfront.storage_secret` row that holds no credential and materializes
+no secret. The row's `vended` flag drives `coldfront._attach_delegation_mode()`,
+so `ensure_attached()` attaches the catalog with
+`ACCESS_DELEGATION_MODE VENDED_CREDENTIALS`: Lakekeeper mints short-lived
+per-table credentials (S3 STS, or Azure SAS) that `duckdb-iceberg`
+consumes directly. A static row attaches with `ACCESS_DELEGATION_MODE
+NONE` (the persistent secret supplies the credential); the vended path
+sidesteps the fresh-transaction limitation below because `duckdb-iceberg`
+re-creates the per-table secret inside the commit transaction.
+
 For backup and restore (`pg_dump`), the durable tiering metadata -
 `coldfront.tiered_views` (registry), `archive_watermark` (cutoffs) and
 `partition_config` - is marked with `pg_extension_config_dump`, so a
 logical `pg_dump` carries it and a restore re-attaches to the **same**
 Iceberg cold tier with no re-provisioning. Two things are deliberately
 **not** dumped: the credential (`coldfront.storage_secret` above - re-run
-`set_storage_secret` once after restoring into a fresh instance) and the
+`set_storage_secret` (or `set_storage_secret_vended`) once after
+restoring into a fresh instance) and the
 bakery's transient claim tables (`claims` / `claim_acks` /
 `deferred_acks`, per-node mesh state). Until the credential is
 re-established a restored node serves hot reads but fails cold I/O
@@ -219,7 +232,7 @@ DuckDB temp table:
 ```sql
 CREATE TEMP TABLE duck_stage USING duckdb AS
   SELECT * FROM public.p_2026_01;
-SELECT duckdb.raw_query($$INSERT INTO ice.default.events
+SELECT duckdb.raw_query($$INSERT INTO ice.public.events
   SELECT * FROM pg_temp.duck_stage$$);
 DROP TABLE duck_stage;
 ```
@@ -230,7 +243,7 @@ DROP TABLE duck_stage;
 
 ```sql
 SELECT r['id']::bigint, r['ts']::timestamptz, r['status']::text
-FROM iceberg_scan('ice.default.events') r
+FROM iceberg_scan('ice.public.events') r
 WHERE r['ts'] < '2026-03-01'::timestamptz;
 ```
 
@@ -628,7 +641,7 @@ but dwarfed by the Iceberg commit work for any realistic batch.
 straight into the Iceberg writer - e.g. a `COPY` form:
 
 ```sql
-COPY (SELECT * FROM public.events_partition) TO ICEBERG 'ice.default.events';
+COPY (SELECT * FROM public.events_partition) TO ICEBERG 'ice.public.events';
 ```
 
 That would make pg_duckdb the only place in the data path that touches
@@ -676,4 +689,31 @@ on the catalog's current spec, with no new SQL surface (existing
 `INSERT INTO ice.x VALUES ...` would route rows through the partition
 transform). Until then the spec stays empty and pruning relies on
 manifest statistics.
+
+### duckdb-iceberg: append to the manifest list instead of rebuilding it
+
+At commit, duckdb-iceberg (v1.5) rebuilds the new snapshot's manifest
+list from every entry of the existing one (`CreateFromEntries` plus
+`IcebergAddSnapshot`), so the commit reads the whole existing manifest
+list. Under ColdFront's serialized cold-write protocol that read happens
+while the writer holds the bakery ticket, and its cost grows with the
+manifest-list length, so it inflates the serialized critical section
+(compaction only partly offsets it).
+
+**Workaround today:** the `iceberg-bakery-aware-commit-refresh` patch
+re-reads the manifest list from the freshly-loaded catalog head inside
+the ticket (`RefreshExistingManifestList`). This is correct - it folds
+in any peer manifests committed since this writer staged its parquet -
+but it pays the full re-scan of the manifest list under the lock.
+
+**Upstream shape that would drop it:** a manifest-list commit that
+appends the new manifest to the existing manifest-list file, referenced
+by path from the current catalog head, instead of rebuilding from all
+scanned entries. That keeps peer inclusion (the fresh head already points
+at peers' manifests) while removing the full re-scan from the commit, so
+the serialized section no longer grows with manifest-list length. It is
+correctness-sensitive (manifest-list integrity, commit conflicts, silent
+data loss) and its throughput value is unmeasured and workload dependent,
+so it belongs upstream with fleet benchmarking rather than as a
+ColdFront-carried patch.
 

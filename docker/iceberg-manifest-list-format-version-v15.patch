@@ -1,6 +1,6 @@
 # iceberg-manifest-list-format-version-v15.patch
 #
-# Applies to: duckdb-iceberg @ 0fad545a (branch v1.5-variegata), DuckDB v1.5.x.
+# Applies to: duckdb-iceberg @ 5edc45f0 (branch v1.5-variegata), DuckDB v1.5.x.
 #
 # Cross-engine interop fix — upstreamable to duckdb-iceberg.
 #

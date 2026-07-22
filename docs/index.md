@@ -42,24 +42,27 @@ ColdFront runs inside PostgreSQL and rewrites each statement to the
 correct tier, so the application sees one relation:
 
 ```text
-Application
-  |
-  |-- SELECT * FROM events            reads hot + cold transparently
-  |-- INSERT INTO events ...          hot via PG, cold via raw_query
-  |-- UPDATE events SET ... WHERE ... rewritten to the right tier
-  |-- DELETE FROM events WHERE ...    rewritten to the right tier
-         |
-  PostgreSQL 16/17/18 + pg_duckdb + coldfront
-    _events (partitioned hot data, native PG)
-    events  VIEW (hot + cold, replaces the original table)
-    coldfront extension (rewrites DML to the right tier)
-    pg_duckdb (Iceberg reads + writes via DuckDB, in-process)
-         |
-  Lakekeeper (Iceberg REST catalog)
-         |
-  S3-compatible object store (Parquet data + Iceberg metadata)
-         |
-  Archiver (Go binary, cron) moves expired PG partitions to Iceberg
+                       Application
+                            │
+              SELECT / INSERT / UPDATE / DELETE
+              against one relation: "events"
+                            │
+                 PostgreSQL 16 / 17 / 18
+        events VIEW: reads union hot + cold
+        coldfront extension: rewrites writes to the right tier
+              ┌─────────────┴───────────────┐
+              │                             │
+          hot tier                      cold tier
+      _events: native PG            pg_duckdb: in-process
+      range partitions              DuckDB, Iceberg reads + writes
+              │                             │
+              │                   Lakekeeper (Iceberg REST catalog)
+              │                             │
+              │                   object store, S3 / Azure / GCS
+              │                   (Parquet data + Iceberg metadata)
+              │                             ▲
+              └──── Archiver (Go, cron) ────┘
+                    moves partitions past the hot window: hot → cold
 ```
 
 ## Quickstart
@@ -85,6 +88,11 @@ SELECT coldfront.create_iceberg_table('public', 'events',
 INSERT INTO events VALUES (1, now(), 'hello');
 SELECT count(*) FROM events;
 ```
+
+For compliance environments that cannot store an object-store credential,
+`coldfront.set_storage_secret_vended()` runs with no credential in the
+database: Lakekeeper mints short-lived per-table credentials at access
+time. See [Vended credentials](usage.md#vended-minted-credentials).
 
 ## Least-privilege application roles
 
@@ -123,6 +131,9 @@ Disable those features on the storage account before using it as a cold
 tier.
 
 ## Next Steps
+
+New here? Run the [guided walkthrough](walkthrough.md) to see all
+three modes in action with copy-pasteable commands.
 
 To go further with ColdFront, consult the following guides:
 

@@ -50,7 +50,7 @@ services:
     # start it (cloud-store users talk to AWS/Azure/GCS directly). Enable it for
     # local eval with: docker compose --profile local-store up -d --build
     profiles: ["local-store"]
-    image: chrislusf/seaweedfs:latest
+    image: chrislusf/seaweedfs:4.38
     command: "server -s3 -dir=/data -s3.config=/etc/seaweedfs/s3.json"
     volumes:
       - ./docker/seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro

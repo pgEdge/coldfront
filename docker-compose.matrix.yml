@@ -27,10 +27,17 @@ services:
       retries: 20
 
   seaweedfs:
-    image: chrislusf/seaweedfs:latest
-    command: "server -s3 -dir=/data -s3.config=/etc/seaweedfs/s3.json"
+    # Pinned: the `vended` backend needs SeaweedFS STS (AssumeRole → temp creds),
+    # whose Lakekeeper-vending path was only fully fixed upstream by 4.30-ish;
+    # `latest` drifts. -s3.iam.config adds the STS role/policy the vended lane
+    # assumes; it does not disturb the static admin identity in s3.json (the
+    # static lanes still authenticate by access key). See ci/topo/vanilla.sh
+    # (--backend vended).
+    image: chrislusf/seaweedfs:4.38
+    command: "server -s3 -dir=/data -s3.config=/etc/seaweedfs/s3.json -s3.iam.config=/etc/seaweedfs/iam.json"
     volumes:
       - ./docker/seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro
+      - ./docker/seaweedfs-iam.json:/etc/seaweedfs/iam.json:ro
 
   # Lakekeeper keeps its catalog in its OWN dedicated Postgres — never on a
   # ColdFront data node. Stock postgres ships the contrib uuid-ossp Lakekeeper's

@@ -23,7 +23,6 @@ type Config struct {
 	Iceberg struct {
 		Warehouse          string `yaml:"warehouse"`
 		LakekeeperEndpoint string `yaml:"lakekeeper_endpoint"`
-		Namespace          string `yaml:"namespace"`
 	} `yaml:"iceberg"`
 	S3 struct {
 		Endpoint  string `yaml:"endpoint"`
@@ -48,10 +47,18 @@ func LoadConfig(path string) (*Config, error) {
 	if err := yaml.Unmarshal(data, &c); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
-	if c.Iceberg.Namespace == "" {
-		c.Iceberg.Namespace = "default"
-	}
 	return &c, nil
+}
+
+// splitSchemaTable parses a "schema.table" CLI argument into its parts; a bare
+// name defaults to the "public" schema, matching the archiver's default source
+// schema. The PG schema is the Iceberg namespace, so same-named tables in
+// different schemas resolve to distinct Iceberg tables.
+func splitSchemaTable(arg string) (schema, table string) {
+	if s, t, found := strings.Cut(arg, "."); found {
+		return s, t
+	}
+	return "public", arg
 }
 
 // storageProps builds the iceberg-go fileio credential properties for whichever
@@ -73,9 +80,15 @@ func (c *Config) storageProps() (iceberg.Properties, error) {
 		}, nil
 	}
 
-	p := iceberg.Properties{
-		iceio.S3AccessKeyID:     c.S3.AccessKey,
-		iceio.S3SecretAccessKey: c.S3.SecretKey,
+	p := iceberg.Properties{}
+	// Static S3 keys. Omitted entirely for a vended deployment (empty s3 block):
+	// iceberg-go always requests delegation and merges Lakekeeper's vended
+	// storage-credentials last, so empty static keys must not shadow them. (A
+	// vended Azure store leaves the azure block empty too, so no ADLSSharedKey*
+	// is set above; its shared-key branch would otherwise beat the vended SAS.)
+	if c.S3.AccessKey != "" && c.S3.SecretKey != "" {
+		p[iceio.S3AccessKeyID] = c.S3.AccessKey
+		p[iceio.S3SecretAccessKey] = c.S3.SecretKey
 	}
 	if c.S3.Region != "" {
 		p[iceio.S3Region] = c.S3.Region

@@ -33,19 +33,21 @@ func (s *Store) EnsureTable(ctx context.Context) error {
 	}
 	if _, err := s.db.Exec(ctx, `
 		CREATE TABLE IF NOT EXISTS coldfront.archive_watermark (
-			table_name  text PRIMARY KEY,
-			cutoff_time timestamptz NOT NULL
+			schema_name text        NOT NULL,
+			table_name  text        NOT NULL,
+			cutoff_time timestamptz NOT NULL,
+			PRIMARY KEY (schema_name, table_name)
 		)`); err != nil {
 		return fmt.Errorf("create watermark table: %w", err)
 	}
 	return nil
 }
 
-// Get returns the cutoff time for the given table. If no watermark exists, found is false.
-func (s *Store) Get(ctx context.Context, tableName string) (cutoff time.Time, found bool, err error) {
+// Get returns the cutoff time for the given (schema, table). If no watermark exists, found is false.
+func (s *Store) Get(ctx context.Context, schemaName, tableName string) (cutoff time.Time, found bool, err error) {
 	err = s.db.QueryRow(ctx,
-		`SELECT cutoff_time FROM coldfront.archive_watermark WHERE table_name = $1`,
-		tableName,
+		`SELECT cutoff_time FROM coldfront.archive_watermark WHERE schema_name = $1 AND table_name = $2`,
+		schemaName, tableName,
 	).Scan(&cutoff)
 	if errors.Is(err, pgx.ErrNoRows) {
 		return time.Time{}, false, nil
@@ -56,13 +58,13 @@ func (s *Store) Get(ctx context.Context, tableName string) (cutoff time.Time, fo
 	return cutoff, true, nil
 }
 
-// Set upserts the cutoff time for the given table.
-func (s *Store) Set(ctx context.Context, tableName string, cutoff time.Time) error {
+// Set upserts the cutoff time for the given (schema, table).
+func (s *Store) Set(ctx context.Context, schemaName, tableName string, cutoff time.Time) error {
 	if _, err := s.db.Exec(ctx, `
-		INSERT INTO coldfront.archive_watermark (table_name, cutoff_time)
-		VALUES ($1, $2)
-		ON CONFLICT (table_name) DO UPDATE SET cutoff_time = EXCLUDED.cutoff_time`,
-		tableName, cutoff,
+		INSERT INTO coldfront.archive_watermark (schema_name, table_name, cutoff_time)
+		VALUES ($1, $2, $3)
+		ON CONFLICT (schema_name, table_name) DO UPDATE SET cutoff_time = EXCLUDED.cutoff_time`,
+		schemaName, tableName, cutoff,
 	); err != nil {
 		return fmt.Errorf("set watermark: %w", err)
 	}

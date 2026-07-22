@@ -7,19 +7,18 @@ build story is [DUCKDB_1.5_PATCHED.md](DUCKDB_1.5_PATCHED.md).
 ## What "unpatched 1.5" is
 
 The *same* 1.5.x stack — pg_duckdb PR #1025 + `duckdb-iceberg` `v1.5-variegata`
-@ `0fad545a` + avro/azure/postgres_scanner, libcurl 8.12, the same vcpkg/libasan
-toolchain and version pins — built with the four ColdFront patches **omitted**.
+@ `5edc45f0` + avro/azure/postgres_scanner, libcurl 8.12, the same vcpkg/libasan
+toolchain and version pins — built with the three ColdFront patches **omitted**.
 It is still a locally-built (unsigned) extension; there is no signed upstream
 1.5.x iceberg to auto-install (no released pg_duckdb bundles DuckDB 1.5).
 
 ## The build delta (vs the patched base)
 
 In `docker/Dockerfile.duckdb15-base`, drop the `COPY` + `git apply --check` +
-`git apply` of all four patches:
+`git apply` of all three patches:
 
 - `iceberg-bakery-aware-commit-refresh-v15.patch`
 - `iceberg-manifest-list-format-version-v15.patch`
-- `iceberg-manifest-content-v15.patch`
 - `iceberg-data-file-format-v15.patch`
 
 Everything else — libcurl, vcpkg deps, the pins, the extension config, the
@@ -51,13 +50,15 @@ strict reader checks. So iceberg-go rejects the manifests at:
 
 - **format-version** — the manifest *list* never declares it, so a strict reader
   defaults to v1 and then conflicts with the v2 manifest files.
-- **content** — the manifest *file* hardcodes `"data"`, conflicting with a delete
-  manifest's list entry (`"deletes"`).
 - **file_format** — written lowercase `"parquet"`, but the spec enum is `PARQUET`.
+
+(The manifest *file* `content` key — hardcoded `"data"` vs a delete manifest's
+`"deletes"` — was the same class of bug, but it is fixed upstream at the pinned
+ref, so it is not a consequence of running unpatched here.)
 
 `compactor` therefore fails at `PlanFiles` / read-task building and **nothing
 consolidates the cold tier** — at scale, tens of thousands of small Parquet files
-accumulate with no go-native compaction path. The three interop patches (carried
+accumulate with no go-native compaction path. The two interop patches (carried
 in the patched base) are exactly what make the compactor work; see
 [docs/compaction.md](docs/compaction.md) and [DUCKDB_1.5_PATCHED.md §3](DUCKDB_1.5_PATCHED.md).
 
@@ -82,5 +83,5 @@ the default.
   table (same-node and cross-node) → 3/3, no 409 — claim-first serializes the
   uploads, so each writer reads a fresh catalog head.
 - **Compactor blocked (the documented consequence):** `compactor --config <yaml>
-  --table <t> --dry-run` errors at `PlanFiles` on the format-version / content /
+  --table <t> --dry-run` errors at `PlanFiles` on the format-version /
   file_format cross-check.

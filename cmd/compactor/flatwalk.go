@@ -41,8 +41,7 @@ func (f flatWalkIO) WalkDir(root string, fn stdfs.WalkDirFunc) error {
 	if err != nil {
 		return fmt.Errorf("invalid URL %s: %w", root, err)
 	}
-	prefix := strings.TrimPrefix(u.Path, "/")
-	iter := bucket.List(&blob.ListOptions{Prefix: prefix}) // empty Delimiter => flat
+	iter := bucket.List(&blob.ListOptions{Prefix: listPrefix(u.Path)}) // empty Delimiter => flat
 	for {
 		obj, err := iter.Next(context.Background())
 		if err == io.EOF {
@@ -61,6 +60,21 @@ func (f flatWalkIO) WalkDir(root string, fn stdfs.WalkDirFunc) error {
 		}
 	}
 	return nil
+}
+
+// listPrefix turns a WalkDir root's URL path into the object-list prefix.
+// WalkDir's root is the table's directory, so we list its contents under a
+// trailing-slash prefix. Beyond being the correct directory semantics, the
+// trailing slash is required under vended credentials: Lakekeeper scopes the
+// vended s3:ListBucket grant with a condition of s3:prefix = "<table-dir>/*",
+// which a prefix WITHOUT the trailing slash does not satisfy (403). All of the
+// table's objects live under "<table-dir>/", so the listed set is unchanged.
+func listPrefix(urlPath string) string {
+	prefix := strings.TrimPrefix(urlPath, "/")
+	if prefix != "" && !strings.HasSuffix(prefix, "/") {
+		prefix += "/"
+	}
+	return prefix
 }
 
 // bucketOf extracts the *blob.Bucket from a gocloud-backed iceberg FileIO by

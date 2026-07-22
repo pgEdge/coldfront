@@ -64,7 +64,7 @@ func TestGet_Found(t *testing.T) {
 		},
 	}
 	s := NewStore(db)
-	got, found, err := s.Get(context.Background(), "events")
+	got, found, err := s.Get(context.Background(), "public", "events")
 	require.NoError(t, err)
 	assert.True(t, found)
 	assert.Equal(t, cutoff, got)
@@ -73,7 +73,7 @@ func TestGet_Found(t *testing.T) {
 func TestGet_NotFound(t *testing.T) {
 	db := &mockDB{} // default rowFunc returns ErrNoRows
 	s := NewStore(db)
-	_, found, err := s.Get(context.Background(), "events")
+	_, found, err := s.Get(context.Background(), "public", "events")
 	require.NoError(t, err)
 	assert.False(t, found)
 }
@@ -87,7 +87,7 @@ func TestGet_Error(t *testing.T) {
 		},
 	}
 	s := NewStore(db)
-	_, _, err := s.Get(context.Background(), "events")
+	_, _, err := s.Get(context.Background(), "public", "events")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "get watermark")
 }
@@ -96,7 +96,7 @@ func TestSet(t *testing.T) {
 	cutoff := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
 	db := &mockDB{}
 	s := NewStore(db)
-	err := s.Set(context.Background(), "events", cutoff)
+	err := s.Set(context.Background(), "public", "events", cutoff)
 	require.NoError(t, err)
 	require.Len(t, db.execSQL, 1)
 	assert.Contains(t, db.execSQL[0], "INSERT INTO")
@@ -110,7 +110,7 @@ func TestSet_Error(t *testing.T) {
 		},
 	}
 	s := NewStore(db)
-	err := s.Set(context.Background(), "events", time.Now())
+	err := s.Set(context.Background(), "public", "events", time.Now())
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "set watermark")
 }

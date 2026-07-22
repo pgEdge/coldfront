@@ -65,7 +65,13 @@ esac; done
 
 # storage_secret_sql — the SQL that sets the cold-store credential, per backend.
 storage_secret_sql() {
-    if [ "$BACKEND" = azure ]; then
+    if [ "$BACKEND" = azure-vended ]; then
+        printf "SELECT coldfront.set_storage_secret_vended('azure');"
+    elif [ "$BACKEND" = vended ]; then
+        # Vended (minted) creds: no credential stored. Lakekeeper mints per-table
+        # STS creds and ensure_attached() uses ACCESS_DELEGATION_MODE VENDED_CREDENTIALS.
+        printf "SELECT coldfront.set_storage_secret_vended();"
+    elif [ "$BACKEND" = azure ]; then
         printf "SELECT coldfront.set_storage_secret_azure('%s');" "$AZURE_CONN"
     elif [ "$BACKEND" = gcs ]; then
         # GCS via S3-interop: same s3 setter, GCS endpoint + HMAC + TLS.
@@ -81,7 +87,11 @@ storage_secret_sql() {
 
 # storage_yaml — the cold-store block for an archiver YAML config, per backend.
 storage_yaml() {
-    if [ "$BACKEND" = azure ]; then
+    if [ "$BACKEND" = vended ] || [ "$BACKEND" = azure-vended ]; then
+        # Vended: the YAML carries NO storage block. The archiver reads
+        # coldfront.storage_secret.vended and attaches with credential vending.
+        printf ''
+    elif [ "$BACKEND" = azure ]; then
         printf 'azure:\n  connection_string: "%s"' "$AZURE_CONN"
     elif [ "$BACKEND" = gcs ]; then
         # GCS = the s3 block pointed at the interop endpoint over TLS, HMAC creds.
@@ -118,6 +128,10 @@ EOSQL
     assert_eq "extensions present" "2" "$ext"
     local secret; secret=$(q "$HOST" "SELECT count(*) FROM coldfront.storage_secret;")
     assert_eq "storage secret row written" "1" "$secret"
+    if [ "$BACKEND" = vended ] || [ "$BACKEND" = azure-vended ]; then
+        assert_eq "storage secret is vended (no credential stored)" "t" \
+            "$(q "$HOST" "SELECT vended FROM coldfront.storage_secret LIMIT 1;")"
+    fi
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -170,7 +184,6 @@ postgres:
 iceberg:
   warehouse: "${WAREHOUSE}"
   lakekeeper_endpoint: "http://${LK_IP}:8181/catalog"
-  namespace: "default"
 $(storage_yaml)
 archiver:
   tables:
@@ -220,7 +233,6 @@ postgres:
 iceberg:
   warehouse: "${WAREHOUSE}"
   lakekeeper_endpoint: "http://${LK_IP}:8181/catalog"
-  namespace: "default"
 $(storage_yaml)
 archiver:
   tables:
@@ -267,8 +279,8 @@ story_provision_decoupled() {
         sleep 2
     done
     assert_eq "iceonly wrapper view created" "v" "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='iceonly' AND relnamespace='public'::regnamespace;")"
-    assert_eq "iceberg-only registry row present" "1" "$(q "$HOST" "SELECT count(*) FROM coldfront.tiered_views WHERE is_iceberg_only AND iceberg_table='ice.default.iceonly';")"
-    assert_eq "no hot table for iceberg-only view" "" "$(q "$HOST" "SELECT hot_table FROM coldfront.tiered_views WHERE iceberg_table='ice.default.iceonly';")"
+    assert_eq "iceberg-only registry row present" "1" "$(q "$HOST" "SELECT count(*) FROM coldfront.tiered_views WHERE is_iceberg_only AND iceberg_table='ice.public.iceonly';")"
+    assert_eq "no hot table for iceberg-only view" "" "$(q "$HOST" "SELECT hot_table FROM coldfront.tiered_views WHERE iceberg_table='ice.public.iceonly';")"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -464,7 +476,7 @@ EOSQL
     local ret_days=$(( ( $(date -u +%s) - $(date -u -d "$(date -u +%Y-%m-01) -1 month" +%s) ) / 86400 ))
     cat > /tmp/journey-typed.yaml <<EOF
 postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
-iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog", namespace: "default" }
+iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog" }
 $(storage_yaml)
 archiver: { tables: [ { source_table: typed, partition_period: monthly, hot_period: "${ret_days} days" } ] }
 EOF
@@ -1009,7 +1021,7 @@ EOSQL
     local ret_race=$(( ( $(date -u +%s) - $(date -u -d "$(date -u +%Y-%m-01) +14 days" +%s) ) / 86400 ))
     cat > /tmp/journey-race.yaml <<EOF
 postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
-iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog", namespace: "default" }
+iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog" }
 $(storage_yaml)
 archiver: { tables: [ { source_table: events, partition_period: monthly, hot_period: "${ret_race} days" } ] }
 EOF
@@ -1129,7 +1141,7 @@ story_mesh() {
     local pc
     for pc in "${PARR[@]}"; do
         q_may "$pc" "SELECT coldfront.create_iceberg_table('public','iceonly','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"ts\",\"type\":\"timestamptz\"},{\"name\":\"status\",\"type\":\"text\"},{\"name\":\"data\",\"type\":\"jsonb\"}]'::jsonb);" >/dev/null 2>&1
-        assert_eq "iceberg-only registered on peer $pc" "1" "$(q "$pc" "SELECT count(*) FROM coldfront.tiered_views WHERE is_iceberg_only AND iceberg_table='ice.default.iceonly';")"
+        assert_eq "iceberg-only registered on peer $pc" "1" "$(q "$pc" "SELECT count(*) FROM coldfront.tiered_views WHERE is_iceberg_only AND iceberg_table='ice.public.iceonly';")"
     done
 
     # Cross-node READ: every row db1 wrote to Iceberg is visible on each peer via
@@ -1503,7 +1515,7 @@ EOSQL
     local ret_days; ret_days=$(( ( $(date -u +%s) - $(date -u -d "$(date -u +%Y-%m-01) -1 month" +%s) ) / 86400 ))  # cutoff = start of now-1mo
     cat > /tmp/journey-tl.yaml <<EOF
 postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
-iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog", namespace: "default" }
+iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog" }
 $(storage_yaml)
 archiver:
   tables:
@@ -1636,7 +1648,7 @@ EOSQL
 
     cat > /tmp/journey-fk.yaml <<EOF
 postgres: { dsn: "${dsn}" }
-iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog", namespace: "default" }
+iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog" }
 $(storage_yaml)
 EOF
     if "$ARCHIVER" --config /tmp/journey-fk.yaml >/tmp/journey-fk-arch.log 2>&1; then
@@ -1702,6 +1714,194 @@ EOF
     q "$HOST" "DROP VIEW  IF EXISTS public.fk_events CASCADE;" >/dev/null 2>&1
     q "$HOST" "DROP TABLE IF EXISTS public._fk_events CASCADE;" >/dev/null 2>&1
     q "$HOST" "DROP TABLE IF EXISTS public.fk_categories CASCADE;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story — archiver mid-archive crash rollback: kill the archiver during the
+# post-Phase-2 debug window and verify that on re-run Phase 0 wipes the
+# partial Iceberg data and the archive completes cleanly. Asserts no data is
+# lost from PostgreSQL during a crash.
+# ───────────────────────────────────────────────────────────────────────────
+story_archiver_rollback() {
+    step "Archiver rollback: mid-archive crash → Phase 0 self-heals on re-run"
+
+    # Tear down the temp table + its config/watermark rows on EVERY exit path,
+    # including the early failure returns below, so a failed run cannot leak
+    # rb_events (or its partition_config row) into later config-driven stories.
+    _rb_cleanup() {
+        q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name='rb_events';" >/dev/null 2>&1
+        q "$HOST" "DELETE FROM coldfront.archive_watermark WHERE table_name='rb_events';" >/dev/null 2>&1
+        q "$HOST" "DROP VIEW  IF EXISTS public.rb_events CASCADE;" >/dev/null 2>&1
+        q "$HOST" "DROP TABLE IF EXISTS public._rb_events CASCADE;" >/dev/null 2>&1
+        q "$HOST" "DROP TABLE IF EXISTS public.rb_events CASCADE;" >/dev/null 2>&1
+    }
+    trap _rb_cleanup RETURN
+
+    local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
+    local ret_days; ret_days=$(( ( $(date -u +%s) - $(date -u -d "$(date -u +%Y-%m-01) -1 month" +%s) ) / 86400 ))
+
+    # Partitioned table with one cold partition (3 months ago) and one hot partition (current month).
+    qf "$HOST" <<'EOSQL' >/dev/null
+SET search_path = public;
+CREATE TABLE IF NOT EXISTS public.rb_events (
+    id     bigint GENERATED ALWAYS AS IDENTITY,
+    ts     timestamptz NOT NULL,
+    status text,
+    PRIMARY KEY (id, ts)
+) PARTITION BY RANGE (ts);
+DO $do$
+DECLARE m date;
+BEGIN
+  m := date_trunc('month', now()) - interval '3 months';
+  EXECUTE format('CREATE TABLE IF NOT EXISTS %I PARTITION OF rb_events FOR VALUES FROM (%L) TO (%L)',
+    'rb_events_p_cold', m, m + interval '1 month');
+  m := date_trunc('month', now());
+  EXECUTE format('CREATE TABLE IF NOT EXISTS %I PARTITION OF rb_events FOR VALUES FROM (%L) TO (%L)',
+    'rb_events_p_hot', m, m + interval '1 month');
+END $do$;
+EOSQL
+
+    q "$HOST" "INSERT INTO public.rb_events (ts, status) VALUES (date_trunc('month',now()) - interval '3 months' + interval '1 day', 'crash-row'), (now(), 'hot-row');" >/dev/null
+
+    if "$ARCHIVER" register --config /tmp/journey-archiver.yaml --table rb_events \
+            --period monthly --hot-period "${ret_days} days" >/tmp/journey-rb-reg.log 2>&1; then
+        pass "rb_events registered"
+    else
+        fail "rb_events register failed"; tail -5 /tmp/journey-rb-reg.log; return
+    fi
+
+    cat > /tmp/journey-rb.yaml <<EOF
+postgres: { dsn: "${dsn}" }
+iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog" }
+$(storage_yaml)
+EOF
+
+    # Hold the window open AFTER Phase 2 (bulk export+commit) and BEFORE Phase 3
+    # (replay+cutover). Wait for the archiver to actually reach that hold (its log
+    # marker) before killing, so the crash lands with cold rows already in Iceberg
+    # but the partition not yet cut over -- the partial state Phase 0 must
+    # self-heal. Fail loudly if it never gets there (else the test proves nothing).
+    "$ARCHIVER" --config /tmp/journey-rb.yaml --debug-export-delay 60s >/tmp/journey-rb-crash.log 2>&1 &
+    local arch_pid=$!
+    local reached=0
+    for _ in $(seq 1 60); do
+        grep -q "debug-export-delay" /tmp/journey-rb-crash.log 2>/dev/null && { reached=1; break; }
+        kill -0 "$arch_pid" 2>/dev/null || break   # archiver exited early (error)
+        sleep 1
+    done
+    if [ "$reached" != 1 ]; then
+        fail "archiver never reached the post-Phase-2 hold (nothing to crash-test)"
+        tail -8 /tmp/journey-rb-crash.log
+        kill "$arch_pid" 2>/dev/null || true; wait "$arch_pid" 2>/dev/null || true
+        return
+    fi
+    kill "$arch_pid" 2>/dev/null || true
+    wait "$arch_pid" 2>/dev/null || true
+
+    # Data must still be in PG — not lost.
+    assert_eq "crash-row still in PG after mid-archive crash" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM public.rb_events WHERE status='crash-row';")"
+
+    # Re-run: Phase 0 wipes partial Iceberg data; full archive must complete.
+    if "$ARCHIVER" --config /tmp/journey-rb.yaml >/tmp/journey-rb-rerun.log 2>&1; then
+        pass "archiver self-healed on re-run (Phase 0 wiped partial Iceberg data)"
+    else
+        fail "archiver re-run failed after crash"; tail -8 /tmp/journey-rb-rerun.log; return
+    fi
+
+    assert_eq "watermark written after successful re-run" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.archive_watermark WHERE table_name='rb_events';")"
+    assert_eq "both rows visible via unified view after re-run" "2" \
+        "$(q "$HOST" "SELECT count(*) FROM public.rb_events;")"
+    # cleanup is handled by the RETURN trap set at the top (covers early returns)
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story — partitioner inbound FK blocks expired partition drop: asserts the
+# partitioner fails fast (SQLSTATE 23503, no retry), the partition remains
+# attached, and on re-run after the FK reference is removed the partition is
+# dropped cleanly.
+# ───────────────────────────────────────────────────────────────────────────
+story_partitioner_fk_drop() {
+    step "Partitioner rollback: inbound FK blocks expired partition drop → self-heals after FK removed"
+
+    # Mesh topology propagates partition detach to peers; peer DNS is not
+    # available in the single-node journey config, so skip in mesh mode.
+    if [ "$MESH" = 1 ]; then
+        note "skipping partitioner FK drop rollback in mesh mode (peer propagation requires mesh config)"
+        return
+    fi
+
+    local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
+    printf 'postgres: { dsn: "%s" }\n' "$dsn" > /tmp/journey-pfk.yaml
+
+    # Partitioned table with one expired partition (3 months old) and one current partition.
+    qf "$HOST" <<'EOSQL' >/dev/null
+SET search_path = public;
+CREATE TABLE IF NOT EXISTS public.pfk_logs (
+    id  bigint GENERATED ALWAYS AS IDENTITY,
+    ts  timestamptz NOT NULL,
+    msg text,
+    PRIMARY KEY (id, ts)
+) PARTITION BY RANGE (ts);
+DO $do$
+DECLARE m date;
+BEGIN
+  m := date_trunc('month', now()) - interval '3 months';
+  EXECUTE format('CREATE TABLE IF NOT EXISTS %I PARTITION OF pfk_logs FOR VALUES FROM (%L) TO (%L)',
+    'pfk_logs_p_expired', m, m + interval '1 month');
+  m := date_trunc('month', now());
+  EXECUTE format('CREATE TABLE IF NOT EXISTS %I PARTITION OF pfk_logs FOR VALUES FROM (%L) TO (%L)',
+    'pfk_logs_p_current', m, m + interval '1 month');
+END $do$;
+EOSQL
+
+    q "$HOST" "INSERT INTO public.pfk_logs (ts, msg) VALUES (date_trunc('month',now()) - interval '3 months' + interval '1 day', 'old-row'), (now(), 'hot-row');" >/dev/null
+
+    # Inbound FK from pfk_log_refs → pfk_logs(id, ts) references the expired row.
+    qf "$HOST" <<'EOSQL' >/dev/null
+CREATE TABLE IF NOT EXISTS public.pfk_log_refs (
+    ref_id bigint GENERATED ALWAYS AS IDENTITY PRIMARY KEY,
+    log_id bigint NOT NULL,
+    log_ts timestamptz NOT NULL,
+    FOREIGN KEY (log_id, log_ts) REFERENCES public.pfk_logs(id, ts)
+);
+INSERT INTO public.pfk_log_refs (log_id, log_ts)
+    SELECT id, ts FROM public.pfk_logs WHERE msg = 'old-row';
+EOSQL
+
+    if "$PARTITIONER" register --dsn "$dsn" --schema public --table pfk_logs \
+            --period monthly --retention "1 month" >/tmp/journey-pfk-reg.log 2>&1; then
+        pass "pfk_logs registered as partition-only"
+    else
+        fail "pfk_logs register failed"; tail -5 /tmp/journey-pfk-reg.log; return
+    fi
+
+    # Run partitioner — inbound FK must block the expired partition drop and fail fast.
+    local pfk_out
+    pfk_out=$("$PARTITIONER" --config /tmp/journey-pfk.yaml 2>&1 || true)
+    assert_contains "partitioner fails fast on inbound FK (SQLSTATE 23503)" "23503" "$pfk_out"
+
+    # Expired partition must still be attached — data safe in PG.
+    assert_eq "expired partition still attached after FK-blocked drop" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname='pfk_logs_p_expired';")"
+
+    # Fix: remove the referencing row then re-run.
+    q "$HOST" "DELETE FROM public.pfk_log_refs WHERE log_ts < date_trunc('month',now()) - interval '2 months';" >/dev/null
+
+    if "$PARTITIONER" --config /tmp/journey-pfk.yaml >/tmp/journey-pfk-rerun.log 2>&1; then
+        pass "partitioner self-healed after FK reference removed"
+    else
+        fail "partitioner re-run failed after FK removed"; tail -8 /tmp/journey-pfk-rerun.log; return
+    fi
+
+    assert_eq "expired partition dropped after FK removed" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname='pfk_logs_p_expired';")"
+
+    # Cleanup.
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name='pfk_logs';" >/dev/null 2>&1
+    q "$HOST" "DROP TABLE IF EXISTS public.pfk_log_refs CASCADE;" >/dev/null 2>&1
+    q "$HOST" "DROP TABLE IF EXISTS public.pfk_logs CASCADE;" >/dev/null 2>&1
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -1809,7 +2009,7 @@ EOF
     # drive entirely off coldfront.partition_config.
     cat > /tmp/journey-conn.yaml <<EOF
 postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
-iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog", namespace: "default" }
+iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog" }
 $(storage_yaml)
 EOF
     if "$ARCHIVER" --config /tmp/journey-conn.yaml >/tmp/journey-dbrun.log 2>&1; then
@@ -2111,6 +2311,8 @@ if [ "$MODE" = "tiered" ]; then
     story_partitioner_multitable
     story_partitioner_after_swap
     story_fk_constraint
+    story_archiver_rollback
+    story_partitioner_fk_drop
     story_register_cli
     story_partition_config_ownership   # each binary loads only its own rows
 else

@@ -1,6 +1,6 @@
 # iceberg-bakery-aware-commit-refresh-v15.patch
 #
-# Applies to: duckdb-iceberg @ 0fad545a (branch v1.5-variegata), DuckDB v1.5.x.
+# Applies to: duckdb-iceberg @ 5edc45f0 (branch v1.5-variegata), DuckDB v1.5.x.
 #
 # The bakery-aware commit-refresh patch for duckdb-iceberg v1.5-variegata. Full
 # rationale: DUCKDB_1.5_PATCHED.md.
@@ -36,8 +36,13 @@
 # (8 concurrent cold writers) over Azure ADLS land 8/8 and 8/8 with 0 errors,
 # 0 loss.
 #
+# The refresh block re-creates the table's vended storage secret in the
+# commit context (PrepareIcebergScanFromEntry) before re-reading the manifest
+# list: the commit runs on a fresh connection with no secret, and under
+# catalog credential vending there is no persistent secret to fall back on.
+#
 diff --git a/src/catalog/rest/transaction/iceberg_transaction.cpp b/src/catalog/rest/transaction/iceberg_transaction.cpp
-index 4047986d..5ed21955 100644
+index 6901b08e..b057c3d8 100644
 --- a/src/catalog/rest/transaction/iceberg_transaction.cpp
 +++ b/src/catalog/rest/transaction/iceberg_transaction.cpp
 @@ -7,6 +7,7 @@
@@ -48,7 +53,7 @@ index 4047986d..5ed21955 100644
  #include "yyjson.hpp"
  
  #include "planning/metadata_io/manifest/iceberg_manifest_reader.hpp"
-@@ -444,6 +445,72 @@ void IcebergTransaction::DoTableUpdates(IcebergTransactionAlterUpdate &alter_upd
+@@ -444,6 +445,82 @@ void IcebergTransaction::DoTableUpdates(IcebergTransactionAlterUpdate &alter_upd
  	if (!alter_update.HasUpdates()) {
  		return;
  	}
@@ -113,6 +118,16 @@ index 4047986d..5ed21955 100644
 +		// the cold-append path does not change the schema; this mirrors the
 +		// cached-reinit path (iceberg_table_set.cpp / CreateMetadataFromLog).
 +		table_info.InitializeFromLoadTableResult(*refreshed.result_, false);
++		// Vended credentials: (re)create this table's storage secret in THIS
++		// context before the manifest-list re-read below touches object
++		// storage. This commit runs on a fresh connection whose context has no
++		// secret yet (the one from planning is not visible here), so without
++		// this the re-read has no credential. Same idiom as
++		// GetTransactionRequest's ADD_SNAPSHOT loop ("we need to recreate the
++		// keys in the current context"); with access-delegation NONE (static
++		// credentials via a persistent secret) it returns immediately.
++		auto &ic_table_entry = table_info.GetLatestSchema(context)->Cast<IcebergTableEntry>();
++		ic_table_entry.PrepareIcebergScanFromEntry(context);
 +		// Re-read the source manifest list from the freshly-loaded head so the
 +		// new manifest list is built on top of the peer's manifests.
 +		transaction_data.RefreshExistingManifestList(context);
@@ -122,7 +137,7 @@ index 4047986d..5ed21955 100644
  	auto &transaction = transaction_info.request;
  
 diff --git a/src/catalog/rest/transaction/iceberg_transaction_data.cpp b/src/catalog/rest/transaction/iceberg_transaction_data.cpp
-index f3187e5f..b13cb6e8 100644
+index ae908046..bdf6aa28 100644
 --- a/src/catalog/rest/transaction/iceberg_transaction_data.cpp
 +++ b/src/catalog/rest/transaction/iceberg_transaction_data.cpp
 @@ -24,11 +24,17 @@ IcebergTransactionData::IcebergTransactionData(ClientContext &context, const Ice

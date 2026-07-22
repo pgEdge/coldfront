@@ -22,8 +22,8 @@ VALUES ('public', 'MixedEvents',
         'public."_MixedEvents"',
         'ice.default."MixedEvents"',
         'ts');
-INSERT INTO coldfront.archive_watermark(table_name, cutoff_time)
-VALUES ('MixedEvents', '2026-03-01'::timestamptz);
+INSERT INTO coldfront.archive_watermark(schema_name, table_name, cutoff_time)
+VALUES ('public', 'MixedEvents', '2026-03-01'::timestamptz);
 
 -- Cold UPDATE through the mixed-case view: must rewrite, not error.
 EXPLAIN (COSTS OFF, VERBOSE)

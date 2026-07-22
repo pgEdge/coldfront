@@ -60,7 +60,10 @@ services:
       retries: 25
 
   seaweedfs:
-    image: chrislusf/seaweedfs:latest
+    # Pinned for reproducibility. No -s3.iam.config here: the mesh vended lane is
+    # deferred (static mesh cells cover row/flag replication), so mesh stays on
+    # the static admin identity.
+    image: chrislusf/seaweedfs:4.38
     command: "server -s3 -dir=/data -s3.config=/etc/seaweedfs/s3.json"
     volumes:
       - ./docker/seaweedfs-s3.json:/etc/seaweedfs/s3.json:ro
