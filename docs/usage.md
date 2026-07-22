@@ -549,7 +549,7 @@ The following PostgreSQL column types are supported:
 `bigint` · `integer` · `smallint` · `real` · `double precision` ·
 `boolean` · `timestamp with time zone` · `timestamp without time zone` ·
 `date` · `time without time zone` · `uuid` · `text` · `varchar(N)` ·
-`char(N)` · `bytea` · `oid` · `numeric(P,S)` (P ≤ 38) · `jsonb` / `json` ·
+`char(N)` · `bytea` · `numeric(P,S)` (P ≤ 38) · `jsonb` / `json` ·
 `interval`
 
 Anything else (unbounded `numeric`, `xml`, `tsvector`, range/multirange
@@ -591,11 +591,11 @@ query skips DuckDB entirely. Such a read surfaces `data` as native
 cold-only, or reach the view through a join or sub-query stay in DuckDB,
 where the limits above apply.
 
-`inet`/`cidr` are **not supported**: pg_duckdb cannot process PG `inet`
-(Oid 869) in any Iceberg-backed query, and every cross-tier read is
-planned by pg_duckdb - so no cast makes them readable. Store IP data as
-`text` (you can still index/compare it; cast to `inet` in your own
-queries on the hot side only if needed).
+`inet`/`cidr`/`oid` are **not supported**: pg_duckdb cannot process them
+(`inet` Oid 869, `oid` Oid 26) in any Iceberg-backed query, and every
+cross-tier read is planned by pg_duckdb - so no cast makes them readable.
+Store IP data as `text` and `oid` values as `bigint` (you can still
+index/compare them; cast on the hot side only if needed).
 
 ## Gotchas
 
