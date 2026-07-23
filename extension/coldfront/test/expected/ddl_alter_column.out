@@ -26,8 +26,8 @@ VALUES ('public', 'events', 'public._events', 'ice.default.events', 'ts');
 -- 1. Unsupported column type is rejected up front (originator path), before any
 --    Iceberg I/O; the hot ALTER rolls back with it, so _events is unchanged.
 ALTER TABLE public._events ADD COLUMN bad inet;
-ERROR:  coldfront: PG type inet has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, oid, numeric(P,S), jsonb, json, interval. inet/cidr unsupported (store IP data as text)
-CONTEXT:  PL/pgSQL function _iceberg_storage_type(text) line 42 at RAISE
+ERROR:  coldfront: PG type inet has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, numeric(P,S), jsonb, json, interval. inet/cidr/oid unsupported (store IP data as text, oid values as bigint)
+CONTEXT:  PL/pgSQL function _iceberg_storage_type(text) line 41 at RAISE
 PL/pgSQL function _mirror_iceberg_alter(text,text,jsonb) line 36 at assignment
 SQL statement "SELECT coldfront._mirror_iceberg_alter('ice.default.events', 'public._events', jsonb_build_array(jsonb_build_object('op', 'add', 'col', 'bad')))"
 SELECT attname FROM pg_attribute

@@ -168,7 +168,6 @@ func TestPgFormatTypeToDuckDB(t *testing.T) {
 		{pg: "character varying", wantStorage: "VARCHAR"},
 		{pg: "character(10)", wantStorage: "VARCHAR"},
 		{pg: "bytea", wantStorage: "BLOB", wantViewCastTyp: "bytea"}, // BLOB not PG-parseable
-		{pg: "oid", wantStorage: "BIGINT"},                           // widened; BIGINT is its own surface
 		{pg: "numeric(20,5)", wantStorage: "DECIMAL(20,5)"},
 		{pg: "numeric(38, 10)", wantStorage: "DECIMAL(38,10)"},
 
@@ -177,11 +176,13 @@ func TestPgFormatTypeToDuckDB(t *testing.T) {
 		{pg: "json", wantStorage: "VARCHAR", wantViewCastTyp: "json"},
 		{pg: "interval", wantStorage: "VARCHAR", wantViewCastTyp: "interval"},
 
-		// Errors. inet/cidr are rejected: pg_duckdb cannot process inet (Oid
-		// 869) in an Iceberg-backed query, and every tiered read is planned by
-		// pg_duckdb, so there is no cast that makes them readable.
+		// Errors. inet/cidr/oid are rejected: pg_duckdb cannot process them in
+		// an Iceberg-backed query, and every tiered read is planned by pg_duckdb,
+		// so there is no cast that makes them readable (oid would archive fine but
+		// its column becomes unreadable through the view after cutover).
 		{pg: "inet", wantErr: true},
 		{pg: "cidr", wantErr: true},
+		{pg: "oid", wantErr: true},
 		{pg: "numeric", wantErr: true},
 		{pg: "time with time zone", wantErr: true},
 		{pg: "tsvector", wantErr: true},

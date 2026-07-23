@@ -1369,9 +1369,9 @@ func pgFormatTypeToDuckDB(s string) (storage, viewCastType string, err error) {
 		"PG type %q has no Iceberg-compatible mapping. Supported: bigint, integer, "+
 			"smallint, real, double precision, boolean, timestamp with/without time "+
 			"zone, date, time without time zone, uuid, text, character varying(N), "+
-			"character(N), bytea, numeric(P,S) with P<=38, json, jsonb, interval, "+
-			"oid. inet/cidr are not supported (pg_duckdb cannot process inet in "+
-			"Iceberg-backed queries); store IP data as text", s)
+			"character(N), bytea, numeric(P,S) with P<=38, json, jsonb, interval. "+
+			"inet/cidr/oid are not supported (pg_duckdb cannot process them in "+
+			"Iceberg-backed queries): store IP data as text and oid values as bigint", s)
 }
 
 // pgTypeMap holds the 1:1 PG-format_type → (storage, viewCast) mappings used by
@@ -1381,8 +1381,8 @@ var pgTypeMap = map[string]struct{ storage, viewCast string }{
 	// Numeric / boolean — storage matches surface; no cast needed.
 	"bigint":  {"BIGINT", ""},
 	"integer": {"INTEGER", ""},
-	// Iceberg has no 16-bit integer; widen to INTEGER (lossless, same as oid →
-	// BIGINT). duckdb-iceberg rejects SMALLINT at CREATE TABLE. No view cast
+	// Iceberg has no 16-bit integer; widen to INTEGER (lossless). duckdb-iceberg
+	// rejects SMALLINT at CREATE TABLE. No view cast
 	// needed: INTEGER is itself a PG-parseable surface, and the view casts BOTH
 	// branches to the storage type, so bootstrap (hot-only) and post-cutover
 	// (hot+cold) views agree on the column type.
@@ -1408,13 +1408,6 @@ var pgTypeMap = map[string]struct{ storage, viewCast string }{
 	// Iceberg/DuckDB storage is BLOB, which is not a PG-parseable cast name;
 	// surface via the PG-spelled "bytea" on both branches.
 	"bytea": {"BLOB", "bytea"},
-
-	// PG `oid` is 4-byte unsigned (max 4_294_967_295). DuckDB INTEGER is signed
-	// 32-bit, so values above 2_147_483_647 would overflow; widen to BIGINT for
-	// safe round-trip. No view cast: BIGINT is a PG-parseable surface and the
-	// view casts both branches to the storage type, so bootstrap/cutover view
-	// types agree.
-	"oid": {"BIGINT", ""},
 
 	// Iceberg has no JSON primitive — storage VARCHAR, surface json.
 	"jsonb": {"VARCHAR", "json"},

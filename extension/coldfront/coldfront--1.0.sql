@@ -1507,8 +1507,8 @@ BEGIN
     -- Numeric / boolean
     IF t IN ('bigint', 'int8')             THEN RETURN 'BIGINT';   END IF;
     IF t IN ('integer', 'int', 'int4')     THEN RETURN 'INTEGER';  END IF;
-    -- Iceberg has no 16-bit integer; widen smallint to INTEGER (lossless,
-    -- same principle as oid → BIGINT). duckdb-iceberg rejects SMALLINT outright.
+    -- Iceberg has no 16-bit integer; widen smallint to INTEGER (lossless).
+    -- duckdb-iceberg rejects SMALLINT outright.
     IF t IN ('smallint', 'int2')           THEN RETURN 'INTEGER';  END IF;
     IF t IN ('real', 'float4')             THEN RETURN 'REAL';     END IF;
     IF t IN ('double precision', 'float8') THEN RETURN 'DOUBLE';   END IF;
@@ -1522,7 +1522,6 @@ BEGIN
     IF t = 'uuid'  THEN RETURN 'UUID';    END IF;
     IF t = 'text'  THEN RETURN 'VARCHAR'; END IF;
     IF t = 'bytea' THEN RETURN 'BLOB';    END IF;
-    IF t = 'oid'   THEN RETURN 'BIGINT';  END IF;  -- 4-byte unsigned safe-widen
     -- Variable-precision strings
     IF t LIKE 'character varying%' OR t LIKE 'varchar%'
        OR t LIKE 'character(%' OR t LIKE 'char(%' OR t = 'character'
@@ -1536,12 +1535,12 @@ BEGIN
     END IF;
     -- View-cast types: stored as VARCHAR, surfaced via wrapper view as native PG type
     IF t IN ('jsonb', 'json', 'interval') THEN RETURN 'VARCHAR'; END IF;
-    -- inet/cidr are NOT supported: pg_duckdb rejects PG inet (Oid 869) in any
-    -- query it plans, and every Iceberg-backed view read is planned by
-    -- pg_duckdb, so there is no cast that makes them readable. Store IP data
-    -- as text instead.
+    -- inet/cidr/oid are NOT supported: pg_duckdb rejects them (inet Oid 869,
+    -- oid Oid 26) in any query it plans, and every Iceberg-backed view read is
+    -- planned by pg_duckdb, so no cast makes them readable. Store IP data as
+    -- text and oid values as bigint instead.
 
-    RAISE EXCEPTION 'coldfront: PG type % has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, oid, numeric(P,S), jsonb, json, interval. inet/cidr unsupported (store IP data as text)', p_pg_type;
+    RAISE EXCEPTION 'coldfront: PG type % has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, numeric(P,S), jsonb, json, interval. inet/cidr/oid unsupported (store IP data as text, oid values as bigint)', p_pg_type;
 END;
 $$;
 
@@ -1562,10 +1561,10 @@ LANGUAGE sql IMMUTABLE STRICT AS $$
         WHEN 'float8'           THEN 'double precision'
         -- BLOB is not a PG-parseable cast name; surface bytea via "bytea".
         WHEN 'bytea'            THEN 'bytea'
-        -- Everything else (incl. smallint→INTEGER, oid→BIGINT widening) has a
-        -- storage type that is itself a PG-parseable surface; the view casts
-        -- BOTH branches to that storage type, so no separate surface cast is
-        -- needed and bootstrap/post-cutover view column types still agree.
+        -- Everything else (incl. smallint→INTEGER widening) has a storage type
+        -- that is itself a PG-parseable surface; the view casts BOTH branches
+        -- to that storage type, so no separate surface cast is needed and
+        -- bootstrap/post-cutover view column types still agree.
         ELSE ''
     END;
 $$;

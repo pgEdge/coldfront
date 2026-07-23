@@ -524,11 +524,15 @@ EOSQL
 )
     assert_eq "cold-INSERT-via-trigger bytea stored natively (2 bytes)" "2" "$(extract COLDINS_LEN "$CI")"
 
-    # inet/cidr are rejected at provisioning — no cast makes them readable
+    # inet/cidr/oid are rejected at provisioning: no cast makes them readable
     # through pg_duckdb once the table is Iceberg-backed. Match the specific
     # rejection text, not just the type name (which the input itself contains).
     local IE; IE=$(q_may "$HOST" "SELECT coldfront.create_iceberg_table('public','ip_reject','[{\"name\":\"a\",\"type\":\"inet\"}]'::jsonb);")
     assert_contains "inet rejected at provisioning" "store IP data as text" "$IE"
+    # oid archives but its column is unreadable through the pg_duckdb-planned
+    # view after cutover, so it is rejected up front like inet; use bigint.
+    local OE; OE=$(q_may "$HOST" "SELECT coldfront.create_iceberg_table('public','oid_reject','[{\"name\":\"a\",\"type\":\"oid\"}]'::jsonb);")
+    assert_contains "oid rejected at provisioning" "oid values as bigint" "$OE"
 }
 
 # ───────────────────────────────────────────────────────────────────────────

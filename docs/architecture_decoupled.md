@@ -131,7 +131,6 @@ surface are:
 | `date` / `time without time zone` | `DATE` / `TIME` | identical |
 | `uuid` | `UUID` | identical |
 | `bytea` | `BLOB` | identical |
-| `oid` | `BIGINT` (signed-safe widen) | identical |
 | `text` / `varchar(N)` / `char(N)` | `VARCHAR` | unbounded; declared length not enforced; `char(N)` returns unpadded (`pg_typeof varchar`) |
 | `numeric(P,S)` (P ≤ 38) | `DECIMAL(P,S)` | identical |
 | `jsonb` / `json` | `VARCHAR` | view-cast back to `json` (not `jsonb` - Iceberg has no JSON primitive) |
@@ -140,9 +139,10 @@ surface are:
 Rejected (rather than silently downgraded to `VARCHAR` and losing
 precision/identity):
 
-- `inet` / `cidr` - pg_duckdb cannot process PG `inet` (Oid 869) in any
-  query it plans, and every Iceberg-backed read is planned by
-  pg_duckdb. No cast makes them readable; store IP data as `text`.
+- `inet` / `cidr` / `oid` - pg_duckdb cannot process them (`inet` Oid 869,
+  `oid` Oid 26) in any query it plans, and every Iceberg-backed read is
+  planned by pg_duckdb. No cast makes them readable; store IP data as
+  `text` and `oid` values as `bigint`.
 - `numeric` without explicit `(P,S)` - Iceberg requires bounded decimals.
 - Custom enums, `xml`, `tsvector`/`tsquery`, range types, multirange types.
 - Composite types and arrays. (Arrays would map to Parquet `LIST<…>`
