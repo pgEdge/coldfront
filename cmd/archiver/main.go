@@ -100,7 +100,7 @@ func dispatchCLI(ctx context.Context) bool {
 // setupConnection connects to PostgreSQL, verifies the connection, and ensures
 // the watermark table exists. Any failure log.Fatalf's — this is the cron body.
 func setupConnection(ctx context.Context, cfg *config.Config) (*pgx.Conn, *watermark.Store) {
-	conn, err := pgx.Connect(ctx, cfg.Postgres.DSN)
+	conn, err := partition.Connect(ctx, cfg.Postgres.DSN)
 	if err != nil {
 		log.Fatalf("connect pg: %v", err)
 	}
