@@ -86,7 +86,7 @@ func ParseBoundExpr(expr string) (lower, upper time.Time, err error) {
 // does not apply. The layouts are the stdlib time.DateTime (timestamp without
 // time zone) and time.DateOnly (date), plus a numeric-offset layout for
 // timestamptz; time.Parse consumes any trailing fractional second on its own.
-// Callers pin the session (PinSessionForBounds) so the render stays in this set.
+// Callers connect via Connect, which pins the session so the render stays in this set.
 func parseTimestamp(s string) (time.Time, error) {
 	for _, layout := range []string{
 		"2006-01-02 15:04:05-07",

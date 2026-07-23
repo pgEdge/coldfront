@@ -158,6 +158,14 @@ func TestBoundConnConfig(t *testing.T) {
 	assert.Equal(t, "UTC", cfg.RuntimeParams["timezone"])
 }
 
+// A malformed DSN fails in boundConnConfig (pgx.ParseConfig) before any network
+// I/O, so Connect's error path is unit-testable without a live server.
+func TestConnect_MalformedDSN(t *testing.T) {
+	_, err := Connect(context.Background(), "postgres://u@localhost:notaport/db")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "parse dsn")
+}
+
 func TestPartitionName(t *testing.T) {
 	assert.Equal(t, "p_2026_03", PartitionName(time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC), "monthly"))
 	assert.Equal(t, "p_2026_03_15", PartitionName(time.Date(2026, 3, 15, 0, 0, 0, 0, time.UTC), "daily"))
