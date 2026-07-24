@@ -2431,6 +2431,14 @@ EOF
 # ───────────────────────────────────────────────────────────────────────────
 story_empty_partition() {
     step "TC-024: 0-row partition archives cleanly (all 6 phases, exit 0)"
+    # In mesh mode cleanupAlreadyArchived fans out DETACH CONCURRENTLY to Spock
+    # peers via their interface DSN; those hostnames are not resolvable from the
+    # archiver host in the journey config. Skip here — same reason as
+    # story_partitioner_fk_drop.
+    if [ "$MESH" = 1 ]; then
+        note "TC-024: skipping in mesh mode (cleanupAlreadyArchived peer detach requires resolvable peer DSNs)"
+        return
+    fi
     # Create an empty partition for now-12mo in public schema. That month is well
     # past the hot_period cutoff so the archiver picks it up as a cold partition.
     local m12; m12=$(date -u -d "$(date -u +%Y-%m-01) -12 months" +%Y-%m-%d)

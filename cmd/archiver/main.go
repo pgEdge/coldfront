@@ -629,14 +629,14 @@ func (ac *archiveCycle) bootstrapTieredView(ctx context.Context, columns []view.
 
 // cleanupAlreadyArchived is the idempotent cleanup branch: the partition was
 // archived in a prior cycle (watermark already past its upper bound), so there
-// is no race — just drop the stale PG partition. DROP TABLE IF EXISTS detaches
-// the partition from its parent atomically inside PostgreSQL and is transactional,
-// so Spock replicates it to mesh peers without the DETACH CONCURRENTLY fan-out
-// that would require connecting to each peer's DSN (which may use hostnames not
-// resolvable from the host running the archiver binary).
+// is no race — just detach + drop the stale PG partition.
 func (ac *archiveCycle) cleanupAlreadyArchived(ctx context.Context, part partition.Info) error {
 	t, partMgr := ac.t, ac.partMgr
 	log.Printf("partition %s already archived, cleaning up", part.Name)
+	parent := partition.ResolveSourceTable(ctx, ac.conn, t.SourceSchema, t.SourceTable)
+	if err := partMgr.Detach(ctx, parent, t.SourceSchema, part.Name); err != nil {
+		return fmt.Errorf("detach %s: %w", part.Name, err)
+	}
 	if err := partMgr.Drop(ctx, t.SourceSchema, part.Name); err != nil {
 		return fmt.Errorf("drop %s: %w", part.Name, err)
 	}
