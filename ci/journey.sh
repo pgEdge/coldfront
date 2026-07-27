@@ -2059,33 +2059,30 @@ EOYAML
         pass "TC-118: YAML archiver.tables block was not processed"
     fi
 
-    # TC-119: export → delete row → import restores the partition_config entry.
-    # export emits ALL enabled tables; importing that full set would hit unique-key
-    # conflicts on rows still in partition_config. Verify export is correct
-    # separately, then import only cli_events via a targeted YAML.
-    "$ARCHIVER" export --config /tmp/journey-conn.yaml >/tmp/journey-export.log 2>&1
-    if grep -q "source_table: cli_events" /tmp/journey-export.log; then
+    # TC-119: export, delete the row, then re-import the EXPORTED archiver.tables
+    # to restore it. export omits connection config (per-node), so wrap the real
+    # exported block with a DSN before importing. import upserts (ON CONFLICT DO
+    # UPDATE), so the rows still present are no-ops and cli_events is restored from
+    # its exported entry, validating the serialization a hand-written YAML wouldn't.
+    "$ARCHIVER" export --config /tmp/journey-conn.yaml >/tmp/journey-export.yaml 2>&1
+    if grep -q "source_table: cli_events" /tmp/journey-export.yaml; then
         pass "TC-119: export produced YAML with cli_events"
     else
-        fail "TC-119: export missing cli_events"; tail -3 /tmp/journey-export.log
+        fail "TC-119: export missing cli_events"; tail -3 /tmp/journey-export.yaml
     fi
     cat > /tmp/journey-roundtrip.yaml <<EOF
 postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
-iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog", namespace: "default" }
+iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog" }
 $(storage_yaml)
-archiver:
-  tables:
-    - source_table: cli_events
-      partition_period: monthly
-      hot_period: "${ret_days} days"
 EOF
+    cat /tmp/journey-export.yaml >>/tmp/journey-roundtrip.yaml
     q "$HOST" "DELETE FROM coldfront.partition_config WHERE schema_name='public' AND table_name='cli_events';" >/dev/null
     assert_eq "TC-119: cli_events deleted from partition_config" "0" \
         "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='cli_events';")"
     if "$ARCHIVER" import --config /tmp/journey-roundtrip.yaml >/tmp/journey-roundtrip.log 2>&1; then
-        pass "TC-119: import from YAML succeeded"
+        pass "TC-119: re-import of exported artifact succeeded"
     else
-        fail "TC-119: import failed — see /tmp/journey-roundtrip.log"; tail -5 /tmp/journey-roundtrip.log
+        fail "TC-119: import failed (see /tmp/journey-roundtrip.log)"; tail -5 /tmp/journey-roundtrip.log
     fi
     assert_eq "TC-119: cli_events row restored in partition_config" "1" \
         "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='cli_events';")"
@@ -2542,25 +2539,30 @@ EOF
     fi
     assert_eq "TC-053: events disabled in partition_config" "f" \
         "$(q "$HOST" "SELECT enabled FROM coldfront.partition_config WHERE schema_name='public' AND table_name='events';")"
-    "$ARCHIVER" --config /tmp/journey-disen.yaml >>/tmp/journey-disen.log 2>&1 || true
-    if grep -q "\[events\]" /tmp/journey-disen.log; then
+    # Disabled run: fresh log so the grep sees only this run. No-op archiver runs
+    # may legitimately exit non-zero, so the run stays non-fatal (|| true); the log
+    # assertion, not the exit code, proves events was excluded.
+    "$ARCHIVER" --config /tmp/journey-disen.yaml >/tmp/journey-disen-off.log 2>&1 || true
+    if grep -q "\[events\]" /tmp/journey-disen-off.log; then
         fail "TC-053: [events] appeared in archiver log while disabled (should be silently excluded)"
     else
         pass "TC-053: [events] absent from archiver log (silently excluded via WHERE enabled)"
     fi
 
-    if "$ARCHIVER" set --config /tmp/journey-disen.yaml --table events --enable >>/tmp/journey-disen.log 2>&1; then
+    if "$ARCHIVER" set --config /tmp/journey-disen.yaml --table events --enable >/tmp/journey-disen-enable.log 2>&1; then
         pass "TC-053: archiver set --enable succeeded"
     else
-        fail "TC-053: archiver set --enable failed — see /tmp/journey-disen.log"; tail -5 /tmp/journey-disen.log
+        fail "TC-053: archiver set --enable failed (see /tmp/journey-disen-enable.log)"; tail -5 /tmp/journey-disen-enable.log
     fi
     assert_eq "TC-053: events re-enabled in partition_config" "t" \
         "$(q "$HOST" "SELECT enabled FROM coldfront.partition_config WHERE schema_name='public' AND table_name='events';")"
-    "$ARCHIVER" --config /tmp/journey-disen.yaml >>/tmp/journey-disen.log 2>&1 || true
-    if grep -q "\[events\]" /tmp/journey-disen.log; then
+    # Re-enabled run: fresh log (grep only this run); non-fatal, since no-op runs
+    # may legitimately exit non-zero.
+    "$ARCHIVER" --config /tmp/journey-disen.yaml >/tmp/journey-disen-on.log 2>&1 || true
+    if grep -q "\[events\]" /tmp/journey-disen-on.log; then
         pass "TC-053: [events] present in archiver log after re-enable"
     else
-        fail "TC-053: [events] absent from archiver log even after re-enable"; tail -8 /tmp/journey-disen.log
+        fail "TC-053: [events] absent from archiver log even after re-enable (see /tmp/journey-disen-on.log)"; tail -8 /tmp/journey-disen-on.log
     fi
     # Ensure events is enabled regardless of test outcome (safety net for later stories).
     "$ARCHIVER" set --config /tmp/journey-disen.yaml --table events --enable >/dev/null 2>&1 || true
