@@ -2076,6 +2076,11 @@ iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:818
 $(storage_yaml)
 EOF
     cat /tmp/journey-export.yaml >>/tmp/journey-roundtrip.yaml
+    # Snapshot the serialized config values before deletion; the round-trip must
+    # restore them exactly, not merely recreate the row (value fidelity, not just
+    # a row-count check).
+    local cfg_sig_before
+    cfg_sig_before=$(q "$HOST" "SELECT partition_period::text||'|'||coalesce(hot_period::text,'NULL')||'|'||coalesce(retention_period::text,'NULL')||'|'||enabled::text FROM coldfront.partition_config WHERE schema_name='public' AND table_name='cli_events';")
     q "$HOST" "DELETE FROM coldfront.partition_config WHERE schema_name='public' AND table_name='cli_events';" >/dev/null
     assert_eq "TC-119: cli_events deleted from partition_config" "0" \
         "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='cli_events';")"
@@ -2086,6 +2091,10 @@ EOF
     fi
     assert_eq "TC-119: cli_events row restored in partition_config" "1" \
         "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='cli_events';")"
+    local cfg_sig_after
+    cfg_sig_after=$(q "$HOST" "SELECT partition_period::text||'|'||coalesce(hot_period::text,'NULL')||'|'||coalesce(retention_period::text,'NULL')||'|'||enabled::text FROM coldfront.partition_config WHERE schema_name='public' AND table_name='cli_events';")
+    assert_eq "TC-119: restored values match pre-deletion snapshot (period|hot|retention|enabled)" \
+        "$cfg_sig_before" "$cfg_sig_after"
 
     # TC-120: set writes to partition_config only — the YAML config file is never
     # touched. Capture a checksum before, run set, then verify both the DB
