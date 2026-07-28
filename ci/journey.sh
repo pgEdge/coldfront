@@ -2733,7 +2733,11 @@ story_seaweedfs_restart() {
     local before; before=$(q "$HOST" "SELECT count(*) FROM events WHERE ts >= date_trunc('month',now()) - interval '3 months' AND ts < date_trunc('month',now()) - interval '1 month';")
     assert_gt "TC-062: cold rows present before restart" "0" "$before"
     docker restart "$sw_container" >/dev/null
-    sleep 15
+    local i=0
+    until curl -sf "http://${SW_IP}:8333" >/dev/null 2>&1; do
+        i=$((i + 1)); [ "$i" -gt 30 ] && { fail "TC-062: SeaweedFS did not come back after restart"; return; }; sleep 2
+    done
+    sleep 2
     local after; after=$(q "$HOST" "SELECT count(*) FROM events WHERE ts >= date_trunc('month',now()) - interval '3 months' AND ts < date_trunc('month',now()) - interval '1 month';")
     assert_eq "TC-062: cold row count unchanged after SeaweedFS restart" "$before" "$after"
 }
@@ -2977,7 +2981,7 @@ EOSQL
         assert_contains "TC-098: interval round-trip"      "1 day"               "$(extract INTERVAL "$O")"
         assert_eq "TC-099: oid widened to bigint"          "12345"               "$(extract OID      "$O")"
         # TC-105: full-column-set assertion — every extended column non-null in cold row.
-        assert_eq "TC-105: all extended columns non-null in cold row" "t" \
+        assert_eq "TC-105: all extended columns non-null in cold row" "true" \
             "$(q "$HOST" "SELECT (col_ts_ntz IS NOT NULL AND col_time IS NOT NULL AND col_char IS NOT NULL AND col_json IS NOT NULL AND col_interval IS NOT NULL AND col_oid IS NOT NULL)::text FROM typed_ext WHERE ts < date_trunc('month',now()) - interval '3 months' LIMIT 1;")"
     fi
     # Always clean up so a failed archive does not leave typed_ext in partition_config
@@ -3115,8 +3119,8 @@ INSERT INTO tc109.orders (ts) VALUES (date_trunc('month',now()) - interval '2 mo
 INSERT INTO tc109.logs   (ts) VALUES (date_trunc('month',now()) - interval '2 months' + interval '5 days');
 EOSQL
     local ret_days=$(( ( $(date -u +%s) - $(date -u -d "$(date -u +%Y-%m-01) -1 month" +%s) ) / 86400 ))
-    "$PARTITIONER" register --dsn "$dsn" --schema tc109 --table orders --period monthly --retention "${ret_days} days" >/dev/null 2>&1
-    "$PARTITIONER" register --dsn "$dsn" --schema tc109 --table logs   --period monthly --retention "${ret_days} days" >/dev/null 2>&1
+    "$PARTITIONER" register --dsn "$dsn" --schema tc109 --table orders --period monthly --hot-period "${ret_days} days" --retention "${ret_days} days" >/dev/null 2>&1
+    "$PARTITIONER" register --dsn "$dsn" --schema tc109 --table logs   --period monthly --hot-period "${ret_days} days" --retention "${ret_days} days" >/dev/null 2>&1
     # Disable logs via direct SQL (partition_config.enabled = false).
     q "$HOST" "UPDATE coldfront.partition_config SET enabled=false WHERE schema_name='tc109' AND table_name='logs';" >/dev/null
     assert_eq "TC-109: logs disabled in partition_config" "f" \
