@@ -1,0 +1,1512 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>pgEdge ColdFront — Interactive Architecture & Flow Diagram</title>
+  
+  <!-- Modern Fonts -->
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Fira+Code:wght@400;600&family=Outfit:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+  
+  <style>
+    :root {
+      --bg-dark: #090d16;
+      --bg-card: rgba(15, 23, 42, 0.65);
+      --bg-card-hover: rgba(30, 41, 59, 0.8);
+      --border-color: rgba(51, 65, 85, 0.4);
+      --border-focus: rgba(6, 182, 212, 0.6);
+      
+      --color-pg: #06b6d4;      /* Cyan - PG / Hot tier */
+      --color-cf: #10b981;      /* Emerald - ColdFront hook / trigger */
+      --color-duck: #3b82f6;    /* Blue - DuckDB */
+      --color-lake: #8b5cf6;    /* Purple - Lakekeeper REST Catalog */
+      --color-s3: #f59e0b;      /* Amber - S3 Object Store */
+      --color-arch: #f43f5e;    /* Rose - Archiver */
+      --color-text-main: #f8fafc;
+      --color-text-muted: #94a3b8;
+      
+      --glow-pg: 0 0 15px rgba(6, 182, 212, 0.4);
+      --glow-cf: 0 0 15px rgba(16, 185, 129, 0.4);
+      --glow-duck: 0 0 15px rgba(59, 130, 246, 0.4);
+      --glow-lake: 0 0 15px rgba(139, 92, 246, 0.4);
+      --glow-s3: 0 0 15px rgba(245, 158, 11, 0.4);
+      --glow-arch: 0 0 15px rgba(244, 63, 94, 0.4);
+    }
+    
+    * {
+      box-sizing: border-box;
+      margin: 0;
+      padding: 0;
+    }
+    
+    body {
+      background-color: var(--bg-dark);
+      color: var(--color-text-main);
+      font-family: 'Outfit', sans-serif;
+      min-height: 100vh;
+      overflow-x: hidden;
+      padding: 2rem;
+      background-image: 
+        radial-gradient(circle at 10% 20%, rgba(6, 182, 212, 0.05) 0%, transparent 40%),
+        radial-gradient(circle at 90% 80%, rgba(139, 92, 246, 0.05) 0%, transparent 40%);
+    }
+    
+    header {
+      max-width: 1400px;
+      margin: 0 auto 2rem auto;
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      border-bottom: 1px solid var(--border-color);
+      padding-bottom: 1.5rem;
+    }
+    
+    .logo-container {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+    
+    .badge {
+      background: linear-gradient(135deg, var(--color-pg), var(--color-cf));
+      padding: 0.25rem 0.75rem;
+      border-radius: 9999px;
+      font-size: 0.75rem;
+      font-weight: 600;
+      letter-spacing: 0.05em;
+      text-transform: uppercase;
+      box-shadow: 0 0 10px rgba(6, 182, 212, 0.2);
+    }
+    
+    h1 {
+      font-size: 1.75rem;
+      font-weight: 700;
+      background: linear-gradient(to right, #ffffff, var(--color-text-muted));
+      -webkit-background-clip: text;
+      -webkit-text-fill-color: transparent;
+      margin-top: 0.25rem;
+    }
+    
+    .dashboard {
+      max-width: 1400px;
+      margin: 0 auto;
+      display: grid;
+      grid-template-columns: 320px 1fr;
+      gap: 2rem;
+      align-items: start;
+    }
+    
+    /* Control Panel styling */
+    .panel {
+      background: var(--bg-card);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border: 1px solid var(--border-color);
+      border-radius: 16px;
+      padding: 1.5rem;
+      display: flex;
+      flex-direction: column;
+      gap: 1.5rem;
+      box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+      transition: all 0.3s ease;
+    }
+    
+    .panel:hover {
+      border-color: rgba(51, 65, 85, 0.6);
+    }
+    
+    .section-title {
+      font-size: 0.875rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.1em;
+      color: var(--color-text-muted);
+      margin-bottom: 0.5rem;
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+    }
+    
+    .mode-selector, .action-selector {
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+    
+    .btn {
+      background: rgba(30, 41, 59, 0.4);
+      border: 1px solid var(--border-color);
+      color: var(--color-text-muted);
+      padding: 0.75rem 1rem;
+      border-radius: 8px;
+      cursor: pointer;
+      text-align: left;
+      font-family: 'Outfit', sans-serif;
+      font-size: 0.95rem;
+      font-weight: 500;
+      transition: all 0.2s ease;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+    }
+    
+    .btn:hover {
+      background: rgba(30, 41, 59, 0.8);
+      color: var(--color-text-main);
+      border-color: var(--color-text-muted);
+    }
+    
+    .btn.active {
+      background: rgba(6, 182, 212, 0.1);
+      border-color: var(--color-pg);
+      color: var(--color-pg);
+      box-shadow: inset 0 0 10px rgba(6, 182, 212, 0.1);
+    }
+    
+    .btn.active.mode-decoupled {
+      background: rgba(139, 92, 246, 0.1);
+      border-color: var(--color-lake);
+      color: var(--color-lake);
+      box-shadow: inset 0 0 10px rgba(139, 92, 246, 0.1);
+    }
+    
+    .btn.action-btn.active {
+      background: rgba(16, 185, 129, 0.1);
+      border-color: var(--color-cf);
+      color: var(--color-cf);
+      box-shadow: inset 0 0 10px rgba(16, 185, 129, 0.1);
+    }
+    
+    .btn.action-btn.arch-btn.active {
+      background: rgba(244, 63, 94, 0.1);
+      border-color: var(--color-arch);
+      color: var(--color-arch);
+      box-shadow: inset 0 0 10px rgba(244, 63, 94, 0.1);
+    }
+    
+    .btn-icon {
+      font-size: 1.1rem;
+    }
+    
+    /* Play controls */
+    .animation-controls {
+      display: flex;
+      gap: 0.5rem;
+      align-items: center;
+      justify-content: space-between;
+      background: rgba(30, 41, 59, 0.2);
+      padding: 0.5rem;
+      border-radius: 8px;
+      border: 1px solid var(--border-color);
+    }
+    
+    .play-btn {
+      background: var(--color-cf);
+      color: #000;
+      border: none;
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      cursor: pointer;
+      font-weight: bold;
+      transition: all 0.2s ease;
+    }
+    
+    .play-btn:hover {
+      transform: scale(1.05);
+      box-shadow: var(--glow-cf);
+    }
+    
+    .speed-slider-container {
+      display: flex;
+      align-items: center;
+      gap: 0.5rem;
+      flex-grow: 1;
+      padding: 0 0.5rem;
+    }
+    
+    .speed-slider {
+      flex-grow: 1;
+      accent-color: var(--color-cf);
+      cursor: pointer;
+    }
+    
+    /* Viewport Area */
+    .viewport-container {
+      display: flex;
+      flex-direction: column;
+      gap: 1.5rem;
+    }
+    
+    .viewport {
+      background: var(--bg-card);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border: 1px solid var(--border-color);
+      border-radius: 16px;
+      width: 100%;
+      aspect-ratio: 1000 / 600;
+      position: relative;
+      overflow: hidden;
+      box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+      display: flex;
+      justify-content: center;
+      align-items: center;
+    }
+    
+    svg {
+      width: 100%;
+      height: 100%;
+    }
+    
+    /* Info Box */
+    .info-panel {
+      background: var(--bg-card);
+      backdrop-filter: blur(12px);
+      -webkit-backdrop-filter: blur(12px);
+      border: 1px solid var(--border-color);
+      border-radius: 16px;
+      padding: 1.5rem;
+      box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.37);
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1.5rem;
+    }
+    
+    .info-desc h3 {
+      font-size: 1.1rem;
+      margin-bottom: 0.5rem;
+      color: var(--color-pg);
+    }
+    
+    .info-desc p {
+      font-size: 0.925rem;
+      color: var(--color-text-muted);
+      line-height: 1.5;
+    }
+    
+    .info-sql {
+      border-left: 1px solid var(--border-color);
+      padding-left: 1.5rem;
+    }
+    
+    .info-sql h4 {
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 0.15em;
+      color: var(--color-text-muted);
+      margin-bottom: 0.5rem;
+    }
+    
+    .code-block {
+      background: rgba(15, 23, 42, 0.8);
+      border: 1px solid var(--border-color);
+      padding: 0.75rem;
+      border-radius: 6px;
+      font-family: 'Fira Code', monospace;
+      font-size: 0.85rem;
+      color: var(--color-pg);
+      overflow-x: auto;
+      white-space: pre;
+    }
+    
+    .console-log {
+      max-height: 120px;
+      overflow-y: auto;
+      font-family: 'Fira Code', monospace;
+      font-size: 0.8rem;
+      padding: 0.5rem;
+      background: rgba(0,0,0,0.4);
+      border-radius: 6px;
+      border: 1px solid rgba(255,255,255,0.05);
+      margin-top: 0.5rem;
+    }
+    
+    .log-entry {
+      margin-bottom: 0.25rem;
+      color: var(--color-text-muted);
+    }
+    
+    .log-entry.active {
+      color: var(--color-cf);
+    }
+    
+    /* Interactive SVG elements */
+    .node {
+      cursor: pointer;
+      transition: all 0.3s ease;
+    }
+    
+    .node:hover .node-bg {
+      stroke: var(--color-text-main);
+      filter: drop-shadow(0px 0px 8px rgba(255,255,255,0.2));
+    }
+    
+    .node-bg {
+      fill: #111827;
+      stroke: #374151;
+      stroke-width: 1.5;
+      rx: 8;
+      transition: all 0.3s ease;
+    }
+    
+    .node-title {
+      font-size: 11px;
+      font-weight: 600;
+      fill: #f3f4f6;
+      font-family: 'Outfit', sans-serif;
+    }
+    
+    .node-subtitle {
+      font-size: 9px;
+      fill: #9ca3af;
+      font-family: 'Outfit', sans-serif;
+    }
+    
+    /* Connection lines */
+    .flow-line {
+      fill: none;
+      stroke: #374151;
+      stroke-dasharray: 4, 4;
+      stroke-width: 2;
+      transition: stroke 0.3s ease;
+    }
+    
+    .flow-line.active {
+      stroke: var(--color-cf);
+      stroke-width: 2.5;
+      animation: dash 30s linear infinite;
+    }
+    
+    .flow-line.active-pg {
+      stroke: var(--color-pg);
+      stroke-width: 2.5;
+      animation: dash 30s linear infinite;
+    }
+    
+    .flow-line.active-duck {
+      stroke: var(--color-duck);
+      stroke-width: 2.5;
+      animation: dash 30s linear infinite;
+    }
+    
+    .flow-line.active-lake {
+      stroke: var(--color-lake);
+      stroke-width: 2.5;
+      animation: dash 30s linear infinite;
+    }
+    
+    .flow-line.active-arch {
+      stroke: var(--color-arch);
+      stroke-width: 2.5;
+      animation: dash 30s linear infinite;
+    }
+    
+    @keyframes dash {
+      to {
+        stroke-dashoffset: -1000;
+      }
+    }
+    
+    /* Glowing highlights */
+    .glow-overlay {
+      pointer-events: none;
+      opacity: 0;
+      transition: opacity 0.3s ease;
+    }
+    
+    .node.active .node-bg {
+      stroke-width: 2.5;
+    }
+    
+    .node.active-pg .node-bg { stroke: var(--color-pg); filter: drop-shadow(0 0 10px rgba(6, 182, 212, 0.4)); }
+    .node.active-cf .node-bg { stroke: var(--color-cf); filter: drop-shadow(0 0 10px rgba(16, 185, 129, 0.4)); }
+    .node.active-duck .node-bg { stroke: var(--color-duck); filter: drop-shadow(0 0 10px rgba(59, 130, 246, 0.4)); }
+    .node.active-lake .node-bg { stroke: var(--color-lake); filter: drop-shadow(0 0 10px rgba(139, 92, 246, 0.4)); }
+    .node.active-s3 .node-bg { stroke: var(--color-s3); filter: drop-shadow(0 0 10px rgba(245, 158, 11, 0.4)); }
+    .node.active-arch .node-bg { stroke: var(--color-arch); filter: drop-shadow(0 0 10px rgba(244, 63, 94, 0.4)); }
+    
+    /* Particle flow animation */
+    .particle {
+      fill: #fff;
+      filter: drop-shadow(0 0 4px #fff);
+      opacity: 0;
+    }
+    
+    .particle.active {
+      opacity: 1;
+    }
+    
+    /* Watermark text style */
+    .watermark-indicator {
+      font-size: 10px;
+      font-weight: bold;
+      fill: var(--color-arch);
+      font-family: 'Fira Code', monospace;
+    }
+    
+    /* Staging table styles */
+    .stage-table {
+      opacity: 0;
+      transition: opacity 0.3s ease;
+    }
+    
+    .stage-table.visible {
+      opacity: 1;
+    }
+    
+    /* Tooltip popup styles */
+    .tooltip-card {
+      position: absolute;
+      background: rgba(15, 23, 42, 0.95);
+      border: 1px solid var(--border-color);
+      border-radius: 8px;
+      padding: 0.75rem 1rem;
+      font-size: 0.85rem;
+      pointer-events: none;
+      display: none;
+      z-index: 100;
+      max-width: 250px;
+      box-shadow: 0 4px 20px rgba(0,0,0,0.5);
+    }
+    
+    .tooltip-card h4 {
+      margin-bottom: 0.25rem;
+      font-weight: 600;
+      color: var(--color-text-main);
+    }
+    
+    .tooltip-card p {
+      color: var(--color-text-muted);
+      line-height: 1.4;
+    }
+    
+  </style>
+</head>
+<body>
+
+  <header>
+    <div class="logo-container">
+      <div class="badge">pgEdge</div>
+      <h1>ColdFront Working Architecture</h1>
+    </div>
+    <div style="font-size: 0.9rem; color: var(--color-text-muted);">
+      Interactive Technical Flow Diagrams
+    </div>
+  </header>
+
+  <div class="dashboard">
+    <!-- Sidebar Control Panel -->
+    <div class="panel">
+      <!-- Section: Storage Mode -->
+      <div>
+        <div class="section-title">
+          <span class="btn-icon">⚙️</span> Storage Mode
+        </div>
+        <div class="mode-selector">
+          <button class="btn active" id="mode-tiered" onclick="setMode('tiered')">
+            <span>Tiered Mode <span style="font-size: 0.75rem; color: var(--color-text-muted); display: block; text-align: left; font-weight: normal;">PG Partition Heap + Cold S3</span></span>
+            <span class="btn-icon">⚡</span>
+          </button>
+          <button class="btn mode-decoupled" id="mode-decoupled" onclick="setMode('decoupled')">
+            <span>Decoupled Mode <span style="font-size: 0.75rem; color: var(--color-text-muted); display: block; text-align: left; font-weight: normal;">100% S3/Iceberg + PG Wrapper View</span></span>
+            <span class="btn-icon">🧊</span>
+          </button>
+        </div>
+      </div>
+      
+      <!-- Section: Actions -->
+      <div>
+        <div class="section-title">
+          <span class="btn-icon">📊</span> SQL Operations
+        </div>
+        <div class="action-selector">
+          <button class="btn action-btn active" id="action-select" onclick="runAction('select')">
+            <span>SELECT Query <span style="font-size: 0.7rem; color: var(--color-text-muted); display: block;">Read data from hot/cold tiers</span></span>
+            <span style="font-size: 0.8rem; font-family: monospace; background: rgba(0,0,0,0.2); padding: 2px 4px; border-radius: 4px;">DML</span>
+          </button>
+          <button class="btn action-btn" id="action-insert" onclick="runAction('insert')">
+            <span>INSERT Query <span style="font-size: 0.7rem; color: var(--color-text-muted); display: block;">Add rows (routed by watermark)</span></span>
+            <span style="font-size: 0.8rem; font-family: monospace; background: rgba(0,0,0,0.2); padding: 2px 4px; border-radius: 4px;">DML</span>
+          </button>
+          <button class="btn action-btn" id="action-update" onclick="runAction('update')">
+            <span>UPDATE / DELETE <span style="font-size: 0.7rem; color: var(--color-text-muted); display: block;">Mutate rows in matching tiers</span></span>
+            <span style="font-size: 0.8rem; font-family: monospace; background: rgba(0,0,0,0.2); padding: 2px 4px; border-radius: 4px;">DML</span>
+          </button>
+          <button class="btn action-btn arch-btn" id="action-archive" onclick="runAction('archive')">
+            <span>ARCHIVE PIPELINE <span style="font-size: 0.7rem; color: var(--color-text-muted); display: block;">Archiver daemon moves data hot→cold</span></span>
+            <span style="font-size: 0.8rem; font-family: monospace; background: rgba(244, 63, 94, 0.2); color: var(--color-arch); padding: 2px 4px; border-radius: 4px;">CRON</span>
+          </button>
+        </div>
+      </div>
+      
+      <!-- Animation Speed -->
+      <div>
+        <div class="section-title">
+          <span class="btn-icon">⏱️</span> Simulation Controls
+        </div>
+        <div class="animation-controls">
+          <button class="play-btn" id="play-pause" onclick="togglePlay()">⏸</button>
+          <div class="speed-slider-container">
+            <span style="font-size: 0.75rem; color: var(--color-text-muted);">Slower</span>
+            <input type="range" class="speed-slider" id="speed-range" min="1" max="10" value="5" oninput="updateSpeed()">
+            <span style="font-size: 0.75rem; color: var(--color-text-muted);">Faster</span>
+          </div>
+        </div>
+      </div>
+    </div>
+    
+    <!-- Viewport and Info panels -->
+    <div class="viewport-container">
+      <!-- Main SVG Viewport -->
+      <div class="viewport" id="viewport">
+        <div class="tooltip-card" id="tooltip"></div>
+        
+        <svg viewBox="0 0 1000 600" width="100%" height="100%">
+          <defs>
+            <!-- Glowing Filters -->
+            <filter id="glow-cyan" x="-20%" y="-20%" width="140%" height="140%">
+              <feGaussianBlur stdDeviation="5" result="blur"/>
+              <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+            </filter>
+            <filter id="glow-purple" x="-20%" y="-20%" width="140%" height="140%">
+              <feGaussianBlur stdDeviation="5" result="blur"/>
+              <feComposite in="SourceGraphic" in2="blur" operator="over"/>
+            </filter>
+            
+            <marker id="arrow" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M 0 1 L 10 5 L 0 9 z" fill="#475569" />
+            </marker>
+            <marker id="arrow-active" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M 0 1 L 10 5 L 0 9 z" fill="#10b981" />
+            </marker>
+            <marker id="arrow-arch" viewBox="0 0 10 10" refX="6" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+              <path d="M 0 1 L 10 5 L 0 9 z" fill="#f43f5e" />
+            </marker>
+          </defs>
+
+          <!-- Outer boundary grid / background accents -->
+          <rect x="5" y="5" width="990" height="590" rx="12" fill="none" stroke="rgba(255,255,255,0.02)" stroke-width="2"/>
+          <line x1="500" y1="5" x2="500" y2="595" stroke="rgba(255,255,255,0.01)" stroke-dasharray="5,5"/>
+          
+          <!-- PostgreSQL Container -->
+          <rect x="250" y="40" width="400" height="420" rx="16" fill="rgba(15, 23, 42, 0.4)" stroke="rgba(6, 182, 212, 0.2)" stroke-width="2"/>
+          <text x="270" y="65" fill="var(--color-pg)" font-size="12" font-weight="700" font-family="Outfit" letter-spacing="1">POSTGRESQL INSTANCE</text>
+
+          <!-- Flow paths / connection lines -->
+          
+          <!-- Path 1: Client -> PG / Hook -->
+          <path id="path-client-hook" d="M 120,150 L 320,150" class="flow-line" marker-end="url(#arrow)"/>
+          
+          <!-- Path 2: Hook -> PG Partitions (Hot Tier) -->
+          <path id="path-hook-pg" d="M 370,180 L 370,230" class="flow-line" marker-end="url(#arrow)"/>
+          
+          <!-- Path 3: Hook -> pg_duckdb (Cold Tier) -->
+          <path id="path-hook-duck" d="M 450,180 L 520,230" class="flow-line" marker-end="url(#arrow)"/>
+          
+          <!-- Path 4: pg_duckdb -> Lakekeeper (REST Catalog) -->
+          <path id="path-duck-lake" d="M 610,270 L 710,210" class="flow-line" marker-end="url(#arrow)"/>
+          
+          <!-- Path 5: pg_duckdb -> Object Store -->
+          <path id="path-duck-s3" d="M 610,300 L 710,380" class="flow-line" marker-end="url(#arrow)"/>
+
+          <!-- Path 6: Lakekeeper -> Object Store (Metadata updates) -->
+          <path id="path-lake-s3" d="M 780,240 L 780,340" class="flow-line" marker-end="url(#arrow)"/>
+          
+          <!-- Path 7: Archiver -> PG Partitions -->
+          <path id="path-arch-pg" d="M 370,510 L 370,350" class="flow-line" marker-end="url(#arrow)"/>
+          
+          <!-- Path 8: Archiver -> pg_duckdb -->
+          <path id="path-arch-duck" d="M 470,510 L 530,330" class="flow-line" marker-end="url(#arrow)"/>
+          
+          <!-- Path 9: Archiver -> Watermark -->
+          <path id="path-arch-watermark" d="M 450,540 L 450,425" class="flow-line" marker-end="url(#arrow)"/>
+
+          <!-- Nodes representing components -->
+
+          <!-- 1. Client App -->
+          <g class="node" id="node-client" onmouseover="showTooltip('client', event)" onmouseout="hideTooltip()">
+            <rect x="20" y="100" width="100" height="100" class="node-bg" />
+            <text x="70" y="140" text-anchor="middle" class="node-title">Application</text>
+            <text x="70" y="155" text-anchor="middle" class="node-subtitle">SQL client</text>
+            <image href="data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' fill='none' viewBox='0 0 24 24' stroke='%23f8fafc'><path stroke-linecap='round' stroke-linejoin='round' stroke-width='2' d='M10 20l4-16m4 4l4 4-4 4M6 16l-4-4 4-4'/></svg>" x="58" y="108" width="24" height="24" />
+          </g>
+
+          <!-- 2. ColdFront Extension / Hook -->
+          <g class="node" id="node-hook" onmouseover="showTooltip('hook', event)" onmouseout="hideTooltip()">
+            <rect x="320" y="100" width="180" height="80" class="node-bg" />
+            <text x="410" y="130" text-anchor="middle" class="node-title">ColdFront Hook</text>
+            <text x="410" y="145" text-anchor="middle" class="node-subtitle">post_parse_analyze_hook</text>
+            <text x="410" y="160" text-anchor="middle" class="node-subtitle" style="fill: var(--color-cf); font-weight: bold;">SQL Rewrite & routing</text>
+          </g>
+
+          <!-- 3. Watermark / View Registry (Inside PG) -->
+          <g class="node" id="node-watermark" onmouseover="showTooltip('watermark', event)" onmouseout="hideTooltip()">
+            <rect x="320" y="380" width="180" height="50" class="node-bg" />
+            <text x="410" y="405" text-anchor="middle" class="node-title">events VIEW & Watermark</text>
+            <text x="410" y="420" text-anchor="middle" class="watermark-indicator" id="watermark-text">Watermark: 2026-03-01</text>
+          </g>
+
+          <!-- 4. PG Partitions (Hot Tier) -->
+          <g class="node" id="node-pg" onmouseover="showTooltip('pg', event)" onmouseout="hideTooltip()">
+            <rect x="270" y="230" width="130" height="120" class="node-bg" />
+            <text x="335" y="255" text-anchor="middle" class="node-title">PG Partition Heap</text>
+            <text x="335" y="270" text-anchor="middle" class="node-subtitle">Hot Data Tier</text>
+            <!-- Partitions sub-boxes -->
+            <rect x="280" y="280" width="50" height="25" rx="4" fill="rgba(6, 182, 212, 0.1)" stroke="var(--color-pg)" stroke-width="1" id="partition-a"/>
+            <text x="305" y="295" text-anchor="middle" font-size="7" fill="var(--color-pg)" id="partition-a-lbl">p_2026_03</text>
+            
+            <rect x="340" y="280" width="50" height="25" rx="4" fill="rgba(6, 182, 212, 0.1)" stroke="var(--color-pg)" stroke-width="1" id="partition-b"/>
+            <text x="365" y="295" text-anchor="middle" font-size="7" fill="var(--color-pg)" id="partition-b-lbl">p_2026_04</text>
+            
+            <rect x="280" y="315" width="50" height="25" rx="4" fill="rgba(6, 182, 212, 0.1)" stroke="var(--color-pg)" stroke-width="1" id="partition-c"/>
+            <text x="305" y="330" text-anchor="middle" font-size="7" fill="var(--color-pg)" id="partition-c-lbl">p_2026_05</text>
+          </g>
+
+          <!-- 5. In-process DuckDB (pg_duckdb) -->
+          <g class="node" id="node-duck" onmouseover="showTooltip('duck', event)" onmouseout="hideTooltip()">
+            <rect x="490" y="230" width="130" height="120" class="node-bg" />
+            <text x="555" y="255" text-anchor="middle" class="node-title">pg_duckdb (DuckDB)</text>
+            <text x="555" y="270" text-anchor="middle" class="node-subtitle">Cold Data Engine</text>
+            <rect x="500" y="280" width="110" height="25" rx="4" fill="rgba(59, 130, 246, 0.1)" stroke="var(--color-duck)" stroke-width="1" />
+            <text x="555" y="295" text-anchor="middle" font-size="7" fill="var(--color-duck)" id="duck-action-lbl">iceberg_scan()</text>
+            <rect x="500" y="315" width="110" height="25" rx="4" fill="rgba(59, 130, 246, 0.1)" stroke="var(--color-duck)" stroke-width="1" class="stage-table" id="duckdb-stage"/>
+            <text x="555" y="330" text-anchor="middle" font-size="7" fill="var(--color-duck)" class="stage-table" id="duckdb-stage-lbl">duck_stage (Temp)</text>
+          </g>
+
+          <!-- 6. Lakekeeper REST Catalog -->
+          <g class="node" id="node-lake" onmouseover="showTooltip('lake', event)" onmouseout="hideTooltip()">
+            <rect x="710" y="140" width="170" height="100" class="node-bg" />
+            <text x="795" y="170" text-anchor="middle" class="node-title">Lakekeeper Catalog</text>
+            <text x="795" y="185" text-anchor="middle" class="node-subtitle">Iceberg REST Protocol</text>
+            <text x="795" y="200" text-anchor="middle" class="node-subtitle" style="fill: var(--color-lake);">Snapshot Serializer</text>
+            <rect x="730" y="210" width="130" height="20" rx="3" fill="rgba(139, 92, 246, 0.15)" stroke="var(--color-lake)" stroke-width="1" id="bakery-status" style="display: none;"/>
+            <text x="795" y="223" text-anchor="middle" font-size="7" fill="var(--color-lake)" id="bakery-status-lbl" style="display: none;">Bakery Claim: Idle</text>
+          </g>
+
+          <!-- 7. S3/Azure/GCS Object Store -->
+          <g class="node" id="node-s3" onmouseover="showTooltip('s3', event)" onmouseout="hideTooltip()">
+            <rect x="710" y="340" width="170" height="120" class="node-bg" />
+            <text x="795" y="370" text-anchor="middle" class="node-title">S3 / Object Store</text>
+            <text x="795" y="385" text-anchor="middle" class="node-subtitle">Apache Iceberg Table</text>
+            <rect x="730" y="405" width="60" height="40" rx="4" fill="rgba(245, 158, 11, 0.1)" stroke="var(--color-s3)" stroke-width="1" />
+            <text x="760" y="420" text-anchor="middle" font-size="7" fill="var(--color-s3)">*.parquet</text>
+            <text x="760" y="435" text-anchor="middle" font-size="6" fill="var(--color-text-muted)">Parquet Data</text>
+            <rect x="800" y="405" width="60" height="40" rx="4" fill="rgba(245, 158, 11, 0.1)" stroke="var(--color-s3)" stroke-width="1" />
+            <text x="830" y="420" text-anchor="middle" font-size="7" fill="var(--color-s3)">metadata.json</text>
+            <text x="830" y="435" text-anchor="middle" font-size="6" fill="var(--color-text-muted)">Iceberg Metadata</text>
+          </g>
+
+          <!-- 8. Go Archiver Daemon (Cron) -->
+          <g class="node" id="node-arch" onmouseover="showTooltip('arch', event)" onmouseout="hideTooltip()">
+            <rect x="320" y="500" width="220" height="70" class="node-bg" />
+            <text x="430" y="525" text-anchor="middle" class="node-title" style="fill: var(--color-arch);">Go Archiver (Cron)</text>
+            <text x="430" y="540" text-anchor="middle" class="node-subtitle">Moves partitions PG → Iceberg</text>
+            <text x="430" y="555" text-anchor="middle" class="node-subtitle" id="archiver-step-lbl" style="fill: var(--color-text-muted);">State: Sleeping</text>
+          </g>
+
+          <!-- Particles for flow path animations -->
+          <circle id="part-client-hook" r="4" class="particle"/>
+          <circle id="part-hook-pg" r="4" class="particle"/>
+          <circle id="part-hook-duck" r="4" class="particle"/>
+          <circle id="part-duck-lake" r="4" class="particle"/>
+          <circle id="part-duck-s3" r="4" class="particle"/>
+          <circle id="part-lake-s3" r="4" class="particle"/>
+          <circle id="part-arch-pg" r="4" class="particle"/>
+          <circle id="part-arch-duck" r="4" class="particle"/>
+          <circle id="part-arch-watermark" r="4" class="particle"/>
+        </svg>
+      </div>
+      
+      <!-- Information display & Console -->
+      <div class="info-panel">
+        <div class="info-desc">
+          <h3 id="info-title">SELECT Query (Tiered Mode)</h3>
+          <p id="info-text">The application issues a standard SELECT statement against the unified table view. The coldfront extension intercepts the query and splits it between the hot and cold tiers transparently.</p>
+          <div class="console-log" id="console-log">
+            <!-- Terminal logs go here -->
+          </div>
+        </div>
+        <div class="info-sql">
+          <h4>Active Query Representation</h4>
+          <div class="code-block" id="sql-display">SELECT * FROM events;</div>
+        </div>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    // System Modes: 'tiered', 'decoupled'
+    let currentMode = 'tiered';
+    // Active Operation: 'select', 'insert', 'update', 'archive'
+    let currentAction = 'select';
+    let isPlaying = true;
+    let animationSpeedMultiplier = 1.0;
+    
+    // Animation execution timer
+    let activeTimeline = null;
+    let currentStepIndex = 0;
+    
+    // Tooltip database
+    const tooltips = {
+      client: {
+        title: "Application Client",
+        desc: "Executes standard PostgreSQL queries. Unaware of the separate storage tiers under the hood, enabling seamless legacy application compatibility."
+      },
+      hook: {
+        title: "ColdFront PG Hook (C Extension)",
+        desc: "Pre-analyzes queries, checks watermarks, and dynamically rewrites SELECT, INSERT, UPDATE, and DELETE statements to target the correct PostgreSQL heap and/or Iceberg tables."
+      },
+      watermark: {
+        title: "Unified View & Watermark",
+        desc: "The public table interface is actually a View combining PG partitions and Iceberg scans using a UNION ALL. The archive_watermark table determines the time boundary between tiers."
+      },
+      pg: {
+        title: "Native PostgreSQL Partitions (Hot)",
+        desc: "Recent, active database partitions kept as native PostgreSQL heap tables. Highly performant for transactions, index scans, and frequent updates."
+      },
+      duck: {
+        title: "pg_duckdb Extension (Cold)",
+        desc: "Integrates DuckDB directly inside PostgreSQL. Handles low-overhead Iceberg catalog attachments, Parquet reads, and writes through a REST protocol."
+      },
+      lake: {
+        title: "Lakekeeper Iceberg REST Catalog",
+        desc: "A stateless Iceberg REST catalog. Manages namespace transactions, schema versions, and guarantees consistent snapshots. In mesh mode, Bakery locks serialize concurrent commits here."
+      },
+      s3: {
+        title: "Object Storage Tier",
+        desc: "S3, Azure ADLS, or GCS storage containing raw Parquet files and transactional Iceberg metadata logs. Represents the cost-effective cold storage layer."
+      },
+      arch: {
+        title: "Go Archiver Daemon",
+        desc: "A background job running via cron. Moves whole PG partitions past their hot period into Parquet/Iceberg via the DuckDB temp stage, drops the PG partitions, and advances watermarks."
+      }
+    };
+
+    function showTooltip(key, event) {
+      const tooltip = document.getElementById('tooltip');
+      const data = tooltips[key];
+      if (!data) return;
+      
+      tooltip.innerHTML = `<h4>${data.title}</h4><p>${data.desc}</p>`;
+      tooltip.style.display = 'block';
+      
+      // Position the tooltip near the mouse cursor inside the viewport card
+      const rect = document.getElementById('viewport').getBoundingClientRect();
+      const x = event.clientX - rect.left + 15;
+      const y = event.clientY - rect.top + 15;
+      tooltip.style.left = `${x}px`;
+      tooltip.style.top = `${y}px`;
+    }
+
+    function hideTooltip() {
+      document.getElementById('tooltip').style.display = 'none';
+    }
+
+    // Set layout parameters based on selected mode
+    function setMode(mode) {
+      currentMode = mode;
+      
+      document.getElementById('mode-tiered').classList.toggle('active', mode === 'tiered');
+      document.getElementById('mode-decoupled').classList.toggle('active', mode === 'decoupled');
+      
+      // Update UI elements based on mode
+      const partitionLabels = ['partition-a', 'partition-b', 'partition-c', 'partition-a-lbl', 'partition-b-lbl', 'partition-c-lbl'];
+      const archBtn = document.getElementById('action-archive');
+      
+      if (mode === 'decoupled') {
+        // In Decoupled Mode, the Hot PG heap is empty/unused
+        partitionLabels.forEach(id => {
+          const el = document.getElementById(id);
+          if (el) el.style.opacity = '0.15';
+        });
+        document.getElementById('watermark-text').innerText = "Table in Iceberg Only";
+        archBtn.style.opacity = '0.5';
+        archBtn.style.pointerEvents = 'none';
+        
+        // Show Bakery components in Lakekeeper
+        document.getElementById('bakery-status').style.display = 'block';
+        document.getElementById('bakery-status-lbl').style.display = 'block';
+        
+        // If current action is archive, switch it back to select
+        if (currentAction === 'archive') {
+          runAction('select');
+        } else {
+          runAction(currentAction);
+        }
+      } else {
+        // Tiered Mode
+        partitionLabels.forEach(id => {
+          const el = document.getElementById(id);
+          if (el) el.style.opacity = '1';
+        });
+        document.getElementById('watermark-text').innerText = "Watermark: 2026-03-01";
+        archBtn.style.opacity = '1';
+        archBtn.style.pointerEvents = 'auto';
+        
+        // Hide Bakery components in Lakekeeper (only active in mesh decoupled writes)
+        document.getElementById('bakery-status').style.display = 'none';
+        document.getElementById('bakery-status-lbl').style.display = 'none';
+        
+        runAction(currentAction);
+      }
+      
+      logToConsole(`System switched to ${mode.toUpperCase()} mode.`);
+    }
+
+    function updateSpeed() {
+      const val = document.getElementById('speed-range').value;
+      // Map 1-10 slider to 0.2x - 3x speed multiplier
+      animationSpeedMultiplier = 0.2 + (val - 1) * 0.31;
+    }
+
+    function togglePlay() {
+      isPlaying = !isPlaying;
+      document.getElementById('play-pause').innerText = isPlaying ? "⏸" : "▶";
+      logToConsole(isPlaying ? "Simulation resumed." : "Simulation paused.");
+    }
+
+    function logToConsole(text, isActive = false) {
+      const consoleLog = document.getElementById('console-log');
+      const entry = document.createElement('div');
+      entry.className = `log-entry ${isActive ? 'active' : ''}`;
+      
+      const time = new Date().toLocaleTimeString();
+      entry.innerText = `[${time}] ${text}`;
+      consoleLog.appendChild(entry);
+      consoleLog.scrollTop = consoleLog.scrollHeight;
+      
+      // Keep only last 15 entries
+      while (consoleLog.children.length > 15) {
+        consoleLog.removeChild(consoleLog.firstChild);
+      }
+    }
+
+    function runAction(action) {
+      currentAction = action;
+      
+      // Update button highlights
+      document.querySelectorAll('.action-btn').forEach(btn => {
+        btn.classList.remove('active');
+      });
+      document.getElementById(`action-${action}`).classList.add('active');
+      
+      // Reset all nodes and connections
+      resetAnimationState();
+      
+      // Initialize state step
+      currentStepIndex = 0;
+      
+      // Clear console
+      document.getElementById('console-log').innerHTML = "";
+      
+      // Run the specific step flow
+      startFlowAnimation();
+    }
+
+    function resetAnimationState() {
+      if (activeTimeline) {
+        clearTimeout(activeTimeline);
+        activeTimeline = null;
+      }
+      
+      // Reset SVG classes
+      document.querySelectorAll('.node').forEach(node => {
+        node.className.baseVal = "node";
+      });
+      document.querySelectorAll('.flow-line').forEach(line => {
+        line.className.baseVal = "flow-line";
+      });
+      document.querySelectorAll('.particle').forEach(part => {
+        part.className.baseVal = "particle";
+      });
+      
+      // Staging table
+      document.getElementById('duckdb-stage').className.baseVal = "stage-table";
+      document.getElementById('duckdb-stage-lbl').className.baseVal = "stage-table";
+      document.getElementById('duck-action-lbl').innerText = "iceberg_scan()";
+      
+      // Archiver sublabel
+      document.getElementById('archiver-step-lbl').innerText = "State: Sleeping";
+      
+      // Bakery label
+      document.getElementById('bakery-status-lbl').innerText = "Bakery Claim: Idle";
+      
+      // Partition text resets
+      document.getElementById('partition-a-lbl').innerText = "p_2026_03";
+      document.getElementById('partition-a').style.stroke = "var(--color-pg)";
+      document.getElementById('partition-a').style.fill = "rgba(6, 182, 212, 0.1)";
+    }
+
+    // Helper to animate a packet along a path
+    function animatePacket(pathId, particleId, duration, onComplete) {
+      if (!isPlaying) {
+        // If paused, wait and try again
+        activeTimeline = setTimeout(() => animatePacket(pathId, particleId, duration, onComplete), 200);
+        return;
+      }
+      
+      const path = document.getElementById(pathId);
+      const particle = document.getElementById(particleId);
+      if (!path || !particle) return;
+      
+      const length = path.getTotalLength();
+      particle.className.baseVal = "particle active";
+      
+      let start = null;
+      const adjustedDuration = duration / animationSpeedMultiplier;
+      
+      function step(timestamp) {
+        if (!isPlaying) {
+          // Pause logic: save current position or just re-request animation frame later
+          start = null; // resets time offset
+          requestAnimationFrame(step);
+          return;
+        }
+        
+        if (!start) start = timestamp;
+        const progress = (timestamp - start) / adjustedDuration;
+        
+        if (progress < 1) {
+          const point = path.getPointAtLength(progress * length);
+          particle.setAttribute('cx', point.x);
+          particle.setAttribute('cy', point.y);
+          requestAnimationFrame(step);
+        } else {
+          const point = path.getPointAtLength(length);
+          particle.setAttribute('cx', point.x);
+          particle.setAttribute('cy', point.y);
+          particle.className.baseVal = "particle";
+          if (onComplete) onComplete();
+        }
+      }
+      requestAnimationFrame(step);
+    }
+
+    function delayStep(ms, nextStep) {
+      const adjustedDelay = ms / animationSpeedMultiplier;
+      activeTimeline = setTimeout(() => {
+        if (isPlaying) {
+          nextStep();
+        } else {
+          delayStep(ms, nextStep); // recheck after pause
+        }
+      }, adjustedDelay);
+    }
+
+    function startFlowAnimation() {
+      if (currentMode === 'tiered') {
+        switch (currentAction) {
+          case 'select':
+            runTieredSelect();
+            break;
+          case 'insert':
+            runTieredInsert();
+            break;
+          case 'update':
+            runTieredUpdate();
+            break;
+          case 'archive':
+            runTieredArchive();
+            break;
+        }
+      } else {
+        // Decoupled mode
+        switch (currentAction) {
+          case 'select':
+            runDecoupledSelect();
+            break;
+          case 'insert':
+            runDecoupledInsert();
+            break;
+          case 'update':
+            runDecoupledUpdate();
+            break;
+        }
+      }
+    }
+
+    /* =========================================================================
+       TIERED MODE FLOWS
+       ========================================================================= */
+
+    function runTieredSelect() {
+      document.getElementById('info-title').innerText = "SELECT Query (Tiered Mode)";
+      document.getElementById('info-text').innerText = "The client runs a query against the main 'events' view. The parser rewrites this into a UNION ALL between PostgreSQL's local partitions (for data >= cutoff) and the Iceberg cold store (for data < cutoff).";
+      document.getElementById('sql-display').innerText = `SELECT * FROM events WHERE ts BETWEEN '2026-02-01' AND '2026-04-15';
+-- Rewritten internally to:
+SELECT * FROM _events WHERE ts >= '2026-03-01' AND ts <= '2026-04-15'
+UNION ALL
+SELECT * FROM iceberg_scan('ice.public.events') WHERE ts >= '2026-02-01' AND ts < '2026-03-01';`;
+
+      // Step 1: SQL arrives at PG from Client
+      logToConsole("Application issues SELECT query spanning hot and cold boundaries.", true);
+      document.getElementById('node-client').classList.add('active-pg');
+      
+      animatePacket('path-client-hook', 'part-client-hook', 1200, () => {
+        document.getElementById('node-hook').classList.add('active-cf');
+        logToConsole("ColdFront post_parse_analyze_hook intercepts the SELECT statement.");
+        
+        delayStep(1000, () => {
+          logToConsole("Hook checks query predicates against watermark '2026-03-01'. Identifies dual-tier read requirement.");
+          document.getElementById('node-watermark').classList.add('active-cf');
+          
+          delayStep(1000, () => {
+            // Step 2: Split read flow
+            logToConsole("View executes. Query branches to Hot heap and pg_duckdb concurrently.");
+            document.getElementById('path-hook-pg').classList.add('active-pg');
+            document.getElementById('path-hook-duck').classList.add('active-duck');
+            
+            // Animate packet down to Hot heap
+            animatePacket('path-hook-pg', 'part-hook-pg', 800, () => {
+              document.getElementById('node-pg').classList.add('active-pg');
+              logToConsole("Hot Tier: Scans local PG partition p_2026_04 (heap memory/disk).");
+            });
+            
+            // Animate packet to DuckDB
+            animatePacket('path-hook-duck', 'part-hook-duck', 1000, () => {
+              document.getElementById('node-duck').classList.add('active-duck');
+              document.getElementById('duck-action-lbl').innerText = "iceberg_scan()";
+              logToConsole("Cold Tier: pg_duckdb checks if Iceberg REST catalog is ATTACHed.");
+              
+              delayStep(1000, () => {
+                logToConsole("DuckDB hits Lakekeeper Catalog to fetch active metadata snapshot.");
+                document.getElementById('path-duck-lake').classList.add('active-lake');
+                
+                animatePacket('path-duck-lake', 'part-duck-lake', 1000, () => {
+                  document.getElementById('node-lake').classList.add('active-lake');
+                  logToConsole("Lakekeeper verifies Iceberg metadata path.");
+                  
+                  delayStep(800, () => {
+                    logToConsole("DuckDB streams Parquet data directly from S3 bucket.");
+                    document.getElementById('path-duck-s3').classList.add('active-duck');
+                    
+                    animatePacket('path-duck-s3', 'part-duck-s3', 1200, () => {
+                      document.getElementById('node-s3').classList.add('active-s3');
+                      
+                      // Return results
+                      delayStep(1200, () => {
+                        logToConsole("Union complete. Dual tier dataset combined and returned to application.");
+                        resetAnimationState();
+                        // Repeat loop
+                        runTieredSelect();
+                      });
+                    });
+                  });
+                });
+              });
+            });
+          });
+        });
+      });
+    }
+
+    function runTieredInsert() {
+      document.getElementById('info-title').innerText = "INSERT Query (Tiered Mode)";
+      document.getElementById('info-text').innerText = "The client inserts multiple rows. The ColdFront extension evaluates the timestamp of each row. Rows after the watermark go directly to native PostgreSQL partitions. Rows before the watermark are routed to the S3 Iceberg tier via pg_duckdb.";
+      document.getElementById('sql-display').innerText = `INSERT INTO events (id, ts, note) VALUES 
+  (120, '2026-03-15', 'Hot Row'), 
+  (121, '2026-02-10', 'Cold Row');
+-- Rewritten internally to:
+INSERT INTO _events VALUES (120, '2026-03-15', 'Hot Row');
+-- and:
+SELECT duckdb.raw_query('INSERT INTO ice.public.events VALUES (121, ...)');`;
+
+      logToConsole("Application inserts dual-tier rows (one hot row, one cold row).", true);
+      document.getElementById('node-client').classList.add('active-pg');
+      
+      animatePacket('path-client-hook', 'part-client-hook', 1200, () => {
+        document.getElementById('node-hook').classList.add('active-cf');
+        logToConsole("ColdFront post_parse_analyze_hook evaluates row values against watermark.");
+        
+        delayStep(1200, () => {
+          logToConsole("Row 1 ('2026-03-15') is >= watermark. Routing to Hot PG Partition Heap.");
+          document.getElementById('path-hook-pg').classList.add('active-pg');
+          
+          animatePacket('path-hook-pg', 'part-hook-pg', 800, () => {
+            document.getElementById('node-pg').classList.add('active-pg');
+            logToConsole("Hot row committed to local table partition 'p_2026_03'.");
+            
+            delayStep(800, () => {
+              logToConsole("Row 2 ('2026-02-10') is < watermark. Routing to DuckDB.");
+              document.getElementById('path-hook-duck').classList.add('active-duck');
+              
+              animatePacket('path-hook-duck', 'part-hook-duck', 1000, () => {
+                document.getElementById('node-duck').classList.add('active-duck');
+                document.getElementById('duck-action-lbl').innerText = "raw_query('INSERT ...')";
+                logToConsole("pg_duckdb prepares Iceberg transaction.");
+                
+                delayStep(1000, () => {
+                  logToConsole("DuckDB creates parquet file and registers change with Lakekeeper Catalog.");
+                  document.getElementById('path-duck-s3').classList.add('active-duck');
+                  document.getElementById('path-duck-lake').classList.add('active-lake');
+                  
+                  animatePacket('path-duck-s3', 'part-duck-s3', 1000, () => {
+                    document.getElementById('node-s3').classList.add('active-s3');
+                    
+                    animatePacket('path-duck-lake', 'part-duck-lake', 800, () => {
+                      document.getElementById('node-lake').classList.add('active-lake');
+                      
+                      animatePacket('path-lake-s3', 'part-lake-s3', 1000, () => {
+                        logToConsole("Lakekeeper commits new Iceberg snapshot, serializing the transaction.");
+                        
+                        delayStep(1200, () => {
+                          logToConsole("Dual-tier insert successfully completed.");
+                          resetAnimationState();
+                          runTieredInsert();
+                        });
+                      });
+                    });
+                  });
+                });
+              });
+            });
+          });
+        });
+      });
+    }
+
+    function runTieredUpdate() {
+      document.getElementById('info-title').innerText = "UPDATE / DELETE (Tiered Mode)";
+      document.getElementById('info-text').innerText = "Mutations are evaluated by the hook. In permissive mode, updates are routed to both the hot PG partitions and cold Iceberg tables depending on the WHERE criteria. In strict mode, mixed mutations across boundaries are rejected to prevent write mismatches.";
+      document.getElementById('sql-display').innerText = `UPDATE events SET note = 'updated' 
+WHERE ts BETWEEN '2026-02-15' AND '2026-03-15';
+-- In Permissive mode, this rewrites to:
+UPDATE _events SET note = 'updated' WHERE ts >= '2026-03-01' AND ts <= '2026-03-15';
+-- And:
+SELECT duckdb.raw_query('UPDATE ice.public.events SET note = ... WHERE ts < ...');`;
+
+      logToConsole("Application issues UPDATE query targeting both tiers.", true);
+      document.getElementById('node-client').classList.add('active-pg');
+      
+      animatePacket('path-client-hook', 'part-client-hook', 1200, () => {
+        document.getElementById('node-hook').classList.add('active-cf');
+        logToConsole("ColdFront C hook inspects target range against watermark.");
+        
+        delayStep(1200, () => {
+          logToConsole("Mixed write identified. Permissive mode enabled: executing on both tiers.");
+          document.getElementById('path-hook-pg').classList.add('active-pg');
+          document.getElementById('path-hook-duck').classList.add('active-duck');
+          
+          animatePacket('path-hook-pg', 'part-hook-pg', 800, () => {
+            document.getElementById('node-pg').classList.add('active-pg');
+            logToConsole("Hot Tier: Local PG UPDATE executed on matching records in partition.");
+          });
+          
+          animatePacket('path-hook-duck', 'part-hook-duck', 1000, () => {
+            document.getElementById('node-duck').classList.add('active-duck');
+            document.getElementById('duck-action-lbl').innerText = "raw_query('UPDATE ...')";
+            
+            delayStep(1000, () => {
+              logToConsole("Cold Tier: pg_duckdb performs update on Iceberg table. Acquires Lakekeeper lock.");
+              document.getElementById('path-duck-lake').classList.add('active-lake');
+              
+              animatePacket('path-duck-lake', 'part-duck-lake', 1000, () => {
+                document.getElementById('node-lake').classList.add('active-lake');
+                logToConsole("Lakekeeper serializes commit. DuckDB writes updated Parquet files.");
+                document.getElementById('path-duck-s3').classList.add('active-duck');
+                
+                animatePacket('path-duck-s3', 'part-duck-s3', 1200, () => {
+                  document.getElementById('node-s3').classList.add('active-s3');
+                  
+                  delayStep(1200, () => {
+                    logToConsole("Update operation completed on both hot and cold storage.");
+                    resetAnimationState();
+                    runTieredUpdate();
+                  });
+                });
+              });
+            });
+          });
+        });
+      });
+    }
+
+    function runTieredArchive() {
+      document.getElementById('info-title').innerText = "Go Archiver Pipeline (Tiered Mode)";
+      document.getElementById('info-text').innerText = "The Go Archiver daemon runs periodically. It converts cold PG partitions to Iceberg format, replays concurrent updates, advances the watermark, and drops the archived PG heap partitions.";
+      document.getElementById('sql-display').innerText = `-- Phase 1: Create delta capture trigger
+CREATE UNLOGGED TABLE p_2026_03_delta ...;
+-- Phase 2: Copy partition via DuckDB temp bridge
+CREATE TEMP TABLE duck_stage USING duckdb AS SELECT * FROM _events.p_2026_03;
+-- Phase 3: Copy to Iceberg, replay deltas, drop partition
+DROP TABLE _events.p_2026_03;
+-- Phase 4: Advance watermark
+UPDATE archive_watermark SET cutoff = '2026-04-01';`;
+
+      logToConsole("Archiver daemon wakes up from Cron trigger.", true);
+      document.getElementById('node-arch').classList.add('active-arch');
+      document.getElementById('archiver-step-lbl').innerText = "State: Running (Phase 0)";
+      
+      delayStep(1500, () => {
+        // Step 1: Wipe overlap (Idempotency)
+        logToConsole("Archiver Phase 0: Wipe any existing Iceberg rows in target range to ensure idempotency.");
+        document.getElementById('archiver-step-lbl').innerText = "State: Phase 0 (Iceberg Clean)";
+        document.getElementById('path-arch-duck').classList.add('active-arch');
+        
+        animatePacket('path-arch-duck', 'part-arch-duck', 1000, () => {
+          document.getElementById('node-duck').classList.add('active-duck');
+          document.getElementById('duck-action-lbl').innerText = "raw_query('DELETE ...')";
+          
+          delayStep(1000, () => {
+            // Step 2: Install capture trigger in PG
+            logToConsole("Archiver Phase 1: Install capture trigger & delta table on partition p_2026_03.");
+            document.getElementById('archiver-step-lbl').innerText = "State: Phase 1 (Trigger capture)";
+            document.getElementById('path-arch-pg').classList.add('active-arch');
+            
+            animatePacket('path-arch-pg', 'part-arch-pg', 1000, () => {
+              document.getElementById('node-pg').classList.add('active-pg');
+              document.getElementById('partition-a').style.stroke = "var(--color-arch)";
+              
+              delayStep(1200, () => {
+                // Step 3: Temp stage copy
+                logToConsole("Archiver Phase 2: Copy PG Partition heap into DuckDB temp stage 'duck_stage'.");
+                document.getElementById('archiver-step-lbl').innerText = "State: Phase 2 (Temp stage)";
+                document.getElementById('duckdb-stage').className.baseVal = "stage-table visible";
+                document.getElementById('duckdb-stage-lbl').className.baseVal = "stage-table visible";
+                
+                delayStep(1500, () => {
+                  // Step 4: Bulk export to Iceberg
+                  logToConsole("Archiver Phase 3: Bulk export from duck_stage to S3 Iceberg table.");
+                  document.getElementById('archiver-step-lbl').innerText = "State: Phase 3 (S3 Export)";
+                  document.getElementById('path-duck-s3').classList.add('active-duck');
+                  
+                  animatePacket('path-duck-s3', 'part-duck-s3', 1200, () => {
+                    document.getElementById('node-s3').classList.add('active-s3');
+                    
+                    delayStep(1200, () => {
+                      // Step 5: Delta replay & Drop PG partition
+                      logToConsole("Archiver Phase 4: Replay capture deltas, drop PG partition p_2026_03.");
+                      document.getElementById('archiver-step-lbl').innerText = "State: Phase 4 (Replay & Drop)";
+                      document.getElementById('partition-a-lbl').innerText = "[DROPPED]";
+                      document.getElementById('partition-a').style.fill = "rgba(244, 63, 94, 0.05)";
+                      document.getElementById('partition-a').style.stroke = "rgba(244, 63, 94, 0.2)";
+                      document.getElementById('duckdb-stage').className.baseVal = "stage-table";
+                      document.getElementById('duckdb-stage-lbl').className.baseVal = "stage-table";
+                      
+                      delayStep(1500, () => {
+                        // Step 6: Advance Watermark
+                        logToConsole("Archiver Phase 5: Update archive_watermark to '2026-04-01' & recreate View.");
+                        document.getElementById('archiver-step-lbl').innerText = "State: Phase 5 (Watermark updated)";
+                        document.getElementById('watermark-text').innerText = "Watermark: 2026-04-01";
+                        document.getElementById('node-watermark').classList.add('active-arch');
+                        document.getElementById('path-arch-watermark').classList.add('active-arch');
+                        
+                        animatePacket('path-arch-watermark', 'part-arch-watermark', 1000, () => {
+                          delayStep(2000, () => {
+                            logToConsole("Archive pipeline cycle successfully completed.");
+                            resetAnimationState();
+                            runTieredArchive();
+                          });
+                        });
+                      });
+                    });
+                  });
+                });
+              });
+            });
+          });
+        });
+      });
+    }
+
+    /* =========================================================================
+       DECOUPLED MODE FLOWS
+       ========================================================================= */
+
+    function runDecoupledSelect() {
+      document.getElementById('info-title').innerText = "SELECT Query (Decoupled Mode)";
+      document.getElementById('info-text').innerText = "In Decoupled mode, the table data resides entirely in the S3 Iceberg tier. The PostgreSQL table is just a thin wrapper view. The C hook translates all reads directly to iceberg_scan().";
+      document.getElementById('sql-display').innerText = `SELECT * FROM events WHERE id = 120;
+-- Rewritten internally to:
+SELECT r['id']::bigint, r['ts']::timestamptz, r['note']::text 
+FROM iceberg_scan('ice.public.events') r 
+WHERE r['id'] = 120;`;
+
+      logToConsole("Application issues SELECT query on decoupled table.", true);
+      document.getElementById('node-client').classList.add('active-pg');
+      
+      animatePacket('path-client-hook', 'part-client-hook', 1200, () => {
+        document.getElementById('node-hook').classList.add('active-cf');
+        logToConsole("ColdFront hook identifies table is DECOUPLED (100% Iceberg).");
+        
+        delayStep(1000, () => {
+          logToConsole("Routing query execution entirely to pg_duckdb, bypassing local PG partitions.");
+          document.getElementById('path-hook-duck').classList.add('active-duck');
+          
+          animatePacket('path-hook-duck', 'part-hook-duck', 1000, () => {
+            document.getElementById('node-duck').classList.add('active-duck');
+            document.getElementById('duck-action-lbl').innerText = "iceberg_scan()";
+            
+            delayStep(1000, () => {
+              logToConsole("DuckDB contacts Lakekeeper to retrieve the active metadata pointer.");
+              document.getElementById('path-duck-lake').classList.add('active-lake');
+              
+              animatePacket('path-duck-lake', 'part-duck-lake', 1000, () => {
+                document.getElementById('node-lake').classList.add('active-lake');
+                
+                delayStep(800, () => {
+                  logToConsole("DuckDB scans Parquet data directly from the S3 bucket.");
+                  document.getElementById('path-duck-s3').classList.add('active-duck');
+                  
+                  animatePacket('path-duck-s3', 'part-duck-s3', 1200, () => {
+                    document.getElementById('node-s3').classList.add('active-s3');
+                    
+                    delayStep(1200, () => {
+                      logToConsole("Select complete. Dataset returned to application client.");
+                      resetAnimationState();
+                      runDecoupledSelect();
+                    });
+                  });
+                });
+              });
+            });
+          });
+        });
+      });
+    }
+
+    function runDecoupledInsert() {
+      document.getElementById('info-title').innerText = "INSERT Query (Decoupled Mode)";
+      document.getElementById('info-text').innerText = "Writes in Decoupled Mode bypass the PG heap. In a Spock mesh topology, the Bakery protocol secures cluster-wide write claims using Snowflake tickets, preventing REST catalog commit conflicts.";
+      document.getElementById('sql-display').innerText = `INSERT INTO events VALUES (122, '2026-07-24', 'Decoupled row');
+-- Executed on Iceberg:
+SELECT coldfront._exec_iceberg_with_claim(
+  'ice.public.events', 
+  'INSERT INTO ice.public.events VALUES (122, ...)'
+);`;
+
+      logToConsole("Application issues INSERT query on decoupled table.", true);
+      document.getElementById('node-client').classList.add('active-pg');
+      
+      animatePacket('path-client-hook', 'part-client-hook', 1200, () => {
+        document.getElementById('node-hook').classList.add('active-cf');
+        logToConsole("ColdFront identifies Decoupled WRITE. Invoking Bakery Claim protocol.");
+        
+        delayStep(1000, () => {
+          // Bakery claim simulation
+          document.getElementById('bakery-status-lbl').innerText = "Bakery Claim: Claiming...";
+          logToConsole("Bakery: Requesting ticket lock across Spock mesh nodes.");
+          
+          delayStep(1200, () => {
+            document.getElementById('bakery-status-lbl').innerText = "Bakery Claim: ARMED";
+            logToConsole("Bakery: Write claim acquired cluster-wide. Proceeding to DuckDB write.");
+            document.getElementById('path-hook-duck').classList.add('active-duck');
+            
+            animatePacket('path-hook-duck', 'part-hook-duck', 1000, () => {
+              document.getElementById('node-duck').classList.add('active-duck');
+              document.getElementById('duck-action-lbl').innerText = "raw_query('INSERT ...')";
+              
+              delayStep(1000, () => {
+                logToConsole("DuckDB creates parquet file and submits commit request to Lakekeeper.");
+                document.getElementById('path-duck-s3').classList.add('active-duck');
+                document.getElementById('path-duck-lake').classList.add('active-lake');
+                
+                animatePacket('path-duck-s3', 'part-duck-s3', 1000, () => {
+                  document.getElementById('node-s3').classList.add('active-s3');
+                  
+                  animatePacket('path-duck-lake', 'part-duck-lake', 800, () => {
+                    document.getElementById('node-lake').classList.add('active-lake');
+                    
+                    animatePacket('path-lake-s3', 'part-lake-s3', 1000, () => {
+                      logToConsole("Lakekeeper commits new metadata transaction.");
+                      
+                      delayStep(1000, () => {
+                        // Release bakery
+                        document.getElementById('bakery-status-lbl').innerText = "Bakery Claim: Releasing...";
+                        logToConsole("Bakery: Releasing claim lock.");
+                        
+                        delayStep(1000, () => {
+                          document.getElementById('bakery-status-lbl').innerText = "Bakery Claim: Idle";
+                          logToConsole("Decoupled insert completed successfully.");
+                          resetAnimationState();
+                          runDecoupledInsert();
+                        });
+                      });
+                    });
+                  });
+                });
+              });
+            });
+          });
+        });
+      });
+    }
+
+    function runDecoupledUpdate() {
+      document.getElementById('info-title').innerText = "UPDATE / DELETE (Decoupled Mode)";
+      document.getElementById('info-text').innerText = "Like inserts, all updates and deletes in decoupled mode target the Iceberg S3 layers. Writes coordinate through the Bakery protocol, maintaining transactional safety.";
+      document.getElementById('sql-display').innerText = `DELETE FROM events WHERE id = 101;
+-- Executed on Iceberg:
+SELECT coldfront._exec_iceberg_with_claim(
+  'ice.public.events', 
+  'DELETE FROM ice.public.events WHERE id = 101'
+);`;
+
+      logToConsole("Application issues DELETE query on decoupled table.", true);
+      document.getElementById('node-client').classList.add('active-pg');
+      
+      animatePacket('path-client-hook', 'part-client-hook', 1200, () => {
+        document.getElementById('node-hook').classList.add('active-cf');
+        logToConsole("ColdFront identifies Decoupled WRITE mutation.");
+        
+        delayStep(1000, () => {
+          document.getElementById('bakery-status-lbl').innerText = "Bakery Claim: Claiming...";
+          logToConsole("Bakery: Requesting ticket lock across Spock mesh.");
+          
+          delayStep(1200, () => {
+            document.getElementById('bakery-status-lbl').innerText = "Bakery Claim: ARMED";
+            logToConsole("Bakery: Write claim acquired. Rewriting statement to pg_duckdb.");
+            document.getElementById('path-hook-duck').classList.add('active-duck');
+            
+            animatePacket('path-hook-duck', 'part-hook-duck', 1000, () => {
+              document.getElementById('node-duck').classList.add('active-duck');
+              document.getElementById('duck-action-lbl').innerText = "raw_query('DELETE ...')";
+              
+              delayStep(1000, () => {
+                logToConsole("DuckDB issues deletion logs and requests commit update from Lakekeeper.");
+                document.getElementById('path-duck-s3').classList.add('active-duck');
+                document.getElementById('path-duck-lake').classList.add('active-lake');
+                
+                animatePacket('path-duck-s3', 'part-duck-s3', 1000, () => {
+                  document.getElementById('node-s3').classList.add('active-s3');
+                  
+                  animatePacket('path-duck-lake', 'part-duck-lake', 800, () => {
+                    document.getElementById('node-lake').classList.add('active-lake');
+                    
+                    animatePacket('path-lake-s3', 'part-lake-s3', 1000, () => {
+                      logToConsole("Lakekeeper registers new Iceberg metadata snapshot.");
+                      
+                      delayStep(1000, () => {
+                        document.getElementById('bakery-status-lbl').innerText = "Bakery Claim: Releasing...";
+                        logToConsole("Bakery: Releasing lock.");
+                        
+                        delayStep(1000, () => {
+                          document.getElementById('bakery-status-lbl').innerText = "Bakery Claim: Idle";
+                          logToConsole("Decoupled delete mutation completed successfully.");
+                          resetAnimationState();
+                          runDecoupledUpdate();
+                        });
+                      });
+                    });
+                  });
+                });
+              });
+            });
+          });
+        });
+      });
+    }
+
+    // Initialize diagram on page load
+    window.onload = function() {
+      setMode('tiered');
+    };
+  </script>
+</body>
+</html>
