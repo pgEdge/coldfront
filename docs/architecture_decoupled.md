@@ -238,6 +238,80 @@ The helper doesn't add capability over raw_query - it composes the
 existing primitives into a single call so applications get a
 normal-looking PG table.
 
+## Wrapper helper: `coldfront.drop_iceberg_table()`
+
+Drops the Iceberg table backing a registered relation, in either mode:
+
+```sql
+-- catalog entry and stored objects both go
+SELECT coldfront.drop_iceberg_table('public', 'events', true);
+
+-- catalog entry goes; Parquet and metadata objects stay in the bucket
+SELECT coldfront.drop_iceberg_table('public', 'events', false);
+```
+
+One verb covers both modes because in both the thing being dropped is
+the Iceberg table. What that means for PostgreSQL differs, because the
+modes differ, and the function says which path it took in a NOTICE:
+
+- Iceberg-only: the Iceberg table is the whole relation, so nothing
+  remains. This is the inverse of `create_iceberg_table()`.
+- Tiered: the Iceberg table is the cold tier, so the cold tier goes and
+  the hot table returns under the relation's own name. This is the
+  inverse of tiering, so the table ends up an ordinary partitioned
+  Postgres table again, holding the data that had not yet aged out.
+
+`p_purge` has no default, because the two outcomes are irreversible in
+opposite directions. `true` deletes the data and metadata objects, which
+for the cold tier are the only copy of that data. `false` leaves those
+objects in the object store with no catalog entry, where no coldfront
+component reclaims them, since the compactor's expiry and orphan passes
+walk the snapshots of a table that still exists. The caller states which
+one they mean.
+
+What the function does:
+
+1. Refuses a relation that is not registered in
+   `coldfront.tiered_views`, so a drop never runs against the catalog
+   blindly.
+2. Deletes the registration. For a tiered table that includes the
+   `partition_config` and `archive_watermark` rows, because the archiver
+   resolves its work from `partition_config` and a surviving row would
+   re-tier the table into a catalog entry that no longer exists.
+   Deleting the `tiered_views` row also disarms the C DDL hook for the
+   relation, which is what permits step 3.
+3. Drops the wrapper view, and for a tiered table renames the hot table
+   back, reversing the rename the archiver's first run performed.
+4. Takes the same per-table claim every other cold write takes, then
+   drops the Iceberg table through a second attachment carrying
+   `PURGE_REQUESTED`. Lakekeeper performs the object deletion itself,
+   with the warehouse credential, so purge works unchanged under vended
+   credentials.
+
+Plain `DROP TABLE` and `DROP VIEW` on a registered relation stay blocked
+by the DDL hook; this function is the sanctioned path. Destroying a cold
+tier is deliberate, and a habitual statement is the wrong trigger for it.
+
+Three properties worth knowing:
+
+- The purge decision is an ATTACH option in duckdb-iceberg rather than a
+  statement clause, so the drop runs through a scoped attachment whose
+  alias encodes the flag. The long-lived `ice` attachment is never
+  purge-armed.
+- Purge is asynchronous. The catalog entry disappears with the drop, but
+  the objects are removed by Lakekeeper's own background purge queue
+  shortly afterwards, so a check made immediately after the call can
+  still see them.
+- Whether a purged table is recoverable is a property of the Lakekeeper
+  warehouse, not of coldfront. Under the soft delete profile the dropped
+  table stays restorable for the warehouse's expiration window before its
+  objects are deleted; under the hard profile, which is Lakekeeper's
+  default, there is no recovery window and the purge is queued as soon as
+  the table is dropped. A table on which a Lakekeeper hold
+  (`set_table_protection`) is set cannot be dropped at all, and this
+  function cannot override that: the drop carries `PURGE_REQUESTED` but
+  never `force`.
+
 ## ACID model
 
 (Summarises material from [architecture.md](architecture.md) §Concurrency
