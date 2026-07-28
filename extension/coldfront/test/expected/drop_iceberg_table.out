@@ -26,11 +26,13 @@ SELECT coldfront._iceberg_drop_sql('public', 'iceonly', true);
  ATTACH IF NOT EXISTS 'wh' AS ice_drop_purge (TYPE ICEBERG, ENDPOINT 'http://lk:8181/catalog', AUTHORIZATION_TYPE NONE, ACCESS_DELEGATION_MODE NONE, PURGE_REQUESTED true); DROP TABLE ice_drop_purge.public.iceonly
 (1 row)
 
--- purge=false drops the catalog entry only; the objects stay in the bucket.
+-- purge=false needs no attachment of its own: the everyday 'ice' attachment is
+-- never purge-armed, so the drop goes straight through it and the objects stay
+-- in the bucket.
 SELECT coldfront._iceberg_drop_sql('public', 'iceonly', false);
-                                                                                                 _iceberg_drop_sql                                                                                                  
---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- ATTACH IF NOT EXISTS 'wh' AS ice_drop_keep (TYPE ICEBERG, ENDPOINT 'http://lk:8181/catalog', AUTHORIZATION_TYPE NONE, ACCESS_DELEGATION_MODE NONE, PURGE_REQUESTED false); DROP TABLE ice_drop_keep.public.iceonly
+       _iceberg_drop_sql       
+-------------------------------
+ DROP TABLE ice.public.iceonly
 (1 row)
 
 -- Identifiers are quoted, so mixed case and embedded quotes cannot break out.

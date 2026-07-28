@@ -3524,9 +3524,22 @@ dit_provision() {
 # registration and wrapper view always go; a tiered table additionally loses its
 # archiver config and gets its hot table back under the relation's own name.
 dit_assert_pg() {
-    local label="$1" t="$2" mode="$3"
+    local label="$1" t="$2" mode="$3" nodes n
     assert_eq "$label: registry row gone" "0" \
         "$(q "$HOST" "SELECT count(*) FROM coldfront.tiered_views WHERE schema_name='dropprobe' AND relname='$t';")"
+
+    # On EVERY node, not just the origin. A wrapper view left behind on a peer
+    # would read through to a catalog entry that no longer exists, which is the
+    # one way this drop can be locally correct and still break the mesh. Asserted
+    # as "no view named $t" rather than on the hot table, because whether the
+    # provisioning DDL itself reached the peers is a separate question. $PEERS is
+    # empty on vanilla, so this collapses to the origin and needs no mode branch.
+    read -ra nodes <<< "$HOST $PEERS"
+    [ -n "$PEERS" ] && sleep 3
+    for n in "${nodes[@]}"; do
+        assert_eq "$label: no wrapper view left on $n" "0" \
+            "$(q "$n" "SELECT count(*) FROM pg_class WHERE relname='$t' AND relkind='v' AND relnamespace='dropprobe'::regnamespace;")"
+    done
     if [ "$mode" = decoupled ]; then
         assert_eq "$label: nothing left in PostgreSQL" "0" \
             "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname='$t' AND relnamespace='dropprobe'::regnamespace;")"

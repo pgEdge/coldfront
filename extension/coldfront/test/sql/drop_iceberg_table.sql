@@ -23,7 +23,9 @@ SET coldfront.dblink_self = '';
 -- data and metadata objects.
 SELECT coldfront._iceberg_drop_sql('public', 'iceonly', true);
 
--- purge=false drops the catalog entry only; the objects stay in the bucket.
+-- purge=false needs no attachment of its own: the everyday 'ice' attachment is
+-- never purge-armed, so the drop goes straight through it and the objects stay
+-- in the bucket.
 SELECT coldfront._iceberg_drop_sql('public', 'iceonly', false);
 
 -- Identifiers are quoted, so mixed case and embedded quotes cannot break out.

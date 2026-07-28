@@ -2439,41 +2439,38 @@ BEGIN
 END;
 $$;
 
--- coldfront._iceberg_drop_sql builds the DuckDB batch that drops one Iceberg
--- table from the catalog. duckdb-iceberg takes the purge decision as an ATTACH
--- option (PURGE_REQUESTED), not a statement clause, so the drop runs through a
--- second attachment carrying the caller's choice: the long-lived 'ice'
--- attachment is never purge-armed.
+-- coldfront._iceberg_drop_sql builds the DuckDB statements that drop one Iceberg
+-- table from the catalog.
 --
--- The attachment is not detached afterwards, and the alias encodes the flag.
--- DuckDB refuses to DETACH a database the current transaction still has
--- outstanding work on, and the drop is staged until this transaction commits, so
--- a trailing DETACH would always fail. Encoding the flag in the alias makes that
--- harmless: ATTACH IF NOT EXISTS can reuse an attachment left by an earlier call
--- (including one in this same transaction) and it is always armed the way the
--- caller asked, because a different choice resolves to a different alias.
+-- duckdb-iceberg takes the purge decision as an ATTACH option
+-- (PURGE_REQUESTED), not a statement clause. The long-lived 'ice' attachment is
+-- never purge-armed, which is precisely what a keep-files drop wants, so that
+-- case goes straight through it and needs nothing of its own.
 --
--- The table reference is built from schema + table rather than the stored
--- iceberg_table string, so it is identical whichever writer registered the row
--- (the archiver quotes every part, the SQL provisioner does not).
+-- Only a purging drop needs its own attachment, and that one is not detached
+-- afterwards: DuckDB refuses to detach a database while the transaction still
+-- has staged work on it, and the drop stays staged until commit. A fixed alias
+-- keeps reuse safe, because ice_drop_purge is armed identically on every call.
+--
+-- The reference is built from schema + table rather than the stored
+-- iceberg_table string, which the archiver quotes and this SQL path does not.
 CREATE FUNCTION coldfront._iceberg_drop_sql(
     p_schema text,
     p_table  text,
     p_purge  boolean
 ) RETURNS text LANGUAGE sql STABLE AS $$
-    SELECT format(
-        'ATTACH IF NOT EXISTS %L AS %I (TYPE ICEBERG, ENDPOINT %L, '
-        'AUTHORIZATION_TYPE NONE, ACCESS_DELEGATION_MODE %s, PURGE_REQUESTED %s); '
-        'DROP TABLE %I.%I.%I',
-        current_setting('coldfront.warehouse', true),
-        v_alias,
-        current_setting('coldfront.lakekeeper_endpoint', true),
-        coldfront._attach_delegation_mode(),
-        -- ::text, not %s on the boolean: boolean's output function renders t/f,
-        -- which DuckDB's ATTACH option parser does not accept.
-        p_purge::text,
-        v_alias, p_schema, p_table)
-    FROM (SELECT CASE WHEN p_purge THEN 'ice_drop_purge' ELSE 'ice_drop_keep' END) AS a(v_alias)
+    SELECT CASE WHEN p_purge THEN
+        format(
+            'ATTACH IF NOT EXISTS %L AS ice_drop_purge (TYPE ICEBERG, ENDPOINT %L, '
+            'AUTHORIZATION_TYPE NONE, ACCESS_DELEGATION_MODE %s, PURGE_REQUESTED true); '
+            'DROP TABLE ice_drop_purge.%I.%I',
+            current_setting('coldfront.warehouse', true),
+            current_setting('coldfront.lakekeeper_endpoint', true),
+            coldfront._attach_delegation_mode(),
+            p_schema, p_table)
+    ELSE
+        format('DROP TABLE ice.%I.%I', p_schema, p_table)
+    END
 $$;
 
 -- coldfront._unregister_iceberg removes the PostgreSQL side of a registered
@@ -2587,9 +2584,26 @@ BEGIN
     SET LOCAL duckdb.unsafe_allow_mixed_transactions = on;
     PERFORM coldfront.ensure_attached();
 
-    PERFORM coldfront._unregister_iceberg(p_schema, p_table);
-
+    -- GLOBAL LOCK ORDER, step 1: the bakery claim (resource B) before any
+    -- ACCESS EXCLUSIVE (resource A), which is the order cutover_archive takes
+    -- (see its comment). Dropping the view and renaming the hot table below both
+    -- take A, so acquiring B first is what keeps a drop racing a cutover on the
+    -- same table deadlock-free instead of inverting the order.
     PERFORM coldfront._take_iceberg_claim(v_ice_ref);
+
+    -- GLOBAL LOCK ORDER, step 2: A, with the same circuit breaker and the same
+    -- 100ms as cutover_archive, for the same reasons. A pending ACCESS EXCLUSIVE
+    -- request queues ahead of new conflicting lockers, so every millisecond
+    -- spent waiting is a millisecond the table is unavailable to new queries,
+    -- and the bakery claim is held throughout, which stalls cold writes to this
+    -- table on every node. Under deadlock_timeout so contention always yields
+    -- lock_not_available rather than making this the deadlock victim. An
+    -- operator who would rather wait sets their own lock_timeout, which is kept.
+    IF current_setting('lock_timeout') IN ('0', '0ms') THEN
+        SET LOCAL lock_timeout = '100ms';
+    END IF;
+
+    PERFORM coldfront._unregister_iceberg(p_schema, p_table);
     PERFORM duckdb.raw_query(coldfront._iceberg_drop_sql(p_schema, p_table, p_purge));
 
     IF v_iceberg_only THEN
