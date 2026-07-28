@@ -2914,7 +2914,8 @@ EOSQL
 story_types_extended() {
     step "TC-087/089/092/096/098/099/105: extended type round-trip (timestamp,time,char,json,interval,oid)"
     qf "$HOST" <<'EOSQL' >/dev/null
-CREATE TABLE IF NOT EXISTS public.typed_ext (
+SET search_path = public;
+CREATE TABLE IF NOT EXISTS typed_ext (
     id          bigint GENERATED ALWAYS AS IDENTITY,
     ts          timestamptz NOT NULL,
     col_ts_ntz  timestamp,
@@ -2930,7 +2931,7 @@ DECLARE m date;
 BEGIN
   FOREACH m IN ARRAY ARRAY[(date_trunc('month',now()) - interval '4 months')::date,
                            (date_trunc('month',now()) - interval '1 month')::date] LOOP
-    EXECUTE format('CREATE TABLE IF NOT EXISTS %I PARTITION OF typed_ext FOR VALUES FROM (%L) TO (%L)',
+    EXECUTE format('CREATE TABLE IF NOT EXISTS public.%I PARTITION OF public.typed_ext FOR VALUES FROM (%L) TO (%L)',
                    'typed_ext_p_' || to_char(m, 'YYYY_MM'), m, (m + interval '1 month'));
   END LOOP;
 END $do$;
@@ -2950,37 +2951,43 @@ iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:818
 $(storage_yaml)
 archiver: { tables: [ { source_table: typed_ext, partition_period: monthly, hot_period: "${ret_days} days" } ] }
 EOF
+    local _archived=0
     if ! "$ARCHIVER" import --config /tmp/journey-typed-ext.yaml >/tmp/journey-typed-ext.log 2>&1; then
-        fail "import typed_ext — see /tmp/journey-typed-ext.log"; tail -5 /tmp/journey-typed-ext.log; return
-    fi
-    if "$ARCHIVER" --config /tmp/journey-typed-ext.yaml >>/tmp/journey-typed-ext.log 2>&1; then
+        fail "import typed_ext — see /tmp/journey-typed-ext.log"; tail -5 /tmp/journey-typed-ext.log
+    elif "$ARCHIVER" --config /tmp/journey-typed-ext.yaml >>/tmp/journey-typed-ext.log 2>&1; then
         pass "typed_ext archived (m4 partition → cold)"
+        _archived=1
     else
-        fail "typed_ext archive — see /tmp/journey-typed-ext.log"; tail -5 /tmp/journey-typed-ext.log; return
+        fail "typed_ext archive — see /tmp/journey-typed-ext.log"; tail -5 /tmp/journey-typed-ext.log
     fi
-    local O; O=$(qf "$HOST" <<'EOSQL'
+    if [ "$_archived" = "1" ]; then
+        local O; O=$(qf "$HOST" <<'EOSQL'
 SELECT 'NTZ:'      || col_ts_ntz::text       FROM typed_ext WHERE ts < date_trunc('month',now()) - interval '3 months';
 SELECT 'TIME:'     || col_time::text          FROM typed_ext WHERE ts < date_trunc('month',now()) - interval '3 months';
 SELECT 'CHAR:'     || rtrim(col_char)         FROM typed_ext WHERE ts < date_trunc('month',now()) - interval '3 months';
 SELECT 'JSON:'     || (col_json->>'key')      FROM typed_ext WHERE ts < date_trunc('month',now()) - interval '3 months';
 SELECT 'INTERVAL:' || col_interval::text      FROM typed_ext WHERE ts < date_trunc('month',now()) - interval '3 months';
-SELECT 'OID:'      || col_oid::text            FROM typed_ext WHERE ts < date_trunc('month',now()) - interval '3 months';
+SELECT 'OID:'      || col_oid::text           FROM typed_ext WHERE ts < date_trunc('month',now()) - interval '3 months';
 EOSQL
 )
-    assert_eq "TC-087: timestamp (no tz) round-trip"   "2026-01-15 10:30:00" "$(extract NTZ      "$O")"
-    assert_eq "TC-089: time round-trip"                "10:30:00"            "$(extract TIME     "$O")"
-    assert_eq "TC-092: char(10) round-trip (trimmed)"  "hello"               "$(extract CHAR     "$O")"
-    assert_eq "TC-096: json round-trip (->>key)"       "value"               "$(extract JSON     "$O")"
-    assert_contains "TC-098: interval round-trip"      "1 day"               "$(extract INTERVAL "$O")"
-    assert_eq "TC-099: oid widened to bigint"          "12345"               "$(extract OID      "$O")"
-    # TC-105: full-column-set assertion — every extended column non-null in cold row.
-    assert_eq "TC-105: all extended columns non-null in cold row" "t" \
-        "$(q "$HOST" "SELECT (col_ts_ntz IS NOT NULL AND col_time IS NOT NULL AND col_char IS NOT NULL AND col_json IS NOT NULL AND col_interval IS NOT NULL AND col_oid IS NOT NULL)::text FROM typed_ext WHERE ts < date_trunc('month',now()) - interval '3 months' LIMIT 1;")"
+        assert_eq "TC-087: timestamp (no tz) round-trip"   "2026-01-15 10:30:00" "$(extract NTZ      "$O")"
+        assert_eq "TC-089: time round-trip"                "10:30:00"            "$(extract TIME     "$O")"
+        assert_eq "TC-092: char(10) round-trip (trimmed)"  "hello"               "$(extract CHAR     "$O")"
+        assert_eq "TC-096: json round-trip (->>key)"       "value"               "$(extract JSON     "$O")"
+        assert_contains "TC-098: interval round-trip"      "1 day"               "$(extract INTERVAL "$O")"
+        assert_eq "TC-099: oid widened to bigint"          "12345"               "$(extract OID      "$O")"
+        # TC-105: full-column-set assertion — every extended column non-null in cold row.
+        assert_eq "TC-105: all extended columns non-null in cold row" "t" \
+            "$(q "$HOST" "SELECT (col_ts_ntz IS NOT NULL AND col_time IS NOT NULL AND col_char IS NOT NULL AND col_json IS NOT NULL AND col_interval IS NOT NULL AND col_oid IS NOT NULL)::text FROM typed_ext WHERE ts < date_trunc('month',now()) - interval '3 months' LIMIT 1;")"
+    fi
+    # Always clean up so a failed archive does not leave typed_ext in partition_config
+    # and poison later archiver runs (TC-109, TC-066, TC-067, TC-138).
     q "$HOST" "DELETE FROM coldfront.partition_config  WHERE table_name='typed_ext';"  >/dev/null 2>&1
     q "$HOST" "DELETE FROM coldfront.tiered_views      WHERE relname='typed_ext';"     >/dev/null 2>&1
     q "$HOST" "DELETE FROM coldfront.archive_watermark WHERE table_name='typed_ext';"  >/dev/null 2>&1
-    q "$HOST" "DROP VIEW  IF EXISTS public.typed_ext;" >/dev/null 2>&1
-    q "$HOST" "DROP TABLE IF EXISTS public._typed_ext CASCADE;" >/dev/null 2>&1
+    q "$HOST" "DROP VIEW   IF EXISTS public.typed_ext;" >/dev/null 2>&1
+    q "$HOST" "DROP TABLE  IF EXISTS public._typed_ext CASCADE;" >/dev/null 2>&1
+    q "$HOST" "DROP TABLE  IF EXISTS public.typed_ext  CASCADE;" >/dev/null 2>&1
 }
 
 # ───────────────────────────────────────────────────────────────────────────
