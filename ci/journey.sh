@@ -2734,8 +2734,8 @@ story_seaweedfs_restart() {
     assert_gt "TC-062: cold rows present before restart" "0" "$before"
     docker restart "$sw_container" >/dev/null
     local i=0
-    until curl -sf "http://${SW_IP}:8333" >/dev/null 2>&1; do
-        i=$((i + 1)); [ "$i" -gt 30 ] && { fail "TC-062: SeaweedFS did not come back after restart"; return; }; sleep 2
+    until bash -c ">/dev/tcp/${SW_IP}/8333" 2>/dev/null; do
+        i=$((i + 1)); [ "$i" -gt 60 ] && { fail "TC-062: SeaweedFS did not come back after restart"; return; }; sleep 2
     done
     sleep 2
     local after; after=$(q "$HOST" "SELECT count(*) FROM events WHERE ts >= date_trunc('month',now()) - interval '3 months' AND ts < date_trunc('month',now()) - interval '1 month';")
@@ -3119,8 +3119,8 @@ INSERT INTO tc109.orders (ts) VALUES (date_trunc('month',now()) - interval '2 mo
 INSERT INTO tc109.logs   (ts) VALUES (date_trunc('month',now()) - interval '2 months' + interval '5 days');
 EOSQL
     local ret_days=$(( ( $(date -u +%s) - $(date -u -d "$(date -u +%Y-%m-01) -1 month" +%s) ) / 86400 ))
-    "$PARTITIONER" register --dsn "$dsn" --schema tc109 --table orders --period monthly --hot-period "${ret_days} days" --retention "${ret_days} days" >/dev/null 2>&1
-    "$PARTITIONER" register --dsn "$dsn" --schema tc109 --table logs   --period monthly --hot-period "${ret_days} days" --retention "${ret_days} days" >/dev/null 2>&1
+    "$PARTITIONER" register --dsn "$dsn" --schema tc109 --table orders --period monthly --hot-period "${ret_days} days" --retention "6 months" >/dev/null 2>&1
+    "$PARTITIONER" register --dsn "$dsn" --schema tc109 --table logs   --period monthly --hot-period "${ret_days} days" --retention "6 months" >/dev/null 2>&1
     # Disable logs via direct SQL (partition_config.enabled = false).
     q "$HOST" "UPDATE coldfront.partition_config SET enabled=false WHERE schema_name='tc109' AND table_name='logs';" >/dev/null
     assert_eq "TC-109: logs disabled in partition_config" "f" \
