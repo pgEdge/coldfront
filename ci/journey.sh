@@ -2734,10 +2734,10 @@ story_seaweedfs_restart() {
     assert_gt "TC-062: cold rows present before restart" "0" "$before"
     docker restart "$sw_container" >/dev/null
     local i=0
-    until bash -c ">/dev/tcp/${SW_IP}/8333" 2>/dev/null; do
+    until curl -s -o /dev/null --max-time 2 "http://${SW_IP}:8333/" 2>/dev/null; do
         i=$((i + 1)); [ "$i" -gt 60 ] && { fail "TC-062: SeaweedFS did not come back after restart"; return; }; sleep 2
     done
-    sleep 2
+    sleep 3
     local after; after=$(q "$HOST" "SELECT count(*) FROM events WHERE ts >= date_trunc('month',now()) - interval '3 months' AND ts < date_trunc('month',now()) - interval '1 month';")
     assert_eq "TC-062: cold row count unchanged after SeaweedFS restart" "$before" "$after"
 }
