@@ -3358,6 +3358,139 @@ EOF
     q "$HOST" "DROP SCHEMA sc2 CASCADE;" >/dev/null 2>&1
 }
 
+# ───────────────────────────────────────────────────────────────────────────
+# Story: coldfront.drop_iceberg_table. One verb, both modes, and the caller
+# decides whether the stored objects go with the catalog entry.
+#
+# Throwaway tables in their own namespace, so the journey's own fixtures are
+# untouched and this runs in any mode. The tiered registration is built directly
+# (real Iceberg table + hot table + view + registry rows) instead of by running
+# the archiver: story_provision_tiered already covers the archiver's path, and
+# what is under test here is the drop.
+# ───────────────────────────────────────────────────────────────────────────
+
+# http status of a dropprobe catalog entry: 200 while it exists, 404 once dropped.
+dit_catalog() { curl -s -o /dev/null -w '%{http_code}' \
+    "http://${LK_IP}:8181/catalog/v1/${DIT_WH}/namespaces/dropprobe/tables/$1"; }
+
+# The table's storage location, resolved while the catalog entry still exists:
+# after the drop it is a 404, which is exactly when the location is needed to
+# check whether the objects survived.
+dit_location() {
+    curl -s "http://${LK_IP}:8181/catalog/v1/${DIT_WH}/namespaces/dropprobe/tables/$1" \
+      | grep -oE '"location":"[^"]+"' | head -1 | cut -d'"' -f4
+}
+
+# Objects under a location. The URI comes from Lakekeeper, so the glob follows
+# whatever object store this cell runs against.
+dit_count() {
+    [ -n "$1" ] || { echo ""; return; }
+    q "$HOST" "SELECT coldfront.ensure_attached(); SELECT r['n'] FROM duckdb.query('SELECT count(*) AS n FROM glob(''$1/**'')') AS t(r);" | tail -1
+}
+
+# dit_provision <table> <mode>: a registered relation of the given mode,
+# holding real Iceberg data.
+dit_provision() {
+    local t="$1" mode="$2"
+    if [ "$mode" = decoupled ]; then
+        q "$HOST" "SELECT coldfront.create_iceberg_table('dropprobe','$t','[{\"name\":\"id\",\"type\":\"bigint\"}]'::jsonb);" >/dev/null 2>&1
+    else
+        # Tiered by construction: a real Iceberg cold table, a hot heap under the
+        # archiver's _-prefixed name, the transparent view in its place, and the
+        # registration rows the archiver would have written.
+        q "$HOST" "SELECT coldfront.ensure_attached(); SELECT duckdb.raw_query('CREATE TABLE IF NOT EXISTS ice.dropprobe.$t (id BIGINT)');" >/dev/null 2>&1
+        q "$HOST" "CREATE TABLE IF NOT EXISTS dropprobe._$t (id bigint);
+                   CREATE OR REPLACE VIEW dropprobe.$t AS SELECT * FROM dropprobe._$t;
+                   INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
+                   VALUES ('dropprobe','$t','dropprobe._$t','ice.dropprobe.$t','id')
+                     ON CONFLICT (schema_name, relname) DO NOTHING;
+                   INSERT INTO coldfront.partition_config(schema_name, table_name, partition_period, hot_period)
+                   VALUES ('dropprobe','$t','monthly','30 days')
+                     ON CONFLICT (schema_name, table_name) DO NOTHING;" >/dev/null 2>&1
+    fi
+    q "$HOST" "SELECT coldfront.ensure_attached(); SELECT duckdb.raw_query('INSERT INTO ice.dropprobe.$t SELECT i FROM range(1,11) t(i)');" >/dev/null 2>&1
+}
+
+# dit_assert_pg <label> <table> <mode>: the PostgreSQL side after a drop. The
+# registration and wrapper view always go; a tiered table additionally loses its
+# archiver config and gets its hot table back under the relation's own name.
+dit_assert_pg() {
+    local label="$1" t="$2" mode="$3"
+    assert_eq "$label: registry row gone" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.tiered_views WHERE schema_name='dropprobe' AND relname='$t';")"
+    if [ "$mode" = decoupled ]; then
+        assert_eq "$label: nothing left in PostgreSQL" "0" \
+            "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname='$t' AND relnamespace='dropprobe'::regnamespace;")"
+        return
+    fi
+    # partition_config must go too, or the next archiver run would re-tier into a
+    # catalog entry that no longer exists.
+    assert_eq "$label: partition_config row gone" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE schema_name='dropprobe' AND table_name='$t';")"
+    assert_eq "$label: hot table retained under its own name" "r" \
+        "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='$t' AND relnamespace='dropprobe'::regnamespace;")"
+    assert_eq "$label: the _-prefixed hot table is gone" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname='_$t' AND relnamespace='dropprobe'::regnamespace;")"
+}
+
+# dit_assert_objects <label> <loc> <before> <purge>: Lakekeeper deletes objects
+# from its own background queue, so neither outcome can be read immediately:
+# purge has to be waited for, and "retained" only means something once a purge
+# would have had time to run.
+dit_assert_objects() {
+    local label="$1" loc="$2" before="$3" purge="$4" after i=0
+    if [ "$purge" != true ]; then
+        sleep 5
+        assert_eq "$label: stored objects retained" "$before" "$(dit_count "$loc")"
+        return
+    fi
+    while [ "$i" -lt 30 ]; do
+        after=$(dit_count "$loc")
+        [ "$after" = "0" ] && break
+        sleep 1; i=$((i + 1))
+    done
+    assert_eq "$label: stored objects purged" "0" "$after"
+}
+
+# dit_case <label> <table> <mode> <purge>: provision, drop, then assert the PG
+# side, the catalog entry and whether the stored objects survived.
+dit_case() {
+    local label="$1" t="$2" mode="$3" purge="$4" loc before out
+    dit_provision "$t" "$mode"
+    loc=$(dit_location "$t")
+    before=$(dit_count "$loc")
+    assert_gt "$label: objects exist before the drop" 0 "${before:-0}"
+
+    out=$(q_may "$HOST" "SELECT coldfront.drop_iceberg_table('dropprobe','$t',$purge);")
+    case "$out" in
+        *ERROR*) fail "$label: drop_iceberg_table failed: $out"; return;;
+        *)       pass "$label: drop_iceberg_table succeeded";;
+    esac
+
+    dit_assert_pg "$label" "$t" "$mode"
+    assert_eq "$label: catalog entry dropped" "404" "$(dit_catalog "$t")"
+    dit_assert_objects "$label" "$loc" "$before" "$purge"
+}
+
+story_drop_iceberg_table() {
+    step "drop_iceberg_table: decoupled and tiered, purge and keep-files"
+    DIT_WH=$(curl -s "http://${LK_IP}:8181/management/v1/warehouse" \
+               | grep -oE '"warehouse-id":"[^"]+"' | head -1 | cut -d'"' -f4)
+    [ -n "$DIT_WH" ] || { fail "drop_iceberg_table: could not resolve the warehouse id"; return; }
+
+    # The Iceberg namespace must be committed before any CREATE TABLE references
+    # it (DuckDB defers CREATE SCHEMA to COMMIT; see story_provision_decoupled).
+    q "$HOST" "SELECT coldfront.ensure_attached(); SELECT duckdb.raw_query('CREATE SCHEMA IF NOT EXISTS ice.dropprobe');" >/dev/null 2>&1
+    q "$HOST" "CREATE SCHEMA IF NOT EXISTS dropprobe;" >/dev/null 2>&1
+
+    dit_case "decoupled/purge" dpurge decoupled true
+    dit_case "decoupled/keep"  dkeep  decoupled false
+    dit_case "tiered/purge"    tpurge tiered    true
+    dit_case "tiered/keep"     tkeep  tiered    false
+
+    q "$HOST" "DROP SCHEMA IF EXISTS dropprobe CASCADE;" >/dev/null 2>&1
+}
+
 # ── orchestrate ────────────────────────────────────────────────────────────
 # Setup is shared. The story set then branches on mode: tiered exercises the
 # hot+cold partitioned path; decoupled exercises the all-Iceberg wrapper. (The
@@ -3431,6 +3564,7 @@ else
     story_decoupled_concurrency
     story_decoupled_ryw
 fi
+story_drop_iceberg_table   # both modes, purge and keep-files (own throwaway tables)
 [ "$MESH" = 1 ] && [ "$MODE" = decoupled ] && story_mesh   # tiered+mesh runs story_mesh_tiered (above)
 [ "$MESH" = 1 ] && story_mesh_multiwriter   # >1 cold writer/node cross-node (tiered: events, decoupled: iceonly)
 [ -n "$STANDBY" ]    && story_standby_reads

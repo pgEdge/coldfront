@@ -105,6 +105,11 @@ INSERT INTO events VALUES (1, now(), 'hello');
 SELECT count(*) FROM events;
 ```
 
+To remove a table again, `coldfront.drop_iceberg_table()` unregisters it
+and drops the Iceberg table, deleting the stored objects only when asked
+to. See
+[Dropping an Iceberg table](docs/usage.md#dropping-an-iceberg-table-both-modes).
+
 For compliance environments that cannot store an object-store credential,
 `coldfront.set_storage_secret_vended()` runs with no credential in the
 database: Lakekeeper mints short-lived per-table credentials at access
