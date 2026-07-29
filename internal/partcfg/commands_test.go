@@ -1,9 +1,12 @@
 package partcfg
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/pgedge/coldfront/internal/config"
 )
 
@@ -172,5 +175,61 @@ func TestPartKeyCols(t *testing.T) {
 				break
 			}
 		}
+	}
+}
+
+// mockRow / persistDB: the one-row surface requireLogged needs.
+type mockRow struct{ scan func(dest ...any) error }
+
+func (r *mockRow) Scan(dest ...any) error { return r.scan(dest...) }
+
+type persistDB struct {
+	mockDB
+	unlogged string
+	err      error
+	gotArgs  []any
+}
+
+func (p *persistDB) QueryRow(_ context.Context, _ string, args ...any) pgx.Row {
+	p.gotArgs = args
+	return &mockRow{scan: func(dest ...any) error {
+		if p.err != nil {
+			return p.err
+		}
+		*(dest[0].(*string)) = p.unlogged
+		return nil
+	}}
+}
+
+func TestRequireLogged_RejectsUnloggedRelations(t *testing.T) {
+	// An UNLOGGED partition is not WAL-logged, so its rows are gone after a
+	// crash. Registering such a table would tier data that PostgreSQL never
+	// promised to keep. The error must name the offending relations.
+	db := &persistDB{unlogged: "public.events_p_2026_01, public.events_p_2026_02"}
+	err := requireLogged(context.Background(), db, "public", "events")
+	if err == nil {
+		t.Fatal("expected rejection")
+	}
+	for _, want := range []string{"unlogged", "events_p_2026_01", "events_p_2026_02"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err.Error(), want)
+		}
+	}
+}
+
+func TestRequireLogged_AcceptsFullyLoggedTree(t *testing.T) {
+	db := &persistDB{unlogged: ""}
+	if err := requireLogged(context.Background(), db, "public", "events"); err != nil {
+		t.Fatalf("a permanent tree must pass: %v", err)
+	}
+	if len(db.gotArgs) != 2 || db.gotArgs[0] != "public" || db.gotArgs[1] != "events" {
+		t.Errorf("schema/table not passed as args: %v", db.gotArgs)
+	}
+}
+
+func TestRequireLogged_PropagatesQueryError(t *testing.T) {
+	db := &persistDB{err: errors.New("boom")}
+	if err := requireLogged(context.Background(), db, "public", "events"); err == nil {
+		t.Fatal("query failure must not be reported as a clean tree")
 	}
 }

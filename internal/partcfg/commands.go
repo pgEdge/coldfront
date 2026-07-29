@@ -189,16 +189,46 @@ type validateDB interface {
 //     LIST column comes from the catalog).
 //   - period validity + retention>hot ordering: PostgreSQL interval semantics,
 //     checked against the connection (the interval column type is the backstop).
+//   - every relation in the partition tree is WAL-logged (see requireLogged).
 func validateRow(ctx context.Context, db validateDB, row configRow) error {
 	// After the archiver's first-run swap the source is a VIEW over "_"+name, so
 	// validate the PK / partition key against the real partitioned table. register
 	// runs pre-swap and resolves to the source unchanged, so every writer (register
 	// pre-swap, import/set post-swap) validates the same underlying table.
 	base := partition.ResolveSourceTable(ctx, db, row.schema, row.table)
+	if err := requireLogged(ctx, db, row.schema, base); err != nil {
+		return err
+	}
 	if err := validatePKSuperset(ctx, db, row.schema, base, row.column, row.subValues != ""); err != nil {
 		return err
 	}
 	return partition.ValidatePeriods(ctx, db, row.hot, row.retention)
+}
+
+// requireLogged rejects a table whose partition tree contains an UNLOGGED
+// relation. UNLOGGED data is not WAL-logged and is truncated after a crash, so
+// tiering it would archive rows PostgreSQL never promised to keep, and would
+// replicate nothing to a standby or a Spock peer.
+//
+// The whole tree is checked, not just the parent. A permanent parent may hold
+// UNLOGGED partitions on every supported major (PG18 forbids only an UNLOGGED
+// parent), and the partitions are what actually carry the rows.
+func requireLogged(ctx context.Context, db partition.RowQuerier, schema, table string) error {
+	var unlogged string
+	err := db.QueryRow(ctx, `
+		SELECT coalesce(string_agg(t.relid::regclass::text, ', ' ORDER BY t.relid::regclass::text), '')
+		FROM pg_partition_tree(format('%I.%I', $1::text, $2::text)::regclass) t
+		JOIN pg_class c ON c.oid = t.relid
+		WHERE c.relpersistence = 'u'`, schema, table).Scan(&unlogged)
+	if err != nil {
+		return fmt.Errorf("check persistence of %s.%s: %w", schema, table, err)
+	}
+	if unlogged != "" {
+		return fmt.Errorf("%s.%s has unlogged relations (%s): unlogged data is truncated on crash "+
+			"and cannot be archived; make them permanent with ALTER TABLE ... SET LOGGED",
+			schema, table, unlogged)
+	}
+	return nil
 }
 
 // writeRow validates then inserts one table. register and import both call it
