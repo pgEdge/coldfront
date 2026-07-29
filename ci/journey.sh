@@ -3259,22 +3259,34 @@ story_register_idempotent() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────
-# Story — TC-113: UNLOGGED partitioned table rejected at register.
-# UNLOGGED data is not WAL-logged and is lost on crash — incompatible with
-# ColdFront's durability guarantees. Register is where this is caught, so there
-# is nothing left to test at archive time: the table never reaches the registry.
+# Story — TC-113: an UNLOGGED relation in the partition tree is rejected at
+# register. UNLOGGED data is truncated after a crash and replicates nowhere, so
+# tiering it would archive rows PostgreSQL never promised to keep.
+#
+# The fixture is a PERMANENT parent with an UNLOGGED partition, which is the case
+# that actually loses rows and is creatable on every supported major. An unlogged
+# PARENT is not usable as a fixture: PG18 refuses it outright ("partitioned tables
+# cannot be unlogged"), so a test built on one asserts PostgreSQL's DDL rules on
+# 16/17 and nothing at all on 18.
 # ───────────────────────────────────────────────────────────────────────────
 story_unlogged_rejected() {
-    step "TC-113: UNLOGGED partitioned table rejected at register"
-    q "$HOST" "CREATE UNLOGGED TABLE IF NOT EXISTS public.tc113_unlogged (
-        id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL, PRIMARY KEY (id,ts)
-    ) PARTITION BY RANGE (ts);" >/dev/null 2>&1 || true
+    step "TC-113: UNLOGGED partition rejected at register"
+    qf "$HOST" <<'EOSQL' >/dev/null 2>&1
+CREATE TABLE IF NOT EXISTS public.tc113_unlogged (
+    id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL, PRIMARY KEY (id, ts)
+) PARTITION BY RANGE (ts);
+CREATE UNLOGGED TABLE IF NOT EXISTS public.tc113_unlogged_p
+    PARTITION OF public.tc113_unlogged FOR VALUES FROM ('2020-01-01') TO ('2020-02-01');
+EOSQL
+    assert_eq "TC-113: fixture has a permanent parent and an unlogged partition" "p|u" \
+        "$(q "$HOST" "SELECT string_agg(relpersistence,'|' ORDER BY relname) FROM pg_class WHERE relname IN ('tc113_unlogged','tc113_unlogged_p');")"
     if "$ARCHIVER" register --config /tmp/journey-archiver.yaml --table tc113_unlogged \
             --period monthly --hot-period "30 days" >/tmp/journey-unlogged.log 2>&1; then
-        fail "TC-113: register accepted an UNLOGGED table"
+        fail "TC-113: register accepted a tree containing an unlogged partition"
     else
-        assert_contains "TC-113: register rejected UNLOGGED with a clear error" "unlogged" \
-            "$(tr '[:upper:]' '[:lower:]' < /tmp/journey-unlogged.log)"
+        # Names the offending partition, not just the parent the caller typed.
+        assert_contains "TC-113: register named the unlogged partition" "tc113_unlogged_p" \
+            "$(cat /tmp/journey-unlogged.log)"
     fi
     assert_eq "TC-113: nothing registered" "0" \
         "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='tc113_unlogged';")"
