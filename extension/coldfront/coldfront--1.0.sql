@@ -1507,8 +1507,8 @@ BEGIN
     -- Numeric / boolean
     IF t IN ('bigint', 'int8')             THEN RETURN 'BIGINT';   END IF;
     IF t IN ('integer', 'int', 'int4')     THEN RETURN 'INTEGER';  END IF;
-    -- Iceberg has no 16-bit integer; widen smallint to INTEGER (lossless,
-    -- same principle as oid → BIGINT). duckdb-iceberg rejects SMALLINT outright.
+    -- Iceberg has no 16-bit integer; widen smallint to INTEGER (lossless).
+    -- duckdb-iceberg rejects SMALLINT outright.
     IF t IN ('smallint', 'int2')           THEN RETURN 'INTEGER';  END IF;
     IF t IN ('real', 'float4')             THEN RETURN 'REAL';     END IF;
     IF t IN ('double precision', 'float8') THEN RETURN 'DOUBLE';   END IF;
@@ -1522,7 +1522,6 @@ BEGIN
     IF t = 'uuid'  THEN RETURN 'UUID';    END IF;
     IF t = 'text'  THEN RETURN 'VARCHAR'; END IF;
     IF t = 'bytea' THEN RETURN 'BLOB';    END IF;
-    IF t = 'oid'   THEN RETURN 'BIGINT';  END IF;  -- 4-byte unsigned safe-widen
     -- Variable-precision strings
     IF t LIKE 'character varying%' OR t LIKE 'varchar%'
        OR t LIKE 'character(%' OR t LIKE 'char(%' OR t = 'character'
@@ -1536,12 +1535,12 @@ BEGIN
     END IF;
     -- View-cast types: stored as VARCHAR, surfaced via wrapper view as native PG type
     IF t IN ('jsonb', 'json', 'interval') THEN RETURN 'VARCHAR'; END IF;
-    -- inet/cidr are NOT supported: pg_duckdb rejects PG inet (Oid 869) in any
-    -- query it plans, and every Iceberg-backed view read is planned by
-    -- pg_duckdb, so there is no cast that makes them readable. Store IP data
-    -- as text instead.
+    -- inet/cidr/oid are NOT supported: pg_duckdb rejects them (inet Oid 869,
+    -- oid Oid 26) in any query it plans, and every Iceberg-backed view read is
+    -- planned by pg_duckdb, so no cast makes them readable. Store IP data as
+    -- text and oid values as bigint instead.
 
-    RAISE EXCEPTION 'coldfront: PG type % has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, oid, numeric(P,S), jsonb, json, interval. inet/cidr unsupported (store IP data as text)', p_pg_type;
+    RAISE EXCEPTION 'coldfront: PG type % has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, numeric(P,S), jsonb, json, interval. inet/cidr/oid unsupported (store IP data as text, oid values as bigint)', p_pg_type;
 END;
 $$;
 
@@ -1562,10 +1561,10 @@ LANGUAGE sql IMMUTABLE STRICT AS $$
         WHEN 'float8'           THEN 'double precision'
         -- BLOB is not a PG-parseable cast name; surface bytea via "bytea".
         WHEN 'bytea'            THEN 'bytea'
-        -- Everything else (incl. smallint→INTEGER, oid→BIGINT widening) has a
-        -- storage type that is itself a PG-parseable surface; the view casts
-        -- BOTH branches to that storage type, so no separate surface cast is
-        -- needed and bootstrap/post-cutover view column types still agree.
+        -- Everything else (incl. smallint→INTEGER widening) has a storage type
+        -- that is itself a PG-parseable surface; the view casts BOTH branches
+        -- to that storage type, so no separate surface cast is needed and
+        -- bootstrap/post-cutover view column types still agree.
         ELSE ''
     END;
 $$;
@@ -2437,6 +2436,183 @@ BEGIN
             USING HINT = 'Standbys serve reads only; run the compactor against the primary.';
     END IF;
     PERFORM coldfront._take_iceberg_claim(p_iceberg_table);
+END;
+$$;
+
+-- coldfront._iceberg_drop_sql builds the DuckDB statements that drop one Iceberg
+-- table from the catalog.
+--
+-- duckdb-iceberg takes the purge decision as an ATTACH option
+-- (PURGE_REQUESTED), not a statement clause. The long-lived 'ice' attachment is
+-- never purge-armed, which is precisely what a keep-files drop wants, so that
+-- case goes straight through it and needs nothing of its own.
+--
+-- Only a purging drop needs its own attachment, and that one is not detached
+-- afterwards: DuckDB refuses to detach a database while the transaction still
+-- has staged work on it, and the drop stays staged until commit. A fixed alias
+-- keeps reuse safe, because ice_drop_purge is armed identically on every call.
+--
+-- The reference is built from schema + table rather than the stored
+-- iceberg_table string, which the archiver quotes and this SQL path does not.
+CREATE FUNCTION coldfront._iceberg_drop_sql(
+    p_schema text,
+    p_table  text,
+    p_purge  boolean
+) RETURNS text LANGUAGE sql STABLE AS $$
+    SELECT CASE WHEN p_purge THEN
+        format(
+            'ATTACH IF NOT EXISTS %L AS ice_drop_purge (TYPE ICEBERG, ENDPOINT %L, '
+            'AUTHORIZATION_TYPE NONE, ACCESS_DELEGATION_MODE %s, PURGE_REQUESTED true); '
+            'DROP TABLE ice_drop_purge.%I.%I',
+            current_setting('coldfront.warehouse', true),
+            current_setting('coldfront.lakekeeper_endpoint', true),
+            coldfront._attach_delegation_mode(),
+            p_schema, p_table)
+    ELSE
+        format('DROP TABLE ice.%I.%I', p_schema, p_table)
+    END
+$$;
+
+-- coldfront._unregister_iceberg removes the PostgreSQL side of a registered
+-- Iceberg relation: the registry rows and the wrapper view, plus, for a tiered
+-- table, the archiver's configuration and the rename that put the view in the
+-- hot table's place. It performs no Iceberg I/O, so it is the entire
+-- PG-visible effect of a drop and is exercisable without a catalog.
+--
+-- Order matters. The tiered_views DELETE also disarms the C DDL hook for these
+-- relations, which is what permits the view drop that follows. For a tiered
+-- table partition_config must go as well: the archiver resolves its work from
+-- that table, so a surviving row would re-tier into a catalog entry that no
+-- longer exists.
+CREATE FUNCTION coldfront._unregister_iceberg(p_schema text, p_table text)
+RETURNS void LANGUAGE plpgsql AS $$
+DECLARE
+    v_hot          text;
+    v_iceberg_only boolean;
+    v_hot_reg      regclass;
+BEGIN
+    SELECT hot_table, is_iceberg_only
+      INTO v_hot, v_iceberg_only
+      FROM coldfront.tiered_views
+     WHERE schema_name = p_schema AND relname = p_table;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'coldfront: "%.%" is not a registered Iceberg table', p_schema, p_table
+            USING HINT = 'Only tables registered in coldfront.tiered_views can be unregistered.';
+    END IF;
+
+    DELETE FROM coldfront.tiered_views
+     WHERE schema_name = p_schema AND relname = p_table;
+
+    IF NOT v_iceberg_only THEN
+        DELETE FROM coldfront.partition_config
+         WHERE schema_name = p_schema AND table_name = p_table;
+        DELETE FROM coldfront.archive_watermark
+         WHERE schema_name = p_schema AND table_name = p_table;
+    END IF;
+
+    EXECUTE format('DROP VIEW IF EXISTS %I.%I', p_schema, p_table);
+
+    -- Reverse the archiver's first-run rename so the hot table is addressable
+    -- under its original name again. to_regclass resolves either quoting form
+    -- of the stored hot_table, and yields NULL if it is already gone.
+    IF NOT v_iceberg_only AND v_hot IS NOT NULL THEN
+        v_hot_reg := to_regclass(v_hot);
+        IF v_hot_reg IS NOT NULL THEN
+            EXECUTE format('ALTER TABLE %s RENAME TO %I', v_hot_reg::text, p_table);
+        END IF;
+    END IF;
+END;
+$$;
+
+-- coldfront.drop_iceberg_table drops the Iceberg table backing a registered
+-- relation. It is the inverse of coldfront.create_iceberg_table for an
+-- iceberg-only table, and the inverse of tiering for a tiered one. What that
+-- means for PostgreSQL differs because the modes differ:
+--
+--   * iceberg-only: the Iceberg table IS the relation, so nothing remains.
+--   * tiered:       the Iceberg table is the cold tier, so the cold tier goes
+--                   and the hot table returns under the relation's own name.
+--
+-- Both end states are announced with a NOTICE, because one call yielding two
+-- outcomes is worth stating out loud rather than leaving to documentation.
+--
+-- p_purge has no default because both choices are irreversible in opposite
+-- directions: true deletes the data and metadata objects, which for the cold
+-- tier are the only copy of that data, while false drops the catalog entry and
+-- leaves those objects in the object store where nothing reclaims them. The
+-- caller states which one they mean.
+--
+-- Plain DROP TABLE / DROP VIEW stays blocked by the C DDL hook; this is the
+-- sanctioned path. Reversible work runs first, and the catalog drop, the one
+-- step whose effect outlives a ROLLBACK, runs last under the same per-table
+-- claim every other cold write takes. A protected table (a Lakekeeper hold) is
+-- refused by the catalog itself, and this path cannot override it: the drop
+-- carries PURGE_REQUESTED but never force.
+CREATE FUNCTION coldfront.drop_iceberg_table(
+    p_schema text,
+    p_table  text,
+    p_purge  boolean
+) RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_ice_ref      text;
+    v_iceberg_only boolean;
+BEGIN
+    IF p_purge IS NULL THEN
+        RAISE EXCEPTION 'coldfront.drop_iceberg_table: p_purge is required (true or false)'
+            USING HINT = 'true also deletes the Iceberg data and metadata objects; false drops only the catalog entry and leaves the objects in the object store.';
+    END IF;
+
+    SELECT iceberg_table, is_iceberg_only
+      INTO v_ice_ref, v_iceberg_only
+      FROM coldfront.tiered_views
+     WHERE schema_name = p_schema AND relname = p_table;
+
+    IF NOT FOUND THEN
+        RAISE EXCEPTION 'coldfront.drop_iceberg_table: "%.%" is not a registered Iceberg table', p_schema, p_table
+            USING HINT = 'Only tables registered in coldfront.tiered_views can be dropped through this function.';
+    END IF;
+
+    IF pg_is_in_recovery() THEN
+        RAISE EXCEPTION 'coldfront: cannot drop an Iceberg table on a read-only standby'
+            USING HINT = 'Standbys serve reads only; run this on the primary.';
+    END IF;
+
+    -- Combines PG writes (registry DELETEs, DROP VIEW, the rename) with a DuckDB
+    -- write in one transaction, the same pattern create_iceberg_table needs.
+    SET LOCAL duckdb.unsafe_allow_mixed_transactions = on;
+    PERFORM coldfront.ensure_attached();
+
+    -- GLOBAL LOCK ORDER, step 1: the bakery claim (resource B) before any
+    -- ACCESS EXCLUSIVE (resource A), which is the order cutover_archive takes
+    -- (see its comment). Dropping the view and renaming the hot table below both
+    -- take A, so acquiring B first is what keeps a drop racing a cutover on the
+    -- same table deadlock-free instead of inverting the order.
+    PERFORM coldfront._take_iceberg_claim(v_ice_ref);
+
+    -- GLOBAL LOCK ORDER, step 2: A, with the same circuit breaker and the same
+    -- 100ms as cutover_archive, for the same reasons. A pending ACCESS EXCLUSIVE
+    -- request queues ahead of new conflicting lockers, so every millisecond
+    -- spent waiting is a millisecond the table is unavailable to new queries,
+    -- and the bakery claim is held throughout, which stalls cold writes to this
+    -- table on every node. Under deadlock_timeout so contention always yields
+    -- lock_not_available rather than making this the deadlock victim. An
+    -- operator who would rather wait sets their own lock_timeout, which is kept.
+    IF current_setting('lock_timeout') IN ('0', '0ms') THEN
+        SET LOCAL lock_timeout = '100ms';
+    END IF;
+
+    PERFORM coldfront._unregister_iceberg(p_schema, p_table);
+    PERFORM duckdb.raw_query(coldfront._iceberg_drop_sql(p_schema, p_table, p_purge));
+
+    IF v_iceberg_only THEN
+        RAISE NOTICE 'coldfront: dropped iceberg-only table "%.%" (purge=%); nothing remains in PostgreSQL',
+            p_schema, p_table, p_purge;
+    ELSE
+        RAISE NOTICE 'coldfront: dropped the cold tier of "%.%" (purge=%); the hot table is retained as a plain table under that name',
+            p_schema, p_table, p_purge;
+    END IF;
 END;
 $$;
 

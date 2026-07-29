@@ -320,6 +320,52 @@ appearing values automatically:
         values_source: "SELECT code FROM regions"
 ```
 
+## Dropping an Iceberg table (both modes)
+
+`coldfront.drop_iceberg_table()` removes the Iceberg table backing a
+registered relation. It is the only sanctioned way to do so: a plain
+`DROP TABLE` or `DROP VIEW` on a registered relation stays blocked,
+because it would leave the cold tier behind with nothing pointing at it.
+
+The call takes the schema, the table, and an explicit purge decision:
+
+```sql
+-- drop the catalog entry and delete the stored objects
+SELECT coldfront.drop_iceberg_table('public', 'events', true);
+
+-- drop the catalog entry and leave the objects in the object store
+SELECT coldfront.drop_iceberg_table('public', 'events', false);
+```
+
+What remains afterwards depends on the mode, and the call reports which
+path it took:
+
+- in decoupled mode the Iceberg table is the whole relation, so nothing
+  remains in PostgreSQL.
+- in tiered mode the Iceberg table is the cold tier, so the cold tier is
+  removed and the hot table returns under the relation's own name, as an
+  ordinary partitioned table holding the data that had not yet aged out.
+
+In tiered mode the call also deletes the table's `partition_config` row,
+which stops the archiver from tiering it again on the next run.
+
+There is no default for the purge argument, because the two outcomes are
+irreversible in opposite directions. Passing `true` deletes the Parquet
+and metadata objects, which for the cold tier are the only copy of that
+data. Passing `false` keeps those objects but removes the catalog entry
+that ColdFront would need to reach them again, so nothing reclaims them
+afterwards; use it when another system is taking ownership of the files.
+
+ColdFront has no guard of its own against dropping the wrong table. The
+preventive control lives in Lakekeeper: table protection has to be enabled
+manually, per table, and a protected table cannot be dropped at all,
+whether or not purge is requested. This function cannot override a hold.
+
+Deletion is not instantaneous. The catalog entry disappears with the
+call, and Lakekeeper's own background queue removes the objects shortly
+afterwards, so a listing taken immediately after the call can still show
+them.
+
 ## Managing partitioned tables (CLI)
 
 ColdFront splits configuration into two kinds. **Connection** config -
@@ -549,7 +595,7 @@ The following PostgreSQL column types are supported:
 `bigint` · `integer` · `smallint` · `real` · `double precision` ·
 `boolean` · `timestamp with time zone` · `timestamp without time zone` ·
 `date` · `time without time zone` · `uuid` · `text` · `varchar(N)` ·
-`char(N)` · `bytea` · `oid` · `numeric(P,S)` (P ≤ 38) · `jsonb` / `json` ·
+`char(N)` · `bytea` · `numeric(P,S)` (P ≤ 38) · `jsonb` / `json` ·
 `interval`
 
 Anything else (unbounded `numeric`, `xml`, `tsvector`, range/multirange
@@ -591,11 +637,11 @@ query skips DuckDB entirely. Such a read surfaces `data` as native
 cold-only, or reach the view through a join or sub-query stay in DuckDB,
 where the limits above apply.
 
-`inet`/`cidr` are **not supported**: pg_duckdb cannot process PG `inet`
-(Oid 869) in any Iceberg-backed query, and every cross-tier read is
-planned by pg_duckdb - so no cast makes them readable. Store IP data as
-`text` (you can still index/compare it; cast to `inet` in your own
-queries on the hot side only if needed).
+`inet`/`cidr`/`oid` are **not supported**: pg_duckdb cannot process them
+(`inet` Oid 869, `oid` Oid 26) in any Iceberg-backed query, and every
+cross-tier read is planned by pg_duckdb - so no cast makes them readable.
+Store IP data as `text` and `oid` values as `bigint` (you can still
+index/compare them; cast on the hot side only if needed).
 
 ## Gotchas
 

@@ -105,6 +105,36 @@ storage_yaml() {
     fi
 }
 
+# hot_days — the hot_period, in days, that pins the tier cutoff at the start of
+# last month: everything older than that month is cold, the last two months are
+# hot. Every story that wants that fixed, calendar-independent cutoff uses this
+# rather than inventing a literal.
+hot_days() { echo $(( ( $(date -u +%s) - $(date -u -d "$(date -u +%Y-%m-01) -1 month" +%s) ) / 86400 )); }
+
+# archive_only — run the archiver with ONLY the partition_config rows matching a
+# keep predicate enabled, then restore the rows it disabled. The archiver takes
+# its table set from coldfront.partition_config, never from the YAML
+# (cmd/archiver/main.go: "loaded N table(s) from coldfront.partition_config"), so
+# a per-story config file isolates connection settings but NOT the work list.
+# Without this, a story asserting "the archiver rejected my bad table" can pass
+# on an unrelated table's failure. Only rows this call disabled are re-enabled,
+# so a table another story deliberately left disabled stays that way.
+archive_only() {
+    local keep="$1" cfg="$2" log="$3" others rc=0
+    # Truncated, not appended: /tmp outlives a journey run, so a rejection grep
+    # could otherwise match a previous run's output in the same file.
+    : >"$log"
+    others=$(q "$HOST" "SELECT string_agg(format('(%L,%L)', schema_name, table_name), ',')
+                          FROM coldfront.partition_config
+                         WHERE enabled AND NOT ($keep);")
+    [ -n "$others" ] && q "$HOST" "UPDATE coldfront.partition_config SET enabled=false
+                                    WHERE (schema_name,table_name) IN ($others);" >/dev/null
+    "$ARCHIVER" --config "$cfg" >>"$log" 2>&1 || rc=$?
+    [ -n "$others" ] && q "$HOST" "UPDATE coldfront.partition_config SET enabled=true
+                                    WHERE (schema_name,table_name) IN ($others);" >/dev/null
+    return $rc
+}
+
 step "JOURNEY  host=$HOST  mode=$MODE  mesh=$MESH  standby=${STANDBY:-none}"
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -473,7 +503,7 @@ VALUES (date_trunc('month',now()) - interval '1 month' + interval '9 days', 42, 
 EOSQL
     # Same fixed-cutoff pin as events (cutoff = start of now-1mo): typed's m4
     # partition cold, m1 hot, deterministically.
-    local ret_days=$(( ( $(date -u +%s) - $(date -u -d "$(date -u +%Y-%m-01) -1 month" +%s) ) / 86400 ))
+    local ret_days; ret_days=$(hot_days)
     cat > /tmp/journey-typed.yaml <<EOF
 postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
 iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog" }
@@ -524,11 +554,15 @@ EOSQL
 )
     assert_eq "cold-INSERT-via-trigger bytea stored natively (2 bytes)" "2" "$(extract COLDINS_LEN "$CI")"
 
-    # inet/cidr are rejected at provisioning — no cast makes them readable
+    # inet/cidr/oid are rejected at provisioning: no cast makes them readable
     # through pg_duckdb once the table is Iceberg-backed. Match the specific
     # rejection text, not just the type name (which the input itself contains).
     local IE; IE=$(q_may "$HOST" "SELECT coldfront.create_iceberg_table('public','ip_reject','[{\"name\":\"a\",\"type\":\"inet\"}]'::jsonb);")
     assert_contains "inet rejected at provisioning" "store IP data as text" "$IE"
+    # oid archives but its column is unreadable through the pg_duckdb-planned
+    # view after cutover, so it is rejected up front like inet; use bigint.
+    local OE; OE=$(q_may "$HOST" "SELECT coldfront.create_iceberg_table('public','oid_reject','[{\"name\":\"a\",\"type\":\"oid\"}]'::jsonb);")
+    assert_contains "oid rejected at provisioning" "oid values as bigint" "$OE"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -1512,7 +1546,7 @@ INSERT INTO regional (region, ts, status, data) SELECT 'us', date_trunc('month',
 EOSQL
     assert_eq "2-level seeded 420 rows" "420" "$(q "$HOST" "SELECT count(*) FROM public.regional;")"
 
-    local ret_days; ret_days=$(( ( $(date -u +%s) - $(date -u -d "$(date -u +%Y-%m-01) -1 month" +%s) ) / 86400 ))  # cutoff = start of now-1mo
+    local ret_days; ret_days=$(hot_days)  # cutoff = start of now-1mo
     cat > /tmp/journey-tl.yaml <<EOF
 postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
 iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog" }
@@ -1577,7 +1611,7 @@ story_fk_constraint() {
     step "FK: PostgreSQL enforces on the hot tier; the cold tier has no FKs"
 
     local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
-    local ret_days; ret_days=$(( ( $(date -u +%s) - $(date -u -d "$(date -u +%Y-%m-01) -1 month" +%s) ) / 86400 ))
+    local ret_days; ret_days=$(hot_days)
 
     # Reference table + a partitioned table whose PK is (id, ts) (the partition
     # column must be in the PK) plus an outbound FK on category_id. The FK is
@@ -1738,7 +1772,7 @@ story_archiver_rollback() {
     trap _rb_cleanup RETURN
 
     local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
-    local ret_days; ret_days=$(( ( $(date -u +%s) - $(date -u -d "$(date -u +%Y-%m-01) -1 month" +%s) ) / 86400 ))
+    local ret_days; ret_days=$(hot_days)
 
     # Partitioned table with one cold partition (3 months ago) and one hot partition (current month).
     qf "$HOST" <<'EOSQL' >/dev/null
@@ -1937,7 +1971,7 @@ INSERT INTO cli_events (ts, v) SELECT date_trunc('month',now()) - interval '1 mo
 -- partition key, so "PK doesn't cover the key" is impossible to construct.)
 CREATE TABLE IF NOT EXISTS cli_nopk (id bigint, ts timestamptz NOT NULL) PARTITION BY RANGE (ts);
 EOSQL
-    local ret_days; ret_days=$(( ( $(date -u +%s) - $(date -u -d "$(date -u +%Y-%m-01) -1 month" +%s) ) / 86400 ))  # tier m3, keep m1
+    local ret_days; ret_days=$(hot_days)  # tier m3, keep m1
 
     # register (tiered) — validates the PK, INSERTs the row.
     if "$ARCHIVER" register --config /tmp/journey-archiver.yaml --table cli_events \
@@ -2024,6 +2058,94 @@ EOF
     # export round-trips the managed set to reviewable YAML.
     "$ARCHIVER" export --config /tmp/journey-conn.yaml >/tmp/journey-export.log 2>&1
     if grep -q "source_table: cli_events" /tmp/journey-export.log; then pass "export emits cli_events as YAML"; else fail "export missing cli_events"; tail -5 /tmp/journey-export.log; fi
+
+    # TC-118: archiver.tables in YAML is ignored at runtime — the archiver always
+    # resolves its table set from coldfront.partition_config regardless of what
+    # archiver.tables says in the config file.
+    cat > /tmp/journey-yaml-tables.yaml <<EOYAML
+postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
+iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog", namespace: "default" }
+$(storage_yaml)
+archiver:
+  tables:
+    - source_table: bogus_table_yaml
+      partition_period: monthly
+      hot_period: "1 month"
+      retention_period: "2 years"
+EOYAML
+    if "$ARCHIVER" --config /tmp/journey-yaml-tables.yaml >/tmp/journey-yaml-tables.log 2>&1; then
+        pass "TC-118: archiver ran with stale archiver.tables block in YAML"
+    else
+        fail "TC-118: archiver failed — see /tmp/journey-yaml-tables.log"; tail -8 /tmp/journey-yaml-tables.log
+    fi
+    if grep -q "from coldfront.partition_config" /tmp/journey-yaml-tables.log; then
+        pass "TC-118: archiver drove off partition_config (YAML archiver.tables ignored)"
+    else
+        fail "TC-118: archiver did not load from partition_config"; tail -5 /tmp/journey-yaml-tables.log
+    fi
+    if grep -qi "bogus_table_yaml" /tmp/journey-yaml-tables.log; then
+        fail "TC-118: archiver processed the YAML-only table (should be ignored)"
+    else
+        pass "TC-118: YAML archiver.tables block was not processed"
+    fi
+
+    # TC-119: export, delete the row, then re-import the EXPORTED archiver.tables
+    # to restore it. export omits connection config (per-node), so wrap the real
+    # exported block with a DSN before importing. import upserts (ON CONFLICT DO
+    # UPDATE), so the rows still present are no-ops and cli_events is restored from
+    # its exported entry, validating the serialization a hand-written YAML wouldn't.
+    "$ARCHIVER" export --config /tmp/journey-conn.yaml >/tmp/journey-export.yaml 2>&1
+    if grep -q "source_table: cli_events" /tmp/journey-export.yaml; then
+        pass "TC-119: export produced YAML with cli_events"
+    else
+        fail "TC-119: export missing cli_events"; tail -3 /tmp/journey-export.yaml
+    fi
+    cat > /tmp/journey-roundtrip.yaml <<EOF
+postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
+iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog" }
+$(storage_yaml)
+EOF
+    cat /tmp/journey-export.yaml >>/tmp/journey-roundtrip.yaml
+    # Snapshot the serialized config values before deletion; the round-trip must
+    # restore them exactly, not merely recreate the row (value fidelity, not just
+    # a row-count check).
+    local cfg_sig_before
+    cfg_sig_before=$(q "$HOST" "SELECT partition_period::text||'|'||coalesce(hot_period::text,'NULL')||'|'||coalesce(retention_period::text,'NULL')||'|'||enabled::text FROM coldfront.partition_config WHERE schema_name='public' AND table_name='cli_events';")
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE schema_name='public' AND table_name='cli_events';" >/dev/null
+    assert_eq "TC-119: cli_events deleted from partition_config" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='cli_events';")"
+    if "$ARCHIVER" import --config /tmp/journey-roundtrip.yaml >/tmp/journey-roundtrip.log 2>&1; then
+        pass "TC-119: re-import of exported artifact succeeded"
+    else
+        fail "TC-119: import failed (see /tmp/journey-roundtrip.log)"; tail -5 /tmp/journey-roundtrip.log
+    fi
+    assert_eq "TC-119: cli_events row restored in partition_config" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='cli_events';")"
+    local cfg_sig_after
+    cfg_sig_after=$(q "$HOST" "SELECT partition_period::text||'|'||coalesce(hot_period::text,'NULL')||'|'||coalesce(retention_period::text,'NULL')||'|'||enabled::text FROM coldfront.partition_config WHERE schema_name='public' AND table_name='cli_events';")
+    assert_eq "TC-119: restored values match pre-deletion snapshot (period|hot|retention|enabled)" \
+        "$cfg_sig_before" "$cfg_sig_after"
+
+    # TC-120: set writes to partition_config only — the YAML config file is never
+    # touched. Capture a checksum before, run set, then verify both the DB
+    # change and the unchanged file.
+    local yaml_cksum; yaml_cksum=$(md5sum /tmp/journey-conn.yaml | awk '{print $1}')
+    if "$ARCHIVER" set --config /tmp/journey-conn.yaml --table cli_events --hot-period "45 days" >/tmp/journey-setf.log 2>&1; then
+        pass "TC-120: set --hot-period succeeded"
+    else
+        fail "TC-120: set failed — see /tmp/journey-setf.log"; tail -3 /tmp/journey-setf.log
+    fi
+    local hot_val; hot_val=$(q "$HOST" "SELECT hot_period FROM coldfront.partition_config WHERE schema_name='public' AND table_name='cli_events';")
+    if echo "$hot_val" | grep -qi "45"; then
+        pass "TC-120: partition_config.hot_period updated to 45 days"
+    else
+        fail "TC-120: partition_config.hot_period not updated (got: $hot_val)"
+    fi
+    if [ "$(md5sum /tmp/journey-conn.yaml | awk '{print $1}')" = "$yaml_cksum" ]; then
+        pass "TC-120: YAML file unchanged by set"
+    else
+        fail "TC-120: set modified the YAML file (it must not)"
+    fi
 }
 
 # idmode_check <label> <table> <coltype> <id-default> <id-scheme> — provision a
@@ -2274,6 +2396,1223 @@ story_app_privilege() {
     fi
 }
 
+# ───────────────────────────────────────────────────────────────────────────
+# Story — TC-022: a deliberately wrong S3 endpoint causes Phase 2 to fail.
+# The archiver connects to Postgres and Lakekeeper fine (phases 0-1) but the
+# bulk-export (phase 2) can't reach the object store and exits non-zero with
+# a connection error naming the bad host. Skipped for non-s3 backends where
+# the static-endpoint knob isn't meaningful.
+# ───────────────────────────────────────────────────────────────────────────
+story_wrong_s3_endpoint() {
+    step "TC-022: wrong S3 endpoint → archiver Phase 2 fails with connection error"
+    if [ "$BACKEND" != s3 ]; then
+        note "TC-022: requires s3 backend (current: $BACKEND) — skipped"; return
+    fi
+    qf "$HOST" <<'EOSQL' >/dev/null
+SET search_path = public;
+CREATE TABLE IF NOT EXISTS wrong_ep_tbl (
+    id bigint GENERATED ALWAYS AS IDENTITY,
+    ts timestamptz NOT NULL,
+    PRIMARY KEY (id, ts)
+) PARTITION BY RANGE (ts);
+DO $do$
+DECLARE m date;
+BEGIN
+    m := (date_trunc('month', now()) - interval '2 months')::date;
+    EXECUTE format('CREATE TABLE IF NOT EXISTS %I PARTITION OF wrong_ep_tbl FOR VALUES FROM (%L) TO (%L)',
+                   'wrong_ep_tbl_p_' || to_char(m, 'YYYY_MM'), m, (m + interval '1 month'));
+END $do$;
+INSERT INTO wrong_ep_tbl (ts)
+    SELECT date_trunc('month', now()) - interval '2 months' + interval '7 days' + (i * interval '1 hour')
+    FROM generate_series(1, 10) i;
+EOSQL
+    local ret_days; ret_days=$(hot_days)
+    if ! "$ARCHIVER" register --config /tmp/journey-archiver.yaml --table wrong_ep_tbl \
+            --period monthly --hot-period "${ret_days} days" >/tmp/journey-wrong-ep.log 2>&1; then
+        fail "TC-022: register wrong_ep_tbl — see /tmp/journey-wrong-ep.log"; tail -5 /tmp/journey-wrong-ep.log; return
+    fi
+    cat > /tmp/journey-wrong-ep.yaml <<EOF
+postgres:
+  dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
+iceberg:
+  warehouse: "${WAREHOUSE}"
+  lakekeeper_endpoint: "http://${LK_IP}:8181/catalog"
+  namespace: "default"
+s3:
+  endpoint: "wronghost:8333"
+  region: "us-east-1"
+  access_key: "admin"
+  secret_key: "adminsecret"
+EOF
+    if "$ARCHIVER" --config /tmp/journey-wrong-ep.yaml >>/tmp/journey-wrong-ep.log 2>&1; then
+        fail "TC-022: archiver should have failed with a bad S3 endpoint"
+    else
+        if grep -qi "wronghost" /tmp/journey-wrong-ep.log; then
+            pass "TC-022: archiver exited non-zero; Phase 2 failed (named bad host: wronghost)"
+        else
+            fail "TC-022: archiver failed but expected 'wronghost' in error"; tail -5 /tmp/journey-wrong-ep.log
+        fi
+    fi
+    # Clean up regardless of pass/fail so partition_config stays tidy for later stories.
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name='wrong_ep_tbl';" >/dev/null 2>&1
+    q "$HOST" "DROP TABLE IF EXISTS public.wrong_ep_tbl CASCADE;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story — TC-024: an empty (0-row) partition archives cleanly through all six
+# phases (0–5). The partition must be created in the PUBLIC schema with an
+# explicit prefix — the coldfront user's search_path defaults to
+# coldfront,public, so a bare CREATE TABLE lands in the coldfront schema and
+# the PK check (nspname='public') would find 0 primary-key columns.
+# ───────────────────────────────────────────────────────────────────────────
+story_empty_partition() {
+    step "TC-024: 0-row partition archives cleanly (all 6 phases, exit 0)"
+    # In mesh mode cleanupAlreadyArchived fans out DETACH CONCURRENTLY to Spock
+    # peers via their interface DSN; those hostnames are not resolvable from the
+    # archiver host in the journey config. Skip here — same reason as
+    # story_partitioner_fk_drop.
+    if [ "$MESH" = 1 ]; then
+        note "TC-024: skipping in mesh mode (cleanupAlreadyArchived peer detach requires resolvable peer DSNs)"
+        return
+    fi
+    # Create an empty partition for now-12mo in public schema. That month is well
+    # past the hot_period cutoff so the archiver picks it up as a cold partition.
+    local m12; m12=$(date -u -d "$(date -u +%Y-%m-01) -12 months" +%Y-%m-%d)
+    local m12_end; m12_end=$(date -u -d "$m12 +1 month" +%Y-%m-%d)
+    local pname; pname="events_p_$(date -u -d "$m12" +%Y_%m)"
+    q "$HOST" "CREATE TABLE IF NOT EXISTS public.${pname} PARTITION OF public._events FOR VALUES FROM ('${m12}') TO ('${m12_end}');" >/dev/null
+    assert_eq "TC-024: empty partition created (0 rows)" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM public.${pname};")"
+    if "$ARCHIVER" --config /tmp/journey-archiver.yaml >/tmp/journey-empty-part.log 2>&1; then
+        pass "TC-024: archiver completed with empty partition (exit 0)"
+    else
+        fail "TC-024: archiver failed on empty partition — see /tmp/journey-empty-part.log"; tail -8 /tmp/journey-empty-part.log
+    fi
+    # Phase 5 drops the partition from PG after cutover.
+    assert_eq "TC-024: empty partition archived and dropped from PG" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname='${pname}' AND relnamespace='public'::regnamespace;")"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story — TC-040: renaming the hot table (_events → _events_renamed) triggers
+# the coldfront DDL hook, which updates coldfront.tiered_views.hot_table and
+# rebuilds the transparent UNION-ALL view. DML via the view must route to the
+# renamed table without error, and the table rename back to _events restores
+# the registry. Leaves the table and registry in the original state.
+# ───────────────────────────────────────────────────────────────────────────
+story_rename_hot_table() {
+    step "TC-040: rename hot table updates registry; DML via view works after rename"
+    assert_eq "precondition: events is a view" "v" \
+        "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='events' AND relnamespace='public'::regnamespace;")"
+    assert_eq "precondition: _events is partitioned" "p" \
+        "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='_events' AND relnamespace='public'::regnamespace;")"
+
+    q "$HOST" "ALTER TABLE public._events RENAME TO _events_renamed;" >/dev/null
+    local hot_renamed; hot_renamed=$(q "$HOST" "SELECT hot_table FROM coldfront.tiered_views WHERE schema_name='public' AND relname='events';")
+    assert_contains "TC-040: tiered_views.hot_table updated to _events_renamed" "_events_renamed" "$hot_renamed"
+
+    # INSERT via the view must route to the renamed hot table. Use a timestamp
+    # in the CURRENT month (5 days in) — this partition was premade by
+    # story_partitioner_after_swap and is unambiguously above any cutoff.
+    q "$HOST" "INSERT INTO events (ts, status, data) VALUES (date_trunc('month',now()) + interval '5 days', 'rename_chk', '{}');" >/dev/null
+    assert_eq "TC-040: row landed in _events_renamed after hot table rename" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM public._events_renamed WHERE status='rename_chk';")"
+    q "$HOST" "DELETE FROM public._events_renamed WHERE status='rename_chk';" >/dev/null
+
+    # Rename back so later stories find _events as expected.
+    q "$HOST" "ALTER TABLE public._events_renamed RENAME TO _events;" >/dev/null
+    local hot_restored; hot_restored=$(q "$HOST" "SELECT hot_table FROM coldfront.tiered_views WHERE schema_name='public' AND relname='events';")
+    assert_eq "TC-040: tiered_views.hot_table restored to _events" "public._events" "$hot_restored"
+    pass "TC-040: hot table renamed and restored, registry updated both ways"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story — TC-052: partitioner set --retention updates the retention_period
+# field in partition_config. Uses an isolated schema so the shared events row
+# is not disturbed.
+# ───────────────────────────────────────────────────────────────────────────
+story_partitioner_set_retention() {
+    step "TC-052: partitioner set --retention updates partition_config"
+    local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
+    q "$HOST" "CREATE SCHEMA IF NOT EXISTS setret;
+               CREATE TABLE IF NOT EXISTS setret.logs (id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL, PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);" >/dev/null
+    if ! "$PARTITIONER" register --dsn "$dsn" --schema setret --table logs \
+            --period monthly --retention "12 months" >/tmp/journey-setret.log 2>&1; then
+        fail "TC-052: register setret.logs — see /tmp/journey-setret.log"; tail -5 /tmp/journey-setret.log
+        q "$HOST" "DROP SCHEMA setret CASCADE;" >/dev/null 2>&1; return
+    fi
+    assert_eq "TC-052: initial retention is 1 year" "1 year" \
+        "$(q "$HOST" "SELECT retention_period::text FROM coldfront.partition_config WHERE schema_name='setret' AND table_name='logs';")"
+    if "$PARTITIONER" set --dsn "$dsn" --schema setret --table logs \
+            --retention "24 months" >>/tmp/journey-setret.log 2>&1; then
+        pass "TC-052: partitioner set --retention succeeded"
+    else
+        fail "TC-052: partitioner set --retention failed — see /tmp/journey-setret.log"; tail -5 /tmp/journey-setret.log
+    fi
+    assert_eq "TC-052: retention updated to 2 years" "2 years" \
+        "$(q "$HOST" "SELECT retention_period::text FROM coldfront.partition_config WHERE schema_name='setret' AND table_name='logs';")"
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE schema_name='setret'; DROP SCHEMA setret CASCADE;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story — TC-053: disabling a table in partition_config silently excludes it
+# from the archiver run (no [events] in the log, no "skipping" message). Re-
+# enabling it restores normal processing. The events table is used since it is
+# already tiered and its [events] log token is unambiguous.
+# ───────────────────────────────────────────────────────────────────────────
+story_partitioner_disable_enable() {
+    step "TC-053: disable silently excludes from archiver; enable restores it"
+    cat > /tmp/journey-disen.yaml <<EOF
+postgres:
+  dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
+iceberg:
+  warehouse: "${WAREHOUSE}"
+  lakekeeper_endpoint: "http://${LK_IP}:8181/catalog"
+  namespace: "default"
+$(storage_yaml)
+EOF
+    if "$ARCHIVER" set --config /tmp/journey-disen.yaml --table events --disable >/tmp/journey-disen.log 2>&1; then
+        pass "TC-053: archiver set --disable succeeded"
+    else
+        fail "TC-053: archiver set --disable failed — see /tmp/journey-disen.log"; tail -5 /tmp/journey-disen.log
+    fi
+    assert_eq "TC-053: events disabled in partition_config" "f" \
+        "$(q "$HOST" "SELECT enabled FROM coldfront.partition_config WHERE schema_name='public' AND table_name='events';")"
+    # Disabled run: fresh log so the grep sees only this run. No-op archiver runs
+    # may legitimately exit non-zero, so the run stays non-fatal (|| true); the log
+    # assertion, not the exit code, proves events was excluded.
+    "$ARCHIVER" --config /tmp/journey-disen.yaml >/tmp/journey-disen-off.log 2>&1 || true
+    if grep -q "\[events\]" /tmp/journey-disen-off.log; then
+        fail "TC-053: [events] appeared in archiver log while disabled (should be silently excluded)"
+    else
+        pass "TC-053: [events] absent from archiver log (silently excluded via WHERE enabled)"
+    fi
+
+    if "$ARCHIVER" set --config /tmp/journey-disen.yaml --table events --enable >/tmp/journey-disen-enable.log 2>&1; then
+        pass "TC-053: archiver set --enable succeeded"
+    else
+        fail "TC-053: archiver set --enable failed (see /tmp/journey-disen-enable.log)"; tail -5 /tmp/journey-disen-enable.log
+    fi
+    assert_eq "TC-053: events re-enabled in partition_config" "t" \
+        "$(q "$HOST" "SELECT enabled FROM coldfront.partition_config WHERE schema_name='public' AND table_name='events';")"
+    # Re-enabled run: fresh log (grep only this run); non-fatal, since no-op runs
+    # may legitimately exit non-zero.
+    "$ARCHIVER" --config /tmp/journey-disen.yaml >/tmp/journey-disen-on.log 2>&1 || true
+    if grep -q "\[events\]" /tmp/journey-disen-on.log; then
+        pass "TC-053: [events] present in archiver log after re-enable"
+    else
+        fail "TC-053: [events] absent from archiver log even after re-enable (see /tmp/journey-disen-on.log)"; tail -8 /tmp/journey-disen-on.log
+    fi
+    # Ensure events is enabled regardless of test outcome (safety net for later stories).
+    "$ARCHIVER" set --config /tmp/journey-disen.yaml --table events --enable >/dev/null 2>&1 || true
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story — TC-054: remove unregisters a table (deletes its partition_config row)
+# while leaving the table itself intact. Uses an isolated schema so the shared
+# partition_config is not permanently modified.
+# ───────────────────────────────────────────────────────────────────────────
+story_partitioner_remove() {
+    step "TC-054: remove unregisters a table; the table itself is left intact"
+    local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
+    q "$HOST" "CREATE SCHEMA IF NOT EXISTS rmtest;
+               CREATE TABLE IF NOT EXISTS rmtest.logs (id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL, PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);" >/dev/null
+    if ! "$PARTITIONER" register --dsn "$dsn" --schema rmtest --table logs \
+            --period monthly --retention "12 months" >/tmp/journey-rmtest.log 2>&1; then
+        fail "TC-054: register rmtest.logs — see /tmp/journey-rmtest.log"; tail -5 /tmp/journey-rmtest.log
+        q "$HOST" "DROP SCHEMA rmtest CASCADE;" >/dev/null 2>&1; return
+    fi
+    assert_eq "TC-054: row present before remove" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE schema_name='rmtest' AND table_name='logs';")"
+    if "$PARTITIONER" remove --dsn "$dsn" --schema rmtest --table logs >>/tmp/journey-rmtest.log 2>&1; then
+        pass "TC-054: remove succeeded"
+    else
+        fail "TC-054: remove failed — see /tmp/journey-rmtest.log"; tail -5 /tmp/journey-rmtest.log
+    fi
+    assert_eq "TC-054: partition_config row gone after remove" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE schema_name='rmtest' AND table_name='logs';")"
+    assert_eq "TC-054: table still exists after remove" "p" \
+        "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='logs' AND relnamespace='rmtest'::regnamespace;")"
+    q "$HOST" "DROP SCHEMA rmtest CASCADE;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story — TC-071: a PARTITION BY RANGE (col1, col2) table is rejected at
+# archive time with a clear error. The PK check at register time passes (the
+# PK covers every partition-key column), but the archiver's single scalar
+# watermark cannot express independent per-dimension thresholds, so it rejects
+# composite partition keys before attempting any Iceberg work.
+# ───────────────────────────────────────────────────────────────────────────
+story_composite_key_rejected() {
+    step "TC-071: composite partition key RANGE (region, ts) rejected at archive time"
+    q "$HOST" "CREATE TABLE IF NOT EXISTS public.composite_part (
+        id bigint, region text NOT NULL, ts timestamptz NOT NULL,
+        PRIMARY KEY (id, region, ts)
+    ) PARTITION BY RANGE (region, ts);" >/dev/null
+    # register succeeds: validatePKSuperset passes because the PK covers all
+    # partition-key columns. The composite-key guard fires later in the archiver.
+    if "$ARCHIVER" register --config /tmp/journey-archiver.yaml --table composite_part \
+            --period monthly --hot-period "1 month" --retention "5 years" >/tmp/journey-cp-reg.log 2>&1; then
+        pass "TC-071: register composite_part succeeded (PK covers partition key)"
+    else
+        fail "TC-071: register composite_part failed unexpectedly — see /tmp/journey-cp-reg.log"
+        tail -3 /tmp/journey-cp-reg.log
+        q "$HOST" "DROP TABLE IF EXISTS public.composite_part;" >/dev/null 2>&1; return
+    fi
+    assert_eq "TC-071: composite_part row written to partition_config" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='composite_part';")"
+    # Archive run: detectPartitionColumns sees two columns and exits non-zero
+    # before any Iceberg or S3 work is attempted.
+    if "$ARCHIVER" --config /tmp/journey-archiver.yaml >/tmp/journey-cp.log 2>&1; then
+        fail "TC-071: archiver should have rejected the composite partition key"
+    else
+        if grep -qi "multi-column partition keys are not supported" /tmp/journey-cp.log; then
+            pass "TC-071: archiver rejects composite partition key (multi-column guard)"
+        else
+            fail "TC-071: archiver failed but wrong reason"; tail -5 /tmp/journey-cp.log
+        fi
+    fi
+    # Clean up so partition_config stays tidy for any subsequent stories.
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name='composite_part';" >/dev/null 2>&1
+    q "$HOST" "DROP TABLE IF EXISTS public.composite_part;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story — TC-043: cold data confirmed in Iceberg via metadata probe.
+# After archival, iceberg_metadata() must report at least one Parquet data file
+# for the events Iceberg table. iceberg_metadata() resolves its argument as a
+# filesystem path, so a REST-catalog table cannot be addressed by name: the
+# table's metadata.json location comes from Lakekeeper first, exactly as
+# docs/walkthrough.md does it. This is the only story that reads the cold tier
+# through the object store rather than through the view, so it must never fall
+# back to a row count — that would just re-assert story_reads.
+# ───────────────────────────────────────────────────────────────────────────
+story_iceberg_metadata() {
+    step "TC-043: cold data confirmed in Iceberg via metadata (Parquet file probe)"
+    local ice_tbl ns tbl wh meta cnt
+    ice_tbl=$(q "$HOST" "SELECT iceberg_table FROM coldfront.tiered_views WHERE schema_name='public' AND relname='events' AND NOT is_iceberg_only LIMIT 1;")
+    if [ -z "$ice_tbl" ]; then
+        fail "TC-043: events not found in tiered_views — story_provision_tiered must run first"; return
+    fi
+    # iceberg_table is stored quoted ("ice"."ns"."tbl"); the catalog API wants
+    # the two bare parts.
+    ns=${ice_tbl//\"/}; ns=${ns#ice.}; tbl=${ns##*.}; ns=${ns%.*}
+    wh=$(curl -s "http://${LK_IP}:8181/management/v1/warehouse" \
+           | grep -oE '"warehouse-id":"[^"]+"' | head -1 | cut -d'"' -f4)
+    [ -n "$wh" ] || { fail "TC-043: could not resolve the warehouse id"; return; }
+    meta=$(curl -s "http://${LK_IP}:8181/catalog/v1/${wh}/namespaces/${ns}/tables/${tbl}" \
+             | grep -oE '"metadata-location":"[^"]+"' | head -1 | cut -d'"' -f4)
+    [ -n "$meta" ] || { fail "TC-043: no metadata-location for ${ns}.${tbl} in the catalog"; return; }
+    cnt=$(q "$HOST" "SELECT coldfront.ensure_attached(); SELECT r['n'] FROM duckdb.query('SELECT count(*) AS n FROM iceberg_metadata(''${meta}'') WHERE file_path LIKE ''%.parquet''') AS t(r);" | tail -1)
+    assert_gt "TC-043: Parquet data files registered in the events snapshot" "0" "$cnt"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story — TC-058: storage credentials must not appear in pg_dump output.
+# coldfront.storage_secret is UNLOGGED so pg_dump skips its data by default,
+# keeping S3/GCS/Azure keys out of logical backups.
+# ───────────────────────────────────────────────────────────────────────────
+story_pg_dump_no_secrets() {
+    step "TC-058: storage secret not exposed in pg_dump output"
+    local dump leaked=0
+    dump=$(docker exec -e PGUSER="$CF_DBUSER" "$HOST" pg_dump -U "$CF_DBUSER" -d "$CF_DBNAME" 2>&1)
+    # Positive control first. A pg_dump that errored produces no output, matches
+    # no secret, and would otherwise report a clean bill of health.
+    assert_contains "TC-058: pg_dump produced a real dump" "CREATE EXTENSION" "$dump"
+    # -F throughout: real S3 secrets contain regex metacharacters.
+    echo "$dump" | grep -qF "adminsecret"                             && leaked=1
+    [ -n "$GCS_SECRET" ]  && echo "$dump" | grep -qF "$GCS_SECRET"  && leaked=1
+    [ -n "$AWS_SECRET" ]  && echo "$dump" | grep -qF "$AWS_SECRET"  && leaked=1
+    [ -n "$AZURE_CONN" ]  && echo "$dump" | grep -qF "$AZURE_CONN"  && leaked=1
+    if [ "$leaked" -eq 1 ]; then
+        fail "TC-058: raw storage credentials found in pg_dump output"
+    else
+        pass "TC-058: storage credentials absent from pg_dump output"
+    fi
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story — TC-059: Lakekeeper rejects warehouse creation with wrong S3 creds.
+# Only meaningful for the s3 backend where SeaweedFS is the credential target.
+# ───────────────────────────────────────────────────────────────────────────
+story_wrong_lakekeeper_creds() {
+    step "TC-059: Lakekeeper rejects warehouse with wrong S3 credentials"
+    [ "$BACKEND" = s3 ] || { note "TC-059: non-S3 backend; skipping Lakekeeper credential check"; return; }
+    local http_code
+    http_code=$(curl -s -o /tmp/journey-badcreds.json -w "%{http_code}" \
+        -X POST "http://${LK_IP}:8181/management/v1/warehouse" \
+        -H "Content-Type: application/json" \
+        -d "{\"name\":\"wh_bad_$$\",\"storage-profile\":{\"type\":\"s3\",\"bucket\":\"iceberg\",\"flavor\":\"s3-compat\",\"endpoint\":\"http://${SW_IP}:8333\",\"path-style-access\":true,\"region\":\"us-east-1\",\"sts-enabled\":false},\"storage-credential\":{\"type\":\"s3\",\"credential-type\":\"access-key\",\"aws-access-key-id\":\"badkey\",\"aws-secret-access-key\":\"badsecret\"}}")
+    if [ "$http_code" = "400" ] || [ "$http_code" = "403" ] || [ "$http_code" = "422" ]; then
+        pass "TC-059: Lakekeeper rejected bad credentials (HTTP ${http_code})"
+    else
+        fail "TC-059: expected 400/403/422, got HTTP ${http_code}"; head -5 /tmp/journey-badcreds.json 2>/dev/null || true
+        # It was created after all: take it back out so later stories enumerating
+        # warehouses do not trip over one built on credentials that do not work.
+        curl -s -o /dev/null -X DELETE "http://${LK_IP}:8181/management/v1/warehouse/$(
+            curl -s "http://${LK_IP}:8181/management/v1/warehouse" \
+              | grep -oE "\"id\":\"[^\"]+\",\"name\":\"wh_bad_$$\"" | grep -oE '[0-9a-f-]{36}' | head -1)"
+    fi
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story — TC-062: SeaweedFS restart — the cold tier is re-served after the
+# object store bounces. Only meaningful for the s3 backend (SeaweedFS is the
+# S3-compat target). Scope: the compose file gives SeaweedFS no volume for
+# -dir=/data, so this covers restart of the same container, not durability
+# across container replacement.
+# ───────────────────────────────────────────────────────────────────────────
+story_seaweedfs_restart() {
+    step "TC-062: SeaweedFS restart — cold data survives container restart"
+    [ "$BACKEND" = s3 ] || { note "TC-062: non-S3 backend; skipping SeaweedFS restart"; return; }
+    # Derive the SeaweedFS container name by matching SW_IP in docker inspect.
+    local sw_container=""
+    while IFS= read -r cid; do
+        local ip; ip=$(docker inspect "$cid" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null)
+        if [ "$ip" = "$SW_IP" ]; then
+            sw_container=$(docker inspect "$cid" --format '{{.Name}}' 2>/dev/null | tr -d '/'); break
+        fi
+    done < <(docker ps -q 2>/dev/null)
+    if [ -z "$sw_container" ]; then
+        note "TC-062: cannot identify SeaweedFS container for IP $SW_IP — skipping"; return
+    fi
+    local before; before=$(q "$HOST" "SELECT count(*) FROM events WHERE ts >= date_trunc('month',now()) - interval '3 months' AND ts < date_trunc('month',now()) - interval '1 month';")
+    assert_gt "TC-062: cold rows present before restart" "0" "$before"
+    docker restart "$sw_container" >/dev/null
+    local i=0
+    until curl -s -o /dev/null --max-time 2 "http://${SW_IP}:8333/" 2>/dev/null; do
+        i=$((i + 1)); [ "$i" -gt 60 ] && { fail "TC-062: SeaweedFS did not come back after restart"; return; }; sleep 2
+    done
+    sleep 3
+    local after; after=$(q "$HOST" "SELECT count(*) FROM events WHERE ts >= date_trunc('month',now()) - interval '3 months' AND ts < date_trunc('month',now()) - interval '1 month';")
+    assert_eq "TC-062: cold row count unchanged after SeaweedFS restart" "$before" "$after"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story — TC-063: PostgreSQL restart — coldfront + pg_duckdb reload correctly;
+# the DuckDB storage secret is reloaded from persistent storage at init time
+# so cold reads work without any manual re-configuration after restart.
+# ───────────────────────────────────────────────────────────────────────────
+story_pg_restart() {
+    step "TC-063: PostgreSQL restart — extensions reload; DuckDB secret persists; cold reads work"
+    # Skip in mesh: a node restart mid-journey churns Spock replication.
+    if [ "$MESH" = 1 ]; then note "TC-063: skipping in mesh mode (node restart churns Spock)"; return; fi
+    local before; before=$(q "$HOST" "SELECT count(*) FROM events WHERE ts >= date_trunc('month',now()) - interval '3 months' AND ts < date_trunc('month',now()) - interval '1 month';")
+    assert_gt "TC-063: cold rows present before restart" "0" "$before"
+    docker restart "$HOST" >/dev/null
+    local i=0
+    until docker exec -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" "$HOST" "$CF_PSQL" -tAc 'SELECT 1' >/dev/null 2>&1; do
+        i=$((i + 1)); [ "$i" -gt 60 ] && { fail "TC-063: postgres did not come back after restart"; return; }; sleep 1
+    done
+    assert_eq "TC-063: both extensions present after restart" "2" \
+        "$(q "$HOST" "SELECT count(*) FROM pg_extension WHERE extname IN ('pg_duckdb','coldfront');")"
+    assert_eq "TC-063: storage secret row persists after restart" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.storage_secret;")"
+    local after; after=$(q "$HOST" "SELECT count(*) FROM events WHERE ts >= date_trunc('month',now()) - interval '3 months' AND ts < date_trunc('month',now()) - interval '1 month';")
+    assert_eq "TC-063: cold row count unchanged after PG restart" "$before" "$after"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story — TC-066: partition column — timestamp without time zone.
+# ColdFront maps PG 'timestamp' to DuckDB TIMESTAMP (no tz). The partition
+# bounds are plain TIMESTAMP literals; the archiver must accept this type,
+# archive the cold partition, and return the row via the unified view.
+# ───────────────────────────────────────────────────────────────────────────
+story_partition_col_timestamp() {
+    step "TC-066: partition column — timestamp without time zone"
+    qf "$HOST" <<'EOSQL' >/dev/null
+SET search_path = public;
+CREATE TABLE IF NOT EXISTS tc066_ntz (
+    id         bigint NOT NULL,
+    created_at timestamp NOT NULL,
+    val        text,
+    PRIMARY KEY (id, created_at)
+) PARTITION BY RANGE (created_at);
+DO $do$
+DECLARE m date;
+BEGIN
+  m := (date_trunc('month', now()) - interval '2 months')::date;
+  EXECUTE format(
+    'CREATE TABLE IF NOT EXISTS public.%I PARTITION OF public.tc066_ntz FOR VALUES FROM (%L) TO (%L)',
+    'tc066_ntz_p_' || to_char(m, 'YYYY_MM'), m, (m + interval '1 month'));
+END $do$;
+INSERT INTO public.tc066_ntz (id, created_at, val)
+VALUES (1, (date_trunc('month', now()) - interval '2 months' + interval '5 days')::timestamp, 'cold_ntz');
+EOSQL
+    local ret_days; ret_days=$(hot_days)
+    if "$ARCHIVER" register --config /tmp/journey-archiver.yaml --table tc066_ntz \
+            --period monthly --hot-period "${ret_days} days" >/tmp/journey-ntz.log 2>&1; then
+        pass "TC-066: register tc066_ntz succeeded (timestamp no-tz column accepted)"
+    else
+        fail "TC-066: register failed — see /tmp/journey-ntz.log"; tail -5 /tmp/journey-ntz.log
+        q "$HOST" "DROP TABLE IF EXISTS public.tc066_ntz CASCADE;" >/dev/null 2>&1; return
+    fi
+    if archive_only "schema_name='public' AND table_name='tc066_ntz'" /tmp/journey-archiver.yaml /tmp/journey-ntz.log; then
+        pass "TC-066: archiver archived timestamp (no tz) partition column"
+    else
+        fail "TC-066: archive failed — see /tmp/journey-ntz.log"; tail -5 /tmp/journey-ntz.log
+        q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name='tc066_ntz';" >/dev/null 2>&1
+        q "$HOST" "DROP TABLE IF EXISTS public.tc066_ntz CASCADE;" >/dev/null 2>&1; return
+    fi
+    assert_eq "TC-066: tc066_ntz is now a view" "v" \
+        "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='tc066_ntz' AND relnamespace='public'::regnamespace;")"
+    assert_eq "TC-066: cold row readable via unified view" "cold_ntz" \
+        "$(q "$HOST" "SELECT val FROM public.tc066_ntz WHERE created_at < date_trunc('month',now()) - interval '1 month' LIMIT 1;")"
+    # Clean up: tiered_view, watermark, view, underlying heap.
+    q "$HOST" "DELETE FROM coldfront.partition_config  WHERE table_name='tc066_ntz';"  >/dev/null 2>&1
+    q "$HOST" "DELETE FROM coldfront.tiered_views      WHERE relname='tc066_ntz';"     >/dev/null 2>&1
+    q "$HOST" "DELETE FROM coldfront.archive_watermark WHERE table_name='tc066_ntz';"  >/dev/null 2>&1
+    q "$HOST" "DROP VIEW  IF EXISTS public.tc066_ntz;" >/dev/null 2>&1
+    q "$HOST" "DROP TABLE IF EXISTS public._tc066_ntz CASCADE;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story — TC-067: partition column — date type.
+# PG 'date' maps to DuckDB DATE; the archiver must accept date-partitioned
+# tables and return the cold row via the unified view.
+# ───────────────────────────────────────────────────────────────────────────
+story_partition_col_date() {
+    step "TC-067: partition column — date type"
+    qf "$HOST" <<'EOSQL' >/dev/null
+SET search_path = public;
+CREATE TABLE IF NOT EXISTS tc067_date (
+    id         bigint NOT NULL,
+    order_date date NOT NULL,
+    val        text,
+    PRIMARY KEY (id, order_date)
+) PARTITION BY RANGE (order_date);
+DO $do$
+DECLARE m date;
+BEGIN
+  m := (date_trunc('month', now()) - interval '2 months')::date;
+  EXECUTE format(
+    'CREATE TABLE IF NOT EXISTS public.%I PARTITION OF public.tc067_date FOR VALUES FROM (%L) TO (%L)',
+    'tc067_date_p_' || to_char(m, 'YYYY_MM'), m, (m + interval '1 month'));
+END $do$;
+INSERT INTO public.tc067_date (id, order_date, val)
+VALUES (1, (date_trunc('month', now()) - interval '2 months' + interval '5 days')::date, 'cold_date');
+EOSQL
+    local ret_days; ret_days=$(hot_days)
+    if "$ARCHIVER" register --config /tmp/journey-archiver.yaml --table tc067_date \
+            --period monthly --hot-period "${ret_days} days" >/tmp/journey-datecol.log 2>&1; then
+        pass "TC-067: register tc067_date succeeded (date column accepted)"
+    else
+        fail "TC-067: register failed — see /tmp/journey-datecol.log"; tail -5 /tmp/journey-datecol.log
+        q "$HOST" "DROP TABLE IF EXISTS public.tc067_date CASCADE;" >/dev/null 2>&1; return
+    fi
+    if archive_only "schema_name='public' AND table_name='tc067_date'" /tmp/journey-archiver.yaml /tmp/journey-datecol.log; then
+        pass "TC-067: archiver archived date partition column"
+    else
+        fail "TC-067: archive failed — see /tmp/journey-datecol.log"; tail -5 /tmp/journey-datecol.log
+        q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name='tc067_date';" >/dev/null 2>&1
+        q "$HOST" "DROP TABLE IF EXISTS public.tc067_date CASCADE;" >/dev/null 2>&1; return
+    fi
+    assert_eq "TC-067: tc067_date is now a view" "v" \
+        "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='tc067_date' AND relnamespace='public'::regnamespace;")"
+    assert_eq "TC-067: cold row readable via unified view" "cold_date" \
+        "$(q "$HOST" "SELECT val FROM public.tc067_date WHERE order_date < (date_trunc('month',now()) - interval '1 month')::date LIMIT 1;")"
+    q "$HOST" "DELETE FROM coldfront.partition_config  WHERE table_name='tc067_date';"  >/dev/null 2>&1
+    q "$HOST" "DELETE FROM coldfront.tiered_views      WHERE relname='tc067_date';"     >/dev/null 2>&1
+    q "$HOST" "DELETE FROM coldfront.archive_watermark WHERE table_name='tc067_date';"  >/dev/null 2>&1
+    q "$HOST" "DROP VIEW  IF EXISTS public.tc067_date;" >/dev/null 2>&1
+    q "$HOST" "DROP TABLE IF EXISTS public._tc067_date CASCADE;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story — TC-070: partition column — unsupported type (text) rejected at
+# archive time. A RANGE table on a text column registers (no strategy check)
+# but the archiver cannot parse the text-valued bounds ("'a'" to "'n'") as a
+# timestamp or id, so it exits non-zero with a clear error.
+# ───────────────────────────────────────────────────────────────────────────
+story_partition_col_text_rejected() {
+    step "TC-070: text partition column accepted at register; rejected at archive time"
+    qf "$HOST" <<'EOSQL' >/dev/null
+CREATE TABLE IF NOT EXISTS public.tc070_textpart (
+    id       bigint NOT NULL,
+    category text   NOT NULL,
+    PRIMARY KEY (id, category)
+) PARTITION BY RANGE (category);
+CREATE TABLE IF NOT EXISTS public.tc070_textpart_a
+    PARTITION OF public.tc070_textpart FOR VALUES FROM ('a') TO ('n');
+INSERT INTO public.tc070_textpart VALUES (1, 'apple');
+EOSQL
+    if "$ARCHIVER" register --config /tmp/journey-archiver.yaml --table tc070_textpart \
+            --period monthly --hot-period "30 days" >/tmp/journey-textpart.log 2>&1; then
+        pass "TC-070: register text-partitioned table succeeded (no strategy check at register)"
+    else
+        note "TC-070: register rejected text partition column at register time (earlier than expected)"
+    fi
+    # The archive pass gets its own log so the rejection grep below cannot be
+    # satisfied by the register output above.
+    if archive_only "schema_name='public' AND table_name='tc070_textpart'" /tmp/journey-archiver.yaml /tmp/journey-textpart-arch.log; then
+        fail "TC-070: archiver should have rejected text partition column"
+    else
+        if grep -qi "cannot parse partition bound\|unsupported partition\|unsupported.*column\|not supported\|unrecognized\|parse.*bound" /tmp/journey-textpart-arch.log; then
+            pass "TC-070: archiver rejected text partition column at archive time"
+        else
+            fail "TC-070: archiver failed but unexpected reason — see /tmp/journey-textpart-arch.log"; tail -5 /tmp/journey-textpart-arch.log
+        fi
+    fi
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name='tc070_textpart';" >/dev/null 2>&1
+    q "$HOST" "DROP TABLE IF EXISTS public.tc070_textpart CASCADE;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story — TC-087/089/092/096/098/105: extended type round-trip.
+# Column types absent from story_types(): timestamp (no tz), time, char(N),
+# json and interval. TC-105 asserts all extended columns are non-null in the
+# cold row.
+#
+# No oid column here: pg_duckdb cannot process oid in an Iceberg-backed query,
+# so ColdFront rejects it at provisioning and story_types asserts that ("oid
+# values as bigint"). col_oid is a plain bigint, the documented workaround, and
+# is labelled as such.
+# ───────────────────────────────────────────────────────────────────────────
+story_types_extended() {
+    step "TC-087/089/092/096/098/105: extended type round-trip (timestamp,time,char,json,interval)"
+    qf "$HOST" <<'EOSQL' >/dev/null
+SET search_path = public;
+CREATE TABLE IF NOT EXISTS typed_ext (
+    id          bigint GENERATED ALWAYS AS IDENTITY,
+    ts          timestamptz NOT NULL,
+    col_ts_ntz  timestamp,
+    col_time    time,
+    col_char    char(10),
+    col_json    json,
+    col_interval interval,
+    col_oid_workaround bigint,
+    PRIMARY KEY (id, ts)
+) PARTITION BY RANGE (ts);
+DO $do$
+DECLARE m date;
+BEGIN
+  FOREACH m IN ARRAY ARRAY[(date_trunc('month',now()) - interval '4 months')::date,
+                           (date_trunc('month',now()) - interval '1 month')::date] LOOP
+    EXECUTE format('CREATE TABLE IF NOT EXISTS public.%I PARTITION OF public.typed_ext FOR VALUES FROM (%L) TO (%L)',
+                   'typed_ext_p_' || to_char(m, 'YYYY_MM'), m, (m + interval '1 month'));
+  END LOOP;
+END $do$;
+INSERT INTO public.typed_ext (ts, col_ts_ntz, col_time, col_char, col_json, col_interval, col_oid_workaround)
+VALUES (date_trunc('month',now()) - interval '4 months' + interval '14 days',
+        '2026-01-15 10:30:00'::timestamp, '10:30:00'::time, 'hello',
+        '{"key":"value"}'::json, '1 day 2 hours'::interval, 12345::bigint);
+INSERT INTO public.typed_ext (ts, col_ts_ntz, col_time, col_char, col_json, col_interval, col_oid_workaround)
+VALUES (date_trunc('month',now()) - interval '1 month' + interval '14 days',
+        '2026-01-15 10:30:00'::timestamp, '10:30:00'::time, 'hello',
+        '{"key":"value"}'::json, '1 day 2 hours'::interval, 12345::bigint);
+EOSQL
+    local ret_days; ret_days=$(hot_days)
+    cat > /tmp/journey-typed-ext.yaml <<EOF
+postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
+iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog" }
+$(storage_yaml)
+archiver: { tables: [ { source_table: typed_ext, partition_period: monthly, hot_period: "${ret_days} days" } ] }
+EOF
+    local _archived=0
+    if ! "$ARCHIVER" import --config /tmp/journey-typed-ext.yaml >/tmp/journey-typed-ext.log 2>&1; then
+        fail "import typed_ext — see /tmp/journey-typed-ext.log"; tail -5 /tmp/journey-typed-ext.log
+    elif "$ARCHIVER" --config /tmp/journey-typed-ext.yaml >>/tmp/journey-typed-ext.log 2>&1; then
+        pass "typed_ext archived (m4 partition → cold)"
+        _archived=1
+    else
+        fail "typed_ext archive — see /tmp/journey-typed-ext.log"; tail -5 /tmp/journey-typed-ext.log
+    fi
+    if [ "$_archived" = "1" ]; then
+        local O; O=$(qf "$HOST" <<'EOSQL'
+SELECT 'NTZ:'      || col_ts_ntz::text       FROM typed_ext WHERE ts < date_trunc('month',now()) - interval '3 months';
+SELECT 'TIME:'     || col_time::text          FROM typed_ext WHERE ts < date_trunc('month',now()) - interval '3 months';
+SELECT 'CHAR:'     || rtrim(col_char)         FROM typed_ext WHERE ts < date_trunc('month',now()) - interval '3 months';
+SELECT 'JSON:'     || (col_json->>'key')      FROM typed_ext WHERE ts < date_trunc('month',now()) - interval '3 months';
+SELECT 'INTERVAL:' || col_interval::text      FROM typed_ext WHERE ts < date_trunc('month',now()) - interval '3 months';
+SELECT 'OIDW:'     || col_oid_workaround::text FROM typed_ext WHERE ts < date_trunc('month',now()) - interval '3 months';
+EOSQL
+)
+        assert_eq "TC-087: timestamp (no tz) round-trip"   "2026-01-15 10:30:00" "$(extract NTZ      "$O")"
+        assert_eq "TC-089: time round-trip"                "10:30:00"            "$(extract TIME     "$O")"
+        assert_eq "TC-092: char(10) round-trip (trimmed)"  "hello"               "$(extract CHAR     "$O")"
+        assert_eq "TC-096: json round-trip (->>key)"       "value"               "$(extract JSON     "$O")"
+        assert_contains "TC-098: interval round-trip"      "1 day"               "$(extract INTERVAL "$O")"
+        assert_eq "bigint round-trip (the oid workaround)" "12345"               "$(extract OIDW     "$O")"
+        # TC-105: full-column-set assertion — every extended column non-null in cold row.
+        assert_eq "TC-105: all extended columns non-null in cold row" "true" \
+            "$(q "$HOST" "SELECT (col_ts_ntz IS NOT NULL AND col_time IS NOT NULL AND col_char IS NOT NULL AND col_json IS NOT NULL AND col_interval IS NOT NULL AND col_oid_workaround IS NOT NULL)::text FROM typed_ext WHERE ts < date_trunc('month',now()) - interval '3 months' LIMIT 1;")"
+    fi
+    # Always clean up so a failed archive does not leave typed_ext in partition_config
+    # and poison later archiver runs (TC-109, TC-066, TC-067, TC-138).
+    q "$HOST" "DELETE FROM coldfront.partition_config  WHERE table_name='typed_ext';"  >/dev/null 2>&1
+    q "$HOST" "DELETE FROM coldfront.tiered_views      WHERE relname='typed_ext';"     >/dev/null 2>&1
+    q "$HOST" "DELETE FROM coldfront.archive_watermark WHERE table_name='typed_ext';"  >/dev/null 2>&1
+    q "$HOST" "DROP VIEW   IF EXISTS public.typed_ext;" >/dev/null 2>&1
+    q "$HOST" "DROP TABLE  IF EXISTS public._typed_ext CASCADE;" >/dev/null 2>&1
+    q "$HOST" "DROP TABLE  IF EXISTS public.typed_ext  CASCADE;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story — TC-108: partitioner list shows all registered tables with the correct
+# individual lifecycle values. Uses an isolated schema (tc108) so global
+# partition_config entries do not contaminate the per-table assertions.
+# ───────────────────────────────────────────────────────────────────────────
+story_multitable_list() {
+    step "TC-108: partitioner list shows all registered tables with correct config"
+    local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
+    q "$HOST" "CREATE SCHEMA IF NOT EXISTS tc108;" >/dev/null
+    for tbl in orders logs transactions; do
+        q "$HOST" "CREATE TABLE IF NOT EXISTS tc108.${tbl} (id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL, PRIMARY KEY (id,ts)) PARTITION BY RANGE (ts);" >/dev/null
+    done
+    "$PARTITIONER" register --dsn "$dsn" --schema tc108 --table orders       --period monthly --hot-period "1 month"  --retention "5 years" >/dev/null 2>&1
+    "$PARTITIONER" register --dsn "$dsn" --schema tc108 --table logs         --period monthly --hot-period "2 months" --retention "3 years" >/dev/null 2>&1
+    "$PARTITIONER" register --dsn "$dsn" --schema tc108 --table transactions --period daily   --hot-period "1 month"  --retention "2 years" >/dev/null 2>&1
+    # Verify via partition_config (canonical truth).
+    assert_eq "TC-108: orders hot_period is 1 month"            "1 mon"  "$(q "$HOST" "SELECT hot_period FROM coldfront.partition_config WHERE schema_name='tc108' AND table_name='orders';")"
+    assert_eq "TC-108: logs hot_period is 2 months"             "2 mons" "$(q "$HOST" "SELECT hot_period FROM coldfront.partition_config WHERE schema_name='tc108' AND table_name='logs';")"
+    assert_eq "TC-108: transactions partition_period is daily"   "daily"  "$(q "$HOST" "SELECT partition_period FROM coldfront.partition_config WHERE schema_name='tc108' AND table_name='transactions';")"
+    assert_eq "TC-108: all 3 tables enabled"                    "3"      "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE schema_name='tc108' AND enabled;")"
+    # Also verify CLI list output includes all 3 tables.
+    "$PARTITIONER" list --dsn "$dsn" >/tmp/journey-tc108-list.log 2>&1
+    local found=0
+    grep -q "orders"       /tmp/journey-tc108-list.log && found=$((found + 1))
+    grep -q "logs"         /tmp/journey-tc108-list.log && found=$((found + 1))
+    grep -q "transactions" /tmp/journey-tc108-list.log && found=$((found + 1))
+    assert_eq "TC-108: partitioner list shows all 3 tables" "3" "$found"
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE schema_name='tc108';" >/dev/null 2>&1
+    q "$HOST" "DROP SCHEMA tc108 CASCADE;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story — TC-107: one registered table fails at archive time (its PK is dropped
+# after registration) and the run aborts there.
+#
+# Fail-fast is the contract, not continue-on-error: prepareAndRunTable
+# log.Fatalf's on the first table error ("the first table error must abort the
+# whole run non-zero"), and LoadTables orders by schema_name, table_name — so
+# logs is reached before orders and orders is never touched. What is asserted is
+# the abort and its attribution to the right table.
+#
+# Both tables are registered WITH --hot-period: omitting it registers a table
+# partition-only (hot_period NULL), and the archiver only ever loads rows where
+# hot_period IS NOT NULL, so neither table would be picked up and the story
+# would assert nothing.
+# ───────────────────────────────────────────────────────────────────────────
+story_multitable_fail_fast() {
+    step "TC-107: a table failing at archive time (PK dropped) aborts the run"
+    local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
+    q "$HOST" "CREATE SCHEMA IF NOT EXISTS tc107;" >/dev/null
+    qf "$HOST" <<'EOSQL' >/dev/null
+CREATE TABLE IF NOT EXISTS tc107.orders (
+    id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL, amount numeric(10,2),
+    PRIMARY KEY (id, ts)
+) PARTITION BY RANGE (ts);
+CREATE TABLE IF NOT EXISTS tc107.logs (
+    id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL, data text,
+    PRIMARY KEY (id, ts)
+) PARTITION BY RANGE (ts);
+DO $do$
+DECLARE m date; tbl text;
+BEGIN
+  m := (date_trunc('month', now()) - interval '2 months')::date;
+  FOR tbl IN VALUES ('orders'), ('logs') LOOP
+    EXECUTE format('CREATE TABLE IF NOT EXISTS tc107.%I PARTITION OF tc107.%I FOR VALUES FROM (%L) TO (%L)',
+                   tbl || '_p_' || to_char(m, 'YYYY_MM'), tbl, m, (m + interval '1 month'));
+  END LOOP;
+END $do$;
+INSERT INTO tc107.orders (ts, amount) VALUES (date_trunc('month',now()) - interval '2 months' + interval '5 days', 99.99);
+INSERT INTO tc107.logs   (ts, data)   VALUES (date_trunc('month',now()) - interval '2 months' + interval '5 days', 'entry');
+EOSQL
+    local ret_days; ret_days=$(hot_days)
+    "$PARTITIONER" register --dsn "$dsn" --schema tc107 --table orders --period monthly --hot-period "${ret_days} days" --retention "5 years" >/dev/null 2>&1
+    "$PARTITIONER" register --dsn "$dsn" --schema tc107 --table logs   --period monthly --hot-period "${ret_days} days" --retention "5 years" >/dev/null 2>&1
+    assert_eq "TC-107: both tables registered as tiered (hot_period set)" "2" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE schema_name='tc107' AND hot_period IS NOT NULL AND enabled;")"
+    # Drop logs' PK to provoke a PK-check failure at archive time.
+    q "$HOST" "DO \$\$
+DECLARE cname text;
+BEGIN
+    SELECT conname INTO cname FROM pg_constraint
+    WHERE conrelid='tc107.logs'::regclass AND contype='p' LIMIT 1;
+    IF cname IS NOT NULL THEN EXECUTE 'ALTER TABLE tc107.logs DROP CONSTRAINT ' || cname; END IF;
+END \$\$;" >/dev/null 2>&1 || true
+    cat > /tmp/journey-tc107.yaml <<EOF
+postgres:
+  dsn: "${dsn}"
+iceberg:
+  warehouse: "${WAREHOUSE}"
+  lakekeeper_endpoint: "http://${LK_IP}:8181/catalog"
+$(storage_yaml)
+EOF
+    if archive_only "schema_name='tc107'" /tmp/journey-tc107.yaml /tmp/journey-tc107.log; then
+        fail "TC-107: archiver exited 0 — the PK-less logs table should have failed it"
+        tail -5 /tmp/journey-tc107.log
+    else
+        pass "TC-107: archiver exited non-zero on the PK-less table"
+    fi
+    assert_contains "TC-107: the failure names the offending table" "tc107.logs" \
+        "$(cat /tmp/journey-tc107.log)"
+    assert_contains "TC-107: the failure names the missing primary key" "no primary key" \
+        "$(cat /tmp/journey-tc107.log)"
+    # Fail-fast, so neither table is tiered: logs errored and orders sorts after it.
+    assert_eq "TC-107: run aborted at logs, orders never reached" "p" \
+        "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='orders' AND relnamespace='tc107'::regnamespace;")"
+    assert_eq "TC-107: logs left untouched (still a partitioned table)" "p" \
+        "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='logs' AND relnamespace='tc107'::regnamespace;")"
+    q "$HOST" "DELETE FROM coldfront.partition_config  WHERE schema_name='tc107';" >/dev/null 2>&1
+    q "$HOST" "DELETE FROM coldfront.archive_watermark WHERE schema_name='tc107';" >/dev/null 2>&1
+    q "$HOST" "DELETE FROM coldfront.tiered_views      WHERE schema_name='tc107';" >/dev/null 2>&1
+    q "$HOST" "DROP SCHEMA tc107 CASCADE;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story — TC-109: disable one table — archiver skips it (silently, via
+# WHERE enabled) while processing remaining enabled tables normally.
+# ───────────────────────────────────────────────────────────────────────────
+story_multitable_disable_one() {
+    step "TC-109: disable one table — archiver skips it; processes others"
+    local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
+    q "$HOST" "CREATE SCHEMA IF NOT EXISTS tc109;" >/dev/null
+    qf "$HOST" <<'EOSQL' >/dev/null
+CREATE TABLE IF NOT EXISTS tc109.orders (
+    id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL, PRIMARY KEY (id, ts)
+) PARTITION BY RANGE (ts);
+CREATE TABLE IF NOT EXISTS tc109.logs (
+    id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL, PRIMARY KEY (id, ts)
+) PARTITION BY RANGE (ts);
+DO $do$
+DECLARE m date; tbl text;
+BEGIN
+  m := (date_trunc('month', now()) - interval '2 months')::date;
+  FOR tbl IN VALUES ('orders'), ('logs') LOOP
+    EXECUTE format('CREATE TABLE IF NOT EXISTS tc109.%I PARTITION OF tc109.%I FOR VALUES FROM (%L) TO (%L)',
+                   tbl || '_p_' || to_char(m, 'YYYY_MM'), tbl, m, (m + interval '1 month'));
+  END LOOP;
+END $do$;
+INSERT INTO tc109.orders (ts) VALUES (date_trunc('month',now()) - interval '2 months' + interval '5 days');
+INSERT INTO tc109.logs   (ts) VALUES (date_trunc('month',now()) - interval '2 months' + interval '5 days');
+EOSQL
+    local ret_days; ret_days=$(hot_days)
+    "$PARTITIONER" register --dsn "$dsn" --schema tc109 --table orders --period monthly --hot-period "${ret_days} days" --retention "6 months" >/dev/null 2>&1
+    "$PARTITIONER" register --dsn "$dsn" --schema tc109 --table logs   --period monthly --hot-period "${ret_days} days" --retention "6 months" >/dev/null 2>&1
+    # Disable logs via direct SQL (partition_config.enabled = false).
+    q "$HOST" "UPDATE coldfront.partition_config SET enabled=false WHERE schema_name='tc109' AND table_name='logs';" >/dev/null
+    assert_eq "TC-109: logs disabled in partition_config" "f" \
+        "$(q "$HOST" "SELECT enabled FROM coldfront.partition_config WHERE schema_name='tc109' AND table_name='logs';")"
+    cat > /tmp/journey-tc109.yaml <<EOF
+postgres:
+  dsn: "${dsn}"
+iceberg:
+  warehouse: "${WAREHOUSE}"
+  lakekeeper_endpoint: "http://${LK_IP}:8181/catalog"
+$(storage_yaml)
+EOF
+    if archive_only "schema_name='tc109'" /tmp/journey-tc109.yaml /tmp/journey-tc109.log; then
+        pass "TC-109: archiver completed"
+    else
+        fail "TC-109: archiver failed — see /tmp/journey-tc109.log"; tail -5 /tmp/journey-tc109.log
+    fi
+    # The archiver logs every table it picks up ("[schema.table] starting archive
+    # cycle"), so the disabled one being absent is real evidence it was skipped.
+    if grep -qi "tc109.*logs\|logs.*tc109" /tmp/journey-tc109.log; then
+        fail "TC-109: disabled table logs appeared in archiver log"
+    else
+        pass "TC-109: disabled table logs absent from archiver log (silently skipped)"
+    fi
+    assert_eq "TC-109: orders archived (now a view)" "v" \
+        "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='orders' AND relnamespace='tc109'::regnamespace;")"
+    # Stronger than the log check: the skipped table has no cold-tier state at all.
+    assert_eq "TC-109: logs still a partitioned table" "p" \
+        "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='logs' AND relnamespace='tc109'::regnamespace;")"
+    assert_eq "TC-109: logs has no watermark or registry row" "0" \
+        "$(q "$HOST" "SELECT (SELECT count(*) FROM coldfront.archive_watermark WHERE schema_name='tc109' AND table_name='logs')
+                           + (SELECT count(*) FROM coldfront.tiered_views      WHERE schema_name='tc109' AND relname='logs');")"
+    q "$HOST" "DELETE FROM coldfront.partition_config  WHERE schema_name='tc109';" >/dev/null 2>&1
+    q "$HOST" "DELETE FROM coldfront.archive_watermark WHERE schema_name='tc109';" >/dev/null 2>&1
+    q "$HOST" "DELETE FROM coldfront.tiered_views      WHERE schema_name='tc109';" >/dev/null 2>&1
+    q "$HOST" "DROP SCHEMA tc109 CASCADE;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story — TC-110: re-registering a table is idempotent — it updates the
+# existing partition_config row rather than inserting a duplicate.
+# ───────────────────────────────────────────────────────────────────────────
+story_register_idempotent() {
+    step "TC-110: re-register same table — updates values; no duplicate row created"
+    local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
+    q "$HOST" "CREATE TABLE IF NOT EXISTS public.tc110_idem (id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL, PRIMARY KEY (id,ts)) PARTITION BY RANGE (ts);" >/dev/null
+    "$PARTITIONER" register --dsn "$dsn" --table tc110_idem \
+        --period monthly --hot-period "1 month" --retention "5 years" >/dev/null 2>&1
+    assert_eq "TC-110: exactly 1 row after first register" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='tc110_idem';")"
+    if "$PARTITIONER" register --dsn "$dsn" --table tc110_idem \
+            --period monthly --hot-period "2 months" --retention "3 years" >/tmp/journey-tc110.log 2>&1; then
+        pass "TC-110: re-register succeeded"
+    else
+        fail "TC-110: re-register failed — see /tmp/journey-tc110.log"; tail -5 /tmp/journey-tc110.log
+    fi
+    assert_eq "TC-110: still exactly 1 row after re-register (no duplicate)" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='tc110_idem';")"
+    assert_eq "TC-110: hot_period updated to 2 months" "2 mons" \
+        "$(q "$HOST" "SELECT hot_period FROM coldfront.partition_config WHERE table_name='tc110_idem';")"
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name='tc110_idem';" >/dev/null 2>&1
+    q "$HOST" "DROP TABLE IF EXISTS public.tc110_idem CASCADE;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story — TC-113: UNLOGGED partitioned table rejected at register.
+# UNLOGGED data is not WAL-logged and is lost on crash — incompatible with
+# ColdFront's durability guarantees. Register is where this is caught, so there
+# is nothing left to test at archive time: the table never reaches the registry.
+# ───────────────────────────────────────────────────────────────────────────
+story_unlogged_rejected() {
+    step "TC-113: UNLOGGED partitioned table rejected at register"
+    q "$HOST" "CREATE UNLOGGED TABLE IF NOT EXISTS public.tc113_unlogged (
+        id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL, PRIMARY KEY (id,ts)
+    ) PARTITION BY RANGE (ts);" >/dev/null 2>&1 || true
+    if "$ARCHIVER" register --config /tmp/journey-archiver.yaml --table tc113_unlogged \
+            --period monthly --hot-period "30 days" >/tmp/journey-unlogged.log 2>&1; then
+        fail "TC-113: register accepted an UNLOGGED table"
+    else
+        assert_contains "TC-113: register rejected UNLOGGED with a clear error" "unlogged" \
+            "$(tr '[:upper:]' '[:lower:]' < /tmp/journey-unlogged.log)"
+    fi
+    assert_eq "TC-113: nothing registered" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='tc113_unlogged';")"
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name='tc113_unlogged';" >/dev/null 2>&1
+    q "$HOST" "DROP TABLE IF EXISTS public.tc113_unlogged CASCADE;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story — TC-114: TEMPORARY table invisible to archiver — register fails with
+# a "does not exist" error. TEMP tables are session-local; the archiver
+# connects in a new session and cannot see them.
+# ───────────────────────────────────────────────────────────────────────────
+story_temp_rejected() {
+    step "TC-114: TEMP table invisible to archiver — register fails with does-not-exist"
+    # The TEMP table has to be created and observed inside ONE psql session,
+    # because that session-locality is the whole property under test. It dies
+    # with that session, which is exactly why the archiver's connection, opened
+    # next, cannot see it.
+    local insession
+    insession=$(qf "$HOST" <<'EOSQL'
+CREATE TEMP TABLE tc114_tempev (
+    id bigint NOT NULL, ts timestamptz NOT NULL, PRIMARY KEY (id, ts)
+) PARTITION BY RANGE (ts);
+SELECT 'INSESSION:' || (to_regclass('tc114_tempev') IS NOT NULL)::text;
+EOSQL
+)
+    assert_eq "TC-114: TEMP table is visible inside its creating session" "true" \
+        "$(extract INSESSION "$insession")"
+    if "$ARCHIVER" register --config /tmp/journey-archiver.yaml --table tc114_tempev \
+            --period monthly --hot-period "30 days" >/tmp/journey-temprej.log 2>&1; then
+        fail "TC-114: register should fail (table not visible in new session)"
+    else
+        if grep -qi "does not exist\|not a partitioned\|not found\|no such" /tmp/journey-temprej.log; then
+            pass "TC-114: TEMP table invisible to archiver — register fails with does-not-exist"
+        else
+            fail "TC-114: register failed but unexpected reason — see /tmp/journey-temprej.log"; tail -5 /tmp/journey-temprej.log
+        fi
+    fi
+    assert_eq "TC-114: table not in partition_config" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='tc114_tempev';")"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story — TC-115: flat LIST partitioned table — accepted at register (no
+# strategy check) but rejected at archive time: the archiver cannot parse
+# "FOR VALUES IN (...)" as a RANGE bound.
+# ───────────────────────────────────────────────────────────────────────────
+story_list_partition_rejected() {
+    step "TC-115: LIST-partitioned table accepted at register; rejected at archive"
+    qf "$HOST" <<'EOSQL' >/dev/null
+CREATE TABLE IF NOT EXISTS public.tc115_region_ev (
+    id     bigint GENERATED ALWAYS AS IDENTITY,
+    region text   NOT NULL,
+    ts     timestamptz NOT NULL,
+    PRIMARY KEY (id, region)
+) PARTITION BY LIST (region);
+CREATE TABLE IF NOT EXISTS public.tc115_region_ev_eu
+    PARTITION OF public.tc115_region_ev FOR VALUES IN ('eu');
+INSERT INTO public.tc115_region_ev (region, ts) VALUES ('eu', now() - interval '6 months');
+EOSQL
+    if "$ARCHIVER" register --config /tmp/journey-archiver.yaml --table tc115_region_ev \
+            --period monthly --hot-period "30 days" >/tmp/journey-listpart.log 2>&1; then
+        pass "TC-115: register LIST table succeeded (no strategy check at register)"
+    else
+        note "TC-115: register rejected LIST table at register time"; tail -3 /tmp/journey-listpart.log
+    fi
+    # Own log for the archive pass: the grep below matches on "LIST", which the
+    # register output also contains.
+    if archive_only "schema_name='public' AND table_name='tc115_region_ev'" /tmp/journey-archiver.yaml /tmp/journey-listpart-arch.log; then
+        fail "TC-115: archiver should have rejected LIST-partitioned table"
+    else
+        if grep -qi "cannot parse partition bound\|FOR VALUES IN\|LIST\|unsupported\|unrecognized\|parse.*bound" /tmp/journey-listpart-arch.log; then
+            pass "TC-115: archiver rejected LIST partition at archive time (parse error on bound)"
+        else
+            fail "TC-115: archiver failed but unexpected reason — see /tmp/journey-listpart-arch.log"; tail -5 /tmp/journey-listpart-arch.log
+        fi
+    fi
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name='tc115_region_ev';" >/dev/null 2>&1
+    q "$HOST" "DROP TABLE IF EXISTS public.tc115_region_ev CASCADE;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story — TC-116: HASH-partitioned table — accepted at register (no strategy
+# check) but rejected at archive time: the archiver cannot parse
+# "FOR VALUES WITH (MODULUS ..., REMAINDER ...)" as a RANGE bound.
+# ───────────────────────────────────────────────────────────────────────────
+story_hash_partition_rejected() {
+    step "TC-116: HASH-partitioned table accepted at register; rejected at archive"
+    qf "$HOST" <<'EOSQL' >/dev/null
+CREATE TABLE IF NOT EXISTS public.tc116_hash_ev (
+    id bigint NOT NULL, ts timestamptz NOT NULL, PRIMARY KEY (id, ts)
+) PARTITION BY HASH (id);
+CREATE TABLE IF NOT EXISTS public.tc116_hash_ev_0
+    PARTITION OF public.tc116_hash_ev FOR VALUES WITH (MODULUS 4, REMAINDER 0);
+INSERT INTO public.tc116_hash_ev VALUES (1, now() - interval '6 months');
+EOSQL
+    if "$ARCHIVER" register --config /tmp/journey-archiver.yaml --table tc116_hash_ev \
+            --period monthly --hot-period "30 days" >/tmp/journey-hashpart.log 2>&1; then
+        pass "TC-116: register HASH table succeeded (no strategy check at register)"
+    else
+        note "TC-116: register rejected HASH table at register time"; tail -3 /tmp/journey-hashpart.log
+    fi
+    # Own log for the archive pass: the grep below matches on "HASH", which the
+    # register output also contains.
+    if archive_only "schema_name='public' AND table_name='tc116_hash_ev'" /tmp/journey-archiver.yaml /tmp/journey-hashpart-arch.log; then
+        fail "TC-116: archiver should have rejected HASH-partitioned table"
+    else
+        if grep -qi "cannot parse partition bound\|MODULUS\|HASH\|unsupported" /tmp/journey-hashpart-arch.log; then
+            pass "TC-116: archiver rejected HASH partition at archive time (parse error on bound)"
+        else
+            fail "TC-116: archiver failed but unexpected reason — see /tmp/journey-hashpart-arch.log"; tail -5 /tmp/journey-hashpart-arch.log
+        fi
+    fi
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name='tc116_hash_ev';" >/dev/null 2>&1
+    q "$HOST" "DROP TABLE IF EXISTS public.tc116_hash_ev CASCADE;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story — TC-138: same table name in two PG schemas — Iceberg uses distinct
+# namespaces per schema so there is no collision. public.sa_items archives to
+# ice.public.sa_items; sc2.sa_items archives to ice.sc2.sa_items. Cold data
+# from each schema must be independently readable. (Fix: archiver qualifies
+# Iceberg table names with the PG schema_name.)
+# ───────────────────────────────────────────────────────────────────────────
+story_schema_collision() {
+    step "TC-138: same table name in two schemas — Iceberg uses schema-qualified names"
+    local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
+    q "$HOST" "CREATE SCHEMA IF NOT EXISTS sc2;" >/dev/null
+    local ret_days; ret_days=$(hot_days)
+    qf "$HOST" <<EOSQL >/dev/null
+CREATE TABLE IF NOT EXISTS public.sa_items (
+    id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL, val text, PRIMARY KEY (id, ts)
+) PARTITION BY RANGE (ts);
+CREATE TABLE IF NOT EXISTS sc2.sa_items (
+    id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL, val text, PRIMARY KEY (id, ts)
+) PARTITION BY RANGE (ts);
+DO \$do\$
+DECLARE m date;
+BEGIN
+  m := (date_trunc('month', now()) - interval '2 months')::date;
+  EXECUTE format('CREATE TABLE IF NOT EXISTS public.%I PARTITION OF public.sa_items FOR VALUES FROM (%L) TO (%L)',
+                 'sa_items_p_' || to_char(m, 'YYYY_MM'), m, (m + interval '1 month'));
+  EXECUTE format('CREATE TABLE IF NOT EXISTS sc2.%I PARTITION OF sc2.sa_items FOR VALUES FROM (%L) TO (%L)',
+                 'sa_items_p_' || to_char(m, 'YYYY_MM'), m, (m + interval '1 month'));
+END \$do\$;
+INSERT INTO public.sa_items (ts, val) VALUES (date_trunc('month',now()) - interval '2 months' + interval '5 days', 'pub_cold');
+INSERT INTO sc2.sa_items    (ts, val) VALUES (date_trunc('month',now()) - interval '2 months' + interval '5 days', 'sc2_cold');
+EOSQL
+    # --hot-period is what makes these tiered rows. Registered with --retention
+    # alone they would be partition-only, the archiver would never load them, and
+    # every assertion below would read the untouched hot heap and pass.
+    "$PARTITIONER" register --dsn "$dsn" --schema public --table sa_items --period monthly --hot-period "${ret_days} days" --retention "5 years" >/dev/null 2>&1
+    "$PARTITIONER" register --dsn "$dsn" --schema sc2    --table sa_items --period monthly --hot-period "${ret_days} days" --retention "5 years" >/dev/null 2>&1
+    assert_eq "TC-138: both sa_items registered as tiered" "2" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='sa_items' AND hot_period IS NOT NULL AND enabled;")"
+    cat > /tmp/journey-schema-coll.yaml <<EOF
+postgres:
+  dsn: "${dsn}"
+iceberg:
+  warehouse: "${WAREHOUSE}"
+  lakekeeper_endpoint: "http://${LK_IP}:8181/catalog"
+$(storage_yaml)
+EOF
+    if archive_only "table_name='sa_items'" /tmp/journey-schema-coll.yaml /tmp/journey-schema-coll.log; then
+        pass "TC-138: archiver archived both schemas without conflict"
+    else
+        fail "TC-138: archiver failed — see /tmp/journey-schema-coll.log"; tail -5 /tmp/journey-schema-coll.log
+    fi
+    # Both really reached the cold tier. Without this, the reads below would be
+    # satisfied by the hot heap and would pass even if nothing was archived.
+    assert_eq "TC-138: public.sa_items is now a view over hot+cold" "v" \
+        "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='sa_items' AND relnamespace='public'::regnamespace;")"
+    assert_eq "TC-138: sc2.sa_items is now a view over hot+cold" "v" \
+        "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='sa_items' AND relnamespace='sc2'::regnamespace;")"
+    # The point of the story: one PG table name, two Iceberg identities.
+    # De-quoted, because what is under test is the namespace the PG schema maps
+    # to, not the quoting the archiver applies to the identifier it stores.
+    assert_eq "TC-138: public.sa_items registered under its own Iceberg name" "ice.public.sa_items" \
+        "$(q "$HOST" "SELECT replace(iceberg_table,'\"','') FROM coldfront.tiered_views WHERE schema_name='public' AND relname='sa_items';")"
+    assert_eq "TC-138: sc2.sa_items registered under its own Iceberg name" "ice.sc2.sa_items" \
+        "$(q "$HOST" "SELECT replace(iceberg_table,'\"','') FROM coldfront.tiered_views WHERE schema_name='sc2' AND relname='sa_items';")"
+    local pub_val; pub_val=$(q "$HOST" "SELECT val FROM public.sa_items WHERE ts < date_trunc('month',now()) - interval '1 month' LIMIT 1;" 2>/dev/null || echo "")
+    local sc2_val; sc2_val=$(q "$HOST" "SELECT val FROM sc2.sa_items    WHERE ts < date_trunc('month',now()) - interval '1 month' LIMIT 1;" 2>/dev/null || echo "")
+    assert_eq "TC-138: public.sa_items cold row readable"              "pub_cold" "$pub_val"
+    assert_eq "TC-138: sc2.sa_items cold row readable independently"   "sc2_cold" "$sc2_val"
+    q "$HOST" "DELETE FROM coldfront.partition_config  WHERE table_name='sa_items';" >/dev/null 2>&1
+    q "$HOST" "DELETE FROM coldfront.archive_watermark WHERE table_name='sa_items';" >/dev/null 2>&1
+    q "$HOST" "DELETE FROM coldfront.tiered_views      WHERE relname='sa_items';"    >/dev/null 2>&1
+    # public.sa_items is a view once archived, and DROP TABLE IF EXISTS errors on
+    # a name that exists as something else. The hot heap under it goes too.
+    q "$HOST" "DROP VIEW  IF EXISTS public.sa_items;" >/dev/null 2>&1
+    q "$HOST" "DROP TABLE IF EXISTS public._sa_items CASCADE;" >/dev/null 2>&1
+    q "$HOST" "DROP TABLE IF EXISTS public.sa_items CASCADE;" >/dev/null 2>&1
+    q "$HOST" "DROP SCHEMA sc2 CASCADE;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story: coldfront.drop_iceberg_table. One verb, both modes, and the caller
+# decides whether the stored objects go with the catalog entry.
+#
+# Throwaway tables in their own namespace, so the journey's own fixtures are
+# untouched and this runs in any mode. The tiered registration is built directly
+# (real Iceberg table + hot table + view + registry rows) instead of by running
+# the archiver: story_provision_tiered already covers the archiver's path, and
+# what is under test here is the drop.
+# ───────────────────────────────────────────────────────────────────────────
+
+# http status of a dropprobe catalog entry: 200 while it exists, 404 once dropped.
+dit_catalog() { curl -s -o /dev/null -w '%{http_code}' \
+    "http://${LK_IP}:8181/catalog/v1/${DIT_WH}/namespaces/dropprobe/tables/$1"; }
+
+# The table's storage location, resolved while the catalog entry still exists:
+# after the drop it is a 404, which is exactly when the location is needed to
+# check whether the objects survived.
+dit_location() {
+    curl -s "http://${LK_IP}:8181/catalog/v1/${DIT_WH}/namespaces/dropprobe/tables/$1" \
+      | grep -oE '"location":"[^"]+"' | head -1 | cut -d'"' -f4
+}
+
+# Objects under a location. The URI comes from Lakekeeper, so the glob follows
+# whatever object store this cell runs against.
+dit_count() {
+    [ -n "$1" ] || { echo ""; return; }
+    q "$HOST" "SELECT coldfront.ensure_attached(); SELECT r['n'] FROM duckdb.query('SELECT count(*) AS n FROM glob(''$1/**'')') AS t(r);" | tail -1
+}
+
+# dit_provision <table> <mode>: a registered relation of the given mode,
+# holding real Iceberg data.
+dit_provision() {
+    local t="$1" mode="$2"
+    if [ "$mode" = decoupled ]; then
+        q "$HOST" "SELECT coldfront.create_iceberg_table('dropprobe','$t','[{\"name\":\"id\",\"type\":\"bigint\"}]'::jsonb);" >/dev/null 2>&1
+    else
+        # Tiered by construction: a real Iceberg cold table, a hot heap under the
+        # archiver's _-prefixed name, the transparent view in its place, and the
+        # registration rows the archiver would have written.
+        q "$HOST" "SELECT coldfront.ensure_attached(); SELECT duckdb.raw_query('CREATE TABLE IF NOT EXISTS ice.dropprobe.$t (id BIGINT)');" >/dev/null 2>&1
+        q "$HOST" "CREATE TABLE IF NOT EXISTS dropprobe._$t (id bigint);
+                   CREATE OR REPLACE VIEW dropprobe.$t AS SELECT * FROM dropprobe._$t;
+                   INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
+                   VALUES ('dropprobe','$t','dropprobe._$t','ice.dropprobe.$t','id')
+                     ON CONFLICT (schema_name, relname) DO NOTHING;
+                   INSERT INTO coldfront.partition_config(schema_name, table_name, partition_period, hot_period)
+                   VALUES ('dropprobe','$t','monthly','30 days')
+                     ON CONFLICT (schema_name, table_name) DO NOTHING;" >/dev/null 2>&1
+    fi
+    q "$HOST" "SELECT coldfront.ensure_attached(); SELECT duckdb.raw_query('INSERT INTO ice.dropprobe.$t SELECT i FROM range(1,11) t(i)');" >/dev/null 2>&1
+}
+
+# dit_assert_pg <label> <table> <mode>: the PostgreSQL side after a drop. The
+# registration and wrapper view always go; a tiered table additionally loses its
+# archiver config and gets its hot table back under the relation's own name.
+dit_assert_pg() {
+    local label="$1" t="$2" mode="$3" nodes n
+    assert_eq "$label: registry row gone" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.tiered_views WHERE schema_name='dropprobe' AND relname='$t';")"
+
+    # On EVERY node, not just the origin. A wrapper view left behind on a peer
+    # would read through to a catalog entry that no longer exists, which is the
+    # one way this drop can be locally correct and still break the mesh. Asserted
+    # as "no view named $t" rather than on the hot table, because whether the
+    # provisioning DDL itself reached the peers is a separate question. $PEERS is
+    # empty on vanilla, so this collapses to the origin and needs no mode branch.
+    read -ra nodes <<< "$HOST $PEERS"
+    [ -n "$PEERS" ] && sleep 3
+    for n in "${nodes[@]}"; do
+        assert_eq "$label: no wrapper view left on $n" "0" \
+            "$(q "$n" "SELECT count(*) FROM pg_class WHERE relname='$t' AND relkind='v' AND relnamespace='dropprobe'::regnamespace;")"
+    done
+    if [ "$mode" = decoupled ]; then
+        assert_eq "$label: nothing left in PostgreSQL" "0" \
+            "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname='$t' AND relnamespace='dropprobe'::regnamespace;")"
+        return
+    fi
+    # partition_config must go too, or the next archiver run would re-tier into a
+    # catalog entry that no longer exists.
+    assert_eq "$label: partition_config row gone" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE schema_name='dropprobe' AND table_name='$t';")"
+    assert_eq "$label: hot table retained under its own name" "r" \
+        "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='$t' AND relnamespace='dropprobe'::regnamespace;")"
+    assert_eq "$label: the _-prefixed hot table is gone" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname='_$t' AND relnamespace='dropprobe'::regnamespace;")"
+}
+
+# dit_assert_objects <label> <loc> <before> <purge>: Lakekeeper deletes objects
+# from its own background queue, so neither outcome can be read immediately:
+# purge has to be waited for, and "retained" only means something once a purge
+# would have had time to run.
+dit_assert_objects() {
+    local label="$1" loc="$2" before="$3" purge="$4" after i=0
+    if [ "$purge" != true ]; then
+        sleep 5
+        assert_eq "$label: stored objects retained" "$before" "$(dit_count "$loc")"
+        return
+    fi
+    while [ "$i" -lt 30 ]; do
+        after=$(dit_count "$loc")
+        [ "$after" = "0" ] && break
+        sleep 1; i=$((i + 1))
+    done
+    assert_eq "$label: stored objects purged" "0" "$after"
+}
+
+# dit_case <label> <table> <mode> <purge>: provision, drop, then assert the PG
+# side, the catalog entry and whether the stored objects survived.
+dit_case() {
+    local label="$1" t="$2" mode="$3" purge="$4" loc before out
+    dit_provision "$t" "$mode"
+    loc=$(dit_location "$t")
+    before=$(dit_count "$loc")
+    assert_gt "$label: objects exist before the drop" 0 "${before:-0}"
+
+    out=$(q_may "$HOST" "SELECT coldfront.drop_iceberg_table('dropprobe','$t',$purge);")
+    case "$out" in
+        *ERROR*) fail "$label: drop_iceberg_table failed: $out"; return;;
+        *)       pass "$label: drop_iceberg_table succeeded";;
+    esac
+
+    dit_assert_pg "$label" "$t" "$mode"
+    assert_eq "$label: catalog entry dropped" "404" "$(dit_catalog "$t")"
+    dit_assert_objects "$label" "$loc" "$before" "$purge"
+}
+
+story_drop_iceberg_table() {
+    step "drop_iceberg_table: decoupled and tiered, purge and keep-files"
+    DIT_WH=$(curl -s "http://${LK_IP}:8181/management/v1/warehouse" \
+               | grep -oE '"warehouse-id":"[^"]+"' | head -1 | cut -d'"' -f4)
+    [ -n "$DIT_WH" ] || { fail "drop_iceberg_table: could not resolve the warehouse id"; return; }
+
+    # The Iceberg namespace must be committed before any CREATE TABLE references
+    # it (DuckDB defers CREATE SCHEMA to COMMIT; see story_provision_decoupled).
+    q "$HOST" "SELECT coldfront.ensure_attached(); SELECT duckdb.raw_query('CREATE SCHEMA IF NOT EXISTS ice.dropprobe');" >/dev/null 2>&1
+    q "$HOST" "CREATE SCHEMA IF NOT EXISTS dropprobe;" >/dev/null 2>&1
+
+    dit_case "decoupled/purge" dpurge decoupled true
+    dit_case "decoupled/keep"  dkeep  decoupled false
+    dit_case "tiered/purge"    tpurge tiered    true
+    dit_case "tiered/keep"     tkeep  tiered    false
+
+    q "$HOST" "DROP SCHEMA IF EXISTS dropprobe CASCADE;" >/dev/null 2>&1
+}
+
 # ── orchestrate ────────────────────────────────────────────────────────────
 # Setup is shared. The story set then branches on mode: tiered exercises the
 # hot+cold partitioned path; decoupled exercises the all-Iceberg wrapper. (The
@@ -2315,6 +3654,31 @@ if [ "$MODE" = "tiered" ]; then
     story_partitioner_fk_drop
     story_register_cli
     story_partition_config_ownership   # each binary loads only its own rows
+    story_wrong_s3_endpoint            # TC-022: bad S3 endpoint → Phase 2 connection error
+    story_empty_partition              # TC-024: 0-row partition archives cleanly
+    story_rename_hot_table             # TC-040: hot table rename updates registry + DML
+    story_partitioner_set_retention    # TC-052: set --retention updates partition_config
+    story_partitioner_disable_enable   # TC-053: disable silently excludes; enable restores
+    story_partitioner_remove           # TC-054: remove unregisters; table intact
+    story_composite_key_rejected       # TC-071: RANGE (col1, col2) rejected at archive time
+    story_iceberg_metadata             # TC-043: cold data confirmed via Parquet metadata
+    story_pg_dump_no_secrets           # TC-058: storage secret not in pg_dump
+    story_wrong_lakekeeper_creds       # TC-059: wrong Lakekeeper credentials rejected
+    story_types_extended               # TC-087/089/092/096/098/105: extended type round-trip
+    story_multitable_list              # TC-108: list shows all tables with correct config
+    story_multitable_fail_fast         # TC-107: a table failing at archive aborts the run
+    story_multitable_disable_one       # TC-109: disable one table; others still processed
+    story_register_idempotent          # TC-110: re-register updates values; no duplicate row
+    story_unlogged_rejected            # TC-113: UNLOGGED rejected at register
+    story_temp_rejected                # TC-114: TEMP table invisible to archiver
+    story_list_partition_rejected      # TC-115: LIST partition accepted at register; rejected at archive
+    story_hash_partition_rejected      # TC-116: HASH partition accepted at register; rejected at archive
+    story_partition_col_timestamp      # TC-066: timestamp (no tz) partition column
+    story_partition_col_date           # TC-067: date partition column
+    story_partition_col_text_rejected  # TC-070: text partition column rejected at archive
+    story_schema_collision             # TC-138: same table name in two schemas — distinct Iceberg namespaces
+    story_seaweedfs_restart            # TC-062: SeaweedFS restart; cold data persists
+    story_pg_restart                   # TC-063: PG restart; DuckDB secret reloads; cold reads work
 else
     story_provision_decoupled
     story_decoupled_crud
@@ -2322,6 +3686,7 @@ else
     story_decoupled_concurrency
     story_decoupled_ryw
 fi
+story_drop_iceberg_table   # both modes, purge and keep-files (own throwaway tables)
 [ "$MESH" = 1 ] && [ "$MODE" = decoupled ] && story_mesh   # tiered+mesh runs story_mesh_tiered (above)
 [ "$MESH" = 1 ] && story_mesh_multiwriter   # >1 cold writer/node cross-node (tiered: events, decoupled: iceonly)
 [ -n "$STANDBY" ]    && story_standby_reads

@@ -58,7 +58,7 @@ func main() {
 		log.Fatalf("load config: %v", err)
 	}
 
-	conn, err := pgx.Connect(ctx, cfg.Postgres.DSN)
+	conn, err := partition.Connect(ctx, cfg.Postgres.DSN)
 	if err != nil {
 		log.Fatalf("connect: %v", err)
 	}
