@@ -105,6 +105,14 @@ storage_yaml() {
     fi
 }
 
+# vended_creds — true when Lakekeeper mints per-table credentials and no DuckDB
+# secret exists for the bucket. Reads that address the object store BY PATH
+# (glob(), iceberg_metadata('<location>')) cannot authenticate in that mode:
+# vending is scoped to a table resolved through the catalog, so a bare path has
+# nothing to vend against. Reads through the catalog, and every PG-side and
+# catalog-side assertion, are unaffected.
+vended_creds() { [ "$BACKEND" = vended ] || [ "$BACKEND" = azure-vended ]; }
+
 # hot_days — the hot_period, in days, that pins the tier cutoff at the start of
 # last month: everything older than that month is cold, the last two months are
 # hot. Every story that wants that fixed, calendar-independent cutoff uses this
@@ -2689,21 +2697,17 @@ story_composite_key_rejected() {
 # ───────────────────────────────────────────────────────────────────────────
 story_iceberg_metadata() {
     step "TC-043: cold data confirmed in Iceberg via metadata (Parquet file probe)"
-    local ice_tbl ns tbl wh meta cnt
-    ice_tbl=$(q "$HOST" "SELECT iceberg_table FROM coldfront.tiered_views WHERE schema_name='public' AND relname='events' AND NOT is_iceberg_only LIMIT 1;")
-    if [ -z "$ice_tbl" ]; then
+    local ice_ref cnt
+    ice_ref=$(q "$HOST" "SELECT replace(iceberg_table,'\"','') FROM coldfront.tiered_views WHERE schema_name='public' AND relname='events' AND NOT is_iceberg_only LIMIT 1;")
+    if [ -z "$ice_ref" ]; then
         fail "TC-043: events not found in tiered_views — story_provision_tiered must run first"; return
     fi
-    # iceberg_table is stored quoted ("ice"."ns"."tbl"); the catalog API wants
-    # the two bare parts.
-    ns=${ice_tbl//\"/}; ns=${ns#ice.}; tbl=${ns##*.}; ns=${ns%.*}
-    wh=$(curl -s "http://${LK_IP}:8181/management/v1/warehouse" \
-           | grep -oE '"warehouse-id":"[^"]+"' | head -1 | cut -d'"' -f4)
-    [ -n "$wh" ] || { fail "TC-043: could not resolve the warehouse id"; return; }
-    meta=$(curl -s "http://${LK_IP}:8181/catalog/v1/${wh}/namespaces/${ns}/tables/${tbl}" \
-             | grep -oE '"metadata-location":"[^"]+"' | head -1 | cut -d'"' -f4)
-    [ -n "$meta" ] || { fail "TC-043: no metadata-location for ${ns}.${tbl} in the catalog"; return; }
-    cnt=$(q "$HOST" "SELECT coldfront.ensure_attached(); SELECT r['n'] FROM duckdb.query('SELECT count(*) AS n FROM iceberg_metadata(''${meta}'') WHERE file_path LIKE ''%.parquet''') AS t(r);" | tail -1)
+    # Addressed as the attached catalog table, never as a metadata.json path.
+    # duckdb-iceberg resolves a 3-part name through the catalog and calls
+    # PrepareIcebergScanFromEntry, which mints that table's secret, so this reads
+    # identically on static and vended credentials and needs no backend branch.
+    # De-quoted because the archiver stores the reference quoted.
+    cnt=$(q "$HOST" "SELECT coldfront.ensure_attached(); SELECT r['n'] FROM duckdb.query('SELECT count(*) AS n FROM iceberg_metadata(''${ice_ref}'') WHERE file_path LIKE ''%.parquet''') AS t(r);" | tail -1)
     assert_gt "TC-043: Parquet data files registered in the events snapshot" "0" "$cnt"
 }
 
@@ -3561,6 +3565,10 @@ dit_assert_pg() {
 # would have had time to run.
 dit_assert_objects() {
     local label="$1" loc="$2" before="$3" purge="$4" after i=0
+    # Counting objects means globbing the bucket by path, which a vended cell
+    # cannot authenticate. The catalog-entry and PG-side assertions in dit_case
+    # still run, so the drop itself stays covered.
+    vended_creds && { note "$label: vended creds; skipping the object-store assertions"; return; }
     if [ "$purge" != true ]; then
         sleep 5
         assert_eq "$label: stored objects retained" "$before" "$(dit_count "$loc")"
@@ -3577,11 +3585,13 @@ dit_assert_objects() {
 # dit_case <label> <table> <mode> <purge>: provision, drop, then assert the PG
 # side, the catalog entry and whether the stored objects survived.
 dit_case() {
-    local label="$1" t="$2" mode="$3" purge="$4" loc before out
+    local label="$1" t="$2" mode="$3" purge="$4" loc out before=""
     dit_provision "$t" "$mode"
     loc=$(dit_location "$t")
-    before=$(dit_count "$loc")
-    assert_gt "$label: objects exist before the drop" 0 "${before:-0}"
+    if ! vended_creds; then
+        before=$(dit_count "$loc")
+        assert_gt "$label: objects exist before the drop" 0 "${before:-0}"
+    fi
 
     out=$(q_may "$HOST" "SELECT coldfront.drop_iceberg_table('dropprobe','$t',$purge);")
     case "$out" in
