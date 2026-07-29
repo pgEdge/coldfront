@@ -1,0 +1,4 @@
+archiver usr/bin/
+partitioner usr/bin/
+compactor usr/bin/
+debian/tmp/sbom/* usr/share/pgedge-coldfront/

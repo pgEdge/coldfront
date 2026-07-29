@@ -50,13 +50,34 @@ builds:
       - amd64
       - arm64
 
-# One tarball per platform containing both binaries — archiver and partitioner
-# are deployed together.
+  # compactor lives in its own Go module (cmd/compactor/go.mod, heavy iceberg-go
+  # deps), so it is built with dir: pointed at that module. Still pure-Go
+  # (CGO_ENABLED=0), so it cross-compiles statically like the others.
+  - id: compactor
+    binary: compactor
+    main: .
+    dir: cmd/compactor
+    env:
+      - CGO_ENABLED=0
+    flags:
+      - -trimpath
+    ldflags:
+      - -s -w
+    goos:
+      - linux
+      - darwin
+    goarch:
+      - amd64
+      - arm64
+
+# One tarball per platform containing all three binaries — archiver,
+# partitioner and compactor are deployed together.
 archives:
   - id: coldfront
     ids:
       - archiver
       - partitioner
+      - compactor
     formats:
       - tar.gz
     name_template: >-

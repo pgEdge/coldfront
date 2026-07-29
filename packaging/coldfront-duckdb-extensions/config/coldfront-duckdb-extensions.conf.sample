@@ -1,0 +1,35 @@
+# =============================================================================
+# ColdFront DuckDB extensions — required configuration
+# =============================================================================
+#
+# This package installs the patched DuckDB extensions (iceberg, avro, azure,
+# postgres_scanner) under:
+#
+#     /usr/lib/pgedge/coldfront/duckdb-extensions/v<duckdb-version>/linux_<arch>/
+#
+# For pg_duckdb to load them from there (instead of downloading unpatched copies),
+# add the three settings below to your cluster and RESTART PostgreSQL.
+#
+# NOTE: duckdb.extension_directory is read at server start only — a reload is not
+# enough; you must restart. autoinstall_known_extensions MUST stay off: with it
+# on, a missing extension file makes DuckDB silently download the UNPATCHED
+# upstream extension.
+#
+# -----------------------------------------------------------------------------
+# Option A — append to postgresql.conf, then restart:
+# -----------------------------------------------------------------------------
+#
+#   duckdb.extension_directory = '/usr/lib/pgedge/coldfront/duckdb-extensions'
+#   duckdb.allow_unsigned_extensions = true
+#   duckdb.autoinstall_known_extensions = false
+#
+# -----------------------------------------------------------------------------
+# Option B — via ALTER SYSTEM (writes postgresql.auto.conf), then restart:
+# -----------------------------------------------------------------------------
+#
+#   ALTER SYSTEM SET duckdb.extension_directory = '/usr/lib/pgedge/coldfront/duckdb-extensions';
+#   ALTER SYSTEM SET duckdb.allow_unsigned_extensions = true;
+#   ALTER SYSTEM SET duckdb.autoinstall_known_extensions = false;
+#   -- then: restart the PostgreSQL service
+#
+# =============================================================================

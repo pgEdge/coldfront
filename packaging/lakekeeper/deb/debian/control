@@ -1,0 +1,29 @@
+Source: pgedge-lakekeeper
+Section: database
+Priority: optional
+Maintainer: pgEdge Build Team <support@pgedge.com>
+Build-Depends:
+ debhelper-compat (= 13),
+ systemd,
+Standards-Version: 4.7.0
+Rules-Requires-Root: no
+Homepage: https://lakekeeper.io
+
+Package: pgedge-lakekeeper
+Architecture: any
+Depends:
+ ${misc:Depends},
+ ${shlibs:Depends},
+ systemd,
+ adduser,
+Conflicts: lakekeeper
+Provides: lakekeeper
+Description: Lakekeeper - Apache Iceberg REST Catalog
+ Lakekeeper is an implementation of the Apache Iceberg REST Catalog. It stores
+ catalog state in PostgreSQL and serves the Iceberg REST API to query engines
+ and data tools.
+ .
+ This package installs the prebuilt lakekeeper binary and a systemd service.
+ Lakekeeper requires an external PostgreSQL 15+ database and is not enabled or
+ started automatically: configure /etc/lakekeeper/lakekeeper.env and run the
+ one-time database migration first.
