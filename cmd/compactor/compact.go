@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 
@@ -110,13 +111,25 @@ type planResult struct {
 	plan   compaction.Plan
 }
 
+// loadTableErr turns a LoadTable failure into the message the operator sees.
+// A missing table is the one case worth rewording: the REST catalog's own text
+// ("NoSuchTableException: Error getting tabular from catalog") names neither
+// the table nor anything actionable. Every other cause keeps its cause chain,
+// so a refused connection or a rejected credential still reads as itself.
+func loadTableErr(ns, name string, err error) error {
+	if errors.Is(err, catalog.ErrNoSuchTable) {
+		return fmt.Errorf("table %q not found in catalog", ns+"."+name)
+	}
+	return fmt.Errorf("load table %s.%s: %w", ns, name, err)
+}
+
 // planCompaction loads the table, scans its current snapshot, and bin-packs the
 // below-target data files into rewrite groups. This is the detection step: an
 // empty plan.groups means every file already meets the target — a clean no-op.
 func planCompaction(ctx context.Context, cat *rest.Catalog, ns, name string, targetSize int64) (*table.Table, *planResult, error) {
 	tbl, err := cat.LoadTable(ctx, catalog.ToIdentifier(ns, name))
 	if err != nil {
-		return nil, nil, fmt.Errorf("load table %s.%s: %w", ns, name, err)
+		return nil, nil, loadTableErr(ns, name, err)
 	}
 	tasks, err := tbl.Scan().PlanFiles(ctx)
 	if err != nil {
