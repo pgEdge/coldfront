@@ -23,12 +23,17 @@ export DUCKDB_EXT_VERSION="$DUCKDB_VERSION"
 export DUCKDB_EXT_BUILDNUM="${COMPONENT_BUILDNUM:-1}"
 
 # --- Build pins -------------------------------------------------------------------
-# duckdb-iceberg: the 4 patches target ICEBERG_REF (branch fetched first so the
+# duckdb-iceberg: the 3 patches target ICEBERG_REF (branch fetched first so the
 # ref resolves). avro/azure/postgres_scanner refs live in the extension_config
 # cmake (packaging copies docker/iceberg-azure-extension-config-v15.cmake).
+# ICEBERG_REF is read from the base-image Dockerfile — the single source of truth,
+# so the native extension build and the docker base image can never pin different
+# refs. CWD (repo root) is set by the caller before this file is sourced, the same
+# base the patch/cmake copies use.
 export ICEBERG_REPO="https://github.com/duckdb/duckdb-iceberg"
 export ICEBERG_BRANCH="${ICEBERG_BRANCH:-v1.5-variegata}"
-export ICEBERG_REF="${ICEBERG_REF:-0fad545a}"
+export ICEBERG_REF="${ICEBERG_REF:-$(sed -n 's/^ARG ICEBERG_REF=\([^[:space:]]*\).*/\1/p' "${CWD}/docker/Dockerfile.duckdb15-base" | head -1)}"
+: "${ICEBERG_REF:?could not read ARG ICEBERG_REF from docker/Dockerfile.duckdb15-base}"
 export DUCKDB_REPO="https://github.com/duckdb/duckdb"
 export VCPKG_REPO="https://github.com/microsoft/vcpkg"
 

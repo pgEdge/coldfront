@@ -45,12 +45,11 @@ git clone --depth 1 --branch "v${DUCKDB_VERSION}" --recurse-submodules "${DUCKDB
 git clone "${VCPKG_REPO}" "${BUILD_ROOT}/vcpkg"
 "${BUILD_ROOT}/vcpkg/bootstrap-vcpkg.sh" -disableMetrics
 
-# extension set (avro/azure/postgres_scanner refs) + the 4 ColdFront patches live
+# extension set (avro/azure/postgres_scanner refs) + the 3 ColdFront patches live
 # in the repo's docker/ dir; git apply --check fails loudly on patch rot.
 cp "${CWD}/docker/iceberg-azure-extension-config-v15.cmake" "$ICE/extension_config.cmake"
 for p in iceberg-bakery-aware-commit-refresh-v15 \
          iceberg-manifest-list-format-version-v15 \
-         iceberg-manifest-content-v15 \
          iceberg-data-file-format-v15; do
     git -C "$ICE" apply --check "${CWD}/docker/${p}.patch"
     git -C "$ICE" apply         "${CWD}/docker/${p}.patch"
