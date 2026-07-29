@@ -11,6 +11,7 @@ Homepage: https://github.com/pgEdge/ColdFront
 Package: pgedge-coldfront
 Architecture: any
 Depends:
+ adduser,
  ${misc:Depends},
  ${shlibs:Depends},
 Description: ColdFront tiered-storage command-line tools
