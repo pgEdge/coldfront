@@ -90,8 +90,18 @@ func (c *Config) storageProps() (iceberg.Properties, error) {
 		p[iceio.S3AccessKeyID] = c.S3.AccessKey
 		p[iceio.S3SecretAccessKey] = c.S3.SecretKey
 	}
-	if c.S3.Region != "" {
-		p[iceio.S3Region] = c.S3.Region
+	// The SDK refuses to sign an S3 request without a region, and its complaint
+	// ("A region must be set") names nothing in the YAML. Default it the way the
+	// archiver does so one config drives both tools, but only where an S3 store
+	// was actually configured: a vended deployment leaves this block empty and
+	// takes its region from Lakekeeper's vended table config, which an invented
+	// value would shadow (and which would be meaningless for vended ADLS).
+	region := c.S3.Region
+	if region == "" && (c.S3.Endpoint != "" || c.S3.AccessKey != "") {
+		region = "us-east-1"
+	}
+	if region != "" {
+		p[iceio.S3Region] = region
 	}
 	if c.S3.Endpoint != "" {
 		// S3-compatible store (SeaweedFS/MinIO) or GCS S3-interop: an explicit

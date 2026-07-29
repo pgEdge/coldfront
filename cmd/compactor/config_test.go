@@ -178,3 +178,74 @@ func TestWithColdStoreSigning_NoOverride(t *testing.T) {
 		})
 	}
 }
+
+func TestStorageProps_RegionDefault(t *testing.T) {
+	// An omitted region defaults to us-east-1 ONLY where an S3 store was
+	// actually configured, matching the archiver (internal/config:
+	// applyDefaults) so one YAML drives both tools. Without it the AWS SDK
+	// fails inside iceberg-go with "A region must be set", naming nothing the
+	// operator wrote. A vended deployment configures no store here and must be
+	// left alone: Lakekeeper vends s3.region in the table config, and inventing
+	// one would also stamp a meaningless s3.region on a vended ADLS store.
+	cases := []struct {
+		name   string
+		setup  func(*Config)
+		region string // "" means the key must be absent
+	}{
+		{"gcs interop, region omitted", func(c *Config) {
+			c.S3.Endpoint = "storage.googleapis.com"
+			c.S3.UseSSL = true
+			c.S3.AccessKey = "GOOGTESTHMAC"
+			c.S3.SecretKey = "secret"
+		}, "us-east-1"},
+		{"aws native, region omitted", func(c *Config) {
+			c.S3.AccessKey = "AKIAEXAMPLE"
+			c.S3.SecretKey = "secret"
+		}, "us-east-1"},
+		{"endpoint only, no creds", func(c *Config) {
+			c.S3.Endpoint = "seaweedfs:8333"
+		}, "us-east-1"},
+		{"explicit region wins", func(c *Config) {
+			c.S3.Endpoint = "seaweedfs:8333"
+			c.S3.Region = "eu-west-2"
+		}, "eu-west-2"},
+		{"vended: no store configured", func(c *Config) {
+			c.Iceberg.Warehouse = "wh"
+		}, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := &Config{}
+			tc.setup(c)
+			p, err := c.storageProps()
+			if err != nil {
+				t.Fatal(err)
+			}
+			got, ok := p[iceio.S3Region]
+			if tc.region == "" {
+				if ok {
+					t.Fatalf("region must be absent, got %q", got)
+				}
+				return
+			}
+			if got != tc.region {
+				t.Fatalf("region = %q, want %q", got, tc.region)
+			}
+		})
+	}
+}
+
+func TestStorageProps_AzureNeverGetsRegion(t *testing.T) {
+	// A static ADLS store returns before the S3 branch, so it cannot pick up an
+	// S3 region. Pinned because the region default lives on the other side of
+	// that early return.
+	c := &Config{}
+	c.Azure.ConnectionString = "DefaultEndpointsProtocol=https;AccountName=acct;AccountKey=a2V5;EndpointSuffix=core.windows.net"
+	p, err := c.storageProps()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, ok := p[iceio.S3Region]; ok {
+		t.Fatalf("azure must carry no s3.region, got %q", got)
+	}
+}
