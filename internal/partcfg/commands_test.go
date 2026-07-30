@@ -178,16 +178,16 @@ func TestPartKeyCols(t *testing.T) {
 	}
 }
 
-// mockRow / persistDB: the one-row surface requireLogged needs.
+// mockRow / persistDB: the one-row scalar surface the register guards need.
 type mockRow struct{ scan func(dest ...any) error }
 
 func (r *mockRow) Scan(dest ...any) error { return r.scan(dest...) }
 
 type persistDB struct {
 	mockDB
-	unlogged string
-	err      error
-	gotArgs  []any
+	scalar  string
+	err     error
+	gotArgs []any
 }
 
 func (p *persistDB) QueryRow(_ context.Context, _ string, args ...any) pgx.Row {
@@ -196,7 +196,7 @@ func (p *persistDB) QueryRow(_ context.Context, _ string, args ...any) pgx.Row {
 		if p.err != nil {
 			return p.err
 		}
-		*(dest[0].(*string)) = p.unlogged
+		*(dest[0].(*string)) = p.scalar
 		return nil
 	}}
 }
@@ -205,7 +205,7 @@ func TestRequireLogged_RejectsUnloggedRelations(t *testing.T) {
 	// An UNLOGGED partition is not WAL-logged, so its rows are gone after a
 	// crash. Registering such a table would tier data that PostgreSQL never
 	// promised to keep. The error must name the offending relations.
-	db := &persistDB{unlogged: "public.events_p_2026_01, public.events_p_2026_02"}
+	db := &persistDB{scalar: "public.events_p_2026_01, public.events_p_2026_02"}
 	err := requireLogged(context.Background(), db, "public", "events")
 	if err == nil {
 		t.Fatal("expected rejection")
@@ -218,7 +218,7 @@ func TestRequireLogged_RejectsUnloggedRelations(t *testing.T) {
 }
 
 func TestRequireLogged_AcceptsFullyLoggedTree(t *testing.T) {
-	db := &persistDB{unlogged: ""}
+	db := &persistDB{scalar: ""}
 	if err := requireLogged(context.Background(), db, "public", "events"); err != nil {
 		t.Fatalf("a permanent tree must pass: %v", err)
 	}
@@ -231,5 +231,41 @@ func TestRequireLogged_PropagatesQueryError(t *testing.T) {
 	db := &persistDB{err: errors.New("boom")}
 	if err := requireLogged(context.Background(), db, "public", "events"); err == nil {
 		t.Fatal("query failure must not be reported as a clean tree")
+	}
+}
+
+func TestRequireNoCaseCollision_RejectsDifferentCase(t *testing.T) {
+	// DuckDB resolves identifiers case-insensitively even when quoted, so
+	// public."Events" and public.events are ONE Iceberg table. Registering the
+	// second silently archives into the first. The error must name the row that
+	// already holds the folded name.
+	db := &persistDB{scalar: "public.events"}
+	err := requireNoCaseCollision(context.Background(), db, "public", "Events")
+	if err == nil {
+		t.Fatal("expected rejection")
+	}
+	for _, want := range []string{"public.events", "case-insensitively", "Events"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err.Error(), want)
+		}
+	}
+}
+
+func TestRequireNoCaseCollision_AllowsExactSameName(t *testing.T) {
+	// Re-registering the identical name is an update, not a collision: the SQL
+	// excludes the exact match, so an empty result means "no other row".
+	db := &persistDB{scalar: ""}
+	if err := requireNoCaseCollision(context.Background(), db, "public", "events"); err != nil {
+		t.Fatalf("re-registering the same name must be allowed: %v", err)
+	}
+	if len(db.gotArgs) != 2 || db.gotArgs[0] != "public" || db.gotArgs[1] != "events" {
+		t.Errorf("schema/table not passed as args: %v", db.gotArgs)
+	}
+}
+
+func TestRequireNoCaseCollision_PropagatesQueryError(t *testing.T) {
+	db := &persistDB{err: errors.New("boom")}
+	if err := requireNoCaseCollision(context.Background(), db, "public", "events"); err == nil {
+		t.Fatal("query failure must not be reported as no collision")
 	}
 }

@@ -195,6 +195,11 @@ func validateRow(ctx context.Context, db validateDB, row configRow) error {
 	// validate the PK / partition key against the real partitioned table. register
 	// runs pre-swap and resolves to the source unchanged, so every writer (register
 	// pre-swap, import/set post-swap) validates the same underlying table.
+	// Keyed on the registered name, not the resolved base: the registered name is
+	// what icebergRef turns into the cold table's identifier.
+	if err := requireNoCaseCollision(ctx, db, row.schema, row.table); err != nil {
+		return err
+	}
 	base := partition.ResolveSourceTable(ctx, db, row.schema, row.table)
 	if err := requireLogged(ctx, db, row.schema, base); err != nil {
 		return err
@@ -203,6 +208,40 @@ func validateRow(ctx context.Context, db validateDB, row configRow) error {
 		return err
 	}
 	return partition.ValidatePeriods(ctx, db, row.hot, row.retention)
+}
+
+// requireNoCaseCollision rejects a table whose name differs only by case from
+// one already registered. PostgreSQL keeps public."Events" and public.events
+// apart; the cold tier cannot. All Iceberg I/O goes through DuckDB, and DuckDB
+// matches identifiers case-insensitively even when they are quoted
+// (https://duckdb.org/docs/stable/sql/dialect/keywords_and_identifiers), so both
+// names resolve to ONE Iceberg table. Left unchecked, CREATE TABLE IF NOT EXISTS
+// for the second is a silent no-op and the archiver exports its rows into the
+// first table's schema.
+//
+// No configuration avoids this: preserve_identifier_case only controls whether
+// the original spelling is retained, not whether matching folds case. Refusing
+// the registration is therefore the only correct answer.
+//
+// The exact name is excluded so re-registering a table stays an update.
+func requireNoCaseCollision(ctx context.Context, db partition.RowQuerier, schema, table string) error {
+	var clash string
+	err := db.QueryRow(ctx, `
+		SELECT coalesce(string_agg(format('%I.%I', schema_name, table_name), ', '
+		                           ORDER BY schema_name, table_name), '')
+		FROM coldfront.partition_config
+		WHERE lower(schema_name) = lower($1::text) AND lower(table_name) = lower($2::text)
+		  AND NOT (schema_name = $1::text AND table_name = $2::text)`, schema, table).Scan(&clash)
+	if err != nil {
+		return fmt.Errorf("check name collision for %s.%s: %w", schema, table, err)
+	}
+	if clash != "" {
+		return fmt.Errorf("%s.%s collides with the already-registered %s: the cold tier matches "+
+			"identifiers case-insensitively, so both names would share one Iceberg table and "+
+			"overwrite each other; register a name that differs by more than case",
+			schema, table, clash)
+	}
+	return nil
 }
 
 // requireLogged rejects a table whose partition tree contains an UNLOGGED

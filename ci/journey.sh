@@ -3295,6 +3295,37 @@ EOSQL
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# Story — issue #66: a name differing only by case is refused at register.
+# PostgreSQL keeps public."Events" and public.events apart; DuckDB matches
+# identifiers case-insensitively even when quoted, so both would resolve to one
+# Iceberg table and the second would archive into the first. Registering the
+# mixed-case twin must fail before anything is written.
+# ───────────────────────────────────────────────────────────────────────────
+story_case_collision_rejected() {
+    step "issue #66: table name differing only by case rejected at register"
+    q "$HOST" "CREATE TABLE IF NOT EXISTS public.\"Events\" (
+        id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL, payload text,
+        PRIMARY KEY (id, ts)
+    ) PARTITION BY RANGE (ts);" >/dev/null
+    assert_eq "#66: PostgreSQL holds both names as distinct relations" "2" \
+        "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname IN ('events','Events') AND relnamespace='public'::regnamespace;")"
+    if "$ARCHIVER" register --config /tmp/journey-archiver.yaml --table Events \
+            --period monthly --hot-period "30 days" >/tmp/journey-casecoll.log 2>&1; then
+        fail "#66: register accepted a name colliding with the archived events table"
+    else
+        # Must name the row it collides with, so the operator knows which one.
+        assert_contains "#66: register named the colliding registration" "public.events" \
+            "$(cat /tmp/journey-casecoll.log)"
+    fi
+    assert_eq "#66: nothing registered for the mixed-case name" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='Events';")"
+    # The existing registration is untouched.
+    assert_eq "#66: the original events registration survives" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='events';")"
+    q "$HOST" "DROP TABLE IF EXISTS public.\"Events\" CASCADE;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Story — TC-114: TEMPORARY table invisible to archiver — register fails with
 # a "does not exist" error. TEMP tables are session-local; the archiver
 # connects in a new session and cannot see them.
@@ -3692,6 +3723,7 @@ if [ "$MODE" = "tiered" ]; then
     story_multitable_disable_one       # TC-109: disable one table; others still processed
     story_register_idempotent          # TC-110: re-register updates values; no duplicate row
     story_unlogged_rejected            # TC-113: UNLOGGED rejected at register
+    story_case_collision_rejected      # #66: name differing only by case rejected at register
     story_temp_rejected                # TC-114: TEMP table invisible to archiver
     story_list_partition_rejected      # TC-115: LIST partition accepted at register; rejected at archive
     story_hash_partition_rejected      # TC-116: HASH partition accepted at register; rejected at archive
