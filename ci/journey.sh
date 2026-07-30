@@ -119,6 +119,20 @@ vended_creds() { [ "$BACKEND" = vended ] || [ "$BACKEND" = azure-vended ]; }
 # rather than inventing a literal.
 hot_days() { echo $(( ( $(date -u +%s) - $(date -u -d "$(date -u +%Y-%m-01) -1 month" +%s) ) / 86400 )); }
 
+# assert_register_rejected <label> <table> <needle>: `archiver register` must
+# fail on <table> and say why. Passing a needle rather than only checking the
+# exit code keeps the assertion attributable to the rule under test.
+assert_register_rejected() {
+    local label="$1" tbl="$2" needle="$3" log
+    log="/tmp/journey-reject-$(echo "$tbl" | tr -c 'a-zA-Z0-9_' '_').log"
+    if "$ARCHIVER" register --config /tmp/journey-archiver.yaml --table "$tbl" \
+            --period monthly --hot-period "30 days" >"$log" 2>&1; then
+        fail "$label: register accepted it"
+    else
+        assert_contains "$label" "$needle" "$(cat "$log")"
+    fi
+}
+
 # archive_only — run the archiver with ONLY the partition_config rows matching a
 # keep predicate enabled, then restore the rows it disabled. The archiver takes
 # its table set from coldfront.partition_config, never from the YAML
@@ -3280,14 +3294,9 @@ CREATE UNLOGGED TABLE IF NOT EXISTS public.tc113_unlogged_p
 EOSQL
     assert_eq "TC-113: fixture has a permanent parent and an unlogged partition" "p|u" \
         "$(q "$HOST" "SELECT string_agg(relpersistence,'|' ORDER BY relname) FROM pg_class WHERE relname IN ('tc113_unlogged','tc113_unlogged_p');")"
-    if "$ARCHIVER" register --config /tmp/journey-archiver.yaml --table tc113_unlogged \
-            --period monthly --hot-period "30 days" >/tmp/journey-unlogged.log 2>&1; then
-        fail "TC-113: register accepted a tree containing an unlogged partition"
-    else
-        # Names the offending partition, not just the parent the caller typed.
-        assert_contains "TC-113: register named the unlogged partition" "tc113_unlogged_p" \
-            "$(cat /tmp/journey-unlogged.log)"
-    fi
+    # Names the offending partition, not just the parent the caller typed.
+    assert_register_rejected "TC-113: register named the unlogged partition" \
+        tc113_unlogged tc113_unlogged_p
     assert_eq "TC-113: nothing registered" "0" \
         "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='tc113_unlogged';")"
     q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name='tc113_unlogged';" >/dev/null 2>&1
@@ -3295,34 +3304,57 @@ EOSQL
 }
 
 # ───────────────────────────────────────────────────────────────────────────
-# Story — issue #66: a name differing only by case is refused at register.
-# PostgreSQL keeps public."Events" and public.events apart; DuckDB matches
-# identifiers case-insensitively even when quoted, so both would resolve to one
-# Iceberg table and the second would archive into the first. Registering the
-# mixed-case twin must fail before anything is written.
+# Story — a name differing only by case is refused at register. PostgreSQL keeps
+# public."Events" and public.events apart; DuckDB matches identifiers
+# case-insensitively even when quoted, so both resolve to one Iceberg table.
 # ───────────────────────────────────────────────────────────────────────────
 story_case_collision_rejected() {
-    step "issue #66: table name differing only by case rejected at register"
+    step "table name differing only by case rejected at register"
     q "$HOST" "CREATE TABLE IF NOT EXISTS public.\"Events\" (
         id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL, payload text,
         PRIMARY KEY (id, ts)
     ) PARTITION BY RANGE (ts);" >/dev/null
-    assert_eq "#66: PostgreSQL holds both names as distinct relations" "2" \
+    assert_eq "case collision: PostgreSQL holds both names as distinct relations" "2" \
         "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname IN ('events','Events') AND relnamespace='public'::regnamespace;")"
-    if "$ARCHIVER" register --config /tmp/journey-archiver.yaml --table Events \
-            --period monthly --hot-period "30 days" >/tmp/journey-casecoll.log 2>&1; then
-        fail "#66: register accepted a name colliding with the archived events table"
-    else
-        # Must name the row it collides with, so the operator knows which one.
-        assert_contains "#66: register named the colliding registration" "public.events" \
-            "$(cat /tmp/journey-casecoll.log)"
-    fi
-    assert_eq "#66: nothing registered for the mixed-case name" "0" \
+    # Names the row it collides with, so the operator knows which one.
+    assert_register_rejected "case collision: register named the colliding registration" \
+        Events public.events
+    assert_eq "case collision: nothing registered for the mixed-case name" "0" \
         "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='Events';")"
     # The existing registration is untouched.
-    assert_eq "#66: the original events registration survives" "1" \
+    assert_eq "case collision: the original events registration survives" "1" \
         "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='events';")"
     q "$HOST" "DROP TABLE IF EXISTS public.\"Events\" CASCADE;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story — names the partition naming scheme cannot carry are refused at register.
+# A leading "_" is the tiered hot table's prefix, and a partition is named
+# <name>_p_YYYY_MM (_p_YYYY_MM_DD daily), so the name must fit within 63 bytes.
+# ───────────────────────────────────────────────────────────────────────────
+story_bad_source_names_rejected() {
+    step "unrepresentable table names rejected at register"
+    local long53 long54
+    long53=$(head -c 53 < /dev/zero | tr "\\0" a); long54="${long53}a"
+    q "$HOST" "CREATE TABLE IF NOT EXISTS public._mytest (id bigint NOT NULL, ts timestamptz NOT NULL, PRIMARY KEY (id,ts)) PARTITION BY RANGE (ts);" >/dev/null
+    q "$HOST" "CREATE TABLE IF NOT EXISTS public.${long54} (id bigint NOT NULL, ts timestamptz NOT NULL, PRIMARY KEY (id,ts)) PARTITION BY RANGE (ts);" >/dev/null
+    q "$HOST" "CREATE TABLE IF NOT EXISTS public.${long53} (id bigint NOT NULL, ts timestamptz NOT NULL, PRIMARY KEY (id,ts)) PARTITION BY RANGE (ts);" >/dev/null
+
+    assert_register_rejected "name rules: register explained the reserved underscore" \
+        _mytest underscore
+    assert_register_rejected "name rules: register stated the 53-byte maximum" "$long54" 53
+    # The boundary must still be usable: 53 is exactly what monthly allows.
+    if "$ARCHIVER" register --config /tmp/journey-archiver.yaml --table "$long53" \
+            --period monthly --hot-period "30 days" >/tmp/journey-badname53.log 2>&1; then
+        pass "name rules: a 53-char name is accepted (the limit is not off by one)"
+    else
+        fail "name rules: 53 chars must be accepted — see /tmp/journey-badname53.log"; tail -3 /tmp/journey-badname53.log
+    fi
+
+    assert_eq "name rules: only the legal name reached partition_config" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name IN ('_mytest','${long53}','${long54}');")"
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name IN ('_mytest','${long53}','${long54}');" >/dev/null 2>&1
+    q "$HOST" "DROP TABLE IF EXISTS public._mytest, public.${long53}, public.${long54} CASCADE;" >/dev/null 2>&1
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -3466,9 +3498,9 @@ END \$do\$;
 INSERT INTO public.sa_items (ts, val) VALUES (date_trunc('month',now()) - interval '2 months' + interval '5 days', 'pub_cold');
 INSERT INTO sc2.sa_items    (ts, val) VALUES (date_trunc('month',now()) - interval '2 months' + interval '5 days', 'sc2_cold');
 EOSQL
-    # --hot-period is what makes these tiered rows. Registered with --retention
-    # alone they would be partition-only, the archiver would never load them, and
-    # every assertion below would read the untouched hot heap and pass.
+    # --hot-period is what makes these tiered rows. With --retention alone they are
+    # partition-only, the archiver never loads them, and the reads below pass
+    # against the untouched source.
     "$PARTITIONER" register --dsn "$dsn" --schema public --table sa_items --period monthly --hot-period "${ret_days} days" --retention "5 years" >/dev/null 2>&1
     "$PARTITIONER" register --dsn "$dsn" --schema sc2    --table sa_items --period monthly --hot-period "${ret_days} days" --retention "5 years" >/dev/null 2>&1
     assert_eq "TC-138: both sa_items registered as tiered" "2" \
@@ -3486,8 +3518,8 @@ EOF
     else
         fail "TC-138: archiver failed — see /tmp/journey-schema-coll.log"; tail -5 /tmp/journey-schema-coll.log
     fi
-    # Both really reached the cold tier. Without this, the reads below would be
-    # satisfied by the hot heap and would pass even if nothing was archived.
+    # Both really reached the cold tier; otherwise the reads below are served by
+    # the source table and pass even when nothing was archived.
     assert_eq "TC-138: public.sa_items is now a view over hot+cold" "v" \
         "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='sa_items' AND relnamespace='public'::regnamespace;")"
     assert_eq "TC-138: sc2.sa_items is now a view over hot+cold" "v" \
@@ -3506,8 +3538,8 @@ EOF
     q "$HOST" "DELETE FROM coldfront.partition_config  WHERE table_name='sa_items';" >/dev/null 2>&1
     q "$HOST" "DELETE FROM coldfront.archive_watermark WHERE table_name='sa_items';" >/dev/null 2>&1
     q "$HOST" "DELETE FROM coldfront.tiered_views      WHERE relname='sa_items';"    >/dev/null 2>&1
-    # public.sa_items is a view once archived, and DROP TABLE IF EXISTS errors on
-    # a name that exists as something else. The hot heap under it goes too.
+    # Once archived public.sa_items is a view, and DROP TABLE IF EXISTS errors on a
+    # name that exists as something else. The renamed table under it goes too.
     q "$HOST" "DROP VIEW  IF EXISTS public.sa_items;" >/dev/null 2>&1
     q "$HOST" "DROP TABLE IF EXISTS public._sa_items CASCADE;" >/dev/null 2>&1
     q "$HOST" "DROP TABLE IF EXISTS public.sa_items CASCADE;" >/dev/null 2>&1
@@ -3551,7 +3583,7 @@ dit_provision() {
     if [ "$mode" = decoupled ]; then
         q "$HOST" "SELECT coldfront.create_iceberg_table('dropprobe','$t','[{\"name\":\"id\",\"type\":\"bigint\"}]'::jsonb);" >/dev/null 2>&1
     else
-        # Tiered by construction: a real Iceberg cold table, a hot heap under the
+        # Tiered by construction: a real Iceberg cold table, the hot table under the
         # archiver's _-prefixed name, the transparent view in its place, and the
         # registration rows the archiver would have written.
         q "$HOST" "SELECT coldfront.ensure_attached(); SELECT duckdb.raw_query('CREATE TABLE IF NOT EXISTS ice.dropprobe.$t (id BIGINT)');" >/dev/null 2>&1
@@ -3723,7 +3755,8 @@ if [ "$MODE" = "tiered" ]; then
     story_multitable_disable_one       # TC-109: disable one table; others still processed
     story_register_idempotent          # TC-110: re-register updates values; no duplicate row
     story_unlogged_rejected            # TC-113: UNLOGGED rejected at register
-    story_case_collision_rejected      # #66: name differing only by case rejected at register
+    story_case_collision_rejected      # name differing only by case rejected at register
+    story_bad_source_names_rejected    # leading underscore and over-long names rejected
     story_temp_rejected                # TC-114: TEMP table invisible to archiver
     story_list_partition_rejected      # TC-115: LIST partition accepted at register; rejected at archive
     story_hash_partition_rejected      # TC-116: HASH partition accepted at register; rejected at archive

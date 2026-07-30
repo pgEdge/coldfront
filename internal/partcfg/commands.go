@@ -189,12 +189,17 @@ type validateDB interface {
 //     LIST column comes from the catalog).
 //   - period validity + retention>hot ordering: PostgreSQL interval semantics,
 //     checked against the connection (the interval column type is the backstop).
+//   - the name is representable by the partition naming scheme: no reserved
+//     leading underscore, and short enough for the generated leaf names.
 //   - every relation in the partition tree is WAL-logged (see requireLogged).
 func validateRow(ctx context.Context, db validateDB, row configRow) error {
 	// After the archiver's first-run swap the source is a VIEW over "_"+name, so
 	// validate the PK / partition key against the real partitioned table. register
 	// runs pre-swap and resolves to the source unchanged, so every writer (register
 	// pre-swap, import/set post-swap) validates the same underlying table.
+	if err := partition.ValidateSourceName(row.table, row.period); err != nil {
+		return err
+	}
 	// Keyed on the registered name, not the resolved base: the registered name is
 	// what icebergRef turns into the cold table's identifier.
 	if err := requireNoCaseCollision(ctx, db, row.schema, row.table); err != nil {
@@ -210,20 +215,10 @@ func validateRow(ctx context.Context, db validateDB, row configRow) error {
 	return partition.ValidatePeriods(ctx, db, row.hot, row.retention)
 }
 
-// requireNoCaseCollision rejects a table whose name differs only by case from
-// one already registered. PostgreSQL keeps public."Events" and public.events
-// apart; the cold tier cannot. All Iceberg I/O goes through DuckDB, and DuckDB
-// matches identifiers case-insensitively even when they are quoted
-// (https://duckdb.org/docs/stable/sql/dialect/keywords_and_identifiers), so both
-// names resolve to ONE Iceberg table. Left unchecked, CREATE TABLE IF NOT EXISTS
-// for the second is a silent no-op and the archiver exports its rows into the
-// first table's schema.
-//
-// No configuration avoids this: preserve_identifier_case only controls whether
-// the original spelling is retained, not whether matching folds case. Refusing
-// the registration is therefore the only correct answer.
-//
-// The exact name is excluded so re-registering a table stays an update.
+// requireNoCaseCollision rejects a table whose name differs only by case from one
+// already registered. DuckDB matches identifiers case-insensitively even when
+// quoted, so public."Events" and public.events are one Iceberg table. The exact
+// name is excluded, keeping re-registration an update.
 func requireNoCaseCollision(ctx context.Context, db partition.RowQuerier, schema, table string) error {
 	var clash string
 	err := db.QueryRow(ctx, `
@@ -245,13 +240,9 @@ func requireNoCaseCollision(ctx context.Context, db partition.RowQuerier, schema
 }
 
 // requireLogged rejects a table whose partition tree contains an UNLOGGED
-// relation. UNLOGGED data is not WAL-logged and is truncated after a crash, so
-// tiering it would archive rows PostgreSQL never promised to keep, and would
-// replicate nothing to a standby or a Spock peer.
-//
-// The whole tree is checked, not just the parent. A permanent parent may hold
-// UNLOGGED partitions on every supported major (PG18 forbids only an UNLOGGED
-// parent), and the partitions are what actually carry the rows.
+// relation: that data is truncated after a crash and replicates nowhere. The
+// whole tree is checked, since a permanent parent may hold UNLOGGED partitions
+// and the partitions carry the rows.
 func requireLogged(ctx context.Context, db partition.RowQuerier, schema, table string) error {
 	var unlogged string
 	err := db.QueryRow(ctx, `

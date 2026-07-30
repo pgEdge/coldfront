@@ -517,3 +517,54 @@ func TestRowCount(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, int64(42), count)
 }
+
+func TestValidateSourceName_LeadingUnderscoreReserved(t *testing.T) {
+	// "_" is the tiered hot table's prefix; the partition prefix trims one, so a
+	// source already starting with "_" yields a different prefix after the swap.
+	err := ValidateSourceName("_mytest", PeriodMonthly)
+	if err == nil {
+		t.Fatal("a leading underscore must be rejected")
+	}
+	if !strings.Contains(err.Error(), "_mytest") || !strings.Contains(err.Error(), "underscore") {
+		t.Errorf("error should name the table and the rule: %v", err)
+	}
+}
+
+func TestValidateSourceName_LengthBudgetPerPeriod(t *testing.T) {
+	// 63 less the "_" joiner and the date suffix: 9 monthly, 12 daily.
+	cases := []struct {
+		period string
+		ok     int // longest name that must be accepted
+	}{
+		{PeriodMonthly, 53},
+		{PeriodDaily, 50},
+	}
+	for _, c := range cases {
+		if err := ValidateSourceName(strings.Repeat("a", c.ok), c.period); err != nil {
+			t.Errorf("%s: %d chars must be accepted: %v", c.period, c.ok, err)
+		}
+		if err := ValidateSourceName(strings.Repeat("a", c.ok+1), c.period); err == nil {
+			t.Errorf("%s: %d chars must be rejected", c.period, c.ok+1)
+		}
+	}
+}
+
+func TestValidateSourceName_RejectionNamesTheLimit(t *testing.T) {
+	err := ValidateSourceName(strings.Repeat("a", 54), PeriodMonthly)
+	if err == nil {
+		t.Fatal("expected rejection")
+	}
+	for _, want := range []string{"53", "54"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q should state actual and maximum length", err.Error())
+		}
+	}
+}
+
+func TestValidateSourceName_AcceptsOrdinaryNames(t *testing.T) {
+	for _, p := range []string{PeriodMonthly, PeriodDaily} {
+		if err := ValidateSourceName("events", p); err != nil {
+			t.Errorf("%s: plain name rejected: %v", p, err)
+		}
+	}
+}

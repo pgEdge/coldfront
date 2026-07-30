@@ -202,9 +202,7 @@ func (p *persistDB) QueryRow(_ context.Context, _ string, args ...any) pgx.Row {
 }
 
 func TestRequireLogged_RejectsUnloggedRelations(t *testing.T) {
-	// An UNLOGGED partition is not WAL-logged, so its rows are gone after a
-	// crash. Registering such a table would tier data that PostgreSQL never
-	// promised to keep. The error must name the offending relations.
+	// The error names the offending relations.
 	db := &persistDB{scalar: "public.events_p_2026_01, public.events_p_2026_02"}
 	err := requireLogged(context.Background(), db, "public", "events")
 	if err == nil {
@@ -235,10 +233,7 @@ func TestRequireLogged_PropagatesQueryError(t *testing.T) {
 }
 
 func TestRequireNoCaseCollision_RejectsDifferentCase(t *testing.T) {
-	// DuckDB resolves identifiers case-insensitively even when quoted, so
-	// public."Events" and public.events are ONE Iceberg table. Registering the
-	// second silently archives into the first. The error must name the row that
-	// already holds the folded name.
+	// The error names the row already holding the folded name.
 	db := &persistDB{scalar: "public.events"}
 	err := requireNoCaseCollision(context.Background(), db, "public", "Events")
 	if err == nil {
@@ -252,8 +247,7 @@ func TestRequireNoCaseCollision_RejectsDifferentCase(t *testing.T) {
 }
 
 func TestRequireNoCaseCollision_AllowsExactSameName(t *testing.T) {
-	// Re-registering the identical name is an update, not a collision: the SQL
-	// excludes the exact match, so an empty result means "no other row".
+	// Re-registering the identical name is an update, not a collision.
 	db := &persistDB{scalar: ""}
 	if err := requireNoCaseCollision(context.Background(), db, "public", "events"); err != nil {
 		t.Fatalf("re-registering the same name must be allowed: %v", err)
