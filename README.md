@@ -1,7 +1,7 @@
 # pgEdge ColdFront
 
 > [!WARNING]
-> ColdFront is pre-release beta software under active development. Do
+> ColdFront is beta software under active development. Do
 > not use it in production. Interfaces, on-disk formats, and behaviour
 > may change without notice, and data loss is possible.
 
