@@ -3,6 +3,7 @@ package partition
 import (
 	"context"
 	"fmt"
+	"strconv"
 	"strings"
 	"time"
 
@@ -88,16 +89,60 @@ func ParseBoundExpr(expr string) (lower, upper time.Time, err error) {
 // timestamptz; time.Parse consumes any trailing fractional second on its own.
 // Callers connect via Connect, which pins the session so the render stays in this set.
 func parseTimestamp(s string) (time.Time, error) {
+	year, rest, ok := splitYear(s)
+	if !ok {
+		return time.Time{}, fmt.Errorf("unrecognized timestamp format: %q", s)
+	}
 	for _, layout := range []string{
 		"2006-01-02 15:04:05-07",
 		time.DateTime,
 		time.DateOnly,
 	} {
-		if t, err := time.Parse(layout, s); err == nil {
-			return t.UTC(), nil
+		// Pinned to UTC: a "+00" offset otherwise binds to the local zone, where
+		// rebuilding a pre-1900 date resolves to LMT and skews it by seconds.
+		t, err := time.ParseInLocation(layout, placeholderYear+rest, time.UTC)
+		if err != nil {
+			continue
 		}
+		got := time.Date(year, t.Month(), t.Day(), t.Hour(), t.Minute(), t.Second(),
+			t.Nanosecond(), t.Location())
+		// time.Date normalizes an impossible date (Feb 29 of a common year), so
+		// reject the rewrite if the calendar moved under it.
+		if got.Month() != t.Month() || got.Day() != t.Day() {
+			return time.Time{}, fmt.Errorf("unrecognized timestamp format: %q", s)
+		}
+		return got.UTC(), nil
 	}
 	return time.Time{}, fmt.Errorf("unrecognized timestamp format: %q", s)
+}
+
+// placeholderYear stands in for the real year while time.Parse reads the rest of
+// the value. It is a leap year so a Feb 29 bound parses.
+const placeholderYear = "2000"
+
+// splitYear separates the leading year from a PostgreSQL timestamp rendering and
+// returns it as an astronomical year with the remainder of the string. The year
+// is 1 to 7 digits wide (PostgreSQL spans 4713 BC to 5874897 AD) where
+// time.Parse's "2006" consumes exactly four, and a " BC" suffix means year N is
+// astronomical 1-N.
+func splitYear(s string) (year int, rest string, ok bool) {
+	bc := strings.HasSuffix(s, " BC")
+	s = strings.TrimSuffix(s, " BC")
+	i := 0
+	for i < len(s) && s[i] >= '0' && s[i] <= '9' {
+		i++
+	}
+	if i == 0 || i == len(s) || s[i] != '-' {
+		return 0, "", false
+	}
+	y, err := strconv.Atoi(s[:i])
+	if err != nil {
+		return 0, "", false
+	}
+	if bc {
+		y = 1 - y
+	}
+	return y, s[i:], true
 }
 
 // boundConnConfig parses dsn and pins DateStyle and TimeZone as connection

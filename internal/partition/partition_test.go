@@ -568,3 +568,49 @@ func TestValidateSourceName_AcceptsOrdinaryNames(t *testing.T) {
 		}
 	}
 }
+
+// PostgreSQL renders bounds across its whole domain: 4713 BC to 294276 AD for
+// timestamp/timestamptz and to 5874897 AD for date, with " BC" appended for
+// years before 1. Go's "2006" layout consumes exactly four digits, so the wide
+// years and the era suffix need handling of their own.
+func TestParseTimestamp_FullPostgresDomain(t *testing.T) {
+	tests := []struct {
+		in   string
+		want time.Time
+	}{
+		{"2026-06-01 00:00:00+00", time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)},
+		{"9999-12-31 00:00:00+00", time.Date(9999, 12, 31, 0, 0, 0, 0, time.UTC)},
+		{"10000-06-01 00:00:00+00", time.Date(10000, 6, 1, 0, 0, 0, 0, time.UTC)},
+		{"294276-12-31 00:00:00+00", time.Date(294276, 12, 31, 0, 0, 0, 0, time.UTC)},
+		{"5874897-12-31", time.Date(5874897, 12, 31, 0, 0, 0, 0, time.UTC)},
+		// 1 BC is astronomical year 0, so N BC is 1-N.
+		{"0001-01-01 00:00:00+00 BC", time.Date(0, 1, 1, 0, 0, 0, 0, time.UTC)},
+		{"4713-01-01 00:00:00+00 BC", time.Date(-4712, 1, 1, 0, 0, 0, 0, time.UTC)},
+		{"0044-03-15 BC", time.Date(-43, 3, 15, 0, 0, 0, 0, time.UTC)},
+		// A leap day must survive whatever placeholder year the parser uses.
+		{"10000-02-29 00:00:00+00", time.Date(10000, 2, 29, 0, 0, 0, 0, time.UTC)},
+	}
+	for _, tc := range tests {
+		got, err := parseTimestamp(tc.in)
+		if err != nil {
+			t.Errorf("parseTimestamp(%q): %v", tc.in, err)
+			continue
+		}
+		if !got.Equal(tc.want) {
+			t.Errorf("parseTimestamp(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+// The parser stays strict: its rejection is the seam the open-bound and default
+// handlers branch on, so a non-timestamp token must never parse.
+func TestParseTimestamp_StillRejectsNonTimestamps(t *testing.T) {
+	for _, in := range []string{
+		"MINVALUE", "MAXVALUE", "infinity", "-infinity", "DEFAULT",
+		"", "BC", " BC", "not-a-date", "2026-13-01 00:00:00+00", "20x6-01-01",
+	} {
+		if got, err := parseTimestamp(in); err == nil {
+			t.Errorf("parseTimestamp(%q) = %v, want an error", in, got)
+		}
+	}
+}

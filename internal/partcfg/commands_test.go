@@ -263,3 +263,37 @@ func TestRequireNoCaseCollision_PropagatesQueryError(t *testing.T) {
 		t.Fatal("query failure must not be reported as no collision")
 	}
 }
+
+func TestRequireNoDefaultPartition_Rejects(t *testing.T) {
+	// A DEFAULT partition has no bounds, so its rows never tier and never
+	// expire, and PostgreSQL refuses DETACH CONCURRENTLY for every partition of
+	// a table that has one, which is how partitions are expired. The error names
+	// it and the remedy.
+	db := &persistDB{scalar: "public.events_default"}
+	err := requireNoDefaultPartition(context.Background(), db, "public", "events")
+	if err == nil {
+		t.Fatal("expected rejection")
+	}
+	for _, want := range []string{"events_default", "default partition", "detach"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err.Error(), want)
+		}
+	}
+}
+
+func TestRequireNoDefaultPartition_AcceptsPlainTable(t *testing.T) {
+	db := &persistDB{scalar: ""}
+	if err := requireNoDefaultPartition(context.Background(), db, "public", "events"); err != nil {
+		t.Fatalf("a table with no default must pass: %v", err)
+	}
+	if len(db.gotArgs) != 2 || db.gotArgs[0] != "public" || db.gotArgs[1] != "events" {
+		t.Errorf("schema/table not passed as args: %v", db.gotArgs)
+	}
+}
+
+func TestRequireNoDefaultPartition_PropagatesQueryError(t *testing.T) {
+	db := &persistDB{err: errors.New("boom")}
+	if err := requireNoDefaultPartition(context.Background(), db, "public", "events"); err == nil {
+		t.Fatal("query failure must not be reported as no default")
+	}
+}

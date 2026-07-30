@@ -905,7 +905,7 @@ func dropColdBeforeRetention(ctx context.Context, conn *pgx.Conn, iceTable, part
 		`DELETE FROM %s WHERE %s < '%s'::timestamptz`,
 		iceTable,
 		pgx.Identifier{partCol}.Sanitize(),
-		cutoff.UTC().Format("2006-01-02 15:04:05+00"))
+		sqlutil.Timestamp(cutoff))
 	q, err := dollarQuote(inner)
 	if err != nil {
 		return err
@@ -1134,9 +1134,9 @@ func wipeIcebergRange(ctx context.Context, conn *pgx.Conn, iceTable, partCol str
 		`DELETE FROM %s WHERE %s >= '%s'::timestamptz AND %s < '%s'::timestamptz%s`,
 		iceTable,
 		pgx.Identifier{partCol}.Sanitize(),
-		lower.UTC().Format("2006-01-02 15:04:05+00"),
+		sqlutil.Timestamp(lower),
 		pgx.Identifier{partCol}.Sanitize(),
-		upper.UTC().Format("2006-01-02 15:04:05+00"),
+		sqlutil.Timestamp(upper),
 		listPred)
 	q, err := dollarQuote(inner)
 	if err != nil {

@@ -192,6 +192,7 @@ type validateDB interface {
 //   - the name is representable by the partition naming scheme: no reserved
 //     leading underscore, and short enough for the generated leaf names.
 //   - every relation in the partition tree is WAL-logged (see requireLogged).
+//   - the table has no DEFAULT partition (see requireNoDefaultPartition).
 func validateRow(ctx context.Context, db validateDB, row configRow) error {
 	// After the archiver's first-run swap the source is a VIEW over "_"+name, so
 	// validate the PK / partition key against the real partitioned table. register
@@ -207,6 +208,9 @@ func validateRow(ctx context.Context, db validateDB, row configRow) error {
 	}
 	base := partition.ResolveSourceTable(ctx, db, row.schema, row.table)
 	if err := requireLogged(ctx, db, row.schema, base); err != nil {
+		return err
+	}
+	if err := requireNoDefaultPartition(ctx, db, row.schema, base); err != nil {
 		return err
 	}
 	if err := validatePKSuperset(ctx, db, row.schema, base, row.column, row.subValues != ""); err != nil {
@@ -235,6 +239,34 @@ func requireNoCaseCollision(ctx context.Context, db partition.RowQuerier, schema
 			"identifiers case-insensitively, so both names would share one Iceberg table and "+
 			"overwrite each other; register a name that differs by more than case",
 			schema, table, clash)
+	}
+	return nil
+}
+
+// requireNoDefaultPartition rejects a table that has a DEFAULT partition. Such a
+// partition has no bounds, so nothing it catches can be tiered or expired, and
+// PostgreSQL refuses DETACH CONCURRENTLY for every partition of a table that has
+// one, which is how partitions are expired. Its presence also blocks creating a
+// range partition over rows it already holds.
+func requireNoDefaultPartition(ctx context.Context, db partition.RowQuerier, schema, table string) error {
+	var name string
+	err := db.QueryRow(ctx, `
+		SELECT coalesce(max(format('%I.%I', n.nspname, c.relname)), '')
+		FROM pg_inherits i
+		JOIN pg_class c ON c.oid = i.inhrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		JOIN pg_class p ON p.oid = i.inhparent
+		JOIN pg_namespace pn ON pn.oid = p.relnamespace
+		WHERE pn.nspname = $1::text AND p.relname = $2::text
+		  AND pg_get_expr(c.relpartbound, c.oid) = 'DEFAULT'`, schema, table).Scan(&name)
+	if err != nil {
+		return fmt.Errorf("check for a default partition on %s.%s: %w", schema, table, err)
+	}
+	if name != "" {
+		return fmt.Errorf("%s.%s has a default partition (%s): its rows can never be tiered or "+
+			"expired, and PostgreSQL blocks concurrent detach of every partition while it exists; "+
+			"move any rows it holds and detach it",
+			schema, table, name)
 	}
 	return nil
 }

@@ -73,7 +73,7 @@ func (c ViewConfig) hasCutoff() bool {
 // cutoffLiteral formats the cutoff as a SQL timestamp literal in UTC
 // suitable for embedding in the generated view definition.
 func (c ViewConfig) cutoffLiteral() string {
-	return c.CutoffTime.UTC().Format("2006-01-02 15:04:05+00")
+	return sqlutil.Timestamp(c.CutoffTime)
 }
 
 // fqSource returns the fully qualified original table name (which becomes the view).
