@@ -3304,6 +3304,76 @@ EOSQL
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# Story — partition bounds outside the ordinary finite-ISO shape. PostgreSQL
+# spans 4713 BC to 5874897 AD and renders " BC" below year 1, and a partition
+# edge may be open (MINVALUE/MAXVALUE, infinity) or absent entirely (DEFAULT).
+# A table carrying any of these must not abort the run: the archiver reads every
+# table in one pass, so one unreadable bound would strand every table after it.
+# ───────────────────────────────────────────────────────────────────────────
+story_exotic_partition_bounds() {
+    step "exotic partition bounds do not abort the archiver"
+    # The MINVALUE partition ends up below the watermark once the BC one
+    # archives, so it takes the cleanupAlreadyArchived path, whose peer detach
+    # needs peer DSNs the host-side archiver cannot resolve. Same reason TC-024
+    # skips here; bound parsing is topology-independent and the vanilla cells
+    # cover it.
+    if [ "$MESH" = 1 ]; then
+        note "exotic bounds: skipping in mesh mode (cleanupAlreadyArchived peer detach requires resolvable peer DSNs)"
+        return
+    fi
+    local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
+    q "$HOST" "CREATE SCHEMA IF NOT EXISTS xb;" >/dev/null
+    # Ascending, non-overlapping, all inside PostgreSQL's range (4713 BC to
+    # 294276 AD for timestamptz). No default here: a default constrains
+    # maintenance table-wide, which is exercised on its own table below.
+    qf "$HOST" <<'EOSQL' >/dev/null
+CREATE TABLE IF NOT EXISTS xb.events (
+    id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL, val text,
+    PRIMARY KEY (id, ts)
+) PARTITION BY RANGE (ts);
+CREATE TABLE IF NOT EXISTS xb.events_open_lo PARTITION OF xb.events FOR VALUES FROM (MINVALUE) TO ('0100-01-01 BC');
+CREATE TABLE IF NOT EXISTS xb.events_bc      PARTITION OF xb.events FOR VALUES FROM ('0100-01-01 BC') TO ('0043-01-01 BC');
+CREATE TABLE IF NOT EXISTS xb.events_wide    PARTITION OF xb.events FOR VALUES FROM ('10000-06-01') TO ('20000-01-01');
+INSERT INTO xb.events (ts, val) VALUES ('0044-03-15 00:00:00+00 BC', 'ides');
+EOSQL
+    "$PARTITIONER" register --dsn "$dsn" --schema xb --table events \
+        --period monthly --hot-period "30 days" --retention "5 years" >/dev/null 2>&1
+    if archive_only "schema_name='xb' AND table_name='events'" /tmp/journey-archiver.yaml /tmp/journey-xb.log; then
+        pass "exotic bounds: archiver completed instead of aborting"
+    else
+        fail "exotic bounds: archiver aborted — see /tmp/journey-xb.log"; tail -8 /tmp/journey-xb.log
+    fi
+    # The BC partition is past the hot window, so it tiered: its bound is read as
+    # an astronomical year and written back with the era suffix PostgreSQL wants.
+    assert_eq "exotic bounds: the BC partition archived to the cold tier" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.tiered_views WHERE schema_name='xb' AND relname='events';")"
+    # MINVALUE and the year-20000 bound must not have stopped the pass.
+    assert_contains "exotic bounds: the BC partition reached cutover" "archived events_bc" \
+        "$(cat /tmp/journey-xb.log)"
+
+    # A DEFAULT partition is refused outright at registration: its rows could
+    # never tier or expire, and PostgreSQL blocks concurrent detach of every
+    # partition of the table while one exists, which is how partitions expire.
+    qf "$HOST" <<'EOSQL' >/dev/null
+CREATE TABLE IF NOT EXISTS public.xb_withdef (
+    id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL,
+    PRIMARY KEY (id, ts)
+) PARTITION BY RANGE (ts);
+CREATE TABLE IF NOT EXISTS public.xb_withdef_default PARTITION OF public.xb_withdef DEFAULT;
+EOSQL
+    assert_register_rejected "default partition: register names it and the remedy" \
+        xb_withdef xb_withdef_default
+    assert_eq "default partition: nothing registered" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='xb_withdef';")"
+    q "$HOST" "DROP TABLE IF EXISTS public.xb_withdef CASCADE;" >/dev/null 2>&1
+
+    q "$HOST" "DELETE FROM coldfront.partition_config  WHERE schema_name='xb';" >/dev/null 2>&1
+    q "$HOST" "DELETE FROM coldfront.archive_watermark WHERE schema_name='xb';" >/dev/null 2>&1
+    q "$HOST" "DELETE FROM coldfront.tiered_views      WHERE schema_name='xb';" >/dev/null 2>&1
+    q "$HOST" "DROP SCHEMA xb CASCADE;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Story — a name differing only by case is refused at register. PostgreSQL keeps
 # public."Events" and public.events apart; DuckDB matches identifiers
 # case-insensitively even when quoted, so both resolve to one Iceberg table.
@@ -3763,6 +3833,7 @@ if [ "$MODE" = "tiered" ]; then
     story_partition_col_timestamp      # TC-066: timestamp (no tz) partition column
     story_partition_col_date           # TC-067: date partition column
     story_partition_col_text_rejected  # TC-070: text partition column rejected at archive
+    story_exotic_partition_bounds      # BC, wide years, open-ended and DEFAULT bounds
     story_schema_collision             # TC-138: same table name in two schemas — distinct Iceberg namespaces
     story_seaweedfs_restart            # TC-062: SeaweedFS restart; cold data persists
     story_pg_restart                   # TC-063: PG restart; DuckDB secret reloads; cold reads work
