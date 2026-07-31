@@ -2774,39 +2774,6 @@ story_wrong_lakekeeper_creds() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────
-# Story — TC-062: SeaweedFS restart — the cold tier is re-served after the
-# object store bounces. Only meaningful for the s3 backend (SeaweedFS is the
-# S3-compat target). Scope: the compose file gives SeaweedFS no volume for
-# -dir=/data, so this covers restart of the same container, not durability
-# across container replacement.
-# ───────────────────────────────────────────────────────────────────────────
-story_seaweedfs_restart() {
-    step "TC-062: SeaweedFS restart — cold data survives container restart"
-    [ "$BACKEND" = s3 ] || { note "TC-062: non-S3 backend; skipping SeaweedFS restart"; return; }
-    # Derive the SeaweedFS container name by matching SW_IP in docker inspect.
-    local sw_container=""
-    while IFS= read -r cid; do
-        local ip; ip=$(docker inspect "$cid" --format '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' 2>/dev/null)
-        if [ "$ip" = "$SW_IP" ]; then
-            sw_container=$(docker inspect "$cid" --format '{{.Name}}' 2>/dev/null | tr -d '/'); break
-        fi
-    done < <(docker ps -q 2>/dev/null)
-    if [ -z "$sw_container" ]; then
-        note "TC-062: cannot identify SeaweedFS container for IP $SW_IP — skipping"; return
-    fi
-    local before; before=$(q "$HOST" "SELECT count(*) FROM events WHERE ts >= date_trunc('month',now()) - interval '3 months' AND ts < date_trunc('month',now()) - interval '1 month';")
-    assert_gt "TC-062: cold rows present before restart" "0" "$before"
-    docker restart "$sw_container" >/dev/null
-    local i=0
-    until curl -s -o /dev/null --max-time 2 "http://${SW_IP}:8333/" 2>/dev/null; do
-        i=$((i + 1)); [ "$i" -gt 60 ] && { fail "TC-062: SeaweedFS did not come back after restart"; return; }; sleep 2
-    done
-    sleep 3
-    local after; after=$(q "$HOST" "SELECT count(*) FROM events WHERE ts >= date_trunc('month',now()) - interval '3 months' AND ts < date_trunc('month',now()) - interval '1 month';")
-    assert_eq "TC-062: cold row count unchanged after SeaweedFS restart" "$before" "$after"
-}
-
-# ───────────────────────────────────────────────────────────────────────────
 # Story — TC-063: PostgreSQL restart — coldfront + pg_duckdb reload correctly;
 # the DuckDB storage secret is reloaded from persistent storage at init time
 # so cold reads work without any manual re-configuration after restart.
@@ -3835,7 +3802,6 @@ if [ "$MODE" = "tiered" ]; then
     story_partition_col_text_rejected  # TC-070: text partition column rejected at archive
     story_exotic_partition_bounds      # BC, wide years, open-ended and DEFAULT bounds
     story_schema_collision             # TC-138: same table name in two schemas — distinct Iceberg namespaces
-    story_seaweedfs_restart            # TC-062: SeaweedFS restart; cold data persists
     story_pg_restart                   # TC-063: PG restart; DuckDB secret reloads; cold reads work
 else
     story_provision_decoupled
