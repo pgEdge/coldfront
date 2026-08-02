@@ -3,6 +3,7 @@ package partition
 import (
 	"context"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -260,10 +261,10 @@ func (m *Manager) EnsureCurrent(ctx context.Context, parent, schema, period stri
 func (m *Manager) createPartition(ctx context.Context, parent, schema, period string, d time.Time, b Boundary, leafPrefix string) error {
 	lower, upper := PartitionBounds(d, period)
 	// Table-scope the leaf name. The date suffix alone (p_2026_06) is not unique
-	// within a schema, so two flat tables in the same schema would generate the
-	// SAME partition name and the second's CREATE … IF NOT EXISTS would silently
-	// no-op (issue #11). Prefixing with the parent table makes every leaf unique
-	// per schema — the same scheme the 2-level path already uses (child_p_2026_06).
+	// within a schema, so two flat tables in one schema generate the SAME
+	// partition name and the second's CREATE … IF NOT EXISTS silently no-ops.
+	// Prefixing with the parent table makes every leaf unique per schema, the
+	// same scheme the 2-level path uses (child_p_2026_06).
 	// The leading "_" of a tiered hot table is stripped so the prefix is STABLE
 	// across the archiver's events→_events rename: premake (pre-swap, parent
 	// "events") and a later run (post-swap, parent "_events") must produce the
@@ -284,11 +285,11 @@ func (m *Manager) createPartition(ctx context.Context, parent, schema, period st
 	if _, err := m.db.Exec(ctx, sql); err != nil { // nosemgrep
 		return fmt.Errorf("create partition %s: %w", name, err)
 	}
-	// CREATE … IF NOT EXISTS no-ops if a relation with this name already exists —
+	// CREATE … IF NOT EXISTS no-ops if a relation with this name already exists,
 	// even one attached to a DIFFERENT parent (a name collision, or identifier
 	// truncation). Verify the partition is actually attached to OUR parent, so a
-	// collision fails loud instead of silently leaving the table partition-less
-	// and the run reporting success (issue #11, bug 2).
+	// collision fails loud instead of leaving the table partition-less while the
+	// run reports success.
 	var attached bool
 	if err := m.db.QueryRow(ctx, /* nosemgrep */
 		`SELECT EXISTS(SELECT 1 FROM pg_inherits WHERE inhrelid = to_regclass($1) AND inhparent = to_regclass($2))`,
@@ -317,7 +318,18 @@ func (m *Manager) FindExpired(ctx context.Context, parent, schema string, cutoff
 }
 
 // listPartitions enumerates every direct partition of parent with its bounds
-// decoded to time via the Boundary. Shared by FindExpired and EnsureCurrent.
+// decoded to time via the Boundary, in ascending bound order. Shared by
+// FindExpired and EnsureCurrent.
+//
+// The order comes from the bounds. A partition's place in time is its range;
+// the name is a label the caller chose, free to sort against the calendar
+// (unpadded month numbers, where "10" precedes "9" as text; month
+// abbreviations; an open MINVALUE edge). Callers that walk the result in order
+// depend on it being chronological: the archiver tiers candidates in this
+// order and advances the watermark to each upper bound in turn, so every
+// partition is reached while the watermark still sits below its range. The SQL
+// order only makes the fetch deterministic; the stable sort below establishes
+// the contract.
 func (m *Manager) listPartitions(ctx context.Context, parent, schema string, b Boundary) ([]Info, error) {
 	const query = `
 		SELECT c.relname, pg_get_expr(c.relpartbound, c.oid)
@@ -346,7 +358,14 @@ func (m *Manager) listPartitions(ctx context.Context, parent, schema string, b B
 		}
 		parts = append(parts, Info{Name: name, LowerBound: lower, UpperBound: upper})
 	}
-	return parts, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	// One parent's ranges are disjoint, so the lower bound totally orders them.
+	sort.SliceStable(parts, func(i, j int) bool {
+		return parts[i].LowerBound.Before(parts[j].LowerBound)
+	})
+	return parts, nil
 }
 
 // Detach detaches a partition from its parent concurrently. CONCURRENTLY avoids

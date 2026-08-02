@@ -2481,14 +2481,18 @@ EOF
 }
 
 # ───────────────────────────────────────────────────────────────────────────
-# Story — TC-024: an empty (0-row) partition archives cleanly through all six
-# phases (0–5). The partition must be created in the PUBLIC schema with an
-# explicit prefix — the coldfront user's search_path defaults to
+# Story: TC-024, an empty (0-row) partition over a range the cold tier already
+# covers is dropped cleanly and the run still exits 0. Every month past the hot
+# window on this table also sits below the watermark, so this exercises the
+# stale-partition cleanup branch; the drop is allowed precisely because the
+# partition holds no rows (story_partition_order_by_bound covers the non-empty
+# case, which is refused). The partition must be created in the PUBLIC schema
+# with an explicit prefix: the coldfront user's search_path defaults to
 # coldfront,public, so a bare CREATE TABLE lands in the coldfront schema and
-# the PK check (nspname='public') would find 0 primary-key columns.
+# the PK check (nspname='public') finds 0 primary-key columns.
 # ───────────────────────────────────────────────────────────────────────────
 story_empty_partition() {
-    step "TC-024: 0-row partition archives cleanly (all 6 phases, exit 0)"
+    step "TC-024: 0-row partition over an already-cold range is dropped (exit 0)"
     # In mesh mode cleanupAlreadyArchived fans out DETACH CONCURRENTLY to Spock
     # peers via their interface DSN; those hostnames are not resolvable from the
     # archiver host in the journey config. Skip here — same reason as
@@ -2510,8 +2514,7 @@ story_empty_partition() {
     else
         fail "TC-024: archiver failed on empty partition — see /tmp/journey-empty-part.log"; tail -8 /tmp/journey-empty-part.log
     fi
-    # Phase 5 drops the partition from PG after cutover.
-    assert_eq "TC-024: empty partition archived and dropped from PG" "0" \
+    assert_eq "TC-024: empty partition dropped from PG" "0" \
         "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname='${pname}' AND relnamespace='public'::regnamespace;")"
 }
 
@@ -3279,15 +3282,6 @@ EOSQL
 # ───────────────────────────────────────────────────────────────────────────
 story_exotic_partition_bounds() {
     step "exotic partition bounds do not abort the archiver"
-    # The MINVALUE partition ends up below the watermark once the BC one
-    # archives, so it takes the cleanupAlreadyArchived path, whose peer detach
-    # needs peer DSNs the host-side archiver cannot resolve. Same reason TC-024
-    # skips here; bound parsing is topology-independent and the vanilla cells
-    # cover it.
-    if [ "$MESH" = 1 ]; then
-        note "exotic bounds: skipping in mesh mode (cleanupAlreadyArchived peer detach requires resolvable peer DSNs)"
-        return
-    fi
     local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
     q "$HOST" "CREATE SCHEMA IF NOT EXISTS xb;" >/dev/null
     # Ascending, non-overlapping, all inside PostgreSQL's range (4713 BC to
@@ -3317,6 +3311,11 @@ EOSQL
     # MINVALUE and the year-20000 bound must not have stopped the pass.
     assert_contains "exotic bounds: the BC partition reached cutover" "archived events_bc" \
         "$(cat /tmp/journey-xb.log)"
+    # The open lower edge (MINVALUE) sorts LAST by name and FIRST by bound, so
+    # it pins the ordering contract: it is tiered on its bound, ahead of the BC
+    # partition whose cutover carries the watermark past its range.
+    assert_contains "exotic bounds: the MINVALUE partition tiered, not dropped as stale" \
+        "archived events_open_lo" "$(cat /tmp/journey-xb.log)"
 
     # A DEFAULT partition is refused outright at registration: its rows could
     # never tier or expire, and PostgreSQL blocks concurrent detach of every
@@ -3338,6 +3337,89 @@ EOSQL
     q "$HOST" "DELETE FROM coldfront.archive_watermark WHERE schema_name='xb';" >/dev/null 2>&1
     q "$HOST" "DELETE FROM coldfront.tiered_views      WHERE schema_name='xb';" >/dev/null 2>&1
     q "$HOST" "DROP SCHEMA xb CASCADE;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story: partitions are tiered in bound order, whatever they are named, and a
+# stale-looking partition that still holds rows is refused, not dropped.
+#
+# The user names the initial partition set (the documented tiered workflow is to
+# bring your own RANGE-partitioned table and register it), and unpadded month
+# numbers sort "10" before "9". Each cutover advances the watermark to its own
+# partition's upper bound, so the tiering order has to follow the calendar for
+# every partition to be exported before its range goes cold.
+# ───────────────────────────────────────────────────────────────────────────
+story_partition_order_by_bound() {
+    step "partitions tier in bound order, not name order"
+    local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
+    # Two aged months whose names sort against the calendar, seeded relative to
+    # now() so the split holds under any wall clock. now-4mo/now-3mo keeps the
+    # newer partition's upper bound at least 59 days old, so a 30-day hot window
+    # covers both on every calendar date. Ids are explicit so the story stays on
+    # the set-based cold-write path; ordering is the subject here.
+    qf "$HOST" <<'EOSQL' >/dev/null
+CREATE SCHEMA IF NOT EXISTS ord;
+CREATE TABLE IF NOT EXISTS ord.sales (
+    id bigint NOT NULL, ts timestamptz NOT NULL, amount numeric(10,2),
+    PRIMARY KEY (id, ts)
+) PARTITION BY RANGE (ts);
+DO $do$
+DECLARE older date := (date_trunc('month', now()) - interval '4 months')::date;
+        newer date := (date_trunc('month', now()) - interval '3 months')::date;
+BEGIN
+  -- Unpadded single-digit vs two-digit suffixes: "..._10" sorts before "..._9".
+  EXECUTE format('CREATE TABLE IF NOT EXISTS ord.%I PARTITION OF ord.sales FOR VALUES FROM (%L) TO (%L)',
+                 'sales_p_9',  older, newer);
+  EXECUTE format('CREATE TABLE IF NOT EXISTS ord.%I PARTITION OF ord.sales FOR VALUES FROM (%L) TO (%L)',
+                 'sales_p_10', newer, (newer + interval '1 month')::date);
+END $do$;
+INSERT INTO ord.sales (id, ts, amount) SELECT i, date_trunc('month',now()) - interval '4 months' + (i*interval '1 hour'), 1
+                                         FROM generate_series(1,70) i;
+INSERT INTO ord.sales (id, ts, amount) SELECT 1000+i, date_trunc('month',now()) - interval '3 months' + (i*interval '1 hour'), 1
+                                         FROM generate_series(1,50) i;
+EOSQL
+    assert_eq "bound order: seeded 120 rows across two aged partitions" "120" \
+        "$(q "$HOST" "SELECT count(*) FROM ord.sales;")"
+    "$PARTITIONER" register --dsn "$dsn" --schema ord --table sales \
+        --period monthly --hot-period "30 days" >/dev/null 2>&1
+    if archive_only "schema_name='ord' AND table_name='sales'" /tmp/journey-archiver.yaml /tmp/journey-ord.log; then
+        pass "bound order: archive cycle completed"
+    else
+        fail "bound order: archiver failed, see /tmp/journey-ord.log"; tail -8 /tmp/journey-ord.log
+    fi
+    # Both partitions must reach Iceberg. "archived" is logged only by the full
+    # export pipeline, so it distinguishes a real export from a stale-partition
+    # drop for the single-digit name that sorts last.
+    assert_contains "bound order: the name-last partition was exported" "archived sales_p_9" \
+        "$(cat /tmp/journey-ord.log)"
+    assert_contains "bound order: the name-first partition was exported" "archived sales_p_10" \
+        "$(cat /tmp/journey-ord.log)"
+    # The whole point: no row went missing across the tier move.
+    assert_eq "bound order: all 120 rows still readable through the view" "120" \
+        "$(q "$HOST" "SELECT count(*) FROM ord.sales;")"
+    assert_eq "bound order: the older month survived in the cold tier" "70" \
+        "$(q "$HOST" "SELECT count(*) FROM ord.sales WHERE ts < date_trunc('month',now()) - interval '3 months';")"
+
+    # A partition below the watermark that still holds rows is in neither tier,
+    # so the drop is refused and the rows survive: the DROP relies on direct
+    # evidence that the partition is empty, never on the watermark alone.
+    q "$HOST" "CREATE TABLE ord.sales_p_stale PARTITION OF ord._sales
+                 FOR VALUES FROM ('2001-01-01') TO ('2001-02-01');" >/dev/null
+    q "$HOST" "INSERT INTO ord.sales_p_stale (id, ts, amount) VALUES (9001, '2001-01-15', 1);" >/dev/null
+    if archive_only "schema_name='ord' AND table_name='sales'" /tmp/journey-archiver.yaml /tmp/journey-ord2.log; then
+        fail "bound order: archiver dropped a non-empty stale partition; it must refuse"
+    else
+        pass "bound order: archiver refused a non-empty partition below the watermark"
+    fi
+    assert_contains "bound order: the refusal names the partition and the remedy" \
+        "refusing to drop ord.sales_p_stale" "$(cat /tmp/journey-ord2.log)"
+    assert_eq "bound order: the unaccounted row was not destroyed" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM ord.sales_p_stale;")"
+
+    q "$HOST" "DELETE FROM coldfront.partition_config  WHERE schema_name='ord';" >/dev/null 2>&1
+    q "$HOST" "DELETE FROM coldfront.archive_watermark WHERE schema_name='ord';" >/dev/null 2>&1
+    q "$HOST" "DELETE FROM coldfront.tiered_views      WHERE schema_name='ord';" >/dev/null 2>&1
+    q "$HOST" "DROP SCHEMA ord CASCADE;" >/dev/null 2>&1
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -3801,6 +3883,7 @@ if [ "$MODE" = "tiered" ]; then
     story_partition_col_date           # TC-067: date partition column
     story_partition_col_text_rejected  # TC-070: text partition column rejected at archive
     story_exotic_partition_bounds      # BC, wide years, open-ended and DEFAULT bounds
+    story_partition_order_by_bound     # tier in bound order; refuse a non-empty stale partition
     story_schema_collision             # TC-138: same table name in two schemas — distinct Iceberg namespaces
     story_pg_restart                   # TC-063: PG restart; DuckDB secret reloads; cold reads work
 else

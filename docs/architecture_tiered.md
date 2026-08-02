@@ -127,7 +127,23 @@ when the extension is not loaded.
 
 ### The archive pipeline
 
-Each partition past the hot window then moves to Iceberg through a
+Candidates are tiered oldest first, ordered by partition **bound**. The order
+is a correctness contract: each cutover advances the watermark to its
+partition's upper bound, so chronological order is what guarantees every
+partition is exported while the watermark still sits below its range. A
+partition's place in time is its range; the name is a label the user chose and
+is free to sort against the calendar.
+
+A partition already below the watermark when the cycle begins was tiered by an
+earlier cycle, leaving only its stale PostgreSQL partition to remove. That
+drop requires the partition to be **empty**. Phase 4 detaches atomically with
+the watermark advance, so a partition the pipeline archived is never a
+candidate again, and rows found in one here are in neither tier: an
+out-of-band write to the heap, or a mesh peer writing hot against a stale
+cutoff. Those rows are the only copy, so the archiver refuses the drop and
+fails the table.
+
+Each remaining partition past the hot window then moves to Iceberg through a
 six-phase pipeline:
 
 **0. Idempotent Iceberg-range wipe** - deletes any Iceberg rows already
