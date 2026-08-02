@@ -26,6 +26,7 @@ type mockRows struct {
 	rows   []func(dest ...any) error
 	idx    int
 	closed bool
+	err    error // reported by Err(), as pgx does for a mid-iteration failure
 }
 
 func (r *mockRows) Next() bool {
@@ -39,7 +40,7 @@ func (r *mockRows) Scan(dest ...any) error {
 }
 
 func (r *mockRows) Close()                                       { r.closed = true }
-func (r *mockRows) Err() error                                   { return nil }
+func (r *mockRows) Err() error                                   { return r.err }
 func (r *mockRows) CommandTag() pgconn.CommandTag                { return pgconn.NewCommandTag("SELECT") }
 func (r *mockRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
 func (r *mockRows) RawValues() [][]byte                          { return nil }
@@ -351,6 +352,66 @@ func TestFindExpired(t *testing.T) {
 	assert.Equal(t, "p_2025_11", parts[0].Name)
 	assert.Equal(t, time.Date(2025, 12, 1, 0, 0, 0, 0, time.UTC), parts[0].UpperBound)
 	assert.Equal(t, "p_2025_12", parts[1].Name)
+}
+
+// TestFindExpired_OrdersByBoundNotName locks the ordering contract: candidates
+// come back in ascending bound order whatever the partitions are named. A
+// partition's place in time is its bound; the name is a label the user chose,
+// and unpadded month numbers ("10" < "9" as text) are the everyday case where
+// the two disagree. The archiver tiers candidates in this order and advances
+// the watermark to each upper bound in turn, so chronological order is what
+// keeps every partition exported before its range goes cold.
+func TestFindExpired_OrdersByBoundNotName(t *testing.T) {
+	db := &mockDB{rowsFunc: partitionRows(
+		[2]string{"sales_p_2025_10", "FOR VALUES FROM ('2025-10-01 00:00:00+00') TO ('2025-11-01 00:00:00+00')"},
+		[2]string{"sales_p_2025_9", "FOR VALUES FROM ('2025-09-01 00:00:00+00') TO ('2025-10-01 00:00:00+00')"},
+	)}
+	cutoff := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	parts, err := NewManager(db).FindExpired(context.Background(), "sales", "public", cutoff, TimeBoundary{})
+	require.NoError(t, err)
+	require.Len(t, parts, 2)
+	assert.Equal(t, "sales_p_2025_9", parts[0].Name, "September is first by bound, last by name")
+	assert.Equal(t, "sales_p_2025_10", parts[1].Name)
+}
+
+// TestFindExpired_PropagatesRowError locks that a failure part-way through
+// iteration reaches the caller instead of a short candidate list. The archiver
+// drops every partition it is handed once the export succeeds, so a silently
+// truncated list is as dangerous as a mis-ordered one.
+func TestFindExpired_PropagatesRowError(t *testing.T) {
+	boom := errors.New("connection reset mid-iteration")
+	db := &mockDB{rowsFunc: func(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
+		return &mockRows{
+			rows: []func(dest ...any) error{
+				func(dest ...any) error {
+					*(dest[0].(*string)) = "sales_p_9"
+					*(dest[1].(*string)) = "FOR VALUES FROM ('2025-09-01 00:00:00+00') TO ('2025-10-01 00:00:00+00')"
+					return nil
+				},
+			},
+			err: boom,
+		}, nil
+	}}
+	cutoff := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	parts, err := NewManager(db).FindExpired(context.Background(), "sales", "public", cutoff, TimeBoundary{})
+	require.ErrorIs(t, err, boom)
+	assert.Nil(t, parts, "a truncated candidate list must never reach the caller")
+}
+
+// TestFindExpired_OrdersOpenLowerBoundFirst covers the same contract for an
+// unbounded lower edge: MINVALUE parses to a sentinel below every real bound,
+// so the open partition sorts first even though its name sorts last.
+func TestFindExpired_OrdersOpenLowerBoundFirst(t *testing.T) {
+	db := &mockDB{rowsFunc: partitionRows(
+		[2]string{"events_bc", "FOR VALUES FROM ('0100-01-01 BC') TO ('0043-01-01 BC')"},
+		[2]string{"events_open_lo", "FOR VALUES FROM (MINVALUE) TO ('0100-01-01 BC')"},
+	)}
+	cutoff := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	parts, err := NewManager(db).FindExpired(context.Background(), "events", "public", cutoff, TimeBoundary{})
+	require.NoError(t, err)
+	require.Len(t, parts, 2)
+	assert.Equal(t, "events_open_lo", parts[0].Name, "the open lower edge precedes every real bound")
+	assert.Equal(t, "events_bc", parts[1].Name)
 }
 
 // TestEnsureFuture_SnowflakeBounds locks that an id-mode (snowflake) premake

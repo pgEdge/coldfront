@@ -397,6 +397,14 @@ type archiveCycle struct {
 	iceTable         string
 	now              time.Time
 	debugExportDelay time.Duration
+	// The archive watermark as it stood when this cycle's tiering pass began,
+	// captured by bootstrapTieredView before the per-partition loop and held
+	// fixed for the whole pass. Each cutover advances the stored watermark to
+	// its own partition's upper bound, so this snapshot is what keeps
+	// "already archived" a property of the cycle rather than of a partition's
+	// position in the loop.
+	wmCutoff time.Time
+	haveWM   bool
 }
 
 // runCycle performs one archive pass for a single table: ensures future
@@ -577,16 +585,14 @@ func (ac *archiveCycle) tierExpiredPartitions(ctx context.Context, hotExpired []
 	return nil
 }
 
-// archiveOnePartition tiers one past-hot partition: if the watermark is already
-// past its upper bound it was archived in a prior cycle, so just detach + drop
-// (idempotent cleanup, no race); otherwise run the full archive pipeline.
+// archiveOnePartition tiers one past-hot partition: if the cycle-start
+// watermark was already past its upper bound it was archived in a prior cycle,
+// so just clean up the stale PG partition; otherwise run the full archive
+// pipeline. Candidates arrive in ascending bound order, so within one cycle a
+// partition is only ever reached before the watermark passes its range.
 func (ac *archiveCycle) archiveOnePartition(ctx context.Context, part partition.Info, columns []view.Column) error {
 	t := ac.t
-	wmCutoff, found, err := ac.wmStore.Get(ctx, t.SourceSchema, t.SourceTable)
-	if err != nil {
-		return fmt.Errorf("get watermark: %w", err)
-	}
-	if found && !part.UpperBound.After(wmCutoff) {
+	if ac.haveWM && !part.UpperBound.After(ac.wmCutoff) {
 		return ac.cleanupAlreadyArchived(ctx, part)
 	}
 
@@ -604,10 +610,11 @@ func (ac *archiveCycle) archiveOnePartition(ctx context.Context, part partition.
 // per-partition / per-period loop, never inside it.
 func (ac *archiveCycle) bootstrapTieredView(ctx context.Context, columns []view.Column) error {
 	t, iceTable := ac.t, ac.iceTable
-	wmCutoff, _, err := ac.wmStore.Get(ctx, t.SourceSchema, t.SourceTable)
+	wmCutoff, found, err := ac.wmStore.Get(ctx, t.SourceSchema, t.SourceTable)
 	if err != nil {
 		return fmt.Errorf("get watermark: %w", err)
 	}
+	ac.wmCutoff, ac.haveWM = wmCutoff, found // the cycle-start snapshot; see archiveCycle
 	bootstrapCfg := view.ViewConfig{
 		SourceSchema:    t.SourceSchema,
 		SourceTable:     t.SourceTable,
@@ -627,13 +634,30 @@ func (ac *archiveCycle) bootstrapTieredView(ctx context.Context, columns []view.
 	return nil
 }
 
-// cleanupAlreadyArchived is the idempotent cleanup branch: the partition was
-// archived in a prior cycle (watermark already past its upper bound), so there
-// is no race — just detach + drop the stale PG partition.
+// cleanupAlreadyArchived removes a stale PG partition whose range the cold
+// tier already covers. The drop requires direct evidence that nothing is lost:
+// the partition must be empty. That is the legitimate case, an operator
+// creating a historical partition over a range that has already been tiered.
+//
+// A partition below the watermark that still holds rows is an anomaly. Phase 4
+// detaches atomically with the watermark advance, so a partition the pipeline
+// archived is never a candidate again, and rows here are in neither tier: an
+// out-of-band write straight to the heap, or a mesh peer writing hot against a
+// stale cutoff. They are the only copy, so the table fails loudly.
 func (ac *archiveCycle) cleanupAlreadyArchived(ctx context.Context, part partition.Info) error {
 	t, partMgr := ac.t, ac.partMgr
-	log.Printf("partition %s already archived, cleaning up", part.Name)
-	parent := partition.ResolveSourceTable(ctx, ac.conn, t.SourceSchema, t.SourceTable)
+	rows, err := partMgr.RowCount(ctx, t.SourceSchema, part.Name)
+	if err != nil {
+		return fmt.Errorf("count rows in %s before dropping it: %w", part.Name, err)
+	}
+	if rows > 0 {
+		return fmt.Errorf("refusing to drop %s.%s: its range is already below the archive "+
+			"watermark, yet it holds %d row(s) that were never exported to the cold tier. "+
+			"Move them into the cold tier (or out of the database) and drop the partition, "+
+			"then re-run", t.SourceSchema, part.Name, rows)
+	}
+	log.Printf("partition %s is empty and its range is already cold, dropping it", part.Name)
+	parent := partMgr.ResolveSourceTable(ctx, t.SourceSchema, t.SourceTable)
 	if err := partMgr.Detach(ctx, parent, t.SourceSchema, part.Name); err != nil {
 		return fmt.Errorf("detach %s: %w", part.Name, err)
 	}
