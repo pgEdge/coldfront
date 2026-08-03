@@ -193,6 +193,14 @@ first cycle's bootstrap actually renaming the table. In order:
 A run with nothing past the hot window and no `retention_period` set
 is a no-op.
 
+Premake provisions a **range**, not a name. Each period it would create is
+first checked against the parent's existing partition bounds, so a period
+another partition already covers is left alone whatever that partition is
+called - the generated `events_p_YYYY_MM` names are ColdFront's own
+convention, not a requirement on tables you bring yourself. A partition
+covering only part of a period is reported as such, naming both ranges,
+since PostgreSQL cannot then create the partition that would complete it.
+
 ### Crash recovery
 
 The watermark is the single source of truth, and phase 4 is the only

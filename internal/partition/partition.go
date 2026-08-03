@@ -2,6 +2,7 @@ package partition
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"sort"
 	"strconv"
@@ -211,8 +212,12 @@ func FuturePartitionDates(now time.Time, period string, count int) []time.Time {
 // flat tables in one schema never collide; a 2-level sub-tree passes its child
 // name so leaves are unique across siblings (events_eu_p_2026_06).
 func (m *Manager) EnsureFuture(ctx context.Context, parent, schema, column, period string, count int, now time.Time, b Boundary, leafPrefix string) error {
+	existing, err := m.listPartitions(ctx, parent, schema, b)
+	if err != nil {
+		return err
+	}
 	for _, d := range FuturePartitionDates(now, period, count) {
-		if err := m.createPartition(ctx, parent, schema, period, d, b, leafPrefix); err != nil {
+		if err := m.createPartition(ctx, parent, schema, period, d, b, leafPrefix, existing); err != nil {
 			return err
 		}
 	}
@@ -248,18 +253,55 @@ func (m *Manager) EnsureCurrent(ctx context.Context, parent, schema, period stri
 	}
 	behind := hasPast && !covered
 	if !covered {
-		if err := m.createPartition(ctx, parent, schema, period, now, b, leafPrefix); err != nil {
+		if err := m.createPartition(ctx, parent, schema, period, now, b, leafPrefix, parts); err != nil {
 			return behind, err
 		}
 	}
 	return behind, nil
 }
 
-// createPartition creates the single partition for the period containing d
-// (idempotent). Shared by EnsureFuture and EnsureCurrent so name, bound and
-// leaf-prefix handling live in one place.
-func (m *Manager) createPartition(ctx context.Context, parent, schema, period string, d time.Time, b Boundary, leafPrefix string) error {
+// How the parent's existing partitions relate to a period premake wants.
+type rangeCoverage int
+
+const (
+	rangeAbsent  rangeCoverage = iota // nothing intersects the period; it must be created
+	rangeCovered                      // one partition contains the whole period
+	rangePartial                      // one intersects the period without containing it
+)
+
+// classifyRange reports how existing covers [lower, upper), returning the
+// partition responsible for a covered or partial verdict. A parent's ranges are
+// disjoint, so at most one can contain the period, and nothing else can then
+// intersect it: the first match settles the answer.
+func classifyRange(existing []Info, lower, upper time.Time) (Info, rangeCoverage) {
+	for _, p := range existing {
+		if !p.LowerBound.After(lower) && !p.UpperBound.Before(upper) {
+			return p, rangeCovered
+		}
+		if p.LowerBound.Before(upper) && p.UpperBound.After(lower) {
+			return p, rangePartial
+		}
+	}
+	return Info{}, rangeAbsent
+}
+
+// createPartition provisions the period containing d (idempotent). Shared by
+// EnsureFuture and EnsureCurrent so name, bound and leaf-prefix handling live
+// in one place. existing is the parent's current partition set, which decides
+// whether there is anything to do: the question is whether the period's RANGE
+// is provisioned, not whether the generated name is taken. A period some other
+// partition already covers is left alone whatever that partition is called.
+func (m *Manager) createPartition(ctx context.Context, parent, schema, period string, d time.Time, b Boundary, leafPrefix string, existing []Info) error {
 	lower, upper := PartitionBounds(d, period)
+	switch p, cov := classifyRange(existing, lower, upper); cov {
+	case rangeCovered:
+		return nil
+	case rangePartial:
+		return fmt.Errorf("cannot provision %s to %s on %s.%s: partition %q covers %s to %s, "+
+			"part of that period but not all of it, and PostgreSQL rejects an overlapping range. "+
+			"Widen or split that partition so whole periods are covered",
+			lower, upper, schema, parent, p.Name, p.LowerBound, p.UpperBound)
+	}
 	// Table-scope the leaf name. The date suffix alone (p_2026_06) is not unique
 	// within a schema, so two flat tables in one schema generate the SAME
 	// partition name and the second's CREATE … IF NOT EXISTS silently no-ops.
@@ -285,19 +327,37 @@ func (m *Manager) createPartition(ctx context.Context, parent, schema, period st
 	if _, err := m.db.Exec(ctx, sql); err != nil { // nosemgrep
 		return fmt.Errorf("create partition %s: %w", name, err)
 	}
-	// CREATE … IF NOT EXISTS no-ops if a relation with this name already exists,
-	// even one attached to a DIFFERENT parent (a name collision, or identifier
-	// truncation). Verify the partition is actually attached to OUR parent, so a
-	// collision fails loud instead of leaving the table partition-less while the
-	// run reports success.
-	var attached bool
-	if err := m.db.QueryRow(ctx, /* nosemgrep */
-		`SELECT EXISTS(SELECT 1 FROM pg_inherits WHERE inhrelid = to_regclass($1) AND inhparent = to_regclass($2))`,
-		qname, qparent).Scan(&attached); err != nil {
-		return fmt.Errorf("verify partition %s attached to %s.%s: %w", name, schema, parent, err)
+	return m.verifyPartition(ctx, parent, schema, b,
+		Info{Name: name, LowerBound: lower, UpperBound: upper})
+}
+
+// verifyPartition reads back the partition the CREATE was meant to produce.
+// CREATE … IF NOT EXISTS no-ops when a relation already holds the name, so the
+// name alone proves nothing: what is there must be attached to OUR parent (a
+// name collision or an identifier truncation otherwise leaves the table
+// partition-less while the run reports success) and must hold the range that
+// was asked for.
+func (m *Manager) verifyPartition(ctx context.Context, parent, schema string, b Boundary, want Info) error {
+	var boundExpr string
+	err := m.db.QueryRow(ctx, /* nosemgrep */
+		`SELECT pg_get_expr(c.relpartbound, c.oid)
+		   FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
+		  WHERE i.inhrelid = to_regclass($1) AND i.inhparent = to_regclass($2)`,
+		pgx.Identifier{schema, want.Name}.Sanitize(),
+		pgx.Identifier{schema, parent}.Sanitize()).Scan(&boundExpr)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return fmt.Errorf("partition %q is not attached to %s.%s: a relation with that name already exists under a different parent; partition names must be unique within a schema", want.Name, schema, parent)
 	}
-	if !attached {
-		return fmt.Errorf("partition %q is not attached to %s.%s — a relation with that name already exists under a different parent; partition names must be unique within a schema", name, schema, parent)
+	if err != nil {
+		return fmt.Errorf("verify partition %s attached to %s.%s: %w", want.Name, schema, parent, err)
+	}
+	got := Info{Name: want.Name}
+	if got.LowerBound, got.UpperBound, err = parseBoundPair(boundExpr, b); err != nil {
+		return fmt.Errorf("verify bounds of partition %s: %w", want.Name, err)
+	}
+	if !got.LowerBound.Equal(want.LowerBound) || !got.UpperBound.Equal(want.UpperBound) {
+		return fmt.Errorf("partition %q on %s.%s covers %s to %s, not the %s to %s this period needs; a partition holds the range its bounds define, not the one its name suggests",
+			want.Name, schema, parent, got.LowerBound, got.UpperBound, want.LowerBound, want.UpperBound)
 	}
 	return nil
 }

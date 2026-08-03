@@ -493,29 +493,40 @@ func (ac *archiveCycle) attachAndEnsureTable(ctx context.Context) error {
 	return nil
 }
 
+// premakeRange provisions one RANGE parent: the forward window of future
+// periods and the period covering now, which must be maintained together and
+// on the same cadence. It reports whether premake had fallen behind. Shared by
+// the flat cycle and by each LIST-value child of the 2-level cycle.
+func (ac *archiveCycle) premakeRange(ctx context.Context, parent, leafPrefix string) (bool, error) {
+	t, partMgr, now := ac.t, ac.partMgr, ac.now
+	// The cold tier always partitions by time.
+	if err := partMgr.EnsureFuture(ctx, parent, t.SourceSchema,
+		t.PartitionColumn, t.PartitionPeriod,
+		t.FuturePartitions, now, partition.TimeBoundary{}, leafPrefix); err != nil {
+		return false, fmt.Errorf("premake %s: %w", parent, err)
+	}
+	behind, err := partMgr.EnsureCurrent(ctx, parent, t.SourceSchema,
+		t.PartitionPeriod, now, partition.TimeBoundary{}, leafPrefix)
+	if err != nil {
+		return false, fmt.Errorf("ensure current %s: %w", parent, err)
+	}
+	return behind, nil
+}
+
 // ensureSingleLevelPartitions is phases 1 + 1b of runCycle: create the forward
 // window of future partitions, then self-heal the partition covering now.
+//
+// The archiver deliberately does NOT abort on the "behind" flag (unlike the
+// standalone partitioner): it legitimately tiers historical tables whose newest
+// partition is already in the past, so "no current partition" is normal here
+// rather than a lagging cron, and the two cannot be told apart without per-table
+// state. It is logged instead, so a genuine lag stays visible. The 2-level path
+// treats it the same way.
 func (ac *archiveCycle) ensureSingleLevelPartitions(ctx context.Context, tableName string) error {
-	t, partMgr, now := ac.t, ac.partMgr, ac.now
-	// 1. Create future partitions. The cold tier always partitions by time.
-	if err := partMgr.EnsureFuture(ctx, tableName, t.SourceSchema,
-		t.PartitionColumn, t.PartitionPeriod,
-		t.FuturePartitions, now, partition.TimeBoundary{}, ""); err != nil {
-		return fmt.Errorf("ensure future partitions: %w", err)
-	}
-
-	// 1b. Self-heal: ensure the partition covering now exists, so an actively
-	//     written table whose cron lagged past the premade window doesn't get an
-	//     insert-outage hole. We deliberately do NOT abort on EnsureCurrent's
-	//     "behind" flag (unlike the standalone partitioner): the archiver
-	//     legitimately tiers historical tables whose newest partition is already in
-	//     the past, so "no current partition" is normal here, not necessarily a
-	//     lagging cron — it cannot be distinguished without per-table state. But we
-	//     DO log it (non-fatal) so a genuine lag is visible. Matches the 2-level path.
-	behind, err := partMgr.EnsureCurrent(ctx, tableName, t.SourceSchema,
-		t.PartitionPeriod, now, partition.TimeBoundary{}, "")
+	t, now := ac.t, ac.now
+	behind, err := ac.premakeRange(ctx, tableName, "")
 	if err != nil {
-		return fmt.Errorf("ensure current partition: %w", err)
+		return err
 	}
 	if behind {
 		log.Printf("[%s] no hot partition covered %s — created it; if this table is actively written, widen future_partitions (=%d) or run more often",
@@ -539,17 +550,35 @@ func (ac *archiveCycle) findSingleLevelExpired(ctx context.Context, tableName st
 	return hotExpired, nil
 }
 
-// requirePK errors with the caller-supplied message when no column in columns
-// participates in the primary key. The race-safe archive pipeline keys delta
-// capture by source PK, so a PK is mandatory. The message differs slightly
-// between the single-level and 2-level callers, so it is passed in.
-func requirePK(columns []view.Column, msg string) error {
+// requirePK errors when no column participates in the primary key. The
+// race-safe archive pipeline keys delta capture by source PK, so without one an
+// UPDATE or DELETE cannot be replayed to Iceberg.
+func requirePK(columns []view.Column, schema, table string) error {
 	for _, c := range columns {
 		if c.IsPK {
 			return nil
 		}
 	}
-	return fmt.Errorf("%s", msg)
+	return fmt.Errorf("%s.%s has no primary key: required for race-safe archive "+
+		"(delta capture keys writes by source PK, and without one an UPDATE or "+
+		"DELETE cannot be replayed to Iceberg)", schema, table)
+}
+
+// prepareTiering is the once-per-cycle preamble both tiering passes share: read
+// the table's columns, require a primary key, then bootstrap and register the
+// unified view. Called before the per-partition / per-period loop, never inside it.
+func (ac *archiveCycle) prepareTiering(ctx context.Context) ([]view.Column, error) {
+	columns, err := getColumns(ctx, ac.conn, ac.t.SourceSchema, ac.t.SourceTable)
+	if err != nil {
+		return nil, fmt.Errorf("get columns: %w", err)
+	}
+	if err := requirePK(columns, ac.t.SourceSchema, ac.t.SourceTable); err != nil {
+		return nil, err
+	}
+	if err := ac.bootstrapTieredView(ctx, columns); err != nil {
+		return nil, err
+	}
+	return columns, nil
 }
 
 // tierExpiredPartitions is step 4 of runCycle: get columns, require a PK,
@@ -557,19 +586,8 @@ func requirePK(columns []view.Column, msg string) error {
 // partition through the cutover pipeline (with idempotent cleanup of any that a
 // prior cycle already archived).
 func (ac *archiveCycle) tierExpiredPartitions(ctx context.Context, hotExpired []partition.Info) error {
-	t := ac.t
-	columns, err := getColumns(ctx, ac.conn, t.SourceSchema, t.SourceTable)
+	columns, err := ac.prepareTiering(ctx)
 	if err != nil {
-		return fmt.Errorf("get columns: %w", err)
-	}
-	if err := requirePK(columns, fmt.Sprintf(
-		"%s.%s has no primary key — required for race-safe archive (delta capture "+
-			"keys writes by source PK; without one we can't replay UPDATE/DELETE to Iceberg)",
-		t.SourceSchema, t.SourceTable)); err != nil {
-		return err
-	}
-
-	if err := ac.bootstrapTieredView(ctx, columns); err != nil {
 		return err
 	}
 
@@ -793,14 +811,9 @@ func (ac *archiveCycle) premakeListChildren(ctx context.Context, parent string, 
 		if err := partMgr.EnsureListChild(ctx, parent, t.SourceSchema, v, child, t.PartitionColumn); err != nil {
 			return nil, err
 		}
-		prefix := child + "_"
-		if err := partMgr.EnsureFuture(ctx, child, t.SourceSchema, t.PartitionColumn,
-			t.PartitionPeriod, t.FuturePartitions, now, partition.TimeBoundary{}, prefix); err != nil {
-			return nil, fmt.Errorf("premake %s: %w", child, err)
-		}
-		b, err := partMgr.EnsureCurrent(ctx, child, t.SourceSchema, t.PartitionPeriod, now, partition.TimeBoundary{}, prefix)
+		b, err := ac.premakeRange(ctx, child, child+"_")
 		if err != nil {
-			return nil, fmt.Errorf("ensure current %s: %w", child, err)
+			return nil, err
 		}
 		anyBehind = anyBehind || b
 		children = append(children, childRef{child, v})
@@ -833,28 +846,22 @@ func (ac *archiveCycle) findExpiredLeaves(ctx context.Context, children []childR
 	return leaves, nil
 }
 
-// tierLeavesByPeriod is step 4 of the 2-level cycle: get columns, require a PK,
-// detect the LIST column, bootstrap the unified view + register it (ONCE), then
-// group the leaves by ts period and tier them oldest-first.
+// tierLeavesByPeriod is step 4 of the 2-level cycle: run the shared tiering
+// preamble, detect the LIST column, then group the leaves by ts period and tier
+// them oldest-first.
 func (ac *archiveCycle) tierLeavesByPeriod(ctx context.Context, leaves []leafRef) error {
 	t := ac.t
-	columns, err := getColumns(ctx, ac.conn, t.SourceSchema, t.SourceTable)
-	if err != nil {
-		return fmt.Errorf("get columns: %w", err)
-	}
-	if err := requirePK(columns, fmt.Sprintf(
-		"%s.%s has no primary key — required for race-safe archive (delta capture "+
-			"keys writes by source PK)", t.SourceSchema, t.SourceTable)); err != nil {
-		return err
-	}
-	// The LIST (level-1) column, for the LIST-value-scoped Phase-0 wipe.
+	// The LIST (level-1) column, for the LIST-value-scoped Phase-0 wipe. Read
+	// before the preamble renames the hot table, though detectPartitionColumns
+	// resolves either name.
 	listCols, err := detectPartitionColumns(ctx, ac.conn, t.SourceSchema, t.SourceTable)
 	if err != nil {
 		return fmt.Errorf("detect list column: %w", err)
 	}
 	listCol := listCols[0]
 
-	if err := ac.bootstrapTieredView(ctx, columns); err != nil {
+	columns, err := ac.prepareTiering(ctx)
+	if err != nil {
 		return err
 	}
 

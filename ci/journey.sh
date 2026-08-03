@@ -2230,6 +2230,51 @@ story_partitioner_idmode() {
 # success. Assert BOTH tables get their own (table-scoped) partitions, the leaf
 # names are prefixed per table, and a fresh row lands in each.
 # ───────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────
+# Story: premake provisions a RANGE, not a name. A period some other partition
+# already covers is left alone whatever it is called, so an operator who
+# pre-created next month under their own naming keeps a working reconcile pass
+# instead of PostgreSQL rejecting an overlapping range on every run.
+# ───────────────────────────────────────────────────────────────────────────
+story_premake_respects_existing_range() {
+    step "premake accepts a user-named partition covering a future period"
+    local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
+    printf 'postgres: { dsn: "%s" }\n' "$dsn" > /tmp/journey-pre.yaml
+    qf "$HOST" <<'EOSQL' >/dev/null
+CREATE SCHEMA IF NOT EXISTS pre;
+CREATE TABLE IF NOT EXISTS pre.events (
+    id bigint NOT NULL, ts timestamptz NOT NULL, PRIMARY KEY (id, ts)
+) PARTITION BY RANGE (ts);
+DO $do$
+DECLARE nxt date := (date_trunc('month', now()) + interval '1 month')::date;
+BEGIN
+  -- The operator's own name for next month, not the generated events_p_YYYY_MM.
+  EXECUTE format('CREATE TABLE IF NOT EXISTS pre.%I PARTITION OF pre.events FOR VALUES FROM (%L) TO (%L)',
+                 'events_next_month', nxt, (nxt + interval '1 month')::date);
+END $do$;
+EOSQL
+    "$PARTITIONER" register --dsn "$dsn" --schema pre --table events \
+        --period monthly --retention "60 months" >/dev/null 2>&1
+    if "$PARTITIONER" --config /tmp/journey-pre.yaml >/tmp/journey-pre.log 2>&1; then
+        pass "premake: reconcile completed over a differently-named future partition"
+    else
+        fail "premake: reconcile failed, see /tmp/journey-pre.log"; tail -8 /tmp/journey-pre.log
+    fi
+    # The operator's partition still owns next month, and premake did not add a
+    # second one for the same range (PostgreSQL refuses an overlap regardless).
+    assert_eq "premake: the user-named partition still covers next month" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM pg_inherits i JOIN pg_class c ON c.oid=i.inhrelid
+                       WHERE i.inhparent='pre.events'::regclass AND c.relname='events_next_month';")"
+    assert_eq "premake: no generated duplicate for that period" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM pg_inherits i JOIN pg_class c ON c.oid=i.inhrelid
+                       WHERE i.inhparent='pre.events'::regclass
+                         AND c.relname = 'events_p_' || to_char(date_trunc('month',now()) + interval '1 month', 'YYYY_MM');")"
+    # Premake still provisions the periods nothing covers.
+    assert_gt "premake: later periods were still created" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM pg_inherits WHERE inhparent='pre.events'::regclass;")"
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE schema_name='pre'; DROP SCHEMA pre CASCADE;" >/dev/null 2>&1
+}
+
 story_partitioner_multitable() {
     step "Partitioner multi-table: two flat tables, one schema, both partitioned"
     local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
@@ -3852,6 +3897,7 @@ if [ "$MODE" = "tiered" ]; then
     story_tiered_twolevel
     story_partitioner_idmode
     story_partitioner_multitable
+    story_premake_respects_existing_range  # premake provisions a range, not a name
     story_partitioner_after_swap
     story_fk_constraint
     story_archiver_rollback
