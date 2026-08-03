@@ -177,7 +177,9 @@ One Iceberg table holds every region (region is just a column); the
 archiver tiers leaves a whole `ts` period at a time across **all**
 regions before advancing the shared hot/cold watermark, so a period only
 becomes cold once it is cold for every region. `id` mode is not supported
-in tiered mode (the cold tier is time-keyed).
+in tiered mode (the cold tier is time-keyed). For why the ordering works
+that way, see
+[architecture_tiered.md → Two-level tiering](architecture_tiered.md#two-level-list-range-tiering).
 
 ## Mode 2 - Decoupled (iceberg-only)
 

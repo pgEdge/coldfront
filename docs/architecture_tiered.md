@@ -16,6 +16,7 @@ This document is organized into the following sections:
 
 - [Data flow](#data-flow)
 - [Archiver Workflow](#archiver-workflow)
+- [Two-level (LIST → RANGE) tiering](#two-level-list-range-tiering)
 - [Transparent INSERT](#transparent-insert)
 - [Transparent UPDATE/DELETE](#transparent-updatedelete)
 - [Write modes: strict vs permissive](#write-modes-strict-vs-permissive-allow_mixed_writes)
@@ -193,13 +194,13 @@ first cycle's bootstrap actually renaming the table. In order:
 A run with nothing past the hot window and no `retention_period` set
 is a no-op.
 
-Premake provisions a **range**, not a name. Each period it would create is
+Premake provisions a **range**, not a name. Each period it provisions is
 first checked against the parent's existing partition bounds, so a period
 another partition already covers is left alone whatever that partition is
 called - the generated `events_p_YYYY_MM` names are ColdFront's own
 convention, not a requirement on tables you bring yourself. A partition
 covering only part of a period is reported as such, naming both ranges,
-since PostgreSQL cannot then create the partition that would complete it.
+since PostgreSQL cannot create the partition that completes it.
 
 ### Crash recovery
 
@@ -214,6 +215,56 @@ point in the pipeline:
 | During phases 0-3 (wipe, capture, export, replay) | Watermark unchanged, partition still attached; the next cycle re-runs the pipeline - the phase-0 range wipe and the delta replay are idempotent, so no duplicates |
 | During phase 4 (cutover) | The transaction rolls back whole: watermark unchanged, view unchanged, partition still attached; lock timeouts are retried in-run, anything else leaves the trigger + delta for the next cycle to retry |
 | Between phase 4 and phase 5 | The cutover is already committed (watermark, view, and DETACH all in place); the detached partition and its now-inert capture trigger + delta table are left behind for the operator to drop |
+
+## Two-level (LIST → RANGE) tiering
+
+A `LIST (key) → RANGE (ts)` table is tiered as **one** relation. The LIST
+key is an ordinary column in the cold tier, so every LIST value's rows
+land in a single Iceberg table, under a single watermark and a single
+`UNION ALL` view. The `LIST` level partitions PostgreSQL storage; it does
+not partition the cold tier.
+
+Provisioning is driven by the sub-partition block's `values_source`
+query, re-run each cycle: every value it returns gets a LIST child and a
+RANGE sub-tree beneath it, so a newly appearing value is provisioned
+automatically on the next pass.
+
+### Period-major ordering
+
+Because the watermark is shared, the cycle is **period-major across LIST
+values**, not value-major. Past-hot leaves are grouped by their `ts`
+period, the groups run oldest first, and within a group two passes run
+strictly in sequence:
+
+1. Export every LIST value's leaf for that period. No detach, watermark
+   unchanged.
+2. Cut them all over. The first cutover advances the watermark to the
+   period's upper bound; the rest re-set it to the same value and detach
+   their now-excluded leaf.
+
+Both the group order and the split into two passes are correctness
+requirements. The watermark advance makes a period cold for the **whole
+table** at once, and the view reads a below-cutoff row only from the cold
+tier, so every LIST value's rows for a period must already be in Iceberg
+before the cutoff crosses that period. Exporting the entire group first
+is what establishes that, and running the groups oldest first keeps the
+cutoff moving in one direction.
+
+### Scoped range wipe
+
+Phase 0 deletes existing Iceberg rows in the range about to be exported.
+The cold tier is shared, so that delete is scoped by the LIST column and
+value: it reaches only the rows of the leaf being exported, leaving its
+siblings' already-cold rows in the same `ts` range untouched.
+
+Scoping also makes re-export idempotent, so this path exports every
+past-hot leaf it finds without consulting the watermark. A leaf
+interrupted between the two passes is exported again on the next cycle.
+The stale-partition branch described under
+[The archive pipeline](#the-archive-pipeline) is specific to the flat
+path.
+
+`id` mode is not available here: the cold tier is keyed by time.
 
 ## Transparent INSERT
 
@@ -369,8 +420,10 @@ divergence to reason about. See
 
 ## Partition Scheme Compatibility
 
-The archiver supports single-column RANGE partitioning on a time-like
-column. Other shapes are rejected at archiver startup.
+The archiver tiers two partition shapes: a flat table partitioned by
+RANGE on a single time-like column, and a two-level `LIST → RANGE` tree
+registered with a sub-partition block. Anything else is rejected at
+archiver startup.
 
 ### Supported: single-column RANGE
 
@@ -396,10 +449,10 @@ The archiver rejects composite partition keys such as
 single scalar watermark per table; a composite key would need one
 watermark per non-time dimension value.
 
-### Not supported: multi-level (sub-partitioned) tables at the top level
+### Supported: two-level LIST → RANGE, with a sub-partition block
 
-The archiver also rejects multi-level (sub-partitioned) tables at the
-top level, such as the following:
+A table whose top level is `LIST` and whose children are themselves
+`RANGE`-partitioned by time is tiered as one relation:
 
 ```sql
 CREATE TABLE events (...) PARTITION BY LIST (branch_id);
@@ -407,21 +460,27 @@ CREATE TABLE events_branch_1 PARTITION OF events
   FOR VALUES IN (1) PARTITION BY RANGE (ts);
 ```
 
-A multi-level top table cannot be archived directly. The workaround is
-to tier each sub-partition independently - one `register` call per
-branch (or the equivalent YAML list fed to `archiver import`):
+It requires a sub-partition block naming the query that yields the
+current LIST values, and an explicit `partition_column` for the RANGE
+(time) key, since on a first run there is no LIST child to detect it
+from:
 
 ```sh
-archiver register --config cf.yaml --table events_branch_1 \
-    --period monthly --hot-period "1 month" --retention "3 months"
-archiver register --config cf.yaml --table events_branch_2 \
-    --period monthly --hot-period "1 month" --retention "3 months"
+archiver register --config cf.yaml --table events --period monthly \
+    --column ts --hot-period "1 month" \
+    --sub-values-source "SELECT branch_id FROM branches"
 ```
 
-Each `events_branch_N` is a valid single-level range-partitioned table
-and is tiered independently. After conversion, each becomes a view;
-applications query the branch views directly rather than the top-level
-`events`.
+The design is in
+[Two-level (LIST → RANGE) tiering](#two-level-list-range-tiering).
+
+Registered **without** a sub-partition block, a table with any
+sub-partitioned child is rejected at startup: the flat path has no way
+to enumerate the LIST children or to coordinate one watermark across
+them. The alternative to a sub-partition block is to register each
+`events_branch_N` as its own flat table, tiered independently. Each then
+becomes its own view, and applications query those rather than the
+top-level `events`.
 
 ### Performance note: partition pruning after the swap
 
