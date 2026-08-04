@@ -3363,15 +3363,18 @@ EOSQL
     # partition whose cutover carries the watermark past its range.
     assert_contains "TC-147: MINVALUE partition tiered, not dropped as stale" \
         "archived events_open_lo" "$(cat /tmp/journey-xb.log)"
-    # TC-146, TC-148, TC-149: future-dated partitions must exist in pg_class —
-    # PostgreSQL accepted the bounds and the archiver scanned past them without
-    # aborting (proven by the archive_only pass above).
-    assert_eq "TC-146: year-9999 partition exists (PostgreSQL accepted near-max-year bound)" "1" \
-        "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname='events_y9999' AND relnamespace='xb'::regnamespace;")"
-    assert_eq "TC-148: year-2038 partition exists (32-bit overflow year accepted as bound)" "1" \
-        "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname='events_y2038' AND relnamespace='xb'::regnamespace;")"
-    assert_eq "TC-149: year-294276 partition exists (6-digit PostgreSQL max-year bound accepted)" "1" \
-        "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname='events_y294276' AND relnamespace='xb'::regnamespace;")"
+    # TC-146, TC-148, TC-149: these bounds are all in the future, so the archiver
+    # classifies each partition hot and leaves it attached to the hot heap behind the
+    # view. Cutover DETACHes an archived partition and cleanup DROPs it, so still
+    # being attached is what proves the bound was read and classified. The parent
+    # comes from the registry, which is where the hot heap's real name lives.
+    local hotp="(SELECT hot_table FROM coldfront.tiered_views WHERE schema_name='xb' AND relname='events')::regclass"
+    assert_eq "TC-146: year-9999 partition left hot, not archived" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM pg_inherits i JOIN pg_class c ON c.oid=i.inhrelid WHERE i.inhparent=$hotp AND c.relname='events_y9999';")"
+    assert_eq "TC-148: year-2038 partition left hot, not archived" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM pg_inherits i JOIN pg_class c ON c.oid=i.inhrelid WHERE i.inhparent=$hotp AND c.relname='events_y2038';")"
+    assert_eq "TC-149: year-294276 partition left hot, not archived" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM pg_inherits i JOIN pg_class c ON c.oid=i.inhrelid WHERE i.inhparent=$hotp AND c.relname='events_y294276';")"
 
     # A DEFAULT partition is refused outright at registration: its rows could
     # never tier or expire, and PostgreSQL blocks concurrent detach of every
