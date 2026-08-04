@@ -584,7 +584,7 @@ EOSQL
     # oid archives but its column is unreadable through the pg_duckdb-planned
     # view after cutover, so it is rejected up front like inet; use bigint.
     local OE; OE=$(q_may "$HOST" "SELECT coldfront.create_iceberg_table('public','oid_reject','[{\"name\":\"a\",\"type\":\"oid\"}]'::jsonb);")
-    assert_contains "oid rejected at provisioning" "oid values as bigint" "$OE"
+    assert_contains "TC-099: oid rejected at provisioning (use bigint instead)" "oid values as bigint" "$OE"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -747,24 +747,24 @@ EOSQL
 
     local before; before=$("$COMPACTOR" --config /tmp/journey-archiver.yaml --table events --dry-run 2>&1)
     if echo "$before" | grep -q "group(s)"; then
-        pass "compactor sees small cold files to compact"
+        pass "TC-129: compactor dry-run reports groups of small files to compact (no files modified)"
     else
-        fail "compactor --dry-run found nothing to compact: $before"; return
+        fail "TC-129: compactor --dry-run found nothing to compact: $before"; return
     fi
 
     if "$COMPACTOR" --config /tmp/journey-archiver.yaml --table events >/tmp/journey-compact.log 2>&1; then
-        pass "compaction ran (bakery-serialized, no 409)"
+        pass "TC-130: actual compaction merged small files (bakery-serialized, no 409)"
     else
-        fail "compaction failed — see /tmp/journey-compact.log"; tail -8 /tmp/journey-compact.log; return
+        fail "TC-130: compaction failed — see /tmp/journey-compact.log"; tail -8 /tmp/journey-compact.log; return
     fi
 
     local after; after=$("$COMPACTOR" --config /tmp/journey-archiver.yaml --table events --dry-run 2>&1)
     if echo "$after" | grep -q "nothing to compact"; then
-        pass "small files consolidated (none left below target)"
+        pass "TC-128: no-op after compaction — all files now meet the target size"
     else
-        fail "files still below target after compaction: $after"
+        fail "TC-128: files still below target after compaction: $after"
     fi
-    assert_eq "compaction preserved all rows" "$rows_before" "$(q "$HOST" "SELECT count(*) FROM events;")"
+    assert_eq "TC-130: compaction preserved all rows" "$rows_before" "$(q "$HOST" "SELECT count(*) FROM events;")"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -786,50 +786,49 @@ story_maintenance() {
     local snaps; snaps=$("$COMPACTOR" --config /tmp/journey-archiver.yaml --table events --expire-snapshots --dry-run 2>&1)
     local nsnap; nsnap=$(echo "$snaps" | grep -oE '[0-9]+ snapshot' | head -1 | grep -oE '[0-9]+')
     if [ "${nsnap:-0}" -gt 1 ]; then
-        pass "expire sees >1 snapshot (compaction + cold writes left $nsnap)"
+        pass "TC-131: snapshot expiry sees >1 snapshot to expire (compaction + cold writes left $nsnap)"
     else
-        fail "expire --dry-run shows nothing to expire: $snaps"; return
+        fail "TC-131: expire --dry-run shows nothing to expire: $snaps"; return
     fi
 
-    # Expire metadata, KEEP files — leaves the superseded smalls as real orphans for --orphans.
-    # --expire-older-than 0s: Iceberg expiry is age-driven, so expire all but the current
-    # snapshot now (the freshly-created test snapshots are only seconds old).
+    # TC-132: expire metadata only (--expire-keep-files), leaving freed files as orphans for --orphans.
+    # --expire-older-than 0s: age-driven expiry, so expire all but the current snapshot now.
     if "$COMPACTOR" --config /tmp/journey-archiver.yaml --table events \
          --expire-snapshots --expire-older-than 0s --expire-retain-last 1 --expire-keep-files >/tmp/journey-expire.log 2>&1; then
-        pass "snapshots expired (bakery-serialized, no 409)"
+        pass "TC-132: expire-keep-files expired snapshot metadata but left physical files intact"
     else
-        fail "expire failed — see /tmp/journey-expire.log"; tail -8 /tmp/journey-expire.log; return
+        fail "TC-132: expire failed — see /tmp/journey-expire.log"; tail -8 /tmp/journey-expire.log; return
     fi
 
     local after; after=$("$COMPACTOR" --config /tmp/journey-archiver.yaml --table events --expire-snapshots --dry-run 2>&1)
     local nafter; nafter=$(echo "$after" | grep -oE '[0-9]+ snapshot' | head -1 | grep -oE '[0-9]+')
     if [ "${nafter:-0}" -eq 1 ]; then
-        pass "expired down to the retain-last target (1 snapshot)"
+        pass "TC-131: snapshot expiry removed old snapshots down to the retain-last target"
     else
-        fail "snapshot count not at retain target after expire: $after"
+        fail "TC-131: snapshot count not at retain target after expire: $after"
     fi
 
     # The files those expired snapshots alone pinned are now orphans (referenced by nothing).
     local orph; orph=$("$COMPACTOR" --config /tmp/journey-archiver.yaml --table events --orphans --orphan-age 0s --dry-run 2>&1)
     local norph; norph=$(echo "$orph" | grep -oE '[0-9]+ orphan' | head -1 | grep -oE '[0-9]+')
     if [ "${norph:-0}" -gt 0 ]; then
-        pass "orphan scan finds the freed files ($norph; real backend, no prefix-mismatch)"
+        pass "TC-133: orphan deletion dry-run reports $norph candidate files (real backend, no prefix-mismatch)"
     else
-        fail "no orphans detected after expire-keep-files: $orph"; return
+        fail "TC-133: no orphans detected after expire-keep-files: $orph"; return
     fi
 
     if "$COMPACTOR" --config /tmp/journey-archiver.yaml --table events --orphans --orphan-age 0s >/tmp/journey-orphans.log 2>&1; then
-        pass "orphan files deleted (bakery-serialized)"
+        pass "TC-133: orphan files deleted (bakery-serialized)"
     else
-        fail "orphan deletion failed — see /tmp/journey-orphans.log"; tail -8 /tmp/journey-orphans.log; return
+        fail "TC-133: orphan deletion failed — see /tmp/journey-orphans.log"; tail -8 /tmp/journey-orphans.log; return
     fi
 
     local orph2; orph2=$("$COMPACTOR" --config /tmp/journey-archiver.yaml --table events --orphans --orphan-age 0s --dry-run 2>&1)
     local norph2; norph2=$(echo "$orph2" | grep -oE '[0-9]+ orphan' | head -1 | grep -oE '[0-9]+')
     if [ "${norph2:-1}" -eq 0 ]; then
-        pass "no orphans remain (reclaimed)"
+        pass "TC-133: no orphans remain after deletion"
     else
-        fail "orphans remain after deletion: $orph2"
+        fail "TC-133: orphans remain after deletion: $orph2"
     fi
 
     assert_eq "maintenance preserved all rows" "$rows_before" "$(q "$HOST" "SELECT count(*) FROM events;")"
@@ -3362,30 +3361,45 @@ CREATE TABLE IF NOT EXISTS xb.events (
     id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL, val text,
     PRIMARY KEY (id, ts)
 ) PARTITION BY RANGE (ts);
-CREATE TABLE IF NOT EXISTS xb.events_open_lo PARTITION OF xb.events FOR VALUES FROM (MINVALUE) TO ('0100-01-01 BC');
-CREATE TABLE IF NOT EXISTS xb.events_bc      PARTITION OF xb.events FOR VALUES FROM ('0100-01-01 BC') TO ('0043-01-01 BC');
-CREATE TABLE IF NOT EXISTS xb.events_wide    PARTITION OF xb.events FOR VALUES FROM ('10000-06-01') TO ('20000-01-01');
+CREATE TABLE IF NOT EXISTS xb.events_open_lo  PARTITION OF xb.events FOR VALUES FROM (MINVALUE)    TO ('0100-01-01 BC');
+CREATE TABLE IF NOT EXISTS xb.events_bc       PARTITION OF xb.events FOR VALUES FROM ('0100-01-01 BC') TO ('0043-01-01 BC');
+CREATE TABLE IF NOT EXISTS xb.events_y2038    PARTITION OF xb.events FOR VALUES FROM ('2038-01-01') TO ('2038-02-01');
+CREATE TABLE IF NOT EXISTS xb.events_y9999    PARTITION OF xb.events FOR VALUES FROM ('9999-01-01') TO ('9999-02-01');
+CREATE TABLE IF NOT EXISTS xb.events_wide     PARTITION OF xb.events FOR VALUES FROM ('10000-06-01') TO ('20000-01-01');
+CREATE TABLE IF NOT EXISTS xb.events_y294276  PARTITION OF xb.events FOR VALUES FROM ('294276-01-01') TO ('294276-02-01');
 INSERT INTO xb.events (ts, val) VALUES ('0044-03-15 00:00:00+00 BC', 'ides');
 EOSQL
     "$PARTITIONER" register --dsn "$dsn" --schema xb --table events \
         --period monthly --hot-period "30 days" --retention "5 years" >/dev/null 2>&1
     if archive_only "schema_name='xb' AND table_name='events'" /tmp/journey-archiver.yaml /tmp/journey-xb.log; then
-        pass "exotic bounds: archiver completed instead of aborting"
+        pass "TC-145/TC-146/TC-147/TC-148/TC-149: exotic bounds: archiver completed without aborting"
     else
-        fail "exotic bounds: archiver aborted — see /tmp/journey-xb.log"; tail -8 /tmp/journey-xb.log
+        fail "TC-145/TC-146/TC-147/TC-148/TC-149: exotic bounds: archiver aborted — see /tmp/journey-xb.log"; tail -8 /tmp/journey-xb.log
     fi
     # The BC partition is past the hot window, so it tiered: its bound is read as
     # an astronomical year and written back with the era suffix PostgreSQL wants.
-    assert_eq "exotic bounds: the BC partition archived to the cold tier" "1" \
+    assert_eq "TC-145: BC partition archived to the cold tier" "1" \
         "$(q "$HOST" "SELECT count(*) FROM coldfront.tiered_views WHERE schema_name='xb' AND relname='events';")"
     # MINVALUE and the year-20000 bound must not have stopped the pass.
-    assert_contains "exotic bounds: the BC partition reached cutover" "archived events_bc" \
+    assert_contains "TC-145: BC partition reached cutover" "archived events_bc" \
         "$(cat /tmp/journey-xb.log)"
     # The open lower edge (MINVALUE) sorts LAST by name and FIRST by bound, so
     # it pins the ordering contract: it is tiered on its bound, ahead of the BC
     # partition whose cutover carries the watermark past its range.
-    assert_contains "exotic bounds: the MINVALUE partition tiered, not dropped as stale" \
+    assert_contains "TC-147: MINVALUE partition tiered, not dropped as stale" \
         "archived events_open_lo" "$(cat /tmp/journey-xb.log)"
+    # TC-146, TC-148, TC-149: these bounds are all in the future, so the archiver
+    # classifies each partition hot and leaves it attached to the hot heap behind the
+    # view. Cutover DETACHes an archived partition and cleanup DROPs it, so still
+    # being attached is what proves the bound was read and classified. The parent
+    # comes from the registry, which is where the hot heap's real name lives.
+    local hotp="(SELECT hot_table FROM coldfront.tiered_views WHERE schema_name='xb' AND relname='events')::regclass"
+    assert_eq "TC-146: year-9999 partition left hot, not archived" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM pg_inherits i JOIN pg_class c ON c.oid=i.inhrelid WHERE i.inhparent=$hotp AND c.relname='events_y9999';")"
+    assert_eq "TC-148: year-2038 partition left hot, not archived" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM pg_inherits i JOIN pg_class c ON c.oid=i.inhrelid WHERE i.inhparent=$hotp AND c.relname='events_y2038';")"
+    assert_eq "TC-149: year-294276 partition left hot, not archived" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM pg_inherits i JOIN pg_class c ON c.oid=i.inhrelid WHERE i.inhparent=$hotp AND c.relname='events_y294276';")"
 
     # A DEFAULT partition is refused outright at registration: its rows could
     # never tier or expire, and PostgreSQL blocks concurrent detach of every
@@ -3498,20 +3512,20 @@ EOSQL
 # case-insensitively even when quoted, so both resolve to one Iceberg table.
 # ───────────────────────────────────────────────────────────────────────────
 story_case_collision_rejected() {
-    step "table name differing only by case rejected at register"
+    step "TC-141: table name differing only by case rejected at register"
     q "$HOST" "CREATE TABLE IF NOT EXISTS public.\"Events\" (
         id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL, payload text,
         PRIMARY KEY (id, ts)
     ) PARTITION BY RANGE (ts);" >/dev/null
-    assert_eq "case collision: PostgreSQL holds both names as distinct relations" "2" \
+    assert_eq "TC-141: PostgreSQL holds both names as distinct relations" "2" \
         "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname IN ('events','Events') AND relnamespace='public'::regnamespace;")"
     # Names the row it collides with, so the operator knows which one.
-    assert_register_rejected "case collision: register named the colliding registration" \
+    assert_register_rejected "TC-141: register named the colliding registration" \
         Events public.events
-    assert_eq "case collision: nothing registered for the mixed-case name" "0" \
+    assert_eq "TC-141: nothing registered for the mixed-case name" "0" \
         "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='Events';")"
     # The existing registration is untouched.
-    assert_eq "case collision: the original events registration survives" "1" \
+    assert_eq "TC-141: the original events registration survives" "1" \
         "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='events';")"
     q "$HOST" "DROP TABLE IF EXISTS public.\"Events\" CASCADE;" >/dev/null 2>&1
 }
@@ -3522,25 +3536,25 @@ story_case_collision_rejected() {
 # <name>_p_YYYY_MM (_p_YYYY_MM_DD daily), so the name must fit within 63 bytes.
 # ───────────────────────────────────────────────────────────────────────────
 story_bad_source_names_rejected() {
-    step "unrepresentable table names rejected at register"
+    step "TC-139/TC-142: unrepresentable table names rejected at register"
     local long53 long54
     long53=$(head -c 53 < /dev/zero | tr "\\0" a); long54="${long53}a"
     q "$HOST" "CREATE TABLE IF NOT EXISTS public._mytest (id bigint NOT NULL, ts timestamptz NOT NULL, PRIMARY KEY (id,ts)) PARTITION BY RANGE (ts);" >/dev/null
     q "$HOST" "CREATE TABLE IF NOT EXISTS public.${long54} (id bigint NOT NULL, ts timestamptz NOT NULL, PRIMARY KEY (id,ts)) PARTITION BY RANGE (ts);" >/dev/null
     q "$HOST" "CREATE TABLE IF NOT EXISTS public.${long53} (id bigint NOT NULL, ts timestamptz NOT NULL, PRIMARY KEY (id,ts)) PARTITION BY RANGE (ts);" >/dev/null
 
-    assert_register_rejected "name rules: register explained the reserved underscore" \
+    assert_register_rejected "TC-139: register explained the reserved leading underscore" \
         _mytest underscore
-    assert_register_rejected "name rules: register stated the 53-byte maximum" "$long54" 53
+    assert_register_rejected "TC-142: register stated the 53-byte maximum for over-long names" "$long54" 53
     # The boundary must still be usable: 53 is exactly what monthly allows.
     if "$ARCHIVER" register --config /tmp/journey-archiver.yaml --table "$long53" \
             --period monthly --hot-period "30 days" >/tmp/journey-badname53.log 2>&1; then
-        pass "name rules: a 53-char name is accepted (the limit is not off by one)"
+        pass "TC-142: a 53-char name is accepted (the limit is not off by one)"
     else
-        fail "name rules: 53 chars must be accepted — see /tmp/journey-badname53.log"; tail -3 /tmp/journey-badname53.log
+        fail "TC-142: 53 chars must be accepted — see /tmp/journey-badname53.log"; tail -3 /tmp/journey-badname53.log
     fi
 
-    assert_eq "name rules: only the legal name reached partition_config" "1" \
+    assert_eq "TC-139/TC-142: only the legal name reached partition_config" "1" \
         "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name IN ('_mytest','${long53}','${long54}');")"
     q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name IN ('_mytest','${long53}','${long54}');" >/dev/null 2>&1
     q "$HOST" "DROP TABLE IF EXISTS public._mytest, public.${long53}, public.${long54} CASCADE;" >/dev/null 2>&1
@@ -3887,6 +3901,241 @@ story_drop_iceberg_table() {
     q "$HOST" "DROP SCHEMA IF EXISTS dropprobe CASCADE;" >/dev/null 2>&1
 }
 
+# ───────────────────────────────────────────────────────────────────────────
+# Story — TC-126/TC-127: compactor error paths — missing required flag and
+# nonexistent table both produce a clear error message and a non-zero exit.
+# ───────────────────────────────────────────────────────────────────────────
+story_compactor_error_paths() {
+    require_compactor || return
+    step "TC-126: compactor missing --table flag exits 2 with usage message"
+    local ec
+
+    # TC-126: --config present, --table absent → exit 2 + usage on stderr.
+    "$COMPACTOR" --config /tmp/journey-archiver.yaml >/dev/null 2>/tmp/journey-comp-miss.log
+    ec=$?
+    assert_eq "TC-126: missing --table flag exits with code 2" "2" "$ec"
+    assert_contains "TC-126: usage message printed on missing --table" "usage:" \
+        "$(cat /tmp/journey-comp-miss.log)"
+
+    step "TC-127: compactor nonexistent table exits non-zero with error"
+    # TC-127: --table names a table that has never been registered with Lakekeeper.
+    "$COMPACTOR" --config /tmp/journey-archiver.yaml --table nonexistent_xyz_table \
+        >/dev/null 2>/tmp/journey-comp-noexist.log
+    ec=$?
+    if [ "$ec" -ne 0 ]; then
+        pass "TC-127: nonexistent table exits non-zero (exit $ec)"
+    else
+        fail "TC-127: expected non-zero exit for nonexistent table, got 0"
+    fi
+    assert_contains "TC-127: error output emitted for nonexistent table" "compactor:" \
+        "$(cat /tmp/journey-comp-noexist.log)"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story — TC-134/TC-135: compactor advanced flags — combine all three
+# maintenance steps in one invocation and use a non-default --target-size-mb.
+# ───────────────────────────────────────────────────────────────────────────
+story_compactor_advanced() {
+    require_compactor || return
+    step "TC-134/TC-135: compactor advanced flags — all-in-one and custom target size"
+
+    # TC-134: pass --expire-snapshots and --orphans together with compaction.
+    # After story_maintenance the events cold tier has 1 snapshot and 0 orphans,
+    # so each step is a no-op — but all three code paths must exit 0 together.
+    if "$COMPACTOR" --config /tmp/journey-archiver.yaml --table events \
+            --expire-snapshots --expire-older-than 0s --expire-retain-last 1 \
+            --orphans --orphan-age 0s >/dev/null 2>/tmp/journey-tc134.log; then
+        pass "TC-134: compaction + expire-snapshots + orphans in one invocation exited 0"
+    else
+        fail "TC-134: all-in-one invocation failed — see /tmp/journey-tc134.log"
+        tail -8 /tmp/journey-tc134.log
+    fi
+
+    # TC-135: non-default --target-size-mb accepted; dry-run exits 0.
+    local out135 ec135
+    out135=$("$COMPACTOR" --config /tmp/journey-archiver.yaml --table events \
+            --target-size-mb 512 --dry-run 2>&1)
+    ec135=$?
+    if [ "$ec135" -eq 0 ]; then
+        pass "TC-135: --target-size-mb 512 accepted; dry-run exits 0"
+    else
+        fail "TC-135: --target-size-mb 512 dry-run failed (exit $ec135): $out135"
+    fi
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story — TC-136: compactor rejects an unreachable Lakekeeper endpoint with a
+# clear error and a non-zero exit.
+# ───────────────────────────────────────────────────────────────────────────
+story_compactor_wrong_creds() {
+    require_compactor || return
+    step "TC-136: compactor bad Lakekeeper endpoint — non-zero exit with error"
+    local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
+    cat >/tmp/journey-badlk.yaml <<EOF
+postgres:
+  dsn: "${dsn}"
+iceberg:
+  warehouse: "${WAREHOUSE}"
+  lakekeeper_endpoint: "http://127.0.0.1:19999/catalog"
+$(storage_yaml)
+EOF
+    if "$COMPACTOR" --config /tmp/journey-badlk.yaml --table events \
+            >/dev/null 2>/tmp/journey-tc136.log; then
+        fail "TC-136: expected non-zero exit with bad Lakekeeper endpoint, got 0"
+    else
+        pass "TC-136: unreachable Lakekeeper endpoint rejected (exit $?)"
+        [ -s /tmp/journey-tc136.log ] || fail "TC-136: no error output emitted"
+    fi
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story — TC-137: two compactor processes running simultaneously against the
+# same Iceberg table — the bakery claim serialises both and neither produces
+# a 409 or any other error.
+# ───────────────────────────────────────────────────────────────────────────
+story_compactor_concurrent() {
+    require_compactor || return
+    step "TC-137: concurrent compactor processes — bakery serialises both (no 409)"
+    local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
+
+    # Create a dedicated cold table so this story is independent of the events
+    # table's compacted state. Six rows 4 months back produce small Parquet files
+    # via the cold-write path after archiving.
+    qf "$HOST" <<'EOSQL' >/dev/null
+CREATE TABLE IF NOT EXISTS public.tc137_conc (
+    id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL,
+    PRIMARY KEY (id, ts)
+) PARTITION BY RANGE (ts);
+DO $do$
+DECLARE m date;
+BEGIN
+  m := (date_trunc('month', now()) - interval '4 months')::date;
+  EXECUTE format(
+    'CREATE TABLE IF NOT EXISTS public.%I PARTITION OF public.tc137_conc FOR VALUES FROM (%L) TO (%L)',
+    'tc137_conc_p_' || to_char(m, 'YYYY_MM'), m, (m + interval '1 month')::date);
+END $do$;
+INSERT INTO public.tc137_conc (ts) VALUES
+  (date_trunc('month',now()) - interval '4 months' + interval '1 hour'),
+  (date_trunc('month',now()) - interval '4 months' + interval '2 hours'),
+  (date_trunc('month',now()) - interval '4 months' + interval '3 hours'),
+  (date_trunc('month',now()) - interval '4 months' + interval '4 hours'),
+  (date_trunc('month',now()) - interval '4 months' + interval '5 hours'),
+  (date_trunc('month',now()) - interval '4 months' + interval '6 hours');
+EOSQL
+    "$PARTITIONER" register --dsn "$dsn" --table tc137_conc \
+        --period monthly --hot-period "30 days" >/dev/null 2>&1
+    if ! archive_only "table_name='tc137_conc'" /tmp/journey-archiver.yaml /tmp/journey-tc137a.log; then
+        fail "TC-137: initial archive of tc137_conc failed — see /tmp/journey-tc137a.log"
+        tail -5 /tmp/journey-tc137a.log
+        q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name='tc137_conc';" >/dev/null 2>&1
+        q "$HOST" "DROP TABLE IF EXISTS public.tc137_conc CASCADE;" >/dev/null 2>&1
+        return
+    fi
+    local rows_before; rows_before=$(q "$HOST" "SELECT count(*) FROM tc137_conc;")
+
+    # Two simultaneous compactors; bakery claim must serialise their commits.
+    "$COMPACTOR" --config /tmp/journey-archiver.yaml --table tc137_conc \
+        >/dev/null 2>/tmp/journey-tc137-c1.log &
+    local pid1=$!
+    "$COMPACTOR" --config /tmp/journey-archiver.yaml --table tc137_conc \
+        >/dev/null 2>/tmp/journey-tc137-c2.log &
+    local pid2=$!
+    wait "$pid1"; local ec1=$?
+    wait "$pid2"; local ec2=$?
+
+    if [ "$ec1" -eq 0 ] && [ "$ec2" -eq 0 ]; then
+        pass "TC-137: both concurrent compactors exited 0 (bakery-serialised, no 409)"
+    else
+        fail "TC-137: exit codes c1=$ec1 c2=$ec2"
+        cat /tmp/journey-tc137-c1.log /tmp/journey-tc137-c2.log
+    fi
+    assert_eq "TC-137: row count preserved after concurrent compaction" "$rows_before" \
+        "$(q "$HOST" "SELECT count(*) FROM tc137_conc;")"
+
+    q "$HOST" "DELETE FROM coldfront.partition_config  WHERE table_name='tc137_conc';" >/dev/null 2>&1
+    q "$HOST" "DELETE FROM coldfront.tiered_views      WHERE relname='tc137_conc';"   >/dev/null 2>&1
+    q "$HOST" "DELETE FROM coldfront.archive_watermark WHERE table_name='tc137_conc';" >/dev/null 2>&1
+    q "$HOST" "DROP VIEW  IF EXISTS public.tc137_conc;"          >/dev/null 2>&1
+    q "$HOST" "DROP TABLE IF EXISTS public._tc137_conc CASCADE;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story — TC-140/TC-143/TC-144: table names containing a dot, hyphen, or
+# space round-trip through registration, archiving, and cold reads.
+# PostgreSQL allows any quoted identifier as a table name; pgx.Identifier
+# sanitises them correctly at every call site.
+# ───────────────────────────────────────────────────────────────────────────
+story_quoted_table_names() {
+    step "TC-140/TC-143/TC-144: quoted table names (dot, hyphen, space) — register + archive + cold read"
+    local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
+    local ret_days; ret_days=$(hot_days)
+    q "$HOST" "CREATE SCHEMA IF NOT EXISTS qtn;" >/dev/null
+
+    # Three RANGE-partitioned tables whose names contain characters that require quoting.
+    qf "$HOST" <<'EOSQL' >/dev/null
+CREATE TABLE IF NOT EXISTS qtn."my.table" (
+    id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL, val text,
+    PRIMARY KEY (id, ts)
+) PARTITION BY RANGE (ts);
+CREATE TABLE IF NOT EXISTS qtn."my-table" (
+    id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL, val text,
+    PRIMARY KEY (id, ts)
+) PARTITION BY RANGE (ts);
+CREATE TABLE IF NOT EXISTS qtn."my table" (
+    id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL, val text,
+    PRIMARY KEY (id, ts)
+) PARTITION BY RANGE (ts);
+EOSQL
+    # Create a cold partition for each table and insert one row to archive.
+    qf "$HOST" <<'EOSQL' >/dev/null
+DO $do$
+DECLARE m date;
+BEGIN
+  m := (date_trunc('month', now()) - interval '2 months')::date;
+  EXECUTE format('CREATE TABLE IF NOT EXISTS qtn.%I PARTITION OF qtn.%I FOR VALUES FROM (%L) TO (%L)',
+    'my.table_p_' || to_char(m,'YYYY_MM'), 'my.table', m, (m + interval '1 month')::date);
+  EXECUTE format('CREATE TABLE IF NOT EXISTS qtn.%I PARTITION OF qtn.%I FOR VALUES FROM (%L) TO (%L)',
+    'my-table_p_' || to_char(m,'YYYY_MM'), 'my-table', m, (m + interval '1 month')::date);
+  EXECUTE format('CREATE TABLE IF NOT EXISTS qtn.%I PARTITION OF qtn.%I FOR VALUES FROM (%L) TO (%L)',
+    'my table_p_' || to_char(m,'YYYY_MM'), 'my table', m, (m + interval '1 month')::date);
+  EXECUTE format('INSERT INTO qtn.%I (ts, val) VALUES (%L, %L)', 'my.table', m + interval '5 days', 'my.table');
+  EXECUTE format('INSERT INTO qtn.%I (ts, val) VALUES (%L, %L)', 'my-table', m + interval '5 days', 'my-table');
+  EXECUTE format('INSERT INTO qtn.%I (ts, val) VALUES (%L, %L)', 'my table', m + interval '5 days', 'my table');
+END $do$;
+EOSQL
+
+    local tname
+    for tname in 'my.table' 'my-table' 'my table'; do
+        if "$ARCHIVER" register --dsn "$dsn" --schema qtn --table "$tname" \
+                --period monthly --hot-period "${ret_days} days" >/tmp/journey-qtn-reg.log 2>&1; then
+            pass "quoted names: registered qtn.\"$tname\""
+        else
+            fail "quoted names: register failed for \"$tname\" — see /tmp/journey-qtn-reg.log"
+            tail -3 /tmp/journey-qtn-reg.log
+        fi
+    done
+
+    if archive_only "schema_name='qtn'" /tmp/journey-archiver.yaml /tmp/journey-qtn.log; then
+        pass "TC-140/TC-143/TC-144: archiver completed for all three quoted-name tables"
+    else
+        fail "TC-140/TC-143/TC-144: archiver aborted — see /tmp/journey-qtn.log"
+        tail -8 /tmp/journey-qtn.log
+    fi
+
+    # Each cold row is readable through the unified tiered view.
+    assert_eq "TC-140: cold row readable from qtn.\"my.table\"" "my.table" \
+        "$(q "$HOST" "SELECT val FROM qtn.\"my.table\" LIMIT 1;")"
+    assert_eq "TC-143: cold row readable from qtn.\"my-table\"" "my-table" \
+        "$(q "$HOST" "SELECT val FROM qtn.\"my-table\" LIMIT 1;")"
+    assert_eq "TC-144: cold row readable from qtn.\"my table\"" "my table" \
+        "$(q "$HOST" "SELECT val FROM qtn.\"my table\" LIMIT 1;")"
+
+    q "$HOST" "DELETE FROM coldfront.partition_config  WHERE schema_name='qtn';" >/dev/null 2>&1
+    q "$HOST" "DELETE FROM coldfront.archive_watermark WHERE schema_name='qtn';" >/dev/null 2>&1
+    q "$HOST" "DELETE FROM coldfront.tiered_views      WHERE schema_name='qtn';" >/dev/null 2>&1
+    q "$HOST" "DROP SCHEMA qtn CASCADE;" >/dev/null 2>&1
+}
+
 # ── orchestrate ────────────────────────────────────────────────────────────
 # Setup is shared. The story set then branches on mode: tiered exercises the
 # hot+cold partitioned path; decoupled exercises the all-Iceberg wrapper. (The
@@ -3945,17 +4194,22 @@ if [ "$MODE" = "tiered" ]; then
     story_multitable_disable_one       # TC-109: disable one table; others still processed
     story_register_idempotent          # TC-110: re-register updates values; no duplicate row
     story_unlogged_rejected            # TC-113: UNLOGGED rejected at register
-    story_case_collision_rejected      # name differing only by case rejected at register
-    story_bad_source_names_rejected    # leading underscore and over-long names rejected
+    story_case_collision_rejected      # TC-141: name differing only by case rejected at register
+    story_bad_source_names_rejected    # TC-139/TC-142: leading underscore and over-long names rejected
+    story_quoted_table_names           # TC-140/TC-143/TC-144: dot, hyphen, space in table name
     story_temp_rejected                # TC-114: TEMP table invisible to archiver
     story_list_partition_rejected      # TC-115: LIST partition accepted at register; rejected at archive
     story_hash_partition_rejected      # TC-116: HASH partition accepted at register; rejected at archive
     story_partition_col_timestamp      # TC-066: timestamp (no tz) partition column
     story_partition_col_date           # TC-067: date partition column
     story_partition_col_text_rejected  # TC-070: text partition column rejected at archive
-    story_exotic_partition_bounds      # BC, wide years, open-ended and DEFAULT bounds
+    story_exotic_partition_bounds      # TC-145/TC-147: BC, wide years, open-ended bounds; TC-146/TC-148/TC-149: 9999/2038/294276
     story_partition_order_by_bound     # tier in bound order; refuse a non-empty stale partition
     story_schema_collision             # TC-138: same table name in two schemas — distinct Iceberg namespaces
+    story_compactor_error_paths        # TC-126/TC-127: missing --table flag; nonexistent table
+    story_compactor_advanced           # TC-134/TC-135: all-in-one invocation; custom --target-size-mb
+    story_compactor_wrong_creds        # TC-136: unreachable Lakekeeper endpoint rejected
+    story_compactor_concurrent         # TC-137: concurrent compactors — bakery serialises both
     story_pg_restart                   # TC-063: PG restart; DuckDB secret reloads; cold reads work
 else
     story_provision_decoupled
