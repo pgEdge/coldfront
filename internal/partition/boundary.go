@@ -6,6 +6,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/pgedge/coldfront/internal/sqlutil"
 )
 
 // Partition key modes and id schemes. The valid set lives here (like the Period
@@ -41,7 +43,7 @@ type TimeBoundary struct{}
 
 // Literal renders t as a quoted timestamptz bound.
 func (TimeBoundary) Literal(t time.Time) string {
-	return "'" + t.Format("2006-01-02 15:04:05+00") + "'"
+	return "'" + sqlutil.Timestamp(t) + "'"
 }
 
 // Parse reads a (possibly quoted) timestamp bound back to its time.
@@ -101,6 +103,27 @@ func BoundaryFor(mode, scheme string) (Boundary, error) {
 // the quoting and the type conversion.
 var boundRe = regexp.MustCompile(`FOR VALUES FROM \((.+?)\) TO \((.+?)\)`)
 
+// negInfinity and posInfinity stand for an unbounded partition edge, outside
+// PostgreSQL's own range (4713 BC to 5874897 AD) so no real bound equals one.
+// The ordinary comparisons then hold: an edge open above is never past the hot
+// window, never expires, and still covers the current period.
+var (
+	negInfinity = time.Date(-5000, 1, 1, 0, 0, 0, 0, time.UTC)
+	posInfinity = time.Date(6000000, 1, 1, 0, 0, 0, 0, time.UTC)
+)
+
+// openBound maps an unbounded edge token to its sentinel. MINVALUE/MAXVALUE are
+// partition-bound keywords; infinity/-infinity are timestamp values.
+func openBound(lit string) (time.Time, bool) {
+	switch strings.ToLower(unquote(lit)) {
+	case "minvalue", "-infinity":
+		return negInfinity, true
+	case "maxvalue", "infinity":
+		return posInfinity, true
+	}
+	return time.Time{}, false
+}
+
 // parseBoundPair extracts the lower and upper bound values from a
 // pg_get_expr(relpartbound) string and converts both to time via b.
 func parseBoundPair(expr string, b Boundary) (lower, upper time.Time, err error) {
@@ -108,13 +131,22 @@ func parseBoundPair(expr string, b Boundary) (lower, upper time.Time, err error)
 	if m == nil {
 		return time.Time{}, time.Time{}, fmt.Errorf("cannot parse partition bound: %q", expr)
 	}
-	if lower, err = b.Parse(m[1]); err != nil {
+	if lower, err = parseEdge(m[1], b); err != nil {
 		return time.Time{}, time.Time{}, fmt.Errorf("parse lower bound: %w", err)
 	}
-	if upper, err = b.Parse(m[2]); err != nil {
+	if upper, err = parseEdge(m[2], b); err != nil {
 		return time.Time{}, time.Time{}, fmt.Errorf("parse upper bound: %w", err)
 	}
 	return lower, upper, nil
+}
+
+// parseEdge resolves one bound value: a sentinel when the edge is open, else the
+// Boundary's own conversion.
+func parseEdge(lit string, b Boundary) (time.Time, error) {
+	if t, ok := openBound(lit); ok {
+		return t, nil
+	}
+	return b.Parse(lit)
 }
 
 // unquote strips one layer of surrounding single quotes, if present.

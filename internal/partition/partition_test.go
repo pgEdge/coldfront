@@ -26,6 +26,7 @@ type mockRows struct {
 	rows   []func(dest ...any) error
 	idx    int
 	closed bool
+	err    error // reported by Err(), as pgx does for a mid-iteration failure
 }
 
 func (r *mockRows) Next() bool {
@@ -39,7 +40,7 @@ func (r *mockRows) Scan(dest ...any) error {
 }
 
 func (r *mockRows) Close()                                       { r.closed = true }
-func (r *mockRows) Err() error                                   { return nil }
+func (r *mockRows) Err() error                                   { return r.err }
 func (r *mockRows) CommandTag() pgconn.CommandTag                { return pgconn.NewCommandTag("SELECT") }
 func (r *mockRows) FieldDescriptions() []pgconn.FieldDescription { return nil }
 func (r *mockRows) RawValues() [][]byte                          { return nil }
@@ -195,55 +196,150 @@ func TestFuturePartitionDates(t *testing.T) {
 	assert.Equal(t, time.Date(2026, 4, 10, 0, 0, 0, 0, time.UTC), dates[1])
 }
 
-// attachedRow models the verify-attach guard's pg_inherits check: `attached`
-// controls whether the just-created partition is reported as attached to our parent.
-func attachedRow(attached bool) func(context.Context, string, ...any) pgx.Row {
+// attachedRow models the post-create verify read for a partition that IS ours
+// and carries the bounds the CREATE asked for: it echoes the FOR VALUES clause
+// of the statement the Manager just issued, the way PostgreSQL renders it back.
+// attached=false models a name that resolves to something else (no row).
+func attachedRow(db *mockDB, attached bool) func(context.Context, string, ...any) pgx.Row {
 	return func(_ context.Context, _ string, _ ...any) pgx.Row {
-		return &mockRow{scanFunc: func(dest ...any) error { *(dest[0].(*bool)) = attached; return nil }}
+		return &mockRow{scanFunc: func(dest ...any) error {
+			if !attached {
+				return pgx.ErrNoRows
+			}
+			*(dest[0].(*string)) = lastForValues(db.execSQL)
+			return nil
+		}}
 	}
 }
 
+// boundRow models the verify read returning one specific bound expression,
+// for the case where the existing partition covers a different range.
+func boundRow(expr string) func(context.Context, string, ...any) pgx.Row {
+	return func(_ context.Context, _ string, _ ...any) pgx.Row {
+		return &mockRow{scanFunc: func(dest ...any) error {
+			*(dest[0].(*string)) = expr
+			return nil
+		}}
+	}
+}
+
+// lastForValues returns the FOR VALUES clause of the most recent recorded
+// CREATE, which is what PostgreSQL renders for the partition it made.
+func lastForValues(sqls []string) string {
+	for i := len(sqls) - 1; i >= 0; i-- {
+		if j := strings.Index(sqls[i], "FOR VALUES"); j >= 0 {
+			return sqls[i][j:]
+		}
+	}
+	return ""
+}
+
 func TestEnsureFuture(t *testing.T) {
-	db := &mockDB{rowFunc: attachedRow(true)}
+	db := &mockDB{}
+	db.rowFunc = attachedRow(db, true)
 	m := NewManager(db)
 	now := time.Date(2026, 4, 8, 0, 0, 0, 0, time.UTC)
 	err := m.EnsureFuture(context.Background(), "events", "public", "time", "monthly", 2, now, TimeBoundary{}, "")
 	require.NoError(t, err)
-	// 2 partitions × (CREATE + verify-attach) = 4 statements.
-	assert.Len(t, db.execSQL, 4)
-	assert.Contains(t, db.execSQL[0], "CREATE TABLE IF NOT EXISTS")
-	// Table-scoped name (issue #11): the leaf is prefixed with the parent table.
-	assert.Contains(t, db.execSQL[0], `"public"."events_p_2026_05"`)
-	assert.Contains(t, db.execSQL[0], "PARTITION OF")
-	// Time-mode bounds stay single-quoted timestamps (byte-for-byte legacy SQL).
-	assert.Contains(t, db.execSQL[0], "FOR VALUES FROM ('2026-05-01 00:00:00+00') TO ('2026-06-01 00:00:00+00')")
+	// 1 partition list + 2 partitions × (CREATE + verify read) = 5 statements.
+	assert.Len(t, db.execSQL, 5)
+	create := createSQL(db.execSQL)
+	// Table-scoped name: the leaf is prefixed with the parent table.
+	assert.Contains(t, create, `"public"."events_p_2026_05"`)
+	assert.Contains(t, create, "PARTITION OF")
+	// Time-mode bounds are single-quoted timestamps.
+	assert.Contains(t, create, "FOR VALUES FROM ('2026-05-01 00:00:00+00') TO ('2026-06-01 00:00:00+00')")
 }
 
-// Issue #11, bug 1: two independent flat tables in the SAME schema must get
-// DISTINCT, table-scoped partition names — never a shared p_2026_07 that the
-// second table's CREATE … IF NOT EXISTS would silently skip.
+// Two independent flat tables in the SAME schema must get DISTINCT,
+// table-scoped partition names, never a shared p_2026_07 that the second
+// table's CREATE … IF NOT EXISTS silently skips.
 func TestEnsureFuture_TableScopedPerTable(t *testing.T) {
 	now := time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC)
-	dbA := &mockDB{rowFunc: attachedRow(true)}
+	dbA := &mockDB{}
+	dbA.rowFunc = attachedRow(dbA, true)
 	require.NoError(t, NewManager(dbA).EnsureFuture(context.Background(), "table_a", "public", "ts", "monthly", 1, now, TimeBoundary{}, ""))
-	dbB := &mockDB{rowFunc: attachedRow(true)}
+	dbB := &mockDB{}
+	dbB.rowFunc = attachedRow(dbB, true)
 	require.NoError(t, NewManager(dbB).EnsureFuture(context.Background(), "table_b", "public", "ts", "monthly", 1, now, TimeBoundary{}, ""))
-	assert.Contains(t, dbA.execSQL[0], `"public"."table_a_p_2026_07"`)
-	assert.Contains(t, dbB.execSQL[0], `"public"."table_b_p_2026_07"`)
-	// Neither uses the un-scoped name that caused the collision.
-	assert.NotContains(t, dbA.execSQL[0], `"public"."p_2026_07"`)
-	assert.NotContains(t, dbB.execSQL[0], `"public"."p_2026_07"`)
+	assert.Contains(t, createSQL(dbA.execSQL), `"public"."table_a_p_2026_07"`)
+	assert.Contains(t, createSQL(dbB.execSQL), `"public"."table_b_p_2026_07"`)
+	// Neither uses the un-scoped name that collides.
+	assert.NotContains(t, createSQL(dbA.execSQL), `"public"."p_2026_07"`)
+	assert.NotContains(t, createSQL(dbB.execSQL), `"public"."p_2026_07"`)
 }
 
-// Issue #11, bug 2: if the scoped name already exists under a DIFFERENT parent,
-// CREATE … IF NOT EXISTS no-ops; the verify-attach guard must fail loud rather
-// than report success on a partition-less table.
+// If the scoped name already exists under a DIFFERENT parent, CREATE … IF NOT
+// EXISTS no-ops; the verify read must fail loud rather than report success on a
+// partition-less table.
 func TestEnsureFuture_CollisionFailsLoud(t *testing.T) {
-	db := &mockDB{rowFunc: attachedRow(false)} // pg_inherits: NOT attached to us
+	db := &mockDB{} // the verify read finds no partition of ours under that name
+	db.rowFunc = attachedRow(db, false)
 	now := time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC)
 	err := NewManager(db).EnsureFuture(context.Background(), "table_b", "public", "ts", "monthly", 1, now, TimeBoundary{}, "")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not attached")
+}
+
+// Premake asks whether the period is provisioned, not whether its generated
+// name exists. A user's own naming for a future month is a covered period, not
+// a collision, so nothing is created and PostgreSQL is never asked to overlap.
+func TestEnsureFuture_SkipsRangeCoveredUnderAnotherName(t *testing.T) {
+	db := &mockDB{rowsFunc: partitionRows(
+		[2]string{"sales_may", "FOR VALUES FROM ('2026-05-01 00:00:00+00') TO ('2026-06-01 00:00:00+00')"},
+	)}
+	db.rowFunc = attachedRow(db, true)
+	now := time.Date(2026, 4, 8, 0, 0, 0, 0, time.UTC)
+	require.NoError(t, NewManager(db).EnsureFuture(context.Background(), "sales", "public",
+		"ts", "monthly", 1, now, TimeBoundary{}, ""))
+	assert.False(t, hasCreate(db.execSQL), "the period is already provisioned")
+}
+
+// A partition that covers only part of the period leaves a hole premake cannot
+// fill, since PostgreSQL rejects an overlapping range. Name both sides rather
+// than let PostgreSQL's raw overlap error stand.
+func TestEnsureFuture_RejectsPartialOverlap(t *testing.T) {
+	db := &mockDB{rowsFunc: partitionRows(
+		[2]string{"sales_may_h1", "FOR VALUES FROM ('2026-05-01 00:00:00+00') TO ('2026-05-16 00:00:00+00')"},
+	)}
+	db.rowFunc = attachedRow(db, true)
+	now := time.Date(2026, 4, 8, 0, 0, 0, 0, time.UTC)
+	err := NewManager(db).EnsureFuture(context.Background(), "sales", "public",
+		"ts", "monthly", 1, now, TimeBoundary{}, "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "sales_may_h1")
+	assert.False(t, hasCreate(db.execSQL), "a partial overlap must not attempt a CREATE")
+}
+
+// CREATE … IF NOT EXISTS no-ops on the name alone, so a partition of our parent
+// that already holds that name while covering a different range leaves the
+// period unprovisioned with the run reporting success.
+func TestEnsureFuture_RejectsExistingNameWithWrongBounds(t *testing.T) {
+	db := &mockDB{rowFunc: boundRow(
+		"FOR VALUES FROM ('2027-05-01 00:00:00+00') TO ('2027-06-01 00:00:00+00')")}
+	now := time.Date(2026, 4, 8, 0, 0, 0, 0, time.UTC)
+	err := NewManager(db).EnsureFuture(context.Background(), "sales", "public",
+		"ts", "monthly", 1, now, TimeBoundary{}, "")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "sales_p_2026_05")
+	assert.Contains(t, err.Error(), "2027")
+}
+
+// The post-create bound check compares what PostgreSQL renders back against the
+// value premake asked for, so every Boundary must round-trip exactly or it
+// rejects correct partitions.
+func TestBoundaryRoundTrip(t *testing.T) {
+	for _, b := range []Boundary{TimeBoundary{}, UUIDv7Boundary{}, SnowflakeBoundary{}} {
+		for _, want := range []time.Time{
+			time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC),
+			time.Date(2026, 12, 31, 0, 0, 0, 0, time.UTC),
+			time.Date(2027, 2, 1, 0, 0, 0, 0, time.UTC),
+		} {
+			got, err := b.Parse(b.Literal(want))
+			require.NoErrorf(t, err, "%T", b)
+			assert.Truef(t, got.Equal(want), "%T: %s round-tripped to %s", b, want, got)
+		}
+	}
 }
 
 // partitionRows builds a mockDB.rowsFunc emitting (relname, relpartbound) pairs.
@@ -262,17 +358,21 @@ func partitionRows(pairs ...[2]string) func(context.Context, string, ...any) (pg
 	}
 }
 
-func hasCreate(sqls []string) bool {
+// createSQL returns the first recorded CREATE, or "" when premake issued none.
+func createSQL(sqls []string) string {
 	for _, s := range sqls {
 		if strings.Contains(s, "CREATE TABLE IF NOT EXISTS") {
-			return true
+			return s
 		}
 	}
-	return false
+	return ""
 }
 
+func hasCreate(sqls []string) bool { return createSQL(sqls) != "" }
+
 func TestEnsureCurrent_FreshCreatesNotBehind(t *testing.T) {
-	db := &mockDB{rowsFunc: partitionRows(), rowFunc: attachedRow(true)} // no existing partitions
+	db := &mockDB{rowsFunc: partitionRows()} // no existing partitions
+	db.rowFunc = attachedRow(db, true)
 	m := NewManager(db)
 	now := time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC)
 	behind, err := m.EnsureCurrent(context.Background(), "events", "public", "monthly", now, TimeBoundary{}, "")
@@ -296,7 +396,8 @@ func TestEnsureCurrent_CoveredNoCreateNotBehind(t *testing.T) {
 func TestEnsureCurrent_GapIsBehindAndHeals(t *testing.T) {
 	db := &mockDB{rowsFunc: partitionRows(
 		[2]string{"p_2026_03", "FOR VALUES FROM ('2026-03-01 00:00:00+00') TO ('2026-04-01 00:00:00+00')"},
-	), rowFunc: attachedRow(true)}
+	)}
+	db.rowFunc = attachedRow(db, true)
 	m := NewManager(db)
 	now := time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC)
 	behind, err := m.EnsureCurrent(context.Background(), "events", "public", "monthly", now, TimeBoundary{}, "")
@@ -315,7 +416,8 @@ func TestEnsureCurrent_FutureOnlyNotBehind(t *testing.T) {
 		[2]string{"p_2026_07", "FOR VALUES FROM ('2026-07-01 00:00:00+00') TO ('2026-08-01 00:00:00+00')"},
 		[2]string{"p_2026_08", "FOR VALUES FROM ('2026-08-01 00:00:00+00') TO ('2026-09-01 00:00:00+00')"},
 		[2]string{"p_2026_09", "FOR VALUES FROM ('2026-09-01 00:00:00+00') TO ('2026-10-01 00:00:00+00')"},
-	), rowFunc: attachedRow(true)}
+	)}
+	db.rowFunc = attachedRow(db, true)
 	m := NewManager(db)
 	now := time.Date(2026, 6, 15, 0, 0, 0, 0, time.UTC)
 	behind, err := m.EnsureCurrent(context.Background(), "events", "public", "monthly", now, TimeBoundary{}, "")
@@ -353,21 +455,83 @@ func TestFindExpired(t *testing.T) {
 	assert.Equal(t, "p_2025_12", parts[1].Name)
 }
 
+// TestFindExpired_OrdersByBoundNotName locks the ordering contract: candidates
+// come back in ascending bound order whatever the partitions are named. A
+// partition's place in time is its bound; the name is a label the user chose,
+// and unpadded month numbers ("10" < "9" as text) are the everyday case where
+// the two disagree. The archiver tiers candidates in this order and advances
+// the watermark to each upper bound in turn, so chronological order is what
+// keeps every partition exported before its range goes cold.
+func TestFindExpired_OrdersByBoundNotName(t *testing.T) {
+	db := &mockDB{rowsFunc: partitionRows(
+		[2]string{"sales_p_2025_10", "FOR VALUES FROM ('2025-10-01 00:00:00+00') TO ('2025-11-01 00:00:00+00')"},
+		[2]string{"sales_p_2025_9", "FOR VALUES FROM ('2025-09-01 00:00:00+00') TO ('2025-10-01 00:00:00+00')"},
+	)}
+	cutoff := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	parts, err := NewManager(db).FindExpired(context.Background(), "sales", "public", cutoff, TimeBoundary{})
+	require.NoError(t, err)
+	require.Len(t, parts, 2)
+	assert.Equal(t, "sales_p_2025_9", parts[0].Name, "September is first by bound, last by name")
+	assert.Equal(t, "sales_p_2025_10", parts[1].Name)
+}
+
+// TestFindExpired_PropagatesRowError locks that a failure part-way through
+// iteration reaches the caller instead of a short candidate list. The archiver
+// drops every partition it is handed once the export succeeds, so a silently
+// truncated list is as dangerous as a mis-ordered one.
+func TestFindExpired_PropagatesRowError(t *testing.T) {
+	boom := errors.New("connection reset mid-iteration")
+	db := &mockDB{rowsFunc: func(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
+		return &mockRows{
+			rows: []func(dest ...any) error{
+				func(dest ...any) error {
+					*(dest[0].(*string)) = "sales_p_9"
+					*(dest[1].(*string)) = "FOR VALUES FROM ('2025-09-01 00:00:00+00') TO ('2025-10-01 00:00:00+00')"
+					return nil
+				},
+			},
+			err: boom,
+		}, nil
+	}}
+	cutoff := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	parts, err := NewManager(db).FindExpired(context.Background(), "sales", "public", cutoff, TimeBoundary{})
+	require.ErrorIs(t, err, boom)
+	assert.Nil(t, parts, "a truncated candidate list must never reach the caller")
+}
+
+// TestFindExpired_OrdersOpenLowerBoundFirst covers the same contract for an
+// unbounded lower edge: MINVALUE parses to a sentinel below every real bound,
+// so the open partition sorts first even though its name sorts last.
+func TestFindExpired_OrdersOpenLowerBoundFirst(t *testing.T) {
+	db := &mockDB{rowsFunc: partitionRows(
+		[2]string{"events_bc", "FOR VALUES FROM ('0100-01-01 BC') TO ('0043-01-01 BC')"},
+		[2]string{"events_open_lo", "FOR VALUES FROM (MINVALUE) TO ('0100-01-01 BC')"},
+	)}
+	cutoff := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	parts, err := NewManager(db).FindExpired(context.Background(), "events", "public", cutoff, TimeBoundary{})
+	require.NoError(t, err)
+	require.Len(t, parts, 2)
+	assert.Equal(t, "events_open_lo", parts[0].Name, "the open lower edge precedes every real bound")
+	assert.Equal(t, "events_bc", parts[1].Name)
+}
+
 // TestEnsureFuture_SnowflakeBounds locks that an id-mode (snowflake) premake
 // emits bare-integer RANGE bounds — and that those bounds decode back to the
 // expected month, so the partition really does hold that month's snowflakes.
 func TestEnsureFuture_SnowflakeBounds(t *testing.T) {
-	db := &mockDB{rowFunc: attachedRow(true)}
+	db := &mockDB{}
+	db.rowFunc = attachedRow(db, true)
 	m := NewManager(db)
 	now := time.Date(2026, 4, 8, 0, 0, 0, 0, time.UTC)
 	err := m.EnsureFuture(context.Background(), "events", "public", "id", "monthly", 1, now, SnowflakeBoundary{}, "")
 	require.NoError(t, err)
-	require.Len(t, db.execSQL, 2) // CREATE + verify-attach
+	require.Len(t, db.execSQL, 3) // partition list + CREATE + verify read
 	lo := MinSnowflakeBound(time.Date(2026, 5, 1, 0, 0, 0, 0, time.UTC))
 	hi := MinSnowflakeBound(time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC))
-	assert.Contains(t, db.execSQL[0], fmt.Sprintf("FOR VALUES FROM (%d) TO (%d)", lo, hi))
+	create := createSQL(db.execSQL)
+	assert.Contains(t, create, fmt.Sprintf("FOR VALUES FROM (%d) TO (%d)", lo, hi))
 	// No quotes around the integer bounds.
-	assert.NotContains(t, db.execSQL[0], fmt.Sprintf("'%d'", lo))
+	assert.NotContains(t, create, fmt.Sprintf("'%d'", lo))
 }
 
 // boolRow returns a rowFunc that scans a single bool (the Spock-presence probe).
@@ -516,4 +680,101 @@ func TestRowCount(t *testing.T) {
 	count, err := m.RowCount(context.Background(), "public", "p_2025_11")
 	require.NoError(t, err)
 	assert.Equal(t, int64(42), count)
+}
+
+func TestValidateSourceName_LeadingUnderscoreReserved(t *testing.T) {
+	// "_" is the tiered hot table's prefix; the partition prefix trims one, so a
+	// source already starting with "_" yields a different prefix after the swap.
+	err := ValidateSourceName("_mytest", PeriodMonthly)
+	if err == nil {
+		t.Fatal("a leading underscore must be rejected")
+	}
+	if !strings.Contains(err.Error(), "_mytest") || !strings.Contains(err.Error(), "underscore") {
+		t.Errorf("error should name the table and the rule: %v", err)
+	}
+}
+
+func TestValidateSourceName_LengthBudgetPerPeriod(t *testing.T) {
+	// 63 less the "_" joiner and the date suffix: 9 monthly, 12 daily.
+	cases := []struct {
+		period string
+		ok     int // longest name that must be accepted
+	}{
+		{PeriodMonthly, 53},
+		{PeriodDaily, 50},
+	}
+	for _, c := range cases {
+		if err := ValidateSourceName(strings.Repeat("a", c.ok), c.period); err != nil {
+			t.Errorf("%s: %d chars must be accepted: %v", c.period, c.ok, err)
+		}
+		if err := ValidateSourceName(strings.Repeat("a", c.ok+1), c.period); err == nil {
+			t.Errorf("%s: %d chars must be rejected", c.period, c.ok+1)
+		}
+	}
+}
+
+func TestValidateSourceName_RejectionNamesTheLimit(t *testing.T) {
+	err := ValidateSourceName(strings.Repeat("a", 54), PeriodMonthly)
+	if err == nil {
+		t.Fatal("expected rejection")
+	}
+	for _, want := range []string{"53", "54"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q should state actual and maximum length", err.Error())
+		}
+	}
+}
+
+func TestValidateSourceName_AcceptsOrdinaryNames(t *testing.T) {
+	for _, p := range []string{PeriodMonthly, PeriodDaily} {
+		if err := ValidateSourceName("events", p); err != nil {
+			t.Errorf("%s: plain name rejected: %v", p, err)
+		}
+	}
+}
+
+// PostgreSQL renders bounds across its whole domain: 4713 BC to 294276 AD for
+// timestamp/timestamptz and to 5874897 AD for date, with " BC" appended for
+// years before 1. Go's "2006" layout consumes exactly four digits, so the wide
+// years and the era suffix need handling of their own.
+func TestParseTimestamp_FullPostgresDomain(t *testing.T) {
+	tests := []struct {
+		in   string
+		want time.Time
+	}{
+		{"2026-06-01 00:00:00+00", time.Date(2026, 6, 1, 0, 0, 0, 0, time.UTC)},
+		{"9999-12-31 00:00:00+00", time.Date(9999, 12, 31, 0, 0, 0, 0, time.UTC)},
+		{"10000-06-01 00:00:00+00", time.Date(10000, 6, 1, 0, 0, 0, 0, time.UTC)},
+		{"294276-12-31 00:00:00+00", time.Date(294276, 12, 31, 0, 0, 0, 0, time.UTC)},
+		{"5874897-12-31", time.Date(5874897, 12, 31, 0, 0, 0, 0, time.UTC)},
+		// 1 BC is astronomical year 0, so N BC is 1-N.
+		{"0001-01-01 00:00:00+00 BC", time.Date(0, 1, 1, 0, 0, 0, 0, time.UTC)},
+		{"4713-01-01 00:00:00+00 BC", time.Date(-4712, 1, 1, 0, 0, 0, 0, time.UTC)},
+		{"0044-03-15 BC", time.Date(-43, 3, 15, 0, 0, 0, 0, time.UTC)},
+		// A leap day must survive whatever placeholder year the parser uses.
+		{"10000-02-29 00:00:00+00", time.Date(10000, 2, 29, 0, 0, 0, 0, time.UTC)},
+	}
+	for _, tc := range tests {
+		got, err := parseTimestamp(tc.in)
+		if err != nil {
+			t.Errorf("parseTimestamp(%q): %v", tc.in, err)
+			continue
+		}
+		if !got.Equal(tc.want) {
+			t.Errorf("parseTimestamp(%q) = %v, want %v", tc.in, got, tc.want)
+		}
+	}
+}
+
+// The parser stays strict: its rejection is the seam the open-bound and default
+// handlers branch on, so a non-timestamp token must never parse.
+func TestParseTimestamp_StillRejectsNonTimestamps(t *testing.T) {
+	for _, in := range []string{
+		"MINVALUE", "MAXVALUE", "infinity", "-infinity", "DEFAULT",
+		"", "BC", " BC", "not-a-date", "2026-13-01 00:00:00+00", "20x6-01-01",
+	} {
+		if got, err := parseTimestamp(in); err == nil {
+			t.Errorf("parseTimestamp(%q) = %v, want an error", in, got)
+		}
+	}
 }

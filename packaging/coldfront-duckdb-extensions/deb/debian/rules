@@ -1,0 +1,32 @@
+#!/usr/bin/make -f
+
+# Prebuilt .duckdb_extension binaries (built by build-deb.sh) — nothing to
+# compile or test here.
+%:
+	dh $@
+
+override_dh_auto_build:
+
+override_dh_auto_test:
+
+override_dh_strip:
+	# .duckdb_extension files carry a DuckDB metadata footer that strip would
+	# corrupt, making DuckDB reject them — do NOT strip.
+
+override_dh_dwz:
+	# Same reason: leave the extension binaries untouched.
+
+override_dh_builddeb:
+	dh_builddeb -- -Zgzip
+
+execute_before_dh_install:
+	# --- SBOM generation and signing (per-format DEB key) ---
+	mkdir -p debian/tmp/sbom
+	syft dir:$(CURDIR) -o cyclonedx-json > debian/tmp/sbom/coldfront-duckdb-extensions-sbom.json || exit 1
+	KEY_ID=$$(gpg --list-secret-keys --with-colons | awk -F: '/^sec/{print $$5}' | head -n 1); \
+	gpg --armor --detach-sign --local-user "$$KEY_ID" \
+		--output debian/tmp/sbom/coldfront-duckdb-extensions-sbom.json.asc \
+		debian/tmp/sbom/coldfront-duckdb-extensions-sbom.json || exit 1
+
+override_dh_installdocs:
+	dh_installdocs --all README.*

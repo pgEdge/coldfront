@@ -1,9 +1,12 @@
 package partcfg
 
 import (
+	"context"
+	"errors"
 	"strings"
 	"testing"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/pgedge/coldfront/internal/config"
 )
 
@@ -172,5 +175,125 @@ func TestPartKeyCols(t *testing.T) {
 				break
 			}
 		}
+	}
+}
+
+// mockRow / persistDB: the one-row scalar surface the register guards need.
+type mockRow struct{ scan func(dest ...any) error }
+
+func (r *mockRow) Scan(dest ...any) error { return r.scan(dest...) }
+
+type persistDB struct {
+	mockDB
+	scalar  string
+	err     error
+	gotArgs []any
+}
+
+func (p *persistDB) QueryRow(_ context.Context, _ string, args ...any) pgx.Row {
+	p.gotArgs = args
+	return &mockRow{scan: func(dest ...any) error {
+		if p.err != nil {
+			return p.err
+		}
+		*(dest[0].(*string)) = p.scalar
+		return nil
+	}}
+}
+
+func TestRequireLogged_RejectsUnloggedRelations(t *testing.T) {
+	// The error names the offending relations.
+	db := &persistDB{scalar: "public.events_p_2026_01, public.events_p_2026_02"}
+	err := requireLogged(context.Background(), db, "public", "events")
+	if err == nil {
+		t.Fatal("expected rejection")
+	}
+	for _, want := range []string{"unlogged", "events_p_2026_01", "events_p_2026_02"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err.Error(), want)
+		}
+	}
+}
+
+func TestRequireLogged_AcceptsFullyLoggedTree(t *testing.T) {
+	db := &persistDB{scalar: ""}
+	if err := requireLogged(context.Background(), db, "public", "events"); err != nil {
+		t.Fatalf("a permanent tree must pass: %v", err)
+	}
+	if len(db.gotArgs) != 2 || db.gotArgs[0] != "public" || db.gotArgs[1] != "events" {
+		t.Errorf("schema/table not passed as args: %v", db.gotArgs)
+	}
+}
+
+func TestRequireLogged_PropagatesQueryError(t *testing.T) {
+	db := &persistDB{err: errors.New("boom")}
+	if err := requireLogged(context.Background(), db, "public", "events"); err == nil {
+		t.Fatal("query failure must not be reported as a clean tree")
+	}
+}
+
+func TestRequireNoCaseCollision_RejectsDifferentCase(t *testing.T) {
+	// The error names the row already holding the folded name.
+	db := &persistDB{scalar: "public.events"}
+	err := requireNoCaseCollision(context.Background(), db, "public", "Events")
+	if err == nil {
+		t.Fatal("expected rejection")
+	}
+	for _, want := range []string{"public.events", "case-insensitively", "Events"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err.Error(), want)
+		}
+	}
+}
+
+func TestRequireNoCaseCollision_AllowsExactSameName(t *testing.T) {
+	// Re-registering the identical name is an update, not a collision.
+	db := &persistDB{scalar: ""}
+	if err := requireNoCaseCollision(context.Background(), db, "public", "events"); err != nil {
+		t.Fatalf("re-registering the same name must be allowed: %v", err)
+	}
+	if len(db.gotArgs) != 2 || db.gotArgs[0] != "public" || db.gotArgs[1] != "events" {
+		t.Errorf("schema/table not passed as args: %v", db.gotArgs)
+	}
+}
+
+func TestRequireNoCaseCollision_PropagatesQueryError(t *testing.T) {
+	db := &persistDB{err: errors.New("boom")}
+	if err := requireNoCaseCollision(context.Background(), db, "public", "events"); err == nil {
+		t.Fatal("query failure must not be reported as no collision")
+	}
+}
+
+func TestRequireNoDefaultPartition_Rejects(t *testing.T) {
+	// A DEFAULT partition has no bounds, so its rows never tier and never
+	// expire, and PostgreSQL refuses DETACH CONCURRENTLY for every partition of
+	// a table that has one, which is how partitions are expired. The error names
+	// it and the remedy.
+	db := &persistDB{scalar: "public.events_default"}
+	err := requireNoDefaultPartition(context.Background(), db, "public", "events")
+	if err == nil {
+		t.Fatal("expected rejection")
+	}
+	for _, want := range []string{"events_default", "default partition", "detach"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err.Error(), want)
+		}
+	}
+}
+
+func TestRequireNoDefaultPartition_AcceptsPlainTable(t *testing.T) {
+	db := &persistDB{scalar: ""}
+	if err := requireNoDefaultPartition(context.Background(), db, "public", "events"); err != nil {
+		t.Fatalf("a table with no default must pass: %v", err)
+	}
+	if len(db.gotArgs) != 2 || db.gotArgs[0] != "public" || db.gotArgs[1] != "events" {
+		t.Errorf("schema/table not passed as args: %v", db.gotArgs)
+	}
+}
+
+func TestRequireNoDefaultPartition_PropagatesQueryError(t *testing.T) {
+	db := &persistDB{err: errors.New("boom")}
+	if err := requireNoDefaultPartition(context.Background(), db, "public", "events"); err == nil {
+		t.Fatal("query failure must not be reported as no default")
 	}
 }

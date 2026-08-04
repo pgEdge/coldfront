@@ -177,7 +177,9 @@ One Iceberg table holds every region (region is just a column); the
 archiver tiers leaves a whole `ts` period at a time across **all**
 regions before advancing the shared hot/cold watermark, so a period only
 becomes cold once it is cold for every region. `id` mode is not supported
-in tiered mode (the cold tier is time-keyed).
+in tiered mode (the cold tier is time-keyed). For why the ordering works
+that way, see
+[architecture_tiered.md → Two-level tiering](architecture_tiered.md#two-level-list-range-tiering).
 
 ## Mode 2 - Decoupled (iceberg-only)
 
@@ -390,6 +392,39 @@ The data lifecycle is **hot PG → `hot_period` → cold Iceberg →
 `retention_period` → dropped** (tiered) or **hot PG → `retention_period`
 → dropped** (partition-only). Setting `hot_period` makes a table tiered;
 omitting it makes it partition-only.
+
+### What registration refuses
+
+`register`, `import` and `set` share one validation gate, so a table that
+one command rejects cannot be added by another. Registration fails when:
+
+- any relation in the partition tree is `UNLOGGED`, because that data is
+  truncated after a crash and replicates nowhere, so archiving it would
+  preserve rows PostgreSQL never promised to keep.
+- the table has a `DEFAULT` partition. Rows it catches carry no time
+  bounds, so they can never be tiered or expired, and PostgreSQL refuses
+  `DETACH PARTITION ... CONCURRENTLY` for every partition of a table that
+  has one, which is how partitions are expired. Its mere existence is
+  enough; it does not have to hold any rows. Move any rows it holds into
+  real partitions and detach it.
+- the name differs only by case from an already-registered table.
+  PostgreSQL keeps `public."Events"` and `public.events` apart, but DuckDB
+  matches identifiers case-insensitively even when they are quoted, so both
+  names would resolve to one Iceberg table and overwrite each other.
+- the name starts with an underscore, which is reserved for the tiered hot
+  table.
+- the name leaves no room for the generated partition suffix: 53
+  characters for monthly and 50 for daily, within PostgreSQL's 63-byte
+  identifier limit.
+
+Registration validates the table as it is at that moment, not
+continuously. Adding a `DEFAULT` partition to an already-registered table
+is therefore not caught then; the next archiver run fails while reading
+that table's partition bounds.
+
+Other unusual bounds are supported rather than refused. Partitions open at
+either end (`MINVALUE`, `MAXVALUE`, `infinity`) are handled, as is
+PostgreSQL's full timestamp range, from 4713 BC through year 294276.
 
 `hot_period` and `retention_period` are native PostgreSQL `interval`s -
 use any interval syntax (`1 month`, `90 days`, `1 year 2 mons`, `5

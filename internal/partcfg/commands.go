@@ -189,16 +189,108 @@ type validateDB interface {
 //     LIST column comes from the catalog).
 //   - period validity + retention>hot ordering: PostgreSQL interval semantics,
 //     checked against the connection (the interval column type is the backstop).
+//   - the name is representable by the partition naming scheme: no reserved
+//     leading underscore, and short enough for the generated leaf names.
+//   - every relation in the partition tree is WAL-logged (see requireLogged).
+//   - the table has no DEFAULT partition (see requireNoDefaultPartition).
 func validateRow(ctx context.Context, db validateDB, row configRow) error {
 	// After the archiver's first-run swap the source is a VIEW over "_"+name, so
 	// validate the PK / partition key against the real partitioned table. register
 	// runs pre-swap and resolves to the source unchanged, so every writer (register
 	// pre-swap, import/set post-swap) validates the same underlying table.
+	if err := partition.ValidateSourceName(row.table, row.period); err != nil {
+		return err
+	}
+	// Keyed on the registered name, not the resolved base: the registered name is
+	// what icebergRef turns into the cold table's identifier.
+	if err := requireNoCaseCollision(ctx, db, row.schema, row.table); err != nil {
+		return err
+	}
 	base := partition.ResolveSourceTable(ctx, db, row.schema, row.table)
+	if err := requireLogged(ctx, db, row.schema, base); err != nil {
+		return err
+	}
+	if err := requireNoDefaultPartition(ctx, db, row.schema, base); err != nil {
+		return err
+	}
 	if err := validatePKSuperset(ctx, db, row.schema, base, row.column, row.subValues != ""); err != nil {
 		return err
 	}
 	return partition.ValidatePeriods(ctx, db, row.hot, row.retention)
+}
+
+// requireNoCaseCollision rejects a table whose name differs only by case from one
+// already registered. DuckDB matches identifiers case-insensitively even when
+// quoted, so public."Events" and public.events are one Iceberg table. The exact
+// name is excluded, keeping re-registration an update.
+func requireNoCaseCollision(ctx context.Context, db partition.RowQuerier, schema, table string) error {
+	var clash string
+	err := db.QueryRow(ctx, `
+		SELECT coalesce(string_agg(format('%I.%I', schema_name, table_name), ', '
+		                           ORDER BY schema_name, table_name), '')
+		FROM coldfront.partition_config
+		WHERE lower(schema_name) = lower($1::text) AND lower(table_name) = lower($2::text)
+		  AND NOT (schema_name = $1::text AND table_name = $2::text)`, schema, table).Scan(&clash)
+	if err != nil {
+		return fmt.Errorf("check name collision for %s.%s: %w", schema, table, err)
+	}
+	if clash != "" {
+		return fmt.Errorf("%s.%s collides with the already-registered %s: the cold tier matches "+
+			"identifiers case-insensitively, so both names would share one Iceberg table and "+
+			"overwrite each other; register a name that differs by more than case",
+			schema, table, clash)
+	}
+	return nil
+}
+
+// requireNoDefaultPartition rejects a table that has a DEFAULT partition. Such a
+// partition has no bounds, so nothing it catches can be tiered or expired, and
+// PostgreSQL refuses DETACH CONCURRENTLY for every partition of a table that has
+// one, which is how partitions are expired. Its presence also blocks creating a
+// range partition over rows it already holds.
+func requireNoDefaultPartition(ctx context.Context, db partition.RowQuerier, schema, table string) error {
+	var name string
+	err := db.QueryRow(ctx, `
+		SELECT coalesce(max(format('%I.%I', n.nspname, c.relname)), '')
+		FROM pg_inherits i
+		JOIN pg_class c ON c.oid = i.inhrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		JOIN pg_class p ON p.oid = i.inhparent
+		JOIN pg_namespace pn ON pn.oid = p.relnamespace
+		WHERE pn.nspname = $1::text AND p.relname = $2::text
+		  AND pg_get_expr(c.relpartbound, c.oid) = 'DEFAULT'`, schema, table).Scan(&name)
+	if err != nil {
+		return fmt.Errorf("check for a default partition on %s.%s: %w", schema, table, err)
+	}
+	if name != "" {
+		return fmt.Errorf("%s.%s has a default partition (%s): its rows can never be tiered or "+
+			"expired, and PostgreSQL blocks concurrent detach of every partition while it exists; "+
+			"move any rows it holds and detach it",
+			schema, table, name)
+	}
+	return nil
+}
+
+// requireLogged rejects a table whose partition tree contains an UNLOGGED
+// relation: that data is truncated after a crash and replicates nowhere. The
+// whole tree is checked, since a permanent parent may hold UNLOGGED partitions
+// and the partitions carry the rows.
+func requireLogged(ctx context.Context, db partition.RowQuerier, schema, table string) error {
+	var unlogged string
+	err := db.QueryRow(ctx, `
+		SELECT coalesce(string_agg(t.relid::regclass::text, ', ' ORDER BY t.relid::regclass::text), '')
+		FROM pg_partition_tree(format('%I.%I', $1::text, $2::text)::regclass) t
+		JOIN pg_class c ON c.oid = t.relid
+		WHERE c.relpersistence = 'u'`, schema, table).Scan(&unlogged)
+	if err != nil {
+		return fmt.Errorf("check persistence of %s.%s: %w", schema, table, err)
+	}
+	if unlogged != "" {
+		return fmt.Errorf("%s.%s has unlogged relations (%s): unlogged data is truncated on crash "+
+			"and cannot be archived; make them permanent with ALTER TABLE ... SET LOGGED",
+			schema, table, unlogged)
+	}
+	return nil
 }
 
 // writeRow validates then inserts one table. register and import both call it

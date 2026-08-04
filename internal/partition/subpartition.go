@@ -23,6 +23,29 @@ func checkIdent(name string) error {
 	return nil
 }
 
+// maxSourceNameLen is the longest parent name whose generated partition names
+// still fit in an identifier: the limit less the "_" joiner and the date suffix.
+func maxSourceNameLen(period string) int {
+	return maxIdentLen - 1 - len(PartitionName(time.Time{}, period))
+}
+
+// ValidateSourceName rejects a source name the partition naming scheme cannot
+// represent: "_" is reserved for the tiered hot table, and the name must leave
+// room for the date suffix.
+func ValidateSourceName(table, period string) error {
+	if strings.HasPrefix(table, "_") {
+		return fmt.Errorf("table name %q starts with an underscore, which is reserved for the "+
+			"tiered hot table", table)
+	}
+	suffix := "_" + PartitionName(time.Time{}, period)
+	if max := maxIdentLen - len(suffix); len(table) > max {
+		return fmt.Errorf("table name %q is %d bytes; the maximum for %s partitioning is %d "+
+			"(%d-byte identifier limit less the generated %q suffix)",
+			table, len(table), period, max, maxIdentLen, suffix)
+	}
+	return nil
+}
+
 // SubName derives the level-1 (LIST) child table name for one value: the parent
 // name, an underscore, and the value sanitized to a legal identifier fragment
 // (lowercased, non-[a-z0-9_] runes mapped to _). The raw value is still used
@@ -38,8 +61,7 @@ func SubName(parent, value string) (string, error) {
 		}
 	}
 	name := parent + "_" + b.String()
-	// Reserve room for "_" + the longest leaf name (daily: p_YYYY_MM_DD = 12).
-	if len(name) > maxIdentLen-13 {
+	if len(name) > maxSourceNameLen(PeriodDaily) {
 		return "", fmt.Errorf("sub-partition name %q is too long to hold a leaf within %d bytes", name, maxIdentLen)
 	}
 	return name, nil

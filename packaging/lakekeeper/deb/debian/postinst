@@ -1,0 +1,23 @@
+#!/bin/sh
+set -e
+
+# Create the lakekeeper group and system user.
+if ! getent group lakekeeper >/dev/null; then
+    addgroup --system lakekeeper
+fi
+
+if ! getent passwd lakekeeper >/dev/null; then
+    adduser --system --ingroup lakekeeper --home /var/lib/lakekeeper \
+        --no-create-home --shell /usr/sbin/nologin \
+        --disabled-password --gecos "Lakekeeper Iceberg REST Catalog" lakekeeper
+fi
+
+# The env file carries secrets (DB URL, encryption key) — restrict it to
+# root:lakekeeper now that the group exists.
+if [ -f /etc/lakekeeper/lakekeeper.env ]; then
+    chgrp lakekeeper /etc/lakekeeper/lakekeeper.env 2>/dev/null || true
+    chmod 0640 /etc/lakekeeper/lakekeeper.env || true
+fi
+
+#DEBHELPER#
+exit 0

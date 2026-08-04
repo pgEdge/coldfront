@@ -132,3 +132,68 @@ func TestParseBoundPair_UnquotedBigint(t *testing.T) {
 		t.Fatalf("hi = %v, want %v", hi, jun)
 	}
 }
+
+// An open bound (MINVALUE/MAXVALUE, or the infinity literals) carries no time
+// and resolves to a sentinel outside PostgreSQL's domain.
+func TestParseBoundPair_OpenBounds(t *testing.T) {
+	finite := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	tests := []struct {
+		name              string
+		expr              string
+		wantLow, wantHigh time.Time
+	}{
+		{"minvalue lower", "FOR VALUES FROM (MINVALUE) TO ('2026-01-01 00:00:00+00')", negInfinity, finite},
+		{"maxvalue upper", "FOR VALUES FROM ('2026-01-01 00:00:00+00') TO (MAXVALUE)", finite, posInfinity},
+		{"both open", "FOR VALUES FROM (MINVALUE) TO (MAXVALUE)", negInfinity, posInfinity},
+		{"-infinity lower", "FOR VALUES FROM ('-infinity') TO ('2026-01-01 00:00:00+00')", negInfinity, finite},
+		{"infinity upper", "FOR VALUES FROM ('2026-01-01 00:00:00+00') TO ('infinity')", finite, posInfinity},
+	}
+	for _, tc := range tests {
+		low, high, err := parseBoundPair(tc.expr, TimeBoundary{})
+		if err != nil {
+			t.Errorf("%s: %v", tc.name, err)
+			continue
+		}
+		if !low.Equal(tc.wantLow) || !high.Equal(tc.wantHigh) {
+			t.Errorf("%s: got (%v, %v), want (%v, %v)", tc.name, low, high, tc.wantLow, tc.wantHigh)
+		}
+	}
+}
+
+// The sentinels must sit outside PostgreSQL's representable range, or a real
+// bound could collide with one.
+func TestOpenBoundSentinelsOutsidePostgresDomain(t *testing.T) {
+	pgMin := time.Date(-4712, 1, 1, 0, 0, 0, 0, time.UTC)     // 4713 BC
+	pgMax := time.Date(5874897, 12, 31, 0, 0, 0, 0, time.UTC) // date ceiling
+	if !negInfinity.Before(pgMin) {
+		t.Errorf("negInfinity %v must precede %v", negInfinity, pgMin)
+	}
+	if !posInfinity.After(pgMax) {
+		t.Errorf("posInfinity %v must follow %v", posInfinity, pgMax)
+	}
+}
+
+// A bound is parsed from PostgreSQL and later written back to it, so the two
+// directions must agree. Go prints a non-positive astronomical year as a
+// negative number, which PostgreSQL rejects with "time zone displacement out of
+// range"; it wants the era suffix instead.
+func TestTimeBoundaryLiteral_RoundTripsPostgresRendering(t *testing.T) {
+	for _, in := range []string{
+		"2026-06-01 00:00:00+00",
+		"10000-06-01 00:00:00+00",
+		"294276-12-31 00:00:00+00",
+		"0001-01-01 00:00:00+00 BC",
+		"0043-03-15 00:00:00+00 BC",
+		"4713-01-01 00:00:00+00 BC",
+	} {
+		parsed, err := (TimeBoundary{}).Parse("'" + in + "'")
+		if err != nil {
+			t.Errorf("Parse(%q): %v", in, err)
+			continue
+		}
+		got := (TimeBoundary{}).Literal(parsed)
+		if got != "'"+in+"'" {
+			t.Errorf("round trip of %q gave %s", in, got)
+		}
+	}
+}

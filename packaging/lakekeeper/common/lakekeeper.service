@@ -1,0 +1,29 @@
+[Unit]
+Description=Lakekeeper - Apache Iceberg REST Catalog
+Documentation=https://docs.lakekeeper.io
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=exec
+User=lakekeeper
+Group=lakekeeper
+EnvironmentFile=/etc/lakekeeper/lakekeeper.env
+# Lakekeeper stores all state in PostgreSQL; the database must be migrated once
+# before the first start (`lakekeeper migrate`) — see the README. To run the
+# (idempotent) migration automatically on every start instead, uncomment:
+#ExecStartPre=/usr/bin/lakekeeper migrate
+ExecStart=/usr/bin/lakekeeper serve
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+
+# Hardening — lakekeeper only reads its env file and talks to PostgreSQL over
+# the network; it writes nothing to the local filesystem.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

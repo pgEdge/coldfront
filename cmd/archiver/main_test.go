@@ -12,6 +12,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/pgedge/coldfront/internal/config"
+	"github.com/pgedge/coldfront/internal/partition"
 	"github.com/pgedge/coldfront/internal/view"
 )
 
@@ -495,6 +496,65 @@ func TestCutoverFailHint(t *testing.T) {
 	assert.Contains(t, h, "must be dropped", "gives actionable guidance")
 	assert.Empty(t, cutoverFailHint(&pgconn.PgError{Code: "55P03"}), "no hint for the transient lock timeout")
 	assert.Empty(t, cutoverFailHint(errors.New("boom")), "no hint for non-Postgres errors")
+}
+
+// cleanupCycle builds an archiveCycle whose partition Manager is backed by a
+// mock answering the three reads the cleanup path makes: the partition's row
+// count, the hot-table name resolution, and the Spock probe (no peers). onExec
+// receives every statement the path executes.
+func cleanupCycle(rowCount int64, onExec func(sql string)) *archiveCycle {
+	db := &mockQuerier{
+		rowFunc: func(_ context.Context, sql string, _ ...any) pgx.Row {
+			return &mockRow{scanFunc: func(dest ...any) error {
+				switch {
+				case strings.Contains(sql, "count(*)"):
+					*(dest[0].(*int64)) = rowCount
+				case strings.Contains(sql, "pg_extension"):
+					*(dest[0].(*bool)) = false // vanilla: no Spock, no peer fan-out
+				default:
+					*(dest[0].(*bool)) = true // hot table already swapped to _sales
+				}
+				return nil
+			}}
+		},
+		execFunc: func(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+			onExec(sql)
+			return pgconn.NewCommandTag("OK"), nil
+		},
+	}
+	return &archiveCycle{
+		t:       &config.TableConfig{SourceSchema: "public", SourceTable: "sales"},
+		partMgr: partition.NewManager(db),
+	}
+}
+
+// A partition whose range sits below the watermark but which still holds rows
+// is an anomaly, not a cleanup candidate: the pipeline detaches atomically with
+// the watermark advance, so an archived partition is never a candidate again.
+// Its rows are in neither tier, so they are the only copy and the drop is
+// refused.
+func TestCleanupAlreadyArchived_RefusesNonEmptyPartition(t *testing.T) {
+	ac := cleanupCycle(70, func(sql string) {
+		t.Fatalf("nothing may be executed for a partition holding rows, got: %s", sql)
+	})
+	err := ac.cleanupAlreadyArchived(context.Background(),
+		partition.Info{Name: "sales_p_2025_9"})
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "sales_p_2025_9")
+	assert.Contains(t, err.Error(), "70")
+}
+
+// The legitimate case: an empty partition over a range the cold tier already
+// holds (an operator-created historical partition). Nothing can be lost, so it
+// is detached and dropped.
+func TestCleanupAlreadyArchived_DropsEmptyPartition(t *testing.T) {
+	var executed []string
+	ac := cleanupCycle(0, func(sql string) { executed = append(executed, sql) })
+	require.NoError(t, ac.cleanupAlreadyArchived(context.Background(),
+		partition.Info{Name: "sales_p_2025_9"}))
+	ran := strings.Join(executed, "\n")
+	assert.Contains(t, ran, "DETACH PARTITION", "an empty stale partition is detached")
+	assert.Contains(t, ran, "DROP TABLE", "an empty stale partition is dropped")
 }
 
 // Two tables sharing a name in different PG schemas map to distinct Iceberg
