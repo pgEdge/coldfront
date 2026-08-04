@@ -1,0 +1,128 @@
+-- coldfront.drop_iceberg_table drops the Iceberg table backing a registered
+-- relation, in either mode. Decoupled: the relation is the Iceberg table, so
+-- nothing is left. Tiered: the Iceberg table is the cold tier, so the cold tier
+-- goes and the hot table returns under its original name. Whether the Parquet
+-- and metadata objects are also deleted is the caller's explicit decision
+-- (p_purge), never a default.
+--
+-- White-box: checks the emitted DDL and the PG-side teardown, not Iceberg I/O.
+-- Real cold I/O (that purge deletes objects and keep-files does not) is
+-- ci/journey.sh; see README.md.
+CREATE EXTENSION IF NOT EXISTS pg_duckdb;
+NOTICE:  extension "pg_duckdb" already exists, skipping
+CREATE EXTENSION IF NOT EXISTS coldfront;
+NOTICE:  extension "coldfront" already exists, skipping
+SET TIME ZONE 'UTC';
+SET coldfront.warehouse = 'wh';
+SET coldfront.lakekeeper_endpoint = 'http://lk:8181/catalog';
+SET coldfront.dblink_self = '';
+-- The emitted DDL is built from schema+table, never from the stored
+-- iceberg_table string, so it is identical whichever writer registered the row.
+-- purge=true arms PURGE_REQUESTED on a scoped attachment: Lakekeeper deletes the
+-- data and metadata objects.
+SELECT coldfront._iceberg_drop_sql('public', 'iceonly', true);
+                                                                                                  _iceberg_drop_sql                                                                                                  
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ ATTACH IF NOT EXISTS 'wh' AS ice_drop_purge (TYPE ICEBERG, ENDPOINT 'http://lk:8181/catalog', AUTHORIZATION_TYPE NONE, ACCESS_DELEGATION_MODE NONE, PURGE_REQUESTED true); DROP TABLE ice_drop_purge.public.iceonly
+(1 row)
+
+-- purge=false needs no attachment of its own: the everyday 'ice' attachment is
+-- never purge-armed, so the drop goes straight through it and the objects stay
+-- in the bucket.
+SELECT coldfront._iceberg_drop_sql('public', 'iceonly', false);
+       _iceberg_drop_sql       
+-------------------------------
+ DROP TABLE ice.public.iceonly
+(1 row)
+
+-- Identifiers are quoted, so mixed case and embedded quotes cannot break out.
+SELECT coldfront._iceberg_drop_sql('My Schema', 'Odd"Name', true);
+                                                                                                      _iceberg_drop_sql                                                                                                       
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ ATTACH IF NOT EXISTS 'wh' AS ice_drop_purge (TYPE ICEBERG, ENDPOINT 'http://lk:8181/catalog', AUTHORIZATION_TYPE NONE, ACCESS_DELEGATION_MODE NONE, PURGE_REQUESTED true); DROP TABLE ice_drop_purge."My Schema"."Odd""Name"
+(1 row)
+
+-- An unregistered table is refused (nothing to unregister; no blind catalog drop).
+SELECT coldfront.drop_iceberg_table('public', 'nosuch', true);
+ERROR:  coldfront.drop_iceberg_table: "public.nosuch" is not a registered Iceberg table
+HINT:  Only tables registered in coldfront.tiered_views can be dropped through this function.
+CONTEXT:  PL/pgSQL function drop_iceberg_table(text,text,boolean) line 17 at RAISE
+-- The purge decision is mandatory: NULL is not a silent "false".
+CREATE VIEW public.iceonly AS SELECT 1 AS id;
+INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col, is_iceberg_only)
+VALUES ('public', 'iceonly', NULL, 'ice.public.iceonly', NULL, true);
+SELECT coldfront.drop_iceberg_table('public', 'iceonly', NULL);
+ERROR:  coldfront.drop_iceberg_table: p_purge is required (true or false)
+HINT:  true also deletes the Iceberg data and metadata objects; false drops only the catalog entry and leaves the objects in the object store.
+CONTEXT:  PL/pgSQL function drop_iceberg_table(text,text,boolean) line 7 at RAISE
+-- Decoupled teardown: the registry row and the wrapper view both go.
+SELECT coldfront._unregister_iceberg('public', 'iceonly');
+ _unregister_iceberg 
+---------------------
+ 
+(1 row)
+
+SELECT count(*) AS registry_rows FROM coldfront.tiered_views WHERE relname = 'iceonly';
+ registry_rows 
+---------------
+             0
+(1 row)
+
+SELECT count(*) AS view_left FROM pg_class WHERE relname = 'iceonly';
+ view_left 
+-----------
+         0
+(1 row)
+
+-- Tiered teardown: the archiver's first run renamed events to _events and put a
+-- view in its place, so un-tiering reverses that. Every registration row goes
+-- (partition_config too, or the next archiver run re-tiers into a dropped
+-- catalog entry), and the hot table returns under its original name.
+CREATE TABLE public._events (id int, ts timestamptz, status text);
+CREATE VIEW public.events AS SELECT * FROM public._events;
+INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
+VALUES ('public', 'events', 'public._events', 'ice.default.events', 'ts');
+INSERT INTO coldfront.partition_config(schema_name, table_name, partition_period, hot_period)
+VALUES ('public', 'events', 'monthly', '30 days');
+INSERT INTO coldfront.archive_watermark(schema_name, table_name, cutoff_time)
+VALUES ('public', 'events', '2026-01-01 00:00:00+00');
+SELECT coldfront._unregister_iceberg('public', 'events');
+ _unregister_iceberg 
+---------------------
+ 
+(1 row)
+
+SELECT count(*) AS tiered_views_rows    FROM coldfront.tiered_views    WHERE relname    = 'events';
+ tiered_views_rows 
+-------------------
+                 0
+(1 row)
+
+SELECT count(*) AS partition_config_rows FROM coldfront.partition_config WHERE table_name = 'events';
+ partition_config_rows 
+-----------------------
+                     0
+(1 row)
+
+SELECT count(*) AS watermark_rows        FROM coldfront.archive_watermark WHERE table_name = 'events';
+ watermark_rows 
+----------------
+              0
+(1 row)
+
+-- events is a plain table again (relkind r, not v), and _events is gone.
+SELECT relname, relkind FROM pg_class
+ WHERE relname IN ('events', '_events') AND relnamespace = 'public'::regnamespace
+ ORDER BY relname;
+ relname | relkind 
+---------+---------
+ events  | r
+(1 row)
+
+-- Unregistering something that was never registered is refused.
+SELECT coldfront._unregister_iceberg('public', 'nosuch');
+ERROR:  coldfront: "public.nosuch" is not a registered Iceberg table
+HINT:  Only tables registered in coldfront.tiered_views can be unregistered.
+CONTEXT:  PL/pgSQL function _unregister_iceberg(text,text) line 13 at RAISE
+-- Cleanup.
+DROP TABLE public.events;
