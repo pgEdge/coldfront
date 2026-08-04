@@ -1360,12 +1360,37 @@ story_standby_reads() {
     [ "$MODE" = tiered ] && assert_eq "archive_watermark replicated" \
         "$(q "$HOST" "SELECT count(*) FROM coldfront.archive_watermark;")" "$(q "$STANDBY" "SELECT count(*) FROM coldfront.archive_watermark;")"
 
-    # A write through the view fails CLEANLY, not a coldfront crash. Use a COLD-
-    # dated row so it routes through coldfront's cold chokepoint
-    # (_exec_iceberg_with_claim) on BOTH modes, exercising the standby guard there
-    # — a hot write would be rejected by PG natively, never reaching coldfront.
+    # A write through the view fails CLEANLY, not a coldfront crash. A cold-dated
+    # INSERT: on decoupled it is a pure cold write through _exec_iceberg_with_claim;
+    # on tiered the rewrite pairs a hot INSERT with the cold half, and PG rejects the
+    # statement on the hot half. Both are clean read-only refusals.
     local w; w=$(q_may "$STANDBY" "INSERT INTO $vn (ts,status,data) VALUES (date_trunc('month',now()) - interval '4 months' + interval '19 days','x','{}'::jsonb);")
     assert_err "cold write through view on standby → clean read-only rejection" "read-only" "$w"
+
+    # The cold paths that reach duckdb.raw_query without going through
+    # _exec_iceberg_with_claim must refuse on their own. Match coldfront's own
+    # message, not the bare "read-only" PG emits: PG also rejects these once execution
+    # reaches an incidental hot-tier write, so only the coldfront text proves the
+    # guard itself fired, ahead of any claim.
+    if [ "$MODE" = tiered ]; then
+        # Partition-column UPDATE crossing the cutoff: the hook rewrites it to a bare
+        # SELECT coldfront._cross_tier_move(...), which PG's read-only check passes.
+        local m; m=$(q_may "$STANDBY" "UPDATE $vn SET ts = ts - interval '6 months' WHERE status = 'x';")
+        assert_err "cross-tier move on standby → coldfront refuses before the claim" \
+            "cannot move rows across tiers (Iceberg write) on a read-only standby" "$m"
+    fi
+    # The IDENTITY-omit cold loop is only reachable by calling it directly, so call
+    # it directly: the guard is the first statement, ahead of argument handling.
+    local c; c=$(q_may "$STANDBY" "SELECT coldfront._tiered_insert_cold('${vn%%.*}','${vn##*.}',ARRAY['ts']::text[],'SELECT now()');")
+    assert_err "cold insert loop on standby → coldfront refuses before the claim" \
+        "cannot execute a cold (Iceberg) write on a read-only standby" "$c"
+
+    # Provisioning POSTs CREATE TABLE to the catalog eagerly (see
+    # story_provision_decoupled) and precedes its own PG writes, so coldfront's own
+    # refusal is what keeps catalog writes off a replica.
+    local p; p=$(q_may "$STANDBY" "SELECT coldfront.create_iceberg_table('public','sb_reject','[{\"name\":\"id\",\"type\":\"bigint\"}]'::jsonb);")
+    assert_err "provisioning on standby → coldfront refuses before the catalog POST" \
+        "cannot create an Iceberg table on a read-only standby" "$p"
 
     # Mesh + tiered: the standby is a physical replica of db1 (HOST). A peer's HOT
     # write reaches db1 via Spock (logical) and then the standby via physical

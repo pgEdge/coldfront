@@ -340,11 +340,11 @@ BEGIN
                         -- cold rows via _move_row_literal.
                         '_cross_tier_move', '_move_row_literal', '_move_pg_row_literal',
                         '_enqueue_release',
-                        -- cold-write serializer gate wrappers (armed-predicate +
-                        -- the claim-or-advisory acquire); app-role cold paths call
-                        -- these SECURITY INVOKER wrappers, which delegate to the
-                        -- DEFINER primitives below.
-                        '_bakery_armed', '_take_iceberg_claim',
+                        -- cold-write preconditions + serializer gate wrappers (the
+                        -- standby refusal, the armed-predicate, the claim-or-advisory
+                        -- acquire); app-role cold paths call these SECURITY INVOKER
+                        -- wrappers, which delegate to the DEFINER primitives below.
+                        '_reject_on_standby', '_bakery_armed', '_take_iceberg_claim',
                         -- R-A bakery coordination (mesh cold writes); SECURITY
                         -- DEFINER, so the app role just needs EXECUTE — the
                         -- spock/dblink/pg_stat_replication access happens as owner.
@@ -779,6 +779,9 @@ DECLARE
     i               int;
     col             text;
 BEGIN
+    -- The cold loop below reaches duckdb.raw_query directly rather than through
+    -- _exec_iceberg_with_claim, so it carries the standby guard itself.
+    PERFORM coldfront._reject_on_standby('execute a cold (Iceberg) write');
     -- Mixed-tier writes inside one PG tx (PG hot INSERT plus DuckDB
     -- raw_query writes for cold) need pg_duckdb's mixed-write guard
     -- relaxed.
@@ -1002,6 +1005,10 @@ DECLARE
     v_hot_targets timestamptz[];
     v_uncovered   bigint;
 BEGIN
+    -- The cold leg below reaches duckdb.raw_query directly rather than through
+    -- _exec_iceberg_with_claim, so it carries the standby guard itself. The hook
+    -- rewrite that reaches here is a bare SELECT, which PG's read-only check passes.
+    PERFORM coldfront._reject_on_standby('move rows across tiers (Iceberg write)');
     SET LOCAL duckdb.unsafe_allow_execution_inside_functions = on;
     SET LOCAL duckdb.unsafe_allow_mixed_transactions = on;
     SET LOCAL coldfront.iceberg_async_parquet = off;
@@ -1605,6 +1612,10 @@ DECLARE
     storage_type     text;
     cast_type        text;
 BEGIN
+    -- The Iceberg CREATE SCHEMA / CREATE TABLE below precede this function's PG
+    -- writes, so this guard is the one that keeps catalog writes off a replica.
+    PERFORM coldfront._reject_on_standby('create an Iceberg table');
+
     IF p_columns IS NULL OR jsonb_array_length(p_columns) = 0 THEN
         RAISE EXCEPTION 'coldfront.create_iceberg_table: p_columns must be a non-empty jsonb array of {name,type}';
     END IF;
@@ -2278,6 +2289,22 @@ CREATE FUNCTION coldfront._enqueue_release(p_ticket bigint)
 RETURNS void
 LANGUAGE c AS 'coldfront', 'coldfront_enqueue_release';
 
+-- coldfront._reject_on_standby: refuse a cold-tier mutation on a physical standby.
+-- PostgreSQL's read-only enforcement covers only its own writes; a cold write leaves
+-- PG entirely (DuckDB to object storage), so the cold tier relies on this explicit
+-- check to keep a replica out of the writer set. p_action names the attempted
+-- operation in the error text. Callers invoke this before taking a claim, so a
+-- standby stays outside the serialization protocol.
+CREATE FUNCTION coldfront._reject_on_standby(p_action text) RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF pg_is_in_recovery() THEN
+        RAISE EXCEPTION 'coldfront: cannot % on a read-only standby', p_action
+            USING HINT = 'Standbys serve reads only; run this on the primary.';
+    END IF;
+END;
+$$;
+
 -- coldfront._bakery_armed: TRUE when this node is configured for the multi-writer
 -- Ricart-Agrawala bakery (both GUCs the protocol needs are set). FALSE means
 -- vanilla single-node, which serializes cold writes with a local advisory xact
@@ -2376,16 +2403,10 @@ DECLARE
     -- used (always safe). Never a 409 either way.
     v_async   boolean := coldfront._iceberg_async_active();
 BEGIN
-    -- A physical standby is read-only. The vanilla path below takes only an
-    -- advisory lock (not a PG write), so without this guard a cold write on a
-    -- read replica would slip past PG's read-only protection and attempt a
-    -- DuckDB→S3 Iceberg write — an uncoordinated writer mutating the shared cold
-    -- tier. Every cold write funnels through here, so one recovery check fences
-    -- them all off cleanly. (A hot write hits a PG heap; PG rejects it natively.)
-    IF pg_is_in_recovery() THEN
-        RAISE EXCEPTION 'coldfront: cannot execute a cold (Iceberg) write on a read-only standby'
-            USING HINT = 'Standbys serve reads only; route writes to the primary.';
-    END IF;
+    -- This wrapper is the single-statement cold path; _tiered_insert_cold and
+    -- _cross_tier_move issue their own multi-statement cold writes and carry the
+    -- same guard. A hot write hits a PG heap, which PG rejects natively.
+    PERFORM coldfront._reject_on_standby('execute a cold (Iceberg) write');
     -- Fail-safe, not fail-silent: if async was REQUESTED but the bakery-aware
     -- patch is not asserted, we use the stock ordering (always safe) and note it
     -- ONCE per session. Running async on stock iceberg would let a peer capture a
@@ -2431,10 +2452,7 @@ $$;
 CREATE FUNCTION coldfront._claim_iceberg_external(p_iceberg_table text)
 RETURNS void LANGUAGE plpgsql AS $$
 BEGIN
-    IF pg_is_in_recovery() THEN
-        RAISE EXCEPTION 'coldfront: cannot compact (Iceberg write) on a read-only standby'
-            USING HINT = 'Standbys serve reads only; run the compactor against the primary.';
-    END IF;
+    PERFORM coldfront._reject_on_standby('compact (Iceberg write)');
     PERFORM coldfront._take_iceberg_claim(p_iceberg_table);
 END;
 $$;
@@ -2574,10 +2592,7 @@ BEGIN
             USING HINT = 'Only tables registered in coldfront.tiered_views can be dropped through this function.';
     END IF;
 
-    IF pg_is_in_recovery() THEN
-        RAISE EXCEPTION 'coldfront: cannot drop an Iceberg table on a read-only standby'
-            USING HINT = 'Standbys serve reads only; run this on the primary.';
-    END IF;
+    PERFORM coldfront._reject_on_standby('drop an Iceberg table');
 
     -- Combines PG writes (registry DELETEs, DROP VIEW, the rename) with a DuckDB
     -- write in one transaction, the same pattern create_iceberg_table needs.
