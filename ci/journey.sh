@@ -2110,7 +2110,7 @@ EOF
     # archiver.tables says in the config file.
     cat > /tmp/journey-yaml-tables.yaml <<EOYAML
 postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
-iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog", namespace: "default" }
+iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog" }
 $(storage_yaml)
 archiver:
   tables:
@@ -2528,7 +2528,6 @@ postgres:
 iceberg:
   warehouse: "${WAREHOUSE}"
   lakekeeper_endpoint: "http://${LK_IP}:8181/catalog"
-  namespace: "default"
 s3:
   endpoint: "wronghost:8333"
   region: "us-east-1"
@@ -2662,7 +2661,6 @@ postgres:
 iceberg:
   warehouse: "${WAREHOUSE}"
   lakekeeper_endpoint: "http://${LK_IP}:8181/catalog"
-  namespace: "default"
 $(storage_yaml)
 EOF
     if "$ARCHIVER" set --config /tmp/journey-disen.yaml --table events --disable >/tmp/journey-disen.log 2>&1; then

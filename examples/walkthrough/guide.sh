@@ -11,6 +11,10 @@ OS="$(uname -s)"
 PG_PORT="${COLDFRONT_PG_PORT:-5432}"
 LK_PORT="${COLDFRONT_LK_PORT:-8181}"
 LK_URL="http://localhost:${LK_PORT}"
+# The Iceberg namespace mirrors the PG schema the demos use, so it has to be
+# seeded and addressed under that name. One constant keeps the bootstrap, the
+# metadata lookup, and the purge helper from drifting apart.
+LK_NS="public"
 
 # Mesh (Demo 4) — a separate 2-node stack, brought up on demand. Ports are picked
 # lazily by detect_mesh_ports() from a base that avoids the single-node stack, so
@@ -67,14 +71,14 @@ show_query() {
 }
 
 # _iceberg_meta_loc <table_name> — echo the table's metadata.json S3 path from the
-# Lakekeeper catalog (warehouse id → GET …/catalog/v1/<wh_id>/namespaces/default/
+# Lakekeeper catalog (warehouse id → GET …/catalog/v1/<wh_id>/namespaces/<LK_NS>/
 # tables/<table_name> → metadata-location). Empty string if it can't be resolved.
-# Shared by show_parquet_files and show_parquet_contents. Consumes LK_URL.
+# Shared by show_parquet_files and show_parquet_contents. Consumes LK_URL, LK_NS.
 _iceberg_meta_loc() {
     local table_name="$1" wh_id
     wh_id=$(curl -s "${LK_URL}/management/v1/warehouse" \
         | grep -o '"warehouse-id":"[^"]*"' | head -1 | cut -d'"' -f4)
-    curl -s "${LK_URL}/catalog/v1/${wh_id}/namespaces/default/tables/${table_name}" \
+    curl -s "${LK_URL}/catalog/v1/${wh_id}/namespaces/${LK_NS}/tables/${table_name}" \
         -H 'accept: application/json' \
         | grep -o '"metadata-location":"[^"]*"' | head -1 | cut -d'"' -f4
 }
@@ -331,7 +335,9 @@ ensure_coldfront_setup() {
 # ensure_warehouse_and_namespace <lk_url> — bootstrap Lakekeeper, then POST
 # warehouse 'wh' (retrying until config?warehouse=wh resolves — the POST validates
 # its S3 profile against SeaweedFS and 4xx/5xxs until the S3 endpoint is live) and
-# create the 'default' namespace. Returns non-zero if 'wh' never resolves. Shared
+# create the LK_NS namespace. Seeding it is required, not cosmetic: DuckDB defers
+# an Iceberg CREATE SCHEMA to COMMIT while POSTing CREATE TABLE eagerly, so
+# create_iceberg_table 404s unless the namespace is already committed. Shared
 # by phase_a_bringup (single-node) and mesh_bringup (2-node); both seed the same
 # warehouse against their own Lakekeeper on the SeaweedFS at http://seaweedfs:8333.
 ensure_warehouse_and_namespace() {
@@ -354,7 +360,7 @@ ensure_warehouse_and_namespace() {
     [ "$ok" = 1 ] || return 1
     wid=$(curl -s "$lk/management/v1/warehouse" | grep -oE '"warehouse-id":"[^"]+"' | head -1 | cut -d'"' -f4)
     curl -sf -X POST "$lk/catalog/v1/$wid/namespaces" \
-        -H 'Content-Type: application/json' -d '{"namespace":["default"]}' >/dev/null 2>&1 || true
+        -H 'Content-Type: application/json' -d "{\"namespace\":[\"${LK_NS}\"]}" >/dev/null 2>&1 || true
     return 0
 }
 
@@ -398,7 +404,7 @@ phase_a_bringup() {
         exit 1
     fi
     stop_spinner
-    info "[4/4] Warehouse 'wh' + namespace 'default' ready"
+    info "[4/4] Warehouse 'wh' + namespace '${LK_NS}' ready"
     echo ""
 }
 
@@ -465,7 +471,7 @@ mesh_bringup() {
     [ "$ok" = 1 ] && { ensure_warehouse_and_namespace "$MESH_LK_URL" || ok=0; }
     stop_spinner
     [ "$ok" = 1 ] || { error "Shared Lakekeeper/warehouse did not become ready"; $MESH_COMPOSE logs lakekeeper seaweedfs | tail -20; return 1; }
-    info "[4/6] Shared lake ready (warehouse 'wh', namespace 'default')"
+    info "[4/6] Shared lake ready (warehouse 'wh', namespace '${LK_NS}')"
 
     start_spinner "[5/6] Installing ColdFront + forming the Spock mesh"
     # Extensions on both nodes, one per call (a chained CREATE aborts the rest on
@@ -695,7 +701,7 @@ drop_iceberg_table() {
         | grep -o '"warehouse-id":"[^"]*"' | head -1 | cut -d'"' -f4)
     [ -n "$wh_id" ] || return 0
     curl -s -o /dev/null -X DELETE \
-        "${LK_URL}/catalog/v1/${wh_id}/namespaces/default/tables/$1?purgeRequested=true" || true
+        "${LK_URL}/catalog/v1/${wh_id}/namespaces/${LK_NS}/tables/$1?purgeRequested=true" || true
 }
 
 # teardown_tiered / teardown_decoupled — idempotent cleanup for a demo's objects.
