@@ -107,24 +107,8 @@ func run(cfgPath, tableName string, o runOpts) error {
 	schema, table := splitSchemaTable(tableName)
 	icebergRef := pgx.Identifier{"ice", schema, table}.Sanitize()
 
-	// One PG connection, shared across each step's bakery claim, opened lazily — a
-	// pure dry-run never needs it.
-	var conn *pgx.Conn
-	defer func() {
-		if conn != nil {
-			_ = conn.Close(ctx)
-		}
-	}()
-	claim := func(fn func() error) error {
-		if conn == nil {
-			c, cerr := pgx.Connect(ctx, cfg.Postgres.DSN)
-			if cerr != nil {
-				return fmt.Errorf("connect postgres (bakery): %w", cerr)
-			}
-			conn = c
-		}
-		return withBakeryClaim(ctx, conn, icebergRef, fn)
-	}
+	claim, closeConn := newClaimer(ctx, cfg.Postgres.DSN, icebergRef)
+	defer closeConn()
 
 	if err := doCompaction(ctx, cat, schema, table, o, claim); err != nil {
 		return err
@@ -140,6 +124,28 @@ func run(cfgPath, tableName string, o runOpts) error {
 		}
 	}
 	return nil
+}
+
+// newClaimer returns a wrapper that runs fn under the bakery claim for icebergRef,
+// plus a closer for the one PG connection every step shares. The connection opens
+// on the first claim, so a pure dry-run never needs Postgres at all.
+func newClaimer(ctx context.Context, dsn, icebergRef string) (claim func(func() error) error, closeConn func()) {
+	var conn *pgx.Conn
+	claim = func(fn func() error) error {
+		if conn == nil {
+			c, err := pgx.Connect(ctx, dsn)
+			if err != nil {
+				return fmt.Errorf("connect postgres (bakery): %w", err)
+			}
+			conn = c
+		}
+		return withBakeryClaim(ctx, conn, icebergRef, fn)
+	}
+	return claim, func() {
+		if conn != nil {
+			_ = conn.Close(ctx)
+		}
+	}
 }
 
 // doCompaction plans + (unless dry-run) rewrites below-target files under one claim.

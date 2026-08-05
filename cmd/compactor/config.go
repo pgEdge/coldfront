@@ -79,28 +79,23 @@ func (c *Config) storageProps() (iceberg.Properties, error) {
 			iceio.ADLSSharedKeyAccountKey:  key,
 		}, nil
 	}
+	return c.s3Props(), nil
+}
 
+// s3Props builds the S3 fileio properties: static keys, region, endpoint
+// addressing.
+func (c *Config) s3Props() iceberg.Properties {
 	p := iceberg.Properties{}
 	// Static S3 keys. Omitted entirely for a vended deployment (empty s3 block):
 	// iceberg-go always requests delegation and merges Lakekeeper's vended
 	// storage-credentials last, so empty static keys must not shadow them. (A
 	// vended Azure store leaves the azure block empty too, so no ADLSSharedKey*
-	// is set above; its shared-key branch would otherwise beat the vended SAS.)
+	// is set; the shared-key branch would otherwise beat the vended SAS.)
 	if c.S3.AccessKey != "" && c.S3.SecretKey != "" {
 		p[iceio.S3AccessKeyID] = c.S3.AccessKey
 		p[iceio.S3SecretAccessKey] = c.S3.SecretKey
 	}
-	// The SDK refuses to sign an S3 request without a region, and its complaint
-	// ("A region must be set") names nothing in the YAML. Default it the way the
-	// archiver does so one config drives both tools, but only where an S3 store
-	// was actually configured: a vended deployment leaves this block empty and
-	// takes its region from Lakekeeper's vended table config, which an invented
-	// value would shadow (and which would be meaningless for vended ADLS).
-	region := c.S3.Region
-	if region == "" && (c.S3.Endpoint != "" || c.S3.AccessKey != "") {
-		region = "us-east-1"
-	}
-	if region != "" {
+	if region := c.s3Region(); region != "" {
 		p[iceio.S3Region] = region
 	}
 	if c.S3.Endpoint != "" {
@@ -116,7 +111,20 @@ func (c *Config) storageProps() (iceberg.Properties, error) {
 	}
 	// No endpoint => real AWS S3: leave endpoint/addressing to the aws-sdk
 	// default (per-Region virtual-hosted HTTPS), set only the region.
-	return p, nil
+	return p
+}
+
+// s3Region resolves the region to sign with. The SDK refuses to sign without
+// one, so default it the way the archiver does, but only where an S3 store is
+// configured: a vended deployment takes its region from Lakekeeper instead.
+func (c *Config) s3Region() string {
+	if c.S3.Region != "" {
+		return c.S3.Region
+	}
+	if c.S3.Endpoint != "" || c.S3.AccessKey != "" {
+		return "us-east-1"
+	}
+	return ""
 }
 
 // parseAzureConnString extracts AccountName and AccountKey from an ADLS
