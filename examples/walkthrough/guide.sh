@@ -1299,14 +1299,13 @@ demo_distributed() {
     fi
     explain "First the receipts — the bakery's durable proof. Each cold write took a"
     explain "globally-ordered ticket; the peer node acked it before the commit. This trail"
-    explain "records every one (node names resolved from spock.node, not hardcoded):"
+    explain "records every one (the acking node is stamped by name, the issuer by its"
+    explain "snowflake node id, which is what the ticket carries):"
     mshow db1 "$MESH_PG1_PORT" "SELECT ca.ticket,
-                iss.node_name  AS issued_by,
-                ackn.node_name AS acked_by,
+                snowflake.get_node(ca.ticket) AS issued_by_node,
+                ca.ack_from_name              AS acked_by,
                 ca.iceberg_table
              FROM coldfront.claim_acks ca
-             JOIN spock.node iss  ON (hashtext(iss.node_name)  & 1023) = snowflake.get_node(ca.ticket)
-             JOIN spock.node ackn ON (hashtext(ackn.node_name) & 1023) = ca.ack_from_node
              ORDER BY ca.ticket;"
     info "Tickets issued by BOTH nodes, each acked by its peer — the bakery serialized them cluster-wide, so no two Iceberg commits ever collided."
     explain "And the row count confirms it — up by exactly 10, every concurrent write landed (none lost to a conflict):"
