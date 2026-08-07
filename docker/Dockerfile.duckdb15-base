@@ -165,7 +165,8 @@ FROM ghcr.io/pgedge/pgedge-postgres:${PGEDGE_TAG}
 ARG PG_MAJOR
 ARG TARGETARCH
 USER root
-RUN dnf install -y --setopt=install_weak_deps=False --allowerasing \
+RUN dnf update -y \
+    && dnf install -y --setopt=install_weak_deps=False --allowerasing \
         libcurl lz4 pgedge-postgresql${PG_MAJOR}-contrib openssl \
     && dnf clean all
 
