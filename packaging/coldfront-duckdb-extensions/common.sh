@@ -28,8 +28,10 @@ export DUCKDB_EXT_BUILDNUM="${COMPONENT_BUILDNUM:-1}"
 # cmake (packaging copies docker/iceberg-azure-extension-config-v15.cmake).
 # ICEBERG_REF is read from the base-image Dockerfile — the single source of truth,
 # so the native extension build and the docker base image can never pin different
-# refs. CWD (repo root) is set by the caller before this file is sourced, the same
-# base the patch/cmake copies use.
+# refs. CWD is the repo root — the same base the patch/cmake copies use; the
+# build scripts set it, and anything sourcing this file directly (release.yml,
+# the detect-build-matrix action) gets it derived from this file's own location.
+CWD="${CWD:-$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)}"
 export ICEBERG_REPO="https://github.com/duckdb/duckdb-iceberg"
 export ICEBERG_BRANCH="${ICEBERG_BRANCH:-v1.5-variegata}"
 export ICEBERG_REF="${ICEBERG_REF:-$(sed -n 's/^ARG ICEBERG_REF=\([^[:space:]]*\).*/\1/p' "${CWD}/docker/Dockerfile.duckdb15-base" | head -1)}"
