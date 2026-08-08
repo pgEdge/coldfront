@@ -7,7 +7,34 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.0.0-beta2] - 2026-08-08
+
+### Added
+
+- `coldfront.drop_iceberg_table()` drops a decoupled or tiered table, with
+  purge or keep-files for the stored objects.
+- Vended (minted) object-store credentials, so cold access can use
+  short-lived credentials issued by Lakekeeper instead of static keys.
+- Cross-tier row relocation: an UPDATE that moves a row's partition key
+  across the cutoff now moves the row between tiers.
+- Multi-arch base images: linux/amd64 and linux/arm64.
+- An interactive walkthrough with four demos, runnable in Codespaces.
+
+### Changed
+
+- DuckDB 1.5.4 via the merged pg_duckdb PR #1025.
+- Registration refuses unlogged relations, names that the partition naming
+  scheme cannot represent, and names differing only by case.
+
+### Fixed
+
+- Cold-tier writes are refused on a standby in every path that reaches them.
+- Exotic partition bounds parse correctly, DEFAULT partitions are refused,
+  and timestamp-without-time-zone bounds are handled.
+- `oid` columns are rejected as unsupported rather than failing later.
+- Same-node cold writers serialise through a node-local advisory lock, and
+  bakery acknowledgements match on the spock node name.
+- Permanent cutover errors stop immediately instead of being retried.
 
 ## [1.0.0-beta1] - 2026-06-18
 
