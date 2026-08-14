@@ -320,6 +320,14 @@ recognises one shape and rewrites it:
   nested in a subquery or a CTE is not the query it is looking at. Wrapping a
   search to aggregate over it therefore makes it exact.
 
+Grouping, aggregation, window functions and `DISTINCT` above that `ORDER BY` are
+accepted, and they compute over the narrowed scan: the probe restricts rows, and
+the statement's own semantics apply to what was read. The structural declines are
+joins, CTEs, set operations, sublinks and row-marks. On PostgreSQL 18 a grouped
+query carries an `RTE_GROUP` entry and its sort expression references grouping
+expressions as Vars of that RTE; the hook counts that entry as no second relation
+and resolves such Vars through `groupexprs` before matching the shape.
+
 Everything else is left byte-identical. That is an exact scan over both tiers,
 which is correct, and it is what the product did before there was a layout.
 

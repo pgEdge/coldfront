@@ -54,6 +54,7 @@
 #include "nodes/pg_list.h"
 #include "optimizer/optimizer.h"
 #include "parser/analyze.h"
+#include "parser/parsetree.h"
 #include "tcop/tcopprot.h"
 #include "tcop/utility.h"
 #include "utils/builtins.h"
@@ -246,9 +247,9 @@ typedef struct {
     char        *partition_col;   /* e.g. "ts"; NULL when is_iceberg_only */
     bool         has_cutoff;      /* false → nothing archived yet */
     bool         is_iceberg_only; /* true → table lives entirely in Iceberg, no hot tier */
-    char        *vec_columns;     /* comma-joined vector columns, or NULL when none.
-                                   * First owns the file sort order; only its probe
-                                   * prunes row groups (see _vec_sort_key). */
+    bool         has_vector;      /* the table carries clustered vector columns;
+                                   * which ones is SQL's to answer (per-column
+                                   * lookups keyed on the ref or the query). */
     TimestampTz  cutoff;          /* archive watermark            */
 } TieredViewInfo;
 
@@ -291,7 +292,7 @@ lookup_tiered_view(Oid relid, const char *vname, TieredViewInfo *info)
     initStringInfo(&sql);
     appendStringInfo(&sql,
         "SELECT tv.hot_table, tv.iceberg_table, tv.partition_col, "
-        "       tv.is_iceberg_only, aw.cutoff_time, array_to_string(tv.vec_columns, ',') "
+        "       tv.is_iceberg_only, aw.cutoff_time, tv.vec_columns IS NOT NULL "
         "FROM coldfront.tiered_views tv "
         "LEFT JOIN coldfront.archive_watermark aw ON aw.table_name = %s "
         "WHERE tv.schema_name = %s AND tv.relname = %s",
@@ -325,9 +326,8 @@ lookup_tiered_view(Oid relid, const char *vname, TieredViewInfo *info)
         if (!isnull)
             info->cutoff = DatumGetTimestampTz(d);
 
-        /* NULL unless the table has a clustered vector column. */
-        s = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 6);
-        info->vec_columns = s ? pstrdup(s) : NULL;
+        d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 6, &isnull);
+        info->has_vector = !isnull && DatumGetBool(d);
 
         MemoryContextSwitchTo(oldcxt);
         found = true;
@@ -994,7 +994,7 @@ build_cold_dml(DeparseResult *dr, TieredViewInfo *info, Query *query)
      * embedding changes while its cluster does not is permanently invisible to
      * its own probe, silently. */
     if (query != NULL && query->commandType == CMD_UPDATE
-        && info->vec_columns != NULL)
+        && info->has_vector)
     {
         RangeTblEntry *rte = (RangeTblEntry *) list_nth(query->rtable,
                                                         query->resultRelation - 1);
@@ -1398,7 +1398,7 @@ emit_cold(Query *query, TieredViewInfo *info, ColdParamSet *ps, bool in_plpgsql)
      * is derived in the same statement: a row whose cluster disagrees with its
      * vector is invisible to its own search and reports no error. */
     if (query->commandType == CMD_INSERT && info->is_iceberg_only
-        && info->vec_columns != NULL)
+        && info->has_vector)
     {
         char *col_list = insert_targetlist_collist(query);
         char *with_cluster = build_iceberg_only_insert_with_cluster(
@@ -1823,31 +1823,6 @@ add_set_item(const char *cold_dml, const char *set_item)
 }
 
 /*
- * The SET assignment for a named column in an UPDATE's post-parse-analyze target
- * list, or NULL when the statement does not set it.  Same shape as
- * partcol_set_target, over a different column.
- */
-static TargetEntry *
-named_set_target(Query *query, RangeTblEntry *rte, const char *colname)
-{
-    AttrNumber  attno;
-    ListCell   *lc;
-
-    if (query->commandType != CMD_UPDATE || colname == NULL)
-        return NULL;
-    attno = get_attnum(rte->relid, colname);
-    if (attno == InvalidAttrNumber)
-        return NULL;
-    foreach(lc, query->targetList)
-    {
-        TargetEntry *tle = (TargetEntry *) lfirst(lc);
-        if (!tle->resjunk && tle->resno == attno)
-            return tle;
-    }
-    return NULL;
-}
-
-/*
  * Re-stamp the cluster on a cold UPDATE that sets an embedding.
  *
  * The derivation takes the text of the new embedding expression rather than a
@@ -1855,27 +1830,33 @@ named_set_target(Query *query, RangeTblEntry *rte, const char *colname)
  * The expression is evaluated twice, once for the column and once for the
  * cluster.  Returns the extended statement, or NULL to leave it untouched.
  *
- * Every vector column the UPDATE sets gets its own SET item, because each has its
- * own cluster column and leaving one stale would make those rows invisible to that
- * column's probe while the others stayed correct.
+ * Every SET column is offered to coldfront._vec_list_set_item, which answers
+ * NULL for one that is not a clustered vector column: which columns qualify is
+ * the registry's knowledge, consulted where it lives instead of copied here.
+ * Every vector column the UPDATE sets gets its own item, because each has its
+ * own cluster column and leaving one stale would make those rows invisible to
+ * that column's probe while the others stayed correct.
  */
 static char *
 add_cluster_set_item(Query *query, RangeTblEntry *rte, TieredViewInfo *info,
                      const char *cold_dml)
 {
-    char *out = NULL;
-    char *cols = pstrdup(info->vec_columns);
-    char *col  = strtok(cols, ",");
+    char     *out = NULL;
+    ListCell *lc;
 
-    for (; col != NULL; col = strtok(NULL, ","))
+    foreach(lc, query->targetList)
     {
-        TargetEntry   *tle = named_set_target(query, rte, col);
+        TargetEntry   *tle = (TargetEntry *) lfirst(lc);
+        char          *colname;
         List          *dpcontext;
         char          *e_text, *item = NULL;
         StringInfoData q;
 
-        if (tle == NULL)
-            continue;               /* the UPDATE does not touch this vector */
+        if (tle->resjunk)
+            continue;
+        colname = get_attname(rte->relid, tle->resno, true);
+        if (colname == NULL)
+            continue;
 
         dpcontext = deparse_context_for(get_rel_name(rte->relid), rte->relid);
         e_text    = deparse_expression((Node *) tle->expr, dpcontext, false, false);
@@ -1883,15 +1864,22 @@ add_cluster_set_item(Query *query, RangeTblEntry *rte, TieredViewInfo *info,
         initStringInfo(&q);
         appendStringInfo(&q, "SELECT coldfront._vec_list_set_item(%s, %s, %s)",
                          quote_literal_cstr(info->iceberg_table),
-                         quote_literal_cstr(col),
+                         quote_literal_cstr(colname),
                          quote_literal_cstr(e_text));
         if (SPI_connect() == SPI_OK_CONNECT)
         {
             if (SPI_execute(q.data, true, 1) == SPI_OK_SELECT && SPI_processed == 1)
             {
-                MemoryContext oldcxt = MemoryContextSwitchTo(CurTransactionContext);
-                item = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
-                MemoryContextSwitchTo(oldcxt);
+                bool  itemnull;
+
+                (void) SPI_getbinval(SPI_tuptable->vals[0],
+                                     SPI_tuptable->tupdesc, 1, &itemnull);
+                if (!itemnull)
+                {
+                    MemoryContext oldcxt = MemoryContextSwitchTo(CurTransactionContext);
+                    item = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+                    MemoryContextSwitchTo(oldcxt);
+                }
             }
             SPI_finish();
         }
@@ -1902,7 +1890,6 @@ add_cluster_set_item(Query *query, RangeTblEntry *rte, TieredViewInfo *info,
         out = add_set_item(out ? out : cold_dml, normalize_casts_for_duckdb(item));
     }
     return out;
-
 }
 
 /*
@@ -1923,7 +1910,7 @@ build_iceberg_only_insert_with_cluster(Query *query, TieredViewInfo *info,
     char          *prefix = NULL;
     char          *list_cols = NULL;   /* already quoted and comma-joined */
 
-    if (info->vec_columns == NULL)
+    if (!info->has_vector)
         return NULL;
 
     /* The assignment reads the vector out of the derived table. */
@@ -2037,7 +2024,7 @@ build_cold_bulk_call(Query *query, TieredViewInfo *info, const char *source,
     /* Ordered by cluster when there is one, so this write's own row groups each
      * hold roughly one cluster and a probe skips the rest of the file.  The
      * cluster leads the projection, hence ordinal 1. */
-    if (info->vec_columns != NULL)
+    if (info->has_vector)
         appendStringInfoString(&cold, " ORDER BY 1");
     cold_pfx  = prefix_pg_tables_with_pglocal(query, cold.data);
     cold_norm = normalize_casts_for_duckdb(cold_pfx);
@@ -2458,6 +2445,34 @@ cf_normalize_read_jsonb(Query *query)
     cf_reparse_and_replace(query, norm, &ps);
 }
 
+/*
+ * Resolve a node through the grouping RTE. A grouped query's sort expression
+ * references grouping expressions as Vars of RTE_GROUP, and the expression the
+ * shape check needs is the one they stand for. On releases without the grouping
+ * RTE, grouped queries carry the base-relation Vars directly, so this is the
+ * identity there.
+ */
+static Node *
+cf_unwrap_group_var(Query *query, Node *node)
+{
+#if PG_VERSION_NUM >= 180000
+    if (node != NULL && IsA(node, Var))
+    {
+        Var *var = (Var *) node;
+
+        if (var->varlevelsup == 0 &&
+            var->varno >= 1 && var->varno <= list_length(query->rtable))
+        {
+            RangeTblEntry *rte = rt_fetch(var->varno, query->rtable);
+
+            if (rte->rtekind == RTE_GROUP)
+                return (Node *) list_nth(rte->groupexprs, var->varattno - 1);
+        }
+    }
+#endif
+    return node;
+}
+
 /* True for a reference to a column of the query's single range-table entry.
  * InvalidAttrNumber matches any column, for a caller that wants to learn which. */
 static bool
@@ -2498,35 +2513,25 @@ cf_query_vector_literal(Node *expr)
 }
 
 /*
- * Probe injection. A top-k similarity search over a clustered tiered view is
- * rewritten to read only the clusters nearest the query vector, which is what turns
- * the layout every write maintains into a shorter read. Every other shape is left
- * exactly as it was: that is an exact scan, which is correct.
+ * The shape the probe rewrite recognises: a single-relation SELECT on a
+ * registered view with a clustered vector column, ordered by one cosine distance
+ * between that column and a constant, with a LIMIT. Grouping, aggregation,
+ * windows and DISTINCT above that ORDER BY are part of the shape; they compute
+ * over whatever the narrowed scan reads.
  *
- * The recognised shape is a single-relation SELECT on a registered view with a
- * clustered vector column, ordered by one cosine distance between that column and a
- * constant, with a LIMIT. The LIMIT is part of the shape and not a detail: a probe
- * trades recall for reads, which is the bargain a top-k asks for and is not one to
- * impose on a query that asked for every row in order. Cosine only, because the
- * centroids were trained under cosine and ordering by another metric would route to
- * the wrong clusters and report nothing.
+ * The LIMIT is not a detail: a probe trades recall for reads, which is the
+ * bargain a top-k asks for and not one to impose on a query that asked for every
+ * row in order. Cosine only, because the centroids were trained under cosine and
+ * ordering by another metric would route to the wrong clusters and report
+ * nothing. Which column is being searched comes from the query rather than the
+ * registry, because a table may carry several vector columns; a column with no
+ * configuration resolves to no probe set downstream and the rewrite declines.
  *
- * The predicate cannot be added to the caller's query, because the column it tests
- * is deliberately in no branch of the view (see coldfront._vec_list_col). So the
- * view reference is replaced by the view's own definition carrying the predicate on
- * its cold arm, which puts the test where the column exists and leaves the caller's
- * query surface alone. Nothing here is text surgery on the caller's SQL: the
- * substitution swaps one range-table entry for a subquery and PostgreSQL deparses
- * the result.
- *
- * Declining is silent and total. A table with no centroid generation, a probe set
- * that resolves to nothing, a view with no cold arm: all of them keep today's
- * query. The read is then slower than it could be, never wrong, which is the right
- * direction for a read to fail in (a WRITE that cannot resolve a generation has to
- * fail loudly instead).
+ * On a match, *vec_name is the searched column and *vec_lit the query vector's
+ * PostgreSQL literal.
  */
-static void
-cf_maybe_inject_probe(Query *query)
+static bool
+cf_probe_match(Query *query, char **vec_name, char **vec_lit)
 {
     RangeTblEntry  *view_rte;
     TieredViewInfo  info;
@@ -2538,31 +2543,31 @@ cf_maybe_inject_probe(Query *query)
     Oid             funcid;
     char           *fname;
     AttrNumber      vec_attno;
-    char           *vec_name;
     Node           *lhs, *rhs, *other;
-    char           *vec_lit;
-    char           *body = NULL;
-    Query          *clone;
-    RangeTblEntry  *crte;
-    char           *sql;
-    ColdParamSet    ps;
-    StringInfoData  q;
+    int             nrte;
 
-    if (!coldfront_vector_probe)
-        return;
+    nrte = list_length(query->rtable);
+#if PG_VERSION_NUM >= 180000
+    /* A grouped query carries an RTE_GROUP entry holding the grouping
+     * expressions. It adds no second scan, so it does not disqualify the shape;
+     * its Vars are unwrapped where the sort expression is matched. */
+    if (nrte == 2 &&
+        ((RangeTblEntry *) lsecond(query->rtable))->rtekind == RTE_GROUP)
+        nrte = 1;
+#endif
     if (query->cteList || query->setOperations || query->hasSubLinks ||
-        query->rowMarks || list_length(query->rtable) != 1 ||
+        query->rowMarks || nrte != 1 ||
         list_length(query->sortClause) != 1 || query->limitCount == NULL)
-        return;
+        return false;
 
     view_rte = (RangeTblEntry *) linitial(query->rtable);
     if (view_rte->rtekind != RTE_RELATION ||
         get_rel_relkind(view_rte->relid) != RELKIND_VIEW)
-        return;
+        return false;
     if (!lookup_tiered_view(view_rte->relid, get_rel_name(view_rte->relid), &info))
-        return;
-    if (info.vec_columns == NULL)
-        return;
+        return false;
+    if (!info.has_vector)
+        return false;
 
     /* The single sort key, which may be resjunk (ORDER BY an unselected expr). */
     sgc = (SortGroupClause *) linitial(query->sortClause);
@@ -2577,10 +2582,10 @@ cf_maybe_inject_probe(Query *query)
         }
     }
     if (tle == NULL)
-        return;
+        return false;
 
     /* Written as an operator or as the function behind it; both name the same. */
-    expr = (Node *) tle->expr;
+    expr = cf_unwrap_group_var(query, (Node *) tle->expr);
     if (IsA(expr, OpExpr))
     {
         funcid = ((OpExpr *) expr)->opfuncid;
@@ -2592,19 +2597,16 @@ cf_maybe_inject_probe(Query *query)
         args   = ((FuncExpr *) expr)->args;
     }
     else
-        return;
+        return false;
     if (list_length(args) != 2)
-        return;
+        return false;
     fname = get_func_name(funcid);
     if (fname == NULL || strcmp(fname, "list_cosine_distance") != 0)  /* nosemgrep */
-        return;
+        return false;
 
-    /* One side is a column of the view, the other is the query vector. Which column
-     * it is comes from the query rather than from the registry, because a table may
-     * carry several vector columns and each has its own cluster column. A column that
-     * is not configured resolves to no probe set and the rewrite declines. */
-    lhs = (Node *) linitial(args);
-    rhs = (Node *) lsecond(args);
+    /* One side is a column of the view, the other is the query vector. */
+    lhs = cf_unwrap_group_var(query, (Node *) linitial(args));
+    rhs = cf_unwrap_group_var(query, (Node *) lsecond(args));
     if (cf_is_single_rel_var(lhs, InvalidAttrNumber))
     {
         vec_attno = ((Var *) lhs)->varattno;
@@ -2616,13 +2618,53 @@ cf_maybe_inject_probe(Query *query)
         other     = lhs;
     }
     else
+        return false;
+    *vec_name = get_attname(view_rte->relid, vec_attno, true);
+    if (*vec_name == NULL)
+        return false;
+    *vec_lit = cf_query_vector_literal(other);
+    return *vec_lit != NULL;
+}
+
+/*
+ * Probe injection. A top-k similarity search over a clustered tiered view
+ * (cf_probe_match) is rewritten to read only the clusters nearest the query
+ * vector, which is what turns the layout every write maintains into a shorter
+ * read. Every other shape is left exactly as it was: that is an exact scan,
+ * which is correct.
+ *
+ * The predicate cannot be added to the caller's query, because the column it
+ * tests is deliberately in no branch of the view (see coldfront._vec_list_col).
+ * So the view reference is replaced by the view's own definition carrying the
+ * predicate on its cold arm, which puts the test where the column exists and
+ * leaves the caller's query surface alone. Nothing here is text surgery on the
+ * caller's SQL: the substitution swaps one range-table entry for a subquery and
+ * PostgreSQL deparses the result.
+ *
+ * Declining is silent and total. A table with no centroid generation, a probe
+ * set that resolves to nothing, a view with no cold arm: all of them keep
+ * today's query. The read is then slower than it could be, never wrong, which is
+ * the right direction for a read to fail in (a WRITE that cannot resolve a
+ * generation has to fail loudly instead).
+ */
+static void
+cf_maybe_inject_probe(Query *query)
+{
+    RangeTblEntry  *view_rte;
+    char           *vec_name;
+    char           *vec_lit;
+    char           *body = NULL;
+    Query          *clone;
+    RangeTblEntry  *crte;
+    char           *sql;
+    ColdParamSet    ps;
+    StringInfoData  q;
+
+    if (!coldfront_vector_probe)
         return;
-    vec_name = get_attname(view_rte->relid, vec_attno, true);
-    if (vec_name == NULL)
+    if (!cf_probe_match(query, &vec_name, &vec_lit))
         return;
-    vec_lit = cf_query_vector_literal(other);
-    if (vec_lit == NULL)
-        return;
+    view_rte = (RangeTblEntry *) linitial(query->rtable);
 
     /* Resolve the probe set and the definition that carries it, in one round trip. */
     initStringInfo(&q);

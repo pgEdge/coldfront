@@ -174,6 +174,12 @@ Once a column has a trained generation, a search that ends in `ORDER BY <column>
 The query you write does not change. The result becomes approximate, in the same
 way it does with any vector index: raise `nprobe` for recall, lower it for speed.
 
+A search that also groups, aggregates, windows or applies `DISTINCT` is narrowed
+the same way: the probe restricts which rows are scanned, and everything in the
+statement is computed over those rows. A grouped count, for example, counts probed
+rows only. There is no approximate-inside, exact-outside form of one statement:
+wrapping the search in a subquery makes the whole thing exact.
+
 Anything that is not that shape stays an exact scan of both tiers, which is
 correct. Two cases worth knowing: a search with no `LIMIT` is answered exactly,
 because asking for every row in order is not a request to approximate; and so is

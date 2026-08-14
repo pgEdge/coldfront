@@ -26,14 +26,6 @@ type ViewConfig struct {
 	CutoffTime      time.Time
 	PartitionColumn string
 	Columns         []Column
-
-	// VecListExpr is the DuckDB expression that assigns a cluster, as
-	// coldfront._vec_list_expr returns it, with the vector's own placeholder
-	// already inside. Fetched rather than spelled here: a row whose cluster
-	// disagrees with its vector is invisible to its own search and reports no
-	// error, so the extension holds the single definition every path emits.
-	// Empty on a table with no vector, and empty leaves the column unassigned.
-	VecListExpr string
 }
 
 // Column holds a column name, its DuckDB types, and key-participation flags.
@@ -84,18 +76,6 @@ func (c Column) HotRef() (ref string, aliased bool) {
 // cold INSERT is positional because Iceberg rejects a targeted one, so a column
 // added later must land after everything both sides already agree on.
 func VecListColumn(col string) string { return "_cf_vec_list_" + col }
-
-// HasVector reports whether a column set carries a vector, which is what decides
-// whether the Iceberg schema gets the cluster column at all. A table without one
-// keeps exactly the schema and the write statements it had.
-func HasVector(cols []Column) bool {
-	for _, c := range cols {
-		if c.IsVector() {
-			return true
-		}
-	}
-	return false
-}
 
 // IsVector reports whether this column's Iceberg storage is a list of floats,
 // which is how a pgvector vector/halfvec is stored.
@@ -167,116 +147,6 @@ func (c ViewConfig) fqHot() string {
 // an unqualified identifier.
 func (c ViewConfig) hotTable() string {
 	return pgx.Identifier{"_" + c.SourceTable}.Sanitize()
-}
-
-// insertCols returns column names and NEW."col" refs for INSERT.
-// Skips GENERATED ALWAYS AS IDENTITY columns (cannot accept explicit values).
-// No per-type cast: the view exposes each column in its native PG type (jsonb
-// stays jsonb, etc.), so NEW.col arrives at the trigger already matching the
-// underlying _events column type.
-func (c ViewConfig) insertCols() (colList, valList string) {
-	var cols, vals []string
-	for _, col := range c.Columns {
-		if col.IsIdentity {
-			continue
-		}
-		q := pgx.Identifier{col.Name}.Sanitize()
-		cols = append(cols, q)
-		vals = append(vals, "NEW."+q)
-	}
-	return strings.Join(cols, ", "), strings.Join(vals, ", ")
-}
-
-// coldInsertVals returns the format() args for the cold INSERT via
-// duckdb.raw_query(format(...)). Identity columns are excluded (same as hot).
-// Each arg pairs positionally with a %L placeholder from coldInsertPlaceholders.
-//
-//   - VARCHAR-backed rich types (jsonb/json/interval — Type=="VARCHAR" with a
-//     ViewCastType): serialised via ::text, since their Iceberg column is VARCHAR.
-//   - bytea (Type=="BLOB"): emitted as encode(NEW.col,'hex') and wrapped by a
-//     from_hex(%L) placeholder. The cold INSERT goes through %L, which renders a
-//     bytea as PG's '\xcafe' text — which DuckDB then MIS-parses into a BLOB
-//     (\xca → 1 byte, fe → 2 literal bytes = 3 bytes, corruption). Round-tripping
-//     the hex string through DuckDB's from_hex() rebuilds the exact bytes.
-//   - vector (Type=="FLOAT[]"): the view exposes the column as real[], so
-//     NEW.col's text form is PG's {1,2,3}, which DuckDB's list cast rejects.
-//     translate rewrites the delimiters to [1,2,3] and the CAST(%L AS FLOAT[])
-//     placeholder gives it the Iceberg column's type.
-//   - everything else (incl. double precision, whose '2.5' text round-trips
-//     cleanly through DuckDB): NEW.col as-is.
-//
-// This must stay consistent with the archiver's bulk-export path, which writes
-// bytea natively because pg_duckdb scans it directly (no %L stringification).
-// vecListPlaceholder is the leading entry of the positional cold INSERT: the
-// cluster expression when one was fetched, else an unassigned column.
-func (c ViewConfig) vecListPlaceholder() string {
-	if c.VecListExpr != "" {
-		return c.VecListExpr
-	}
-	return "NULL"
-}
-
-// vecListArg is the argument the cluster expression's own placeholder consumes,
-// which is the same value the vector column is written from.
-func (c ViewConfig) vecListArg() string {
-	for _, col := range c.Columns {
-		if col.IsVector() {
-			return "translate(NEW." + pgx.Identifier{col.Name}.Sanitize() + "::text,'{}','[]')"
-		}
-	}
-	return ""
-}
-
-func (c ViewConfig) coldInsertVals() string {
-	var vals []string
-	if HasVector(c.Columns) && c.VecListExpr != "" {
-		vals = append(vals, c.vecListArg())
-	}
-	for _, col := range c.Columns {
-		if col.IsIdentity {
-			continue
-		}
-		q := pgx.Identifier{col.Name}.Sanitize()
-		switch {
-		case col.Type == "BLOB":
-			vals = append(vals, "encode(NEW."+q+",'hex')")
-		case col.IsVector():
-			vals = append(vals, "translate(NEW."+q+"::text,'{}','[]')")
-		case col.Type == "VARCHAR" && col.ViewCastType != "":
-			vals = append(vals, "NEW."+q+"::text")
-		default:
-			vals = append(vals, "NEW."+q)
-		}
-	}
-	return strings.Join(vals, ", ")
-}
-
-// coldInsertPlaceholders returns positional value placeholders for the cold
-// INSERT via PG's format() call.  The cluster column leads, unassigned, whenever
-// the table has a vector: it leads the Iceberg schema and this INSERT is
-// positional.  Identity columns use literal NULL (Iceberg
-// has no sequences); bytea uses from_hex(%L) so DuckDB reconstructs the exact
-// bytes from the hex string (see coldInsertVals); all other columns use %L so
-// format() quotes them safely. DuckDB/Iceberg does not support targeted inserts
-// (INSERT INTO t(col) ...), so we emit a positional INSERT INTO t VALUES (...).
-func (c ViewConfig) coldInsertPlaceholders() string {
-	var ph []string
-	if HasVector(c.Columns) {
-		ph = append(ph, c.vecListPlaceholder())
-	}
-	for _, col := range c.Columns {
-		switch {
-		case col.IsIdentity:
-			ph = append(ph, "NULL")
-		case col.Type == "BLOB":
-			ph = append(ph, "from_hex(%L)")
-		case col.IsVector():
-			ph = append(ph, "CAST(%L AS FLOAT[])")
-		default:
-			ph = append(ph, "%L")
-		}
-	}
-	return strings.Join(ph, ", ")
 }
 
 // GenerateSwapSQL generates the conditional rename of the source table to _{source}.
@@ -375,90 +245,6 @@ func GenerateViewSQL(cfg ViewConfig) string {
 		coldColKey, cutoff)
 }
 
-// GenerateTriggerFuncSQL generates the INSTEAD OF INSERT trigger function for
-// the unified view. Hot inserts go to _{source}; cold inserts are forwarded
-// to Iceberg via duckdb.raw_query. UPDATE/DELETE are handled by the
-// coldfront C extension's post_parse_analyze_hook rewrite, not this trigger.
-func GenerateTriggerFuncSQL(cfg ViewConfig) string {
-	funcName := pgx.Identifier{"coldfront", cfg.SourceTable + "_write"}.Sanitize()
-	fqHot := cfg.fqHot()
-	col := pgx.Identifier{cfg.PartitionColumn}.Sanitize()
-
-	cutoff := "'-infinity'::timestamptz"
-	if cfg.hasCutoff() {
-		cutoff = fmt.Sprintf("'%s'::timestamptz", cfg.cutoffLiteral())
-	}
-
-	colList, hotVals := cfg.insertCols()
-	coldPlaceholders := cfg.coldInsertPlaceholders()
-	coldVals := cfg.coldInsertVals()
-
-	// Only the cluster lookup reads pglocal, so a table without a vector must not
-	// pay for the attach.
-	attachPG := ""
-	if HasVector(cfg.Columns) {
-		attachPG = "\n      PERFORM coldfront.ensure_pg_attached();"
-	}
-
-	// cfg.IcebergTable is the ref DuckDB parses (not a PG identifier); embed
-	// it in the format() template as-is, apostrophe-escaped so it survives
-	// PG's outer string-literal scan. The placeholders need the same escape for
-	// the same reason: the cluster expression carries the literals that name its
-	// configuration row, and a bare apostrophe there would close the template.
-	iceRef := strings.ReplaceAll(cfg.IcebergTable, "'", "''")
-	coldPlaceholders = strings.ReplaceAll(coldPlaceholders, "'", "''")
-
-	coldStmt := fmt.Sprintf("INSERT INTO %s VALUES (%s)", iceRef, coldPlaceholders)
-
-	return fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s() RETURNS trigger AS $fn$
-DECLARE
-  cutoff timestamptz;
-BEGIN
-  SELECT cutoff_time INTO cutoff FROM coldfront.archive_watermark WHERE schema_name = %s AND table_name = %s;
-  IF cutoff IS NULL THEN
-    cutoff := %s;
-  END IF;
-
-  IF TG_OP = 'INSERT' THEN
-    IF NEW.%s < cutoff THEN
-      PERFORM coldfront.ensure_attached();%s
-      PERFORM duckdb.raw_query(format(
-        '%s',
-        %s
-      ));
-      RETURN NEW;
-    END IF;
-    INSERT INTO %s (%s) VALUES (%s);
-    RETURN NEW;
-  END IF;
-  RETURN NULL;
-END;
-$fn$ LANGUAGE plpgsql`,
-		funcName,
-		sqlutil.Literal(cfg.SourceSchema), sqlutil.Literal(cfg.SourceTable),
-		cutoff,
-		col,
-		attachPG,
-		coldStmt, coldVals,
-		fqHot, colList, hotVals)
-}
-
-// GenerateTriggerSQL generates the DROP + CREATE TRIGGER on the unified view.
-// INSERT-only: UPDATE/DELETE are rewritten by the coldfront hook before
-// they reach the view, so no trigger is needed for those operations.
-func GenerateTriggerSQL(cfg ViewConfig) string {
-	trigName := pgx.Identifier{cfg.SourceTable + "_write_trigger"}.Sanitize()
-	viewName := cfg.fqSource()
-	funcName := pgx.Identifier{"coldfront", cfg.SourceTable + "_write"}.Sanitize()
-
-	return fmt.Sprintf(`DROP TRIGGER IF EXISTS %s ON %s;
-CREATE TRIGGER %s
-  INSTEAD OF INSERT ON %s
-  FOR EACH ROW EXECUTE FUNCTION %s()`,
-		trigName, viewName,
-		trigName, viewName, funcName)
-}
-
 // GenerateVecCompanionSQL adds each vector column's generated real[] companion to
 // the hot table. Empty when no column needs one.
 //
@@ -492,15 +278,16 @@ func GenerateVectorOpsSQL(cfg ViewConfig) string {
 	return ""
 }
 
-// Recreate performs the table→view swap (if needed) and recreates the view + triggers.
+// Recreate performs the table→view swap (if needed) and recreates the view. The
+// INSTEAD OF INSERT trigger is not built here: coldfront._rebuild_write_trigger
+// is its one generator, and the archiver calls it after registering the view,
+// since the builder reads the registry.
 func (g *Generator) Recreate(ctx context.Context, cfg ViewConfig) error {
 	stmts := []string{
 		GenerateSwapSQL(cfg),
 		GenerateVecCompanionSQL(cfg), // after the swap: it targets the renamed hot table
 		GenerateVectorOpsSQL(cfg),
 		GenerateViewSQL(cfg),
-		GenerateTriggerFuncSQL(cfg),
-		GenerateTriggerSQL(cfg),
 	}
 	for _, sql := range stmts {
 		if sql == "" {

@@ -633,10 +633,6 @@ func (ac *archiveCycle) bootstrapTieredView(ctx context.Context, columns []view.
 		return fmt.Errorf("get watermark: %w", err)
 	}
 	ac.wmCutoff, ac.haveWM = wmCutoff, found // the cycle-start snapshot; see archiveCycle
-	vecExpr, err := vecListExpr(ctx, ac.conn, t, columns)
-	if err != nil {
-		return err
-	}
 	bootstrapCfg := view.ViewConfig{
 		SourceSchema:    t.SourceSchema,
 		SourceTable:     t.SourceTable,
@@ -644,7 +640,6 @@ func (ac *archiveCycle) bootstrapTieredView(ctx context.Context, columns []view.
 		CutoffTime:      wmCutoff,
 		PartitionColumn: t.PartitionColumn,
 		Columns:         columns,
-		VecListExpr:     vecExpr,
 	}
 	if err := ac.viewGen.Recreate(ctx, bootstrapCfg); err != nil {
 		return fmt.Errorf("bootstrap view: %w", err)
@@ -653,6 +648,14 @@ func (ac *archiveCycle) bootstrapTieredView(ctx context.Context, columns []view.
 	if err := registerTieredView(ctx, ac.conn, t.SourceSchema, t.SourceTable,
 		hotTable, iceTable, t.PartitionColumn, vectorColumns(columns)); err != nil {
 		return fmt.Errorf("register tiered view: %w", err)
+	}
+	// The INSTEAD OF INSERT trigger, from the extension's one builder. After the
+	// registration, because the builder reads the registry for the hot table, the
+	// Iceberg ref and the vector columns.
+	if _, err := ac.conn.Exec(ctx,
+		"SELECT coldfront._rebuild_write_trigger($1, $2)",
+		t.SourceSchema, t.SourceTable); err != nil {
+		return fmt.Errorf("build write trigger: %w", err)
 	}
 	return nil
 }
@@ -1039,10 +1042,6 @@ func archiveExport(ctx context.Context, conn *pgx.Conn, t *config.TableConfig,
 func archiveCutover(ctx context.Context, conn *pgx.Conn, t *config.TableConfig,
 	part partition.Info, iceTable, snapshotStr string, columns []view.Column,
 ) error {
-	vecExpr, err := vecListExpr(ctx, conn, t, columns)
-	if err != nil {
-		return err
-	}
 	viewCfg := view.ViewConfig{
 		SourceSchema:    t.SourceSchema,
 		SourceTable:     t.SourceTable,
@@ -1050,7 +1049,6 @@ func archiveCutover(ctx context.Context, conn *pgx.Conn, t *config.TableConfig,
 		CutoffTime:      part.UpperBound,
 		PartitionColumn: t.PartitionColumn,
 		Columns:         columns,
-		VecListExpr:     vecExpr,
 	}
 	viewDDL := view.GenerateViewSQL(viewCfg)
 
@@ -1209,30 +1207,6 @@ func wipeIcebergRange(ctx context.Context, conn *pgx.Conn, iceTable, partCol str
 // scannable form on the hot table. coldfront._vec_companion derives the same name
 // for the SQL-side view rebuild; the two have to agree.
 func vecCompanion(col string) string { return "_cf_vec_" + col }
-
-// vecListExpr asks the extension for the expressions that assign a cluster from the
-// values the generated trigger writes the vectors from, so the trigger emits the
-// same derivation every other cold write path does. One per vector column, comma
-// separated and ready to lead the positional VALUES list; "" when the table has no
-// vector.
-func vecListExpr(ctx context.Context, conn *pgx.Conn, t *config.TableConfig, columns []view.Column) (string, error) {
-	vecCols := vectorColumns(columns)
-	if len(vecCols) == 0 {
-		return "", nil
-	}
-	placeholders := make([]string, len(vecCols))
-	for i := range vecCols {
-		placeholders[i] = "CAST(%L AS FLOAT[])"
-	}
-	var prefix string
-	if err := conn.QueryRow(ctx,
-		"SELECT coldfront._vec_list_prefix($1, $2, $3, $4)",
-		t.SourceSchema, t.SourceTable, vecCols, placeholders,
-	).Scan(&prefix); err != nil {
-		return "", fmt.Errorf("cluster expression: %w", err)
-	}
-	return strings.TrimSuffix(prefix, ", "), nil
-}
 
 // vecLayoutProps asks the extension for the CREATE TABLE properties a clustered
 // table needs, or "" when the table has no vector. The values live in the

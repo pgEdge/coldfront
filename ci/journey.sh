@@ -969,6 +969,35 @@ EOSQL
     local NEAR; NEAR=$(q "$HOST" "SET coldfront.vector_nprobe = 1; SELECT body FROM chunks ORDER BY embedding <=> ARRAY[4,5.5,-6]::real[] LIMIT 3;" | grep -vx SET | grep -c '^coldins$' || true)
     assert_eq "a probed search still finds an unassigned row"  "1" "$NEAR"
 
+    # Grouping, aggregates, windows and DISTINCT ride the same narrowed scan: the
+    # probe rewrites the statement they sit in, and everything in it computes over
+    # the rows the probe reads. At an exhaustive probe each answers exactly what it
+    # answers with the probe off, which also proves the rewrite round-trips these
+    # shapes through deparse and reparse.
+    local shapes=(
+        "SELECT body FROM chunks GROUP BY body, embedding ORDER BY embedding <=> ARRAY[$FARCENT]::real[] LIMIT 100"
+        "SELECT count(*)::text FROM chunks GROUP BY embedding ORDER BY embedding <=> ARRAY[$FARCENT]::real[] LIMIT 100"
+        "SELECT body || '/' || (rank() OVER (ORDER BY embedding <=> ARRAY[$FARCENT]::real[]))::text FROM chunks ORDER BY embedding <=> ARRAY[$FARCENT]::real[] LIMIT 100"
+        "SELECT DISTINCT body, embedding <=> ARRAY[$FARCENT]::real[] AS d FROM chunks ORDER BY d LIMIT 100"
+    )
+    local names=("a grouped search" "an aggregated search" "a windowed search" "a DISTINCT search")
+    local si exact probed np
+    for si in 0 1 2 3; do
+        exact=$(q "$HOST"  "SET coldfront.vector_probe = off; ${shapes[$si]};" | grep -vx SET | sort | tr '\n' ' ')
+        probed=$(q "$HOST" "SET coldfront.vector_nprobe = 2; ${shapes[$si]};"  | grep -vx SET | sort | tr '\n' ' ')
+        assert_eq "${names[$si]} answers exactly at an exhaustive probe" "$exact" "$probed"
+        # Without this, the equality above passes vacuously when the shape is
+        # declined: both arms would be the same exact scan.
+        np=$(q "$HOST" "SET coldfront.vector_nprobe = 1; EXPLAIN (COSTS OFF, VERBOSE) ${shapes[$si]};" | grep -c "cf_vec_list" || true)
+        assert_gt "${names[$si]} carries the probe predicate" "0" "$np"
+    done
+    # And the probe is on the scan, not on the grouping: narrowed, the grouped
+    # search reads the same rows the plain one does.
+    local GN PN
+    GN=$(q "$HOST" "SET coldfront.vector_nprobe = 1; ${shapes[0]};" | grep -vx SET | sort | tr '\n' ' ')
+    PN=$(q "$HOST" "SET coldfront.vector_nprobe = 1; $topk LIMIT 100;" | grep -vx SET | sort | tr '\n' ' ')
+    assert_eq "a narrowed grouped search reads the plain search's rows" "$PN" "$GN"
+
     # Decoupled: no hot arm, so the predicate becomes the whole of the cold arm's
     # WHERE rather than an addition to a cutoff qual — the other branch of
     # coldfront._vec_probed_viewdef. Row 1 predates the generation and row 2 sits in
@@ -4671,7 +4700,7 @@ if [ "$MODE" = "tiered" ]; then
     story_types
     story_vector            # embeddings: vector → list<float> over all three cold-write paths
     story_writes
-    story_compaction        # iceberg-go RewriteDataFiles, now that the manifest-list
+    story_compaction        # iceberg-go RewriteDataFiles; the manifest-list
                             # format-version interop patch makes the cold tier's
                             # manifests iceberg-go-readable
     story_maintenance       # iceberg-go ExpireSnapshots + DeleteOrphanFiles — reclaim the

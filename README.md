@@ -182,7 +182,7 @@ pgedge-coldfront/
 │   ├── partcfg/                ← in-DB, Spock-replicated per-table lifecycle config
 │   ├── partition/              ← partition create/find/detach/drop (time + id modes)
 │   ├── sqlutil/                ← shared SQL helpers
-│   ├── view/                   ← unified view + trigger generation
+│   ├── view/                   ← unified view generation
 │   └── watermark/              ← archive_watermark table CRUD
 ├── extension/coldfront/        ← PGXS C extension (DML hooks, bakery, registry, SQL)
 ├── ci/
