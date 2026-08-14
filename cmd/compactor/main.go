@@ -16,6 +16,7 @@ import (
 	"flag"
 	"fmt"
 	"os"
+	"path/filepath"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -52,7 +53,13 @@ func main() {
 	keepFiles := flag.Bool("expire-keep-files", false, "with --expire-snapshots: expire metadata only, leave freed files for an --orphans pass (iceberg-go WithPostCommit(false))")
 	orphans := flag.Bool("orphans", false, "also delete orphan files (under the table location, referenced by no retained snapshot)")
 	orphanAge := flag.Duration("orphan-age", 72*time.Hour, "with --orphans: only delete files older than this (in-flight-write safety; never 0 in production)")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("%s %s (built %s)\n", filepath.Base(os.Args[0]), Version, BuildTime)
+		return
+	}
 
 	if *cfgPath == "" || *tableName == "" {
 		fmt.Fprintln(os.Stderr, "usage: compactor --config <yaml> --table <name> [--target-size-mb N] [--dry-run]"+

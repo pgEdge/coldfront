@@ -14,6 +14,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -23,6 +24,7 @@ import (
 	"github.com/pgedge/coldfront/internal/config"
 	"github.com/pgedge/coldfront/internal/partcfg"
 	"github.com/pgedge/coldfront/internal/partition"
+	"github.com/pgedge/coldfront/internal/version"
 )
 
 // reconcileFailed logs a reconcile error and reports whether it should fail the
@@ -48,7 +50,12 @@ func main() {
 	}
 
 	cfgPath := flag.String("config", "", "path to the YAML config file")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
+	if *showVersion {
+		fmt.Printf("%s %s (built %s)\n", filepath.Base(os.Args[0]), version.Version, version.BuildTime)
+		return
+	}
 	if *cfgPath == "" {
 		log.Fatal("--config is required")
 	}

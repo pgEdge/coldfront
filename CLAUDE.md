@@ -54,7 +54,7 @@
   - Release tags use 3-part SemVer (`vMAJOR.MINOR.PATCH`, e.g. `v1.0.0`). This is required, not stylistic: ColdFront is a Go module (`github.com/pgedge/coldfront`), and the toolchain only treats full `vX.Y.Z` tags as releases — a 2-part `v1.0` tag yields pseudo-versions. Git tags, GitHub releases, container image tags, and the changelog all use this form. The patch field keeps a bugfix-only release (`v1.0.1`) distinct from a feature release (`v1.1.0`).
   - The PostgreSQL extension keeps the conventional 2-part version in `extension/coldfront/coldfront.control` (`default_version`) and the `coldfront--X.Y.sql` / `coldfront--X.Y--X.Z.sql` upgrade-script filenames, per PG convention. Extension `1.0` ships inside release `v1.0.0`; a patch release may carry the same extension version or bump it with an upgrade script when the SQL changes.
 - Build 4 static binaries per release: linux-amd64, linux-arm64, darwin-amd64, darwin-arm64
-- Build command: `CGO_ENABLED=0 go build -ldflags="-s -w"`
+- Build command: `CGO_ENABLED=0 go build -ldflags="-s -w -X github.com/pgedge/coldfront/internal/version.Version=$TAG -X ...version.BuildTime=$(date -u +%Y-%m-%dT%H:%M:%SZ)"` (the compactor stamps `-X main.Version` / `-X main.BuildTime`); `make build` derives the stamp from `git describe`
 - Release notes format: `## Added` / `## Changed` / `## Fixed`
   - Only list user-facing changes — no internal test additions, no same-cycle fix churn
   - `## Fixed` is for bugs that existed in the previous release, not things broken and fixed in the same cycle

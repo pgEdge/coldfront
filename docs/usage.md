@@ -124,6 +124,9 @@ Run the archiver (typically via cron):
 ./bin/archiver --config config.yaml
 ```
 
+`--version` prints the build's version (the release tag, or the commit it was
+built from) and exits; the partitioner and compactor accept the same flag.
+
 The first run renames `events` → `_events`, creates the unified view
 `events`, and registers it. From then on every cycle (1) tiers
 partitions older than `hot_period` from hot PG to cold Iceberg and

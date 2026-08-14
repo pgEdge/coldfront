@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -23,6 +24,7 @@ import (
 	"github.com/pgedge/coldfront/internal/partcfg"
 	"github.com/pgedge/coldfront/internal/partition"
 	"github.com/pgedge/coldfront/internal/sqlutil"
+	"github.com/pgedge/coldfront/internal/version"
 	"github.com/pgedge/coldfront/internal/view"
 	"github.com/pgedge/coldfront/internal/watermark"
 )
@@ -51,7 +53,13 @@ func main() {
 		"sleep this long after Phase 2 (capture+bulk-export) and before Phase 3 "+
 			"(replay+cutover). Test-only knob to widen the window so concurrent "+
 			"writes deterministically race into the capture trigger.")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("%s %s (built %s)\n", filepath.Base(os.Args[0]), version.Version, version.BuildTime)
+		return
+	}
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {

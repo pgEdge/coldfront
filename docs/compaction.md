@@ -37,6 +37,7 @@ each reclaims:
 | `--expire-keep-files` | off | expire metadata only; leave the freed files for an `--orphans` pass |
 | `--orphans` | off | delete files under the table location that no retained snapshot references |
 | `--orphan-age D` | 72h | with `--orphans`: only delete files older than D - protects in-flight writes; never set 0 in production |
+| `--version` |  | print the version and exit |
 | `--dry-run` | off | report what each step would do; change nothing |
 
 Compaction always runs (a no-op when nothing is below target);
