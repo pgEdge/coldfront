@@ -37,6 +37,76 @@ var testCfg = ViewConfig{
 	},
 }
 
+// A tiered table carrying an embedding. The view exposes the column as real[],
+// so that is what NEW.embedding is inside the INSTEAD OF trigger.
+var vectorCfg = ViewConfig{
+	SourceSchema:    "public",
+	SourceTable:     "chunks",
+	IcebergTable:    "ice.default.chunks",
+	CutoffTime:      time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC),
+	PartitionColumn: "ts",
+	Columns: []Column{
+		{Name: "id", Type: "BIGINT", IsPK: true},
+		{Name: "ts", Type: "TIMESTAMPTZ"},
+		{Name: "embedding", Type: "FLOAT[]", ViewCastType: "real[]"},
+	},
+}
+
+// pg_duckdb rejects a pgvector column while it builds the plan, before any cast in
+// the projection can apply, so the hot table carries a generated real[] companion
+// and the hot branch reads that under the user's own column name. The view still
+// exposes one embedding column, and the companion is never a column of the view.
+func TestGenerateViewSQL_VectorHotSourceIsTheCompanion(t *testing.T) {
+	cfg := vectorCfg
+	cfg.Columns = []Column{
+		{Name: "id", Type: "BIGINT", IsPK: true},
+		{Name: "ts", Type: "TIMESTAMPTZ"},
+		{Name: "embedding", Type: "FLOAT[]", ViewCastType: "real[]", HotSource: "_cf_vec_embedding"},
+	}
+	sql := GenerateViewSQL(cfg)
+	assert.Contains(t, sql, `"_cf_vec_embedding"::real[] AS "embedding"`,
+		"hot branch reads the companion, aliased to the user's column name")
+	assert.NotContains(t, sql, `"embedding"::real[] FROM`,
+		"the pgvector column itself must not be scanned")
+	assert.Contains(t, sql, "r['embedding']::real[]", "the cold branch is unchanged")
+}
+
+// A column without a HotSource is read by its own name, which is every column that
+// is not a vector.
+func TestGenerateViewSQL_NoHotSourceReadsItsOwnName(t *testing.T) {
+	assert.Contains(t, GenerateViewSQL(testCfg), `"status"::VARCHAR`)
+}
+
+// The distance operators are installed only for a table that carries a vector.
+func TestGenerateVectorOpsSQL(t *testing.T) {
+	cfg := vectorCfg
+	assert.Equal(t, "SELECT coldfront.install_vector_ops()", GenerateVectorOpsSQL(cfg))
+	assert.Equal(t, "", GenerateVectorOpsSQL(testCfg), "no vector column, no operators")
+}
+
+// The companion is added to the renamed hot table, idempotently, and only for a
+// column that needs one.
+func TestGenerateVecCompanionSQL(t *testing.T) {
+	cfg := vectorCfg
+	cfg.Columns = []Column{
+		{Name: "id", Type: "BIGINT"},
+		{Name: "embedding", Type: "FLOAT[]", ViewCastType: "real[]", HotSource: "_cf_vec_embedding"},
+	}
+	sql := GenerateVecCompanionSQL(cfg)
+	assert.Contains(t, sql, `ALTER TABLE "public"."_chunks" ADD COLUMN IF NOT EXISTS "_cf_vec_embedding" real[]`)
+	assert.Contains(t, sql, `GENERATED ALWAYS AS ("embedding"::real[]) STORED`)
+	assert.Equal(t, "", GenerateVecCompanionSQL(testCfg), "no vector column, no companion")
+}
+
+// The view exposes real[] on both branches: FLOAT[] would parse in PG as
+// double precision[] and the two branches would disagree.
+func TestGenerateViewSQL_VectorSurfaceIsRealArray(t *testing.T) {
+	sql := GenerateViewSQL(vectorCfg)
+	assert.Contains(t, sql, `"embedding"::real[]`, "hot side casts to real[]")
+	assert.Contains(t, sql, "r['embedding']::real[]", "cold side casts to real[]")
+	assert.NotContains(t, sql, "::FLOAT[]", "FLOAT[] is double precision[] in PG")
+}
+
 func TestGenerateSwapSQL(t *testing.T) {
 	sql := GenerateSwapSQL(testCfg)
 	// Identifier positions are double-quoted; literal-string positions keep
@@ -73,29 +143,6 @@ func TestGenerateViewSQL_NoCutoff(t *testing.T) {
 	assert.NotContains(t, sql, "UNION ALL")
 }
 
-// Trigger is INSERT-only: the C extension handles UPDATE/DELETE via CTE rewrite.
-func TestGenerateTriggerFuncSQL_InsertOnly(t *testing.T) {
-	sql := GenerateTriggerFuncSQL(testCfg)
-	assert.Contains(t, sql, `CREATE OR REPLACE FUNCTION "coldfront"."events_write"`)
-	assert.Contains(t, sql, "RETURNS trigger")
-	assert.Contains(t, sql, "TG_OP = 'INSERT'")
-	assert.NotContains(t, sql, "TG_OP = 'UPDATE'")
-	assert.NotContains(t, sql, "TG_OP = 'DELETE'")
-}
-
-// Cold INSERT routes to duckdb.raw_query, not RAISE EXCEPTION.
-func TestGenerateTriggerFuncSQL_ColdInsertRoutesToRawQuery(t *testing.T) {
-	sql := GenerateTriggerFuncSQL(testCfg)
-	assert.Contains(t, sql, "duckdb.raw_query")
-	assert.NotContains(t, sql, "RAISE EXCEPTION")
-	assert.NotContains(t, sql, "Cannot insert into archived range")
-	// Cold INSERT must reference the Iceberg table
-	assert.Contains(t, sql, "ice.default.events")
-	// jsonb must be serialized to text on the cold-INSERT path (Iceberg
-	// stores jsonb as VARCHAR). Independent of the view's read-side cast.
-	assert.Contains(t, sql, `NEW."data"::text`)
-}
-
 // nativeCfg has columns whose Iceberg storage is NATIVE (BLOB / DOUBLE) but
 // which carry a ViewCastType only for the view's PG-parseable hot-side cast.
 var nativeCfg = ViewConfig{
@@ -112,19 +159,28 @@ var nativeCfg = ViewConfig{
 	},
 }
 
-// Cold-INSERT serialises each value through format()'s %L. bytea must go
-// through from_hex(encode(NEW.col,'hex')) — %L renders a bytea as PG's '\xcafe'
-// text which DuckDB mis-parses into a BLOB; round-tripping the hex string
-// rebuilds the exact bytes. double precision round-trips fine as '2.5' text, so
-// it stays native (no ::text). Only VARCHAR-backed json is ::text-serialised.
-func TestGenerateTriggerFuncSQL_ColdInsertBlobViaFromHex(t *testing.T) {
-	sql := GenerateTriggerFuncSQL(nativeCfg)
-	assert.Contains(t, sql, "from_hex(%L)", "bytea placeholder rebuilds bytes in DuckDB")
-	assert.Contains(t, sql, `encode(NEW."blob",'hex')`, "bytea value is sent as hex")
-	assert.NotContains(t, sql, `NEW."blob"::text`, "bytea must not be ::text-stringified")
-	assert.Contains(t, sql, `NEW."amt"`, "double inserted as-is (text round-trips)")
-	assert.NotContains(t, sql, `NEW."amt"::text`, "double needs no ::text")
-	assert.Contains(t, sql, `NEW."doc"::text`, "json IS VARCHAR-backed; serialise to text")
+// Only two storage forms need a PG-side cast on the way out to pg_duckdb: the
+// VARCHAR-backed rich types and the vector. Everything else exports as-is, and
+// a ViewCastType alone does not imply a cast (bytea and double carry one purely
+// so the view has a PG-parseable spelling).
+func TestColumn_ExportCast(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		col  Column
+		want string
+	}{
+		{"jsonb is VARCHAR-backed", Column{Type: "VARCHAR", ViewCastType: "json"}, "text"},
+		{"interval is VARCHAR-backed", Column{Type: "VARCHAR", ViewCastType: "interval"}, "text"},
+		{"plain text needs nothing", Column{Type: "VARCHAR"}, ""},
+		{"bytea exports as bytes", Column{Type: "BLOB", ViewCastType: "bytea"}, ""},
+		{"double exports as-is", Column{Type: "DOUBLE", ViewCastType: "double precision"}, ""},
+		{"integer exports as-is", Column{Type: "INTEGER"}, ""},
+		{"vector exports as real[]", Column{Type: "FLOAT[]", ViewCastType: "real[]"}, "real[]"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.col.ExportCast())
+		})
+	}
 }
 
 // The view casts BLOB→bytea / DOUBLE→double precision on BOTH UNION branches
@@ -157,126 +213,17 @@ func TestGenerateViewSQL_BootstrapMatchesCutoverHotCasts(t *testing.T) {
 	}
 }
 
-// Cold INSERT checks the watermark before routing.
-func TestGenerateTriggerFuncSQL_ColdInsertWatermarkCheck(t *testing.T) {
-	sql := GenerateTriggerFuncSQL(testCfg)
-	assert.Contains(t, sql, "archive_watermark")
-	assert.Contains(t, sql, "schema_name = 'public'") // watermark lookup is schema-scoped
-	assert.Contains(t, sql, `NEW."ts" < cutoff`)
-}
-
-// Hot INSERT still goes to _events.
-func TestGenerateTriggerFuncSQL_HotInsert(t *testing.T) {
-	sql := GenerateTriggerFuncSQL(testCfg)
-	assert.Contains(t, sql, `INSERT INTO "public"."_events"`)
-	// INSERT column list excludes the identity column
-	assert.Contains(t, sql, `"ts", "status", "data"`)
-	// NEW.data arrives as jsonb natively (view exposes jsonb now), so no
-	// cast is needed on the hot-INSERT path.
-	assert.Contains(t, sql, `NEW."ts", NEW."status", NEW."data"`)
-	assert.NotContains(t, sql, `NEW."data"::jsonb`, "NEW.data already jsonb, redundant cast removed")
-	assert.NotContains(t, sql, `NEW."id"`)
-}
-
-// Non-identity, non-PK column named `id`: included in INSERT col list.
-func TestGenerateTriggerFuncSQL_IdIsNotIdentity(t *testing.T) {
-	cfg := ViewConfig{
-		SourceSchema:    "public",
-		SourceTable:     "events",
-		IcebergTable:    "ice.default.events",
-		CutoffTime:      time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC),
-		PartitionColumn: "ts",
-		Columns: []Column{
-			{Name: "event_id", Type: "UUID", IsPK: true},
-			{Name: "id", Type: "BIGINT"},
-			{Name: "ts", Type: "TIMESTAMPTZ"},
-			{Name: "status", Type: "VARCHAR"},
-		},
-	}
-	sql := GenerateTriggerFuncSQL(cfg)
-	assert.Contains(t, sql, `"event_id", "id", "ts", "status"`)
-	assert.Contains(t, sql, `NEW."event_id", NEW."id", NEW."ts", NEW."status"`)
-}
-
-// Composite PK: identity column excluded from INSERT col list.
-func TestGenerateTriggerFuncSQL_CompositePK(t *testing.T) {
-	cfg := ViewConfig{
-		SourceSchema:    "public",
-		SourceTable:     "events",
-		IcebergTable:    "ice.default.events",
-		CutoffTime:      time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC),
-		PartitionColumn: "ts",
-		Columns: []Column{
-			{Name: "tenant_id", Type: "INTEGER", IsPK: true},
-			{Name: "event_id", Type: "BIGINT", IsPK: true, IsIdentity: true},
-			{Name: "ts", Type: "TIMESTAMPTZ"},
-			{Name: "status", Type: "VARCHAR"},
-		},
-	}
-	sql := GenerateTriggerFuncSQL(cfg)
-	assert.Contains(t, sql, `"tenant_id", "ts", "status"`)
-	assert.NotContains(t, sql, `NEW."event_id"`)
-}
-
-// No PK: all non-identity columns in INSERT col list.
-func TestGenerateTriggerFuncSQL_NoPK(t *testing.T) {
-	cfg := ViewConfig{
-		SourceSchema:    "public",
-		SourceTable:     "events",
-		IcebergTable:    "ice.default.events",
-		CutoffTime:      time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC),
-		PartitionColumn: "ts",
-		Columns: []Column{
-			{Name: "ts", Type: "TIMESTAMPTZ"},
-			{Name: "status", Type: "VARCHAR"},
-		},
-	}
-	sql := GenerateTriggerFuncSQL(cfg)
-	assert.Contains(t, sql, `"ts", "status"`)
-	assert.NotContains(t, sql, `"id"`)
-}
-
-// Identity without PK: excluded from INSERT, trigger is still INSERT-only.
-func TestGenerateTriggerFuncSQL_IdentityNoPK(t *testing.T) {
-	cfg := ViewConfig{
-		SourceSchema:    "public",
-		SourceTable:     "events",
-		IcebergTable:    "ice.default.events",
-		CutoffTime:      time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC),
-		PartitionColumn: "ts",
-		Columns: []Column{
-			{Name: "id", Type: "BIGINT", IsIdentity: true},
-			{Name: "ts", Type: "TIMESTAMPTZ"},
-			{Name: "status", Type: "VARCHAR"},
-			{Name: "data", Type: "VARCHAR", ViewCastType: "json"},
-		},
-	}
-	sql := GenerateTriggerFuncSQL(cfg)
-	assert.NotContains(t, sql, `NEW."id"`)
-	assert.Contains(t, sql, `"ts", "status", "data"`)
-}
-
-// Trigger fires on INSERT only — no UPDATE or DELETE.
-func TestGenerateTriggerSQL_InsertOnly(t *testing.T) {
-	sql := GenerateTriggerSQL(testCfg)
-	assert.Contains(t, sql, `DROP TRIGGER IF EXISTS "events_write_trigger" ON "public"."events"`)
-	assert.Contains(t, sql, `CREATE TRIGGER "events_write_trigger"`)
-	assert.Contains(t, sql, `INSTEAD OF INSERT ON "public"."events"`)
-	assert.NotContains(t, sql, "UPDATE")
-	assert.NotContains(t, sql, "DELETE")
-}
-
 func TestRecreate(t *testing.T) {
 	db := &mockDB{}
 	g := NewGenerator(db)
 	err := g.Recreate(context.Background(), testCfg)
 	require.NoError(t, err)
-	require.Len(t, db.execSQL, 4)
+	// Swap and view only: the write trigger is coldfront._rebuild_write_trigger's,
+	// built by the archiver after registration.
+	require.Len(t, db.execSQL, 2)
 	assert.Contains(t, db.execSQL[0], `ALTER TABLE "public"."events" RENAME TO "_events"`)
 	assert.Contains(t, db.execSQL[1], `"public"."_events"`)
 	assert.Contains(t, db.execSQL[1], "iceberg_scan")
-	assert.Contains(t, db.execSQL[2], "CREATE OR REPLACE FUNCTION")
-	assert.Contains(t, db.execSQL[3], "CREATE TRIGGER")
 }
 
 // Complex identifiers: mixed case, hyphens, reserved keywords, embedded

@@ -48,11 +48,13 @@
 #include "executor/executor.h"
 #include "executor/spi.h"
 #include "lib/stringinfo.h"
+#include "nodes/makefuncs.h"
 #include "nodes/parsenodes.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/pg_list.h"
 #include "optimizer/optimizer.h"
 #include "parser/analyze.h"
+#include "parser/parsetree.h"
 #include "tcop/tcopprot.h"
 #include "tcop/utility.h"
 #include "utils/builtins.h"
@@ -191,6 +193,16 @@ static bool coldfront_allow_mixed_writes = true;
 static int  coldfront_cold_write_batch_size = 10000;
 
 /*
+ * GUCs: the two levers over a probed vector search. Off gives the exact scan the
+ * product performed before there was a layout to probe, and a positive nprobe
+ * overrides the table's configured one. Both exist because the acceptance test for
+ * the rewrite is that the same query answers identically with the probe disabled
+ * and with it exhaustive, which needs a way to say each in one session.
+ */
+static bool coldfront_vector_probe  = true;
+static int  coldfront_vector_nprobe = 0;
+
+/*
  * GUCs: the deployment-config endpoint/DSN strings that ensure_attached() /
  * ensure_pg_attached() feed to DuckDB's ATTACH. Those helpers are SECURITY
  * DEFINER (they must run elevated so the side-loaded iceberg/postgres
@@ -235,8 +247,20 @@ typedef struct {
     char        *partition_col;   /* e.g. "ts"; NULL when is_iceberg_only */
     bool         has_cutoff;      /* false → nothing archived yet */
     bool         is_iceberg_only; /* true → table lives entirely in Iceberg, no hot tier */
+    bool         has_vector;      /* the table carries clustered vector columns;
+                                   * which ones is SQL's to answer (per-column
+                                   * lookups keyed on the ref or the query). */
     TimestampTz  cutoff;          /* archive watermark            */
 } TieredViewInfo;
+
+static char *insert_targetlist_collist(Query *query);
+static const char *skip_leading_collist(const char *rest);
+static char *build_iceberg_only_insert_with_cluster(Query *query,
+                                                   TieredViewInfo *info,
+                                                   const char *source,
+                                                   const char *col_list);
+static char *add_cluster_set_item(Query *query, RangeTblEntry *rte,
+                                  TieredViewInfo *info, const char *cold_dml);
 
 /*
  * Which tier a DML statement targets, based on its WHERE clause predicate on
@@ -268,7 +292,7 @@ lookup_tiered_view(Oid relid, const char *vname, TieredViewInfo *info)
     initStringInfo(&sql);
     appendStringInfo(&sql,
         "SELECT tv.hot_table, tv.iceberg_table, tv.partition_col, "
-        "       tv.is_iceberg_only, aw.cutoff_time "
+        "       tv.is_iceberg_only, aw.cutoff_time, tv.vec_columns IS NOT NULL "
         "FROM coldfront.tiered_views tv "
         "LEFT JOIN coldfront.archive_watermark aw ON aw.table_name = %s "
         "WHERE tv.schema_name = %s AND tv.relname = %s",
@@ -301,6 +325,9 @@ lookup_tiered_view(Oid relid, const char *vname, TieredViewInfo *info)
         info->has_cutoff = !isnull;
         if (!isnull)
             info->cutoff = DatumGetTimestampTz(d);
+
+        d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 6, &isnull);
+        info->has_vector = !isnull && DatumGetBool(d);
 
         MemoryContextSwitchTo(oldcxt);
         found = true;
@@ -649,7 +676,9 @@ classify_tier(Query *query, TieredViewInfo *info)
 
 /* ---------- string helpers -------------------------------------------- */
 
-typedef struct { const char *pg; const char *duck; } CfSubst;
+/* drop_typmod: after substituting, skip a following "(...)" so a typmod that is
+ * valid on the PG spelling but not on the DuckDB one does not survive. */
+typedef struct { const char *pg; const char *duck; bool drop_typmod; } CfSubst;
 
 /*
  * Cold-WRITE substitutions. The deparsed cold DML is handed to DuckDB inside a
@@ -662,13 +691,19 @@ typedef struct { const char *pg; const char *duck; } CfSubst;
  * json_set) errors in DuckDB — its boundary, not a rewrite coldfront withholds.
  */
 static const CfSubst cf_write_subst[] = {
-    { "::timestamp with time zone",    "::timestamptz" },
-    { "::timestamp without time zone", "::timestamp"   },
-    { "::character varying",           "::varchar"     },
-    { "::double precision",            "::double"      },
-    { "jsonb_build_object(",           "json_object("  },
-    { "jsonb_build_array(",            "json_array("   },
-    { "to_jsonb(",                     "to_json("      },
+    { "::timestamp with time zone",    "::timestamptz", false },
+    { "::timestamp without time zone", "::timestamp",   false },
+    { "::character varying",           "::varchar",     false },
+    { "::double precision",            "::double",      false },
+    /* pgvector's types are unknown to DuckDB, and the Iceberg column is FLOAT[].
+     * The dimension typmod goes with the name: FLOAT[](3) is not a type. The
+     * cast's operand is already bracketed here, since a vector Const deparses
+     * through pgvector's own output function. */
+    { "::vector",                      "::FLOAT[]",     true  },
+    { "::halfvec",                     "::FLOAT[]",     true  },
+    { "jsonb_build_object(",           "json_object(",  false },
+    { "jsonb_build_array(",            "json_array(",   false },
+    { "to_jsonb(",                     "to_json(",      false },
 };
 
 /*
@@ -684,8 +719,8 @@ static const CfSubst cf_write_subst[] = {
  * verified identical ([10,20,30]→3, []→0) and exists in both.
  */
 static const CfSubst cf_read_subst[] = {
-    { "::jsonb",             "::json"             },
-    { "jsonb_array_length(", "json_array_length(" },
+    { "::jsonb",             "::json",             false },
+    { "jsonb_array_length(", "json_array_length(", false },
 };
 
 /*
@@ -753,6 +788,13 @@ cf_apply_subst(const char *sql, const CfSubst *map, int map_len, bool jsonb_catc
                 {
                     appendStringInfoString(&buf, map[i].duck);
                     p += plen;
+                    if (map[i].drop_typmod && *p == '(')
+                    {
+                        while (*p && *p != ')')
+                            p++;
+                        if (*p == ')')
+                            p++;
+                    }
                     replaced = true;
                     break;
                 }
@@ -917,6 +959,26 @@ deparse_and_find_prefix(Query *query, DeparseResult *dr)
 }
 
 /*
+ * Prepend the statement's leading WITH clause (dr->head_len bytes, before the
+ * verb) to a row source. Emitters that wrap the source in a parenthesised
+ * derived table need this: that subquery is the only scope the CTEs are
+ * visible from, on either engine. Returns source unchanged when there is no
+ * leading clause.
+ */
+static const char *
+fold_leading_with(const DeparseResult *dr, const char *source)
+{
+    StringInfoData sb;
+
+    if (dr->head_len == 0)
+        return source;
+    initStringInfo(&sb);
+    appendBinaryStringInfo(&sb, dr->orig_sql, dr->head_len);
+    appendStringInfoString(&sb, source);
+    return sb.data;
+}
+
+/*
  * Build a DML string targeting info->hot_table. Preserves any RETURNING.
  */
 static char *
@@ -936,13 +998,31 @@ build_hot_dml(DeparseResult *dr, TieredViewInfo *info)
  * deparse_and_find_prefix(), so no RETURNING clause appears in dr->rest.
  */
 static char *
-build_cold_dml(DeparseResult *dr, TieredViewInfo *info)
+build_cold_dml(DeparseResult *dr, TieredViewInfo *info, Query *query)
 {
     StringInfoData buf;
+    char          *sql;
+
     initStringInfo(&buf);
     appendBinaryStringInfo(&buf, dr->orig_sql, dr->head_len);  /* leading WITH, if any */
     appendStringInfo(&buf, "%s%s %s", dr->verb, info->iceberg_table, dr->rest);
-    return normalize_casts_for_duckdb(buf.data);
+    sql = normalize_casts_for_duckdb(buf.data);
+
+    /* A cold UPDATE that sets the embedding re-derives the cluster in the same
+     * statement.  Here rather than in a caller because both the cold and the
+     * dual path build their cold half through this one function, and a row whose
+     * embedding changes while its cluster does not is permanently invisible to
+     * its own probe, silently. */
+    if (query != NULL && query->commandType == CMD_UPDATE
+        && info->has_vector)
+    {
+        RangeTblEntry *rte = (RangeTblEntry *) list_nth(query->rtable,
+                                                        query->resultRelation - 1);
+        char *restamped = add_cluster_set_item(query, rte, info, sql);
+        if (restamped != NULL)
+            sql = restamped;
+    }
+    return sql;
 }
 
 /*
@@ -963,7 +1043,9 @@ build_cold_dml(DeparseResult *dr, TieredViewInfo *info)
  * duckdb_target selects value rendering. true: the string reaches
  * duckdb.raw_query (emit_cold / emit_dual / the fast tiered-INSERT path), so it
  * mirrors the INSTEAD-OF trigger's DuckDB literals — bytea -> from_hex(%P$L) /
- * encode($K,'hex'); json/jsonb/interval -> %P$L / $K::text; else %P$L / $K.
+ * encode($K,'hex'); real[] (a vector column's view type) ->
+ * CAST(%P$L AS FLOAT[]) / translate($K::text,'{}','[]');
+ * json/jsonb/interval -> %P$L / $K::text; else %P$L / $K.
  * false: the string is embedded in a PostgreSQL cursor by
  * coldfront._tiered_insert_cold (the slow IDENTITY-omit path), executed by PG
  * not DuckDB. Most params render as plain %P$L / $K (PG coerces by the column
@@ -1026,6 +1108,13 @@ cold_sql_arg(const char *cold_dml, ColdParamSet *ps, bool duckdb_target)
                          * is irrelevant); both targets reconstruct the exact
                          * bytes: DuckDB via from_hex, PG via decode. */
                         appendStringInfo(&args, ", encode($%d,'hex')", id);
+                    else if (duckdb_target && t == FLOAT4ARRAYOID)
+                        /* A vector column reaches this path as real[], the type the
+                         * view exposes. PG spells that {1,2,3} and DuckDB's list
+                         * cast takes [1,2,3], so translate rewrites the delimiters
+                         * and the template supplies the cast. PG's own target needs
+                         * neither: it coerces the literal by the column type. */
+                        appendStringInfo(&args, ", translate($%d::text,'{}','[]')", id);
                     else if (duckdb_target &&
                              (t == JSONOID || t == JSONBOID || t == INTERVALOID))
                         appendStringInfo(&args, ", $%d::text", id);
@@ -1034,6 +1123,8 @@ cold_sql_arg(const char *cold_dml, ColdParamSet *ps, bool duckdb_target)
                 }
                 if (t == BYTEAOID && duckdb_target)
                     appendStringInfo(&tmpl, "from_hex(%%%d$L)", pos_of_id[id - 1]);
+                else if (t == FLOAT4ARRAYOID && duckdb_target)
+                    appendStringInfo(&tmpl, "CAST(%%%d$L AS FLOAT[])", pos_of_id[id - 1]);
                 else if (t == BYTEAOID)
                     /* native PG (the _tiered_insert_cold cursor): rebuild a real
                      * bytea from the hex arg so the projected column is bytea
@@ -1321,7 +1412,21 @@ emit_cold(Query *query, TieredViewInfo *info, ColdParamSet *ps, bool in_plpgsql)
     deparse_and_find_prefix(query, &dr);
     query->returningList = saved_returning;
 
-    cold_dml = build_cold_dml(&dr, info);
+    cold_dml = build_cold_dml(&dr, info, query);
+
+    /* An iceberg-only INSERT into a clustered table is re-emitted so the cluster
+     * is derived in the same statement: a row whose cluster disagrees with its
+     * vector is invisible to its own search and reports no error. */
+    if (query->commandType == CMD_INSERT && info->is_iceberg_only
+        && info->has_vector)
+    {
+        char *col_list = insert_targetlist_collist(query);
+        char *with_cluster = build_iceberg_only_insert_with_cluster(
+            query, info,
+            fold_leading_with(&dr, skip_leading_collist(dr.rest)), col_list);
+        if (with_cluster != NULL)
+            cold_dml = normalize_casts_for_duckdb(with_cluster);
+    }
 
     /* INSERT … SELECT FROM pg_table needs each non-result PG-table
      * reference prefixed with pglocal. so DuckDB can resolve via the
@@ -1395,7 +1500,7 @@ emit_dual(Query *query, TieredViewInfo *info, ColdParamSet *ps, bool in_plpgsql)
     query->returningList = NIL;
     deparse_and_find_prefix(query, &dr_cold);
     query->returningList = saved_returning;
-    cold_dml = build_cold_dml(&dr_cold, info);
+    cold_dml = build_cold_dml(&dr_cold, info, query);
     call = cold_exec_call(info->iceberg_table, cold_sql_arg(cold_dml, ps, true));
 
     initStringInfo(&buf);
@@ -1477,9 +1582,10 @@ skip_leading_collist(const char *rest)
 
 /*
  * Build the cold-side SELECT list for the fast pglocal-streaming path,
- * projecting every underlying-table column in attnum order. DuckDB-
- * iceberg's INSERT is positional and rejects column lists, so we must
- * emit the full tuple.  For each underlying column:
+ * projecting every underlying-table column in attnum order: the cold INSERT
+ * supplies the full tuple, and a PG-side DEFAULT expression exists nowhere in
+ * the Iceberg schema, so whatever fills one fills it here.  For each
+ * underlying column:
  *
  *   - If it appears in the user's INSERT targetList → emit the bare
  *     identifier (gets value from `coldfront_src` alias).
@@ -1527,10 +1633,12 @@ append_cold_projection(StringInfo sel, bool in_target, const char *attname,
 }
 
 static char *
-build_cold_select_list(const char *hot_qualified, List *targeted)
+build_cold_select_list(const char *hot_qualified, const char *iceberg_ref,
+                       List *targeted)
 {
     StringInfoData sql, sel;
     bool           first = true;
+    char          *vec_prefix = NULL;
 
     initStringInfo(&sql);
     appendStringInfo(&sql,
@@ -1543,6 +1651,7 @@ build_cold_select_list(const char *hot_qualified, List *targeted)
         "WHERE n.nspname = (parse_ident(%s))[1] "
         "AND c.relname = (parse_ident(%s))[2] "
         "AND a.attnum > 0 AND NOT a.attisdropped "
+        "AND NOT coldfront._is_vec_companion(a.attname, a.attgenerated) "
         "ORDER BY a.attnum",
         quote_literal_cstr(hot_qualified),
         quote_literal_cstr(hot_qualified));
@@ -1568,10 +1677,30 @@ build_cold_select_list(const char *hot_qualified, List *targeted)
                                        default_expr);
                 first = false;
             }
+            /* The Iceberg schema leads with the cluster column and this INSERT
+             * is positional, so the projection leads with it too.  The
+             * expression comes from the extension rather than being spelled
+             * here: a row whose cluster disagrees with its vector is invisible
+             * to its own search and reports no error, so every write path
+             * derives from one definition.  Still inside the SPI call, and
+             * inside CurTransactionContext, so the result outlives SPI_finish. */
+            {
+                StringInfoData q;
+                initStringInfo(&q);
+                appendStringInfo(&q,
+                    "SELECT coldfront._vec_list_prefix_for_ref(%s, '')",
+                    quote_literal_cstr(iceberg_ref));
+                if (SPI_execute(q.data, true, 1) == SPI_OK_SELECT
+                    && SPI_processed == 1)
+                    vec_prefix = SPI_getvalue(SPI_tuptable->vals[0],
+                                              SPI_tuptable->tupdesc, 1);
+            }
             MemoryContextSwitchTo(oldcxt);
         }
         SPI_finish();
     }
+    if (vec_prefix != NULL)
+        return psprintf("%s%s", vec_prefix, sel.data);
     return sel.data;
 }
 
@@ -1667,6 +1796,176 @@ build_tiered_hot_dml(const char *hot_table, const char *col_list,
 }
 
 /*
+ * Find the statement's own WHERE in deparsed DML: the first " WHERE " at paren
+ * depth zero and outside every literal.  Quotes are tracked before parens
+ * because a literal can hold an unbalanced one, and depth matters because a
+ * sublink carries its own WHERE a level down.  NULL when there is none, meaning
+ * the insertion point is the end of the statement.
+ */
+static const char *
+find_toplevel_where(const char *sql)
+{
+    const char *p;
+    bool        in_squote = false, in_dquote = false;
+    int         depth = 0;
+
+    for (p = sql; *p; p++)
+    {
+        if (in_squote) { if (*p == '\'') in_squote = false; continue; }
+        if (in_dquote) { if (*p == '"')  in_dquote = false; continue; }
+        if (*p == '\'') { in_squote = true; continue; }
+        if (*p == '"')  { in_dquote = true; continue; }
+        if (*p == '(')  { depth++; continue; }
+        if (*p == ')')  { depth--; continue; }
+        if (depth == 0 && pg_strncasecmp(p, " WHERE ", 7) == 0)
+            return p;
+    }
+    return NULL;
+}
+
+/*
+ * Add one SET item to a deparsed UPDATE, before the statement's own WHERE or at
+ * the end when it has none.  Returns palloc'd.
+ */
+static char *
+add_set_item(const char *cold_dml, const char *set_item)
+{
+    const char    *w = find_toplevel_where(cold_dml);
+    StringInfoData buf;
+
+    initStringInfo(&buf);
+    if (w == NULL)
+        appendStringInfo(&buf, "%s, %s", cold_dml, set_item);
+    else
+    {
+        appendBinaryStringInfo(&buf, cold_dml, w - cold_dml);
+        appendStringInfo(&buf, ", %s%s", set_item, w);
+    }
+    return buf.data;
+}
+
+/*
+ * Re-stamp the cluster on a cold UPDATE that sets an embedding.
+ *
+ * The derivation takes the text of the new embedding expression rather than a
+ * value, which is what makes this tractable: this path never sees row contents.
+ * The expression is evaluated twice, once for the column and once for the
+ * cluster.  Returns the extended statement, or NULL to leave it untouched.
+ *
+ * Every SET column is offered to coldfront._vec_list_set_item, which answers
+ * NULL for one that is not a clustered vector column: which columns qualify is
+ * the registry's knowledge, consulted where it lives instead of copied here.
+ * Every vector column the UPDATE sets gets its own item, because each has its
+ * own cluster column and leaving one stale would make those rows invisible to
+ * that column's probe while the others stayed correct.
+ */
+static char *
+add_cluster_set_item(Query *query, RangeTblEntry *rte, TieredViewInfo *info,
+                     const char *cold_dml)
+{
+    char     *out = NULL;
+    ListCell *lc;
+
+    foreach(lc, query->targetList)
+    {
+        TargetEntry   *tle = (TargetEntry *) lfirst(lc);
+        char          *colname;
+        List          *dpcontext;
+        char          *e_text, *item = NULL;
+        StringInfoData q;
+
+        if (tle->resjunk)
+            continue;
+        colname = get_attname(rte->relid, tle->resno, true);
+        if (colname == NULL)
+            continue;
+
+        dpcontext = deparse_context_for(get_rel_name(rte->relid), rte->relid);
+        e_text    = deparse_expression((Node *) tle->expr, dpcontext, false, false);
+
+        initStringInfo(&q);
+        appendStringInfo(&q, "SELECT coldfront._vec_list_set_item(%s, %s, %s)",
+                         quote_literal_cstr(info->iceberg_table),
+                         quote_literal_cstr(colname),
+                         quote_literal_cstr(e_text));
+        if (SPI_connect() == SPI_OK_CONNECT)
+        {
+            if (SPI_execute(q.data, true, 1) == SPI_OK_SELECT && SPI_processed == 1)
+            {
+                bool  itemnull;
+
+                (void) SPI_getbinval(SPI_tuptable->vals[0],
+                                     SPI_tuptable->tupdesc, 1, &itemnull);
+                if (!itemnull)
+                {
+                    MemoryContext oldcxt = MemoryContextSwitchTo(CurTransactionContext);
+                    item = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+                    MemoryContextSwitchTo(oldcxt);
+                }
+            }
+            SPI_finish();
+        }
+        if (item == NULL)
+            continue;
+
+        /* The item carries the caller's own PG spelling of the new embedding. */
+        out = add_set_item(out ? out : cold_dml, normalize_casts_for_duckdb(item));
+    }
+    return out;
+}
+
+/*
+ * Re-emit an iceberg-only INSERT so it carries the cluster assignment.
+ *
+ * The deparsed statement is targeted (`INSERT INTO t (cols) VALUES …`), so the
+ * column and its value are added by naming both rather than by editing each
+ * tuple: the source becomes a derived table and the assignment reads the vector
+ * from it, which is the same shape the tiered cold half already writes. Returns
+ * NULL when the table has no clustered vector column, leaving today's statement
+ * untouched.
+ */
+static char *
+build_iceberg_only_insert_with_cluster(Query *query, TieredViewInfo *info,
+                                       const char *source, const char *col_list)
+{
+    StringInfoData sql, q;
+    char          *prefix = NULL;
+    char          *list_cols = NULL;   /* already quoted and comma-joined */
+
+    if (!info->has_vector)
+        return NULL;
+
+    /* The assignment reads the vector out of the derived table. */
+    initStringInfo(&q);
+    appendStringInfo(&q,
+        "SELECT coldfront._vec_list_cols_for_ref(%s), "
+        "       coldfront._vec_list_prefix_for_ref(%s, %s)",
+        quote_literal_cstr(info->iceberg_table),
+        quote_literal_cstr(info->iceberg_table),
+        quote_literal_cstr("coldfront_src."));
+    if (SPI_connect() == SPI_OK_CONNECT)
+    {
+        if (SPI_execute(q.data, true, 1) == SPI_OK_SELECT && SPI_processed == 1)
+        {
+            MemoryContext oldcxt = MemoryContextSwitchTo(CurTransactionContext);
+            list_cols = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+            prefix   = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2);
+            MemoryContextSwitchTo(oldcxt);
+        }
+        SPI_finish();
+    }
+    if (prefix == NULL || list_cols == NULL)
+        return NULL;
+
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+        "INSERT INTO %s (%s, %s) SELECT %s%s FROM (%s) AS coldfront_src(%s)",
+        info->iceberg_table, list_cols, col_list,
+        prefix, col_list, source, col_list);
+    return sql.data;
+}
+
+/*
  * Build the slow-path cold call (IDENTITY-omitted case): the target-name
  * ARRAY[...] plus the coldfront._tiered_insert_cold(...) call. Its source SQL
  * runs in a PG cursor (executed by PG, not DuckDB), so params render as NATIVE
@@ -1733,7 +2032,8 @@ build_cold_bulk_call(Query *query, TieredViewInfo *info, const char *source,
         if (!tle->resjunk && tle->resname != NULL)
             targeted_names = lappend(targeted_names, tle->resname);
     }
-    cold_select = build_cold_select_list(info->hot_table, targeted_names);
+    cold_select = build_cold_select_list(info->hot_table, info->iceberg_table,
+                                        targeted_names);
 
     initStringInfo(&cold);
     appendStringInfo(&cold,
@@ -1743,6 +2043,11 @@ build_cold_bulk_call(Query *query, TieredViewInfo *info, const char *source,
         info->iceberg_table,
         cold_select, source, col_list,
         quote_identifier(info->partition_col), cutoff_lit);
+    /* Ordered by cluster when there is one, so this write's own row groups each
+     * hold roughly one cluster and a probe skips the rest of the file.  The
+     * cluster leads the projection, hence ordinal 1. */
+    if (info->has_vector)
+        appendStringInfoString(&cold, " ORDER BY 1");
     cold_pfx  = prefix_pg_tables_with_pglocal(query, cold.data);
     cold_norm = normalize_casts_for_duckdb(cold_pfx);
 
@@ -1826,21 +2131,8 @@ emit_tiered_insert(Query *query, TieredViewInfo *info, ColdParamSet *ps, bool in
     query->returningList = saved_returning;
 
     col_list   = insert_targetlist_collist(query);
-    source     = skip_leading_collist(dr.rest);
+    source     = fold_leading_with(&dr, skip_leading_collist(dr.rest));
     cutoff_lit = format_timestamptz_literal(info->cutoff);
-
-    /* A leading WITH clause (dr.head_len bytes, before "INSERT INTO <view> ") must
-     * reach both halves, which each read `source` inside a parenthesised derived
-     * table. Fold it into source so its CTEs scope to that subquery on each engine
-     * (PG hot, DuckDB cold) — no top-level WITH to merge. */
-    if (dr.head_len > 0)
-    {
-        StringInfoData sb;
-        initStringInfo(&sb);
-        appendBinaryStringInfo(&sb, dr.orig_sql, dr.head_len);
-        appendStringInfoString(&sb, source);
-        source = sb.data;
-    }
 
     {
         RangeTblEntry *rte = (RangeTblEntry *) list_nth(query->rtable,
@@ -2163,13 +2455,302 @@ cf_normalize_read_jsonb(Query *query)
 }
 
 /*
+ * Resolve a node through the grouping RTE. A grouped query's sort expression
+ * references grouping expressions as Vars of RTE_GROUP, and the expression the
+ * shape check needs is the one they stand for. On releases without the grouping
+ * RTE, grouped queries carry the base-relation Vars directly, so this is the
+ * identity there.
+ */
+static Node *
+cf_unwrap_group_var(Query *query, Node *node)
+{
+#if PG_VERSION_NUM >= 180000
+    if (node != NULL && IsA(node, Var))
+    {
+        Var *var = (Var *) node;
+
+        if (var->varlevelsup == 0 &&
+            var->varno >= 1 && var->varno <= list_length(query->rtable))
+        {
+            RangeTblEntry *rte = rt_fetch(var->varno, query->rtable);
+
+            if (rte->rtekind == RTE_GROUP)
+                return (Node *) list_nth(rte->groupexprs, var->varattno - 1);
+        }
+    }
+#endif
+    return node;
+}
+
+/* True for a reference to a column of the query's single range-table entry.
+ * InvalidAttrNumber matches any column, for a caller that wants to learn which. */
+static bool
+cf_is_single_rel_var(Node *node, AttrNumber attno)
+{
+    Var *var;
+
+    if (node == NULL || !IsA(node, Var))
+        return false;
+    var = (Var *) node;
+    if (var->varno != 1 || var->varlevelsup != 0)
+        return false;
+    return attno == InvalidAttrNumber || var->varattno == attno;
+}
+
+/*
+ * The query vector as a PostgreSQL literal, or NULL if this expression is not one.
+ *
+ * The vector has to be inlined: pg_duckdb converts neither a `vector` nor a
+ * `real[]` bound parameter, on a custom plan as much as a generic one, so a probe
+ * that could only be computed from a parameter's value could not have run the
+ * search either. Constant-folded first, because the caller writes ARRAY[…]::real[]
+ * (an ArrayExpr of constants) or a `vector` literal the operator's implicit cast
+ * wraps, and neither is a Const until it is folded.
+ */
+static char *
+cf_query_vector_literal(Node *expr)
+{
+    Const *c;
+    Oid    typoutput;
+    bool   typisvarlena;
+
+    c = (Const *) expression_planner((Expr *) copyObject(expr));
+    if (!IsA(c, Const) || c->constisnull || c->consttype != FLOAT4ARRAYOID)
+        return NULL;
+    getTypeOutputInfo(c->consttype, &typoutput, &typisvarlena);
+    return OidOutputFunctionCall(typoutput, c->constvalue);
+}
+
+/*
+ * The shape the probe rewrite recognises: a single-relation SELECT on a
+ * registered view with a clustered vector column, ordered by one cosine distance
+ * between that column and a constant, with a LIMIT. Grouping, aggregation,
+ * windows and DISTINCT above that ORDER BY are part of the shape; they compute
+ * over whatever the narrowed scan reads.
+ *
+ * The LIMIT is not a detail: a probe trades recall for reads, which is the
+ * bargain a top-k asks for and not one to impose on a query that asked for every
+ * row in order. Cosine only, because the centroids were trained under cosine and
+ * ordering by another metric would route to the wrong clusters and report
+ * nothing. Which column is being searched comes from the query rather than the
+ * registry, because a table may carry several vector columns; a column with no
+ * configuration resolves to no probe set downstream and the rewrite declines.
+ *
+ * On a match, *vec_name is the searched column and *vec_lit the query vector's
+ * PostgreSQL literal.
+ */
+static bool
+cf_probe_match(Query *query, char **vec_name, char **vec_lit)
+{
+    RangeTblEntry  *view_rte;
+    TieredViewInfo  info;
+    SortGroupClause *sgc;
+    TargetEntry    *tle = NULL;
+    ListCell       *lc;
+    Node           *expr;
+    List           *args;
+    Oid             funcid;
+    char           *fname;
+    AttrNumber      vec_attno;
+    Node           *lhs, *rhs, *other;
+    int             nrte;
+
+    nrte = list_length(query->rtable);
+#if PG_VERSION_NUM >= 180000
+    /* A grouped query carries an RTE_GROUP entry holding the grouping
+     * expressions. It adds no second scan, so it does not disqualify the shape;
+     * its Vars are unwrapped where the sort expression is matched. */
+    if (nrte == 2 &&
+        ((RangeTblEntry *) lsecond(query->rtable))->rtekind == RTE_GROUP)
+        nrte = 1;
+#endif
+    if (query->cteList || query->setOperations || query->hasSubLinks ||
+        query->rowMarks || nrte != 1 ||
+        list_length(query->sortClause) != 1 || query->limitCount == NULL)
+        return false;
+
+    view_rte = (RangeTblEntry *) linitial(query->rtable);
+    if (view_rte->rtekind != RTE_RELATION ||
+        get_rel_relkind(view_rte->relid) != RELKIND_VIEW)
+        return false;
+    if (!lookup_tiered_view(view_rte->relid, get_rel_name(view_rte->relid), &info))
+        return false;
+    if (!info.has_vector)
+        return false;
+
+    /* The single sort key, which may be resjunk (ORDER BY an unselected expr). */
+    sgc = (SortGroupClause *) linitial(query->sortClause);
+    foreach(lc, query->targetList)
+    {
+        TargetEntry *t = (TargetEntry *) lfirst(lc);
+
+        if (t->ressortgroupref == sgc->tleSortGroupRef)
+        {
+            tle = t;
+            break;
+        }
+    }
+    if (tle == NULL)
+        return false;
+
+    /* Written as an operator or as the function behind it; both name the same. */
+    expr = cf_unwrap_group_var(query, (Node *) tle->expr);
+    if (IsA(expr, OpExpr))
+    {
+        funcid = ((OpExpr *) expr)->opfuncid;
+        args   = ((OpExpr *) expr)->args;
+    }
+    else if (IsA(expr, FuncExpr))
+    {
+        funcid = ((FuncExpr *) expr)->funcid;
+        args   = ((FuncExpr *) expr)->args;
+    }
+    else
+        return false;
+    if (list_length(args) != 2)
+        return false;
+    fname = get_func_name(funcid);
+    if (fname == NULL || strcmp(fname, "list_cosine_distance") != 0)  /* nosemgrep */
+        return false;
+
+    /* One side is a column of the view, the other is the query vector. */
+    lhs = cf_unwrap_group_var(query, (Node *) linitial(args));
+    rhs = cf_unwrap_group_var(query, (Node *) lsecond(args));
+    if (cf_is_single_rel_var(lhs, InvalidAttrNumber))
+    {
+        vec_attno = ((Var *) lhs)->varattno;
+        other     = rhs;
+    }
+    else if (cf_is_single_rel_var(rhs, InvalidAttrNumber))
+    {
+        vec_attno = ((Var *) rhs)->varattno;
+        other     = lhs;
+    }
+    else
+        return false;
+    *vec_name = get_attname(view_rte->relid, vec_attno, true);
+    if (*vec_name == NULL)
+        return false;
+    *vec_lit = cf_query_vector_literal(other);
+    return *vec_lit != NULL;
+}
+
+/*
+ * Probe injection. A top-k similarity search over a clustered tiered view
+ * (cf_probe_match) is rewritten to read only the clusters nearest the query
+ * vector, which is what turns the layout every write maintains into a shorter
+ * read. Every other shape is left exactly as it was: that is an exact scan,
+ * which is correct.
+ *
+ * The predicate cannot be added to the caller's query, because the column it
+ * tests is deliberately in no branch of the view (see coldfront._vec_list_col).
+ * So the view reference is replaced by the view's own definition carrying the
+ * predicate on its cold arm, which puts the test where the column exists and
+ * leaves the caller's query surface alone. Nothing here is text surgery on the
+ * caller's SQL: the substitution swaps one range-table entry for a subquery and
+ * PostgreSQL deparses the result.
+ *
+ * Declining is silent and total. A table with no centroid generation, a probe
+ * set that resolves to nothing, a view with no cold arm: all of them keep
+ * today's query. The read is then slower than it could be, never wrong, which is
+ * the right direction for a read to fail in (a WRITE that cannot resolve a
+ * generation has to fail loudly instead).
+ */
+static void
+cf_maybe_inject_probe(Query *query)
+{
+    RangeTblEntry  *view_rte;
+    char           *vec_name;
+    char           *vec_lit;
+    char           *body = NULL;
+    Query          *clone;
+    RangeTblEntry  *crte;
+    char           *sql;
+    ColdParamSet    ps;
+    StringInfoData  q;
+
+    if (!coldfront_vector_probe)
+        return;
+    if (!cf_probe_match(query, &vec_name, &vec_lit))
+        return;
+    view_rte = (RangeTblEntry *) linitial(query->rtable);
+
+    /* Resolve the probe set and the definition that carries it, in one round trip. */
+    initStringInfo(&q);
+    appendStringInfo(&q,
+                     "SELECT coldfront._vec_probed_viewdef(%s, %s, "
+                     "coldfront._vec_probe_qual(%s, coldfront._vec_probe_ids("
+                     "%s, %s, %s, %s::real[], %s)))",
+                     quote_literal_cstr(get_namespace_name(
+                                            get_rel_namespace(view_rte->relid))),
+                     quote_literal_cstr(get_rel_name(view_rte->relid)),
+                     quote_literal_cstr(vec_name),
+                     quote_literal_cstr(get_namespace_name(
+                                            get_rel_namespace(view_rte->relid))),
+                     quote_literal_cstr(get_rel_name(view_rte->relid)),
+                     quote_literal_cstr(vec_name),
+                     quote_literal_cstr(vec_lit),
+                     coldfront_vector_nprobe > 0
+                         ? psprintf("%d", coldfront_vector_nprobe) : "NULL");
+    if (SPI_connect() == SPI_OK_CONNECT)
+    {
+        if (SPI_execute(q.data, true, 1) == SPI_OK_SELECT && SPI_processed == 1)
+        {
+            MemoryContext oldcxt = MemoryContextSwitchTo(CurTransactionContext);
+
+            body = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+            MemoryContextSwitchTo(oldcxt);
+        }
+        SPI_finish();
+    }
+    if (body == NULL)
+        return;
+
+    /* Stand the probed definition in for the view, then deparse and reparse so the
+     * whole statement is planned against it. */
+    clone = copyObject(query);
+    crte  = (RangeTblEntry *) linitial(clone->rtable);
+
+    coldfront_in_rewrite = true;
+    PG_TRY();
+    {
+        List    *parsetree_list = pg_parse_query(body);
+        RawStmt *raw            = linitial_node(RawStmt, parsetree_list);
+
+        crte->subquery = parse_analyze_fixedparams(raw, body, NULL, 0, NULL);
+    }
+    PG_FINALLY();
+    {
+        coldfront_in_rewrite = false;
+    }
+    PG_END_TRY();
+
+    crte->rtekind       = RTE_SUBQUERY;
+    crte->relid         = InvalidOid;
+    crte->relkind       = 0;
+    crte->rellockmode   = NoLock;
+    crte->inh           = false;
+    /* The caller's query names its columns by the view's name, so the subquery
+     * answers to it too. */
+    crte->alias         = makeAlias(crte->eref->aliasname, NIL);
+#if PG_VERSION_NUM >= 160000
+    crte->perminfoindex = 0;
+#endif
+
+    sql = pg_get_querydef(clone, false);
+    collect_cold_params(query, &ps);
+    cf_reparse_and_replace(query, sql, &ps);
+}
+
+/*
  * Read path for a SELECT that touches a registered tiered view. First try to
  * reroute a provably-hot read to the heap (runs in plain PG). Otherwise the read
- * spans the cold tier: lazily attach 'ice' (once per session) so the view body's
- * iceberg_scan('ice...') resolves — the version-agnostic cold-read attach (PG
- * 16/17/18) — and normalize the whitelisted jsonb spellings so DuckDB (which runs
- * the whole view query) accepts them. The relkind check inside
- * query_reads_tiered_view keeps plain queries off the SPI path.
+ * spans the cold tier: lazily attach
+ * 'ice' (once per session) so the view body's iceberg_scan('ice...') resolves —
+ * the version-agnostic cold-read attach (PG 16/17/18) — narrow a recognised
+ * similarity search to its probed clusters, and normalize the whitelisted jsonb
+ * spellings so DuckDB (which runs the whole view query) accepts them. The relkind
+ * check inside query_reads_tiered_view keeps plain queries off the SPI path.
  */
 static void
 cf_maybe_attach_for_read(Query *query)
@@ -2180,6 +2761,7 @@ cf_maybe_attach_for_read(Query *query)
         return;   /* rewritten to the hot heap; runs in plain PostgreSQL */
     if (!coldfront_ice_attached)
         ensure_ice_attached_once();
+    cf_maybe_inject_probe(query);
     cf_normalize_read_jsonb(query);
 }
 
@@ -3385,6 +3967,34 @@ register_gucs(void)
         &coldfront_cold_write_batch_size,
         10000,              /* boot_val */
         1,                  /* min */
+        PG_INT32_MAX,       /* max */
+        PGC_USERSET,
+        0,
+        NULL, NULL, NULL);
+
+    DefineCustomBoolVariable(
+        "coldfront.vector_probe",
+        "Restrict a recognised similarity search to its nearest clusters.",
+        "When on (default), a top-k search on a clustered vector column reads only "
+        "the clusters nearest the query vector, which is approximate in the way "
+        "every vector index is. Off gives an exact scan of the whole corpus: "
+        "slower, and the reference a recall measurement compares against.",
+        &coldfront_vector_probe,
+        true,           /* boot_val */
+        PGC_USERSET,
+        0,              /* flags */
+        NULL, NULL, NULL);
+
+    DefineCustomIntVariable(
+        "coldfront.vector_nprobe",
+        "Clusters a similarity search reads, overriding the table's own setting.",
+        "0 (default) uses the nprobe recorded for the column in "
+        "coldfront.vector_config. A value at or above that column's nlist reads "
+        "every cluster, which is exact and is how an approximate result is "
+        "compared against ground truth without turning the rewrite off.",
+        &coldfront_vector_nprobe,
+        0,                  /* boot_val: defer to vector_config */
+        0,                  /* min */
         PG_INT32_MAX,       /* max */
         PGC_USERSET,
         0,

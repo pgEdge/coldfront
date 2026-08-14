@@ -16,8 +16,10 @@ SET TIME ZONE 'UTC';
 SET coldfront.warehouse = '';
 SET coldfront.lakekeeper_endpoint = '';
 -- evt_jsonb's name embeds "jsonb": it must survive the jsonb→json rewrite intact.
+CREATE EXTENSION IF NOT EXISTS vector;
 CREATE TABLE public._events (id int, ts timestamptz, c_tsn timestamp,
-                             c_vc varchar, c_dp double precision, evt_jsonb jsonb);
+                             c_vc varchar, c_dp double precision, evt_jsonb jsonb,
+                             emb vector(3));
 CREATE VIEW public.events AS SELECT * FROM public._events;
 INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
 VALUES ('public', 'events', 'public._events', 'ice.default.events', 'ts');
@@ -41,6 +43,19 @@ EXPLAIN (COSTS OFF, VERBOSE)
    Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET c_tsn = ''Mon Jun 01 00:00:00 2020''::timestamp, c_vc = ''x''::varchar, c_dp = (1.5)::double, evt_jsonb = json_set(json_object(''k'', 1), ''{x}''::text[], ''"v"''::json)   WHERE (ts < ''Tue Jan 01 00:00:00 2019 UTC''::timestamptz)'::text)
 (2 rows)
 
+-- (A2) pgvector's cast: DuckDB knows no `vector`, and the Iceberg column is
+-- FLOAT[]. The dimension typmod must go with the name, since FLOAT[](3) is not a
+-- type. The literal needs no rewriting here: a vector Const deparses through
+-- pgvector's own output function, which is already bracket-delimited.
+EXPLAIN (COSTS OFF, VERBOSE)
+  UPDATE public.events SET emb = '[1,2,3]'::vector(3)
+  WHERE ts < '2019-01-01'::timestamp with time zone;
+                                                                                          QUERY PLAN                                                                                           
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result
+   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET emb = ''[1,2,3]''::FLOAT[]   WHERE (ts < ''Tue Jan 01 00:00:00 2019 UTC''::timestamptz)'::text)
+(2 rows)
+
 -- (B) Parity against the live DuckDB: the rewrite targets are accepted; `jsonb`
 -- is rejected (which is why the map rewrites it). A void row = accepted.
 SELECT duckdb.raw_query($$ SELECT NULL::json $$);
@@ -49,6 +64,18 @@ SELECT duckdb.raw_query($$ SELECT NULL::json $$);
  
 (1 row)
 
+SELECT duckdb.raw_query($$ SELECT '[1,2,3]'::FLOAT[] $$);
+ raw_query 
+-----------
+ 
+(1 row)
+
+SELECT duckdb.raw_query($$ SELECT NULL::vector $$);
+ERROR:  (PGDuckDB/pgduckdb_raw_query_cpp) Catalog Error: Type with name vector does not exist!
+Did you mean "dec"?
+
+LINE 1:  SELECT NULL::vector 
+                      ^
 SELECT duckdb.raw_query($$ SELECT json_object('k', 1) $$);
  raw_query 
 -----------

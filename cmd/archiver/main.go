@@ -10,6 +10,7 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -23,6 +24,7 @@ import (
 	"github.com/pgedge/coldfront/internal/partcfg"
 	"github.com/pgedge/coldfront/internal/partition"
 	"github.com/pgedge/coldfront/internal/sqlutil"
+	"github.com/pgedge/coldfront/internal/version"
 	"github.com/pgedge/coldfront/internal/view"
 	"github.com/pgedge/coldfront/internal/watermark"
 )
@@ -51,7 +53,13 @@ func main() {
 		"sleep this long after Phase 2 (capture+bulk-export) and before Phase 3 "+
 			"(replay+cutover). Test-only knob to widen the window so concurrent "+
 			"writes deterministically race into the capture trigger.")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Printf("%s %s (built %s)\n", filepath.Base(os.Args[0]), version.Version, version.BuildTime)
+		return
+	}
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -646,8 +654,16 @@ func (ac *archiveCycle) bootstrapTieredView(ctx context.Context, columns []view.
 	}
 	hotTable := pgx.Identifier{t.SourceSchema, "_" + t.SourceTable}.Sanitize()
 	if err := registerTieredView(ctx, ac.conn, t.SourceSchema, t.SourceTable,
-		hotTable, iceTable, t.PartitionColumn); err != nil {
+		hotTable, iceTable, t.PartitionColumn, vectorColumns(columns)); err != nil {
 		return fmt.Errorf("register tiered view: %w", err)
+	}
+	// The INSTEAD OF INSERT trigger, from the extension's one builder. After the
+	// registration, because the builder reads the registry for the hot table, the
+	// Iceberg ref and the vector columns.
+	if _, err := ac.conn.Exec(ctx,
+		"SELECT coldfront._rebuild_write_trigger($1, $2)",
+		t.SourceSchema, t.SourceTable); err != nil {
+		return fmt.Errorf("build write trigger: %w", err)
 	}
 	return nil
 }
@@ -1195,41 +1211,129 @@ func wipeIcebergRange(ctx context.Context, conn *pgx.Conn, iceTable, partCol str
 // in S" → replayed. The replay is idempotent (DELETE+INSERT keyed on PK), so
 // the duplicate work is correct, just wasted. For typical workloads this
 // window is sub-millisecond.
-// stageSelectList builds the SELECT projection for the bulk export, casting
-// only the VARCHAR-backed rich types (jsonb/json/interval — Type=="VARCHAR"
-// with a surface ViewCastType) to ::text so they land as VARCHAR in Iceberg
-// and the transparent view casts them back on read.
+// vecCompanion names the generated real[] column that carries a vector column's
+// scannable form on the hot table. coldfront._vec_companion derives the same name
+// for the SQL-side view rebuild; the two have to agree.
+func vecCompanion(col string) string { return "_cf_vec_" + col }
+
+// vecLayoutProps asks the extension for the CREATE TABLE properties a clustered
+// table needs, or "" when the table has no vector. The values live in the
+// extension so both modes create the same layout; the primary key rides along as
+// the sort key's tiebreak, which only this side knows.
+func vecLayoutProps(ctx context.Context, conn *pgx.Conn, columns []view.Column) (string, error) {
+	if len(vectorColumns(columns)) == 0 {
+		return "", nil
+	}
+	var pk []string
+	for _, c := range columns {
+		if c.IsPK {
+			pk = append(pk, c.Name)
+		}
+	}
+	var props string
+	if err := conn.QueryRow(ctx,
+		"SELECT coldfront._vec_layout_props(coldfront._vec_sort_key($1, $2))",
+		vectorColumns(columns)[0], pk).Scan(&props); err != nil {
+		return "", fmt.Errorf("layout properties: %w", err)
+	}
+	return props, nil
+}
+
+// pkOrder spells the primary key as trailing ORDER BY terms, or "" when the table
+// has none. A tiebreak for determinism, not a pruning aid: sorting by cluster
+// scatters a cluster's rows through key space.
+func pkOrder(columns []view.Column) string {
+	var terms []string
+	for _, c := range columns {
+		if c.IsPK {
+			terms = append(terms, "s."+pgx.Identifier{c.Name}.Sanitize())
+		}
+	}
+	if len(terms) == 0 {
+		return ""
+	}
+	return ", " + strings.Join(terms, ", ")
+}
+
+// vectorColumns names the table's vector columns in column order, empty when it has
+// none. The order is the contract: the Iceberg schema declares one cluster column
+// per entry in this order, a positional cold write fills them in it, and the first
+// entry is the one that owns the file sort order.
+func vectorColumns(columns []view.Column) []string {
+	var out []string
+	for _, c := range columns {
+		if c.IsVector() {
+			out = append(out, c.Name)
+		}
+	}
+	return out
+}
+
+// vecListPrefix asks the extension for the expression that assigns a cluster to
+// each staged row, leading the Iceberg INSERT's projection, or "" when the table
+// has no vector.
 //
-// A ViewCastType alone does NOT mean text-backed: bytea (storage BLOB) and
-// double precision (storage DOUBLE) carry a ViewCastType only to give the view
-// a PG-parseable hot-side cast (`::bytea`/`::double precision` instead of the
-// non-PG `::BLOB`/`::DOUBLE`). Iceberg stores those natively (binary / double),
-// so they must be exported AS-IS — ::text-casting bytea would stringify the
-// bytes ('\xdeadbeef') and corrupt the BLOB column. Gating on Type=="VARCHAR"
-// selects exactly the text-backed types and leaves native ones untouched.
+// The extension owns the expression rather than the archiver spelling its own:
+// a row whose cluster disagrees with its vector is invisible to its own search
+// and reports no error, so every write path derives from one definition. It also
+// reads the centroids over pglocal, which is why the caller attaches it.
+func vecListPrefix(ctx context.Context, conn *pgx.Conn, t *config.TableConfig, columns []view.Column) (string, error) {
+	vecCols := vectorColumns(columns)
+	if len(vecCols) == 0 {
+		return "", nil
+	}
+	if _, err := conn.Exec(ctx, "SELECT coldfront.ensure_pg_attached()"); err != nil {
+		return "", fmt.Errorf("attach pglocal: %w", err)
+	}
+	exprs := make([]string, len(vecCols))
+	for i, c := range vecCols {
+		exprs[i] = "s." + pgx.Identifier{c}.Sanitize()
+	}
+	var prefix string
+	if err := conn.QueryRow(ctx,
+		"SELECT coldfront._vec_list_prefix($1, $2, $3, $4)",
+		t.SourceSchema, t.SourceTable, vecCols, exprs,
+	).Scan(&prefix); err != nil {
+		return "", fmt.Errorf("cluster expression: %w", err)
+	}
+	return prefix, nil
+}
+
+// stageSelectList builds the SELECT projection for the bulk export. Which
+// columns need a cast, and to what, is view.Column.ExportCast's decision, and
+// which hot-side column is read is view.Column.HotRef's: this only spells the
+// projection.
 func stageSelectList(columns []view.Column) string {
 	if len(columns) == 0 {
 		return "*"
 	}
-	parts := make([]string, len(columns))
-	for i, c := range columns {
+	parts := make([]string, 0, len(columns))
+	for _, c := range columns {
 		id := pgx.Identifier{c.Name}.Sanitize()
-		if c.Type == "VARCHAR" && c.ViewCastType != "" {
-			parts[i] = id + "::text AS " + id
-		} else {
-			parts[i] = id
+		ref, aliased := c.HotRef()
+		switch {
+		case aliased:
+			// The companion is already real[]; reading it needs no cast.
+			parts = append(parts, ref+" AS "+id)
+		case c.ExportCast() != "":
+			parts = append(parts, ref+"::"+c.ExportCast()+" AS "+id)
+		default:
+			parts = append(parts, ref)
 		}
 	}
 	return strings.Join(parts, ", ")
 }
 
-// needsPGTextStage reports whether the column set contains a type pg_duckdb's
-// PG reader cannot scan, requiring a PostgreSQL-side text-cast staging table
-// before the DuckDB stage. jsonb (ViewCastType "json") scans fine, so it does
-// NOT trigger the detour. interval is included defensively (Iceberg-VARCHAR-
-// backed, and not worth a separate scan probe). inet/cidr were the original
-// offenders but are no longer supported (pg_duckdb rejects inet outright).
-func needsPGTextStage(columns []view.Column) bool {
+// needsPGStage reports whether the column set contains a type pg_duckdb's PG
+// reader cannot scan, so PostgreSQL has to materialise a cast copy in a plain
+// temp table before the DuckDB stage reads it.
+//
+// interval is included defensively (Iceberg-VARCHAR-backed, and not worth a
+// separate scan probe). jsonb, bytea and double scan fine and must not trigger
+// it: the detour copies every partition twice. A vector does not trigger it
+// either, because the export reads its generated real[] companion rather than the
+// pgvector column (see view.Column.HotRef).
+func needsPGStage(columns []view.Column) bool {
 	for _, c := range columns {
 		if c.ViewCastType == "interval" {
 			return true
@@ -1252,19 +1356,25 @@ func bulkExportWithSnapshot(ctx context.Context, conn *pgx.Conn, t *config.Table
 	// (inet/cidr were the original Oid-869 offenders that motivated this detour
 	// but are no longer supported — see pgFormatTypeToDuckDB.) jsonb-only /
 	// plain tables skip the detour (single copy, fast path).
+	// The projection belongs to whichever statement reads the real partition: it is
+	// what casts the VARCHAR-backed types and what reads a vector through its
+	// generated companion instead of the pgvector column pg_duckdb cannot scan.
+	// After the detour, cf_pgstage already holds those columns under their own
+	// names, so the DuckDB stage takes them as they are.
 	src := pgx.Identifier{t.SourceSchema, partName}.Sanitize()
-	if needsPGTextStage(columns) {
+	proj := stageSelectList(columns)
+	if needsPGStage(columns) {
 		pgStageSQL := fmt.Sprintf(
-			"CREATE TEMP TABLE cf_pgstage AS SELECT %s FROM %s",
-			stageSelectList(columns), src)
+			"CREATE TEMP TABLE cf_pgstage AS SELECT %s FROM %s", proj, src)
 		if _, err := conn.Exec(ctx, pgStageSQL); err != nil { // nosemgrep
 			return "", fmt.Errorf("pg text-stage: %w", err)
 		}
 		defer func() { _, _ = conn.Exec(ctx, "DROP TABLE IF EXISTS cf_pgstage") }() // nosemgrep
 		src = "cf_pgstage"
+		proj = "*"
 	}
 	stageSQL := fmt.Sprintf(
-		"CREATE TEMP TABLE duck_stage USING duckdb AS SELECT * FROM %s", src)
+		"CREATE TEMP TABLE duck_stage USING duckdb AS SELECT %s FROM %s", proj, src)
 	if _, err := conn.Exec(ctx, stageSQL); err != nil { // nosemgrep
 		return "", fmt.Errorf("stage: %w", err)
 	}
@@ -1275,7 +1385,19 @@ func bulkExportWithSnapshot(ctx context.Context, conn *pgx.Conn, t *config.Table
 	// statement on this dedicated conn, so the claim/lock is released at this
 	// statement's commit. duck_stage was created on the same conn in the prior
 	// statement, so only one DuckDB-database write happens inside this tx.
-	insertSQL, err := dollarQuote(fmt.Sprintf("INSERT INTO %s SELECT * FROM pg_temp.duck_stage", iceTable))
+	vecPrefix, err := vecListPrefix(ctx, conn, t, columns)
+	if err != nil {
+		return "", err
+	}
+	// Ordered by cluster, so this file's own row groups each hold roughly one
+	// cluster and a probe skips the rest of it. Nothing outside this file is
+	// touched: the sorted regions accumulate and compaction folds them together.
+	order := ""
+	if vecPrefix != "" {
+		order = " ORDER BY 1" + pkOrder(columns)
+	}
+	insertSQL, err := dollarQuote(fmt.Sprintf(
+		"INSERT INTO %s SELECT %ss.* FROM pg_temp.duck_stage s%s", iceTable, vecPrefix, order))
 	if err != nil {
 		return "", fmt.Errorf("iceberg insert: %w", err)
 	}
@@ -1311,15 +1433,23 @@ func ensureIcebergTable(ctx context.Context, conn *pgx.Conn, t *config.TableConf
 	if err != nil {
 		return fmt.Errorf("get columns: %w", err)
 	}
-	var colDefs string
-	for i, c := range columns {
-		if i > 0 {
-			colDefs += ", "
-		}
-		colDefs += fmt.Sprintf("%s %s", pgx.Identifier{c.Name}.Sanitize(), c.Type)
+	defs := make([]string, 0, len(columns)+1)
+	// One cluster column per vector column, leading the schema in column order, which
+	// is the order a positional cold write fills them in.
+	for _, c := range vectorColumns(columns) {
+		defs = append(defs, pgx.Identifier{view.VecListColumn(c)}.Sanitize()+" INTEGER")
 	}
+	for _, c := range columns {
+		defs = append(defs, fmt.Sprintf("%s %s", pgx.Identifier{c.Name}.Sanitize(), c.Type))
+	}
+	colDefs := strings.Join(defs, ", ")
 
-	if err := execDuckDB(ctx, conn, fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (%s)", iceTable, colDefs)); err != nil {
+	props, err := vecLayoutProps(ctx, conn, columns)
+	if err != nil {
+		return err
+	}
+	if err := execDuckDB(ctx, conn, fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (%s)%s",
+		iceTable, colDefs, props)); err != nil {
 		return fmt.Errorf("create iceberg table: %w", err)
 	}
 	return nil
@@ -1328,15 +1458,16 @@ func ensureIcebergTable(ctx context.Context, conn *pgx.Conn, t *config.TableConf
 // registerTieredView upserts a row in coldfront.tiered_views so the
 // coldfront C extension can identify this view as a tiered target and
 // rewrite UPDATE/DELETE into dual-tier CTEs. Called after every view recreate.
-func registerTieredView(ctx context.Context, conn *pgx.Conn, schema, table, hotTable, icebergTable, partitionCol string) error {
+func registerTieredView(ctx context.Context, conn *pgx.Conn, schema, table, hotTable, icebergTable, partitionCol string, vecColumns []string) error {
 	_, err := conn.Exec(ctx /* nosemgrep */, `
-		INSERT INTO coldfront.tiered_views (schema_name, relname, hot_table, iceberg_table, partition_col)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO coldfront.tiered_views (schema_name, relname, hot_table, iceberg_table, partition_col, vec_columns)
+		VALUES ($1, $2, $3, $4, $5, NULLIF($6, '{}'::text[]))
 		ON CONFLICT (schema_name, relname) DO UPDATE
 		  SET hot_table     = EXCLUDED.hot_table,
 		      iceberg_table = EXCLUDED.iceberg_table,
-		      partition_col = EXCLUDED.partition_col`,
-		schema, table, hotTable, icebergTable, partitionCol)
+		      partition_col = EXCLUDED.partition_col,
+		      vec_columns   = EXCLUDED.vec_columns`,
+		schema, table, hotTable, icebergTable, partitionCol, vecColumns)
 	return err
 }
 
@@ -1385,6 +1516,20 @@ func pgFormatTypeToDuckDB(s string) (storage, viewCastType string, err error) {
 		return "VARCHAR", "", nil
 	}
 
+	// pgvector. format_type emits the dimension as a typmod (vector(1536))
+	// unless the column was declared without one. Both types widen losslessly
+	// to float4 and store as an Iceberg list<float>. The view cast is real[]
+	// rather than FLOAT[]: PG reads FLOAT as an alias for double precision, so
+	// ::FLOAT[] on the hot branch would widen to double precision[] and the two
+	// UNION branches would disagree on the column type. coldfront's SQL twin
+	// (_iceberg_storage_type / _iceberg_view_cast_type) returns the same pair
+	// for the decoupled path. sparsevec is absent deliberately: densifying it
+	// is a 100x storage blowup, so it stays hot-only and errors below.
+	if s == "vector" || strings.HasPrefix(s, "vector(") ||
+		s == "halfvec" || strings.HasPrefix(s, "halfvec(") {
+		return "FLOAT[]", "real[]", nil
+	}
+
 	// numeric(P,S) → DECIMAL(P,S). Iceberg supports decimal up to P=38.
 	if m := numericTypeRe.FindStringSubmatch(s); m != nil {
 		return "DECIMAL(" + m[1] + "," + m[2] + ")", "", nil
@@ -1400,9 +1545,11 @@ func pgFormatTypeToDuckDB(s string) (storage, viewCastType string, err error) {
 		"PG type %q has no Iceberg-compatible mapping. Supported: bigint, integer, "+
 			"smallint, real, double precision, boolean, timestamp with/without time "+
 			"zone, date, time without time zone, uuid, text, character varying(N), "+
-			"character(N), bytea, numeric(P,S) with P<=38, json, jsonb, interval. "+
+			"character(N), bytea, numeric(P,S) with P<=38, json, jsonb, interval, "+
+			"vector(N), halfvec(N). "+
 			"inet/cidr/oid are not supported (pg_duckdb cannot process them in "+
-			"Iceberg-backed queries): store IP data as text and oid values as bigint", s)
+			"Iceberg-backed queries): store IP data as text and oid values as bigint. "+
+			"sparsevec is not supported: keep it in the hot tier", s)
 }
 
 // pgTypeMap holds the 1:1 PG-format_type → (storage, viewCast) mappings used by
@@ -1500,7 +1647,8 @@ func scanColumns(ctx context.Context, db querier, schema, actualName string) ([]
 	rows, err := db.Query(ctx /* nosemgrep */, `
 		SELECT a.attname,
 		       format_type(a.atttypid, a.atttypmod),
-		       a.attidentity::text
+		       a.attidentity::text,
+		       a.attgenerated::text
 		FROM pg_attribute a
 		JOIN pg_class c ON c.oid = a.attrelid
 		JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -1514,20 +1662,31 @@ func scanColumns(ctx context.Context, db querier, schema, actualName string) ([]
 
 	var cols []view.Column
 	for rows.Next() {
-		var name, pgFormatType, attidentity string
-		if err := rows.Scan(&name, &pgFormatType, &attidentity); err != nil {
+		var name, pgFormatType, attidentity, attgenerated string
+		if err := rows.Scan(&name, &pgFormatType, &attidentity, &attgenerated); err != nil {
 			return nil, err
+		}
+		// A companion is ColdFront's own generated column, not a column of the
+		// table as far as the Iceberg schema and the view are concerned. Skipping
+		// it keeps exactly one column per user column. A generated column the user
+		// wrote is left alone and treated like any other.
+		if attgenerated != "" && strings.HasPrefix(name, vecCompanion("")) {
+			continue
 		}
 		storage, viewCastType, err := pgFormatTypeToDuckDB(pgFormatType)
 		if err != nil {
 			return nil, fmt.Errorf("column %s.%s.%s: %w", schema, actualName, name, err)
 		}
-		cols = append(cols, view.Column{
+		col := view.Column{
 			Name:         name,
 			Type:         storage,
 			ViewCastType: viewCastType,
 			IsIdentity:   attidentity == "a",
-		})
+		}
+		if col.IsVector() {
+			col.HotSource = vecCompanion(name)
+		}
+		cols = append(cols, col)
 	}
 	return cols, rows.Err()
 }

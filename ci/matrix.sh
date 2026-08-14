@@ -64,10 +64,15 @@ preflight() {
     step "preflight 5: build"
     if ! make build 2>&1; then fail "build"; exit 1; fi
     pass "build ($(ls -lh bin/archiver 2>/dev/null | awk '{print $5}'))"
+    if ! bin/archiver --version | grep -q . || ! bin/partitioner --version | grep -q .; then
+        fail "--version"; exit 1
+    fi
+    pass "--version ($(bin/archiver --version))"
 
     step "preflight 6: compactor module (separate go.mod — iceberg-go)"
     if ! make compactor GOLANGCI="$linter" 2>&1; then fail "compactor module"; exit 1; fi
     pass "compactor (vet, lint, test, build $(ls -lh bin/compactor 2>/dev/null | awk '{print $5}'))"
+    if ! bin/compactor --version | grep -q .; then fail "compactor --version"; exit 1; fi
 
     step "preflight 7: docs (mkdocs build --strict)"
     if ! command -v mkdocs >/dev/null 2>&1; then

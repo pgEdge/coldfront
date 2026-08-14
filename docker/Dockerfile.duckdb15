@@ -53,6 +53,14 @@ COPY --from=cf-build /out/usr/pgsql-${PG_MAJOR}/lib/             /usr/pgsql-${PG
 COPY --from=cf-build /out/usr/pgsql-${PG_MAJOR}/share/extension/ /usr/pgsql-${PG_MAJOR}/share/extension/
 COPY docker/entrypoint.sh /usr/local/bin/coldfront-entrypoint.sh
 RUN chmod +x /usr/local/bin/coldfront-entrypoint.sh
+# pgvector, from the same pgEdge repo the base is built from. A tiered vector
+# table carries the type on its hot side, and both the cold read and cold write
+# paths rely on pgvector's implicit vector -> real[] cast. It sits in the app
+# layer for the same reason as entrypoint.sh: baked only into the separately
+# published base, a stale base would silently lack it and local CI would diverge
+# from GitHub CI.
+RUN dnf install -y --setopt=install_weak_deps=False pgedge-pgvector_${PG_MAJOR} \
+    && dnf clean all
 # License + third-party notices travel with the binaries we redistribute (DuckDB
 # family is MIT — the notice must accompany the distributed Software).
 COPY THIRD_PARTY_NOTICES.md LICENSE.md /usr/share/doc/coldfront/

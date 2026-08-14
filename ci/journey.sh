@@ -588,6 +588,597 @@ EOSQL
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# Story 5b — Embeddings round-trip. A pgvector column tiers as an Iceberg
+# list<float> and comes back element-for-element through the view, over all three
+# cold-write paths: the archiver's bulk export, the INSTEAD OF trigger's cold
+# INSERT, and the decoupled hook. The view exposes the column as real[], and PG
+# spells an array {1,2,3} where DuckDB's list cast takes only [1,2,3], so each
+# path has to rewrite the delimiters; comparing the stored value to a literal is
+# what catches a path that does not.
+# ───────────────────────────────────────────────────────────────────────────
+story_vector() {
+    step "5b. Embeddings round-trip (vector → list<float>, tiered + decoupled)"
+    qf "$HOST" <<'EOSQL' >/dev/null
+SET search_path = public;
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE TABLE IF NOT EXISTS chunks (
+    id        bigint GENERATED ALWAYS AS IDENTITY,
+    ts        timestamptz NOT NULL,
+    body      text,
+    embedding vector(3),
+    PRIMARY KEY (id, ts)
+) PARTITION BY RANGE (ts);
+-- m4 (cold after archiving) and m1 (hot), named from now()-relative months.
+DO $do$
+DECLARE m date;
+BEGIN
+  FOREACH m IN ARRAY ARRAY[(date_trunc('month',now()) - interval '4 months')::date,
+                           (date_trunc('month',now()) - interval '1 month')::date] LOOP
+    EXECUTE format('CREATE TABLE IF NOT EXISTS %I PARTITION OF chunks FOR VALUES FROM (%L) TO (%L)',
+                   'chunks_p_' || to_char(m, 'YYYY_MM'), m, (m + interval '1 month'));
+  END LOOP;
+END $do$;
+-- The hot column is a real vector, so the unadorned pgvector literal is what a
+-- user writes. Both rows carry the same value: one archives, one stays hot.
+INSERT INTO chunks (ts, body, embedding)
+VALUES (date_trunc('month',now()) - interval '4 months' + interval '9 days', 'cold', '[1.5,-2,3]'),
+       (date_trunc('month',now()) - interval '1 month' + interval '9 days',  'hot',  '[1.5,-2,3]');
+EOSQL
+    local ret_days; ret_days=$(hot_days)
+    cat > /tmp/journey-chunks.yaml <<EOF
+postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
+iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog" }
+$(storage_yaml)
+archiver: { tables: [ { source_table: chunks, partition_period: monthly, hot_period: "${ret_days} days" } ] }
+EOF
+    if ! "$ARCHIVER" import --config /tmp/journey-chunks.yaml >/tmp/journey-chunks.log 2>&1; then
+        fail "import chunks into partition_config — see /tmp/journey-chunks.log"; tail -5 /tmp/journey-chunks.log; return
+    fi
+    if "$ARCHIVER" --config /tmp/journey-chunks.yaml >>/tmp/journey-chunks.log 2>&1; then
+        pass "vector table archived (m4 → cold)"
+    else
+        fail "vector archive — see /tmp/journey-chunks.log"; tail -5 /tmp/journey-chunks.log; return
+    fi
+
+    # Verify what landed in Iceberg, read straight from the cold table. Equality
+    # against a real[] literal is the whole assertion: a stringified write could
+    # not have landed at all, since a FLOAT[] column rejects PG's {…} array text.
+    #
+    # Not through the tiered view: that plan carries the hot table's pgvector
+    # column, which pg_duckdb cannot scan, so a view read of this column depends
+    # on PostgreSQL happening to prune the hot branch.
+    local O; O=$(qf "$HOST" <<'EOSQL'
+SELECT coldfront.ensure_attached();
+SELECT 'COLD_VEC:' || (r['embedding']::real[] = ARRAY[1.5,-2,3]::real[])::text
+  FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] = 'cold';
+EOSQL
+)
+    assert_eq "cold vector round-trip (bulk export)" "true" "$(extract COLD_VEC "$O")"
+
+    # Through the view, with the predicate a caller actually writes. The watermark
+    # classifies this as cold-only, so the read must reach the Iceberg side alone:
+    # the hot branch scans a pgvector column, which fails the whole plan even when
+    # no hot row can match.
+    # Through the view, with a now()-relative bound. The watermark sits at the
+    # archived partition's upper bound, which date_trunc lands on exactly, so the
+    # read is cold-only however long ago the fixture was built.
+    local V; V=$(qf "$HOST" <<'EOSQL'
+SELECT 'VIEW_VEC:' || (embedding = ARRAY[1.5,-2,3]::real[])::text FROM chunks
+  WHERE body = 'cold' AND ts < date_trunc('month', now()) - interval '3 months';
+SELECT 'VIEW_X:' || count(*)::text FROM chunks WHERE embedding IS NOT NULL;
+SELECT 'VIEW_XB:' || string_agg(body, ',' ORDER BY body) FROM chunks WHERE embedding IS NOT NULL;
+EOSQL
+)
+    assert_eq "cold vector read through the view" "true" "$(extract VIEW_VEC "$V")"
+    # No tier bound: one hot row and one archived row, both projecting the vector,
+    # which is the read that needs the hot side to be scannable at all.
+    assert_eq "cross-tier read projecting the vector" "2" "$(extract VIEW_X "$V")"
+    assert_eq "cross-tier read spans both tiers" "cold,hot" "$(extract VIEW_XB "$V")"
+    assert_eq "cold vector read through the view (classified, now()-relative)" "true" "$(extract VIEW_VEC "$V")"
+
+    # Cold INSERT through the view trigger (ts < cutoff): a second write path,
+    # and the one that renders NEW.embedding::text. The vector literal exercises
+    # pgvector's implicit vector -> real[] cast on the way into the view column.
+    local CI; CI=$(qf "$HOST" <<'EOSQL'
+INSERT INTO chunks (ts, body, embedding)
+VALUES (date_trunc('month',now()) - interval '4 months' + interval '19 days', 'coldins', '[4,5.5,-6]'::vector);
+SELECT coldfront.ensure_attached();
+SELECT 'COLDINS_VEC:' || (r['embedding']::real[] = ARRAY[4,5.5,-6]::real[])::text
+  FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] = 'coldins';
+EOSQL
+)
+    assert_eq "cold-INSERT-via-trigger vector round-trip" "true" "$(extract COLDINS_VEC "$CI")"
+
+    # The search itself: pgvector-shaped syntax over the view, ranking hot and cold
+    # rows together in one statement. The query vector is one of the stored rows, so
+    # the nearest is exact rather than a tie.
+    local S; S=$(qf "$HOST" <<'EOSQL'
+SELECT 'NEAREST:' || body FROM chunks ORDER BY embedding <=> ARRAY[4,5.5,-6]::real[] LIMIT 1;
+SELECT 'RANKED:' || string_agg(body, ',' ORDER BY d) FROM (
+  SELECT body, embedding <=> ARRAY[4,5.5,-6]::real[] AS d FROM chunks) t;
+EOSQL
+)
+    assert_eq "top-k over both tiers finds the nearest row" "coldins" "$(extract NEAREST "$S")"
+    assert_contains "top-k ranks the exact match first" "coldins," "$(extract RANKED "$S")"
+
+    # Decoupled: no hot tier, its own generated trigger, its own type map. Shares
+    # none of the archiver's plumbing, so it is a distinct path.
+    local i
+    for i in 1 2 3 4 5; do
+        q_may "$HOST" "SELECT coldfront.create_iceberg_table('public','icevec','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"ts\",\"type\":\"timestamptz\"},{\"name\":\"embedding\",\"type\":\"vector(3)\"}]'::jsonb);" >/dev/null 2>&1
+        [ "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname='icevec' AND relkind='v' AND relnamespace='public'::regnamespace;")" = "1" ] && break
+        sleep 2
+    done
+    local D; D=$(qf "$HOST" <<'EOSQL'
+INSERT INTO icevec VALUES (1, date_trunc('month',now()) + interval '11 hours', '[7,-8.25,9]'::vector);
+SELECT 'DEC_VEC:' || (embedding = ARRAY[7,-8.25,9]::real[])::text FROM icevec WHERE id = 1;
+EOSQL
+)
+    assert_eq "decoupled vector round-trip" "true" "$(extract DEC_VEC "$D")"
+
+    # Decoupled declares its own schema, so the append has a second implementation.
+    local DL; DL=$(qf "$HOST" <<'EOSQL'
+SELECT coldfront.ensure_attached();
+SELECT 'DEC_ICE_LIST:' || count(*) FROM duckdb.query($$SELECT column_name FROM (DESCRIBE ice.public.icevec)$$) AS t(r)
+ WHERE r['column_name']::text = '_cf_vec_list_embedding';
+SELECT 'DEC_VIEW_LIST:' || count(*) FROM pg_attribute
+ WHERE attrelid = 'public.icevec'::regclass AND attname = '_cf_vec_list_embedding' AND attnum > 0;
+EOSQL
+)
+    assert_eq "decoupled Iceberg schema carries the cluster column" "1" "$(extract DEC_ICE_LIST "$DL")"
+    assert_eq "decoupled view does not project it"                  "0" "$(extract DEC_VIEW_LIST "$DL")"
+
+    # A decoupled INSERT is rewritten in C, a different generator again, and it
+    # must stamp the cluster in the same statement once a generation is live.
+    q "$HOST" "INSERT INTO coldfront.vector_config (schema_name, table_name, column_name, nlist, nprobe) VALUES ('public','icevec','embedding',2,1);" >/dev/null
+    q "$HOST" "INSERT INTO coldfront.vector_centroids (schema_name, table_name, column_name, generation, centroid_id, centroid) VALUES ('public','icevec','embedding',1,0,ARRAY[7,-8.25,9]::real[]),('public','icevec','embedding',1,1,ARRAY[-1,-1,-1]::real[]);" >/dev/null
+    q "$HOST" "UPDATE coldfront.vector_config SET generation = 1 WHERE table_name = 'icevec';" >/dev/null
+    local DA; DA=$(qf "$HOST" <<'EOSQL'
+INSERT INTO icevec VALUES (2, date_trunc('month',now()) + interval '12 hours', '[7,-8.25,9]'::vector);
+SELECT coldfront.ensure_attached();
+SELECT 'DEC_ASG:' || r['_cf_vec_list_embedding'] FROM iceberg_scan('ice.public.icevec') r WHERE r['id'] = 2;
+EOSQL
+)
+    assert_eq "a decoupled INSERT stamps the nearest cluster" "0" "$(extract DEC_ASG "$DA")"
+
+    # Two vector columns on one table. Each gets its own cluster column and its own
+    # assignment; only the first gets the file sort order, so only its probe prunes.
+    # Its own table, so nothing above depends on the second column existing.
+    local i2
+    for i2 in 1 2 3 4 5; do
+        q_may "$HOST" "SELECT coldfront.create_iceberg_table('public','icetwo','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"ts\",\"type\":\"timestamptz\"},{\"name\":\"embedding\",\"type\":\"vector(3)\"},{\"name\":\"summary\",\"type\":\"vector(2)\"}]'::jsonb);" >/dev/null 2>&1
+        [ "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname='icetwo' AND relkind='v';")" = "1" ] && break
+        sleep 2
+    done
+    q "$HOST" "INSERT INTO coldfront.vector_config (schema_name, table_name, column_name, nlist, nprobe) VALUES ('public','icetwo','embedding',2,1),('public','icetwo','summary',2,1);" >/dev/null
+    q "$HOST" "INSERT INTO coldfront.vector_centroids (schema_name, table_name, column_name, generation, centroid_id, centroid) VALUES ('public','icetwo','embedding',1,0,ARRAY[1,0,0]::real[]),('public','icetwo','embedding',1,1,ARRAY[0,0,1]::real[]),('public','icetwo','summary',1,0,ARRAY[1,0]::real[]),('public','icetwo','summary',1,1,ARRAY[0,1]::real[]);" >/dev/null
+    q "$HOST" "UPDATE coldfront.vector_config SET generation = 1 WHERE table_name = 'icetwo';" >/dev/null
+    local T2; T2=$(qf "$HOST" <<'EOSQL'
+SELECT coldfront.ensure_attached();
+SELECT 'TWO_REG:' || array_to_string(vec_columns, ',') FROM coldfront.tiered_views WHERE relname = 'icetwo';
+SELECT 'TWO_COLS:' || string_agg(r['column_name']::text, ',' ORDER BY r['column_name']::text)
+  FROM duckdb.query($$SELECT column_name FROM (DESCRIBE ice.public.icetwo)$$) AS t(r)
+ WHERE starts_with(r['column_name']::text, '_cf_vec_list_');
+INSERT INTO icetwo VALUES (1, date_trunc('month',now()) + interval '13 hours', '[0,0,1]'::vector, '[0,1]'::vector);
+SELECT coldfront.ensure_attached();
+SELECT 'TWO_ASG:' || r['_cf_vec_list_embedding'] || '/' || r['_cf_vec_list_summary']
+  FROM iceberg_scan('ice.public.icetwo') r WHERE r['id'] = 1;
+EOSQL
+)
+    assert_eq "the registry records both vector columns"      "embedding,summary" "$(extract TWO_REG "$T2")"
+    assert_eq "the Iceberg schema carries a cluster column each" "_cf_vec_list_embedding,_cf_vec_list_summary" "$(extract TWO_COLS "$T2")"
+    # embedding [0,0,1] is nearest its centroid 1; summary [0,1] is nearest its 1.
+    assert_eq "one INSERT assigns every vector column"        "1/1" "$(extract TWO_ASG "$T2")"
+    # Only the first column is in the sort key, which is what makes its probe the
+    # only one that prunes.
+    local SK; SK=$(q "$HOST" "SELECT coldfront._vec_sort_key((SELECT vec_columns[1] FROM coldfront.tiered_views WHERE relname='icetwo'), NULL);")
+    assert_eq "the sort key names only the first vector column" "_cf_vec_list_embedding" "$SK"
+
+    # Multi-row INSERT ... SELECT of cold rows: the extension rewrites this in C,
+    # a different generator from the single-row trigger above, and it builds its
+    # projection from the hot table's own column list.
+    local B; B=$(qf "$HOST" <<'EOSQL'
+INSERT INTO chunks (ts, body, embedding)
+SELECT date_trunc('month',now()) - interval '4 months' + interval '20 days' + (i || ' hours')::interval,
+       'bulk' || i, ARRAY[i, i + 1, i + 2]::real[]::vector
+  FROM generate_series(1, 3) i;
+SELECT 'BULK_N:' || count(*) FROM chunks WHERE body LIKE 'bulk%';
+SELECT 'BULK_VEC:' || (embedding = ARRAY[2,3,4]::real[])::text FROM chunks WHERE body = 'bulk2';
+EOSQL
+)
+    assert_eq "bulk cold INSERT of vectors lands"     "3"    "$(extract BULK_N "$B")"
+    assert_eq "bulk cold INSERT round-trips the vector" "true" "$(extract BULK_VEC "$B")"
+
+    # The cluster column belongs to the Iceberg schema and to nothing else: no
+    # branch of the view projects it, so no query written against the view can
+    # name it and SELECT * stays the user's own column list.
+    local H; H=$(qf "$HOST" <<'EOSQL'
+SELECT coldfront.ensure_attached();
+SELECT 'ICE_LIST:' || count(*) FROM duckdb.query($$SELECT column_name FROM (DESCRIBE ice.public.chunks)$$) AS t(r)
+ WHERE r['column_name']::text = '_cf_vec_list_embedding';
+SELECT 'VIEW_LIST:' || count(*) FROM pg_attribute
+ WHERE attrelid = 'public.chunks'::regclass AND attname = '_cf_vec_list_embedding' AND attnum > 0;
+SELECT 'HOT_LIST:' || count(*) FROM pg_attribute
+ WHERE attrelid = 'public._chunks'::regclass AND attname = '_cf_vec_list_embedding' AND attnum > 0;
+EOSQL
+)
+    assert_eq "the cluster column is in the Iceberg schema" "1" "$(extract ICE_LIST "$H")"
+    assert_eq "the view does not project it"                "0" "$(extract VIEW_LIST "$H")"
+    assert_eq "the hot table does not carry it"             "0" "$(extract HOT_LIST "$H")"
+
+    # Training reads the cold corpus through DuckDB and writes a centroid set back
+    # into PostgreSQL. Two clusters over the archived rows is enough to prove the
+    # loop runs, the means come back as real[], and the generation pointer moves.
+    # CALL, not SELECT: reading a DuckDB result is only possible outside a function.
+    q "$HOST" "INSERT INTO coldfront.vector_config (schema_name, table_name, column_name, nlist, nprobe) VALUES ('public','chunks','embedding',2,1);" >/dev/null
+    local T; T=$(qf "$HOST" <<'EOSQL'
+CALL coldfront.vector_train('public','chunks','embedding');
+SELECT 'GEN:' || generation FROM coldfront.vector_config WHERE table_name = 'chunks';
+SELECT 'NCENT:' || count(*) FROM coldfront.vector_centroids
+ WHERE table_name = 'chunks' AND generation = (SELECT generation FROM coldfront.vector_config WHERE table_name = 'chunks');
+SELECT 'DIMS:' || string_agg(DISTINCT array_length(centroid,1)::text, ',') FROM coldfront.vector_centroids WHERE table_name = 'chunks';
+SELECT 'FINITE:' || bool_and(c > '-Infinity'::real AND c < 'Infinity'::real)::text
+  FROM coldfront.vector_centroids, unnest(centroid) c WHERE table_name = 'chunks';
+-- k-means++ excludes a point it has already chosen (its distance to the seed set is
+-- zero), so no two centroids may start from the same row. Distinct after the Lloyd
+-- means as well, which a collapsed pair would not be.
+SELECT 'DISTINCT:' || count(DISTINCT centroid::text) FROM coldfront.vector_centroids
+ WHERE table_name = 'chunks'
+   AND generation = (SELECT generation FROM coldfront.vector_config WHERE table_name = 'chunks');
+EOSQL
+)
+    assert_eq "training writes a new generation"        "1"    "$(extract GEN "$T")"
+    assert_eq "training stores the trained centroids"   "2"    "$(extract NCENT "$T")"
+    assert_eq "centroids keep the column's dimension"   "3"    "$(extract DIMS "$T")"
+    assert_eq "centroid means are finite"               "true" "$(extract FINITE "$T")"
+    assert_eq "seeding picked distinct starting points"  "2"    "$(extract DISTINCT "$T")"
+
+    # A retrain is a new generation, never an edit of the one queries are resolving.
+    local T2; T2=$(qf "$HOST" <<'EOSQL'
+CALL coldfront.vector_train('public','chunks','embedding');
+SELECT 'GEN2:' || generation FROM coldfront.vector_config WHERE table_name = 'chunks';
+SELECT 'GENS:' || string_agg(DISTINCT generation::text, ',' ORDER BY generation::text) FROM coldfront.vector_centroids WHERE table_name = 'chunks';
+EOSQL
+)
+    assert_eq "a retrain moves the pointer forward"     "2"     "$(extract GEN2 "$T2")"
+    assert_eq "the previous generation is left intact"  "1,2"   "$(extract GENS "$T2")"
+
+    # Training fewer centroids than the configured nprobe clamps nprobe in the
+    # same write: k-means returns at most one cluster per distinct point, and an
+    # unclamped row would fail vc_nprobe_fit and abort the transaction that did
+    # the training work.
+    local CL; CL=$(qf "$HOST" <<'EOSQL'
+SELECT coldfront.create_iceberg_table('public','vecclamp','[
+  {"name":"id","type":"bigint"},{"name":"ts","type":"timestamptz"},{"name":"embedding","type":"vector(2)"}
+]'::jsonb);
+INSERT INTO vecclamp VALUES (1, now(), '[1,0]'::vector), (2, now(), '[0,1]'::vector);
+INSERT INTO coldfront.vector_config (schema_name, table_name, column_name, nlist, nprobe)
+VALUES ('public','vecclamp','embedding',8,4);
+CALL coldfront.vector_train('public','vecclamp','embedding');
+SELECT 'CLAMP:' || nlist || '/' || nprobe FROM coldfront.vector_config WHERE table_name = 'vecclamp';
+EOSQL
+)
+    assert_eq "training clamps nprobe to the trained count" "2/2" "$(extract CLAMP "$CL")"
+
+    # With a generation live, every path that writes a vector into the cold tier
+    # stamps the cluster in the same statement. Two paths, one vector, read back
+    # from Iceberg: the view cannot project the column, by design.
+    local A; A=$(qf "$HOST" <<'EOSQL'
+INSERT INTO chunks (ts, body, embedding)
+VALUES (date_trunc('month',now()) - interval '4 months' + interval '21 days', 'asg_trig', '[1.5,-2,3]'::vector);
+INSERT INTO chunks (ts, body, embedding)
+SELECT date_trunc('month',now()) - interval '4 months' + interval '22 days', 'asg_bulk' || i, ARRAY[1.5,-2,3]::real[]::vector
+  FROM generate_series(1, 1) i;
+SELECT coldfront.ensure_attached();
+SELECT 'ASG:' || r['body'] || '=' || r['_cf_vec_list_embedding']
+  FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] IN ('asg_trig', 'asg_bulk1') ORDER BY r['body'];
+SELECT 'ASG_AGREE:' || count(DISTINCT r['_cf_vec_list_embedding']::int)
+  FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] IN ('asg_trig', 'asg_bulk1');
+SELECT 'ASG_NOTNULL:' || bool_and(r['_cf_vec_list_embedding'] IS NOT NULL)::text
+  FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] IN ('asg_trig', 'asg_bulk1');
+EOSQL
+)
+    assert_eq "every write path agrees on the cluster" "1"    "$(extract ASG_AGREE "$A")"
+    assert_eq "a written vector is never left unassigned" "true" "$(extract ASG_NOTNULL "$A")"
+
+    # The assignment is the nearest centroid, not just any value: computed here
+    # independently of the generator the write paths used.
+    local E; E=$(qf "$HOST" <<'EOSQL'
+SELECT coldfront.ensure_attached();
+SELECT 'EXPECT:' || (SELECT centroid_id FROM coldfront.vector_centroids
+   WHERE table_name = 'chunks' AND generation = (SELECT generation FROM coldfront.vector_config WHERE table_name = 'chunks')
+   ORDER BY centroid <=> ARRAY[1.5,-2,3]::real[] LIMIT 1);
+SELECT 'ACTUAL:' || min(r['_cf_vec_list_embedding']::int) FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] = 'asg_trig';
+EOSQL
+)
+    assert_eq "the stamped cluster is the nearest centroid" "$(extract EXPECT "$E")" "$(extract ACTUAL "$E")"
+
+    # Rows archived before any training stay unassigned, which a probe reads
+    # through the null arm of its predicate rather than missing.
+    local U; U=$(qf "$HOST" <<'EOSQL'
+SELECT coldfront.ensure_attached();
+SELECT 'PRE:' || count(*) FROM iceberg_scan('ice.public.chunks') r
+ WHERE r['body'] = 'cold' AND r['_cf_vec_list_embedding'] IS NULL;
+EOSQL
+)
+    assert_eq "a row written before training stays unassigned" "1" "$(extract PRE "$U")"
+
+    # A cold UPDATE that sets a new embedding must re-derive the cluster in the
+    # same statement. The row is found by its new cluster and no longer by its
+    # old one, which is the silent-invisibility bug stated as a test.
+    #
+    # The new vector is the centroid farthest from the one this row holds, read from
+    # the trained set rather than written here: that makes the move a real change of
+    # cluster whatever training produced, and it leaves the two assigned rows in
+    # different clusters, which is what the probe assertions below need.
+    local FARCENT
+    FARCENT=$(q "$HOST" "SELECT array_to_string(centroid, ',') FROM coldfront.vector_centroids
+        WHERE table_name = 'chunks'
+          AND generation = (SELECT generation FROM coldfront.vector_config WHERE table_name = 'chunks')
+        ORDER BY centroid <=> ARRAY[1.5,-2,3]::real[] DESC LIMIT 1;")
+    local OA; OA=$(qf "$HOST" <<'EOSQL'
+SELECT coldfront.ensure_attached();
+SELECT 'OLD_ASG:' || r['_cf_vec_list_embedding'] FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] = 'asg_trig';
+EOSQL
+)
+    local OLD_ASG; OLD_ASG=$(extract OLD_ASG "$OA")
+    local UP; UP=$(qf "$HOST" <<EOSQL
+SET coldfront.allow_mixed_writes = on;
+UPDATE chunks SET embedding = ARRAY[$FARCENT]::real[]::vector WHERE body = 'asg_trig';
+SELECT coldfront.ensure_attached();
+SELECT 'NEW_VEC:' || (r['embedding']::real[] = ARRAY[$FARCENT]::real[])::text
+  FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] = 'asg_trig';
+SELECT 'NEW_ASG:' || r['_cf_vec_list_embedding'] FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] = 'asg_trig';
+SELECT 'NEAREST_TO_NEW:' || (SELECT centroid_id FROM coldfront.vector_centroids
+   WHERE table_name = 'chunks' AND generation = (SELECT generation FROM coldfront.vector_config WHERE table_name = 'chunks')
+   ORDER BY centroid <=> ARRAY[$FARCENT]::real[] LIMIT 1);
+EOSQL
+)
+    assert_eq "a cold UPDATE writes the new embedding" "true" "$(extract NEW_VEC "$UP")"
+    assert_eq "a cold UPDATE re-derives the cluster" "$(extract NEAREST_TO_NEW "$UP")" "$(extract NEW_ASG "$UP")"
+    assert_ne "the row left its old cluster" "$OLD_ASG" "$(extract NEW_ASG "$UP")"
+
+    # An untrained column is a clear error, not a silent empty probe set.
+    local TE; TE=$(q_may "$HOST" "CALL coldfront.vector_train('public','chunks','nosuchcol',2);")
+    assert_err "training an unconfigured column is refused" "no configuration" "$TE"
+
+    # The probe. A recognised top-k reads only the clusters nearest the query
+    # vector, and the counts are what prove it: the predicate cannot be observed
+    # from the caller's side, since the column it tests is in no branch of the view.
+    #
+    # The query vector is the cluster asg_trig was just moved into, so a
+    # single-cluster probe reads that one and skips asg_bulk1's. nlist is 2, so
+    # nprobe=2 is exhaustive by construction and is the reference every other count
+    # is compared against. Each query is its own session, so a SET cannot leak into
+    # the next; psql prints the SET's own tag, which is not a row.
+    local topk="SELECT body FROM chunks ORDER BY embedding <=> ARRAY[$FARCENT]::real[]"
+    local ALL OFF ONE NOLIMIT
+    ALL=$(q     "$HOST" "SET coldfront.vector_nprobe = 2; $topk LIMIT 100;"  | grep -vx SET | grep -c . || true)
+    OFF=$(q     "$HOST" "SET coldfront.vector_probe = off; $topk LIMIT 100;" | grep -vx SET | grep -c . || true)
+    ONE=$(q     "$HOST" "SET coldfront.vector_nprobe = 1; $topk LIMIT 100;"  | grep -vx SET | grep -c . || true)
+    NOLIMIT=$(q "$HOST" "SET coldfront.vector_nprobe = 1; $topk;"            | grep -vx SET | grep -c . || true)
+    assert_eq "an exhaustive probe returns the exact answer"   "$OFF" "$ALL"
+    assert_gt "a narrower probe reads fewer rows"              "$ONE" "$ALL"
+    assert_eq "an unrecognised shape keeps its exact answer"   "$ALL" "$NOLIMIT"
+
+    # Which rows it drops, and which it must never drop.
+    local ONE_ROWS
+    ONE_ROWS=$(q "$HOST" "SET coldfront.vector_nprobe = 1; $topk LIMIT 100;" | grep -vx SET)
+    assert_eq "a probe reads the cluster it aimed at"          "1" "$(printf '%s\n' "$ONE_ROWS" | grep -c '^asg_trig$'  || true)"
+    assert_eq "a probe skips the cluster it did not look in"   "0" "$(printf '%s\n' "$ONE_ROWS" | grep -c '^asg_bulk1$' || true)"
+    assert_eq "a probe keeps every unassigned row"             "1" "$(printf '%s\n' "$ONE_ROWS" | grep -c '^coldins$'   || true)"
+    assert_eq "a probe keeps every hot row"                    "1" "$(printf '%s\n' "$ONE_ROWS" | grep -c '^hot$'       || true)"
+
+    # The predicate reaches the Iceberg scan itself rather than filtering above it,
+    # and a shape the rewrite declines carries none at all.
+    local PLAN_TOPK PLAN_PLAIN
+    PLAN_TOPK=$(q  "$HOST" "SET coldfront.vector_nprobe = 1; EXPLAIN (COSTS OFF, VERBOSE) $topk LIMIT 100;" 2>/dev/null)
+    PLAN_PLAIN=$(q "$HOST" "SET coldfront.vector_nprobe = 1; EXPLAIN (COSTS OFF, VERBOSE) $topk;" 2>/dev/null)
+    assert_contains "the probe predicate reaches the scan"    "_cf_vec_list_embedding" "$PLAN_TOPK"
+    assert_eq "a declined shape carries no predicate"          "0" "$(printf '%s\n' "$PLAN_PLAIN" | grep -c '_cf_vec_list_embedding' || true)"
+
+    # The null arm carrying its weight, stated as an answer rather than a count:
+    # coldins holds this exact vector and was written before there was a generation,
+    # so a probe returns it only through that disjunct. Asserted as membership in the
+    # top few rather than as the single winner: asg_trig carries a centroid, and a
+    # centroid of a cluster with one member IS that member's vector, so the two can
+    # tie at distance zero and either is then a correct answer to LIMIT 1.
+    local NEAR; NEAR=$(q "$HOST" "SET coldfront.vector_nprobe = 1; SELECT body FROM chunks ORDER BY embedding <=> ARRAY[4,5.5,-6]::real[] LIMIT 3;" | grep -vx SET | grep -c '^coldins$' || true)
+    assert_eq "a probed search still finds an unassigned row"  "1" "$NEAR"
+
+    # Grouping, aggregates, windows and DISTINCT ride the same narrowed scan: the
+    # probe rewrites the statement they sit in, and everything in it computes over
+    # the rows the probe reads. At an exhaustive probe each answers exactly what it
+    # answers with the probe off, which also proves the rewrite round-trips these
+    # shapes through deparse and reparse.
+    local shapes=(
+        "SELECT body FROM chunks GROUP BY body, embedding ORDER BY embedding <=> ARRAY[$FARCENT]::real[] LIMIT 100"
+        "SELECT count(*)::text FROM chunks GROUP BY embedding ORDER BY embedding <=> ARRAY[$FARCENT]::real[] LIMIT 100"
+        "SELECT body || '/' || (rank() OVER (ORDER BY embedding <=> ARRAY[$FARCENT]::real[]))::text FROM chunks ORDER BY embedding <=> ARRAY[$FARCENT]::real[] LIMIT 100"
+        "SELECT DISTINCT body, embedding <=> ARRAY[$FARCENT]::real[] AS d FROM chunks ORDER BY d LIMIT 100"
+    )
+    local names=("a grouped search" "an aggregated search" "a windowed search" "a DISTINCT search")
+    local si exact probed np
+    for si in 0 1 2 3; do
+        exact=$(q "$HOST"  "SET coldfront.vector_probe = off; ${shapes[$si]};" | grep -vx SET | sort | tr '\n' ' ')
+        probed=$(q "$HOST" "SET coldfront.vector_nprobe = 2; ${shapes[$si]};"  | grep -vx SET | sort | tr '\n' ' ')
+        assert_eq "${names[$si]} answers exactly at an exhaustive probe" "$exact" "$probed"
+        # Without this, the equality above passes vacuously when the shape is
+        # declined: both arms would be the same exact scan.
+        np=$(q "$HOST" "SET coldfront.vector_nprobe = 1; EXPLAIN (COSTS OFF, VERBOSE) ${shapes[$si]};" | grep -c "cf_vec_list" || true)
+        assert_gt "${names[$si]} carries the probe predicate" "0" "$np"
+    done
+    # And the probe is on the scan, not on the grouping: narrowed, the grouped
+    # search reads the same rows the plain one does.
+    local GN PN
+    GN=$(q "$HOST" "SET coldfront.vector_nprobe = 1; ${shapes[0]};" | grep -vx SET | sort | tr '\n' ' ')
+    PN=$(q "$HOST" "SET coldfront.vector_nprobe = 1; $topk LIMIT 100;" | grep -vx SET | sort | tr '\n' ' ')
+    assert_eq "a narrowed grouped search reads the plain search's rows" "$PN" "$GN"
+
+    # Decoupled: no hot arm, so the predicate becomes the whole of the cold arm's
+    # WHERE rather than an addition to a cutoff qual — the other branch of
+    # coldfront._vec_probed_viewdef. Row 1 predates the generation and row 2 sits in
+    # the cluster this probe does not look in.
+    local dtopk="SELECT id FROM icevec ORDER BY embedding <=> ARRAY[-1,-1,-1]::real[]"
+    local DONE_ DALL
+    DONE_=$(q "$HOST" "SET coldfront.vector_nprobe = 1; $dtopk LIMIT 100;" | grep -vx SET | grep -c . || true)
+    DALL=$(q  "$HOST" "SET coldfront.vector_nprobe = 2; $dtopk LIMIT 100;" | grep -vx SET | grep -c . || true)
+    assert_eq "a decoupled probe reads one cluster and the unassigned" "1" "$DONE_"
+    assert_eq "an exhaustive decoupled probe reads everything"         "2" "$DALL"
+
+    # vector_status reports what a retrain decision needs. Every count is compared
+    # against the same number computed independently from the cold table, so the
+    # assertions hold whatever the fixture grows into.
+    local S; S=$(qf "$HOST" <<'EOSQL'
+CALL coldfront.vector_status('public', 'chunks');
+SELECT coldfront.ensure_attached();
+SELECT 'REPORTED:' || count(*) FROM cf_vector_status;
+SELECT 'GEN:' || generation FROM cf_vector_status;
+SELECT 'TRAINED:' || clusters_trained FROM cf_vector_status;
+SELECT 'REPORTS:' || rows_total || '/' || rows_unassigned || '/' || clusters_occupied
+  FROM cf_vector_status;
+SELECT 'ACTUAL:' || count(*) || '/' || count(*) FILTER (WHERE r['_cf_vec_list_embedding'] IS NULL)
+       || '/' || count(DISTINCT r['_cf_vec_list_embedding']::int)
+  FROM iceberg_scan('ice.public.chunks') r;
+SELECT 'FRACTION_SANE:' || (probe_fraction > 0 AND probe_fraction <= 1)::text FROM cf_vector_status;
+SELECT 'FLOOR:' || (clusters_below_row_group = clusters_occupied)::text FROM cf_vector_status;
+SELECT 'ADVICE:' || (advice IS NOT NULL)::text FROM cf_vector_status;
+EOSQL
+)
+    assert_eq "vector_status reports the clustered table"  "1" "$(extract REPORTED "$S")"
+    assert_eq "it reports the live generation"             "2" "$(extract GEN "$S")"
+    assert_eq "it reports that generation's centroid count" "2" "$(extract TRAINED "$S")"
+    assert_eq "the distribution matches the cold table"    "$(extract ACTUAL "$S")" "$(extract REPORTS "$S")"
+    assert_eq "the probe fraction is a fraction"           "true" "$(extract FRACTION_SANE "$S")"
+    # Every cluster here holds one row, far under a row group, which is exactly the
+    # condition the floor exists to name.
+    assert_eq "clusters under one row group are counted"   "true" "$(extract FLOOR "$S")"
+    assert_eq "a fixture this small draws advice"          "true" "$(extract ADVICE "$S")"
+
+    # Assigning the rows that predate training. These are the rows vector_status
+    # just counted as unassigned, and they are read by every probe whatever clusters
+    # it looks in, so on a corpus tiered before training they are the entire cost of
+    # a search. One claimed UPDATE, reusing the SET item a cold UPDATE emits.
+    local unasg_before; unasg_before=$(extract REPORTS "$S" | cut -d/ -f2)
+    local A; A=$(qf "$HOST" <<'EOSQL'
+CALL coldfront.vector_assign('public', 'chunks', 'embedding');
+SELECT coldfront.ensure_attached();
+SELECT 'LEFT:' || count(*) FROM iceberg_scan('ice.public.chunks') r
+ WHERE r['_cf_vec_list_embedding'] IS NULL;
+SELECT 'ROWS:' || count(*) FROM iceberg_scan('ice.public.chunks') r;
+SELECT 'MATCHES:' || count(*) FROM iceberg_scan('ice.public.chunks') r
+ WHERE r['_cf_vec_list_embedding']::int = (
+   SELECT centroid_id FROM coldfront.vector_centroids c
+    WHERE c.table_name = 'chunks'
+      AND c.generation = (SELECT generation FROM coldfront.vector_config WHERE table_name = 'chunks')
+    ORDER BY c.centroid <=> r['embedding']::real[] LIMIT 1);
+EOSQL
+)
+    assert_gt "there were rows to assign"                  "0"   "$unasg_before"
+    assert_eq "no cold row is left without a cluster"      "0"   "$(extract LEFT "$A")"
+    assert_eq "assigning rewrote rows, it did not add any" "7"   "$(extract ROWS "$A")"
+    assert_eq "every row sits in its nearest cluster"      "$(extract ROWS "$A")" "$(extract MATCHES "$A")"
+
+    # Which is the point: with nothing unassigned, a narrow probe stops reading the
+    # whole table.
+    local narrowed
+    narrowed=$(q "$HOST" "SET coldfront.vector_nprobe = 1; $topk LIMIT 100;" | grep -vx SET | grep -c . || true)
+    assert_gt "a narrow probe now reads less than everything" "$narrowed" "$ALL"
+
+    # Idempotent: nothing to do the second time, and no rewrite to pay for.
+    local A2; A2=$(q_may "$HOST" "CALL coldfront.vector_assign('public','chunks','embedding');")
+    assert_contains "a second assign has nothing to do" "already assigned" "$A2"
+
+    # A NULL embedding through the identity-omitted slow path. The Iceberg schema
+    # declares one cluster column per vector column unconditionally, so the row's
+    # prefix slot must survive a NULL value: the insert succeeds, lands unassigned,
+    # and the view returns it through the null arm. A cold DELETE then restores the
+    # fixture's shape for the compaction story.
+    local NV; NV=$(qf "$HOST" <<'EOSQL'
+INSERT INTO chunks (ts, body, embedding)
+VALUES (date_trunc('month',now()) - interval '4 months' + interval '23 days', 'nullvec', NULL);
+SELECT coldfront.ensure_attached();
+SELECT 'NV_LAND:' || count(*) FROM iceberg_scan('ice.public.chunks') r
+ WHERE r['body'] = 'nullvec' AND r['embedding'] IS NULL AND r['_cf_vec_list_embedding'] IS NULL;
+SELECT 'NV_VIEW:' || count(*) FROM chunks WHERE body = 'nullvec';
+EOSQL
+)
+    assert_eq "a NULL embedding rides the slow path unassigned" "1" "$(extract NV_LAND "$NV")"
+    assert_eq "the view returns the NULL-embedding row"         "1" "$(extract NV_VIEW "$NV")"
+    local ND; ND=$(qf "$HOST" <<'EOSQL'
+DELETE FROM chunks WHERE body = 'nullvec';
+SELECT coldfront.ensure_attached();
+SELECT 'NV_GONE:' || count(*) FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] = 'nullvec';
+EOSQL
+)
+    assert_eq "the NULL-embedding row deletes cleanly" "0" "$(extract NV_GONE "$ND")"
+
+    story_vector_compaction
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story 5c — Compaction on a clustered table. Each cold write leaves a file
+# sorted within itself, so what accumulates is a set of files with overlapping
+# cluster ranges, and the rewrite has to merge them on the sort column rather
+# than append them. That the merge orders rows is asserted exactly in
+# cmd/compactor's unit tests, which read back through iceberg-go; what only a
+# real deployment can show is that the pass runs against a live catalog with the
+# claim held, keeps every row, converges, and leaves a probe answering the same
+# question.
+# ───────────────────────────────────────────────────────────────────────────
+story_vector_compaction() {
+    step "5c. Compaction of a clustered vector table"
+    require_compactor || return
+
+    # The answer a probed search gives, captured before the merge so it can be
+    # compared with the answer after it. Sorted and unbounded by the probe, because
+    # what must not change is the set of rows, not their order among equal distances.
+    local probe_q="SELECT body FROM chunks ORDER BY embedding <=> ARRAY[4,5.5,-6]::real[] LIMIT 100"
+    local answer_before; answer_before=$(q "$HOST" "SET coldfront.vector_nprobe = 1; $probe_q;" | grep -vx SET | sort | tr '\n' ' ')
+
+    local rows_before; rows_before=$(q "$HOST" "SELECT count(*) FROM chunks;")
+    local before; before=$("$COMPACTOR" --config /tmp/journey-chunks.yaml --table chunks --dry-run 2>&1)
+    if echo "$before" | grep -q "group(s)"; then
+        pass "a clustered table with small files reports work to do"
+    else
+        fail "nothing to compact on the clustered table: $before"; return
+    fi
+
+    if "$COMPACTOR" --config /tmp/journey-chunks.yaml --table chunks >/tmp/journey-compact-vec.log 2>&1; then
+        pass "the sort-key merge committed against a live catalog"
+    else
+        fail "compaction of chunks failed — see /tmp/journey-compact-vec.log"
+        tail -8 /tmp/journey-compact-vec.log; return
+    fi
+    assert_eq "the merge preserved every row" "$rows_before" "$(q "$HOST" "SELECT count(*) FROM chunks;")"
+
+    # A merge that did not converge would rewrite the same table forever.
+    local again; again=$("$COMPACTOR" --config /tmp/journey-chunks.yaml --table chunks --dry-run 2>&1)
+    if echo "$again" | grep -q "nothing to compact"; then
+        pass "a second pass over the merged table is a no-op"
+    else
+        fail "clustered table still reports work after compaction: $again"
+    fi
+
+    # The rows the cold UPDATE had marked deleted must not come back: the merge
+    # reads through the scan, which applies the position deletes it found.
+    local D; D=$(qf "$HOST" <<'EOSQL'
+SELECT coldfront.ensure_attached();
+SELECT 'ASG_ROWS:' || count(*) FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] = 'asg_trig';
+SELECT 'ASG_VEC:' || count(*) FROM iceberg_scan('ice.public.chunks') r
+ WHERE r['body'] = 'asg_trig' AND r['_cf_vec_list_embedding'] IS NOT NULL;
+EOSQL
+)
+    assert_eq "the merge applied the deletes it read through" "1" "$(extract ASG_ROWS "$D")"
+    assert_eq "the updated row kept its cluster"              "1" "$(extract ASG_VEC "$D")"
+
+    # A merge rewrites where every row lives, so the one thing it must not change is
+    # which rows a probe finds. Same query, same probe count, same answer.
+    local answer_after; answer_after=$(q "$HOST" "SET coldfront.vector_nprobe = 1; $probe_q;" | grep -vx SET | sort | tr '\n' ' ')
+    assert_eq "a probed search answers the same after compaction" "$answer_before" "$answer_after"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Story 6 — Writes via the view (proven assertions from run-ci-local).
 # ───────────────────────────────────────────────────────────────────────────
 story_writes() {
@@ -4148,8 +4739,9 @@ if [ "$MODE" = "tiered" ]; then
     [ "$MESH" = 1 ] && story_mesh_tiered    # cross-node tiered, while hot+cold coexist
     story_reads
     story_types
+    story_vector            # embeddings: vector → list<float> over all three cold-write paths
     story_writes
-    story_compaction        # iceberg-go RewriteDataFiles, now that the manifest-list
+    story_compaction        # iceberg-go RewriteDataFiles; the manifest-list
                             # format-version interop patch makes the cold tier's
                             # manifests iceberg-go-readable
     story_maintenance       # iceberg-go ExpireSnapshots + DeleteOrphanFiles — reclaim the

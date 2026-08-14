@@ -22,6 +22,8 @@ note() { echo -e "${YELLOW}  NOTE: $1${NC}"; }
 assert_eq()       { if [ "$2" = "$3" ];        then pass "$1"; else fail "$1 — expected '$2', got '$3'"; fi; }
 assert_gt()       { if [ "$3" -gt "$2" ] 2>/dev/null; then pass "$1"; else fail "$1 — expected > $2, got '$3'"; fi; }
 assert_contains() { case "$3" in *"$2"*) pass "$1";; *) fail "$1 — '$3' does not contain '$2'";; esac; }
+# Assert two values differ (for "this must have changed" checks).
+assert_ne()       { if [ "$2" != "$3" ]; then pass "$1"; else fail "$1 — both sides are '$2'"; fi; }
 # Assert a command/SQL produced a specific error fragment (for blocked-op / read-only stories).
 assert_err()      { case "$3" in *"$2"*) pass "$1";; *) fail "$1 — error did not contain '$2'; got: $3";; esac; }
 

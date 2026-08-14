@@ -2,23 +2,52 @@ package main
 
 import (
 	"errors"
-	"fmt"
 	"testing"
 
-	"github.com/apache/iceberg-go/catalog"
+	"github.com/apache/iceberg-go"
 )
 
-func TestLoadTableErr_NotFound(t *testing.T) {
-	// The REST catalog maps a 404 to catalog.ErrNoSuchTable, but its Error()
-	// renders the server's wording ("NoSuchTableException: Error getting
-	// tabular from catalog"), which says nothing useful to whoever ran the
-	// command. Only the identifier they typed matters.
-	raw := fmt.Errorf("NoSuchTableException: Error getting tabular from catalog: %w",
-		catalog.ErrNoSuchTable)
-	got := loadTableErr("public", "no_such_table", raw)
-	want := `table "public.no_such_table" not found in catalog`
-	if got.Error() != want {
-		t.Errorf("got %q, want %q", got.Error(), want)
+func testSchema() *iceberg.Schema {
+	return iceberg.NewSchema(0,
+		iceberg.NestedField{ID: 1, Name: "id", Type: iceberg.PrimitiveTypes.Int64},
+		iceberg.NestedField{ID: 2, Name: "list", Type: iceberg.PrimitiveTypes.Int32},
+		iceberg.NestedField{ID: 3, Name: "label", Type: iceberg.PrimitiveTypes.String},
+	)
+}
+
+func TestSortField(t *testing.T) {
+	sc := testSchema()
+	tests := []struct {
+		name    string
+		props   iceberg.Properties
+		wantID  int
+		wantOK  bool
+		wantErr bool
+	}{
+		{name: "absent leaves compaction alone", props: iceberg.Properties{}},
+		{name: "nil props", props: nil},
+		{name: "blank is absent", props: iceberg.Properties{sortKeyProp: "  "}},
+		{name: "single column", props: iceberg.Properties{sortKeyProp: "list"}, wantID: 2, wantOK: true},
+		// Only the leading column orders files: within one list value the
+		// secondary key never straddles two files.
+		{name: "compound key uses the first", props: iceberg.Properties{sortKeyProp: "list, id"}, wantID: 2, wantOK: true},
+		// A key naming a column that is not there is a misconfiguration, and
+		// rewriting anyway would scramble the layout it was meant to protect.
+		{name: "unknown column errors", props: iceberg.Properties{sortKeyProp: "nope"}, wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			field, ok, err := sortField(tt.props, sc)
+			if (err != nil) != tt.wantErr {
+				t.Fatalf("err = %v, wantErr = %v", err, tt.wantErr)
+			}
+			if ok != tt.wantOK {
+				t.Fatalf("ok = %v, want %v", ok, tt.wantOK)
+			}
+			if ok && field.ID != tt.wantID {
+				t.Errorf("field.ID = %d, want %d", field.ID, tt.wantID)
+			}
+		})
 	}
 }
 

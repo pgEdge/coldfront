@@ -65,8 +65,10 @@ nav:
       - Overview: architecture.md
       - Tiered Mode: architecture_tiered.md
       - Decoupled Mode: architecture_decoupled.md
+      - Vector Storage: architecture_vectors.md
 
   - Using ColdFront: usage.md
+  - Embeddings: usage_vectors.md
   - Compaction: compaction.md
 
   - Developer Resources:
