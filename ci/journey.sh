@@ -720,9 +720,9 @@ EOSQL
     local DL; DL=$(qf "$HOST" <<'EOSQL'
 SELECT coldfront.ensure_attached();
 SELECT 'DEC_ICE_LIST:' || count(*) FROM duckdb.query($$SELECT column_name FROM (DESCRIBE ice.public.icevec)$$) AS t(r)
- WHERE r['column_name']::text = '_cf_vec_list';
+ WHERE r['column_name']::text = '_cf_vec_list_embedding';
 SELECT 'DEC_VIEW_LIST:' || count(*) FROM pg_attribute
- WHERE attrelid = 'public.icevec'::regclass AND attname = '_cf_vec_list' AND attnum > 0;
+ WHERE attrelid = 'public.icevec'::regclass AND attname = '_cf_vec_list_embedding' AND attnum > 0;
 EOSQL
 )
     assert_eq "decoupled Iceberg schema carries the cluster column" "1" "$(extract DEC_ICE_LIST "$DL")"
@@ -736,10 +736,43 @@ EOSQL
     local DA; DA=$(qf "$HOST" <<'EOSQL'
 INSERT INTO icevec VALUES (2, date_trunc('month',now()) + interval '12 hours', '[7,-8.25,9]'::vector);
 SELECT coldfront.ensure_attached();
-SELECT 'DEC_ASG:' || r['_cf_vec_list'] FROM iceberg_scan('ice.public.icevec') r WHERE r['id'] = 2;
+SELECT 'DEC_ASG:' || r['_cf_vec_list_embedding'] FROM iceberg_scan('ice.public.icevec') r WHERE r['id'] = 2;
 EOSQL
 )
     assert_eq "a decoupled INSERT stamps the nearest cluster" "0" "$(extract DEC_ASG "$DA")"
+
+    # Two vector columns on one table. Each gets its own cluster column and its own
+    # assignment; only the first gets the file sort order, so only its probe prunes.
+    # Its own table, so nothing above depends on the second column existing.
+    local i2
+    for i2 in 1 2 3 4 5; do
+        q_may "$HOST" "SELECT coldfront.create_iceberg_table('public','icetwo','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"ts\",\"type\":\"timestamptz\"},{\"name\":\"embedding\",\"type\":\"vector(3)\"},{\"name\":\"summary\",\"type\":\"vector(2)\"}]'::jsonb);" >/dev/null 2>&1
+        [ "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname='icetwo' AND relkind='v';")" = "1" ] && break
+        sleep 2
+    done
+    q "$HOST" "INSERT INTO coldfront.vector_config (schema_name, table_name, column_name, nlist, nprobe) VALUES ('public','icetwo','embedding',2,1),('public','icetwo','summary',2,1);" >/dev/null
+    q "$HOST" "INSERT INTO coldfront.vector_centroids (schema_name, table_name, column_name, generation, centroid_id, centroid) VALUES ('public','icetwo','embedding',1,0,ARRAY[1,0,0]::real[]),('public','icetwo','embedding',1,1,ARRAY[0,0,1]::real[]),('public','icetwo','summary',1,0,ARRAY[1,0]::real[]),('public','icetwo','summary',1,1,ARRAY[0,1]::real[]);" >/dev/null
+    q "$HOST" "UPDATE coldfront.vector_config SET generation = 1 WHERE table_name = 'icetwo';" >/dev/null
+    local T2; T2=$(qf "$HOST" <<'EOSQL'
+SELECT coldfront.ensure_attached();
+SELECT 'TWO_REG:' || array_to_string(vec_columns, ',') FROM coldfront.tiered_views WHERE relname = 'icetwo';
+SELECT 'TWO_COLS:' || string_agg(r['column_name']::text, ',' ORDER BY r['column_name']::text)
+  FROM duckdb.query($$SELECT column_name FROM (DESCRIBE ice.public.icetwo)$$) AS t(r)
+ WHERE starts_with(r['column_name']::text, '_cf_vec_list_');
+INSERT INTO icetwo VALUES (1, date_trunc('month',now()) + interval '13 hours', '[0,0,1]'::vector, '[0,1]'::vector);
+SELECT coldfront.ensure_attached();
+SELECT 'TWO_ASG:' || r['_cf_vec_list_embedding'] || '/' || r['_cf_vec_list_summary']
+  FROM iceberg_scan('ice.public.icetwo') r WHERE r['id'] = 1;
+EOSQL
+)
+    assert_eq "the registry records both vector columns"      "embedding,summary" "$(extract TWO_REG "$T2")"
+    assert_eq "the Iceberg schema carries a cluster column each" "_cf_vec_list_embedding,_cf_vec_list_summary" "$(extract TWO_COLS "$T2")"
+    # embedding [0,0,1] is nearest its centroid 1; summary [0,1] is nearest its 1.
+    assert_eq "one INSERT assigns every vector column"        "1/1" "$(extract TWO_ASG "$T2")"
+    # Only the first column is in the sort key, which is what makes its probe the
+    # only one that prunes.
+    local SK; SK=$(q "$HOST" "SELECT coldfront._vec_sort_key((SELECT vec_columns[1] FROM coldfront.tiered_views WHERE relname='icetwo'), NULL);")
+    assert_eq "the sort key names only the first vector column" "_cf_vec_list_embedding" "$SK"
 
     # Multi-row INSERT ... SELECT of cold rows: the extension rewrites this in C,
     # a different generator from the single-row trigger above, and it builds its
@@ -762,11 +795,11 @@ EOSQL
     local H; H=$(qf "$HOST" <<'EOSQL'
 SELECT coldfront.ensure_attached();
 SELECT 'ICE_LIST:' || count(*) FROM duckdb.query($$SELECT column_name FROM (DESCRIBE ice.public.chunks)$$) AS t(r)
- WHERE r['column_name']::text = '_cf_vec_list';
+ WHERE r['column_name']::text = '_cf_vec_list_embedding';
 SELECT 'VIEW_LIST:' || count(*) FROM pg_attribute
- WHERE attrelid = 'public.chunks'::regclass AND attname = '_cf_vec_list' AND attnum > 0;
+ WHERE attrelid = 'public.chunks'::regclass AND attname = '_cf_vec_list_embedding' AND attnum > 0;
 SELECT 'HOT_LIST:' || count(*) FROM pg_attribute
- WHERE attrelid = 'public._chunks'::regclass AND attname = '_cf_vec_list' AND attnum > 0;
+ WHERE attrelid = 'public._chunks'::regclass AND attname = '_cf_vec_list_embedding' AND attnum > 0;
 EOSQL
 )
     assert_eq "the cluster column is in the Iceberg schema" "1" "$(extract ICE_LIST "$H")"
@@ -813,11 +846,11 @@ INSERT INTO chunks (ts, body, embedding)
 SELECT date_trunc('month',now()) - interval '4 months' + interval '22 days', 'asg_bulk' || i, ARRAY[1.5,-2,3]::real[]::vector
   FROM generate_series(1, 1) i;
 SELECT coldfront.ensure_attached();
-SELECT 'ASG:' || r['body'] || '=' || r['_cf_vec_list']
+SELECT 'ASG:' || r['body'] || '=' || r['_cf_vec_list_embedding']
   FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] IN ('asg_trig', 'asg_bulk1') ORDER BY r['body'];
-SELECT 'ASG_AGREE:' || count(DISTINCT r['_cf_vec_list']::int)
+SELECT 'ASG_AGREE:' || count(DISTINCT r['_cf_vec_list_embedding']::int)
   FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] IN ('asg_trig', 'asg_bulk1');
-SELECT 'ASG_NOTNULL:' || bool_and(r['_cf_vec_list'] IS NOT NULL)::text
+SELECT 'ASG_NOTNULL:' || bool_and(r['_cf_vec_list_embedding'] IS NOT NULL)::text
   FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] IN ('asg_trig', 'asg_bulk1');
 EOSQL
 )
@@ -831,7 +864,7 @@ SELECT coldfront.ensure_attached();
 SELECT 'EXPECT:' || (SELECT centroid_id FROM coldfront.vector_centroids
    WHERE table_name = 'chunks' AND generation = (SELECT generation FROM coldfront.vector_config WHERE table_name = 'chunks')
    ORDER BY centroid <=> ARRAY[1.5,-2,3]::real[] LIMIT 1);
-SELECT 'ACTUAL:' || min(r['_cf_vec_list']::int) FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] = 'asg_trig';
+SELECT 'ACTUAL:' || min(r['_cf_vec_list_embedding']::int) FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] = 'asg_trig';
 EOSQL
 )
     assert_eq "the stamped cluster is the nearest centroid" "$(extract EXPECT "$E")" "$(extract ACTUAL "$E")"
@@ -841,7 +874,7 @@ EOSQL
     local U; U=$(qf "$HOST" <<'EOSQL'
 SELECT coldfront.ensure_attached();
 SELECT 'PRE:' || count(*) FROM iceberg_scan('ice.public.chunks') r
- WHERE r['body'] = 'cold' AND r['_cf_vec_list'] IS NULL;
+ WHERE r['body'] = 'cold' AND r['_cf_vec_list_embedding'] IS NULL;
 EOSQL
 )
     assert_eq "a row written before training stays unassigned" "1" "$(extract PRE "$U")"
@@ -861,7 +894,7 @@ EOSQL
         ORDER BY centroid <=> ARRAY[1.5,-2,3]::real[] DESC LIMIT 1;")
     local OA; OA=$(qf "$HOST" <<'EOSQL'
 SELECT coldfront.ensure_attached();
-SELECT 'OLD_ASG:' || r['_cf_vec_list'] FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] = 'asg_trig';
+SELECT 'OLD_ASG:' || r['_cf_vec_list_embedding'] FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] = 'asg_trig';
 EOSQL
 )
     local OLD_ASG; OLD_ASG=$(extract OLD_ASG "$OA")
@@ -871,7 +904,7 @@ UPDATE chunks SET embedding = ARRAY[$FARCENT]::real[]::vector WHERE body = 'asg_
 SELECT coldfront.ensure_attached();
 SELECT 'NEW_VEC:' || (r['embedding']::real[] = ARRAY[$FARCENT]::real[])::text
   FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] = 'asg_trig';
-SELECT 'NEW_ASG:' || r['_cf_vec_list'] FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] = 'asg_trig';
+SELECT 'NEW_ASG:' || r['_cf_vec_list_embedding'] FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] = 'asg_trig';
 SELECT 'NEAREST_TO_NEW:' || (SELECT centroid_id FROM coldfront.vector_centroids
    WHERE table_name = 'chunks' AND generation = (SELECT generation FROM coldfront.vector_config WHERE table_name = 'chunks')
    ORDER BY centroid <=> ARRAY[$FARCENT]::real[] LIMIT 1);
@@ -917,8 +950,8 @@ EOSQL
     local PLAN_TOPK PLAN_PLAIN
     PLAN_TOPK=$(q  "$HOST" "SET coldfront.vector_nprobe = 1; EXPLAIN (COSTS OFF, VERBOSE) $topk LIMIT 100;" 2>/dev/null)
     PLAN_PLAIN=$(q "$HOST" "SET coldfront.vector_nprobe = 1; EXPLAIN (COSTS OFF, VERBOSE) $topk;" 2>/dev/null)
-    assert_contains "the probe predicate reaches the scan"    "_cf_vec_list" "$PLAN_TOPK"
-    assert_eq "a declined shape carries no predicate"          "0" "$(printf '%s\n' "$PLAN_PLAIN" | grep -c '_cf_vec_list' || true)"
+    assert_contains "the probe predicate reaches the scan"    "_cf_vec_list_embedding" "$PLAN_TOPK"
+    assert_eq "a declined shape carries no predicate"          "0" "$(printf '%s\n' "$PLAN_PLAIN" | grep -c '_cf_vec_list_embedding' || true)"
 
     # The null arm carrying its weight, stated as an answer rather than a count:
     # coldins holds this exact vector and was written before there was a generation,
@@ -951,8 +984,8 @@ SELECT 'GEN:' || generation FROM cf_vector_status;
 SELECT 'TRAINED:' || clusters_trained FROM cf_vector_status;
 SELECT 'REPORTS:' || rows_total || '/' || rows_unassigned || '/' || clusters_occupied
   FROM cf_vector_status;
-SELECT 'ACTUAL:' || count(*) || '/' || count(*) FILTER (WHERE r['_cf_vec_list'] IS NULL)
-       || '/' || count(DISTINCT r['_cf_vec_list']::int)
+SELECT 'ACTUAL:' || count(*) || '/' || count(*) FILTER (WHERE r['_cf_vec_list_embedding'] IS NULL)
+       || '/' || count(DISTINCT r['_cf_vec_list_embedding']::int)
   FROM iceberg_scan('ice.public.chunks') r;
 SELECT 'FRACTION_SANE:' || (probe_fraction > 0 AND probe_fraction <= 1)::text FROM cf_vector_status;
 SELECT 'FLOOR:' || (clusters_below_row_group = clusters_occupied)::text FROM cf_vector_status;
@@ -978,10 +1011,10 @@ EOSQL
 CALL coldfront.vector_assign('public', 'chunks', 'embedding');
 SELECT coldfront.ensure_attached();
 SELECT 'LEFT:' || count(*) FROM iceberg_scan('ice.public.chunks') r
- WHERE r['_cf_vec_list'] IS NULL;
+ WHERE r['_cf_vec_list_embedding'] IS NULL;
 SELECT 'ROWS:' || count(*) FROM iceberg_scan('ice.public.chunks') r;
 SELECT 'MATCHES:' || count(*) FROM iceberg_scan('ice.public.chunks') r
- WHERE r['_cf_vec_list']::int = (
+ WHERE r['_cf_vec_list_embedding']::int = (
    SELECT centroid_id FROM coldfront.vector_centroids c
     WHERE c.table_name = 'chunks'
       AND c.generation = (SELECT generation FROM coldfront.vector_config WHERE table_name = 'chunks')
@@ -1056,7 +1089,7 @@ story_vector_compaction() {
 SELECT coldfront.ensure_attached();
 SELECT 'ASG_ROWS:' || count(*) FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] = 'asg_trig';
 SELECT 'ASG_VEC:' || count(*) FROM iceberg_scan('ice.public.chunks') r
- WHERE r['body'] = 'asg_trig' AND r['_cf_vec_list'] IS NOT NULL;
+ WHERE r['body'] = 'asg_trig' AND r['_cf_vec_list_embedding'] IS NOT NULL;
 EOSQL
 )
     assert_eq "the merge applied the deletes it read through" "1" "$(extract ASG_ROWS "$D")"

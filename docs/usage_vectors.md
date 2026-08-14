@@ -222,11 +222,49 @@ holding that number up, and says which:
 | no trained generation | `CALL coldfront.vector_train(...)` |
 | over half the rows predate training | `CALL coldfront.vector_assign(...)`, then compact |
 | over half the clusters hold less than one row group | retrain with a smaller `nlist` |
-| clusters are lopsided by more than 10x | retrain |
+| the largest clusters hold over 4x the median | expect some queries to be slower than `probe_fraction` suggests; uneven clusters are mostly a property of the embeddings and a retrain rarely changes it |
 
 Pass a schema and table to report on one column: `CALL
 coldfront.vector_status('public', 'chunks')`. The results land in a temporary table
 that lasts for your session, and each call replaces the last.
+
+## More than one vector column
+
+A table may carry as many vector columns as you like. Each gets its own
+configuration, its own centroids and its own generation, and each is assigned on
+every write path:
+
+```sql
+INSERT INTO coldfront.vector_config (schema_name, table_name, column_name, nlist, nprobe)
+VALUES ('public', 'docs', 'body_embedding',  1000, 20),
+       ('public', 'docs', 'title_embedding', 1000, 20);
+CALL coldfront.vector_train('public', 'docs', 'body_embedding');
+CALL coldfront.vector_train('public', 'docs', 'title_embedding');
+```
+
+**Only the first vector column's searches get the full speedup.** Not a policy
+choice: a Parquet file has one physical row order, and the clustering works by
+putting a cluster's rows next to each other so the reader can skip whole row groups.
+The first column in table order gets that order. A second column's clusters are
+scattered through it, so its row-group statistics cover most of the file and nothing
+gets skipped.
+
+What a later column still gets is the filter. Its predicate cuts the rows that have
+to be *scored*, just not the rows that have to be *read*, and reading is about 95% of
+the cost. Expect single-digit percent rather than the 54x the first column gets.
+
+`vector_status` reports which is which:
+
+```sql
+SELECT table_name, column_name, prunes, probe_fraction FROM cf_vector_status;
+```
+
+`prunes` is true for the one column that owns the sort order. For the others,
+`probe_fraction` describes the rows scored rather than the rows read.
+
+If a second vector column needs to be fast, the honest answer is a second table
+holding that column and a key, ordered by its own clustering. That is what a
+secondary index is, and Iceberg gives us no way to have two orders in one file.
 
 ## What a clustered table needs from the deployment
 

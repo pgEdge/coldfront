@@ -75,14 +75,15 @@ func (c Column) HotRef() (ref string, aliased bool) {
 	return pgx.Identifier{c.Name}.Sanitize(), false
 }
 
-// VecListColumn is the Iceberg-only column carrying a row's cluster assignment.
-// It exists in the Iceberg schema and nowhere else: not on the hot table, and not
-// in either branch of the view, so no query written against the view can name it.
+// VecListColumn names the Iceberg-only column carrying a row's cluster assignment
+// for one vector column. Such a column exists in the Iceberg schema and nowhere
+// else: not on the hot table, and not in either branch of the view, so no query
+// written against the view can name it. coldfront._vec_list_col is the SQL twin.
 //
-// It leads the schema rather than trailing it. Iceberg evolution appends, and a
+// They lead the schema rather than trailing it. Iceberg evolution appends, and a
 // cold INSERT is positional because Iceberg rejects a targeted one, so a column
 // added later must land after everything both sides already agree on.
-const VecListColumn = "_cf_vec_list"
+func VecListColumn(col string) string { return "_cf_vec_list_" + col }
 
 // HasVector reports whether a column set carries a vector, which is what decides
 // whether the Iceberg schema gets the cluster column at all. A table without one

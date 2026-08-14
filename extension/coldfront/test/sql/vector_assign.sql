@@ -16,8 +16,8 @@ SET coldfront.lakekeeper_endpoint = '';
 CALL coldfront.vector_assign('public', 'chunks', 'embedding');
 
 CREATE TABLE public._chunks (id bigint, ts timestamptz, embedding vector(3));
-INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col, vec_column)
-VALUES ('public', 'chunks', 'public._chunks', 'ice.default.chunks', 'ts', 'embedding');
+INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col, vec_columns)
+VALUES ('public', 'chunks', 'public._chunks', 'ice.default.chunks', 'ts', ARRAY['embedding']);
 
 -- Registered, but the column named is not the clustered one.
 CALL coldfront.vector_assign('public', 'chunks', 'other');

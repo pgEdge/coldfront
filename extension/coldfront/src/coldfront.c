@@ -246,7 +246,9 @@ typedef struct {
     char        *partition_col;   /* e.g. "ts"; NULL when is_iceberg_only */
     bool         has_cutoff;      /* false → nothing archived yet */
     bool         is_iceberg_only; /* true → table lives entirely in Iceberg, no hot tier */
-    char        *vec_column;      /* clustered vector column, or NULL when none */
+    char        *vec_columns;     /* comma-joined vector columns, or NULL when none.
+                                   * First owns the file sort order; only its probe
+                                   * prunes row groups (see _vec_sort_key). */
     TimestampTz  cutoff;          /* archive watermark            */
 } TieredViewInfo;
 
@@ -289,7 +291,7 @@ lookup_tiered_view(Oid relid, const char *vname, TieredViewInfo *info)
     initStringInfo(&sql);
     appendStringInfo(&sql,
         "SELECT tv.hot_table, tv.iceberg_table, tv.partition_col, "
-        "       tv.is_iceberg_only, aw.cutoff_time, tv.vec_column "
+        "       tv.is_iceberg_only, aw.cutoff_time, array_to_string(tv.vec_columns, ',') "
         "FROM coldfront.tiered_views tv "
         "LEFT JOIN coldfront.archive_watermark aw ON aw.table_name = %s "
         "WHERE tv.schema_name = %s AND tv.relname = %s",
@@ -325,7 +327,7 @@ lookup_tiered_view(Oid relid, const char *vname, TieredViewInfo *info)
 
         /* NULL unless the table has a clustered vector column. */
         s = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 6);
-        info->vec_column = s ? pstrdup(s) : NULL;
+        info->vec_columns = s ? pstrdup(s) : NULL;
 
         MemoryContextSwitchTo(oldcxt);
         found = true;
@@ -992,7 +994,7 @@ build_cold_dml(DeparseResult *dr, TieredViewInfo *info, Query *query)
      * embedding changes while its cluster does not is permanently invisible to
      * its own probe, silently. */
     if (query != NULL && query->commandType == CMD_UPDATE
-        && info->vec_column != NULL)
+        && info->vec_columns != NULL)
     {
         RangeTblEntry *rte = (RangeTblEntry *) list_nth(query->rtable,
                                                         query->resultRelation - 1);
@@ -1396,7 +1398,7 @@ emit_cold(Query *query, TieredViewInfo *info, ColdParamSet *ps, bool in_plpgsql)
      * is derived in the same statement: a row whose cluster disagrees with its
      * vector is invisible to its own search and reports no error. */
     if (query->commandType == CMD_INSERT && info->is_iceberg_only
-        && info->vec_column != NULL)
+        && info->vec_columns != NULL)
     {
         char *col_list = insert_targetlist_collist(query);
         char *with_cluster = build_iceberg_only_insert_with_cluster(
@@ -1846,48 +1848,61 @@ named_set_target(Query *query, RangeTblEntry *rte, const char *colname)
 }
 
 /*
- * Re-stamp the cluster on a cold UPDATE that sets the embedding.
+ * Re-stamp the cluster on a cold UPDATE that sets an embedding.
  *
  * The derivation takes the text of the new embedding expression rather than a
  * value, which is what makes this tractable: this path never sees row contents.
  * The expression is evaluated twice, once for the column and once for the
  * cluster.  Returns the extended statement, or NULL to leave it untouched.
+ *
+ * Every vector column the UPDATE sets gets its own SET item, because each has its
+ * own cluster column and leaving one stale would make those rows invisible to that
+ * column's probe while the others stayed correct.
  */
 static char *
 add_cluster_set_item(Query *query, RangeTblEntry *rte, TieredViewInfo *info,
                      const char *cold_dml)
 {
-    TargetEntry   *tle;
-    List          *dpcontext;
-    char          *e_text, *item = NULL;
-    StringInfoData q;
+    char *out = NULL;
+    char *cols = pstrdup(info->vec_columns);
+    char *col  = strtok(cols, ",");
 
-    tle = named_set_target(query, rte, info->vec_column);
-    if (tle == NULL)
-        return NULL;                    /* the UPDATE does not touch the vector */
-
-    dpcontext = deparse_context_for(get_rel_name(rte->relid), rte->relid);
-    e_text    = deparse_expression((Node *) tle->expr, dpcontext, false, false);
-
-    initStringInfo(&q);
-    appendStringInfo(&q, "SELECT coldfront._vec_list_set_item(%s, %s)",
-                     quote_literal_cstr(info->iceberg_table),
-                     quote_literal_cstr(e_text));
-    if (SPI_connect() == SPI_OK_CONNECT)
+    for (; col != NULL; col = strtok(NULL, ","))
     {
-        if (SPI_execute(q.data, true, 1) == SPI_OK_SELECT && SPI_processed == 1)
-        {
-            MemoryContext oldcxt = MemoryContextSwitchTo(CurTransactionContext);
-            item = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
-            MemoryContextSwitchTo(oldcxt);
-        }
-        SPI_finish();
-    }
-    if (item == NULL)
-        return NULL;
+        TargetEntry   *tle = named_set_target(query, rte, col);
+        List          *dpcontext;
+        char          *e_text, *item = NULL;
+        StringInfoData q;
 
-    /* The item carries the caller's own PG spelling of the new embedding. */
-    return add_set_item(cold_dml, normalize_casts_for_duckdb(item));
+        if (tle == NULL)
+            continue;               /* the UPDATE does not touch this vector */
+
+        dpcontext = deparse_context_for(get_rel_name(rte->relid), rte->relid);
+        e_text    = deparse_expression((Node *) tle->expr, dpcontext, false, false);
+
+        initStringInfo(&q);
+        appendStringInfo(&q, "SELECT coldfront._vec_list_set_item(%s, %s, %s)",
+                         quote_literal_cstr(info->iceberg_table),
+                         quote_literal_cstr(col),
+                         quote_literal_cstr(e_text));
+        if (SPI_connect() == SPI_OK_CONNECT)
+        {
+            if (SPI_execute(q.data, true, 1) == SPI_OK_SELECT && SPI_processed == 1)
+            {
+                MemoryContext oldcxt = MemoryContextSwitchTo(CurTransactionContext);
+                item = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+                MemoryContextSwitchTo(oldcxt);
+            }
+            SPI_finish();
+        }
+        if (item == NULL)
+            continue;
+
+        /* The item carries the caller's own PG spelling of the new embedding. */
+        out = add_set_item(out ? out : cold_dml, normalize_casts_for_duckdb(item));
+    }
+    return out;
+
 }
 
 /*
@@ -1906,16 +1921,17 @@ build_iceberg_only_insert_with_cluster(Query *query, TieredViewInfo *info,
 {
     StringInfoData sql, q;
     char          *prefix = NULL;
-    char          *list_col = NULL;
+    char          *list_cols = NULL;   /* already quoted and comma-joined */
 
-    if (info->vec_column == NULL)
+    if (info->vec_columns == NULL)
         return NULL;
 
     /* The assignment reads the vector out of the derived table. */
     initStringInfo(&q);
     appendStringInfo(&q,
-        "SELECT coldfront._vec_list_col(), "
+        "SELECT coldfront._vec_list_cols_for_ref(%s), "
         "       coldfront._vec_list_prefix_for_ref(%s, %s)",
+        quote_literal_cstr(info->iceberg_table),
         quote_literal_cstr(info->iceberg_table),
         quote_literal_cstr("coldfront_src."));
     if (SPI_connect() == SPI_OK_CONNECT)
@@ -1923,19 +1939,19 @@ build_iceberg_only_insert_with_cluster(Query *query, TieredViewInfo *info,
         if (SPI_execute(q.data, true, 1) == SPI_OK_SELECT && SPI_processed == 1)
         {
             MemoryContext oldcxt = MemoryContextSwitchTo(CurTransactionContext);
-            list_col = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+            list_cols = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
             prefix   = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2);
             MemoryContextSwitchTo(oldcxt);
         }
         SPI_finish();
     }
-    if (prefix == NULL || list_col == NULL)
+    if (prefix == NULL || list_cols == NULL)
         return NULL;
 
     initStringInfo(&sql);
     appendStringInfo(&sql,
         "INSERT INTO %s (%s, %s) SELECT %s%s FROM (%s) AS coldfront_src(%s)",
-        info->iceberg_table, quote_identifier(list_col), col_list,
+        info->iceberg_table, list_cols, col_list,
         prefix, col_list, source, col_list);
     return sql.data;
 }
@@ -2021,7 +2037,7 @@ build_cold_bulk_call(Query *query, TieredViewInfo *info, const char *source,
     /* Ordered by cluster when there is one, so this write's own row groups each
      * hold roughly one cluster and a probe skips the rest of the file.  The
      * cluster leads the projection, hence ordinal 1. */
-    if (info->vec_column != NULL)
+    if (info->vec_columns != NULL)
         appendStringInfoString(&cold, " ORDER BY 1");
     cold_pfx  = prefix_pg_tables_with_pglocal(query, cold.data);
     cold_norm = normalize_casts_for_duckdb(cold_pfx);
@@ -2442,7 +2458,8 @@ cf_normalize_read_jsonb(Query *query)
     cf_reparse_and_replace(query, norm, &ps);
 }
 
-/* True for a reference to attno of the query's single range-table entry. */
+/* True for a reference to a column of the query's single range-table entry.
+ * InvalidAttrNumber matches any column, for a caller that wants to learn which. */
 static bool
 cf_is_single_rel_var(Node *node, AttrNumber attno)
 {
@@ -2451,7 +2468,9 @@ cf_is_single_rel_var(Node *node, AttrNumber attno)
     if (node == NULL || !IsA(node, Var))
         return false;
     var = (Var *) node;
-    return var->varno == 1 && var->varattno == attno && var->varlevelsup == 0;
+    if (var->varno != 1 || var->varlevelsup != 0)
+        return false;
+    return attno == InvalidAttrNumber || var->varattno == attno;
 }
 
 /*
@@ -2519,6 +2538,7 @@ cf_maybe_inject_probe(Query *query)
     Oid             funcid;
     char           *fname;
     AttrNumber      vec_attno;
+    char           *vec_name;
     Node           *lhs, *rhs, *other;
     char           *vec_lit;
     char           *body = NULL;
@@ -2541,7 +2561,7 @@ cf_maybe_inject_probe(Query *query)
         return;
     if (!lookup_tiered_view(view_rte->relid, get_rel_name(view_rte->relid), &info))
         return;
-    if (info.vec_column == NULL)
+    if (info.vec_columns == NULL)
         return;
 
     /* The single sort key, which may be resjunk (ORDER BY an unselected expr). */
@@ -2579,17 +2599,26 @@ cf_maybe_inject_probe(Query *query)
     if (fname == NULL || strcmp(fname, "list_cosine_distance") != 0)  /* nosemgrep */
         return;
 
-    /* One side is the view's vector column, the other is the query vector. */
-    vec_attno = get_attnum(view_rte->relid, info.vec_column);
-    if (vec_attno == InvalidAttrNumber)
-        return;
+    /* One side is a column of the view, the other is the query vector. Which column
+     * it is comes from the query rather than from the registry, because a table may
+     * carry several vector columns and each has its own cluster column. A column that
+     * is not configured resolves to no probe set and the rewrite declines. */
     lhs = (Node *) linitial(args);
     rhs = (Node *) lsecond(args);
-    if (cf_is_single_rel_var(lhs, vec_attno))
-        other = rhs;
-    else if (cf_is_single_rel_var(rhs, vec_attno))
-        other = lhs;
+    if (cf_is_single_rel_var(lhs, InvalidAttrNumber))
+    {
+        vec_attno = ((Var *) lhs)->varattno;
+        other     = rhs;
+    }
+    else if (cf_is_single_rel_var(rhs, InvalidAttrNumber))
+    {
+        vec_attno = ((Var *) rhs)->varattno;
+        other     = lhs;
+    }
     else
+        return;
+    vec_name = get_attname(view_rte->relid, vec_attno, true);
+    if (vec_name == NULL)
         return;
     vec_lit = cf_query_vector_literal(other);
     if (vec_lit == NULL)
@@ -2599,15 +2628,16 @@ cf_maybe_inject_probe(Query *query)
     initStringInfo(&q);
     appendStringInfo(&q,
                      "SELECT coldfront._vec_probed_viewdef(%s, %s, "
-                     "coldfront._vec_probe_qual(coldfront._vec_probe_ids("
+                     "coldfront._vec_probe_qual(%s, coldfront._vec_probe_ids("
                      "%s, %s, %s, %s::real[], %s)))",
                      quote_literal_cstr(get_namespace_name(
                                             get_rel_namespace(view_rte->relid))),
                      quote_literal_cstr(get_rel_name(view_rte->relid)),
+                     quote_literal_cstr(vec_name),
                      quote_literal_cstr(get_namespace_name(
                                             get_rel_namespace(view_rte->relid))),
                      quote_literal_cstr(get_rel_name(view_rte->relid)),
-                     quote_literal_cstr(info.vec_column),
+                     quote_literal_cstr(vec_name),
                      quote_literal_cstr(vec_lit),
                      coldfront_vector_nprobe > 0
                          ? psprintf("%d", coldfront_vector_nprobe) : "NULL");

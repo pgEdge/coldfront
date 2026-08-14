@@ -29,6 +29,7 @@ SELECT a.attname, format_type(a.atttypid, a.atttypmod) AS type
  schema_name              | text
  table_name               | text
  column_name              | text
+ prunes                   | boolean
  generation               | integer
  nlist                    | integer
  nprobe                   | integer
@@ -40,10 +41,12 @@ SELECT a.attname, format_type(a.atttypid, a.atttypmod) AS type
  rows_unassigned          | bigint
  rows_per_cluster_min     | bigint
  rows_per_cluster_max     | bigint
+ rows_per_cluster_p50     | bigint
+ rows_per_cluster_p99     | bigint
  clusters_below_row_group | integer
  probe_fraction           | numeric
  advice                   | text
-(17 rows)
+(20 rows)
 
 -- Re-running replaces the previous result rather than appending to it.
 CALL coldfront.vector_status();

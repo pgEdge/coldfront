@@ -84,13 +84,35 @@ A generation is immutable. A retrain writes a new one and moves the pointer, so
 an assignment already stored keeps meaning what it meant, and the primary key
 rejects a repeated `centroid_id` within one generation.
 
-`coldfront.tiered_views.vec_column` records which column is clustered. It cannot
-be derived afterwards in either mode: the view exposes `real[]` rather than the
-pgvector type, and a decoupled table names its types without holding them.
+`coldfront.tiered_views.vec_columns` records which columns are clustered, in order.
+It cannot be derived afterwards in either mode: the view exposes `real[]` rather than
+the pgvector type, and a decoupled table names its types without holding them.
 
-## The cluster column
+## The cluster columns, and which one owns the sort order
 
-`_cf_vec_list integer` exists in the Iceberg schema and nowhere else. It is not a
+A table may carry several vector columns. The Iceberg schema gets one cluster column
+per vector column, `_cf_vec_list_<column>`, leading the schema in column order, and
+every write path assigns all of them. The registry records the ordered list in
+`tiered_views.vec_columns`, and that order is a contract: a cold INSERT is
+positional, so the prefix must fill the cluster columns in exactly the order the
+schema declares them. `_vec_list_prefix` raises rather than emitting a short prefix,
+because a short one would land every following value in the wrong column.
+
+**Only `vec_columns[1]` appears in `coldfront.sort-key`.** A Parquet file has one
+physical row order, and pruning depends on a cluster's rows being adjacent so the
+reader can skip row groups on their statistics. Ordering by a second cluster column
+after the first would scatter its values inside every band of the first, leaving its
+statistics bounding the whole file. So a later column's probe filters the rows
+scored and prunes nothing read, and since S0 measured ~95% of query cost as column
+read and decode, that is worth single-digit percent rather than a multiple.
+`cf_vector_status.prunes` reports which column is which.
+
+The read path needs no registry lookup to pick between them: it takes the column
+name off the `ORDER BY` expression's Var and derives that column's cluster column
+from it. A column with no configuration resolves to no probe set and the rewrite
+declines.
+
+`_cf_vec_list_<column> integer` exists in the Iceberg schema and nowhere else. It is not a
 column of the hot table and neither branch of the view projects it, so no query
 written against the view can name it.
 
@@ -100,8 +122,8 @@ sides already agree on. Trailing the cluster column would put a user's
 `ADD COLUMN` on the far side of an internal column and silently misalign every
 positional write.
 
-`coldfront._vec_list_col()` and `view.VecListColumn` are the two spellings of the
-name.
+`coldfront._vec_list_col(column)` and `view.VecListColumn(column)` are the two
+spellings of the name.
 
 ## Assignment
 
@@ -164,7 +186,7 @@ staging table holds the user's own columns.
 The decoupled INSERT is targeted, so it is re-emitted over a derived table:
 
 ```sql
-INSERT INTO <ice> (_cf_vec_list, <cols>)
+INSERT INTO <ice> (_cf_vec_list_<col>, <cols>)
 SELECT <lookup>, <cols> FROM (<source>) AS coldfront_src(<cols>)
 ```
 
@@ -302,7 +324,8 @@ own definition carrying that predicate on its cold arm
 
 ```sql
 … WHERE r['ts'] < <cutoff>
-  AND (r['_cf_vec_list']::integer IN (3, 17) OR r['_cf_vec_list']::integer IS NULL)
+  AND (r['_cf_vec_list_embedding']::integer IN (3, 17)
+       OR r['_cf_vec_list_embedding']::integer IS NULL)
 ```
 
 The substitution exists because the predicate has nowhere else to go: the cluster

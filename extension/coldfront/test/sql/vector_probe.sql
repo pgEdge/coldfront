@@ -45,18 +45,18 @@ UPDATE coldfront.vector_config SET generation = 1 WHERE table_name = 'chunks';
 
 -- The predicate. The null arm is not optional: a row another engine appended
 -- straight to Iceberg carries no assignment, and a bare IN would drop it.
-SELECT coldfront._vec_probe_qual(ARRAY[1,2]) AS qual;
-SELECT coldfront._vec_probe_qual(coldfront._vec_probe_ids('public', 'chunks', 'embedding',
+SELECT coldfront._vec_probe_qual('embedding', ARRAY[1,2]) AS qual;
+SELECT coldfront._vec_probe_qual('embedding', coldfront._vec_probe_ids('public', 'chunks', 'embedding',
                                                           ARRAY[0.1,0.9,0.2]::real[])) AS qual_from_probe;
-SELECT coldfront._vec_probe_qual(NULL) IS NULL  AS no_probe_set,
-       coldfront._vec_probe_qual('{}') IS NULL  AS empty_probe_set;
+SELECT coldfront._vec_probe_qual('embedding', NULL) IS NULL  AS no_probe_set,
+       coldfront._vec_probe_qual('embedding', '{}') IS NULL  AS empty_probe_set;
 
 -- A real tiered view, built by the generator, so the definition the rewrite
 -- appends to is the one the product actually creates.
 CREATE TABLE public._chunks (id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz, body text, embedding vector(3));
 ALTER TABLE public._chunks ADD COLUMN IF NOT EXISTS "_cf_vec_embedding" real[] GENERATED ALWAYS AS ("embedding"::real[]) STORED;
-INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col, vec_column)
-VALUES ('public', 'chunks', 'public._chunks', 'ice.default.chunks', 'ts', 'embedding');
+INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col, vec_columns)
+VALUES ('public', 'chunks', 'public._chunks', 'ice.default.chunks', 'ts', ARRAY['embedding']);
 INSERT INTO coldfront.archive_watermark(schema_name, table_name, cutoff_time)
 VALUES ('public', 'chunks', '2026-03-01'::timestamptz);
 SELECT coldfront._rebuild_tiered_view('public', 'chunks');
@@ -65,11 +65,11 @@ SELECT coldfront._rebuild_tiered_view('public', 'chunks');
 -- name it, which is why the predicate has to be added inside the definition.
 SELECT count(*) AS cluster_column_in_view
   FROM pg_attribute
- WHERE attrelid = 'public.chunks'::regclass AND attname = coldfront._vec_list_col();
+ WHERE attrelid = 'public.chunks'::regclass AND attname = coldfront._vec_list_col('embedding');
 
 -- The probed definition. The tail is what matters: the qual lands inside the cold
 -- arm's WHERE, after the cutoff comparison, and the hot arm is untouched.
-SELECT coldfront._vec_probed_viewdef('public', 'chunks', coldfront._vec_probe_qual(ARRAY[1,2]));
+SELECT coldfront._vec_probed_viewdef('public', 'chunks', coldfront._vec_probe_qual('embedding', ARRAY[1,2]));
 
 -- It reparses, which is the whole contract: the rewrite substitutes this for the
 -- view reference and PostgreSQL has to accept it. IN becomes = ANY on the way in.
@@ -77,21 +77,21 @@ DO $do$
 BEGIN
     EXECUTE format('CREATE VIEW public.chunks_probed AS %s',
                    coldfront._vec_probed_viewdef('public', 'chunks',
-                       coldfront._vec_probe_qual(ARRAY[1,2])));
+                       coldfront._vec_probe_qual('embedding', ARRAY[1,2])));
 END
 $do$;
 SELECT right(pg_get_viewdef('public.chunks_probed'::regclass), 120) AS reparsed_tail;
 
 -- Declining is silent. No probe set, and a table with no vector column.
 SELECT coldfront._vec_probed_viewdef('public', 'chunks', NULL) IS NULL AS no_qual;
-UPDATE coldfront.tiered_views SET vec_column = NULL WHERE relname = 'chunks';
-SELECT coldfront._vec_probed_viewdef('public', 'chunks', coldfront._vec_probe_qual(ARRAY[1,2])) IS NULL AS no_vector_column;
-UPDATE coldfront.tiered_views SET vec_column = 'embedding' WHERE relname = 'chunks';
+UPDATE coldfront.tiered_views SET vec_columns = NULL WHERE relname = 'chunks';
+SELECT coldfront._vec_probed_viewdef('public', 'chunks', coldfront._vec_probe_qual('embedding', ARRAY[1,2])) IS NULL AS no_vector_column;
+UPDATE coldfront.tiered_views SET vec_columns = ARRAY['embedding'] WHERE relname = 'chunks';
 
 -- A tiered view with no cutoff is hot-only: it has no cold arm, so there is nothing
 -- to probe.
 DELETE FROM coldfront.archive_watermark WHERE table_name = 'chunks';
-SELECT coldfront._vec_probed_viewdef('public', 'chunks', coldfront._vec_probe_qual(ARRAY[1,2])) IS NULL AS hot_only;
+SELECT coldfront._vec_probed_viewdef('public', 'chunks', coldfront._vec_probe_qual('embedding', ARRAY[1,2])) IS NULL AS hot_only;
 
 -- Cleanup. Unregister before dropping: the DDL hook blocks DROP of a registered
 -- tiered table/view.

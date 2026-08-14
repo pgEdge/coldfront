@@ -651,7 +651,7 @@ func (ac *archiveCycle) bootstrapTieredView(ctx context.Context, columns []view.
 	}
 	hotTable := pgx.Identifier{t.SourceSchema, "_" + t.SourceTable}.Sanitize()
 	if err := registerTieredView(ctx, ac.conn, t.SourceSchema, t.SourceTable,
-		hotTable, iceTable, t.PartitionColumn, vectorColumn(columns)); err != nil {
+		hotTable, iceTable, t.PartitionColumn, vectorColumns(columns)); err != nil {
 		return fmt.Errorf("register tiered view: %w", err)
 	}
 	return nil
@@ -1210,23 +1210,28 @@ func wipeIcebergRange(ctx context.Context, conn *pgx.Conn, iceTable, partCol str
 // for the SQL-side view rebuild; the two have to agree.
 func vecCompanion(col string) string { return "_cf_vec_" + col }
 
-// vecListExpr asks the extension for the expression that assigns a cluster from
-// the value the generated trigger writes the vector from, so the trigger emits the
-// same derivation every other cold write path does. "" when the table has no
+// vecListExpr asks the extension for the expressions that assign a cluster from the
+// values the generated trigger writes the vectors from, so the trigger emits the
+// same derivation every other cold write path does. One per vector column, comma
+// separated and ready to lead the positional VALUES list; "" when the table has no
 // vector.
 func vecListExpr(ctx context.Context, conn *pgx.Conn, t *config.TableConfig, columns []view.Column) (string, error) {
-	vecCol := vectorColumn(columns)
-	if vecCol == "" {
+	vecCols := vectorColumns(columns)
+	if len(vecCols) == 0 {
 		return "", nil
 	}
-	var expr string
+	placeholders := make([]string, len(vecCols))
+	for i := range vecCols {
+		placeholders[i] = "CAST(%L AS FLOAT[])"
+	}
+	var prefix string
 	if err := conn.QueryRow(ctx,
-		"SELECT coldfront._vec_list_expr($1, $2, $3, $4)",
-		t.SourceSchema, t.SourceTable, vecCol, "CAST(%L AS FLOAT[])",
-	).Scan(&expr); err != nil {
+		"SELECT coldfront._vec_list_prefix($1, $2, $3, $4)",
+		t.SourceSchema, t.SourceTable, vecCols, placeholders,
+	).Scan(&prefix); err != nil {
 		return "", fmt.Errorf("cluster expression: %w", err)
 	}
-	return expr, nil
+	return strings.TrimSuffix(prefix, ", "), nil
 }
 
 // vecLayoutProps asks the extension for the CREATE TABLE properties a clustered
@@ -1234,7 +1239,7 @@ func vecListExpr(ctx context.Context, conn *pgx.Conn, t *config.TableConfig, col
 // extension so both modes create the same layout; the primary key rides along as
 // the sort key's tiebreak, which only this side knows.
 func vecLayoutProps(ctx context.Context, conn *pgx.Conn, columns []view.Column) (string, error) {
-	if vectorColumn(columns) == "" {
+	if len(vectorColumns(columns)) == 0 {
 		return "", nil
 	}
 	var pk []string
@@ -1245,7 +1250,8 @@ func vecLayoutProps(ctx context.Context, conn *pgx.Conn, columns []view.Column) 
 	}
 	var props string
 	if err := conn.QueryRow(ctx,
-		"SELECT coldfront._vec_layout_props(coldfront._vec_sort_key($1))", pk).Scan(&props); err != nil {
+		"SELECT coldfront._vec_layout_props(coldfront._vec_sort_key($1, $2))",
+		vectorColumns(columns)[0], pk).Scan(&props); err != nil {
 		return "", fmt.Errorf("layout properties: %w", err)
 	}
 	return props, nil
@@ -1267,16 +1273,18 @@ func pkOrder(columns []view.Column) string {
 	return ", " + strings.Join(terms, ", ")
 }
 
-// vectorColumn names the table's vector column, or "" when it has none. One
-// clustered vector column a table: the cluster column is single and names which
-// column it describes through coldfront.vector_config.
-func vectorColumn(columns []view.Column) string {
+// vectorColumns names the table's vector columns in column order, empty when it has
+// none. The order is the contract: the Iceberg schema declares one cluster column
+// per entry in this order, a positional cold write fills them in it, and the first
+// entry is the one that owns the file sort order.
+func vectorColumns(columns []view.Column) []string {
+	var out []string
 	for _, c := range columns {
 		if c.IsVector() {
-			return c.Name
+			out = append(out, c.Name)
 		}
 	}
-	return ""
+	return out
 }
 
 // vecListPrefix asks the extension for the expression that assigns a cluster to
@@ -1288,18 +1296,21 @@ func vectorColumn(columns []view.Column) string {
 // and reports no error, so every write path derives from one definition. It also
 // reads the centroids over pglocal, which is why the caller attaches it.
 func vecListPrefix(ctx context.Context, conn *pgx.Conn, t *config.TableConfig, columns []view.Column) (string, error) {
-	vecCol := vectorColumn(columns)
-	if vecCol == "" {
+	vecCols := vectorColumns(columns)
+	if len(vecCols) == 0 {
 		return "", nil
 	}
 	if _, err := conn.Exec(ctx, "SELECT coldfront.ensure_pg_attached()"); err != nil {
 		return "", fmt.Errorf("attach pglocal: %w", err)
 	}
+	exprs := make([]string, len(vecCols))
+	for i, c := range vecCols {
+		exprs[i] = "s." + pgx.Identifier{c}.Sanitize()
+	}
 	var prefix string
 	if err := conn.QueryRow(ctx,
 		"SELECT coldfront._vec_list_prefix($1, $2, $3, $4)",
-		t.SourceSchema, t.SourceTable, vecCol,
-		"s."+pgx.Identifier{vecCol}.Sanitize(),
+		t.SourceSchema, t.SourceTable, vecCols, exprs,
 	).Scan(&prefix); err != nil {
 		return "", fmt.Errorf("cluster expression: %w", err)
 	}
@@ -1441,8 +1452,10 @@ func ensureIcebergTable(ctx context.Context, conn *pgx.Conn, t *config.TableConf
 		return fmt.Errorf("get columns: %w", err)
 	}
 	defs := make([]string, 0, len(columns)+1)
-	if view.HasVector(columns) {
-		defs = append(defs, pgx.Identifier{view.VecListColumn}.Sanitize()+" INTEGER")
+	// One cluster column per vector column, leading the schema in column order, which
+	// is the order a positional cold write fills them in.
+	for _, c := range vectorColumns(columns) {
+		defs = append(defs, pgx.Identifier{view.VecListColumn(c)}.Sanitize()+" INTEGER")
 	}
 	for _, c := range columns {
 		defs = append(defs, fmt.Sprintf("%s %s", pgx.Identifier{c.Name}.Sanitize(), c.Type))
@@ -1463,16 +1476,16 @@ func ensureIcebergTable(ctx context.Context, conn *pgx.Conn, t *config.TableConf
 // registerTieredView upserts a row in coldfront.tiered_views so the
 // coldfront C extension can identify this view as a tiered target and
 // rewrite UPDATE/DELETE into dual-tier CTEs. Called after every view recreate.
-func registerTieredView(ctx context.Context, conn *pgx.Conn, schema, table, hotTable, icebergTable, partitionCol, vecColumn string) error {
+func registerTieredView(ctx context.Context, conn *pgx.Conn, schema, table, hotTable, icebergTable, partitionCol string, vecColumns []string) error {
 	_, err := conn.Exec(ctx /* nosemgrep */, `
-		INSERT INTO coldfront.tiered_views (schema_name, relname, hot_table, iceberg_table, partition_col, vec_column)
-		VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''))
+		INSERT INTO coldfront.tiered_views (schema_name, relname, hot_table, iceberg_table, partition_col, vec_columns)
+		VALUES ($1, $2, $3, $4, $5, NULLIF($6, '{}'::text[]))
 		ON CONFLICT (schema_name, relname) DO UPDATE
 		  SET hot_table     = EXCLUDED.hot_table,
 		      iceberg_table = EXCLUDED.iceberg_table,
 		      partition_col = EXCLUDED.partition_col,
-		      vec_column    = EXCLUDED.vec_column`,
-		schema, table, hotTable, icebergTable, partitionCol, vecColumn)
+		      vec_columns   = EXCLUDED.vec_columns`,
+		schema, table, hotTable, icebergTable, partitionCol, vecColumns)
 	return err
 }
 
