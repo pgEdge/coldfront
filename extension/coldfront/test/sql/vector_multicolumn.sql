@@ -31,7 +31,7 @@ SELECT coldfront._vec_list_prefix('public', 'docs',
                                   ARRAY['embedding','summary'],
                                   ARRAY['s.embedding','s.summary']) AS prefix;
 
--- One column behaves as it did before there were two.
+-- A single vector column yields a prefix of one expression.
 SELECT coldfront._vec_list_prefix('public', 'docs',
                                   ARRAY['embedding'], ARRAY['s.embedding']) AS one_column;
 
@@ -67,13 +67,14 @@ CREATE TABLE public._docs (
     id        bigint GENERATED ALWAYS AS IDENTITY,
     ts        timestamptz,
     body      text,
+    body_len  int GENERATED ALWAYS AS (length(body)) STORED,
     embedding vector(3),
     summary   vector(2)
 );
 ALTER TABLE public._docs
     ADD COLUMN "_cf_vec_embedding" real[] GENERATED ALWAYS AS ("embedding"::real[]) STORED,
     ADD COLUMN "_cf_vec_summary"   real[] GENERATED ALWAYS AS ("summary"::real[]) STORED;
-CREATE VIEW public.docs AS SELECT id, ts, body,
+CREATE VIEW public.docs AS SELECT id, ts, body, body_len,
        "_cf_vec_embedding"::real[] AS embedding, "_cf_vec_summary"::real[] AS summary
   FROM public._docs;
 INSERT INTO coldfront.tiered_views (schema_name, relname, hot_table, iceberg_table, partition_col, vec_columns)
@@ -92,8 +93,10 @@ SELECT coldfront._vec_list_set_item('ice.default.docs', 'embedding', 'NEW_EXPR')
        coldfront._vec_list_set_item('ice.default.docs', 'body', 'NEW_EXPR') IS NULL      AS non_vector_declines;
 
 -- The trigger function is the contract. Both cluster expressions lead, each
--- pairing with its own column's value, in column order; the identity column is a
--- positional NULL; the watermark is read at fire time with the bootstrap default.
+-- pairing with its own column's value, in column order; the identity column and
+-- the user-written generated column are positional NULLs the hot INSERT skips,
+-- since neither accepts a supplied value; the watermark is read at fire time
+-- with the bootstrap default.
 -- Needles containing apostrophes are dollar-quoted: inside the trigger body the
 -- cold-INSERT template is itself a quoted literal, so its own apostrophes arrive
 -- doubled in the function definition.
@@ -105,9 +108,10 @@ SELECT (length(def) - length(replace(def, 'arg_min', ''))) / length('arg_min') A
        strpos(def, 'translate(NEW.summary')   < strpos(def, ', NEW.ts')          AS arguments_lead_the_list,
        strpos(def, 'VALUES (NULL') = 0                                          AS prefix_before_identity_null,
        strpos(def, ', NULL, %L') > 0                                            AS identity_positional_null,
+       strpos(def, '%L, NULL, CAST(') > 0                                       AS generated_positional_null,
        def LIKE '%FROM coldfront.archive_watermark%'                            AS watermark_read_at_fire_time,
        def LIKE '%''-infinity''::timestamptz%'                                  AS bootstrap_default,
-       def LIKE '%INSERT INTO public._docs (ts, body, embedding, summary)%'     AS hot_insert_skips_identity
+       def LIKE '%INSERT INTO public._docs (ts, body, embedding, summary)%'     AS hot_insert_skips_generated
   FROM pg_get_functiondef('coldfront.docs_write()'::regprocedure) AS d(def);
 
 -- Idempotent: the archiver re-runs bootstrap every cycle against a view that

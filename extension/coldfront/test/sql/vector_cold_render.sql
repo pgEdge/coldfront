@@ -35,3 +35,18 @@ SELECT coldfront._render_cold_value('[1,2,3]', 'vector(3)')    AS vec_tight,
 SELECT coldfront._render_cold_value('\xcafe', 'bytea')  AS blob,
        coldfront._render_cold_value('2.5', 'double precision') AS dbl,
        coldfront._render_cold_value('a''b', 'text')     AS quoted;
+
+-- The per-row serialiser keeps a NULL vector's positional slot. The Iceberg schema
+-- declares one cluster column per vector column unconditionally, so the prefix
+-- carries one assignment per vector column whatever this row holds; an entry
+-- missing from the prefix would shift every following value one column left.
+SELECT coldfront._move_row_literal(
+    '{"id": 8, "cf_new_ts": "2026-06-01 00:00:00+00", "embedding": "[1,2,3]"}'::jsonb,
+    ARRAY['id','ts','embedding'],
+    ARRAY['bigint','timestamp with time zone','vector(3)'],
+    'ts', 'public', 'chunks') AS vec_row;
+SELECT coldfront._move_row_literal(
+    '{"id": 7, "cf_new_ts": "2026-06-01 00:00:00+00", "embedding": null}'::jsonb,
+    ARRAY['id','ts','embedding'],
+    ARRAY['bigint','timestamp with time zone','vector(3)'],
+    'ts', 'public', 'chunks') AS null_vec_row;

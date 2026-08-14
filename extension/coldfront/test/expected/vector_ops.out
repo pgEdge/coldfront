@@ -62,3 +62,43 @@ SELECT round((ARRAY[1,0,0]::real[] <=> '[0,1,0]'::vector)::numeric, 6) AS mixed_
        1.000000
 (1 row)
 
+-- A same-shaped operator in an unrelated schema does not satisfy install: the
+-- caller resolves unqualified through pgvector's schema, so the operator has to
+-- exist there. Drop one installed operator, plant a foreign clash, reinstall.
+CREATE SCHEMA cf_opclash;
+CREATE FUNCTION cf_opclash.zero_dist(real[], real[]) RETURNS double precision
+LANGUAGE sql IMMUTABLE AS 'SELECT 0::double precision';
+DO $$
+DECLARE v_nsp text;
+BEGIN
+    SELECT n.nspname INTO v_nsp
+      FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+     WHERE t.typname = 'vector';
+    EXECUTE format('DROP OPERATOR %I.<-> (real[], real[])', v_nsp);
+    CREATE OPERATOR cf_opclash.<-> (LEFTARG = real[], RIGHTARG = real[], FUNCTION = cf_opclash.zero_dist);
+END $$;
+SELECT coldfront.install_vector_ops();
+ install_vector_ops 
+--------------------
+ 
+(1 row)
+
+SELECT count(*) AS l2_in_vector_schema
+  FROM pg_operator o
+ WHERE o.oprname = '<->' AND o.oprleft = 'real[]'::regtype AND o.oprright = 'real[]'::regtype
+   AND o.oprnamespace = (SELECT t.typnamespace FROM pg_type t WHERE t.typname = 'vector');
+ l2_in_vector_schema 
+---------------------
+                   1
+(1 row)
+
+-- Unqualified resolution lands on the reinstalled operator, not the clash.
+SELECT round((ARRAY[1,0,0]::real[] <-> ARRAY[0,1,0]::real[])::numeric, 6) AS l2_after_reinstall;
+ l2_after_reinstall 
+--------------------
+           1.414214
+(1 row)
+
+DROP OPERATOR cf_opclash.<-> (real[], real[]);
+DROP FUNCTION cf_opclash.zero_dist(real[], real[]);
+DROP SCHEMA cf_opclash;

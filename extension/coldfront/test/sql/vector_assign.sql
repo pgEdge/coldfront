@@ -7,6 +7,7 @@
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS pg_duckdb;
 CREATE EXTENSION IF NOT EXISTS coldfront;
+CREATE EXTENSION IF NOT EXISTS vector;
 RESET client_min_messages;
 SET coldfront.warehouse = '';
 SET coldfront.lakekeeper_endpoint = '';

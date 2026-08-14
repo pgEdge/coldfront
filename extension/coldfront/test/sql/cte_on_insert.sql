@@ -30,3 +30,21 @@ DELETE FROM coldfront.tiered_views;
 DELETE FROM coldfront.archive_watermark;
 DROP VIEW public.events;
 DROP TABLE public._events;
+
+-- The clustered iceberg-only INSERT is re-emitted so the cluster is derived in
+-- the same statement, and the CTE must survive that re-emission too: the WITH
+-- folds into the derived table the assignment reads from, the only scope its
+-- CTEs are visible from.
+CREATE TABLE public._vec_base (id int, ts timestamptz, embedding real[]);
+CREATE VIEW public.icevec AS SELECT * FROM public._vec_base;
+INSERT INTO coldfront.tiered_views(schema_name, relname, iceberg_table, is_iceberg_only, vec_columns)
+VALUES ('public', 'icevec', 'ice.default.icevec', true, ARRAY['embedding']);
+
+EXPLAIN (COSTS OFF, VERBOSE)
+  WITH s AS (SELECT 7 AS id, '2026-05-01 00:00:00+00'::timestamptz AS ts, ARRAY[1,0,0]::real[] AS embedding)
+  INSERT INTO public.icevec SELECT id, ts, embedding FROM s;
+
+-- Cleanup.
+DELETE FROM coldfront.tiered_views WHERE relname = 'icevec';
+DROP VIEW public.icevec;
+DROP TABLE public._vec_base;

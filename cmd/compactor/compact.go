@@ -280,92 +280,31 @@ func rewriteSorted(ctx context.Context, tbl *table.Table, groups []table.Compact
 }
 
 // mergeGroup reads one group with its deletes applied, sorts it by field, and
-// writes the result back as new data files.
-//
-// A group is bin-packed to the file-size target, so holding one is bounded by
-// that target rather than by the table. Nulls sort last and therefore land
-// together: a row another engine appended carries no assignment, and keeping
-// those rows contiguous is what lets a probe read them in proportion to their own
-// size instead of scattering them through every row group.
+// writes the result back as new data files. A group is bin-packed to the
+// file-size target, so holding one is bounded by that target rather than by the
+// table.
 func mergeGroup(ctx context.Context, tbl *table.Table, group table.CompactionTaskGroup,
 	field iceberg.NestedField, targetSize int64) (table.CompactionGroupResult, error) {
 	var zero table.CompactionGroupResult
 
-	if len(group.Tasks) == 0 {
-		return table.CompactionGroupResult{PartitionKey: group.PartitionKey}, nil
-	}
-
-	// One reader: the sort below decides the order, so a concurrent read would
-	// only shuffle its input to no effect.
-	schema, records, err := tbl.Scan(table.WitMaxConcurrency(1)).ReadTasks(ctx, group.Tasks)
+	unsorted, err := readGroupTable(ctx, tbl, group)
 	if err != nil {
-		return zero, fmt.Errorf("read group %q: %w", group.PartitionKey, err)
+		return zero, err
 	}
-
-	var batches []arrow.RecordBatch
-	defer func() {
-		for _, b := range batches {
-			b.Release()
-		}
-	}()
-	for rec, err := range records {
-		if err != nil {
-			return zero, fmt.Errorf("read group %q: %w", group.PartitionKey, err)
-		}
-		rec.Retain()
-		batches = append(batches, rec)
-	}
-	if len(batches) == 0 {
+	if unsorted == nil {
 		return table.CompactionGroupResult{PartitionKey: group.PartitionKey}, nil
 	}
-
-	idx, ok := schema.FieldIndices(field.Name), true
-	if len(idx) != 1 {
-		ok = false
-	}
-	if !ok {
-		return zero, fmt.Errorf("sort column %q is not a single column of the read schema", field.Name)
-	}
-
-	unsorted := array.NewTableFromRecords(schema, batches)
 	defer unsorted.Release()
 
-	order, err := compute.SortIndicesTable(ctx, unsorted, []compute.SortKey{{
-		ColumnIndex:   idx[0],
-		Order:         compute.SortOrderAscending,
-		NullPlacement: compute.SortNullsAtEnd,
-	}})
+	sorted, err := sortedByField(ctx, unsorted, field)
 	if err != nil {
-		return zero, fmt.Errorf("sort group %q by %q: %w", group.PartitionKey, field.Name, err)
+		return zero, fmt.Errorf("group %q: %w", group.PartitionKey, err)
 	}
-	defer order.Release()
+	defer sorted.Release()
 
-	taken, err := compute.Take(ctx, *compute.DefaultTakeOptions(),
-		compute.NewDatumWithoutOwning(unsorted), compute.NewDatumWithoutOwning(order))
+	newFiles, bytesAfter, err := writeSorted(ctx, tbl, sorted, targetSize)
 	if err != nil {
-		return zero, fmt.Errorf("reorder group %q: %w", group.PartitionKey, err)
-	}
-	defer taken.Release()
-	sorted := taken.(*compute.TableDatum).Value
-
-	writeOpts := []table.WriteRecordOption{table.WithClusteredWrite()}
-	if targetSize > 0 {
-		writeOpts = append(writeOpts, table.WithTargetFileSize(targetSize))
-	}
-
-	rdr := array.NewTableReader(sorted, 0)
-	defer rdr.Release()
-
-	var (
-		newFiles   []iceberg.DataFile
-		bytesAfter int64
-	)
-	for df, err := range table.WriteRecords(ctx, tbl, schema, recordSeq(rdr), writeOpts...) {
-		if err != nil {
-			return zero, fmt.Errorf("write merged files for group %q: %w", group.PartitionKey, err)
-		}
-		newFiles = append(newFiles, df)
-		bytesAfter += df.FileSizeBytes()
+		return zero, fmt.Errorf("write merged files for group %q: %w", group.PartitionKey, err)
 	}
 
 	oldFiles := make([]iceberg.DataFile, 0, len(group.Tasks))
@@ -380,6 +319,92 @@ func mergeGroup(ctx context.Context, tbl *table.Table, group table.CompactionTas
 		BytesBefore:    group.TotalSizeBytes,
 		BytesAfter:     bytesAfter,
 	}, nil
+}
+
+// readGroupTable reads a group's tasks with their deletes applied into one Arrow
+// table, released by the caller, or nil when the group holds no rows.
+func readGroupTable(ctx context.Context, tbl *table.Table, group table.CompactionTaskGroup) (arrow.Table, error) {
+	if len(group.Tasks) == 0 {
+		return nil, nil
+	}
+	// One reader: the sort decides the order, so a concurrent read would only
+	// shuffle its input to no effect.
+	schema, records, err := tbl.Scan(table.WitMaxConcurrency(1)).ReadTasks(ctx, group.Tasks)
+	if err != nil {
+		return nil, fmt.Errorf("read group %q: %w", group.PartitionKey, err)
+	}
+	var batches []arrow.RecordBatch
+	defer func() {
+		for _, b := range batches {
+			b.Release()
+		}
+	}()
+	for rec, err := range records {
+		if err != nil {
+			return nil, fmt.Errorf("read group %q: %w", group.PartitionKey, err)
+		}
+		rec.Retain()
+		batches = append(batches, rec)
+	}
+	if len(batches) == 0 {
+		return nil, nil
+	}
+	return array.NewTableFromRecords(schema, batches), nil
+}
+
+// sortedByField returns the table's rows reordered ascending by field, in a new
+// table released by the caller. Nulls sort last and therefore land together: a
+// row another engine appended carries no assignment, and keeping those rows
+// contiguous is what lets a probe read them in proportion to their own size
+// instead of scattering them through every row group.
+func sortedByField(ctx context.Context, unsorted arrow.Table, field iceberg.NestedField) (arrow.Table, error) {
+	idx := unsorted.Schema().FieldIndices(field.Name)
+	if len(idx) != 1 {
+		return nil, fmt.Errorf("sort column %q is not a single column of the read schema", field.Name)
+	}
+	order, err := compute.SortIndicesTable(ctx, unsorted, []compute.SortKey{{
+		ColumnIndex:   idx[0],
+		Order:         compute.SortOrderAscending,
+		NullPlacement: compute.SortNullsAtEnd,
+	}})
+	if err != nil {
+		return nil, fmt.Errorf("sort by %q: %w", field.Name, err)
+	}
+	defer order.Release()
+
+	taken, err := compute.Take(ctx, *compute.DefaultTakeOptions(),
+		compute.NewDatumWithoutOwning(unsorted), compute.NewDatumWithoutOwning(order))
+	if err != nil {
+		return nil, fmt.Errorf("reorder by %q: %w", field.Name, err)
+	}
+	sorted := taken.(*compute.TableDatum).Value
+	sorted.Retain()
+	taken.Release()
+	return sorted, nil
+}
+
+// writeSorted writes the table back through WriteRecords, clustered and
+// bin-packed to targetSize, returning the new data files and their total size.
+func writeSorted(ctx context.Context, tbl *table.Table, sorted arrow.Table, targetSize int64) ([]iceberg.DataFile, int64, error) {
+	writeOpts := []table.WriteRecordOption{table.WithClusteredWrite()}
+	if targetSize > 0 {
+		writeOpts = append(writeOpts, table.WithTargetFileSize(targetSize))
+	}
+	rdr := array.NewTableReader(sorted, 0)
+	defer rdr.Release()
+
+	var (
+		files []iceberg.DataFile
+		size  int64
+	)
+	for df, err := range table.WriteRecords(ctx, tbl, sorted.Schema(), recordSeq(rdr), writeOpts...) {
+		if err != nil {
+			return nil, 0, err
+		}
+		files = append(files, df)
+		size += df.FileSizeBytes()
+	}
+	return files, size, nil
 }
 
 // recordSeq adapts an Arrow table reader to the iterator WriteRecords consumes.

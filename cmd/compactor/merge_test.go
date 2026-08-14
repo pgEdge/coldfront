@@ -230,8 +230,8 @@ func TestRewriteSorted_RowsStayIntact(t *testing.T) {
 	}
 	defer at.Release()
 
-	// id was seeded as list*... no: each id is paired with one list value, so the
-	// pairing is what is asserted, not a formula.
+	// Each id is paired with exactly one list value, so the pairing itself is
+	// asserted, not a formula over the ids.
 	want := map[int32]int64{0: 10, 5: 20, 10: 30, 1: 40, 6: 50, 11: 60}
 	ids := at.Column(0).Data()
 	lists := at.Column(1).Data()

@@ -293,9 +293,10 @@ compactor as you already do.
 
 On a clustered table it does more than consolidate. Each write leaves a file
 sorted within itself, and a search has to look in every one of them; compaction
-merges those into one ordered run, which is what keeps the number of places a
-search looks from growing with the table. Nothing to configure: the table records
-its own sort column at creation and the compactor reads it.
+merges them on the sort column, one ordered run per size-bounded merge group, so
+the number of places a search looks is set by data volume rather than by write
+count. Nothing to configure: the table records its own sort column at creation
+and the compactor reads it.
 
 ## Limits worth knowing
 
@@ -303,8 +304,9 @@ its own sort column at creation and the compactor reads it.
   `vector` column beyond 2,000 dimensions and a `halfvec` beyond 4,000, while
   storage tops out at 16,000 for both. A 3,072-dimension model gets no hot HNSW
   as a plain `vector`, and searches do not assume one exists.
-- A table has one clustered vector column. A second vector column is stored and
-  searched exactly, without clustering.
+- One vector column per table owns the physical sort order. Every vector column
+  gets centroids, assignments and a probe filter, but only the sorted column's
+  probes skip row groups; the others cut the rows scored, not the rows read.
 - `SELECT *` returns your own columns. The cluster assignment is internal and no
   branch of the view projects it, so no query can reference it.
 - A hot row stores its embedding twice, once as `vector` and once in a generated

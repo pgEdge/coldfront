@@ -959,6 +959,26 @@ deparse_and_find_prefix(Query *query, DeparseResult *dr)
 }
 
 /*
+ * Prepend the statement's leading WITH clause (dr->head_len bytes, before the
+ * verb) to a row source. Emitters that wrap the source in a parenthesised
+ * derived table need this: that subquery is the only scope the CTEs are
+ * visible from, on either engine. Returns source unchanged when there is no
+ * leading clause.
+ */
+static const char *
+fold_leading_with(const DeparseResult *dr, const char *source)
+{
+    StringInfoData sb;
+
+    if (dr->head_len == 0)
+        return source;
+    initStringInfo(&sb);
+    appendBinaryStringInfo(&sb, dr->orig_sql, dr->head_len);
+    appendStringInfoString(&sb, source);
+    return sb.data;
+}
+
+/*
  * Build a DML string targeting info->hot_table. Preserves any RETURNING.
  */
 static char *
@@ -1402,7 +1422,8 @@ emit_cold(Query *query, TieredViewInfo *info, ColdParamSet *ps, bool in_plpgsql)
     {
         char *col_list = insert_targetlist_collist(query);
         char *with_cluster = build_iceberg_only_insert_with_cluster(
-            query, info, skip_leading_collist(dr.rest), col_list);
+            query, info,
+            fold_leading_with(&dr, skip_leading_collist(dr.rest)), col_list);
         if (with_cluster != NULL)
             cold_dml = normalize_casts_for_duckdb(with_cluster);
     }
@@ -1561,9 +1582,10 @@ skip_leading_collist(const char *rest)
 
 /*
  * Build the cold-side SELECT list for the fast pglocal-streaming path,
- * projecting every underlying-table column in attnum order. DuckDB-
- * iceberg's INSERT is positional and rejects column lists, so we must
- * emit the full tuple.  For each underlying column:
+ * projecting every underlying-table column in attnum order: the cold INSERT
+ * supplies the full tuple, and a PG-side DEFAULT expression exists nowhere in
+ * the Iceberg schema, so whatever fills one fills it here.  For each
+ * underlying column:
  *
  *   - If it appears in the user's INSERT targetList → emit the bare
  *     identifier (gets value from `coldfront_src` alias).
@@ -2109,21 +2131,8 @@ emit_tiered_insert(Query *query, TieredViewInfo *info, ColdParamSet *ps, bool in
     query->returningList = saved_returning;
 
     col_list   = insert_targetlist_collist(query);
-    source     = skip_leading_collist(dr.rest);
+    source     = fold_leading_with(&dr, skip_leading_collist(dr.rest));
     cutoff_lit = format_timestamptz_literal(info->cutoff);
-
-    /* A leading WITH clause (dr.head_len bytes, before "INSERT INTO <view> ") must
-     * reach both halves, which each read `source` inside a parenthesised derived
-     * table. Fold it into source so its CTEs scope to that subquery on each engine
-     * (PG hot, DuckDB cold) — no top-level WITH to merge. */
-    if (dr.head_len > 0)
-    {
-        StringInfoData sb;
-        initStringInfo(&sb);
-        appendBinaryStringInfo(&sb, dr.orig_sql, dr.head_len);
-        appendStringInfoString(&sb, source);
-        source = sb.data;
-    }
 
     {
         RangeTblEntry *rte = (RangeTblEntry *) list_nth(query->rtable,

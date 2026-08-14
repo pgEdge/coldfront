@@ -4,7 +4,7 @@
 # passes GOLANGCI=<resolved path> so the compactor gate uses the same linter.
 GOLANGCI ?= $(shell command -v golangci-lint 2>/dev/null || echo $(HOME)/go/bin/golangci-lint)
 VERSION    ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo unknown)
-BUILD_TIME  = $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
+BUILD_TIME := $(shell date -u +"%Y-%m-%dT%H:%M:%SZ")
 
 build:
 	CGO_ENABLED=0 go build -ldflags="-s -w -X github.com/pgedge/coldfront/internal/version.Version=$(VERSION) -X github.com/pgedge/coldfront/internal/version.BuildTime=$(BUILD_TIME)" -o bin/archiver ./cmd/archiver

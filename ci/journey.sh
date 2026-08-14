@@ -843,6 +843,23 @@ EOSQL
     assert_eq "a retrain moves the pointer forward"     "2"     "$(extract GEN2 "$T2")"
     assert_eq "the previous generation is left intact"  "1,2"   "$(extract GENS "$T2")"
 
+    # Training fewer centroids than the configured nprobe clamps nprobe in the
+    # same write: k-means returns at most one cluster per distinct point, and an
+    # unclamped row would fail vc_nprobe_fit and abort the transaction that did
+    # the training work.
+    local CL; CL=$(qf "$HOST" <<'EOSQL'
+SELECT coldfront.create_iceberg_table('public','vecclamp','[
+  {"name":"id","type":"bigint"},{"name":"ts","type":"timestamptz"},{"name":"embedding","type":"vector(2)"}
+]'::jsonb);
+INSERT INTO vecclamp VALUES (1, now(), '[1,0]'::vector), (2, now(), '[0,1]'::vector);
+INSERT INTO coldfront.vector_config (schema_name, table_name, column_name, nlist, nprobe)
+VALUES ('public','vecclamp','embedding',8,4);
+CALL coldfront.vector_train('public','vecclamp','embedding');
+SELECT 'CLAMP:' || nlist || '/' || nprobe FROM coldfront.vector_config WHERE table_name = 'vecclamp';
+EOSQL
+)
+    assert_eq "training clamps nprobe to the trained count" "2/2" "$(extract CLAMP "$CL")"
+
     # With a generation live, every path that writes a vector into the cold tier
     # stamps the cluster in the same statement. Two paths, one vector, read back
     # from Iceberg: the view cannot project the column, by design.
@@ -1071,6 +1088,30 @@ EOSQL
     # Idempotent: nothing to do the second time, and no rewrite to pay for.
     local A2; A2=$(q_may "$HOST" "CALL coldfront.vector_assign('public','chunks','embedding');")
     assert_contains "a second assign has nothing to do" "already assigned" "$A2"
+
+    # A NULL embedding through the identity-omitted slow path. The Iceberg schema
+    # declares one cluster column per vector column unconditionally, so the row's
+    # prefix slot must survive a NULL value: the insert succeeds, lands unassigned,
+    # and the view returns it through the null arm. A cold DELETE then restores the
+    # fixture's shape for the compaction story.
+    local NV; NV=$(qf "$HOST" <<'EOSQL'
+INSERT INTO chunks (ts, body, embedding)
+VALUES (date_trunc('month',now()) - interval '4 months' + interval '23 days', 'nullvec', NULL);
+SELECT coldfront.ensure_attached();
+SELECT 'NV_LAND:' || count(*) FROM iceberg_scan('ice.public.chunks') r
+ WHERE r['body'] = 'nullvec' AND r['embedding'] IS NULL AND r['_cf_vec_list_embedding'] IS NULL;
+SELECT 'NV_VIEW:' || count(*) FROM chunks WHERE body = 'nullvec';
+EOSQL
+)
+    assert_eq "a NULL embedding rides the slow path unassigned" "1" "$(extract NV_LAND "$NV")"
+    assert_eq "the view returns the NULL-embedding row"         "1" "$(extract NV_VIEW "$NV")"
+    local ND; ND=$(qf "$HOST" <<'EOSQL'
+DELETE FROM chunks WHERE body = 'nullvec';
+SELECT coldfront.ensure_attached();
+SELECT 'NV_GONE:' || count(*) FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] = 'nullvec';
+EOSQL
+)
+    assert_eq "the NULL-embedding row deletes cleanly" "0" "$(extract NV_GONE "$ND")"
 
     story_vector_compaction
 }

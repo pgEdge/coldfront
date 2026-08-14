@@ -970,6 +970,13 @@ BEGIN
                     row_lit := row_lit || coldfront._render_cold_value(val_text, full_types[i]);
                 END IF;
             ELSE
+                -- A NULL vector still owns its prefix slot: the Iceberg schema
+                -- declares one cluster column per vector column unconditionally,
+                -- so a shorter prefix would misalign the positional tuple.
+                IF coldfront._is_vector_type(full_types[i]) THEN
+                    vec_cols  := vec_cols  || col;
+                    vec_exprs := vec_exprs || 'NULL'::text;
+                END IF;
                 row_lit := row_lit || 'NULL';
             END IF;
         END LOOP;
@@ -1278,6 +1285,13 @@ BEGIN
                 row_lit := row_lit || coldfront._render_cold_value(val_text, p_types[i]);
             END IF;
         ELSE
+            -- A NULL vector still owns its prefix slot: the Iceberg schema
+            -- declares one cluster column per vector column unconditionally,
+            -- so a shorter prefix would misalign the positional tuple.
+            IF coldfront._is_vector_type(p_types[i]) THEN
+                vec_cols  := vec_cols  || col;
+                vec_exprs := vec_exprs || 'NULL'::text;
+            END IF;
             row_lit := row_lit || 'NULL';
         END IF;
     END LOOP;
@@ -1741,7 +1755,11 @@ BEGIN
     -- The centroids land in a temporary heap first. A single INSERT reading a
     -- DuckDB scan is planned as a DuckDB statement, and DuckDB cannot write to a
     -- PostgreSQL table, so the read and the write have to be separate statements.
-    DROP TABLE IF EXISTS cf_cent_pg;
+    -- The drop names pg_temp: an unqualified name would resolve through
+    -- search_path and could hit a permanent table of the same name.
+    IF to_regclass('pg_temp.cf_cent_pg') IS NOT NULL THEN
+        DROP TABLE pg_temp.cf_cent_pg;
+    END IF;
     CREATE TEMP TABLE cf_cent_pg ON COMMIT DROP AS
     SELECT r['cid']::int AS cid, r['v']::real[] AS v
     FROM duckdb.query('SELECT cid, v FROM memory.main.cf_cent') AS t(r);
@@ -1753,8 +1771,11 @@ BEGIN
     SELECT p_schema, p_table, p_column, v_gen, cid, v FROM cf_cent_pg;
 
     GET DIAGNOSTICS v_n = ROW_COUNT;
+    -- The trained count can fall below the configured nprobe (empty clusters do
+    -- not come back from the mean); clamp it in the same statement or the row
+    -- would fail vc_nprobe_fit and abort the whole training transaction.
     UPDATE coldfront.vector_config
-       SET generation = v_gen, nlist = v_n
+       SET generation = v_gen, nlist = v_n, nprobe = LEAST(nprobe, v_n)
      WHERE schema_name = p_schema AND table_name = p_table AND column_name = p_column;
 
     RAISE NOTICE 'coldfront: trained % centroids for "%.%"."%" as generation %',
@@ -1896,7 +1917,7 @@ BEGIN
     -- Dropped by name only when it is there. IF EXISTS would do the same and add a
     -- NOTICE to every caller's output for the ordinary case of a first call.
     IF to_regclass('pg_temp.cf_vector_status') IS NOT NULL THEN
-        DROP TABLE cf_vector_status;
+        DROP TABLE pg_temp.cf_vector_status;
     END IF;
     CREATE TEMP TABLE cf_vector_status (
         schema_name          text,
@@ -1999,7 +2020,15 @@ BEGIN
          WHERE c.schema_name = vt.schema_name AND c.table_name = vt.relname
            AND c.column_name = vt.vec_column AND c.generation = vt.generation;
 
-        INSERT INTO cf_vector_status VALUES (
+        INSERT INTO cf_vector_status (
+            schema_name, table_name, column_name, prunes,
+            generation, nlist, nprobe,
+            clusters_trained, clusters_occupied, additions, addition_cap,
+            rows_total, rows_unassigned,
+            rows_per_cluster_min, rows_per_cluster_max,
+            rows_per_cluster_p50, rows_per_cluster_p99,
+            clusters_below_row_group, probe_fraction, advice
+        ) VALUES (
             vt.schema_name, vt.relname, vt.vec_column, vt.prunes,
             vt.generation, vt.nlist, vt.nprobe,
             v_trained, v_occ, v_added, vt.addition_cap,
@@ -2114,7 +2143,9 @@ BEGIN
 
         IF NOT EXISTS (
             SELECT 1 FROM pg_operator o
+            JOIN pg_namespace n ON n.oid = o.oprnamespace
             WHERE o.oprname = r.op
+              AND n.nspname = v_nsp
               AND o.oprleft  = 'real[]'::regtype
               AND o.oprright = 'real[]'::regtype)
         THEN
@@ -3826,12 +3857,15 @@ BEGIN
         v_cutoff_lit := to_char(v_cutoff AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS+00');
     END IF;
 
-    -- Placeholders are positional over ALL live columns incl. identity (NULL for
-    -- identity, %L otherwise) because DuckDB/Iceberg has no targeted insert.
+    -- Placeholders are positional over ALL live columns incl. identity and
+    -- generated (NULL for those, %L otherwise): the cold INSERT supplies the
+    -- full tuple. An identity or generated column also stays out of the hot
+    -- INSERT list: PostgreSQL rejects a supplied value for either.
     FOR r IN
         SELECT a.attname,
                format_type(a.atttypid, a.atttypmod) AS pg_type,
-               a.attidentity
+               a.attidentity,
+               a.attgenerated
         FROM pg_attribute a
         JOIN pg_class c      ON c.oid = a.attrelid
         JOIN pg_namespace nn ON nn.oid = c.relnamespace
@@ -3853,7 +3887,7 @@ BEGIN
         END IF;
         iter := iter + 1;
 
-        IF r.attidentity = 'a' THEN
+        IF r.attidentity = 'a' OR r.attgenerated <> '' THEN
             v_placeholders := v_placeholders || 'NULL';
         ELSE
             IF v_col_list <> '' THEN
