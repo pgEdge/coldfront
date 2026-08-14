@@ -235,8 +235,18 @@ typedef struct {
     char        *partition_col;   /* e.g. "ts"; NULL when is_iceberg_only */
     bool         has_cutoff;      /* false → nothing archived yet */
     bool         is_iceberg_only; /* true → table lives entirely in Iceberg, no hot tier */
+    char        *vec_column;      /* clustered vector column, or NULL when none */
     TimestampTz  cutoff;          /* archive watermark            */
 } TieredViewInfo;
+
+static char *insert_targetlist_collist(Query *query);
+static const char *skip_leading_collist(const char *rest);
+static char *build_iceberg_only_insert_with_cluster(Query *query,
+                                                   TieredViewInfo *info,
+                                                   const char *source,
+                                                   const char *col_list);
+static char *add_cluster_set_item(Query *query, RangeTblEntry *rte,
+                                  TieredViewInfo *info, const char *cold_dml);
 
 /*
  * Which tier a DML statement targets, based on its WHERE clause predicate on
@@ -268,7 +278,7 @@ lookup_tiered_view(Oid relid, const char *vname, TieredViewInfo *info)
     initStringInfo(&sql);
     appendStringInfo(&sql,
         "SELECT tv.hot_table, tv.iceberg_table, tv.partition_col, "
-        "       tv.is_iceberg_only, aw.cutoff_time "
+        "       tv.is_iceberg_only, aw.cutoff_time, tv.vec_column "
         "FROM coldfront.tiered_views tv "
         "LEFT JOIN coldfront.archive_watermark aw ON aw.table_name = %s "
         "WHERE tv.schema_name = %s AND tv.relname = %s",
@@ -301,6 +311,10 @@ lookup_tiered_view(Oid relid, const char *vname, TieredViewInfo *info)
         info->has_cutoff = !isnull;
         if (!isnull)
             info->cutoff = DatumGetTimestampTz(d);
+
+        /* NULL unless the table has a clustered vector column. */
+        s = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 6);
+        info->vec_column = s ? pstrdup(s) : NULL;
 
         MemoryContextSwitchTo(oldcxt);
         found = true;
@@ -951,13 +965,31 @@ build_hot_dml(DeparseResult *dr, TieredViewInfo *info)
  * deparse_and_find_prefix(), so no RETURNING clause appears in dr->rest.
  */
 static char *
-build_cold_dml(DeparseResult *dr, TieredViewInfo *info)
+build_cold_dml(DeparseResult *dr, TieredViewInfo *info, Query *query)
 {
     StringInfoData buf;
+    char          *sql;
+
     initStringInfo(&buf);
     appendBinaryStringInfo(&buf, dr->orig_sql, dr->head_len);  /* leading WITH, if any */
     appendStringInfo(&buf, "%s%s %s", dr->verb, info->iceberg_table, dr->rest);
-    return normalize_casts_for_duckdb(buf.data);
+    sql = normalize_casts_for_duckdb(buf.data);
+
+    /* A cold UPDATE that sets the embedding re-derives the cluster in the same
+     * statement.  Here rather than in a caller because both the cold and the
+     * dual path build their cold half through this one function, and a row whose
+     * embedding changes while its cluster does not is permanently invisible to
+     * its own probe, silently. */
+    if (query != NULL && query->commandType == CMD_UPDATE
+        && info->vec_column != NULL)
+    {
+        RangeTblEntry *rte = (RangeTblEntry *) list_nth(query->rtable,
+                                                        query->resultRelation - 1);
+        char *restamped = add_cluster_set_item(query, rte, info, sql);
+        if (restamped != NULL)
+            sql = restamped;
+    }
+    return sql;
 }
 
 /*
@@ -1347,7 +1379,20 @@ emit_cold(Query *query, TieredViewInfo *info, ColdParamSet *ps, bool in_plpgsql)
     deparse_and_find_prefix(query, &dr);
     query->returningList = saved_returning;
 
-    cold_dml = build_cold_dml(&dr, info);
+    cold_dml = build_cold_dml(&dr, info, query);
+
+    /* An iceberg-only INSERT into a clustered table is re-emitted so the cluster
+     * is derived in the same statement: a row whose cluster disagrees with its
+     * vector is invisible to its own search and reports no error. */
+    if (query->commandType == CMD_INSERT && info->is_iceberg_only
+        && info->vec_column != NULL)
+    {
+        char *col_list = insert_targetlist_collist(query);
+        char *with_cluster = build_iceberg_only_insert_with_cluster(
+            query, info, skip_leading_collist(dr.rest), col_list);
+        if (with_cluster != NULL)
+            cold_dml = normalize_casts_for_duckdb(with_cluster);
+    }
 
     /* INSERT … SELECT FROM pg_table needs each non-result PG-table
      * reference prefixed with pglocal. so DuckDB can resolve via the
@@ -1421,7 +1466,7 @@ emit_dual(Query *query, TieredViewInfo *info, ColdParamSet *ps, bool in_plpgsql)
     query->returningList = NIL;
     deparse_and_find_prefix(query, &dr_cold);
     query->returningList = saved_returning;
-    cold_dml = build_cold_dml(&dr_cold, info);
+    cold_dml = build_cold_dml(&dr_cold, info, query);
     call = cold_exec_call(info->iceberg_table, cold_sql_arg(cold_dml, ps, true));
 
     initStringInfo(&buf);
@@ -1553,10 +1598,12 @@ append_cold_projection(StringInfo sel, bool in_target, const char *attname,
 }
 
 static char *
-build_cold_select_list(const char *hot_qualified, List *targeted)
+build_cold_select_list(const char *hot_qualified, const char *iceberg_ref,
+                       List *targeted)
 {
     StringInfoData sql, sel;
     bool           first = true;
+    char          *vec_prefix = NULL;
 
     initStringInfo(&sql);
     appendStringInfo(&sql,
@@ -1569,6 +1616,7 @@ build_cold_select_list(const char *hot_qualified, List *targeted)
         "WHERE n.nspname = (parse_ident(%s))[1] "
         "AND c.relname = (parse_ident(%s))[2] "
         "AND a.attnum > 0 AND NOT a.attisdropped "
+        "AND NOT coldfront._is_vec_companion(a.attname, a.attgenerated) "
         "ORDER BY a.attnum",
         quote_literal_cstr(hot_qualified),
         quote_literal_cstr(hot_qualified));
@@ -1594,10 +1642,30 @@ build_cold_select_list(const char *hot_qualified, List *targeted)
                                        default_expr);
                 first = false;
             }
+            /* The Iceberg schema leads with the cluster column and this INSERT
+             * is positional, so the projection leads with it too.  The
+             * expression comes from the extension rather than being spelled
+             * here: a row whose cluster disagrees with its vector is invisible
+             * to its own search and reports no error, so every write path
+             * derives from one definition.  Still inside the SPI call, and
+             * inside CurTransactionContext, so the result outlives SPI_finish. */
+            {
+                StringInfoData q;
+                initStringInfo(&q);
+                appendStringInfo(&q,
+                    "SELECT coldfront._vec_list_prefix_for_ref(%s, '')",
+                    quote_literal_cstr(iceberg_ref));
+                if (SPI_execute(q.data, true, 1) == SPI_OK_SELECT
+                    && SPI_processed == 1)
+                    vec_prefix = SPI_getvalue(SPI_tuptable->vals[0],
+                                              SPI_tuptable->tupdesc, 1);
+            }
             MemoryContextSwitchTo(oldcxt);
         }
         SPI_finish();
     }
+    if (vec_prefix != NULL)
+        return psprintf("%s%s", vec_prefix, sel.data);
     return sel.data;
 }
 
@@ -1693,6 +1761,175 @@ build_tiered_hot_dml(const char *hot_table, const char *col_list,
 }
 
 /*
+ * Find the statement's own WHERE in deparsed DML: the first " WHERE " at paren
+ * depth zero and outside every literal.  Quotes are tracked before parens
+ * because a literal can hold an unbalanced one, and depth matters because a
+ * sublink carries its own WHERE a level down.  NULL when there is none, meaning
+ * the insertion point is the end of the statement.
+ */
+static const char *
+find_toplevel_where(const char *sql)
+{
+    const char *p;
+    bool        in_squote = false, in_dquote = false;
+    int         depth = 0;
+
+    for (p = sql; *p; p++)
+    {
+        if (in_squote) { if (*p == '\'') in_squote = false; continue; }
+        if (in_dquote) { if (*p == '"')  in_dquote = false; continue; }
+        if (*p == '\'') { in_squote = true; continue; }
+        if (*p == '"')  { in_dquote = true; continue; }
+        if (*p == '(')  { depth++; continue; }
+        if (*p == ')')  { depth--; continue; }
+        if (depth == 0 && pg_strncasecmp(p, " WHERE ", 7) == 0)
+            return p;
+    }
+    return NULL;
+}
+
+/*
+ * Add one SET item to a deparsed UPDATE, before the statement's own WHERE or at
+ * the end when it has none.  Returns palloc'd.
+ */
+static char *
+add_set_item(const char *cold_dml, const char *set_item)
+{
+    const char    *w = find_toplevel_where(cold_dml);
+    StringInfoData buf;
+
+    initStringInfo(&buf);
+    if (w == NULL)
+        appendStringInfo(&buf, "%s, %s", cold_dml, set_item);
+    else
+    {
+        appendBinaryStringInfo(&buf, cold_dml, w - cold_dml);
+        appendStringInfo(&buf, ", %s%s", set_item, w);
+    }
+    return buf.data;
+}
+
+/*
+ * The SET assignment for a named column in an UPDATE's post-parse-analyze target
+ * list, or NULL when the statement does not set it.  Same shape as
+ * partcol_set_target, over a different column.
+ */
+static TargetEntry *
+named_set_target(Query *query, RangeTblEntry *rte, const char *colname)
+{
+    AttrNumber  attno;
+    ListCell   *lc;
+
+    if (query->commandType != CMD_UPDATE || colname == NULL)
+        return NULL;
+    attno = get_attnum(rte->relid, colname);
+    if (attno == InvalidAttrNumber)
+        return NULL;
+    foreach(lc, query->targetList)
+    {
+        TargetEntry *tle = (TargetEntry *) lfirst(lc);
+        if (!tle->resjunk && tle->resno == attno)
+            return tle;
+    }
+    return NULL;
+}
+
+/*
+ * Re-stamp the cluster on a cold UPDATE that sets the embedding.
+ *
+ * The derivation takes the text of the new embedding expression rather than a
+ * value, which is what makes this tractable: this path never sees row contents.
+ * The expression is evaluated twice, once for the column and once for the
+ * cluster.  Returns the extended statement, or NULL to leave it untouched.
+ */
+static char *
+add_cluster_set_item(Query *query, RangeTblEntry *rte, TieredViewInfo *info,
+                     const char *cold_dml)
+{
+    TargetEntry   *tle;
+    List          *dpcontext;
+    char          *e_text, *item = NULL;
+    StringInfoData q;
+
+    tle = named_set_target(query, rte, info->vec_column);
+    if (tle == NULL)
+        return NULL;                    /* the UPDATE does not touch the vector */
+
+    dpcontext = deparse_context_for(get_rel_name(rte->relid), rte->relid);
+    e_text    = deparse_expression((Node *) tle->expr, dpcontext, false, false);
+
+    initStringInfo(&q);
+    appendStringInfo(&q, "SELECT coldfront._vec_list_set_item(%s, %s)",
+                     quote_literal_cstr(info->iceberg_table),
+                     quote_literal_cstr(e_text));
+    if (SPI_connect() == SPI_OK_CONNECT)
+    {
+        if (SPI_execute(q.data, true, 1) == SPI_OK_SELECT && SPI_processed == 1)
+        {
+            MemoryContext oldcxt = MemoryContextSwitchTo(CurTransactionContext);
+            item = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+            MemoryContextSwitchTo(oldcxt);
+        }
+        SPI_finish();
+    }
+    if (item == NULL)
+        return NULL;
+
+    /* The item carries the caller's own PG spelling of the new embedding. */
+    return add_set_item(cold_dml, normalize_casts_for_duckdb(item));
+}
+
+/*
+ * Re-emit an iceberg-only INSERT so it carries the cluster assignment.
+ *
+ * The deparsed statement is targeted (`INSERT INTO t (cols) VALUES …`), so the
+ * column and its value are added by naming both rather than by editing each
+ * tuple: the source becomes a derived table and the assignment reads the vector
+ * from it, which is the same shape the tiered cold half already writes. Returns
+ * NULL when the table has no clustered vector column, leaving today's statement
+ * untouched.
+ */
+static char *
+build_iceberg_only_insert_with_cluster(Query *query, TieredViewInfo *info,
+                                       const char *source, const char *col_list)
+{
+    StringInfoData sql, q;
+    char          *prefix = NULL;
+    char          *list_col = NULL;
+
+    if (info->vec_column == NULL)
+        return NULL;
+
+    /* The assignment reads the vector out of the derived table. */
+    initStringInfo(&q);
+    appendStringInfo(&q,
+        "SELECT coldfront._vec_list_col(), "
+        "       coldfront._vec_list_prefix_for_ref(%s, %s)",
+        quote_literal_cstr(info->iceberg_table),
+        quote_literal_cstr("coldfront_src."));
+    if (SPI_connect() == SPI_OK_CONNECT)
+    {
+        if (SPI_execute(q.data, true, 1) == SPI_OK_SELECT && SPI_processed == 1)
+        {
+            MemoryContext oldcxt = MemoryContextSwitchTo(CurTransactionContext);
+            list_col = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+            prefix   = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 2);
+            MemoryContextSwitchTo(oldcxt);
+        }
+        SPI_finish();
+    }
+    if (prefix == NULL || list_col == NULL)
+        return NULL;
+
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+        "INSERT INTO %s (%s, %s) SELECT %s%s FROM (%s) AS coldfront_src(%s)",
+        info->iceberg_table, quote_identifier(list_col), col_list,
+        prefix, col_list, source, col_list);
+    return sql.data;
+}
+
+/*
  * Build the slow-path cold call (IDENTITY-omitted case): the target-name
  * ARRAY[...] plus the coldfront._tiered_insert_cold(...) call. Its source SQL
  * runs in a PG cursor (executed by PG, not DuckDB), so params render as NATIVE
@@ -1759,7 +1996,8 @@ build_cold_bulk_call(Query *query, TieredViewInfo *info, const char *source,
         if (!tle->resjunk && tle->resname != NULL)
             targeted_names = lappend(targeted_names, tle->resname);
     }
-    cold_select = build_cold_select_list(info->hot_table, targeted_names);
+    cold_select = build_cold_select_list(info->hot_table, info->iceberg_table,
+                                        targeted_names);
 
     initStringInfo(&cold);
     appendStringInfo(&cold,
@@ -1769,6 +2007,11 @@ build_cold_bulk_call(Query *query, TieredViewInfo *info, const char *source,
         info->iceberg_table,
         cold_select, source, col_list,
         quote_identifier(info->partition_col), cutoff_lit);
+    /* Ordered by cluster when there is one, so this write's own row groups each
+     * hold roughly one cluster and a probe skips the rest of the file.  The
+     * cluster leads the projection, hence ordinal 1. */
+    if (info->vec_column != NULL)
+        appendStringInfoString(&cold, " ORDER BY 1");
     cold_pfx  = prefix_pg_tables_with_pglocal(query, cold.data);
     cold_norm = normalize_casts_for_duckdb(cold_pfx);
 

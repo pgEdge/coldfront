@@ -24,7 +24,7 @@ REGRESS     = load_order update_unregistered_view update_heap_table \
               param_cold_via_plpgsql async_requires_patch \
               storage_secret_azure storage_secret_vended privilege_model \
               partition_config_interval self_join_rejected returning_cold_rejected \
-              schema_collision drop_iceberg_table vector_type_map vector_cold_render vector_param_render vector_ops
+              schema_collision drop_iceberg_table vector_centroids vector_type_map vector_cold_render vector_param_render vector_ops
 REGRESS_OPTS = --inputdir=test --outputdir=test
 
 PG_CONFIG  ?= pg_config

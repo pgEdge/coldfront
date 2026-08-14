@@ -633,6 +633,10 @@ func (ac *archiveCycle) bootstrapTieredView(ctx context.Context, columns []view.
 		return fmt.Errorf("get watermark: %w", err)
 	}
 	ac.wmCutoff, ac.haveWM = wmCutoff, found // the cycle-start snapshot; see archiveCycle
+	vecExpr, err := vecListExpr(ctx, ac.conn, t, columns)
+	if err != nil {
+		return err
+	}
 	bootstrapCfg := view.ViewConfig{
 		SourceSchema:    t.SourceSchema,
 		SourceTable:     t.SourceTable,
@@ -640,13 +644,14 @@ func (ac *archiveCycle) bootstrapTieredView(ctx context.Context, columns []view.
 		CutoffTime:      wmCutoff,
 		PartitionColumn: t.PartitionColumn,
 		Columns:         columns,
+		VecListExpr:     vecExpr,
 	}
 	if err := ac.viewGen.Recreate(ctx, bootstrapCfg); err != nil {
 		return fmt.Errorf("bootstrap view: %w", err)
 	}
 	hotTable := pgx.Identifier{t.SourceSchema, "_" + t.SourceTable}.Sanitize()
 	if err := registerTieredView(ctx, ac.conn, t.SourceSchema, t.SourceTable,
-		hotTable, iceTable, t.PartitionColumn); err != nil {
+		hotTable, iceTable, t.PartitionColumn, vectorColumn(columns)); err != nil {
 		return fmt.Errorf("register tiered view: %w", err)
 	}
 	return nil
@@ -1034,6 +1039,10 @@ func archiveExport(ctx context.Context, conn *pgx.Conn, t *config.TableConfig,
 func archiveCutover(ctx context.Context, conn *pgx.Conn, t *config.TableConfig,
 	part partition.Info, iceTable, snapshotStr string, columns []view.Column,
 ) error {
+	vecExpr, err := vecListExpr(ctx, conn, t, columns)
+	if err != nil {
+		return err
+	}
 	viewCfg := view.ViewConfig{
 		SourceSchema:    t.SourceSchema,
 		SourceTable:     t.SourceTable,
@@ -1041,6 +1050,7 @@ func archiveCutover(ctx context.Context, conn *pgx.Conn, t *config.TableConfig,
 		CutoffTime:      part.UpperBound,
 		PartitionColumn: t.PartitionColumn,
 		Columns:         columns,
+		VecListExpr:     vecExpr,
 	}
 	viewDDL := view.GenerateViewSQL(viewCfg)
 
@@ -1200,6 +1210,102 @@ func wipeIcebergRange(ctx context.Context, conn *pgx.Conn, iceTable, partCol str
 // for the SQL-side view rebuild; the two have to agree.
 func vecCompanion(col string) string { return "_cf_vec_" + col }
 
+// vecListExpr asks the extension for the expression that assigns a cluster from
+// the value the generated trigger writes the vector from, so the trigger emits the
+// same derivation every other cold write path does. "" when the table has no
+// vector.
+func vecListExpr(ctx context.Context, conn *pgx.Conn, t *config.TableConfig, columns []view.Column) (string, error) {
+	vecCol := vectorColumn(columns)
+	if vecCol == "" {
+		return "", nil
+	}
+	var expr string
+	if err := conn.QueryRow(ctx,
+		"SELECT coldfront._vec_list_expr($1, $2, $3, $4)",
+		t.SourceSchema, t.SourceTable, vecCol, "CAST(%L AS FLOAT[])",
+	).Scan(&expr); err != nil {
+		return "", fmt.Errorf("cluster expression: %w", err)
+	}
+	return expr, nil
+}
+
+// vecLayoutProps asks the extension for the CREATE TABLE properties a clustered
+// table needs, or "" when the table has no vector. The values live in the
+// extension so both modes create the same layout; the primary key rides along as
+// the sort key's tiebreak, which only this side knows.
+func vecLayoutProps(ctx context.Context, conn *pgx.Conn, columns []view.Column) (string, error) {
+	if vectorColumn(columns) == "" {
+		return "", nil
+	}
+	var pk []string
+	for _, c := range columns {
+		if c.IsPK {
+			pk = append(pk, c.Name)
+		}
+	}
+	var props string
+	if err := conn.QueryRow(ctx,
+		"SELECT coldfront._vec_layout_props(coldfront._vec_sort_key($1))", pk).Scan(&props); err != nil {
+		return "", fmt.Errorf("layout properties: %w", err)
+	}
+	return props, nil
+}
+
+// pkOrder spells the primary key as trailing ORDER BY terms, or "" when the table
+// has none. A tiebreak for determinism, not a pruning aid: sorting by cluster
+// scatters a cluster's rows through key space.
+func pkOrder(columns []view.Column) string {
+	var terms []string
+	for _, c := range columns {
+		if c.IsPK {
+			terms = append(terms, "s."+pgx.Identifier{c.Name}.Sanitize())
+		}
+	}
+	if len(terms) == 0 {
+		return ""
+	}
+	return ", " + strings.Join(terms, ", ")
+}
+
+// vectorColumn names the table's vector column, or "" when it has none. One
+// clustered vector column a table: the cluster column is single and names which
+// column it describes through coldfront.vector_config.
+func vectorColumn(columns []view.Column) string {
+	for _, c := range columns {
+		if c.IsVector() {
+			return c.Name
+		}
+	}
+	return ""
+}
+
+// vecListPrefix asks the extension for the expression that assigns a cluster to
+// each staged row, leading the Iceberg INSERT's projection, or "" when the table
+// has no vector.
+//
+// The extension owns the expression rather than the archiver spelling its own:
+// a row whose cluster disagrees with its vector is invisible to its own search
+// and reports no error, so every write path derives from one definition. It also
+// reads the centroids over pglocal, which is why the caller attaches it.
+func vecListPrefix(ctx context.Context, conn *pgx.Conn, t *config.TableConfig, columns []view.Column) (string, error) {
+	vecCol := vectorColumn(columns)
+	if vecCol == "" {
+		return "", nil
+	}
+	if _, err := conn.Exec(ctx, "SELECT coldfront.ensure_pg_attached()"); err != nil {
+		return "", fmt.Errorf("attach pglocal: %w", err)
+	}
+	var prefix string
+	if err := conn.QueryRow(ctx,
+		"SELECT coldfront._vec_list_prefix($1, $2, $3, $4)",
+		t.SourceSchema, t.SourceTable, vecCol,
+		"s."+pgx.Identifier{vecCol}.Sanitize(),
+	).Scan(&prefix); err != nil {
+		return "", fmt.Errorf("cluster expression: %w", err)
+	}
+	return prefix, nil
+}
+
 // stageSelectList builds the SELECT projection for the bulk export. Which
 // columns need a cast, and to what, is view.Column.ExportCast's decision, and
 // which hot-side column is read is view.Column.HotRef's: this only spells the
@@ -1208,18 +1314,18 @@ func stageSelectList(columns []view.Column) string {
 	if len(columns) == 0 {
 		return "*"
 	}
-	parts := make([]string, len(columns))
-	for i, c := range columns {
+	parts := make([]string, 0, len(columns))
+	for _, c := range columns {
 		id := pgx.Identifier{c.Name}.Sanitize()
 		ref, aliased := c.HotRef()
 		switch {
 		case aliased:
 			// The companion is already real[]; reading it needs no cast.
-			parts[i] = ref + " AS " + id
+			parts = append(parts, ref+" AS "+id)
 		case c.ExportCast() != "":
-			parts[i] = ref + "::" + c.ExportCast() + " AS " + id
+			parts = append(parts, ref+"::"+c.ExportCast()+" AS "+id)
 		default:
-			parts[i] = ref
+			parts = append(parts, ref)
 		}
 	}
 	return strings.Join(parts, ", ")
@@ -1286,7 +1392,19 @@ func bulkExportWithSnapshot(ctx context.Context, conn *pgx.Conn, t *config.Table
 	// statement on this dedicated conn, so the claim/lock is released at this
 	// statement's commit. duck_stage was created on the same conn in the prior
 	// statement, so only one DuckDB-database write happens inside this tx.
-	insertSQL, err := dollarQuote(fmt.Sprintf("INSERT INTO %s SELECT * FROM pg_temp.duck_stage", iceTable))
+	vecPrefix, err := vecListPrefix(ctx, conn, t, columns)
+	if err != nil {
+		return "", err
+	}
+	// Ordered by cluster, so this file's own row groups each hold roughly one
+	// cluster and a probe skips the rest of it. Nothing outside this file is
+	// touched: the sorted regions accumulate and compaction folds them together.
+	order := ""
+	if vecPrefix != "" {
+		order = " ORDER BY 1" + pkOrder(columns)
+	}
+	insertSQL, err := dollarQuote(fmt.Sprintf(
+		"INSERT INTO %s SELECT %ss.* FROM pg_temp.duck_stage s%s", iceTable, vecPrefix, order))
 	if err != nil {
 		return "", fmt.Errorf("iceberg insert: %w", err)
 	}
@@ -1322,15 +1440,21 @@ func ensureIcebergTable(ctx context.Context, conn *pgx.Conn, t *config.TableConf
 	if err != nil {
 		return fmt.Errorf("get columns: %w", err)
 	}
-	var colDefs string
-	for i, c := range columns {
-		if i > 0 {
-			colDefs += ", "
-		}
-		colDefs += fmt.Sprintf("%s %s", pgx.Identifier{c.Name}.Sanitize(), c.Type)
+	defs := make([]string, 0, len(columns)+1)
+	if view.HasVector(columns) {
+		defs = append(defs, pgx.Identifier{view.VecListColumn}.Sanitize()+" INTEGER")
 	}
+	for _, c := range columns {
+		defs = append(defs, fmt.Sprintf("%s %s", pgx.Identifier{c.Name}.Sanitize(), c.Type))
+	}
+	colDefs := strings.Join(defs, ", ")
 
-	if err := execDuckDB(ctx, conn, fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (%s)", iceTable, colDefs)); err != nil {
+	props, err := vecLayoutProps(ctx, conn, columns)
+	if err != nil {
+		return err
+	}
+	if err := execDuckDB(ctx, conn, fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (%s)%s",
+		iceTable, colDefs, props)); err != nil {
 		return fmt.Errorf("create iceberg table: %w", err)
 	}
 	return nil
@@ -1339,15 +1463,16 @@ func ensureIcebergTable(ctx context.Context, conn *pgx.Conn, t *config.TableConf
 // registerTieredView upserts a row in coldfront.tiered_views so the
 // coldfront C extension can identify this view as a tiered target and
 // rewrite UPDATE/DELETE into dual-tier CTEs. Called after every view recreate.
-func registerTieredView(ctx context.Context, conn *pgx.Conn, schema, table, hotTable, icebergTable, partitionCol string) error {
+func registerTieredView(ctx context.Context, conn *pgx.Conn, schema, table, hotTable, icebergTable, partitionCol, vecColumn string) error {
 	_, err := conn.Exec(ctx /* nosemgrep */, `
-		INSERT INTO coldfront.tiered_views (schema_name, relname, hot_table, iceberg_table, partition_col)
-		VALUES ($1, $2, $3, $4, $5)
+		INSERT INTO coldfront.tiered_views (schema_name, relname, hot_table, iceberg_table, partition_col, vec_column)
+		VALUES ($1, $2, $3, $4, $5, NULLIF($6, ''))
 		ON CONFLICT (schema_name, relname) DO UPDATE
 		  SET hot_table     = EXCLUDED.hot_table,
 		      iceberg_table = EXCLUDED.iceberg_table,
-		      partition_col = EXCLUDED.partition_col`,
-		schema, table, hotTable, icebergTable, partitionCol)
+		      partition_col = EXCLUDED.partition_col,
+		      vec_column    = EXCLUDED.vec_column`,
+		schema, table, hotTable, icebergTable, partitionCol, vecColumn)
 	return err
 }
 

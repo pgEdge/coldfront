@@ -448,6 +448,17 @@ func TestStageSelectList_Vector(t *testing.T) {
 	assert.Equal(t, `"id", "_cf_vec_embedding" AS "embedding"`, stageSelectList(cols))
 }
 
+// The staging table holds the user's own columns. The cluster is derived by the
+// statement that writes Iceberg, which is the one DuckDB executes and so the only
+// one that can read the centroids.
+func TestStageSelectList_NoClusterColumnStaged(t *testing.T) {
+	cols := []view.Column{
+		{Name: "id", Type: "BIGINT"},
+		{Name: "embedding", Type: "FLOAT[]", ViewCastType: "real[]", HotSource: "_cf_vec_embedding"},
+	}
+	assert.NotContains(t, stageSelectList(cols), "_cf_vec_list")
+}
+
 // The companion is what makes a vector scannable, so its name has to be derived
 // the same way here and in coldfront._vec_companion, which the SQL side uses.
 func TestVecCompanion(t *testing.T) {

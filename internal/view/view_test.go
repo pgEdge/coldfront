@@ -2,6 +2,7 @@ package view
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -63,6 +64,47 @@ func TestGenerateTriggerFuncSQL_ColdInsertVectorBracketsAndCasts(t *testing.T) {
 		"the literal is cast to the Iceberg column type")
 	assert.NotContains(t, sql, `NEW."embedding",`,
 		"a bare real[] reaches DuckDB as {…} and fails to cast")
+}
+
+// The Iceberg schema leads with the cluster column, and this INSERT is positional
+// because it is assembled positionally, so the value list leads with it too.
+func TestGenerateTriggerFuncSQL_ColdInsertLeadsWithClusterColumn(t *testing.T) {
+	sql := GenerateTriggerFuncSQL(vectorCfg)
+	assert.Contains(t, sql, "VALUES (NULL, %L, %L, CAST(%L AS FLOAT[]))",
+		"with no expression fetched the column is written unassigned")
+}
+
+// With the extension's expression fetched, the trigger emits it and repeats the
+// vector's value for the placeholder inside it, so the two pair up positionally.
+// The expression is not spelled here: one definition, in the extension.
+func TestGenerateTriggerFuncSQL_ColdInsertAssignsTheCluster(t *testing.T) {
+	cfg := vectorCfg
+	cfg.VecListExpr = "(SELECT arg_min(c.centroid_id, list_cosine_distance(c.centroid, CAST(%L AS FLOAT[]))) FROM pglocal.coldfront.vector_centroids c)"
+	sql := GenerateTriggerFuncSQL(cfg)
+	// Doubled apostrophes: the template is itself a single-quoted string, so the
+	// expression's own literals have to survive PostgreSQL's scan of it.
+	assert.Contains(t, sql,
+		"VALUES ("+strings.ReplaceAll(cfg.VecListExpr, "'", "''")+", %L, %L, CAST(%L AS FLOAT[]))",
+		"the cluster expression leads the positional cold INSERT")
+	assert.Contains(t, sql, `translate(NEW."embedding"::text,'{}','[]'), NEW."id"`,
+		"the vector's value leads the argument list, feeding the expression")
+	assert.Contains(t, sql, "PERFORM coldfront.ensure_pg_attached();",
+		"the lookup reads the centroids over pglocal")
+}
+
+// A table with no vector never attaches pglocal: only the lookup reads it.
+func TestGenerateTriggerFuncSQL_NoVectorNoPglocalAttach(t *testing.T) {
+	assert.NotContains(t, GenerateTriggerFuncSQL(testCfg), "ensure_pg_attached")
+}
+
+// A table with no vector has no cluster column anywhere, so its generated SQL is
+// exactly what it was. Asserted on a config with no identity column, since an
+// identity already contributes a leading NULL of its own.
+func TestGenerateTriggerFuncSQL_NoVectorNoClusterColumn(t *testing.T) {
+	cfg := testCfg
+	cfg.Columns = []Column{{Name: "ts", Type: "TIMESTAMPTZ"}, {Name: "status", Type: "VARCHAR"}}
+	assert.Contains(t, GenerateTriggerFuncSQL(cfg), "VALUES (%L, %L)",
+		"a table without a vector must not gain a leading placeholder")
 }
 
 // pg_duckdb rejects a pgvector column while it builds the plan, before any cast in

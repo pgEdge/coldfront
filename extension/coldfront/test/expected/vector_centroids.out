@@ -1,0 +1,100 @@
+-- The routing state Phase 2 assigns and probes against: one centroid set per
+-- vector column, plus the per-table settings that describe it.
+--
+-- It lives in PostgreSQL because three consumers need it there: the read-path
+-- rewrite scores a query against it in the same backend, the write paths resolve
+-- an assignment inside the statement doing the write, and an adaptive addition is
+-- inserted in the same transaction as the row that triggered it.
+--
+-- Suppress the run-order-dependent "already exists" NOTICE: in the shared regress
+-- db an earlier test may have created the extensions, standalone not.
+-- Deliberately no pgvector here: these tables ship with the extension, so they
+-- must exist on a database that has no vectors and may never have any.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_duckdb;
+CREATE EXTENSION IF NOT EXISTS coldfront;
+RESET client_min_messages;
+-- Name-keyed, like partition_config: a mesh replicates it by value, so every node
+-- assigns identical cluster ids without sharing OIDs.
+SELECT a.attname, format_type(a.atttypid, a.atttypmod) AS type, a.attnotnull
+  FROM pg_attribute a
+ WHERE a.attrelid = 'coldfront.vector_centroids'::regclass
+   AND a.attnum > 0 AND NOT a.attisdropped
+ ORDER BY a.attnum;
+   attname   |  type   | attnotnull 
+-------------+---------+------------
+ schema_name | text    | t
+ table_name  | text    | t
+ column_name | text    | t
+ generation  | integer | t
+ centroid_id | integer | t
+ parent_id   | integer | f
+ centroid    | real[]  | t
+(7 rows)
+
+SELECT conname, pg_get_constraintdef(oid) AS def
+  FROM pg_constraint
+ WHERE conrelid = 'coldfront.vector_centroids'::regclass
+ ORDER BY conname;
+                conname                |                                     def                                     
+---------------------------------------+-----------------------------------------------------------------------------
+ vcent_gen_pos                         | CHECK ((generation >= 1))
+ vector_centroids_centroid_id_not_null | NOT NULL centroid_id
+ vector_centroids_centroid_not_null    | NOT NULL centroid
+ vector_centroids_column_name_not_null | NOT NULL column_name
+ vector_centroids_generation_not_null  | NOT NULL generation
+ vector_centroids_pkey                 | PRIMARY KEY (schema_name, table_name, column_name, generation, centroid_id)
+ vector_centroids_schema_name_not_null | NOT NULL schema_name
+ vector_centroids_table_name_not_null  | NOT NULL table_name
+(8 rows)
+
+SELECT a.attname, format_type(a.atttypid, a.atttypmod) AS type
+  FROM pg_attribute a
+ WHERE a.attrelid = 'coldfront.vector_config'::regclass
+   AND a.attnum > 0 AND NOT a.attisdropped
+ ORDER BY a.attnum;
+   attname    |  type   
+--------------+---------
+ schema_name  | text
+ table_name   | text
+ column_name  | text
+ nlist        | integer
+ nprobe       | integer
+ generation   | integer
+ addition_cap | integer
+(7 rows)
+
+-- A restored node must re-attach to the same cold tier without retraining, and a
+-- generation is meaningless without the centroids that defined it.
+SELECT c.relname
+  FROM pg_class c
+ WHERE c.oid = ANY (SELECT unnest(extconfig) FROM pg_extension WHERE extname = 'coldfront')
+   AND c.relname IN ('vector_centroids', 'vector_config')
+ ORDER BY c.relname;
+     relname      
+------------------
+ vector_centroids
+ vector_config
+(2 rows)
+
+-- A generation is immutable: rows are inserted, never updated in place, so a
+-- query that resolved a generation keeps meaning the same thing.
+INSERT INTO coldfront.vector_config (schema_name, table_name, column_name, nlist, nprobe)
+VALUES ('public', 'chunks', 'embedding', 500, 20);
+INSERT INTO coldfront.vector_centroids (schema_name, table_name, column_name, generation, centroid_id, centroid)
+VALUES ('public', 'chunks', 'embedding', 1, 0, ARRAY[1,0,0]::real[]),
+       ('public', 'chunks', 'embedding', 1, 1, ARRAY[0,1,0]::real[]);
+SELECT count(*) AS centroids FROM coldfront.vector_centroids WHERE table_name = 'chunks';
+ centroids 
+-----------
+         2
+(1 row)
+
+-- The same centroid id twice in one generation would make an assignment ambiguous.
+INSERT INTO coldfront.vector_centroids (schema_name, table_name, column_name, generation, centroid_id, centroid)
+VALUES ('public', 'chunks', 'embedding', 1, 0, ARRAY[9,9,9]::real[]);
+ERROR:  duplicate key value violates unique constraint "vector_centroids_pkey"
+DETAIL:  Key (schema_name, table_name, column_name, generation, centroid_id)=(public, chunks, embedding, 1, 0) already exists.
+-- Cleanup.
+DELETE FROM coldfront.vector_centroids WHERE table_name = 'chunks';
+DELETE FROM coldfront.vector_config WHERE table_name = 'chunks';

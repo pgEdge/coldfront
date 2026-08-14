@@ -26,6 +26,14 @@ type ViewConfig struct {
 	CutoffTime      time.Time
 	PartitionColumn string
 	Columns         []Column
+
+	// VecListExpr is the DuckDB expression that assigns a cluster, as
+	// coldfront._vec_list_expr returns it, with the vector's own placeholder
+	// already inside. Fetched rather than spelled here: a row whose cluster
+	// disagrees with its vector is invisible to its own search and reports no
+	// error, so the extension holds the single definition every path emits.
+	// Empty on a table with no vector, and empty leaves the column unassigned.
+	VecListExpr string
 }
 
 // Column holds a column name, its DuckDB types, and key-participation flags.
@@ -67,14 +75,35 @@ func (c Column) HotRef() (ref string, aliased bool) {
 	return pgx.Identifier{c.Name}.Sanitize(), false
 }
 
+// VecListColumn is the Iceberg-only column carrying a row's cluster assignment.
+// It exists in the Iceberg schema and nowhere else: not on the hot table, and not
+// in either branch of the view, so no query written against the view can name it.
+//
+// It leads the schema rather than trailing it. Iceberg evolution appends, and a
+// cold INSERT is positional because Iceberg rejects a targeted one, so a column
+// added later must land after everything both sides already agree on.
+const VecListColumn = "_cf_vec_list"
+
+// HasVector reports whether a column set carries a vector, which is what decides
+// whether the Iceberg schema gets the cluster column at all. A table without one
+// keeps exactly the schema and the write statements it had.
+func HasVector(cols []Column) bool {
+	for _, c := range cols {
+		if c.IsVector() {
+			return true
+		}
+	}
+	return false
+}
+
 // IsVector reports whether this column's Iceberg storage is a list of floats,
 // which is how a pgvector vector/halfvec is stored.
 //
 // Two consequences follow, and both have callers. The view exposes the column as
 // real[], so every path that renders a value for DuckDB converts PG's {1,2,3}
 // array text into DuckDB's [1,2,3] list literal. And pg_duckdb cannot scan the
-// pgvector type at all, so the archiver stages the partition through PostgreSQL
-// first (see needsPGStage).
+// pgvector type at all, so every hot-side read goes through the generated
+// companion instead (see HotRef).
 func (c Column) IsVector() bool { return c.Type == "FLOAT[]" }
 
 // ExportCast returns the cast the archiver's bulk-export projection applies to
@@ -177,8 +206,31 @@ func (c ViewConfig) insertCols() (colList, valList string) {
 //
 // This must stay consistent with the archiver's bulk-export path, which writes
 // bytea natively because pg_duckdb scans it directly (no %L stringification).
+// vecListPlaceholder is the leading entry of the positional cold INSERT: the
+// cluster expression when one was fetched, else an unassigned column.
+func (c ViewConfig) vecListPlaceholder() string {
+	if c.VecListExpr != "" {
+		return c.VecListExpr
+	}
+	return "NULL"
+}
+
+// vecListArg is the argument the cluster expression's own placeholder consumes,
+// which is the same value the vector column is written from.
+func (c ViewConfig) vecListArg() string {
+	for _, col := range c.Columns {
+		if col.IsVector() {
+			return "translate(NEW." + pgx.Identifier{col.Name}.Sanitize() + "::text,'{}','[]')"
+		}
+	}
+	return ""
+}
+
 func (c ViewConfig) coldInsertVals() string {
 	var vals []string
+	if HasVector(c.Columns) && c.VecListExpr != "" {
+		vals = append(vals, c.vecListArg())
+	}
 	for _, col := range c.Columns {
 		if col.IsIdentity {
 			continue
@@ -199,13 +251,18 @@ func (c ViewConfig) coldInsertVals() string {
 }
 
 // coldInsertPlaceholders returns positional value placeholders for the cold
-// INSERT via PG's format() call.  Identity columns use literal NULL (Iceberg
+// INSERT via PG's format() call.  The cluster column leads, unassigned, whenever
+// the table has a vector: it leads the Iceberg schema and this INSERT is
+// positional.  Identity columns use literal NULL (Iceberg
 // has no sequences); bytea uses from_hex(%L) so DuckDB reconstructs the exact
 // bytes from the hex string (see coldInsertVals); all other columns use %L so
 // format() quotes them safely. DuckDB/Iceberg does not support targeted inserts
 // (INSERT INTO t(col) ...), so we emit a positional INSERT INTO t VALUES (...).
 func (c ViewConfig) coldInsertPlaceholders() string {
 	var ph []string
+	if HasVector(c.Columns) {
+		ph = append(ph, c.vecListPlaceholder())
+	}
 	for _, col := range c.Columns {
 		switch {
 		case col.IsIdentity:
@@ -335,10 +392,22 @@ func GenerateTriggerFuncSQL(cfg ViewConfig) string {
 	coldPlaceholders := cfg.coldInsertPlaceholders()
 	coldVals := cfg.coldInsertVals()
 
+	// Only the cluster lookup reads pglocal, so a table without a vector must not
+	// pay for the attach.
+	attachPG := ""
+	if HasVector(cfg.Columns) {
+		attachPG = "\n      PERFORM coldfront.ensure_pg_attached();"
+	}
+
 	// cfg.IcebergTable is the ref DuckDB parses (not a PG identifier); embed
 	// it in the format() template as-is, apostrophe-escaped so it survives
-	// PG's outer string-literal scan.
+	// PG's outer string-literal scan. The placeholders need the same escape for
+	// the same reason: the cluster expression carries the literals that name its
+	// configuration row, and a bare apostrophe there would close the template.
 	iceRef := strings.ReplaceAll(cfg.IcebergTable, "'", "''")
+	coldPlaceholders = strings.ReplaceAll(coldPlaceholders, "'", "''")
+
+	coldStmt := fmt.Sprintf("INSERT INTO %s VALUES (%s)", iceRef, coldPlaceholders)
 
 	return fmt.Sprintf(`CREATE OR REPLACE FUNCTION %s() RETURNS trigger AS $fn$
 DECLARE
@@ -351,9 +420,9 @@ BEGIN
 
   IF TG_OP = 'INSERT' THEN
     IF NEW.%s < cutoff THEN
-      PERFORM coldfront.ensure_attached();
+      PERFORM coldfront.ensure_attached();%s
       PERFORM duckdb.raw_query(format(
-        'INSERT INTO %s VALUES (%s)',
+        '%s',
         %s
       ));
       RETURN NEW;
@@ -368,7 +437,8 @@ $fn$ LANGUAGE plpgsql`,
 		sqlutil.Literal(cfg.SourceSchema), sqlutil.Literal(cfg.SourceTable),
 		cutoff,
 		col,
-		iceRef, coldPlaceholders, coldVals,
+		attachPG,
+		coldStmt, coldVals,
 		fqHot, colList, hotVals)
 }
 

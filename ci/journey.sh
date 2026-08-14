@@ -715,6 +715,161 @@ SELECT 'DEC_VEC:' || (embedding = ARRAY[7,-8.25,9]::real[])::text FROM icevec WH
 EOSQL
 )
     assert_eq "decoupled vector round-trip" "true" "$(extract DEC_VEC "$D")"
+
+    # Decoupled declares its own schema, so the append has a second implementation.
+    local DL; DL=$(qf "$HOST" <<'EOSQL'
+SELECT coldfront.ensure_attached();
+SELECT 'DEC_ICE_LIST:' || count(*) FROM duckdb.query($$SELECT column_name FROM (DESCRIBE ice.public.icevec)$$) AS t(r)
+ WHERE r['column_name']::text = '_cf_vec_list';
+SELECT 'DEC_VIEW_LIST:' || count(*) FROM pg_attribute
+ WHERE attrelid = 'public.icevec'::regclass AND attname = '_cf_vec_list' AND attnum > 0;
+EOSQL
+)
+    assert_eq "decoupled Iceberg schema carries the cluster column" "1" "$(extract DEC_ICE_LIST "$DL")"
+    assert_eq "decoupled view does not project it"                  "0" "$(extract DEC_VIEW_LIST "$DL")"
+
+    # A decoupled INSERT is rewritten in C, a different generator again, and it
+    # must stamp the cluster in the same statement once a generation is live.
+    q "$HOST" "INSERT INTO coldfront.vector_config (schema_name, table_name, column_name, nlist, nprobe) VALUES ('public','icevec','embedding',2,1);" >/dev/null
+    q "$HOST" "INSERT INTO coldfront.vector_centroids (schema_name, table_name, column_name, generation, centroid_id, centroid) VALUES ('public','icevec','embedding',1,0,ARRAY[7,-8.25,9]::real[]),('public','icevec','embedding',1,1,ARRAY[-1,-1,-1]::real[]);" >/dev/null
+    q "$HOST" "UPDATE coldfront.vector_config SET generation = 1 WHERE table_name = 'icevec';" >/dev/null
+    local DA; DA=$(qf "$HOST" <<'EOSQL'
+INSERT INTO icevec VALUES (2, date_trunc('month',now()) + interval '12 hours', '[7,-8.25,9]'::vector);
+SELECT coldfront.ensure_attached();
+SELECT 'DEC_ASG:' || r['_cf_vec_list'] FROM iceberg_scan('ice.public.icevec') r WHERE r['id'] = 2;
+EOSQL
+)
+    assert_eq "a decoupled INSERT stamps the nearest cluster" "0" "$(extract DEC_ASG "$DA")"
+
+    # Multi-row INSERT ... SELECT of cold rows: the extension rewrites this in C,
+    # a different generator from the single-row trigger above, and it builds its
+    # projection from the hot table's own column list.
+    local B; B=$(qf "$HOST" <<'EOSQL'
+INSERT INTO chunks (ts, body, embedding)
+SELECT date_trunc('month',now()) - interval '4 months' + interval '20 days' + (i || ' hours')::interval,
+       'bulk' || i, ARRAY[i, i + 1, i + 2]::real[]::vector
+  FROM generate_series(1, 3) i;
+SELECT 'BULK_N:' || count(*) FROM chunks WHERE body LIKE 'bulk%';
+SELECT 'BULK_VEC:' || (embedding = ARRAY[2,3,4]::real[])::text FROM chunks WHERE body = 'bulk2';
+EOSQL
+)
+    assert_eq "bulk cold INSERT of vectors lands"     "3"    "$(extract BULK_N "$B")"
+    assert_eq "bulk cold INSERT round-trips the vector" "true" "$(extract BULK_VEC "$B")"
+
+    # The cluster column belongs to the Iceberg schema and to nothing else: no
+    # branch of the view projects it, so no query written against the view can
+    # name it and SELECT * stays the user's own column list.
+    local H; H=$(qf "$HOST" <<'EOSQL'
+SELECT coldfront.ensure_attached();
+SELECT 'ICE_LIST:' || count(*) FROM duckdb.query($$SELECT column_name FROM (DESCRIBE ice.public.chunks)$$) AS t(r)
+ WHERE r['column_name']::text = '_cf_vec_list';
+SELECT 'VIEW_LIST:' || count(*) FROM pg_attribute
+ WHERE attrelid = 'public.chunks'::regclass AND attname = '_cf_vec_list' AND attnum > 0;
+SELECT 'HOT_LIST:' || count(*) FROM pg_attribute
+ WHERE attrelid = 'public._chunks'::regclass AND attname = '_cf_vec_list' AND attnum > 0;
+EOSQL
+)
+    assert_eq "the cluster column is in the Iceberg schema" "1" "$(extract ICE_LIST "$H")"
+    assert_eq "the view does not project it"                "0" "$(extract VIEW_LIST "$H")"
+    assert_eq "the hot table does not carry it"             "0" "$(extract HOT_LIST "$H")"
+
+    # Training reads the cold corpus through DuckDB and writes a centroid set back
+    # into PostgreSQL. Two clusters over the archived rows is enough to prove the
+    # loop runs, the means come back as real[], and the generation pointer moves.
+    # CALL, not SELECT: reading a DuckDB result is only possible outside a function.
+    q "$HOST" "INSERT INTO coldfront.vector_config (schema_name, table_name, column_name, nlist, nprobe) VALUES ('public','chunks','embedding',2,1);" >/dev/null
+    local T; T=$(qf "$HOST" <<'EOSQL'
+CALL coldfront.vector_train('public','chunks','embedding');
+SELECT 'GEN:' || generation FROM coldfront.vector_config WHERE table_name = 'chunks';
+SELECT 'NCENT:' || count(*) FROM coldfront.vector_centroids
+ WHERE table_name = 'chunks' AND generation = (SELECT generation FROM coldfront.vector_config WHERE table_name = 'chunks');
+SELECT 'DIMS:' || string_agg(DISTINCT array_length(centroid,1)::text, ',') FROM coldfront.vector_centroids WHERE table_name = 'chunks';
+SELECT 'FINITE:' || bool_and(c > '-Infinity'::real AND c < 'Infinity'::real)::text
+  FROM coldfront.vector_centroids, unnest(centroid) c WHERE table_name = 'chunks';
+EOSQL
+)
+    assert_eq "training writes a new generation"        "1"    "$(extract GEN "$T")"
+    assert_eq "training stores the trained centroids"   "2"    "$(extract NCENT "$T")"
+    assert_eq "centroids keep the column's dimension"   "3"    "$(extract DIMS "$T")"
+    assert_eq "centroid means are finite"               "true" "$(extract FINITE "$T")"
+
+    # A retrain is a new generation, never an edit of the one queries are resolving.
+    local T2; T2=$(qf "$HOST" <<'EOSQL'
+CALL coldfront.vector_train('public','chunks','embedding');
+SELECT 'GEN2:' || generation FROM coldfront.vector_config WHERE table_name = 'chunks';
+SELECT 'GENS:' || string_agg(DISTINCT generation::text, ',' ORDER BY generation::text) FROM coldfront.vector_centroids WHERE table_name = 'chunks';
+EOSQL
+)
+    assert_eq "a retrain moves the pointer forward"     "2"     "$(extract GEN2 "$T2")"
+    assert_eq "the previous generation is left intact"  "1,2"   "$(extract GENS "$T2")"
+
+    # With a generation live, every path that writes a vector into the cold tier
+    # stamps the cluster in the same statement. Two paths, one vector, read back
+    # from Iceberg: the view cannot project the column, by design.
+    local A; A=$(qf "$HOST" <<'EOSQL'
+INSERT INTO chunks (ts, body, embedding)
+VALUES (date_trunc('month',now()) - interval '4 months' + interval '21 days', 'asg_trig', '[1.5,-2,3]'::vector);
+INSERT INTO chunks (ts, body, embedding)
+SELECT date_trunc('month',now()) - interval '4 months' + interval '22 days', 'asg_bulk' || i, ARRAY[1.5,-2,3]::real[]::vector
+  FROM generate_series(1, 1) i;
+SELECT coldfront.ensure_attached();
+SELECT 'ASG:' || r['body'] || '=' || r['_cf_vec_list']
+  FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] IN ('asg_trig', 'asg_bulk1') ORDER BY r['body'];
+SELECT 'ASG_AGREE:' || count(DISTINCT r['_cf_vec_list']::int)
+  FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] IN ('asg_trig', 'asg_bulk1');
+SELECT 'ASG_NOTNULL:' || bool_and(r['_cf_vec_list'] IS NOT NULL)::text
+  FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] IN ('asg_trig', 'asg_bulk1');
+EOSQL
+)
+    assert_eq "every write path agrees on the cluster" "1"    "$(extract ASG_AGREE "$A")"
+    assert_eq "a written vector is never left unassigned" "true" "$(extract ASG_NOTNULL "$A")"
+
+    # The assignment is the nearest centroid, not just any value: computed here
+    # independently of the generator the write paths used.
+    local E; E=$(qf "$HOST" <<'EOSQL'
+SELECT coldfront.ensure_attached();
+SELECT 'EXPECT:' || (SELECT centroid_id FROM coldfront.vector_centroids
+   WHERE table_name = 'chunks' AND generation = (SELECT generation FROM coldfront.vector_config WHERE table_name = 'chunks')
+   ORDER BY centroid <=> ARRAY[1.5,-2,3]::real[] LIMIT 1);
+SELECT 'ACTUAL:' || min(r['_cf_vec_list']::int) FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] = 'asg_trig';
+EOSQL
+)
+    assert_eq "the stamped cluster is the nearest centroid" "$(extract EXPECT "$E")" "$(extract ACTUAL "$E")"
+
+    # Rows archived before any training stay unassigned, which a probe reads
+    # through the null arm of its predicate rather than missing.
+    local U; U=$(qf "$HOST" <<'EOSQL'
+SELECT coldfront.ensure_attached();
+SELECT 'PRE:' || count(*) FROM iceberg_scan('ice.public.chunks') r
+ WHERE r['body'] = 'cold' AND r['_cf_vec_list'] IS NULL;
+EOSQL
+)
+    assert_eq "a row written before training stays unassigned" "1" "$(extract PRE "$U")"
+
+    # A cold UPDATE that sets a new embedding must re-derive the cluster in the
+    # same statement. The row is found by its new cluster and no longer by its
+    # old one, which is the silent-invisibility bug stated as a test.
+    local OLD_ASG; OLD_ASG=$(q "$HOST" "SELECT r['_cf_vec_list'] FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] = 'asg_trig';" 2>/dev/null)
+    local UP; UP=$(qf "$HOST" <<'EOSQL'
+SET coldfront.allow_mixed_writes = on;
+UPDATE chunks SET embedding = ARRAY[-1,-1,-1]::real[]::vector WHERE body = 'asg_trig';
+SELECT coldfront.ensure_attached();
+SELECT 'NEW_VEC:' || (r['embedding']::real[] = ARRAY[-1,-1,-1]::real[])::text
+  FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] = 'asg_trig';
+SELECT 'NEW_ASG:' || r['_cf_vec_list'] FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] = 'asg_trig';
+SELECT 'NEAREST_TO_NEW:' || (SELECT centroid_id FROM coldfront.vector_centroids
+   WHERE table_name = 'chunks' AND generation = (SELECT generation FROM coldfront.vector_config WHERE table_name = 'chunks')
+   ORDER BY centroid <=> ARRAY[-1,-1,-1]::real[] LIMIT 1);
+EOSQL
+)
+    assert_eq "a cold UPDATE writes the new embedding" "true" "$(extract NEW_VEC "$UP")"
+    assert_eq "a cold UPDATE re-derives the cluster" "$(extract NEAREST_TO_NEW "$UP")" "$(extract NEW_ASG "$UP")"
+    assert_ne "the row left its old cluster" "$OLD_ASG" "$(extract NEW_ASG "$UP")"
+
+    # An untrained column is a clear error, not a silent empty probe set.
+    local TE; TE=$(q_may "$HOST" "CALL coldfront.vector_train('public','chunks','nosuchcol',2);")
+    assert_err "training an unconfigured column is refused" "no configuration" "$TE"
+
 }
 
 # ───────────────────────────────────────────────────────────────────────────
