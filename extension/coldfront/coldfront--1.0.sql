@@ -657,7 +657,8 @@ BEGIN
     JOIN pg_class c ON c.oid = a.attrelid
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE n.nspname = p_schema AND c.relname = p_part
-      AND a.attnum > 0 AND NOT a.attisdropped;
+      AND a.attnum > 0 AND NOT a.attisdropped
+      AND NOT coldfront._is_vec_companion(a.attname, a.attgenerated);
 
     -- Idempotent reset. CASCADE on DROP FUNCTION removes the AFTER-row /
     -- BEFORE-TRUNCATE triggers on the partition that reference these
@@ -847,7 +848,8 @@ BEGIN
     JOIN pg_namespace n ON n.oid = c.relnamespace
     LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
     WHERE n.nspname = v_hot_schema AND c.relname = v_hot_relname
-      AND a.attnum > 0 AND NOT a.attisdropped;
+      AND a.attnum > 0 AND NOT a.attisdropped
+      AND NOT coldfront._is_vec_companion(a.attname, a.attgenerated);
 
     target_csv := array_to_string(
         ARRAY(SELECT quote_ident(c) FROM unnest(p_target_cols) c), ', ');
@@ -902,16 +904,7 @@ BEGIN
             ELSIF payload ? col AND (payload->col) IS NOT NULL
                   AND jsonb_typeof(payload->col) <> 'null' THEN
                 val_text := payload->>col;
-                IF full_types[i] = 'bytea' THEN
-                    -- val_text is PG bytea text '\xHEX' (bytea_output pinned to
-                    -- hex above). DuckDB stores a BLOB, so rebuild the exact
-                    -- bytes from the hex digits via from_hex(). Passing the
-                    -- '\xHEX' string straight to a BLOB column would make DuckDB
-                    -- mis-parse the \x escapes and corrupt the value.
-                    row_lit := row_lit || format('from_hex(%L)', substr(val_text, 3));
-                ELSE
-                    row_lit := row_lit || quote_literal(val_text);
-                END IF;
+                row_lit  := row_lit || coldfront._render_cold_value(val_text, full_types[i]);
             ELSE
                 row_lit := row_lit || 'NULL';
             END IF;
@@ -1042,7 +1035,8 @@ BEGIN
     FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid
     JOIN pg_namespace nn ON nn.oid = c.relnamespace
     WHERE nn.nspname = v_hot_schema AND c.relname = v_hot_relname
-      AND a.attnum > 0 AND NOT a.attisdropped;
+      AND a.attnum > 0 AND NOT a.attisdropped
+      AND NOT coldfront._is_vec_companion(a.attname, a.attgenerated);
     SELECT string_agg(quote_ident(col), ', ' ORDER BY ord),
            string_agg(format('r[%L]::%s AS %I', col,
                              COALESCE(NULLIF(coldfront._iceberg_view_cast_type(typ), ''),
@@ -1200,11 +1194,7 @@ BEGIN
             row_lit := row_lit || quote_literal(p_payload->>'cf_new_ts');
         ELSIF p_payload ? col AND jsonb_typeof(p_payload->col) <> 'null' THEN
             val_text := p_payload->>col;
-            IF p_types[i] = 'bytea' THEN
-                row_lit := row_lit || format('from_hex(%L)', substr(val_text, 3));
-            ELSE
-                row_lit := row_lit || quote_literal(val_text);
-            END IF;
+            row_lit  := row_lit || coldfront._render_cold_value(val_text, p_types[i]);
         ELSE
             row_lit := row_lit || 'NULL';
         END IF;
@@ -1279,7 +1269,8 @@ BEGIN
     JOIN pg_class c ON c.oid = a.attrelid
     JOIN pg_namespace n ON n.oid = c.relnamespace
     WHERE n.nspname = p_schema AND c.relname = p_part
-      AND a.attnum > 0 AND NOT a.attisdropped;
+      AND a.attnum > 0 AND NOT a.attisdropped
+      AND NOT coldfront._is_vec_companion(a.attname, a.attgenerated);
 
     SELECT array_agg(a.attname ORDER BY x.ord)
     INTO pk_names
@@ -1501,6 +1492,162 @@ $$;
 -- rejected at create time. See ARCHITECTURE_DECOUPLED.md for the full table.
 -- ============================================================================
 
+-- pgvector's vector/halfvec, with or without the dimension typmod. Both maps
+-- below call this so they cannot disagree about what counts as a vector: the
+-- storage type and the view cast have to move together or a column stores one
+-- way and reads another. sparsevec is excluded deliberately (densifying it is a
+-- 100x storage blowup), so it falls through to the unsupported-type error.
+CREATE OR REPLACE FUNCTION coldfront._is_vector_type(p_pg_type text)
+RETURNS boolean
+LANGUAGE sql IMMUTABLE STRICT AS $$
+    SELECT lower(trim(p_pg_type)) IN ('vector', 'halfvec')
+        OR lower(trim(p_pg_type)) LIKE 'vector(%'
+        OR lower(trim(p_pg_type)) LIKE 'halfvec(%';
+$$;
+
+-- The distance operators a caller writes, on the real[] the view exposes.
+--
+-- Each function is named for the DuckDB function it has to become: pg_duckdb
+-- resolves an operator by its implementing function's NAME in DuckDB's catalog, so
+-- the cold side gets DuckDB's own list_cosine_distance / list_distance /
+-- list_negative_inner_product. The PostgreSQL bodies are real implementations, not
+-- stubs, because a read that stays in PostgreSQL executes them: they delegate to
+-- pgvector, which is exact and SIMD-accelerated, rather than hand-rolling the
+-- arithmetic.
+--
+-- They are created in pgvector's own schema, whatever that is. A caller who has a
+-- vector column has that schema on their search_path already, so `<=>` resolves
+-- unqualified without ColdFront claiming public. Installed at onboarding rather
+-- than at CREATE EXTENSION, since pgvector need not be present until a table
+-- actually carries a vector.
+CREATE OR REPLACE FUNCTION coldfront.install_vector_ops()
+RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_nsp  text;
+    r      record;
+BEGIN
+    SELECT n.nspname INTO v_nsp
+    FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+    WHERE t.typname = 'vector';
+
+    -- Install pgvector rather than demand it. A tiered table cannot have declared a
+    -- vector column without it, but a decoupled table names its types in jsonb, so
+    -- the type need never have existed until now.
+    IF v_nsp IS NULL THEN
+        CREATE EXTENSION IF NOT EXISTS vector;
+        SELECT n.nspname INTO v_nsp
+        FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
+        WHERE t.typname = 'vector';
+    END IF;
+    IF v_nsp IS NULL THEN
+        RAISE EXCEPTION 'coldfront: pgvector is required for a vector column and could not be installed'
+            USING HINT = 'Install the pgvector package, then CREATE EXTENSION vector;';
+    END IF;
+
+    FOR r IN
+        SELECT * FROM (VALUES
+            ('list_cosine_distance',          '<=>'),
+            ('list_distance',                 '<->'),
+            ('list_negative_inner_product',   '<#>')
+        ) AS v(fn, op)
+    LOOP
+        EXECUTE format(
+            'CREATE OR REPLACE FUNCTION %I.%I(real[], real[]) RETURNS double precision '
+            'LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS '
+            '$fn$ SELECT $1::%I.vector OPERATOR(%I.%s) $2::%I.vector $fn$',
+            v_nsp, r.fn, v_nsp, v_nsp, r.op, v_nsp);
+
+        IF NOT EXISTS (
+            SELECT 1 FROM pg_operator o
+            WHERE o.oprname = r.op
+              AND o.oprleft  = 'real[]'::regtype
+              AND o.oprright = 'real[]'::regtype)
+        THEN
+            EXECUTE format(
+                'CREATE OPERATOR %I.%s (LEFTARG = real[], RIGHTARG = real[], FUNCTION = %I.%I)',
+                v_nsp, r.op, v_nsp, r.fn);
+        END IF;
+    END LOOP;
+END;
+$$;
+
+-- The hot-side column a vector is read through. pg_duckdb rejects a pgvector
+-- column while it builds the plan, before a cast in the projection can apply, so
+-- the hot table carries a generated real[] column and every hot-side read goes
+-- through that. The archiver derives the same name in Go (vecCompanion); the two
+-- have to agree or the view reads a column that is not there.
+CREATE OR REPLACE FUNCTION coldfront._vec_companion(p_col text)
+RETURNS text
+LANGUAGE sql IMMUTABLE STRICT AS $$
+    SELECT '_cf_vec_' || p_col;
+$$;
+
+-- True for the generated column above. It belongs to the hot table alone, so no
+-- column list describing the user's table includes it: not the Iceberg schema, not
+-- the view's projection, not an INSERT's column list (a generated column cannot be
+-- written). starts_with rather than LIKE, since the prefix is full of underscores.
+CREATE OR REPLACE FUNCTION coldfront._is_vec_companion(p_attname name, p_attgenerated "char")
+RETURNS boolean
+LANGUAGE sql IMMUTABLE STRICT AS $$
+    SELECT p_attgenerated <> '' AND starts_with(p_attname::text, coldfront._vec_companion(''));
+$$;
+
+-- Cold-value rendering, shared so the write paths cannot disagree. DuckDB's list
+-- cast accepts [1,2,3] and rejects PG's {1,2,3}, and whitespace between elements
+-- is fine, which is what splits the two helpers below: a value taken from a jsonb
+-- payload is already bracketed (jsonb spells a vector as a string and a real[] as
+-- an array), while NEW.col::text on the view's real[] column is brace-delimited.
+
+-- The literal for a value already serialised to text. Callers: the cursor loop in
+-- _tiered_insert_cold and _move_row_literal, both reading a jsonb payload.
+CREATE OR REPLACE FUNCTION coldfront._render_cold_value(p_val_text text, p_pg_type text)
+RETURNS text
+LANGUAGE sql IMMUTABLE STRICT AS $$
+    SELECT CASE
+        -- p_val_text is PG bytea text '\xHEX' (callers pin bytea_output to hex).
+        -- DuckDB mis-parses the \x escape into a BLOB, so rebuild the bytes from
+        -- the hex digits.
+        WHEN p_pg_type = 'bytea' THEN format('from_hex(%L)', substr(p_val_text, 3))
+        -- The Iceberg column is FLOAT[]; without the cast the literal stays a
+        -- VARCHAR and the INSERT fails.
+        WHEN coldfront._is_vector_type(p_pg_type) THEN format('CAST(%L AS FLOAT[])', p_val_text)
+        ELSE quote_literal(p_val_text)
+    END;
+$$;
+
+-- The INSTEAD OF trigger's cold INSERT is a format() template plus its args.
+-- These two spell one column's half of each. Callers: create_iceberg_table for a
+-- decoupled table and _rebuild_tiered_view for a tiered one, with view.go's
+-- coldInsertPlaceholders / coldInsertVals as the Go twin. Identity columns are the
+-- caller's business: they take NULL, since Iceberg has no sequences.
+CREATE OR REPLACE FUNCTION coldfront._cold_placeholder(p_pg_type text)
+RETURNS text
+LANGUAGE sql IMMUTABLE STRICT AS $$
+    SELECT CASE
+        WHEN coldfront._iceberg_storage_type(p_pg_type) = 'BLOB' THEN 'from_hex(%L)'
+        WHEN coldfront._is_vector_type(p_pg_type)                THEN 'CAST(%L AS FLOAT[])'
+        ELSE '%L'
+    END;
+$$;
+
+CREATE OR REPLACE FUNCTION coldfront._cold_value(p_col text, p_pg_type text)
+RETURNS text
+LANGUAGE sql IMMUTABLE STRICT AS $$
+    SELECT CASE
+        WHEN coldfront._iceberg_storage_type(p_pg_type) = 'BLOB'
+            THEN format('encode(NEW.%I,%L)', p_col, 'hex')
+        -- The view exposes a vector as real[], so ::text yields {1,2,3}.
+        WHEN coldfront._is_vector_type(p_pg_type)
+            THEN format('translate(NEW.%I::text,%L,%L)', p_col, '{}', '[]')
+        -- VARCHAR-backed rich types are stored as their text form.
+        WHEN coldfront._iceberg_view_cast_type(p_pg_type) IN ('json', 'interval')
+            THEN format('NEW.%I::text', p_col)
+        -- Everything else round-trips through %L, double precision included.
+        ELSE format('NEW.%I', p_col)
+    END;
+$$;
+
 -- Map a PG type name (canonical or common alias) to the DuckDB/Iceberg
 -- storage type used in CREATE TABLE on the attached catalog. Raises on any
 -- type that cannot round-trip cleanly — silent VARCHAR fallback would lose
@@ -1542,12 +1689,14 @@ BEGIN
     END IF;
     -- View-cast types: stored as VARCHAR, surfaced via wrapper view as native PG type
     IF t IN ('jsonb', 'json', 'interval') THEN RETURN 'VARCHAR'; END IF;
+    -- pgvector: both widen losslessly to float4 and store as list<float>.
+    IF coldfront._is_vector_type(t) THEN RETURN 'FLOAT[]'; END IF;
     -- inet/cidr/oid are NOT supported: pg_duckdb rejects them (inet Oid 869,
     -- oid Oid 26) in any query it plans, and every Iceberg-backed view read is
     -- planned by pg_duckdb, so no cast makes them readable. Store IP data as
     -- text and oid values as bigint instead.
 
-    RAISE EXCEPTION 'coldfront: PG type % has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, numeric(P,S), jsonb, json, interval. inet/cidr/oid unsupported (store IP data as text, oid values as bigint)', p_pg_type;
+    RAISE EXCEPTION 'coldfront: PG type % has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, numeric(P,S), jsonb, json, interval, vector(N), halfvec(N). inet/cidr/oid unsupported (store IP data as text, oid values as bigint); sparsevec unsupported (keep it in the hot tier)', p_pg_type;
 END;
 $$;
 
@@ -1558,22 +1707,25 @@ $$;
 CREATE OR REPLACE FUNCTION coldfront._iceberg_view_cast_type(p_pg_type text)
 RETURNS text
 LANGUAGE sql IMMUTABLE STRICT AS $$
-    SELECT CASE lower(trim(p_pg_type))
-        WHEN 'jsonb'            THEN 'json'      -- DuckDB has no jsonb, surface as json
-        WHEN 'json'             THEN 'json'
-        WHEN 'interval'         THEN 'interval'
+    SELECT CASE
+        WHEN t IN ('jsonb', 'json') THEN 'json'  -- DuckDB has no jsonb, surface as json
+        WHEN t = 'interval'         THEN 'interval'
         -- PG has no bare "double" type, so the view's cold cast r['col']::DOUBLE
         -- (the Iceberg storage name) won't parse. Surface via "double precision".
-        WHEN 'double precision' THEN 'double precision'
-        WHEN 'float8'           THEN 'double precision'
+        WHEN t IN ('double precision', 'float8') THEN 'double precision'
         -- BLOB is not a PG-parseable cast name; surface bytea via "bytea".
-        WHEN 'bytea'            THEN 'bytea'
+        WHEN t = 'bytea'            THEN 'bytea'
+        -- FLOAT[] would parse in PG as double precision[] (FLOAT is an alias),
+        -- so the two branches would disagree on the column type. real[] is the
+        -- one spelling both engines read as 4-byte floats.
+        WHEN coldfront._is_vector_type(t) THEN 'real[]'
         -- Everything else (incl. smallint→INTEGER widening) has a storage type
         -- that is itself a PG-parseable surface; the view casts BOTH branches
         -- to that storage type, so no separate surface cast is needed and
         -- bootstrap/post-cutover view column types still agree.
         ELSE ''
-    END;
+    END
+    FROM (SELECT lower(trim(p_pg_type))) AS s(t);
 $$;
 
 -- create_iceberg_table: provision an iceberg-only table end-to-end.
@@ -1632,6 +1784,12 @@ BEGIN
         IF col_name IS NULL OR pg_type IS NULL THEN
             RAISE EXCEPTION 'coldfront.create_iceberg_table: each p_columns element needs both "name" and "type"';
         END IF;
+        -- A declared vector needs pgvector present before the view exposes real[]
+        -- columns a caller compares with <=>, and nothing else here guarantees it:
+        -- a decoupled table names its types, it does not hold the type.
+        IF coldfront._is_vector_type(pg_type) THEN
+            PERFORM coldfront.install_vector_ops();
+        END IF;
         storage_type := coldfront._iceberg_storage_type(pg_type);
         cast_type    := coldfront._iceberg_view_cast_type(pg_type);
 
@@ -1657,22 +1815,9 @@ BEGIN
         END IF;
 
         -- INSERT trigger: format('INSERT INTO ice... VALUES (<placeholders>)', <new_refs>).
-        --  * json/interval (VARCHAR-backed): NEW.col::text.
-        --  * bytea (BLOB): from_hex(%L) + encode(NEW.col,'hex') — %L renders a
-        --    bytea as PG's '\xcafe' text which DuckDB mis-parses into a BLOB;
-        --    round-tripping the hex through from_hex() rebuilds the exact bytes.
-        --  * everything else (incl. double, '2.5' text round-trips): NEW.col.
-        -- Mirrors _rebuild_tiered_view and the archiver export.
-        IF storage_type = 'BLOB' THEN
-            placeholders := placeholders || 'from_hex(%L)';
-            new_refs     := new_refs || format('encode(NEW.%I,%L)', col_name, 'hex');
-        ELSIF cast_type IN ('json', 'interval') THEN
-            placeholders := placeholders || '%L';
-            new_refs     := new_refs || format('NEW.%I::text', col_name);
-        ELSE
-            placeholders := placeholders || '%L';
-            new_refs     := new_refs || format('NEW.%I', col_name);
-        END IF;
+        -- One shared decision with _rebuild_tiered_view and view.go's Go twin.
+        placeholders := placeholders || coldfront._cold_placeholder(pg_type);
+        new_refs     := new_refs || coldfront._cold_value(col_name, pg_type);
     END LOOP;
 
     -- TODO: pg_duckdb v1.1.1 + duckdb-iceberg do not accept PARTITIONED BY
@@ -2508,6 +2653,7 @@ DECLARE
     v_hot          text;
     v_iceberg_only boolean;
     v_hot_reg      regclass;
+    v_companion    name;
 BEGIN
     SELECT hot_table, is_iceberg_only
       INTO v_hot, v_iceberg_only
@@ -2537,6 +2683,16 @@ BEGIN
     IF NOT v_iceberg_only AND v_hot IS NOT NULL THEN
         v_hot_reg := to_regclass(v_hot);
         IF v_hot_reg IS NOT NULL THEN
+            -- The generated companions exist only to make a vector scannable
+            -- through the view. With the view gone the table is a plain table
+            -- again, so it goes back the shape its owner gave it.
+            FOR v_companion IN
+                SELECT a.attname FROM pg_attribute a
+                WHERE a.attrelid = v_hot_reg AND a.attnum > 0 AND NOT a.attisdropped
+                  AND coldfront._is_vec_companion(a.attname, a.attgenerated)
+            LOOP
+                EXECUTE format('ALTER TABLE %s DROP COLUMN %I', v_hot_reg::text, v_companion);
+            END LOOP;
             EXECUTE format('ALTER TABLE %s RENAME TO %I', v_hot_reg::text, p_table);
         END IF;
     END IF;
@@ -2794,6 +2950,7 @@ BEGIN
           AND c.relname  = v_hot_relname
           AND a.attnum > 0
           AND NOT a.attisdropped
+          AND NOT coldfront._is_vec_companion(a.attname, a.attgenerated)
         ORDER BY a.attnum
     LOOP
         cast_type := coldfront._iceberg_view_cast_type(r.pg_type);
@@ -2805,7 +2962,14 @@ BEGIN
             v_cold_proj := v_cold_proj || ', ';
         END IF;
 
-        IF cast_type <> '' THEN
+        IF coldfront._is_vector_type(r.pg_type) THEN
+            -- The hot branch reads the generated companion, aliased to the user's
+            -- column name, so the pgvector column is never scanned.
+            v_hot_proj  := v_hot_proj  || format('%I::%s AS %I',
+                                                 coldfront._vec_companion(r.attname),
+                                                 cast_type, r.attname);
+            v_cold_proj := v_cold_proj || format('r[%L]::%s', r.attname, cast_type);
+        ELSIF cast_type <> '' THEN
             -- VARCHAR-backed rich types (json/interval): cast both branches to
             -- the surface type so bootstrap and post-cutover views agree.
             v_hot_proj  := v_hot_proj  || quote_ident(r.attname) || '::' || cast_type;
@@ -2840,25 +3004,10 @@ BEGIN
             END IF;
             v_col_list := v_col_list || quote_ident(r.attname);
             v_hot_vals := v_hot_vals || 'NEW.' || quote_ident(r.attname);
-            -- Cold-INSERT value, serialised through format()'s %L:
-            --  * json/interval (VARCHAR-backed): NEW.col::text.
-            --  * bytea (BLOB): from_hex(%L) placeholder + encode(NEW.col,'hex')
-            --    value. %L renders a bytea as PG's '\xcafe' text, which DuckDB
-            --    MIS-parses into a BLOB; round-tripping the hex through DuckDB's
-            --    from_hex() rebuilds the exact bytes. (double precision round-
-            --    trips fine as '2.5' text, so it stays a plain %L.)
-            --  * everything else: NEW.col as-is.
-            -- Consistent with create_iceberg_table and the archiver export.
-            IF cold_type = 'BLOB' THEN
-                v_placeholders := v_placeholders || 'from_hex(%L)';
-                v_cold_vals    := v_cold_vals || format('encode(NEW.%I,%L)', r.attname, 'hex');
-            ELSIF cast_type IN ('json', 'interval') THEN
-                v_placeholders := v_placeholders || '%L';
-                v_cold_vals    := v_cold_vals || 'NEW.' || quote_ident(r.attname) || '::text';
-            ELSE
-                v_placeholders := v_placeholders || '%L';
-                v_cold_vals    := v_cold_vals || 'NEW.' || quote_ident(r.attname);
-            END IF;
+            -- Cold-INSERT value and its format() placeholder: one shared decision
+            -- with create_iceberg_table and view.go's Go twin.
+            v_placeholders := v_placeholders || coldfront._cold_placeholder(r.pg_type);
+            v_cold_vals    := v_cold_vals || coldfront._cold_value(r.attname, r.pg_type);
         END IF;
     END LOOP;
 

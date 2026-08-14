@@ -177,6 +177,20 @@ func TestPgFormatTypeToDuckDB(t *testing.T) {
 		{pg: "json", wantStorage: "VARCHAR", wantViewCastTyp: "json"},
 		{pg: "interval", wantStorage: "VARCHAR", wantViewCastTyp: "interval"},
 
+		// pgvector. Both widen losslessly to float4 and store as list<float>.
+		// The view cast is real[], not FLOAT[]: PG parses FLOAT as an alias for
+		// double precision, so ::FLOAT[] on the hot branch would widen to
+		// double precision[] and the two branches would disagree.
+		// coldfront._iceberg_storage_type / _iceberg_view_cast_type must return
+		// this same pair for the decoupled path; test/sql/vector_type_map.sql
+		// asserts these literals on that side.
+		{pg: "vector(1536)", wantStorage: "FLOAT[]", wantViewCastTyp: "real[]"},
+		{pg: "vector", wantStorage: "FLOAT[]", wantViewCastTyp: "real[]"},
+		{pg: "halfvec(768)", wantStorage: "FLOAT[]", wantViewCastTyp: "real[]"},
+		{pg: "halfvec", wantStorage: "FLOAT[]", wantViewCastTyp: "real[]"},
+		// sparsevec stays hot-only: densifying it is a 100x storage blowup.
+		{pg: "sparsevec(65536)", wantErr: true},
+
 		// Errors. inet/cidr/oid are rejected: pg_duckdb cannot process them in
 		// an Iceberg-backed query, and every tiered read is planned by pg_duckdb,
 		// so there is no cast that makes them readable (oid would archive fine but
@@ -424,21 +438,43 @@ func TestStageSelectList(t *testing.T) {
 	assert.Equal(t, `"i", "j"::text AS "j", "iv"::text AS "iv", "b", "d"`, got)
 }
 
+// The bulk export reads a vector through its generated real[] companion, so
+// pg_duckdb never scans the pgvector type. Already real[], so no cast is added.
+func TestStageSelectList_Vector(t *testing.T) {
+	cols := []view.Column{
+		{Name: "id", Type: "BIGINT"},
+		{Name: "embedding", Type: "FLOAT[]", ViewCastType: "real[]", HotSource: "_cf_vec_embedding"},
+	}
+	assert.Equal(t, `"id", "_cf_vec_embedding" AS "embedding"`, stageSelectList(cols))
+}
+
+// The companion is what makes a vector scannable, so its name has to be derived
+// the same way here and in coldfront._vec_companion, which the SQL side uses.
+func TestVecCompanion(t *testing.T) {
+	assert.Equal(t, "_cf_vec_embedding", vecCompanion("embedding"))
+	assert.Equal(t, "_cf_vec_My Col", vecCompanion("My Col"))
+}
+
 func TestStageSelectList_Empty(t *testing.T) {
 	assert.Equal(t, "*", stageSelectList(nil))
 }
 
-// The PG text-stage detour is only needed for types pg_duckdb's reader cannot
-// scan natively — now just interval (kept defensively). bytea, jsonb and
-// double scan fine and must not trigger it.
-func TestNeedsPGTextStage(t *testing.T) {
-	assert.True(t, needsPGTextStage([]view.Column{{Name: "iv", Type: "VARCHAR", ViewCastType: "interval"}}))
-	assert.False(t, needsPGTextStage([]view.Column{
+// The PG staging detour is for source types pg_duckdb's reader cannot scan, which
+// is interval, kept defensively. bytea, jsonb and double scan fine and must not
+// trigger it, since the detour costs a full extra copy of every partition.
+func TestNeedsPGStage(t *testing.T) {
+	assert.True(t, needsPGStage([]view.Column{{Name: "iv", Type: "VARCHAR", ViewCastType: "interval"}}))
+	// A vector exports through its generated real[] companion, so the detour
+	// would copy every partition twice for nothing.
+	assert.False(t, needsPGStage([]view.Column{
+		{Name: "embedding", Type: "FLOAT[]", ViewCastType: "real[]", HotSource: "_cf_vec_embedding"},
+	}))
+	assert.False(t, needsPGStage([]view.Column{
 		{Name: "j", Type: "VARCHAR", ViewCastType: "json"},
 		{Name: "b", Type: "BLOB", ViewCastType: "bytea"},
 		{Name: "d", Type: "DOUBLE", ViewCastType: "double precision"},
 	}))
-	assert.False(t, needsPGTextStage(nil))
+	assert.False(t, needsPGStage(nil))
 }
 
 // TestDollarQuote proves the dollar-quote wrapper cannot be broken out of by any

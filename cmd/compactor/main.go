@@ -155,6 +155,15 @@ func doCompaction(ctx context.Context, cat *rest.Catalog, ns, tableName string, 
 	if err != nil {
 		return err
 	}
+	if plan.skipped != "" {
+		// Refusing beats rewriting: a rewrite that cannot keep the file order
+		// scrambles the layout its queries prune on, and says nothing about it.
+		// File count stops being bounded until the cause is fixed, so this is
+		// loud and names the cause.
+		fmt.Fprintf(os.Stderr, "compactor: %s.%s NOT compacted: %s. Fix %s or unset it; "+
+			"file count is unbounded until then\n", ns, tableName, plan.skipped, sortKeyProp)
+		return nil
+	}
 	if len(plan.groups) == 0 {
 		fmt.Fprintf(os.Stderr, "compactor: %s.%s — nothing to compact (%d files scanned, none below target)\n",
 			ns, tableName, plan.plan.TotalInputFiles)
@@ -168,7 +177,7 @@ func doCompaction(ctx context.Context, cat *rest.Catalog, ns, tableName string, 
 	var res *table.RewriteResult
 	if err := claim(func() error {
 		var rerr error
-		res, rerr = rewrite(ctx, tbl, plan.groups, o.targetSize)
+		res, rerr = rewrite(ctx, tbl, plan.groups, o.targetSize, plan.sorted)
 		return rerr
 	}); err != nil {
 		return err

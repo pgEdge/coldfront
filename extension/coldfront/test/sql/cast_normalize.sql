@@ -19,8 +19,10 @@ SET coldfront.warehouse = '';
 SET coldfront.lakekeeper_endpoint = '';
 
 -- evt_jsonb's name embeds "jsonb": it must survive the jsonb→json rewrite intact.
+CREATE EXTENSION IF NOT EXISTS vector;
 CREATE TABLE public._events (id int, ts timestamptz, c_tsn timestamp,
-                             c_vc varchar, c_dp double precision, evt_jsonb jsonb);
+                             c_vc varchar, c_dp double precision, evt_jsonb jsonb,
+                             emb vector(3));
 CREATE VIEW public.events AS SELECT * FROM public._events;
 INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
 VALUES ('public', 'events', 'public._events', 'ice.default.events', 'ts');
@@ -40,9 +42,19 @@ EXPLAIN (COSTS OFF, VERBOSE)
       evt_jsonb = jsonb_set(jsonb_build_object('k', 1), '{x}', '"v"'::jsonb)
   WHERE ts < '2019-01-01'::timestamp with time zone;
 
+-- (A2) pgvector's cast: DuckDB knows no `vector`, and the Iceberg column is
+-- FLOAT[]. The dimension typmod must go with the name, since FLOAT[](3) is not a
+-- type. The literal needs no rewriting here: a vector Const deparses through
+-- pgvector's own output function, which is already bracket-delimited.
+EXPLAIN (COSTS OFF, VERBOSE)
+  UPDATE public.events SET emb = '[1,2,3]'::vector(3)
+  WHERE ts < '2019-01-01'::timestamp with time zone;
+
 -- (B) Parity against the live DuckDB: the rewrite targets are accepted; `jsonb`
 -- is rejected (which is why the map rewrites it). A void row = accepted.
 SELECT duckdb.raw_query($$ SELECT NULL::json $$);
+SELECT duckdb.raw_query($$ SELECT '[1,2,3]'::FLOAT[] $$);
+SELECT duckdb.raw_query($$ SELECT NULL::vector $$);
 SELECT duckdb.raw_query($$ SELECT json_object('k', 1) $$);
 SELECT duckdb.raw_query($$ SELECT NULL::timestamp $$);
 SELECT duckdb.raw_query($$ SELECT NULL::varchar $$);

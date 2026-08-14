@@ -37,6 +37,89 @@ var testCfg = ViewConfig{
 	},
 }
 
+// A tiered table carrying an embedding. The view exposes the column as real[],
+// so that is what NEW.embedding is inside the INSTEAD OF trigger.
+var vectorCfg = ViewConfig{
+	SourceSchema:    "public",
+	SourceTable:     "chunks",
+	IcebergTable:    "ice.default.chunks",
+	CutoffTime:      time.Date(2026, 3, 1, 0, 0, 0, 0, time.UTC),
+	PartitionColumn: "ts",
+	Columns: []Column{
+		{Name: "id", Type: "BIGINT", IsPK: true},
+		{Name: "ts", Type: "TIMESTAMPTZ"},
+		{Name: "embedding", Type: "FLOAT[]", ViewCastType: "real[]"},
+	},
+}
+
+// The cold INSERT crosses into DuckDB as text, and PG spells an array
+// {1,2,3} while DuckDB's list cast only accepts [1,2,3]. translate is the whole
+// conversion; the placeholder then casts to the Iceberg column's FLOAT[].
+func TestGenerateTriggerFuncSQL_ColdInsertVectorBracketsAndCasts(t *testing.T) {
+	sql := GenerateTriggerFuncSQL(vectorCfg)
+	assert.Contains(t, sql, `translate(NEW."embedding"::text,'{}','[]')`,
+		"PG array text must become a DuckDB list literal")
+	assert.Contains(t, sql, "CAST(%L AS FLOAT[])",
+		"the literal is cast to the Iceberg column type")
+	assert.NotContains(t, sql, `NEW."embedding",`,
+		"a bare real[] reaches DuckDB as {…} and fails to cast")
+}
+
+// pg_duckdb rejects a pgvector column while it builds the plan, before any cast in
+// the projection can apply, so the hot table carries a generated real[] companion
+// and the hot branch reads that under the user's own column name. The view still
+// exposes one embedding column, and the companion is never a column of the view.
+func TestGenerateViewSQL_VectorHotSourceIsTheCompanion(t *testing.T) {
+	cfg := vectorCfg
+	cfg.Columns = []Column{
+		{Name: "id", Type: "BIGINT", IsPK: true},
+		{Name: "ts", Type: "TIMESTAMPTZ"},
+		{Name: "embedding", Type: "FLOAT[]", ViewCastType: "real[]", HotSource: "_cf_vec_embedding"},
+	}
+	sql := GenerateViewSQL(cfg)
+	assert.Contains(t, sql, `"_cf_vec_embedding"::real[] AS "embedding"`,
+		"hot branch reads the companion, aliased to the user's column name")
+	assert.NotContains(t, sql, `"embedding"::real[] FROM`,
+		"the pgvector column itself must not be scanned")
+	assert.Contains(t, sql, "r['embedding']::real[]", "the cold branch is unchanged")
+}
+
+// A column without a HotSource is read by its own name, which is every column that
+// is not a vector.
+func TestGenerateViewSQL_NoHotSourceReadsItsOwnName(t *testing.T) {
+	assert.Contains(t, GenerateViewSQL(testCfg), `"status"::VARCHAR`)
+}
+
+// The distance operators are installed only for a table that carries a vector.
+func TestGenerateVectorOpsSQL(t *testing.T) {
+	cfg := vectorCfg
+	assert.Equal(t, "SELECT coldfront.install_vector_ops()", GenerateVectorOpsSQL(cfg))
+	assert.Equal(t, "", GenerateVectorOpsSQL(testCfg), "no vector column, no operators")
+}
+
+// The companion is added to the renamed hot table, idempotently, and only for a
+// column that needs one.
+func TestGenerateVecCompanionSQL(t *testing.T) {
+	cfg := vectorCfg
+	cfg.Columns = []Column{
+		{Name: "id", Type: "BIGINT"},
+		{Name: "embedding", Type: "FLOAT[]", ViewCastType: "real[]", HotSource: "_cf_vec_embedding"},
+	}
+	sql := GenerateVecCompanionSQL(cfg)
+	assert.Contains(t, sql, `ALTER TABLE "public"."_chunks" ADD COLUMN IF NOT EXISTS "_cf_vec_embedding" real[]`)
+	assert.Contains(t, sql, `GENERATED ALWAYS AS ("embedding"::real[]) STORED`)
+	assert.Equal(t, "", GenerateVecCompanionSQL(testCfg), "no vector column, no companion")
+}
+
+// The view exposes real[] on both branches: FLOAT[] would parse in PG as
+// double precision[] and the two branches would disagree.
+func TestGenerateViewSQL_VectorSurfaceIsRealArray(t *testing.T) {
+	sql := GenerateViewSQL(vectorCfg)
+	assert.Contains(t, sql, `"embedding"::real[]`, "hot side casts to real[]")
+	assert.Contains(t, sql, "r['embedding']::real[]", "cold side casts to real[]")
+	assert.NotContains(t, sql, "::FLOAT[]", "FLOAT[] is double precision[] in PG")
+}
+
 func TestGenerateSwapSQL(t *testing.T) {
 	sql := GenerateSwapSQL(testCfg)
 	// Identifier positions are double-quoted; literal-string positions keep
@@ -125,6 +208,30 @@ func TestGenerateTriggerFuncSQL_ColdInsertBlobViaFromHex(t *testing.T) {
 	assert.Contains(t, sql, `NEW."amt"`, "double inserted as-is (text round-trips)")
 	assert.NotContains(t, sql, `NEW."amt"::text`, "double needs no ::text")
 	assert.Contains(t, sql, `NEW."doc"::text`, "json IS VARCHAR-backed; serialise to text")
+}
+
+// Only two storage forms need a PG-side cast on the way out to pg_duckdb: the
+// VARCHAR-backed rich types and the vector. Everything else exports as-is, and
+// a ViewCastType alone does not imply a cast (bytea and double carry one purely
+// so the view has a PG-parseable spelling).
+func TestColumn_ExportCast(t *testing.T) {
+	for _, tt := range []struct {
+		name string
+		col  Column
+		want string
+	}{
+		{"jsonb is VARCHAR-backed", Column{Type: "VARCHAR", ViewCastType: "json"}, "text"},
+		{"interval is VARCHAR-backed", Column{Type: "VARCHAR", ViewCastType: "interval"}, "text"},
+		{"plain text needs nothing", Column{Type: "VARCHAR"}, ""},
+		{"bytea exports as bytes", Column{Type: "BLOB", ViewCastType: "bytea"}, ""},
+		{"double exports as-is", Column{Type: "DOUBLE", ViewCastType: "double precision"}, ""},
+		{"integer exports as-is", Column{Type: "INTEGER"}, ""},
+		{"vector exports as real[]", Column{Type: "FLOAT[]", ViewCastType: "real[]"}, "real[]"},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, tt.col.ExportCast())
+		})
+	}
 }
 
 // The view casts BLOB→bytea / DOUBLE→double precision on BOTH UNION branches

@@ -649,7 +649,9 @@ classify_tier(Query *query, TieredViewInfo *info)
 
 /* ---------- string helpers -------------------------------------------- */
 
-typedef struct { const char *pg; const char *duck; } CfSubst;
+/* drop_typmod: after substituting, skip a following "(...)" so a typmod that is
+ * valid on the PG spelling but not on the DuckDB one does not survive. */
+typedef struct { const char *pg; const char *duck; bool drop_typmod; } CfSubst;
 
 /*
  * Cold-WRITE substitutions. The deparsed cold DML is handed to DuckDB inside a
@@ -662,13 +664,19 @@ typedef struct { const char *pg; const char *duck; } CfSubst;
  * json_set) errors in DuckDB — its boundary, not a rewrite coldfront withholds.
  */
 static const CfSubst cf_write_subst[] = {
-    { "::timestamp with time zone",    "::timestamptz" },
-    { "::timestamp without time zone", "::timestamp"   },
-    { "::character varying",           "::varchar"     },
-    { "::double precision",            "::double"      },
-    { "jsonb_build_object(",           "json_object("  },
-    { "jsonb_build_array(",            "json_array("   },
-    { "to_jsonb(",                     "to_json("      },
+    { "::timestamp with time zone",    "::timestamptz", false },
+    { "::timestamp without time zone", "::timestamp",   false },
+    { "::character varying",           "::varchar",     false },
+    { "::double precision",            "::double",      false },
+    /* pgvector's types are unknown to DuckDB, and the Iceberg column is FLOAT[].
+     * The dimension typmod goes with the name: FLOAT[](3) is not a type. The
+     * cast's operand is already bracketed here, since a vector Const deparses
+     * through pgvector's own output function. */
+    { "::vector",                      "::FLOAT[]",     true  },
+    { "::halfvec",                     "::FLOAT[]",     true  },
+    { "jsonb_build_object(",           "json_object(",  false },
+    { "jsonb_build_array(",            "json_array(",   false },
+    { "to_jsonb(",                     "to_json(",      false },
 };
 
 /*
@@ -684,8 +692,8 @@ static const CfSubst cf_write_subst[] = {
  * verified identical ([10,20,30]→3, []→0) and exists in both.
  */
 static const CfSubst cf_read_subst[] = {
-    { "::jsonb",             "::json"             },
-    { "jsonb_array_length(", "json_array_length(" },
+    { "::jsonb",             "::json",             false },
+    { "jsonb_array_length(", "json_array_length(", false },
 };
 
 /*
@@ -753,6 +761,13 @@ cf_apply_subst(const char *sql, const CfSubst *map, int map_len, bool jsonb_catc
                 {
                     appendStringInfoString(&buf, map[i].duck);
                     p += plen;
+                    if (map[i].drop_typmod && *p == '(')
+                    {
+                        while (*p && *p != ')')
+                            p++;
+                        if (*p == ')')
+                            p++;
+                    }
                     replaced = true;
                     break;
                 }
@@ -963,7 +978,9 @@ build_cold_dml(DeparseResult *dr, TieredViewInfo *info)
  * duckdb_target selects value rendering. true: the string reaches
  * duckdb.raw_query (emit_cold / emit_dual / the fast tiered-INSERT path), so it
  * mirrors the INSTEAD-OF trigger's DuckDB literals — bytea -> from_hex(%P$L) /
- * encode($K,'hex'); json/jsonb/interval -> %P$L / $K::text; else %P$L / $K.
+ * encode($K,'hex'); real[] (a vector column's view type) ->
+ * CAST(%P$L AS FLOAT[]) / translate($K::text,'{}','[]');
+ * json/jsonb/interval -> %P$L / $K::text; else %P$L / $K.
  * false: the string is embedded in a PostgreSQL cursor by
  * coldfront._tiered_insert_cold (the slow IDENTITY-omit path), executed by PG
  * not DuckDB. Most params render as plain %P$L / $K (PG coerces by the column
@@ -1026,6 +1043,13 @@ cold_sql_arg(const char *cold_dml, ColdParamSet *ps, bool duckdb_target)
                          * is irrelevant); both targets reconstruct the exact
                          * bytes: DuckDB via from_hex, PG via decode. */
                         appendStringInfo(&args, ", encode($%d,'hex')", id);
+                    else if (duckdb_target && t == FLOAT4ARRAYOID)
+                        /* A vector column reaches this path as real[], the type the
+                         * view exposes. PG spells that {1,2,3} and DuckDB's list
+                         * cast takes [1,2,3], so translate rewrites the delimiters
+                         * and the template supplies the cast. PG's own target needs
+                         * neither: it coerces the literal by the column type. */
+                        appendStringInfo(&args, ", translate($%d::text,'{}','[]')", id);
                     else if (duckdb_target &&
                              (t == JSONOID || t == JSONBOID || t == INTERVALOID))
                         appendStringInfo(&args, ", $%d::text", id);
@@ -1034,6 +1058,8 @@ cold_sql_arg(const char *cold_dml, ColdParamSet *ps, bool duckdb_target)
                 }
                 if (t == BYTEAOID && duckdb_target)
                     appendStringInfo(&tmpl, "from_hex(%%%d$L)", pos_of_id[id - 1]);
+                else if (t == FLOAT4ARRAYOID && duckdb_target)
+                    appendStringInfo(&tmpl, "CAST(%%%d$L AS FLOAT[])", pos_of_id[id - 1]);
                 else if (t == BYTEAOID)
                     /* native PG (the _tiered_insert_cold cursor): rebuild a real
                      * bytea from the hex arg so the projected column is bytea
@@ -2165,11 +2191,12 @@ cf_normalize_read_jsonb(Query *query)
 /*
  * Read path for a SELECT that touches a registered tiered view. First try to
  * reroute a provably-hot read to the heap (runs in plain PG). Otherwise the read
- * spans the cold tier: lazily attach 'ice' (once per session) so the view body's
- * iceberg_scan('ice...') resolves — the version-agnostic cold-read attach (PG
- * 16/17/18) — and normalize the whitelisted jsonb spellings so DuckDB (which runs
- * the whole view query) accepts them. The relkind check inside
- * query_reads_tiered_view keeps plain queries off the SPI path.
+ * spans the cold tier: lazily attach
+ * 'ice' (once per session) so the view body's iceberg_scan('ice...') resolves —
+ * the version-agnostic cold-read attach (PG 16/17/18) — and normalize the
+ * whitelisted jsonb spellings so DuckDB (which runs the whole view query) accepts
+ * them. The relkind check inside query_reads_tiered_view keeps plain queries off
+ * the SPI path.
  */
 static void
 cf_maybe_attach_for_read(Query *query)

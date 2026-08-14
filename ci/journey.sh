@@ -588,6 +588,136 @@ EOSQL
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# Story 5b — Embeddings round-trip. A pgvector column tiers as an Iceberg
+# list<float> and comes back element-for-element through the view, over all three
+# cold-write paths: the archiver's bulk export, the INSTEAD OF trigger's cold
+# INSERT, and the decoupled hook. The view exposes the column as real[], and PG
+# spells an array {1,2,3} where DuckDB's list cast takes only [1,2,3], so each
+# path has to rewrite the delimiters; comparing the stored value to a literal is
+# what catches a path that does not.
+# ───────────────────────────────────────────────────────────────────────────
+story_vector() {
+    step "5b. Embeddings round-trip (vector → list<float>, tiered + decoupled)"
+    qf "$HOST" <<'EOSQL' >/dev/null
+SET search_path = public;
+CREATE EXTENSION IF NOT EXISTS vector;
+CREATE TABLE IF NOT EXISTS chunks (
+    id        bigint GENERATED ALWAYS AS IDENTITY,
+    ts        timestamptz NOT NULL,
+    body      text,
+    embedding vector(3),
+    PRIMARY KEY (id, ts)
+) PARTITION BY RANGE (ts);
+-- m4 (cold after archiving) and m1 (hot), named from now()-relative months.
+DO $do$
+DECLARE m date;
+BEGIN
+  FOREACH m IN ARRAY ARRAY[(date_trunc('month',now()) - interval '4 months')::date,
+                           (date_trunc('month',now()) - interval '1 month')::date] LOOP
+    EXECUTE format('CREATE TABLE IF NOT EXISTS %I PARTITION OF chunks FOR VALUES FROM (%L) TO (%L)',
+                   'chunks_p_' || to_char(m, 'YYYY_MM'), m, (m + interval '1 month'));
+  END LOOP;
+END $do$;
+-- The hot column is a real vector, so the unadorned pgvector literal is what a
+-- user writes. Both rows carry the same value: one archives, one stays hot.
+INSERT INTO chunks (ts, body, embedding)
+VALUES (date_trunc('month',now()) - interval '4 months' + interval '9 days', 'cold', '[1.5,-2,3]'),
+       (date_trunc('month',now()) - interval '1 month' + interval '9 days',  'hot',  '[1.5,-2,3]');
+EOSQL
+    local ret_days; ret_days=$(hot_days)
+    cat > /tmp/journey-chunks.yaml <<EOF
+postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
+iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog" }
+$(storage_yaml)
+archiver: { tables: [ { source_table: chunks, partition_period: monthly, hot_period: "${ret_days} days" } ] }
+EOF
+    if ! "$ARCHIVER" import --config /tmp/journey-chunks.yaml >/tmp/journey-chunks.log 2>&1; then
+        fail "import chunks into partition_config — see /tmp/journey-chunks.log"; tail -5 /tmp/journey-chunks.log; return
+    fi
+    if "$ARCHIVER" --config /tmp/journey-chunks.yaml >>/tmp/journey-chunks.log 2>&1; then
+        pass "vector table archived (m4 → cold)"
+    else
+        fail "vector archive — see /tmp/journey-chunks.log"; tail -5 /tmp/journey-chunks.log; return
+    fi
+
+    # Verify what landed in Iceberg, read straight from the cold table. Equality
+    # against a real[] literal is the whole assertion: a stringified write could
+    # not have landed at all, since a FLOAT[] column rejects PG's {…} array text.
+    #
+    # Not through the tiered view: that plan carries the hot table's pgvector
+    # column, which pg_duckdb cannot scan, so a view read of this column depends
+    # on PostgreSQL happening to prune the hot branch.
+    local O; O=$(qf "$HOST" <<'EOSQL'
+SELECT coldfront.ensure_attached();
+SELECT 'COLD_VEC:' || (r['embedding']::real[] = ARRAY[1.5,-2,3]::real[])::text
+  FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] = 'cold';
+EOSQL
+)
+    assert_eq "cold vector round-trip (bulk export)" "true" "$(extract COLD_VEC "$O")"
+
+    # Through the view, with the predicate a caller actually writes. The watermark
+    # classifies this as cold-only, so the read must reach the Iceberg side alone:
+    # the hot branch scans a pgvector column, which fails the whole plan even when
+    # no hot row can match.
+    # Through the view, with a now()-relative bound. The watermark sits at the
+    # archived partition's upper bound, which date_trunc lands on exactly, so the
+    # read is cold-only however long ago the fixture was built.
+    local V; V=$(qf "$HOST" <<'EOSQL'
+SELECT 'VIEW_VEC:' || (embedding = ARRAY[1.5,-2,3]::real[])::text FROM chunks
+  WHERE body = 'cold' AND ts < date_trunc('month', now()) - interval '3 months';
+SELECT 'VIEW_X:' || count(*)::text FROM chunks WHERE embedding IS NOT NULL;
+SELECT 'VIEW_XB:' || string_agg(body, ',' ORDER BY body) FROM chunks WHERE embedding IS NOT NULL;
+EOSQL
+)
+    assert_eq "cold vector read through the view" "true" "$(extract VIEW_VEC "$V")"
+    # No tier bound: one hot row and one archived row, both projecting the vector,
+    # which is the read that needs the hot side to be scannable at all.
+    assert_eq "cross-tier read projecting the vector" "2" "$(extract VIEW_X "$V")"
+    assert_eq "cross-tier read spans both tiers" "cold,hot" "$(extract VIEW_XB "$V")"
+    assert_eq "cold vector read through the view (classified, now()-relative)" "true" "$(extract VIEW_VEC "$V")"
+
+    # Cold INSERT through the view trigger (ts < cutoff): a second write path,
+    # and the one that renders NEW.embedding::text. The vector literal exercises
+    # pgvector's implicit vector -> real[] cast on the way into the view column.
+    local CI; CI=$(qf "$HOST" <<'EOSQL'
+INSERT INTO chunks (ts, body, embedding)
+VALUES (date_trunc('month',now()) - interval '4 months' + interval '19 days', 'coldins', '[4,5.5,-6]'::vector);
+SELECT coldfront.ensure_attached();
+SELECT 'COLDINS_VEC:' || (r['embedding']::real[] = ARRAY[4,5.5,-6]::real[])::text
+  FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] = 'coldins';
+EOSQL
+)
+    assert_eq "cold-INSERT-via-trigger vector round-trip" "true" "$(extract COLDINS_VEC "$CI")"
+
+    # The search itself: pgvector-shaped syntax over the view, ranking hot and cold
+    # rows together in one statement. The query vector is one of the stored rows, so
+    # the nearest is exact rather than a tie.
+    local S; S=$(qf "$HOST" <<'EOSQL'
+SELECT 'NEAREST:' || body FROM chunks ORDER BY embedding <=> ARRAY[4,5.5,-6]::real[] LIMIT 1;
+SELECT 'RANKED:' || string_agg(body, ',' ORDER BY d) FROM (
+  SELECT body, embedding <=> ARRAY[4,5.5,-6]::real[] AS d FROM chunks) t;
+EOSQL
+)
+    assert_eq "top-k over both tiers finds the nearest row" "coldins" "$(extract NEAREST "$S")"
+    assert_contains "top-k ranks the exact match first" "coldins," "$(extract RANKED "$S")"
+
+    # Decoupled: no hot tier, its own generated trigger, its own type map. Shares
+    # none of the archiver's plumbing, so it is a distinct path.
+    local i
+    for i in 1 2 3 4 5; do
+        q_may "$HOST" "SELECT coldfront.create_iceberg_table('public','icevec','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"ts\",\"type\":\"timestamptz\"},{\"name\":\"embedding\",\"type\":\"vector(3)\"}]'::jsonb);" >/dev/null 2>&1
+        [ "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname='icevec' AND relkind='v' AND relnamespace='public'::regnamespace;")" = "1" ] && break
+        sleep 2
+    done
+    local D; D=$(qf "$HOST" <<'EOSQL'
+INSERT INTO icevec VALUES (1, date_trunc('month',now()) + interval '11 hours', '[7,-8.25,9]'::vector);
+SELECT 'DEC_VEC:' || (embedding = ARRAY[7,-8.25,9]::real[])::text FROM icevec WHERE id = 1;
+EOSQL
+)
+    assert_eq "decoupled vector round-trip" "true" "$(extract DEC_VEC "$D")"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Story 6 — Writes via the view (proven assertions from run-ci-local).
 # ───────────────────────────────────────────────────────────────────────────
 story_writes() {
@@ -4148,6 +4278,7 @@ if [ "$MODE" = "tiered" ]; then
     [ "$MESH" = 1 ] && story_mesh_tiered    # cross-node tiered, while hot+cold coexist
     story_reads
     story_types
+    story_vector            # embeddings: vector → list<float> over all three cold-write paths
     story_writes
     story_compaction        # iceberg-go RewriteDataFiles, now that the manifest-list
                             # format-version interop patch makes the cold tier's

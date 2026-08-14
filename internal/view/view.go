@@ -49,8 +49,54 @@ type Column struct {
 	Name         string
 	Type         string // storage / DuckDB-CREATE-TABLE type, e.g. "BIGINT", "VARCHAR", "DECIMAL(20,5)"
 	ViewCastType string // optional surface-type cast emitted by the view, e.g. "json", "interval", "bytea"
+	HotSource    string // hot-side column to read instead of Name; "" means Name itself
 	IsIdentity   bool   // pg_attribute.attidentity = 'a' (GENERATED ALWAYS) — skip from INSERT
 	IsPK         bool   // participates in primary key (pg_index.indisprimary)
+}
+
+// HotRef returns the quoted hot-side identifier this column is read from, and
+// whether that differs from the column's own name.
+//
+// Only a vector differs. pg_duckdb rejects a pgvector column while it builds the
+// plan, before a cast in the projection can apply, so the hot table carries a
+// generated real[] companion and every hot-side read goes through that instead.
+func (c Column) HotRef() (ref string, aliased bool) {
+	if c.HotSource != "" && c.HotSource != c.Name {
+		return pgx.Identifier{c.HotSource}.Sanitize(), true
+	}
+	return pgx.Identifier{c.Name}.Sanitize(), false
+}
+
+// IsVector reports whether this column's Iceberg storage is a list of floats,
+// which is how a pgvector vector/halfvec is stored.
+//
+// Two consequences follow, and both have callers. The view exposes the column as
+// real[], so every path that renders a value for DuckDB converts PG's {1,2,3}
+// array text into DuckDB's [1,2,3] list literal. And pg_duckdb cannot scan the
+// pgvector type at all, so the archiver stages the partition through PostgreSQL
+// first (see needsPGStage).
+func (c Column) IsVector() bool { return c.Type == "FLOAT[]" }
+
+// ExportCast returns the cast the archiver's bulk-export projection applies to
+// this column on the PostgreSQL side, before pg_duckdb reads it, or "" when the
+// column exports as-is.
+//
+// Two cases need one, for different reasons. A VARCHAR-backed rich type
+// (jsonb/json/interval) exports ::text because its Iceberg column is VARCHAR. A
+// vector exports ::real[] because pg_duckdb's PG reader cannot scan the pgvector
+// type at all, and ::text would stringify it into the wrong column type.
+//
+// Types whose Iceberg storage is native (BLOB, DOUBLE) carry a ViewCastType only
+// to give the view a PG-parseable spelling, and must export unchanged:
+// ::text-casting a bytea would write '\xdeadbeef' into a binary column.
+func (c Column) ExportCast() string {
+	switch {
+	case c.Type == "VARCHAR" && c.ViewCastType != "":
+		return "text"
+	case c.IsVector():
+		return "real[]"
+	}
+	return ""
 }
 
 // Generator creates and replaces the view and triggers.
@@ -122,6 +168,10 @@ func (c ViewConfig) insertCols() (colList, valList string) {
 //     bytea as PG's '\xcafe' text — which DuckDB then MIS-parses into a BLOB
 //     (\xca → 1 byte, fe → 2 literal bytes = 3 bytes, corruption). Round-tripping
 //     the hex string through DuckDB's from_hex() rebuilds the exact bytes.
+//   - vector (Type=="FLOAT[]"): the view exposes the column as real[], so
+//     NEW.col's text form is PG's {1,2,3}, which DuckDB's list cast rejects.
+//     translate rewrites the delimiters to [1,2,3] and the CAST(%L AS FLOAT[])
+//     placeholder gives it the Iceberg column's type.
 //   - everything else (incl. double precision, whose '2.5' text round-trips
 //     cleanly through DuckDB): NEW.col as-is.
 //
@@ -137,6 +187,8 @@ func (c ViewConfig) coldInsertVals() string {
 		switch {
 		case col.Type == "BLOB":
 			vals = append(vals, "encode(NEW."+q+",'hex')")
+		case col.IsVector():
+			vals = append(vals, "translate(NEW."+q+"::text,'{}','[]')")
 		case col.Type == "VARCHAR" && col.ViewCastType != "":
 			vals = append(vals, "NEW."+q+"::text")
 		default:
@@ -160,6 +212,8 @@ func (c ViewConfig) coldInsertPlaceholders() string {
 			ph = append(ph, "NULL")
 		case col.Type == "BLOB":
 			ph = append(ph, "from_hex(%L)")
+		case col.IsVector():
+			ph = append(ph, "CAST(%L AS FLOAT[])")
 		default:
 			ph = append(ph, "%L")
 		}
@@ -226,7 +280,11 @@ func GenerateViewSQL(cfg ViewConfig) string {
 		if c.ViewCastType != "" {
 			surface = c.ViewCastType
 		}
-		hotCols[i] = hotName + "::" + surface
+		hotRef, aliased := c.HotRef()
+		hotCols[i] = hotRef + "::" + surface
+		if aliased {
+			hotCols[i] += " AS " + hotName
+		}
 		coldCols[i] = fmt.Sprintf("r['%s']::%s", coldKey, surface)
 	}
 
@@ -330,15 +388,53 @@ CREATE TRIGGER %s
 		trigName, viewName, funcName)
 }
 
+// GenerateVecCompanionSQL adds each vector column's generated real[] companion to
+// the hot table. Empty when no column needs one.
+//
+// The companion is what every hot-side read goes through, since pg_duckdb rejects
+// a pgvector column while it builds the plan. It is a column of the hot table only:
+// the view does not project it, and getColumns does not enumerate it, so the user's
+// surface carries exactly one embedding column. Adding it to a table that already
+// holds rows rewrites those rows once, at onboarding.
+func GenerateVecCompanionSQL(cfg ViewConfig) string {
+	var b strings.Builder
+	for _, c := range cfg.Columns {
+		ref, aliased := c.HotRef()
+		if !aliased {
+			continue
+		}
+		fmt.Fprintf(&b,
+			"ALTER TABLE %s ADD COLUMN IF NOT EXISTS %s real[] GENERATED ALWAYS AS (%s::real[]) STORED;\n",
+			cfg.fqHot(), ref, pgx.Identifier{c.Name}.Sanitize())
+	}
+	return b.String()
+}
+
+// GenerateVectorOpsSQL installs the distance operators a caller writes against the
+// view's real[] columns. Empty when the table carries no vector column.
+func GenerateVectorOpsSQL(cfg ViewConfig) string {
+	for _, c := range cfg.Columns {
+		if c.IsVector() {
+			return "SELECT coldfront.install_vector_ops()"
+		}
+	}
+	return ""
+}
+
 // Recreate performs the table→view swap (if needed) and recreates the view + triggers.
 func (g *Generator) Recreate(ctx context.Context, cfg ViewConfig) error {
 	stmts := []string{
 		GenerateSwapSQL(cfg),
+		GenerateVecCompanionSQL(cfg), // after the swap: it targets the renamed hot table
+		GenerateVectorOpsSQL(cfg),
 		GenerateViewSQL(cfg),
 		GenerateTriggerFuncSQL(cfg),
 		GenerateTriggerSQL(cfg),
 	}
 	for _, sql := range stmts {
+		if sql == "" {
+			continue
+		}
 		if _, err := g.db.Exec(ctx, sql); err != nil { // nosemgrep
 			return fmt.Errorf("recreate view: %w", err)
 		}

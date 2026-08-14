@@ -1195,18 +1195,15 @@ func wipeIcebergRange(ctx context.Context, conn *pgx.Conn, iceTable, partCol str
 // in S" → replayed. The replay is idempotent (DELETE+INSERT keyed on PK), so
 // the duplicate work is correct, just wasted. For typical workloads this
 // window is sub-millisecond.
-// stageSelectList builds the SELECT projection for the bulk export, casting
-// only the VARCHAR-backed rich types (jsonb/json/interval — Type=="VARCHAR"
-// with a surface ViewCastType) to ::text so they land as VARCHAR in Iceberg
-// and the transparent view casts them back on read.
-//
-// A ViewCastType alone does NOT mean text-backed: bytea (storage BLOB) and
-// double precision (storage DOUBLE) carry a ViewCastType only to give the view
-// a PG-parseable hot-side cast (`::bytea`/`::double precision` instead of the
-// non-PG `::BLOB`/`::DOUBLE`). Iceberg stores those natively (binary / double),
-// so they must be exported AS-IS — ::text-casting bytea would stringify the
-// bytes ('\xdeadbeef') and corrupt the BLOB column. Gating on Type=="VARCHAR"
-// selects exactly the text-backed types and leaves native ones untouched.
+// vecCompanion names the generated real[] column that carries a vector column's
+// scannable form on the hot table. coldfront._vec_companion derives the same name
+// for the SQL-side view rebuild; the two have to agree.
+func vecCompanion(col string) string { return "_cf_vec_" + col }
+
+// stageSelectList builds the SELECT projection for the bulk export. Which
+// columns need a cast, and to what, is view.Column.ExportCast's decision, and
+// which hot-side column is read is view.Column.HotRef's: this only spells the
+// projection.
 func stageSelectList(columns []view.Column) string {
 	if len(columns) == 0 {
 		return "*"
@@ -1214,22 +1211,30 @@ func stageSelectList(columns []view.Column) string {
 	parts := make([]string, len(columns))
 	for i, c := range columns {
 		id := pgx.Identifier{c.Name}.Sanitize()
-		if c.Type == "VARCHAR" && c.ViewCastType != "" {
-			parts[i] = id + "::text AS " + id
-		} else {
-			parts[i] = id
+		ref, aliased := c.HotRef()
+		switch {
+		case aliased:
+			// The companion is already real[]; reading it needs no cast.
+			parts[i] = ref + " AS " + id
+		case c.ExportCast() != "":
+			parts[i] = ref + "::" + c.ExportCast() + " AS " + id
+		default:
+			parts[i] = ref
 		}
 	}
 	return strings.Join(parts, ", ")
 }
 
-// needsPGTextStage reports whether the column set contains a type pg_duckdb's
-// PG reader cannot scan, requiring a PostgreSQL-side text-cast staging table
-// before the DuckDB stage. jsonb (ViewCastType "json") scans fine, so it does
-// NOT trigger the detour. interval is included defensively (Iceberg-VARCHAR-
-// backed, and not worth a separate scan probe). inet/cidr were the original
-// offenders but are no longer supported (pg_duckdb rejects inet outright).
-func needsPGTextStage(columns []view.Column) bool {
+// needsPGStage reports whether the column set contains a type pg_duckdb's PG
+// reader cannot scan, so PostgreSQL has to materialise a cast copy in a plain
+// temp table before the DuckDB stage reads it.
+//
+// interval is included defensively (Iceberg-VARCHAR-backed, and not worth a
+// separate scan probe). jsonb, bytea and double scan fine and must not trigger
+// it: the detour copies every partition twice. A vector does not trigger it
+// either, because the export reads its generated real[] companion rather than the
+// pgvector column (see view.Column.HotRef).
+func needsPGStage(columns []view.Column) bool {
 	for _, c := range columns {
 		if c.ViewCastType == "interval" {
 			return true
@@ -1252,19 +1257,25 @@ func bulkExportWithSnapshot(ctx context.Context, conn *pgx.Conn, t *config.Table
 	// (inet/cidr were the original Oid-869 offenders that motivated this detour
 	// but are no longer supported — see pgFormatTypeToDuckDB.) jsonb-only /
 	// plain tables skip the detour (single copy, fast path).
+	// The projection belongs to whichever statement reads the real partition: it is
+	// what casts the VARCHAR-backed types and what reads a vector through its
+	// generated companion instead of the pgvector column pg_duckdb cannot scan.
+	// After the detour, cf_pgstage already holds those columns under their own
+	// names, so the DuckDB stage takes them as they are.
 	src := pgx.Identifier{t.SourceSchema, partName}.Sanitize()
-	if needsPGTextStage(columns) {
+	proj := stageSelectList(columns)
+	if needsPGStage(columns) {
 		pgStageSQL := fmt.Sprintf(
-			"CREATE TEMP TABLE cf_pgstage AS SELECT %s FROM %s",
-			stageSelectList(columns), src)
+			"CREATE TEMP TABLE cf_pgstage AS SELECT %s FROM %s", proj, src)
 		if _, err := conn.Exec(ctx, pgStageSQL); err != nil { // nosemgrep
 			return "", fmt.Errorf("pg text-stage: %w", err)
 		}
 		defer func() { _, _ = conn.Exec(ctx, "DROP TABLE IF EXISTS cf_pgstage") }() // nosemgrep
 		src = "cf_pgstage"
+		proj = "*"
 	}
 	stageSQL := fmt.Sprintf(
-		"CREATE TEMP TABLE duck_stage USING duckdb AS SELECT * FROM %s", src)
+		"CREATE TEMP TABLE duck_stage USING duckdb AS SELECT %s FROM %s", proj, src)
 	if _, err := conn.Exec(ctx, stageSQL); err != nil { // nosemgrep
 		return "", fmt.Errorf("stage: %w", err)
 	}
@@ -1385,6 +1396,20 @@ func pgFormatTypeToDuckDB(s string) (storage, viewCastType string, err error) {
 		return "VARCHAR", "", nil
 	}
 
+	// pgvector. format_type emits the dimension as a typmod (vector(1536))
+	// unless the column was declared without one. Both types widen losslessly
+	// to float4 and store as an Iceberg list<float>. The view cast is real[]
+	// rather than FLOAT[]: PG reads FLOAT as an alias for double precision, so
+	// ::FLOAT[] on the hot branch would widen to double precision[] and the two
+	// UNION branches would disagree on the column type. coldfront's SQL twin
+	// (_iceberg_storage_type / _iceberg_view_cast_type) returns the same pair
+	// for the decoupled path. sparsevec is absent deliberately: densifying it
+	// is a 100x storage blowup, so it stays hot-only and errors below.
+	if s == "vector" || strings.HasPrefix(s, "vector(") ||
+		s == "halfvec" || strings.HasPrefix(s, "halfvec(") {
+		return "FLOAT[]", "real[]", nil
+	}
+
 	// numeric(P,S) → DECIMAL(P,S). Iceberg supports decimal up to P=38.
 	if m := numericTypeRe.FindStringSubmatch(s); m != nil {
 		return "DECIMAL(" + m[1] + "," + m[2] + ")", "", nil
@@ -1400,9 +1425,11 @@ func pgFormatTypeToDuckDB(s string) (storage, viewCastType string, err error) {
 		"PG type %q has no Iceberg-compatible mapping. Supported: bigint, integer, "+
 			"smallint, real, double precision, boolean, timestamp with/without time "+
 			"zone, date, time without time zone, uuid, text, character varying(N), "+
-			"character(N), bytea, numeric(P,S) with P<=38, json, jsonb, interval. "+
+			"character(N), bytea, numeric(P,S) with P<=38, json, jsonb, interval, "+
+			"vector(N), halfvec(N). "+
 			"inet/cidr/oid are not supported (pg_duckdb cannot process them in "+
-			"Iceberg-backed queries): store IP data as text and oid values as bigint", s)
+			"Iceberg-backed queries): store IP data as text and oid values as bigint. "+
+			"sparsevec is not supported: keep it in the hot tier", s)
 }
 
 // pgTypeMap holds the 1:1 PG-format_type → (storage, viewCast) mappings used by
@@ -1500,7 +1527,8 @@ func scanColumns(ctx context.Context, db querier, schema, actualName string) ([]
 	rows, err := db.Query(ctx /* nosemgrep */, `
 		SELECT a.attname,
 		       format_type(a.atttypid, a.atttypmod),
-		       a.attidentity::text
+		       a.attidentity::text,
+		       a.attgenerated::text
 		FROM pg_attribute a
 		JOIN pg_class c ON c.oid = a.attrelid
 		JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -1514,20 +1542,31 @@ func scanColumns(ctx context.Context, db querier, schema, actualName string) ([]
 
 	var cols []view.Column
 	for rows.Next() {
-		var name, pgFormatType, attidentity string
-		if err := rows.Scan(&name, &pgFormatType, &attidentity); err != nil {
+		var name, pgFormatType, attidentity, attgenerated string
+		if err := rows.Scan(&name, &pgFormatType, &attidentity, &attgenerated); err != nil {
 			return nil, err
+		}
+		// A companion is ColdFront's own generated column, not a column of the
+		// table as far as the Iceberg schema and the view are concerned. Skipping
+		// it keeps exactly one column per user column. A generated column the user
+		// wrote is left alone and treated like any other.
+		if attgenerated != "" && strings.HasPrefix(name, vecCompanion("")) {
+			continue
 		}
 		storage, viewCastType, err := pgFormatTypeToDuckDB(pgFormatType)
 		if err != nil {
 			return nil, fmt.Errorf("column %s.%s.%s: %w", schema, actualName, name, err)
 		}
-		cols = append(cols, view.Column{
+		col := view.Column{
 			Name:         name,
 			Type:         storage,
 			ViewCastType: viewCastType,
 			IsIdentity:   attidentity == "a",
-		})
+		}
+		if col.IsVector() {
+			col.HotSource = vecCompanion(name)
+		}
+		cols = append(cols, col)
 	}
 	return cols, rows.Err()
 }

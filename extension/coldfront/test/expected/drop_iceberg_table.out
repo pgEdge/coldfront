@@ -123,6 +123,6 @@ SELECT relname, relkind FROM pg_class
 SELECT coldfront._unregister_iceberg('public', 'nosuch');
 ERROR:  coldfront: "public.nosuch" is not a registered Iceberg table
 HINT:  Only tables registered in coldfront.tiered_views can be unregistered.
-CONTEXT:  PL/pgSQL function _unregister_iceberg(text,text) line 13 at RAISE
+CONTEXT:  PL/pgSQL function _unregister_iceberg(text,text) line 14 at RAISE
 -- Cleanup.
 DROP TABLE public.events;
