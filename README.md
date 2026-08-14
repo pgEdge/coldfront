@@ -121,6 +121,7 @@ The following table lists the ColdFront guides and what each one covers:
 
 | Doc | Contents |
 |---|---|
+| **[Embeddings](docs/usage_vectors.md)** | Storing and searching embeddings with the pgvector interface |
 | **[Usage](docs/usage.md)** | Day-to-day use - both modes plus the standalone partition manager, one-time setup, reading/writing, supported types, the partition CLI, storage backends, distributed (mesh) setup, tuning |
 | **[Installation](docs/installation.md)** | Build from source (Docker or bare-metal); Testing & CI |
 | **[Object store setup](docs/object_store.md)** | Get ColdFront running on cloud S3 (virtual-hosted), end-to-end |
@@ -128,6 +129,7 @@ The following table lists the ColdFront guides and what each one covers:
 | **[Architecture](docs/architecture.md)** | Shared architecture and core mechanics |
 | **[Architecture: tiered](docs/architecture_tiered.md)** | Tiered (hot PG + cold Iceberg) deep dive |
 | **[Architecture: decoupled](docs/architecture_decoupled.md)** | Decoupled (iceberg-only) deep dive |
+| **[Architecture: vectors](docs/architecture_vectors.md)** | Vector storage internals - type mapping, routing state, cluster assignment, layout |
 
 ## Least-privilege application roles
 
@@ -201,7 +203,8 @@ pgedge-coldfront/
 │   └── seaweedfs-s3.json        ← SeaweedFS S3 auth config (example)
 ├── docs/                       ← MkDocs site (user docs; mkdocs.yml at repo root)
 │   ├── index.md · installation.md · object_store.md · usage.md · compaction.md
-│   ├── architecture.md · architecture_tiered.md · architecture_decoupled.md · changelog.md
+│   ├── architecture.md · architecture_tiered.md · architecture_decoupled.md
+│   ├── architecture_vectors.md · usage_vectors.md · changelog.md
 │   └── formal/                 ← TLA+ model of the bakery protocol (Bakery_v2.tla)
 ├── docker-compose.yml          ← END-USER single-node stack (ports published)
 ├── docker-compose.matrix.yml   ← CI only: single-node vanilla matrix
