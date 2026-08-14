@@ -847,6 +847,13 @@ The following GUCs adjust write behaviour and execution; tune them as needed:
   target one tier. `on` emits a dual-tier CTE; `off` rejects with an error
   and a hint. Not relevant in decoupled mode (every write is single-tier
   by definition).
+- `coldfront.vector_probe` (bool, default `on`) - whether a recognised
+  similarity search reads only the clusters nearest its query vector. `off`
+  gives an exact scan of the whole corpus. Only affects a table with a
+  trained vector column ([usage_vectors.md](usage_vectors.md)).
+- `coldfront.vector_nprobe` (int, default `0`) - clusters such a search
+  reads, overriding the column's own `nprobe`. `0` uses the configured
+  value; at or above the column's `nlist` the search is exhaustive.
 - `duckdb.force_execution` - bench it before flipping: on a mixed
   workload it helps `count(distinct)` and similar but regresses index
   lookups, top-K with PK ordering, and JSON access. **Default off.**

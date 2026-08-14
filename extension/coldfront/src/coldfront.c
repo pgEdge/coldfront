@@ -48,6 +48,7 @@
 #include "executor/executor.h"
 #include "executor/spi.h"
 #include "lib/stringinfo.h"
+#include "nodes/makefuncs.h"
 #include "nodes/parsenodes.h"
 #include "nodes/nodeFuncs.h"
 #include "nodes/pg_list.h"
@@ -189,6 +190,16 @@ static bool coldfront_ice_attached = false;
  */
 static bool coldfront_allow_mixed_writes = true;
 static int  coldfront_cold_write_batch_size = 10000;
+
+/*
+ * GUCs: the two levers over a probed vector search. Off gives the exact scan the
+ * product performed before there was a layout to probe, and a positive nprobe
+ * overrides the table's configured one. Both exist because the acceptance test for
+ * the rewrite is that the same query answers identically with the probe disabled
+ * and with it exhaustive, which needs a way to say each in one session.
+ */
+static bool coldfront_vector_probe  = true;
+static int  coldfront_vector_nprobe = 0;
 
 /*
  * GUCs: the deployment-config endpoint/DSN strings that ensure_attached() /
@@ -2431,15 +2442,234 @@ cf_normalize_read_jsonb(Query *query)
     cf_reparse_and_replace(query, norm, &ps);
 }
 
+/* True for a reference to attno of the query's single range-table entry. */
+static bool
+cf_is_single_rel_var(Node *node, AttrNumber attno)
+{
+    Var *var;
+
+    if (node == NULL || !IsA(node, Var))
+        return false;
+    var = (Var *) node;
+    return var->varno == 1 && var->varattno == attno && var->varlevelsup == 0;
+}
+
+/*
+ * The query vector as a PostgreSQL literal, or NULL if this expression is not one.
+ *
+ * The vector has to be inlined: pg_duckdb converts neither a `vector` nor a
+ * `real[]` bound parameter, on a custom plan as much as a generic one, so a probe
+ * that could only be computed from a parameter's value could not have run the
+ * search either. Constant-folded first, because the caller writes ARRAY[…]::real[]
+ * (an ArrayExpr of constants) or a `vector` literal the operator's implicit cast
+ * wraps, and neither is a Const until it is folded.
+ */
+static char *
+cf_query_vector_literal(Node *expr)
+{
+    Const *c;
+    Oid    typoutput;
+    bool   typisvarlena;
+
+    c = (Const *) expression_planner((Expr *) copyObject(expr));
+    if (!IsA(c, Const) || c->constisnull || c->consttype != FLOAT4ARRAYOID)
+        return NULL;
+    getTypeOutputInfo(c->consttype, &typoutput, &typisvarlena);
+    return OidOutputFunctionCall(typoutput, c->constvalue);
+}
+
+/*
+ * Probe injection. A top-k similarity search over a clustered tiered view is
+ * rewritten to read only the clusters nearest the query vector, which is what turns
+ * the layout every write maintains into a shorter read. Every other shape is left
+ * exactly as it was: that is an exact scan, which is correct.
+ *
+ * The recognised shape is a single-relation SELECT on a registered view with a
+ * clustered vector column, ordered by one cosine distance between that column and a
+ * constant, with a LIMIT. The LIMIT is part of the shape and not a detail: a probe
+ * trades recall for reads, which is the bargain a top-k asks for and is not one to
+ * impose on a query that asked for every row in order. Cosine only, because the
+ * centroids were trained under cosine and ordering by another metric would route to
+ * the wrong clusters and report nothing.
+ *
+ * The predicate cannot be added to the caller's query, because the column it tests
+ * is deliberately in no branch of the view (see coldfront._vec_list_col). So the
+ * view reference is replaced by the view's own definition carrying the predicate on
+ * its cold arm, which puts the test where the column exists and leaves the caller's
+ * query surface alone. Nothing here is text surgery on the caller's SQL: the
+ * substitution swaps one range-table entry for a subquery and PostgreSQL deparses
+ * the result.
+ *
+ * Declining is silent and total. A table with no centroid generation, a probe set
+ * that resolves to nothing, a view with no cold arm: all of them keep today's
+ * query. The read is then slower than it could be, never wrong, which is the right
+ * direction for a read to fail in (a WRITE that cannot resolve a generation has to
+ * fail loudly instead).
+ */
+static void
+cf_maybe_inject_probe(Query *query)
+{
+    RangeTblEntry  *view_rte;
+    TieredViewInfo  info;
+    SortGroupClause *sgc;
+    TargetEntry    *tle = NULL;
+    ListCell       *lc;
+    Node           *expr;
+    List           *args;
+    Oid             funcid;
+    char           *fname;
+    AttrNumber      vec_attno;
+    Node           *lhs, *rhs, *other;
+    char           *vec_lit;
+    char           *body = NULL;
+    Query          *clone;
+    RangeTblEntry  *crte;
+    char           *sql;
+    ColdParamSet    ps;
+    StringInfoData  q;
+
+    if (!coldfront_vector_probe)
+        return;
+    if (query->cteList || query->setOperations || query->hasSubLinks ||
+        query->rowMarks || list_length(query->rtable) != 1 ||
+        list_length(query->sortClause) != 1 || query->limitCount == NULL)
+        return;
+
+    view_rte = (RangeTblEntry *) linitial(query->rtable);
+    if (view_rte->rtekind != RTE_RELATION ||
+        get_rel_relkind(view_rte->relid) != RELKIND_VIEW)
+        return;
+    if (!lookup_tiered_view(view_rte->relid, get_rel_name(view_rte->relid), &info))
+        return;
+    if (info.vec_column == NULL)
+        return;
+
+    /* The single sort key, which may be resjunk (ORDER BY an unselected expr). */
+    sgc = (SortGroupClause *) linitial(query->sortClause);
+    foreach(lc, query->targetList)
+    {
+        TargetEntry *t = (TargetEntry *) lfirst(lc);
+
+        if (t->ressortgroupref == sgc->tleSortGroupRef)
+        {
+            tle = t;
+            break;
+        }
+    }
+    if (tle == NULL)
+        return;
+
+    /* Written as an operator or as the function behind it; both name the same. */
+    expr = (Node *) tle->expr;
+    if (IsA(expr, OpExpr))
+    {
+        funcid = ((OpExpr *) expr)->opfuncid;
+        args   = ((OpExpr *) expr)->args;
+    }
+    else if (IsA(expr, FuncExpr))
+    {
+        funcid = ((FuncExpr *) expr)->funcid;
+        args   = ((FuncExpr *) expr)->args;
+    }
+    else
+        return;
+    if (list_length(args) != 2)
+        return;
+    fname = get_func_name(funcid);
+    if (fname == NULL || strcmp(fname, "list_cosine_distance") != 0)  /* nosemgrep */
+        return;
+
+    /* One side is the view's vector column, the other is the query vector. */
+    vec_attno = get_attnum(view_rte->relid, info.vec_column);
+    if (vec_attno == InvalidAttrNumber)
+        return;
+    lhs = (Node *) linitial(args);
+    rhs = (Node *) lsecond(args);
+    if (cf_is_single_rel_var(lhs, vec_attno))
+        other = rhs;
+    else if (cf_is_single_rel_var(rhs, vec_attno))
+        other = lhs;
+    else
+        return;
+    vec_lit = cf_query_vector_literal(other);
+    if (vec_lit == NULL)
+        return;
+
+    /* Resolve the probe set and the definition that carries it, in one round trip. */
+    initStringInfo(&q);
+    appendStringInfo(&q,
+                     "SELECT coldfront._vec_probed_viewdef(%s, %s, "
+                     "coldfront._vec_probe_qual(coldfront._vec_probe_ids("
+                     "%s, %s, %s, %s::real[], %s)))",
+                     quote_literal_cstr(get_namespace_name(
+                                            get_rel_namespace(view_rte->relid))),
+                     quote_literal_cstr(get_rel_name(view_rte->relid)),
+                     quote_literal_cstr(get_namespace_name(
+                                            get_rel_namespace(view_rte->relid))),
+                     quote_literal_cstr(get_rel_name(view_rte->relid)),
+                     quote_literal_cstr(info.vec_column),
+                     quote_literal_cstr(vec_lit),
+                     coldfront_vector_nprobe > 0
+                         ? psprintf("%d", coldfront_vector_nprobe) : "NULL");
+    if (SPI_connect() == SPI_OK_CONNECT)
+    {
+        if (SPI_execute(q.data, true, 1) == SPI_OK_SELECT && SPI_processed == 1)
+        {
+            MemoryContext oldcxt = MemoryContextSwitchTo(CurTransactionContext);
+
+            body = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+            MemoryContextSwitchTo(oldcxt);
+        }
+        SPI_finish();
+    }
+    if (body == NULL)
+        return;
+
+    /* Stand the probed definition in for the view, then deparse and reparse so the
+     * whole statement is planned against it. */
+    clone = copyObject(query);
+    crte  = (RangeTblEntry *) linitial(clone->rtable);
+
+    coldfront_in_rewrite = true;
+    PG_TRY();
+    {
+        List    *parsetree_list = pg_parse_query(body);
+        RawStmt *raw            = linitial_node(RawStmt, parsetree_list);
+
+        crte->subquery = parse_analyze_fixedparams(raw, body, NULL, 0, NULL);
+    }
+    PG_FINALLY();
+    {
+        coldfront_in_rewrite = false;
+    }
+    PG_END_TRY();
+
+    crte->rtekind       = RTE_SUBQUERY;
+    crte->relid         = InvalidOid;
+    crte->relkind       = 0;
+    crte->rellockmode   = NoLock;
+    crte->inh           = false;
+    /* The caller's query names its columns by the view's name, so the subquery
+     * answers to it too. */
+    crte->alias         = makeAlias(crte->eref->aliasname, NIL);
+#if PG_VERSION_NUM >= 160000
+    crte->perminfoindex = 0;
+#endif
+
+    sql = pg_get_querydef(clone, false);
+    collect_cold_params(query, &ps);
+    cf_reparse_and_replace(query, sql, &ps);
+}
+
 /*
  * Read path for a SELECT that touches a registered tiered view. First try to
  * reroute a provably-hot read to the heap (runs in plain PG). Otherwise the read
  * spans the cold tier: lazily attach
  * 'ice' (once per session) so the view body's iceberg_scan('ice...') resolves —
- * the version-agnostic cold-read attach (PG 16/17/18) — and normalize the
- * whitelisted jsonb spellings so DuckDB (which runs the whole view query) accepts
- * them. The relkind check inside query_reads_tiered_view keeps plain queries off
- * the SPI path.
+ * the version-agnostic cold-read attach (PG 16/17/18) — narrow a recognised
+ * similarity search to its probed clusters, and normalize the whitelisted jsonb
+ * spellings so DuckDB (which runs the whole view query) accepts them. The relkind
+ * check inside query_reads_tiered_view keeps plain queries off the SPI path.
  */
 static void
 cf_maybe_attach_for_read(Query *query)
@@ -2450,6 +2680,7 @@ cf_maybe_attach_for_read(Query *query)
         return;   /* rewritten to the hot heap; runs in plain PostgreSQL */
     if (!coldfront_ice_attached)
         ensure_ice_attached_once();
+    cf_maybe_inject_probe(query);
     cf_normalize_read_jsonb(query);
 }
 
@@ -3655,6 +3886,34 @@ register_gucs(void)
         &coldfront_cold_write_batch_size,
         10000,              /* boot_val */
         1,                  /* min */
+        PG_INT32_MAX,       /* max */
+        PGC_USERSET,
+        0,
+        NULL, NULL, NULL);
+
+    DefineCustomBoolVariable(
+        "coldfront.vector_probe",
+        "Restrict a recognised similarity search to its nearest clusters.",
+        "When on (default), a top-k search on a clustered vector column reads only "
+        "the clusters nearest the query vector, which is approximate in the way "
+        "every vector index is. Off gives an exact scan of the whole corpus: "
+        "slower, and the reference a recall measurement compares against.",
+        &coldfront_vector_probe,
+        true,           /* boot_val */
+        PGC_USERSET,
+        0,              /* flags */
+        NULL, NULL, NULL);
+
+    DefineCustomIntVariable(
+        "coldfront.vector_nprobe",
+        "Clusters a similarity search reads, overriding the table's own setting.",
+        "0 (default) uses the nprobe recorded for the column in "
+        "coldfront.vector_config. A value at or above that column's nlist reads "
+        "every cluster, which is exact and is how an approximate result is "
+        "compared against ground truth without turning the rewrite off.",
+        &coldfront_vector_nprobe,
+        0,                  /* boot_val: defer to vector_config */
+        0,                  /* min */
         PG_INT32_MAX,       /* max */
         PGC_USERSET,
         0,

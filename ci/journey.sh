@@ -849,17 +849,32 @@ EOSQL
     # A cold UPDATE that sets a new embedding must re-derive the cluster in the
     # same statement. The row is found by its new cluster and no longer by its
     # old one, which is the silent-invisibility bug stated as a test.
-    local OLD_ASG; OLD_ASG=$(q "$HOST" "SELECT r['_cf_vec_list'] FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] = 'asg_trig';" 2>/dev/null)
-    local UP; UP=$(qf "$HOST" <<'EOSQL'
-SET coldfront.allow_mixed_writes = on;
-UPDATE chunks SET embedding = ARRAY[-1,-1,-1]::real[]::vector WHERE body = 'asg_trig';
+    #
+    # The new vector is the centroid farthest from the one this row holds, read from
+    # the trained set rather than written here: that makes the move a real change of
+    # cluster whatever training produced, and it leaves the two assigned rows in
+    # different clusters, which is what the probe assertions below need.
+    local FARCENT
+    FARCENT=$(q "$HOST" "SELECT array_to_string(centroid, ',') FROM coldfront.vector_centroids
+        WHERE table_name = 'chunks'
+          AND generation = (SELECT generation FROM coldfront.vector_config WHERE table_name = 'chunks')
+        ORDER BY centroid <=> ARRAY[1.5,-2,3]::real[] DESC LIMIT 1;")
+    local OA; OA=$(qf "$HOST" <<'EOSQL'
 SELECT coldfront.ensure_attached();
-SELECT 'NEW_VEC:' || (r['embedding']::real[] = ARRAY[-1,-1,-1]::real[])::text
+SELECT 'OLD_ASG:' || r['_cf_vec_list'] FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] = 'asg_trig';
+EOSQL
+)
+    local OLD_ASG; OLD_ASG=$(extract OLD_ASG "$OA")
+    local UP; UP=$(qf "$HOST" <<EOSQL
+SET coldfront.allow_mixed_writes = on;
+UPDATE chunks SET embedding = ARRAY[$FARCENT]::real[]::vector WHERE body = 'asg_trig';
+SELECT coldfront.ensure_attached();
+SELECT 'NEW_VEC:' || (r['embedding']::real[] = ARRAY[$FARCENT]::real[])::text
   FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] = 'asg_trig';
 SELECT 'NEW_ASG:' || r['_cf_vec_list'] FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] = 'asg_trig';
 SELECT 'NEAREST_TO_NEW:' || (SELECT centroid_id FROM coldfront.vector_centroids
    WHERE table_name = 'chunks' AND generation = (SELECT generation FROM coldfront.vector_config WHERE table_name = 'chunks')
-   ORDER BY centroid <=> ARRAY[-1,-1,-1]::real[] LIMIT 1);
+   ORDER BY centroid <=> ARRAY[$FARCENT]::real[] LIMIT 1);
 EOSQL
 )
     assert_eq "a cold UPDATE writes the new embedding" "true" "$(extract NEW_VEC "$UP")"
@@ -870,6 +885,57 @@ EOSQL
     local TE; TE=$(q_may "$HOST" "CALL coldfront.vector_train('public','chunks','nosuchcol',2);")
     assert_err "training an unconfigured column is refused" "no configuration" "$TE"
 
+    # The probe. A recognised top-k reads only the clusters nearest the query
+    # vector, and the counts are what prove it: the predicate cannot be observed
+    # from the caller's side, since the column it tests is in no branch of the view.
+    #
+    # The query vector is the cluster asg_trig was just moved into, so a
+    # single-cluster probe reads that one and skips asg_bulk1's. nlist is 2, so
+    # nprobe=2 is exhaustive by construction and is the reference every other count
+    # is compared against. Each query is its own session, so a SET cannot leak into
+    # the next; psql prints the SET's own tag, which is not a row.
+    local topk="SELECT body FROM chunks ORDER BY embedding <=> ARRAY[$FARCENT]::real[]"
+    local ALL OFF ONE NOLIMIT
+    ALL=$(q     "$HOST" "SET coldfront.vector_nprobe = 2; $topk LIMIT 100;"  | grep -vx SET | grep -c . || true)
+    OFF=$(q     "$HOST" "SET coldfront.vector_probe = off; $topk LIMIT 100;" | grep -vx SET | grep -c . || true)
+    ONE=$(q     "$HOST" "SET coldfront.vector_nprobe = 1; $topk LIMIT 100;"  | grep -vx SET | grep -c . || true)
+    NOLIMIT=$(q "$HOST" "SET coldfront.vector_nprobe = 1; $topk;"            | grep -vx SET | grep -c . || true)
+    assert_eq "an exhaustive probe returns the exact answer"   "$OFF" "$ALL"
+    assert_gt "a narrower probe reads fewer rows"              "$ONE" "$ALL"
+    assert_eq "an unrecognised shape keeps its exact answer"   "$ALL" "$NOLIMIT"
+
+    # Which rows it drops, and which it must never drop.
+    local ONE_ROWS
+    ONE_ROWS=$(q "$HOST" "SET coldfront.vector_nprobe = 1; $topk LIMIT 100;" | grep -vx SET)
+    assert_eq "a probe reads the cluster it aimed at"          "1" "$(printf '%s\n' "$ONE_ROWS" | grep -c '^asg_trig$'  || true)"
+    assert_eq "a probe skips the cluster it did not look in"   "0" "$(printf '%s\n' "$ONE_ROWS" | grep -c '^asg_bulk1$' || true)"
+    assert_eq "a probe keeps every unassigned row"             "1" "$(printf '%s\n' "$ONE_ROWS" | grep -c '^coldins$'   || true)"
+    assert_eq "a probe keeps every hot row"                    "1" "$(printf '%s\n' "$ONE_ROWS" | grep -c '^hot$'       || true)"
+
+    # The predicate reaches the Iceberg scan itself rather than filtering above it,
+    # and a shape the rewrite declines carries none at all.
+    local PLAN_TOPK PLAN_PLAIN
+    PLAN_TOPK=$(q  "$HOST" "SET coldfront.vector_nprobe = 1; EXPLAIN (COSTS OFF, VERBOSE) $topk LIMIT 100;" 2>/dev/null)
+    PLAN_PLAIN=$(q "$HOST" "SET coldfront.vector_nprobe = 1; EXPLAIN (COSTS OFF, VERBOSE) $topk;" 2>/dev/null)
+    assert_contains "the probe predicate reaches the scan"    "_cf_vec_list" "$PLAN_TOPK"
+    assert_eq "a declined shape carries no predicate"          "0" "$(printf '%s\n' "$PLAN_PLAIN" | grep -c '_cf_vec_list' || true)"
+
+    # The null arm carrying its weight, stated as an answer rather than a count:
+    # coldins is the exact match for this vector and was written before there was
+    # a generation, so it comes back only through that disjunct.
+    local NEAR; NEAR=$(q "$HOST" "SET coldfront.vector_nprobe = 1; SELECT body FROM chunks ORDER BY embedding <=> ARRAY[4,5.5,-6]::real[] LIMIT 1;" | grep -vx SET)
+    assert_eq "a probed search still finds an unassigned row"  "coldins" "$NEAR"
+
+    # Decoupled: no hot arm, so the predicate becomes the whole of the cold arm's
+    # WHERE rather than an addition to a cutoff qual — the other branch of
+    # coldfront._vec_probed_viewdef. Row 1 predates the generation and row 2 sits in
+    # the cluster this probe does not look in.
+    local dtopk="SELECT id FROM icevec ORDER BY embedding <=> ARRAY[-1,-1,-1]::real[]"
+    local DONE_ DALL
+    DONE_=$(q "$HOST" "SET coldfront.vector_nprobe = 1; $dtopk LIMIT 100;" | grep -vx SET | grep -c . || true)
+    DALL=$(q  "$HOST" "SET coldfront.vector_nprobe = 2; $dtopk LIMIT 100;" | grep -vx SET | grep -c . || true)
+    assert_eq "a decoupled probe reads one cluster and the unassigned" "1" "$DONE_"
+    assert_eq "an exhaustive decoupled probe reads everything"         "2" "$DALL"
 }
 
 # ───────────────────────────────────────────────────────────────────────────

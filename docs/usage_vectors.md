@@ -114,10 +114,42 @@ Choosing `nlist` is a floor rather than a formula: aim for at least one row
 group's worth of rows per cluster, roughly 2048. Below that, extra clusters stop
 reducing the data read. Above it there is a wide plateau.
 
-**Searches do not use the clustering yet.** The routing state is maintained and
-correct, but the read path does not filter by cluster in this release, so a search
-remains an exact scan. Configuring clustering now costs nothing and means the data
-is already assigned when the read path starts using it.
+### What a clustered search does
+
+Once a column has a trained generation, a search that ends in `ORDER BY <column>
+<=> <vector> LIMIT n` reads only the `nprobe` clusters nearest your query vector.
+The query you write does not change. The result becomes approximate, in the same
+way it does with any vector index: raise `nprobe` for recall, lower it for speed.
+
+Anything that is not that shape stays an exact scan of both tiers, which is
+correct. Two cases worth knowing: a search with no `LIMIT` is answered exactly,
+because asking for every row in order is not a request to approximate; and so is
+one wrapped in a subquery or CTE, because the clustering is applied to the
+statement you write rather than to a nested part of it.
+
+```sql
+-- narrowed to the nearest clusters
+SELECT id, body FROM chunks ORDER BY embedding <=> ARRAY[…]::real[] LIMIT 10;
+-- exact: the search is not the statement
+SELECT string_agg(body, ',') FROM (
+  SELECT body FROM chunks ORDER BY embedding <=> ARRAY[…]::real[] LIMIT 10) t;
+```
+
+Rows written before the column was trained have no cluster, and they are returned
+by every search regardless of which clusters it reads. So is every hot-tier row.
+Nothing goes missing because it predates the clustering.
+
+Two settings, per session:
+
+```sql
+-- read every cluster: exact, and the reference to compare recall against
+SET coldfront.vector_nprobe = 500;    -- at or above nlist
+-- or turn the narrowing off entirely
+SET coldfront.vector_probe = off;
+```
+
+Leave `coldfront.vector_nprobe` at its default of `0` to use the `nprobe` you
+recorded for the column.
 
 ## What a clustered table needs from the deployment
 

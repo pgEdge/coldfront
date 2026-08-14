@@ -247,13 +247,74 @@ so each new file is internally sorted and its own row groups prune. No existing
 file is touched: sorted regions accumulate, and a probe reads the matching row
 group in each of them.
 
+## Reading: the probe
+
+`cf_maybe_inject_probe` runs on the read path, alongside the hot-tier reroute and
+the jsonb normalisation, and it is what makes the layout worth maintaining. It
+recognises one shape and rewrites it:
+
+- a single-relation `SELECT` on a registered view with a clustered vector column,
+- ordered by exactly one cosine distance between that column and a constant,
+- with a `LIMIT`,
+- and at the top level of the statement: the hook sees one `Query`, so a top-k
+  nested in a subquery or a CTE is not the query it is looking at. Wrapping a
+  search to aggregate over it therefore makes it exact.
+
+Everything else is left byte-identical. That is an exact scan over both tiers,
+which is correct, and it is what the product did before there was a layout.
+
+Three of those conditions are load-bearing. **The `LIMIT`** is part of the shape
+because a probe trades recall for reads: that is the bargain a top-k asks for, and
+not one to impose on a query that asked for every row in order. **Cosine only**,
+because the centroids were trained under cosine, and ordering by `<->` or `<#>`
+would route to clusters chosen under a different metric and quietly return the
+wrong rows. **A constant query vector**, because pg_duckdb converts neither a
+`vector` nor a `real[]` bound parameter, so a search that could only be resolved
+from a parameter could not have run at all.
+
+The rewrite resolves the nearest `nprobe` centroid ids
+(`coldfront._vec_probe_ids`), turns them into a predicate
+(`coldfront._vec_probe_qual`), and substitutes the view reference for the view's
+own definition carrying that predicate on its cold arm
+(`coldfront._vec_probed_viewdef`):
+
+```sql
+… WHERE r['ts'] < <cutoff>
+  AND (r['_cf_vec_list']::integer IN (3, 17) OR r['_cf_vec_list']::integer IS NULL)
+```
+
+The substitution exists because the predicate has nowhere else to go: the cluster
+column is in no branch of the view, so no query written against the view can name
+it. Adding the test inside the definition puts it where the column exists and
+leaves the user's column list alone. It is a range-table entry swapped for a
+subquery, not text surgery on the caller's SQL, and PostgreSQL deparses the
+result.
+
+The hot arm is untouched: hot rows carry no assignment and every one of them is
+returned.
+
+**The null disjunct is not optional.** Rows another engine appended straight to
+Iceberg carry no assignment, and a bare `IN` drops them silently. It is also not
+expensive, because the reader prunes on each row group's null count: unassigned
+rows are read in proportion to their own size rather than the table's.
+
+**Declining is total and silent.** No centroid generation, an empty probe set, a
+view with no cold arm: each keeps today's query. This is the one place in the
+vector path that fails open, and deliberately so. A read that loses its predicate
+is slower, never wrong. A *write* that cannot resolve a generation fails loudly
+instead, because a wrong cluster id makes a row invisible to its own probe.
+
+Two session knobs, both `PGC_USERSET`:
+
+| GUC | Default | Effect |
+|---|---|---|
+| `coldfront.vector_probe` | `on` | `off` gives the exact scan a recall measurement compares against |
+| `coldfront.vector_nprobe` | `0` | `0` uses the column's configured `nprobe`; a value at or above `nlist` is exhaustive |
+
 ## Current gaps
 
 These are properties of the code as it stands, not plans.
 
-- **The read path does not inject a probe predicate.** A search is an exact scan
-  over both tiers. The cluster column is written and maintained but nothing reads
-  it, so the layout has no effect on query time yet.
 - **Compaction degrades a clustered layout.** The compactor concatenates files
   ordered by their lower bound, which preserves order only when the input ranges
   do not overlap. Two internally sorted files of mixed clusters always overlap,
