@@ -110,9 +110,62 @@ CALL coldfront.vector_train('public', 'chunks', 'embedding');
 stamps the row's nearest cluster in the same statement, on every write path, and a
 retrain does not require regenerating anything.
 
+**Rows already in the cold tier are not clustered by training.** Training only
+writes the centroids; the rows that predate it carry no cluster, and every search
+reads all of them. If you are clustering a column that already has cold data, give
+those rows a cluster and then compact:
+
+```sql
+CALL coldfront.vector_assign('public', 'chunks', 'embedding');
+```
+
+That rewrites the unassigned rows in one operation, serialised like any other cold
+write. Compacting afterwards is what puts them in cluster order and clears the
+delete markers the rewrite leaves; without it the rows are assigned but a search
+still reads more of the table than it needs to. On a column clustered before any
+data arrives there is nothing to assign and nothing to run.
+
 Choosing `nlist` is a floor rather than a formula: aim for at least one row
 group's worth of rows per cluster, roughly 2048. Below that, extra clusters stop
 reducing the data read. Above it there is a wide plateau.
+
+### Choosing `nprobe`
+
+`nprobe` is how many clusters a search reads, and it is the dial between recall and
+speed. Measured on a 10 million row corpus of 1024-dimension embeddings, `nlist`
+1000, against the exact answer for 100 queries:
+
+| `nprobe` | clusters read | recall | median query |
+|---|---|---|---|
+| 1 | 0.1% | 57% | 49 ms |
+| 10 | 1% | 87% | 307 ms |
+| 20 | 2% | 93% | 592 ms |
+| 50 | 5% | 97% | 1.9 s |
+| 100 | 10% | 98.5% | 5.1 s |
+
+The same queries scanned exactly take 32 s each, so `nprobe` 20 is roughly 54 times
+faster for 93% of the exact answer.
+
+**Start at 2% of `nlist`.** Recall gets rapidly more expensive as you buy more of
+it: on that corpus the first 23 points of recall cost 111 ms, and the last 1.8
+points cost 3.2 s. The rate worsens from 5 ms per recall point to 1776, and the
+knee is at 2% of the clusters. Above it you are paying several hundred milliseconds
+per point.
+
+That also fixes `nlist`, given the row-group floor above. **Aim for `nlist` ≈ rows
+/ 10,000**, which leaves a few row groups per cluster: 1000 clusters for 10 million
+rows. Dividing more finely than one row group per cluster costs latency without
+buying anything, because a cluster read pulls a whole row group either way.
+
+Two things the averages hide. **Recall is an average over queries, and the tail is
+worse**: at `nprobe` 20 the worst of those 100 queries returned 4 of its true 10.
+If every query matters, measure the worst case rather than the mean. **A more finely
+divided index is not automatically better**: `nlist` 4999 returned more recall per
+cluster read, but cost more time for it, and only came out ahead above about 98%
+recall. Below that, fewer and larger clusters were faster at the same recall.
+
+Your corpus is not this one. Take these as the shape of the curve, and measure your
+own against a sample of queries you have exact answers for.
 
 ### What a clustered search does
 
@@ -150,6 +203,30 @@ SET coldfront.vector_probe = off;
 
 Leave `coldfront.vector_nprobe` at its default of `0` to use the `nprobe` you
 recorded for the column.
+
+### Checking whether the clustering is earning its keep
+
+```sql
+CALL coldfront.vector_status();
+SELECT table_name, rows_total, rows_unassigned, clusters_occupied,
+       probe_fraction, advice
+  FROM cf_vector_status;
+```
+
+`probe_fraction` is the number to watch: the share of the cold rows a search reads
+on average. Lower is faster. `advice` is filled in only when something specific is
+holding that number up, and says which:
+
+| What it says | What to do |
+|---|---|
+| no trained generation | `CALL coldfront.vector_train(...)` |
+| over half the rows predate training | `CALL coldfront.vector_assign(...)`, then compact |
+| over half the clusters hold less than one row group | retrain with a smaller `nlist` |
+| clusters are lopsided by more than 10x | retrain |
+
+Pass a schema and table to report on one column: `CALL
+coldfront.vector_status('public', 'chunks')`. The results land in a temporary table
+that lasts for your session, and each call replaces the last.
 
 ## What a clustered table needs from the deployment
 

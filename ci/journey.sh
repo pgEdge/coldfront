@@ -921,10 +921,13 @@ EOSQL
     assert_eq "a declined shape carries no predicate"          "0" "$(printf '%s\n' "$PLAN_PLAIN" | grep -c '_cf_vec_list' || true)"
 
     # The null arm carrying its weight, stated as an answer rather than a count:
-    # coldins is the exact match for this vector and was written before there was
-    # a generation, so it comes back only through that disjunct.
-    local NEAR; NEAR=$(q "$HOST" "SET coldfront.vector_nprobe = 1; SELECT body FROM chunks ORDER BY embedding <=> ARRAY[4,5.5,-6]::real[] LIMIT 1;" | grep -vx SET)
-    assert_eq "a probed search still finds an unassigned row"  "coldins" "$NEAR"
+    # coldins holds this exact vector and was written before there was a generation,
+    # so a probe returns it only through that disjunct. Asserted as membership in the
+    # top few rather than as the single winner: asg_trig carries a centroid, and a
+    # centroid of a cluster with one member IS that member's vector, so the two can
+    # tie at distance zero and either is then a correct answer to LIMIT 1.
+    local NEAR; NEAR=$(q "$HOST" "SET coldfront.vector_nprobe = 1; SELECT body FROM chunks ORDER BY embedding <=> ARRAY[4,5.5,-6]::real[] LIMIT 3;" | grep -vx SET | grep -c '^coldins$' || true)
+    assert_eq "a probed search still finds an unassigned row"  "1" "$NEAR"
 
     # Decoupled: no hot arm, so the predicate becomes the whole of the cold arm's
     # WHERE rather than an addition to a cutoff qual — the other branch of
@@ -936,6 +939,69 @@ EOSQL
     DALL=$(q  "$HOST" "SET coldfront.vector_nprobe = 2; $dtopk LIMIT 100;" | grep -vx SET | grep -c . || true)
     assert_eq "a decoupled probe reads one cluster and the unassigned" "1" "$DONE_"
     assert_eq "an exhaustive decoupled probe reads everything"         "2" "$DALL"
+
+    # vector_status reports what a retrain decision needs. Every count is compared
+    # against the same number computed independently from the cold table, so the
+    # assertions hold whatever the fixture grows into.
+    local S; S=$(qf "$HOST" <<'EOSQL'
+CALL coldfront.vector_status('public', 'chunks');
+SELECT coldfront.ensure_attached();
+SELECT 'REPORTED:' || count(*) FROM cf_vector_status;
+SELECT 'GEN:' || generation FROM cf_vector_status;
+SELECT 'TRAINED:' || clusters_trained FROM cf_vector_status;
+SELECT 'REPORTS:' || rows_total || '/' || rows_unassigned || '/' || clusters_occupied
+  FROM cf_vector_status;
+SELECT 'ACTUAL:' || count(*) || '/' || count(*) FILTER (WHERE r['_cf_vec_list'] IS NULL)
+       || '/' || count(DISTINCT r['_cf_vec_list']::int)
+  FROM iceberg_scan('ice.public.chunks') r;
+SELECT 'FRACTION_SANE:' || (probe_fraction > 0 AND probe_fraction <= 1)::text FROM cf_vector_status;
+SELECT 'FLOOR:' || (clusters_below_row_group = clusters_occupied)::text FROM cf_vector_status;
+SELECT 'ADVICE:' || (advice IS NOT NULL)::text FROM cf_vector_status;
+EOSQL
+)
+    assert_eq "vector_status reports the clustered table"  "1" "$(extract REPORTED "$S")"
+    assert_eq "it reports the live generation"             "2" "$(extract GEN "$S")"
+    assert_eq "it reports that generation's centroid count" "2" "$(extract TRAINED "$S")"
+    assert_eq "the distribution matches the cold table"    "$(extract ACTUAL "$S")" "$(extract REPORTS "$S")"
+    assert_eq "the probe fraction is a fraction"           "true" "$(extract FRACTION_SANE "$S")"
+    # Every cluster here holds one row, far under a row group, which is exactly the
+    # condition the floor exists to name.
+    assert_eq "clusters under one row group are counted"   "true" "$(extract FLOOR "$S")"
+    assert_eq "a fixture this small draws advice"          "true" "$(extract ADVICE "$S")"
+
+    # Assigning the rows that predate training. These are the rows vector_status
+    # just counted as unassigned, and they are read by every probe whatever clusters
+    # it looks in, so on a corpus tiered before training they are the entire cost of
+    # a search. One claimed UPDATE, reusing the SET item a cold UPDATE emits.
+    local unasg_before; unasg_before=$(extract REPORTS "$S" | cut -d/ -f2)
+    local A; A=$(qf "$HOST" <<'EOSQL'
+CALL coldfront.vector_assign('public', 'chunks', 'embedding');
+SELECT coldfront.ensure_attached();
+SELECT 'LEFT:' || count(*) FROM iceberg_scan('ice.public.chunks') r
+ WHERE r['_cf_vec_list'] IS NULL;
+SELECT 'ROWS:' || count(*) FROM iceberg_scan('ice.public.chunks') r;
+SELECT 'MATCHES:' || count(*) FROM iceberg_scan('ice.public.chunks') r
+ WHERE r['_cf_vec_list']::int = (
+   SELECT centroid_id FROM coldfront.vector_centroids c
+    WHERE c.table_name = 'chunks'
+      AND c.generation = (SELECT generation FROM coldfront.vector_config WHERE table_name = 'chunks')
+    ORDER BY c.centroid <=> r['embedding']::real[] LIMIT 1);
+EOSQL
+)
+    assert_gt "there were rows to assign"                  "0"   "$unasg_before"
+    assert_eq "no cold row is left without a cluster"      "0"   "$(extract LEFT "$A")"
+    assert_eq "assigning rewrote rows, it did not add any" "7"   "$(extract ROWS "$A")"
+    assert_eq "every row sits in its nearest cluster"      "$(extract ROWS "$A")" "$(extract MATCHES "$A")"
+
+    # Which is the point: with nothing unassigned, a narrow probe stops reading the
+    # whole table.
+    local narrowed
+    narrowed=$(q "$HOST" "SET coldfront.vector_nprobe = 1; $topk LIMIT 100;" | grep -vx SET | grep -c . || true)
+    assert_gt "a narrow probe now reads less than everything" "$narrowed" "$ALL"
+
+    # Idempotent: nothing to do the second time, and no rewrite to pay for.
+    local A2; A2=$(q_may "$HOST" "CALL coldfront.vector_assign('public','chunks','embedding');")
+    assert_contains "a second assign has nothing to do" "already assigned" "$A2"
 
     story_vector_compaction
 }
@@ -953,6 +1019,12 @@ EOSQL
 story_vector_compaction() {
     step "5c. Compaction of a clustered vector table"
     require_compactor || return
+
+    # The answer a probed search gives, captured before the merge so it can be
+    # compared with the answer after it. Sorted and unbounded by the probe, because
+    # what must not change is the set of rows, not their order among equal distances.
+    local probe_q="SELECT body FROM chunks ORDER BY embedding <=> ARRAY[4,5.5,-6]::real[] LIMIT 100"
+    local answer_before; answer_before=$(q "$HOST" "SET coldfront.vector_nprobe = 1; $probe_q;" | grep -vx SET | sort | tr '\n' ' ')
 
     local rows_before; rows_before=$(q "$HOST" "SELECT count(*) FROM chunks;")
     local before; before=$("$COMPACTOR" --config /tmp/journey-chunks.yaml --table chunks --dry-run 2>&1)
@@ -990,9 +1062,10 @@ EOSQL
     assert_eq "the merge applied the deletes it read through" "1" "$(extract ASG_ROWS "$D")"
     assert_eq "the updated row kept its cluster"              "1" "$(extract ASG_VEC "$D")"
 
-    # And the probe still answers the same question against the merged layout.
-    local NEAR; NEAR=$(q "$HOST" "SET coldfront.vector_nprobe = 1; SELECT body FROM chunks ORDER BY embedding <=> ARRAY[4,5.5,-6]::real[] LIMIT 1;" | grep -vx SET)
-    assert_eq "a probed search survives compaction" "coldins" "$NEAR"
+    # A merge rewrites where every row lives, so the one thing it must not change is
+    # which rows a probe finds. Same query, same probe count, same answer.
+    local answer_after; answer_after=$(q "$HOST" "SET coldfront.vector_nprobe = 1; $probe_q;" | grep -vx SET | sort | tr '\n' ' ')
+    assert_eq "a probed search answers the same after compaction" "$answer_before" "$answer_after"
 }
 
 # ───────────────────────────────────────────────────────────────────────────

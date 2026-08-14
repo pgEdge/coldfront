@@ -207,3 +207,46 @@ func TestRewriteSorted_PreservesRowsWithNoSortableOrder(t *testing.T) {
 		}
 	}
 }
+
+func TestRewriteSorted_RowsStayIntact(t *testing.T) {
+	// The sort permutes every column or none: a reorder that moved the sort column
+	// alone would leave each row carrying another row's payload, which no assertion
+	// on the sort column's order can see.
+	ctx, tbl, cat := localTable(t, iceberg.Properties{sortKeyProp: "list"})
+	tbl = appendRun(t, ctx, tbl, []int64{10, 20, 30}, []int32{0, 5, 10})
+	tbl = appendRun(t, ctx, tbl, []int64{40, 50, 60}, []int32{1, 6, 11})
+
+	field, _ := tbl.Schema().FindFieldByName("list")
+	if _, err := rewriteSorted(ctx, tbl, groupsFor(t, ctx, tbl), field, 0); err != nil {
+		t.Fatalf("rewriteSorted: %v", err)
+	}
+	merged, err := cat.LoadTable(ctx, catalog.ToIdentifier("ns", "t"))
+	if err != nil {
+		t.Fatalf("reload: %v", err)
+	}
+	at, err := merged.Scan().ToArrowTable(ctx)
+	if err != nil {
+		t.Fatalf("scan: %v", err)
+	}
+	defer at.Release()
+
+	// id was seeded as list*... no: each id is paired with one list value, so the
+	// pairing is what is asserted, not a formula.
+	want := map[int32]int64{0: 10, 5: 20, 10: 30, 1: 40, 6: 50, 11: 60}
+	ids := at.Column(0).Data()
+	lists := at.Column(1).Data()
+	var n int
+	for c := range ids.Chunks() {
+		idv := ids.Chunk(c).(*array.Int64)
+		lsv := lists.Chunk(c).(*array.Int32)
+		for i := 0; i < idv.Len(); i++ {
+			if got := idv.Value(i); got != want[lsv.Value(i)] {
+				t.Errorf("list %d carries id %d, want %d", lsv.Value(i), got, want[lsv.Value(i)])
+			}
+			n++
+		}
+	}
+	if n != len(want) {
+		t.Fatalf("read %d rows, want %d", n, len(want))
+	}
+}

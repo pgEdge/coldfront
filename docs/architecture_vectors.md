@@ -333,6 +333,64 @@ Two session knobs, both `PGC_USERSET`:
 | `coldfront.vector_probe` | `on` | `off` gives the exact scan a recall measurement compares against |
 | `coldfront.vector_nprobe` | `0` | `0` uses the column's configured `nprobe`; a value at or above `nlist` is exhaustive |
 
+## Assigning what predates training
+
+`CALL coldfront.vector_assign(schema, table, column)` gives a cluster to the cold
+rows that have none, which are exactly those written before the generation existed.
+It is one claimed UPDATE whose SET item is the same generator a cold UPDATE uses
+when a caller changes an embedding, applied to the embedding already stored, so it
+serialises through the bakery like every other cold write and adds no new way to
+compute an assignment.
+
+It refuses without a live generation rather than reporting success. The lookup would
+resolve to NULL for every row, so the table would be rewritten in full and left
+exactly as it was.
+
+Two constraints shape the body, and both bite anything else written here:
+
+- **A DuckDB transaction may write one attached database.** Staging the row count in
+  a `memory.main` table would spend this transaction's one database on `memory` and
+  leave the UPDATE unable to write `ice` at all.
+- **`duckdb.query` needs a constant at plan time, not a literal in the source.**
+  Built through `EXECUTE format(...)` the argument is a constant again, which is how
+  a dynamic table name is read without staging anything. `vector_status` reads its
+  distribution the same way.
+
+What it leaves behind is a merge-on-read delete per rewritten row, and rows in
+update order rather than cluster order. Compaction resolves both. The sequence is
+train, assign, compact.
+
+## Reporting
+
+`CALL coldfront.vector_status([schema, table])` fills a session-lifetime temporary
+table `cf_vector_status`, one row per registered clustered column. A procedure
+writing a table rather than a function returning rows, for the reason
+`vector_train` is one: pg_duckdb refuses to execute a DuckDB query inside a
+function, and a single `INSERT … SELECT` over a DuckDB scan is planned as DuckDB's,
+which cannot write a PostgreSQL table. Session lifetime rather than `ON COMMIT DROP`
+because a bare `CALL` is its own transaction.
+
+Nothing is staged on the way. DuckDB groups the table by cluster and aggregates
+that grouping in one query, so a row of scalars crosses back per table, read through
+the same `EXECUTE format(...)` form `vector_assign` uses. The work list is a pair of
+key arrays walked by index, because a `FOR` over a query would hold a portal open
+for its body and pg_duckdb refuses a DuckDB read while one is. `vector_train`'s
+`memory.main` tables are its algorithm's own state, not a way to move a result
+across, and nothing else here needs one.
+
+The headline is `probe_fraction`: the share of the corpus a probe reads on average,
+which is the cost the layout exists to lower. Everything beside it explains that
+number when it disappoints. `rows_unassigned` is the part no probe can skip, since
+a row with no cluster is read by every one of them. `clusters_below_row_group`
+counts occupied clusters holding fewer rows than a row group, which is the measured
+floor on `nlist`. `advice` names the first condition that holds, or is NULL.
+
+File count, bytes and row-group structure are deliberately absent. Reaching them
+means resolving a table's metadata location, which is a Lakekeeper HTTP call, and
+the SQL layer makes no HTTP calls. The compactor reports files and bytes on every
+pass, and file count is the wrong health signal regardless: a merge bounds it
+without changing what a probe reads.
+
 ## Current gaps
 
 These are properties of the code as it stands, not plans.
@@ -340,12 +398,6 @@ These are properties of the code as it stands, not plans.
 - **`coldfront._tiered_insert_cold` writes unsorted.** Its cursor loop appends in
   cursor order and would need buffering to sort. It is the fallback path for a
   tiered INSERT that omits an IDENTITY column.
-- **There is no operation that establishes clustering on an existing corpus.**
-  Training writes centroids, and writes after it are assigned, but rows written
-  before it stay unassigned until they are rewritten.
-- **There is no `vector_status`.** Rows per cluster against the one-row-group
-  floor, and row groups touched per probe over the clustered ideal, are the
-  signals a retrain decision needs and nothing reports them.
 
 ## Constraints that are correctness
 

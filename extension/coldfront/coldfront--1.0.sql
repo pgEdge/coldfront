@@ -1726,6 +1726,250 @@ BEGIN
 END;
 $$;
 
+-- Give a cluster to the cold rows that have none.
+--
+-- Training writes centroids and every write after it is assigned in the statement
+-- that writes it, so the rows without an assignment are exactly those that predate
+-- the generation. A probe reads all of them whatever clusters it looks in, so on a
+-- corpus tiered before training they are the whole cost of the search.
+--
+-- One claimed UPDATE, and nothing new: the SET item is the same generator a cold
+-- UPDATE uses when a caller changes an embedding, applied to the embedding already
+-- there. Serialised through the bakery like every other cold write, so a concurrent
+-- writer cannot land a row assigned under a different generation partway through.
+--
+-- What it leaves behind is a merge-on-read delete per rewritten row, and rows in
+-- the order the update produced rather than in cluster order. Compaction resolves
+-- both: it applies the deletes and merges the result on the sort key. So the
+-- sequence is train, assign, compact.
+--
+-- Fails rather than no-ops without a live generation. The lookup would resolve to
+-- NULL for every row, leaving the table exactly as it was after a full rewrite, and
+-- a wrong or absent cluster is invisible in a way a probe never reports.
+CREATE PROCEDURE coldfront.vector_assign(
+    p_schema text,
+    p_table  text,
+    p_column text
+)
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_ice  text;
+    v_gen  int;
+    v_item text;
+    v_col  text := quote_ident(coldfront._vec_list_col());
+    v_n    bigint;
+BEGIN
+    PERFORM coldfront._reject_on_standby('assign vector clusters');
+
+    SELECT iceberg_table INTO v_ice
+      FROM coldfront.tiered_views
+     WHERE schema_name = p_schema AND relname = p_table AND vec_column = p_column;
+    IF v_ice IS NULL THEN
+        RAISE EXCEPTION 'coldfront.vector_assign: "%.%"."%" is not a registered clustered column',
+            p_schema, p_table, p_column;
+    END IF;
+
+    SELECT NULLIF(generation, 0) INTO v_gen
+      FROM coldfront.vector_config
+     WHERE schema_name = p_schema AND table_name = p_table AND column_name = p_column;
+    IF v_gen IS NULL THEN
+        RAISE EXCEPTION 'coldfront.vector_assign: "%.%"."%" has no trained generation',
+            p_schema, p_table, p_column
+            USING HINT = 'CALL coldfront.vector_train(...) first: without centroids '
+                         'every row would be assigned NULL, which is what it already is.';
+    END IF;
+
+    v_item := coldfront._vec_list_set_item(v_ice, quote_ident(p_column));
+
+    SET LOCAL duckdb.unsafe_allow_mixed_transactions = on;
+    PERFORM coldfront.ensure_attached();
+
+    -- Counted before the write, so the notice reports what this call did rather than
+    -- what the table looks like afterwards.
+    --
+    -- Through EXECUTE, which is what makes a dynamic table name work here: a bare
+    -- duckdb.query(format(...)) is not a constant at plan time and is refused, while
+    -- staging the count in a memory.main table the way vector_train stages its
+    -- centroids would spend this transaction's one database on memory and leave the
+    -- UPDATE below unable to write ice at all ("a single transaction can only modify
+    -- one database"). Built as dynamic SQL, the argument is a literal again.
+    EXECUTE format('SELECT t.r[%L]::bigint FROM duckdb.query(%L) AS t(r)', 'n',
+                   format('SELECT count(*) AS n FROM %s WHERE %s IS NULL', v_ice, v_col))
+      INTO v_n;
+
+    IF COALESCE(v_n, 0) = 0 THEN
+        RAISE NOTICE 'coldfront: every cold row of "%.%"."%" is already assigned',
+            p_schema, p_table, p_column;
+        RETURN;
+    END IF;
+
+    PERFORM coldfront._exec_iceberg_with_claim(v_ice, format(
+        'UPDATE %s SET %s WHERE %s IS NULL', v_ice, v_item, v_col));
+
+    RAISE NOTICE 'coldfront: assigned % cold row(s) of "%.%"."%" to generation %; '
+                 'compact the table to apply the deletes and restore cluster order',
+        v_n, p_schema, p_table, p_column, v_gen;
+END;
+$$;
+
+-- What a decision about a clustered column needs, and nothing else available.
+--
+-- The headline is probe_fraction: the share of the corpus a probe reads on
+-- average, which is the cost the whole layout exists to lower. Everything beside
+-- it is there to explain that number when it is disappointing. rows_unassigned is
+-- the part no probe can skip, because a row with no cluster is read by every one
+-- of them. clusters_below_row_group counts occupied clusters holding fewer rows
+-- than a row group: past that point extra clusters cut the rows scored without
+-- cutting the rows read, which is the measured floor on nlist and the reason it is
+-- a floor rather than a formula.
+--
+-- Deliberately absent: file count, bytes, and row-group structure. Reaching those
+-- means resolving a table's metadata location, which is a Lakekeeper HTTP call,
+-- and the SQL layer does not make HTTP calls. The compactor already reports files
+-- and bytes on every pass, and file count is the wrong health signal anyway: a
+-- merge bounds it without changing what a probe reads.
+--
+-- A PROCEDURE writing a temporary table, for the same reason vector_train is one:
+-- pg_duckdb refuses to execute a DuckDB query inside a function, and a single
+-- INSERT ... SELECT over a DuckDB scan is planned as DuckDB's, which cannot write
+-- a PostgreSQL table. Nothing is staged on the way, though: DuckDB aggregates the
+-- distribution and hands back one row (see the EXECUTE below).
+CREATE PROCEDURE coldfront.vector_status(
+    p_schema text DEFAULT NULL,
+    p_table  text DEFAULT NULL
+)
+LANGUAGE plpgsql AS $$
+DECLARE
+    vt        record;
+    v_schemas text[];
+    v_names   text[];
+    v_rows    bigint;
+    v_unasg   bigint;
+    v_occ     int;
+    v_min     bigint;
+    v_max     bigint;
+    v_floor   int;
+    v_trained int;
+    v_added   int;
+    v_i       int;
+BEGIN
+    -- Dropped by name only when it is there. IF EXISTS would do the same and add a
+    -- NOTICE to every caller's output for the ordinary case of a first call.
+    IF to_regclass('pg_temp.cf_vector_status') IS NOT NULL THEN
+        DROP TABLE cf_vector_status;
+    END IF;
+    CREATE TEMP TABLE cf_vector_status (
+        schema_name          text,
+        table_name           text,
+        column_name          text,
+        generation           int,
+        nlist                int,
+        nprobe               int,
+        clusters_trained     int,
+        clusters_occupied    int,
+        additions            int,
+        addition_cap         int,
+        rows_total           bigint,
+        rows_unassigned      bigint,
+        rows_per_cluster_min bigint,
+        rows_per_cluster_max bigint,
+        clusters_below_row_group int,
+        probe_fraction       numeric,
+        advice               text
+    );
+    -- Session lifetime, not ON COMMIT DROP: a bare CALL is its own transaction, so
+    -- a table dropped at commit would be gone before the caller could select from
+    -- it. Re-running the procedure replaces it.
+
+    SET LOCAL duckdb.unsafe_allow_mixed_transactions = on;
+    PERFORM coldfront.ensure_attached();
+
+    -- The work list is a pair of key arrays walked by index, not a query the loop
+    -- iterates: a plpgsql FOR over a query holds a portal open for its body, and
+    -- pg_duckdb refuses a DuckDB read while one is ("DuckDB execution is not
+    -- supported inside functions"). An integer loop opens none.
+    SELECT array_agg(tv.schema_name ORDER BY tv.schema_name, tv.relname),
+           array_agg(tv.relname     ORDER BY tv.schema_name, tv.relname)
+      INTO v_schemas, v_names
+      FROM coldfront.tiered_views tv
+     WHERE tv.vec_column IS NOT NULL
+       AND (p_schema IS NULL OR tv.schema_name = p_schema)
+       AND (p_table  IS NULL OR tv.relname     = p_table);
+
+    FOR v_i IN 1 .. COALESCE(array_length(v_schemas, 1), 0) LOOP
+        SELECT tv.schema_name, tv.relname, tv.vec_column, tv.iceberg_table,
+               vc.nlist, vc.nprobe, NULLIF(vc.generation, 0) AS generation,
+               vc.addition_cap
+          INTO vt
+          FROM coldfront.tiered_views tv
+          LEFT JOIN coldfront.vector_config vc
+                 ON vc.schema_name = tv.schema_name
+                AND vc.table_name  = tv.relname
+                AND vc.column_name = tv.vec_column
+         WHERE tv.schema_name = v_schemas[v_i] AND tv.relname = v_names[v_i];
+
+        -- One pass over the cold table: DuckDB groups by cluster and aggregates the
+        -- grouping, so what crosses back is a single row of scalars.
+        --
+        -- Through EXECUTE because the table name is dynamic and duckdb.query needs a
+        -- constant at plan time, not a literal in the source. Staging the grouping in
+        -- a memory.main table the way vector_train stages its centroids would work
+        -- here too, but it is a table to name, drop and read back for a result that
+        -- fits in one row, and on any path that also writes Iceberg it would spend
+        -- the transaction's one writable database (see vector_assign).
+        EXECUTE format(
+            'SELECT t.r[%L]::bigint, t.r[%L]::bigint, t.r[%L]::int, '
+                   't.r[%L]::bigint, t.r[%L]::bigint, t.r[%L]::int '
+              'FROM duckdb.query(%L) AS t(r)',
+            'rows_total', 'rows_unasg', 'occupied', 'min_n', 'max_n', 'below',
+            format(
+                'WITH d AS (SELECT %I AS cl, count(*) AS n FROM %s GROUP BY 1) '
+                'SELECT coalesce(sum(n), 0) AS rows_total, '
+                       'coalesce(sum(n) FILTER (WHERE cl IS NULL), 0) AS rows_unasg, '
+                       'count(*) FILTER (WHERE cl IS NOT NULL) AS occupied, '
+                       'min(n) FILTER (WHERE cl IS NOT NULL) AS min_n, '
+                       'max(n) FILTER (WHERE cl IS NOT NULL) AS max_n, '
+                       'count(*) FILTER (WHERE cl IS NOT NULL AND n < 2048) AS below '
+                  'FROM d',
+                coldfront._vec_list_col(), vt.iceberg_table))
+          INTO v_rows, v_unasg, v_occ, v_min, v_max, v_floor;
+
+        SELECT count(*), count(*) FILTER (WHERE parent_id IS NOT NULL)
+          INTO v_trained, v_added
+          FROM coldfront.vector_centroids c
+         WHERE c.schema_name = vt.schema_name AND c.table_name = vt.relname
+           AND c.column_name = vt.vec_column AND c.generation = vt.generation;
+
+        INSERT INTO cf_vector_status VALUES (
+            vt.schema_name, vt.relname, vt.vec_column,
+            vt.generation, vt.nlist, vt.nprobe,
+            v_trained, v_occ, v_added, vt.addition_cap,
+            v_rows, v_unasg, v_min, v_max, v_floor,
+            -- What a probe reads on average: its share of the occupied clusters,
+            -- plus every unassigned row, which it always reads.
+            CASE WHEN v_rows = 0 THEN NULL
+                 ELSE round(LEAST(1.0, (
+                     COALESCE(LEAST(vt.nprobe, v_occ)::numeric / NULLIF(v_occ, 0), 1)
+                       * (v_rows - v_unasg) + v_unasg) / v_rows), 4)
+            END,
+            CASE
+                WHEN vt.generation IS NULL THEN
+                    'no trained generation: every row is unassigned and every probe reads the whole table'
+                WHEN v_rows > 0 AND v_unasg::numeric / v_rows > 0.5 THEN
+                    'over half the rows predate training, and a probe reads all of them'
+                WHEN v_occ > 0 AND v_floor::numeric / v_occ > 0.5 THEN
+                    'over half the occupied clusters hold less than one row group: retrain with a smaller nlist'
+                WHEN v_min IS NOT NULL AND v_max > v_min * 10 THEN
+                    'clusters are lopsided by more than 10x, so probe cost varies by as much: retrain'
+            END);
+    END LOOP;
+
+    IF NOT EXISTS (SELECT 1 FROM cf_vector_status) THEN
+        RAISE NOTICE 'coldfront: no registered table has a clustered vector column';
+    END IF;
+END;
+$$;
+
 -- Routing state replicates cluster-wide, for the reason the assignment itself
 -- exists: every node has to resolve a vector to the same cluster id, or a row
 -- written on one node is invisible to a probe issued on another. Gated on spock
