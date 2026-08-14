@@ -936,6 +936,63 @@ EOSQL
     DALL=$(q  "$HOST" "SET coldfront.vector_nprobe = 2; $dtopk LIMIT 100;" | grep -vx SET | grep -c . || true)
     assert_eq "a decoupled probe reads one cluster and the unassigned" "1" "$DONE_"
     assert_eq "an exhaustive decoupled probe reads everything"         "2" "$DALL"
+
+    story_vector_compaction
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story 5c — Compaction on a clustered table. Each cold write leaves a file
+# sorted within itself, so what accumulates is a set of files with overlapping
+# cluster ranges, and the rewrite has to merge them on the sort column rather
+# than append them. That the merge orders rows is asserted exactly in
+# cmd/compactor's unit tests, which read back through iceberg-go; what only a
+# real deployment can show is that the pass runs against a live catalog with the
+# claim held, keeps every row, converges, and leaves a probe answering the same
+# question.
+# ───────────────────────────────────────────────────────────────────────────
+story_vector_compaction() {
+    step "5c. Compaction of a clustered vector table"
+    require_compactor || return
+
+    local rows_before; rows_before=$(q "$HOST" "SELECT count(*) FROM chunks;")
+    local before; before=$("$COMPACTOR" --config /tmp/journey-chunks.yaml --table chunks --dry-run 2>&1)
+    if echo "$before" | grep -q "group(s)"; then
+        pass "a clustered table with small files reports work to do"
+    else
+        fail "nothing to compact on the clustered table: $before"; return
+    fi
+
+    if "$COMPACTOR" --config /tmp/journey-chunks.yaml --table chunks >/tmp/journey-compact-vec.log 2>&1; then
+        pass "the sort-key merge committed against a live catalog"
+    else
+        fail "compaction of chunks failed — see /tmp/journey-compact-vec.log"
+        tail -8 /tmp/journey-compact-vec.log; return
+    fi
+    assert_eq "the merge preserved every row" "$rows_before" "$(q "$HOST" "SELECT count(*) FROM chunks;")"
+
+    # A merge that did not converge would rewrite the same table forever.
+    local again; again=$("$COMPACTOR" --config /tmp/journey-chunks.yaml --table chunks --dry-run 2>&1)
+    if echo "$again" | grep -q "nothing to compact"; then
+        pass "a second pass over the merged table is a no-op"
+    else
+        fail "clustered table still reports work after compaction: $again"
+    fi
+
+    # The rows the cold UPDATE had marked deleted must not come back: the merge
+    # reads through the scan, which applies the position deletes it found.
+    local D; D=$(qf "$HOST" <<'EOSQL'
+SELECT coldfront.ensure_attached();
+SELECT 'ASG_ROWS:' || count(*) FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] = 'asg_trig';
+SELECT 'ASG_VEC:' || count(*) FROM iceberg_scan('ice.public.chunks') r
+ WHERE r['body'] = 'asg_trig' AND r['_cf_vec_list'] IS NOT NULL;
+EOSQL
+)
+    assert_eq "the merge applied the deletes it read through" "1" "$(extract ASG_ROWS "$D")"
+    assert_eq "the updated row kept its cluster"              "1" "$(extract ASG_VEC "$D")"
+
+    # And the probe still answers the same question against the merged layout.
+    local NEAR; NEAR=$(q "$HOST" "SET coldfront.vector_nprobe = 1; SELECT body FROM chunks ORDER BY embedding <=> ARRAY[4,5.5,-6]::real[] LIMIT 1;" | grep -vx SET)
+    assert_eq "a probed search survives compaction" "coldins" "$NEAR"
 }
 
 # ───────────────────────────────────────────────────────────────────────────

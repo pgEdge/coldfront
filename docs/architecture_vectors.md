@@ -247,6 +247,28 @@ so each new file is internally sorted and its own row groups prune. No existing
 file is touched: sorted regions accumulate, and a probe reads the matching row
 group in each of them.
 
+**Compaction merges those regions rather than appending them.** A table carrying
+`coldfront.sort-key` is rewritten group by group through `rewriteSorted`
+(`cmd/compactor/compact.go`), which reads the group with `Scan.ReadTasks`, sorts
+it on the sort column, and writes it back with `WriteRecords`. Appending the files
+in key order, which is what the compactor did while the only clustered files came
+from a single sorted pass, preserves order only while their ranges are disjoint,
+and an incremental write's file spans the whole of cluster space by construction.
+What that would cost is a run count: a probe reads at least one row group per
+sorted run, so bounding file count without merging the runs bounds the wrong
+thing.
+
+The two halves are iceberg-go's own, which is what makes the merge safe rather
+than merely correct on a good day. Reading through the scan applies the position
+deletes a cold UPDATE or DELETE left behind; writing through `WriteRecords`
+produces files with field ids, column statistics and the table's row-group limit.
+Touching the Parquet directly would have none of that, and would reinstate every
+deleted row. Nulls sort last, so rows another engine appended without an
+assignment stay contiguous instead of appearing in every row group.
+
+Each group is bin-packed to the file-size target, so a merge holds one group in
+memory rather than one table.
+
 ## Reading: the probe
 
 `cf_maybe_inject_probe` runs on the read path, alongside the hot-tier reroute and
@@ -315,12 +337,6 @@ Two session knobs, both `PGC_USERSET`:
 
 These are properties of the code as it stands, not plans.
 
-- **Compaction degrades a clustered layout.** The compactor concatenates files
-  ordered by their lower bound, which preserves order only when the input ranges
-  do not overlap. Two internally sorted files of mixed clusters always overlap,
-  so folding them produces row groups that straddle cluster junctions. A
-  clustered table's layout holds until its first compaction. Closing this needs a
-  sort-merge on the sort column, whose inputs are each already sorted.
 - **`coldfront._tiered_insert_cold` writes unsorted.** Its cursor loop appends in
   cursor order and would need buffering to sort. It is the fallback path for a
   tiered INSERT that omits an IDENTITY column.

@@ -177,7 +177,7 @@ func doCompaction(ctx context.Context, cat *rest.Catalog, ns, tableName string, 
 	var res *table.RewriteResult
 	if err := claim(func() error {
 		var rerr error
-		res, rerr = rewrite(ctx, tbl, plan.groups, o.targetSize, plan.sorted)
+		res, rerr = rewrite(ctx, tbl, plan, o.targetSize)
 		return rerr
 	}); err != nil {
 		return err

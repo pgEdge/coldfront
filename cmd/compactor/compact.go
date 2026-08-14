@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"sort"
+	"iter"
 	"strings"
 
+	"github.com/apache/arrow-go/v18/arrow"
+	"github.com/apache/arrow-go/v18/arrow/array"
+	"github.com/apache/arrow-go/v18/arrow/compute"
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
 	"github.com/apache/iceberg-go/catalog/rest"
@@ -111,24 +114,21 @@ func excludeFromSigning(headers ...string) func(*middleware.Stack) error {
 type planResult struct {
 	groups  []table.CompactionTaskGroup
 	plan    compaction.Plan
-	sorted  bool   // tasks are in sort-key order; the rewrite must read serially
-	skipped string // non-empty: why the rewrite must leave this table alone
+	sorted  bool                // the table declares a sort key: merge, do not concatenate
+	sortKey iceberg.NestedField // the column to merge on, when sorted
+	skipped string              // non-empty: why the rewrite must leave this table alone
 }
 
-// sortKeyProp names the column a table's data files are already ordered by, so a
-// rewrite can concatenate them in that order. Set it on tables whose query speed
-// depends on row-group pruning; a table without it is rewritten with no ordering
-// step and no serial-read constraint.
+// sortKeyProp names the column a table's data files are ordered by. Set it on
+// tables whose query speed depends on row-group pruning; a table without it is
+// rewritten as it arrives, with no ordering step.
 //
-// Without it, iceberg-go's rewrite reads a group's files concurrently and writes
-// the stream as it arrives, so the files land in arbitrary order and one output
-// row group per junction spans both sides of it. Ordering the files and reading
-// them one at a time keeps every junction between adjacent key values, which is
-// what leaves the row-group statistics useful. Row group *size* is a separate
-// property: iceberg-go cuts groups only by write.parquet.row-group-limit (a row
-// count, default 1,048,576) and never reads
-// write.parquet.row-group-size-bytes, so a table that wants small groups sets
-// the row-count property too.
+// With it, a rewrite merges each group on that column rather than appending its
+// files, so every output row group spans adjacent key values and its statistics
+// stay useful. Row group *size* is a separate property: iceberg-go cuts groups
+// only by write.parquet.row-group-limit (a row count, default 1,048,576) and
+// never reads write.parquet.row-group-size-bytes, so a table that wants small
+// groups sets the row-count property too.
 const sortKeyProp = "coldfront.sort-key"
 
 // sortField returns the schema field named by sortKeyProp. The bool is false when
@@ -150,81 +150,6 @@ func sortField(props iceberg.Properties, sc *iceberg.Schema) (iceberg.NestedFiel
 			"%s names column %q, which the table schema does not have", sortKeyProp, name)
 	}
 	return field, true, nil
-}
-
-// orderTasksBySortKey sorts tasks in place by each file's lower bound on field,
-// so the rewrite concatenates them in key order.
-//
-// Any file whose bound is missing or unorderable fails the whole group: a
-// best-effort sort would put that file somewhere arbitrary, which is the exact
-// scrambling this exists to prevent.
-func orderTasksBySortKey(tasks []table.FileScanTask, field iceberg.NestedField) error {
-	// Decode every bound up front, because sort's comparator cannot report an
-	// error and one that silently answered "not less" would leave the group in
-	// an order nobody chose.
-	keyed := make([]orderedTask, len(tasks))
-	for i, t := range tasks {
-		raw, ok := t.File.LowerBoundValues()[field.ID]
-		if !ok {
-			return fmt.Errorf("file %s has no lower bound for sort column %q",
-				t.File.FilePath(), field.Name)
-		}
-		bound, err := iceberg.LiteralFromBytes(field.Type, raw)
-		if err != nil {
-			return fmt.Errorf("decode lower bound of %q in %s: %w",
-				field.Name, t.File.FilePath(), err)
-		}
-		if _, ok := lessLiteral(bound, bound); !ok {
-			return fmt.Errorf("cannot order sort column %q of type %s", field.Name, field.Type)
-		}
-		keyed[i] = orderedTask{bound: bound, task: t}
-	}
-	sort.SliceStable(keyed, func(i, j int) bool {
-		less, _ := lessLiteral(keyed[i].bound, keyed[j].bound)
-		return less
-	})
-	for i, k := range keyed {
-		tasks[i] = k.task
-	}
-	return nil
-}
-
-// orderedTask pairs a task with the decoded lower bound that positions it.
-type orderedTask struct {
-	bound iceberg.Literal
-	task  table.FileScanTask
-}
-
-// lessLiteral orders two lower bounds of the same Iceberg type. The second return
-// is false for a pair this cannot order, so the caller declines the rewrite
-// rather than guessing.
-//
-// Every type here is physically an integer or a string, which covers the keys a
-// table is sorted by: a cluster id, a primary key, a timestamp, a date, a label.
-// Floating-point keys are deliberately absent: nothing ColdFront sorts by is a
-// float, and NaN has no total order.
-func lessLiteral(a, b iceberg.Literal) (bool, bool) {
-	switch av := a.Any().(type) {
-	case int32:
-		bv, ok := b.Any().(int32)
-		return ok && av < bv, ok
-	case int64:
-		bv, ok := b.Any().(int64)
-		return ok && av < bv, ok
-	case iceberg.Date:
-		bv, ok := b.Any().(iceberg.Date)
-		return ok && av < bv, ok
-	case iceberg.Time:
-		bv, ok := b.Any().(iceberg.Time)
-		return ok && av < bv, ok
-	case iceberg.Timestamp:
-		bv, ok := b.Any().(iceberg.Timestamp)
-		return ok && av < bv, ok
-	case string:
-		bv, ok := b.Any().(string)
-		return ok && av < bv, ok
-	}
-	return false, false
 }
 
 // loadTableErr turns a LoadTable failure into the message the operator sees.
@@ -272,18 +197,13 @@ func planCompaction(ctx context.Context, cat *rest.Catalog, ns, name string, tar
 
 	groups := make([]table.CompactionTaskGroup, len(plan.Groups))
 	for i, g := range plan.Groups {
-		if sorted {
-			if err := orderTasksBySortKey(g.Tasks, sortKey); err != nil {
-				return tbl, &planResult{skipped: err.Error()}, nil
-			}
-		}
 		groups[i] = table.CompactionTaskGroup{
 			PartitionKey:   g.PartitionKey,
 			Tasks:          g.Tasks,
 			TotalSizeBytes: g.TotalSizeBytes,
 		}
 	}
-	return tbl, &planResult{groups: groups, plan: plan, sorted: sorted}, nil
+	return tbl, &planResult{groups: groups, plan: plan, sorted: sorted, sortKey: sortKey}, nil
 }
 
 // rewrite executes the planned compaction as a single atomic rewrite snapshot
@@ -295,19 +215,16 @@ func planCompaction(ctx context.Context, cat *rest.Catalog, ns, name string, tar
 // iceberg-go has no bakery-aware re-stamp patch, the claim is held across the
 // WHOLE read->rewrite->commit so the CAS parent is captured under the claim —
 // the stock-ordering discipline proved safe in docs/formal (Bakery_v2.cfg).
-func rewrite(ctx context.Context, tbl *table.Table, groups []table.CompactionTaskGroup, targetSize int64, sorted bool) (*table.RewriteResult, error) {
+func rewrite(ctx context.Context, tbl *table.Table, p *planResult, targetSize int64) (*table.RewriteResult, error) {
+	if p.sorted {
+		return rewriteSorted(ctx, tbl, p.groups, p.sortKey, targetSize)
+	}
 	txn := tbl.NewTransaction()
 	opts := table.RewriteDataFilesOptions{}
 	if targetSize > 0 {
 		opts.GroupOptions = []table.CompactionGroupOption{table.WithCompactionTargetFileSize(targetSize)}
 	}
-	if sorted {
-		// One reader, so the ordered files concatenate in that order. With more
-		// than one, workers race and the output interleaves them, which is what
-		// scrambles the sort order the tasks were just put into.
-		opts.GroupOptions = append(opts.GroupOptions, table.WithCompactionScanConcurrency(1))
-	}
-	res, err := txn.RewriteDataFiles(ctx, groups, opts)
+	res, err := txn.RewriteDataFiles(ctx, p.groups, opts)
 	if err != nil {
 		return nil, fmt.Errorf("rewrite data files: %w", err)
 	}
@@ -315,4 +232,166 @@ func rewrite(ctx context.Context, tbl *table.Table, groups []table.CompactionTas
 		return nil, fmt.Errorf("commit rewrite: %w", err)
 	}
 	return res, nil
+}
+
+// rewriteSorted compacts a sorted table by merging each group on its sort column
+// instead of concatenating it, and stages every group on one rewrite snapshot.
+//
+// Concatenation preserves order only while a group's input ranges are disjoint,
+// which is true of a table built by one sorted pass and false as soon as writes
+// land clustered: a batch cold write orders its own rows, so each new file spans
+// the whole of key space and appending two of them interleaves two sorted runs.
+// The cost of that is a run count, and a probe reads at least one row group per
+// run, so bounding file count without merging the runs bounds the wrong thing.
+//
+// This drives the same two halves iceberg-go's own group executor drives, with a
+// sort between them, which is the seam its documentation points distributed
+// coordinators at. Reading through Scan.ReadTasks applies the position deletes a
+// cold UPDATE or DELETE left behind, and writing through WriteRecords produces
+// files with field ids, statistics and the table's row-group limit. Neither is
+// true of touching the Parquet directly.
+func rewriteSorted(ctx context.Context, tbl *table.Table, groups []table.CompactionTaskGroup,
+	field iceberg.NestedField, targetSize int64) (*table.RewriteResult, error) {
+	txn := tbl.NewTransaction()
+	rw := txn.NewRewrite(nil)
+	res := &table.RewriteResult{}
+
+	for _, g := range groups {
+		gr, err := mergeGroup(ctx, tbl, g, field, targetSize)
+		if err != nil {
+			return nil, err
+		}
+		rw.ApplyResult(gr)
+		res.RewrittenGroups++
+		res.AddedDataFiles += len(gr.NewDataFiles)
+		res.RemovedDataFiles += len(gr.OldDataFiles)
+		res.RemovedPositionDeleteFiles += len(gr.SafePosDeletes)
+		res.BytesBefore += gr.BytesBefore
+		res.BytesAfter += gr.BytesAfter
+	}
+
+	if err := rw.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("stage sorted rewrite: %w", err)
+	}
+	if _, err := txn.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("commit rewrite: %w", err)
+	}
+	return res, nil
+}
+
+// mergeGroup reads one group with its deletes applied, sorts it by field, and
+// writes the result back as new data files.
+//
+// A group is bin-packed to the file-size target, so holding one is bounded by
+// that target rather than by the table. Nulls sort last and therefore land
+// together: a row another engine appended carries no assignment, and keeping
+// those rows contiguous is what lets a probe read them in proportion to their own
+// size instead of scattering them through every row group.
+func mergeGroup(ctx context.Context, tbl *table.Table, group table.CompactionTaskGroup,
+	field iceberg.NestedField, targetSize int64) (table.CompactionGroupResult, error) {
+	var zero table.CompactionGroupResult
+
+	if len(group.Tasks) == 0 {
+		return table.CompactionGroupResult{PartitionKey: group.PartitionKey}, nil
+	}
+
+	// One reader: the sort below decides the order, so a concurrent read would
+	// only shuffle its input to no effect.
+	schema, records, err := tbl.Scan(table.WitMaxConcurrency(1)).ReadTasks(ctx, group.Tasks)
+	if err != nil {
+		return zero, fmt.Errorf("read group %q: %w", group.PartitionKey, err)
+	}
+
+	var batches []arrow.RecordBatch
+	defer func() {
+		for _, b := range batches {
+			b.Release()
+		}
+	}()
+	for rec, err := range records {
+		if err != nil {
+			return zero, fmt.Errorf("read group %q: %w", group.PartitionKey, err)
+		}
+		rec.Retain()
+		batches = append(batches, rec)
+	}
+	if len(batches) == 0 {
+		return table.CompactionGroupResult{PartitionKey: group.PartitionKey}, nil
+	}
+
+	idx, ok := schema.FieldIndices(field.Name), true
+	if len(idx) != 1 {
+		ok = false
+	}
+	if !ok {
+		return zero, fmt.Errorf("sort column %q is not a single column of the read schema", field.Name)
+	}
+
+	unsorted := array.NewTableFromRecords(schema, batches)
+	defer unsorted.Release()
+
+	order, err := compute.SortIndicesTable(ctx, unsorted, []compute.SortKey{{
+		ColumnIndex:   idx[0],
+		Order:         compute.SortOrderAscending,
+		NullPlacement: compute.SortNullsAtEnd,
+	}})
+	if err != nil {
+		return zero, fmt.Errorf("sort group %q by %q: %w", group.PartitionKey, field.Name, err)
+	}
+	defer order.Release()
+
+	taken, err := compute.Take(ctx, *compute.DefaultTakeOptions(),
+		compute.NewDatumWithoutOwning(unsorted), compute.NewDatumWithoutOwning(order))
+	if err != nil {
+		return zero, fmt.Errorf("reorder group %q: %w", group.PartitionKey, err)
+	}
+	defer taken.Release()
+	sorted := taken.(*compute.TableDatum).Value
+
+	writeOpts := []table.WriteRecordOption{table.WithClusteredWrite()}
+	if targetSize > 0 {
+		writeOpts = append(writeOpts, table.WithTargetFileSize(targetSize))
+	}
+
+	rdr := array.NewTableReader(sorted, 0)
+	defer rdr.Release()
+
+	var (
+		newFiles   []iceberg.DataFile
+		bytesAfter int64
+	)
+	for df, err := range table.WriteRecords(ctx, tbl, schema, recordSeq(rdr), writeOpts...) {
+		if err != nil {
+			return zero, fmt.Errorf("write merged files for group %q: %w", group.PartitionKey, err)
+		}
+		newFiles = append(newFiles, df)
+		bytesAfter += df.FileSizeBytes()
+	}
+
+	oldFiles := make([]iceberg.DataFile, 0, len(group.Tasks))
+	for _, t := range group.Tasks {
+		oldFiles = append(oldFiles, t.File)
+	}
+	return table.CompactionGroupResult{
+		PartitionKey:   group.PartitionKey,
+		OldDataFiles:   oldFiles,
+		NewDataFiles:   newFiles,
+		SafePosDeletes: table.CollectSafePositionDeletes(group.Tasks),
+		BytesBefore:    group.TotalSizeBytes,
+		BytesAfter:     bytesAfter,
+	}, nil
+}
+
+// recordSeq adapts an Arrow table reader to the iterator WriteRecords consumes.
+func recordSeq(rdr array.RecordReader) iter.Seq2[arrow.RecordBatch, error] {
+	return func(yield func(arrow.RecordBatch, error) bool) {
+		for rdr.Next() {
+			if !yield(rdr.RecordBatch(), nil) {
+				return
+			}
+		}
+		if err := rdr.Err(); err != nil {
+			yield(nil, err)
+		}
+	}
 }

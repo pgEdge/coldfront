@@ -168,9 +168,13 @@ not exist` rather than writing an unassigned row.
 
 Compaction stays mandatory on these tables, as it is on any ColdFront table:
 every small write makes a file and query cost grows with file count. Run the
-compactor as you already do. Note that compacting a clustered table currently
-reorders its rows, so its layout advantage is lost until the table is clustered
-again; if you rely on clustering, hold off on compacting that table.
+compactor as you already do.
+
+On a clustered table it does more than consolidate. Each write leaves a file
+sorted within itself, and a search has to look in every one of them; compaction
+merges those into one ordered run, which is what keeps the number of places a
+search looks from growing with the table. Nothing to configure: the table records
+its own sort column at creation and the compactor reads it.
 
 ## Limits worth knowing
 
