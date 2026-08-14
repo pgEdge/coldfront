@@ -103,8 +103,8 @@ physical row order, and pruning depends on a cluster's rows being adjacent so th
 reader can skip row groups on their statistics. Ordering by a second cluster column
 after the first would scatter its values inside every band of the first, leaving its
 statistics bounding the whole file. So a later column's probe filters the rows
-scored and prunes nothing read, and since S0 measured ~95% of query cost as column
-read and decode, that is worth single-digit percent rather than a multiple.
+scored and prunes nothing read. Column read and decode is ~95% of query cost, so that
+is worth single-digit percent rather than a multiple.
 `cf_vector_status.prunes` reports which column is which.
 
 The read path needs no registry lookup to pick between them: it takes the column
@@ -234,6 +234,22 @@ DuckDB's, so the read and the write are separate statements.
 Empty clusters do not come back from the mean, so the stored count can be below
 `nlist`; the actual count is recorded rather than padded. A `vector_config` row
 must exist first, since it holds the generation pointer the procedure writes.
+
+Seeds come from k-means++: one sample row at random, then each next drawn with
+probability proportional to its squared distance from the nearest seed already
+chosen, by an exponential race (the minimum of `-ln(u)/w` is a weighted draw, in one
+pass and with no cumulative sum). The running distance folds in only the seed just
+added, keyed on an insertion sequence rather than a row id, so a round is one pass
+over the sample.
+
+Seeding costs about 46 ms per seed on a 20,000-row sample, so `nlist` 1000 adds
+roughly 45 seconds and `nlist` 10,000 about eight minutes, on top of Lloyd's
+iterations. Training is a one-time operation and nothing a query pays.
+
+What the spread start defends against is seeds clumping in a dense region, which
+Lloyd cannot repair because it only moves centroids locally. That matters most at the
+lower dimensionalities many embedding models produce; above about 1000 dimensions
+distances concentrate and the starting spread makes little difference either way.
 
 ## Layout
 

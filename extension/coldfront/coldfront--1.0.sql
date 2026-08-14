@@ -1680,11 +1680,46 @@ BEGIN
             p_schema, p_table, p_column;
     END IF;
 
-    PERFORM duckdb.raw_query(format(
+    -- k-means++ seeding: one seed at random, then each next drawn with probability
+    -- proportional to its squared distance from the nearest seed already chosen, so
+    -- the seeds spread out instead of clumping. Lloyd's iterations below only move
+    -- centroids locally, so they cannot repair a clumped start.
+    --
+    -- It matters most where dense clumps exist, which is the lower dimensionalities
+    -- many embedding models produce; at 1024 dimensions distances concentrate and the
+    -- spread start makes little difference. Seeding is a one-time training cost and
+    -- nothing a query pays.
+    --
+    -- The draw is an exponential race: for weights w, the minimum of -ln(u)/w is
+    -- distributed exactly as a weighted draw, in one pass and with no cumulative sum.
+    -- d is maintained incrementally, folding in only the seed just added, so a round
+    -- is one pass over the sample rather than one per seed chosen so far.
+    PERFORM duckdb.raw_query(
+        'CREATE OR REPLACE TABLE memory.main.cf_seed AS '
+        'SELECT 1 AS seq, id, v FROM memory.main.cf_samp '
+        'USING SAMPLE reservoir(1 ROWS) REPEATABLE (7)');
+    PERFORM duckdb.raw_query(
+        'CREATE OR REPLACE TABLE memory.main.cf_seed_d AS '
+        'SELECT s.id, s.v, '
+               '(SELECT min(list_cosine_distance(s.v, p.v)) FROM memory.main.cf_seed p) AS d '
+          'FROM memory.main.cf_samp s');
+    FOR i IN 2 .. v_nlist LOOP
+        -- A sample smaller than nlist, or one whose remaining rows all duplicate a
+        -- seed, leaves d = 0 everywhere and the draw returns nothing. The centroid
+        -- count recorded below is whatever came back, so that resolves itself.
+        PERFORM duckdb.raw_query(format(
+            'INSERT INTO memory.main.cf_seed '
+            'SELECT %s, id, v FROM memory.main.cf_seed_d '
+            'WHERE d > 0 ORDER BY -ln(random()) / (d * d) LIMIT 1', i));
+        -- Keyed on seq, because a sample id says nothing about insertion order.
+        PERFORM duckdb.raw_query(format(
+            'UPDATE memory.main.cf_seed_d SET d = least(d, '
+                'list_cosine_distance(v, (SELECT p.v FROM memory.main.cf_seed p '
+                                         'WHERE p.seq = %s)))', i));
+    END LOOP;
+    PERFORM duckdb.raw_query(
         'CREATE OR REPLACE TABLE memory.main.cf_cent AS '
-        'SELECT row_number() OVER () AS cid, v FROM '
-        '(SELECT v FROM memory.main.cf_samp USING SAMPLE reservoir(%s ROWS) REPEATABLE (7))',
-        v_nlist));
+        'SELECT row_number() OVER (ORDER BY seq) AS cid, v FROM memory.main.cf_seed');
 
     -- Assign, then recompute each cluster's mean. The mean unnests the vector
     -- against a matching range so the two lists advance together: DuckDB has no
@@ -1983,10 +2018,10 @@ BEGIN
                     'over half the rows predate training, and a probe reads all of them'
                 WHEN v_occ > 0 AND v_floor::numeric / v_occ > 0.5 THEN
                     'over half the occupied clusters hold less than one row group: retrain with a smaller nlist'
-                -- Against the median, not the minimum: measured on a real 10M
-                -- corpus, max/min was 491 while p99/p50 was 2.6, because one tiny
-                -- cluster sets max/min and a real corpus has one. A rule on max/min
-                -- therefore fires on every table.
+                -- Against the median, not the minimum: one tiny cluster sets max/min
+                -- and every real corpus has one, so a rule on max/min fires on every
+                -- table. The upper tail against the typical case is what a query
+                -- landing in a large cluster actually pays.
                 WHEN v_p50 IS NOT NULL AND v_p50 > 0 AND v_p99 > v_p50 * 4 THEN
                     'the largest clusters hold over 4x the median, so a query landing '
                     'in one reads that much more than probe_fraction suggests'

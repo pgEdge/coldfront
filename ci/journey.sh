@@ -819,12 +819,19 @@ SELECT 'NCENT:' || count(*) FROM coldfront.vector_centroids
 SELECT 'DIMS:' || string_agg(DISTINCT array_length(centroid,1)::text, ',') FROM coldfront.vector_centroids WHERE table_name = 'chunks';
 SELECT 'FINITE:' || bool_and(c > '-Infinity'::real AND c < 'Infinity'::real)::text
   FROM coldfront.vector_centroids, unnest(centroid) c WHERE table_name = 'chunks';
+-- k-means++ excludes a point it has already chosen (its distance to the seed set is
+-- zero), so no two centroids may start from the same row. Distinct after the Lloyd
+-- means as well, which a collapsed pair would not be.
+SELECT 'DISTINCT:' || count(DISTINCT centroid::text) FROM coldfront.vector_centroids
+ WHERE table_name = 'chunks'
+   AND generation = (SELECT generation FROM coldfront.vector_config WHERE table_name = 'chunks');
 EOSQL
 )
     assert_eq "training writes a new generation"        "1"    "$(extract GEN "$T")"
     assert_eq "training stores the trained centroids"   "2"    "$(extract NCENT "$T")"
     assert_eq "centroids keep the column's dimension"   "3"    "$(extract DIMS "$T")"
     assert_eq "centroid means are finite"               "true" "$(extract FINITE "$T")"
+    assert_eq "seeding picked distinct starting points"  "2"    "$(extract DISTINCT "$T")"
 
     # A retrain is a new generation, never an edit of the one queries are resolving.
     local T2; T2=$(qf "$HOST" <<'EOSQL'
