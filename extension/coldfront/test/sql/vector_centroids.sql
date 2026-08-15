@@ -23,9 +23,12 @@ SELECT a.attname, format_type(a.atttypid, a.atttypmod) AS type, a.attnotnull
    AND a.attnum > 0 AND NOT a.attisdropped
  ORDER BY a.attnum;
 
+-- PG18 catalogues a table's NOT NULL constraints in pg_constraint; PG16 and PG17
+-- keep them only in pg_attribute.attnotnull, which the query above asserts.
 SELECT conname, pg_get_constraintdef(oid) AS def
   FROM pg_constraint
  WHERE conrelid = 'coldfront.vector_centroids'::regclass
+   AND contype <> 'n'
  ORDER BY conname;
 
 SELECT a.attname, format_type(a.atttypid, a.atttypmod) AS type
