@@ -45,6 +45,12 @@ COMPOSE_FILE="docker-compose.matrix.yml"
 COMPOSE="docker compose -f $COMPOSE_FILE"
 DB=coldfront-db-1; LK=coldfront-lakekeeper-1; SW=coldfront-seaweedfs-1
 RESTORE=coldfront-restore
+# The restore log goes in a directory nobody else can reach: an unpredictable
+# name, mode 0700, owner-only under this umask. It is the only scratch file here
+# and it outlives the run, so a failed restore stays readable.
+umask 077
+TMPD=$(mktemp -d /tmp/cf-ops.XXXXXX) || { echo "ops.sh: cannot create a private temp dir"; exit 2; }
+echo "ops.sh: log in $TMPD"
 trap 'docker rm -f "$RESTORE" >/dev/null 2>&1 || true; topo_teardown' EXIT
 
 ip() { docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$1"; }
@@ -168,7 +174,7 @@ for _ in $(seq 1 40); do [ "$(docker inspect -f '{{.State.Health.Status}}' "$RES
 # Logical dump of the live coldfront DB → restore into the fresh instance's empty
 # coldfront DB (the dump's CREATE EXTENSION + config-dumped data rebuild it).
 docker exec "$DB" pg_dump -U coldfront -d coldfront 2>/dev/null \
-  | docker exec -i "$RESTORE" psql -U coldfront -d coldfront -q >/tmp/cf_restore.log 2>&1 || true
+  | docker exec -i "$RESTORE" psql -U coldfront -d coldfront -q >$TMPD/cf_restore.log 2>&1 || true
 
 # 1. Durable tiering metadata survived the dump (pg_extension_config_dump).
 assert_eq "registry (tiered_views) survived pg_dump/restore" "1" \

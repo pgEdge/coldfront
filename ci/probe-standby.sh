@@ -40,7 +40,14 @@ SB="$CF_STANDBY"
 ARCHIVER="./bin/archiver"
 WAREHOUSE=wh
 
-trap topo_teardown EXIT   # unless --keep, removes the standby + tears the stack down
+# The generated config carries the cold-store credential, so it lives in a
+# directory nobody else can reach: an unpredictable name, mode 0700, owner-only
+# files under this umask. However the probe ends, the config goes and the log
+# stays; --keep holds the stack for inspection, never the credential.
+umask 077
+TMPD=$(mktemp -d /tmp/probe-standby.XXXXXX) || { echo "probe-standby.sh: cannot create a private temp dir"; exit 2; }
+trap 'topo_teardown; find "$TMPD" -type f ! -name "*.log" -delete 2>/dev/null' EXIT   # unless --keep, removes the standby + tears the stack down
+echo "probe-standby.sh: log in $TMPD"
 
 # ── 1. Bring up the vanilla primary stack ──────────────────────────────────
 step "1. build + up primary stack"
@@ -95,7 +102,7 @@ INSERT INTO events (ts, status, data) SELECT '2026-04-01'::timestamptz + (i*inte
 EOSQL
 # Pin the cutoff to 2026-04-15 (Apr hot, Jan-Mar cold) regardless of wall clock.
 ret_days=$(( ( $(date -u +%s) - $(date -u -d '2026-04-15' +%s) ) / 86400 ))
-cat > /tmp/probe-archiver.yaml <<EOF
+cat > $TMPD/archiver.yaml <<EOF
 postgres:
   dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
 iceberg:
@@ -113,10 +120,10 @@ archiver:
       hot_period: "${ret_days} days"
 EOF
 make -s build >/dev/null 2>&1 || go build -o bin/archiver ./cmd/archiver
-if "$ARCHIVER" --config /tmp/probe-archiver.yaml >/tmp/probe-archiver.log 2>&1; then
+if "$ARCHIVER" --config $TMPD/archiver.yaml >$TMPD/archiver.log 2>&1; then
     pass "archiver run (cold data created)"
 else
-    fail "archiver run — see /tmp/probe-archiver.log"; tail -8 /tmp/probe-archiver.log; exit 1
+    fail "archiver run — see $TMPD/archiver.log"; tail -8 $TMPD/archiver.log; exit 1
 fi
 
 PRIMARY_TOTAL=$(q "$DB" "SELECT count(*) FROM public.events;")
