@@ -110,5 +110,5 @@ install -p -m 0644 %{_builddir}/%{sname}-%{version}/%{sname}-sbom.json.asc %{bui
 %{pginstdir}/sbom/%{sname}-sbom.json.asc
 
 %changelog
-* Mon Jun 30 2026 Muhammad Aqeel <muhammad.aqeel@pgedge.com> - 1.5.4-1
+* Tue Jun 30 2026 Muhammad Aqeel <muhammad.aqeel@pgedge.com> - 1.5.4-1
 - ColdFront build of pgEdge pg_duckdb (DuckDB 1.5.4, pg_duckdb PR #1025)

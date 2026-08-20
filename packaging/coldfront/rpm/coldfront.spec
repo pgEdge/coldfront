@@ -58,5 +58,5 @@ install -p -m 0644 %{_builddir}/%{sname}-%{version}/%{sname}-sbom.json.asc %{bui
 %{pginstdir}/sbom/%{sname}-sbom.json.asc
 
 %changelog
-* Mon Jun 30 2026 Muhammad Aqeel <muhammad.aqeel@pgedge.com> - 1.0.0-1
+* Tue Jun 30 2026 Muhammad Aqeel <muhammad.aqeel@pgedge.com> - 1.0.0-1
 - Initial build of the pgEdge ColdFront extension
