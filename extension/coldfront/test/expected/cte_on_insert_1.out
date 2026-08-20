@@ -51,3 +51,24 @@ DELETE FROM coldfront.tiered_views;
 DELETE FROM coldfront.archive_watermark;
 DROP VIEW public.events;
 DROP TABLE public._events;
+-- The clustered iceberg-only INSERT is re-emitted so the cluster is derived in
+-- the same statement, and the CTE must survive that re-emission too: the WITH
+-- folds into the derived table the assignment reads from, the only scope its
+-- CTEs are visible from.
+CREATE TABLE public._vec_base (id int, ts timestamptz, embedding real[]);
+CREATE VIEW public.icevec AS SELECT * FROM public._vec_base;
+INSERT INTO coldfront.tiered_views(schema_name, relname, iceberg_table, is_iceberg_only, vec_columns)
+VALUES ('public', 'icevec', 'ice.default.icevec', true, ARRAY['embedding']);
+EXPLAIN (COSTS OFF, VERBOSE)
+  WITH s AS (SELECT 7 AS id, '2026-05-01 00:00:00+00'::timestamptz AS ts, ARRAY[1,0,0]::real[] AS embedding)
+  INSERT INTO public.icevec SELECT id, ts, embedding FROM s;
+                                                                                                                                                                                                                                                                                                                                                                                                                                                  QUERY PLAN                                                                                                                                                                                                                                                                                                                                                                                                                                                   
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result
+   Output: _exec_iceberg_with_claim('ice.default.icevec'::text, 'INSERT INTO ice.default.icevec (_cf_vec_list_embedding, id, ts, embedding) SELECT (SELECT arg_min(c.centroid_id, list_cosine_distance(c.centroid, coldfront_src.embedding)) FROM pglocal.coldfront.vector_centroids c WHERE c.schema_name = ''public'' AND c.table_name = ''icevec'' AND c.column_name = ''embedding'' AND c.generation = (SELECT vc.generation FROM pglocal.coldfront.vector_config vc WHERE vc.schema_name = ''public'' AND vc.table_name = ''icevec'' AND vc.column_name = ''embedding'')), id, ts, embedding FROM (WITH s AS (          SELECT 7 AS id,             ''Fri May 01 00:00:00 2026 UTC''::timestamptz AS ts,             ARRAY[(1)::real, (0)::real, (0)::real] AS embedding         )  SELECT s.id,             s.ts,             s.embedding            FROM s) AS coldfront_src(id, ts, embedding)'::text)
+(2 rows)
+
+-- Cleanup.
+DELETE FROM coldfront.tiered_views WHERE relname = 'icevec';
+DROP VIEW public.icevec;
+DROP TABLE public._vec_base;
