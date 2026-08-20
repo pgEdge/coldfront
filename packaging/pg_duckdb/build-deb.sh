@@ -9,6 +9,23 @@ CWD="$(pwd)"
 
 export DEBIAN_FRONTEND=noninteractive
 
+# Only the owner major (the latest — see common.sh) packages the shared DuckDB
+# engine as pgedge-libduckdb; every other major deletes its identical copy.
+# debian/rules reads both of these from the environment.
+if [ "${PG_MAJOR_VERSION}" = "${LIBDUCKDB_OWNER_PG_MAJOR}" ]; then
+  export LIBDUCKDB_OWNER=yes
+else
+  export LIBDUCKDB_OWNER=no
+fi
+
+# LIBDUCKDB_DIR comes from common.sh and is used for both the RPATH (below) and
+# the install location (debian/rules reads it from the environment).
+
+# Upper bound for the engine dependency — DuckDB's C++ ABI is tied to the
+# upstream version, so 1.5.4 must never resolve against 1.5.5. Bumps the last
+# component: 1.5.4 -> 1.5.5.
+LIBDUCKDB_ENGINE_NEXT="$(awk -F. '{ $NF = $NF + 1; print }' OFS=. <<< "${PG_DUCKDB_ENGINE_VERSION}")"
+
 prepare() {
 
   setup_apt_build_env
@@ -35,13 +52,32 @@ prepare() {
     # pgEdge propagates -fexcess-precision=standard into CXXFLAGS, which gcc
     # rejects for C++. Strip it after PGXS is included (no-op if absent).
     printf '\noverride CXXFLAGS := $(filter-out -fexcess-precision=standard,$(CXXFLAGS))\n' >> Makefile.global
+    # Teach pg_duckdb.so where the shared engine lives. Upstream links it with a
+    # plain -lduckdb plus -Wl,-rpath,$(PG_LIB), which only worked while
+    # libduckdb.so sat in the PG libdir; it now ships in LIBDUCKDB_DIR, so add
+    # that to the RPATH. Makefile.global is included AFTER $(PGXS), and PGXS
+    # expands SHLIB_LINK when it links, so appending here still lands.
+    printf '\nSHLIB_LINK += -Wl,-rpath,%s\n' "${LIBDUCKDB_DIR}" >> Makefile.global
   )
 
   echo "Moving Debian packaging into source directory..."
   cp -rp "${CWD}/${COMPONENT_NAME}/deb/debian" "$SRC_DIR/"
   cd "$SRC_DIR"
   cp debian/control.in debian/control
+  # The shared-engine stanza is appended ONLY for the owner major; the other
+  # majors must not declare pgedge-libduckdb at all, or the release would push
+  # several same-version builds of it and reprepro would reject the second.
+  if [ "${LIBDUCKDB_OWNER}" = "yes" ]; then
+    echo "PG ${PG_MAJOR_VERSION} is the libduckdb owner — building pgedge-libduckdb here"
+    cat debian/control.libduckdb.in >> debian/control
+  else
+    echo "PG ${PG_MAJOR_VERSION} is not the libduckdb owner (${LIBDUCKDB_OWNER_PG_MAJOR} is) — engine comes from pgedge-libduckdb"
+    rm -f debian/pgedge-libduckdb.install
+  fi
+  rm -f debian/control.in debian/control.libduckdb.in
   sed -i "s|PG_MAJOR_VERSION|${PG_MAJOR_VERSION}|g" debian/control
+  sed -i "s|DUCKDB_ENGINE_VERSION|${PG_DUCKDB_ENGINE_VERSION}|g;s|DUCKDB_ENGINE_NEXT|${LIBDUCKDB_ENGINE_NEXT}|g" \
+     debian/control
   mv debian/pgedge-postgresql-pg-duckdb.install \
      debian/pgedge-postgresql-${PG_MAJOR_VERSION}-pg-duckdb.install
   sed -i "s|PG_MAJOR_VERSION|${PG_MAJOR_VERSION}|g" \

@@ -1,0 +1,15 @@
+
+Package: pgedge-libduckdb
+Architecture: any
+Section: libs
+Depends:
+ ${misc:Depends},
+ ${shlibs:Depends},
+Description: DuckDB engine shared library for pgEdge pg_duckdb
+ The DuckDB columnar-vectorized analytics engine, built from the
+ third_party/duckdb submodule pinned by pgEdge's pg_duckdb and shared by the
+ pg_duckdb extension for every PostgreSQL major version.
+ .
+ This library contains no PostgreSQL-specific code; the per-major
+ pgedge-postgresql-N-pg-duckdb packages link against it and find it at runtime
+ through an RPATH, so they ship nothing but the extension itself.

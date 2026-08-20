@@ -3,6 +3,16 @@ set -euo pipefail
 
 RHEL="$(rpm --eval %rhel)"
 
+# Only the owner major (the latest — see common.sh) packages the shared DuckDB
+# engine; every other major deletes its identical copy and links against it.
+# The comparison lives here, not in the spec, so RPM and DEB decide it the same
+# way from the same variable.
+if [ "${PG_MAJOR_VERSION}" = "${LIBDUCKDB_OWNER_PG_MAJOR}" ]; then
+  WITH_LIBDUCKDB=1
+else
+  WITH_LIBDUCKDB=0
+fi
+
 prepare() {
   setup_dnf_build_env
 
@@ -38,6 +48,8 @@ prepare() {
   # This function is for debugging purpose if you have your own keys. GH workflow does not need it.
   #import_gpg_keys
 
+  # with_libduckdb must be defined here too — builddep parses the same spec, and
+  # an undefined macro in the %if would abort the parse.
   echo "🔧 Installing RPM build dependencies..."
   dnf builddep -y \
     --define "pgmajorversion ${PG_MAJOR_VERSION}" \
@@ -45,17 +57,26 @@ prepare() {
     --define "pg_duckdb_version ${PG_DUCKDB_VERSION}" \
     --define "pg_duckdb_buildnum ${PG_DUCKDB_BUILDNUM}" \
     --define "curl_version ${CURL_VERSION}" \
+    --define "with_libduckdb ${WITH_LIBDUCKDB}" \
+    --define "libduckdb_dir ${LIBDUCKDB_DIR}" \
     ~/rpmbuild/SPECS/pg_duckdb.spec
 }
 
 build() {
   echo "Building RPM and SRPM..."
+  if [ "${WITH_LIBDUCKDB}" = "1" ]; then
+    echo "  PG ${PG_MAJOR_VERSION} is the libduckdb owner — this cell also builds pgedge-libduckdb"
+  else
+    echo "  PG ${PG_MAJOR_VERSION} is not the libduckdb owner (${LIBDUCKDB_OWNER_PG_MAJOR} is) — engine comes from pgedge-libduckdb"
+  fi
   QA_RPATHS=$(( 0xffff )) rpmbuild -ba ~/rpmbuild/SPECS/pg_duckdb.spec \
     --define "pgmajorversion ${PG_MAJOR_VERSION}" \
     --define "pginstdir /usr/pgsql-${PG_MAJOR_VERSION}" \
     --define "pg_duckdb_version ${PG_DUCKDB_VERSION}" \
     --define "pg_duckdb_buildnum ${PG_DUCKDB_BUILDNUM}" \
-    --define "curl_version ${CURL_VERSION}"
+    --define "curl_version ${CURL_VERSION}" \
+    --define "with_libduckdb ${WITH_LIBDUCKDB}" \
+    --define "libduckdb_dir ${LIBDUCKDB_DIR}"
 }
 
 post_build() {

@@ -29,6 +29,8 @@ Depends:
  ${misc:Depends},
  ${shlibs:Depends},
  pgedge-postgresql-PG_MAJOR_VERSION,
+ pgedge-libduckdb (>= DUCKDB_ENGINE_VERSION~),
+ pgedge-libduckdb (<< DUCKDB_ENGINE_NEXT~),
  libcurl4,
 Conflicts:
  postgresql-PG_MAJOR_VERSION-pg-duckdb,

@@ -66,5 +66,5 @@ install -D -m 0644 %{sname}-sbom.json.asc %{buildroot}%{_datadir}/pgedge-%{sname
 %{_datadir}/pgedge-%{sname}/%{sname}-sbom.json.asc
 
 %changelog
-* Tue Jul 01 2026 Muhammad Aqeel <muhammad.aqeel@pgedge.com> - 1.5.4-1
+* Wed Jul 01 2026 Muhammad Aqeel <muhammad.aqeel@pgedge.com> - 1.5.4-1
 - Initial build of the ColdFront patched DuckDB extensions (DuckDB 1.5.4)

@@ -4,6 +4,25 @@
 export DUCKDB_GEN = ninja
 export CMAKE_BUILD_PARALLEL_LEVEL = 4
 
+# --- Shared DuckDB engine (rationale in packaging/pg_duckdb/common.sh) ----------
+# libduckdb.so is PG-major independent, so exactly one major — the owner, which
+# build-deb.sh exports here from LIBDUCKDB_OWNER_PG_MAJOR — ships it as
+# pgedge-libduckdb; every other major drops its identical copy. Shipping it from
+# all of them gave every per-major dbgsym the same
+# /usr/lib/debug/.build-id/<xx>/<hash>.debug path, so they refused to install
+# side by side. pg_duckdb.so reaches the engine in its new home through an RPATH
+# that build-deb.sh adds at build time, so no per-major link has to be managed.
+LIBDUCKDB_OWNER ?= no
+# Exported by build-deb.sh, which uses the same value for the RPATH; the default
+# keeps a standalone `dpkg-buildpackage` working.
+LIBDUCKDB_DIR ?= /usr/lib/pgedge/coldfront/libduckdb
+# build-deb.sh puts the target major's bin dir first on PATH, so this resolves to
+# that major's libdir — where `make install` drops both artifacts.
+PG_PKGLIBDIR := $(shell pg_config --pkglibdir)
+# dh_shlibdeps needs the engine to resolve pg_duckdb.so's NEEDED entry in the
+# builds that no longer stage libduckdb.so themselves.
+DUCKDB_BUILD_LIBDIR := $(CURDIR)/third_party/duckdb/build/release/src
+
 %:
 	dh $@
 
@@ -14,7 +33,34 @@ override_dh_auto_build:
 	USE_PGXS=1 dh_auto_build -- -j4 with_llvm=no
 
 override_dh_auto_install:
-	USE_PGXS=1 dh_auto_install -- with_llvm=no
+	# --destdir is pinned so the layout does not change between the owner build
+	# (two binary packages -> debian/tmp) and the others (one -> debian/<pkg>);
+	# the .install files depend on it being debian/tmp either way.
+	USE_PGXS=1 dh_auto_install --destdir=debian/tmp -- with_llvm=no
+	# The owner relocates the engine to the shared directory already on
+	# pg_duckdb.so's RPATH; everyone else drops their identical copy. Nothing is
+	# left in the PG libdir, so there is no per-major link to keep in step.
+	if [ "$(LIBDUCKDB_OWNER)" = "yes" ]; then \
+		mkdir -p debian/tmp$(LIBDUCKDB_DIR); \
+		mv debian/tmp$(PG_PKGLIBDIR)/libduckdb.so debian/tmp$(LIBDUCKDB_DIR)/libduckdb.so; \
+	else \
+		rm -f debian/tmp$(PG_PKGLIBDIR)/libduckdb.so; \
+	fi
+
+override_dh_shlibdeps:
+	# -l: libduckdb.so is no longer beside pg_duckdb.so in the staging tree, so
+	# point dpkg-shlibdeps at the build tree to resolve the NEEDED entry.
+	# --ignore-missing-info: it comes from this build rather than an installed
+	# package, so it has no shlibs/symbols data. The dependency on the engine is
+	# declared explicitly in debian/control instead.
+	dh_shlibdeps -l$(DUCKDB_BUILD_LIBDIR) -- --ignore-missing-info
+
+override_dh_missing:
+	# The .install globs above are the only thing routing files into packages in
+	# the owner build (dh_install's "install whatever is left" fallback applies
+	# to single-binary sources only), so fail loudly rather than silently
+	# shipping a package with a file missing.
+	dh_missing --fail-missing
 
 override_dh_auto_test:
 	# pg_duckdb's `make check` drives a full regression harness that needs a

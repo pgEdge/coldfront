@@ -1,1 +1,9 @@
 debian/tmp/sbom/* usr/lib/postgresql/PG_MAJOR_VERSION/sbom/
+# Everything `make install` produced, minus libduckdb.so: debian/rules has
+# already moved that to the shared pgedge dir (owner build, where it becomes
+# pgedge-libduckdb) or deleted it (every other major). Listed explicitly because
+# dh_install only falls back to "install whatever is left in debian/tmp" when
+# the source builds a SINGLE binary package, which stops being true in the
+# owner build.
+usr/lib/postgresql/
+usr/share/postgresql/
