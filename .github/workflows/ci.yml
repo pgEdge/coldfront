@@ -57,7 +57,7 @@ jobs:
       - name: Install golangci-lint
         run: |
           curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
-            | sh -s -- -b "$(go env GOPATH)/bin"
+            | sh -s -- -b "$(go env GOPATH)/bin" v2.12.2
 
       - name: Install mkdocs (for docs --strict preflight)
         run: pipx install mkdocs && pipx inject mkdocs mkdocs-material
@@ -109,7 +109,7 @@ jobs:
       - name: Install golangci-lint
         run: |
           curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
-            | sh -s -- -b "$(go env GOPATH)/bin"
+            | sh -s -- -b "$(go env GOPATH)/bin" v2.12.2
 
       - name: Install mkdocs (for docs --strict preflight)
         run: pipx install mkdocs && pipx inject mkdocs mkdocs-material
