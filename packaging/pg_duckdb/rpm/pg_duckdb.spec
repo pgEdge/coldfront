@@ -4,6 +4,8 @@
 # installed artifacts (pg_duckdb.so, pg_duckdb.control, tarball dir).
 %global pkgname pg-duckdb
 
+%global _build_id_links none
+
 Name:		pgedge-%{pkgname}_%{pgmajorversion}
 Version:	%{pg_duckdb_version}
 Release:	%{pg_duckdb_buildnum}%{?dist}

@@ -20,6 +20,9 @@ override_dh_auto_test:
 	# pg_duckdb's `make check` drives a full regression harness that needs a
 	# running server and is not packaging-relevant; skip it during the build.
 
+override_dh_strip:
+	dh_strip --no-automatic-dbgsym
+
 override_dh_dwz:
 	# libduckdb.so is enormous; dwz bails with "Too many DIEs" and errors out.
 	# Skip dwz debug-info optimization (not packaging-relevant).
