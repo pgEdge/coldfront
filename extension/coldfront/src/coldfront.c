@@ -757,7 +757,18 @@ classify_tier(Query *query, TieredViewInfo *info)
 
 /* drop_typmod: after substituting, skip a following "(...)" so a typmod that is
  * valid on the PG spelling but not on the DuckDB one does not survive. */
-typedef struct { const char *pg; const char *duck; bool drop_typmod; } CfSubst;
+/* wrap: the replacement opens one paren more than the spelling it replaces
+ * (to_json(array_agg( for jsonb_agg(), so a closing paren is added at the
+ * matched call's own close. */
+typedef struct {
+    const char *pg;
+    const char *duck;
+    bool        drop_typmod;
+    bool        wrap;
+} CfSubst;
+
+/* Deepest nesting of wrapped calls one statement may carry. */
+#define CF_WRAP_MAX 16
 
 /*
  * Cold-WRITE substitutions. The deparsed cold DML is handed to DuckDB inside a
@@ -768,21 +779,30 @@ typedef struct { const char *pg; const char *duck; bool drop_typmod; } CfSubst;
  * whose DuckDB name is not json_<rest> are listed here, matched with the opening
  * paren so a column prefix can't false-match. A result DuckDB lacks (e.g.
  * json_set) errors in DuckDB — its boundary, not a rewrite coldfront withholds.
+ *
+ * The JSON aggregates are the one pair whose target is not a single name.
+ * DuckDB has neither json_agg nor jsonb_agg, and its json_group_array is a macro
+ * that refuses the ORDER BY an aggregate carries, so both spellings become
+ * to_json(array_agg(...)): array_agg is a DuckDB aggregate and keeps the
+ * ORDER BY. That target opens one paren more than the spelling it replaces,
+ * which is what `wrap` closes.
  */
 static const CfSubst cf_write_subst[] = {
-    { "::timestamp with time zone",    "::timestamptz", false },
-    { "::timestamp without time zone", "::timestamp",   false },
-    { "::character varying",           "::varchar",     false },
-    { "::double precision",            "::double",      false },
+    { "::timestamp with time zone",    "::timestamptz", false, false },
+    { "::timestamp without time zone", "::timestamp",   false, false },
+    { "::character varying",           "::varchar",     false, false },
+    { "::double precision",            "::double",      false, false },
     /* pgvector's types are unknown to DuckDB, and the Iceberg column is FLOAT[].
      * The dimension typmod goes with the name: FLOAT[](3) is not a type. The
      * cast's operand is already bracketed here, since a vector Const deparses
      * through pgvector's own output function. */
-    { "::vector",                      "::FLOAT[]",     true  },
-    { "::halfvec",                     "::FLOAT[]",     true  },
-    { "jsonb_build_object(",           "json_object(",  false },
-    { "jsonb_build_array(",            "json_array(",   false },
-    { "to_jsonb(",                     "to_json(",      false },
+    { "::vector",                      "::FLOAT[]",     true,  false },
+    { "::halfvec",                     "::FLOAT[]",     true,  false },
+    { "jsonb_build_object(",           "json_object(",  false, false },
+    { "jsonb_build_array(",            "json_array(",   false, false },
+    { "to_jsonb(",                     "to_json(",      false, false },
+    { "jsonb_agg(",   "to_json(array_agg(",             false, true  },
+    { "json_agg(",    "to_json(array_agg(",             false, true  },
 };
 
 /*
@@ -803,9 +823,9 @@ static const CfSubst cf_write_subst[] = {
  * are rewritten on the node tree instead: see cf_json_builder_mutator.
  */
 static const CfSubst cf_read_subst[] = {
-    { "::jsonb",             "::json",             false },
-    { "jsonb_array_length(", "json_array_length(", false },
-    { "date_bin(",           "time_bucket(",       false },
+    { "::jsonb",             "::json",             false, false },
+    { "jsonb_array_length(", "json_array_length(", false, false },
+    { "date_bin(",           "time_bucket(",       false, false },
 };
 
 /*
@@ -822,6 +842,9 @@ cf_apply_subst(const char *sql, const CfSubst *map, int map_len, bool jsonb_catc
     const char    *p         = sql;
     bool           in_quote  = false;
     bool           in_dquote = false;
+    int            depth     = 0;                /* paren depth, outside quotes */
+    int            wrap_at[CF_WRAP_MAX];         /* depths owing a closing paren */
+    int            nwrap     = 0;
 
     initStringInfo(&buf);
     while (*p)
@@ -885,6 +908,19 @@ cf_apply_subst(const char *sql, const CfSubst *map, int map_len, bool jsonb_catc
                         if (*p == ')')
                             p++;
                     }
+                    /* The spelling ends with its own '(', already consumed, so
+                     * the call's arguments sit one level in. Its close is the
+                     * ')' that brings the depth back to where it started. */
+                    if (map[i].wrap)
+                    {
+                        if (nwrap == CF_WRAP_MAX)
+                            ereport(ERROR,
+                                    (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                                     errmsg("coldfront: JSON aggregates nested deeper than %d",
+                                            CF_WRAP_MAX)));
+                        wrap_at[nwrap++] = depth;
+                        depth++;
+                    }
                     replaced = true;
                     break;
                 }
@@ -907,6 +943,22 @@ cf_apply_subst(const char *sql, const CfSubst *map, int map_len, bool jsonb_catc
                 {
                     appendStringInfoString(&buf, "json");
                     p += 5;
+                    continue;
+                }
+            }
+
+            /* Track the depth the wrap flag closes against, and emit the added
+             * paren when a wrapped call's own close is reached. */
+            if (*p == '(')
+                depth++;
+            else if (*p == ')' && depth > 0)
+            {
+                depth--;
+                if (nwrap > 0 && wrap_at[nwrap - 1] == depth)
+                {
+                    nwrap--;
+                    appendStringInfoString(&buf, "))");
+                    p++;
                     continue;
                 }
             }
