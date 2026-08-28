@@ -42,22 +42,31 @@
 
 #include "access/attnum.h"
 #include "access/xact.h"
+#include "catalog/dependency.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_class.h"
+#include "catalog/pg_collation.h"
+#include "catalog/pg_namespace.h"
+#include "catalog/pg_proc.h"
 #include "catalog/pg_type_d.h"
+#include "commands/extension.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
 #include "lib/stringinfo.h"
 #include "nodes/makefuncs.h"
 #include "nodes/parsenodes.h"
 #include "nodes/nodeFuncs.h"
+#include "nodes/params.h"
 #include "nodes/pg_list.h"
 #include "optimizer/optimizer.h"
+#include "optimizer/planner.h"
 #include "parser/analyze.h"
+#include "parser/parse_func.h"
 #include "parser/parsetree.h"
 #include "tcop/tcopprot.h"
 #include "tcop/utility.h"
 #include "utils/builtins.h"
+#include "utils/datum.h"
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
@@ -221,6 +230,7 @@ static char *coldfront_lakekeeper_endpoint = NULL;
 static char *coldfront_local_pg_dsn       = NULL;
 
 static post_parse_analyze_hook_type prev_post_parse_analyze_hook = NULL;
+static planner_hook_type            prev_planner_hook            = NULL;
 
 /* Previous ProcessUtility_hook (pg_duckdb's, since coldfront loads after it). */
 static ProcessUtility_hook_type prev_process_utility_hook = NULL;
@@ -338,31 +348,43 @@ lookup_tiered_view(Oid relid, const char *vname, TieredViewInfo *info)
 }
 
 /*
- * True if the query reads from a registered tiered/iceberg-only view — any
- * RangeTblEntry that is a VIEW resolving in coldfront.tiered_views.  Used to
- * lazily attach 'ice' before a plain SELECT against a tiered view executes:
- * the view body's iceberg_scan('ice...') only resolves once the catalog is
- * attached.  The cheap relkind syscache check gates the SPI lookup so plain
+ * True if the query reads from a registered tiered/iceberg-only view: a VIEW
+ * RangeTblEntry resolving in coldfront.tiered_views, at any depth (a CTE, a
+ * sub-select, a set-operation branch): pg_duckdb runs the whole statement in DuckDB
+ * whichever branch names the view. Once the rewriter has expanded the view its RTE
+ * is a subquery that keeps the view's relid, so the planner hook sees it too. Used
+ * to lazily attach 'ice' before the read executes (the view body's
+ * iceberg_scan('ice...') only resolves once the catalog is attached) and to gate
+ * the read rewrites. The cheap relkind syscache check gates the SPI lookup so plain
  * table queries (the OLTP hot path) never pay for it.
  */
 static bool
-query_reads_tiered_view(Query *query)
+reads_tiered_view_walker(Node *node, void *ctx)
 {
-    ListCell *lc;
-
-    foreach(lc, query->rtable)
+    if (node == NULL)
+        return false;
+    if (IsA(node, RangeTblEntry))
     {
-        RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+        RangeTblEntry *rte = (RangeTblEntry *) node;
         TieredViewInfo info;
 
-        if (rte->rtekind != RTE_RELATION)
-            continue;
-        if (get_rel_relkind(rte->relid) != RELKIND_VIEW)
-            continue;
-        if (lookup_tiered_view(rte->relid, get_rel_name(rte->relid), &info))
-            return true;
+        return (rte->rtekind == RTE_RELATION || rte->rtekind == RTE_SUBQUERY) &&
+               OidIsValid(rte->relid) &&
+               get_rel_relkind(rte->relid) == RELKIND_VIEW &&
+               get_rel_namespace(rte->relid) != PG_CATALOG_NAMESPACE &&
+               lookup_tiered_view(rte->relid, get_rel_name(rte->relid), &info);
     }
-    return false;
+    if (IsA(node, Query))
+        return query_tree_walker((Query *) node, reads_tiered_view_walker, ctx,
+                                 QTW_EXAMINE_RTES_BEFORE);
+    return expression_tree_walker(node, reads_tiered_view_walker, ctx);
+}
+
+static bool
+query_reads_tiered_view(Query *query)
+{
+    return query_tree_walker(query, reads_tiered_view_walker, NULL,
+                             QTW_EXAMINE_RTES_BEFORE);
 }
 
 /*
@@ -716,11 +738,17 @@ static const CfSubst cf_write_subst[] = {
  * json_path_query fails PG reparse (PG has no json_path_query), and
  * json_extract_path_text / json_type are signature- or vocabulary-incompatible in
  * DuckDB (array result; UBIGINT/VARCHAR vs number/string). json_array_length is
- * verified identical ([10,20,30]→3, []→0) and exists in both.
+ * verified identical ([10,20,30]→3, []→0) and exists in both. DuckDB has no
+ * date_bin; its time_bucket takes the same (interval, timestamp[tz], timestamp[tz])
+ * arguments, pg_duckdb declares it PG-side, and the two agree on every fixed-width
+ * bucket (a month or year width, which date_bin rejects, time_bucket accepts).
+ * The JSON builders (jsonb_build_object, jsonb_agg) need more than a spelling and
+ * are rewritten on the node tree instead: see cf_json_builder_mutator.
  */
 static const CfSubst cf_read_subst[] = {
     { "::jsonb",             "::json",             false },
     { "jsonb_array_length(", "json_array_length(", false },
+    { "date_bin(",           "time_bucket(",       false },
 };
 
 /*
@@ -784,6 +812,11 @@ cf_apply_subst(const char *sql, const CfSubst *map, int map_len, bool jsonb_catc
             for (i = 0; i < map_len; i++)
             {
                 size_t plen = strlen(map[i].pg); /* nosemgrep */
+                /* A function spelling must start the identifier: undate_bin( is not
+                 * date_bin(. Cast spellings start at '::' and need no such check. */
+                if (isalpha((unsigned char) map[i].pg[0]) && p > sql &&
+                    (isalnum((unsigned char) p[-1]) || p[-1] == '_'))
+                    continue;
                 if (strncmp(p, map[i].pg, plen) == 0)
                 {
                     appendStringInfoString(&buf, map[i].duck);
@@ -836,9 +869,202 @@ normalize_casts_for_duckdb(const char *sql)
 
 /* Tiered-read path: whitelist only (output is reparsed by PG, then run by DuckDB). */
 static char *
-normalize_jsonb_for_read(const char *sql)
+normalize_for_read(const char *sql)
 {
     return cf_apply_subst(sql, cf_read_subst, lengthof(cf_read_subst), false);
+}
+
+/* ---------- read-path JSON builders ------------------------------------ */
+
+/*
+ * jsonb_build_object / json_build_object and jsonb_agg / json_agg have no DuckDB
+ * counterpart a spelling can reach: PostgreSQL's grammar reserves json_object, so
+ * that name never resolves to a function, and DuckDB's json_group_array is a macro
+ * that refuses the ORDER BY an aggregate carries. Both engines share concat,
+ * to_json, array_agg and the json cast, so a builder becomes those:
+ *   jsonb_build_object(k1, v1, …)  →  concat('{', to_json(k1::text)::text, ':',
+ *                                             COALESCE(to_json(v1)::text, 'null'),
+ *                                             ',', …, '}')::json
+ *   jsonb_agg(e ORDER BY …)         →  to_json(array_agg(e ORDER BY …))
+ * to_json(NULL) is SQL NULL in both engines, so a value is COALESCEd to the JSON
+ * null; a NULL key gives concat text the json cast rejects, as jsonb_build_object
+ * rejects a NULL key. The result is JSON-equal to jsonb's rendering (jsonb also
+ * sorts keys and pads punctuation). Pairing keys with values is exact on the
+ * argument List; the emitted function OIDs come from the catalog, once per backend.
+ * A VARIADIC array argument cannot be paired and is left alone.
+ */
+typedef struct { bool changed; } JsonBuilderCtx;
+
+static Oid cf_to_json_oid       = InvalidOid;
+static Oid cf_concat_oid        = InvalidOid;
+static Oid cf_array_agg_oid     = InvalidOid;   /* array_agg(anynonarray) */
+static Oid cf_array_agg_arr_oid = InvalidOid;   /* array_agg(anyarray)    */
+
+static void
+cf_resolve_json_builder_oids(void)
+{
+    List *array_agg = list_make2(makeString("pg_catalog"), makeString("array_agg"));
+    Oid   argtype;
+
+    if (OidIsValid(cf_to_json_oid))
+        return;
+    cf_to_json_oid = LookupFuncName(list_make2(makeString("pg_catalog"), makeString("to_json")),
+                                    -1, NULL, false);
+    cf_concat_oid  = LookupFuncName(list_make2(makeString("pg_catalog"), makeString("concat")),
+                                    -1, NULL, false);
+    argtype = ANYNONARRAYOID;
+    cf_array_agg_oid     = LookupFuncName(array_agg, 1, &argtype, false);
+    argtype = ANYARRAYOID;
+    cf_array_agg_arr_oid = LookupFuncName(array_agg, 1, &argtype, false);
+}
+
+static bool
+cf_is_pg_catalog_func(Oid funcid, const char *name, const char *alt)
+{
+    const char *fname;
+
+    if (get_func_namespace(funcid) != PG_CATALOG_NAMESPACE)
+        return false;
+    fname = get_func_name(funcid);
+    return strcmp(fname, name) == 0 || strcmp(fname, alt) == 0; /* nosemgrep */
+}
+
+static Node *
+cf_text_const(const char *s)
+{
+    return (Node *) makeConst(TEXTOID, -1, DEFAULT_COLLATION_OID, -1,
+                              CStringGetTextDatum(s), false, false);
+}
+
+static Node *
+cf_cast_via_io(Node *arg, Oid type)
+{
+    CoerceViaIO *c = makeNode(CoerceViaIO);
+
+    c->arg          = (Expr *) arg;
+    c->resulttype   = type;
+    c->resultcollid = (type == TEXTOID) ? DEFAULT_COLLATION_OID : InvalidOid;
+    c->coerceformat = COERCE_EXPLICIT_CAST;
+    c->location     = -1;
+    return (Node *) c;
+}
+
+/* to_json(e)::text */
+static Node *
+cf_json_text(Node *e)
+{
+    FuncExpr *f = makeFuncExpr(cf_to_json_oid, JSONOID, list_make1(e),
+                               InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+
+    return cf_cast_via_io((Node *) f, TEXTOID);
+}
+
+/* COALESCE(to_json(v)::text, 'null'); a value that is already json (a nested
+ * builder, a view's json column) needs only the cast. */
+static Node *
+cf_json_value(Node *v)
+{
+    CoalesceExpr *c = makeNode(CoalesceExpr);
+
+    c->coalescetype   = TEXTOID;
+    c->coalescecollid = DEFAULT_COLLATION_OID;
+    c->args           = list_make2(exprType(v) == JSONOID ? cf_cast_via_io(v, TEXTOID)
+                                                          : cf_json_text(v),
+                                   cf_text_const("null"));
+    c->location       = -1;
+    return (Node *) c;
+}
+
+/* to_json(k::text)::text: a JSON key is a string whatever the key's type. */
+static Node *
+cf_json_key(Node *k)
+{
+    if (exprType(k) != TEXTOID)
+        k = cf_cast_via_io(k, TEXTOID);
+    return cf_json_text(k);
+}
+
+/* concat('{', key, ':', value, ',', …, '}')::json over the paired argument list. */
+static Node *
+cf_json_object(List *args)
+{
+    List     *cat = list_make1(cf_text_const("{"));
+    ListCell *lc;
+    int       i   = 0;
+
+    foreach(lc, args)
+    {
+        Node *a = (Node *) lfirst(lc);
+
+        if (i % 2 == 0)
+        {
+            if (i > 0)
+                cat = lappend(cat, cf_text_const(","));
+            cat = lappend(cat, cf_json_key(a));
+            cat = lappend(cat, cf_text_const(":"));
+        }
+        else
+            cat = lappend(cat, cf_json_value(a));
+        i++;
+    }
+    cat = lappend(cat, cf_text_const("}"));
+    return cf_cast_via_io((Node *) makeFuncExpr(cf_concat_oid, TEXTOID, cat, InvalidOid,
+                                                DEFAULT_COLLATION_OID, COERCE_EXPLICIT_CALL),
+                          JSONOID);
+}
+
+/* to_json(array_agg(e …)): the Aggref keeps its ORDER BY, FILTER and DISTINCT. */
+static Node *
+cf_json_agg(Aggref *agg, Oid elemtype, Oid arrtype)
+{
+    agg->aggfnoid = type_is_array(elemtype) ? cf_array_agg_arr_oid : cf_array_agg_oid;
+    agg->aggtype  = arrtype;
+    return (Node *) makeFuncExpr(cf_to_json_oid, JSONOID, list_make1(agg),
+                                 InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
+}
+
+static Node *
+cf_json_builder_mutator(Node *node, void *ctx)
+{
+    JsonBuilderCtx *jc = (JsonBuilderCtx *) ctx;
+
+    if (node == NULL)
+        return NULL;
+    if (IsA(node, Query))
+        return (Node *) query_tree_mutator((Query *) node, cf_json_builder_mutator, ctx, 0);
+    if (IsA(node, FuncExpr))
+    {
+        FuncExpr *f = (FuncExpr *) expression_tree_mutator(node, cf_json_builder_mutator, ctx);
+
+        if (!f->funcvariadic &&
+            cf_is_pg_catalog_func(f->funcid, "jsonb_build_object", "json_build_object"))
+        {
+            cf_resolve_json_builder_oids();
+            jc->changed = true;
+            return cf_json_object(f->args);
+        }
+        return (Node *) f;
+    }
+    if (IsA(node, Aggref))
+    {
+        Aggref *a = (Aggref *) expression_tree_mutator(node, cf_json_builder_mutator, ctx);
+
+        if (list_length(a->aggargtypes) == 1 &&
+            cf_is_pg_catalog_func(a->aggfnoid, "jsonb_agg", "json_agg"))
+        {
+            Oid elemtype = linitial_oid(a->aggargtypes);
+            Oid arrtype  = get_array_type(elemtype);
+
+            if (OidIsValid(arrtype))
+            {
+                cf_resolve_json_builder_oids();
+                jc->changed = true;
+                return cf_json_agg(a, elemtype, arrtype);
+            }
+        }
+        return (Node *) a;
+    }
+    return expression_tree_mutator(node, cf_json_builder_mutator, ctx);
 }
 
 /* ---------- SQL builder ----------------------------------------------- */
@@ -2433,22 +2659,27 @@ cf_try_reroute_hot_read(Query *query)
 }
 
 /*
- * jsonb → json on the read path. A query against a tiered / iceberg-only view runs
- * entirely in DuckDB (the view body is an iceberg_scan UNION), and DuckDB has no
- * jsonb type. Deparse, apply the read whitelist (normalize_jsonb_for_read: the
- * ::jsonb cast and the functions verified equivalent in both engines), reparse in
- * place. No whitelisted token ⇒ strcmp matches and the query is left untouched (the
- * common case — ->>/-> operators and plain reads never reparse). jsonb spellings
- * outside the whitelist pass through and DuckDB rejects them clearly (documented).
+ * Make a read DuckDB will run acceptable to it. A query against a tiered /
+ * iceberg-only view runs entirely in DuckDB (the view body is an iceberg_scan
+ * UNION), which has no jsonb type, no date_bin and no JSON builders. Two passes over
+ * the analysed tree: the JSON builders are rewritten on the node tree
+ * (cf_json_builder_mutator, where key/value pairing is exact), then the deparsed
+ * text gets the read whitelist (normalize_for_read: the ::jsonb cast and the
+ * functions verified equivalent in both engines), and the result is reparsed in
+ * place. Nothing to rewrite ⇒ the query is left untouched (the common case: ->>/->
+ * operators and plain reads never reparse). Other jsonb spellings pass through and
+ * DuckDB rejects them clearly (documented).
  */
 static void
-cf_normalize_read_jsonb(Query *query)
+cf_normalize_read(Query *query)
 {
-    char         *sql  = pg_get_querydef(query, false);
-    char         *norm = normalize_jsonb_for_read(sql);
-    ColdParamSet  ps;
+    JsonBuilderCtx jc   = { false };
+    Query         *tree = query_tree_mutator(query, cf_json_builder_mutator, &jc, 0);
+    char          *sql  = pg_get_querydef(tree, false);
+    char          *norm = normalize_for_read(sql);
+    ColdParamSet   ps;
 
-    if (strcmp(sql, norm) == 0)  /* nosemgrep */
+    if (!jc.changed && strcmp(sql, norm) == 0)  /* nosemgrep */
         return;
     collect_cold_params(query, &ps);
     cf_reparse_and_replace(query, norm, &ps);
@@ -2748,9 +2979,9 @@ cf_maybe_inject_probe(Query *query)
  * spans the cold tier: lazily attach
  * 'ice' (once per session) so the view body's iceberg_scan('ice...') resolves —
  * the version-agnostic cold-read attach (PG 16/17/18) — narrow a recognised
- * similarity search to its probed clusters, and normalize the whitelisted jsonb
- * spellings so DuckDB (which runs the whole view query) accepts them. The relkind
- * check inside query_reads_tiered_view keeps plain queries off the SPI path.
+ * similarity search to its probed clusters, and rewrite the spellings DuckDB (which
+ * runs the whole view query) lacks into ones it accepts. The relkind check inside
+ * query_reads_tiered_view keeps plain queries off the SPI path.
  */
 static void
 cf_maybe_attach_for_read(Query *query)
@@ -2762,7 +2993,7 @@ cf_maybe_attach_for_read(Query *query)
     if (!coldfront_ice_attached)
         ensure_ice_attached_once();
     cf_maybe_inject_probe(query);
-    cf_normalize_read_jsonb(query);
+    cf_normalize_read(query);
 }
 
 /*
@@ -4038,6 +4269,151 @@ register_gucs(void)
         NULL, NULL, NULL);
 }
 
+/* ---------- planner hook: bound parameters on a tiered read ------------- */
+
+/*
+ * pg_duckdb deparses a PARAM_EXTERN as a bare $N placeholder. DuckDB types most
+ * placeholders from their context (ts > $1), but not one that is a direct argument
+ * of a DuckDB function with several overloads (time_bucket's origin) or any argument
+ * of a table function (generate_series), so such a prepared tiered read fails to
+ * plan. The values are known here: the plan cache hands the planner bound_params for
+ * every custom plan, and a custom plan serves exactly that execution, so when a
+ * parameter sits in one of those two places every parameter is folded to a Const
+ * before pg_duckdb plans (what eval_const_expressions would do later for a
+ * PostgreSQL plan). The generic-plan build carries no values; it is answered with a
+ * PostgreSQL plan priced above any custom plan, so the cache keeps choosing the
+ * value-bearing custom plans and never runs the generic one (plan_cache_mode =
+ * force_generic_plan does run it, and pg_duckdb's read functions then refuse
+ * PostgreSQL execution). A read whose parameters DuckDB types on its own is left
+ * alone and keeps its generic plan. A DuckDB function is recognised as one the
+ * pg_duckdb extension owns: every function it declares stands for a DuckDB one.
+ */
+#define CF_DECOY_PLAN_COST 1.0e10
+
+typedef struct { ParamListInfo params; } FoldParamsCtx;
+typedef struct { Oid duckdb_ext; bool in_table_func; } NeedsValueCtx;
+
+static bool
+is_extern_param(Node *node)
+{
+    return node != NULL && IsA(node, Param) &&
+           ((Param *) node)->paramkind == PARAM_EXTERN;
+}
+
+static bool
+has_extern_param_walker(Node *node, void *ctx)
+{
+    if (node == NULL)
+        return false;
+    if (IsA(node, Param))
+        return is_extern_param(node);
+    if (IsA(node, Query))
+        return query_tree_walker((Query *) node, has_extern_param_walker, ctx, 0);
+    return expression_tree_walker(node, has_extern_param_walker, ctx);
+}
+
+/* True if a PARAM_EXTERN sits where DuckDB cannot type a placeholder. */
+static bool
+param_needs_value_walker(Node *node, void *ctx)
+{
+    NeedsValueCtx *nv = (NeedsValueCtx *) ctx;
+
+    if (node == NULL)
+        return false;
+    if (IsA(node, Param))
+        return nv->in_table_func && is_extern_param(node);
+    if (IsA(node, RangeTblEntry))
+    {
+        RangeTblEntry *rte = (RangeTblEntry *) node;
+        bool           found;
+
+        if (rte->rtekind != RTE_FUNCTION)
+            return false;
+        nv->in_table_func = true;
+        found = expression_tree_walker((Node *) rte->functions, param_needs_value_walker, ctx);
+        nv->in_table_func = false;
+        return found;
+    }
+    if (IsA(node, FuncExpr) &&
+        getExtensionOfObject(ProcedureRelationId, ((FuncExpr *) node)->funcid) == nv->duckdb_ext)
+    {
+        ListCell *lc;
+
+        foreach(lc, ((FuncExpr *) node)->args)
+            if (is_extern_param((Node *) lfirst(lc)))
+                return true;
+    }
+    if (IsA(node, Query))
+        return query_tree_walker((Query *) node, param_needs_value_walker, ctx,
+                                 QTW_EXAMINE_RTES_BEFORE);
+    return expression_tree_walker(node, param_needs_value_walker, ctx);
+}
+
+static Node *
+fold_params_mutator(Node *node, void *ctx)
+{
+    ParamListInfo params = ((FoldParamsCtx *) ctx)->params;
+
+    if (node == NULL)
+        return NULL;
+    if (IsA(node, Param))
+    {
+        Param           *p = (Param *) node;
+        ParamExternData  prmdata;
+        ParamExternData *prm;
+        int16            typlen;
+        bool             typbyval;
+
+        if (p->paramkind != PARAM_EXTERN || p->paramid < 1 ||
+            p->paramid > params->numParams)
+            return expression_tree_mutator(node, fold_params_mutator, ctx);
+        if (params->paramFetch != NULL)
+            prm = params->paramFetch(params, p->paramid, true, &prmdata);
+        else
+            prm = &params->params[p->paramid - 1];
+        if (!OidIsValid(prm->ptype) || prm->ptype != p->paramtype)
+            return expression_tree_mutator(node, fold_params_mutator, ctx);
+        get_typlenbyval(p->paramtype, &typlen, &typbyval);
+        return (Node *) makeConst(p->paramtype, p->paramtypmod, p->paramcollid, typlen,
+                                  prm->isnull ? (Datum) 0
+                                              : datumCopy(prm->value, typbyval, typlen),
+                                  prm->isnull, typbyval);
+    }
+    if (IsA(node, Query))
+        return (Node *) query_tree_mutator((Query *) node, fold_params_mutator, ctx, 0);
+    return expression_tree_mutator(node, fold_params_mutator, ctx);
+}
+
+static PlannedStmt *
+coldfront_planner(Query *parse, const char *query_string, int cursor_options,
+                  ParamListInfo bound_params)
+{
+    if (parse->commandType == CMD_SELECT && coldfront_registry_present() &&
+        query_tree_walker(parse, has_extern_param_walker, NULL, 0) &&
+        query_reads_tiered_view(parse))
+    {
+        NeedsValueCtx nv = { get_extension_oid("pg_duckdb", true), false };
+
+        if (OidIsValid(nv.duckdb_ext) &&
+            query_tree_walker(parse, param_needs_value_walker, &nv, QTW_EXAMINE_RTES_BEFORE))
+        {
+            FoldParamsCtx fc = { bound_params };
+
+            if (bound_params == NULL)
+            {
+                PlannedStmt *decoy = standard_planner(parse, query_string, cursor_options, NULL);
+
+                decoy->planTree->total_cost = CF_DECOY_PLAN_COST;
+                return decoy;
+            }
+            parse = query_tree_mutator(parse, fold_params_mutator, &fc, 0);
+        }
+    }
+    if (prev_planner_hook)
+        return prev_planner_hook(parse, query_string, cursor_options, bound_params);
+    return standard_planner(parse, query_string, cursor_options, bound_params);
+}
+
 void
 _PG_init(void)
 {
@@ -4045,6 +4421,12 @@ _PG_init(void)
 
     prev_post_parse_analyze_hook = post_parse_analyze_hook;
     post_parse_analyze_hook      = coldfront_post_parse_analyze;
+
+    /* Bound parameters on a tiered read (coldfront_planner). Chains pg_duckdb's
+     * planner_hook (coldfront loads later, so prev == pg_duckdb's): the fold runs
+     * before DuckDB plans. */
+    prev_planner_hook = planner_hook;
+    planner_hook      = coldfront_planner;
 
     /* DDL synchronization for tiered tables. Chains pg_duckdb's
      * ProcessUtility_hook (coldfront loads later, so prev == pg_duckdb's). */

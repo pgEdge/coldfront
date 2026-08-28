@@ -41,6 +41,14 @@ extension's non-hook surface (third table below) and register no view.
 | `self_join_rejected` | a second reference to the tiered view (self-join / `USING` / sub-select) rejected at parse-analyze |
 | `bakery_wraps_cold_writes` | every cold write funnels through `_exec_iceberg_with_claim` |
 | `update_unregistered_view`, `update_heap_table` | unregistered / non-tiered relations pass through untouched |
+| `read_date_bin` | a read that DuckDB will run has `date_bin` rewritten to `time_bucket` (DuckDB executes it against the heap and agrees with `date_bin`); a hot-rerouted read and a look-alike function name are left alone |
+| `read_json_builders` | `jsonb_build_object` / `jsonb_agg` (and the `json_` twins) on a read that DuckDB will run become the `concat` / `to_json` / `array_agg` form; the result is JSON-equal to jsonb's rendering, keeps `ORDER BY` / `FILTER`, still takes `->>`, is rewritten below the top level too, and DuckDB executes it |
+
+### `planner_hook`: bound parameters on a tiered read (executed)
+
+| test | checks |
+|---|---|
+| `read_param_fold` | `$N` values are folded into the read before pg_duckdb plans it when a parameter sits where DuckDB cannot type a placeholder (`time_bucket`'s origin, every `generate_series` argument), through seven executions of a prepared statement and of a plpgsql query, so the plan cache's generic-plan attempt after the fifth never reaches DuckDB; a literal-only read and a parameter DuckDB types from context (`ts > $1`, which keeps its generic plan) are untouched |
 
 ### `ProcessUtility_hook` — DDL gating (executed)
 

@@ -110,7 +110,7 @@ The following table describes each component, its role, and its license:
 |-----------|------|---------|
 | PostgreSQL 16+ | Heap storage; range partitioning for the tiered hot tier. Works uniformly on PG 16, 17, and 18 - the cold-tier secret is a DuckDB persistent secret loaded at instance init, with no version-gated mechanism. | PostgreSQL |
 | pg_duckdb | DuckDB in-process. Iceberg read + write. Analytics. pg_duckdb 1.5.4 (PR #1025). The `duckdb-iceberg` carries the bakery-aware commit-refresh patch (async parquet overlap, no 409); see [Cold-write strategy](#cold-write-strategy-stock-vs-patched-duckdb-iceberg). | MIT |
-| coldfront | PGXS C extension. `post_parse_analyze_hook` rewrites INSERT/UPDATE/DELETE on registered views to the correct tier; `ProcessUtility_hook` handles DDL; the hook lazily ATTACHes the Iceberg catalog on the first query touching a tiered view. | PostgreSQL |
+| coldfront | PGXS C extension. `post_parse_analyze_hook` rewrites INSERT/UPDATE/DELETE on registered views to the correct tier and, on a SELECT DuckDB will run, the spellings DuckDB lacks (`date_bin`, `::jsonb`, the JSON builders); `planner_hook` folds bound parameters into such a read; `ProcessUtility_hook` handles DDL; the hook lazily ATTACHes the Iceberg catalog on the first query touching a tiered view. | PostgreSQL |
 | Lakekeeper | Iceberg REST catalog. Single Rust binary. | Apache 2.0 |
 | S3-compatible store | Any: SeaweedFS, MinIO, GCS, Azure Blob, etc. | Varies |
 | Archiver (tiered mode) | Go binary, invoked by cron. Thin SQL orchestrator that moves rows hot→cold. | PostgreSQL |
@@ -257,6 +257,20 @@ rewrites the parsed `Query` so it lands in the correct tier; cold-side
 writes funnel through the `_exec_iceberg_with_claim` chokepoint (see
 [Concurrency](#concurrency-and-pgedge-spock-deployments)). A
 `ProcessUtility_hook` handles DDL on the same relations.
+
+The same parse-analyze hook prepares a SELECT that DuckDB will run,
+wherever in the statement the view is named (a CTE, a sub-select, a
+set-operation branch): `date_bin`, the `::jsonb` cast,
+`jsonb_array_length` and the JSON builders (`jsonb_build_object`,
+`jsonb_agg` and their `json_` twins) are rewritten into spellings both
+engines accept (see
+[usage.md → Supported column types](usage.md#supported-column-types)). A
+`planner_hook` folds bound parameters into such a read before pg_duckdb
+plans it when a parameter sits where DuckDB cannot type a placeholder (a
+direct argument of a pg_duckdb function, any argument of a table
+function); the plan cache's generic-plan build, which carries no values,
+gets a PostgreSQL plan priced above any custom plan, so the read is
+planned from its values on every execution.
 
 The following table maps each operation to its interface and routing path:
 
