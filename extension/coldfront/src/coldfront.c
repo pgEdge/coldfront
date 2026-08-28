@@ -283,68 +283,125 @@ typedef enum { TIER_HOT, TIER_COLD, TIER_AMBIGUOUS } TierClass;
 /* ---------- catalog lookup -------------------------------------------- */
 
 /*
- * Look up the tiered_views catalog row for relid via SPI, also fetching the
- * current archive watermark (if any).  vname must be get_rel_name(relid) —
- * the caller already has it, so we avoid a redundant syscache hit.
- * Returns true and populates *info (palloc'd into CurTransactionContext)
- * if found; false otherwise.
+ * Per-statement snapshot of the tiered registry.
+ *
+ * Both hooks ask "is this relation a registered view?" once per range-table
+ * entry, and a statement may name several views, most of them not ours. The
+ * registry holds one row per managed table, so the whole of it is read once per
+ * statement and matched in memory, which keeps the cost off every view a
+ * statement happens to reference.
+ *
+ * The snapshot is keyed on the command id, so a registration made earlier in
+ * this transaction (create_iceberg_table(), then a write through the view it
+ * created) belongs to an earlier command and the next statement reloads and
+ * sees it. The rows live in TopTransactionContext, which transaction end frees;
+ * the pointer is cleared in coldfront_xact_callback, so a fresh transaction
+ * cannot match a stale command id.
+ */
+typedef struct {
+    char           *schema_name;
+    char           *relname;
+    TieredViewInfo  info;
+} CfRegistryRow;
+
+static List     *cf_registry     = NIL;              /* of CfRegistryRow * */
+static CommandId cf_registry_cid = InvalidCommandId; /* command it was read for */
+
+static void
+cf_load_registry(void)
+{
+    MemoryContext oldcxt;
+    uint64        i;
+
+    cf_registry     = NIL;
+    cf_registry_cid = GetCurrentCommandId(false);
+
+    /* Absent before CREATE EXTENSION, and while another extension's install
+     * script runs a query the hooks see. No registered views, so no rewrite. */
+    if (!coldfront_registry_present())
+        return;
+    if (SPI_connect() != SPI_OK_CONNECT)
+        return;
+
+    /* The watermark joins on table_name alone: it is keyed by table name. */
+    if (SPI_execute(
+            "SELECT tv.schema_name, tv.relname, tv.hot_table, tv.iceberg_table, "
+            "       tv.partition_col, tv.is_iceberg_only, aw.cutoff_time, "
+            "       tv.vec_columns IS NOT NULL "
+            "FROM coldfront.tiered_views tv "
+            "LEFT JOIN coldfront.archive_watermark aw ON aw.table_name = tv.relname",
+            true, 0) == SPI_OK_SELECT)
+    {
+        oldcxt = MemoryContextSwitchTo(TopTransactionContext);
+        for (i = 0; i < SPI_processed; i++)
+        {
+            HeapTuple      tup = SPI_tuptable->vals[i];
+            TupleDesc      td  = SPI_tuptable->tupdesc;
+            CfRegistryRow *row = (CfRegistryRow *) palloc0(sizeof(CfRegistryRow));
+            bool           isnull;
+            Datum          d;
+
+            row->schema_name   = SPI_getvalue(tup, td, 1);
+            row->relname       = SPI_getvalue(tup, td, 2);
+            /* hot_table and partition_col are NULLable for iceberg-only rows. */
+            row->info.hot_table     = SPI_getvalue(tup, td, 3);
+            row->info.iceberg_table = SPI_getvalue(tup, td, 4);
+            row->info.partition_col = SPI_getvalue(tup, td, 5);
+
+            d = SPI_getbinval(tup, td, 6, &isnull);
+            row->info.is_iceberg_only = !isnull && DatumGetBool(d);
+
+            d = SPI_getbinval(tup, td, 7, &isnull);
+            row->info.has_cutoff = !isnull;
+            if (!isnull)
+                row->info.cutoff = DatumGetTimestampTz(d);
+
+            d = SPI_getbinval(tup, td, 8, &isnull);
+            row->info.has_vector = !isnull && DatumGetBool(d);
+
+            cf_registry = lappend(cf_registry, row);
+        }
+        MemoryContextSwitchTo(oldcxt);
+    }
+
+    SPI_finish();
+}
+
+/*
+ * Find the registry row for relid, also carrying the archive watermark (if
+ * any). vname must be get_rel_name(relid): the caller already has it, so we
+ * avoid a redundant syscache hit. Returns true and populates *info, whose
+ * strings belong to the snapshot and must not be modified, if found; false
+ * otherwise. Matching is by name, as the registry is keyed (it replicates by
+ * value across a mesh, where OIDs diverge), and the first match wins.
  */
 static bool
 lookup_tiered_view(Oid relid, const char *vname, TieredViewInfo *info)
 {
-    int            ret;
-    bool           found = false;
-    StringInfoData sql;
+    const char *nspname;
+    ListCell   *lc;
 
-    if (SPI_connect() != SPI_OK_CONNECT)
+    if (cf_registry_cid != GetCurrentCommandId(false))
+        cf_load_registry();
+    if (cf_registry == NIL)
         return false;
 
-    initStringInfo(&sql);
-    appendStringInfo(&sql,
-        "SELECT tv.hot_table, tv.iceberg_table, tv.partition_col, "
-        "       tv.is_iceberg_only, aw.cutoff_time, tv.vec_columns IS NOT NULL "
-        "FROM coldfront.tiered_views tv "
-        "LEFT JOIN coldfront.archive_watermark aw ON aw.table_name = %s "
-        "WHERE tv.schema_name = %s AND tv.relname = %s",
-        quote_literal_cstr(vname),
-        quote_literal_cstr(get_namespace_name(get_rel_namespace(relid))),
-        quote_literal_cstr(vname));
-    ret = SPI_execute(sql.data, true, 1);
+    nspname = get_namespace_name(get_rel_namespace(relid));
+    if (nspname == NULL)
+        return false;
 
-    if (ret == SPI_OK_SELECT && SPI_processed == 1)
+    foreach(lc, cf_registry)
     {
-        bool            isnull;
-        Datum           d;
-        char           *s;
-        MemoryContext   oldcxt = MemoryContextSwitchTo(CurTransactionContext);
+        CfRegistryRow *row = (CfRegistryRow *) lfirst(lc);
 
-        /* hot_table and partition_col are NULLable for iceberg-only rows. */
-        s = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
-        info->hot_table = s ? pstrdup(s) : NULL;
-
-        info->iceberg_table = pstrdup(SPI_getvalue(SPI_tuptable->vals[0],
-                                                    SPI_tuptable->tupdesc, 2));
-
-        s = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3);
-        info->partition_col = s ? pstrdup(s) : NULL;
-
-        d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 4, &isnull);
-        info->is_iceberg_only = !isnull && DatumGetBool(d);
-
-        d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 5, &isnull);
-        info->has_cutoff = !isnull;
-        if (!isnull)
-            info->cutoff = DatumGetTimestampTz(d);
-
-        d = SPI_getbinval(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 6, &isnull);
-        info->has_vector = !isnull && DatumGetBool(d);
-
-        MemoryContextSwitchTo(oldcxt);
-        found = true;
+        if (strcmp(row->relname, vname) == 0 &&       /* nosemgrep */
+            strcmp(row->schema_name, nspname) == 0)   /* nosemgrep */
+        {
+            *info = row->info;
+            return true;
+        }
     }
-
-    SPI_finish();
-    return found;
+    return false;
 }
 
 /*
@@ -3496,6 +3553,12 @@ coldfront_xact_callback(XactEvent event, void *arg)
 
     if (event != XACT_EVENT_COMMIT && event != XACT_EVENT_ABORT)
         return;
+
+    /* The registry snapshot lives in TopTransactionContext, which this
+     * transaction's end frees. Drop the pointer with it, so the next
+     * transaction reloads rather than matching a repeated command id. */
+    cf_registry     = NIL;
+    cf_registry_cid = InvalidCommandId;
 
     /* A lazy 'ice' ATTACH runs inside the user's transaction, so an abort rolls
      * the DuckDB ATTACH back.  Clear the once-per-session guard so the next

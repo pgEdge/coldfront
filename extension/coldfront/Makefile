@@ -25,7 +25,7 @@ REGRESS     = load_order update_unregistered_view update_heap_table \
               storage_secret_azure storage_secret_vended privilege_model \
               partition_config_interval self_join_rejected returning_cold_rejected \
               schema_collision drop_iceberg_table \
-              read_date_bin read_json_builders read_param_fold \
+              read_date_bin read_json_builders read_param_fold registry_snapshot \
               vector_centroids vector_type_map vector_cold_render vector_param_render vector_ops vector_probe vector_status vector_assign vector_multicolumn
 REGRESS_OPTS = --inputdir=test --outputdir=test
 

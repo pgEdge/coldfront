@@ -43,6 +43,7 @@ extension's non-hook surface (third table below) and register no view.
 | `update_unregistered_view`, `update_heap_table` | unregistered / non-tiered relations pass through untouched |
 | `read_date_bin` | a read that DuckDB will run has `date_bin` rewritten to `time_bucket` (DuckDB executes it against the heap and agrees with `date_bin`); a hot-rerouted read and a look-alike function name are left alone |
 | `read_json_builders` | `jsonb_build_object` / `jsonb_agg` (and the `json_` twins) on a read that DuckDB will run become the `concat` / `to_json` / `array_agg` form; the result is JSON-equal to jsonb's rendering, keeps `ORDER BY` / `FILTER`, still takes `->>`, is rewritten below the top level too, and DuckDB executes it |
+| `registry_snapshot` | the per-statement registry snapshot stays fresh within a transaction: a registration or a moved watermark from an earlier statement of the same transaction is seen by the next one, and a statement naming several views finds the registered one and leaves the others alone |
 
 ### `planner_hook`: bound parameters on a tiered read (executed)
 
