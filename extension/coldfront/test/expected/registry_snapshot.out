@@ -61,8 +61,8 @@ ROLLBACK;
 -- (B) The watermark joins by (schema_name, table_name), the key it is stored
 -- under: a same-named table's watermark in another schema must not attach to
 -- this view. With public.events's own row gone the view has no cutoff, so the
--- write stays plain hot-tier DML; the decoy row would otherwise classify it
--- cold.
+-- write stays plain hot-tier DML; the other schema's row would otherwise
+-- classify it cold.
 BEGIN;
 DELETE FROM coldfront.archive_watermark
  WHERE schema_name = 'public' AND table_name = 'events';

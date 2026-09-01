@@ -4408,7 +4408,7 @@ register_gucs(void)
  * alone and keeps its generic plan. A DuckDB function is recognised as one the
  * pg_duckdb extension owns: every function it declares stands for a DuckDB one.
  */
-#define CF_DECOY_PLAN_COST 1.0e10
+#define CF_GENERIC_PLAN_COST 1.0e10
 
 typedef struct { ParamListInfo params; } FoldParamsCtx;
 typedef struct { Oid duckdb_ext; bool in_table_func; } NeedsValueCtx;
@@ -4521,10 +4521,10 @@ coldfront_planner(Query *parse, const char *query_string, int cursor_options,
 
             if (bound_params == NULL)
             {
-                PlannedStmt *decoy = standard_planner(parse, query_string, cursor_options, NULL);
+                PlannedStmt *generic = standard_planner(parse, query_string, cursor_options, NULL);
 
-                decoy->planTree->total_cost = CF_DECOY_PLAN_COST;
-                return decoy;
+                generic->planTree->total_cost = CF_GENERIC_PLAN_COST;
+                return generic;
             }
             parse = query_tree_mutator(parse, fold_params_mutator, &fc, 0);
         }
