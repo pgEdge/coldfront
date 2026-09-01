@@ -323,13 +323,13 @@ cf_load_registry(void)
     if (SPI_connect() != SPI_OK_CONNECT)
         return;
 
-    /* The watermark joins on table_name alone: it is keyed by table name. */
     if (SPI_execute(
             "SELECT tv.schema_name, tv.relname, tv.hot_table, tv.iceberg_table, "
             "       tv.partition_col, tv.is_iceberg_only, aw.cutoff_time, "
             "       tv.vec_columns IS NOT NULL "
             "FROM coldfront.tiered_views tv "
-            "LEFT JOIN coldfront.archive_watermark aw ON aw.table_name = tv.relname",
+            "LEFT JOIN coldfront.archive_watermark aw "
+            "  ON aw.schema_name = tv.schema_name AND aw.table_name = tv.relname",
             true, 0) == SPI_OK_SELECT)
     {
         oldcxt = MemoryContextSwitchTo(TopTransactionContext);

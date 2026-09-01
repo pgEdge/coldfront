@@ -1,9 +1,11 @@
--- The registry is read once per statement and matched in memory. Two behaviours
--- that the snapshot must preserve:
+-- The registry is read once per statement and matched in memory. Three
+-- behaviours that the snapshot must preserve:
 --   (A) a registration made earlier in the same transaction is visible to the
 --       next statement, so create_iceberg_table() followed by a write through
 --       the view it created still rewrites.
---   (B) a statement naming several views finds the registered one among them,
+--   (B) the watermark attaches by (schema_name, table_name), never by table
+--       name alone.
+--   (C) a statement naming several views finds the registered one among them,
 --       and leaves the others alone.
 -- White-box: the assertions are on the rewritten SQL, not on Iceberg I/O.
 -- Suppress the run-order-dependent "already exists" NOTICE: in the shared regress
@@ -40,7 +42,21 @@ EXPLAIN (COSTS OFF)
   UPDATE public.events SET status = 'y' WHERE ts < '2019-01-01'::timestamptz;
 ROLLBACK;
 
--- (B) Two plain views the registry does not know, named alongside the tiered
+-- (B) The watermark joins by (schema_name, table_name), the key it is stored
+-- under: a same-named table's watermark in another schema must not attach to
+-- this view. With public.events's own row gone the view has no cutoff, so the
+-- write stays plain hot-tier DML; the decoy row would otherwise classify it
+-- cold.
+BEGIN;
+DELETE FROM coldfront.archive_watermark
+ WHERE schema_name = 'public' AND table_name = 'events';
+INSERT INTO coldfront.archive_watermark(schema_name, table_name, cutoff_time)
+VALUES ('other', 'events', '2026-03-01'::timestamptz);
+EXPLAIN (COSTS OFF)
+  UPDATE public.events SET status = 'z' WHERE ts < '2019-01-01'::timestamptz;
+ROLLBACK;
+
+-- (C) Two plain views the registry does not know, named alongside the tiered
 -- one. The tiered view is still found, so the builder is rewritten. The JSON
 -- rewrite is the one to assert on here: its output is PostgreSQL's own plan,
 -- where date_bin's would be a DuckDB plan carrying row estimates.
