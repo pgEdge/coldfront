@@ -294,9 +294,11 @@ typedef enum { TIER_HOT, TIER_COLD, TIER_AMBIGUOUS } TierClass;
  * The snapshot is keyed on the command id, so a registration made earlier in
  * this transaction (create_iceberg_table(), then a write through the view it
  * created) belongs to an earlier command and the next statement reloads and
- * sees it. The rows live in TopTransactionContext, which transaction end frees;
- * the pointer is cleared in coldfront_xact_callback, so a fresh transaction
- * cannot match a stale command id.
+ * sees it. The rows live in a child context of TopTransactionContext that each
+ * reload resets, so a superseded snapshot is freed at the next load rather
+ * than accumulating until transaction end; the pointers are cleared in
+ * coldfront_xact_callback, so a fresh transaction cannot match a stale
+ * command id.
  */
 typedef struct {
     char           *schema_name;
@@ -304,8 +306,9 @@ typedef struct {
     TieredViewInfo  info;
 } CfRegistryRow;
 
-static List     *cf_registry     = NIL;              /* of CfRegistryRow * */
-static CommandId cf_registry_cid = InvalidCommandId; /* command it was read for */
+static List         *cf_registry     = NIL;              /* of CfRegistryRow * */
+static CommandId     cf_registry_cid = InvalidCommandId; /* command it was read for */
+static MemoryContext cf_registry_cxt = NULL;             /* holds the snapshot's rows */
 
 static void
 cf_load_registry(void)
@@ -315,6 +318,16 @@ cf_load_registry(void)
 
     cf_registry     = NIL;
     cf_registry_cid = GetCurrentCommandId(false);
+
+    /* The snapshot's own context: created on first use, reset (freeing the
+     * superseded snapshot) on every reload, freed with its parent at
+     * transaction end. */
+    if (cf_registry_cxt == NULL)
+        cf_registry_cxt = AllocSetContextCreate(TopTransactionContext,
+                                                "coldfront registry snapshot",
+                                                ALLOCSET_SMALL_SIZES);
+    else
+        MemoryContextReset(cf_registry_cxt);
 
     /* Absent before CREATE EXTENSION, and while another extension's install
      * script runs a query the hooks see. No registered views, so no rewrite. */
@@ -332,7 +345,7 @@ cf_load_registry(void)
             "  ON aw.schema_name = tv.schema_name AND aw.table_name = tv.relname",
             true, 0) == SPI_OK_SELECT)
     {
-        oldcxt = MemoryContextSwitchTo(TopTransactionContext);
+        oldcxt = MemoryContextSwitchTo(cf_registry_cxt);
         for (i = 0; i < SPI_processed; i++)
         {
             HeapTuple      tup = SPI_tuptable->vals[i];
@@ -3611,11 +3624,12 @@ coldfront_xact_callback(XactEvent event, void *arg)
     if (event != XACT_EVENT_COMMIT && event != XACT_EVENT_ABORT)
         return;
 
-    /* The registry snapshot lives in TopTransactionContext, which this
-     * transaction's end frees. Drop the pointer with it, so the next
-     * transaction reloads rather than matching a repeated command id. */
+    /* The registry snapshot's context is a child of TopTransactionContext,
+     * which this transaction's end frees. Drop the pointers with it, so the
+     * next transaction reloads rather than matching a repeated command id. */
     cf_registry     = NIL;
     cf_registry_cid = InvalidCommandId;
+    cf_registry_cxt = NULL;
 
     /* A lazy 'ice' ATTACH runs inside the user's transaction, so an abort rolls
      * the DuckDB ATTACH back.  Clear the once-per-session guard so the next
