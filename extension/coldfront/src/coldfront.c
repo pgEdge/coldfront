@@ -908,17 +908,22 @@ cf_apply_subst(const char *sql, const CfSubst *map, int map_len, bool jsonb_catc
                         if (*p == ')')
                             p++;
                     }
-                    /* The spelling ends with its own '(', already consumed, so
-                     * the call's arguments sit one level in. Its close is the
-                     * ')' that brings the depth back to where it started. */
-                    if (map[i].wrap)
+                    /* A function spelling ends with its own '(', already
+                     * consumed, so the call's arguments sit one level in and
+                     * the depth must count it. The call's close is the ')'
+                     * that brings the depth back to where it started, and a
+                     * wrapped call owes an added close there. */
+                    if (map[i].pg[plen - 1] == '(')
                     {
-                        if (nwrap == CF_WRAP_MAX)
-                            ereport(ERROR,
-                                    (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
-                                     errmsg("coldfront: JSON aggregates nested deeper than %d",
-                                            CF_WRAP_MAX)));
-                        wrap_at[nwrap++] = depth;
+                        if (map[i].wrap)
+                        {
+                            if (nwrap == CF_WRAP_MAX)
+                                ereport(ERROR,
+                                        (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                                         errmsg("coldfront: JSON aggregates nested deeper than %d",
+                                                CF_WRAP_MAX)));
+                            wrap_at[nwrap++] = depth;
+                        }
                         depth++;
                     }
                     replaced = true;

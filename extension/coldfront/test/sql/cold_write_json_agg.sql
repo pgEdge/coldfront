@@ -67,10 +67,20 @@ EXPLAIN (COSTS OFF, VERBOSE)
 UPDATE public.events SET data = to_jsonb('jsonb_agg(x)'::text)
 WHERE ts < '2019-01-01'::timestamptz;
 
+-- (A8) The reverse nesting of (A5): a builder inside the aggregate, with an
+-- operator applied to the builder's result. The builder's own paren also counts
+-- toward the depth, so the added paren still lands at the aggregate's close,
+-- keeping the operator and the ORDER BY inside array_agg.
+EXPLAIN (COSTS OFF, VERBOSE)
+UPDATE public.events
+SET data = (SELECT jsonb_agg(jsonb_build_object('k', k) ->> 'k' ORDER BY k) FROM public.src)
+WHERE ts < '2019-01-01'::timestamptz;
+
 -- (B) Parity against the live DuckDB: the target is accepted (ordered and not),
 -- and both spellings it replaces are rejected. A void row = accepted.
 SELECT duckdb.raw_query($$ SELECT to_json(array_agg(x ORDER BY x)) FROM (VALUES ('b'),('a')) v(x) $$);
 SELECT duckdb.raw_query($$ SELECT to_json(array_agg(x)) FROM (VALUES ('b'),('a')) v(x) $$);
+SELECT duckdb.raw_query($$ SELECT to_json(array_agg(json_object('k', x) ->> 'k' ORDER BY x)) FROM (VALUES ('b'),('a')) v(x) $$);
 SELECT duckdb.raw_query($$ SELECT json_agg(x) FROM (VALUES ('a')) v(x) $$);
 SELECT duckdb.raw_query($$ SELECT jsonb_agg(x) FROM (VALUES ('a')) v(x) $$);
 -- json_group_array is why the target is not that: a macro cannot take ORDER BY.
