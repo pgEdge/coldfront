@@ -269,8 +269,12 @@ engines accept (see
 plans it when a parameter sits where DuckDB cannot type a placeholder (a
 direct argument of a pg_duckdb function, any argument of a table
 function); the plan cache's generic-plan build, which carries no values,
-gets a PostgreSQL plan priced above any custom plan, so the read is
-planned from its values on every execution.
+gets a PostgreSQL plan priced above any custom plan, so under the plan
+cache's cost-based selection the read is planned from its values on every
+execution. `plan_cache_mode = force_generic_plan` bypasses that selection
+and picks the value-less generic plan, which fails with `only works with
+DuckDB execution` (see
+[usage.md → Supported column types](usage.md#supported-column-types)).
 
 The following table maps each operation to its interface and routing path:
 
