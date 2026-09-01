@@ -297,3 +297,96 @@ func TestRequireNoDefaultPartition_PropagatesQueryError(t *testing.T) {
 		t.Fatal("query failure must not be reported as no default")
 	}
 }
+
+// coldTierDB answers the two questions the column guard asks: does this database
+// have the extension, then what does its type map say about the table's columns.
+// checkErr stands in for the RAISE the extension throws on a type Iceberg cannot
+// store.
+type coldTierDB struct {
+	mockDB
+	installed bool
+	checkErr  error
+	asked     []string
+	args      []any
+}
+
+func (d *coldTierDB) QueryRow(_ context.Context, sql string, args ...any) pgx.Row {
+	d.asked = append(d.asked, sql)
+	if len(d.asked) == 1 {
+		return &mockRow{scan: func(dest ...any) error {
+			*(dest[0].(*bool)) = d.installed
+			return nil
+		}}
+	}
+	d.args = args
+	return &mockRow{scan: func(dest ...any) error {
+		if d.checkErr != nil {
+			return d.checkErr
+		}
+		*(dest[0].(*int)) = 3
+		return nil
+	}}
+}
+
+// The message the extension raises for the canonical case: PostgreSQL's
+// full-text pattern is a generated tsvector column, and Iceberg has no type
+// for it.
+var errUnmappable = errors.New("ERROR: coldfront: PG type tsvector has no Iceberg-compatible mapping")
+
+func TestRequireMappableColumns_RejectsUnmappableType(t *testing.T) {
+	// The rejection carries the extension's own wording (which type), the table
+	// it came from, and the partition-only alternative, which is open at
+	// registration and gone by archive time.
+	db := &coldTierDB{installed: true, checkErr: errUnmappable}
+	err := requireMappableColumns(context.Background(), db, "public", "events", "1 month")
+	if err == nil {
+		t.Fatal("expected rejection")
+	}
+	for _, want := range []string{"public.events", "tsvector", "partitions only"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("error %q does not mention %q", err.Error(), want)
+		}
+	}
+}
+
+func TestRequireMappableColumns_SkipsPartitionOnlyRow(t *testing.T) {
+	// No hot period, no cold tier: the column types are PostgreSQL's business
+	// alone, and a table that registers today must keep registering. The same
+	// unmappable table passes, without the database being asked at all.
+	db := &coldTierDB{installed: true, checkErr: errUnmappable}
+	if err := requireMappableColumns(context.Background(), db, "public", "events", ""); err != nil {
+		t.Fatalf("a partition-only row must not be type-checked: %v", err)
+	}
+	if len(db.asked) != 0 {
+		t.Errorf("a partition-only row queried the database: %v", db.asked)
+	}
+}
+
+func TestRequireMappableColumns_SkipsDatabaseWithoutTheExtension(t *testing.T) {
+	// A stock-PG partitioner node has no cold tier, so there is nothing for the
+	// row to be wrong about, and nothing to ask.
+	db := &coldTierDB{installed: false, checkErr: errUnmappable}
+	if err := requireMappableColumns(context.Background(), db, "public", "events", "1 month"); err != nil {
+		t.Fatalf("a database with no cold tier must not be type-checked: %v", err)
+	}
+	if len(db.asked) != 1 {
+		t.Errorf("expected only the extension probe, got %d queries", len(db.asked))
+	}
+}
+
+func TestRequireMappableColumns_AcceptsMappableTable(t *testing.T) {
+	db := &coldTierDB{installed: true}
+	if err := requireMappableColumns(context.Background(), db, "public", "events", "1 month"); err != nil {
+		t.Fatalf("a fully mappable table must pass: %v", err)
+	}
+	if len(db.args) != 2 || db.args[0] != "public" || db.args[1] != "events" {
+		t.Errorf("schema/table not passed as args: %v", db.args)
+	}
+	// The extension's map decides, not a second copy in Go, and its companion
+	// predicate is what keeps a vector's generated real[] column out of the check.
+	for _, want := range []string{"coldfront._iceberg_storage_type", "coldfront._is_vec_companion"} {
+		if !strings.Contains(db.asked[1], want) {
+			t.Errorf("the check does not go through %s", want)
+		}
+	}
+}

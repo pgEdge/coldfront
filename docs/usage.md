@@ -419,6 +419,12 @@ one command rejects cannot be added by another. Registration fails when:
 - the name leaves no room for the generated partition suffix: 53
   characters for monthly and 50 for daily, within PostgreSQL's 63-byte
   identifier limit.
+- a tiered table carries a column whose type has no Iceberg equivalent
+  (see [Supported column types](#supported-column-types)). Every column
+  goes through the same type map the cold tier itself uses, so the answer
+  comes back at the prompt rather than hours later from cron.
+  Partition-only tables are exempt: nothing about them reaches Iceberg,
+  so their column types are PostgreSQL's business alone.
 
 Registration validates the table as it is at that moment, not
 continuously. Adding a `DEFAULT` partition to an already-registered table
@@ -637,9 +643,10 @@ The following PostgreSQL column types are supported:
 `interval`
 
 Anything else (unbounded `numeric`, `xml`, `tsvector`, range/multirange
-types, custom enums, arrays, composite types) is rejected at
-table-creation time. We refuse silent fallback to `varchar` - losing
-precision/identity is worse than no support.
+types, custom enums, arrays, composite types) is rejected when a tiered
+table is registered, and when a decoupled table is created. We refuse
+silent fallback to `varchar` - losing precision/identity is worse than
+no support.
 
 `char(N)` is stored and read as `varchar`. The data round-trips
 losslessly: values, comparisons, and `length()` match a hot PG table,
