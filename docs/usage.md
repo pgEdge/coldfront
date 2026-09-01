@@ -419,6 +419,12 @@ one command rejects cannot be added by another. Registration fails when:
 - the name leaves no room for the generated partition suffix: 53
   characters for monthly and 50 for daily, within PostgreSQL's 63-byte
   identifier limit.
+- a tiered table carries a column whose type has no Iceberg equivalent
+  (see [Supported column types](#supported-column-types)). Every column
+  goes through the same type map the cold tier itself uses, so the answer
+  comes back at the prompt rather than hours later from cron.
+  Partition-only tables are exempt: nothing about them reaches Iceberg,
+  so their column types are PostgreSQL's business alone.
 
 Registration validates the table as it is at that moment, not
 continuously. Adding a `DEFAULT` partition to an already-registered table
@@ -637,9 +643,10 @@ The following PostgreSQL column types are supported:
 `interval`
 
 Anything else (unbounded `numeric`, `xml`, `tsvector`, range/multirange
-types, custom enums, arrays, composite types) is rejected at
-table-creation time. We refuse silent fallback to `varchar` - losing
-precision/identity is worse than no support.
+types, custom enums, arrays, composite types) is rejected when a tiered
+table is registered, and when a decoupled table is created. We refuse
+silent fallback to `varchar` - losing precision/identity is worse than
+no support.
 
 `char(N)` is stored and read as `varchar`. The data round-trips
 losslessly: values, comparisons, and `length()` match a hot PG table,
@@ -653,8 +660,14 @@ native primitive). On read, `interval` is view-cast back to the rich PG
 type; `json` and `jsonb` surface as DuckDB's `json` (the equivalent of
 PG's `jsonb`), not the rich PG `jsonb` type, because Iceberg-backed reads
 run entirely in DuckDB. Queries like `data->>'key'` and `data->'key'`
-work, and ColdFront translates the `::jsonb` cast and `jsonb_array_length`
-on read. The jsonb-only operators (`?`, `@>`, `<@`, `#>`, `#>>`) and most
+work, and ColdFront translates the `::jsonb` cast, `jsonb_array_length`,
+`jsonb_build_object` / `jsonb_agg` (and their `json_` twins, which DuckDB
+also lacks) and `date_bin` on read: the builders become the `concat` /
+`to_json` / `array_agg` form both engines evaluate identically (the result
+is JSON-equal to jsonb's rendering, in compact form and in argument
+order), and `date_bin` becomes DuckDB's `time_bucket`, which takes the
+same arguments and agrees on every fixed-width bucket. The jsonb-only
+operators (`?`, `@>`, `<@`, `#>`, `#>>`) and most
 jsonb functions (`jsonb_typeof`, `jsonb_extract_path`,
 `jsonb_extract_path_text`, `jsonb_set`, `jsonb_path_*`, `jsonb_each`,
 `jsonb_object_keys`) are not supported on tiered or decoupled data:
@@ -665,6 +678,17 @@ These limits apply only to reads that go through a tiered or
 iceberg-only view, which pg_duckdb plans entirely in DuckDB. Ordinary
 (non-tiered) PostgreSQL tables are untouched by ColdFront and keep full
 jsonb support, as does the hot partition table itself.
+
+Bound parameters (`$1` from a prepared statement, a driver's extended
+protocol, or a plpgsql variable) work in such reads. DuckDB types most
+placeholders from their context (`ts > $1`); one that is a direct
+argument of a DuckDB function with several overloads (`time_bucket`'s
+origin, so `date_bin`'s) or any argument of a table function
+(`generate_series`) it cannot, so ColdFront plans such a read from the
+bound values on every execution instead of caching a generic plan. Under
+`plan_cache_mode = force_generic_plan` those reads cannot run: the forced
+generic plan has no values and fails with `only works with DuckDB
+execution`.
 
 A hot-only read is the exception. When a `SELECT` reads a tiered view
 directly (no join, CTE, or sub-query) and its `WHERE` provably restricts
@@ -686,9 +710,9 @@ index/compare them; cast on the hot side only if needed).
 Keep the following caveats in mind when running either mode:
 
 - **`jsonb` reads**: surface as `json`. The `->`/`->>` operators work,
-  and ColdFront translates the `::jsonb` cast and `jsonb_array_length`;
-  other jsonb operators and functions are unsupported on cold or
-  cross-tier reads. A hot-only read of the view runs in PostgreSQL with
+  and ColdFront translates the `::jsonb` cast, `jsonb_array_length`,
+  `jsonb_build_object` / `jsonb_agg` and `date_bin`; other jsonb
+  operators and functions are unsupported on cold or cross-tier reads. A hot-only read of the view runs in PostgreSQL with
   full jsonb (see Supported column types).
 - **Cross-tier isolation**: a long-running `SELECT` that touches the
   Iceberg side multiple times within one transaction may see writes from

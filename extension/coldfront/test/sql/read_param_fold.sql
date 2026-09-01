@@ -1,0 +1,94 @@
+-- Bound parameters on a tiered read. pg_duckdb deparses $N as a placeholder, and
+-- DuckDB cannot type a placeholder it sees only as one overload candidate among
+-- several (time_bucket's third argument) or as a table-function argument
+-- (generate_series), so the prepared read fails to plan. coldfront's planner hook
+-- folds the bound values into the query before pg_duckdb plans it, and hands the
+-- plan cache a prohibitively costed PostgreSQL plan when no values are bound (the
+-- generic-plan build) so it keeps choosing value-bearing custom plans. White-box:
+-- DuckDB runs the reads against the heap (duckdb.force_execution); no Iceberg I/O.
+-- Suppress the run-order-dependent "already exists" NOTICE: in the shared regress
+-- db an earlier test may have created the extensions, standalone not.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_duckdb;
+CREATE EXTENSION IF NOT EXISTS coldfront;
+RESET client_min_messages;
+SET TIME ZONE 'UTC';
+-- White-box: checks the generated SQL, not Iceberg I/O.
+SET coldfront.warehouse = '';
+SET coldfront.lakekeeper_endpoint = '';
+
+CREATE TABLE public._events (id int, ts timestamptz);
+CREATE VIEW public.events AS SELECT * FROM public._events;
+INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
+VALUES ('public', 'events', 'public._events', 'ice.default.events', 'ts');
+INSERT INTO coldfront.archive_watermark(schema_name, table_name, cutoff_time)
+VALUES ('public', 'events', '2026-03-01'::timestamptz);
+INSERT INTO public._events VALUES (1, '2026-01-01 00:05+00'),
+                                  (2, '2026-01-01 00:50+00'),
+                                  (3, '2026-01-01 01:07+00');
+SET duckdb.force_execution = true;
+
+-- (A) Every parameter sits where DuckDB cannot type a placeholder: the bucket
+-- origin and width, and all three generate_series arguments. Seven executions
+-- cross the plan cache's switch from custom to generic planning after the fifth,
+-- and every one returns the same rows with no planning warning.
+PREPARE buckets(timestamptz, timestamptz, interval) AS
+SELECT g.bucket, count(e.id) AS n
+FROM generate_series($1, $2, $3) AS g(bucket)
+LEFT JOIN public.events e ON time_bucket($3, e.ts, $1) = g.bucket
+GROUP BY 1 ORDER BY 1;
+EXECUTE buckets('2026-01-01 00:00+00', '2026-01-01 03:00+00', '1 hour');
+EXECUTE buckets('2026-01-01 00:00+00', '2026-01-01 03:00+00', '1 hour');
+EXECUTE buckets('2026-01-01 00:00+00', '2026-01-01 03:00+00', '1 hour');
+EXECUTE buckets('2026-01-01 00:00+00', '2026-01-01 03:00+00', '1 hour');
+EXECUTE buckets('2026-01-01 00:00+00', '2026-01-01 03:00+00', '1 hour');
+EXECUTE buckets('2026-01-01 00:00+00', '2026-01-01 03:00+00', '1 hour');
+EXECUTE buckets('2026-01-01 00:00+00', '2026-01-01 03:00+00', '1 hour');
+-- The plan is built from the values, so new values change the answer.
+EXECUTE buckets('2026-01-01 00:00+00', '2026-01-01 01:00+00', '30 minutes');
+
+-- (B) plpgsql variables reach the planner through the parameter-fetch hook rather
+-- than an array of values; the loop crosses the same custom-to-generic switch.
+-- pg_duckdb gates DuckDB execution inside functions on its own setting.
+SET duckdb.unsafe_allow_execution_inside_functions = true;
+CREATE FUNCTION public.bucket_rows(p_from timestamptz, p_to timestamptz, p_w interval)
+RETURNS bigint LANGUAGE plpgsql AS $$
+DECLARE
+  total bigint := 0;
+BEGIN
+  FOR i IN 1..7 LOOP
+    total := total + (SELECT count(*)
+                      FROM generate_series(p_from, p_to, p_w) AS g(bucket)
+                      LEFT JOIN public.events e ON time_bucket(p_w, e.ts, p_from) = g.bucket);
+  END LOOP;
+  RETURN total;
+END $$;
+SELECT public.bucket_rows('2026-01-01 00:00+00', '2026-01-01 03:00+00', '1 hour') AS rows_over_7_runs;
+
+-- (C) A read without parameters is not touched: the same query with literals plans
+-- as before.
+SELECT g.bucket, count(e.id) AS n
+FROM generate_series('2026-01-01 00:00+00'::timestamptz, '2026-01-01 03:00+00'::timestamptz, '1 hour'::interval) AS g(bucket)
+LEFT JOIN public.events e ON time_bucket('1 hour'::interval, e.ts, '2026-01-01 00:00+00'::timestamptz) = g.bucket
+GROUP BY 1 ORDER BY 1;
+
+-- (D) A parameter DuckDB types from its context (a comparison) is left alone, so
+-- that read keeps a generic plan: it works even when the plan cache is forced to
+-- plan without values. The read whose parameters need values has no generic plan;
+-- forced to one, it is the placeholder PostgreSQL plan, and pg_duckdb's function
+-- refuses to run outside DuckDB.
+SET plan_cache_mode = force_generic_plan;
+PREPARE since(timestamptz) AS SELECT count(*) FROM public.events WHERE ts > $1;
+EXECUTE since('2026-01-01 00:30+00');
+EXECUTE buckets('2026-01-01 00:00+00', '2026-01-01 03:00+00', '1 hour');
+RESET plan_cache_mode;
+
+-- Cleanup.
+RESET duckdb.force_execution;
+DEALLOCATE since;
+DEALLOCATE buckets;
+DROP FUNCTION public.bucket_rows(timestamptz, timestamptz, interval);
+DELETE FROM coldfront.tiered_views;
+DELETE FROM coldfront.archive_watermark;
+DROP VIEW public.events;
+DROP TABLE public._events;

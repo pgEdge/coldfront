@@ -142,6 +142,10 @@ assert_register_rejected() {
     fi
 }
 
+# qdb <db> <sql>: q against another database on the same server. Extensions are
+# per-database, so a database story 1 never touched is stock PostgreSQL.
+qdb() { local d="$1"; shift; docker exec -e PGUSER="$CF_DBUSER" -e PGDATABASE="$d" "$HOST" "$CF_PSQL" -tA -c "$*"; }
+
 # archive_only — run the archiver with ONLY the partition_config rows matching a
 # keep predicate enabled, then restore the rows it disabled. The archiver takes
 # its table set from coldfront.partition_config, never from the YAML
@@ -3329,6 +3333,62 @@ story_partitioner_remove() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# Story: the standalone partition manager, on stock PostgreSQL. Every other story
+# shares the database story 1 installed pg_duckdb and coldfront into, so nothing
+# covers the configuration the partitioner is documented to run in. A database
+# story 1 never touched is that configuration, on this same server: no extension,
+# so partition_config is the Go-side DDL's to create, and a hot period has no
+# cold tier behind it to type-check a column against.
+# ───────────────────────────────────────────────────────────────────────────
+story_partitioner_stock_pg() {
+    step "TC-151: standalone partitioner on stock PostgreSQL (no extension)"
+    local db=cf_stock_pg
+    local dsn="host=${DB_IP} port=5432 dbname=$db user=coldfront password=coldfront sslmode=disable"
+    q "$HOST" "DROP DATABASE IF EXISTS $db;" >/dev/null 2>&1
+    q "$HOST" "CREATE DATABASE $db;" >/dev/null
+    assert_eq "TC-151: the database carries neither extension" "0" \
+        "$(qdb $db "SELECT count(*) FROM pg_extension WHERE extname IN ('coldfront','pg_duckdb');")"
+    qdb $db "CREATE TABLE public.stockev (id bigint GENERATED ALWAYS AS IDENTITY,
+        ts timestamptz NOT NULL, PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);" >/dev/null
+
+    # With no extension to have created it, partition_config is materialized by
+    # the partitioner's own DDL, the copy that exists for exactly this case.
+    if "$PARTITIONER" register --dsn "$dsn" --table stockev --period monthly \
+            --retention "12 months" >$TMPD/stock-reg.log 2>&1; then
+        assert_eq "TC-151: register materialized its own partition_config" "1" \
+            "$(qdb $db "SELECT count(*) FROM coldfront.partition_config WHERE table_name='stockev';")"
+    else
+        fail "TC-151: register failed on stock PG"; tail -3 $TMPD/stock-reg.log
+    fi
+
+    # The tsvector column TC-150 refuses on a tiered node registers here: with no
+    # extension there is no cold tier for a column type to be wrong about.
+    qdb $db "CREATE TABLE public.stockfts (id bigint NOT NULL, ts timestamptz NOT NULL, body text,
+        tsv tsvector GENERATED ALWAYS AS (to_tsvector('english', coalesce(body,''))) STORED,
+        PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);" >/dev/null
+    if "$PARTITIONER" register --dsn "$dsn" --table stockfts --period monthly \
+            --hot-period "30 days" >$TMPD/stock-fts.log 2>&1; then
+        pass "TC-151: no extension, no cold tier, no column type check"
+    else
+        fail "TC-151: stock PG must not type-check a column"; tail -3 $TMPD/stock-fts.log
+    fi
+
+    # And the job itself: a reconcile run creates the forward window.
+    printf 'postgres: { dsn: "%s" }\n' "$dsn" > $TMPD/stock.yaml
+    if "$PARTITIONER" --config $TMPD/stock.yaml >$TMPD/stock-run.log 2>&1; then
+        assert_ne "TC-151: reconcile created partitions" "0" \
+            "$(qdb $db "SELECT count(*) FROM pg_inherits WHERE inhparent='public.stockev'::regclass;")"
+    else
+        fail "TC-151: reconcile failed on stock PG"; tail -5 $TMPD/stock-run.log
+    fi
+
+    "$PARTITIONER" remove --dsn "$dsn" --table stockev >/dev/null 2>&1
+    assert_eq "TC-151: remove unregistered it" "0" \
+        "$(qdb $db "SELECT count(*) FROM coldfront.partition_config WHERE table_name='stockev';")"
+    q "$HOST" "DROP DATABASE $db;" >/dev/null
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Story — TC-071: a PARTITION BY RANGE (col1, col2) table is rejected at
 # archive time with a clear error. The PK check at register time passes (the
 # PK covers every partition-key column), but the archiver's single scalar
@@ -4159,6 +4219,50 @@ story_bad_source_names_rejected() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# Story: a column type the cold tier cannot store is refused at register, not
+# hours later on the first archive cycle. tsvector is the canonical case:
+# PostgreSQL's full-text pattern is a generated tsvector column, and Iceberg has
+# no type for it. Registration goes through the extension's own type map, the one
+# every cold write already uses, so what registers is what an archive cycle
+# accepts. Partition-only management is untouched, since nothing about such a
+# table ever reaches Iceberg.
+# ───────────────────────────────────────────────────────────────────────────
+story_unmappable_column_rejected() {
+    step "TC-150: column type with no Iceberg mapping rejected at register"
+    local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
+    q "$HOST" "CREATE TABLE IF NOT EXISTS public.tc150_fts (
+        id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL, body text,
+        tsv tsvector GENERATED ALWAYS AS (to_tsvector('english', coalesce(body,''))) STORED,
+        PRIMARY KEY (id, ts)
+    ) PARTITION BY RANGE (ts);" >/dev/null
+    assert_eq "TC-150: fixture carries a generated tsvector column" "tsvector" \
+        "$(q "$HOST" "SELECT format_type(atttypid, atttypmod) FROM pg_attribute
+                       WHERE attrelid='public.tc150_fts'::regclass AND attname='tsv';")"
+    assert_register_rejected "TC-150: register named the unstorable type" \
+        tc150_fts "PG type tsvector has no Iceberg-compatible mapping"
+    # The partitioner writes tiered rows through the same gate, and the archiver
+    # is what later reads them, so the refusal must not be dodgeable by
+    # registering from the binary that owns no cold tier.
+    if "$PARTITIONER" register --dsn "$dsn" --table tc150_fts \
+            --period monthly --hot-period "30 days" >$TMPD/unmappable-part.log 2>&1; then
+        fail "TC-150: partitioner accepted a tiered row the archiver cannot process"
+    else
+        assert_contains "TC-150: partitioner refused it too" "tsvector" "$(cat $TMPD/unmappable-part.log)"
+    fi
+    # The same table is fine partition-only: --dry-run validates everything and
+    # writes nothing, so the acceptance is asserted without leaving a config row.
+    if "$ARCHIVER" register --config $TMPD/archiver.yaml --table tc150_fts \
+            --period monthly --retention "5 years" --dry-run >$TMPD/unmappable-po.log 2>&1; then
+        pass "TC-150: the same table validates partition-only (no cold tier, no type check)"
+    else
+        fail "TC-150: partition-only must be unaffected, see $TMPD/unmappable-po.log"; tail -3 $TMPD/unmappable-po.log
+    fi
+    assert_eq "TC-150: still nothing registered after both binaries tried" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='tc150_fts';")"
+    q "$HOST" "DROP TABLE IF EXISTS public.tc150_fts CASCADE;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Story — TC-114: TEMPORARY table invisible to archiver — register fails with
 # a "does not exist" error. TEMP tables are session-local; the archiver
 # connects in a new session and cannot see them.
@@ -4783,6 +4887,7 @@ if [ "$MODE" = "tiered" ]; then
     story_partitioner_set_retention    # TC-052: set --retention updates partition_config
     story_partitioner_disable_enable   # TC-053: disable silently excludes; enable restores
     story_partitioner_remove           # TC-054: remove unregisters; table intact
+    story_partitioner_stock_pg         # TC-151: standalone partitioner on stock PG (no extension)
     story_composite_key_rejected       # TC-071: RANGE (col1, col2) rejected at archive time
     story_iceberg_metadata             # TC-043: cold data confirmed via Parquet metadata
     story_pg_dump_no_secrets           # TC-058: storage secret not in pg_dump
@@ -4795,6 +4900,7 @@ if [ "$MODE" = "tiered" ]; then
     story_unlogged_rejected            # TC-113: UNLOGGED rejected at register
     story_case_collision_rejected      # TC-141: name differing only by case rejected at register
     story_bad_source_names_rejected    # TC-139/TC-142: leading underscore and over-long names rejected
+    story_unmappable_column_rejected   # TC-150: column type with no Iceberg mapping rejected at register
     story_quoted_table_names           # TC-140/TC-143/TC-144: dot, hyphen, space in table name
     story_temp_rejected                # TC-114: TEMP table invisible to archiver
     story_list_partition_rejected      # TC-115: LIST partition accepted at register; rejected at archive
