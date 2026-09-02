@@ -4584,6 +4584,97 @@ dit_case() {
     dit_assert_objects "$label" "$loc" "$before" "$purge"
 }
 
+story_duckdb_spill_concurrency() {
+    step "TC-153: concurrent DuckDB spills land in their own directories and stay correct"
+    local dd base want seen pids bad i
+    dd=$(q "$HOST" "SHOW data_directory")
+    base="$dd/pg_duckdb/temp"
+    want=4499998500000      # sum(0..2999999), the aggregate's answer
+
+    # Watch for spill files while the sessions run: they exist only while a
+    # query holds them, so this samples from inside the container rather than
+    # over docker exec per sample.
+    docker exec "$HOST" bash -c "rm -f /tmp/cf_spillwatch.log /tmp/cf_spillwatch.stop" 2>/dev/null
+    docker exec -d "$HOST" bash -c \
+        "rm -f /tmp/cf_spillwatch.stop; for i in \$(seq 1 400); do [ -f /tmp/cf_spillwatch.stop ] && break; ls -1 $base/*/duckdb_temp_* >> /tmp/cf_spillwatch.log 2>/dev/null; sleep 0.2; done"
+
+    # Four sessions spilling at once. A 3M-group aggregate carrying a 100-byte
+    # payload per group does not fit in the 150 MB each session allows itself,
+    # so DuckDB writes it to disk: the shape that read and deleted peers' files
+    # back when every session shared one directory.
+    for i in 1 2 3 4; do
+        ( qf "$HOST" >"$TMPD/spill-$i.out" 2>&1 <<'EOSQL'
+SET duckdb.max_memory = '150MB';
+SELECT r['s']::bigint AS s
+  FROM duckdb.query($$SELECT sum(g)::BIGINT AS s
+                        FROM (SELECT i % 3000000 AS g, string_agg(repeat('y',100)) AS pad
+                                FROM range(9000000) t(i) GROUP BY 1)$$) r;
+EOSQL
+        ) &
+    done
+    wait
+    docker exec "$HOST" touch /tmp/cf_spillwatch.stop 2>/dev/null
+
+    # Real spill files, written by DuckDB itself, under a directory named for
+    # the backend that wrote them: proof pg_duckdb used the path coldfront
+    # assigned, not merely that the GUC reads back nicely.
+    seen=$(docker exec "$HOST" bash -c "sort -u /tmp/cf_spillwatch.log 2>/dev/null | grep -c '/[0-9][0-9]*/duckdb_temp_'")
+    pids=$(docker exec "$HOST" bash -c "sed -n 's#.*/\([0-9][0-9]*\)/duckdb_temp_.*#\1#p' /tmp/cf_spillwatch.log 2>/dev/null | sort -u | wc -l")
+    docker exec "$HOST" bash -c "rm -f /tmp/cf_spillwatch.log /tmp/cf_spillwatch.stop" 2>/dev/null
+    assert_eq "TC-153: DuckDB spilled into per-backend directories" "yes" \
+        "$([ "${seen:-0}" -gt 0 ] && echo yes || echo no)"
+    assert_eq "TC-153: concurrent spills went to more than one directory" "yes" \
+        "$([ "${pids:-0}" -ge 2 ] && echo yes || echo no)"
+
+    bad=0
+    for i in 1 2 3 4; do
+        grep -qx "$want" "$TMPD/spill-$i.out" || bad=$((bad + 1))
+    done
+    assert_eq "TC-153: every concurrent spilling session returned the right sum" "0" "$bad"
+    assert_eq "TC-153: no session read another's spill file" "0" \
+        "$(grep -h "IO Error\|ERROR" "$TMPD"/spill-*.out 2>/dev/null | wc -l)"
+}
+
+story_duckdb_temp_dirs() {
+    step "TC-152: per-backend DuckDB spill directory, and reclaim of departed backends' spills"
+    local dd base livepid
+    dd=$(q "$HOST" "SHOW data_directory")
+    base="$dd/pg_duckdb/temp"
+
+    assert_eq "TC-152: a session's spill path ends with its own backend PID" "t" \
+        "$(q "$HOST" "SELECT current_setting('duckdb.temporary_directory') LIKE '%/' || pg_backend_pid()")"
+
+    # A PID no backend holds: its spill files go and the directory with them. A
+    # directory carrying anything else stays as it is, files included.
+    docker exec "$HOST" bash -c "mkdir -p $base/999001 $base/999002 && \
+        head -c 1M /dev/urandom > $base/999001/duckdb_temp_storage_DEFAULT-0.tmp && \
+        : > $base/999002/keepme.txt"
+    q "$HOST" "SELECT 1" >/dev/null
+    assert_eq "TC-152: the departed backend's spill directory is reclaimed" "" \
+        "$(docker exec "$HOST" bash -c "ls -d $base/999001 2>/dev/null")"
+    assert_eq "TC-152: a directory holding other files is left alone" "keepme.txt" \
+        "$(docker exec "$HOST" bash -c "ls -1 $base/999002 2>/dev/null")"
+    assert_eq "TC-152: the reclaim reports what it freed and what it cost" "1" \
+        "$(docker exec "$HOST" bash -c "grep -h 'coldfront: reclaimed .* DuckDB spill .* bytes) under .* in .* ms' $dd/log/*.log 2>/dev/null | wc -l | (read n; [ \"\$n\" -ge 1 ] && echo 1 || echo 0)")"
+
+    # A live backend keeps its directory: sweeping one would delete spills a
+    # running query is still reading.
+    docker exec -d -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" "$HOST" \
+        "$CF_PSQL" -tA -c "SELECT pg_sleep(10)"
+    sleep 2
+    livepid=$(q "$HOST" "SELECT pid FROM pg_stat_activity WHERE query LIKE 'SELECT pg_sleep%' AND pid <> pg_backend_pid() LIMIT 1")
+    if [ -n "$livepid" ]; then
+        docker exec "$HOST" bash -c "mkdir -p $base/$livepid && : > $base/$livepid/duckdb_temp_storage_DEFAULT-0.tmp"
+        q "$HOST" "SELECT 1" >/dev/null
+        assert_eq "TC-152: a live backend's spill directory is skipped" "duckdb_temp_storage_DEFAULT-0.tmp" \
+            "$(docker exec "$HOST" bash -c "ls -1 $base/$livepid 2>/dev/null")"
+    else
+        fail "TC-152: no live backend to check the skip against"
+    fi
+
+    docker exec "$HOST" bash -c "rm -rf $base/999002 ${livepid:+$base/$livepid}"
+}
+
 story_drop_iceberg_table() {
     step "drop_iceberg_table: decoupled and tiered, purge and keep-files"
     DIT_WH=$(curl -s "http://${LK_IP}:8181/management/v1/warehouse" \
@@ -4923,6 +5014,8 @@ else
     story_decoupled_concurrency
     story_decoupled_ryw
 fi
+story_duckdb_temp_dirs     # TC-152: per-backend spill dir; departed backends' spills reclaimed
+story_duckdb_spill_concurrency  # TC-153: four sessions spilling at once stay isolated and correct
 story_drop_iceberg_table   # both modes, purge and keep-files (own throwaway tables)
 [ "$MESH" = 1 ] && [ "$MODE" = decoupled ] && story_mesh   # tiered+mesh runs story_mesh_tiered (above)
 [ "$MESH" = 1 ] && story_mesh_multiwriter   # >1 cold writer/node cross-node (tiered: events, decoupled: iceonly)

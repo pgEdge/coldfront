@@ -884,6 +884,14 @@ The following GUCs adjust write behaviour and execution; tune them as needed:
 - `duckdb.force_execution` - bench it before flipping: on a mixed
   workload it helps `count(distinct)` and similar but regresses index
   lookups, top-K with PK ordering, and JSON access. **Default off.**
+- `duckdb.temporary_directory` - where DuckDB spills. Each backend gets
+  its own subdirectory of it, named after its process id, so concurrent
+  spills cannot collide; one left by a departed backend is reclaimed. See
+  [architecture.md](architecture.md#duckdb-spill-files-are-not-namespaced-per-instance).
+- `duckdb.max_temp_directory_size` - a cap **per connection**, not a
+  cluster total, and unset it is 90% of free space per session. For a
+  total budget, divide it by the concurrent sessions or give the temp
+  path its own filesystem or quota.
 
 ## Going deeper
 

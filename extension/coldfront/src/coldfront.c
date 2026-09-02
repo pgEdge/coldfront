@@ -39,6 +39,7 @@
 #include "postgres.h"
 
 #include <ctype.h>
+#include <sys/stat.h>
 
 #include "access/attnum.h"
 #include "access/xact.h"
@@ -58,11 +59,14 @@
 #include "nodes/nodeFuncs.h"
 #include "nodes/params.h"
 #include "nodes/pg_list.h"
+#include "miscadmin.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/planner.h"
 #include "parser/analyze.h"
 #include "parser/parse_func.h"
 #include "parser/parsetree.h"
+#include "storage/fd.h"
+#include "storage/procarray.h"
 #include "tcop/tcopprot.h"
 #include "tcop/utility.h"
 #include "utils/builtins.h"
@@ -3449,6 +3453,144 @@ cf_dispatch_emit(Query *query, RangeTblEntry *rte, TieredViewInfo *info,
     return NULL;        /* unreachable */
 }
 
+/* ---------- DuckDB spill directory -------------------------------------- */
+
+/*
+ * DuckDB names every spill file from a per-instance counter that starts at zero
+ * (duckdb_temp_storage_<class>-<index>.tmp), and an instance being torn down
+ * deletes each duckdb_temp_* file in its temp directory. Backends sharing one
+ * duckdb.temporary_directory thus write the same paths and delete each other's
+ * spills, so a backend takes a subdirectory of the configured path named after
+ * its own PID. pg_duckdb reads the setting when it builds the instance and
+ * refuses a later change, hence the parse-analyze hook: it sees the session's
+ * first statement, ahead of any DuckDB planning.
+ */
+#define CF_TEMP_DIR_GUC "duckdb.temporary_directory"
+
+/*
+ * Unlink the spill files in one departed backend's directory, counting them and
+ * the bytes they held. True when nothing is left in it. Any other entry belongs
+ * to whoever put it there and keeps the directory.
+ */
+static bool
+cf_drain_temp_dir(const char *path, int *nfiles, int64 *nbytes)
+{
+    DIR           *dir = AllocateDir(path);
+    struct dirent *de;
+    bool           drained = true;
+
+    if (dir == NULL)
+        return false;
+
+    while ((de = ReadDir(dir, path)) != NULL)
+    {
+        char       *file;
+        struct stat st;
+
+        if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0)
+            continue;
+        if (strncmp(de->d_name, "duckdb_temp_", sizeof("duckdb_temp_") - 1) != 0)
+        {
+            drained = false;
+            continue;
+        }
+        file = psprintf("%s/%s", path, de->d_name);
+        if (stat(file, &st) == 0)
+            *nbytes += (int64) st.st_size;
+        if (unlink(file) != 0)
+            drained = false;
+        else
+            (*nfiles)++;
+        pfree(file);
+    }
+    FreeDir(dir);
+    return drained;
+}
+
+/*
+ * Reclaim the subdirectories of `base` named for a PID that no backend holds.
+ * A directory whose PID is live belongs to a session that is still spilling.
+ * Reclaiming a hard-killed backend's spills is the one case that touches real
+ * data, so it is reported with what it freed and what it cost.
+ */
+static void
+cf_reclaim_temp_dirs(const char *base)
+{
+    DIR           *dir    = AllocateDir(base);
+    TimestampTz    start  = GetCurrentTimestamp();
+    int            ndirs  = 0;
+    int            nfiles = 0;
+    int64          nbytes = 0;
+    struct dirent *de;
+
+    /* Nothing has spilled under this path yet. */
+    if (dir == NULL)
+        return;
+
+    while ((de = ReadDir(dir, base)) != NULL)
+    {
+        char *end;
+        long  pid = strtol(de->d_name, &end, 10);
+        char *path;
+
+        if (*end != '\0' || pid <= 0 || pid == (long) MyProcPid ||
+            BackendPidGetProc((int) pid) != NULL)
+            continue;
+
+        path = psprintf("%s/%s", base, de->d_name);
+        if (cf_drain_temp_dir(path, &nfiles, &nbytes) && rmdir(path) == 0)
+            ndirs++;
+        pfree(path);
+    }
+    FreeDir(dir);
+
+    if (nfiles > 0 || ndirs > 0)
+        ereport(LOG,
+                (errmsg("coldfront: reclaimed %d DuckDB spill %s (%d file(s), "
+                        INT64_FORMAT " bytes) under \"%s\" in %ld ms",
+                        ndirs, ndirs == 1 ? "directory" : "directories",
+                        nfiles, nbytes, base,
+                        TimestampDifferenceMilliseconds(start,
+                                                        GetCurrentTimestamp()))));
+}
+
+/*
+ * Give this backend's DuckDB spills a directory of its own, reclaiming what
+ * departed backends left under the configured path on the way. Runs once, on
+ * the session's first statement, where pg_duckdb has yet to build its instance
+ * and still reads this setting.
+ *
+ * PGC_S_OVERRIDE keeps the value off the transactional GUC stack, so it holds
+ * for the session even if the transaction that set it rolls back. A session
+ * that sets the path itself outranks that source and keeps what it asked for.
+ * DEBUG3 leaves pg_duckdb's refusal (its instance already built) a log detail
+ * rather than an error on an unrelated statement.
+ */
+static void
+cf_own_duckdb_temp_dir(void)
+{
+    static bool  owned = false;
+    const char  *base;
+    char         pid[16];
+
+    /* A parallel worker runs on the leader's settings, this one included, and a
+     * GUC cannot be set inside a parallel operation at all. */
+    if (owned || IsInParallelMode())
+        return;
+
+    base = GetConfigOption(CF_TEMP_DIR_GUC, true, false);
+
+    /* No pg_duckdb in this backend, or DuckDB spills nowhere. */
+    if (base == NULL || base[0] == '\0')
+        return;
+
+    owned = true;
+    cf_reclaim_temp_dirs(base);
+    snprintf(pid, sizeof(pid), "%d", MyProcPid);
+    set_config_option(CF_TEMP_DIR_GUC, psprintf("%s/%s", base, pid),
+                      PGC_SUSET, PGC_S_OVERRIDE, GUC_ACTION_SET, true, DEBUG3, false);
+}
+
 /* ---------- hook -------------------------------------------------------- */
 
 /*
@@ -3479,6 +3621,10 @@ coldfront_post_parse_analyze(ParseState *pstate, Query *query,
     /* Chain to any previous hook first */
     if (prev_post_parse_analyze_hook)
         prev_post_parse_analyze_hook(pstate, query, jstate);
+
+    /* Any DuckDB query can spill, tiered or not, so this precedes the registry
+     * check below. */
+    cf_own_duckdb_temp_dir();
 
     /* Re-entrancy guard */
     if (coldfront_in_rewrite)
