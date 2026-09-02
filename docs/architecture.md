@@ -667,6 +667,87 @@ the rows: PG executor (heap reader) → pg_duckdb vector format → Iceberg
 writer, **one pass, in-process**, with no libpq loopback and no
 temp-disk.
 
+### pg_duckdb: a statement DuckDB cannot run is refused, not delegated
+
+pg_duckdb's planner hook takes over any statement whose parse tree
+references a DuckDB item, and then requires that statement to be one
+DuckDB can execute: `IsAllowedStatement` runs with `throw_error` set, so
+a statement that needs DuckDB but modifies a PostgreSQL relation raises
+*"DuckDB does not support modifying Postgres tables"* rather than being
+handed back to the PostgreSQL planner. Two shapes reach it through a view
+whose body reads a cold table:
+
+- `UPDATE`/`DELETE` on a view carrying `INSTEAD OF` triggers. PostgreSQL
+  expands the view to scan its rows and fire the trigger, the expanded
+  body carries the DuckDB item, and the statement errors before any
+  trigger runs.
+- `INSERT ... SELECT` whose source needs DuckDB, even where the target's
+  own `INSTEAD OF INSERT` trigger would have taken the row.
+
+A plain `INSERT ... VALUES` through an `INSTEAD OF INSERT` trigger is
+unaffected, because that plan never expands the view and so carries no
+DuckDB item into the hook.
+
+**Workaround today:** ColdFront's `post_parse_analyze_hook` rewrites
+INSERT/UPDATE/DELETE on a registered view into its hot, cold or dual emit
+path before planning, so on the paths ColdFront owns pg_duckdb only ever
+sees a shape it accepts; the wrapper view's `INSTEAD OF INSERT` trigger
+covers plain inserts when the extension is not loaded. What has no
+workaround is a view an application defines over cold data with its own
+`INSTEAD OF UPDATE`/`DELETE` triggers, or an `INSERT ... SELECT` drawing
+from such a view.
+
+**Upstream shape that would drop it:** where `NeedsDuckdbExecution` is
+true and `IsAllowedStatement` is false, chain to the previous planner
+hook instead of throwing, so PostgreSQL plans the statement and its
+`INSTEAD OF` triggers fire. Every statement DuckDB can run stays on the
+DuckDB path, and the check that decides this already exists in a
+non-throwing form.
+
+### DuckDB: spill files are not namespaced per instance
+
+DuckDB names a spill file from a counter that starts at zero in every
+instance (`duckdb_temp_storage_<class>-<index>.tmp`,
+`duckdb_temp_block-<id>.block`), and an instance being torn down deletes
+every `duckdb_temp_*` file in its temp directory. pg_duckdb gives each
+backend its own DuckDB instance but one shared
+`duckdb.temporary_directory` (default `$PGDATA/pg_duckdb/temp`), so
+concurrent backends that spill open the same paths, read each other's
+bytes, and delete each other's files. On the 1.5.4 stack, of four
+sessions spilling a 3M-group aggregate under a 150 MB memory limit,
+three died with `IO Error: Could not read enough bytes`. Tracked as
+duckdb#15173 (open, reproduced); pg_duckdb#887 is an unmerged fix one
+layer up.
+
+**Workaround today:** each backend takes a subdirectory of the configured
+path named after its own PID, assigned by `cf_own_duckdb_temp_dir` from
+the parse-analyze hook on the session's first statement, which is ahead
+of pg_duckdb building its instance and reading the setting. The same hook
+reclaims the subdirectories whose PID no live backend holds, removing
+their spill files and the directory and reporting what that freed. That
+sweep runs once per session and costs single-digit milliseconds per spill
+file, so even a directory abandoned with 600 GB in it (about 600 files at
+DuckDB's file size) is a couple of seconds on the one statement that finds
+it. See
+[usage.md → Tuning knobs](usage.md#tuning-knobs).
+
+The PID is what makes that reclaim possible, and is why ColdFront does
+not simply carry pg_duckdb#887, which names the directory with a random
+uuid and removes it from an `on_proc_exit` hook. That hook does not run
+when a backend is killed by `SIGKILL`, an immediate shutdown or the OOM
+killer, which is precisely when spill files are left behind, and a random
+name cannot be attributed to an owner afterwards: nothing can decide
+whether the directory belongs to a live session or a dead one, so the
+disk is never reclaimed. A PID can be checked against the live backends
+(`BackendPidGetProc`), so any later session reclaims the orphans, whole
+gigabytes at a time. A reused PID resolves to a live backend and is left
+alone, as is any directory holding something other than spill files.
+
+**Upstream shape that would drop it:** a spill filename that carries the
+instance's own identity, so instances sharing a temp directory cannot
+collide and teardown deletes only what it wrote. That belongs in DuckDB,
+where the naming is, rather than in each embedder.
+
 ### duckdb-iceberg: secret visibility under fresh transactions
 
 A secret created with `CREATE SECRET` from a caller's still-active
