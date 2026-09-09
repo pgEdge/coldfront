@@ -111,6 +111,71 @@ type SubPartitionConfig struct {
 	ValuesSource string `yaml:"values_source"`
 }
 
+// defaultPackagedConfigPath is where pgedge-coldfront installs its config, and
+// the last place Resolve looks -- so an RPM install needs no -config flag.
+const defaultPackagedConfigPath = "/etc/pgedge/coldfront/config.yaml"
+
+// packagedConfigPath is a variable only so tests can redirect it; the real path
+// is root-owned.
+var packagedConfigPath = defaultPackagedConfigPath
+
+// Resolve reports which config file to read, given the -config flag's value
+// ("" when the flag was not passed).
+//
+// A file the operator named -- via -config or COLDFRONT_CONFIG -- must exist.
+// Falling through to a different file in that case would silently run against
+// the wrong database or object store, so it is an error. Only the implicit
+// chain falls through:
+//
+//	-config  →  $COLDFRONT_CONFIG  →  ./config.yaml  →  /etc/pgedge/coldfront/config.yaml
+func Resolve(flagPath string) (string, error) {
+	if flagPath != "" {
+		if err := readableFile(flagPath); err != nil {
+			return "", fmt.Errorf("config %q: %w", flagPath, err)
+		}
+		return flagPath, nil
+	}
+
+	if env := os.Getenv("COLDFRONT_CONFIG"); env != "" {
+		if err := readableFile(env); err != nil {
+			return "", fmt.Errorf("config %q from COLDFRONT_CONFIG: %w", env, err)
+		}
+		return env, nil
+	}
+
+	implicit := []string{"config.yaml", packagedConfigPath}
+	for _, candidate := range implicit {
+		if readableFile(candidate) == nil {
+			return candidate, nil
+		}
+	}
+
+	return "", fmt.Errorf(
+		"no config file: pass -config, set COLDFRONT_CONFIG, or create one of %s",
+		strings.Join(implicit, " or "))
+}
+
+// readableFile reports whether path is an existing regular file.
+func readableFile(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		return fmt.Errorf("is a directory")
+	}
+	return nil
+}
+
+// LoadDefault resolves the config file (see Resolve) and loads it.
+func LoadDefault(flagPath string) (*Config, error) {
+	path, err := Resolve(flagPath)
+	if err != nil {
+		return nil, err
+	}
+	return Load(path)
+}
+
 // Load reads a YAML config file from path, applies defaults, and validates
 // the result. Returns the parsed Config or an error describing the first
 // problem encountered (read, parse, or validation).

@@ -17,11 +17,13 @@ linters:
       - path: cmd/.*/main\.go$
         linters: [gosec]
         text: "G706"
-      # G304 (file inclusion): the config loader reads the operator-supplied
-      # --config path by design.
+      # G304 (file inclusion) / G703 (path traversal via taint): the config
+      # loader opens and stats the operator-supplied config path by design —
+      # the --config flag, $COLDFRONT_CONFIG, or the packaged default. An
+      # operator who can set those already controls the process.
       - path: internal/config/config\.go$
         linters: [gosec]
-        text: "G304"
+        text: "G304|G703"
       # G115 (integer overflow): intentional bit-packing truncation in the
       # snowflake / UUIDv7 id-to-partition-bound encoding.
       - path: internal/partition/idmap\.go$
