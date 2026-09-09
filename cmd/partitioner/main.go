@@ -56,10 +56,6 @@ func main() {
 		fmt.Printf("%s %s (built %s)\n", filepath.Base(os.Args[0]), version.Version, version.BuildTime)
 		return
 	}
-	if *cfgPath == "" {
-		log.Fatal("--config is required")
-	}
-
 	cfg, err := config.LoadDefault(*cfgPath)
 	if err != nil {
 		log.Fatalf("load config: %v", err)

@@ -111,8 +111,10 @@ func addConn(fs *flag.FlagSet) func(context.Context) (*pgx.Conn, error) {
 			switch {
 			case err == nil:
 				d = cfg.Postgres.DSN
-			case *cfgPath != "":
-				return nil, fmt.Errorf("read --config: %w", err)
+			case !errors.Is(err, config.ErrNoConfig):
+				// A config was found but is unusable. Reporting "pass --dsn or
+				// --config" here would hide a parse or validation failure.
+				return nil, fmt.Errorf("read config: %w", err)
 			}
 		}
 		if d == "" {
@@ -856,7 +858,7 @@ EXAMPLES:
 // runImport seeds partition_config from a deployment YAML's archiver.tables list.
 func runImport(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("import", flag.ContinueOnError)
-	cfgPath := fs.String("config", "", "deployment YAML to import: its archiver.tables become partition_config rows (required)")
+	cfgPath := fs.String("config", "", "deployment YAML to import: its archiver.tables become partition_config rows (default: $COLDFRONT_CONFIG, ./config.yaml, then /etc/pgedge/coldfront/config.yaml)")
 	dsn := fs.String("dsn", "", "connection DSN (default: postgres.dsn from --config)")
 	printSQL := fs.Bool("print-sql", false, "print the INSERTs instead of running them")
 	dryRun := fs.Bool("dry-run", false, "validate/parse but make no changes")

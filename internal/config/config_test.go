@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -668,4 +669,58 @@ func TestLoadDefaultResolvesThenLoads(t *testing.T) {
 	cfg, err := LoadDefault("")
 	require.NoError(t, err)
 	assert.Equal(t, "wh", cfg.Iceberg.Warehouse)
+}
+
+func TestResolveRejectsANonRegularFile(t *testing.T) {
+	// A FIFO would make Load block forever; a device file would read without
+	// end. Only a regular file is a config.
+	dir := t.TempDir()
+	fifo := filepath.Join(dir, "config.yaml")
+	require.NoError(t, syscall.Mkfifo(fifo, 0o600))
+	t.Setenv("COLDFRONT_CONFIG", "")
+	t.Chdir(dir)
+	packagedConfigPath = filepath.Join(t.TempDir(), "absent.yaml")
+	t.Cleanup(func() { packagedConfigPath = defaultPackagedConfigPath })
+
+	_, err := Resolve("")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrNoConfig)
+}
+
+func TestResolveFallsThroughAnUnreadableCandidate(t *testing.T) {
+	// An unreadable ./config.yaml must not shadow the packaged path.
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(validConfig), 0o000))
+	packaged := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(packaged, []byte(validConfig), 0o600))
+	t.Setenv("COLDFRONT_CONFIG", "")
+	t.Chdir(dir)
+	packagedConfigPath = packaged
+	t.Cleanup(func() { packagedConfigPath = defaultPackagedConfigPath })
+
+	got, err := Resolve("")
+	require.NoError(t, err)
+	assert.Equal(t, packaged, got)
+}
+
+func TestResolveNotFoundIsErrNoConfig(t *testing.T) {
+	// Callers distinguish "nothing configured" from "configured but broken".
+	t.Setenv("COLDFRONT_CONFIG", "")
+	t.Chdir(t.TempDir())
+	packagedConfigPath = filepath.Join(t.TempDir(), "absent.yaml")
+	t.Cleanup(func() { packagedConfigPath = defaultPackagedConfigPath })
+
+	_, err := Resolve("")
+	assert.ErrorIs(t, err, ErrNoConfig)
+}
+
+func TestLoadDefaultParseErrorIsNotErrNoConfig(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("postgres: [oops"), 0o600))
+	t.Setenv("COLDFRONT_CONFIG", "")
+	t.Chdir(dir)
+
+	_, err := LoadDefault("")
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, ErrNoConfig)
 }

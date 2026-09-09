@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -111,6 +112,12 @@ type SubPartitionConfig struct {
 	ValuesSource string `yaml:"values_source"`
 }
 
+// ErrNoConfig reports that no config file was found. A caller that can proceed
+// without one -- the CLI's --dsn path -- tests for it with errors.Is; any other
+// error means a candidate existed but could not be used, which must not be
+// mistaken for an absent config.
+var ErrNoConfig = errors.New("no config file found")
+
 // defaultPackagedConfigPath is where pgedge-coldfront installs its config, and
 // the last place Resolve looks -- so an RPM install needs no -config flag.
 const defaultPackagedConfigPath = "/etc/pgedge/coldfront/config.yaml"
@@ -150,21 +157,28 @@ func Resolve(flagPath string) (string, error) {
 		}
 	}
 
-	return "", fmt.Errorf(
-		"no config file: pass -config, set COLDFRONT_CONFIG, or create one of %s",
-		strings.Join(implicit, " or "))
+	return "", fmt.Errorf("%w: pass -config, set COLDFRONT_CONFIG, or create one of %s",
+		ErrNoConfig, strings.Join(implicit, " or "))
 }
 
-// readableFile reports whether path is an existing regular file.
+// readableFile reports whether path is a regular file that can be opened.
+// Anything else is not a config: a directory cannot be parsed, a FIFO would
+// block Load forever, and a device file would read without end. Opening it
+// here also lets an unreadable candidate fall through to the next one rather
+// than shadowing it.
 func readableFile(path string) error {
 	info, err := os.Stat(path)
 	if err != nil {
 		return err
 	}
-	if info.IsDir() {
-		return fmt.Errorf("is a directory")
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("not a regular file")
 	}
-	return nil
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	return f.Close()
 }
 
 // LoadDefault resolves the config file (see Resolve) and loads it.
