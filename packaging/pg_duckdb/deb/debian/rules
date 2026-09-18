@@ -3,6 +3,13 @@
 # DuckDB is a large, memory-heavy C++ build driven by CMake+Ninja.
 export DUCKDB_GEN = ninja
 export CMAKE_BUILD_PARALLEL_LEVEL = 4
+# Upstream's Makefile.global caps at the last GA major and gates newer ones behind
+# PG_MAX_VER; ColdFront pins the pg_duckdb commit, so it opts in for the major
+# this build targets (build-deb.sh puts that major's pg_config first on PATH).
+# Exported, not passed per-target: dh runs clean first, and dh_auto_clean's
+# `make distclean` hits the same cap. Makefile.global uses ?=, so the
+# environment is enough.
+export PG_MAX_VER := $(shell pg_config --version | sed 's/^[^ ]* \([0-9]*\).*/\1/')
 
 %:
 	dh $@

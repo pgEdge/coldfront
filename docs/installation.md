@@ -90,7 +90,8 @@ Then follow [usage.md → One-time setup](usage.md#one-time-setup)
 
 > **pg_duckdb pin.** The base pins pg_duckdb to the merged PR #1025 commit
 > `c04e6a2` (DuckDB 1.5.4 — its duckdb submodule is the v1.5.4 tag), a fixed
-> commit for reproducible builds rather than a moving PR head.
+> commit for reproducible builds rather than a moving PR head. The RPM/DEB
+> packages pin a later commit — see [PostgreSQL 19 (beta)](#postgresql-19-beta).
 >
 > **Base foundation.** The base is
 > `FROM ghcr.io/pgedge/pgedge-postgres:<pg>-spock5-minimal`; you need pull
@@ -189,6 +190,21 @@ coldfront.local_pg_dsn        = 'host=/var/run/postgresql dbname=<db> user=<role
 
 (See the README for the full GUC set and the optional turnkey
 non-superuser role.)
+
+### PostgreSQL 19 (beta)
+
+PG 19 is a packages-only target. The RPM and DEB cells build it alongside
+16/17/18 - the pgEdge `dnf`/`apt` repositories carry PG 19 beta, and both the
+coldfront extension and pg_duckdb compile against it. Those cells pin pg_duckdb
+to `ee7aaeb` (PR #983, PG 16-19 support) in `packaging/pg_duckdb/common.sh`, and
+need two ColdFront-side adjustments for 19: `PG_MAX_VER=19` (upstream's
+Makefile.global defaults it to 18) and
+`packaging/patches/pg_duckdb-pg19-ruleutils.patch`, which re-syncs its vendored
+PG-19 deparser with PG 19 as released. Both are no-ops below 19.
+
+The container images stay on PG 16/17/18 and on pg_duckdb `c04e6a2`: there is no
+`pgedge-postgres:19-*` base to build from and Spock has no 19 build, so the
+`ci/matrix.sh` cells - and therefore mesh topologies - remain 16/17/18.
 
 ## Testing & CI
 

@@ -198,21 +198,21 @@ jobs:
                   git clone --depth 1 \
                       "https://x-access-token:${TOKEN}@github.com/pgEdge/pgedge-detect-build-matrix.git" \
                       ".github/actions/pgedge-detect-build-matrix"
-            - name: Detect — pg_duckdb (PG 16/17/18)
+            - name: Detect — pg_duckdb (PG 16/17/18/19)
               id: pgduckdb
               uses: ./.github/actions/pgedge-detect-build-matrix
               with:
                   component_name: packaging/pg_duckdb
-                  pg_versions: '16,17,18'
+                  pg_versions: '16,17,18,19'
                   archs: '["amd64","arm64"]'
                   rpm_images: ${{ env.RPM_IMAGES }}
                   deb_images: ${{ env.DEB_IMAGES }}
-            - name: Detect — coldfront extension (PG 16/17/18)
+            - name: Detect — coldfront extension (PG 16/17/18/19)
               id: coldfront
               uses: ./.github/actions/pgedge-detect-build-matrix
               with:
                   component_name: packaging/coldfront
-                  pg_versions: '16,17,18'
+                  pg_versions: '16,17,18,19'
                   archs: '["amd64","arm64"]'
                   rpm_images: ${{ env.RPM_IMAGES }}
                   deb_images: ${{ env.DEB_IMAGES }}

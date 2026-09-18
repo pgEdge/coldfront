@@ -19,7 +19,28 @@ and verified*. The cold-tier compactor's own story lives in
 | **Bakery-aware commit-refresh** | `docker/iceberg-bakery-aware-commit-refresh-v15.patch` | makes the async parquet-upload ordering safe → the **no-409** guarantee for concurrent cold writers, at contended-upload throughput | cold writes still work and still never 409 — they fall back to serialized (claim-first) uploads (see [DUCKDB_1.5_UNPATCHED.md](DUCKDB_1.5_UNPATCHED.md)) |
 | **Strict-reader interop** (upstreamable) | `docker/iceberg-manifest-list-format-version-v15.patch`, `docker/iceberg-data-file-format-v15.patch` | make the manifests duckdb-iceberg *writes* readable by strict Apache readers (apache/iceberg-go) | the cold-tier **compactor cannot read the table** - see [docs/compaction.md](docs/compaction.md). pg_duckdb's own reads/writes are unaffected. |
 
-All three patches apply cleanly to a **pristine** `duckdb-iceberg` @ `5edc45f0`
+There is also one patch outside the iceberg families, and outside the image:
+**PG-19 deparser re-sync** (`packaging/patches/pg_duckdb-pg19-ruleutils.patch`).
+pg_duckdb's vendored PG-19 `ruleutils.c` predates two PostgreSQL changes late in
+the 19 beta cycle — the `GROUP BY ALL` revert (postgres `372b8d1`) and
+`ForPortionOfExpr.range_name` → `rangeVar` (postgres `2a9541d`) — so it
+references fields that no longer exist, and without the patch the extension does
+not compile against PG 19 at all. The file is `#if`'d to PG 19, so it is
+irrelevant to PG 16/17/18. `packaging/patches/apply-pg19-ruleutils-patch.sh` —
+shared by `packaging/pg_duckdb/build-rpm.sh` and `build-deb.sh` — is the one
+place that decides: it applies the patch only for PG >= 19, skips silently when
+the change is already in the tree (a re-run, or upstream having refreshed its
+vendored copy), and fails the build on anything else, so patch rot is loud but a
+stale patch never blocks a PG 16/17/18 build. PG 19 also needs `PG_MAX_VER=19`
+passed to `make` - upstream's Makefile.global defaults it to 18. Drop both once
+upstream refreshes the vendored copy; the helper's skip message says when that
+has happened.
+
+This is a packaging-only path. The base image is unchanged: it stays on
+pg_duckdb `c04e6a2` and builds PG 16/17/18, because there is no
+`pgedge-postgres:19-*` base to build 19 from. Only the RPM/DEB cells build 19.
+
+All three iceberg patches apply cleanly to a **pristine** `duckdb-iceberg` @ `5edc45f0`
 (branch `v1.5-variegata`); `docker/Dockerfile.duckdb15-base` `git apply --check`s
 each before applying, failing the build loudly on patch rot.
 
@@ -144,8 +165,9 @@ patches only.
 
 | Component | Pin | Notes |
 |---|---|---|
-| pg_duckdb | **merged PR #1025** (`c04e6a2`) | no released tag carries 1.5.x; `git checkout c04e6a2`. Its duckdb submodule is the v1.5.4 tag (`08e34c4`). |
-| DuckDB | **v1.5.4 tag** (`08e34c4`) | pinned by pg_duckdb @ `c04e6a2`; the iceberg build re-pins ITS duckdb submodule to the same tag so the extension ABI matches the engine. The `duckdb.*` GUCs + PRE_COMMIT iceberg-commit deferral ColdFront relies on are unchanged. |
+| pg_duckdb (packages) | **PR #983** (`ee7aaeb`) | PG 16-19 support, three commits past `c04e6a2`; no released tag carries 1.5.x. Pinned in `packaging/pg_duckdb/common.sh`. Its duckdb submodule is still the v1.5.4 tag (`08e34c4`). |
+| pg_duckdb (base image) | **merged PR #1025** (`c04e6a2`) | the image builds PG 16/17/18 only (no `pgedge-postgres:19-*` base), so it stays on the pin it shipped with rather than rebuilding three majors for a 19 it cannot use. Pinned in `docker/Dockerfile.duckdb15-base`. |
+| DuckDB | **v1.5.4 tag** (`08e34c4`) | pinned by both pg_duckdb commits; the iceberg build re-pins ITS duckdb submodule to the same tag so the extension ABI matches the engine. The `duckdb.*` GUCs + PRE_COMMIT iceberg-commit deferral ColdFront relies on are unchanged. |
 | duckdb-iceberg | **`v1.5-variegata` @ `5edc45f0`** | extension code the three patches target — kept fixed, so the patches apply unchanged. The build re-pins its duckdb submodule to the v1.5.4 tag (the branch tracks duckdb `main`, which drifts off the release; verified: `5edc45f0` compiles clean against v1.5.4). Transaction code lives in `src/catalog/rest/transaction/`. |
 | avro | **`7f423d69`** | the pin `v1.5-variegata` uses. |
 | azure | **`v1.5-variegata` @ `563589b2`** | the ABI-matched sibling of iceberg's branch. **NOT `main`** — azure `main` collides at link (`multiple definition of duckdb::FileFlags::FILE_FLAGS_NULL_IF_NOT_EXISTS`). |

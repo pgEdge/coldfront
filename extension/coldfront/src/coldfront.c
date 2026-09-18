@@ -3108,8 +3108,14 @@ cf_dispatch_emit(Query *query, RangeTblEntry *rte, TieredViewInfo *info,
  * rewrite, so do nothing — the same guard the DDL hook already applies.
  */
 static void
+#if PG_VERSION_NUM >= 190000
+/* PG 19 made the hook's JumbleState argument const. */
+coldfront_post_parse_analyze(ParseState *pstate, Query *query,
+                              const JumbleState *jstate)
+#else
 coldfront_post_parse_analyze(ParseState *pstate, Query *query,
                               JumbleState *jstate)
+#endif
 {
     TieredViewInfo  info;
     char           *new_sql;
