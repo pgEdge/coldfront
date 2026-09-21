@@ -9,7 +9,7 @@
 # 19, so 16/17/18 builds must not be held hostage to it) and when the change is
 # already in the tree — a re-run, or upstream refreshed its vendored copy.
 # Anything else is patch rot: exit 1, so the build fails loudly instead of
-# compiling a deparser that no longer matches PG 19.
+# compiling a deparser that does not match PG 19.
 set -euo pipefail
 
 SRC="${1:?usage: $0 <pg_duckdb-checkout> <pg-major>}"

@@ -3109,7 +3109,7 @@ cf_dispatch_emit(Query *query, RangeTblEntry *rte, TieredViewInfo *info,
  */
 static void
 #if PG_VERSION_NUM >= 190000
-/* PG 19 made the hook's JumbleState argument const. */
+/* PG 19+ passes a const JumbleState. */
 coldfront_post_parse_analyze(ParseState *pstate, Query *query,
                               const JumbleState *jstate)
 #else
