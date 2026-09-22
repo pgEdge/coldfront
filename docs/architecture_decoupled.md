@@ -238,6 +238,161 @@ The helper doesn't add capability over raw_query - it composes the
 existing primitives into a single call so applications get a
 normal-looking PG table.
 
+## Wrapper helper: `coldfront.adopt_iceberg_table()`
+
+Adoption registers a table that already exists in the Iceberg catalog.
+The wrapper view and the registry row are built from the schema the
+catalog holds, and nothing is provisioned:
+
+```sql
+SELECT coldfront.adopt_iceberg_table('public', 'orders', 'lake');
+```
+
+The following table describes the parameters:
+
+| Parameter | Meaning |
+|---|---|
+| `p_schema` | PostgreSQL schema that holds the wrapper view; it must exist. |
+| `p_table` | The view's name, and the Iceberg table's name. |
+| `p_namespace` | Iceberg namespace the table lives in; NULL means `p_schema`. It need not exist as a PostgreSQL schema. |
+| `p_writable` | False registers the read path alone; true arms the DML rewrite. |
+| `p_types` | `{"column": "pg_type"}` overrides for the types the columns read as. |
+
+The schema is read with `DESCRIBE` through `duckdb.query()`, with
+`duckdb.unsafe_allow_execution_inside_functions = on` set LOCAL for the
+call. `DESCRIBE` is a metadata-only read: it scans no Parquet and works
+on a table with no snapshot. Its rows arrive in Iceberg schema order,
+which fixes a clustered table's cluster-column order.
+
+Adoption differs from creation in four places: types map from Iceberg
+to PostgreSQL, no `CREATE SCHEMA` or `CREATE TABLE` reaches the catalog,
+the registry row records writability, and a writable table with no
+snapshot is primed. Priming runs one INSERT of NULLs and one DELETE in a
+single DuckDB transaction, so the table has a current snapshot id;
+without one, Lakekeeper's ref precondition holds for every concurrent
+"first snapshot" commit and the last writer silently wins. The C hook
+emits `tiered_views.iceberg_table` verbatim, so a reference outside
+`ice.<pg_schema>.<pg_relname>` needs no further handling.
+
+### Types an adopted column reads as
+
+Iceberg records no PostgreSQL type, so the PostgreSQL types that share
+one storage type all come back as the type that storage type reads as
+natively. The following table shows the mapping, and which PostgreSQL
+types collapse onto each row:
+
+| Iceberg | DuckDB `column_type` | PostgreSQL type | Collapsed inputs |
+|---|---|---|---|
+| boolean | `BOOLEAN` | `boolean` | |
+| int | `INTEGER` | `integer` | `smallint` |
+| long | `BIGINT` | `bigint` | |
+| float | `FLOAT` | `real` | |
+| double | `DOUBLE` | `double precision` | |
+| decimal(P,S) | `DECIMAL(P,S)` | `numeric(P,S)` | |
+| date | `DATE` | `date` | |
+| time | `TIME` | `time` | |
+| timestamp | `TIMESTAMP` | `timestamp` | |
+| timestamptz | `TIMESTAMP WITH TIME ZONE` | `timestamptz` | |
+| string | `VARCHAR` | `text` | `varchar(N)`, `char(N)`, `jsonb`, `json`, `interval` |
+| uuid | `UUID` | `uuid` | |
+| binary, fixed[n] | `BLOB` | `bytea` | |
+| list of float | `FLOAT[]` | `real[]` | `vector(N)`, `halfvec(N)` |
+
+Nanosecond timestamps are refused, because PostgreSQL stores
+microseconds; so are variant, geometry, struct, map, and lists of
+anything but float. The refusal names the column and the Iceberg type.
+
+`p_types` sets the type a column reads as, so a `jsonb` column that
+ColdFront created adopts as `jsonb` rather than `text`:
+
+```sql
+SELECT coldfront.adopt_iceberg_table(
+    'public', 'orders', 'lake',
+    p_writable => true,
+    p_types    => '{"meta":"jsonb"}'::jsonb);
+```
+
+An override is accepted only where it maps to the storage type the
+catalog holds. Both sides run through the same reverse map, so
+`timestamptz` matches `TIMESTAMP WITH TIME ZONE` and `numeric(12, 2)`
+matches `DECIMAL(12,2)`, while `bigint` over a `DECIMAL(12,2)` column is
+refused. An override cannot reinterpret the stored bytes.
+
+A `FLOAT[]` column whose Iceberg schema carries a `_cf_vec_list_<column>`
+sibling is recorded in `vec_columns`, and the cluster columns stay out of
+the view's projection. Without the sibling the column is a plain
+`real[]`.
+
+### Writability
+
+The registry row carries `is_writable`, and the parse-analyze hook
+refuses INSERT, UPDATE and DELETE on a relation whose flag is false:
+
+```
+ERROR:  coldfront: "public.orders" is adopted read-only
+HINT:  Release it with coldfront.release_iceberg_table() and adopt again with p_writable => true to arm INSERT/UPDATE/DELETE.
+```
+
+Reads never consult the flag. `vector_train()`, `vector_assign()` and
+`drop_iceberg_table()` refuse a read-only relation too, since each
+rewrites or destroys the Iceberg table. The archiver and
+`create_iceberg_table()` set the flag; adoption defaults it to false.
+
+### One relation per Iceberg table
+
+`coldfront.tiered_views` has a unique constraint on `iceberg_table`, and
+adoption refuses a reference that is already registered. The
+cluster-column lookups resolve a table by its reference, so two rows
+sharing one would concatenate both tables' cluster columns into the
+first's INSERT list and fail the second outright.
+
+### Adoption binds the name once
+
+A second `adopt_iceberg_table()` under a registered name is refused
+whatever its arguments, as is a tiered relation's name. To arm writes,
+change an override, or pick up an evolved schema, release the table and
+adopt it again; the new view is built from the schema the catalog holds
+then.
+
+In a Spock mesh one node adopts. The `CREATE VIEW` replicates through
+the `ddl_sql` repset (`spock.allow_ddl_from_functions` is on) and the
+registry row through the `default` repset, which arms the parse-analyze
+hook on every peer; a peer's own adopt is refused as already registered.
+A release unregisters everywhere, because the registry `DELETE` precedes
+the `DROP VIEW` in the same transaction and disarms the peer's DDL hook
+before the drop is applied there.
+
+### Handing a table back
+
+`coldfront.release_iceberg_table()` removes the wrapper view and the
+registry row and performs no Iceberg I/O, so the Iceberg table keeps
+every row:
+
+```sql
+SELECT coldfront.release_iceberg_table('public', 'orders');
+```
+
+A plain `DROP VIEW` stays blocked by the DDL hook. A tiered registration
+is refused, because releasing one would leave its cold rows unreachable
+while the hot table returned under the relation's name.
+
+### Limits
+
+Adoption inherits three limits:
+
+- writers outside ColdFront are outside the bakery, so Spark or any
+  other engine on the same catalog can still collide with a ColdFront
+  write at Lakekeeper. An in-house tool joins the protocol through
+  `coldfront._claim_iceberg_external()`, as the Go compactor does.
+- nested Iceberg namespaces are not reachable. The pinned duckdb-iceberg
+  build joins the parts of a nested namespace with an unencoded
+  separator byte in the request path, so a table under `lake.eu` cannot
+  be loaded, from adoption or from `duckdb.query()`. A namespace that
+  merely needs quoting, such as `Lake-EU`, works.
+- adopting a table as the cold tier of an existing hot table is out of
+  scope; the watermark and the partition configuration would have to be
+  reconciled with data ColdFront did not write.
+
 ## Wrapper helper: `coldfront.drop_iceberg_table()`
 
 Drops the Iceberg table backing a registered relation, in either mode:

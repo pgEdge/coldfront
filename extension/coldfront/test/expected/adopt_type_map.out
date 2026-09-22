@@ -1,0 +1,175 @@
+-- coldfront._pg_type_from_iceberg maps a DuckDB column type, as DESCRIBE spells
+-- it on an attached Iceberg table, to the PostgreSQL type an adopted wrapper
+-- view exposes it as. It is the reverse of _iceberg_storage_type, and lossier:
+-- Iceberg stores no PG type, so several PG types collapse onto one storage type
+-- and come back as whichever one that storage type reads as natively.
+--
+-- Both spellings of a type have to arrive at the same PG type, because
+-- adopt_iceberg_table compares a caller's p_types override against the observed
+-- storage type by running both through this function, and the two sides spell
+-- some types differently: _iceberg_storage_type returns REAL and TIMESTAMPTZ
+-- and keeps the caller's DECIMAL whitespace, while DESCRIBE returns FLOAT,
+-- TIMESTAMP WITH TIME ZONE and DECIMAL(P,S).
+--
+-- Pure SQL: no catalog, no Iceberg I/O.
+CREATE EXTENSION IF NOT EXISTS pg_duckdb;
+NOTICE:  extension "pg_duckdb" already exists, skipping
+CREATE EXTENSION IF NOT EXISTS coldfront;
+NOTICE:  extension "coldfront" already exists, skipping
+-- The type map, in the spellings DESCRIBE returns.
+SELECT d AS duckdb_type, coldfront._pg_type_from_iceberg(d) AS pg_type
+  FROM unnest(ARRAY[
+      'BOOLEAN', 'INTEGER', 'BIGINT', 'FLOAT', 'DOUBLE', 'DECIMAL(12,2)',
+      'DATE', 'TIME', 'TIMESTAMP', 'TIMESTAMP WITH TIME ZONE',
+      'VARCHAR', 'UUID', 'BLOB', 'FLOAT[]'
+  ]) WITH ORDINALITY AS u(d, ord)
+ ORDER BY ord;
+       duckdb_type        |     pg_type      
+--------------------------+------------------
+ BOOLEAN                  | boolean
+ INTEGER                  | integer
+ BIGINT                   | bigint
+ FLOAT                    | real
+ DOUBLE                   | double precision
+ DECIMAL(12,2)            | numeric(12,2)
+ DATE                     | date
+ TIME                     | time
+ TIMESTAMP                | timestamp
+ TIMESTAMP WITH TIME ZONE | timestamptz
+ VARCHAR                  | text
+ UUID                     | uuid
+ BLOB                     | bytea
+ FLOAT[]                  | real[]
+(14 rows)
+
+-- The spellings _iceberg_storage_type returns for the same types, which DESCRIBE
+-- never produces. They must land on the same PG types as their twins above.
+SELECT d AS duckdb_type, coldfront._pg_type_from_iceberg(d) AS pg_type
+  FROM unnest(ARRAY['REAL', 'TIMESTAMPTZ', 'DECIMAL(12, 2)']) WITH ORDINALITY AS u(d, ord)
+ ORDER BY ord;
+  duckdb_type   |    pg_type    
+----------------+---------------
+ REAL           | real
+ TIMESTAMPTZ    | timestamptz
+ DECIMAL(12, 2) | numeric(12,2)
+(3 rows)
+
+-- Case and surrounding whitespace are not significant.
+SELECT coldfront._pg_type_from_iceberg('  timestamp with time zone  ') AS lower_padded,
+       coldfront._pg_type_from_iceberg('Decimal( 9 , 4 )')             AS mixed_case_spaced;
+ lower_padded | mixed_case_spaced 
+--------------+-------------------
+ timestamptz  | numeric(9,4)
+(1 row)
+
+-- Every PG type _iceberg_storage_type accepts, round-tripped. Where two PG types
+-- share one storage type the round trip returns the one that storage type reads
+-- as natively, so smallint comes back integer, every string type comes back
+-- text, and a pgvector column comes back real[], the same as the plain float
+-- list it shares its storage with.
+SELECT p                                                                   AS pg_type,
+       coldfront._iceberg_storage_type(p)                                  AS storage,
+       coldfront._pg_type_from_iceberg(coldfront._iceberg_storage_type(p)) AS round_trip
+  FROM unnest(ARRAY[
+      'bigint', 'int8', 'integer', 'int', 'int4', 'smallint', 'int2',
+      'real', 'float4', 'double precision', 'float8', 'boolean', 'bool',
+      'timestamp with time zone', 'timestamptz',
+      'timestamp without time zone', 'timestamp',
+      'date', 'time without time zone', 'time',
+      'uuid', 'text', 'bytea',
+      'character varying(10)', 'varchar(10)', 'varchar',
+      'character(5)', 'char(5)', 'character',
+      'numeric(12,2)', 'numeric(12, 2)', 'decimal(10,4)',
+      'jsonb', 'json', 'interval',
+      'vector(3)', 'halfvec(3)'
+  ]) WITH ORDINALITY AS u(p, ord)
+ ORDER BY ord;
+           pg_type           |    storage     |    round_trip    
+-----------------------------+----------------+------------------
+ bigint                      | BIGINT         | bigint
+ int8                        | BIGINT         | bigint
+ integer                     | INTEGER        | integer
+ int                         | INTEGER        | integer
+ int4                        | INTEGER        | integer
+ smallint                    | INTEGER        | integer
+ int2                        | INTEGER        | integer
+ real                        | REAL           | real
+ float4                      | REAL           | real
+ double precision            | DOUBLE         | double precision
+ float8                      | DOUBLE         | double precision
+ boolean                     | BOOLEAN        | boolean
+ bool                        | BOOLEAN        | boolean
+ timestamp with time zone    | TIMESTAMPTZ    | timestamptz
+ timestamptz                 | TIMESTAMPTZ    | timestamptz
+ timestamp without time zone | TIMESTAMP      | timestamp
+ timestamp                   | TIMESTAMP      | timestamp
+ date                        | DATE           | date
+ time without time zone      | TIME           | time
+ time                        | TIME           | time
+ uuid                        | UUID           | uuid
+ text                        | VARCHAR        | text
+ bytea                       | BLOB           | bytea
+ character varying(10)       | VARCHAR        | text
+ varchar(10)                 | VARCHAR        | text
+ varchar                     | VARCHAR        | text
+ character(5)                | VARCHAR        | text
+ char(5)                     | VARCHAR        | text
+ character                   | VARCHAR        | text
+ numeric(12,2)               | DECIMAL(12,2)  | numeric(12,2)
+ numeric(12, 2)              | DECIMAL(12, 2) | numeric(12,2)
+ decimal(10,4)               | DECIMAL(10,4)  | numeric(10,4)
+ jsonb                       | VARCHAR        | text
+ json                        | VARCHAR        | text
+ interval                    | VARCHAR        | text
+ vector(3)                   | FLOAT[]        | real[]
+ halfvec(3)                  | FLOAT[]        | real[]
+(37 rows)
+
+-- Nanosecond timestamps are refused: PostgreSQL stores microseconds.
+SELECT coldfront._pg_type_from_iceberg('TIMESTAMP_NS');
+ERROR:  coldfront: Iceberg type TIMESTAMP_NS has no PostgreSQL mapping
+HINT:  Supported: BOOLEAN, INTEGER, BIGINT, FLOAT, DOUBLE, DECIMAL(P,S), DATE, TIME, TIMESTAMP, TIMESTAMP WITH TIME ZONE, VARCHAR, UUID, BLOB, FLOAT[]. Leave the table where it is, or project the unsupported columns away into an Iceberg view first.
+CONTEXT:  PL/pgSQL function _pg_type_from_iceberg(text,text) line 39 at RAISE
+-- Iceberg types with no PostgreSQL equivalent this mode can expose. DuckDB
+-- loads and DESCRIBEs all of them, so the refusal is coldfront's.
+SELECT coldfront._pg_type_from_iceberg('VARIANT');
+ERROR:  coldfront: Iceberg type VARIANT has no PostgreSQL mapping
+HINT:  Supported: BOOLEAN, INTEGER, BIGINT, FLOAT, DOUBLE, DECIMAL(P,S), DATE, TIME, TIMESTAMP, TIMESTAMP WITH TIME ZONE, VARCHAR, UUID, BLOB, FLOAT[]. Leave the table where it is, or project the unsupported columns away into an Iceberg view first.
+CONTEXT:  PL/pgSQL function _pg_type_from_iceberg(text,text) line 39 at RAISE
+SELECT coldfront._pg_type_from_iceberg('GEOMETRY');
+ERROR:  coldfront: Iceberg type GEOMETRY has no PostgreSQL mapping
+HINT:  Supported: BOOLEAN, INTEGER, BIGINT, FLOAT, DOUBLE, DECIMAL(P,S), DATE, TIME, TIMESTAMP, TIMESTAMP WITH TIME ZONE, VARCHAR, UUID, BLOB, FLOAT[]. Leave the table where it is, or project the unsupported columns away into an Iceberg view first.
+CONTEXT:  PL/pgSQL function _pg_type_from_iceberg(text,text) line 39 at RAISE
+SELECT coldfront._pg_type_from_iceberg('STRUCT(x INTEGER, y VARCHAR)');
+ERROR:  coldfront: Iceberg type STRUCT(x INTEGER, y VARCHAR) has no PostgreSQL mapping
+HINT:  Supported: BOOLEAN, INTEGER, BIGINT, FLOAT, DOUBLE, DECIMAL(P,S), DATE, TIME, TIMESTAMP, TIMESTAMP WITH TIME ZONE, VARCHAR, UUID, BLOB, FLOAT[]. Leave the table where it is, or project the unsupported columns away into an Iceberg view first.
+CONTEXT:  PL/pgSQL function _pg_type_from_iceberg(text,text) line 39 at RAISE
+SELECT coldfront._pg_type_from_iceberg('MAP(VARCHAR, INTEGER)');
+ERROR:  coldfront: Iceberg type MAP(VARCHAR, INTEGER) has no PostgreSQL mapping
+HINT:  Supported: BOOLEAN, INTEGER, BIGINT, FLOAT, DOUBLE, DECIMAL(P,S), DATE, TIME, TIMESTAMP, TIMESTAMP WITH TIME ZONE, VARCHAR, UUID, BLOB, FLOAT[]. Leave the table where it is, or project the unsupported columns away into an Iceberg view first.
+CONTEXT:  PL/pgSQL function _pg_type_from_iceberg(text,text) line 39 at RAISE
+-- A list of anything but float: only list<float> has a wrapper-view spelling
+-- both engines read the same way.
+SELECT coldfront._pg_type_from_iceberg('BIGINT[]');
+ERROR:  coldfront: Iceberg type BIGINT[] has no PostgreSQL mapping
+HINT:  Supported: BOOLEAN, INTEGER, BIGINT, FLOAT, DOUBLE, DECIMAL(P,S), DATE, TIME, TIMESTAMP, TIMESTAMP WITH TIME ZONE, VARCHAR, UUID, BLOB, FLOAT[]. Leave the table where it is, or project the unsupported columns away into an Iceberg view first.
+CONTEXT:  PL/pgSQL function _pg_type_from_iceberg(text,text) line 39 at RAISE
+-- An unbounded DECIMAL never comes from DESCRIBE, which always spells out the
+-- precision and scale, and PostgreSQL cannot be told the width otherwise.
+SELECT coldfront._pg_type_from_iceberg('DECIMAL');
+ERROR:  coldfront: Iceberg type DECIMAL has no PostgreSQL mapping
+HINT:  Supported: BOOLEAN, INTEGER, BIGINT, FLOAT, DOUBLE, DECIMAL(P,S), DATE, TIME, TIMESTAMP, TIMESTAMP WITH TIME ZONE, VARCHAR, UUID, BLOB, FLOAT[]. Leave the table where it is, or project the unsupported columns away into an Iceberg view first.
+CONTEXT:  PL/pgSQL function _pg_type_from_iceberg(text,text) line 39 at RAISE
+-- Given the column, the refusal names it: this is the message adopt_iceberg_table
+-- shows, and the column is what tells the caller which one to leave behind.
+SELECT coldfront._pg_type_from_iceberg('STRUCT(x INTEGER, y VARCHAR)', 'payload');
+ERROR:  coldfront: column "payload" has Iceberg type STRUCT(x INTEGER, y VARCHAR), which has no PostgreSQL mapping
+HINT:  Supported: BOOLEAN, INTEGER, BIGINT, FLOAT, DOUBLE, DECIMAL(P,S), DATE, TIME, TIMESTAMP, TIMESTAMP WITH TIME ZONE, VARCHAR, UUID, BLOB, FLOAT[]. Leave the table where it is, or project the unsupported columns away into an Iceberg view first.
+CONTEXT:  PL/pgSQL function _pg_type_from_iceberg(text,text) line 36 at RAISE
+-- STRICT: a NULL type yields NULL rather than raising.
+SELECT coldfront._pg_type_from_iceberg(NULL) IS NULL AS null_in_null_out;
+ null_in_null_out 
+------------------
+ t
+(1 row)
+

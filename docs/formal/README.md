@@ -51,6 +51,8 @@ describes its files and their roles:
 | `Bakery_v2_wedge.cfg` | **The orphan-claim wedge, reaper OFF** (`Reaper=FALSE`, `NodeParts={{a1,a2},{b1}}`, 1 crash). A same-node writer crashes holding its claim; its row stays in `coldfront.claims` with no owner. **`SurvivorProgress` is EXPECTED to be violated**: the surviving writer never decides. Safety still holds. The first v2 config to check liveness under crash at all; `Bakery_v2_crash.cfg` checks only safety. |
 | `Bakery_v2_reaper.cfg` | **The reaper ON** (`Reaper=TRUE`, `NodeRetries=TRUE`), same topology. Three paths reap ownerless same-node claims: the claim path under the table lock, the apply path on its defer branch when the lock is free, and the waiter's poke. `SurvivorProgress` HOLDS *and* all four safety invariants hold: the reap never breaks mutual exclusion. |
 | `Bakery_v2_reaper_quiet.cfg` | **The poke's case** (`Reaper=TRUE`, `NodeRetries=FALSE`): the crash strands a claim on a node no local writer or new peer claim ever reaches again, while a peer that already deferred behind it waits. Only the waiter's poke reaches that node. `SurvivorProgress` HOLDS and safety holds. |
+| `Bakery_v2_adopt_race.cfg` | **Table registration OUTSIDE the bakery** (`AdoptClaims=FALSE`, one writer per node on two nodes). `_adopt_preflight` reads only the calling node's `coldfront.tiered_views`, so while the peer's row is in flight both preflights pass and both nodes INSERT. **`NoDoubleRegistration` is EXPECTED to be violated.** On a mesh the rows then replicate into each other and the second violates `UNIQUE (iceberg_table)` inside the apply worker, where no status field reports it. |
+| `Bakery_v2_adopt.cfg` | **Registration UNDER the claim** (`AdoptClaims=TRUE`), same topology. The second node cannot reach its preflight until the first releases, and the release runs in the COMMIT callback, after the registry row is committed and ahead of the drained ack that frees the waiter. `NoDoubleRegistration` HOLDS *and* the four safety invariants hold: adding a claimant costs nothing the bakery already guarantees. |
 
 ## Properties
 
@@ -189,6 +191,15 @@ java -cp $TLA tlc2.TLC -workers auto -deadlock -config Bakery_v2_reaper.cfg Bake
 #      peer claim ever reaches the crashed node; only the waiter's poke does.  All
 #      hold: SurvivorProgress AND the four safety invariants.
 java -cp $TLA tlc2.TLC -workers auto -deadlock -config Bakery_v2_reaper_quiet.cfg Bakery_v2.tla
+
+# v2.l Table registration OUTSIDE the bakery (AdoptClaims=FALSE): two nodes adopt
+#      one Iceberg table and both preflights pass inside the replication window.
+#      EXPECTED: NoDoubleRegistration VIOLATED.
+java -cp $TLA tlc2.TLC -workers auto -deadlock -config Bakery_v2_adopt_race.cfg Bakery_v2.tla
+
+# v2.m Registration UNDER the claim (AdoptClaims=TRUE), same topology.  All hold:
+#      NoDoubleRegistration AND the four safety invariants.
+java -cp $TLA tlc2.TLC -workers auto -deadlock -config Bakery_v2_adopt.cfg Bakery_v2.tla
 ```
 
 The `-deadlock` flag tells TLC not to flag final stuttering states as

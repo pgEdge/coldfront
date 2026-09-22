@@ -45,6 +45,7 @@ extension's non-hook surface (third table below) and register no view.
 | `read_json_builders` | `jsonb_build_object` / `jsonb_agg` (and the `json_` twins) on a read that DuckDB will run become the `concat` / `to_json` / `array_agg` form; the result is JSON-equal to jsonb's rendering, keeps `ORDER BY` / `FILTER`, still takes `->>`, is rewritten below the top level too, and DuckDB executes it |
 | `registry_snapshot` | the per-statement registry snapshot stays fresh within a transaction: a registration or a moved watermark from an earlier statement of the same transaction is seen by the next one, and a statement naming several views finds the registered one and leaves the others alone |
 | `duckdb_temp_dir` | a backend's DuckDB spill path is its own subdirectory of the configured one, named after its PID and appended once; a session that sets the path itself keeps it, `RESET` returns to the backend's own, and the value survives a rollback |
+| `adopt_read_only` | a registration with `is_writable = false` refuses INSERT, UPDATE and DELETE alike with the documented hint, while its reads and an armed registration's writes are untouched |
 
 ### `planner_hook`: bound parameters on a tiered read (executed)
 
@@ -73,6 +74,8 @@ extension's non-hook surface (third table below) and register no view.
 | `storage_secret_azure` | `_build_storage_secret_opts` secret bodies (s3 + azure branches) and the azure connection-string setter |
 | `privilege_model` | the privilege invariants that let a non-superuser app role run cold I/O (catalog introspection only) |
 | `partition_config_interval` | `partition_config.hot_period` / `retention_period` are native `interval` columns: valid intervals stored canonically, non-intervals rejected at INSERT |
+| `adopt_type_map` | `_pg_type_from_iceberg` maps every DuckDB column type an adopted table can carry, refuses the rest by name, and agrees with `_iceberg_storage_type` on both spellings of a type |
+| `adopt_iceberg_table` | what adoption refuses before it reads a catalog (arguments, a PG schema that does not exist, a name already taken, a reference already registered, no catalog configured), the wrapper view and registry row it ends in, and its inverse `release_iceberg_table` |
 
 ## Why `coldfront.warehouse = ''` here (and only here)
 

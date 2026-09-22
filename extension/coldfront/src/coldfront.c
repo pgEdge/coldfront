@@ -261,6 +261,7 @@ typedef struct {
     char        *partition_col;   /* e.g. "ts"; NULL when is_iceberg_only */
     bool         has_cutoff;      /* false → nothing archived yet */
     bool         is_iceberg_only; /* true → table lives entirely in Iceberg, no hot tier */
+    bool         is_writable;     /* false → adopted read-only; DML is refused, reads are not */
     bool         has_vector;      /* the table carries clustered vector columns;
                                    * which ones is SQL's to answer (per-column
                                    * lookups keyed on the ref or the query). */
@@ -343,7 +344,7 @@ cf_load_registry(void)
     if (SPI_execute(
             "SELECT tv.schema_name, tv.relname, tv.hot_table, tv.iceberg_table, "
             "       tv.partition_col, tv.is_iceberg_only, aw.cutoff_time, "
-            "       tv.vec_columns IS NOT NULL "
+            "       tv.vec_columns IS NOT NULL, tv.is_writable "
             "FROM coldfront.tiered_views tv "
             "LEFT JOIN coldfront.archive_watermark aw "
             "  ON aw.schema_name = tv.schema_name AND aw.table_name = tv.relname",
@@ -375,6 +376,9 @@ cf_load_registry(void)
 
             d = SPI_getbinval(tup, td, 8, &isnull);
             row->info.has_vector = !isnull && DatumGetBool(d);
+
+            d = SPI_getbinval(tup, td, 9, &isnull);
+            row->info.is_writable = isnull || DatumGetBool(d);
 
             cf_registry = lappend(cf_registry, row);
         }
@@ -3638,6 +3642,16 @@ coldfront_post_parse_analyze(ParseState *pstate, Query *query,
 
     vname = get_rel_name(rte->relid);
 
+    /* A relation adopted from an existing catalog without p_writable carries the
+     * read path and nothing else. One check ahead of the emit paths covers all
+     * three verbs, because each of them would otherwise reach Iceberg. */
+    if (!info.is_writable)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("coldfront: \"%s.%s\" is adopted read-only",
+                        get_namespace_name(get_rel_namespace(rte->relid)), vname),
+                 errhint("Release it with coldfront.release_iceberg_table() and adopt again with p_writable => true to arm INSERT/UPDATE/DELETE.")));
+
     /* Bound params ($N) from a plpgsql / DO / PREPARE / extended-protocol
      * caller, collected once (Cause 1). in_plpgsql gates the Cause-2
      * statement shape — plpgsql installs p_post_columnref_hook on the
@@ -4121,11 +4135,12 @@ cf_handle_drop(const CfUtilityCtx *u, DropStmt *ds)
                 char *name = get_rel_name(relid);
                 ereport(ERROR,
                     (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                     errmsg("coldfront: cannot DROP \"%s.%s\" — it has a cold tier in Iceberg",
+                     errmsg("coldfront: cannot DROP \"%s.%s\": it has a cold tier in Iceberg",
                             ns, name),
                      errhint("Blocked by design: the Iceberg cold tier would be orphaned. "
-                             "Removing a tiered table is a deliberate operation — unregister "
-                             "it from coldfront.tiered_views and drop each tier explicitly.")));
+                             "Use coldfront.drop_iceberg_table() to remove the table and its "
+                             "cold tier, or coldfront.release_iceberg_table() to hand an "
+                             "adopted table back with its Iceberg table intact.")));
             }
         }
     }

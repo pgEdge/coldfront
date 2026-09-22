@@ -144,6 +144,13 @@ CONSTANTS Writers,
                           \* must restore SurvivorProgress. FALSE allows the crash after
                           \* which nothing ever reaches the node: the documented residual,
                           \* which no event-driven mechanism can address.
+          AdoptClaims,    \* coldfront.adopt_iceberg_table taking the table's bakery
+                          \* claim around its registry preflight and INSERT. TRUE =
+                          \* the registration happens under the claim, so two nodes
+                          \* adopting one Iceberg table are serialised and the second
+                          \* reads the first's registry row. FALSE = today's code,
+                          \* where each node's preflight reads only its own registry
+                          \* and both pass inside the replication window.
           SameNodeLock    \* coldfront._claim_iceberg_lock's node-local advisory xact
                           \* lock: TRUE = at most ONE cold writer per node is in the
                           \* bakery at a time (the deployment fix). FALSE = same-node
@@ -162,6 +169,7 @@ ASSUME /\ Writers # {}
        /\ AsyncParquet  \in BOOLEAN
        /\ RestampPatch  \in BOOLEAN
        /\ SafeAcks      \in BOOLEAN
+       /\ AdoptClaims   \in BOOLEAN
        /\ SameNodeLock  \in BOOLEAN
 
 NoTicket == 0
@@ -200,7 +208,18 @@ variables
 
   decision    = [w \in Writers |-> "none"],
   crashed     = [w \in Writers |-> FALSE],
-  crash_budget = MaxCrashes;
+  crash_budget = MaxCrashes,
+
+  \* Per-NODE LOCAL view of coldfront.tiered_views for the one Iceberg table
+  \* every writer here contends for. A writer in `registered[nd]` is one whose
+  \* adoption of that table node nd can see. _adopt_preflight reads only the
+  \* local view, which is what makes the registration racy without a claim.
+  \* Replication is modelled at Release rather than by a separate applier step:
+  \* the registry row commits in the writer's MAIN transaction, the claim DELETE
+  \* and the drained ack ride the dblink transaction the COMMIT callback opens
+  \* afterwards, and spock applies one origin's transactions in commit order. So
+  \* every node has the row before any ack that this writer's release produces.
+  registered = [nd \in Nodes |-> {}];
 
 define
   Live(w)        == ~ crashed[w]
@@ -235,7 +254,8 @@ define
   \* _on_claim_apply succeeds exactly when this is FALSE, which proves every
   \* same-node claim on that node is ownerless.
   HoldsTableLock(nd) ==
-    \E w \in nd : Live(w) /\ pc[w] \in {"WaitAcks", "Prepare", "Decide",
+    \E w \in nd : Live(w) /\ pc[w] \in {"WaitAcks", "RegisterUnderClaim",
+                                          "Prepare", "Decide",
                                           "Release", "DrainForward", "DrainDelete"}
 
   \* Peer-node deferrals queued BEHIND my claim (ticket t) that my Release
@@ -264,6 +284,14 @@ define
         /\ iceberg[j].kind = "commit" )
         => iceberg[i].t < iceberg[j].t
 
+  \* One relation per Iceberg table, the constraint UNIQUE (iceberg_table) states
+  \* and _adopt_preflight enforces locally. Two nodes registering the same table
+  \* is the failure: on a mesh the rows replicate into each other and the second
+  \* violates the peer's unique index inside the apply worker, which no status
+  \* field reports. Expected VIOLATED without AdoptClaims and to hold with it.
+  NoDoubleRegistration ==
+    Cardinality(UNION { registered[nd] : nd \in Nodes }) <= 1
+
   \* LIVENESS — every writer eventually reaches a terminal decision.  A writer
   \* whose ack is dropped by the non-atomic defer/drain race is stranded at
   \* WaitAcks forever: AlivePeersHaveAcked can NEVER become true because the
@@ -286,6 +314,11 @@ end define;
 fair process Writer \in Writers
 variables
   my_ticket = NoTicket,
+  my_pf = FALSE,            \* _adopt_preflight's verdict: the registry row this
+                            \* writer read was absent, so its adoption may INSERT.
+                            \* Read and INSERT are separate points because the read
+                            \* is a SELECT and the row only becomes visible to peers
+                            \* when the transaction commits.
   parent_seen = NoSnap,
   parent_staged = NoSnap;   \* tentative parent captured at the pre-claim parquet
                             \* stage in the async (patched) path. Discarded by the
@@ -304,6 +337,15 @@ begin
     await Live(self);
     if AsyncParquet then
       parent_staged := IcebergHead;
+    end if;
+
+  Preflight:
+    \* _adopt_preflight with NO claim held, which is today's adoption. It reads
+    \* this node's own registry only, so a peer's row still in flight is invisible
+    \* and every racing node's preflight passes.
+    await Live(self);
+    if ~ AdoptClaims then
+      my_pf := (registered[Nd(self)] = {});
     end if;
 
   BeginClaim:
@@ -354,6 +396,15 @@ begin
           /\ SmallestOnMyNode(self, my_ticket)
           /\ AllPeerNodesAcked(self, my_ticket);
 
+  RegisterUnderClaim:
+    \* The same preflight, with the table's claim held. A peer adopting the same
+    \* table is still behind the bakery here, and the claim is not dropped until
+    \* Release, by which point this writer's registry row is on every node.
+    await Live(self);
+    if AdoptClaims then
+      my_pf := (registered[Nd(self)] = {});
+    end if;
+
   Prepare:
     \* Capture the parent_snapshot_id the Lakekeeper CAS asserts against:
     \*   - stock (AsyncParquet FALSE): stamped at stage time, which is UNDER the
@@ -395,9 +446,18 @@ begin
 
   Release:
     \* The C XactCallback's claim DELETE: remove my claim from every node view.
+    \* The callback runs on XACT_EVENT_COMMIT, so the main transaction's registry
+    \* INSERT is already committed here and the DELETE below rides a later dblink
+    \* transaction. spock applies one origin's transactions in commit order, so
+    \* the row reaches every node ahead of any ack this release goes on to drain:
+    \* modelled as the row landing on all nodes in this step. A writer that
+    \* crashes before this point never commits, so it never registers anywhere.
     await Live(self);
     claims := [nd \in Nodes |->
                 claims[nd] \ {[w |-> self, t |-> my_ticket, n |-> Nd(self)]}];
+    if my_pf then
+      registered := [nd \in Nodes |-> registered[nd] \cup {self}];
+    end if;
 
   DrainForward:
     \* _on_claim_release step 1 (forward): INSERT claim_acks SELECT … FROM
@@ -555,9 +615,9 @@ begin
 end process;
 
 end algorithm; *)
-\* BEGIN TRANSLATION (chksum(pcal) = "eab492ec" /\ chksum(tla) = "ba118417")
+\* BEGIN TRANSLATION (chksum(pcal) = "5f991957" /\ chksum(tla) = "40456e54")
 VARIABLES pc, next_ticket, claims, acks, deferred, iceberg, decision, crashed, 
-          crash_budget
+          crash_budget, registered
 
 (* define statement *)
 Live(w)        == ~ crashed[w]
@@ -592,7 +652,8 @@ SmallestOnMyNode(self, t) ==
 
 
 HoldsTableLock(nd) ==
-  \E w \in nd : Live(w) /\ pc[w] \in {"WaitAcks", "Prepare", "Decide",
+  \E w \in nd : Live(w) /\ pc[w] \in {"WaitAcks", "RegisterUnderClaim",
+                                        "Prepare", "Decide",
                                         "Release", "DrainForward", "DrainDelete"}
 
 
@@ -626,6 +687,14 @@ TicketOrderPreserved ==
 
 
 
+NoDoubleRegistration ==
+  Cardinality(UNION { registered[nd] : nd \in Nodes }) <= 1
+
+
+
+
+
+
 
 
 EventualProgress ==
@@ -639,12 +708,12 @@ SurvivorProgress ==
   \A w \in Writers :
     <>( crashed[w] \/ decision[w] \in {"committed", "rolled_back", "lk_409"} )
 
-VARIABLES my_ticket, parent_seen, parent_staged, ap_dst, ap_ct, ap_defer, 
-          ap_behind
+VARIABLES my_ticket, my_pf, parent_seen, parent_staged, ap_dst, ap_ct, 
+          ap_defer, ap_behind
 
 vars == << pc, next_ticket, claims, acks, deferred, iceberg, decision, 
-           crashed, crash_budget, my_ticket, parent_seen, parent_staged, 
-           ap_dst, ap_ct, ap_defer, ap_behind >>
+           crashed, crash_budget, registered, my_ticket, my_pf, parent_seen, 
+           parent_staged, ap_dst, ap_ct, ap_defer, ap_behind >>
 
 ProcSet == (Writers) \cup {"applier"} \cup {"poker"} \cup {"crasher"}
 
@@ -657,8 +726,10 @@ Init == (* Global variables *)
         /\ decision = [w \in Writers |-> "none"]
         /\ crashed = [w \in Writers |-> FALSE]
         /\ crash_budget = MaxCrashes
+        /\ registered = [nd \in Nodes |-> {}]
         (* Process Writer *)
         /\ my_ticket = [self \in Writers |-> NoTicket]
+        /\ my_pf = [self \in Writers |-> FALSE]
         /\ parent_seen = [self \in Writers |-> NoSnap]
         /\ parent_staged = [self \in Writers |-> NoSnap]
         (* Process Applier *)
@@ -675,9 +746,9 @@ Start(self) == /\ pc[self] = "Start"
                /\ Live(self)
                /\ pc' = [pc EXCEPT ![self] = "Stage"]
                /\ UNCHANGED << next_ticket, claims, acks, deferred, iceberg, 
-                               decision, crashed, crash_budget, my_ticket, 
-                               parent_seen, parent_staged, ap_dst, ap_ct, 
-                               ap_defer, ap_behind >>
+                               decision, crashed, crash_budget, registered, 
+                               my_ticket, my_pf, parent_seen, parent_staged, 
+                               ap_dst, ap_ct, ap_defer, ap_behind >>
 
 Stage(self) == /\ pc[self] = "Stage"
                /\ Live(self)
@@ -685,10 +756,24 @@ Stage(self) == /\ pc[self] = "Stage"
                      THEN /\ parent_staged' = [parent_staged EXCEPT ![self] = IcebergHead]
                      ELSE /\ TRUE
                           /\ UNCHANGED parent_staged
-               /\ pc' = [pc EXCEPT ![self] = "BeginClaim"]
+               /\ pc' = [pc EXCEPT ![self] = "Preflight"]
                /\ UNCHANGED << next_ticket, claims, acks, deferred, iceberg, 
-                               decision, crashed, crash_budget, my_ticket, 
-                               parent_seen, ap_dst, ap_ct, ap_defer, ap_behind >>
+                               decision, crashed, crash_budget, registered, 
+                               my_ticket, my_pf, parent_seen, ap_dst, ap_ct, 
+                               ap_defer, ap_behind >>
+
+Preflight(self) == /\ pc[self] = "Preflight"
+                   /\ Live(self)
+                   /\ IF ~ AdoptClaims
+                         THEN /\ my_pf' = [my_pf EXCEPT ![self] = (registered[Nd(self)] = {})]
+                         ELSE /\ TRUE
+                              /\ my_pf' = my_pf
+                   /\ pc' = [pc EXCEPT ![self] = "BeginClaim"]
+                   /\ UNCHANGED << next_ticket, claims, acks, deferred, 
+                                   iceberg, decision, crashed, crash_budget, 
+                                   registered, my_ticket, parent_seen, 
+                                   parent_staged, ap_dst, ap_ct, ap_defer, 
+                                   ap_behind >>
 
 BeginClaim(self) == /\ pc[self] = "BeginClaim"
                     /\ Live(self) /\ \E p \in Writers : p # self /\ Live(p)
@@ -715,18 +800,33 @@ BeginClaim(self) == /\ pc[self] = "BeginClaim"
                                             ELSE {})]
                     /\ pc' = [pc EXCEPT ![self] = "WaitAcks"]
                     /\ UNCHANGED << iceberg, decision, crashed, crash_budget, 
-                                    parent_seen, parent_staged, ap_dst, ap_ct, 
-                                    ap_defer, ap_behind >>
+                                    registered, my_pf, parent_seen, 
+                                    parent_staged, ap_dst, ap_ct, ap_defer, 
+                                    ap_behind >>
 
 WaitAcks(self) == /\ pc[self] = "WaitAcks"
                   /\ Live(self)
                      /\ SmallestOnMyNode(self, my_ticket[self])
                      /\ AllPeerNodesAcked(self, my_ticket[self])
-                  /\ pc' = [pc EXCEPT ![self] = "Prepare"]
+                  /\ pc' = [pc EXCEPT ![self] = "RegisterUnderClaim"]
                   /\ UNCHANGED << next_ticket, claims, acks, deferred, iceberg, 
-                                  decision, crashed, crash_budget, my_ticket, 
-                                  parent_seen, parent_staged, ap_dst, ap_ct, 
-                                  ap_defer, ap_behind >>
+                                  decision, crashed, crash_budget, registered, 
+                                  my_ticket, my_pf, parent_seen, parent_staged, 
+                                  ap_dst, ap_ct, ap_defer, ap_behind >>
+
+RegisterUnderClaim(self) == /\ pc[self] = "RegisterUnderClaim"
+                            /\ Live(self)
+                            /\ IF AdoptClaims
+                                  THEN /\ my_pf' = [my_pf EXCEPT ![self] = (registered[Nd(self)] = {})]
+                                  ELSE /\ TRUE
+                                       /\ my_pf' = my_pf
+                            /\ pc' = [pc EXCEPT ![self] = "Prepare"]
+                            /\ UNCHANGED << next_ticket, claims, acks, 
+                                            deferred, iceberg, decision, 
+                                            crashed, crash_budget, registered, 
+                                            my_ticket, parent_seen, 
+                                            parent_staged, ap_dst, ap_ct, 
+                                            ap_defer, ap_behind >>
 
 Prepare(self) == /\ pc[self] = "Prepare"
                  /\ Live(self)
@@ -735,9 +835,9 @@ Prepare(self) == /\ pc[self] = "Prepare"
                        ELSE /\ parent_seen' = [parent_seen EXCEPT ![self] = parent_staged[self]]
                  /\ pc' = [pc EXCEPT ![self] = "Decide"]
                  /\ UNCHANGED << next_ticket, claims, acks, deferred, iceberg, 
-                                 decision, crashed, crash_budget, my_ticket, 
-                                 parent_staged, ap_dst, ap_ct, ap_defer, 
-                                 ap_behind >>
+                                 decision, crashed, crash_budget, registered, 
+                                 my_ticket, my_pf, parent_staged, ap_dst, 
+                                 ap_ct, ap_defer, ap_behind >>
 
 Decide(self) == /\ pc[self] = "Decide"
                 /\ Live(self)
@@ -752,19 +852,23 @@ Decide(self) == /\ pc[self] = "Decide"
                       /\ UNCHANGED iceberg
                 /\ pc' = [pc EXCEPT ![self] = "Release"]
                 /\ UNCHANGED << next_ticket, claims, acks, deferred, crashed, 
-                                crash_budget, my_ticket, parent_seen, 
-                                parent_staged, ap_dst, ap_ct, ap_defer, 
-                                ap_behind >>
+                                crash_budget, registered, my_ticket, my_pf, 
+                                parent_seen, parent_staged, ap_dst, ap_ct, 
+                                ap_defer, ap_behind >>
 
 Release(self) == /\ pc[self] = "Release"
                  /\ Live(self)
                  /\ claims' = [nd \in Nodes |->
                                 claims[nd] \ {[w |-> self, t |-> my_ticket[self], n |-> Nd(self)]}]
+                 /\ IF my_pf[self]
+                       THEN /\ registered' = [nd \in Nodes |-> registered[nd] \cup {self}]
+                       ELSE /\ TRUE
+                            /\ UNCHANGED registered
                  /\ pc' = [pc EXCEPT ![self] = "DrainForward"]
                  /\ UNCHANGED << next_ticket, acks, deferred, iceberg, 
                                  decision, crashed, crash_budget, my_ticket, 
-                                 parent_seen, parent_staged, ap_dst, ap_ct, 
-                                 ap_defer, ap_behind >>
+                                 my_pf, parent_seen, parent_staged, ap_dst, 
+                                 ap_ct, ap_defer, ap_behind >>
 
 DrainForward(self) == /\ pc[self] = "DrainForward"
                       /\ Live(self)
@@ -772,8 +876,9 @@ DrainForward(self) == /\ pc[self] = "DrainForward"
                       /\ pc' = [pc EXCEPT ![self] = "DrainDelete"]
                       /\ UNCHANGED << next_ticket, claims, deferred, iceberg, 
                                       decision, crashed, crash_budget, 
-                                      my_ticket, parent_seen, parent_staged, 
-                                      ap_dst, ap_ct, ap_defer, ap_behind >>
+                                      registered, my_ticket, my_pf, 
+                                      parent_seen, parent_staged, ap_dst, 
+                                      ap_ct, ap_defer, ap_behind >>
 
 DrainDelete(self) == /\ pc[self] = "DrainDelete"
                      /\ Live(self)
@@ -781,12 +886,14 @@ DrainDelete(self) == /\ pc[self] = "DrainDelete"
                      /\ pc' = [pc EXCEPT ![self] = "Done"]
                      /\ UNCHANGED << next_ticket, claims, acks, iceberg, 
                                      decision, crashed, crash_budget, 
-                                     my_ticket, parent_seen, parent_staged, 
-                                     ap_dst, ap_ct, ap_defer, ap_behind >>
+                                     registered, my_ticket, my_pf, parent_seen, 
+                                     parent_staged, ap_dst, ap_ct, ap_defer, 
+                                     ap_behind >>
 
-Writer(self) == Start(self) \/ Stage(self) \/ BeginClaim(self)
-                   \/ WaitAcks(self) \/ Prepare(self) \/ Decide(self)
-                   \/ Release(self) \/ DrainForward(self)
+Writer(self) == Start(self) \/ Stage(self) \/ Preflight(self)
+                   \/ BeginClaim(self) \/ WaitAcks(self)
+                   \/ RegisterUnderClaim(self) \/ Prepare(self)
+                   \/ Decide(self) \/ Release(self) \/ DrainForward(self)
                    \/ DrainDelete(self)
 
 ApplyLoop == /\ pc["applier"] = "ApplyLoop"
@@ -816,8 +923,8 @@ ApplyLoop == /\ pc["applier"] = "ApplyLoop"
                                               ELSE NoTicket)
              /\ pc' = [pc EXCEPT !["applier"] = "ApplyEmit"]
              /\ UNCHANGED << next_ticket, iceberg, decision, crashed, 
-                             crash_budget, my_ticket, parent_seen, 
-                             parent_staged >>
+                             crash_budget, registered, my_ticket, my_pf, 
+                             parent_seen, parent_staged >>
 
 ApplyEmit == /\ pc["applier"] = "ApplyEmit"
              /\ IF (IF SafeAcks
@@ -829,8 +936,9 @@ ApplyEmit == /\ pc["applier"] = "ApplyEmit"
                         /\ UNCHANGED deferred
              /\ pc' = [pc EXCEPT !["applier"] = "ApplyLoop"]
              /\ UNCHANGED << next_ticket, claims, iceberg, decision, crashed, 
-                             crash_budget, my_ticket, parent_seen, 
-                             parent_staged, ap_dst, ap_ct, ap_defer, ap_behind >>
+                             crash_budget, registered, my_ticket, my_pf, 
+                             parent_seen, parent_staged, ap_dst, ap_ct, 
+                             ap_defer, ap_behind >>
 
 Applier == ApplyLoop \/ ApplyEmit
 
@@ -857,8 +965,9 @@ PokeLoop == /\ pc["poker"] = "PokeLoop"
                           /\ claims' = [nd \in Nodes |-> claims[nd] \ orphans]
             /\ pc' = [pc EXCEPT !["poker"] = "PokeLoop"]
             /\ UNCHANGED << next_ticket, iceberg, decision, crashed, 
-                            crash_budget, my_ticket, parent_seen, 
-                            parent_staged, ap_dst, ap_ct, ap_defer, ap_behind >>
+                            crash_budget, registered, my_ticket, my_pf, 
+                            parent_seen, parent_staged, ap_dst, ap_ct, 
+                            ap_defer, ap_behind >>
 
 Poker == PokeLoop
 
@@ -876,8 +985,9 @@ CrashLoop == /\ pc["crasher"] = "CrashLoop"
                    ELSE /\ pc' = [pc EXCEPT !["crasher"] = "Done"]
                         /\ UNCHANGED << crashed, crash_budget >>
              /\ UNCHANGED << next_ticket, claims, acks, deferred, iceberg, 
-                             decision, my_ticket, parent_seen, parent_staged, 
-                             ap_dst, ap_ct, ap_defer, ap_behind >>
+                             decision, registered, my_ticket, my_pf, 
+                             parent_seen, parent_staged, ap_dst, ap_ct, 
+                             ap_defer, ap_behind >>
 
 Crasher == CrashLoop
 
