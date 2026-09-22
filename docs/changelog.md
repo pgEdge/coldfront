@@ -7,6 +7,28 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/),
 and this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- `coldfront.adopt_iceberg_table()` gives a table that already exists in
+  the Iceberg catalog a PostgreSQL wrapper view and a registry row, so it
+  reads like one ColdFront created. The schema comes from the catalog, and
+  `p_types` restores a type Iceberg cannot record. Adoption is read-only
+  unless `p_writable => true` arms the write path.
+- `coldfront.release_iceberg_table()` hands an adopted table back: the
+  wrapper view and the registry row go, and the Iceberg table keeps every
+  row.
+
+### Changed
+
+- `coldfront.tiered_views` carries an `is_writable` column and a unique
+  constraint on `iceberg_table`. Every existing registration is writable,
+  and one relation is registered per Iceberg table.
+- `coldfront.drop_iceberg_table()` refuses a relation adopted read-only,
+  and builds its catalog DDL from the stored Iceberg reference rather than
+  from the PostgreSQL schema and table names.
+
 ## [1.0.0-beta2] - 2026-08-08
 
 ### Added
