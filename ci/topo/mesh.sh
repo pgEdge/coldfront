@@ -108,23 +108,20 @@ subs=$(m db1 "SELECT count(*) FROM spock.subscription;")
 # it runs on — so peers would otherwise not be armed until too late, and the
 # originator would sleep forever waiting for acks. Idempotent.
 for n in $NODES; do m "$n" "SELECT coldfront._ensure_claims_replicated();" >/dev/null 2>&1; done
-# Tiered cross-node: replicate the registry + watermark alongside the bakery's
-# claims/claim_acks. Both are needed for a tiered table provisioned on db1 to be
-# fully usable on a peer: archive_watermark (keyed by table_name) gives the peer's
-# write hook the hot/cold cutoff, and tiered_views (keyed by schema_name,relname)
-# arms the hook to recognise the view for UPDATE/DELETE + DDL-blocking. Both are
-# name-keyed, so the repset copies each row verbatim and correct on every node (a
-# name is node-independent). VERIFIED necessary: drop the tiered_views entry and
-# the registry is absent on peers (only INSERT keeps working, via the replicated
-# INSTEAD trigger) — the archiver runs on db1 only, so a peer never registers the
-# view itself; it gets the row by replication. (See ARCHITECTURE_TIERED.md "Tiered
-# tables in a Spock mesh". Decoupled re-registers per-node, so this is tiered-only.)
-if [ "$MODE" = tiered ]; then
-    for n in $NODES; do
-        m "$n" "SELECT spock.repset_add_table('default','coldfront.tiered_views'::regclass, false);"    >/dev/null 2>&1
-        m "$n" "SELECT spock.repset_add_table('default','coldfront.archive_watermark'::regclass, false);" >/dev/null 2>&1
-    done
-fi
+# Cross-node registry: replicate tiered_views + archive_watermark alongside the
+# bakery's claims/claim_acks, so a table provisioned, tiered or adopted on db1 is
+# fully usable on a peer. tiered_views (keyed by schema_name,relname) arms the
+# peer's hook to recognise the view for UPDATE/DELETE + DDL-blocking;
+# archive_watermark (keyed by table_name) gives a tiered table's write hook the
+# hot/cold cutoff. Both are name-keyed, so the repset copies each row verbatim and
+# correct on every node (a name is node-independent). One node registers, the
+# archiver on db1 or the node that called create/adopt_iceberg_table; a peer never
+# registers the view itself and gets the row by replication. (See
+# docs/architecture_tiered.md "Tiered tables in a Spock mesh".)
+for n in $NODES; do
+    m "$n" "SELECT spock.repset_add_table('default','coldfront.tiered_views'::regclass, false);"    >/dev/null 2>&1
+    m "$n" "SELECT spock.repset_add_table('default','coldfront.archive_watermark'::regclass, false);" >/dev/null 2>&1
+done
 # Per-table lifecycle config + the cold-tier storage secret replicate by value
 # in any mesh mode (partition_config is also self-registered by the binaries via
 # partcfg.EnsureTable; doing it here too is harmless).
