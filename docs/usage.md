@@ -805,6 +805,14 @@ dead-peer rulings become a problem. An alive peer that hasn't acked is
 either deferring legitimately (R-A's defer rule) or about to ack - either
 way, waiting is correct, not a failure.
 
+A claim whose owner is gone (a hard backend crash) is reaped without
+operator action: by that node's next cold write, to any table, by a
+peer's arriving claim, or by the waiting peer's poke, a no-op UPDATE of
+its own claim row about once a second for as long as it waits. That poke
+is the only replication traffic the bakery generates while a writer
+waits, and there is none when nothing waits. See
+[architecture_decoupled.md](architecture_decoupled.md), *Orphan reaping*.
+
 Sync-rep (`synchronous_standby_names`) is **not required** by the bakery
 - the R-A ack barrier is what serialises iceberg commits. You can still
 enable it cluster-wide if you want stronger durability for non-bakery

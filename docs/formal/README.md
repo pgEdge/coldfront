@@ -39,7 +39,7 @@ describes its files and their roles:
 
 | File | Role |
 |---|---|
-| `Bakery_v2.tla` | PlusCal source.  Models the real spock world: each writer has its OWN local `claims[w]` view, INSERTs propagate via an explicit `Applier`.  No `synchronous_commit = remote_apply`.  Coordination is Lamport's 1978 distributed mutual exclusion algorithm with Ricart-Agrawala's (1981) deferred-reply optimisation: peers ack each claim immediately unless they have a pending claim with smaller ticket, in which case they defer the ack until they release their own claim.  Also models the `coldfront.iceberg_async_parquet` flag (constants `AsyncParquet`/`RestampPatch`): the `Stage` label stages parquet OUTSIDE the claim (async ordering); `Prepare` captures the `parent_snapshot_id` UNDER the claim (stock at stage time, patched async re-stamped at the commit POST); the `Decide` CAS asserts against it.  **Defer/drain atomicity** is modelled too (constant `SafeAcks`): the apply-time defer DECISION and its WRITE (`ApplyDecide`/`ApplyEmit`), and the release drain's FORWARD and DELETE (`DrainForward`/`DrainDelete`), are SEPARATE steps — faithful to the non-atomic SQL.  `SafeAcks=FALSE` lets them race (a deferral written behind a just-released claim is deleted unforwarded / orphaned — a dropped ack); `SafeAcks=TRUE` is the safe implementation: an atomic re-check of R-A's own defer rule against the claim, i.e. `SELECT … FOR UPDATE` on the claim row in `coldfront._on_claim_apply`. |
+| `Bakery_v2.tla` | PlusCal source.  Models the real spock world: each writer has its OWN local `claims[w]` view, INSERTs propagate via an explicit `Applier`.  No `synchronous_commit = remote_apply`.  Coordination is Lamport's 1978 distributed mutual exclusion algorithm with Ricart-Agrawala's (1981) deferred-reply optimisation: peers ack each claim immediately unless they have a pending claim with smaller ticket, in which case they defer the ack until they release their own claim.  Also models the `coldfront.iceberg_async_parquet` flag (constants `AsyncParquet`/`RestampPatch`): the `Stage` label stages parquet OUTSIDE the claim (async ordering); `Prepare` captures the `parent_snapshot_id` UNDER the claim (stock at stage time, patched async re-stamped at the commit POST); the `Decide` CAS asserts against it.  **Defer/drain atomicity** is modelled too (constant `SafeAcks`): the apply-time defer DECISION and its WRITE (`ApplyDecide`/`ApplyEmit`), and the release drain's FORWARD and DELETE (`DrainForward`/`DrainDelete`), are SEPARATE steps — faithful to the non-atomic SQL.  `SafeAcks=FALSE` lets them race (a deferral written behind a just-released claim is deleted unforwarded / orphaned — a dropped ack); `SafeAcks=TRUE` is the safe implementation: an atomic re-check of R-A's own defer rule against the claim, i.e. `SELECT … FOR UPDATE` on the claim row in `coldfront._on_claim_apply`.  **The orphan reaper** (constant `Reaper`): a same-node claim whose writer has crashed holds no advisory lock, so `BeginClaim` deletes it in the step that inserts its own claim; the `Applier` does the same on its defer branch under `HoldsTableLock(nd)` (a live writer holds `coldfront_iceberg:<table>` from `WaitAcks` through `DrainDelete`, because the release runs in the COMMIT callback before PostgreSQL drops the xact lock); and a `Poker` process models the waiter's periodic no-op UPDATE of its own claim row, which re-runs the peer's defer branch and is what unwedges a waiter whose peer's holder died after deferring to it. Constant `NodeRetries` restricts the `Crasher` to writers whose node still has an unstarted writer (the node is touched again); FALSE allows the crash after which only the poke reaches the node. The `Crasher` cannot split `Release`/`DrainForward`/`DrainDelete`, which are one dblink transaction in the real code. |
 | `Bakery_v2.cfg` | TLC config: 3 writers, no crashes, all four safety invariants. **Stock ordering** (`AsyncParquet=FALSE` - the default; parquet staged inside the claim).  Passes - R-A makes `NoLakekeeperConflict` and `TicketOrderPreserved` hold even with realistic asymmetric apply. |
 | `Bakery_v2_async.cfg` | **Patched async ordering** (`AsyncParquet=TRUE, RestampPatch=TRUE`) - what the DuckDB 1.5.x (duckdb15) image runs: parquet staged outside the claim, `parent_snapshot_id` re-stamped at the commit POST under the claim by the bakery-aware patch.  All four safety invariants HOLD; the test is non-vacuous (shares the stock config's under-claim `Prepare→Decide` window, which R-A keeps empty). |
 | `Bakery_v2_race.cfg` | **Pre-patch async race** (`AsyncParquet=TRUE, RestampPatch=FALSE`) - async ordering WITHOUT the bakery-aware patch: the stale tentative parent from the pre-claim stage is used at the POST. **`NoLakekeeperConflict` is EXPECTED to be violated** - the formal proof that the patch is mandatory for the async ordering. |
@@ -48,6 +48,9 @@ describes its files and their roles:
 | `Bakery_v2_fixed.cfg` | **The fix** (`SafeAcks=TRUE`) - the atomic defer/drain (`FOR UPDATE` on the claim row). `EventualProgress` HOLDS *and* all four safety invariants hold: the formal proof the fix restores liveness without weakening safety. |
 | `Bakery_v2_samenode_race.cfg` | **Multiple cold writers per node, no same-node lock** (`NodeParts={{a1,a2},{b1}}`, `SameNodeLock=FALSE`). Two same-node claims `a1<a2` below a peer's `b1`: the node defers `b1` behind its smallest same-node claim `a1` and, on `a1`'s release, forwards the ack for `b1` without re-deferring behind `a2` (still held, still `< b1`), so `a2` and `b1` both clear the bakery. **`NoLakekeeperConflict` is EXPECTED to be violated** - the multi-writer-per-node race, reproduced in the model. |
 | `Bakery_v2_samenode.cfg` | **The fix** (`SameNodeLock=TRUE`) - `coldfront._claim_iceberg_lock`'s node-local advisory xact lock, so at most one same-node writer is in the bakery at a time. `a1` and `a2` never coexist; the topology collapses to one active claim per node and all four safety invariants HOLD: the formal proof the node-local lock is mandatory for multi-writer-per-node cold writes. |
+| `Bakery_v2_wedge.cfg` | **The orphan-claim wedge, reaper OFF** (`Reaper=FALSE`, `NodeParts={{a1,a2},{b1}}`, 1 crash). A same-node writer crashes holding its claim; its row stays in `coldfront.claims` with no owner. **`SurvivorProgress` is EXPECTED to be violated**: the surviving writer never decides. Safety still holds. The first v2 config to check liveness under crash at all; `Bakery_v2_crash.cfg` checks only safety. |
+| `Bakery_v2_reaper.cfg` | **The reaper ON** (`Reaper=TRUE`, `NodeRetries=TRUE`), same topology. Three paths reap ownerless same-node claims: the claim path under the table lock, the apply path on its defer branch when the lock is free, and the waiter's poke. `SurvivorProgress` HOLDS *and* all four safety invariants hold: the reap never breaks mutual exclusion. |
+| `Bakery_v2_reaper_quiet.cfg` | **The poke's case** (`Reaper=TRUE`, `NodeRetries=FALSE`): the crash strands a claim on a node no local writer or new peer claim ever reaches again, while a peer that already deferred behind it waits. Only the waiter's poke reaches that node. `SurvivorProgress` HOLDS and safety holds. |
 
 ## Properties
 
@@ -87,6 +90,14 @@ TLC checks these properties as `PROPERTIES`:
   (`SafeAcks=TRUE`) HOLDS it; `Bakery_v2_live.cfg` (`SafeAcks=FALSE`)
   VIOLATES it - the dropped-ack wedge that strands the min-ticket
   holder at `WaitAcks` forever.
+- `SurvivorProgress` - every writer eventually decides *or crashes*.
+  `EventualProgress` is unusable with `MaxCrashes > 0`, since a crashed
+  writer never decides; this is the form a crash config can check.
+  `Bakery_v2_wedge.cfg` (`Reaper=FALSE`) VIOLATES it, the surviving
+  same-node writer waiting forever on a claim nobody owns;
+  `Bakery_v2_reaper.cfg` (`Reaper=TRUE`, `NodeRetries=TRUE`) and
+  `Bakery_v2_reaper_quiet.cfg` (`NodeRetries=FALSE`, only the poke reaches
+  the crashed node) both HOLD it.
 - `NonCrashedProgress` - every *live* writer with a claim eventually
   decides, or dies. The in-bakery reap (a writer at `BakeryWait`
   evicts the claim of a peer it deems dead) ensures surviving
@@ -165,6 +176,19 @@ java -cp $TLA tlc2.TLC -workers auto -deadlock -config Bakery_v2_samenode_race.c
 # v2.h Same topology WITH the node-local advisory lock (SameNodeLock=TRUE).
 #      All four safety invariants HOLD — the lock restores safety.
 java -cp $TLA tlc2.TLC -workers auto -deadlock -config Bakery_v2_samenode.cfg Bakery_v2.tla
+
+# v2.i Orphan-claim wedge, reaper OFF (Reaper=FALSE, 1 crash).  EXPECTED FAILURE:
+#      SurvivorProgress violated: a crashed same-node claim holder strands the survivor.
+java -cp $TLA tlc2.TLC -workers auto -deadlock -config Bakery_v2_wedge.cfg Bakery_v2.tla
+
+# v2.j The reaper ON (Reaper=TRUE, NodeRetries=TRUE): the crashed node is touched
+#      again.  All hold: SurvivorProgress AND the four safety invariants.
+java -cp $TLA tlc2.TLC -workers auto -deadlock -config Bakery_v2_reaper.cfg Bakery_v2.tla
+
+# v2.k The poke's case (Reaper=TRUE, NodeRetries=FALSE): no local writer or new
+#      peer claim ever reaches the crashed node; only the waiter's poke does.  All
+#      hold: SurvivorProgress AND the four safety invariants.
+java -cp $TLA tlc2.TLC -workers auto -deadlock -config Bakery_v2_reaper_quiet.cfg Bakery_v2.tla
 ```
 
 The `-deadlock` flag tells TLC not to flag final stuttering states as

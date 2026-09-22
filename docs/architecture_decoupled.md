@@ -357,7 +357,9 @@ PG nodes pointing at the same Lakekeeper endpoint and S3 bucket.
     here; deleted on release.
   - `coldfront.claim_acks` - peers insert `(ticket, ack_from_name,
     iceberg_table)` to acknowledge an originator's claim, keyed by the
-    acker's spock node name. Replicates back to the originator.
+    acker's spock node name. Replicates back to the originator, and is
+    deleted with the claim: only the originator's own wait loop ever
+    reads its acks, so a row has no reader once the claim is gone.
 
   Locally on every node, `coldfront.deferred_acks` queues acks the
   node has *deferred* because it has its own pending claim with a
@@ -385,11 +387,16 @@ PG nodes pointing at the same Lakekeeper endpoint and S3 bucket.
   `ENABLE REPLICA` trigger (`coldfront._on_claim_apply`) decides:
 
   - If the peer has its own pending claim with a *smaller* ticket on
-    the same table → defer (queue in `coldfront.deferred_acks` to
-    emit later when the smaller claim is released).
+    the same table, it first asks whether that claim can have a live
+    owner (see *Orphan reaping* below); if it can → defer (queue in
+    `coldfront.deferred_acks` to emit later when the smaller claim is
+    released).
   - Otherwise → ack immediately (INSERT into `coldfront.claim_acks`
     via dblink, so the row is tagged with the local node as origin
     and Spock replicates it back to the originator).
+
+  The same trigger fires on UPDATE, for the waiter's poke described
+  under *Orphan reaping*.
 
   The protocol works across **any number of writers per node** -
   each call holds its own unique ticket; release deletes by ticket
@@ -401,6 +408,51 @@ PG nodes pointing at the same Lakekeeper endpoint and S3 bucket.
   ticket exists on the table (snowflake tickets are per-node
   monotonic + timestamped, so a smaller ticket means `nextval` was
   called earlier on this node).
+
+  **Orphan reaping.** A claim row whose owner is gone (a hard backend
+  crash; an ERROR takes the ABORT callback, which releases normally)
+  would otherwise strand its own node's later writers, through rule
+  (a), and any peer that deferred behind it, through the deferral it
+  can no longer drain. The proof that a same-node claim is ownerless
+  is the per-table advisory transaction lock: a live writer holds
+  `coldfront_iceberg:<table>` from its claim INSERT until its
+  transaction ends, and the release runs in the COMMIT callback before
+  PostgreSQL drops that lock, so whoever holds it knows every other
+  same-node claim on the table has no owner. Three paths use that
+  proof, each riding a statement the bakery already executes, with no
+  timeout, scheduler or background worker:
+
+  - **Claim path.** `_claim_iceberg_lock` already holds the lock for
+    its own table, and tries (session-level, released at once) the lock
+    of every other table this node has a claim on. The dblink statement
+    that inserts the new claim first deletes every same-node claim on
+    those tables (and, after a restart, any claim from before
+    `pg_postmaster_start_time()`) together with their acks, so any cold
+    write on the node clears every orphan the node left. The DELETE
+    fires the release trigger, which forwards whatever peers had
+    deferred behind the orphan.
+  - **Apply path.** When a peer's claim arrives and a smaller same-node
+    claim exists, `_on_claim_apply` tries the lock
+    (`pg_try_advisory_xact_lock`). Success means no live local writer,
+    so it deletes the same-node claims and their acks through dblink
+    and acks the arrival instead of deferring it. A live writer's
+    lock makes the try fail at once, and the trigger defers as before.
+  - **Waiter's poke.** A peer that deferred while the lock was held,
+    whose holder then vanished, sees no further event. So a writer in
+    the wait loop re-touches its own claim row about once a second
+    (a no-op UPDATE); it replicates, the peer's trigger runs the apply
+    path again for that ticket, and the orphan is reaped. A poke that
+    reaps nothing is silent, so no ack is ever issued after its claim
+    is gone.
+
+  A node only ever deletes its own claims: a peer's claim that looks
+  abandoned may belong to a partitioned node mid-write, and it enters
+  neither wait condition anyway. Modelled as the `Reaper` constant,
+  the `Applier`'s reap branch and the `Poker` process in
+  `Bakery_v2.tla`: `Bakery_v2_wedge.cfg` shows the stranding without
+  it, and `Bakery_v2_reaper.cfg` and `Bakery_v2_reaper_quiet.cfg` show
+  liveness and all four safety invariants holding with it, the second
+  in the case where nothing but the poke ever reaches the crashed node.
 
   The wait phase has no explicit timeout. R-A's only failure mode
   is a dead peer (would block forever), and we close it via a

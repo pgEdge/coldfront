@@ -130,6 +130,20 @@ CONSTANTS Writers,
                           \* (decide, then separately write) that drops acks — the bug.
                           \* The PROTOCOL (R-A) is identical either way; only the
                           \* implementation's atomicity differs.
+          Reaper,         \* the orphan reaper in coldfront._claim_iceberg_lock: TRUE
+                          \* deletes same-node claims whose owner is gone in the SAME
+                          \* statement that inserts our claim. Sound because the holder
+                          \* of the node-local advisory xact lock is us: PG released the
+                          \* dead owner's lock at backend exit, so a same-node claim on
+                          \* this table has no live owner. FALSE = today's code, where
+                          \* such a claim strands every later same-node writer.
+          NodeRetries,    \* TRUE restricts the Crasher to writers whose node still has
+                          \* a writer that has not claimed yet, so the crashed node is
+                          \* touched again (a hard crash kills that node's sessions and
+                          \* the application reconnects and retries). Under it the reaper
+                          \* must restore SurvivorProgress. FALSE allows the crash after
+                          \* which nothing ever reaches the node: the documented residual,
+                          \* which no event-driven mechanism can address.
           SameNodeLock    \* coldfront._claim_iceberg_lock's node-local advisory xact
                           \* lock: TRUE = at most ONE cold writer per node is in the
                           \* bakery at a time (the deployment fix). FALSE = same-node
@@ -214,6 +228,16 @@ define
   SmallestOnMyNode(self, t) ==
     ~ \E x \in claims[Nd(self)] : x.n = Nd(self) /\ x.w # self /\ x.t < t
 
+  \* The node-local advisory xact lock coldfront_iceberg:<table>. A live writer
+  \* holds it from its claim INSERT until its transaction ends, and the release
+  \* runs in the COMMIT callback BEFORE PostgreSQL drops the lock, so the holder
+  \* is anywhere from WaitAcks through DrainDelete. pg_try_advisory_xact_lock in
+  \* _on_claim_apply succeeds exactly when this is FALSE, which proves every
+  \* same-node claim on that node is ownerless.
+  HoldsTableLock(nd) ==
+    \E w \in nd : Live(w) /\ pc[w] \in {"WaitAcks", "Prepare", "Decide",
+                                          "Release", "DrainForward", "DrainDelete"}
+
   \* Peer-node deferrals queued BEHIND my claim (ticket t) that my Release
   \* forwards into acks.
   MyForwardable(self, t) ==
@@ -249,6 +273,14 @@ define
   \* and to HOLD again once the fix re-atomises defer vs drain.
   EventualProgress ==
     \A w \in Writers : <>(decision[w] \in {"committed", "rolled_back", "lk_409"})
+
+  \* Same, restricted to writers that survive. A crashed writer never decides, so
+  \* EventualProgress is unusable with MaxCrashes > 0; this is what the reaper
+  \* must restore: a survivor sharing a node with a crashed claim holder still
+  \* reaches a decision instead of waiting on a claim nobody owns.
+  SurvivorProgress ==
+    \A w \in Writers :
+      <>( crashed[w] \/ decision[w] \in {"committed", "rolled_back", "lk_409"} )
 end define;
 
 fair process Writer \in Writers
@@ -280,14 +312,38 @@ begin
     \* coldfront._claim_iceberg_lock's node-local advisory xact lock: block
     \* while another writer on my node is mid-claim, so at most one same-node
     \* claim is in the bakery at a time (node-local, so instant/synchronous).
+    \* Reaper: a same-node claim whose writer has crashed holds no advisory lock
+    \* (PG drops it at backend exit), so it does not block us and we delete it in
+    \* the SAME step that inserts our own claim -- the single dblink statement
+    \* `WITH orphan AS (DELETE ... RETURNING ticket), acks AS (DELETE ... USING
+    \* orphan) INSERT ...`. The orphan DELETE fires _on_claim_release, so a
+    \* deferral queued behind the orphan is forwarded rather than stranded.
     await Live(self) /\ \E p \in Writers : p # self /\ Live(p);
     await next_ticket <= MaxTickets;
     await (~ SameNodeLock)
-          \/ ~ \E x \in claims[Nd(self)] : x.n = Nd(self) /\ x.w # self;
-    my_ticket := next_ticket;
-    next_ticket := next_ticket + 1;
-    claims[Nd(self)] := claims[Nd(self)] \cup
-                        {[w |-> self, t |-> my_ticket, n |-> Nd(self)]};
+          \/ ~ \E x \in claims[Nd(self)] :
+                 x.n = Nd(self) /\ x.w # self /\ (Live(x.w) \/ ~ Reaper);
+    with orphans = IF Reaper
+                     THEN { x \in claims[Nd(self)] :
+                              x.n = Nd(self) /\ x.w # self /\ ~ Live(x.w) }
+                     ELSE {} do
+      my_ticket := next_ticket;
+      next_ticket := next_ticket + 1;
+      \* Drop the orphans' own acks, then forward what was deferred behind them.
+      \* Disjoint: an orphan's acks are keyed by its ticket, a forwarded ack by
+      \* the deferred ticket waiting on it.
+      acks := ( acks \ { a \in acks : \E o \in orphans : a[1] = o.t } )
+              \cup { <<d[2], Nd(self)>> :
+                       d \in { y \in deferred :
+                                 y[1] = Nd(self) /\ \E o \in orphans : y[3] = o.t } };
+      deferred := { y \in deferred :
+                      ~ (y[1] = Nd(self) /\ \E o \in orphans : y[3] = o.t) };
+      claims := [nd \in Nodes |->
+                   (claims[nd] \ orphans) \cup
+                   (IF nd = Nd(self)
+                      THEN {[w |-> self, t |-> my_ticket, n |-> Nd(self)]}
+                      ELSE {})];
+    end with;
 
   WaitAcks:
     \* Clear the bakery when I am BOTH the smallest active claim on my own node
@@ -380,14 +436,33 @@ begin
       with src \in Nodes, dst \in Nodes do
         await dst # src /\ NodeLive(dst);
         with c \in { x \in claims[src] : x \notin claims[dst] /\ x.n = src } do
-          claims[dst] := claims[dst] \cup { c };
-          ap_dst   := dst;
-          ap_ct    := c.t;
-          ap_defer := \E own \in claims[dst] : own.n = dst /\ own.t < c.t;
-          ap_behind := IF \E own \in claims[dst] : own.n = dst /\ own.t < c.t
-                         THEN MinT({ own.t : own \in
-                               {y \in claims[dst] : y.n = dst /\ y.t < c.t} })
-                         ELSE NoTicket;
+          \* Reaper, apply path: only when about to DEFER (a smaller same-node
+          \* claim exists) and only when pg_try_advisory_xact_lock would succeed
+          \* (no live writer on dst holds the table lock). Then every same-node
+          \* claim on dst is an orphan: delete it and its acks, forward what was
+          \* deferred behind it (the _on_claim_release trigger firing), and
+          \* decide against the reaped view -- which acks instead of deferring.
+          with orphans = IF Reaper
+                            /\ \E own \in claims[dst] : own.n = dst /\ own.t < c.t
+                            /\ ~ HoldsTableLock(dst)
+                         THEN { x \in claims[dst] : x.n = dst /\ ~ Live(x.w) }
+                         ELSE {} do
+            acks := ( acks \ { a \in acks : \E o \in orphans : a[1] = o.t } )
+                    \cup { <<d[2], dst>> :
+                             d \in { y \in deferred :
+                                       y[1] = dst /\ \E o \in orphans : y[3] = o.t } };
+            deferred := { y \in deferred :
+                            ~ (y[1] = dst /\ \E o \in orphans : y[3] = o.t) };
+            claims := [nd \in Nodes |->
+                         (claims[nd] \ orphans) \cup (IF nd = dst THEN {c} ELSE {})];
+            ap_dst   := dst;
+            ap_ct    := c.t;
+            ap_defer := \E own \in claims[dst] : own.n = dst /\ own.t < c.t;
+            ap_behind := IF \E own \in claims[dst] : own.n = dst /\ own.t < c.t
+                           THEN MinT({ own.t : own \in
+                                 {y \in claims[dst] : y.n = dst /\ y.t < c.t} })
+                           ELSE NoTicket;
+          end with;
         end with;
       end with;
 
@@ -414,13 +489,62 @@ begin
     end while;
 end process;
 
+\* Poker -- the waiter's poke. A writer stuck at WaitAcks re-touches its own
+\* claim row from the wait loop _claim_iceberg_lock ALREADY runs (a no-op
+\* UPDATE every Nth iteration). It replicates, and an AFTER UPDATE replica
+\* trigger on the peer re-runs _on_claim_apply's defer branch for that ticket:
+\* try the table lock; if it is free, the smaller same-node claim is an orphan,
+\* so reap it (forwarding what was deferred behind it) and ack. This is what
+\* unwedges a waiter whose peer's claim holder died AFTER deferring to it, when
+\* no further claim would otherwise ever reach that peer. Its own process, not
+\* an Applier branch: weak fairness on one shared process would let endless
+\* pokes starve real applies and report a spurious violation.
+fair process Poker = "poker"
+begin
+  PokeLoop:
+    while TRUE do
+      await Reaper;
+      with w \in Writers, dst \in Nodes do
+        \* The waiter's ticket is read from its claim record as already applied
+        \* on dst (the poke replicates after the claim INSERT did), never from
+        \* the Writer's locals: PlusCal rewrites a local as name[self] even from
+        \* another process.
+        await Live(w) /\ pc[w] = "WaitAcks" /\ dst # Nd(w) /\ NodeLive(dst)
+              /\ \E x \in claims[dst] : x.w = w /\ x.n = Nd(w);
+        with c \in { x \in claims[dst] : x.w = w /\ x.n = Nd(w) },
+             orphans = IF \E own \in claims[dst] : own.n = dst /\ own.t < c.t
+                          /\ ~ HoldsTableLock(dst)
+                       THEN { x \in claims[dst] : x.n = dst /\ ~ Live(x.w) }
+                       ELSE {} do
+          acks := ( acks \ { a \in acks : \E o \in orphans : a[1] = o.t } )
+                  \cup { <<d[2], dst>> :
+                           d \in { y \in deferred :
+                                     y[1] = dst /\ \E o \in orphans : y[3] = o.t } }
+                  \cup ( IF ~ \E own \in (claims[dst] \ orphans) :
+                                own.n = dst /\ own.t < c.t
+                         THEN { <<c.t, dst>> } ELSE {} );
+          deferred := { y \in deferred :
+                          ~ (y[1] = dst /\ \E o \in orphans : y[3] = o.t) };
+          claims := [nd \in Nodes |-> claims[nd] \ orphans];
+        end with;
+      end with;
+    end while;
+end process;
+
 fair process Crasher = "crasher"
 begin
   CrashLoop:
     while crash_budget > 0 do
       either
         with w \in Writers do
-          await ~ crashed[w];
+          \* Release, DrainForward and DrainDelete are ONE dblink transaction in
+          \* the real code: the AFTER DELETE trigger runs inside the claim
+          \* DELETE's own statement. A crash inside it aborts the DELETE too,
+          \* which is a crash AT Release (allowed). A crash between the labels
+          \* would leave claim-gone-but-deferral-stranded, unreachable in reality.
+          await ~ crashed[w] /\ pc[w] \notin {"DrainForward", "DrainDelete"}
+                /\ (~ NodeRetries
+                    \/ \E v \in Nd(w) : v # w /\ pc[v] \in {"Start", "Stage"});
           crashed[w] := TRUE;
           crash_budget := crash_budget - 1;
         end with;
@@ -431,7 +555,7 @@ begin
 end process;
 
 end algorithm; *)
-\* BEGIN TRANSLATION (chksum(pcal) = "31d6d69e" /\ chksum(tla) = "3f1a640d")
+\* BEGIN TRANSLATION (chksum(pcal) = "eab492ec" /\ chksum(tla) = "ba118417")
 VARIABLES pc, next_ticket, claims, acks, deferred, iceberg, decision, crashed, 
           crash_budget
 
@@ -460,6 +584,16 @@ AllPeerNodesAcked(self, t) ==
 
 SmallestOnMyNode(self, t) ==
   ~ \E x \in claims[Nd(self)] : x.n = Nd(self) /\ x.w # self /\ x.t < t
+
+
+
+
+
+
+
+HoldsTableLock(nd) ==
+  \E w \in nd : Live(w) /\ pc[w] \in {"WaitAcks", "Prepare", "Decide",
+                                        "Release", "DrainForward", "DrainDelete"}
 
 
 
@@ -497,6 +631,14 @@ TicketOrderPreserved ==
 EventualProgress ==
   \A w \in Writers : <>(decision[w] \in {"committed", "rolled_back", "lk_409"})
 
+
+
+
+
+SurvivorProgress ==
+  \A w \in Writers :
+    <>( crashed[w] \/ decision[w] \in {"committed", "rolled_back", "lk_409"} )
+
 VARIABLES my_ticket, parent_seen, parent_staged, ap_dst, ap_ct, ap_defer, 
           ap_behind
 
@@ -504,7 +646,7 @@ vars == << pc, next_ticket, claims, acks, deferred, iceberg, decision,
            crashed, crash_budget, my_ticket, parent_seen, parent_staged, 
            ap_dst, ap_ct, ap_defer, ap_behind >>
 
-ProcSet == (Writers) \cup {"applier"} \cup {"crasher"}
+ProcSet == (Writers) \cup {"applier"} \cup {"poker"} \cup {"crasher"}
 
 Init == (* Global variables *)
         /\ next_ticket = 1
@@ -526,6 +668,7 @@ Init == (* Global variables *)
         /\ ap_behind = NoTicket
         /\ pc = [self \in ProcSet |-> CASE self \in Writers -> "Start"
                                         [] self = "applier" -> "ApplyLoop"
+                                        [] self = "poker" -> "PokeLoop"
                                         [] self = "crasher" -> "CrashLoop"]
 
 Start(self) == /\ pc[self] = "Start"
@@ -551,15 +694,29 @@ BeginClaim(self) == /\ pc[self] = "BeginClaim"
                     /\ Live(self) /\ \E p \in Writers : p # self /\ Live(p)
                     /\ next_ticket <= MaxTickets
                     /\ (~ SameNodeLock)
-                       \/ ~ \E x \in claims[Nd(self)] : x.n = Nd(self) /\ x.w # self
-                    /\ my_ticket' = [my_ticket EXCEPT ![self] = next_ticket]
-                    /\ next_ticket' = next_ticket + 1
-                    /\ claims' = [claims EXCEPT ![Nd(self)] = claims[Nd(self)] \cup
-                                                              {[w |-> self, t |-> my_ticket'[self], n |-> Nd(self)]}]
+                       \/ ~ \E x \in claims[Nd(self)] :
+                              x.n = Nd(self) /\ x.w # self /\ (Live(x.w) \/ ~ Reaper)
+                    /\ LET orphans == IF Reaper
+                                        THEN { x \in claims[Nd(self)] :
+                                                 x.n = Nd(self) /\ x.w # self /\ ~ Live(x.w) }
+                                        ELSE {} IN
+                         /\ my_ticket' = [my_ticket EXCEPT ![self] = next_ticket]
+                         /\ next_ticket' = next_ticket + 1
+                         /\ acks' = ( acks \ { a \in acks : \E o \in orphans : a[1] = o.t } )
+                                    \cup { <<d[2], Nd(self)>> :
+                                             d \in { y \in deferred :
+                                                       y[1] = Nd(self) /\ \E o \in orphans : y[3] = o.t } }
+                         /\ deferred' = { y \in deferred :
+                                            ~ (y[1] = Nd(self) /\ \E o \in orphans : y[3] = o.t) }
+                         /\ claims' = [nd \in Nodes |->
+                                         (claims[nd] \ orphans) \cup
+                                         (IF nd = Nd(self)
+                                            THEN {[w |-> self, t |-> my_ticket'[self], n |-> Nd(self)]}
+                                            ELSE {})]
                     /\ pc' = [pc EXCEPT ![self] = "WaitAcks"]
-                    /\ UNCHANGED << acks, deferred, iceberg, decision, crashed, 
-                                    crash_budget, parent_seen, parent_staged, 
-                                    ap_dst, ap_ct, ap_defer, ap_behind >>
+                    /\ UNCHANGED << iceberg, decision, crashed, crash_budget, 
+                                    parent_seen, parent_staged, ap_dst, ap_ct, 
+                                    ap_defer, ap_behind >>
 
 WaitAcks(self) == /\ pc[self] = "WaitAcks"
                   /\ Live(self)
@@ -637,17 +794,29 @@ ApplyLoop == /\ pc["applier"] = "ApplyLoop"
                   \E dst \in Nodes:
                     /\ dst # src /\ NodeLive(dst)
                     /\ \E c \in { x \in claims[src] : x \notin claims[dst] /\ x.n = src }:
-                         /\ claims' = [claims EXCEPT ![dst] = claims[dst] \cup { c }]
-                         /\ ap_dst' = dst
-                         /\ ap_ct' = c.t
-                         /\ ap_defer' = (\E own \in claims'[dst] : own.n = dst /\ own.t < c.t)
-                         /\ ap_behind' = (IF \E own \in claims'[dst] : own.n = dst /\ own.t < c.t
-                                            THEN MinT({ own.t : own \in
-                                                  {y \in claims'[dst] : y.n = dst /\ y.t < c.t} })
-                                            ELSE NoTicket)
+                         LET orphans == IF Reaper
+                                           /\ \E own \in claims[dst] : own.n = dst /\ own.t < c.t
+                                           /\ ~ HoldsTableLock(dst)
+                                        THEN { x \in claims[dst] : x.n = dst /\ ~ Live(x.w) }
+                                        ELSE {} IN
+                           /\ acks' = ( acks \ { a \in acks : \E o \in orphans : a[1] = o.t } )
+                                      \cup { <<d[2], dst>> :
+                                               d \in { y \in deferred :
+                                                         y[1] = dst /\ \E o \in orphans : y[3] = o.t } }
+                           /\ deferred' = { y \in deferred :
+                                              ~ (y[1] = dst /\ \E o \in orphans : y[3] = o.t) }
+                           /\ claims' = [nd \in Nodes |->
+                                           (claims[nd] \ orphans) \cup (IF nd = dst THEN {c} ELSE {})]
+                           /\ ap_dst' = dst
+                           /\ ap_ct' = c.t
+                           /\ ap_defer' = (\E own \in claims'[dst] : own.n = dst /\ own.t < c.t)
+                           /\ ap_behind' = (IF \E own \in claims'[dst] : own.n = dst /\ own.t < c.t
+                                              THEN MinT({ own.t : own \in
+                                                    {y \in claims'[dst] : y.n = dst /\ y.t < c.t} })
+                                              ELSE NoTicket)
              /\ pc' = [pc EXCEPT !["applier"] = "ApplyEmit"]
-             /\ UNCHANGED << next_ticket, acks, deferred, iceberg, decision, 
-                             crashed, crash_budget, my_ticket, parent_seen, 
+             /\ UNCHANGED << next_ticket, iceberg, decision, crashed, 
+                             crash_budget, my_ticket, parent_seen, 
                              parent_staged >>
 
 ApplyEmit == /\ pc["applier"] = "ApplyEmit"
@@ -665,10 +834,40 @@ ApplyEmit == /\ pc["applier"] = "ApplyEmit"
 
 Applier == ApplyLoop \/ ApplyEmit
 
+PokeLoop == /\ pc["poker"] = "PokeLoop"
+            /\ Reaper
+            /\ \E w \in Writers:
+                 \E dst \in Nodes:
+                   /\ Live(w) /\ pc[w] = "WaitAcks" /\ dst # Nd(w) /\ NodeLive(dst)
+                      /\ \E x \in claims[dst] : x.w = w /\ x.n = Nd(w)
+                   /\ \E c \in { x \in claims[dst] : x.w = w /\ x.n = Nd(w) }:
+                        LET orphans == IF \E own \in claims[dst] : own.n = dst /\ own.t < c.t
+                                          /\ ~ HoldsTableLock(dst)
+                                       THEN { x \in claims[dst] : x.n = dst /\ ~ Live(x.w) }
+                                       ELSE {} IN
+                          /\ acks' = ( acks \ { a \in acks : \E o \in orphans : a[1] = o.t } )
+                                     \cup { <<d[2], dst>> :
+                                              d \in { y \in deferred :
+                                                        y[1] = dst /\ \E o \in orphans : y[3] = o.t } }
+                                     \cup ( IF ~ \E own \in (claims[dst] \ orphans) :
+                                                   own.n = dst /\ own.t < c.t
+                                            THEN { <<c.t, dst>> } ELSE {} )
+                          /\ deferred' = { y \in deferred :
+                                             ~ (y[1] = dst /\ \E o \in orphans : y[3] = o.t) }
+                          /\ claims' = [nd \in Nodes |-> claims[nd] \ orphans]
+            /\ pc' = [pc EXCEPT !["poker"] = "PokeLoop"]
+            /\ UNCHANGED << next_ticket, iceberg, decision, crashed, 
+                            crash_budget, my_ticket, parent_seen, 
+                            parent_staged, ap_dst, ap_ct, ap_defer, ap_behind >>
+
+Poker == PokeLoop
+
 CrashLoop == /\ pc["crasher"] = "CrashLoop"
              /\ IF crash_budget > 0
                    THEN /\ \/ /\ \E w \in Writers:
-                                   /\ ~ crashed[w]
+                                   /\ ~ crashed[w] /\ pc[w] \notin {"DrainForward", "DrainDelete"}
+                                      /\ (~ NodeRetries
+                                          \/ \E v \in Nd(w) : v # w /\ pc[v] \in {"Start", "Stage"})
                                    /\ crashed' = [crashed EXCEPT ![w] = TRUE]
                                    /\ crash_budget' = crash_budget - 1
                            \/ /\ crash_budget' = 0
@@ -682,12 +881,13 @@ CrashLoop == /\ pc["crasher"] = "CrashLoop"
 
 Crasher == CrashLoop
 
-Next == Applier \/ Crasher
+Next == Applier \/ Poker \/ Crasher
            \/ (\E self \in Writers: Writer(self))
 
 Spec == /\ Init /\ [][Next]_vars
         /\ \A self \in Writers : WF_vars(Writer(self))
         /\ WF_vars(Applier)
+        /\ WF_vars(Poker)
         /\ WF_vars(Crasher)
 
 \* END TRANSLATION

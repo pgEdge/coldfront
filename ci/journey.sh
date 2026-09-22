@@ -1869,6 +1869,111 @@ story_mesh_multiwriter() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# Story (mesh) — the orphan reaper. A claim row whose owner is gone must not
+# block anyone. Orphans are made synthetically: a claim row inserted with this
+# node's ticket by a session that never enters the bakery, so no table lock and
+# no release are ever associated with it. Three paths reap it: the claim path
+# when the next local writer claims (TC-160), the apply path when a peer's claim
+# arrives (TC-162), and the waiter's poke when the peer deferred while the table
+# lock was held and the holder is gone by the time it drops (TC-163). TC-161
+# covers ack hygiene: no ack row outlives its claim.
+# ───────────────────────────────────────────────────────────────────────────
+story_mesh_reaper() {
+    step "12c. Mesh: orphan claims and acks are reaped on the claim, apply and poke paths"
+    local PARR; read -ra PARR <<< "$PEERS"
+    [ "${#PARR[@]}" -ge 1 ] || { fail "mesh: no --peers given"; return; }
+    local p1="${PARR[0]}" tbl ref orphan rc i
+    [ "$MODE" = tiered ] && tbl=events || tbl=iceonly
+    ref=$(q "$HOST" "SELECT iceberg_table FROM coldfront.tiered_views WHERE relname = '$tbl';")
+    # A bounded q: the whole point is that these writes RETURN.
+    tq() { timeout "$1" docker exec -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" "$2" "$CF_PSQL" -tA -c "$3"; }
+    # One cold-routed write per case, distinct rows.
+    local w_a w_b w_c
+    if [ "$MODE" = tiered ]; then
+        w_a="INSERT INTO events (ts,status,data) VALUES (date_trunc('month',now()) - interval '4 months' + interval '20 days','reap','{}');"
+        w_b="INSERT INTO events (ts,status,data) VALUES (date_trunc('month',now()) - interval '4 months' + interval '21 days','reap','{}');"
+        w_c="INSERT INTO events (ts,status,data) VALUES (date_trunc('month',now()) - interval '4 months' + interval '22 days','reap','{}');"
+    else
+        w_a="INSERT INTO iceonly VALUES (9101,date_trunc('month',now()) + interval '3 months' + interval '1 day','reap','{}');"
+        w_b="INSERT INTO iceonly VALUES (9102,date_trunc('month',now()) + interval '3 months' + interval '2 days','reap','{}');"
+        w_c="INSERT INTO iceonly VALUES (9103,date_trunc('month',now()) + interval '3 months' + interval '3 days','reap','{}');"
+    fi
+    # Plant an orphan on $HOST and wait until $p1 has applied it (and acked it).
+    plant_orphan() {
+        # A SELECT over the insert, so tuples-only psql prints the ticket and no
+        # command tag (a bare INSERT ... RETURNING also prints "INSERT 0 1").
+        orphan=$(q "$HOST" "WITH ins AS (INSERT INTO coldfront.claims (iceberg_table, ticket) SELECT '$ref', snowflake.nextval() RETURNING ticket) SELECT ticket FROM ins;")
+        for i in $(seq 1 80); do
+            [ "$(q "$p1" "SELECT count(*) FROM coldfront.claims WHERE ticket = $orphan;")" = "1" ] && break
+            sleep 0.25
+        done
+    }
+    orphan_gone_everywhere() {
+        for i in $(seq 1 80); do
+            [ "$(q "$HOST" "SELECT count(*) FROM coldfront.claims WHERE ticket = $orphan;")" = "0" ] &&
+            [ "$(q "$p1"   "SELECT count(*) FROM coldfront.claims WHERE ticket = $orphan;")" = "0" ] && { echo 0; return; }
+            sleep 0.25
+        done
+        echo 1
+    }
+
+    # TC-160: claim path. The orphan has a smaller same-node ticket, so without
+    # the reap the next writer on $HOST waits on it forever.
+    plant_orphan
+    # The peer's ack travels one more hop back than its apply, so wait for it.
+    for i in $(seq 1 80); do
+        [ "$(q "$HOST" "SELECT count(*) FROM coldfront.claim_acks WHERE ticket = $orphan;")" != "0" ] && break
+        sleep 0.25
+    done
+    assert_gt "TC-160 orphan was acked by the peer before the reap" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.claim_acks WHERE ticket = $orphan;")"
+    tq 60 "$HOST" "$w_a" >"$TMPD/reap.a" 2>&1; rc=$?
+    assert_eq "TC-160 local cold write completes despite a same-node orphan claim" "0" "$rc"
+    assert_eq "TC-160 orphan claim reaped on both nodes" "0" "$(orphan_gone_everywhere)"
+
+    # TC-161: ack hygiene. The orphan's acks went with it, and the completed
+    # write's own acks went with its release. Allow replication to settle.
+    for i in $(seq 1 40); do
+        [ "$(q "$HOST" "SELECT count(*) FROM coldfront.claim_acks a WHERE NOT EXISTS (SELECT 1 FROM coldfront.claims c WHERE c.ticket = a.ticket);")" = "0" ] && break
+        sleep 0.25
+    done
+    local leftover
+    leftover=$(q "$HOST" "SELECT count(*) FROM coldfront.claim_acks a WHERE NOT EXISTS (SELECT 1 FROM coldfront.claims c WHERE c.ticket = a.ticket);")
+    assert_eq "TC-161 no ack row outlives its claim" "0" "$leftover"
+    [ "$leftover" = "0" ] || q "$HOST" "SELECT a.ticket, snowflake.get_node(a.ticket) AS node, to_timestamp(snowflake.get_epoch(a.ticket)) AS issued, a.ack_from_name FROM coldfront.claim_acks a WHERE NOT EXISTS (SELECT 1 FROM coldfront.claims c WHERE c.ticket = a.ticket) ORDER BY 1;"
+
+    # TC-162: apply path. The peer's arriving claim finds the orphan as the
+    # smaller same-node claim on $HOST; the table lock is free, so $HOST reaps
+    # and acks instead of deferring. Without the reap the peer waits forever.
+    plant_orphan
+    tq 60 "$p1" "$w_b" >"$TMPD/reap.b" 2>&1; rc=$?
+    assert_eq "TC-162 peer cold write completes when its arrival reaps the orphan" "0" "$rc"
+    assert_eq "TC-162 orphan claim reaped on both nodes" "0" "$(orphan_gone_everywhere)"
+
+    # TC-163: poke path. Hold the table xact lock on $HOST while the peer's claim
+    # arrives, so $HOST must defer it behind the orphan (the try-lock fails, as
+    # it would for a live writer). Then the lock drops with nothing else ever
+    # reaching $HOST: only the waiter's periodic poke can make $HOST re-run the
+    # defer branch, reap, and ack.
+    plant_orphan
+    docker exec -i -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" "$HOST" "$CF_PSQL" -tA -v ON_ERROR_STOP=1 >/dev/null 2>&1 <<SQL &
+BEGIN;
+SELECT pg_advisory_xact_lock(hashtext('coldfront_iceberg:' || '$ref'));
+SELECT pg_sleep(8);
+COMMIT;
+SQL
+    local holder=$!
+    sleep 1
+    tq 90 "$p1" "$w_c" >"$TMPD/reap.c" 2>&1; rc=$?
+    wait "$holder" 2>/dev/null
+    assert_eq "TC-163 peer deferred behind an orphan is unwedged by its own poke once the lock drops" "0" "$rc"
+    assert_eq "TC-163 orphan claim reaped on both nodes" "0" "$(orphan_gone_everywhere)"
+    assert_eq "TC-160..163 all three reaper-path writes landed" "3" \
+        "$(q "$HOST" "SELECT count(*) FROM $tbl WHERE status='reap';")"
+    rm -f $TMPD/reap.* 2>/dev/null
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Story (mesh + tiered) — cross-node tiered: a tiered table provisioned on db1
 # is readable AND writable from peers. Hot rows arrive via Spock replication of
 # the _events partitions; cold rows via the shared Lakekeeper catalog; the
@@ -5019,6 +5124,7 @@ story_duckdb_spill_concurrency  # TC-153: four sessions spilling at once stay is
 story_drop_iceberg_table   # both modes, purge and keep-files (own throwaway tables)
 [ "$MESH" = 1 ] && [ "$MODE" = decoupled ] && story_mesh   # tiered+mesh runs story_mesh_tiered (above)
 [ "$MESH" = 1 ] && story_mesh_multiwriter   # >1 cold writer/node cross-node (tiered: events, decoupled: iceonly)
+[ "$MESH" = 1 ] && story_mesh_reaper        # orphan claims/acks reaped on the claim, apply and poke paths
 [ -n "$STANDBY" ]    && story_standby_reads
 
 summary

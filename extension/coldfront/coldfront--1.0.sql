@@ -3056,6 +3056,7 @@ DECLARE
     -- each other; they only serialise against an in-flight local INSERT.
     my_lock_key     int    := hashtext('coldfront_claim:'||NEW.iceberg_table)::int;
     smaller_pending bigint;
+    v_reaped        boolean := false;
 BEGIN
     IF snowflake.get_node(NEW.ticket) = my_node THEN
         RETURN NULL;
@@ -3086,6 +3087,42 @@ BEGIN
     -- cannot lock it. Modelled + proven in docs/formal/Bakery_v2.tla (SafeAcks):
     -- SafeAcks=FALSE violates EventualProgress (the wedge); SafeAcks=TRUE holds it
     -- while every safety invariant still holds.
+    -- Reaper, apply path. A smaller same-node claim means we are about to defer
+    -- behind it. First ask whether it can have a live owner: a live local writer
+    -- holds the table xact lock from its claim INSERT until its transaction ends
+    -- (the release runs in the COMMIT callback, before the lock drops). If the
+    -- try succeeds no such writer exists, so every same-node claim for this table
+    -- is an orphan: delete them and their acks through dblink_self, which fires
+    -- _on_claim_release on the origin side and forwards what was deferred behind
+    -- them. Done before the FOR UPDATE below so we hold no row lock the dblink
+    -- session would wait on. Fires for the arriving claim and for the waiter's
+    -- poke UPDATE alike. Modelled in docs/formal/Bakery_v2.tla (Reaper, Applier,
+    -- Poker).
+    IF EXISTS (SELECT 1 FROM coldfront.claims
+                WHERE snowflake.get_node(ticket) = my_node
+                  AND iceberg_table = NEW.iceberg_table
+                  AND ticket < NEW.ticket)
+       AND pg_try_advisory_xact_lock(hashtext('coldfront_iceberg:' || NEW.iceberg_table)) THEN
+        IF NOT 'coldfront_self' = ANY(COALESCE(public.dblink_get_connections(), '{}'::text[])) THEN
+            PERFORM public.dblink_connect('coldfront_self', connstr);
+        END IF;
+        PERFORM public.dblink_exec('coldfront_self', format(
+            'WITH orphan AS ('
+            '  DELETE FROM coldfront.claims'
+            '   WHERE snowflake.get_node(ticket) = %s AND iceberg_table = %L'
+            '  RETURNING ticket'
+            ') DELETE FROM coldfront.claim_acks a USING orphan o WHERE a.ticket = o.ticket',
+            my_node, NEW.iceberg_table));
+        v_reaped := true;
+    END IF;
+
+    -- A poke (UPDATE) that reaped nothing changes nothing: the INSERT-time
+    -- decision stands, acked or deferred behind a live holder. A fresh ack here
+    -- could land after the waiter's release and outlive its claim.
+    IF TG_OP = 'UPDATE' AND NOT v_reaped THEN
+        RETURN NULL;
+    END IF;
+
     PERFORM pg_advisory_lock_shared(my_lock_key);
     SELECT ticket INTO smaller_pending
       FROM coldfront.claims
@@ -3129,7 +3166,7 @@ BEGIN
 END $$;
 
 CREATE TRIGGER coldfront_claim_apply
-    AFTER INSERT ON coldfront.claims
+    AFTER INSERT OR UPDATE ON coldfront.claims
     FOR EACH ROW EXECUTE FUNCTION coldfront._on_claim_apply();
 ALTER TABLE coldfront.claims ENABLE REPLICA TRIGGER coldfront_claim_apply;
 
@@ -3146,6 +3183,13 @@ DECLARE
     my_node int := current_setting('snowflake.node')::int;
     my_name name := coldfront._my_spock_node_name();
 BEGIN
+    -- A deleted claim's acks are dead whoever deleted it (tickets are never
+    -- reused), so drop them before the owner check below: an operator's manual
+    -- DELETE, or a ticket the node id does not resolve, must not leave them
+    -- behind. Only the originator's own wait loop ever read them, and it has
+    -- exited.
+    DELETE FROM coldfront.claim_acks WHERE ticket = OLD.ticket;
+
     IF snowflake.get_node(OLD.ticket) <> my_node THEN
         RETURN NULL;
     END IF;
@@ -3188,6 +3232,9 @@ DECLARE
     -- slot-name computation (see coldfront._my_spock_node_name).
     my_node_name      name     := coldfront._my_spock_node_name();
     my_ticket         bigint;
+    v_other           text[]   := '{}';
+    v_tbl             text;
+    v_poll            int      := 0;
     -- Per-table advisory lock key (pairs with the shared lock taken in
     -- _on_claim_apply). Held EXCLUSIVELY in THIS session ONLY across
     -- nextval() + the dblink INSERT (~1–2 ms). The preamble above
@@ -3231,39 +3278,53 @@ BEGIN
     END IF;
 
 
-    -- NodeStartup self-cleanup of pre-restart orphans.  Cheap when no
-    -- orphans exist (gated on a local EXISTS).
-    IF EXISTS (
-        SELECT 1 FROM coldfront.claims
-         WHERE snowflake.get_node(ticket) = my_node
-           AND snowflake.get_epoch(ticket) < extract(epoch FROM pg_postmaster_start_time())
-    ) THEN
-        PERFORM public.dblink_exec('coldfront_self', format(
-            'DELETE FROM coldfront.claims WHERE snowflake.get_node(ticket) = %s AND snowflake.get_epoch(ticket) < extract(epoch FROM pg_postmaster_start_time())',
-            my_node));
-    END IF;
-
-    -- INSERT my claim.  Async replication via spock — no sync_commit
-    -- = remote_apply.  Peers will fire coldfront._on_claim_apply()
-    -- when they apply this INSERT, inserting either an ack row (into
-    -- coldfront.claim_acks) or a deferred-ack row (into
-    -- coldfront.deferred_acks) per R-A's defer rule.
+    -- Reap, then claim, in ONE dblink statement. Holding the table xact lock
+    -- above proves no live local writer is in the bakery for this table, so any
+    -- same-node claim row for it has no owner; the epoch arm keeps covering other
+    -- tables after a restart. The orphan DELETE fires _on_claim_release, which
+    -- forwards whatever peers deferred behind the orphan, and the acks CTE drops
+    -- the orphan's own acks. Runs before our INSERT, so it cannot reap us.
+    -- Modelled in docs/formal/Bakery_v2.tla (Reaper, BeginClaim).
     --
-    -- Per-table exclusive advisory lock, held ONLY across nextval() +
-    -- dblink INSERT (~1–2 ms). Paired with the shared lock in
-    -- _on_claim_apply, this closes the "we have a ticket but the row
-    -- isn't visible yet" window where a peer trigger could otherwise
-    -- ack us prematurely. The preamble above doesn't need the lock —
-    -- if a peer claim arrives during it, we don't yet have a ticket,
-    -- and snowflake's monotonic timestamp guarantees any future ticket
-    -- of ours will be larger than the peer's (whose nextval already
-    -- happened) — so acking the peer is the correct R-A choice anyway.
+    -- Per-table exclusive advisory lock, held ONLY across nextval() + the dblink
+    -- statement. Paired with the shared lock in _on_claim_apply, this closes the
+    -- "we have a ticket but the row isn't visible yet" window where a peer
+    -- trigger could otherwise ack us prematurely. The preamble above does not
+    -- need it: if a peer claim arrives during it we have no ticket yet, and
+    -- snowflake's monotonic timestamp guarantees any future ticket of ours is
+    -- larger than the peer's, so acking the peer is the correct R-A choice.
+    -- Other tables' orphans too: a same-node claim on a table whose lock this
+    -- backend can take (session-level, released right after the statement) has
+    -- no live owner either, so any cold write on this node clears every orphan
+    -- the node left, whichever table it was on. A live writer's xact lock makes
+    -- the try fail and that table is skipped. The common case has no such rows.
+    FOR v_tbl IN SELECT DISTINCT c.iceberg_table FROM coldfront.claims c
+                  WHERE snowflake.get_node(c.ticket) = my_node
+                    AND c.iceberg_table <> p_iceberg_table LOOP
+        IF pg_try_advisory_lock(hashtext('coldfront_iceberg:' || v_tbl)) THEN
+            v_other := v_other || v_tbl;
+        END IF;
+    END LOOP;
+
     PERFORM pg_advisory_lock(my_lock_key);
     my_ticket := snowflake.nextval();
     PERFORM public.dblink_exec('coldfront_self', format(
-        'INSERT INTO coldfront.claims (iceberg_table, ticket) VALUES (%L, %s)',
-        p_iceberg_table, my_ticket));
+        'WITH orphan AS ('
+        '  DELETE FROM coldfront.claims'
+        '   WHERE snowflake.get_node(ticket) = %1$s'
+        '     AND (iceberg_table = %2$L'
+        '          OR iceberg_table = ANY(%4$L::text[])'
+        '          OR snowflake.get_epoch(ticket) < extract(epoch FROM pg_postmaster_start_time()))'
+        '  RETURNING ticket'
+        '), acks AS ('
+        '  DELETE FROM coldfront.claim_acks a USING orphan o WHERE a.ticket = o.ticket'
+        ') '
+        'INSERT INTO coldfront.claims (iceberg_table, ticket) VALUES (%2$L, %3$s)',
+        my_node, p_iceberg_table, my_ticket, v_other));
     PERFORM pg_advisory_unlock(my_lock_key);
+    FOREACH v_tbl IN ARRAY v_other LOOP
+        PERFORM pg_advisory_unlock(hashtext('coldfront_iceberg:' || v_tbl));
+    END LOOP;
 
     -- Wait phase — pure Ricart-Agrawala, NO timeout:
     --   (a) Same-node-min: I must be the minimum-ticket holder among
@@ -3316,6 +3377,17 @@ BEGIN
                         )
                )
         );
+        -- Waiter's poke: every ~1 s, re-touch our own claim row. The no-op UPDATE
+        -- replicates and re-fires _on_claim_apply on every peer for our ticket, so
+        -- a peer that deferred us behind a claim whose holder has since gone reaps
+        -- it and acks. Nothing else would ever reach that peer. Modelled as the
+        -- Poker process in docs/formal/Bakery_v2.tla.
+        v_poll := v_poll + 1;
+        IF v_poll % 200 = 0 THEN
+            PERFORM public.dblink_exec('coldfront_self', format(
+                'UPDATE coldfront.claims SET iceberg_table = iceberg_table WHERE ticket = %s',
+                my_ticket));
+        END IF;
         PERFORM pg_sleep(0.005);
     END LOOP;
 
@@ -3361,11 +3433,11 @@ $$;
 -- No EXCEPTION wrapper: pg_duckdb forbids subtransactions, so we cannot
 -- catch errors here. If duckdb.raw_query raises, the user's PG xact aborts
 -- (pg_duckdb's XactCallback rolls back the iceberg side too) and our claim
--- row may be left in coldfront.claims. Stale claims block the bakery for
--- everyone (a stuck minimum ticket nobody owns). Operators clean them up
--- with `DELETE FROM coldfront.claims WHERE ticket = <orphan>` after
--- diagnosing the failed writer; an automated TTL-based reaper is on the
--- todo list.
+-- row may be left in coldfront.claims (a hard backend crash; an ERROR takes
+-- the ABORT callback, which releases). An ownerless claim blocks its own node's
+-- later writers and any peer that deferred behind it, until the reaper removes
+-- it: on this node's next cold write to any table, on a peer claim's arrival,
+-- or on the waiting peer's poke (see _claim_iceberg_lock and _on_claim_apply).
 -- C-bridge: enqueues a ticket for release at outer-tx-end. Drained by
 -- the coldfront XactCallback registered in _PG_init (coldfront.c), which
 -- fires after pg_duckdb's XactCallback so the iceberg snapshot has
