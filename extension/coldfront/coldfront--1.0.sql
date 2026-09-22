@@ -383,6 +383,14 @@ BEGIN
   -- DuckDB execution: pg_duckdb gates on membership of duckdb.postgres_role.
   EXECUTE format('GRANT %I TO %s', duckrole, tgt);
 
+  -- _cross_tier_move reads Iceberg with iceberg_scan inside a function, which
+  -- pg_duckdb allows only under this parameter, and pg_duckdb defines it
+  -- superuser-only. The app role runs that move under its own privileges, so it
+  -- needs to set the parameter itself. Narrower than it looks: the deployment
+  -- config GUCs stay superuser-only, so this cannot redirect the elevated ATTACH.
+  EXECUTE format(
+    'GRANT SET ON PARAMETER duckdb.unsafe_allow_execution_inside_functions TO %s', tgt);
+
   -- coldfront schema + registry read + the dual-write anchor table.
   EXECUTE format('GRANT USAGE ON SCHEMA coldfront TO %s', tgt);
   EXECUTE format('GRANT SELECT ON coldfront.tiered_views, coldfront.archive_watermark TO %s', tgt);
