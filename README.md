@@ -49,18 +49,18 @@ correct tier, so the application sees one relation:
               against one relation: "events"
                             │
                  PostgreSQL 16 / 17 / 18
-        events VIEW: reads union hot + cold
-        coldfront extension: rewrites writes to the right tier
+           events VIEW: reads union hot + cold
+       coldfront extension: routes writes by tier
               ┌─────────────┴───────────────┐
               │                             │
           hot tier                      cold tier
-      _events: native PG            pg_duckdb: in-process
-      range partitions              DuckDB, Iceberg reads + writes
+      _events: native PostgreSQL    pg_duckdb: in-process DuckDB
+      range partitions              Iceberg reads + writes
               │                             │
-              │                   Lakekeeper (Iceberg REST catalog)
+              │                     Lakekeeper (Iceberg REST catalog)
               │                             │
-              │                   object store, S3 / Azure / GCS
-              │                   (Parquet data + Iceberg metadata)
+              │                     object store, S3 / Azure / GCS
+              │                     (Parquet data + Iceberg metadata)
               │                             ▲
               └──── Archiver (Go, cron) ────┘
                     moves partitions past the hot window: hot → cold

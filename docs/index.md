@@ -48,18 +48,18 @@ correct tier, so the application sees one relation:
               against one relation: "events"
                             │
                  PostgreSQL 16 / 17 / 18
-        events VIEW: reads union hot + cold
-        coldfront extension: rewrites writes to the right tier
+           events VIEW: reads union hot + cold
+       coldfront extension: routes writes by tier
               ┌─────────────┴───────────────┐
               │                             │
           hot tier                      cold tier
-      _events: native PG            pg_duckdb: in-process
-      range partitions              DuckDB, Iceberg reads + writes
+      _events: native PostgreSQL    pg_duckdb: in-process DuckDB
+      range partitions              Iceberg reads + writes
               │                             │
-              │                   Lakekeeper (Iceberg REST catalog)
+              │                     Lakekeeper (Iceberg REST catalog)
               │                             │
-              │                   object store, S3 / Azure / GCS
-              │                   (Parquet data + Iceberg metadata)
+              │                     object store, S3 / Azure / GCS
+              │                     (Parquet data + Iceberg metadata)
               │                             ▲
               └──── Archiver (Go, cron) ────┘
                     moves partitions past the hot window: hot → cold
@@ -146,7 +146,11 @@ To go further with ColdFront, consult the following guides:
   and bringing up the stack.
 - The [Using ColdFront](usage.md) guide covers both modes, the
   standalone partition manager, supported types, and tuning.
+- The [Embeddings](usage_vectors.md) guide covers storing and searching
+  embeddings through the pgvector interface.
 - The [Object Store Setup](object_store.md) guide takes you from an
   empty bucket to a working cold tier on cloud S3.
+- The [Compaction](compaction.md) guide covers cold-tier maintenance:
+  compaction, snapshot expiry, and orphan-file removal.
 - The [Architecture](architecture.md) overview explains the shared
   mechanics and links to the per-mode deep dives.

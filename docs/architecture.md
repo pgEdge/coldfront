@@ -26,7 +26,8 @@ This document is organized into the following sections:
 
 For mode-specific design, see
 [architecture_tiered.md](architecture_tiered.md) (hot PG + cold Iceberg) ·
-[architecture_decoupled.md](architecture_decoupled.md) (all-Iceberg)
+[architecture_decoupled.md](architecture_decoupled.md) (all-Iceberg) ·
+[architecture_vectors.md](architecture_vectors.md) (vector storage)
 
 ## Operating modes and topologies
 
