@@ -108,12 +108,16 @@ the ticket is held):
    credential under vending. Without the log, a transaction that first touches
    a table another writer committed to since the transaction began is rewound
    to the snapshot current at that start, and upstream throws `already
-   outdated` when there was none. That is every writer queued on the table
-   lock behind the first commit into a never-written table in the stock
-   ordering, and the millisecond between the lazy attach and staging in the
-   async one. The hunk returns the as-of-start state, an empty table
+   outdated` when no such snapshot is left. Either the table had none then,
+   which is every writer queued on the table lock behind the first commit into
+   a never-written table in the stock ordering, and the millisecond between
+   the lazy attach and staging in the async one, or that snapshot has since
+   expired. The hunk tells them apart by the table's first snapshot (no
+   parent, sequence number 1): when it is present and was committed after the
+   transaction began, the hunk returns the as-of-start state, an empty table
    (`has_current_snapshot = false`, `last_sequence_number = 0`), and items 1 to
-   3 then land the write on the live head.
+   3 then land the write on the live head. An expired start snapshot keeps the
+   error.
 
 **Formally verified** before the code (the project rule): `docs/formal/Bakery.tla`
 models the async ordering; `Bakery_async.cfg` (patched) holds

@@ -1676,6 +1676,62 @@ story_maintenance() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# Story 6f: a cold write whose transaction began before the written table's
+# current snapshot, after the snapshot that was current at that start has
+# expired. With the metadata log off, duckdb-iceberg (ICEBERG_REF 5edc45f0)
+# rewinds a table a transaction writes to the table's state at the
+# transaction's start. That state is gone, so the write fails as outdated
+# instead of working from an empty table that lacks the rows the table had.
+# ───────────────────────────────────────────────────────────────────────────
+story_start_snapshot_expired() {
+    step "6f. A write whose start snapshot expired fails as outdated, not over an empty table"
+    require_compactor || return
+    local t i a g
+    for t in cf_exp cf_exq; do
+        q "$HOST" "SELECT coldfront.create_iceberg_table('public','$t','[{\"name\":\"id\",\"type\":\"bigint\"}]'::jsonb);" >/dev/null 2>&1
+        q "$HOST" "INSERT INTO $t VALUES (1);" >/dev/null
+    done
+    # TC-182: the writer's read of cf_exq starts its DuckDB transaction while
+    # cf_exp has one snapshot; the writer then waits on the gate's advisory
+    # lock while a second snapshot lands on cf_exp and the first one expires.
+    qf "$HOST" >/dev/null 2>&1 <<'SQL' &
+SET application_name = 'cf_tc182_gate';
+SELECT pg_advisory_lock(182);
+SELECT pg_sleep(60);
+SQL
+    g=$!
+    for i in $(seq 1 40); do
+        [ "$(q "$HOST" "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 182 AND objsubid = 1 AND granted;")" = 1 ] && break
+        sleep 0.25
+    done
+    qf "$HOST" >"$TMPD/cf.182" 2>&1 <<'SQL' &
+BEGIN;
+SELECT count(*) FROM cf_exq;
+SELECT pg_advisory_lock(182);
+INSERT INTO cf_exp VALUES (3);
+SELECT 'rows=' || count(*) FROM cf_exp;
+COMMIT;
+SQL
+    a=$!
+    for i in $(seq 1 40); do
+        [ "$(q "$HOST" "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 182 AND objsubid = 1 AND NOT granted;")" = 1 ] && break
+        sleep 0.25
+    done
+    q "$HOST" "INSERT INTO cf_exp VALUES (2);" >/dev/null
+    "$COMPACTOR" --config $TMPD/archiver.yaml --table cf_exp --expire-snapshots --expire-older-than 0s \
+        --expire-retain-last 1 --expire-keep-files >"$TMPD/cf.182x" 2>&1
+    q "$HOST" "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'cf_tc182_gate';" >/dev/null
+    wait "$a" "$g" 2>/dev/null
+    assert_eq "TC-182 the snapshot current at the writer's start expired as staged" "1" "$(grep -c -E 'expired [1-9][0-9]* snapshot' "$TMPD/cf.182x")"
+    assert_eq "TC-182 a write whose start snapshot expired fails as outdated" "1" "$(grep -c 'already outdated' "$TMPD/cf.182")"
+    assert_eq "TC-182 the transaction never reads the table without its rows" "" "$(sed -n 's/^rows=//p' "$TMPD/cf.182")"
+    for t in cf_exp cf_exq; do
+        q "$HOST" "SELECT coldfront.drop_iceberg_table('public','$t', true);" >/dev/null 2>&1
+    done
+    rm -f "$TMPD"/cf.182* 2>/dev/null
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Story 6c — Cold + dual-tier DML issued from INSIDE plpgsql (a DO block). This
 # is the end-to-end test of BOTH fixes: plpgsql variable refs become $N bound
 # params (Cause 1, kept live via format()), and the rewrite must be a DML-tagged
@@ -5519,6 +5575,7 @@ if [ "$MODE" = "tiered" ]; then
                             # manifests iceberg-go-readable
     story_maintenance       # iceberg-go ExpireSnapshots + DeleteOrphanFiles — reclaim the
                             # snapshot/small-file bloat compaction leaves (Lakekeeper can't)
+    [ "$MESH" = 1 ] || story_start_snapshot_expired  # a write whose start snapshot expired fails as outdated
     story_writes_plpgsql
     story_app_privilege          # non-superuser onboarding + cold I/O (mesh: cross-node + SD bakery)
     story_mixed_concurrency
