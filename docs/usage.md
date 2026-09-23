@@ -851,6 +851,13 @@ spock.enable_ddl_replication = on
 spock.allow_ddl_from_functions = on
 spock.include_ddl_repset = on
 
+# Only on a server that has this setting (PostgreSQL 16.15, 17.11 and 18.6 in
+# pgEdge's builds):
+# it lists the libraries allowed as logical decoding output plugins, and its
+# default leaves out Spock's, so no subscription can create its slot. A server
+# without the setting refuses to start with this line in place.
+output_plugin_libraries = 'pgoutput, test_decoding, spock_output'
+
 # Keep pg_stat_replication.reply_time fresh on every walsender.  PG
 # default is 10 s; with the bakery's 5 s liveness window that would
 # false-positive every idle peer as "dead" on the first claim after a

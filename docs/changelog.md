@@ -29,6 +29,14 @@ and this project adheres to
   and builds its catalog DDL from the stored Iceberg reference rather than
   from the PostgreSQL schema and table names.
 
+### Fixed
+
+- On a server that has `output_plugin_libraries` (PostgreSQL 16.15, 17.11
+  and 18.6 in pgEdge's builds), no Spock subscription could create its
+  replication slot, because the setting's default leaves out
+  `spock_output`. The Docker image adds `spock_output` to it on mesh nodes,
+  and the per-node configuration in the usage guide lists it.
+
 ## [1.0.0-beta2] - 2026-08-08
 
 ### Added
