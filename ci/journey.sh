@@ -611,7 +611,7 @@ EOSQL
     # claim, which is what serialises two nodes adopting one Iceberg table. Held
     # from another session, the claim key must make an adoption wait rather than
     # register against a registry it has not seen the peer's row in yet. Proven
-    # on the key both bakery paths take (docs/formal/Bakery_v2_adopt.cfg).
+    # on the key both bakery paths take (docs/formal/Bakery_adopt.cfg).
     docker exec -i -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" "$HOST" "$CF_PSQL" -tA -v ON_ERROR_STOP=1 >/dev/null 2>&1 <<SQL &
 BEGIN;
 SELECT pg_advisory_xact_lock(hashtext('coldfront_iceberg:' || 'ice.lake.orders'));

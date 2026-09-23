@@ -218,7 +218,7 @@ dblink claim) with the privilege it requires. `_exec_iceberg_with_claim`
 deliberately stays `SECURITY INVOKER` - it runs the caller's cold DML,
 which must execute as the caller. The bakery SD is **protocol-neutral**:
 it changes the PG execution privilege, not the claim/ack/lock/ticket
-protocol, re-verified against [the TLA+ model](formal/Bakery_v2.tla)
+protocol, re-verified against [the TLA+ model](formal/Bakery.tla)
 (all safe configs pass; the race config still violates
 `NoLakekeeperConflict`).
 

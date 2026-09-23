@@ -1,6 +1,6 @@
 -- _iceberg_async_active(): the async-parquet ordering is enabled ONLY when BOTH
 -- the request flag and the bakery-patch build marker are on; otherwise it fails
--- safe to the stock ordering. Formal basis: docs/formal Bakery_v2_race.cfg.
+-- safe to the stock ordering. Formal basis: docs/formal Bakery_race.cfg.
 -- Every case sets BOTH GUCs explicitly, so the result is independent of the
 -- deployment's postgresql.conf (the patched image sets both on).
 SET coldfront.iceberg_async_parquet = off;

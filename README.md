@@ -212,7 +212,7 @@ pgedge-coldfront/
 │   ├── index.md · installation.md · object_store.md · usage.md · compaction.md
 │   ├── architecture.md · architecture_tiered.md · architecture_decoupled.md
 │   ├── architecture_vectors.md · usage_vectors.md · changelog.md
-│   └── formal/                 ← TLA+ model of the bakery protocol (Bakery_v2.tla)
+│   └── formal/                 ← TLA+ model of the bakery protocol (Bakery.tla)
 ├── docker-compose.yml          ← END-USER single-node stack (ports published)
 ├── docker-compose.matrix.yml   ← CI only: single-node vanilla matrix
 ├── docker-compose.matrix-azure.yml ← CI only: vanilla matrix on Azure ADLS

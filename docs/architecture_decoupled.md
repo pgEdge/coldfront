@@ -324,7 +324,7 @@ the view's projection. Without the sibling the column is a plain
 The registry row carries `is_writable`, and the parse-analyze hook
 refuses INSERT, UPDATE and DELETE on a relation whose flag is false:
 
-```
+```text
 ERROR:  coldfront: "public.orders" is adopted read-only
 HINT:  Release it with coldfront.release_iceberg_table() and adopt again with p_writable => true to arm INSERT/UPDATE/DELETE.
 ```
@@ -499,8 +499,8 @@ PG nodes pointing at the same Lakekeeper endpoint and S3 bucket.
   independent queue, so it never assumes a peer has applied its concurrent
   claim; the snowflake-ticket total order and the ack barrier serialize
   commits, not any global apply ordering. Modelled in
-  [docs/formal/Bakery_v2.tla](https://github.com/pgEdge/ColdFront/blob/main/docs/formal/Bakery_v2.tla); the safety
-  properties are verified via TLA+ (`Bakery_v2.cfg`).
+  [docs/formal/Bakery.tla](https://github.com/pgEdge/ColdFront/blob/main/docs/formal/Bakery.tla); the safety
+  properties are verified via TLA+ (`Bakery.cfg`).
 
   Two tables, both in Spock's `default` repset:
 
@@ -600,8 +600,8 @@ PG nodes pointing at the same Lakekeeper endpoint and S3 bucket.
   abandoned may belong to a partitioned node mid-write, and it enters
   neither wait condition anyway. Modelled as the `Reaper` constant,
   the `Applier`'s reap branch and the `Poker` process in
-  `Bakery_v2.tla`: `Bakery_v2_wedge.cfg` shows the stranding without
-  it, and `Bakery_v2_reaper.cfg` and `Bakery_v2_reaper_quiet.cfg` show
+  `Bakery.tla`: `Bakery_wedge.cfg` shows the stranding without
+  it, and `Bakery_reaper.cfg` and `Bakery_reaper_quiet.cfg` show
   liveness and all four safety invariants holding with it, the second
   in the case where nothing but the poke ever reaches the crashed node.
 

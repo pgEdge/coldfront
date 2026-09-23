@@ -808,7 +808,7 @@ Keep the following caveats in mind when running either mode:
   committing to Lakekeeper. No 409 conflicts, no app-level retry. The
   protocol is Lamport-1978 mutex with the Ricart-Agrawala (1981)
   deferred-reply optimisation; claims and acks replicate as Spock rows
-  and it stays safe under Spock's asymmetric apply (modelled in [docs/formal/Bakery_v2.tla](https://github.com/pgEdge/ColdFront/blob/main/docs/formal/Bakery_v2.tla)). The bakery requires the `dblink` + `snowflake`
+  and it stays safe under Spock's asymmetric apply (modelled in [docs/formal/Bakery.tla](https://github.com/pgEdge/ColdFront/blob/main/docs/formal/Bakery.tla)). The bakery requires the `dblink` + `snowflake`
   extensions, the `coldfront.dblink_self` GUC, and a one-time `SELECT
   coldfront._ensure_claims_replicated()` call on every node after spock
   mesh setup; see [architecture_decoupled.md](architecture_decoupled.md#concurrency-horizontal-scaling-the-bakery-protocol). Sync-rep is **not** required.

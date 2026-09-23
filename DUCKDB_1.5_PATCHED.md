@@ -102,9 +102,9 @@ the ticket is held):
    explicit `scan_context`. Using the wrong context throws
    `TransactionContext::ActiveTransaction called without active transaction`.
 
-**Formally verified** before the code (the project rule): `docs/formal/Bakery_v2.tla`
-models the async ordering; `Bakery_v2_async.cfg` (patched) holds
-`NoLakekeeperConflict`, `Bakery_v2_race.cfg` (async **without** the patch)
+**Formally verified** before the code (the project rule): `docs/formal/Bakery.tla`
+models the async ordering; `Bakery_async.cfg` (patched) holds
+`NoLakekeeperConflict`, `Bakery_race.cfg` (async **without** the patch)
 violates it — the standing proof the patch is mandatory for async. **Validated**
 over Azure ADLS: journey 6b (4 concurrent mixed-tier writers → 8/8, 0 loss) and
 9b (8 concurrent cold writers → 8/8).
@@ -201,7 +201,7 @@ GUCs the patched-base entrypoint writes to `postgresql.conf`:
   — both, together. `coldfront._iceberg_async_active()` is true only when both
   are on; otherwise the cold-write path fails safe to claim-first (never a 409)
   and logs a one-time advisory. Flipping only the async flag on a stock binary
-  can never silently 409 — proven by `Bakery_v2_race.cfg` + the
+  can never silently 409 — proven by `Bakery_race.cfg` + the
   `async_requires_patch` pg_regress test. **Rebuild + republish the base whenever
   the entrypoint or any patch changes**, or async silently downgrades.
 

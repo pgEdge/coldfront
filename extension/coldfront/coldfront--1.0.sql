@@ -2966,8 +2966,8 @@ BEGIN
     -- committed and before the ack that frees the waiter, so the second node
     -- reads the first node's row and refuses. Without it the two rows replicate
     -- into each other and the second violates UNIQUE (iceberg_table) in the apply
-    -- worker. Modelled in docs/formal/Bakery_v2.tla: Bakery_v2_adopt_race.cfg
-    -- violates NoDoubleRegistration, Bakery_v2_adopt.cfg holds it.
+    -- worker. Modelled in docs/formal/Bakery.tla: Bakery_adopt_race.cfg
+    -- violates NoDoubleRegistration, Bakery_adopt.cfg holds it.
     PERFORM coldfront._take_iceberg_claim(v_ice);
 
     -- Every refusal runs before anything is written, PG side or catalog side.
@@ -3415,7 +3415,7 @@ $$;
 --     same iceberg_table → DEFER (queue in coldfront.deferred_acks).
 --   * Otherwise → ack immediately (INSERT into coldfront.claim_acks,
 --     which replicates back to originator).
--- See docs/formal/Bakery_v2.tla, the Applier process.
+-- See docs/formal/Bakery.tla, the Applier process.
 CREATE FUNCTION coldfront._on_claim_apply() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -3456,7 +3456,7 @@ BEGIN
     -- min-ticket holder at the WaitAcks barrier forever (the bakery wedge).
     -- It MUST lock the claim row, NOT deferred_acks: at the drain's forward-SELECT
     -- the lost deferral row does not exist yet (a phantom), so FOR UPDATE there
-    -- cannot lock it. Modelled + proven in docs/formal/Bakery_v2.tla (SafeAcks):
+    -- cannot lock it. Modelled + proven in docs/formal/Bakery.tla (SafeAcks):
     -- SafeAcks=FALSE violates EventualProgress (the wedge); SafeAcks=TRUE holds it
     -- while every safety invariant still holds.
     -- Reaper, apply path. A smaller same-node claim means we are about to defer
@@ -3468,7 +3468,7 @@ BEGIN
     -- _on_claim_release on the origin side and forwards what was deferred behind
     -- them. Done before the FOR UPDATE below so we hold no row lock the dblink
     -- session would wait on. Fires for the arriving claim and for the waiter's
-    -- poke UPDATE alike. Modelled in docs/formal/Bakery_v2.tla (Reaper, Applier,
+    -- poke UPDATE alike. Modelled in docs/formal/Bakery.tla (Reaper, Applier,
     -- Poker).
     IF EXISTS (SELECT 1 FROM coldfront.claims
                 WHERE snowflake.get_node(ticket) = my_node
@@ -3585,14 +3585,14 @@ CREATE TRIGGER coldfront_claim_release
 --
 -- Protocol: Lamport's 1978 distributed mutual exclusion algorithm with
 -- the Ricart-Agrawala (1981) deferred-reply optimisation.
--- Modelled in docs/formal/Bakery_v2.tla.
+-- Modelled in docs/formal/Bakery.tla.
 -- SECURITY DEFINER (search_path pinned; body is fully schema-qualified) so a
 -- NON-superuser writer drives the R-A bakery with superuser privilege: the
 -- pg_stat_replication alive-check sees every walsender (an INVOKER non-superuser
 -- would see none → rule all peers dead → skip acks → the race this serializer
 -- exists to prevent), and the spock.* reads + dblink claim-INSERT succeed. This
 -- only changes the PG execution privilege, not the claim/ack/lock/ticket protocol
--- (TLA+-verified protocol-neutral; see docs/formal/Bakery_v2.tla). The cold DML
+-- (TLA+-verified protocol-neutral; see docs/formal/Bakery.tla). The cold DML
 -- itself still runs as the caller — _exec_iceberg_with_claim stays INVOKER.
 CREATE FUNCTION coldfront._claim_iceberg_lock(
     p_iceberg_table text
@@ -3632,7 +3632,7 @@ BEGIN
     -- Same-node serialization: hold a node-local advisory xact lock for this
     -- iceberg table across the whole claim+commit, so at most ONE cold writer
     -- per node is in the bakery at once. That keeps per-node concurrency at 1
-    -- (the topology Bakery_v2 proves safe), so the cross-node Ricart-Agrawala
+    -- (the topology Bakery proves safe), so the cross-node Ricart-Agrawala
     -- ack/defer only ever arbitrates a single same-node claim. Cross-node
     -- writers are unaffected (advisory locks are instance-local); in the async
     -- path this runs after the parquet upload, so same-node uploads pipeline.
@@ -3656,7 +3656,7 @@ BEGIN
     -- tables after a restart. The orphan DELETE fires _on_claim_release, which
     -- forwards whatever peers deferred behind the orphan, and the acks CTE drops
     -- the orphan's own acks. Runs before our INSERT, so it cannot reap us.
-    -- Modelled in docs/formal/Bakery_v2.tla (Reaper, BeginClaim).
+    -- Modelled in docs/formal/Bakery.tla (Reaper, BeginClaim).
     --
     -- Per-table exclusive advisory lock, held ONLY across nextval() + the dblink
     -- statement. Paired with the shared lock in _on_claim_apply, this closes the
@@ -3753,7 +3753,7 @@ BEGIN
         -- replicates and re-fires _on_claim_apply on every peer for our ticket, so
         -- a peer that deferred us behind a claim whose holder has since gone reaps
         -- it and acks. Nothing else would ever reach that peer. Modelled as the
-        -- Poker process in docs/formal/Bakery_v2.tla.
+        -- Poker process in docs/formal/Bakery.tla.
         v_poll := v_poll + 1;
         IF v_poll % 200 = 0 THEN
             PERFORM public.dblink_exec('coldfront_self', format(
@@ -3778,7 +3778,7 @@ $$;
 -- the claim row; fully schema-qualified, search_path pinned). In production this
 -- runs from the C XactCallback's libpq loopback as the coldfront owner already;
 -- SD also covers any synchronous (bootstrap) caller so a non-superuser release
--- never fails. Protocol-neutral (docs/formal/Bakery_v2.tla).
+-- never fails. Protocol-neutral (docs/formal/Bakery.tla).
 CREATE FUNCTION coldfront._release_iceberg_lock(p_ticket bigint)
 RETURNS void LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
 DECLARE
@@ -3870,8 +3870,8 @@ $$;
 -- GUCs together in postgresql.conf (see docker/entrypoint.sh). Async requested
 -- WITHOUT the patch asserted returns FALSE here, so _exec_iceberg_with_claim
 -- falls back to the always-safe stock ordering instead of silently risking a
--- Lakekeeper 409 / commit loss. Formal basis: docs/formal — Bakery_v2_race.cfg
--- (async WITHOUT the patch) violates NoLakekeeperConflict; Bakery_v2_async.cfg
+-- Lakekeeper 409 / commit loss. Formal basis: docs/formal — Bakery_race.cfg
+-- (async WITHOUT the patch) violates NoLakekeeperConflict; Bakery_async.cfg
 -- (async WITH the patch) is safe. STABLE so the planner can fold it.
 CREATE FUNCTION coldfront._iceberg_async_active() RETURNS boolean
 LANGUAGE sql STABLE AS $$
@@ -3946,7 +3946,7 @@ BEGIN
     -- Fail-safe, not fail-silent: if async was REQUESTED but the bakery-aware
     -- patch is not asserted, we use the stock ordering (always safe) and note it
     -- ONCE per session. Running async on stock iceberg would let a peer capture a
-    -- stale parent and conflict → silent commit loss (docs/formal Bakery_v2_race.cfg).
+    -- stale parent and conflict → silent commit loss (docs/formal Bakery_race.cfg).
     -- RAISE LOG, not WARNING: this is a deployment-config advisory that belongs in
     -- the server log; it must NOT reach the client (a per-statement client message
     -- here would pollute output and break tools that scan write output for errors).
@@ -3984,7 +3984,7 @@ $$;
 -- async branch: iceberg-go has no bakery-aware re-stamp patch, so the compactor
 -- must use the stock ordering (parent stamped under the claim). Formally cleared
 -- in docs/formal — the compactor maps onto the stock-ordering writer
--- (Bakery_v2.cfg); the patchless-async shortcut it must avoid is Bakery_v2_race.
+-- (Bakery.cfg); the patchless-async shortcut it must avoid is Bakery_race.
 CREATE FUNCTION coldfront._claim_iceberg_external(p_iceberg_table text)
 RETURNS void LANGUAGE plpgsql AS $$
 BEGIN

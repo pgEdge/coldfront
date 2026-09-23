@@ -214,7 +214,7 @@ func planCompaction(ctx context.Context, cat *rest.Catalog, ns, name string, tar
 // is what serializes this against concurrent cold writers (no 409). Because
 // iceberg-go has no bakery-aware re-stamp patch, the claim is held across the
 // WHOLE read->rewrite->commit so the CAS parent is captured under the claim —
-// the stock-ordering discipline proved safe in docs/formal (Bakery_v2.cfg).
+// the stock-ordering discipline proved safe in docs/formal (Bakery.cfg).
 func rewrite(ctx context.Context, tbl *table.Table, p *planResult, targetSize int64) (*table.RewriteResult, error) {
 	if p.sorted {
 		return rewriteSorted(ctx, tbl, p.groups, p.sortKey, targetSize)
