@@ -140,10 +140,6 @@ SELECT schema_name, relname, hot_table, iceberg_table, partition_col,
        is_iceberg_only, is_writable, vec_columns
   FROM coldfront.tiered_views WHERE relname = 'lakeside';
 
--- The two-snapshot prime, shared with create_iceberg_table: one INSERT of NULLs
--- and one DELETE lift a table off the null-snapshot state and leave it empty.
-SELECT coldfront._iceberg_prime_sql('ice."Lake-EU".lakeside', 3);
-
 -- Releasing hands the relation back: the view and the registry row go, and no
 -- Iceberg I/O happens, so the table keeps every row. The name is free again.
 SELECT coldfront.release_iceberg_table('public', 'lakeside');

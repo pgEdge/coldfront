@@ -412,6 +412,12 @@ EOSQL
 # precondition and 409 (CatalogCommitConflict), silently losing rows. (Standing
 # rule: multi-writer no-409 probe in vanilla. The bakery is essential.)
 # ───────────────────────────────────────────────────────────────────────────
+# snapshot_count <iceberg-ref>: the table's snapshot count. A table nothing has
+# written to has none, and every commit adds one.
+snapshot_count() {
+    q "$HOST" "SELECT coldfront.ensure_attached(); SELECT r['n'] FROM duckdb.query('SELECT count(*) AS n FROM iceberg_snapshots(''$1'')') AS t(r);" | tail -1
+}
+
 story_decoupled_concurrency() {
     step "9. Concurrency: parallel cold writers serialize via the bakery (no 409)"
     local k pids=()
@@ -426,6 +432,25 @@ story_decoupled_concurrency() {
     assert_eq "8 concurrent cold writers all landed (no 409/loss)" "8" \
         "$(q "$HOST" "SELECT count(*) FROM iceonly WHERE status='conc';")"
     rm -f $TMPD/conc.* 2>/dev/null
+
+    # A table nothing has written to takes concurrent first writes without losing
+    # any: the first commit asserts the table still has no snapshot, so nothing
+    # can silently replace it, and the bakery serialises the rest behind it.
+    q "$HOST" "SELECT coldfront.create_iceberg_table('public','icefirst','[{\"name\":\"id\",\"type\":\"bigint\"}]'::jsonb);" >/dev/null 2>&1
+    assert_eq "a created table has no snapshot until it is written" "0" \
+        "$(snapshot_count ice.public.icefirst)"
+    pids=()
+    for k in 1 2 3 4 5 6 7 8; do
+        q "$HOST" "INSERT INTO icefirst VALUES ($k);" >"$TMPD/first.$k" 2>&1 &
+        pids+=("$!")
+    done
+    for p in "${pids[@]}"; do wait "$p"; done
+    assert_eq "no concurrent first write errored" "0" \
+        "$(cat "$TMPD"/first.* 2>/dev/null | grep -cEi 'error|conflict|409')"
+    assert_eq "8 concurrent first writes into a never-written table all landed" "8" \
+        "$(q "$HOST" "SELECT count(*) FROM icefirst;")"
+    q "$HOST" "SELECT coldfront.drop_iceberg_table('public','icefirst', true);" >/dev/null 2>&1
+    rm -f "$TMPD"/first.* 2>/dev/null
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -469,7 +494,7 @@ adopt_fixture() {
 }
 
 story_adopt_decoupled() {
-    step "TC-164..TC-170, TC-172: adopt an existing Iceberg table (decoupled)"
+    step "TC-164..TC-170, TC-172, TC-173: adopt an existing Iceberg table (decoupled)"
     ADOPT_WH=$(curl -s "http://${LK_IP}:8181/management/v1/warehouse" \
                  | grep -oE '"warehouse-id":"[^"]+"' | head -1 | cut -d'"' -f4)
     [ -n "$ADOPT_WH" ] || { fail "TC-164: could not resolve the warehouse id"; return; }
@@ -607,6 +632,18 @@ SQL
     assert_eq "TC-172: the adoption left no claim behind" "0" \
         "$(q "$HOST" "SELECT count(*) FROM coldfront.claims WHERE iceberg_table = 'ice.lake.orders';")"
     q "$HOST" "SELECT coldfront.release_iceberg_table('public','orders');" >/dev/null 2>&1
+
+    # TC-173: a table nothing has written to adopts writable without ColdFront
+    # writing to it, whatever its columns require, and its first snapshot is the
+    # first real write.
+    adopt_fixture lake fresh '(id BIGINT NOT NULL, note VARCHAR)'
+    q "$HOST" "SELECT coldfront.adopt_iceberg_table('public','fresh','lake', p_writable => true);" >/dev/null 2>&1
+    assert_eq "TC-173: a never-written table with a required column adopts writable" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.tiered_views WHERE relname='fresh' AND is_writable;")"
+    assert_eq "TC-173: adoption wrote nothing to it" "0" "$(snapshot_count ice.lake.fresh)"
+    q "$HOST" "INSERT INTO fresh VALUES (1, 'first');" >/dev/null 2>&1
+    assert_eq "TC-173: its first write lands" "1" "$(q "$HOST" "SELECT count(*) FROM fresh;")"
+    q "$HOST" "SELECT coldfront.release_iceberg_table('public','fresh');" >/dev/null 2>&1
 }
 
 # ───────────────────────────────────────────────────────────────────────────

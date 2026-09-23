@@ -20,15 +20,15 @@ SET coldfront.local_pg_dsn = '';
 -- to build it from.
 SELECT coldfront.adopt_iceberg_table(NULL, 'orders');
 ERROR:  coldfront.adopt_iceberg_table: p_schema and p_table are required
-CONTEXT:  PL/pgSQL function adopt_iceberg_table(text,text,text,boolean,jsonb) line 13 at RAISE
+CONTEXT:  PL/pgSQL function adopt_iceberg_table(text,text,text,boolean,jsonb) line 12 at RAISE
 SELECT coldfront.adopt_iceberg_table('public', NULL);
 ERROR:  coldfront.adopt_iceberg_table: p_schema and p_table are required
-CONTEXT:  PL/pgSQL function adopt_iceberg_table(text,text,text,boolean,jsonb) line 13 at RAISE
+CONTEXT:  PL/pgSQL function adopt_iceberg_table(text,text,text,boolean,jsonb) line 12 at RAISE
 -- Writes are armed or not; there is no third answer to default to.
 SELECT coldfront.adopt_iceberg_table('public', 'orders', p_writable => NULL);
 ERROR:  coldfront.adopt_iceberg_table: p_writable must be true or false
 HINT:  Omit it to adopt read-only.
-CONTEXT:  PL/pgSQL function adopt_iceberg_table(text,text,text,boolean,jsonb) line 16 at RAISE
+CONTEXT:  PL/pgSQL function adopt_iceberg_table(text,text,text,boolean,jsonb) line 15 at RAISE
 -- Catalog writes stay off a replica. On a primary the guard passes.
 SELECT coldfront._reject_on_standby('adopt an Iceberg table');
  _reject_on_standby 
@@ -47,19 +47,19 @@ ERROR:  coldfront.adopt_iceberg_table: "public.orders" is already registered for
 HINT:  Adoption binds a name once. Release an adopted table with coldfront.release_iceberg_table() before adopting under its name again; a tiered table keeps its name.
 CONTEXT:  PL/pgSQL function _adopt_preflight(text,text,text) line 19 at RAISE
 SQL statement "SELECT coldfront._adopt_preflight(p_schema, p_table, v_ice)"
-PL/pgSQL function adopt_iceberg_table(text,text,text,boolean,jsonb) line 37 at PERFORM
+PL/pgSQL function adopt_iceberg_table(text,text,text,boolean,jsonb) line 36 at PERFORM
 SELECT coldfront.adopt_iceberg_table('public', 'orders', 'lake', p_writable => true);
 ERROR:  coldfront.adopt_iceberg_table: "public.orders" is already registered for ice.lake.orders
 HINT:  Adoption binds a name once. Release an adopted table with coldfront.release_iceberg_table() before adopting under its name again; a tiered table keeps its name.
 CONTEXT:  PL/pgSQL function _adopt_preflight(text,text,text) line 19 at RAISE
 SQL statement "SELECT coldfront._adopt_preflight(p_schema, p_table, v_ice)"
-PL/pgSQL function adopt_iceberg_table(text,text,text,boolean,jsonb) line 37 at PERFORM
+PL/pgSQL function adopt_iceberg_table(text,text,text,boolean,jsonb) line 36 at PERFORM
 SELECT coldfront.adopt_iceberg_table('public', 'orders', 'warehouse');
 ERROR:  coldfront.adopt_iceberg_table: "public.orders" is already registered for ice.lake.orders
 HINT:  Adoption binds a name once. Release an adopted table with coldfront.release_iceberg_table() before adopting under its name again; a tiered table keeps its name.
 CONTEXT:  PL/pgSQL function _adopt_preflight(text,text,text) line 19 at RAISE
 SQL statement "SELECT coldfront._adopt_preflight(p_schema, p_table, v_ice)"
-PL/pgSQL function adopt_iceberg_table(text,text,text,boolean,jsonb) line 37 at PERFORM
+PL/pgSQL function adopt_iceberg_table(text,text,text,boolean,jsonb) line 36 at PERFORM
 SELECT count(*) AS registry_rows, bool_and(NOT is_writable) AS still_read_only
   FROM coldfront.tiered_views WHERE relname = 'orders';
  registry_rows | still_read_only 
@@ -78,7 +78,7 @@ ERROR:  coldfront.adopt_iceberg_table: "public.sales" is already registered for 
 HINT:  Adoption binds a name once. Release an adopted table with coldfront.release_iceberg_table() before adopting under its name again; a tiered table keeps its name.
 CONTEXT:  PL/pgSQL function _adopt_preflight(text,text,text) line 19 at RAISE
 SQL statement "SELECT coldfront._adopt_preflight(p_schema, p_table, v_ice)"
-PL/pgSQL function adopt_iceberg_table(text,text,text,boolean,jsonb) line 37 at PERFORM
+PL/pgSQL function adopt_iceberg_table(text,text,text,boolean,jsonb) line 36 at PERFORM
 DELETE FROM coldfront.tiered_views WHERE relname = 'sales';
 DROP VIEW public.sales;
 DROP TABLE public._sales;
@@ -91,7 +91,7 @@ ERROR:  coldfront.adopt_iceberg_table: ice.lake.orders is already registered as 
 HINT:  One relation per Iceberg table: the cluster-column and cold-write lookups resolve a table by its ref. Release the existing registration first.
 CONTEXT:  PL/pgSQL function _adopt_preflight(text,text,text) line 36 at RAISE
 SQL statement "SELECT coldfront._adopt_preflight(p_schema, p_table, v_ice)"
-PL/pgSQL function adopt_iceberg_table(text,text,text,boolean,jsonb) line 37 at PERFORM
+PL/pgSQL function adopt_iceberg_table(text,text,text,boolean,jsonb) line 36 at PERFORM
 SELECT count(*) AS registry_rows FROM coldfront.tiered_views WHERE schema_name = 'reporting';
  registry_rows 
 ---------------
@@ -109,7 +109,7 @@ ERROR:  coldfront.adopt_iceberg_table: ice.lake.orders is already registered as 
 HINT:  One relation per Iceberg table: the cluster-column and cold-write lookups resolve a table by its ref. Release the existing registration first.
 CONTEXT:  PL/pgSQL function _adopt_preflight(text,text,text) line 36 at RAISE
 SQL statement "SELECT coldfront._adopt_preflight(p_schema, p_table, v_ice)"
-PL/pgSQL function adopt_iceberg_table(text,text,text,boolean,jsonb) line 37 at PERFORM
+PL/pgSQL function adopt_iceberg_table(text,text,text,boolean,jsonb) line 36 at PERFORM
 UPDATE coldfront.tiered_views SET iceberg_table = 'ice.lake.orders'
  WHERE schema_name = 'public' AND relname = 'orders';
 -- Adoption puts a wrapper view under the name, so a relation already standing
@@ -121,7 +121,7 @@ ERROR:  coldfront.adopt_iceberg_table: "reporting.orders" already exists
 HINT:  Adoption puts a wrapper view under that name. Adopt under another name, or move the existing relation aside first.
 CONTEXT:  PL/pgSQL function _adopt_preflight(text,text,text) line 25 at RAISE
 SQL statement "SELECT coldfront._adopt_preflight(p_schema, p_table, v_ice)"
-PL/pgSQL function adopt_iceberg_table(text,text,text,boolean,jsonb) line 37 at PERFORM
+PL/pgSQL function adopt_iceberg_table(text,text,text,boolean,jsonb) line 36 at PERFORM
 DROP TABLE reporting.orders;
 CREATE VIEW public.spectators AS SELECT 1 AS id;
 SELECT coldfront.adopt_iceberg_table('public', 'spectators', 'lake');
@@ -129,7 +129,7 @@ ERROR:  coldfront.adopt_iceberg_table: "public.spectators" already exists
 HINT:  Adoption puts a wrapper view under that name. Adopt under another name, or move the existing relation aside first.
 CONTEXT:  PL/pgSQL function _adopt_preflight(text,text,text) line 25 at RAISE
 SQL statement "SELECT coldfront._adopt_preflight(p_schema, p_table, v_ice)"
-PL/pgSQL function adopt_iceberg_table(text,text,text,boolean,jsonb) line 37 at PERFORM
+PL/pgSQL function adopt_iceberg_table(text,text,text,boolean,jsonb) line 36 at PERFORM
 DROP VIEW public.spectators;
 SELECT count(*) AS registry_rows FROM coldfront.tiered_views;
  registry_rows 
@@ -145,7 +145,7 @@ ERROR:  coldfront.adopt_iceberg_table: schema "lake" does not exist
 HINT:  Adoption puts a wrapper view in that schema. Create it first, or adopt into one that exists; p_namespace names the Iceberg side.
 CONTEXT:  PL/pgSQL function _adopt_preflight(text,text,text) line 8 at RAISE
 SQL statement "SELECT coldfront._adopt_preflight(p_schema, p_table, v_ice)"
-PL/pgSQL function adopt_iceberg_table(text,text,text,boolean,jsonb) line 37 at PERFORM
+PL/pgSQL function adopt_iceberg_table(text,text,text,boolean,jsonb) line 36 at PERFORM
 -- With no catalog configured there is no schema to read, and saying so beats
 -- failing against a catalog that was never attached.
 SELECT coldfront.adopt_iceberg_table('reporting', 'invoices', 'lake');
@@ -153,7 +153,7 @@ ERROR:  coldfront.adopt_iceberg_table: no Iceberg catalog is configured, so ice.
 HINT:  Set coldfront.warehouse and coldfront.lakekeeper_endpoint, then adopt again.
 CONTEXT:  PL/pgSQL function _adopt_preflight(text,text,text) line 48 at RAISE
 SQL statement "SELECT coldfront._adopt_preflight(p_schema, p_table, v_ice)"
-PL/pgSQL function adopt_iceberg_table(text,text,text,boolean,jsonb) line 37 at PERFORM
+PL/pgSQL function adopt_iceberg_table(text,text,text,boolean,jsonb) line 36 at PERFORM
 DROP SCHEMA reporting;
 -- One column's cast, which is what the adoption loop decides per column: the
 -- observed Iceberg type through the reverse map, spelled as the PG type the view
@@ -246,14 +246,6 @@ SELECT schema_name, relname, hot_table, iceberg_table, partition_col,
  schema_name | relname  | hot_table |     iceberg_table      | partition_col | is_iceberg_only | is_writable | vec_columns 
 -------------+----------+-----------+------------------------+---------------+-----------------+-------------+-------------
  public      | lakeside |           | ice."Lake-EU".lakeside |               | t               | f           | {embedding}
-(1 row)
-
--- The two-snapshot prime, shared with create_iceberg_table: one INSERT of NULLs
--- and one DELETE lift a table off the null-snapshot state and leave it empty.
-SELECT coldfront._iceberg_prime_sql('ice."Lake-EU".lakeside', 3);
-                                        _iceberg_prime_sql                                        
---------------------------------------------------------------------------------------------------
- INSERT INTO ice."Lake-EU".lakeside VALUES (NULL, NULL, NULL); DELETE FROM ice."Lake-EU".lakeside
 (1 row)
 
 -- Releasing hands the relation back: the view and the registry row go, and no

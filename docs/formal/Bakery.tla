@@ -113,13 +113,14 @@ variables
   \* it considers dead.
   claims = {},
 
-  \* The iceberg table's snapshot history.  iceberg[1] is the prime
-  \* snapshot created by coldfront.create_iceberg_table (NULL insert +
-  \* DELETE) so the table is non-empty before any user write.  Each
+  \* The iceberg table's snapshot history.  iceberg[1] stands for the table
+  \* as it is before any writer here commits, snapshot or not: the first
+  \* commit asserts that state as its parent, which for a table nothing has
+  \* written to is the catalog's check that it still has no snapshot.  Each
   \* later entry is [w |-> writer, t |-> ticket, parent |-> snap_id, kind |-> "commit"].
   \* The `t` field is the writer's snowflake ticket — kept on the
   \* snapshot record so TicketOrderPreserved can verify monotonicity.
-  iceberg = << [w |-> 0, t |-> 0, parent |-> 0, kind |-> "prime"] >>,
+  iceberg = << [w |-> 0, t |-> 0, parent |-> 0, kind |-> "initial"] >>,
 
   \* Per-writer terminal status, used by the safety / liveness invariants.
   decision = [w \in Writers |-> "none"],
@@ -366,7 +367,7 @@ ProcSet == (Writers) \cup {"crasher"}
 Init == (* Global variables *)
         /\ next_ticket = 1
         /\ claims = {}
-        /\ iceberg = << [w |-> 0, t |-> 0, parent |-> 0, kind |-> "prime"] >>
+        /\ iceberg = << [w |-> 0, t |-> 0, parent |-> 0, kind |-> "initial"] >>
         /\ decision = [w \in Writers |-> "none"]
         /\ crashed = [w \in Writers |-> FALSE]
         /\ crash_budget = MaxCrashes

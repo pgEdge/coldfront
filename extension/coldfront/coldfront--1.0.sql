@@ -2807,26 +2807,6 @@ BEGIN
 END;
 $$;
 
--- The DuckDB statements that lift an Iceberg table off the null-snapshot state
--- and leave it semantically empty: one INSERT of NULLs and one DELETE, which
--- commit as two snapshots in one DuckDB transaction.
---
--- Without them the first concurrent N writers against a never-written table can
--- each commit a "first snapshot" without conflict, because Lakekeeper's
--- assert-ref-snapshot-id precondition holds for all of them when the prior ref
--- is null, and the last writer's snapshot silently wins. p_ncols counts every
--- Iceberg column, cluster columns included, since the INSERT is positional.
---
--- NULL works for every column because neither helper emits a NOT NULL
--- constraint. A required column would need a per-type non-null literal instead.
-CREATE OR REPLACE FUNCTION coldfront._iceberg_prime_sql(p_ice_ref text, p_ncols int)
-RETURNS text
-LANGUAGE sql IMMUTABLE STRICT AS $$
-    SELECT format('INSERT INTO %s VALUES (%s); DELETE FROM %s', p_ice_ref,
-                  array_to_string(array_fill('NULL'::text, ARRAY[p_ncols]), ', '),
-                  p_ice_ref);
-$$;
-
 -- Everything adoption refuses before it reads a catalog or writes a row, given
 -- the name the wrapper view would take and the Iceberg reference behind it.
 CREATE OR REPLACE FUNCTION coldfront._adopt_preflight(
@@ -2963,7 +2943,6 @@ DECLARE
     v_cols      jsonb := '[]'::jsonb;
     v_vec_cols  text[] := '{}';
     v_n         int := 0;
-    v_snaps     int;
     v_unknown   text;
     r           record;
 BEGIN
@@ -2975,7 +2954,7 @@ BEGIN
             USING HINT = 'Omit it to adopt read-only.';
     END IF;
 
-    -- The prime below is a catalog write, and the registration is a PG write.
+    -- Refused before the claim below, so a standby stays out of the bakery.
     PERFORM coldfront._reject_on_standby('adopt an Iceberg table');
 
     v_ice := format('ice.%I.%I', COALESCE(p_namespace, p_schema), p_table);
@@ -3058,17 +3037,6 @@ BEGIN
                                              v_cols, v_vec_cols, p_writable);
 
     IF p_writable THEN
-        -- Prime only a table that is still on the null-snapshot state. One that
-        -- someone has already written to is past it, and rewriting its rows is
-        -- not adoption's business.
-        EXECUTE format('SELECT count(*)::int FROM duckdb.query(%L) AS t(r)',
-                       format('SELECT 1 FROM iceberg_snapshots(%s)', quote_literal(v_ice)))
-          INTO v_snaps;
-        IF COALESCE(v_snaps, 0) = 0 THEN
-            PERFORM duckdb.raw_query(coldfront._iceberg_prime_sql(
-                        v_ice, v_n + cardinality(v_vec_cols)));
-        END IF;
-
         -- Cross-node bakery coordination, the same requirement a created table has.
         PERFORM coldfront._ensure_claims_replicated();
     END IF;
@@ -3243,12 +3211,7 @@ BEGIN
     PERFORM coldfront._register_iceberg_view(p_schema, p_table, ice_ref,
                                              v_view_cols, v_vec_cols, true);
 
-    -- 3. Prime the table so current-snapshot-id is non-null; see
-    --    _iceberg_prime_sql for why an unprimed table loses concurrent writes.
-    PERFORM duckdb.raw_query(coldfront._iceberg_prime_sql(
-                ice_ref, n + cardinality(v_vec_cols)));
-
-    -- 4. Ensure claims is in Spock's default replication set so
+    -- 3. Ensure claims is in Spock's default replication set so
     --    cross-node bakery coordination (see below) works. Idempotent.
     --    Claim rows themselves come and go on demand — INSERT in
     --    _claim_iceberg_lock, DELETE in _release_iceberg_lock — so the

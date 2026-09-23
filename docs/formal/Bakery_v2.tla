@@ -204,7 +204,11 @@ variables
   \* while a larger same-node claim below t still holds forwards too early.
   deferred = {},
 
-  iceberg = << [w |-> 0, t |-> 0, parent |-> 0, kind |-> "prime"] >>,
+  \* iceberg[1] stands for the table as it is before any writer here commits,
+  \* snapshot or not: the first commit asserts that state as its parent, which
+  \* for a table nothing has written to is the catalog's check that it still has
+  \* no snapshot.
+  iceberg = << [w |-> 0, t |-> 0, parent |-> 0, kind |-> "initial"] >>,
 
   decision    = [w \in Writers |-> "none"],
   crashed     = [w \in Writers |-> FALSE],
@@ -617,7 +621,7 @@ begin
 end process;
 
 end algorithm; *)
-\* BEGIN TRANSLATION (chksum(pcal) = "6ac38723" /\ chksum(tla) = "7008820c")
+\* BEGIN TRANSLATION (chksum(pcal) = "f6e04df2" /\ chksum(tla) = "22c3e5e6")
 VARIABLES pc, next_ticket, claims, acks, deferred, iceberg, decision, crashed, 
           crash_budget, registered
 
@@ -724,7 +728,7 @@ Init == (* Global variables *)
         /\ claims = [nd \in Nodes |-> {}]
         /\ acks = {}
         /\ deferred = {}
-        /\ iceberg = << [w |-> 0, t |-> 0, parent |-> 0, kind |-> "prime"] >>
+        /\ iceberg = << [w |-> 0, t |-> 0, parent |-> 0, kind |-> "initial"] >>
         /\ decision = [w \in Writers |-> "none"]
         /\ crashed = [w \in Writers |-> FALSE]
         /\ crash_budget = MaxCrashes

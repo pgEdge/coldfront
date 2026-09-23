@@ -264,14 +264,10 @@ call. `DESCRIBE` is a metadata-only read: it scans no Parquet and works
 on a table with no snapshot. Its rows arrive in Iceberg schema order,
 which fixes a clustered table's cluster-column order.
 
-Adoption differs from creation in four places: types map from Iceberg
+Adoption differs from creation in three places: types map from Iceberg
 to PostgreSQL, no `CREATE SCHEMA` or `CREATE TABLE` reaches the catalog,
-the registry row records writability, and a writable table with no
-snapshot is primed. Priming runs one INSERT of NULLs and one DELETE in a
-single DuckDB transaction, so the table has a current snapshot id;
-without one, Lakekeeper's ref precondition holds for every concurrent
-"first snapshot" commit and the last writer silently wins. The C hook
-emits `tiered_views.iceberg_table` verbatim, so a reference outside
+and the registry row records writability. The C hook emits
+`tiered_views.iceberg_table` verbatim, so a reference outside
 `ice.<pg_schema>.<pg_relname>` needs no further handling.
 
 ### Types an adopted column reads as
