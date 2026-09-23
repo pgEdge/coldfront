@@ -81,7 +81,7 @@ step "mesh: extensions on all nodes"
 # behind /dev/null: a silent CREATE EXTENSION spock failure once let a dead mesh
 # masquerade as healthy for an entire matrix run.
 for n in $NODES; do
-    for ext in dblink snowflake spock pg_duckdb coldfront; do
+    for ext in snowflake spock pg_duckdb coldfront; do
         if ! out=$(docker exec -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" "coldfront-${n}-1" \
                    "$CF_PSQL" -v ON_ERROR_STOP=1 -qtAc "CREATE EXTENSION IF NOT EXISTS $ext;" 2>&1); then
             echo "CREATE EXTENSION $ext on $n FAILED: $out"; exit 1
@@ -114,8 +114,8 @@ subs=$(m db1 "SELECT count(*) FROM spock.subscription;")
 
 # Pre-arm the R-A bakery substrate on EVERY node: coldfront.claims/claim_acks
 # must be in each node's replication set BEFORE any cold write. A peer acks an
-# originator's claim by INSERTing into claim_acks (via dblink, so it is the
-# peer's own origin); that ack only reaches the originator if claim_acks is in
+# originator's claim by INSERTing into claim_acks (over its loopback, so it is
+# the peer's own origin); that ack only reaches the originator if claim_acks is in
 # the peer's repset. create_iceberg_table() calls this too, but only on the node
 # it runs on — so peers would otherwise not be armed until too late, and the
 # originator would sleep forever waiting for acks. Idempotent.

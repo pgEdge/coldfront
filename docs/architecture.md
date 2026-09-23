@@ -210,11 +210,11 @@ image defaults `duckdb.postgres_role = coldfront_duckdb` (env
 
 In a **Spock mesh** the role and its grants replicate via Spock DDL -
 onboard once on any node. Mesh cold *writes* route through the R-A
-bakery; its coordination functions `_claim_iceberg_lock` /
-`_release_iceberg_lock` are themselves `SECURITY DEFINER`
+bakery; its coordination function `_claim_iceberg_lock` is
+itself `SECURITY DEFINER`
 (search_path-pinned, fully schema-qualified) so a non-superuser drives
 the cross-node serialization (`pg_stat_replication` liveness + the
-dblink claim) with the privilege it requires. `_exec_iceberg_with_claim`
+loopback claim) with the privilege it requires. `_exec_iceberg_with_claim`
 deliberately stays `SECURITY INVOKER` - it runs the caller's cold DML,
 which must execute as the caller. The bakery SD is **protocol-neutral**:
 it changes the PG execution privilege, not the claim/ack/lock/ticket

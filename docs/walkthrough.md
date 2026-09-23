@@ -953,7 +953,6 @@ docker compose -f examples/walkthrough/docker-compose.mesh.yml up -d
 -- On BOTH nodes - create the extensions. The container preloads the libraries
 -- (shared_preload_libraries) but does not run CREATE EXTENSION, so the SQL
 -- objects (the spock schema, coldfront functions) do not exist until you do:
-CREATE EXTENSION IF NOT EXISTS dblink;
 CREATE EXTENSION IF NOT EXISTS snowflake;
 CREATE EXTENSION IF NOT EXISTS spock;
 CREATE EXTENSION IF NOT EXISTS pg_duckdb;

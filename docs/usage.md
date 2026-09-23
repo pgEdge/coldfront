@@ -808,8 +808,9 @@ Keep the following caveats in mind when running either mode:
   committing to Lakekeeper. No 409 conflicts, no app-level retry. The
   protocol is Lamport-1978 mutex with the Ricart-Agrawala (1981)
   deferred-reply optimisation; claims and acks replicate as Spock rows
-  and it stays safe under Spock's asymmetric apply (modelled in [docs/formal/Bakery.tla](https://github.com/pgEdge/ColdFront/blob/main/docs/formal/Bakery.tla)). The bakery requires the `dblink` + `snowflake`
-  extensions, the `coldfront.dblink_self` GUC, and a one-time `SELECT
+  and it stays safe under Spock's asymmetric apply (modelled in [docs/formal/Bakery.tla](https://github.com/pgEdge/ColdFront/blob/main/docs/formal/Bakery.tla)). The bakery requires the `snowflake`
+  extension, the `coldfront.dblink_self` GUC (the connection string of the
+  node's loopback), and a one-time `SELECT
   coldfront._ensure_claims_replicated()` call on every node after spock
   mesh setup; see [architecture_decoupled.md](architecture_decoupled.md#concurrency-horizontal-scaling-the-bakery-protocol). Sync-rep is **not** required.
   The throughput ceiling is Lakekeeper's commit rate, not the writer
@@ -868,8 +869,8 @@ wal_receiver_status_interval = 1s
 # is otherwise arbitrary — the bakery matches acks by spock node name, not by id).
 snowflake.node = 1
 
-# DSN used by the bakery's autonomous-tx claim INSERT/DELETE via dblink.
-# Unix socket avoids TCP overhead. The claim session only touches the
+# DSN of the node's loopback, which runs the bakery's autonomous claim
+# INSERT/DELETE. Unix socket avoids TCP overhead. The claim session only touches the
 # coldfront.claims/claim_acks heap tables, so it never attaches the
 # Iceberg catalog (the lazy catalog-attach hook fires only on a tiered
 # view). application_name=coldfront_dblink marks the session as bakery
@@ -908,10 +909,8 @@ because `coldfront._ensure_claims_replicated()` calls
 exist:
 
 ```sql
--- 1. Extensions, in dependency order. dblink + snowflake are bakery
--- prereqs (R-A's autonomous-tx claim/ack INSERTs go through dblink;
--- claim tickets come from snowflake.nextval).
-CREATE EXTENSION IF NOT EXISTS dblink;
+-- 1. Extensions, in dependency order. snowflake is a bakery prereq
+-- (claim tickets come from snowflake.nextval).
 CREATE EXTENSION IF NOT EXISTS snowflake;
 CREATE EXTENSION IF NOT EXISTS spock;
 CREATE EXTENSION IF NOT EXISTS pg_duckdb;

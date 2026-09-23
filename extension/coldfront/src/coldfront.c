@@ -3690,51 +3690,107 @@ coldfront_post_parse_analyze(ParseState *pstate, Query *query,
  * after pg_duckdb in shared_preload_libraries; PG calls callbacks in
  * registration order), so on COMMIT the iceberg snapshot is durably
  * committed before we DELETE the claim. On ABORT, pg_duckdb has already
- * rolled back iceberg, and we still need to clean up our (committed-via-
- * dblink-autonomous-tx) claim row so the next writer doesn't block.
+ * rolled back iceberg, and we still need to clean up our claim row (committed
+ * on its own over the loopback) so the next writer doesn't block.
  *
  * Allocated in TopMemoryContext so it survives across PG xacts within one
  * backend session.
  */
 static List *coldfront_pending_releases = NIL;
 
-/* Persistent loopback libpq connection for the XactCallback drain. Opened
- * lazily on first need from the GUC coldfront.dblink_self, kept alive
- * across calls within one backend session. */
-static PGconn *coldfront_release_conn = NULL;
+/* The node's loopback: one libpq connection per backend, opened lazily from the
+ * GUC coldfront.dblink_self and kept for the backend's lifetime. Every bakery
+ * statement that must commit on its own runs here: the claim, the apply
+ * trigger's acks and reaps, the waiter's poke, and the release. Only C holds it,
+ * so no SQL in the session can reach the connection itself. */
+static PGconn *coldfront_loopback_conn = NULL;
 
+/* cf_loopback_get_conn returns the loopback, reconnecting when it is absent or
+ * has failed. A new connection gets a 30 s statement_timeout, the backstop for
+ * a statement stuck on a lock. A connection that cannot be opened is reported
+ * at elevel, and NULL comes back when elevel is below ERROR. */
 static PGconn *
-coldfront_release_get_conn(void)
+cf_loopback_get_conn(int elevel)
 {
     const char *connstr;
+    PGresult   *res;
 
-    if (coldfront_release_conn != NULL &&
-        PQstatus(coldfront_release_conn) == CONNECTION_OK)
-        return coldfront_release_conn;
+    if (coldfront_loopback_conn != NULL &&
+        PQstatus(coldfront_loopback_conn) == CONNECTION_OK)
+        return coldfront_loopback_conn;
 
-    if (coldfront_release_conn != NULL)
+    if (coldfront_loopback_conn != NULL)
     {
-        PQfinish(coldfront_release_conn);
-        coldfront_release_conn = NULL;
+        PQfinish(coldfront_loopback_conn);
+        coldfront_loopback_conn = NULL;
     }
 
     connstr = GetConfigOption("coldfront.dblink_self", true, false);
     if (connstr == NULL || connstr[0] == '\0')
     {
-        elog(WARNING, "coldfront: dblink_self GUC unset; cannot release bakery claim");
+        ereport(elevel,
+                (errmsg("coldfront: coldfront.dblink_self is unset, so the bakery has no loopback connection")));
         return NULL;
     }
 
-    coldfront_release_conn = PQconnectdb(connstr);
-    if (PQstatus(coldfront_release_conn) != CONNECTION_OK)
+    coldfront_loopback_conn = PQconnectdb(connstr);
+    if (PQstatus(coldfront_loopback_conn) != CONNECTION_OK)
     {
-        elog(WARNING, "coldfront: libpq connect for release failed: %s",
-             PQerrorMessage(coldfront_release_conn));
-        PQfinish(coldfront_release_conn);
-        coldfront_release_conn = NULL;
+        char   *msg = pstrdup(PQerrorMessage(coldfront_loopback_conn));
+
+        PQfinish(coldfront_loopback_conn);
+        coldfront_loopback_conn = NULL;
+        ereport(elevel,
+                (errmsg("coldfront: cannot open the loopback connection: %s", msg)));
         return NULL;
     }
-    return coldfront_release_conn;
+    res = PQexec(coldfront_loopback_conn, "SET statement_timeout = '30s'");
+    if (res != NULL)
+        PQclear(res);
+    return coldfront_loopback_conn;
+}
+
+/* cf_loopback_exec runs one statement on the loopback and returns its result,
+ * which the caller clears; a failure is reported at elevel, and NULL comes back
+ * when elevel is below ERROR. A statement that fails because the connection
+ * broke (its backend was terminated, the socket dropped) runs once more on a new
+ * connection, so every statement sent here must be safe to repeat. PQexec
+ * blocks this backend until the loopback answers, so a cancel or terminate
+ * aimed at it takes effect only after the statement has finished: nothing the
+ * loopback runs outlives the backend that asked for it. */
+static PGresult *
+cf_loopback_exec(const char *sql, int elevel)
+{
+    int         attempt;
+
+    for (attempt = 0; attempt < 2; attempt++)
+    {
+        PGconn         *conn = cf_loopback_get_conn(elevel);
+        PGresult       *res;
+        ExecStatusType  st;
+        char           *msg;
+
+        if (conn == NULL)
+            return NULL;
+        res = PQexec(conn, sql);
+        st = res != NULL ? PQresultStatus(res) : PGRES_FATAL_ERROR;
+        if (st == PGRES_COMMAND_OK || st == PGRES_TUPLES_OK)
+            return res;
+        if (attempt == 0 && PQstatus(conn) != CONNECTION_OK)
+        {
+            if (res != NULL)
+                PQclear(res);
+            continue;
+        }
+        msg = pstrdup(res != NULL ? PQresultErrorMessage(res) : PQerrorMessage(conn));
+        if (res != NULL)
+            PQclear(res);
+        ereport(elevel,
+                (errmsg("coldfront: loopback statement failed: %s", msg),
+                 errdetail("Statement: %s", sql)));
+        return NULL;
+    }
+    return NULL;
 }
 
 /*
@@ -3750,11 +3806,11 @@ coldfront_release_get_conn(void)
  * committed"). libpq runs over its own TCP/loopback session and doesn't
  * touch the calling backend's xact state.
  */
-/* cf_release_one_ticket runs one queued claim release over the libpq loopback:
- * an idempotent DELETE-by-ticket; a failure is a WARNING (not ERROR — we are
- * mid-finalize). Split out of coldfront_xact_callback to keep it readable. */
+/* cf_release_one_ticket runs one queued claim release over the loopback: an
+ * idempotent DELETE-by-ticket; a failure is a WARNING, not an ERROR, because
+ * we are mid-finalize. Split out of coldfront_xact_callback to keep it readable. */
 static void
-cf_release_one_ticket(PGconn *conn, int64 ticket)
+cf_release_one_ticket(int64 ticket)
 {
     char        query[160];
     PGresult   *res;
@@ -3763,14 +3819,7 @@ cf_release_one_ticket(PGconn *conn, int64 ticket)
              "DELETE FROM coldfront.claims WHERE ticket = %lld",
              (long long) ticket);
 
-    res = PQexec(conn, query);
-    if (res == NULL ||
-        (PQresultStatus(res) != PGRES_COMMAND_OK &&
-         PQresultStatus(res) != PGRES_TUPLES_OK))
-        elog(WARNING,
-             "coldfront: release of ticket %lld via libpq failed: %s",
-             (long long) ticket,
-             res ? PQresultErrorMessage(res) : PQerrorMessage(conn));
+    res = cf_loopback_exec(query, WARNING);
     if (res != NULL)
         PQclear(res);
 }
@@ -3779,7 +3828,6 @@ static void
 coldfront_xact_callback(XactEvent event, void *arg)
 {
     ListCell *lc;
-    PGconn   *conn;
 
     if (event != XACT_EVENT_COMMIT && event != XACT_EVENT_ABORT)
         return;
@@ -3801,21 +3849,41 @@ coldfront_xact_callback(XactEvent event, void *arg)
     if (coldfront_pending_releases == NIL)
         return;
 
-    conn = coldfront_release_get_conn();
-    if (conn == NULL)
+    if (cf_loopback_get_conn(WARNING) == NULL)
     {
-        /* No connection — claims will be released on next bakery entry
-         * by the idempotent DELETE-by-ticket. Drop the queue silently. */
+        /* No connection: the claims stay behind as orphans, which the
+         * reaper removes (see coldfront._insert_claim). Drop the queue. */
         list_free_deep(coldfront_pending_releases);
         coldfront_pending_releases = NIL;
         return;
     }
 
     foreach(lc, coldfront_pending_releases)
-        cf_release_one_ticket(conn, *((int64 *) lfirst(lc)));
+        cf_release_one_ticket(*((int64 *) lfirst(lc)));
 
     list_free_deep(coldfront_pending_releases);
     coldfront_pending_releases = NIL;
+}
+
+/* coldfront_loopback backs coldfront._loopback: it runs one statement on the
+ * loopback, so the statement commits on its own, and returns the first column
+ * of the first row as text, or NULL when there is none. It runs SQL as the
+ * loopback's user, so the extension script revokes it from PUBLIC. */
+PG_FUNCTION_INFO_V1(coldfront_loopback);
+Datum
+coldfront_loopback(PG_FUNCTION_ARGS)
+{
+    char       *sql = text_to_cstring(PG_GETARG_TEXT_PP(0));
+    PGresult   *res = cf_loopback_exec(sql, ERROR);
+    char       *val = NULL;
+
+    if (PQresultStatus(res) == PGRES_TUPLES_OK && PQntuples(res) > 0 &&
+        PQnfields(res) > 0 && !PQgetisnull(res, 0, 0))
+        val = pstrdup(PQgetvalue(res, 0, 0));
+    PQclear(res);
+    if (val == NULL)
+        PG_RETURN_NULL();
+    PG_RETURN_TEXT_P(cstring_to_text(val));
 }
 
 PG_FUNCTION_INFO_V1(coldfront_enqueue_release);

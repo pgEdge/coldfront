@@ -2209,6 +2209,215 @@ SQL
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# Story (mesh): failures inside the claim step. Every advisory lock the claim
+# and the apply trigger take ends with a transaction, whatever becomes of the
+# loopback connection, and a transaction's claim on a table stays held until it
+# commits. TC-174 times a claim out while another session holds the table's
+# claim key; TC-175 and TC-176 give one transaction a second cold write, to the
+# same table and to another one, while a peer waits behind its first claim;
+# TC-177 fails the apply trigger while it defers a peer's claim; TC-178 checks
+# that an app role's session has no way into the loopback; TC-179 terminates a
+# writer while its claim waits on a row; TC-180 kills every loopback session on
+# a node. Runs on two throwaway Iceberg tables.
+# ───────────────────────────────────────────────────────────────────────────
+story_mesh_claim_failures() {
+    step "12d. Mesh: a failed claim step leaves no lock, claim or open loopback behind"
+    local PARR; read -ra PARR <<< "$PEERS"
+    [ "${#PARR[@]}" -ge 1 ] || { fail "mesh: no --peers given"; return; }
+    local p1="${PARR[0]}" i rc out a a_commit p_done t ref_t loop_app own fake peer_node
+    # A write that must return; the server-side timeout ends the backend's own wait too.
+    tq() { timeout "$1" docker exec -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" -e PGOPTIONS="-c statement_timeout=$(( $1 - 5 ))s" "$2" "$CF_PSQL" -tA -c "$3"; }
+    # Several statements in one session, read from stdin; an error does not stop it.
+    sess() { docker exec -i -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" "$1" "$CF_PSQL" -tA -X -v ON_ERROR_STOP=0; }
+    later() { awk -v a="$1" -v b="$2" 'BEGIN { print (a >= b) ? 1 : 0 }'; }
+    node_claims() { q "$HOST" "SELECT count(*) FROM coldfront.claims WHERE snowflake.get_node(ticket) = coldfront.node_id() AND iceberg_table LIKE '$1%';"; }
+    for t in cf_ct cf_cu; do
+        q "$HOST" "SELECT coldfront.create_iceberg_table('public','$t','[{\"name\":\"id\",\"type\":\"bigint\"}]'::jsonb);" >/dev/null 2>&1
+    done
+    for i in $(seq 1 80); do
+        [ "$(q "$p1" "SELECT count(*) FROM coldfront.tiered_views v WHERE v.relname IN ('cf_ct','cf_cu') AND to_regclass(format('%I.%I', v.schema_name, v.relname)) IS NOT NULL;")" = "2" ] && break
+        sleep 0.25
+    done
+    ref_t=$(q "$HOST" "SELECT iceberg_table FROM coldfront.tiered_views WHERE relname = 'cf_ct';")
+
+    # TC-174: a claim times out while another session holds the table's claim
+    # key. The session holds no advisory lock afterwards, and its next write
+    # clears what the timed-out attempt and an orphan planted on another table
+    # left on the node.
+    q "$HOST" "INSERT INTO coldfront.claims (iceberg_table, ticket) VALUES ('${ref_t}_tc174', snowflake.nextval());" >/dev/null
+    sess "$HOST" >/dev/null 2>&1 <<SQL &
+BEGIN;
+SELECT pg_advisory_xact_lock(hashtext('coldfront_claim:' || '$ref_t'));
+SELECT pg_sleep(4);
+COMMIT;
+SQL
+    a=$!
+    sleep 1
+    out=$(sess "$HOST" 2>&1 <<SQL
+SET statement_timeout = '1s';
+INSERT INTO cf_ct VALUES (1741);
+RESET statement_timeout;
+SELECT 'locks=' || count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid();
+SELECT pg_sleep(4);
+INSERT INTO cf_ct VALUES (1742);
+SQL
+)
+    wait "$a" 2>/dev/null
+    assert_eq "TC-174 the claim timed out as staged" "1" "$(echo "$out" | grep -c 'statement timeout')"
+    assert_eq "TC-174 a timed-out claim leaves no advisory lock" "0" "$(echo "$out" | sed -n 's/^locks=//p')"
+    assert_eq "TC-174 the session's next cold write lands" "1" "$(q "$HOST" "SELECT count(*) FROM cf_ct WHERE id = 1742;")"
+    assert_eq "TC-174 no claim is left on the node for either table" "0" "$(node_claims "$ref_t")"
+
+    # TC-175: one transaction writes cf_ct twice; a peer's write to cf_ct arrives
+    # between the two and stays behind the transaction's claim until COMMIT.
+    sess "$HOST" >"$TMPD/cf.175a" 2>&1 <<SQL &
+BEGIN;
+INSERT INTO cf_ct VALUES (1751);
+SELECT pg_sleep(3);
+INSERT INTO cf_ct VALUES (1752);
+SELECT pg_sleep(3);
+SELECT 'a_commit=' || extract(epoch FROM clock_timestamp());
+COMMIT;
+SQL
+    a=$!
+    sleep 1.5
+    tq 90 "$p1" "INSERT INTO cf_ct VALUES (1753);" >"$TMPD/cf.175b" 2>&1
+    p_done=$(date +%s.%N)
+    wait "$a" 2>/dev/null
+    a_commit=$(sed -n 's/^a_commit=//p' "$TMPD/cf.175a")
+    assert_eq "TC-175 a second write to the same table keeps the transaction's claim" "1" "$(later "$p_done" "$a_commit")"
+    assert_eq "TC-175 no write errored" "0" "$(cat "$TMPD"/cf.175? | grep -c ERROR)"
+    assert_eq "TC-175 all three writes landed" "3" "$(q "$HOST" "SELECT count(*) FROM cf_ct WHERE id BETWEEN 1751 AND 1753;")"
+
+    # TC-176: one transaction writes cf_cu, then cf_ct; a peer's write to cf_cu
+    # arrives between the two and stays behind the cf_cu claim until COMMIT.
+    sess "$HOST" >"$TMPD/cf.176a" 2>&1 <<SQL &
+BEGIN;
+INSERT INTO cf_cu VALUES (1761);
+SELECT pg_sleep(3);
+INSERT INTO cf_ct VALUES (1762);
+SELECT pg_sleep(3);
+SELECT 'a_commit=' || extract(epoch FROM clock_timestamp());
+COMMIT;
+SQL
+    a=$!
+    sleep 1.5
+    tq 90 "$p1" "INSERT INTO cf_cu VALUES (1763);" >"$TMPD/cf.176b" 2>&1
+    p_done=$(date +%s.%N)
+    wait "$a" 2>/dev/null
+    a_commit=$(sed -n 's/^a_commit=//p' "$TMPD/cf.176a")
+    assert_eq "TC-176 a write to a second table keeps the transaction's claim on the first" "1" "$(later "$p_done" "$a_commit")"
+    assert_eq "TC-176 no write errored" "0" "$(cat "$TMPD"/cf.176? | grep -c ERROR)"
+    assert_eq "TC-176 all three writes landed" "3" \
+        "$(q "$HOST" "SELECT (SELECT count(*) FROM cf_cu WHERE id IN (1761, 1763)) + (SELECT count(*) FROM cf_ct WHERE id = 1762);")"
+
+    # TC-177: the apply trigger fails while it defers a peer's claim. It runs in
+    # this session as it does under spock's apply (session_replication_role =
+    # replica); its FOR UPDATE on the smaller same-node claim times out behind a
+    # session holding that row and the table lock, and the session must hold no
+    # advisory lock afterwards.
+    own=$(q "$HOST" "WITH i AS (INSERT INTO coldfront.claims (iceberg_table, ticket) SELECT '$ref_t', snowflake.nextval() RETURNING ticket) SELECT ticket FROM i;")
+    peer_node=$(q "$p1" "SELECT coldfront.node_id();")
+    # One millisecond past now, carrying the peer's node id: a peer claim sorting after $own.
+    fake=$(q "$HOST" "SELECT ((snowflake.nextval() + (1::bigint << 22)) & ~(1023::bigint << 12)) | ($peer_node::bigint << 12);")
+    sess "$HOST" >/dev/null 2>&1 <<SQL &
+BEGIN;
+SELECT pg_advisory_xact_lock(hashtext('coldfront_iceberg:' || '$ref_t'));
+SELECT ticket FROM coldfront.claims WHERE ticket = $own FOR UPDATE;
+SELECT pg_sleep(4);
+COMMIT;
+SQL
+    a=$!
+    sleep 1
+    out=$(sess "$HOST" 2>&1 <<SQL
+SET session_replication_role = replica;
+SET lock_timeout = '500ms';
+INSERT INTO coldfront.claims (iceberg_table, ticket) VALUES ('$ref_t', $fake);
+RESET lock_timeout;
+SET session_replication_role = origin;
+SELECT 'locks=' || count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid();
+SQL
+)
+    wait "$a" 2>/dev/null
+    assert_eq "TC-177 the apply trigger failed while deferring, as staged" "1" "$(echo "$out" | grep -c 'lock timeout')"
+    assert_eq "TC-177 a failed apply trigger leaves no advisory lock" "0" "$(echo "$out" | sed -n 's/^locks=//p')"
+    q "$HOST" "DELETE FROM coldfront.claims WHERE ticket = $own;" >/dev/null
+
+    # TC-178: after a cold write as an app role, its session has no way into the
+    # loopback: no named dblink connection is left open in it, and
+    # coldfront._loopback is not executable by it.
+    q "$HOST" "DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'cf_tc178') THEN CREATE ROLE cf_tc178 NOSUPERUSER LOGIN; END IF; END \$\$;" >/dev/null 2>&1
+    q "$HOST" "SELECT coldfront.grant_app_access('cf_tc178');" >/dev/null 2>&1
+    out=$(sess "$HOST" 2>&1 <<'SQL'
+SET ROLE cf_tc178;
+INSERT INTO cf_ct VALUES (1781);
+SELECT to_regproc('public.dblink_get_connections') IS NOT NULL AS has_dblink \gset
+\if :has_dblink
+SELECT 'named=' || count(*) FROM unnest(public.dblink_get_connections()) c;
+\else
+SELECT 'named=0';
+\endif
+SELECT 'can_exec=' || has_function_privilege('coldfront._loopback(text)', 'execute');
+SQL
+)
+    assert_eq "TC-178 the app role's cold write landed" "1" "$(q "$HOST" "SELECT count(*) FROM cf_ct WHERE id = 1781;")"
+    assert_eq "TC-178 no named loopback connection is left in an app role's session" "0" "$(echo "$out" | sed -n 's/^named=//p')"
+    assert_eq "TC-178 an app role cannot execute the loopback" "false" "$(echo "$out" | sed -n 's/^can_exec=//p')"
+
+    # TC-179: a writer is terminated while its claim waits on a row the claim's
+    # reap must delete. The claim statement finishes before that writer's
+    # backend exits, so the next writer on the node reaps the dead writer's
+    # claim instead of waiting behind it, and no claim is left afterwards.
+    own=$(q "$HOST" "WITH i AS (INSERT INTO coldfront.claims (iceberg_table, ticket) SELECT '$ref_t', snowflake.nextval() RETURNING ticket) SELECT ticket FROM i;")
+    sess "$HOST" >/dev/null 2>&1 <<SQL &
+BEGIN;
+SELECT ticket FROM coldfront.claims WHERE ticket = $own FOR UPDATE;
+SELECT pg_sleep(4);
+COMMIT;
+SQL
+    a=$!
+    sleep 1
+    sess "$HOST" >/dev/null 2>&1 <<'SQL' &
+SET application_name = 'cf_tc179_writer';
+INSERT INTO cf_ct VALUES (1791);
+SQL
+    local w=$!
+    sleep 1
+    q "$HOST" "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'cf_tc179_writer';" >/dev/null
+    tq 60 "$HOST" "INSERT INTO cf_ct VALUES (1792);" >"$TMPD/cf.179" 2>&1; rc=$?
+    wait "$a" "$w" 2>/dev/null
+    assert_eq "TC-179 the next writer is not stranded behind a terminated writer's claim" "0" "$rc"
+    assert_eq "TC-179 the next writer's row landed" "1" "$(q "$HOST" "SELECT count(*) FROM cf_ct WHERE id = 1792;")"
+    assert_eq "TC-179 no claim is left on the node" "0" "$(node_claims "$ref_t")"
+
+    # TC-180: every loopback session on $HOST dies between two cold writes of one
+    # session. The next write reconnects instead of failing, the session holds no
+    # advisory lock afterwards, and a peer's claim still gets $HOST's ack.
+    loop_app=$(q "$HOST" "SELECT substring(current_setting('coldfront.dblink_self') from 'application_name=([^ ]+)');")
+    out=$(sess "$HOST" 2>&1 <<SQL
+INSERT INTO cf_ct VALUES (1801);
+SELECT 'killed=' || count(*) FROM (SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = '$loop_app') k;
+SELECT pg_sleep(0.5);
+INSERT INTO cf_ct VALUES (1802);
+SELECT 'locks=' || count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid();
+INSERT INTO cf_ct VALUES (1803);
+SQL
+)
+    assert_gt "TC-180 the node's loopback sessions were killed" "0" "$(echo "$out" | sed -n 's/^killed=//p')"
+    assert_eq "TC-180 cold writes after the loopback died reconnect instead of failing" "0" "$(echo "$out" | grep -c ERROR)"
+    assert_eq "TC-180 the session holds no advisory lock once its loopback died" "0" "$(echo "$out" | sed -n 's/^locks=//p')"
+    tq 60 "$p1" "INSERT INTO cf_ct VALUES (1804);" >"$TMPD/cf.180" 2>&1; rc=$?
+    assert_eq "TC-180 a peer's cold write still gets the node's ack" "0" "$rc"
+    assert_eq "TC-180 all four writes landed" "4" "$(q "$HOST" "SELECT count(*) FROM cf_ct WHERE id BETWEEN 1801 AND 1804;")"
+    assert_eq "TC-180 no claim is left on the node" "0" "$(node_claims "$ref_t")"
+
+    for t in cf_ct cf_cu; do
+        q "$HOST" "SELECT coldfront.drop_iceberg_table('public','$t', true);" >/dev/null 2>&1
+    done
+    rm -f "$TMPD"/cf.* 2>/dev/null
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Story (mesh + tiered) — cross-node tiered: a tiered table provisioned on db1
 # is readable AND writable from peers. Hot rows arrive via Spock replication of
 # the _events partitions; cold rows via the shared Lakekeeper catalog; the
@@ -5364,6 +5573,7 @@ story_drop_iceberg_table   # both modes, purge and keep-files (own throwaway tab
 [ "$MESH" = 1 ] && [ "$MODE" = decoupled ] && story_mesh   # tiered+mesh runs story_mesh_tiered (above)
 [ "$MESH" = 1 ] && story_mesh_multiwriter   # >1 cold writer/node cross-node (tiered: events, decoupled: iceonly)
 [ "$MESH" = 1 ] && story_mesh_reaper        # orphan claims/acks reaped on the claim, apply and poke paths
+[ "$MESH" = 1 ] && story_mesh_claim_failures  # a failed claim step leaves no lock, claim or open loopback
 [ -n "$STANDBY" ]    && story_standby_reads
 
 summary

@@ -28,9 +28,26 @@ and this project adheres to
 - `coldfront.drop_iceberg_table()` refuses a relation adopted read-only,
   and builds its catalog DDL from the stored Iceberg reference rather than
   from the PostgreSQL schema and table names.
+- The mesh bakery no longer needs the `dblink` extension. Claims, acks,
+  releases and orphan reaping run over a libpq loopback connection that the
+  extension opens from `coldfront.dblink_self`.
 
 ### Fixed
 
+- After one cold write on a mesh, an app role could run any SQL as the
+  loopback connection's user through the `coldfront_self` dblink connection
+  the claim left open in its session. An app role can no longer reach the
+  loopback.
+- A cold write on a mesh that failed or was cancelled during its claim left
+  an advisory lock held for the rest of the session, and the node's other
+  writers on that table waited on it. Every lock the claim takes now ends
+  with a transaction.
+- A mesh session whose loopback connection had died failed every later cold
+  write. The loopback now reconnects.
+- A transaction that made two cold writes to the same table on a mesh hung
+  on its own first claim. A transaction now holds one claim per table.
+- A writer terminated in the middle of its claim could leave a claim that
+  the node's next writer on that table waited behind indefinitely.
 - On a server that has `output_plugin_libraries` (PostgreSQL 16.15, 17.11
   and 18.6 in pgEdge's builds), no Spock subscription could create its
   replication slot, because the setting's default leaves out

@@ -1,7 +1,7 @@
 ------------------------------- MODULE Bakery -------------------------------
 (***************************************************************************)
 (* The decoupled-mode bakery model.  It models the real-world asymmetry of *)
-(* Spock replication (each writer has its own local view of                *)
+(* Spock replication (each node has its own local view of                  *)
 (* `coldfront.claims`; INSERTs propagate via an explicit Apply step) AND   *)
 (* the Ricart-Agrawala (1981) optimisation of Lamport's 1978 distributed   *)
 (* mutual exclusion algorithm that compensates for that asymmetry.         *)
@@ -53,12 +53,12 @@
 (*     (Bakery_live.cfg) -- the dropped-ack wedge.                     *)
 (***************************************************************************)
 (* Execution privilege (protocol-neutral).  In the implementation the       *)
-(* coordination functions _claim_iceberg_lock and _release_iceberg_lock are  *)
-(* SECURITY DEFINER (search_path pinned; both are fully schema-qualified), so *)
+(* coordination function _claim_iceberg_lock is SECURITY DEFINER             *)
+(* (search_path pinned; fully schema-qualified), so                          *)
 (* a non-superuser writer drives the protocol with the SAME privilege as a   *)
 (* superuser: the pg_stat_replication alive-check sees every walsender (a     *)
 (* non-superuser INVOKER would see none -> wrongly rule all peers dead ->     *)
-(* skip acks -> the very race NoLakekeeperConflict forbids), and the dblink   *)
+(* skip acks -> the very race NoLakekeeperConflict forbids), and the loopback *)
 (* claim-INSERT + coldfront.claims / spock.local_node reads succeed.  The     *)
 (* C-level _enqueue_release only appends a ticket to an in-memory queue (no   *)
 (* privileged op), and the release itself runs in the C XactCallback's own    *)
@@ -129,12 +129,12 @@ CONSTANTS Writers,
                           \* (decide, then separately write) that drops acks — the bug.
                           \* The PROTOCOL (R-A) is identical either way; only the
                           \* implementation's atomicity differs.
-          Reaper,         \* the orphan reaper in coldfront._claim_iceberg_lock: TRUE
+          Reaper,         \* the orphan reaper in coldfront._insert_claim: TRUE
                           \* deletes same-node claims whose owner is gone in the SAME
                           \* statement that inserts our claim. Sound because the holder
                           \* of the node-local advisory xact lock is us: PG released the
                           \* dead owner's lock at backend exit, so a same-node claim on
-                          \* this table has no live owner. FALSE = today's code, where
+                          \* this table has no live owner. FALSE = no reaper, where
                           \* such a claim strands every later same-node writer.
           NodeRetries,    \* TRUE restricts the Crasher to writers whose node still has
                           \* a writer that has not claimed yet, so the crashed node is
@@ -147,7 +147,7 @@ CONSTANTS Writers,
                           \* claim around its registry preflight and INSERT. TRUE =
                           \* the registration happens under the claim, so two nodes
                           \* adopting one Iceberg table are serialised and the second
-                          \* reads the first's registry row. FALSE = today's code,
+                          \* reads the first's registry row. FALSE = no claim,
                           \* where each node's preflight reads only its own registry
                           \* and both pass inside the replication window.
           SameNodeLock    \* coldfront._claim_iceberg_lock's node-local advisory xact
@@ -219,7 +219,7 @@ variables
   \* local view, which is what makes the registration racy without a claim.
   \* Replication is modelled at Release rather than by a separate applier step:
   \* the registry row commits in the writer's MAIN transaction, the claim DELETE
-  \* and the drained ack ride the dblink transaction the COMMIT callback opens
+  \* and the drained ack ride the loopback transaction the COMMIT callback opens
   \* afterwards, and spock applies one origin's transactions in commit order. So
   \* every node has the row before any ack that this writer's release produces.
   registered = [nd \in Nodes |-> {}];
@@ -343,7 +343,7 @@ begin
     end if;
 
   Preflight:
-    \* _adopt_preflight with NO claim held, which is today's adoption. It reads
+    \* _adopt_preflight with NO claim held (AdoptClaims FALSE). It reads
     \* this node's own registry only, so a peer's row still in flight is invisible
     \* and every racing node's preflight passes.
     await Live(self);
@@ -359,10 +359,11 @@ begin
     \* claim is in the bakery at a time (node-local, so instant/synchronous).
     \* Reaper: a same-node claim whose writer has crashed holds no advisory lock
     \* (PG drops it at backend exit), so it does not block us and we delete it in
-    \* the SAME step that inserts our own claim -- the single dblink statement
-    \* `WITH orphan AS (DELETE ... RETURNING ticket), acks AS (DELETE ... USING
-    \* orphan) INSERT ...`. The orphan DELETE fires _on_claim_release, so a
-    \* deferral queued behind the orphan is forwarded rather than stranded.
+    \* the SAME step that inserts our own claim -- the single statement in the
+    \* loopback transaction coldfront._insert_claim, `WITH orphan AS (DELETE ...
+    \* RETURNING ticket), acks AS (DELETE ... USING orphan) INSERT ...`. The
+    \* orphan DELETE fires _on_claim_release, so a deferral queued behind the
+    \* orphan is forwarded rather than stranded.
     await Live(self) /\ \E p \in Writers : p # self /\ Live(p);
     await next_ticket <= MaxTickets;
     await (~ SameNodeLock)
@@ -451,7 +452,7 @@ begin
     \* The C XactCallback's claim DELETE: remove my claim from every node view.
     \* The callback runs on XACT_EVENT_COMMIT and XACT_EVENT_ABORT alike. On
     \* commit the main transaction's registry INSERT is already committed here
-    \* and the DELETE below rides a later dblink transaction; spock applies one
+    \* and the DELETE below rides a later loopback transaction; spock applies one
     \* origin's transactions in commit order, so the row reaches every node ahead
     \* of any ack this release goes on to drain: modelled as the row landing on
     \* all nodes in this step. On abort the INSERT never commits, and a writer
@@ -494,10 +495,12 @@ begin
     while TRUE do
       \* ApplyDecide — apply one claim from a src NODE into a dst NODE's local
       \* view and DECIDE, under the read snapshot, whether to defer or ack.
-      \* Mirrors _on_claim_apply reading coldfront.claims (the shared advisory
-      \* lock is dropped after this SELECT) and CHOOSING defer-vs-ack — but NOT
-      \* yet writing it.  ap_behind is the smallest same-node pending claim the
-      \* deferral keys to (ORDER BY ticket LIMIT 1 in the SQL).
+      \* Mirrors _on_claim_apply reading coldfront.claims and CHOOSING
+      \* defer-vs-ack, but NOT yet writing it; a separate step, so this model
+      \* allows every interleaving the SQL does (it holds the shared advisory
+      \* lock to the end of the apply transaction, which allows fewer).
+      \* ap_behind is the smallest same-node pending claim the deferral keys to
+      \* (ORDER BY ticket LIMIT 1 in the SQL).
       with src \in Nodes, dst \in Nodes do
         await dst # src /\ NodeLive(dst);
         with c \in { x \in claims[src] : x \notin claims[dst] /\ x.n = src } do
@@ -535,7 +538,7 @@ begin
       \* The defer/ack write.
       \*   ~SafeAcks: write the STALE ApplyDecide verdict.  The holder may have
       \*     released since, so the deferral is written behind a gone claim and is
-      \*     deleted-unforwarded / orphaned — the dropped-ack bug.  Models today's
+      \*     deleted-unforwarded / orphaned: the dropped-ack bug.  Models a
       \*     non-atomic "decide (lock dropped) then separately INSERT".
       \*   SafeAcks: re-evaluate R-A's defer rule ATOMICALLY against the CURRENT
       \*     claim and write in the same step.  In SQL this is a single
@@ -602,7 +605,7 @@ begin
     while crash_budget > 0 do
       either
         with w \in Writers do
-          \* Release, DrainForward and DrainDelete are ONE dblink transaction in
+          \* Release, DrainForward and DrainDelete are ONE loopback transaction in
           \* the real code: the AFTER DELETE trigger runs inside the claim
           \* DELETE's own statement. A crash inside it aborts the DELETE too,
           \* which is a crash AT Release (allowed). A crash between the labels

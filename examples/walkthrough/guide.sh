@@ -475,9 +475,9 @@ mesh_bringup() {
 
     start_spinner "[5/6] Installing ColdFront + forming the Spock mesh"
     # Extensions on both nodes, one per call (a chained CREATE aborts the rest on
-    # the first failure). dblink+snowflake+spock are the mesh substrate.
+    # the first failure). snowflake+spock are the mesh substrate.
     for port in "$MESH_PG1_PORT" "$MESH_PG2_PORT"; do
-        for ext in dblink snowflake spock pg_duckdb coldfront; do
+        for ext in snowflake spock pg_duckdb coldfront; do
             mpg "$port" "CREATE EXTENSION IF NOT EXISTS $ext;" >/dev/null 2>&1
         done
     done
@@ -1386,6 +1386,7 @@ reset_demos() {
     ensure_single_stack
     teardown_tiered       # events + _events + registry/watermark + Iceberg cold table
     teardown_decoupled    # events_lake + registry + Iceberg table
+    teardown_adopted      # orders + registry + the lake.orders Iceberg table
     pg "DROP TABLE IF EXISTS part_demo CASCADE;" >/dev/null 2>&1 || true   # plain table, no cold tier
     info "Demo tables dropped."
 }

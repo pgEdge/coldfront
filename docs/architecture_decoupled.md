@@ -519,8 +519,11 @@ PG nodes pointing at the same Lakekeeper endpoint and S3 bucket.
   Per-writer flow:
 
   1. `snowflake.nextval()` - fresh globally-unique ticket.
-  2. Insert `(iceberg_table, ticket)` into `coldfront.claims` via
-     dblink (autonomous tx; replicates async via Spock).
+  2. Insert `(iceberg_table, ticket)` into `coldfront.claims` over
+     the node's loopback, a libpq connection the extension's C code
+     keeps and no SQL can reach (autonomous tx; replicates async via
+     Spock). The ticket is taken inside that transaction, under the
+     table's claim key, and every lock it takes ends with it.
   3. **Wait until both** (a) no same-node writer has a smaller
      ticket on this table, and (b) every alive peer has acked the
      ticket (its row appears in `coldfront.claim_acks`).
@@ -534,6 +537,10 @@ PG nodes pointing at the same Lakekeeper endpoint and S3 bucket.
      `coldfront.deferred_acks` for that ticket, emitting any acks
      the node had been holding back.
 
+  A transaction takes one claim per table and holds it until it ends,
+  so a second cold write to the same table in that transaction rides
+  the first claim.
+
   Peer-side, when Spock applies an incoming claim INSERT, an
   `ENABLE REPLICA` trigger (`coldfront._on_claim_apply`) decides:
 
@@ -543,8 +550,8 @@ PG nodes pointing at the same Lakekeeper endpoint and S3 bucket.
     `coldfront.deferred_acks` to emit later when the smaller claim is
     released).
   - Otherwise → ack immediately (INSERT into `coldfront.claim_acks`
-    via dblink, so the row is tagged with the local node as origin
-    and Spock replicates it back to the originator).
+    over the loopback, so the row is tagged with the local node as
+    origin and Spock replicates it back to the originator).
 
   The same trigger fires on UPDATE, for the waiter's poke described
   under *Orphan reaping*.
@@ -574,19 +581,21 @@ PG nodes pointing at the same Lakekeeper endpoint and S3 bucket.
   timeout, scheduler or background worker:
 
   - **Claim path.** `_claim_iceberg_lock` already holds the lock for
-    its own table, and tries (session-level, released at once) the lock
-    of every other table this node has a claim on. The dblink statement
-    that inserts the new claim first deletes every same-node claim on
-    those tables (and, after a restart, any claim from before
-    `pg_postmaster_start_time()`) together with their acks, so any cold
-    write on the node clears every orphan the node left. The DELETE
-    fires the release trigger, which forwards whatever peers had
+    its own table. Its claim transaction on the loopback
+    (`_insert_claim`) tries the lock of every other table this node
+    has a claim on; a lock the claimant's own transaction holds makes
+    the try fail, so a transaction never reaps its own claims. It then
+    deletes every same-node claim on those tables (and, after a
+    restart, any claim from before `pg_postmaster_start_time()`)
+    together with their acks before inserting the new claim, so any
+    cold write on the node clears every orphan the node left. The
+    DELETE fires the release trigger, which forwards whatever peers had
     deferred behind the orphan.
   - **Apply path.** When a peer's claim arrives and a smaller same-node
     claim exists, `_on_claim_apply` tries the lock
     (`pg_try_advisory_xact_lock`). Success means no live local writer,
-    so it deletes the same-node claims and their acks through dblink
-    and acks the arrival instead of deferring it. A live writer's
+    so it deletes the same-node claims and their acks through the
+    loopback and acks the arrival instead of deferring it. A live writer's
     lock makes the try fail at once, and the trigger defers as before.
   - **Waiter's poke.** A peer that deferred while the lock was held,
     whose holder then vanished, sees no further event. So a writer in
@@ -613,16 +622,16 @@ PG nodes pointing at the same Lakekeeper endpoint and S3 bucket.
   slow/lossy WAN links) is implicitly treated as already-acked. An
   *alive* peer that hasn't acked is either deferring (R-A's defer
   rule, legitimate) or about to ack - either way, waiting is
-  correct. Local same-node backends are trusted; a crashed local
-  writer's claim is released by PG's xact rollback via the C
-  XactCallback in
-  [extension/coldfront/src/coldfront.c](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/src/coldfront.c).
+  correct. A same-node claim is released by the C XactCallback in
+  [extension/coldfront/src/coldfront.c](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/src/coldfront.c)
+  at commit or abort, and one whose writer is gone is removed by the
+  reaper.
 
   The mechanics live in [extension/coldfront/coldfront--1.0.sql](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/coldfront--1.0.sql)
-  (`_claim_iceberg_lock`, `_release_iceberg_lock`,
+  (`_claim_iceberg_lock`, `_insert_claim`,
   `_on_claim_apply`, `_on_claim_release`, `_exec_iceberg_with_claim`)
-  and the C-side rewrite in [extension/coldfront/src/coldfront.c](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/src/coldfront.c)
-  (`cold_exec_call`).
+  and the C-side rewrite and loopback in [extension/coldfront/src/coldfront.c](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/src/coldfront.c)
+  (`cold_exec_call`, `cf_loopback_exec`).
 
   Because every commit is uncontested, the duckdb-iceberg writer
   never has to deal with a 409 - no rebase-retry loop needed at
@@ -630,10 +639,11 @@ PG nodes pointing at the same Lakekeeper endpoint and S3 bucket.
   bakery sidesteps the requirement.)
 
 - **DDL replication.** Spock's `ddl_sql` repset replicates
-  `CREATE/ALTER/DROP` of the wrapper view, but the
-  `coldfront.tiered_views` registry row does not replicate - run
-  `coldfront.create_iceberg_table()` (idempotent, name-keyed) on
-  each node to arm the hook there.
+  `CREATE/ALTER/DROP` of the wrapper view, and the `default` repset
+  replicates the `coldfront.tiered_views` registry row (see
+  [Distributed setup](usage.md#distributed-setup-3-node-mesh-decoupled-mode)),
+  so one node provisions the table and replication arms every peer's
+  hook.
 
 ### Throughput characterisation
 
@@ -667,7 +677,7 @@ snowflake.node = 1     # node1
 # snowflake.node = 2   # node2
 # snowflake.node = 3   # node3
 
-# DSN for the bakery's autonomous-tx claim/ack dblink calls (unix socket).
+# DSN of the loopback that runs the bakery's autonomous claim/ack/release statements (unix socket).
 coldfront.dblink_self = 'host=/tmp dbname=coldfront user=coldfront application_name=coldfront_dblink'
 
 # Optional — peer-liveness window for R-A's dead-peer escape; a peer
