@@ -119,7 +119,9 @@ RUN git clone --filter=blob:none --no-checkout https://github.com/duckdb/duckdb-
  && /build/vcpkg/bootstrap-vcpkg.sh -disableMetrics
 COPY docker/iceberg-azure-extension-config-v15.cmake /build/duckdb-iceberg/extension_config.cmake
 # The bakery-aware-commit-refresh patch (v1.5 port) — ESSENTIAL: coldfront's
-# no-409 guarantee for concurrent cold writers. git apply --check fails the
+# no-409 guarantee for concurrent cold writers, and the as-of-start rewind that
+# lets writers queued behind the first commit into a never-written table
+# proceed. git apply --check fails the
 # build loudly on patch rot instead of silently shipping stock iceberg (which
 # 409s under concurrency). See DUCKDB_1.5_PATCHED.md + the patch header.
 COPY docker/iceberg-bakery-aware-commit-refresh-v15.patch /tmp/iceberg-bakery-v15.patch

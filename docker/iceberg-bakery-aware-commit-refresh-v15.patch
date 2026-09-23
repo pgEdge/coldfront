@@ -41,6 +41,18 @@
 # list: the commit runs on a fresh connection with no secret, and under
 # catalog credential vending there is no persistent secret to fall back on.
 #
+# The load-side hunk (iceberg_table_information.cpp, IcebergTableInformation::
+# Copy). coldfront sets iceberg_use_metadata_log off, because the log read
+# needs a storage credential the session does not have under vending. Without
+# the log, a transaction that first touches a table after another writer
+# committed to it is rewound to the snapshot that was current when the
+# transaction began, and upstream throws "already outdated" when there was
+# none: every writer queued on the table lock behind the first commit into a
+# never-written table. The hunk returns the as-of-start state, an empty
+# table, instead. The write stages against it and the commit-time refresh
+# above lands it on the live head, exactly as a write staged before the
+# bakery ticket does.
+#
 diff --git a/src/catalog/rest/transaction/iceberg_transaction.cpp b/src/catalog/rest/transaction/iceberg_transaction.cpp
 index 6901b08e..b057c3d8 100644
 --- a/src/catalog/rest/transaction/iceberg_transaction.cpp
@@ -231,3 +243,26 @@ index c48f5ea5..04232551 100644
  
  public:
  	int32_t initial_schema_id;
+
+diff --git a/src/catalog/rest/catalog_entry/table/iceberg_table_information.cpp b/src/catalog/rest/catalog_entry/table/iceberg_table_information.cpp
+index eed00a8..746b4fb 100644
+--- a/src/catalog/rest/catalog_entry/table/iceberg_table_information.cpp
++++ b/src/catalog/rest/catalog_entry/table/iceberg_table_information.cpp
+@@ -651,8 +651,15 @@ IcebergTableInformation IcebergTableInformation::Copy(IcebergTransaction &iceber
+ 			IcebergSnapshotScanInfo snapshot_info;
+ 			snapshot_info = ret.table_metadata.GetSnapshot(snapshot_lookup);
+ 			if (!snapshot_info.snapshot) {
+-				throw TransactionException("Table %s is already outdated. Please restart your transaction",
+-				                           GetTableKey());
++				// The table had no snapshot when this transaction began, so its state
++				// as of that start is the empty table: return that instead of
++				// throwing. A write staged against it commits through the refresh in
++				// IcebergTransaction::DoTableUpdates, which re-derives the parent from
++				// the live head, the same way a write staged before the bakery ticket
++				// does.
++				ret.table_metadata.has_current_snapshot = false;
++				ret.table_metadata.last_sequence_number = 0;
++				return ret;
+ 			}
+ 
+ 			auto &snapshot = snapshot_info.snapshot;

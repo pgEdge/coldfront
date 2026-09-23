@@ -25,7 +25,7 @@ each before applying, failing the build loudly on patch rot.
 
 ---
 
-## 1. The agnostic cold-write code path (bakery patch is a *performance* feature)
+## 1. The agnostic cold-write code path (the bakery patch never changes it)
 
 ColdFront has **one** cold-write code path; the bakery patch never changes it.
 `coldfront._exec_iceberg_with_claim` (the single chokepoint for decoupled
@@ -65,10 +65,12 @@ END IF;
 
 ## 2. What the bakery patch does (v1.5)
 
-`docker/iceberg-bakery-aware-commit-refresh-v15.patch`, three files across
+`docker/iceberg-bakery-aware-commit-refresh-v15.patch`, four files: three across
 `src/catalog/rest/transaction/` and `src/include/catalog/rest/transaction/`
 (no public API/ABI change; the internal cache/refresh helpers gain an explicit
-`scan_context`). The problem: ColdFront
+`scan_context`), plus one hunk in
+`src/catalog/rest/catalog_entry/table/iceberg_table_information.cpp` (item 5).
+The problem: ColdFront
 uploads parquet *outside* the R-A bakery and takes the ticket only for the commit
 POST, so by POST time a peer may have advanced the catalog head — a commit
 against *session-cached* metadata fails `assert-ref-snapshot-id` (HTTP **409**),
@@ -101,6 +103,17 @@ the ticket is held):
    transaction during the commit callback. So the cache/refresh helpers take an
    explicit `scan_context`. Using the wrong context throws
    `TransactionContext::ActiveTransaction called without active transaction`.
+5. **Load side** (`IcebergTableInformation::Copy`): ColdFront sets
+   `iceberg_use_metadata_log` off, because the log read has no storage
+   credential under vending. Without the log, a transaction that first touches
+   a table another writer committed to since the transaction began is rewound
+   to the snapshot current at that start, and upstream throws `already
+   outdated` when there was none. That is every writer queued on the table
+   lock behind the first commit into a never-written table in the stock
+   ordering, and the millisecond between the lazy attach and staging in the
+   async one. The hunk returns the as-of-start state, an empty table
+   (`has_current_snapshot = false`, `last_sequence_number = 0`), and items 1 to
+   3 then land the write on the live head.
 
 **Formally verified** before the code (the project rule): `docs/formal/Bakery.tla`
 models the async ordering; `Bakery_async.cfg` (patched) holds
