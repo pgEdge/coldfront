@@ -96,7 +96,19 @@ done
 for a in $NODES; do for b in $NODES; do [ "$a" = "$b" ] && continue
     m "$a" "SELECT spock.sub_create('sub_${a}_from_${b}','host=$b user=coldfront dbname=coldfront port=5432');" >/dev/null 2>&1
 done; done
-for n in $NODES; do m "$n" "SELECT spock.sub_wait_for_sync(sub_name) FROM spock.subscription;" >/dev/null 2>&1; done
+# A subscription that never starts leaves sub_wait_for_sync waiting forever, so
+# the wait is bounded and a timeout reports every subscription's status and the
+# node's latest server errors instead of hanging the run.
+for n in $NODES; do
+    if ! m "$n" "SET statement_timeout = '120s'; SELECT spock.sub_wait_for_sync(sub_name) FROM spock.subscription;" >/dev/null; then
+        echo "spock bootstrap FAILED: $n's subscriptions did not sync within 120 s"
+        for s in $NODES; do
+            echo "  $s: $(m "$s" "SELECT string_agg(subscription_name || '=' || status, ' ') FROM spock.sub_show_status();")"
+            docker exec "coldfront-${s}-1" sh -c 'ls -t "$PGDATA"/log/*.log 2>/dev/null | head -1 | xargs -r grep -h -E "ERROR|FATAL" | tail -3' | sed 's/^/    /'
+        done
+        exit 1
+    fi
+done
 subs=$(m db1 "SELECT count(*) FROM spock.subscription;")
 [ "$subs" = 2 ] || { echo "spock bootstrap FAILED: db1 has '$subs' subscriptions (expected 2) — mesh not formed"; exit 1; }
 

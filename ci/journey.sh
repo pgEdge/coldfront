@@ -559,10 +559,10 @@ EOSQL
 
     # The fixture's partition spec is real, and writes through the adopted view
     # honour it: each customer's files land under its own partition directory.
-    local ALOC; ALOC=$(curl -s "http://${LK_IP}:8181/catalog/v1/${ADOPT_WH}/namespaces/lake/tables/orders" \
-                        | grep -oE '"location":"[^"]+"' | head -1 | cut -d'"' -f4)
+    # Counted through the table's own metadata scan, which runs with the table's
+    # credentials, so it works under credential vending as well as static keys.
     assert_gt "TC-167: data files land under partition directories" 0 \
-        "$(q "$HOST" "SELECT coldfront.ensure_attached(); SELECT r['n'] FROM duckdb.query('SELECT count(*) AS n FROM glob(''$ALOC/data/customer=initech/*'')') AS t(r);" | tail -1)"
+        "$(q "$HOST" "SELECT coldfront.ensure_attached(); SELECT r['n'] FROM duckdb.query('SELECT count(*) AS n FROM iceberg_metadata(''ice.lake.orders'') WHERE file_path LIKE ''%/data/customer=initech/%''') AS t(r);" | tail -1)"
 
     # TC-169: p_types restores a type Iceberg cannot record, and only where the
     # override matches what the catalog actually stores. Both go through a fresh
@@ -4945,6 +4945,7 @@ story_duckdb_spill_concurrency() {
     for i in 1 2 3 4; do
         ( qf "$HOST" >"$TMPD/spill-$i.out" 2>&1 <<'EOSQL'
 SET duckdb.max_memory = '150MB';
+SELECT current_setting('duckdb.temporary_directory');
 SELECT r['s']::bigint AS s
   FROM duckdb.query($$SELECT sum(g)::BIGINT AS s
                         FROM (SELECT i % 3000000 AS g, string_agg(repeat('y',100)) AS pad
@@ -4959,12 +4960,13 @@ EOSQL
     # the backend that wrote them: proof pg_duckdb used the path coldfront
     # assigned, not merely that the GUC reads back nicely.
     seen=$(docker exec "$HOST" bash -c "sort -u /tmp/cf_spillwatch.log 2>/dev/null | grep -c '/[0-9][0-9]*/duckdb_temp_'")
-    pids=$(docker exec "$HOST" bash -c "sed -n 's#.*/\([0-9][0-9]*\)/duckdb_temp_.*#\1#p' /tmp/cf_spillwatch.log 2>/dev/null | sort -u | wc -l")
     docker exec "$HOST" bash -c "rm -f /tmp/cf_spillwatch.log /tmp/cf_spillwatch.stop" 2>/dev/null
     assert_eq "TC-153: DuckDB spilled into per-backend directories" "yes" \
         "$([ "${seen:-0}" -gt 0 ] && echo yes || echo no)"
-    assert_eq "TC-153: concurrent spills went to more than one directory" "yes" \
-        "$([ "${pids:-0}" -ge 2 ] && echo yes || echo no)"
+    # Each session reports the directory its backend spills into; four sessions,
+    # four directories.
+    assert_eq "TC-153: each concurrent session spills into its own directory" "4" \
+        "$(grep -h '^/' "$TMPD"/spill-*.out 2>/dev/null | sort -u | wc -l)"
 
     bad=0
     for i in 1 2 3 4; do
