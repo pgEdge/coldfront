@@ -446,16 +446,18 @@ begin
 
   Release:
     \* The C XactCallback's claim DELETE: remove my claim from every node view.
-    \* The callback runs on XACT_EVENT_COMMIT, so the main transaction's registry
-    \* INSERT is already committed here and the DELETE below rides a later dblink
-    \* transaction. spock applies one origin's transactions in commit order, so
-    \* the row reaches every node ahead of any ack this release goes on to drain:
-    \* modelled as the row landing on all nodes in this step. A writer that
-    \* crashes before this point never commits, so it never registers anywhere.
+    \* The callback runs on XACT_EVENT_COMMIT and XACT_EVENT_ABORT alike. On
+    \* commit the main transaction's registry INSERT is already committed here
+    \* and the DELETE below rides a later dblink transaction; spock applies one
+    \* origin's transactions in commit order, so the row reaches every node ahead
+    \* of any ack this release goes on to drain: modelled as the row landing on
+    \* all nodes in this step. On abort the INSERT never commits, and a writer
+    \* that crashes before this point never reaches it, so only a committed
+    \* writer registers anywhere.
     await Live(self);
     claims := [nd \in Nodes |->
                 claims[nd] \ {[w |-> self, t |-> my_ticket, n |-> Nd(self)]}];
-    if my_pf then
+    if my_pf /\ decision[self] = "committed" then
       registered := [nd \in Nodes |-> registered[nd] \cup {self}];
     end if;
 
@@ -615,7 +617,7 @@ begin
 end process;
 
 end algorithm; *)
-\* BEGIN TRANSLATION (chksum(pcal) = "5f991957" /\ chksum(tla) = "40456e54")
+\* BEGIN TRANSLATION (chksum(pcal) = "6ac38723" /\ chksum(tla) = "7008820c")
 VARIABLES pc, next_ticket, claims, acks, deferred, iceberg, decision, crashed, 
           crash_budget, registered
 
@@ -860,7 +862,7 @@ Release(self) == /\ pc[self] = "Release"
                  /\ Live(self)
                  /\ claims' = [nd \in Nodes |->
                                 claims[nd] \ {[w |-> self, t |-> my_ticket[self], n |-> Nd(self)]}]
-                 /\ IF my_pf[self]
+                 /\ IF my_pf[self] /\ decision[self] = "committed"
                        THEN /\ registered' = [nd \in Nodes |-> registered[nd] \cup {self}]
                        ELSE /\ TRUE
                             /\ UNCHANGED registered
