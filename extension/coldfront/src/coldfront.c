@@ -226,12 +226,17 @@ static int  coldfront_vector_nprobe = 0;
  * postgresql.conf, where they
  * ride physical replication unchanged. local_pg_dsn is GUC_SUPERUSER_ONLY too:
  * it can carry libpq credentials, so non-superusers must not read it back.
- * The values are read SQL-side via current_setting(); these backing vars exist
- * only to anchor the GUC definitions.
+ * dblink_self is the DSN of the bakery's loopback, which runs claim statements
+ * as its own user, so it is PGC_SUSET for the same reason: a role that could
+ * set it would choose that user and its startup options. It stays readable
+ * because the invoker-rights _bakery_armed() reads it on every cold write.
+ * The values are read through current_setting() or GetConfigOption(); these
+ * backing vars exist only to anchor the GUC definitions.
  */
 static char *coldfront_warehouse          = NULL;
 static char *coldfront_lakekeeper_endpoint = NULL;
 static char *coldfront_local_pg_dsn       = NULL;
+static char *coldfront_dblink_self        = NULL;
 
 static post_parse_analyze_hook_type prev_post_parse_analyze_hook = NULL;
 static planner_hook_type            prev_planner_hook            = NULL;
@@ -3707,8 +3712,10 @@ static PGconn *coldfront_loopback_conn = NULL;
 
 /* cf_loopback_get_conn returns the loopback, reconnecting when it is absent or
  * has failed. A new connection gets a 30 s statement_timeout, the backstop for
- * a statement stuck on a lock. A connection that cannot be opened is reported
- * at elevel, and NULL comes back when elevel is below ERROR. */
+ * a statement stuck on a lock, and search_path = pg_catalog, so the statements
+ * and trigger functions it runs as the loopback's user resolve unqualified
+ * names in pg_catalog only. A connection that cannot be opened is reported at
+ * elevel, and NULL comes back when elevel is below ERROR. */
 static PGconn *
 cf_loopback_get_conn(int elevel)
 {
@@ -3744,7 +3751,8 @@ cf_loopback_get_conn(int elevel)
                 (errmsg("coldfront: cannot open the loopback connection: %s", msg)));
         return NULL;
     }
-    res = PQexec(coldfront_loopback_conn, "SET statement_timeout = '30s'");
+    res = PQexec(coldfront_loopback_conn,
+                 "SET statement_timeout = '30s'; SET search_path = pg_catalog");
     if (res != NULL)
         PQclear(res);
     return coldfront_loopback_conn;
@@ -4629,6 +4637,17 @@ register_gucs(void)
         "",
         PGC_SUSET,
         GUC_SUPERUSER_ONLY,
+        NULL, NULL, NULL);
+
+    DefineCustomStringVariable(
+        "coldfront.dblink_self",
+        "libpq DSN of the loopback that runs the mesh bakery's claims, acks "
+        "and releases, each committed on its own.",
+        NULL,
+        &coldfront_dblink_self,
+        "",
+        PGC_SUSET,
+        0,
         NULL, NULL, NULL);
 }
 

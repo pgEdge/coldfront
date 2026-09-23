@@ -2218,7 +2218,8 @@ SQL
 # TC-177 fails the apply trigger while it defers a peer's claim; TC-178 checks
 # that an app role's session has no way into the loopback; TC-179 terminates a
 # writer while its claim waits on a row; TC-180 kills every loopback session on
-# a node. Runs on two throwaway Iceberg tables.
+# a node; TC-181 gives a session's loopback a search_path that shadows a
+# pg_catalog function. Runs on two throwaway Iceberg tables.
 # ───────────────────────────────────────────────────────────────────────────
 story_mesh_claim_failures() {
     step "12d. Mesh: a failed claim step leaves no lock, claim or open loopback behind"
@@ -2344,8 +2345,9 @@ SQL
     q "$HOST" "DELETE FROM coldfront.claims WHERE ticket = $own;" >/dev/null
 
     # TC-178: after a cold write as an app role, its session has no way into the
-    # loopback: no named dblink connection is left open in it, and
-    # coldfront._loopback is not executable by it.
+    # loopback: no named dblink connection is left open in it,
+    # coldfront._loopback is not executable by it, and it cannot change
+    # coldfront.dblink_self, the loopback's connection string.
     q "$HOST" "DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'cf_tc178') THEN CREATE ROLE cf_tc178 NOSUPERUSER LOGIN; END IF; END \$\$;" >/dev/null 2>&1
     q "$HOST" "SELECT coldfront.grant_app_access('cf_tc178');" >/dev/null 2>&1
     out=$(sess "$HOST" 2>&1 <<'SQL'
@@ -2358,11 +2360,14 @@ SELECT 'named=' || count(*) FROM unnest(public.dblink_get_connections()) c;
 SELECT 'named=0';
 \endif
 SELECT 'can_exec=' || has_function_privilege('coldfront._loopback(text)', 'execute');
+SET coldfront.dblink_self = 'dbname=cf_tc178';
+SELECT 'dsn_set=' || (current_setting('coldfront.dblink_self') = 'dbname=cf_tc178');
 SQL
 )
     assert_eq "TC-178 the app role's cold write landed" "1" "$(q "$HOST" "SELECT count(*) FROM cf_ct WHERE id = 1781;")"
     assert_eq "TC-178 no named loopback connection is left in an app role's session" "0" "$(echo "$out" | sed -n 's/^named=//p')"
     assert_eq "TC-178 an app role cannot execute the loopback" "false" "$(echo "$out" | sed -n 's/^can_exec=//p')"
+    assert_eq "TC-178 an app role cannot change the loopback's connection string" "false" "$(echo "$out" | sed -n 's/^dsn_set=//p')"
 
     # TC-179: a writer is terminated while its claim waits on a row the claim's
     # reap must delete. The claim statement finishes before that writer's
@@ -2410,6 +2415,19 @@ SQL
     assert_eq "TC-180 a peer's cold write still gets the node's ack" "0" "$rc"
     assert_eq "TC-180 all four writes landed" "4" "$(q "$HOST" "SELECT count(*) FROM cf_ct WHERE id BETWEEN 1801 AND 1804;")"
     assert_eq "TC-180 no claim is left on the node" "0" "$(node_claims "$ref_t")"
+
+    # TC-181: the loopback resolves unqualified names in pg_catalog only. A
+    # session's loopback connection string carries a search_path startup option
+    # naming a schema that shadows pg_advisory_xact_lock(integer); the claim's
+    # call never reaches the shadow, and the write lands.
+    q "$HOST" "DROP SCHEMA IF EXISTS cf_tc181 CASCADE; CREATE SCHEMA cf_tc181; CREATE TABLE cf_tc181.hits (who text); CREATE FUNCTION cf_tc181.pg_advisory_xact_lock(integer) RETURNS void LANGUAGE sql AS 'INSERT INTO cf_tc181.hits VALUES (current_user)';" >/dev/null 2>&1
+    sess "$HOST" >/dev/null 2>&1 <<'SQL'
+SELECT set_config('coldfront.dblink_self', current_setting('coldfront.dblink_self') || ' options=''-csearch_path=cf_tc181''', false);
+INSERT INTO cf_ct VALUES (1811);
+SQL
+    assert_eq "TC-181 the write over the redirected loopback landed" "1" "$(q "$HOST" "SELECT count(*) FROM cf_ct WHERE id = 1811;")"
+    assert_eq "TC-181 the loopback never resolves a name outside pg_catalog" "0" "$(q "$HOST" "SELECT count(*) FROM cf_tc181.hits;")"
+    q "$HOST" "DROP SCHEMA cf_tc181 CASCADE;" >/dev/null 2>&1
 
     for t in cf_ct cf_cu; do
         q "$HOST" "SELECT coldfront.drop_iceberg_table('public','$t', true);" >/dev/null 2>&1

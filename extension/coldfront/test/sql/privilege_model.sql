@@ -11,7 +11,8 @@
 --       extensions load (pg_duckdb force-disables LocalFileSystem for non-superusers)
 --       while the outer scan/commit runs as the app role over S3 (httpfs).
 --   (2) The deployment-config endpoint/DSN GUCs are PGC_SUSET, so a non-superuser
---       cannot redirect the elevated ATTACH to an attacker-controlled endpoint.
+--       cannot redirect the elevated ATTACH to an attacker-controlled endpoint,
+--       or the bakery's loopback to a connection of its choosing.
 --   (3) grant_app_access() is the one-call onboarding helper, and it is NOT
 --       executable by PUBLIC — an app role must never be able to self-grant.
 --   (4) _loopback() runs SQL as the user of the node's own loopback connection,
@@ -35,10 +36,12 @@ WHERE pronamespace = 'coldfront'::regnamespace
                   '_exec_iceberg_with_claim')
 ORDER BY proname;
 
--- (2) the endpoint/DSN GUCs the elevated helpers trust are superuser-set-only.
+-- (2) the endpoint/DSN GUCs the elevated helpers and the loopback trust are
+--     superuser-set-only.
 SELECT name, context
 FROM pg_settings
-WHERE name IN ('coldfront.warehouse', 'coldfront.lakekeeper_endpoint', 'coldfront.local_pg_dsn')
+WHERE name IN ('coldfront.warehouse', 'coldfront.lakekeeper_endpoint', 'coldfront.local_pg_dsn',
+               'coldfront.dblink_self')
 ORDER BY name;
 
 -- (3) the onboarding helper exists and PUBLIC cannot execute it (no self-grant).

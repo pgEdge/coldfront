@@ -522,8 +522,10 @@ PG nodes pointing at the same Lakekeeper endpoint and S3 bucket.
   2. Insert `(iceberg_table, ticket)` into `coldfront.claims` over
      the node's loopback, a libpq connection the extension's C code
      keeps and no SQL can reach (autonomous tx; replicates async via
-     Spock). The ticket is taken inside that transaction, under the
-     table's claim key, and every lock it takes ends with it.
+     Spock). Only a superuser can set its connection string,
+     `coldfront.dblink_self`, and the loopback resolves names in
+     `pg_catalog` only. The ticket is taken inside that transaction,
+     under the table's claim key, and every lock it takes ends with it.
   3. **Wait until both** (a) no same-node writer has a smaller
      ticket on this table, and (b) every alive peer has acked the
      ticket (its row appears in `coldfront.claim_acks`).

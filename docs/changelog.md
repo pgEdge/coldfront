@@ -36,8 +36,10 @@ and this project adheres to
 
 - After one cold write on a mesh, an app role could run any SQL as the
   loopback connection's user through the `coldfront_self` dblink connection
-  the claim left open in its session. An app role can no longer reach the
-  loopback.
+  the claim left open in its session, and by setting
+  `coldfront.dblink_self` it could make the loopback run functions of its
+  own as that user. An app role can no longer reach the loopback or set its
+  connection string, and the loopback resolves names in `pg_catalog` only.
 - A cold write on a mesh that failed or was cancelled during its claim left
   an advisory lock held for the rest of the session, and the node's other
   writers on that table waited on it. Every lock the claim takes now ends

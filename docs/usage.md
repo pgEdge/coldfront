@@ -874,7 +874,7 @@ snowflake.node = 1
 # coldfront.claims/claim_acks heap tables, so it never attaches the
 # Iceberg catalog (the lazy catalog-attach hook fires only on a tiered
 # view). application_name=coldfront_dblink marks the session as bakery
-# traffic.
+# traffic. Only a superuser can set it.
 coldfront.dblink_self = 'host=/tmp dbname=coldfront user=coldfront application_name=coldfront_dblink'
 
 coldfront.warehouse = 'wh'
