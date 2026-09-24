@@ -3707,7 +3707,8 @@ static List *coldfront_pending_releases = NIL;
  * GUC coldfront.dblink_self and kept for the backend's lifetime. Every bakery
  * statement that must commit on its own runs here: the claim, the apply
  * trigger's acks and reaps, the waiter's poke, and the release. Only C holds it,
- * so no SQL in the session can reach the connection itself. */
+ * and SQL reaches it only through coldfront._loopback(), which PUBLIC cannot
+ * execute. */
 static PGconn *coldfront_loopback_conn = NULL;
 
 /* cf_loopback_get_conn returns the loopback, reconnecting when it is absent or

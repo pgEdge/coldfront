@@ -521,8 +521,9 @@ PG nodes pointing at the same Lakekeeper endpoint and S3 bucket.
   1. `snowflake.nextval()` - fresh globally-unique ticket.
   2. Insert `(iceberg_table, ticket)` into `coldfront.claims` over
      the node's loopback, a libpq connection the extension's C code
-     keeps and no SQL can reach (autonomous tx; replicates async via
-     Spock). Only a superuser can set its connection string,
+     keeps (autonomous tx; replicates async via Spock). SQL reaches it
+     only through `coldfront._loopback()`, which PUBLIC cannot execute.
+     Only a superuser can set its connection string,
      `coldfront.dblink_self`, and the loopback resolves names in
      `pg_catalog` only. The ticket is taken inside that transaction,
      under the table's claim key, and every lock it takes ends with it.
