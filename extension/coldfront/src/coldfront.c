@@ -3604,7 +3604,8 @@ cf_own_duckdb_temp_dir(void)
 
 /*
  * The coldfront post-parse-analyze hook: rewrite INSERT/UPDATE/DELETE on a
- * registered tiered view to the hot/cold/dual emit path.
+ * writable registered view to the hot/cold/dual emit path. Reject DML on an
+ * adopted read-only view before it reaches Iceberg.
  *
  * The hook is registered cluster-wide via shared_preload_libraries, so it
  * also fires in databases/sessions where CREATE EXTENSION coldfront was
@@ -3895,6 +3896,8 @@ coldfront_loopback(PG_FUNCTION_ARGS)
     PG_RETURN_TEXT_P(cstring_to_text(val));
 }
 
+/* Queue a bakery ticket for release after the outer transaction commits or
+ * aborts; the transaction callback drains it rather than releasing it here. */
 PG_FUNCTION_INFO_V1(coldfront_enqueue_release);
 Datum
 coldfront_enqueue_release(PG_FUNCTION_ARGS)

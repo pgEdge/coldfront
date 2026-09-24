@@ -2818,8 +2818,9 @@ BEGIN
 END;
 $$;
 
--- Everything adoption refuses before it reads a catalog or writes a row, given
--- the name the wrapper view would take and the Iceberg reference behind it.
+-- Validate the proposed wrapper name and Iceberg reference before describing
+-- the Iceberg table or creating the view and registry row. Refuses a missing PG
+-- schema, an occupied relation or Iceberg reference, or an unconfigured catalog.
 CREATE OR REPLACE FUNCTION coldfront._adopt_preflight(
     p_schema   text,
     p_relname  text,
@@ -2909,11 +2910,9 @@ BEGIN
 END;
 $$;
 
--- coldfront.adopt_iceberg_table: bring a table that already exists in the Iceberg
--- catalog under a PG wrapper view, so it reads and writes like one
--- create_iceberg_table provisioned. Nothing is created on the catalog and no data
--- is moved: the table stays exactly where it is, and releasing it later leaves it
--- untouched.
+-- coldfront.adopt_iceberg_table: bring an existing Iceberg table under a PG
+-- wrapper view for reads, optionally enabling writes. Nothing is created in the
+-- catalog and no data is moved: releasing it later leaves the table untouched.
 --
 --   p_schema     PG schema to put the wrapper view in.
 --   p_table      the view's name, and the Iceberg table's name.
@@ -3104,7 +3103,7 @@ $$;
 --                    created at ice.<p_schema>.<p_table>.
 --   p_columns        jsonb array of {name, type} entries. Type is a PG type
 --                    name from the supported set; see _iceberg_storage_type.
---   p_partition_cols array of column names for Iceberg partitioning, or NULL.
+--   p_partition_cols accepted but ignored; the new table is unpartitioned.
 --
 -- Effects:
 --   1. Creates the Iceberg table via duckdb.raw_query('CREATE TABLE ice...').
@@ -3429,10 +3428,10 @@ BEGIN
 END;
 $$;
 
--- Peer-side trigger: fires when spock applies an originator's claim
--- INSERT into this node's local coldfront.claims (REPLICA-only — does
--- NOT fire on the originator's own local INSERT). Runs Ricart-Agrawala's
--- defer rule:
+-- Peer-side trigger: fires when spock applies an originator's claim INSERT or
+-- poke UPDATE to this node's coldfront.claims (REPLICA-only, not on the
+-- originator). Reaps orphaned local claims before applying Ricart-Agrawala's
+-- defer rule; an UPDATE without a reap keeps the earlier ack/defer decision:
 --   * If this node has its own pending claim with SMALLER ticket on the
 --     same iceberg_table → DEFER (queue in coldfront.deferred_acks).
 --   * Otherwise → ack immediately (INSERT into coldfront.claim_acks,
@@ -4085,6 +4084,8 @@ $$;
 --
 -- Both end states are announced with a NOTICE, because one call yielding two
 -- outcomes is worth stating out loud rather than leaving to documentation.
+-- An adopted read-only relation cannot be dropped; release it instead to leave
+-- its Iceberg table intact.
 --
 -- p_purge has no default because both choices are irreversible in opposite
 -- directions: true deletes the data and metadata objects, which for the cold
