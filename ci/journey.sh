@@ -1736,37 +1736,45 @@ SQL
 # create_iceberg_table() made (TC-183) and on one adoption registered (TC-184),
 # as on the archiver's. Every registration stores one spelling, each part
 # quoted, and it is the one the compactor builds, so a cold write holding the
-# table's claim makes the compactor's claim wait.
+# table's claim makes the compactor's claim wait. Each step then reads the table
+# under its claim, so it works from the write it waited for: expiry (TC-183),
+# compaction (TC-184), and orphan cleanup (TC-185), which with no age window
+# would otherwise delete that write's files.
 # ───────────────────────────────────────────────────────────────────────────
 story_compactor_claim_matches_writes() {
     step "6g. The compactor waits for a cold write's claim on created and adopted tables"
     require_compactor || return
     local col='[{"name":"id","type":"bigint"}]' t
-    q "$HOST" "SELECT coldfront.create_iceberg_table('public','cf_cw','$col'::jsonb);" >/dev/null 2>&1
-    q "$HOST" "SELECT coldfront.create_iceberg_table('public','cf_ad','$col'::jsonb);" >/dev/null 2>&1
+    for t in cf_cw cf_ad cf_or; do
+        q "$HOST" "SELECT coldfront.create_iceberg_table('public','$t','$col'::jsonb);" >/dev/null 2>&1
+    done
     q "$HOST" "SELECT coldfront.release_iceberg_table('public','cf_ad');" >/dev/null 2>&1
     q "$HOST" "SELECT coldfront.adopt_iceberg_table('public','cf_ad', p_writable => true);" >/dev/null 2>&1
     assert_eq "TC-183: the archiver, create_iceberg_table() and adoption register one spelling" \
         '"ice"."public"."cf_ad" "ice"."public"."cf_cw" "ice"."public"."events"' \
         "$(q "$HOST" "SELECT string_agg(iceberg_table, ' ' ORDER BY relname) FROM coldfront.tiered_views WHERE schema_name = 'public' AND relname IN ('cf_ad', 'cf_cw', 'events');")"
-    compactor_waits_for_write TC-183 cf_cw
-    compactor_waits_for_write TC-184 cf_ad
-    for t in cf_cw cf_ad; do
+    compactor_waits_for_write TC-183 cf_cw 2 'expired [1-9][0-9]* snapshot' \
+        --expire-snapshots --expire-older-than 0s --expire-retain-last 1 --expire-keep-files
+    compactor_waits_for_write TC-184 cf_ad 5 'compacted: [0-9]+ files'
+    compactor_waits_for_write TC-185 cf_or 1 'deleted [0-9]+ orphan' --orphans --orphan-age 0s
+    for t in cf_cw cf_ad cf_or; do
         q "$HOST" "SELECT coldfront.drop_iceberg_table('public','$t', true);" >/dev/null 2>&1
     done
 }
 
-# compactor_waits_for_write <TC> <table>: a cold write to public.<table> holds the
-# table's claim for 8 s while the compactor expires the table's snapshots. The
-# compactor's claim waits on the lock the write holds, and the compactor finishes
-# once the write commits.
+# compactor_waits_for_write <TC> <table> <writes> <ERE> [flags...]: after <writes>
+# single-row cold writes to public.<table>, one more holds the table's claim for
+# 8 s while the compactor runs with <flags>. The compactor's claim waits on the
+# lock the write holds; once the write commits, the compactor succeeds, its
+# output matches <ERE>, and every write is still there.
 compactor_waits_for_write() {
-    local tc=$1 t=$2 w c ec i waited=0
-    q "$HOST" "INSERT INTO $t VALUES (1);" >/dev/null
+    local tc=$1 t=$2 n=$3 pat=$4 w c ec i waited=0
+    shift 4
+    for i in $(seq 1 "$n"); do echo "INSERT INTO $t VALUES ($i);"; done | qf "$HOST" >/dev/null 2>&1
     qf "$HOST" >/dev/null 2>&1 <<SQL &
 SET application_name = 'cf_${tc}_writer';
 BEGIN;
-INSERT INTO $t VALUES (2);
+INSERT INTO $t VALUES (0);
 SELECT pg_sleep(8);
 COMMIT;
 SQL
@@ -1775,8 +1783,7 @@ SQL
         [ "$(q "$HOST" "SELECT count(*) FROM pg_stat_activity WHERE application_name = 'cf_${tc}_writer' AND wait_event = 'PgSleep';")" = 1 ] && break
         sleep 0.25
     done
-    "$COMPACTOR" --config $TMPD/archiver.yaml --table "$t" --expire-snapshots --expire-older-than 0s \
-        --expire-retain-last 1 --expire-keep-files >"$TMPD/cf.$tc" 2>&1 &
+    "$COMPACTOR" --config $TMPD/archiver.yaml --table "$t" "$@" >"$TMPD/cf.$tc" 2>&1 &
     c=$!
     for i in $(seq 1 24); do
         if [ "$(q "$HOST" "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%coldfront._claim_iceberg_external%' AND pid <> pg_backend_pid();")" = 1 ]; then
@@ -1789,7 +1796,8 @@ SQL
     assert_eq "$tc: the compactor's claim waits for the cold write's" 1 "$waited"
     assert_eq "$tc: the compactor finishes once the write commits" 0 "$ec"
     [ "$ec" = 0 ] || tail -5 "$TMPD/cf.$tc"
-    assert_eq "$tc: both writes landed" 2 "$(q "$HOST" "SELECT count(*) FROM $t;")"
+    assert_eq "$tc: the compactor did its work" 1 "$(grep -c -E "$pat" "$TMPD/cf.$tc")"
+    assert_eq "$tc: every write is still there" "$((n + 1))" "$(q "$HOST" "SELECT count(*) FROM $t;")"
     rm -f "$TMPD/cf.$tc"
 }
 
@@ -5479,8 +5487,9 @@ story_compactor_concurrent() {
     local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
 
     # Create a dedicated cold table so this story is independent of the events
-    # table's compacted state. Six rows 4 months back produce small Parquet files
-    # via the cold-write path after archiving.
+    # table's compacted state. Archiving six rows from 4 months back writes one
+    # Parquet file, and five cold writes after it add five more, enough for a
+    # compaction group.
     qf "$HOST" <<'EOSQL' >/dev/null
 CREATE TABLE IF NOT EXISTS public.tc137_conc (
     id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL,
@@ -5511,6 +5520,10 @@ EOSQL
         q "$HOST" "DROP TABLE IF EXISTS public.tc137_conc CASCADE;" >/dev/null 2>&1
         return
     fi
+    local i
+    for i in 1 2 3 4 5; do
+        q "$HOST" "INSERT INTO public.tc137_conc (ts) VALUES (date_trunc('month',now()) - interval '4 months' + interval '$i days');" >/dev/null 2>&1
+    done
     local rows_before; rows_before=$(q "$HOST" "SELECT count(*) FROM tc137_conc;")
 
     # Two simultaneous compactors; bakery claim must serialise their commits.
@@ -5529,6 +5542,8 @@ EOSQL
         fail "TC-137: exit codes c1=$ec1 c2=$ec2"
         cat $TMPD/tc137-c1.log $TMPD/tc137-c2.log
     fi
+    assert_eq "TC-137: one compactor compacted, and the other then found nothing left" "1" \
+        "$(cat $TMPD/tc137-c1.log $TMPD/tc137-c2.log | grep -c 'compacted:')"
     assert_eq "TC-137: row count preserved after concurrent compaction" "$rows_before" \
         "$(q "$HOST" "SELECT count(*) FROM tc137_conc;")"
 

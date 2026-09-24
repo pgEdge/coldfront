@@ -26,7 +26,6 @@ import (
 	//   abfs / abfss / wasb / wasbs -> Azure ADLS Gen2
 	"github.com/apache/iceberg-go/catalog/rest"
 	_ "github.com/apache/iceberg-go/io/gocloud"
-	"github.com/apache/iceberg-go/table"
 )
 
 // runOpts is the parsed CLI: compaction always runs (a no-op when nothing is below
@@ -117,17 +116,22 @@ func run(cfgPath, tableName string, o runOpts) error {
 
 	claim, closeConn := newClaimer(ctx, cfg.Postgres.DSN, icebergRef)
 	defer closeConn()
+	if o.dryRun {
+		claim = func(fn func() error) error { return fn() }
+	}
 
-	if err := doCompaction(ctx, cat, schema, table, o, claim); err != nil {
+	// Each step reads the table under its claim, so what it commits is planned
+	// against every cold write that committed before it, including one it waited for.
+	if err := claim(func() error { return doCompaction(ctx, cat, schema, table, o) }); err != nil {
 		return err
 	}
 	if o.expire {
-		if err := doExpire(ctx, cat, schema, table, o, claim); err != nil {
+		if err := claim(func() error { return doExpire(ctx, cat, schema, table, o) }); err != nil {
 			return err
 		}
 	}
 	if o.orphans {
-		if err := doOrphans(ctx, cat, schema, table, o, claim); err != nil {
+		if err := claim(func() error { return doOrphans(ctx, cat, schema, table, o) }); err != nil {
 			return err
 		}
 	}
@@ -158,7 +162,7 @@ func newClaimer(ctx context.Context, dsn, icebergRef string) (claim func(func() 
 
 // doCompaction plans + (unless dry-run) rewrites below-target files under one claim.
 // Detection self-gates: an empty plan is a clean no-op.
-func doCompaction(ctx context.Context, cat *rest.Catalog, ns, tableName string, o runOpts, claim func(func() error) error) error {
+func doCompaction(ctx context.Context, cat *rest.Catalog, ns, tableName string, o runOpts) error {
 	tbl, plan, err := planCompaction(ctx, cat, ns, tableName, o.targetSize)
 	if err != nil {
 		return err
@@ -182,12 +186,8 @@ func doCompaction(ctx context.Context, cat *rest.Catalog, ns, tableName string, 
 	if o.dryRun {
 		return nil
 	}
-	var res *table.RewriteResult
-	if err := claim(func() error {
-		var rerr error
-		res, rerr = rewrite(ctx, tbl, plan, o.targetSize)
-		return rerr
-	}); err != nil {
+	res, err := rewrite(ctx, tbl, plan, o.targetSize)
+	if err != nil {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "compactor: %s.%s — compacted: %d files -> %d (%d MiB -> %d MiB)\n",
@@ -196,7 +196,7 @@ func doCompaction(ctx context.Context, cat *rest.Catalog, ns, tableName string, 
 }
 
 // doExpire expires all but the most-recent --expire-retain-last snapshots under a claim.
-func doExpire(ctx context.Context, cat *rest.Catalog, ns, tableName string, o runOpts, claim func(func() error) error) error {
+func doExpire(ctx context.Context, cat *rest.Catalog, ns, tableName string, o runOpts) error {
 	tbl, err := loadTable(ctx, cat, ns, tableName)
 	if err != nil {
 		return err
@@ -207,12 +207,8 @@ func doExpire(ctx context.Context, cat *rest.Catalog, ns, tableName string, o ru
 			ns, tableName, have, o.retainLast)
 		return nil
 	}
-	var expired int
-	if err := claim(func() error {
-		var eerr error
-		expired, eerr = expireSnapshots(ctx, tbl, o.retainLast, o.olderThan, !o.keepFiles)
-		return eerr
-	}); err != nil {
+	expired, err := expireSnapshots(ctx, tbl, o.retainLast, o.olderThan, !o.keepFiles)
+	if err != nil {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "compactor: %s.%s — expired %d snapshot(s), retained %d\n",
@@ -221,7 +217,7 @@ func doExpire(ctx context.Context, cat *rest.Catalog, ns, tableName string, o ru
 }
 
 // doOrphans deletes orphan files older than --orphan-age under a claim (dry-run reports only).
-func doOrphans(ctx context.Context, cat *rest.Catalog, ns, tableName string, o runOpts, claim func(func() error) error) error {
+func doOrphans(ctx context.Context, cat *rest.Catalog, ns, tableName string, o runOpts) error {
 	tbl, err := loadTable(ctx, cat, ns, tableName)
 	if err != nil {
 		return err
@@ -243,12 +239,8 @@ func doOrphans(ctx context.Context, cat *rest.Catalog, ns, tableName string, o r
 			ns, tableName, n, o.orphanAge)
 		return nil
 	}
-	var deleted int
-	if err := claim(func() error {
-		var oerr error
-		deleted, oerr = deleteOrphans(ctx, tbl, o.orphanAge, false)
-		return oerr
-	}); err != nil {
+	deleted, err := deleteOrphans(ctx, tbl, o.orphanAge, false)
+	if err != nil {
 		return err
 	}
 	fmt.Fprintf(os.Stderr, "compactor: %s.%s — deleted %d orphan file(s) older than %s\n",

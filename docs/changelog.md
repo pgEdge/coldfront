@@ -60,6 +60,11 @@ and this project adheres to
   writes to it claimed, so compaction and snapshot expiry did not wait for
   those writes. Every registration now stores the reference with each part
   quoted, which is how the archiver and the compactor spell it.
+- The compactor read a table before taking its bakery claim. A run that had
+  to wait for a cold write then had its commit refused and exited with an
+  error, and an orphan-file pass with `--orphan-age 0s` could delete the
+  files that write had just committed. Each step now reads the table under
+  its claim.
 
 ## [1.0.0-beta2] - 2026-08-08
 
