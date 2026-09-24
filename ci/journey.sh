@@ -412,6 +412,12 @@ EOSQL
 # precondition and 409 (CatalogCommitConflict), silently losing rows. (Standing
 # rule: multi-writer no-409 probe in vanilla. The bakery is essential.)
 # ───────────────────────────────────────────────────────────────────────────
+# snapshot_count <iceberg-ref>: the table's snapshot count. A table nothing has
+# written to has none, and every commit adds one.
+snapshot_count() {
+    q "$HOST" "SELECT coldfront.ensure_attached(); SELECT r['n'] FROM duckdb.query('SELECT count(*) AS n FROM iceberg_snapshots(''$1'')') AS t(r);" | tail -1
+}
+
 story_decoupled_concurrency() {
     step "9. Concurrency: parallel cold writers serialize via the bakery (no 409)"
     local k pids=()
@@ -426,6 +432,25 @@ story_decoupled_concurrency() {
     assert_eq "8 concurrent cold writers all landed (no 409/loss)" "8" \
         "$(q "$HOST" "SELECT count(*) FROM iceonly WHERE status='conc';")"
     rm -f $TMPD/conc.* 2>/dev/null
+
+    # A table nothing has written to takes concurrent first writes without losing
+    # any: the first commit asserts the table still has no snapshot, so nothing
+    # can silently replace it, and the bakery serialises the rest behind it.
+    q "$HOST" "SELECT coldfront.create_iceberg_table('public','icefirst','[{\"name\":\"id\",\"type\":\"bigint\"}]'::jsonb);" >/dev/null 2>&1
+    assert_eq "a created table has no snapshot until it is written" "0" \
+        "$(snapshot_count ice.public.icefirst)"
+    pids=()
+    for k in 1 2 3 4 5 6 7 8; do
+        q "$HOST" "INSERT INTO icefirst VALUES ($k);" >"$TMPD/first.$k" 2>&1 &
+        pids+=("$!")
+    done
+    for p in "${pids[@]}"; do wait "$p"; done
+    assert_eq "no concurrent first write errored" "0" \
+        "$(cat "$TMPD"/first.* 2>/dev/null | grep -cEi 'error|conflict|409')"
+    assert_eq "8 concurrent first writes into a never-written table all landed" "8" \
+        "$(q "$HOST" "SELECT count(*) FROM icefirst;")"
+    q "$HOST" "SELECT coldfront.drop_iceberg_table('public','icefirst', true);" >/dev/null 2>&1
+    rm -f "$TMPD"/first.* 2>/dev/null
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -445,6 +470,218 @@ EOSQL
 )
     assert_eq "in-tx SELECT sees just-inserted iceberg row" "1" "$(extract INTX "$O")"
     assert_eq "ROLLBACK undoes the iceberg INSERT"          "0" "$(extract POSTRB "$O")"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story: TC-152..TC-159, adopt a table that already exists in the Iceberg
+# catalog. The fixture stands in for an external writer: it is built with
+# duckdb.raw_query in a namespace coldfront never created, carries a partition
+# spec and a VARCHAR column, and is written to before coldfront has heard of it.
+#
+# The namespace's CREATE SCHEMA and the table's CREATE TABLE must commit
+# separately (two psql invocations, not one multi-statement -c): on the attached
+# catalog the schema create is deferred to transaction COMMIT while the table
+# create POSTs eagerly, so one transaction would 404 against a namespace that is
+# not committed yet. Same trap docs/usage.md documents for create_iceberg_table.
+# ───────────────────────────────────────────────────────────────────────────
+# adopt_fixture <namespace> <table> <ddl-tail>: ddl-tail is everything the
+# CREATE TABLE carries after the table name: the parenthesised column list, plus
+# a PARTITIONED BY clause where the fixture has one.
+adopt_fixture() {
+    local ns="$1" tbl="$2" tail="$3"
+    q "$HOST" "SELECT coldfront.ensure_attached(); SELECT duckdb.raw_query('CREATE SCHEMA IF NOT EXISTS ice.\"$ns\"');" >/dev/null 2>&1
+    q "$HOST" "SELECT coldfront.ensure_attached(); SELECT duckdb.raw_query(\$\$CREATE TABLE IF NOT EXISTS ice.\"$ns\".\"$tbl\" $tail\$\$);" >/dev/null 2>&1
+}
+
+story_adopt_decoupled() {
+    step "TC-164..TC-170, TC-172, TC-173: adopt an existing Iceberg table (decoupled)"
+    ADOPT_WH=$(curl -s "http://${LK_IP}:8181/management/v1/warehouse" \
+                 | grep -oE '"warehouse-id":"[^"]+"' | head -1 | cut -d'"' -f4)
+    [ -n "$ADOPT_WH" ] || { fail "TC-164: could not resolve the warehouse id"; return; }
+
+    adopt_fixture lake orders \
+        '(order_id BIGINT, placed_at TIMESTAMP WITH TIME ZONE, customer VARCHAR,
+          amount DECIMAL(12,2), meta VARCHAR) PARTITIONED BY (customer)'
+    q "$HOST" "SELECT coldfront.ensure_attached(); SELECT duckdb.raw_query(\$\$INSERT INTO ice.lake.orders VALUES (1, TIMESTAMPTZ '2026-01-01 10:00:00+00', 'acme', 19.99, '{\"tier\":\"gold\"}'), (2, TIMESTAMPTZ '2026-01-02 10:00:00+00', 'globex', 249.50, '{\"tier\":\"silver\"}')\$\$);" >/dev/null 2>&1
+
+    # TC-164: one call, no column list. The schema comes from the catalog, and the
+    # Iceberg namespace (lake) is not a PG schema: the view lands in public.
+    local O; O=$(q_may "$HOST" "SELECT coldfront.adopt_iceberg_table('public','orders','lake');")
+    assert_contains "TC-164: adopt reports the ref, the column count and read-only" \
+        "adopted ice.lake.orders as public.orders (5 columns, read-only)" "$O"
+    assert_eq "TC-164: wrapper view created" "v" \
+        "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='orders' AND relnamespace='public'::regnamespace;")"
+    assert_eq "TC-164: rows written outside coldfront are readable" "2" \
+        "$(q "$HOST" "SELECT count(*) FROM orders;")"
+    assert_eq "TC-164: DECIMAL(12,2) maps to numeric(12,2)" "numeric(12,2)" \
+        "$(q "$HOST" "SELECT format_type(atttypid,atttypmod) FROM pg_attribute WHERE attrelid='public.orders'::regclass AND attname='amount';")"
+    assert_eq "TC-164: TIMESTAMP WITH TIME ZONE maps to timestamptz" "timestamp with time zone" \
+        "$(q "$HOST" "SELECT format_type(atttypid,atttypmod) FROM pg_attribute WHERE attrelid='public.orders'::regclass AND attname='placed_at';")"
+
+    # TC-165: a namespace that has to be quoted to be one identifier.
+    adopt_fixture 'Lake-EU' invoices '(inv_id BIGINT, region VARCHAR)'
+    q "$HOST" "SELECT coldfront.ensure_attached(); SELECT duckdb.raw_query('INSERT INTO ice.\"Lake-EU\".invoices VALUES (7, ''DE'')');" >/dev/null 2>&1
+    O=$(q_may "$HOST" "SELECT coldfront.adopt_iceberg_table('public','invoices','Lake-EU');")
+    assert_contains "TC-165: a quoted namespace resolves as one identifier" \
+        'adopted ice."Lake-EU".invoices' "$O"
+    assert_eq "TC-165: its rows read back" "DE" "$(q "$HOST" "SELECT region FROM invoices WHERE inv_id=7;")"
+
+    # TC-166: read-only unless asked for, and the refusal says what to do.
+    O=$(q_may "$HOST" "INSERT INTO orders VALUES (99, now(), 'nobody', 1.00, '{}');")
+    assert_contains "TC-166: INSERT on a read-only adoption is refused" \
+        'is adopted read-only' "$O"
+    assert_contains "TC-166: the refusal hints at p_writable" "p_writable => true" "$O"
+    assert_eq "TC-166: nothing was written" "2" "$(q "$HOST" "SELECT count(*) FROM orders;")"
+
+    # TC-167: adoption binds the name once. Arming writes is release, then adopt
+    # again; the second adopt in between is refused and changes nothing.
+    O=$(q_may "$HOST" "SELECT coldfront.adopt_iceberg_table('public','orders','lake', p_writable => true);")
+    assert_contains "TC-167: adopting a registered name again is refused" 'is already registered for ice.lake.orders' "$O"
+    assert_eq "TC-167: the refused call left the table read-only" "f" \
+        "$(q "$HOST" "SELECT is_writable FROM coldfront.tiered_views WHERE relname='orders';")"
+    q "$HOST" "SELECT coldfront.release_iceberg_table('public','orders');" >/dev/null 2>&1
+    q "$HOST" "SELECT coldfront.adopt_iceberg_table('public','orders','lake', p_writable => true);" >/dev/null 2>&1
+    assert_eq "TC-167: release then adopt leaves one registry row, writable" "t" \
+        "$(q "$HOST" "SELECT bool_and(is_writable) FROM coldfront.tiered_views WHERE relname='orders' HAVING count(*) = 1;")"
+    O=$(qf "$HOST" <<'EOSQL'
+INSERT INTO orders VALUES (3, TIMESTAMPTZ '2026-01-03 10:00:00+00', 'initech', 42.00, '{"tier":"bronze"}');
+UPDATE orders SET amount = 21.00 WHERE order_id = 3;
+DELETE FROM orders WHERE order_id = 1;
+SELECT 'CNT:'||count(*) FROM orders;
+SELECT 'AMT:'||amount FROM orders WHERE order_id = 3;
+SELECT 'GONE:'||count(*) FROM orders WHERE order_id = 1;
+EOSQL
+)
+    assert_eq "TC-167: INSERT/UPDATE/DELETE all landed" "2"     "$(extract CNT "$O")"
+    assert_eq "TC-167: the UPDATE is visible"            "21.00" "$(extract AMT "$O")"
+    assert_eq "TC-167: the DELETE is visible"            "0"     "$(extract GONE "$O")"
+    assert_eq "TC-167: every claim was released" "0" "$(q "$HOST" "SELECT count(*) FROM coldfront.claims;")"
+
+    # The fixture's partition spec is real, and writes through the adopted view
+    # honour it: each customer's files land under its own partition directory.
+    # Counted through the table's own metadata scan, which runs with the table's
+    # credentials, so it works under credential vending as well as static keys.
+    assert_gt "TC-167: data files land under partition directories" 0 \
+        "$(q "$HOST" "SELECT coldfront.ensure_attached(); SELECT r['n'] FROM duckdb.query('SELECT count(*) AS n FROM iceberg_metadata(''ice.lake.orders'') WHERE file_path LIKE ''%/data/customer=initech/%''') AS t(r);" | tail -1)"
+
+    # TC-169: p_types restores a type Iceberg cannot record, and only where the
+    # override matches what the catalog actually stores. Both go through a fresh
+    # adoption, so the table is released first.
+    q "$HOST" "SELECT coldfront.release_iceberg_table('public','orders');" >/dev/null 2>&1
+    O=$(q_may "$HOST" "SELECT coldfront.adopt_iceberg_table('public','orders','lake', p_types => '{\"amount\":\"bigint\"}');")
+    assert_contains "TC-169: an override contradicting the stored type is refused" \
+        'but the catalog stores DECIMAL(12,2)' "$O"
+    assert_eq "TC-169: the refused override registered nothing" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.tiered_views WHERE relname='orders';")"
+    O=$(q_may "$HOST" "SELECT coldfront.adopt_iceberg_table('public','orders','lake', p_types => '{\"metaa\":\"jsonb\"}');")
+    assert_contains "TC-169: an override naming no column is refused" \
+        'p_types names "metaa"' "$O"
+    assert_eq "TC-169: the misspelled override registered nothing" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.tiered_views WHERE relname='orders';")"
+    q "$HOST" "SELECT coldfront.adopt_iceberg_table('public','orders','lake', p_writable => true, p_types => '{\"meta\":\"jsonb\"}');" >/dev/null 2>&1
+    assert_eq "TC-169: p_types reads the VARCHAR column as json" "json" \
+        "$(q "$HOST" "SELECT pg_typeof(meta)::text FROM orders LIMIT 1;")"
+    assert_eq "TC-169: the json operators work on it" "bronze" \
+        "$(q "$HOST" "SELECT meta->>'tier' FROM orders WHERE order_id=3;")"
+
+    # TC-170: one relation per ref, so the same table cannot answer to two names.
+    q "$HOST" "CREATE SCHEMA IF NOT EXISTS reporting;" >/dev/null 2>&1
+    O=$(q_may "$HOST" "SELECT coldfront.adopt_iceberg_table('reporting','orders','lake');")
+    assert_contains "TC-170: a second adoption of the same ref is refused" \
+        'is already registered as' "$O"
+    assert_eq "TC-170: nothing was registered for the second name" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.tiered_views WHERE schema_name='reporting';")"
+
+    # TC-168: releasing hands the table back untouched. The view and the registry
+    # row go; a fresh scan straight at the catalog still finds every row, which is
+    # what distinguishes release from drop.
+    O=$(q_may "$HOST" "SELECT coldfront.release_iceberg_table('public','orders');")
+    assert_contains "TC-168: release says the table keeps its rows" "keeps every row" "$O"
+    assert_eq "TC-168: the registry row is gone" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.tiered_views WHERE relname='orders';")"
+    assert_eq "TC-168: the wrapper view is gone" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname='orders' AND relnamespace='public'::regnamespace;")"
+    assert_eq "TC-168: the lake table still holds its rows" "2" \
+        "$(q "$HOST" "SELECT coldfront.ensure_attached(); SELECT r['n'] FROM duckdb.query('SELECT count(*) AS n FROM ice.lake.orders') AS t(r);" | tail -1)"
+
+    q "$HOST" "SELECT coldfront.release_iceberg_table('public','invoices');" >/dev/null 2>&1
+    q "$HOST" "DROP SCHEMA IF EXISTS reporting;" >/dev/null 2>&1
+
+    # TC-172: the preflight and the registry INSERT run under the table's bakery
+    # claim, which is what serialises two nodes adopting one Iceberg table. Held
+    # from another session, the claim key must make an adoption wait rather than
+    # register against a registry it has not seen the peer's row in yet. Proven
+    # on the key both bakery paths take (docs/formal/Bakery_adopt.cfg).
+    docker exec -i -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" "$HOST" "$CF_PSQL" -tA -v ON_ERROR_STOP=1 >/dev/null 2>&1 <<SQL &
+BEGIN;
+SELECT pg_advisory_xact_lock(hashtext('coldfront_iceberg:' || 'ice.lake.orders'));
+SELECT pg_sleep(8);
+COMMIT;
+SQL
+    local claim_holder=$!
+    sleep 1
+    local BL; BL=$(q_may "$HOST" "SET statement_timeout='3s'; SELECT coldfront.adopt_iceberg_table('public','orders','lake');")
+    assert_contains "TC-172: adoption waits while the table's claim key is held" \
+        "canceling statement due to statement timeout" "$BL"
+    assert_eq "TC-172: the blocked adoption registered nothing" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.tiered_views WHERE relname='orders';")"
+    wait "$claim_holder" 2>/dev/null
+    q "$HOST" "SELECT coldfront.adopt_iceberg_table('public','orders','lake');" >/dev/null 2>&1
+    assert_eq "TC-172: it adopts once the claim key is free" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.tiered_views WHERE relname='orders';")"
+    assert_eq "TC-172: the adoption left no claim behind" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.claims WHERE iceberg_table = 'ice.lake.orders';")"
+    q "$HOST" "SELECT coldfront.release_iceberg_table('public','orders');" >/dev/null 2>&1
+
+    # TC-173: a table nothing has written to adopts writable without ColdFront
+    # writing to it, whatever its columns require, and its first snapshot is the
+    # first real write.
+    adopt_fixture lake fresh '(id BIGINT NOT NULL, note VARCHAR)'
+    q "$HOST" "SELECT coldfront.adopt_iceberg_table('public','fresh','lake', p_writable => true);" >/dev/null 2>&1
+    assert_eq "TC-173: a never-written table with a required column adopts writable" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.tiered_views WHERE relname='fresh' AND is_writable;")"
+    assert_eq "TC-173: adoption wrote nothing to it" "0" "$(snapshot_count ice.lake.fresh)"
+    q "$HOST" "INSERT INTO fresh VALUES (1, 'first');" >/dev/null 2>&1
+    assert_eq "TC-173: its first write lands" "1" "$(q "$HOST" "SELECT count(*) FROM fresh;")"
+    q "$HOST" "SELECT coldfront.release_iceberg_table('public','fresh');" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story: TC-171 (mesh), one node adopts and the mesh follows. The wrapper view
+# replicates as DDL and the registry row through the repset, so a peer reads and
+# writes the table under the same name without adopting it, and a peer's own
+# adopt is refused as already registered. Releasing on the adopting node
+# unregisters it everywhere.
+# ───────────────────────────────────────────────────────────────────────────
+story_adopt_mesh() {
+    [ "$MODE" = decoupled ] || return
+    step "TC-171: adopt on one node, read, write and release from the mesh"
+    local PARR; read -ra PARR <<< "$PEERS"
+    [ "${#PARR[@]}" -ge 1 ] || { fail "TC-171: no --peers given"; return; }
+    local p1="${PARR[0]}"
+
+    q "$HOST" "SELECT coldfront.adopt_iceberg_table('public','orders','lake', p_writable => true);" >/dev/null 2>&1
+    sleep 3
+    assert_eq "TC-171: the registry row replicated to the peer" "1" \
+        "$(q "$p1" "SELECT count(*) FROM coldfront.tiered_views WHERE relname='orders' AND iceberg_table='ice.lake.orders' AND is_writable;")"
+    assert_eq "TC-171: the wrapper view replicated to the peer" "v" \
+        "$(q "$p1" "SELECT relkind FROM pg_class WHERE relname='orders' AND relnamespace='public'::regnamespace;")"
+    local O; O=$(q_may "$p1" "SELECT coldfront.adopt_iceberg_table('public','orders','lake', p_writable => true);")
+    assert_contains "TC-171: the peer's own adopt is refused" 'is already registered for ice.lake.orders' "$O"
+
+    q "$HOST" "INSERT INTO orders VALUES (4001, TIMESTAMPTZ '2026-02-01 10:00:00+00', 'mesh', 7.00, '{}');" >/dev/null 2>&1
+    assert_eq "TC-171: the peer reads what this node wrote" "1" \
+        "$(q "$p1" "SELECT count(*) FROM orders WHERE order_id=4001;")"
+    q "$p1" "INSERT INTO orders VALUES (4002, TIMESTAMPTZ '2026-02-02 10:00:00+00', 'mesh', 8.00, '{}');" >/dev/null 2>&1
+    assert_eq "TC-171: this node reads what the peer wrote" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM orders WHERE order_id=4002;")"
+
+    q "$HOST" "SELECT coldfront.release_iceberg_table('public','orders');" >/dev/null 2>&1
+    sleep 3
+    assert_eq "TC-171: release unregistered the table on the peer" "0" \
+        "$(q "$p1" "SELECT count(*) FROM coldfront.tiered_views WHERE relname='orders';")"
+    assert_eq "TC-171: the peer's wrapper view is gone" "0" \
+        "$(q "$p1" "SELECT count(*) FROM pg_class WHERE relname='orders' AND relnamespace='public'::regnamespace;")"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -1439,6 +1676,62 @@ story_maintenance() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# Story 6f: a cold write whose transaction began before the written table's
+# current snapshot, after the snapshot that was current at that start has
+# expired. With the metadata log off, duckdb-iceberg (ICEBERG_REF 5edc45f0)
+# rewinds a table a transaction writes to the table's state at the
+# transaction's start. That state is gone, so the write fails as outdated
+# instead of working from an empty table that lacks the rows the table had.
+# ───────────────────────────────────────────────────────────────────────────
+story_start_snapshot_expired() {
+    step "6f. A write whose start snapshot expired fails as outdated, not over an empty table"
+    require_compactor || return
+    local t i a g
+    for t in cf_exp cf_exq; do
+        q "$HOST" "SELECT coldfront.create_iceberg_table('public','$t','[{\"name\":\"id\",\"type\":\"bigint\"}]'::jsonb);" >/dev/null 2>&1
+        q "$HOST" "INSERT INTO $t VALUES (1);" >/dev/null
+    done
+    # TC-182: the writer's read of cf_exq starts its DuckDB transaction while
+    # cf_exp has one snapshot; the writer then waits on the gate's advisory
+    # lock while a second snapshot lands on cf_exp and the first one expires.
+    qf "$HOST" >/dev/null 2>&1 <<'SQL' &
+SET application_name = 'cf_tc182_gate';
+SELECT pg_advisory_lock(182);
+SELECT pg_sleep(60);
+SQL
+    g=$!
+    for i in $(seq 1 40); do
+        [ "$(q "$HOST" "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 182 AND objsubid = 1 AND granted;")" = 1 ] && break
+        sleep 0.25
+    done
+    qf "$HOST" >"$TMPD/cf.182" 2>&1 <<'SQL' &
+BEGIN;
+SELECT count(*) FROM cf_exq;
+SELECT pg_advisory_lock(182);
+INSERT INTO cf_exp VALUES (3);
+SELECT 'rows=' || count(*) FROM cf_exp;
+COMMIT;
+SQL
+    a=$!
+    for i in $(seq 1 40); do
+        [ "$(q "$HOST" "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND objid = 182 AND objsubid = 1 AND NOT granted;")" = 1 ] && break
+        sleep 0.25
+    done
+    q "$HOST" "INSERT INTO cf_exp VALUES (2);" >/dev/null
+    "$COMPACTOR" --config $TMPD/archiver.yaml --table cf_exp --expire-snapshots --expire-older-than 0s \
+        --expire-retain-last 1 --expire-keep-files >"$TMPD/cf.182x" 2>&1
+    q "$HOST" "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'cf_tc182_gate';" >/dev/null
+    wait "$a" "$g" 2>/dev/null
+    assert_eq "TC-182 the snapshot current at the writer's start expired as staged" "1" "$(grep -c -E 'expired [1-9][0-9]* snapshot' "$TMPD/cf.182x")"
+    assert_eq "TC-182 a write whose start snapshot expired fails as outdated" "1" "$(grep -c 'already outdated' "$TMPD/cf.182")"
+    assert_eq "TC-182 the transaction never reads the table without its rows" "" "$(sed -n 's/^rows=//p' "$TMPD/cf.182")"
+    for t in cf_exp cf_exq; do
+        q "$HOST" "SELECT coldfront.drop_iceberg_table('public','$t', true);" >/dev/null 2>&1
+    done
+    rm -f "$TMPD"/cf.182* 2>/dev/null
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Story 6c — Cold + dual-tier DML issued from INSIDE plpgsql (a DO block). This
 # is the end-to-end test of BOTH fixes: plpgsql variable refs become $N bound
 # params (Cause 1, kept live via format()), and the rewrite must be a DML-tagged
@@ -1783,10 +2076,8 @@ story_coexist() {
 # Story 12 — Mesh-only (decoupled): cross-node visibility + the R-A bakery under
 # real multi-node contention. Runs against the iceberg-only `iceonly` table the
 # decoupled stories created on db1. The wrapper VIEW replicates to peers via
-# Spock DDL; the decoupled topo does not add coldfront.tiered_views to the repset
-# (that is tiered-only), so we re-register on each peer (create_iceberg_table is
-# idempotent, and the registry is name-keyed so every node's row is identical) to
-# arm the C hook there. Cold data itself is shared via Lakekeeper, not Spock.
+# Spock DDL and the name-keyed registry row through the repset, which is what
+# arms the C hook there. Cold data itself is shared via Lakekeeper, not Spock.
 # ───────────────────────────────────────────────────────────────────────────
 story_mesh() {
     step "12. Mesh: cross-node visibility + R-A bakery (decoupled, multi-node)"
@@ -1796,11 +2087,11 @@ story_mesh() {
     local PARR; read -ra PARR <<< "$PEERS"
     [ "${#PARR[@]}" -ge 1 ] || { fail "mesh: no --peers given"; return; }
 
-    # Re-register the iceberg-only view on each peer (local registry row).
+    # db1's registration reached every peer: the view as DDL, the row by value.
     local pc
     for pc in "${PARR[@]}"; do
-        q_may "$pc" "SELECT coldfront.create_iceberg_table('public','iceonly','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"ts\",\"type\":\"timestamptz\"},{\"name\":\"status\",\"type\":\"text\"},{\"name\":\"data\",\"type\":\"jsonb\"}]'::jsonb);" >/dev/null 2>&1
-        assert_eq "iceberg-only registered on peer $pc" "1" "$(q "$pc" "SELECT count(*) FROM coldfront.tiered_views WHERE is_iceberg_only AND iceberg_table='ice.public.iceonly';")"
+        assert_eq "iceberg-only registry row replicated to peer $pc" "1" "$(q "$pc" "SELECT count(*) FROM coldfront.tiered_views WHERE is_iceberg_only AND iceberg_table='ice.public.iceonly';")"
+        assert_eq "iceberg-only wrapper view replicated to peer $pc" "v" "$(q "$pc" "SELECT relkind FROM pg_class WHERE relname='iceonly' AND relnamespace='public'::regnamespace;")"
     done
 
     # Cross-node READ: every row db1 wrote to Iceberg is visible on each peer via
@@ -1971,6 +2262,233 @@ SQL
     assert_eq "TC-160..163 all three reaper-path writes landed" "3" \
         "$(q "$HOST" "SELECT count(*) FROM $tbl WHERE status='reap';")"
     rm -f $TMPD/reap.* 2>/dev/null
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story (mesh): failures inside the claim step. Every advisory lock the claim
+# and the apply trigger take ends with a transaction, whatever becomes of the
+# loopback connection, and a transaction's claim on a table stays held until it
+# commits. TC-174 times a claim out while another session holds the table's
+# claim key; TC-175 and TC-176 give one transaction a second cold write, to the
+# same table and to another one, while a peer waits behind its first claim;
+# TC-177 fails the apply trigger while it defers a peer's claim; TC-178 checks
+# that an app role's session has no way into the loopback; TC-179 terminates a
+# writer while its claim waits on a row; TC-180 kills every loopback session on
+# a node; TC-181 gives a session's loopback a search_path that shadows a
+# pg_catalog function. Runs on two throwaway Iceberg tables.
+# ───────────────────────────────────────────────────────────────────────────
+story_mesh_claim_failures() {
+    step "12d. Mesh: a failed claim step leaves no lock, claim or open loopback behind"
+    local PARR; read -ra PARR <<< "$PEERS"
+    [ "${#PARR[@]}" -ge 1 ] || { fail "mesh: no --peers given"; return; }
+    local p1="${PARR[0]}" i rc out a a_commit p_done t ref_t loop_app own fake peer_node
+    # A write that must return; the server-side timeout ends the backend's own wait too.
+    tq() { timeout "$1" docker exec -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" -e PGOPTIONS="-c statement_timeout=$(( $1 - 5 ))s" "$2" "$CF_PSQL" -tA -c "$3"; }
+    # Several statements in one session, read from stdin; an error does not stop it.
+    sess() { docker exec -i -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" "$1" "$CF_PSQL" -tA -X -v ON_ERROR_STOP=0; }
+    later() { awk -v a="$1" -v b="$2" 'BEGIN { print (a >= b) ? 1 : 0 }'; }
+    node_claims() { q "$HOST" "SELECT count(*) FROM coldfront.claims WHERE snowflake.get_node(ticket) = coldfront.node_id() AND iceberg_table LIKE '$1%';"; }
+    for t in cf_ct cf_cu; do
+        q "$HOST" "SELECT coldfront.create_iceberg_table('public','$t','[{\"name\":\"id\",\"type\":\"bigint\"}]'::jsonb);" >/dev/null 2>&1
+    done
+    for i in $(seq 1 80); do
+        [ "$(q "$p1" "SELECT count(*) FROM coldfront.tiered_views v WHERE v.relname IN ('cf_ct','cf_cu') AND to_regclass(format('%I.%I', v.schema_name, v.relname)) IS NOT NULL;")" = "2" ] && break
+        sleep 0.25
+    done
+    ref_t=$(q "$HOST" "SELECT iceberg_table FROM coldfront.tiered_views WHERE relname = 'cf_ct';")
+
+    # TC-174: a claim times out while another session holds the table's claim
+    # key. The session holds no advisory lock afterwards, and its next write
+    # clears what the timed-out attempt and an orphan planted on another table
+    # left on the node.
+    q "$HOST" "INSERT INTO coldfront.claims (iceberg_table, ticket) VALUES ('${ref_t}_tc174', snowflake.nextval());" >/dev/null
+    sess "$HOST" >/dev/null 2>&1 <<SQL &
+BEGIN;
+SELECT pg_advisory_xact_lock(hashtext('coldfront_claim:' || '$ref_t'));
+SELECT pg_sleep(4);
+COMMIT;
+SQL
+    a=$!
+    sleep 1
+    out=$(sess "$HOST" 2>&1 <<SQL
+SET statement_timeout = '1s';
+INSERT INTO cf_ct VALUES (1741);
+RESET statement_timeout;
+SELECT 'locks=' || count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid();
+SELECT pg_sleep(4);
+INSERT INTO cf_ct VALUES (1742);
+SQL
+)
+    wait "$a" 2>/dev/null
+    assert_eq "TC-174 the claim timed out as staged" "1" "$(echo "$out" | grep -c 'statement timeout')"
+    assert_eq "TC-174 a timed-out claim leaves no advisory lock" "0" "$(echo "$out" | sed -n 's/^locks=//p')"
+    assert_eq "TC-174 the session's next cold write lands" "1" "$(q "$HOST" "SELECT count(*) FROM cf_ct WHERE id = 1742;")"
+    assert_eq "TC-174 no claim is left on the node for either table" "0" "$(node_claims "$ref_t")"
+
+    # TC-175: one transaction writes cf_ct twice; a peer's write to cf_ct arrives
+    # between the two and stays behind the transaction's claim until COMMIT.
+    sess "$HOST" >"$TMPD/cf.175a" 2>&1 <<SQL &
+BEGIN;
+INSERT INTO cf_ct VALUES (1751);
+SELECT pg_sleep(3);
+INSERT INTO cf_ct VALUES (1752);
+SELECT pg_sleep(3);
+SELECT 'a_commit=' || extract(epoch FROM clock_timestamp());
+COMMIT;
+SQL
+    a=$!
+    sleep 1.5
+    tq 90 "$p1" "INSERT INTO cf_ct VALUES (1753);" >"$TMPD/cf.175b" 2>&1
+    p_done=$(date +%s.%N)
+    wait "$a" 2>/dev/null
+    a_commit=$(sed -n 's/^a_commit=//p' "$TMPD/cf.175a")
+    assert_eq "TC-175 a second write to the same table keeps the transaction's claim" "1" "$(later "$p_done" "$a_commit")"
+    assert_eq "TC-175 no write errored" "0" "$(cat "$TMPD"/cf.175? | grep -c ERROR)"
+    assert_eq "TC-175 all three writes landed" "3" "$(q "$HOST" "SELECT count(*) FROM cf_ct WHERE id BETWEEN 1751 AND 1753;")"
+
+    # TC-176: one transaction writes cf_cu, then cf_ct; a peer's write to cf_cu
+    # arrives between the two and stays behind the cf_cu claim until COMMIT.
+    sess "$HOST" >"$TMPD/cf.176a" 2>&1 <<SQL &
+BEGIN;
+INSERT INTO cf_cu VALUES (1761);
+SELECT pg_sleep(3);
+INSERT INTO cf_ct VALUES (1762);
+SELECT pg_sleep(3);
+SELECT 'a_commit=' || extract(epoch FROM clock_timestamp());
+COMMIT;
+SQL
+    a=$!
+    sleep 1.5
+    tq 90 "$p1" "INSERT INTO cf_cu VALUES (1763);" >"$TMPD/cf.176b" 2>&1
+    p_done=$(date +%s.%N)
+    wait "$a" 2>/dev/null
+    a_commit=$(sed -n 's/^a_commit=//p' "$TMPD/cf.176a")
+    assert_eq "TC-176 a write to a second table keeps the transaction's claim on the first" "1" "$(later "$p_done" "$a_commit")"
+    assert_eq "TC-176 no write errored" "0" "$(cat "$TMPD"/cf.176? | grep -c ERROR)"
+    assert_eq "TC-176 all three writes landed" "3" \
+        "$(q "$HOST" "SELECT (SELECT count(*) FROM cf_cu WHERE id IN (1761, 1763)) + (SELECT count(*) FROM cf_ct WHERE id = 1762);")"
+
+    # TC-177: the apply trigger fails while it defers a peer's claim. It runs in
+    # this session as it does under spock's apply (session_replication_role =
+    # replica); its FOR UPDATE on the smaller same-node claim times out behind a
+    # session holding that row and the table lock, and the session must hold no
+    # advisory lock afterwards.
+    own=$(q "$HOST" "WITH i AS (INSERT INTO coldfront.claims (iceberg_table, ticket) SELECT '$ref_t', snowflake.nextval() RETURNING ticket) SELECT ticket FROM i;")
+    peer_node=$(q "$p1" "SELECT coldfront.node_id();")
+    # One millisecond past now, carrying the peer's node id: a peer claim sorting after $own.
+    fake=$(q "$HOST" "SELECT ((snowflake.nextval() + (1::bigint << 22)) & ~(1023::bigint << 12)) | ($peer_node::bigint << 12);")
+    sess "$HOST" >/dev/null 2>&1 <<SQL &
+BEGIN;
+SELECT pg_advisory_xact_lock(hashtext('coldfront_iceberg:' || '$ref_t'));
+SELECT ticket FROM coldfront.claims WHERE ticket = $own FOR UPDATE;
+SELECT pg_sleep(4);
+COMMIT;
+SQL
+    a=$!
+    sleep 1
+    out=$(sess "$HOST" 2>&1 <<SQL
+SET session_replication_role = replica;
+SET lock_timeout = '500ms';
+INSERT INTO coldfront.claims (iceberg_table, ticket) VALUES ('$ref_t', $fake);
+RESET lock_timeout;
+SET session_replication_role = origin;
+SELECT 'locks=' || count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid();
+SQL
+)
+    wait "$a" 2>/dev/null
+    assert_eq "TC-177 the apply trigger failed while deferring, as staged" "1" "$(echo "$out" | grep -c 'lock timeout')"
+    assert_eq "TC-177 a failed apply trigger leaves no advisory lock" "0" "$(echo "$out" | sed -n 's/^locks=//p')"
+    q "$HOST" "DELETE FROM coldfront.claims WHERE ticket = $own;" >/dev/null
+
+    # TC-178: after a cold write as an app role, its session has no way into the
+    # loopback: no named dblink connection is left open in it,
+    # coldfront._loopback is not executable by it, and it cannot change
+    # coldfront.dblink_self, the loopback's connection string.
+    q "$HOST" "DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'cf_tc178') THEN CREATE ROLE cf_tc178 NOSUPERUSER LOGIN; END IF; END \$\$;" >/dev/null 2>&1
+    q "$HOST" "SELECT coldfront.grant_app_access('cf_tc178');" >/dev/null 2>&1
+    out=$(sess "$HOST" 2>&1 <<'SQL'
+SET ROLE cf_tc178;
+INSERT INTO cf_ct VALUES (1781);
+SELECT to_regproc('public.dblink_get_connections') IS NOT NULL AS has_dblink \gset
+\if :has_dblink
+SELECT 'named=' || count(*) FROM unnest(public.dblink_get_connections()) c;
+\else
+SELECT 'named=0';
+\endif
+SELECT 'can_exec=' || has_function_privilege('coldfront._loopback(text)', 'execute');
+SET coldfront.dblink_self = 'dbname=cf_tc178';
+SELECT 'dsn_set=' || (current_setting('coldfront.dblink_self') = 'dbname=cf_tc178');
+SQL
+)
+    assert_eq "TC-178 the app role's cold write landed" "1" "$(q "$HOST" "SELECT count(*) FROM cf_ct WHERE id = 1781;")"
+    assert_eq "TC-178 no named loopback connection is left in an app role's session" "0" "$(echo "$out" | sed -n 's/^named=//p')"
+    assert_eq "TC-178 an app role cannot execute the loopback" "false" "$(echo "$out" | sed -n 's/^can_exec=//p')"
+    assert_eq "TC-178 an app role cannot change the loopback's connection string" "false" "$(echo "$out" | sed -n 's/^dsn_set=//p')"
+
+    # TC-179: a writer is terminated while its claim waits on a row the claim's
+    # reap must delete. The claim statement finishes before that writer's
+    # backend exits, so the next writer on the node reaps the dead writer's
+    # claim instead of waiting behind it, and no claim is left afterwards.
+    own=$(q "$HOST" "WITH i AS (INSERT INTO coldfront.claims (iceberg_table, ticket) SELECT '$ref_t', snowflake.nextval() RETURNING ticket) SELECT ticket FROM i;")
+    sess "$HOST" >/dev/null 2>&1 <<SQL &
+BEGIN;
+SELECT ticket FROM coldfront.claims WHERE ticket = $own FOR UPDATE;
+SELECT pg_sleep(4);
+COMMIT;
+SQL
+    a=$!
+    sleep 1
+    sess "$HOST" >/dev/null 2>&1 <<'SQL' &
+SET application_name = 'cf_tc179_writer';
+INSERT INTO cf_ct VALUES (1791);
+SQL
+    local w=$!
+    sleep 1
+    q "$HOST" "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'cf_tc179_writer';" >/dev/null
+    tq 60 "$HOST" "INSERT INTO cf_ct VALUES (1792);" >"$TMPD/cf.179" 2>&1; rc=$?
+    wait "$a" "$w" 2>/dev/null
+    assert_eq "TC-179 the next writer is not stranded behind a terminated writer's claim" "0" "$rc"
+    assert_eq "TC-179 the next writer's row landed" "1" "$(q "$HOST" "SELECT count(*) FROM cf_ct WHERE id = 1792;")"
+    assert_eq "TC-179 no claim is left on the node" "0" "$(node_claims "$ref_t")"
+
+    # TC-180: every loopback session on $HOST dies between two cold writes of one
+    # session. The next write reconnects instead of failing, the session holds no
+    # advisory lock afterwards, and a peer's claim still gets $HOST's ack.
+    loop_app=$(q "$HOST" "SELECT substring(current_setting('coldfront.dblink_self') from 'application_name=([^ ]+)');")
+    out=$(sess "$HOST" 2>&1 <<SQL
+INSERT INTO cf_ct VALUES (1801);
+SELECT 'killed=' || count(*) FROM (SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = '$loop_app') k;
+SELECT pg_sleep(0.5);
+INSERT INTO cf_ct VALUES (1802);
+SELECT 'locks=' || count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid();
+INSERT INTO cf_ct VALUES (1803);
+SQL
+)
+    assert_gt "TC-180 the node's loopback sessions were killed" "0" "$(echo "$out" | sed -n 's/^killed=//p')"
+    assert_eq "TC-180 cold writes after the loopback died reconnect instead of failing" "0" "$(echo "$out" | grep -c ERROR)"
+    assert_eq "TC-180 the session holds no advisory lock once its loopback died" "0" "$(echo "$out" | sed -n 's/^locks=//p')"
+    tq 60 "$p1" "INSERT INTO cf_ct VALUES (1804);" >"$TMPD/cf.180" 2>&1; rc=$?
+    assert_eq "TC-180 a peer's cold write still gets the node's ack" "0" "$rc"
+    assert_eq "TC-180 all four writes landed" "4" "$(q "$HOST" "SELECT count(*) FROM cf_ct WHERE id BETWEEN 1801 AND 1804;")"
+    assert_eq "TC-180 no claim is left on the node" "0" "$(node_claims "$ref_t")"
+
+    # TC-181: the loopback resolves unqualified names in pg_catalog only. A
+    # session's loopback connection string carries a search_path startup option
+    # naming a schema that shadows pg_advisory_xact_lock(integer); the claim's
+    # call never reaches the shadow, and the write lands.
+    q "$HOST" "DROP SCHEMA IF EXISTS cf_tc181 CASCADE; CREATE SCHEMA cf_tc181; CREATE TABLE cf_tc181.hits (who text); CREATE FUNCTION cf_tc181.pg_advisory_xact_lock(integer) RETURNS void LANGUAGE sql AS 'INSERT INTO cf_tc181.hits VALUES (current_user)';" >/dev/null 2>&1
+    sess "$HOST" >/dev/null 2>&1 <<'SQL'
+SELECT set_config('coldfront.dblink_self', current_setting('coldfront.dblink_self') || ' options=''-csearch_path=cf_tc181''', false);
+INSERT INTO cf_ct VALUES (1811);
+SQL
+    assert_eq "TC-181 the write over the redirected loopback landed" "1" "$(q "$HOST" "SELECT count(*) FROM cf_ct WHERE id = 1811;")"
+    assert_eq "TC-181 the loopback never resolves a name outside pg_catalog" "0" "$(q "$HOST" "SELECT count(*) FROM cf_tc181.hits;")"
+    q "$HOST" "DROP SCHEMA cf_tc181 CASCADE;" >/dev/null 2>&1
+
+    for t in cf_ct cf_cu; do
+        q "$HOST" "SELECT coldfront.drop_iceberg_table('public','$t', true);" >/dev/null 2>&1
+    done
+    rm -f "$TMPD"/cf.* 2>/dev/null
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -4710,6 +5228,7 @@ story_duckdb_spill_concurrency() {
     for i in 1 2 3 4; do
         ( qf "$HOST" >"$TMPD/spill-$i.out" 2>&1 <<'EOSQL'
 SET duckdb.max_memory = '150MB';
+SELECT current_setting('duckdb.temporary_directory');
 SELECT r['s']::bigint AS s
   FROM duckdb.query($$SELECT sum(g)::BIGINT AS s
                         FROM (SELECT i % 3000000 AS g, string_agg(repeat('y',100)) AS pad
@@ -4724,12 +5243,13 @@ EOSQL
     # the backend that wrote them: proof pg_duckdb used the path coldfront
     # assigned, not merely that the GUC reads back nicely.
     seen=$(docker exec "$HOST" bash -c "sort -u /tmp/cf_spillwatch.log 2>/dev/null | grep -c '/[0-9][0-9]*/duckdb_temp_'")
-    pids=$(docker exec "$HOST" bash -c "sed -n 's#.*/\([0-9][0-9]*\)/duckdb_temp_.*#\1#p' /tmp/cf_spillwatch.log 2>/dev/null | sort -u | wc -l")
     docker exec "$HOST" bash -c "rm -f /tmp/cf_spillwatch.log /tmp/cf_spillwatch.stop" 2>/dev/null
     assert_eq "TC-153: DuckDB spilled into per-backend directories" "yes" \
         "$([ "${seen:-0}" -gt 0 ] && echo yes || echo no)"
-    assert_eq "TC-153: concurrent spills went to more than one directory" "yes" \
-        "$([ "${pids:-0}" -ge 2 ] && echo yes || echo no)"
+    # Each session reports the directory its backend spills into; four sessions,
+    # four directories.
+    assert_eq "TC-153: each concurrent session spills into its own directory" "4" \
+        "$(grep -h '^/' "$TMPD"/spill-*.out 2>/dev/null | sort -u | wc -l)"
 
     bad=0
     for i in 1 2 3 4; do
@@ -5055,6 +5575,7 @@ if [ "$MODE" = "tiered" ]; then
                             # manifests iceberg-go-readable
     story_maintenance       # iceberg-go ExpireSnapshots + DeleteOrphanFiles — reclaim the
                             # snapshot/small-file bloat compaction leaves (Lakekeeper can't)
+    [ "$MESH" = 1 ] || story_start_snapshot_expired  # a write whose start snapshot expired fails as outdated
     story_writes_plpgsql
     story_app_privilege          # non-superuser onboarding + cold I/O (mesh: cross-node + SD bakery)
     story_mixed_concurrency
@@ -5118,6 +5639,8 @@ else
     story_decoupled_plpgsql
     story_decoupled_concurrency
     story_decoupled_ryw
+    story_adopt_decoupled
+    [ "$MESH" = 1 ] && story_adopt_mesh
 fi
 story_duckdb_temp_dirs     # TC-152: per-backend spill dir; departed backends' spills reclaimed
 story_duckdb_spill_concurrency  # TC-153: four sessions spilling at once stay isolated and correct
@@ -5125,6 +5648,7 @@ story_drop_iceberg_table   # both modes, purge and keep-files (own throwaway tab
 [ "$MESH" = 1 ] && [ "$MODE" = decoupled ] && story_mesh   # tiered+mesh runs story_mesh_tiered (above)
 [ "$MESH" = 1 ] && story_mesh_multiwriter   # >1 cold writer/node cross-node (tiered: events, decoupled: iceonly)
 [ "$MESH" = 1 ] && story_mesh_reaper        # orphan claims/acks reaped on the claim, apply and poke paths
+[ "$MESH" = 1 ] && story_mesh_claim_failures  # a failed claim step leaves no lock, claim or open loopback
 [ -n "$STANDBY" ]    && story_standby_reads
 
 summary

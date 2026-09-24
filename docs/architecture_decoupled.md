@@ -238,6 +238,157 @@ The helper doesn't add capability over raw_query - it composes the
 existing primitives into a single call so applications get a
 normal-looking PG table.
 
+## Wrapper helper: `coldfront.adopt_iceberg_table()`
+
+Adoption registers a table that already exists in the Iceberg catalog.
+The wrapper view and the registry row are built from the schema the
+catalog holds, and nothing is provisioned:
+
+```sql
+SELECT coldfront.adopt_iceberg_table('public', 'orders', 'lake');
+```
+
+The following table describes the parameters:
+
+| Parameter | Meaning |
+|---|---|
+| `p_schema` | PostgreSQL schema that holds the wrapper view; it must exist. |
+| `p_table` | The view's name, and the Iceberg table's name. |
+| `p_namespace` | Iceberg namespace the table lives in; NULL means `p_schema`. It need not exist as a PostgreSQL schema. |
+| `p_writable` | False registers the read path alone; true arms the DML rewrite. |
+| `p_types` | `{"column": "pg_type"}` overrides for the types the columns read as. |
+
+The schema is read with `DESCRIBE` through `duckdb.query()`, with
+`duckdb.unsafe_allow_execution_inside_functions = on` set LOCAL for the
+call. `DESCRIBE` is a metadata-only read: it scans no Parquet and works
+on a table with no snapshot. Its rows arrive in Iceberg schema order,
+which fixes a clustered table's cluster-column order.
+
+Adoption differs from creation in three places: types map from Iceberg
+to PostgreSQL, no `CREATE SCHEMA` or `CREATE TABLE` reaches the catalog,
+and the registry row records writability. The C hook emits
+`tiered_views.iceberg_table` verbatim, so a reference outside
+`ice.<pg_schema>.<pg_relname>` needs no further handling.
+
+### Types an adopted column reads as
+
+Iceberg records no PostgreSQL type, so the PostgreSQL types that share
+one storage type all come back as the type that storage type reads as
+natively. The following table shows the mapping, and which PostgreSQL
+types collapse onto each row:
+
+| Iceberg | DuckDB `column_type` | PostgreSQL type | Collapsed inputs |
+|---|---|---|---|
+| boolean | `BOOLEAN` | `boolean` | |
+| int | `INTEGER` | `integer` | `smallint` |
+| long | `BIGINT` | `bigint` | |
+| float | `FLOAT` | `real` | |
+| double | `DOUBLE` | `double precision` | |
+| decimal(P,S) | `DECIMAL(P,S)` | `numeric(P,S)` | |
+| date | `DATE` | `date` | |
+| time | `TIME` | `time` | |
+| timestamp | `TIMESTAMP` | `timestamp` | |
+| timestamptz | `TIMESTAMP WITH TIME ZONE` | `timestamptz` | |
+| string | `VARCHAR` | `text` | `varchar(N)`, `char(N)`, `jsonb`, `json`, `interval` |
+| uuid | `UUID` | `uuid` | |
+| binary, fixed[n] | `BLOB` | `bytea` | |
+| list of float | `FLOAT[]` | `real[]` | `vector(N)`, `halfvec(N)` |
+
+Nanosecond timestamps are refused, because PostgreSQL stores
+microseconds; so are variant, geometry, struct, map, and lists of
+anything but float. The refusal names the column and the Iceberg type.
+
+`p_types` sets the type a column reads as, so a `jsonb` column that
+ColdFront created adopts as `jsonb` rather than `text`:
+
+```sql
+SELECT coldfront.adopt_iceberg_table(
+    'public', 'orders', 'lake',
+    p_writable => true,
+    p_types    => '{"meta":"jsonb"}'::jsonb);
+```
+
+An override is accepted only where it maps to the storage type the
+catalog holds. Both sides run through the same reverse map, so
+`timestamptz` matches `TIMESTAMP WITH TIME ZONE` and `numeric(12, 2)`
+matches `DECIMAL(12,2)`, while `bigint` over a `DECIMAL(12,2)` column is
+refused. An override cannot reinterpret the stored bytes.
+
+A `FLOAT[]` column whose Iceberg schema carries a `_cf_vec_list_<column>`
+sibling is recorded in `vec_columns`, and the cluster columns stay out of
+the view's projection. Without the sibling the column is a plain
+`real[]`.
+
+### Writability
+
+The registry row carries `is_writable`, and the parse-analyze hook
+refuses INSERT, UPDATE and DELETE on a relation whose flag is false:
+
+```text
+ERROR:  coldfront: "public.orders" is adopted read-only
+HINT:  Release it with coldfront.release_iceberg_table() and adopt again with p_writable => true to arm INSERT/UPDATE/DELETE.
+```
+
+Reads never consult the flag. `vector_train()`, `vector_assign()` and
+`drop_iceberg_table()` refuse a read-only relation too, since each
+rewrites or destroys the Iceberg table. The archiver and
+`create_iceberg_table()` set the flag; adoption defaults it to false.
+
+### One relation per Iceberg table
+
+`coldfront.tiered_views` has a unique constraint on `iceberg_table`, and
+adoption refuses a reference that is already registered. The
+cluster-column lookups resolve a table by its reference, so two rows
+sharing one would concatenate both tables' cluster columns into the
+first's INSERT list and fail the second outright.
+
+### Adoption binds the name once
+
+A second `adopt_iceberg_table()` under a registered name is refused
+whatever its arguments, as is a tiered relation's name. To arm writes,
+change an override, or pick up an evolved schema, release the table and
+adopt it again; the new view is built from the schema the catalog holds
+then.
+
+In a Spock mesh one node adopts. The `CREATE VIEW` replicates through
+the `ddl_sql` repset (`spock.allow_ddl_from_functions` is on) and the
+registry row through the `default` repset, which arms the parse-analyze
+hook on every peer; a peer's own adopt is refused as already registered.
+A release unregisters everywhere, because the registry `DELETE` precedes
+the `DROP VIEW` in the same transaction and disarms the peer's DDL hook
+before the drop is applied there.
+
+### Handing a table back
+
+`coldfront.release_iceberg_table()` removes the wrapper view and the
+registry row and performs no Iceberg I/O, so the Iceberg table keeps
+every row:
+
+```sql
+SELECT coldfront.release_iceberg_table('public', 'orders');
+```
+
+A plain `DROP VIEW` stays blocked by the DDL hook. A tiered registration
+is refused, because releasing one would leave its cold rows unreachable
+while the hot table returned under the relation's name.
+
+### Limits
+
+Adoption inherits three limits:
+
+- writers outside ColdFront are outside the bakery, so Spark or any
+  other engine on the same catalog can still collide with a ColdFront
+  write at Lakekeeper. An in-house tool joins the protocol through
+  `coldfront._claim_iceberg_external()`, as the Go compactor does.
+- nested Iceberg namespaces are not reachable. The pinned duckdb-iceberg
+  build joins the parts of a nested namespace with an unencoded
+  separator byte in the request path, so a table under `lake.eu` cannot
+  be loaded, from adoption or from `duckdb.query()`. A namespace that
+  merely needs quoting, such as `Lake-EU`, works.
+- adopting a table as the cold tier of an existing hot table is out of
+  scope; the watermark and the partition configuration would have to be
+  reconciled with data ColdFront did not write.
+
 ## Wrapper helper: `coldfront.drop_iceberg_table()`
 
 Drops the Iceberg table backing a registered relation, in either mode:
@@ -348,8 +499,8 @@ PG nodes pointing at the same Lakekeeper endpoint and S3 bucket.
   independent queue, so it never assumes a peer has applied its concurrent
   claim; the snowflake-ticket total order and the ack barrier serialize
   commits, not any global apply ordering. Modelled in
-  [docs/formal/Bakery_v2.tla](https://github.com/pgEdge/ColdFront/blob/main/docs/formal/Bakery_v2.tla); the safety
-  properties are verified via TLA+ (`Bakery_v2.cfg`).
+  [docs/formal/Bakery.tla](https://github.com/pgEdge/ColdFront/blob/main/docs/formal/Bakery.tla); the safety
+  properties are verified via TLA+ (`Bakery.cfg`).
 
   Two tables, both in Spock's `default` repset:
 
@@ -368,8 +519,14 @@ PG nodes pointing at the same Lakekeeper endpoint and S3 bucket.
   Per-writer flow:
 
   1. `snowflake.nextval()` - fresh globally-unique ticket.
-  2. Insert `(iceberg_table, ticket)` into `coldfront.claims` via
-     dblink (autonomous tx; replicates async via Spock).
+  2. Insert `(iceberg_table, ticket)` into `coldfront.claims` over
+     the node's loopback, a libpq connection the extension's C code
+     keeps (autonomous tx; replicates async via Spock). SQL reaches it
+     only through `coldfront._loopback()`, which PUBLIC cannot execute.
+     Only a superuser can set its connection string,
+     `coldfront.dblink_self`, and the loopback resolves names in
+     `pg_catalog` only. The ticket is taken inside that transaction,
+     under the table's claim key, and every lock it takes ends with it.
   3. **Wait until both** (a) no same-node writer has a smaller
      ticket on this table, and (b) every alive peer has acked the
      ticket (its row appears in `coldfront.claim_acks`).
@@ -383,6 +540,10 @@ PG nodes pointing at the same Lakekeeper endpoint and S3 bucket.
      `coldfront.deferred_acks` for that ticket, emitting any acks
      the node had been holding back.
 
+  A transaction takes one claim per table and holds it until it ends,
+  so a second cold write to the same table in that transaction rides
+  the first claim.
+
   Peer-side, when Spock applies an incoming claim INSERT, an
   `ENABLE REPLICA` trigger (`coldfront._on_claim_apply`) decides:
 
@@ -392,8 +553,8 @@ PG nodes pointing at the same Lakekeeper endpoint and S3 bucket.
     `coldfront.deferred_acks` to emit later when the smaller claim is
     released).
   - Otherwise → ack immediately (INSERT into `coldfront.claim_acks`
-    via dblink, so the row is tagged with the local node as origin
-    and Spock replicates it back to the originator).
+    over the loopback, so the row is tagged with the local node as
+    origin and Spock replicates it back to the originator).
 
   The same trigger fires on UPDATE, for the waiter's poke described
   under *Orphan reaping*.
@@ -423,19 +584,21 @@ PG nodes pointing at the same Lakekeeper endpoint and S3 bucket.
   timeout, scheduler or background worker:
 
   - **Claim path.** `_claim_iceberg_lock` already holds the lock for
-    its own table, and tries (session-level, released at once) the lock
-    of every other table this node has a claim on. The dblink statement
-    that inserts the new claim first deletes every same-node claim on
-    those tables (and, after a restart, any claim from before
-    `pg_postmaster_start_time()`) together with their acks, so any cold
-    write on the node clears every orphan the node left. The DELETE
-    fires the release trigger, which forwards whatever peers had
+    its own table. Its claim transaction on the loopback
+    (`_insert_claim`) tries the lock of every other table this node
+    has a claim on; a lock the claimant's own transaction holds makes
+    the try fail, so a transaction never reaps its own claims. It then
+    deletes every same-node claim on those tables (and, after a
+    restart, any claim from before `pg_postmaster_start_time()`)
+    together with their acks before inserting the new claim, so any
+    cold write on the node clears every orphan the node left. The
+    DELETE fires the release trigger, which forwards whatever peers had
     deferred behind the orphan.
   - **Apply path.** When a peer's claim arrives and a smaller same-node
     claim exists, `_on_claim_apply` tries the lock
     (`pg_try_advisory_xact_lock`). Success means no live local writer,
-    so it deletes the same-node claims and their acks through dblink
-    and acks the arrival instead of deferring it. A live writer's
+    so it deletes the same-node claims and their acks through the
+    loopback and acks the arrival instead of deferring it. A live writer's
     lock makes the try fail at once, and the trigger defers as before.
   - **Waiter's poke.** A peer that deferred while the lock was held,
     whose holder then vanished, sees no further event. So a writer in
@@ -449,8 +612,8 @@ PG nodes pointing at the same Lakekeeper endpoint and S3 bucket.
   abandoned may belong to a partitioned node mid-write, and it enters
   neither wait condition anyway. Modelled as the `Reaper` constant,
   the `Applier`'s reap branch and the `Poker` process in
-  `Bakery_v2.tla`: `Bakery_v2_wedge.cfg` shows the stranding without
-  it, and `Bakery_v2_reaper.cfg` and `Bakery_v2_reaper_quiet.cfg` show
+  `Bakery.tla`: `Bakery_wedge.cfg` shows the stranding without
+  it, and `Bakery_reaper.cfg` and `Bakery_reaper_quiet.cfg` show
   liveness and all four safety invariants holding with it, the second
   in the case where nothing but the poke ever reaches the crashed node.
 
@@ -462,16 +625,16 @@ PG nodes pointing at the same Lakekeeper endpoint and S3 bucket.
   slow/lossy WAN links) is implicitly treated as already-acked. An
   *alive* peer that hasn't acked is either deferring (R-A's defer
   rule, legitimate) or about to ack - either way, waiting is
-  correct. Local same-node backends are trusted; a crashed local
-  writer's claim is released by PG's xact rollback via the C
-  XactCallback in
-  [extension/coldfront/src/coldfront.c](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/src/coldfront.c).
+  correct. A same-node claim is released by the C XactCallback in
+  [extension/coldfront/src/coldfront.c](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/src/coldfront.c)
+  at commit or abort, and one whose writer is gone is removed by the
+  reaper.
 
   The mechanics live in [extension/coldfront/coldfront--1.0.sql](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/coldfront--1.0.sql)
-  (`_claim_iceberg_lock`, `_release_iceberg_lock`,
+  (`_claim_iceberg_lock`, `_insert_claim`,
   `_on_claim_apply`, `_on_claim_release`, `_exec_iceberg_with_claim`)
-  and the C-side rewrite in [extension/coldfront/src/coldfront.c](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/src/coldfront.c)
-  (`cold_exec_call`).
+  and the C-side rewrite and loopback in [extension/coldfront/src/coldfront.c](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/src/coldfront.c)
+  (`cold_exec_call`, `cf_loopback_exec`).
 
   Because every commit is uncontested, the duckdb-iceberg writer
   never has to deal with a 409 - no rebase-retry loop needed at
@@ -479,10 +642,11 @@ PG nodes pointing at the same Lakekeeper endpoint and S3 bucket.
   bakery sidesteps the requirement.)
 
 - **DDL replication.** Spock's `ddl_sql` repset replicates
-  `CREATE/ALTER/DROP` of the wrapper view, but the
-  `coldfront.tiered_views` registry row does not replicate - run
-  `coldfront.create_iceberg_table()` (idempotent, name-keyed) on
-  each node to arm the hook there.
+  `CREATE/ALTER/DROP` of the wrapper view, and the `default` repset
+  replicates the `coldfront.tiered_views` registry row (see
+  [Distributed setup](usage.md#distributed-setup-3-node-mesh-decoupled-mode)),
+  so one node provisions the table and replication arms every peer's
+  hook.
 
 ### Throughput characterisation
 
@@ -516,7 +680,7 @@ snowflake.node = 1     # node1
 # snowflake.node = 2   # node2
 # snowflake.node = 3   # node3
 
-# DSN for the bakery's autonomous-tx claim/ack dblink calls (unix socket).
+# DSN of the loopback that runs the bakery's autonomous claim/ack/release statements (unix socket).
 coldfront.dblink_self = 'host=/tmp dbname=coldfront user=coldfront application_name=coldfront_dblink'
 
 # Optional — peer-liveness window for R-A's dead-peer escape; a peer

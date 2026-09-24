@@ -209,11 +209,71 @@ That single statement provisions:
   DELETE on the view is intercepted by the coldfront C hook and rewritten
   to a single `duckdb.raw_query(...)` against `ice.public.events`
 
-Spock's `ddl_sql` repset replicates the `CREATE VIEW`, but the registry
-row does not propagate with it: run `create_iceberg_table()` (idempotent,
-name-keyed) on each node to arm the write hook there. Each node also
+In a mesh one node provisions: Spock's `ddl_sql` repset replicates the
+`CREATE VIEW`, and the `default` repset replicates the name-keyed
+registry row, which arms the write hook on every peer. Each node also
 needs the bakery armed via `coldfront._ensure_claims_replicated()` - see
 the one-time mesh setup below.
+
+### Adopting a table that already exists in the catalog
+
+A table another engine wrote needs no provisioning, only a wrapper view
+and a registry row. `coldfront.adopt_iceberg_table()` reads the schema
+from the catalog and builds both, so the call names the relation and
+nothing else:
+
+```sql
+SELECT coldfront.adopt_iceberg_table(
+    p_schema    => 'public',
+    p_table     => 'orders',
+    p_namespace => 'lake'
+);
+```
+
+`p_schema` is the PostgreSQL schema the wrapper view goes in, and it
+must exist. `p_namespace` is the Iceberg namespace the table lives in,
+which need not exist as a PostgreSQL schema; it defaults to `p_schema`
+when omitted. The view takes the table's name.
+
+Adoption is read-only unless asked otherwise, so reading someone else's
+lake table cannot become writing it by accident. Passing
+`p_writable => true` arms the same INSERT, UPDATE and DELETE rewrite a
+created table gets:
+
+```sql
+SELECT coldfront.adopt_iceberg_table('public', 'orders', 'lake',
+                                     p_writable => true);
+```
+
+Because Iceberg records no PostgreSQL type, an adopted column reads as
+whatever its storage type maps to; a `jsonb` column comes back as
+`text`. Pass `p_types` to restore one, which is accepted where the
+override maps to the type the catalog already stores:
+
+```sql
+SELECT coldfront.adopt_iceberg_table('public', 'orders', 'lake',
+                                     p_writable => true,
+                                     p_types    => '{"meta":"jsonb"}'::jsonb);
+```
+
+Adoption binds the name once. A second call under a registered name is
+refused whatever its arguments; to arm writes or change an override,
+release the table with `coldfront.release_iceberg_table()` and adopt it
+again. A non-superuser deployment runs `coldfront.grant_app_access()`
+after adopting, because the grant reads the registry at call time.
+
+In a mesh one node adopts. The wrapper view replicates through Spock's
+`ddl_sql` repset and the registry row through the `default` repset (see
+the one-time mesh setup below), so every peer reads and writes the table
+under the same name, and a peer's own adopt is refused as already
+registered. Adoption takes the table's bakery claim around that check and
+the registry write, so two nodes adopting the same table at the same
+moment are serialised: the second waits, then reads the first's row and
+refuses, rather than both registering the one table. A writer outside
+ColdFront is outside the bakery and can still collide at Lakekeeper.
+
+One relation can be registered per Iceberg table. A namespace that
+needs quoting, such as `Lake-EU`, works.
 
 ## Mode 3 - Standalone partition manager (no cold tier)
 
@@ -370,6 +430,23 @@ Deletion is not instantaneous. The catalog entry disappears with the
 call, and Lakekeeper's own background queue removes the objects shortly
 afterwards, so a listing taken immediately after the call can still show
 them.
+
+### Handing an adopted table back
+
+An adopted table is released rather than dropped, because ColdFront does
+not own it. `coldfront.release_iceberg_table()` removes the wrapper view
+and the registry row and performs no Iceberg I/O, so the table keeps
+every row and stays in the catalog:
+
+```sql
+SELECT coldfront.release_iceberg_table('public', 'orders');
+```
+
+Release refuses a tiered registration, because removing one would leave
+its cold rows unreachable while the hot table returned under the
+relation's name. `drop_iceberg_table()` refuses a relation adopted
+read-only, for the mirrored reason: read access carries no authority to
+destroy.
 
 ## Managing partitioned tables (CLI)
 
@@ -731,8 +808,9 @@ Keep the following caveats in mind when running either mode:
   committing to Lakekeeper. No 409 conflicts, no app-level retry. The
   protocol is Lamport-1978 mutex with the Ricart-Agrawala (1981)
   deferred-reply optimisation; claims and acks replicate as Spock rows
-  and it stays safe under Spock's asymmetric apply (modelled in [docs/formal/Bakery_v2.tla](https://github.com/pgEdge/ColdFront/blob/main/docs/formal/Bakery_v2.tla)). The bakery requires the `dblink` + `snowflake`
-  extensions, the `coldfront.dblink_self` GUC, and a one-time `SELECT
+  and it stays safe under Spock's asymmetric apply (modelled in [docs/formal/Bakery.tla](https://github.com/pgEdge/ColdFront/blob/main/docs/formal/Bakery.tla)). The bakery requires the `snowflake`
+  extension, the `coldfront.dblink_self` GUC (the connection string of the
+  node's loopback), and a one-time `SELECT
   coldfront._ensure_claims_replicated()` call on every node after spock
   mesh setup; see [architecture_decoupled.md](architecture_decoupled.md#concurrency-horizontal-scaling-the-bakery-protocol). Sync-rep is **not** required.
   The throughput ceiling is Lakekeeper's commit rate, not the writer
@@ -774,6 +852,13 @@ spock.enable_ddl_replication = on
 spock.allow_ddl_from_functions = on
 spock.include_ddl_repset = on
 
+# Only on a server that has this setting (PostgreSQL 16.15, 17.11 and 18.6 in
+# pgEdge's builds):
+# it lists the libraries allowed as logical decoding output plugins, and its
+# default leaves out Spock's, so no subscription can create its slot. A server
+# without the setting refuses to start with this line in place.
+output_plugin_libraries = 'pgoutput, test_decoding, spock_output'
+
 # Keep pg_stat_replication.reply_time fresh on every walsender.  PG
 # default is 10 s; with the bakery's 5 s liveness window that would
 # false-positive every idle peer as "dead" on the first claim after a
@@ -784,12 +869,12 @@ wal_receiver_status_interval = 1s
 # is otherwise arbitrary — the bakery matches acks by spock node name, not by id).
 snowflake.node = 1
 
-# DSN used by the bakery's autonomous-tx claim INSERT/DELETE via dblink.
-# Unix socket avoids TCP overhead. The claim session only touches the
+# DSN of the node's loopback, which runs the bakery's autonomous claim
+# INSERT/DELETE. Unix socket avoids TCP overhead. The claim session only touches the
 # coldfront.claims/claim_acks heap tables, so it never attaches the
 # Iceberg catalog (the lazy catalog-attach hook fires only on a tiered
 # view). application_name=coldfront_dblink marks the session as bakery
-# traffic.
+# traffic. Only a superuser can set it.
 coldfront.dblink_self = 'host=/tmp dbname=coldfront user=coldfront application_name=coldfront_dblink'
 
 coldfront.warehouse = 'wh'
@@ -824,10 +909,8 @@ because `coldfront._ensure_claims_replicated()` calls
 exist:
 
 ```sql
--- 1. Extensions, in dependency order. dblink + snowflake are bakery
--- prereqs (R-A's autonomous-tx claim/ack INSERTs go through dblink;
--- claim tickets come from snowflake.nextval).
-CREATE EXTENSION IF NOT EXISTS dblink;
+-- 1. Extensions, in dependency order. snowflake is a bakery prereq
+-- (claim tickets come from snowflake.nextval).
 CREATE EXTENSION IF NOT EXISTS snowflake;
 CREATE EXTENSION IF NOT EXISTS spock;
 CREATE EXTENSION IF NOT EXISTS pg_duckdb;
@@ -857,8 +940,8 @@ SELECT coldfront._ensure_claims_replicated();
 -- the archiver/partitioner touches it, so it needs no manual step.)
 SELECT spock.repset_add_table('default', 'coldfront.storage_secret'::regclass, false);
 
--- 5. Tiered mesh only, on every node: replicate the registry + watermark
--- so a tiered table provisioned on one node is fully usable on peers
+-- 5. On every node: replicate the registry + watermark, so a table
+-- provisioned, tiered or adopted on one node is fully usable on peers
 -- (both tables are name-keyed, so the rows are node-independent).
 SELECT spock.repset_add_table('default', 'coldfront.tiered_views'::regclass, false);
 SELECT spock.repset_add_table('default', 'coldfront.archive_watermark'::regclass, false);

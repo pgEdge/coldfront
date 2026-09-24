@@ -150,6 +150,14 @@ q "$DB" "SET ROLE cfapp; INSERT INTO public.cold1 VALUES (102),(103);"    >/dev/
 assert_eq "app role: transparent cold writes landed (read-your-write)" "3" \
     "$(qas cfapp "SELECT count(*) FROM public.cold1 WHERE id IN (101,102,103);")"
 
+# A cross-tier move reads Iceberg with iceberg_scan inside a function, which
+# pg_duckdb permits only under a parameter it defines superuser-only. The move
+# runs as the caller, so onboarding grants the app role the right to set it;
+# without that a partition-column UPDATE is denied before any row moves.
+allow_exec=$(q_may "$DB" "SET ROLE cfapp; SET duckdb.unsafe_allow_execution_inside_functions = on;")
+assert_eq "app role CAN set the in-function execution parameter (cross-tier move)" "" \
+    "$(echo "$allow_exec" | grep -iE 'permission denied' || true)"
+
 # The boundary holds — three negatives:
 deny_set=$(q_may "$DB" "SET ROLE cfapp; SET coldfront.lakekeeper_endpoint='http://attacker.example/evil';")
 assert_contains "app role CANNOT redirect the elevated ATTACH endpoint (SUSET GUC)" "permission denied" "$deny_set"
@@ -157,6 +165,8 @@ deny_self=$(q_may "$DB" "SET ROLE cfapp; SELECT coldfront.grant_app_access('cfap
 assert_contains "app role CANNOT self-grant (grant_app_access not PUBLIC-executable)" "permission denied" "$deny_self"
 deny_bare=$(q_may "$DB" "SET ROLE cfnobody; SELECT count(*) FROM public.cold1;")
 assert_contains "un-onboarded role is cleanly DENIED cold access" "ERROR" "$deny_bare"
+deny_exec=$(q_may "$DB" "SET ROLE cfnobody; SET duckdb.unsafe_allow_execution_inside_functions = on;")
+assert_contains "un-onboarded role CANNOT set the in-function execution parameter" "permission denied" "$deny_exec"
 
 # ── Check 4: pg_dump/restore re-attaches to the same Iceberg ───────────────────
 # Real DR: restore the logical dump into a FRESH instance of the same image — same

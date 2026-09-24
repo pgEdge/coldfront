@@ -726,6 +726,118 @@ All four DML operations reach the Iceberg table transparently. The
 coldfront extension intercepts each statement on the view and rewrites
 it to the Iceberg path via pg_duckdb.
 
+## Demo 2b: adopt a table already in the lake
+
+Not every Iceberg table starts in ColdFront. A table another engine
+wrote needs no provisioning, only a wrapper view and a registry row.
+Adoption builds both from the schema the catalog already holds.
+
+### Stand in for the external writer
+
+These three statements are the only ones in this walkthrough written in
+DuckDB SQL, because they represent what some other engine already did to
+your lake. The namespace create commits on its own, ahead of the table
+create, because DuckDB defers an Iceberg `CREATE SCHEMA` to commit while
+posting `CREATE TABLE` immediately:
+
+```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
+SELECT coldfront.ensure_attached();
+SELECT duckdb.raw_query('CREATE SCHEMA IF NOT EXISTS ice.lake');
+```
+
+The table carries a `VARCHAR` column holding JSON, which matters in a
+moment:
+
+```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
+SELECT coldfront.ensure_attached();
+SELECT duckdb.raw_query($$
+  CREATE TABLE IF NOT EXISTS ice.lake.orders (
+    order_id BIGINT, placed_at TIMESTAMP WITH TIME ZONE,
+    customer VARCHAR, amount DECIMAL(12,2), meta VARCHAR)$$);
+SELECT duckdb.raw_query($$
+  INSERT INTO ice.lake.orders VALUES
+    (1, now(), 'acme', 19.99, '{"tier":"gold"}'),
+    (2, now(), 'globex', 249.50, '{"tier":"silver"}')$$);
+```
+
+### Adopt it read-only
+
+One call, and no column list; the schema comes from the catalog. The
+view goes in the PostgreSQL schema `public`; `lake` is the Iceberg
+namespace, and no PostgreSQL schema of that name is needed:
+
+```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
+SELECT coldfront.adopt_iceberg_table('public', 'orders', 'lake');
+
+SELECT order_id, customer, amount FROM orders ORDER BY order_id;
+```
+
+The call reports what it registered:
+
+```text
+NOTICE:  coldfront: adopted ice.lake.orders as public.orders (5 columns, read-only)
+```
+
+Writes are not armed, and the refusal says what to do:
+
+```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -P pager=off -f"}
+UPDATE orders SET amount = 0 WHERE order_id = 1;
+```
+
+```text
+ERROR:  coldfront: "public.orders" is adopted read-only
+HINT:  Release it with coldfront.release_iceberg_table() and adopt again with p_writable => true to arm INSERT/UPDATE/DELETE.
+```
+
+### Arm the writes
+
+Adoption binds the name once, so arming writes is a release followed by
+a second adopt with `p_writable => true`, which arms the same rewrite a
+created table gets. Every write below is one bakery-serialized Iceberg
+snapshot:
+
+```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
+SELECT coldfront.release_iceberg_table('public', 'orders');
+SELECT coldfront.adopt_iceberg_table('public', 'orders', 'lake',
+                                     p_writable => true);
+
+INSERT INTO orders VALUES (3, now(), 'initech', 42.00, '{"tier":"bronze"}');
+UPDATE orders SET amount = 21.00 WHERE order_id = 3;
+DELETE FROM orders WHERE order_id = 1;
+
+SELECT order_id, customer, amount FROM orders ORDER BY order_id;
+```
+
+### Restore a type Iceberg cannot record
+
+The `meta` column reads as text, because Iceberg stores JSON as
+`VARCHAR` and records no PostgreSQL type. `p_types` restores it, and the
+override is accepted because it maps to what the catalog stores:
+
+```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
+SELECT coldfront.release_iceberg_table('public', 'orders');
+SELECT coldfront.adopt_iceberg_table('public', 'orders', 'lake',
+                                     p_writable => true,
+                                     p_types    => '{"meta":"jsonb"}'::jsonb);
+
+SELECT order_id, meta->>'tier' AS tier FROM orders ORDER BY order_id;
+```
+
+### Hand it back
+
+Release removes the view and the registry row and performs no Iceberg
+I/O, so the table keeps every row and stays in the catalog:
+
+```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
+SELECT coldfront.release_iceberg_table('public', 'orders');
+```
+
+Two things are worth carrying away from this demo. A `VARCHAR` column
+comes back as text rather than as `jsonb` unless `p_types` says
+otherwise, because Iceberg records no PostgreSQL type. And the bakery
+serializes ColdFront's own writers, not an external engine writing the
+same table.
+
 ## Demo 3: standalone partitioner
 
 The partitioner binary manages PostgreSQL range partitions without any
@@ -841,7 +953,6 @@ docker compose -f examples/walkthrough/docker-compose.mesh.yml up -d
 -- On BOTH nodes - create the extensions. The container preloads the libraries
 -- (shared_preload_libraries) but does not run CREATE EXTENSION, so the SQL
 -- objects (the spock schema, coldfront functions) do not exist until you do:
-CREATE EXTENSION IF NOT EXISTS dblink;
 CREATE EXTENSION IF NOT EXISTS snowflake;
 CREATE EXTENSION IF NOT EXISTS spock;
 CREATE EXTENSION IF NOT EXISTS pg_duckdb;

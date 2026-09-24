@@ -475,9 +475,9 @@ mesh_bringup() {
 
     start_spinner "[5/6] Installing ColdFront + forming the Spock mesh"
     # Extensions on both nodes, one per call (a chained CREATE aborts the rest on
-    # the first failure). dblink+snowflake+spock are the mesh substrate.
+    # the first failure). snowflake+spock are the mesh substrate.
     for port in "$MESH_PG1_PORT" "$MESH_PG2_PORT"; do
-        for ext in dblink snowflake spock pg_duckdb coldfront; do
+        for ext in snowflake spock pg_duckdb coldfront; do
             mpg "$port" "CREATE EXTENSION IF NOT EXISTS $ext;" >/dev/null 2>&1
         done
     done
@@ -696,12 +696,18 @@ EOSQL
 # to on a kept-infra re-run (inflated counts, duplicate ids). Dropping the catalog
 # entry makes a re-run start clean. Best-effort: silent if the catalog/table is absent.
 drop_iceberg_table() {
+    drop_iceberg_table_ns "${LK_NS}" "$1"
+}
+
+# drop_iceberg_table_ns <namespace> <table>: the same, for a table outside the
+# walkthrough's own namespace (the adoption fixture is in `lake`).
+drop_iceberg_table_ns() {
     local wh_id
     wh_id=$(curl -s "${LK_URL}/management/v1/warehouse" \
         | grep -o '"warehouse-id":"[^"]*"' | head -1 | cut -d'"' -f4)
     [ -n "$wh_id" ] || return 0
     curl -s -o /dev/null -X DELETE \
-        "${LK_URL}/catalog/v1/${wh_id}/namespaces/${LK_NS}/tables/$1?purgeRequested=true" || true
+        "${LK_URL}/catalog/v1/${wh_id}/namespaces/$1/tables/$2?purgeRequested=true" || true
 }
 
 # teardown_tiered / teardown_decoupled — idempotent cleanup for a demo's objects.
@@ -723,6 +729,15 @@ teardown_decoupled() {
     pg "DROP VIEW  IF EXISTS events_lake CASCADE;" >/dev/null 2>&1 || true
     pg "DROP TABLE IF EXISTS events_lake CASCADE;" >/dev/null 2>&1 || true
     drop_iceberg_table events_lake
+}
+
+# The adoption fixture lives in its own Iceberg namespace, since it stands in for
+# a table some other engine wrote. Its wrapper view goes the same way as any
+# registered relation: unregister first, or the coldfront DROP block holds.
+teardown_adopted() {
+    pg "DELETE FROM coldfront.tiered_views WHERE relname='orders';" >/dev/null 2>&1 || true
+    pg "DROP VIEW IF EXISTS orders CASCADE;" >/dev/null 2>&1 || true
+    drop_iceberg_table_ns lake orders
 }
 
 demo_tiered() {
@@ -1043,7 +1058,46 @@ demo_decoupled() {
     show_query "SELECT count(*) AS rows FROM events_lake;"
     show_query "SELECT pg_size_pretty(pg_relation_size('events_lake')) AS pg_bytes;"
 
-    # Step 6 — scale-out bridge (narrative only, no commands).
+    # Step 6: adoption. The fixture stands in for an external writer, which is why
+    # it is the only DuckDB SQL in the walkthrough. The namespace create must commit
+    # ahead of the table create: DuckDB defers an Iceberg CREATE SCHEMA to COMMIT
+    # while POSTing CREATE TABLE eagerly, so one transaction would 404.
+    header "Already have a table in your lake? Adopt it"
+    explain "Not every Iceberg table starts in ColdFront. Here we play the part of some other"
+    explain "engine and write a table ColdFront has never heard of:"
+    teardown_adopted
+    pg "SELECT coldfront.ensure_attached(); SELECT duckdb.raw_query('CREATE SCHEMA IF NOT EXISTS ice.lake');" >/dev/null 2>&1
+    pg "SELECT coldfront.ensure_attached(); SELECT duckdb.raw_query(\$\$CREATE TABLE IF NOT EXISTS ice.lake.orders (order_id BIGINT, placed_at TIMESTAMP WITH TIME ZONE, customer VARCHAR, amount DECIMAL(12,2), meta VARCHAR)\$\$);" >/dev/null 2>&1
+    pg "SELECT coldfront.ensure_attached(); SELECT duckdb.raw_query(\$\$INSERT INTO ice.lake.orders VALUES (1, now(), 'acme', 19.99, '{\"tier\":\"gold\"}'), (2, now(), 'globex', 249.50, '{\"tier\":\"silver\"}')\$\$);" >/dev/null 2>&1
+
+    explain "Now we adopt it: one call, and no column list, because the schema comes from the catalog."
+    explain "The view lands in the Postgres schema public; lake is the Iceberg namespace, not a Postgres schema:"
+    run_sql_shown "SELECT coldfront.adopt_iceberg_table('public', 'orders', 'lake');" "" || return
+    explain "The rows another engine wrote read back as ordinary Postgres rows:"
+    show_query "SELECT order_id, customer, amount FROM orders ORDER BY order_id;"
+
+    explain "Adoption is read-only unless you ask otherwise, so reading someone else's table"
+    explain "cannot become writing it by accident:"
+    show_query "UPDATE orders SET amount = 0 WHERE order_id = 1;"
+    info "Refused, and the hint says exactly what to pass to arm the writes."
+
+    explain "Adoption binds the name once, so arming writes is a release and a second adopt with"
+    explain "p_writable => true. Iceberg records no Postgres type, so p_types restores the jsonb the"
+    explain "VARCHAR column holds:"
+    run_sql_shown "SELECT coldfront.release_iceberg_table('public', 'orders');" "" || return
+    run_sql_shown "SELECT coldfront.adopt_iceberg_table('public','orders','lake', p_writable => true, p_types => '{\"meta\":\"jsonb\"}'::jsonb);" "" || return
+    run_sql_shown "INSERT INTO orders VALUES (3, now(), 'initech', 42.00, '{\"tier\":\"bronze\"}');" "" || return
+    run_sql_shown "DELETE FROM orders WHERE order_id = 1;" "" || return
+    explain "Row 3 added, row 1 gone, and the meta column now answers to the json operators:"
+    show_query "SELECT order_id, customer, meta->>'tier' AS tier FROM orders ORDER BY order_id;"
+
+    explain "Releasing hands the table back. The view and the registry row go; the Iceberg"
+    explain "table keeps every row, because release does no Iceberg I/O at all:"
+    run_sql_shown "SELECT coldfront.release_iceberg_table('public', 'orders');" "" || return
+    show_query "SELECT count(*) AS registrations FROM coldfront.tiered_views WHERE relname='orders';"
+    info "Adopt to read someone else's lake table, arm it to write, release to hand it back untouched."
+
+    # Step 7 — scale-out bridge (narrative only, no commands).
     header "Where this goes next: scale compute, not storage"
     explain "Because the data lives in the lake — not in THIS node — you can point more"
     explain "Postgres nodes at the very same data: pure added compute over one shared copy,"
@@ -1332,6 +1386,7 @@ reset_demos() {
     ensure_single_stack
     teardown_tiered       # events + _events + registry/watermark + Iceberg cold table
     teardown_decoupled    # events_lake + registry + Iceberg table
+    teardown_adopted      # orders + registry + the lake.orders Iceberg table
     pg "DROP TABLE IF EXISTS part_demo CASCADE;" >/dev/null 2>&1 || true   # plain table, no cold tier
     info "Demo tables dropped."
 }

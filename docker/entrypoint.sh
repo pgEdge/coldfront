@@ -108,11 +108,21 @@ spock.include_ddl_repset = on
 spock.exception_behaviour = transdiscard
 spock.save_resolutions = on
 snowflake.node = ${SNOWFLAKE_NODE}
-# dblink DSN for the R-A bakery's autonomous claim/release (unix socket). The
-# bakery touches coldfront.claims only, never a tiered view, so the lazy 'ice'
-# attach never fires here.
+# DSN of the loopback that runs the R-A bakery's autonomous claim/ack/release
+# (unix socket). The bakery touches coldfront.claims only, never a tiered view,
+# so the lazy 'ice' attach never fires here.
 coldfront.dblink_self = 'host=/var/run/postgresql dbname=coldfront user=coldfront application_name=coldfront_dblink'
 EOF
+        # Servers with output_plugin_libraries (16.15, 17.11 and 18.6 here) accept only
+        # the logical decoding output plugins it lists, and its default leaves out
+        # spock_output, so every Spock subscription fails to create its slot. A
+        # server without the setting refuses to start on an unknown parameter, so
+        # it is written only where the server has it. grep reads to the end rather
+        # than stopping at the match (-q): under pipefail, the stages an early exit
+        # cuts off die of SIGPIPE and fail the test.
+        if "$PGBIN/postgres" --describe-config 2>/dev/null | cut -f1 | grep -x output_plugin_libraries >/dev/null; then
+            echo "output_plugin_libraries = 'pgoutput, test_decoding, spock_output'" >> "$PGDATA/postgresql.conf"
+        fi
     fi
 
     cat >> "$PGDATA/pg_hba.conf" <<EOF

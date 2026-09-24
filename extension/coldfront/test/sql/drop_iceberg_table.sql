@@ -17,19 +17,25 @@ SET coldfront.warehouse = 'wh';
 SET coldfront.lakekeeper_endpoint = 'http://lk:8181/catalog';
 SET coldfront.dblink_self = '';
 
--- The emitted DDL is built from schema+table, never from the stored
--- iceberg_table string, so it is identical whichever writer registered the row.
+-- The emitted DDL is built from the stored iceberg_table ref, which is the only
+-- thing that names the right catalog table: an adopted relation's namespace is
+-- whatever the caller adopted from, not its PG schema.
 -- purge=true arms PURGE_REQUESTED on a scoped attachment: Lakekeeper deletes the
 -- data and metadata objects.
-SELECT coldfront._iceberg_drop_sql('public', 'iceonly', true);
+SELECT coldfront._iceberg_drop_sql('ice.public.iceonly', true);
 
 -- purge=false needs no attachment of its own: the everyday 'ice' attachment is
 -- never purge-armed, so the drop goes straight through it and the objects stay
--- in the bucket.
-SELECT coldfront._iceberg_drop_sql('public', 'iceonly', false);
+-- in the bucket, so the ref goes through as it is stored.
+SELECT coldfront._iceberg_drop_sql('ice.public.iceonly', false);
 
--- Identifiers are quoted, so mixed case and embedded quotes cannot break out.
-SELECT coldfront._iceberg_drop_sql('My Schema', 'Odd"Name', true);
+-- The archiver quotes every part of the ref it stores and this SQL path quotes
+-- only what needs it; both parse to the same three identifiers.
+SELECT coldfront._iceberg_drop_sql('"ice"."public"."iceonly"', true);
+
+-- Identifiers are re-quoted on the way out, so mixed case and embedded quotes
+-- cannot break out.
+SELECT coldfront._iceberg_drop_sql(format('ice.%I.%I', 'My Schema', 'Odd"Name'), true);
 
 -- An unregistered table is refused (nothing to unregister; no blind catalog drop).
 SELECT coldfront.drop_iceberg_table('public', 'nosuch', true);
@@ -40,6 +46,22 @@ INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_tabl
 VALUES ('public', 'iceonly', NULL, 'ice.public.iceonly', NULL, true);
 
 SELECT coldfront.drop_iceberg_table('public', 'iceonly', NULL);
+
+-- Read access carries no authority to destroy: a relation adopted read-only is
+-- refused before anything is unregistered.
+UPDATE coldfront.tiered_views SET is_writable = false
+ WHERE schema_name = 'public' AND relname = 'iceonly';
+SELECT coldfront.drop_iceberg_table('public', 'iceonly', false);
+UPDATE coldfront.tiered_views SET is_writable = true
+ WHERE schema_name = 'public' AND relname = 'iceonly';
+
+-- One relation per Iceberg ref. _vec_list_cols_for_ref and _vec_list_prefix_for_ref
+-- look the registry up by ref, so a second row on the same ref would make the
+-- first concatenate two tables' cluster columns and the second fail outright.
+CREATE VIEW public.iceonly_again AS SELECT 1 AS id;
+INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col, is_iceberg_only)
+VALUES ('public', 'iceonly_again', NULL, 'ice.public.iceonly', NULL, true);
+DROP VIEW public.iceonly_again;
 
 -- Decoupled teardown: the registry row and the wrapper view both go.
 SELECT coldfront._unregister_iceberg('public', 'iceonly');

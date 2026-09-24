@@ -81,7 +81,7 @@ step "mesh: extensions on all nodes"
 # behind /dev/null: a silent CREATE EXTENSION spock failure once let a dead mesh
 # masquerade as healthy for an entire matrix run.
 for n in $NODES; do
-    for ext in dblink snowflake spock pg_duckdb coldfront; do
+    for ext in snowflake spock pg_duckdb coldfront; do
         if ! out=$(docker exec -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" "coldfront-${n}-1" \
                    "$CF_PSQL" -v ON_ERROR_STOP=1 -qtAc "CREATE EXTENSION IF NOT EXISTS $ext;" 2>&1); then
             echo "CREATE EXTENSION $ext on $n FAILED: $out"; exit 1
@@ -96,35 +96,44 @@ done
 for a in $NODES; do for b in $NODES; do [ "$a" = "$b" ] && continue
     m "$a" "SELECT spock.sub_create('sub_${a}_from_${b}','host=$b user=coldfront dbname=coldfront port=5432');" >/dev/null 2>&1
 done; done
-for n in $NODES; do m "$n" "SELECT spock.sub_wait_for_sync(sub_name) FROM spock.subscription;" >/dev/null 2>&1; done
+# A subscription that never starts leaves sub_wait_for_sync waiting forever, so
+# the wait is bounded and a timeout reports every subscription's status and the
+# node's latest server errors instead of hanging the run.
+for n in $NODES; do
+    if ! m "$n" "SET statement_timeout = '120s'; SELECT spock.sub_wait_for_sync(sub_name) FROM spock.subscription;" >/dev/null; then
+        echo "spock bootstrap FAILED: $n's subscriptions did not sync within 120 s"
+        for s in $NODES; do
+            echo "  $s: $(m "$s" "SELECT string_agg(subscription_name || '=' || status, ' ') FROM spock.sub_show_status();")"
+            docker exec "coldfront-${s}-1" sh -c 'ls -t "$PGDATA"/log/*.log 2>/dev/null | head -1 | xargs -r grep -h -E "ERROR|FATAL" | tail -3' | sed 's/^/    /'
+        done
+        exit 1
+    fi
+done
 subs=$(m db1 "SELECT count(*) FROM spock.subscription;")
 [ "$subs" = 2 ] || { echo "spock bootstrap FAILED: db1 has '$subs' subscriptions (expected 2) — mesh not formed"; exit 1; }
 
 # Pre-arm the R-A bakery substrate on EVERY node: coldfront.claims/claim_acks
 # must be in each node's replication set BEFORE any cold write. A peer acks an
-# originator's claim by INSERTing into claim_acks (via dblink, so it is the
-# peer's own origin); that ack only reaches the originator if claim_acks is in
+# originator's claim by INSERTing into claim_acks (over its loopback, so it is
+# the peer's own origin); that ack only reaches the originator if claim_acks is in
 # the peer's repset. create_iceberg_table() calls this too, but only on the node
 # it runs on — so peers would otherwise not be armed until too late, and the
 # originator would sleep forever waiting for acks. Idempotent.
 for n in $NODES; do m "$n" "SELECT coldfront._ensure_claims_replicated();" >/dev/null 2>&1; done
-# Tiered cross-node: replicate the registry + watermark alongside the bakery's
-# claims/claim_acks. Both are needed for a tiered table provisioned on db1 to be
-# fully usable on a peer: archive_watermark (keyed by table_name) gives the peer's
-# write hook the hot/cold cutoff, and tiered_views (keyed by schema_name,relname)
-# arms the hook to recognise the view for UPDATE/DELETE + DDL-blocking. Both are
-# name-keyed, so the repset copies each row verbatim and correct on every node (a
-# name is node-independent). VERIFIED necessary: drop the tiered_views entry and
-# the registry is absent on peers (only INSERT keeps working, via the replicated
-# INSTEAD trigger) — the archiver runs on db1 only, so a peer never registers the
-# view itself; it gets the row by replication. (See ARCHITECTURE_TIERED.md "Tiered
-# tables in a Spock mesh". Decoupled re-registers per-node, so this is tiered-only.)
-if [ "$MODE" = tiered ]; then
-    for n in $NODES; do
-        m "$n" "SELECT spock.repset_add_table('default','coldfront.tiered_views'::regclass, false);"    >/dev/null 2>&1
-        m "$n" "SELECT spock.repset_add_table('default','coldfront.archive_watermark'::regclass, false);" >/dev/null 2>&1
-    done
-fi
+# Cross-node registry: replicate tiered_views + archive_watermark alongside the
+# bakery's claims/claim_acks, so a table provisioned, tiered or adopted on db1 is
+# fully usable on a peer. tiered_views (keyed by schema_name,relname) arms the
+# peer's hook to recognise the view for UPDATE/DELETE + DDL-blocking;
+# archive_watermark (keyed by table_name) gives a tiered table's write hook the
+# hot/cold cutoff. Both are name-keyed, so the repset copies each row verbatim and
+# correct on every node (a name is node-independent). One node registers, the
+# archiver on db1 or the node that called create/adopt_iceberg_table; a peer never
+# registers the view itself and gets the row by replication. (See
+# docs/architecture_tiered.md "Tiered tables in a Spock mesh".)
+for n in $NODES; do
+    m "$n" "SELECT spock.repset_add_table('default','coldfront.tiered_views'::regclass, false);"    >/dev/null 2>&1
+    m "$n" "SELECT spock.repset_add_table('default','coldfront.archive_watermark'::regclass, false);" >/dev/null 2>&1
+done
 # Per-table lifecycle config + the cold-tier storage secret replicate by value
 # in any mesh mode (partition_config is also self-registered by the binaries via
 # partcfg.EnsureTable; doing it here too is harmless).

@@ -25,7 +25,7 @@ each before applying, failing the build loudly on patch rot.
 
 ---
 
-## 1. The agnostic cold-write code path (bakery patch is a *performance* feature)
+## 1. The agnostic cold-write code path (the bakery patch never changes it)
 
 ColdFront has **one** cold-write code path; the bakery patch never changes it.
 `coldfront._exec_iceberg_with_claim` (the single chokepoint for decoupled
@@ -65,10 +65,12 @@ END IF;
 
 ## 2. What the bakery patch does (v1.5)
 
-`docker/iceberg-bakery-aware-commit-refresh-v15.patch`, three files across
+`docker/iceberg-bakery-aware-commit-refresh-v15.patch`, four files: three across
 `src/catalog/rest/transaction/` and `src/include/catalog/rest/transaction/`
 (no public API/ABI change; the internal cache/refresh helpers gain an explicit
-`scan_context`). The problem: ColdFront
+`scan_context`), plus one hunk in
+`src/catalog/rest/catalog_entry/table/iceberg_table_information.cpp` (item 5).
+The problem: ColdFront
 uploads parquet *outside* the R-A bakery and takes the ticket only for the commit
 POST, so by POST time a peer may have advanced the catalog head — a commit
 against *session-cached* metadata fails `assert-ref-snapshot-id` (HTTP **409**),
@@ -101,10 +103,25 @@ the ticket is held):
    transaction during the commit callback. So the cache/refresh helpers take an
    explicit `scan_context`. Using the wrong context throws
    `TransactionContext::ActiveTransaction called without active transaction`.
+5. **Load side** (`IcebergTableInformation::Copy`): ColdFront sets
+   `iceberg_use_metadata_log` off, because the log read has no storage
+   credential under vending. Without the log, a transaction that first touches
+   a table another writer committed to since the transaction began is rewound
+   to the snapshot current at that start, and upstream throws `already
+   outdated` when no such snapshot is left. Either the table had none then,
+   which is every writer queued on the table lock behind the first commit into
+   a never-written table in the stock ordering, and the millisecond between
+   the lazy attach and staging in the async one, or that snapshot has since
+   expired. The hunk tells them apart by the table's first snapshot (no
+   parent, sequence number 1): when it is present and was committed after the
+   transaction began, the hunk returns the as-of-start state, an empty table
+   (`has_current_snapshot = false`, `last_sequence_number = 0`), and items 1 to
+   3 then land the write on the live head. An expired start snapshot keeps the
+   error.
 
-**Formally verified** before the code (the project rule): `docs/formal/Bakery_v2.tla`
-models the async ordering; `Bakery_v2_async.cfg` (patched) holds
-`NoLakekeeperConflict`, `Bakery_v2_race.cfg` (async **without** the patch)
+**Formally verified** before the code (the project rule): `docs/formal/Bakery.tla`
+models the async ordering; `Bakery_async.cfg` (patched) holds
+`NoLakekeeperConflict`, `Bakery_race.cfg` (async **without** the patch)
 violates it — the standing proof the patch is mandatory for async. **Validated**
 over Azure ADLS: journey 6b (4 concurrent mixed-tier writers → 8/8, 0 loss) and
 9b (8 concurrent cold writers → 8/8).
@@ -201,7 +218,7 @@ GUCs the patched-base entrypoint writes to `postgresql.conf`:
   — both, together. `coldfront._iceberg_async_active()` is true only when both
   are on; otherwise the cold-write path fails safe to claim-first (never a 409)
   and logs a one-time advisory. Flipping only the async flag on a stock binary
-  can never silently 409 — proven by `Bakery_v2_race.cfg` + the
+  can never silently 409 — proven by `Bakery_race.cfg` + the
   `async_requires_patch` pg_regress test. **Rebuild + republish the base whenever
   the entrypoint or any patch changes**, or async silently downgrades.
 

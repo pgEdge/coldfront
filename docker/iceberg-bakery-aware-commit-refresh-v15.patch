@@ -41,6 +41,22 @@
 # list: the commit runs on a fresh connection with no secret, and under
 # catalog credential vending there is no persistent secret to fall back on.
 #
+# The load-side hunk (iceberg_table_information.cpp, IcebergTableInformation::
+# Copy). coldfront sets iceberg_use_metadata_log off, because the log read
+# needs a storage credential the session does not have under vending. Without
+# the log, a transaction that first touches a table after another writer
+# committed to it is rewound to the snapshot that was current when the
+# transaction began, and upstream throws "already outdated" when no such
+# snapshot is left: either the table had none then, which is every writer
+# queued on the table lock behind the first commit into a never-written
+# table, or it has since expired. The hunk tells the two apart by the table's
+# first snapshot (no parent, sequence number 1): when it is present and was
+# committed after the transaction began, the table had no snapshot at the
+# start, and the hunk returns that state, an empty table. The write stages
+# against it and the commit-time refresh above lands it on the live head,
+# exactly as a write staged before the bakery ticket does. An expired start
+# snapshot keeps the error.
+#
 diff --git a/src/catalog/rest/transaction/iceberg_transaction.cpp b/src/catalog/rest/transaction/iceberg_transaction.cpp
 index 6901b08e..b057c3d8 100644
 --- a/src/catalog/rest/transaction/iceberg_transaction.cpp
@@ -231,3 +247,33 @@ index c48f5ea5..04232551 100644
  
  public:
  	int32_t initial_schema_id;
+
+diff --git a/src/catalog/rest/catalog_entry/table/iceberg_table_information.cpp b/src/catalog/rest/catalog_entry/table/iceberg_table_information.cpp
+index eed00a8f..667850d3 100644
+--- a/src/catalog/rest/catalog_entry/table/iceberg_table_information.cpp
++++ b/src/catalog/rest/catalog_entry/table/iceberg_table_information.cpp
+@@ -651,6 +651,24 @@ IcebergTableInformation IcebergTableInformation::Copy(IcebergTransaction &iceber
+ 			IcebergSnapshotScanInfo snapshot_info;
+ 			snapshot_info = ret.table_metadata.GetSnapshot(snapshot_lookup);
+ 			if (!snapshot_info.snapshot) {
++				// No snapshot current at this transaction's start is left. When the
++				// table's first snapshot (no parent, sequence number 1) is here and
++				// was committed after that start, the table had no snapshot then, so
++				// its state as of the start is the empty table: return that instead
++				// of throwing. A write staged against it commits through the refresh
++				// in IcebergTransaction::DoTableUpdates, which re-derives the parent
++				// from the live head, the same way a write staged before the bakery
++				// ticket does. Otherwise the snapshot current at the start has
++				// expired, and the error stands.
++				for (auto &entry : ret.table_metadata.snapshots) {
++					auto &first = entry.second;
++					if (!first.has_parent_snapshot && first.sequence_number == 1 &&
++					    Timestamp::GetEpochMs(first.timestamp_ms) > transaction_start_millis) {
++						ret.table_metadata.has_current_snapshot = false;
++						ret.table_metadata.last_sequence_number = 0;
++						return ret;
++					}
++				}
+ 				throw TransactionException("Table %s is already outdated. Please restart your transaction",
+ 				                           GetTableKey());
+ 			}
