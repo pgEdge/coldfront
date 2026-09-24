@@ -55,6 +55,11 @@ and this project adheres to
   replication slot, because the setting's default leaves out
   `spock_output`. The Docker image adds `spock_output` to it on mesh nodes,
   and the per-node configuration in the usage guide lists it.
+- The compactor claimed a table made by `coldfront.create_iceberg_table()`
+  under a different spelling of its Iceberg reference than the one cold
+  writes to it claimed, so compaction and snapshot expiry did not wait for
+  those writes. Every registration now stores the reference with each part
+  quoted, which is how the archiver and the compactor spell it.
 
 ## [1.0.0-beta2] - 2026-08-08
 

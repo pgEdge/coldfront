@@ -107,10 +107,11 @@ func run(cfgPath, tableName string, o runOpts) error {
 	}
 
 	// The bakery claim key MUST be byte-identical to the cold-write path's so every
-	// mutating step mutually-excludes with concurrent cold writers. The archiver and
-	// hook build it as pgx.Identifier{"ice", schema, table}.Sanitize() with the PG
-	// schema as the Iceberg namespace (cmd/archiver/main.go icebergRef;
-	// coldfront--1.0.sql tiered_views.iceberg_table).
+	// mutating step mutually-excludes with concurrent cold writers. Cold writes claim
+	// the stored tiered_views.iceberg_table, which every registration spells this
+	// way, each part quoted: the archiver with pgx.Identifier.Sanitize
+	// (cmd/archiver/main.go icebergRef), create_iceberg_table() and adoption with
+	// coldfront._iceberg_ref.
 	schema, table := splitSchemaTable(tableName)
 	icebergRef := pgx.Identifier{"ice", schema, table}.Sanitize()
 

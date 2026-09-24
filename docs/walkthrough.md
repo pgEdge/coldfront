@@ -775,7 +775,7 @@ SELECT order_id, customer, amount FROM orders ORDER BY order_id;
 The call reports what it registered:
 
 ```text
-NOTICE:  coldfront: adopted ice.lake.orders as public.orders (5 columns, read-only)
+NOTICE:  coldfront: adopted "ice"."lake"."orders" as public.orders (5 columns, read-only)
 ```
 
 Writes are not armed, and the refusal says what to do:

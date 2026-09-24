@@ -262,7 +262,7 @@ static bool coldfront_in_utility = false;
 
 typedef struct {
     char        *hot_table;       /* e.g. "public._events"; NULL when is_iceberg_only */
-    char        *iceberg_table;   /* e.g. "ice.default.events"   */
+    char        *iceberg_table;   /* e.g. "ice"."default"."events" */
     char        *partition_col;   /* e.g. "ts"; NULL when is_iceberg_only */
     bool         has_cutoff;      /* false → nothing archived yet */
     bool         is_iceberg_only; /* true → table lives entirely in Iceberg, no hot tier */
@@ -3923,7 +3923,7 @@ typedef struct {
     char *view_schema;     /* registry key part 1: the view's namespace */
     char *view_relname;    /* registry key part 2: the view's name */
     char *hot_table;       /* quoted qualified, e.g. "public"."_events" */
-    char *iceberg_table;   /* DuckDB ref, e.g. ice.default.events */
+    char *iceberg_table;   /* DuckDB ref, e.g. "ice"."default"."events" */
     char *partition_col;   /* the tier partition column */
 } TieredDDLInfo;
 

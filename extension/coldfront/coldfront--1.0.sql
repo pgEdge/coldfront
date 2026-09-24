@@ -21,7 +21,7 @@ CREATE TABLE coldfront.tiered_views (
     schema_name     text    NOT NULL,                  -- namespace of the transparent view
     relname         text    NOT NULL,                  -- name of the transparent view
     hot_table       text,                              -- 'public._events' (tiered) or NULL (iceberg-only)
-    iceberg_table   text    NOT NULL,                  -- DuckDB ref, e.g. 'ice.myapp.events'
+    iceberg_table   text    NOT NULL,                  -- DuckDB ref, e.g. '"ice"."myapp"."events"'
     partition_col   text,                              -- 'ts' (tiered) or NULL (iceberg-only)
     is_iceberg_only boolean NOT NULL DEFAULT false,
     -- Whether the C hook rewrites INSERT/UPDATE/DELETE on this view, or refuses
@@ -2748,6 +2748,17 @@ LANGUAGE sql IMMUTABLE STRICT AS $$
     FROM (SELECT lower(trim(p_pg_type))) AS s(t);
 $$;
 
+-- The reference a table in the attached catalog is registered and claimed under.
+-- Every part is quoted and embedded quotes are doubled, as pgx.Identifier.Sanitize
+-- spells the archiver's and the compactor's, so an Iceberg table has one
+-- reference whichever path registered it, and cold writes and the compactor
+-- claim one key for it.
+CREATE FUNCTION coldfront._iceberg_ref(p_namespace text, p_table text)
+RETURNS text
+LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
+    SELECT '"ice"."' || replace(p_namespace, '"', '""') || '"."' || replace(p_table, '"', '""') || '"';
+$$;
+
 -- The PostgreSQL half of registering a decoupled relation: the wrapper view over
 -- an Iceberg table plus the registry row that arms the C hook on it. Both
 -- create_iceberg_table and adopt_iceberg_table end here, so a created table and
@@ -2842,12 +2853,9 @@ BEGIN
             USING HINT = 'Adoption puts a wrapper view under that name. Adopt under another name, or move the existing relation aside first.';
     END IF;
 
-    -- Compared as identifiers, not as strings: the archiver quotes every part of
-    -- the ref it stores and this path quotes only what needs it, so one table has
-    -- two spellings and a raw comparison would miss the collision.
     SELECT format('%s.%s', schema_name, relname) INTO v_owner
       FROM coldfront.tiered_views
-     WHERE parse_ident(iceberg_table) = parse_ident(p_ice_ref);
+     WHERE iceberg_table = p_ice_ref;
     IF v_owner IS NOT NULL THEN
         RAISE EXCEPTION 'coldfront.adopt_iceberg_table: % is already registered as "%"', p_ice_ref, v_owner
             USING HINT = 'One relation per Iceberg table: the cluster-column and cold-write lookups resolve a table by its ref. Release the existing registration first.';
@@ -2957,7 +2965,7 @@ BEGIN
     -- Refused before the claim below, so a standby stays out of the bakery.
     PERFORM coldfront._reject_on_standby('adopt an Iceberg table');
 
-    v_ice := format('ice.%I.%I', COALESCE(p_namespace, p_schema), p_table);
+    v_ice := coldfront._iceberg_ref(COALESCE(p_namespace, p_schema), p_table);
 
     -- The preflight and the registry INSERT run under the table's bakery claim,
     -- so two nodes adopting one Iceberg table are serialised rather than both
@@ -3111,7 +3119,7 @@ CREATE OR REPLACE FUNCTION coldfront.create_iceberg_table(
 ) RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
-    ice_ref          text := format('ice.%I.%I', p_schema, p_table);
+    ice_ref          text := coldfront._iceberg_ref(p_schema, p_table);
     iceberg_cols     text := '';
     v_view_cols      jsonb := '[]'::jsonb;
     v_vec_cols       text[] := '{}';
@@ -3983,9 +3991,7 @@ $$;
 --
 -- The reference is the stored iceberg_table string, which is the only thing that
 -- names the right catalog table: an adopted relation's namespace is whatever it
--- was adopted from, unrelated to its PG schema. parse_ident reads either form the
--- registry holds, the archiver's fully quoted one and this SQL path's minimally
--- quoted one.
+-- was adopted from, unrelated to its PG schema.
 CREATE FUNCTION coldfront._iceberg_drop_sql(
     p_ice_ref text,
     p_purge   boolean

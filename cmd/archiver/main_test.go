@@ -614,3 +614,11 @@ func TestIcebergRef_SchemaScoped(t *testing.T) {
 	assert.Contains(t, a, "events")
 	assert.Contains(t, b, "analytics")
 }
+
+// Every part is quoted, as coldfront._iceberg_ref spells the references that
+// create_iceberg_table() and adoption register, so cold writes and the
+// compactor claim one key per table whichever path registered it.
+func TestIcebergRef_QuotesEveryPart(t *testing.T) {
+	assert.Equal(t, `"ice"."lake"."orders"`, icebergRef("lake", "orders"))
+	assert.Equal(t, `"ice"."Lake-EU"."say ""hi"""`, icebergRef("Lake-EU", `say "hi"`))
+}

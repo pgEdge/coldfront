@@ -344,8 +344,8 @@ story_provision_decoupled() {
         sleep 2
     done
     assert_eq "iceonly wrapper view created" "v" "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='iceonly' AND relnamespace='public'::regnamespace;")"
-    assert_eq "iceberg-only registry row present" "1" "$(q "$HOST" "SELECT count(*) FROM coldfront.tiered_views WHERE is_iceberg_only AND iceberg_table='ice.public.iceonly';")"
-    assert_eq "no hot table for iceberg-only view" "" "$(q "$HOST" "SELECT hot_table FROM coldfront.tiered_views WHERE iceberg_table='ice.public.iceonly';")"
+    assert_eq "iceberg-only registry row present" "1" "$(q "$HOST" "SELECT count(*) FROM coldfront.tiered_views WHERE is_iceberg_only AND iceberg_table='\"ice\".\"public\".\"iceonly\"';")"
+    assert_eq "no hot table for iceberg-only view" "" "$(q "$HOST" "SELECT hot_table FROM coldfront.tiered_views WHERE iceberg_table='\"ice\".\"public\".\"iceonly\"';")"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -508,7 +508,7 @@ story_adopt_decoupled() {
     # Iceberg namespace (lake) is not a PG schema: the view lands in public.
     local O; O=$(q_may "$HOST" "SELECT coldfront.adopt_iceberg_table('public','orders','lake');")
     assert_contains "TC-164: adopt reports the ref, the column count and read-only" \
-        "adopted ice.lake.orders as public.orders (5 columns, read-only)" "$O"
+        'adopted "ice"."lake"."orders" as public.orders (5 columns, read-only)' "$O"
     assert_eq "TC-164: wrapper view created" "v" \
         "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='orders' AND relnamespace='public'::regnamespace;")"
     assert_eq "TC-164: rows written outside coldfront are readable" "2" \
@@ -523,7 +523,7 @@ story_adopt_decoupled() {
     q "$HOST" "SELECT coldfront.ensure_attached(); SELECT duckdb.raw_query('INSERT INTO ice.\"Lake-EU\".invoices VALUES (7, ''DE'')');" >/dev/null 2>&1
     O=$(q_may "$HOST" "SELECT coldfront.adopt_iceberg_table('public','invoices','Lake-EU');")
     assert_contains "TC-165: a quoted namespace resolves as one identifier" \
-        'adopted ice."Lake-EU".invoices' "$O"
+        'adopted "ice"."Lake-EU"."invoices"' "$O"
     assert_eq "TC-165: its rows read back" "DE" "$(q "$HOST" "SELECT region FROM invoices WHERE inv_id=7;")"
 
     # TC-166: read-only unless asked for, and the refusal says what to do.
@@ -536,7 +536,7 @@ story_adopt_decoupled() {
     # TC-167: adoption binds the name once. Arming writes is release, then adopt
     # again; the second adopt in between is refused and changes nothing.
     O=$(q_may "$HOST" "SELECT coldfront.adopt_iceberg_table('public','orders','lake', p_writable => true);")
-    assert_contains "TC-167: adopting a registered name again is refused" 'is already registered for ice.lake.orders' "$O"
+    assert_contains "TC-167: adopting a registered name again is refused" 'is already registered for "ice"."lake"."orders"' "$O"
     assert_eq "TC-167: the refused call left the table read-only" "f" \
         "$(q "$HOST" "SELECT is_writable FROM coldfront.tiered_views WHERE relname='orders';")"
     q "$HOST" "SELECT coldfront.release_iceberg_table('public','orders');" >/dev/null 2>&1
@@ -614,7 +614,7 @@ EOSQL
     # on the key both bakery paths take (docs/formal/Bakery_adopt.cfg).
     docker exec -i -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" "$HOST" "$CF_PSQL" -tA -v ON_ERROR_STOP=1 >/dev/null 2>&1 <<SQL &
 BEGIN;
-SELECT pg_advisory_xact_lock(hashtext('coldfront_iceberg:' || 'ice.lake.orders'));
+SELECT pg_advisory_xact_lock(hashtext('coldfront_iceberg:' || '"ice"."lake"."orders"'));
 SELECT pg_sleep(8);
 COMMIT;
 SQL
@@ -630,7 +630,7 @@ SQL
     assert_eq "TC-172: it adopts once the claim key is free" "1" \
         "$(q "$HOST" "SELECT count(*) FROM coldfront.tiered_views WHERE relname='orders';")"
     assert_eq "TC-172: the adoption left no claim behind" "0" \
-        "$(q "$HOST" "SELECT count(*) FROM coldfront.claims WHERE iceberg_table = 'ice.lake.orders';")"
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.claims WHERE iceberg_table = '\"ice\".\"lake\".\"orders\"';")"
     q "$HOST" "SELECT coldfront.release_iceberg_table('public','orders');" >/dev/null 2>&1
 
     # TC-173: a table nothing has written to adopts writable without ColdFront
@@ -663,11 +663,11 @@ story_adopt_mesh() {
     q "$HOST" "SELECT coldfront.adopt_iceberg_table('public','orders','lake', p_writable => true);" >/dev/null 2>&1
     sleep 3
     assert_eq "TC-171: the registry row replicated to the peer" "1" \
-        "$(q "$p1" "SELECT count(*) FROM coldfront.tiered_views WHERE relname='orders' AND iceberg_table='ice.lake.orders' AND is_writable;")"
+        "$(q "$p1" "SELECT count(*) FROM coldfront.tiered_views WHERE relname='orders' AND iceberg_table='\"ice\".\"lake\".\"orders\"' AND is_writable;")"
     assert_eq "TC-171: the wrapper view replicated to the peer" "v" \
         "$(q "$p1" "SELECT relkind FROM pg_class WHERE relname='orders' AND relnamespace='public'::regnamespace;")"
     local O; O=$(q_may "$p1" "SELECT coldfront.adopt_iceberg_table('public','orders','lake', p_writable => true);")
-    assert_contains "TC-171: the peer's own adopt is refused" 'is already registered for ice.lake.orders' "$O"
+    assert_contains "TC-171: the peer's own adopt is refused" 'is already registered for "ice"."lake"."orders"' "$O"
 
     q "$HOST" "INSERT INTO orders VALUES (4001, TIMESTAMPTZ '2026-02-01 10:00:00+00', 'mesh', 7.00, '{}');" >/dev/null 2>&1
     assert_eq "TC-171: the peer reads what this node wrote" "1" \
@@ -1732,6 +1732,68 @@ SQL
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# Story 6g: the compactor claims the reference cold writes claim, on a table
+# create_iceberg_table() made (TC-183) and on one adoption registered (TC-184),
+# as on the archiver's. Every registration stores one spelling, each part
+# quoted, and it is the one the compactor builds, so a cold write holding the
+# table's claim makes the compactor's claim wait.
+# ───────────────────────────────────────────────────────────────────────────
+story_compactor_claim_matches_writes() {
+    step "6g. The compactor waits for a cold write's claim on created and adopted tables"
+    require_compactor || return
+    local col='[{"name":"id","type":"bigint"}]' t
+    q "$HOST" "SELECT coldfront.create_iceberg_table('public','cf_cw','$col'::jsonb);" >/dev/null 2>&1
+    q "$HOST" "SELECT coldfront.create_iceberg_table('public','cf_ad','$col'::jsonb);" >/dev/null 2>&1
+    q "$HOST" "SELECT coldfront.release_iceberg_table('public','cf_ad');" >/dev/null 2>&1
+    q "$HOST" "SELECT coldfront.adopt_iceberg_table('public','cf_ad', p_writable => true);" >/dev/null 2>&1
+    assert_eq "TC-183: the archiver, create_iceberg_table() and adoption register one spelling" \
+        '"ice"."public"."cf_ad" "ice"."public"."cf_cw" "ice"."public"."events"' \
+        "$(q "$HOST" "SELECT string_agg(iceberg_table, ' ' ORDER BY relname) FROM coldfront.tiered_views WHERE schema_name = 'public' AND relname IN ('cf_ad', 'cf_cw', 'events');")"
+    compactor_waits_for_write TC-183 cf_cw
+    compactor_waits_for_write TC-184 cf_ad
+    for t in cf_cw cf_ad; do
+        q "$HOST" "SELECT coldfront.drop_iceberg_table('public','$t', true);" >/dev/null 2>&1
+    done
+}
+
+# compactor_waits_for_write <TC> <table>: a cold write to public.<table> holds the
+# table's claim for 8 s while the compactor expires the table's snapshots. The
+# compactor's claim waits on the lock the write holds, and the compactor finishes
+# once the write commits.
+compactor_waits_for_write() {
+    local tc=$1 t=$2 w c ec i waited=0
+    q "$HOST" "INSERT INTO $t VALUES (1);" >/dev/null
+    qf "$HOST" >/dev/null 2>&1 <<SQL &
+SET application_name = 'cf_${tc}_writer';
+BEGIN;
+INSERT INTO $t VALUES (2);
+SELECT pg_sleep(8);
+COMMIT;
+SQL
+    w=$!
+    for i in $(seq 1 40); do
+        [ "$(q "$HOST" "SELECT count(*) FROM pg_stat_activity WHERE application_name = 'cf_${tc}_writer' AND wait_event = 'PgSleep';")" = 1 ] && break
+        sleep 0.25
+    done
+    "$COMPACTOR" --config $TMPD/archiver.yaml --table "$t" --expire-snapshots --expire-older-than 0s \
+        --expire-retain-last 1 --expire-keep-files >"$TMPD/cf.$tc" 2>&1 &
+    c=$!
+    for i in $(seq 1 24); do
+        if [ "$(q "$HOST" "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%coldfront._claim_iceberg_external%' AND pid <> pg_backend_pid();")" = 1 ]; then
+            waited=1; break
+        fi
+        sleep 0.25
+    done
+    wait "$c"; ec=$?
+    wait "$w"
+    assert_eq "$tc: the compactor's claim waits for the cold write's" 1 "$waited"
+    assert_eq "$tc: the compactor finishes once the write commits" 0 "$ec"
+    [ "$ec" = 0 ] || tail -5 "$TMPD/cf.$tc"
+    assert_eq "$tc: both writes landed" 2 "$(q "$HOST" "SELECT count(*) FROM $t;")"
+    rm -f "$TMPD/cf.$tc"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Story 6c — Cold + dual-tier DML issued from INSIDE plpgsql (a DO block). This
 # is the end-to-end test of BOTH fixes: plpgsql variable refs become $N bound
 # params (Cause 1, kept live via format()), and the rewrite must be a DML-tagged
@@ -2090,7 +2152,7 @@ story_mesh() {
     # db1's registration reached every peer: the view as DDL, the row by value.
     local pc
     for pc in "${PARR[@]}"; do
-        assert_eq "iceberg-only registry row replicated to peer $pc" "1" "$(q "$pc" "SELECT count(*) FROM coldfront.tiered_views WHERE is_iceberg_only AND iceberg_table='ice.public.iceonly';")"
+        assert_eq "iceberg-only registry row replicated to peer $pc" "1" "$(q "$pc" "SELECT count(*) FROM coldfront.tiered_views WHERE is_iceberg_only AND iceberg_table='\"ice\".\"public\".\"iceonly\"';")"
         assert_eq "iceberg-only wrapper view replicated to peer $pc" "v" "$(q "$pc" "SELECT relkind FROM pg_class WHERE relname='iceonly' AND relnamespace='public'::regnamespace;")"
     done
 
@@ -5576,6 +5638,7 @@ if [ "$MODE" = "tiered" ]; then
     story_maintenance       # iceberg-go ExpireSnapshots + DeleteOrphanFiles — reclaim the
                             # snapshot/small-file bloat compaction leaves (Lakekeeper can't)
     [ "$MESH" = 1 ] || story_start_snapshot_expired  # a write whose start snapshot expired fails as outdated
+    story_compactor_claim_matches_writes  # the compactor waits for a cold write's claim on created and adopted tables
     story_writes_plpgsql
     story_app_privilege          # non-superuser onboarding + cold I/O (mesh: cross-node + SD bakery)
     story_mixed_concurrency

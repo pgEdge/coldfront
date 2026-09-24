@@ -22,20 +22,16 @@ SET coldfront.dblink_self = '';
 -- whatever the caller adopted from, not its PG schema.
 -- purge=true arms PURGE_REQUESTED on a scoped attachment: Lakekeeper deletes the
 -- data and metadata objects.
-SELECT coldfront._iceberg_drop_sql('ice.public.iceonly', true);
+SELECT coldfront._iceberg_drop_sql('"ice"."public"."iceonly"', true);
 
 -- purge=false needs no attachment of its own: the everyday 'ice' attachment is
 -- never purge-armed, so the drop goes straight through it and the objects stay
 -- in the bucket, so the ref goes through as it is stored.
-SELECT coldfront._iceberg_drop_sql('ice.public.iceonly', false);
-
--- The archiver quotes every part of the ref it stores and this SQL path quotes
--- only what needs it; both parse to the same three identifiers.
-SELECT coldfront._iceberg_drop_sql('"ice"."public"."iceonly"', true);
+SELECT coldfront._iceberg_drop_sql('"ice"."public"."iceonly"', false);
 
 -- Identifiers are re-quoted on the way out, so mixed case and embedded quotes
 -- cannot break out.
-SELECT coldfront._iceberg_drop_sql(format('ice.%I.%I', 'My Schema', 'Odd"Name'), true);
+SELECT coldfront._iceberg_drop_sql(coldfront._iceberg_ref('My Schema', 'Odd"Name'), true);
 
 -- An unregistered table is refused (nothing to unregister; no blind catalog drop).
 SELECT coldfront.drop_iceberg_table('public', 'nosuch', true);
@@ -43,7 +39,7 @@ SELECT coldfront.drop_iceberg_table('public', 'nosuch', true);
 -- The purge decision is mandatory: NULL is not a silent "false".
 CREATE VIEW public.iceonly AS SELECT 1 AS id;
 INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col, is_iceberg_only)
-VALUES ('public', 'iceonly', NULL, 'ice.public.iceonly', NULL, true);
+VALUES ('public', 'iceonly', NULL, '"ice"."public"."iceonly"', NULL, true);
 
 SELECT coldfront.drop_iceberg_table('public', 'iceonly', NULL);
 
@@ -60,7 +56,7 @@ UPDATE coldfront.tiered_views SET is_writable = true
 -- first concatenate two tables' cluster columns and the second fail outright.
 CREATE VIEW public.iceonly_again AS SELECT 1 AS id;
 INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col, is_iceberg_only)
-VALUES ('public', 'iceonly_again', NULL, 'ice.public.iceonly', NULL, true);
+VALUES ('public', 'iceonly_again', NULL, '"ice"."public"."iceonly"', NULL, true);
 DROP VIEW public.iceonly_again;
 
 -- Decoupled teardown: the registry row and the wrapper view both go.

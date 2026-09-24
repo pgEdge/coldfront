@@ -342,6 +342,12 @@ cluster-column lookups resolve a table by its reference, so two rows
 sharing one would concatenate both tables' cluster columns into the
 first's INSERT list and fail the second outright.
 
+The archiver, `create_iceberg_table()` and adoption all store the
+reference with every part quoted, such as `"ice"."lake"."orders"`, and
+the compactor claims under that same spelling. The constraint and the
+bakery compare references as strings, so each Iceberg table has
+exactly one.
+
 ### Adoption binds the name once
 
 A second `adopt_iceberg_table()` under a registered name is refused

@@ -35,7 +35,7 @@ SELECT coldfront._reject_on_standby('adopt an Iceberg table');
 -- and the refusal names the exit. Nothing about the row changes.
 CREATE VIEW public.orders AS SELECT 1 AS order_id;
 INSERT INTO coldfront.tiered_views(schema_name, relname, iceberg_table, is_iceberg_only, is_writable)
-VALUES ('public', 'orders', 'ice.lake.orders', true, false);
+VALUES ('public', 'orders', '"ice"."lake"."orders"', true, false);
 SELECT coldfront.adopt_iceberg_table('public', 'orders', 'lake');
 SELECT coldfront.adopt_iceberg_table('public', 'orders', 'lake', p_writable => true);
 SELECT coldfront.adopt_iceberg_table('public', 'orders', 'warehouse');
@@ -60,15 +60,14 @@ CREATE SCHEMA reporting;
 SELECT coldfront.adopt_iceberg_table('reporting', 'orders', 'lake');
 SELECT count(*) AS registry_rows FROM coldfront.tiered_views WHERE schema_name = 'reporting';
 
--- The archiver quotes every part of the ref it stores and this path quotes only
--- what needs it, so the two spell one table differently. The reference is
--- compared as identifiers, or a table already registered under the other
--- spelling would slip past both this check and the unique constraint.
-UPDATE coldfront.tiered_views SET iceberg_table = '"ice"."lake"."orders"'
- WHERE schema_name = 'public' AND relname = 'orders';
-SELECT coldfront.adopt_iceberg_table('reporting', 'orders', 'lake');
-UPDATE coldfront.tiered_views SET iceberg_table = 'ice.lake.orders'
- WHERE schema_name = 'public' AND relname = 'orders';
+-- Every registration stores, and every claim takes, one spelling of a ref: each
+-- part quoted and embedded quotes doubled, as pgx.Identifier.Sanitize spells the
+-- archiver's and the compactor's. A part that needs no quotes gets them anyway,
+-- so the spelling does not depend on a keyword list, which changes between
+-- PostgreSQL majors: format('%I', 'json') is json on 16 and "json" on 17.
+SELECT coldfront._iceberg_ref('lake', 'orders') AS plain,
+       coldfront._iceberg_ref('Lake-EU', 'say "hi"') AS needs_quotes,
+       coldfront._iceberg_ref('public', 'json') AS keyword;
 
 -- Adoption puts a wrapper view under the name, so a relation already standing
 -- there, a table or a view coldfront did not put there, is refused before the
