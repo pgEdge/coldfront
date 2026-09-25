@@ -3617,8 +3617,14 @@ cf_own_duckdb_temp_dir(void)
  * rewrite, so do nothing — the same guard the DDL hook already applies.
  */
 static void
+#if PG_VERSION_NUM >= 190000
+/* PG 19+ passes a const JumbleState. */
+coldfront_post_parse_analyze(ParseState *pstate, Query *query,
+                              const JumbleState *jstate)
+#else
 coldfront_post_parse_analyze(ParseState *pstate, Query *query,
                               JumbleState *jstate)
+#endif
 {
     TieredViewInfo  info;
     char           *new_sql;

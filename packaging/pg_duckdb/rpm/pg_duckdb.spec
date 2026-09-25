@@ -81,10 +81,13 @@ export CPATH=%{curl_prefix}/include${CPATH:+:$CPATH}
 
 # DuckDB is a large C++17 build driven by CMake+Ninja under the PGXS Makefile.
 # with_llvm=no matches the proven ColdFront recipe (no JIT bitcode shipped).
+# PG_MAX_VER: upstream's Makefile.global defaults it to 18 and hard-errors above
+# that; ColdFront pins the pg_duckdb commit, so it opts in explicitly for the
+# major this cell builds.
 # Parallelism is capped to limit peak memory (DuckDB can OOM at high -j).
 export DUCKDB_GEN=ninja
 export CMAKE_BUILD_PARALLEL_LEVEL=4
-USE_PGXS=1 PATH=%{pginstdir}/bin:$PATH %{__make} -j4 with_llvm=no
+USE_PGXS=1 PATH=%{pginstdir}/bin:$PATH %{__make} -j4 with_llvm=no PG_MAX_VER=%{pgmajorversion}
 
 syft dir:%{_builddir}/%{sname}-%{version} -o cyclonedx-json > %{_builddir}/%{sname}-%{version}/%{sname}-sbom.json || exit 1
 
@@ -93,7 +96,7 @@ gpg --armor --detach-sign --local-user "$KEY_ID" --output %{_builddir}/%{sname}-
 
 %install
 %{__rm} -rf %{buildroot}
-USE_PGXS=1 PATH=%{pginstdir}/bin:$PATH %{__make} install DESTDIR=%{buildroot} with_llvm=no
+USE_PGXS=1 PATH=%{pginstdir}/bin:$PATH %{__make} install DESTDIR=%{buildroot} with_llvm=no PG_MAX_VER=%{pgmajorversion}
 mkdir -p %{buildroot}/%{pginstdir}/sbom
 install -p -m 0644 %{_builddir}/%{sname}-%{version}/%{sname}-sbom.json %{buildroot}/%{pginstdir}/sbom/%{sname}-sbom.json
 install -p -m 0644 %{_builddir}/%{sname}-%{version}/%{sname}-sbom.json.asc %{buildroot}/%{pginstdir}/sbom/%{sname}-sbom.json.asc

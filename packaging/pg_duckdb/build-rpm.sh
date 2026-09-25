@@ -2,6 +2,7 @@
 set -euo pipefail
 
 RHEL="$(rpm --eval %rhel)"
+CWD="$(pwd)"
 
 prepare() {
   setup_dnf_build_env
@@ -18,6 +19,11 @@ prepare() {
     git fetch -q --depth 1 origin "${PG_DUCKDB_COMMIT}"
     git checkout -q FETCH_HEAD
     git submodule update --init --recursive --depth 1
+    # PG19-only fixup: upstream's vendored PG-19 deparser predates the release
+    # and references fields PostgreSQL dropped before beta. The helper no-ops
+    # below PG 19 and when the change is already there, and fails loudly on
+    # patch rot. Run while .git still exists. See the patch header.
+    bash "${CWD}/packaging/patches/apply-pg19-ruleutils-patch.sh" . "${PG_MAJOR_VERSION}"
     # GitHub auto-tarballs omit submodules, and pg_duckdb's Makefile gates the
     # DuckDB build on a `.git/modules/third_party/duckdb/HEAD` marker. Drop the
     # heavy .git history but leave that marker so `make` treats the submodule as

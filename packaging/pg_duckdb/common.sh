@@ -15,13 +15,15 @@ PER_PG_VERSION=true
 export PG_VERSION="${PG_VERSION:-17.7}"
 export PG_MAJOR_VERSION="$(echo "$PG_VERSION" | cut -d. -f1)"
 
-# pg_duckdb pinned to the merged PR #1025 commit (DuckDB 1.5.4). No released
-# pg_duckdb tag carries 1.5.x; this commit pins its duckdb submodule to v1.5.4.
+# pg_duckdb pinned to the PG19-support commit (PR #983), three commits past the
+# merged PR #1025 commit that brought DuckDB 1.5.4. No released pg_duckdb tag
+# carries 1.5.x; this commit keeps its duckdb submodule on the v1.5.4 tag
+# (08e34c4), so the patched duckdb-iceberg extensions stay ABI-paired with it.
 # This is an UPSTREAM pin, independent of the ColdFront release tag — do NOT
 # derive it from COMPONENT_BRANCH (the builder-action always sets that to the
 # ColdFront tag, which is not a pg_duckdb ref). Override only via PG_DUCKDB_COMMIT.
 export PG_DUCKDB_REPO="https://github.com/duckdb/pg_duckdb"
-export PG_DUCKDB_COMMIT="${PG_DUCKDB_COMMIT:-c04e6a2dcf4e999abb921da1ba2f8335dad644e0}"
+export PG_DUCKDB_COMMIT="${PG_DUCKDB_COMMIT:-ee7aaeb1c4b3a1f4b41385a4edd72998c8913d2d}"
 export PG_DUCKDB_VERSION="${COMPONENT_VERSION:-1.5.4}"
 export PG_DUCKDB_BUILDNUM="${COMPONENT_BUILDNUM:-1}"
 
