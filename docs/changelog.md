@@ -45,6 +45,9 @@ and this project adheres to
 
 ### Fixed
 
+- `CREATE EXTENSION coldfront` failed on a database the standalone partitioner
+  had already set up ("table partition_config is not a member of extension"):
+  the extension now adopts that table, registrations included.
 - After one cold write on a mesh, an app role could run any SQL as the
   loopback connection's user through the `coldfront_self` dblink connection
   the claim left open in its session, and by setting

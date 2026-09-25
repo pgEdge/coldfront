@@ -4112,6 +4112,17 @@ story_partitioner_stock_pg() {
         fail "TC-151: reconcile failed on stock PG"; tail -5 $TMPD/stock-run.log
     fi
 
+    # The cold tier can be added to this database later: CREATE EXTENSION adopts
+    # the partition_config the partitioner made, rows and all, instead of
+    # refusing to skip a table it does not own.
+    if qdb $db "CREATE EXTENSION pg_duckdb; CREATE EXTENSION coldfront;" >$TMPD/stock-ext.log 2>&1; then
+        pass "TC-151: the extension installs on a partitioner-first database"
+    else
+        fail "TC-151: CREATE EXTENSION failed on a partitioner-first database"; tail -3 $TMPD/stock-ext.log
+    fi
+    assert_eq "TC-151: partition_config is a member of the extension and kept its row" "1" \
+        "$(qdb $db "SELECT count(*) FROM coldfront.partition_config WHERE table_name = 'stockev' AND EXISTS (SELECT 1 FROM pg_depend d JOIN pg_extension e ON e.oid = d.refobjid WHERE d.objid = 'coldfront.partition_config'::regclass AND e.extname = 'coldfront' AND d.deptype = 'e');")"
+
     "$PARTITIONER" remove --dsn "$dsn" --table stockev >/dev/null 2>&1
     assert_eq "TC-151: remove unregistered it" "0" \
         "$(qdb $db "SELECT count(*) FROM coldfront.partition_config WHERE table_name='stockev';")"

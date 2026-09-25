@@ -307,6 +307,10 @@ go build -o bin/partitioner ./cmd/partitioner   # or: make build
 ./bin/partitioner --config config.yaml
 ```
 
+A database set up this way can gain the cold tier later: `CREATE EXTENSION
+coldfront` adopts the `coldfront.partition_config` the partitioner created,
+registrations included.
+
 A partition-only config omits the `iceberg:` and `s3:` sections entirely
 (supply either all of them or none - a half-filled cold config is
 rejected):
