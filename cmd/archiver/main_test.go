@@ -622,3 +622,28 @@ func TestIcebergRef_QuotesEveryPart(t *testing.T) {
 	assert.Equal(t, `"ice"."lake"."orders"`, icebergRef("lake", "orders"))
 	assert.Equal(t, `"ice"."Lake-EU"."say ""hi"""`, icebergRef("Lake-EU", `say "hi"`))
 }
+
+// The cold table is partitioned the way the hot one is: the period's transform on
+// the time column, led by the LIST column of a two-level table.
+func TestColdPartitionClause(t *testing.T) {
+	cases := []struct{ name, period, ts, list, want string }{
+		{"monthly", partition.PeriodMonthly, "ts", "", ` PARTITIONED BY (month("ts"))`},
+		{"daily", partition.PeriodDaily, "ts", "", ` PARTITIONED BY (day("ts"))`},
+		{"two-level leads with the LIST column", partition.PeriodMonthly, "ts", "region",
+			` PARTITIONED BY ("region", month("ts"))`},
+		{"every name is quoted", partition.PeriodDaily, "Event Time", `say "hi"`,
+			` PARTITIONED BY ("say ""hi""", day("Event Time"))`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			got, err := coldPartitionClause(c.period, c.ts, c.list)
+			require.NoError(t, err)
+			assert.Equal(t, c.want, got)
+		})
+	}
+}
+
+func TestColdPartitionClause_UnknownPeriod(t *testing.T) {
+	_, err := coldPartitionClause("weekly", "ts", "")
+	assert.ErrorContains(t, err, "weekly")
+}

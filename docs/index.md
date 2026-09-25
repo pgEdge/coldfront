@@ -84,7 +84,8 @@ SELECT coldfront.set_storage_secret('admin', 'adminsecret', 'seaweedfs:8333');
 
 -- Decoupled (iceberg-only) table, stored entirely in Iceberg on S3:
 SELECT coldfront.create_iceberg_table('public', 'events',
-  '[{"name":"id","type":"bigint"},{"name":"ts","type":"timestamptz"},{"name":"note","type":"text"}]'::jsonb);
+  '[{"name":"id","type":"bigint"},{"name":"ts","type":"timestamptz"},{"name":"note","type":"text"}]'::jsonb,
+  '{month(ts)}');
 INSERT INTO events VALUES (1, now(), 'hello');
 SELECT count(*) FROM events;
 ```

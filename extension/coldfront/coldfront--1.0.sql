@@ -2336,19 +2336,23 @@ $$;
 -- the compactor already has: it creates nothing, it preserves what it finds.
 --
 -- The file target is large because on object storage every file a query touches is
--- a billed round trip. The sort key is what lets a compaction concatenate a
--- group's files in key order rather than scrambling them.
+-- a billed round trip. A partitioned table is created without it: DuckDB refuses
+-- the property on a partitioned table, and would not split its files by size
+-- there anyway; the compactor takes its target from --target-size-mb. The sort
+-- key is what lets a compaction concatenate a group's files in key order rather
+-- than scrambling them.
 --
 -- Set at CREATE TABLE: the catalog takes properties there, and this build has no
 -- ALTER for them, so a table that predates its vector column keeps the defaults.
-CREATE OR REPLACE FUNCTION coldfront._vec_layout_props(p_sort_key text)
+CREATE OR REPLACE FUNCTION coldfront._vec_layout_props(p_sort_key text, p_partitioned boolean)
 RETURNS text
 LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
     SELECT CASE WHEN p_sort_key IS NULL OR p_sort_key = '' THEN ''
                 ELSE format(
-                    ' WITH (%L=%L, %L=%L, %L=%L)',
+                    ' WITH (%L=%L, %s%L=%L)',
                     'write.parquet.row-group-limit',      coldfront._vec_row_group_limit()::text,
-                    'write.target-file-size-bytes',       '536870912',
+                    CASE WHEN p_partitioned THEN ''
+                         ELSE format('%L=%L, ', 'write.target-file-size-bytes', '536870912') END,
                     'coldfront.sort-key',                 p_sort_key)
            END;
 $$;
@@ -3096,6 +3100,51 @@ BEGIN
 END;
 $$;
 
+-- The PARTITIONED BY clause a decoupled table is created with, or '' for none.
+-- Each element of p_partition_cols is one term as DuckDB takes it: a column name,
+-- year|month|day|hour(col), bucket(N, col) or truncate(W, col), joined as given.
+-- The engine judges them at CREATE TABLE: an unknown transform, a bad argument or
+-- a column not in the schema is refused there. The one check it leaves to the
+-- first INSERT is made here instead, while the table does not exist yet: a time
+-- transform on a column that is not a timestamp or date (for hour, a timestamp)
+-- binds against the wrong type and fails every write to the table. The column is
+-- matched the way the engine matches it, case-insensitively, quoted or not.
+CREATE OR REPLACE FUNCTION coldfront._partition_clause(p_columns jsonb, p_partition_cols text[])
+RETURNS text
+LANGUAGE plpgsql IMMUTABLE AS $$
+DECLARE
+    term      text;
+    m         text[];
+    transform text;
+    col_name  text;
+    col_type  text;
+    storage   text;
+BEGIN
+    IF p_partition_cols IS NULL OR cardinality(p_partition_cols) = 0 THEN
+        RETURN '';
+    END IF;
+    FOREACH term IN ARRAY p_partition_cols LOOP
+        m := regexp_match(term, '^\s*(year|month|day|hour)\s*\(\s*("(?:[^"]|"")*"|[^\s()"]+)\s*\)\s*$', 'i');
+        CONTINUE WHEN m IS NULL;
+        transform := lower(m[1]);
+        col_name  := CASE WHEN m[2] LIKE '"%'
+                          THEN replace(substr(m[2], 2, length(m[2]) - 2), '""', '"')
+                          ELSE m[2] END;
+        SELECT c->>'type' INTO col_type
+          FROM jsonb_array_elements(p_columns) AS c
+         WHERE lower(c->>'name') = lower(col_name);
+        CONTINUE WHEN col_type IS NULL;
+        storage := coldfront._iceberg_storage_type(col_type);
+        IF NOT (storage IN ('TIMESTAMPTZ', 'TIMESTAMP') OR (storage = 'DATE' AND transform <> 'hour')) THEN
+            RAISE EXCEPTION 'coldfront.create_iceberg_table: p_partition_cols term % needs a % column; "%" is %',
+                term, CASE WHEN transform = 'hour' THEN 'timestamp' ELSE 'timestamp or date' END,
+                col_name, col_type;
+        END IF;
+    END LOOP;
+    RETURN ' PARTITIONED BY (' || array_to_string(p_partition_cols, ', ') || ')';
+END;
+$$;
+
 -- create_iceberg_table: provision an iceberg-only table end-to-end.
 --
 --   p_schema         PG schema for the wrapper view (e.g. 'public').
@@ -3103,7 +3152,10 @@ $$;
 --                    created at ice.<p_schema>.<p_table>.
 --   p_columns        jsonb array of {name, type} entries. Type is a PG type
 --                    name from the supported set; see _iceberg_storage_type.
---   p_partition_cols array of column names for Iceberg partitioning, or NULL.
+--   p_partition_cols Iceberg partitioning, one PARTITIONED BY term per element as
+--                    DuckDB takes it (a column name, year|month|day|hour(col),
+--                    bucket(N, col), truncate(W, col)); see _partition_clause.
+--                    NULL or empty creates the table unpartitioned.
 --
 -- Effects:
 --   1. Creates the Iceberg table via duckdb.raw_query('CREATE TABLE ice...').
@@ -3123,6 +3175,7 @@ DECLARE
     v_view_cols      jsonb := '[]'::jsonb;
     v_vec_cols       text[] := '{}';
     v_cluster_cols   text;
+    v_part           text;
     v_props          text := '';
     n                int  := 0;
     col              jsonb;
@@ -3173,6 +3226,8 @@ BEGIN
                                             storage_type));
     END LOOP;
 
+    v_part := coldfront._partition_clause(p_columns, p_partition_cols);
+
     -- The cluster columns lead the Iceberg schema, one per vector column and in the
     -- order they were declared; the view projection deliberately skips them. A
     -- decoupled INSERT is rewritten in C, which is where their values come from.
@@ -3185,26 +3240,19 @@ BEGIN
         iceberg_cols := v_cluster_cols || iceberg_cols;
         -- No primary key is declared in this mode, so the cluster column alone.
         v_props := coldfront._vec_layout_props(
-                       coldfront._vec_sort_key(v_vec_cols[1], NULL));
-    END IF;
-
-    -- p_partition_cols is accepted and ignored: this helper declares no partition
-    -- spec, so the table is unpartitioned and predicate pushdown comes from
-    -- Parquet row-group min/max statistics alone. A table that needs a spec is
-    -- created with one on the catalog and brought in with adopt_iceberg_table.
-    IF p_partition_cols IS NOT NULL AND array_length(p_partition_cols, 1) > 0 THEN
-        RAISE NOTICE 'coldfront.create_iceberg_table: p_partition_cols=% accepted but ignored; the table is created unpartitioned', p_partition_cols;
+                       coldfront._vec_sort_key(v_vec_cols[1], NULL), v_part <> '');
     END IF;
 
     -- 1. Iceberg table on the attached catalog (create namespace first;
     -- CREATE SCHEMA IF NOT EXISTS is idempotent and cheap on Lakekeeper).
     -- IF NOT EXISTS on the table itself makes the helper safe to call again
     -- against an existing table — useful for distributed setups where each
-    -- node registers the same shared Iceberg table independently.
+    -- node registers the same shared Iceberg table independently. PARTITIONED BY
+    -- precedes WITH, as DuckDB parses the statement.
     PERFORM coldfront.ensure_attached();
     PERFORM duckdb.raw_query(format('CREATE SCHEMA IF NOT EXISTS ice.%I', p_schema));
     PERFORM duckdb.raw_query(format(
-        'CREATE TABLE IF NOT EXISTS %s (%s)%s', ice_ref, iceberg_cols, v_props));
+        'CREATE TABLE IF NOT EXISTS %s (%s)%s%s', ice_ref, iceberg_cols, v_part, v_props));
 
     -- 2. PG wrapper view + registry row. From here the C post_parse_analyze hook
     --    intercepts INSERT INTO the view (see coldfront.c emit_cold /

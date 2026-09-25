@@ -405,6 +405,10 @@ type archiveCycle struct {
 	iceTable         string
 	now              time.Time
 	debugExportDelay time.Duration
+	// listCol is the LIST (level-1) column of a two-level table, empty for a flat
+	// one: the cold table is partitioned by it, and the Phase-0 wipe is scoped to
+	// its value.
+	listCol string
 	// The archive watermark as it stood when this cycle's tiering pass began,
 	// captured by bootstrapTieredView before the per-partition loop and held
 	// fixed for the whole pass. Each cutover advances the stored watermark to
@@ -495,7 +499,7 @@ func (ac *archiveCycle) attachAndEnsureTable(ctx context.Context) error {
 	if err := attachIceberg(ctx, ac.conn, ac.cfg); err != nil {
 		return err
 	}
-	if err := ensureIcebergTable(ctx, ac.conn, ac.t, ac.iceTable); err != nil {
+	if err := ensureIcebergTable(ctx, ac.conn, ac.t, ac.iceTable, ac.listCol); err != nil {
 		return fmt.Errorf("ensure iceberg table: %w", err)
 	}
 	return nil
@@ -758,6 +762,13 @@ func runCycleTwoLevel(ctx context.Context, cfg *config.Config, t *config.TableCo
 		return fmt.Errorf("values_source: %w", err)
 	}
 	parent := partition.ResolveSourceTable(ctx, conn, t.SourceSchema, t.SourceTable) // physical top (_events after swap)
+	// The LIST column is read before the tiering preamble renames the hot table,
+	// though detectPartitionColumns resolves either name.
+	listCols, err := detectPartitionColumns(ctx, conn, t.SourceSchema, t.SourceTable)
+	if err != nil {
+		return fmt.Errorf("detect list column: %w", err)
+	}
+	ac.listCol = listCols[0]
 
 	// 1. Premake per LIST value: ensure the LIST child exists (attached to the
 	//    physical top, named by the stable source name) and its forward window.
@@ -863,19 +874,8 @@ func (ac *archiveCycle) findExpiredLeaves(ctx context.Context, children []childR
 }
 
 // tierLeavesByPeriod is step 4 of the 2-level cycle: run the shared tiering
-// preamble, detect the LIST column, then group the leaves by ts period and tier
-// them oldest-first.
+// preamble, then group the leaves by ts period and tier them oldest-first.
 func (ac *archiveCycle) tierLeavesByPeriod(ctx context.Context, leaves []leafRef) error {
-	t := ac.t
-	// The LIST (level-1) column, for the LIST-value-scoped Phase-0 wipe. Read
-	// before the preamble renames the hot table, though detectPartitionColumns
-	// resolves either name.
-	listCols, err := detectPartitionColumns(ctx, ac.conn, t.SourceSchema, t.SourceTable)
-	if err != nil {
-		return fmt.Errorf("detect list column: %w", err)
-	}
-	listCol := listCols[0]
-
 	columns, err := ac.prepareTiering(ctx)
 	if err != nil {
 		return err
@@ -886,7 +886,7 @@ func (ac *archiveCycle) tierLeavesByPeriod(ctx context.Context, leaves []leafRef
 		if err := ctx.Err(); err != nil {
 			return err
 		}
-		if err := ac.tierOnePeriod(ctx, columns, listCol, grp); err != nil {
+		if err := ac.tierOnePeriod(ctx, columns, ac.listCol, grp); err != nil {
 			return err
 		}
 	}
@@ -1219,7 +1219,8 @@ func vecCompanion(col string) string { return "_cf_vec_" + col }
 // vecLayoutProps asks the extension for the CREATE TABLE properties a clustered
 // table needs, or "" when the table has no vector. The values live in the
 // extension so both modes create the same layout; the primary key rides along as
-// the sort key's tiebreak, which only this side knows.
+// the sort key's tiebreak, which only this side knows. Every table the archiver
+// creates is partitioned, which the extension's property set depends on.
 func vecLayoutProps(ctx context.Context, conn *pgx.Conn, columns []view.Column) (string, error) {
 	if len(vectorColumns(columns)) == 0 {
 		return "", nil
@@ -1232,7 +1233,7 @@ func vecLayoutProps(ctx context.Context, conn *pgx.Conn, columns []view.Column) 
 	}
 	var props string
 	if err := conn.QueryRow(ctx,
-		"SELECT coldfront._vec_layout_props(coldfront._vec_sort_key($1, $2))",
+		"SELECT coldfront._vec_layout_props(coldfront._vec_sort_key($1, $2), true)",
 		vectorColumns(columns)[0], pk).Scan(&props); err != nil {
 		return "", fmt.Errorf("layout properties: %w", err)
 	}
@@ -1421,9 +1422,28 @@ func icebergRef(schema, table string) string {
 	return pgx.Identifier{"ice", schema, table}.Sanitize()
 }
 
+// coldPartitionClause is the PARTITIONED BY clause the cold table is created
+// with, mirroring the hot partitioning: the period's transform on the time
+// column, led by the LIST column of a two-level table (listCol, empty for a flat
+// one). One export is then exactly one partition, a leaf wipe covers exactly one,
+// and a predicate on either column skips whole manifests.
+func coldPartitionClause(period, tsCol, listCol string) (string, error) {
+	transform := map[string]string{partition.PeriodMonthly: "month", partition.PeriodDaily: "day"}[period]
+	if transform == "" {
+		return "", fmt.Errorf("partition_period %q has no Iceberg transform", period)
+	}
+	var terms []string
+	if listCol != "" {
+		terms = append(terms, pgx.Identifier{listCol}.Sanitize())
+	}
+	terms = append(terms, transform+"("+pgx.Identifier{tsCol}.Sanitize()+")")
+	return " PARTITIONED BY (" + strings.Join(terms, ", ") + ")", nil
+}
+
 // ensureIcebergTable creates the Iceberg namespace and table (matching the
-// PG source schema) if they don't already exist. Safe to call every run.
-func ensureIcebergTable(ctx context.Context, conn *pgx.Conn, t *config.TableConfig, iceTable string) error {
+// PG source schema) if they don't already exist. Safe to call every run. The
+// partition spec is set at creation and stays with the table.
+func ensureIcebergTable(ctx context.Context, conn *pgx.Conn, t *config.TableConfig, iceTable, listCol string) error {
 	if err := execDuckDB(ctx, conn, fmt.Sprintf("CREATE SCHEMA IF NOT EXISTS %s",
 		pgx.Identifier{"ice", t.SourceSchema}.Sanitize())); err != nil {
 		return fmt.Errorf("create namespace: %w", err)
@@ -1444,12 +1464,16 @@ func ensureIcebergTable(ctx context.Context, conn *pgx.Conn, t *config.TableConf
 	}
 	colDefs := strings.Join(defs, ", ")
 
+	part, err := coldPartitionClause(t.PartitionPeriod, t.PartitionColumn, listCol)
+	if err != nil {
+		return err
+	}
 	props, err := vecLayoutProps(ctx, conn, columns)
 	if err != nil {
 		return err
 	}
-	if err := execDuckDB(ctx, conn, fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (%s)%s",
-		iceTable, colDefs, props)); err != nil {
+	if err := execDuckDB(ctx, conn, fmt.Sprintf("CREATE TABLE IF NOT EXISTS %s (%s)%s%s",
+		iceTable, colDefs, part, props)); err != nil {
 		return fmt.Errorf("create iceberg table: %w", err)
 	}
 	return nil

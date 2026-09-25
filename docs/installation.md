@@ -7,10 +7,12 @@
 
 ColdFront runs on a **DuckDB 1.5.x** stack: PostgreSQL + pg_duckdb
 (DuckDB 1.5.4) and a **patched** duckdb-iceberg that carries ColdFront's
-three patches - the bakery-aware commit-refresh patch (the no-409
-guarantee for concurrent cold-tier writers) and two strict-reader
+four patches - the bakery-aware commit-refresh patch (the no-409
+guarantee for concurrent cold-tier writers), two strict-reader
 interop patches (so apache/iceberg-go, the cold-tier compactor, can read
-the manifests duckdb-iceberg writes). The patch internals are in
+the manifests duckdb-iceberg writes) and a port of an upstream fix that
+computes the time partitions of a `timestamptz` column in UTC. The patch
+internals are in
 [DUCKDB_1.5_PATCHED.md](https://github.com/pgEdge/ColdFront/blob/main/DUCKDB_1.5_PATCHED.md).
 No released pg_duckdb tag carries DuckDB 1.5.x yet, so the stack is built
 from a pinned upstream PR plus our patches - all from sources you can
@@ -31,13 +33,13 @@ components:
 
 The base build runs as three Docker stages: the first builds libcurl and
 pg_duckdb; the second clones duckdb-iceberg at the pinned ref, applies
-ColdFront's three patches, and compiles the iceberg, avro, azure, and
+ColdFront's four patches, and compiles the iceberg, avro, azure, and
 postgres_scanner extensions under vcpkg; the third assembles the runtime.
 The build `git apply --check`s each patch before applying it, so it fails
 loudly on patch rot rather than silently shipping stock iceberg (which
 409s under concurrency and writes manifests strict Apache readers reject).
 
-ColdFront applies the following three patches to duckdb-iceberg; the full
+ColdFront applies the following four patches to duckdb-iceberg; the full
 rationale is in
 [DUCKDB_1.5_PATCHED.md](https://github.com/pgEdge/ColdFront/blob/main/DUCKDB_1.5_PATCHED.md):
 
@@ -46,11 +48,14 @@ rationale is in
 | `iceberg-bakery-aware-commit-refresh-v15` | Refreshes the table head at the commit POST (and re-creates the table's storage secret in the commit context, needed under catalog credential vending) so concurrent cold writers never get a Lakekeeper 409 (the no-409 guarantee). |
 | `iceberg-manifest-list-format-version-v15` | Adds the spec-optional `format-version` key to the manifest-list metadata so strict Apache readers parse the entries as v2. |
 | `iceberg-data-file-format-v15` | Upper-cases the data-file format in the manifest to match the spec enum strict readers check case-sensitively. |
+| `iceberg-timestamptz-utc-transforms-v15` | Computes the year/month/day/hour partition of a `timestamptz` column on the UTC instant rather than in the session's time zone (a port of upstream duckdb-iceberg d3c3348271). |
 
-The bakery patch is mandatory for the no-409 guarantee. The other two
-are interop patches so the manifests duckdb-iceberg writes are readable
-by strict Apache readers such as apache/iceberg-go, the cold-tier
-compactor; they are inert to pg_duckdb's own reads. The canonical recipe
+The bakery patch is mandatory for the no-409 guarantee. The two interop
+patches make the manifests duckdb-iceberg writes readable by strict
+Apache readers such as apache/iceberg-go, the cold-tier compactor; they
+are inert to pg_duckdb's own reads. The fourth is what makes a
+partitioned cold table correct when written from a session whose time
+zone is not UTC. The canonical recipe
 - every source pin and compile step - is
 [`docker/Dockerfile.duckdb15-base`](https://github.com/pgEdge/ColdFront/blob/main/docker/Dockerfile.duckdb15-base) itself.
 
@@ -143,7 +148,8 @@ CREATE EXTENSION IF NOT EXISTS pg_duckdb;
 CREATE EXTENSION IF NOT EXISTS coldfront;
 SELECT coldfront.set_storage_secret('admin', 'adminsecret', 'seaweedfs:8333');
 SELECT coldfront.create_iceberg_table('public', 'events',
-  '[{"name":"id","type":"bigint"},{"name":"ts","type":"timestamptz"},{"name":"note","type":"text"}]'::jsonb);
+  '[{"name":"id","type":"bigint"},{"name":"ts","type":"timestamptz"},{"name":"note","type":"text"}]'::jsonb,
+  '{month(ts)}');
 INSERT INTO events VALUES (1, now(), 'hello');
 SELECT count(*) FROM events;
 SQL

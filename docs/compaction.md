@@ -1,11 +1,11 @@
 # COMPACTOR - cold-tier table maintenance
 
 `cmd/compactor` keeps a cold-tier Iceberg table healthy: it compacts
-small Parquet files into fewer large ones, expires old snapshots, and
-removes orphan files. ColdFront's cold tier writes one Parquet file per
-append and nothing else reclaims the resulting bloat, so without
-maintenance a busy table accumulates tens of thousands of tiny files and
-an unbounded snapshot history.
+each partition's small Parquet files into fewer large ones, expires old
+snapshots, and removes orphan files. ColdFront's cold tier writes one
+Parquet file per append and nothing else reclaims the resulting bloat, so
+without maintenance a busy table accumulates tens of thousands of tiny
+files and an unbounded snapshot history.
 
 It is a standalone static binary built on [apache/iceberg-go], separate
 from the archiver. Every operation that mutates a table is serialized
@@ -69,9 +69,16 @@ One binary serves every ColdFront cold store; configure exactly one:
 The compactor loads the table from the Lakekeeper catalog and runs the
 requested steps, each under a bakery claim on that table:
 
-- **Compaction** bin-packs below-target data files and rewrites each
-  group into one larger file, preserving every row (existing deletes are
-  applied). If nothing is below target it does nothing.
+- **Compaction** bin-packs below-target data files, partition by
+  partition, and rewrites each group into one larger file under its
+  partition, preserving every row (existing deletes are applied). If
+  nothing is below target it does nothing. Before planning, each data
+  file's position-delete files are scoped to its own partition, the only
+  ones that can reference its rows: iceberg-go attaches them by the
+  delete file's `file_path` bounds, which duckdb-iceberg writes under
+  DuckDB's own field id, so it would otherwise attach every delete file
+  to every data file and remove a skipped partition's delete files along
+  with a rewritten one.
 - **Snapshot expiry** is age-driven: it drops snapshots older than
   `--expire-older-than` (always keeping the current snapshot and at least
   `--expire-retain-last`) and, by default, deletes the data and manifest

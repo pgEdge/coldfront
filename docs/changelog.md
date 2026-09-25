@@ -11,6 +11,17 @@ and this project adheres to
 
 ### Added
 
+- Cold tables are partitioned. The archiver creates a tiered table's
+  Iceberg table partitioned the way the hot table is, `month(ts)` or
+  `day(ts)` on the time column, led by the LIST column of a two-level
+  table, so each export is one partition and a query with a time filter
+  skips the months outside it before reading anything.
+- `coldfront.create_iceberg_table()` takes `p_partition_cols`, the
+  partitioning as DuckDB's own `PARTITIONED BY` terms: `'{month(ts)}'`,
+  `'{month(ts), region}'`, `'{"bucket(16, id)"}'`.
+- The base image carries a fourth duckdb-iceberg patch, a port of upstream
+  d3c3348271, so the month of a `timestamptz` partition column is its UTC
+  month whatever the session's time zone.
 - `coldfront.adopt_iceberg_table()` gives a table that already exists in
   the Iceberg catalog a PostgreSQL wrapper view and a registry row, so it
   reads like one ColdFront created. The schema comes from the catalog, and

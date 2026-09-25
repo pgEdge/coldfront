@@ -172,7 +172,8 @@ SELECT coldfront.create_iceberg_table(
       {"name":"ts",     "type":"timestamptz"},
       {"name":"status", "type":"text"},
       {"name":"data",   "type":"jsonb"}
-    ]'::jsonb
+    ]'::jsonb,
+    '{month(ts)}'
 );
 
 INSERT INTO events VALUES (1, now(), 'ok', '{"k":1}');
@@ -181,12 +182,23 @@ UPDATE events SET status = 'done' WHERE id = 1;
 DELETE FROM events WHERE id = 1;
 ```
 
+The fourth argument, `p_partition_cols`, is the table's Iceberg
+partitioning as a `text[]` of `PARTITIONED BY` terms, passed to DuckDB as
+written; the terms, and how a term with a comma or a quoted name is
+written in the array literal, are in
+[usage.md → Mode 2](usage.md#mode-2-decoupled-iceberg-only). DuckDB
+refuses an unknown transform, a bad argument or a column outside the
+schema at `CREATE TABLE`. The one check DuckDB leaves to the first
+INSERT, a time transform on a column that is not a timestamp or date
+(for `hour`, not a timestamp), `coldfront._partition_clause()` makes at
+the same point, while no table exists yet.
+
 What the helper does:
 
 1. `duckdb.raw_query('CREATE SCHEMA IF NOT EXISTS ice."public"')` -
    idempotent namespace creation against Lakekeeper.
 2. `duckdb.raw_query('CREATE TABLE ice.public.<name> (col1
-   STORAGE_TYPE, …)')` - column types are validated by
+   STORAGE_TYPE, …) PARTITIONED BY (…)')` - column types are validated by
    `coldfront._iceberg_storage_type()`, which mirrors the canonical
    map in `cmd/archiver/main.go pgFormatTypeToDuckDB`. Anything outside
    the supported set (see "Supported column types" above) raises before
@@ -223,10 +235,6 @@ Write semantics through the wrapper view:
 
 Limits the helper inherits from the platform:
 
-- **No partition spec at CREATE.** `p_partition_cols` is accepted as a
-  parameter but currently ignored - pg_duckdb and duckdb-iceberg do not
-  expose Iceberg partition specs at CREATE TABLE time. Predicate
-  pushdown still works via Parquet row-group statistics.
 - **Mixed-write guard relaxed.** The helper sets
   `duckdb.unsafe_allow_mixed_transactions = on` LOCAL during
   provisioning (Iceberg DDL + coldfront registry row both happen). The

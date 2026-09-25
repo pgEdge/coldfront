@@ -197,9 +197,23 @@ SELECT coldfront.create_iceberg_table(
       {"name":"ts",     "type":"timestamptz"},
       {"name":"status", "type":"text"},
       {"name":"data",   "type":"jsonb"}
-    ]'::jsonb
+    ]'::jsonb,
+    p_partition_cols => '{month(ts)}'
 );
 ```
+
+`p_partition_cols` partitions the Iceberg table, here by the month of
+`ts`: each month's rows land in their own data files, and a query with a
+time filter skips the months outside it before reading anything. Each
+element is one term as DuckDB's `PARTITIONED BY` takes it: a column name,
+`year(col)`, `month(col)`, `day(col)` or `hour(col)` on a timestamp or
+date column, `bucket(N, col)` or `truncate(W, col)`; `'{month(ts),
+region}'` partitions by both. The argument is a PostgreSQL array
+literal, so a term that contains a comma is double-quoted inside it, the
+comma being the array's delimiter: `'{"bucket(16, id)"}'`. A column name
+that itself needs double quotes carries them backslashed inside such an
+element: `'{"month(\"Event Time\")"}'`. Leave the argument out for an
+unpartitioned table.
 
 That single statement provisions:
 

@@ -280,7 +280,8 @@ SELECT coldfront.create_iceberg_table(
     {"name": "id",   "type": "bigint"},
     {"name": "ts",   "type": "timestamptz"},
     {"name": "note", "type": "text"}
-  ]'::jsonb);
+  ]'::jsonb,
+  '{month(ts)}');
 
 INSERT INTO public.s3_demo VALUES (1, now(), 'hello from S3');
 INSERT INTO public.s3_demo VALUES (2, now(), 'second row');

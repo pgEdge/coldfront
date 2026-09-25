@@ -28,7 +28,8 @@ REGRESS     = load_order update_unregistered_view update_heap_table \
               read_date_bin read_json_builders read_param_fold registry_snapshot \
               adopt_type_map adopt_read_only adopt_iceberg_table \
               cold_write_json_agg duckdb_temp_dir \
-              vector_centroids vector_type_map vector_cold_render vector_param_render vector_ops vector_probe vector_status vector_assign vector_multicolumn
+              vector_centroids vector_type_map vector_cold_render vector_param_render vector_ops vector_probe vector_status vector_assign vector_multicolumn \
+              partition_clause
 REGRESS_OPTS = --inputdir=test --outputdir=test
 
 PG_CONFIG  ?= pg_config
