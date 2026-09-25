@@ -48,7 +48,7 @@ func main() {
 		return
 	}
 
-	configPath := flag.String("config", "config.yaml", "path to config file")
+	configPath := flag.String("config", "", "path to config file (default: $COLDFRONT_CONFIG, ./config.yaml, then /etc/pgedge/coldfront/config.yaml)")
 	debugExportDelay := flag.Duration("debug-export-delay", 0,
 		"sleep this long after Phase 2 (capture+bulk-export) and before Phase 3 "+
 			"(replay+cutover). Test-only knob to widen the window so concurrent "+
@@ -61,7 +61,7 @@ func main() {
 		return
 	}
 
-	cfg, err := config.Load(*configPath)
+	cfg, err := config.LoadDefault(*configPath)
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}

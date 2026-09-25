@@ -49,18 +49,14 @@ func main() {
 		return
 	}
 
-	cfgPath := flag.String("config", "", "path to the YAML config file")
+	cfgPath := flag.String("config", "", "path to the YAML config file (default: $COLDFRONT_CONFIG, ./config.yaml, then /etc/pgedge/coldfront/config.yaml)")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
 	if *showVersion {
 		fmt.Printf("%s %s (built %s)\n", filepath.Base(os.Args[0]), version.Version, version.BuildTime)
 		return
 	}
-	if *cfgPath == "" {
-		log.Fatal("--config is required")
-	}
-
-	cfg, err := config.Load(*cfgPath)
+	cfg, err := config.LoadDefault(*cfgPath)
 	if err != nil {
 		log.Fatalf("load config: %v", err)
 	}
