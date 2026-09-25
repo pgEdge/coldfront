@@ -5774,6 +5774,33 @@ EOF
     q "$HOST" "SELECT coldfront.drop_iceberg_table('public','tccomp', true);" >/dev/null 2>&1
 }
 
+# ───────────────────────────────────────────────────────────────────────────
+# Story TC-192: row-group skipping. A time band over a cold table reads only the
+# Parquet row groups whose statistics can match it. Every cold-read speedup
+# inside a file rests on DuckDB core handing the filter to the Parquet reader,
+# which nothing upstream states as a contract, so the counters DuckDB keeps for
+# it are asserted here, from the JSON profile of a read through the view. Both
+# modes, on its own throwaway table.
+# ───────────────────────────────────────────────────────────────────────────
+story_row_group_pruning() {
+    step "TC-192: a time band skips the row groups outside it"
+    local m="(date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') - interval '2 months'"
+    q "$HOST" "SELECT coldfront.create_iceberg_table('public','tcrg','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"ts\",\"type\":\"timestamptz\"},{\"name\":\"v\",\"type\":\"integer\"}]'::jsonb, '{month(ts)}');" >/dev/null 2>&1
+    # 300,000 rows one second apart, three and a half days inside one month: one
+    # file, several row groups, each covering its own span of ts.
+    q "$HOST" "INSERT INTO public.tcrg SELECT i, ($m) + (i * interval '1 second'), i FROM generate_series(1, 300000) i;" >/dev/null 2>&1
+    assert_eq "TC-192: 300,000 rows in one file" "1" "$(ice_files ice.public.tcrg '\.parquet')"
+    # One session: the profile settings, the read, and the profile it wrote. The
+    # ICEBERG_SCAN node carries the row-group counters.
+    local counters
+    counters=$(q "$HOST" "SELECT duckdb.raw_query('SET custom_profiling_settings = ''{\"OPERATOR_TYPE\": \"true\", \"OPERATOR_ROW_GROUPS_SCANNED\": \"true\", \"OPERATOR_TOTAL_ROW_GROUPS_TO_SCAN\": \"true\"}'''); SELECT duckdb.raw_query('SET enable_profiling = ''json'''); SELECT duckdb.raw_query('SET profiling_output = ''/tmp/tc192.json'''); SELECT count(*) FROM public.tcrg WHERE ts >= ($m) + interval '1 hour' AND ts < ($m) + interval '2 hours'; SELECT duckdb.raw_query('SET enable_profiling = ''no_output'''); SELECT (j->>'operator_row_groups_scanned') || ' ' || (j->>'operator_total_row_groups_to_scan') FROM jsonb_path_query_first(pg_read_file('/tmp/tc192.json')::jsonb, '\$.** ? (@.operator_name == \"ICEBERG_SCAN\")') AS j;" | tail -1)
+    local scanned=${counters% *} total=${counters#* }
+    assert_gt "TC-192: the file holds more than one row group" 1 "$total"
+    assert_gt "TC-192: the band read at least one row group" 0 "$scanned"
+    assert_gt "TC-192: the band skipped the row groups outside it" "$scanned" "$total"
+    q "$HOST" "SELECT coldfront.drop_iceberg_table('public','tcrg', true);" >/dev/null 2>&1
+}
+
 # ── orchestrate ────────────────────────────────────────────────────────────
 # Setup is shared. The story set then branches on mode: tiered exercises the
 # hot+cold partitioned path; decoupled exercises the all-Iceberg wrapper. (The
@@ -5866,6 +5893,7 @@ fi
 story_duckdb_temp_dirs     # TC-152: per-backend spill dir; departed backends' spills reclaimed
 story_duckdb_spill_concurrency  # TC-153: four sessions spilling at once stay isolated and correct
 story_partitioned_cold_tables  # TC-186..TC-189: partition fan-out, UTC months, refusals, manifest skipping
+story_row_group_pruning        # TC-192: a time band skips the row groups outside it
 story_drop_iceberg_table   # both modes, purge and keep-files (own throwaway tables)
 [ "$MESH" = 1 ] && [ "$MODE" = decoupled ] && story_mesh   # tiered+mesh runs story_mesh_tiered (above)
 [ "$MESH" = 1 ] && story_mesh_multiwriter   # >1 cold writer/node cross-node (tiered: events, decoupled: iceonly)
