@@ -25,11 +25,12 @@ type DBTX interface {
 	Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error)
 }
 
-// createTableSQL mirrors the coldfront.partition_config DDL in the C extension
+// CreateTableSQL mirrors the coldfront.partition_config DDL in the C extension
 // (coldfront--1.0.sql) so the vanilla partitioner — stock PG, no extension —
-// can self-materialize the same table. Keep the two in sync (same pattern as
-// archive_watermark / watermark.EnsureTable).
-const createTableSQL = `
+// can self-materialize the same table. The extension adopts that table when it
+// is installed later, so the two are kept token-identical (TestMirrorDDL_MatchesExtension;
+// same pattern as archive_watermark / watermark.EnsureTable).
+const CreateTableSQL = `
 CREATE TABLE IF NOT EXISTS coldfront.partition_config (
     schema_name            text    NOT NULL DEFAULT 'public',
     table_name             text    NOT NULL,
@@ -92,7 +93,7 @@ func EnsureTable(ctx context.Context, db DBTX) error {
 	if _, err := db.Exec(ctx, `CREATE SCHEMA IF NOT EXISTS coldfront`); err != nil {
 		return fmt.Errorf("create schema: %w", err)
 	}
-	if _, err := db.Exec(ctx, createTableSQL); err != nil {
+	if _, err := db.Exec(ctx, CreateTableSQL); err != nil {
 		return fmt.Errorf("create partition_config: %w", err)
 	}
 	if _, err := db.Exec(ctx, addColumnsSQL); err != nil {

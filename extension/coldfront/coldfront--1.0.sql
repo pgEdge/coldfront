@@ -60,6 +60,28 @@ CREATE TABLE coldfront.tiered_views (
 -- ON CONFLICT (schema_name, table_name) DO UPDATE (internal/watermark/watermark.go:Set).
 -- Created with IF NOT EXISTS because the archiver can also materialize it
 -- on first run before CREATE EXTENSION runs against the DB.
+--
+-- A database the standalone partitioner set up before the extension holds
+-- coldfront.partition_config as a plain table, and one the archiver ran on
+-- holds archive_watermark the same way, both from the Go copies of this DDL
+-- (internal/partcfg, internal/watermark). An extension script may skip
+-- CREATE ... IF NOT EXISTS only for an object the extension owns, so such a
+-- table is adopted first: its rows stay, and the pg_extension_config_dump
+-- calls below then cover it like a table this script created.
+DO $$
+DECLARE t text;
+BEGIN
+    FOREACH t IN ARRAY ARRAY['archive_watermark', 'partition_config'] LOOP
+        IF to_regclass('coldfront.' || t) IS NOT NULL AND NOT EXISTS (
+               SELECT 1 FROM pg_depend
+                WHERE classid = 'pg_class'::regclass
+                  AND objid = to_regclass('coldfront.' || t)
+                  AND refclassid = 'pg_extension'::regclass
+                  AND deptype = 'e') THEN
+            EXECUTE format('ALTER EXTENSION coldfront ADD TABLE coldfront.%I', t);
+        END IF;
+    END LOOP;
+END $$;
 CREATE TABLE IF NOT EXISTS coldfront.archive_watermark (
     schema_name text        NOT NULL,
     table_name  text        NOT NULL,

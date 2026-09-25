@@ -26,18 +26,25 @@ func NewStore(db DBTX) *Store {
 	return &Store{db: db}
 }
 
+// CreateTableSQL mirrors the coldfront.archive_watermark DDL in the C extension
+// (coldfront--1.0.sql), so an archiver run can materialize the table before
+// CREATE EXTENSION. The extension adopts that table when it is installed
+// later, so the two are kept token-identical (partcfg's
+// TestMirrorDDL_MatchesExtension).
+const CreateTableSQL = `
+CREATE TABLE IF NOT EXISTS coldfront.archive_watermark (
+    schema_name text        NOT NULL,
+    table_name  text        NOT NULL,
+    cutoff_time timestamptz NOT NULL,
+    PRIMARY KEY (schema_name, table_name)
+)`
+
 // EnsureTable creates the coldfront schema and archive_watermark table if they don't exist.
 func (s *Store) EnsureTable(ctx context.Context) error {
 	if _, err := s.db.Exec(ctx, `CREATE SCHEMA IF NOT EXISTS coldfront`); err != nil {
 		return fmt.Errorf("create schema: %w", err)
 	}
-	if _, err := s.db.Exec(ctx, `
-		CREATE TABLE IF NOT EXISTS coldfront.archive_watermark (
-			schema_name text        NOT NULL,
-			table_name  text        NOT NULL,
-			cutoff_time timestamptz NOT NULL,
-			PRIMARY KEY (schema_name, table_name)
-		)`); err != nil {
+	if _, err := s.db.Exec(ctx, CreateTableSQL); err != nil {
 		return fmt.Errorf("create watermark table: %w", err)
 	}
 	return nil
