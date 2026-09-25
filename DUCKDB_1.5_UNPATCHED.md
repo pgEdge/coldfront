@@ -86,7 +86,10 @@ cold writer, the archiver included, has to run with `TimeZone = 'UTC'`.
 - You don't run the compactor (low cold-write volume, or you compact externally
   with Spark/Trino/PyIceberg — which *may* tolerate stock duckdb-iceberg
   manifests), **and**
-- you don't need the contended-upload throughput (low write concurrency).
+- you don't need the contended-upload throughput (low write concurrency),
+  **and**
+- every cold writer, the archiver included, runs with `TimeZone = 'UTC'`
+  (Consequence 3: every tiered cold table is partitioned by time).
 
 Otherwise run the patched base ([DUCKDB_1.5_PATCHED.md](DUCKDB_1.5_PATCHED.md)) —
 the default.

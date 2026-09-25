@@ -172,8 +172,8 @@ commit-time 403 from missing storage credentials on the commit connection does
 not arise in v1.5. Do
 **not** rewrite `Commit` to run under the caller's `ClientContext`: on the
 deferred `PRE_COMMIT` callback that context has no active transaction and throws
-`ActiveTransaction called without active transaction`. Build the bakery + interop
-patches only.
+`ActiveTransaction called without active transaction`. Build the four carried
+patches (bakery, the two interop patches, the UTC transform port) only.
 
 ---
 

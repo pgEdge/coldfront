@@ -208,26 +208,26 @@ func planCompaction(ctx context.Context, cat *rest.Catalog, ns, name string, tar
 	return tbl, &planResult{groups: groups, plan: plan, sorted: sorted, sortKey: sortKey}, nil
 }
 
-// scopeDeletes keeps, for each data file, only the position-delete files that can
-// reference its rows under the Iceberg spec: those of its own partition, and
-// those of no partition. iceberg-go v0.6.0 attaches position deletes by sequence
-// number and the delete file's file_path bounds alone (table/scanner.go,
-// matchDeletesToData), never by partition, and duckdb-iceberg 5edc45f0 writes
-// those bounds under DuckDB's FILENAME_FIELD_ID (2147483646) rather than the
-// spec's file_path field (2147483546), so every delete file is attached to every
-// data file: one delete file then sits in several partition groups, which
-// ReplaceFiles refuses, and rewriting one partition would remove the delete
-// files of a partition the planner skipped, resurrecting its deleted rows.
-// TC-190 in ci/journey.sh asserts the engine's bound key; when it moves to the
-// spec's field, or iceberg-go matches by partition, this keeps what iceberg-go
-// already kept and can go.
+// scopeDeletes keeps, for each data file, only the position-delete files of its
+// own partition, spec id and partition values both, which is the scope the
+// Iceberg spec gives a position delete (only an equality delete with an
+// unpartitioned spec is global). iceberg-go v0.6.0 attaches position deletes by
+// sequence number and the delete file's file_path bounds alone
+// (table/scanner.go, matchDeletesToData), never by partition, and duckdb-iceberg
+// 5edc45f0 writes those bounds under DuckDB's FILENAME_FIELD_ID (2147483646)
+// rather than the spec's file_path field (2147483546), so every delete file is
+// attached to every data file: one delete file then sits in several partition
+// groups, which ReplaceFiles refuses, and rewriting one partition would remove
+// the delete files of a partition the planner skipped, resurrecting its deleted
+// rows. TC-190 in ci/journey.sh asserts the engine's bound key; when it moves to
+// the spec's field, or iceberg-go matches by partition, this keeps what
+// iceberg-go already kept and can go.
 func scopeDeletes(tasks []table.FileScanTask) []table.FileScanTask {
 	out := make([]table.FileScanTask, 0, len(tasks))
 	for _, task := range tasks {
-		own := task.File.Partition()
 		kept := make([]iceberg.DataFile, 0, len(task.DeleteFiles))
 		for _, df := range task.DeleteFiles {
-			if len(df.Partition()) == 0 || reflect.DeepEqual(df.Partition(), own) {
+			if df.SpecID() == task.File.SpecID() && samePartition(df.Partition(), task.File.Partition()) {
 				kept = append(kept, df)
 			}
 		}
@@ -235,6 +235,20 @@ func scopeDeletes(tasks []table.FileScanTask) []table.FileScanTask {
 		out = append(out, task)
 	}
 	return out
+}
+
+// samePartition compares two partition tuples by field id and value; a nil map
+// and an empty one are the same unpartitioned tuple.
+func samePartition(a, b map[int]any) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for k, v := range a {
+		if w, ok := b[k]; !ok || !reflect.DeepEqual(v, w) {
+			return false
+		}
+	}
+	return true
 }
 
 // rewrite executes the planned compaction as a single atomic rewrite snapshot

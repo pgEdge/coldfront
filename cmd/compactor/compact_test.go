@@ -76,30 +76,55 @@ func deleteFile(t *testing.T, spec iceberg.PartitionSpec, path string, partition
 	return b.Build()
 }
 
-// A data file keeps only the position-delete files that can reference its rows:
-// those of its own partition, and those of no partition at all. Every other
-// delete file is one iceberg-go attached by sequence number alone.
-func TestScopeDeletes(t *testing.T) {
-	spec := iceberg.NewPartitionSpec(iceberg.PartitionField{
-		SourceIDs: []int{2}, FieldID: 1000, Name: "month_ts_2", Transform: iceberg.MonthTransform{}})
-	march, april := map[int]any{1000: int32(674)}, map[int]any{1000: int32(675)}
-	data, err := iceberg.NewDataFileBuilder(spec, iceberg.EntryContentData, "data/month_ts_2=674/d.parquet",
-		iceberg.ParquetFile, march, nil, nil, 10, 1000)
+// dataFile builds a data-file manifest entry in the given partition.
+func dataFile(t *testing.T, spec iceberg.PartitionSpec, path string, partition map[int]any) iceberg.DataFile {
+	t.Helper()
+	b, err := iceberg.NewDataFileBuilder(spec, iceberg.EntryContentData, path, iceberg.ParquetFile,
+		partition, nil, nil, 10, 1000)
 	if err != nil {
 		t.Fatal(err)
 	}
-	own := deleteFile(t, spec, "data/month_ts_2=674/own-deletes.parquet", march)
-	other := deleteFile(t, spec, "data/month_ts_2=675/other-deletes.parquet", april)
-	global := deleteFile(t, spec, "data/global-deletes.parquet", map[int]any{})
+	return b.Build()
+}
 
-	tasks := scopeDeletes([]table.FileScanTask{{File: data.Build(), DeleteFiles: []iceberg.DataFile{other, own, global}}})
-
-	got := make([]string, 0, 2)
+// keptPaths runs scopeDeletes over one data file and returns the paths of the
+// delete files it kept.
+func keptPaths(data iceberg.DataFile, deletes ...iceberg.DataFile) []string {
+	tasks := scopeDeletes([]table.FileScanTask{{File: data, DeleteFiles: deletes}})
+	got := make([]string, 0, len(deletes))
 	for _, df := range tasks[0].DeleteFiles {
 		got = append(got, df.FilePath())
 	}
-	want := []string{"data/month_ts_2=674/own-deletes.parquet", "data/global-deletes.parquet"}
-	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
-		t.Fatalf("kept %v, want %v", got, want)
+	return got
+}
+
+// A data file keeps only the position-delete files of its own partition, spec
+// id and values both, as the Iceberg spec scopes them. Every other delete file is
+// one iceberg-go attached by sequence number alone.
+func TestScopeDeletes(t *testing.T) {
+	month := iceberg.PartitionField{SourceIDs: []int{2}, FieldID: 1000, Name: "month_ts_2",
+		Transform: iceberg.MonthTransform{}}
+	spec, later := iceberg.NewPartitionSpecID(1, month), iceberg.NewPartitionSpecID(2, month)
+	march, april := map[int]any{1000: int32(674)}, map[int]any{1000: int32(675)}
+	data := dataFile(t, spec, "data/month_ts_2=674/d.parquet", march)
+
+	got := keptPaths(data,
+		deleteFile(t, spec, "data/month_ts_2=675/other-month.parquet", april),
+		deleteFile(t, spec, "data/month_ts_2=674/own.parquet", march),
+		deleteFile(t, spec, "data/no-partition.parquet", map[int]any{}),
+		deleteFile(t, later, "data/month_ts_2=674/other-spec.parquet", march))
+	if len(got) != 1 || got[0] != "data/month_ts_2=674/own.parquet" {
+		t.Fatalf("kept %v, want the own-partition delete file alone", got)
+	}
+}
+
+// An unpartitioned table is one partition: its delete files apply to its data
+// files whether the partition map is nil or empty.
+func TestScopeDeletes_Unpartitioned(t *testing.T) {
+	spec := iceberg.NewPartitionSpecID(0)
+	got := keptPaths(dataFile(t, spec, "data/d.parquet", nil),
+		deleteFile(t, spec, "data/deletes.parquet", map[int]any{}))
+	if len(got) != 1 {
+		t.Fatalf("kept %v, want the delete file", got)
 	}
 }
