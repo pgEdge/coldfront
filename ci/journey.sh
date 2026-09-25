@@ -5870,13 +5870,16 @@ story_vector_probe_pruning() {
     q "$HOST" "INSERT INTO public.tcvp SELECT i, now(), (CASE WHEN i % 2 = 0 THEN '[100,100,' || (100 + i % 7) || ']' ELSE '[-100,-100,' || (-100 - i % 7) || ']' END)::vector FROM generate_series(1, 300000) i;" >/dev/null 2>&1
     assert_eq "TC-193: 300,000 rows in one file" "1" "$(ice_files ice.public.tcvp '\.parquet')"
     # One session: the profile settings, the probe, and the profile it wrote. The
-    # probed read has two ICEBERG_SCAN nodes; the counters are summed over both.
-    local counters
-    counters=$(q "$HOST" "SELECT duckdb.raw_query('SET custom_profiling_settings = ''{\"OPERATOR_TYPE\": \"true\", \"OPERATOR_ROW_GROUPS_SCANNED\": \"true\", \"OPERATOR_TOTAL_ROW_GROUPS_TO_SCAN\": \"true\"}'''); SELECT duckdb.raw_query('SET enable_profiling = ''json'''); SELECT duckdb.raw_query('SET profiling_output = ''/tmp/tc193.json'''); SELECT id FROM public.tcvp ORDER BY embedding <=> ARRAY[100,100,100]::real[] LIMIT 1; SELECT duckdb.raw_query('SET enable_profiling = ''no_output'''); SELECT sum((j->>'operator_row_groups_scanned')::int) || ' ' || sum((j->>'operator_total_row_groups_to_scan')::int) FROM jsonb_path_query(pg_read_file('/tmp/tc193.json')::jsonb, '\$.** ? (@.operator_name == \"ICEBERG_SCAN\")') AS j;" | tail -1)
-    local scanned=${counters% *} total=${counters#* }
-    assert_gt "TC-193: the file holds more than one row group" 1 "$total"
-    assert_gt "TC-193: the probe read at least one row group" 0 "$scanned"
-    assert_gt "TC-193: the probe skipped the row groups of the cluster it did not visit" "$scanned" "$total"
+    # probed read has two ICEBERG_SCAN nodes, the probe arm first and the
+    # unassigned arm second, each read on its own (strict jsonpath: lax .**
+    # yields every array element twice).
+    local counters s1 t1 s2 t2
+    counters=$(q "$HOST" "SELECT duckdb.raw_query('SET custom_profiling_settings = ''{\"OPERATOR_TYPE\": \"true\", \"OPERATOR_ROW_GROUPS_SCANNED\": \"true\", \"OPERATOR_TOTAL_ROW_GROUPS_TO_SCAN\": \"true\"}'''); SELECT duckdb.raw_query('SET enable_profiling = ''json'''); SELECT duckdb.raw_query('SET profiling_output = ''/tmp/tc193.json'''); SELECT id FROM public.tcvp ORDER BY embedding <=> ARRAY[100,100,100]::real[] LIMIT 1; SELECT duckdb.raw_query('SET enable_profiling = ''no_output'''); SELECT string_agg((j->>'operator_row_groups_scanned') || ' ' || (j->>'operator_total_row_groups_to_scan'), ' ' ORDER BY o) FROM jsonb_path_query(pg_read_file('/tmp/tc193.json')::jsonb, 'strict \$.** ? (@.operator_name == \"ICEBERG_SCAN\")') WITH ORDINALITY AS t(j, o);" | tail -1)
+    read -r s1 t1 s2 t2 <<< "$counters"
+    assert_gt "TC-193: the file holds more than one row group" 1 "$t1"
+    assert_gt "TC-193: the probe arm read at least one row group" 0 "$s1"
+    assert_gt "TC-193: the probe arm skipped the row groups of the cluster it did not visit" "$s1" "$t1"
+    assert_eq "TC-193: the unassigned arm scanned nothing" "0" "$t2"
     q "$HOST" "SELECT coldfront.drop_iceberg_table('public','tcvp', true);" >/dev/null 2>&1
     assert_eq "TC-193: the drop took the table's vector configuration and centroids with it" "0" \
         "$(q "$HOST" "SELECT (SELECT count(*) FROM coldfront.vector_config WHERE table_name = 'tcvp') + (SELECT count(*) FROM coldfront.vector_centroids WHERE table_name = 'tcvp');")"
