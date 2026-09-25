@@ -374,9 +374,9 @@ before the drop is applied there.
 
 ### Handing a table back
 
-`coldfront.release_iceberg_table()` removes the wrapper view and the
-registry row and performs no Iceberg I/O, so the Iceberg table keeps
-every row:
+`coldfront.release_iceberg_table()` removes the wrapper view, the
+registry row and the relation's vector configuration, and performs no
+Iceberg I/O, so the Iceberg table keeps every row:
 
 ```sql
 SELECT coldfront.release_iceberg_table('public', 'orders');

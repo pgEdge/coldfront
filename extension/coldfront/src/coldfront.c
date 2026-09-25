@@ -2323,9 +2323,12 @@ build_iceberg_only_insert_with_cluster(Query *query, TieredViewInfo *info,
     if (prefix == NULL || list_cols == NULL)
         return NULL;
 
+    /* Ordered by cluster, so this write's own row groups each hold about one
+     * cluster and a probe skips the rest of the file. The cluster leads the
+     * projection, hence ordinal 1. */
     initStringInfo(&sql);
     appendStringInfo(&sql,
-        "INSERT INTO %s (%s, %s) SELECT %s%s FROM (%s) AS coldfront_src(%s)",
+        "INSERT INTO %s (%s, %s) SELECT %s%s FROM (%s) AS coldfront_src(%s) ORDER BY 1",
         info->iceberg_table, list_cols, col_list,
         prefix, col_list, source, col_list);
     return sql.data;
@@ -3015,9 +3018,12 @@ cf_probe_match(Query *query, char **vec_name, char **vec_lit)
  *
  * The predicate cannot be added to the caller's query, because the column it
  * tests is deliberately in no branch of the view (see coldfront._vec_list_col).
- * So the view reference is replaced by the view's own definition carrying the
- * predicate on its cold arm, which puts the test where the column exists and
- * leaves the caller's query surface alone. Nothing here is text surgery on the
+ * So the view reference is replaced by the view's own definition with its cold
+ * arm twice: once carrying the predicate, once carrying IS NULL for the rows
+ * with no assignment. DuckDB pushes an IN into the scan but not an OR that
+ * carries IS NULL, and the second arm costs nothing when every row is assigned.
+ * That puts the test where the column exists and leaves the caller's query
+ * surface alone. Nothing here is text surgery on the
  * caller's SQL: the substitution swaps one range-table entry for a subquery and
  * PostgreSQL deparses the result.
  *
@@ -3049,9 +3055,8 @@ cf_maybe_inject_probe(Query *query)
     /* Resolve the probe set and the definition that carries it, in one round trip. */
     initStringInfo(&q);
     appendStringInfo(&q,
-                     "SELECT coldfront._vec_probed_viewdef(%s, %s, "
-                     "coldfront._vec_probe_qual(%s, coldfront._vec_probe_ids("
-                     "%s, %s, %s, %s::real[], %s)))",
+                     "SELECT coldfront._vec_probed_viewdef(%s, %s, %s, "
+                     "coldfront._vec_probe_ids(%s, %s, %s, %s::real[], %s))",
                      quote_literal_cstr(get_namespace_name(
                                             get_rel_namespace(view_rte->relid))),
                      quote_literal_cstr(get_rel_name(view_rte->relid)),

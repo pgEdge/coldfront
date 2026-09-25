@@ -76,7 +76,14 @@ VALUES ('public', 'iceonly_again', NULL, '"ice"."public"."iceonly"', NULL, true)
 ERROR:  duplicate key value violates unique constraint "tiered_views_iceberg_table_key"
 DETAIL:  Key (iceberg_table)=("ice"."public"."iceonly") already exists.
 DROP VIEW public.iceonly_again;
--- Decoupled teardown: the registry row and the wrapper view both go.
+-- Decoupled teardown: the registry row and the wrapper view both go, and so do
+-- the relation's vector configuration and centroids: they describe the table this
+-- registration named, and a relation registered later under the same name must
+-- not inherit them.
+INSERT INTO coldfront.vector_config (schema_name, table_name, column_name, nlist, nprobe, generation)
+VALUES ('public', 'iceonly', 'embedding', 2, 1, 1);
+INSERT INTO coldfront.vector_centroids (schema_name, table_name, column_name, generation, centroid_id, centroid)
+VALUES ('public', 'iceonly', 'embedding', 1, 0, ARRAY[1,0,0]::real[]);
 SELECT coldfront._unregister_iceberg('public', 'iceonly');
  _unregister_iceberg 
 ---------------------
@@ -93,6 +100,18 @@ SELECT count(*) AS view_left FROM pg_class WHERE relname = 'iceonly';
  view_left 
 -----------
          0
+(1 row)
+
+SELECT count(*) AS vector_config_rows FROM coldfront.vector_config WHERE table_name = 'iceonly';
+ vector_config_rows 
+--------------------
+                  0
+(1 row)
+
+SELECT count(*) AS centroid_rows FROM coldfront.vector_centroids WHERE table_name = 'iceonly';
+ centroid_rows 
+---------------
+             0
 (1 row)
 
 -- Tiered teardown: the archiver's first run renamed events to _events and put a

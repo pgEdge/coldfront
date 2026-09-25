@@ -5843,6 +5843,45 @@ story_row_group_pruning() {
     q "$HOST" "SELECT coldfront.drop_iceberg_table('public','tcrg', true);" >/dev/null 2>&1
 }
 
+# ───────────────────────────────────────────────────────────────────────────
+# Story TC-193: the vector probe and row-group skipping. A clustered cold write
+# lands in cluster order, so a row group holds one cluster or two and its
+# statistics on the cluster column say which. The probe's IN predicate reaches
+# the reader, so the row groups of the clusters it does not visit are skipped;
+# the rows with no assignment are a second arm of the cold scan, counted from
+# the same profile, and cost nothing when there are none. Both modes, on its
+# own throwaway table.
+# ───────────────────────────────────────────────────────────────────────────
+story_vector_probe_pruning() {
+    step "TC-193: a vector probe skips the row groups of the clusters it does not visit"
+    local i
+    for i in 1 2 3 4 5; do
+        q_may "$HOST" "SELECT coldfront.create_iceberg_table('public','tcvp','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"ts\",\"type\":\"timestamptz\"},{\"name\":\"embedding\",\"type\":\"vector(3)\"}]'::jsonb);" >/dev/null 2>&1
+        [ "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname='tcvp' AND relkind='v';")" = "1" ] && break
+        sleep 2
+    done
+    # Two clusters far apart; a probe visits one of them.
+    q "$HOST" "INSERT INTO coldfront.vector_config (schema_name, table_name, column_name, nlist, nprobe) VALUES ('public','tcvp','embedding',2,1);" >/dev/null
+    q "$HOST" "INSERT INTO coldfront.vector_centroids (schema_name, table_name, column_name, generation, centroid_id, centroid) VALUES ('public','tcvp','embedding',1,0,ARRAY[100,100,100]::real[]),('public','tcvp','embedding',1,1,ARRAY[-100,-100,-100]::real[]);" >/dev/null
+    q "$HOST" "UPDATE coldfront.vector_config SET generation = 1 WHERE table_name = 'tcvp';" >/dev/null
+    # 300,000 rows alternating between the clusters, in one write: one file with
+    # several row groups, and the write's own ORDER BY is what puts each cluster's
+    # rows together.
+    q "$HOST" "INSERT INTO public.tcvp SELECT i, now(), (CASE WHEN i % 2 = 0 THEN '[100,100,' || (100 + i % 7) || ']' ELSE '[-100,-100,' || (-100 - i % 7) || ']' END)::vector FROM generate_series(1, 300000) i;" >/dev/null 2>&1
+    assert_eq "TC-193: 300,000 rows in one file" "1" "$(ice_files ice.public.tcvp '\.parquet')"
+    # One session: the profile settings, the probe, and the profile it wrote. The
+    # probed read has two ICEBERG_SCAN nodes; the counters are summed over both.
+    local counters
+    counters=$(q "$HOST" "SELECT duckdb.raw_query('SET custom_profiling_settings = ''{\"OPERATOR_TYPE\": \"true\", \"OPERATOR_ROW_GROUPS_SCANNED\": \"true\", \"OPERATOR_TOTAL_ROW_GROUPS_TO_SCAN\": \"true\"}'''); SELECT duckdb.raw_query('SET enable_profiling = ''json'''); SELECT duckdb.raw_query('SET profiling_output = ''/tmp/tc193.json'''); SELECT id FROM public.tcvp ORDER BY embedding <=> ARRAY[100,100,100]::real[] LIMIT 1; SELECT duckdb.raw_query('SET enable_profiling = ''no_output'''); SELECT sum((j->>'operator_row_groups_scanned')::int) || ' ' || sum((j->>'operator_total_row_groups_to_scan')::int) FROM jsonb_path_query(pg_read_file('/tmp/tc193.json')::jsonb, '\$.** ? (@.operator_name == \"ICEBERG_SCAN\")') AS j;" | tail -1)
+    local scanned=${counters% *} total=${counters#* }
+    assert_gt "TC-193: the file holds more than one row group" 1 "$total"
+    assert_gt "TC-193: the probe read at least one row group" 0 "$scanned"
+    assert_gt "TC-193: the probe skipped the row groups of the cluster it did not visit" "$scanned" "$total"
+    q "$HOST" "SELECT coldfront.drop_iceberg_table('public','tcvp', true);" >/dev/null 2>&1
+    assert_eq "TC-193: the drop took the table's vector configuration and centroids with it" "0" \
+        "$(q "$HOST" "SELECT (SELECT count(*) FROM coldfront.vector_config WHERE table_name = 'tcvp') + (SELECT count(*) FROM coldfront.vector_centroids WHERE table_name = 'tcvp');")"
+}
+
 # ── orchestrate ────────────────────────────────────────────────────────────
 # Setup is shared. The story set then branches on mode: tiered exercises the
 # hot+cold partitioned path; decoupled exercises the all-Iceberg wrapper. (The
@@ -5936,6 +5975,7 @@ story_duckdb_temp_dirs     # TC-152: per-backend spill dir; departed backends' s
 story_duckdb_spill_concurrency  # TC-153: four sessions spilling at once stay isolated and correct
 story_partitioned_cold_tables  # TC-186..TC-189: partition fan-out, UTC months, refusals, manifest skipping
 story_row_group_pruning        # TC-192: a time band skips the row groups outside it
+story_vector_probe_pruning     # TC-193: a vector probe skips the row groups of the clusters it does not visit
 story_drop_iceberg_table   # both modes, purge and keep-files (own throwaway tables)
 [ "$MESH" = 1 ] && [ "$MODE" = decoupled ] && story_mesh   # tiered+mesh runs story_mesh_tiered (above)
 [ "$MESH" = 1 ] && story_mesh_multiwriter   # >1 cold writer/node cross-node (tiered: events, decoupled: iceonly)
