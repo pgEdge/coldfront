@@ -23,7 +23,7 @@ export DUCKDB_EXT_VERSION="$DUCKDB_VERSION"
 export DUCKDB_EXT_BUILDNUM="${COMPONENT_BUILDNUM:-1}"
 
 # --- Build pins -------------------------------------------------------------------
-# duckdb-iceberg: the 3 patches target ICEBERG_REF (branch fetched first so the
+# duckdb-iceberg: the 4 patches target ICEBERG_REF (branch fetched first so the
 # ref resolves). avro/azure/postgres_scanner refs live in the extension_config
 # cmake (packaging copies docker/iceberg-azure-extension-config-v15.cmake).
 # ICEBERG_REF is read from the base-image Dockerfile — the single source of truth,

@@ -1,0 +1,48 @@
+# iceberg-timestamptz-utc-transforms-v15.patch
+#
+# Applies to: duckdb-iceberg @ 5edc45f0 (branch v1.5-variegata), DuckDB v1.5.x.
+#
+# A port of upstream duckdb-iceberg d3c3348271 ("fix: use UTC semantics for Iceberg
+# TIMESTAMPTZ transforms", PR #1361), which is on main only: v1.5-variegata does not
+# carry it (checked up to 890b78a9), nor does the duckdb-iceberg that DuckDB v1.5.5
+# ships (45163a28).
+#
+# Problem: a partitioned write computes year/month/day/hour of a TIMESTAMPTZ column
+# as date_diff on the TIMESTAMPTZ itself, which ICU counts in the session's time
+# zone, and pg_duckdb sets that zone from PostgreSQL's TimeZone. The Iceberg spec,
+# duckdb-iceberg's own partition pruning (iceberg_transform.hpp) and iceberg-go all
+# take the UTC instant. So from a session outside UTC, a row within the zone offset
+# of a boundary is filed in the neighbouring partition, and a predicate on the
+# column prunes it away: from an America/New_York session, 2026-04-01 02:00 UTC is
+# filed under March, and "ts >= '2026-04-01 00:00+00'" does not return it.
+#
+# Fix: bind a TIMESTAMPTZ source as TIMESTAMP through DuckDB's default cast, which
+# reinterprets the stored UTC microseconds and never consults ICU, before date_diff.
+# Upstream also covers TIMESTAMP_TZ_NS, a type DuckDB 1.5 does not have.
+#
+# ci/journey.sh's New York-session write (TC-186) fails without this patch. Drop the
+# patch when ICEBERG_REF moves to a ref that carries the fix: git apply --check then
+# fails on the changed lines.
+#
+diff --git a/src/execution/operator/iceberg_insert.cpp b/src/execution/operator/iceberg_insert.cpp
+index 1fcba7803..3fb0502f8 100644
+--- a/src/execution/operator/iceberg_insert.cpp
++++ b/src/execution/operator/iceberg_insert.cpp
+@@ -574,8 +574,15 @@ static unique_ptr<Expression> GetDateDiffFunction(ClientContext &context, const
+ 	} else {
+ 		children.push_back(make_uniq<BoundConstantExpression>(Value::DATE(Date::FromDate(1970, 1, 1))));
+ 	}
+-	// Third argument: the source column
+-	children.push_back(CreateColumnReference(copy_input, col_type, col_idx));
++	// Third argument: the source column. A TIMESTAMPTZ source is bound as the UTC
++	// TIMESTAMP it holds: the default cast reinterprets it without consulting ICU,
++	// where date_diff on a TIMESTAMPTZ counts in the session's time zone. Iceberg
++	// defines the temporal transforms on the UTC instant.
++	auto source = CreateColumnReference(copy_input, col_type, col_idx);
++	if (col_type.id() == LogicalTypeId::TIMESTAMP_TZ) {
++		source = BoundCastExpression::AddDefaultCastToType(std::move(source), LogicalType::TIMESTAMP);
++	}
++	children.push_back(std::move(source));
+ 
+ 	ErrorData error;
+ 	FunctionBinder binder(context);

@@ -12,14 +12,15 @@ and verified*. The cold-tier compactor's own story lives in
 > `abfss://` Iceberg **reads** (`read_avro` on `abfss`); the base then layers
 > ColdFront's patches on top.
 
-## The two patch families the base carries
+## The patch families the base carries
 
 | Patch family | Files | Purpose | Without it |
 |---|---|---|---|
 | **Bakery-aware commit-refresh** | `docker/iceberg-bakery-aware-commit-refresh-v15.patch` | makes the async parquet-upload ordering safe → the **no-409** guarantee for concurrent cold writers, at contended-upload throughput | cold writes still work and still never 409 — they fall back to serialized (claim-first) uploads (see [DUCKDB_1.5_UNPATCHED.md](DUCKDB_1.5_UNPATCHED.md)) |
 | **Strict-reader interop** (upstreamable) | `docker/iceberg-manifest-list-format-version-v15.patch`, `docker/iceberg-data-file-format-v15.patch` | make the manifests duckdb-iceberg *writes* readable by strict Apache readers (apache/iceberg-go) | the cold-tier **compactor cannot read the table** - see [docs/compaction.md](docs/compaction.md). pg_duckdb's own reads/writes are unaffected. |
+| **TIMESTAMPTZ transforms in UTC** (port of upstream d3c3348271) | `docker/iceberg-timestamptz-utc-transforms-v15.patch` | year/month/day/hour of a TIMESTAMPTZ partition column are computed on the UTC instant, as the Iceberg spec, duckdb-iceberg's own pruning and iceberg-go take them | a session outside UTC files rows within the zone offset of a boundary in the neighbouring partition, and a UTC-bounded read on the column **prunes them away** |
 
-All three patches apply cleanly to a **pristine** `duckdb-iceberg` @ `5edc45f0`
+All four patches apply cleanly to a **pristine** `duckdb-iceberg` @ `5edc45f0`
 (branch `v1.5-variegata`); `docker/Dockerfile.duckdb15-base` `git apply --check`s
 each before applying, failing the build loudly on patch rot.
 
@@ -144,7 +145,26 @@ The compactor itself (usage, backends, maintenance steps) is documented in
 [docs/compaction.md](docs/compaction.md). The interop patches are independent of
 the bakery patch.
 
-## 4. NOT shipped — no `Commit(ClientContext&)` rewrite
+## 4. TIMESTAMPTZ partition transforms in UTC (one patch, a port)
+
+`iceberg-timestamptz-utc-transforms-v15.patch` ports upstream duckdb-iceberg
+d3c3348271 (PR #1361, on `main` only: neither `v1.5-variegata` up to `890b78a9`
+nor the duckdb-iceberg that DuckDB v1.5.5 ships, `45163a28`, carries it). At the
+pinned ref a partitioned write computes `year/month/day/hour` of a TIMESTAMPTZ
+column as `date_diff` on the TIMESTAMPTZ itself, which ICU evaluates in the
+session's time zone, and pg_duckdb sets that zone from PostgreSQL's `TimeZone`.
+The Iceberg spec, duckdb-iceberg's own read-side pruning
+(`iceberg_transform.hpp`) and iceberg-go all take the UTC instant, so from a
+session outside UTC a row within the zone offset of a boundary lands in the
+neighbouring partition and a UTC-bounded predicate on the column prunes it
+away (reproduced: from `America/New_York`, 2026-04-01 02:00 UTC was filed under
+March and `ts >= '2026-04-01 00:00+00'` did not return it). The patch binds a
+TIMESTAMPTZ source as TIMESTAMP through DuckDB's default cast, which
+reinterprets the stored UTC microseconds without ICU, before `date_diff`.
+`ci/journey.sh` TC-186 fails without it. Dropped when `ICEBERG_REF` reaches a
+ref that carries the fix.
+
+## 5. NOT shipped — no `Commit(ClientContext&)` rewrite
 
 v1.5's `IcebergTransaction::Commit` already copies the caller's `ClientConfig`
 into its commit-time connection, so `s3_access_key_id` etc. are available; a
@@ -157,19 +177,19 @@ patches only.
 
 ---
 
-## 5. Version pins (do not drift)
+## 6. Version pins (do not drift)
 
 | Component | Pin | Notes |
 |---|---|---|
 | pg_duckdb | **merged PR #1025** (`c04e6a2`) | no released tag carries 1.5.x; `git checkout c04e6a2`. Its duckdb submodule is the v1.5.4 tag (`08e34c4`). |
 | DuckDB | **v1.5.4 tag** (`08e34c4`) | pinned by pg_duckdb @ `c04e6a2`; the iceberg build re-pins ITS duckdb submodule to the same tag so the extension ABI matches the engine. The `duckdb.*` GUCs + PRE_COMMIT iceberg-commit deferral ColdFront relies on are unchanged. |
-| duckdb-iceberg | **`v1.5-variegata` @ `5edc45f0`** | extension code the three patches target — kept fixed, so the patches apply unchanged. The build re-pins its duckdb submodule to the v1.5.4 tag (the branch tracks duckdb `main`, which drifts off the release; verified: `5edc45f0` compiles clean against v1.5.4). Transaction code lives in `src/catalog/rest/transaction/`. |
+| duckdb-iceberg | **`v1.5-variegata` @ `5edc45f0`** | extension code the four patches target — kept fixed, so the patches apply unchanged. The build re-pins its duckdb submodule to the v1.5.4 tag (the branch tracks duckdb `main`, which drifts off the release; verified: `5edc45f0` compiles clean against v1.5.4). Transaction code lives in `src/catalog/rest/transaction/`. |
 | avro | **`7f423d69`** | the pin `v1.5-variegata` uses. |
 | azure | **`v1.5-variegata` @ `563589b2`** | the ABI-matched sibling of iceberg's branch. **NOT `main`** — azure `main` collides at link (`multiple definition of duckdb::FileFlags::FILE_FLAGS_NULL_IF_NOT_EXISTS`). |
 | postgres_scanner | duckdb-postgres **`6b2b12ca`** | the `postgres` ext; built bundled (ABI-matched, stamped v1.5.4), **shipped** in the image (never downloaded). Its vcpkg `libpq` build needs **flex** + **bison**. |
 | libcurl | **build 8.12.0** (≥ 7.77) | **REQUIRED** — DuckDB 1.5.4 httpfs uses `CURLSSLOPT_AUTO_CLIENT_CERT` (≥ 7.77); the pgEdge base ships 7.76.1. 8.12.0 fixes CVE-2025-0665 (the 8.11.1 resolver SIGABRT); runtime still pins httplib regardless. |
 
-## 6. Build — `docker/Dockerfile.duckdb15-base`
+## 7. Build — `docker/Dockerfile.duckdb15-base`
 
 The base build *is* the recipe; read it as the source of truth. Its non-obvious
 requirements (each a real build failure if missing):
@@ -193,7 +213,7 @@ requirements (each a real build failure if missing):
 Cold base build is ~30–60 min (vcpkg compiles the Azure SDK + libpq from source);
 incremental rebuilds after a patch change recompile only the iceberg extension.
 
-## 7. Install / GUCs / image wiring (base/app split)
+## 8. Install / GUCs / image wiring (base/app split)
 
 The expensive, **stable** compiles live in the **base** image, published to
 `ghcr.io/pgedge/coldfront-duckdb-base:pg{16,17,18}`. The thin **app** image layers
@@ -235,7 +255,7 @@ Building the app locally pulls the published base
 `ghcr.io/pgedge/coldfront-duckdb-base:pg<major>`, or uses a locally-built
 base tagged the same.
 
-## 8. v1.5 architecture notes (verified against source)
+## 9. v1.5 architecture notes (verified against source)
 
 - `IcebergTransaction::Commit()` opens a fresh `temp_con` but **copies the
   caller's config** (settings like `s3_access_key_id`, not the secret catalog).
@@ -251,7 +271,7 @@ base tagged the same.
   works by refreshing metadata at commit time rather than re-stamping fields,
   and why its no-409 correctness is proven by the 3-node bench, not assumed.
 
-## 9. Azure secret (`TYPE azure`)
+## 10. Azure secret (`TYPE azure`)
 
 Verified against duckdb-azure `src/azure_secret.cpp` + the built extension. There
 is **no `ACCOUNT_KEY` parameter** — a shared-key account key is supplied only in
@@ -273,7 +293,7 @@ One secret serves both `abfss://` (ADLS Gen2 / dfs) and `az://` (blob).
 live `CREATE PERSISTENT SECRET` is exercised only on the 1.5.x image, not in
 pg_regress — a green regress run does **not** prove azure I/O).
 
-## 10. CI coverage — why azure is creds-gated, not hermetic
+## 11. CI coverage — why azure is creds-gated, not hermetic
 
 `ci/matrix.sh` runs the same storage-agnostic journey under s3 (hermetic,
 SeaweedFS, always) and under azure (creds-gated) across the full grid: both
@@ -286,7 +306,7 @@ PENDING — never silently skipped); the storage-divergent code (secret renderin
 config selection) is covered with no creds by the unit + pg_regress layer on
 every PR.
 
-## 11. Cutover vs cold-write serialization
+## 12. Cutover vs cold-write serialization
 
 `coldfront.cutover_archive` acquires the **same bakery** the cold-write path
 takes (same `v_armed` gate, same `coldfront_iceberg:<ref>` key) on its
@@ -306,7 +326,7 @@ inversion forms, the **cutover** yields first (100 ms), frees the bakery, the
 writer commits, and the harness retries the cutover; the writer is never the
 victim.
 
-## 12. Reverting to UNPATCHED
+## 13. Reverting to UNPATCHED
 
 No code change — flip to stock by unsetting `coldfront.iceberg_bakery_patch`
 (the gate goes false → claim-first even if the async flag stays on). To run a

@@ -15,11 +15,12 @@ It is still a locally-built (unsigned) extension; there is no signed upstream
 ## The build delta (vs the patched base)
 
 In `docker/Dockerfile.duckdb15-base`, drop the `COPY` + `git apply --check` +
-`git apply` of all three patches:
+`git apply` of all four patches:
 
 - `iceberg-bakery-aware-commit-refresh-v15.patch`
 - `iceberg-manifest-list-format-version-v15.patch`
 - `iceberg-data-file-format-v15.patch`
+- `iceberg-timestamptz-utc-transforms-v15.patch`
 
 Everything else — libcurl, vcpkg deps, the pins, the extension config, the
 runtime stage — is identical. In `docker/entrypoint.sh`, leave
@@ -66,6 +67,19 @@ in the patched base) are exactly what make the compactor work; see
 version/content/format from table metadata, never from the Avro keys iceberg-go
 checks. So an unpatched cold tier reads and writes fine through PostgreSQL; it
 just can't be compacted by the go-native compactor.
+
+## Consequence 3: partitioned cold tables are only correct from UTC sessions
+
+Every tiered cold table, and a decoupled one created with `p_partition_cols`,
+is partitioned by `month(ts)` or `day(ts)`. Stock duckdb-iceberg at the pinned
+ref computes that transform with `date_diff` on the TIMESTAMPTZ itself, which
+ICU evaluates in the session's time zone (pg_duckdb sets it from PostgreSQL's
+`TimeZone`), while its own read-side pruning and iceberg-go take the UTC
+instant. From a session outside UTC, a row within the zone offset of a month
+boundary is filed in the neighbouring partition, and a UTC month-bounded read
+prunes it away. The fourth patch, a port of upstream d3c3348271, binds the
+column as the UTC TIMESTAMP it holds before the transform. Unpatched, every
+cold writer, the archiver included, has to run with `TimeZone = 'UTC'`.
 
 ## When unpatched is acceptable
 
