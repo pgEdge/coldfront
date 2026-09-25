@@ -131,7 +131,7 @@ CREATE TABLE IF NOT EXISTS coldfront.storage_secret (
     url_style         text    NOT NULL DEFAULT 'path',
     use_ssl           boolean NOT NULL DEFAULT false,
     connection_string text,                            -- azure CONFIG provider: AccountName/AccountKey (shared key)
-    vended            boolean NOT NULL DEFAULT false,   -- true ⇒ Lakekeeper mints per-table creds; this row stores none
+    vended            boolean NOT NULL DEFAULT false,   -- true ⇒ Lakekeeper issues per-table creds; this row stores none
     CONSTRAINT ss_type_enum  CHECK (storage_type IN ('s3','azure')),
     CONSTRAINT ss_s3_creds   CHECK (vended OR storage_type <> 's3'
                                      OR (key_id IS NOT NULL AND secret IS NOT NULL)),
@@ -251,7 +251,7 @@ BEGIN
     -- pg_duckdb when this ATTACH (TYPE ICEBERG, ...) fires, gated by
     -- duckdb.autoinstall_known_extensions / autoload_known_extensions. No
     -- explicit install or per-session LOAD needed. ACCESS_DELEGATION_MODE is
-    -- VENDED_CREDENTIALS for a vended cold store (Lakekeeper mints per-table
+    -- VENDED_CREDENTIALS for a vended cold store (Lakekeeper issues per-table
     -- creds), else NONE (the persistent secret supplies them).
     PERFORM duckdb.raw_query(format(
       'ATTACH IF NOT EXISTS %L AS ice (TYPE ICEBERG, ENDPOINT %L, '
@@ -468,7 +468,7 @@ RETURNS text
 LANGUAGE plpgsql IMMUTABLE AS $$
 DECLARE opts text;
 BEGIN
-  -- Vended rows carry no credentials: Lakekeeper mints per-table creds and
+  -- Vended rows carry no credentials: Lakekeeper issues per-table creds and
   -- duckdb-iceberg creates the DuckDB secret from them, so there is nothing to
   -- materialize here.
   IF r.vended THEN
@@ -624,7 +624,7 @@ $$;
 -- must not store object-store credentials. It writes a credential-less row
 -- (vended = true) so nothing is materialized as a DuckDB secret; instead
 -- ensure_attached() turns on Iceberg REST credential vending and Lakekeeper
--- mints short-lived per-table credentials at read/write time. The Lakekeeper
+-- issues short-lived per-table credentials at read/write time. The Lakekeeper
 -- warehouse keeps its own long-term credential (the client plane holds none).
 -- p_storage_type selects s3 (default; AWS + S3-compatible) or azure (so
 -- ensure_attached still LOADs the azure extension for the vended SAS). Same
@@ -645,7 +645,7 @@ $$;
 
 -- _attach_delegation_mode(): the DuckDB ICEBERG ATTACH access-delegation mode
 -- for this node. VENDED_CREDENTIALS when the stored row is vended (Lakekeeper
--- mints per-table creds), else NONE (the persistent secret supplies them).
+-- issues per-table creds), else NONE (the persistent secret supplies them).
 -- Absent row ⇒ NONE (no cold store configured yet).
 CREATE OR REPLACE FUNCTION coldfront._attach_delegation_mode() RETURNS text
 LANGUAGE sql STABLE AS $$
@@ -4680,7 +4680,7 @@ $$;
 COMMENT ON SCHEMA coldfront IS 'pgEdge ColdFront: transparent PostgreSQL to Apache Iceberg tiering, plus decoupled iceberg-only tables.';
 COMMENT ON TABLE coldfront.tiered_views IS 'Registry (keyed by schema, relname) of views the coldfront DML hook handles — tiered (hot+cold) and decoupled (iceberg-only).';
 COMMENT ON TABLE coldfront.archive_watermark IS 'Per-tiered-table (schema, table) hot/cold cutoff: ts >= cutoff is hot (PG), ts < cutoff is cold (Iceberg).';
-COMMENT ON TABLE coldfront.storage_secret IS 'Cold-store credential; materialized as a DuckDB PERSISTENT SECRET, replicated by value across a Spock mesh, excluded from pg_dump. A vended row stores no credential and materializes nothing: Lakekeeper mints per-table creds and ensure_attached uses ACCESS_DELEGATION_MODE VENDED_CREDENTIALS.';
+COMMENT ON TABLE coldfront.storage_secret IS 'Cold-store credential; materialized as a DuckDB PERSISTENT SECRET, replicated by value across a Spock mesh, excluded from pg_dump. A vended row stores no credential and materializes nothing: Lakekeeper issues per-table creds and ensure_attached uses ACCESS_DELEGATION_MODE VENDED_CREDENTIALS.';
 COMMENT ON TABLE coldfront.partition_config IS 'Name-keyed per-table partition/tiering lifecycle config (period, hot_period, retention); replicates by value so every mesh node reads identical config.';
 COMMENT ON TABLE coldfront.claims IS 'Ricart-Agrawala bakery: a writer''s outstanding iceberg-commit claim (iceberg_table, snowflake ticket); deleted on release.';
 COMMENT ON TABLE coldfront.claim_acks IS 'Ricart-Agrawala bakery: per-peer acknowledgements of a claim, replicated back to the originating writer.';

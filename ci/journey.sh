@@ -77,7 +77,7 @@ storage_secret_sql() {
     if [ "$BACKEND" = azure-vended ]; then
         printf "SELECT coldfront.set_storage_secret_vended('azure');"
     elif [ "$BACKEND" = vended ]; then
-        # Vended (minted) creds: no credential stored. Lakekeeper mints per-table
+        # Vended creds: no credential stored. Lakekeeper issues per-table
         # STS creds and ensure_attached() uses ACCESS_DELEGATION_MODE VENDED_CREDENTIALS.
         printf "SELECT coldfront.set_storage_secret_vended();"
     elif [ "$BACKEND" = azure ]; then
@@ -114,7 +114,7 @@ storage_yaml() {
     fi
 }
 
-# vended_creds — true when Lakekeeper mints per-table credentials and no DuckDB
+# vended_creds: true when Lakekeeper issues per-table credentials and no DuckDB
 # secret exists for the bucket. Reads that address the object store BY PATH
 # (glob(), iceberg_metadata('<location>')) cannot authenticate in that mode:
 # vending is scoped to a table resolved through the catalog, so a bare path has
@@ -4141,7 +4141,7 @@ story_iceberg_metadata() {
     fi
     # Addressed as the attached catalog table, never as a metadata.json path.
     # duckdb-iceberg resolves a 3-part name through the catalog and calls
-    # PrepareIcebergScanFromEntry, which mints that table's secret, so this reads
+    # PrepareIcebergScanFromEntry, which creates that table's secret, so this reads
     # identically on static and vended credentials and needs no backend branch.
     # De-quoted because the archiver stores the reference quoted.
     cnt=$(q "$HOST" "SELECT coldfront.ensure_attached(); SELECT r['n'] FROM duckdb.query('SELECT count(*) AS n FROM iceberg_metadata(''${ice_ref}'') WHERE file_path LIKE ''%.parquet''') AS t(r);" | tail -1)

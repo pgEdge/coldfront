@@ -31,7 +31,7 @@ on:
 
 permissions:
   contents: read
-  packages: read   # pull the private coldfront-duckdb-base image the app builds FROM
+  packages: read   # pull the coldfront-duckdb-base image the app builds FROM
 
 jobs:
   quick:

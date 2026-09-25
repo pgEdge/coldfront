@@ -254,13 +254,13 @@ func coldSecretSQL(cfg *config.Config) string {
 // staticCredsConfigured reports whether the config carries static object-store
 // credentials to build a DuckDB secret from (an S3 access key or an Azure
 // connection string). False means a vended deployment: the YAML carries no
-// credentials and Lakekeeper mints them per table. (Config validation has
+// credentials and Lakekeeper issues them per table. (Config validation has
 // already rejected a partial s3.* config by the time we get here.)
 func staticCredsConfigured(cfg *config.Config) bool {
 	return cfg.S3.AccessKey != "" || cfg.Azure.ConnectionString != ""
 }
 
-// storageSecretVended reports whether the cold store uses vended (minted)
+// storageSecretVended reports whether the cold store uses vended
 // credentials: coldfront.storage_secret.vended is true. A missing row reads as
 // false (no cold store configured yet).
 func storageSecretVended(ctx context.Context, conn *pgx.Conn) (bool, error) {

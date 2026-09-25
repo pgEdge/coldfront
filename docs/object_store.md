@@ -33,9 +33,9 @@ Before you begin, gather the following:
   >
   > This applies to the warehouse's own credential. A deployment that
   > must not store any object-store credential in the database can use
-  > vended credentials instead, where the warehouse mints short-lived
+  > vended credentials instead, where the warehouse issues short-lived
   > per-table credentials at access time; see
-  > [usage.md](usage.md#vended-minted-credentials).
+  > [usage.md](usage.md#vended-credentials).
 
 - **Permissions** - the key needs read/write/list on the bucket
   (`GetObject` / `PutObject` / `DeleteObject` / `ListBucket`). Example
@@ -154,8 +154,8 @@ The `key-prefix` is an arbitrary path inside the bucket; `coldfront` is
 just an example.
 
 **Vended-credentials variant.** To run ColdFront with no stored
-credential ([usage.md](usage.md#vended-minted-credentials)), the
-warehouse mints per-table STS credentials instead of handing the client
+credential ([usage.md](usage.md#vended-credentials)), the
+warehouse issues per-table STS credentials instead of handing the client
 a static key. Two things change from the warehouse above.
 
 First, an IAM role scoped to the bucket. Lakekeeper assumes it per table

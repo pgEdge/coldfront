@@ -151,7 +151,7 @@ For deployments that must not store a credential at all,
 `coldfront.storage_secret` row that holds no credential and materializes
 no secret. The row's `vended` flag drives `coldfront._attach_delegation_mode()`,
 so `ensure_attached()` attaches the catalog with
-`ACCESS_DELEGATION_MODE VENDED_CREDENTIALS`: Lakekeeper mints short-lived
+`ACCESS_DELEGATION_MODE VENDED_CREDENTIALS`: Lakekeeper issues short-lived
 per-table credentials (S3 STS, or Azure SAS) that `duckdb-iceberg`
 consumes directly. A static row attaches with `ACCESS_DELEGATION_MODE
 NONE` (the persistent secret supplies the credential); the vended path
