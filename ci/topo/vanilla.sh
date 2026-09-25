@@ -139,7 +139,7 @@ elif [ "$BACKEND" = aws ]; then
     \"storage-credential\":{\"type\":\"s3\",\"credential-type\":\"access-key\",\"aws-access-key-id\":\"${COLDFRONT_AWS_ACCESS_KEY}\",\"aws-secret-access-key\":\"${COLDFRONT_AWS_SECRET_KEY}\"}
   }"
 elif [ "$BACKEND" = vended ]; then
-  # Vended: SeaweedFS mints per-table STS creds. sts-enabled + assume-role-arn
+  # Vended: SeaweedFS issues per-table STS creds. sts-enabled + assume-role-arn
   # (the role/trust-policy in docker/seaweedfs-iam.json); sts-endpoint = the S3
   # endpoint. The warehouse's OWN credential stays the long-term admin access-key
   # (vending changes only the client plane). Lakekeeper delivers the temp creds in

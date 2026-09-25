@@ -103,8 +103,8 @@ to. See
 
 For compliance environments that cannot store an object-store credential,
 `coldfront.set_storage_secret_vended()` runs with no credential in the
-database: Lakekeeper mints short-lived per-table credentials at access
-time. See [Vended credentials](usage.md#vended-minted-credentials).
+database: Lakekeeper issues short-lived per-table credentials at access
+time. See [Vended credentials](usage.md#vended-credentials).
 
 ## Least-privilege application roles
 

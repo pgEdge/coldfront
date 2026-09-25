@@ -1,4 +1,4 @@
--- White-box test for vended (minted) credential mode. Vended rows carry NO
+-- White-box test for vended credential mode. Vended rows carry NO
 -- object-store credentials: _build_storage_secret_opts returns NULL (nothing is
 -- materialized as a DuckDB secret), the CHECK guards allow the creds-NULL row,
 -- and _attach_delegation_mode() reports VENDED_CREDENTIALS so ensure_attached

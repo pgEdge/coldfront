@@ -212,7 +212,7 @@ archiver:
 }
 
 func TestValidate_VendedNoBackendOK(t *testing.T) {
-	// Vended (minted) credentials: the warehouse + endpoint are set, but no
+	// Vended credentials: the warehouse + endpoint are set, but no
 	// s3.*/azure creds: Lakekeeper vends them at read/write time and the
 	// archiver enforces coldfront.storage_secret.vended at attach. Valid config.
 	cfg := `

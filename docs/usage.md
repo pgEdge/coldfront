@@ -622,12 +622,12 @@ It writes the same `coldfront.storage_secret` row (replicated,
 The Azure cold tier is subject to the soft-delete / change-feed
 restriction in [Gotchas](#gotchas).
 
-## Vended (minted) credentials
+## Vended credentials
 
 Vended credentials let a deployment run with no object-store credential
 stored in the database, in a DuckDB secret file, or in an archiver
 config; this suits compliance environments that forbid persisting
-long-term keys. Lakekeeper mints a short-lived, per-table credential
+long-term keys. Lakekeeper issues a short-lived, per-table credential
 (an S3 STS access key, secret, and session token) at read and write
 time, and ColdFront uses it directly. The long-term credential lives
 only in the Lakekeeper warehouse.
@@ -645,7 +645,7 @@ reads the same row and skips its own credential setup, so a vended
 deployment omits the `s3:`/`azure:` block from the archiver config
 entirely. The compactor likewise needs no credential in its config.
 
-Vended mode targets the two clouds that mint scoped credentials: AWS S3
+Vended mode targets the two clouds that issue scoped credentials: AWS S3
 (STS) and Azure ADLS Gen2 (SAS). The `set_storage_secret_vended()` call
 above enables AWS S3; the same call with `'azure'` enables Azure through
 the identical path:
@@ -654,7 +654,7 @@ the identical path:
 SELECT coldfront.set_storage_secret_vended('azure');
 ```
 
-Vending requires a Lakekeeper warehouse configured to mint credentials:
+Vending requires a Lakekeeper warehouse configured to vend credentials:
 
 - AWS S3: `flavor: aws` with `sts-enabled: true`, an `assume-role-arn`
   for a bucket-scoped IAM role, and an `external-id` on the warehouse
@@ -667,10 +667,10 @@ Vending requires a Lakekeeper warehouse configured to mint credentials:
   `azure-system-identity`.
 
 Google Cloud Storage over the S3-interoperability endpoint has no STS to
-mint against, so GCS stays on static HMAC credentials.
+issue short-lived credentials, so GCS stays on static HMAC credentials.
 
 The compactor runs fully under vended credentials: compaction, snapshot
-expiry, and orphan-file reclaim all use the minted per-table credentials.
+expiry, and orphan-file reclaim all use the vended per-table credentials.
 
 Switching a running deployment between static and vended credentials
 changes the attach mode, which is fixed per PostgreSQL backend at attach

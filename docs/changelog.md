@@ -72,7 +72,7 @@ and this project adheres to
 
 - `coldfront.drop_iceberg_table()` drops a decoupled or tiered table, with
   purge or keep-files for the stored objects.
-- Vended (minted) object-store credentials, so cold access can use
+- Vended object-store credentials, so cold access can use
   short-lived credentials issued by Lakekeeper instead of static keys.
 - Cross-tier row relocation: an UPDATE that moves a row's partition key
   across the cutoff now moves the row between tiers.
