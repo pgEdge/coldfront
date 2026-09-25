@@ -105,7 +105,7 @@ RUN dnf install -y --setopt=install_weak_deps=False \
         flex bison \
     && dnf clean all
 WORKDIR /build
-# ICEBERG_REF is the extension code the three patches target (kept fixed so they
+# ICEBERG_REF is the extension code the four patches target (kept fixed so they
 # apply unchanged). Its duckdb submodule tracks duckdb main, which drifts off the
 # release, so after init we pin that submodule to the v1.5.4 TAG — the same engine
 # pg_duckdb links — and build the extension against it.
@@ -140,13 +140,20 @@ COPY docker/iceberg-manifest-list-format-version-v15.patch /tmp/iceberg-mlist-fm
 # (iceberg-go's compaction scan) match it case-sensitively. Inert to pg_duckdb
 # reads (reader stores verbatim; ducklake lowercases). See the patch header.
 COPY docker/iceberg-data-file-format-v15.patch /tmp/iceberg-fileformat-v15.patch
+# TIMESTAMPTZ transform patch, a port of upstream d3c3348271 (on main only):
+# year/month/day/hour of a TIMESTAMPTZ partition column are computed on the UTC
+# instant, as the Iceberg spec, duckdb-iceberg's own pruning and iceberg-go take
+# them, not in the session's time zone. See the patch header.
+COPY docker/iceberg-timestamptz-utc-transforms-v15.patch /tmp/iceberg-tstz-utc-v15.patch
 RUN cd /build/duckdb-iceberg \
  && git apply --check /tmp/iceberg-bakery-v15.patch \
  && git apply        /tmp/iceberg-bakery-v15.patch \
  && git apply --check /tmp/iceberg-mlist-fmtver-v15.patch \
  && git apply        /tmp/iceberg-mlist-fmtver-v15.patch \
  && git apply --check /tmp/iceberg-fileformat-v15.patch \
- && git apply        /tmp/iceberg-fileformat-v15.patch
+ && git apply        /tmp/iceberg-fileformat-v15.patch \
+ && git apply --check /tmp/iceberg-tstz-utc-v15.patch \
+ && git apply        /tmp/iceberg-tstz-utc-v15.patch
 # vcpkg triplet is derived from the build arch (uname -m): x86_64→x64-linux,
 # aarch64→arm64-linux. Host and target match here (the stage runs on the target
 # arch, native or emulated), so HOST and TARGET triplets are the same value.

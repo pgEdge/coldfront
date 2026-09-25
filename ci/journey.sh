@@ -128,6 +128,22 @@ vended_creds() { [ "$BACKEND" = vended ] || [ "$BACKEND" = azure-vended ]; }
 # rather than inventing a literal.
 hot_days() { echo $(( ( $(date -u +%s) - $(date -u -d "$(date -u +%Y-%m-01) -1 month" +%s) ) / 86400 )); }
 
+# ice_files <ice_ref> <regex>: live data files (delete files and entries a later
+# snapshot removed excluded) whose path matches the regex, counted through the
+# table's own metadata scan. Addressed as the attached catalog table, which
+# reads identically on static and vended credentials: a bare object-store path
+# cannot authenticate under vending.
+ice_files() {
+    q "$HOST" "SELECT coldfront.ensure_attached(); SELECT r['n'] FROM duckdb.query('SELECT count(*) AS n FROM iceberg_metadata(''$1'') WHERE status <> ''DELETED'' AND content NOT LIKE ''%DELETES'' AND regexp_matches(file_path, ''$2'')') AS t(r);" | tail -1
+}
+
+# ice_spec <ice_ref>: the table's partition spec as transform:column terms in
+# field order (e.g. "identity:region,month:ts"), empty for an unpartitioned
+# table or one that has no data yet.
+ice_spec() {
+    q "$HOST" "SELECT coldfront.ensure_attached(); SELECT r['s'] FROM duckdb.query('SELECT string_agg(t || '':'' || c, '','' ORDER BY id) AS s FROM (SELECT DISTINCT partition_field_id AS id, partition_field_transform AS t, partition_source_columns[1] AS c FROM iceberg_partition_stats(''$1''))') AS t(r);" | tail -1
+}
+
 # assert_register_rejected <label> <table> <needle>: `archiver register` must
 # fail on <table> and say why. Passing a needle rather than only checking the
 # exit code keeps the assertion attributable to the rule under test.
@@ -269,6 +285,14 @@ EOF
     assert_eq "events is now a view" "v" "$relkind"
     local wm; wm=$(q "$HOST" "SELECT count(*) FROM coldfront.archive_watermark WHERE table_name='events';")
     assert_eq "watermark registered" "1" "$wm"
+
+    # The cold table mirrors the hot partitioning, month(ts): each archived month
+    # is a data file under its own month directory, and none sits outside one.
+    assert_eq "cold spec mirrors the hot partitioning" "month:ts" "$(ice_spec ice.public.events)"
+    local n_all n_month
+    n_all=$(ice_files ice.public.events '\.parquet'); n_month=$(ice_files ice.public.events '/data/month_ts_[0-9]+=')
+    assert_gt "archived months landed as partition files" 2 "$n_month"
+    assert_eq "every cold data file sits in a month directory" "$n_all" "$n_month"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -337,9 +361,11 @@ story_provision_decoupled() {
     # references a namespace not yet committed). With the namespace already
     # committed, its in-txn CREATE SCHEMA IF NOT EXISTS no-ops and CREATE TABLE
     # succeeds. The loop is a thin safety net in case seeding raced the warehouse.
+    # Partitioned by month(ts), so every decoupled story writes and reads a
+    # partitioned table.
     local i
     for i in 1 2 3 4 5; do
-        q_may "$HOST" "SELECT coldfront.create_iceberg_table('public','iceonly','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"ts\",\"type\":\"timestamptz\"},{\"name\":\"status\",\"type\":\"text\"},{\"name\":\"data\",\"type\":\"jsonb\"}]'::jsonb);" >/dev/null 2>&1
+        q_may "$HOST" "SELECT coldfront.create_iceberg_table('public','iceonly','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"ts\",\"type\":\"timestamptz\"},{\"name\":\"status\",\"type\":\"text\"},{\"name\":\"data\",\"type\":\"jsonb\"}]'::jsonb, '{month(ts)}');" >/dev/null 2>&1
         [ "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname='iceonly' AND relkind='v' AND relnamespace='public'::regnamespace;")" = "1" ] && break
         sleep 2
     done
@@ -559,10 +585,8 @@ EOSQL
 
     # The fixture's partition spec is real, and writes through the adopted view
     # honour it: each customer's files land under its own partition directory.
-    # Counted through the table's own metadata scan, which runs with the table's
-    # credentials, so it works under credential vending as well as static keys.
     assert_gt "TC-167: data files land under partition directories" 0 \
-        "$(q "$HOST" "SELECT coldfront.ensure_attached(); SELECT r['n'] FROM duckdb.query('SELECT count(*) AS n FROM iceberg_metadata(''ice.lake.orders'') WHERE file_path LIKE ''%/data/customer=initech/%''') AS t(r);" | tail -1)"
+        "$(ice_files ice.lake.orders '/data/customer=initech/')"
 
     # TC-169: p_types restores a type Iceberg cannot record, and only where the
     # override matches what the catalog actually stores. Both go through a fresh
@@ -889,6 +913,10 @@ EOF
     else
         fail "vector archive — see $TMPD/chunks.log"; tail -5 $TMPD/chunks.log; return
     fi
+    # A clustered table is partitioned like every tiered table, and is created
+    # without the file-size target DuckDB refuses on a partitioned table: the
+    # export above is the write that would have failed with it.
+    assert_gt "clustered table's export sits in a month directory" 0 "$(ice_files ice.public.chunks '/data/month_ts_[0-9]+=')"
 
     # Verify what landed in Iceberg, read straight from the cold table. Equality
     # against a real[] literal is the whole assertion: a stringified write could
@@ -1606,6 +1634,9 @@ EOSQL
         fail "TC-128: files still below target after compaction: $after"
     fi
     assert_eq "TC-130: compaction preserved all rows" "$rows_before" "$(q "$HOST" "SELECT count(*) FROM events;")"
+    # iceberg-go rewrites each partition's group on its own and writes the result
+    # back under that partition's directory.
+    assert_eq "TC-130: rewritten files sit in month directories" "$(ice_files ice.public.events '\.parquet')" "$(ice_files ice.public.events '/data/month_ts_[0-9]+=')"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -2928,6 +2959,12 @@ EOF
     # Cold side is region-usable: a region-filtered cold read returns that region only.
     assert_eq "eu cold rows (m4-m2) present"      "240" "$(q "$HOST" "SELECT count(*) FROM regional WHERE region='eu' AND ts < date_trunc('month',now()) - interval '1 month';")"
     assert_eq "old eu m4 leaf rows live in cold"  "100" "$(q "$HOST" "SELECT count(*) FROM regional WHERE region='eu' AND ts >= date_trunc('month',now()) - interval '4 months' AND ts < date_trunc('month',now()) - interval '3 months';")"
+    # The cold table mirrors the two-level hot partitioning: region, then month(ts).
+    # Beside a transform, the engine files the identity term under its spec field
+    # name, identity_region_<id>, not the bare column.
+    assert_eq "2-level cold spec is (region, month(ts))" "identity:region,month:ts" "$(ice_spec ice.public.regional)"
+    assert_gt "eu files sit under identity_region_N=eu/month_ts_" 0 "$(ice_files ice.public.regional '/data/identity_region_[0-9]+=eu/month_ts_')"
+    assert_gt "us files sit under identity_region_N=us/month_ts_" 0 "$(ice_files ice.public.regional '/data/identity_region_[0-9]+=us/month_ts_')"
 
     # Idempotency / cross-region wipe guard: a second run must NOT lose cold rows
     # (a region-blind Phase-0 wipe would under-count here).
@@ -4144,7 +4181,7 @@ story_iceberg_metadata() {
     # PrepareIcebergScanFromEntry, which creates that table's secret, so this reads
     # identically on static and vended credentials and needs no backend branch.
     # De-quoted because the archiver stores the reference quoted.
-    cnt=$(q "$HOST" "SELECT coldfront.ensure_attached(); SELECT r['n'] FROM duckdb.query('SELECT count(*) AS n FROM iceberg_metadata(''${ice_ref}'') WHERE file_path LIKE ''%.parquet''') AS t(r);" | tail -1)
+    cnt=$(ice_files "$ice_ref" '\.parquet')
     assert_gt "TC-043: Parquet data files registered in the events snapshot" "0" "$cnt"
 }
 
@@ -5631,6 +5668,139 @@ EOSQL
     q "$HOST" "DROP SCHEMA qtn CASCADE;" >/dev/null 2>&1
 }
 
+# ───────────────────────────────────────────────────────────────────────────
+# Story TC-186..TC-189: partitioned cold tables. create_iceberg_table takes
+# the partitioning as DuckDB's own PARTITIONED BY terms; one write fans out into
+# one data file per partition value; the month of a TIMESTAMPTZ is its UTC
+# month whatever the session's time zone (the iceberg-timestamptz-utc-
+# transforms-v15 patch: without it a New York session files the row under the
+# previous month and a UTC month-bounded read prunes it away); a bad term is
+# refused before the table exists; and a month-bounded read skips the other
+# months' manifests. Both modes, on its own throwaway tables.
+# ───────────────────────────────────────────────────────────────────────────
+story_partitioned_cold_tables() {
+    step "TC-186..TC-189: partitioned cold tables (fan-out, UTC months, refusals, pruning)"
+    local cols='[{"name":"id","type":"bigint"},{"name":"ts","type":"timestamptz"},{"name":"status","type":"text"}]'
+    # The UTC start of the month two months back, whatever the session's zone.
+    local m="(date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') - interval '2 months'"
+    q "$HOST" "SELECT coldfront.create_iceberg_table('public','tcpart','$cols'::jsonb, '{month(ts)}');" >/dev/null 2>&1
+
+    # TC-187: one statement, three rows in three consecutive UTC months. The hook
+    # hands the row expressions to DuckDB, so only functions both engines have.
+    q "$HOST" "INSERT INTO public.tcpart VALUES (1, ($m) + interval '1 month' + interval '10 days', 'm1'), (2, ($m) + interval '10 days', 'm2'), (3, ($m) - interval '1 month' + interval '10 days', 'm3');" >/dev/null 2>&1
+    assert_eq "TC-187: the spec is month(ts)" "month:ts" "$(ice_spec ice.public.tcpart)"
+    assert_eq "TC-187: one bulk write lands one file per month" "3" "$(ice_files ice.public.tcpart '/data/month_ts_[0-9]+=')"
+    assert_eq "TC-187: no data file outside a month directory" "3" "$(ice_files ice.public.tcpart '\.parquet')"
+    assert_eq "TC-187: a month-bounded read returns that month only" "m2" \
+        "$(q "$HOST" "SELECT status FROM public.tcpart WHERE ts >= $m AND ts < ($m) + interval '1 month';")"
+
+    # TC-186: a row two hours into that UTC month, written from a New York session,
+    # where the local clock still shows the previous month.
+    q "$HOST" "SET TimeZone = 'America/New_York'; INSERT INTO public.tcpart VALUES (10, ($m) + interval '2 hours', 'tz');" >/dev/null 2>&1
+    assert_eq "TC-186: a boundary write from a non-UTC session reads back in its UTC month" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM public.tcpart WHERE status = 'tz' AND ts >= $m;")"
+    local n; n=$(q "$HOST" "SELECT ((extract(year FROM $m) - 1970) * 12 + extract(month FROM $m) - 1)::int;")
+    assert_eq "TC-186: its file sits in the UTC month's directory" "2" "$(ice_files ice.public.tcpart "/data/month_ts_[0-9]+=${n}/")"
+
+    # TC-189: a read bounded to the oldest month skips the manifest whose months
+    # all lie outside it (the New York write's), which duckdb-iceberg logs. The
+    # upper bound sits inside the month: the pruner compares months, so a bound
+    # exactly on the next month's start keeps that month's manifests.
+    assert_gt "TC-189: a month-bounded read skips out-of-range manifests" 0 \
+        "$(q "$HOST" "SELECT coldfront.ensure_attached(); SELECT duckdb.raw_query('CALL enable_logging(''Iceberg'')'); SELECT count(*) FROM public.tcpart WHERE ts >= ($m) - interval '1 month' AND ts < ($m) - interval '1 month' + interval '20 days'; SELECT r['n'] FROM duckdb.query('SELECT count(*) AS n FROM duckdb_logs() WHERE type = ''Iceberg'' AND message LIKE ''%skipped%manifest_file%''') AS t(r);" | tail -1)"
+
+    # TC-188: a time transform on a text column is refused by ColdFront before
+    # anything is created, an unknown transform by the engine, and a table created
+    # without p_partition_cols is not partitioned at all.
+    local out
+    out=$(q_may "$HOST" "SELECT coldfront.create_iceberg_table('public','tcbad','$cols'::jsonb, '{month(status)}');")
+    if echo "$out" | grep "needs a timestamp or date column" >/dev/null; then
+        pass "TC-188: a time transform on a text column is refused"
+    else
+        fail "TC-188: expected the type refusal, got: $out"
+    fi
+    out=$(q_may "$HOST" "SELECT coldfront.create_iceberg_table('public','tcbad','$cols'::jsonb, '{bogus(ts)}');")
+    if echo "$out" | grep -i "unrecognized transform" >/dev/null; then
+        pass "TC-188: an unknown transform is refused by the engine"
+    else
+        fail "TC-188: expected the engine's refusal, got: $out"
+    fi
+    assert_eq "TC-188: a refused create registers nothing" "0" "$(q "$HOST" "SELECT count(*) FROM coldfront.tiered_views WHERE relname = 'tcbad';")"
+    q "$HOST" "SELECT coldfront.create_iceberg_table('public','tcflat','$cols'::jsonb);" >/dev/null 2>&1
+    q "$HOST" "INSERT INTO public.tcflat VALUES (1, now(), 'a'), (2, now() - interval '1 month', 'b');" >/dev/null 2>&1
+    assert_eq "TC-188: without p_partition_cols two months share one file" "1" "$(ice_files ice.public.tcflat '\.parquet')"
+    assert_eq "TC-188: and the table has no partition spec" "" "$(ice_spec ice.public.tcflat)"
+
+    # TC-190: compaction of a partitioned table with deletes. Month A holds six
+    # small files and month B two, each month with deleted rows. The compactor
+    # rewrites A alone (B is under MinInputFiles) and must leave B's delete file
+    # where it is. iceberg-go attaches a delete file to a data file by the file's
+    # file_path bounds, and the engine writes those under DuckDB's own field id,
+    # so without the compactor scoping deletes to their partition (compact.go,
+    # scopeDeletes) B's delete file would ride along with A's rewrite and its
+    # deleted row would come back. The last assertion is the engine fact itself:
+    # when it stops holding, the scoping can go.
+    require_compactor || return
+    q "$HOST" "SELECT coldfront.create_iceberg_table('public','tccomp','$cols'::jsonb, '{month(ts)}');" >/dev/null 2>&1
+    local i
+    for i in 1 2 3 4 5 6; do q "$HOST" "INSERT INTO public.tccomp VALUES ($i, ($m) + interval '$i days', 'a');" >/dev/null 2>&1; done
+    for i in 7 8; do q "$HOST" "INSERT INTO public.tccomp VALUES ($i, ($m) + interval '1 month' + interval '$i days', 'b');" >/dev/null 2>&1; done
+    q "$HOST" "DELETE FROM public.tccomp WHERE id IN (1, 2, 7);" >/dev/null 2>&1
+    assert_eq "TC-190: eight rows written, three deleted" "5" "$(q "$HOST" "SELECT count(*) FROM public.tccomp;")"
+    cat > $TMPD/tccomp.yaml <<EOF
+postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
+iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog" }
+$(storage_yaml)
+EOF
+    if "$COMPACTOR" --config $TMPD/tccomp.yaml --table tccomp >$TMPD/tccomp.log 2>&1; then
+        pass "TC-190: compaction of a partitioned table with deletes succeeds"
+    else
+        fail "TC-190: compaction failed, see $TMPD/tccomp.log"; tail -3 $TMPD/tccomp.log
+    fi
+    assert_eq "TC-190: month A merged into one file, month B left alone" "3" "$(ice_files ice.public.tccomp '\.parquet')"
+    assert_eq "TC-190: deleted rows stay deleted after compaction" "5" "$(q "$HOST" "SELECT count(*) FROM public.tccomp;")"
+    assert_eq "TC-190: the skipped month keeps its delete file" "1" \
+        "$(q "$HOST" "SELECT coldfront.ensure_attached(); SELECT r['n'] FROM duckdb.query('SELECT count(*) AS n FROM iceberg_metadata(''ice.public.tccomp'') WHERE status <> ''DELETED'' AND content = ''POSITION_DELETES''') AS t(r);" | tail -1)"
+    if vended_creds; then
+        note "TC-190: delete-manifest bound key not read under vended credentials (a path read cannot authenticate)"
+    else
+        local mf; mf=$(q "$HOST" "SELECT coldfront.ensure_attached(); SELECT r['p'] FROM duckdb.query('SELECT DISTINCT manifest_path AS p FROM iceberg_metadata(''ice.public.tccomp'') WHERE status <> ''DELETED'' AND content = ''POSITION_DELETES''') AS t(r);" | tail -1)
+        assert_eq "TC-190: the engine keys delete-file bounds by DuckDB's FILENAME_FIELD_ID (scopeDeletes stays)" "2147483646" \
+            "$(q "$HOST" "SELECT coldfront.ensure_attached(); SELECT r['k'] FROM duckdb.query('SELECT string_agg(DISTINCT k::VARCHAR, '','') AS k FROM (SELECT unnest(map_keys(data_file.lower_bounds)) AS k FROM read_avro(''$mf''))') AS t(r);" | tail -1)"
+    fi
+
+    q "$HOST" "SELECT coldfront.drop_iceberg_table('public','tcpart', true);" >/dev/null 2>&1
+    q "$HOST" "SELECT coldfront.drop_iceberg_table('public','tcflat', true);" >/dev/null 2>&1
+    q "$HOST" "SELECT coldfront.drop_iceberg_table('public','tccomp', true);" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story TC-192: row-group skipping. A time band over a cold table reads only the
+# Parquet row groups whose statistics can match it. Every cold-read speedup
+# inside a file rests on DuckDB core handing the filter to the Parquet reader,
+# which nothing upstream states as a contract, so the counters DuckDB keeps for
+# it are asserted here, from the JSON profile of a read through the view. Both
+# modes, on its own throwaway table.
+# ───────────────────────────────────────────────────────────────────────────
+story_row_group_pruning() {
+    step "TC-192: a time band skips the row groups outside it"
+    local m="(date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') - interval '2 months'"
+    q "$HOST" "SELECT coldfront.create_iceberg_table('public','tcrg','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"ts\",\"type\":\"timestamptz\"},{\"name\":\"v\",\"type\":\"integer\"}]'::jsonb, '{month(ts)}');" >/dev/null 2>&1
+    # 300,000 rows one second apart, three and a half days inside one month: one
+    # file, several row groups, each covering its own span of ts.
+    q "$HOST" "INSERT INTO public.tcrg SELECT i, ($m) + (i * interval '1 second'), i FROM generate_series(1, 300000) i;" >/dev/null 2>&1
+    assert_eq "TC-192: 300,000 rows in one file" "1" "$(ice_files ice.public.tcrg '\.parquet')"
+    # One session: the profile settings, the read, and the profile it wrote. The
+    # ICEBERG_SCAN node carries the row-group counters.
+    local counters
+    counters=$(q "$HOST" "SELECT duckdb.raw_query('SET custom_profiling_settings = ''{\"OPERATOR_TYPE\": \"true\", \"OPERATOR_ROW_GROUPS_SCANNED\": \"true\", \"OPERATOR_TOTAL_ROW_GROUPS_TO_SCAN\": \"true\"}'''); SELECT duckdb.raw_query('SET enable_profiling = ''json'''); SELECT duckdb.raw_query('SET profiling_output = ''/tmp/tc192.json'''); SELECT count(*) FROM public.tcrg WHERE ts >= ($m) + interval '1 hour' AND ts < ($m) + interval '2 hours'; SELECT duckdb.raw_query('SET enable_profiling = ''no_output'''); SELECT (j->>'operator_row_groups_scanned') || ' ' || (j->>'operator_total_row_groups_to_scan') FROM jsonb_path_query_first(pg_read_file('/tmp/tc192.json')::jsonb, '\$.** ? (@.operator_name == \"ICEBERG_SCAN\")') AS j;" | tail -1)
+    local scanned=${counters% *} total=${counters#* }
+    assert_gt "TC-192: the file holds more than one row group" 1 "$total"
+    assert_gt "TC-192: the band read at least one row group" 0 "$scanned"
+    assert_gt "TC-192: the band skipped the row groups outside it" "$scanned" "$total"
+    q "$HOST" "SELECT coldfront.drop_iceberg_table('public','tcrg', true);" >/dev/null 2>&1
+}
+
 # ── orchestrate ────────────────────────────────────────────────────────────
 # Setup is shared. The story set then branches on mode: tiered exercises the
 # hot+cold partitioned path; decoupled exercises the all-Iceberg wrapper. (The
@@ -5722,6 +5892,8 @@ else
 fi
 story_duckdb_temp_dirs     # TC-152: per-backend spill dir; departed backends' spills reclaimed
 story_duckdb_spill_concurrency  # TC-153: four sessions spilling at once stay isolated and correct
+story_partitioned_cold_tables  # TC-186..TC-189: partition fan-out, UTC months, refusals, manifest skipping
+story_row_group_pruning        # TC-192: a time band skips the row groups outside it
 story_drop_iceberg_table   # both modes, purge and keep-files (own throwaway tables)
 [ "$MESH" = 1 ] && [ "$MODE" = decoupled ] && story_mesh   # tiered+mesh runs story_mesh_tiered (above)
 [ "$MESH" = 1 ] && story_mesh_multiwriter   # >1 cold writer/node cross-node (tiered: events, decoupled: iceonly)

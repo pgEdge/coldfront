@@ -258,7 +258,7 @@ Three properties, set at `CREATE TABLE`:
 | Property | Value | Read by |
 |---|---|---|
 | `write.parquet.row-group-limit` | `2048` | iceberg-go |
-| `write.target-file-size-bytes` | `536870912` | both |
+| `write.target-file-size-bytes` | `536870912`, unpartitioned only | both |
 | `coldfront.sort-key` | the cluster column, then the key | the compactor |
 
 Row groups are the pruning granularity: the Parquet reader skips a row group
@@ -270,7 +270,10 @@ does not work while preserving insertion order`), so it is not set. A DuckDB
 write therefore emits one row group per file and compaction is what cuts them.
 
 The file target is large because on object storage every file a query touches is
-a billed round trip.
+a billed round trip. A partitioned table (every tiered table, and a decoupled
+one created with `p_partition_cols`) is created without it: DuckDB refuses the
+property on a partitioned table and does not split a partitioned write by size
+anyway, and the compactor takes its target from `--target-size-mb`.
 
 The sort key's leading column is what a compaction orders its inputs by. The key
 after it is a tiebreak for determinism, not a pruning aid: sorting by cluster
@@ -295,6 +298,12 @@ and an incremental write's file spans the whole of cluster space by construction
 What that would cost is a run count: a probe reads at least one row group per
 sorted run, so bounding file count without merging the runs bounds the wrong
 thing.
+
+**A partition is a run boundary.** Compaction merges within a partition, never
+across, so a table partitioned by month holds at least one sorted run per month.
+A search with a time filter skips the months outside it at the manifest level; a
+search over all of history reads about one row group per probed cluster per
+month instead of one.
 
 The two halves are iceberg-go's own, which is what makes the merge safe rather
 than merely correct on a good day. Reading through the scan applies the position

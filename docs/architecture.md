@@ -522,8 +522,7 @@ in [usage.md](usage.md#managing-partitioned-tables-cli).
 
 These apply to both storage modes. Tiered-only limitations (cold
 RETURNING, dual-tier command tag, crash-safety of permissive writes,
-partition-scheme constraints, the empty cold-tier partition spec,
-autovacuum-vs-cutover) are in
+partition-scheme constraints, autovacuum-vs-cutover) are in
 [architecture_tiered.md → Tiered-specific limitations](architecture_tiered.md#tiered-specific-limitations).
 
 The cross-cutting limitations are:
@@ -770,25 +769,6 @@ freshly-opened Connection), or any extension that synthesises
 so the secret sits at a committed timestamp before a consumer's fresh
 transaction looks it up. Either would let a per-session synthesized
 secret work without relying on the persistent-secret mechanism.
-
-### duckdb-iceberg: INSERT into a table with a partition spec
-
-duckdb-iceberg refuses to INSERT into an Iceberg table that has a
-non-empty partition spec (*"INSERT into a partitioned table is not
-supported yet"*), so setting `month(ts)` to make predicate pruning
-structural rather than statistical is not possible.
-
-**Workaround today:** none - Iceberg tables created by coldfront have an
-empty partition spec; cold-tier pruning relies on per-file manifest
-min/max stats. See
-[architecture_tiered.md → Tiered-specific limitations](architecture_tiered.md#tiered-specific-limitations).
-
-**Desired end-state.** INSERT/MERGE into a partitioned Iceberg table -
-DuckDB writes data files into the appropriate partition directories based
-on the catalog's current spec, with no new SQL surface (existing
-`INSERT INTO ice.x VALUES ...` would route rows through the partition
-transform). Until then the spec stays empty and pruning relies on
-manifest statistics.
 
 ### duckdb-iceberg: append to the manifest list instead of rebuilding it
 

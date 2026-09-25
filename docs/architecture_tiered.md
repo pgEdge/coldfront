@@ -502,6 +502,34 @@ SELECT * FROM _events WHERE ts = '2026-04-15';
 
 This is a read-path detail; writes are unaffected.
 
+## Cold-tier partitioning
+
+The archiver creates the Iceberg table partitioned the way the hot table
+is: `month(ts)` or `day(ts)` on the time column, following
+`partition_period`, and for a two-level LIST→RANGE table the LIST column
+first, so `regional` becomes `PARTITIONED BY (region, month(ts))`. The
+spec is set at `CREATE TABLE IF NOT EXISTS` and stays with the table.
+Each export then writes exactly one partition, the Phase-0 wipe of a leaf
+covers exactly one, and a predicate on `ts` or on the LIST column skips
+whole manifests before any data file is opened: the manifest list carries
+each manifest's partition-value bounds, and duckdb-iceberg applies the
+transform to the predicate's constant to compare them. The comparison is
+by month, so an upper bound that falls exactly on a month's start keeps
+that month's manifests (`ts < '2026-07-01'` reads as "up to and including
+July"); the files inside them are still skipped on their own
+statistics. The `month` or
+`day` of a `timestamptz` is its UTC month or day, on write and on read,
+whatever the session's time zone. Data files sit under
+`data/month_ts_<n>=<months since 1970>/`, or
+`data/identity_region_<n>=<value>/month_ts_<n>=…/` for a two-level table
+(beside a transform, the engine names the identity term by its spec field
+rather than the bare column); the path is
+opaque to readers, and iceberg-go's rewrites use the same field name with
+its own value format. Within a partition, each file's `min(ts)/max(ts)`
+statistics prune as well. Retention DELETEs and the wipe are position
+deletes, so partitioning makes reads skip months; it does not make
+deletes cheaper.
+
 ## Tiered-specific limitations
 
 These are specific to the dual-tier model. Cross-cutting limitations
@@ -539,17 +567,7 @@ The dual-tier model carries the following limitations:
 5. **Partitioned tables only** - the source table must already be
    range-partitioned.
 
-6. **No Iceberg partition spec on the cold tier** - Iceberg tables
-   are created without a `partition-spec`
-   (`partition-specs[0].fields = []`), because duckdb-iceberg rejects
-   writes to a partitioned table. Cold-tier predicate pruning therefore
-   relies on **per-file manifest min/max statistics**, which
-   DuckDB-iceberg uses to skip data files whose range doesn't intersect
-   a query's WHERE clause. Writing one Iceberg snapshot per source
-   partition keeps each file's `min(ts)/max(ts)` tight, which is what
-   makes that pruning effective.
-
-7. **Cutover blocked by autovacuum on freshly-loaded partitions** -
+6. **Cutover blocked by autovacuum on freshly-loaded partitions** -
    Phase 4 of `archivePartition` takes `ACCESS EXCLUSIVE` on the
    partition under a 100 ms `lock_timeout` circuit breaker. Autovacuum's
    `SHARE UPDATE EXCLUSIVE` on the partition conflicts with that

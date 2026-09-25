@@ -100,7 +100,8 @@ SELECT coldfront.set_storage_secret('admin', 'adminsecret', 'seaweedfs:8333');
 
 -- Decoupled (iceberg-only) table, stored entirely in Iceberg on S3:
 SELECT coldfront.create_iceberg_table('public', 'events',
-  '[{"name":"id","type":"bigint"},{"name":"ts","type":"timestamptz"},{"name":"note","type":"text"}]'::jsonb);
+  '[{"name":"id","type":"bigint"},{"name":"ts","type":"timestamptz"},{"name":"note","type":"text"}]'::jsonb,
+  '{month(ts)}');
 INSERT INTO events VALUES (1, now(), 'hello');
 SELECT count(*) FROM events;
 ```
@@ -233,7 +234,7 @@ against:
 |-----------|---------|---------|
 | PostgreSQL | 16, 17, or 18 | Database with native partitioning (stock upstream; no fork) |
 | pg_duckdb | 1.5.4 (PR #1025) | Iceberg reads + writes via DuckDB in-process |
-| duckdb-iceberg | `v1.5-variegata` @ `5edc45f0`, patched | Iceberg catalog/IO for DuckDB; carries ColdFront's three patches (see [DUCKDB_1.5_PATCHED.md](DUCKDB_1.5_PATCHED.md)) |
+| duckdb-iceberg | `v1.5-variegata` @ `5edc45f0`, patched | Iceberg catalog/IO for DuckDB; carries ColdFront's four patches (see [DUCKDB_1.5_PATCHED.md](DUCKDB_1.5_PATCHED.md)) |
 | Lakekeeper | latest | Iceberg REST catalog (Rust binary) |
 | S3-compatible store | any | SeaweedFS, MinIO, GCS, Azure Blob, etc. |
 
