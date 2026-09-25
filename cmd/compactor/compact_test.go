@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/apache/iceberg-go"
+	"github.com/apache/iceberg-go/table"
 )
 
 func testSchema() *iceberg.Schema {
@@ -61,5 +62,44 @@ func TestLoadTableErr_OtherErrorsPassThrough(t *testing.T) {
 	}
 	if got.Error() == `table "public.events" not found in catalog` {
 		t.Error("non-404 error was reported as a missing table")
+	}
+}
+
+// deleteFile builds a position-delete manifest entry in the given partition.
+func deleteFile(t *testing.T, spec iceberg.PartitionSpec, path string, partition map[int]any) iceberg.DataFile {
+	t.Helper()
+	b, err := iceberg.NewDataFileBuilder(spec, iceberg.EntryContentPosDeletes, path, iceberg.ParquetFile,
+		partition, nil, nil, 1, 100)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b.Build()
+}
+
+// A data file keeps only the position-delete files that can reference its rows:
+// those of its own partition, and those of no partition at all. Every other
+// delete file is one iceberg-go attached by sequence number alone.
+func TestScopeDeletes(t *testing.T) {
+	spec := iceberg.NewPartitionSpec(iceberg.PartitionField{
+		SourceIDs: []int{2}, FieldID: 1000, Name: "month_ts_2", Transform: iceberg.MonthTransform{}})
+	march, april := map[int]any{1000: int32(674)}, map[int]any{1000: int32(675)}
+	data, err := iceberg.NewDataFileBuilder(spec, iceberg.EntryContentData, "data/month_ts_2=674/d.parquet",
+		iceberg.ParquetFile, march, nil, nil, 10, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	own := deleteFile(t, spec, "data/month_ts_2=674/own-deletes.parquet", march)
+	other := deleteFile(t, spec, "data/month_ts_2=675/other-deletes.parquet", april)
+	global := deleteFile(t, spec, "data/global-deletes.parquet", map[int]any{})
+
+	tasks := scopeDeletes([]table.FileScanTask{{File: data.Build(), DeleteFiles: []iceberg.DataFile{other, own, global}}})
+
+	got := make([]string, 0, 2)
+	for _, df := range tasks[0].DeleteFiles {
+		got = append(got, df.FilePath())
+	}
+	want := []string{"data/month_ts_2=674/own-deletes.parquet", "data/global-deletes.parquet"}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("kept %v, want %v", got, want)
 	}
 }
