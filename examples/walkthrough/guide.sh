@@ -980,7 +980,7 @@ EOSQL
         [[ "$a" =~ ^[Nn]$ ]] || teardown_tiered
     fi
 }
-# demo_decoupled — create and exercise a lake-only table, then demonstrate
+# demo_decoupled: create and exercise a lake-only table, then demonstrate
 # adopting and releasing an external Iceberg table. The adoption fixture stays
 # in the catalog; interactive users can remove the lake-only table on exit.
 demo_decoupled() {
@@ -1382,7 +1382,7 @@ demo_distributed() {
     fi
 }
 
-# reset_demos — restore the single-node stack and attempt to remove each demo's
+# reset_demos: restore the single-node stack and attempt to remove each demo's
 # PostgreSQL and Iceberg tables, including the external adoption fixture.
 reset_demos() {
     # Restore the single-node stack first (no-op if already there). Covers the mesh

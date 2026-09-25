@@ -3103,7 +3103,7 @@ $$;
 --                    created at ice.<p_schema>.<p_table>.
 --   p_columns        jsonb array of {name, type} entries. Type is a PG type
 --                    name from the supported set; see _iceberg_storage_type.
---   p_partition_cols accepted but ignored; the new table is unpartitioned.
+--   p_partition_cols array of column names for Iceberg partitioning, or NULL.
 --
 -- Effects:
 --   1. Creates the Iceberg table via duckdb.raw_query('CREATE TABLE ice...').
