@@ -2377,18 +2377,18 @@ SELECT pg_sleep(8);
 COMMIT;
 SQL
     holder=$!
-    local w_d w_end
+    local w_d probe="SELECT pg_try_advisory_xact_lock(hashtext('coldfront_iceberg:' || '$stale_tbl'));"
     if [ "$MODE" = tiered ]; then
         w_d="INSERT INTO events (ts,status,data) VALUES (date_trunc('month',now()) - interval '4 months' + interval '23 days','reap191','{}');"
     else
         w_d="INSERT INTO iceonly VALUES (9104,date_trunc('month',now()) + interval '3 months' + interval '4 days','reap191','{}');"
     fi
     sleep 1
+    assert_eq "TC-191 the stale claim's table lock is held before the write" "f" "$(q "$HOST" "$probe")"
     tq 90 "$HOST" "$w_d" >"$TMPD/reap.d" 2>&1; rc=$?
-    w_end=$(date +%s)
-    wait "$holder" 2>/dev/null
     assert_eq "TC-191 the cold write to another table lands" "0" "$rc"
-    assert_gt "TC-191 the write finished while the stale claim's table stayed locked" "$w_end" "$(date +%s)"
+    assert_eq "TC-191 the stale claim's table lock is still held after the write" "f" "$(q "$HOST" "$probe")"
+    wait "$holder" 2>/dev/null
     assert_eq "TC-191 the stale claim was reaped by the epoch rule" "0" \
         "$(q "$HOST" "SELECT count(*) FROM coldfront.claims WHERE ticket = $stale;")"
     assert_eq "TC-160..163 all three reaper-path writes landed" "3" \
