@@ -2360,6 +2360,37 @@ SQL
     wait "$holder" 2>/dev/null
     assert_eq "TC-163 peer deferred behind an orphan is unwedged by its own poke once the lock drops" "0" "$rc"
     assert_eq "TC-163 orphan claim reaped on both nodes" "0" "$(orphan_gone_everywhere)"
+
+    # TC-191: epoch path. A same-node claim on another table whose ticket predates
+    # this postmaster is a leftover of a previous owner: a restart, or a
+    # reassigned snowflake.node. The other-table rule cannot reap it while a live
+    # session holds that table's lock, so only the epoch rule does. The lock is
+    # held for the whole write; a write that outlived it would prove nothing.
+    local stale_tbl="${ref}_tc191" stale
+    stale=$(q "$HOST" "WITH ins AS (INSERT INTO coldfront.claims (iceberg_table, ticket) SELECT '$stale_tbl', snowflake.nextval() - (((extract(epoch FROM now() - pg_postmaster_start_time())::bigint + 3600) * 1000) << 22) RETURNING ticket) SELECT ticket FROM ins;")
+    assert_eq "TC-191 the planted ticket carries this node and predates the postmaster" "t" \
+        "$(q "$HOST" "SELECT snowflake.get_node($stale) = coldfront.node_id() AND snowflake.get_epoch($stale) < extract(epoch FROM pg_postmaster_start_time());")"
+    docker exec -i -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" "$HOST" "$CF_PSQL" -tA -v ON_ERROR_STOP=1 >/dev/null 2>&1 <<SQL &
+BEGIN;
+SELECT pg_advisory_xact_lock(hashtext('coldfront_iceberg:' || '$stale_tbl'));
+SELECT pg_sleep(8);
+COMMIT;
+SQL
+    holder=$!
+    local w_d w_end
+    if [ "$MODE" = tiered ]; then
+        w_d="INSERT INTO events (ts,status,data) VALUES (date_trunc('month',now()) - interval '4 months' + interval '23 days','reap191','{}');"
+    else
+        w_d="INSERT INTO iceonly VALUES (9104,date_trunc('month',now()) + interval '3 months' + interval '4 days','reap191','{}');"
+    fi
+    sleep 1
+    tq 90 "$HOST" "$w_d" >"$TMPD/reap.d" 2>&1; rc=$?
+    w_end=$(date +%s)
+    wait "$holder" 2>/dev/null
+    assert_eq "TC-191 the cold write to another table lands" "0" "$rc"
+    assert_gt "TC-191 the write finished while the stale claim's table stayed locked" "$w_end" "$(date +%s)"
+    assert_eq "TC-191 the stale claim was reaped by the epoch rule" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.claims WHERE ticket = $stale;")"
     assert_eq "TC-160..163 all three reaper-path writes landed" "3" \
         "$(q "$HOST" "SELECT count(*) FROM $tbl WHERE status='reap';")"
     rm -f $TMPD/reap.* 2>/dev/null
