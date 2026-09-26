@@ -72,9 +72,9 @@ CONTEXT:  PL/pgSQL function _vec_list_prefix(text,text,text[],text[]) line 10 at
 -- filter on different cluster columns.
 SELECT coldfront._vec_probe_qual('embedding', ARRAY[1,2]) AS embedding_qual,
        coldfront._vec_probe_qual('summary',   ARRAY[7])   AS summary_qual;
-                                          embedding_qual                                          |                                       summary_qual                                        
---------------------------------------------------------------------------------------------------+-------------------------------------------------------------------------------------------
- (r['_cf_vec_list_embedding']::integer IN (1, 2) OR r['_cf_vec_list_embedding']::integer IS NULL) | (r['_cf_vec_list_summary']::integer IN (7) OR r['_cf_vec_list_summary']::integer IS NULL)
+                  embedding_qual                  |                summary_qual                 
+--------------------------------------------------+---------------------------------------------
+ (r['_cf_vec_list_embedding']::integer IN (1, 2)) | (r['_cf_vec_list_summary']::integer IN (7))
 (1 row)
 
 -- Each column carries its own configuration and its own generation.

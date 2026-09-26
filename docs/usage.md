@@ -452,9 +452,9 @@ them.
 ### Handing an adopted table back
 
 An adopted table is released rather than dropped, because ColdFront does
-not own it. `coldfront.release_iceberg_table()` removes the wrapper view
-and the registry row and performs no Iceberg I/O, so the table keeps
-every row and stays in the catalog:
+not own it. `coldfront.release_iceberg_table()` removes the wrapper view,
+the registry row and the relation's vector configuration, and performs no
+Iceberg I/O, so the table keeps every row and stays in the catalog:
 
 ```sql
 SELECT coldfront.release_iceberg_table('public', 'orders');

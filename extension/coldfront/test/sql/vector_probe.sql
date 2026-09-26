@@ -43,8 +43,10 @@ UPDATE coldfront.vector_config SET generation = 0 WHERE table_name = 'chunks';
 SELECT coldfront._vec_probe_ids('public', 'chunks', 'embedding', ARRAY[1,0,0]::real[]) IS NULL AS untrained;
 UPDATE coldfront.vector_config SET generation = 1 WHERE table_name = 'chunks';
 
--- The predicate. The null arm is not optional: a row another engine appended
--- straight to Iceberg carries no assignment, and a bare IN would drop it.
+-- The predicate on the probed arm: an IN the scan takes as a filter. The rows with
+-- no assignment are read by a second arm of the cold scan (below), not by an OR:
+-- DuckDB pushes an OR that carries IS NULL neither into the scan nor to the
+-- manifest bounds.
 SELECT coldfront._vec_probe_qual('embedding', ARRAY[1,2]) AS qual;
 SELECT coldfront._vec_probe_qual('embedding', coldfront._vec_probe_ids('public', 'chunks', 'embedding',
                                                           ARRAY[0.1,0.9,0.2]::real[])) AS qual_from_probe;
@@ -67,31 +69,35 @@ SELECT count(*) AS cluster_column_in_view
   FROM pg_attribute
  WHERE attrelid = 'public.chunks'::regclass AND attname = coldfront._vec_list_col('embedding');
 
--- The probed definition. The tail is what matters: the qual lands inside the cold
--- arm's WHERE, after the cutoff comparison, and the hot arm is untouched.
-SELECT coldfront._vec_probed_viewdef('public', 'chunks', coldfront._vec_probe_qual('embedding', ARRAY[1,2]));
+-- The probed definition. The cold arm appears twice, once with the probe set and
+-- once for the rows with no assignment, each inside its own WHERE after the cutoff
+-- comparison; the hot arm appears once and is untouched.
+SELECT coldfront._vec_probed_viewdef('public', 'chunks', 'embedding', ARRAY[1,2]);
+SELECT (length(d) - length(replace(d, 'FROM _chunks', ''))) / length('FROM _chunks') AS hot_arms,
+       (length(d) - length(replace(d, 'iceberg_scan(', ''))) / length('iceberg_scan(') AS cold_arms
+  FROM coldfront._vec_probed_viewdef('public', 'chunks', 'embedding', ARRAY[1,2]) AS d;
 
 -- It reparses, which is the whole contract: the rewrite substitutes this for the
 -- view reference and PostgreSQL has to accept it. IN becomes = ANY on the way in.
 DO $do$
 BEGIN
     EXECUTE format('CREATE VIEW public.chunks_probed AS %s',
-                   coldfront._vec_probed_viewdef('public', 'chunks',
-                       coldfront._vec_probe_qual('embedding', ARRAY[1,2])));
+                   coldfront._vec_probed_viewdef('public', 'chunks', 'embedding', ARRAY[1,2]));
 END
 $do$;
 SELECT right(pg_get_viewdef('public.chunks_probed'::regclass), 120) AS reparsed_tail;
 
--- Declining is silent. No probe set, and a table with no vector column.
-SELECT coldfront._vec_probed_viewdef('public', 'chunks', NULL) IS NULL AS no_qual;
+-- Declining is silent. No probe set, an empty one, and a table with no vector column.
+SELECT coldfront._vec_probed_viewdef('public', 'chunks', 'embedding', NULL) IS NULL AS no_probe_set,
+       coldfront._vec_probed_viewdef('public', 'chunks', 'embedding', '{}') IS NULL AS empty_probe_set;
 UPDATE coldfront.tiered_views SET vec_columns = NULL WHERE relname = 'chunks';
-SELECT coldfront._vec_probed_viewdef('public', 'chunks', coldfront._vec_probe_qual('embedding', ARRAY[1,2])) IS NULL AS no_vector_column;
+SELECT coldfront._vec_probed_viewdef('public', 'chunks', 'embedding', ARRAY[1,2]) IS NULL AS no_vector_column;
 UPDATE coldfront.tiered_views SET vec_columns = ARRAY['embedding'] WHERE relname = 'chunks';
 
 -- A tiered view with no cutoff is hot-only: it has no cold arm, so there is nothing
 -- to probe.
 DELETE FROM coldfront.archive_watermark WHERE table_name = 'chunks';
-SELECT coldfront._vec_probed_viewdef('public', 'chunks', coldfront._vec_probe_qual('embedding', ARRAY[1,2])) IS NULL AS hot_only;
+SELECT coldfront._vec_probed_viewdef('public', 'chunks', 'embedding', ARRAY[1,2]) IS NULL AS hot_only;
 
 -- Cleanup. Unregister before dropping: the DDL hook blocks DROP of a registered
 -- tiered table/view.

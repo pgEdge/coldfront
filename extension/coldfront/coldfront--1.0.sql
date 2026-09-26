@@ -2502,53 +2502,66 @@ BEGIN
 END;
 $$;
 
--- The predicate a probe set becomes on the cold arm, or NULL for an empty set.
---
--- The null arm is not optional. Rows another engine appended straight to Iceberg
--- carry no assignment, and a bare IN drops them silently. It is also not expensive:
--- the reader prunes on each row group's null count, so unassigned rows are read in
--- proportion to their own size rather than the table's.
---
--- Cast on both arms, matching the cutoff qual the view generator already emits. The
--- subscript yields duckdb.unresolved_type, and the cast is what makes this an
+-- The cluster column of p_column as the cold arm reads it. Cast, matching the
+-- cutoff qual the view generator already emits: the subscript yields
+-- duckdb.unresolved_type, and the cast is what makes a comparison on it an
 -- integer comparison the Parquet reader can take.
+CREATE OR REPLACE FUNCTION coldfront._vec_list_ref(p_column text, p_alias text DEFAULT 'r')
+RETURNS text
+LANGUAGE sql IMMUTABLE AS $$
+    SELECT format('%s[%L]::integer', p_alias, coldfront._vec_list_col(p_column));
+$$;
+
+-- The predicate a probe set becomes on the cold arm, or NULL for an empty set:
+-- an IN, which DuckDB pushes into the scan and checks against the manifest
+-- bounds. The rows with no assignment are a second arm of the cold scan
+-- (_vec_probed_viewdef), not an IS NULL here: DuckDB pushes an OR that carries
+-- one to neither place.
 CREATE OR REPLACE FUNCTION coldfront._vec_probe_qual(
     p_column text, p_ids int[], p_alias text DEFAULT 'r')
 RETURNS text
 LANGUAGE sql IMMUTABLE AS $$
-    WITH c(ref) AS (
-        SELECT format('%s[%L]::integer', p_alias, coldfront._vec_list_col(p_column)))
-    SELECT format('(%s IN (%s) OR %s IS NULL)',
-                  c.ref, array_to_string(p_ids, ', '), c.ref)
-      FROM c
+    SELECT format('(%s IN (%s))',
+                  coldfront._vec_list_ref(p_column, p_alias), array_to_string(p_ids, ', '))
      WHERE cardinality(p_ids) > 0;
 $$;
 
--- The view's own definition with a probe predicate on its cold arm, or NULL when
--- there is no cold arm to probe. The read rewrite substitutes this for the view
--- reference, and that substitution is what keeps the cluster column out of the
--- view: the predicate is added where the column already exists, instead of the
--- view exposing a column so a caller's query can name it.
+-- The view's own definition with its cold arm probed, or NULL when there is no
+-- cold arm to probe. The read rewrite substitutes this for the view reference,
+-- and that substitution is what keeps the cluster column out of the view: the
+-- predicate is added where the column already exists, instead of the view
+-- exposing a column so a caller's query can name it.
+--
+-- The cold arm appears twice: once with the probe set, once with IS NULL on the
+-- cluster column for the rows with no assignment. Two arms rather than one OR,
+-- because DuckDB pushes the IN into the scan and to the manifest bounds but not
+-- an OR that carries IS NULL, and the second arm reads only the files whose null
+-- counts say they hold unassigned rows: nothing, when there are none.
 --
 -- Appended, not spliced. The generator puts the cold arm last and gives the view
 -- neither ORDER BY nor LIMIT, so the end of the definition is the end of the cold
 -- arm: of its WHERE for a tiered view, which always carries the cutoff qual, and of
 -- its FROM for a decoupled one, which carries no qual at all. The registry says
--- which, so nothing here parses the deparsed text to find out. The regress test's
--- expected output locks the shape.
+-- which. A tiered view is one set operation, hot arm then cold arm, so its cold
+-- arm is the text after the UNION ALL. The regress test's expected output locks
+-- the shape.
 --
 -- A tiered view with no cutoff has no cold arm at all, only the hot heap, so there
 -- is nothing to probe and the caller keeps its query.
 CREATE OR REPLACE FUNCTION coldfront._vec_probed_viewdef(
-    p_schema text, p_view text, p_qual text)
+    p_schema text, p_view text, p_column text, p_ids int[])
 RETURNS text
 LANGUAGE plpgsql STABLE AS $$
 DECLARE
     v_iceberg_only boolean;
     v_has_cutoff   boolean;
     v_body         text;
+    v_cold         text;
+    v_probed       text;
+    v_unassigned   text;
 BEGIN
-    IF p_qual IS NULL THEN
+    v_probed := coldfront._vec_probe_qual(p_column, p_ids);
+    IF v_probed IS NULL THEN
         RETURN NULL;
     END IF;
 
@@ -2565,9 +2578,14 @@ BEGIN
 
     v_body := rtrim(pg_get_viewdef(format('%I.%I', p_schema, p_view)::regclass),
                     E' \t\r\n;');
-    RETURN v_body
-        || CASE WHEN v_iceberg_only THEN ' WHERE ' ELSE ' AND ' END
-        || p_qual;
+    v_unassigned := coldfront._vec_list_ref(p_column) || ' IS NULL';
+    IF v_iceberg_only THEN
+        RETURN format('%s WHERE %s UNION ALL %s WHERE %s',
+                      v_body, v_probed, v_body, v_unassigned);
+    END IF;
+    v_cold := substring(v_body from '.*\n *UNION ALL\n(.*)$');
+    RETURN format('%s AND %s UNION ALL %s AND %s',
+                  v_body, v_probed, v_cold, v_unassigned);
 END;
 $$;
 
@@ -4111,6 +4129,14 @@ BEGIN
 
     DELETE FROM coldfront.tiered_views
      WHERE schema_name = p_schema AND relname = p_table;
+
+    -- The registration's vector layout goes with it: the centroids and the
+    -- configuration describe the table this registration named, and a relation
+    -- registered later under the same name must not inherit them.
+    DELETE FROM coldfront.vector_centroids
+     WHERE schema_name = p_schema AND table_name = p_table;
+    DELETE FROM coldfront.vector_config
+     WHERE schema_name = p_schema AND table_name = p_table;
 
     IF NOT v_iceberg_only THEN
         DELETE FROM coldfront.partition_config

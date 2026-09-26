@@ -92,7 +92,7 @@ notes:
 | SELECT (function-call form) | `SELECT … FROM iceberg_scan('ice.<ns>.<name>') r WHERE r['col'] = …` | Columns must use `r['col']` accessor |
 | SELECT (raw-query form) | `SELECT duckdb.raw_query('SELECT ... FROM ice.<ns>.<name> WHERE ...')` | Returns scalar/text result via pg_duckdb's NOTICE channel |
 | ROLLBACK of writes | `BEGIN; raw_query(...); ROLLBACK;` | pg_duckdb's `XactCallback` ties DuckDB↔PG tx, so ROLLBACK undoes pending Iceberg writes |
-| DROP TABLE | `SELECT duckdb.raw_query('DROP TABLE ice.<ns>.<name>')` | |
+| DROP TABLE | `SELECT coldfront.drop_iceberg_table('<schema>', '<name>', <purge>)` | Removes the wrapper view and every registration row, vector configuration included. A raw `DROP TABLE` through `duckdb.raw_query` drops only the catalog table and leaves them behind |
 
 ### What does not work
 
@@ -374,9 +374,9 @@ before the drop is applied there.
 
 ### Handing a table back
 
-`coldfront.release_iceberg_table()` removes the wrapper view and the
-registry row and performs no Iceberg I/O, so the Iceberg table keeps
-every row:
+`coldfront.release_iceberg_table()` removes the wrapper view, the
+registry row and the relation's vector configuration, and performs no
+Iceberg I/O, so the Iceberg table keeps every row:
 
 ```sql
 SELECT coldfront.release_iceberg_table('public', 'orders');

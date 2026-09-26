@@ -262,12 +262,14 @@ Three properties, set at `CREATE TABLE`:
 | `coldfront.sort-key` | the cluster column, then the key | the compactor |
 
 Row groups are the pruning granularity: the Parquet reader skips a row group
-whose statistics cannot match the filter, and at 2048 rows a group holds a median
-of one cluster. The two writers each read one row-group property and ignore the
-other. DuckDB reads only `write.parquet.row-group-size-bytes`, and a table
-carrying that property refuses every DuckDB write to it (`ROW_GROUP_SIZE_BYTES
-does not work while preserving insertion order`), so it is not set. A DuckDB
-write therefore emits one row group per file and compaction is what cuts them.
+whose statistics cannot match the filter. The two writers each read one
+row-group property and ignore the other. iceberg-go honours the 2048-row limit,
+so a compacted file's groups hold a median of one cluster. DuckDB reads only
+`write.parquet.row-group-size-bytes`, and a table carrying that property refuses
+every DuckDB write to it (`ROW_GROUP_SIZE_BYTES does not work while preserving
+insertion order`), so it is not set: a DuckDB write emits its own row groups of
+up to 122,880 rows, each a contiguous slice of the ordered stream, and
+compaction is what cuts them down.
 
 The file target is large because on object storage every file a query touches is
 a billed round trip. A partitioned table (every tiered table, and a decoupled
@@ -282,11 +284,12 @@ scatters a cluster's rows through key space.
 Properties cannot be altered after creation on this build, so a table that
 predates its vector column keeps the defaults.
 
-**Batch cold writes order by cluster.** The archiver's Iceberg INSERT and the C
-bulk INSERT append `ORDER BY 1` (the cluster leads the projection) plus the key,
-so each new file is internally sorted and its own row groups prune. No existing
-file is touched: sorted regions accumulate, and a probe reads the matching row
-group in each of them.
+**Batch cold writes order by cluster.** The archiver's Iceberg INSERT appends
+`ORDER BY 1` (the cluster leads the projection) plus the key, and the C bulk
+INSERT and the decoupled INSERT append `ORDER BY 1`, so each new file is
+internally sorted and its own row groups prune. No existing file is touched:
+sorted regions accumulate, and a probe reads the matching row groups in each of
+them.
 
 **Compaction merges those regions rather than appending them.** A table carrying
 `coldfront.sort-key` is rewritten group by group through `rewriteSorted`
@@ -352,13 +355,16 @@ from a parameter could not have run at all.
 The rewrite resolves the nearest `nprobe` centroid ids
 (`coldfront._vec_probe_ids`), turns them into a predicate
 (`coldfront._vec_probe_qual`), and substitutes the view reference for the view's
-own definition carrying that predicate on its cold arm
+own definition with its cold arm twice: once carrying that predicate, and once
+carrying `IS NULL` on the cluster column for the rows with no assignment
 (`coldfront._vec_probed_viewdef`):
 
 ```sql
 … WHERE r['ts'] < <cutoff>
-  AND (r['_cf_vec_list_embedding']::integer IN (3, 17)
-       OR r['_cf_vec_list_embedding']::integer IS NULL)
+  AND (r['_cf_vec_list_embedding']::integer IN (3, 17))
+UNION ALL
+… WHERE r['ts'] < <cutoff>
+  AND r['_cf_vec_list_embedding']::integer IS NULL
 ```
 
 The substitution exists because the predicate has nowhere else to go: the cluster
@@ -371,10 +377,13 @@ result.
 The hot arm is untouched: hot rows carry no assignment and every one of them is
 returned.
 
-**The null disjunct is not optional.** Rows another engine appended straight to
-Iceberg carry no assignment, and a bare `IN` drops them silently. It is also not
-expensive, because the reader prunes on each row group's null count: unassigned
-rows are read in proportion to their own size rather than the table's.
+**The unassigned arm is not optional, and it is a second arm rather than an
+OR.** Rows another engine appended straight to Iceberg carry no assignment, and
+a bare `IN` drops them silently. As its own arm it is also not expensive: the
+reader prunes it on each file's null count, so unassigned rows are read in
+proportion to their own size, and a table with none reads nothing for it. It is
+not an `OR` on the first arm because DuckDB pushes an `IN` into the scan and to
+the manifest bounds, but not an `OR` that carries `IS NULL`.
 
 **Declining is total and silent.** No centroid generation, an empty probe set, a
 view with no cold arm: each keeps today's query. This is the one place in the

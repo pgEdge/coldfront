@@ -59,10 +59,19 @@ INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_tabl
 VALUES ('public', 'iceonly_again', NULL, '"ice"."public"."iceonly"', NULL, true);
 DROP VIEW public.iceonly_again;
 
--- Decoupled teardown: the registry row and the wrapper view both go.
+-- Decoupled teardown: the registry row and the wrapper view both go, and so do
+-- the relation's vector configuration and centroids: they describe the table this
+-- registration named, and a relation registered later under the same name must
+-- not inherit them.
+INSERT INTO coldfront.vector_config (schema_name, table_name, column_name, nlist, nprobe, generation)
+VALUES ('public', 'iceonly', 'embedding', 2, 1, 1);
+INSERT INTO coldfront.vector_centroids (schema_name, table_name, column_name, generation, centroid_id, centroid)
+VALUES ('public', 'iceonly', 'embedding', 1, 0, ARRAY[1,0,0]::real[]);
 SELECT coldfront._unregister_iceberg('public', 'iceonly');
 SELECT count(*) AS registry_rows FROM coldfront.tiered_views WHERE relname = 'iceonly';
 SELECT count(*) AS view_left FROM pg_class WHERE relname = 'iceonly';
+SELECT count(*) AS vector_config_rows FROM coldfront.vector_config WHERE table_name = 'iceonly';
+SELECT count(*) AS centroid_rows FROM coldfront.vector_centroids WHERE table_name = 'iceonly';
 
 -- Tiered teardown: the archiver's first run renamed events to _events and put a
 -- view in its place, so un-tiering reverses that. Every registration row goes
