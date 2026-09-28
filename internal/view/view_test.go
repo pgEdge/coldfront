@@ -2,6 +2,8 @@ package view
 
 import (
 	"context"
+	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -263,4 +265,13 @@ func TestGenerateViewSQL_ComplexIdentifiers(t *testing.T) {
 	// embedded double quote in `odd"name` passes through unchanged.
 	assert.Contains(t, sql, `r['odd"name']::VARCHAR`)
 	assert.Contains(t, sql, `r['Ts'] <`)
+}
+
+// coldfront._vec_list_col is the SQL twin: both sides derive the same name.
+func TestVecListColumn_MatchesSQLTwin(t *testing.T) {
+	src, err := os.ReadFile("../../extension/coldfront/coldfront--1.0.sql")
+	require.NoError(t, err)
+	i := strings.Index(string(src), "FUNCTION coldfront._vec_list_col(")
+	require.NotEqual(t, -1, i)
+	assert.Contains(t, string(src)[i:i+300], "'"+VecListColumn("")+"' || p_column")
 }
