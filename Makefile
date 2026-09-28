@@ -1,4 +1,4 @@
-.PHONY: build test test-cover lint licenses compactor ci-local clean
+.PHONY: build test lint licenses compactor ci-local clean
 
 # golangci-lint path: PATH first, else the default go install location. ci/matrix.sh
 # passes GOLANGCI=<resolved path> so the compactor gate uses the same linter.
@@ -25,10 +25,6 @@ compactor:
 test:
 	go test -race -v ./...
 
-test-cover:
-	go test -race -coverprofile=coverage.out ./...
-	go tool cover -html=coverage.out -o coverage.html
-
 lint:
 	~/go/bin/golangci-lint run --timeout=5m
 
@@ -42,4 +38,4 @@ ci-local:
 	./run-ci-local.sh
 
 clean:
-	rm -rf bin/ coverage.out coverage.html ci-*.log
+	rm -rf bin/ ci-*.log

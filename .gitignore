@@ -3,7 +3,6 @@ bin/
 dist/
 *.log
 *.out
-coverage.html
 .env
 .claude/*
 !.claude/agents/

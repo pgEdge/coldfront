@@ -11,6 +11,26 @@ and this project adheres to
 
 ### Added
 
+- pgvector columns tier like any other column. The archiver carries them to
+  Iceberg as `list<float>`, the tiered view keeps the pgvector query
+  interface, and writes through the view work unchanged on both tiers. A
+  table may carry several vector columns, with the Iceberg file layout
+  sorted for one of them.
+- `coldfront.vector_train` clusters a vector column with k-means. Every cold
+  write assigns each row to its nearest cluster, the compactor keeps that
+  layout, and a nearest-neighbour search through the view reads the nearest
+  clusters, `nlist` and `nprobe` being per-column settings, plus the rows
+  that carry no assignment. Grouped, aggregated, windowed and `DISTINCT`
+  shapes are recognised; an unrecognised shape scans exactly.
+  `coldfront.vector_status` reports cluster health.
+- Reads that DuckDB executes accept `date_bin` (rewritten to `time_bucket`),
+  `jsonb_build_object` and `jsonb_agg` with their `json_` twins (`ORDER BY`,
+  `FILTER` and `DISTINCT` kept), and bound parameters where DuckDB cannot
+  type a placeholder. Such reads are planned from their values each
+  execution, so `plan_cache_mode = force_generic_plan` cannot run them. A
+  view named in a CTE, sub-select or set-operation branch is detected
+  wherever it sits in the statement.
+- `--version` on the archiver, the partitioner and the compactor.
 - Cold tables are partitioned. The archiver creates a tiered table's
   Iceberg table partitioned the way the hot table is, `month(ts)` or
   `day(ts)` on the time column, led by the LIST column of a two-level
@@ -42,6 +62,8 @@ and this project adheres to
 - The mesh bakery no longer needs the `dblink` extension. Claims, acks,
   releases and orphan reaping run over a libpq loopback connection that the
   extension opens from `coldfront.dblink_self`.
+- Registering a tiered table rejects a column whose type has no Iceberg
+  mapping, instead of failing at the first archive cycle.
 
 ### Fixed
 
@@ -65,7 +87,7 @@ and this project adheres to
 - A writer terminated in the middle of its claim could leave a claim that
   the node's next writer on that table waited behind indefinitely.
 - On a server that has `output_plugin_libraries` (PostgreSQL 16.15, 17.11
-  and 18.6 in pgEdge's builds), no Spock subscription could create its
+  and 18.6), no Spock subscription could create its
   replication slot, because the setting's default leaves out
   `spock_output`. The Docker image adds `spock_output` to it on mesh nodes,
   and the per-node configuration in the usage guide lists it.
@@ -79,6 +101,15 @@ and this project adheres to
   error, and an orphan-file pass with `--orphan-age 0s` could delete the
   files that write had just committed. Each step now reads the table under
   its claim.
+- The pg_duckdb packages for different PostgreSQL majors could not be
+  installed side by side: each claimed the same build-id link for the
+  bundled `libduckdb.so`. The RPMs carry no build-id links and the DEBs no
+  longer produce dbgsym packages.
+- Backends that shared one `duckdb.temporary_directory` overwrote each
+  other's spill files, since DuckDB numbers them from zero per instance, and
+  a backend whose DuckDB instance ended deleted its peers' spills. Each
+  backend now spills into its own subdirectory of the configured path, and
+  the files of a departed backend are removed.
 
 ## [1.0.0-beta2] - 2026-08-08
 
