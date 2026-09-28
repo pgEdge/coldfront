@@ -205,8 +205,6 @@ COPY --from=iceberg-builder /build/duckdb-iceberg/build/release/extension/postgr
 ENV COLDFRONT_DUCKDB_VERSION=v1.5.4 \
     COLDFRONT_DUCKDB_PLATFORM=linux_${TARGETARCH}
 
-COPY docker/entrypoint.sh /usr/local/bin/coldfront-entrypoint.sh
-RUN chmod +x /usr/local/bin/coldfront-entrypoint.sh
 RUN mkdir -p /data && chown postgres:postgres /data
 
 ENV PG_MAJOR=${PG_MAJOR}
@@ -217,4 +215,5 @@ LABEL org.opencontainers.image.title="coldfront-duckdb-base" \
       org.opencontainers.image.description="ColdFront DuckDB 1.5.4 base (pg_duckdb PR#1025 + patched duckdb-iceberg with the bakery-aware commit-refresh patch)."
 
 USER postgres
+# The entrypoint itself is installed by the app layer (docker/Dockerfile.duckdb15).
 ENTRYPOINT ["/usr/local/bin/coldfront-entrypoint.sh"]

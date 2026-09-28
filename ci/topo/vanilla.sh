@@ -63,6 +63,7 @@ fi
 
 cd "$ROOT"
 export PG_MAJOR="$PG"           # consumed by docker-compose.matrix.yml build arg + entrypoint
+require_base "$PG" || exit 1    # exports COLDFRONT_BASE for the same build
 COMPOSE="docker compose -f $COMPOSE_FILE"
 DB=coldfront-db-1
 

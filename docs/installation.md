@@ -88,7 +88,11 @@ yourself (step 1) the app layer `FROM`s your local image; otherwise it
 `FROM`s the published `ghcr.io/pgedge/coldfront-duckdb-base:pg<major>`.
 Rebuild the published base via the
 [base-image workflow](https://github.com/pgEdge/ColdFront/blob/main/.github/workflows/base-image.yml) (`gh workflow run
-base-image.yml`) when its inputs change.
+base-image.yml`) when its inputs change. CI builds the app on the tag
+`ci/base-ref.sh <major>` prints, `pg<major>-r<hash>`, where the hash covers the
+base Dockerfile and the files it copies in, and stops before the app build if
+that tag is not published, naming the command that publishes it. The floating
+`pg<major>` tag moves to the same image once the change is on `main`.
 
 Then follow [usage.md → One-time setup](usage.md#one-time-setup)
 (bootstrap Lakekeeper → create a table → tier → verify).

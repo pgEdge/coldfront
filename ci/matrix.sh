@@ -80,6 +80,18 @@ preflight() {
     fi
     if ! mkdocs build --strict 2>&1; then fail "mkdocs build --strict"; exit 1; fi
     pass "docs build --strict"
+
+    step "preflight 8: base recipe hash (ci/base-ref.sh)"
+    local tag tmp
+    tag="$(ci/base-ref.sh)"
+    tmp="$(mktemp -d)"; mkdir -p "$tmp/ci"; cp ci/base-ref.sh "$tmp/ci/"; cp -r docker "$tmp/"
+    echo >> "$tmp/docker/iceberg-data-file-format-v15.patch"
+    if [[ "$tag" =~ ^r[0-9a-f]{8}$ ]] && [ "$("$tmp/ci/base-ref.sh")" != "$tag" ]; then
+        pass "base recipe hash $tag, and a patch edit changes it"
+    else
+        fail "ci/base-ref.sh: got '$tag'"; rm -rf "$tmp"; exit 1
+    fi
+    rm -rf "$tmp"
 }
 
 # ── Cells ────────────────────────────────────────────────────────────────────
@@ -121,7 +133,9 @@ compose_for() {
 prebuild_duckdb15() {
     local pg="$1"
     step "prebuild coldfront-duckdb15:pg${pg} (azure image)"
+    require_base "$pg" || { fail "prebuild coldfront-duckdb15:pg${pg}"; return 1; }
     if docker build -f docker/Dockerfile.duckdb15 --build-arg PG_MAJOR="$pg" \
+           --build-arg COLDFRONT_BASE="$COLDFRONT_BASE" \
            -t "coldfront-duckdb15:pg${pg}" . >/dev/null 2>&1; then
         pass "image coldfront-duckdb15:pg${pg}"
     else

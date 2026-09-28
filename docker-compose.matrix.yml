@@ -15,6 +15,7 @@ services:
       dockerfile: docker/Dockerfile.duckdb15
       args:
         PG_MAJOR: ${PG_MAJOR:-18}
+        COLDFRONT_BASE: ${COLDFRONT_BASE:-ghcr.io/pgedge/coldfront-duckdb-base:pg${PG_MAJOR:-18}}
     environment:
       PG_MAJOR: ${PG_MAJOR:-18}
       MESH: "off"

@@ -51,6 +51,7 @@ fi
 
 cd "$ROOT"
 export PG_MAJOR="$PG"
+require_base "$PG" || exit 1
 COMPOSE="docker compose -f $COMPOSE_FILE"
 NODES="db1 db2 db3"
 PRIMARY="coldfront-db1-1"

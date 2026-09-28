@@ -43,6 +43,22 @@ q_may() { local c="$1"; shift; docker exec -e PGUSER="$CF_DBUSER" -e PGDATABASE=
 # extract KEY "$BLOCK"  — pull the value from a "KEY:value" line in a captured block.
 extract() { echo "$2" | grep "^$1:" | head -1 | cut -d: -f2-; }
 
+# require_base <pg>: resolve the base image the tree's recipe maps to
+# (ci/base-ref.sh), make sure it is present locally or pullable, and export it
+# as COLDFRONT_BASE for the app build. A base that is neither stops the run here
+# and names the two ways to produce it.
+require_base() {
+    local pg="$1" ref err
+    ref="$("${BASH_SOURCE[0]%/*}/base-ref.sh" "$pg")" || return 1
+    if ! docker image inspect "$ref" >/dev/null 2>&1 && ! err="$(docker pull "$ref" 2>&1)"; then
+        echo "base image $ref is not available (${err##*$'\n'})" >&2
+        echo "  build it locally:  docker build -f docker/Dockerfile.duckdb15-base --build-arg PG_MAJOR=$pg -t $ref ." >&2
+        echo "  or publish it:     gh workflow run base-image.yml --ref ${GITHUB_HEAD_REF:-${GITHUB_REF_NAME:-$(git rev-parse --abbrev-ref HEAD)}} -f push=true" >&2
+        return 1
+    fi
+    export COLDFRONT_BASE="$ref"
+}
+
 # summary  — print pass/fail tally; returns nonzero if any FAIL (drives matrix exit code).
 summary() {
     echo -e "\n  Passed: ${GREEN}${PASS}${NC}   Failed: ${RED}${FAIL}${NC}"
