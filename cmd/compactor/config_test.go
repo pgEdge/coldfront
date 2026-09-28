@@ -1,12 +1,10 @@
 package main
 
 import (
-	"context"
 	"strings"
 	"testing"
 
 	iceio "github.com/apache/iceberg-go/io"
-	"github.com/apache/iceberg-go/utils"
 )
 
 func TestSplitSchemaTable(t *testing.T) {
@@ -59,6 +57,9 @@ func TestStorageProps_GCSInterop(t *testing.T) {
 	}
 	if got := p[iceio.S3EndpointURL]; got != "https://storage.googleapis.com" {
 		t.Fatalf("gcs-interop endpoint = %q", got)
+	}
+	if got := p[iceio.S3CompatMode]; got != "true" {
+		t.Fatalf("a TLS S3-compatible endpoint needs %s=true, got %q", iceio.S3CompatMode, got)
 	}
 }
 
@@ -126,30 +127,9 @@ func TestStorageProps_AzureMalformed(t *testing.T) {
 	}
 }
 
-func TestWithColdStoreSigning_GCS(t *testing.T) {
-	// TLS S3-compatible endpoint (GCS interop): an aws.Config carrying the
-	// signing adjustments must ride the context.
-	c := &Config{}
-	c.S3.Endpoint = "storage.googleapis.com"
-	c.S3.UseSSL = true
-	c.S3.AccessKey = "GOOGTESTHMAC"
-	c.S3.SecretKey = "secret"
-	ctx, err := withColdStoreSigning(context.Background(), c)
-	if err != nil {
-		t.Fatal(err)
-	}
-	awscfg := utils.GetAwsConfig(ctx)
-	if awscfg == nil {
-		t.Fatal("expected an aws.Config on the context for a TLS S3 endpoint")
-	}
-	if len(awscfg.APIOptions) == 0 {
-		t.Fatal("expected the signing-exclusion middleware in APIOptions")
-	}
-}
-
-func TestWithColdStoreSigning_NoOverride(t *testing.T) {
+func TestStorageProps_NoCompatModeWithoutTLSEndpoint(t *testing.T) {
 	// Plain-http S3 (SeaweedFS/MinIO), no-endpoint AWS native, and Azure stay
-	// on SDK defaults: context returned unchanged.
+	// on SDK defaults.
 	cases := map[string]func(*Config){
 		"seaweedfs-http": func(c *Config) {
 			c.S3.Endpoint = "seaweedfs:8333"
@@ -169,12 +149,12 @@ func TestWithColdStoreSigning_NoOverride(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			c := &Config{}
 			setup(c)
-			ctx, err := withColdStoreSigning(context.Background(), c)
+			p, err := c.storageProps()
 			if err != nil {
 				t.Fatal(err)
 			}
-			if utils.GetAwsConfig(ctx) != nil {
-				t.Fatalf("%s must not adjust signing (GCS-only)", name)
+			if got, set := p[iceio.S3CompatMode]; set {
+				t.Fatalf("%s must not set %s, got %q", name, iceio.S3CompatMode, got)
 			}
 		})
 	}
