@@ -141,6 +141,15 @@ SELECT coldfront._vec_list_set_item('ice.default.docs', 'embedding', 'NEW_EXPR')
  t              | t
 (1 row)
 
+-- One formula for the nearest centroid whatever set it is scored against: the live
+-- generation over pglocal for a cold write, the session's freshly trained set for
+-- the assignment at the end of training.
+SELECT coldfront._vec_nearest_expr('temp.main.cf_gen c', 'embedding');
+                                          _vec_nearest_expr                                           
+------------------------------------------------------------------------------------------------------
+ (SELECT arg_min(c.centroid_id, list_cosine_distance(c.centroid, embedding)) FROM temp.main.cf_gen c)
+(1 row)
+
 -- The trigger function is the contract. Both cluster expressions lead, each
 -- pairing with its own column's value, in column order; the identity column and
 -- the user-written generated column are positional NULLs the hot INSERT skips,

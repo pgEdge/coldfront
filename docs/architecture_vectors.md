@@ -128,8 +128,9 @@ spellings of the name.
 ## Assignment
 
 `coldfront._vec_list_expr(schema, table, column, vec_expr)` is the only place a
-cluster assignment is defined. Given the text of an expression that yields the
-vector as DuckDB sees it, it returns:
+cluster assignment is defined for a write; its formula, `_vec_nearest_expr`, is
+shared with the assignment at the end of training. Given the text of an
+expression that yields the vector as DuckDB sees it, it returns:
 
 ```sql
 (SELECT arg_min(c.centroid_id, list_cosine_distance(c.centroid, <vec_expr>))
@@ -223,8 +224,10 @@ Lloyd iterations run as DuckDB statements over a reservoir sample, with fixed
 `REPEATABLE` seeds so a retrain on unchanged data reproduces the same centroids.
 The mean recompute unnests the vector against a matching `range` so the two lists
 advance together, because DuckDB has no `WITH ORDINALITY`. The sample and the
-working tables live in `memory.main`, which is session-scoped, so the whole loop
-must run in one call.
+working tables are DuckDB temporary tables, session-scoped, so the whole loop
+must run in one call; temporary rather than `memory.main` because a DuckDB
+transaction may write one attached database, the temporary database is exempt,
+and the assignment at the end writes `ice`.
 
 The centroids return through a temporary heap table. A single
 `INSERT … SELECT FROM duckdb.query(…)` fails with `DuckDB does not support
@@ -234,6 +237,26 @@ DuckDB's, so the read and the write are separate statements.
 Empty clusters do not come back from the mean, so the stored count can be below
 `nlist`; the actual count is recorded rather than padded. A `vector_config` row
 must exist first, since it holds the generation pointer the procedure writes.
+
+A retrain at the same `nlist` (a call without `p_nlist`, or with the trained
+count) starts the iterations from the live centroids instead of fresh seeds, so
+each centroid keeps its id and moves with its data. A first training, or a
+changed `nlist`, has no set to start from and seeds with k-means++.
+
+Training ends with the loop's final step applied to the table rather than the
+sample: every cold row is assigned to its nearest centroid of the generation just
+written, in one claimed `UPDATE` whose `WHERE` is `cluster IS DISTINCT FROM
+nearest`, so only a row whose cluster changed is rewritten and a row with no
+cluster counts as changed. It scores against the session's copy of the new
+centroids (`temp.main.cf_gen`), because the rows inserted into
+`vector_centroids` in this transaction are invisible over `pglocal` until commit;
+the formula is `_vec_nearest_expr`, the same one every write path uses. The
+pointer and the assignments commit together, so no search ever reads a row
+against centroids it was not assigned under. The claim is held from the sample
+to the commit, as the compactor holds it across its read and rewrite, so a cold
+write cannot land between the two with an assignment against the replaced set.
+What the pass leaves behind is a merge-on-read delete per rewritten row, and
+those rows in update order; compaction resolves both.
 
 Seeds come from k-means++: one sample row at random, then each next drawn with
 probability proportional to its squared distance from the nearest seed already
@@ -398,33 +421,6 @@ Two session knobs, both `PGC_USERSET`:
 | `coldfront.vector_probe` | `on` | `off` gives the exact scan a recall measurement compares against |
 | `coldfront.vector_nprobe` | `0` | `0` uses the column's configured `nprobe`; a value at or above `nlist` is exhaustive |
 
-## Assigning what predates training
-
-`CALL coldfront.vector_assign(schema, table, column)` gives a cluster to the cold
-rows that have none, which are exactly those written before the generation existed.
-It is one claimed UPDATE whose SET item is the same generator a cold UPDATE uses
-when a caller changes an embedding, applied to the embedding already stored, so it
-serialises through the bakery like every other cold write and adds no new way to
-compute an assignment.
-
-It refuses without a live generation rather than reporting success. The lookup would
-resolve to NULL for every row, so the table would be rewritten in full and left
-exactly as it was.
-
-Two constraints shape the body, and both bite anything else written here:
-
-- **A DuckDB transaction may write one attached database.** Staging the row count in
-  a `memory.main` table would spend this transaction's one database on `memory` and
-  leave the UPDATE unable to write `ice` at all.
-- **`duckdb.query` needs a constant at plan time, not a literal in the source.**
-  Built through `EXECUTE format(...)` the argument is a constant again, which is how
-  a dynamic table name is read without staging anything. `vector_status` reads its
-  distribution the same way.
-
-What it leaves behind is a merge-on-read delete per rewritten row, and rows in
-update order rather than cluster order. Compaction resolves both. The sequence is
-train, assign, compact.
-
 ## Reporting
 
 `CALL coldfront.vector_status([schema, table])` fills a session-lifetime temporary
@@ -437,7 +433,9 @@ because a bare `CALL` is its own transaction.
 
 Nothing is staged on the way. DuckDB groups the table by cluster and aggregates
 that grouping in one query, so a row of scalars crosses back per table, read through
-the same `EXECUTE format(...)` form `vector_assign` uses. The work list is a pair of
+`EXECUTE format(...)`: `duckdb.query` needs a constant at plan time, not a literal
+in the source, and a dynamic table name built into the executed text is one
+again. The work list is a pair of
 key arrays walked by index, because a `FOR` over a query would hold a portal open
 for its body and pg_duckdb refuses a DuckDB read while one is. `vector_train`'s
 `memory.main` tables are its algorithm's own state, not a way to move a result

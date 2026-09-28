@@ -92,6 +92,11 @@ SELECT coldfront._vec_list_prefix_for_ref('ice.default.docs', 's.') IS NOT NULL 
 SELECT coldfront._vec_list_set_item('ice.default.docs', 'embedding', 'NEW_EXPR') IS NOT NULL AS vector_answers,
        coldfront._vec_list_set_item('ice.default.docs', 'body', 'NEW_EXPR') IS NULL      AS non_vector_declines;
 
+-- One formula for the nearest centroid whatever set it is scored against: the live
+-- generation over pglocal for a cold write, the session's freshly trained set for
+-- the assignment at the end of training.
+SELECT coldfront._vec_nearest_expr('temp.main.cf_gen c', 'embedding');
+
 -- The trigger function is the contract. Both cluster expressions lead, each
 -- pairing with its own column's value, in column order; the identity column and
 -- the user-written generated column are positional NULLs the hot INSERT skips,

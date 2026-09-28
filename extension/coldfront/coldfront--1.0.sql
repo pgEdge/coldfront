@@ -1662,13 +1662,94 @@ LANGUAGE sql IMMUTABLE STRICT AS $$
         OR lower(trim(p_pg_type)) LIKE 'halfvec(%';
 $$;
 
--- Train a centroid set for one vector column and store it as a new generation.
+-- k-means++ seeding over the session's sample (temp.main.cf_samp): one seed at
+-- random, then each next drawn with probability proportional to its squared
+-- distance from the nearest seed already chosen, so the seeds spread out instead
+-- of clumping. Lloyd's iterations only move centroids locally, so they cannot
+-- repair a clumped start. Leaves the seeds in temp.main.cf_cent as (cid, v).
+--
+-- It matters most where dense clumps exist, which is the lower dimensionalities
+-- many embedding models produce; at 1024 dimensions distances concentrate and the
+-- spread start makes little difference. Seeding is a one-time training cost and
+-- nothing a query pays.
+--
+-- The draw is an exponential race: for weights w, the minimum of -ln(u)/w is
+-- distributed exactly as a weighted draw, in one pass and with no cumulative sum.
+-- d is maintained incrementally, folding in only the seed just added, so a round
+-- is one pass over the sample rather than one per seed chosen so far. The first
+-- seed's draw is fixed, like the sample's, so a retrain on unchanged data
+-- reproduces the same centroids.
+CREATE OR REPLACE FUNCTION coldfront._vec_seed_kmeanspp(p_nlist int) RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    i int;
+BEGIN
+    PERFORM duckdb.raw_query(
+        'CREATE OR REPLACE TEMP TABLE cf_seed AS '
+        'SELECT 1 AS seq, id, v FROM temp.main.cf_samp '
+        'USING SAMPLE reservoir(1 ROWS) REPEATABLE (7)');
+    PERFORM duckdb.raw_query(
+        'CREATE OR REPLACE TEMP TABLE cf_seed_d AS '
+        'SELECT s.id, s.v, '
+               '(SELECT min(list_cosine_distance(s.v, p.v)) FROM temp.main.cf_seed p) AS d '
+          'FROM temp.main.cf_samp s');
+    FOR i IN 2 .. p_nlist LOOP
+        -- A sample smaller than nlist, or one whose remaining rows all duplicate a
+        -- seed, leaves d = 0 everywhere and the draw returns nothing. The centroid
+        -- count the caller records is whatever came back, so that resolves itself.
+        PERFORM duckdb.raw_query(format(
+            'INSERT INTO temp.main.cf_seed '
+            'SELECT %s, id, v FROM temp.main.cf_seed_d '
+            'WHERE d > 0 ORDER BY -ln(random()) / (d * d) LIMIT 1', i));
+        -- Keyed on seq, because a sample id says nothing about insertion order.
+        PERFORM duckdb.raw_query(format(
+            'UPDATE temp.main.cf_seed_d SET d = least(d, '
+                'list_cosine_distance(v, (SELECT p.v FROM temp.main.cf_seed p '
+                                         'WHERE p.seq = %s)))', i));
+    END LOOP;
+    PERFORM duckdb.raw_query(
+        'CREATE OR REPLACE TEMP TABLE cf_cent AS '
+        'SELECT row_number() OVER (ORDER BY seq) AS cid, v FROM temp.main.cf_seed');
+END;
+$$;
+
+-- Lloyd's iterations over the session's sample, from the centroids in
+-- temp.main.cf_cent and back into it: assign, then recompute each cluster's
+-- mean, p_iterations times. The mean unnests the vector against a matching range
+-- so the two lists advance together: DuckDB has no WITH ORDINALITY, and position
+-- is what makes the average element-wise. Empty clusters do not come back from
+-- the mean.
+CREATE OR REPLACE FUNCTION coldfront._vec_lloyd(p_iterations int, p_dim int) RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    i int;
+BEGIN
+    FOR i IN 1 .. p_iterations LOOP
+        PERFORM duckdb.raw_query(
+            'CREATE OR REPLACE TEMP TABLE cf_asg AS '
+            'SELECT s.id, arg_min(c.cid, list_cosine_distance(s.v, c.v)) AS cid '
+            'FROM temp.main.cf_samp s CROSS JOIN temp.main.cf_cent c GROUP BY s.id');
+        PERFORM duckdb.raw_query(format(
+            'CREATE OR REPLACE TEMP TABLE cf_cent AS '
+            'SELECT cid, list(m ORDER BY i)::FLOAT[] AS v FROM ('
+            '  SELECT cid, i, avg(x) AS m FROM ('
+            '    SELECT a.cid, unnest(range(1, %s)) AS i, unnest(s.v) AS x '
+            '    FROM temp.main.cf_samp s JOIN temp.main.cf_asg a USING (id))'
+            '  GROUP BY cid, i) GROUP BY cid', p_dim + 1));
+    END LOOP;
+END;
+$$;
+
+-- Train a centroid set for one vector column, store it as a new generation, and
+-- assign every cold row to its nearest centroid of that generation.
 --
 -- Lloyd iterations over a reservoir sample, run as DuckDB statements: both the
 -- assignment and the mean are distance work over the cold corpus, which is what
 -- DuckDB is for and what pulling the vectors into PostgreSQL would waste. The
 -- sample and the working tables live in the session's own DuckDB instance, so the
--- whole loop has to run in one call.
+-- whole loop has to run in one call. They are temporary tables rather than tables
+-- in memory.main: a DuckDB transaction may write one attached database, the
+-- temporary database is exempt, and the assignment at the end writes ice.
 --
 -- A PROCEDURE, not a function, and that is a hard requirement rather than a
 -- preference: pg_duckdb refuses to execute a DuckDB query inside a function
@@ -1677,9 +1758,18 @@ $$;
 -- DuckDB channel with no access to PostgreSQL tables, so a function can move data
 -- in neither direction. CALL is what makes reading the result possible.
 --
+-- A retrain at the same nlist starts the iterations from the live centroids, so a
+-- centroid keeps its id and moves with its data, and the assignment rewrites only
+-- the rows whose nearest centroid changed. A first training, or a changed nlist,
+-- has no set to start from and seeds with k-means++.
+--
 -- Empty clusters simply do not come back from the mean, so the stored count can be
 -- below p_nlist; it is recorded rather than padded, since a centroid nothing was
 -- assigned to routes nothing.
+--
+-- The table's claim is held from the sample to the commit, as the compactor holds
+-- it across its read and rewrite: a cold write landing in between would carry an
+-- assignment against the centroids this call replaces.
 CREATE PROCEDURE coldfront.vector_train(
     p_schema     text,
     p_table      text,
@@ -1690,13 +1780,15 @@ CREATE PROCEDURE coldfront.vector_train(
 )
 LANGUAGE plpgsql AS $$
 DECLARE
-    v_ice      text;
-    v_writable boolean;
-    v_nlist    int;
-    v_gen      int;
-    v_n        int;
-    v_dim      int;
-    i          int;
+    v_ice       text;
+    v_writable  boolean;
+    v_nlist     int;
+    v_cfg_nlist int;
+    v_gen       int;
+    v_n         int;
+    v_dim       int;
+    v_col       text := quote_ident(coldfront._vec_list_col(p_column));
+    v_nearest   text := coldfront._vec_nearest_expr('temp.main.cf_gen c', quote_ident(p_column));
 BEGIN
     PERFORM coldfront._reject_on_standby('train vector centroids');
 
@@ -1709,10 +1801,10 @@ BEGIN
     END IF;
     IF NOT v_writable THEN
         RAISE EXCEPTION 'coldfront.vector_train: "%.%" is adopted read-only', p_schema, p_table
-            USING HINT = 'Training stores a centroid generation the assignment then writes into the cold table. Release it and adopt again with p_writable => true.';
+            USING HINT = 'Training rewrites the cold rows. Release it and adopt again with p_writable => true.';
     END IF;
 
-    SELECT COALESCE(p_nlist, nlist), generation INTO v_nlist, v_gen
+    SELECT COALESCE(p_nlist, nlist), nlist, generation INTO v_nlist, v_cfg_nlist, v_gen
     FROM coldfront.vector_config
     WHERE schema_name = p_schema AND table_name = p_table AND column_name = p_column;
     IF v_nlist IS NULL THEN
@@ -1724,80 +1816,45 @@ BEGIN
 
     SET LOCAL duckdb.unsafe_allow_mixed_transactions = on;
     PERFORM coldfront.ensure_attached();
+    PERFORM coldfront._take_iceberg_claim(v_ice);
 
-    -- The sample, then the seeds drawn from it. Both seeds are fixed so a retrain
-    -- on unchanged data reproduces the same centroids.
+    -- The sample. Its seed is fixed so a retrain on unchanged data reproduces the
+    -- same centroids.
     PERFORM duckdb.raw_query(format(
-        'CREATE OR REPLACE TABLE memory.main.cf_samp AS '
+        'CREATE OR REPLACE TEMP TABLE cf_samp AS '
         'SELECT row_number() OVER () AS id, v FROM ('
         '  SELECT %I AS v FROM %s WHERE %I IS NOT NULL '
         '  USING SAMPLE reservoir(%s ROWS) REPEATABLE (42))',
         p_column, v_ice, p_column, p_sample));
 
     SELECT r['n']::int, r['d']::int INTO v_n, v_dim
-    FROM duckdb.query('SELECT count(*) AS n, max(len(v)) AS d FROM memory.main.cf_samp') AS t(r);
+    FROM duckdb.query('SELECT count(*) AS n, max(len(v)) AS d FROM temp.main.cf_samp') AS t(r);
     IF COALESCE(v_n, 0) = 0 THEN
         RAISE EXCEPTION 'coldfront.vector_train: "%.%"."%" has no cold rows to train on',
             p_schema, p_table, p_column;
     END IF;
 
-    -- k-means++ seeding: one seed at random, then each next drawn with probability
-    -- proportional to its squared distance from the nearest seed already chosen, so
-    -- the seeds spread out instead of clumping. Lloyd's iterations below only move
-    -- centroids locally, so they cannot repair a clumped start.
-    --
-    -- It matters most where dense clumps exist, which is the lower dimensionalities
-    -- many embedding models produce; at 1024 dimensions distances concentrate and the
-    -- spread start makes little difference. Seeding is a one-time training cost and
-    -- nothing a query pays.
-    --
-    -- The draw is an exponential race: for weights w, the minimum of -ln(u)/w is
-    -- distributed exactly as a weighted draw, in one pass and with no cumulative sum.
-    -- d is maintained incrementally, folding in only the seed just added, so a round
-    -- is one pass over the sample rather than one per seed chosen so far.
-    PERFORM duckdb.raw_query(
-        'CREATE OR REPLACE TABLE memory.main.cf_seed AS '
-        'SELECT 1 AS seq, id, v FROM memory.main.cf_samp '
-        'USING SAMPLE reservoir(1 ROWS) REPEATABLE (7)');
-    PERFORM duckdb.raw_query(
-        'CREATE OR REPLACE TABLE memory.main.cf_seed_d AS '
-        'SELECT s.id, s.v, '
-               '(SELECT min(list_cosine_distance(s.v, p.v)) FROM memory.main.cf_seed p) AS d '
-          'FROM memory.main.cf_samp s');
-    FOR i IN 2 .. v_nlist LOOP
-        -- A sample smaller than nlist, or one whose remaining rows all duplicate a
-        -- seed, leaves d = 0 everywhere and the draw returns nothing. The centroid
-        -- count recorded below is whatever came back, so that resolves itself.
+    IF v_gen > 0 AND v_nlist = v_cfg_nlist THEN
+        -- The live centroids are the seeds: same ids, and the iterations then
+        -- move each one with its data.
+        PERFORM coldfront.ensure_pg_attached();
         PERFORM duckdb.raw_query(format(
-            'INSERT INTO memory.main.cf_seed '
-            'SELECT %s, id, v FROM memory.main.cf_seed_d '
-            'WHERE d > 0 ORDER BY -ln(random()) / (d * d) LIMIT 1', i));
-        -- Keyed on seq, because a sample id says nothing about insertion order.
-        PERFORM duckdb.raw_query(format(
-            'UPDATE memory.main.cf_seed_d SET d = least(d, '
-                'list_cosine_distance(v, (SELECT p.v FROM memory.main.cf_seed p '
-                                         'WHERE p.seq = %s)))', i));
-    END LOOP;
-    PERFORM duckdb.raw_query(
-        'CREATE OR REPLACE TABLE memory.main.cf_cent AS '
-        'SELECT row_number() OVER (ORDER BY seq) AS cid, v FROM memory.main.cf_seed');
+            'CREATE OR REPLACE TEMP TABLE cf_cent AS '
+            'SELECT centroid_id AS cid, centroid AS v FROM pglocal.coldfront.vector_centroids '
+            'WHERE schema_name = %L AND table_name = %L AND column_name = %L AND generation = %s',
+            p_schema, p_table, p_column, v_gen));
+    ELSE
+        PERFORM coldfront._vec_seed_kmeanspp(v_nlist);
+    END IF;
+    PERFORM coldfront._vec_lloyd(p_iterations, v_dim);
 
-    -- Assign, then recompute each cluster's mean. The mean unnests the vector
-    -- against a matching range so the two lists advance together: DuckDB has no
-    -- WITH ORDINALITY, and position is what makes the average element-wise.
-    FOR i IN 1 .. p_iterations LOOP
-        PERFORM duckdb.raw_query(
-            'CREATE OR REPLACE TABLE memory.main.cf_asg AS '
-            'SELECT s.id, arg_min(c.cid, list_cosine_distance(s.v, c.v)) AS cid '
-            'FROM memory.main.cf_samp s CROSS JOIN memory.main.cf_cent c GROUP BY s.id');
-        PERFORM duckdb.raw_query(format(
-            'CREATE OR REPLACE TABLE memory.main.cf_cent AS '
-            'SELECT cid, list(m ORDER BY i)::FLOAT[] AS v FROM ('
-            '  SELECT cid, i, avg(x) AS m FROM ('
-            '    SELECT a.cid, unnest(range(1, %s)) AS i, unnest(s.v) AS x '
-            '    FROM memory.main.cf_samp s JOIN memory.main.cf_asg a USING (id))'
-            '  GROUP BY cid, i) GROUP BY cid', v_dim + 1));
-    END LOOP;
+    -- The generation as it is stored, in the columns the nearest-centroid
+    -- expression reads. It is what the assignment below scores against: the set
+    -- written to PostgreSQL in this transaction, which a read over pglocal could
+    -- not see yet.
+    PERFORM duckdb.raw_query(
+        'CREATE OR REPLACE TEMP TABLE cf_gen AS '
+        'SELECT cid::INTEGER AS centroid_id, v AS centroid FROM temp.main.cf_cent');
 
     -- The centroids land in a temporary heap first. A single INSERT reading a
     -- DuckDB scan is planned as a DuckDB statement, and DuckDB cannot write to a
@@ -1808,14 +1865,14 @@ BEGIN
         DROP TABLE pg_temp.cf_cent_pg;
     END IF;
     CREATE TEMP TABLE cf_cent_pg ON COMMIT DROP AS
-    SELECT r['cid']::int AS cid, r['v']::real[] AS v
-    FROM duckdb.query('SELECT cid, v FROM memory.main.cf_cent') AS t(r);
+    SELECT r['centroid_id']::int AS centroid_id, r['centroid']::real[] AS centroid
+    FROM duckdb.query('SELECT centroid_id, centroid FROM temp.main.cf_gen') AS t(r);
 
     -- A generation is immutable, so this writes a new one and moves the pointer.
     v_gen := COALESCE(v_gen, 0) + 1;
     INSERT INTO coldfront.vector_centroids
         (schema_name, table_name, column_name, generation, centroid_id, centroid)
-    SELECT p_schema, p_table, p_column, v_gen, cid, v FROM cf_cent_pg;
+    SELECT p_schema, p_table, p_column, v_gen, centroid_id, centroid FROM cf_cent_pg;
 
     GET DIAGNOSTICS v_n = ROW_COUNT;
     -- The trained count can fall below the configured nprobe (empty clusters do
@@ -1825,99 +1882,16 @@ BEGIN
        SET generation = v_gen, nlist = v_n, nprobe = LEAST(nprobe, v_n)
      WHERE schema_name = p_schema AND table_name = p_table AND column_name = p_column;
 
-    RAISE NOTICE 'coldfront: trained % centroids for "%.%"."%" as generation %',
-        v_n, p_schema, p_table, p_column, v_gen;
-END;
-$$;
-
--- Give a cluster to the cold rows that have none.
---
--- Training writes centroids and every write after it is assigned in the statement
--- that writes it, so the rows without an assignment are exactly those that predate
--- the generation. A probe reads all of them whatever clusters it looks in, so on a
--- corpus tiered before training they are the whole cost of the search.
---
--- One claimed UPDATE, and nothing new: the SET item is the same generator a cold
--- UPDATE uses when a caller changes an embedding, applied to the embedding already
--- there. Serialised through the bakery like every other cold write, so a concurrent
--- writer cannot land a row assigned under a different generation partway through.
---
--- What it leaves behind is a merge-on-read delete per rewritten row, and rows in
--- the order the update produced rather than in cluster order. Compaction resolves
--- both: it applies the deletes and merges the result on the sort key. So the
--- sequence is train, assign, compact.
---
--- Fails rather than no-ops without a live generation. The lookup would resolve to
--- NULL for every row, leaving the table exactly as it was after a full rewrite, and
--- a wrong or absent cluster is invisible in a way a probe never reports.
-CREATE PROCEDURE coldfront.vector_assign(
-    p_schema text,
-    p_table  text,
-    p_column text
-)
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_ice      text;
-    v_writable boolean;
-    v_gen      int;
-    v_item     text;
-    v_col      text := quote_ident(coldfront._vec_list_col(p_column));
-    v_n        bigint;
-BEGIN
-    PERFORM coldfront._reject_on_standby('assign vector clusters');
-
-    SELECT iceberg_table, is_writable INTO v_ice, v_writable
-      FROM coldfront.tiered_views
-     WHERE schema_name = p_schema AND relname = p_table
-       AND p_column = ANY (COALESCE(vec_columns, '{}'));
-    IF v_ice IS NULL THEN
-        RAISE EXCEPTION 'coldfront.vector_assign: "%.%"."%" is not a registered clustered column',
-            p_schema, p_table, p_column;
-    END IF;
-    IF NOT v_writable THEN
-        RAISE EXCEPTION 'coldfront.vector_assign: "%.%" is adopted read-only', p_schema, p_table
-            USING HINT = 'Assigning rewrites every cold row. Release it and adopt again with p_writable => true.';
-    END IF;
-
-    SELECT NULLIF(generation, 0) INTO v_gen
-      FROM coldfront.vector_config
-     WHERE schema_name = p_schema AND table_name = p_table AND column_name = p_column;
-    IF v_gen IS NULL THEN
-        RAISE EXCEPTION 'coldfront.vector_assign: "%.%"."%" has no trained generation',
-            p_schema, p_table, p_column
-            USING HINT = 'CALL coldfront.vector_train(...) first: without centroids '
-                         'every row would be assigned NULL, which is what it already is.';
-    END IF;
-
-    v_item := coldfront._vec_list_set_item(v_ice, p_column, quote_ident(p_column));
-
-    SET LOCAL duckdb.unsafe_allow_mixed_transactions = on;
-    PERFORM coldfront.ensure_attached();
-
-    -- Counted before the write, so the notice reports what this call did rather than
-    -- what the table looks like afterwards.
-    --
-    -- Through EXECUTE, which is what makes a dynamic table name work here: a bare
-    -- duckdb.query(format(...)) is not a constant at plan time and is refused, while
-    -- staging the count in a memory.main table the way vector_train stages its
-    -- centroids would spend this transaction's one database on memory and leave the
-    -- UPDATE below unable to write ice at all ("a single transaction can only modify
-    -- one database"). Built as dynamic SQL, the argument is a literal again.
-    EXECUTE format('SELECT t.r[%L]::bigint FROM duckdb.query(%L) AS t(r)', 'n',
-                   format('SELECT count(*) AS n FROM %s WHERE %s IS NULL', v_ice, v_col))
-      INTO v_n;
-
-    IF COALESCE(v_n, 0) = 0 THEN
-        RAISE NOTICE 'coldfront: every cold row of "%.%"."%" is already assigned',
-            p_schema, p_table, p_column;
-        RETURN;
-    END IF;
-
+    -- The corpus, assigned: the loop's final step applied to the table rather than
+    -- the sample. Only a row whose cluster changed is rewritten, and a row with no
+    -- cluster counts as changed. The pointer and the assignments commit together.
+    -- What it leaves behind is a merge-on-read delete per rewritten row, and those
+    -- rows in update order rather than cluster order; compaction resolves both.
     PERFORM coldfront._exec_iceberg_with_claim(v_ice, format(
-        'UPDATE %s SET %s WHERE %s IS NULL', v_ice, v_item, v_col));
+        'UPDATE %s SET %s = %s WHERE %s IS DISTINCT FROM %s',
+        v_ice, v_col, v_nearest, v_col, v_nearest));
 
-    RAISE NOTICE 'coldfront: assigned % cold row(s) of "%.%"."%" to generation %; '
-                 'compact the table to apply the deletes and restore cluster order',
+    RAISE NOTICE 'coldfront: trained % centroids for "%.%"."%" as generation % and assigned the cold rows; compact the table to apply the deletes and restore cluster order',
         v_n, p_schema, p_table, p_column, v_gen;
 END;
 $$;
@@ -2041,10 +2015,9 @@ BEGIN
         --
         -- Through EXECUTE because the table name is dynamic and duckdb.query needs a
         -- constant at plan time, not a literal in the source. Staging the grouping in
-        -- a memory.main table the way vector_train stages its centroids would work
-        -- here too, but it is a table to name, drop and read back for a result that
-        -- fits in one row, and on any path that also writes Iceberg it would spend
-        -- the transaction's one writable database (see vector_assign).
+        -- a DuckDB table the way vector_train stages its centroids would work here
+        -- too, but it is a table to name, drop and read back for a result that fits
+        -- in one row.
         EXECUTE format(
             'SELECT t.r[%L]::bigint, t.r[%L]::bigint, t.r[%L]::int, '
                    't.r[%L]::bigint, t.r[%L]::bigint, t.r[%L]::bigint, '
@@ -2096,7 +2069,7 @@ BEGIN
                 WHEN vt.generation IS NULL THEN
                     'no trained generation: every row is unassigned and every probe reads the whole table'
                 WHEN v_rows > 0 AND v_unasg::numeric / v_rows > 0.5 THEN
-                    'over half the rows predate training, and a probe reads all of them'
+                    'over half the rows have no assignment, and a probe reads all of them'
                 WHEN v_occ > 0 AND v_floor::numeric / v_occ > 0.5 THEN
                     'over half the occupied clusters hold less than one row group: retrain with a smaller nlist'
                 -- Against the median, not the minimum: one tiny cluster sets max/min
@@ -2296,20 +2269,30 @@ $$;
 -- Before any training the config carries no generation, the inner query matches
 -- nothing, and the expression yields NULL: unassigned, which a probe reads
 -- through the null arm of its predicate rather than missing. A retrain cannot
--- interleave with a cold write, since optimize() holds the table's claim for its
--- duration and every cold write serialises on that same claim.
+-- interleave with a cold write, since vector_train holds the table's claim from
+-- its sample to its commit and every cold write serialises on that same claim.
+--
+-- The formula itself is _vec_nearest_expr, shared with vector_train, which scores
+-- the generation it has just trained from its own session: one formula, so a
+-- write and the training can never disagree on a cluster.
+CREATE OR REPLACE FUNCTION coldfront._vec_nearest_expr(p_from text, p_vec_expr text)
+RETURNS text
+LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
+    SELECT format('(SELECT arg_min(c.centroid_id, list_cosine_distance(c.centroid, %s)) FROM %s)',
+                  p_vec_expr, p_from);
+$$;
+
 CREATE OR REPLACE FUNCTION coldfront._vec_list_expr(
     p_schema text, p_table text, p_column text, p_vec_expr text)
 RETURNS text
 LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
-    SELECT format(
-        '(SELECT arg_min(c.centroid_id, list_cosine_distance(c.centroid, %s)) '
-         'FROM pglocal.coldfront.vector_centroids c '
+    SELECT coldfront._vec_nearest_expr(format(
+        'pglocal.coldfront.vector_centroids c '
         'WHERE c.schema_name = %L AND c.table_name = %L AND c.column_name = %L '
           'AND c.generation = (SELECT vc.generation FROM pglocal.coldfront.vector_config vc '
                               'WHERE vc.schema_name = %L AND vc.table_name = %L '
-                                'AND vc.column_name = %L))',
-        p_vec_expr, p_schema, p_table, p_column, p_schema, p_table, p_column);
+                                'AND vc.column_name = %L)',
+        p_schema, p_table, p_column, p_schema, p_table, p_column), p_vec_expr);
 $$;
 
 -- The cluster columns for an Iceberg ref, quoted and comma-joined in schema order.

@@ -337,9 +337,9 @@ ERROR:  coldfront: "public.orders" is adopted read-only
 HINT:  Release it with coldfront.release_iceberg_table() and adopt again with p_writable => true to arm INSERT/UPDATE/DELETE.
 ```
 
-Reads never consult the flag. `vector_train()`, `vector_assign()` and
-`drop_iceberg_table()` refuse a read-only relation too, since each
-rewrites or destroys the Iceberg table. The archiver and
+Reads never consult the flag. `vector_train()` and `drop_iceberg_table()`
+refuse a read-only relation too, since each rewrites or destroys the Iceberg
+table. The archiver and
 `create_iceberg_table()` set the flag; adoption defaults it to false.
 
 ### One relation per Iceberg table
