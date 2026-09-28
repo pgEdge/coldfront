@@ -3,6 +3,7 @@ package config
 import (
 	"os"
 	"path/filepath"
+	"syscall"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -564,4 +565,162 @@ archiver:
 	_, err := Load(writeConfig(t, cfg))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "lakekeeper_endpoint")
+}
+
+// --- Resolve -----------------------------------------------------------------
+
+func TestResolveExplicitPathWins(t *testing.T) {
+	dir := t.TempDir()
+	named := filepath.Join(dir, "named.yaml")
+	require.NoError(t, os.WriteFile(named, []byte(validConfig), 0o600))
+	t.Setenv("COLDFRONT_CONFIG", filepath.Join(dir, "from-env.yaml"))
+
+	got, err := Resolve(named)
+	require.NoError(t, err)
+	assert.Equal(t, named, got)
+}
+
+func TestResolveExplicitPathMissingIsAnError(t *testing.T) {
+	// Falling through to another file when the operator named one would
+	// silently use different credentials.
+	_, err := Resolve(filepath.Join(t.TempDir(), "absent.yaml"))
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "absent.yaml")
+}
+
+func TestResolveUsesEnvWhenNoFlag(t *testing.T) {
+	dir := t.TempDir()
+	env := filepath.Join(dir, "from-env.yaml")
+	require.NoError(t, os.WriteFile(env, []byte(validConfig), 0o600))
+	t.Setenv("COLDFRONT_CONFIG", env)
+
+	got, err := Resolve("")
+	require.NoError(t, err)
+	assert.Equal(t, env, got)
+}
+
+func TestResolveEnvMissingIsAnError(t *testing.T) {
+	t.Setenv("COLDFRONT_CONFIG", filepath.Join(t.TempDir(), "absent.yaml"))
+
+	_, err := Resolve("")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "COLDFRONT_CONFIG")
+}
+
+func TestResolveFallsBackToWorkingDirectory(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(validConfig), 0o600))
+	t.Setenv("COLDFRONT_CONFIG", "")
+	t.Chdir(dir)
+
+	got, err := Resolve("")
+	require.NoError(t, err)
+	assert.Equal(t, "config.yaml", got)
+}
+
+func TestResolveFallsBackToPackagedPath(t *testing.T) {
+	// The packaged location is the last resort, so an RPM install needs no
+	// -config flag. Redirected here because the real path is root-owned.
+	dir := t.TempDir()
+	packaged := filepath.Join(dir, "etc", "pgedge", "coldfront", "config.yaml")
+	require.NoError(t, os.MkdirAll(filepath.Dir(packaged), 0o755))
+	require.NoError(t, os.WriteFile(packaged, []byte(validConfig), 0o600))
+
+	t.Setenv("COLDFRONT_CONFIG", "")
+	t.Chdir(t.TempDir()) // no ./config.yaml here
+	packagedConfigPath = packaged
+	t.Cleanup(func() { packagedConfigPath = defaultPackagedConfigPath })
+
+	got, err := Resolve("")
+	require.NoError(t, err)
+	assert.Equal(t, packaged, got)
+}
+
+func TestResolveNothingFoundListsWhatWasTried(t *testing.T) {
+	t.Setenv("COLDFRONT_CONFIG", "")
+	t.Chdir(t.TempDir())
+	packagedConfigPath = filepath.Join(t.TempDir(), "absent.yaml")
+	t.Cleanup(func() { packagedConfigPath = defaultPackagedConfigPath })
+
+	_, err := Resolve("")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "config.yaml")
+	assert.Contains(t, err.Error(), "COLDFRONT_CONFIG")
+}
+
+func TestResolveIgnoresADirectory(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.MkdirAll(filepath.Join(dir, "config.yaml"), 0o755))
+	t.Setenv("COLDFRONT_CONFIG", "")
+	t.Chdir(dir)
+	packagedConfigPath = filepath.Join(t.TempDir(), "absent.yaml")
+	t.Cleanup(func() { packagedConfigPath = defaultPackagedConfigPath })
+
+	_, err := Resolve("")
+	require.Error(t, err)
+}
+
+func TestLoadDefaultResolvesThenLoads(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(validConfig), 0o600))
+	t.Setenv("COLDFRONT_CONFIG", "")
+	t.Chdir(dir)
+
+	cfg, err := LoadDefault("")
+	require.NoError(t, err)
+	assert.Equal(t, "wh", cfg.Iceberg.Warehouse)
+}
+
+func TestResolveRejectsANonRegularFile(t *testing.T) {
+	// A FIFO would make Load block forever; a device file would read without
+	// end. Only a regular file is a config.
+	dir := t.TempDir()
+	fifo := filepath.Join(dir, "config.yaml")
+	require.NoError(t, syscall.Mkfifo(fifo, 0o600))
+	t.Setenv("COLDFRONT_CONFIG", "")
+	t.Chdir(dir)
+	packagedConfigPath = filepath.Join(t.TempDir(), "absent.yaml")
+	t.Cleanup(func() { packagedConfigPath = defaultPackagedConfigPath })
+
+	_, err := Resolve("")
+	require.Error(t, err)
+	assert.ErrorIs(t, err, ErrNoConfig)
+}
+
+func TestResolveFallsThroughAnUnreadableCandidate(t *testing.T) {
+	// An unreadable ./config.yaml must not shadow the packaged path.
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "config.yaml"), []byte(validConfig), 0o000))
+	packaged := filepath.Join(t.TempDir(), "config.yaml")
+	require.NoError(t, os.WriteFile(packaged, []byte(validConfig), 0o600))
+	t.Setenv("COLDFRONT_CONFIG", "")
+	t.Chdir(dir)
+	packagedConfigPath = packaged
+	t.Cleanup(func() { packagedConfigPath = defaultPackagedConfigPath })
+
+	got, err := Resolve("")
+	require.NoError(t, err)
+	assert.Equal(t, packaged, got)
+}
+
+func TestResolveNotFoundIsErrNoConfig(t *testing.T) {
+	// Callers distinguish "nothing configured" from "configured but broken".
+	t.Setenv("COLDFRONT_CONFIG", "")
+	t.Chdir(t.TempDir())
+	packagedConfigPath = filepath.Join(t.TempDir(), "absent.yaml")
+	t.Cleanup(func() { packagedConfigPath = defaultPackagedConfigPath })
+
+	_, err := Resolve("")
+	assert.ErrorIs(t, err, ErrNoConfig)
+}
+
+func TestLoadDefaultParseErrorIsNotErrNoConfig(t *testing.T) {
+	dir := t.TempDir()
+	require.NoError(t, os.WriteFile(filepath.Join(dir, "config.yaml"), []byte("postgres: [oops"), 0o600))
+	t.Setenv("COLDFRONT_CONFIG", "")
+	t.Chdir(dir)
+
+	_, err := LoadDefault("")
+	require.Error(t, err)
+	assert.NotErrorIs(t, err, ErrNoConfig)
 }

@@ -102,12 +102,20 @@ func addConn(fs *flag.FlagSet) func(context.Context) (*pgx.Conn, error) {
 	cfgPath := fs.String("config", "", "path to the deployment YAML; its postgres.dsn is used if --dsn is unset")
 	return func(ctx context.Context) (*pgx.Conn, error) {
 		d := *dsn
-		if d == "" && *cfgPath != "" {
-			cfg, err := config.Load(*cfgPath)
-			if err != nil {
-				return nil, fmt.Errorf("read --config: %w", err)
+		if d == "" {
+			// With no --dsn, take the DSN from a config file. An explicitly
+			// named one must load; otherwise discovery is best-effort so the
+			// "pass --dsn or --config" message below still describes the
+			// problem when there is simply no configuration anywhere.
+			cfg, err := config.LoadDefault(*cfgPath)
+			switch {
+			case err == nil:
+				d = cfg.Postgres.DSN
+			case !errors.Is(err, config.ErrNoConfig):
+				// A config was found but is unusable. Reporting "pass --dsn or
+				// --config" here would hide a parse or validation failure.
+				return nil, fmt.Errorf("read config: %w", err)
 			}
-			d = cfg.Postgres.DSN
 		}
 		if d == "" {
 			return nil, fmt.Errorf("a connection is required: pass --dsn or --config")
@@ -892,7 +900,7 @@ EXAMPLES:
 // runImport seeds partition_config from a deployment YAML's archiver.tables list.
 func runImport(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("import", flag.ContinueOnError)
-	cfgPath := fs.String("config", "", "deployment YAML to import: its archiver.tables become partition_config rows (required)")
+	cfgPath := fs.String("config", "", "deployment YAML to import: its archiver.tables become partition_config rows (default: $COLDFRONT_CONFIG, ./config.yaml, then /etc/pgedge/coldfront/config.yaml)")
 	dsn := fs.String("dsn", "", "connection DSN (default: postgres.dsn from --config)")
 	printSQL := fs.Bool("print-sql", false, "print the INSERTs instead of running them")
 	dryRun := fs.Bool("dry-run", false, "validate/parse but make no changes")
@@ -912,16 +920,13 @@ EXAMPLES:
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if *cfgPath == "" {
-		fs.Usage()
-		return fmt.Errorf("--config is required (the YAML to import)")
-	}
-	cfg, err := config.Load(*cfgPath)
+	cfg, err := config.LoadDefault(*cfgPath)
 	if err != nil {
+		fs.Usage()
 		return fmt.Errorf("read --config: %w", err)
 	}
 	if len(cfg.Archiver.Tables) == 0 {
-		return fmt.Errorf("no archiver.tables in %s", *cfgPath)
+		return fmt.Errorf("no archiver.tables in the config")
 	}
 	if *printSQL {
 		for _, t := range cfg.Archiver.Tables {

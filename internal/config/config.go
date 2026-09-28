@@ -1,6 +1,7 @@
 package config
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -109,6 +110,84 @@ type TableConfig struct {
 // auto-maintained beneath each level-1 value.
 type SubPartitionConfig struct {
 	ValuesSource string `yaml:"values_source"`
+}
+
+// ErrNoConfig reports that no config file was found. A caller that can proceed
+// without one -- the CLI's --dsn path -- tests for it with errors.Is; any other
+// error means a candidate existed but could not be used, which must not be
+// mistaken for an absent config.
+var ErrNoConfig = errors.New("no config file found")
+
+// defaultPackagedConfigPath is where pgedge-coldfront installs its config, and
+// the last place Resolve looks -- so an RPM install needs no -config flag.
+const defaultPackagedConfigPath = "/etc/pgedge/coldfront/config.yaml"
+
+// packagedConfigPath is a variable only so tests can redirect it; the real path
+// is root-owned.
+var packagedConfigPath = defaultPackagedConfigPath
+
+// Resolve reports which config file to read, given the -config flag's value
+// ("" when the flag was not passed).
+//
+// A file the operator named -- via -config or COLDFRONT_CONFIG -- must exist.
+// Falling through to a different file in that case would silently run against
+// the wrong database or object store, so it is an error. Only the implicit
+// chain falls through:
+//
+//	-config  →  $COLDFRONT_CONFIG  →  ./config.yaml  →  /etc/pgedge/coldfront/config.yaml
+func Resolve(flagPath string) (string, error) {
+	if flagPath != "" {
+		if err := readableFile(flagPath); err != nil {
+			return "", fmt.Errorf("config %q: %w", flagPath, err)
+		}
+		return flagPath, nil
+	}
+
+	if env := os.Getenv("COLDFRONT_CONFIG"); env != "" {
+		if err := readableFile(env); err != nil {
+			return "", fmt.Errorf("config %q from COLDFRONT_CONFIG: %w", env, err)
+		}
+		return env, nil
+	}
+
+	implicit := []string{"config.yaml", packagedConfigPath}
+	for _, candidate := range implicit {
+		if readableFile(candidate) == nil {
+			return candidate, nil
+		}
+	}
+
+	return "", fmt.Errorf("%w: pass -config, set COLDFRONT_CONFIG, or create one of %s",
+		ErrNoConfig, strings.Join(implicit, " or "))
+}
+
+// readableFile reports whether path is a regular file that can be opened.
+// Anything else is not a config: a directory cannot be parsed, a FIFO would
+// block Load forever, and a device file would read without end. Opening it
+// here also lets an unreadable candidate fall through to the next one rather
+// than shadowing it.
+func readableFile(path string) error {
+	info, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf("not a regular file")
+	}
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	return f.Close()
+}
+
+// LoadDefault resolves the config file (see Resolve) and loads it.
+func LoadDefault(flagPath string) (*Config, error) {
+	path, err := Resolve(flagPath)
+	if err != nil {
+		return nil, err
+	}
+	return Load(path)
 }
 
 // Load reads a YAML config file from path, applies defaults, and validates
