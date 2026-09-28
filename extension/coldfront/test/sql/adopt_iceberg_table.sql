@@ -159,15 +159,14 @@ SELECT coldfront.release_iceberg_table('public', 'events');
 -- Plain DROP VIEW stays blocked, and the hint names both exits.
 DROP VIEW public.events;
 
--- Training and assigning both rewrite the cold table, so both refuse a relation
--- adopted read-only, ahead of any DuckDB statement.
+-- Training rewrites the cold table, so it refuses a relation adopted read-only,
+-- ahead of any DuckDB statement.
 INSERT INTO coldfront.tiered_views(schema_name, relname, iceberg_table, is_iceberg_only, vec_columns, is_writable)
 VALUES ('public', 'chunks', 'ice.lake.chunks', true, ARRAY['embedding'], false);
 INSERT INTO coldfront.vector_config (schema_name, table_name, column_name, nlist, nprobe, generation)
 VALUES ('public', 'chunks', 'embedding', 2, 1, 1);
 
 CALL coldfront.vector_train('public', 'chunks', 'embedding');
-CALL coldfront.vector_assign('public', 'chunks', 'embedding');
 
 -- Cleanup.
 DELETE FROM coldfront.vector_config WHERE table_name = 'chunks';

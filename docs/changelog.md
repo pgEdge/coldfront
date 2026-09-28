@@ -16,8 +16,11 @@ and this project adheres to
   interface, and writes through the view work unchanged on both tiers. A
   table may carry several vector columns, with the Iceberg file layout
   sorted for one of them.
-- `coldfront.vector_train` clusters a vector column with k-means. Every cold
-  write assigns each row to its nearest cluster, the compactor keeps that
+- `coldfront.vector_train` clusters a vector column with k-means and assigns
+  the cold rows to the clusters; a retrain without a new `nlist` keeps each
+  centroid's identity and rewrites only the rows whose nearest centroid
+  changed. Every cold write assigns each row to its nearest cluster, the
+  compactor keeps that
   layout, and a nearest-neighbour search through the view reads the nearest
   clusters, `nlist` and `nprobe` being per-column settings, plus the rows
   that carry no assignment. Grouped, aggregated, windowed and `DISTINCT`

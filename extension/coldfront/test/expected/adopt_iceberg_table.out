@@ -287,20 +287,16 @@ CONTEXT:  PL/pgSQL function release_iceberg_table(text,text) line 17 at RAISE
 DROP VIEW public.events;
 ERROR:  coldfront: cannot DROP "public.events": it has a cold tier in Iceberg
 HINT:  Blocked by design: the Iceberg cold tier would be orphaned. Use coldfront.drop_iceberg_table() to remove the table and its cold tier, or coldfront.release_iceberg_table() to hand an adopted table back with its Iceberg table intact.
--- Training and assigning both rewrite the cold table, so both refuse a relation
--- adopted read-only, ahead of any DuckDB statement.
+-- Training rewrites the cold table, so it refuses a relation adopted read-only,
+-- ahead of any DuckDB statement.
 INSERT INTO coldfront.tiered_views(schema_name, relname, iceberg_table, is_iceberg_only, vec_columns, is_writable)
 VALUES ('public', 'chunks', 'ice.lake.chunks', true, ARRAY['embedding'], false);
 INSERT INTO coldfront.vector_config (schema_name, table_name, column_name, nlist, nprobe, generation)
 VALUES ('public', 'chunks', 'embedding', 2, 1, 1);
 CALL coldfront.vector_train('public', 'chunks', 'embedding');
 ERROR:  coldfront.vector_train: "public.chunks" is adopted read-only
-HINT:  Training stores a centroid generation the assignment then writes into the cold table. Release it and adopt again with p_writable => true.
-CONTEXT:  PL/pgSQL function vector_train(text,text,text,integer,integer,integer) line 21 at RAISE
-CALL coldfront.vector_assign('public', 'chunks', 'embedding');
-ERROR:  coldfront.vector_assign: "public.chunks" is adopted read-only
-HINT:  Assigning rewrites every cold row. Release it and adopt again with p_writable => true.
-CONTEXT:  PL/pgSQL function vector_assign(text,text,text) line 21 at RAISE
+HINT:  Training rewrites the cold rows. Release it and adopt again with p_writable => true.
+CONTEXT:  PL/pgSQL function vector_train(text,text,text,integer,integer,integer) line 23 at RAISE
 -- Cleanup.
 DELETE FROM coldfront.vector_config WHERE table_name = 'chunks';
 DELETE FROM coldfront.tiered_views;

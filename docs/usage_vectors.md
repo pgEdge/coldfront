@@ -106,24 +106,21 @@ CALL coldfront.vector_train('public', 'chunks', 'embedding');
 ```
 
 `CALL`, not `SELECT`: this is a procedure. It samples the cold tier, trains
-`nlist` centroids, and stores them as a new generation. Every cold write after it
-stamps the row's nearest cluster in the same statement, on every write path, and a
-retrain does not require regenerating anything.
+`nlist` centroids, stores them as a new generation, and assigns every cold row to
+its nearest centroid, rewriting the rows whose cluster changed. Every cold write
+after it assigns the row in the same statement, on every write path.
 
-**Rows already in the cold tier are not clustered by training.** Training only
-writes the centroids; the rows that predate it carry no cluster, and every search
-reads all of them. If you are clustering a column that already has cold data, give
-those rows a cluster and then compact:
+Compact afterwards. The assignment leaves a delete marker per rewritten row and
+those rows in rewrite order; compaction is what puts them in cluster order and
+clears the markers. Without it the rows are assigned but a search still reads
+more of the table than it needs to.
 
-```sql
-CALL coldfront.vector_assign('public', 'chunks', 'embedding');
-```
-
-That rewrites the unassigned rows in one operation, serialised like any other cold
-write. Compacting afterwards is what puts them in cluster order and clears the
-delete markers the rewrite leaves; without it the rows are assigned but a search
-still reads more of the table than it needs to. On a column clustered before any
-data arrives there is nothing to assign and nothing to run.
+**Retraining.** Call `vector_train` again when the data has grown or you want a
+different `nlist`. Without `p_nlist`, the new centroids start from the current
+ones and keep their identities, so only the rows whose nearest centroid changed
+are rewritten; with a new `nlist`, every row is. Either way the centroids and
+the assignments change together, so a search is never wrong in between; it is
+only slower until the next compaction.
 
 Choosing `nlist` is a floor rather than a formula: aim for at least one row
 group's worth of rows per cluster, roughly 2048. Below that, extra clusters stop
@@ -233,7 +230,7 @@ holding that number up, and says which:
 | What it says | What to do |
 |---|---|
 | no trained generation | `CALL coldfront.vector_train(...)` |
-| over half the rows predate training | `CALL coldfront.vector_assign(...)`, then compact |
+| over half the rows have no assignment | rows another engine appended straight to Iceberg carry none; `CALL coldfront.vector_train(...)` assigns them, then compact |
 | over half the clusters hold less than one row group | retrain with a smaller `nlist` |
 | the largest clusters hold over 4x the median | expect some queries to be slower than `probe_fraction` suggests; uneven clusters are mostly a property of the embeddings and a retrain rarely changes it |
 
