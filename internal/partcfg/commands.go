@@ -916,7 +916,7 @@ EXAMPLES:
 		fs.Usage()
 		return fmt.Errorf("--config is required (the YAML to import)")
 	}
-	cfg, err := config.Load(*cfgPath)
+	cfg, err := config.LoadTables(*cfgPath)
 	if err != nil {
 		return fmt.Errorf("read --config: %w", err)
 	}

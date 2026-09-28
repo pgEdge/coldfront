@@ -4093,6 +4093,47 @@ story_partitioner_remove() {
     q "$HOST" "DROP SCHEMA rmtest CASCADE;" >/dev/null 2>&1
 }
 
+story_partitioner_import_export() {
+    step "TC-194: import registers a YAML's tables; export writes them back as YAML that imports again"
+    local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
+    local row="SELECT partition_period || '|' || partition_column || '|' || hot_period::text || '|' || retention_period::text FROM coldfront.partition_config WHERE schema_name='impexp' AND table_name='logs';"
+    q "$HOST" "CREATE SCHEMA IF NOT EXISTS impexp;
+               CREATE TABLE IF NOT EXISTS impexp.logs (id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL, PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);" >/dev/null
+    cat >"$TMPD/impexp.yaml" <<'EOF'
+archiver:
+  tables:
+    - source_schema: impexp
+      source_table: logs
+      partition_column: ts
+      partition_period: monthly
+      hot_period: 2 months
+      retention_period: 12 months
+EOF
+    if "$PARTITIONER" import --config "$TMPD/impexp.yaml" --dsn "$dsn" >"$TMPD/impexp.log" 2>&1; then
+        pass "TC-194: import succeeded"
+    else
+        fail "TC-194: import failed: see $TMPD/impexp.log"; tail -5 "$TMPD/impexp.log"
+        q "$HOST" "DROP SCHEMA impexp CASCADE;" >/dev/null 2>&1; return
+    fi
+    assert_eq "TC-194: import registered the table with its periods" "monthly|ts|2 mons|1 year" "$(q "$HOST" "$row")"
+    "$PARTITIONER" export --dsn "$dsn" >"$TMPD/impexp.export.yaml" 2>>"$TMPD/impexp.log"
+    # The export lists every active table; keep only this table's list item.
+    local block
+    block="$(awk '/^ *- /{if (blk ~ /source_schema: impexp/) print blk; blk=""} {blk = blk $0 "\n"} END{if (blk ~ /source_schema: impexp/) print blk}' "$TMPD/impexp.export.yaml")"
+    assert_contains "TC-194: export carries the table's period" "partition_period: monthly" "$block"
+    assert_contains "TC-194: export carries the table's retention" "retention_period: 1 year" "$block"
+    { head -2 "$TMPD/impexp.export.yaml"; printf '%s\n' "$block"; } >"$TMPD/impexp.roundtrip.yaml"
+    "$PARTITIONER" remove --dsn "$dsn" --schema impexp --table logs >>"$TMPD/impexp.log" 2>&1
+    assert_eq "TC-194: registration gone before the re-import" "" "$(q "$HOST" "$row")"
+    if "$PARTITIONER" import --config "$TMPD/impexp.roundtrip.yaml" --dsn "$dsn" >>"$TMPD/impexp.log" 2>&1; then
+        pass "TC-194: the exported YAML imports again"
+    else
+        fail "TC-194: re-import of the exported YAML failed: see $TMPD/impexp.log"; tail -5 "$TMPD/impexp.log"
+    fi
+    assert_eq "TC-194: the re-imported registration matches" "monthly|ts|2 mons|1 year" "$(q "$HOST" "$row")"
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE schema_name='impexp'; DROP SCHEMA impexp CASCADE;" >/dev/null 2>&1
+}
+
 # ───────────────────────────────────────────────────────────────────────────
 # Story: the standalone partition manager, on stock PostgreSQL. Every other story
 # shares the database story 1 installed pg_duckdb and coldfront into, so nothing
@@ -5936,6 +5977,7 @@ if [ "$MODE" = "tiered" ]; then
     story_partitioner_set_retention    # TC-052: set --retention updates partition_config
     story_partitioner_disable_enable   # TC-053: disable silently excludes; enable restores
     story_partitioner_remove           # TC-054: remove unregisters; table intact
+    story_partitioner_import_export    # TC-194: import loads a YAML; export writes YAML that imports again
     story_partitioner_stock_pg         # TC-151: standalone partitioner on stock PG (no extension)
     story_composite_key_rejected       # TC-071: RANGE (col1, col2) rejected at archive time
     story_iceberg_metadata             # TC-043: cold data confirmed via Parquet metadata

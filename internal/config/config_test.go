@@ -57,6 +57,42 @@ func TestLoad_Defaults(t *testing.T) {
 	assert.Equal(t, 3, cfg.Archiver.Tables[0].FuturePartitions)
 }
 
+func TestLoadTables_TablesOnlyFile(t *testing.T) {
+	path := writeConfig(t, `
+archiver:
+  tables:
+    - source_table: "sales.orders"
+      partition_column: "ts"
+      partition_period: "monthly"
+      hot_period: "2 months"
+      retention_period: "12 months"
+    - source_table: "audit"
+      partition_column: "ts"
+      partition_period: "daily"
+      retention_period: "90 days"
+`)
+	_, err := Load(path)
+	require.ErrorContains(t, err, "postgres.dsn is required")
+	cfg, err := LoadTables(path)
+	require.NoError(t, err)
+	require.Len(t, cfg.Archiver.Tables, 2)
+	assert.Equal(t, "sales", cfg.Archiver.Tables[0].SourceSchema)
+	assert.Equal(t, "orders", cfg.Archiver.Tables[0].SourceTable)
+	assert.Equal(t, 3, cfg.Archiver.Tables[0].FuturePartitions)
+	assert.Equal(t, "public", cfg.Archiver.Tables[1].SourceSchema)
+}
+
+func TestLoadTables_StillValidatesTables(t *testing.T) {
+	_, err := LoadTables(writeConfig(t, `
+archiver:
+  tables:
+    - source_table: "orders"
+      partition_column: "ts"
+      partition_period: "fortnightly"
+`))
+	require.Error(t, err)
+}
+
 func TestLoad_MultipleTables(t *testing.T) {
 	cfg := `
 postgres:

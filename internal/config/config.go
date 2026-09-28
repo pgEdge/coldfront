@@ -115,22 +115,44 @@ type SubPartitionConfig struct {
 // the result. Returns the parsed Config or an error describing the first
 // problem encountered (read, parse, or validation).
 func Load(path string) (*Config, error) {
+	cfg, err := parse(path)
+	if err != nil {
+		return nil, err
+	}
+	if err := cfg.Validate(); err != nil {
+		return nil, err
+	}
+	return cfg, nil
+}
+
+// LoadTables reads a YAML config file for its archiver.tables. Each table is
+// validated on its own terms, tiered when it has a hot_period and partition-only
+// otherwise, and the connection and cold-tier sections are not read, so a file
+// that carries only tables, such as one `export` writes, loads.
+func LoadTables(path string) (*Config, error) {
+	cfg, err := parse(path)
+	if err != nil {
+		return nil, err
+	}
+	for i, t := range cfg.Archiver.Tables {
+		if err := validateTable(t, i, t.HotPeriod != ""); err != nil {
+			return nil, err
+		}
+	}
+	return cfg, nil
+}
+
+// parse reads and unmarshals a YAML config file and applies the defaults.
+func parse(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
 	if err != nil {
 		return nil, fmt.Errorf("read config: %w", err)
 	}
-
 	cfg := &Config{}
 	if err := yaml.Unmarshal(data, cfg); err != nil {
 		return nil, fmt.Errorf("parse config: %w", err)
 	}
-
 	applyDefaults(cfg)
-
-	if err := cfg.Validate(); err != nil {
-		return nil, err
-	}
-
 	return cfg, nil
 }
 

@@ -105,6 +105,10 @@ and this project adheres to
   installed side by side: each claimed the same build-id link for the
   bundled `libduckdb.so`. The RPMs carry no build-id links and the DEBs no
   longer produce dbgsym packages.
+- `partitioner import` refused a file without a `postgres` section, which
+  is what `export` writes, even with `--dsn` given. A tables-only file now
+  imports, each table validated as tiered when it has a `hot_period` and as
+  partition-only otherwise.
 - Backends that shared one `duckdb.temporary_directory` overwrote each
   other's spill files, since DuckDB numbers them from zero per instance, and
   a backend whose DuckDB instance ended deleted its peers' spills. Each
