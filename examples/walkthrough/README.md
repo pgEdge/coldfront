@@ -112,6 +112,9 @@ Environment variables:
   `tiered` (default), `decoupled`, `partitioner`, or `distributed`
 - `WALKTHROUGH_ROWS`: row count for the tiered demo in non-interactive
   mode (default: `1000000`)
+- `WALKTHROUGH_TYPE_DELAY`: seconds between characters when the guide shows
+  a command (default `0`, printed at once); `0.03` gives a recording typed
+  commands
 
 ### runner.sh
 

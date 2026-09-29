@@ -43,9 +43,24 @@ explain() {
   echo -e "$1"
 }
 
+# type_out <text>: print <text> one character at a time, WALKTHROUGH_TYPE_DELAY
+# seconds apart (default 0: all at once). Every command the guide shows goes
+# through it, so a recording can have the commands typed.
+TYPE_DELAY="${WALKTHROUGH_TYPE_DELAY:-0}"
+type_out() {
+  local s="$1" i
+  if [ "$TYPE_DELAY" = 0 ]; then printf '%s' "$s"; return; fi
+  for (( i=0; i<${#s}; i++ )); do
+    printf '%s' "${s:i:1}"
+    sleep "$TYPE_DELAY"
+  done
+}
+
 show_cmd() {
   echo ""
-  echo -e "${ORANGE}\$ $1${RESET}"
+  printf '%b' "${ORANGE}\$ "
+  type_out "$1"
+  printf '%b\n' "${RESET}"
 }
 
 # --- Interactive helpers ---

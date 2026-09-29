@@ -66,7 +66,9 @@ show_query() {
     local q
     q=$(printf '%s' "$1" | tr '\n' ' ' | tr -s ' ' | sed 's/^ //;s/ *$//')
     echo ""
-    echo -e "${ORANGE}\$ psql -c \"${q}\"${RESET}"
+    printf '%b' "${ORANGE}\$ psql -c \""
+    type_out "$q"
+    printf '%b\n' "\"${RESET}"
     echo -e "${DIM}─── result ─────────────────────────────────────────────────${RESET}"
     PGPASSWORD=coldfront psql -h localhost -p "$PG_PORT" -U coldfront -d coldfront -c "$1"
     echo -e "${DIM}────────────────────────────────────────────────────────────${RESET}"
@@ -242,7 +244,9 @@ mshow() {
     local label="$1" port="$2" q
     q=$(printf '%s' "$3" | tr '\n' ' ' | tr -s ' ' | sed 's/^ //;s/ *$//')
     echo ""
-    echo -e "${ORANGE}\$ psql (${label}) -c \"${q}\"${RESET}"
+    printf '%b' "${ORANGE}\$ psql (${label}) -c \""
+    type_out "$q"
+    printf '%b\n' "\"${RESET}"
     echo -e "${DIM}─── result (${label}) ──────────────────────────────────────${RESET}"
     PGPASSWORD=coldfront psql -h localhost -p "$port" -U coldfront -d coldfront -c "$3"
     echo -e "${DIM}────────────────────────────────────────────────────────────${RESET}"
