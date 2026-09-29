@@ -16,7 +16,7 @@ LK_URL="http://localhost:${LK_PORT}"
 # metadata lookup, and the purge helper from drifting apart.
 LK_NS="public"
 
-# Mesh (Demo 4) — a separate 2-node stack, brought up on demand. Ports are picked
+# Mesh (Demo 4): a separate 2-node stack, brought up on demand. Ports are picked
 # lazily by detect_mesh_ports() from a base that avoids the single-node stack, so
 # the two never contend even mid-switch. ACTIVE_STACK tracks which stack is up
 # (single | mesh | none) so the menu only pays a switch on an actual transition.
@@ -35,6 +35,9 @@ export PGPASSWORD=coldfront
 # Silence pg_duckdb's "NOTICE: result: Success" chatter on every cross-tier query
 # so the walkthrough output stays clean. Applies to all psql invocations below.
 export PGOPTIONS='-c client_min_messages=warning'
+# psql pages a result wider or taller than the terminal (the Parquet paths are),
+# which would park a demo on a keypress; print everything straight through.
+export PSQL_PAGER=cat
 
 cleanup() { stop_spinner; }
 trap cleanup EXIT
@@ -42,7 +45,7 @@ trap cleanup EXIT
 pg()       { PGPASSWORD=coldfront psql -h localhost -p "$PG_PORT" -U coldfront -d coldfront -tAX -c "$1"; }
 psql_file(){ PGPASSWORD=coldfront psql -h localhost -p "$PG_PORT" -U coldfront -d coldfront -v ON_ERROR_STOP=1; }
 
-# heap_size <relname> — pretty total heap of a relation INCLUDING its partitions.
+# heap_size <relname>: pretty total heap of a relation INCLUDING its partitions.
 # pg_total_relation_size() on a partitioned parent counts only the (empty) parent,
 # so for `events`/`_events` (range-partitioned) it reports 0; sum the partition
 # tree instead. Works for plain tables too (the tree subquery is then empty).
@@ -53,7 +56,7 @@ heap_size() {
                       FROM pg_partition_tree('$1') WHERE relid <> '$1'::regclass), 0));"
 }
 
-# show_query — show the SQL, then run it and print the result as an aligned psql
+# show_query: show the SQL, then run it and print the result as an aligned psql
 # table, framed, for the viewer to read. The query MUST be shown before its result
 # so the viewer knows what produced it. Use this for anything shown on screen.
 # (pg() stays -tAX, only for values captured into shell variables.)
@@ -70,22 +73,23 @@ show_query() {
     echo ""
 }
 
-# _iceberg_meta_loc <table_name> — echo the table's metadata.json S3 path from the
-# Lakekeeper catalog (warehouse id → GET …/catalog/v1/<wh_id>/namespaces/<LK_NS>/
-# tables/<table_name> → metadata-location). Empty string if it can't be resolved.
-# Shared by show_parquet_files and show_parquet_contents. Consumes LK_URL, LK_NS.
+# _iceberg_meta_loc <table_name> [lk_url]: echo the table's metadata.json S3 path
+# from the Lakekeeper catalog at lk_url, default LK_URL (warehouse id → GET
+# …/catalog/v1/<wh_id>/namespaces/<LK_NS>/tables/<table_name> → metadata-location).
+# Empty string if it can't be resolved. Shared by show_parquet_files,
+# show_parquet_contents and the Distributed demo's snapshot history. Consumes LK_NS.
 _iceberg_meta_loc() {
-    local table_name="$1" wh_id
-    wh_id=$(curl -s "${LK_URL}/management/v1/warehouse" \
+    local table_name="$1" lk_url="${2:-$LK_URL}" wh_id
+    wh_id=$(curl -s "${lk_url}/management/v1/warehouse" \
         | grep -o '"warehouse-id":"[^"]*"' | head -1 | cut -d'"' -f4)
-    curl -s "${LK_URL}/catalog/v1/${wh_id}/namespaces/${LK_NS}/tables/${table_name}" \
+    curl -s "${lk_url}/catalog/v1/${wh_id}/namespaces/${LK_NS}/tables/${table_name}" \
         -H 'accept: application/json' \
         | grep -o '"metadata-location":"[^"]*"' | head -1 | cut -d'"' -f4
 }
 
-# show_parquet_files <table_name> — list the table's .parquet data files via
+# show_parquet_files <table_name>: list the table's .parquet data files via
 # iceberg_metadata(). On a failed resolution prints a warn and returns non-zero
-# (non-fatal — callers continue). Consumes _iceberg_meta_loc, show_query, warn.
+# (non-fatal, callers continue). Consumes _iceberg_meta_loc, show_query, warn.
 show_parquet_files() {
     local meta_loc; meta_loc=$(_iceberg_meta_loc "$1")
     if [ -n "$meta_loc" ]; then
@@ -97,7 +101,7 @@ show_parquet_files() {
     fi
 }
 
-# show_parquet_contents <table_name> — the physical proof: read ONE actual data file
+# show_parquet_contents <table_name>: the physical proof: read ONE actual data file
 # straight from object storage with read_parquet(), bypassing the Iceberg catalog /
 # version layer (so no version-hint error). pg_duckdb needs the r['col'] alias form.
 # We read a NON-delete data file: raw reads ignore merge-on-read delete files, so this
@@ -171,12 +175,12 @@ detect_ports() {
     LK_URL="http://localhost:${lk_picked}"
 }
 
-# db_unreachable_msg — print the standard "database is unreachable" diagnostic.
+# db_unreachable_msg: print the standard "database is unreachable" diagnostic.
 # Used whenever a shown step or the liveness probe can't reach Postgres, so a
-# dead/unreachable db surfaces as clear guidance instead of a raw psql
+# dead/unreachable db reads as clear guidance instead of a raw psql
 # "connection refused" that the user would otherwise Enter straight past.
 db_unreachable_msg() {
-    error "The database is unreachable — the walkthrough can't continue."
+    error "The database is unreachable: the walkthrough can't continue."
     warn  "  Check that:"
     warn  "    - Docker is running"
     warn  "    - the stack is up and healthy:      docker compose ps"
@@ -184,7 +188,7 @@ db_unreachable_msg() {
     warn  "  Then re-run the walkthrough."
 }
 
-# require_db_reachable — lightweight liveness gate: a short bounded wait for
+# require_db_reachable: lightweight liveness gate: a short bounded wait for
 # Postgres to answer SELECT 1. Returns 0 if it answers within the window, else
 # prints the unreachable diagnostic and returns 1 so callers return to the menu
 # instead of marching into raw connection-refused errors. ~10s max (5 x 2s).
@@ -198,9 +202,9 @@ require_db_reachable() {
     return 1
 }
 
-# run_sql_shown — explain what the command does FIRST, then show + run it.
+# run_sql_shown: explain what the command does FIRST, then show + run it.
 # The "why" MUST print before the command/output so the viewer knows what they're
-# about to run before hitting Enter — never after. Returns non-zero if the SQL
+# about to run before hitting Enter, never after. Returns non-zero if the SQL
 # fails (e.g. the db went away mid-demo): callers MUST check and stop rather than
 # let the user Enter-through a failed step into raw connection-refused noise.
 run_sql_shown() {
@@ -228,12 +232,12 @@ run_sql_shown() {
 # ── Mesh (Demo 4) node-addressed helpers ────────────────────────────────────
 # The single-node helpers above are hardwired to $PG_PORT. The Distributed demo
 # drives TWO nodes, so these siblings take a node label + host port and PRINT the
-# node the query ran on — the whole point is showing "this ran on db2".
+# node the query ran on: the whole point is showing "this ran on db2".
 
-# mpg <port> <sql> — value capture against a mesh node by host port (like pg()).
+# mpg <port> <sql>: value capture against a mesh node by host port (like pg()).
 mpg() { PGPASSWORD=coldfront psql -h localhost -p "$1" -U coldfront -d coldfront -tAX -c "$2"; }
 
-# mshow <label> <port> <sql> — show the SQL + framed result, labelled by node.
+# mshow <label> <port> <sql>: show the SQL + framed result, labelled by node.
 mshow() {
     local label="$1" port="$2" q
     q=$(printf '%s' "$3" | tr '\n' ' ' | tr -s ' ' | sed 's/^ //;s/ *$//')
@@ -245,7 +249,7 @@ mshow() {
     echo ""
 }
 
-# mrun <label> <port> <sql> <why> — explain-first, then show + run a mutation on a
+# mrun <label> <port> <sql> <why>: explain-first, then show + run a mutation on a
 # named node. Mirrors run_sql_shown's contract (why prints BEFORE the command;
 # non-zero return on failure so callers stop instead of Enter-through errors).
 mrun() {
@@ -270,12 +274,65 @@ mrun() {
     fi
 }
 
-# coldfront_installed — true once both extensions exist in this database.
+# wait_for_value <port> <sql> <want> <what>: poll a mesh node with mpg every 100 ms
+# (up to 15 s) until <sql> returns <want>. Replication is asynchronous, so a claim,
+# an ack or a release reaches the peer a few ms after the origin. On a timeout it
+# reports <what>; in NONINTERACTIVE mode that ends the run, the proof having failed.
+wait_for_value() {
+    local port="$1" sql="$2" want="$3" what="$4" i
+    for (( i=0; i<150; i++ )); do
+        [ "$(mpg "$port" "$sql" 2>/dev/null)" = "$want" ] && return 0
+        sleep 0.1
+    done
+    error "$what"
+    [ "$NONINTERACTIVE" = 1 ] && { $MESH_COMPOSE logs db1 db2 | tail -30; exit 1; }
+    return 1
+}
+
+# hold_cold_write <port> <sql>: run <sql> inside a transaction on a mesh node and
+# keep that transaction open, so the bakery rows the write created stay readable
+# from other sessions until release_cold_write commits it. The session is a
+# background psql fed from a here-document: psql runs each \! synchronously, so
+# marker files under HELD_DIR sequence the two processes (no bash 4 needed).
+HELD_DIR=""; HELD_PID=""
+hold_cold_write() {
+    local port="$1" sql="$2" i
+    HELD_DIR=$(mktemp -d)
+    PGPASSWORD=coldfront psql -h localhost -p "$port" -U coldfront -d coldfront \
+        -v ON_ERROR_STOP=1 -q >"$HELD_DIR/log" 2>&1 <<EOF &
+BEGIN;
+$sql
+\\! touch "$HELD_DIR/inserted"
+\\! until [ -f "$HELD_DIR/commit" ]; do sleep 0.2; done
+COMMIT;
+EOF
+    HELD_PID=$!
+    for (( i=0; i<150; i++ )); do
+        [ -f "$HELD_DIR/inserted" ] && return 0
+        kill -0 "$HELD_PID" 2>/dev/null || break
+        sleep 0.2
+    done
+    error "The held write did not complete its INSERT: $(tail -3 "$HELD_DIR/log" 2>/dev/null)"
+    release_cold_write >/dev/null 2>&1
+    return 1
+}
+
+# release_cold_write: COMMIT the transaction hold_cold_write left open and wait for
+# that session to exit. Returns psql's exit status.
+release_cold_write() {
+    local rc
+    touch "$HELD_DIR/commit"
+    wait "$HELD_PID"; rc=$?
+    rm -rf "$HELD_DIR"; HELD_DIR=""; HELD_PID=""
+    return "$rc"
+}
+
+# coldfront_installed: true once both extensions exist in this database.
 coldfront_installed() {
     [ "$(pg "SELECT count(*) FROM pg_extension WHERE extname IN ('pg_duckdb','coldfront');")" = "2" ]
 }
 
-# ensure_coldfront_setup [shown] — idempotently install ColdFront onto the running
+# ensure_coldfront_setup [shown]: idempotently install ColdFront onto the running
 # database: the two extensions + the cold-store secret. Pass "shown" to narrate each
 # command (the tiered demo does this as Steps 4-5); omit to run silently (the other
 # demos just need ColdFront present). Safe to call repeatedly.
@@ -286,10 +343,10 @@ ensure_coldfront_setup() {
         # dead/unreachable stack yields a clear diagnostic, not raw psql errors.
         require_db_reachable || return 1
 
-        # CREATE EXTENSION and set_storage_secret return no rows / void — showing their
+        # CREATE EXTENSION and set_storage_secret return no rows / void, showing their
         # raw output is a blank box. So we run them, then show a CONFIRMATION query
         # (installed extensions / the stored cold-store target) as the visible result.
-        explain "Now we install ColdFront onto your running database — two extensions:"
+        explain "Now we install ColdFront onto your running database, two extensions:"
         explain "pg_duckdb (an in-process engine so Postgres can read Parquet in object"
         explain "storage) and coldfront (routes each query to the right tier and rewrites"
         explain "writes). No migration, no new database:"
@@ -301,10 +358,10 @@ ensure_coldfront_setup() {
         fi
         pg "CREATE EXTENSION IF NOT EXISTS pg_duckdb; CREATE EXTENSION IF NOT EXISTS coldfront;" >/dev/null \
             || { db_unreachable_msg; return 1; }
-        explain "See it worked — both extensions are now installed:"
+        explain "See it worked, both extensions are now installed:"
         show_query "SELECT extname, extversion FROM pg_extension WHERE extname IN ('pg_duckdb','coldfront') ORDER BY extname;"
 
-        # set the secret only if not already present (idempotent — mirrors silent branch)
+        # set the secret only if not already present (idempotent, mirrors silent branch)
         if [ "$(pg "SELECT count(*) FROM coldfront.storage_secret;" 2>/dev/null)" != "1" ]; then
             explain "Now we tell ColdFront where the cold data lives. In production you'd pass"
             explain "your real bucket's key, secret, and endpoint here; for this walkthrough we"
@@ -319,9 +376,9 @@ ensure_coldfront_setup() {
             pg "SELECT coldfront.set_storage_secret('admin','adminsecret','seaweedfs:8333');" >/dev/null \
                 || { db_unreachable_msg; return 1; }
         else
-            explain "  ${DIM}Cold-store secret already set — skipping (idempotent).${RESET}"
+            explain "  ${DIM}Cold-store secret already set, skipping (idempotent).${RESET}"
         fi
-        explain "See where the cold data will go — the stored target (credentials never shown):"
+        explain "See where the cold data will go, the stored target (credentials never shown):"
         show_query "SELECT name, storage_type, endpoint, region, url_style FROM coldfront.storage_secret;"
     else
         pg "CREATE EXTENSION IF NOT EXISTS pg_duckdb; CREATE EXTENSION IF NOT EXISTS coldfront;" >/dev/null 2>&1
@@ -332,8 +389,8 @@ ensure_coldfront_setup() {
     fi
 }
 
-# ensure_warehouse_and_namespace <lk_url> — bootstrap Lakekeeper, then POST
-# warehouse 'wh' (retrying until config?warehouse=wh resolves — the POST validates
+# ensure_warehouse_and_namespace <lk_url>: bootstrap Lakekeeper, then POST
+# warehouse 'wh' (retrying until config?warehouse=wh resolves: the POST validates
 # its S3 profile against SeaweedFS and 4xx/5xxs until the S3 endpoint is live) and
 # create the LK_NS namespace. Seeding it is required, not cosmetic: DuckDB defers
 # an Iceberg CREATE SCHEMA to COMMIT while POSTing CREATE TABLE eagerly, so
@@ -366,7 +423,7 @@ ensure_warehouse_and_namespace() {
 
 phase_a_bringup() {
     header "Getting the environment ready"
-    explain "This is just infrastructure — the ColdFront parts come next and we'll"
+    explain "This is just infrastructure: the ColdFront parts come next and we'll"
     explain "walk through those together. The stack includes a local S3-compatible"
     explain "store (SeaweedFS) standing in for a real cloud bucket (AWS S3 / Azure /"
     explain "GCS); in production you'd point ColdFront at your own bucket instead."
@@ -374,6 +431,11 @@ phase_a_bringup() {
 
     start_spinner "[1/4] Starting containers (Postgres, Lakekeeper, local S3)"
     $COMPOSE up -d --build >/dev/null 2>&1
+    # The archiver service sits behind the "tools" profile, so `up --build`
+    # skips it and `run` would reuse whatever image an earlier run left behind.
+    if ! $COMPOSE build archiver >/dev/null 2>&1; then
+        stop_spinner; error "The archiver image did not build:"; $COMPOSE build archiver 2>&1 | tail -20; exit 1
+    fi
     stop_spinner; info "[1/4] Containers started"
 
     start_spinner "[2/4] Waiting for Postgres to accept connections"
@@ -410,10 +472,11 @@ phase_a_bringup() {
 
 # ── Mesh (Demo 4) bring-up ──────────────────────────────────────────────────
 
-# detect_mesh_ports — pick free host ports for the on-demand mesh stack from a
-# base that avoids the single-node stack (5432/8181/8333), so the two can briefly
-# coexist during a switch without colliding. Exports the COLDFRONT_MESH_* vars the
-# mesh compose reads and updates the globals guide.sh drives the nodes over.
+# detect_mesh_ports: pick free host ports for the on-demand mesh stack from a
+# base that avoids the single-node stack's ports (5432/8181/8333). Runs after the
+# previous stacks are down, so a leftover mesh does not push the ports along.
+# Exports the COLDFRONT_MESH_* vars the mesh compose reads and updates the
+# globals guide.sh drives the nodes over.
 detect_mesh_ports() {
     MESH_PG1_PORT=$(pick_port "${COLDFRONT_MESH_PG1_PORT:-5442}")
     MESH_PG2_PORT=$(pick_port "$(( MESH_PG1_PORT + 1 ))")
@@ -426,21 +489,19 @@ detect_mesh_ports() {
     export COLDFRONT_MESH_S3_PORT="$MESH_S3_PORT"
 }
 
-# mesh_bringup — switch from the single-node stack to a 2-node Spock mesh: tear the
+# mesh_bringup: switch from the single-node stack to a 2-node Spock mesh: tear the
 # single-node stack down (a laptop can't hold both), bring up db1/db2 + a shared
-# Lakekeeper + SeaweedFS, install the extensions, form the Spock mesh, and arm the
-# bakery substrate on both nodes. Mirrors ci/topo/mesh.sh trimmed to 2 nodes and
+# Lakekeeper + SeaweedFS, install the extensions, form the Spock mesh, and set up the
+# bakery's claim replication on both nodes. Mirrors ci/topo/mesh.sh trimmed to 2 nodes and
 # driven over host ports. Returns non-zero (does not exit) on any failure so the
 # caller can fall back to the menu.
 mesh_bringup() {
     header "Bringing up a 2-node distributed cluster"
-    explain "The single-node stack from the other demos comes down first — a laptop"
+    explain "The single-node stack from the other demos comes down first: a laptop"
     explain "can't hold both at once. In production these are separate machines"
     explain "(different regions or clouds); here they're two containers on one host,"
     explain "both pointed at ONE shared lake."
     echo ""
-
-    detect_mesh_ports
 
     local ok=0 i port ext subs
 
@@ -448,6 +509,8 @@ mesh_bringup() {
     $COMPOSE down -v >/dev/null 2>&1 || true
     $MESH_COMPOSE down -v >/dev/null 2>&1 || true   # clear any prior mesh so this run starts on fresh volumes
     stop_spinner; info "[1/6] Existing stacks down"
+
+    detect_mesh_ports
 
     start_spinner "[2/6] Starting 2 Postgres nodes + shared lake (Lakekeeper, S3)"
     $MESH_COMPOSE up -d --build >/dev/null 2>&1
@@ -482,7 +545,7 @@ mesh_bringup() {
         done
     done
     # Spock nodes reach each OTHER over the compose network (host=db1/db2, the
-    # in-container port 5432) — NOT the published host ports we drive from here.
+    # in-container port 5432), NOT the published host ports we drive from here.
     mpg "$MESH_PG1_PORT" "SELECT CASE WHEN EXISTS(SELECT 1 FROM spock.node WHERE node_name='db1') THEN 'exists' ELSE spock.node_create('db1','host=db1 user=coldfront dbname=coldfront port=5432')::text END;" >/dev/null 2>&1
     mpg "$MESH_PG2_PORT" "SELECT CASE WHEN EXISTS(SELECT 1 FROM spock.node WHERE node_name='db2') THEN 'exists' ELSE spock.node_create('db2','host=db2 user=coldfront dbname=coldfront port=5432')::text END;" >/dev/null 2>&1
     mpg "$MESH_PG1_PORT" "SELECT spock.sub_create('sub_db1_from_db2','host=db2 user=coldfront dbname=coldfront port=5432');" >/dev/null 2>&1
@@ -494,16 +557,16 @@ mesh_bringup() {
     [ "$subs" = 1 ] || { error "Spock mesh not formed (db1 has '${subs:-0}' subscriptions, expected 1)"; return 1; }
     info "[5/6] ColdFront installed; Spock mesh formed (bidirectional)"
 
-    start_spinner "[6/6] Arming the bakery + cold-store secret on both nodes"
+    start_spinner "[6/6] Setting up the bakery + cold-store secret on both nodes"
     for port in "$MESH_PG1_PORT" "$MESH_PG2_PORT"; do
-        # claims/claim_acks into the repset BEFORE any cold write — a peer must be
-        # armed to ack an originator's claim, else the originator waits forever.
+        # claims/claim_acks into the repset BEFORE any cold write: a peer has to
+        # have them to ack an originator's claim, else the originator waits forever.
         mpg "$port" "SELECT coldfront._ensure_claims_replicated();" >/dev/null 2>&1
         mpg "$port" "SELECT spock.repset_add_table('default','coldfront.partition_config'::regclass, false);" >/dev/null 2>&1
         mpg "$port" "SELECT spock.repset_add_table('default','coldfront.storage_secret'::regclass, false);" >/dev/null 2>&1
         mpg "$port" "SELECT coldfront.set_storage_secret('admin','adminsecret','seaweedfs:8333');" >/dev/null 2>&1
     done
-    stop_spinner; info "[6/6] Bakery substrate armed; cold-store secret set"
+    stop_spinner; info "[6/6] Bakery replication set up; cold-store secret set"
     echo ""
 }
 
@@ -521,25 +584,25 @@ mesh_bringup() {
 PER_ROW_PEAK_KB=1        # conservative peak per row, in KB (heap+PK index+WAL+temp+Parquet)
 HEADROOM_DIV=2           # require free/HEADROOM_DIV to cover the peak (~2x headroom)
 
-# docker_free_mb — free MB on Docker's data root, probed from a throwaway
+# docker_free_mb: free MB on Docker's data root, probed from a throwaway
 # container. Echoes 0 if Docker is unreachable.
 docker_free_mb() {
   docker run --rm alpine:3.20 sh -c "df -m / | awk 'NR==2{print \$4}'" 2>/dev/null || echo 0
 }
 
-# peak_mb <rows> — estimated peak footprint in MB for a row count.
+# peak_mb <rows>: estimated peak footprint in MB for a row count.
 peak_mb() {
   echo $(( $1 * PER_ROW_PEAK_KB / 1024 ))
 }
 
-# fits <rows> <free_mb> — 0 (true) if the row count fits with headroom.
+# fits <rows> <free_mb>: 0 (true) if the row count fits with headroom.
 fits() {
   local rows="$1" free_mb="$2"
   [ "$free_mb" -le 0 ] && return 0           # probe failed → don't block
   [ "$(peak_mb "$rows")" -le $(( free_mb / HEADROOM_DIV )) ]
 }
 
-# suggested_rows <free_mb> — largest "nice" round row count that fits with
+# suggested_rows <free_mb>: largest "nice" round row count that fits with
 # headroom. rows_max = free_mb*1024 / PER_ROW_PEAK / HEADROOM_DIV; with the
 # defaults that is free_mb*512. Rounded down to a nice power-of-ten step, floor
 # 50k so we always offer something runnable.
@@ -556,7 +619,7 @@ suggested_rows() {
   echo "$rounded"
 }
 
-# fit_note <rows> <free_mb> — human "does it fit" annotation for the menu.
+# fit_note <rows> <free_mb>: human "does it fit" annotation for the menu.
 fit_note() {
   local rows="$1" free_mb="$2" need
   [ "$free_mb" -le 0 ] && { echo ""; return; }
@@ -564,13 +627,13 @@ fit_note() {
   if fits "$rows" "$free_mb"; then
     echo "(fits)"
   elif [ "$need" -ge 1024 ]; then
-    echo "(needs ~$(( need / 1024 )) GB — more than your ~${free_mb} MB free)"
+    echo "(needs ~$(( need / 1024 )) GB, more than your ~${free_mb} MB free)"
   else
-    echo "(needs ~${need} MB — more than your ~${free_mb} MB free)"
+    echo "(needs ~${need} MB, more than your ~${free_mb} MB free)"
   fi
 }
 
-# choose_volume — sets GEN_ROWS. The only feature-relevant prompt in the guide.
+# choose_volume: sets GEN_ROWS. The only feature-relevant prompt in the guide.
 # Probes Docker's free disk FIRST, computes a Suggested row count that fits with
 # headroom, and re-prompts if the user picks a fixed/custom size that won't fit
 # (rather than proceeding into a load that will disk-full and roll back).
@@ -590,14 +653,14 @@ choose_volume() {
   if [ "$free_mb" -gt 0 ]; then
     explain "  ${DIM}Docker has ~${free_mb} MB free on its data root.${RESET}"
   else
-    warn "  Could not probe Docker's free disk — fit checks disabled."
+    warn "  Could not probe Docker's free disk: fit checks disabled."
   fi
   echo ""
 
   # shellcheck disable=SC2034  # GEN_ROWS consumed by Task-9 demo functions
 
   # If even the floored Suggested size doesn't fit, free disk is critically low.
-  # Do NOT present a fitting-looking default — show an explicit message and
+  # Do NOT present a fitting-looking default: show an explicit message and
   # fall back to Custom-only so the user must type a row count they know fits,
   # or free space and re-run.
   if [ "$free_mb" -gt 0 ] && ! fits "$sugg" "$free_mb"; then
@@ -649,14 +712,14 @@ choose_volume() {
     if fits "$pick" "$free_mb"; then
       GEN_ROWS="$pick"; return
     fi
-    warn "That size needs ~$(peak_mb "$pick") MB, you have ~${free_mb} MB free —"
+    warn "That size needs ~$(peak_mb "$pick") MB, you have ~${free_mb} MB free:"
     warn "pick a smaller size (Suggested is ~${sugg} rows), or free Docker disk with:"
     warn "    docker system prune -af --volumes"
     echo ""
   done
 }
 
-# generate_events — seed `events` across ~24 months of history,
+# generate_events: seed `events` across ~24 months of history,
 # all derived from now() (never invented literals). Explicit id keeps inserts
 # on the fast set-based path. Spread <rows> over ~24 months by 'spacing'.
 generate_events() {
@@ -664,7 +727,7 @@ generate_events() {
   local out; out=$(mktemp)
   start_spinner "Generating ${rows} rows"
   # psql_file uses ON_ERROR_STOP=1, so a disk-full (or any) INSERT error makes
-  # psql exit non-zero. Capture stdout+stderr and check the exit code — never
+  # psql exit non-zero. Capture stdout+stderr and check the exit code, never
   # report success unconditionally: a swallowed failure would misreport it
   # as "Generated N rows" when the txn had actually rolled back to 0 rows.
   psql_file >"$out" 2>&1 <<EOSQL
@@ -681,7 +744,7 @@ EOSQL
   local rc=$?
   stop_spinner
   if [ "$rc" -ne 0 ]; then
-    error "Load failed — the INSERT did not complete (rows rolled back):"
+    error "Load failed: the INSERT did not complete (rows rolled back):"
     tail -5 "$out" | sed 's/^/    /'
     rm -f "$out"
     return 1
@@ -690,7 +753,7 @@ EOSQL
   info "Loaded ${rows} rows."
 }
 
-# drop_iceberg_table <table_name> — drop the Iceberg cold table from the Lakekeeper
+# drop_iceberg_table <table_name>: drop the Iceberg cold table from the Lakekeeper
 # REST catalog (with purge). The archiver and create_iceberg_table both do
 # CREATE TABLE IF NOT EXISTS on the cold side, so a leftover table would be APPENDED
 # to on a kept-infra re-run (inflated counts, duplicate ids). Dropping the catalog
@@ -710,12 +773,12 @@ drop_iceberg_table_ns() {
         "${LK_URL}/catalog/v1/${wh_id}/namespaces/$1/tables/$2?purgeRequested=true" || true
 }
 
-# teardown_tiered / teardown_decoupled — idempotent cleanup for a demo's objects.
+# teardown_tiered / teardown_decoupled: idempotent cleanup for a demo's objects.
 # coldfront BLOCKS a DROP of a registered tiered/iceberg view ("cannot DROP … it has
 # a cold tier"), so we UNREGISTER first (delete the registry + watermark rows, which
-# lifts the block), THEN drop the PG objects — one statement per psql call and
+# lifts the block), THEN drop the PG objects (one statement per psql call and
 # best-effort, so a wrong-relkind DROP (events can be a view OR a plain table) can't
-# abort the rest — and finally drop the Iceberg cold table so re-runs start clean.
+# abort the rest) and finally drop the Iceberg cold table so re-runs start clean.
 teardown_tiered() {
     pg "DELETE FROM coldfront.archive_watermark WHERE table_name='events';
         DELETE FROM coldfront.tiered_views     WHERE relname='events';" >/dev/null 2>&1 || true
@@ -741,17 +804,17 @@ teardown_adopted() {
 }
 
 demo_tiered() {
-    header "Tiered storage — start with a Postgres DB you already have"
+    header "Tiered storage: start with a Postgres DB you already have"
 
     # Idempotent teardown: events may be a plain table (fresh) OR a tiered view with a
     # cold tier (prior run). teardown_tiered unregisters before dropping, so the
     # coldfront "has a cold tier" DROP block doesn't leave events behind.
     teardown_tiered
 
-    # ── Part 1: you already have this — a data-laden plain Postgres table ──────────
-    explain "Step 1 — Create the database table: an ordinary partitioned Postgres table"
+    # ── Part 1: you already have this, a data-laden plain Postgres table ──────────
+    explain "Step 1. Create the database table: an ordinary partitioned Postgres table"
     explain "  ${DIM}Now we create a range-partitioned Postgres table and its monthly${RESET}"
-    explain "  ${DIM}partitions — standing in for the live DB you already run. No ColdFront yet.${RESET}"
+    explain "  ${DIM}partitions, standing in for the live DB you already run. No ColdFront yet.${RESET}"
     if [ "$NONINTERACTIVE" != 1 ]; then prompt_continue; fi
     # generate_events seeds rows across now-730d .. now (~24 months). RANGE
     # partitioning REJECTS any insert with no covering partition, so we create
@@ -759,7 +822,7 @@ demo_tiered() {
     # covers the ~730-day window with margin (25 months > 730 days) under any
     # wall clock. Everything older than 30 days tiers to cold; the last month
     # or two stays hot.
-    psql_file >/dev/null <<'EOSQL' || { error "Could not create the demo table — a previous run's 'events' may still exist. Try 'Reset demos' from the menu, then re-run."; return 1; }
+    psql_file >/dev/null <<'EOSQL' || { error "Could not create the demo table: a previous run's 'events' may still exist. Try 'Reset demos' from the menu, then re-run."; return 1; }
 SET search_path = public;
 CREATE TABLE events (
     id     bigint GENERATED BY DEFAULT AS IDENTITY,
@@ -781,8 +844,8 @@ EOSQL
 
     # Load loop: pick a size, load, verify. On a failed/short load, loop back to
     # choose_volume so the user can pick smaller (choose_volume itself already
-    # blocks a too-big fixed/custom pick). generate_events surfaces the real
-    # error (e.g. disk-full) and returns non-zero — the primary failure signal;
+    # blocks a too-big fixed/custom pick). generate_events reports the real
+    # error (e.g. disk-full) and returns non-zero, the primary failure signal;
     # the row-count check below is belt-and-suspenders for a silent short load.
     # NON-INTERACTIVE never loops: on failure it errors and returns (CI must not
     # hang), and empties the partial table first so a rolled-back load can't be
@@ -796,7 +859,7 @@ EOSQL
                 pg "TRUNCATE events;" >/dev/null 2>&1
                 return
             fi
-            warn "Load did not complete — pick a smaller size, or free Docker disk, and try again."
+            warn "Load did not complete: pick a smaller size, or free Docker disk, and try again."
             pg "TRUNCATE events;" >/dev/null 2>&1   # clear any partial state before retry
             continue
         fi
@@ -805,17 +868,17 @@ EOSQL
         if [ "$before" = "$GEN_ROWS" ]; then break; fi
         error "Row-count mismatch: generated ${GEN_ROWS} but events has ${before}."
         if [ "$NONINTERACTIVE" = 1 ]; then pg "TRUNCATE events;" >/dev/null 2>&1; return; fi
-        warn "Short load — pick a smaller size and try again."
+        warn "Short load: pick a smaller size and try again."
         pg "TRUNCATE events;" >/dev/null 2>&1
     done
 
     # Step "see the problem": how much hot storage, and it's ALL hot. ColdFront is not
     # installed yet, so this is a plain-Postgres query over the partitioned table.
-    # (pg_total_relation_size on a partitioned PARENT reports 0 — the real heap is the
+    # (pg_total_relation_size on a partitioned PARENT reports 0: the real heap is the
     # sum over its partition tree.) hot_before is also captured for the later before/
     # after takeaway.
     local hot_before; hot_before=$(heap_size events)
-    explain "See the problem — how many rows there are:"
+    explain "See the problem, how many rows there are:"
     show_query "SELECT count(*) AS rows FROM events;"
     explain "...and how much Postgres (hot) storage they take (summed across the partition tree):"
     show_query "SELECT pg_size_pretty(pg_total_relation_size('events') +
@@ -828,15 +891,15 @@ EOSQL
     # ── Part 2: add ColdFront to the existing database (shown, AFTER the data load) ─
     header "Add ColdFront to that database"
     # If the db went unreachable mid-demo, ensure_coldfront_setup prints the
-    # diagnostic and returns non-zero — stop here and return to the menu rather
+    # diagnostic and returns non-zero: stop here and return to the menu rather
     # than pressing on into more connection-refused errors.
     ensure_coldfront_setup shown || return
     if [ "$NONINTERACTIVE" != 1 ]; then prompt_continue; fi
 
     # ── Part 3: tier it, and prove it ──────────────────────────────────────────────
-    header "Tier it — relocate the cold data, prove it moved"
+    header "Tier it: relocate the cold data, prove it moved"
     # Concise policy summary (the meaningful rule), NOT the whole YAML: the archiver
-    # config also carries dsn/iceberg/s3 plumbing that only clutters the story here.
+    # config also has dsn/iceberg/s3 plumbing that only clutters the story here.
     explain "The archiver reads a small policy from config/archiver.yaml:"
     echo -e "  ${DIM}Policy: table=events, monthly partitions, hot_period=30 days${RESET}"
     echo -e "  ${DIM}        → partitions older than 30 days move to object storage.${RESET}"
@@ -846,14 +909,14 @@ EOSQL
     # Enter that triggers the archiver, so the viewer knows what is about to happen.
     # Production-vs-demo: in production the archiver is a scheduled cron/timer job on
     # ONE node; here we invoke the same binary once, by hand, so the move is visible.
-    explain "In production the archiver runs unattended on a schedule — a cron job or a"
+    explain "In production the archiver runs unattended on a schedule: a cron job or a"
     explain "systemd timer fires one pass per period, on a single node. Here we run that"
     explain "same binary once, by hand, so you can watch the move happen:"
     explain "  ${DIM}It moves partitions older than 30 days PG → Parquet in S3, and rebuilds events as a unified hot+cold view.${RESET}"
     # The archiver reads its managed-table set from coldfront.partition_config, not
     # from the YAML at run time; seed it once from the YAML's archiver.tables block.
     if ! $COMPOSE run --rm --no-deps archiver import --config /config/archiver.yaml >/tmp/wt-archiver.log 2>&1; then
-        error "Registering the table failed (archiver import) — see /tmp/wt-archiver.log"
+        error "Registering the table failed (archiver import): see /tmp/wt-archiver.log"
         grep -vE '^ Container ' /tmp/wt-archiver.log | tail -5 | sed 's/^/    /'
         return 1
     fi
@@ -866,7 +929,7 @@ EOSQL
     start_spinner "Archiving cold partitions to object storage"
     # --no-deps: use the already-running, data-populated db over the shared compose
     # network. Without it, `compose run` re-evaluates depends_on:db and can RECREATE
-    # the db from its config hash — replacing the loaded db with a fresh one, so the
+    # the db from its config hash, replacing the loaded db with a fresh one, so the
     # archiver's host=db then finds no `events` table.
     $COMPOSE run --rm --no-deps archiver --config /config/archiver.yaml >>/tmp/wt-archiver.log 2>&1
     local rc=$?
@@ -877,100 +940,100 @@ EOSQL
         local reason
         reason=$(grep -iE 'error|fatal|panic|does not exist|not found' /tmp/wt-archiver.log | tail -1)
         [ -n "$reason" ] || reason="see /tmp/wt-archiver.log for details"
-        error "The archiver failed — ${reason}"
+        error "The archiver failed: ${reason}"
         grep -vE '^ Container ' /tmp/wt-archiver.log | tail -5 | sed 's/^/    /'
         return 1
     fi
 
     # Proof (a): it's really Parquet in S3. iceberg_metadata() lists the data files
     # of a table, but pg_duckdb's table-function form resolves its argument as a
-    # filesystem path — a REST-catalog-managed table can't be addressed by name
+    # filesystem path: a REST-catalog-managed table can't be addressed by name
     # there. So we ask the catalog for the table's metadata.json location (warehouse
     # UUID → loadTable), then point iceberg_metadata at that explicit S3 path. Run as
     # a native pg_duckdb table function (NOT duckdb.raw_query, which returns void for
     # SELECTs) so the rows reach the viewer. All values derived at runtime.
-    explain "Proof it really moved — the cold rows are now Parquet files in object storage:"
+    explain "Proof it really moved, the cold rows are now Parquet files in object storage:"
     if show_parquet_files events; then
-        info "Real .parquet objects in the bucket — the cold rows aren't in Postgres anymore."
+        info "Real .parquet objects in the bucket: the cold rows aren't in Postgres anymore."
     fi
 
-    # Proof (b): events is now a VIEW (relkind = v) — shown, not asserted.
-    explain "And events itself is now a unified VIEW over hot + cold — ColdFront swapped the table for a view (relkind = v); _events holds only the hot remainder:"
+    # Proof (b): events is now a VIEW (relkind = v), shown, not asserted.
+    explain "And events itself is now a unified VIEW over hot + cold (ColdFront swapped the table for a view, relkind = v); _events holds only the hot remainder:"
     show_query "SELECT relkind FROM pg_class WHERE relname='events' AND relnamespace='public'::regnamespace;"
     if [ "$NONINTERACTIVE" != 1 ]; then prompt_continue; fi
 
-    # Step 8 — the hot/cold accounting (the payoff vs the 'see the problem' baseline).
+    # Step 8: the hot/cold accounting (the payoff vs the 'see the problem' baseline).
     # Shown as two proven-safe simple counts (pg_duckdb's planner hook mishandles a
     # combined count+SIZE over the tiered parent); cold = total - hot is stated in the
     # takeaway, and the heap figure comes from heap_size (a catalog-only sum).
-    header "Where the data lives now — hot vs cold"
+    header "Where the data lives now: hot vs cold"
     explain "Rows still in the Postgres hot heap (_events):"
     show_query "SELECT count(*) AS hot_rows FROM _events;"
-    explain "Rows total — hot + cold — through the unified view:"
+    explain "Rows total, hot + cold, through the unified view:"
     show_query "SELECT count(*) AS total_rows FROM events;"
     local hot_rows total cold_rows hot_after
     hot_rows=$(pg "SELECT count(*) FROM _events;")
     total=$(pg "SELECT count(*) FROM events;")
     cold_rows=$((total - hot_rows))
     hot_after=$(heap_size _events)
-    info "So ${cold_rows} of ${total} rows now live as Parquet in object storage (0 bytes in PG); only ${hot_rows} remain in the Postgres heap — which is down to ${hot_after}. Before ColdFront: ${before} rows at ${hot_before}, all hot. Same total, a fraction of the hot footprint."
+    info "So ${cold_rows} of ${total} rows now live as Parquet in object storage (0 bytes in PG); only ${hot_rows} remain in the Postgres heap, which is down to ${hot_after}. Before ColdFront: ${before} rows at ${hot_before}, all hot. Same total, a fraction of the hot footprint."
     if [ "$NONINTERACTIVE" != 1 ]; then prompt_continue; fi
 
-    # Step 9 — query across tiers.
-    explain "One query spans both tiers — the app can't tell hot from cold:"
+    # Step 9: query across tiers.
+    explain "One query spans both tiers, the app can't tell hot from cold:"
     show_query "SELECT id, ts, status FROM events
                  WHERE ts < date_trunc('month', now()) - interval '3 months'
                  ORDER BY ts LIMIT 3;"
     info "Those rows came from Parquet in S3 through the same events table."
     if [ "$NONINTERACTIVE" != 1 ]; then prompt_continue; fi
 
-    # Step 10 — write to cold data (the differentiator).
-    header "Write to cold data — no rehydration, no separate tool"
+    # Step 10: write to cold data (the differentiator).
+    header "Write to cold data: no rehydration, no separate tool"
     # Capture cold_id in a SEPARATE query: a sub-select over the same tiered view
     # inside the UPDATE is rejected (the rewrite retargets the leading reference).
     local cold_id; cold_id=$(pg "SELECT id FROM events WHERE ts < date_trunc('month',now()) - interval '2 months' ORDER BY ts LIMIT 1;")
     explain "How do we know this row is really cold, not just sitting in Postgres?"
-    explain "First — it is NOT in the Postgres hot heap (_events is plain Postgres, no lake):"
+    explain "First, it is NOT in the Postgres hot heap (_events is plain Postgres, no lake):"
     show_query "SELECT count(*) AS in_hot_heap FROM _events WHERE id=${cold_id};"
-    explain "And the hot heap only holds the recent window — its oldest row is far newer than our archived one:"
+    explain "And the hot heap only holds the recent window, its oldest row is far newer than our archived one:"
     show_query "SELECT min(ts) AS oldest_row_in_hot_heap FROM _events;"
     if [ "$NONINTERACTIVE" != 1 ]; then prompt_continue; fi
-    explain "Now the physical proof — the rows literally live as Parquet objects in object"
+    explain "Now the physical proof: the rows literally live as Parquet objects in object"
     explain "storage. We read one of those objects straight from the bucket (no Postgres heap involved):"
     show_parquet_contents events || true
-    explain "And that same archived row reads back through the unified events view — served from"
+    explain "And that same archived row reads back through the unified events view, served from"
     explain "the cold tier, not from Postgres:"
     show_query "SELECT id, ts, status FROM events WHERE id=${cold_id};"
     info "Zero rows in the hot heap; the data physically sits in Parquet objects in S3; yet the row reads back through events. It lives only in object storage."
     if [ "$NONINTERACTIVE" != 1 ]; then prompt_continue; fi
-    explain "Now we update that archived row through the same table — one line of plain SQL, and the write goes straight to the cold tier in object storage:"
+    explain "Now we update that archived row through the same table, one line of plain SQL, and the write goes straight to the cold tier in object storage:"
     run_sql_shown "UPDATE events SET status='corrected' WHERE id=${cold_id};" "" || return
-    explain "Read it back through the view — the change is there:"
+    explain "Read it back through the view, the change is there:"
     show_query "SELECT id, ts, status FROM events WHERE id=${cold_id};"
-    explain "And prove it STAYED cold — still 0 rows in the Postgres hot heap, so the write"
+    explain "And prove it STAYED cold, still 0 rows in the Postgres hot heap, so the write"
     explain "went straight to object storage without rehydrating the row into Postgres:"
     show_query "SELECT count(*) AS in_hot_heap FROM _events WHERE id=${cold_id};"
-    info "status = corrected, in_hot_heap = 0 — the update landed directly in object storage. No rehydration, no restore job, no second tool."
+    info "status = corrected, in_hot_heap = 0: the update landed directly in object storage. No rehydration, no restore job, no second tool."
     if [ "$NONINTERACTIVE" != 1 ]; then prompt_continue; fi
 
-    # Step 11 — prove it stuck (fresh connection). Each psql -c is a brand-new backend
-    # process, so showing pg_backend_pid() — and watching it change between the two
-    # calls — is visible proof that these are genuinely fresh sessions, not the one
+    # Step 11: prove it stuck (fresh connection). Each psql -c is a brand-new backend
+    # process, so showing pg_backend_pid() (and watching it change between the two
+    # calls) is visible proof that these are genuinely fresh sessions, not the one
     # that did the write. The committed value surviving that proves durability.
-    header "Prove it stuck — it's real, not a session trick"
-    explain "Each psql command opens a brand-new connection — a fresh backend process. The"
+    header "Prove it stuck: it's real, not a session trick"
+    explain "Each psql command opens a brand-new connection, a fresh backend process. The"
     explain "pg_backend_pid() below changes call to call, proving these really are new sessions"
     explain "and the corrected value is committed and durable, not a cached artifact of the writer."
-    explain "Fresh connection — its backend PID:"
+    explain "Fresh connection, its backend PID:"
     show_query "SELECT pg_backend_pid() AS session_pid;"
-    explain "Yet another fresh connection — re-read the corrected row:"
+    explain "Yet another fresh connection, re-read the corrected row:"
     show_query "SELECT id, ts, status FROM events WHERE id=${cold_id};"
-    explain "One more fresh connection — note the PID differs again (a different backend each time):"
+    explain "One more fresh connection, note the PID differs again (a different backend each time):"
     show_query "SELECT pg_backend_pid() AS session_pid;"
     local hot_final; hot_final=$(heap_size _events)
-    info "Different session_pid across calls = genuinely new connections; the corrected row survives every one. All ${total} rows present, hot heap still ${hot_final} — durable, and the data never came back to Postgres. That is ColdFront: cheaper storage that's still writeable."
+    info "Different session_pid across calls = genuinely new connections; the corrected row survives every one. All ${total} rows present, hot heap still ${hot_final}: durable, and the data never came back to Postgres. That is ColdFront: cheaper storage that's still writeable."
 
-    # No DELETE here — keeps the final count clean. (A DELETE works identically;
+    # No DELETE here: keeps the final count clean. (A DELETE works identically;
     # the script notes it only as an aside.) Exit cleanup is interactive-only: CI
     # runs non-interactively and asserts on the post-run state (events is a view,
     # watermark row present), so we MUST leave events/_events/watermark intact when
@@ -984,12 +1047,12 @@ EOSQL
 # adopting and releasing an external Iceberg table. The adoption fixture stays
 # in the catalog; interactive users can remove the lake-only table on exit.
 demo_decoupled() {
-    ensure_coldfront_setup        # silent — ColdFront may not be installed yet if this demo ran first
-    header "Decoupled — a table whose data lives in the lake, not in Postgres"
+    ensure_coldfront_setup        # silent: ColdFront may not be installed yet if this demo ran first
+    header "Decoupled: a table whose data lives in the lake, not in Postgres"
 
-    explain "\"I want a table whose data lives in the lake from day one — full SQL,"
+    explain "\"I want a table whose data lives in the lake from day one: full SQL,"
     explain " none of the Postgres storage cost.\" That's decoupled mode."
-    explain "  ${DIM}Unlike tiered, the data is never in a Postgres heap — it starts in the lake.${RESET}"
+    explain "  ${DIM}Unlike tiered, the data is never in a Postgres heap: it starts in the lake.${RESET}"
     echo ""
 
     # Idempotent teardown: events_lake may be a leftover iceberg-only view + registry
@@ -997,9 +1060,9 @@ demo_decoupled() {
     # coldfront cold-tier DROP block) and drops the Iceberg table so re-runs start clean.
     teardown_decoupled
 
-    # Step 2 — create the lake-native table (one call).
+    # Step 2: create the lake-native table (one call).
     explain "Now we create a lake-native table in a single call. It builds a view plus a"
-    explain "registry row and NO Postgres heap — the rows will have nowhere to live but the lake:"
+    explain "registry row and NO Postgres heap, the rows will have nowhere to live but the lake:"
     if [ "$NONINTERACTIVE" != 1 ]; then
         explain "  ${DIM}One function call, passing the column definitions as JSON:${RESET}"
         show_cmd "SELECT coldfront.create_iceberg_table('public', 'events_lake',
@@ -1010,7 +1073,7 @@ demo_decoupled() {
     fi
     # The Iceberg namespace is pre-seeded in Phase A. DuckDB 1.5.x defers an
     # Iceberg CREATE SCHEMA to COMMIT but POSTs CREATE TABLE eagerly, so
-    # create_iceberg_table — both in ONE plpgsql txn — would 404 on a cold
+    # create_iceberg_table (both in ONE plpgsql txn) would 404 on a cold
     # warehouse. With the namespace already committed this no-ops; the loop is a
     # thin safety net in case seeding raced the warehouse.
     local i ok=0
@@ -1020,44 +1083,44 @@ demo_decoupled() {
         sleep 2
     done
     [ "$ok" = 1 ] || { error "create_iceberg_table did not succeed"; return 1; }
-    explain "Confirm what it created — events_lake is a VIEW (relkind = v), not a table:"
+    explain "Confirm what it created, events_lake is a VIEW (relkind = v), not a table:"
     show_query "SELECT relkind FROM pg_class WHERE relname='events_lake';"
-    info "relkind = v — events_lake is a VIEW, no heap table was created. The data has nowhere to live but the lake."
+    info "relkind = v: events_lake is a VIEW, no heap table was created. The data has nowhere to live but the lake."
 
-    # Step 3 — registry proof (iceberg-only, no hot table).
+    # Step 3: registry proof (iceberg-only, no hot table).
     explain "The registry confirms it's iceberg-only, with no Postgres hot table behind it:"
     show_query "SELECT relname, is_iceberg_only, hot_table FROM coldfront.tiered_views WHERE relname='events_lake';"
-    info "is_iceberg_only = t, hot_table = NULL — nothing in Postgres holds these rows."
+    info "is_iceberg_only = t, hot_table = NULL: nothing in Postgres holds these rows."
 
-    # Step 4 — use it like any Postgres table. Every write is SHOWN (run_sql_shown):
+    # Step 4: use it like any Postgres table. Every write is SHOWN (run_sql_shown):
     # the differentiator here is that ordinary INSERT/UPDATE/DELETE land in Iceberg,
     # so the viewer must SEE each write command, not just its before/after.
     header "Use it like any Postgres table"
-    explain "Now we insert three rows — ordinary SQL, but each row lands as Parquet in the lake, not in a Postgres heap:"
+    explain "Now we insert three rows, ordinary SQL, but each row lands as Parquet in the lake, not in a Postgres heap:"
     run_sql_shown "INSERT INTO events_lake VALUES (1, now(), 'ok', '{\"k\":1}'), (2, now(), 'ok', '{\"k\":2}'), (3, now(), 'warn', '{\"k\":3}');" "" || return
     explain "Read them back through the view:"
     show_query "SELECT id, status, data->>'k' AS k FROM events_lake ORDER BY id;"
-    explain "Now we correct row 1 — an UPDATE that goes straight to Iceberg:"
+    explain "Now we correct row 1, an UPDATE that goes straight to Iceberg:"
     run_sql_shown "UPDATE events_lake SET status='corrected' WHERE id=1;" "" || return
-    explain "And delete row 3 — again ordinary SQL, straight to the lake:"
+    explain "And delete row 3, again ordinary SQL, straight to the lake:"
     run_sql_shown "DELETE FROM events_lake WHERE id=3;" "" || return
-    explain "Read back the result — row 1 corrected, row 3 gone:"
+    explain "Read back the result, row 1 corrected, row 3 gone:"
     show_query "SELECT id, status FROM events_lake ORDER BY id;"
-    info "Full read/write SQL — your application code is identical to any Postgres table, yet none of it lives in a Postgres heap."
+    info "Full read/write SQL: your application code is identical to any Postgres table, yet none of it lives in a Postgres heap."
 
-    # Step 5 — prove the data isn't in Postgres (the climax).
+    # Step 5: prove the data isn't in Postgres (the climax).
     header "Prove the data isn't in Postgres"
     explain "events_lake is a view (views store no rows), and there's no heap table behind it:"
     show_query "SELECT relkind, pg_size_pretty(pg_relation_size(c.oid)) AS pg_bytes
                 FROM pg_class c WHERE c.relname='events_lake';"
     show_query "SELECT count(*) AS heap_tables_named_events_lake
                 FROM pg_class WHERE relname LIKE 'events_lake%' AND relkind='r';"
-    explain "Yet the rows are really there — as Parquet files in object storage:"
+    explain "Yet the rows are really there, as Parquet files in object storage:"
     show_parquet_files events_lake || true
-    info "A fully queryable, writeable SQL table with real rows — and Postgres stores 0 bytes of that data."
+    info "A fully queryable, writeable SQL table with real rows, and Postgres stores 0 bytes of that data."
 
-    # Durability — fresh connection.
-    explain "And it's durable — a brand-new connection sees every row, still 0 bytes in Postgres:"
+    # Durability: fresh connection.
+    explain "And it's durable, a brand-new connection sees every row, still 0 bytes in Postgres:"
     show_query "SELECT count(*) AS rows FROM events_lake;"
     show_query "SELECT pg_size_pretty(pg_relation_size('events_lake')) AS pg_bytes;"
 
@@ -1082,9 +1145,9 @@ demo_decoupled() {
     explain "Adoption is read-only unless you ask otherwise, so reading someone else's table"
     explain "cannot become writing it by accident:"
     show_query "UPDATE orders SET amount = 0 WHERE order_id = 1;"
-    info "Refused, and the hint says exactly what to pass to arm the writes."
+    info "Refused, and the hint says exactly what to pass to enable writes."
 
-    explain "Adoption binds the name once, so arming writes is a release and a second adopt with"
+    explain "Adoption binds the name once, so enabling writes is a release and a second adopt with"
     explain "p_writable => true. Iceberg records no Postgres type, so p_types restores the jsonb the"
     explain "VARCHAR column holds:"
     run_sql_shown "SELECT coldfront.release_iceberg_table('public', 'orders');" "" || return
@@ -1098,16 +1161,16 @@ demo_decoupled() {
     explain "table keeps every row, because release does no Iceberg I/O at all:"
     run_sql_shown "SELECT coldfront.release_iceberg_table('public', 'orders');" "" || return
     show_query "SELECT count(*) AS registrations FROM coldfront.tiered_views WHERE relname='orders';"
-    info "Adopt to read someone else's lake table, arm it to write, release to hand it back untouched."
+    info "Adopt to read someone else's lake table, adopt it again writable to write, release to hand it back untouched."
 
-    # Step 7 — scale-out bridge (narrative only, no commands).
+    # Step 7: scale-out bridge (narrative only, no commands).
     header "Where this goes next: scale compute, not storage"
-    explain "Because the data lives in the lake — not in THIS node — you can point more"
+    explain "Because the data lives in the lake, not in THIS node, you can point more"
     explain "Postgres nodes at the very same data: pure added compute over one shared copy,"
     explain "no data to replicate. ColdFront serializes their writes so they never collide"
     explain "(a Spock-replicated, TLA+-verified protocol)."
-    explain "  ${DIM}Seeing that live — write on node A, read on node B, concurrent writes with no${RESET}"
-    explain "  ${DIM}conflicts — is its own story: the Distributed walkthrough (coming as #4).${RESET}"
+    explain "  ${DIM}Seeing that live (write on node A, read on node B, concurrent writes with no${RESET}"
+    explain "  ${DIM}conflicts) is its own story: the Distributed walkthrough (coming as #4).${RESET}"
     echo ""
 
     # Exit cleanup is interactive-only: CI / NONINTERACTIVE runs assert on the
@@ -1119,16 +1182,16 @@ demo_decoupled() {
     fi
 }
 demo_partitioner() {
-    ensure_coldfront_setup        # silent — ColdFront may not be installed yet if this demo ran first
-    header "Standalone partitioner — automated partitioning, no cold tier"
+    ensure_coldfront_setup        # silent: ColdFront may not be installed yet if this demo ran first
+    header "Standalone partitioner: automated partitioning, no cold tier"
     explain "Only want automated PostgreSQL partition maintenance? The partitioner"
-    explain "binary alone is the whole product — no Iceberg, no DuckDB, no cold tier."
+    explain "binary alone is the whole product: no Iceberg, no DuckDB, no cold tier."
     echo ""
 
     pg "DROP TABLE IF EXISTS part_demo CASCADE;" >/dev/null 2>&1 || true
 
-    # Step 1 — the bare partitioned table, with no partitions yet.
-    explain "Step 1 — First we create an empty range-partitioned table. It has no"
+    # Step 1: the bare partitioned table, with no partitions yet.
+    explain "Step 1: First we create an empty range-partitioned table. It has no"
     explain "partitions yet, so an INSERT right now would fail with 'no partition found':"
     if [ "$NONINTERACTIVE" != 1 ]; then prompt_continue; fi
     psql_file >/dev/null <<'EOSQL'
@@ -1143,10 +1206,10 @@ EOSQL
     explain "Confirm it starts with zero partitions:"
     show_query "SELECT count(*) AS partitions FROM pg_inherits WHERE inhparent='part_demo'::regclass;"
 
-    # Step 2 — register the policy (records intent, builds nothing yet).
+    # Step 2: register the policy (records intent, builds nothing yet).
     header "Register a partitioning policy"
     explain "Now we register the table with the partitioner: monthly partitions, 12-month"
-    explain "retention. This records the policy only — it doesn't build any partitions yet."
+    explain "retention. This records the policy only: it doesn't build any partitions yet."
     if [ "$NONINTERACTIVE" != 1 ]; then
         show_cmd "partitioner register --table part_demo --period monthly --retention \"12 months\""
         echo ""
@@ -1154,7 +1217,7 @@ EOSQL
         echo ""
     fi
     start_spinner "Registering the partitioning policy"
-    # --no-deps: reuse the already-running db (see the archiver note above) — a plain
+    # --no-deps: reuse the already-running db (see the archiver note above): a plain
     # `compose run` can recreate the db from its config hash and wipe the loaded data.
     $COMPOSE run --rm --no-deps --entrypoint partitioner archiver \
         register --config /config/partitioner.yaml --table part_demo \
@@ -1162,20 +1225,20 @@ EOSQL
     local rc=$?
     stop_spinner
     if [ "$rc" != 0 ]; then
-        error "Registration failed — see /tmp/wt-part.log"
+        error "Registration failed: see /tmp/wt-part.log"
         grep -vE '^ Container ' /tmp/wt-part.log | tail -5 | sed 's/^/    /'
         return 1
     fi
     info "Policy registered."
 
-    # Step 3 — reconcile: build the partitions the policy calls for.
-    header "Reconcile — let the partitioner build what the policy requires"
+    # Step 3, reconcile: build the partitions the policy calls for.
+    header "Reconcile: let the partitioner build what the policy requires"
     # Production-vs-demo: in production this is a scheduled cron/timer pass; here we
     # run one pass by hand so the created partitions are visible in the moment.
-    explain "In production the partitioner runs on a schedule — a cron job or systemd"
-    explain "timer — so the forward window keeps rolling and partitions past retention"
+    explain "In production the partitioner runs on a schedule (a cron job or systemd"
+    explain "timer) so the forward window keeps rolling and partitions past retention"
     explain "get dropped automatically. Here we run one pass by hand so you can see it work:"
-    explain "  ${DIM}It reads the policy and creates the missing partitions — the current month plus the forward window — so writes never hit a gap.${RESET}"
+    explain "  ${DIM}It reads the policy and creates the missing partitions (the current month plus the forward window) so writes never hit a gap.${RESET}"
     if [ "$NONINTERACTIVE" != 1 ]; then
         show_cmd "partitioner --config /config/partitioner.yaml"
         echo ""
@@ -1187,17 +1250,17 @@ EOSQL
     rc=$?
     stop_spinner
     if [ "$rc" != 0 ]; then
-        error "Reconcile failed — see /tmp/wt-part.log"
+        error "Reconcile failed: see /tmp/wt-part.log"
         grep -vE '^ Container ' /tmp/wt-part.log | tail -5 | sed 's/^/    /'
         return 1
     fi
 
-    # Step 4 — see the result: the forward window, built automatically.
-    explain "See the result — the partitioner created the forward window for you:"
+    # Step 4, see the result: the forward window, built automatically.
+    explain "See the result, the partitioner created the forward window for you:"
     show_query "SELECT c.relname AS partition
                 FROM pg_inherits i JOIN pg_class c ON c.oid = i.inhrelid
                 WHERE i.inhparent='part_demo'::regclass ORDER BY c.relname;"
-    info "Every month in the forward window now has a partition — created and maintained for you, no cold tier involved. On a schedule, the same run also drops partitions older than the 12-month retention."
+    info "Every month in the forward window now has a partition, created and maintained for you, no cold tier involved. On a schedule, the same run also drops partitions older than the 12-month retention."
     if [ "$NONINTERACTIVE" != 1 ]; then prompt_continue; fi
 
     # Exit cleanup is interactive-only: a NONINTERACTIVE / CI run asserts on the
@@ -1210,15 +1273,15 @@ EOSQL
 
 # ── Stack switch (single-node ↔ mesh) ───────────────────────────────────────
 # The single-node stack and the 2-node mesh can't run at once on a laptop, so the
-# menu switches between them lazily — a switch runs only on an actual transition.
+# menu switches between them lazily: a switch runs only on an actual transition.
 # ACTIVE_STACK (single | mesh | none) tracks which is up.
 
-# ensure_single_stack — demos 1-3 need the single-node stack. If the mesh is up,
+# ensure_single_stack: demos 1-3 need the single-node stack. If the mesh is up,
 # tear it down and bring the single-node stack back.
 ensure_single_stack() {
     [ "$ACTIVE_STACK" = single ] && return 0
     header "Restoring the single-node stack"
-    explain "Freeing the 2-node cluster and bringing the single-node stack back —"
+    explain "Freeing the 2-node cluster and bringing the single-node stack back:"
     explain "only one can run at a time on a single machine."
     start_spinner "Tearing down the 2-node cluster"
     $MESH_COMPOSE down -v >/dev/null 2>&1 || true
@@ -1227,26 +1290,26 @@ ensure_single_stack() {
     ACTIVE_STACK=single
 }
 
-# ensure_mesh_stack — Demo 4 needs the 2-node mesh. mesh_bringup tears the
+# ensure_mesh_stack: Demo 4 needs the 2-node mesh. mesh_bringup tears the
 # single-node stack down first. On failure ACTIVE_STACK drops to 'none' so the
 # next single-node demo restores cleanly.
 ensure_mesh_stack() {
     [ "$ACTIVE_STACK" = mesh ] && return 0
     if mesh_bringup; then ACTIVE_STACK=mesh; return 0; fi
-    error "Mesh bring-up failed — returning to the menu."
+    error "Mesh bring-up failed, returning to the menu."
     ACTIVE_STACK=none
     return 1
 }
 
-# _CREATE_EVENTS_LAKE — the column JSON for events_lake, shared by the db1 create
-# and the db2 re-register (identical call — create_iceberg_table is idempotent).
+# _CREATE_EVENTS_LAKE: the column JSON for events_lake, shared by the db1 create
+# and the db2 re-register (identical call: create_iceberg_table is idempotent).
 _CREATE_EVENTS_LAKE="SELECT coldfront.create_iceberg_table('public','events_lake','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"ts\",\"type\":\"timestamptz\"},{\"name\":\"status\",\"type\":\"text\"},{\"name\":\"data\",\"type\":\"jsonb\"}]'::jsonb);"
 
 demo_distributed() {
-    header "Distributed — scale compute, not storage"
+    header "Distributed: scale compute, not storage"
     explain "The Decoupled demo ended by pointing here: once a table's data lives in the"
     explain "lake, you can point MORE Postgres nodes at the very same data. Let's do"
-    explain "exactly that — two nodes, one shared lake — and prove two things:"
+    explain "exactly that, two nodes, one shared lake, and prove two things:"
     explain "  ${DIM}• a write on one node is instantly readable on the other${RESET}"
     explain "  ${DIM}• concurrent writes from both nodes never collide${RESET}"
     echo ""
@@ -1254,22 +1317,22 @@ demo_distributed() {
 
     ensure_mesh_stack || return
 
-    # ── Beat 1 — the mesh is real ───────────────────────────────────────────
+    # ── Beat 1: the mesh is real ───────────────────────────────────────────
     header "The cluster: two nodes, one lake"
     explain "Two Postgres nodes in an active-active Spock mesh. Both are ColdFront nodes"
-    explain "pointed at the SAME Lakekeeper catalog and object store — one shared copy of"
+    explain "pointed at the SAME Lakekeeper catalog and object store: one shared copy of"
     explain "the data. Here are the nodes:"
     mshow db1 "$MESH_PG1_PORT" "SELECT node_name FROM spock.node ORDER BY node_name;"
     explain "And the bidirectional subscriptions that carry ColdFront's coordination"
     explain "metadata between them (one per direction, synced at bring-up):"
     mshow db1 "$MESH_PG1_PORT" "SELECT sub_name FROM spock.subscription ORDER BY sub_name;"
     mshow db2 "$MESH_PG2_PORT" "SELECT sub_name FROM spock.subscription ORDER BY sub_name;"
-    info "Two nodes, replicating tiny coordination metadata — NOT the data. The data stays in the lake."
+    info "Two nodes, replicating tiny coordination metadata, NOT the data. The data stays in the lake."
     if [ "$NONINTERACTIVE" != 1 ]; then prompt_continue; fi
 
-    # ── Beat 2 — cross-node visibility ──────────────────────────────────────
+    # ── Beat 2: cross-node visibility ──────────────────────────────────────
     header "Write on one node, read on the other"
-    explain "We create a lake-native table on db1 — the same one-call create as the"
+    explain "We create a lake-native table on db1, the same one-call create as the"
     explain "Decoupled demo, columns passed as JSON:"
     if [ "$NONINTERACTIVE" != 1 ]; then
         show_cmd "psql (db1) -c \"SELECT coldfront.create_iceberg_table('public','events_lake', '[ id bigint, ts timestamptz, status text, data jsonb ]');\""
@@ -1284,10 +1347,10 @@ demo_distributed() {
         sleep 2
     done
     [ "$ok" = 1 ] || { error "create_iceberg_table did not succeed on db1"; return 1; }
-    info "events_lake created on db1 — a VIEW over the shared Iceberg table, no Postgres heap."
+    info "events_lake created on db1: a VIEW over the shared Iceberg table, no Postgres heap."
 
     explain "Now register the same table on db2 so that node can read AND write it. The"
-    explain "Iceberg table already exists — this just gives db2 its own local view +"
+    explain "Iceberg table already exists, so this just gives db2 its own local view +"
     explain "registry row (create_iceberg_table is idempotent, keyed by name):"
     ok=0
     for i in 1 2 3 4 5; do
@@ -1297,33 +1360,85 @@ demo_distributed() {
     done
     [ "$ok" = 1 ] || { error "could not register events_lake on db2"; return 1; }
     mshow db2 "$MESH_PG2_PORT" "SELECT relname, is_iceberg_only, hot_table FROM coldfront.tiered_views WHERE relname='events_lake';"
-    info "Registered on db2 — is_iceberg_only = t, hot_table = NULL. Both nodes now front the one shared lake table."
+    info "Registered on db2: is_iceberg_only = t, hot_table = NULL. Both nodes now front the one shared lake table."
     if [ "$NONINTERACTIVE" != 1 ]; then prompt_continue; fi
 
-    explain "Insert three rows on db1 — ordinary SQL, landing as Parquet in the shared lake:"
-    mrun db1 "$MESH_PG1_PORT" "INSERT INTO events_lake VALUES (1, now(), 'ok', '{\"n\":\"db1\"}'), (2, now(), 'ok', '{\"n\":\"db1\"}'), (3, now(), 'warn', '{\"n\":\"db1\"}');" "Written on db1 — but the rows live in the lake, not in db1's heap." || return
-    explain "Now read them back on db2 — a DIFFERENT node that stored none of this data:"
+    explain "Insert three rows on db1, ordinary SQL, landing as Parquet in the shared lake:"
+    mrun db1 "$MESH_PG1_PORT" "INSERT INTO events_lake VALUES (1, now(), 'ok', '{\"n\":\"db1\"}'), (2, now(), 'ok', '{\"n\":\"db1\"}'), (3, now(), 'warn', '{\"n\":\"db1\"}');" "Written on db1, but the rows live in the lake, not in db1's heap." || return
+    explain "Now read them back on db2, a DIFFERENT node that stored none of this data:"
     mshow db2 "$MESH_PG2_PORT" "SELECT id, status, data->>'n' AS written_by FROM events_lake ORDER BY id;"
-    info "db2 sees every row db1 wrote — over the shared lake. Spock never shipped these rows node-to-node."
-    explain "And db2 truly holds none of it — events_lake is a VIEW there, zero heap bytes:"
+    info "db2 sees every row db1 wrote, over the shared lake. Spock never shipped these rows node-to-node."
+    explain "And db2 truly holds none of it, events_lake is a VIEW there, zero heap bytes:"
     mshow db2 "$MESH_PG2_PORT" "SELECT relkind, pg_size_pretty(pg_relation_size('events_lake')) AS pg_bytes FROM pg_class WHERE relname='events_lake';"
-    info "Zero bytes on db2. That's the point: add a node for more COMPUTE over one shared copy of the data — no storage to replicate."
+    info "Zero bytes on db2. That's the point: add a node for more COMPUTE over one shared copy of the data, no storage to replicate."
     if [ "$NONINTERACTIVE" != 1 ]; then prompt_continue; fi
 
-    # ── Beat 3 — bakery serialization ───────────────────────────────────────
+    # ── Beat 3: bakery serialization ────────────────────────────────────────
     header "Concurrent writes, no collisions"
     explain "The hard part: both nodes write to the SAME lake table at the SAME time."
-    explain "Two Iceberg commits racing one table would normally collide — Lakekeeper"
+    explain "Two Iceberg commits racing one table would normally collide: Lakekeeper"
     explain "returns 409 Conflict and the app has to retry. ColdFront's bakery protocol"
     explain "serializes them cluster-wide: each write takes a globally-ordered ticket"
     explain "(Spock-replicated, TLA+-verified) and waits its turn. Every write lands, no retries."
     echo ""
-    explain "  ${DIM}We fire 10 writers at once — 5 on db1 (ids 101-105) and 5 on db2 (201-205),${RESET}"
+    explain "First, one write in slow motion. We open a transaction on db1, insert a row,"
+    explain "and hold the transaction open. The bakery's bookkeeping is ordinary rows in"
+    explain "coldfront.claims and coldfront.claim_acks, and the write's commit clears them,"
+    explain "so this is the moment to read them:"
+    if [ "$NONINTERACTIVE" != 1 ]; then
+        show_cmd "psql (db1):  BEGIN; INSERT INTO events_lake VALUES (301, now(), 'held', '{\"n\":\"db1\"}');   -- held open, no COMMIT yet"
+        echo ""
+        read -rp "Press Enter to open the transaction..." </dev/tty
+        echo ""
+    fi
+    hold_cold_write "$MESH_PG1_PORT" "INSERT INTO events_lake VALUES (301, now(), 'held', '{\"n\":\"db1\"}');" || return 1
+    local node1 node2
+    node1=$(mpg "$MESH_PG1_PORT" "SELECT current_setting('snowflake.node');")
+    node2=$(mpg "$MESH_PG2_PORT" "SELECT current_setting('snowflake.node');")
+    explain "The transaction is open. db1 holds a claim on the table, keyed by its ticket: a"
+    explain "snowflake id, so it also names the issuing node (db1 is node ${node1}, db2 is node ${node2}):"
+    mshow db1 "$MESH_PG1_PORT" "SELECT ticket, snowflake.get_node(ticket) AS issued_by_node, iceberg_table FROM coldfront.claims;"
+    explain "The claim is written over its own connection and committed at once, so it"
+    explain "reaches db2 while db1's transaction is still open. db2 has it already:"
+    wait_for_value "$MESH_PG2_PORT" "SELECT count(*) FROM coldfront.claims;" 1 "The claim did not replicate to db2."
+    mshow db2 "$MESH_PG2_PORT" "SELECT ticket, snowflake.get_node(ticket) AS issued_by_node, iceberg_table FROM coldfront.claims;"
+    info "A write starting on db2 now takes a later ticket and waits for this one to release."
+    explain "db2 acknowledges the ticket, and the ack replicates back to db1. A writer"
+    explain "commits only once every peer has acked its ticket; that is what orders"
+    explain "writers across nodes (the Ricart-Agrawala rule):"
+    wait_for_value "$MESH_PG1_PORT" "SELECT count(*) FROM coldfront.claim_acks;" 1 "db2's ack did not reach db1."
+    mshow db1 "$MESH_PG1_PORT" "SELECT ticket, ack_from_name AS acked_by, iceberg_table FROM coldfront.claim_acks;"
+    explain "The row itself is not in the lake yet: the Iceberg snapshot is written when the"
+    explain "transaction commits, under the claim. db2 cannot see it:"
+    mshow db2 "$MESH_PG2_PORT" "SELECT count(*) AS rows_with_id_301 FROM events_lake WHERE id = 301;"
+    if [ "$NONINTERACTIVE" != 1 ]; then
+        show_cmd "psql (db1):  COMMIT;"
+        echo ""
+        read -rp "Press Enter to commit..." </dev/tty
+        echo ""
+    fi
+    if ! release_cold_write; then
+        error "The held write did not commit."
+        [ "$NONINTERACTIVE" = 1 ] && { $MESH_COMPOSE logs db1 | tail -30; exit 1; }
+    fi
+    explain "Committed. The release deletes the claim, its acks go with it, and both deletes"
+    explain "replicate. Tickets are never reused, so an empty ledger is the steady state"
+    explain "between writes, and the row is now in the lake for db2 to read:"
+    wait_for_value "$MESH_PG2_PORT" "SELECT count(*) FROM coldfront.claims;" 0 "The release did not replicate to db2."
+    mshow db1 "$MESH_PG1_PORT" "SELECT (SELECT count(*) FROM coldfront.claims) AS claims, (SELECT count(*) FROM coldfront.claim_acks) AS acks;"
+    mshow db2 "$MESH_PG2_PORT" "SELECT (SELECT count(*) FROM coldfront.claims) AS claims, (SELECT count(*) FROM coldfront.claim_acks) AS acks, (SELECT count(*) FROM events_lake WHERE id = 301) AS rows_with_id_301;"
+    if [ "$NONINTERACTIVE" != 1 ]; then prompt_continue; fi
+
+    explain "Now at full speed, with contention:"
+    explain "  ${DIM}We fire 10 writers at once: 5 on db1 (ids 101-105) and 5 on db2 (201-205),${RESET}"
     explain "  ${DIM}all committing events_lake at the same instant. Multiple cold writes are${RESET}"
-    explain "  ${DIM}in flight on each node AND across both — the exact contention the bakery${RESET}"
+    explain "  ${DIM}in flight on each node AND across both, the exact contention the bakery${RESET}"
     explain "  ${DIM}must serialize so no two Iceberg commits collide.${RESET}"
-    explain "First — the row count before the storm:"
-    local before; before=$(mpg "$MESH_PG2_PORT" "SELECT count(*) FROM events_lake;")
+    explain "First, the row count before the storm:"
+    local before meta_loc snaps_before
+    before=$(mpg "$MESH_PG2_PORT" "SELECT count(*) FROM events_lake;")
+    meta_loc=$(_iceberg_meta_loc events_lake "$MESH_LK_URL")
+    snaps_before=$(mpg "$MESH_PG2_PORT" "SELECT count(*) FROM iceberg_snapshots('${meta_loc}');" 2>/dev/null)
     mshow db2 "$MESH_PG2_PORT" "SELECT count(*) AS rows_before FROM events_lake;"
     if [ "$NONINTERACTIVE" != 1 ]; then
         show_cmd "# simultaneously, on BOTH nodes:  INSERT INTO events_lake VALUES (…, 'storm', …);"
@@ -1332,16 +1447,16 @@ demo_distributed() {
         echo ""
     fi
     # All 10 writers fire at once (no per-round wait): 5 concurrent on db1 AND 5 on
-    # db2, same table. Two layers serialize them — a node-local advisory lock keeps
+    # db2, same table. Two layers serialize them (a node-local advisory lock keeps
     # one cold writer per node in the bakery, and the R-A claim protocol serializes
-    # across nodes — so every commit lands, no 409 (ci/journey.sh:story_mesh_multiwriter).
+    # across nodes), so every commit lands, no 409 (ci/journey.sh:story_mesh_multiwriter).
     local tmp i; tmp=$(mktemp -d)
     for i in 1 2 3 4 5; do
         mpg "$MESH_PG1_PORT" "INSERT INTO events_lake VALUES (10$i, now(), 'storm', '{\"n\":\"db1\"}');" >"$tmp/db1.$i" 2>&1 &
         mpg "$MESH_PG2_PORT" "INSERT INTO events_lake VALUES (20$i, now(), 'storm', '{\"n\":\"db2\"}');" >"$tmp/db2.$i" 2>&1 &
     done
     wait
-    # Assert on the real +10 row delta, not just a token grep — a client that dies
+    # Assert on the real +10 row delta, not just a token grep: a client that dies
     # without printing 'error/conflict/409' (dropped connection, 5xx) must still fail.
     local errs after landed
     errs=$(cat "$tmp"/* 2>/dev/null | grep -cEi 'error|conflict|409')
@@ -1349,29 +1464,35 @@ demo_distributed() {
     after=$(mpg "$MESH_PG2_PORT" "SELECT count(*) FROM events_lake;")
     landed=$((after - before))
     if [ "$landed" = 10 ] && [ "$errs" = 0 ]; then
-        info "All 10 concurrent writers committed — +10 rows, 0 conflicts, 0 Lakekeeper 409s."
+        info "All 10 concurrent writers committed: +10 rows, 0 conflicts, 0 Lakekeeper 409s."
     else
         error "Storm did not fully land: +$landed rows (want +10), $errs error/conflict line(s)."
         [ "$NONINTERACTIVE" = 1 ] && { $MESH_COMPOSE logs db1 db2 | tail -30; exit 1; }
     fi
-    explain "First the receipts — the bakery's durable proof. Each cold write took a"
-    explain "globally-ordered ticket; the peer node acked it before the commit. This trail"
-    explain "records every one (the acking node is stamped by name, the issuer by its"
-    explain "snowflake node id, which is what the ticket carries):"
-    mshow db1 "$MESH_PG1_PORT" "SELECT ca.ticket,
-                snowflake.get_node(ca.ticket) AS issued_by_node,
-                ca.ack_from_name              AS acked_by,
-                ca.iceberg_table
-             FROM coldfront.claim_acks ca
-             ORDER BY ca.ticket;"
-    info "Tickets issued by BOTH nodes, each acked by its peer — the bakery serialized them cluster-wide, so no two Iceberg commits ever collided."
-    explain "And the row count confirms it — up by exactly 10, every concurrent write landed (none lost to a conflict):"
     mshow db2 "$MESH_PG2_PORT" "SELECT count(*) AS rows_after FROM events_lake;"
+    explain "The lake keeps its own record of all this, and it outlives the ledger: every"
+    explain "commit adds one snapshot to the table's metadata, in a single chain of"
+    explain "sequence numbers. The whole history of events_lake, read from db2:"
+    local snaps_after
+    meta_loc=$(_iceberg_meta_loc events_lake "$MESH_LK_URL")
+    if [ -z "$meta_loc" ]; then
+        warn "Could not resolve the Iceberg metadata location from the catalog; skipping the snapshot history."
+        [ "$NONINTERACTIVE" = 1 ] && exit 1
+    else
+        mshow db2 "$MESH_PG2_PORT" "SELECT sequence_number, snapshot_id, timestamp_ms FROM iceberg_snapshots('${meta_loc}') ORDER BY sequence_number;"
+        snaps_after=$(mpg "$MESH_PG2_PORT" "SELECT count(*) FROM iceberg_snapshots('${meta_loc}');" 2>/dev/null)
+        if [ "$((snaps_after - snaps_before))" = 10 ]; then
+            info "${snaps_after} snapshots for ${snaps_after} writes, the storm's 10 among them: no gap, no fork, no retry. Two nodes, one serialized history."
+        else
+            error "Expected the storm to add 10 snapshots, found $((snaps_after - snaps_before))."
+            [ "$NONINTERACTIVE" = 1 ] && exit 1
+        fi
+    fi
     if [ "$NONINTERACTIVE" != 1 ]; then prompt_continue; fi
 
-    # ── Beat 4 — close ──────────────────────────────────────────────────────
+    # ── Beat 4: close ──────────────────────────────────────────────────────
     header "Where the ladder ends: scale compute, keep one copy"
-    explain "That's the top rung. Same SQL, same tables — now scaled horizontally across"
+    explain "That's the top rung. Same SQL, same tables, now scaled horizontally across"
     explain "nodes. Add a node for more compute; storage stays one copy in the lake. Put"
     explain "the nodes in different regions or clouds and the picture doesn't change."
     explain "  ${DIM}Tiered → Decoupled → Distributed: one adoption ladder, no re-platforming.${RESET}"
@@ -1409,21 +1530,21 @@ quit_walkthrough() {
 
 main_menu() {
     while true; do
-        header "ColdFront — what would you like to see?"
+        header "ColdFront: what would you like to see?"
         explain "  ${DIM}\"My Postgres database is getting expensive.\"${RESET}"
-        explain "  1) Tiered storage   — relocate cold data to object storage, same table, still writeable"
+        explain "  1) Tiered storage:   relocate cold data to object storage, same table, still writeable"
         echo ""
         explain "  ${DIM}\"I want a table whose data lives in the lake from day one.\"${RESET}"
-        explain "  2) Decoupled        — Postgres as a front-end to the lake (data in Iceberg from day one)"
+        explain "  2) Decoupled:        Postgres as a front-end to the lake (data in Iceberg from day one)"
         echo ""
         explain "  ${DIM}\"I just want automated partition maintenance.\"${RESET}"
-        explain "  3) Partitioner      — automated PG range-partitioning, no cold tier"
+        explain "  3) Partitioner:      automated PG range-partitioning, no cold tier"
         echo ""
         explain "  ${DIM}\"I want to scale across nodes without copying the data.\"${RESET}"
-        explain "  4) Distributed      — two Postgres nodes, one shared lake (switches to a 2-node cluster)"
+        explain "  4) Distributed:      two Postgres nodes, one shared lake (switches to a 2-node cluster)"
         echo ""
-        explain "  R) Reset            — drop demo tables / reclaim disk"
-        explain "  Q) Quit             — (offers docker compose down -v)"
+        explain "  R) Reset:            drop demo tables / reclaim disk"
+        explain "  Q) Quit:             (offers docker compose down -v)"
         echo ""
         read -rp "Choose [1/2/3/4/R/Q]: " c </dev/tty
         case "$c" in
@@ -1453,7 +1574,7 @@ fi
 # ── Clean up a leftover Distributed (mesh) cluster ──────────────────────────
 # The mesh stack is on-demand (Demo 4 only) and its own compose project, so the
 # single-node detect below never sees it. A leftover mesh from a prior Demo 4
-# would otherwise run ALONGSIDE the single-node stack we bring up next — twice
+# would otherwise run ALONGSIDE the single-node stack we bring up next: twice
 # the containers and resource contention. The menu baseline is single-node and
 # Demo 4 rebuilds the mesh when picked, so remove any leftover mesh now.
 if [ "${NONINTERACTIVE:-0}" != 1 ] && [ -n "$($MESH_COMPOSE ps --status running -q 2>/dev/null)" ]; then
@@ -1470,10 +1591,10 @@ if [ "${NONINTERACTIVE:-0}" != 1 ] && [ -n "$($COMPOSE ps --status running -q 2>
     warn "Found an existing ColdFront walkthrough stack from a previous run."
     echo ""
     explain "  It may still hold a previous run's demo data. The Docker image is already"
-    explain "  built, so rebuilding fresh is quick — and it's the most reliable way to start"
+    explain "  built, so rebuilding fresh is quick, and it's the most reliable way to start"
     explain "  clean (it wipes the old Postgres, object store, and catalog outright)."
     echo ""
-    explain "  1) Rebuild fresh   ${DIM}(recommended — wipes old demo data, quick: image is cached)${RESET}"
+    explain "  1) Rebuild fresh   ${DIM}(recommended, wipes old demo data, quick: image is cached)${RESET}"
     explain "  2) Keep it running ${DIM}(reuse the stack and any data a previous run left behind)${RESET}"
     explain "  3) Cancel"
     echo ""

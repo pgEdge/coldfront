@@ -71,8 +71,8 @@ else
   explain ""
   explain "The walkthrough requires 'docker compose' (v2 plugin), not legacy 'docker-compose'."
   explain "Install hints:"
-  explain "  Docker Desktop (macOS/Windows) — includes Compose v2 by default."
-  explain "  Linux — https://docs.docker.com/compose/install/"
+  explain "  Docker Desktop (macOS/Windows): includes Compose v2 by default."
+  explain "  Linux: https://docs.docker.com/compose/install/"
   echo ""
   exit 1
 fi

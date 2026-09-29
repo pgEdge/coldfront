@@ -32,8 +32,9 @@ demos as an interactive guide.
 ## 💻 On your own machine
 
 You need Docker 24+ with Compose V2 (the `docker compose` plugin, not
-the legacy `docker-compose` binary), roughly 1.5 GB of free disk inside
-Docker's virtual disk, and `curl`, `bash`, and `psql` on the host.
+the legacy `docker-compose` binary), roughly 3 GB of free disk inside
+Docker's virtual disk (the images alone are about 2.5 GB), and `curl`,
+`bash`, and `psql` on the host.
 
 The fastest path is the one-liner, which downloads the walkthrough
 files and launches the interactive guide:
@@ -67,11 +68,15 @@ and namespace. The stack includes the following services:
 - Lakekeeper, the Iceberg REST catalog that tracks table metadata and
   file locations.
 
-Start the containers:
+Start the containers, then build the archiver image. That service is not
+part of `up`: it runs on demand in Step 7 and Demo 3, so `up --build`
+leaves it alone:
 
 ```bash
 docker compose -f examples/walkthrough/docker-compose.yml \
   up -d --build
+docker compose -f examples/walkthrough/docker-compose.yml \
+  build archiver
 ```
 
 If port 5432, 8181, or 8333 is already in use on your host, set
@@ -314,10 +319,11 @@ Confirm both are installed:
 ```
 
 ```text {"ignore":"true"}
-   Name    | Version |   Schema   |            Description
------------+---------+------------+------------------------------------
- coldfront | 1.0     | coldfront  | transparent PG <-> Iceberg tiering
- pg_duckdb | 1.1.x   | public     | DuckDB engine inside PostgreSQL
+   Name    | Version |   Schema   |                                          Description
+-----------+---------+------------+------------------------------------------------------------------------------------------------
+ coldfront | 1.0     | coldfront  | Transparent tiered storage: route DML on tiered views across hot (PG) and cold (Iceberg) tiers
+ pg_duckdb | 1.1.0   | public     | DuckDB Embedded in Postgres
+ plpgsql   | 1.0     | pg_catalog | PL/pgSQL procedural language
 ```
 
 Two extensions - that is the entire ColdFront install. No sidecar, no
@@ -446,17 +452,19 @@ SQL
 ```
 
 ```text {"ignore":"true"}
-s3://iceberg/wh/.../metadata/00001-....metadata.json
+s3://iceberg/<warehouse-uuid>/<table-uuid>/metadata/00023-<uuid>.gz.metadata.json
 
  file_path
-----------------------------------------------------------
- s3://iceberg/.../data/019eb6d0-....parquet
- s3://iceberg/.../data/019eb6d1-....parquet
- s3://iceberg/.../data/019eb6d2-....parquet
+-----------------------------------------------------------------
+ s3://iceberg/.../data/month_ts_2=656/01a0ec3d-8abb-....parquet
+ s3://iceberg/.../data/month_ts_2=657/01a0ec3d-8b52-....parquet
+ s3://iceberg/.../data/month_ts_2=658/01a0ec3d-8bd4-....parquet
 ```
 
 Real `.parquet` objects are in the bucket. The cold rows are no longer
-in PostgreSQL - they are objects in object storage.
+in PostgreSQL - they are objects in object storage. Each month's files
+sit under their own `month_ts_<n>=` directory: the cold table is
+partitioned by month, the way the hot table is.
 
 **Proof (b) - the table changed shape.** Inspect the relation type:
 
@@ -550,13 +558,14 @@ LIMIT 3;
 ```
 
 ```text {"ignore":"true"}
-  id  |           ts            | status
-------+-------------------------+--------
-    1 | 2025-12-...             | ok
-    2 | 2025-12-...             | warn
-    3 | 2025-12-...             | error
+ id |              ts               | status
+----+-------------------------------+--------
+  1 | 2024-09-29 08:17:49.334041+00 | warn
+  2 | 2024-09-29 08:23:04.694041+00 | error
+  3 | 2024-09-29 08:28:20.054041+00 | ok
 ```
 
+The timestamps track your load: row 1 sits exactly 730 days before it.
 One table, one query, no application change required.
 
 ### Step 10 - Write to cold data
@@ -579,9 +588,9 @@ LIMIT 1;
 ```
 
 ```text {"ignore":"true"}
-  id |           ts            | status
------+-------------------------+--------
-   1 | 2025-12-...             | ok
+ id |              ts               | status
+----+-------------------------------+--------
+  1 | 2024-09-29 08:17:49.334041+00 | warn
 ```
 
 Update the archived row through the same table using the captured id:
@@ -597,12 +606,12 @@ SELECT id, ts, status FROM events WHERE id = 1;
 ```
 
 ```text {"ignore":"true"}
-  id |           ts            |  status
------+-------------------------+-----------
-   1 | 2025-12-...             | corrected
+ id |              ts               |  status
+----+-------------------------------+-----------
+  1 | 2024-09-29 08:17:49.334041+00 | corrected
 ```
 
-The row's status flipped `ok` to `corrected`. That row is still
+The row's status flipped `warn` to `corrected`. That row is still
 sitting in object storage - ColdFront wrote through to it directly.
 
 ### Step 11 - Prove it stuck
@@ -683,8 +692,7 @@ modes are independent.
 
 One SQL call provisions the Iceberg table and the PostgreSQL view. The
 `public` namespace was seeded during setup, and the call wraps both
-steps in a single transaction. A short retry loop guards against a
-timing edge where the warehouse is still warming up:
+steps in a single transaction:
 
 ```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT coldfront.create_iceberg_table(
@@ -745,7 +753,7 @@ SELECT coldfront.ensure_attached();
 SELECT duckdb.raw_query('CREATE SCHEMA IF NOT EXISTS ice.lake');
 ```
 
-The table carries a `VARCHAR` column holding JSON, which matters in a
+The table has a `VARCHAR` column holding JSON, which matters in a
 moment:
 
 ```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
@@ -778,7 +786,7 @@ The call reports what it registered:
 NOTICE:  coldfront: adopted "ice"."lake"."orders" as public.orders (5 columns, read-only)
 ```
 
-Writes are not armed, and the refusal says what to do:
+Writes are refused, and the message says what to do:
 
 ```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -P pager=off -f"}
 UPDATE orders SET amount = 0 WHERE order_id = 1;
@@ -789,12 +797,12 @@ ERROR:  coldfront: "public.orders" is adopted read-only
 HINT:  Release it with coldfront.release_iceberg_table() and adopt again with p_writable => true to arm INSERT/UPDATE/DELETE.
 ```
 
-### Arm the writes
+### Enable writes
 
-Adoption binds the name once, so arming writes is a release followed by
-a second adopt with `p_writable => true`, which arms the same rewrite a
-created table gets. Every write below is one bakery-serialized Iceberg
-snapshot:
+Adoption binds the name once, so enabling writes is a release followed
+by a second adopt with `p_writable => true`, which gives the view the
+same DML rewrite a created table gets. Every write below is one
+bakery-serialized Iceberg snapshot:
 
 ```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT coldfront.release_iceberg_table('public', 'orders');
@@ -832,7 +840,7 @@ I/O, so the table keeps every row and stays in the catalog:
 SELECT coldfront.release_iceberg_table('public', 'orders');
 ```
 
-Two things are worth carrying away from this demo. A `VARCHAR` column
+Two things to take from this demo. A `VARCHAR` column
 comes back as text rather than as `jsonb` unless `p_types` says
 otherwise, because Iceberg records no PostgreSQL type. And the bakery
 serializes ColdFront's own writers, not an external engine writing the
@@ -942,8 +950,8 @@ or reproduce it by hand.
 ### Bring up the two-node mesh
 
 Start the mesh stack, then form the Spock mesh - create a node on each
-member, subscribe each to the other, and arm the cold-write
-coordination substrate on both:
+member, subscribe each to the other, and set up the cold-write
+coordination on both:
 
 ```bash {"ignore":"true"}
 docker compose -f examples/walkthrough/docker-compose.mesh.yml up -d
@@ -1037,8 +1045,55 @@ collide - the catalog rejects the second commit with a `409 Conflict`
 and the application has to retry. ColdFront's bakery protocol prevents
 that: each cold write takes a globally-ordered ticket (replicated via
 Spock, verified in the TLA+ model under `docs/formal/`) and waits its
-turn. Fire many writers at once - several on each node, on both nodes,
-all into the same table:
+turn.
+
+The bookkeeping is ordinary rows in `coldfront.claims` and
+`coldfront.claim_acks`, and a write's commit clears them, so the way to
+read them is to hold a transaction open. In one session on `db1`:
+
+```sql {"ignore":"true"}
+BEGIN;
+INSERT INTO events_lake VALUES (301, now(), 'held', '{"n":"db1"}');
+-- leave the transaction open
+```
+
+In a second session, the claim is on `db1`, keyed by a ticket that also
+names the issuing node (a snowflake id), and it is already on `db2`: the
+claim is written over its own connection and committed at once, so it
+replicates while the transaction that took it is still open:
+
+```sql {"ignore":"true"}
+-- On db1, then on db2 - the same row on both:
+SELECT ticket, snowflake.get_node(ticket) AS issued_by_node, iceberg_table
+FROM coldfront.claims;
+```
+
+`db2` acknowledges the ticket and the ack replicates back. A writer
+commits only once every peer has acked its ticket, which is what orders
+writers across nodes (the Ricart-Agrawala rule):
+
+```sql {"ignore":"true"}
+-- On db1:
+SELECT ticket, ack_from_name AS acked_by FROM coldfront.claim_acks;
+```
+
+The row itself is not in the lake yet: the Iceberg snapshot is written
+when the transaction commits, under the claim, so on `db2` the count of
+rows with `id = 301` is still 0. Now `COMMIT` in the first session. The
+release deletes the claim and its acks, both deletes replicate, and the
+row is readable from `db2`:
+
+```sql {"ignore":"true"}
+-- On db2:
+SELECT (SELECT count(*) FROM coldfront.claims)           AS claims,
+       (SELECT count(*) FROM coldfront.claim_acks)       AS acks,
+       (SELECT count(*) FROM events_lake WHERE id = 301) AS rows_with_id_301;
+-- 0 | 0 | 1
+```
+
+Tickets are never reused, so an empty ledger is the steady state between
+writes. Now fire many writers at once - several on each node, on both
+nodes, all into the same table:
 
 ```sql {"ignore":"true"}
 -- concurrently, on BOTH nodes at the same instant:
@@ -1051,15 +1106,27 @@ Every write lands, with no conflicts and no application-level retry.
 Two layers serialize them: a node-local advisory lock keeps one cold
 writer per node in the bakery at a time, and the cross-node
 Ricart-Agrawala claim protocol orders writers across nodes. The durable
-proof is the claim ledger - each ticket, the node that issued it, and
-the peer that acknowledged it before the commit:
+record is the lake's own: every commit adds one snapshot to the table's
+metadata, in a single chain of sequence numbers. Resolve the table's
+metadata location from the mesh stack's Lakekeeper (port 8191), as in
+Demo 1, and list the history from either node:
 
-```sql {"ignore":"true"}
-SELECT ticket,
-       snowflake.get_node(ticket) AS issued_by,
-       ack_from_node              AS acked_by
-FROM coldfront.claim_acks ORDER BY ticket;
+```bash {"ignore":"true"}
+WH_ID=$(curl -s http://localhost:8191/management/v1/warehouse \
+  | grep -o '"warehouse-id":"[^"]*"' | head -1 | cut -d'"' -f4)
+META_LOC=$(curl -s \
+  "http://localhost:8191/catalog/v1/${WH_ID}/namespaces/public/tables/events_lake" \
+  -H 'accept: application/json' \
+  | grep -o '"metadata-location":"[^"]*"' | head -1 | cut -d'"' -f4)
+
+psql "postgresql://coldfront@localhost:5443/coldfront" -P pager=off <<SQL
+SELECT sequence_number, snapshot_id, timestamp_ms
+FROM iceberg_snapshots('${META_LOC}')
+ORDER BY sequence_number;
+SQL
 ```
+
+Twelve writes from two nodes, twelve snapshots, no gap and no fork.
 
 ## Teardown
 

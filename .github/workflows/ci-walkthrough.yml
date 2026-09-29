@@ -28,10 +28,18 @@ jobs:
           docker compose -f examples/walkthrough/docker-compose.mesh.yml config --quiet
 
   smoke:
-    name: Smoke Test
+    name: Smoke Test (${{ matrix.demo }})
     needs: [validate]
     runs-on: ubuntu-latest
     timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - demo: tiered
+            compose: docker-compose.yml
+          - demo: distributed
+            compose: docker-compose.mesh.yml
     steps:
       - uses: actions/checkout@v7
       - name: Log in to GHCR
@@ -42,14 +50,15 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Install prerequisites
         run: sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client jq iproute2
-      - name: Run setup + Tiered demo non-interactively
+      - name: Run setup + the ${{ matrix.demo }} demo non-interactively
         working-directory: examples/walkthrough
         env:
           WALKTHROUGH_NONINTERACTIVE: "1"
-          WALKTHROUGH_DEMO: tiered
+          WALKTHROUGH_DEMO: ${{ matrix.demo }}
           WALKTHROUGH_ROWS: "200000"
         run: bash guide.sh
       - name: Assert tiering proof
+        if: matrix.demo == 'tiered'
         run: |
           export PGPASSWORD=coldfront
           relk=$(psql -h localhost -U coldfront -d coldfront -tAc "SELECT relkind FROM pg_class WHERE relname='events';")
@@ -60,21 +69,20 @@ jobs:
       - name: Check no services have exited
         run: |
           echo "=== Service Status ==="
-          docker compose -f examples/walkthrough/docker-compose.yml ps -a
+          docker compose -f examples/walkthrough/${{ matrix.compose }} ps -a
           # -a is required: plain `ps` hides stopped containers, so the grep could
           # never match. lakekeeper-migrate is a one-shot that exits 0 by design;
           # any OTHER exited container is a real crash.
-          if docker compose -f examples/walkthrough/docker-compose.yml ps -a \
+          if docker compose -f examples/walkthrough/${{ matrix.compose }} ps -a \
                | grep -iE 'exit' | grep -v lakekeeper-migrate; then
             echo "ERROR: a service crashed"
-            docker compose -f examples/walkthrough/docker-compose.yml logs
+            docker compose -f examples/walkthrough/${{ matrix.compose }} logs
             exit 1
           fi
           echo "All services running (aside from the by-design migrate one-shot)"
       - name: Dump logs on failure
         if: failure()
-        working-directory: examples/walkthrough
-        run: docker compose logs
+        run: docker compose -f examples/walkthrough/${{ matrix.compose }} logs
       - name: Cleanup
         if: always()
-        run: docker compose -f examples/walkthrough/docker-compose.yml down -v
+        run: docker compose -f examples/walkthrough/${{ matrix.compose }} down -v

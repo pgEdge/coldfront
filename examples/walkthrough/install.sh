@@ -4,7 +4,7 @@ set -euo pipefail
 
 if [ -n "${CODESPACES:-}" ]; then
     echo ""
-    echo "  Running inside GitHub Codespaces — setup is already handled by"
+    echo "  Running inside GitHub Codespaces: setup is already handled by"
     echo "  the devcontainer. To start the walkthrough, run:"
     echo ""
     echo "      bash examples/walkthrough/guide.sh"
@@ -53,13 +53,13 @@ done
 
 if [[ $FAILED -gt 0 ]]; then
     echo ""
-    echo "  Error: ${FAILED} file(s) failed to download — check your network/branch." >&2
+    echo "  Error: ${FAILED} file(s) failed to download: check your network/branch." >&2
     echo ""
     exit 1
 fi
 
 # The db service (docker-compose.yml context: ../..) and archiver service both
-# build from source at $WORK_DIR. Fetch a tarball subset from GitHub — no git
+# build from source at $WORK_DIR. Fetch a tarball subset from GitHub, no git
 # clone needed. The top-level directory inside the archive is coldfront-<branch>/
 # with slashes in the branch name flattened to dashes (coldfront-main/,
 # coldfront-feat-walkthrough/), so --strip-components=1 lands everything
@@ -96,8 +96,8 @@ bash examples/walkthrough/setup.sh
 echo ""
 echo "  Setup complete! How would you like to continue?"
 echo ""
-echo "    1) Interactive Guide — step-by-step in this terminal  [default]"
-echo "    2) Exit — I'll open the walkthrough in my editor"
+echo "    1) Interactive Guide: step-by-step in this terminal  [default]"
+echo "    2) Exit: I'll open the walkthrough in my editor"
 echo ""
 read -rp "  Choose [1/2]: " choice </dev/tty
 

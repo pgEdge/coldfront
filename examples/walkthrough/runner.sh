@@ -1,5 +1,5 @@
 # shellcheck shell=bash
-# runner.sh — Terminal UX framework for interactive walkthrough scripts.
+# runner.sh: Terminal UX framework for interactive walkthrough scripts.
 # Source this file from guide.sh; do not execute directly.
 #
 # Usage:

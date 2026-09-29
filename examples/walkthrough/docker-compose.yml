@@ -1,4 +1,4 @@
-# ColdFront walkthrough — self-contained single-node stack (DuckDB 1.5.x).
+# ColdFront walkthrough: self-contained single-node stack (DuckDB 1.5.x).
 # Pulls the published coldfront-duckdb-base, compiles the thin coldfront
 # extension on top, and runs Lakekeeper + a local SeaweedFS S3 store.
 # Build context is the repo root so the db build sees docker/ and extension/.

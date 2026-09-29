@@ -1,6 +1,6 @@
-# ColdFront walkthrough partitioner config — Demo 3 (standalone partitioner).
+# ColdFront walkthrough partitioner config: Demo 3 (standalone partitioner).
 #
-# PARTITION-ONLY: just postgres + archiver.tables. No iceberg/s3 — this demo is
+# PARTITION-ONLY: just postgres + archiver.tables. No iceberg/s3: this demo is
 # the "you don't need the cold tier" story: automated PostgreSQL range-partition
 # maintenance against stock Postgres. Runs INSIDE the compose network
 # (docker compose run --rm --entrypoint partitioner archiver), so the host is the
