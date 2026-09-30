@@ -1,10 +1,10 @@
-# Vector storage architecture
+# Vector Storage Architecture
 
 Reference for maintainers. Embeddings live in the cold (Iceberg) tier as
 `list<float>`; PostgreSQL holds the hot rows, the routing centroids, and
 nothing proportional to the corpus.
 
-## Type mapping and the two column forms
+## Type Mapping and the Two Column Forms
 
 A `vector(n)` or `halfvec(n)` column maps to Iceberg `FLOAT[]`, and the tiered
 view exposes it as `real[]`, because DuckDB has no `vector` type and both arms
@@ -34,7 +34,7 @@ column per user column. Teardown drops it.
 function's expression. A hot row therefore stores its embedding twice. Cold
 rows, which are all of the data by design, do not.
 
-## The search operators
+## The Search Operators
 
 `coldfront.install_vector_ops()` creates three functions and three operators on
 `(real[], real[])` in pgvector's own schema, resolved from the catalog rather
@@ -61,7 +61,7 @@ operator resolution, and pgvector's cast function is immutable so a constant
 folds. The same cast makes an `INSERT` of a `vector` value coerce to the
 column.
 
-## Routing state
+## Routing State
 
 Two tables, both name-keyed so a Spock mesh replicates them by value and every
 node resolves a vector to the same cluster id without sharing OIDs:
@@ -72,7 +72,7 @@ node resolves a vector to the same cluster id without sharing OIDs:
 | `coldfront.vector_centroids` | the centroids themselves, keyed additionally by `(generation, centroid_id)`, with `parent_id` for an adaptive addition |
 
 Both are registered in Spock's `default` replication set by
-`coldfront._ensure_vector_state_replicated()`, gated on the spock extension so
+`coldfront._ensure_vector_state_replicated()`, gated on the Spock extension so
 vanilla is a no-op, and both are `pg_extension_config_dump`-marked: losing them
 makes every stored cluster id uninterpretable and forces a retrain.
 
@@ -90,7 +90,7 @@ order. It cannot be derived afterwards in either mode: the view exposes
 `real[]` rather than the pgvector type, and a decoupled table names its types
 without holding them.
 
-## The cluster columns, and which one owns the sort order
+## The Cluster Columns, and Which One Owns the Sort Order
 
 A table may carry several vector columns. The Iceberg schema gets one cluster
 column per vector column, `_cf_vec_list_<column>`, leading the schema in column
@@ -117,9 +117,8 @@ and the rewrite declines.
 
 `_cf_vec_list_<column> integer` exists in the Iceberg schema and nowhere else.
 It is not a column of the hot table and neither branch of the view projects it,
-so no query written against the view can name it.
-
-It **leads** the Iceberg schema. Iceberg schema evolution appends, and a cold
+so no query written against the view can name it. `_cf_vec_list_<column>`
+**leads** the Iceberg schema. Iceberg schema evolution appends, and a cold
 INSERT is positional, so a column added later has to land after everything both
 sides already agree on. Trailing the cluster column would put a user's
 `ADD COLUMN` on the far side of an internal column and silently misalign every
@@ -173,7 +172,10 @@ A retrain cannot interleave with a cold write, because an operation that
 rewrites the table holds the table's claim and every cold write serializes on
 that same claim.
 
-### The seven paths
+### The Seven Paths
+
+Every path that can put a row into a clustered table's Iceberg storage must
+derive that row's cluster assignment; these are the seven that do it, and how:
 
 | Path | Where | Shape |
 |---|---|---|
@@ -217,6 +219,9 @@ INSERT template is itself a single-quoted string and the assignment expression
 carries the literals that name its configuration row.
 
 ## Training
+
+Training computes a fresh set of centroids for one column and reassigns every
+cold row's cluster against them, through this signature:
 
 `CALL coldfront.vector_train(schema, table, column, nlist, sample, iterations)`.
 
@@ -354,7 +359,7 @@ row group.
 Each group is bin-packed to the file-size target, so a merge holds one group in
 memory rather than one table.
 
-## Reading: the probe
+## Reading: The Probe
 
 `cf_maybe_inject_probe` runs on the read path, alongside the hot-tier reroute
 and the jsonb normalization, and it is what makes the layout worth maintaining.
@@ -472,7 +477,7 @@ call, and the SQL layer makes no HTTP calls. The compactor reports files and
 bytes on every pass, and file count is the wrong health signal regardless: a
 merge bounds it without changing what a probe reads.
 
-## Current gaps
+## Current Gaps
 
 These are properties of the code as it stands, not plans.
 
@@ -480,7 +485,10 @@ These are properties of the code as it stands, not plans.
   in cursor order and would need buffering to sort. It is the fallback path for
   a tiered INSERT that omits an IDENTITY column.
 
-## Constraints that are correctness
+## Constraints That Are Correctness
+
+These are not implementation quirks to work around; violating any of them
+produces silently wrong results or a hard failure:
 
 - **The query vector is a literal, never a bound parameter.** A parameter typed
   `vector` fails to convert, and so does one typed `real[]`, on a custom plan

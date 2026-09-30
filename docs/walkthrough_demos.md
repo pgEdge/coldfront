@@ -1,13 +1,13 @@
 ---
 cwd: ../
 ---
-# ColdFront walkthrough demos
+# ColdFront Walkthrough Demos
 
 This page contains the four demos of the [guided walkthrough](walkthrough.md).
-Run the steps in [What setup does](walkthrough.md#what-setup-does) before you
+Run the steps in [What Setup Does](walkthrough.md#what-setup-does) before you
 start Demo 1.
 
-## Demo 1: tiered storage
+## Demo 1: Tiered Storage
 
 Tiered storage is a brownfield retrofit: you begin with a plain PostgreSQL
 database full of data, add ColdFront to it, and let the archiver relocate the
@@ -18,24 +18,24 @@ The following table shows the eleven steps this demo covers:
 
 | Step | What you will do |
 |------|-----------------|
-| 1. Start the stack | Bring up Postgres, Lakekeeper, and the object store |
-| 2. Create a table and load history | An ordinary partitioned table with months of data |
-| 3. See the problem | All rows in hot Postgres storage, and it only grows |
-| 4. Enable the extensions | Two extensions retrofit tiering onto the existing database |
-| 5. Point at object storage | Tell ColdFront where cold data lives |
-| 6. Show the archiver policy | `hot_period: 30 days` - the hot/cold boundary |
-| 7. Run the archiver | Move everything older than 30 days to object storage |
-| 8. Where it lives now | The hot/cold split: rows and space in each tier |
-| 9. Query across tiers | One table, one query, hot + cold together |
-| 10. Write to cold data | UPDATE an archived row in place - no rehydration |
-| 11. Prove it stuck | Reconnect and confirm the edit persisted in cold storage |
+| [1. Start the stack](#step-1-start-the-stack-setup) | Bring up Postgres, Lakekeeper, and the object store |
+| [2. Create a table and load history](#step-2-create-a-table-and-load-months-of-history) | An ordinary partitioned table with months of data |
+| [3. See the problem](#step-3-see-the-problem) | All rows in hot Postgres storage, and it only grows |
+| [4. Enable the extensions](#step-4-enable-the-extensions) | Two extensions retrofit tiering onto the existing database |
+| [5. Point at object storage](#step-5-point-coldfront-at-the-object-store) | Tell ColdFront where cold data lives |
+| [6. Show the archiver policy](#step-6-show-the-archiver-policy) | `hot_period: 30 days` - the hot/cold boundary |
+| [7. Run the archiver](#step-7-register-the-table-then-run-the-archiver) | Move everything older than 30 days to object storage |
+| [8. Where it lives now](#step-8-where-the-data-lives-now) | The hot/cold split: rows and space in each tier |
+| [9. Query across tiers](#step-9-query-across-tiers) | One table, one query, hot + cold together |
+| [10. Write to cold data](#step-10-write-to-cold-data) | UPDATE an archived row in place - no rehydration |
+| [11. Prove it stuck](#step-11-prove-it-stuck) | Reconnect and confirm the edit persisted in cold storage |
 
-### Step 1 - Start the stack (setup)
+### Step 1: Start the Stack (Setup)
 
 Setup starts the infrastructure: PostgreSQL (your database), plus Lakekeeper
 and SeaweedFS. The cold-storage side sits idle until you point ColdFront at it
 in Step 5. Run the `docker compose up` command shown in
-[What setup does](walkthrough.md#what-setup-does). Then confirm that the `db`,
+[What Setup Does](walkthrough.md#what-setup-does). Then confirm that the `db`,
 `lakekeeper-db`, and `lakekeeper` services report `healthy`:
 
 ```bash
@@ -46,7 +46,7 @@ PostgreSQL is your existing database. The catalog and object store are also
 running - that is the cold-storage side, unused until Step 5. Locally the store
 is SeaweedFS; in production it is your AWS S3, Azure Blob, or GCS bucket.
 
-### Step 2 - Create a table and load months of history
+### Step 2: Create a Table and Load Months of History
 
 This step stands in for the database you already run: an ordinary
 range-partitioned PostgreSQL table, filled with months of accumulated data.
@@ -118,6 +118,8 @@ Confirm all rows landed:
 SELECT count(*) FROM events;
 ```
 
+The count confirms it:
+
 ```text {"ignore":"true"}
   count
 ---------
@@ -127,7 +129,7 @@ SELECT count(*) FROM events;
 Months of data now live in an ordinary PostgreSQL table - no ColdFront involved
 yet.
 
-### Step 3 - See the problem
+### Step 3: See the Problem
 
 This step measures how much hot Postgres storage that data occupies and
 confirms that none of it is anywhere cheaper yet. This is the baseline you will
@@ -148,6 +150,8 @@ SELECT pg_size_pretty(
 ) AS hot_size;
 ```
 
+The result:
+
 ```text {"ignore":"true"}
  hot_size
 ----------
@@ -158,7 +162,7 @@ Every row - all one million - occupies hot, expensive primary storage, and the
 table only grows. Remember this figure; Step 8 shows where it goes after
 tiering.
 
-### Step 4 - Enable the extensions
+### Step 4: Enable the Extensions
 
 This step retrofits tiering onto the database you already have, using two
 extensions. `pg_duckdb` gives PostgreSQL an in-process engine that can read
@@ -179,6 +183,8 @@ Confirm both are installed:
 \dx
 ```
 
+The output lists both:
+
 ```text {"ignore":"true"}
    Name    | Version |   Schema   |                                          Description
 -----------+---------+------------+------------------------------------------------------------------------------------------------
@@ -190,7 +196,7 @@ Confirm both are installed:
 Two extensions - that is the entire ColdFront install. No sidecar, no proxy, no
 data movement yet.
 
-### Step 5 - Point ColdFront at the object store
+### Step 5: Point ColdFront at the Object Store
 
 This step tells ColdFront where cold data goes and how to authenticate to it.
 The credentials below are throwaway values for the local SeaweedFS emulator. In
@@ -213,21 +219,25 @@ curl -s localhost:8181/management/v1/warehouse \
   | grep -o '"name":"wh"'
 ```
 
+The response confirms it:
+
 ```text {"ignore":"true"}
 "name":"wh"
 ```
 
-### Step 6 - Show the archiver policy
+### Step 6: Show the Archiver Policy
 
 The archiver policy is one rule in a YAML file: data older than 30 days belongs
 in cheap object storage; the most recent data stays hot in PostgreSQL. Nothing
-moves yet - this step just shows the boundary.
+moves yet - this step shows the boundary.
 
 Inspect the archiver configuration:
 
 ```bash
 cat examples/walkthrough/config/archiver.yaml
 ```
+
+The file reads:
 
 ```yaml {"ignore":"true"}
 # ColdFront walkthrough archiver config: Demo 1 (tiered).
@@ -259,7 +269,7 @@ The `hot_period: 30 days` value is the hot/cold line. Any partition whose data
 is entirely older than 30 days will move to object storage when the archiver
 runs.
 
-### Step 7 - Register the table, then run the archiver
+### Step 7: Register the Table, Then Run the Archiver
 
 The archiver reads its managed-table set from `coldfront.partition_config`, not
 from the YAML at run time. Seed that table once from the YAML's
@@ -287,9 +297,10 @@ The archiver connects inside the Compose network (service name `db`, not
 exports them to Iceberg via pg_duckdb, and replaces the `events` table with a
 unified view that queries both tiers.
 
-**Proof (a) - the cold rows are really in S3 as Parquet.** The
-`iceberg_metadata()` table function resolves its argument as a filesystem path,
-so a REST-catalog table cannot be addressed by name directly. Resolve the
+#### Proof (a): The Cold Rows Are Really in S3 as Parquet
+
+The `iceberg_metadata()` table function resolves its argument as a filesystem
+path, so a REST-catalog table cannot be addressed by name directly. Resolve the
 table's `metadata.json` S3 location from the Lakekeeper catalog first, then
 point `iceberg_metadata()` at that path:
 
@@ -317,6 +328,8 @@ LIMIT 3;
 SQL
 ```
 
+The query returns:
+
 ```text {"ignore":"true"}
 s3://iceberg/<warehouse-uuid>/<table-uuid>/metadata/00023-<uuid>.gz.metadata.json
 
@@ -332,7 +345,9 @@ PostgreSQL - they are objects in object storage. Each month's files sit under
 their own `month_ts_<n>=` directory: the cold table is partitioned by month,
 the way the hot table is.
 
-**Proof (b) - the table changed shape.** Inspect the relation type:
+#### Proof (b): The Table Changed Shape
+
+Inspect the relation type:
 
 ```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 \d events
@@ -345,7 +360,7 @@ the following query to see the recorded hot/cold cutoff:
 SELECT * FROM coldfront.archive_watermark;
 ```
 
-### Step 8 - Where the data lives now
+### Step 8: Where the Data Lives Now
 
 This step accounts for every row after tiering: how many are still hot in
 PostgreSQL, how many are now cold in object storage, and how much space each
@@ -391,7 +406,7 @@ Before tiering (Step 3): one million rows, all hot, approximately 152 MB of
 Postgres heap. After tiering: only the last month or two remains in PostgreSQL;
 over 90% of the hot storage is gone while the total row count is unchanged.
 
-### Step 9 - Query across tiers
+### Step 9: Query Across Tiers
 
 This step runs one ordinary query against `events` that spans both tiers, then
 queries the hot-only table for contrast. The application issuing this query
@@ -419,6 +434,8 @@ ORDER BY ts
 LIMIT 3;
 ```
 
+The query returns:
+
 ```text {"ignore":"true"}
  id |              ts               | status
 ----+-------------------------------+--------
@@ -430,7 +447,7 @@ LIMIT 3;
 The timestamps track your load: row 1 sits exactly 730 days before it. One
 table, one query, no application change required.
 
-### Step 10 - Write to cold data
+### Step 10: Write to Cold Data
 
 This step takes a specific row from a cold (archived) month and updates it
 through the same `events` view. Watch for what does not happen: no rehydration
@@ -448,6 +465,8 @@ WHERE ts < date_trunc('month', now()) - interval '2 months'
 ORDER BY ts
 LIMIT 1;
 ```
+
+The query returns:
 
 ```text {"ignore":"true"}
  id |              ts               | status
@@ -467,6 +486,8 @@ Read the row back immediately:
 SELECT id, ts, status FROM events WHERE id = 1;
 ```
 
+The updated row reads:
+
 ```text {"ignore":"true"}
  id |              ts               |  status
 ----+-------------------------------+-----------
@@ -476,7 +497,7 @@ SELECT id, ts, status FROM events WHERE id = 1;
 The row's status flipped `warn` to `corrected`. That row is still sitting in
 object storage - ColdFront wrote through to it directly.
 
-### Step 11 - Prove it stuck
+### Step 11: Prove It Stuck
 
 This step opens a fresh `psql` connection (nothing cached from the session that
 did the write) and re-checks the row, the total row count, and the hot heap
@@ -484,8 +505,8 @@ size. This confirms that the cold edit is durable persistent state and that the
 data did not quietly return to PostgreSQL to make the edit possible.
 
 Each runnable cell on this page already opens a fresh connection, so
-cell-runners can simply run the checks below. In a local shell, open a new
-terminal and connect with a fresh session first:
+cell-runners can run the checks below. In a local shell, open a new terminal
+and connect with a fresh session first:
 
 ```bash {"ignore":"true"}
 PGOPTIONS='-c client_min_messages=warning' \
@@ -498,6 +519,8 @@ Confirm the archived row is still `corrected`:
 SELECT id, status FROM events WHERE id = 1;
 ```
 
+The row reads:
+
 ```text {"ignore":"true"}
   id |  status
 -----+-----------
@@ -509,6 +532,8 @@ Confirm the total row count is unchanged:
 ```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT count(*) AS total_rows FROM events;
 ```
+
+The count confirms it:
 
 ```text {"ignore":"true"}
  total_rows
@@ -529,6 +554,8 @@ SELECT pg_size_pretty(
 ) AS hot_size;
 ```
 
+The result:
+
 ```text {"ignore":"true"}
  hot_size
 ----------
@@ -541,7 +568,7 @@ PostgreSQL. Over 90% of the original storage now lives in object storage as
 Parquet, and that data is still a normal, writeable part of the table -
 corrected in place, no rehydration, no separate system.
 
-## Demo 2: decoupled (Iceberg-only)
+## Demo 2: Decoupled (Iceberg-Only)
 
 Decoupled mode stores a table entirely in Iceberg from the first row.
 PostgreSQL holds a thin wrapper view and a registry entry. This is a fresh
@@ -550,7 +577,7 @@ independent. Demo 2 still needs the extensions and storage secret from Steps 4
 and 5 of [Demo 1](#demo-1-tiered-storage). If you start here, run those two
 steps first.
 
-### Create an Iceberg-only table
+### Create an Iceberg-Only Table
 
 One SQL call provisions the Iceberg table and the PostgreSQL view. The `public`
 namespace was seeded during setup, and the call wraps both steps in a single
@@ -572,7 +599,7 @@ SELECT coldfront.create_iceberg_table(
 After the call returns, `events_lake` is a view; every row lives in Iceberg on
 S3.
 
-### Read and write the lake table
+### Read and Write the Lake Table
 
 `events_lake` behaves like any PostgreSQL table:
 
@@ -596,13 +623,13 @@ All four DML operations reach the Iceberg table transparently. The coldfront
 extension intercepts each statement on the view and rewrites it to the Iceberg
 path via pg_duckdb.
 
-## Demo 2b: adopt a table already in the lake
+## Demo 2b: Adopt a Table Already in the Lake
 
 Not every Iceberg table starts in ColdFront. A table another engine wrote needs
 no provisioning, only a wrapper view and a registry row. Adoption builds both
 from the schema the catalog already holds.
 
-### Stand in for the external writer
+### Stand In for the External Writer
 
 These three statements are the only ones in this walkthrough written in DuckDB
 SQL, because they represent what some other engine already did to your lake.
@@ -629,7 +656,7 @@ SELECT duckdb.raw_query($$
     (2, now(), 'globex', 249.50, '{"tier":"silver"}')$$);
 ```
 
-### Adopt it read-only
+### Adopt It Read-Only
 
 One call, and no column list; the schema comes from the catalog. The view goes
 in the PostgreSQL schema `public`; `lake` is the Iceberg namespace, and no
@@ -653,12 +680,14 @@ Writes are refused, and the message says what to do:
 UPDATE orders SET amount = 0 WHERE order_id = 1;
 ```
 
+The refusal reads:
+
 ```text
 ERROR:  coldfront: "public.orders" is adopted read-only
 HINT:  Release it with coldfront.release_iceberg_table() and adopt again with p_writable => true to arm INSERT/UPDATE/DELETE.
 ```
 
-### Enable writes
+### Enable Writes
 
 Adoption binds the name once, so enabling writes is a release followed by a
 second adopt with `p_writable => true`, which gives the view the same DML
@@ -677,11 +706,11 @@ DELETE FROM orders WHERE order_id = 1;
 SELECT order_id, customer, amount FROM orders ORDER BY order_id;
 ```
 
-### Restore a type Iceberg cannot record
+### Restore a Type Iceberg Cannot Record
 
 The `meta` column reads as text, because Iceberg stores JSON as `VARCHAR` and
-records no PostgreSQL type. `p_types` restores it, and the override is accepted
-because it maps to what the catalog stores:
+records no PostgreSQL type. `p_types` restores the column's type, and the
+override is accepted because it maps to what the catalog stores:
 
 ```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT coldfront.release_iceberg_table('public', 'orders');
@@ -692,7 +721,7 @@ SELECT coldfront.adopt_iceberg_table('public', 'orders', 'lake',
 SELECT order_id, meta->>'tier' AS tier FROM orders ORDER BY order_id;
 ```
 
-### Hand it back
+### Hand It Back
 
 Release removes the view and the registry row and performs no Iceberg I/O, so
 the table keeps every row and stays in the catalog:
@@ -703,17 +732,17 @@ SELECT coldfront.release_iceberg_table('public', 'orders');
 
 Two things to take from this demo. A `VARCHAR` column comes back as text rather
 than as `jsonb` unless `p_types` says otherwise, because Iceberg records no
-PostgreSQL type. And the bakery serializes ColdFront's own writers, not an
-external engine writing the same table.
+PostgreSQL type. The bakery serializes ColdFront's own writers, not an external
+engine writing the same table.
 
-## Demo 3: standalone partitioner
+## Demo 3: Standalone Partitioner
 
 The partitioner binary manages PostgreSQL range partitions without any cold
 tier. If all you need is automated partition maintenance on stock PostgreSQL,
 the partitioner is the whole product - no Iceberg, no DuckDB, no archiver cold
 path.
 
-### Create the demo table
+### Create the Demo Table
 
 Create a partitioned table with no existing partitions:
 
@@ -728,7 +757,7 @@ CREATE TABLE part_demo (
 ) PARTITION BY RANGE (ts);
 ```
 
-### Register and reconcile
+### Register and Reconcile
 
 Register the table with the partitioner (monthly period, 12-month retention)
 and run a reconcile pass. Both commands run inside the Compose network against
@@ -773,7 +802,7 @@ archiver:
           retention_period: 12 months
 ```
 
-### Verify the partitions
+### Verify the Partitions
 
 Each reconcile pass premakes the next three monthly partitions ahead of now and
 ensures a partition covering today always exists. It also drops any partition
@@ -785,7 +814,7 @@ FROM pg_inherits
 WHERE inhparent = 'part_demo'::regclass;
 ```
 
-## Demo 4: distributed
+## Demo 4: Distributed
 
 Distributed mode points two or more PostgreSQL nodes at the *same* lake. The
 nodes form an active-active [Spock](https://github.com/pgEdge/spock) mesh; the
@@ -811,7 +840,7 @@ bash examples/walkthrough/guide.sh   # then choose: 4) Distributed
 The sections below show what that option does, so you can follow along or
 reproduce it by hand.
 
-### Bring up the two-node mesh
+### Bring Up the Two-Node Mesh
 
 Start the mesh stack, then form the Spock mesh - create a node on each member,
 subscribe each to the other, and set up the cold-write coordination on both.
@@ -826,7 +855,7 @@ If port 5442, 5443, 8191, or 8343 is already in use on your host, set
 or `COLDFRONT_MESH_S3_PORT` before `up`.
 
 Next, run the `curl` block from
-[What setup does](walkthrough.md#what-setup-does) with port 8191 in place
+[What Setup Does](walkthrough.md#what-setup-does) with port 8191 in place
 of 8181. That creates the `wh` warehouse and `public` namespace on the mesh's
 own Lakekeeper.
 
@@ -870,7 +899,7 @@ nodes - never the table data, which stays in the lake. The `set_storage_secret`
 call is what lets each node's DuckDB write Parquet to the shared object store;
 without it, cold writes fail to authenticate.
 
-### See the mesh
+### See the Mesh
 
 Both nodes are present, each subscribed to the other:
 
@@ -879,7 +908,7 @@ SELECT node_name FROM spock.node ORDER BY node_name;   -- db1, db2
 SELECT sub_name  FROM spock.subscription;              -- one per node
 ```
 
-### Write on one node, read on the other
+### Write on One Node, Read on the Other
 
 Create a lake-native table on `db1` and register it on `db2` as well (the call
 is idempotent and the registry is keyed by name, so each node ends up with an
@@ -913,7 +942,7 @@ FROM pg_class WHERE relname = 'events_lake';   -- v, 0 bytes
 reads straight from the shared lake. That is the point of distributed mode: add
 a node for compute over one copy of the data, with no storage to replicate.
 
-### Concurrent writes serialize (the bakery)
+### Concurrent Writes Serialize (The Bakery)
 
 Two nodes committing the same Iceberg table at once would normally collide -
 the catalog rejects the second commit with a `409 Conflict` and the application
@@ -932,7 +961,7 @@ INSERT INTO events_lake VALUES (301, now(), 'held', '{"n":"db1"}');
 ```
 
 In a second session, the claim is on `db1`, keyed by a ticket that also names
-the issuing node (a snowflake id), and it is already on `db2`: the claim is
+the issuing node (a Snowflake id), and it is already on `db2`: the claim is
 written over its own connection and committed at once, so it replicates while
 the transaction that took it is still open:
 

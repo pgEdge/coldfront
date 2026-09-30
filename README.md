@@ -70,13 +70,14 @@ modes in action with copy-pasteable commands.
 
 ColdFront is open source under the PostgreSQL License and runs on stock
 PostgreSQL 16, 17, and 18. The full build workflow lives in the
-**[Installation guide](docs/installation.md)**: build the thin coldfront layer
+**[Installation guide](docs/installation.md)**: build the thin ColdFront layer
 on top of the published DuckDB 1.5.x base image (or build the base yourself),
 or install bare-metal. Then continue with the Quickstart below.
 
-**Setting up on cloud S3?** Once the image is built, the
-**[S3 setup guide](docs/object_store.md)** takes you from an empty bucket to a
-working cold tier end-to-end.
+### Setting Up on Cloud S3?
+
+Once the image is built, the **[S3 setup guide](docs/object_store.md)** takes
+you from an empty bucket to a working cold tier end-to-end.
 
 ## Quickstart
 
@@ -106,18 +107,18 @@ SELECT count(*) FROM events;
 A table that already exists in the Iceberg catalog is adopted rather than
 created: `coldfront.adopt_iceberg_table()` reads its schema from the catalog
 and gives it the same wrapper view and registry row, read-only unless writes
-are asked for. `coldfront.release_iceberg_table()` hands it back with the
-Iceberg table untouched. See
-[Adopting a table that already exists in the catalog](docs/usage.md#adopting-a-table-that-already-exists-in-the-catalog).
+are asked for. `coldfront.release_iceberg_table()` hands the table back with
+the Iceberg table untouched. See
+[Adopting a Table That Already Exists in the Catalog](docs/usage.md#adopting-a-table-that-already-exists-in-the-catalog).
 
 To remove a table again, `coldfront.drop_iceberg_table()` unregisters it and
 drops the Iceberg table, deleting the stored objects only when asked to. See
-[Dropping an Iceberg table](docs/usage.md#dropping-an-iceberg-table-both-modes).
+[Dropping an Iceberg Table](docs/usage.md#dropping-an-iceberg-table-both-modes).
 
 For compliance environments that cannot store an object-store credential,
 `coldfront.set_storage_secret_vended()` runs with no credential in the
 database: Lakekeeper issues short-lived per-table credentials at access time.
-See [Vended credentials](docs/usage.md#vended-credentials).
+See [Vended Credentials](docs/usage.md#vended-credentials).
 
 ## Documentation
 
@@ -135,7 +136,7 @@ The following table lists the ColdFront guides and what each one covers:
 | **[Architecture: decoupled](docs/architecture_decoupled.md)** | Decoupled (iceberg-only) deep dive |
 | **[Architecture: vectors](docs/architecture_vectors.md)** | Vector storage internals - type mapping, routing state, cluster assignment, layout |
 
-## Least-privilege application roles
+## Least-Privilege Application Roles
 
 Application roles need no superuser and no server-file access, yet they read
 and write the cold tier through the same transparent view. Onboarding an

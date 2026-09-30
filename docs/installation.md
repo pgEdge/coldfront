@@ -1,4 +1,4 @@
-# Building ColdFront from source
+# Building ColdFront from Source
 
 > **Most users should install from packages** - see
 > [Installation](https://github.com/pgEdge/ColdFront/blob/main/README.md#installation)
@@ -15,7 +15,7 @@ column in UTC. No released pg_duckdb tag carries DuckDB 1.5.x yet, so the stack
 is built from a pinned upstream PR plus our patches - all from sources you can
 fetch.
 
-## What gets built
+## What Gets Built
 
 `docker/Dockerfile.duckdb15-base` is the recipe; it fetches the requirements,
 applies our patches, and compiles the following components:
@@ -53,7 +53,7 @@ source pin and compile step - is
 [`docker/Dockerfile.duckdb15-base`](https://github.com/pgEdge/ColdFront/blob/main/docker/Dockerfile.duckdb15-base)
 itself.
 
-## Build the image (Docker)
+## Build the Image (Docker)
 
 Build the stack in two stages, the prebuilt base and the thin app layer:
 
@@ -66,10 +66,10 @@ git clone <coldfront-repo> && cd coldfront
 docker build -f docker/Dockerfile.duckdb15-base --build-arg PG_MAJOR=18 \
   -t ghcr.io/pgedge/coldfront-duckdb-base:pg18 .
 
-# 2. Build the thin coldfront app layer + bring up the stack (seconds — it only
+# 2. Build the thin coldfront app layer + bring up the stack (seconds - it only
 #    compiles the coldfront extension on top of the base).
 docker compose up -d --build      # end-user single-node stack (ports published)
-# (CI uses docker-compose.matrix.yml / docker-compose.mesh.yml — NOT for end-user setup)
+# (CI uses docker-compose.matrix.yml / docker-compose.mesh.yml - NOT for end-user setup)
 ```
 
 The split keeps app builds fast and always testing current source: the
@@ -77,8 +77,8 @@ expensive, stable compiles (pg_duckdb 1.5.4 + the patched duckdb-iceberg) live
 in the prebuilt **base**, published to
 `ghcr.io/pgedge/coldfront-duckdb-base:pg{16,17,18}`; the **app** build
 ([`docker/Dockerfile.duckdb15`](https://github.com/pgEdge/ColdFront/blob/main/docker/Dockerfile.duckdb15))
-just `FROM`s it and compiles the coldfront extension in seconds. If you build
-the base yourself (step 1) the app layer `FROM`s your local image; otherwise it
+`FROM`s it and compiles the coldfront extension in seconds. If you build the
+base yourself (step 1) the app layer `FROM`s your local image; otherwise it
 `FROM`s the published `ghcr.io/pgedge/coldfront-duckdb-base:pg<major>`. Rebuild
 the published base via the
 [base-image workflow](https://github.com/pgEdge/ColdFront/blob/main/.github/workflows/base-image.yml)
@@ -88,11 +88,11 @@ covers the base Dockerfile and the files it copies in, and stops before the app
 build if that tag is not published, naming the command that publishes it. The
 floating `pg<major>` tag moves to the same image once the change is on `main`.
 
-Then follow [usage.md → One-time setup](usage.md#one-time-setup) (bootstrap
+Then follow [usage.md → One-Time Setup](usage.md#one-time-setup) (bootstrap
 Lakekeeper → create a table → tier → verify).
 
 > **pg_duckdb pin.** The base pins pg_duckdb to the merged PR #1025 commit
-> `c04e6a2` (DuckDB 1.5.4 — its duckdb submodule is the v1.5.4 tag), a fixed
+> `c04e6a2` (DuckDB 1.5.4 - its duckdb submodule is the v1.5.4 tag), a fixed
 > commit for reproducible builds rather than a moving PR head.
 >
 > **Base foundation.** The base is
@@ -100,7 +100,7 @@ Lakekeeper → create a table → tier → verify).
 > access to that image (or substitute an equivalent PostgreSQL base with the
 > same layout).
 
-## Verify the build
+## Verify the Build
 
 A self-contained smoke test confirms the freshly built stack works end to end:
 pg_duckdb, the patched duckdb-iceberg, Lakekeeper, and the object store. The
@@ -154,10 +154,10 @@ SQL
 
 A row count of 1 read back through Iceberg confirms the full path. For a real
 cloud store, drop the `local-store` profile, point the warehouse at your own
-bucket, and follow [usage.md → One-time setup](usage.md#one-time-setup) for the
+bucket, and follow [usage.md → One-Time Setup](usage.md#one-time-setup) for the
 full tier-and-verify journey.
 
-## Build prerequisites
+## Build Prerequisites
 
 The following table lists the prerequisites for each build path:
 
@@ -167,7 +167,7 @@ The following table lists the prerequisites for each build path:
 | The archiver (all paths) | Go 1.26.5+ (pinned in [go.mod](https://github.com/pgEdge/ColdFront/blob/main/go.mod)), `make` (`make build` → `./bin/archiver`) |
 | Bare metal (below) | `pg_config`, PostgreSQL server dev headers, libpq client headers/library (libpq-dev / libpq-devel), `make`, `gcc` |
 
-## Bare metal (no Docker)
+## Bare Metal (No Docker)
 
 The coldfront extension is a standard PGXS C extension:
 
@@ -203,7 +203,7 @@ built on the prebuilt
 [base](https://github.com/pgEdge/ColdFront/blob/main/docker/Dockerfile.duckdb15-base);
 `--build-arg PG_MAJOR=16|17|18`).
 
-### Pre-commit gate
+### Pre-Commit Gate
 
 `./run-ci-local.sh` runs `ci/matrix.sh --quick`: gofmt, golangci-lint, unit
 tests, build, the pg_regress unit layer, and the full journey on one
@@ -213,7 +213,7 @@ GitHub Actions
 runs the identical `ci/matrix.sh` harness - `--quick` on every push/PR,
 `--full` nightly and on demand - so local and CI never diverge.
 
-### Full matrix
+### Full Matrix
 
 `ci/matrix.sh --full`, the beta gate: PG {16, 17, 18} × {vanilla, mesh (3-node
 Spock)} × {tiered, decoupled} × {primary, standby} × {s3, aws, azure, gcs}. The
@@ -222,7 +222,7 @@ visibility via the shared Lakekeeper catalog, the R-A bakery serializing
 concurrent cold writers (same-node and cross-node) with no 409, and an N×(N-1)
 probe that the bakery's `coldfront.claims` table replicates in every direction.
 
-### Storage-backend gating
+### Storage-Backend Gating
 
 The same policy applies locally and in GitHub CI: the hermetic
 **SeaweedFS-as-S3** backend (`s3`) always runs - that is the default coverage

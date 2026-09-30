@@ -1,4 +1,4 @@
-# Using coldfront
+# Using ColdFront
 
 ColdFront offers two operating modes. Pick one per table; both can coexist in
 the same database. The two modes compare as follows:
@@ -13,14 +13,13 @@ the same database. The two modes compare as follows:
 Once the table exists, **the SQL surface is identical**: `SELECT`, `INSERT`,
 `UPDATE`, `DELETE` all work normally against the relation name (e.g. `events`).
 
-## Prerequisites (both modes)
+## Prerequisites (Both Modes)
 
-The stack must already be running as three services: PostgreSQL with the
-pg_duckdb and coldfront extensions, Lakekeeper, and any S3-compatible object
-store (SeaweedFS, MinIO, GCS, etc.). The one-time setup below brings it up and
-bootstraps it.
+The setup needs three services: PostgreSQL with the pg_duckdb and coldfront
+extensions, Lakekeeper, and any S3-compatible object store (SeaweedFS, MinIO,
+GCS, etc.). The one-time setup below brings them up and bootstraps them.
 
-## One-time setup
+## One-Time Setup
 
 Bring up the end-user stack (the example uses SeaweedFS, gated behind the
 `local-store` compose profile; host ports are published so the `localhost`
@@ -58,8 +57,8 @@ curl -X POST http://localhost:8181/management/v1/warehouse \
 # 3. Create the Iceberg namespace in the new warehouse.
 #    REQUIRED for decoupled (iceberg-only) mode: the Iceberg CREATE SCHEMA is
 #    deferred to transaction COMMIT but CREATE TABLE is POSTed eagerly, so
-#    coldfront.create_iceberg_table — which runs both in one
-#    transaction — would 404 against a cold warehouse. Pre-creating the
+#    coldfront.create_iceberg_table - which runs both in one
+#    transaction - would 404 against a cold warehouse. Pre-creating the
 #    namespace here (its own committed REST call) makes the function's in-txn
 #    CREATE SCHEMA IF NOT EXISTS a no-op so the table create succeeds. The
 #    archiver (tiered mode) creates the namespace itself and does not need this.
@@ -88,7 +87,7 @@ query that touches a tiered/decoupled view (read or write).
 
 For a real cloud-S3 setup, see [object_store.md](object_store.md).
 
-## Mode 1 - Tiered (hot + cold)
+## Mode 1 - Tiered (Hot + Cold)
 
 Create a partitioned table normally:
 
@@ -131,7 +130,7 @@ and registers it. From then on every cycle (1) tiers partitions older than
 lifecycle is **hot → `hot_period` → cold → `retention_period` → gone**; omit
 `retention_period` to keep cold data forever.
 
-### Inbound foreign keys
+### Inbound Foreign Keys
 
 A tiered table cannot be the target of an enforced foreign key from another
 table over its archivable range. Archiving physically removes the rows from
@@ -155,7 +154,7 @@ ALTER TABLE event_logs DROP CONSTRAINT event_logs_events_fkey;
 Better still, do not point an enforced foreign key at a tiered table over its
 archivable range in the first place.
 
-### 2-level (LIST → RANGE) tiered tables
+### 2-Level (LIST → RANGE) Tiered Tables
 
 A table partitioned `LIST (region) → RANGE (ts)` can be tiered too - the same
 `sub_partition` block as the standalone partition manager (Mode 3), so a
@@ -164,7 +163,7 @@ archiver at it:
 
 ```yaml
     - source_table: regional
-      partition_column: ts          # the RANGE (time) column — required for 2-level
+      partition_column: ts          # the RANGE (time) column - required for 2-level
       partition_period: monthly
       hot_period: 1 month
       # retention_period: 5 years   # optional cold expiry (region-agnostic, by ts)
@@ -172,14 +171,14 @@ archiver at it:
         values_source: "SELECT region FROM regions"
 ```
 
-One Iceberg table holds every region (region is just a column); the archiver
-tiers leaves a whole `ts` period at a time across **all** regions before
-advancing the shared hot/cold watermark, so a period only becomes cold once it
-is cold for every region. `id` mode is not supported in tiered mode (the cold
-tier is time-keyed). For why the ordering works that way, see
+One Iceberg table holds every region (region is an ordinary column); the
+archiver tiers leaves a whole `ts` period at a time across **all** regions
+before advancing the shared hot/cold watermark, so a period only becomes cold
+once it is cold for every region. `id` mode is not supported in tiered mode
+(the cold tier is time-keyed). For why the ordering works that way, see
 [architecture_tiered.md → Two-level tiering](architecture_tiered.md#two-level-list-range-tiering).
 
-## Mode 2 - Decoupled (iceberg-only)
+## Mode 2 - Decoupled (Iceberg-Only)
 
 Single call:
 
@@ -213,9 +212,11 @@ That single statement provisions:
 
 - `ice.public.events` on the attached Iceberg catalog.
 - a PG-side wrapper view `public.events` with proper PG-typed columns.
+
 - a `coldfront.tiered_views` registry row - every INSERT, UPDATE, and DELETE on
   the view is intercepted by the coldfront C hook and rewritten to a single
   `duckdb.raw_query(...)` against `ice.public.events`.
+
 
 In a mesh one node provisions: Spock's `ddl_sql` repset replicates the
 `CREATE VIEW`, and the `default` repset replicates the name-keyed registry row,
@@ -223,7 +224,7 @@ which arms the write hook on every peer. Each node also needs the bakery armed
 via `coldfront._ensure_claims_replicated()` - see the one-time mesh setup
 below.
 
-### Adopting a table that already exists in the catalog
+### Adopting a Table That Already Exists in the Catalog
 
 A table another engine wrote needs no provisioning, only a wrapper view and a
 registry row. `coldfront.adopt_iceberg_table()` reads the schema from the
@@ -281,7 +282,7 @@ collide at Lakekeeper.
 One relation can be registered per Iceberg table. A namespace that needs
 quoting, such as `Lake-EU`, works.
 
-## Mode 3 - Standalone partition manager (no cold tier)
+## Mode 3 - Standalone Partition Manager (No Cold Tier)
 
 **You don't need Iceberg at all.** If automated PostgreSQL partition
 maintenance is all you want - declarative time- or id-based RANGE partitioning
@@ -320,7 +321,7 @@ Register each managed table in `coldfront.partition_config`:
                       #     standalone table - data preserved)
 ```
 
-### Operating it
+### Operating It
 
 Schedule one pass per period or more often - a cron line, or a systemd
 `oneshot` service plus timer (a failed pass then surfaces as a failed unit, so
@@ -353,7 +354,7 @@ Keep the following operational behavior in mind when scheduling it:
   correct). `detach` is partition-only - the tiered archiver always drops after
   exporting to cold.
 
-### Primary keys on time-partitioned tables (id mode)
+### Primary Keys on Time-Partitioned Tables (id Mode)
 
 PostgreSQL requires a unique index to include the partition key, so a plain
 `PRIMARY KEY (id)` is impossible on a table partitioned by a separate `ts`
@@ -370,11 +371,11 @@ key *is* the key - a single-column `PRIMARY KEY (id)`:
 ```
 
 `uuidv7` reads the RFC 9562 leading-millisecond timestamp; `snowflake` decodes
-the pgEdge snowflake extension's layout. Either way the manager computes the
+the pgEdge Snowflake extension's layout. Either way the manager computes the
 month/day partition bounds as id values, so id-order equals time-order and the
 forward/retention schedule is unchanged.
 
-### Two-level (LIST → RANGE) sub-partitioning
+### Two-Level (LIST → RANGE) Sub-Partitioning
 
 For a table partitioned by `LIST (region)` whose children are themselves
 `RANGE`-partitioned by time, add a `sub_partition` block. `values_source` is a
@@ -391,7 +392,7 @@ values automatically:
         values_source: "SELECT code FROM regions"
 ```
 
-## Dropping an Iceberg table (both modes)
+## Dropping an Iceberg Table (Both Modes)
 
 `coldfront.drop_iceberg_table()` removes the Iceberg table backing a registered
 relation. It is the only sanctioned way to do so: a plain `DROP TABLE` or
@@ -436,7 +437,7 @@ Deletion is not instantaneous. The catalog entry disappears with the call, and
 Lakekeeper's own background queue removes the objects shortly afterwards, so a
 listing taken immediately after the call can still show them.
 
-### Handing an adopted table back
+### Handing an Adopted Table Back
 
 An adopted table is released rather than dropped, because ColdFront does not
 own it. `coldfront.release_iceberg_table()` removes the wrapper view, the
@@ -452,11 +453,11 @@ cold rows unreachable while the hot table returned under the relation's name.
 `drop_iceberg_table()` refuses a relation adopted read-only, for the mirrored
 reason: read access carries no authority to destroy.
 
-## Managing partitioned tables (CLI)
+## Managing Partitioned Tables (CLI)
 
 ColdFront splits configuration into two kinds. **Connection** config - the
-Postgres DSN, and (tiered archiver only) the Iceberg/S3 connection - stays in a
-small per-node YAML and is never replicated. **Per-table lifecycle** lives in
+PostgreSQL DSN, and (tiered archiver only) the Iceberg/S3 connection - stays in
+a small per-node YAML and is never replicated. **Per-table lifecycle** lives in
 `coldfront.partition_config`, a name-keyed table that replicates by value
 across a Spock mesh (like `tiered_views`/`archive_watermark`), so every node
 reads identical config - no per-node file syncing. Manage it with the CLI below
@@ -475,7 +476,7 @@ The data lifecycle is **hot PG → `hot_period` → cold Iceberg →
 dropped** (partition-only). Setting `hot_period` makes a table tiered; omitting
 it makes it partition-only.
 
-### What registration refuses
+### What Registration Refuses
 
 `register`, `import` and `set` share one validation gate, so a table that one
 command rejects cannot be added by another. Registration fails when:
@@ -498,7 +499,7 @@ command rejects cannot be added by another. Registration fails when:
 - the name leaves no room for the generated partition suffix: 53 characters for
   monthly and 50 for daily, within PostgreSQL's 63-byte identifier limit.
 - a tiered table carries a column whose type has no Iceberg equivalent (see
-  [Supported column types](#supported-column-types)). Every column goes through
+  [Supported Column Types](#supported-column-types)). Every column goes through
   the same type map the cold tier itself uses, so the answer comes back at the
   prompt rather than hours later from cron. Partition-only tables are exempt:
   nothing about them reaches Iceberg, so their column types are PostgreSQL's
@@ -542,7 +543,7 @@ partitioner register --config cf.yaml --table events --period monthly \
 archiver register --config cf.yaml --table events --period monthly \
     --hot-period "1 month" --retention "5 years"
 
-# id mode — a real single-column PRIMARY KEY (id) on a snowflake-keyed table.
+# id mode - a real single-column PRIMARY KEY (id) on a snowflake-keyed table.
 partitioner register --config cf.yaml --table events --period monthly \
     --column id --part-mode id --id-scheme snowflake --retention "1 year"
 
@@ -569,14 +570,14 @@ removing it; a disabled table is skipped by reconcile and omitted from
 `pg_catalog` for flat tables (required for 2-level). `register` writes a row
 whose `CHECK` constraints enforce the lifecycle rules at write time.
 
-**Managing tables:** the archiver and partitioner read the managed set only
-from `coldfront.partition_config`. `register` adds one table; `import` adds
-every table in a YAML `archiver.tables` list. Both write through the same
-validation (the PK must cover the partition key; `retention` must exceed
-`hot_period`), so an imported table is checked exactly as a registered one.
-`export` dumps the active rows back to YAML or SQL for git.
+Managing tables: the archiver and partitioner read the managed set only from
+`coldfront.partition_config`. `register` adds one table; `import` adds every
+table in a YAML `archiver.tables` list. Both write through the same validation
+(the PK must cover the partition key; `retention` must exceed `hot_period`), so
+an imported table is checked exactly as a registered one. `export` dumps the
+active rows back to YAML or SQL for git.
 
-## Storage backends
+## Storage Backends
 
 Configure **exactly one** cold-store backend:
 
@@ -585,12 +586,12 @@ Configure **exactly one** cold-store backend:
   `vhost`.
 - **Virtual-hosted cloud S3** (AWS S3 is the canonical one) - **omit
   `endpoint`** (and the `endpoint` arg to `set_storage_secret`) so DuckDB uses
-  the native per-Region virtual-hosted + HTTPS addressing; just set `region` to
-  your bucket's Region. This is **required** for Regions launched after
-  2019-03-20 (e.g. `ap-south-2`), whose DNS does not route path-style requests
-  and returns HTTP 400. The Lakekeeper warehouse profile must be a
-  virtual-hosted `s3` profile (`flavor: aws`, `path-style-access: false`, no
-  custom endpoint); the full walkthrough is [object_store.md](object_store.md).
+  the native per-Region virtual-hosted + HTTPS addressing; set `region` to your
+  bucket's Region. This is **required** for Regions launched after 2019-03-20
+  (e.g. `ap-south-2`), whose DNS does not route path-style requests and returns
+  HTTP 400. The Lakekeeper warehouse profile must be a virtual-hosted `s3`
+  profile (`flavor: aws`, `path-style-access: false`, no custom endpoint); the
+  full walkthrough is [object_store.md](object_store.md).
 - **Google Cloud Storage** - *not a separate backend*: use `s3:` pointed at
   GCS's S3-interoperability endpoint with an
   [HMAC key pair](https://cloud.google.com/storage/docs/authentication/hmackeys)
@@ -618,7 +619,7 @@ It writes the same `coldfront.storage_secret` row (replicated,
 Azure cold tier is subject to the soft-delete / change-feed restriction in
 [Caveats](index.md#caveats).
 
-## Vended credentials
+## Vended Credentials
 
 Vended credentials let a deployment run with no object-store credential stored
 in the database, in a DuckDB secret file, or in an archiver config; this suits
@@ -669,13 +670,13 @@ the attach mode, which is fixed per PostgreSQL backend at attach time; open a
 new session (or restart the archiver and compactor, which are short-lived
 processes) so the new mode takes effect.
 
-## Reading + writing (identical for both modes)
+## Reading + Writing (Identical for Both Modes)
 
 The same SQL works against the relation name in either mode, as the following
 examples show:
 
 ```sql
--- Reads — pg_duckdb handles the iceberg side; PG handles the heap side
+-- Reads - pg_duckdb handles the iceberg side; PG handles the heap side
 SELECT count(*) FROM events;
 SELECT id, status, data->>'k' FROM events WHERE ts >= '2026-04-01';
 
@@ -687,7 +688,7 @@ INSERT INTO events (ts, status, data) VALUES (now(), 'ok', '{"k":1}');
 UPDATE events SET status = 'fixed' WHERE id = 123;
 DELETE FROM events WHERE ts < '2025-01-01';
 
--- Bulk INSERT shapes are all set-based — no per-row work:
+-- Bulk INSERT shapes are all set-based - no per-row work:
 INSERT INTO events (ts, status, data) VALUES (...), (...), (...);
 INSERT INTO events (ts, status, data) SELECT ts, status, data FROM staging;
 INSERT INTO events (ts, status, data) SELECT now() + i*'1s'::interval, 'ok', '{}'
@@ -701,7 +702,7 @@ ROLLBACK;
 SELECT status FROM events WHERE id = 1;     -- back to whatever it was
 ```
 
-## Supported column types
+## Supported Column Types
 
 The following PostgreSQL column types are supported:
 
@@ -768,7 +769,7 @@ cross-tier read is planned by pg_duckdb - so no cast makes them readable. Store
 IP data as `text` and `oid` values as `bigint` (you can still index/compare
 them; cast on the hot side only if needed).
 
-## Gotchas
+## Caveats
 
 Keep the following caveats in mind when running either mode:
 
@@ -777,7 +778,7 @@ Keep the following caveats in mind when running either mode:
   `jsonb_build_object` / `jsonb_agg` and `date_bin`; other jsonb operators and
   functions are unsupported on cold or cross-tier reads. A hot-only read of the
   view runs in PostgreSQL with full jsonb (see
-  [Supported column types](#supported-column-types)).
+  [Supported Column Types](#supported-column-types)).
 - **Cross-tier isolation**: a long-running `SELECT` that touches the Iceberg
   side multiple times within one transaction may see writes from other sessions
   interleaved between scans. PG's repeatable-read does not extend across the
@@ -789,7 +790,7 @@ Keep the following caveats in mind when running either mode:
 - **Concurrent writes from multiple PG nodes (decoupled mode)**: serialized
   PG-side by the bakery protocol - every iceberg-only INSERT goes through
   `coldfront._exec_iceberg_with_claim`, which holds a globally-ordered
-  snowflake ticket and waits for its turn before committing to Lakekeeper. No
+  Snowflake ticket and waits for its turn before committing to Lakekeeper. No
   409 conflicts, no app-level retry. The protocol is Lamport-1978 mutex with
   the Ricart-Agrawala (1981) deferred-reply optimization; claims and acks
   replicate as Spock rows and it stays safe under Spock's asymmetric apply
@@ -797,7 +798,7 @@ Keep the following caveats in mind when running either mode:
   [docs/formal/Bakery.tla](https://github.com/pgEdge/ColdFront/blob/main/docs/formal/Bakery.tla)).
   The bakery requires the `snowflake` extension, the `coldfront.dblink_self`
   GUC (the connection string of the node's loopback), and a one-time
-  `SELECT coldfront._ensure_claims_replicated()` call on every node after spock
+  `SELECT coldfront._ensure_claims_replicated()` call on every node after Spock
   mesh setup; see
   [architecture_decoupled.md](architecture_decoupled.md#concurrency-horizontal-scaling-the-bakery-protocol).
   Sync-rep is **not** required. The throughput ceiling is Lakekeeper's commit
@@ -816,13 +817,13 @@ Keep the following caveats in mind when running either mode:
   very large historical seeds (mostly-cold), prefer iceberg-only mode where ids
   come from your source data.
 
-## Distributed setup (3-node mesh, decoupled mode)
+## Distributed Setup (3-Node Mesh, Decoupled Mode)
 
-For multi-writer iceberg workloads, run coldfront on N PG nodes in a Spock mesh
+For multi-writer iceberg workloads, run ColdFront on N PG nodes in a Spock mesh
 against the same Lakekeeper + S3. The bakery serializes commits PG-side so
 writers never collide at the catalog.
 
-### Per-node `postgresql.conf`
+### Per-Node `postgresql.conf`
 
 The configuration below applies to each node in the mesh:
 
@@ -852,8 +853,8 @@ output_plugin_libraries = 'pgoutput, test_decoding, spock_output'
 # quiet period.  1 s leaves comfortable margin.
 wal_receiver_status_interval = 1s
 
-# Per-node — any distinct integer 1..1023 (must be unique per node; the value
-# is otherwise arbitrary — the bakery matches acks by spock node name, not by id).
+# Per-node - any distinct integer 1..1023 (must be unique per node; the value
+# is otherwise arbitrary - the bakery matches acks by spock node name, not by id).
 snowflake.node = 1
 
 # DSN of the node's loopback, which runs the bakery's autonomous claim
@@ -890,9 +891,9 @@ R-A ack barrier is what serializes iceberg commits. You can still enable it
 cluster-wide if you want stronger durability for non-bakery writes, but it
 plays no part in iceberg-commit serialization.
 
-**One-time mesh setup** - must be done in this order on every node, because
+One-time mesh setup - must be done in this order on every node, because
 `coldfront._ensure_claims_replicated()` calls `spock.repset_add_table` and so
-requires the local spock node to already exist:
+requires the local Spock node to already exist:
 
 ```sql
 -- 1. Extensions, in dependency order. snowflake is a bakery prereq
@@ -936,11 +937,11 @@ SELECT spock.repset_add_table('default', 'coldfront.archive_watermark'::regclass
 `synchronize_structure := false, synchronize_data := false` - tables already
 exist on every node from the coldfront extension; no initial copy needed.
 
-**Verify before benching** - insert a sentinel claim on each node and read it
-back from every other node. All N×(N-1) directions must show the row before
-traffic starts. `ci/journey.sh` `story_mesh_substrate` is a copyable reference.
+Verify before benching - insert a sentinel claim on each node and read it back
+from every other node. All N×(N-1) directions must show the row before traffic
+starts. `ci/journey.sh` `story_mesh_substrate` is a copyable reference.
 
-## Tuning knobs
+## Tuning Knobs
 
 The following GUCs adjust write behavior and execution; tune them as needed:
 
@@ -967,7 +968,7 @@ The following GUCs adjust write behavior and execution; tune them as needed:
   divide it by the concurrent sessions or give the temp path its own filesystem
   or quota.
 
-## Going deeper
+## Going Deeper
 
 For deeper detail on each mode's internals, see the architecture references:
 

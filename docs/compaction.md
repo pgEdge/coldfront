@@ -1,17 +1,16 @@
-# COMPACTOR - cold-tier table maintenance
+# COMPACTOR - Cold-Tier Table Maintenance
 
 `cmd/compactor` keeps a cold-tier Iceberg table healthy: it compacts each
 partition's small Parquet files into fewer large ones, expires old snapshots,
 and removes orphan files. ColdFront's cold tier writes one Parquet file per
 append and nothing else reclaims the resulting bloat, so without maintenance a
 busy table accumulates tens of thousands of tiny files and an unbounded
-snapshot history.
-
-It is a standalone static binary built on [apache/iceberg-go], separate from
-the archiver. Every operation that mutates a table is serialized through the
-ColdFront bakery - the same claim cold writes take - so it never conflicts
-(409s) with concurrent writers, on a single node or across a Spock mesh. It
-runs against a primary; against a read-only standby it exits with an error.
+snapshot history. The compactor is a standalone static binary built on
+[apache/iceberg-go], separate from the archiver. Every operation that mutates a
+table is serialized through the ColdFront bakery - the same claim cold writes
+take - so it never conflicts (409s) with concurrent writers, on a single node
+or across a Spock mesh. The compactor runs against a primary; against a
+read-only standby it exits with an error.
 
 [apache/iceberg-go]: https://github.com/apache/iceberg-go
 
@@ -23,8 +22,8 @@ Run the compactor against a deployment config, naming the table to maintain:
 compactor --config <yaml> --table <name> [flags]
 ```
 
-The flags below control which maintenance steps run and how aggressively each
-reclaims:
+The following table describes the flags that control which maintenance steps
+run and how aggressively each reclaims:
 
 | Flag | Default | Effect |
 |---|---|---|
@@ -52,7 +51,8 @@ cold-store stanza.
 
 ## Backends
 
-One binary serves every ColdFront cold store; configure exactly one:
+The following table lists the backends a single binary serves; configure
+exactly one:
 
 | Backend | Config |
 |---|---|
@@ -61,7 +61,7 @@ One binary serves every ColdFront cold store; configure exactly one:
 | Google Cloud Storage | `s3:` pointed at `storage.googleapis.com` with HMAC keys (S3-interop) |
 | Azure ADLS Gen2 | `azure: {connection_string}` |
 
-## How it works
+## How It Works
 
 The compactor loads the table from the Lakekeeper catalog and runs the
 requested steps, each under a bakery claim on that table:

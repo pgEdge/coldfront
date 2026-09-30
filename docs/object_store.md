@@ -1,4 +1,4 @@
-# Get ColdFront running on S3
+# Get ColdFront Running on S3
 
 This walkthrough takes you from an empty S3 bucket to a working ColdFront cold
 tier in one sitting. You stand up the ColdFront stack (PostgreSQL + the
@@ -8,7 +8,7 @@ Postgres.
 
 It targets a real cloud S3 service that uses virtual-hosted addressing. For a
 path-style S3-compatible store (MinIO, SeaweedFS) or GCS, see
-[usage.md → Storage backends](usage.md#storage-backends) instead.
+[usage.md → Storage Backends](usage.md#storage-backends) instead.
 
 No prior ColdFront knowledge assumed. Copy-paste top to bottom. Placeholders
 used throughout: bucket `my-iceberg-bucket`, region `eu-west-1`, key
@@ -60,7 +60,7 @@ Before you begin, gather the following:
 
 ---
 
-## 2. Bring up the stack (Postgres + Lakekeeper)
+## 2. Bring Up the Stack (Postgres + Lakekeeper)
 
 Start the stack from the repo root with a single Compose command:
 
@@ -72,7 +72,8 @@ This starts **Postgres** (with `pg_duckdb` and `coldfront` preloaded),
 **Lakekeeper** (the Iceberg REST catalog), Lakekeeper's **own catalog
 Postgres**, and a one-shot **migrate** job. It does **not** start the bundled
 SeaweedFS - that is gated behind the `local-store` profile for credential-free
-local eval. For cloud S3 you talk to the bucket directly, so you don't need it.
+local eval. For cloud S3 you talk to the bucket directly, so you don't need the
+bundled SeaweedFS.
 
 If a local Postgres already owns port 5432, pick another host port:
 
@@ -89,7 +90,7 @@ docker inspect -f '{{.State.Health.Status}}' "$(docker compose ps -q db)"   # =>
 
 ---
 
-## 3. One-time Lakekeeper setup
+## 3. One-Time Lakekeeper Setup
 
 Run the following three calls once each.
 
@@ -103,7 +104,7 @@ curl -X POST http://localhost:8181/management/v1/bootstrap \
   -d '{"accept-terms-of-use":true}'
 ```
 
-### 3b. Create the S3 warehouse
+### 3b. Create the S3 Warehouse
 
 A warehouse tells Lakekeeper where on S3 your Iceberg tables live and which
 credential to use. This is the **virtual-hosted cloud-S3** profile - these
@@ -144,20 +145,20 @@ curl -X POST http://localhost:8181/management/v1/warehouse \
 # => HTTP 201
 ```
 
-The `key-prefix` is an arbitrary path inside the bucket. `coldfront` is just an
+The `key-prefix` is an arbitrary path inside the bucket. `coldfront` is only an
 example.
 
-**Vended-credentials variant.** To run ColdFront with no stored credential
+Vended-credentials variant. To run ColdFront with no stored credential
 ([usage.md](usage.md#vended-credentials)), the warehouse issues per-table STS
 credentials instead of handing the client a static key. Two things change from
 the warehouse above.
 
-First, create an IAM role scoped to the bucket. Lakekeeper assumes it per table
-and vends the resulting short-lived key, secret, and session token to
+First, create an IAM role scoped to the bucket. Lakekeeper assumes the role per
+table and vends the resulting short-lived key, secret, and session token to
 ColdFront. Its permission policy grants `GetObject` / `PutObject` /
 `DeleteObject` / `ListBucket` (plus the multipart actions) on the bucket and
 `arn:aws:s3:::my-iceberg-bucket/*`. Its trust policy lets the warehouse
-credential's own IAM identity assume it, gated by an `ExternalId` that
+credential's own IAM identity assume the role, gated by an `ExternalId` that
 Lakekeeper must present (confused-deputy protection):
 
 ```json
@@ -194,14 +195,14 @@ in the warehouse and in the role's trust condition must match. On the database
 side, replace the `set_storage_secret(...)` call in Section 4 with
 `SELECT coldfront.set_storage_secret_vended();`.
 
-### 3c. Pre-create the `public` namespace
+### 3c. Pre-Create the `public` Namespace
 
 Resolve the warehouse id, then create the `public` namespace under it:
 
 ```bash
 WID=$(curl -s http://localhost:8181/management/v1/warehouse \
   | grep -oE '"warehouse-id":"[^"]+"' | head -1 | cut -d'"' -f4)
-[ -n "$WID" ] || { echo "no warehouse id — did step 3b return 201?"; exit 1; }
+[ -n "$WID" ] || { echo "no warehouse id - did step 3b return 201?"; exit 1; }
 
 curl -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
   -H "Content-Type: application/json" \
@@ -218,7 +219,7 @@ curl -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
 
 ---
 
-## 4. Database setup
+## 4. Database Setup
 
 Open psql inside the Postgres container:
 
@@ -232,7 +233,7 @@ Create both extensions in your database:
 CREATE EXTENSION IF NOT EXISTS pg_duckdb;
 CREATE EXTENSION IF NOT EXISTS coldfront;
 -- duckdb.install_extension('iceberg') is harmless but NOT needed on the ColdFront
--- image — the patched iceberg extension ships preplaced and autoloads on ATTACH.
+-- image - the patched iceberg extension ships preplaced and autoloads on ATTACH.
 ```
 
 > **`CREATE EXTENSION coldfront` is required and easy to miss.** The image
@@ -257,7 +258,7 @@ SELECT coldfront.set_storage_secret('AKIAEXAMPLE...', '<your-secret-key>', NULL,
 
 ---
 
-## 5. Fastest demo - decoupled mode (the table lives entirely in S3)
+## 5. Fastest Demo - Decoupled Mode (The Table Lives Entirely in S3)
 
 A decoupled (iceberg-only) table has no Postgres hot tier; every row lives in
 Iceberg on S3, and you read and write it through a normal-looking Postgres
@@ -283,7 +284,7 @@ SELECT count(*) AS n, max(note) AS last FROM public.s3_demo;
 That `count(*) = 2` is read back through `iceberg_scan` from your real S3
 bucket - the round trip is complete.
 
-### Tiered mode - the headline feature
+### Tiered Mode - The Headline Feature
 
 Decoupled mode is the warm-up. ColdFront's real purpose is **tiered** tables: a
 partitioned Postgres table whose hot partitions automatically age out to
@@ -291,15 +292,15 @@ Iceberg on S3 once they pass a retention window, after which reads
 transparently union live Postgres data with cold S3 data and writes route to
 the correct tier.
 
-You drive it with the `archiver` binary against a small YAML config (Postgres
-DSN, the `wh` warehouse, your S3 region/keys); each table's lifecycle is
-registered with `archiver register`. The credential and warehouse you set up
+You drive tiered tables with the `archiver` binary against a small YAML config
+(Postgres DSN, the `wh` warehouse, your S3 region/keys); each table's lifecycle
+is registered with `archiver register`. The credential and warehouse you set up
 above are exactly what it needs. See [usage.md](usage.md) for the archiver
 config and the partition CLI.
 
 ---
 
-## 6. Verify in S3 and troubleshoot
+## 6. Verify in S3 and Troubleshoot
 
 Confirm objects physically landed (an S3 client such as the `aws` CLI, region
 exported):
@@ -316,12 +317,12 @@ did `s3_demo` go?" → look under the UUID path beneath your `key-prefix`.
 
 Work through this checklist if something failed:
 
-1. **`CREATE EXTENSION coldfront`** - ran it once in your database? Preloading
-   is not the same as creating the extension. Symptom:
-   `schema "coldfront" does not exist`.
-2. **`set_storage_secret(..., NULL, 'eu-west-1')`** - 3rd arg `NULL` (native
-   vhost+HTTPS), 4th arg your real region? A non-NULL endpoint forces
-   path-style and breaks modern Regions (HTTP 400).
-3. **Namespace `public` pre-created** in Lakekeeper before
-   `create_iceberg_table`? Without it the decoupled create 404s.
-4. **Long-term key** - not an SSO / temporary session-token credential.
+- **`CREATE EXTENSION coldfront`** - ran it once in your database? Preloading
+  is not the same as creating the extension. Symptom:
+  `schema "coldfront" does not exist`.
+- **`set_storage_secret(..., NULL, 'eu-west-1')`** - 3rd arg `NULL` (native
+  vhost+HTTPS), 4th arg your real region? A non-NULL endpoint forces path-style
+  and breaks modern Regions (HTTP 400).
+- **Namespace `public` pre-created** in Lakekeeper before
+  `create_iceberg_table`? Without it the decoupled create 404s.
+- **Long-term key** - not an SSO / temporary session-token credential.

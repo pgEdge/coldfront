@@ -1,17 +1,16 @@
-# Decoupled (iceberg-only) operating mode
+# Decoupled (Iceberg-Only) Operating Mode
 
-This document describes an alternate operating mode of the coldfront project
+This document describes an alternate operating mode of the ColdFront project
 where a table lives entirely in Iceberg - no PG-native heap, no hot tier, no
 archiver. PostgreSQL becomes a stateless compute front-end; storage is owned by
-Lakekeeper + the underlying S3-compatible object store.
+Lakekeeper + the underlying S3-compatible object store. Decoupled mode shares
+the same codebase, docker stack and extension as tiered mode. The shared
+mechanics - pg_duckdb Iceberg I/O, the rewrite hook, the bakery protocol, the
+registry - are in [architecture.md](architecture.md); tiered mode is in
+[architecture_tiered.md](architecture_tiered.md). This document covers what is
+specific to decoupled mode.
 
-It shares the same codebase, docker stack and extension as tiered mode. The
-shared mechanics - pg_duckdb Iceberg I/O, the rewrite hook, the bakery
-protocol, the registry - are in [architecture.md](architecture.md); tiered mode
-is in [architecture_tiered.md](architecture_tiered.md). This document covers
-what is specific to decoupled mode.
-
-## What "decoupled" means
+## What "Decoupled" Means
 
 The table below contrasts each concern between tiered mode and decoupled mode
 described in this document:
@@ -43,7 +42,7 @@ Iceberg snapshot per statement. Tables that don't appear in
 `coldfront.tiered_views` are invisible to the hook (`lookup_tiered_view`
 returns null → fast path-out).
 
-## Bootstrap sequence
+## Bootstrap Sequence
 
 Configure the warehouse GUCs, then create the extensions and storage secret
 once per database:
@@ -63,7 +62,7 @@ SELECT coldfront.set_storage_secret('<key>', '<secret>', '<endpoint>');  -- cold
 table - an extension-member table (so its data is excluded from `pg_dump` by
 default) that is added to the Spock repset (so it replicates by value to every
 mesh node) - and materializes a DuckDB PERSISTENT SECRET, which DuckDB loads at
-instance init. It is set once; no per-session arming is needed.
+instance init. The secret is set once; no per-session arming is needed.
 
 After that, the first query touching a tiered view in any session lazily
 attaches the catalog and `ice.public.*` becomes available.
@@ -73,7 +72,7 @@ attaches the catalog and `ice.public.*` becomes available.
 With the coldfront extension loaded and the storage secret set, the wrapper
 view supports the operations below.
 
-### What works
+### What Works
 
 The following operations are supported, with their dispatch path and notes:
 
@@ -89,7 +88,7 @@ The following operations are supported, with their dispatch path and notes:
 | ROLLBACK of writes | `BEGIN; raw_query(...); ROLLBACK;` | pg_duckdb's `XactCallback` ties DuckDB↔PG tx, so ROLLBACK undoes pending Iceberg writes |
 | DROP TABLE | `SELECT coldfront.drop_iceberg_table('<schema>', '<name>', <purge>)` | Removes the wrapper view and every registration row, vector configuration included. A raw `DROP TABLE` through `duckdb.raw_query` drops only the catalog table and leaves them behind |
 
-### What does not work
+### What Does Not Work
 
 The following attempts fail, with the reason for each:
 
@@ -105,7 +104,7 @@ through `duckdb.raw_query('… DuckDB SQL …')`. Neither is as ergonomic as a
 normal PG table. This is the fundamental ergonomics gap of decoupled mode
 without a PG-side wrapper view.
 
-## Supported column types
+## Supported Column Types
 
 The supported column types are exactly the set that round-trips cleanly between
 PG and Iceberg (shared with tiered mode; see `pgFormatTypeToDuckDB` in
@@ -147,11 +146,11 @@ The narrowing is deliberate: a type that cannot round-trip exactly is rejected
 rather than silently downgraded, because data that appears stored but changes
 shape on read is worse than no support.
 
-## Wrapper helper: `coldfront.create_iceberg_table()`
+## Wrapper Helper: `coldfront.create_iceberg_table()`
 
 Raw_query / iceberg_scan are functional but ergonomically poor - every read
 needs `r['col']` accessor, every write needs a
-`duckdb.raw_query('… DuckDB SQL …')` envelope. To close that gap, coldfront
+`duckdb.raw_query('… DuckDB SQL …')` envelope. To close that gap, ColdFront
 ships a single helper that provisions an Iceberg-only table together with a
 PG-side wrapper view and a registry row that arms the C hook to handle every
 DML on the view. After that, applications use **plain PG syntax** against the
@@ -193,7 +192,7 @@ What the helper does:
    column types are validated by `coldfront._iceberg_storage_type()`, which
    mirrors the canonical map in `cmd/archiver/main.go pgFormatTypeToDuckDB`.
    Anything outside the supported set (see
-   [Supported column types](#supported-column-types) above) raises before any
+   [Supported Column Types](#supported-column-types) above) raises before any
    DDL is issued.
 3. `CREATE OR REPLACE VIEW <schema>.<name> AS SELECT r['col']::pg_type AS col, … FROM duckdb.query('SELECT * FROM ice.public.<name>') AS t(r)` -
    projection wraps the struct accessor so applications see flat columns.
@@ -232,7 +231,7 @@ Limits the helper inherits from the platform:
 The helper doesn't add capability over raw_query - it composes the existing
 primitives into a single call so applications get a normal-looking PG table.
 
-## Wrapper helper: `coldfront.adopt_iceberg_table()`
+## Wrapper Helper: `coldfront.adopt_iceberg_table()`
 
 Adoption registers a table that already exists in the Iceberg catalog. The
 wrapper view and the registry row are built from the schema the catalog holds,
@@ -264,7 +263,7 @@ registry row records writability. The C hook emits `tiered_views.iceberg_table`
 verbatim, so a reference outside `ice.<pg_schema>.<pg_relname>` needs no
 further handling.
 
-### Types an adopted column reads as
+### Types an Adopted Column Reads As
 
 Iceberg records no PostgreSQL type, so the PostgreSQL types that share one
 storage type all come back as the type that storage type reads as natively. The
@@ -327,7 +326,7 @@ refuse a read-only relation too, since each rewrites or destroys the Iceberg
 table. The archiver and `create_iceberg_table()` set the flag; adoption
 defaults it to false.
 
-### One relation per Iceberg table
+### One Relation per Iceberg Table
 
 `coldfront.tiered_views` has a unique constraint on `iceberg_table`, and
 adoption refuses a reference that is already registered. The cluster-column
@@ -340,7 +339,7 @@ with every part quoted, such as `"ice"."lake"."orders"`, and the compactor
 claims under that same spelling. The constraint and the bakery compare
 references as strings, so each Iceberg table has exactly one.
 
-### Adoption binds the name once
+### Adoption Binds the Name Once
 
 A second `adopt_iceberg_table()` under a registered name is refused whatever
 its arguments, as is a tiered relation's name. To arm writes, change an
@@ -354,7 +353,7 @@ a peer's own adopt is refused as already registered. A release unregisters
 everywhere, because the registry `DELETE` precedes the `DROP VIEW` in the same
 transaction and disarms the peer's DDL hook before the drop is applied there.
 
-### Handing a table back
+### Handing a Table Back
 
 `coldfront.release_iceberg_table()` removes the wrapper view, the registry row
 and the relation's vector configuration, and performs no Iceberg I/O, so the
@@ -385,7 +384,7 @@ Adoption inherits three limits:
   the watermark and the partition configuration would have to be reconciled
   with data ColdFront did not write.
 
-## Wrapper helper: `coldfront.drop_iceberg_table()`
+## Wrapper Helper: `coldfront.drop_iceberg_table()`
 
 Drops the Iceberg table backing a registered relation, in either mode:
 
@@ -411,7 +410,7 @@ differ, and the function says which path it took in a NOTICE:
 `p_purge` has no default, because the two outcomes are irreversible in opposite
 directions. `true` deletes the data and metadata objects, which for the cold
 tier are the only copy of that data. `false` leaves those objects in the object
-store with no catalog entry, where no coldfront component reclaims them, since
+store with no catalog entry, where no ColdFront component reclaims them, since
 the compactor's expiry and orphan passes walk the snapshots of a table that
 still exists. The caller states which one they mean.
 
@@ -453,7 +452,7 @@ Three properties worth knowing:
   dropped at all, and this function cannot override that: the drop carries
   `PURGE_REQUESTED` but never `force`.
 
-## ACID model
+## ACID Model
 
 (Summarizes material from [architecture.md](architecture.md) §Concurrency and
 §Known Limitations applied to the decoupled scenario.)
@@ -469,10 +468,10 @@ The table below gives the status of each ACID property in decoupled mode:
 | Isolation | **Read-your-own-write within a tx works** when the wrapper view uses `duckdb.query('SELECT * FROM ice.…')` as its read path (the helper does this by default). The plain `iceberg_scan('ice.…')` form is *not* tx-aware (it re-resolves the table from Lakekeeper each call), but pg_duckdb's planner folds `duckdb.query('SELECT * FROM ice.…')` into the same `ICEBERG_SCAN` plan with identical predicate pushdown, so the wrapper view gets tx visibility for free. Cross-call snapshot consistency is weaker than PG-native (see [Limitations](#limitations)). |
 | Durability | **Yes** - Iceberg commits are durable on the object store once Lakekeeper acknowledges. Stronger than PG WAL on local disk for many production setups. |
 
-## Concurrency / horizontal scaling - the bakery protocol
+## Concurrency / Horizontal Scaling - The Bakery Protocol
 
 Decoupled mode makes the data layer fully shared between any number of PG nodes
-pointing at the same Lakekeeper endpoint and S3 bucket.
+pointing at the same Lakekeeper endpoint and S3 bucket:
 
 - **Reads scale out trivially.** Each PG node hits Lakekeeper + S3
   independently. New nodes spin up in seconds; no data sync.
@@ -485,7 +484,7 @@ pointing at the same Lakekeeper endpoint and S3 bucket.
   and every live peer has acked (a peer defers its ack while it holds a smaller
   ticket). This stays safe under Spock's *asymmetric* apply - each node applies
   peers' rows on its own independent queue, so it never assumes a peer has
-  applied its concurrent claim; the snowflake-ticket total order and the ack
+  applied its concurrent claim; the Snowflake-ticket total order and the ack
   barrier serialize commits, not any global apply ordering. Modeled in
   [docs/formal/Bakery.tla](https://github.com/pgEdge/ColdFront/blob/main/docs/formal/Bakery.tla);
   the safety properties are verified via TLA+ (`Bakery.cfg`).
@@ -496,7 +495,7 @@ pointing at the same Lakekeeper endpoint and S3 bucket.
       deleted on release.
     - `coldfront.claim_acks` - peers insert
       `(ticket, ack_from_name, iceberg_table)` to acknowledge an originator's
-      claim, keyed by the acker's spock node name. Replicates back to the
+      claim, keyed by the acker's Spock node name. Replicates back to the
       originator, and is deleted with the claim: only the originator's own wait
       loop ever reads its acks, so a row has no reader once the claim is gone.
 
@@ -552,7 +551,7 @@ pointing at the same Lakekeeper endpoint and S3 bucket.
     node-local advisory transaction lock per Iceberg table, held across the
     whole claim + commit, so at most one same-node writer is inside the bakery
     at a time; the wait loop also requires that no same-node claim with a
-    smaller ticket exists on the table (snowflake tickets are per-node
+    smaller ticket exists on the table (Snowflake tickets are per-node
     monotonic + timestamped, so a smaller ticket means `nextval` was called
     earlier on this node).
 
@@ -627,21 +626,21 @@ pointing at the same Lakekeeper endpoint and S3 bucket.
 - **DDL replication.** Spock's `ddl_sql` repset replicates `CREATE/ALTER/DROP`
   of the wrapper view, and the `default` repset replicates the
   `coldfront.tiered_views` registry row (see
-  [Distributed setup](usage.md#distributed-setup-3-node-mesh-decoupled-mode)),
+  [Distributed Setup](usage.md#distributed-setup-3-node-mesh-decoupled-mode)),
   so one node provisions the table and replication arms every peer's hook.
 
-### Throughput characterization
+### Throughput Characterization
 
 The commit-rate ceiling sits at Lakekeeper, not at the PG side, so scale
 throughput with larger per-INSERT batches or by partitioning the Iceberg table.
 
-### Required configuration on every PG node
+### Required Configuration on Every PG Node
 
 Apply the following settings on every PG node - the server-wide settings first,
 then the per-node settings:
 
 ```ini
-# postgresql.conf — server-wide
+# postgresql.conf - server-wide
 wal_level = logical
 shared_preload_libraries = 'snowflake,spock,pg_duckdb,coldfront'
 
@@ -649,11 +648,11 @@ shared_preload_libraries = 'snowflake,spock,pg_duckdb,coldfront'
 # liveness check (PG default 10s would false-positive idle peers as dead).
 wal_receiver_status_interval = 1s
 
-# Sync-rep is NOT required by the bakery — R-A's ack barrier replaces it.
+# Sync-rep is NOT required by the bakery - R-A's ack barrier replaces it.
 ```
 
 ```ini
-# postgresql.conf — per-node. snowflake.node is any integer 1..1023, unique per
+# postgresql.conf - per-node. snowflake.node is any integer 1..1023, unique per
 # node; the value is otherwise arbitrary. The bakery matches acks by spock node
 # name (dead-peer detection joins claim_acks.ack_from_name to spock.node), so it
 # imposes no relationship between snowflake.node and the node name.
@@ -664,7 +663,7 @@ snowflake.node = 1     # node1
 # DSN of the loopback that runs the bakery's autonomous claim/ack/release statements (unix socket).
 coldfront.dblink_self = 'host=/tmp dbname=coldfront user=coldfront application_name=coldfront_dblink'
 
-# Optional — peer-liveness window for R-A's dead-peer escape; a peer
+# Optional - peer-liveness window for R-A's dead-peer escape; a peer
 # whose reply_time is older than this is treated as already-acked.
 coldfront.peer_alive_window_ms = 5000
 ```
@@ -674,9 +673,9 @@ The bakery has no peer-ack timeout knob. Dead peers are caught by the
 walsender is treated as already-acked); alive peers that haven't acked are
 either deferring legitimately or about to ack.
 
-**Per-node bootstrap** - after spock mesh setup, register the bakery tables in
-each node's default repset. Required because `spock.repset_add_table` needs the
-local spock node to exist (can't run at `CREATE EXTENSION` time):
+Per-node bootstrap - after Spock mesh setup, register the bakery tables in each
+node's default repset. Required because `spock.repset_add_table` needs the
+local Spock node to exist (can't run at `CREATE EXTENSION` time):
 
 ```sql
 -- run on every node, after spock.node_create + spock.sub_create:
@@ -693,7 +692,7 @@ receive the wrapper-view DDL via Spock's `ddl_sql` repset but do *not* re-run
 the helper - so the explicit per-node call above is mandatory in any multi-node
 setup.
 
-## When to use decoupled vs tiered
+## When to Use Decoupled vs Tiered
 
 The two modes suit different workloads; the guidance below summarizes when each
 one fits.
@@ -705,7 +704,7 @@ Decoupled (iceberg-only) is the right choice when:
   workloads).
 - Operational simplicity outweighs ergonomics: no archiver cron, no watermark,
   no autovacuum-vs-cutover lock conflict (see
-  [architecture_tiered.md → Tiered-specific limitations](architecture_tiered.md#tiered-specific-limitations)),
+  [architecture_tiered.md → Tiered-Specific Limitations](architecture_tiered.md#tiered-specific-limitations)),
   no PK rebuild after bulk load, no partition-management script.
 - You can tolerate the isolation gap (cross-query snapshot consistency). Tables
   created via `create_iceberg_table()` are queried with plain SQL through the

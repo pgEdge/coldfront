@@ -1,7 +1,7 @@
 ---
 cwd: ../
 ---
-# ColdFront guided walkthrough
+# ColdFront Guided Walkthrough
 
 New here? Run the guided walkthrough.
 
@@ -28,7 +28,7 @@ minutes); everything after it is quick.
 Prefer a terminal? `bash examples/walkthrough/guide.sh` runs the same demos as
 an interactive guide.
 
-## 💻 On your own machine
+## 💻 On Your Own Machine
 
 You need Docker 24+ with Compose V2 (the `docker compose` plugin, not the
 legacy `docker-compose` binary), roughly 3 GB of free disk inside Docker's
@@ -56,7 +56,7 @@ stack, and walks through each demo interactively. This page and the
 [demos](walkthrough_demos.md) cover the same steps - run them from the doc or
 paste them into your shell.
 
-## What setup does
+## What Setup Does
 
 Setup runs before the demos begin. Setup starts the containers, waits for
 PostgreSQL and Lakekeeper to accept connections, and creates the Lakekeeper
@@ -134,7 +134,7 @@ curl -sf -X POST \
   -d '{"namespace":["public"]}'
 ```
 
-### Using a cloud object store
+### Using a Cloud Object Store
 
 The walkthrough hero path uses SeaweedFS. To use a cloud store instead, replace
 the warehouse JSON above and the `set_storage_secret` call in Step 5 of

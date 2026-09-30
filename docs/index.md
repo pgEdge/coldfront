@@ -90,20 +90,20 @@ SELECT count(*) FROM events;
 A table that already exists in the Iceberg catalog is adopted rather than
 created: `coldfront.adopt_iceberg_table()` reads its schema from the catalog
 and gives it the same wrapper view and registry row, read-only unless writes
-are asked for. `coldfront.release_iceberg_table()` hands it back with the
-Iceberg table untouched. See
-[Adopting a table that already exists in the catalog](usage.md#adopting-a-table-that-already-exists-in-the-catalog).
+are asked for. `coldfront.release_iceberg_table()` hands the table back with
+the Iceberg table untouched. See
+[Adopting a Table That Already Exists in the Catalog](usage.md#adopting-a-table-that-already-exists-in-the-catalog).
 
 To remove a table again, `coldfront.drop_iceberg_table()` unregisters it and
 drops the Iceberg table, deleting the stored objects only when asked to. See
-[Dropping an Iceberg table](usage.md#dropping-an-iceberg-table-both-modes).
+[Dropping an Iceberg Table](usage.md#dropping-an-iceberg-table-both-modes).
 
 For compliance environments that cannot store an object-store credential,
 `coldfront.set_storage_secret_vended()` runs with no credential in the
 database: Lakekeeper issues short-lived per-table credentials at access time.
-See [Vended credentials](usage.md#vended-credentials).
+See [Vended Credentials](usage.md#vended-credentials).
 
-## Least-privilege application roles
+## Least-Privilege Application Roles
 
 Application roles need no superuser and no server-file access, yet they read
 and write the cold tier through the same transparent view. Onboarding an

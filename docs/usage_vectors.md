@@ -1,11 +1,11 @@
-# Working with embeddings
+# Working with Embeddings
 
 ColdFront stores embeddings in the cold tier as Iceberg `list<float>` and keeps
 the pgvector interface you already write. A vector column works in both modes:
 a tiered table whose recent rows stay in PostgreSQL, and a decoupled table that
 lives entirely in Iceberg.
 
-## Creating a table
+## Creating a Table
 
 Tiered, through the archiver's normal configuration:
 
@@ -45,7 +45,7 @@ The value coerces to the column whether the row lands hot or cold, and an
 changes when a table is clustered (below): assignments are maintained for you
 in the same statement as the write.
 
-## Reading and searching
+## Reading and Searching
 
 The view exposes the column as `real[]`, which is the same type Iceberg stores.
 Read it like any column:
@@ -68,7 +68,7 @@ All three pgvector operators are available: `<=>` cosine, `<->` Euclidean,
 `<#>` negative inner product. Use `<=>` unless you have a reason not to;
 clustering is built on cosine.
 
-### Three rules for the query vector
+### Three Rules for the Query Vector
 
 These are requirements, not style. Each fails clearly if broken.
 
@@ -108,23 +108,28 @@ CALL coldfront.vector_train('public', 'chunks', 'embedding');
 
 `CALL`, not `SELECT`: this is a procedure. It samples the cold tier, trains
 `nlist` centroids, stores them as a new generation, and assigns every cold row
-to its nearest centroid, rewriting the rows whose cluster changed. Every cold
-write after it assigns the row in the same statement, on every write path.
+to its nearest centroid, rewriting the rows whose cluster changed. After
+`vector_train` runs, every cold write assigns the row to a cluster in the same
+statement, on every write path.
 
 Compact afterwards. The assignment leaves a delete marker per rewritten row and
 those rows in rewrite order; compaction is what puts them in cluster order and
 clears the markers. Without it the rows are assigned but a search still reads
 more of the table than it needs to.
 
-**Retraining.** Call `vector_train` again when the data has grown or you want a
-different `nlist`. Without `p_nlist`, the new centroids start from the current
-ones and keep their identities, so only the rows whose nearest centroid changed
-are rewritten; with a new `nlist`, every row is. Either way the centroids and
-the assignments change together, so a search is never wrong in between; it is
-only slower until the next compaction.
+### Retraining
 
-**Time partitioning.** A tiered vector table is partitioned by time, because
-its hot table is; a decoupled one only if it was created with time partitioning
+Call `vector_train` again when the data has grown or you want a different
+`nlist`. Without `p_nlist`, the new centroids start from the current ones and
+keep their identities, so only the rows whose nearest centroid changed are
+rewritten; with a new `nlist`, every row is. Either way the centroids and the
+assignments change together, so a search is never wrong in between; it is only
+slower until the next compaction.
+
+### Time Partitioning
+
+A tiered vector table is partitioned by time, because its hot table is; a
+decoupled one only if it was created with time partitioning
 (`p_partition_cols`). On such a table a search with a time filter skips the
 months outside it, and a search over all of history reads one row group of each
 probed cluster per month rather than one, roughly the number of months more
@@ -139,8 +144,9 @@ stop reducing the data read. Above it there is a wide plateau.
 ### Choosing `nprobe`
 
 `nprobe` is how many clusters a search reads, and it is the dial between recall
-and speed. Measured on a 10 million row corpus of 1024-dimension embeddings,
-`nlist` 1000, against the exact answer for 100 queries:
+and speed. The following table shows recall and query time at each `nprobe`,
+measured on a 10 million row corpus of 1024-dimension embeddings, `nlist` 1000,
+against the exact answer for 100 queries:
 
 | `nprobe` | clusters read | recall | median query |
 |---|---|---|---|
@@ -176,7 +182,7 @@ faster at the same recall.
 Your corpus is not this one. Take these as the shape of the curve, and measure
 your own against a sample of queries you have exact answers for.
 
-### What a clustered search does
+### What a Clustered Search Does
 
 Once a column has a trained generation, a search that ends in
 `ORDER BY <column> <=> <vector> LIMIT n` reads only the `nprobe` clusters
@@ -195,7 +201,8 @@ Anything that is not that shape stays an exact scan of both tiers, which is
 correct. Two cases worth knowing: a search with no `LIMIT` is answered exactly,
 because asking for every row in order is not a request to approximate; and so
 is one wrapped in a subquery or CTE, because the clustering is applied to the
-statement you write rather than to a nested part of it.
+statement you write rather than to a nested part of it. The following two
+statements show the difference:
 
 ```sql
 -- narrowed to the nearest clusters
@@ -207,7 +214,7 @@ SELECT string_agg(body, ',') FROM (
 
 Rows written before the column was trained have no cluster, and they are
 returned by every search regardless of which clusters it reads. So is every
-hot-tier row. Nothing goes missing because it predates the clustering.
+hot-tier row. A row written before training never goes missing on that account.
 
 Two settings, per session:
 
@@ -221,7 +228,9 @@ SET coldfront.vector_probe = off;
 Leave `coldfront.vector_nprobe` at its default of `0` to use the `nprobe` you
 recorded for the column.
 
-### Checking whether the clustering is earning its keep
+### Checking Whether the Clustering Is Earning Its Keep
+
+Call `vector_status` and query its results table:
 
 ```sql
 CALL coldfront.vector_status();
@@ -232,7 +241,8 @@ SELECT table_name, rows_total, rows_unassigned, clusters_occupied,
 
 `probe_fraction` is the number to watch: the share of the cold rows a search
 reads on average. Lower is faster. `advice` is filled in only when something
-specific is holding that number up, and says which:
+specific is holding that number up; the following table shows what each message
+means and what to do:
 
 | What it says | What to do |
 |---|---|
@@ -245,7 +255,7 @@ Pass a schema and table to report on one column:
 `CALL coldfront.vector_status('public', 'chunks')`. The results land in a
 temporary table that lasts for your session, and each call replaces the last.
 
-## More than one vector column
+## More than One Vector Column
 
 A table may carry as many vector columns as you like. Each gets its own
 configuration, its own centroids and its own generation, and each is assigned
@@ -267,7 +277,7 @@ clusters are scattered through it, so its row-group statistics cover most of
 the file and nothing gets skipped.
 
 What a later column still gets is the filter. Its predicate cuts the rows that
-have to be *scored*, just not the rows that have to be *read*, and reading is
+have to be *scored*, but not the rows that have to be *read*, and reading is
 about 95% of the cost. Expect single-digit percent rather than the 54x the
 first column gets.
 
@@ -284,7 +294,7 @@ If a second vector column needs to be fast, the honest answer is a second table
 holding that column and a key, ordered by its own clustering. That is what a
 secondary index is, and Iceberg gives us no way to have two orders in one file.
 
-## What a clustered table needs from the deployment
+## What a Clustered Table Needs from the Deployment
 
 The assignment lookup reads the centroid tables through a local connection, so
 `coldfront.local_pg_dsn` must be set. The shipped container image sets it. On
@@ -311,7 +321,9 @@ so the number of places a search looks is set by data volume rather than by
 write count. Nothing to configure: the table records its own sort column at
 creation and the compactor reads it.
 
-## Limits worth knowing
+## Limits Worth Knowing
+
+The following limits apply to vector columns:
 
 - A hot pgvector index is optional and capped by pgvector itself: HNSW refuses
   a `vector` column beyond 2,000 dimensions and a `halfvec` beyond 4,000, while
