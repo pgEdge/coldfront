@@ -1,8 +1,8 @@
 # Third-Party Notices
 
-ColdFront bundles the third-party components below; their notices are reproduced to
-satisfy their licenses. ColdFront itself is under the PostgreSQL License
-([LICENSE.md](LICENSE.md)).
+ColdFront bundles the third-party components below; their notices are
+reproduced to satisfy their licenses. ColdFront itself is under the PostgreSQL
+License ([LICENSE.md](LICENSE.md)).
 
 ## MIT License
 
@@ -32,7 +32,8 @@ Copyright © Stichting DuckDB Foundation — **DuckDB** (2018-2025), **pg_duckdb
 
 pg_duckdb includes portions of PostgreSQL — Portions Copyright © 1996-2024
 PostgreSQL Global Development Group; © 1994 The Regents of the University of
-California — under the PostgreSQL License (full text in [LICENSE.md](LICENSE.md)).
+California — under the PostgreSQL License (full text in
+[LICENSE.md](LICENSE.md)).
 
 ## curl License
 

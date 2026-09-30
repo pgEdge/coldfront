@@ -1,32 +1,30 @@
 # COMPACTOR - cold-tier table maintenance
 
-`cmd/compactor` keeps a cold-tier Iceberg table healthy: it compacts
-each partition's small Parquet files into fewer large ones, expires old
-snapshots, and removes orphan files. ColdFront's cold tier writes one
-Parquet file per append and nothing else reclaims the resulting bloat, so
-without maintenance a busy table accumulates tens of thousands of tiny
-files and an unbounded snapshot history.
+`cmd/compactor` keeps a cold-tier Iceberg table healthy: it compacts each
+partition's small Parquet files into fewer large ones, expires old snapshots,
+and removes orphan files. ColdFront's cold tier writes one Parquet file per
+append and nothing else reclaims the resulting bloat, so without maintenance a
+busy table accumulates tens of thousands of tiny files and an unbounded
+snapshot history.
 
-It is a standalone static binary built on [apache/iceberg-go], separate
-from the archiver. Every operation that mutates a table is serialized
-through the ColdFront bakery - the same claim cold writes take - so it
-never conflicts (409s) with concurrent writers, on a single node or
-across a Spock mesh. It runs against a primary; against a read-only
-standby it exits with an error.
+It is a standalone static binary built on [apache/iceberg-go], separate from
+the archiver. Every operation that mutates a table is serialized through the
+ColdFront bakery - the same claim cold writes take - so it never conflicts
+(409s) with concurrent writers, on a single node or across a Spock mesh. It
+runs against a primary; against a read-only standby it exits with an error.
 
 [apache/iceberg-go]: https://github.com/apache/iceberg-go
 
 ## Usage
 
-Run the compactor against a deployment config, naming the table to
-maintain:
+Run the compactor against a deployment config, naming the table to maintain:
 
 ```text
 compactor --config <yaml> --table <name> [flags]
 ```
 
-The flags below control which maintenance steps run and how aggressively
-each reclaims:
+The flags below control which maintenance steps run and how aggressively each
+reclaims:
 
 | Flag | Default | Effect |
 |---|---|---|
@@ -41,16 +39,15 @@ each reclaims:
 | `--dry-run` | off | report what each step would do; change nothing |
 
 Compaction always runs (a no-op when nothing is below target);
-`--expire-snapshots` and `--orphans` are opt-in. A typical maintenance
-pass looks like this:
+`--expire-snapshots` and `--orphans` are opt-in. A typical maintenance pass
+looks like this:
 
 ```text
 compactor --config deploy.yaml --table events --expire-snapshots --orphans
 ```
 
-The config is the same deployment YAML the archiver reads - `postgres.dsn`
-(for the bakery claim),
-`iceberg.{warehouse, lakekeeper_endpoint}`, and exactly one
+The config is the same deployment YAML the archiver reads - `postgres.dsn` (for
+the bakery claim), `iceberg.{warehouse, lakekeeper_endpoint}`, and exactly one
 cold-store stanza.
 
 ## Backends
@@ -69,35 +66,32 @@ One binary serves every ColdFront cold store; configure exactly one:
 The compactor loads the table from the Lakekeeper catalog and runs the
 requested steps, each under a bakery claim on that table:
 
-- **Compaction** bin-packs below-target data files, partition by
-  partition, and rewrites each group into one larger file under its
-  partition, preserving every row (existing deletes are applied). If
-  nothing is below target it does nothing. Before planning, each data
-  file's position-delete files are scoped to its own partition, the only
-  ones that can reference its rows: iceberg-go attaches them by the
-  delete file's `file_path` bounds, which duckdb-iceberg writes under
-  DuckDB's own field id, so it would otherwise attach every delete file
-  to every data file and remove a skipped partition's delete files along
+- **Compaction** bin-packs below-target data files, partition by partition, and
+  rewrites each group into one larger file under its partition, preserving
+  every row (existing deletes are applied). If nothing is below target it does
+  nothing. Before planning, each data file's position-delete files are scoped
+  to its own partition, the only ones that can reference its rows: iceberg-go
+  attaches them by the delete file's `file_path` bounds, which duckdb-iceberg
+  writes under DuckDB's own field id, so it would otherwise attach every delete
+  file to every data file and remove a skipped partition's delete files along
   with a rewritten one.
 - **Snapshot expiry** is age-driven: it drops snapshots older than
   `--expire-older-than` (always keeping the current snapshot and at least
-  `--expire-retain-last`) and, by default, deletes the data and manifest
-  files only those snapshots referenced. This is what reclaims the small
-  files a compaction supersedes - they stay pinned by the pre-compaction
-  snapshot until it is expired.
-- **Orphan removal** deletes files under the table location that no
-  retained snapshot references - the safety net for files left by an
-  interrupted write or by `--expire-keep-files`. The `--orphan-age`
-  window keeps a concurrent writer's freshly-staged files from being
-  removed.
+  `--expire-retain-last`) and, by default, deletes the data and manifest files
+  only those snapshots referenced. This is what reclaims the small files a
+  compaction supersedes - they stay pinned by the pre-compaction snapshot until
+  it is expired.
+- **Orphan removal** deletes files under the table location that no retained
+  snapshot references - the safety net for files left by an interrupted write
+  or by `--expire-keep-files`. The `--orphan-age` window keeps a concurrent
+  writer's freshly-staged files from being removed.
 
 Each mutating step holds the bakery claim across its catalog commit and
-releases it when its PostgreSQL transaction commits, so it cannot
-interleave with a cold write to the same table. Snapshot maintenance is
-the engine's job, not the catalog's: Lakekeeper does no Iceberg snapshot
-or orphan maintenance.
+releases it when its PostgreSQL transaction commits, so it cannot interleave
+with a cold write to the same table. Snapshot maintenance is the engine's job,
+not the catalog's: Lakekeeper does no Iceberg snapshot or orphan maintenance.
 
 ## Requirements
 
-The compactor (`cmd/compactor`, apache/iceberg-go) reads the cold-tier
-Iceberg tables directly. Build the binary with `make compactor`.
+The compactor (`cmd/compactor`, apache/iceberg-go) reads the cold-tier Iceberg
+tables directly. Build the binary with `make compactor`.

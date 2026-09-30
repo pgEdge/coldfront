@@ -27,7 +27,7 @@ mkdir -p "${WORK_DIR}/docs"
 
 # All walkthrough files tracked under examples/walkthrough/, the
 # Dockerfile needed by the db service build context, and the published
-# tour document so curl-pipe users can open it in an editor.
+# tour documents so curl-pipe users can open them in an editor.
 FILES=(
     examples/walkthrough/guide.sh
     examples/walkthrough/runner.sh
@@ -40,6 +40,7 @@ FILES=(
     examples/walkthrough/config/partitioner.yaml
     docker/Dockerfile.duckdb15
     docs/walkthrough.md
+    docs/walkthrough_demos.md
 )
 
 FAILED=0
@@ -104,8 +105,9 @@ read -rp "  Choose [1/2]: " choice </dev/tty
 case "$choice" in
     2)
         echo ""
-        echo "  Open this file in your editor and run the commands in this terminal:"
+        echo "  Open these files in your editor and run the commands in this terminal:"
         echo "    $(pwd)/docs/walkthrough.md"
+        echo "    $(pwd)/docs/walkthrough_demos.md"
         echo ""
         ;;
     *)

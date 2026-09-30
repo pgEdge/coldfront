@@ -3,17 +3,16 @@
 ## Reporting a Vulnerability
 
 Please report security vulnerabilities to
-[**security@pgedge.com**](mailto:security@pgedge.com), which reaches the
-pgEdge security team.
+[**security@pgedge.com**](mailto:security@pgedge.com), which reaches the pgEdge
+security team.
 
 Please do not open a public issue for a suspected vulnerability.
 
-Tell us the product and version, what the impact is, and how to reproduce
-it. You do not need to sign anything or hold a pgEdge contract to report to
-us.
+Tell us the product and version, what the impact is, and how to reproduce it.
+You do not need to sign anything or hold a pgEdge contract to report to us.
 
-We acknowledge reports within five business days, tell you the outcome of
-our assessment, and tell you before we publish anything.
+We acknowledge reports within five business days, tell you the outcome of our
+assessment, and tell you before we publish anything.
 
 ## Supported Versions
 
@@ -28,8 +27,8 @@ Disclosure Statement:
 
 [**https://docs.pgedge.com/security**](https://docs.pgedge.com/security)
 
-You may test this software freely in an environment you control. Testing
-pgEdge Cloud requires prior written authorisation — see the statement.
+You may test this software freely in an environment you control. Testing pgEdge
+Cloud requires prior written authorisation — see the statement.
 
 ## Published Advisories
 

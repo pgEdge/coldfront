@@ -11,7 +11,8 @@
   "customizations": {
     "codespaces": {
       "openFiles": [
-        "docs/walkthrough.md"
+        "docs/walkthrough.md",
+        "docs/walkthrough_demos.md"
       ]
     },
     "vscode": {

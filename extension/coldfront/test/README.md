@@ -4,10 +4,10 @@ These are the **coldfront extension's** regression tests, run by PostgreSQL's
 `pg_regress` driver via the standard PGXS path (`make installcheck`, with the
 `REGRESS = …` list in [`../Makefile`](../Makefile)).
 
-They are **not** PostgreSQL's own ~200-test core suite (`src/test/regress`, which
-tests Postgres itself), and they are **not** the end-to-end suite — that is
-[`ci/journey.sh`](../../../ci/journey.sh), driven across the deployment matrix by
-`ci/matrix.sh`.
+They are **not** PostgreSQL's own ~200-test core suite (`src/test/regress`,
+which tests Postgres itself), and they are **not** the end-to-end suite — that
+is [`ci/journey.sh`](../../../ci/journey.sh), driven across the deployment
+matrix by `ci/matrix.sh`.
 
 ## What this layer is: white-box checks of the two C hooks (plus SQL unit tests)
 
@@ -79,13 +79,13 @@ extension's non-hook surface (third table below) and register no view.
 
 ## Why `coldfront.warehouse = ''` here (and only here)
 
-Fixtures that register a view blank `coldfront.warehouse` / `coldfront.lakekeeper_endpoint`.
-**This is deliberate isolation, not a coverage shortcut.** These tests verify the
-SQL the hooks *generate* and the DDL they *gate* — they do not touch Iceberg.
-With the warehouse blanked, the hook never attaches a live catalog during
-statement analysis, so the rewrite is checked **fast and deterministically** —
-no live Lakekeeper / S3 dependency, no non-deterministic attach NOTICE in the
-expected output.
+Fixtures that register a view blank `coldfront.warehouse` /
+`coldfront.lakekeeper_endpoint`. **This is deliberate isolation, not a coverage
+shortcut.** These tests verify the SQL the hooks *generate* and the DDL they
+*gate* — they do not touch Iceberg. With the warehouse blanked, the hook never
+attaches a live catalog during statement analysis, so the rewrite is checked
+**fast and deterministically** — no live Lakekeeper / S3 dependency, no
+non-deterministic attach NOTICE in the expected output.
 
 **Real cold-tier reads and writes — against a live Lakekeeper + SeaweedFS,
 writing real Parquet to real Iceberg and reading it back — are exercised
@@ -95,13 +95,13 @@ vanilla/mesh × tiered/decoupled cells). The split is intentional:
 - **this layer** — white-box unit tests of hook *logic* (no Iceberg I/O);
 - **the journey** — black-box E2E of real *behavior* (real Iceberg I/O).
 
-So `warehouse=off` appears *only* in this white-box layer, and never as a stand-in
-for real cold-tier coverage.
+So `warehouse=off` appears *only* in this white-box layer, and never as a
+stand-in for real cold-tier coverage.
 
 ## Scaffolding note
 
-Fixtures register a view by inserting a `coldfront.tiered_views` row (and, where a
-cutoff matters, an `archive_watermark` row) directly, rather than running the
-archiver — again because they test the hooks in isolation. The real provisioning
-paths (the archiver's table-swap, `coldfront.create_iceberg_table()`) are
-exercised by the journey.
+Fixtures register a view by inserting a `coldfront.tiered_views` row (and,
+where a cutoff matters, an `archive_watermark` row) directly, rather than
+running the archiver — again because they test the hooks in isolation. The real
+provisioning paths (the archiver's table-swap,
+`coldfront.create_iceberg_table()`) are exercised by the journey.

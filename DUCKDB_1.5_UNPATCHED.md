@@ -7,10 +7,11 @@ build story is [DUCKDB_1.5_PATCHED.md](DUCKDB_1.5_PATCHED.md).
 ## What "unpatched 1.5" is
 
 The *same* 1.5.x stack — pg_duckdb PR #1025 + `duckdb-iceberg` `v1.5-variegata`
-@ `5edc45f0` + avro/azure/postgres_scanner, libcurl 8.12, the same vcpkg/libasan
-toolchain and version pins — built with the three ColdFront patches **omitted**.
-It is still a locally-built (unsigned) extension; there is no signed upstream
-1.5.x iceberg to auto-install (no released pg_duckdb bundles DuckDB 1.5).
+@ `5edc45f0` + avro/azure/postgres_scanner, libcurl 8.12, the same
+vcpkg/libasan toolchain and version pins — built with the three ColdFront
+patches **omitted**. It is still a locally-built (unsigned) extension; there is
+no signed upstream 1.5.x iceberg to auto-install (no released pg_duckdb bundles
+DuckDB 1.5).
 
 ## The build delta (vs the patched base)
 
@@ -35,38 +36,41 @@ apply steps.
 ColdFront's cold-write code path is **agnostic** (see
 [DUCKDB_1.5_PATCHED.md §1](DUCKDB_1.5_PATCHED.md)) and fails safe: with
 `iceberg_bakery_patch` off, every cold write is **claim-first** — the bakery
-ticket is held across the parquet upload *and* the commit, so concurrent writers
-to one table serialize their (slow) uploads. This is correct and **never 409s**.
-The only thing lost is the ≈ 2.6× contended-upload throughput the bakery patch
-buys by overlapping uploads. Single-writer/sequential writes, writes to different
-tables, and tiered `INSERT`s (always claim-first) are unaffected either way.
+ticket is held across the parquet upload *and* the commit, so concurrent
+writers to one table serialize their (slow) uploads. This is correct and
+**never 409s**. The only thing lost is the ≈ 2.6× contended-upload throughput
+the bakery patch buys by overlapping uploads. Single-writer/sequential writes,
+writes to different tables, and tiered `INSERT`s (always claim-first) are
+unaffected either way.
 
 ## Consequence 2 — the COMPACTOR will NOT work
 
-The cold-tier small-file compactor (`cmd/compactor`, apache/iceberg-go) reads the
-Iceberg manifests that pg_duckdb / duckdb-iceberg wrote. Stock duckdb-iceberg's
-write path is **not** strict-Apache-reader compliant — it only ever round-trips
-through its own metadata-driven reader, which ignores the Avro metadata keys a
-strict reader checks. So iceberg-go rejects the manifests at:
+The cold-tier small-file compactor (`cmd/compactor`, apache/iceberg-go) reads
+the Iceberg manifests that pg_duckdb / duckdb-iceberg wrote. Stock
+duckdb-iceberg's write path is **not** strict-Apache-reader compliant — it only
+ever round-trips through its own metadata-driven reader, which ignores the Avro
+metadata keys a strict reader checks. So iceberg-go rejects the manifests at:
 
-- **format-version** — the manifest *list* never declares it, so a strict reader
-  defaults to v1 and then conflicts with the v2 manifest files.
-- **file_format** — written lowercase `"parquet"`, but the spec enum is `PARQUET`.
+- **format-version** — the manifest *list* never declares it, so a strict
+  reader defaults to v1 and then conflicts with the v2 manifest files.
+- **file_format** — written lowercase `"parquet"`, but the spec enum is
+  `PARQUET`.
 
 (The manifest *file* `content` key — hardcoded `"data"` vs a delete manifest's
 `"deletes"` — was the same class of bug, but it is fixed upstream at the pinned
 ref, so it is not a consequence of running unpatched here.)
 
 `compactor` therefore fails at `PlanFiles` / read-task building and **nothing
-consolidates the cold tier** — at scale, tens of thousands of small Parquet files
-accumulate with no go-native compaction path. The two interop patches (carried
-in the patched base) are exactly what make the compactor work; see
-[docs/compaction.md](docs/compaction.md) and [DUCKDB_1.5_PATCHED.md §3](DUCKDB_1.5_PATCHED.md).
+consolidates the cold tier** — at scale, tens of thousands of small Parquet
+files accumulate with no go-native compaction path. The two interop patches
+(carried in the patched base) are exactly what make the compactor work; see
+[docs/compaction.md](docs/compaction.md) and
+[DUCKDB_1.5_PATCHED.md §3](DUCKDB_1.5_PATCHED.md).
 
-**pg_duckdb's own reads and writes of the cold tier are unaffected** — it derives
-version/content/format from table metadata, never from the Avro keys iceberg-go
-checks. So an unpatched cold tier reads and writes fine through PostgreSQL; it
-just can't be compacted by the go-native compactor.
+**pg_duckdb's own reads and writes of the cold tier are unaffected** — it
+derives version/content/format from table metadata, never from the Avro keys
+iceberg-go checks. So an unpatched cold tier reads and writes fine through
+PostgreSQL; it just can't be compacted by the go-native compactor.
 
 ## Consequence 3: partitioned cold tables are only correct from UTC sessions
 
@@ -91,14 +95,14 @@ cold writer, the archiver included, has to run with `TimeZone = 'UTC'`.
 - every cold writer, the archiver included, runs with `TimeZone = 'UTC'`
   (Consequence 3: every tiered cold table is partitioned by time).
 
-Otherwise run the patched base ([DUCKDB_1.5_PATCHED.md](DUCKDB_1.5_PATCHED.md)) —
-the default.
+Otherwise run the patched base ([DUCKDB_1.5_PATCHED.md](DUCKDB_1.5_PATCHED.md))
+— the default.
 
 ## Verify (unpatched)
 
-- **Cold writes no-409:** a 3-way overlapping decoupled `INSERT` into one Iceberg
-  table (same-node and cross-node) → 3/3, no 409 — claim-first serializes the
-  uploads, so each writer reads a fresh catalog head.
-- **Compactor blocked (the documented consequence):** `compactor --config <yaml>
-  --table <t> --dry-run` errors at `PlanFiles` on the format-version /
-  file_format cross-check.
+- **Cold writes no-409:** a 3-way overlapping decoupled `INSERT` into one
+  Iceberg table (same-node and cross-node) → 3/3, no 409 — claim-first
+  serializes the uploads, so each writer reads a fresh catalog head.
+- **Compactor blocked (the documented consequence):**
+  `compactor --config <yaml> --table <t> --dry-run` errors at `PlanFiles` on
+  the format-version / file_format cross-check.

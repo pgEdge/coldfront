@@ -4283,10 +4283,7 @@ story_composite_key_rejected() {
 # ───────────────────────────────────────────────────────────────────────────
 # Story — TC-043: cold data confirmed in Iceberg via metadata probe.
 # After archival, iceberg_metadata() must report at least one Parquet data file
-# for the events Iceberg table. iceberg_metadata() resolves its argument as a
-# filesystem path, so a REST-catalog table cannot be addressed by name: the
-# table's metadata.json location comes from Lakekeeper first, exactly as
-# docs/walkthrough.md does it. This is the only story that reads the cold tier
+# for the events Iceberg table. This is the only story that reads the cold tier
 # through the object store rather than through the view, so it must never fall
 # back to a row count — that would just re-assert story_reads.
 # ───────────────────────────────────────────────────────────────────────────

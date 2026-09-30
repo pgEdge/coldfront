@@ -28,9 +28,9 @@ Edit the environment file and set at least the two required variables:
 
 - `LAKEKEEPER__PG_DATABASE_URL_WRITE` — the PostgreSQL connection string.
 - `LAKEKEEPER__PG_ENCRYPTION_KEY` — a strong random secret that encrypts stored
-  credentials. Generate one with `openssl rand -base64 32`. **Keep it stable and
-  back it up**: it must be identical across nodes sharing the same catalog, and
-  losing it makes stored secrets unrecoverable.
+  credentials. Generate one with `openssl rand -base64 32`. **Keep it stable
+  and back it up**: it must be identical across nodes sharing the same catalog,
+  and losing it makes stored secrets unrecoverable.
 
 Optional settings (read replica, listen address/port, authorization backend)
 are documented inline in the file. If no authorization backend is configured

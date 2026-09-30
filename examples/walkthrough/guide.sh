@@ -483,7 +483,9 @@ phase_a_bringup() {
 # globals guide.sh drives the nodes over.
 detect_mesh_ports() {
     MESH_PG1_PORT=$(pick_port "${COLDFRONT_MESH_PG1_PORT:-5442}")
-    MESH_PG2_PORT=$(pick_port "$(( MESH_PG1_PORT + 1 ))")
+    local pg2="${COLDFRONT_MESH_PG2_PORT:-0}"
+    (( pg2 > MESH_PG1_PORT )) || pg2=$(( MESH_PG1_PORT + 1 ))
+    MESH_PG2_PORT=$(pick_port "$pg2")
     MESH_LK_PORT=$(pick_port "${COLDFRONT_MESH_LK_PORT:-8191}")
     MESH_S3_PORT=$(pick_port "${COLDFRONT_MESH_S3_PORT:-8343}")
     MESH_LK_URL="http://localhost:${MESH_LK_PORT}"

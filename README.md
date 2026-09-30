@@ -1,46 +1,43 @@
 # pgEdge ColdFront
 
 > [!WARNING]
-> ColdFront is beta software under active development. Do
-> not use it in production. Interfaces, on-disk formats, and behaviour
-> may change without notice, and data loss is possible.
+> ColdFront is beta software under active development. Do not use it in
+> production. Interfaces, on-disk formats, and behaviour may change without
+> notice, and data loss is possible.
 
 [![CI](https://github.com/pgEdge/ColdFront/actions/workflows/ci.yml/badge.svg)](https://github.com/pgEdge/ColdFront/actions/workflows/ci.yml)
 
-ColdFront keeps tables in PostgreSQL and cold data in Apache Iceberg
-(Parquet on S3-compatible, Azure, or GCS storage), and the cold tier is
-both readable and writable through the same SQL with no application
-changes. The application queries every table as an ordinary PostgreSQL
-relation, and both operating modes present the same standard SQL
-surface.
+ColdFront keeps tables in PostgreSQL and cold data in Apache Iceberg (Parquet
+on S3-compatible, Azure, or GCS storage), and the cold tier is both readable
+and writable through the same SQL with no application changes. The application
+queries every table as an ordinary PostgreSQL relation, and both operating
+modes present the same standard SQL surface.
 
 ColdFront provides two operating modes:
 
-- Tiered mode keeps recent data in native PostgreSQL partitions and
-  archives older data to Iceberg on a watermark; the application reads a
-  single unified view, and the archiver moves rows from hot to cold on a
-  schedule.
-- Decoupled mode stores the table entirely in Iceberg from the first
-  row; PostgreSQL holds a thin wrapper view and a registry row, and the
-  coldfront extension handles every data-modifying statement on that
-  view.
+- Tiered mode keeps recent data in native PostgreSQL partitions and archives
+  older data to Iceberg on a watermark; the application reads a single unified
+  view, and the archiver moves rows from hot to cold on a schedule.
+- Decoupled mode stores the table entirely in Iceberg from the first row;
+  PostgreSQL holds a thin wrapper view and a registry row, and the coldfront
+  extension handles every data-modifying statement on that view.
 
-Both modes coexist within one database, and you choose the mode per
-table at creation time. The SQL surface is identical for both modes:
-standard SELECT, INSERT, UPDATE, and DELETE against the relation.
+Both modes coexist within one database, and you choose the mode per table at
+creation time. The SQL surface is identical for both modes: standard SELECT,
+INSERT, UPDATE, and DELETE against the relation.
 
-Decoupled mode scales out horizontally across many PostgreSQL nodes that
-share one Lakekeeper catalog and one object store. The bakery protocol
-in the coldfront extension serializes Iceberg commits on the PostgreSQL
-side using Spock-replicated Snowflake tickets, so concurrent writers
-never collide at the catalog. The protocol implements Lamport mutual
-exclusion with the Ricart-Agrawala deferred-reply optimization, and the
+Decoupled mode scales out horizontally across many PostgreSQL nodes that share
+one Lakekeeper catalog and one object store. The bakery protocol in the
+coldfront extension serializes Iceberg commits on the PostgreSQL side using
+Spock-replicated Snowflake tickets, so concurrent writers never collide at the
+catalog. The protocol implements Lamport mutual exclusion with the
+Ricart-Agrawala deferred-reply optimization, and the
 [formal model](docs/formal/README.md) verifies its safety with TLA+.
 
 ## How It Works
 
-ColdFront runs inside PostgreSQL and rewrites each statement to the
-correct tier, so the application sees one relation:
+ColdFront runs inside PostgreSQL and rewrites each statement to the correct
+tier, so the application sees one relation:
 
 ```text
                        Application
@@ -68,30 +65,30 @@ correct tier, so the application sees one relation:
 
 ## Installation
 
-New here? Run the [guided walkthrough](docs/walkthrough.md) to see all
-three modes in action with copy-pasteable commands.
+New here? Run the [guided walkthrough](docs/walkthrough.md) to see all three
+modes in action with copy-pasteable commands.
 
 ColdFront is open source under the PostgreSQL License and runs on stock
 PostgreSQL 16, 17, and 18. The full build workflow lives in the
-**[Installation guide](docs/installation.md)**: build the thin coldfront
-layer on top of the published DuckDB 1.5.x base image (or build the base
-yourself), or install bare-metal. Then continue with the Quickstart below.
+**[Installation guide](docs/installation.md)**: build the thin coldfront layer
+on top of the published DuckDB 1.5.x base image (or build the base yourself),
+or install bare-metal. Then continue with the Quickstart below.
 
 **Setting up on cloud S3?** Once the image is built, the
-**[S3 setup guide](docs/object_store.md)** takes you from an empty bucket to
-a working cold tier end-to-end.
+**[S3 setup guide](docs/object_store.md)** takes you from an empty bucket to a
+working cold tier end-to-end.
 
 ## Quickstart
 
-Build the image (see the [Installation](docs/installation.md) guide) and
-bring up the stack:
+Build the image (see the [Installation](docs/installation.md) guide) and bring
+up the stack:
 
 ```bash
 docker compose up -d --build
 ```
 
-Bootstrap Lakekeeper and create a warehouse (see the one-time setup in
-the [Using ColdFront](docs/usage.md) guide), then create a table in psql:
+Bootstrap Lakekeeper and create a warehouse (see the one-time setup in the
+[Using ColdFront](docs/usage.md) guide), then create a table in psql:
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS pg_duckdb;
@@ -107,21 +104,20 @@ SELECT count(*) FROM events;
 ```
 
 A table that already exists in the Iceberg catalog is adopted rather than
-created: `coldfront.adopt_iceberg_table()` reads its schema from the
-catalog and gives it the same wrapper view and registry row, read-only
-unless writes are asked for. `coldfront.release_iceberg_table()` hands it
-back with the Iceberg table untouched. See
+created: `coldfront.adopt_iceberg_table()` reads its schema from the catalog
+and gives it the same wrapper view and registry row, read-only unless writes
+are asked for. `coldfront.release_iceberg_table()` hands it back with the
+Iceberg table untouched. See
 [Adopting a table that already exists in the catalog](docs/usage.md#adopting-a-table-that-already-exists-in-the-catalog).
 
-To remove a table again, `coldfront.drop_iceberg_table()` unregisters it
-and drops the Iceberg table, deleting the stored objects only when asked
-to. See
+To remove a table again, `coldfront.drop_iceberg_table()` unregisters it and
+drops the Iceberg table, deleting the stored objects only when asked to. See
 [Dropping an Iceberg table](docs/usage.md#dropping-an-iceberg-table-both-modes).
 
 For compliance environments that cannot store an object-store credential,
 `coldfront.set_storage_secret_vended()` runs with no credential in the
-database: Lakekeeper issues short-lived per-table credentials at access
-time. See [Vended credentials](docs/usage.md#vended-credentials).
+database: Lakekeeper issues short-lived per-table credentials at access time.
+See [Vended credentials](docs/usage.md#vended-credentials).
 
 ## Documentation
 
@@ -141,39 +137,37 @@ The following table lists the ColdFront guides and what each one covers:
 
 ## Least-privilege application roles
 
-Application roles need no superuser and no server-file access, yet they
-read and write the cold tier through the same transparent view.
-Onboarding an application role is a single call:
+Application roles need no superuser and no server-file access, yet they read
+and write the cold tier through the same transparent view. Onboarding an
+application role is a single call:
 
 ```sql
 SELECT coldfront.grant_app_access('alice');
 ```
 
-grant_app_access grants only the minimum the cold path needs: membership
-in duckdb.postgres_role, schema USAGE, SELECT on the registry, DML on
-every registered view and the hot table and sequences behind it (all
-derived from the registry, not hardcoded), plus EXECUTE on a fixed
-allow-list of runtime cold-path functions. The
-call is idempotent and is not executable by PUBLIC, so an application
-role can never self-grant. The role is never granted
-pg_read_server_files or pg_write_server_files, so it has no host-file
-access. CREATE ROLE and GRANT both replicate over Spock, so you onboard
-a role once on any node and it propagates across the mesh.
+grant_app_access grants only the minimum the cold path needs: membership in
+duckdb.postgres_role, schema USAGE, SELECT on the registry, DML on every
+registered view and the hot table and sequences behind it (all derived from the
+registry, not hardcoded), plus EXECUTE on a fixed allow-list of runtime
+cold-path functions. The call is idempotent and is not executable by PUBLIC, so
+an application role can never self-grant. The role is never granted
+pg_read_server_files or pg_write_server_files, so it has no host-file access.
+CREATE ROLE and GRANT both replicate over Spock, so you onboard a role once on
+any node and it propagates across the mesh.
 
-For how the non-superuser path works under the hood - the `SECURITY
-DEFINER` attach helpers, the `PGC_SUSET` / `GUC_SUPERUSER_ONLY` config
-hardening, the turnkey `duckdb.postgres_role` default, and how least
-privilege holds across a Spock mesh - see [Architecture: non-superuser
-app roles](docs/architecture.md#non-superuser-app-roles-least-privilege).
+For how the non-superuser path works under the hood - the `SECURITY DEFINER`
+attach helpers, the `PGC_SUSET` / `GUC_SUPERUSER_ONLY` config hardening, the
+turnkey `duckdb.postgres_role` default, and how least privilege holds across a
+Spock mesh - see
+[Architecture: non-superuser app roles](docs/architecture.md#non-superuser-app-roles-least-privilege).
 
 ## Caveats
 
-Iceberg on Azure ADLS Gen2 requires Blob soft-delete, container
-soft-delete, and change feed (blob events) to be OFF on the storage
-account. Lakekeeper warehouse creation otherwise fails with HTTP 409
-("This endpoint does not support BlobStorageEvents or SoftDelete").
-Disable those features on the storage account before using it as a cold
-tier.
+Iceberg on Azure ADLS Gen2 requires Blob soft-delete, container soft-delete,
+and change feed (blob events) to be OFF on the storage account. Lakekeeper
+warehouse creation otherwise fails with HTTP 409 ("This endpoint does not
+support BlobStorageEvents or SoftDelete"). Disable those features on the
+storage account before using it as a cold tier.
 
 ## Project Structure
 
@@ -227,8 +221,7 @@ pgedge-coldfront/
 
 ## Dependencies
 
-The following table lists the services and components ColdFront runs
-against:
+The following table lists the services and components ColdFront runs against:
 
 | Component | Version | Purpose |
 |-----------|---------|---------|
@@ -240,32 +233,30 @@ against:
 
 Building from source needs the Go toolchain (the version is pinned in
 [go.mod](go.mod)). The Go module dependencies are the source of truth in
-[go.mod](go.mod) / [go.sum](go.sum); the archiver and partitioner build
-as static, CGO-free binaries on `pgx/v5`, and the compactor is a separate
-module ([cmd/compactor/go.mod](cmd/compactor/go.mod)) built on
-`apache/iceberg-go`.
+[go.mod](go.mod) / [go.sum](go.sum); the archiver and partitioner build as
+static, CGO-free binaries on `pgx/v5`, and the compactor is a separate module
+([cmd/compactor/go.mod](cmd/compactor/go.mod)) built on `apache/iceberg-go`.
 
 ## Versioning
 
 ColdFront carries two independent version numbers, each following its own
 convention:
 
-- Release tags use three-part
-  [Semantic Versioning](https://semver.org) (`vMAJOR.MINOR.PATCH`, for
-  example `v1.0.0`); Git tags, GitHub releases, container image tags, and
-  the changelog all use this form. Three parts are required because
-  ColdFront is a Go module, and the toolchain recognises only full `vX.Y.Z`
-  tags as releases. The patch field keeps a bugfix-only release (`v1.0.1`)
-  distinct from a feature release (`v1.1.0`), which matters for a
+- Release tags use three-part [Semantic Versioning](https://semver.org)
+  (`vMAJOR.MINOR.PATCH`, for example `v1.0.0`); Git tags, GitHub releases,
+  container image tags, and the changelog all use this form. Three parts are
+  required because ColdFront is a Go module, and the toolchain recognises only
+  full `vX.Y.Z` tags as releases. The patch field keeps a bugfix-only release
+  (`v1.0.1`) distinct from a feature release (`v1.1.0`), which matters for a
   data-writing extension where "same behaviour, one safety fix" is worth
   stating plainly.
 - The PostgreSQL extension uses the conventional two-part version in its
   control file (`default_version = '1.0'`) and upgrade-script filenames
   (`coldfront--1.0--1.1.sql`), as is standard for PostgreSQL extensions.
 
-The two map cleanly: extension `1.0` ships inside release `v1.0.0`, and a
-patch release may carry the same extension version or bump it with an
-upgrade script when the SQL changes.
+The two map cleanly: extension `1.0` ships inside release `v1.0.0`, and a patch
+release may carry the same extension version or bump it with an upgrade script
+when the SQL changes.
 
 ## Author
 

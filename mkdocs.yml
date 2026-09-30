@@ -58,6 +58,7 @@ nav:
   - Getting Started:
       - Introduction: index.md
       - Walkthrough: walkthrough.md
+      - Walkthrough Demos: walkthrough_demos.md
       - Installation: installation.md
       - Object Store Setup: object_store.md
 

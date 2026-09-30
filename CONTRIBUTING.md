@@ -6,18 +6,20 @@ Thanks for your interest in improving ColdFront.
 
 - Build and run the stack: [Installation](docs/installation.md).
 - Day-to-day usage and the two operating modes: [Usage](docs/usage.md).
-- Architecture: [Architecture](docs/architecture.md) (plus the tiered/decoupled deep dives).
+- Architecture: [Architecture](docs/architecture.md) (plus the tiered/decoupled
+  deep dives).
 
 ## Development workflow
 
 - **Test-driven.** Write the test first, then the implementation. Prioritise
   smoke / integration / endpoint tests over unit tests.
 - **Run the gate before every commit:** `./run-ci-local.sh` — gofmt,
-  golangci-lint, unit tests, build, the pg_regress layer, and the canonical user
-  journey. GitHub Actions runs the identical `ci/matrix.sh` harness, so local and
-  CI never diverge.
+  golangci-lint, unit tests, build, the pg_regress layer, and the canonical
+  user journey. GitHub Actions runs the identical `ci/matrix.sh` harness, so
+  local and CI never diverge.
 - **Bakery / mesh / distributed changes** must be modelled and verified in the
-  TLA+ spec **first** ([docs/formal/](docs/formal/)) before the code change lands.
+  TLA+ spec **first** ([docs/formal/](docs/formal/)) before the code change
+  lands.
 - Keep it KISS (minimal lines), DRY (no repeated logic), stdlib-first, and use
   plain parameterised SQL — no ORM.
 
@@ -30,13 +32,12 @@ Thanks for your interest in improving ColdFront.
 
 ## Versioning
 
-ColdFront uses two independent version numbers. Release tags follow
-three-part [Semantic Versioning](https://semver.org)
-(`vMAJOR.MINOR.PATCH`, for example `v1.0.0`); three parts are required
-because ColdFront is a Go module and the toolchain treats only full
-`vX.Y.Z` tags as releases. The PostgreSQL extension uses the conventional
-two-part version in its control file (`default_version`) and
-upgrade-script names (`coldfront--1.0--1.1.sql`). Extension `1.0` ships
+ColdFront uses two independent version numbers. Release tags follow three-part
+[Semantic Versioning](https://semver.org) (`vMAJOR.MINOR.PATCH`, for example
+`v1.0.0`); three parts are required because ColdFront is a Go module and the
+toolchain treats only full `vX.Y.Z` tags as releases. The PostgreSQL extension
+uses the conventional two-part version in its control file (`default_version`)
+and upgrade-script names (`coldfront--1.0--1.1.sql`). Extension `1.0` ships
 inside release `v1.0.0`.
 
 ## Licensing

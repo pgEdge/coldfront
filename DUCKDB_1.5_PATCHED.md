@@ -6,8 +6,8 @@ home for *what* we patch, *why*, *how the base is built*, and *how it is wired
 and verified*. The cold-tier compactor's own story lives in
 [docs/compaction.md](docs/compaction.md).
 
-> **Why a custom build at all?** There is no released pg_duckdb bundling
-> DuckDB 1.5.x, so the stack is assembled off pg_duckdb PR #1025 + the
+> **Why a custom build at all?** There is no released pg_duckdb bundling DuckDB
+> 1.5.x, so the stack is assembled off pg_duckdb PR #1025 + the
 > `v1.5-variegata` extension branch. DuckDB 1.5.x is required for Azure ADLS
 > `abfss://` Iceberg **reads** (`read_avro` on `abfss`); the base then layers
 > ColdFront's patches on top.
@@ -21,8 +21,9 @@ and verified*. The cold-tier compactor's own story lives in
 | **TIMESTAMPTZ transforms in UTC** (port of upstream d3c3348271) | `docker/iceberg-timestamptz-utc-transforms-v15.patch` | year/month/day/hour of a TIMESTAMPTZ partition column are computed on the UTC instant, as the Iceberg spec, duckdb-iceberg's own pruning and iceberg-go take them | a session outside UTC files rows within the zone offset of a boundary in the neighbouring partition, and a UTC-bounded read on the column **prunes them away** |
 
 All four patches apply cleanly to a **pristine** `duckdb-iceberg` @ `5edc45f0`
-(branch `v1.5-variegata`); `docker/Dockerfile.duckdb15-base` `git apply --check`s
-each before applying, failing the build loudly on patch rot.
+(branch `v1.5-variegata`); `docker/Dockerfile.duckdb15-base`
+`git apply --check`s each before applying, failing the build loudly on patch
+rot.
 
 ---
 
@@ -30,8 +31,8 @@ each before applying, failing the build loudly on patch rot.
 
 ColdFront has **one** cold-write code path; the bakery patch never changes it.
 `coldfront._exec_iceberg_with_claim` (the single chokepoint for decoupled
-INSERTs, archiver batches, tiered UPDATE/DELETE) picks its strategy at runtime —
-the SQL is identical whichever iceberg binary is loaded:
+INSERTs, archiver batches, tiered UPDATE/DELETE) picks its strategy at runtime
+— the SQL is identical whichever iceberg binary is loaded:
 
 ```sql
 IF v_armed AND v_async THEN          -- PATCHED: patched binary + BOTH GUCs on
@@ -50,8 +51,8 @@ END IF;
 ```
 
 - `coldfront.iceberg_async_parquet` and `coldfront.iceberg_bakery_patch` are
-  **placeholder GUCs**, default `false` (read with `current_setting(..., true)`).
-  No C definition, no recompile.
+  **placeholder GUCs**, default `false` (read with
+  `current_setting(..., true)`). No C definition, no recompile.
 - **The patched base sets BOTH `on`** (entrypoint): the binary re-stamps the
   parent at the deferred commit POST, so the background upload is safe, and the
   `iceberg_bakery_patch` marker tells `coldfront._iceberg_async_active()` the
@@ -61,23 +62,23 @@ END IF;
   *serialized* upload. `_tiered_insert_cold` is always claim-first.
 - **Why it pays off:** the S3/ADLS parquet upload is the slow part of a cold
   write; the Lakekeeper commit POST is fast. PATCHED lets concurrent writers'
-  uploads overlap and serializes only the commit — measured ≈ **2.6×** contended
-  throughput. It is a performance feature; UNPATCHED is equally correct.
+  uploads overlap and serializes only the commit — measured ≈ **2.6×**
+  contended throughput. It is a performance feature; UNPATCHED is equally
+  correct.
 
 ## 2. What the bakery patch does (v1.5)
 
-`docker/iceberg-bakery-aware-commit-refresh-v15.patch`, four files: three across
-`src/catalog/rest/transaction/` and `src/include/catalog/rest/transaction/`
-(no public API/ABI change; the internal cache/refresh helpers gain an explicit
-`scan_context`), plus one hunk in
+`docker/iceberg-bakery-aware-commit-refresh-v15.patch`, four files: three
+across `src/catalog/rest/transaction/` and
+`src/include/catalog/rest/transaction/` (no public API/ABI change; the internal
+cache/refresh helpers gain an explicit `scan_context`), plus one hunk in
 `src/catalog/rest/catalog_entry/table/iceberg_table_information.cpp` (item 5).
-The problem: ColdFront
-uploads parquet *outside* the R-A bakery and takes the ticket only for the commit
-POST, so by POST time a peer may have advanced the catalog head — a commit
-against *session-cached* metadata fails `assert-ref-snapshot-id` (HTTP **409**),
-and (worse) an append built from the stale cached manifest list would **silently
-drop the peer's data**. The fix, inside `DoTableUpdates` (PG `PRE_COMMIT`, while
-the ticket is held):
+The problem: ColdFront uploads parquet *outside* the R-A bakery and takes the
+ticket only for the commit POST, so by POST time a peer may have advanced the
+catalog head — a commit against *session-cached* metadata fails
+`assert-ref-snapshot-id` (HTTP **409**), and (worse) an append built from the
+stale cached manifest list would **silently drop the peer's data**. The fix,
+inside `DoTableUpdates` (PG `PRE_COMMIT`, while the ticket is held):
 
 1. Re-read the table's `table_metadata` from Lakekeeper before
    `GetTransactionRequest` builds the commit. v1.5 derives the parent +
@@ -92,40 +93,40 @@ the ticket is held):
    credential vending (`ACCESS_DELEGATION_MODE VENDED_CREDENTIALS`) there is no
    persistent secret to fall back on; without this the re-read has no
    credential and fails 403. No-op with delegation `NONE` (static credentials).
-3. Call `RefreshExistingManifestList()` to re-read the source manifest list that
-   was cached at `AddSnapshot` time from the *stale* head — so the new list is
-   built on the peer's manifests instead of dropping them. **Skipping it = silent
-   peer-manifest loss** (verified: a no-refresh build lost 3 of 4 concurrent cold
-   writes).
+3. Call `RefreshExistingManifestList()` to re-read the source manifest list
+   that was cached at `AddSnapshot` time from the *stale* head — so the new
+   list is built on the peer's manifests instead of dropping them. **Skipping
+   it = silent peer-manifest loss** (verified: a no-refresh build lost 3 of 4
+   concurrent cold writes).
 4. **The subtle part:** `RefreshExistingManifestList` is a `read_avro` table
    scan, which needs a `ClientContext` with an **active transaction**. It must
    run on the fresh `temp_con` that `IcebergTransaction::Commit` opens —
-   **not** `IcebergTransactionData`'s stored (main) context, which has no active
-   transaction during the commit callback. So the cache/refresh helpers take an
-   explicit `scan_context`. Using the wrong context throws
+   **not** `IcebergTransactionData`'s stored (main) context, which has no
+   active transaction during the commit callback. So the cache/refresh helpers
+   take an explicit `scan_context`. Using the wrong context throws
    `TransactionContext::ActiveTransaction called without active transaction`.
 5. **Load side** (`IcebergTableInformation::Copy`): ColdFront sets
    `iceberg_use_metadata_log` off, because the log read has no storage
    credential under vending. Without the log, a transaction that first touches
    a table another writer committed to since the transaction began is rewound
-   to the snapshot current at that start, and upstream throws `already
-   outdated` when no such snapshot is left. Either the table had none then,
-   which is every writer queued on the table lock behind the first commit into
-   a never-written table in the stock ordering, and the millisecond between
-   the lazy attach and staging in the async one, or that snapshot has since
-   expired. The hunk tells them apart by the table's first snapshot (no
+   to the snapshot current at that start, and upstream throws
+   `already outdated` when no such snapshot is left. Either the table had none
+   then, which is every writer queued on the table lock behind the first commit
+   into a never-written table in the stock ordering, and the millisecond
+   between the lazy attach and staging in the async one, or that snapshot has
+   since expired. The hunk tells them apart by the table's first snapshot (no
    parent, sequence number 1): when it is present and was committed after the
    transaction began, the hunk returns the as-of-start state, an empty table
    (`has_current_snapshot = false`, `last_sequence_number = 0`), and items 1 to
    3 then land the write on the live head. An expired start snapshot keeps the
    error.
 
-**Formally verified** before the code (the project rule): `docs/formal/Bakery.tla`
-models the async ordering; `Bakery_async.cfg` (patched) holds
-`NoLakekeeperConflict`, `Bakery_race.cfg` (async **without** the patch)
-violates it — the standing proof the patch is mandatory for async. **Validated**
-over Azure ADLS: journey 6b (4 concurrent mixed-tier writers → 8/8, 0 loss) and
-9b (8 concurrent cold writers → 8/8).
+**Formally verified** before the code (the project rule):
+`docs/formal/Bakery.tla` models the async ordering; `Bakery_async.cfg`
+(patched) holds `NoLakekeeperConflict`, `Bakery_race.cfg` (async **without**
+the patch) violates it — the standing proof the patch is mandatory for async.
+**Validated** over Azure ADLS: journey 6b (4 concurrent mixed-tier writers →
+8/8, 0 loss) and 9b (8 concurrent cold writers → 8/8).
 
 ## 3. Strict-reader interop (two patches + one upstream fix)
 
@@ -135,28 +136,31 @@ metadata keys a strict Apache reader needs. iceberg-go (the compactor) *is*
 strict. Two small, **upstreamable** patches — each verified inert to
 pg_duckdb's own reads — make the manifests cross-engine-readable:
 
-- `iceberg-manifest-list-format-version-v15.patch` — declare the manifest-list `format-version`.
-- `iceberg-data-file-format-v15.patch` — upper-case the data-file `file_format` to the spec enum (`PARQUET`).
+- `iceberg-manifest-list-format-version-v15.patch` — declare the manifest-list
+  `format-version`.
+- `iceberg-data-file-format-v15.patch` — upper-case the data-file `file_format`
+  to the spec enum (`PARQUET`).
 
-(A third fix of this class, the manifest file's `content` key (`data`/`deletes`),
-is upstream at the pinned ref, so ColdFront carries no patch for it.)
+(A third fix of this class, the manifest file's `content` key
+(`data`/`deletes`), is upstream at the pinned ref, so ColdFront carries no
+patch for it.)
 
 The compactor itself (usage, backends, maintenance steps) is documented in
-[docs/compaction.md](docs/compaction.md). The interop patches are independent of
-the bakery patch.
+[docs/compaction.md](docs/compaction.md). The interop patches are independent
+of the bakery patch.
 
 ## 4. TIMESTAMPTZ partition transforms in UTC (one patch, a port)
 
 `iceberg-timestamptz-utc-transforms-v15.patch` ports upstream duckdb-iceberg
 d3c3348271 (PR #1361, on `main` only: neither `v1.5-variegata` up to `890b78a9`
-nor the duckdb-iceberg that DuckDB v1.5.5 ships, `45163a28`, carries it). At the
-pinned ref a partitioned write computes `year/month/day/hour` of a TIMESTAMPTZ
-column as `date_diff` on the TIMESTAMPTZ itself, which ICU evaluates in the
-session's time zone, and pg_duckdb sets that zone from PostgreSQL's `TimeZone`.
-The Iceberg spec, duckdb-iceberg's own read-side pruning
-(`iceberg_transform.hpp`) and iceberg-go all take the UTC instant, so from a
-session outside UTC a row within the zone offset of a boundary lands in the
-neighbouring partition and a UTC-bounded predicate on the column prunes it
+nor the duckdb-iceberg that DuckDB v1.5.5 ships, `45163a28`, carries it). At
+the pinned ref a partitioned write computes `year/month/day/hour` of a
+TIMESTAMPTZ column as `date_diff` on the TIMESTAMPTZ itself, which ICU
+evaluates in the session's time zone, and pg_duckdb sets that zone from
+PostgreSQL's `TimeZone`. The Iceberg spec, duckdb-iceberg's own read-side
+pruning (`iceberg_transform.hpp`) and iceberg-go all take the UTC instant, so
+from a session outside UTC a row within the zone offset of a boundary lands in
+the neighbouring partition and a UTC-bounded predicate on the column prunes it
 away (reproduced: from `America/New_York`, 2026-04-01 02:00 UTC was filed under
 March and `ts >= '2026-04-01 00:00+00'` did not return it). The patch binds a
 TIMESTAMPTZ source as TIMESTAMP through DuckDB's default cast, which
@@ -169,9 +173,9 @@ ref that carries the fix.
 v1.5's `IcebergTransaction::Commit` already copies the caller's `ClientConfig`
 into its commit-time connection, so `s3_access_key_id` etc. are available; a
 commit-time 403 from missing storage credentials on the commit connection does
-not arise in v1.5. Do
-**not** rewrite `Commit` to run under the caller's `ClientContext`: on the
-deferred `PRE_COMMIT` callback that context has no active transaction and throws
+not arise in v1.5. Do **not** rewrite `Commit` to run under the caller's
+`ClientContext`: on the deferred `PRE_COMMIT` callback that context has no
+active transaction and throws
 `ActiveTransaction called without active transaction`. Build the four carried
 patches (bakery, the two interop patches, the UTC transform port) only.
 
@@ -195,13 +199,14 @@ The base build *is* the recipe; read it as the source of truth. Its non-obvious
 requirements (each a real build failure if missing):
 
 - **libcurl ≥ 7.77** built from source in the pg_duckdb stage (the
-  `CURLSSLOPT_AUTO_CLIENT_CERT` symbol). The bundled httplib client is what runs
-  at runtime — libcurl is a *compile-time* dependency of httpfs only.
+  `CURLSSLOPT_AUTO_CLIENT_CERT` symbol). The bundled httplib client is what
+  runs at runtime — libcurl is a *compile-time* dependency of httpfs only.
 - **`gcc-toolset-14-libasan-devel` + `-libubsan-devel`** in the iceberg-builder
   (`manylinux_2_28_x86_64`, gcc-toolset-14). The extension's
   `extension_configuration` phase builds a Debug `duckdb_platform_binary` that
-  links AddressSanitizer; without the runtime the build dies with `ld: cannot
-  find -lasan`. Affects only the Debug helper — the shipped extensions are Release.
+  links AddressSanitizer; without the runtime the build dies with
+  `ld: cannot find -lasan`. Affects only the Debug helper — the shipped
+  extensions are Release.
 - **`flex` + `bison`** for the `postgres_scanner` vcpkg `libpq` build.
 - **azure pinned `v1.5-variegata` (`563589b2`), not `main`** (link collision).
 - iceberg/avro/azure/postgres_scanner are built **bundled** against one DuckDB
@@ -210,15 +215,16 @@ requirements (each a real build failure if missing):
 - The bakery + two interop patches are `COPY`'d in and `git apply --check`'d
   then applied (see the Dockerfile's patch block).
 
-Cold base build is ~30–60 min (vcpkg compiles the Azure SDK + libpq from source);
-incremental rebuilds after a patch change recompile only the iceberg extension.
+Cold base build is ~30–60 min (vcpkg compiles the Azure SDK + libpq from
+source); incremental rebuilds after a patch change recompile only the iceberg
+extension.
 
 ## 8. Install / GUCs / image wiring (base/app split)
 
 The expensive, **stable** compiles live in the **base** image, published to
-`ghcr.io/pgedge/coldfront-duckdb-base:pg{16,17,18}`. The thin **app** image layers
-only the coldfront extension on top, so CI/local builds are fast and always test
-current source.
+`ghcr.io/pgedge/coldfront-duckdb-base:pg{16,17,18}`. The thin **app** image
+layers only the coldfront extension on top, so CI/local builds are fast and
+always test current source.
 
 | File | Role |
 |---|---|
@@ -231,51 +237,53 @@ current source.
 GUCs the patched-base entrypoint writes to `postgresql.conf`:
 
 - `duckdb.allow_unsigned_extensions = on` — the local extensions are unsigned.
-- `duckdb.autoinstall_known_extensions = on`, `duckdb.autoload_known_extensions = on`
-  — autoinstall does **not** clobber a pre-placed local extension (verified); it
-  only fetches *missing* ones.
-- **`coldfront.iceberg_async_parquet = on`** AND **`coldfront.iceberg_bakery_patch = on`**
-  — both, together. `coldfront._iceberg_async_active()` is true only when both
-  are on; otherwise the cold-write path fails safe to claim-first (never a 409)
-  and logs a one-time advisory. Flipping only the async flag on a stock binary
-  can never silently 409 — proven by `Bakery_race.cfg` + the
-  `async_requires_patch` pg_regress test. **Rebuild + republish the base whenever
-  the entrypoint or any patch changes**, or async silently downgrades.
+- `duckdb.autoinstall_known_extensions = on`,
+  `duckdb.autoload_known_extensions = on` — autoinstall does **not** clobber a
+  pre-placed local extension (verified); it only fetches *missing* ones.
+- **`coldfront.iceberg_async_parquet = on`** AND
+  **`coldfront.iceberg_bakery_patch = on`** — both, together.
+  `coldfront._iceberg_async_active()` is true only when both are on; otherwise
+  the cold-write path fails safe to claim-first (never a 409) and logs a
+  one-time advisory. Flipping only the async flag on a stock binary can never
+  silently 409 — proven by `Bakery_race.cfg` + the `async_requires_patch`
+  pg_regress test. **Rebuild + republish the base whenever the entrypoint or
+  any patch changes**, or async silently downgrades.
 
-> **GUC gotcha:** the `duckdb.*` GUCs are `PGC_SUSET`, read once at DuckDB init,
-> and rejected after. In the image they sit in `postgresql.conf` from first init
-> so the trap never arises; on bare metal apply via `ALTER SYSTEM` + reload
-> **before** any DuckDB use, one `ALTER SYSTEM` per statement.
+> **GUC gotcha:** the `duckdb.*` GUCs are `PGC_SUSET`, read once at DuckDB
+> init, and rejected after. In the image they sit in `postgresql.conf` from
+> first init so the trap never arises; on bare metal apply via `ALTER SYSTEM` +
+> reload **before** any DuckDB use, one `ALTER SYSTEM` per statement.
 
 > **avro is a hard dependency of iceberg.** With autoinstall **off**, `avro`
 > (and `azure` for an Azure cold tier) must be pre-placed beside `iceberg` or
 > `LOAD iceberg` fails. The shipped image pre-places all four, so this is moot.
 
 Building the app locally pulls the published base
-`ghcr.io/pgedge/coldfront-duckdb-base:pg<major>`, or uses a locally-built
-base tagged the same.
+`ghcr.io/pgedge/coldfront-duckdb-base:pg<major>`, or uses a locally-built base
+tagged the same.
 
 ## 9. v1.5 architecture notes (verified against source)
 
 - `IcebergTransaction::Commit()` opens a fresh `temp_con` but **copies the
   caller's config** (settings like `s3_access_key_id`, not the secret catalog).
-  ColdFront's **persistent-secret design still holds and is still required** — a
-  `PERSISTENT SECRET` loaded at init is visible to `temp_con`; a session secret
-  would not be.
+  ColdFront's **persistent-secret design still holds and is still required** —
+  a `PERSISTENT SECRET` loaded at init is visible to `temp_con`; a session
+  secret would not be.
 - Transaction code lives in `src/catalog/rest/transaction/`.
-  `GetTransactionRequest` builds the commit
-  (parent + `AssertRefSnapshotId` from the session-cached `current_snapshot`) —
-  the bakery-refresh injection site.
-- v1.5 bakes the snapshot `sequence_number` into the manifest at *parquet-write*
-  time (outside the bakery ticket in async mode), which is why the bakery patch
-  works by refreshing metadata at commit time rather than re-stamping fields,
-  and why its no-409 correctness is proven by the 3-node bench, not assumed.
+  `GetTransactionRequest` builds the commit (parent + `AssertRefSnapshotId`
+  from the session-cached `current_snapshot`) — the bakery-refresh injection
+  site.
+- v1.5 bakes the snapshot `sequence_number` into the manifest at
+  *parquet-write* time (outside the bakery ticket in async mode), which is why
+  the bakery patch works by refreshing metadata at commit time rather than
+  re-stamping fields, and why its no-409 correctness is proven by the 3-node
+  bench, not assumed.
 
 ## 10. Azure secret (`TYPE azure`)
 
-Verified against duckdb-azure `src/azure_secret.cpp` + the built extension. There
-is **no `ACCOUNT_KEY` parameter** — a shared-key account key is supplied only in
-the CONFIG provider's `CONNECTION_STRING`:
+Verified against duckdb-azure `src/azure_secret.cpp` + the built extension.
+There is **no `ACCOUNT_KEY` parameter** — a shared-key account key is supplied
+only in the CONFIG provider's `CONNECTION_STRING`:
 
 ```sql
 CREATE OR REPLACE PERSISTENT SECRET cf_storage (
@@ -302,34 +310,34 @@ topologies (vanilla, mesh), both modes (tiered, decoupled), both targets
 storage profile is `adls` (forces the `abfss://`/DFS endpoint), and Azurite
 implements Blob/Queue/Table but **not** the DFS endpoint (Azure/Azurite#553).
 So the azure cells are gated on `COLDFRONT_AZURE_*` (RUN when present, else
-PENDING — never silently skipped); the storage-divergent code (secret rendering,
-config selection) is covered with no creds by the unit + pg_regress layer on
-every PR.
+PENDING — never silently skipped); the storage-divergent code (secret
+rendering, config selection) is covered with no creds by the unit + pg_regress
+layer on every PR.
 
 ## 12. Cutover vs cold-write serialization
 
 `coldfront.cutover_archive` acquires the **same bakery** the cold-write path
 takes (same `v_armed` gate, same `coldfront_iceberg:<ref>` key) on its
-`p_iceberg_ref` parameter, as its **first** lock, before `LOCK TABLE …
-ACCESS EXCLUSIVE` on the partition; the archiver passes the ref as a `CALL`
-argument (`cmd/archiver/main.go`). The bakery acquire has no `lock_timeout`, so
-the cutover waits out any in-flight cold writer's full commit, then takes the
-uncontended `ACCESS EXCLUSIVE`.
+`p_iceberg_ref` parameter, as its **first** lock, before
+`LOCK TABLE … ACCESS EXCLUSIVE` on the partition; the archiver passes the ref
+as a `CALL` argument (`cmd/archiver/main.go`). The bakery acquire has no
+`lock_timeout`, so the cutover waits out any in-flight cold writer's full
+commit, then takes the uncontended `ACCESS EXCLUSIVE`.
 
-**Deadlock-freedom** comes from the `lock_timeout = 100 ms` (< `deadlock_timeout`)
-circuit breaker on the partition lock plus the archiver's retry harness
-(`runCutoverWithRetry`, 10 attempts, exponential backoff), **not** a global lock
-order (impossible: PostgreSQL locks a `ModifyTable`'s result relations at
-executor startup, before any CTE runs, so a dual-tier writer is unavoidably
-`RowExclusive`-before-bakery, an inversion vs the cutover). Whenever the
-inversion forms, the **cutover** yields first (100 ms), frees the bakery, the
-writer commits, and the harness retries the cutover; the writer is never the
-victim.
+**Deadlock-freedom** comes from the `lock_timeout = 100 ms` (<
+`deadlock_timeout`) circuit breaker on the partition lock plus the archiver's
+retry harness (`runCutoverWithRetry`, 10 attempts, exponential backoff),
+**not** a global lock order (impossible: PostgreSQL locks a `ModifyTable`'s
+result relations at executor startup, before any CTE runs, so a dual-tier
+writer is unavoidably `RowExclusive`-before-bakery, an inversion vs the
+cutover). Whenever the inversion forms, the **cutover** yields first (100 ms),
+frees the bakery, the writer commits, and the harness retries the cutover; the
+writer is never the victim.
 
 ## 13. Reverting to UNPATCHED
 
 No code change — flip to stock by unsetting `coldfront.iceberg_bakery_patch`
 (the gate goes false → claim-first even if the async flag stays on). To run a
 genuinely unpatched base, omit the patch `git apply` steps in the base build —
-see [DUCKDB_1.5_UNPATCHED.md](DUCKDB_1.5_UNPATCHED.md), including the consequence
-that the compactor will not work.
+see [DUCKDB_1.5_UNPATCHED.md](DUCKDB_1.5_UNPATCHED.md), including the
+consequence that the compactor will not work.
