@@ -15,10 +15,10 @@ Once the table exists, **the SQL surface is identical**: `SELECT`, `INSERT`,
 
 ## Prerequisites (both modes)
 
-The stack must already be running with PG + pg_duckdb + coldfront +
-Lakekeeper + S3-compatible storage: three services - PostgreSQL + pg_duckdb,
-Lakekeeper, and any S3-compatible object store (SeaweedFS, MinIO, GCS, etc.).
-The one-time setup below brings it up and bootstraps it.
+The stack must already be running as three services: PostgreSQL with the
+pg_duckdb and coldfront extensions, Lakekeeper, and any S3-compatible object
+store (SeaweedFS, MinIO, GCS, etc.). The one-time setup below brings it up and
+bootstraps it.
 
 ## One-time setup
 
@@ -211,11 +211,11 @@ the argument out for an unpartitioned table.
 
 That single statement provisions:
 
-- `ice.public.events` on the attached Iceberg catalog
-- a PG-side wrapper view `public.events` with proper PG-typed columns
+- `ice.public.events` on the attached Iceberg catalog.
+- a PG-side wrapper view `public.events` with proper PG-typed columns.
 - a `coldfront.tiered_views` registry row - every INSERT, UPDATE, and DELETE on
   the view is intercepted by the coldfront C hook and rewritten to a single
-  `duckdb.raw_query(...)` against `ice.public.events`
+  `duckdb.raw_query(...)` against `ice.public.events`.
 
 In a mesh one node provisions: Spock's `ddl_sql` repset replicates the
 `CREATE VIEW`, and the `default` repset replicates the name-keyed registry row,
@@ -273,7 +273,7 @@ In a mesh one node adopts. The wrapper view replicates through Spock's
 one-time mesh setup below), so every peer reads and writes the table under the
 same name, and a peer's own adopt is refused as already registered. Adoption
 takes the table's bakery claim around that check and the registry write, so two
-nodes adopting the same table at the same moment are serialised: the second
+nodes adopting the same table at the same moment are serialized: the second
 waits, then reads the first's row and refuses, rather than both registering the
 one table. A writer outside ColdFront is outside the bakery and can still
 collide at Lakekeeper.
@@ -330,7 +330,7 @@ alerting is free):
 17 * * * * postgres /usr/local/bin/partitioner --config /etc/coldfront/partitioner.yaml >> /var/log/coldfront-partitioner.log 2>&1
 ```
 
-Keep the following operational behaviour in mind when scheduling it:
+Keep the following operational behavior in mind when scheduling it:
 
 - **Exit codes.** `0` = every table reconciled (a self-healed *behind*
   condition still exits `0`); non-zero = at least one table failed
@@ -616,7 +616,7 @@ SELECT coldfront.set_storage_secret_azure(
 It writes the same `coldfront.storage_secret` row (replicated,
 `pg_dump`-excluded) and materializes a `TYPE azure` PERSISTENT SECRET. The
 Azure cold tier is subject to the soft-delete / change-feed restriction in
-[Gotchas](#gotchas).
+[Caveats](index.md#caveats).
 
 ## Vended credentials
 
@@ -776,7 +776,8 @@ Keep the following caveats in mind when running either mode:
   ColdFront translates the `::jsonb` cast, `jsonb_array_length`,
   `jsonb_build_object` / `jsonb_agg` and `date_bin`; other jsonb operators and
   functions are unsupported on cold or cross-tier reads. A hot-only read of the
-  view runs in PostgreSQL with full jsonb (see Supported column types).
+  view runs in PostgreSQL with full jsonb (see
+  [Supported column types](#supported-column-types)).
 - **Cross-tier isolation**: a long-running `SELECT` that touches the Iceberg
   side multiple times within one transaction may see writes from other sessions
   interleaved between scans. PG's repeatable-read does not extend across the
@@ -790,9 +791,9 @@ Keep the following caveats in mind when running either mode:
   `coldfront._exec_iceberg_with_claim`, which holds a globally-ordered
   snowflake ticket and waits for its turn before committing to Lakekeeper. No
   409 conflicts, no app-level retry. The protocol is Lamport-1978 mutex with
-  the Ricart-Agrawala (1981) deferred-reply optimisation; claims and acks
+  the Ricart-Agrawala (1981) deferred-reply optimization; claims and acks
   replicate as Spock rows and it stays safe under Spock's asymmetric apply
-  (modelled in
+  (modeled in
   [docs/formal/Bakery.tla](https://github.com/pgEdge/ColdFront/blob/main/docs/formal/Bakery.tla)).
   The bakery requires the `snowflake` extension, the `coldfront.dblink_self`
   GUC (the connection string of the node's loopback), and a one-time
@@ -885,9 +886,9 @@ nothing waits. See [architecture_decoupled.md](architecture_decoupled.md),
 *Orphan reaping*.
 
 Sync-rep (`synchronous_standby_names`) is **not required** by the bakery - the
-R-A ack barrier is what serialises iceberg commits. You can still enable it
+R-A ack barrier is what serializes iceberg commits. You can still enable it
 cluster-wide if you want stronger durability for non-bakery writes, but it
-plays no part in iceberg-commit serialisation.
+plays no part in iceberg-commit serialization.
 
 **One-time mesh setup** - must be done in this order on every node, because
 `coldfront._ensure_claims_replicated()` calls `spock.repset_add_table` and so
@@ -941,13 +942,13 @@ traffic starts. `ci/journey.sh` `story_mesh_substrate` is a copyable reference.
 
 ## Tuning knobs
 
-The following GUCs adjust write behaviour and execution; tune them as needed:
+The following GUCs adjust write behavior and execution; tune them as needed:
 
 - `coldfront.allow_mixed_writes` (bool, default `on`) - controls what happens
   for tiered-mode UPDATE/DELETE whose WHERE can't be proven to target one tier.
   `on` emits a dual-tier CTE; `off` rejects with an error and a hint. Not
   relevant in decoupled mode (every write is single-tier by definition).
-- `coldfront.vector_probe` (bool, default `on`) - whether a recognised
+- `coldfront.vector_probe` (bool, default `on`) - whether a recognized
   similarity search reads only the clusters nearest its query vector. `off`
   gives an exact scan of the whole corpus. Only affects a table with a trained
   vector column ([usage_vectors.md](usage_vectors.md)).

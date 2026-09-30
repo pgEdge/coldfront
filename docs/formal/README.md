@@ -20,7 +20,7 @@ an explicit applier. The following table describes its files and their roles:
 
 | File | Role |
 |---|---|
-| `Bakery.tla` | PlusCal source.  Models the real spock world: each node has its OWN local `claims[nd]` view, INSERTs propagate via an explicit `Applier`.  No `synchronous_commit = remote_apply`.  Coordination is Lamport's 1978 distributed mutual exclusion algorithm with Ricart-Agrawala's (1981) deferred-reply optimisation: peers ack each claim immediately unless they have a pending claim with smaller ticket, in which case they defer the ack until they release their own claim.  Also models the `coldfront.iceberg_async_parquet` flag (constants `AsyncParquet`/`RestampPatch`): the `Stage` label stages parquet OUTSIDE the claim (async ordering); `Prepare` captures the `parent_snapshot_id` UNDER the claim (stock at stage time, patched async re-stamped at the commit POST); the `Decide` CAS asserts against it.  **Defer/drain atomicity** is modelled too (constant `SafeAcks`): the apply-time defer DECISION and its WRITE (`ApplyDecide`/`ApplyEmit`), and the release drain's FORWARD and DELETE (`DrainForward`/`DrainDelete`), are SEPARATE steps — faithful to the non-atomic SQL.  `SafeAcks=FALSE` lets them race (a deferral written behind a just-released claim is deleted unforwarded / orphaned — a dropped ack); `SafeAcks=TRUE` is the safe implementation: an atomic re-check of R-A's own defer rule against the claim, i.e. `SELECT … FOR UPDATE` on the claim row in `coldfront._on_claim_apply`.  **The orphan reaper** (constant `Reaper`): a same-node claim whose writer has crashed holds no advisory lock, so `BeginClaim` deletes it in the step that inserts its own claim; the `Applier` does the same on its defer branch under `HoldsTableLock(nd)` (a live writer holds `coldfront_iceberg:<table>` from `WaitAcks` through `DrainDelete`, because the release runs in the COMMIT callback before PostgreSQL drops the xact lock); and a `Poker` process models the waiter's periodic no-op UPDATE of its own claim row, which re-runs the peer's defer branch and is what unwedges a waiter whose peer's holder died after deferring to it. Constant `NodeRetries` restricts the `Crasher` to writers whose node still has an unstarted writer (the node is touched again); FALSE allows the crash after which only the poke reaches the node. The `Crasher` cannot split `Release`/`DrainForward`/`DrainDelete`, which are one loopback transaction in the real code. |
+| `Bakery.tla` | PlusCal source.  Models the real spock world: each node has its OWN local `claims[nd]` view, INSERTs propagate via an explicit `Applier`.  No `synchronous_commit = remote_apply`.  Coordination is Lamport's 1978 distributed mutual exclusion algorithm with Ricart-Agrawala's (1981) deferred-reply optimization: peers ack each claim immediately unless they have a pending claim with smaller ticket, in which case they defer the ack until they release their own claim.  Also models the `coldfront.iceberg_async_parquet` flag (constants `AsyncParquet`/`RestampPatch`): the `Stage` label stages parquet OUTSIDE the claim (async ordering); `Prepare` captures the `parent_snapshot_id` UNDER the claim (stock at stage time, patched async re-stamped at the commit POST); the `Decide` CAS asserts against it.  **Defer/drain atomicity** is modeled too (constant `SafeAcks`): the apply-time defer DECISION and its WRITE (`ApplyDecide`/`ApplyEmit`), and the release drain's FORWARD and DELETE (`DrainForward`/`DrainDelete`), are SEPARATE steps — faithful to the non-atomic SQL.  `SafeAcks=FALSE` lets them race (a deferral written behind a just-released claim is deleted unforwarded / orphaned — a dropped ack); `SafeAcks=TRUE` is the safe implementation: an atomic re-check of R-A's own defer rule against the claim, i.e. `SELECT … FOR UPDATE` on the claim row in `coldfront._on_claim_apply`.  **The orphan reaper** (constant `Reaper`): a same-node claim whose writer has crashed holds no advisory lock, so `BeginClaim` deletes it in the step that inserts its own claim; the `Applier` does the same on its defer branch under `HoldsTableLock(nd)` (a live writer holds `coldfront_iceberg:<table>` from `WaitAcks` through `DrainDelete`, because the release runs in the COMMIT callback before PostgreSQL drops the xact lock); and a `Poker` process models the waiter's periodic no-op UPDATE of its own claim row, which re-runs the peer's defer branch and is what unwedges a waiter whose peer's holder died after deferring to it. Constant `NodeRetries` restricts the `Crasher` to writers whose node still has an unstarted writer (the node is touched again); FALSE allows the crash after which only the poke reaches the node. The `Crasher` cannot split `Release`/`DrainForward`/`DrainDelete`, which are one loopback transaction in the real code. |
 | `Bakery.cfg` | TLC config: 3 writers, no crashes, all four safety invariants. **Stock ordering** (`AsyncParquet=FALSE` - the default; parquet staged inside the claim).  Passes - R-A makes `NoLakekeeperConflict` and `TicketOrderPreserved` hold even with realistic asymmetric apply. |
 | `Bakery_async.cfg` | **Patched async ordering** (`AsyncParquet=TRUE, RestampPatch=TRUE`) - what the DuckDB 1.5.x (duckdb15) image runs: parquet staged outside the claim, `parent_snapshot_id` re-stamped at the commit POST under the claim by the bakery-aware patch.  All four safety invariants HOLD; the test is non-vacuous (shares the stock config's under-claim `Prepare→Decide` window, which R-A keeps empty). |
 | `Bakery_race.cfg` | **Pre-patch async race** (`AsyncParquet=TRUE, RestampPatch=FALSE`) - async ordering WITHOUT the bakery-aware patch: the stale tentative parent from the pre-claim stage is used at the POST. **`NoLakekeeperConflict` is EXPECTED to be violated** - the formal proof that the patch is mandatory for the async ordering. |
@@ -257,8 +257,8 @@ faithfully because they affect protocol correctness:
   [_claim_iceberg_lock](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/coldfront--1.0.sql).
 - The deferred release: pg_duckdb's XactCallback commits iceberg first, then
   coldfront's XactCallback (registered after, runs after per PG's documented
-  registration-order chain) DELETEs the claim. Modelled as the iceberg append
-  at `Decide` followed by the claim DELETE at `Release`.
+  registration-order chain) DELETEs the claim. Modeled as the iceberg append at
+  `Decide` followed by the claim DELETE at `Release`.
 - pg_duckdb's iceberg ROLLBACK on PG ABORT (no append on the rollback branch) -
   required for the `RollbackNoIceberg` property to hold.
 
@@ -269,7 +269,7 @@ The Go compactor (`cmd/compactor`, apache/iceberg-go) is a bakery claimant
 claim via `_claim_iceberg_lock` on the node it connects to, captures the parent
 snapshot under the held claim, issues one Lakekeeper CAS POST - a *replace*
 (`RewriteDataFiles`: drop small data files, add the rewritten one), which has
-the same parent-CAS conflict shape as the append modelled at `Decide` - then
+the same parent-CAS conflict shape as the append modeled at `Decide` - then
 releases. It adds no new protocol primitive, so it is covered by the existing
 proof as the **stock-ordering writer** (`AsyncParquet = FALSE`, `Bakery.cfg`).
 
@@ -300,8 +300,8 @@ the shared Iceberg tier by `coldfront._mirror_iceberg_alter`, which routes the
 Iceberg ALTER through the **unchanged** `_exec_iceberg_with_claim`. It is
 therefore the **same stock-ordering claimant** the cold writer is: one
 metadata-only CAS commit (the schema change - identical parent-CAS conflict
-shape to the append modelled at `Decide`) under the held claim, then release.
-It forces the claim-first ordering
+shape to the append modeled at `Decide`) under the held claim, then release. It
+forces the claim-first ordering
 (`SET LOCAL coldfront.iceberg_async_parquet = off`): an ALTER stages no
 parquet, so there is nothing to overlap, and `AsyncParquet = FALSE`
 (`Bakery.cfg`) is the config the model already proves safe. It adds no new
@@ -326,7 +326,7 @@ MetaTransaction - one Iceberg snapshot, one Lakekeeper CAS POST - under **one**
 `_claim_iceberg_lock` held to transaction end (released by the C
 `XactCallback`). It is therefore the **same stock-ordering single claimant**
 the cold writer is: one CAS commit (identical parent-CAS conflict shape to the
-append modelled at `Decide`) under the held claim. It forces
+append modeled at `Decide`) under the held claim. It forces
 `iceberg_async_parquet = off` (`AsyncParquet = FALSE`, `Bakery.cfg`) - the
 DELETE+INSERT bundle is not pg_duckdb's single deferred POST that the async
 re-stamp patch wraps. Exactly **one** claim per move (a second
@@ -341,14 +341,14 @@ The retention path detaches expired partitions with
 `DETACH PARTITION … CONCURRENTLY`, which Spock cannot replicate (it is
 non-transactional), so the partition manager re-runs the same concurrent detach
 on each peer itself, over its own connection to each Spock node (gated on Spock
-being present; a no-op on a vanilla single node). This is **outside the
-modelled protocol entirely**: it touches no Iceberg catalog, takes no claim,
-and POSTs nothing to Lakekeeper - it is pure PostgreSQL partition maintenance
-on the hot tier. It adds no claimant, no CAS commit, and no new ordering, so it
-falls outside `Bakery`'s scope; no dedicated config is needed. (The archiver's
-cold cutover *does* commit to Iceberg under a claim, but its detach is a plain
+being present; a no-op on a vanilla single node). This is **outside the modeled
+protocol entirely**: it touches no Iceberg catalog, takes no claim, and POSTs
+nothing to Lakekeeper - it is pure PostgreSQL partition maintenance on the hot
+tier. It adds no claimant, no CAS commit, and no new ordering, so it falls
+outside `Bakery`'s scope; no dedicated config is needed. (The archiver's cold
+cutover *does* commit to Iceberg under a claim, but its detach is a plain
 transactional `DETACH` that Spock replicates on its own - it is the
-already-modelled stock-ordering writer, not a new primitive.)
+already-modeled stock-ordering writer, not a new primitive.)
 
 ### Known abstractions (model deviates from reality)
 
@@ -362,7 +362,7 @@ reality:
 The following are *abstracted away* because they don't affect protocol
 correctness:
 
-- Lakekeeper REST API and Iceberg snapshot serialization. Modelled as an atomic
+- Lakekeeper REST API and Iceberg snapshot serialization. Modeled as an atomic
   CAS on a sequence head.
 - pg_duckdb internals (its XactCallback registration ordering is a *premise* -
   coldfront loads after pg_duckdb in `shared_preload_libraries`).
@@ -370,7 +370,7 @@ correctness:
   keepalive cadence; reply_time freshness in the reap uses a 5 s threshold
   which works in active clusters but degrades to the keepalive cadence floor
   for idle-then-crashed peers).
-- DuckDB's pglocal connection-keepalive behaviour. The bakery does not use
+- DuckDB's pglocal connection-keepalive behavior. The bakery does not use
   pglocal; the archiver's Phase 3 does, but Phase 3 is a separate code path
   with its own CI test (the race-window regression in `ci/journey.sh` story 9).
 - Async-replicated user-data tables (Spock's data path for non-bakery commits).

@@ -11,10 +11,9 @@ the bakery-aware commit-refresh patch (the no-409 guarantee for concurrent
 cold-tier writers), two strict-reader interop patches (so apache/iceberg-go,
 the cold-tier compactor, can read the manifests duckdb-iceberg writes) and a
 port of an upstream fix that computes the time partitions of a `timestamptz`
-column in UTC. The patch internals are in
-[DUCKDB_1.5_PATCHED.md](https://github.com/pgEdge/ColdFront/blob/main/DUCKDB_1.5_PATCHED.md).
-No released pg_duckdb tag carries DuckDB 1.5.x yet, so the stack is built from
-a pinned upstream PR plus our patches - all from sources you can fetch.
+column in UTC. No released pg_duckdb tag carries DuckDB 1.5.x yet, so the stack
+is built from a pinned upstream PR plus our patches - all from sources you can
+fetch.
 
 ## What gets built
 
@@ -36,9 +35,7 @@ build `git apply --check`s each patch before applying it, so it fails loudly on
 patch rot rather than silently shipping stock iceberg (which 409s under
 concurrency and writes manifests strict Apache readers reject).
 
-ColdFront applies the following four patches to duckdb-iceberg; the full
-rationale is in
-[DUCKDB_1.5_PATCHED.md](https://github.com/pgEdge/ColdFront/blob/main/DUCKDB_1.5_PATCHED.md):
+ColdFront applies the following four patches to duckdb-iceberg:
 
 | Patch | What it does |
 |---|---|
@@ -221,7 +218,7 @@ runs the identical `ci/matrix.sh` harness - `--quick` on every push/PR,
 `ci/matrix.sh --full`, the beta gate: PG {16, 17, 18} × {vanilla, mesh (3-node
 Spock)} × {tiered, decoupled} × {primary, standby} × {s3, aws, azure, gcs}. The
 mesh cells add the cross-node stories - hot visibility via Spock, cold
-visibility via the shared Lakekeeper catalog, the R-A bakery serialising
+visibility via the shared Lakekeeper catalog, the R-A bakery serializing
 concurrent cold writers (same-node and cross-node) with no 409, and an N×(N-1)
 probe that the bakery's `coldfront.claims` table replicates in every direction.
 

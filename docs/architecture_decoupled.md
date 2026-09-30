@@ -192,8 +192,9 @@ What the helper does:
 2. `duckdb.raw_query('CREATE TABLE ice.public.<name> (col1 STORAGE_TYPE, …) PARTITIONED BY (…)')` -
    column types are validated by `coldfront._iceberg_storage_type()`, which
    mirrors the canonical map in `cmd/archiver/main.go pgFormatTypeToDuckDB`.
-   Anything outside the supported set (see "Supported column types" above)
-   raises before any DDL is issued.
+   Anything outside the supported set (see
+   [Supported column types](#supported-column-types) above) raises before any
+   DDL is issued.
 3. `CREATE OR REPLACE VIEW <schema>.<name> AS SELECT r['col']::pg_type AS col, … FROM duckdb.query('SELECT * FROM ice.public.<name>') AS t(r)` -
    projection wraps the struct accessor so applications see flat columns.
    View-cast types (`jsonb` → `json`, `interval`) are surfaced via the
@@ -454,7 +455,7 @@ Three properties worth knowing:
 
 ## ACID model
 
-(Summarises material from [architecture.md](architecture.md) §Concurrency and
+(Summarizes material from [architecture.md](architecture.md) §Concurrency and
 §Known Limitations applied to the decoupled scenario.)
 
 The table below gives the status of each ACID property in decoupled mode:
@@ -465,7 +466,7 @@ The table below gives the status of each ACID property in decoupled mode:
 | Atomicity (multi-statement tx, graceful) | **Yes.** pg_duckdb's `XactCallback` ties the DuckDB transaction to PG's, so PG `ROLLBACK` undoes pending Iceberg writes. |
 | Atomicity (multi-statement tx, backend crash) | **Partial.** A backend crash between Iceberg snapshot commit and PG commit can leave S3 objects orphaned. Iceberg housekeeping (orphan-file expiry) reclaims them; not corrupting, but a real failure mode for very-strict ACID requirements. |
 | Consistency | **Yes** within a snapshot - Iceberg's serializable model + Lakekeeper optimistic concurrency. |
-| Isolation | **Read-your-own-write within a tx works** when the wrapper view uses `duckdb.query('SELECT * FROM ice.…')` as its read path (the helper does this by default). The plain `iceberg_scan('ice.…')` form is *not* tx-aware (it re-resolves the table from Lakekeeper each call), but pg_duckdb's planner folds `duckdb.query('SELECT * FROM ice.…')` into the same `ICEBERG_SCAN` plan with identical predicate pushdown, so we get tx visibility for free. Cross-call snapshot consistency is weaker than PG-native (see Limitations). |
+| Isolation | **Read-your-own-write within a tx works** when the wrapper view uses `duckdb.query('SELECT * FROM ice.…')` as its read path (the helper does this by default). The plain `iceberg_scan('ice.…')` form is *not* tx-aware (it re-resolves the table from Lakekeeper each call), but pg_duckdb's planner folds `duckdb.query('SELECT * FROM ice.…')` into the same `ICEBERG_SCAN` plan with identical predicate pushdown, so the wrapper view gets tx visibility for free. Cross-call snapshot consistency is weaker than PG-native (see [Limitations](#limitations)). |
 | Durability | **Yes** - Iceberg commits are durable on the object store once Lakekeeper acknowledges. Stronger than PG WAL on local disk for many production setups. |
 
 ## Concurrency / horizontal scaling - the bakery protocol
@@ -478,147 +479,150 @@ pointing at the same Lakekeeper endpoint and S3 bucket.
 
 - **Writes are serialized PG-side by the bakery protocol** so they never
   collide at Lakekeeper. The implementation is Lamport's 1978 distributed
-  mutual exclusion with the Ricart-Agrawala (1981) deferred-reply optimisation.
+  mutual exclusion with the Ricart-Agrawala (1981) deferred-reply optimization.
   Claims and acks travel as Spock-replicated rows (the two repset tables
   below); a writer commits only when it holds the minimum outstanding ticket
   and every live peer has acked (a peer defers its ack while it holds a smaller
   ticket). This stays safe under Spock's *asymmetric* apply - each node applies
   peers' rows on its own independent queue, so it never assumes a peer has
   applied its concurrent claim; the snowflake-ticket total order and the ack
-  barrier serialize commits, not any global apply ordering. Modelled in
+  barrier serialize commits, not any global apply ordering. Modeled in
   [docs/formal/Bakery.tla](https://github.com/pgEdge/ColdFront/blob/main/docs/formal/Bakery.tla);
   the safety properties are verified via TLA+ (`Bakery.cfg`).
 
-  Two tables, both in Spock's `default` repset:
+    Two tables, both in Spock's `default` repset:
 
-  - `coldfront.claims` - each writer inserts `(iceberg_table, ticket)` here;
-    deleted on release.
-  - `coldfront.claim_acks` - peers insert
-    `(ticket, ack_from_name, iceberg_table)` to acknowledge an originator's
-    claim, keyed by the acker's spock node name. Replicates back to the
-    originator, and is deleted with the claim: only the originator's own wait
-    loop ever reads its acks, so a row has no reader once the claim is gone.
+    - `coldfront.claims` - each writer inserts `(iceberg_table, ticket)` here;
+      deleted on release.
+    - `coldfront.claim_acks` - peers insert
+      `(ticket, ack_from_name, iceberg_table)` to acknowledge an originator's
+      claim, keyed by the acker's spock node name. Replicates back to the
+      originator, and is deleted with the claim: only the originator's own wait
+      loop ever reads its acks, so a row has no reader once the claim is gone.
 
-  Locally on every node, `coldfront.deferred_acks` queues acks the node has
-  *deferred* because it has its own pending claim with a smaller ticket on the
-  same table. Not replicated.
+    Locally on every node, `coldfront.deferred_acks` queues acks the node has
+    *deferred* because it has its own pending claim with a smaller ticket on
+    the same table. Not replicated.
 
-  Per-writer flow:
+    Per-writer flow:
 
-  1. `snowflake.nextval()` - fresh globally-unique ticket.
-  2. Insert `(iceberg_table, ticket)` into `coldfront.claims` over the node's
-     loopback, a libpq connection the extension's C code keeps (autonomous tx;
-     replicates async via Spock). SQL reaches it only through
-     `coldfront._loopback()`, which PUBLIC cannot execute. Only a superuser can
-     set its connection string, `coldfront.dblink_self`, and the loopback
-     resolves names in `pg_catalog` only. The ticket is taken inside that
-     transaction, under the table's claim key, and every lock it takes ends
-     with it.
-  3. **Wait until both** (a) no same-node writer has a smaller ticket on this
-     table, and (b) every alive peer has acked the ticket (its row appears in
-     `coldfront.claim_acks`).
-  4. Issue the iceberg `duckdb.raw_query(...)` write - exactly one uncontested
-     commit at Lakekeeper.
-  5. Release at PG outer-transaction end (COMMIT or ABORT): the ticket is
-     enqueued at claim time (`_enqueue_release`) and the C `XactCallback`
-     deletes the claim over a loopback connection, running after pg_duckdb's
-     callback so the Iceberg snapshot has already committed (or rolled back).
-     The release trigger drains `coldfront.deferred_acks` for that ticket,
-     emitting any acks the node had been holding back.
+    1. `snowflake.nextval()` - fresh globally-unique ticket.
+    2. Insert `(iceberg_table, ticket)` into `coldfront.claims` over the node's
+       loopback, a libpq connection the extension's C code keeps (autonomous
+       tx; replicates async via Spock). SQL reaches it only through
+       `coldfront._loopback()`, which PUBLIC cannot execute. Only a superuser
+       can set its connection string, `coldfront.dblink_self`, and the loopback
+       resolves names in `pg_catalog` only. The ticket is taken inside that
+       transaction, under the table's claim key, and every lock it takes ends
+       with it.
+    3. **Wait until both** (a) no same-node writer has a smaller ticket on this
+       table, and (b) every alive peer has acked the ticket (its row appears in
+       `coldfront.claim_acks`).
+    4. Issue the iceberg `duckdb.raw_query(...)` write - exactly one
+       uncontested commit at Lakekeeper.
+    5. Release at PG outer-transaction end (COMMIT or ABORT): the ticket is
+       enqueued at claim time (`_enqueue_release`) and the C `XactCallback`
+       deletes the claim over a loopback connection, running after pg_duckdb's
+       callback so the Iceberg snapshot has already committed (or rolled back).
+       The release trigger drains `coldfront.deferred_acks` for that ticket,
+       emitting any acks the node had been holding back.
 
-  A transaction takes one claim per table and holds it until it ends, so a
-  second cold write to the same table in that transaction rides the first
-  claim.
+    A transaction takes one claim per table and holds it until it ends, so a
+    second cold write to the same table in that transaction rides the first
+    claim.
 
-  Peer-side, when Spock applies an incoming claim INSERT, an `ENABLE REPLICA`
-  trigger (`coldfront._on_claim_apply`) decides:
+    Peer-side, when Spock applies an incoming claim INSERT, an `ENABLE REPLICA`
+    trigger (`coldfront._on_claim_apply`) decides:
 
-  - If the peer has its own pending claim with a *smaller* ticket on the same
-    table, it first asks whether that claim can have a live owner (see *Orphan
-    reaping* below); if it can → defer (queue in `coldfront.deferred_acks` to
-    emit later when the smaller claim is released).
-  - Otherwise → ack immediately (INSERT into `coldfront.claim_acks` over the
-    loopback, so the row is tagged with the local node as origin and Spock
-    replicates it back to the originator).
+    - If the peer has its own pending claim with a *smaller* ticket on the same
+      table, it first asks whether that claim can have a live owner (see
+      *Orphan reaping* below); if it can → defer (queue in
+      `coldfront.deferred_acks` to emit later when the smaller claim is
+      released).
+    - Otherwise → ack immediately (INSERT into `coldfront.claim_acks` over the
+      loopback, so the row is tagged with the local node as origin and Spock
+      replicates it back to the originator).
 
-  The same trigger fires on UPDATE, for the waiter's poke described under
-  *Orphan reaping*.
+    The same trigger fires on UPDATE, for the waiter's poke described under
+    *Orphan reaping*.
 
-  The protocol works across **any number of writers per node** - each call
-  holds its own unique ticket; release deletes by ticket only, so concurrent
-  backends on the same node coexist cleanly. Same-node writers serialise on a
-  node-local advisory transaction lock per Iceberg table, held across the whole
-  claim + commit, so at most one same-node writer is inside the bakery at a
-  time; the wait loop also requires that no same-node claim with a smaller
-  ticket exists on the table (snowflake tickets are per-node monotonic +
-  timestamped, so a smaller ticket means `nextval` was called earlier on this
-  node).
+    The protocol works across **any number of writers per node** - each call
+    holds its own unique ticket; release deletes by ticket only, so concurrent
+    backends on the same node coexist cleanly. Same-node writers serialize on a
+    node-local advisory transaction lock per Iceberg table, held across the
+    whole claim + commit, so at most one same-node writer is inside the bakery
+    at a time; the wait loop also requires that no same-node claim with a
+    smaller ticket exists on the table (snowflake tickets are per-node
+    monotonic + timestamped, so a smaller ticket means `nextval` was called
+    earlier on this node).
 
-  **Orphan reaping.** A claim row whose owner is gone (a hard backend crash; an
-  ERROR takes the ABORT callback, which releases normally) would otherwise
-  strand its own node's later writers, through rule (a), and any peer that
-  deferred behind it, through the deferral it can no longer drain. The proof
-  that a same-node claim is ownerless is the per-table advisory transaction
-  lock: a live writer holds `coldfront_iceberg:<table>` from its claim INSERT
-  until its transaction ends, and the release runs in the COMMIT callback
-  before PostgreSQL drops that lock, so whoever holds it knows every other
-  same-node claim on the table has no owner. Three paths use that proof, each
-  riding a statement the bakery already executes, with no timeout, scheduler or
-  background worker:
+    **Orphan reaping.** A claim row whose owner is gone (a hard backend crash;
+    an ERROR takes the ABORT callback, which releases normally) would otherwise
+    strand its own node's later writers, through rule (a), and any peer that
+    deferred behind it, through the deferral it can no longer drain. The proof
+    that a same-node claim is ownerless is the per-table advisory transaction
+    lock: a live writer holds `coldfront_iceberg:<table>` from its claim INSERT
+    until its transaction ends, and the release runs in the COMMIT callback
+    before PostgreSQL drops that lock, so whoever holds it knows every other
+    same-node claim on the table has no owner. Three paths use that proof, each
+    riding a statement the bakery already executes, with no timeout, scheduler
+    or background worker:
 
-  - **Claim path.** `_claim_iceberg_lock` already holds the lock for its own
-    table. Its claim transaction on the loopback (`_insert_claim`) tries the
-    lock of every other table this node has a claim on; a lock the claimant's
-    own transaction holds makes the try fail, so a transaction never reaps its
-    own claims. It then deletes every same-node claim on those tables (and,
-    after a restart, any claim from before `pg_postmaster_start_time()`)
-    together with their acks before inserting the new claim, so any cold write
-    on the node clears every orphan the node left. The DELETE fires the release
-    trigger, which forwards whatever peers had deferred behind the orphan.
-  - **Apply path.** When a peer's claim arrives and a smaller same-node claim
-    exists, `_on_claim_apply` tries the lock (`pg_try_advisory_xact_lock`).
-    Success means no live local writer, so it deletes the same-node claims and
-    their acks through the loopback and acks the arrival instead of deferring
-    it. A live writer's lock makes the try fail at once, and the trigger defers
-    as before.
-  - **Waiter's poke.** A peer that deferred while the lock was held, whose
-    holder then vanished, sees no further event. So a writer in the wait loop
-    re-touches its own claim row about once a second (a no-op UPDATE); it
-    replicates, the peer's trigger runs the apply path again for that ticket,
-    and the orphan is reaped. A poke that reaps nothing is silent, so no ack is
-    ever issued after its claim is gone.
+    - **Claim path.** `_claim_iceberg_lock` already holds the lock for its own
+      table. Its claim transaction on the loopback (`_insert_claim`) tries the
+      lock of every other table this node has a claim on; a lock the claimant's
+      own transaction holds makes the try fail, so a transaction never reaps
+      its own claims. It then deletes every same-node claim on those tables
+      (and, after a restart, any claim from before
+      `pg_postmaster_start_time()`) together with their acks before inserting
+      the new claim, so any cold write on the node clears every orphan the node
+      left. The DELETE fires the release trigger, which forwards whatever peers
+      had deferred behind the orphan.
+    - **Apply path.** When a peer's claim arrives and a smaller same-node claim
+      exists, `_on_claim_apply` tries the lock (`pg_try_advisory_xact_lock`).
+      Success means no live local writer, so it deletes the same-node claims
+      and their acks through the loopback and acks the arrival instead of
+      deferring it. A live writer's lock makes the try fail at once, and the
+      trigger defers as before.
+    - **Waiter's poke.** A peer that deferred while the lock was held, whose
+      holder then vanished, sees no further event. So a writer in the wait loop
+      re-touches its own claim row about once a second (a no-op UPDATE); it
+      replicates, the peer's trigger runs the apply path again for that ticket,
+      and the orphan is reaped. A poke that reaps nothing is silent, so no ack
+      is ever issued after its claim is gone.
 
-  A node only ever deletes its own claims: a peer's claim that looks abandoned
-  may belong to a partitioned node mid-write, and it enters neither wait
-  condition anyway. Modelled as the `Reaper` constant, the `Applier`'s reap
-  branch and the `Poker` process in `Bakery.tla`: `Bakery_wedge.cfg` shows the
-  stranding without it, and `Bakery_reaper.cfg` and `Bakery_reaper_quiet.cfg`
-  show liveness and all four safety invariants holding with it, the second in
-  the case where nothing but the poke ever reaches the crashed node.
+    A node only ever deletes its own claims: a peer's claim that looks
+    abandoned may belong to a partitioned node mid-write, and it enters neither
+    wait condition anyway. Modeled as the `Reaper` constant, the `Applier`'s
+    reap branch and the `Poker` process in `Bakery.tla`: `Bakery_wedge.cfg`
+    shows the stranding without it, and `Bakery_reaper.cfg` and
+    `Bakery_reaper_quiet.cfg` show liveness and all four safety invariants
+    holding with it, the second in the case where nothing but the poke ever
+    reaches the crashed node.
 
-  The wait phase has no explicit timeout. R-A's only failure mode is a dead
-  peer (would block forever), and we close it via a liveness check on
-  `pg_stat_replication.reply_time`: a peer whose walsender has been silent
-  longer than `coldfront.peer_alive_window_ms` (default 5000 ms; tune up on
-  slow/lossy WAN links) is implicitly treated as already-acked. An *alive* peer
-  that hasn't acked is either deferring (R-A's defer rule, legitimate) or about
-  to ack - either way, waiting is correct. A same-node claim is released by the
-  C XactCallback in
-  [extension/coldfront/src/coldfront.c](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/src/coldfront.c)
-  at commit or abort, and one whose writer is gone is removed by the reaper.
+    The wait phase has no explicit timeout. R-A's only failure mode is a dead
+    peer (would block forever), and ColdFront closes it via a liveness check on
+    `pg_stat_replication.reply_time`: a peer whose walsender has been silent
+    longer than `coldfront.peer_alive_window_ms` (default 5000 ms; tune up on
+    slow/lossy WAN links) is implicitly treated as already-acked. An *alive*
+    peer that hasn't acked is either deferring (R-A's defer rule, legitimate)
+    or about to ack - either way, waiting is correct. A same-node claim is
+    released by the C XactCallback in
+    [extension/coldfront/src/coldfront.c](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/src/coldfront.c)
+    at commit or abort, and one whose writer is gone is removed by the reaper.
 
-  The mechanics live in
-  [extension/coldfront/coldfront--1.0.sql](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/coldfront--1.0.sql)
-  (`_claim_iceberg_lock`, `_insert_claim`, `_on_claim_apply`,
-  `_on_claim_release`, `_exec_iceberg_with_claim`) and the C-side rewrite and
-  loopback in
-  [extension/coldfront/src/coldfront.c](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/src/coldfront.c)
-  (`cold_exec_call`, `cf_loopback_exec`).
+    The mechanics live in
+    [extension/coldfront/coldfront--1.0.sql](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/coldfront--1.0.sql)
+    (`_claim_iceberg_lock`, `_insert_claim`, `_on_claim_apply`,
+    `_on_claim_release`, `_exec_iceberg_with_claim`) and the C-side rewrite and
+    loopback in
+    [extension/coldfront/src/coldfront.c](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/src/coldfront.c)
+    (`cold_exec_call`, `cf_loopback_exec`).
 
-  Because every commit is uncontested, the duckdb-iceberg writer never has to
-  deal with a 409 - no rebase-retry loop needed at all. (Upstream
-  `duckdb-iceberg` does not implement one; the bakery sidesteps the
-  requirement.)
+    Because every commit is uncontested, the duckdb-iceberg writer never has to
+    deal with a 409 - no rebase-retry loop needed at all. (Upstream
+    `duckdb-iceberg` does not implement one; the bakery sidesteps the
+    requirement.)
 
 - **DDL replication.** Spock's `ddl_sql` repset replicates `CREATE/ALTER/DROP`
   of the wrapper view, and the `default` repset replicates the
@@ -626,7 +630,7 @@ pointing at the same Lakekeeper endpoint and S3 bucket.
   [Distributed setup](usage.md#distributed-setup-3-node-mesh-decoupled-mode)),
   so one node provisions the table and replication arms every peer's hook.
 
-### Throughput characterisation
+### Throughput characterization
 
 The commit-rate ceiling sits at Lakekeeper, not at the PG side, so scale
 throughput with larger per-INSERT batches or by partitioning the Iceberg table.
@@ -691,7 +695,7 @@ setup.
 
 ## When to use decoupled vs tiered
 
-The two modes suit different workloads; the guidance below summarises when each
+The two modes suit different workloads; the guidance below summarizes when each
 one fits.
 
 Decoupled (iceberg-only) is the right choice when:
@@ -700,9 +704,9 @@ Decoupled (iceberg-only) is the right choice when:
   analytic reads run substantially faster than PG heap on shape-matched
   workloads).
 - Operational simplicity outweighs ergonomics: no archiver cron, no watermark,
-  no autovacuum-vs-cutover lock conflict (see architecture_tiered.md →
-  Tiered-specific limitations), no PK rebuild after bulk load, no
-  partition-management script.
+  no autovacuum-vs-cutover lock conflict (see
+  [architecture_tiered.md → Tiered-specific limitations](architecture_tiered.md#tiered-specific-limitations)),
+  no PK rebuild after bulk load, no partition-management script.
 - You can tolerate the isolation gap (cross-query snapshot consistency). Tables
   created via `create_iceberg_table()` are queried with plain SQL through the
   wrapper view; the verbose `iceberg_scan` / `raw_query` syntax applies only to

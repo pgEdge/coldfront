@@ -3,7 +3,7 @@
 !!! warning "Pre-release beta software"
 
     ColdFront is pre-release beta software under active development. Do not use
-    it in production. Interfaces, on-disk formats, and behaviour may change
+    it in production. Interfaces, on-disk formats, and behavior may change
     without notice, and data loss is possible.
 
 ColdFront keeps tables in PostgreSQL and cold data in Apache Iceberg (Parquet
@@ -114,14 +114,14 @@ SELECT coldfront.grant_app_access('alice');
 ```
 
 grant_app_access grants only the minimum the cold path needs: membership in
-duckdb.postgres_role, schema USAGE, SELECT on the registry, DML on every
-registered view and the hot table and sequences behind it (all derived from the
-registry, not hardcoded), plus EXECUTE on a fixed allow-list of runtime
-cold-path functions. The call is idempotent and is not executable by PUBLIC, so
-an application role can never self-grant. The role is never granted
-pg_read_server_files or pg_write_server_files, so it has no host-file access.
-CREATE ROLE and GRANT both replicate over Spock, so you onboard a role once on
-any node and it propagates across the mesh.
+duckdb.postgres_role, schema USAGE, SELECT on the registry, and DML on every
+registered view and the hot table and sequences behind it. Those objects are
+derived from the registry, not hardcoded, and the call also grants EXECUTE on a
+fixed allow-list of runtime cold-path functions. The call is idempotent and is
+not executable by PUBLIC, so an application role can never self-grant. The role
+is never granted pg_read_server_files or pg_write_server_files, so it has no
+host-file access. CREATE ROLE and GRANT both replicate over Spock, so you
+onboard a role once on any node and it propagates across the mesh.
 
 For how the non-superuser path works under the hood - the `SECURITY DEFINER`
 attach helpers, the `PGC_SUSET` / `GUC_SUPERUSER_ONLY` config hardening, the

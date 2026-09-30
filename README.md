@@ -2,7 +2,7 @@
 
 > [!WARNING]
 > ColdFront is beta software under active development. Do not use it in
-> production. Interfaces, on-disk formats, and behaviour may change without
+> production. Interfaces, on-disk formats, and behavior may change without
 > notice, and data loss is possible.
 
 [![CI](https://github.com/pgEdge/ColdFront/actions/workflows/ci.yml/badge.svg)](https://github.com/pgEdge/ColdFront/actions/workflows/ci.yml)
@@ -146,14 +146,14 @@ SELECT coldfront.grant_app_access('alice');
 ```
 
 grant_app_access grants only the minimum the cold path needs: membership in
-duckdb.postgres_role, schema USAGE, SELECT on the registry, DML on every
-registered view and the hot table and sequences behind it (all derived from the
-registry, not hardcoded), plus EXECUTE on a fixed allow-list of runtime
-cold-path functions. The call is idempotent and is not executable by PUBLIC, so
-an application role can never self-grant. The role is never granted
-pg_read_server_files or pg_write_server_files, so it has no host-file access.
-CREATE ROLE and GRANT both replicate over Spock, so you onboard a role once on
-any node and it propagates across the mesh.
+duckdb.postgres_role, schema USAGE, SELECT on the registry, and DML on every
+registered view and the hot table and sequences behind it. Those objects are
+derived from the registry, not hardcoded, and the call also grants EXECUTE on a
+fixed allow-list of runtime cold-path functions. The call is idempotent and is
+not executable by PUBLIC, so an application role can never self-grant. The role
+is never granted pg_read_server_files or pg_write_server_files, so it has no
+host-file access. CREATE ROLE and GRANT both replicate over Spock, so you
+onboard a role once on any node and it propagates across the mesh.
 
 For how the non-superuser path works under the hood - the `SECURITY DEFINER`
 attach helpers, the `PGC_SUSET` / `GUC_SUPERUSER_ONLY` config hardening, the
@@ -227,7 +227,7 @@ The following table lists the services and components ColdFront runs against:
 |-----------|---------|---------|
 | PostgreSQL | 16, 17, or 18 | Database with native partitioning (stock upstream; no fork) |
 | pg_duckdb | 1.5.4 (PR #1025) | Iceberg reads + writes via DuckDB in-process |
-| duckdb-iceberg | `v1.5-variegata` @ `5edc45f0`, patched | Iceberg catalog/IO for DuckDB; carries ColdFront's four patches (see [DUCKDB_1.5_PATCHED.md](DUCKDB_1.5_PATCHED.md)) |
+| duckdb-iceberg | `v1.5-variegata` @ `5edc45f0`, patched | Iceberg catalog/IO for DuckDB; carries ColdFront's four patches (see [docker/Dockerfile.duckdb15-base](docker/Dockerfile.duckdb15-base)) |
 | Lakekeeper | latest | Iceberg REST catalog (Rust binary) |
 | S3-compatible store | any | SeaweedFS, MinIO, GCS, Azure Blob, etc. |
 
@@ -245,11 +245,11 @@ convention:
 - Release tags use three-part [Semantic Versioning](https://semver.org)
   (`vMAJOR.MINOR.PATCH`, for example `v1.0.0`); Git tags, GitHub releases,
   container image tags, and the changelog all use this form. Three parts are
-  required because ColdFront is a Go module, and the toolchain recognises only
+  required because ColdFront is a Go module, and the toolchain recognizes only
   full `vX.Y.Z` tags as releases. The patch field keeps a bugfix-only release
   (`v1.0.1`) distinct from a feature release (`v1.1.0`), which matters for a
-  data-writing extension where "same behaviour, one safety fix" is worth
-  stating plainly.
+  data-writing extension where "same behavior, one safety fix" is worth stating
+  plainly.
 - The PostgreSQL extension uses the conventional two-part version in its
   control file (`default_version = '1.0'`) and upgrade-script filenames
   (`coldfront--1.0--1.1.sql`), as is standard for PostgreSQL extensions.

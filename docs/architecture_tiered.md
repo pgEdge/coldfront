@@ -345,7 +345,7 @@ UPDATE is a plain hot UPDATE in either mode.
 
 ## Write modes: strict vs permissive (`allow_mixed_writes`)
 
-When the predicate is AMBIGUOUS the hook picks one of two behaviours from the
+When the predicate is AMBIGUOUS the hook picks one of two behaviors from the
 `coldfront.allow_mixed_writes` GUC (USERSET, default `on`).
 
 **Permissive (`on`, default).** The hook emits a dual-tier CTE:
@@ -374,7 +374,7 @@ clause.
 
 ## Tiered tables in a Spock mesh
 
-The bakery protocol that serialises cold writes cluster-wide is described in
+The bakery protocol that serializes cold writes cluster-wide is described in
 [architecture.md → Concurrency](architecture.md#concurrency-and-pgedge-spock-deployments).
 This section covers what is specific to a *tiered* table across a mesh.
 
@@ -393,7 +393,7 @@ So alongside the bakery substrate (`coldfront.claims` /
 `coldfront.archive_watermark` are added to the Spock replication set** when a
 mesh runs in tiered mode. The archiver runs on one node, so a peer only gets
 these rows by replication; without `tiered_views` a peer can read and INSERT
-but UPDATE/DELETE/DDL-blocking stop recognising the view.
+but UPDATE/DELETE/DDL-blocking stop recognizing the view.
 
 Both tables are **name-keyed** - `tiered_views` by `(schema_name, relname)`,
 `archive_watermark` by `table_name` - so each row replicates verbatim and
@@ -547,7 +547,7 @@ The dual-tier model carries the following limitations:
    cutover fails cleanly with `ERROR: canceling statement due to lock timeout`
    and leaves the trigger + delta in place for the next cycle to retry.
 
-   Mitigation: disable autovacuum on the soon-to-be-archived partition
-   (`ALTER TABLE <part> SET (autovacuum_enabled = false);` - the setting goes
-   with the partition when it is detached and dropped), or schedule the archive
-   cycle so partitions have already settled.
+    Mitigation: disable autovacuum on the soon-to-be-archived partition
+    (`ALTER TABLE <part> SET (autovacuum_enabled = false);` - the setting goes
+    with the partition when it is detached and dropped), or schedule the
+    archive cycle so partitions have already settled.

@@ -170,7 +170,7 @@ rows a foreign engine appended straight to Iceberg carry none either, and the
 read path handles them explicitly.
 
 A retrain cannot interleave with a cold write, because an operation that
-rewrites the table holds the table's claim and every cold write serialises on
+rewrites the table holds the table's claim and every cold write serializes on
 that same claim.
 
 ### The seven paths
@@ -295,7 +295,7 @@ Three properties, set at `CREATE TABLE`:
 
 Row groups are the pruning granularity: the Parquet reader skips a row group
 whose statistics cannot match the filter. The two writers each read one
-row-group property and ignore the other. iceberg-go honours the 2048-row limit,
+row-group property and ignore the other. iceberg-go honors the 2048-row limit,
 so a compacted file's groups hold a median of one cluster. DuckDB reads only
 `write.parquet.row-group-size-bytes`, and a table carrying that property
 refuses every DuckDB write to it
@@ -357,16 +357,18 @@ memory rather than one table.
 ## Reading: the probe
 
 `cf_maybe_inject_probe` runs on the read path, alongside the hot-tier reroute
-and the jsonb normalisation, and it is what makes the layout worth maintaining.
-It recognises one shape and rewrites it:
+and the jsonb normalization, and it is what makes the layout worth maintaining.
+It recognizes one shape and rewrites it:
 
 - a single-relation `SELECT` on a registered view with a clustered vector
-  column,
-- ordered by exactly one cosine distance between that column and a constant,
-- with a `LIMIT`,
-- and at the top level of the statement: the hook sees one `Query`, so a top-k
-  nested in a subquery or a CTE is not the query it is looking at. Wrapping a
-  search to aggregate over it therefore makes it exact.
+  column.
+- ordered by exactly one cosine distance between that column and a constant.
+- with a `LIMIT`.
+- and at the top level of the statement.
+
+The hook sees one `Query`, so a top-k nested in a subquery or a CTE is not the
+query it is looking at. Wrapping a search to aggregate over it therefore makes
+it exact.
 
 Grouping, aggregation, window functions and `DISTINCT` above that `ORDER BY`
 are accepted, and they compute over the narrowed scan: the probe restricts
@@ -487,9 +489,9 @@ These are properties of the code as it stands, not plans.
 - **`'{…}'::real[]` does not work as the query vector.** It reaches DuckDB as a
   VARCHAR and fails to cast. The spelling is `ARRAY[…]::real[]`.
 - **`embedding::vector <=> …` fails** with
-  `Type with name vector does not exist!`, and materialising the read does not
+  `Type with name vector does not exist!`, and materializing the read does not
   help. The unadorned form resolves, so nothing needs the cast.
-- **There is no PostgreSQL-side fallback.** Once a view embeds `iceberg_scan`,
+- **There is no PostgreSQL-side fallback.** When a view embeds `iceberg_scan`,
   DuckDB owns the whole query and a function it lacks is a hard error rather
   than a slow path. Every expression the product wants users to write has to
   resolve in DuckDB.

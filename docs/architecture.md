@@ -27,7 +27,7 @@ This document is organized into the following sections:
 For mode-specific design, see [architecture_tiered.md](architecture_tiered.md)
 (hot PG + cold Iceberg) ·
 [architecture_decoupled.md](architecture_decoupled.md) (all-Iceberg) ·
-[architecture_vectors.md](architecture_vectors.md) (vector storage)
+[architecture_vectors.md](architecture_vectors.md) (vector storage).
 
 ## Operating modes and topologies
 
@@ -37,7 +37,7 @@ below. They compose freely - e.g. tiered + mesh + permissive writes:
 | Axis | Values | Selected by |
 |---|---|---|
 | **Storage mode** | **Tiered** - hot PG heap + cold Iceberg, unified by a `UNION ALL` view; an archiver moves rows hot→cold on a cron. · **Decoupled** - the table lives entirely in Iceberg; PG holds only a wrapper view + a registry row (no archiver, no PG storage, no watermark). | Per relation at creation, via the `is_iceberg_only` flag on `coldfront.tiered_views` (short-circuited in the hook's `classify_tier()`). |
-| **Topology** | **Vanilla** - single node; `spock`/`snowflake` not loaded; cold writes serialise on a local advisory lock. · **Mesh** - 3-node pgEdge Spock active-active; cold writes serialise cluster-wide via the bakery protocol. | Whether `spock`/`snowflake` are in `shared_preload_libraries`. One image and one SQL surface serve both; the `_exec_iceberg_with_claim` chokepoint self-selects via its `v_armed` gate. |
+| **Topology** | **Vanilla** - single node; `spock`/`snowflake` not loaded; cold writes serialize on a local advisory lock. · **Mesh** - 3-node pgEdge Spock active-active; cold writes serialize cluster-wide via the bakery protocol. | Whether `spock`/`snowflake` are in `shared_preload_libraries`. One image and one SQL surface serve both; the `_exec_iceberg_with_claim` chokepoint self-selects via its `v_armed` gate. |
 | **Write mode** | **Permissive** (default) - an ambiguous cross-tier `UPDATE`/`DELETE` writes both tiers. · **Strict** - it is rejected with a hint. | `coldfront.allow_mixed_writes` (USERSET). |
 
 Both storage modes coexist in one database and share **one** code path: the
@@ -46,7 +46,7 @@ transparent view and read rewriter, the INSERT/UPDATE/DELETE hook (`emit_cold`
 [`extension/coldfront/src/coldfront.c`](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/src/coldfront.c)),
 and the `_exec_iceberg_with_claim` write chokepoint. Decoupled mode simply
 always classifies as `TIER_COLD` and never reaches `emit_hot`; vanilla and mesh
-differ only in how that chokepoint serialises cold writes. This document covers
+differ only in how that chokepoint serializes cold writes. This document covers
 the shared mechanics and the tiered path; see
 [architecture_decoupled.md](architecture_decoupled.md) for the decoupled mode's
 ACID model and distributed scaling story.
@@ -307,18 +307,18 @@ inside a plpgsql function / `DO` block / trigger, via two mechanisms:
    object PG cannot tag a real DML against, so the call is reshaped as a no-row
    DML:
 
-   ```sql
-   UPDATE coldfront._dummy_dml_target SET anchor = anchor
-    WHERE coldfront._exec_iceberg_with_claim(...) IS NULL
-   ```
+    ```sql
+    UPDATE coldfront._dummy_dml_target SET anchor = anchor
+     WHERE coldfront._exec_iceberg_with_claim(...) IS NULL
+    ```
 
-   The cold call runs exactly once in the WHERE qual; because
-   `_exec_iceberg_with_claim` returns `void` and `void IS NULL` is always
-   false, **zero rows match - the carrier is never written: no dead rows, no
-   WAL, no bloat.** For dual-tier and tiered-INSERT the hot DML is the outer
-   statement and this same UPDATE rides in a data-modifying `WITH`-CTE. At the
-   top level the rewrite keeps the plain
-   `SELECT coldfront._exec_iceberg_with_claim(...)` shape.
+    The cold call runs exactly once in the WHERE qual; because
+    `_exec_iceberg_with_claim` returns `void` and `void IS NULL` is always
+    false, **zero rows match - the carrier is never written: no dead rows, no
+    WAL, no bloat.** For dual-tier and tiered-INSERT the hot DML is the outer
+    statement and this same UPDATE rides in a data-modifying `WITH`-CTE. At the
+    top level the rewrite keeps the plain
+    `SELECT coldfront._exec_iceberg_with_claim(...)` shape.
 
 "Inside plpgsql" is detected via `pstate->p_post_columnref_hook != NULL`
 (plpgsql installs that hook to resolve identifiers as variables; a top-level
@@ -334,7 +334,7 @@ ColdFront coordinates concurrent writes across the cluster as follows:
   are prevented up front rather than retried; the only retry is the cutover's
   lock acquisition (10 attempts, exponential backoff from 100 ms to 51.2 s).
 - Hot writes are replicated by Spock normally (standard PG DML).
-- Cold writes via `duckdb.raw_query()` from multiple nodes are serialised
+- Cold writes via `duckdb.raw_query()` from multiple nodes are serialized
   PG-side by the **bakery protocol** in the coldfront extension - every
   iceberg-only INSERT/UPDATE/DELETE wraps in
   `coldfront._exec_iceberg_with_claim`, which holds a globally-ordered
@@ -353,12 +353,12 @@ build marker `coldfront.iceberg_bakery_patch` (asserting the loaded
 duckdb-iceberg carries the patch) are on (`coldfront._iceberg_async_active()`),
 as the following table shows:
 
-| Ordering | duckdb-iceberg | Behaviour |
+| Ordering | duckdb-iceberg | Behavior |
 |---|---|---|
-| stock (default) | **stock** upstream | Claim-first: take the bakery ticket, *then* upload parquet **and** commit inside the ticket. Correct on an unpatched binary, but the whole parquet upload happens under the lock, so concurrent writers serialise on upload + commit. |
-| async (both GUCs `on`) | **patched** (`iceberg-bakery-aware-commit-refresh-v15.patch`) | Overlap: upload parquet in the background *first*, then take the ticket only for the Lakekeeper commit. Concurrent writers' uploads overlap; only the short commit POST is serialised. |
+| stock (default) | **stock** upstream | Claim-first: take the bakery ticket, *then* upload parquet **and** commit inside the ticket. Correct on an unpatched binary, but the whole parquet upload happens under the lock, so concurrent writers serialize on upload + commit. |
+| async (both GUCs `on`) | **patched** (`iceberg-bakery-aware-commit-refresh-v15.patch`) | Overlap: upload parquet in the background *first*, then take the ticket only for the Lakekeeper commit. Concurrent writers' uploads overlap; only the short commit POST is serialized. |
 
-The code path and the application-visible behaviour are identical, so the GUCs
+The code path and the application-visible behavior are identical, so the GUCs
 are purely a performance knob. The patch relocates parent-snapshot stamping
 from upload time into PG's pre-commit phase (inside the bakery ticket, against
 a freshly-fetched table), so overlapping uploads can't commit a stale parent.
@@ -367,10 +367,8 @@ ordering, noted once per session with a server LOG line - never a silent 409.
 The Docker image ships the patched binary and sets both GUCs on
 (`docker/entrypoint.sh`); bare-metal users on a stock binary leave both `off`
 and lose only the upload overlap. See
-[DUCKDB_1.5_PATCHED.md](https://github.com/pgEdge/ColdFront/blob/main/DUCKDB_1.5_PATCHED.md)
-and
-[DUCKDB_1.5_UNPATCHED.md](https://github.com/pgEdge/ColdFront/blob/main/DUCKDB_1.5_UNPATCHED.md)
-for the build and the full rationale.
+[`docker/Dockerfile.duckdb15-base`](https://github.com/pgEdge/ColdFront/blob/main/docker/Dockerfile.duckdb15-base)
+for the build.
 
 ### Transparent DDL via coldfront
 
@@ -380,7 +378,7 @@ relation to an OID and comparing against the OID of the registry's
 `hot_table` - never by string, so it is schema-agnostic), as the following
 table summarizes:
 
-| DDL | Behaviour |
+| DDL | Behavior |
 |---|---|
 | `ALTER TABLE _t ADD/DROP COLUMN`, `ALTER COLUMN ... TYPE`, `RENAME COLUMN` | **Mirrored to Iceberg** - the hook drops the view, runs the hot-side change, then `coldfront._mirror_iceberg_alter` issues the matching Iceberg `ALTER` (one bakery-serialized, claim-first catalog change) and rebuilds the view, so both tiers evolve in one statement. Column types map through `coldfront._iceberg_storage_type`, so an unsupported type (e.g. `inet`) is rejected up front; `ALTER COLUMN TYPE` is limited to the safe promotions duckdb-iceberg accepts (int→bigint, float→double, date→timestamp, decimal-widen). |
 | `ALTER TABLE _t RENAME TO ...` | Supported (touches no Iceberg schema): update `tiered_views.hot_table`, rebuild the view. |
@@ -396,7 +394,7 @@ view's `(schema_name, relname)`, which either rebuild leaves unchanged, so
 there is nothing to re-point. A column change is mirrored to Iceberg through
 `ensure_attached()` + the bakery, so it requires a configured
 `coldfront.warehouse`; a RENAME TABLE/VIEW touches no Iceberg schema and
-rebuilds the view regardless. Concurrent schema changes are serialised by the
+rebuilds the view regardless. Concurrent schema changes are serialized by the
 same bakery as cold DML.
 
 In active-active deployments, Spock replicates the top-level `ALTER TABLE` (the
@@ -411,7 +409,7 @@ every node: the rebuild needs no re-pointing. DROP and TRUNCATE are blocked on
 every node. What a tiered table additionally needs to be usable on a peer is
 covered next.
 
-The tiered-specific cross-node behaviour - what replicates so a tiered table is
+The tiered-specific cross-node behavior - what replicates so a tiered table is
 usable on every peer, and why both the registry and the watermark join the
 replication set - is in
 [architecture_tiered.md → Tiered tables in a Spock mesh](architecture_tiered.md#tiered-tables-in-a-spock-mesh).
@@ -537,7 +535,7 @@ The cross-cutting limitations are:
    on. `pg_duckdb` does not distribute the DuckDB plan across nodes.
    Replication (single- or multi-master via pgEdge Spock) is supported on the
    hot tier and transparent to the application; scaling read throughput
-   requires more replicas rather than parallelising one query. Those replicas,
+   requires more replicas rather than parallelizing one query. Those replicas,
    including read-only physical standbys, serve cross-tier reads (see
    [Read target](#read-target-primary-or-physical-standby)).
 
@@ -590,7 +588,7 @@ only, no uuid-ossp).
 
 ## Upstream Requests
 
-Behaviours in upstream projects that ColdFront works around, kept as
+Behaviors in upstream projects that ColdFront works around, kept as
 architectural notes: the gap, the workaround in use today, and the shape of the
 upstream capability that would let us drop the workaround.
 
@@ -622,7 +620,7 @@ an attached Iceberg catalog.
 `duckdb.raw_query` that reads through the DuckDB `postgres` extension's
 `pglocal.<schema>.<table>` ATTACH, pipelining rows over libpq (loopback) →
 DuckDB executor → Iceberg writer → S3 in a single pass, no local
-materialisation. The cost is the libpq round-trip per row batch - real, but
+materialization. The cost is the libpq round-trip per row batch - real, but
 dwarfed by the Iceberg commit work for any realistic batch.
 
 **Desired end-state.** A way to drive the native in-process reader straight

@@ -25,34 +25,34 @@ Before you begin, gather the following:
 - **A long-term access key** - an access key id (`AKIAEXAMPLE...`) and secret
   (`<your-secret-key>`).
 
-  > **Long-term keys only.** Lakekeeper's warehouse credential has no field for
-  > a session token, so single sign-on (SSO) or temporary session-token
-  > credentials do **not** work here. Use a permanent access-key pair with no
-  > expiry.
-  >
-  > This applies to the warehouse's own credential. A deployment that must not
-  > store any object-store credential in the database can use vended
-  > credentials instead, where the warehouse issues short-lived per-table
-  > credentials at access time; see [usage.md](usage.md#vended-credentials).
+    > **Long-term keys only.** Lakekeeper's warehouse credential has no field
+    > for a session token, so single sign-on (SSO) or temporary session-token
+    > credentials do **not** work here. Use a permanent access-key pair with no
+    > expiry.
+    >
+    > This applies to the warehouse's own credential. A deployment that must
+    > not store any object-store credential in the database can use vended
+    > credentials instead, where the warehouse issues short-lived per-table
+    > credentials at access time; see [usage.md](usage.md#vended-credentials).
 
 - **Permissions** - the key needs read/write/list on the bucket (`GetObject` /
   `PutObject` / `DeleteObject` / `ListBucket`). Example policy:
 
-  ```json
-  {
-    "Version": "2012-10-17",
-    "Statement": [
-      {
-        "Effect": "Allow",
-        "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"],
-        "Resource": [
-          "arn:aws:s3:::my-iceberg-bucket",
-          "arn:aws:s3:::my-iceberg-bucket/*"
-        ]
-      }
-    ]
-  }
-  ```
+    ```json
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Effect": "Allow",
+          "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"],
+          "Resource": [
+            "arn:aws:s3:::my-iceberg-bucket",
+            "arn:aws:s3:::my-iceberg-bucket/*"
+          ]
+        }
+      ]
+    }
+    ```
 
 - **The ColdFront image, built once.** Build it by following
   [installation.md](installation.md) (it notes the registry access the base
@@ -144,7 +144,7 @@ curl -X POST http://localhost:8181/management/v1/warehouse \
 # => HTTP 201
 ```
 
-The `key-prefix` is an arbitrary path inside the bucket; `coldfront` is just an
+The `key-prefix` is an arbitrary path inside the bucket. `coldfront` is just an
 example.
 
 **Vended-credentials variant.** To run ColdFront with no stored credential
@@ -152,10 +152,10 @@ example.
 credentials instead of handing the client a static key. Two things change from
 the warehouse above.
 
-First, an IAM role scoped to the bucket. Lakekeeper assumes it per table and
-vends the resulting short-lived key, secret, and session token to ColdFront.
-Its permission policy grants `GetObject` / `PutObject` / `DeleteObject` /
-`ListBucket` (plus the multipart actions) on the bucket and
+First, create an IAM role scoped to the bucket. Lakekeeper assumes it per table
+and vends the resulting short-lived key, secret, and session token to
+ColdFront. Its permission policy grants `GetObject` / `PutObject` /
+`DeleteObject` / `ListBucket` (plus the multipart actions) on the bucket and
 `arn:aws:s3:::my-iceberg-bucket/*`. Its trust policy lets the warehouse
 credential's own IAM identity assume it, gated by an `ExternalId` that
 Lakekeeper must present (confused-deputy protection):
@@ -172,8 +172,8 @@ Lakekeeper must present (confused-deputy protection):
 }
 ```
 
-Second, the warehouse: set `sts-enabled: true` and `assume-role-arn` in the
-`storage-profile`, and add the matching `external-id` to the
+Second, update the warehouse: set `sts-enabled: true` and `assume-role-arn` in
+the `storage-profile`, and add the matching `external-id` to the
 `storage-credential` (which stays the warehouse's own long-term key):
 
 ```json

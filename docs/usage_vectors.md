@@ -123,16 +123,18 @@ are rewritten; with a new `nlist`, every row is. Either way the centroids and
 the assignments change together, so a search is never wrong in between; it is
 only slower until the next compaction.
 
-Choosing `nlist` is a floor rather than a formula: aim for at least one row
-group's worth of rows per cluster, roughly 2048. Below that, extra clusters
-stop reducing the data read. Above it there is a wide plateau.
-
 **Time partitioning.** A tiered vector table is partitioned by time, because
 its hot table is; a decoupled one only if it was created with time partitioning
 (`p_partition_cols`). On such a table a search with a time filter skips the
 months outside it, and a search over all of history reads one row group of each
 probed cluster per month rather than one, roughly the number of months more
 data. A decoupled vector table created without time partitioning is unaffected.
+
+### Choosing `nlist`
+
+Choosing `nlist` is a floor rather than a formula: aim for at least one row
+group's worth of rows per cluster, roughly 2048. Below that, extra clusters
+stop reducing the data read. Above it there is a wide plateau.
 
 ### Choosing `nprobe`
 
@@ -288,7 +290,8 @@ The assignment lookup reads the centroid tables through a local connection, so
 `coldfront.local_pg_dsn` must be set. The shipped container image sets it. On
 bare metal, add it to `postgresql.conf`:
 
-```
+```ini
+
 coldfront.local_pg_dsn = 'host=/var/run/postgresql dbname=<db> user=<role>'
 ```
 
