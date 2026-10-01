@@ -1957,6 +1957,21 @@ EOSQL
     assert_eq "concurrent mixed write updated the hot tier (4 m1 rows)"  "4" "$(q "$HOST" "SELECT count(*) FROM _events WHERE status='mixdone';")"
 }
 
+# assert_peers_agree <label> <sql>: on a mesh, every peer returns what HOST
+# returns for <sql>, read after a 3 s wait for Spock to apply HOST's last change.
+assert_peers_agree() {
+    [ "$MESH" = 1 ] || return 0
+    local PARR pc want; read -ra PARR <<< "$PEERS"
+    want=$(q "$HOST" "$2"); sleep 3
+    for pc in "${PARR[@]}"; do assert_eq "$1 on $pc" "$want" "$(q "$pc" "$2")"; done
+}
+
+# peer_exceptions: each peer's spock.exception_log row count, space-separated.
+peer_exceptions() {
+    local PARR pc; read -ra PARR <<< "$PEERS"
+    for pc in "${PARR[@]}"; do printf '%s ' "$(q "$pc" "SELECT count(*) FROM spock.exception_log;")"; done
+}
+
 # ───────────────────────────────────────────────────────────────────────────
 # Story 7 — Schema DDL. Column-shape changes (ADD/DROP/ALTER-TYPE/RENAME COLUMN)
 # are MIRRORED onto the Iceberg cold tier and the transparent view is rebuilt;
@@ -1964,40 +1979,58 @@ EOSQL
 # the PG side. Exercised on a scratch column so the table shape is restored for
 # later stories. Each cross-tier read after a change only succeeds if the Iceberg
 # schema actually followed it (else the rebuilt cold branch fails to resolve).
+# On a mesh, each change reaches every peer's hot table, view and registry and
+# leaves replication running (TC-198).
 # ───────────────────────────────────────────────────────────────────────────
 story_ddl() {
     step "7. Schema DDL mirrored to Iceberg (ADD/DROP/ALTER TYPE/RENAME COLUMN); rename table/view"
     local cutoff="date_trunc('month',now()) - interval '2 months'"   # m2 boundary
+    local cols="SELECT coalesce(string_agg(table_name || '.' || column_name || ':' || data_type, ',' ORDER BY table_name), '') FROM information_schema.columns WHERE table_schema='public' AND table_name IN ('_events','events') AND column_name IN ('cnt','ctr');"
+    local exc=""; [ "$MESH" = 1 ] && exc=$(peer_exceptions)
 
     # ADD COLUMN → mirrored; the cold UNION branch now projects it.
     q "$HOST" "ALTER TABLE _events ADD COLUMN cnt integer;" >/dev/null
     assert_gt "cold tier readable after ADD COLUMN (mirrored to Iceberg)" "0" "$(q "$HOST" "SELECT count(*) FROM events WHERE ts < $cutoff;")"
     assert_eq "view exposes the added column" "cnt" "$(q "$HOST" "SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='events' AND column_name='cnt';")"
     assert_eq "added column is NULL on historical cold rows" "" "$(q "$HOST" "SELECT cnt FROM events WHERE ts < $cutoff ORDER BY ts LIMIT 1;")"
+    assert_peers_agree "TC-198: ADD COLUMN reached the hot table and view" "$cols"
+    q "$HOST" "INSERT INTO _events (ts,status,data,cnt) VALUES (date_trunc('month',now()) - interval '1 month' + interval '11 days','ddl_peer','{}',7);" >/dev/null
+    assert_peers_agree "TC-198: a hot row written after the ADD COLUMN arrived" "SELECT cnt FROM events WHERE status='ddl_peer';"
+    q "$HOST" "DELETE FROM _events WHERE status='ddl_peer';" >/dev/null
 
     # ALTER COLUMN TYPE → mirrored safe promotion (INTEGER -> BIGINT).
     q "$HOST" "ALTER TABLE _events ALTER COLUMN cnt TYPE bigint;" >/dev/null
     assert_gt "cold tier readable after ALTER COLUMN TYPE" "0" "$(q "$HOST" "SELECT count(*) FROM events WHERE ts < $cutoff;")"
+    assert_peers_agree "TC-198: ALTER COLUMN TYPE reached the hot table and view" "$cols"
 
     # RENAME COLUMN → Iceberg column renamed too, or the rebuilt cold branch
     # (r['ctr']) could not resolve against the old Iceberg name.
     q "$HOST" "ALTER TABLE _events RENAME COLUMN cnt TO ctr;" >/dev/null
     assert_gt "cold tier readable after RENAME COLUMN (Iceberg col renamed)" "0" "$(q "$HOST" "SELECT count(*) FROM events WHERE ts < $cutoff;")"
     assert_eq "renamed column visible on the view" "ctr" "$(q "$HOST" "SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='events' AND column_name='ctr';")"
+    assert_peers_agree "TC-198: RENAME COLUMN reached the hot table and view" "$cols"
 
     # DROP COLUMN → mirrored; restores the original shape for later stories.
     q "$HOST" "ALTER TABLE _events DROP COLUMN ctr;" >/dev/null
     assert_eq "scratch column dropped from the view" "0" "$(q "$HOST" "SELECT count(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='events' AND column_name IN ('cnt','ctr');")"
     assert_gt "cold tier readable after DROP COLUMN" "0" "$(q "$HOST" "SELECT count(*) FROM events WHERE ts < $cutoff;")"
+    assert_peers_agree "TC-198: DROP COLUMN reached the hot table and view" "$cols"
+    [ "$MESH" = 1 ] && assert_eq "TC-198: no peer logged an apply exception for the column DDL" "$exc" "$(peer_exceptions)"
 
     # Data-type correspondence is enforced: an unsupported type is rejected up front.
     assert_err "ADD COLUMN inet rejected (no Iceberg mapping)" "no Iceberg-compatible mapping" "$(q_may "$HOST" "ALTER TABLE _events ADD COLUMN ip inet;")"
 
     # RENAME VIEW is supported and must migrate the watermark so the cold branch survives.
+    local reg="SELECT concat_ws('/', (SELECT string_agg(relname, ',' ORDER BY relname) FROM pg_class WHERE relkind='v' AND relnamespace='public'::regnamespace AND relname IN ('events','events_v2')), (SELECT string_agg(relname, ',' ORDER BY relname) FROM coldfront.tiered_views WHERE schema_name='public' AND relname IN ('events','events_v2')), (SELECT string_agg(table_name, ',' ORDER BY table_name) FROM coldfront.archive_watermark WHERE schema_name='public' AND table_name IN ('events','events_v2')));"
+    [ "$MESH" = 1 ] && exc=$(peer_exceptions)
     q "$HOST" "ALTER VIEW events RENAME TO events_v2;" >/dev/null
     assert_gt "cold tier survives view rename" "0" "$(q "$HOST" "SELECT count(*) FROM events_v2 WHERE ts < $cutoff;")"
+    assert_peers_agree "TC-198: the view rename reached every peer's view and registry" "$reg"
+    assert_peers_agree "TC-198: a cold read through the renamed view agrees on every peer" "SELECT count(*) FROM events_v2 WHERE ts < $cutoff;"
     q "$HOST" "ALTER VIEW events_v2 RENAME TO events;" >/dev/null
     pass "view renamed back to events"
+    assert_peers_agree "TC-198: the rename back reached every peer's view and registry" "$reg"
+    [ "$MESH" = 1 ] && assert_eq "TC-198: no peer logged an apply exception for the view renames" "$exc" "$(peer_exceptions)"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -3995,9 +4028,11 @@ story_empty_partition() {
 # rebuilds the transparent UNION-ALL view. DML via the view must route to the
 # renamed table without error, and the table rename back to _events restores
 # the registry. Leaves the table and registry in the original state.
+# On a mesh both renames reach every peer's registry (TC-198).
 # ───────────────────────────────────────────────────────────────────────────
 story_rename_hot_table() {
     step "TC-040: rename hot table updates registry; DML via view works after rename"
+    local reg="SELECT to_regclass(hot_table)::text FROM coldfront.tiered_views WHERE schema_name='public' AND relname='events';"
     assert_eq "precondition: events is a view" "v" \
         "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='events' AND relnamespace='public'::regnamespace;")"
     assert_eq "precondition: _events is partitioned" "p" \
@@ -4006,6 +4041,7 @@ story_rename_hot_table() {
     q "$HOST" "ALTER TABLE public._events RENAME TO _events_renamed;" >/dev/null
     local hot_renamed; hot_renamed=$(q "$HOST" "SELECT hot_table FROM coldfront.tiered_views WHERE schema_name='public' AND relname='events';")
     assert_contains "TC-040: tiered_views.hot_table updated to _events_renamed" "_events_renamed" "$hot_renamed"
+    assert_peers_agree "TC-198: the hot-table rename reached the registry" "$reg"
 
     # INSERT via the view must route to the renamed hot table. Use a timestamp
     # in the CURRENT month (5 days in) — this partition was premade by
@@ -4013,12 +4049,14 @@ story_rename_hot_table() {
     q "$HOST" "INSERT INTO events (ts, status, data) VALUES (date_trunc('month',now()) + interval '5 days', 'rename_chk', '{}');" >/dev/null
     assert_eq "TC-040: row landed in _events_renamed after hot table rename" "1" \
         "$(q "$HOST" "SELECT count(*) FROM public._events_renamed WHERE status='rename_chk';")"
+    assert_peers_agree "TC-198: a row written through the view after the rename arrived" "SELECT count(*) FROM events WHERE status='rename_chk';"
     q "$HOST" "DELETE FROM public._events_renamed WHERE status='rename_chk';" >/dev/null
 
     # Rename back so later stories find _events as expected.
     q "$HOST" "ALTER TABLE public._events_renamed RENAME TO _events;" >/dev/null
     local hot_restored; hot_restored=$(q "$HOST" "SELECT hot_table FROM coldfront.tiered_views WHERE schema_name='public' AND relname='events';")
     assert_eq "TC-040: tiered_views.hot_table restored to _events" "public._events" "$hot_restored"
+    assert_peers_agree "TC-198: the rename back reached the registry" "$reg"
     pass "TC-040: hot table renamed and restored, registry updated both ways"
 }
 

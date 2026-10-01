@@ -398,19 +398,21 @@ there is nothing to re-point. A column change is mirrored to Iceberg through
 rebuilds the view regardless. Concurrent schema changes are serialized by the
 same bakery as cold DML.
 
-In active-active deployments, Spock replicates the top-level `ALTER TABLE`.
-Because the image sets `spock.allow_ddl_from_functions = on`, Spock also
-replicates the hook's SPI-issued `DROP VIEW` and `CREATE VIEW`:
-`autoddl_can_proceed()` accepts statements in `PROCESS_UTILITY_QUERY` context
-when that setting is on. A peer's apply worker re-runs the replicated
-`ALTER TABLE`; the hook rebuilds **that peer's own** local view, but
-`coldfront._mirror_iceberg_alter` skips the Iceberg `ALTER` there (it runs
-under `session_replication_role = replica`) because the originator already
-evolved the shared Lakekeeper catalog. Because the registry is name-keyed (see
-[Registry Keying](#registry-keying-by-name-not-oid)), the row is identical on
-every node: the rebuild needs no re-pointing. DROP and TRUNCATE are blocked on
-every node. What a tiered table additionally needs to be usable on a peer is
-covered next.
+In active-active deployments, Spock replicates only the top-level `ALTER TABLE`
+or `ALTER VIEW`. The image sets `spock.allow_ddl_from_functions = on`, which
+would also replicate the hook's SPI-issued view and trigger DDL, so the
+hook issues that DDL with `spock.enable_ddl_replication` off. The registry
+tables replicate for the archiver's writes, so the hook makes a rename's
+registry update in Spock's repair mode (`spock.repair_mode`), and each
+peer's hook makes the same update itself. A peer's apply worker re-runs
+the replicated statement; the hook rebuilds **that peer's own** local view,
+but `coldfront._mirror_iceberg_alter` skips the Iceberg `ALTER` there (it
+runs under `session_replication_role = replica`) because the originator
+already evolved the shared Lakekeeper catalog. Because the registry is
+name-keyed (see [Registry Keying](#registry-keying-by-name-not-oid)), the
+row is identical on every node: the rebuild needs no re-pointing. DROP and
+TRUNCATE are blocked on every node. What a tiered table additionally needs
+to be usable on a peer is covered next.
 
 The tiered-specific cross-node behavior - what replicates so a tiered table is
 usable on every peer, and why both the registry and the watermark join the

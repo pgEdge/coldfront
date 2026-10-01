@@ -4042,15 +4042,55 @@ relid_is_tiered(Oid relid)
     return found;
 }
 
-/* Run one void-returning coldfront helper via SPI with up to two text args. */
+#define CF_SPOCK_DDL_GUC "spock.enable_ddl_replication"
+
+/* Run one void-returning coldfront helper via SPI with up to two text args.
+ * The DDL hook issues its view and trigger DDL through here, and each peer's
+ * own hook issues the same DDL when it applies the user's replicated statement,
+ * so the helper runs with spock.enable_ddl_replication off and only the user's
+ * statement replicates. Spock reads the setting just after each statement it
+ * runs, which is inside this call whatever order the hooks load in. The nest
+ * level restores the setting on return, and an error restores it with the
+ * transaction. Without Spock the setting does not exist and nothing is set. */
 static void
 spi_exec_void(const char *sql)
 {
     if (SPI_connect() == SPI_OK_CONNECT)
     {
+        int nest = NewGUCNestLevel();
+
+        if (GetConfigOption(CF_SPOCK_DDL_GUC, true, false) != NULL)
+            (void) set_config_option(CF_SPOCK_DDL_GUC, "off",
+                                     PGC_USERSET, PGC_S_SESSION,
+                                     GUC_ACTION_SAVE, true, 0, false);
         SPI_execute(sql, false, 0);
+        AtEOXact_GUC(true, nest);
         SPI_finish();
     }
+}
+
+#define CF_SPOCK_REPAIR_GUC "spock.replication_repair_mode"
+
+/* Run one registry update via spi_exec_void with Spock's repair mode on, so the
+ * rows it changes do not replicate. The registry tables replicate for the
+ * archiver's writes, but each peer's own hook makes the same update when it
+ * applies the user's replicated statement, and a replicated copy keyed on the
+ * old name would find no row there. spock.repair_mode logs its on and off
+ * markers in the transaction's change stream, so the rest of the transaction
+ * replicates as usual. A session already in repair mode is left in it, and
+ * without the spock extension in this database nothing is set. */
+static void
+spi_exec_local_rows(const char *sql)
+{
+    const char *repair = GetConfigOption(CF_SPOCK_REPAIR_GUC, true, false);
+    bool        toggle = repair != NULL && strcmp(repair, "off") == 0 &&
+                         OidIsValid(get_extension_oid("spock", true));
+
+    if (toggle)
+        spi_exec_void("SELECT spock.repair_mode(true)");
+    spi_exec_void(sql);
+    if (toggle)
+        spi_exec_void("SELECT spock.repair_mode(false)");
 }
 
 /* Rebuild the transparent view + INSERT trigger from current catalog state.
@@ -4104,7 +4144,7 @@ update_hot_table(const char *schema, const char *relname, const char *new_hot_qu
         "SELECT coldfront._update_tiered_hot_table(%s, %s, %s)",
         quote_literal_cstr(schema), quote_literal_cstr(relname),
         quote_literal_cstr(new_hot_quoted));
-    spi_exec_void(sql.data);
+    spi_exec_local_rows(sql.data);
     pfree(sql.data);
 }
 
@@ -4121,7 +4161,7 @@ rename_tiered_view(const char *schema, const char *old_view_name, const char *ne
         "SELECT coldfront._rename_tiered_view(%s, %s, %s)",
         quote_literal_cstr(schema), quote_literal_cstr(old_view_name),
         quote_literal_cstr(new_view_name));
-    spi_exec_void(sql.data);
+    spi_exec_local_rows(sql.data);
     pfree(sql.data);
 }
 
@@ -4493,14 +4533,14 @@ cf_handle_rename(const CfUtilityCtx *u, RenameStmt *rs)
  * DROP/TRUNCATE (blocked — never replicated, they error on the originator),
  * column DDL (ADD/DROP/ALTER-TYPE/RENAME COLUMN — mirrored to Iceberg), and
  * RENAME TABLE/VIEW. A replicated statement re-runs in the peer's apply
- * worker; the hook then does the peer's LOCAL registry update + view
- * rebuild, which is exactly right because the registry/view are per-node
- * (not Spock-replicated). The Iceberg cold tier, by contrast, is SHARED
- * (one Lakekeeper), so its column DDL must run exactly once: the mirror
- * (coldfront._mirror_iceberg_alter) self-skips when
- * session_replication_role = replica, leaving the apply worker to rebuild
- * its local view only. The SPI-issued mirror/rebuild DDL runs at
- * non-top-level context, which Spock filters out, so it never re-replicates.
+ * worker, and the hook then makes the peer's own registry update and view
+ * rebuild. The hook's SPI DDL runs with spock.enable_ddl_replication off
+ * (spi_exec_void) and its registry updates in Spock's repair mode
+ * (spi_exec_local_rows), so only the user's statement replicates. The
+ * Iceberg cold tier, by contrast, is SHARED (one Lakekeeper), so its column
+ * DDL must run exactly once: the mirror (coldfront._mirror_iceberg_alter)
+ * self-skips when session_replication_role = replica, leaving the apply
+ * worker to rebuild its local view only.
  */
 static void
 coldfront_process_utility(PlannedStmt *pstmt, const char *queryString,
