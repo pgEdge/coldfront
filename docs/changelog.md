@@ -75,6 +75,19 @@ this project adheres to
   and `ROLLBACK TO SAVEPOINT` failed with "ResourceOwnerEnlarge called after
   release started", and the session stayed in the failed transaction until it
   disconnected. They now end the block.
+- On a mesh, a column change, a hot-table rename or a view rename on a tiered
+  table failed to apply on the peers. Spock replicated the statement together
+  with the view and registry changes the originating node's DDL hook made, and
+  each peer's hook made them again, so the peers kept the old columns or name
+  and stopped receiving the originating node's later writes. Only the
+  statement replicates now, and each peer makes its own view and registry
+  changes.
+- The archiver gave two LIST values that map to the same child name, such as
+  `eu-west` and `eu_west`, a single child, archived that child's oldest
+  partition twice and failed the second cutover. It now refuses them before
+  creating anything, as the partitioner did. `partitioner set --period` did not
+  re-check the table name's length, so a name too long for daily partitions
+  could be switched to daily. `set` now checks it when the period changes.
 - After one cold write on a mesh, an app role could run any SQL as the loopback
   connection's user through the `coldfront_self` dblink connection the claim
   left open in its session, and by setting `coldfront.dblink_self` it could
