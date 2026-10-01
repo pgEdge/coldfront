@@ -6,13 +6,14 @@ Lakekeeper Iceberg catalog) with Docker, point it at your bucket, and write
 rows that land as Apache Iceberg tables in S3 - readable straight back through
 Postgres.
 
-It targets a real cloud S3 service that uses virtual-hosted addressing. For a
-path-style S3-compatible store (MinIO, SeaweedFS) or GCS, see
+This walkthrough targets a real cloud S3 service that uses virtual-hosted
+addressing. For a path-style S3-compatible store (MinIO, SeaweedFS) or GCS, see
 [usage.md → Storage Backends](usage.md#storage-backends) instead.
 
-No prior ColdFront knowledge assumed. Copy-paste top to bottom. Placeholders
-used throughout: bucket `my-iceberg-bucket`, region `eu-west-1`, key
-`AKIAEXAMPLE...`, secret `<your-secret-key>` - substitute your own.
+No prior ColdFront knowledge is assumed. Copy and paste the commands from top
+to bottom. The examples use the following placeholders throughout: bucket
+`my-iceberg-bucket`, region `eu-west-1`, key `AKIAEXAMPLE...`, secret
+`<your-secret-key>` - substitute your own.
 
 ---
 
@@ -20,23 +21,24 @@ used throughout: bucket `my-iceberg-bucket`, region `eu-west-1`, key
 
 Before you begin, gather the following:
 
-- **An S3 bucket** - `my-iceberg-bucket` below.
-- **Its region** - `eu-west-1` below. Use your bucket's real region.
-- **A long-term access key** - an access key id (`AKIAEXAMPLE...`) and secret
-  (`<your-secret-key>`).
+- an S3 bucket (`my-iceberg-bucket` in the examples below).
+- the bucket's real region (`eu-west-1` in the examples below).
+- a long-term access key, meaning an access key id (`AKIAEXAMPLE...`) and its
+  secret (`<your-secret-key>`).
 
-    > **Long-term keys only.** Lakekeeper's warehouse credential has no field
-    > for a session token, so single sign-on (SSO) or temporary session-token
-    > credentials do **not** work here. Use a permanent access-key pair with no
-    > expiry.
+    > **Only long-term keys work.** Lakekeeper's warehouse credential has no
+    > field for a session token, so single sign-on (SSO) or temporary
+    > session-token credentials do **not** work here. Use a permanent
+    > access-key pair with no expiry.
     >
     > This applies to the warehouse's own credential. A deployment that must
     > not store any object-store credential in the database can use vended
     > credentials instead, where the warehouse issues short-lived per-table
     > credentials at access time; see [usage.md](usage.md#vended-credentials).
 
-- **Permissions** - the key needs read/write/list on the bucket (`GetObject` /
-  `PutObject` / `DeleteObject` / `ListBucket`). Example policy:
+- permission for the key to read, write and list the bucket (`GetObject` /
+  `PutObject` / `DeleteObject` / `ListBucket`), as in the following example
+  policy:
 
     ```json
     {
@@ -54,9 +56,9 @@ Before you begin, gather the following:
     }
     ```
 
-- **The ColdFront image, built once.** Build it by following
-  [installation.md](installation.md) (it notes the registry access the base
-  image needs). Run the commands below from the repo root.
+- the ColdFront image, built once by following
+  [installation.md](installation.md), which notes the registry access the base
+  image needs. Run the commands below from the repo root.
 
 ---
 
@@ -70,16 +72,20 @@ docker compose up -d --build
 
 This starts **Postgres** (with `pg_duckdb` and `coldfront` preloaded),
 **Lakekeeper** (the Iceberg REST catalog), Lakekeeper's **own catalog
-Postgres**, and a one-shot **migrate** job. It does **not** start the bundled
-SeaweedFS - that is gated behind the `local-store` profile for credential-free
-local eval. For cloud S3 you talk to the bucket directly, so you don't need the
-bundled SeaweedFS.
+Postgres**, and a one-shot **migrate** job. The command does **not** start the
+bundled SeaweedFS - that is gated behind the `local-store` profile for
+credential-free local evaluation. For cloud S3 you connect to the bucket
+directly, so you do not need the bundled SeaweedFS.
 
 If a local Postgres already owns port 5432, pick another host port:
 
 ```bash
 COLDFRONT_PG_PORT=55432 docker compose up -d --build
 ```
+
+If port 8181 is taken, set `COLDFRONT_LK_PORT` the same way to move
+Lakekeeper's host port. Then use that port in place of `8181` in every `curl`
+command in Section 3.
 
 Wait for Postgres to report healthy (the container name is derived from your
 directory, so resolve it at runtime):
@@ -107,16 +113,17 @@ curl -X POST http://localhost:8181/management/v1/bootstrap \
 ### 3b. Create the S3 Warehouse
 
 A warehouse tells Lakekeeper where on S3 your Iceberg tables live and which
-credential to use. This is the **virtual-hosted cloud-S3** profile - these
-flags matter:
+credential to use. This is the **virtual-hosted cloud-S3** profile, and the
+following flags matter:
 
-- `endpoint` **omitted** ⇒ native per-Region virtual-hosted + HTTPS addressing.
-- `path-style-access: false` - required for virtual-hosted S3; path-style fails
-  on any Region launched after 2019.
-- `flavor: "aws"` - the Lakekeeper profile for virtual-hosted S3, not
+- omitting `endpoint` selects native per-Region virtual-hosted addressing over
+  HTTPS.
+- `path-style-access: false` is required for virtual-hosted S3, because
+  path-style fails on any Region launched after 2019.
+- `flavor: "aws"` selects the Lakekeeper profile for virtual-hosted S3, not
   `s3-compat`.
-- `sts-enabled: false` and `remote-signing-enabled: false` - long-term access
-  key.
+- `sts-enabled: false` and `remote-signing-enabled: false` make the warehouse
+  use the long-term access key.
 
 Create the warehouse with those flags set:
 
@@ -148,10 +155,10 @@ curl -X POST http://localhost:8181/management/v1/warehouse \
 The `key-prefix` is an arbitrary path inside the bucket. `coldfront` is only an
 example.
 
-Vended-credentials variant. To run ColdFront with no stored credential
-([usage.md](usage.md#vended-credentials)), the warehouse issues per-table STS
-credentials instead of handing the client a static key. Two things change from
-the warehouse above.
+A vended-credentials variant is also available. To run ColdFront with no stored
+credential ([usage.md](usage.md#vended-credentials)), the warehouse issues
+per-table temporary credentials from AWS Security Token Service (STS) instead
+of handing the client a static key. Two things change from the warehouse above.
 
 First, create an IAM role scoped to the bucket. Lakekeeper assumes the role per
 table and vends the resulting short-lived key, secret, and session token to
@@ -190,10 +197,11 @@ the `storage-profile`, and add the matching `external-id` to the
 }
 ```
 
-An `external-id` is **required** with `assume-role-arn`; the `<shared-secret>`
-in the warehouse and in the role's trust condition must match. On the database
-side, replace the `set_storage_secret(...)` call in Section 4 with
-`SELECT coldfront.set_storage_secret_vended();`.
+The role's trust policy above requires `sts:ExternalId`, so the `external-id`
+in the warehouse credential must match the `<shared-secret>` in that condition;
+Lakekeeper itself makes `external-id` mandatory only for `aws-system-identity`
+credentials. On the database side, replace the `set_storage_secret(...)` call
+in Section 4 with `SELECT coldfront.set_storage_secret_vended();`.
 
 ### 3c. Pre-Create the `public` Namespace
 
@@ -212,10 +220,11 @@ curl -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
 > **Why this step is required (decoupled mode).**
 > `coldfront.create_iceberg_table()` (Section 5) runs `CREATE SCHEMA` and
 > `CREATE TABLE` in one transaction. The schema create is deferred to COMMIT
-> but the table create is POSTed eagerly, so against a namespace-less warehouse
-> it 404s. Pre-creating `public` makes the in-transaction
-> `CREATE SCHEMA IF NOT EXISTS` a no-op. (Tiered mode's archiver creates the
-> namespace itself, so this is only needed for the decoupled demo below.)
+> but the table-create POST is sent immediately, so against a namespace-less
+> warehouse it fails with HTTP 404. Pre-creating `public` makes the
+> in-transaction `CREATE SCHEMA IF NOT EXISTS` a no-op. (Tiered mode's archiver
+> creates the namespace itself, so this is only needed for the decoupled demo
+> below.)
 
 ---
 
@@ -239,7 +248,7 @@ CREATE EXTENSION IF NOT EXISTS coldfront;
 > **`CREATE EXTENSION coldfront` is required and easy to miss.** The image
 > preloads the `coldfront` shared library, but preloading does not register the
 > extension's schema and functions in your database - you must
-> `CREATE EXTENSION` it once. Skip it and the next call fails with
+> `CREATE EXTENSION` it once. Skip that step and the next call fails with
 > `schema "coldfront" does not exist`.
 
 Set the cold-tier S3 credential once. The signature is
@@ -310,19 +319,35 @@ export AWS_DEFAULT_REGION=eu-west-1
 aws s3 ls s3://my-iceberg-bucket/coldfront/ --recursive
 ```
 
-Iceberg stores objects under `coldfront/<namespace-uuid>/<table-uuid>/` with a
-`data/` directory (parquet) and a `metadata/` directory (metadata JSON,
-`*.avro` manifests, snapshot files) - UUID paths, not your table name. "Where
-did `s3_demo` go?" → look under the UUID path beneath your `key-prefix`.
+Iceberg stores each table directly under your `key-prefix`, as
+`coldfront/<table-uuid>/`, with a `data/` directory (parquet) and a `metadata/`
+directory (metadata JSON, `*.avro` manifests, snapshot files) - UUID paths, not
+your table name. (A namespace created on a Lakekeeper release before 0.13 keeps
+its `coldfront/<namespace-uuid>/<table-uuid>/` layout.) "Where did `s3_demo`
+go?" → look under the UUID path beneath your `key-prefix`.
 
-Work through this checklist if something failed:
+Work through the following checklist if something failed:
 
-- **`CREATE EXTENSION coldfront`** - ran it once in your database? Preloading
-  is not the same as creating the extension. Symptom:
-  `schema "coldfront" does not exist`.
-- **`set_storage_secret(..., NULL, 'eu-west-1')`** - 3rd arg `NULL` (native
-  vhost+HTTPS), 4th arg your real region? A non-NULL endpoint forces path-style
-  and breaks modern Regions (HTTP 400).
-- **Namespace `public` pre-created** in Lakekeeper before
-  `create_iceberg_table`? Without it the decoupled create 404s.
-- **Long-term key** - not an SSO / temporary session-token credential.
+- Check that you ran `CREATE EXTENSION coldfront` once in your database.
+  Preloading is not the same as creating the extension, and a missing extension
+  produces `schema "coldfront" does not exist`.
+- Check that `set_storage_secret(..., NULL, 'eu-west-1')` has `NULL` as its
+  third argument (native virtual-hosted addressing over HTTPS) and your real
+  region as its fourth. A non-NULL endpoint forces path-style addressing and
+  breaks modern Regions with HTTP 400.
+- Check that the namespace `public` exists in Lakekeeper before
+  `create_iceberg_table` runs. Without the namespace, the decoupled create
+  fails with HTTP 404.
+- Check that the key is a long-term key, not an SSO or temporary session-token
+  credential.
+
+## Next Steps
+
+To go further with ColdFront, consult the following guides:
+
+- The [Using ColdFront](usage.md) guide covers the archiver config, the
+  partition CLI, and the other storage backends.
+- The [Compaction](compaction.md) guide covers cold-tier maintenance on the
+  bucket.
+- The [Architecture](architecture.md) overview describes how the cold tier is
+  read and written.

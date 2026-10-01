@@ -1,16 +1,16 @@
 # pgEdge ColdFront
 
-!!! warning "Pre-release beta software"
-
-    ColdFront is pre-release beta software under active development. Do not use
-    it in production. Interfaces, on-disk formats, and behavior may change
-    without notice, and data loss is possible.
-
 ColdFront keeps tables in PostgreSQL and cold data in Apache Iceberg (Parquet
 on S3-compatible, Azure, or GCS storage), and the cold tier is both readable
 and writable through the same SQL with no application changes. The application
 queries every table as an ordinary PostgreSQL relation, and both operating
 modes present the same standard SQL surface.
+
+!!! warning "Beta software"
+
+    ColdFront is beta software under active development. Do not use it in
+    production. Interfaces, on-disk formats, and behavior may change without
+    notice, and data loss is possible.
 
 ColdFront provides two operating modes:
 
@@ -68,7 +68,7 @@ Build the image (see the [Installation](installation.md) guide) and bring up
 the stack:
 
 ```bash
-docker compose up -d --build
+docker compose --profile local-store up -d --build
 ```
 
 Bootstrap Lakekeeper and create a warehouse (see the one-time setup in the
@@ -114,8 +114,10 @@ SELECT coldfront.grant_app_access('alice');
 ```
 
 grant_app_access grants only the minimum the cold path needs: membership in
-duckdb.postgres_role, schema USAGE, SELECT on the registry, and DML on every
-registered view and the hot table and sequences behind it. Those objects are
+duckdb.postgres_role, SET on the duckdb.unsafe_allow_execution_inside_functions
+parameter, schema USAGE, SELECT on the registry and the watermark table, DML on
+the dual-write anchor table, DML on every registered view and the hot table
+behind it, and USAGE and SELECT on the hot table's sequences. Those objects are
 derived from the registry, not hardcoded, and the call also grants EXECUTE on a
 fixed allow-list of runtime cold-path functions. The call is idempotent and is
 not executable by PUBLIC, so an application role can never self-grant. The role
@@ -123,10 +125,16 @@ is never granted pg_read_server_files or pg_write_server_files, so it has no
 host-file access. CREATE ROLE and GRANT both replicate over Spock, so you
 onboard a role once on any node and it propagates across the mesh.
 
-For how the non-superuser path works under the hood - the `SECURITY DEFINER`
-attach helpers, the `PGC_SUSET` / `GUC_SUPERUSER_ONLY` config hardening, the
-turnkey `duckdb.postgres_role` default, and how least privilege holds across a
-Spock mesh - see
+The Docker image sets `duckdb.postgres_role` to `coldfront_duckdb` and creates
+that role when it initializes a new data directory. To name a different role,
+set the container's `COLDFRONT_DUCKDB_ROLE` environment variable before that
+first start. An empty value keeps pg_duckdb's default, under which only
+superusers run DuckDB, so grant_app_access then fails with an error.
+
+For how the non-superuser path works - the `SECURITY DEFINER` attach helpers,
+the `PGC_SUSET` / `GUC_SUPERUSER_ONLY` config hardening, the
+`duckdb.postgres_role` default that the image sets up, and how least privilege
+holds across a Spock mesh - see
 [Architecture: non-superuser app roles](architecture.md#non-superuser-app-roles-least-privilege).
 
 ## Caveats
@@ -139,8 +147,8 @@ storage account before using it as a cold tier.
 
 ## Next Steps
 
-New here? Run the [guided walkthrough](walkthrough.md) to see all three modes
-in action with copy-pasteable commands.
+If you are new to ColdFront, run the [guided walkthrough](walkthrough.md) to
+see all three modes in action with copy-pasteable commands.
 
 To go further with ColdFront, consult the following guides:
 

@@ -17,11 +17,14 @@ You are a security specialist for ColdFront.
 
 ## Standards
 
-- No hardcoded secrets (use config / environment variables / DuckDB persistent secrets)
-- No real hostnames, buckets, accounts, keys, or paths in committed code, tests, docs, or commit messages
+- No hardcoded secrets (use config / environment variables / DuckDB persistent
+  secrets)
+- No real hostnames, buckets, accounts, keys, or paths in committed code,
+  tests, docs, or commit messages
 - Parameterized queries; never concatenate values into SQL
 - Input validation at all boundaries
 - gitleaks must pass (no committed secrets)
 - gosec findings must be addressed
 - Principle of least privilege for database connections and app roles
-  (`grant_app_access`, the SECURITY DEFINER attach helpers, PGC_SUSET config GUCs)
+  (`grant_app_access`, the SECURITY DEFINER attach helpers, PGC_SUSET config
+  GUCs)

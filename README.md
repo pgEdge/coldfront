@@ -1,17 +1,39 @@
 # pgEdge ColdFront
 
-> [!WARNING]
-> ColdFront is beta software under active development. Do not use it in
-> production. Interfaces, on-disk formats, and behavior may change without
-> notice, and data loss is possible.
-
 [![CI](https://github.com/pgEdge/ColdFront/actions/workflows/ci.yml/badge.svg)](https://github.com/pgEdge/ColdFront/actions/workflows/ci.yml)
+
+## Table of Contents
+
+The ColdFront documentation consists of the following guides:
+
+- [Introduction](docs/index.md)
+- Getting Started
+    - [Running the Walkthrough](docs/walkthrough.md)
+    - [Exploring the Walkthrough Demos](docs/walkthrough_demos.md)
+    - [Building ColdFront from Source](docs/installation.md)
+    - [Setting Up an Object Store](docs/object_store.md)
+- Architecture
+    - [Architecture Overview](docs/architecture.md)
+    - [Tiered Mode](docs/architecture_tiered.md)
+    - [Decoupled Mode](docs/architecture_decoupled.md)
+    - [Vector Storage](docs/architecture_vectors.md)
+- [Using ColdFront](docs/usage.md)
+- [Storing and Searching Embeddings](docs/usage_vectors.md)
+- [Compacting the Cold Tier](docs/compaction.md)
+- Developer Resources
+    - [Verifying the Bakery Protocol](docs/formal/README.md)
+- [Release Notes](docs/changelog.md)
 
 ColdFront keeps tables in PostgreSQL and cold data in Apache Iceberg (Parquet
 on S3-compatible, Azure, or GCS storage), and the cold tier is both readable
 and writable through the same SQL with no application changes. The application
 queries every table as an ordinary PostgreSQL relation, and both operating
 modes present the same standard SQL surface.
+
+> [!WARNING]
+> ColdFront is beta software under active development. Do not use it in
+> production. Interfaces, on-disk formats, and behavior may change without
+> notice, and data loss is possible.
 
 ColdFront provides two operating modes:
 
@@ -65,11 +87,13 @@ tier, so the application sees one relation:
 
 ## Installation
 
-New here? Run the [guided walkthrough](docs/walkthrough.md) to see all three
-modes in action with copy-pasteable commands.
+If you are new to ColdFront, run the [guided walkthrough](docs/walkthrough.md)
+to see all three modes in action with copy-pasteable commands.
 
-ColdFront is open source under the PostgreSQL License and runs on stock
-PostgreSQL 16, 17, and 18. The full build workflow lives in the
+ColdFront is open source under the PostgreSQL License and runs on PostgreSQL
+16, 17, and 18: stock PostgreSQL for a single node, and pgEdge's PostgreSQL
+build with Spock, which the Docker image is based on, for distributed mode. The
+full build workflow lives in the
 **[Installation guide](docs/installation.md)**: build the thin ColdFront layer
 on top of the published DuckDB 1.5.x base image (or build the base yourself),
 or install bare-metal. Then continue with the Quickstart below.
@@ -79,13 +103,27 @@ or install bare-metal. Then continue with the Quickstart below.
 Once the image is built, the **[S3 setup guide](docs/object_store.md)** takes
 you from an empty bucket to a working cold tier end-to-end.
 
+## Configuration
+
+ColdFront reads its settings from two places. The server settings live in
+`postgresql.conf`: `shared_preload_libraries = 'pg_duckdb,coldfront'`,
+`coldfront.warehouse` and `coldfront.lakekeeper_endpoint`, plus
+`snowflake.node` and `coldfront.dblink_self` on every node of a mesh. The
+Docker image writes them on first start. The archiver, partitioner, and
+compactor read a deployment YAML, modeled on
+[config.example.yaml](config.example.yaml), for the database DSN, the Iceberg
+catalog, and the cold-store credentials, and each table's lifecycle lives in
+`coldfront.partition_config`. For every setting, see
+[Using ColdFront → One-Time Setup](docs/usage.md#one-time-setup) and
+[Tuning Knobs](docs/usage.md#tuning-knobs).
+
 ## Quickstart
 
 Build the image (see the [Installation](docs/installation.md) guide) and bring
 up the stack:
 
 ```bash
-docker compose up -d --build
+docker compose --profile local-store up -d --build
 ```
 
 Bootstrap Lakekeeper and create a warehouse (see the one-time setup in the
@@ -120,21 +158,31 @@ For compliance environments that cannot store an object-store credential,
 database: Lakekeeper issues short-lived per-table credentials at access time.
 See [Vended Credentials](docs/usage.md#vended-credentials).
 
+## Using ColdFront
+
+The Quickstart covers a decoupled table from start to finish. The
+[Using ColdFront](docs/usage.md) guide covers both modes in depth, the
+standalone partition manager and its CLI, the storage backends, and the
+distributed setup; the [walkthrough demos](docs/walkthrough_demos.md) run each
+mode on a sample table.
+
 ## Documentation
 
 The following table lists the ColdFront guides and what each one covers:
 
 | Doc | Contents |
 |---|---|
-| **[Embeddings](docs/usage_vectors.md)** | Storing and searching embeddings with the pgvector interface |
-| **[Usage](docs/usage.md)** | Day-to-day use - both modes plus the standalone partition manager, one-time setup, reading/writing, supported types, the partition CLI, storage backends, distributed (mesh) setup, tuning |
-| **[Installation](docs/installation.md)** | Build from source (Docker or bare-metal); Testing & CI |
-| **[Object store setup](docs/object_store.md)** | Get ColdFront running on cloud S3 (virtual-hosted), end-to-end |
-| **[Compaction](docs/compaction.md)** | Cold-tier table maintenance - compaction, snapshot expiry, orphan-file removal |
-| **[Architecture](docs/architecture.md)** | Shared architecture and core mechanics |
-| **[Architecture: tiered](docs/architecture_tiered.md)** | Tiered (hot PG + cold Iceberg) deep dive |
-| **[Architecture: decoupled](docs/architecture_decoupled.md)** | Decoupled (iceberg-only) deep dive |
-| **[Architecture: vectors](docs/architecture_vectors.md)** | Vector storage internals - type mapping, routing state, cluster assignment, layout |
+| [Walkthrough](docs/walkthrough.md) | Sets up the demo stack and runs ColdFront hands-on. |
+| [Walkthrough demos](docs/walkthrough_demos.md) | Walks through the tiered, decoupled, partitioner, and distributed demos. |
+| [Embeddings](docs/usage_vectors.md) | Covers storing and searching embeddings with the pgvector interface. |
+| [Usage](docs/usage.md) | Covers day-to-day use: both modes plus the standalone partition manager, one-time setup, reading and writing, supported types, the partition CLI, storage backends, distributed (mesh) setup, and tuning. |
+| [Installation](docs/installation.md) | Covers building from source (Docker or bare-metal), and testing and CI. |
+| [Object store setup](docs/object_store.md) | Gets ColdFront running on cloud S3 (virtual-hosted), end to end. |
+| [Compaction](docs/compaction.md) | Covers cold-tier table maintenance: compaction, snapshot expiry, and orphan-file removal. |
+| [Architecture](docs/architecture.md) | Describes the shared architecture and core mechanics. |
+| [Architecture: tiered](docs/architecture_tiered.md) | Describes tiered mode (hot PG plus cold Iceberg) in depth. |
+| [Architecture: decoupled](docs/architecture_decoupled.md) | Describes decoupled (iceberg-only) mode in depth. |
+| [Architecture: vectors](docs/architecture_vectors.md) | Describes vector storage internals: type mapping, routing state, cluster assignment, and layout. |
 
 ## Least-Privilege Application Roles
 
@@ -147,8 +195,10 @@ SELECT coldfront.grant_app_access('alice');
 ```
 
 grant_app_access grants only the minimum the cold path needs: membership in
-duckdb.postgres_role, schema USAGE, SELECT on the registry, and DML on every
-registered view and the hot table and sequences behind it. Those objects are
+duckdb.postgres_role, SET on the duckdb.unsafe_allow_execution_inside_functions
+parameter, schema USAGE, SELECT on the registry and the watermark table, DML on
+the dual-write anchor table, DML on every registered view and the hot table
+behind it, and USAGE and SELECT on the hot table's sequences. Those objects are
 derived from the registry, not hardcoded, and the call also grants EXECUTE on a
 fixed allow-list of runtime cold-path functions. The call is idempotent and is
 not executable by PUBLIC, so an application role can never self-grant. The role
@@ -156,10 +206,16 @@ is never granted pg_read_server_files or pg_write_server_files, so it has no
 host-file access. CREATE ROLE and GRANT both replicate over Spock, so you
 onboard a role once on any node and it propagates across the mesh.
 
-For how the non-superuser path works under the hood - the `SECURITY DEFINER`
-attach helpers, the `PGC_SUSET` / `GUC_SUPERUSER_ONLY` config hardening, the
-turnkey `duckdb.postgres_role` default, and how least privilege holds across a
-Spock mesh - see
+The Docker image sets `duckdb.postgres_role` to `coldfront_duckdb` and creates
+that role when it initializes a new data directory. To name a different role,
+set the container's `COLDFRONT_DUCKDB_ROLE` environment variable before that
+first start. An empty value keeps pg_duckdb's default, under which only
+superusers run DuckDB, so grant_app_access then fails with an error.
+
+For how the non-superuser path works - the `SECURITY DEFINER` attach helpers,
+the `PGC_SUSET` / `GUC_SUPERUSER_ONLY` config hardening, the
+`duckdb.postgres_role` default that the image sets up, and how least privilege
+holds across a Spock mesh - see
 [Architecture: non-superuser app roles](docs/architecture.md#non-superuser-app-roles-least-privilege).
 
 ## Caveats
@@ -198,17 +254,19 @@ pgedge-coldfront/
 │   ├── topo/                   ← vanilla.sh (1 node) · mesh.sh (3-node Spock)
 │   └── runbooks/               ← failover-patroni.md (failover delegated to Patroni)
 ├── docker/
-│   ├── Dockerfile.duckdb15-base ← DuckDB 1.5.x base (pg_duckdb 1.5.4 + patched iceberg)
+│   ├── Dockerfile.duckdb15-base ← DuckDB 1.5.x base (pg_duckdb on DuckDB 1.5.4 + patched iceberg)
 │   ├── Dockerfile.duckdb15      ← thin coldfront app layer (ARG PG_MAJOR=16|17|18)
 │   ├── iceberg-*.patch          ← duckdb-iceberg patches (bakery commit-refresh + strict-reader interop)
 │   ├── iceberg-azure-extension-config-v15.cmake ← Azure ADLS extension build config
 │   ├── entrypoint.sh
 │   └── seaweedfs-s3.json        ← SeaweedFS S3 auth config (example)
 ├── docs/                       ← MkDocs site (user docs; mkdocs.yml at repo root)
-│   ├── index.md · installation.md · object_store.md · usage.md · compaction.md
+│   ├── index.md · walkthrough.md · walkthrough_demos.md · installation.md
+│   ├── object_store.md · usage.md · compaction.md
 │   ├── architecture.md · architecture_tiered.md · architecture_decoupled.md
 │   ├── architecture_vectors.md · usage_vectors.md · changelog.md
 │   └── formal/                 ← TLA+ model of the bakery protocol (Bakery.tla)
+├── examples/walkthrough/       ← interactive walkthrough (guide.sh, its compose stack and configs)
 ├── docker-compose.yml          ← END-USER single-node stack (ports published)
 ├── docker-compose.matrix.yml   ← CI only: single-node vanilla matrix
 ├── docker-compose.matrix-azure.yml ← CI only: vanilla matrix on Azure ADLS
@@ -226,11 +284,12 @@ The following table lists the services and components ColdFront runs against:
 
 | Component | Version | Purpose |
 |-----------|---------|---------|
-| PostgreSQL | 16, 17, or 18 | Database with native partitioning (stock upstream; no fork) |
-| pg_duckdb | 1.5.4 (PR #1025) | Iceberg reads + writes via DuckDB in-process |
-| duckdb-iceberg | `v1.5-variegata` @ `5edc45f0`, patched | Iceberg catalog/IO for DuckDB; carries ColdFront's four patches (see [docker/Dockerfile.duckdb15-base](docker/Dockerfile.duckdb15-base)) |
-| Lakekeeper | latest | Iceberg REST catalog (Rust binary) |
-| S3-compatible store | any | SeaweedFS, MinIO, GCS, Azure Blob, etc. |
+| PostgreSQL | 16, 17, or 18 | Provides the database with native partitioning; stock PostgreSQL serves a single node, and the Docker image and distributed mode use pgEdge's PostgreSQL build with Spock. |
+| pg_duckdb | commit c04e6a2 (PR #1025), on DuckDB 1.5.4 | Runs Iceberg reads and writes through in-process DuckDB. |
+| duckdb-iceberg | `v1.5-variegata` @ `5edc45f0`, patched | Provides Iceberg catalog and I/O for DuckDB, with ColdFront's four patches applied (see [docker/Dockerfile.duckdb15-base](docker/Dockerfile.duckdb15-base)). |
+| Lakekeeper | latest | Provides the Iceberg REST catalog (a Rust binary). |
+| S3-compatible store | any | Stores the cold data; SeaweedFS, MinIO, AWS S3, and GCS all work. |
+| Azure ADLS Gen2 | any | Stores the cold data instead of an S3 store, through `set_storage_secret_azure` and an `adls` warehouse. |
 
 Building from source needs the Go toolchain (the version is pinned in
 [go.mod](go.mod)). The Go module dependencies are the source of truth in
@@ -240,7 +299,7 @@ static, CGO-free binaries on `pgx/v5`, and the compactor is a separate module
 
 ## Versioning
 
-ColdFront carries two independent version numbers, each following its own
+ColdFront has two independent version numbers, each following its own
 convention:
 
 - Release tags use three-part [Semantic Versioning](https://semver.org)
@@ -249,21 +308,35 @@ convention:
   required because ColdFront is a Go module, and the toolchain recognizes only
   full `vX.Y.Z` tags as releases. The patch field keeps a bugfix-only release
   (`v1.0.1`) distinct from a feature release (`v1.1.0`), which matters for a
-  data-writing extension where "same behavior, one safety fix" is worth stating
-  plainly.
+  data-writing extension, where a release that keeps the same behavior and adds
+  one safety fix must be easy to recognize.
 - The PostgreSQL extension uses the conventional two-part version in its
   control file (`default_version = '1.0'`) and upgrade-script filenames
   (`coldfront--1.0--1.1.sql`), as is standard for PostgreSQL extensions.
 
 The two map cleanly: extension `1.0` ships inside release `v1.0.0`, and a patch
-release may carry the same extension version or bump it with an upgrade script
+release may keep the same extension version or bump it with an upgrade script
 when the SQL changes.
+
+## Support & Resources
+
+For more information about pgEdge products, visit
+[docs.pgedge.com](https://docs.pgedge.com).
+
+To report an issue with the software, visit
+[GitHub Issues](https://github.com/pgEdge/ColdFront/issues).
+
+## Contributing
+
+We welcome your project contributions; for more information, see
+[CONTRIBUTING.md](CONTRIBUTING.md).
 
 ## Author
 
-Created by Jimmy Angelakos.
+Jimmy Angelakos created ColdFront.
 
 ## License
 
-PostgreSQL License. See [LICENSE.md](LICENSE.md). Redistributed third-party
-components and their notices: [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+This project is licensed under the [PostgreSQL License](LICENSE.md). The
+redistributed third-party components and their notices are listed in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).

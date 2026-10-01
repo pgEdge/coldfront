@@ -63,8 +63,8 @@ catalog, the object store, and the archiver:
 
 ## Archiver Workflow
 
-A single Go binary runs via cron. It converts an existing partitioned table
-into a tiered table on first run, then manages the ongoing lifecycle. The
+A single Go binary runs via cron. The binary converts an existing partitioned
+table into a tiered table on first run, then manages the ongoing lifecycle. The
 archiver is a thin SQL orchestrator - no DuckDB/Iceberg/Arrow Go libraries; all
 Iceberg I/O goes through `pg_duckdb` (see
 [architecture.md → Core Mechanics](architecture.md#core-mechanics-pg_duckdb)).
@@ -73,29 +73,35 @@ Iceberg I/O goes through `pg_duckdb` (see
 
 The archiver requires the following before its first run:
 
-- PostgreSQL 16+ with pg_duckdb, Lakekeeper bootstrapped with a warehouse
-- Persistent S3 secret configured (see
-  [architecture.md → Session Setup](architecture.md#session-setup))
-- An existing range-partitioned table
+- PostgreSQL 16+ with pg_duckdb.
+- Lakekeeper, bootstrapped with a warehouse.
+- a configured storage secret (see
+  [architecture.md → Session Setup](architecture.md#session-setup)).
+- static `s3:` or `azure:` credentials in the archiver config, unless the cold
+  store uses vended credentials.
+- an existing range-partitioned table.
 
 ### First Run: Conversion
 
 The archiver auto-detects the partition column from `pg_get_partkeydef()` and
-column types from `information_schema.columns`.
+column types from `pg_attribute` via `format_type()`.
 
 A run that finds partitions past the hot window (older than `hot_period`)
 starts with an idempotent bootstrap, executed once before the per-partition
-loop: rename the source table, recreate the unified view with the current
-watermark as its cutoff, and register the view in `coldfront.tiered_views`:
+loop: rename the source table, recreate the unified view, and register the view
+in `coldfront.tiered_views`. Until the first cutover sets a watermark, the view
+reads the hot table alone; after it, the view is a UNION with the watermark as
+its cutoff, and both branches cast every column to its view type (`jsonb` to
+`json`):
 
 ```sql
 ALTER TABLE events RENAME TO _events;
 
 CREATE OR REPLACE VIEW events AS
-  SELECT "id", "ts", "status", "data"::text FROM _events
+  SELECT "id"::bigint, "ts"::timestamptz, "status"::text, "data"::json FROM _events
   WHERE "ts" >= '2026-03-01'::timestamptz
   UNION ALL
-  SELECT r['id']::bigint, r['ts']::timestamptz, r['status']::text, r['data']::text
+  SELECT r['id']::bigint, r['ts']::timestamptz, r['status']::text, r['data']::json
   FROM iceberg_scan('ice.public.events') r
   WHERE r['ts'] < '2026-03-01'::timestamptz;
 ```
@@ -104,9 +110,9 @@ The rename is conditional, so it converts the table on the first run and no-ops
 afterwards; the `CREATE OR REPLACE VIEW` keeps the view's OID across runs. With
 the extension loaded, the C hook rewrites an INSERT on the view by the
 watermark cutoff, into a hot INSERT of the at/after-cutoff rows into `_events`
-and a cold `duckdb.raw_query` INSERT of the older rows. The view also carries
-an INSTEAD OF INSERT trigger that does the same routing; it is the fallback
-that fires only when the extension is not loaded.
+and a cold `duckdb.raw_query` INSERT of the older rows. The view also has an
+INSTEAD OF INSERT trigger that does the same routing; it is the fallback that
+fires only when the extension is not loaded.
 
 ### The Archive Pipeline
 
@@ -123,64 +129,66 @@ requires the partition to be **empty**. Phase 4 detaches atomically with the
 watermark advance, so a partition the pipeline archived is never a candidate
 again, and rows found in one here are in neither tier: an out-of-band write to
 the heap, or a mesh peer writing hot against a stale cutoff. Those rows are the
-only copy, so the archiver refuses the drop and fails the table.
+only copy, so the archiver refuses the drop and exits non-zero, skipping the
+remaining tables.
 
 Each remaining partition past the hot window then moves to Iceberg through a
 six-phase pipeline:
 
-0. Idempotent Iceberg-range wipe - deletes any Iceberg rows already in the
+0. The idempotent Iceberg-range wipe deletes any Iceberg rows already in the
    partition's range (a previous cycle may have exported without cutting over),
    so the re-export cannot duplicate rows.
 
-1. Install capture - installs a capture trigger and an UNLOGGED delta table on
-   the partition, so writes that land during the export are recorded for
-   replay.
+1. Capture installation (`install_archive_capture`) adds a capture trigger and
+   an UNLOGGED delta table to the partition, so writes that land during the
+   export are recorded for replay.
 
-2. Bulk export - exports the partition PG → Iceberg under a captured snapshot,
+2. The bulk export copies the partition PG → Iceberg under a captured snapshot,
    using the temp table bridge (see
    [architecture.md → Temp Table Bridge](architecture.md#temp-table-bridge-pg-iceberg))
-   and a single bakery-claimed Iceberg INSERT. On the very first export,
-   creates the Iceberg namespace and table.
+   and a single bakery-claimed Iceberg INSERT. Each cycle has already created
+   the Iceberg namespace and table, if missing, before the per-partition loop.
 
-3. Delta replay - applies the delta rows the export snapshot did not see to
-   Iceberg in batched commits, with no lock on the partition - concurrent
-   writers keep going and keep adding to the delta.
+3. Delta replay (`replay_archive_delta`) applies the delta rows the export
+   snapshot did not see to Iceberg in batched commits, with no lock on the
+   partition - concurrent writers keep going and keep adding to the delta.
 
-4. Atomic cutover (`cutover_archive`) - a single transaction updates
+4. The atomic cutover (`cutover_archive`) is a single transaction that updates
    `coldfront.archive_watermark` to the partition's upper bound (derived from
    `pg_catalog`, not `MAX(ts)`), takes the bakery claim on the Iceberg table,
    takes `ACCESS EXCLUSIVE` on the parent and the partition under a 100 ms
-   `lock_timeout` circuit breaker, re-issues the view DDL with the new cutoff,
-   and detaches the partition with a plain transactional `DETACH PARTITION` -
-   all of it commits atomically or rolls back whole. On a lock timeout, phases
-   3-4 are retried (10 attempts, exponential backoff from 100 ms to 51.2 s);
-   any other error fails the cycle immediately.
+   `lock_timeout`, re-issues the view DDL with the new cutoff, and detaches the
+   partition with a plain transactional `DETACH PARTITION` - all of it commits
+   atomically or rolls back whole. On a lock timeout, phases 3-4 are retried
+   (10 attempts, exponential backoff from 100 ms to 51.2 s); any other error
+   fails the cycle immediately.
 
-5. Cleanup (`cutover_cleanup`) - drains stragglers that landed between phase
-   3's last commit and phase 4's lock, then drops the detached partition, the
+5. Cleanup (`cutover_cleanup`) drains stragglers that landed between phase 3's
+   last commit and phase 4's lock, then drops the detached partition, the
    capture trigger, and the delta table.
 
 ### Subsequent Runs
 
 Every run executes the same cycle - the conversion above is the first cycle's
-bootstrap actually renaming the table. In order:
+bootstrap actually renaming the table. Each run performs the following steps in
+order:
 
 1. Create future partitions (default: 3) and self-heal the partition covering
-   now
+   now.
 2. Run the bootstrap, then the six-phase pipeline for each partition past the
-   hot window
-3. Delete cold rows older than `retention_period` (when configured)
+   hot window.
+3. Delete cold rows older than `retention_period` (when configured).
 
-A run with nothing past the hot window and no `retention_period` set is a
-no-op.
+A run with nothing past the hot window and no `retention_period` set only
+creates future partitions and self-heals the current one.
 
-Premake provisions a **range**, not a name. Each period it provisions is first
-checked against the parent's existing partition bounds, so a period another
-partition already covers is left alone whatever that partition is called - the
-generated `events_p_YYYY_MM` names are ColdFront's own convention, not a
-requirement on tables you bring yourself. A partition covering only part of a
-period is reported as such, naming both ranges, since PostgreSQL cannot create
-the partition that completes it.
+Premake provisions a **range**, not a name. Each period premake provisions is
+first checked against the parent's existing partition bounds, so a period
+another partition already covers is left alone whatever that partition is
+called - the generated `events_p_YYYY_MM` names are ColdFront's own convention,
+not a requirement on tables you bring yourself. A partition covering only part
+of a period is reported as such, naming both ranges, since PostgreSQL cannot
+create the partition that completes it.
 
 ### Crash Recovery
 
@@ -191,9 +199,9 @@ archiver recovers from a crash at each point in the pipeline:
 
 | Crash point | Recovery |
 |---|---|
-| During phases 0-3 (wipe, capture, export, replay) | Watermark unchanged, partition still attached; the next cycle re-runs the pipeline - the phase-0 range wipe and the delta replay are idempotent, so no duplicates |
-| During phase 4 (cutover) | The transaction rolls back whole: watermark unchanged, view unchanged, partition still attached; lock timeouts are retried in-run, anything else leaves the trigger + delta for the next cycle to retry |
-| Between phase 4 and phase 5 | The cutover is already committed (watermark, view, and DETACH all in place); the detached partition and its now-inert capture trigger + delta table are left behind for the operator to drop |
+| During phases 0-3 (wipe, capture, export, replay) | The watermark is unchanged and the partition is still attached. The next cycle re-runs the pipeline, and because the phase-0 range wipe and the delta replay are idempotent, no duplicates result. |
+| During phase 4 (cutover) | The transaction rolls back whole: the watermark and view are unchanged, and the partition is still attached. Lock timeouts are retried in the same run; any other error leaves the trigger and delta table for the next cycle to retry. |
+| Between phase 4 and phase 5 | The cutover is already committed (the watermark, view, and DETACH are all in place). The detached partition, its capture trigger, and the delta table are left behind, and the delta can still hold rows that landed after phase 3's last commit. Run `CALL coldfront.cutover_cleanup(schema, partition, NULL, iceberg_ref)` to replay the delta into Iceberg and drop the leftovers; dropping them by hand loses those rows. |
 
 ## Two-Level (LIST → RANGE) Tiering
 
@@ -215,8 +223,8 @@ values**, not value-major. Past-hot leaves are grouped by their `ts` period,
 the groups run oldest first, and within a group two passes run strictly in
 sequence:
 
-1. Export every LIST value's leaf for that period. No detach, watermark
-   unchanged.
+1. Export every LIST value's leaf for that period. This pass detaches nothing
+   and leaves the watermark unchanged.
 2. Cut them all over. The first cutover advances the watermark to the period's
    upper bound; the rest re-set it to the same value and detach their
    now-excluded leaf.
@@ -262,7 +270,7 @@ WITH hot_ins AS MATERIALIZED (
   RETURNING 1
 ),
 cold_call AS MATERIALIZED (
-  SELECT duckdb.raw_query(
+  SELECT coldfront._exec_iceberg_with_claim('ice.public.events',
     'INSERT INTO ice.public.events
      SELECT id, ts, status, data FROM (<source-pglocal-prefixed>) ...
      WHERE ts < ''<cutoff>'''
@@ -277,8 +285,8 @@ and its cost:
 
 | Cold side | When | Cost |
 |---|---|---|
-| **Bulk pglocal stream** (single `raw_query`, source streamed via libpq through DuckDB's postgres extension into the Iceberg writer in one pipeline) | Default. Used whenever the user's INSERT either (a) has no IDENTITY column on `_events`, or (b) supplies an explicit value for the IDENTITY column. DEFAULT clauses on omitted columns are inlined into the cold SELECT so DuckDB evaluates them per row. | Same as iceberg-only INSERT - one Iceberg snapshot for the whole cold subset, no per-row PG/DuckDB round-trip. |
-| **plpgsql cold-loop** (`coldfront._tiered_insert_cold` - a PG cursor over the cold subset, calls `nextval()` on the IDENTITY sequence per row, accumulates VALUES, flushes one `raw_query` per `coldfront.cold_write_batch_size` rows, default 10000) | Fallback. Only triggered when the table has an IDENTITY column AND the user's INSERT omits it - the only case that requires PG-side `nextval()` per row to keep cold ids coherent with hot. | Bounded by plpgsql per-row iteration speed (~10-50k rows/s). For very large mostly-cold seeds, prefer iceberg-only mode where ids come from the source data. |
+| The bulk pglocal stream is a single `raw_query` that streams the source via libpq through DuckDB's postgres extension into the Iceberg writer in one pipeline. | This is the default path, used whenever the user's INSERT either (a) has no IDENTITY column on `_events`, or (b) supplies an explicit value for the IDENTITY column. DEFAULT clauses on omitted columns are inlined into the cold SELECT so DuckDB evaluates them per row. | The cost matches an iceberg-only INSERT: one Iceberg snapshot for the whole cold subset, with no per-row PG/DuckDB round-trip. |
+| The plpgsql cold loop (`coldfront._tiered_insert_cold`) runs a PG cursor over the cold subset, calls `nextval()` on the IDENTITY sequence per row, accumulates VALUES, and flushes one `raw_query` per `coldfront.cold_write_batch_size` rows (default 10000). | This is the fallback path, triggered only when the table has an IDENTITY column AND the user's INSERT omits it, the only case that requires PG-side `nextval()` per row to keep cold ids coherent with hot. | Throughput is bounded by plpgsql per-row iteration speed (~10-50k rows/s). For very large mostly-cold seeds, prefer iceberg-only mode where ids come from the source data. |
 
 The hot half is always plain set-based `INSERT INTO _events` - IDENTITY
 auto-allocates server-side, full PG speed regardless of row count.
@@ -289,42 +297,49 @@ A watermark-split INSERT cannot use `RETURNING` - see Cold RETURNING under
 ## Transparent UPDATE/DELETE
 
 The hook inspects every UPDATE/DELETE whose target is a registered tiered view.
-It looks at the WHERE clause and the archive watermark, classifies the
+The hook looks at the WHERE clause and the archive watermark, classifies the
 predicate into one of three tiers, and rewrites the Query accordingly. The
 following table maps each predicate shape to its tier and rewrite:
 
 | Predicate shape | Tier | Rewrite |
 |---|---|---|
-| WHERE proves all matching rows have `ts >= cutoff` (equality, `>=`, `>`, BETWEEN, IN, OR all in hot range) | HOT | `UPDATE _events SET ... WHERE ...` - plain PG DML, preserves RETURNING |
-| WHERE proves all matching rows have `ts <  cutoff` | COLD | `SELECT duckdb.raw_query('UPDATE ice.public.events SET ... WHERE ...')` - DuckDB DML wrapped as a standard SQL literal (via `quote_literal_cstr`); the SELECT envelope keeps it off PG's command-ID counter so there's no mixed-write tripwire |
-| WHERE cannot be proven to target one tier | AMBIGUOUS | depends on `coldfront.allow_mixed_writes` - see next section |
+| The WHERE clause proves that all matching rows have `ts >= cutoff` (equality, `>=`, `>`, BETWEEN, IN, or OR, all in the hot range). | HOT | The statement becomes `UPDATE _events SET ... WHERE ...`, plain PG DML that preserves RETURNING. |
+| The WHERE clause proves that all matching rows have `ts <  cutoff`. | COLD | The statement becomes `SELECT coldfront._exec_iceberg_with_claim('ice.public.events', 'UPDATE ice.public.events SET ... WHERE ...')`, with the DuckDB DML as a standard SQL literal (via `quote_literal_cstr`), or as a `format()` call when bound parameters are present. The SELECT envelope keeps the DML off PG's command-ID counter, so pg_duckdb's mixed-write guard does not fire. |
+| The WHERE clause cannot be proven to target one tier. | AMBIGUOUS | The rewrite depends on `coldfront.allow_mixed_writes` (see the next section). |
 
-The classifier understands `Var <op> Const` (both operand orders), AND of
+The classifier understands `Var <op> bound` (both operand orders), AND of
 those, OR of those when all arms prove the same tier, BETWEEN (via its
-desugaring to AND), and `ts IN (...)` (ScalarArrayOpExpr). Subqueries, UDF
-calls, and expressions on the partition column are AMBIGUOUS.
+desugaring to AND), and `ts IN (...)` (ScalarArrayOpExpr). The bound must be
+`timestamptz`-typed: a literal, or a non-volatile expression such as
+`now() - interval '1 hour'` (a STABLE function call counts); IN-list elements
+must be `timestamptz` literals. A `date` or `timestamp` literal, a volatile
+call, a subquery, or an expression on the partition column classifies as
+AMBIGUOUS.
 
-The tier classification above applies to the WHERE clause. The SET clause
-carries a separate rule for the partition column itself, because changing it
-can move a row across the cutoff. An in-place per-tier rewrite would leave such
-a row in its old tier where the view's tier predicate then hides it, so the
-hook handles a partition-column SET separately by the
-`coldfront.allow_mixed_writes` GUC:
+The tier classification above applies to the WHERE clause. The SET clause has a
+separate rule for the partition column itself, because changing it can move a
+row across the cutoff. An in-place per-tier rewrite would leave such a row in
+its old tier where the view's tier predicate then hides it, so the hook handles
+a partition-column SET separately by the `coldfront.allow_mixed_writes` GUC:
 
-- Permissive (on, default): the hook rewrites the UPDATE to
+- When the GUC is on (permissive, the default), the hook rewrites the UPDATE to
   `SELECT coldfront._cross_tier_move(...)`, which RELOCATES each matched row
-  between tiers. The function reads the affected rows once, then applies four
-  disjoint cases by current tier and new value: stay-hot (in-place heap
-  UPDATE), stay-cold (re-add to Iceberg with the new value), hot to cold (heap
-  DELETE plus Iceberg INSERT), and cold to hot (heap INSERT plus Iceberg
-  DELETE). The hot side is plain PG; the cold side is one `duckdb.raw_query`
-  (DELETE plus INSERT, one Iceberg snapshot) under one bakery claim. A target
-  value with no covering hot partition is rejected naming the view; the move is
-  not supported inside a function or DO block, with bound parameters, with a
-  VOLATILE new value, with a bare NULL new value, with a new value referencing
-  other columns, or alongside a SET of other columns.
-- Strict (off): the hook rejects the partition-column SET. To change the
-  partition column, delete the row and re-insert it with the new value.
+  between tiers. The function first checks that every hot landing target has a
+  covering partition, then captures the affected rows and applies four disjoint
+  cases by current tier and new value: stay-hot (in-place heap UPDATE),
+  stay-cold (re-add to Iceberg with the new value), hot to cold (heap DELETE
+  plus Iceberg INSERT), and cold to hot (heap INSERT plus Iceberg DELETE). The
+  hot side is plain PG; the cold side is one `duckdb.raw_query` (DELETE plus
+  INSERT, one Iceberg snapshot) under one bakery claim. A target value with no
+  covering hot partition is rejected naming the view; the move is not supported
+  inside a function or DO block, with bound parameters, with a VOLATILE new
+  value, with a bare NULL new value, with a new value referencing other
+  columns, alongside a SET of other columns, with `RETURNING`, with a WHERE
+  that references other tables or sub-queries (`UPDATE … FROM`, a sub-select),
+  or on a hot table without a primary key.
+- When the GUC is off (strict), the hook rejects the partition-column SET. To
+  change the partition column, delete the row and re-insert it with the new
+  value.
 
 Before anything is archived (no cutoff) every row is hot, so a partition-column
 UPDATE is a plain hot UPDATE in either mode.
@@ -340,11 +355,12 @@ The hook emits a dual-tier CTE:
 
 ```sql
 WITH hot AS (UPDATE _events SET ... WHERE ... RETURNING *)
-   , cold AS (SELECT duckdb.raw_query('UPDATE ice.public.events SET ... WHERE ...'))
+   , cold AS (SELECT coldfront._exec_iceberg_with_claim('ice.public.events',
+                       'UPDATE ice.public.events SET ... WHERE ...'))
 SELECT h.* FROM hot h CROSS JOIN cold c;
 ```
 
-The CROSS JOIN forces PG to execute the cold CTE (a pure-SELECT CTE that isn't
+The CROSS JOIN forces PG to execute the cold CTE (a pure-SELECT CTE that is not
 otherwise referenced would be pruned even with MATERIALIZED). The hook also
 sets `duckdb.unsafe_allow_mixed_transactions = on` LOCAL for the current
 transaction to clear pg_duckdb's pre-commit mixed-write check. pg_duckdb's
@@ -373,17 +389,18 @@ capability reaches a peer:
 
 | Capability on a peer | How it gets there |
 |---|---|
-| **Read** (hot + cold, via the `UNION ALL` view) | The view is created by replicated DDL; hot rows arrive via normal Spock DML replication; cold rows are read from the **shared Lakekeeper catalog** that every node attaches. |
-| **INSERT** through the view | The `INSTEAD OF INSERT` trigger is part of the replicated view definition, so it fires on the peer with no registry lookup. |
-| **UPDATE / DELETE** and **DDL-blocking** | Need the `coldfront.tiered_views` row present on the peer - the hook resolves the target view through it. |
-| **Hot/cold write routing** | Needs the `coldfront.archive_watermark` row (name-keyed) so the peer's write hook knows the cutoff. |
+| Read (hot and cold, via the `UNION ALL` view) | The view is created by replicated DDL; hot rows arrive via normal Spock DML replication; cold rows are read from the shared Lakekeeper catalog, which a node attaches only for a view that has a `coldfront.tiered_views` row, so reads need that row too. |
+| INSERT through the view | The `INSTEAD OF INSERT` trigger fires on the peer with no registry lookup, but it is a separate trigger rather than part of the view definition, and its cold INSERT takes no bakery claim. |
+| UPDATE / DELETE and DDL blocking | These need the `coldfront.tiered_views` row present on the peer, because the hook resolves the target view through that row. |
+| Hot/cold write routing | Routing needs the `coldfront.archive_watermark` row (name-keyed) so the peer's write hook knows the cutoff. |
 
 So alongside the bakery substrate (`coldfront.claims` /
 `coldfront.claim_acks`), **both `coldfront.tiered_views` and
 `coldfront.archive_watermark` are added to the Spock replication set** when a
 mesh runs in tiered mode. The archiver runs on one node, so a peer only gets
-these rows by replication; without `tiered_views` a peer can read and INSERT
-but UPDATE/DELETE/DDL-blocking stop recognizing the view.
+these rows by replication; without `tiered_views` a peer cannot read the cold
+tier, can INSERT only through the trigger fallback, and UPDATE/DELETE/
+DDL-blocking stop recognizing the view.
 
 Both tables are **name-keyed** - `tiered_views` by `(schema_name, relname)`,
 `archive_watermark` by `table_name` - so each row replicates verbatim and
@@ -431,9 +448,10 @@ CREATE TABLE events_branch_1 PARTITION OF events
   FOR VALUES IN (1) PARTITION BY RANGE (ts);
 ```
 
-It requires a sub-partition block naming the query that yields the current LIST
-values, and an explicit `partition_column` for the RANGE (time) key, since on a
-first run there is no LIST child to detect it from:
+Registering such a table requires a sub-partition block naming the query that
+yields the current LIST values, and an explicit `partition_column` for the
+RANGE (time) key, since on a first run there is no LIST child to detect it
+from:
 
 ```sh
 archiver register --config cf.yaml --table events --period monthly \
@@ -456,15 +474,18 @@ query those rather than the top-level `events`.
 A query through the `events` view routes via pg_duckdb's takeover path
 (`iceberg_scan` is present, so pg_duckdb converts the whole query to DuckDB
 SQL, which issues a `postgres_scan` on `_events` where PG applies partition
-pruning natively). Pruning works, but hot-only queries pay pg_duckdb's
-roundtrip overhead; users who know their query hits only hot data can query
-`_events` directly for fully native PG with no pg_duckdb involvement:
+pruning natively). A single-table read whose WHERE proves it hot
+(`ts >= cutoff`) is rerouted to `_events` automatically and runs in plain
+PostgreSQL. Other queries through the view, such as joins or reads that span
+the cutoff, pay pg_duckdb's roundtrip overhead; users who know such a query
+hits only hot data can query `_events` directly for fully native PG with no
+pg_duckdb involvement:
 
 ```sql
--- Transparent (hot + cold via pg_duckdb):
+-- Through the view: a provably hot single-table read is rerouted to _events.
 SELECT * FROM events WHERE ts = '2026-04-15';
 
--- Zero-overhead hot-only (native PG partition pruning only):
+-- Directly on the hot table (native PG partition pruning only):
 SELECT * FROM _events WHERE ts = '2026-04-15';
 ```
 
@@ -479,7 +500,7 @@ for a two-level LIST→RANGE table the LIST column first, so `regional` becomes
 `CREATE TABLE IF NOT EXISTS` and stays with the table. Each export then writes
 exactly one partition, the Phase-0 wipe of a leaf covers exactly one, and a
 predicate on `ts` or on the LIST column skips whole manifests before any data
-file is opened: the manifest list carries each manifest's partition-value
+file is opened: the manifest list records each manifest's partition-value
 bounds, and duckdb-iceberg applies the transform to the predicate's constant to
 compare them. The comparison is by month, so an upper bound that falls exactly
 on a month's start keeps that month's manifests (`ts < '2026-07-01'` reads as
@@ -493,7 +514,7 @@ rather than the bare column); the path is opaque to readers, and iceberg-go's
 rewrites use the same field name with its own value format. Within a partition,
 each file's `min(ts)/max(ts)` statistics prune as well. Retention DELETEs and
 the wipe are position deletes, so partitioning makes reads skip months; it does
-not make deletes cheaper.
+not make deletes less expensive.
 
 ## Tiered-Specific Limitations
 
@@ -502,42 +523,55 @@ planner-level takeover, jsonb-as-json, single-node execution, S3 compatibility,
 one-time secret setup) are in
 [architecture.md → Known Limitations](architecture.md#known-limitations).
 
-The dual-tier model carries the following limitations:
+The dual-tier model has the following limitations:
 
-- **Cold RETURNING** - any write that touches the cold tier (a cold-only
-  UPDATE/DELETE, a permissive dual-tier UPDATE/DELETE, or a watermark-split
-  INSERT) **rejects `RETURNING` with a clear error** rather than returning a
-  partial result. The cold tier genuinely cannot return affected rows:
-  duckdb-iceberg's binder refuses `RETURNING` on Iceberg writes and pg_duckdb's
-  row-returning entry point is SELECT-only. Hot-only DML keeps `RETURNING` (it
-  is plain PG DML).
+- Any write that touches the cold tier (a cold-only UPDATE/DELETE, a permissive
+  dual-tier UPDATE/DELETE, or a watermark-split INSERT) **rejects `RETURNING`
+  with a clear error** rather than returning a partial result. The cold tier
+  genuinely cannot return affected rows: duckdb-iceberg's binder refuses
+  `RETURNING` on Iceberg writes and pg_duckdb's row-returning entry point is
+  SELECT-only. Hot-only DML keeps `RETURNING` (it is plain PG DML).
 
-- **Command tag** - an ambiguous dual-tier UPDATE returns `SELECT n` rather
-  than `UPDATE n`, because the rewrite produces a SELECT wrapper around a DML
-  CTE. The row count reflects hot rows only.
+- An ambiguous dual-tier UPDATE returns the command tag `SELECT n` rather than
+  `UPDATE n`, because the rewrite produces a SELECT wrapper around a DML CTE.
+  The row count reflects hot rows only. Other rewritten writes report
+  `SELECT 1`: a top-level cold-only UPDATE/DELETE, a watermark-split INSERT
+  (which returns one `(hot_rows, cold_rows)` row), and a cross-tier move.
+  Inside PL/pgSQL, a cold-only write reports `UPDATE 0`, so `FOUND` is false.
 
-- **Self-join / multiple references** - an UPDATE/DELETE that references the
-  same tiered view more than once - a self-join
-  (`UPDATE events ... FROM events e2`), `DELETE ... USING events`, or a
-  sub-select (`... WHERE id IN (SELECT ... FROM events)`) - is rejected with a
-  clear error. The rewrite swaps only the leading result-relation reference, so
-  a second one cannot be retargeted; reference the view once.
+- An UPDATE/DELETE that references the same tiered view more than once - a
+  self-join (`UPDATE events ... FROM events e2`), `DELETE ... USING events`, or
+  a sub-select (`... WHERE id IN (SELECT ... FROM events)`) - is rejected with
+  a clear error. The rewrite swaps only the leading result-relation reference,
+  so a second one cannot be retargeted; reference the view once.
 
-- **Crash-safety of permissive writes** - a backend crash mid-commit can leave
+- A backend crash in the middle of a permissive write's commit can leave
   orphaned S3 objects; see
   [Write Modes](#write-modes-strict-vs-permissive-allow_mixed_writes).
 
-- **Partitioned tables only** - the source table must already be
-  range-partitioned.
+- The source table must already be range-partitioned.
 
-- **Cutover blocked by autovacuum on freshly-loaded partitions** - Phase 4 of
+- Autovacuum on a freshly-loaded partition can block the cutover: Phase 4 of
   `archivePartition` takes `ACCESS EXCLUSIVE` on the partition under a 100 ms
-  `lock_timeout` circuit breaker. Autovacuum's `SHARE UPDATE EXCLUSIVE` on the
-  partition conflicts with that request, so when a vacuum is running the
-  cutover fails cleanly with `ERROR: canceling statement due to lock timeout`
-  and leaves the trigger + delta in place for the next cycle to retry.
+  `lock_timeout`. Autovacuum's `SHARE UPDATE EXCLUSIVE` on the partition
+  conflicts with that request, so while a vacuum runs, each attempt times out
+  with `ERROR: canceling statement due to lock timeout`. The archiver retries
+  up to 10 times in the same run, with backoff from 100 ms to 51.2 s; only then
+  does the cutover fail, leaving the trigger and delta in place for the next
+  cycle.
 
-    Mitigation: disable autovacuum on the soon-to-be-archived partition
+    To mitigate this, disable autovacuum on the soon-to-be-archived partition
     (`ALTER TABLE <part> SET (autovacuum_enabled = false);` - the setting goes
     with the partition when it is detached and dropped), or schedule the
     archive cycle so partitions have already settled.
+
+## Next Steps
+
+To go further with ColdFront, consult the following documents:
+
+- The [Architecture](architecture.md) overview describes the mechanics both
+  modes share.
+- The [Decoupled Mode](architecture_decoupled.md) deep dive describes the
+  bakery protocol that serializes cold writes.
+- The [Using ColdFront](usage.md) guide covers tiering a table and managing it
+  with the partition CLI.

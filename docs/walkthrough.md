@@ -3,7 +3,7 @@ cwd: ../
 ---
 # ColdFront Guided Walkthrough
 
-New here? Run the guided walkthrough.
+If you are new to ColdFront, run the guided walkthrough.
 
 The walkthrough is a self-contained, step-by-step tour of ColdFront's three
 operating modes - tiered storage (hot PostgreSQL + cold Iceberg), decoupled
@@ -12,9 +12,9 @@ distributed demo that runs two nodes over one shared lake. Every command on
 this page is real: click it to run in Codespaces, or copy it into a local
 shell.
 
-> **Pre-release beta software** - ColdFront is pre-release beta software under
-> active development. Do not use it in production. Interfaces, on-disk formats,
-> and behavior may change without notice, and data loss is possible.
+> **Beta software** - ColdFront is beta software under active development. Do
+> not use it in production. Interfaces, on-disk formats, and behavior may
+> change without notice, and data loss is possible.
 
 ## ▶ In GitHub Codespaces
 
@@ -25,8 +25,8 @@ that turns each code block below into a runnable cell. Click **Run** on each
 cell as you read. The first cell builds the Docker images (two to five
 minutes); everything after it is quick.
 
-Prefer a terminal? `bash examples/walkthrough/guide.sh` runs the same demos as
-an interactive guide.
+If you prefer a terminal, `bash examples/walkthrough/guide.sh` runs the same
+demos as an interactive guide.
 
 ## 💻 On Your Own Machine
 
@@ -45,6 +45,13 @@ curl -fsSL \
   | bash
 ```
 
+The installer writes the files to a `coldfront-walkthrough` directory under the
+current directory, and downloads them from the `main` branch. Set
+`WALKTHROUGH_DIR` to choose another directory, or `WALKTHROUGH_BRANCH` to
+download the files and build sources from another branch. Both variables must
+reach `bash`, so set them after the pipe, as in
+`| WALKTHROUGH_DIR=cf-demo bash`.
+
 If you already have the repository cloned, run the guide directly:
 
 ```bash {"ignore":"true"}
@@ -55,6 +62,11 @@ Either way, the guide builds the Docker images on first run, brings up the
 stack, and walks through each demo interactively. This page and the
 [demos](walkthrough_demos.md) cover the same steps - run them from the doc or
 paste them into your shell.
+
+The guide prints each demo command and query before it runs it. To have the
+guide type each one a character at a time, as in a recording, set
+`WALKTHROUGH_TYPE_DELAY` to the delay in seconds between characters (for
+example, `0.03`). The default of `0` prints each command at once.
 
 ## What Setup Does
 
@@ -137,8 +149,10 @@ curl -sf -X POST \
 ### Using a Cloud Object Store
 
 The walkthrough hero path uses SeaweedFS. To use a cloud store instead, replace
-the warehouse JSON above and the `set_storage_secret` call in Step 5 of
-[Demo 1](walkthrough_demos.md#demo-1-tiered-storage).
+the warehouse JSON above, the `set_storage_secret` call in Step 5 of
+[Demo 1](walkthrough_demos.md#demo-1-tiered-storage), and the `s3:` block in
+`examples/walkthrough/config/archiver.yaml`, which the archiver uses for its
+own connection to the store.
 
 The following table shows the `set_storage_secret` signature for each supported
 store:
@@ -148,10 +162,11 @@ store:
 | SeaweedFS (local) | `SELECT coldfront.set_storage_secret('admin', 'adminsecret', 'seaweedfs:8333');` |
 | AWS S3 | `SELECT coldfront.set_storage_secret('key-id', 'secret-key', null, 'ap-south-2');` |
 | GCS (HMAC) | `SELECT coldfront.set_storage_secret(p_key_id => '<hmac-key>', p_secret => '<hmac-secret>', p_endpoint => 'storage.googleapis.com', p_region => 'us-east-1', p_url_style => 'path', p_use_ssl => true);` |
-| Azure Blob | `SELECT coldfront.set_storage_secret_azure('AccountName=<account>;AccountKey=<key>;EndpointSuffix=core.windows.net');` |
+| Azure ADLS Gen2 | `SELECT coldfront.set_storage_secret_azure('AccountName=<account>;AccountKey=<key>;EndpointSuffix=core.windows.net');` |
 
-For the matching warehouse JSON for each store, see the
-[Object Store Setup](object_store.md) guide.
+The [Object Store Setup](object_store.md) guide shows the matching warehouse
+JSON for AWS S3; for GCS and Azure, see
+[usage.md → Storage Backends](usage.md#storage-backends).
 
 ## Next Steps
 

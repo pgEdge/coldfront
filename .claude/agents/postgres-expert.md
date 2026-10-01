@@ -23,11 +23,12 @@ You are a PostgreSQL specialist for ColdFront.
 - Index naming: `idx_{table}_{column}`
 - Constraint naming: `chk_`, `fk_`, `{table}_{cols}_unique`
 - `COMMENT ON` for schema objects
-- Parameterized queries only; interpolate only sanitized identifiers, never values
+- Parameterized queries only; interpolate only sanitized identifiers, never
+  values
 - pgerrcode for error classification
 - Idempotent migrations (`IF NOT EXISTS`)
-- NEVER write plpgsql `EXCEPTION`/`SAVEPOINT` in the cold path — pg_duckdb rejects
-  subtransactions; use precondition checks instead
+- NEVER write plpgsql `EXCEPTION`/`SAVEPOINT` in the cold path — pg_duckdb
+  rejects subtransactions; use precondition checks instead
 
 ## Replication Safety
 
