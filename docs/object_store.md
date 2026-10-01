@@ -37,8 +37,8 @@ Before you begin, gather the following:
     > credentials at access time; see [usage.md](usage.md#vended-credentials).
 
 - permission for the key to read, write and list the bucket (`GetObject` /
-  `PutObject` / `DeleteObject` / `ListBucket`), as in the following example
-  policy:
+  `PutObject` / `DeleteObject` / `ListBucket`) and to abort a failed multipart
+  upload (`AbortMultipartUpload`), as in the following example policy:
 
     ```json
     {
@@ -46,7 +46,7 @@ Before you begin, gather the following:
       "Statement": [
         {
           "Effect": "Allow",
-          "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket"],
+          "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket", "s3:AbortMultipartUpload"],
           "Resource": [
             "arn:aws:s3:::my-iceberg-bucket",
             "arn:aws:s3:::my-iceberg-bucket/*"
@@ -55,6 +55,10 @@ Before you begin, gather the following:
       ]
     }
     ```
+
+    DuckDB never aborts a failed multipart upload, so add an
+    `AbortIncompleteMultipartUpload` lifecycle rule to the bucket to delete
+    leftover parts.
 
 - the ColdFront image, built once by following
   [installation.md](installation.md), which notes the registry access the base
@@ -118,10 +122,10 @@ following flags matter:
 
 - omitting `endpoint` selects native per-Region virtual-hosted addressing over
   HTTPS.
-- `path-style-access: false` is required for virtual-hosted S3, because
-  path-style fails on any Region launched after 2019.
-- `flavor: "aws"` selects the Lakekeeper profile for virtual-hosted S3, not
-  `s3-compat`.
+- `path-style-access: false` selects virtual-hosted addressing, because AWS
+  plans to discontinue path-style URLs.
+- `flavor: "aws"` marks the store as AWS S3, which decides how Lakekeeper uses
+  STS, while `s3-compat` is for other S3-compatible stores.
 - `sts-enabled: false` and `remote-signing-enabled: false` make the warehouse
   use the long-term access key.
 
@@ -260,10 +264,10 @@ SELECT coldfront.set_storage_secret('AKIAEXAMPLE...', '<your-secret-key>', NULL,
 ```
 
 > **The 3rd argument (endpoint) must be `NULL` for a cloud S3 endpoint** - that
-> selects DuckDB's native per-Region virtual-hosted + HTTPS addressing
-> (required for Regions launched after 2019). The 4th argument is your bucket's
-> region. The SeaweedFS form you may have seen elsewhere passes a non-NULL
-> endpoint and no region - do **not** use that shape for cloud S3.
+> selects DuckDB's native per-Region virtual-hosted + HTTPS addressing. The 4th
+> argument is your bucket's region, from which DuckDB derives the endpoint. The
+> SeaweedFS form you may have seen elsewhere passes a non-NULL endpoint and no
+> region - do **not** use that shape for cloud S3.
 
 ---
 
@@ -333,8 +337,10 @@ Work through the following checklist if something failed:
   produces `schema "coldfront" does not exist`.
 - Check that `set_storage_secret(..., NULL, 'eu-west-1')` has `NULL` as its
   third argument (native virtual-hosted addressing over HTTPS) and your real
-  region as its fourth. A non-NULL endpoint forces path-style addressing and
-  breaks modern Regions with HTTP 400.
+  region as its fourth. A non-NULL endpoint applies `url_style` and `use_ssl`,
+  which default to path-style over plain HTTP. A wrong region sends requests to
+  another Region's endpoint, which S3 rejects (with HTTP 400 for a bucket in a
+  Region launched after 2019-03-20).
 - Check that the namespace `public` exists in Lakekeeper before
   `create_iceberg_table` runs. Without the namespace, the decoupled create
   fails with HTTP 404.

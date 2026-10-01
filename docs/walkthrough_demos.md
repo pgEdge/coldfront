@@ -412,12 +412,14 @@ Together, the three queries give the following hot/cold split:
   Total                     1,000,000
 ```
 
-The hot share depends on the day of the month you run the demo, because the
-cutoff is the start of the previous month: a run on the 1st keeps about 41,000
-rows hot, and a run at the end of a month about 83,000. Before tiering (Step
-3), the table held one million rows, all hot, in approximately 152 MB of
-Postgres heap. After tiering, only the last month or two remains in PostgreSQL;
-over 90% of the hot storage is gone while the total row count is unchanged.
+The hot share depends on the day you run the demo. The archiver moves a monthly
+partition to cold storage once its end is at least 30 days in the past, so the
+previous month stays hot until the 31st. A run on the 1st or the 31st keeps
+about 42,000 rows hot, and a run late in any other month about 83,000. Before
+tiering (Step 3), the table held one million rows, all hot, in approximately
+152 MB of Postgres heap. After tiering, only the last month or two remains in
+PostgreSQL; over 90% of the hot storage is gone while the total row count is
+unchanged.
 
 ### Step 9: Query Across Tiers
 
@@ -486,7 +488,7 @@ The query returns:
 ```text {"ignore":"true"}
  id |              ts               | status
 ----+-------------------------------+--------
-  1 | 2024-09-29 08:17:49.334041+00 | warn
+  1 | 2024-10-01 14:44:24.687844+00 | warn
 ```
 
 Update the archived row through the same table using the captured id:

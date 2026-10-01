@@ -24,7 +24,7 @@ this document, concern by concern:
 | `post_parse_analyze_hook` | The hook rewrites INSERT/UPDATE/DELETE per tier. | The hook rewrites every INSERT/UPDATE/DELETE on the wrapper view to a single `SELECT coldfront._exec_iceberg_with_claim(<ref>, <DuckDB SQL>)`, which takes the table's claim and runs the statement through `duckdb.raw_query`. |
 | Archiver | The archiver moves rows from hot to cold on a cron. | None, because there is nothing to archive. |
 | `coldfront.tiered_views` row | The row is required for each managed table. | The row is required (with `is_iceberg_only = true`), and `create_iceberg_table()` registers it. |
-| Required at runtime | `pg_duckdb`, `coldfront`, Lakekeeper, S3 | `pg_duckdb`, `coldfront` (lazy catalog ATTACH, DML rewrite, and write serialization), Lakekeeper, S3 |
+| Required at runtime | `pg_duckdb`, `coldfront`, Lakekeeper, an S3-compatible store or Azure ADLS Gen2 | `pg_duckdb`, `coldfront` (lazy catalog ATTACH, DML rewrite, and write serialization), Lakekeeper, an S3-compatible store or Azure ADLS Gen2 |
 
 The coldfront extension provides the lazy catalog-attach glue: the C extension
 hook intercepts the first query that touches a tiered view (read or write) and,
@@ -92,7 +92,7 @@ notes:
 |---|---|---|
 | Lazy catalog ATTACH | The C hook calls `ensure_attached()` on the first query that touches a tiered view. | The ATTACH costs one round-trip on the first Iceberg query per session. |
 | CREATE TABLE | `SELECT duckdb.raw_query('CREATE TABLE ice.<ns>.<name> (...)')` | The statement is DuckDB SQL in attached-catalog syntax. |
-| INSERT | The C hook rewrites `INSERT INTO <view> [VALUES (…) | SELECT … FROM <pg_table> | SELECT … FROM generate_series(…)]` to one `SELECT coldfront._exec_iceberg_with_claim(<ref>, 'INSERT INTO ice.<ns>.<name> …')`. Source-table references get the prefix `pglocal.<schema>.<table>`, so DuckDB's postgres extension streams the source via libpq into the Iceberg writer. That attachment needs `coldfront.local_pg_dsn` (see [Bootstrap Sequence](#bootstrap-sequence)). | Each INSERT produces a single Iceberg snapshot, regardless of row count. |
+| INSERT | The C hook rewrites an `INSERT INTO <view>` whose source is `VALUES (…)`, `SELECT … FROM <pg_table>` or `SELECT … FROM generate_series(…)` to one `SELECT coldfront._exec_iceberg_with_claim(<ref>, 'INSERT INTO ice.<ns>.<name> …')`. Source-table references get the prefix `pglocal.<schema>.<table>`, so DuckDB's postgres extension streams the source via libpq into the Iceberg writer. That attachment needs `coldfront.local_pg_dsn` (see [Bootstrap Sequence](#bootstrap-sequence)). | Each INSERT produces a single Iceberg snapshot, regardless of row count. |
 | UPDATE | The hook rewrites `UPDATE <view> SET … WHERE …` to `SELECT coldfront._exec_iceberg_with_claim(<ref>, 'UPDATE ice.<ns>.<name> SET ... WHERE ...')`. | Iceberg applies the update as merge-on-read. |
 | DELETE | The hook rewrites `DELETE FROM <view> WHERE …` to `SELECT coldfront._exec_iceberg_with_claim(<ref>, 'DELETE FROM ice.<ns>.<name> WHERE ...')`. | Iceberg records the delete in position-delete files. |
 | SELECT (function-call form) | `SELECT … FROM iceberg_scan('ice.<ns>.<name>') r WHERE r['col'] = …` | Columns must use the `r['col']` accessor. In a fresh session, run `SELECT coldfront.ensure_attached();` first, or DuckDB treats the argument as a file path. |

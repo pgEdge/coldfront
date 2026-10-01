@@ -707,11 +707,11 @@ or `vhost`. `region` defaults to `us-east-1`.
 For virtual-hosted cloud S3 (AWS S3 is the canonical one), **omit `endpoint`**
 (and the `endpoint` arg to `set_storage_secret`) so DuckDB uses the native
 per-Region virtual-hosted + HTTPS addressing; set `region` to your bucket's
-Region. This is **required** for Regions launched after 2019-03-20 (e.g.
-`ap-south-2`), whose DNS does not route path-style requests and returns
-HTTP 400. The Lakekeeper warehouse profile must be a virtual-hosted `s3`
-profile (`flavor: aws`, `path-style-access: false`, no custom endpoint); the
-full walkthrough is [object_store.md](object_store.md).
+Region. DuckDB derives the endpoint from `region`, and a bucket in a Region
+launched after 2019-03-20 (e.g. `ap-south-2`) rejects requests sent to another
+Region's endpoint with HTTP 400. The Lakekeeper warehouse profile must be a
+virtual-hosted `s3` profile (`flavor: aws`, `path-style-access: false`, no
+custom endpoint); the full walkthrough is [object_store.md](object_store.md).
 
 ### Google Cloud Storage
 
