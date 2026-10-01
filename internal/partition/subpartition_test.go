@@ -37,6 +37,21 @@ func TestSubName(t *testing.T) {
 	}
 }
 
+func TestSubNames(t *testing.T) {
+	got, err := SubNames("events", []string{"eu", "US-East"})
+	if err != nil || strings.Join(got, ",") != "events_eu,events_us_east" {
+		t.Fatalf("SubNames = %v, %v; want [events_eu events_us_east]", got, err)
+	}
+	// "eu-west" and "eu_west" both sanitize to events_eu_west.
+	if _, err := SubNames("events", []string{"eu-west", "eu_west"}); err == nil ||
+		!strings.Contains(err.Error(), `values "eu-west" and "eu_west" both map to "events_eu_west"`) {
+		t.Fatalf("expected a collision naming both values, got %v", err)
+	}
+	if _, err := SubNames("events", []string{"eu", strings.Repeat("x", 60)}); err == nil {
+		t.Fatal("expected the name-length error")
+	}
+}
+
 func TestEnsureListChild_SQL(t *testing.T) {
 	db := &mockDB{}
 	m := NewManager(db)
@@ -115,9 +130,12 @@ func TestRunReconcileTwoLevel_CollisionFailsLoud(t *testing.T) {
 	f := &fakeLifecycle{}
 	s := Spec{Parent: "events", Schema: "public", Column: "ts", Period: PeriodMonthly, Premake: 1}
 	// "eu-west" and "eu_west" both sanitize to events_eu_west: a silent
-	// table-name collision must fail loud, not clobber one subtree.
+	// table-name collision must fail loud before the pass creates any child.
 	err := RunReconcileTwoLevel(context.Background(), f, s, []string{"eu-west", "eu_west"}, time.Now(), nil)
 	if err == nil || !strings.Contains(err.Error(), "collision") {
 		t.Fatalf("expected collision error, got %v", err)
+	}
+	if len(f.log) != 0 {
+		t.Fatalf("the pass created %v before rejecting the collision", f.log)
 	}
 }

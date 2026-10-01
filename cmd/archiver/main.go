@@ -826,15 +826,17 @@ func (ac *archiveCycle) tierAndExpireTwoLevel(ctx context.Context, leaves []leaf
 // premakeListChildren is step 1 of the 2-level cycle: for each LIST value ensure
 // its child (attached to the physical top, named by the stable source name) and
 // its forward window + current partition exist, logging once if any was behind.
+// Two values that map to one child name fail the cycle before it creates any.
 func (ac *archiveCycle) premakeListChildren(ctx context.Context, parent string, values []string) ([]childRef, error) {
 	t, partMgr, now := ac.t, ac.partMgr, ac.now
+	names, err := partition.SubNames(t.SourceTable, values)
+	if err != nil {
+		return nil, err
+	}
 	var children []childRef
 	anyBehind := false
-	for _, v := range values {
-		child, err := partition.SubName(t.SourceTable, v)
-		if err != nil {
-			return nil, fmt.Errorf("sub-partition name for %q: %w", v, err)
-		}
+	for i, v := range values {
+		child := names[i]
 		if err := partMgr.EnsureListChild(ctx, parent, t.SourceSchema, v, child, t.PartitionColumn); err != nil {
 			return nil, err
 		}

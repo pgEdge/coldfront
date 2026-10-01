@@ -750,14 +750,14 @@ EXAMPLES:
 }
 
 // setTouchesValidatedField reports whether the `set` invocation changed a field
-// the shared validation covers (partition key, tier/drop ages, or the 2-level
-// source), so execSet knows to re-validate the resulting row rather than trust
-// the DB CHECK constraints alone.
+// the shared validation covers (cadence, partition key, tier/drop ages, or the
+// 2-level source), so execSet knows to re-validate the resulting row rather
+// than trust the DB CHECK constraints alone.
 func setTouchesValidatedField(fs *flag.FlagSet) bool {
 	touched := false
 	fs.Visit(func(f *flag.Flag) {
 		switch f.Name {
-		case "column", "hot-period", "retention", "sub-values-source":
+		case "period", "column", "hot-period", "retention", "sub-values-source":
 			touched = true
 		}
 	})

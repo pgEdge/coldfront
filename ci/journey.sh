@@ -3076,6 +3076,30 @@ EOF
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# Story: two LIST values with one child name ('eu-west' and 'eu_west' both
+# name clash_eu_west) fail the archiver pass before it creates any partition,
+# as they fail a partitioner pass (TC-199).
+# ───────────────────────────────────────────────────────────────────────────
+story_twolevel_name_collision() {
+    step "TC-199: the archiver rejects two LIST values that map to one child name"
+    q "$HOST" "CREATE TABLE public.clash (id bigint GENERATED ALWAYS AS IDENTITY, region text NOT NULL,
+                   ts timestamptz NOT NULL, PRIMARY KEY (id, region, ts)) PARTITION BY LIST (region);
+               CREATE TABLE public.clash_eu_west PARTITION OF public.clash FOR VALUES IN ('eu-west') PARTITION BY RANGE (ts);" >/dev/null
+    if ! "$ARCHIVER" register --config $TMPD/archiver.yaml --table clash --column ts --period monthly --hot-period "30 days" \
+            --sub-values-source "SELECT v FROM (VALUES ('eu-west'),('eu_west')) r(v)" >$TMPD/clash.log 2>&1; then
+        fail "TC-199: register clash (see $TMPD/clash.log)"; tail -5 $TMPD/clash.log
+    elif "$ARCHIVER" --config $TMPD/archiver.yaml >>$TMPD/clash.log 2>&1; then
+        fail "TC-199: the archiver pass accepted the colliding values"
+    else
+        assert_contains "TC-199: the archiver named the collision" \
+            'values "eu-west" and "eu_west" both map to "clash_eu_west"' "$(cat $TMPD/clash.log)"
+    fi
+    assert_eq "TC-199: the pass created no partition under clash_eu_west" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM pg_inherits WHERE inhparent='public.clash_eu_west'::regclass;")"
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name='clash'; DROP TABLE public.clash;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Story - FK: foreign key on a tiered partitioned table. Asserts:
 #   1. The archiver registers and archives a table that has a FK constraint.
 #   2. PostgreSQL enforces the FK on the hot tier before and after the view
@@ -5078,9 +5102,10 @@ story_case_collision_rejected() {
 # Story — names the partition naming scheme cannot carry are refused at register.
 # A leading "_" is the tiered hot table's prefix, and a partition is named
 # <name>_p_YYYY_MM (_p_YYYY_MM_DD daily), so the name must fit within 63 bytes.
+# `set --period` checks the name against the new suffix too (TC-200).
 # ───────────────────────────────────────────────────────────────────────────
 story_bad_source_names_rejected() {
-    step "TC-139/TC-142: unrepresentable table names rejected at register"
+    step "TC-139/TC-142/TC-200: unrepresentable table names rejected at register and set"
     local long53 long54
     long53=$(head -c 53 < /dev/zero | tr "\\0" a); long54="${long53}a"
     q "$HOST" "CREATE TABLE IF NOT EXISTS public._mytest (id bigint NOT NULL, ts timestamptz NOT NULL, PRIMARY KEY (id,ts)) PARTITION BY RANGE (ts);" >/dev/null
@@ -5097,6 +5122,15 @@ story_bad_source_names_rejected() {
     else
         fail "TC-142: 53 chars must be accepted — see $TMPD/badname53.log"; tail -3 $TMPD/badname53.log
     fi
+    # set re-validates a period change: 53 bytes leave no room for the daily suffix.
+    if "$ARCHIVER" set --config $TMPD/archiver.yaml --table "$long53" --period daily >$TMPD/badname53-set.log 2>&1; then
+        fail "TC-200: set --period daily accepted a 53-char name"
+    else
+        assert_contains "TC-200: set --period daily stated the 50-byte daily maximum" \
+            "maximum for daily partitioning is 50" "$(cat $TMPD/badname53-set.log)"
+    fi
+    assert_eq "TC-200: the refused set left the period monthly" "monthly" \
+        "$(q "$HOST" "SELECT partition_period FROM coldfront.partition_config WHERE table_name='${long53}';")"
 
     assert_eq "TC-139/TC-142: only the legal name reached partition_config" "1" \
         "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name IN ('_mytest','${long53}','${long54}');")"
@@ -6035,6 +6069,7 @@ if [ "$MODE" = "tiered" ]; then
     story_coexist
     story_cold_retention
     story_tiered_twolevel
+    story_twolevel_name_collision      # TC-199: colliding LIST child names fail the archiver pass
     story_partitioner_idmode
     story_partitioner_multitable
     story_premake_respects_existing_range  # premake provisions a range, not a name
@@ -6063,7 +6098,7 @@ if [ "$MODE" = "tiered" ]; then
     story_register_idempotent          # TC-110: re-register updates values; no duplicate row
     story_unlogged_rejected            # TC-113: UNLOGGED rejected at register
     story_case_collision_rejected      # TC-141: name differing only by case rejected at register
-    story_bad_source_names_rejected    # TC-139/TC-142: leading underscore and over-long names rejected
+    story_bad_source_names_rejected    # TC-139/TC-142/TC-200: leading underscore and over-long names rejected
     story_unmappable_column_rejected   # TC-150: column type with no Iceberg mapping rejected at register
     story_quoted_table_names           # TC-140/TC-143/TC-144: dot, hyphen, space in table name
     story_temp_rejected                # TC-114: TEMP table invisible to archiver

@@ -470,8 +470,8 @@ Each level-1 child is named `<table>_<value>`, with the value lowercased and
 every character outside `a-z`, `0-9` and `_` replaced by `_`. That name must
 fit in 50 bytes, which leaves room for the daily leaf suffix within
 PostgreSQL's 63-byte identifier limit. A pass that meets a longer name fails,
-for tiered two-level tables as well. The partitioner also fails a pass in which
-two values map to the same name.
+for tiered two-level tables as well. The partitioner and the archiver also
+fail a pass in which two values map to the same name.
 
 ## Dropping an Iceberg Table (Both Modes)
 
@@ -550,7 +550,7 @@ table, validated on the spot. `import` and `export` are bulk helpers for
 (re)configuring a machine - seed a fresh node from a YAML, or dump the live
 config to git and replay it on another node - not the day-to-day path.
 `register` and `import` run the full validation; `set` re-runs it only when it
-changes the partition column, `hot_period`, `retention_period` or the
+changes the partition period or column, `hot_period`, `retention_period` or the
 sub-partition source, and otherwise relies on the table's CHECK constraints.
 
 The data lifecycle is **hot PG → `hot_period` → cold Iceberg →
