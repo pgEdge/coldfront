@@ -5800,7 +5800,7 @@ story_partitioned_cold_tables() {
     step "TC-186..TC-189: partitioned cold tables (fan-out, UTC months, refusals, pruning)"
     local cols='[{"name":"id","type":"bigint"},{"name":"ts","type":"timestamptz"},{"name":"status","type":"text"}]'
     # The UTC start of the month two months back, whatever the session's zone.
-    local m="(date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') - interval '2 months'"
+    local m="(date_trunc('month', now() AT TIME ZONE 'UTC') - interval '2 months') AT TIME ZONE 'UTC'"
     q "$HOST" "SELECT coldfront.create_iceberg_table('public','tcpart','$cols'::jsonb, '{month(ts)}');" >/dev/null 2>&1
 
     # TC-187: one statement, three rows in three consecutive UTC months. The hook
@@ -5902,7 +5902,7 @@ EOF
 # ───────────────────────────────────────────────────────────────────────────
 story_row_group_pruning() {
     step "TC-192: a time band skips the row groups outside it"
-    local m="(date_trunc('month', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC') - interval '2 months'"
+    local m="(date_trunc('month', now() AT TIME ZONE 'UTC') - interval '2 months') AT TIME ZONE 'UTC'"
     q "$HOST" "SELECT coldfront.create_iceberg_table('public','tcrg','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"ts\",\"type\":\"timestamptz\"},{\"name\":\"v\",\"type\":\"integer\"}]'::jsonb, '{month(ts)}');" >/dev/null 2>&1
     # 300,000 rows one second apart, three and a half days inside one month: one
     # file, several row groups, each covering its own span of ts.
