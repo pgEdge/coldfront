@@ -70,6 +70,11 @@ this project adheres to
 
 ### Fixed
 
+- On PostgreSQL 17 and 18, a transaction block in which a statement had failed
+  could not be ended in a database with the extension: `ROLLBACK`, `COMMIT`
+  and `ROLLBACK TO SAVEPOINT` failed with "ResourceOwnerEnlarge called after
+  release started", and the session stayed in the failed transaction until it
+  disconnected. They now end the block.
 - After one cold write on a mesh, an app role could run any SQL as the loopback
   connection's user through the `coldfront_self` dblink connection the claim
   left open in its session, and by setting `coldfront.dblink_self` it could

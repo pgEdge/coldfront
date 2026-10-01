@@ -3951,7 +3951,14 @@ typedef struct {
 static bool
 coldfront_registry_present(void)
 {
-    Oid nsoid = get_namespace_oid("coldfront", true);
+    Oid nsoid;
+
+    /* The COMMIT or ROLLBACK that ends a failed transaction block reaches the
+     * hooks after the transaction's resources are released, when no catalog
+     * lookup can run, and it has nothing tiered to act on. */
+    if (!IsTransactionState())
+        return false;
+    nsoid = get_namespace_oid("coldfront", true);
     if (!OidIsValid(nsoid))
         return false;
     return OidIsValid(get_relname_relid("tiered_views", nsoid));

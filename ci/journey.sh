@@ -493,6 +493,31 @@ story_decoupled_concurrency() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# TC-201: a transaction block in which a statement failed still ends. The
+# ROLLBACK or COMMIT that ends it reaches coldfront's hooks after the
+# transaction's resources are released, and must still end the block, undo its
+# writes and leave the session usable; an aborted cold write leaves no claim.
+# failed_block_ends <view> <insert> <status>: <insert> writes rows whose status
+# is <status> through <view>.
+# ───────────────────────────────────────────────────────────────────────────
+failed_block_ends() {
+    local view="$1" ins="$2" status="$3" end O
+    for end in ROLLBACK COMMIT; do
+        O=$(qf "$HOST" <<EOSQL
+BEGIN;
+$ins;
+SELECT 1/0;
+$end;
+SELECT 'FB_AFTER:' || count(*) FROM $view WHERE status = '$status';
+EOSQL
+)
+        assert_eq "TC-201: $end ends a failed block on $view and undoes its writes" "0" "$(extract FB_AFTER "$O")"
+    done
+    assert_eq "TC-201: the failed blocks left no claim on $view" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.claims c JOIN coldfront.tiered_views tv ON tv.iceberg_table = c.iceberg_table WHERE tv.relname = '$view';")"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Decoupled read-your-own-write — the wrapper view sources duckdb.query (not
 # iceberg_scan), so an in-transaction SELECT sees the same tx's prior write,
 # and ROLLBACK undoes the Iceberg INSERT (pg_duckdb XactCallback ties the txns).
@@ -509,6 +534,7 @@ EOSQL
 )
     assert_eq "in-tx SELECT sees just-inserted iceberg row" "1" "$(extract INTX "$O")"
     assert_eq "ROLLBACK undoes the iceberg INSERT"          "0" "$(extract POSTRB "$O")"
+    failed_block_ends iceonly "INSERT INTO iceonly VALUES (98, date_trunc('month',now()) + interval '12 hours', 'fb_blk', '{}')" fb_blk
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -2218,6 +2244,7 @@ SELECT 'RB_TOTAL:' || count(*) FROM events WHERE status='rollback_me';
 EOSQL
 )
     assert_eq "rollback undoes hot+cold" "0" "$(extract RB_TOTAL "$O")"
+    failed_block_ends events "INSERT INTO events (ts, status, data) VALUES (date_trunc('month',now()) - interval '1 month' + interval '9 days', 'fb_blk', '{}'), (date_trunc('month',now()) - interval '4 months' + interval '15 days', 'fb_blk', '{}')" fb_blk
     if "$ARCHIVER" --config $TMPD/archiver.yaml >$TMPD/idem.log 2>&1; then
         assert_contains "archiver idempotent (re-run no-op)" "nothing to tier or expire" "$(cat $TMPD/idem.log)"
     else
