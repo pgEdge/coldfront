@@ -54,6 +54,10 @@ this project adheres to
   `coldfront.cold_write_batch_size` rows, with the identity values and defaults
   an `INSERT` would give them. `COPY ... WHERE` and the `FREEZE`, `ON_ERROR`,
   `REJECT_LIMIT` and `DEFAULT` options are refused.
+- An `INSERT` nested in a `WITH` entry, on a tiered or a decoupled view, goes
+  through the INSERT rewrite: the hot `INSERT` becomes the entry's body, and
+  the rewrite's source and cold sink join the statement's `WITH` list. With a
+  watermark, `RETURNING` on it is refused, as on a top-level `INSERT`.
 
 ### Changed
 
@@ -88,7 +92,17 @@ this project adheres to
   rather than the hook (a `COPY`, an `INSERT` nested in `WITH`, a session or a
   node without the hook) wrote cold rows with NULL identity and default values
   and without the table's claim. The trigger is gone: the hook is the only
-  write path, and such a write now fails in PostgreSQL.
+  write path.
+- A tiered `INSERT` whose `WITH` clause held an entry that modifies data
+  (`WITH moved AS (DELETE … RETURNING …) INSERT INTO <view> SELECT … FROM
+  moved`) failed with "WITH clause containing a data-modifying statement must
+  be at the top level", because the rewrite folded the clause into its source
+  sub-query. The clause's entries now open the rewritten statement. On a
+  decoupled view, where the source runs in DuckDB, such an entry is refused
+  with an error that says so instead of DuckDB's parser error.
+- A tiered `INSERT` with a second `INSERT` into the same view nested in its
+  `WITH` was rewritten into a statement with a syntax error. A statement that
+  writes a tiered view more than once is now refused.
 - A tiered `INSERT … SELECT` ran its source once per tier. A source whose
   rows differed between the two runs landed some rows in both tiers and others
   in neither, and when the hot table had no identity column, or the statement

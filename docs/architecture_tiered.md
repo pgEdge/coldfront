@@ -109,8 +109,9 @@ afterwards; the `CREATE OR REPLACE VIEW` keeps the view's OID across runs. The
 C hook rewrites an INSERT on the view by the watermark cutoff, into a hot
 INSERT of the at/after-cutoff rows into `_events` and the cold sink for the
 older rows, and the utility hook feeds a `COPY FROM` into the same rewrite in
-batches. The view has no INSTEAD OF trigger, so a write that reaches it without
-the hook, such as an `INSERT` nested in `WITH`, fails in PostgreSQL.
+batches. An `INSERT` nested in a `WITH` entry is rewritten in place. The view
+has no INSTEAD OF trigger, so a write the hook does not handle, such as
+`MERGE`, fails in PostgreSQL.
 
 ### The Archive Pipeline
 
@@ -261,30 +262,32 @@ statement that splits the input by the partition-column watermark:
 INSERT INTO events (ts, status, data) SELECT ts, status, data FROM staging;
 
 -- Rewritten by the hook to (schematically):
-WITH src AS MATERIALIZED (
+WITH coldfront_source AS MATERIALIZED (
   SELECT ts::timestamptz AS ts, status::text AS status, data::jsonb AS data
   FROM (<source>) AS s(ts, status, data)
 ),
-hot_ins AS MATERIALIZED (
+coldfront_hot AS MATERIALIZED (
   INSERT INTO _events (ts, status, data)
-  SELECT ts, status, data FROM src WHERE ts >= '<cutoff>'::timestamptz
+  SELECT ts, status, data FROM coldfront_source
+  WHERE ts >= '<cutoff>'::timestamptz
   RETURNING 1
 ),
-cold_call AS MATERIALIZED (
+coldfront_cold AS MATERIALIZED (
   SELECT coldfront._cold_sink('public', 'events', to_jsonb(r)) AS n
-  FROM (SELECT nextval('_events_id_seq') AS id, src.ts, src.status, src.data
-        FROM src WHERE src.ts < '<cutoff>'::timestamptz) AS r
+  FROM (SELECT nextval('_events_id_seq') AS id, ts, status, data
+        FROM coldfront_source WHERE ts < '<cutoff>'::timestamptz) AS r
 )
-SELECT (SELECT count(*) FROM hot_ins) AS hot_rows,
-       (SELECT n FROM cold_call) AS cold_rows;
+SELECT (SELECT count(*) FROM coldfront_hot) AS hot_rows,
+       (SELECT n FROM coldfront_cold) AS cold_rows;
 ```
 
-The source runs once, into the `src` tuplestore, and both halves read it, so
-a volatile source lands every row exactly once and a row the transaction wrote
-before the `INSERT` reaches the cold tier. Each column of `src` is cast to the
-hot table's type, which restates the coercions PostgreSQL applied when it
-analyzed the statement (an untyped literal against a `jsonb` column keeps that
-type), and `OVERRIDING SYSTEM VALUE` stays on the hot `INSERT`.
+The source runs once, into the `coldfront_source` tuplestore, and both halves
+read it, so a volatile source lands every row exactly once and a row the
+transaction wrote before the `INSERT` reaches the cold tier. Each column of
+`coldfront_source` is cast to the hot table's type, which restates the
+coercions PostgreSQL applied when it analyzed the statement (an untyped literal
+against a `jsonb` column keeps that type), and `OVERRIDING SYSTEM VALUE` stays
+on the hot `INSERT`.
 
 The hot half is plain set-based `INSERT INTO _events`: IDENTITY and DEFAULT
 columns fill server-side at full PG speed. The cold half projects each row to
@@ -297,6 +300,19 @@ as one `INSERT` under the table's claim, taken once per table per transaction;
 its final step flushes the rest. Throughput is bounded by the per-row rendering
 in plpgsql, so for very large mostly-cold seeds, prefer iceberg-only mode where
 ids come from the source data.
+
+A `WITH` clause on the `INSERT` keeps its entries at the top of the rewritten
+statement, ahead of the three above, so an entry that modifies data (`WITH
+moved AS (DELETE FROM staging RETURNING …) INSERT INTO events SELECT … FROM
+moved`) stays where PostgreSQL allows one. An `INSERT` nested in a `WITH`
+entry (`WITH i AS (INSERT INTO events …) SELECT …`) is rewritten in place: the
+hot `INSERT` becomes the entry's body, and `coldfront_source` and
+`coldfront_cold`, the latter as a data-modifying entry so that it always runs,
+are lifted into the statement's `WITH` list just before it. With a watermark a
+row may go cold, so `RETURNING` on such an entry is refused as on a top-level
+`INSERT`; without one every row is hot and `RETURNING` works. A statement may
+write a tiered view once, and a nested `UPDATE` or `DELETE` is not rewritten,
+so PostgreSQL refuses it.
 
 `COPY <view> FROM` takes the same path. The utility hook reads the rows with
 PostgreSQL's COPY reader (`BeginCopyFrom`, `NextCopyFrom`), collects

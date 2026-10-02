@@ -130,35 +130,35 @@ INSERT INTO coldfront.archive_watermark(schema_name, table_name, cutoff_time)
 VALUES ('public', 'eid', '2026-03-01'::timestamptz);
 PREPARE eid_ins(timestamptz, bytea) AS INSERT INTO public.eid (ts, data) VALUES ($1, $2);
 EXPLAIN (COSTS OFF, VERBOSE) EXECUTE eid_ins('2026-01-10 00:00+00', '\xcafe'::bytea);
-                                                        QUERY PLAN                                                         
----------------------------------------------------------------------------------------------------------------------------
+                                                                     QUERY PLAN                                                                      
+-----------------------------------------------------------------------------------------------------------------------------------------------------
  Result
    Output: $4, $5
-   CTE src
+   CTE coldfront_source
      ->  Result
            Output: $1, $2
-   CTE hot_ins
+   CTE coldfront_hot
      ->  Insert on public._eid
            Output: 1
-           ->  CTE Scan on src
-                 Output: nextval('_eid_id_seq'), src.ts, src.data
-                 Filter: (src.ts >= 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
-   CTE cold_call
+           ->  CTE Scan on coldfront_source
+                 Output: nextval('_eid_id_seq'), coldfront_source.ts, coldfront_source.data
+                 Filter: (coldfront_source.ts >= 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
+   CTE coldfront_cold
      ->  Aggregate
            Output: _cold_sink('public'::text, 'eid'::text, to_jsonb(r.*))
            ->  Subquery Scan on r
                  Output: r.*
-                 ->  CTE Scan on src src_1
-                       Output: nextval('_eid_id_seq'::regclass), src_1.ts, ('\x'::text || encode(src_1.data, 'hex'::text))
-                       Filter: (src_1.ts < 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
+                 ->  CTE Scan on coldfront_source coldfront_source_1
+                       Output: nextval('_eid_id_seq'::regclass), coldfront_source_1.ts, ('\x'::text || encode(coldfront_source_1.data, 'hex'::text))
+                       Filter: (coldfront_source_1.ts < 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
    InitPlan 4 (returns $4)
      ->  Aggregate
            Output: count(*)
-           ->  CTE Scan on hot_ins
-                 Output: hot_ins."?column?"
+           ->  CTE Scan on coldfront_hot
+                 Output: coldfront_hot."?column?"
    InitPlan 5 (returns $5)
-     ->  CTE Scan on cold_call
-           Output: cold_call.n
+     ->  CTE Scan on coldfront_cold
+           Output: coldfront_cold.n
 (27 rows)
 
 DEALLOCATE cold_upd;

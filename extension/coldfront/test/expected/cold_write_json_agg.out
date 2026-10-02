@@ -61,11 +61,11 @@ WHERE ts < '2019-01-01'::timestamptz;
 EXPLAIN (COSTS OFF, VERBOSE)
 INSERT INTO public.events
 SELECT 9, '2019-01-01'::timestamptz, jsonb_agg(k ORDER BY k) FROM public.src;
-                                                   QUERY PLAN                                                   
-----------------------------------------------------------------------------------------------------------------
+                                                                     QUERY PLAN                                                                     
+----------------------------------------------------------------------------------------------------------------------------------------------------
  Result
    Output: (InitPlan 4).col1, (InitPlan 5).col1
-   CTE src
+   CTE coldfront_source
      ->  Aggregate
            Output: 9, 'Tue Jan 01 00:00:00 2019 UTC'::timestamp with time zone, jsonb_agg(src.k ORDER BY src.k)
            ->  Sort
@@ -73,26 +73,26 @@ SELECT 9, '2019-01-01'::timestamptz, jsonb_agg(k ORDER BY k) FROM public.src;
                  Sort Key: src.k
                  ->  Seq Scan on public.src
                        Output: src.k
-   CTE hot_ins
+   CTE coldfront_hot
      ->  Insert on public._events
            Output: 1
-           ->  CTE Scan on src src_1
-                 Output: src_1.id, src_1.ts, src_1.data
-                 Filter: (src_1.ts >= 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
-   CTE cold_call
+           ->  CTE Scan on coldfront_source
+                 Output: coldfront_source.id, coldfront_source.ts, coldfront_source.data
+                 Filter: (coldfront_source.ts >= 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
+   CTE coldfront_cold
      ->  Aggregate
-           Output: _cold_sink('public'::text, 'events'::text, to_jsonb(ROW(src_2.id, src_2.ts, src_2.data)))
-           ->  CTE Scan on src src_2
-                 Output: src_2.id, src_2.ts, src_2.data
-                 Filter: (src_2.ts < 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
+           Output: _cold_sink('public'::text, 'events'::text, to_jsonb(ROW(coldfront_source_1.id, coldfront_source_1.ts, coldfront_source_1.data)))
+           ->  CTE Scan on coldfront_source coldfront_source_1
+                 Output: coldfront_source_1.id, coldfront_source_1.ts, coldfront_source_1.data
+                 Filter: (coldfront_source_1.ts < 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
    InitPlan 4
      ->  Aggregate
            Output: count(*)
-           ->  CTE Scan on hot_ins
-                 Output: hot_ins."?column?"
+           ->  CTE Scan on coldfront_hot
+                 Output: coldfront_hot."?column?"
    InitPlan 5
-     ->  CTE Scan on cold_call
-           Output: cold_call.n
+     ->  CTE Scan on coldfront_cold
+           Output: coldfront_cold.n
 (30 rows)
 
 -- (A5) An aggregate nested inside an object builder: the added paren must land

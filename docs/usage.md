@@ -823,6 +823,11 @@ INSERT INTO events (ts, status, data) VALUES (...), (...), (...);
 INSERT INTO events (ts, status, data) SELECT ts, status, data FROM staging;
 INSERT INTO events (ts, status, data) SELECT now() + i*'1s'::interval, 'ok', '{}'
                                        FROM generate_series(1, 1000) i;
+-- A WITH clause works in both positions; a nested INSERT takes no RETURNING:
+WITH moved AS (DELETE FROM staging RETURNING ts, status, data)
+INSERT INTO events (ts, status, data) SELECT ts, status, data FROM moved;
+WITH i AS (INSERT INTO events (ts, status, data) VALUES (now(), 'ok', '{}'))
+SELECT 1;
 -- COPY FROM loads the same way, one INSERT per cold_write_batch_size rows:
 COPY events (ts, status, data) FROM '/path/to/events.csv' WITH (FORMAT csv);
 
@@ -960,6 +965,13 @@ Keep the following caveats in mind when running either mode:
   `GENERATED ALWAYS` identity column is kept, as `COPY` into a table keeps it.
   `COPY ... WHERE` and the `FREEZE`, `ON_ERROR`, `REJECT_LIMIT` and `DEFAULT`
   options are refused.
+- An `INSERT` nested in a `WITH` entry goes through the same rewrite. With a
+  watermark a row may go cold, so `RETURNING` on it is refused, as on a
+  top-level `INSERT`; a nested `UPDATE` or `DELETE` is not rewritten and fails
+  in PostgreSQL. A statement may write a tiered view once. On a decoupled view
+  the source runs in DuckDB, so a `WITH` entry that modifies data is refused
+  (DuckDB 1.5 has no data-modifying `WITH`), and a nested `INSERT` may not
+  read another `WITH` entry.
 - `TRUNCATE` on a registered relation, or on the hot table behind a tiered one,
   fails with an error, because the cold rows in Iceberg would stay visible
   through the view.

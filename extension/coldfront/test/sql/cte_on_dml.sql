@@ -31,6 +31,22 @@ EXPLAIN (COSTS OFF, VERBOSE)
   DELETE FROM public.events
   WHERE ts < '2026-01-01 00:00:00+00' AND id < (SELECT n FROM lim);
 
+-- A WITH entry that modifies data cannot reach the cold tier: DuckDB runs the
+-- statement there and has no data-modifying WITH, so a cold write is refused,
+-- and so is a dual-tier one, whose cold half runs there too.
+CREATE TABLE public.staging (id int);
+WITH gone AS (DELETE FROM public.staging RETURNING id)
+DELETE FROM public.events
+WHERE ts < '2026-01-01 00:00:00+00' AND id IN (SELECT id FROM gone);
+WITH gone AS (DELETE FROM public.staging RETURNING id)
+UPDATE public.events SET status = 'gone' WHERE id IN (SELECT id FROM gone);
+DROP TABLE public.staging;
+-- The refusal stands in for DuckDB 1.5.4's parser, which takes only a SELECT
+-- as a WITH entry's body. DuckDB 2.0 runs a data-modifying entry, so this
+-- statement stops failing when the pin moves, and reject_cold_modifying_cte
+-- (coldfront.c) is then revisited.
+SELECT duckdb.raw_query('WITH gone AS (DELETE FROM nowhere RETURNING id) SELECT id FROM gone');
+
 -- Cleanup.
 DELETE FROM coldfront.tiered_views;
 DELETE FROM coldfront.archive_watermark;

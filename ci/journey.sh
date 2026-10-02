@@ -410,10 +410,16 @@ COPY iceonly (id, ts, status, data) FROM stdin WITH (FORMAT csv);
 21,2026-01-01 10:00:01+00,copied,{}
 \.
 SELECT 'COPIED:'||count(*) FROM iceonly WHERE status='copied';
+WITH i AS (INSERT INTO iceonly VALUES (30,date_trunc('month',now()) + interval '10 hours 2 minutes 0 seconds','nested','{}')) SELECT 1;
+SELECT 'NESTED:'||count(*) FROM iceonly WHERE status='nested';
 EOSQL
 )
     assert_eq "decoupled INSERT + read (2 rows)"        "2"    "$(extract CNT "$O")"
     assert_eq "decoupled COPY FROM lands through the hook (2 rows)" "2" "$(extract COPIED "$O")"
+    assert_eq "decoupled INSERT nested in WITH lands through the hook" "1" "$(extract NESTED "$O")"
+    # The source runs in DuckDB, which cannot run the write a WITH entry holds.
+    assert_err "decoupled INSERT refuses a leading WITH that modifies data" "data-modifying WITH" \
+        "$(q_may "$HOST" "CREATE TABLE iceonly_staging (id int, ts timestamptz, status text, data jsonb); WITH gone AS (DELETE FROM iceonly_staging RETURNING id, ts, status, data) INSERT INTO iceonly (id, ts, status, data) SELECT id, ts, status, data FROM gone; DROP TABLE iceonly_staging;")"
     assert_eq "decoupled jsonb surfaces as json"        "json" "$(extract JSONTYPE "$O")"
     assert_eq "decoupled jsonb round-trip (data->>a)"   "1"    "$(extract JSON "$O")"
     assert_eq "decoupled multi-row INSERT (3 rows)"     "3"    "$(extract MULTI "$O")"
@@ -2360,8 +2366,7 @@ EOSQL
 
 # ───────────────────────────────────────────────────────────────────────────
 # TC-203: a tiered view has no INSTEAD OF INSERT trigger. The hook is the one
-# write path; a write that reaches the view any other way (an INSERT nested in
-# WITH) fails in PostgreSQL and lands nothing on either tier.
+# write path, and the extension has no builder for a trigger.
 # ───────────────────────────────────────────────────────────────────────────
 story_view_without_trigger() {
     step "TC-203: a tiered view has no INSTEAD OF INSERT trigger"
@@ -2369,13 +2374,6 @@ story_view_without_trigger() {
         "$(q "$HOST" "SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.events'::regclass AND NOT tgisinternal;")"
     assert_eq "TC-203: the extension has no trigger builder" "t" \
         "$(q "$HOST" "SELECT to_regproc('coldfront._rebuild_write_trigger') IS NULL;")"
-    local cold before after
-    cold=$(q "$HOST" "SELECT cutoff_time - interval '10 days' FROM coldfront.archive_watermark WHERE table_name = 'events';")
-    before=$(q "$HOST" "SELECT (SELECT count(*) FROM public._events) || '|' || (SELECT count(*) FROM events);" | tail -1)
-    assert_err "TC-203: an INSERT nested in WITH fails in PostgreSQL" "cannot insert into view" \
-        "$(q_may "$HOST" "WITH i AS (INSERT INTO events (ts, status, data) VALUES ('$cold', 'tc203_nested', '{}') RETURNING id) SELECT count(*) FROM i;")"
-    after=$(q "$HOST" "SELECT (SELECT count(*) FROM public._events) || '|' || (SELECT count(*) FROM events);" | tail -1)
-    assert_eq "TC-203: the write landed on neither tier" "$before" "$after"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -2450,6 +2448,72 @@ EOSQL
         "$(q_may "$HOST" "COPY events (ts, status, data) FROM '/tmp/tc205.csv' WITH (FORMAT csv) WHERE status = 'x';")"
     q "$HOST" "DELETE FROM events WHERE status LIKE 'tc205%';" >/dev/null 2>&1
     docker exec "$HOST" rm -f /tmp/tc205.csv
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# TC-206: an INSERT nested in WITH, and a leading WITH that modifies data, on a
+# tiered INSERT. The hook rewrites the nested INSERT in place and lifts the
+# rewrite's source and cold sink into the outer WITH list; a leading WITH's
+# entries open the rewritten statement, so the write one holds stays at the top
+# level where PostgreSQL requires it.
+# ───────────────────────────────────────────────────────────────────────────
+story_nested_insert() {
+    step "TC-206: an INSERT nested in WITH goes through the INSERT rewrite"
+    local cut O
+    cut=$(q "$HOST" "SELECT cutoff_time FROM coldfront.archive_watermark WHERE table_name = 'events';")
+    O=$(qf "$HOST" <<EOSQL
+WITH i AS (INSERT INTO events (ts, status, data) VALUES ('$cut'::timestamptz - interval '1 day', 'tc206_nested', '{}'), ('$cut'::timestamptz + interval '1 day', 'tc206_nested', '{}'))
+SELECT 'OUTER:' || 1;
+SELECT 'HOT:' || count(*) FROM public._events WHERE status = 'tc206_nested';
+SELECT 'COLD:' || count(*) FROM events WHERE status = 'tc206_nested' AND ts < '$cut';
+EOSQL
+)
+    assert_eq "TC-206: the outer statement ran" "1" "$(extract OUTER "$O")"
+    assert_eq "TC-206: the nested INSERT's hot row landed in the hot table" "1" "$(extract HOT "$O")"
+    assert_eq "TC-206: its cold row landed cold" "1" "$(extract COLD "$O")"
+    # The nested INSERT reads an entry before it, which the outer statement reads too.
+    O=$(qf "$HOST" <<EOSQL
+WITH a AS (SELECT '$cut'::timestamptz - i * interval '1 day' AS ts, 'tc206_cte' AS status, '{}'::jsonb AS data FROM generate_series(1, 3) i),
+     i AS (INSERT INTO events (ts, status, data) SELECT ts, status, data FROM a)
+SELECT 'READ:' || count(*) FROM a;
+SELECT 'CTE:' || count(*) || '|' || count(DISTINCT id) FROM events WHERE status = 'tc206_cte';
+EOSQL
+)
+    assert_eq "TC-206: the outer statement read the entry the nested INSERT read" "3" "$(extract READ "$O")"
+    assert_eq "TC-206: three cold rows landed once each, with distinct ids" "3|3" "$(extract CTE "$O")"
+    # A leading WITH that modifies data: a DELETE's rows move from a staging table to both tiers.
+    O=$(qf "$HOST" <<EOSQL
+CREATE TABLE tc206_staging (ts timestamptz, status text, data jsonb);
+INSERT INTO tc206_staging VALUES ('$cut'::timestamptz - interval '2 days', 'tc206_moved', '{}'), ('$cut'::timestamptz + interval '2 days', 'tc206_moved', '{}');
+WITH moved AS (DELETE FROM tc206_staging RETURNING ts, status, data)
+INSERT INTO events (ts, status, data) SELECT ts, status, data FROM moved;
+SELECT 'LEFT:' || count(*) FROM tc206_staging;
+SELECT 'MOVED:' || (SELECT count(*) FROM public._events WHERE status = 'tc206_moved') || '|' || (SELECT count(*) FROM events WHERE status = 'tc206_moved' AND ts < '$cut');
+DROP TABLE tc206_staging;
+EOSQL
+)
+    assert_eq "TC-206: the DELETE in WITH emptied the staging table" "0" "$(extract LEFT "$O")"
+    assert_eq "TC-206: its rows landed on both tiers" "1|1" "$(extract MOVED "$O")"
+    # A bound parameter inside the nested INSERT binds.
+    O=$(qf "$HOST" <<EOSQL
+PREPARE tc206(text) AS WITH i AS (INSERT INTO events (ts, status, data) VALUES ('$cut'::timestamptz - interval '3 days', \$1, '{}')) SELECT 1;
+EXECUTE tc206('tc206_param');
+SELECT 'PARAM:' || count(*) FROM events WHERE status = 'tc206_param' AND ts < '$cut';
+EOSQL
+)
+    assert_eq "TC-206: a parameter in the nested INSERT landed cold" "1" "$(extract PARAM "$O")"
+    qf "$HOST" <<EOSQL >/dev/null 2>&1
+BEGIN;
+WITH i AS (INSERT INTO events (ts, status, data) VALUES ('$cut'::timestamptz - interval '1 day', 'tc206_rb', '{}'), ('$cut'::timestamptz + interval '1 day', 'tc206_rb', '{}')) SELECT 1;
+ROLLBACK;
+EOSQL
+    assert_eq "TC-206: ROLLBACK undid the nested INSERT on both tiers" "0" "$(q "$HOST" "SELECT count(*) FROM events WHERE status = 'tc206_rb';" | tail -1)"
+    assert_err "TC-206: RETURNING is refused when a row may go cold" "cold tier" \
+        "$(q_may "$HOST" "WITH i AS (INSERT INTO events (ts, status, data) VALUES ('$cut'::timestamptz - interval '1 day', 'tc206_ret', '{}') RETURNING id) SELECT id FROM i;")"
+    # A nested UPDATE or DELETE is not rewritten, and the view refuses it.
+    assert_err "TC-206: a nested DELETE stays PostgreSQL's business" "cannot delete from view" \
+        "$(q_may "$HOST" "WITH d AS (DELETE FROM events WHERE status = 'tc206_nested' RETURNING id) SELECT count(*) FROM d;")"
+    q "$HOST" "DELETE FROM events WHERE status LIKE 'tc206%';" >/dev/null 2>&1
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -6297,6 +6361,7 @@ if [ "$MODE" = "tiered" ]; then
     story_view_without_trigger
     story_preload_required
     story_copy_into_view
+    story_nested_insert
     story_coexist
     story_cold_retention
     story_tiered_twolevel

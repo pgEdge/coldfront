@@ -27,7 +27,9 @@
  * every row is hot. Iceberg-only views short-circuit INSERT to the cold path.
  * The view has no INSTEAD OF trigger: the INSERT is rewritten off the view
  * (cf_reparse_and_replace) before the rewriter sees it, and a write the hook
- * does not rewrite fails in PostgreSQL.
+ * does not rewrite fails in PostgreSQL. An INSERT nested in a WITH entry is
+ * rewritten in place, with the rewrite's own WITH entries lifted into the
+ * statement's list (cf_splice_nested_insert).
  *
  * ATTACH requirement: the DuckDB 'ice' catalog alias must be attached in the
  * current session before cold DML fires.  The hook calls
@@ -1276,68 +1278,57 @@ find_dml_prefix(const char *orig_sql, const char *search_unqual,
     return NULL; /* unreachable */
 }
 
+/* pg_get_querydef's text on one line: newlines and tabs become spaces, and the
+ * leading indent goes. */
+static char *
+deparse_flat(Query *query)
+{
+    char *sql = pg_get_querydef(query, false), *p;
+
+    for (p = sql; *p; p++)
+        if (*p == '\n' || *p == '\t') *p = ' ';
+    while (*sql == ' ')
+        sql++;
+    return sql;
+}
+
+/* The two spellings pg_get_querydef can give the statement's verb and result
+ * relation, unqualified and schema-qualified. It quotes mixed-case and reserved
+ * identifiers, and quote_identifier returns a plain name unchanged. */
+static void
+dml_search_strings(Query *query, char *unqual, char *qual, size_t len,
+                   const char **verb)
+{
+    RangeTblEntry *rte = rt_fetch(query->resultRelation, query->rtable);
+    const char    *q_vname = quote_identifier(get_rel_name(rte->relid));
+    const char    *q_ns = quote_identifier(get_namespace_name(get_rel_namespace(rte->relid)));
+
+    *verb = query->commandType == CMD_UPDATE ? "UPDATE " :
+            query->commandType == CMD_DELETE ? "DELETE FROM " : "INSERT INTO ";
+    snprintf(unqual, len, "%s%s ", *verb, q_vname);
+    snprintf(qual, len, "%s%s.%s ", *verb, q_ns, q_vname);
+}
+
 static void
 deparse_and_find_prefix(Query *query, DeparseResult *dr)
 {
-    RangeTblEntry *rte;
-    char          *vname, *ns;
-    char           search_unqual[256], search_qual[256];
-    const char    *matched, *at;
+    char        search_unqual[256], search_qual[256];
+    const char *matched, *at;
 
-    dr->orig_sql = pg_get_querydef(query, false);
-    {
-        char *p;
-        for (p = dr->orig_sql; *p; p++)
-            if (*p == '\n' || *p == '\t') *p = ' ';
-    }
-    while (*dr->orig_sql == ' ')
-        dr->orig_sql++;
-
-    rte   = (RangeTblEntry *) list_nth(query->rtable, query->resultRelation - 1);
-    vname = get_rel_name(rte->relid);
-    ns    = get_namespace_name(get_rel_namespace(rte->relid));
-
-    /*
-     * pg_get_querydef quotes mixed-case / reserved identifiers; the search
-     * prefix must match. quote_identifier returns the input unchanged when
-     * no quoting is needed.
-     */
-    {
-        const char *q_vname = quote_identifier(vname);
-        const char *q_ns    = quote_identifier(ns);
-
-        if (query->commandType == CMD_UPDATE)
-        {
-            snprintf(search_unqual, sizeof(search_unqual), "UPDATE %s ",    q_vname);
-            snprintf(search_qual,   sizeof(search_qual),   "UPDATE %s.%s ", q_ns, q_vname);
-            dr->verb = "UPDATE ";
-        }
-        else if (query->commandType == CMD_DELETE)
-        {
-            snprintf(search_unqual, sizeof(search_unqual), "DELETE FROM %s ",    q_vname);
-            snprintf(search_qual,   sizeof(search_qual),   "DELETE FROM %s.%s ", q_ns, q_vname);
-            dr->verb = "DELETE FROM ";
-        }
-        else /* CMD_INSERT */
-        {
-            snprintf(search_unqual, sizeof(search_unqual), "INSERT INTO %s ",    q_vname);
-            snprintf(search_qual,   sizeof(search_qual),   "INSERT INTO %s.%s ", q_ns, q_vname);
-            dr->verb = "INSERT INTO ";
-        }
-    }
-
-    at = find_dml_prefix(dr->orig_sql, search_unqual, search_qual, vname, &matched);
-
+    dr->orig_sql = deparse_flat(query);
+    dml_search_strings(query, search_unqual, search_qual, sizeof(search_unqual), &dr->verb);
+    at = find_dml_prefix(dr->orig_sql, search_unqual, search_qual,
+                         get_rel_name(rt_fetch(query->resultRelation, query->rtable)->relid),
+                         &matched);
     dr->head_len = (size_t) (at - dr->orig_sql);
     dr->rest     = at + strlen(matched); /* nosemgrep */
 }
 
 /*
  * Prepend the statement's leading WITH clause (dr->head_len bytes, before the
- * verb) to a row source. Emitters that wrap the source in a parenthesised
- * derived table need this: that subquery is the only scope the CTEs are
- * visible from, on either engine. Returns source unchanged when there is no
- * leading clause.
+ * verb) to a row source. The decoupled INSERT ships its source to DuckDB inside
+ * a parenthesised derived table, the only scope its CTEs are visible from
+ * there. Returns source unchanged when there is no leading clause.
  */
 static const char *
 fold_leading_with(const DeparseResult *dr, const char *source)
@@ -2284,7 +2275,7 @@ build_cold_projection(Query *query, const HotColumns *hc)
             (!in_target || query->override == OVERRIDING_USER_VALUE))
             expr = psprintf("nextval(%s::regclass)", quote_literal_cstr(hc->seq[i]));
         else if (in_target)
-            expr = psprintf("src.%s", quote_identifier(hc->name[i]));
+            expr = psprintf("coldfront_source.%s", quote_identifier(hc->name[i]));
         else if (hc->dflt[i] != NULL)
             expr = psprintf("(%s)", hc->dflt[i]);
         else
@@ -2307,7 +2298,7 @@ build_tiered_hot_dml(const char *hot_table, const char *col_list,
                      const char *override, const char *partition_col,
                      const char *cutoff_lit)
 {
-    return psprintf("INSERT INTO %s (%s) %sSELECT %s FROM src WHERE %s >= %s",
+    return psprintf("INSERT INTO %s (%s) %sSELECT %s FROM coldfront_source WHERE %s >= %s",
                     hot_table, col_list, override, col_list,
                     quote_identifier(partition_col), cutoff_lit);
 }
@@ -2320,7 +2311,7 @@ build_cold_sink_select(const char *vschema, const char *vname,
                        const char *cutoff_lit)
 {
     return psprintf("SELECT coldfront._cold_sink(%s, %s, to_jsonb(r)) AS n "
-                    "FROM (SELECT %s FROM src WHERE src.%s < %s) AS r",
+                    "FROM (SELECT %s FROM coldfront_source WHERE coldfront_source.%s < %s) AS r",
                     quote_literal_cstr(vschema), quote_literal_cstr(vname),
                     projection, quote_identifier(partition_col), cutoff_lit);
 }
@@ -2344,28 +2335,45 @@ skip_override_clause(const char *rest, OverridingKind override)
 }
 
 /*
- * Wrap the source CTE, the hot INSERT and the cold sink into one statement.
+ * Wrap the source CTE, the hot INSERT and the cold sink into one statement,
+ * behind the statement's own WITH entries (dr->head_len bytes), which stay at
+ * the top level: PostgreSQL allows an entry that modifies data nowhere else.
  *
  * At top level the hot INSERT and the sink are CTEs and the statement reports
- * (hot_rows, cold_rows). In plpgsql the hot INSERT is the OUTER statement, the
- * DML tag plpgsql accepts, and the sink rides in a data-modifying CTE
- * (cold_anchor_update) that always runs to completion; the sink's count is
- * never NULL, so the anchor updates no row.
+ * (hot_rows, cold_rows). In plpgsql, and for an INSERT nested in WITH, the hot
+ * INSERT is the statement itself (the DML tag plpgsql accepts, and the body
+ * the WITH entry keeps once cf_splice_nested_insert lifts the rest out), and
+ * the sink rides in a data-modifying CTE (cold_anchor_update) that always runs
+ * to completion; the sink's count is never NULL, so the anchor updates no row.
  */
 static char *
-wrap_tiered_result(bool in_plpgsql, const char *src_cte, const char *hot_dml,
-                   const char *cold_select)
+wrap_tiered_result(bool in_plpgsql, const DeparseResult *dr, const char *src_cte,
+                   const char *hot_dml, const char *cold_select)
 {
+    StringInfoData buf;
+
+    initStringInfo(&buf);
+    if (dr->head_len > 0)
+    {
+        appendBinaryStringInfo(&buf, dr->orig_sql, dr->head_len);
+        while (buf.len > 0 && buf.data[buf.len - 1] == ' ')
+            buf.len--;
+        buf.data[buf.len] = '\0';
+        appendStringInfoString(&buf, ", ");
+    }
+    else
+        appendStringInfoString(&buf, "WITH ");
+    appendStringInfo(&buf, "coldfront_source AS MATERIALIZED (%s), ", src_cte);
     if (in_plpgsql)
-        return psprintf("WITH src AS MATERIALIZED (%s), cold_call AS (%s) %s",
-                        src_cte, cold_anchor_update(psprintf("(%s)", cold_select)),
-                        hot_dml);
-    return psprintf("WITH src AS MATERIALIZED (%s), "
-                    "hot_ins AS MATERIALIZED (%s RETURNING 1), "
-                    "cold_call AS MATERIALIZED (%s) "
-                    "SELECT (SELECT count(*) FROM hot_ins) AS hot_rows, "
-                    "       (SELECT n FROM cold_call) AS cold_rows",
-                    src_cte, hot_dml, cold_select);
+        appendStringInfo(&buf, "coldfront_cold AS (%s) %s",
+                         cold_anchor_update(psprintf("(%s)", cold_select)), hot_dml);
+    else
+        appendStringInfo(&buf, "coldfront_hot AS MATERIALIZED (%s RETURNING 1), "
+                         "coldfront_cold AS MATERIALIZED (%s) "
+                         "SELECT (SELECT count(*) FROM coldfront_hot) AS hot_rows, "
+                         "       (SELECT n FROM coldfront_cold) AS cold_rows",
+                         hot_dml, cold_select);
+    return buf.data;
 }
 
 /*
@@ -2373,12 +2381,16 @@ wrap_tiered_result(bool in_plpgsql, const char *src_cte, const char *hot_dml,
  * reads the source once and splits that result by the partition column
  * against the watermark:
  *
- *   WITH src AS MATERIALIZED (<source, each column cast to its hot type>),
- *        hot_ins AS MATERIALIZED (INSERT INTO <hot> (cols) SELECT cols FROM src
- *                                 WHERE <partcol> >= <cutoff> RETURNING 1),
- *        cold_call AS MATERIALIZED (SELECT coldfront._cold_sink(schema, view,
- *                                   to_jsonb(r)) FROM (<every hot column FROM
- *                                   src WHERE <partcol> < <cutoff>>) AS r)
+ *   WITH <the INSERT's own WITH entries, if any>,
+ *        coldfront_source AS MATERIALIZED (<source, each column cast to its
+ *                                          hot type>),
+ *        coldfront_hot AS MATERIALIZED (INSERT INTO <hot> (cols) SELECT cols
+ *                                       FROM coldfront_source
+ *                                       WHERE <partcol> >= <cutoff> RETURNING 1),
+ *        coldfront_cold AS MATERIALIZED (SELECT coldfront._cold_sink(schema,
+ *                                        view, to_jsonb(r)) FROM (<every hot
+ *                                        column FROM coldfront_source WHERE
+ *                                        <partcol> < <cutoff>>) AS r)
  *   SELECT hot_rows, cold_rows
  *
  * The hot half is plain PG: set-based, IDENTITY and DEFAULT fill server-side.
@@ -2406,8 +2418,7 @@ emit_tiered_insert(Query *query, TieredViewInfo *info, bool in_plpgsql)
     query->returningList = saved_returning;
 
     col_list   = insert_targetlist_collist(query);
-    source     = fold_leading_with(&dr, skip_override_clause(skip_leading_collist(dr.rest),
-                                                            query->override));
+    source     = skip_override_clause(skip_leading_collist(dr.rest), query->override);
     cutoff_lit = format_timestamptz_literal(info->cutoff);
     override   = query->override == OVERRIDING_SYSTEM_VALUE ? "OVERRIDING SYSTEM VALUE " :
                  query->override == OVERRIDING_USER_VALUE   ? "OVERRIDING USER VALUE "   : "";
@@ -2426,7 +2437,7 @@ emit_tiered_insert(Query *query, TieredViewInfo *info, bool in_plpgsql)
     cold_select = build_cold_sink_select(vschema, vname,
                                          build_cold_projection(query, &hc),
                                          info->partition_col, cutoff_lit);
-    return wrap_tiered_result(in_plpgsql, src_cte, hot_dml, cold_select);
+    return wrap_tiered_result(in_plpgsql, &dr, src_cte, hot_dml, cold_select);
 }
 
 /*
@@ -2498,6 +2509,29 @@ reject_cold_returning(Query *query, const char *vname)
 }
 
 /*
+ * Refuse a WITH entry that modifies data on a write that runs in DuckDB. DuckDB
+ * 1.5.4 (the pinned build) has no data-modifying WITH: its parser takes only a
+ * SELECT as an entry's body. DuckDB 2.0 (branch v2.0-cyanoptera) runs INSERT,
+ * UPDATE and DELETE entries, so on it the WITH can ship whole, the entry's
+ * write running through the pglocal attachment on the terms a source table
+ * read has (committed rows, the attachment's role). That also needs
+ * duckdb-postgres to return the rows of such a write, which it refuses today
+ * ("RETURNING clause not yet supported", src/storage/postgres_delete.cpp).
+ * pg_regress cte_on_dml sends such a WITH to DuckDB directly and fails once
+ * the pin accepts it.
+ */
+static void
+reject_cold_modifying_cte(Query *query, const char *vname)
+{
+    if (query->hasModifyingCTE)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("a cold-tier write on \"%s\" cannot use a data-modifying WITH query", vname),
+                 errdetail("The cold tier runs the statement in DuckDB, where a WITH query must be a SELECT."),
+                 errhint("Run the WITH query's write as a separate statement.")));
+}
+
+/*
  * Build the rewritten SQL for a tiered-view INSERT (bulk split-by-watermark).
  * Tiered without a watermark yet (no archive run): everything is hot; emit a
  * plain hot INSERT. With a watermark, some rows go cold (cannot RETURN them).
@@ -2521,6 +2555,7 @@ cf_emit_cold_path(Query *query, TieredViewInfo *info, ColdParamSet *ps,
                   bool in_plpgsql, const char *vname)
 {
     reject_cold_returning(query, vname);
+    reject_cold_modifying_cte(query, vname);
     ensure_ice_attached_once();
     /* INSERT … SELECT FROM pg_source needs pglocal. Walk the
      * rtable; if any non-result RTE_RELATION is present, the
@@ -2559,6 +2594,7 @@ cf_emit_dual_path(Query *query, TieredViewInfo *info, ColdParamSet *ps,
     /* A dual-tier rewrite returns only hot rows; refuse RETURNING rather
      * than silently return a partial result set. */
     reject_cold_returning(query, vname);
+    reject_cold_modifying_cte(query, vname);
 
     /* Permissive: clear pg_duckdb's mixed-write guard for this
      * transaction (GUC_ACTION_LOCAL resets it at tx end) and emit
@@ -3032,6 +3068,20 @@ cf_maybe_attach_for_read(Query *query)
     cf_normalize_read(query);
 }
 
+/* True when the DML `query` writes a registered tiered view; *rte and *info
+ * describe it. */
+static bool
+cf_dml_target_view(Query *query, RangeTblEntry **rte, TieredViewInfo *info)
+{
+    if (query->resultRelation == 0)
+        return false;
+    *rte = rt_fetch(query->resultRelation, query->rtable);
+    if ((*rte)->rtekind != RTE_RELATION ||
+        get_rel_relkind((*rte)->relid) != RELKIND_VIEW)
+        return false;
+    return lookup_tiered_view((*rte)->relid, get_rel_name((*rte)->relid), info);
+}
+
 /*
  * Resolve the DML target: decide whether `query` is an INSERT/UPDATE/DELETE on
  * a registered tiered view that this hook should rewrite. On the read path
@@ -3054,20 +3104,178 @@ cf_resolve_tiered_dml_target(Query *query, RangeTblEntry **rte,
         return false;
     }
 
-    if (query->resultRelation == 0)
-        return false;
+    return cf_dml_target_view(query, rte, info);
+}
 
-    *rte = (RangeTblEntry *) list_nth(query->rtable, query->resultRelation - 1);
-    if ((*rte)->rtekind != RTE_RELATION)
-        return false;
-    if (get_rel_relkind((*rte)->relid) != RELKIND_VIEW)
-        return false;
+/*
+ * The first WITH entry of `query` that is an INSERT into a registered tiered
+ * view, or NULL; *nwrites counts them all. Only a top-level statement can hold
+ * one (parse_cte.c), and parse_sub_analyze runs no post_parse_analyze_hook for
+ * it, so the hook meets it here, inside the statement that holds it.
+ */
+static CommonTableExpr *
+cf_find_nested_insert(Query *query, RangeTblEntry **rte, TieredViewInfo *info,
+                      int *nwrites)
+{
+    CommonTableExpr *found = NULL;
+    ListCell        *lc;
 
-    /* Check the catalog — only rewrite registered tiered views */
-    if (!lookup_tiered_view((*rte)->relid, get_rel_name((*rte)->relid), info))
-        return false;
+    *nwrites = 0;
+    foreach(lc, query->cteList)
+    {
+        CommonTableExpr *cte = (CommonTableExpr *) lfirst(lc);
+        Query           *q = (Query *) cte->ctequery;
+        RangeTblEntry   *r;
+        TieredViewInfo   i;
 
-    return true;
+        if (q->commandType != CMD_INSERT || !cf_dml_target_view(q, &r, &i))
+            continue;
+        if (found == NULL)
+        {
+            found = cte;
+            *rte = r;
+            *info = i;
+        }
+        (*nwrites)++;
+    }
+    return found;
+}
+
+/*
+ * Skip a quoted run ('…' or "…", a doubled quote included) or a balanced
+ * parenthesised run, quoted runs inside it included; p is at its first byte.
+ * The deparser never escapes a quote with a backslash, so quotes come in pairs.
+ */
+static const char *
+skip_quoted_or_parens(const char *p)
+{
+    char q = *p;
+    int  depth = 0;
+
+    if (q == '\'' || q == '"')
+    {
+        for (p++; *p; p++)
+            if (*p == q && *++p != q)
+                return p;
+        return p;
+    }
+    for (; *p; p++)
+    {
+        if (*p == '\'' || *p == '"')
+            p = skip_quoted_or_parens(p) - 1;
+        else if (*p == '(')
+            depth++;
+        else if (*p == ')' && --depth == 0)
+            return p + 1;
+    }
+    return p;
+}
+
+/* The start of the WITH entry whose body opens at `open`: past the last
+ * top-level comma before it, or past the WITH keyword. */
+static const char *
+with_entry_start(const char *sql, const char *open)
+{
+    const char *p = sql, *start = NULL;
+
+    while (p < open)
+    {
+        if (*p == '\'' || *p == '"' || *p == '(')
+        {
+            p = skip_quoted_or_parens(p);
+            continue;
+        }
+        if (*p == ',')
+            start = p + 1;
+        p++;
+    }
+    if (start == NULL)
+        start = sql + (strncmp(sql, "WITH RECURSIVE ", 15) == 0 ? 15 : 5);
+    while (*start == ' ')
+        start++;
+    return start;
+}
+
+/*
+ * Splice the rewrite of an INSERT nested in a WITH entry into the statement
+ * that holds it. The rewrite is a DML statement, possibly behind WITH entries
+ * of its own (the source, the cold sink, any the INSERT had): the DML becomes
+ * the entry's new body, and those entries are lifted into the outer WITH list
+ * just before it, after everything the INSERT's source may read, where a
+ * data-modifying entry is legal. The entry is found in the deparsed statement
+ * at its INSERT INTO <view>, the only one (a second write to a tiered view is
+ * refused before this), and its body is the parenthesised run around it.
+ */
+static char *
+cf_splice_nested_insert(Query *query, Query *inner, RangeTblEntry *rte,
+                        TieredViewInfo *info, const char *rewritten)
+{
+    const char     *outer_sql = deparse_flat(query);
+    const char     *vname = get_rel_name(rte->relid);
+    char            search_unqual[256], search_qual[256];
+    const char     *verb, *matched, *at, *open, *close, *start;
+    const char     *lifted = NULL, *body = rewritten;
+    StringInfoData  buf;
+
+    if (strncmp(rewritten, "WITH ", 5) == 0)
+    {
+        char   *hot_verb = psprintf("INSERT INTO %s ", info->hot_table);
+        size_t  skip = strncmp(rewritten, "WITH RECURSIVE ", 15) == 0 ? 15 : 5, len;
+
+        if (skip == 15 && !query->hasRecursive)
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("an INSERT nested in WITH on tiered view \"%s\" cannot have a recursive WITH of its own", vname),
+                     errhint("Make the outer WITH recursive, or run the INSERT as its own statement.")));
+        body = find_dml_prefix(rewritten, hot_verb, hot_verb, vname, &matched);
+        len  = (size_t) (body - rewritten) - skip;
+        while (len > 0 && rewritten[skip + len - 1] == ' ')
+            len--;
+        lifted = pnstrdup(rewritten + skip, len);
+    }
+
+    dml_search_strings(inner, search_unqual, search_qual, sizeof(search_unqual), &verb);
+    at = find_dml_prefix(outer_sql, search_unqual, search_qual, vname, &matched);
+    for (open = at; open > outer_sql && open[-1] == ' '; open--)
+        ;
+    if (open == outer_sql || *--open != '(')
+        elog(ERROR, "coldfront: cannot locate the WITH entry of the nested INSERT in: %s",
+             outer_sql);
+    close = skip_quoted_or_parens(open);      /* past the entry's ')' */
+    start = with_entry_start(outer_sql, open);
+
+    initStringInfo(&buf);
+    appendBinaryStringInfo(&buf, outer_sql, start - outer_sql);
+    if (lifted != NULL)
+        appendStringInfo(&buf, "%s, ", lifted);
+    appendBinaryStringInfo(&buf, start, open + 1 - start);   /* <name> AS ( */
+    appendStringInfoString(&buf, body);
+    appendStringInfoString(&buf, close - 1);                 /* ) and the rest */
+    return buf.data;
+}
+
+/* True when the query reads a WITH entry it does not define itself. */
+static bool
+reads_outer_cte_walker(Node *node, void *ctx)
+{
+    if (node == NULL)
+        return false;
+    if (IsA(node, RangeTblEntry))
+    {
+        RangeTblEntry *rte = (RangeTblEntry *) node;
+        ListCell      *lc;
+
+        if (rte->rtekind != RTE_CTE)
+            return false;
+        foreach(lc, (List *) ctx)
+            if (strcmp(((CommonTableExpr *) lfirst(lc))->ctename, rte->ctename) == 0)
+                return false;
+        return true;
+    }
+    if (IsA(node, Query))
+        return query_tree_walker((Query *) node, reads_outer_cte_walker, ctx,
+                                 QTW_EXAMINE_RTES_BEFORE);
+    return expression_tree_walker(node, reads_outer_cte_walker, ctx);
 }
 
 /*
@@ -3516,12 +3724,15 @@ static void
 coldfront_post_parse_analyze(ParseState *pstate, Query *query,
                               JumbleState *jstate)
 {
-    TieredViewInfo  info;
-    char           *new_sql;
-    RangeTblEntry  *rte;
-    ColdParamSet    ps;
-    bool            in_plpgsql;
-    const char     *vname;
+    TieredViewInfo   info, nested_info;
+    char            *new_sql;
+    RangeTblEntry   *rte, *nested_rte;
+    ColdParamSet     ps;
+    bool             in_plpgsql, top;
+    const char      *vname;
+    CommonTableExpr *cte;
+    Query           *inner = query;
+    int              nwrites;
 
     /* Chain to any previous hook first */
     if (prev_post_parse_analyze_hook)
@@ -3538,8 +3749,26 @@ coldfront_post_parse_analyze(ParseState *pstate, Query *query,
     if (!coldfront_registry_present())
         return;
 
-    if (!cf_resolve_tiered_dml_target(query, &rte, &info))
+    /* The statement itself, or one INSERT nested in its WITH, writes a tiered
+     * view. The rewrite stands in for one write: a second one would stay in the
+     * statement unrewritten, so it is refused. */
+    top = cf_resolve_tiered_dml_target(query, &rte, &info);
+    cte = cf_find_nested_insert(query, &nested_rte, &nested_info, &nwrites);
+    if (!top && cte == NULL)
         return;
+    if (nwrites + (top ? 1 : 0) > 1)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("a statement may write a tiered view only once"),
+                 errhint("Split the writes into separate statements.")));
+    if (top)
+        cte = NULL;
+    else
+    {
+        rte   = nested_rte;
+        info  = nested_info;
+        inner = (Query *) cte->ctequery;
+    }
 
     vname = get_rel_name(rte->relid);
 
@@ -3553,18 +3782,32 @@ coldfront_post_parse_analyze(ParseState *pstate, Query *query,
                         get_namespace_name(get_rel_namespace(rte->relid)), vname),
                  errhint("Release it with coldfront.release_iceberg_table() and adopt again with p_writable => true to arm INSERT/UPDATE/DELETE.")));
 
+    /* A decoupled INSERT runs its source in DuckDB, which does not see the
+     * statement's WITH entries, so a nested one may not read them. */
+    if (cte != NULL && info.is_iceberg_only &&
+        query_tree_walker(inner, reads_outer_cte_walker, (void *) inner->cteList,
+                          QTW_EXAMINE_RTES_BEFORE))
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("an INSERT nested in WITH on decoupled view \"%s\" cannot read another WITH entry", vname),
+                 errdetail("Its source runs in DuckDB, which does not see the statement's WITH entries."),
+                 errhint("Run the INSERT as its own statement.")));
+
     /* Bound params ($N) from a plpgsql / DO / PREPARE / extended-protocol
-     * caller, collected once (Cause 1). in_plpgsql gates the Cause-2
-     * statement shape — plpgsql installs p_post_columnref_hook on the
-     * ParseState; top-level (even parameterized) does not. See the
-     * architecture block at the top of this file and the
+     * caller, collected once over the whole statement (Cause 1). in_plpgsql
+     * gates the Cause-2 statement shape, a DML statement: plpgsql installs
+     * p_post_columnref_hook on the ParseState (top-level, even parameterized,
+     * does not), and a nested INSERT needs that shape for the body of its WITH
+     * entry. See the architecture block at the top of this file and the
      * coldfront._dummy_dml_target comment in coldfront--1.0.sql. */
     collect_cold_params(query, &ps);
-    in_plpgsql = (pstate->p_post_columnref_hook != NULL);
+    in_plpgsql = cte != NULL || pstate->p_post_columnref_hook != NULL;
 
-    new_sql = cf_dispatch_emit(query, rte, &info, &ps, in_plpgsql, vname);
+    new_sql = cf_dispatch_emit(inner, rte, &info, &ps, in_plpgsql, vname);
     if (new_sql == NULL)
         return;     /* unreachable default tier */
+    if (cte != NULL)
+        new_sql = cf_splice_nested_insert(query, inner, rte, &info, new_sql);
 
     /* Parse and analyze the rewritten SQL, guarded against re-entry */
     cf_reparse_and_replace(query, new_sql, &ps);

@@ -1,8 +1,6 @@
 -- A tiered view has no INSTEAD OF INSERT trigger. The post_parse_analyze hook
--- is the one write path: it rewrites a top-level INSERT off the view before the
--- rewriter runs, and a write that reaches the view any other way (an INSERT
--- nested in WITH) fails in PostgreSQL instead of landing rows that skipped the
--- hook.
+-- is the one write path: it rewrites an INSERT off the view before the rewriter
+-- runs, and there is no trigger for a write to land through otherwise.
 -- Suppress the run-order-dependent "already exists" NOTICE: in the shared
 -- regress db an earlier test may have created the extensions, standalone not.
 SET client_min_messages = warning;
@@ -41,11 +39,6 @@ SELECT to_regproc('coldfront._rebuild_write_trigger') IS NULL              AS no
 -- A hot INSERT through the hook lands with the heap's identity and default values.
 INSERT INTO public.events_v2 (ts) VALUES ('2026-04-01');
 SELECT id, status FROM public._events;
-
--- A write the hook does not rewrite fails in PostgreSQL, and nothing lands.
-WITH i AS (INSERT INTO public.events_v2 (ts, status) VALUES ('2026-01-01', 'nested') RETURNING id)
-SELECT count(*) FROM i;
-SELECT count(*) AS rows_after FROM public._events;
 
 -- Cleanup.
 DELETE FROM coldfront.tiered_views;
