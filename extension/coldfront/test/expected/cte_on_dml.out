@@ -61,9 +61,9 @@ DETAIL:  The cold tier runs the statement in DuckDB, where a WITH query must be 
 HINT:  Run the WITH query's write as a separate statement.
 DROP TABLE public.staging;
 -- The refusal stands in for DuckDB 1.5.4's parser, which takes only a SELECT
--- as a WITH entry's body. DuckDB 2.0 runs a data-modifying entry, so this
--- statement stops failing when the pin moves, and reject_cold_modifying_cte
--- (coldfront.c) is then revisited.
+-- as a WITH entry's body. DuckDB 2.0 runs a data-modifying entry, so once the
+-- pin moves this statement succeeds and the test fails: the cue to remove
+-- reject_cold_modifying_cte (coldfront.c).
 SELECT duckdb.raw_query('WITH gone AS (DELETE FROM nowhere RETURNING id) SELECT id FROM gone');
 ERROR:  (PGDuckDB/pgduckdb_raw_query_cpp) Parser Error: A CTE needs a SELECT
 -- An UPDATE or DELETE nested in a WITH entry. A hot one is a plain swap that

@@ -48,9 +48,9 @@ WITH gone AS (DELETE FROM public.staging RETURNING id)
 UPDATE public.events SET status = 'gone' WHERE id IN (SELECT id FROM gone);
 DROP TABLE public.staging;
 -- The refusal stands in for DuckDB 1.5.4's parser, which takes only a SELECT
--- as a WITH entry's body. DuckDB 2.0 runs a data-modifying entry, so this
--- statement stops failing when the pin moves, and reject_cold_modifying_cte
--- (coldfront.c) is then revisited.
+-- as a WITH entry's body. DuckDB 2.0 runs a data-modifying entry, so once the
+-- pin moves this statement succeeds and the test fails: the cue to remove
+-- reject_cold_modifying_cte (coldfront.c).
 SELECT duckdb.raw_query('WITH gone AS (DELETE FROM nowhere RETURNING id) SELECT id FROM gone');
 
 -- An UPDATE or DELETE nested in a WITH entry. A hot one is a plain swap that

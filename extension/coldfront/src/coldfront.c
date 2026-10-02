@@ -2567,7 +2567,7 @@ reject_cold_returning(Query *query, const char *vname)
  * UPDATE and DELETE entries, so on it the WITH can ship whole, the entry's
  * write running through the pglocal attachment on the terms a source table
  * read has (committed rows, the attachment's role). That also needs
- * duckdb-postgres to return the rows of such a write, which it refuses today
+ * duckdb-postgres to return the rows of such a write, which it refuses
  * ("RETURNING clause not yet supported", src/storage/postgres_delete.cpp).
  * pg_regress cte_on_dml sends such a WITH to DuckDB directly and fails once
  * the pin accepts it.
