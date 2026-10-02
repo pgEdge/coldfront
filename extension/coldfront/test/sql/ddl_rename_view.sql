@@ -1,6 +1,5 @@
--- RENAME of the transparent VIEW must migrate every name-keyed reference:
---   * coldfront.archive_watermark.table_name (the bare view name in its (schema, table) key)
---   * the regenerated INSERT trigger function/trigger names
+-- RENAME of the transparent VIEW must migrate its name-keyed reference,
+-- coldfront.archive_watermark.table_name (the bare view name in its (schema, table) key).
 -- Without the watermark migration the rebuilt view would silently lose its
 -- cold (Iceberg) UNION branch — the watermark lookup would miss, v_has_cutoff
 -- would be false, and only the hot branch would remain.
@@ -40,11 +39,6 @@ SELECT pg_get_viewdef('public.events_v2'::regclass) LIKE '%iceberg_scan%' AS has
 SELECT (schema_name = 'public' AND relname = 'events_v2') AS registry_points_at_new_view,
        hot_table, partition_col
   FROM coldfront.tiered_views;
-
--- The INSERT trigger was regenerated under the new view name.
-SELECT tgname FROM pg_trigger
- WHERE tgrelid = 'public.events_v2'::regclass AND NOT tgisinternal
- ORDER BY tgname;
 
 -- Cleanup.
 DELETE FROM coldfront.tiered_views;

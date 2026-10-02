@@ -93,9 +93,8 @@ SELECT coldfront._vec_probe_ids('public','docs','embedding', ARRAY[0.9,0.1,0]::r
  {0,1}           | {1}
 (1 row)
 
--- The write trigger, from its one builder, on a real two-vector hot table. This
--- is the bootstrap shape: registered, no watermark yet, so the trigger carries
--- the -infinity default and every insert routes hot until the first cutover.
+-- A registered two-vector hot table: the lookups by ref below read its registry
+-- row, and the per-row renderer at the end renders one of its rows.
 CREATE TABLE public._docs (
     id        bigint GENERATED ALWAYS AS IDENTITY,
     ts        timestamptz,
@@ -112,12 +111,6 @@ CREATE VIEW public.docs AS SELECT id, ts, body, body_len,
   FROM public._docs;
 INSERT INTO coldfront.tiered_views (schema_name, relname, hot_table, iceberg_table, partition_col, vec_columns)
 VALUES ('public', 'docs', 'public._docs', 'ice.default.docs', 'ts', ARRAY['embedding','summary']);
-SELECT coldfront._rebuild_write_trigger('public', 'docs');
- _rebuild_write_trigger 
-------------------------
- 
-(1 row)
-
 -- The C rewrite asks these two for a targeted decoupled INSERT; the same registry
 -- row answers both, in schema order.
 SELECT coldfront._vec_list_cols_for_ref('ice.default.docs') AS cluster_cols;
@@ -150,45 +143,18 @@ SELECT coldfront._vec_nearest_expr('temp.main.cf_gen c', 'embedding');
  (SELECT arg_min(c.centroid_id, list_cosine_distance(c.centroid, embedding)) FROM temp.main.cf_gen c)
 (1 row)
 
--- The trigger function is the contract. Both cluster expressions lead, each
--- pairing with its own column's value, in column order; the identity column and
--- the user-written generated column are positional NULLs the hot INSERT skips,
--- since neither accepts a supplied value; the watermark is read at fire time
--- with the bootstrap default.
--- Needles containing apostrophes are dollar-quoted: inside the trigger body the
--- cold-INSERT template is itself a quoted literal, so its own apostrophes arrive
--- doubled in the function definition.
-SELECT (length(def) - length(replace(def, 'arg_min', ''))) / length('arg_min') AS cluster_lookups,
-       (length(def) - length(replace(def, 'CAST(%L AS FLOAT[])', ''))) / length('CAST(%L AS FLOAT[])') AS float_placeholders,
-       strpos(def, '_cf_vec_list') = 0                                          AS positional_not_named,
-       strpos(def, $n$column_name = ''embedding''$n$) < strpos(def, $n$column_name = ''summary''$n$) AS expressions_in_column_order,
-       strpos(def, 'translate(NEW.embedding') < strpos(def, 'translate(NEW.summary') AS arguments_in_column_order,
-       strpos(def, 'translate(NEW.summary')   < strpos(def, ', NEW.ts')          AS arguments_lead_the_list,
-       strpos(def, 'VALUES (NULL') = 0                                          AS prefix_before_identity_null,
-       strpos(def, ', NULL, %L') > 0                                            AS identity_positional_null,
-       strpos(def, '%L, NULL, CAST(') > 0                                       AS generated_positional_null,
-       def LIKE '%FROM coldfront.archive_watermark%'                            AS watermark_read_at_fire_time,
-       def LIKE '%''-infinity''::timestamptz%'                                  AS bootstrap_default,
-       def LIKE '%INSERT INTO public._docs (ts, body, embedding, summary)%'     AS hot_insert_skips_generated
-  FROM pg_get_functiondef('coldfront.docs_write()'::regprocedure) AS d(def);
- cluster_lookups | float_placeholders | positional_not_named | expressions_in_column_order | arguments_in_column_order | arguments_lead_the_list | prefix_before_identity_null | identity_positional_null | generated_positional_null | watermark_read_at_fire_time | bootstrap_default | hot_insert_skips_generated 
------------------+--------------------+----------------------+-----------------------------+---------------------------+-------------------------+-----------------------------+--------------------------+---------------------------+-----------------------------+-------------------+----------------------------
-               2 |                  4 | t                    | t                           | t                         | t                       | t                           | t                        | t                         | t                           | t                 | t
-(1 row)
-
--- Idempotent: the archiver re-runs bootstrap every cycle against a view that
--- already carries the trigger.
-SELECT coldfront._rebuild_write_trigger('public', 'docs');
- _rebuild_write_trigger 
-------------------------
- 
-(1 row)
-
-SELECT count(*) AS triggers FROM pg_trigger
- WHERE tgrelid = 'public.docs'::regclass AND NOT tgisinternal;
- triggers 
-----------
-        1
+-- The one per-row renderer, shared by the cold sink and the cross-tier move, on
+-- a row of this table. Both cluster expressions lead, each derived from its own
+-- column's value, in column order; a column absent from the payload (the
+-- identity column here) keeps its positional slot as NULL.
+SELECT coldfront._cold_row_literal(
+    '{"ts": "2026-06-01 00:00:00+00", "body": "b", "body_len": 1, "embedding": "[0.9,0.1,0]", "summary": "[-1,1]"}'::jsonb,
+    ARRAY['id', 'ts', 'body', 'body_len', 'embedding', 'summary'],
+    ARRAY['bigint', 'timestamp with time zone', 'text', 'integer', 'vector(3)', 'vector(2)'],
+    'public', 'docs') AS two_vector_row;
+                                                                                                                                                                                                                                                                                                                                                                                                                                                           two_vector_row                                                                                                                                                                                                                                                                                                                                                                                                                                                           
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ (SELECT arg_min(c.centroid_id, list_cosine_distance(c.centroid, CAST('[0.9,0.1,0]' AS FLOAT[]))) FROM pglocal.coldfront.vector_centroids c WHERE c.schema_name = 'public' AND c.table_name = 'docs' AND c.column_name = 'embedding' AND c.generation = (SELECT vc.generation FROM pglocal.coldfront.vector_config vc WHERE vc.schema_name = 'public' AND vc.table_name = 'docs' AND vc.column_name = 'embedding')), (SELECT arg_min(c.centroid_id, list_cosine_distance(c.centroid, CAST('[-1,1]' AS FLOAT[]))) FROM pglocal.coldfront.vector_centroids c WHERE c.schema_name = 'public' AND c.table_name = 'docs' AND c.column_name = 'summary' AND c.generation = (SELECT vc.generation FROM pglocal.coldfront.vector_config vc WHERE vc.schema_name = 'public' AND vc.table_name = 'docs' AND vc.column_name = 'summary')), NULL, '2026-06-01 00:00:00+00', 'b', '1', CAST('[0.9,0.1,0]' AS FLOAT[]), CAST('[-1,1]' AS FLOAT[])
 (1 row)
 
 -- Cleanup. Unregister before dropping: the DDL hook blocks DROP of a registered
@@ -198,4 +164,3 @@ DELETE FROM coldfront.vector_centroids WHERE table_name = 'docs';
 DELETE FROM coldfront.vector_config    WHERE table_name = 'docs';
 DROP VIEW public.docs;
 DROP TABLE public._docs;
-DROP FUNCTION coldfront.docs_write();

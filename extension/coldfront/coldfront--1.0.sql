@@ -1520,12 +1520,11 @@ $$;
 -- Decoupled (iceberg-only) operating mode.
 --
 -- Helpers below let an operator create a table that lives entirely in
--- Iceberg from row 1 — no PG heap, no hot tier, no archiver. The PG side is
--- a thin wrapper view that projects iceberg_scan() into PG-typed columns
--- plus an INSTEAD OF INSERT trigger that routes writes to
--- duckdb.raw_query('INSERT INTO ice...'). UPDATE/DELETE on the wrapper view
--- are intercepted by the coldfront post_parse_analyze hook (which short-
--- circuits to TIER_COLD when the registry row has is_iceberg_only=true).
+-- Iceberg from row 1: no PG heap, no hot tier, no archiver. The PG side is
+-- a thin wrapper view that projects iceberg_scan() into PG-typed columns.
+-- INSERT/UPDATE/DELETE on the wrapper view are rewritten by the coldfront
+-- post_parse_analyze hook (which short-circuits to TIER_COLD when the
+-- registry row has is_iceberg_only=true).
 --
 -- The supported column types match the canonical map in
 -- cmd/archiver/main.go pgFormatTypeToDuckDB. Anything outside the set is
@@ -2475,37 +2474,6 @@ LANGUAGE sql IMMUTABLE STRICT AS $$
         -- VARCHAR and the INSERT fails.
         WHEN coldfront._is_vector_type(p_pg_type) THEN format('CAST(%L AS FLOAT[])', p_val_text)
         ELSE quote_literal(p_val_text)
-    END;
-$$;
-
--- The INSTEAD OF trigger's cold INSERT is a format() template plus its args.
--- These two spell one column's half of each, for _rebuild_write_trigger.
--- Identity columns are the caller's business: they take NULL, since Iceberg has
--- no sequences.
-CREATE OR REPLACE FUNCTION coldfront._cold_placeholder(p_pg_type text)
-RETURNS text
-LANGUAGE sql IMMUTABLE STRICT AS $$
-    SELECT CASE
-        WHEN coldfront._iceberg_storage_type(p_pg_type) = 'BLOB' THEN 'from_hex(%L)'
-        WHEN coldfront._is_vector_type(p_pg_type)                THEN 'CAST(%L AS FLOAT[])'
-        ELSE '%L'
-    END;
-$$;
-
-CREATE OR REPLACE FUNCTION coldfront._cold_value(p_col text, p_pg_type text)
-RETURNS text
-LANGUAGE sql IMMUTABLE STRICT AS $$
-    SELECT CASE
-        WHEN coldfront._iceberg_storage_type(p_pg_type) = 'BLOB'
-            THEN format('encode(NEW.%I,%L)', p_col, 'hex')
-        -- The view exposes a vector as real[], so ::text yields {1,2,3}.
-        WHEN coldfront._is_vector_type(p_pg_type)
-            THEN format('translate(NEW.%I::text,%L,%L)', p_col, '{}', '[]')
-        -- VARCHAR-backed rich types are stored as their text form.
-        WHEN coldfront._iceberg_view_cast_type(p_pg_type) IN ('json', 'interval')
-            THEN format('NEW.%I::text', p_col)
-        -- Everything else round-trips through %L, double precision included.
-        ELSE format('NEW.%I', p_col)
     END;
 $$;
 
@@ -4188,193 +4156,11 @@ CREATE FUNCTION coldfront._rename_tiered_view(
      WHERE schema_name = p_schema AND table_name = p_old_view_name;
 $$;
 
--- coldfront._rebuild_write_trigger: (re)build a tiered view's INSTEAD OF INSERT
--- trigger from the registry, the watermark and the hot table's live columns.
---
--- The one generator of the trigger's positional lists: the archiver calls it at
--- bootstrap and _rebuild_tiered_view calls it after DDL, so the pairing of the
--- inner format()'s placeholders with their arguments is decided in exactly one
--- place, for every column type alike. CREATE OR REPLACE on both the function and
--- the trigger keeps it idempotent: the archiver re-runs bootstrap each cycle
--- against a view that already carries the previous trigger.
---
--- Iceberg-only views are a no-op: their trigger is create_iceberg_table's, built
--- from the declared jsonb columns rather than a hot heap.
-CREATE FUNCTION coldfront._rebuild_write_trigger(
-    p_schema    text,
-    p_view_name text
-)
-RETURNS void
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_hot_table     text;          -- stored quoted, e.g. "public"."_events"
-    v_iceberg       text;          -- DuckDB ref, e.g. ice.myapp.events
-    v_partcol       text;
-    v_is_ice_only   boolean;
-    v_hot_schema    text;
-    v_hot_relname   text;
-    v_cutoff        timestamptz;
-    v_cutoff_lit    text;          -- UTC text literal of the cutoff
-    v_has_cutoff    boolean;
-
-    v_col_list      text := '';     -- hot INSERT target columns (non-identity)
-    v_hot_vals      text := '';     -- NEW."col" refs (non-identity)
-    v_cold_vals     text := '';     -- NEW."col"[::text] refs (non-identity)
-    v_placeholders  text := '';     -- %L / NULL per column, positional
-    v_vec_cols         text[] := '{}';
-    v_vec_placeholders text[] := '{}';
-    v_vec_refs         text[] := '{}';
-
-    v_func_sql      text;
-    v_funcname      text;           -- coldfront."<view>_write"
-    v_trigname      text;           -- "<view>_write_trigger"
-    r               record;
-    iter            int := 0;
-BEGIN
-    SELECT tv.hot_table, tv.iceberg_table, tv.partition_col, tv.is_iceberg_only
-    INTO v_hot_table, v_iceberg, v_partcol, v_is_ice_only
-    FROM coldfront.tiered_views tv
-    WHERE tv.schema_name = p_schema AND tv.relname = p_view_name;
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'coldfront._rebuild_write_trigger: view %.% not registered',
-            p_schema, p_view_name;
-    END IF;
-    IF v_is_ice_only OR v_hot_table IS NULL OR v_partcol IS NULL THEN
-        RETURN;
-    END IF;
-
-    -- hot_table is stored as a quoted identifier; parse_ident handles the
-    -- quoting/escaping. No EXCEPTION wrapper: pg_duckdb forbids subtxns.
-    v_hot_schema  := (parse_ident(v_hot_table))[1];
-    v_hot_relname := (parse_ident(v_hot_table))[2];
-
-    SELECT cutoff_time INTO v_cutoff
-    FROM coldfront.archive_watermark
-    WHERE schema_name = p_schema AND table_name = p_view_name;
-    v_has_cutoff := (v_cutoff IS NOT NULL);
-    IF v_has_cutoff THEN
-        v_cutoff_lit := to_char(v_cutoff AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS+00');
-    END IF;
-
-    -- Placeholders are positional over ALL live columns incl. identity and
-    -- generated (NULL for those, %L otherwise): the cold INSERT supplies the
-    -- full tuple. An identity or generated column also stays out of the hot
-    -- INSERT list: PostgreSQL rejects a supplied value for either.
-    FOR r IN
-        SELECT a.attname,
-               format_type(a.atttypid, a.atttypmod) AS pg_type,
-               a.attidentity,
-               a.attgenerated
-        FROM pg_attribute a
-        JOIN pg_class c      ON c.oid = a.attrelid
-        JOIN pg_namespace nn ON nn.oid = c.relnamespace
-        WHERE nn.nspname = v_hot_schema
-          AND c.relname  = v_hot_relname
-          AND a.attnum > 0
-          AND NOT a.attisdropped
-          AND NOT coldfront._is_vec_companion(a.attname, a.attgenerated)
-        ORDER BY a.attnum
-    LOOP
-        IF coldfront._is_vector_type(r.pg_type) THEN
-            v_vec_cols         := v_vec_cols || r.attname;
-            v_vec_placeholders := v_vec_placeholders || coldfront._cold_placeholder(r.pg_type);
-            v_vec_refs         := v_vec_refs || coldfront._cold_value(r.attname, r.pg_type);
-        END IF;
-
-        IF iter > 0 THEN
-            v_placeholders := v_placeholders || ', ';
-        END IF;
-        iter := iter + 1;
-
-        IF r.attidentity = 'a' OR r.attgenerated <> '' THEN
-            v_placeholders := v_placeholders || 'NULL';
-        ELSE
-            IF v_col_list <> '' THEN
-                v_col_list := v_col_list || ', ';
-                v_hot_vals := v_hot_vals || ', ';
-                v_cold_vals := v_cold_vals || ', ';
-            END IF;
-            v_col_list := v_col_list || quote_ident(r.attname);
-            v_hot_vals := v_hot_vals || 'NEW.' || quote_ident(r.attname);
-            -- Cold-INSERT value and its format() placeholder: one shared decision
-            -- with create_iceberg_table.
-            v_placeholders := v_placeholders || coldfront._cold_placeholder(r.pg_type);
-            v_cold_vals    := v_cold_vals || coldfront._cold_value(r.attname, r.pg_type);
-        END IF;
-    END LOOP;
-
-    IF iter = 0 THEN
-        RAISE EXCEPTION 'coldfront._rebuild_write_trigger: hot table %.% has no live columns',
-            v_hot_schema, v_hot_relname;
-    END IF;
-
-    -- The cluster columns lead the Iceberg schema, so they lead this positional
-    -- VALUES list too, and each lookup's own %L makes that vector's value lead the
-    -- argument list with it.
-    IF cardinality(v_vec_cols) > 0 THEN
-        v_placeholders := coldfront._vec_list_prefix(p_schema, p_view_name, v_vec_cols,
-                                                    v_vec_placeholders) || v_placeholders;
-        v_cold_vals    := array_to_string(v_vec_refs, ', ') || ', ' || v_cold_vals;
-    END IF;
-
-    v_funcname := format('coldfront.%I', p_view_name || '_write');
-    v_trigname := p_view_name || '_write_trigger';
-
-    -- Double-formatted: the outer format() builds the function body; the body
-    -- itself calls format(...) at trigger time to fill %L placeholders with
-    -- NEW values. The INSERT template, placeholders, and iceberg ref must
-    -- survive THIS format() literally, so they are assembled by concatenation.
-    v_func_sql := format(
-$fn$CREATE OR REPLACE FUNCTION %s() RETURNS trigger AS $body$
-DECLARE
-  cutoff timestamptz;
-BEGIN
-  SELECT cutoff_time INTO cutoff FROM coldfront.archive_watermark WHERE schema_name = %L AND table_name = %L;
-  IF cutoff IS NULL THEN
-    cutoff := %s;
-  END IF;
-
-  IF TG_OP = 'INSERT' THEN
-    IF NEW.%I < cutoff THEN
-      PERFORM coldfront.ensure_attached();%s
-      PERFORM duckdb.raw_query(format(
-        %L,
-        %s
-      ));
-      RETURN NEW;
-    END IF;
-    INSERT INTO %I.%I (%s) VALUES (%s);
-    RETURN NEW;
-  END IF;
-  RETURN NULL;
-END;
-$body$ LANGUAGE plpgsql$fn$,
-        v_funcname,
-        p_schema, p_view_name,                                  -- watermark key literals (schema, name)
-        CASE WHEN v_has_cutoff
-             THEN quote_literal(v_cutoff_lit) || '::timestamptz'
-             ELSE '''-infinity''::timestamptz' END,             -- default cutoff
-        v_partcol,                                              -- NEW.<partcol>
-        CASE WHEN cardinality(v_vec_cols) = 0 THEN ''
-             ELSE E'\n      PERFORM coldfront.ensure_pg_attached();' END,
-        'INSERT INTO ' || v_iceberg || ' VALUES (' || v_placeholders || ')',
-        v_cold_vals,                                            -- args to inner format()
-        v_hot_schema, v_hot_relname, v_col_list, v_hot_vals);   -- hot INSERT
-
-    EXECUTE v_func_sql;
-    EXECUTE format(
-        'CREATE OR REPLACE TRIGGER %I INSTEAD OF INSERT ON %I.%I FOR EACH ROW EXECUTE FUNCTION %s()',
-        v_trigname, p_schema, p_view_name, v_funcname);
-END;
-$$;
-
 -- coldfront._rebuild_tiered_view: regenerate the transparent UNION-ALL view
--- and its INSTEAD OF INSERT trigger after a RENAME TABLE (hot heap) or RENAME
--- VIEW. Driven entirely from pg_catalog; the view projection is the runtime
--- equivalent of internal/view/view.go's GenerateViewSQL, and the trigger comes
--- from _rebuild_write_trigger, the same builder the archiver uses. (Also rebuilt
--- after a mirrored column-shape change, so the view's column set follows the hot
--- heap; and after a hot-table or view rename.)
+-- after a RENAME TABLE (hot heap) or RENAME VIEW. Driven entirely from
+-- pg_catalog; the view projection is the runtime equivalent of
+-- internal/view/view.go's GenerateViewSQL. (Also rebuilt after a mirrored
+-- column-shape change, so the view's column set follows the hot heap.)
 --
 -- Called by the coldfront DDL hook for tiered views (rows with a non-NULL
 -- hot_table). Iceberg-only views (is_iceberg_only = true, hot_table NULL) are
@@ -4384,11 +4170,10 @@ $$;
 -- View strategy: DROP VIEW IF EXISTS ... CASCADE then CREATE VIEW (never
 -- CREATE OR REPLACE). PG only lets CREATE OR REPLACE VIEW append columns at
 -- the end; a DDL that drops/renames/reorders/retypes a column would fail it.
--- DROP also removes the INSTEAD OF trigger (recreated below) and changes the
--- view OID — but the registry is keyed by (schema, relname), which the
--- DROP+CREATE leaves unchanged, so there is no row to re-point. On a VIEW
--- rename the hook migrates the registry key (old→new name) BEFORE calling this,
--- so p_view_name is always the current (post-rename) view name.
+-- DROP changes the view OID, but the registry is keyed by (schema, relname),
+-- which the DROP+CREATE leaves unchanged, so there is no row to re-point. On a
+-- VIEW rename the hook migrates the registry key (old→new name) BEFORE calling
+-- this, so p_view_name is always the current (post-rename) view name.
 CREATE FUNCTION coldfront._rebuild_tiered_view(
     p_schema     text,
     p_view_name  text
@@ -4455,8 +4240,7 @@ BEGIN
     END IF;
 
     -- 3. Post-DDL column list from the HOT table, attnum order, live columns.
-    --    Build the hot/cold projections; the trigger's lists are
-    --    _rebuild_write_trigger's own pass.
+    --    Build the hot/cold projections.
     FOR r IN
         SELECT a.attname,
                format_type(a.atttypid, a.atttypmod) AS pg_type,
@@ -4534,11 +4318,7 @@ $ddl$CREATE VIEW %I.%I AS
     EXECUTE format('DROP VIEW IF EXISTS %I.%I CASCADE', v_schema, v_view_name);
     EXECUTE v_view_sql;
 
-    -- 5. The trigger, from the shared builder (the DROP above removed it with
-    --    the view).
-    PERFORM coldfront._rebuild_write_trigger(p_schema, p_view_name);
-
-    -- 6. The registry key (schema, relname) is unchanged by the DROP+CREATE
+    -- 5. The registry key (schema, relname) is unchanged by the DROP+CREATE
     --    above (the view name is stable), so there is nothing to re-point. The
     --    cross-tier-move path is the post_parse_analyze hook + coldfront._cross_tier_move;
     --    it needs no per-view object here.

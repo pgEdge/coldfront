@@ -39,8 +39,7 @@ var testCfg = ViewConfig{
 	},
 }
 
-// A tiered table carrying an embedding. The view exposes the column as real[],
-// so that is what NEW.embedding is inside the INSTEAD OF trigger.
+// A tiered table with an embedding column, which the view exposes as real[].
 var vectorCfg = ViewConfig{
 	SourceSchema:    "public",
 	SourceTable:     "chunks",
@@ -220,8 +219,7 @@ func TestRecreate(t *testing.T) {
 	g := NewGenerator(db)
 	err := g.Recreate(context.Background(), testCfg)
 	require.NoError(t, err)
-	// Swap and view only: the write trigger is coldfront._rebuild_write_trigger's,
-	// built by the archiver after registration.
+	// The swap and the view.
 	require.Len(t, db.execSQL, 2)
 	assert.Contains(t, db.execSQL[0], `ALTER TABLE "public"."events" RENAME TO "_events"`)
 	assert.Contains(t, db.execSQL[1], `"public"."_events"`)

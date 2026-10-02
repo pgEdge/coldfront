@@ -661,14 +661,6 @@ func (ac *archiveCycle) bootstrapTieredView(ctx context.Context, columns []view.
 		hotTable, iceTable, t.PartitionColumn, vectorColumns(columns)); err != nil {
 		return fmt.Errorf("register tiered view: %w", err)
 	}
-	// The INSTEAD OF INSERT trigger, from the extension's one builder. After the
-	// registration, because the builder reads the registry for the hot table, the
-	// Iceberg ref and the vector columns.
-	if _, err := ac.conn.Exec(ctx,
-		"SELECT coldfront._rebuild_write_trigger($1, $2)",
-		t.SourceSchema, t.SourceTable); err != nil {
-		return fmt.Errorf("build write trigger: %w", err)
-	}
 	return nil
 }
 

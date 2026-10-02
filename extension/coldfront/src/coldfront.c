@@ -25,10 +25,9 @@
  * the cutoff into a hot INSERT into public._events and the cold sink
  * coldfront._cold_sink, which writes Iceberg in batches; with no watermark yet
  * every row is hot. Iceberg-only views short-circuit INSERT to the cold path.
- * The view's INSTEAD OF INSERT trigger does the same routing but is only a
- * fallback for when the extension is not loaded: with the hook active the
- * INSERT is rewritten off the view (cf_reparse_and_replace) before the trigger
- * could fire.
+ * The view has no INSTEAD OF trigger: the INSERT is rewritten off the view
+ * (cf_reparse_and_replace) before the rewriter sees it, and a write the hook
+ * does not rewrite fails in PostgreSQL.
  *
  * ATTACH requirement: the DuckDB 'ice' catalog alias must be attached in the
  * current session before cold DML fires.  The hook calls
@@ -1407,10 +1406,10 @@ build_cold_dml(DeparseResult *dr, TieredViewInfo *info, Query *query)
  * it through.
  *
  * The string reaches duckdb.raw_query (emit_cold / emit_dual), so a value
- * renders as the INSTEAD-OF trigger's DuckDB literals: bytea -> from_hex(%P$L) /
- * encode($K,'hex'); real[] (a vector column's view type) ->
- * CAST(%P$L AS FLOAT[]) / translate($K::text,'{}','[]');
- * json/jsonb/interval -> %P$L / $K::text; else %P$L / $K.
+ * renders as a DuckDB literal: bytea -> from_hex(%P$L) / encode($K,'hex');
+ * real[] (a vector column's view type) -> CAST(%P$L AS FLOAT[]) /
+ * translate($K::text,'{}','[]'); json/jsonb/interval -> %P$L / $K::text;
+ * else %P$L / $K.
  */
 static char *
 cold_sql_arg(const char *cold_dml, ColdParamSet *ps)
@@ -3038,8 +3037,7 @@ cf_resolve_tiered_dml_target(Query *query, RangeTblEntry **rte,
     /* Intercept INSERT, UPDATE and DELETE on registered tiered views.
      * INSERT is rewritten in both modes: a tiered INSERT splits by the
      * watermark cutoff (cf_emit_tiered_insert_path), an iceberg-only INSERT
-     * goes straight to the cold path. The view's INSTEAD OF INSERT trigger is
-     * only the fallback used when the extension is not loaded. */
+     * goes straight to the cold path. */
     if (query->commandType != CMD_UPDATE &&
         query->commandType != CMD_DELETE &&
         query->commandType != CMD_INSERT)

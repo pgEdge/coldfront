@@ -389,8 +389,8 @@ story_provision_decoupled() {
 
 # ───────────────────────────────────────────────────────────────────────────
 # Decoupled CRUD — every DML on the wrapper view is rewritten by the C hook to
-# a single duckdb.raw_query against Iceberg (no INSTEAD OF trigger). Covers the
-# INSERT shapes, jsonb surfacing, UPDATE, DELETE.
+# a single duckdb.raw_query against Iceberg. Covers the INSERT shapes, jsonb
+# surfacing, UPDATE, DELETE.
 # ───────────────────────────────────────────────────────────────────────────
 story_decoupled_crud() {
     step "6. Decoupled CRUD (INSERT/SELECT/UPDATE/DELETE → Iceberg via the hook)"
@@ -903,8 +903,8 @@ EOSQL
 # ───────────────────────────────────────────────────────────────────────────
 # Story 5b — Embeddings round-trip. A pgvector column tiers as an Iceberg
 # list<float> and comes back element-for-element through the view, over all three
-# cold-write paths: the archiver's bulk export, the INSTEAD OF trigger's cold
-# INSERT, and the decoupled hook. The view exposes the column as real[], and PG
+# cold-write paths: the archiver's bulk export, the tiered INSERT's cold sink,
+# and the decoupled hook. The view exposes the column as real[], and PG
 # spells an array {1,2,3} where DuckDB's list cast takes only [1,2,3], so each
 # path has to rewrite the delimiters; comparing the stored value to a literal is
 # what catches a path that does not.
@@ -993,9 +993,8 @@ EOSQL
     assert_eq "cross-tier read spans both tiers" "cold,hot" "$(extract VIEW_XB "$V")"
     assert_eq "cold vector read through the view (classified, now()-relative)" "true" "$(extract VIEW_VEC "$V")"
 
-    # Cold INSERT through the view trigger (ts < cutoff): a second write path,
-    # and the one that renders NEW.embedding::text. The vector literal exercises
-    # pgvector's implicit vector -> real[] cast on the way into the view column.
+    # Cold INSERT through the view (ts < cutoff): the hook's cold sink, which
+    # renders the vector from the row's jsonb payload.
     local CI; CI=$(qf "$HOST" <<'EOSQL'
 INSERT INTO chunks (ts, body, embedding)
 VALUES (date_trunc('month',now()) - interval '4 months' + interval '19 days', 'coldins', '[4,5.5,-6]'::vector);
@@ -1004,7 +1003,7 @@ SELECT 'COLDINS_VEC:' || (r['embedding']::real[] = ARRAY[4,5.5,-6]::real[])::tex
   FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] = 'coldins';
 EOSQL
 )
-    assert_eq "cold-INSERT-via-trigger vector round-trip" "true" "$(extract COLDINS_VEC "$CI")"
+    assert_eq "cold INSERT through the view: vector round-trip" "true" "$(extract COLDINS_VEC "$CI")"
 
     # The search itself: pgvector-shaped syntax over the view, ranking hot and cold
     # rows together in one statement. The query vector is one of the stored rows, so
@@ -2350,7 +2349,34 @@ EOSQL
         "$(q_may "$HOST" "INSERT INTO tc202 (ts, status) SELECT ts, 'ret' FROM public.tc202_src WHERE status = 'src' RETURNING id;")"
     q "$HOST" "DELETE FROM events WHERE status IN ('tc202_lit', 'tc202_ovr');" >/dev/null 2>&1
     q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name = 'tc202'; DELETE FROM coldfront.tiered_views WHERE relname = 'tc202'; DELETE FROM coldfront.archive_watermark WHERE table_name = 'tc202';" >/dev/null 2>&1
-    q "$HOST" "DROP VIEW IF EXISTS public.tc202; DROP TABLE IF EXISTS public._tc202 CASCADE; DROP FUNCTION IF EXISTS coldfront.tc202_write(); DROP TABLE IF EXISTS public.tc202_src, public.tc202_ticks; DROP FUNCTION IF EXISTS public.tc202_tick();" >/dev/null 2>&1
+    q "$HOST" "DROP VIEW IF EXISTS public.tc202; DROP TABLE IF EXISTS public._tc202 CASCADE; DROP TABLE IF EXISTS public.tc202_src, public.tc202_ticks; DROP FUNCTION IF EXISTS public.tc202_tick();" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# TC-203: a tiered view has no INSTEAD OF INSERT trigger. The hook is the one
+# write path; a write that reaches the view any other way (a COPY, an INSERT
+# nested in WITH) fails in PostgreSQL and lands nothing on either tier.
+# ───────────────────────────────────────────────────────────────────────────
+story_view_without_trigger() {
+    step "TC-203: a tiered view has no INSTEAD OF INSERT trigger"
+    assert_eq "TC-203: no trigger on the tiered view" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.events'::regclass AND NOT tgisinternal;")"
+    assert_eq "TC-203: the extension has no trigger builder" "t" \
+        "$(q "$HOST" "SELECT to_regproc('coldfront._rebuild_write_trigger') IS NULL;")"
+    local cold before after
+    cold=$(q "$HOST" "SELECT cutoff_time - interval '10 days' FROM coldfront.archive_watermark WHERE table_name = 'events';")
+    before=$(q "$HOST" "SELECT (SELECT count(*) FROM public._events) || '|' || (SELECT count(*) FROM events);" | tail -1)
+    assert_err "TC-203: COPY into the view fails in PostgreSQL" "cannot copy to view" \
+        "$(qf "$HOST" 2>&1 <<EOSQL
+COPY events (ts, status, data) FROM stdin WITH (FORMAT csv);
+$cold,tc203_copy,{}
+\\.
+EOSQL
+)"
+    assert_err "TC-203: an INSERT nested in WITH fails in PostgreSQL" "cannot insert into view" \
+        "$(q_may "$HOST" "WITH i AS (INSERT INTO events (ts, status, data) VALUES ('$cold', 'tc203_nested', '{}') RETURNING id) SELECT count(*) FROM i;")"
+    after=$(q "$HOST" "SELECT (SELECT count(*) FROM public._events) || '|' || (SELECT count(*) FROM events);" | tail -1)
+    assert_eq "TC-203: neither write landed on either tier" "$before" "$after"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -6195,6 +6221,7 @@ if [ "$MODE" = "tiered" ]; then
     story_concurrent_writers
     story_txn
     story_insert_single_pass
+    story_view_without_trigger
     story_coexist
     story_cold_retention
     story_tiered_twolevel

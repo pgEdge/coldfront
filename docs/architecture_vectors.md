@@ -194,17 +194,16 @@ A retrain cannot interleave with a cold write, because an operation that
 rewrites the table holds the table's claim and every cold write serializes on
 that same claim.
 
-### The Eight Paths
+### The Six Paths
 
 Every path that can put a row into a clustered table's Iceberg storage must
-derive that row's cluster assignment. The following table shows the eight paths
+derive that row's cluster assignment. The following table shows the six paths
 that do so, where each one lives, and its shape:
 
 | Path | Where | Shape |
 |---|---|---|
 | bulk archive | the Iceberg INSERT in `cmd/archiver`, not the staging SELECT | set-based |
 | tiered INSERT, cold half | `coldfront._cold_row_literal`, through the `coldfront._cold_sink` aggregate | per row |
-| tiered trigger INSERT | `coldfront._rebuild_write_trigger` (called by the archiver and by `_rebuild_tiered_view`) | per row |
 | cross-tier move | `coldfront._move_row_literal` | per row |
 | replay drain | `coldfront.replay_archive_delta` | set-based |
 | decoupled INSERT | the C rewrite | per statement |
@@ -234,13 +233,8 @@ The replay drain casts a vector to `real[]` in its scratch projection, because
 DuckDB reads that scratch over libpq and cannot scan the pgvector type.
 
 `pglocal` is attached only where a lookup will run: `_exec_iceberg_with_claim`
-attaches when the statement names it, the generated triggers emit the attach
-only for a clustered table, and the per-row paths guard on
+attaches when the statement names it, and the per-row paths guard on
 `coldfront._types_have_vector`.
-
-The generated trigger's placeholder list is apostrophe-escaped, because the
-INSERT template is itself a single-quoted string and the assignment expression
-contains the literals that name its configuration row.
 
 ## Training
 

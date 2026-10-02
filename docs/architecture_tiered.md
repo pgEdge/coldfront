@@ -25,8 +25,6 @@ catalog, the object store, and the archiver:
 │  └── ...                                                  │
 │                                                           │
 │  events VIEW (replaces original table - hot + cold)       │
-│  + INSTEAD OF INSERT trigger (fallback when hook isn't    │
-│                                loaded; bypassed otherwise)│
 │  + archive_watermark table (cutoff boundary)              │
 │  + coldfront.tiered_views (catalog of rewrite targets)    │
 │                                                           │
@@ -107,12 +105,11 @@ CREATE OR REPLACE VIEW events AS
 ```
 
 The rename is conditional, so it converts the table on the first run and no-ops
-afterwards; the `CREATE OR REPLACE VIEW` keeps the view's OID across runs. With
-the extension loaded, the C hook rewrites an INSERT on the view by the
-watermark cutoff, into a hot INSERT of the at/after-cutoff rows into `_events`
-and a cold `duckdb.raw_query` INSERT of the older rows. The view also has an
-INSTEAD OF INSERT trigger that does the same routing; it is the fallback that
-fires only when the extension is not loaded.
+afterwards; the `CREATE OR REPLACE VIEW` keeps the view's OID across runs. The
+C hook rewrites an INSERT on the view by the watermark cutoff, into a hot
+INSERT of the at/after-cutoff rows into `_events` and the cold sink for the
+older rows. The view has no INSTEAD OF trigger, so a write that reaches it
+without the hook, such as a `COPY`, fails in PostgreSQL.
 
 ### The Archive Pipeline
 
@@ -399,8 +396,7 @@ capability reaches a peer:
 | Capability on a peer | How it gets there |
 |---|---|
 | Read (hot and cold, via the `UNION ALL` view) | The view is created by replicated DDL; hot rows arrive via normal Spock DML replication; cold rows are read from the shared Lakekeeper catalog, which a node attaches only for a view that has a `coldfront.tiered_views` row, so reads need that row too. |
-| INSERT through the view | The `INSTEAD OF INSERT` trigger fires on the peer with no registry lookup, but it is a separate trigger rather than part of the view definition, and its cold INSERT takes no bakery claim. |
-| UPDATE / DELETE and DDL blocking | These need the `coldfront.tiered_views` row present on the peer, because the hook resolves the target view through that row. |
+| INSERT, UPDATE and DELETE through the view, and DDL blocking | These need the `coldfront.tiered_views` row present on the peer, because the hook resolves the target view through that row. Without it the statement is not rewritten, and once the view has its cold branch PostgreSQL refuses it ("cannot insert into view"). |
 | Hot/cold write routing | Routing needs the `coldfront.archive_watermark` row (name-keyed) so the peer's write hook knows the cutoff. |
 
 So alongside the bakery substrate (`coldfront.claims` /
@@ -408,8 +404,7 @@ So alongside the bakery substrate (`coldfront.claims` /
 `coldfront.archive_watermark` are added to the Spock replication set** when a
 mesh runs in tiered mode. The archiver runs on one node, so a peer only gets
 these rows by replication; without `tiered_views` a peer cannot read the cold
-tier, can INSERT only through the trigger fallback, and UPDATE/DELETE/
-DDL-blocking stop recognizing the view.
+tier, and INSERT/UPDATE/DELETE/DDL-blocking stop recognizing the view.
 
 Both tables are **name-keyed** - `tiered_views` by `(schema_name, relname)`,
 `archive_watermark` by `table_name` - so each row replicates verbatim and

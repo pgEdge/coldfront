@@ -107,4 +107,3 @@ DELETE FROM coldfront.vector_centroids WHERE table_name = 'chunks';
 DELETE FROM coldfront.vector_config WHERE table_name = 'chunks';
 DROP VIEW public.chunks;
 DROP TABLE public._chunks;
-DROP FUNCTION coldfront.chunks_write();

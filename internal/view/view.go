@@ -278,10 +278,7 @@ func GenerateVectorOpsSQL(cfg ViewConfig) string {
 	return ""
 }
 
-// Recreate performs the table→view swap (if needed) and recreates the view. The
-// INSTEAD OF INSERT trigger is not built here: coldfront._rebuild_write_trigger
-// is its one generator, and the archiver calls it after registering the view,
-// since the builder reads the registry.
+// Recreate performs the table→view swap (if needed) and recreates the view.
 func (g *Generator) Recreate(ctx context.Context, cfg ViewConfig) error {
 	stmts := []string{
 		GenerateSwapSQL(cfg),

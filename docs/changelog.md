@@ -70,6 +70,11 @@ this project adheres to
 
 ### Fixed
 
+- A write that reached a tiered view through its `INSTEAD OF INSERT` trigger
+  rather than the hook (a `COPY`, an `INSERT` nested in `WITH`, a session or a
+  node without the hook) wrote cold rows with NULL identity and default values
+  and without the table's claim. The trigger is gone: the hook is the only
+  write path, and such a write now fails in PostgreSQL.
 - A tiered `INSERT … SELECT` ran its source once per tier. A source whose
   rows differed between the two runs landed some rows in both tiers and others
   in neither, and when the hot table had no identity column, or the statement

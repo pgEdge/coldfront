@@ -20,7 +20,6 @@ this document, concern by concern:
 | Hot rows | PG heap (`_events`, partitioned) | None |
 | Cold rows | Iceberg via Lakekeeper | All rows, in Iceberg |
 | Unified view | The `events` view UNION-ALLs hot and cold. | None; users query Iceberg directly. |
-| INSTEAD-OF trigger | The trigger is bypassed when coldfront is preloaded and remains as a fallback when it is not. | None |
 | `post_parse_analyze_hook` | The hook rewrites INSERT/UPDATE/DELETE per tier. | The hook rewrites every INSERT/UPDATE/DELETE on the wrapper view to a single `SELECT coldfront._exec_iceberg_with_claim(<ref>, <DuckDB SQL>)`, which takes the table's claim and runs the statement through `duckdb.raw_query`. |
 | Archiver | The archiver moves rows from hot to cold on a cron. | None, because there is nothing to archive. |
 | `coldfront.tiered_views` row | The row is required for each managed table. | The row is required (with `is_iceberg_only = true`), and `create_iceberg_table()` registers it. |
@@ -228,7 +227,7 @@ The helper performs the following steps:
    view, regardless of WHERE clause or watermark - so every write rewrites
    cleanly into a single
    `SELECT coldfront._exec_iceberg_with_claim(<ref>, 'INSERT/UPDATE/DELETE ice.public.<name> …')`.
-   No INSTEAD OF INSERT trigger is created - the hook is the dispatch path.
+   The hook is the dispatch path.
 
 Writes through the wrapper view behave as follows:
 

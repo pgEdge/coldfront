@@ -345,8 +345,8 @@ ColdFront coordinates concurrent writes across the cluster as follows:
 
 ### Cold-Write Strategy: Stock vs Patched duckdb-iceberg
 
-Most cold writes run through `_exec_iceberg_with_claim`; the tiered INSERT
-fallback and the cross-tier move take the claim through `_take_iceberg_claim`
+Most cold writes run through `_exec_iceberg_with_claim`; the tiered INSERT's
+cold sink and the cross-tier move take the claim through `_take_iceberg_claim`
 themselves. What differs is *when* the bakery ticket is held. The async
 ordering is used only on a mesh node with the bakery enabled, and only when
 **both** `coldfront.iceberg_async_parquet` (default `off`) and the build marker
@@ -523,8 +523,7 @@ The cross-cutting limitations are:
   (`->>`, `->`, `#>`) works without any caller-side cast; jsonb-only operators
   (`?`, `@>`, containment, de-dup) need an explicit `data::jsonb` in the
   caller's query. Storage in Iceberg remains VARCHAR (Iceberg has no JSON type
-  either). The INSTEAD OF trigger's cold path still casts the incoming value to
-  `text` before sending it to `duckdb.raw_query`.
+  either). The cold sink sends the incoming value as its text form.
 
 - Lakekeeper remote signing may not work with all S3-compatible stores; the
   workaround is `ACCESS_DELEGATION_MODE NONE` with a direct DuckDB S3 secret.
@@ -673,10 +672,9 @@ the hook.
 As the workaround in use today, ColdFront's `post_parse_analyze_hook` rewrites
 INSERT/UPDATE/DELETE on a registered view into its hot, cold or dual emit path
 before planning, so on the paths ColdFront owns pg_duckdb only ever sees a
-shape it accepts; the wrapper view's `INSTEAD OF INSERT` trigger covers plain
-inserts when the extension is not loaded. What has no workaround is a view an
-application defines over cold data with its own `INSTEAD OF UPDATE`/`DELETE`
-triggers, or an `INSERT ... SELECT` drawing from such a view.
+shape it accepts. What has no workaround is a view an application defines over
+cold data with its own `INSTEAD OF UPDATE`/`DELETE` triggers, or an
+`INSERT ... SELECT` drawing from such a view.
 
 In the upstream shape that would drop it, where `NeedsDuckdbExecution` is true
 and `IsAllowedStatement` is false, pg_duckdb chains to the previous planner
