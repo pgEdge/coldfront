@@ -60,6 +60,12 @@ this project adheres to
   `INSERT`'s source and cold sink, a dual-tier write's cold half) join the
   statement's `WITH` list. With a watermark, `RETURNING` on a nested `INSERT`
   is refused, as on a top-level one; a hot `UPDATE` or `DELETE` keeps it.
+- `MERGE INTO` a tiered or decoupled view, on PostgreSQL 17 and later. A
+  tiered `MERGE` runs on the tier its `ON` condition bounds the partition
+  column to, in PostgreSQL against the hot table or in DuckDB against the
+  Iceberg table, and each `INSERT` action's row is checked to belong to that
+  tier; a `MERGE` that bounds neither tier is refused. A decoupled `MERGE` runs
+  in DuckDB.
 
 ### Changed
 
@@ -109,6 +115,13 @@ this project adheres to
   function or `DO` block failed with a syntax error, because the rewrite put
   its own `WITH` ahead of the statement's. The statement's entries now open
   the rewritten statement.
+- A hot `UPDATE … FROM`, `DELETE … USING` or correlated sub-select on a tiered
+  view failed with "missing FROM-clause entry" when the statement gave the
+  view no alias, because the deparser qualifies the view's columns by its name
+  and the rewrite swapped the relation alone. The retargeted relation now
+  takes the view's name as its alias. A cold `UPDATE … FROM` or `DELETE …
+  USING` a PostgreSQL table failed in DuckDB, which did not know the table;
+  it is now read through `pglocal`, as an `INSERT`'s source is.
 - A tiered `INSERT … SELECT` ran its source once per tier. A source whose
   rows differed between the two runs landed some rows in both tiers and others
   in neither, and when the hot table had no identity column, or the statement

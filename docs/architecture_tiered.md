@@ -109,9 +109,9 @@ afterwards; the `CREATE OR REPLACE VIEW` keeps the view's OID across runs. The
 C hook rewrites an INSERT on the view by the watermark cutoff, into a hot
 INSERT of the at/after-cutoff rows into `_events` and the cold sink for the
 older rows, and the utility hook feeds a `COPY FROM` into the same rewrite in
-batches. An `INSERT` nested in a `WITH` entry is rewritten in place. The view
-has no INSTEAD OF trigger, so a write the hook does not handle, such as
-`MERGE`, fails in PostgreSQL.
+batches. An `INSERT` nested in a `WITH` entry is rewritten in place, and a
+`MERGE` runs on the tier its `ON` condition bounds. The view has no INSTEAD OF
+trigger, so a write the hook does not handle fails in PostgreSQL.
 
 ### The Archive Pipeline
 
@@ -318,6 +318,33 @@ half lifted into the statement's `WITH` list. What runs in DuckDB cannot read
 another `WITH` entry, since DuckDB does not see them, and a cross-tier move
 cannot be a `WITH` entry. A statement may write a tiered view once, and a
 nested write may not have a `WITH` clause of its own.
+
+A `MERGE INTO events` (PostgreSQL 17 and later; 16 allows `MERGE` on tables
+alone and fails in parse analysis, before the hook) runs on the tier its `ON`
+condition bounds the partition column to, classified as an `UPDATE`'s `WHERE`
+is. A hot `MERGE` is the statement retargeted to `_events`; a cold one runs in
+DuckDB against the
+Iceberg table under the table's claim, its PostgreSQL source read through
+`pglocal`. Either sees its own tier's rows alone, so a source row that matches
+a row of the other tier would look unmatched and its `WHEN NOT MATCHED` action
+would run: a `MERGE` whose `ON` condition bounds neither tier is refused, and
+each `INSERT` action's partition value is guarded per row, by
+`coldfront._hot_only` on the hot tier and by a `CASE` on DuckDB's `error()` on
+the cold tier, so a row that belongs to the other tier raises instead of
+landing in the wrong one. A `WHEN NOT MATCHED BY SOURCE` action (PostgreSQL 17
+on) must bound the same tier in its own condition, since the other tier's rows
+match no source row either. A cold `INSERT` action must give every identity or
+defaulted column a value, as DuckDB can draw neither, and loses its
+`OVERRIDING` clause, which DuckDB does not know; duckdb-iceberg runs one
+`UPDATE` or `DELETE` action per statement and no `RETURNING`. A `MERGE` that
+sets the partition column is refused in favour of an `UPDATE`, whose
+cross-tier move replays a single-relation `WHERE` per tier, and so is one on a
+table with a clustered vector column, whose rows the `INSERT`, `UPDATE` and
+`DELETE` rewrites assign to clusters. A `MERGE` nested in a `WITH` entry is
+not rewritten and fails in PostgreSQL. When a statement gives the view no
+alias, the deparser qualifies its columns by the view's name, so the
+retargeted relation takes that name as its alias; an `UPDATE … FROM`, a
+`DELETE … USING` and a correlated sub-select are handled the same way.
 
 `COPY <view> FROM` takes the same path. The utility hook reads the rows with
 PostgreSQL's COPY reader (`BeginCopyFrom`, `NextCopyFrom`), collects

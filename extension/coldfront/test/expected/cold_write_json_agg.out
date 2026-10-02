@@ -29,20 +29,20 @@ VALUES ('public', 'events', '2026-03-01'::timestamptz);
 EXPLAIN (COSTS OFF, VERBOSE)
 UPDATE public.events SET data = (SELECT jsonb_agg(k ORDER BY k) FROM public.src)
 WHERE ts < '2019-01-01'::timestamptz;
-                                                                                                                          QUERY PLAN                                                                                                                          
---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                             QUERY PLAN                                                                                                                              
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
-   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET data = ( SELECT to_json(array_agg(src.k ORDER BY src.k)) AS json_agg            FROM src)   WHERE (ts < ''Tue Jan 01 00:00:00 2019 UTC''::timestamptz)'::text)
+   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events events SET data = ( SELECT to_json(array_agg(src.k ORDER BY src.k)) AS json_agg            FROM src)   WHERE (ts < ''Tue Jan 01 00:00:00 2019 UTC''::timestamptz)'::text)
 (2 rows)
 
 -- (A2) Cold UPDATE, no ORDER BY.
 EXPLAIN (COSTS OFF, VERBOSE)
 UPDATE public.events SET data = (SELECT jsonb_agg(k) FROM public.src)
 WHERE ts < '2019-01-01'::timestamptz;
-                                                                                                                  QUERY PLAN                                                                                                                   
------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                      QUERY PLAN                                                                                                                      
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
-   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET data = ( SELECT to_json(array_agg(src.k)) AS json_agg            FROM src)   WHERE (ts < ''Tue Jan 01 00:00:00 2019 UTC''::timestamptz)'::text)
+   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events events SET data = ( SELECT to_json(array_agg(src.k)) AS json_agg            FROM src)   WHERE (ts < ''Tue Jan 01 00:00:00 2019 UTC''::timestamptz)'::text)
 (2 rows)
 
 -- (A3) The json_ spelling reaches DuckDB the same way: the catch-all leaves it
@@ -50,10 +50,10 @@ WHERE ts < '2019-01-01'::timestamptz;
 EXPLAIN (COSTS OFF, VERBOSE)
 UPDATE public.events SET data = (SELECT json_agg(k)::jsonb FROM public.src)
 WHERE ts < '2019-01-01'::timestamptz;
-                                                                                                                      QUERY PLAN                                                                                                                       
--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                          QUERY PLAN                                                                                                                          
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
-   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET data = ( SELECT (to_json(array_agg(src.k)))::json AS json_agg            FROM src)   WHERE (ts < ''Tue Jan 01 00:00:00 2019 UTC''::timestamptz)'::text)
+   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events events SET data = ( SELECT (to_json(array_agg(src.k)))::json AS json_agg            FROM src)   WHERE (ts < ''Tue Jan 01 00:00:00 2019 UTC''::timestamptz)'::text)
 (2 rows)
 
 -- (A4) INSERT ... SELECT: the source runs in PostgreSQL, once, so the aggregate
@@ -101,10 +101,10 @@ EXPLAIN (COSTS OFF, VERBOSE)
 UPDATE public.events
 SET data = (SELECT jsonb_build_object('all', jsonb_agg(k ORDER BY k)) FROM public.src)
 WHERE ts < '2019-01-01'::timestamptz;
-                                                                                                                                         QUERY PLAN                                                                                                                                          
----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                                             QUERY PLAN                                                                                                                                             
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
-   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET data = ( SELECT json_object(''all'', to_json(array_agg(src.k ORDER BY src.k))) AS json_build_object            FROM src)   WHERE (ts < ''Tue Jan 01 00:00:00 2019 UTC''::timestamptz)'::text)
+   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events events SET data = ( SELECT json_object(''all'', to_json(array_agg(src.k ORDER BY src.k))) AS json_build_object            FROM src)   WHERE (ts < ''Tue Jan 01 00:00:00 2019 UTC''::timestamptz)'::text)
 (2 rows)
 
 -- (A6) A hot-tier UPDATE is plain PostgreSQL DML: jsonb_agg stays, and the
@@ -112,17 +112,17 @@ WHERE ts < '2019-01-01'::timestamptz;
 EXPLAIN (COSTS OFF, VERBOSE)
 UPDATE public.events SET data = (SELECT jsonb_agg(k) FROM public.src)
 WHERE ts >= '2026-06-01'::timestamptz;
-                                        QUERY PLAN                                        
-------------------------------------------------------------------------------------------
- Update on public._events
+                                       QUERY PLAN                                        
+-----------------------------------------------------------------------------------------
+ Update on public._events events
    InitPlan 1
      ->  Aggregate
            Output: jsonb_agg(src.k)
            ->  Seq Scan on public.src
                  Output: src.k
-   ->  Seq Scan on public._events
-         Output: (InitPlan 1).col1, _events.ctid
-         Filter: (_events.ts >= 'Mon Jun 01 00:00:00 2026 UTC'::timestamp with time zone)
+   ->  Seq Scan on public._events events
+         Output: (InitPlan 1).col1, events.ctid
+         Filter: (events.ts >= 'Mon Jun 01 00:00:00 2026 UTC'::timestamp with time zone)
 (9 rows)
 
 -- (A7) The aggregate's name inside a string literal is not a call: left intact.
@@ -143,10 +143,10 @@ EXPLAIN (COSTS OFF, VERBOSE)
 UPDATE public.events
 SET data = (SELECT jsonb_agg(jsonb_build_object('k', k) ->> 'k' ORDER BY k) FROM public.src)
 WHERE ts < '2019-01-01'::timestamptz;
-                                                                                                                                             QUERY PLAN                                                                                                                                             
-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                                                QUERY PLAN                                                                                                                                                 
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
-   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET data = ( SELECT to_json(array_agg((json_object(''k'', src.k) ->> ''k''::text) ORDER BY src.k)) AS json_agg            FROM src)   WHERE (ts < ''Tue Jan 01 00:00:00 2019 UTC''::timestamptz)'::text)
+   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events events SET data = ( SELECT to_json(array_agg((json_object(''k'', src.k) ->> ''k''::text) ORDER BY src.k)) AS json_agg            FROM src)   WHERE (ts < ''Tue Jan 01 00:00:00 2019 UTC''::timestamptz)'::text)
 (2 rows)
 
 -- (B) Parity against the live DuckDB: the target is accepted (ordered and not),

@@ -25,8 +25,8 @@ is selected:
 | Write mode | In permissive mode (the default), an ambiguous cross-tier `UPDATE`/`DELETE` writes both tiers. In strict mode, such a statement is rejected with a hint. | `coldfront.allow_mixed_writes` (USERSET) selects the write mode. |
 
 Both storage modes coexist in one database and share **one** code path: the
-transparent view and read rewriter, the INSERT/UPDATE/DELETE hook (`emit_cold`
-/ `emit_hot` / `emit_dual` in
+transparent view and read rewriter, the INSERT/UPDATE/DELETE/MERGE hook
+(`emit_cold` / `emit_hot` / `emit_dual` in
 [`extension/coldfront/src/coldfront.c`](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/src/coldfront.c)),
 and the per-table claim (`coldfront._take_iceberg_claim`) that every cold write
 path in the hook takes, mostly through `_exec_iceberg_with_claim`. Decoupled
@@ -97,7 +97,7 @@ The following table describes each component, its role, and its license:
 |-----------|------|---------|
 | PostgreSQL 16+ | Provides heap storage and range partitioning for the tiered hot tier. ColdFront works uniformly on PG 16, 17, and 18, because the cold-tier secret is a DuckDB persistent secret loaded at instance init, with no version-gated mechanism. | PostgreSQL |
 | pg_duckdb | Runs DuckDB in-process for Iceberg reads, writes, and analytics; the build is pg_duckdb at commit c04e6a2 (PR #1025) on DuckDB 1.5.4. The bundled `duckdb-iceberg` includes the bakery-aware commit-refresh patch (async parquet overlap, no 409); see [Cold-Write Strategy](#cold-write-strategy-stock-vs-patched-duckdb-iceberg). | MIT |
-| coldfront | This PGXS C extension's `post_parse_analyze_hook` rewrites INSERT/UPDATE/DELETE on registered views to the correct tier and, on a SELECT DuckDB will run, the spellings DuckDB lacks (`date_bin`, `::jsonb`, the JSON builders); `planner_hook` folds bound parameters into such a read; `ProcessUtility_hook` handles DDL; the hook lazily ATTACHes the Iceberg catalog on the first query touching a tiered view. | PostgreSQL |
+| coldfront | This PGXS C extension's `post_parse_analyze_hook` rewrites INSERT/UPDATE/DELETE/MERGE on registered views to the correct tier and, on a SELECT DuckDB will run, the spellings DuckDB lacks (`date_bin`, `::jsonb`, the JSON builders); `planner_hook` folds bound parameters into such a read; `ProcessUtility_hook` handles DDL; the hook lazily ATTACHes the Iceberg catalog on the first query touching a tiered view. | PostgreSQL |
 | Lakekeeper | Provides the Iceberg REST catalog as a single Rust binary. | Apache 2.0 |
 | S3-compatible store or Azure ADLS Gen2 | Stores the cold data; any S3-compatible store works, including SeaweedFS, MinIO, AWS S3, and GCS, and Azure ADLS Gen2 works through `set_storage_secret_azure`. | Varies |
 | Archiver (tiered mode) | Moves rows from hot to cold; this Go binary is a thin SQL orchestrator that cron invokes. | PostgreSQL |
@@ -243,7 +243,7 @@ WHERE r['ts'] < '2026-03-01'::timestamptz;
 
 Applications use the transparent view exactly like a table. A
 `post_parse_analyze_hook` in the coldfront extension intercepts
-INSERT/UPDATE/DELETE whose target is a registered relation - resolved in
+INSERT/UPDATE/DELETE/MERGE whose target is a registered relation - resolved in
 `coldfront.tiered_views` by name (`schema_name`, `relname`) - and rewrites the
 parsed `Query` so it lands in the correct tier; cold-side writes go through
 `_exec_iceberg_with_claim` (see
@@ -335,7 +335,7 @@ ColdFront coordinates concurrent writes across the cluster as follows:
 - Hot writes are replicated by Spock normally (standard PG DML).
 - Cold writes via `duckdb.raw_query()` from multiple nodes are serialized
   PG-side by the **bakery protocol** in the coldfront extension - every
-  iceberg-only INSERT/UPDATE/DELETE wraps in
+  iceberg-only INSERT/UPDATE/DELETE/MERGE wraps in
   `coldfront._exec_iceberg_with_claim`, which holds a globally-ordered
   Snowflake ticket via the Spock-replicated `coldfront.claims` table and waits
   for its turn before issuing the iceberg commit. There are no 409s and no
@@ -670,7 +670,7 @@ unaffected, because that plan never expands the view, so no DuckDB item reaches
 the hook.
 
 As the workaround in use today, ColdFront's `post_parse_analyze_hook` rewrites
-INSERT/UPDATE/DELETE on a registered view into its hot, cold or dual emit path
+INSERT/UPDATE/DELETE/MERGE on a registered view into its hot, cold or dual emit
 before planning, so on the paths ColdFront owns pg_duckdb only ever sees a
 shape it accepts. What has no workaround is a view an application defines over
 cold data with its own `INSTEAD OF UPDATE`/`DELETE` triggers, or an

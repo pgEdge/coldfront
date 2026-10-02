@@ -1,0 +1,117 @@
+-- MERGE INTO a tiered or decoupled view, which PostgreSQL 17 and later allow;
+-- on 16 every MERGE here fails in parse analysis, before the hook, and
+-- merge_on_view_1.out records that. The ON condition's bound on the partition
+-- column picks the tier. A hot MERGE is retargeted to the hot table, with the
+-- view's name as its alias when the statement gave none, since the deparser
+-- qualifies columns by it, and each INSERT action's partition value
+-- goes through coldfront._hot_only, which refuses a row below the cutoff. A
+-- cold MERGE runs in DuckDB against the Iceberg table: its INSERT actions must
+-- give every identity or defaulted column a value, lose OVERRIDING, which
+-- DuckDB does not know, and guard the partition value with DuckDB's error().
+-- White-box: EXPLAIN VERBOSE shows the cold SQL, and only hot statements run,
+-- since the regress server has no warehouse.
+-- Suppress the run-order-dependent "already exists" NOTICE: in the shared
+-- regress db an earlier test may have created the extensions, standalone not.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_duckdb;
+CREATE EXTENSION IF NOT EXISTS coldfront;
+RESET client_min_messages;
+
+SET TIME ZONE 'UTC';
+SET coldfront.warehouse = '';
+SET coldfront.lakekeeper_endpoint = '';
+SET coldfront.dblink_self = '';
+
+CREATE TABLE public._events (id int GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL, status text);
+CREATE VIEW public.events AS SELECT * FROM public._events;
+INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
+VALUES ('public', 'events', 'public._events', 'ice.default.events', 'ts');
+INSERT INTO coldfront.archive_watermark(schema_name, table_name, cutoff_time)
+VALUES ('public', 'events', '2026-03-01'::timestamptz);
+CREATE TABLE public.src (id int, ts timestamptz, status text);
+INSERT INTO public._events (ts, status) VALUES ('2026-05-01 00:00:00+00', 'keep'), ('2026-05-02 00:00:00+00', 'drop');
+INSERT INTO public.src VALUES (1, '2026-05-01 00:00:00+00', 'upd'), (2, '2026-05-02 00:00:00+00', 'del'), (3, '2026-05-03 00:00:00+00', 'ins');
+
+-- A hot MERGE with an alias: the UPDATE, DELETE and INSERT actions run on the
+-- hot table, the INSERT's partition value through the guard.
+EXPLAIN (COSTS OFF, VERBOSE)
+  MERGE INTO public.events t USING public.src s ON t.id = s.id AND t.ts >= '2026-05-01 00:00:00+00'
+  WHEN MATCHED AND s.status = 'del' THEN DELETE
+  WHEN MATCHED THEN UPDATE SET status = s.status
+  WHEN NOT MATCHED THEN INSERT (ts, status) VALUES (s.ts, s.status);
+MERGE INTO public.events t USING public.src s ON t.id = s.id AND t.ts >= '2026-05-01 00:00:00+00'
+WHEN MATCHED AND s.status = 'del' THEN DELETE
+WHEN MATCHED THEN UPDATE SET status = s.status
+WHEN NOT MATCHED THEN INSERT (ts, status) VALUES (s.ts, s.status);
+SELECT id, ts, status FROM public._events ORDER BY id;
+-- Without an alias the deparser qualifies the view's columns by its name, which
+-- becomes the hot table's alias.
+MERGE INTO public.events USING public.src s ON events.id = s.id AND events.ts >= '2026-05-01 00:00:00+00'
+WHEN MATCHED AND s.status = 'ins' THEN UPDATE SET status = 'noalias';
+SELECT id, status FROM public._events ORDER BY id;
+-- A row below the cutoff cannot be inserted through a hot MERGE.
+MERGE INTO public.events t USING (VALUES (0)) s(id) ON t.id = s.id AND t.ts >= '2026-05-01 00:00:00+00'
+WHEN NOT MATCHED THEN INSERT (ts, status) VALUES ('2026-01-01 00:00:00+00', 'cold');
+
+-- A cold MERGE runs in DuckDB, the PostgreSQL source through pglocal: the
+-- INSERT action gives the identity column a value, OVERRIDING goes, and the
+-- partition value is guarded with error().
+EXPLAIN (COSTS OFF, VERBOSE)
+  MERGE INTO public.events USING public.src s ON events.id = s.id AND events.ts < '2026-01-01 00:00:00+00'
+  WHEN MATCHED AND s.status = 'del' THEN DELETE
+  WHEN NOT MATCHED THEN INSERT (id, ts, status) OVERRIDING SYSTEM VALUE VALUES (s.id, s.ts, s.status);
+-- Inside plpgsql a hot MERGE is the retargeted statement itself.
+CREATE FUNCTION public.hot_merge() RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+  MERGE INTO public.events t USING public.src s ON t.id = s.id AND t.ts >= '2026-05-01 00:00:00+00'
+  WHEN MATCHED THEN UPDATE SET status = 'plpgsql';
+END $$;
+SELECT public.hot_merge();
+SELECT id, status FROM public._events ORDER BY id;
+DROP FUNCTION public.hot_merge();
+-- An identity column the cold INSERT action leaves out has no value DuckDB can
+-- give it.
+MERGE INTO public.events t USING public.src s ON t.id = s.id AND t.ts < '2026-01-01 00:00:00+00'
+WHEN NOT MATCHED THEN INSERT (ts, status) VALUES (s.ts, s.status);
+-- The ON condition must bound one tier; the partition column cannot be set; the
+-- source cannot read the view.
+MERGE INTO public.events t USING public.src s ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET status = s.status;
+MERGE INTO public.events t USING public.src s ON t.id = s.id AND t.ts >= '2026-05-01 00:00:00+00'
+WHEN MATCHED THEN UPDATE SET ts = s.ts;
+MERGE INTO public.events t USING (SELECT id FROM public.events) s ON t.id = s.id AND t.ts >= '2026-05-01 00:00:00+00'
+WHEN MATCHED THEN UPDATE SET status = 'self';
+-- A table with a clustered vector column assigns each written row a cluster,
+-- which a MERGE's actions do not.
+UPDATE coldfront.tiered_views SET vec_columns = '{embedding}' WHERE relname = 'events';
+MERGE INTO public.events t USING public.src s ON t.id = s.id AND t.ts >= '2026-05-01 00:00:00+00'
+WHEN MATCHED THEN UPDATE SET status = s.status;
+UPDATE coldfront.tiered_views SET vec_columns = NULL WHERE relname = 'events';
+
+-- Without a watermark every row is hot: a plain swap, no guard.
+CREATE TABLE public._plain (id int, ts timestamptz, status text);
+CREATE VIEW public.plain AS SELECT * FROM public._plain;
+INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
+VALUES ('public', 'plain', 'public._plain', 'ice.default.plain', 'ts');
+EXPLAIN (COSTS OFF, VERBOSE)
+  MERGE INTO public.plain t USING public.src s ON t.id = s.id
+  WHEN NOT MATCHED THEN INSERT (id, ts, status) VALUES (s.id, s.ts, s.status);
+MERGE INTO public.plain t USING public.src s ON t.id = s.id
+WHEN NOT MATCHED THEN INSERT (id, ts, status) VALUES (s.id, s.ts, s.status);
+SELECT count(*) FROM public._plain;
+
+-- A decoupled view: every MERGE runs in DuckDB.
+CREATE TABLE public._ice_base (id int, ts timestamptz, status text);
+CREATE VIEW public.iceplain AS SELECT * FROM public._ice_base;
+INSERT INTO coldfront.tiered_views(schema_name, relname, iceberg_table, is_iceberg_only)
+VALUES ('public', 'iceplain', 'ice.default.iceplain', true);
+EXPLAIN (COSTS OFF, VERBOSE)
+  MERGE INTO public.iceplain t USING public.src s ON t.id = s.id
+  WHEN MATCHED THEN UPDATE SET status = s.status
+  WHEN NOT MATCHED THEN INSERT (id, ts, status) VALUES (s.id, s.ts, s.status);
+
+-- Cleanup.
+DELETE FROM coldfront.tiered_views;
+DELETE FROM coldfront.archive_watermark;
+DROP VIEW public.events, public.plain, public.iceplain;
+DROP TABLE public._events, public._plain, public._ice_base, public.src;

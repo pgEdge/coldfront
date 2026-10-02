@@ -366,6 +366,25 @@ END;
 -- non-superuser. search_path pinned per SECURITY DEFINER hardening.
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog;
 
+-- coldfront._hot_only: the per-row guard a hot MERGE's INSERT action gets on its
+-- partition-column value. The hot MERGE runs in PostgreSQL against the hot table
+-- alone, so a row below the cutoff, which belongs in Iceberg, is refused rather
+-- than written to the wrong tier; any other value comes back unchanged. STABLE,
+-- so the planner does not fold a constant value and EXPLAIN shows the guard.
+CREATE OR REPLACE FUNCTION coldfront._hot_only(
+    p_value timestamptz, p_cutoff timestamptz, p_view text, p_col text
+) RETURNS timestamptz LANGUAGE plpgsql STABLE STRICT AS $$
+BEGIN
+  IF p_value < p_cutoff THEN
+    RAISE EXCEPTION 'a MERGE into the hot tier of tiered view "%" cannot insert a row with "%" = %, which is below the cutoff',
+      p_view, p_col, p_value
+      USING ERRCODE = 'feature_not_supported',
+            HINT = 'Insert the row with INSERT, which splits rows by the cutoff.';
+  END IF;
+  RETURN p_value;
+END;
+$$;
+
 -- grant_app_access(target_role) — ONE-CALL onboarding for a NON-superuser app
 -- role. Grants exactly the minimal privileges the transparent cold path needs
 -- and nothing more: duckdb.postgres_role membership (DuckDB execution), USAGE on
@@ -428,6 +447,8 @@ BEGIN
                         -- the tiered INSERT's cold sink and its row renderer
                         '_cold_sink', '_cold_sink_step', '_cold_sink_flush',
                         '_cold_sink_final', '_cold_row_literal',
+                        -- the hot MERGE's per-row cutoff guard on INSERT actions
+                        '_hot_only',
                         -- cross-tier move: the hook rewrites a partition-column
                         -- UPDATE to SELECT _cross_tier_move(...), which serialises
                         -- cold rows via _move_row_literal.

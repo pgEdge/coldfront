@@ -289,8 +289,8 @@ That single statement provisions:
 - a PG-side wrapper view `public.events` with proper PG-typed columns.
 
 - a `coldfront.tiered_views` registry row, so that the coldfront C hook
-  intercepts every INSERT, UPDATE, and DELETE on the view and rewrites each one
-  to a single `duckdb.raw_query(...)` against `ice.public.events`.
+  intercepts every INSERT, UPDATE, DELETE, and MERGE on the view and rewrites
+  each one to a single `duckdb.raw_query(...)` against `ice.public.events`.
 
 
 In a mesh one node provisions: Spock's `ddl_sql` repset replicates the
@@ -320,7 +320,7 @@ view takes the table's name.
 
 Adoption is read-only unless asked otherwise, so reading someone else's lake
 table cannot become writing it by accident. Passing `p_writable => true`
-enables the same INSERT, UPDATE and DELETE rewrite a created table gets:
+enables the same INSERT, UPDATE, DELETE and MERGE rewrite a created table gets:
 
 ```sql
 SELECT coldfront.adopt_iceberg_table('public', 'orders', 'lake',
@@ -978,6 +978,23 @@ Keep the following caveats in mind when running either mode:
   a nested write and also reads a tiered view runs in DuckDB as a whole, and
   pg_duckdb refuses it ("DuckDB does not support modifying CTEs"); read the
   hot table, or split the statement.
+- `MERGE INTO <view>`, on PostgreSQL 17 and later (16 allows `MERGE` on tables
+  alone), runs on the tier its `ON` condition bounds the partition column to
+  (`AND t.ts >= '<cutoff>'` for the hot tier, `AND t.ts < '<cutoff>'` for the
+  cold tier): a hot `MERGE` runs in PostgreSQL against the hot table
+  and keeps `RETURNING`, a cold one in DuckDB against the Iceberg table. Each
+  tier sees its own rows alone, so a `MERGE` that bounds neither tier is
+  refused, and an `INSERT` action's row must belong to the statement's tier: a
+  hot `MERGE` refuses a row below the cutoff, a cold one a row at or after it;
+  insert such rows with `INSERT`, which splits them. A cold `INSERT` action
+  must give the identity column a value (`OVERRIDING SYSTEM VALUE` for a
+  `GENERATED ALWAYS` one), a cold `MERGE` cannot return rows and runs one
+  `UPDATE` or `DELETE` action per statement (duckdb-iceberg's limit), and a
+  `WHEN NOT MATCHED BY SOURCE` action must bound the same tier in its own
+  condition. A `MERGE` that sets the partition column is refused (run the
+  change as an `UPDATE`), as is one on a table with a clustered vector column,
+  one whose source reads the view, and one nested in a `WITH` entry. On a
+  decoupled view every `MERGE` runs in DuckDB.
 - `TRUNCATE` on a registered relation, or on the hot table behind a tiered one,
   fails with an error, because the cold rows in Iceberg would stay visible
   through the view.

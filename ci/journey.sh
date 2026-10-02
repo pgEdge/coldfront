@@ -425,6 +425,19 @@ EOSQL
     assert_eq "decoupled multi-row INSERT (3 rows)"     "3"    "$(extract MULTI "$O")"
     assert_eq "decoupled UPDATE visible"                "upd"  "$(extract UPD "$O")"
     assert_eq "decoupled DELETE visible (0 of id=2)"    "0"    "$(extract DEL "$O")"
+    # PostgreSQL 17 and later allow MERGE into a view.
+    if [ "$(q "$HOST" "SHOW server_version_num;")" -ge 170000 ]; then
+        O=$(qf "$HOST" <<'EOSQL'
+MERGE INTO iceonly t USING (VALUES (1, 'merged'), (40, 'merge_ins')) s(id, st) ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET status = s.st
+WHEN NOT MATCHED THEN INSERT (id, ts, status, data) VALUES (s.id, date_trunc('month',now()) + interval '10 hours 3 minutes 0 seconds', s.st, '{}');
+SELECT 'MERGED:'||string_agg(status, ',' ORDER BY status) FROM iceonly WHERE id IN (1, 40);
+MERGE INTO iceonly t USING (VALUES (40)) s(id) ON t.id = s.id WHEN MATCHED THEN DELETE;
+SELECT 'MERGEDEL:'||count(*) FROM iceonly WHERE id = 40;
+EOSQL
+)
+        assert_eq "decoupled MERGE ran its UPDATE and INSERT actions, and a second its DELETE, through the hook" "merge_ins,merged|0" "$(extract MERGED "$O")|$(extract MERGEDEL "$O")"
+    fi
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -2575,6 +2588,113 @@ ROLLBACK;
 EOSQL
     assert_eq "TC-207: ROLLBACK undid a nested cold DELETE" "1" "$(q "$HOST" "SELECT count(*) FROM events WHERE status = 'tc207_cte' AND ts < '$cut';" | tail -1)"
     q "$HOST" "DELETE FROM events WHERE status LIKE 'tc207%';" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# TC-208: MERGE INTO a tiered view. The ON condition's bound on the partition
+# column picks the tier: a hot MERGE runs in PostgreSQL against the hot table, a
+# cold one in DuckDB against the Iceberg table, and each tier's INSERT action
+# guards the inserted partition value per row, since the statement sees one
+# tier. A mixed MERGE, one that sets the partition column, and a NOT MATCHED BY
+# SOURCE action without the tier's bound are refused. The view's name is the
+# retargeted statement's alias when the user gave none, since the deparser
+# qualifies columns by it; UPDATE ... FROM and DELETE ... USING share that.
+# ───────────────────────────────────────────────────────────────────────────
+story_merge() {
+    step "TC-208: MERGE INTO a tiered view runs on the tier its ON condition bounds"
+    local cut hot cold pgv O h1 h2 c1 c2 c3 c4 c5
+    cut=$(q "$HOST" "SELECT cutoff_time FROM coldfront.archive_watermark WHERE table_name = 'events';")
+    hot=$(q "$HOST" "SELECT '$cut'::timestamptz + interval '2 days';")
+    cold=$(q "$HOST" "SELECT '$cut'::timestamptz - interval '2 days';")
+    pgv=$(q "$HOST" "SHOW server_version_num;")
+    if [ "$pgv" -lt 170000 ]; then
+        # PostgreSQL 16 allows MERGE on tables alone (transformMergeStmt), so the
+        # statement fails in parse analysis there, before any hook runs.
+        assert_err "TC-208: on PostgreSQL 16 a MERGE into the view is refused by PostgreSQL, ahead of the hook" "cannot execute MERGE on relation" \
+            "$(q_may "$HOST" "MERGE INTO events t USING (VALUES (0)) s(id) ON t.id = s.id AND t.ts >= '$cut' WHEN MATCHED THEN UPDATE SET status = 'tc208';")"
+        return
+    fi
+    # One hot and one cold row per status.
+    q "$HOST" "INSERT INTO events (ts, status, data) SELECT '$cut'::timestamptz + i * interval '1 day', s, '{}' FROM (VALUES (1), (-1)) v(i), unnest(ARRAY['tc208_h1', 'tc208_h2', 'tc208_c1', 'tc208_c2', 'tc208_c3', 'tc208_c4', 'tc208_c5', 'tc208_bs']) s;" >/dev/null 2>&1
+    h1=$(q "$HOST" "SELECT id FROM public._events WHERE status = 'tc208_h1';")
+    h2=$(q "$HOST" "SELECT id FROM public._events WHERE status = 'tc208_h2';")
+    c1=$(q "$HOST" "SELECT id FROM events WHERE status = 'tc208_c1' AND ts < '$cut';" | tail -1)
+    c2=$(q "$HOST" "SELECT id FROM events WHERE status = 'tc208_c2' AND ts < '$cut';" | tail -1)
+    c3=$(q "$HOST" "SELECT id FROM events WHERE status = 'tc208_c3' AND ts < '$cut';" | tail -1)
+    c4=$(q "$HOST" "SELECT id FROM events WHERE status = 'tc208_c4' AND ts < '$cut';" | tail -1)
+    c5=$(q "$HOST" "SELECT id FROM events WHERE status = 'tc208_c5' AND ts < '$cut';" | tail -1)
+    O=$(qf "$HOST" <<EOSQL
+MERGE INTO events t USING (VALUES ($h1, 'upd'), ($h2, 'del'), (0, 'ins')) s(id, op) ON t.id = s.id AND t.ts >= '$cut'
+WHEN MATCHED AND s.op = 'del' THEN DELETE
+WHEN MATCHED THEN UPDATE SET status = 'tc208_hot_upd'
+WHEN NOT MATCHED THEN INSERT (ts, status, data) VALUES ('$hot', 'tc208_hot_ins', '{}');
+SELECT 'HOT:' || string_agg(status, ',' ORDER BY status) FROM events WHERE id IN ($h1, $h2) OR status = 'tc208_hot_ins';
+SELECT 'HOTINS:' || count(*) FROM public._events WHERE status = 'tc208_hot_ins';
+MERGE INTO events USING (VALUES ($c1, 'upd'), (990001, 'ins')) s(id, op) ON events.id = s.id AND events.ts < '$cut'
+WHEN MATCHED THEN UPDATE SET status = 'tc208_cold_upd'
+WHEN NOT MATCHED THEN INSERT (id, ts, status, data) OVERRIDING SYSTEM VALUE VALUES (s.id, '$cold', 'tc208_cold_ins', '{}');
+MERGE INTO events USING (VALUES ($c2)) s(id) ON events.id = s.id AND events.ts < '$cut' WHEN MATCHED THEN DELETE;
+SELECT 'COLD:' || string_agg(status, ',' ORDER BY status) FROM events WHERE id IN ($c1, $c2, 990001);
+SELECT 'COLDHOT:' || count(*) FROM public._events WHERE id IN ($c1, $c2, 990001);
+EOSQL
+)
+    assert_eq "TC-208: a hot MERGE ran its UPDATE, DELETE and INSERT actions on the hot table" "tc208_hot_ins,tc208_hot_upd" "$(extract HOT "$O")"
+    assert_eq "TC-208: the hot MERGE's inserted row is in the hot table" "1" "$(extract HOTINS "$O")"
+    assert_eq "TC-208: a cold MERGE without an alias ran its UPDATE and INSERT actions, and a second its DELETE, on the Iceberg table" "tc208_cold_ins,tc208_cold_upd" "$(extract COLD "$O")"
+    assert_eq "TC-208: the cold MERGEs touched no hot row" "0" "$(extract COLDHOT "$O")"
+    assert_err "TC-208: a hot MERGE's INSERT of a row below the cutoff is refused" "hot tier" \
+        "$(q_may "$HOST" "MERGE INTO events t USING (VALUES (0)) s(id) ON t.id = s.id AND t.ts >= '$cut' WHEN NOT MATCHED THEN INSERT (ts, status, data) VALUES ('$cold', 'tc208_hot_bad', '{}');")"
+    assert_err "TC-208: a cold MERGE's INSERT of a row at or after the cutoff is refused" "cold tier" \
+        "$(q_may "$HOST" "MERGE INTO events USING (VALUES (990002)) s(id) ON events.id = s.id AND events.ts < '$cut' WHEN NOT MATCHED THEN INSERT (id, ts, status, data) OVERRIDING SYSTEM VALUE VALUES (s.id, '$hot', 'tc208_cold_bad', '{}');")"
+    assert_eq "TC-208: the refused cold INSERT wrote nothing" "0" "$(q "$HOST" "SELECT count(*) FROM events WHERE id = 990002;" | tail -1)"
+    assert_err "TC-208: a cold MERGE's INSERT must give the identity column a value" "give a value for column" \
+        "$(q_may "$HOST" "MERGE INTO events USING (VALUES (990003)) s(id) ON events.id = s.id AND events.ts < '$cut' WHEN NOT MATCHED THEN INSERT (ts, status, data) VALUES ('$cold', 'tc208_cold_noid', '{}');")"
+    assert_err "TC-208: a MERGE whose ON condition bounds no tier is refused" "one tier" \
+        "$(q_may "$HOST" "MERGE INTO events t USING (VALUES ($c3)) s(id) ON t.id = s.id WHEN MATCHED THEN UPDATE SET status = 'tc208_mixed';")"
+    assert_err "TC-208: a MERGE that sets the partition column is refused" "sets partition column" \
+        "$(q_may "$HOST" "MERGE INTO events t USING (VALUES ($h1)) s(id) ON t.id = s.id AND t.ts >= '$cut' WHEN MATCHED THEN UPDATE SET ts = t.ts - interval '400 days';")"
+    assert_err "TC-208: a cold MERGE with an UPDATE and a DELETE action meets duckdb-iceberg's one-action limit" "single UPDATE/DELETE action" \
+        "$(q_may "$HOST" "MERGE INTO events t USING (VALUES ($c3)) s(id) ON t.id = s.id AND t.ts < '$cut' WHEN MATCHED AND t.status = 'x' THEN DELETE WHEN MATCHED THEN UPDATE SET status = 'tc208_two';")"
+    assert_err "TC-208: a MERGE whose source reads the view is refused" "more than once" \
+        "$(q_may "$HOST" "MERGE INTO events t USING (SELECT id FROM events WHERE status = 'tc208_c3') s ON t.id = s.id AND t.ts < '$cut' WHEN MATCHED THEN UPDATE SET status = 'tc208_self';")"
+    if [ "$pgv" -ge 170000 ]; then
+        assert_eq "TC-208: a hot MERGE keeps RETURNING" "UPDATE|tc208_hot_ret" \
+            "$(q "$HOST" "MERGE INTO events t USING (VALUES ($h1)) s(id) ON t.id = s.id AND t.ts >= '$cut' WHEN MATCHED THEN UPDATE SET status = 'tc208_hot_ret' RETURNING merge_action(), t.status;" | grep '|')"
+        assert_err "TC-208: RETURNING on a cold MERGE is refused" "cold tier" \
+            "$(q_may "$HOST" "MERGE INTO events t USING (VALUES ($c3)) s(id) ON t.id = s.id AND t.ts < '$cut' WHEN MATCHED THEN UPDATE SET status = 'tc208_ret' RETURNING t.id;")"
+        assert_err "TC-208: a NOT MATCHED BY SOURCE action without the tier's bound is refused" "NOT MATCHED BY SOURCE" \
+            "$(q_may "$HOST" "MERGE INTO events t USING (VALUES (0)) s(id) ON t.id = s.id AND t.ts >= '$cut' WHEN NOT MATCHED BY SOURCE AND t.status = 'tc208_bs' THEN UPDATE SET status = 'tc208_bs_bad';")"
+        assert_eq "TC-208: a NOT MATCHED BY SOURCE action bounded to the hot tier ran on the hot row only" "1" \
+            "$(q "$HOST" "MERGE INTO events t USING (VALUES (0)) s(id) ON t.id = s.id AND t.ts >= '$cut' WHEN NOT MATCHED BY SOURCE AND t.ts >= '$cut' AND t.status = 'tc208_bs' THEN UPDATE SET status = 'tc208_bs_done'; SELECT count(*) FROM events WHERE status = 'tc208_bs_done';" | tail -1)"
+    fi
+    O=$(qf "$HOST" <<EOSQL
+DO \$\$ BEGIN MERGE INTO events t USING (VALUES ($c3)) s(id) ON t.id = s.id AND t.ts < '$cut' WHEN MATCHED THEN UPDATE SET status = 'tc208_pl_done'; END \$\$;
+SELECT 'PL:' || count(*) FROM events WHERE status = 'tc208_pl_done';
+CREATE TABLE public.tc208_src (id bigint, status text);
+INSERT INTO public.tc208_src VALUES ($c4, 'tc208_pgl_done'), ($h1, 'tc208_hot_src');
+MERGE INTO events t USING public.tc208_src s ON t.id = s.id AND t.ts < '$cut' WHEN MATCHED THEN UPDATE SET status = s.status;
+SELECT 'PGL:' || count(*) FROM events WHERE status = 'tc208_pgl_done';
+UPDATE events t SET status = 'tc208_updfrom_done' FROM public.tc208_src s WHERE t.id = s.id AND t.ts < '$cut';
+SELECT 'UPDFROM:' || count(*) FROM events WHERE status = 'tc208_updfrom_done';
+UPDATE events SET status = 'tc208_hotfrom_done' FROM public.tc208_src s WHERE events.id = s.id AND events.ts >= '$cut';
+SELECT 'HOTFROM:' || count(*) FROM public._events WHERE status = 'tc208_hotfrom_done';
+DELETE FROM events USING public.tc208_src s WHERE events.id = s.id AND events.ts >= '$cut';
+SELECT 'HOTUSING:' || count(*) FROM public._events WHERE id = $h1;
+DROP TABLE public.tc208_src;
+EOSQL
+)
+    assert_eq "TC-208: a cold MERGE inside plpgsql ran" "1" "$(extract PL "$O")"
+    assert_eq "TC-208: a cold MERGE read a PostgreSQL source table through pglocal" "1" "$(extract PGL "$O")"
+    assert_eq "TC-208: a cold UPDATE ... FROM a PostgreSQL table ran through pglocal" "1" "$(extract UPDFROM "$O")"
+    assert_eq "TC-208: a hot UPDATE ... FROM without an alias ran" "1" "$(extract HOTFROM "$O")"
+    assert_eq "TC-208: a hot DELETE ... USING without an alias ran" "0" "$(extract HOTUSING "$O")"
+    qf "$HOST" <<EOSQL >/dev/null 2>&1
+BEGIN;
+MERGE INTO events t USING (VALUES ($c5)) s(id) ON t.id = s.id AND t.ts < '$cut' WHEN MATCHED THEN DELETE;
+ROLLBACK;
+EOSQL
+    assert_eq "TC-208: ROLLBACK undid a cold MERGE" "1" "$(q "$HOST" "SELECT count(*) FROM events WHERE id = $c5;" | tail -1)"
+    q "$HOST" "DELETE FROM events WHERE status LIKE 'tc208%';" >/dev/null 2>&1
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -6424,6 +6544,7 @@ if [ "$MODE" = "tiered" ]; then
     story_copy_into_view
     story_nested_insert
     story_nested_update_delete
+    story_merge
     story_coexist
     story_cold_retention
     story_tiered_twolevel

@@ -23,7 +23,8 @@ ColdFront provides two operating modes:
 
 Both modes coexist within one database, and you choose the mode per table at
 creation time. The SQL surface is identical for both modes: standard SELECT,
-INSERT, UPDATE, and DELETE against the relation.
+INSERT, UPDATE, and DELETE against the relation, and MERGE on PostgreSQL 17
+and later.
 
 Decoupled mode scales out horizontally across many PostgreSQL nodes that share
 one Lakekeeper catalog and one object store. The bakery protocol in the

@@ -27,10 +27,10 @@ EXPLAIN (COSTS OFF, VERBOSE)
   WITH v AS (SELECT 'cold_upd'::text AS s)
   UPDATE public.events SET status = (SELECT s FROM v)
   WHERE ts < '2026-01-01 00:00:00+00';
-                                                                                                                                 QUERY PLAN                                                                                                                                 
-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                                    QUERY PLAN                                                                                                                                     
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
-   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'WITH v AS (          SELECT ''cold_upd''::text AS s         )  UPDATE ice.default.events SET status = ( SELECT v.s            FROM v)   WHERE (ts < ''Thu Jan 01 00:00:00 2026 UTC''::timestamptz)'::text)
+   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'WITH v AS (          SELECT ''cold_upd''::text AS s         )  UPDATE ice.default.events events SET status = ( SELECT v.s            FROM v)   WHERE (ts < ''Thu Jan 01 00:00:00 2026 UTC''::timestamptz)'::text)
 (2 rows)
 
 -- Cold DELETE (ts < cutoff) with a CTE referenced in WHERE: WITH carried through.
@@ -38,10 +38,10 @@ EXPLAIN (COSTS OFF, VERBOSE)
   WITH lim AS (SELECT 99 AS n)
   DELETE FROM public.events
   WHERE ts < '2026-01-01 00:00:00+00' AND id < (SELECT n FROM lim);
-                                                                                                                              QUERY PLAN                                                                                                                               
------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                                  QUERY PLAN                                                                                                                                  
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
-   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'WITH lim AS (          SELECT 99 AS n         )  DELETE FROM ice.default.events   WHERE ((ts < ''Thu Jan 01 00:00:00 2026 UTC''::timestamptz) AND (id < ( SELECT lim.n            FROM lim)))'::text)
+   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'WITH lim AS (          SELECT 99 AS n         )  DELETE FROM ice.default.events events   WHERE ((ts < ''Thu Jan 01 00:00:00 2026 UTC''::timestamptz) AND (id < ( SELECT lim.n            FROM lim)))'::text)
 (2 rows)
 
 -- A WITH entry that modifies data cannot reach the cold tier: DuckDB runs the
