@@ -405,9 +405,15 @@ UPDATE iceonly SET status='upd' WHERE id=1;
 SELECT 'UPD:'||status FROM iceonly WHERE id=1;
 DELETE FROM iceonly WHERE id=2;
 SELECT 'DEL:'||count(*) FROM iceonly WHERE id=2;
+COPY iceonly (id, ts, status, data) FROM stdin WITH (FORMAT csv);
+20,2026-01-01 10:00:00+00,copied,{}
+21,2026-01-01 10:00:01+00,copied,{}
+\.
+SELECT 'COPIED:'||count(*) FROM iceonly WHERE status='copied';
 EOSQL
 )
     assert_eq "decoupled INSERT + read (2 rows)"        "2"    "$(extract CNT "$O")"
+    assert_eq "decoupled COPY FROM lands through the hook (2 rows)" "2" "$(extract COPIED "$O")"
     assert_eq "decoupled jsonb surfaces as json"        "json" "$(extract JSONTYPE "$O")"
     assert_eq "decoupled jsonb round-trip (data->>a)"   "1"    "$(extract JSON "$O")"
     assert_eq "decoupled multi-row INSERT (3 rows)"     "3"    "$(extract MULTI "$O")"
@@ -2354,8 +2360,8 @@ EOSQL
 
 # ───────────────────────────────────────────────────────────────────────────
 # TC-203: a tiered view has no INSTEAD OF INSERT trigger. The hook is the one
-# write path; a write that reaches the view any other way (a COPY, an INSERT
-# nested in WITH) fails in PostgreSQL and lands nothing on either tier.
+# write path; a write that reaches the view any other way (an INSERT nested in
+# WITH) fails in PostgreSQL and lands nothing on either tier.
 # ───────────────────────────────────────────────────────────────────────────
 story_view_without_trigger() {
     step "TC-203: a tiered view has no INSTEAD OF INSERT trigger"
@@ -2366,17 +2372,10 @@ story_view_without_trigger() {
     local cold before after
     cold=$(q "$HOST" "SELECT cutoff_time - interval '10 days' FROM coldfront.archive_watermark WHERE table_name = 'events';")
     before=$(q "$HOST" "SELECT (SELECT count(*) FROM public._events) || '|' || (SELECT count(*) FROM events);" | tail -1)
-    assert_err "TC-203: COPY into the view fails in PostgreSQL" "cannot copy to view" \
-        "$(qf "$HOST" 2>&1 <<EOSQL
-COPY events (ts, status, data) FROM stdin WITH (FORMAT csv);
-$cold,tc203_copy,{}
-\\.
-EOSQL
-)"
     assert_err "TC-203: an INSERT nested in WITH fails in PostgreSQL" "cannot insert into view" \
         "$(q_may "$HOST" "WITH i AS (INSERT INTO events (ts, status, data) VALUES ('$cold', 'tc203_nested', '{}') RETURNING id) SELECT count(*) FROM i;")"
     after=$(q "$HOST" "SELECT (SELECT count(*) FROM public._events) || '|' || (SELECT count(*) FROM events);" | tail -1)
-    assert_eq "TC-203: neither write landed on either tier" "$before" "$after"
+    assert_eq "TC-203: the write landed on neither tier" "$before" "$after"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -2396,6 +2395,61 @@ story_preload_required() {
     assert_eq "TC-204: nothing of the extension was created" "0" \
         "$(docker exec "$HOST" psql -h /tmp -p 5433 -U "$CF_DBUSER" -d postgres -tA -c "SELECT count(*) FROM pg_extension WHERE extname = 'coldfront';")"
     docker exec "$HOST" bash -c "pg_ctl -D $d -m immediate stop >/dev/null 2>&1; rm -rf $d $d.log"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# TC-205: COPY into a tiered view goes through the INSERT rewrite. The utility
+# hook reads the rows with PostgreSQL's COPY reader and writes each batch of
+# cold_write_batch_size rows as an INSERT into the view, so the routing, the
+# claim, the identity values and the defaults are the INSERT's.
+# ───────────────────────────────────────────────────────────────────────────
+story_copy_into_view() {
+    step "TC-205: COPY into a tiered view goes through the INSERT rewrite"
+    local cut rows O
+    cut=$(q "$HOST" "SELECT cutoff_time FROM coldfront.archive_watermark WHERE table_name = 'events';")
+    # Hot and cold rows in one CSV from stdin, the identity column omitted.
+    rows=$(q "$HOST" "SELECT string_agg(('$cut'::timestamptz + i * interval '1 day')::text || ',' || CASE WHEN i < 0 THEN 'tc205_cold' ELSE 'tc205_hot' END || ',{}', E'\n' ORDER BY i) FROM generate_series(-3, 2) i WHERE i <> 0;")
+    O=$(docker exec -i -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" "$HOST" "$CF_PSQL" -A 2>&1 <<EOSQL
+COPY events (ts, status, data) FROM stdin WITH (FORMAT csv);
+$rows
+\\.
+EOSQL
+)
+    assert_contains "TC-205: the command tag counts every row" "COPY 5" "$O"
+    assert_eq "TC-205: the two hot rows landed in the hot table" "2" \
+        "$(q "$HOST" "SELECT count(*) FROM public._events WHERE status = 'tc205_hot';")"
+    assert_eq "TC-205: the three cold rows landed cold, each with its own identity value" "3|3" \
+        "$(q "$HOST" "SELECT count(*) || '|' || count(DISTINCT id) FROM events WHERE status = 'tc205_cold' AND ts < '$cut';" | tail -1)"
+    # More cold rows than one batch holds: every row lands once.
+    rows=$(q "$HOST" "SELECT string_agg(('$cut'::timestamptz - i * interval '1 hour')::text || ',tc205_batch,{}', E'\n' ORDER BY i) FROM generate_series(1, 12) i;")
+    O=$(docker exec -i -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" "$HOST" "$CF_PSQL" -A 2>&1 <<EOSQL
+SET coldfront.cold_write_batch_size = 5;
+COPY events (ts, status, data) FROM stdin WITH (FORMAT csv);
+$rows
+\\.
+EOSQL
+)
+    assert_contains "TC-205: the command tag counts the rows of every batch" "COPY 12" "$O"
+    assert_eq "TC-205: twelve cold rows over three batches landed once each" "12|12" \
+        "$(q "$HOST" "SELECT count(*) || '|' || count(DISTINCT id) FROM events WHERE status = 'tc205_batch';" | tail -1)"
+    # A file on the server lands on both tiers, and ROLLBACK undoes a COPY on both.
+    rows=$(q "$HOST" "SELECT string_agg(('$cut'::timestamptz + i * interval '2 days')::text || ',tc205_file,{}', E'\n' ORDER BY i) FROM (VALUES (-1), (1)) AS v(i);")
+    docker exec -i "$HOST" bash -c "cat > /tmp/tc205.csv" <<< "$rows"
+    q "$HOST" "COPY events (ts, status, data) FROM '/tmp/tc205.csv' WITH (FORMAT csv);" >/dev/null 2>&1
+    assert_eq "TC-205: a server-side file landed on both tiers" "1|1" \
+        "$(q "$HOST" "SELECT (SELECT count(*) FROM public._events WHERE status = 'tc205_file') || '|' || (SELECT count(*) FROM events WHERE status = 'tc205_file' AND ts < '$cut');" | tail -1)"
+    qf "$HOST" <<EOSQL >/dev/null 2>&1
+BEGIN;
+COPY events (ts, status, data) FROM '/tmp/tc205.csv' WITH (FORMAT csv);
+ROLLBACK;
+EOSQL
+    assert_eq "TC-205: ROLLBACK undid the COPY on both tiers" "2" \
+        "$(q "$HOST" "SELECT count(*) FROM events WHERE status = 'tc205_file';" | tail -1)"
+    # An option the rewrite cannot honour is refused, not ignored.
+    assert_err "TC-205: COPY ... WHERE is refused" "not supported" \
+        "$(q_may "$HOST" "COPY events (ts, status, data) FROM '/tmp/tc205.csv' WITH (FORMAT csv) WHERE status = 'x';")"
+    q "$HOST" "DELETE FROM events WHERE status LIKE 'tc205%';" >/dev/null 2>&1
+    docker exec "$HOST" rm -f /tmp/tc205.csv
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -6242,6 +6296,7 @@ if [ "$MODE" = "tiered" ]; then
     story_insert_single_pass
     story_view_without_trigger
     story_preload_required
+    story_copy_into_view
     story_coexist
     story_cold_retention
     story_tiered_twolevel

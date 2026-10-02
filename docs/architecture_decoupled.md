@@ -232,6 +232,8 @@ The helper performs the following steps:
 Writes through the wrapper view behave as follows:
 
 - An INSERT adds the row to Iceberg, and a fresh session's SELECT sees it.
+- A `COPY <view> FROM` adds its rows the same way, one INSERT per
+  `coldfront.cold_write_batch_size` rows.
 - An UPDATE changes the row in Iceberg, and a fresh session's SELECT sees the
   new value.
 - A DELETE removes the row from Iceberg.

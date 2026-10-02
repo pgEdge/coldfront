@@ -49,6 +49,11 @@ this project adheres to
   d3c3348271, so the month of a `timestamptz` partition column is its UTC month
   whatever the session's time zone.
 - `--version` on the archiver, the partitioner and the compactor.
+- `COPY <view> FROM` loads a tiered or decoupled table through its view. The
+  rows take the same path as an `INSERT`, in batches of
+  `coldfront.cold_write_batch_size` rows, with the identity values and defaults
+  an `INSERT` would give them. `COPY ... WHERE` and the `FREEZE`, `ON_ERROR`,
+  `REJECT_LIMIT` and `DEFAULT` options are refused.
 
 ### Changed
 
@@ -70,6 +75,10 @@ this project adheres to
 
 ### Fixed
 
+- A prepared `INSERT` into a tiered view whose source held a bound parameter
+  inside a sub-select or a function in `FROM` failed with "there is no
+  parameter $1". The parameter now carries through the rewrite wherever it
+  sits.
 - On a server that did not preload coldfront, `CREATE EXTENSION coldfront`
   succeeded and every session then ran without the extension's hooks: no write
   routing, no DDL mirroring, and no refusal of `DROP` or `TRUNCATE` on a tiered

@@ -42,14 +42,17 @@
 #include <sys/stat.h>
 
 #include "access/attnum.h"
+#include "access/relation.h"
 #include "access/xact.h"
 #include "catalog/dependency.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_authid.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type_d.h"
+#include "commands/copy.h"
 #include "commands/extension.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
@@ -69,6 +72,7 @@
 #include "storage/procarray.h"
 #include "tcop/tcopprot.h"
 #include "tcop/utility.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/guc.h"
@@ -153,6 +157,10 @@ collect_params_walker(Node *node, void *ctx)
 
     if (node == NULL)
         return false;
+    /* A sub-Query (an INSERT's SELECT source, a sub-select) is walked too:
+     * expression_tree_walker stops at it. */
+    if (IsA(node, Query))
+        return query_tree_walker((Query *) node, collect_params_walker, ctx, 0);
     if (IsA(node, Param))
     {
         Param *p = (Param *) node;
@@ -4413,6 +4421,189 @@ cf_handle_rename(const CfUtilityCtx *u, RenameStmt *rs)
         cf_handle_rename_relation(u, rs, &info, hot_relid, view_relid);
 }
 
+/* ---- COPY FROM on a registered view. ---- */
+
+static bool
+cf_copy_has_option(List *options, const char *name)
+{
+    ListCell *lc;
+
+    foreach(lc, options)
+        if (strcmp(((DefElem *) lfirst(lc))->defname, name) == 0)
+            return true;
+    return false;
+}
+
+/*
+ * COPY <view> FROM reads the rows with PostgreSQL's COPY reader and writes
+ * them in batches of coldfront.cold_write_batch_size rows, each batch one
+ * INSERT ... VALUES into the view with every value as a literal in its type's
+ * text form. That INSERT goes through the parse-analysis hook like any other,
+ * so the routing, the claim, the identity values and the defaults are the
+ * INSERT's, for a tiered and for a decoupled view alike. OVERRIDING SYSTEM
+ * VALUE because COPY into a table keeps a supplied value for a GENERATED
+ * ALWAYS identity column. The reader applies the format options; WHERE and
+ * the options that act after a row is read (FREEZE, ON_ERROR, REJECT_LIMIT,
+ * DEFAULT) have no row to act on here and are refused.
+ */
+static void
+cf_handle_copy(CfUtilityCtx *u, CopyStmt *stmt)
+{
+    static const char *refused[] = { "freeze", "on_error", "reject_limit", "default", NULL };
+    TieredViewInfo info;
+    Oid            relid;
+    Relation       rel;
+    TupleDesc      desc;
+    ParseState    *pstate;
+    CopyFromState  cstate;
+    ExprContext   *econtext;
+    MemoryContext  rowctx, oldctx;
+    StringInfoData sql;
+    FmgrInfo      *outfn;
+    Datum         *values;
+    bool          *nulls;
+    int           *attnum;          /* the COPY's columns, in its order, 1-based */
+    int            ncols = 0, prefix_len, c, i;
+    int            n = 0, batch = coldfront_cold_write_batch_size;
+    uint64         processed = 0;
+    ListCell      *lc;
+
+    relid = stmt->is_from && stmt->relation
+        ? RangeVarGetRelid(stmt->relation, NoLock, true) : InvalidOid;
+    if (!OidIsValid(relid) || get_rel_relkind(relid) != RELKIND_VIEW ||
+        !lookup_tiered_view(relid, get_rel_name(relid), &info))
+    {
+        cf_call_through(u);
+        return;
+    }
+
+    if (stmt->whereClause)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("COPY ... WHERE is not supported on a tiered view"),
+                 errhint("Filter the rows before loading them.")));
+    for (i = 0; refused[i]; i++)
+        if (cf_copy_has_option(stmt->options, refused[i]))
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("COPY option %s is not supported on a tiered view",
+                            refused[i])));
+
+    /* The checks DoCopy makes before it reads a server-side source. */
+    if (stmt->filename && stmt->is_program &&
+        !has_privs_of_role(GetUserId(), ROLE_PG_EXECUTE_SERVER_PROGRAM))
+        ereport(ERROR,
+                (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                 errmsg("permission denied to COPY to or from an external program"),
+                 errdetail("Only roles with privileges of the \"%s\" role may COPY to or from an external program.",
+                           "pg_execute_server_program")));
+    if (stmt->filename && !stmt->is_program &&
+        !has_privs_of_role(GetUserId(), ROLE_PG_READ_SERVER_FILES))
+        ereport(ERROR,
+                (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                 errmsg("permission denied to COPY from a file"),
+                 errdetail("Only roles with privileges of the \"%s\" role may COPY from a file.",
+                           "pg_read_server_files")));
+    if (XactReadOnly)
+        PreventCommandIfReadOnly("COPY FROM");
+
+    rel  = relation_open(relid, AccessShareLock);
+    desc = RelationGetDescr(rel);
+
+    /* The INSERT's column list is the COPY's; BeginCopyFrom rejects a name
+     * that is not a column. */
+    attnum = palloc(sizeof(int) * desc->natts);
+    if (stmt->attlist)
+    {
+        foreach(lc, stmt->attlist)
+            for (i = 0; i < desc->natts; i++)
+                if (strcmp(NameStr(TupleDescAttr(desc, i)->attname), strVal(lfirst(lc))) == 0)
+                    attnum[ncols++] = i + 1;
+    }
+    else
+    {
+        for (i = 0; i < desc->natts; i++)
+            attnum[ncols++] = i + 1;
+    }
+    outfn = palloc(sizeof(FmgrInfo) * ncols);
+    initStringInfo(&sql);
+    appendStringInfo(&sql, "INSERT INTO %s.%s (",
+                     quote_identifier(get_namespace_name(get_rel_namespace(relid))),
+                     quote_identifier(get_rel_name(relid)));
+    for (c = 0; c < ncols; c++)
+    {
+        Form_pg_attribute att = TupleDescAttr(desc, attnum[c] - 1);
+        Oid               outoid;
+        bool              isvarlena;
+
+        getTypeOutputInfo(att->atttypid, &outoid, &isvarlena);
+        fmgr_info(outoid, &outfn[c]);
+        appendStringInfo(&sql, "%s%s", c ? ", " : "", quote_identifier(NameStr(att->attname)));
+    }
+    appendStringInfoString(&sql, ") OVERRIDING SYSTEM VALUE VALUES ");
+    prefix_len = sql.len;
+
+    pstate = make_parsestate(NULL);
+    pstate->p_sourcetext = u->queryString;
+    cstate = BeginCopyFrom(pstate, rel, NULL, stmt->filename, stmt->is_program,
+                           NULL, stmt->attlist, stmt->options);
+    econtext = CreateStandaloneExprContext();
+    rowctx = AllocSetContextCreate(CurrentMemoryContext, "coldfront copy row",
+                                   ALLOCSET_DEFAULT_SIZES);
+    values = palloc(sizeof(Datum) * desc->natts);
+    nulls  = palloc(sizeof(bool) * desc->natts);
+
+    for (;;)
+    {
+        bool more;
+
+        /* The reader allocates each row's values in the current context, and
+         * the rendered literals go there too; the statement text is copied. */
+        MemoryContextReset(rowctx);
+        oldctx = MemoryContextSwitchTo(rowctx);
+        more = NextCopyFrom(cstate, econtext, values, nulls);
+        if (more)
+        {
+            appendStringInfoString(&sql, n ? ", (" : "(");
+            for (c = 0; c < ncols; c++)
+            {
+                if (c)
+                    appendStringInfoString(&sql, ", ");
+                if (nulls[attnum[c] - 1])
+                    appendStringInfoString(&sql, "NULL");
+                else
+                    appendStringInfoString(&sql, quote_literal_cstr(
+                        OutputFunctionCall(&outfn[c], values[attnum[c] - 1])));
+            }
+            appendStringInfoChar(&sql, ')');
+            n++;
+            processed++;
+        }
+        MemoryContextSwitchTo(oldctx);
+
+        if (n > 0 && (n == batch || !more))
+        {
+            if (SPI_connect() != SPI_OK_CONNECT)
+                elog(ERROR, "coldfront: SPI_connect failed in COPY");
+            if (SPI_execute(sql.data, false, 0) < 0)
+                elog(ERROR, "coldfront: the INSERT of a COPY batch failed");
+            SPI_finish();
+            sql.len = prefix_len;
+            sql.data[prefix_len] = '\0';
+            n = 0;
+        }
+        if (!more)
+            break;
+    }
+
+    EndCopyFrom(cstate);
+    FreeExprContext(econtext, true);
+    MemoryContextDelete(rowctx);
+    relation_close(rel, NoLock);
+    if (u->qc)
+        SetQueryCompletion(u->qc, CMDTAG_COPY, processed);
+}
+
 /*
  * The coldfront ProcessUtility_hook. Intercepts DDL on registered tiered
  * relations: blocks DROP/TRUNCATE, mirrors schema/rename DDL to Iceberg, and
@@ -4469,6 +4660,8 @@ coldfront_process_utility(PlannedStmt *pstmt, const char *queryString,
         cf_handle_alter_table(&u, (AlterTableStmt *) stmt);
     else if (IsA(stmt, RenameStmt))
         cf_handle_rename(&u, (RenameStmt *) stmt);
+    else if (IsA(stmt, CopyStmt))
+        cf_handle_copy(&u, (CopyStmt *) stmt);
     else
         cf_call_through(&u);
 }

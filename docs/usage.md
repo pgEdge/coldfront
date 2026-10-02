@@ -823,6 +823,8 @@ INSERT INTO events (ts, status, data) VALUES (...), (...), (...);
 INSERT INTO events (ts, status, data) SELECT ts, status, data FROM staging;
 INSERT INTO events (ts, status, data) SELECT now() + i*'1s'::interval, 'ok', '{}'
                                        FROM generate_series(1, 1000) i;
+-- COPY FROM loads the same way, one INSERT per cold_write_batch_size rows:
+COPY events (ts, status, data) FROM '/path/to/events.csv' WITH (FORMAT csv);
 
 -- Transactions work; ROLLBACK undoes Iceberg writes too
 BEGIN;
@@ -952,6 +954,12 @@ Keep the following caveats in mind when running either mode:
   side, and an omitted column with a DEFAULT takes it. The hot rows are one
   set-based INSERT. For very large historical seeds (mostly-cold), prefer
   iceberg-only mode where ids come from your source data.
+- `COPY <view> FROM` reads the rows with PostgreSQL's COPY reader and writes
+  them through that same INSERT path, `coldfront.cold_write_batch_size` rows
+  per INSERT. The format options are the reader's, and a supplied value for a
+  `GENERATED ALWAYS` identity column is kept, as `COPY` into a table keeps it.
+  `COPY ... WHERE` and the `FREEZE`, `ON_ERROR`, `REJECT_LIMIT` and `DEFAULT`
+  options are refused.
 - `TRUNCATE` on a registered relation, or on the hot table behind a tiered one,
   fails with an error, because the cold rows in Iceberg would stay visible
   through the view.

@@ -108,8 +108,9 @@ The rename is conditional, so it converts the table on the first run and no-ops
 afterwards; the `CREATE OR REPLACE VIEW` keeps the view's OID across runs. The
 C hook rewrites an INSERT on the view by the watermark cutoff, into a hot
 INSERT of the at/after-cutoff rows into `_events` and the cold sink for the
-older rows. The view has no INSTEAD OF trigger, so a write that reaches it
-without the hook, such as a `COPY`, fails in PostgreSQL.
+older rows, and the utility hook feeds a `COPY FROM` into the same rewrite in
+batches. The view has no INSTEAD OF trigger, so a write that reaches it without
+the hook, such as an `INSERT` nested in `WITH`, fails in PostgreSQL.
 
 ### The Archive Pipeline
 
@@ -296,6 +297,17 @@ as one `INSERT` under the table's claim, taken once per table per transaction;
 its final step flushes the rest. Throughput is bounded by the per-row rendering
 in plpgsql, so for very large mostly-cold seeds, prefer iceberg-only mode where
 ids come from the source data.
+
+`COPY <view> FROM` takes the same path. The utility hook reads the rows with
+PostgreSQL's COPY reader (`BeginCopyFrom`, `NextCopyFrom`), collects
+`cold_write_batch_size` of them, and runs one
+`INSERT INTO <view> (<COPY's columns>) OVERRIDING SYSTEM VALUE VALUES (…), (…)`
+per batch, every value a literal in its type's text form, so the statement is
+the one an application would write and the same rewrite handles it, for a
+decoupled view too. `OVERRIDING SYSTEM VALUE` gives the INSERT the rule `COPY`
+has for a `GENERATED ALWAYS` identity column: a supplied value is kept. `WHERE`
+and the options that act after a row is read (`FREEZE`, `ON_ERROR`,
+`REJECT_LIMIT`, `DEFAULT`) are refused.
 
 A watermark-split INSERT cannot use `RETURNING` - see Cold RETURNING under
 [Tiered-Specific Limitations](#tiered-specific-limitations).

@@ -1,8 +1,8 @@
 -- A tiered view has no INSTEAD OF INSERT trigger. The post_parse_analyze hook
 -- is the one write path: it rewrites a top-level INSERT off the view before the
--- rewriter runs, and a write that reaches the view any other way (a COPY, an
--- INSERT nested in WITH) fails in PostgreSQL instead of landing rows that
--- skipped the hook.
+-- rewriter runs, and a write that reaches the view any other way (an INSERT
+-- nested in WITH) fails in PostgreSQL instead of landing rows that skipped the
+-- hook.
 -- Suppress the run-order-dependent "already exists" NOTICE: in the shared
 -- regress db an earlier test may have created the extensions, standalone not.
 SET client_min_messages = warning;
@@ -62,10 +62,7 @@ SELECT id, status FROM public._events;
   1 | new
 (1 row)
 
--- Writes the hook does not rewrite fail in PostgreSQL, and nothing lands.
-COPY public.events_v2 (ts, status) FROM stdin;
-ERROR:  cannot copy to view "events_v2"
-HINT:  To enable copying to a view, provide an INSTEAD OF INSERT trigger.
+-- A write the hook does not rewrite fails in PostgreSQL, and nothing lands.
 WITH i AS (INSERT INTO public.events_v2 (ts, status) VALUES ('2026-01-01', 'nested') RETURNING id)
 SELECT count(*) FROM i;
 ERROR:  cannot insert into view "events_v2"
