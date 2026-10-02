@@ -310,9 +310,14 @@ hot `INSERT` becomes the entry's body, and `coldfront_source` and
 `coldfront_cold`, the latter as a data-modifying entry so that it always runs,
 are lifted into the statement's `WITH` list just before it. With a watermark a
 row may go cold, so `RETURNING` on such an entry is refused as on a top-level
-`INSERT`; without one every row is hot and `RETURNING` works. A statement may
-write a tiered view once, and a nested `UPDATE` or `DELETE` is not rewritten,
-so PostgreSQL refuses it.
+`INSERT`; without one every row is hot and `RETURNING` works. An `UPDATE` or
+`DELETE` nested in a `WITH` entry takes the path of a top-level one the same
+way: a hot one is a plain swap that keeps `RETURNING`, a cold one is the
+anchor `UPDATE` that runs the DuckDB write, and a dual-tier one has its cold
+half lifted into the statement's `WITH` list. What runs in DuckDB cannot read
+another `WITH` entry, since DuckDB does not see them, and a cross-tier move
+cannot be a `WITH` entry. A statement may write a tiered view once, and a
+nested write may not have a `WITH` clause of its own.
 
 `COPY <view> FROM` takes the same path. The utility hook reads the rows with
 PostgreSQL's COPY reader (`BeginCopyFrom`, `NextCopyFrom`), collects
@@ -366,11 +371,11 @@ a partition-column SET separately by the `coldfront.allow_mixed_writes` GUC:
   hot side is plain PG; the cold side is one `duckdb.raw_query` (DELETE plus
   INSERT, one Iceberg snapshot) under one bakery claim. A target value with no
   covering hot partition is rejected naming the view; the move is not supported
-  inside a function or DO block, with bound parameters, with a VOLATILE new
-  value, with a bare NULL new value, with a new value referencing other
-  columns, alongside a SET of other columns, with `RETURNING`, with a WHERE
-  that references other tables or sub-queries (`UPDATE … FROM`, a sub-select),
-  or on a hot table without a primary key.
+  inside a function, a DO block or a `WITH` entry, with bound parameters, with
+  a VOLATILE new value, with a bare NULL new value, with a new value
+  referencing other columns, alongside a SET of other columns, with
+  `RETURNING`, with a WHERE that references other tables or sub-queries
+  (`UPDATE … FROM`, a sub-select), or on a hot table without a primary key.
 - When the GUC is off (strict), the hook rejects the partition-column SET. To
   change the partition column, delete the row and re-insert it with the new
   value.
@@ -388,10 +393,11 @@ When the predicate is AMBIGUOUS the hook picks one of two behaviors from the
 The hook emits a dual-tier CTE:
 
 ```sql
-WITH hot AS (UPDATE _events SET ... WHERE ... RETURNING *)
-   , cold AS (SELECT coldfront._exec_iceberg_with_claim('ice.public.events',
-                       'UPDATE ice.public.events SET ... WHERE ...'))
-SELECT h.* FROM hot h CROSS JOIN cold c;
+WITH coldfront_hot AS (UPDATE _events SET ... WHERE ... RETURNING *)
+   , coldfront_cold AS (SELECT coldfront._exec_iceberg_with_claim(
+                            'ice.public.events',
+                            'UPDATE ice.public.events SET ... WHERE ...'))
+SELECT h.* FROM coldfront_hot h CROSS JOIN coldfront_cold c;
 ```
 
 The CROSS JOIN forces PG to execute the cold CTE (a pure-SELECT CTE that is not

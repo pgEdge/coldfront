@@ -2510,10 +2510,71 @@ EOSQL
     assert_eq "TC-206: ROLLBACK undid the nested INSERT on both tiers" "0" "$(q "$HOST" "SELECT count(*) FROM events WHERE status = 'tc206_rb';" | tail -1)"
     assert_err "TC-206: RETURNING is refused when a row may go cold" "cold tier" \
         "$(q_may "$HOST" "WITH i AS (INSERT INTO events (ts, status, data) VALUES ('$cut'::timestamptz - interval '1 day', 'tc206_ret', '{}') RETURNING id) SELECT id FROM i;")"
-    # A nested UPDATE or DELETE is not rewritten, and the view refuses it.
-    assert_err "TC-206: a nested DELETE stays PostgreSQL's business" "cannot delete from view" \
-        "$(q_may "$HOST" "WITH d AS (DELETE FROM events WHERE status = 'tc206_nested' RETURNING id) SELECT count(*) FROM d;")"
     q "$HOST" "DELETE FROM events WHERE status LIKE 'tc206%';" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# TC-207: an UPDATE or DELETE nested in WITH takes the path of a top-level one.
+# A hot one is a plain swap that keeps RETURNING; a cold one is the anchor
+# UPDATE that runs the DuckDB write; a dual one lifts its cold half into the
+# outer WITH list. What runs in DuckDB cannot read another WITH entry.
+# ───────────────────────────────────────────────────────────────────────────
+story_nested_update_delete() {
+    step "TC-207: an UPDATE or DELETE nested in WITH goes through the rewrite"
+    local cut O
+    cut=$(q "$HOST" "SELECT cutoff_time FROM coldfront.archive_watermark WHERE table_name = 'events';")
+    # One hot and one cold row per shape.
+    O=$(qf "$HOST" <<EOSQL
+INSERT INTO events (ts, status, data) SELECT '$cut'::timestamptz + i * interval '1 day', s, '{}' FROM (VALUES (1), (-1)) v(i), unnest(ARRAY['tc207_hot', 'tc207_cold', 'tc207_dual', 'tc207_cte', 'tc207_upd']) s;
+CREATE TABLE tc207_archive (id bigint);
+WITH d AS (DELETE FROM events WHERE status = 'tc207_hot' AND ts >= '$cut' RETURNING id)
+INSERT INTO tc207_archive SELECT id FROM d;
+SELECT 'HOTDEL:' || (SELECT count(*) FROM tc207_archive) || '|' || (SELECT count(*) FROM events WHERE status = 'tc207_hot');
+WITH d AS (DELETE FROM events WHERE status = 'tc207_cold' AND ts < '$cut') SELECT 1;
+SELECT 'COLDLEFT:' || count(*) FROM events WHERE status = 'tc207_cold';
+WITH d AS (DELETE FROM events WHERE status = 'tc207_dual') SELECT 1;
+SELECT 'DUALLEFT:' || count(*) FROM events WHERE status = 'tc207_dual';
+WITH u AS (UPDATE events SET status = 'tc207_upd_hot' WHERE status = 'tc207_upd' AND ts >= '$cut' RETURNING id) SELECT 'HOTUPD:' || count(*) FROM u;
+WITH u AS (UPDATE events SET status = 'tc207_upd_cold' WHERE status = 'tc207_upd' AND ts < '$cut') SELECT 1;
+SELECT 'UPD:' || string_agg(status, ',' ORDER BY status) FROM events WHERE status LIKE 'tc207_upd%';
+WITH ids AS (SELECT id FROM public._events WHERE status = 'tc207_cte'),
+     d AS (DELETE FROM events WHERE ts >= '$cut' AND id IN (SELECT id FROM ids) RETURNING id)
+SELECT 'CTEDEL:' || count(*) FROM d;
+DROP TABLE tc207_archive;
+EOSQL
+)
+    assert_eq "TC-207: a hot nested DELETE kept RETURNING and fed the outer INSERT" "1|1" "$(extract HOTDEL "$O")"
+    assert_eq "TC-207: a cold nested DELETE removed the cold row and left the hot one" "1" "$(extract COLDLEFT "$O")"
+    assert_eq "TC-207: a dual nested DELETE removed both tiers' rows" "0" "$(extract DUALLEFT "$O")"
+    assert_eq "TC-207: a hot nested UPDATE kept RETURNING" "1" "$(extract HOTUPD "$O")"
+    assert_eq "TC-207: the hot and the cold nested UPDATE both landed" "tc207_upd_cold,tc207_upd_hot" "$(extract UPD "$O")"
+    assert_eq "TC-207: a hot nested DELETE read an entry before it" "1" "$(extract CTEDEL "$O")"
+    # pg_duckdb runs a statement that reads the view's cold tier in DuckDB, and refuses a data-modifying entry there.
+    assert_err "TC-207: a nested write beside a read of the view is pg_duckdb's refusal" "does not support modifying CTEs" \
+        "$(q_may "$HOST" "WITH ids AS (SELECT id FROM events WHERE status = 'tc207_cte'), d AS (DELETE FROM events WHERE ts >= '$cut' AND id IN (SELECT id FROM ids)) SELECT 1;")"
+    assert_err "TC-207: RETURNING on a cold nested DELETE is refused" "cold tier" \
+        "$(q_may "$HOST" "WITH d AS (DELETE FROM events WHERE status = 'tc207_cte' AND ts < '$cut' RETURNING id) SELECT count(*) FROM d;")"
+    assert_err "TC-207: a cold nested DELETE cannot read another WITH entry" "cannot read another WITH entry" \
+        "$(q_may "$HOST" "WITH ids AS (SELECT id FROM events WHERE status = 'tc207_cte'), d AS (DELETE FROM events WHERE ts < '$cut' AND id IN (SELECT id FROM ids)) SELECT 1;")"
+    assert_err "TC-207: a nested cross-tier move is refused" "not supported" \
+        "$(q_may "$HOST" "WITH u AS (UPDATE events SET ts = ts - interval '400 days' WHERE status = 'tc207_cte' AND ts >= '$cut') SELECT 1;")"
+    assert_err "TC-207: a second write to the view in the statement is refused" "only once" \
+        "$(q_may "$HOST" "WITH d AS (DELETE FROM events WHERE status = 'tc207_cte') INSERT INTO events (ts, status, data) VALUES ('$cut'::timestamptz + interval '1 day', 'tc207_twice', '{}');")"
+    # Inside plpgsql a dual-tier UPDATE's own leading WITH opens the rewritten statement.
+    O=$(qf "$HOST" <<EOSQL
+INSERT INTO events (ts, status, data) SELECT '$cut'::timestamptz + i * interval '1 day', 'tc207_pl', '{}' FROM (VALUES (1), (-1)) v(i);
+DO \$\$ BEGIN WITH v AS (SELECT 'tc207_pl_done' AS s) UPDATE events SET status = (SELECT s FROM v) WHERE status = 'tc207_pl'; END \$\$;
+SELECT 'PLDUAL:' || count(*) FROM events WHERE status = 'tc207_pl_done';
+EOSQL
+)
+    assert_eq "TC-207: a dual UPDATE with a leading WITH inside plpgsql landed on both tiers" "2" "$(extract PLDUAL "$O")"
+    qf "$HOST" <<EOSQL >/dev/null 2>&1
+BEGIN;
+WITH d AS (DELETE FROM events WHERE status = 'tc207_cte' AND ts < '$cut') SELECT 1;
+ROLLBACK;
+EOSQL
+    assert_eq "TC-207: ROLLBACK undid a nested cold DELETE" "1" "$(q "$HOST" "SELECT count(*) FROM events WHERE status = 'tc207_cte' AND ts < '$cut';" | tail -1)"
+    q "$HOST" "DELETE FROM events WHERE status LIKE 'tc207%';" >/dev/null 2>&1
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -6362,6 +6423,7 @@ if [ "$MODE" = "tiered" ]; then
     story_preload_required
     story_copy_into_view
     story_nested_insert
+    story_nested_update_delete
     story_coexist
     story_cold_retention
     story_tiered_twolevel

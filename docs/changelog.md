@@ -54,10 +54,12 @@ this project adheres to
   `coldfront.cold_write_batch_size` rows, with the identity values and defaults
   an `INSERT` would give them. `COPY ... WHERE` and the `FREEZE`, `ON_ERROR`,
   `REJECT_LIMIT` and `DEFAULT` options are refused.
-- An `INSERT` nested in a `WITH` entry, on a tiered or a decoupled view, goes
-  through the INSERT rewrite: the hot `INSERT` becomes the entry's body, and
-  the rewrite's source and cold sink join the statement's `WITH` list. With a
-  watermark, `RETURNING` on it is refused, as on a top-level `INSERT`.
+- An `INSERT`, `UPDATE` or `DELETE` nested in a `WITH` entry, on a tiered or
+  a decoupled view, goes through the same rewrite as a top-level one: the hot
+  statement becomes the entry's body, and the rewrite's own entries (a tiered
+  `INSERT`'s source and cold sink, a dual-tier write's cold half) join the
+  statement's `WITH` list. With a watermark, `RETURNING` on a nested `INSERT`
+  is refused, as on a top-level one; a hot `UPDATE` or `DELETE` keeps it.
 
 ### Changed
 
@@ -103,6 +105,10 @@ this project adheres to
 - A tiered `INSERT` with a second `INSERT` into the same view nested in its
   `WITH` was rewritten into a statement with a syntax error. A statement that
   writes a tiered view more than once is now refused.
+- A dual-tier `UPDATE` or `DELETE` with a leading `WITH` inside a plpgsql
+  function or `DO` block failed with a syntax error, because the rewrite put
+  its own `WITH` ahead of the statement's. The statement's entries now open
+  the rewritten statement.
 - A tiered `INSERT … SELECT` ran its source once per tier. A source whose
   rows differed between the two runs landed some rows in both tiers and others
   in neither, and when the hot table had no identity column, or the statement

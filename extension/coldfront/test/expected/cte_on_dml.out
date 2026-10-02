@@ -1,15 +1,20 @@
--- Regression guard: a leading WITH (CTE) clause on UPDATE/DELETE over a tiered
--- view. pg_get_querydef emits the WITH clause before the verb, so the rewrite
--- must find the result relation past the WITH preamble and carry the WITH through
--- verbatim with only the relation swapped (hot heap / Iceberg). White-box:
--- EXPLAIN VERBOSE shows the rewritten cold SQL; we do NOT execute.
+-- A WITH clause on an UPDATE or DELETE over a tiered view, in both positions
+-- PostgreSQL allows. A leading WITH is carried through verbatim with only the
+-- relation swapped (hot heap or Iceberg): pg_get_querydef emits it before the
+-- verb, so the rewrite finds the result relation past it. An UPDATE or DELETE
+-- nested in a WITH entry takes the path of a top-level one, rewritten in
+-- place. White-box: EXPLAIN VERBOSE shows the cold SQL, and only hot rows are
+-- executed, since the regress server has no warehouse.
+-- Suppress the run-order-dependent "already exists" NOTICE: in the shared
+-- regress db an earlier test may have created the extensions, standalone not.
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS pg_duckdb;
-NOTICE:  extension "pg_duckdb" already exists, skipping
 CREATE EXTENSION IF NOT EXISTS coldfront;
-NOTICE:  extension "coldfront" already exists, skipping
+RESET client_min_messages;
 SET TIME ZONE 'UTC';
 SET coldfront.warehouse = '';
 SET coldfront.lakekeeper_endpoint = '';
+SET coldfront.dblink_self = '';
 CREATE TABLE public._events (id int, ts timestamptz, status text);
 CREATE VIEW public.events AS SELECT * FROM public._events;
 INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
@@ -61,6 +66,88 @@ DROP TABLE public.staging;
 -- (coldfront.c) is then revisited.
 SELECT duckdb.raw_query('WITH gone AS (DELETE FROM nowhere RETURNING id) SELECT id FROM gone');
 ERROR:  (PGDuckDB/pgduckdb_raw_query_cpp) Parser Error: A CTE needs a SELECT
+-- An UPDATE or DELETE nested in a WITH entry. A hot one is a plain swap that
+-- keeps RETURNING and may read an entry before it; a cold one is the anchor
+-- UPDATE that runs the DuckDB write; a dual one lifts its cold half into the
+-- statement's WITH list, just before the entry.
+INSERT INTO public._events VALUES (1, '2026-05-01 00:00:00+00', 'hot'), (2, '2026-05-02 00:00:00+00', 'hot');
+WITH u AS (UPDATE public.events SET status = 'nested' WHERE ts >= '2026-05-01 00:00:00+00' AND id = 1 RETURNING id, status)
+SELECT id, status FROM u;
+ id | status 
+----+--------
+  1 | nested
+(1 row)
+
+WITH ids AS (SELECT 2 AS id),
+     d AS (DELETE FROM public.events WHERE ts >= '2026-05-01 00:00:00+00' AND id IN (SELECT id FROM ids) RETURNING id)
+SELECT id AS deleted FROM d;
+ deleted 
+---------
+       2
+(1 row)
+
+SELECT id, status FROM public._events ORDER BY id;
+ id | status 
+----+--------
+  1 | nested
+(1 row)
+
+EXPLAIN (COSTS OFF, VERBOSE)
+  WITH d AS (DELETE FROM public.events WHERE ts < '2026-01-01 00:00:00+00')
+  SELECT 1;
+                                                                                         QUERY PLAN                                                                                          
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result
+   Output: 1
+   CTE d
+     ->  Update on coldfront._dummy_dml_target
+           ->  Seq Scan on coldfront._dummy_dml_target
+                 Output: _dummy_dml_target.anchor, _dummy_dml_target.ctid
+                 Filter: (_exec_iceberg_with_claim('ice.default.events'::text, 'DELETE FROM ice.default.events   WHERE (ts < ''Thu Jan 01 00:00:00 2026 UTC''::timestamptz)'::text) IS NULL)
+(7 rows)
+
+EXPLAIN (COSTS OFF, VERBOSE)
+  WITH u AS (UPDATE public.events SET status = 'dual' WHERE id = 1)
+  SELECT 1;
+                                                                               QUERY PLAN                                                                               
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result
+   Output: 1
+   CTE coldfront_cold
+     ->  Update on coldfront._dummy_dml_target
+           ->  Seq Scan on coldfront._dummy_dml_target
+                 Output: _dummy_dml_target.anchor, _dummy_dml_target.ctid
+                 Filter: (_exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET status = ''dual''::text   WHERE (id = 1)'::text) IS NULL)
+   CTE u
+     ->  Update on public._events
+           ->  Seq Scan on public._events
+                 Output: 'dual'::text, _events.ctid
+                 Filter: (_events.id = 1)
+(12 rows)
+
+-- What runs in DuckDB cannot read another WITH entry, or return rows.
+WITH ids AS (SELECT 1 AS id),
+     d AS (DELETE FROM public.events WHERE ts < '2026-01-01 00:00:00+00' AND id IN (SELECT id FROM ids))
+SELECT 1;
+ERROR:  a cold-tier write on "events" nested in WITH cannot read another WITH entry
+DETAIL:  It runs in DuckDB, which does not see the statement's WITH entries.
+HINT:  Run it as its own statement.
+WITH d AS (DELETE FROM public.events WHERE ts < '2026-01-01 00:00:00+00' RETURNING id)
+SELECT id FROM d;
+ERROR:  RETURNING is not supported for writes to the cold tier of "events"
+HINT:  The cold tier (Iceberg) cannot return affected rows — duckdb-iceberg does not support RETURNING on writes. Re-run without RETURNING.
+-- A partition-column UPDATE with a watermark is a cross-tier move, which no
+-- WITH entry can hold.
+WITH u AS (UPDATE public.events SET ts = ts - interval '1 year' WHERE ts >= '2026-05-01 00:00:00+00')
+SELECT 1;
+ERROR:  a cross-tier move of partition column "ts" on tiered view "events" is not supported inside a function, a DO block or a WITH entry
+HINT:  Run the partition-column UPDATE as a top-level statement.
+-- One write to the view per statement.
+WITH d AS (DELETE FROM public.events WHERE ts >= '2026-05-01 00:00:00+00')
+INSERT INTO public.events VALUES (3, '2026-05-03 00:00:00+00', 'twice');
+ERROR:  a statement may write a tiered view only once
+HINT:  Split the writes into separate statements.
+DELETE FROM public._events;
 -- Cleanup.
 DELETE FROM coldfront.tiered_views;
 DELETE FROM coldfront.archive_watermark;

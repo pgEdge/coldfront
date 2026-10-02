@@ -206,9 +206,9 @@ EXPLAIN (COSTS OFF, VERBOSE)
 WITH a AS (SELECT 2 AS id, '2026-05-01 00:00:00+00'::timestamptz AS ts, 'from_cte' AS status),
      i AS (INSERT INTO public.iceplain SELECT id, ts, status FROM a)
 SELECT 1;
-ERROR:  an INSERT nested in WITH on decoupled view "iceplain" cannot read another WITH entry
-DETAIL:  Its source runs in DuckDB, which does not see the statement's WITH entries.
-HINT:  Run the INSERT as its own statement.
+ERROR:  a cold-tier write on "iceplain" nested in WITH cannot read another WITH entry
+DETAIL:  It runs in DuckDB, which does not see the statement's WITH entries.
+HINT:  Run it as its own statement.
 CREATE TABLE public.staging (id int, ts timestamptz, status text);
 WITH moved AS (DELETE FROM public.staging RETURNING id, ts, status)
 INSERT INTO public.iceplain SELECT id, ts, status FROM moved;
