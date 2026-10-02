@@ -340,11 +340,13 @@ defaulted column a value, as DuckDB can draw neither, and loses its
 sets the partition column is refused in favour of an `UPDATE`, whose
 cross-tier move replays a single-relation `WHERE` per tier, and so is one on a
 table with a clustered vector column, whose rows the `INSERT`, `UPDATE` and
-`DELETE` rewrites assign to clusters. A `MERGE` nested in a `WITH` entry is
-not rewritten and fails in PostgreSQL. When a statement gives the view no
-alias, the deparser qualifies its columns by the view's name, so the
-retargeted relation takes that name as its alias; an `UPDATE … FROM`, a
-`DELETE … USING` and a correlated sub-select are handled the same way.
+`DELETE` rewrites assign to clusters. A `MERGE` nested in a `WITH` entry
+takes the path of a nested `UPDATE` or `DELETE`: a hot one is the entry's body
+and keeps `RETURNING`, a cold one is the anchor `UPDATE` that runs the DuckDB
+write. When a statement gives the view no alias, the deparser qualifies its
+columns by the view's name, so the retargeted relation takes that name as its
+alias; an `UPDATE … FROM`, a `DELETE … USING` and a correlated sub-select are
+handled the same way.
 
 `COPY <view> FROM` takes the same path. The utility hook reads the rows with
 PostgreSQL's COPY reader (`BeginCopyFrom`, `NextCopyFrom`), collects

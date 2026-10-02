@@ -992,9 +992,10 @@ Keep the following caveats in mind when running either mode:
   `UPDATE` or `DELETE` action per statement (duckdb-iceberg's limit), and a
   `WHEN NOT MATCHED BY SOURCE` action must bound the same tier in its own
   condition. A `MERGE` that sets the partition column is refused (run the
-  change as an `UPDATE`), as is one on a table with a clustered vector column,
-  one whose source reads the view, and one nested in a `WITH` entry. On a
-  decoupled view every `MERGE` runs in DuckDB.
+  change as an `UPDATE`), as is one on a table with a clustered vector column
+  and one whose source reads the view. A `MERGE` nested in a `WITH` entry
+  takes the same path as a nested `UPDATE` or `DELETE`. On a decoupled view
+  every `MERGE` runs in DuckDB.
 - `TRUNCATE` on a registered relation, or on the hot table behind a tiered one,
   fails with an error, because the cold rows in Iceberg would stay visible
   through the view.

@@ -65,7 +65,8 @@ this project adheres to
   column to, in PostgreSQL against the hot table or in DuckDB against the
   Iceberg table, and each `INSERT` action's row is checked to belong to that
   tier; a `MERGE` that bounds neither tier is refused. A decoupled `MERGE` runs
-  in DuckDB.
+  in DuckDB. A `MERGE` nested in a `WITH` entry takes the same path as a
+  nested `UPDATE` or `DELETE`.
 
 ### Changed
 

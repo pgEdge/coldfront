@@ -73,6 +73,31 @@ DROP FUNCTION public.hot_merge();
 -- give it.
 MERGE INTO public.events t USING public.src s ON t.id = s.id AND t.ts < '2026-01-01 00:00:00+00'
 WHEN NOT MATCHED THEN INSERT (ts, status) VALUES (s.ts, s.status);
+-- A MERGE nested in a WITH entry takes the path of a top-level one, rewritten
+-- in place: a hot one is the entry's body and keeps RETURNING, a cold one is
+-- the anchor UPDATE that runs the DuckDB write.
+WITH m AS (MERGE INTO public.events t USING public.src s ON t.id = s.id AND t.ts >= '2026-05-01 00:00:00+00'
+           WHEN MATCHED AND s.status = 'upd' THEN UPDATE SET status = 'nested' RETURNING merge_action() AS action, t.id, t.status)
+SELECT action, id, status FROM m;
+EXPLAIN (COSTS OFF, VERBOSE)
+  WITH m AS (MERGE INTO public.events t USING public.src s ON t.id = s.id AND t.ts < '2026-01-01 00:00:00+00'
+             WHEN MATCHED THEN UPDATE SET status = s.status)
+  SELECT 1;
+-- What runs in DuckDB cannot return rows or read another WITH entry; a nested
+-- MERGE may not have a WITH clause of its own, and the view is written once.
+WITH m AS (MERGE INTO public.events t USING public.src s ON t.id = s.id AND t.ts < '2026-01-01 00:00:00+00'
+           WHEN MATCHED THEN UPDATE SET status = s.status RETURNING t.id)
+SELECT id FROM m;
+WITH ids AS (SELECT 1 AS id),
+     m AS (MERGE INTO public.events t USING ids ON t.id = ids.id AND t.ts < '2026-01-01 00:00:00+00'
+           WHEN MATCHED THEN UPDATE SET status = 'x')
+SELECT 1;
+WITH m AS (WITH ids AS (SELECT 1 AS id) MERGE INTO public.events t USING ids ON t.id = ids.id AND t.ts >= '2026-05-01 00:00:00+00'
+           WHEN MATCHED THEN UPDATE SET status = 'x')
+SELECT 1;
+WITH m AS (MERGE INTO public.events t USING public.src s ON t.id = s.id AND t.ts >= '2026-05-01 00:00:00+00'
+           WHEN MATCHED THEN UPDATE SET status = 'x')
+INSERT INTO public.events (ts, status) VALUES ('2026-05-05 00:00:00+00', 'twice');
 -- The ON condition must bound one tier; the partition column cannot be set; the
 -- source cannot read the view.
 MERGE INTO public.events t USING public.src s ON t.id = s.id

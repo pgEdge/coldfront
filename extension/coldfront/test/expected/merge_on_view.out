@@ -129,6 +129,66 @@ WHEN NOT MATCHED THEN INSERT (ts, status) VALUES (s.ts, s.status);
 ERROR:  a MERGE into the cold tier of tiered view "events" must give a value for column "id"
 DETAIL:  The row is built in DuckDB, which cannot draw the column's next identity value or evaluate its default.
 HINT:  List "id" in the INSERT action, with OVERRIDING SYSTEM VALUE for a GENERATED ALWAYS identity column.
+-- A MERGE nested in a WITH entry takes the path of a top-level one, rewritten
+-- in place: a hot one is the entry's body and keeps RETURNING, a cold one is
+-- the anchor UPDATE that runs the DuckDB write.
+WITH m AS (MERGE INTO public.events t USING public.src s ON t.id = s.id AND t.ts >= '2026-05-01 00:00:00+00'
+           WHEN MATCHED AND s.status = 'upd' THEN UPDATE SET status = 'nested' RETURNING merge_action() AS action, t.id, t.status)
+SELECT action, id, status FROM m;
+ action | id | status 
+--------+----+--------
+ UPDATE |  1 | nested
+(1 row)
+
+EXPLAIN (COSTS OFF, VERBOSE)
+  WITH m AS (MERGE INTO public.events t USING public.src s ON t.id = s.id AND t.ts < '2026-01-01 00:00:00+00'
+             WHEN MATCHED THEN UPDATE SET status = s.status)
+  SELECT 1;
+NOTICE:  result: Success	
+BOOLEAN	
+[ Rows: 0]
+
+
+NOTICE:  result: Success	
+BOOLEAN	
+[ Rows: 0]
+
+
+                                                                                                                                              QUERY PLAN                                                                                                                                              
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result
+   Output: 1
+   CTE m
+     ->  Update on coldfront._dummy_dml_target
+           ->  Seq Scan on coldfront._dummy_dml_target
+                 Output: _dummy_dml_target.anchor, _dummy_dml_target.ctid
+                 Filter: (_exec_iceberg_with_claim('ice.default.events'::text, 'MERGE INTO ice.default.events t    USING pglocal.public.src s    ON ((t.id = s.id) AND (t.ts < ''Thu Jan 01 00:00:00 2026 UTC''::timestamptz))    WHEN MATCHED     THEN UPDATE SET status = s.status'::text) IS NULL)
+(7 rows)
+
+-- What runs in DuckDB cannot return rows or read another WITH entry; a nested
+-- MERGE may not have a WITH clause of its own, and the view is written once.
+WITH m AS (MERGE INTO public.events t USING public.src s ON t.id = s.id AND t.ts < '2026-01-01 00:00:00+00'
+           WHEN MATCHED THEN UPDATE SET status = s.status RETURNING t.id)
+SELECT id FROM m;
+ERROR:  RETURNING is not supported for writes to the cold tier of "events"
+HINT:  The cold tier (Iceberg) cannot return affected rows — duckdb-iceberg does not support RETURNING on writes. Re-run without RETURNING.
+WITH ids AS (SELECT 1 AS id),
+     m AS (MERGE INTO public.events t USING ids ON t.id = ids.id AND t.ts < '2026-01-01 00:00:00+00'
+           WHEN MATCHED THEN UPDATE SET status = 'x')
+SELECT 1;
+ERROR:  a cold-tier write on "events" nested in WITH cannot read another WITH entry
+DETAIL:  It runs in DuckDB, which does not see the statement's WITH entries.
+HINT:  Run it as its own statement.
+WITH m AS (WITH ids AS (SELECT 1 AS id) MERGE INTO public.events t USING ids ON t.id = ids.id AND t.ts >= '2026-05-01 00:00:00+00'
+           WHEN MATCHED THEN UPDATE SET status = 'x')
+SELECT 1;
+ERROR:  a write to tiered view "events" nested in WITH cannot have a WITH clause of its own
+HINT:  Move its entries to the statement's WITH clause.
+WITH m AS (MERGE INTO public.events t USING public.src s ON t.id = s.id AND t.ts >= '2026-05-01 00:00:00+00'
+           WHEN MATCHED THEN UPDATE SET status = 'x')
+INSERT INTO public.events (ts, status) VALUES ('2026-05-05 00:00:00+00', 'twice');
+ERROR:  a statement may write a tiered view only once
+HINT:  Split the writes into separate statements.
 -- The ON condition must bound one tier; the partition column cannot be set; the
 -- source cannot read the view.
 MERGE INTO public.events t USING public.src s ON t.id = s.id

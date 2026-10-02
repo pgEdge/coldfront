@@ -27,12 +27,12 @@
  * every row is hot. Iceberg-only views short-circuit INSERT to the cold path.
  * The view has no INSTEAD OF trigger: the INSERT is rewritten off the view
  * (cf_reparse_and_replace) before the rewriter sees it, and a write the hook
- * does not rewrite fails in PostgreSQL. An INSERT, UPDATE or DELETE nested in
- * a WITH entry is rewritten in place, with the rewrite's own WITH entries
- * lifted into the statement's list (cf_splice_nested_dml). A MERGE runs on the
- * tier its ON condition bounds (cf_emit_merge_path): retargeted to the hot
- * table, or in DuckDB against the Iceberg table, each INSERT action guarding
- * the inserted partition value per row.
+ * does not rewrite fails in PostgreSQL. A MERGE runs on the tier its ON
+ * condition bounds (cf_emit_merge_path): retargeted to the hot table, or in
+ * DuckDB against the Iceberg table, each INSERT action guarding the inserted
+ * partition value per row. Any of the four nested in a WITH entry is rewritten
+ * in place, with the rewrite's own WITH entries lifted into the statement's
+ * list (cf_splice_nested_dml).
  *
  * ATTACH requirement: the DuckDB 'ice' catalog alias must be attached in the
  * current session before cold DML fires.  The hook calls
@@ -3200,11 +3200,11 @@ cf_resolve_tiered_dml_target(Query *query, RangeTblEntry **rte,
 }
 
 /*
- * The first WITH entry of `query` that is an INSERT, UPDATE or DELETE on a
- * registered tiered view, or NULL; *nwrites counts them all. Only a top-level
- * statement can hold one (parse_cte.c), and parse_sub_analyze runs no
- * post_parse_analyze_hook for it, so the hook meets it here, inside the
- * statement that holds it.
+ * The first WITH entry of `query` that is an INSERT, UPDATE, DELETE or MERGE
+ * on a registered tiered view, or NULL; *nwrites counts them all. Only a
+ * top-level statement can hold one (parse_cte.c, which admits a MERGE from
+ * PostgreSQL 17), and parse_sub_analyze runs no post_parse_analyze_hook for
+ * it, so the hook meets it here, inside the statement that holds it.
  */
 static CommonTableExpr *
 cf_find_nested_dml(Query *query, RangeTblEntry **rte, TieredViewInfo *info,
@@ -3222,7 +3222,8 @@ cf_find_nested_dml(Query *query, RangeTblEntry **rte, TieredViewInfo *info,
         TieredViewInfo   i;
 
         if ((q->commandType != CMD_INSERT && q->commandType != CMD_UPDATE &&
-             q->commandType != CMD_DELETE) || !cf_dml_target_view(q, &r, &i))
+             q->commandType != CMD_DELETE && q->commandType != CMD_MERGE) ||
+            !cf_dml_target_view(q, &r, &i))
             continue;
         if (found == NULL)
         {

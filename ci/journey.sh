@@ -434,9 +434,12 @@ WHEN NOT MATCHED THEN INSERT (id, ts, status, data) VALUES (s.id, date_trunc('mo
 SELECT 'MERGED:'||string_agg(status, ',' ORDER BY status) FROM iceonly WHERE id IN (1, 40);
 MERGE INTO iceonly t USING (VALUES (40)) s(id) ON t.id = s.id WHEN MATCHED THEN DELETE;
 SELECT 'MERGEDEL:'||count(*) FROM iceonly WHERE id = 40;
+WITH m AS (MERGE INTO iceonly t USING (VALUES (41, 'nested_merge')) s(id, st) ON t.id = s.id WHEN NOT MATCHED THEN INSERT (id, ts, status, data) VALUES (s.id, date_trunc('month',now()) + interval '10 hours 4 minutes 0 seconds', s.st, '{}')) SELECT 1;
+SELECT 'NESTEDMERGE:'||count(*) FROM iceonly WHERE id = 41;
 EOSQL
 )
         assert_eq "decoupled MERGE ran its UPDATE and INSERT actions, and a second its DELETE, through the hook" "merge_ins,merged|0" "$(extract MERGED "$O")|$(extract MERGEDEL "$O")"
+        assert_eq "decoupled MERGE nested in WITH lands through the hook" "1" "$(extract NESTEDMERGE "$O")"
     fi
 }
 
@@ -2695,6 +2698,76 @@ ROLLBACK;
 EOSQL
     assert_eq "TC-208: ROLLBACK undid a cold MERGE" "1" "$(q "$HOST" "SELECT count(*) FROM events WHERE id = $c5;" | tail -1)"
     q "$HOST" "DELETE FROM events WHERE status LIKE 'tc208%';" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# TC-209: a MERGE nested in a WITH entry (PostgreSQL 17 on) takes the path of a
+# top-level one, rewritten in place: a hot one is the entry's body and keeps
+# RETURNING, a cold one is the anchor UPDATE that runs the DuckDB write.
+# ───────────────────────────────────────────────────────────────────────────
+story_nested_merge() {
+    step "TC-209: a MERGE nested in WITH goes through the rewrite"
+    local cut hot cold pgv O h1 h2 c1 c2 c3
+    cut=$(q "$HOST" "SELECT cutoff_time FROM coldfront.archive_watermark WHERE table_name = 'events';")
+    hot=$(q "$HOST" "SELECT '$cut'::timestamptz + interval '2 days';")
+    cold=$(q "$HOST" "SELECT '$cut'::timestamptz - interval '2 days';")
+    pgv=$(q "$HOST" "SHOW server_version_num;")
+    if [ "$pgv" -lt 170000 ]; then
+        # PostgreSQL 16 refuses a MERGE as a WITH entry (parse_cte.c), before any hook runs.
+        assert_err "TC-209: on PostgreSQL 16 a MERGE in WITH is refused by PostgreSQL, ahead of the hook" "MERGE not supported in WITH query" \
+            "$(q_may "$HOST" "WITH m AS (MERGE INTO events t USING (VALUES (0)) s(id) ON t.id = s.id AND t.ts >= '$cut' WHEN MATCHED THEN UPDATE SET status = 'tc209') SELECT 1;")"
+        return
+    fi
+    # One hot and one cold row per status.
+    q "$HOST" "INSERT INTO events (ts, status, data) SELECT '$cut'::timestamptz + i * interval '1 day', s, '{}' FROM (VALUES (1), (-1)) v(i), unnest(ARRAY['tc209_h1', 'tc209_h2', 'tc209_c1', 'tc209_c2', 'tc209_c3']) s;" >/dev/null 2>&1
+    h1=$(q "$HOST" "SELECT id FROM public._events WHERE status = 'tc209_h1';")
+    h2=$(q "$HOST" "SELECT id FROM public._events WHERE status = 'tc209_h2';")
+    c1=$(q "$HOST" "SELECT id FROM events WHERE status = 'tc209_c1' AND ts < '$cut';" | tail -1)
+    c2=$(q "$HOST" "SELECT id FROM events WHERE status = 'tc209_c2' AND ts < '$cut';" | tail -1)
+    c3=$(q "$HOST" "SELECT id FROM events WHERE status = 'tc209_c3' AND ts < '$cut';" | tail -1)
+    O=$(qf "$HOST" <<EOSQL
+WITH m AS (MERGE INTO events t USING (VALUES ($h1)) s(id) ON t.id = s.id AND t.ts >= '$cut' WHEN MATCHED THEN UPDATE SET status = 'tc209_hot_upd' RETURNING merge_action() AS a, t.status)
+SELECT 'HOT:' || a || '|' || status FROM m;
+WITH a AS (SELECT 0 AS id),
+     m AS (MERGE INTO events t USING a ON t.id = a.id AND t.ts >= '$cut' WHEN NOT MATCHED THEN INSERT (ts, status, data) VALUES ('$hot', 'tc209_hot_ins', '{}') RETURNING t.id)
+SELECT 'HOTINS:' || count(*) FROM m;
+SELECT 'HOTINSROW:' || count(*) FROM public._events WHERE status = 'tc209_hot_ins';
+CREATE TABLE public.tc209_log (id bigint);
+WITH m AS (MERGE INTO events t USING (VALUES ($h2)) s(id) ON t.id = s.id AND t.ts >= '$cut' WHEN MATCHED THEN DELETE RETURNING t.id)
+INSERT INTO public.tc209_log SELECT id FROM m;
+SELECT 'LOG:' || (SELECT count(*) FROM public.tc209_log) || '|' || (SELECT count(*) FROM public._events WHERE id = $h2);
+DROP TABLE public.tc209_log;
+WITH m AS (MERGE INTO events USING (VALUES ($c1)) s(id) ON events.id = s.id AND events.ts < '$cut' WHEN MATCHED THEN UPDATE SET status = 'tc209_cold_upd') SELECT 1;
+SELECT 'COLD:' || status FROM events WHERE id = $c1;
+WITH m AS (MERGE INTO events t USING (VALUES (990011)) s(id) ON t.id = s.id AND t.ts < '$cut' WHEN NOT MATCHED THEN INSERT (id, ts, status, data) OVERRIDING SYSTEM VALUE VALUES (s.id, '$cold', 'tc209_cold_ins', '{}')) SELECT 1;
+SELECT 'COLDINS:' || count(*) FROM events WHERE id = 990011;
+DO \$\$ DECLARE x int; BEGIN WITH m AS (MERGE INTO events t USING (VALUES ($c2)) s(id) ON t.id = s.id AND t.ts < '$cut' WHEN MATCHED THEN UPDATE SET status = 'tc209_pl_done') SELECT 1 INTO x; END \$\$;
+SELECT 'PL:' || count(*) FROM events WHERE status = 'tc209_pl_done';
+EOSQL
+)
+    assert_eq "TC-209: a hot nested MERGE kept RETURNING" "UPDATE|tc209_hot_upd" "$(extract HOT "$O")"
+    assert_eq "TC-209: a hot nested MERGE read an entry before it and inserted through the guard" "1|1" "$(extract HOTINS "$O")|$(extract HOTINSROW "$O")"
+    assert_eq "TC-209: a hot nested MERGE's RETURNING fed the outer INSERT" "1|0" "$(extract LOG "$O")"
+    assert_eq "TC-209: a cold nested MERGE without an alias ran on the Iceberg table" "tc209_cold_upd" "$(extract COLD "$O")"
+    assert_eq "TC-209: a cold nested MERGE's INSERT action landed cold" "1" "$(extract COLDINS "$O")"
+    assert_eq "TC-209: a cold nested MERGE inside plpgsql ran" "1" "$(extract PL "$O")"
+    assert_err "TC-209: a hot nested MERGE's INSERT of a row below the cutoff is refused" "hot tier" \
+        "$(q_may "$HOST" "WITH m AS (MERGE INTO events t USING (VALUES (0)) s(id) ON t.id = s.id AND t.ts >= '$cut' WHEN NOT MATCHED THEN INSERT (ts, status, data) VALUES ('$cold', 'tc209_bad', '{}')) SELECT 1;")"
+    assert_err "TC-209: RETURNING on a cold nested MERGE is refused" "cold tier" \
+        "$(q_may "$HOST" "WITH m AS (MERGE INTO events t USING (VALUES ($c3)) s(id) ON t.id = s.id AND t.ts < '$cut' WHEN MATCHED THEN UPDATE SET status = 'x' RETURNING t.id) SELECT count(*) FROM m;")"
+    assert_err "TC-209: a cold nested MERGE cannot read another WITH entry" "cannot read another WITH entry" \
+        "$(q_may "$HOST" "WITH ids AS (SELECT $c3 AS id), m AS (MERGE INTO events t USING ids ON t.id = ids.id AND t.ts < '$cut' WHEN MATCHED THEN UPDATE SET status = 'x') SELECT 1;")"
+    assert_err "TC-209: a nested MERGE with a WITH clause of its own is refused" "WITH clause of its own" \
+        "$(q_may "$HOST" "WITH m AS (WITH s AS (SELECT $h1 AS id) MERGE INTO events t USING s ON t.id = s.id AND t.ts >= '$cut' WHEN MATCHED THEN UPDATE SET status = 'x') SELECT 1;")"
+    assert_err "TC-209: a second write to the view beside a nested MERGE is refused" "only once" \
+        "$(q_may "$HOST" "WITH m AS (MERGE INTO events t USING (VALUES ($h1)) s(id) ON t.id = s.id AND t.ts >= '$cut' WHEN MATCHED THEN UPDATE SET status = 'x') INSERT INTO events (ts, status, data) VALUES ('$hot', 'tc209_twice', '{}');")"
+    qf "$HOST" <<EOSQL >/dev/null 2>&1
+BEGIN;
+WITH m AS (MERGE INTO events t USING (VALUES ($c3)) s(id) ON t.id = s.id AND t.ts < '$cut' WHEN MATCHED THEN DELETE) SELECT 1;
+ROLLBACK;
+EOSQL
+    assert_eq "TC-209: ROLLBACK undid a cold nested MERGE" "1" "$(q "$HOST" "SELECT count(*) FROM events WHERE id = $c3;" | tail -1)"
+    q "$HOST" "DELETE FROM events WHERE status LIKE 'tc209%';" >/dev/null 2>&1
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -6545,6 +6618,7 @@ if [ "$MODE" = "tiered" ]; then
     story_nested_insert
     story_nested_update_delete
     story_merge
+    story_nested_merge
     story_coexist
     story_cold_retention
     story_tiered_twolevel
