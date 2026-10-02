@@ -41,7 +41,7 @@ ACID model and distributed scaling story.
 Orthogonal to the three axes above, any ColdFront node - vanilla or a mesh
 member - can have one or more **physical (streaming) standbys that serve
 read-only cross-tier reads**. The hot tier arrives by physical replication; the
-cold tier is read by `iceberg_scan` executing on the read-only backend. A base
+cold tier is read by DuckDB executing on the read-only backend. A base
 backup contains the coldfront catalog (`tiered_views`, `archive_watermark`,
 `storage_secret`) and the GUCs (in `postgresql.conf`, not `ALTER SYSTEM`), so a
 replica is byte-identical to its primary (same OIDs). The DuckDB persistent
@@ -76,7 +76,7 @@ below:
 │    Iceberg catalog on the first query touching a view      │
 │  • coldfront.tiered_views registry + bakery claims         │
 │  • pg_duckdb runs DuckDB in-process:                       │
-│      iceberg_scan() reads cold data, duckdb.raw_query()    │
+│      DuckDB reads cold data, duckdb.raw_query()            │
 │      writes it                                             │
 └──────────────┬───────────────────────────────────────────┘
                │
@@ -164,9 +164,9 @@ The Iceberg catalog ATTACH is **lazy**: the coldfront C extension hook issues
 `coldfront.warehouse` and `coldfront.lakekeeper_endpoint` GUCs - on the **first
 query that touches a tiered view** (read or write), per DuckDB cached
 connection. There is no setup step and no per-session boilerplate: both reads
-(`iceberg_scan`) and writes (`duckdb.raw_query`) work on a fresh psql session.
-Until a tiered view is touched no ATTACH is attempted, so a pre-bootstrap
-connection is never blocked by a missing warehouse.
+(the view's `duckdb.query`) and writes (`duckdb.raw_query`) work on a fresh
+psql session. Until a tiered view is touched no ATTACH is attempted, so a
+pre-bootstrap connection is never blocked by a missing warehouse.
 
 ### Non-Superuser App Roles (Least Privilege)
 
@@ -178,7 +178,7 @@ loading on `ATTACH`. So `coldfront.ensure_attached()` / `ensure_pg_attached()`
 are `SECURITY DEFINER` with a pinned `search_path`: the extension load +
 `ATTACH` run elevated (gates key off `GetUserId()`, the effective user), and
 because the DuckDB instance is per-backend the attach persists for the
-session - every subsequent `iceberg_scan` / `_exec_iceberg_with_claim` then
+session - every subsequent cold read / `_exec_iceberg_with_claim` then
 runs as the **app role** over S3/httpfs, never touching `LocalFileSystem`. The
 app role needs only `duckdb.postgres_role` membership, object grants, and SET
 on the superuser-only `duckdb.unsafe_allow_execution_inside_functions`
@@ -516,7 +516,7 @@ The cross-cutting limitations are:
 
 - `jsonb` reads as `json` through the view, unless the read is rerouted to the
   hot heap: DuckDB has no native `jsonb`, and pg_duckdb takes over any query
-  that references `iceberg_scan` (all-or-nothing plan takeover), so the cold
+  that references a DuckDB read (all-or-nothing plan takeover), so the cold
   branch cannot produce a PG `jsonb` directly. The view generator casts `jsonb`
   columns to DuckDB-safe `json` on both sides: hot emits `"col"::json`, cold
   emits `r['col']::json`, the UNION unifies on `json`. Standard JSON access
@@ -530,7 +530,7 @@ The cross-cutting limitations are:
 
 - Interception happens at the planner level, with no per-query decision engine:
   `pg_duckdb` decides whether to take over a query by inspecting the parse tree
-  for signals (references to `iceberg_scan`, the `duckdb.force_execution` GUC,
+  for signals (a pg_duckdb table function, the `duckdb.force_execution` GUC,
   DuckDB-only functions). Once pg_duckdb takes over, the whole statement runs
   in DuckDB; there is no cost-based hot-vs-cold split per predicate. The one
   exception is a single-table read whose WHERE proves `ts >= cutoff`: the hook

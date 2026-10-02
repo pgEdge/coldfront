@@ -1523,7 +1523,7 @@ func pgFormatTypeToDuckDB(s string) (storage, viewCastType string, err error) {
 
 	// inet/cidr are NOT supported. pg_duckdb cannot represent PG inet (Oid 869)
 	// anywhere in a query it plans, and every read through an Iceberg-backed view
-	// is planned by pg_duckdb (the view embeds iceberg_scan). It rejects the
+	// is planned by pg_duckdb (the view embeds a DuckDB read). It rejects the
 	// column *reference* at plan time, before any cast — so "store as VARCHAR,
 	// cast back to inet" is impossible. They fall through to the unsupported-type
 	// error below; users store IP data as text.

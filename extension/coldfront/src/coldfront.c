@@ -17,8 +17,8 @@
  * The hot rewrite is plain PG DML.  The cold rewrite wraps the DuckDB DML in
  * a SELECT so it doesn't trip pg_duckdb's mixed-write check (the PG
  * command-ID counter stays put), and duckdb.raw_query() runs as a regular C
- * function call.  In both cases the rewritten query contains no iceberg_scan
- * references, so pg_duckdb's planner hook leaves it alone.
+ * function call.  In both cases the rewritten query holds no DuckDB table
+ * function, so pg_duckdb's planner hook leaves it alone.
  *
  * INSERT is rewritten too (cf_emit_tiered_insert_path): with a watermark it
  * reads the source once and splits the rows by the partition column against
@@ -451,8 +451,8 @@ lookup_tiered_view(Oid relid, const char *vname, TieredViewInfo *info)
  * sub-select, a set-operation branch): pg_duckdb runs the whole statement in DuckDB
  * whichever branch names the view. Once the rewriter has expanded the view its RTE
  * is a subquery that keeps the view's relid, so the planner hook sees it too. Used
- * to lazily attach 'ice' before the read executes (the view body's
- * iceberg_scan('ice...') only resolves once the catalog is attached) and to gate
+ * to lazily attach 'ice' before the read executes (the view body's read of
+ * ice.<ns>.<table> only resolves once the catalog is attached) and to gate
  * the read rewrites. The cheap relkind syscache check gates the SPI lookup so plain
  * table queries (the OLTP hot path) never pay for it.
  */
@@ -2710,7 +2710,7 @@ cf_reparse_and_replace(Query *query, const char *new_sql, ColdParamSet *ps)
  * have ts < cutoff), the rows it can return are exactly those the hot heap already
  * holds. Re-point the tiered-view reference at that heap and reparse: the read then
  * runs in plain PostgreSQL — full jsonb, no DuckDB round-trip — instead of pg_duckdb
- * planning the whole iceberg_scan UNION in DuckDB. The reparse re-resolves column
+ * planning the whole hot/cold UNION in DuckDB. The reparse re-resolves column
  * types (the view casts data::json; the heap is native jsonb).
  *
  * Conservative by construction — only the simple single-relation shape (no join, CTE,
@@ -2784,8 +2784,8 @@ cf_try_reroute_hot_read(Query *query)
 
 /*
  * Make a read DuckDB will run acceptable to it. A query against a tiered /
- * iceberg-only view runs entirely in DuckDB (the view body is an iceberg_scan
- * UNION), which has no jsonb type, no date_bin and no JSON builders. Two passes over
+ * iceberg-only view runs entirely in DuckDB (the view body reads the Iceberg
+ * table), which has no jsonb type, no date_bin and no JSON builders. Two passes over
  * the analysed tree: the JSON builders are rewritten on the node tree
  * (cf_json_builder_mutator, where key/value pairing is exact), then the deparsed
  * text gets the read whitelist (normalize_for_read: the ::jsonb cast and the
@@ -3103,8 +3103,8 @@ cf_maybe_inject_probe(Query *query)
  * Read path for a SELECT that touches a registered tiered view. First try to
  * reroute a provably-hot read to the heap (runs in plain PG). Otherwise the read
  * spans the cold tier: lazily attach
- * 'ice' (once per session) so the view body's iceberg_scan('ice...') resolves —
- * the version-agnostic cold-read attach (PG 16/17/18) — narrow a recognised
+ * 'ice' (once per session) so the view body's read of ice.<ns>.<table> resolves
+ * (the version-agnostic cold-read attach, PG 16/17/18), narrow a recognised
  * similarity search to its probed clusters, and rewrite the spellings DuckDB (which
  * runs the whole view query) lacks into ones it accepts. The relkind check inside
  * query_reads_tiered_view keeps plain queries off the SPI path.
@@ -3339,7 +3339,7 @@ cf_splice_nested_dml(Query *query, Query *inner, RangeTblEntry *rte,
  * reference. A second reference to the SAME tiered view, a self-join (UPDATE …
  * FROM v), DELETE … USING v, a MERGE source, or a sub-select (… WHERE id IN
  * (SELECT … FROM v)), would be copied through verbatim and then fail
- * confusingly (PG cannot scan the iceberg_scan view; DuckDB does not know it).
+ * confusingly (PG cannot run the view's DuckDB read; DuckDB does not know it).
  * Reject it cleanly here; a structural multi-reference rewrite is out of scope.
  * (INSERT … SELECT routing is handled separately by emit_tiered_insert.)
  */
@@ -3443,8 +3443,8 @@ expr_refs_other_col_walker(Node *node, void *ctx)
  * cold tier is read through DuckDB, which can't correlate with Postgres tables);
  * bound params (e and WHERE are deparsed to literal text at parse-analyze, where
  * a param's value is not yet known); a multi-column SET; a VOLATILE e; an e that
- * references other columns; a bare-NULL e. (in_plpgsql is rejected by the caller
- * — the move's iceberg_scan read can't run nested inside a function/DO.)
+ * references other columns; a bare-NULL e. (in_plpgsql is rejected by the caller:
+ * the move's cold read can't run nested inside a function/DO.)
  */
 static void
 cf_reject_unsupported_move(Query *query, RangeTblEntry *rte,
@@ -3457,7 +3457,7 @@ cf_reject_unsupported_move(Query *query, RangeTblEntry *rte,
     reject_cold_returning(query, vname);
 
     /* The move replays the deparsed WHERE against one relation at a time (the hot
-     * heap, and iceberg_scan for the cold tier), so it cannot reference other
+     * heap, and the catalog read for the cold tier), so it cannot reference other
      * tables: the cold tier is read through DuckDB, which can't correlate with
      * Postgres tables. Reject UPDATE ... FROM and sub-query predicates with a clear
      * message rather than the opaque "missing FROM-clause entry" they fail with. */
@@ -3530,7 +3530,7 @@ cf_reject_unsupported_move(Query *query, RangeTblEntry *rte,
  * returns the rewrite "SELECT coldfront._cross_tier_move(schema, view, where, e)".
  * That function does the relocation: it arms its own GUCs, attaches 'ice', and
  * routes matched rows into the four tier cases. The work lives there (not in a
- * hook-installed Query) because cold→hot rows are read with iceberg_scan, which
+ * hook-installed Query) because cold→hot rows are read through DuckDB, which
  * pg_duckdb runs in DuckDB only as a standalone read — not as the modifying Query
  * the hook installs — and only inside a function with the unsafe-execution GUC.
  */

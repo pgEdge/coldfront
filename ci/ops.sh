@@ -150,7 +150,7 @@ q "$DB" "SET ROLE cfapp; INSERT INTO public.cold1 VALUES (102),(103);"    >/dev/
 assert_eq "app role: transparent cold writes landed (read-your-write)" "3" \
     "$(qas cfapp "SELECT count(*) FROM public.cold1 WHERE id IN (101,102,103);")"
 
-# A cross-tier move reads Iceberg with iceberg_scan inside a function, which
+# A cross-tier move reads Iceberg through DuckDB inside a function, which
 # pg_duckdb permits only under a parameter it defines superuser-only. The move
 # runs as the caller, so onboarding grants the app role the right to set it;
 # without that a partition-column UPDATE is denied before any row moves.

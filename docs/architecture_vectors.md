@@ -536,7 +536,7 @@ produces silently wrong results or a hard failure:
 - `embedding::vector <=> …` fails with `Type with name vector does not exist!`,
   and materializing the read does not help. The unadorned form resolves, so
   nothing needs the cast.
-- There is no PostgreSQL-side fallback. When a view embeds `iceberg_scan`,
+- There is no PostgreSQL-side fallback. When a view embeds a DuckDB read,
   DuckDB owns the whole query and a function it lacks is a hard error rather
   than a slow path. Every expression the product wants users to write has to
   resolve in DuckDB.

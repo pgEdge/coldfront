@@ -2,7 +2,7 @@
 -- to a tiered view. A second reference to the same view — a self-join
 -- (UPDATE … FROM v), DELETE … USING v, or a sub-select (… WHERE id IN
 -- (SELECT … FROM v)) — would be copied through verbatim and then fail
--- confusingly (PG cannot scan the iceberg_scan view; DuckDB does not know it).
+-- confusingly (PG cannot run the view's DuckDB read; DuckDB does not know it).
 -- The hook must reject these cleanly at parse-analyze, before planning. A
 -- structural multi-reference rewrite is out of scope. White-box: no Iceberg
 -- attached; single-reference DML is unaffected (see update_{hot,cold}_via_view).

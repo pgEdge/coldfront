@@ -22,8 +22,8 @@ VALUES ('public', 'events', 'public._events', 'ice.default.events', 'ts');
 INSERT INTO coldfront.archive_watermark(schema_name, table_name, cutoff_time)
 VALUES ('public', 'events', '2026-03-01'::timestamptz);
 
--- Before: view definition has the cold iceberg_scan branch.
-SELECT pg_get_viewdef('public.events'::regclass) LIKE '%iceberg_scan%' AS has_cold_branch;
+-- Before: the view definition has the cold branch, a catalog read.
+SELECT pg_get_viewdef('public.events'::regclass) LIKE '%duckdb.query(%' AS has_cold_branch;
 
 -- Rename the view.
 ALTER VIEW public.events RENAME TO events_v2;
@@ -33,7 +33,7 @@ SELECT table_name FROM coldfront.archive_watermark ORDER BY table_name;
 
 -- The rebuilt view under the new name STILL has the cold UNION branch
 -- (watermark lookup matched the new name).
-SELECT pg_get_viewdef('public.events_v2'::regclass) LIKE '%iceberg_scan%' AS has_cold_branch;
+SELECT pg_get_viewdef('public.events_v2'::regclass) LIKE '%duckdb.query(%' AS has_cold_branch;
 
 -- The registry relname migrated to the new view name (name-keyed).
 SELECT (schema_name = 'public' AND relname = 'events_v2') AS registry_points_at_new_view,

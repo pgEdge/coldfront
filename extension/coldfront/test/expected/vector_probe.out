@@ -129,21 +129,21 @@ SELECT coldfront._vec_probed_viewdef('public', 'chunks', 'embedding', ARRAY[1,2]
     FROM _chunks                                                                                                                                                                       +
    WHERE (_chunks.ts >= '2026-03-01 00:00:00+00'::timestamp with time zone)                                                                                                            +
  UNION ALL                                                                                                                                                                             +
-  SELECT (r.r['id'::text])::bigint AS id,                                                                                                                                              +
-     (r.r['ts'::text])::timestamp with time zone AS ts,                                                                                                                                +
-     (r.r['body'::text])::character varying AS body,                                                                                                                                   +
-     (r.r['embedding'::text])::real[] AS embedding                                                                                                                                     +
-    FROM iceberg_scan('ice.default.chunks'::text) r(r)                                                                                                                                 +
-   WHERE (r.r['ts'::text] < '2026-03-01 00:00:00+00'::timestamp with time zone) AND (r['_cf_vec_list_embedding']::integer IN (1, 2)) UNION ALL  SELECT (r.r['id'::text])::bigint AS id,+
-     (r.r['ts'::text])::timestamp with time zone AS ts,                                                                                                                                +
-     (r.r['body'::text])::character varying AS body,                                                                                                                                   +
-     (r.r['embedding'::text])::real[] AS embedding                                                                                                                                     +
-    FROM iceberg_scan('ice.default.chunks'::text) r(r)                                                                                                                                 +
-   WHERE (r.r['ts'::text] < '2026-03-01 00:00:00+00'::timestamp with time zone) AND r['_cf_vec_list_embedding']::integer IS NULL
+  SELECT (t.r['id'::text])::bigint AS id,                                                                                                                                              +
+     (t.r['ts'::text])::timestamp with time zone AS ts,                                                                                                                                +
+     (t.r['body'::text])::character varying AS body,                                                                                                                                   +
+     (t.r['embedding'::text])::real[] AS embedding                                                                                                                                     +
+    FROM duckdb.query('SELECT * FROM ice.default.chunks'::text) t(r)                                                                                                                   +
+   WHERE (t.r['ts'::text] < '2026-03-01 00:00:00+00'::timestamp with time zone) AND (r['_cf_vec_list_embedding']::integer IN (1, 2)) UNION ALL  SELECT (t.r['id'::text])::bigint AS id,+
+     (t.r['ts'::text])::timestamp with time zone AS ts,                                                                                                                                +
+     (t.r['body'::text])::character varying AS body,                                                                                                                                   +
+     (t.r['embedding'::text])::real[] AS embedding                                                                                                                                     +
+    FROM duckdb.query('SELECT * FROM ice.default.chunks'::text) t(r)                                                                                                                   +
+   WHERE (t.r['ts'::text] < '2026-03-01 00:00:00+00'::timestamp with time zone) AND r['_cf_vec_list_embedding']::integer IS NULL
 (1 row)
 
 SELECT (length(d) - length(replace(d, 'FROM _chunks', ''))) / length('FROM _chunks') AS hot_arms,
-       (length(d) - length(replace(d, 'iceberg_scan(', ''))) / length('iceberg_scan(') AS cold_arms
+       (length(d) - length(replace(d, 'duckdb.query(', ''))) / length('duckdb.query(') AS cold_arms
   FROM coldfront._vec_probed_viewdef('public', 'chunks', 'embedding', ARRAY[1,2]) AS d;
  hot_arms | cold_arms 
 ----------+-----------
@@ -161,7 +161,7 @@ $do$;
 SELECT right(pg_get_viewdef('public.chunks_probed'::regclass), 120) AS reparsed_tail;
                                                       reparsed_tail                                                       
 --------------------------------------------------------------------------------------------------------------------------
- xt] < '2026-03-01 00:00:00+00'::timestamp with time zone) AND ((r.r['_cf_vec_list_embedding'::text])::integer IS NULL));
+ xt] < '2026-03-01 00:00:00+00'::timestamp with time zone) AND ((t.r['_cf_vec_list_embedding'::text])::integer IS NULL));
 (1 row)
 
 -- Declining is silent. No probe set, an empty one, and a table with no vector column.

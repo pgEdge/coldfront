@@ -38,7 +38,7 @@ catalog, the object store, and the archiver:
 │  └── errors on ambiguous predicates in strict mode        │
 │                                                           │
 │  pg_duckdb: DuckDB runs in-process inside PostgreSQL      │
-│  ├── view reads cold data via iceberg_scan()              │
+│  ├── view reads cold data through the catalog             │
 │  └── Archiver + coldfront write via duckdb.raw_query()    │
 └──────────────┬───────────────────────────────────────────┘
                │
@@ -100,7 +100,7 @@ CREATE OR REPLACE VIEW events AS
   WHERE "ts" >= '2026-03-01'::timestamptz
   UNION ALL
   SELECT r['id']::bigint, r['ts']::timestamptz, r['status']::text, r['data']::json
-  FROM iceberg_scan('ice.public.events') r
+  FROM duckdb.query('SELECT * FROM ice.public.events') AS t(r)
   WHERE r['ts'] < '2026-03-01'::timestamptz;
 ```
 
@@ -539,7 +539,7 @@ query those rather than the top-level `events`.
 ### Performance Note: Partition Pruning After the Swap
 
 A query through the `events` view routes via pg_duckdb's takeover path
-(`iceberg_scan` is present, so pg_duckdb converts the whole query to DuckDB
+(a DuckDB read is present, so pg_duckdb converts the whole query to DuckDB
 SQL, which issues a `postgres_scan` on `_events` where PG applies partition
 pruning natively). A single-table read whose WHERE proves it hot
 (`ts >= cutoff`) is rerouted to `_events` automatically and runs in plain
@@ -595,16 +595,20 @@ The dual-tier model has the following limitations:
 - Any write that touches the cold tier (a cold-only UPDATE/DELETE, a permissive
   dual-tier UPDATE/DELETE, or a watermark-split INSERT) **rejects `RETURNING`
   with a clear error** rather than returning a partial result. The cold tier
-  genuinely cannot return affected rows: duckdb-iceberg's binder refuses
+  cannot return affected rows: duckdb-iceberg's binder refuses
   `RETURNING` on Iceberg writes and pg_duckdb's row-returning entry point is
   SELECT-only. Hot-only DML keeps `RETURNING` (it is plain PG DML).
 
 - An ambiguous dual-tier UPDATE returns the command tag `SELECT n` rather than
   `UPDATE n`, because the rewrite produces a SELECT wrapper around a DML CTE.
-  The row count reflects hot rows only. Other rewritten writes report
-  `SELECT 1`: a top-level cold-only UPDATE/DELETE, a watermark-split INSERT
-  (which returns one `(hot_rows, cold_rows)` row), and a cross-tier move.
-  Inside PL/pgSQL, a cold-only write reports `UPDATE 0`, so `FOUND` is false.
+  The row count reflects hot rows only. A watermark-split INSERT reports
+  `SELECT 1` for the same reason and returns one `(hot_rows, cold_rows)` row.
+  A top-level cold-only UPDATE or DELETE and a cross-tier move become a plain
+  SELECT of one function call, a shape for which PostgreSQL keeps the
+  statement's own tag with the rows returned, so they report `UPDATE 1` or
+  `DELETE 1` whatever the number of cold rows written. Inside PL/pgSQL, a
+  cold-only write reports `UPDATE 0`, so `FOUND` is false, and a dual-tier
+  write or a split INSERT counts its hot rows.
 
 - An UPDATE/DELETE that references the same tiered view more than once - a
   self-join (`UPDATE events ... FROM events e2`), `DELETE ... USING events`, or

@@ -168,7 +168,9 @@ END $$`,
 }
 
 // GenerateViewSQL generates the unified view replacing the original table name.
-// Hot data comes from _{source}, cold data from iceberg_scan.
+// Hot data comes from _{source}, cold data from the Iceberg table read through
+// the catalog's table entry (duckdb.query), which sees the transaction's own
+// writes.
 //
 // IMPORTANT: column types in the projected view are stable across cutoffs.
 // Bootstrap (cutoff=zero) emits the hot-only branch but with the same casts
@@ -200,7 +202,7 @@ func GenerateViewSQL(cfg ViewConfig) string {
 		// bootstrap but the UNION with the un-typmod'd cold cast would drop it,
 		// changing the column type on cutover.
 		//
-		// pg_duckdb takes over the whole query once iceberg_scan appears in the
+		// pg_duckdb takes over the whole query once the DuckDB read appears in the
 		// FROM, so the cast runs inside DuckDB on the cutover view; on the
 		// bootstrap (hot-only) view it runs in plain PG. The surface types are
 		// valid in both engines, so the resulting PG column type matches.
@@ -225,8 +227,8 @@ func GenerateViewSQL(cfg ViewConfig) string {
 	}
 
 	cutoff := cfg.cutoffLiteral()
-	// iceberg_scan('...') argument is a DuckDB string literal (the catalog
-	// table ref), not a SQL identifier. Escape apostrophes only.
+	// The catalog read's argument is a DuckDB statement in a string literal, so
+	// the table ref is escaped as a literal (apostrophes only), not an identifier.
 	iceArg := strings.ReplaceAll(cfg.IcebergTable, "'", "''")
 
 	return fmt.Sprintf(
@@ -235,7 +237,7 @@ func GenerateViewSQL(cfg ViewConfig) string {
   WHERE %s >= '%s'::timestamptz
   UNION ALL
   SELECT %s
-  FROM iceberg_scan('%s') r
+  FROM duckdb.query('SELECT * FROM %s') AS t(r)
   WHERE r['%s'] < '%s'::timestamptz`,
 		viewName,
 		strings.Join(hotCols, ", "), cfg.fqHot(),

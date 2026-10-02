@@ -546,8 +546,8 @@ EOSQL
 }
 
 # ───────────────────────────────────────────────────────────────────────────
-# Decoupled read-your-own-write — the wrapper view sources duckdb.query (not
-# iceberg_scan), so an in-transaction SELECT sees the same tx's prior write,
+# Decoupled read-your-own-write: the wrapper view reads through the catalog's
+# table entry, so an in-transaction SELECT sees the same tx's prior write,
 # and ROLLBACK undoes the Iceberg INSERT (pg_duckdb XactCallback ties the txns).
 # ───────────────────────────────────────────────────────────────────────────
 story_decoupled_ryw() {
@@ -2774,6 +2774,45 @@ EOSQL
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# TC-210: a read through a tiered view sees the transaction's own cold writes.
+# The view's cold branch reads the Iceberg table through the catalog's table
+# entry, which includes the transaction's pending data and delete files, and
+# the cross-tier move reads the rows it moves the same way.
+# ───────────────────────────────────────────────────────────────────────────
+story_tiered_ryw() {
+    step "TC-210: a tiered read sees the transaction's own cold writes"
+    local cut cold O
+    cut=$(q "$HOST" "SELECT cutoff_time FROM coldfront.archive_watermark WHERE table_name = 'events';")
+    cold=$(q "$HOST" "SELECT '$cut'::timestamptz - interval '3 days';")
+    q "$HOST" "INSERT INTO events (ts, status, data) VALUES ('$cold', 'tc210_upd', '{}'), ('$cold', 'tc210_del', '{}');" >/dev/null 2>&1
+    O=$(qf "$HOST" <<EOSQL
+BEGIN;
+UPDATE events SET status = 'tc210_upd2' WHERE status = 'tc210_upd' AND ts < '$cut';
+SELECT 'UPD:' || count(*) FROM events WHERE status = 'tc210_upd2';
+INSERT INTO events (ts, status, data) VALUES ('$cold', 'tc210_ins', '{}');
+SELECT 'INS:' || count(*) FROM events WHERE status = 'tc210_ins';
+DELETE FROM events WHERE status = 'tc210_del' AND ts < '$cut';
+SELECT 'DEL:' || count(*) FROM events WHERE status = 'tc210_del';
+ROLLBACK;
+SELECT 'RB1:' || string_agg(status, ',' ORDER BY status) FROM events WHERE status LIKE 'tc210%';
+BEGIN;
+INSERT INTO events (ts, status, data) VALUES ('$cold', 'tc210_mv', '{}');
+UPDATE events SET ts = ts - interval '1 day' WHERE status = 'tc210_mv';
+SELECT 'MOVED:' || count(*) FROM events WHERE status = 'tc210_mv' AND ts = '$cold'::timestamptz - interval '1 day';
+ROLLBACK;
+SELECT 'RB2:' || count(*) FROM events WHERE status = 'tc210_mv';
+EOSQL
+)
+    assert_eq "TC-210: a read in the transaction sees its own cold UPDATE" "1" "$(extract UPD "$O")"
+    assert_eq "TC-210: a read in the transaction sees its own cold INSERT" "1" "$(extract INS "$O")"
+    assert_eq "TC-210: a read in the transaction sees its own cold DELETE" "0" "$(extract DEL "$O")"
+    assert_eq "TC-210: ROLLBACK undid the three cold writes" "tc210_del,tc210_upd" "$(extract RB1 "$O")"
+    assert_eq "TC-210: a cross-tier move finds the transaction's own pending cold row" "1" "$(extract MOVED "$O")"
+    assert_eq "TC-210: ROLLBACK undid the insert and the move" "0" "$(extract RB2 "$O")"
+    q "$HOST" "DELETE FROM events WHERE status LIKE 'tc210%' AND ts < '$cut';" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Story 11 — Coexistence: a second tiered table, no cross-talk.
 # ───────────────────────────────────────────────────────────────────────────
 story_coexist() {
@@ -3285,7 +3324,7 @@ story_mesh_tiered() {
 
 # ───────────────────────────────────────────────────────────────────────────
 # Story 13 — Standby reads: a read-only physical replica serves cross-tier reads
-# (hot via physical replication, cold via iceberg_scan executed on the read-only
+# (hot via physical replication, cold via the DuckDB read executed on the read-only
 # backend) and rejects writes cleanly. The coldfront catalog (registry,
 # watermark, storage-secret row) arrives through the base
 # backup + WAL stream, so the replica is byte-identical to the primary (same
@@ -3327,9 +3366,9 @@ story_standby_reads() {
 
     # Reads MATCH the primary across tiers. The extension hook attaches 'ice'
     # lazily on the first tiered-view query in this read-only session;
-    # iceberg_scan then executes read-only on the replica.
+    # the DuckDB read then executes read-only on the replica.
     assert_eq "standby cross-tier read == primary" "$(q "$HOST" "SELECT count(*) FROM $vn;")" "$(q "$STANDBY" "SELECT count(*) FROM $vn;")"
-    assert_eq "standby cold-side read (iceberg_scan on replica) == primary" \
+    assert_eq "standby cold-side read (DuckDB read on replica) == primary" \
         "$(q "$HOST" "SELECT count(*) FROM $vn WHERE ts < date_trunc('month',now()) - interval '1 month';")" \
         "$(q "$STANDBY" "SELECT count(*) FROM $vn WHERE ts < date_trunc('month',now()) - interval '1 month';")"
 
@@ -6622,6 +6661,7 @@ if [ "$MODE" = "tiered" ]; then
     story_nested_update_delete
     story_merge
     story_nested_merge
+    story_tiered_ryw
     story_coexist
     story_cold_retention
     story_tiered_twolevel

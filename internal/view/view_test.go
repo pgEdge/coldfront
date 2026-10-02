@@ -123,7 +123,7 @@ func TestGenerateViewSQL_WithCutoff(t *testing.T) {
 	assert.Contains(t, sql, `"public"."_events"`)
 	assert.Contains(t, sql, `"ts" >= '2026-03-01`)
 	assert.Contains(t, sql, "UNION ALL")
-	assert.Contains(t, sql, "iceberg_scan")
+	assert.Contains(t, sql, "duckdb.query('SELECT * FROM ")
 	assert.Contains(t, sql, "r['id']::BIGINT")
 	// jsonb columns: the view exposes them as `json` on both sides (pg_duckdb
 	// takes over the whole query and DuckDB has no jsonb type; json works
@@ -223,7 +223,7 @@ func TestRecreate(t *testing.T) {
 	require.Len(t, db.execSQL, 2)
 	assert.Contains(t, db.execSQL[0], `ALTER TABLE "public"."events" RENAME TO "_events"`)
 	assert.Contains(t, db.execSQL[1], `"public"."_events"`)
-	assert.Contains(t, db.execSQL[1], "iceberg_scan")
+	assert.Contains(t, db.execSQL[1], "duckdb.query('SELECT * FROM ")
 }
 
 // Complex identifiers: mixed case, hyphens, reserved keywords, embedded

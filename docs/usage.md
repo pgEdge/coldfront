@@ -923,10 +923,8 @@ Keep the following caveats in mind when running either mode:
   commit by another session after the transaction's first cold read stays
   invisible until the transaction ends. The hot tier follows PostgreSQL's own
   isolation level, so at READ COMMITTED a later statement can see new hot rows
-  but not new cold ones. Within one transaction, a read of a tiered table sees
-  the transaction's own hot-tier writes but not its cold-tier writes, which
-  become visible once it commits. A decoupled table's reads see its own
-  writes.
+  but not new cold ones. Within one transaction, a read of a tiered or
+  decoupled table sees the transaction's own writes on both tiers.
 - In decoupled mode, pg_duckdb commits the Iceberg snapshot at PRE_COMMIT, so a
   backend crash after that but before the PG commit record leaves the Iceberg
   write committed and the PG side lost. A crash after the Parquet upload but

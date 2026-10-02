@@ -29,7 +29,7 @@ VALUES ('public', 'events', '2026-03-01'::timestamptz);
 -- follows with a rebuild) has its cold branch and no trigger, and the extension
 -- has no builder for one.
 ALTER VIEW public.events RENAME TO events_v2;
-SELECT pg_get_viewdef('public.events_v2'::regclass) LIKE '%iceberg_scan%' AS has_cold_branch;
+SELECT pg_get_viewdef('public.events_v2'::regclass) LIKE '%duckdb.query(%' AS has_cold_branch;
 SELECT count(*) AS triggers FROM pg_trigger
  WHERE tgrelid = 'public.events_v2'::regclass AND NOT tgisinternal;
 SELECT to_regproc('coldfront._rebuild_write_trigger') IS NULL              AS no_builder,

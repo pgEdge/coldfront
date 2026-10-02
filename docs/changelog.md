@@ -197,6 +197,12 @@ this project adheres to
 - The walkthrough's guide ran whatever archiver image an earlier run had built,
   because the `archiver` service sits behind a Compose profile that
   `up --build` skips. The guide now builds that image at bring-up.
+- A read through a tiered view inside a transaction sees the transaction's own
+  cold writes (`UPDATE`, `INSERT` and `DELETE`), and a cross-tier move finds a
+  cold row the same transaction inserted. The view's cold branch and the
+  move read the Iceberg table through the catalog's table entry
+  (`duckdb.query`), as a decoupled view does; the plan is the same
+  `ICEBERG_SCAN` with the same pushdown.
 
 ## [1.0.0-beta2] - 2026-08-08
 

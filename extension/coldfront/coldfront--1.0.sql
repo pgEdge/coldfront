@@ -424,7 +424,7 @@ BEGIN
   -- DuckDB execution: pg_duckdb gates on membership of duckdb.postgres_role.
   EXECUTE format('GRANT %I TO %s', duckrole, tgt);
 
-  -- _cross_tier_move reads Iceberg with iceberg_scan inside a function, which
+  -- _cross_tier_move reads Iceberg through DuckDB inside a function, which
   -- pg_duckdb allows only under this parameter, and pg_duckdb defines it
   -- superuser-only. The app role runs that move under its own privileges, so it
   -- needs to set the parameter itself. Narrower than it looks: the deployment
@@ -1006,22 +1006,23 @@ CREATE AGGREGATE coldfront._cold_sink(text, text, jsonb) (
 --   stay-hot  hot,  e>=cut : in-place UPDATE of the hot heap.
 --   hot→cold  hot,  e<cut  : the row leaves the heap (DELETE) and is added to
 --                            Iceberg (INSERT).
---   cold→hot  cold, e>=cut : the row is read from Iceberg into the heap (INSERT
---                            … FROM iceberg_scan) and removed from Iceberg.
+--   cold→hot  cold, e>=cut : the row is read from Iceberg into the heap (a
+--                            cursor row, re-inserted by VALUE) and removed from Iceberg.
 --   stay-cold cold, e<cut  : removed from Iceberg and re-added with the new ts.
 -- Same-tier changes are in-place; crossings write the OTHER tier and remove from
 -- the origin (different relations) — no same-relation overlap.
 --
 -- Cold tier: ONE raw_query (DELETE-set + INSERT-set = one MetaTransaction = one
--- snapshot, the replay_archive_delta idiom; the single delete-bearing op pg_duckdb
--- allows per table per tx) under ONE claim (never per-row tickets). cold→hot reads
--- Iceberg with iceberg_scan, which pg_duckdb permits inside a function only with
--- duckdb.unsafe_allow_execution_inside_functions — the move needs it because the
--- legs are deparsed and run together here. The cold rows destined to stay/return
--- cold are serialised by VALUE from an iceberg_scan cursor (so no uncommitted-
--- staging visibility problem and no second claim); hot→cold rows are serialised
--- from a heap cursor. DELETE is by the OLD primary key; old/new keys differ (the
--- partition column changed) so it never hits a just-inserted row.
+-- snapshot, the replay_archive_delta idiom) under ONE claim (never per-row
+-- tickets). The cold rows are read through the catalog's table entry
+-- (duckdb.query over the Iceberg table), whose scan includes the transaction's
+-- own pending rows; pg_duckdb permits that read inside a function only with
+-- duckdb.unsafe_allow_execution_inside_functions, which the move needs because
+-- the legs are deparsed and run together here. The cold rows destined to
+-- stay/return cold are serialised by VALUE from that cursor before the one
+-- raw_query runs; hot→cold rows are serialised from a heap cursor. DELETE is by
+-- the OLD primary key; old/new keys differ (the partition column changed) so it
+-- never hits a just-inserted row.
 CREATE FUNCTION coldfront._cross_tier_move(
     p_view_schema text, p_view_name text, p_where text, p_newpc text
 ) RETURNS void
@@ -1036,9 +1037,9 @@ DECLARE
     v_cut_lit     text;          -- 'YYYY-…'::timestamptz of the cutoff
     v_pc          text;          -- quoted partition column
     v_cols        text;          -- heap col list (all live cols), quoted
-    v_cold_read   text;          -- iceberg_scan surface projection: r[col]::cast AS col
+    v_cold_read   text;          -- cold read projection: r[col]::cast AS col
     v_has_ident   boolean;
-    v_inner       text;          -- "SELECT v_cold_read FROM iceberg_scan(ice) r WHERE r[pc] < cut"
+    v_inner       text;          -- "SELECT v_cold_read FROM duckdb.query(...) AS t(r) WHERE r[pc] < cut"
     full_cols     text[];
     full_types    text[];
     pk_names      text[];
@@ -1083,7 +1084,7 @@ BEGIN
 
     -- All live heap columns in attnum order — names, types, and whether any is an
     -- identity column — in ONE catalog scan. v_cols (quoted list) and v_cold_read
-    -- (the iceberg_scan surface projection r[col]::cast AS col) derive from the
+    -- (the cold read projection r[col]::cast AS col) derive from the
     -- arrays, mirroring _rebuild_tiered_view's casts (one source of truth via
     -- _iceberg_view_cast_type / _iceberg_storage_type; view cast, else storage).
     SELECT array_agg(a.attname ORDER BY a.attnum),
@@ -1116,8 +1117,8 @@ BEGIN
     SELECT string_agg(quote_ident(nm), ', ' ORDER BY ord) INTO v_pk_list
     FROM unnest(pk_names) WITH ORDINALITY AS u(nm, ord);
 
-    v_inner := format('SELECT %s FROM iceberg_scan(%L) r WHERE r[%L] < %s',
-                      v_cold_read, v_iceberg, v_partcol, v_cut_lit);
+    v_inner := format('SELECT %s FROM duckdb.query(%L) AS t(r) WHERE r[%L] < %s',
+                      v_cold_read, format('SELECT * FROM %s', v_iceberg), v_partcol, v_cut_lit);
     PERFORM coldfront.ensure_attached();
     IF coldfront._types_have_vector(full_types) THEN
         PERFORM coldfront.ensure_pg_attached();
@@ -1128,8 +1129,8 @@ BEGIN
     -- partition, so a row LANDING hot (cold→hot, or stay-hot whose new ts crosses a
     -- hot-partition boundary) would otherwise raise PG's "no partition of relation
     -- _events". Collect the distinct new-ts values of all hot-landing rows from both
-    -- tiers — cold via iceberg_scan, hot via the heap — kept in SEPARATE queries so
-    -- one never mixes iceberg_scan (DuckDB) with pg_catalog (which pg_duckdb cannot
+    -- tiers (cold through DuckDB, hot via the heap) kept in SEPARATE queries so
+    -- one never mixes the DuckDB read with pg_catalog (which pg_duckdb cannot
     -- read), then check coverage against pg_inherits leaf bounds (split_part on the
     -- single-key FOR VALUES FROM ('lo') TO ('hi') rendering; no regex).
     EXECUTE format(
@@ -1160,10 +1161,10 @@ BEGIN
     -- mesh takes the R-A bakery, vanilla a local advisory xact lock.
     PERFORM coldfront._take_iceberg_claim(v_iceberg);
 
-    -- ── Capture the moved rows by VALUE (no iceberg_scan in any modifying stmt) ──
-    -- Affected COLD rows are read with a SELECT cursor over iceberg_scan (a pure
-    -- read, which pg_duckdb runs in DuckDB — a modifying INSERT…FROM iceberg_scan
-    -- would instead trip pg_duckdb's "cannot modify a Postgres table" path). Each
+    -- ── Capture the moved rows by VALUE (no DuckDB read in any modifying stmt) ──
+    -- Affected COLD rows are read with a SELECT cursor over the catalog read (a
+    -- pure read, which pg_duckdb runs in DuckDB; a modifying INSERT … FROM that
+    -- read would trip pg_duckdb's "cannot modify a Postgres table" path). Each
     -- affected cold row is DELETEd from Iceberg by its OLD pk; rows staying cold are
     -- re-added to Iceberg with the new ts; rows crossing to hot are added to the
     -- heap. cf_new_ts is computed in the cursor so e is evaluated once per row.
@@ -1542,7 +1543,7 @@ $$;
 --
 -- Helpers below let an operator create a table that lives entirely in
 -- Iceberg from row 1: no PG heap, no hot tier, no archiver. The PG side is
--- a thin wrapper view that projects iceberg_scan() into PG-typed columns.
+-- a thin wrapper view that projects the Iceberg table into PG-typed columns.
 -- INSERT/UPDATE/DELETE on the wrapper view are rewritten by the coldfront
 -- post_parse_analyze hook (which short-circuits to TIER_COLD when the
 -- registry row has is_iceberg_only=true).
@@ -2670,15 +2671,11 @@ $$;
 --   p_vec_cols the vector columns those cluster columns belong to, or '{}'.
 --   p_writable whether the hook rewrites DML on the view or refuses it.
 --
--- The view sources duckdb.query('SELECT * FROM <ref>') rather than
--- iceberg_scan(<ref>). The pg_duckdb planner folds both into the same
--- iceberg_scan execution plan with predicate pushdown into Parquet row groups,
--- but they differ in transactional visibility: iceberg_scan re-resolves the table
--- from Lakekeeper on each call and always reads the committed snapshot, blind to
--- the same DuckDB session's pending writes, while duckdb.query goes through the
--- session's planner and sees in-progress transaction state. So a SELECT inside an
--- explicit BEGIN block sees the same transaction's prior INSERT/UPDATE/DELETE:
--- read-your-own-write works in decoupled mode.
+-- The view reads the table as duckdb.query('SELECT * FROM <ref>'): the catalog's
+-- table entry, whose scan includes the transaction's own pending data and
+-- delete files, so a SELECT inside a transaction block sees the same
+-- transaction's prior INSERT/UPDATE/DELETE. A tiered view's cold branch reads
+-- the same way (_rebuild_tiered_view, internal/view/view.go).
 CREATE OR REPLACE FUNCTION coldfront._register_iceberg_view(
     p_schema   text,
     p_relname  text,
@@ -4326,13 +4323,13 @@ $ddl$CREATE VIEW %I.%I AS
   WHERE %I >= %L::timestamptz
   UNION ALL
   SELECT %s
-  FROM iceberg_scan(%L) r
+  FROM duckdb.query(%L) AS t(r)
   WHERE r[%L] < %L::timestamptz$ddl$,
             v_schema, v_view_name,
             v_hot_proj, v_hot_schema, v_hot_relname,
             v_partcol, v_cutoff_lit,
             v_cold_proj,
-            v_iceberg,
+            format('SELECT * FROM %s', v_iceberg),
             v_partcol, v_cutoff_lit);
     END IF;
 

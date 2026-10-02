@@ -39,7 +39,7 @@ coordination state to begin accepting writes.
 
 ## Limitation 1 — Iceberg reads on a replica are snapshot-consistent, not linearizable
 
-A hot standby's `iceberg_scan` reads whatever Iceberg snapshot Lakekeeper
+A hot standby's cold reads take whatever Iceberg snapshot Lakekeeper
 points at when the query starts. While the **primary** archives new data or
 commits cold writes, a replica's in-flight read does not observe the concurrent
 commit — it sees the snapshot resolved at query start. This is ordinary Iceberg
