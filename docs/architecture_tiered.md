@@ -439,6 +439,10 @@ upload and the PG commit can leave orphaned object-storage files referenced by
 an uncommitted snapshot. Iceberg housekeeping (orphan-file expiry) reclaims
 them. Strict mode avoids this path entirely.
 
+A cold-only `UPDATE` or `DELETE` sets nothing, so a transaction block that
+holds one cannot also write a PostgreSQL table unless the session sets the
+parameter itself; the [Caveats](usage.md#caveats) state the rule.
+
 ### Strict (`off`)
 
 The hook raises an error with a hint pointing at the partition column and the

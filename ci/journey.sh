@@ -441,6 +441,29 @@ EOSQL
         assert_eq "decoupled MERGE ran its UPDATE and INSERT actions, and a second its DELETE, through the hook" "merge_ins,merged|0" "$(extract MERGED "$O")|$(extract MERGEDEL "$O")"
         assert_eq "decoupled MERGE nested in WITH lands through the hook" "1" "$(extract NESTEDMERGE "$O")"
     fi
+    # pg_duckdb (c04e6a2) refuses a PostgreSQL write after a decoupled write in one
+    # transaction block unless duckdb.unsafe_allow_mixed_transactions is on; the
+    # docs state the rule and leave the parameter to the user.
+    q "$HOST" "CREATE TABLE IF NOT EXISTS mixed_plain (x int);" >/dev/null 2>&1
+    O=$(qf "$HOST" 2>&1 <<'EOSQL'
+BEGIN;
+INSERT INTO iceonly VALUES (42, date_trunc('month',now()) + interval '10 hours 5 minutes 0 seconds', 'mixed', '{}');
+INSERT INTO mixed_plain VALUES (1);
+COMMIT;
+SELECT 'MIXED:' || (SELECT count(*) FROM iceonly WHERE id = 42) || ',' || (SELECT count(*) FROM mixed_plain);
+BEGIN;
+SET LOCAL duckdb.unsafe_allow_mixed_transactions = on;
+INSERT INTO iceonly VALUES (42, date_trunc('month',now()) + interval '10 hours 5 minutes 0 seconds', 'mixed', '{}');
+INSERT INTO mixed_plain VALUES (1);
+COMMIT;
+SELECT 'MIXEDON:' || (SELECT count(*) FROM iceonly WHERE id = 42) || ',' || (SELECT count(*) FROM mixed_plain);
+EOSQL
+)
+    assert_contains "decoupled: pg_duckdb refuses a plain-table write after a decoupled write in one transaction block" "same transaction block is not supported" "$O"
+    assert_eq "decoupled: that block committed nothing" "0,0" "$(extract MIXED "$O")"
+    assert_eq "decoupled: with duckdb.unsafe_allow_mixed_transactions on, the block commits both writes" "1,1" "$(extract MIXEDON "$O")"
+    q "$HOST" "DROP TABLE mixed_plain;" >/dev/null 2>&1
+    q "$HOST" "DELETE FROM iceonly WHERE id = 42;" >/dev/null 2>&1
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -2810,6 +2833,54 @@ EOSQL
     assert_eq "TC-210: a cross-tier move finds the transaction's own pending cold row" "1" "$(extract MOVED "$O")"
     assert_eq "TC-210: ROLLBACK undid the insert and the move" "0" "$(extract RB2 "$O")"
     q "$HOST" "DELETE FROM events WHERE status LIKE 'tc210%' AND ts < '$cut';" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# TC-211: pg_duckdb (c04e6a2) refuses a transaction block that writes both a
+# PostgreSQL table and the cold tier unless duckdb.unsafe_allow_mixed_transactions
+# is on: at the PostgreSQL write when it comes second, at COMMIT when it came
+# first. A cold-only write sets nothing; the dual, split-INSERT and move paths
+# set it for their transaction. The checks pin the rule the docs state.
+# ───────────────────────────────────────────────────────────────────────────
+story_mixed_write_rule() {
+    step "TC-211: a cold-only write and a PostgreSQL write cannot share a transaction block"
+    local cut cold hot O1 O2 O3
+    cut=$(q "$HOST" "SELECT cutoff_time FROM coldfront.archive_watermark WHERE table_name = 'events';")
+    cold=$(q "$HOST" "SELECT '$cut'::timestamptz - interval '3 days';")
+    hot=$(q "$HOST" "SELECT '$cut'::timestamptz + interval '1 day';")
+    q "$HOST" "INSERT INTO events (ts, status, data) VALUES ('$cold', 'tc211_c', '{}'), ('$hot', 'tc211_h', '{}');" >/dev/null 2>&1
+    O1=$(qf "$HOST" 2>&1 <<EOSQL
+BEGIN;
+UPDATE events SET status = 'tc211_c2' WHERE status = 'tc211_c' AND ts < '$cut';
+UPDATE events SET status = 'tc211_h2' WHERE status = 'tc211_h' AND ts >= '$cut';
+COMMIT;
+SELECT 'AFTER:' || string_agg(status, ',' ORDER BY status) FROM events WHERE status LIKE 'tc211%';
+EOSQL
+)
+    assert_contains "TC-211: pg_duckdb refuses a PostgreSQL write after a cold-only write in one transaction block" "same transaction block is not supported" "$O1"
+    assert_eq "TC-211: that block left both rows as they were" "tc211_c,tc211_h" "$(extract AFTER "$O1")"
+    O2=$(qf "$HOST" 2>&1 <<EOSQL
+BEGIN;
+UPDATE events SET status = 'tc211_h2' WHERE status = 'tc211_h' AND ts >= '$cut';
+UPDATE events SET status = 'tc211_c2' WHERE status = 'tc211_c' AND ts < '$cut';
+COMMIT;
+SELECT 'AFTER:' || string_agg(status, ',' ORDER BY status) FROM events WHERE status LIKE 'tc211%';
+EOSQL
+)
+    assert_contains "TC-211: pg_duckdb refuses the COMMIT of a block that wrote a PostgreSQL table before the cold tier" "same transaction block is not supported" "$O2"
+    assert_eq "TC-211: that block left both rows as they were too" "tc211_c,tc211_h" "$(extract AFTER "$O2")"
+    O3=$(qf "$HOST" 2>&1 <<EOSQL
+BEGIN;
+SET LOCAL duckdb.unsafe_allow_mixed_transactions = on;
+UPDATE events SET status = 'tc211_c3' WHERE status = 'tc211_c' AND ts < '$cut';
+UPDATE events SET status = 'tc211_h3' WHERE status = 'tc211_h' AND ts >= '$cut';
+COMMIT;
+SELECT 'AFTER:' || string_agg(status, ',' ORDER BY status) FROM events WHERE status LIKE 'tc211%';
+EOSQL
+)
+    assert_eq "TC-211: with duckdb.unsafe_allow_mixed_transactions on, the same block commits both writes" "tc211_c3,tc211_h3" "$(extract AFTER "$O3")"
+    q "$HOST" "DELETE FROM events WHERE status LIKE 'tc211%' AND ts < '$cut';" >/dev/null 2>&1
+    q "$HOST" "DELETE FROM events WHERE status LIKE 'tc211%' AND ts >= '$cut';" >/dev/null 2>&1
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -6662,6 +6733,7 @@ if [ "$MODE" = "tiered" ]; then
     story_merge
     story_nested_merge
     story_tiered_ryw
+    story_mixed_write_rule
     story_coexist
     story_cold_retention
     story_tiered_twolevel

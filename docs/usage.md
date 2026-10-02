@@ -925,6 +925,20 @@ Keep the following caveats in mind when running either mode:
   isolation level, so at READ COMMITTED a later statement can see new hot rows
   but not new cold ones. Within one transaction, a read of a tiered or
   decoupled table sees the transaction's own writes on both tiers.
+- One transaction block cannot hold both a PostgreSQL write and a cold-tier
+  write unless `duckdb.unsafe_allow_mixed_transactions` is on. pg_duckdb
+  refuses the pair ("Writing to DuckDB and Postgres tables in the same
+  transaction block is not supported"), at the PostgreSQL write when it comes
+  second and at `COMMIT` when it came first. A cold-tier write here is a
+  tiered `UPDATE` or `DELETE` whose `WHERE` bounds the cold tier, or any write
+  to a decoupled table. The statements that write both tiers themselves (a
+  dual-tier `UPDATE` or `DELETE`, a tiered `INSERT` with cold rows, a
+  cross-tier move) set the parameter `LOCAL` for the rest of their
+  transaction, so the block they ran in accepts later writes of either kind.
+  You can set it yourself, `SET LOCAL duckdb.unsafe_allow_mixed_transactions =
+  on`, at your own risk: pg_duckdb commits the Iceberg snapshot at
+  `PRE_COMMIT`, so a backend crash between that and the PostgreSQL commit
+  record keeps the cold write and loses the PostgreSQL writes.
 - In decoupled mode, pg_duckdb commits the Iceberg snapshot at PRE_COMMIT, so a
   backend crash after that but before the PG commit record leaves the Iceberg
   write committed and the PG side lost. A crash after the Parquet upload but

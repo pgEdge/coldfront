@@ -786,12 +786,17 @@ Tiered (the default) is the right choice when:
 
 ## Limitations
 
-Decoupled mode has the following limitation:
+Decoupled mode has the following limitations:
 
 - The cold tier keeps one Iceberg snapshot for the whole transaction, even at
   READ COMMITTED: a commit by another session after the transaction's first
   cold read stays invisible until the transaction ends, where PostgreSQL would
   show it to the next statement.
+- A transaction block that writes a decoupled table cannot also write a
+  PostgreSQL table unless `duckdb.unsafe_allow_mixed_transactions` is on:
+  pg_duckdb refuses the PostgreSQL write, or the `COMMIT` when that write came
+  first. The [Caveats](usage.md#caveats) describe the rule and the risk of
+  setting the parameter.
 
 ## Next Steps
 
