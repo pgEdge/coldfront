@@ -2380,6 +2380,25 @@ EOSQL
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# TC-204: coldfront refuses to load outside shared_preload_libraries. A scratch
+# server from the same binaries that preloads only pg_duckdb cannot create the
+# extension, so a node that skips the setting fails at CREATE EXTENSION instead
+# of running without the hooks.
+# ───────────────────────────────────────────────────────────────────────────
+story_preload_required() {
+    step "TC-204: CREATE EXTENSION coldfront fails on a server that does not preload it"
+    local d=/tmp/cf_nopreload O
+    if ! docker exec "$HOST" bash -c "rm -rf $d $d.log && initdb -D $d --auth=trust -U $CF_DBUSER -E UTF8 --locale=C >/dev/null 2>&1 && pg_ctl -D $d -l $d.log -w -o \"-p 5433 -c listen_addresses='' -c unix_socket_directories=/tmp -c logging_collector=off -c shared_preload_libraries=pg_duckdb\" start >/dev/null 2>&1"; then
+        fail "TC-204: the scratch server did not start"; docker exec "$HOST" bash -c "tail -5 $d.log; rm -rf $d $d.log"; return
+    fi
+    O=$(docker exec "$HOST" psql -h /tmp -p 5433 -U "$CF_DBUSER" -d postgres -tA -c "CREATE EXTENSION pg_duckdb;" -c "CREATE EXTENSION coldfront;" 2>&1 || true)
+    assert_err "TC-204: CREATE EXTENSION coldfront is refused without the preload" "must be loaded via shared_preload_libraries" "$O"
+    assert_eq "TC-204: nothing of the extension was created" "0" \
+        "$(docker exec "$HOST" psql -h /tmp -p 5433 -U "$CF_DBUSER" -d postgres -tA -c "SELECT count(*) FROM pg_extension WHERE extname = 'coldfront';")"
+    docker exec "$HOST" bash -c "pg_ctl -D $d -m immediate stop >/dev/null 2>&1; rm -rf $d $d.log"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Story 11 — Coexistence: a second tiered table, no cross-talk.
 # ───────────────────────────────────────────────────────────────────────────
 story_coexist() {
@@ -6222,6 +6241,7 @@ if [ "$MODE" = "tiered" ]; then
     story_txn
     story_insert_single_pass
     story_view_without_trigger
+    story_preload_required
     story_coexist
     story_cold_retention
     story_tiered_twolevel

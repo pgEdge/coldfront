@@ -99,7 +99,9 @@ when it initializes a new data directory. A server built another way sets them
 itself, as [installation.md](installation.md#bare-metal-no-docker) shows:
 
 - `shared_preload_libraries = 'pg_duckdb,coldfront'` loads both extensions at
-  server start.
+  server start. coldfront refuses to load any other way: `CREATE EXTENSION
+  coldfront` fails on a server that does not preload it, with an error that
+  names the setting.
 - `coldfront.warehouse` and `coldfront.lakekeeper_endpoint` name the Lakekeeper
   warehouse and its catalog endpoint, which the Iceberg catalog `ice` attaches
   to. Only a superuser can set them, and while either is empty the catalog does

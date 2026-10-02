@@ -4737,6 +4737,14 @@ coldfront_planner(Query *parse, const char *query_string, int cursor_options,
 void
 _PG_init(void)
 {
+    /* The hooks exist only in a preloaded library; a session that loaded it
+     * later would run the SQL without them. */
+    if (!process_shared_preload_libraries_in_progress)
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("coldfront must be loaded via shared_preload_libraries"),
+                 errhint("Add coldfront to shared_preload_libraries after pg_duckdb and restart the server.")));
+
     register_gucs();
 
     prev_post_parse_analyze_hook = post_parse_analyze_hook;

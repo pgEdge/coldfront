@@ -70,6 +70,11 @@ this project adheres to
 
 ### Fixed
 
+- On a server that did not preload coldfront, `CREATE EXTENSION coldfront`
+  succeeded and every session then ran without the extension's hooks: no write
+  routing, no DDL mirroring, and no refusal of `DROP` or `TRUNCATE` on a tiered
+  table. The extension now refuses to load outside `shared_preload_libraries`,
+  so `CREATE EXTENSION` fails with an error that names the setting.
 - A write that reached a tiered view through its `INSTEAD OF INSERT` trigger
   rather than the hook (a `COPY`, an `INSERT` nested in `WITH`, a session or a
   node without the hook) wrote cold rows with NULL identity and default values
