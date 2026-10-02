@@ -21,19 +21,19 @@ VALUES ('public', 'events', '2026-03-01'::timestamptz);
 -- Cold UPDATE … RETURNING (ts < cutoff) — rejected.
 UPDATE public.events SET status = 'x' WHERE ts = '2026-01-15 01:00:00+00' RETURNING id;
 ERROR:  RETURNING is not supported for writes to the cold tier of "events"
-HINT:  The cold tier (Iceberg) cannot return affected rows — duckdb-iceberg does not support RETURNING on writes. Re-run without RETURNING.
+HINT:  The cold tier (Iceberg) cannot return affected rows: duckdb-iceberg does not support RETURNING on writes. Re-run without RETURNING.
 -- Cold DELETE … RETURNING — rejected.
 DELETE FROM public.events WHERE ts = '2026-01-15 01:00:00+00' RETURNING id;
 ERROR:  RETURNING is not supported for writes to the cold tier of "events"
-HINT:  The cold tier (Iceberg) cannot return affected rows — duckdb-iceberg does not support RETURNING on writes. Re-run without RETURNING.
+HINT:  The cold tier (Iceberg) cannot return affected rows: duckdb-iceberg does not support RETURNING on writes. Re-run without RETURNING.
 -- Dual-tier (ambiguous predicate, allow_mixed_writes on by default) … RETURNING — rejected.
 UPDATE public.events SET status = 'x' WHERE data->>'m' = 'y' RETURNING id;
 ERROR:  RETURNING is not supported for writes to the cold tier of "events"
-HINT:  The cold tier (Iceberg) cannot return affected rows — duckdb-iceberg does not support RETURNING on writes. Re-run without RETURNING.
+HINT:  The cold tier (Iceberg) cannot return affected rows: duckdb-iceberg does not support RETURNING on writes. Re-run without RETURNING.
 -- Tiered INSERT … RETURNING (watermark present ⇒ split path) — rejected.
 INSERT INTO public.events (id, ts, status) VALUES (1, '2026-01-15 01:00:00+00', 'x') RETURNING id;
 ERROR:  RETURNING is not supported for writes to the cold tier of "events"
-HINT:  The cold tier (Iceberg) cannot return affected rows — duckdb-iceberg does not support RETURNING on writes. Re-run without RETURNING.
+HINT:  The cold tier (Iceberg) cannot return affected rows: duckdb-iceberg does not support RETURNING on writes. Re-run without RETURNING.
 -- Hot UPDATE … RETURNING (ts >= cutoff) is plain PG DML and KEEPS RETURNING —
 -- rewritten to _events, no error.
 EXPLAIN (COSTS OFF)

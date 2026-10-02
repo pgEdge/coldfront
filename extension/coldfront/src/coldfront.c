@@ -490,9 +490,10 @@ query_reads_tiered_view(Query *query)
  * relation plus any self-join FROM/USING entry, sub-select, or CTE that resolves
  * to the same view.  QTW_EXAMINE_RTES_BEFORE makes the walker fire on each
  * RangeTblEntry; recursion into sub-Querys (RTE_SUBQUERY and SubLink subselects)
- * goes through the Query arm.  Used to reject DML that names a tiered view more
- * than once: the deparse rewrite only swaps the leading result-relation token,
- * so a second reference would be copied through verbatim and fail confusingly.
+ * goes through the Query arm.  cf_reject_multi_reference refuses DML that names
+ * a tiered view more than once by this count: the deparse rewrite only swaps
+ * the leading result-relation token, so a second reference would be copied
+ * through verbatim and fail confusingly.
  */
 typedef struct { Oid relid; int count; } ViewRefCount;
 
@@ -679,8 +680,9 @@ classify_qual(Node *qual, Index result_rel, AttrNumber partcol_attno,
         if (!sa_opname || strcmp(sa_opname, "=") != 0)
             return TIER_AMBIGUOUS;
 
-        /* v0.1 handles only ArrayExpr element lists; Const-array folding
-         * happens later in the planner so we should see ArrayExpr here. */
+        /* An IN list reaches the hook as an ArrayExpr of its elements; the
+         * planner folds it into a Const array later. Any other array shape is
+         * ambiguous. */
         if (!IsA(array, ArrayExpr))
             return TIER_AMBIGUOUS;
 
@@ -1798,28 +1800,9 @@ static char *
 emit_cold(Query *query, TieredViewInfo *info, ColdParamSet *ps, bool in_plpgsql)
 {
     DeparseResult  dr;
-    List          *saved_returning;
     char          *cold_dml, *call;
 
-    /*
-     * Save / NIL / restore the returningList around deparse instead of
-     * copyObject(query) — the deep-copy is hundreds of palloc'd nodes per
-     * cold UPDATE/DELETE, all to flip one field. This is on the parser-stage
-     * hot path, so it adds up under load.
-     *
-     * Provably safe: pg_get_querydef's only use of returningList is inside
-     * get_update_query_def / get_delete_query_def / get_insert_query_def,
-     * which read the list and call get_returning_clause to emit text. None
-     * stash a pointer past the call — the deparse_context is stack-local
-     * and dies when the function returns. Cold writes don't currently
-     * return rows (v0.1 cosmetic limit), so we strip RETURNING at the
-     * tree level.
-     */
-    saved_returning = query->returningList;
-    query->returningList = NIL;
     deparse_and_find_prefix(query, &dr);
-    query->returningList = saved_returning;
-
     cold_dml = build_cold_dml(&dr, info, query);
     if (query->commandType == CMD_MERGE)
         cold_dml = rewrite_merge_inserts(cold_dml, query, info, true);
@@ -1869,45 +1852,29 @@ emit_cold(Query *query, TieredViewInfo *info, ColdParamSet *ps, bool in_plpgsql)
  * emit_dual builds the dual-tier CTE used when coldfront.allow_mixed_writes
  * is on and the predicate is TIER_AMBIGUOUS.  Both sides run in the same
  * statement; pg_duckdb's XactCallback keeps the DuckDB transaction tied to
- * PG's, so ROLLBACK undoes both tiers (not crash-safe — orphaned S3 objects
+ * PG's, so ROLLBACK undoes both tiers (not crash-safe: orphaned S3 objects
  * on crash are Iceberg housekeeping's concern).
  *
  * The cold CTE is a SELECT (not DML), so PG would prune it as unreferenced
  * unless the outer query forces its execution.  We use a CROSS JOIN with
- * `cold` in the outer SELECT — see the body comment near the appendStringInfo
+ * `cold` in the outer SELECT; see the body comment near the appendStringInfo
  * call for why MATERIALIZED alone would not be enough.
  *
- * The hot CTE must have RETURNING so the outer SELECT can consume its
- * output.  If the user's UPDATE/DELETE already has a RETURNING list we keep
- * theirs; otherwise we append RETURNING *.  Cold RETURNING is not supported
- * in v0.1, so the outer SELECT only ever shows hot rows.
+ * The hot CTE gets RETURNING * so the outer SELECT can consume its output.
+ * The statement's own RETURNING is refused before this
+ * (reject_cold_returning), since the cold half returns no rows.
  */
 static char *
 emit_dual(Query *query, TieredViewInfo *info, ColdParamSet *ps, bool in_plpgsql)
 {
-    DeparseResult  dr_hot, dr_cold;
+    DeparseResult  dr;
     char          *hot_dml, *cold_dml, *call;
-    bool           has_returning = (query->returningList != NIL);
     StringInfoData buf;
-    List          *saved_returning;
 
-    /* Hot side: deparse with RETURNING intact. */
-    deparse_and_find_prefix(query, &dr_hot);
-    hot_dml = build_hot_dml(&dr_hot, info);
-
-    /*
-     * Cold side: NIL the returningList just for this deparse, then restore.
-     * Same safety argument as emit_cold — pg_get_querydef doesn't keep any
-     * post-call references into the list, so the Query is bit-identical
-     * after restoration. Saves a copyObject(query) per ambiguous UPDATE/
-     * DELETE on a tiered view.
-     */
-    saved_returning = query->returningList;
-    query->returningList = NIL;
-    deparse_and_find_prefix(query, &dr_cold);
-    query->returningList = saved_returning;
-    cold_dml = build_cold_dml(&dr_cold, info, query);
-    call = cold_exec_call(info->iceberg_table, cold_sql_arg(cold_dml, ps));
+    deparse_and_find_prefix(query, &dr);
+    hot_dml  = build_hot_dml(&dr, info);
+    cold_dml = build_cold_dml(&dr, info, query);
+    call     = cold_exec_call(info->iceberg_table, cold_sql_arg(cold_dml, ps));
 
     initStringInfo(&buf);
     if (in_plpgsql)
@@ -1918,11 +1885,11 @@ emit_dual(Query *query, TieredViewInfo *info, ColdParamSet *ps, bool in_plpgsql)
          * WITH entries; the cold call rides in a data-modifying entry
          * (cold_anchor_update), which PG always runs to completion regardless of
          * references, so the cold write still happens when the hot side matches
-         * no rows. The user's RETURNING stays; cold RETURNING is not supported. */
-        append_with_opener(&buf, &dr_hot);
+         * no rows. */
+        append_with_opener(&buf, &dr);
         appendStringInfo(&buf, "coldfront_cold AS (%s) %s%s %s%s",
-                         cold_anchor_update(call), dr_hot.verb, info->hot_table,
-                         dr_hot.alias, dr_hot.rest);
+                         cold_anchor_update(call), dr.verb, info->hot_table,
+                         dr.alias, dr.rest);
     }
     else
     {
@@ -1931,12 +1898,10 @@ emit_dual(Query *query, TieredViewInfo *info, ColdParamSet *ps, bool in_plpgsql)
          * with it in the outer SELECT forces its execution while keeping the row
          * set equal to the hot CTE's, which is DML and always runs. */
         appendStringInfo(&buf,
-            "WITH coldfront_hot AS (%s%s)"
+            "WITH coldfront_hot AS (%s RETURNING *)"
             ", coldfront_cold AS (SELECT %s)"
             " SELECT h.* FROM coldfront_hot h CROSS JOIN coldfront_cold c",
-            hot_dml,
-            has_returning ? "" : " RETURNING *",
-            call);
+            hot_dml, call);
     }
     return buf.data;
 }
@@ -2462,13 +2427,8 @@ emit_tiered_insert(Query *query, TieredViewInfo *info, bool in_plpgsql)
     HotColumns     hc;
     char          *col_list, *cutoff_lit, *src_cte, *hot_dml, *cold_select;
     const char    *source, *vname, *vschema, *override;
-    List          *saved_returning;
 
-    saved_returning = query->returningList;
-    query->returningList = NIL;
     deparse_and_find_prefix(query, &dr);
-    query->returningList = saved_returning;
-
     col_list   = insert_targetlist_collist(query);
     source     = skip_override_clause(skip_leading_collist(dr.rest), query->override);
     cutoff_lit = format_timestamptz_literal(info->cutoff);
@@ -2540,14 +2500,19 @@ ensure_pg_attached_via_spi(void)
 }
 
 /*
- * Refuse a RETURNING clause on any write that touches the cold tier.  The cold
- * tier cannot return affected rows: duckdb-iceberg's binder rejects RETURNING on
- * Iceberg writes ("not yet supported for updates of a Iceberg table"), and
- * pg_duckdb's only row-returning entry point (duckdb.query) is SELECT-only.
- * Erroring here is honest — the alternative is silently returning hot rows only
- * (dual), a void internal row (cold), or nothing (tiered INSERT).  Hot-only DML
- * keeps RETURNING (it is plain PG DML); this is called only on the cold/dual
- * paths.  Revisit when duckdb-iceberg adds RETURNING on writes (see BACKLOG §4).
+ * Refuse a RETURNING clause on any write that touches the cold tier. duckdb-iceberg
+ * 5edc45f0 (the pinned build) refuses RETURNING on every Iceberg write: a
+ * BinderException "RETURNING clause not yet supported for ..." from
+ * src/execution/operator/iceberg_insert.cpp, iceberg_update.cpp and
+ * iceberg_delete.cpp, and a NotImplementedException from
+ * merge_into/iceberg_merge_into.cpp; and pg_duckdb's row-returning entry
+ * point (duckdb.query) runs a SELECT alone. Without this refusal a dual write
+ * would return its hot rows alone, a cold write a void internal row, a tiered
+ * INSERT nothing. Hot-only DML keeps RETURNING (plain PostgreSQL DML); the
+ * cold, dual, tiered-INSERT and cross-tier-move paths call this, so the
+ * emitters behind them deparse a statement without RETURNING. The journey
+ * check "duckdb-iceberg refuses RETURNING on an Iceberg write" sends such a
+ * write to DuckDB directly and fails once the pin accepts it.
  */
 static void
 reject_cold_returning(Query *query, const char *vname)
@@ -2556,7 +2521,7 @@ reject_cold_returning(Query *query, const char *vname)
         ereport(ERROR,
                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                  errmsg("RETURNING is not supported for writes to the cold tier of \"%s\"", vname),
-                 errhint("The cold tier (Iceberg) cannot return affected rows — duckdb-iceberg "
+                 errhint("The cold tier (Iceberg) cannot return affected rows: duckdb-iceberg "
                          "does not support RETURNING on writes. Re-run without RETURNING.")));
 }
 
@@ -3508,8 +3473,8 @@ cf_reject_unsupported_move(Query *query, RangeTblEntry *rte,
                  errmsg("a cross-tier move on tiered view \"%s\" cannot use bound parameters", vname),
                  errhint("Run the UPDATE with literal values for the partition column and WHERE clause.")));
 
-    /* Only the partition column may be SET in a move (v1). A second SET target
-     * would have to be re-projected across all four legs; defer that. */
+    /* Only the partition column may be SET in a move: a second SET target
+     * would have to be re-projected across all four legs. */
     foreach(lc, query->targetList)
     {
         TargetEntry *tle = (TargetEntry *) lfirst(lc);
@@ -4508,7 +4473,8 @@ lookup_tiered_by_hot_oid(Oid relid, TieredDDLInfo *out)
 
 /*
  * Returns true if relid is a registered tiered relation — either the hot table
- * or the transparent view. Used to block DROP/TRUNCATE on either side. Single
+ * or the transparent view. The utility hook blocks DROP/TRUNCATE on either side
+ * with it. Single
  * query, schema-safe via to_regclass (see lookup_tiered_by_hot_oid).
  */
 static bool

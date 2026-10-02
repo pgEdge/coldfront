@@ -171,7 +171,7 @@ WITH m AS (MERGE INTO public.events t USING public.src s ON t.id = s.id AND t.ts
            WHEN MATCHED THEN UPDATE SET status = s.status RETURNING t.id)
 SELECT id FROM m;
 ERROR:  RETURNING is not supported for writes to the cold tier of "events"
-HINT:  The cold tier (Iceberg) cannot return affected rows — duckdb-iceberg does not support RETURNING on writes. Re-run without RETURNING.
+HINT:  The cold tier (Iceberg) cannot return affected rows: duckdb-iceberg does not support RETURNING on writes. Re-run without RETURNING.
 WITH ids AS (SELECT 1 AS id),
      m AS (MERGE INTO public.events t USING ids ON t.id = ids.id AND t.ts < '2026-01-01 00:00:00+00'
            WHEN MATCHED THEN UPDATE SET status = 'x')

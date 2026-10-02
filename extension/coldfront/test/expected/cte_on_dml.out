@@ -135,7 +135,7 @@ HINT:  Run it as its own statement.
 WITH d AS (DELETE FROM public.events WHERE ts < '2026-01-01 00:00:00+00' RETURNING id)
 SELECT id FROM d;
 ERROR:  RETURNING is not supported for writes to the cold tier of "events"
-HINT:  The cold tier (Iceberg) cannot return affected rows — duckdb-iceberg does not support RETURNING on writes. Re-run without RETURNING.
+HINT:  The cold tier (Iceberg) cannot return affected rows: duckdb-iceberg does not support RETURNING on writes. Re-run without RETURNING.
 -- A partition-column UPDATE with a watermark is a cross-tier move, which no
 -- WITH entry can hold.
 WITH u AS (UPDATE public.events SET ts = ts - interval '1 year' WHERE ts >= '2026-05-01 00:00:00+00')

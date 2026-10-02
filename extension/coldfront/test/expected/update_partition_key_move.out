@@ -57,7 +57,7 @@ HINT:  Move the row by setting only "ts"; update other columns in a separate sta
 -- RETURNING from a move (the cold tier cannot return rows).
 UPDATE public.events SET ts = '2026-06-18 10:00:00+00' WHERE status = 'x' RETURNING id;
 ERROR:  RETURNING is not supported for writes to the cold tier of "events"
-HINT:  The cold tier (Iceberg) cannot return affected rows — duckdb-iceberg does not support RETURNING on writes. Re-run without RETURNING.
+HINT:  The cold tier (Iceberg) cannot return affected rows: duckdb-iceberg does not support RETURNING on writes. Re-run without RETURNING.
 -- a WHERE that pulls in other tables / sub-queries: the cold tier is read in
 -- DuckDB, which can't correlate with Postgres tables, so it is rejected up front.
 UPDATE public.events SET ts = '2026-06-18 10:00:00+00' WHERE id IN (SELECT 1);

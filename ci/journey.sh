@@ -447,7 +447,7 @@ EOSQL
 # Story 6b' — Decoupled CRUD from INSIDE plpgsql (a DO block). Every iceonly DML
 # is cold (emit_tiered_insert / emit_cold); a plpgsql var ⇒ a $N kept live via
 # format() (Cause 1), and inside plpgsql the rewrite is the DML-tagged carrier
-# shape (Cause 2). RED before / GREEN after. Exercises the jsonb param branch.
+# shape (Cause 2). Exercises the jsonb param branch.
 # ───────────────────────────────────────────────────────────────────────────
 story_decoupled_plpgsql() {
     step "6b'. Decoupled CRUD from inside plpgsql (DO block, bound params)"
@@ -1597,6 +1597,10 @@ EOSQL
     # rows) rather than silently returning a partial/void result.
     local cr; cr=$(q_may "$HOST" "UPDATE events SET status='x' WHERE ts < date_trunc('month',now()) - interval '3 months' RETURNING id;")
     assert_err "cold-tier RETURNING rejected" "cold tier" "$cr"
+    # duckdb-iceberg 5edc45f0 refuses RETURNING on an Iceberg write itself, the
+    # constraint behind that refusal; this check fails once the pin accepts it.
+    assert_err "duckdb-iceberg refuses RETURNING on an Iceberg write" "RETURNING clause not yet supported" \
+        "$(q_may "$HOST" "SELECT coldfront.ensure_attached(); SELECT duckdb.raw_query('UPDATE \"ice\".\"public\".\"events\" SET status = status WHERE false RETURNING id');")"
     story_cross_tier_move
 }
 
@@ -1924,13 +1928,12 @@ SQL
 }
 
 # ───────────────────────────────────────────────────────────────────────────
-# Story 6c — Cold + dual-tier DML issued from INSIDE plpgsql (a DO block). This
-# is the end-to-end test of BOTH fixes: plpgsql variable refs become $N bound
-# params (Cause 1, kept live via format()), and the rewrite must be a DML-tagged
-# statement plpgsql accepts rather than a bare SELECT (Cause 2, the
-# coldfront._dummy_dml_target carrier — only used here, in the in-plpgsql case).
-# RED before the fix (DuckDB param error, then "query has no destination"),
-# GREEN after, on every backend+topology. Cold = m4 (< the start-of-now-1mo cutoff).
+# Story 6c — Cold + dual-tier DML issued from INSIDE plpgsql (a DO block), the
+# end-to-end test of both plpgsql behaviours: plpgsql variable refs become $N
+# bound params (Cause 1, kept live via format()), and the rewrite is a
+# DML-tagged statement plpgsql accepts rather than a bare SELECT (Cause 2, the
+# coldfront._dummy_dml_target carrier, used in the in-plpgsql case alone). Runs
+# on every backend and topology. Cold = m4 (< the start-of-now-1mo cutoff).
 # ───────────────────────────────────────────────────────────────────────────
 story_writes_plpgsql() {
     step "6c. Cold + dual-tier DML from inside plpgsql (DO block, bound params)"

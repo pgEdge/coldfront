@@ -146,7 +146,7 @@ SELECT id, status FROM public.staging ORDER BY id;
 WITH i AS (INSERT INTO public.events (id, ts, status) VALUES (40, '2026-05-01 00:00:00+00', 'returning') RETURNING id)
 SELECT id FROM i;
 ERROR:  RETURNING is not supported for writes to the cold tier of "events"
-HINT:  The cold tier (Iceberg) cannot return affected rows — duckdb-iceberg does not support RETURNING on writes. Re-run without RETURNING.
+HINT:  The cold tier (Iceberg) cannot return affected rows: duckdb-iceberg does not support RETURNING on writes. Re-run without RETURNING.
 -- The rewrite stands in for one write to the view: a second one in the same
 -- statement is refused.
 WITH i AS (INSERT INTO public.events (id, ts, status) VALUES (41, '2026-05-01 00:00:00+00', 'twice'))
