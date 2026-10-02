@@ -22,29 +22,34 @@ VALUES ('public', 'events', '2026-03-01'::timestamptz);
 EXPLAIN (COSTS OFF, VERBOSE)
   WITH s AS (SELECT 7 AS id, '2026-05-01 00:00:00+00'::timestamptz AS ts, 'new' AS status)
   INSERT INTO public.events SELECT id, ts, status FROM s;
-                                                                                                                                                                                                                            QUERY PLAN                                                                                                                                                                                                                            
-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                  QUERY PLAN                                                   
+---------------------------------------------------------------------------------------------------------------
  Result
-   Output: $3, $4
+   Output: $4, $5
+   CTE src
+     ->  Result
+           Output: 7, 'Fri May 01 00:00:00 2026 UTC'::timestamp with time zone, 'new'::text
    CTE hot_ins
      ->  Insert on public._events
            Output: 1
-           ->  Result
-                 Output: 7, 'Fri May 01 00:00:00 2026 UTC'::timestamp with time zone, 'new'::text
+           ->  CTE Scan on src
+                 Output: src.id, src.ts, src.status
+                 Filter: (src.ts >= 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
    CTE cold_call
-     ->  Result
-           Output: _exec_iceberg_with_claim('ice.default.events'::text, 'INSERT INTO ice.default.events SELECT id, ts, status FROM (WITH s AS (          SELECT 7 AS id,             ''Fri May 01 00:00:00 2026 UTC''::timestamptz AS ts,             ''new''::text AS status         )  SELECT s.id,             s.ts,             s.status            FROM s) AS coldfront_src(id, ts, status) WHERE ts < ''Sun Mar 01 00:00:00 2026 UTC''::timestamptz'::text)
-   InitPlan 3 (returns $3)
+     ->  Aggregate
+           Output: _cold_sink('public'::text, 'events'::text, to_jsonb(ROW(src_1.id, src_1.ts, src_1.status)))
+           ->  CTE Scan on src src_1
+                 Output: src_1.id, src_1.ts, src_1.status
+                 Filter: (src_1.ts < 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
+   InitPlan 4 (returns $4)
      ->  Aggregate
            Output: count(*)
            ->  CTE Scan on hot_ins
                  Output: hot_ins."?column?"
-   InitPlan 4 (returns $4)
-     ->  Aggregate
-           Output: count(*)
-           ->  CTE Scan on cold_call
-                 Output: cold_call._exec_iceberg_with_claim
-(20 rows)
+   InitPlan 5 (returns $5)
+     ->  CTE Scan on cold_call
+           Output: cold_call.n
+(25 rows)
 
 -- Cleanup.
 DELETE FROM coldfront.tiered_views;

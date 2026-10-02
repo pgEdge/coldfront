@@ -33,8 +33,8 @@ catalog, the object store, and the archiver:
 │  coldfront extension: post_parse_analyze_hook             │
 │  ├── INSERT: splits hot/cold by partition_col vs cutoff;  │
 │  │     hot side is plain set-based PG INSERT into _events,│
-│  │     cold side is one duckdb.raw_query (or plpgsql      │
-│  │     cursor loop when an IDENTITY column is omitted)    │
+│  │     cold side is the cold sink, batched DuckDB INSERTs │
+│  │     under one claim (the _cold_sink aggregate)         │
 │  ├── UPDATE/DELETE: classifies WHERE against the watermark│
 │  │     and rewrites to target one tier or both            │
 │  └── errors on ambiguous predicates in strict mode        │
@@ -263,33 +263,42 @@ statement that splits the input by the partition-column watermark:
 INSERT INTO events (ts, status, data) SELECT ts, status, data FROM staging;
 
 -- Rewritten by the hook to (schematically):
-WITH hot_ins AS MATERIALIZED (
+WITH src AS MATERIALIZED (
+  SELECT ts::timestamptz AS ts, status::text AS status, data::jsonb AS data
+  FROM (<source>) AS s(ts, status, data)
+),
+hot_ins AS MATERIALIZED (
   INSERT INTO _events (ts, status, data)
-  SELECT ts, status, data FROM (<source>) AS s(ts, status, data)
-  WHERE ts >= '<cutoff>'::timestamptz
+  SELECT ts, status, data FROM src WHERE ts >= '<cutoff>'::timestamptz
   RETURNING 1
 ),
 cold_call AS MATERIALIZED (
-  SELECT coldfront._exec_iceberg_with_claim('ice.public.events',
-    'INSERT INTO ice.public.events
-     SELECT id, ts, status, data FROM (<source-pglocal-prefixed>) ...
-     WHERE ts < ''<cutoff>'''
-  )
+  SELECT coldfront._cold_sink('public', 'events', to_jsonb(r)) AS n
+  FROM (SELECT nextval('_events_id_seq') AS id, src.ts, src.status, src.data
+        FROM src WHERE src.ts < '<cutoff>'::timestamptz) AS r
 )
 SELECT (SELECT count(*) FROM hot_ins) AS hot_rows,
-       (SELECT count(*) FROM cold_call) AS cold_rows;
+       (SELECT n FROM cold_call) AS cold_rows;
 ```
 
-The following table describes the two cold-side write paths, when each applies,
-and its cost:
+The source runs once, into the `src` tuplestore, and both halves read it, so
+a volatile source lands every row exactly once and a row the transaction wrote
+before the `INSERT` reaches the cold tier. Each column of `src` is cast to the
+hot table's type, which restates the coercions PostgreSQL applied when it
+analyzed the statement (an untyped literal against a `jsonb` column keeps that
+type), and `OVERRIDING SYSTEM VALUE` stays on the hot `INSERT`.
 
-| Cold side | When | Cost |
-|---|---|---|
-| The bulk pglocal stream is a single `raw_query` that streams the source via libpq through DuckDB's postgres extension into the Iceberg writer in one pipeline. | This is the default path, used whenever the user's INSERT either (a) has no IDENTITY column on `_events`, or (b) supplies an explicit value for the IDENTITY column. DEFAULT clauses on omitted columns are inlined into the cold SELECT so DuckDB evaluates them per row. | The cost matches an iceberg-only INSERT: one Iceberg snapshot for the whole cold subset, with no per-row PG/DuckDB round-trip. |
-| The plpgsql cold loop (`coldfront._tiered_insert_cold`) runs a PG cursor over the cold subset, calls `nextval()` on the IDENTITY sequence per row, accumulates VALUES, and flushes one `raw_query` per `coldfront.cold_write_batch_size` rows (default 10000). | This is the fallback path, triggered only when the table has an IDENTITY column AND the user's INSERT omits it, the only case that requires PG-side `nextval()` per row to keep cold ids coherent with hot. | Throughput is bounded by plpgsql per-row iteration speed (~10-50k rows/s). For very large mostly-cold seeds, prefer iceberg-only mode where ids come from the source data. |
-
-The hot half is always plain set-based `INSERT INTO _events` - IDENTITY
-auto-allocates server-side, full PG speed regardless of row count.
+The hot half is plain set-based `INSERT INTO _events`: IDENTITY and DEFAULT
+columns fill server-side at full PG speed. The cold half projects each row to
+the hot table's full column list, with `nextval()` on the hot table's sequence
+for an omitted IDENTITY column and the DEFAULT expression for an omitted column
+that has one, both evaluated by PostgreSQL per row, and hands it to
+`coldfront._cold_sink`. That aggregate renders each row as a DuckDB `VALUES`
+tuple and flushes every `coldfront.cold_write_batch_size` rows (default 10000)
+as one `INSERT` under the table's claim, taken once per table per transaction;
+its final step flushes the rest. Throughput is bounded by the per-row rendering
+in plpgsql, so for very large mostly-cold seeds, prefer iceberg-only mode where
+ids come from the source data.
 
 A watermark-split INSERT cannot use `RETURNING` - see Cold RETURNING under
 [Tiered-Specific Limitations](#tiered-specific-limitations).

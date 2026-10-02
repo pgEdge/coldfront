@@ -1,0 +1,130 @@
+-- A tiered INSERT ... SELECT reads its source once: the rewrite holds the source
+-- in a MATERIALIZED CTE that the hot INSERT and the cold sink both read, casts
+-- every column to the hot table's type (an untyped literal keeps the target's
+-- type), fills an omitted identity column with nextval() and an omitted column
+-- with its DEFAULT on the cold side, and keeps OVERRIDING SYSTEM VALUE on the
+-- hot INSERT. White-box: EXPLAIN VERBOSE shows the rewritten shape; no Iceberg
+-- I/O (warehouse and endpoint left '').
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_duckdb;
+CREATE EXTENSION IF NOT EXISTS coldfront;
+RESET client_min_messages;
+SET TIME ZONE 'UTC';
+SET coldfront.warehouse = '';
+SET coldfront.lakekeeper_endpoint = '';
+CREATE TABLE public._events (id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL,
+                             status text NOT NULL DEFAULT 'new', data jsonb);
+CREATE VIEW public.events AS SELECT * FROM public._events;
+INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
+VALUES ('public', 'events', 'public._events', 'ice.default.events', 'ts');
+INSERT INTO coldfront.archive_watermark(schema_name, table_name, cutoff_time)
+VALUES ('public', 'events', '2026-03-01'::timestamptz);
+-- The identity and the defaulted column are omitted, and the literal is untyped.
+EXPLAIN (COSTS OFF, VERBOSE)
+  INSERT INTO public.events (ts, data)
+  SELECT '2026-01-01'::timestamptz + i * interval '1 day', '{}' FROM generate_series(1, 3) i;
+                                                                 QUERY PLAN                                                                  
+---------------------------------------------------------------------------------------------------------------------------------------------
+ Result
+   Output: $4, $5
+   CTE src
+     ->  Function Scan on pg_catalog.generate_series i
+           Output: ('Thu Jan 01 00:00:00 2026 UTC'::timestamp with time zone + ((i.i)::double precision * '@ 1 day'::interval)), '{}'::jsonb
+           Function Call: generate_series(1, 3)
+   CTE hot_ins
+     ->  Insert on public._events
+           Output: 1
+           ->  CTE Scan on src
+                 Output: nextval('_events_id_seq'), src.ts, 'new'::text, src.data
+                 Filter: (src.ts >= 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
+   CTE cold_call
+     ->  Aggregate
+           Output: _cold_sink('public'::text, 'events'::text, to_jsonb(r.*))
+           ->  Subquery Scan on r
+                 Output: r.*
+                 ->  CTE Scan on src src_1
+                       Output: nextval('_events_id_seq'::regclass), src_1.ts, 'new'::text, src_1.data
+                       Filter: (src_1.ts < 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
+   InitPlan 4 (returns $4)
+     ->  Aggregate
+           Output: count(*)
+           ->  CTE Scan on hot_ins
+                 Output: hot_ins."?column?"
+   InitPlan 5 (returns $5)
+     ->  CTE Scan on cold_call
+           Output: cold_call.n
+(28 rows)
+
+-- OVERRIDING SYSTEM VALUE supplies the identity; the cold side takes it as given.
+EXPLAIN (COSTS OFF, VERBOSE)
+  INSERT INTO public.events (id, ts, status, data) OVERRIDING SYSTEM VALUE
+  SELECT i, '2026-01-01'::timestamptz, 'old', '{}'::jsonb FROM generate_series(1, 3) i;
+                                                        QUERY PLAN                                                         
+---------------------------------------------------------------------------------------------------------------------------
+ Result
+   Output: $4, $5
+   CTE src
+     ->  Function Scan on pg_catalog.generate_series i
+           Output: (i.i)::bigint, 'Thu Jan 01 00:00:00 2026 UTC'::timestamp with time zone, 'old'::text, '{}'::jsonb
+           Function Call: generate_series(1, 3)
+   CTE hot_ins
+     ->  Insert on public._events
+           Output: 1
+           ->  CTE Scan on src
+                 Output: src.id, src.ts, src.status, src.data
+                 Filter: (src.ts >= 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
+   CTE cold_call
+     ->  Aggregate
+           Output: _cold_sink('public'::text, 'events'::text, to_jsonb(ROW(src_1.id, src_1.ts, src_1.status, src_1.data)))
+           ->  CTE Scan on src src_1
+                 Output: src_1.id, src_1.ts, src_1.status, src_1.data
+                 Filter: (src_1.ts < 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
+   InitPlan 4 (returns $4)
+     ->  Aggregate
+           Output: count(*)
+           ->  CTE Scan on hot_ins
+                 Output: hot_ins."?column?"
+   InitPlan 5 (returns $5)
+     ->  CTE Scan on cold_call
+           Output: cold_call.n
+(26 rows)
+
+-- VALUES takes the same shape.
+EXPLAIN (COSTS OFF, VERBOSE)
+  INSERT INTO public.events (ts, status) VALUES ('2026-01-01', 'a'), ('2026-05-01', 'b');
+                                               QUERY PLAN                                               
+--------------------------------------------------------------------------------------------------------
+ Result
+   Output: $4, $5
+   CTE src
+     ->  Values Scan on "*VALUES*"
+           Output: "*VALUES*".column1, "*VALUES*".column2
+   CTE hot_ins
+     ->  Insert on public._events
+           Output: 1
+           ->  CTE Scan on src
+                 Output: nextval('_events_id_seq'), src.ts, src.status, NULL::jsonb
+                 Filter: (src.ts >= 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
+   CTE cold_call
+     ->  Aggregate
+           Output: _cold_sink('public'::text, 'events'::text, to_jsonb(r.*))
+           ->  Subquery Scan on r
+                 Output: r.*
+                 ->  CTE Scan on src src_1
+                       Output: nextval('_events_id_seq'::regclass), src_1.ts, src_1.status, NULL::jsonb
+                       Filter: (src_1.ts < 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
+   InitPlan 4 (returns $4)
+     ->  Aggregate
+           Output: count(*)
+           ->  CTE Scan on hot_ins
+                 Output: hot_ins."?column?"
+   InitPlan 5 (returns $5)
+     ->  CTE Scan on cold_call
+           Output: cold_call.n
+(27 rows)
+
+-- Cleanup.
+DELETE FROM coldfront.tiered_views;
+DELETE FROM coldfront.archive_watermark;
+DROP VIEW public.events;
+DROP TABLE public._events;

@@ -630,12 +630,14 @@ pg_duckdb has a fully-native, in-process Postgres-table reader for analytics on
 PG heap data, but that machinery is **not reachable** from the write path into
 an attached Iceberg catalog.
 
-As the workaround in use today, ColdFront's hook rewrites the INSERT into one
-`duckdb.raw_query` that reads through the DuckDB `postgres` extension's
+As the workarounds in use today, a tiered INSERT renders its cold rows in the
+backend (`coldfront._cold_sink`) and writes them to Iceberg in batched
+`duckdb.raw_query` INSERTs, and a decoupled `INSERT … SELECT` from a
+PostgreSQL table reads it through the DuckDB `postgres` extension's
 `pglocal.<schema>.<table>` ATTACH, pipelining rows over libpq (loopback) →
-DuckDB executor → Iceberg writer → S3 in a single pass, no local
-materialization. The cost is the libpq round-trip per row batch - real, but
-dwarfed by the Iceberg commit work for any realistic batch.
+DuckDB executor → Iceberg writer → S3. Neither is the in-process reader: the
+first pays for the per-row rendering, the second for the libpq round-trip per
+row batch.
 
 The desired end-state is a way to drive the native in-process reader straight
 into the Iceberg writer - e.g. a `COPY` form:

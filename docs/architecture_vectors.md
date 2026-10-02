@@ -203,9 +203,8 @@ that do so, where each one lives, and its shape:
 | Path | Where | Shape |
 |---|---|---|
 | bulk archive | the Iceberg INSERT in `cmd/archiver`, not the staging SELECT | set-based |
-| tiered INSERT, cold half | the C rewrite (`build_cold_bulk_call`) | per statement |
+| tiered INSERT, cold half | `coldfront._cold_row_literal`, through the `coldfront._cold_sink` aggregate | per row |
 | tiered trigger INSERT | `coldfront._rebuild_write_trigger` (called by the archiver and by `_rebuild_tiered_view`) | per row |
-| slow per-row INSERT | `coldfront._tiered_insert_cold` | per row, cursor loop |
 | cross-tier move | `coldfront._move_row_literal` | per row |
 | replay drain | `coldfront.replay_archive_delta` | set-based |
 | decoupled INSERT | the C rewrite | per statement |
@@ -523,9 +522,9 @@ merge bounds it without changing what a probe reads.
 
 The following are properties of the code as it stands, not plans:
 
-- `coldfront._tiered_insert_cold` writes unsorted: its cursor loop appends in
-  cursor order and would need buffering to sort. The function is the fallback
-  path for a tiered INSERT that omits an IDENTITY column.
+- `coldfront._cold_sink` writes unsorted: it appends rows in the order the
+  statement delivers them and would need buffering to sort. It is the cold
+  half of every tiered INSERT.
 - The replay drain (`coldfront.replay_archive_delta`) and the cross-tier move
   also write without ordering by cluster.
 

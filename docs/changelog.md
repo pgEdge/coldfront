@@ -70,6 +70,13 @@ this project adheres to
 
 ### Fixed
 
+- A tiered `INSERT … SELECT` ran its source once per tier. A source whose
+  rows differed between the two runs landed some rows in both tiers and others
+  in neither, and when the hot table had no identity column, or the statement
+  supplied one, a source table written earlier in the same transaction lost
+  its cold rows, with no error either way. The source now runs once and both
+  tiers read that result; an untyped literal in the source keeps the target
+  column's type, and `OVERRIDING SYSTEM VALUE` works.
 - On PostgreSQL 17 and 18, a transaction block in which a statement had failed
   could not be ended in a database with the extension: `ROLLBACK`, `COMMIT`
   and `ROLLBACK TO SAVEPOINT` failed with "ResourceOwnerEnlarge called after

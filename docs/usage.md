@@ -105,10 +105,11 @@ itself, as [installation.md](installation.md#bare-metal-no-docker) shows:
   to. Only a superuser can set them, and while either is empty the catalog does
   not attach.
 - `coldfront.local_pg_dsn` is the connection string DuckDB uses to read
-  PostgreSQL tables from this server, which a cold `INSERT … SELECT` from a
-  PostgreSQL table needs. Only a superuser can set or read it. Set it before
-  calling `set_storage_secret()`, which installs the DuckDB `postgres`
-  extension this path loads only when the setting is present.
+  PostgreSQL tables from this server, which a decoupled table's
+  `INSERT … SELECT` from a PostgreSQL table needs, as does a cold write to a
+  table with a clustered vector column. Only a superuser can set or read it.
+  Set it before calling `set_storage_secret()`, which installs the DuckDB
+  `postgres` extension this path loads only when the setting is present.
 
 An application that connects as a non-superuser needs its role granted access
 with `coldfront.grant_app_access()`, which takes an existing role:
@@ -808,13 +809,14 @@ SELECT id, status, data->>'k' FROM events WHERE ts >= '2026-04-01';
 
 -- Inserts, updates, and deletes all go through the coldfront C hook,
 -- which rewrites the query into one PG-set-based statement (hot side)
--- + one duckdb.raw_query (cold side). For iceberg-only mode every write
+-- + duckdb.raw_query calls (cold side). For iceberg-only mode every write
 -- goes cold; for tiered mode the hook splits by ts vs the watermark.
 INSERT INTO events (ts, status, data) VALUES (now(), 'ok', '{"k":1}');
 UPDATE events SET status = 'fixed' WHERE id = 123;
 DELETE FROM events WHERE ts < '2025-01-01';
 
--- Bulk INSERT shapes are all set-based - no per-row work:
+-- Bulk INSERT shapes: the source is read once, the hot rows are one
+-- set-based INSERT and the cold rows are written in batches:
 INSERT INTO events (ts, status, data) VALUES (...), (...), (...);
 INSERT INTO events (ts, status, data) SELECT ts, status, data FROM staging;
 INSERT INTO events (ts, status, data) SELECT now() + i*'1s'::interval, 'ok', '{}'
@@ -823,7 +825,7 @@ INSERT INTO events (ts, status, data) SELECT now() + i*'1s'::interval, 'ok', '{}
 -- Transactions work; ROLLBACK undoes Iceberg writes too
 BEGIN;
   UPDATE events SET status = 'pending' WHERE id = 1;
-  SELECT status FROM events WHERE id = 1;   -- sees 'pending' (read-your-own-write)
+  SELECT status FROM events WHERE id = 1;   -- sees 'pending' if row 1 is hot
 ROLLBACK;
 SELECT status FROM events WHERE id = 1;     -- back to whatever it was
 ```
@@ -912,7 +914,10 @@ Keep the following caveats in mind when running either mode:
   commit by another session after the transaction's first cold read stays
   invisible until the transaction ends. The hot tier follows PostgreSQL's own
   isolation level, so at READ COMMITTED a later statement can see new hot rows
-  but not new cold ones. Read-your-own-write *within* one transaction works.
+  but not new cold ones. Within one transaction, a read of a tiered table sees
+  the transaction's own hot-tier writes but not its cold-tier writes, which
+  become visible once it commits. A decoupled table's reads see its own
+  writes.
 - In decoupled mode, pg_duckdb commits the Iceberg snapshot at PRE_COMMIT, so a
   backend crash after that but before the PG commit record leaves the Iceberg
   write committed and the PG side lost. A crash after the Parquet upload but
@@ -938,15 +943,13 @@ Keep the following caveats in mind when running either mode:
   `ice.public.<name>` is the Iceberg table - only addressable via
   `iceberg_scan(...)` or `duckdb.raw_query('… ice.… …')`, never via PG-native
   3-part names.
-- When a tiered INSERT omits an IDENTITY column (e.g.
-  `INSERT INTO events (ts, status, data) VALUES …` where `id` is
-  `GENERATED ALWAYS AS IDENTITY`), the cold side falls back to a plpgsql cursor
-  loop that calls `nextval()` per row so cold ids share the hot side's
-  sequence. Correctness is full; throughput is lower than the set-based fast
-  path. Either supply `id` explicitly in the INSERT, or use a partition-column
-  predicate that proves the rows are all hot, to stay on the fast path. For
-  very large historical seeds (mostly-cold), prefer iceberg-only mode where ids
-  come from your source data.
+- A tiered INSERT writes its cold rows through `coldfront._cold_sink`, which
+  renders each row in plpgsql and writes Iceberg in batches of
+  `coldfront.cold_write_batch_size` rows. An omitted IDENTITY column takes
+  `nextval()` on the hot table's sequence, so cold ids share it with the hot
+  side, and an omitted column with a DEFAULT takes it. The hot rows are one
+  set-based INSERT. For very large historical seeds (mostly-cold), prefer
+  iceberg-only mode where ids come from your source data.
 - `TRUNCATE` on a registered relation, or on the hot table behind a tiered one,
   fails with an error, because the cold rows in Iceberg would stay visible
   through the view.
@@ -1096,10 +1099,10 @@ The following GUCs adjust write behavior and execution; tune them as needed:
   setting is not relevant in decoupled mode (every write is single-tier by
   definition).
 - `coldfront.cold_write_batch_size` (int, default `10000`, minimum `1`) sets
-  how many rows the IDENTITY cursor loop (see [Caveats](#caveats)) gathers
-  before it writes them to Iceberg as one append. A larger value writes fewer,
-  larger Parquet files, and the remainder always flushes, so a small write
-  stays one file.
+  how many cold rows a tiered INSERT gathers (see [Caveats](#caveats)) before
+  it writes them to Iceberg as one INSERT. A larger value writes fewer, larger
+  Parquet files, and the remainder always flushes, so a small write stays one
+  file.
 - `coldfront.vector_probe` (bool, default `on`) sets whether a recognized
   similarity search reads only the clusters nearest its query vector. `off`
   gives an exact scan of the whole corpus. The setting affects only a table

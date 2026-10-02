@@ -1,6 +1,6 @@
 -- coldfront.cold_write_batch_size is a GUC (DefineCustomIntVariable; default
--- 10000, min 1) that coldfront._tiered_insert_cold reads to size each cold-tier
--- Iceberg flush (one duckdb.raw_query / Parquet file per batch). White-box: this
+-- 10000, min 1) that the cold sink (coldfront._cold_sink_step) reads to size each
+-- cold-tier Iceberg flush (one duckdb.raw_query per batch). White-box: this
 -- checks the GUC's definition, default, settability, and lower bound — the flush
 -- behavior itself is exercised live in ci/journey.sh.
 CREATE EXTENSION IF NOT EXISTS pg_duckdb;

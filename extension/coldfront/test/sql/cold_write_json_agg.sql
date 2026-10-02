@@ -43,8 +43,8 @@ EXPLAIN (COSTS OFF, VERBOSE)
 UPDATE public.events SET data = (SELECT json_agg(k)::jsonb FROM public.src)
 WHERE ts < '2019-01-01'::timestamptz;
 
--- (A4) Cold INSERT ... SELECT: the aggregate sits in the row source that the
--- cold leg streams out of PostgreSQL.
+-- (A4) INSERT ... SELECT: the source runs in PostgreSQL, once, so the aggregate
+-- stays jsonb_agg and both halves read its result.
 EXPLAIN (COSTS OFF, VERBOSE)
 INSERT INTO public.events
 SELECT 9, '2019-01-01'::timestamptz, jsonb_agg(k ORDER BY k) FROM public.src;
