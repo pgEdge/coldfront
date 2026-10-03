@@ -18,7 +18,7 @@ type DBTX interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
 }
 
-// ViewConfig holds all parameters needed to generate the view and triggers.
+// ViewConfig holds all parameters needed to generate the view.
 type ViewConfig struct {
 	SourceSchema    string
 	SourceTable     string // original table name — becomes the view name after swap
@@ -109,7 +109,7 @@ func (c Column) ExportCast() string {
 	return ""
 }
 
-// Generator creates and replaces the view and triggers.
+// Generator creates and replaces the view.
 type Generator struct {
 	db DBTX
 }

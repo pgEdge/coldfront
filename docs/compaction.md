@@ -39,7 +39,7 @@ run and how aggressively each reclaims:
 | `--orphans` | off | Deletes files under the table location that no retained snapshot references. |
 | `--orphan-age D` | 72h | With `--orphans`, deletes only files older than D, which protects in-flight writes; never set the value to 0 in production. |
 | `--version` |  | Prints the version and exits. |
-| `--dry-run` | off | Reports what each step would do and changes nothing; for snapshot expiry it reports only the snapshot count and the `--expire-retain-last` floor. |
+| `--dry-run` | off | Reports what each step would do and changes nothing; for snapshot expiry it stages the same expiry the real run commits and reports how many snapshots it would expire and keep. |
 
 Compaction always runs (a no-op when no partition has enough small files);
 `--expire-snapshots` and `--orphans` are opt-in. A typical maintenance pass
@@ -60,15 +60,17 @@ which is wherever the database server itself reaches Lakekeeper and the store.
 
 ## Backends
 
-The following table lists the backends a single binary serves; configure at
-most one, and none for vended credentials:
+The following table lists the backends a single binary serves, by the storage
+secret the server holds (written by `set_storage_secret`, or by `import` from a
+YAML's `s3:` or `azure:` stanza); configure at most one, and none for vended
+credentials:
 
-| Backend | Config |
+| Backend | Storage secret |
 |---|---|
-| S3-compatible (SeaweedFS, MinIO) | `s3: {endpoint, region, access_key, secret_key, use_ssl, url_style}` |
-| AWS S3 | `s3: {region, access_key, secret_key}` with no `endpoint`; without keys, the AWS SDK default credential chain applies |
-| Google Cloud Storage | `s3: {endpoint: storage.googleapis.com, use_ssl: true, access_key, secret_key}` with HMAC keys (S3 interoperability) |
-| Azure ADLS Gen2 | `azure: {connection_string}`, which must contain `AccountName` and `AccountKey` (shared key) |
+| S3-compatible (SeaweedFS, MinIO) | An `s3` secret with `endpoint`, `region`, the keys, `use_ssl` and `url_style`. |
+| AWS S3 | An `s3` secret with `region` and the keys and no `endpoint`. |
+| Google Cloud Storage | An `s3` secret with `endpoint` `storage.googleapis.com`, `use_ssl` on and HMAC keys (S3 interoperability). |
+| Azure ADLS Gen2 | An `azure` secret whose connection string contains `AccountName` and `AccountKey` (shared key). |
 
 ## How It Works
 
@@ -95,12 +97,12 @@ requested steps, each under a bakery claim on that table:
   compaction supersedes - they stay pinned by the pre-compaction snapshot until
   it is expired.
   A transaction that has read the table keeps the snapshot of its first cold
-  read until it ends, and expiry does not know about it: if the snapshot is
-  expired and its files deleted meanwhile, the transaction's next scan fails
-  with the object store's HTTP 404 (a scan that already fetched the files
-  answers from DuckDB's file cache instead). Keep `--expire-older-than`
-  longer than the longest transaction that reads the table; the 168 h default
-  does, and `0s` is for a table nothing is reading.
+  read until it ends, and expiry does not know about that transaction: if
+  expiry removes the snapshot and deletes its files meanwhile, the
+  transaction's next scan fails with the object store's HTTP 404 (a scan that
+  already fetched the files answers from DuckDB's file cache instead). Keep
+  `--expire-older-than` longer than the longest transaction that reads the
+  table; the 168 h default does, and `0s` is for a table nothing is reading.
 - Orphan removal deletes files under the table location that no retained
   snapshot references, which covers files left by an interrupted write or by
   `--expire-keep-files`. The `--orphan-age` window keeps a concurrent writer's

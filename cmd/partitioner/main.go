@@ -1,9 +1,9 @@
 // Command partitioner is the standalone native-partition manager: for each
 // managed table it premakes the forward window of partitions and detaches +
 // drops those past retention, against stock PostgreSQL — no cold-tier / Iceberg
-// dependency. One reconcile pass per invocation; run it from cron. Config is a
-// YAML file (--config) holding the Postgres DSN and per-table partition
-// settings; any iceberg/s3 sections are ignored here.
+// dependency. One reconcile pass per invocation; run it from cron. It connects
+// from --dsn or the libpq environment and reads its tables from
+// coldfront.partition_config; a deployment YAML is an `import` input.
 package main
 
 import (

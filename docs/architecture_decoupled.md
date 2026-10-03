@@ -650,10 +650,10 @@ pointing at the same Lakekeeper endpoint and S3 bucket:
 
     The wait phase has no explicit timeout. R-A's only failure mode is a dead
     peer (would block forever), and ColdFront closes it via a liveness check on
-    `pg_stat_replication.reply_time`: a peer whose walsender has been silent
-    longer than `coldfront.peer_alive_window_ms` is implicitly treated as
-    already-acked, whatever the walsender's state. The reply is the peer's
-    apply-worker feedback, sent after it applies, every
+    `pg_stat_replication.reply_time`: ColdFront treats a peer whose walsender
+    has been silent longer than `coldfront.peer_alive_window_ms` as already
+    acked, whatever the walsender's state. The peer's apply worker sends that
+    reply after it applies, every
     `spock.feedback_frequency` messages, and in answer to the walsender's
     keepalive, which on an idle link comes every `wal_sender_timeout/2`, so
     the claim refuses to run unless `wal_sender_timeout` is positive and

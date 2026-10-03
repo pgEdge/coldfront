@@ -62,7 +62,8 @@ func main() {
 
 	if *tableName == "" {
 		fmt.Fprintln(os.Stderr, "usage: compactor --table <name> [--dsn <dsn>] [--target-size-mb N] [--dry-run]"+
-			" [--expire-snapshots [--expire-retain-last N]] [--orphans [--orphan-age D]]")
+			" [--expire-snapshots [--expire-older-than D] [--expire-retain-last N] [--expire-keep-files]]"+
+			" [--orphans [--orphan-age D]]")
 		os.Exit(2)
 	}
 	o := runOpts{
@@ -139,8 +140,9 @@ func run(dsn, tableName string, o runOpts) error {
 }
 
 // newClaimer returns a wrapper that runs fn under the bakery claim for icebergRef,
-// plus a closer for the one PG connection every step shares. The connection opens
-// on the first claim, so a pure dry-run never needs Postgres at all.
+// plus a closer for the one PG connection every step shares. The connection
+// opens on the first claim; a dry run takes no claim, so it opens none here
+// (loadServerConfig already read the settings and the secret row).
 func newClaimer(ctx context.Context, dsn, icebergRef string) (claim func(func() error) error, closeConn func()) {
 	var conn *pgx.Conn
 	claim = func(fn func() error) error {

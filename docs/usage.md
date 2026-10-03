@@ -173,10 +173,11 @@ archiver:
 
 `import` upserts each table into `coldfront.partition_config`, validated as
 `register` validates one table, and writes the `s3:` or `azure:` stanza through
-`set_storage_secret`, so the file and the server agree when it returns. A file
-may also name `iceberg.warehouse` and `iceberg.lakekeeper_endpoint`; those are
-checked against the server settings, which are set in `postgresql.conf`, and
-the import fails if they differ. From then on the server is the configuration:
+`set_storage_secret` or `set_storage_secret_azure`, so the file and the server
+agree when it returns. A file may also name `iceberg.warehouse` and
+`iceberg.lakekeeper_endpoint`; the import checks those against the server
+settings, which live in `postgresql.conf`, before it writes anything, and
+refuses the file if they differ. From then on the server is the configuration:
 change it with `set`, `register`, `set_storage_secret` or `postgresql.conf`. A
 YAML passed to any later run is checked, value by value, against what the
 server holds, and any difference is refused with an error that says where
@@ -662,9 +663,10 @@ partitioner export > managed.yaml                  # active config, git-reviewab
 ```
 
 Run `partitioner` (or `archiver`) with `help` or `--help` for the command
-overview, and with no arguments for its normal run; every subcommand has detailed `--help` with worked
-examples. The write commands accept `--print-sql` (emit the SQL without running
-it - review/commit it); `register` and `import` also accept `--dry-run`.
+overview, and with no arguments for its normal run; every subcommand has a
+detailed `--help` with worked examples. The write commands accept
+`--print-sql` (emit the SQL without running it - review/commit it; `import`
+prints its table INSERTs); `register` and `import` also accept `--dry-run`.
 `set --enable`/`--disable` (mutually exclusive) pause/resume a table without
 removing it; a disabled table is skipped by reconcile and omitted from
 `export`. Per table, only the cadence and a lifecycle boundary (`hot_period` or
@@ -714,7 +716,7 @@ an explicit `source_schema` takes precedence over that prefix.
 
 Configure **exactly one** of the following cold-store backends, through
 `set_storage_secret` or through the `s3:` or `azure:` stanza of a deployment
-YAML, which `import` writes through the same setter.
+YAML, which `import` writes through the same setters.
 
 ### S3
 
@@ -1091,17 +1093,17 @@ coldfront.iceberg_bakery_patch = on
 ```
 
 The bakery has no peer-ack timeout. R-A's only failure mode is a dead peer
-(would wait forever), closed by a liveness check inside the wait-loop: a peer
-whose `pg_stat_replication.reply_time` is older than
-`coldfront.peer_alive_window_ms` is implicitly treated as already-acked,
-whatever the walsender's state (a peer that has just reconnected is catching
-up and still alive). `reply_time` is the peer's apply worker's feedback: sent
-after it applies, every `spock.feedback_frequency` messages, and in answer to
-the walsender's keepalive; `wal_receiver_status_interval` plays no part, since
-Spock's apply worker does not read it. The window and `wal_sender_timeout` are
-a pair, set together as [Timeouts](#timeouts) below describes. An alive peer
-that has not acked is either deferring legitimately (R-A's defer rule) or
-about to ack - either way, waiting is correct, not a failure.
+(would wait forever), and a liveness check inside the wait loop closes it:
+the bakery treats a peer whose `pg_stat_replication.reply_time` is older than
+`coldfront.peer_alive_window_ms` as already acked, whatever the walsender's
+state (a peer that has just reconnected is catching up and still alive). The
+peer's apply worker sends that reply after it applies, every
+`spock.feedback_frequency` messages, and in answer to the walsender's
+keepalive; `wal_receiver_status_interval` plays no part, since Spock's apply
+worker does not read it. The window and `wal_sender_timeout` form a pair; set
+them together as [Timeouts](#timeouts) below describes. An alive peer that has
+not acked is either deferring legitimately (R-A's defer rule) or about to
+ack, and waiting for it is correct, not a failure.
 
 A claim whose owner is gone (a hard backend crash) is reaped without operator
 action: by that node's next cold write, to any table, by a peer's arriving
@@ -1156,26 +1158,28 @@ needed.
 
 ### Timeouts
 
-Two settings decide how long a cold write waits for a peer. They must be set
-together, on every node:
+The following table lists the two settings that decide how long a cold write
+waits for a peer; set them together, on every node:
 
 | Setting | Recommended | Where | What it does |
 |---|---|---|---|
 | `wal_sender_timeout` | `15s` | `postgresql.conf` on every node; the image sets it in mesh mode | The node's walsender asks each peer for a reply after half of it (7.5 s) and drops a peer that has not replied for the whole of it. |
-| `coldfront.peer_alive_window_ms` | `10000` (the default) | `postgresql.conf`, superuser-only | A peer whose last reply is older than this is treated as dead, and its ack is not waited for. |
+| `coldfront.peer_alive_window_ms` | `10000` (the default) | `postgresql.conf`, superuser-only | The bakery treats a peer whose last reply is older than this as dead and stops waiting for its ack. |
 
-The rule is: half of `wal_sender_timeout`, plus a round trip, below the
-window. An idle peer replies only when the walsender asks, so the PostgreSQL
-default of 60 s against a 10 s window would rule a live idle peer dead; a
-claim refuses to run with such a pair and names both settings. With the
-recommended pair a writer waits at most 10 s for a peer that is really dead,
-and a peer silent for 15 s is disconnected and reconnects on its own.
+The rule: half of `wal_sender_timeout` must stay below the window, with a
+round trip to spare; the claim enforces the first part. An idle peer replies
+only when the walsender asks, so the
+PostgreSQL default of 60 s against a 10 s window would rule a live idle peer
+dead; a claim refuses to run with such a pair and names both settings. With
+the recommended pair a writer waits at most 10 s for a peer that is really
+dead, and the walsender disconnects a peer silent for 15 s, which then
+reconnects on its own.
 
 On a slow or lossy WAN raise both together and keep the rule, for example
 `wal_sender_timeout = 30s` with `coldfront.peer_alive_window_ms = 20000`.
 Both take effect on a reload (`ALTER SYSTEM SET ...;` then
 `SELECT pg_reload_conf();`), no restart: walsenders re-read the timeout, and
-the window is read once per claim.
+each claim reads the window once.
 
 ### What `coldfront.ensure_replicated()` Does
 

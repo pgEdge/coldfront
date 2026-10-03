@@ -12,12 +12,14 @@
 # need no file. A YAML passed to any later run is checked against the server
 # and refused if it disagrees in any value.
 
-# Optional: the connection `import` uses when PG* is not set and --dsn not given.
+# Optional: the connection `import` uses when --dsn is not given; fields it
+# omits come from the libpq environment.
 postgres:
   dsn: "host=localhost port=5432 dbname=mydb user=myuser password=mypass sslmode=disable"
 
-# Optional: checked against the server settings of the same name; the import
-# fails if they differ, since those settings are set in postgresql.conf.
+# Optional: checked against the server settings of the same name before
+# anything is written; the import refuses the file if they differ, since those
+# settings live in postgresql.conf.
 iceberg:
   warehouse: "wh"
   lakekeeper_endpoint: "http://lakekeeper:8181/catalog"
