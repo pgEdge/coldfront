@@ -17,7 +17,7 @@ Everything a promoted node needs to serve cold reads/writes must survive a base
 backup and a promotion:
 
 - **`coldfront.warehouse`, `coldfront.lakekeeper_endpoint`,
-  `coldfront.local_pg_dsn`** (and, on mesh nodes, `coldfront.dblink_self`)
+  `coldfront.local_pg_dsn`** (and, on mesh nodes, `coldfront.loopback_dsn`)
   belong in `postgresql.conf` — the ColdFront image entrypoint writes them
   there. They then ride a `pg_basebackup` to every replica and remain in force
   after promotion. Avoid `ALTER SYSTEM` for these: it works

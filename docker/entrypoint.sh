@@ -111,7 +111,7 @@ snowflake.node = ${SNOWFLAKE_NODE}
 # DSN of the loopback that runs the R-A bakery's autonomous claim/ack/release
 # (unix socket). The bakery touches coldfront.claims only, never a tiered view,
 # so the lazy 'ice' attach never fires here.
-coldfront.dblink_self = 'host=/var/run/postgresql dbname=coldfront user=coldfront application_name=coldfront_dblink'
+coldfront.loopback_dsn = 'host=/var/run/postgresql dbname=coldfront user=coldfront application_name=coldfront_loopback'
 EOF
         # Servers with output_plugin_libraries (16.15, 17.11 and 18.6 here) accept only
         # the logical decoding output plugins it lists, and its default leaves out

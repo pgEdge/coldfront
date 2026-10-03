@@ -12,7 +12,7 @@ RESET client_min_messages;
 SET TIME ZONE 'UTC';
 SET coldfront.warehouse = '';
 SET coldfront.lakekeeper_endpoint = '';
-SET coldfront.dblink_self = '';
+SET coldfront.loopback_dsn = '';
 
 -- Without a watermark every row is hot.
 CREATE TABLE public._plain (id int, ts timestamptz, status text);

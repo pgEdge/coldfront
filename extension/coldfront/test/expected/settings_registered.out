@@ -14,11 +14,11 @@ SELECT name, vartype, context, boot_val, min_val
  coldfront._claimed                | string  | user      |          | 
  coldfront.allow_mixed_writes      | bool    | user      | on       | 
  coldfront.cold_write_batch_size   | integer | user      | 10000    | 1
- coldfront.dblink_self             | string  | superuser |          | 
  coldfront.iceberg_async_parquet   | bool    | user      | off      | 
  coldfront.iceberg_bakery_patch    | bool    | superuser | off      | 
  coldfront.lakekeeper_endpoint     | string  | superuser |          | 
  coldfront.local_pg_dsn            | string  | superuser |          | 
+ coldfront.loopback_dsn            | string  | superuser |          | 
  coldfront.peer_alive_window_ms    | integer | superuser | 5000     | 1
  coldfront.vector_nprobe           | integer | user      | 0        | 0
  coldfront.vector_probe            | bool    | user      | on       | 
@@ -54,4 +54,13 @@ SHOW coldfront.iceberg_async_parquet;
 (1 row)
 
 COMMIT;
+-- The loopback accepts a unix-socket DSN only: every onboarded role can read
+-- the setting, so it must never need a password.
+SET coldfront.loopback_dsn = 'host=127.0.0.1 dbname=regress';
+SELECT coldfront._loopback('SELECT 1');
+ERROR:  coldfront: coldfront.loopback_dsn must name a unix socket (host=/directory), not host=127.0.0.1
+SET coldfront.loopback_dsn = 'hostaddr=127.0.0.1 dbname=regress';
+SELECT coldfront._loopback('SELECT 1');
+ERROR:  coldfront: coldfront.loopback_dsn must name a unix socket (host=/directory), not hostaddr=127.0.0.1
+RESET coldfront.loopback_dsn;
 DROP ROLE cf_settings_app;

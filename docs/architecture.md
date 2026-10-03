@@ -21,7 +21,7 @@ is selected:
 | Axis | Values | Selected by |
 |---|---|---|
 | Storage mode | In tiered mode, a `UNION ALL` view unifies the hot PG heap and cold Iceberg, and an archiver moves rows from hot to cold on a cron. In decoupled mode, the table lives entirely in Iceberg, and PG holds only a wrapper view and a registry row (no archiver, no PG storage, no watermark). | The `is_iceberg_only` flag on `coldfront.tiered_views` selects the mode per relation at creation, and the hook's `classify_tier()` short-circuits on that flag. |
-| Topology | In a vanilla topology (a single node, with `spock`/`snowflake` not loaded), cold writes serialize on a local advisory lock. In a mesh (3-node pgEdge Spock active-active), cold writes serialize cluster-wide via the bakery protocol. | The topology follows whether `spock`/`snowflake` are in `shared_preload_libraries`. One image and one SQL surface serve both. The serializer follows `coldfront._bakery_armed()`: the bakery when both `snowflake.node` and `coldfront.dblink_self` are set, and a local advisory lock otherwise; the image sets both only when `MESH=on`. |
+| Topology | In a vanilla topology (a single node, with `spock`/`snowflake` not loaded), cold writes serialize on a local advisory lock, and a node that runs Spock without the bakery's two settings refuses them. In a mesh (3-node pgEdge Spock active-active), cold writes serialize cluster-wide via the bakery protocol. | The topology follows whether `spock`/`snowflake` are in `shared_preload_libraries`. One image and one SQL surface serve both. The serializer follows `coldfront._bakery_armed()`: the bakery when both `snowflake.node` and `coldfront.loopback_dsn` are set, and a local advisory lock otherwise; the image sets both only when `MESH=on`. |
 | Write mode | In permissive mode (the default), an ambiguous cross-tier `UPDATE`/`DELETE` writes both tiers. In strict mode, such a statement is rejected with a hint. | `coldfront.allow_mixed_writes` (USERSET) selects the write mode. |
 
 Both storage modes coexist in one database and share **one** code path: the
@@ -189,7 +189,7 @@ Because the attach helpers run elevated, the deployment-config GUCs they
 consume (`coldfront.warehouse`, `coldfront.lakekeeper_endpoint`,
 `coldfront.local_pg_dsn`) are registered `PGC_SUSET` (the last also
 `GUC_SUPERUSER_ONLY`) in `_PG_init`, so a non-superuser cannot redirect the
-elevated `ATTACH` at an attacker endpoint. `coldfront.dblink_self`, the DSN of
+elevated `ATTACH` at an attacker endpoint. `coldfront.loopback_dsn`, the DSN of
 the bakery's loopback, is `PGC_SUSET` as well, because the loopback runs claim
 statements as the user that DSN names. It stays readable by every role, since
 the invoker-rights `coldfront._bakery_armed()` reads it on every cold write.

@@ -28,4 +28,12 @@ SET LOCAL coldfront.iceberg_async_parquet = off;
 SHOW coldfront.iceberg_async_parquet;
 COMMIT;
 
+-- The loopback accepts a unix-socket DSN only: every onboarded role can read
+-- the setting, so it must never need a password.
+SET coldfront.loopback_dsn = 'host=127.0.0.1 dbname=regress';
+SELECT coldfront._loopback('SELECT 1');
+SET coldfront.loopback_dsn = 'hostaddr=127.0.0.1 dbname=regress';
+SELECT coldfront._loopback('SELECT 1');
+RESET coldfront.loopback_dsn;
+
 DROP ROLE cf_settings_app;

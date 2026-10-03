@@ -547,10 +547,10 @@ pointing at the same Lakekeeper endpoint and S3 bucket:
        loopback, a libpq connection the extension's C code keeps (autonomous
        tx; replicates async via Spock). SQL reaches the loopback only through
        `coldfront._loopback()`, which PUBLIC cannot execute. Only a superuser
-       can set its connection string, `coldfront.dblink_self`, and the loopback
-       resolves names in `pg_catalog` only. The ticket is taken inside that
-       transaction, under the table's claim key, and every lock it takes ends
-       with it.
+       can set its connection string, `coldfront.loopback_dsn`, and the
+       loopback resolves names in `pg_catalog` only. The ticket is taken inside
+       that transaction, under the table's claim key, and every lock it takes
+       ends with it.
     3. Wait until both (a) no same-node writer has a smaller ticket on this
        table, and (b) every alive peer has acked the ticket (its row appears in
        `coldfront.claim_acks`).
@@ -712,8 +712,8 @@ snowflake.node = 1     # node1
 # snowflake.node = 2   # node2
 # snowflake.node = 3   # node3
 
-# DSN of the loopback that runs the bakery's autonomous claim/ack/release statements (unix socket).
-coldfront.dblink_self = 'host=/tmp dbname=coldfront user=coldfront application_name=coldfront_dblink'
+# DSN of the loopback that runs the bakery's autonomous claim/ack/release statements (unix socket only).
+coldfront.loopback_dsn = 'host=/tmp dbname=coldfront user=coldfront application_name=coldfront_loopback'
 
 # Optional, superuser-only: the peer-liveness window for R-A's dead-peer
 # escape; a peer whose reply_time is older than this is treated as
@@ -722,10 +722,11 @@ coldfront.peer_alive_window_ms = 5000
 ```
 
 The bakery runs only on a node where both `snowflake.node` and
-`coldfront.dblink_self` are set, which `coldfront._bakery_armed()` checks on
-every cold write. A node missing either setting serializes its cold writes on a
+`coldfront.loopback_dsn` are set, which `coldfront._bakery_armed()` checks on
+every cold write. A node without Spock serializes its cold writes on a
 transaction-scoped local advisory lock instead. That lock orders the writers on
-one node only, so every mesh node needs both settings.
+one node only, so a node that runs Spock with either setting missing refuses
+the write and names the setting.
 
 The bakery has no peer-ack timeout knob. Dead peers are caught by the
 `pg_stat_replication.reply_time` liveness check inside the wait-loop (a stale

@@ -14,7 +14,7 @@ RESET client_min_messages;
 SET TIME ZONE 'UTC';
 SET coldfront.warehouse = '';
 SET coldfront.lakekeeper_endpoint = '';
-SET coldfront.dblink_self = '';
+SET coldfront.loopback_dsn = '';
 
 CREATE TABLE public._events (id int, ts timestamptz, status text);
 CREATE VIEW public.events AS SELECT * FROM public._events;

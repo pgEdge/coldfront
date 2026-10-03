@@ -2938,7 +2938,7 @@ story_mesh() {
 
     # R-A bakery under multi-node contention: concurrent cold writers on db1 AND
     # a peer to the SAME Iceberg table must both land. Here v_armed is true
-    # (snowflake.node + dblink_self set), so this exercises the Ricart-Agrawala
+    # (snowflake.node + loopback_dsn set), so this exercises the Ricart-Agrawala
     # claim protocol across nodes — not the local advisory lock — to avoid 409.
     rm -f $TMPD/ra.* 2>/dev/null
     q "$HOST" "INSERT INTO iceonly VALUES (6001,date_trunc('month',now()) + interval '2 months' + interval '1 days' + interval '10 hours 0 minutes 0 seconds','ra','{}');" >$TMPD/ra.1 2>&1 &
@@ -3264,7 +3264,7 @@ SQL
     # TC-178: after a cold write as an app role, its session has no way into the
     # loopback: no named dblink connection is left open in it,
     # coldfront._loopback is not executable by it, and it cannot change
-    # coldfront.dblink_self, the loopback's connection string.
+    # coldfront.loopback_dsn, the loopback's connection string.
     q "$HOST" "DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'cf_tc178') THEN CREATE ROLE cf_tc178 NOSUPERUSER LOGIN; END IF; END \$\$;" >/dev/null 2>&1
     q "$HOST" "SELECT coldfront.grant_app_access('cf_tc178');" >/dev/null 2>&1
     out=$(sess "$HOST" 2>&1 <<'SQL'
@@ -3277,8 +3277,8 @@ SELECT 'named=' || count(*) FROM unnest(public.dblink_get_connections()) c;
 SELECT 'named=0';
 \endif
 SELECT 'can_exec=' || has_function_privilege('coldfront._loopback(text)', 'execute');
-SET coldfront.dblink_self = 'dbname=cf_tc178';
-SELECT 'dsn_set=' || (current_setting('coldfront.dblink_self') = 'dbname=cf_tc178');
+SET coldfront.loopback_dsn = 'dbname=cf_tc178';
+SELECT 'dsn_set=' || (current_setting('coldfront.loopback_dsn') = 'dbname=cf_tc178');
 SQL
 )
     assert_eq "TC-178 the app role's cold write landed" "1" "$(q "$HOST" "SELECT count(*) FROM cf_ct WHERE id = 1781;")"
@@ -3315,7 +3315,7 @@ SQL
     # TC-180: every loopback session on $HOST dies between two cold writes of one
     # session. The next write reconnects instead of failing, the session holds no
     # advisory lock afterwards, and a peer's claim still gets $HOST's ack.
-    loop_app=$(q "$HOST" "SELECT substring(current_setting('coldfront.dblink_self') from 'application_name=([^ ]+)');")
+    loop_app=$(q "$HOST" "SELECT substring(current_setting('coldfront.loopback_dsn') from 'application_name=([^ ]+)');")
     out=$(sess "$HOST" 2>&1 <<SQL
 INSERT INTO cf_ct VALUES (1801);
 SELECT 'killed=' || count(*) FROM (SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = '$loop_app') k;
@@ -3339,12 +3339,25 @@ SQL
     # call never reaches the shadow, and the write lands.
     q "$HOST" "DROP SCHEMA IF EXISTS cf_tc181 CASCADE; CREATE SCHEMA cf_tc181; CREATE TABLE cf_tc181.hits (who text); CREATE FUNCTION cf_tc181.pg_advisory_xact_lock(integer) RETURNS void LANGUAGE sql AS 'INSERT INTO cf_tc181.hits VALUES (current_user)';" >/dev/null 2>&1
     sess "$HOST" >/dev/null 2>&1 <<'SQL'
-SELECT set_config('coldfront.dblink_self', current_setting('coldfront.dblink_self') || ' options=''-csearch_path=cf_tc181''', false);
+SELECT set_config('coldfront.loopback_dsn', current_setting('coldfront.loopback_dsn') || ' options=''-csearch_path=cf_tc181''', false);
 INSERT INTO cf_ct VALUES (1811);
 SQL
     assert_eq "TC-181 the write over the redirected loopback landed" "1" "$(q "$HOST" "SELECT count(*) FROM cf_ct WHERE id = 1811;")"
     assert_eq "TC-181 the loopback never resolves a name outside pg_catalog" "0" "$(q "$HOST" "SELECT count(*) FROM cf_tc181.hits;")"
     q "$HOST" "DROP SCHEMA cf_tc181 CASCADE;" >/dev/null 2>&1
+
+    # TC-212: a node that runs Spock serializes cold writes through the bakery
+    # alone. With the loopback DSN empty it refuses a cold write, naming the
+    # setting, rather than taking the node-local lock that peers cannot see.
+    out=$(sess "$HOST" 2>&1 <<'SQL'
+SET coldfront.loopback_dsn = '';
+INSERT INTO cf_ct VALUES (2121);
+RESET coldfront.loopback_dsn;
+INSERT INTO cf_ct VALUES (2122);
+SQL
+)
+    assert_contains "TC-212 a Spock node with no loopback DSN refuses a cold write" "coldfront.loopback_dsn is not set" "$out"
+    assert_eq "TC-212 the refused write landed nothing and the next one landed" "0|1" "$(q "$HOST" "SELECT count(*) FILTER (WHERE id = 2121) || '|' || count(*) FILTER (WHERE id = 2122) FROM cf_ct;")"
 
     for t in cf_ct cf_cu; do
         q "$HOST" "SELECT coldfront.drop_iceberg_table('public','$t', true);" >/dev/null 2>&1

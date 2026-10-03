@@ -72,7 +72,10 @@ this project adheres to
 
 - The mesh bakery no longer needs the `dblink` extension. Claims, acks,
   releases and orphan reaping run over a libpq loopback connection that the
-  extension opens from `coldfront.dblink_self`.
+  extension opens from `coldfront.loopback_dsn`, which must name a unix socket.
+  A node that runs Spock refuses cold writes until that setting and
+  `snowflake.node` are set, instead of serializing them on the node-local
+  lock.
 - `coldfront.tiered_views` has an `is_writable` column and a unique constraint
   on `iceberg_table`. Every existing registration is writable, and one relation
   is registered per Iceberg table.

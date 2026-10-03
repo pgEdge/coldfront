@@ -239,17 +239,18 @@ static int  coldfront_vector_nprobe = 0;
  * postgresql.conf, where they
  * ride physical replication unchanged. local_pg_dsn is GUC_SUPERUSER_ONLY too:
  * it can carry libpq credentials, so non-superusers must not read it back.
- * dblink_self is the DSN of the bakery's loopback, which runs claim statements
+ * loopback_dsn is the DSN of the bakery's loopback, which runs claim statements
  * as its own user, so it is PGC_SUSET for the same reason: a role that could
  * set it would choose that user and its startup options. It stays readable
- * because the invoker-rights _bakery_armed() reads it on every cold write.
+ * because the invoker-rights _bakery_armed() reads it on every cold write, so
+ * it must name a unix socket, which needs no password (cf_loopback_get_conn).
  * The values are read through current_setting() or GetConfigOption(); these
  * backing vars exist only to anchor the GUC definitions.
  */
 static char *coldfront_warehouse          = NULL;
 static char *coldfront_lakekeeper_endpoint = NULL;
 static char *coldfront_local_pg_dsn       = NULL;
-static char *coldfront_dblink_self        = NULL;
+static char *coldfront_loopback_dsn       = NULL;
 /* The bakery's dead-peer window, the async-ordering switch and its build
  * marker, and two per-session values the SQL keeps with set_config. */
 static int   coldfront_peer_alive_window_ms   = 5000;
@@ -4172,7 +4173,7 @@ coldfront_post_parse_analyze(ParseState *pstate, Query *query,
 static List *coldfront_pending_releases = NIL;
 
 /* The node's loopback: one libpq connection per backend, opened lazily from the
- * GUC coldfront.dblink_self and kept for the backend's lifetime. Every bakery
+ * GUC coldfront.loopback_dsn and kept for the backend's lifetime. Every bakery
  * statement that must commit on its own runs here: the claim, the apply
  * trigger's acks and reaps, the waiter's poke, and the release. Only C holds it,
  * and SQL reaches it only through coldfront._loopback(), which PUBLIC cannot
@@ -4188,8 +4189,10 @@ static PGconn *coldfront_loopback_conn = NULL;
 static PGconn *
 cf_loopback_get_conn(int elevel)
 {
-    const char *connstr;
-    PGresult   *res;
+    const char       *connstr;
+    PGresult         *res;
+    PQconninfoOption *opts, *opt;
+    char             *parse_err = NULL;
 
     if (coldfront_loopback_conn != NULL &&
         PQstatus(coldfront_loopback_conn) == CONNECTION_OK)
@@ -4201,13 +4204,44 @@ cf_loopback_get_conn(int elevel)
         coldfront_loopback_conn = NULL;
     }
 
-    connstr = GetConfigOption("coldfront.dblink_self", true, false);
+    connstr = GetConfigOption("coldfront.loopback_dsn", true, false);
     if (connstr == NULL || connstr[0] == '\0')
     {
         ereport(elevel,
-                (errmsg("coldfront: coldfront.dblink_self is unset, so the bakery has no loopback connection")));
+                (errmsg("coldfront: coldfront.loopback_dsn is unset, so the bakery has no loopback connection")));
         return NULL;
     }
+
+    /* Every onboarded role can read the DSN (_bakery_armed reads it), so it must
+     * never need a password: a unix socket under peer or trust auth, never TCP. */
+    opts = PQconninfoParse(connstr, &parse_err);
+    if (opts == NULL)
+    {
+        char *msg = pstrdup(parse_err != NULL ? parse_err : "");
+
+        PQfreemem(parse_err);
+        ereport(elevel,
+                (errmsg("coldfront: coldfront.loopback_dsn is not a valid connection string: %s", msg)));
+        return NULL;
+    }
+    for (opt = opts; opt->keyword != NULL; opt++)
+    {
+        if (opt->val == NULL || opt->val[0] == '\0')
+            continue;
+        if ((strcmp(opt->keyword, "host") == 0 && opt->val[0] != '/') ||
+            strcmp(opt->keyword, "hostaddr") == 0)
+        {
+            char *kw = pstrdup(opt->keyword);
+            char *val = pstrdup(opt->val);
+
+            PQconninfoFree(opts);
+            ereport(elevel,
+                    (errmsg("coldfront: coldfront.loopback_dsn must name a unix socket (host=/directory), not %s=%s",
+                            kw, val)));
+            return NULL;
+        }
+    }
+    PQconninfoFree(opts);
 
     coldfront_loopback_conn = PQconnectdb(connstr);
     if (PQstatus(coldfront_loopback_conn) != CONNECTION_OK)
@@ -5344,11 +5378,11 @@ register_gucs(void)
         NULL, NULL, NULL);
 
     DefineCustomStringVariable(
-        "coldfront.dblink_self",
+        "coldfront.loopback_dsn",
         "libpq DSN of the loopback that runs the mesh bakery's claims, acks "
-        "and releases, each committed on its own.",
+        "and releases, each committed on its own; a unix socket.",
         NULL,
-        &coldfront_dblink_self,
+        &coldfront_loopback_dsn,
         "",
         PGC_SUSET,
         0,

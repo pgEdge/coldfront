@@ -953,8 +953,8 @@ Keep the following caveats in mind when running either mode:
   optimization; claims and acks replicate as Spock rows and it stays safe under
   Spock's asymmetric apply (modeled in
   [docs/formal/Bakery.tla](https://github.com/pgEdge/ColdFront/blob/main/docs/formal/Bakery.tla)).
-  The bakery requires the `snowflake` extension, the `coldfront.dblink_self`
-  GUC (the connection string of the node's loopback), and a one-time
+  The bakery requires the `snowflake` extension, the `coldfront.loopback_dsn`
+  GUC (the node's loopback, a unix-socket DSN), and a one-time
   `SELECT coldfront._ensure_claims_replicated()` call on every node after Spock
   mesh setup; see
   [architecture_decoupled.md](architecture_decoupled.md#concurrency-horizontal-scaling-the-bakery-protocol).
@@ -1052,12 +1052,13 @@ wal_receiver_status_interval = 1s
 snowflake.node = 1
 
 # DSN of the node's loopback, which runs the bakery's autonomous claim
-# INSERT/DELETE. Unix socket avoids TCP overhead. The claim session only touches the
-# coldfront.claims/claim_acks heap tables, so it never attaches the
-# Iceberg catalog (the lazy catalog-attach hook fires only on a tiered
-# view). application_name=coldfront_dblink marks the session as bakery
+# INSERT/DELETE. It must name a unix socket: every onboarded role can read
+# this setting, so it must never need a password. The claim session only
+# touches the coldfront.claims/claim_acks heap tables, so it never attaches
+# the Iceberg catalog (the lazy catalog-attach hook fires only on a tiered
+# view). application_name=coldfront_loopback marks the session as bakery
 # traffic. Only a superuser can set it.
-coldfront.dblink_self = 'host=/tmp dbname=coldfront user=coldfront application_name=coldfront_dblink'
+coldfront.loopback_dsn = 'host=/tmp dbname=coldfront user=coldfront application_name=coldfront_loopback'
 
 coldfront.warehouse = 'wh'
 coldfront.lakekeeper_endpoint = 'http://lakekeeper:8181/catalog'

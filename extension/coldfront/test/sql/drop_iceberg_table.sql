@@ -15,7 +15,7 @@ CREATE EXTENSION IF NOT EXISTS coldfront;
 SET TIME ZONE 'UTC';
 SET coldfront.warehouse = 'wh';
 SET coldfront.lakekeeper_endpoint = 'http://lk:8181/catalog';
-SET coldfront.dblink_self = '';
+SET coldfront.loopback_dsn = '';
 
 -- The emitted DDL is built from the stored iceberg_table ref, which is the only
 -- thing that names the right catalog table: an adopted relation's namespace is

@@ -109,7 +109,7 @@ you from an empty bucket to a working cold tier end-to-end.
 ColdFront reads its settings from two places. The server settings live in
 `postgresql.conf`: `shared_preload_libraries = 'pg_duckdb,coldfront'`,
 `coldfront.warehouse` and `coldfront.lakekeeper_endpoint`, plus
-`snowflake.node` and `coldfront.dblink_self` on every node of a mesh. The
+`snowflake.node` and `coldfront.loopback_dsn` on every node of a mesh. The
 Docker image writes them on first start. The archiver, partitioner, and
 compactor read a deployment YAML, modeled on
 [config.example.yaml](config.example.yaml), for the database DSN, the Iceberg

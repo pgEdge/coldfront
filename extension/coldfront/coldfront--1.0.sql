@@ -3304,20 +3304,18 @@ CREATE TABLE coldfront.deferred_acks (
 );
 
 -- Configuration: the libpq connection string of the loopback that runs the
--- bakery's autonomous transactions (see coldfront._loopback).
--- Operator sets this once per database (typically in postgresql.conf or
--- via ALTER DATABASE):
---    SET coldfront.dblink_self = 'host=/var/run/postgresql dbname=coldfront user=coldfront';
--- Default is empty; helpers raise a clear error if unset.
--- current_setting(name, missing_ok=true) returns NULL when the GUC isn't
--- defined; no EXCEPTION block needed (which would create a subtxn that
--- pg_duckdb's SubXactCallback hard-rejects).
-CREATE FUNCTION coldfront._dblink_self_connstr() RETURNS text
+-- bakery's autonomous transactions (see coldfront._loopback). It must name a
+-- unix socket: every onboarded role can read it, so it must never need a
+-- password. Set once per node in postgresql.conf:
+--    coldfront.loopback_dsn = 'host=/var/run/postgresql dbname=coldfront user=coldfront'
+-- Empty on a node outside a mesh; _take_iceberg_claim refuses a cold write on
+-- a node that runs Spock without it.
+CREATE FUNCTION coldfront._loopback_dsn() RETURNS text
 LANGUAGE sql STABLE AS
-$$ SELECT current_setting('coldfront.dblink_self', true) $$;
+$$ SELECT current_setting('coldfront.loopback_dsn') $$;
 
 -- coldfront._loopback runs one statement on this node's loopback: a libpq
--- connection the extension's C code opens from coldfront.dblink_self and keeps
+-- connection the extension's C code opens from coldfront.loopback_dsn and keeps
 -- for the backend's lifetime. The statement commits on its own and is tagged
 -- with this node as its origin, so Spock replicates it everywhere. Returns the
 -- first column of the first row as text, or NULL. A statement that fails
@@ -3604,7 +3602,7 @@ CREATE FUNCTION coldfront._claim_iceberg_lock(
     p_iceberg_table text
 ) RETURNS bigint LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
 DECLARE
-    connstr           text     := coldfront._dblink_self_connstr();
+    connstr           text     := coldfront._loopback_dsn();
     my_node           int      := current_setting('snowflake.node')::int;
     -- Local spock node name, used for the ack-wait join and the liveness
     -- slot-name computation (see coldfront._my_spock_node_name).
@@ -3619,7 +3617,7 @@ DECLARE
         current_setting('coldfront.peer_alive_window_ms')::int / 1000.0);
 BEGIN
     IF connstr IS NULL OR connstr = '' THEN
-        RAISE EXCEPTION 'coldfront: configure GUC coldfront.dblink_self with a libpq connstr (e.g. ''host=/var/run/postgresql dbname=coldfront user=coldfront'')';
+        RAISE EXCEPTION 'coldfront: configure coldfront.loopback_dsn with this server''s unix-socket DSN (e.g. ''host=/var/run/postgresql dbname=coldfront user=coldfront'')';
     END IF;
 
     -- Same-node serialization: hold a node-local advisory xact lock for this
@@ -3744,19 +3742,21 @@ END;
 $$;
 
 -- coldfront._bakery_armed: TRUE when this node is configured for the multi-writer
--- Ricart-Agrawala bakery (both GUCs the protocol needs are set). FALSE means
--- vanilla single-node, which serializes cold writes with a local advisory xact
--- lock. The single source of truth for the gate.
+-- Ricart-Agrawala bakery (both GUCs the protocol needs are set). FALSE means a
+-- node without them: a vanilla single node, which serializes cold writes with a
+-- local advisory xact lock, or a node that runs Spock, which _take_iceberg_claim
+-- refuses. The single source of truth for the gate.
 CREATE FUNCTION coldfront._bakery_armed() RETURNS boolean
 LANGUAGE sql STABLE AS $$
     SELECT NULLIF(current_setting('snowflake.node', true), '') IS NOT NULL
-       AND NULLIF(current_setting('coldfront.dblink_self', true), '') IS NOT NULL
+       AND NULLIF(current_setting('coldfront.loopback_dsn'), '') IS NOT NULL
 $$;
 
 -- coldfront._take_iceberg_claim: acquire the per-iceberg-table cold-write mutex,
 -- held to transaction end. Mesh (_bakery_armed): take the R-A bakery claim and
--- enqueue its release for the C XactCallback. Vanilla: a transaction-scoped local
--- advisory lock (auto-released at xact end). Callers decide WHEN to call it
+-- enqueue its release for the C XactCallback. Vanilla (no Spock): a transaction-
+-- scoped local advisory lock (auto-released at xact end); a node that runs Spock
+-- without the bakery's settings is refused. Callers decide WHEN to call it
 -- relative to their own work; it deliberately omits the standby
 -- (pg_is_in_recovery) guard and any lock ordering, which stay in callers.
 -- A transaction holds one claim per table: the claim lasts until commit, so a
@@ -3776,6 +3776,15 @@ BEGIN
                            concat_ws(E'\n', NULLIF(current_setting('coldfront._claimed'), ''), p_iceberg_ref),
                            true);
     ELSE
+        -- A node that runs Spock is a mesh node, and a mesh node serializes cold
+        -- writes through the bakery alone: without its settings, refuse rather
+        -- than take the node-local lock, which peers cannot see.
+        IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'spock') THEN
+            RAISE EXCEPTION 'coldfront: this node runs Spock, so a cold write needs the bakery, and % is not set',
+                CASE WHEN NULLIF(current_setting('coldfront.loopback_dsn'), '') IS NULL
+                     THEN 'coldfront.loopback_dsn' ELSE 'snowflake.node' END
+                USING HINT = 'Set coldfront.loopback_dsn to this server''s unix-socket DSN (e.g. ''host=/var/run/postgresql dbname=coldfront user=coldfront'') and snowflake.node to this node''s id.';
+        END IF;
         PERFORM pg_advisory_xact_lock(hashtext('coldfront_iceberg:' || p_iceberg_ref));
     END IF;
 END;
@@ -3830,7 +3839,7 @@ $$;
 --     dependency. Taken BEFORE staging so a second backend on this node blocks
 --     before it captures parent_snapshot_id (no stale-parent 409); auto-released
 --     at commit. This is the path for plain PostgreSQL tiered deployments, which
---     have no snowflake.node / dblink_self configured.
+--     have no snowflake.node / loopback_dsn configured.
 --
 -- _bakery_armed() probes the two GUCs the R-A bakery requires. current_setting(...,true)
 -- returns NULL for an unrecognised GUC, so the probe is safe with no snowflake
