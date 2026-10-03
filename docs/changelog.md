@@ -244,6 +244,10 @@ this project adheres to
   tier, a statement the same check refuses. It names what the check allows:
   the hot partitions one at a time and a `DELETE` through the view for the
   cold rows, or the `DELETE` alone for an iceberg-only view.
+- The compactor's snapshot expiry reported its flags, not its result: the dry
+  run ignored `--expire-older-than` and the real run printed the
+  `--expire-retain-last` value as the kept count. Both now count the snapshots
+  the expiry keeps, the dry run from the staged metadata.
 
 ## [1.0.0-beta2] - 2026-08-08
 

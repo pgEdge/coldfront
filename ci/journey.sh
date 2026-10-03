@@ -1770,6 +1770,12 @@ story_maintenance() {
         fail "TC-131: expire --dry-run shows nothing to expire: $snaps"; return
     fi
 
+    # TC-220: the dry run stages the same expiry the real run commits and counts the
+    # result. With the default age (168 h) every snapshot here is minutes old, so it
+    # expires nothing and keeps them all.
+    assert_contains "TC-220: a default dry run expires nothing and keeps every snapshot" \
+        "would expire 0 and keep $nsnap" "$snaps"
+
     # TC-132: expire metadata only (--expire-keep-files), leaving freed files as orphans for --orphans.
     # --expire-older-than 0s: age-driven expiry, so expire all but the current snapshot now.
     if compactor --table events \
@@ -1786,6 +1792,8 @@ story_maintenance() {
     else
         fail "TC-131: snapshot count not at retain target after expire: $after"
     fi
+    assert_eq "TC-220: the real run reports the snapshots it kept" "$nafter" \
+        "$(grep -oE 'kept [0-9]+' $TMPD/expire.log | grep -oE '[0-9]+')"
 
     # The files those expired snapshots alone pinned are now orphans (referenced by nothing).
     local orph; orph=$(compactor --table events --orphans --orphan-age 0s --dry-run 2>&1)

@@ -195,24 +195,24 @@ func doCompaction(ctx context.Context, cat *rest.Catalog, ns, tableName string, 
 	return nil
 }
 
-// doExpire expires all but the most-recent --expire-retain-last snapshots under a claim.
+// doExpire expires the snapshots --expire-older-than and --expire-retain-last select, under a
+// claim; in dry-run it reports what the same expiry would do.
 func doExpire(ctx context.Context, cat *rest.Catalog, ns, tableName string, o runOpts) error {
 	tbl, err := loadTable(ctx, cat, ns, tableName)
 	if err != nil {
 		return err
 	}
-	have := len(tbl.Metadata().Snapshots())
-	if o.dryRun {
-		fmt.Fprintf(os.Stderr, "compactor: %s.%s — %d snapshot(s); would retain the most recent %d\n",
-			ns, tableName, have, o.retainLast)
-		return nil
-	}
-	expired, err := expireSnapshots(ctx, tbl, o.retainLast, o.olderThan, !o.keepFiles)
+	expired, kept, err := expireSnapshots(ctx, tbl, o.retainLast, o.olderThan, !o.keepFiles, o.dryRun)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "compactor: %s.%s — expired %d snapshot(s), retained %d\n",
-		ns, tableName, expired, o.retainLast)
+	if o.dryRun {
+		fmt.Fprintf(os.Stderr, "compactor: %s.%s: %d snapshot(s); would expire %d and keep %d\n",
+			ns, tableName, expired+kept, expired, kept)
+		return nil
+	}
+	fmt.Fprintf(os.Stderr, "compactor: %s.%s: expired %d snapshot(s), kept %d\n",
+		ns, tableName, expired, kept)
 	return nil
 }
 
