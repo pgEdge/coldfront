@@ -93,9 +93,19 @@ this project adheres to
   refused. `coldfront.peer_alive_window_ms` and the build marker
   `coldfront.iceberg_bakery_patch` are superuser-only;
   `coldfront.iceberg_async_parquet` stays session-settable.
+- One call, `coldfront.ensure_replicated()`, is the per-node mesh setup step.
+  It puts every ColdFront table that replicates by value in the node's default
+  replication set: the bakery's claims and acks, the registry and watermark,
+  the storage secret, the lifecycle config and the vector routing state. It
+  replaces `_ensure_claims_replicated()`, `_ensure_vector_state_replicated()`
+  and the `spock.repset_add_table` calls the setup asked for by hand, and
+  nothing calls it at run time.
 
 ### Fixed
 
+- The archiver registered a tiered table as two statements, the view and then
+  the registry row, so a mesh peer briefly had the view without the row its
+  hook needs, and a write there failed. The registration is one transaction.
 - A prepared `INSERT` into a tiered view whose source held a bound parameter
   inside a sub-select or a function in `FROM` failed with "there is no
   parameter $1". The parameter now carries through the rewrite wherever it

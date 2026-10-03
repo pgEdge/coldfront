@@ -433,7 +433,7 @@ Re-run the model after any change to the following:
 - The bakery functions in `extension/coldfront/coldfront--1.0.sql`
   (`_claim_iceberg_lock`, `_insert_claim`, `_take_iceberg_claim`,
   `_exec_iceberg_with_claim`, `_enqueue_release`, `_on_claim_apply`,
-  `_on_claim_release`, `_ensure_claims_replicated`).
+  `_on_claim_release`, `ensure_replicated`).
 - The `_exec_iceberg_with_claim` ordering or the
   `coldfront.iceberg_async_parquet` flag's meaning (which parquet-stage point /
   where `parent_snapshot_id` is stamped relative to the claim), which means

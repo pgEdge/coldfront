@@ -910,12 +910,11 @@ SELECT spock.sub_create('sub_db1_from_db2', 'host=db2 user=coldfront dbname=cold
 -- On db2:
 SELECT spock.sub_create('sub_db2_from_db1', 'host=db1 user=coldfront dbname=coldfront port=5432');
 
--- On BOTH nodes - wait for the subscription to sync, then replicate the bakery's
--- claim + config tables and set the cold-store secret, before any cold write:
+-- On BOTH nodes - wait for the subscription to sync, then put the replicated
+-- ColdFront tables in the repset and set the cold-store secret, before any
+-- cold write:
 SELECT spock.sub_wait_for_sync(sub_name) FROM spock.subscription;
-SELECT coldfront._ensure_claims_replicated();
-SELECT spock.repset_add_table('default', 'coldfront.partition_config'::regclass, false);
-SELECT spock.repset_add_table('default', 'coldfront.storage_secret'::regclass, false);
+SELECT coldfront.ensure_replicated();
 SELECT coldfront.set_storage_secret('admin', 'adminsecret', 'seaweedfs:8333');
 ```
 

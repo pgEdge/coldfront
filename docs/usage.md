@@ -295,9 +295,9 @@ That single statement provisions:
 
 In a mesh one node provisions: Spock's `ddl_sql` repset replicates the
 `CREATE VIEW`, and the `default` repset replicates the name-keyed registry row,
-which enables the write hook on every peer. Each node also needs the bakery
-enabled via `coldfront._ensure_claims_replicated()` - see the one-time mesh
-setup below.
+which enables the write hook on every peer. Each node also needs the one-time
+setup call `coldfront.ensure_replicated()` - see the one-time mesh setup
+below.
 
 ### Adopting a Table That Already Exists in the Catalog
 
@@ -955,8 +955,8 @@ Keep the following caveats in mind when running either mode:
   [docs/formal/Bakery.tla](https://github.com/pgEdge/ColdFront/blob/main/docs/formal/Bakery.tla)).
   The bakery requires the `snowflake` extension, the `coldfront.loopback_dsn`
   GUC (the node's loopback, a unix-socket DSN), and a one-time
-  `SELECT coldfront._ensure_claims_replicated()` call on every node after Spock
-  mesh setup; see
+  `SELECT coldfront.ensure_replicated()` call on every node after Spock mesh
+  setup; see
   [architecture_decoupled.md](architecture_decoupled.md#concurrency-horizontal-scaling-the-bakery-protocol).
   Sync-rep is **not** required. The throughput ceiling is Lakekeeper's commit
   rate, not the writer count.
@@ -1093,8 +1093,8 @@ sync-rep cluster-wide if you want stronger durability for non-bakery writes,
 but it plays no part in iceberg-commit serialization.
 
 The one-time mesh setup must be done in this order on every node, because
-`coldfront._ensure_claims_replicated()` calls `spock.repset_add_table` and so
-requires the local Spock node to already exist:
+step 3 calls `spock.repset_add_table`, which requires the local Spock node to
+already exist:
 
 ```sql
 -- 1. Extensions, in dependency order. snowflake is a bakery prereq
@@ -1119,24 +1119,10 @@ SELECT spock.sub_create('sub_n1_from_n3', 'host=<n3> user=coldfront dbname=coldf
                         ARRAY['default','default_insert_only','ddl_sql'],
                         false, false, '{}', '0', false);
 
--- 3. **Required** on every node, after spock setup: register the R-A
--- bakery tables (coldfront.claims + coldfront.claim_acks) in the local
--- node's default repset.  Without this on a peer, the peer's ack INSERTs
--- never replicate back to the originating writer and every claim on the
--- originator waits forever at the ack barrier.
-SELECT coldfront._ensure_claims_replicated();
-
--- 4. On every node: replicate the cold-store secret by value, so a
--- set_storage_secret() call on one node reaches all peers.
--- (coldfront.partition_config self-registers the same way the first time
--- the archiver/partitioner touches it, so it needs no manual step.)
-SELECT spock.repset_add_table('default', 'coldfront.storage_secret'::regclass, false);
-
--- 5. On every node: replicate the registry + watermark, so a table
--- provisioned, tiered or adopted on one node is fully usable on peers
--- (both tables are name-keyed, so the rows are node-independent).
-SELECT spock.repset_add_table('default', 'coldfront.tiered_views'::regclass, false);
-SELECT spock.repset_add_table('default', 'coldfront.archive_watermark'::regclass, false);
+-- 3. **Required** on every node, after its subscriptions exist and before
+-- the first cold write, storage secret or table registration: put every
+-- ColdFront table that replicates by value in this node's default repset.
+SELECT coldfront.ensure_replicated();
 ```
 
 The subscriptions set
@@ -1144,9 +1130,56 @@ The subscriptions set
 already exist on every node from the coldfront extension, so no initial copy is
 needed.
 
-Verify before benching - insert a sentinel claim on each node and read it back
-from every other node. All N×(N-1) directions must show the row before traffic
-starts. `ci/journey.sh` `story_mesh_substrate` is a copyable reference.
+### What `coldfront.ensure_replicated()` Does
+
+The call is the one ColdFront-specific step of the mesh setup. It adds eight
+tables to the node's `default` replication set, each keyed by name, so a row is
+identical on every node and replicates by value:
+
+| Table | What replicates, and why a peer needs it |
+|---|---|
+| `coldfront.claims`, `coldfront.claim_acks` | The bakery's tickets and acknowledgements. A peer acknowledges an originator's claim by inserting into `claim_acks` on its own node, and the ack reaches the originator only if the table is in the peer's set. |
+| `coldfront.tiered_views` | The registry. A peer's hook recognizes a view by its row; without it the peer's writes through the view fail in PostgreSQL ("cannot insert into view") and its reads cannot attach the cold tier. |
+| `coldfront.archive_watermark` | The hot/cold cutoff a tiered write is routed by. |
+| `coldfront.storage_secret` | The cold-store credential, so one `set_storage_secret` call reaches every node. |
+| `coldfront.partition_config` | The per-table lifecycle. The archiver and the partitioner add this table themselves as well, because the partitioner runs without the extension. |
+| `coldfront.vector_config`, `coldfront.vector_centroids` | The cluster routing state, so every node resolves a vector to the same cluster. |
+
+Two tables stay local by design and are not added: `coldfront.deferred_acks`
+(each node's queue of the acks it owes) and `coldfront._dummy_dml_target`.
+
+The call runs on every node because a replication set is a property of the
+provider: each node sends the rows of the tables in its own set, and a node
+that skipped the step keeps its acks, registry rows and secret to itself. It
+cannot run at `CREATE EXTENSION` time, because `spock.repset_add_table` needs
+the local Spock node, and nothing runs it later on a node's behalf:
+provisioning a table, setting the secret and writing cold rows all assume it
+has run. It is idempotent, so running it again is harmless, and a node added to
+the mesh later runs the same three steps.
+
+A skipped step shows up late and away from the node that skipped it. If a peer
+never ran it, the originator of every cold write waits at the ack barrier for
+an ack that never arrives. If the node that registers a table never ran it,
+the view reaches each peer as replicated DDL but the registry row does not, so
+the peer's writes through the view fail with "cannot insert into view". A
+secret set on such a node stays on that node.
+
+Verify the step on every node. The query lists the eight tables:
+
+```sql
+SELECT c.relname
+  FROM spock.replication_set rs
+  JOIN spock.replication_set_table rst ON rst.set_id = rs.set_id
+  JOIN pg_class c ON c.oid = rst.set_reloid
+ WHERE rs.set_name = 'default' AND c.relnamespace = 'coldfront'::regnamespace
+ ORDER BY 1;
+```
+
+Then verify the mesh before benching - insert a sentinel claim on each node
+and read it back from every other node. All N×(N-1) directions must show the
+row before traffic starts. `ci/journey.sh` `story_mesh_substrate` is a
+copyable reference: it checks the membership above on every node and then the
+sentinels.
 
 ## Tuning Knobs
 

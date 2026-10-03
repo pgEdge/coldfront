@@ -126,14 +126,15 @@ SELECT coldfront.set_storage_secret_azure('<connection string>');
 
 `set_storage_secret` does two things. (1) The function stores the secret in the
 `coldfront.storage_secret` table - an extension-member table, so its data is
-excluded from `pg_dump` by default, and it is added to the Spock replication
-set, so the secret replicates **by value** to every mesh node with no per-node
-file syncing. (2) The function materializes a DuckDB **persistent secret**,
-which DuckDB loads automatically at instance init - so every backend, including
-the first fresh one, sees the secret at a committed timestamp before any query
-runs. `set_storage_secret_azure` takes one connection string holding the
-account name, account key and endpoint suffix, writes the same row, and
-materializes a `TYPE azure` persistent secret.
+excluded from `pg_dump` by default, and `coldfront.ensure_replicated()` adds
+it to the Spock replication set, so the secret replicates **by value** to every
+mesh node with no per-node file syncing. (2) The function materializes a
+DuckDB **persistent secret**, which DuckDB loads automatically at instance
+init - so every backend, including the first fresh one, sees the secret at a
+committed timestamp before any query runs. `set_storage_secret_azure` takes
+one connection string holding the account name, account key and endpoint
+suffix, writes the same row, and materializes a `TYPE azure` persistent
+secret.
 
 For deployments that must not store a credential at all,
 `coldfront.set_storage_secret_vended()` records a vended
@@ -453,9 +454,10 @@ Which tables are managed and their lifecycle (`hot_period`, `retention_period`,
 `partition_period`, premake, mode, `expiration_strategy`) live in
 `coldfront.partition_config` - like `tiered_views` and `archive_watermark`, a
 name-keyed table (see [Registry Keying](#registry-keying-by-name-not-oid)).
-`coldfront.partition_config` is auto-added to the default replication set on a
-Spock node (a no-op on vanilla, where there is one node), so every node reads
-identical config with no per-node file syncing. `hot_period` and
+`coldfront.partition_config` is added to the default replication set on a
+Spock node by the binaries themselves and by `coldfront.ensure_replicated()`
+(a no-op on vanilla, where there is one node), so every node reads identical
+config with no per-node file syncing. `hot_period` and
 `retention_period` are native PostgreSQL `interval` columns - the column type
 validates each value on write, and expiry cutoffs are computed in-DB with
 calendar-accurate interval arithmetic (`now() - period`: real months, leap

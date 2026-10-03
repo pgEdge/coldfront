@@ -126,9 +126,10 @@ INSERT INTO coldfront._dummy_dml_target DEFAULT VALUES;
 
 -- Cold-tier S3 credential — the in-DB source of truth, set via
 -- coldfront.set_storage_secret(). As an extension-member table its DATA is NOT
--- carried by pg_dump (no pg_extension_config_dump), and it is added to the
--- Spock repset so the row replicates by value to every mesh node — unlike an
--- FDW user-mapping (which pg_dump DOES dump and which does not replicate).
+-- carried by pg_dump (no pg_extension_config_dump), and the one-time mesh step
+-- coldfront.ensure_replicated() adds it to the Spock repset, so the row
+-- replicates by value to every mesh node, unlike an FDW user-mapping (which
+-- pg_dump DOES dump and which does not replicate).
 --
 -- The row is materialized into a DuckDB PERSISTENT SECRET (see
 -- coldfront.materialize_storage_secret); DuckDB loads that at instance init, so
@@ -253,6 +254,56 @@ SELECT pg_extension_config_dump('coldfront.partition_config', '');
 -- to be retrained from scratch, so they travel with a dump like the rest.
 SELECT pg_extension_config_dump('coldfront.vector_config', '');
 SELECT pg_extension_config_dump('coldfront.vector_centroids', '');
+
+-- ============================================================================
+-- ONE-TIME MESH SETUP
+-- ============================================================================
+-- coldfront.ensure_replicated(): run once on every node of a Spock mesh, after
+-- spock.node_create and the node's spock.sub_create calls and before the first
+-- cold write, storage secret or table registration. It puts every ColdFront
+-- table that replicates by value in the node's default replication set.
+-- Membership is a property of the provider, so each node adds the tables for
+-- the rows it will send; a peer's subscription then receives them. Nothing
+-- calls it at run time: a node that skipped it keeps its claim acks, registry
+-- rows, secret and lifecycle config to itself.
+--
+-- The tables, all keyed by name so a row is identical on every node:
+--   claims, claim_acks               the bakery's tickets and acknowledgements
+--   tiered_views                     the registry the hook resolves a view by
+--   archive_watermark                the hot/cold cutoff a tiered write routes by
+--   storage_secret                   the cold-store credential
+--   partition_config                 per-table lifecycle (the archiver and the
+--                                    partitioner add it themselves as well, since
+--                                    the partitioner runs without the extension)
+--   vector_config, vector_centroids  cluster routing state
+-- Two tables stay local by design and are not added: deferred_acks (each
+-- node's own queue of acks it owes) and _dummy_dml_target (each node's
+-- CREATE EXTENSION seeds its row).
+--
+-- Idempotent, and a no-op without the spock extension. spock.repset_add_table
+-- needs the local Spock node, which is why this cannot run at CREATE EXTENSION
+-- time. No EXCEPTION block: pg_duckdb rejects every subtransaction.
+CREATE FUNCTION coldfront.ensure_replicated() RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    t text;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'spock') THEN
+        RETURN;
+    END IF;
+    FOREACH t IN ARRAY ARRAY['coldfront.claims', 'coldfront.claim_acks',
+                             'coldfront.tiered_views', 'coldfront.archive_watermark',
+                             'coldfront.storage_secret', 'coldfront.partition_config',
+                             'coldfront.vector_config', 'coldfront.vector_centroids'] LOOP
+        PERFORM spock.repset_add_table('default', t::regclass, false)
+        WHERE NOT EXISTS (
+            SELECT 1 FROM spock.replication_set rs
+              JOIN spock.replication_set_table rst ON rst.set_id = rs.set_id
+             WHERE rs.set_name = 'default' AND rst.set_reloid = t::regclass
+        );
+    END LOOP;
+END;
+$$;
 
 -- ensure_attached() issues ATTACH IF NOT EXISTS for the Lakekeeper catalog
 -- using the coldfront.warehouse and coldfront.lakekeeper_endpoint GUCs. Called
@@ -1992,29 +2043,6 @@ BEGIN
 END;
 $$;
 
--- Routing state replicates cluster-wide, for the reason the assignment itself
--- exists: every node has to resolve a vector to the same cluster id, or a row
--- written on one node is invisible to a probe issued on another. Gated on spock
--- like the claims tables, so vanilla is a no-op.
-CREATE FUNCTION coldfront._ensure_vector_state_replicated()
-RETURNS void LANGUAGE plpgsql AS $$
-DECLARE
-    t text;
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'spock') THEN
-        RETURN;
-    END IF;
-    FOREACH t IN ARRAY ARRAY['coldfront.vector_config', 'coldfront.vector_centroids'] LOOP
-        PERFORM spock.repset_add_table('default', t::regclass, false)
-        WHERE NOT EXISTS (
-            SELECT 1 FROM spock.replication_set rs
-              JOIN spock.replication_set_table rst ON rst.set_id = rs.set_id
-             WHERE rs.set_name = 'default' AND rst.set_reloid = t::regclass
-        );
-    END LOOP;
-END;
-$$;
-
 -- The distance operators a caller writes, on the real[] the view exposes.
 --
 -- Each function is named for the DuckDB function it has to become: pg_duckdb
@@ -2038,7 +2066,6 @@ DECLARE
     v_nsp  text;
     r      record;
 BEGIN
-    PERFORM coldfront._ensure_vector_state_replicated();
     SELECT n.nspname INTO v_nsp
     FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
     WHERE t.typname = 'vector';
@@ -2939,11 +2966,6 @@ BEGIN
     PERFORM coldfront._register_iceberg_view(p_schema, p_table, v_ice,
                                              v_cols, v_vec_cols, p_writable);
 
-    IF p_writable THEN
-        -- Cross-node bakery coordination, the same requirement a created table has.
-        PERFORM coldfront._ensure_claims_replicated();
-    END IF;
-
     RAISE NOTICE 'coldfront: adopted % as %.% (% columns, %)%',
         v_ice, p_schema, p_table, v_n,
         CASE WHEN p_writable THEN 'writable' ELSE 'read-only' END,
@@ -3157,13 +3179,6 @@ BEGIN
     --    libpq with no local materialisation.
     PERFORM coldfront._register_iceberg_view(p_schema, p_table, ice_ref,
                                              v_view_cols, v_vec_cols, true);
-
-    -- 3. Ensure claims is in Spock's default replication set so
-    --    cross-node bakery coordination (see below) works. Idempotent.
-    --    Claim rows themselves come and go on demand (INSERT in
-    --    _insert_claim, DELETE in coldfront_xact_callback), so the
-    --    table stays empty when no writers are mid-commit.
-    PERFORM coldfront._ensure_claims_replicated();
 END;
 $$;
 
@@ -3326,45 +3341,6 @@ $$ SELECT current_setting('coldfront.loopback_dsn') $$;
 CREATE FUNCTION coldfront._loopback(p_sql text) RETURNS text
 LANGUAGE c STRICT AS 'coldfront', 'coldfront_loopback';
 REVOKE EXECUTE ON FUNCTION coldfront._loopback(text) FROM PUBLIC;
-
--- One-time setup: ensure claims is in Spock's default replication set so
--- peer nodes see our INSERT/DELETE on it. Idempotent via existence check.
--- No EXCEPTION block: pg_duckdb's SubXactCallback hard-rejects every
--- subtransaction in the session, even ones that don't touch DuckDB.
--- Called from coldfront.create_iceberg_table() on whichever node first
--- declares an iceberg table.
-CREATE FUNCTION coldfront._ensure_claims_replicated()
-RETURNS void LANGUAGE plpgsql AS $$
-BEGIN
-    -- Claims replication is a Spock-mesh concern only. In a vanilla single-node
-    -- deployment there is no spock extension (and the bakery uses a local
-    -- advisory lock, not cross-node claim rows), so this is a no-op. Gating on
-    -- the spock extension's presence keeps create_iceberg_table working
-    -- identically in vanilla and mesh (single shared path).
-    IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'spock') THEN
-        RETURN;
-    END IF;
-
-    -- coldfront.claims is replicated cluster-wide.
-    PERFORM spock.repset_add_table('default', 'coldfront.claims'::regclass, false)
-    WHERE NOT EXISTS (
-        SELECT 1 FROM spock.replication_set rs
-          JOIN spock.replication_set_table rst ON rst.set_id = rs.set_id
-         WHERE rs.set_name = 'default'
-           AND rst.set_reloid = 'coldfront.claims'::regclass
-    );
-    -- coldfront.claim_acks too — originator needs to see peers' acks.
-    PERFORM spock.repset_add_table('default', 'coldfront.claim_acks'::regclass, false)
-    WHERE NOT EXISTS (
-        SELECT 1 FROM spock.replication_set rs
-          JOIN spock.replication_set_table rst ON rst.set_id = rs.set_id
-         WHERE rs.set_name = 'default'
-           AND rst.set_reloid = 'coldfront.claim_acks'::regclass
-    );
-    -- coldfront.deferred_acks is INTENTIONALLY local-only (each node's
-    -- queue of acks-it-owes-to-others-once-it-releases).
-END;
-$$;
 
 -- Peer-side trigger: fires when spock applies an originator's claim INSERT or
 -- poke UPDATE to this node's coldfront.claims (REPLICA-only, not on the

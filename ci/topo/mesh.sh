@@ -113,36 +113,20 @@ done
 subs=$(m db1 "SELECT count(*) FROM spock.subscription;")
 [ "$subs" = 2 ] || { echo "spock bootstrap FAILED: db1 has '$subs' subscriptions (expected 2) — mesh not formed"; exit 1; }
 
-# Pre-arm the R-A bakery substrate on EVERY node: coldfront.claims/claim_acks
-# must be in each node's replication set BEFORE any cold write. A peer acks an
-# originator's claim by INSERTing into claim_acks (over its loopback, so it is
-# the peer's own origin); that ack only reaches the originator if claim_acks is in
-# the peer's repset. create_iceberg_table() calls this too, but only on the node
-# it runs on — so peers would otherwise not be armed until too late, and the
-# originator would sleep forever waiting for acks. Idempotent.
-for n in $NODES; do m "$n" "SELECT coldfront._ensure_claims_replicated();" >/dev/null 2>&1; done
-# Cross-node registry: replicate tiered_views + archive_watermark alongside the
-# bakery's claims/claim_acks, so a table provisioned, tiered or adopted on db1 is
-# fully usable on a peer. tiered_views (keyed by schema_name,relname) arms the
-# peer's hook to recognise the view for UPDATE/DELETE + DDL-blocking;
-# archive_watermark (keyed by table_name) gives a tiered table's write hook the
-# hot/cold cutoff. Both are name-keyed, so the repset copies each row verbatim and
-# correct on every node (a name is node-independent). One node registers, the
-# archiver on db1 or the node that called create/adopt_iceberg_table; a peer never
-# registers the view itself and gets the row by replication. (See
-# docs/architecture_tiered.md "Tiered tables in a Spock mesh".)
+# The one-time per-node step every mesh needs, before any cold write, secret or
+# registration: coldfront.ensure_replicated() puts each ColdFront table that
+# replicates by value in this node's default replication set. Membership is a
+# property of the provider, so every node runs it for its own rows: a peer acks
+# an originator's claim by INSERTing into claim_acks over its loopback, and the
+# ack reaches the originator only if claim_acks is in the peer's set; the same
+# holds for the registry row a peer's hook resolves a view by, the secret and
+# the lifecycle config. Loud on failure: a table missing here fails only later,
+# at a peer.
 for n in $NODES; do
-    m "$n" "SELECT spock.repset_add_table('default','coldfront.tiered_views'::regclass, false);"    >/dev/null 2>&1
-    m "$n" "SELECT spock.repset_add_table('default','coldfront.archive_watermark'::regclass, false);" >/dev/null 2>&1
+    out=$(m "$n" "SELECT coldfront.ensure_replicated();")
+    [ -z "$out" ] || { echo "coldfront.ensure_replicated() failed on $n: $out"; exit 1; }
 done
-# Per-table lifecycle config + the cold-tier storage secret replicate by value
-# in any mesh mode (partition_config is also self-registered by the binaries via
-# partcfg.EnsureTable; doing it here too is harmless).
-for n in $NODES; do
-    m "$n" "SELECT spock.repset_add_table('default','coldfront.partition_config'::regclass, false);" >/dev/null 2>&1
-    m "$n" "SELECT spock.repset_add_table('default','coldfront.storage_secret'::regclass, false);" >/dev/null 2>&1
-done
-pass "spock mesh formed (6 subs) + bakery substrate armed on all nodes"
+pass "spock mesh formed (6 subs) + every replicated coldfront table in each node's default set"
 
 step "mesh: bootstrap Lakekeeper + warehouse ($BACKEND)"
 curl -sf "http://$LK_IP:8181/management/v1/bootstrap" -X POST -H "Content-Type: application/json" \

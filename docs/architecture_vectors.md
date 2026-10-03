@@ -77,10 +77,10 @@ id without sharing OIDs. The following table describes what each one holds:
 | `coldfront.vector_config` | The table holds `nlist`, `nprobe`, the live `generation`, and `addition_cap` (reserved, default 0) for each (schema, table, column). |
 | `coldfront.vector_centroids` | The table holds the centroids themselves, keyed additionally by `(generation, centroid_id)`, with a `parent_id` column that no code path sets. |
 
-Both are registered in Spock's `default` replication set by
-`coldfront._ensure_vector_state_replicated()`, gated on the Spock extension so
-vanilla is a no-op, and both are `pg_extension_config_dump`-marked: losing them
-makes every stored cluster id uninterpretable and forces a retrain.
+Both are put in Spock's `default` replication set by
+`coldfront.ensure_replicated()`, the one-time per-node mesh step, and both are
+`pg_extension_config_dump`-marked: losing them makes every stored cluster id
+uninterpretable and forces a retrain.
 
 `coldfront._unregister_iceberg`, which both `release_iceberg_table` and
 `drop_iceberg_table` call, deletes the table's rows from both tables. The

@@ -468,10 +468,13 @@ capability reaches a peer:
 
 So alongside the bakery substrate (`coldfront.claims` /
 `coldfront.claim_acks`), **both `coldfront.tiered_views` and
-`coldfront.archive_watermark` are added to the Spock replication set** when a
-mesh runs in tiered mode. The archiver runs on one node, so a peer only gets
-these rows by replication; without `tiered_views` a peer cannot read the cold
-tier, and INSERT/UPDATE/DELETE/DDL-blocking stop recognizing the view.
+`coldfront.archive_watermark` are in the Spock replication set**:
+`coldfront.ensure_replicated()`, the one-time per-node mesh step described in
+[usage.md](usage.md#what-coldfrontensure_replicated-does), adds them with the
+rest. The archiver runs on one node and registers a table, its view and its
+registry row, in one transaction, so a peer applies them together and only
+gets these rows by replication; without `tiered_views` a peer cannot read the
+cold tier, and INSERT/UPDATE/DELETE/DDL-blocking stop recognizing the view.
 
 Both tables are **name-keyed** - `tiered_views` by `(schema_name, relname)`,
 `archive_watermark` by `table_name` - so each row replicates verbatim and

@@ -401,7 +401,6 @@ type archiveCycle struct {
 	conn             *pgx.Conn
 	wmStore          *watermark.Store
 	partMgr          *partition.Manager
-	viewGen          *view.Generator
 	iceTable         string
 	now              time.Time
 	debugExportDelay time.Duration
@@ -431,7 +430,6 @@ func runCycle(ctx context.Context, cfg *config.Config, t *config.TableConfig, co
 	ac := &archiveCycle{
 		cfg: cfg, t: t, conn: conn, wmStore: wmStore,
 		partMgr:  partition.NewManager(conn),
-		viewGen:  view.NewGenerator(conn),
 		iceTable: icebergRef(t.SourceSchema, t.SourceTable),
 		now:      now, debugExportDelay: debugExportDelay,
 	}
@@ -634,10 +632,13 @@ func (ac *archiveCycle) archiveOnePartition(ctx context.Context, part partition.
 }
 
 // bootstrapTieredView is the first-cycle bootstrap shared by both tiering
-// passes: read the watermark, rename {source} → _{source} and (re)create the
-// unified view with cutoff=watermark, then register the tiered view. Idempotent
-// — the swap SQL no-ops if the rename already happened. Called ONCE before the
-// per-partition / per-period loop, never inside it.
+// passes: read the watermark, then in one transaction rename {source} to
+// _{source}, (re)create the unified view with cutoff=watermark and register the
+// tiered view. One transaction, so the view never exists without the registry
+// row the hook resolves it by, on this node or on a Spock peer, which applies
+// the transaction as a unit. Idempotent: the swap SQL no-ops if the rename
+// already happened. Called ONCE before the per-partition / per-period loop,
+// never inside it.
 func (ac *archiveCycle) bootstrapTieredView(ctx context.Context, columns []view.Column) error {
 	t, iceTable := ac.t, ac.iceTable
 	wmCutoff, found, err := ac.wmStore.Get(ctx, t.SourceSchema, t.SourceTable)
@@ -653,13 +654,21 @@ func (ac *archiveCycle) bootstrapTieredView(ctx context.Context, columns []view.
 		PartitionColumn: t.PartitionColumn,
 		Columns:         columns,
 	}
-	if err := ac.viewGen.Recreate(ctx, bootstrapCfg); err != nil {
+	tx, err := ac.conn.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin bootstrap: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := view.NewGenerator(tx).Recreate(ctx, bootstrapCfg); err != nil {
 		return fmt.Errorf("bootstrap view: %w", err)
 	}
 	hotTable := pgx.Identifier{t.SourceSchema, "_" + t.SourceTable}.Sanitize()
-	if err := registerTieredView(ctx, ac.conn, t.SourceSchema, t.SourceTable,
+	if err := registerTieredView(ctx, tx, t.SourceSchema, t.SourceTable,
 		hotTable, iceTable, t.PartitionColumn, vectorColumns(columns)); err != nil {
 		return fmt.Errorf("register tiered view: %w", err)
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit bootstrap: %w", err)
 	}
 	return nil
 }
@@ -744,7 +753,6 @@ func runCycleTwoLevel(ctx context.Context, cfg *config.Config, t *config.TableCo
 	ac := &archiveCycle{
 		cfg: cfg, t: t, conn: conn, wmStore: wmStore,
 		partMgr:  partition.NewManager(conn),
-		viewGen:  view.NewGenerator(conn),
 		iceTable: icebergRef(t.SourceSchema, t.SourceTable),
 		now:      now, debugExportDelay: debugExportDelay,
 	}
@@ -1476,8 +1484,8 @@ func ensureIcebergTable(ctx context.Context, conn *pgx.Conn, t *config.TableConf
 // registerTieredView upserts a row in coldfront.tiered_views so the
 // coldfront C extension can identify this view as a tiered target and
 // rewrite UPDATE/DELETE into dual-tier CTEs. Called after every view recreate.
-func registerTieredView(ctx context.Context, conn *pgx.Conn, schema, table, hotTable, icebergTable, partitionCol string, vecColumns []string) error {
-	_, err := conn.Exec(ctx /* nosemgrep */, `
+func registerTieredView(ctx context.Context, db view.DBTX, schema, table, hotTable, icebergTable, partitionCol string, vecColumns []string) error {
+	_, err := db.Exec(ctx /* nosemgrep */, `
 		INSERT INTO coldfront.tiered_views (schema_name, relname, hot_table, iceberg_table, partition_col, vec_columns)
 		VALUES ($1, $2, $3, $4, $5, NULLIF($6, '{}'::text[]))
 		ON CONFLICT (schema_name, relname) DO UPDATE

@@ -565,11 +565,11 @@ mesh_bringup() {
 
     start_spinner "[6/6] Setting up the bakery + cold-store secret on both nodes"
     for port in "$MESH_PG1_PORT" "$MESH_PG2_PORT"; do
-        # claims/claim_acks into the repset BEFORE any cold write: a peer has to
-        # have them to ack an originator's claim, else the originator waits forever.
-        mpg "$port" "SELECT coldfront._ensure_claims_replicated();" >/dev/null 2>&1
-        mpg "$port" "SELECT spock.repset_add_table('default','coldfront.partition_config'::regclass, false);" >/dev/null 2>&1
-        mpg "$port" "SELECT spock.repset_add_table('default','coldfront.storage_secret'::regclass, false);" >/dev/null 2>&1
+        # The replicated ColdFront tables into the repset BEFORE any cold write: a
+        # peer has to have claim_acks there to ack an originator's claim, else the
+        # originator waits forever, and the secret set below reaches the peer only
+        # through it.
+        mpg "$port" "SELECT coldfront.ensure_replicated();" >/dev/null 2>&1
         mpg "$port" "SELECT coldfront.set_storage_secret('admin','adminsecret','seaweedfs:8333');" >/dev/null 2>&1
     done
     stop_spinner; info "[6/6] Bakery replication set up; cold-store secret set"

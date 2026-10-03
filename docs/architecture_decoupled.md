@@ -733,26 +733,28 @@ The bakery has no peer-ack timeout knob. Dead peers are caught by the
 walsender is treated as already-acked); alive peers that have not acked are
 either deferring legitimately or about to ack.
 
-For the per-node bootstrap, after Spock mesh setup, register the bakery tables
-in each node's default repset. This step is required because
-`spock.repset_add_table` needs the local Spock node to exist (it cannot run at
-`CREATE EXTENSION` time):
+For the per-node bootstrap, after Spock mesh setup, run the one-time setup
+call on each node. This step is required because `spock.repset_add_table`
+needs the local Spock node to exist (it cannot run at `CREATE EXTENSION` time):
 
 ```sql
 -- run on every node, after spock.node_create + spock.sub_create:
-SELECT coldfront._ensure_claims_replicated();
+SELECT coldfront.ensure_replicated();
 ```
 
-The helper is idempotent. If the helper has not run on a peer, that peer's ack
-INSERTs are local-only and never replicate back to the originating writer:
-every claim on the originator waits forever at the ack barrier.
+The call is idempotent. It puts every ColdFront table that replicates by value
+in the node's default repset: the two bakery tables, the registry and the
+watermark, the storage secret, the lifecycle config and the vector routing
+state (the list and the reason for each table are in
+[usage.md → Distributed Setup](usage.md#what-coldfrontensure_replicated-does)).
+If it has not run on a peer, that peer's ack INSERTs are local-only and never
+replicate back to the originating writer: every claim on the originator waits
+at the ack barrier for an ack that never arrives.
 
-`coldfront.create_iceberg_table()` and
-`coldfront.adopt_iceberg_table(p_writable => true)` call
-`_ensure_claims_replicated()` on the node they run on, but that only registers
-the repset on *that* node. Peers receive the wrapper-view DDL via Spock's
-`ddl_sql` repset but do *not* re-run the helper - so the explicit per-node call
-above is mandatory in any multi-node setup.
+Nothing runs it later on a node's behalf. `coldfront.create_iceberg_table()`
+and `coldfront.adopt_iceberg_table(p_writable => true)` assume it has run on
+the node they run on and on every peer, so the explicit per-node call is
+mandatory in any multi-node setup.
 
 ## When to Use Decoupled vs Tiered
 

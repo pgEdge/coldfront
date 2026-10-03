@@ -1,0 +1,9 @@
+-- coldfront.ensure_replicated() is the one-time mesh setup call, run once on
+-- every node after its Spock subscriptions exist. Without the spock extension
+-- there is no replication set to add to, and the call returns.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_duckdb;
+CREATE EXTENSION IF NOT EXISTS coldfront;
+RESET client_min_messages;
+
+SELECT coldfront.ensure_replicated();
