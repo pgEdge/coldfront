@@ -651,12 +651,14 @@ pointing at the same Lakekeeper endpoint and S3 bucket:
     The wait phase has no explicit timeout. R-A's only failure mode is a dead
     peer (would block forever), and ColdFront closes it via a liveness check on
     `pg_stat_replication.reply_time`: a peer whose walsender has been silent
-    longer than `coldfront.peer_alive_window_ms` (default 5000 ms; tune up on
-    slow/lossy WAN links) is implicitly treated as already-acked. The reply is
-    the peer's apply-worker feedback, sent after it applies, every
+    longer than `coldfront.peer_alive_window_ms` is implicitly treated as
+    already-acked, whatever the walsender's state. The reply is the peer's
+    apply-worker feedback, sent after it applies, every
     `spock.feedback_frequency` messages, and in answer to the walsender's
-    keepalive, which on an idle link comes every `wal_sender_timeout/2` (30 s
-    by default); `wal_receiver_status_interval` plays no part. An *alive*
+    keepalive, which on an idle link comes every `wal_sender_timeout/2`, so
+    the claim refuses to run unless `wal_sender_timeout` is positive and
+    below twice the window; usage.md gives the default and the pairing. An
+    *alive*
     peer that has not acked is either deferring (R-A's defer rule, legitimate)
     or about to ack - either way, waiting is correct. A same-node claim is
     released by the C XactCallback in
@@ -697,6 +699,9 @@ settings:
 wal_level = logical
 shared_preload_libraries = 'snowflake,spock,pg_duckdb,coldfront'
 
+# Paired with coldfront.peer_alive_window_ms (see usage.md).
+wal_sender_timeout = 15s
+
 # Sync-rep is NOT required by the bakery - R-A's ack barrier replaces it.
 ```
 
@@ -714,10 +719,6 @@ snowflake.node = 1     # node1
 # DSN of the loopback that runs the bakery's autonomous claim/ack/release statements (unix socket only).
 coldfront.loopback_dsn = 'host=/tmp dbname=coldfront user=coldfront application_name=coldfront_loopback'
 
-# Optional, superuser-only: the peer-liveness window for R-A's dead-peer
-# escape; a peer whose reply_time is older than this is treated as
-# already-acked.
-coldfront.peer_alive_window_ms = 5000
 ```
 
 The bakery runs only on a node where both `snowflake.node` and

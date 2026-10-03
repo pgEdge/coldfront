@@ -3588,15 +3588,27 @@ DECLARE
     my_node_name      name     := coldfront._my_spock_node_name();
     my_ticket         bigint;
     v_poll            int      := 0;
-    -- coldfront.peer_alive_window_ms (superuser-only, default 5000): a peer
-    -- whose walsender has not replied within this window is treated as
-    -- already acked (the R-A dead-peer escape); raise it on slow or lossy
-    -- links. Read once per claim, so a change applies to the next claim.
-    peer_alive_window interval := make_interval(secs =>
-        current_setting('coldfront.peer_alive_window_ms')::int / 1000.0);
+    -- coldfront.peer_alive_window_ms (superuser-only): a peer whose walsender
+    -- has not replied within this window is treated as already acked (the
+    -- R-A dead-peer escape); raise it on slow or lossy links, together with
+    -- wal_sender_timeout. Read once per claim, so a change applies to the
+    -- next claim.
+    peer_alive_window_ms int := current_setting('coldfront.peer_alive_window_ms')::int;
+    peer_alive_window interval := make_interval(secs => peer_alive_window_ms / 1000.0);
+    -- The server's wal_sender_timeout in ms (reset_val, which a session SET
+    -- cannot hide). The walsender asks a peer for a reply every half of it,
+    -- so it must not be 0 and half of it must be below the window, or an
+    -- idle live peer would be ruled dead.
+    wal_sender_timeout_ms int := (SELECT reset_val::int FROM pg_settings
+                                   WHERE name = 'wal_sender_timeout');
 BEGIN
     IF connstr IS NULL OR connstr = '' THEN
         RAISE EXCEPTION 'coldfront: configure coldfront.loopback_dsn with this server''s unix-socket DSN (e.g. ''host=/var/run/postgresql dbname=coldfront user=coldfront'')';
+    END IF;
+    IF wal_sender_timeout_ms = 0 OR wal_sender_timeout_ms / 2 >= peer_alive_window_ms THEN
+        RAISE EXCEPTION 'coldfront: wal_sender_timeout is % ms and coldfront.peer_alive_window_ms is % ms: the walsender asks a peer for a reply every wal_sender_timeout/2, so an idle live peer would be ruled dead',
+            wal_sender_timeout_ms, peer_alive_window_ms
+            USING HINT = 'Set wal_sender_timeout above 0 and below twice the window on every node, as the image does: ALTER SYSTEM SET wal_sender_timeout = ''15s''; SELECT pg_reload_conf();';
     END IF;
 
     -- Same-node serialization: hold a node-local advisory xact lock for this
@@ -3621,13 +3633,14 @@ BEGIN
     --       are per-node monotonic + timestamped, so a smaller ticket
     --       means nextval was called earlier on this node.
     --   (b) Peer-ack: every ALIVE peer must have acked my ticket.
-    --       "Alive" = walsender row in pg_stat_replication is
-    --       state='streaming' with reply_time within
-    --       coldfront.peer_alive_window_ms (default 5 s). reply_time is
-    --       the peer's apply-worker feedback: sent after it applies, every
-    --       spock.feedback_frequency messages, and in answer to the
-    --       walsender's keepalive, every wal_sender_timeout/2 (30 s by
-    --       default) on an idle link. A peer whose last reply is older
+    --       "Alive" = a walsender row in pg_stat_replication for the peer
+    --       with reply_time within coldfront.peer_alive_window_ms, whatever
+    --       its state: a peer that has just reconnected is catching up and
+    --       still alive. reply_time is the peer's apply-worker feedback:
+    --       sent after it applies, every spock.feedback_frequency messages,
+    --       and in answer to the walsender's keepalive, every
+    --       wal_sender_timeout/2 on an idle link, which the check above
+    --       keeps inside the window. A peer whose last reply is older
     --       than the window is implicitly treated as already-acked: this
     --       is R-A's dead-peer escape, the only way out of waiting
     --       indefinitely. There is no separate timeout: a peer that
@@ -3661,8 +3674,7 @@ BEGIN
                  -- IMMUTABLE so PG caches the call. No LIKE, no regex, no
                  -- node-name ambiguity (db1 vs db10).
                  SELECT 1 FROM pg_stat_replication r
-                  WHERE r.state = 'streaming'
-                    AND r.reply_time > now() - peer_alive_window
+                  WHERE r.reply_time > now() - peer_alive_window
                     AND r.application_name = spock.spock_gen_slot_name(
                           current_database()::name,
                           my_node_name,

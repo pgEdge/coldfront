@@ -253,7 +253,7 @@ static char *coldfront_local_pg_dsn       = NULL;
 static char *coldfront_loopback_dsn       = NULL;
 /* The bakery's dead-peer window, the async-ordering switch and its build
  * marker, and two per-session values the SQL keeps with set_config. */
-static int   coldfront_peer_alive_window_ms   = 5000;
+static int   coldfront_peer_alive_window_ms   = 10000;
 static bool  coldfront_iceberg_async_parquet  = false;
 static bool  coldfront_iceberg_bakery_patch   = false;
 static char *coldfront_claimed                = NULL;
@@ -5436,7 +5436,7 @@ register_gucs(void)
         "Milliseconds without a walsender reply after which the bakery treats a peer as dead.",
         NULL,
         &coldfront_peer_alive_window_ms,
-        5000,
+        10000,
         1,
         PG_INT32_MAX,
         PGC_SUSET,

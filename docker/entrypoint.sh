@@ -102,6 +102,10 @@ max_replication_slots = 64
 max_wal_senders = 64
 track_commit_timestamp = on
 synchronous_commit = local
+# The bakery rules a peer dead when its walsender's last reply is older than
+# coldfront.peer_alive_window_ms, and an idle peer replies only to the keepalive
+# the walsender sends every wal_sender_timeout/2.
+wal_sender_timeout = 15s
 spock.conflict_resolution = last_update_wins
 spock.enable_ddl_replication = on
 spock.allow_ddl_from_functions = on

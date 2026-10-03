@@ -2981,6 +2981,88 @@ story_mesh_multiwriter() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# Story (mesh): the dead-peer test. A peer counts as alive while its walsender
+# on this node has a reply younger than coldfront.peer_alive_window_ms. That
+# reply is the peer's apply-worker feedback, which on an idle link comes only in
+# answer to the walsender's keepalive every wal_sender_timeout/2, so the claim
+# refuses to run unless wal_sender_timeout is positive and below twice the
+# window (TC-221), an idle mesh keeps every peer inside the window (TC-222), and
+# a peer that stops replying is ruled dead within the window and rejoins cleanly
+# once it answers again (TC-223).
+# ───────────────────────────────────────────────────────────────────────────
+story_mesh_dead_peer() {
+    step "12f. Mesh: the dead-peer test (timeout pairing, idle replies, a silent peer)"
+    local PARR; read -ra PARR <<< "$PEERS"
+    [ "${#PARR[@]}" -ge 1 ] || { fail "mesh: no --peers given"; return; }
+    local p1="${PARR[0]}" npeers="${#PARR[@]}" tbl out i sample
+    [ "$MODE" = tiered ] && tbl=events || tbl=iceonly
+    cold_stmt() {  # cold_stmt <tag> <k>: one cold-routed INSERT
+        if [ "$MODE" = tiered ]; then
+            echo "INSERT INTO events (ts,status,data) VALUES (date_trunc('month',now()) - interval '4 months' + interval '$2 hours','$1','{}');"
+        else
+            echo "INSERT INTO iceonly VALUES ($((9000 + $2)),date_trunc('month',now()) + interval '3 months' + interval '$2 minutes','$1','{}');"
+        fi
+    }
+    local alive_sql="SELECT count(*) FILTER (WHERE reply_time > now() - make_interval(secs => current_setting('coldfront.peer_alive_window_ms')::int / 1000.0)) || '/' || count(*) FROM pg_stat_replication;"
+    local window; window=$(q "$HOST" "SHOW coldfront.peer_alive_window_ms;")
+    assert_eq "TC-221: the image pairs wal_sender_timeout with the window" "15s" "$(q "$HOST" "SHOW wal_sender_timeout;")"
+
+    # TC-221: a timeout of 60 s or 0 is refused by the claim, naming both settings.
+    # ALTER SYSTEM cannot share a transaction block with the reload, so two calls,
+    # and the new value is confirmed before the write (the reload is a signal).
+    set_wst() {  # set_wst <ALTER SYSTEM clause> <expected SHOW value>
+        q "$HOST" "ALTER SYSTEM $1;" >/dev/null; q "$HOST" "SELECT pg_reload_conf();" >/dev/null
+        local j; for j in $(seq 1 20); do [ "$(q "$HOST" "SHOW wal_sender_timeout;")" = "$2" ] && return 0; sleep 0.5; done
+        return 1
+    }
+    if set_wst "SET wal_sender_timeout = '60s'" 1min; then pass "TC-221: wal_sender_timeout set to 60 s for the test (SHOW prints 1min)"; else fail "TC-221: could not set wal_sender_timeout to 60 s"; fi
+    out=$(q_may "$HOST" "$(cold_stmt dp221 1)")
+    assert_contains "TC-221: a 60 s wal_sender_timeout is refused" "wal_sender_timeout is 60000 ms" "$out"
+    assert_contains "TC-221: the refusal names the window" "coldfront.peer_alive_window_ms is $window ms" "$out"
+    if set_wst "SET wal_sender_timeout = 0" 0; then pass "TC-221: wal_sender_timeout set to 0 for the test"; else fail "TC-221: could not set wal_sender_timeout to 0"; fi
+    out=$(q_may "$HOST" "$(cold_stmt dp221 2)")
+    assert_contains "TC-221: a disabled wal_sender_timeout is refused" "wal_sender_timeout is 0 ms" "$out"
+    if set_wst "RESET wal_sender_timeout" 15s; then pass "TC-221: the timeout is back to the image's value"; else fail "TC-221: the timeout did not return to 15s"; fi
+    assert_eq "TC-221: no row landed from the refused writes" "0" "$(q "$HOST" "SELECT count(*) FROM $tbl WHERE status='dp221';")"
+
+    # TC-222: on an idle link every peer's last reply stays inside the window.
+    local bad=0
+    for i in $(seq 1 20); do
+        sample=$(q "$HOST" "$alive_sql")
+        [ "$sample" = "$npeers/$npeers" ] || { bad=$((bad + 1)); echo "    sample $i: alive/total = $sample"; }
+        sleep 1
+    done
+    assert_eq "TC-222: every peer replied inside the window in all 20 samples of an idle link" "0" "$bad"
+
+    # TC-223: a paused peer stops replying; a cold write here is held only until
+    # the window rules it dead, and the peer rejoins once it runs again.
+    docker pause "$p1" >/dev/null
+    local t0 ms rc; t0=$(date +%s%N)
+    out=$(timeout 60 docker exec -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" "$HOST" "$CF_PSQL" -tA -c "$(cold_stmt dp223 1)" 2>&1); rc=$?
+    ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+    docker unpause "$p1" >/dev/null
+    assert_eq "TC-223: a cold write completes while a peer is silent (${ms} ms)" "0" "$rc"
+    if [ "$ms" -lt $(( window + 15000 )) ]; then
+        pass "TC-223: the write was held at most the window plus a margin (${ms} ms)"
+    else
+        fail "TC-223: the write took ${ms} ms with the window at ${window} ms"
+    fi
+    for i in $(seq 1 60); do
+        sample=$(q "$HOST" "$alive_sql"); [ "$sample" = "$npeers/$npeers" ] && break; sleep 1
+    done
+    assert_eq "TC-223: the resumed peer replies again (after ${i} s)" "$npeers/$npeers" "$sample"
+    out=$(q_may "$p1" "$(cold_stmt dp223 2)")
+    assert_eq "TC-223: the resumed peer writes cold again" "" "$(echo "$out" | grep -i error)"
+    assert_eq "TC-223: both rows readable on $HOST" "2" "$(q "$HOST" "SELECT count(*) FROM $tbl WHERE status='dp223';")"
+    assert_eq "TC-223: both rows readable on the resumed peer" "2" "$(q "$p1" "SELECT count(*) FROM $tbl WHERE status='dp223';")"
+    for i in $(seq 1 20); do
+        sample=$(q "$HOST" "SELECT count(*) FROM coldfront.claims;")$(q "$p1" "SELECT count(*) FROM coldfront.claims;")
+        [ "$sample" = "00" ] && break; sleep 1
+    done
+    assert_eq "TC-223: no claim is left on either node" "00" "$sample"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Story (mesh) — the orphan reaper. A claim row whose owner is gone must not
 # block anyone. Orphans are made synthetically: a claim row inserted with this
 # node's ticket by a session that never enters the bakery, so no table lock and
@@ -6842,6 +6924,7 @@ story_drop_iceberg_table   # both modes, purge and keep-files (own throwaway tab
 [ "$MESH" = 1 ] && story_mesh_multiwriter   # >1 cold writer/node cross-node (tiered: events, decoupled: iceonly)
 [ "$MESH" = 1 ] && story_mesh_reaper        # orphan claims/acks reaped on the claim, apply and poke paths
 [ "$MESH" = 1 ] && story_mesh_claim_failures  # a failed claim step leaves no lock, claim or open loopback
+[ "$MESH" = 1 ] && story_mesh_dead_peer  # TC-221..223: timeout pairing refusal, idle replies inside the window, a silent peer ruled dead and rejoining
 [ -n "$STANDBY" ]    && story_standby_reads
 
 summary

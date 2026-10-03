@@ -397,12 +397,15 @@ correctness:
   commits at PRE_COMMIT, before coldfront's release at COMMIT).
 - The reply cadence behind the wait loop's dead-peer check. `NodeLive` is
   exact in the model; the code rules a peer dead when its walsender's
-  `reply_time` is older than `coldfront.peer_alive_window_ms` (default 5 s),
-  and that reply is the apply worker's feedback: after applying, every
+  `reply_time` is older than `coldfront.peer_alive_window_ms`, and that reply
+  is the apply worker's feedback: after applying, every
   `spock.feedback_frequency` messages, and in answer to the walsender's
-  keepalive, every `wal_sender_timeout/2` (30 s by default) on an idle link.
-  So on an idle link a live peer's last reply can be older than the window,
-  which the model does not represent.
+  keepalive, every `wal_sender_timeout/2` on an idle link. The claim refuses
+  to run unless `wal_sender_timeout` is positive and below twice the window,
+  which keeps an idle live peer alive in the code's test as it is in the
+  model's; a peer silent for longer than the window for any other reason (a
+  lock wait inside its apply worker, a partition) is ruled dead, the residual
+  the model states as the failure-detector clause.
 - DuckDB's pglocal connection-keepalive behavior. The bakery does not use
   pglocal; the archiver's Phase 3 does, but Phase 3 is a separate code path
   with its own CI test (the race-window regression in `ci/journey.sh` story 9).

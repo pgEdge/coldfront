@@ -19,7 +19,7 @@ SELECT name, vartype, context, boot_val, min_val
  coldfront.lakekeeper_endpoint     | string  | superuser |          | 
  coldfront.local_pg_dsn            | string  | superuser |          | 
  coldfront.loopback_dsn            | string  | superuser |          | 
- coldfront.peer_alive_window_ms    | integer | superuser | 5000     | 1
+ coldfront.peer_alive_window_ms    | integer | superuser | 10000    | 1
  coldfront.vector_nprobe           | integer | user      | 0        | 0
  coldfront.vector_probe            | bool    | user      | on       | 
  coldfront.warehouse               | string  | superuser |          | 
@@ -36,7 +36,7 @@ ERROR:  0 is outside the valid range for parameter "coldfront.peer_alive_window_
 SHOW coldfront.peer_alive_window_ms;
  coldfront.peer_alive_window_ms 
 --------------------------------
- 5000
+ 10000
 (1 row)
 
 -- A name under the reserved prefix that is not a setting is refused.

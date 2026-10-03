@@ -110,6 +110,14 @@ this project adheres to
   passed to any other run is checked against the server, value by value, and
   refused if it disagrees. The compactor takes no YAML.
 
+- The bakery's dead-peer window `coldfront.peer_alive_window_ms` defaults to
+  10 s and is paired with `wal_sender_timeout`: the walsender asks a peer for
+  a reply every half of that timeout, so a claim refuses to run unless the
+  timeout is positive and below twice the window, naming both. The image sets
+  `wal_sender_timeout = 15s`. A peer counts as alive while its walsender has
+  a reply inside the window, whatever the walsender's state, so a peer that
+  has just reconnected is waited for rather than ruled dead.
+
 ### Fixed
 
 - A deployment YAML could name a warehouse other than the server's: the
