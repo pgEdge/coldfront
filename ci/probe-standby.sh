@@ -38,7 +38,6 @@ COMPOSE="docker compose -f docker-compose.matrix.yml"
 DB=coldfront-db-1
 SB="$CF_STANDBY"
 ARCHIVER="./bin/archiver"
-WAREHOUSE=wh
 
 # The generated config carries the cold-store credential, so it lives in a
 # directory nobody else can reach: an unpredictable name, mode 0700, owner-only

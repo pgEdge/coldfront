@@ -74,7 +74,7 @@ done
 ip() { docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$1"; }
 DB1_IP=$(ip "$PRIMARY"); LK_IP=$(ip coldfront-lakekeeper-1)
 # SeaweedFS only exists in the s3 backend; azure's cold store is real ADLS.
-if [ "$BACKEND" = azure ]; then SW_IP=""; WAREHOUSE=wh-azure; elif [ "$BACKEND" = gcs ] || [ "$BACKEND" = aws ]; then SW_IP=""; WAREHOUSE=wh; else SW_IP=$(ip coldfront-seaweedfs-1); WAREHOUSE=wh; fi
+if [ "$BACKEND" = azure ] || [ "$BACKEND" = gcs ] || [ "$BACKEND" = aws ]; then SW_IP=""; else SW_IP=$(ip coldfront-seaweedfs-1); fi
 
 step "mesh: extensions on all nodes"
 # One CREATE EXTENSION per call with ON_ERROR_STOP, errors surfaced — never chain
@@ -189,4 +189,4 @@ topo_standby "$PRIMARY"
 
 step "mesh: run journey (backend=$BACKEND mode=$MODE standby=$STANDBY) against db1 + mesh stories"
 "$SCRIPT_DIR/../journey.sh" --host "$PRIMARY" --db-ip "$DB1_IP" --sw-ip "$SW_IP" --lk-ip "$LK_IP" \
-    --mode "$MODE" --backend "$BACKEND" --warehouse "$WAREHOUSE" --mesh --peers "$PEERS" "${STANDBY_ARG[@]}"
+    --mode "$MODE" --backend "$BACKEND" --mesh --peers "$PEERS" "${STANDBY_ARG[@]}"
