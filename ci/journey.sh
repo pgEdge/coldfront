@@ -3492,6 +3492,18 @@ story_standby_reads() {
         assert_eq "mesh: standby of db1 sees peer-originated hot row (origin $peer, via Spock→physical)" "1" "$seen"
         q "$HOST" "DELETE FROM $vn WHERE status='sb_xnode';" >/dev/null 2>&1
     fi
+
+    # TC-219: the compactor refuses a standby. On a single node the bakery is the
+    # node-local advisory lock, which PostgreSQL grants during recovery, and the
+    # compactor writes the Iceberg table itself, so only this refusal
+    # (_reject_on_standby in _claim_iceberg_external) stops a compactor pointed
+    # at the replica from rewriting the cold tier under the primary's writers. It
+    # runs inside the standby container, where the server's addresses resolve,
+    # as compactor() does on the primary.
+    docker cp "$COMPACTOR" "$STANDBY":/usr/local/bin/compactor >/dev/null 2>&1
+    local cout; cout=$(docker exec -e PGHOST=localhost -e PGUSER=coldfront -e PGPASSWORD=coldfront -e PGDATABASE=coldfront \
+        "$STANDBY" /usr/local/bin/compactor --table events 2>&1 || true)
+    assert_contains "TC-219 the compactor refuses to compact against a standby" "cannot compact (Iceberg write) on a read-only standby" "$cout"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
