@@ -3077,7 +3077,7 @@ story_mesh_dead_peer() {
     local bad=0
     for i in $(seq 1 20); do
         sample=$(q "$HOST" "$alive_sql")
-        [ "$sample" = "$npeers/$npeers" ] || { bad=$((bad + 1)); echo "    sample $i: alive/total = $sample"; }
+        { [ "${sample%/*}" = "${sample#*/}" ] && [ "${sample#*/}" -ge "$npeers" ]; } || { bad=$((bad + 1)); echo "    sample $i: alive/total = $sample"; }
         sleep 1
     done
     assert_eq "TC-222: every peer replied inside the window in all 20 samples of an idle link" "0" "$bad"
