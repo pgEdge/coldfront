@@ -6,11 +6,11 @@ import (
 	"io"
 	stdfs "io/fs"
 	"net/url"
-	"reflect"
 	"strings"
 	"time"
 
 	iceio "github.com/apache/iceberg-go/io"
+	"github.com/apache/iceberg-go/io/gocloud/blobfs"
 	"github.com/apache/iceberg-go/table"
 	"gocloud.dev/blob"
 )
@@ -24,24 +24,26 @@ import (
 // literal "readdir …: not implemented". A flat list never opens a path as a
 // directory, so the collision cannot occur. Everything else delegates to the
 // wrapped FileIO, and orphan reachability + deletion stay iceberg-go's.
+// Verified against iceberg-go v0.7.0 and gocloud.dev v0.46.0;
+// TestBlobWalkDir_ObjectAtDirectoryPathFails fails once the collision is gone.
 type flatWalkIO struct {
 	iceio.IO
 }
 
 func (f flatWalkIO) WalkDir(root string, fn stdfs.WalkDirFunc) error {
-	bucket, err := bucketOf(f.IO)
-	if err != nil {
+	bfs, ok := f.IO.(*blobfs.FileIO)
+	if !ok {
 		// Non-blob backend (e.g. local FS): defer to the wrapped walk.
 		if lw, ok := f.IO.(iceio.ListableIO); ok {
 			return lw.WalkDir(root, fn)
 		}
-		return err
+		return fmt.Errorf("FileIO %T cannot list files", f.IO)
 	}
 	u, err := url.Parse(root)
 	if err != nil {
 		return fmt.Errorf("invalid URL %s: %w", root, err)
 	}
-	iter := bucket.List(&blob.ListOptions{Prefix: listPrefix(u.Path)}) // empty Delimiter => flat
+	iter := bfs.List(&blob.ListOptions{Prefix: listPrefix(u.Path)}) // empty Delimiter => flat
 	for {
 		obj, err := iter.Next(context.Background())
 		if err == io.EOF {
@@ -75,28 +77,6 @@ func listPrefix(urlPath string) string {
 		prefix += "/"
 	}
 	return prefix
-}
-
-// bucketOf extracts the *blob.Bucket from a gocloud-backed iceberg FileIO by
-// reflection — the same access iceberg-go itself uses internally
-// (table/orphan_cleanup.go getBucketName). Errors for a non-blob FileIO.
-func bucketOf(fio iceio.IO) (*blob.Bucket, error) {
-	v := reflect.ValueOf(fio)
-	if v.Kind() == reflect.Pointer {
-		v = v.Elem()
-	}
-	if v.Kind() != reflect.Struct {
-		return nil, fmt.Errorf("FileIO %T is not a struct", fio)
-	}
-	field := v.FieldByName("Bucket")
-	if !field.IsValid() {
-		return nil, fmt.Errorf("FileIO %T has no Bucket field", fio)
-	}
-	b, ok := field.Interface().(*blob.Bucket)
-	if !ok {
-		return nil, fmt.Errorf("FileIO %T Bucket field is not *blob.Bucket", fio)
-	}
-	return b, nil
 }
 
 // flatDirEntry / flatFileInfo adapt a gocloud ListObject to fs.DirEntry so

@@ -1,0 +1,161 @@
+# iceberg-schema-id-allocation-v15.patch
+#
+# Applies to: duckdb-iceberg @ 5edc45f0 (branch v1.5-variegata), DuckDB v1.5.x.
+#
+# A port of upstream duckdb-iceberg c1cfe2ef ("fix: Allocate new schema ids from
+# the highest existing id instead of the current one", PR #1438, issue #1436),
+# which is on main only: v1.5-variegata does not have it (checked up to
+# 5dcf5070), nor does the duckdb-iceberg that DuckDB v1.5.5 ships (45163a28).
+#
+# Problem: every ALTER path copies the current schema and numbers the copy one
+# above the current schema's id, and AddSchemaOrGetExisting reuses an existing
+# schema equal to the new one, compared by field ids, names and types but not
+# by schema id. A change that returns the table to an earlier schema, such as a
+# DROP COLUMN of the column the last ADD COLUMN added, makes that earlier schema
+# current again, and the next change computes an id a later schema already has:
+# "Attempted to add schema with id N, but this already exists in the table!".
+# An ADD COLUMN always takes a new field id, so it never equals an existing
+# schema, and the table can take no new column; the Iceberg mirror runs inside
+# the user's statement, so the hot-side change rolls back with it.
+#
+# Fix: IntroduceNewSchema numbers the new schema GetMaxSchemaId() + 1 (the
+# table's loaded schema versions hold every schema in the metadata), the
+# per-path increments are gone, RemoveColumn keeps the id for IntroduceNewSchema
+# to set, and the two paths that registered the schema inline (RENAME COLUMN,
+# SET DEFAULT) call IntroduceNewSchema. Upstream's SET_COLUMN_COMMENT path does
+# not exist at this ref.
+#
+# ci/journey.sh's second add-and-drop cycle (TC-228) fails without this patch.
+# Drop the patch when ICEBERG_REF moves to a ref that has the fix: git apply
+# --check then fails on the removed lines.
+#
+diff --git a/src/catalog/rest/catalog_entry/schema/iceberg_schema_entry.cpp b/src/catalog/rest/catalog_entry/schema/iceberg_schema_entry.cpp
+index b40f1b613..aa7a83560 100644
+--- a/src/catalog/rest/catalog_entry/schema/iceberg_schema_entry.cpp
++++ b/src/catalog/rest/catalog_entry/schema/iceberg_schema_entry.cpp
+@@ -262,8 +262,8 @@ static void VerifySchemaEvolution(const IcebergTableMetadata &table_metadata, co
+ 
+ void IntroduceNewSchema(IcebergTableInformation &updated_table, IcebergTransactionData &transaction_data,
+                         shared_ptr<IcebergTableSchema> new_schema) {
+-	auto new_schema_id = new_schema->schema_id;
+-
++	auto new_schema_id = static_cast<int32_t>(updated_table.GetMaxSchemaId() + 1);
++	new_schema->schema_id = new_schema_id;
+ 	auto &result_schema = updated_table.table_metadata.AddSchemaOrGetExisting(std::move(new_schema));
+ 	if (result_schema.schema_id == new_schema_id) {
+ 		// Update the Table Metadata to have our new schema
+@@ -351,7 +351,6 @@ void IcebergSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info)
+ 		last_column_id = field_id - 1;
+ 
+ 		auto new_schema = current_schema.Copy();
+-		new_schema->schema_id++;
+ 		new_schema->columns.push_back(std::move(new_iceberg_column));
+ 
+ 		IntroduceNewSchema(updated_table, transaction_data, new_schema);
+@@ -400,7 +399,6 @@ void IcebergSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info)
+ 		auto &change_type_info = alter_table_info.Cast<ChangeColumnTypeInfo>();
+ 
+ 		auto new_schema = current_schema.Copy();
+-		new_schema->schema_id++;
+ 
+ 		auto &column = ResolveColumn<ChangeColumnTypeInfo>(change_type_info, new_schema);
+ 
+@@ -421,7 +419,6 @@ void IcebergSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info)
+ 		auto &drop_not_null_info = alter_table_info.Cast<DropNotNullInfo>();
+ 
+ 		auto new_schema = current_schema.Copy();
+-		new_schema->schema_id++;
+ 
+ 		auto &column = ResolveColumn<DropNotNullInfo>(drop_not_null_info, new_schema);
+ 
+@@ -457,7 +454,6 @@ void IcebergSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info)
+ 		auto &new_name = rename_info.new_name;
+ 
+ 		auto new_schema = current_schema.Copy();
+-		new_schema->schema_id++;
+ 
+ 		auto column_p = new_schema->GetMutableFromPath({column_name}, nullptr);
+ 		if (!column_p) {
+@@ -472,17 +468,7 @@ void IcebergSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info)
+ 		auto &column = *column_p;
+ 		column.name = new_name;
+ 
+-		auto new_schema_id = new_schema->schema_id;
+-
+-		auto &result_schema = updated_table.table_metadata.AddSchemaOrGetExisting(std::move(new_schema));
+-		if (result_schema.schema_id == new_schema_id) {
+-			// Update the Table Metadata to have our new schema
+-			updated_table.CreateSchemaVersion(result_schema);
+-			transaction_data.TableAddSchema(new_schema_id);
+-		} else {
+-			transaction_data.TableSetCurrentSchema();
+-		}
+-		updated_table.table_metadata.SetCurrentSchemaId(result_schema.schema_id);
++		IntroduceNewSchema(updated_table, transaction_data, new_schema);
+ 		return;
+ 	}
+ 	case AlterTableType::SET_TABLE_OPTIONS: {
+@@ -557,7 +543,6 @@ void IcebergSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info)
+ 		auto &expression = set_default_info.expression;
+ 
+ 		auto new_schema = current_schema.Copy();
+-		new_schema->schema_id++;
+ 
+ 		auto column_p = new_schema->GetMutableFromPath({column_name}, nullptr);
+ 		if (!column_p) {
+@@ -576,17 +561,7 @@ void IcebergSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info)
+ 			column.write_default = make_uniq<Value>(default_constant_value);
+ 		}
+ 
+-		auto new_schema_id = new_schema->schema_id;
+-
+-		auto &result_schema = updated_table.table_metadata.AddSchemaOrGetExisting(std::move(new_schema));
+-		if (result_schema.schema_id == new_schema_id) {
+-			// Update the Table Metadata to have our new schema
+-			updated_table.CreateSchemaVersion(result_schema);
+-			transaction_data.TableAddSchema(new_schema_id);
+-		} else {
+-			transaction_data.TableSetCurrentSchema();
+-		}
+-		updated_table.table_metadata.SetCurrentSchemaId(result_schema.schema_id);
++		IntroduceNewSchema(updated_table, transaction_data, new_schema);
+ 		return;
+ 	}
+ 	case AlterTableType::ADD_FIELD: {
+@@ -596,7 +571,6 @@ void IcebergSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info)
+ 		auto &if_field_not_exists = add_field_info.if_field_not_exists;
+ 
+ 		auto new_schema = current_schema.Copy();
+-		new_schema->schema_id++;
+ 
+ 		auto parent_path = column_path;
+ 		column_path.push_back(new_field.GetName());
+@@ -650,7 +624,6 @@ void IcebergSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info)
+ 		auto &new_name = rename_field_info.new_name;
+ 
+ 		auto new_schema = current_schema.Copy();
+-		new_schema->schema_id++;
+ 
+ 		auto column_p = new_schema->GetMutableFromPath(column_path, nullptr);
+ 		if (!column_p) {
+@@ -679,7 +652,6 @@ void IcebergSchemaEntry::Alter(CatalogTransaction transaction, AlterInfo &info)
+ 		auto &if_column_exists = remove_field_info.if_column_exists;
+ 
+ 		auto new_schema = current_schema.Copy();
+-		new_schema->schema_id++;
+ 
+ 		D_ASSERT(column_path.size() > 1);
+ 		auto parent_path = column_path;
+diff --git a/src/core/metadata/schema/iceberg_table_schema.cpp b/src/core/metadata/schema/iceberg_table_schema.cpp
+index b85b26947..61d4ea53f 100644
+--- a/src/core/metadata/schema/iceberg_table_schema.cpp
++++ b/src/core/metadata/schema/iceberg_table_schema.cpp
+@@ -260,7 +260,7 @@ shared_ptr<IcebergTableSchema> IcebergTableSchema::Copy() const {
+ 
+ shared_ptr<IcebergTableSchema> IcebergTableSchema::RemoveColumn(const string &name, optional_idx &column_id) const {
+ 	auto res = make_shared_ptr<IcebergTableSchema>();
+-	res->schema_id = schema_id + 1;
++	res->schema_id = schema_id;
+ 	res->last_column_id = last_column_id;
+ 	for (auto &column : columns) {
+ 		if (column->name == name) {

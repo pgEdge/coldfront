@@ -2091,6 +2091,15 @@ story_ddl() {
     assert_peers_agree "TC-198: DROP COLUMN reached the hot table and view" "$cols"
     [ "$MESH" = 1 ] && assert_eq "TC-198: no peer logged an apply exception for the column DDL" "$exc" "$(peer_exceptions)"
 
+    # A second add-and-drop cycle. The DROP returned the Iceberg table to its
+    # first schema, and the next ADD COLUMN must take a schema id no earlier
+    # schema holds.
+    assert_eq "TC-228: a second ADD COLUMN after the DROP is mirrored" "ALTER TABLE" "$(q_may "$HOST" "ALTER TABLE _events ADD COLUMN cnt integer;" | tail -1)"
+    assert_eq "TC-228: the view exposes the re-added column" "cnt" "$(q "$HOST" "SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='events' AND column_name='cnt';")"
+    assert_gt "TC-228: cold tier readable after the second ADD COLUMN" "0" "$(q "$HOST" "SELECT count(*) FROM events WHERE ts < $cutoff;")"
+    assert_eq "TC-228: the re-added column is dropped again" "ALTER TABLE" "$(q_may "$HOST" "ALTER TABLE _events DROP COLUMN cnt;" | tail -1)"
+    assert_eq "TC-228: the re-added column is gone from the view" "0" "$(q "$HOST" "SELECT count(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='events' AND column_name='cnt';")"
+
     # Data-type correspondence is enforced: an unsupported type is rejected up front.
     assert_err "ADD COLUMN inet rejected (no Iceberg mapping)" "no Iceberg-compatible mapping" "$(q_may "$HOST" "ALTER TABLE _events ADD COLUMN ip inet;")"
 
@@ -6797,12 +6806,10 @@ story_partitioned_cold_tables() {
     # TC-190: compaction of a partitioned table with deletes. Month A holds six
     # small files and month B two, each month with deleted rows. The compactor
     # rewrites A alone (B is under MinInputFiles) and must leave B's delete file
-    # where it is. iceberg-go attaches a delete file to a data file by the file's
-    # file_path bounds, and the engine writes those under DuckDB's own field id,
-    # so without the compactor scoping deletes to their partition (compact.go,
-    # scopeDeletes) B's delete file would ride along with A's rewrite and its
-    # deleted row would come back. The last assertion is the engine fact itself:
-    # when it stops holding, the scoping can go.
+    # where it is. The engine writes a delete file's file_path bounds under
+    # DuckDB's own field id, which iceberg-go does not read, so what keeps B's
+    # delete file out of A's rewrite is iceberg-go scoping each delete file to
+    # its own partition. Without that, B's deleted row would come back.
     require_compactor || return
     q "$HOST" "SELECT coldfront.create_iceberg_table('public','tccomp','$cols'::jsonb, '{month(ts)}');" >/dev/null 2>&1
     local i
@@ -6819,13 +6826,6 @@ story_partitioned_cold_tables() {
     assert_eq "TC-190: deleted rows stay deleted after compaction" "5" "$(q "$HOST" "SELECT count(*) FROM public.tccomp;")"
     assert_eq "TC-190: the skipped month keeps its delete file" "1" \
         "$(q "$HOST" "SELECT coldfront.ensure_attached(); SELECT r['n'] FROM duckdb.query('SELECT count(*) AS n FROM iceberg_metadata(''ice.public.tccomp'') WHERE status <> ''DELETED'' AND content = ''POSITION_DELETES''') AS t(r);" | tail -1)"
-    if vended_creds; then
-        note "TC-190: delete-manifest bound key not read under vended credentials (a path read cannot authenticate)"
-    else
-        local mf; mf=$(q "$HOST" "SELECT coldfront.ensure_attached(); SELECT r['p'] FROM duckdb.query('SELECT DISTINCT manifest_path AS p FROM iceberg_metadata(''ice.public.tccomp'') WHERE status <> ''DELETED'' AND content = ''POSITION_DELETES''') AS t(r);" | tail -1)
-        assert_eq "TC-190: the engine keys delete-file bounds by DuckDB's FILENAME_FIELD_ID (scopeDeletes stays)" "2147483646" \
-            "$(q "$HOST" "SELECT coldfront.ensure_attached(); SELECT r['k'] FROM duckdb.query('SELECT string_agg(DISTINCT k::VARCHAR, '','') AS k FROM (SELECT unnest(map_keys(data_file.lower_bounds)) AS k FROM read_avro(''$mf''))') AS t(r);" | tail -1)"
-    fi
 
     q "$HOST" "SELECT coldfront.drop_iceberg_table('public','tcpart', true);" >/dev/null 2>&1
     q "$HOST" "SELECT coldfront.drop_iceberg_table('public','tcflat', true);" >/dev/null 2>&1

@@ -2,10 +2,12 @@ package main
 
 import (
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/apache/iceberg-go"
-	"github.com/apache/iceberg-go/table"
+	"github.com/apache/iceberg-go/catalog"
 )
 
 func testSchema() *iceberg.Schema {
@@ -87,44 +89,46 @@ func dataFile(t *testing.T, spec iceberg.PartitionSpec, path string, partition m
 	return b.Build()
 }
 
-// keptPaths runs scopeDeletes over one data file and returns the paths of the
-// delete files it kept.
-func keptPaths(data iceberg.DataFile, deletes ...iceberg.DataFile) []string {
-	tasks := scopeDeletes([]table.FileScanTask{{File: data, DeleteFiles: deletes}})
-	got := make([]string, 0, len(deletes))
-	for _, df := range tasks[0].DeleteFiles {
-		got = append(got, df.FilePath())
+// The engine writes a position-delete file's file_path bounds under DuckDB's own
+// field id, which iceberg-go does not read, so to the planner those files have
+// no bounds. PlanFiles must then attach each one to the data files of its own
+// partition alone, the scope the Iceberg spec gives a position delete. A delete
+// file attached across partitions sits in two rewrite groups, which the rewrite
+// commit refuses, and rewriting one partition would remove the other's delete
+// file and bring its deleted rows back.
+func TestPlanFiles_ScopesPositionDeletesToPartition(t *testing.T) {
+	byList := iceberg.NewPartitionSpec(iceberg.PartitionField{SourceIDs: []int{2}, FieldID: 1000,
+		Name: "list", Transform: iceberg.IdentityTransform{}})
+	ctx, tbl, _ := localTable(t, nil, catalog.WithPartitionSpec(&byList))
+	spec := tbl.Spec()
+	key := spec.Field(0).FieldID
+
+	txn := tbl.NewTransaction()
+	rd := txn.NewRowDelta(nil)
+	for _, list := range []int32{1, 2} {
+		dir := fmt.Sprintf("%s/data/list=%d/", tbl.Location(), list)
+		rd.AddRows(dataFile(t, spec, dir+"data.parquet", map[int]any{key: list}))
+		rd.AddDeletes(deleteFile(t, spec, dir+"deletes.parquet", map[int]any{key: list}))
 	}
-	return got
-}
-
-// A data file keeps only the position-delete files of its own partition, spec
-// id and values both, as the Iceberg spec scopes them. Every other delete file is
-// one iceberg-go attached by sequence number alone.
-func TestScopeDeletes(t *testing.T) {
-	month := iceberg.PartitionField{SourceIDs: []int{2}, FieldID: 1000, Name: "month_ts_2",
-		Transform: iceberg.MonthTransform{}}
-	spec, later := iceberg.NewPartitionSpecID(1, month), iceberg.NewPartitionSpecID(2, month)
-	march, april := map[int]any{1000: int32(674)}, map[int]any{1000: int32(675)}
-	data := dataFile(t, spec, "data/month_ts_2=674/d.parquet", march)
-
-	got := keptPaths(data,
-		deleteFile(t, spec, "data/month_ts_2=675/other-month.parquet", april),
-		deleteFile(t, spec, "data/month_ts_2=674/own.parquet", march),
-		deleteFile(t, spec, "data/no-partition.parquet", map[int]any{}),
-		deleteFile(t, later, "data/month_ts_2=674/other-spec.parquet", march))
-	if len(got) != 1 || got[0] != "data/month_ts_2=674/own.parquet" {
-		t.Fatalf("kept %v, want the own-partition delete file alone", got)
+	if err := rd.Commit(ctx); err != nil {
+		t.Fatalf("stage row delta: %v", err)
 	}
-}
+	committed, err := txn.Commit(ctx)
+	if err != nil {
+		t.Fatalf("commit row delta: %v", err)
+	}
 
-// An unpartitioned table is one partition: its delete files apply to its data
-// files whether the partition map is nil or empty.
-func TestScopeDeletes_Unpartitioned(t *testing.T) {
-	spec := iceberg.NewPartitionSpecID(0)
-	got := keptPaths(dataFile(t, spec, "data/d.parquet", nil),
-		deleteFile(t, spec, "data/deletes.parquet", map[int]any{}))
-	if len(got) != 1 {
-		t.Fatalf("kept %v, want the delete file", got)
+	tasks, err := committed.Scan().PlanFiles(ctx)
+	if err != nil {
+		t.Fatalf("plan files: %v", err)
+	}
+	if len(tasks) != 2 {
+		t.Fatalf("planned %d tasks, want 2", len(tasks))
+	}
+	for _, task := range tasks {
+		want := strings.TrimSuffix(task.File.FilePath(), "data.parquet") + "deletes.parquet"
+		if len(task.DeleteFiles) != 1 || task.DeleteFiles[0].FilePath() != want {
+			t.Errorf("%s has %d delete files, want %s alone", task.File.FilePath(), len(task.DeleteFiles), want)
+		}
 	}
 }

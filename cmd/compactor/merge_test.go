@@ -27,7 +27,7 @@ func mergeSchema() *iceberg.Schema {
 // uses in production rather than against a stub. Filesystem rather than a SQL
 // catalog because the sqlite driver would add nineteen modules, one of them CGO,
 // to a module whose whole point is to quarantine heavy dependencies.
-func localTable(t *testing.T, props iceberg.Properties) (context.Context, *table.Table, catalog.Catalog) {
+func localTable(t *testing.T, props iceberg.Properties, opts ...catalog.CreateTableOpt) (context.Context, *table.Table, catalog.Catalog) {
 	t.Helper()
 	ctx := context.Background()
 	cat, err := hadoop.NewCatalog("test", "file://"+t.TempDir(), nil)
@@ -38,7 +38,7 @@ func localTable(t *testing.T, props iceberg.Properties) (context.Context, *table
 		t.Fatalf("create namespace: %v", err)
 	}
 	tbl, err := cat.CreateTable(ctx, catalog.ToIdentifier("ns", "t"), mergeSchema(),
-		catalog.WithProperties(props))
+		append([]catalog.CreateTableOpt{catalog.WithProperties(props)}, opts...)...)
 	if err != nil {
 		t.Fatalf("create table: %v", err)
 	}

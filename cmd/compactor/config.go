@@ -144,6 +144,14 @@ func (c *Config) s3Props() iceberg.Properties {
 		scheme := "http"
 		if c.S3.UseSSL {
 			scheme = "https"
+			// A TLS S3-compatible store (GCS via its S3-interop endpoint)
+			// rejects a signed Accept-Encoding, which Google's frontend
+			// rewrites before verifying, and the CRC32 upload checksum the SDK
+			// sends in an aws-chunked body. iceberg-go's compat mode keeps
+			// Accept-Encoding and the SDK's own headers out of the signature
+			// and suppresses object-write checksums, including the one the S3
+			// transfer manager adds on each call.
+			p[iceio.S3CompatMode] = "true"
 		}
 		p[iceio.S3EndpointURL] = scheme + "://" + c.S3.Endpoint
 		p[iceio.S3ForceVirtualAddressing] = fmt.Sprintf("%t", c.S3.URLStyle == "vhost")

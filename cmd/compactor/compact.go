@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"iter"
-	"reflect"
 	"strings"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -14,14 +13,8 @@ import (
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
 	"github.com/apache/iceberg-go/catalog/rest"
-	iceio "github.com/apache/iceberg-go/io"
-	"github.com/apache/iceberg-go/io/gocloud"
 	"github.com/apache/iceberg-go/table"
 	"github.com/apache/iceberg-go/table/compaction"
-	"github.com/apache/iceberg-go/utils"
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/smithy-go/middleware"
-	smithyhttp "github.com/aws/smithy-go/transport/http"
 )
 
 // openCatalog connects to the Lakekeeper REST catalog for the deployment's
@@ -35,79 +28,6 @@ func openCatalog(ctx context.Context, cfg *Config) (*rest.Catalog, error) {
 	return rest.NewCatalog(ctx, "lakekeeper", cfg.Iceberg.LakekeeperEndpoint,
 		rest.WithWarehouseLocation(cfg.Iceberg.Warehouse),
 		rest.WithAdditionalProps(props))
-}
-
-// withColdStoreSigning adapts SigV4 signing for an S3-compatible cold store
-// reached over TLS (GCS via its S3-interop endpoint), which requires:
-//   - Accept-Encoding NOT covered by the signature (Google's frontend rewrites
-//     the header before verifying, so a signed value never matches), and
-//   - no CRC32 upload checksum (it rides an aws-chunked streaming body the
-//     endpoint does not accept); WhenRequired computes checksums only for
-//     operations that mandate one.
-//
-// SeaweedFS/MinIO (plain http) and real AWS S3 (no custom endpoint) verify the
-// SDK defaults correctly and are left alone; Azure is not S3. The adapted
-// aws.Config rides the context: iceberg-go's gocloud backend prefers a
-// caller-supplied config (utils.GetAwsConfig) over building its own, and the
-// table's file IO is created lazily with the call-site context, so every
-// downstream read/commit inherits it.
-func withColdStoreSigning(ctx context.Context, cfg *Config) (context.Context, error) {
-	props, err := cfg.storageProps()
-	if err != nil {
-		return nil, err
-	}
-	if !strings.HasPrefix(props[iceio.S3EndpointURL], "https://") {
-		return ctx, nil
-	}
-	awscfg, err := gocloud.ParseAWSConfig(ctx, props)
-	if err != nil {
-		return nil, err
-	}
-	awscfg.APIOptions = append(awscfg.APIOptions, excludeFromSigning("Accept-Encoding"))
-	awscfg.RequestChecksumCalculation = aws.RequestChecksumCalculationWhenRequired
-	return utils.WithAwsConfig(ctx, awscfg), nil
-}
-
-type ignoredHeadersKey struct{}
-
-// excludeFromSigning returns a middleware installer that hides the named
-// headers from the SigV4 signer: removed immediately before the "Signing"
-// finalize step, restored immediately after, so they go on the wire unsigned.
-func excludeFromSigning(headers ...string) func(*middleware.Stack) error {
-	return func(stack *middleware.Stack) error {
-		drop := middleware.FinalizeMiddlewareFunc("ExcludeFromSigning",
-			func(ctx context.Context, in middleware.FinalizeInput, next middleware.FinalizeHandler) (middleware.FinalizeOutput, middleware.Metadata, error) {
-				req, ok := in.Request.(*smithyhttp.Request)
-				if !ok {
-					return next.HandleFinalize(ctx, in)
-				}
-				ignored := make(map[string][]string, len(headers))
-				for _, h := range headers {
-					if v, present := req.Header[h]; present {
-						ignored[h] = v
-						req.Header.Del(h)
-					}
-				}
-				ctx = middleware.WithStackValue(ctx, ignoredHeadersKey{}, ignored)
-				return next.HandleFinalize(ctx, in)
-			})
-		restore := middleware.FinalizeMiddlewareFunc("RestoreExcludedFromSigning",
-			func(ctx context.Context, in middleware.FinalizeInput, next middleware.FinalizeHandler) (middleware.FinalizeOutput, middleware.Metadata, error) {
-				req, ok := in.Request.(*smithyhttp.Request)
-				if !ok {
-					return next.HandleFinalize(ctx, in)
-				}
-				ignored, _ := middleware.GetStackValue(ctx, ignoredHeadersKey{}).(map[string][]string)
-				for h, v := range ignored {
-					req.Header[h] = v
-				}
-				return next.HandleFinalize(ctx, in)
-			})
-		if err := stack.Finalize.Insert(drop, "Signing", middleware.Before); err != nil {
-			return err
-		}
-		return stack.Finalize.Insert(restore, "Signing", middleware.After)
-	}
 }
 
 // planResult bundles the rewrite groups with the planner's summary (for logging
@@ -181,7 +101,6 @@ func planCompaction(ctx context.Context, cat *rest.Catalog, ns, name string, tar
 	if err != nil {
 		return nil, nil, fmt.Errorf("plan files for %s.%s: %w", ns, name, err)
 	}
-	tasks = scopeDeletes(tasks)
 
 	cfg := compaction.DefaultConfig()
 	if targetSize > 0 {
@@ -206,49 +125,6 @@ func planCompaction(ctx context.Context, cat *rest.Catalog, ns, name string, tar
 		}
 	}
 	return tbl, &planResult{groups: groups, plan: plan, sorted: sorted, sortKey: sortKey}, nil
-}
-
-// scopeDeletes keeps, for each data file, only the position-delete files of its
-// own partition, spec id and partition values both, which is the scope the
-// Iceberg spec gives a position delete (only an equality delete with an
-// unpartitioned spec is global). iceberg-go v0.6.0 attaches position deletes by
-// sequence number and the delete file's file_path bounds alone
-// (table/scanner.go, matchDeletesToData), never by partition, and duckdb-iceberg
-// 5edc45f0 writes those bounds under DuckDB's FILENAME_FIELD_ID (2147483646)
-// rather than the spec's file_path field (2147483546), so every delete file is
-// attached to every data file: one delete file then sits in several partition
-// groups, which ReplaceFiles refuses, and rewriting one partition would remove
-// the delete files of a partition the planner skipped, resurrecting its deleted
-// rows. TC-190 in ci/journey.sh asserts the engine's bound key; when it moves to
-// the spec's field, or iceberg-go matches by partition, this keeps what
-// iceberg-go already kept and can go.
-func scopeDeletes(tasks []table.FileScanTask) []table.FileScanTask {
-	out := make([]table.FileScanTask, 0, len(tasks))
-	for _, task := range tasks {
-		kept := make([]iceberg.DataFile, 0, len(task.DeleteFiles))
-		for _, df := range task.DeleteFiles {
-			if df.SpecID() == task.File.SpecID() && samePartition(df.Partition(), task.File.Partition()) {
-				kept = append(kept, df)
-			}
-		}
-		task.DeleteFiles = kept
-		out = append(out, task)
-	}
-	return out
-}
-
-// samePartition compares two partition tuples by field id and value; a nil map
-// and an empty one are the same unpartitioned tuple.
-func samePartition(a, b map[int]any) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	for k, v := range a {
-		if w, ok := b[k]; !ok || !reflect.DeepEqual(v, w) {
-			return false
-		}
-	}
-	return true
 }
 
 // rewrite executes the planned compaction as a single atomic rewrite snapshot
@@ -374,7 +250,7 @@ func readGroupTable(ctx context.Context, tbl *table.Table, group table.Compactio
 	}
 	// One reader: the sort decides the order, so a concurrent read would only
 	// shuffle its input to no effect.
-	schema, records, err := tbl.Scan(table.WitMaxConcurrency(1)).ReadTasks(ctx, group.Tasks)
+	schema, records, err := tbl.Scan(table.WithMaxConcurrency(1)).ReadTasks(ctx, group.Tasks)
 	if err != nil {
 		return nil, fmt.Errorf("read group %q: %w", group.PartitionKey, err)
 	}
