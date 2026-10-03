@@ -33,7 +33,7 @@ run and how aggressively each reclaims:
 |---|---|---|
 | `--target-size-mb N` | 128 | Sets the compaction target file size; files below 75% of it are rewritten. |
 | `--expire-snapshots` | off | Expires old snapshots and, by default, deletes the files they alone pinned. |
-| `--expire-older-than D` | 168h | With `--expire-snapshots`, expires snapshots older than D; lower the value to reclaim sooner. |
+| `--expire-older-than D` | 168h | With `--expire-snapshots`, expires snapshots older than D; lower the value to reclaim sooner, but keep it longer than any transaction that reads the table (see below). |
 | `--expire-retain-last N` | 1 | With `--expire-snapshots`, always keeps at least the N most recent snapshots. |
 | `--expire-keep-files` | off | With `--expire-snapshots`, expires metadata only and leaves the freed files for an `--orphans` pass. |
 | `--orphans` | off | Deletes files under the table location that no retained snapshot references. |
@@ -94,6 +94,13 @@ requested steps, each under a bakery claim on that table:
   only those snapshots referenced. This is what reclaims the small files a
   compaction supersedes - they stay pinned by the pre-compaction snapshot until
   it is expired.
+  A transaction that has read the table keeps the snapshot of its first cold
+  read until it ends, and expiry does not know about it: if the snapshot is
+  expired and its files deleted meanwhile, the transaction's next scan fails
+  with the object store's HTTP 404 (a scan that already fetched the files
+  answers from DuckDB's file cache instead). Keep `--expire-older-than`
+  longer than the longest transaction that reads the table; the 168 h default
+  does, and `0s` is for a table nothing is reading.
 - Orphan removal deletes files under the table location that no retained
   snapshot references, which covers files left by an interrupted write or by
   `--expire-keep-files`. The `--orphan-age` window keeps a concurrent writer's

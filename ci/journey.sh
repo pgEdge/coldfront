@@ -2793,6 +2793,46 @@ EOSQL
 # entry, which includes the transaction's pending data and delete files, and
 # the cross-tier move reads the rows it moves the same way.
 # ───────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────
+# Story: the cold tier's snapshot is fixed for the transaction. pg_duckdb at the
+# pin opens one DuckDB transaction per PostgreSQL transaction block, at its first
+# DuckDB statement, and duckdb-iceberg resolves an attached table as of that
+# transaction's start, so a commit by another session after the transaction's
+# first cold read stays invisible until the transaction ends. usage.md states it
+# under Caveats; this check pins it, so a pin bump that changes it fails here and
+# the docs are revisited.
+# ───────────────────────────────────────────────────────────────────────────
+story_snapshot_pinned() {
+    step "TC-224: a transaction keeps the snapshot of its first cold read"
+    local tbl ins del O first
+    if [ "$MODE" = tiered ]; then
+        local cut; cut=$(q "$HOST" "SELECT cutoff_time FROM coldfront.archive_watermark WHERE table_name = 'events';")
+        tbl=events
+        ins="INSERT INTO events (ts, status, data) VALUES ('$cut'::timestamptz - interval '3 days', 'tc224', '{}');"
+        del="DELETE FROM events WHERE status = 'tc224' AND ts < '$cut';"
+    else
+        tbl=iceonly
+        ins="INSERT INTO iceonly VALUES (224, now(), 'tc224', '{}');"
+        del="DELETE FROM iceonly WHERE status = 'tc224';"
+    fi
+    docker exec -i -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" "$HOST" "$CF_PSQL" -tA -v ON_ERROR_STOP=1 >"$TMPD/tc224.out" 2>&1 <<SQL &
+BEGIN;
+SELECT 'FIRST:' || count(*) FROM $tbl;
+SELECT pg_sleep(8);
+SELECT 'SECOND:' || count(*) FROM $tbl;
+COMMIT;
+SELECT 'AFTER:' || count(*) FROM $tbl;
+SQL
+    local reader=$!
+    sleep 3
+    q "$HOST" "$ins" >/dev/null 2>&1
+    wait "$reader"
+    O=$(cat "$TMPD/tc224.out"); first=$(extract FIRST "$O")
+    assert_eq "TC-224: a second cold read in the transaction sees the first read's snapshot" "$first" "$(extract SECOND "$O")"
+    assert_eq "TC-224: after COMMIT the other session's committed cold row is visible" "$((first + 1))" "$(extract AFTER "$O")"
+    q "$HOST" "$del" >/dev/null 2>&1
+}
+
 story_tiered_ryw() {
     step "TC-210: a tiered read sees the transaction's own cold writes"
     local cut cold O
@@ -3060,6 +3100,45 @@ story_mesh_dead_peer() {
         [ "$sample" = "00" ] && break; sleep 1
     done
     assert_eq "TC-223: no claim is left on either node" "00" "$sample"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story: snapshot expiry against an open reader. A transaction keeps the snapshot
+# of its first cold read (TC-224), and expiry deletes the files only the expired
+# snapshots reference, so an expiry shorter than an open transaction takes that
+# transaction's files away: its next scan fails with the object store's 404 (a
+# scan that already fetched the files answers from DuckDB's file cache instead).
+# compaction.md states the rule; this check pins the outcome at the pinned refs.
+# ───────────────────────────────────────────────────────────────────────────
+story_expiry_vs_reader() {
+    step "TC-225: expiring an open reader's snapshot fails its next scan"
+    require_compactor || return
+    local k O
+    q "$HOST" "SELECT coldfront.create_iceberg_table('public','tc225','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"ts\",\"type\":\"timestamptz\"}]'::jsonb, '{month(ts)}');" >/dev/null 2>&1
+    for k in 1 2 3 4 5 6; do q "$HOST" "INSERT INTO tc225 VALUES ($k, now());" >/dev/null 2>&1; done
+    # The first read is metadata-only, so the files are not yet cached; the
+    # second must fetch them. The reader runs without ON_ERROR_STOP so its
+    # COMMIT and the read after it still run.
+    docker exec -i -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" "$HOST" "$CF_PSQL" -tA >"$TMPD/tc225.out" 2>&1 <<SQL &
+BEGIN;
+SELECT 'FIRST:' || count(*) FROM tc225;
+SELECT pg_sleep(12);
+SELECT 'SECOND:' || sum(id) FROM tc225;
+COMMIT;
+SELECT 'AFTER:' || sum(id) FROM tc225;
+SQL
+    local reader=$!
+    sleep 3
+    compactor --table tc225 >"$TMPD/tc225.compact" 2>&1
+    compactor --table tc225 --expire-snapshots --expire-older-than 0s --expire-retain-last 1 >"$TMPD/tc225.expire" 2>&1
+    assert_contains "TC-225: the six small files were compacted" "compacted: 6 files -> 1" "$(cat "$TMPD/tc225.compact")"
+    assert_contains "TC-225: the six pre-compaction snapshots were expired" "expired 6 snapshot(s), kept 1" "$(cat "$TMPD/tc225.expire")"
+    wait "$reader"
+    O=$(cat "$TMPD/tc225.out")
+    assert_eq "TC-225: the reader's first, metadata-only read saw six rows" "6" "$(extract FIRST "$O")"
+    assert_contains "TC-225: its scan after the expiry fails with the object store's 404" "404" "$O"
+    assert_eq "TC-225: after COMMIT the same scan reads the compacted snapshot" "21" "$(extract AFTER "$O")"
+    q "$HOST" "SELECT coldfront.drop_iceberg_table('public','tc225', true);" >/dev/null 2>&1
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -6833,6 +6912,7 @@ if [ "$MODE" = "tiered" ]; then
                             # manifests iceberg-go-readable
     story_maintenance       # iceberg-go ExpireSnapshots + DeleteOrphanFiles — reclaim the
                             # snapshot/small-file bloat compaction leaves (Lakekeeper can't)
+    story_expiry_vs_reader  # TC-225: an expiry shorter than an open transaction fails its next scan
     [ "$MESH" = 1 ] || story_start_snapshot_expired  # a write whose start snapshot expired fails as outdated
     story_compactor_claim_matches_writes  # the compactor waits for a cold write's claim on created and adopted tables
     story_writes_plpgsql
@@ -6854,6 +6934,7 @@ if [ "$MODE" = "tiered" ]; then
     story_merge
     story_nested_merge
     story_tiered_ryw
+    story_snapshot_pinned   # TC-224: a transaction keeps the snapshot of its first cold read
     story_mixed_write_rule
     story_coexist
     story_cold_retention

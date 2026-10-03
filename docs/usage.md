@@ -940,7 +940,10 @@ Keep the following caveats in mind when running either mode:
   invisible until the transaction ends. The hot tier follows PostgreSQL's own
   isolation level, so at READ COMMITTED a later statement can see new hot rows
   but not new cold ones. Within one transaction, a read of a tiered or
-  decoupled table sees the transaction's own writes on both tiers.
+  decoupled table sees the transaction's own writes on both tiers. The held
+  snapshot is also why the compactor's `--expire-older-than` must stay longer
+  than the longest transaction that reads the table (see
+  [compaction.md](compaction.md)).
 - One transaction block cannot hold both a PostgreSQL write and a cold-tier
   write unless `duckdb.unsafe_allow_mixed_transactions` is on. pg_duckdb
   refuses the pair ("Writing to DuckDB and Postgres tables in the same
