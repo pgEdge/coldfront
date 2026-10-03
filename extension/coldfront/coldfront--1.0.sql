@@ -2278,8 +2278,9 @@ $$;
 -- key is what lets a compaction concatenate a group's files in key order rather
 -- than scrambling them.
 --
--- Set at CREATE TABLE: the catalog takes properties there, and this build has no
--- ALTER for them, so a table that predates its vector column keeps the defaults.
+-- Set at CREATE TABLE: the catalog takes properties there, and ColdFront never
+-- alters them afterwards, so a table that predates its vector column keeps the
+-- defaults.
 CREATE OR REPLACE FUNCTION coldfront._vec_layout_props(p_sort_key text, p_partitioned boolean)
 RETURNS text
 LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
@@ -3233,8 +3234,9 @@ END $$;
 -- table via pg_duckdb, every iceberg commit posts to Lakekeeper which does CAS
 -- on metadata_location. Concurrent writers that prepared their commit body
 -- against the same parent snapshot lose the race; whichever lands second
--- gets HTTP 409 CatalogCommitConflicts, and DuckDB-iceberg has no
--- writer-side rebase loop, so the loser's batch is silently dropped.
+-- gets HTTP 409 CatalogCommitConflicts, which duckdb-iceberg (5edc45f0) raises
+-- as "Failed to commit Iceberg transaction" and pg_duckdb turns into an ERROR
+-- at PRE_COMMIT: the losing transaction aborts and the batch has to be retried.
 --
 -- Architecture. Coordinate cluster-wide via:
 --  • coldfront.claims: one row per active claim, keyed by its ticket, the
@@ -3263,8 +3265,9 @@ END $$;
 --      alive peer has acked.
 --   4. Runs the actual iceberg INSERT (in user's PG transaction). Sole
 --      writer to Lakekeeper at this moment, no CAS race.
---   5. The C xact callback (coldfront_xact_callback) fires after pg_duckdb's
---      at PG commit/abort and DELETEs the claim over the same loopback; the
+--   5. The C xact callback (coldfront_xact_callback) DELETEs the claim at
+--      XACT_EVENT_COMMIT, after pg_duckdb committed the Iceberg transaction at
+--      XACT_EVENT_PRE_COMMIT (and at ABORT), over the same loopback; the
 --      DELETE trigger (_on_claim_release) forwards the acks deferred behind it.
 --
 -- Complexity is in the four primitives above. The body of each helper is
@@ -3695,8 +3698,9 @@ $$;
 -- or on the waiting peer's poke (see _insert_claim and _on_claim_apply).
 -- C-bridge: enqueues a ticket for release at outer-tx-end. Drained by
 -- the coldfront XactCallback registered in _PG_init (coldfront.c), which
--- fires after pg_duckdb's XactCallback so the iceberg snapshot has
--- already committed (or rolled back) by the time we DELETE the claim.
+-- fires at XACT_EVENT_COMMIT, after pg_duckdb's XACT_EVENT_PRE_COMMIT commit
+-- of the Iceberg transaction, so the snapshot has landed by the time we DELETE
+-- the claim (and at ABORT, where nothing landed).
 CREATE FUNCTION coldfront._enqueue_release(p_ticket bigint)
 RETURNS void
 LANGUAGE c AS 'coldfront', 'coldfront_enqueue_release';
@@ -3785,8 +3789,9 @@ LANGUAGE sql STABLE AS $$
 $$;
 
 -- Serialise one cold-tier Iceberg write so concurrent committers never hit a
--- Lakekeeper 409 CatalogCommitConflict (duckdb-iceberg does not rebase → the
--- loser's data is silently dropped). This is THE chokepoint every cold write
+-- Lakekeeper 409 CatalogCommitConflict (duckdb-iceberg does not rebase: the
+-- losing transaction aborts and its batch has to be retried). This is THE
+-- chokepoint every cold write
 -- routes through, in every deployment.
 --
 -- The serializer is fundamentally a per-Iceberg-table mutex that scales by
@@ -3851,7 +3856,8 @@ BEGIN
     -- Fail-safe, not fail-silent: if async was REQUESTED but the bakery-aware
     -- patch is not asserted, we use the stock ordering (always safe) and note it
     -- ONCE per session. Running async on stock iceberg would let a peer capture a
-    -- stale parent and conflict → silent commit loss (docs/formal Bakery_race.cfg).
+    -- stale parent and conflict: a 409 that aborts the losing transaction
+    -- (docs/formal Bakery_race.cfg).
     -- RAISE LOG, not WARNING: this is a deployment-config advisory that belongs in
     -- the server log; it must NOT reach the client (a per-statement client message
     -- here would pollute output and break tools that scan write output for errors).

@@ -478,8 +478,9 @@ EOSQL
 # table must all land. Vanilla serializes them with the local advisory-lock
 # bakery (_exec_iceberg_with_claim, v_armed=false → pg_advisory_xact_lock);
 # without it, concurrent Iceberg commits race Lakekeeper's assert-ref-snapshot
-# precondition and 409 (CatalogCommitConflict), silently losing rows. (Standing
-# rule: multi-writer no-409 probe in vanilla. The bakery is essential.)
+# precondition and 409 (CatalogCommitConflict), which aborts the losing
+# transaction. (Standing rule: multi-writer no-409 probe in vanilla. The bakery
+# is essential.)
 # ───────────────────────────────────────────────────────────────────────────
 # snapshot_count <iceberg-ref>: the table's snapshot count. A table nothing has
 # written to has none, and every commit adds one.

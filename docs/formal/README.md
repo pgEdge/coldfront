@@ -47,8 +47,8 @@ These properties must hold; TLC checks them as `INVARIANTS`:
 - `NoLakekeeperConflict` states that no writer's `decision` ends in `lk_409`.
   Equivalently, while a writer holds the bakery's minimum ticket, no other
   writer can issue a conditional commit POST to Lakekeeper against the same
-  iceberg table. This is the headline correctness claim - pre-bakery this could
-  fail and produce silent commit loss.
+  iceberg table. This is the headline correctness claim: without the bakery it
+  fails, and the losing commit gets HTTP 409 and aborts its transaction.
 - `RollbackNoIceberg` states that if a writer's `decision = "rolled_back"`,
   there is no iceberg snapshot owned by that writer in the committed history.
   The property models PG ROLLBACK undoing pg_duckdb's pending iceberg

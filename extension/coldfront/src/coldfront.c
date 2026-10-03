@@ -1584,8 +1584,9 @@ cold_sql_arg(const char *cold_dml, ColdParamSet *ps)
  * cold_sql_arg() output. This is the single chokepoint for ALL cold-tier writes
  * (tiered and iceberg-only): its plpgsql wrapper self-selects the cluster-wide
  * R-A bakery (mesh) or a local advisory lock (vanilla), runs the cold DML via
- * duckdb.raw_query, and releases the claim after pg_duckdb's iceberg COMMIT via
- * the C XactCallback. Callers wrap it in a SELECT (top level) or in
+ * duckdb.raw_query, and releases the claim at XACT_EVENT_COMMIT, after pg_duckdb
+ * has committed the Iceberg transaction at XACT_EVENT_PRE_COMMIT, via the C
+ * XactCallback. Callers wrap it in a SELECT (top level) or in
  * cold_anchor_update() (in plpgsql).
  */
 static char *
@@ -4176,17 +4177,21 @@ coldfront_post_parse_analyze(ParseState *pstate, Query *query,
  * Why deferred: pg_duckdb commits the iceberg snapshot at outer-tx-commit
  * time (via its own XactCallback). Releasing the claim before that commit
  * lands creates a window where the next bakery winner sees no claim and
- * races into Lakekeeper alongside us — 409 / silent loss. Conversely,
+ * races into Lakekeeper alongside us, and one of the two commits fails with
+ * HTTP 409 and aborts its transaction. Conversely,
  * releasing inside the same outer tx (so it's atomic with iceberg) makes
  * the release invisible to peers until commit, which is correct on COMMIT
  * but leaves a stale claim on ROLLBACK.
  *
- * The XactCallback runs after pg_duckdb's XactCallback (coldfront loads
- * after pg_duckdb in shared_preload_libraries; PG calls callbacks in
- * registration order), so on COMMIT the iceberg snapshot is durably
- * committed before we DELETE the claim. On ABORT, pg_duckdb has already
- * rolled back iceberg, and we still need to clean up our claim row (committed
- * on its own over the loopback) so the next writer doesn't block.
+ * pg_duckdb commits the Iceberg transaction at XACT_EVENT_PRE_COMMIT and this
+ * callback DELETEs the claim at XACT_EVENT_COMMIT, so on COMMIT the iceberg
+ * snapshot is durably committed before the claim goes. On ABORT this callback
+ * runs before pg_duckdb discards its staged Iceberg work (PostgreSQL calls the
+ * most recently registered callback first, and coldfront registers after
+ * pg_duckdb); that order is harmless, since duckdb-iceberg's rollback deletes
+ * staged data files and sends nothing to the catalog, and the claim row
+ * (committed on its own over the loopback) still has to go so the next writer
+ * does not block.
  *
  * Allocated in TopMemoryContext so it survives across PG xacts within one
  * backend session.
@@ -4326,10 +4331,11 @@ cf_loopback_exec(const char *sql, int elevel)
 }
 
 /*
- * Drain the per-session pending-release queue at outer-tx end. Runs after
- * pg_duckdb's XactCallback (registration-order chain), so on COMMIT the
- * iceberg snapshot has landed before we DELETE the claim, and on ABORT
- * pg_duckdb has already rolled back iceberg.
+ * Drain the per-session pending-release queue at outer-tx end. Runs at
+ * XACT_EVENT_COMMIT, after pg_duckdb's XACT_EVENT_PRE_COMMIT commit of the
+ * Iceberg transaction, so the iceberg snapshot has landed before we DELETE the
+ * claim; on ABORT it runs before pg_duckdb discards its staged work, which is
+ * harmless (see coldfront_xact_callback).
  *
  * We use libpq directly rather than SPI because SPI inside an
  * XACT_EVENT_COMMIT / XACT_EVENT_ABORT callback would try to start a
@@ -5650,9 +5656,10 @@ _PG_init(void)
     prev_process_utility_hook = ProcessUtility_hook;
     ProcessUtility_hook       = coldfront_process_utility;
 
-    /* Register the bakery release-deferral callback. Runs after pg_duckdb's
-     * XactCallback (coldfront appears later in shared_preload_libraries, so
-     * its _PG_init runs after pg_duckdb's, so its XactCallback is invoked
-     * later in PG's registration-ordered chain). */
+    /* Register the bakery release callback. The order the bakery needs is by
+     * event, not by registration: pg_duckdb commits the Iceberg transaction at
+     * XACT_EVENT_PRE_COMMIT and this callback releases the claim at
+     * XACT_EVENT_COMMIT. Within one event PostgreSQL runs the most recently
+     * registered callback first, so there coldfront's runs before pg_duckdb's. */
     RegisterXactCallback(coldfront_xact_callback, NULL);
 }

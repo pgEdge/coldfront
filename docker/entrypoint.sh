@@ -30,11 +30,13 @@ DUCKDB_ROLE="${COLDFRONT_DUCKDB_ROLE-coldfront_duckdb}"
 
 if [ ! -f "$PGDATA/PG_VERSION" ] && [ -n "${COLDFRONT_STANDBY_OF:-}" ]; then
     # ── Physical standby: base-backup the primary instead of initdb. ──
-    # A base backup carries everything a hot standby needs to serve cross-tier
-    # reads: the data, the coldfront GUCs (they live in postgresql.conf, not
-    # ALTER SYSTEM, so they ride the backup), the patched duckdb-iceberg cache
-    # (it sits inside PGDATA), and the DuckDB S3 secret (a pg_foreign_server row,
-    # physically replicated). -R writes standby.signal + primary_conninfo;
+    # A base backup carries the data, the coldfront GUCs (they live in
+    # postgresql.conf, not ALTER SYSTEM, so they ride the backup) and the patched
+    # duckdb-iceberg cache (it sits inside PGDATA). It does not carry the DuckDB
+    # persistent secret, whose file sits outside PGDATA: a standby materializes
+    # it from the replicated coldfront.storage_secret row
+    # (coldfront.materialize_storage_secret), as ci/probe-standby.sh does.
+    # -R writes standby.signal + primary_conninfo;
     # hot_standby defaults on, so the replica serves read queries.
     mkdir -p "$PGDATA"; chmod 700 "$PGDATA"
     echo "standby: waiting for primary ${COLDFRONT_STANDBY_OF} …"
