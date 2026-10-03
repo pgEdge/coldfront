@@ -1,4 +1,3 @@
-| `iceberg-schema-id-allocation-v15` | Numbers a new table schema one above the highest schema id in the metadata rather than above the current one, so a column change after a `DROP COLUMN` that returned the table to an earlier schema is accepted (a port of upstream duckdb-iceberg c1cfe2ef). |
 # Building ColdFront from Source
 
 This guide builds ColdFront from source, either in Docker on top of the
@@ -10,13 +9,14 @@ published base image or on bare metal.
 > patched DuckDB-1.5.x stack yourself, in Docker or bare-metal.
 
 ColdFront runs on a **DuckDB 1.5.x** stack: PostgreSQL + pg_duckdb (DuckDB
-1.5.4) and a **patched** duckdb-iceberg that includes ColdFront's four
+1.5.4) and a **patched** duckdb-iceberg that includes ColdFront's five
 patches - the bakery-aware commit-refresh patch (the no-409 guarantee for
 concurrent cold-tier writers), two strict-reader interop patches (so
 apache/iceberg-go, the cold-tier compactor, can read the manifests
-duckdb-iceberg writes) and a port of an upstream fix that computes the time
-partitions of a `timestamptz` column in UTC. No released pg_duckdb tag includes
-DuckDB 1.5.x yet, so the stack is built from a pinned upstream PR plus
+duckdb-iceberg writes), a port of an upstream fix that computes the time
+partitions of a `timestamptz` column in UTC, and a port of another that numbers
+a new table schema above the highest schema id. No released pg_duckdb tag
+includes DuckDB 1.5.x yet, so the stack is built from a pinned upstream PR plus
 ColdFront's patches - all from sources you can fetch.
 
 ## What Gets Built
@@ -52,6 +52,7 @@ what each one does:
 | `iceberg-manifest-list-format-version-v15` | Adds the spec-optional `format-version` key to the manifest-list metadata so strict Apache readers parse the entries as v2. |
 | `iceberg-data-file-format-v15` | Upper-cases the data-file format in the manifest to match the spec enum strict readers check case-sensitively. |
 | `iceberg-timestamptz-utc-transforms-v15` | Computes the year/month/day/hour partition of a `timestamptz` column on the UTC instant rather than in the session's time zone (a port of upstream duckdb-iceberg d3c3348271). |
+| `iceberg-schema-id-allocation-v15` | Numbers a new table schema one above the highest schema id in the metadata rather than above the current one, so a column change after a `DROP COLUMN` that returned the table to an earlier schema is accepted (a port of upstream duckdb-iceberg c1cfe2ef). |
 
 The bakery patch is mandatory for the no-409 guarantee. The two interop patches
 make the manifests duckdb-iceberg writes readable by strict Apache readers such

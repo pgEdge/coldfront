@@ -1,14 +1,14 @@
 # DUCKDB_1.5_UNPATCHED — stock duckdb-iceberg 1.5.x (no ColdFront patches)
 
 How to build and run the DuckDB 1.5.x base **without** ColdFront's patches, and
-the two consequences of doing so. The patched base is the default and the full
+the four consequences of doing so. The patched base is the default and the full
 build story is [DUCKDB_1.5_PATCHED.md](DUCKDB_1.5_PATCHED.md).
 
 ## What "unpatched 1.5" is
 
 The *same* 1.5.x stack — pg_duckdb PR #1025 + `duckdb-iceberg` `v1.5-variegata`
 @ `5edc45f0` + avro/azure/postgres_scanner, libcurl 8.12, the same
-vcpkg/libasan toolchain and version pins — built with the three ColdFront
+vcpkg/libasan toolchain and version pins — built with the five ColdFront
 patches **omitted**. It is still a locally-built (unsigned) extension; there is
 no signed upstream 1.5.x iceberg to auto-install (no released pg_duckdb bundles
 DuckDB 1.5).

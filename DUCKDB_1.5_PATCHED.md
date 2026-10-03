@@ -1,4 +1,3 @@
-| **Schema ids from the highest existing id** (port of upstream c1cfe2ef) | `docker/iceberg-schema-id-allocation-v15.patch` | a new table schema is numbered one above the highest schema id in the metadata, not above the current schema's | once a `DROP COLUMN` returns a table to an earlier schema, the next column change fails with "Attempted to add schema with id N, but this already exists in the table!" and **the table can take no further column change** |
 # PATCHED — duckdb-iceberg patches & build (DuckDB 1.5.x)
 
 ColdFront runs on a **custom-built DuckDB 1.5.4 base image** that carries a
@@ -20,6 +19,7 @@ and verified*. The cold-tier compactor's own story lives in
 | **Bakery-aware commit-refresh** | `docker/iceberg-bakery-aware-commit-refresh-v15.patch` | makes the async parquet-upload ordering safe → the **no-409** guarantee for concurrent cold writers, at contended-upload throughput | cold writes still work and still never 409 — they fall back to serialized (claim-first) uploads (see [DUCKDB_1.5_UNPATCHED.md](DUCKDB_1.5_UNPATCHED.md)) |
 | **Strict-reader interop** (upstreamable) | `docker/iceberg-manifest-list-format-version-v15.patch`, `docker/iceberg-data-file-format-v15.patch` | make the manifests duckdb-iceberg *writes* readable by strict Apache readers (apache/iceberg-go) | the cold-tier **compactor cannot read the table** - see [docs/compaction.md](docs/compaction.md). pg_duckdb's own reads/writes are unaffected. |
 | **TIMESTAMPTZ transforms in UTC** (port of upstream d3c3348271) | `docker/iceberg-timestamptz-utc-transforms-v15.patch` | year/month/day/hour of a TIMESTAMPTZ partition column are computed on the UTC instant, as the Iceberg spec, duckdb-iceberg's own pruning and iceberg-go take them | a session outside UTC files rows within the zone offset of a boundary in the neighbouring partition, and a UTC-bounded read on the column **prunes them away** |
+| **Schema ids from the highest existing id** (port of upstream c1cfe2ef) | `docker/iceberg-schema-id-allocation-v15.patch` | a new table schema is numbered one above the highest schema id in the metadata, not above the current schema's | once a `DROP COLUMN` returns a table to an earlier schema, the next column change fails with "Attempted to add schema with id N, but this already exists in the table!" and **the table can take no further column change** |
 
 All five patches apply cleanly to a **pristine** `duckdb-iceberg` @ `5edc45f0`
 (branch `v1.5-variegata`); `docker/Dockerfile.duckdb15-base`
