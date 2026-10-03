@@ -3611,14 +3611,12 @@ DECLARE
     my_node_name      name     := coldfront._my_spock_node_name();
     my_ticket         bigint;
     v_poll            int      := 0;
-    -- coldfront.peer_alive_window_ms: a peer whose walsender hasn't
-    -- heartbeated within this window is treated as already-acked (R-A
-    -- dead-peer escape). Default 5000 ms matches spock's default
-    -- heartbeat cadence; raise it on slow/lossy WAN links if false-
-    -- positive dead-peer rulings become a problem. Read once per
-    -- claim — GUC changes take effect on the next claim.
+    -- coldfront.peer_alive_window_ms (superuser-only, default 5000): a peer
+    -- whose walsender has not replied within this window is treated as
+    -- already acked (the R-A dead-peer escape); raise it on slow or lossy
+    -- links. Read once per claim, so a change applies to the next claim.
     peer_alive_window interval := make_interval(secs =>
-        COALESCE(NULLIF(current_setting('coldfront.peer_alive_window_ms', true), '')::int, 5000) / 1000.0);
+        current_setting('coldfront.peer_alive_window_ms')::int / 1000.0);
 BEGIN
     IF connstr IS NULL OR connstr = '' THEN
         RAISE EXCEPTION 'coldfront: configure GUC coldfront.dblink_self with a libpq connstr (e.g. ''host=/var/run/postgresql dbname=coldfront user=coldfront'')';
@@ -3770,12 +3768,12 @@ CREATE FUNCTION coldfront._take_iceberg_claim(p_iceberg_ref text) RETURNS void
 LANGUAGE plpgsql AS $$
 BEGIN
     IF coldfront._bakery_armed() THEN
-        IF p_iceberg_ref = ANY(string_to_array(current_setting('coldfront._claimed', true), E'\n')) THEN
+        IF p_iceberg_ref = ANY(string_to_array(current_setting('coldfront._claimed'), E'\n')) THEN
             RETURN;
         END IF;
         PERFORM coldfront._enqueue_release(coldfront._claim_iceberg_lock(p_iceberg_ref));
         PERFORM set_config('coldfront._claimed',
-                           concat_ws(E'\n', NULLIF(current_setting('coldfront._claimed', true), ''), p_iceberg_ref),
+                           concat_ws(E'\n', NULLIF(current_setting('coldfront._claimed'), ''), p_iceberg_ref),
                            true);
     ELSE
         PERFORM pg_advisory_xact_lock(hashtext('coldfront_iceberg:' || p_iceberg_ref));
@@ -3797,8 +3795,8 @@ $$;
 -- (async WITH the patch) is safe. STABLE so the planner can fold it.
 CREATE FUNCTION coldfront._iceberg_async_active() RETURNS boolean
 LANGUAGE sql STABLE AS $$
-  SELECT COALESCE(NULLIF(current_setting('coldfront.iceberg_async_parquet', true), '')::boolean, false)
-     AND COALESCE(NULLIF(current_setting('coldfront.iceberg_bakery_patch',   true), '')::boolean, false)
+  SELECT current_setting('coldfront.iceberg_async_parquet')::boolean
+     AND current_setting('coldfront.iceberg_bakery_patch')::boolean
 $$;
 
 -- Serialise one cold-tier Iceberg write so concurrent committers never hit a
@@ -3873,10 +3871,10 @@ BEGIN
     -- the server log; it must NOT reach the client (a per-statement client message
     -- here would pollute output and break tools that scan write output for errors).
     IF NOT v_async
-       AND COALESCE(NULLIF(current_setting('coldfront.iceberg_async_parquet', true), '')::boolean, false)
-       AND current_setting('coldfront._async_downgrade_warned', true) IS DISTINCT FROM 'true' THEN
+       AND current_setting('coldfront.iceberg_async_parquet')::boolean
+       AND NOT current_setting('coldfront._async_downgrade_warned')::boolean THEN
         RAISE LOG 'coldfront: iceberg_async_parquet is on but iceberg_bakery_patch is not set — the loaded duckdb-iceberg is not the bakery-aware build; using the SAFE stock upload ordering instead of async. Set coldfront.iceberg_bakery_patch=on ONLY where duckdb-iceberg carries the bakery-aware-commit-refresh patch (the coldfront patched images set both GUCs).';
-        PERFORM set_config('coldfront._async_downgrade_warned', 'true', false);
+        PERFORM set_config('coldfront._async_downgrade_warned', 'on', false);
     END IF;
     IF v_armed AND v_async THEN
         -- Patched iceberg: upload parquet in the background, then take the claim

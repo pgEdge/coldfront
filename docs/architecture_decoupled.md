@@ -715,8 +715,9 @@ snowflake.node = 1     # node1
 # DSN of the loopback that runs the bakery's autonomous claim/ack/release statements (unix socket).
 coldfront.dblink_self = 'host=/tmp dbname=coldfront user=coldfront application_name=coldfront_dblink'
 
-# Optional - peer-liveness window for R-A's dead-peer escape; a peer
-# whose reply_time is older than this is treated as already-acked.
+# Optional, superuser-only: the peer-liveness window for R-A's dead-peer
+# escape; a peer whose reply_time is older than this is treated as
+# already-acked.
 coldfront.peer_alive_window_ms = 5000
 ```
 

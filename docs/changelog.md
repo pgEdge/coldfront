@@ -85,6 +85,11 @@ this project adheres to
   write: the ticket on the writing node, the same claim on its peer, the peer's
   ack, and the ledger cleared once the write commits. After the concurrent
   writes it lists the table's snapshot history.
+- Every `coldfront.*` setting is registered: typed, bounded, with its default
+  visible in `pg_settings`, and the prefix is reserved, so a mistyped name is
+  refused. `coldfront.peer_alive_window_ms` and the build marker
+  `coldfront.iceberg_bakery_patch` are superuser-only;
+  `coldfront.iceberg_async_parquet` stays session-settable.
 
 ### Fixed
 

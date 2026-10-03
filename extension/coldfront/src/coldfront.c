@@ -250,6 +250,13 @@ static char *coldfront_warehouse          = NULL;
 static char *coldfront_lakekeeper_endpoint = NULL;
 static char *coldfront_local_pg_dsn       = NULL;
 static char *coldfront_dblink_self        = NULL;
+/* The bakery's dead-peer window, the async-ordering switch and its build
+ * marker, and two per-session values the SQL keeps with set_config. */
+static int   coldfront_peer_alive_window_ms   = 5000;
+static bool  coldfront_iceberg_async_parquet  = false;
+static bool  coldfront_iceberg_bakery_patch   = false;
+static char *coldfront_claimed                = NULL;
+static bool  coldfront_async_downgrade_warned = false;
 
 static post_parse_analyze_hook_type prev_post_parse_analyze_hook = NULL;
 static planner_hook_type            prev_planner_hook            = NULL;
@@ -5346,6 +5353,74 @@ register_gucs(void)
         PGC_SUSET,
         0,
         NULL, NULL, NULL);
+
+    /*
+     * The bakery's dead-peer window: a peer whose walsender has not replied
+     * within it counts as already acked (_claim_iceberg_lock), so an ordinary
+     * role must not be able to shrink it.
+     */
+    DefineCustomIntVariable(
+        "coldfront.peer_alive_window_ms",
+        "Milliseconds without a walsender reply after which the bakery treats a peer as dead.",
+        NULL,
+        &coldfront_peer_alive_window_ms,
+        5000,
+        1,
+        PG_INT32_MAX,
+        PGC_SUSET,
+        0,
+        NULL, NULL, NULL);
+
+    /*
+     * The async parquet ordering runs only with both on (_iceberg_async_active).
+     * The request flag is PGC_USERSET because _cross_tier_move and the Iceberg
+     * ALTER path SET LOCAL it off; the build marker states that the loaded
+     * duckdb-iceberg includes the bakery-aware patch, which only the deployment
+     * knows, so it is PGC_SUSET.
+     */
+    DefineCustomBoolVariable(
+        "coldfront.iceberg_async_parquet",
+        "Stage a cold write's Parquet before taking the bakery claim.",
+        NULL,
+        &coldfront_iceberg_async_parquet,
+        false,
+        PGC_USERSET,
+        0,
+        NULL, NULL, NULL);
+
+    DefineCustomBoolVariable(
+        "coldfront.iceberg_bakery_patch",
+        "The loaded duckdb-iceberg includes the bakery-aware commit refresh.",
+        NULL,
+        &coldfront_iceberg_bakery_patch,
+        false,
+        PGC_SUSET,
+        0,
+        NULL, NULL, NULL);
+
+    /* Per-session state the SQL keeps with set_config. */
+    DefineCustomStringVariable(
+        "coldfront._claimed",
+        "Iceberg tables this transaction holds a bakery claim on, one per line.",
+        NULL,
+        &coldfront_claimed,
+        "",
+        PGC_USERSET,
+        0,
+        NULL, NULL, NULL);
+
+    DefineCustomBoolVariable(
+        "coldfront._async_downgrade_warned",
+        "This session has logged its fall-back from the async ordering.",
+        NULL,
+        &coldfront_async_downgrade_warned,
+        false,
+        PGC_USERSET,
+        0,
+        NULL, NULL, NULL);
+
+    /* Every coldfront.* name is registered above, so a mistyped one is refused. */
+    MarkGUCPrefixReserved("coldfront");
 }
 
 /* ---------- planner hook: bound parameters on a tiered read ------------- */

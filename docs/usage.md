@@ -1072,11 +1072,11 @@ coldfront.iceberg_bakery_patch = on
 The bakery has no peer-ack timeout. R-A's only failure mode is a dead peer
 (would wait forever), closed by a liveness check inside the wait-loop: a peer
 whose `pg_stat_replication.reply_time` is older than
-`coldfront.peer_alive_window_ms` (default `5000`) is implicitly treated as
-already-acked. Raise this on slow/lossy WAN links if false-positive dead-peer
-rulings become a problem. An alive peer that has not acked is either deferring
-legitimately (R-A's defer rule) or about to ack - either way, waiting is
-correct, not a failure.
+`coldfront.peer_alive_window_ms` (superuser-only, default `5000`) is implicitly
+treated as already-acked. Raise this on slow/lossy WAN links if false-positive
+dead-peer rulings become a problem. An alive peer that has not acked is either
+deferring legitimately (R-A's defer rule) or about to ack - either way, waiting
+is correct, not a failure.
 
 A claim whose owner is gone (a hard backend crash) is reaped without operator
 action: by that node's next cold write, to any table, by a peer's arriving
