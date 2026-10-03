@@ -49,11 +49,11 @@ metric:
 
 pg_duckdb passes the operator symbol to DuckDB, which resolves `<=>` and `<->`
 as its own aliases of `list_cosine_distance` and `list_distance`. DuckDB has no
-`<#>`, so that operator fails with a parser error on any query DuckDB runs, and
-`list_negative_inner_product(…)` is the spelling that works there. The
-PostgreSQL function names match DuckDB's, so the function-call form resolves
-too and the probe can recognize the sort expression. The PostgreSQL bodies are
-real implementations that delegate to pgvector, because a hot-only
+`<#>`, so the read rewrite turns that operator into a call of the function
+behind it, `list_negative_inner_product`, which DuckDB has under the same name.
+The PostgreSQL function names match DuckDB's, so the function-call form
+resolves too and the probe can recognize the sort expression. The PostgreSQL
+bodies are real implementations that delegate to pgvector, because a hot-only
 (pre-cutover) view has no Iceberg scan to pull the query into DuckDB and
 PostgreSQL executes them itself.
 

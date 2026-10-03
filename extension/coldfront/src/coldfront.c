@@ -886,7 +886,8 @@ static const CfSubst cf_write_subst[] = {
  * arguments, pg_duckdb declares it PG-side, and the two agree on every fixed-width
  * bucket (a month or year width, which date_bin rejects, time_bucket accepts).
  * The JSON builders (jsonb_build_object, jsonb_agg) need more than a spelling and
- * are rewritten on the node tree instead: see cf_json_builder_mutator.
+ * are rewritten on the node tree instead, as is the <#> operator, which DuckDB
+ * lacks and whose function it has: see cf_json_builder_mutator.
  */
 static const CfSubst cf_read_subst[] = {
     { "::jsonb",             "::json",             false, false },
@@ -1243,6 +1244,25 @@ cf_json_builder_mutator(Node *node, void *ctx)
             }
         }
         return (Node *) a;
+    }
+    if (IsA(node, OpExpr))
+    {
+        OpExpr *op    = (OpExpr *) expression_tree_mutator(node, cf_json_builder_mutator, ctx);
+        char   *fname = get_func_name(op->opfuncid);
+
+        /* pg_duckdb hands an operator to DuckDB by its symbol. DuckDB has <=> and
+         * <-> as aliases of its own list_cosine_distance and list_distance and has
+         * no <#>, so that operator becomes a call of the function behind it, which
+         * DuckDB has under the same name. */
+        if (fname != NULL && list_length(op->args) == 2 &&
+            strcmp(fname, "list_negative_inner_product") == 0)  /* nosemgrep */
+        {
+            jc->changed = true;
+            return (Node *) makeFuncExpr(op->opfuncid, op->opresulttype, op->args,
+                                         op->opcollid, op->inputcollid,
+                                         COERCE_EXPLICIT_CALL);
+        }
+        return (Node *) op;
     }
     return expression_tree_mutator(node, cf_json_builder_mutator, ctx);
 }
@@ -2793,9 +2813,10 @@ cf_try_reroute_hot_read(Query *query)
 /*
  * Make a read DuckDB will run acceptable to it. A query against a tiered /
  * iceberg-only view runs entirely in DuckDB (the view body reads the Iceberg
- * table), which has no jsonb type, no date_bin and no JSON builders. Two passes over
- * the analysed tree: the JSON builders are rewritten on the node tree
- * (cf_json_builder_mutator, where key/value pairing is exact), then the deparsed
+ * table), which has no jsonb type, no date_bin, no JSON builders and no <#>
+ * operator. Two passes over the analysed tree: the JSON builders and the <#>
+ * operator are rewritten on the node tree (cf_json_builder_mutator, where
+ * key/value pairing is exact and the operator's function is known), then the deparsed
  * text gets the read whitelist (normalize_for_read: the ::jsonb cast and the
  * functions verified equivalent in both engines), and the result is reparsed in
  * place. Nothing to rewrite ⇒ the query is left untouched (the common case: ->>/->

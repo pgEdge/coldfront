@@ -79,11 +79,8 @@ SELECT id, body
  LIMIT 10;
 ```
 
-`<=>` (cosine) and `<->` (Euclidean) work on both tiers. `<#>` (negative inner
-product) works only while a query runs entirely in PostgreSQL: DuckDB has no
-`<#>` operator, so any query that reads the cold tier fails with a parser
-error. Write `list_negative_inner_product(embedding, ARRAY[…]::real[])`
-instead. Use `<=>` unless you have a reason not to; clustering is built on
+`<=>` (cosine), `<->` (Euclidean) and `<#>` (negative inner product) work on
+both tiers. Use `<=>` unless you have a reason not to; clustering is built on
 cosine.
 
 ### Three Rules for the Query Vector

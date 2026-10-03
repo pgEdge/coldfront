@@ -1068,6 +1068,17 @@ EOSQL
     assert_eq "top-k over both tiers finds the nearest row" "coldins" "$(extract NEAREST "$S")"
     assert_contains "top-k ranks the exact match first" "coldins," "$(extract RANKED "$S")"
 
+    # TC-215: <#> reaches DuckDB as the function it has under the same name
+    # (list_negative_inner_product), so it ranks hot and cold rows together like
+    # <=> does; the stored vector scores its own negative dot product.
+    local IP; IP=$(qf "$HOST" <<'EOSQL'
+SELECT 'IP_NEAREST:' || body FROM chunks ORDER BY embedding <#> ARRAY[4,5.5,-6]::real[] LIMIT 1;
+SELECT 'IP_VALUE:' || round((embedding <#> ARRAY[4,5.5,-6]::real[])::numeric, 2) FROM chunks WHERE body = 'coldins';
+EOSQL
+)
+    assert_eq "TC-215 <#> through the tiered view ranks the matching row first" "coldins" "$(extract IP_NEAREST "$IP")"
+    assert_eq "TC-215 <#> through the tiered view is the negative inner product" "-82.25" "$(extract IP_VALUE "$IP")"
+
     # Decoupled: no hot tier, its own generated trigger, its own type map. Shares
     # none of the archiver's plumbing, so it is a distinct path.
     local i
@@ -1079,9 +1090,11 @@ EOSQL
     local D; D=$(qf "$HOST" <<'EOSQL'
 INSERT INTO icevec VALUES (1, date_trunc('month',now()) + interval '11 hours', '[7,-8.25,9]'::vector);
 SELECT 'DEC_VEC:' || (embedding = ARRAY[7,-8.25,9]::real[])::text FROM icevec WHERE id = 1;
+SELECT 'DEC_IP:' || round((embedding <#> ARRAY[7,-8.25,9]::real[])::numeric, 2) FROM icevec WHERE id = 1;
 EOSQL
 )
     assert_eq "decoupled vector round-trip" "true" "$(extract DEC_VEC "$D")"
+    assert_eq "TC-215 <#> through the decoupled view is the negative inner product" "-198.06" "$(extract DEC_IP "$D")"
 
     # Decoupled declares its own schema, so the append has a second implementation.
     local DL; DL=$(qf "$HOST" <<'EOSQL'
