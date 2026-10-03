@@ -70,8 +70,8 @@ github.com/antlr4-go/antlr/v4 v4.13.1 h1:SqQKkuVZ+zWkMMNkjy5FZe5mr5WURWnlpmOuzYW
 github.com/antlr4-go/antlr/v4 v4.13.1/go.mod h1:GKmUxMtwp6ZgGwZSva4eWPC5mS6vUAmOABFgjdkM7Nw=
 github.com/apache/arrow-go/v18 v18.8.0 h1:BLOzbPv7bxMPgXPacAg6HQjnxupYsZzC4tf+FkqPU/M=
 github.com/apache/arrow-go/v18 v18.8.0/go.mod h1:uJCFfCwq0KsxCmsCfQg4ft+LsW+iHYzAXiSDh5ug/8U=
-github.com/apache/iceberg-go v0.7.0-rc0 h1:l1iSpu8lygpFVRyos5WFWrb4bdhOU2QsRvEc6QyxaW0=
-github.com/apache/iceberg-go v0.7.0-rc0/go.mod h1:oGz5MX3/m3GDc6acsrwbdHChj28jZH8MVDWqUrW6WQQ=
+github.com/apache/iceberg-go v0.7.0 h1:bTD6Pb4uM4sWcMfIx0/cV1haHMc84r+CvPieUqYzD4I=
+github.com/apache/iceberg-go v0.7.0/go.mod h1:oGz5MX3/m3GDc6acsrwbdHChj28jZH8MVDWqUrW6WQQ=
 github.com/apache/thrift v0.24.0 h1:zy31L1a49QTNB2bG1BBfMXol3yJrTH975G3pPubQVLQ=
 github.com/apache/thrift v0.24.0/go.mod h1:zPt6WxgvTOM6hF92y8C+MkEM5LMxZuk4JcQOiU4Esvs=
 github.com/aws/aws-sdk-go-v2 v1.45.1 h1:iIoG3NaLhV6UZpPXyPXlDj2I9oS8tV/nMcMnITCC6Ks=

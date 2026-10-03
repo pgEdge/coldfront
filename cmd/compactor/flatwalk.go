@@ -24,7 +24,7 @@ import (
 // literal "readdir …: not implemented". A flat list never opens a path as a
 // directory, so the collision cannot occur. Everything else delegates to the
 // wrapped FileIO, and orphan reachability + deletion stay iceberg-go's.
-// Verified against iceberg-go v0.7.0-rc0 and gocloud.dev v0.46.0;
+// Verified against iceberg-go v0.7.0 and gocloud.dev v0.46.0;
 // TestBlobWalkDir_ObjectAtDirectoryPathFails fails once the collision is gone.
 type flatWalkIO struct {
 	iceio.IO

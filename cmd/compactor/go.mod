@@ -4,7 +4,7 @@ go 1.26.5
 
 require (
 	github.com/apache/arrow-go/v18 v18.8.0
-	github.com/apache/iceberg-go v0.7.0-rc0
+	github.com/apache/iceberg-go v0.7.0
 	github.com/jackc/pgx/v5 v5.11.0
 	gocloud.dev v0.46.0
 )
