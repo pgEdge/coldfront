@@ -983,12 +983,12 @@ EXAMPLES:
 }
 
 // applyImport connects, refuses a file whose iceberg keys disagree with the
-// server, ensures the config table, then writes every table
-// through writeRow — the same validated path `register` uses, so an imported
-// table is checked exactly as a singly-registered one (PK superset, retention
-// > hot). A failure names the offending table and stops the import. The
-// cold-store stanza, when the file has one, then becomes the storage secret,
-// and the whole file is verified against the server it was just written to.
+// server, then writes every table through writeRow, the same validated path
+// `register` uses, so an imported table is checked exactly as a
+// singly-registered one (PK superset, retention > hot). A failure names the
+// offending table and stops the import. The cold-store stanza, when the file
+// has one, then becomes the storage secret, and the whole file is verified
+// against the server it was just written to.
 func applyImport(ctx context.Context, dsn string, cfg *config.Config, dryRun bool) error {
 	tables := cfg.Archiver.Tables
 	conn, err := openConn(ctx, dsn)
@@ -1009,11 +1009,23 @@ func applyImport(ctx context.Context, dsn string, cfg *config.Config, dryRun boo
 		fmt.Printf("dry-run OK: would import %d table(s) into coldfront.partition_config\n", len(tables))
 		return nil
 	}
+	if err := importTables(ctx, conn, tables); err != nil {
+		return err
+	}
+	fmt.Printf("imported %d table(s) into coldfront.partition_config\n", len(tables))
+	if err := importSecret(ctx, conn, cfg); err != nil {
+		return err
+	}
+	return Verify(ctx, conn, cfg)
+}
+
+// importTables ensures the config table, then writes every table's row in
+// one transaction: a failure on any table rolls back the earlier inserts, so a
+// bulk import never leaves partial config behind.
+func importTables(ctx context.Context, conn *pgx.Conn, tables []config.TableConfig) error {
 	if err := EnsureTable(ctx, conn); err != nil {
 		return err
 	}
-	// One transaction for the whole import: a failure on any table rolls back the
-	// earlier inserts, so a bulk import never leaves partial config behind.
 	tx, err := conn.Begin(ctx)
 	if err != nil {
 		return err
@@ -1022,14 +1034,7 @@ func applyImport(ctx context.Context, dsn string, cfg *config.Config, dryRun boo
 	if err := writeRows(ctx, tx, tables, false); err != nil {
 		return err
 	}
-	if err := tx.Commit(ctx); err != nil {
-		return err
-	}
-	fmt.Printf("imported %d table(s) into coldfront.partition_config\n", len(tables))
-	if err := importSecret(ctx, conn, cfg); err != nil {
-		return err
-	}
-	return Verify(ctx, conn, cfg)
+	return tx.Commit(ctx)
 }
 
 // writeRows runs every table of an import through writeRow, naming the table

@@ -123,20 +123,29 @@ func run(dsn, tableName string, o runOpts) error {
 
 	// Each step reads the table under its claim, so what it commits is planned
 	// against every cold write that committed before it, including one it waited for.
-	if err := claim(func() error { return doCompaction(ctx, cat, schema, table, o) }); err != nil {
-		return err
-	}
-	if o.expire {
-		if err := claim(func() error { return doExpire(ctx, cat, schema, table, o) }); err != nil {
-			return err
-		}
-	}
-	if o.orphans {
-		if err := claim(func() error { return doOrphans(ctx, cat, schema, table, o) }); err != nil {
+	for _, s := range steps(o) {
+		if err := claim(func() error { return s(ctx, cat, schema, table, o) }); err != nil {
 			return err
 		}
 	}
 	return nil
+}
+
+// step is one maintenance pass over a table: compaction, snapshot expiry or
+// orphan-file deletion.
+type step func(ctx context.Context, cat *rest.Catalog, ns, tableName string, o runOpts) error
+
+// steps lists the passes the flags enable, in the order run performs them:
+// compaction always, then snapshot expiry and orphan-file deletion when asked for.
+func steps(o runOpts) []step {
+	s := []step{doCompaction}
+	if o.expire {
+		s = append(s, doExpire)
+	}
+	if o.orphans {
+		s = append(s, doOrphans)
+	}
+	return s
 }
 
 // newClaimer returns a wrapper that runs fn under the bakery claim for icebergRef,

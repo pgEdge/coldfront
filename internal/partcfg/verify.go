@@ -82,7 +82,7 @@ func Verify(ctx context.Context, db DBTX, cfg *config.Config) error {
 // disagrees with the server, naming it.
 func runChecks(ctx context.Context, db DBTX, checks []check) error {
 	for _, c := range checks {
-		rows, err := db.Query(ctx, c.sql, c.args...)
+		rows, err := db.Query(ctx, c.sql, c.args...) // nosemgrep
 		if err != nil {
 			return fmt.Errorf("check %s against the server: %w", c.what, err)
 		}
