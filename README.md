@@ -116,9 +116,10 @@ else from the server: each table's lifecycle in `coldfront.partition_config`,
 the cold-store credential in `coldfront.storage_secret` and the catalog
 settings above. A deployment YAML, modeled on
 [config.example.yaml](config.example.yaml), is written into the server once
-with `import`. For every setting, see
-[Using ColdFront → One-Time Setup](docs/usage.md#one-time-setup) and
-[Tuning Knobs](docs/usage.md#tuning-knobs).
+with `import`. For every setting, see the
+[One-Time Setup](docs/usage.md#one-time-setup) and
+[Tuning Knobs](docs/usage.md#tuning-knobs) sections of the Using ColdFront
+guide.
 
 ## Quickstart
 

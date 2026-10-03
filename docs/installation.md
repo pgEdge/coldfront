@@ -3,10 +3,11 @@
 This guide builds ColdFront from source, either in Docker on top of the
 published base image or on bare metal.
 
-> **Most users should install from packages** - see
-> [Installation](https://github.com/pgEdge/ColdFront/blob/main/README.md#installation)
-> in the README. This document is the **build-from-source** workflow: build the
-> patched DuckDB-1.5.x stack yourself, in Docker or bare-metal.
+!!! note "Most users should install from packages"
+
+    See [Installation](https://github.com/pgEdge/ColdFront/blob/main/README.md#installation)
+    in the README. This document is the **build-from-source** workflow: build
+    the patched DuckDB-1.5.x stack yourself, in Docker or bare-metal.
 
 ColdFront runs on a **DuckDB 1.5.x** stack: PostgreSQL + pg_duckdb (DuckDB
 1.5.4) and a **patched** duckdb-iceberg that includes ColdFront's five
@@ -102,17 +103,43 @@ publishes it. The floating `pg<major>` tag moves to the same image only when
 the base-image workflow is dispatched from `main` with `push=true` and both
 architectures.
 
-Then follow [usage.md → One-Time Setup](usage.md#one-time-setup) (bootstrap
-Lakekeeper → create a table → tier → verify).
+Then follow the [One-Time Setup](usage.md#one-time-setup) section of the Using
+ColdFront guide: bootstrap Lakekeeper, create a table, tier it, and verify.
 
-> **pg_duckdb pin.** The base pins pg_duckdb to the merged PR #1025 commit
-> `c04e6a2` (DuckDB 1.5.4 - its duckdb submodule is the v1.5.4 tag), a fixed
-> commit for reproducible builds rather than a moving PR head.
->
-> **Base foundation.** The base is
-> `FROM ghcr.io/pgedge/pgedge-postgres:<pg>-spock5-minimal`; you need pull
-> access to that image (or substitute an equivalent PostgreSQL base with the
-> same layout).
+!!! note "pg_duckdb pin"
+
+    The base pins pg_duckdb to the merged PR #1025 commit `c04e6a2` (DuckDB
+    1.5.4 - its duckdb submodule is the v1.5.4 tag), a fixed commit for
+    reproducible builds rather than a moving PR head.
+
+!!! note "Base foundation"
+
+    The base is `FROM ghcr.io/pgedge/pgedge-postgres:<pg>-spock5-minimal`; you
+    need pull access to that image (or substitute an equivalent PostgreSQL base
+    with the same layout).
+
+### Image Environment Variables
+
+The entrypoint reads the following variables when the container starts. It
+writes the server settings they control into `postgresql.conf` only when the
+data directory is empty, so a change to one of them takes effect on a fresh
+volume or after editing `postgresql.conf` by hand. The following table
+describes each variable:
+
+| Variable | Default | Effect |
+|----------|---------|--------|
+| `PG_MAJOR` | set by the image | The PostgreSQL major the entrypoint starts. The image sets it from its build argument, so a value given at run time must match. |
+| `MESH` | `off` | `on` adds `snowflake` and `spock` to `shared_preload_libraries` and writes the mesh settings: logical WAL, Spock DDL replication, `snowflake.node` and `coldfront.loopback_dsn`. |
+| `COLDFRONT_WAREHOUSE` | `wh` | The Lakekeeper warehouse name written to `coldfront.warehouse`. |
+| `COLDFRONT_LAKEKEEPER` | `http://lakekeeper:8181/catalog` | The catalog endpoint written to `coldfront.lakekeeper_endpoint`. |
+| `COLDFRONT_SNOWFLAKE_NODE` | `1` | The `snowflake.node` value of a mesh member; every member needs a distinct one. |
+| `COLDFRONT_DUCKDB_ROLE` | `coldfront_duckdb` | The role written to `duckdb.postgres_role` and created `NOLOGIN`; an empty value keeps pg_duckdb's superuser-only default. |
+| `COLDFRONT_STANDBY_OF` | unset | The host of a primary. An empty data directory is then filled with `pg_basebackup` from that host and the server starts as a streaming standby. |
+| `COLDFRONT_DUCKDB_VERSION` | `v1.5.4` | The version directory under `$PGDATA/pg_duckdb/extensions/` that receives the patched DuckDB extensions. |
+| `COLDFRONT_DUCKDB_PLATFORM` | from `uname -m` | The platform directory under that version, `linux_amd64` or `linux_arm64`. |
+
+The image is built for development and testing: `pg_hba.conf` trusts every
+connection from any address without a password.
 
 ## Verify the Build
 
@@ -168,8 +195,8 @@ SQL
 
 A row count of 1 read back through Iceberg confirms the full path. For a real
 cloud store, drop the `local-store` profile, point the warehouse at your own
-bucket, and follow [usage.md → One-Time Setup](usage.md#one-time-setup) for the
-full tier-and-verify journey.
+bucket, and follow the [One-Time Setup](usage.md#one-time-setup) section of the
+Using ColdFront guide for the full tier-and-verify journey.
 
 ## Build Prerequisites
 
@@ -214,8 +241,9 @@ coldfront.iceberg_bakery_patch  = on
 coldfront refuses to load any other way: `CREATE EXTENSION coldfront` fails on
 a server that does not preload it, with an error that names the setting.
 
-See [usage.md → Tuning Knobs](usage.md#tuning-knobs) for the remaining GUCs,
-and the README for the optional non-superuser role that the image sets up.
+See the [Tuning Knobs](usage.md#tuning-knobs) section of the Using ColdFront
+guide for the remaining GUCs, and the README for the optional non-superuser
+role that the image sets up.
 
 ## Testing & CI
 

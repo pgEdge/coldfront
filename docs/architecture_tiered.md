@@ -64,8 +64,9 @@ catalog, the object store, and the archiver:
 A single Go binary runs via cron. The binary converts an existing partitioned
 table into a tiered table on first run, then manages the ongoing lifecycle. The
 archiver is a thin SQL orchestrator - no DuckDB/Iceberg/Arrow Go libraries; all
-Iceberg I/O goes through `pg_duckdb` (see
-[architecture.md → Core Mechanics](architecture.md#core-mechanics-pg_duckdb)).
+Iceberg I/O goes through `pg_duckdb` (see the
+[Core Mechanics](architecture.md#core-mechanics-pg_duckdb) section of the
+Architecture overview).
 
 ### Prerequisites
 
@@ -73,8 +74,9 @@ The archiver requires the following before its first run:
 
 - PostgreSQL 16+ with pg_duckdb.
 - Lakekeeper, bootstrapped with a warehouse.
-- a configured storage secret (see
-  [architecture.md → Session Setup](architecture.md#session-setup)).
+- a configured storage secret (see the
+  [Session Setup](architecture.md#session-setup) section of the Architecture
+  overview).
 - static `s3:` or `azure:` credentials in the archiver config, unless the cold
   store uses vended credentials.
 - an existing range-partitioned table.
@@ -143,10 +145,11 @@ six-phase pipeline:
    export are recorded for replay.
 
 2. The bulk export copies the partition PG → Iceberg under a captured
-   snapshot, using the temp table bridge (see
-   [architecture.md → Temp Table Bridge](architecture.md#temp-table-bridge-pg-iceberg))
-   and a single bakery-claimed Iceberg `INSERT`. Each cycle has already created
-   the Iceberg namespace and table, if missing, before the per-partition loop.
+   snapshot, using the temp table bridge (see the
+   [Temp Table Bridge](architecture.md#temp-table-bridge-pg-iceberg) section of
+   the Architecture overview) and a single bakery-claimed Iceberg `INSERT`.
+   Each cycle has already created the Iceberg namespace and table, if missing,
+   before the per-partition loop.
 
 3. Delta replay (`replay_archive_delta`) applies the delta rows the export
    snapshot did not see to Iceberg in batched commits, with no lock on the
@@ -253,10 +256,11 @@ the flat path.
 
 ## Transparent `INSERT`
 
-The `post_parse_analyze_hook` (see
-[architecture.md → Application Interface](architecture.md#application-interface))
-intercepts `INSERT` on a registered tiered view and rewrites it into a single
-statement that splits the input by the partition-column watermark:
+The `post_parse_analyze_hook` (see the
+[Application Interface](architecture.md#application-interface) section of the
+Architecture overview) intercepts `INSERT` on a registered tiered view and
+rewrites it into a single statement that splits the input by the
+partition-column watermark:
 
 ```sql
 INSERT INTO events (ts, status, data) SELECT ts, status, data FROM staging;
@@ -452,8 +456,9 @@ applications to supply a tier-deterministic WHERE clause.
 ## Tiered Tables in a Spock Mesh
 
 The bakery protocol that serializes cold writes cluster-wide is described in
-[architecture.md → Concurrency](architecture.md#concurrency-and-pgedge-spock-deployments).
-This section covers what is specific to a *tiered* table across a mesh.
+the [Concurrency](architecture.md#concurrency-and-pgedge-spock-deployments)
+section of the Architecture overview. This section covers what is specific to
+a *tiered* table across a mesh.
 
 A tiered table provisioned on one node becomes usable on every peer, but the
 pieces arrive by different routes. The following table shows how each
@@ -477,8 +482,9 @@ tier, and `INSERT`/`UPDATE`/`DELETE`/DDL-blocking stop recognizing the view.
 
 Both tables are **name-keyed** - `tiered_views` by `(schema_name, relname)`,
 `archive_watermark` by `table_name` - so each row replicates verbatim and
-correct on every node, with no OID divergence to reason about. See
-[architecture.md → Registry Keying](architecture.md#registry-keying-by-name-not-oid).
+correct on every node, with no OID divergence to reason about. See the
+[Registry Keying](architecture.md#registry-keying-by-name-not-oid) section of
+the Architecture overview.
 
 ## Partition Scheme Compatibility
 
@@ -593,8 +599,9 @@ not make deletes less expensive.
 
 These are specific to the dual-tier model. Cross-cutting limitations (the
 planner-level takeover, jsonb-as-json, single-node execution, S3 compatibility,
-one-time secret setup) are in
-[architecture.md → Known Limitations](architecture.md#known-limitations).
+one-time secret setup) are in the
+[Known Limitations](architecture.md#known-limitations) section of the
+Architecture overview.
 
 The dual-tier model has the following limitations:
 

@@ -16,7 +16,7 @@ shell.
 > not use it in production. Interfaces, on-disk formats, and behavior may
 > change without notice, and data loss is possible.
 
-## ▶ In GitHub Codespaces
+## In GitHub Codespaces
 
 [Open this repo in a Codespace](https://github.com/codespaces/new?repo=pgEdge/coldfront)
 and everything is preinstalled - Docker, psql, and the
@@ -28,7 +28,7 @@ minutes); everything after it is quick.
 If you prefer a terminal, `bash examples/walkthrough/guide.sh` runs the same
 demos as an interactive guide.
 
-## 💻 On Your Own Machine
+## On Your Own Machine
 
 You need Docker 24+ with Compose V2 (the `docker compose` plugin, not the
 legacy `docker-compose` binary), roughly 3 GB of free disk inside Docker's
@@ -148,8 +148,8 @@ curl -sf -X POST \
 
 ### Using a Cloud Object Store
 
-The walkthrough hero path uses SeaweedFS. To use a cloud store instead, replace
-the warehouse JSON above, the `set_storage_secret` call in Step 5 of
+The walkthrough uses SeaweedFS by default. To use a cloud store instead,
+replace the warehouse JSON above, the `set_storage_secret` call in Step 5 of
 [Demo 1](walkthrough_demos.md#demo-1-tiered-storage), and the `s3:` block in
 `examples/walkthrough/config/archiver.yaml`, which `import` writes into the
 server as the storage secret.
@@ -165,8 +165,9 @@ store:
 | Azure ADLS Gen2 | `SELECT coldfront.set_storage_secret_azure('AccountName=<account>;AccountKey=<key>;EndpointSuffix=core.windows.net');` |
 
 The [Object Store Setup](object_store.md) guide shows the matching warehouse
-JSON for AWS S3; for GCS and Azure, see
-[usage.md → Storage Backends](usage.md#storage-backends).
+JSON for AWS S3; for GCS and Azure, see the
+[Storage Backends](usage.md#storage-backends) section of the Using ColdFront
+guide.
 
 ## Next Steps
 

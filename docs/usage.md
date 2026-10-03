@@ -167,6 +167,8 @@ archiver:
       hot_period: "1 month"
 ```
 
+The `import` command writes the file into the server:
+
 ```bash
 ./bin/archiver import --config config.yaml
 ```
@@ -266,8 +268,9 @@ One Iceberg table holds every region (region is an ordinary column); the
 archiver tiers leaves a whole `ts` period at a time across **all** regions
 before advancing the shared hot/cold watermark, so a period only becomes cold
 once it is cold for every region. `id` mode is not supported in tiered mode
-(the cold tier is time-keyed). For why the ordering works that way, see
-[architecture_tiered.md → Two-level tiering](architecture_tiered.md#two-level-list-range-tiering).
+(the cold tier is time-keyed). For why the ordering works that way, see the
+[Two-level tiering](architecture_tiered.md#two-level-list-range-tiering)
+section of the Tiered Mode page.
 
 ## Mode 2 - Decoupled (Iceberg-Only)
 

@@ -256,6 +256,18 @@ this project adheres to
   run ignored `--expire-older-than` and the real run printed the
   `--expire-retain-last` value as the kept count. Both now count the snapshots
   the expiry keeps, the dry run from the staged metadata.
+- A nearest-neighbour search by negative inner product (`<#>`) on a tiered or
+  decoupled view failed with "syntax error at or near >" whenever DuckDB ran
+  it, since DuckDB has `<=>` and `<->` as operators of its own and no `<#>`.
+  The read now spells it as the function DuckDB has under the same name,
+  `list_negative_inner_product`; `<=>` and `<->` are unchanged.
+- Once a `DROP COLUMN` returned a tiered table to an earlier schema, the next
+  column change failed in the Iceberg mirror with "Attempted to add schema
+  with id N, but this already exists in the table!" and rolled back the
+  hot-side change with it, because duckdb-iceberg numbered each new schema one
+  above the current one. The base image's fifth duckdb-iceberg patch, a port
+  of upstream c1cfe2ef, numbers it above the highest schema id in the
+  metadata.
 
 ## [1.0.0-beta2] - 2026-08-08
 

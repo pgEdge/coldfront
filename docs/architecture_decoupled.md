@@ -27,9 +27,14 @@ this document, concern by concern:
 
 The coldfront extension provides the lazy catalog-attach glue: the C extension
 hook intercepts the first query that touches a tiered view (read or write) and,
-if the Iceberg catalog `ice` is not yet attached in this session, issues
-`duckdb.raw_query('ATTACH IF NOT EXISTS ''wh'' AS ice (TYPE ICEBERG, ENDPOINT ...)')`
-against the GUCs `coldfront.warehouse` and `coldfront.lakekeeper_endpoint`.
+if the Iceberg catalog `ice` is not yet attached in this session, issues the
+following against the GUCs `coldfront.warehouse` and
+`coldfront.lakekeeper_endpoint`:
+
+```sql
+duckdb.raw_query('ATTACH IF NOT EXISTS ''wh'' AS ice (TYPE ICEBERG, ENDPOINT ...)')
+```
+
 There is no connect-time setup - the attach happens on demand, transparently,
 the first time a session actually queries Iceberg.
 
@@ -194,41 +199,58 @@ DELETE FROM events WHERE id = 1;
 The fourth argument, `p_partition_cols`, is the table's Iceberg partitioning as
 a `text[]` of `PARTITIONED BY` terms, passed to DuckDB as written; the terms,
 and how a term with a comma or a quoted name is written in the array literal,
-are in [usage.md → Mode 2](usage.md#mode-2-decoupled-iceberg-only). DuckDB
-refuses an unknown transform, a bad argument or a column outside the schema at
-`CREATE TABLE`. The one check DuckDB leaves to the first `INSERT`, a time
-transform on a column that is not a timestamp or date (for `hour`, not a
-timestamp), `coldfront._partition_clause()` makes at the same point, while no
-table exists yet.
+are in the [Mode 2](usage.md#mode-2-decoupled-iceberg-only) section of the
+Using ColdFront guide. DuckDB refuses an unknown transform, a bad argument or a
+column outside the schema at `CREATE TABLE`. The one check DuckDB leaves to the
+first `INSERT`, a time transform on a column that is not a timestamp or date
+(for `hour`, not a timestamp), `coldfront._partition_clause()` makes at the
+same point, while no table exists yet.
 
 The helper performs the following steps:
 
 1. Creates the Iceberg namespace against Lakekeeper, idempotently, with
-   `duckdb.raw_query('CREATE SCHEMA IF NOT EXISTS ice."public"')`.
-2. Creates the Iceberg table with
-   `duckdb.raw_query('CREATE TABLE ice.public.<name> (col1 STORAGE_TYPE, …) PARTITIONED BY (…)')`.
-   Column types are validated by `coldfront._iceberg_storage_type()`, which
-   mirrors the canonical map in `cmd/archiver/main.go pgFormatTypeToDuckDB`.
-   Anything outside the supported set (see
-   [Supported Column Types](#supported-column-types) above) raises before any
-   DDL is issued.
-3. Creates the wrapper view with
-   `CREATE OR REPLACE VIEW <schema>.<name> AS SELECT r['col']::<view type> AS col, … FROM duckdb.query('SELECT * FROM ice.public.<name>') AS t(r)`.
-   The projection wraps the struct accessor so applications see flat columns.
-   Each column is cast to its view type where one exists (`json` for `jsonb`,
-   `interval`, `double precision`, `bytea`, `real[]` for vectors), and to its
-   storage type otherwise, so a `text` column reads as `character varying`. The
-   view reads via `duckdb.query()` so read-your-own-write inside an explicit
-   transaction works; pg_duckdb's planner folds it into the same `ICEBERG_SCAN`
-   plan with identical Parquet predicate pushdown, so there is no performance
-   cost.
+    `duckdb.raw_query('CREATE SCHEMA IF NOT EXISTS ice."public"')`.
+
+2. Creates the Iceberg table with the following statement:
+
+    ```sql
+    duckdb.raw_query('CREATE TABLE ice.public.<name> (col1 STORAGE_TYPE, …) PARTITIONED BY (…)')
+    ```
+
+    Column types are validated by `coldfront._iceberg_storage_type()`, which
+    mirrors the canonical map in `cmd/archiver/main.go pgFormatTypeToDuckDB`.
+    Anything outside the supported set (see
+    [Supported Column Types](#supported-column-types) above) raises before any
+    DDL is issued.
+
+3. Creates the wrapper view with the following statement:
+
+    ```sql
+    CREATE OR REPLACE VIEW <schema>.<name> AS
+    SELECT r['col']::<view type> AS col, …
+    FROM duckdb.query('SELECT * FROM ice.public.<name>') AS t(r)
+    ```
+
+    The projection wraps the struct accessor so applications see flat columns.
+    Each column is cast to its view type where one exists (`json` for `jsonb`,
+    `interval`, `double precision`, `bytea`, `real[]` for vectors), and to its
+    storage type otherwise, so a `text` column reads as `character varying`.
+    The view reads via `duckdb.query()` so read-your-own-write inside an
+    explicit transaction works; pg_duckdb's planner folds it into the same
+    `ICEBERG_SCAN` plan with identical Parquet predicate pushdown, so there is
+    no performance cost.
+
 4. Registers the row in `coldfront.tiered_views` with `is_iceberg_only = true`.
-   The C-side `post_parse_analyze_hook` reads this flag and short-circuits
-   `classify_tier()` to `TIER_COLD` for any `INSERT`/`UPDATE`/`DELETE` on the
-   wrapper view, regardless of WHERE clause or watermark - so every write
-   rewrites cleanly into a single
-   `SELECT coldfront._exec_iceberg_with_claim(<ref>, 'INSERT/UPDATE/DELETE ice.public.<name> …')`.
-   The hook is the dispatch path.
+    The C-side `post_parse_analyze_hook` reads this flag and short-circuits
+    `classify_tier()` to `TIER_COLD` for any `INSERT`/`UPDATE`/`DELETE` on the
+    wrapper view, regardless of WHERE clause or watermark - so every write
+    rewrites cleanly into a single call:
+
+    ```sql
+    SELECT coldfront._exec_iceberg_with_claim(<ref>, 'INSERT/UPDATE/DELETE ice.public.<name> …')
+    ```
+
+    The hook is the dispatch path.
 
 Writes through the wrapper view behave as follows:
 
@@ -745,8 +767,9 @@ SELECT coldfront.ensure_replicated();
 The call is idempotent. It puts every ColdFront table that replicates by value
 in the node's default repset: the two bakery tables, the registry and the
 watermark, the storage secret, the lifecycle config and the vector routing
-state (the list and the reason for each table are in
-[usage.md → Distributed Setup](usage.md#what-coldfrontensure_replicated-does)).
+state (the list and the reason for each table are in the
+[Distributed Setup](usage.md#what-coldfrontensure_replicated-does) section of
+the Using ColdFront guide).
 If it has not run on a peer, that peer's ack `INSERT`s are local-only and never
 replicate back to the originating writer: every claim on the originator waits
 at the ack barrier for an ack that never arrives.
@@ -767,9 +790,10 @@ Decoupled (iceberg-only) is the right choice when:
   analytic reads run substantially faster than PG heap on shape-matched
   workloads).
 - Operational simplicity outweighs ergonomics: no archiver cron, no watermark,
-  no autovacuum-vs-cutover lock conflict (see
-  [architecture_tiered.md → Tiered-Specific Limitations](architecture_tiered.md#tiered-specific-limitations)),
-  no PK rebuild after bulk load, no partition-management script.
+  no autovacuum-vs-cutover lock conflict (see the
+  [Tiered-Specific Limitations](architecture_tiered.md#tiered-specific-limitations)
+  section of the Tiered Mode page), no PK rebuild after bulk load, no
+  partition-management script.
 - You can accept that cold reads in one transaction share one Iceberg snapshot,
   even at READ COMMITTED (see [Limitations](#limitations)). Tables created via
   `create_iceberg_table()` are queried with plain SQL through the wrapper view;

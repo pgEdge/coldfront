@@ -8,7 +8,8 @@ Postgres.
 
 This walkthrough targets a real cloud S3 service that uses virtual-hosted
 addressing. For a path-style S3-compatible store (MinIO, SeaweedFS) or GCS, see
-[usage.md → Storage Backends](usage.md#storage-backends) instead.
+the [Storage Backends](usage.md#storage-backends) section of the Using
+ColdFront guide instead.
 
 No prior ColdFront knowledge is assumed. Copy and paste the commands from top
 to bottom. The examples use the following placeholders throughout: bucket
@@ -221,14 +222,15 @@ curl -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
   -d '{"namespace":["public"]}'
 ```
 
-> **Why this step is required (decoupled mode).**
-> `coldfront.create_iceberg_table()` (Section 5) runs `CREATE SCHEMA` and
-> `CREATE TABLE` in one transaction. The schema create is deferred to COMMIT
-> but the table-create POST is sent immediately, so against a namespace-less
-> warehouse it fails with HTTP 404. Pre-creating `public` makes the
-> in-transaction `CREATE SCHEMA IF NOT EXISTS` a no-op. (Tiered mode's archiver
-> creates the namespace itself, so this is only needed for the decoupled demo
-> below.)
+!!! note "Why this step is required (decoupled mode)"
+
+    `coldfront.create_iceberg_table()` (Section 5) runs `CREATE SCHEMA` and
+    `CREATE TABLE` in one transaction. The schema create is deferred to COMMIT
+    but the table-create POST is sent immediately, so against a namespace-less
+    warehouse it fails with HTTP 404. Pre-creating `public` makes the
+    in-transaction `CREATE SCHEMA IF NOT EXISTS` a no-op. (Tiered mode's
+    archiver creates the namespace itself, so this is only needed for the
+    decoupled demo below.)
 
 ---
 
@@ -249,11 +251,12 @@ CREATE EXTENSION IF NOT EXISTS coldfront;
 -- image - the patched iceberg extension ships preplaced and autoloads on ATTACH.
 ```
 
-> **`CREATE EXTENSION coldfront` is required and easy to miss.** The image
-> preloads the `coldfront` shared library, but preloading does not register the
-> extension's schema and functions in your database - you must
-> `CREATE EXTENSION` it once. Skip that step and the next call fails with
-> `schema "coldfront" does not exist`.
+!!! warning "CREATE EXTENSION coldfront is required and easy to miss"
+
+    The image preloads the `coldfront` shared library, but preloading does not
+    register the extension's schema and functions in your database - you must
+    `CREATE EXTENSION` it once. Skip that step and the next call fails with
+    `schema "coldfront" does not exist`.
 
 Set the cold-tier S3 credential once. The signature is
 `set_storage_secret(key_id, secret, endpoint, region, url_style, use_ssl)`; the
@@ -263,11 +266,12 @@ last four default to `NULL`, `'us-east-1'`, `'path'`, `false`:
 SELECT coldfront.set_storage_secret('AKIAEXAMPLE...', '<your-secret-key>', NULL, 'eu-west-1');
 ```
 
-> **The 3rd argument (endpoint) must be `NULL` for a cloud S3 endpoint** - that
-> selects DuckDB's native per-Region virtual-hosted + HTTPS addressing. The 4th
-> argument is your bucket's region, from which DuckDB derives the endpoint. The
-> SeaweedFS form you may have seen elsewhere passes a non-NULL endpoint and no
-> region - do **not** use that shape for cloud S3.
+!!! warning "The 3rd argument (endpoint) must be NULL for a cloud S3 endpoint"
+
+    A `NULL` endpoint selects DuckDB's native per-Region virtual-hosted + HTTPS
+    addressing. The 4th argument is your bucket's region, from which DuckDB
+    derives the endpoint. The SeaweedFS form you may have seen elsewhere passes
+    a non-NULL endpoint and no region - do **not** use that shape for cloud S3.
 
 ---
 

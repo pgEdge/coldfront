@@ -103,9 +103,10 @@ The following table describes each component, its role, and its license:
 | Archiver (tiered mode) | Moves rows from hot to cold; this Go binary is a thin SQL orchestrator that cron invokes. | PostgreSQL |
 
 How rows move through this depends on the storage mode: the tiered hot heap +
-archiver + `UNION ALL` data-flow is in
-[architecture_tiered.md → Data Flow](architecture_tiered.md#data-flow); the
-all-Iceberg flow is in [architecture_decoupled.md](architecture_decoupled.md).
+archiver + `UNION ALL` data-flow is in the
+[Data Flow](architecture_tiered.md#data-flow) section of the Tiered Mode page;
+the all-Iceberg flow is in
+[architecture_decoupled.md](architecture_decoupled.md).
 
 ## Core Mechanics: pg_duckdb
 
@@ -255,8 +256,9 @@ The same parse-analyze hook prepares a `SELECT` that DuckDB will run, wherever
 in the statement the view is named (a CTE, a sub-select, a set-operation
 branch): `date_bin`, the `::jsonb` cast, `jsonb_array_length` and the JSON
 builders (`jsonb_build_object`, `jsonb_agg` and their `json_` twins) are
-rewritten into spellings both engines accept (see
-[usage.md → Supported Column Types](usage.md#supported-column-types)). A
+rewritten into spellings both engines accept (see the
+[Supported Column Types](usage.md#supported-column-types) section of the Using
+ColdFront guide). A
 `planner_hook` folds bound parameters into such a read before pg_duckdb plans
 it when a parameter sits where DuckDB cannot type a placeholder (a direct
 argument of a pg_duckdb function, any argument of a table function); the plan
@@ -265,7 +267,8 @@ above any custom plan, so under the plan cache's cost-based selection the read
 is planned from its values on every execution.
 `plan_cache_mode = force_generic_plan` bypasses that selection and picks the
 value-less generic plan, which fails with `only works with DuckDB execution`
-(see [usage.md → Supported Column Types](usage.md#supported-column-types)).
+(see the [Supported Column Types](usage.md#supported-column-types) section of
+the Using ColdFront guide).
 
 The following table maps each operation to its interface and routing path:
 
@@ -284,8 +287,9 @@ How the hook splits a write is mode-specific:
 
 - In tiered mode, the hook routes by the partition-column watermark - hot heap
   vs cold Iceberg, with dual-tier writes for ambiguous predicates. See
-  [architecture_tiered.md → Transparent `INSERT`](architecture_tiered.md#transparent-insert)
-  and [→ `UPDATE`/`DELETE`](architecture_tiered.md#transparent-updatedelete).
+  [Transparent `INSERT`](architecture_tiered.md#transparent-insert) and
+  [Transparent `UPDATE`/`DELETE`](architecture_tiered.md#transparent-updatedelete)
+  in the Tiered Mode page.
 - In decoupled mode, the hook always classifies `TIER_COLD`, so every write is
   a single-tier Iceberg write. See
   [architecture_decoupled.md](architecture_decoupled.md).
@@ -340,9 +344,9 @@ ColdFront coordinates concurrent writes across the cluster as follows:
   `coldfront._exec_iceberg_with_claim`, which holds a globally-ordered
   Snowflake ticket via the Spock-replicated `coldfront.claims` table and waits
   for its turn before issuing the iceberg commit. There are no 409s and no
-  app-level retry. See
-  [architecture_decoupled.md → Concurrency](architecture_decoupled.md#concurrency-horizontal-scaling-the-bakery-protocol)
-  for the full design and benchmarks.
+  app-level retry. See the
+  [Concurrency](architecture_decoupled.md#concurrency-horizontal-scaling-the-bakery-protocol)
+  section of the Decoupled Mode page for the full design and benchmarks.
 
 ### Cold-Write Strategy: Stock vs Patched duckdb-iceberg
 
@@ -417,8 +421,9 @@ to be usable on a peer is covered next.
 
 The tiered-specific cross-node behavior - what replicates so a tiered table is
 usable on every peer, and why both the registry and the watermark join the
-replication set - is in
-[architecture_tiered.md → Tiered Tables in a Spock Mesh](architecture_tiered.md#tiered-tables-in-a-spock-mesh).
+replication set - is in the
+[Tiered Tables in a Spock Mesh](architecture_tiered.md#tiered-tables-in-a-spock-mesh)
+section of the Tiered Mode page.
 
 ### Registry Keying: By Name, Not OID
 
@@ -441,8 +446,9 @@ The name also **replicates cleanly across a Spock mesh**: it is
 node-independent, so the registry row is identical on every node and the
 replication set copies it by value (an OID is node-local and could not be).
 That is what makes cross-node tiered tables work with no per-node
-re-resolution - see
-[architecture_tiered.md → Tiered Tables in a Spock Mesh](architecture_tiered.md#tiered-tables-in-a-spock-mesh).
+re-resolution - see the
+[Tiered Tables in a Spock Mesh](architecture_tiered.md#tiered-tables-in-a-spock-mesh)
+section of the Tiered Mode page.
 
 Lower-level operations that genuinely need an OID - catalog lookups, the DDL
 hook matching the hot heap - resolve name→OID via `to_regclass` /
@@ -505,8 +511,9 @@ in [usage.md](usage.md#managing-partitioned-tables-cli).
 
 These apply to both storage modes. Tiered-only limitations (cold `RETURNING`,
 dual-tier command tag, crash-safety of permissive writes, partition-scheme
-constraints, autovacuum-vs-cutover) are in
-[architecture_tiered.md → Tiered-Specific Limitations](architecture_tiered.md#tiered-specific-limitations).
+constraints, autovacuum-vs-cutover) are in the
+[Tiered-Specific Limitations](architecture_tiered.md#tiered-specific-limitations)
+section of the Tiered Mode page.
 
 The cross-cutting limitations are:
 
@@ -705,8 +712,8 @@ the subdirectories whose PID no live backend holds, removing their spill files
 and the directory and reporting what that freed. That sweep runs once per
 session and costs single-digit milliseconds per spill file, so even a directory
 abandoned with 600 GB in it (about 600 files at DuckDB's file size) is a couple
-of seconds on the one statement that finds it. See
-[usage.md → Tuning Knobs](usage.md#tuning-knobs).
+of seconds on the one statement that finds it. See the
+[Tuning Knobs](usage.md#tuning-knobs) section of the Using ColdFront guide.
 
 The PID is what makes that reclaim possible, and is why ColdFront does not
 apply pg_duckdb#887, which names the directory with a random uuid and removes
