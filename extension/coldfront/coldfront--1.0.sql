@@ -3623,15 +3623,19 @@ BEGIN
     --   (b) Peer-ack: every ALIVE peer must have acked my ticket.
     --       "Alive" = walsender row in pg_stat_replication is
     --       state='streaming' with reply_time within
-    --       coldfront.peer_alive_window_ms (default 5 s). A peer that
-    --       is stale (heartbeat gone past the window) is implicitly
-    --       treated as already-acked — this is R-A's dead-peer escape,
-    --       the only way out of waiting indefinitely. There is no
-    --       separate timeout: a peer that hasn't acked while alive is
-    --       either deferring (legitimate per R-A's defer rule) or
-    --       going to ack imminently. A same-node claim is released by
-    --       the C XactCallback in coldfront.c at commit or abort, and one
-    --       whose owner is gone is removed by the reaper.
+    --       coldfront.peer_alive_window_ms (default 5 s). reply_time is
+    --       the peer's apply-worker feedback: sent after it applies, every
+    --       spock.feedback_frequency messages, and in answer to the
+    --       walsender's keepalive, every wal_sender_timeout/2 (30 s by
+    --       default) on an idle link. A peer whose last reply is older
+    --       than the window is implicitly treated as already-acked: this
+    --       is R-A's dead-peer escape, the only way out of waiting
+    --       indefinitely. There is no separate timeout: a peer that
+    --       hasn't acked while alive is either deferring (legitimate per
+    --       R-A's defer rule) or going to ack imminently. A same-node
+    --       claim is released by the C XactCallback in coldfront.c at
+    --       commit or abort, and one whose owner is gone is removed by
+    --       the reaper.
     LOOP
         EXIT WHEN NOT EXISTS (
             SELECT 1 FROM coldfront.claims c

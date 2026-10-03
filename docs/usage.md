@@ -1058,11 +1058,6 @@ spock.include_ddl_repset = on
 # without the setting refuses to start with this line in place.
 output_plugin_libraries = 'pgoutput, test_decoding, spock_output'
 
-# Spock's apply worker does not read this setting: on an idle link,
-# pg_stat_replication.reply_time refreshes only on the walsender's
-# reply-requested keepalive, every wal_sender_timeout/2 (30 s by default).
-wal_receiver_status_interval = 1s
-
 # Per-node - any distinct integer 1..1023 (must be unique per node; the value
 # is otherwise arbitrary - the bakery matches acks by spock node name, not by id).
 snowflake.node = 1
@@ -1090,10 +1085,14 @@ The bakery has no peer-ack timeout. R-A's only failure mode is a dead peer
 (would wait forever), closed by a liveness check inside the wait-loop: a peer
 whose `pg_stat_replication.reply_time` is older than
 `coldfront.peer_alive_window_ms` (superuser-only, default `5000`) is implicitly
-treated as already-acked. Raise this on slow/lossy WAN links if false-positive
-dead-peer rulings become a problem. An alive peer that has not acked is either
-deferring legitimately (R-A's defer rule) or about to ack - either way, waiting
-is correct, not a failure.
+treated as already-acked. `reply_time` is refreshed by the peer's apply
+worker's feedback: after it applies, every `spock.feedback_frequency` messages,
+and in answer to the walsender's keepalive, which on an idle link comes every
+`wal_sender_timeout/2` (30 s by default); `wal_receiver_status_interval` plays
+no part, since Spock's apply worker does not read it. Raise the window on
+slow or lossy WAN links if false-positive dead-peer rulings become a problem.
+An alive peer that has not acked is either deferring legitimately (R-A's defer
+rule) or about to ack - either way, waiting is correct, not a failure.
 
 A claim whose owner is gone (a hard backend crash) is reaped without operator
 action: by that node's next cold write, to any table, by a peer's arriving

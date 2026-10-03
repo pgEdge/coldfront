@@ -102,7 +102,6 @@ max_replication_slots = 64
 max_wal_senders = 64
 track_commit_timestamp = on
 synchronous_commit = local
-wal_receiver_status_interval = 1s
 spock.conflict_resolution = last_update_wins
 spock.enable_ddl_replication = on
 spock.allow_ddl_from_functions = on

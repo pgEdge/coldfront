@@ -652,7 +652,11 @@ pointing at the same Lakekeeper endpoint and S3 bucket:
     peer (would block forever), and ColdFront closes it via a liveness check on
     `pg_stat_replication.reply_time`: a peer whose walsender has been silent
     longer than `coldfront.peer_alive_window_ms` (default 5000 ms; tune up on
-    slow/lossy WAN links) is implicitly treated as already-acked. An *alive*
+    slow/lossy WAN links) is implicitly treated as already-acked. The reply is
+    the peer's apply-worker feedback, sent after it applies, every
+    `spock.feedback_frequency` messages, and in answer to the walsender's
+    keepalive, which on an idle link comes every `wal_sender_timeout/2` (30 s
+    by default); `wal_receiver_status_interval` plays no part. An *alive*
     peer that has not acked is either deferring (R-A's defer rule, legitimate)
     or about to ack - either way, waiting is correct. A same-node claim is
     released by the C XactCallback in
@@ -692,11 +696,6 @@ settings:
 # postgresql.conf - server-wide
 wal_level = logical
 shared_preload_libraries = 'snowflake,spock,pg_duckdb,coldfront'
-
-# Spock's apply worker does not read this setting: on an idle link,
-# pg_stat_replication.reply_time refreshes only on the walsender's
-# reply-requested keepalive, every wal_sender_timeout/2 (30 s by default).
-wal_receiver_status_interval = 1s
 
 # Sync-rep is NOT required by the bakery - R-A's ack barrier replaces it.
 ```

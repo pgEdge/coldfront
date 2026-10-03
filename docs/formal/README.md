@@ -395,11 +395,14 @@ correctness:
   represents as an atomic conditional update of a sequence head.
 - pg_duckdb internals (the transaction-event order is a *premise*: pg_duckdb
   commits at PRE_COMMIT, before coldfront's release at COMMIT).
-- Spock walsender / heartbeat cadence (wal_sender_timeout/2 ≈ 30 s default
-  keepalive cadence; reply_time freshness in the wait loop's dead-peer check
-  uses `coldfront.peer_alive_window_ms`, default 5 s, a threshold which works
-  in active clusters but degrades to the keepalive cadence floor for
-  idle-then-crashed peers).
+- The reply cadence behind the wait loop's dead-peer check. `NodeLive` is
+  exact in the model; the code rules a peer dead when its walsender's
+  `reply_time` is older than `coldfront.peer_alive_window_ms` (default 5 s),
+  and that reply is the apply worker's feedback: after applying, every
+  `spock.feedback_frequency` messages, and in answer to the walsender's
+  keepalive, every `wal_sender_timeout/2` (30 s by default) on an idle link.
+  So on an idle link a live peer's last reply can be older than the window,
+  which the model does not represent.
 - DuckDB's pglocal connection-keepalive behavior. The bakery does not use
   pglocal; the archiver's Phase 3 does, but Phase 3 is a separate code path
   with its own CI test (the race-window regression in `ci/journey.sh` story 9).
