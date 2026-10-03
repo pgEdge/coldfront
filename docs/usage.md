@@ -1100,8 +1100,8 @@ state (a peer that has just reconnected is catching up and still alive). The
 peer's apply worker sends that reply after it applies, every
 `spock.feedback_frequency` messages, and in answer to the walsender's
 keepalive; `wal_receiver_status_interval` plays no part, since Spock's apply
-worker does not read it. The window and `wal_sender_timeout` form a pair; set
-them together as [Timeouts](#timeouts) below describes. An alive peer that has
+worker does not read it. The window and `wal_sender_timeout` go together; set
+them as [Timeouts](#timeouts) below describes. An alive peer that has
 not acked is either deferring legitimately (R-A's defer rule) or about to
 ack, and waiting for it is correct, not a failure.
 
@@ -1170,8 +1170,8 @@ The rule: half of `wal_sender_timeout` must stay below the window, with a
 round trip to spare; the claim enforces the first part. An idle peer replies
 only when the walsender asks, so the
 PostgreSQL default of 60 s against a 10 s window would rule a live idle peer
-dead; a claim refuses to run with such a pair and names both settings. With
-the recommended pair a writer waits at most 10 s for a peer that is really
+dead; a claim refuses to run with such settings and names both. With the
+recommended values a writer waits at most 10 s for a peer that is really
 dead, and the walsender disconnects a peer silent for 15 s, which then
 reconnects on its own.
 

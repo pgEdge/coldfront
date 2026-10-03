@@ -3030,7 +3030,7 @@ story_mesh_multiwriter() {
 # once it answers again (TC-223).
 # ───────────────────────────────────────────────────────────────────────────
 story_mesh_dead_peer() {
-    step "12f. Mesh: the dead-peer test (timeout pairing, idle replies, a silent peer)"
+    step "12f. Mesh: the dead-peer test (the two timeouts, idle replies, a silent peer)"
     local PARR; read -ra PARR <<< "$PEERS"
     [ "${#PARR[@]}" -ge 1 ] || { fail "mesh: no --peers given"; return; }
     local p1="${PARR[0]}" npeers="${#PARR[@]}" tbl out i sample
@@ -3044,7 +3044,7 @@ story_mesh_dead_peer() {
     }
     local alive_sql="SELECT count(*) FILTER (WHERE reply_time > now() - make_interval(secs => current_setting('coldfront.peer_alive_window_ms')::int / 1000.0)) || '/' || count(*) FROM pg_stat_replication;"
     local window; window=$(q "$HOST" "SHOW coldfront.peer_alive_window_ms;")
-    assert_eq "TC-221: the image pairs wal_sender_timeout with the window" "15s" "$(q "$HOST" "SHOW wal_sender_timeout;")"
+    assert_eq "TC-221: the image sets wal_sender_timeout to 15s for the 10 s window" "15s" "$(q "$HOST" "SHOW wal_sender_timeout;")"
 
     # TC-221: a timeout of 60 s or 0 is refused by the claim, naming both settings.
     # ALTER SYSTEM cannot share a transaction block with the reload, so two calls,
@@ -7029,7 +7029,7 @@ story_drop_iceberg_table   # both modes, purge and keep-files (own throwaway tab
 [ "$MESH" = 1 ] && story_mesh_multiwriter   # >1 cold writer/node cross-node (tiered: events, decoupled: iceonly)
 [ "$MESH" = 1 ] && story_mesh_reaper        # orphan claims/acks reaped on the claim, apply and poke paths
 [ "$MESH" = 1 ] && story_mesh_claim_failures  # a failed claim step leaves no lock, claim or open loopback
-[ "$MESH" = 1 ] && story_mesh_dead_peer  # TC-221..223: timeout pairing refusal, idle replies inside the window, a silent peer ruled dead and rejoining
+[ "$MESH" = 1 ] && story_mesh_dead_peer  # TC-221..223: a wal_sender_timeout the window does not cover is refused, idle replies inside the window, a silent peer ruled dead and rejoining
 [ -n "$STANDBY" ]    && story_standby_reads
 
 summary

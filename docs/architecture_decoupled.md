@@ -657,7 +657,7 @@ pointing at the same Lakekeeper endpoint and S3 bucket:
     `spock.feedback_frequency` messages, and in answer to the walsender's
     keepalive, which on an idle link comes every `wal_sender_timeout/2`, so
     the claim refuses to run unless `wal_sender_timeout` is positive and
-    below twice the window; usage.md gives the default and the pairing. An
+    below twice the window; usage.md gives the default and the rule. An
     *alive*
     peer that has not acked is either deferring (R-A's defer rule, legitimate)
     or about to ack - either way, waiting is correct. A same-node claim is
@@ -699,7 +699,7 @@ settings:
 wal_level = logical
 shared_preload_libraries = 'snowflake,spock,pg_duckdb,coldfront'
 
-# Paired with coldfront.peer_alive_window_ms (see usage.md).
+# Set together with coldfront.peer_alive_window_ms (see usage.md).
 wal_sender_timeout = 15s
 
 # Sync-rep is NOT required by the bakery - R-A's ack barrier replaces it.
