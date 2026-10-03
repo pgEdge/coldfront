@@ -52,6 +52,14 @@ func verifyChecks(cfg *config.Config) []check {
 			       WHERE NOT vended AND storage_type = 's3' AND key_id = $1 AND secret = $2
 			         AND COALESCE(endpoint, '') = $3 AND region = $4 AND url_style = $5 AND use_ssl = $6)`})
 	}
+	return append(checks, catalogChecks(cfg)...)
+}
+
+// catalogChecks lists the checks for the iceberg keys a file sets. The settings
+// they name live in postgresql.conf, which an import cannot write, so `import`
+// runs them before it writes anything.
+func catalogChecks(cfg *config.Config) []check {
+	var checks []check
 	if cfg.Iceberg.Warehouse != "" {
 		checks = append(checks, check{what: "iceberg.warehouse", args: []any{cfg.Iceberg.Warehouse},
 			sql: `SELECT COALESCE(current_setting('coldfront.warehouse', true), '') = $1`})
@@ -67,7 +75,13 @@ func verifyChecks(cfg *config.Config) []check {
 // value it sets. It runs after `import` has written the file (when the two
 // agree by construction) and on every other run that was given a file.
 func Verify(ctx context.Context, db DBTX, cfg *config.Config) error {
-	for _, c := range verifyChecks(cfg) {
+	return runChecks(ctx, db, verifyChecks(cfg))
+}
+
+// runChecks runs the checks in order and refuses on the first value that
+// disagrees with the server, naming it.
+func runChecks(ctx context.Context, db DBTX, checks []check) error {
+	for _, c := range checks {
 		rows, err := db.Query(ctx, c.sql, c.args...)
 		if err != nil {
 			return fmt.Errorf("check %s against the server: %w", c.what, err)

@@ -84,8 +84,9 @@ USAGE:
   %s [--dsn <dsn>]        %s
   %s <command> [flags]    manage the partition_config table (any node; replicates on a mesh)
 
-The connection is --dsn or the libpq environment (PGHOST, PGDATABASE, PGUSER,
-PGPASSWORD, PGSERVICE), as for psql. Configuration lives in the server:
+The connection is --dsn, the file's postgres.dsn when --config is given, or
+the libpq environment (PGHOST, PGDATABASE, PGUSER, PGPASSWORD, PGSERVICE), as
+for psql. Configuration lives in the server:
 coldfront.partition_config, coldfront.storage_secret and the
 coldfront.warehouse and coldfront.lakekeeper_endpoint settings. A deployment
 YAML is for "import", which writes it into the server once; passed to any
@@ -944,9 +945,9 @@ exactly as `+"`register`"+` validates a single table (PK covers the partition ke
 retention exceeds hot-period). Its s3: or azure: stanza becomes the storage
 secret (coldfront.set_storage_secret). Its iceberg.warehouse and
 iceberg.lakekeeper_endpoint are checked against the server settings of the same
-name, which live in postgresql.conf. After the import the file and the server
-agree; from then on the server is the configuration, and a YAML passed to any
-run is refused if it disagrees.
+name, which live in postgresql.conf, before anything is written. After the
+import the file and the server agree; from then on the server is the
+configuration, and a YAML passed to any run is refused if it disagrees.
 
 USAGE:
   <binary> import --config <yaml> [--dsn <dsn>]
@@ -981,7 +982,8 @@ EXAMPLES:
 	return applyImport(ctx, d, cfg, *dryRun)
 }
 
-// applyImport connects, ensures the config table, then writes every table
+// applyImport connects, refuses a file whose iceberg keys disagree with the
+// server, ensures the config table, then writes every table
 // through writeRow — the same validated path `register` uses, so an imported
 // table is checked exactly as a singly-registered one (PK superset, retention
 // > hot). A failure names the offending table and stops the import. The
@@ -994,12 +996,15 @@ func applyImport(ctx context.Context, dsn string, cfg *config.Config, dryRun boo
 		return err
 	}
 	defer func() { _ = conn.Close(ctx) }()
+	// The iceberg keys name postgresql.conf settings the import cannot write, so
+	// a file that disagrees on them is refused before anything is written.
+	if err := runChecks(ctx, conn, catalogChecks(cfg)); err != nil {
+		return err
+	}
 	// dry-run is side-effect free: validate every table, touch nothing.
 	if dryRun {
-		for _, t := range tables {
-			if err := writeRow(ctx, conn, rowFrom(t), true); err != nil {
-				return fmt.Errorf("import %s: %w", t.SourceTable, err)
-			}
+		if err := writeRows(ctx, conn, tables, true); err != nil {
+			return err
 		}
 		fmt.Printf("dry-run OK: would import %d table(s) into coldfront.partition_config\n", len(tables))
 		return nil
@@ -1014,10 +1019,8 @@ func applyImport(ctx context.Context, dsn string, cfg *config.Config, dryRun boo
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	for _, t := range tables {
-		if err := writeRow(ctx, tx, rowFrom(t), false); err != nil {
-			return fmt.Errorf("import %s: %w", t.SourceTable, err)
-		}
+	if err := writeRows(ctx, tx, tables, false); err != nil {
+		return err
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return err
@@ -1027,6 +1030,17 @@ func applyImport(ctx context.Context, dsn string, cfg *config.Config, dryRun boo
 		return err
 	}
 	return Verify(ctx, conn, cfg)
+}
+
+// writeRows runs every table of an import through writeRow, naming the table
+// that fails. With dryRun it validates and writes nothing.
+func writeRows(ctx context.Context, db validateDB, tables []config.TableConfig, dryRun bool) error {
+	for _, t := range tables {
+		if err := writeRow(ctx, db, rowFrom(t), dryRun); err != nil {
+			return fmt.Errorf("import %s: %w", t.SourceTable, err)
+		}
+	}
+	return nil
 }
 
 // importSecret writes the file's cold-store stanza into the server through the

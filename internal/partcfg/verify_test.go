@@ -99,3 +99,13 @@ func TestImportSecret_NoStanza(t *testing.T) {
 	require.NoError(t, importSecret(context.Background(), db, &config.Config{}))
 	assert.Empty(t, db.execSQL)
 }
+
+func TestCatalogChecks_OnlyTheSettings(t *testing.T) {
+	checks := catalogChecks(verifyCfg())
+	require.Len(t, checks, 2)
+	assert.Equal(t, "iceberg.warehouse", checks[0].what)
+	assert.Equal(t, "iceberg.lakekeeper_endpoint", checks[1].what)
+	assert.Contains(t, checks[0].sql, "coldfront.warehouse', true), '') = $1")
+	assert.Contains(t, checks[1].sql, "coldfront.lakekeeper_endpoint', true), '') = $1")
+	assert.Empty(t, catalogChecks(&config.Config{}))
+}

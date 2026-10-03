@@ -30,7 +30,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib.sh"
 
 HOST=""; MODE="tiered"; MESH=0; PEERS=""; STANDBY=""
-DB_IP=""; SW_IP=""; LK_IP=""; WAREHOUSE="wh"
+DB_IP=""; SW_IP=""; LK_IP=""
 # Cold-store backend: s3 (default) or azure (ADLS Gen2, DuckDB 1.5.x stack). The
 # journey STORIES are storage-agnostic — only the secret call and the archiver
 # config block differ. Real azure creds come from env (never committed): the
@@ -59,7 +59,6 @@ while [ $# -gt 0 ]; do case "$1" in
   --db-ip) DB_IP="$2"; shift 2;;
   --sw-ip) SW_IP="$2"; shift 2;;
   --lk-ip) LK_IP="$2"; shift 2;;
-  --warehouse) WAREHOUSE="$2"; shift 2;;
   --backend) BACKEND="$2"; shift 2;;
   --azure-conn) AZURE_CONN="$2"; shift 2;;
   --archiver) ARCHIVER="$2"; shift 2;;
@@ -3052,7 +3051,7 @@ story_mesh_dead_peer() {
     # and the new value is confirmed before the write (the reload is a signal).
     set_wst() {  # set_wst <ALTER SYSTEM clause> <expected SHOW value>
         q "$HOST" "ALTER SYSTEM $1;" >/dev/null; q "$HOST" "SELECT pg_reload_conf();" >/dev/null
-        local j; for j in $(seq 1 20); do [ "$(q "$HOST" "SHOW wal_sender_timeout;")" = "$2" ] && return 0; sleep 0.5; done
+        for _ in $(seq 1 20); do [ "$(q "$HOST" "SHOW wal_sender_timeout;")" = "$2" ] && return 0; sleep 0.5; done
         return 1
     }
     if set_wst "SET wal_sender_timeout = '60s'" 1min; then pass "TC-221: wal_sender_timeout set to 60 s for the test (SHOW prints 1min)"; else fail "TC-221: could not set wal_sender_timeout to 60 s"; fi
@@ -5074,6 +5073,33 @@ EOF
             "$(q "$HOST" "SELECT key_id || '|' || endpoint FROM coldfront.storage_secret;")"
         q "$HOST" "$(storage_secret_sql)" >/dev/null
     fi
+    # TC-226: a file whose iceberg keys disagree with the server is refused before
+    # anything is written, with or without --dry-run: those settings live in
+    # postgresql.conf, which the import cannot write, so it cannot make them agree.
+    cat >"$TMPD/catdrift.yaml" <<'EOYAML'
+iceberg:
+  warehouse: "not-the-server-warehouse"
+archiver:
+  tables:
+    - source_table: cli_catdrift
+      partition_period: monthly
+      retention_period: "12 months"
+EOYAML
+    q "$HOST" "CREATE TABLE IF NOT EXISTS cli_catdrift (id bigint, ts timestamptz NOT NULL, PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);" >/dev/null 2>&1
+    if "$PARTITIONER" import --config "$TMPD/catdrift.yaml" >"$TMPD/catdrift.log" 2>&1; then
+        fail "TC-226: import accepted a YAML whose iceberg.warehouse disagrees with the server"
+    else
+        pass "TC-226: import refuses a YAML whose iceberg.warehouse disagrees with the server"
+    fi
+    assert_contains "TC-226: the refusal names the key" "iceberg.warehouse in the YAML" "$(cat "$TMPD/catdrift.log")"
+    assert_eq "TC-226: the refused file wrote no table row" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name = 'cli_catdrift';")"
+    if "$PARTITIONER" import --config "$TMPD/catdrift.yaml" --dry-run >"$TMPD/catdrift-dry.log" 2>&1; then
+        fail "TC-226: a dry run accepted the same file"
+    else
+        pass "TC-226: a dry run refuses the same file"
+    fi
+    q "$HOST" "DROP TABLE IF EXISTS cli_catdrift;" >/dev/null 2>&1
     q "$HOST" "DELETE FROM coldfront.partition_config WHERE schema_name='impexp'; DROP SCHEMA impexp CASCADE;" >/dev/null 2>&1
 }
 
