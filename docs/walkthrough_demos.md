@@ -1066,8 +1066,9 @@ docker compose \
   down -v
 ```
 
-The `-v` flag removes the named volumes (`pgdata` and `s3data`). Omit the flag
-to keep the data for a later session.
+The `-v` flag removes the named volumes: `pgdata` (PostgreSQL), `lkdata` (the
+Lakekeeper catalog) and `s3data` (the object store). Omit the flag to keep the
+data for a later session.
 
 If you ran the distributed demo, tear down its separate mesh stack too:
 

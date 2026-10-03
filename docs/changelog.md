@@ -221,6 +221,10 @@ this project adheres to
   move read the Iceberg table through the catalog's table entry
   (`duckdb.query`), as a decoupled view does; the plan is the same
   `ICEBERG_SCAN` with the same pushdown.
+- The walkthrough's Lakekeeper database had no named volume, so `docker compose
+  down` without `-v` kept the PostgreSQL and object-store data and lost the
+  catalog: the next `up` had no warehouse and no table metadata. It has the
+  `lkdata` volume, and the teardown text names it.
 
 ## [1.0.0-beta2] - 2026-08-08
 

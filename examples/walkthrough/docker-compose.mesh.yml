@@ -77,6 +77,8 @@ services:
             POSTGRES_USER: lakekeeper
             POSTGRES_PASSWORD: lakekeeper
             POSTGRES_DB: lakekeeper
+        volumes:
+            - lkdata:/var/lib/postgresql/data
         healthcheck:
             test: ["CMD-SHELL", "pg_isready -U lakekeeper"]
             interval: 3s
@@ -116,4 +118,5 @@ services:
 volumes:
     pgdata1:
     pgdata2:
+    lkdata:
     s3data:
