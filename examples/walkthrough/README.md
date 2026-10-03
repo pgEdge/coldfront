@@ -53,8 +53,7 @@ examples/walkthrough/
 ├── Dockerfile.archiver     # Archiver + partitioner image (builds from source)
 ├── seaweedfs-s3.json       # SeaweedFS S3 gateway credentials
 └── config/
-    ├── archiver.yaml       # Archiver config (30-day tiering threshold)
-    └── partitioner.yaml    # Partitioner config (DSN + connection settings)
+    └── archiver.yaml       # Import input: the events table, 30-day hot window
 ```
 
 ### install.sh

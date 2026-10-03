@@ -1162,7 +1162,7 @@ together, on every node:
 | Setting | Recommended | Where | What it does |
 |---|---|---|---|
 | `wal_sender_timeout` | `15s` | `postgresql.conf` on every node; the image sets it in mesh mode | The node's walsender asks each peer for a reply after half of it (7.5 s) and drops a peer that has not replied for the whole of it. |
-| `coldfront.peer_alive_window_ms` | `10000` (the default) | `postgresql.conf`, superuser-only | A peer whose last reply is older than this is treated as dead, and its ack is no longer waited for. |
+| `coldfront.peer_alive_window_ms` | `10000` (the default) | `postgresql.conf`, superuser-only | A peer whose last reply is older than this is treated as dead, and its ack is not waited for. |
 
 The rule is: half of `wal_sender_timeout`, plus a round trip, below the
 window. An idle peer replies only when the walsender asks, so the PostgreSQL

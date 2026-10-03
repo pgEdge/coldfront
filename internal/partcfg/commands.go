@@ -937,7 +937,7 @@ func runImport(ctx context.Context, args []string) error {
 	dsn := fs.String("dsn", "", "connection DSN (default: postgres.dsn from --config, else the libpq environment)")
 	printSQL := fs.Bool("print-sql", false, "print the INSERTs instead of running them")
 	dryRun := fs.Bool("dry-run", false, "validate/parse but make no changes")
-	fs.Usage = simpleUsage(fs, "import", `import — write a deployment YAML into the server, once.
+	fs.Usage = simpleUsage(fs, "import", `import: write a deployment YAML into the server, once.
 
 Its archiver.tables become coldfront.partition_config rows, each validated
 exactly as `+"`register`"+` validates a single table (PK covers the partition key;

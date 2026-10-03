@@ -2799,8 +2799,8 @@ EOSQL
 # DuckDB statement, and duckdb-iceberg resolves an attached table as of that
 # transaction's start, so a commit by another session after the transaction's
 # first cold read stays invisible until the transaction ends. usage.md states it
-# under Caveats; this check pins it, so a pin bump that changes it fails here and
-# the docs are revisited.
+# under Caveats; this check pins it, so a pin bump that changes it fails here,
+# which is the cue to change the docs.
 # ───────────────────────────────────────────────────────────────────────────
 story_snapshot_pinned() {
     step "TC-224: a transaction keeps the snapshot of its first cold read"
@@ -4633,8 +4633,6 @@ story_partitioner_after_swap() {
     # _events is the partitioned hot table.
     assert_eq "precondition — events is a view"       "v" "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='events'  AND relnamespace='public'::regnamespace;")"
     assert_eq "precondition — _events is partitioned" "p" "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='_events' AND relnamespace='public'::regnamespace;")"
-    local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
-    printf 'postgres: { dsn: "%s" }\n' "$dsn" > $TMPD/partitioner.yaml
     # events is archiver-owned (tiered). Temporarily make it partition-only so the
     # standalone partitioner manages it and premakes a wide future window (6, vs the
     # archiver's 3) — proving it resolves the events VIEW to the real _events table
