@@ -106,12 +106,12 @@ CREATE OR REPLACE VIEW events AS
 
 The rename is conditional, so it converts the table on the first run and no-ops
 afterwards; the `CREATE OR REPLACE VIEW` keeps the view's OID across runs. The
-C hook rewrites an INSERT on the view by the watermark cutoff, into a hot
-INSERT of the at/after-cutoff rows into `_events` and the cold sink for the
+C hook rewrites an `INSERT` on the view by the watermark cutoff, into a hot
+`INSERT` of the at/after-cutoff rows into `_events` and the cold sink for the
 older rows, and the utility hook feeds a `COPY FROM` into the same rewrite in
 batches. An `INSERT` nested in a `WITH` entry is rewritten in place, and a
-`MERGE` runs on the tier its `ON` condition bounds. The view has no INSTEAD OF
-trigger, so a write the hook does not handle fails in PostgreSQL.
+`MERGE` runs on the tier its `ON` condition bounds. The view has no
+`INSTEAD OF` trigger, so a write the hook does not handle fails in PostgreSQL.
 
 ### The Archive Pipeline
 
@@ -142,10 +142,10 @@ six-phase pipeline:
    an UNLOGGED delta table to the partition, so writes that land during the
    export are recorded for replay.
 
-2. The bulk export copies the partition PG → Iceberg under a captured snapshot,
-   using the temp table bridge (see
+2. The bulk export copies the partition PG → Iceberg under a captured
+   snapshot, using the temp table bridge (see
    [architecture.md → Temp Table Bridge](architecture.md#temp-table-bridge-pg-iceberg))
-   and a single bakery-claimed Iceberg INSERT. Each cycle has already created
+   and a single bakery-claimed Iceberg `INSERT`. Each cycle has already created
    the Iceberg namespace and table, if missing, before the per-partition loop.
 
 3. Delta replay (`replay_archive_delta`) applies the delta rows the export
@@ -251,11 +251,11 @@ the flat path.
 
 `id` mode is not available here: the cold tier is keyed by time.
 
-## Transparent INSERT
+## Transparent `INSERT`
 
 The `post_parse_analyze_hook` (see
 [architecture.md → Application Interface](architecture.md#application-interface))
-intercepts INSERT on a registered tiered view and rewrites it into a single
+intercepts `INSERT` on a registered tiered view and rewrites it into a single
 statement that splits the input by the partition-column watermark:
 
 ```sql
@@ -304,17 +304,17 @@ ids come from the source data.
 A `WITH` clause on the `INSERT` keeps its entries at the top of the rewritten
 statement, ahead of the three above, so an entry that modifies data (`WITH
 moved AS (DELETE FROM staging RETURNING …) INSERT INTO events SELECT … FROM
-moved`) stays where PostgreSQL allows one. An `INSERT` nested in a `WITH`
-entry (`WITH i AS (INSERT INTO events …) SELECT …`) is rewritten in place: the
+moved`) stays where PostgreSQL allows one. An `INSERT` nested in a `WITH` entry
+(`WITH i AS (INSERT INTO events …) SELECT …`) is rewritten in place: the
 hot `INSERT` becomes the entry's body, and `coldfront_source` and
 `coldfront_cold`, the latter as a data-modifying entry so that it always runs,
 are lifted into the statement's `WITH` list just before it. With a watermark a
 row may go cold, so `RETURNING` on such an entry is refused as on a top-level
 `INSERT`; without one every row is hot and `RETURNING` works. An `UPDATE` or
 `DELETE` nested in a `WITH` entry takes the path of a top-level one the same
-way: a hot one is a plain swap that keeps `RETURNING`, a cold one is the
-anchor `UPDATE` that runs the DuckDB write, and a dual-tier one has its cold
-half lifted into the statement's `WITH` list. What runs in DuckDB cannot read
+way: a hot one is a plain swap that keeps `RETURNING`, a cold one is the anchor
+`UPDATE` that runs the DuckDB write, and a dual-tier one has its cold half
+lifted into the statement's `WITH` list. What runs in DuckDB cannot read
 another `WITH` entry, since DuckDB does not see them, and a cross-tier move
 cannot be a `WITH` entry. A statement may write a tiered view once, and a
 nested write may not have a `WITH` clause of its own.
@@ -323,50 +323,49 @@ A `MERGE INTO events` (PostgreSQL 17 and later; 16 allows `MERGE` on tables
 alone and fails in parse analysis, before the hook) runs on the tier its `ON`
 condition bounds the partition column to, classified as an `UPDATE`'s `WHERE`
 is. A hot `MERGE` is the statement retargeted to `_events`; a cold one runs in
-DuckDB against the
-Iceberg table under the table's claim, its PostgreSQL source read through
-`pglocal`. Either sees its own tier's rows alone, so a source row that matches
-a row of the other tier would look unmatched and its `WHEN NOT MATCHED` action
-would run: a `MERGE` whose `ON` condition bounds neither tier is refused, and
-each `INSERT` action's partition value is guarded per row, by
-`coldfront._hot_only` on the hot tier and by a `CASE` on DuckDB's `error()` on
-the cold tier, so a row that belongs to the other tier raises instead of
-landing in the wrong one. A `WHEN NOT MATCHED BY SOURCE` action (PostgreSQL 17
-on) must bound the same tier in its own condition, since the other tier's rows
-match no source row either. A cold `INSERT` action must give every identity or
-defaulted column a value, as DuckDB can draw neither, and loses its
-`OVERRIDING` clause, which DuckDB does not know; duckdb-iceberg runs one
-`UPDATE` or `DELETE` action per statement and no `RETURNING`. A `MERGE` that
-sets the partition column is refused in favour of an `UPDATE`, whose
+DuckDB against the Iceberg table under the table's claim, its PostgreSQL source
+read through `pglocal`. Either sees its own tier's rows alone, so a source row
+that matches a row of the other tier would look unmatched and its
+`WHEN NOT MATCHED` action would run: a `MERGE` whose `ON` condition bounds
+neither tier is refused, and each `INSERT` action's partition value is guarded
+per row, by `coldfront._hot_only` on the hot tier and by a `CASE` on DuckDB's
+`error()` on the cold tier, so a row that belongs to the other tier raises
+instead of landing in the wrong one. A `WHEN NOT MATCHED BY SOURCE` action
+(PostgreSQL 17 on) must bound the same tier in its own condition, since the
+other tier's rows match no source row either. A cold `INSERT` action must give
+every identity or defaulted column a value, as DuckDB can draw neither, and
+loses its `OVERRIDING` clause, which DuckDB does not know; duckdb-iceberg runs
+one `UPDATE` or `DELETE` action per statement and no `RETURNING`. A `MERGE`
+that sets the partition column is refused in favour of an `UPDATE`, whose
 cross-tier move replays a single-relation `WHERE` per tier, and so is one on a
 table with a clustered vector column, whose rows the `INSERT`, `UPDATE` and
-`DELETE` rewrites assign to clusters. A `MERGE` nested in a `WITH` entry
-takes the path of a nested `UPDATE` or `DELETE`: a hot one is the entry's body
-and keeps `RETURNING`, a cold one is the anchor `UPDATE` that runs the DuckDB
+`DELETE` rewrites assign to clusters. A `MERGE` nested in a `WITH` entry takes
+the path of a nested `UPDATE` or `DELETE`: a hot one is the entry's body and
+keeps `RETURNING`, a cold one is the anchor `UPDATE` that runs the DuckDB
 write. When a statement gives the view no alias, the deparser qualifies its
 columns by the view's name, so the retargeted relation takes that name as its
-alias; an `UPDATE … FROM`, a `DELETE … USING` and a correlated sub-select are
-handled the same way.
+alias; an `UPDATE … FROM`, a `DELETE … USING` and a correlated sub-select
+are handled the same way.
 
 `COPY <view> FROM` takes the same path. The utility hook reads the rows with
-PostgreSQL's COPY reader (`BeginCopyFrom`, `NextCopyFrom`), collects
+PostgreSQL's `COPY` reader (`BeginCopyFrom`, `NextCopyFrom`), collects
 `cold_write_batch_size` of them, and runs one
 `INSERT INTO <view> (<COPY's columns>) OVERRIDING SYSTEM VALUE VALUES (…), (…)`
 per batch, every value a literal in its type's text form, so the statement is
 the one an application would write and the same rewrite handles it, for a
-decoupled view too. `OVERRIDING SYSTEM VALUE` gives the INSERT the rule `COPY`
-has for a `GENERATED ALWAYS` identity column: a supplied value is kept. `WHERE`
-and the options that act after a row is read (`FREEZE`, `ON_ERROR`,
+decoupled view too. `OVERRIDING SYSTEM VALUE` gives the `INSERT` the rule
+`COPY` has for a `GENERATED ALWAYS` identity column: a supplied value is kept.
+`WHERE` and the options that act after a row is read (`FREEZE`, `ON_ERROR`,
 `REJECT_LIMIT`, `DEFAULT`) are refused.
 
-A watermark-split INSERT cannot use `RETURNING` - see Cold RETURNING under
+A watermark-split `INSERT` cannot use `RETURNING` - see Cold `RETURNING` under
 [Tiered-Specific Limitations](#tiered-specific-limitations).
 
-## Transparent UPDATE/DELETE
+## Transparent `UPDATE`/`DELETE`
 
-The hook inspects every UPDATE/DELETE whose target is a registered tiered view.
-The hook looks at the WHERE clause and the archive watermark, classifies the
-predicate into one of three tiers, and rewrites the Query accordingly. The
+The hook inspects every `UPDATE`/`DELETE` whose target is a registered tiered
+view. The hook looks at the WHERE clause and the archive watermark, classifies
+the predicate into one of three tiers, and rewrites the Query accordingly. The
 following table maps each predicate shape to its tier and rewrite:
 
 | Predicate shape | Tier | Rewrite |
@@ -390,19 +389,19 @@ row across the cutoff. An in-place per-tier rewrite would leave such a row in
 its old tier where the view's tier predicate then hides it, so the hook handles
 a partition-column SET separately by the `coldfront.allow_mixed_writes` GUC:
 
-- When the GUC is on (permissive, the default), the hook rewrites the UPDATE to
-  `SELECT coldfront._cross_tier_move(...)`, which RELOCATES each matched row
+- When the GUC is on (permissive, the default), the hook rewrites the `UPDATE`
+  to `SELECT coldfront._cross_tier_move(...)`, which RELOCATES each matched row
   between tiers. The function first checks that every hot landing target has a
   covering partition, then captures the affected rows and applies four disjoint
-  cases by current tier and new value: stay-hot (in-place heap UPDATE),
-  stay-cold (re-add to Iceberg with the new value), hot to cold (heap DELETE
-  plus Iceberg INSERT), and cold to hot (heap INSERT plus Iceberg DELETE). The
-  hot side is plain PG; the cold side is one `duckdb.raw_query` (DELETE plus
-  INSERT, one Iceberg snapshot) under one bakery claim. A target value with no
-  covering hot partition is rejected naming the view; the move is not supported
-  inside a function, a DO block or a `WITH` entry, with bound parameters, with
-  a VOLATILE new value, with a bare NULL new value, with a new value
-  referencing other columns, alongside a SET of other columns, with
+  cases by current tier and new value: stay-hot (in-place heap `UPDATE`),
+  stay-cold (re-add to Iceberg with the new value), hot to cold (heap `DELETE`
+  plus Iceberg `INSERT`), and cold to hot (heap `INSERT` plus Iceberg
+  `DELETE`). The hot side is plain PG; the cold side is one `duckdb.raw_query`
+  (`DELETE` plus `INSERT`, one Iceberg snapshot) under one bakery claim. A
+  target value with no covering hot partition is rejected naming the view; the
+  move is not supported inside a function, a DO block or a `WITH` entry, with
+  bound parameters, with a VOLATILE new value, with a bare NULL new value, with
+  a new value referencing other columns, alongside a SET of other columns, with
   `RETURNING`, with a WHERE that references other tables or sub-queries
   (`UPDATE … FROM`, a sub-select), or on a hot table without a primary key.
 - When the GUC is off (strict), the hook rejects the partition-column SET. To
@@ -410,7 +409,7 @@ a partition-column SET separately by the `coldfront.allow_mixed_writes` GUC:
   value.
 
 Before anything is archived (no cutoff) every row is hot, so a partition-column
-UPDATE is a plain hot UPDATE in either mode.
+`UPDATE` is a plain hot `UPDATE` in either mode.
 
 ## Write Modes: Strict vs Permissive (`allow_mixed_writes`)
 
@@ -472,9 +471,9 @@ So alongside the bakery substrate (`coldfront.claims` /
 `coldfront.ensure_replicated()`, the one-time per-node mesh step described in
 [usage.md](usage.md#what-coldfrontensure_replicated-does), adds them with the
 rest. The archiver runs on one node and registers a table, its view and its
-registry row, in one transaction, so a peer applies them together and only
-gets these rows by replication; without `tiered_views` a peer cannot read the
-cold tier, and INSERT/UPDATE/DELETE/DDL-blocking stop recognizing the view.
+registry row, in one transaction, so a peer applies them together and only gets
+these rows by replication; without `tiered_views` a peer cannot read the cold
+tier, and `INSERT`/`UPDATE`/`DELETE`/DDL-blocking stop recognizing the view.
 
 Both tables are **name-keyed** - `tiered_views` by `(schema_name, relname)`,
 `archive_watermark` by `table_name` - so each row replicates verbatim and
@@ -484,8 +483,8 @@ correct on every node, with no OID divergence to reason about. See
 ## Partition Scheme Compatibility
 
 The archiver tiers two partition shapes: a flat table partitioned by RANGE on a
-single time-like column, and a two-level `LIST → RANGE` tree registered with a
-sub-partition block. Anything else is rejected at archiver startup.
+single time-like column, and a two-level `LIST → RANGE` tree registered with
+a sub-partition block. Anything else is rejected at archiver startup.
 
 ### Supported: Single-Column RANGE
 
@@ -586,7 +585,7 @@ under `data/month_ts_<n>=<months since 1970>/`, or
 (beside a transform, the engine names the identity term by its spec field
 rather than the bare column); the path is opaque to readers, and iceberg-go's
 rewrites use the same field name with its own value format. Within a partition,
-each file's `min(ts)/max(ts)` statistics prune as well. Retention DELETEs and
+each file's `min(ts)/max(ts)` statistics prune as well. Retention `DELETE`s and
 the wipe are position deletes, so partitioning makes reads skip months; it does
 not make deletes less expensive.
 
@@ -599,25 +598,25 @@ one-time secret setup) are in
 
 The dual-tier model has the following limitations:
 
-- Any write that touches the cold tier (a cold-only UPDATE/DELETE, a permissive
-  dual-tier UPDATE/DELETE, or a watermark-split INSERT) **rejects `RETURNING`
-  with a clear error** rather than returning a partial result. The cold tier
-  cannot return affected rows: duckdb-iceberg's binder refuses
-  `RETURNING` on Iceberg writes and pg_duckdb's row-returning entry point is
-  SELECT-only. Hot-only DML keeps `RETURNING` (it is plain PG DML).
+- Any write that touches the cold tier (a cold-only `UPDATE`/`DELETE`, a
+  permissive dual-tier `UPDATE`/`DELETE`, or a watermark-split `INSERT`)
+  **rejects `RETURNING` with a clear error** rather than returning a partial
+  result. The cold tier cannot return affected rows: duckdb-iceberg's binder
+  refuses `RETURNING` on Iceberg writes and pg_duckdb's row-returning entry
+  point is `SELECT`-only. Hot-only DML keeps `RETURNING` (it is plain PG DML).
 
-- An ambiguous dual-tier UPDATE returns the command tag `SELECT n` rather than
-  `UPDATE n`, because the rewrite produces a SELECT wrapper around a DML CTE.
-  The row count reflects hot rows only. A watermark-split INSERT reports
-  `SELECT 1` for the same reason and returns one `(hot_rows, cold_rows)` row.
-  A top-level cold-only UPDATE or DELETE and a cross-tier move become a plain
-  SELECT of one function call, a shape for which PostgreSQL keeps the
+- An ambiguous dual-tier `UPDATE` returns the command tag `SELECT n` rather
+  than `UPDATE n`, because the rewrite produces a `SELECT` wrapper around a DML
+  CTE. The row count reflects hot rows only. A watermark-split `INSERT` reports
+  `SELECT 1` for the same reason and returns one `(hot_rows, cold_rows)` row. A
+  top-level cold-only `UPDATE` or `DELETE` and a cross-tier move become a plain
+  `SELECT` of one function call, a shape for which PostgreSQL keeps the
   statement's own tag with the rows returned, so they report `UPDATE 1` or
   `DELETE 1` whatever the number of cold rows written. Inside PL/pgSQL, a
   cold-only write reports `UPDATE 0`, so `FOUND` is false, and a dual-tier
-  write or a split INSERT counts its hot rows.
+  write or a split `INSERT` counts its hot rows.
 
-- An UPDATE/DELETE that references the same tiered view more than once - a
+- An `UPDATE`/`DELETE` that references the same tiered view more than once - a
   self-join (`UPDATE events ... FROM events e2`), `DELETE ... USING events`, or
   a sub-select (`... WHERE id IN (SELECT ... FROM events)`) - is rejected with
   a clear error. The rewrite swaps only the leading result-relation reference,

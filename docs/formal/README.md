@@ -51,7 +51,7 @@ These properties must hold; TLC checks them as `INVARIANTS`:
   fails, and the losing commit gets HTTP 409 and aborts its transaction.
 - `RollbackNoIceberg` states that if a writer's `decision = "rolled_back"`,
   there is no iceberg snapshot owned by that writer in the committed history.
-  The property models PG ROLLBACK undoing pg_duckdb's pending iceberg
+  The property models PG `ROLLBACK` undoing pg_duckdb's pending iceberg
   MetaTransaction.
 - `UniqueTickets` states that snowflake.nextval() does not return duplicates.
   The property is a sanity check on the model abstraction.
@@ -198,9 +198,9 @@ Model checking completed. No error has been found.
 The patched async ordering - parquet staged OUTSIDE the claim, parent
 re-stamped at the commit POST UNDER the claim - is safe: all four invariants
 hold. The check is non-vacuous: it shares the stock config's under-claim
-`Prepare → Decide` window, which R-A keeps empty (a peer with a smaller ticket
-defers its ack until it releases, so two writers never both clear `WaitAcks`).
-This is the ordering the DuckDB 1.5.x (duckdb15) image runs.
+`Prepare → Decide` window, which R-A keeps empty (a peer with a smaller
+ticket defers its ack until it releases, so two writers never both clear
+`WaitAcks`). This is the ordering the DuckDB 1.5.x (duckdb15) image runs.
 
 ### `Bakery_race.cfg` (Pre-Patch Async - EXPECTED FAILURE)
 
@@ -217,12 +217,12 @@ The failure is expected. With the async ordering but WITHOUT the bakery-aware
 patch (`RestampPatch=FALSE`), a writer asserts the conditional commit against
 the stale tentative parent it captured at the pre-claim stage; a peer that
 committed while it awaited/held the claim has advanced the iceberg head, so the
-conditional commit fails because its parent is stale → Lakekeeper 409. This is
-the formal proof that the patch is mandatory for the async ordering - the stock
-ordering (`Bakery.cfg`) stamps the parent under the claim and needs no patch.
-(The asymmetric-apply race that motivates R-A itself - two writers passing a
-naive local min-check on stale views - is structurally prevented by the R-A ack
-barrier in this model, so it has no standalone config.)
+conditional commit fails because its parent is stale → Lakekeeper 409. This
+is the formal proof that the patch is mandatory for the async ordering - the
+stock ordering (`Bakery.cfg`) stamps the parent under the claim and needs no
+patch. (The asymmetric-apply race that motivates R-A itself - two writers
+passing a naive local min-check on stale views - is structurally prevented by
+the R-A ack barrier in this model, so it has no standalone config.)
 
 ### `Bakery_samenode_race.cfg` (Multi-Writer-Per-Node - EXPECTED FAILURE)
 
@@ -267,26 +267,26 @@ faithfully because they affect protocol correctness:
 
 - The `coldfront.iceberg_async_parquet` flag's two mesh orderings in
   [_exec_iceberg_with_claim](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/coldfront--1.0.sql):
-  stock (claim → stage+commit under the claim) and patched async (stage parquet
-  outside the claim → claim → re-stamp `parent_snapshot_id` at the commit POST
-  under the claim). The safety-critical invariant - the parent snapshot the
-  conditional commit checks is taken UNDER the held claim - is captured at
-  `Prepare` for both; the `AsyncParquet`/`RestampPatch` constants select the
-  ordering and whether the bakery-aware patch is present. In the code,
-  `coldfront._iceberg_async_active()` selects the async ordering only when the
-  build marker `coldfront.iceberg_bakery_patch` is also on. With the flag
-  alone, the writer keeps the stock ordering and logs the downgrade once per
-  session, so the `Bakery_race.cfg` combination runs only where the marker is
-  set on a stock binary.
+  stock (claim → stage+commit under the claim) and patched async (stage
+  parquet outside the claim → claim → re-stamp `parent_snapshot_id` at the
+  commit POST under the claim). The safety-critical invariant - the parent
+  snapshot the conditional commit checks is taken UNDER the held claim - is
+  captured at `Prepare` for both; the `AsyncParquet`/`RestampPatch` constants
+  select the ordering and whether the bakery-aware patch is present. In the
+  code, `coldfront._iceberg_async_active()` selects the async ordering only
+  when the build marker `coldfront.iceberg_bakery_patch` is also on. With the
+  flag alone, the writer keeps the stock ordering and logs the downgrade once
+  per session, so the `Bakery_race.cfg` combination runs only where the marker
+  is set on a stock binary.
 - The bakery's min-ticket spin in
   [_claim_iceberg_lock](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/coldfront--1.0.sql).
 - The deferred release, in which pg_duckdb commits the Iceberg transaction at
-  `XACT_EVENT_PRE_COMMIT` and coldfront's XactCallback DELETEs the claim at
+  `XACT_EVENT_PRE_COMMIT` and coldfront's XactCallback `DELETE`s the claim at
   `XACT_EVENT_COMMIT`, so the commit always precedes the release whatever order
   the two callbacks were registered in. The model represents this as the
-  iceberg append at `Decide` followed by the claim DELETE at `Release`.
-- pg_duckdb's iceberg ROLLBACK on PG ABORT (no append on the rollback branch),
-  which the `RollbackNoIceberg` property requires.
+  iceberg append at `Decide` followed by the claim `DELETE` at `Release`.
+- pg_duckdb's iceberg `ROLLBACK` on PG ABORT (no append on the rollback
+  branch), which the `RollbackNoIceberg` property requires.
 
 ### Compactor Commits (`cmd/compactor`)
 
@@ -312,50 +312,50 @@ snapshot/orphan maintenance - it is a catalog - so this is the go-native path.)
 
 Binding constraint: iceberg-go has **no bakery-aware re-stamp patch** (that
 patch lives only in the duckdb-iceberg commit path), so the compactor MUST hold
-the claim across the whole read → rewrite → commit and stamp, under the claim,
-the parent snapshot that the conditional commit checks. `Bakery_race.cfg` is
-the proof that the patchless-async shortcut fails with HTTP 409 - the compactor
-is therefore forbidden the async-parquet path. Commit-then-release matches the
-cold-write shape the model already abstracts as the atomic `Decide` step
-(commit iceberg, then DELETE the claim), so the existing configs cover it; no
-dedicated config is needed.
+the claim across the whole read → rewrite → commit and stamp, under the
+claim, the parent snapshot that the conditional commit checks.
+`Bakery_race.cfg` is the proof that the patchless-async shortcut fails with
+HTTP 409 - the compactor is therefore forbidden the async-parquet path.
+Commit-then-release matches the cold-write shape the model already abstracts as
+the atomic `Decide` step (commit iceberg, then `DELETE` the claim), so the
+existing configs cover it; no dedicated config is needed.
 
 ### DDL Mirroring (`ALTER TABLE`)
 
-Tiered-table column DDL (ADD/DROP/ALTER-TYPE/RENAME COLUMN) is mirrored onto
-the shared Iceberg tier by `coldfront._mirror_iceberg_alter`, which routes the
-Iceberg ALTER through the **unchanged** `_exec_iceberg_with_claim`. The mirror
-function is therefore the **same stock-ordering claimant** the cold writer is:
-one metadata-only conditional commit (the schema change - identical
+Tiered-table column DDL (ADD/`DROP`/`ALTER`-TYPE/`RENAME COLUMN`) is mirrored
+onto the shared Iceberg tier by `coldfront._mirror_iceberg_alter`, which routes
+the Iceberg `ALTER` through the **unchanged** `_exec_iceberg_with_claim`. The
+mirror function is therefore the **same stock-ordering claimant** the cold
+writer is: one metadata-only conditional commit (the schema change - identical
 parent-snapshot conflict shape to the append modeled at `Decide`) under the
 held claim, then release. The mirror function forces the claim-first ordering
-(`SET LOCAL coldfront.iceberg_async_parquet = off`): an ALTER stages no
+(`SET LOCAL coldfront.iceberg_async_parquet = off`): an `ALTER` stages no
 parquet, so there is nothing to overlap, and `AsyncParquet = FALSE`
 (`Bakery.cfg`) is the config the model already proves safe. The mirror adds no
 new protocol primitive, so it is covered by the existing model and configs; no
 dedicated config is needed.
 
-In a mesh the user's ALTER replicates as a top-level statement and re-runs in
+In a mesh the user's `ALTER` replicates as a top-level statement and re-runs in
 each peer's apply worker; the mirror self-skips there
 (`session_replication_role = replica`) because the SHARED catalog was already
 evolved by the originator. The single-commit shape thus holds - the catalog is
 altered exactly once, by one claimant - and peers only rebuild their per-node
 view.
 
-### Cross-Tier Move (Partition-Column UPDATE)
+### Cross-Tier Move (Partition-Column `UPDATE`)
 
 A partition-column `UPDATE` that crosses the cutoff is rewritten to
 `coldfront._cross_tier_move`, which relocates rows between tiers. Its hot-tier
-work is plain PostgreSQL (heap INSERT/UPDATE/DELETE - no Iceberg, no claim).
-Its cold-tier work is **one** `duckdb.raw_query` issued through the
-**unchanged** path: a single DELETE-set plus INSERT-set in one DuckDB
+work is plain PostgreSQL (heap `INSERT`/`UPDATE`/`DELETE` - no Iceberg, no
+claim). Its cold-tier work is **one** `duckdb.raw_query` issued through the
+**unchanged** path: a single `DELETE`-set plus `INSERT`-set in one DuckDB
 MetaTransaction - one Iceberg snapshot, one conditional commit POST to
 Lakekeeper - under **one** `_claim_iceberg_lock` held to transaction end
 (released by the C `XactCallback`). The move is therefore the **same
 stock-ordering single claimant** the cold writer is: one conditional commit
 (identical parent-snapshot conflict shape to the append modeled at `Decide`)
 under the held claim. The move forces `iceberg_async_parquet = off`
-(`AsyncParquet = FALSE`, `Bakery.cfg`) - the DELETE+INSERT bundle is not
+(`AsyncParquet = FALSE`, `Bakery.cfg`) - the `DELETE`+`INSERT` bundle is not
 pg_duckdb's single deferred POST that the async re-stamp patch wraps. Each move
 takes exactly **one** claim (a second claim on the same table would reap the
 first, which `_take_iceberg_claim` prevents by reusing the transaction's
@@ -448,8 +448,8 @@ Re-run the model after any change to the following:
   (`coldfront_xact_callback`, `RegisterXactCallback` ordering).
 - The `cmd/compactor` bakery wrapper, meaning the claim/release that brackets
   its iceberg-go `RewriteDataFiles` commit (the wrapper must stay
-  stock-ordering: claim held across read → rewrite → commit; no async-parquet
-  shortcut).
+  stock-ordering: claim held across read → rewrite → commit; no
+  async-parquet shortcut).
 
 If the protocol-level shape changes (e.g. swapping the bakery for a different
 coordination primitive), update the PlusCal source first, re-translate,

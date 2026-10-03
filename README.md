@@ -45,9 +45,9 @@ ColdFront provides two operating modes:
   extension handles every data-modifying statement on that view.
 
 Both modes coexist within one database, and you choose the mode per table at
-creation time. The SQL surface is identical for both modes: standard SELECT,
-INSERT, UPDATE, and DELETE against the relation, and MERGE on PostgreSQL 17
-and later.
+creation time. The SQL surface is identical for both modes: standard `SELECT`,
+`INSERT`, `UPDATE`, and `DELETE` against the relation, and `MERGE` on
+PostgreSQL 17 and later.
 
 Decoupled mode scales out horizontally across many PostgreSQL nodes that share
 one Lakekeeper catalog and one object store. The bakery protocol in the
@@ -199,15 +199,15 @@ SELECT coldfront.grant_app_access('alice');
 
 grant_app_access grants only the minimum the cold path needs: membership in
 duckdb.postgres_role, SET on the duckdb.unsafe_allow_execution_inside_functions
-parameter, schema USAGE, SELECT on the registry and the watermark table, DML on
-the dual-write anchor table, DML on every registered view and the hot table
-behind it, and USAGE and SELECT on the hot table's sequences. Those objects are
-derived from the registry, not hardcoded, and the call also grants EXECUTE on a
-fixed allow-list of runtime cold-path functions. The call is idempotent and is
-not executable by PUBLIC, so an application role can never self-grant. The role
-is never granted pg_read_server_files or pg_write_server_files, so it has no
-host-file access. CREATE ROLE and GRANT both replicate over Spock, so you
-onboard a role once on any node and it propagates across the mesh.
+parameter, schema USAGE, `SELECT` on the registry and the watermark table, DML
+on the dual-write anchor table, DML on every registered view and the hot table
+behind it, and USAGE and `SELECT` on the hot table's sequences. Those objects
+are derived from the registry, not hardcoded, and the call also grants EXECUTE
+on a fixed allow-list of runtime cold-path functions. The call is idempotent
+and is not executable by PUBLIC, so an application role can never self-grant.
+The role is never granted pg_read_server_files or pg_write_server_files, so it
+has no host-file access. `CREATE ROLE` and `GRANT` both replicate over Spock,
+so you onboard a role once on any node and it propagates across the mesh.
 
 The Docker image sets `duckdb.postgres_role` to `coldfront_duckdb` and creates
 that role when it initializes a new data directory. To name a different role,

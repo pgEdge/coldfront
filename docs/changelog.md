@@ -145,7 +145,7 @@ this project adheres to
   write path.
 - A tiered `INSERT` whose `WITH` clause held an entry that modifies data
   (`WITH moved AS (DELETE … RETURNING …) INSERT INTO <view> SELECT … FROM
-  moved`) failed with "WITH clause containing a data-modifying statement must
+  moved`) failed with "`WITH` clause containing a data-modifying statement must
   be at the top level", because the rewrite folded the clause into its source
   sub-query. The clause's entries now open the rewritten statement. On a
   decoupled view, where the source runs in DuckDB, such an entry is refused
@@ -157,13 +157,13 @@ this project adheres to
   function or `DO` block failed with a syntax error, because the rewrite put
   its own `WITH` ahead of the statement's. The statement's entries now open
   the rewritten statement.
-- A hot `UPDATE … FROM`, `DELETE … USING` or correlated sub-select on a tiered
-  view failed with "missing FROM-clause entry" when the statement gave the
-  view no alias, because the deparser qualifies the view's columns by its name
-  and the rewrite swapped the relation alone. The retargeted relation now
+- A hot `UPDATE … FROM`, `DELETE … USING` or correlated sub-select on a
+  tiered view failed with "missing FROM-clause entry" when the statement gave
+  the view no alias, because the deparser qualifies the view's columns by its
+  name and the rewrite swapped the relation alone. The retargeted relation now
   takes the view's name as its alias. A cold `UPDATE … FROM` or `DELETE …
-  USING` a PostgreSQL table failed in DuckDB, which did not know the table;
-  it is now read through `pglocal`, as an `INSERT`'s source is.
+  USING` a PostgreSQL table failed in DuckDB, which did not know the table; it
+  is now read through `pglocal`, as an `INSERT`'s source is.
 - A tiered `INSERT … SELECT` ran its source once per tier. A source whose
   rows differed between the two runs landed some rows in both tiers and others
   in neither, and when the hot table had no identity column, or the statement
@@ -265,8 +265,8 @@ this project adheres to
   purge or keep-files for the stored objects.
 - Vended object-store credentials, so cold access can use short-lived
   credentials issued by Lakekeeper instead of static keys.
-- Cross-tier row relocation: an UPDATE that moves a row's partition key across
-  the cutoff now moves the row between tiers.
+- Cross-tier row relocation: an `UPDATE` that moves a row's partition key
+  across the cutoff now moves the row between tiers.
 - Multi-arch base images: linux/amd64 and linux/arm64.
 - An interactive walkthrough with four demos, runnable in Codespaces.
 

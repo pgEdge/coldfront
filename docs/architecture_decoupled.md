@@ -35,7 +35,7 @@ the first time a session actually queries Iceberg.
 
 For tables registered as iceberg-only via `coldfront.create_iceberg_table()`,
 the parse-analyze rewriter is the **primary** dispatch path: it intercepts
-every INSERT/UPDATE/DELETE on the wrapper view and emits one
+every `INSERT`/`UPDATE`/`DELETE` on the wrapper view and emits one
 `SELECT coldfront._exec_iceberg_with_claim(<ref>, '…')`, which takes the
 table's claim and runs the DuckDB statement against the Iceberg table through
 `duckdb.raw_query` - a single Iceberg snapshot per statement. Tables that do
@@ -71,8 +71,8 @@ attaches as `pglocal`. Only an `INSERT ... SELECT` that reads a PostgreSQL
 table uses it. The GUC is `PGC_SUSET` and superuser-only, because the DSN can
 hold credentials. `set_storage_secret` installs the `postgres` extension when
 the GUC is set, and `coldfront.ensure_pg_attached()` attaches `pglocal` when
-such an INSERT runs. With the GUC unset, that INSERT fails, because DuckDB has
-no `pglocal` catalog to resolve.
+such an `INSERT` runs. With the GUC unset, that `INSERT` fails, because DuckDB
+has no `pglocal` catalog to resolve.
 
 After that, the first query touching a tiered view in any session lazily
 attaches the catalog and `ice.public.*` becomes available.
@@ -112,9 +112,9 @@ The following table shows attempts that fail and the reason for each:
 
 The net effect is that every read or write of an Iceberg-only table either goes
 through the `iceberg_scan(...)` table-function (with `r['col']` accessor) or
-through `duckdb.raw_query('… DuckDB SQL …')`. Neither is as easy to use as a
-normal PG table, which is the main drawback of decoupled mode without a PG-side
-wrapper view.
+through `duckdb.raw_query('… DuckDB SQL …')`. Neither is as easy to use as
+a normal PG table, which is the main drawback of decoupled mode without a
+PG-side wrapper view.
 
 ## Supported Column Types
 
@@ -167,11 +167,11 @@ shape on read is worse than no support.
 
 Raw_query / iceberg_scan are functional but ergonomically poor - every read
 needs `r['col']` accessor, every write needs a
-`duckdb.raw_query('… DuckDB SQL …')` envelope. To make an Iceberg-only table as
-easy to use as a PG table, ColdFront ships a single helper that provisions an
-Iceberg-only table together with a PG-side wrapper view and a registry row that
-makes the C hook to handle every DML on the view. After that, applications use
-**plain PG syntax** against the named relation:
+`duckdb.raw_query('… DuckDB SQL …')` envelope. To make an Iceberg-only
+table as easy to use as a PG table, ColdFront ships a single helper that
+provisions an Iceberg-only table together with a PG-side wrapper view and a
+registry row that makes the C hook to handle every DML on the view. After that,
+applications use **plain PG syntax** against the named relation:
 
 ```sql
 SELECT coldfront.create_iceberg_table(
@@ -196,7 +196,7 @@ a `text[]` of `PARTITIONED BY` terms, passed to DuckDB as written; the terms,
 and how a term with a comma or a quoted name is written in the array literal,
 are in [usage.md → Mode 2](usage.md#mode-2-decoupled-iceberg-only). DuckDB
 refuses an unknown transform, a bad argument or a column outside the schema at
-`CREATE TABLE`. The one check DuckDB leaves to the first INSERT, a time
+`CREATE TABLE`. The one check DuckDB leaves to the first `INSERT`, a time
 transform on a column that is not a timestamp or date (for `hour`, not a
 timestamp), `coldfront._partition_clause()` makes at the same point, while no
 table exists yet.
@@ -224,22 +224,22 @@ The helper performs the following steps:
    cost.
 4. Registers the row in `coldfront.tiered_views` with `is_iceberg_only = true`.
    The C-side `post_parse_analyze_hook` reads this flag and short-circuits
-   `classify_tier()` to `TIER_COLD` for any INSERT/UPDATE/DELETE on the wrapper
-   view, regardless of WHERE clause or watermark - so every write rewrites
-   cleanly into a single
+   `classify_tier()` to `TIER_COLD` for any `INSERT`/`UPDATE`/`DELETE` on the
+   wrapper view, regardless of WHERE clause or watermark - so every write
+   rewrites cleanly into a single
    `SELECT coldfront._exec_iceberg_with_claim(<ref>, 'INSERT/UPDATE/DELETE ice.public.<name> …')`.
    The hook is the dispatch path.
 
 Writes through the wrapper view behave as follows:
 
-- An INSERT adds the row to Iceberg, and a fresh session's SELECT sees it.
-- A `COPY <view> FROM` adds its rows the same way, one INSERT per
+- An `INSERT` adds the row to Iceberg, and a fresh session's `SELECT` sees it.
+- A `COPY <view> FROM` adds its rows the same way, one `INSERT` per
   `coldfront.cold_write_batch_size` rows.
-- An UPDATE changes the row in Iceberg, and a fresh session's SELECT sees the
-  new value.
-- A DELETE removes the row from Iceberg.
-- A ROLLBACK of an INSERT/UPDATE inside `BEGIN` undoes the Iceberg snapshot, so
-  the row count after the transaction matches the count before it.
+- An `UPDATE` changes the row in Iceberg, and a fresh session's `SELECT` sees
+  the new value.
+- A `DELETE` removes the row from Iceberg.
+- A `ROLLBACK` of an `INSERT`/`UPDATE` inside `BEGIN` undoes the Iceberg
+  snapshot, so the row count after the transaction matches the count before it.
 - A jsonb column round-trips through Parquet `VARCHAR` storage and reads as PG
   `json` via the wrapper view's cast (`data->>'k'` works).
 
@@ -248,10 +248,10 @@ The helper inherits the following limit from the platform:
 - The mixed-write guard is relaxed: the helper sets
   `duckdb.unsafe_allow_mixed_transactions = on` LOCAL during provisioning
   (Iceberg DDL + coldfront registry row both happen). The hook does the same
-  for tiered INSERT splits and dual-tier UPDATE/DELETE, where PG-side and
+  for tiered `INSERT` splits and dual-tier `UPDATE`/`DELETE`, where PG-side and
   DuckDB-side writes share one transaction; iceberg-only DML does not need it.
-  ROLLBACK still works via XactCallback; the flag only bypasses the pre-commit
-  guard.
+  `ROLLBACK` still works via XactCallback; the flag only bypasses the
+  pre-commit guard.
 
 The helper does not add capability over raw_query - it composes the existing
 primitives into a single call so applications get a normal-looking PG table.
@@ -341,7 +341,7 @@ projection. Without the sibling the column is a plain `real[]`.
 ### Writability
 
 The registry row has an `is_writable` flag, and the parse-analyze hook refuses
-INSERT, UPDATE and DELETE on a relation whose flag is false:
+`INSERT`, `UPDATE` and `DELETE` on a relation whose flag is false:
 
 ```text
 ERROR:  coldfront: "public.orders" is adopted read-only
@@ -358,8 +358,8 @@ defaults it to false.
 `coldfront.tiered_views` has a unique constraint on `iceberg_table`, and
 adoption refuses a reference that is already registered. The cluster-column
 lookups resolve a table by its reference, so two rows sharing one would
-concatenate both tables' cluster columns into the first's INSERT list and fail
-the second outright.
+concatenate both tables' cluster columns into the first's `INSERT` list and
+fail the second outright.
 
 The archiver, `create_iceberg_table()` and adoption all store the reference
 with every part quoted, such as `"ice"."lake"."orders"`, and the compactor
@@ -747,7 +747,7 @@ in the node's default repset: the two bakery tables, the registry and the
 watermark, the storage secret, the lifecycle config and the vector routing
 state (the list and the reason for each table are in
 [usage.md → Distributed Setup](usage.md#what-coldfrontensure_replicated-does)).
-If it has not run on a peer, that peer's ack INSERTs are local-only and never
+If it has not run on a peer, that peer's ack `INSERT`s are local-only and never
 replicate back to the originating writer: every claim on the originator waits
 at the ack barrier for an ack that never arrives.
 
@@ -781,7 +781,7 @@ Decoupled (iceberg-only) is the right choice when:
 Tiered (the default) is the right choice when:
 
 - The workload has a strong recent-row OLTP component that needs PG-native
-  point lookups, indexes, and transactional UPDATE/DELETE ergonomics.
+  point lookups, indexes, and transactional `UPDATE`/`DELETE` ergonomics.
 - The application queries through a stable named relation (`events`). Decoupled
   tables created via `create_iceberg_table()` also provide this through the
   wrapper view; only tables used without the helper need the

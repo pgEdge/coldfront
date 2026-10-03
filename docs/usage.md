@@ -211,14 +211,14 @@ The archiver also accepts `--debug-export-delay`, a test-only Go duration
 bulk export and the replay, so that a test can race concurrent writes into it.
 Leave it unset in production.
 
-The first run that finds a partition older than `hot_period` renames `events` →
-`_events`, creates the unified view `events`, and registers it; until then the
-archiver only premakes partitions, and the table stays a plain partitioned
+The first run that finds a partition older than `hot_period` renames `events`
+→ `_events`, creates the unified view `events`, and registers it; until then
+the archiver only premakes partitions, and the table stays a plain partitioned
 table. From then on every cycle (1) tiers partitions older than `hot_period`
 from hot PG to cold Iceberg and advances the watermark, and (2) if
 `retention_period` is set, drops cold Iceberg rows older than it. The data
-lifecycle is **hot → `hot_period` → cold → `retention_period` → gone**; omit
-`retention_period` to keep cold data forever.
+lifecycle is **hot → `hot_period` → cold → `retention_period` → gone**;
+omit `retention_period` to keep cold data forever.
 
 ### Inbound Foreign Keys
 
@@ -304,8 +304,9 @@ That single statement provisions:
 - a PG-side wrapper view `public.events` with proper PG-typed columns.
 
 - a `coldfront.tiered_views` registry row, so that the coldfront C hook
-  intercepts every INSERT, UPDATE, DELETE, and MERGE on the view and rewrites
-  each one to a single `duckdb.raw_query(...)` against `ice.public.events`.
+  intercepts every `INSERT`, `UPDATE`, `DELETE`, and `MERGE` on the view and
+  rewrites each one to a single `duckdb.raw_query(...)` against
+  `ice.public.events`.
 
 
 In a mesh one node provisions: Spock's `ddl_sql` repset replicates the
@@ -335,7 +336,8 @@ view takes the table's name.
 
 Adoption is read-only unless asked otherwise, so reading someone else's lake
 table cannot become writing it by accident. Passing `p_writable => true`
-enables the same INSERT, UPDATE, DELETE and MERGE rewrite a created table gets:
+enables the same `INSERT`, `UPDATE`, `DELETE` and `MERGE` rewrite a created
+table gets:
 
 ```sql
 SELECT coldfront.adopt_iceberg_table('public', 'orders', 'lake',
@@ -437,10 +439,10 @@ Keep the following operational behavior in mind when scheduling it:
   before shrinking `retention_period`. Set `expiration_strategy: detach` to
   instead leave the expired partition as a standalone table (detached from the
   parent, data preserved) and reclaim it yourself. A partition is expired only
-  once its *entire* range is older than `now − retention_period`, computed with
-  calendar-accurate PostgreSQL interval arithmetic (a real month, leap years
-  correct). `detach` is partition-only - the tiered archiver always drops after
-  exporting to cold.
+  once its *entire* range is older than `now − retention_period`, computed
+  with calendar-accurate PostgreSQL interval arithmetic (a real month, leap
+  years correct). `detach` is partition-only - the tiered archiver always drops
+  after exporting to cold.
 
 ### Primary Keys on Time-Partitioned Tables (id Mode)
 
@@ -572,9 +574,9 @@ changes the partition period or column, `hot_period`, `retention_period` or the
 sub-partition source, and otherwise relies on the table's CHECK constraints.
 
 The data lifecycle is **hot PG → `hot_period` → cold Iceberg →
-`retention_period` → dropped** (tiered) or **hot PG → `retention_period` →
-dropped** (partition-only). Setting `hot_period` makes a table tiered; omitting
-it makes it partition-only.
+`retention_period` → dropped** (tiered) or **hot PG → `retention_period`
+→ dropped** (partition-only). Setting `hot_period` makes a table tiered;
+omitting it makes it partition-only.
 
 ### What Registration Refuses
 
@@ -666,7 +668,7 @@ Run `partitioner` (or `archiver`) with `help` or `--help` for the command
 overview, and with no arguments for its normal run; every subcommand has a
 detailed `--help` with worked examples. The write commands accept
 `--print-sql` (emit the SQL without running it - review/commit it; `import`
-prints its table INSERTs); `register` and `import` also accept `--dry-run`.
+prints its table `INSERT`s); `register` and `import` also accept `--dry-run`.
 `set --enable`/`--disable` (mutually exclusive) pause/resume a table without
 removing it; a disabled table is skipped by reconcile and omitted from
 `export`. Per table, only the cadence and a lifecycle boundary (`hot_period` or
@@ -751,9 +753,9 @@ native `gcs` profile is service-account only and is **not** used.
 Azure ADLS Gen2 is a supported cold-store backend; the access key rides inside
 `connection_string`. Set the credential with `set_storage_secret_azure()`
 instead of `set_storage_secret()` - it takes a CONFIG-provider connection
-string. The storage-account access key rides inside `AccountKey=…`; the DuckDB
-azure secret has no separate account-key parameter, so shared-key auth lives
-entirely in the connection string:
+string. The storage-account access key rides inside `AccountKey=…`; the
+DuckDB azure secret has no separate account-key parameter, so shared-key auth
+lives entirely in the connection string:
 
 ```sql
 SELECT coldfront.set_storage_secret_azure(
@@ -861,11 +863,12 @@ SELECT status FROM events WHERE id = 1;     -- back to whatever it was
 
 The following PostgreSQL column types are supported:
 
-`bigint` · `integer` · `smallint` · `real` · `double precision` · `boolean` ·
-`timestamp with time zone` · `timestamp without time zone` · `date` ·
-`time without time zone` · `uuid` · `text` · `varchar(N)` · `char(N)` · `bytea`
-· `numeric(P,S)` (P ≤ 38) · `jsonb` / `json` · `interval` · `vector(N)` /
-`halfvec(N)` (pgvector; see [usage_vectors.md](usage_vectors.md))
+`bigint` · `integer` · `smallint` · `real` · `double precision` ·
+`boolean` · `timestamp with time zone` · `timestamp without time zone` ·
+`date` · `time without time zone` · `uuid` · `text` · `varchar(N)` ·
+`char(N)` · `bytea` · `numeric(P,S)` (P ≤ 38) · `jsonb` / `json` ·
+`interval` · `vector(N)` / `halfvec(N)` (pgvector; see
+[usage_vectors.md](usage_vectors.md))
 
 Anything else (unbounded `numeric`, `xml`, `tsvector`, range/multirange types,
 custom enums, arrays, composite types, pgvector's `sparsevec`) is rejected when
@@ -966,7 +969,7 @@ Keep the following caveats in mind when running either mode:
   before the commit POST leaves unreferenced objects, which the compactor's
   orphan pass reclaims.
 - In decoupled mode, concurrent writes from multiple PG nodes are serialized
-  PG-side by the bakery protocol: every iceberg-only INSERT goes through
+  PG-side by the bakery protocol: every iceberg-only `INSERT` goes through
   `coldfront._exec_iceberg_with_claim`, which holds a globally-ordered
   Snowflake ticket and waits for its turn before committing to Lakekeeper.
   There are no 409 conflicts and no app-level retries. The protocol is
@@ -983,18 +986,18 @@ Keep the following caveats in mind when running either mode:
   rate, not the writer count.
 - For direct table access, `_events` is the hot heap (tiered mode only).
   `ice.public.<name>` is the Iceberg table - only addressable via
-  `iceberg_scan(...)` or `duckdb.raw_query('… ice.… …')`, never via PG-native
-  3-part names.
-- A tiered INSERT writes its cold rows through `coldfront._cold_sink`, which
+  `iceberg_scan(...)` or `duckdb.raw_query('… ice.… …')`, never via
+  PG-native 3-part names.
+- A tiered `INSERT` writes its cold rows through `coldfront._cold_sink`, which
   renders each row in plpgsql and writes Iceberg in batches of
   `coldfront.cold_write_batch_size` rows. An omitted IDENTITY column takes
   `nextval()` on the hot table's sequence, so cold ids share it with the hot
   side, and an omitted column with a DEFAULT takes it. The hot rows are one
-  set-based INSERT. For very large historical seeds (mostly-cold), prefer
+  set-based `INSERT`. For very large historical seeds (mostly-cold), prefer
   iceberg-only mode where ids come from your source data.
-- `COPY <view> FROM` reads the rows with PostgreSQL's COPY reader and writes
-  them through that same INSERT path, `coldfront.cold_write_batch_size` rows
-  per INSERT. The format options are the reader's, and a supplied value for a
+- `COPY <view> FROM` reads the rows with PostgreSQL's `COPY` reader and writes
+  them through that same `INSERT` path, `coldfront.cold_write_batch_size` rows
+  per `INSERT`. The format options are the reader's, and a supplied value for a
   `GENERATED ALWAYS` identity column is kept, as `COPY` into a table keeps it.
   `COPY ... WHERE` and the `FREEZE`, `ON_ERROR`, `REJECT_LIMIT` and `DEFAULT`
   options are refused.
@@ -1107,8 +1110,8 @@ ack, and waiting for it is correct, not a failure.
 
 A claim whose owner is gone (a hard backend crash) is reaped without operator
 action: by that node's next cold write, to any table, by a peer's arriving
-claim, or by the waiting peer's poke, a no-op UPDATE of its own claim row about
-once a second for as long as it waits. That poke is the only replication
+claim, or by the waiting peer's poke, a no-op `UPDATE` of its own claim row
+about once a second for as long as it waits. That poke is the only replication
 traffic the bakery generates while a writer waits, and there is none when
 nothing waits. See [architecture_decoupled.md](architecture_decoupled.md),
 *Orphan reaping*.
@@ -1237,15 +1240,15 @@ sentinels.
 The following GUCs adjust write behavior and execution; tune them as needed:
 
 - `coldfront.allow_mixed_writes` (bool, default `on`) controls what happens for
-  tiered-mode UPDATE/DELETE whose WHERE cannot be proven to target one tier.
-  `on` emits a dual-tier CTE; `off` rejects with an error and a hint. The
+  tiered-mode `UPDATE`/`DELETE` whose WHERE cannot be proven to target one
+  tier. `on` emits a dual-tier CTE; `off` rejects with an error and a hint. The
   setting is not relevant in decoupled mode (every write is single-tier by
   definition).
 - `coldfront.cold_write_batch_size` (int, default `10000`, minimum `1`) sets
-  how many cold rows a tiered INSERT gathers (see [Caveats](#caveats)) before
-  it writes them to Iceberg as one INSERT. A larger value writes fewer, larger
-  Parquet files, and the remainder always flushes, so a small write stays one
-  file.
+  how many cold rows a tiered `INSERT` gathers (see [Caveats](#caveats)) before
+  it writes them to Iceberg as one `INSERT`. A larger value writes fewer,
+  larger Parquet files, and the remainder always flushes, so a small write
+  stays one file.
 - `coldfront.vector_probe` (bool, default `on`) sets whether a recognized
   similarity search reads only the clusters nearest its query vector. `off`
   gives an exact scan of the whole corpus. The setting affects only a table
@@ -1270,7 +1273,7 @@ The following GUCs adjust write behavior and execution; tune them as needed:
 To go further with ColdFront, consult the following guides:
 
 - The [Architecture](architecture.md) overview describes the tiered
-  architecture, the watermark, the archiver, transparent UPDATE/DELETE, and
+  architecture, the watermark, the archiver, transparent `UPDATE`/`DELETE`, and
   concurrency.
 - The [Decoupled Mode](architecture_decoupled.md) deep dive describes
   decoupled-mode internals, the ACID model, and distributed scaling.

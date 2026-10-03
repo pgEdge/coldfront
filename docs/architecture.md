@@ -25,7 +25,7 @@ is selected:
 | Write mode | In permissive mode (the default), an ambiguous cross-tier `UPDATE`/`DELETE` writes both tiers. In strict mode, such a statement is rejected with a hint. | `coldfront.allow_mixed_writes` (USERSET) selects the write mode. |
 
 Both storage modes coexist in one database and share **one** code path: the
-transparent view and read rewriter, the INSERT/UPDATE/DELETE/MERGE hook
+transparent view and read rewriter, the `INSERT`/`UPDATE`/`DELETE`/`MERGE` hook
 (`emit_cold` / `emit_hot` / `emit_dual` in
 [`extension/coldfront/src/coldfront.c`](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/src/coldfront.c)),
 and the per-table claim (`coldfront._take_iceberg_claim`) that every cold write
@@ -179,10 +179,10 @@ loading on `ATTACH`. So `coldfront.ensure_attached()` / `ensure_pg_attached()`
 are `SECURITY DEFINER` with a pinned `search_path`: the extension load +
 `ATTACH` run elevated (gates key off `GetUserId()`, the effective user), and
 because the DuckDB instance is per-backend the attach persists for the
-session - every subsequent cold read / `_exec_iceberg_with_claim` then
-runs as the **app role** over S3/httpfs, never touching `LocalFileSystem`. The
-app role needs only `duckdb.postgres_role` membership, object grants, and SET
-on the superuser-only `duckdb.unsafe_allow_execution_inside_functions`
+session - every subsequent cold read / `_exec_iceberg_with_claim` then runs
+as the **app role** over S3/httpfs, never touching `LocalFileSystem`. The app
+role needs only `duckdb.postgres_role` membership, object grants, and SET on
+the superuser-only `duckdb.unsafe_allow_execution_inside_functions`
 parameter, which the cross-tier move needs; **no superuser, no
 `pg_{read,write}_server_files`**.
 
@@ -244,18 +244,18 @@ WHERE r['ts'] < '2026-03-01'::timestamptz;
 
 Applications use the transparent view exactly like a table. A
 `post_parse_analyze_hook` in the coldfront extension intercepts
-INSERT/UPDATE/DELETE/MERGE whose target is a registered relation - resolved in
-`coldfront.tiered_views` by name (`schema_name`, `relname`) - and rewrites the
-parsed `Query` so it lands in the correct tier; cold-side writes go through
-`_exec_iceberg_with_claim` (see
+`INSERT`/`UPDATE`/`DELETE`/`MERGE` whose target is a registered relation -
+resolved in `coldfront.tiered_views` by name (`schema_name`, `relname`) - and
+rewrites the parsed `Query` so it lands in the correct tier; cold-side writes
+go through `_exec_iceberg_with_claim` (see
 [Concurrency](#concurrency-and-pgedge-spock-deployments)). A
 `ProcessUtility_hook` handles DDL on the same relations.
 
-The same parse-analyze hook prepares a SELECT that DuckDB will run, wherever in
-the statement the view is named (a CTE, a sub-select, a set-operation branch):
-`date_bin`, the `::jsonb` cast, `jsonb_array_length` and the JSON builders
-(`jsonb_build_object`, `jsonb_agg` and their `json_` twins) are rewritten into
-spellings both engines accept (see
+The same parse-analyze hook prepares a `SELECT` that DuckDB will run, wherever
+in the statement the view is named (a CTE, a sub-select, a set-operation
+branch): `date_bin`, the `::jsonb` cast, `jsonb_array_length` and the JSON
+builders (`jsonb_build_object`, `jsonb_agg` and their `json_` twins) are
+rewritten into spellings both engines accept (see
 [usage.md → Supported Column Types](usage.md#supported-column-types)). A
 `planner_hook` folds bound parameters into such a read before pg_duckdb plans
 it when a parameter sits where DuckDB cannot type a placeholder (a direct
@@ -284,8 +284,8 @@ How the hook splits a write is mode-specific:
 
 - In tiered mode, the hook routes by the partition-column watermark - hot heap
   vs cold Iceberg, with dual-tier writes for ambiguous predicates. See
-  [architecture_tiered.md → Transparent INSERT](architecture_tiered.md#transparent-insert)
-  and [→ UPDATE/DELETE](architecture_tiered.md#transparent-updatedelete).
+  [architecture_tiered.md → Transparent `INSERT`](architecture_tiered.md#transparent-insert)
+  and [→ `UPDATE`/`DELETE`](architecture_tiered.md#transparent-updatedelete).
 - In decoupled mode, the hook always classifies `TIER_COLD`, so every write is
   a single-tier Iceberg write. See
   [architecture_decoupled.md](architecture_decoupled.md).
@@ -336,7 +336,7 @@ ColdFront coordinates concurrent writes across the cluster as follows:
 - Hot writes are replicated by Spock normally (standard PG DML).
 - Cold writes via `duckdb.raw_query()` from multiple nodes are serialized
   PG-side by the **bakery protocol** in the coldfront extension - every
-  iceberg-only INSERT/UPDATE/DELETE/MERGE wraps in
+  iceberg-only `INSERT`/`UPDATE`/`DELETE`/`MERGE` wraps in
   `coldfront._exec_iceberg_with_claim`, which holds a globally-ordered
   Snowflake ticket via the Spock-replicated `coldfront.claims` table and waits
   for its turn before issuing the iceberg commit. There are no 409s and no
@@ -346,7 +346,7 @@ ColdFront coordinates concurrent writes across the cluster as follows:
 
 ### Cold-Write Strategy: Stock vs Patched duckdb-iceberg
 
-Most cold writes run through `_exec_iceberg_with_claim`; the tiered INSERT's
+Most cold writes run through `_exec_iceberg_with_claim`; the tiered `INSERT`'s
 cold sink and the cross-tier move take the claim through `_take_iceberg_claim`
 themselves. What differs is *when* the bakery ticket is held. The async
 ordering is used only on a mesh node with the bakery enabled, and only when
@@ -411,8 +411,8 @@ but `coldfront._mirror_iceberg_alter` skips the Iceberg `ALTER` there (it
 runs under `session_replication_role = replica`) because the originator
 already evolved the shared Lakekeeper catalog. Because the registry is
 name-keyed (see [Registry Keying](#registry-keying-by-name-not-oid)), the
-row is identical on every node: the rebuild needs no re-pointing. DROP and
-TRUNCATE are blocked on every node. What a tiered table additionally needs
+row is identical on every node: the rebuild needs no re-pointing. `DROP` and
+`TRUNCATE` are blocked on every node. What a tiered table additionally needs
 to be usable on a peer is covered next.
 
 The tiered-specific cross-node behavior - what replicates so a tiered table is
@@ -433,8 +433,8 @@ actually produces**. The DDL-rebuild path does `DROP`+`CREATE` on the view,
 minting a new view OID each time, and the archiver's cutover replaces it with
 `CREATE OR REPLACE VIEW` (same OID) - in both cases the name is unchanged. An
 OID key would have to be re-pointed on every DDL rebuild; a name key is not.
-The one event that *does* change the name, `ALTER VIEW … RENAME`, migrates the
-registry row and the watermark to the new name in a single step
+The one event that *does* change the name, `ALTER VIEW … RENAME`, migrates
+the registry row and the watermark to the new name in a single step
 (`_rename_tiered_view`), exactly as the watermark is name-keyed.
 
 The name also **replicates cleanly across a Spock mesh**: it is
@@ -503,7 +503,7 @@ in [usage.md](usage.md#managing-partitioned-tables-cli).
 
 ## Known Limitations
 
-These apply to both storage modes. Tiered-only limitations (cold RETURNING,
+These apply to both storage modes. Tiered-only limitations (cold `RETURNING`,
 dual-tier command tag, crash-safety of permissive writes, partition-scheme
 constraints, autovacuum-vs-cutover) are in
 [architecture_tiered.md → Tiered-Specific Limitations](architecture_tiered.md#tiered-specific-limitations).
@@ -631,14 +631,14 @@ pg_duckdb has a fully-native, in-process Postgres-table reader for analytics on
 PG heap data, but that machinery is **not reachable** from the write path into
 an attached Iceberg catalog.
 
-As the workarounds in use today, a tiered INSERT renders its cold rows in the
+As the workarounds in use today, a tiered `INSERT` renders its cold rows in the
 backend (`coldfront._cold_sink`) and writes them to Iceberg in batched
-`duckdb.raw_query` INSERTs, and a decoupled `INSERT … SELECT` from a
+`duckdb.raw_query` `INSERT`s, and a decoupled `INSERT … SELECT` from a
 PostgreSQL table reads it through the DuckDB `postgres` extension's
 `pglocal.<schema>.<table>` ATTACH, pipelining rows over libpq (loopback) →
-DuckDB executor → Iceberg writer → S3. Neither is the in-process reader: the
-first pays for the per-row rendering, the second for the libpq round-trip per
-row batch.
+DuckDB executor → Iceberg writer → S3. Neither is the in-process reader:
+the first pays for the per-row rendering, the second for the libpq round-trip
+per row batch.
 
 The desired end-state is a way to drive the native in-process reader straight
 into the Iceberg writer - e.g. a `COPY` form:
@@ -672,11 +672,11 @@ unaffected, because that plan never expands the view, so no DuckDB item reaches
 the hook.
 
 As the workaround in use today, ColdFront's `post_parse_analyze_hook` rewrites
-INSERT/UPDATE/DELETE/MERGE on a registered view into its hot, cold or dual emit
-before planning, so on the paths ColdFront owns pg_duckdb only ever sees a
-shape it accepts. What has no workaround is a view an application defines over
-cold data with its own `INSTEAD OF UPDATE`/`DELETE` triggers, or an
-`INSERT ... SELECT` drawing from such a view.
+`INSERT`/`UPDATE`/`DELETE`/`MERGE` on a registered view into its hot, cold or
+dual emit before planning, so on the paths ColdFront owns pg_duckdb only ever
+sees a shape it accepts. What has no workaround is a view an application
+defines over cold data with its own `INSTEAD OF UPDATE`/`DELETE` triggers, or
+an `INSERT ... SELECT` drawing from such a view.
 
 In the upstream shape that would drop it, where `NeedsDuckdbExecution` is true
 and `IsAllowedStatement` is false, pg_duckdb chains to the previous planner
