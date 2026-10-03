@@ -240,6 +240,10 @@ this project adheres to
   down` without `-v` kept the PostgreSQL and object-store data and lost the
   catalog: the next `up` had no warehouse and no table metadata. It has the
   `lkdata` volume, and the teardown text names it.
+- The hint on a refused `TRUNCATE` of a tiered relation said to truncate each
+  tier, a statement the same check refuses. It names what the check allows:
+  the hot partitions one at a time and a `DELETE` through the view for the
+  cold rows, or the `DELETE` alone for an iceberg-only view.
 
 ## [1.0.0-beta2] - 2026-08-08
 

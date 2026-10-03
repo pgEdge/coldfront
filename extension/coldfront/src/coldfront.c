@@ -4540,13 +4540,14 @@ lookup_tiered_by_hot_oid(Oid relid, TieredDDLInfo *out)
 }
 
 /*
- * Returns true if relid is a registered tiered relation — either the hot table
+ * Returns true if relid is a registered tiered relation, either the hot table
  * or the transparent view. The utility hook blocks DROP/TRUNCATE on either side
- * with it. Single
- * query, schema-safe via to_regclass (see lookup_tiered_by_hot_oid).
+ * with it. When has_hot is given it reports whether the registration has a hot
+ * table (false for an iceberg-only view). Single query, schema-safe via
+ * to_regclass (see lookup_tiered_by_hot_oid).
  */
 static bool
-relid_is_tiered(Oid relid)
+relid_is_tiered(Oid relid, bool *has_hot)
 {
     bool           found = false;
     StringInfoData sql;
@@ -4558,7 +4559,7 @@ relid_is_tiered(Oid relid)
 
     initStringInfo(&sql);
     appendStringInfo(&sql,
-        "SELECT 1 FROM coldfront.tiered_views "
+        "SELECT hot_table IS NOT NULL FROM coldfront.tiered_views "
         "WHERE (schema_name = %s AND relname = %s) "
         "   OR (hot_table IS NOT NULL AND to_regclass(hot_table)::oid = %u) "
         "LIMIT 1",
@@ -4566,7 +4567,15 @@ relid_is_tiered(Oid relid)
         quote_literal_cstr(get_rel_name(relid)),
         relid);
     if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed == 1)
+    {
+        bool isnull;
+
         found = true;
+        if (has_hot)
+            *has_hot = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+                                                  SPI_tuptable->tupdesc, 1,
+                                                  &isnull)) && !isnull;
+    }
     pfree(sql.data);
 
     SPI_finish();
@@ -4785,7 +4794,7 @@ cf_handle_drop(const CfUtilityCtx *u, DropStmt *ds)
             List     *names = (List *) lfirst(lc);
             RangeVar *rv    = makeRangeVarFromNameList(names);
             Oid       relid = RangeVarGetRelid(rv, NoLock, true);
-            if (relid_is_tiered(relid))
+            if (relid_is_tiered(relid, NULL))
             {
                 char *ns   = get_namespace_name(get_rel_namespace(relid));
                 char *name = get_rel_name(relid);
@@ -4812,16 +4821,18 @@ cf_handle_truncate(const CfUtilityCtx *u, TruncateStmt *ts)
     {
         RangeVar *rv    = (RangeVar *) lfirst(lc);
         Oid       relid = RangeVarGetRelid(rv, NoLock, true);
-        if (relid_is_tiered(relid))
+        bool      has_hot;
+        if (relid_is_tiered(relid, &has_hot))
         {
             char *ns   = get_namespace_name(get_rel_namespace(relid));
             char *name = get_rel_name(relid);
             ereport(ERROR,
                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                 errmsg("coldfront: cannot TRUNCATE tiered table \"%s.%s\" — cold-tier rows would remain visible",
+                 errmsg("coldfront: cannot TRUNCATE tiered table \"%s.%s\": cold-tier rows would remain visible",
                         ns, name),
-                 errhint("Blocked by design: cold-tier rows live in Iceberg and would remain "
-                         "visible through the view. Truncate each tier explicitly.")));
+                 has_hot
+                     ? errhint("Truncate the hot partitions individually and delete the cold rows through the view.")
+                     : errhint("Delete the rows through the view.")));
         }
     }
     cf_call_through(u);
@@ -4943,7 +4954,7 @@ cf_match_rename_target(RenameStmt *rs, TieredDDLInfo *info, bool *via_hot,
          * view rename). The registry is keyed by the view's (schema,
          * relname), resolved from the view relid directly — no SPI. */
         *view_relid = RangeVarGetRelid(rs->relation, NoLock, true);
-        if (relid_is_tiered(*view_relid))
+        if (relid_is_tiered(*view_relid, NULL))
         {
             MemoryContext oldcxt = MemoryContextSwitchTo(CurTransactionContext);
             info->view_schema  = get_namespace_name(get_rel_namespace(*view_relid));
