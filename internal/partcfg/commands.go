@@ -983,12 +983,14 @@ EXAMPLES:
 }
 
 // applyImport connects, refuses a file whose iceberg keys disagree with the
-// server, then writes every table through writeRow, the same validated path
+// server, writes the cold-store stanza (when the file has one) as the storage
+// secret, then writes every table through writeRow, the same validated path
 // `register` uses, so an imported table is checked exactly as a
 // singly-registered one (PK superset, retention > hot). A failure names the
-// offending table and stops the import. The cold-store stanza, when the file
-// has one, then becomes the storage secret, and the whole file is verified
-// against the server it was just written to.
+// offending table and stops the import. The secret goes in first because a
+// committed table row is acted on at once and needs the store the stanza
+// describes. The whole file is then verified against the server it was just
+// written to.
 func applyImport(ctx context.Context, dsn string, cfg *config.Config, dryRun bool) error {
 	tables := cfg.Archiver.Tables
 	conn, err := openConn(ctx, dsn)
@@ -1009,13 +1011,13 @@ func applyImport(ctx context.Context, dsn string, cfg *config.Config, dryRun boo
 		fmt.Printf("dry-run OK: would import %d table(s) into coldfront.partition_config\n", len(tables))
 		return nil
 	}
+	if err := importSecret(ctx, conn, cfg); err != nil {
+		return err
+	}
 	if err := importTables(ctx, conn, tables); err != nil {
 		return err
 	}
 	fmt.Printf("imported %d table(s) into coldfront.partition_config\n", len(tables))
-	if err := importSecret(ctx, conn, cfg); err != nil {
-		return err
-	}
 	return Verify(ctx, conn, cfg)
 }
 

@@ -5101,6 +5101,44 @@ EOYAML
     fi
     q "$HOST" "DROP TABLE IF EXISTS cli_catdrift;" >/dev/null 2>&1
     q "$HOST" "DELETE FROM coldfront.partition_config WHERE schema_name='impexp'; DROP SCHEMA impexp CASCADE;" >/dev/null 2>&1
+    # TC-227: the store stanza is written before the table rows, so an import
+    # whose storage-secret setter fails writes no row. A trigger that raises on
+    # coldfront.storage_secret stands in for the setter failing.
+    cat >"$TMPD/secretfail.yaml" <<'EOYAML'
+s3:
+  endpoint: "store.invalid:8333"
+  access_key: "refused"
+  secret_key: "refused"
+archiver:
+  tables:
+    - source_table: cli_secretfail
+      partition_period: monthly
+      retention_period: "12 months"
+EOYAML
+    qf "$HOST" <<'EOSQL' >"$TMPD/secretfail-setup.log" 2>&1
+CREATE TABLE public.cli_secretfail (id bigint, ts timestamptz NOT NULL, PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);
+CREATE FUNCTION public.tc227_refuse() RETURNS trigger LANGUAGE plpgsql AS $f$
+BEGIN RAISE EXCEPTION 'TC-227: storage secret refused'; END $f$;
+CREATE TRIGGER tc227_refuse BEFORE INSERT OR UPDATE ON coldfront.storage_secret
+    FOR EACH ROW EXECUTE FUNCTION public.tc227_refuse();
+EOSQL
+    if grep -q ERROR "$TMPD/secretfail-setup.log"; then
+        fail "TC-227: setup failed (see $TMPD/secretfail-setup.log)"; tail -3 "$TMPD/secretfail-setup.log"; return
+    fi
+    local secret_before
+    secret_before="$(q "$HOST" "SELECT storage_type || '|' || coalesce(key_id, '') || '|' || coalesce(endpoint, '') FROM coldfront.storage_secret;")"
+    if "$PARTITIONER" import --config "$TMPD/secretfail.yaml" >"$TMPD/secretfail.log" 2>&1; then
+        fail "TC-227: import succeeded although the storage-secret setter failed"
+    else
+        pass "TC-227: import fails when the storage-secret setter fails"
+    fi
+    q "$HOST" "DROP TRIGGER IF EXISTS tc227_refuse ON coldfront.storage_secret; DROP FUNCTION IF EXISTS public.tc227_refuse();" >/dev/null 2>&1
+    assert_contains "TC-227: the failure names the store stanza" "import s3 stanza" "$(cat "$TMPD/secretfail.log")"
+    assert_eq "TC-227: the failed import wrote no table row" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name = 'cli_secretfail';")"
+    assert_eq "TC-227: the storage secret is unchanged" "$secret_before" \
+        "$(q "$HOST" "SELECT storage_type || '|' || coalesce(key_id, '') || '|' || coalesce(endpoint, '') FROM coldfront.storage_secret;")"
+    q "$HOST" "DROP TABLE IF EXISTS public.cli_secretfail;" >/dev/null 2>&1
 }
 
 # ───────────────────────────────────────────────────────────────────────────

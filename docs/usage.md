@@ -171,20 +171,21 @@ archiver:
 ./bin/archiver import --config config.yaml
 ```
 
-`import` upserts each table into `coldfront.partition_config`, validated as
-`register` validates one table, and writes the `s3:` or `azure:` stanza through
-`set_storage_secret` or `set_storage_secret_azure`, so the file and the server
-agree when it returns. A file may also name `iceberg.warehouse` and
-`iceberg.lakekeeper_endpoint`; the import checks those against the server
-settings, which live in `postgresql.conf`, before it writes anything, and
-refuses the file if they differ. From then on the server is the configuration:
-change it with `set`, `register`, `set_storage_secret` or `postgresql.conf`. A
-YAML passed to any later run is checked, value by value, against what the
-server holds, and any difference is refused with an error that says where
-configuration lives. A file that agrees, such as the output of `export`, runs.
-`s3.region` defaults to `us-east-1`; [Storage Backends](#storage-backends)
-describes the other `s3:` and `azure:` keys, and a deployment on
-[vended credentials](#vended-credentials) has no stanza to import.
+`import` writes the `s3:` or `azure:` stanza through `set_storage_secret` or
+`set_storage_secret_azure`, then upserts each table into
+`coldfront.partition_config`, validated as `register` validates one table, so
+the file and the server agree when it returns. A file may also name
+`iceberg.warehouse` and `iceberg.lakekeeper_endpoint`; the import checks those
+against the server settings, which live in `postgresql.conf`, before it writes
+anything, and refuses the file if they differ. From then on the server is the
+configuration: change it with `set`, `register`, `set_storage_secret` or
+`postgresql.conf`. A YAML passed to any later run is checked, value by value,
+against what the server holds, and any difference is refused with an error
+that says where configuration lives. A file that agrees, such as the output of
+`export`, runs. `s3.region` defaults to `us-east-1`;
+[Storage Backends](#storage-backends) describes the other `s3:` and `azure:`
+keys, and a deployment on [vended credentials](#vended-credentials) has no
+stanza to import.
 
 Register a single table in `coldfront.partition_config` without a file:
 
