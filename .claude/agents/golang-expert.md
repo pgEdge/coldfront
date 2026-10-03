@@ -26,7 +26,8 @@ You are a Go development specialist for ColdFront.
 ## Testing Approach
 
 - Table-driven tests preferred
-- Integration tests with a real database (the `ci/journey.sh` harness), not mocks
+- Integration tests with a real database (the `ci/journey.sh` harness), not
+  mocks
 - Hand-written mocks defined locally in test files when a unit needs one
 - Test files next to the code they test
 - Use `t.Helper()` in test utilities

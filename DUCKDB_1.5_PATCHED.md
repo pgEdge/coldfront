@@ -121,12 +121,14 @@ inside `DoTableUpdates` (PG `PRE_COMMIT`, while the ticket is held):
    3 then land the write on the live head. An expired start snapshot keeps the
    error.
 
-**Formally verified** before the code (the project rule):
-`docs/formal/Bakery.tla` models the async ordering; `Bakery_async.cfg`
-(patched) holds `NoLakekeeperConflict`, `Bakery_race.cfg` (async **without**
-the patch) violates it — the standing proof the patch is mandatory for async.
-**Validated** over Azure ADLS: journey 6b (4 concurrent mixed-tier writers →
-8/8, 0 loss) and 9b (8 concurrent cold writers → 8/8).
+### Formally verified
+
+Before the code (the project rule): `docs/formal/Bakery.tla` models the async
+ordering; `Bakery_async.cfg` (patched) holds `NoLakekeeperConflict`,
+`Bakery_race.cfg` (async **without** the patch) violates it — the standing
+proof the patch is mandatory for async. **Validated** over Azure ADLS: journey
+6b (4 concurrent mixed-tier writers → 8/8, 0 loss) and 9b (8 concurrent cold
+writers → 8/8).
 
 ## 3. Strict-reader interop (two patches + one upstream fix)
 
