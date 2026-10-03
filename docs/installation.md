@@ -1,3 +1,4 @@
+| `iceberg-schema-id-allocation-v15` | Numbers a new table schema one above the highest schema id in the metadata rather than above the current one, so a column change after a `DROP COLUMN` that returned the table to an earlier schema is accepted (a port of upstream duckdb-iceberg c1cfe2ef). |
 # Building ColdFront from Source
 
 This guide builds ColdFront from source, either in Docker on top of the
@@ -36,13 +37,13 @@ table shows each component and its source:
 
 The base build runs as three Docker stages: the first builds libcurl and
 pg_duckdb; the second clones duckdb-iceberg at the pinned ref, applies
-ColdFront's four patches, and compiles the iceberg, avro, azure, and
+ColdFront's five patches, and compiles the iceberg, avro, azure, and
 postgres_scanner extensions under vcpkg; the third assembles the runtime. The
 build `git apply --check`s each patch before applying it, so it fails loudly on
 patch rot rather than silently shipping stock iceberg (which fails with HTTP
 409 under concurrency and writes manifests strict Apache readers reject).
 
-ColdFront applies four patches to duckdb-iceberg. The following table describes
+ColdFront applies five patches to duckdb-iceberg. The following table describes
 what each one does:
 
 | Patch | What it does |
@@ -56,8 +57,9 @@ The bakery patch is mandatory for the no-409 guarantee. The two interop patches
 make the manifests duckdb-iceberg writes readable by strict Apache readers such
 as apache/iceberg-go, the cold-tier compactor; they are inert to pg_duckdb's
 own reads. The fourth is what makes a partitioned cold table correct when
-written from a session whose time zone is not UTC. The canonical recipe - every
-source pin and compile step - is
+written from a session whose time zone is not UTC. The fifth lets a table take
+a new column after a change that returned it to an earlier schema. The
+canonical recipe - every source pin and compile step - is
 [`docker/Dockerfile.duckdb15-base`](https://github.com/pgEdge/ColdFront/blob/main/docker/Dockerfile.duckdb15-base)
 itself.
 

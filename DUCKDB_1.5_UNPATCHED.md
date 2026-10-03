@@ -16,12 +16,13 @@ DuckDB 1.5).
 ## The build delta (vs the patched base)
 
 In `docker/Dockerfile.duckdb15-base`, drop the `COPY` + `git apply --check` +
-`git apply` of all four patches:
+`git apply` of all five patches:
 
 - `iceberg-bakery-aware-commit-refresh-v15.patch`
 - `iceberg-manifest-list-format-version-v15.patch`
 - `iceberg-data-file-format-v15.patch`
 - `iceberg-timestamptz-utc-transforms-v15.patch`
+- `iceberg-schema-id-allocation-v15.patch`
 
 Everything else — libcurl, vcpkg deps, the pins, the extension config, the
 runtime stage — is identical. In `docker/entrypoint.sh`, leave
@@ -85,6 +86,18 @@ prunes it away. The fourth patch, a port of upstream d3c3348271, binds the
 column as the UTC TIMESTAMP it holds before the transform. Unpatched, every
 cold writer, the archiver included, has to run with `TimeZone = 'UTC'`.
 
+## Consequence 4: a schema revert leaves the cold table unable to change again
+
+Stock duckdb-iceberg at the pinned ref numbers each new schema one above the
+current schema's id and reuses an existing schema that equals the new one. A
+`DROP COLUMN` of the column the last `ADD COLUMN` added returns the table to
+an earlier schema, and the next column change computes an id a later schema
+already has and fails with "Attempted to add schema with id N, but this
+already exists in the table!"; the hot-side change rolls back with it, so the
+table can take no further column change in either tier. The fifth patch, a
+port of upstream c1cfe2ef, numbers a new schema one above the highest id in
+the metadata.
+
 ## When unpatched is acceptable
 
 - You don't run the compactor (low cold-write volume, or you compact externally
@@ -93,7 +106,10 @@ cold writer, the archiver included, has to run with `TimeZone = 'UTC'`.
 - you don't need the contended-upload throughput (low write concurrency),
   **and**
 - every cold writer, the archiver included, runs with `TimeZone = 'UTC'`
-  (Consequence 3: every tiered cold table is partitioned by time).
+  (Consequence 3: every tiered cold table is partitioned by time), **and**
+- no tiered table's column list ever returns to an earlier shape, such as a
+  column added and then dropped (Consequence 4: after that the table can take
+  no further column change).
 
 Otherwise run the patched base ([DUCKDB_1.5_PATCHED.md](DUCKDB_1.5_PATCHED.md))
 — the default.

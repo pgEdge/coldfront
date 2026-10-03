@@ -2091,6 +2091,15 @@ story_ddl() {
     assert_peers_agree "TC-198: DROP COLUMN reached the hot table and view" "$cols"
     [ "$MESH" = 1 ] && assert_eq "TC-198: no peer logged an apply exception for the column DDL" "$exc" "$(peer_exceptions)"
 
+    # A second add-and-drop cycle. The DROP returned the Iceberg table to its
+    # first schema, and the next ADD COLUMN must take a schema id no earlier
+    # schema holds.
+    assert_eq "TC-228: a second ADD COLUMN after the DROP is mirrored" "ALTER TABLE" "$(q_may "$HOST" "ALTER TABLE _events ADD COLUMN cnt integer;" | tail -1)"
+    assert_eq "TC-228: the view exposes the re-added column" "cnt" "$(q "$HOST" "SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='events' AND column_name='cnt';")"
+    assert_gt "TC-228: cold tier readable after the second ADD COLUMN" "0" "$(q "$HOST" "SELECT count(*) FROM events WHERE ts < $cutoff;")"
+    assert_eq "TC-228: the re-added column is dropped again" "ALTER TABLE" "$(q_may "$HOST" "ALTER TABLE _events DROP COLUMN cnt;" | tail -1)"
+    assert_eq "TC-228: the re-added column is gone from the view" "0" "$(q "$HOST" "SELECT count(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='events' AND column_name='cnt';")"
+
     # Data-type correspondence is enforced: an unsupported type is rejected up front.
     assert_err "ADD COLUMN inet rejected (no Iceberg mapping)" "no Iceberg-compatible mapping" "$(q_may "$HOST" "ALTER TABLE _events ADD COLUMN ip inet;")"
 
