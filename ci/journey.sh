@@ -1697,11 +1697,11 @@ require_compactor() {
 # the cold tier's many small Parquet files into fewer large ones via
 # apache/iceberg-go RewriteDataFiles, serialized through the bakery (the SAME
 # claim cold writes take — coldfront._claim_iceberg_external, formally cleared in
-# docs/formal). The compactor reads the SAME deployment YAML the archiver does
-# ($TMPD/archiver.yaml). We use the compactor's own --dry-run as the
-# file-count oracle: it reports group(s) before, "nothing to compact" after, and
-# all rows survive. Six same-day cold INSERTs guarantee >= MinInputFiles (5) small
-# files in one group regardless of prior stories.
+# docs/formal). The compactor reads its configuration from the server, as the
+# archiver does. We use the compactor's own --dry-run as the file-count oracle:
+# it reports group(s) before, "nothing to compact" after, and all rows survive.
+# Six same-day cold INSERTs guarantee >= MinInputFiles (5) small files in one
+# group regardless of prior stories.
 # ───────────────────────────────────────────────────────────────────────────
 story_compaction() {
     # The manifest-list format-version interop patch (docker/iceberg-manifest-list-
@@ -4209,11 +4209,8 @@ EOF
         if grep -qi "interval" $TMPD/badiv.log; then pass "register rejects a non-interval period"; else fail "wrong reason"; tail -3 $TMPD/badiv.log; fi
     fi
 
-    # Run the archiver with a connection-only YAML (NO archiver.tables): it must
-    # drive entirely off coldfront.partition_config.
-    cat > $TMPD/conn.yaml <<EOF
-postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
-EOF
+    # Run the archiver with no YAML: it drives entirely off
+    # coldfront.partition_config.
     if "$ARCHIVER" >$TMPD/dbrun.log 2>&1; then
         pass "archiver ran with no YAML at all"
     else
@@ -4227,9 +4224,6 @@ EOF
     "$ARCHIVER" export >$TMPD/export.log 2>&1
     if grep -q "source_table: cli_events" $TMPD/export.log; then pass "export emits cli_events as YAML"; else fail "export missing cli_events"; tail -5 $TMPD/export.log; fi
 
-    # TC-118: archiver.tables in YAML is ignored at runtime — the archiver always
-    # resolves its table set from coldfront.partition_config regardless of what
-    # archiver.tables says in the config file.
     # TC-216: the server is the configuration. A YAML passed to a run is checked
     # against it and any difference is refused with an error that says where
     # configuration lives: one check per kind of value (a table, the store, a
@@ -4306,10 +4300,7 @@ EOF
     assert_eq "TC-119: restored values match pre-deletion snapshot (period|hot|retention|enabled)" \
         "$cfg_sig_before" "$cfg_sig_after"
 
-    # TC-120: set writes to partition_config only — the YAML config file is never
-    # touched. Capture a checksum before, run set, then verify both the DB
-    # change and the unchanged file.
-    local yaml_cksum; yaml_cksum=$(md5sum $TMPD/conn.yaml | awk '{print $1}')
+    # TC-120: set writes partition_config.
     if "$ARCHIVER" set --table cli_events --hot-period "45 days" >$TMPD/setf.log 2>&1; then
         pass "TC-120: set --hot-period succeeded"
     else
@@ -4320,11 +4311,6 @@ EOF
         pass "TC-120: partition_config.hot_period updated to 45 days"
     else
         fail "TC-120: partition_config.hot_period not updated (got: $hot_val)"
-    fi
-    if [ "$(md5sum $TMPD/conn.yaml | awk '{print $1}')" = "$yaml_cksum" ]; then
-        pass "TC-120: YAML file unchanged by set"
-    else
-        fail "TC-120: set modified the YAML file (it must not)"
     fi
 }
 
