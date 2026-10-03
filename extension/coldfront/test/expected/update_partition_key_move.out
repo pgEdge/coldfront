@@ -3,7 +3,7 @@
 -- coldfront._cross_tier_move(...) call that relocates the matched rows across the
 -- hot/cold cutoff. White-box: we assert the rewrite shape via
 -- EXPLAIN VERBOSE — the rewritten statement is just the function call (no
--- iceberg_scan in it, so the planner needs no Iceberg catalog). The live tier
+-- DuckDB read in it, so the planner needs no Iceberg catalog). The live tier
 -- relocation is exercised in ci/journey.sh. v1 rejects, at parse-analyze, the move
 -- shapes the function does not support.
 CREATE EXTENSION IF NOT EXISTS pg_duckdb;
@@ -57,7 +57,7 @@ HINT:  Move the row by setting only "ts"; update other columns in a separate sta
 -- RETURNING from a move (the cold tier cannot return rows).
 UPDATE public.events SET ts = '2026-06-18 10:00:00+00' WHERE status = 'x' RETURNING id;
 ERROR:  RETURNING is not supported for writes to the cold tier of "events"
-HINT:  The cold tier (Iceberg) cannot return affected rows — duckdb-iceberg does not support RETURNING on writes. Re-run without RETURNING.
+HINT:  The cold tier (Iceberg) cannot return affected rows: duckdb-iceberg does not support RETURNING on writes. Re-run without RETURNING.
 -- a WHERE that pulls in other tables / sub-queries: the cold tier is read in
 -- DuckDB, which can't correlate with Postgres tables, so it is rejected up front.
 UPDATE public.events SET ts = '2026-06-18 10:00:00+00' WHERE id IN (SELECT 1);

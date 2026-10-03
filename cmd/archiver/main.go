@@ -48,7 +48,8 @@ func main() {
 		return
 	}
 
-	configPath := flag.String("config", "config.yaml", "path to config file")
+	configPath := flag.String("config", "", "deployment YAML, checked against the stored configuration; its postgres.dsn connects when --dsn is unset")
+	dsn := flag.String("dsn", "", "PostgreSQL connection string (default: the libpq environment)")
 	debugExportDelay := flag.Duration("debug-export-delay", 0,
 		"sleep this long after Phase 2 (capture+bulk-export) and before Phase 3 "+
 			"(replay+cutover). Test-only knob to widen the window so concurrent "+
@@ -61,15 +62,20 @@ func main() {
 		return
 	}
 
-	cfg, err := config.Load(*configPath)
-	if err != nil {
-		log.Fatalf("load config: %v", err)
+	cfg := &config.Config{}
+	if *configPath != "" {
+		c, err := config.Load(*configPath)
+		if err != nil {
+			log.Fatalf("load config: %v", err)
+		}
+		cfg = c
 	}
 
-	conn, wmStore := setupConnection(ctx, cfg)
+	conn, wmStore := setupConnection(ctx, *dsn, fileConfig(*configPath, cfg))
 	defer func() { _ = conn.Close(ctx) }()
 
-	resolveAndValidateTables(ctx, cfg, conn, *configPath)
+	requireColdTier(ctx, conn)
+	resolveAndValidateTables(ctx, cfg, conn)
 
 	for i := range cfg.Archiver.Tables {
 		prepareAndRunTable(ctx, cfg, &cfg.Archiver.Tables[i], conn, wmStore, *debugExportDelay)
@@ -77,20 +83,23 @@ func main() {
 }
 
 // dispatchCLI handles the non-archive-run invocations: the top-level help
-// overview (no args, or help/-h/--help) and the management subcommands routed
-// through the shared CLI. Returns true when it fully handled the invocation so
-// main should return; false when this is a default archive run (leading "-"
-// flag) that main proceeds with.
+// overview (help/-h/--help) and the management subcommands routed through the
+// shared CLI. Returns true when it fully handled the invocation so main should
+// return; false when this is a default archive run (no arguments, or a leading
+// "-" flag) that main proceeds with.
 func dispatchCLI(ctx context.Context) bool {
 	const defaultDesc = "run one tiering/archive cycle"
-	// Top-level help / overview — no args, or help/-h/--help — lists the
+	// No arguments is the default archive run. help/-h/--help lists the
 	// management subcommands so they are discoverable.
-	if len(os.Args) < 2 || os.Args[1] == "help" || os.Args[1] == "-h" || os.Args[1] == "--help" {
+	if len(os.Args) < 2 {
+		return false
+	}
+	if os.Args[1] == "help" || os.Args[1] == "-h" || os.Args[1] == "--help" {
 		partcfg.PrintTopLevelUsage(os.Stdout, "archiver", defaultDesc)
 		return true
 	}
-	// A management subcommand routes to the shared CLI; with no subcommand the
-	// archiver does its default archive run (--config below).
+	// A management subcommand routes to the shared CLI; a flag means the
+	// default archive run.
 	if !strings.HasPrefix(os.Args[1], "-") {
 		if partcfg.IsCommand(os.Args[1]) {
 			if err := partcfg.Run(ctx, os.Args[1], os.Args[2:]); err != nil {
@@ -105,10 +114,21 @@ func dispatchCLI(ctx context.Context) bool {
 	return false
 }
 
-// setupConnection connects to PostgreSQL, verifies the connection, and ensures
-// the watermark table exists. Any failure log.Fatalf's — this is the cron body.
-func setupConnection(ctx context.Context, cfg *config.Config) (*pgx.Conn, *watermark.Store) {
-	conn, err := partition.Connect(ctx, cfg.Postgres.DSN)
+// fileConfig is the YAML to verify against the server, or nil when the run was
+// given none.
+func fileConfig(path string, cfg *config.Config) *config.Config {
+	if path == "" {
+		return nil
+	}
+	return cfg
+}
+
+// setupConnection connects to PostgreSQL (dsn, else the YAML's postgres.dsn,
+// else the libpq environment), refuses a YAML that disagrees with the stored
+// configuration, verifies the connection, and ensures the watermark table
+// exists. Any failure log.Fatalf's — this is the cron body.
+func setupConnection(ctx context.Context, dsn string, cfg *config.Config) (*pgx.Conn, *watermark.Store) {
+	conn, err := partcfg.Connect(ctx, dsn, cfg)
 	if err != nil {
 		log.Fatalf("connect pg: %v", err)
 	}
@@ -124,16 +144,32 @@ func setupConnection(ctx context.Context, cfg *config.Config) (*pgx.Conn, *water
 	return conn, wmStore
 }
 
+// requireColdTier stops the run on a server with no cold tier: the catalog
+// settings and a storage secret are what every archive cycle needs, and they
+// live in the server, not in a file.
+func requireColdTier(ctx context.Context, conn *pgx.Conn) {
+	var ok bool
+	err := conn.QueryRow(ctx, `SELECT COALESCE(current_setting('coldfront.warehouse', true), '') <> ''
+		   AND COALESCE(current_setting('coldfront.lakekeeper_endpoint', true), '') <> ''
+		   AND EXISTS (SELECT 1 FROM coldfront.storage_secret)`).Scan(&ok)
+	if err != nil {
+		log.Fatalf("read the cold-tier configuration: %v", err)
+	}
+	if !ok {
+		log.Fatalf("this server has no cold tier: set coldfront.warehouse and coldfront.lakekeeper_endpoint in postgresql.conf and run coldfront.set_storage_secret (or set_storage_secret_azure, set_storage_secret_vended), or import a YAML with an s3: or azure: stanza")
+	}
+}
+
 // resolveAndValidateTables loads the managed tables from the replicated
 // coldfront.partition_config table, assigns them onto cfg, and validates the
 // config. Any failure log.Fatalf's.
-func resolveAndValidateTables(ctx context.Context, cfg *config.Config, conn *pgx.Conn, configPath string) {
+func resolveAndValidateTables(ctx context.Context, cfg *config.Config, conn *pgx.Conn) {
 	tables, err := partcfg.ResolveTables(ctx, conn, partcfg.Tiered)
 	if err != nil {
 		log.Fatalf("resolve tables: %v", err)
 	}
 	if len(tables) == 0 {
-		log.Fatalf("no tables in coldfront.partition_config; add one with `archiver register` or seed a YAML with `archiver import --config %s`", configPath)
+		log.Fatalf("no tables in coldfront.partition_config; add one with `archiver register` or write a YAML into the server with `archiver import --config <yaml>`")
 	}
 	log.Printf("loaded %d table(s) from coldfront.partition_config", len(tables))
 	cfg.Archiver.Tables = tables
@@ -211,67 +247,9 @@ func execDuckDB(ctx context.Context, conn *pgx.Conn, sql string) error {
 	return err
 }
 
-// coldSecretSQL builds the CREATE SECRET statement for the cold-store backend.
-// Azure (TYPE azure, CONNECTION_STRING — shared key inside the connection
-// string) when azure.connection_string is set, else S3. The choice mirrors the
-// extension-side coldfront._build_storage_secret_opts(). NOTE: this is a
-// session secret for the archiver's own export; the iceberg COMMIT resolves the
-// credential from the PERSISTENT secret (coldfront.set_storage_secret[_azure]).
-//
-// For S3 we mirror _build_storage_secret_opts exactly: always emit TYPE/KEY_ID/
-// SECRET/REGION, and ONLY when an endpoint is configured append ENDPOINT/
-// URL_STYLE/USE_SSL. An empty endpoint = real AWS S3, where omitting them lets
-// DuckDB use its native virtual-hosted + https endpoint for the region — REQUIRED
-// for AWS Regions launched after 2019-03-20 (e.g. ap-south-2): their DNS does not
-// route path-style requests and returns HTTP 400. A non-empty endpoint = an
-// S3-compatible store (SeaweedFS/MinIO/GCS-interop), path-style by default
-// (override with s3.url_style: vhost).
-func coldSecretSQL(cfg *config.Config) string {
-	if cfg.Azure.ConnectionString != "" {
-		return fmt.Sprintf(
-			"CREATE SECRET IF NOT EXISTS cf_cold_secret (TYPE azure, CONNECTION_STRING %s)",
-			sqlutil.Literal(cfg.Azure.ConnectionString))
-	}
-	s := fmt.Sprintf(
-		"CREATE SECRET IF NOT EXISTS s3_secret (TYPE S3, KEY_ID %s, SECRET %s, REGION %s",
-		sqlutil.Literal(cfg.S3.AccessKey), sqlutil.Literal(cfg.S3.SecretKey),
-		sqlutil.Literal(cfg.S3.Region))
-	if cfg.S3.Endpoint != "" {
-		useSSL := "false"
-		if cfg.S3.UseSSL {
-			useSSL = "true"
-		}
-		urlStyle := cfg.S3.URLStyle
-		if urlStyle == "" {
-			urlStyle = "path"
-		}
-		s += fmt.Sprintf(", ENDPOINT %s, URL_STYLE %s, USE_SSL %s",
-			sqlutil.Literal(cfg.S3.Endpoint), sqlutil.Literal(urlStyle), useSSL)
-	}
-	return s + ")"
-}
-
-// staticCredsConfigured reports whether the config carries static object-store
-// credentials to build a DuckDB secret from (an S3 access key or an Azure
-// connection string). False means a vended deployment: the YAML carries no
-// credentials and Lakekeeper issues them per table. (Config validation has
-// already rejected a partial s3.* config by the time we get here.)
-func staticCredsConfigured(cfg *config.Config) bool {
-	return cfg.S3.AccessKey != "" || cfg.Azure.ConnectionString != ""
-}
-
-// storageSecretVended reports whether the cold store uses vended
-// credentials: coldfront.storage_secret.vended is true. A missing row reads as
-// false (no cold store configured yet).
-func storageSecretVended(ctx context.Context, conn *pgx.Conn) (bool, error) {
-	var vended bool
-	err := conn.QueryRow(ctx,
-		"SELECT COALESCE((SELECT vended FROM coldfront.storage_secret LIMIT 1), false)").Scan(&vended)
-	return vended, err
-}
-
-// attachIceberg sets up the per-connection DuckDB cold-store credential (unless
-// it is vended) and attaches the Lakekeeper catalog. coldfront.ensure_attached()
+// attachIceberg attaches the Lakekeeper catalog. The cold-store credential is
+// the persistent DuckDB secret the stored storage_secret row materialized, so
+// nothing is created here. coldfront.ensure_attached()
 // is the sole ATTACH: it derives the access-delegation mode from the stored
 // storage_secret row (VENDED_CREDENTIALS when vended, else NONE) and pins the
 // bundled httplib HTTP client. The system libcurl client DuckDB 1.5 defaults to
@@ -280,25 +258,7 @@ func storageSecretVended(ctx context.Context, conn *pgx.Conn) (bool, error) {
 // store, which is why CI on SeaweedFS never hit it); curl 8.11.1 made that a hard
 // SIGABRT via CVE-2025-0665. The base now builds curl 8.12.0 (CVE-fixed), but
 // httplib stays pinned: it resolves in-thread, so DuckDB stays fully parallel.
-func attachIceberg(ctx context.Context, conn *pgx.Conn, cfg *config.Config) error {
-	vended, err := storageSecretVended(ctx, conn)
-	if err != nil {
-		return fmt.Errorf("read storage_secret vended flag: %w", err)
-	}
-	static := staticCredsConfigured(cfg)
-	switch {
-	case !static && !vended:
-		return fmt.Errorf("no static s3/azure credentials configured and " +
-			"coldfront.storage_secret is not vended; run coldfront.set_storage_secret[_azure]() " +
-			"or coldfront.set_storage_secret_vended()")
-	case static && vended:
-		log.Printf("coldfront.storage_secret is vended; ignoring static s3/azure credentials in config")
-	case static && !vended:
-		if err := execDuckDB(ctx, conn, coldSecretSQL(cfg)); err != nil {
-			return fmt.Errorf("create cold-store secret: %w", err)
-		}
-	}
-
+func attachIceberg(ctx context.Context, conn *pgx.Conn) error {
 	if _, err := conn.Exec(ctx, "SELECT coldfront.ensure_attached()"); err != nil { // nosemgrep
 		return fmt.Errorf("attach iceberg catalog via ensure_attached: %w", err)
 	}
@@ -401,7 +361,6 @@ type archiveCycle struct {
 	conn             *pgx.Conn
 	wmStore          *watermark.Store
 	partMgr          *partition.Manager
-	viewGen          *view.Generator
 	iceTable         string
 	now              time.Time
 	debugExportDelay time.Duration
@@ -431,7 +390,6 @@ func runCycle(ctx context.Context, cfg *config.Config, t *config.TableConfig, co
 	ac := &archiveCycle{
 		cfg: cfg, t: t, conn: conn, wmStore: wmStore,
 		partMgr:  partition.NewManager(conn),
-		viewGen:  view.NewGenerator(conn),
 		iceTable: icebergRef(t.SourceSchema, t.SourceTable),
 		now:      now, debugExportDelay: debugExportDelay,
 	}
@@ -496,7 +454,7 @@ func (ac *archiveCycle) tierAndExpireSingleLevel(ctx context.Context, hotExpired
 // catalog and ensure the (single) Iceberg table exists — needed by both the
 // tiering pass and the cold-expiry DELETE.
 func (ac *archiveCycle) attachAndEnsureTable(ctx context.Context) error {
-	if err := attachIceberg(ctx, ac.conn, ac.cfg); err != nil {
+	if err := attachIceberg(ctx, ac.conn); err != nil {
 		return err
 	}
 	if err := ensureIcebergTable(ctx, ac.conn, ac.t, ac.iceTable, ac.listCol); err != nil {
@@ -634,10 +592,13 @@ func (ac *archiveCycle) archiveOnePartition(ctx context.Context, part partition.
 }
 
 // bootstrapTieredView is the first-cycle bootstrap shared by both tiering
-// passes: read the watermark, rename {source} → _{source} and (re)create the
-// unified view with cutoff=watermark, then register the tiered view. Idempotent
-// — the swap SQL no-ops if the rename already happened. Called ONCE before the
-// per-partition / per-period loop, never inside it.
+// passes: read the watermark, then in one transaction rename {source} to
+// _{source}, (re)create the unified view with cutoff=watermark and register the
+// tiered view. One transaction, so the view never exists without the registry
+// row the hook resolves it by, on this node or on a Spock peer, which applies
+// the transaction as a unit. Idempotent: the swap SQL no-ops if the rename
+// already happened. Called ONCE before the per-partition / per-period loop,
+// never inside it.
 func (ac *archiveCycle) bootstrapTieredView(ctx context.Context, columns []view.Column) error {
 	t, iceTable := ac.t, ac.iceTable
 	wmCutoff, found, err := ac.wmStore.Get(ctx, t.SourceSchema, t.SourceTable)
@@ -653,21 +614,21 @@ func (ac *archiveCycle) bootstrapTieredView(ctx context.Context, columns []view.
 		PartitionColumn: t.PartitionColumn,
 		Columns:         columns,
 	}
-	if err := ac.viewGen.Recreate(ctx, bootstrapCfg); err != nil {
+	tx, err := ac.conn.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("begin bootstrap: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := view.NewGenerator(tx).Recreate(ctx, bootstrapCfg); err != nil {
 		return fmt.Errorf("bootstrap view: %w", err)
 	}
 	hotTable := pgx.Identifier{t.SourceSchema, "_" + t.SourceTable}.Sanitize()
-	if err := registerTieredView(ctx, ac.conn, t.SourceSchema, t.SourceTable,
+	if err := registerTieredView(ctx, tx, t.SourceSchema, t.SourceTable,
 		hotTable, iceTable, t.PartitionColumn, vectorColumns(columns)); err != nil {
 		return fmt.Errorf("register tiered view: %w", err)
 	}
-	// The INSTEAD OF INSERT trigger, from the extension's one builder. After the
-	// registration, because the builder reads the registry for the hot table, the
-	// Iceberg ref and the vector columns.
-	if _, err := ac.conn.Exec(ctx,
-		"SELECT coldfront._rebuild_write_trigger($1, $2)",
-		t.SourceSchema, t.SourceTable); err != nil {
-		return fmt.Errorf("build write trigger: %w", err)
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit bootstrap: %w", err)
 	}
 	return nil
 }
@@ -752,7 +713,6 @@ func runCycleTwoLevel(ctx context.Context, cfg *config.Config, t *config.TableCo
 	ac := &archiveCycle{
 		cfg: cfg, t: t, conn: conn, wmStore: wmStore,
 		partMgr:  partition.NewManager(conn),
-		viewGen:  view.NewGenerator(conn),
 		iceTable: icebergRef(t.SourceSchema, t.SourceTable),
 		now:      now, debugExportDelay: debugExportDelay,
 	}
@@ -826,15 +786,17 @@ func (ac *archiveCycle) tierAndExpireTwoLevel(ctx context.Context, leaves []leaf
 // premakeListChildren is step 1 of the 2-level cycle: for each LIST value ensure
 // its child (attached to the physical top, named by the stable source name) and
 // its forward window + current partition exist, logging once if any was behind.
+// Two values that map to one child name fail the cycle before it creates any.
 func (ac *archiveCycle) premakeListChildren(ctx context.Context, parent string, values []string) ([]childRef, error) {
 	t, partMgr, now := ac.t, ac.partMgr, ac.now
+	names, err := partition.SubNames(t.SourceTable, values)
+	if err != nil {
+		return nil, err
+	}
 	var children []childRef
 	anyBehind := false
-	for _, v := range values {
-		child, err := partition.SubName(t.SourceTable, v)
-		if err != nil {
-			return nil, fmt.Errorf("sub-partition name for %q: %w", v, err)
-		}
+	for i, v := range values {
+		child := names[i]
 		if err := partMgr.EnsureListChild(ctx, parent, t.SourceSchema, v, child, t.PartitionColumn); err != nil {
 			return nil, err
 		}
@@ -1482,8 +1444,8 @@ func ensureIcebergTable(ctx context.Context, conn *pgx.Conn, t *config.TableConf
 // registerTieredView upserts a row in coldfront.tiered_views so the
 // coldfront C extension can identify this view as a tiered target and
 // rewrite UPDATE/DELETE into dual-tier CTEs. Called after every view recreate.
-func registerTieredView(ctx context.Context, conn *pgx.Conn, schema, table, hotTable, icebergTable, partitionCol string, vecColumns []string) error {
-	_, err := conn.Exec(ctx /* nosemgrep */, `
+func registerTieredView(ctx context.Context, db view.DBTX, schema, table, hotTable, icebergTable, partitionCol string, vecColumns []string) error {
+	_, err := db.Exec(ctx /* nosemgrep */, `
 		INSERT INTO coldfront.tiered_views (schema_name, relname, hot_table, iceberg_table, partition_col, vec_columns)
 		VALUES ($1, $2, $3, $4, $5, NULLIF($6, '{}'::text[]))
 		ON CONFLICT (schema_name, relname) DO UPDATE
@@ -1529,7 +1491,7 @@ func pgFormatTypeToDuckDB(s string) (storage, viewCastType string, err error) {
 
 	// inet/cidr are NOT supported. pg_duckdb cannot represent PG inet (Oid 869)
 	// anywhere in a query it plans, and every read through an Iceberg-backed view
-	// is planned by pg_duckdb (the view embeds iceberg_scan). It rejects the
+	// is planned by pg_duckdb (the view embeds a DuckDB read). It rejects the
 	// column *reference* at plan time, before any cast — so "store as VARCHAR,
 	// cast back to inet" is impossible. They fall through to the unsupported-type
 	// error below; users store IP data as text.

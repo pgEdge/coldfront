@@ -21,7 +21,7 @@ func loadTable(ctx context.Context, cat *rest.Catalog, ns, name string) (*table.
 }
 
 // expireSnapshots drops snapshots older than olderThan (Iceberg expiry is age-driven; the
-// current snapshot is always kept, and retainLast is a FLOOR — keep at least this many —
+// current snapshot is always kept, and retainLast is a FLOOR, keep at least this many,
 // not a target). When deleteFiles is true (the default) it also deletes the manifests,
 // manifest lists, and data files that ONLY those expired snapshots referenced — which is
 // how the small Parquet files a prior RewriteDataFiles superseded are finally reclaimed
@@ -29,9 +29,12 @@ func loadTable(ctx context.Context, cat *rest.Catalog, ns, name string) (*table.
 // --expire-keep-files operator option, iceberg-go's WithPostCommit(false)), the metadata is
 // expired but the now-unreferenced files are left for a separate deleteOrphans pass. It is
 // an Iceberg commit guarded by AssertRefSnapshotID, so it MUST run while the bakery claim is
-// held: the same stock-ordering discipline RewriteDataFiles uses (docs/formal). Returns the
-// number of snapshots expired.
-func expireSnapshots(ctx context.Context, tbl *table.Table, retainLast int, olderThan time.Duration, deleteFiles bool) (int, error) {
+// held: the same stock-ordering discipline RewriteDataFiles uses (docs/formal). In dryRun it
+// stops at the staged metadata, which iceberg-go builds in memory and writes nowhere.
+// Returns the number of snapshots expired and the number kept, both counted from the
+// resulting metadata, so the table's own history.expire.* properties and the ref's
+// overrides are reflected.
+func expireSnapshots(ctx context.Context, tbl *table.Table, retainLast int, olderThan time.Duration, deleteFiles, dryRun bool) (expired, kept int, err error) {
 	before := len(tbl.Metadata().Snapshots())
 	txn := tbl.NewTransaction()
 	if err := txn.ExpireSnapshots(
@@ -39,13 +42,20 @@ func expireSnapshots(ctx context.Context, tbl *table.Table, retainLast int, olde
 		table.WithOlderThan(olderThan),
 		table.WithPostCommit(deleteFiles),
 	); err != nil {
-		return 0, fmt.Errorf("expire snapshots: %w", err)
+		return 0, 0, fmt.Errorf("expire snapshots: %w", err)
 	}
-	updated, err := txn.Commit(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("commit expire snapshots: %w", err)
+	var after *table.Table
+	if dryRun {
+		staged, err := txn.StagedTable()
+		if err != nil {
+			return 0, 0, fmt.Errorf("stage expire snapshots: %w", err)
+		}
+		after = staged.Table
+	} else if after, err = txn.Commit(ctx); err != nil {
+		return 0, 0, fmt.Errorf("commit expire snapshots: %w", err)
 	}
-	return before - len(updated.Metadata().Snapshots()), nil
+	kept = len(after.Metadata().Snapshots())
+	return before - kept, kept, nil
 }
 
 // deleteOrphans removes files under the table's location that no retained snapshot

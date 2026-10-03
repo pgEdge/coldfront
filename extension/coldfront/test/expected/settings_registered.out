@@ -1,0 +1,66 @@
+-- Every coldfront.* setting is registered in _PG_init: it has a type, a
+-- default, bounds and a context, and the prefix is reserved, so a mistyped
+-- name is refused instead of being kept as a placeholder.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_duckdb;
+CREATE EXTENSION IF NOT EXISTS coldfront;
+DROP ROLE IF EXISTS cf_settings_app;
+RESET client_min_messages;
+SELECT name, vartype, context, boot_val, min_val
+  FROM pg_settings WHERE name LIKE 'coldfront.%' ORDER BY name COLLATE "C";
+               name                | vartype |  context  | boot_val | min_val 
+-----------------------------------+---------+-----------+----------+---------
+ coldfront._async_downgrade_warned | bool    | user      | off      | 
+ coldfront._claimed                | string  | user      |          | 
+ coldfront.allow_mixed_writes      | bool    | user      | on       | 
+ coldfront.cold_write_batch_size   | integer | user      | 10000    | 1
+ coldfront.iceberg_async_parquet   | bool    | user      | off      | 
+ coldfront.iceberg_bakery_patch    | bool    | superuser | off      | 
+ coldfront.lakekeeper_endpoint     | string  | superuser |          | 
+ coldfront.local_pg_dsn            | string  | superuser |          | 
+ coldfront.loopback_dsn            | string  | superuser |          | 
+ coldfront.peer_alive_window_ms    | integer | superuser | 10000    | 1
+ coldfront.vector_nprobe           | integer | user      | 0        | 0
+ coldfront.vector_probe            | bool    | user      | on       | 
+ coldfront.warehouse               | string  | superuser |          | 
+(13 rows)
+
+-- The bakery's dead-peer window is superuser-only and at least 1 ms.
+CREATE ROLE cf_settings_app;
+SET ROLE cf_settings_app;
+SET coldfront.peer_alive_window_ms = 1;
+ERROR:  permission denied to set parameter "coldfront.peer_alive_window_ms"
+RESET ROLE;
+SET coldfront.peer_alive_window_ms = 0;
+ERROR:  0 is outside the valid range for parameter "coldfront.peer_alive_window_ms" (1 .. 2147483647)
+SHOW coldfront.peer_alive_window_ms;
+ coldfront.peer_alive_window_ms 
+--------------------------------
+ 10000
+(1 row)
+
+-- A name under the reserved prefix that is not a setting is refused.
+SET coldfront.peer_alive_window = 1;
+ERROR:  invalid configuration parameter name "coldfront.peer_alive_window"
+DETAIL:  "coldfront" is a reserved prefix.
+-- The async switch stays session-settable: the cross-tier move and the Iceberg
+-- ALTER path SET LOCAL it.
+BEGIN;
+SET LOCAL coldfront.iceberg_async_parquet = off;
+SHOW coldfront.iceberg_async_parquet;
+ coldfront.iceberg_async_parquet 
+---------------------------------
+ off
+(1 row)
+
+COMMIT;
+-- The loopback accepts a unix-socket DSN only: every onboarded role can read
+-- the setting, so it must never need a password.
+SET coldfront.loopback_dsn = 'host=127.0.0.1 dbname=regress';
+SELECT coldfront._loopback('SELECT 1');
+ERROR:  coldfront: coldfront.loopback_dsn must name a unix socket (host=/directory), not host=127.0.0.1
+SET coldfront.loopback_dsn = 'hostaddr=127.0.0.1 dbname=regress';
+SELECT coldfront._loopback('SELECT 1');
+ERROR:  coldfront: coldfront.loopback_dsn must name a unix socket (host=/directory), not hostaddr=127.0.0.1
+RESET coldfront.loopback_dsn;
+DROP ROLE cf_settings_app;

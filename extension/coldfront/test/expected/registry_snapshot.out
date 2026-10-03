@@ -47,14 +47,14 @@ EXPLAIN (COSTS OFF)
                                        QUERY PLAN                                        
 -----------------------------------------------------------------------------------------
  Nested Loop
-   CTE hot
+   CTE coldfront_hot
      ->  Update on _events
            ->  Seq Scan on _events
                  Filter: (ts < 'Tue Jan 01 00:00:00 2019 UTC'::timestamp with time zone)
-   CTE cold
+   CTE coldfront_cold
      ->  Result
-   ->  CTE Scan on cold c
-   ->  CTE Scan on hot h
+   ->  CTE Scan on coldfront_cold c
+   ->  CTE Scan on coldfront_hot h
 (9 rows)
 
 ROLLBACK;

@@ -3,7 +3,7 @@
 -- coldfront._cross_tier_move(...) call that relocates the matched rows across the
 -- hot/cold cutoff. White-box: we assert the rewrite shape via
 -- EXPLAIN VERBOSE — the rewritten statement is just the function call (no
--- iceberg_scan in it, so the planner needs no Iceberg catalog). The live tier
+-- DuckDB read in it, so the planner needs no Iceberg catalog). The live tier
 -- relocation is exercised in ci/journey.sh. v1 rejects, at parse-analyze, the move
 -- shapes the function does not support.
 

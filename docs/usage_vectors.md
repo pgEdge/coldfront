@@ -79,11 +79,8 @@ SELECT id, body
  LIMIT 10;
 ```
 
-`<=>` (cosine) and `<->` (Euclidean) work on both tiers. `<#>` (negative inner
-product) works only while a query runs entirely in PostgreSQL: DuckDB has no
-`<#>` operator, so any query that reads the cold tier fails with a parser
-error. Write `list_negative_inner_product(embedding, ARRAY[…]::real[])`
-instead. Use `<=>` unless you have a reason not to; clustering is built on
+`<=>` (cosine), `<->` (Euclidean) and `<#>` (negative inner product) work on
+both tiers. Use `<=>` unless you have a reason not to; clustering is built on
 cosine.
 
 ### Three Rules for the Query Vector
@@ -124,7 +121,7 @@ VALUES ('public', 'chunks', 'embedding', 500, 20);
 CALL coldfront.vector_train('public', 'chunks', 'embedding');
 ```
 
-The `vector_config` row has no default for `nlist` or `nprobe`, so the INSERT
+The `vector_config` row has no default for `nlist` or `nprobe`, so the `INSERT`
 names both. Check constraints require `nlist` to be at least 1 and `nprobe` to
 lie between 1 and `nlist`. `schema_name` defaults to `'public'`, and
 `generation` and `addition_cap` default to `0`. `vector_train` maintains

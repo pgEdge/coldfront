@@ -17,7 +17,7 @@ Everything a promoted node needs to serve cold reads/writes must survive a base
 backup and a promotion:
 
 - **`coldfront.warehouse`, `coldfront.lakekeeper_endpoint`,
-  `coldfront.local_pg_dsn`** (and, on mesh nodes, `coldfront.dblink_self`)
+  `coldfront.local_pg_dsn`** (and, on mesh nodes, `coldfront.loopback_dsn`)
   belong in `postgresql.conf` — the ColdFront image entrypoint writes them
   there. They then ride a `pg_basebackup` to every replica and remain in force
   after promotion. Avoid `ALTER SYSTEM` for these: it works
@@ -39,7 +39,7 @@ coordination state to begin accepting writes.
 
 ## Limitation 1 — Iceberg reads on a replica are snapshot-consistent, not linearizable
 
-A hot standby's `iceberg_scan` reads whatever Iceberg snapshot Lakekeeper
+A hot standby's cold reads take whatever Iceberg snapshot Lakekeeper
 points at when the query starts. While the **primary** archives new data or
 commits cold writes, a replica's in-flight read does not observe the concurrent
 commit — it sees the snapshot resolved at query start. This is ordinary Iceberg

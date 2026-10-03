@@ -1,14 +1,13 @@
 # ColdFront walkthrough archiver config: Demo 1 (tiered).
 #
-# Runs INSIDE the compose network (docker compose run --rm archiver), so every
-# endpoint is a compose SERVICE NAME, not localhost. hot_period "30 days" keeps
-# the current month hot and tiers the older months to Iceberg/S3, deterministic
-# because the walkthrough seeds now()-relative timestamps.
-postgres:
-    dsn: "host=db port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
-iceberg:
-    warehouse: "wh"
-    lakekeeper_endpoint: "http://lakekeeper:8181/catalog"
+# An import input: `docker compose run --rm --no-deps archiver import --config
+# /config/archiver.yaml` writes it into the server once, the table into
+# coldfront.partition_config and the store into coldfront.storage_secret. The
+# archiver then runs with no file, connecting from the PG* environment the
+# compose service sets. Endpoints are compose SERVICE NAMES, since the archiver
+# runs inside the compose network. hot_period "30 days" keeps the current month
+# hot and tiers the older months to Iceberg/S3, deterministic because the
+# walkthrough seeds now()-relative timestamps.
 s3:
     endpoint: "seaweedfs:8333"
     region: "us-east-1"

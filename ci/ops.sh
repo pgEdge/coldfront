@@ -150,7 +150,7 @@ q "$DB" "SET ROLE cfapp; INSERT INTO public.cold1 VALUES (102),(103);"    >/dev/
 assert_eq "app role: transparent cold writes landed (read-your-write)" "3" \
     "$(qas cfapp "SELECT count(*) FROM public.cold1 WHERE id IN (101,102,103);")"
 
-# A cross-tier move reads Iceberg with iceberg_scan inside a function, which
+# A cross-tier move reads Iceberg through DuckDB inside a function, which
 # pg_duckdb permits only under a parameter it defines superuser-only. The move
 # runs as the caller, so onboarding grants the app role the right to set it;
 # without that a partition-column UPDATE is denied before any row moves.
@@ -161,6 +161,8 @@ assert_eq "app role CAN set the in-function execution parameter (cross-tier move
 # The boundary holds — three negatives:
 deny_set=$(q_may "$DB" "SET ROLE cfapp; SET coldfront.lakekeeper_endpoint='http://attacker.example/evil';")
 assert_contains "app role CANNOT redirect the elevated ATTACH endpoint (SUSET GUC)" "permission denied" "$deny_set"
+deny_window=$(q_may "$DB" "SET ROLE cfapp; SET coldfront.peer_alive_window_ms = -1;")
+assert_contains "app role CANNOT shrink the bakery's dead-peer window (SUSET GUC)" "permission denied" "$deny_window"
 deny_self=$(q_may "$DB" "SET ROLE cfapp; SELECT coldfront.grant_app_access('cfapp');")
 assert_contains "app role CANNOT self-grant (grant_app_access not PUBLIC-executable)" "permission denied" "$deny_self"
 deny_bare=$(q_may "$DB" "SET ROLE cfnobody; SELECT count(*) FROM public.cold1;")

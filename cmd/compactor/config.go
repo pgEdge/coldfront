@@ -1,53 +1,92 @@
 package main
 
 import (
+	"context"
 	"fmt"
-	"os"
 	"strings"
 
 	iceberg "github.com/apache/iceberg-go"
 	iceio "github.com/apache/iceberg-go/io"
-	"gopkg.in/yaml.v3"
+	"github.com/jackc/pgx/v5"
 )
 
-// Config is the subset of the ColdFront deployment YAML the compactor needs:
-// the Postgres DSN (for the bakery claim) plus the Lakekeeper catalog and the
-// one configured cold-store backend. It deliberately mirrors the archiver's
-// YAML shape so a single config file drives both — but the compactor is a
-// separate Go module, so it parses its own subset rather than importing the
-// archiver's internal/config across the module boundary.
+// Config is what the compactor needs, read from the server it maintains: the
+// Lakekeeper catalog from the coldfront.warehouse and
+// coldfront.lakekeeper_endpoint settings, and the one cold-store backend from
+// the coldfront.storage_secret row, the same configuration every cold write
+// uses.
 type Config struct {
-	Postgres struct {
-		DSN string `yaml:"dsn"`
-	} `yaml:"postgres"`
 	Iceberg struct {
-		Warehouse          string `yaml:"warehouse"`
-		LakekeeperEndpoint string `yaml:"lakekeeper_endpoint"`
-	} `yaml:"iceberg"`
+		Warehouse          string
+		LakekeeperEndpoint string
+	}
 	S3 struct {
-		Endpoint  string `yaml:"endpoint"`
-		Region    string `yaml:"region"`
-		AccessKey string `yaml:"access_key"`
-		SecretKey string `yaml:"secret_key"`
-		UseSSL    bool   `yaml:"use_ssl"`
-		URLStyle  string `yaml:"url_style"`
-	} `yaml:"s3"`
+		Endpoint  string
+		Region    string
+		AccessKey string
+		SecretKey string
+		UseSSL    bool
+		URLStyle  string
+	}
 	Azure struct {
-		ConnectionString string `yaml:"connection_string"`
-	} `yaml:"azure"`
+		ConnectionString string
+	}
 }
 
-// LoadConfig reads and parses the deployment YAML.
-func LoadConfig(path string) (*Config, error) {
-	data, err := os.ReadFile(path)
+// secretRow is the coldfront.storage_secret row, NULLs read as empty strings.
+type secretRow struct {
+	storageType, keyID, secret, endpoint, region, urlStyle, connectionString string
+	useSSL, vended                                                           bool
+}
+
+// loadServerConfig reads the catalog settings and the storage secret over a
+// connection of its own, closed before the bakery connection opens.
+func loadServerConfig(ctx context.Context, dsn string) (*Config, error) {
+	conn, err := pgx.Connect(ctx, dsn)
 	if err != nil {
-		return nil, fmt.Errorf("read config: %w", err)
+		return nil, fmt.Errorf("connect postgres: %w", err)
 	}
-	var c Config
-	if err := yaml.Unmarshal(data, &c); err != nil {
-		return nil, fmt.Errorf("parse config: %w", err)
+	defer func() { _ = conn.Close(ctx) }()
+	var warehouse, endpoint string
+	if err := conn.QueryRow(ctx, `SELECT COALESCE(current_setting('coldfront.warehouse', true), ''),
+		       COALESCE(current_setting('coldfront.lakekeeper_endpoint', true), '')`).Scan(&warehouse, &endpoint); err != nil {
+		return nil, fmt.Errorf("read catalog settings: %w", err)
 	}
-	return &c, nil
+	var r secretRow
+	err = conn.QueryRow(ctx, `SELECT storage_type, COALESCE(key_id, ''), COALESCE(secret, ''), COALESCE(endpoint, ''),
+		       region, url_style, use_ssl, COALESCE(connection_string, ''), vended
+		  FROM coldfront.storage_secret LIMIT 1`).Scan(
+		&r.storageType, &r.keyID, &r.secret, &r.endpoint, &r.region, &r.urlStyle, &r.useSSL, &r.connectionString, &r.vended)
+	if err == pgx.ErrNoRows {
+		return configFromServer(warehouse, endpoint, nil)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("read coldfront.storage_secret: %w", err)
+	}
+	return configFromServer(warehouse, endpoint, &r)
+}
+
+// configFromServer maps the settings and the secret row onto Config. A vended
+// row stores no credential, so nothing is mapped and Lakekeeper's vended
+// credentials are the only ones iceberg-go sees.
+func configFromServer(warehouse, endpoint string, row *secretRow) (*Config, error) {
+	if warehouse == "" || endpoint == "" {
+		return nil, fmt.Errorf("the server has no catalog: set coldfront.warehouse and coldfront.lakekeeper_endpoint in postgresql.conf")
+	}
+	if row == nil {
+		return nil, fmt.Errorf("the server has no cold store: run coldfront.set_storage_secret (or set_storage_secret_azure, set_storage_secret_vended), or import a YAML with an s3: or azure: stanza")
+	}
+	c := &Config{}
+	c.Iceberg.Warehouse, c.Iceberg.LakekeeperEndpoint = warehouse, endpoint
+	switch {
+	case row.vended:
+	case row.storageType == "azure":
+		c.Azure.ConnectionString = row.connectionString
+	default:
+		c.S3.Endpoint, c.S3.Region, c.S3.AccessKey, c.S3.SecretKey = row.endpoint, row.region, row.keyID, row.secret
+		c.S3.UseSSL, c.S3.URLStyle = row.useSSL, row.urlStyle
+	}
+	return c, nil
 }
 
 // splitSchemaTable parses a "schema.table" CLI argument into its parts; a bare

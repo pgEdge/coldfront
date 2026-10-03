@@ -15,7 +15,7 @@ CREATE EXTENSION IF NOT EXISTS coldfront;
 -- White-box: checks the hooks' SQL/DDL, not Iceberg I/O. Real cold I/O is ci/journey.sh; see README.md.
 SET coldfront.warehouse = '';
 SET coldfront.lakekeeper_endpoint = '';
-SET coldfront.dblink_self = '';
+SET coldfront.loopback_dsn = '';
 
 CREATE TABLE public._events (id int, ts timestamptz, status text)
   PARTITION BY RANGE (ts);

@@ -41,7 +41,7 @@ ORDER BY proname;
 SELECT name, context
 FROM pg_settings
 WHERE name IN ('coldfront.warehouse', 'coldfront.lakekeeper_endpoint', 'coldfront.local_pg_dsn',
-               'coldfront.dblink_self')
+               'coldfront.loopback_dsn')
 ORDER BY name;
 
 -- (3) the onboarding helper exists and PUBLIC cannot execute it (no self-grant).

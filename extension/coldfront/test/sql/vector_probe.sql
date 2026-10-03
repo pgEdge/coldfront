@@ -74,7 +74,7 @@ SELECT count(*) AS cluster_column_in_view
 -- comparison; the hot arm appears once and is untouched.
 SELECT coldfront._vec_probed_viewdef('public', 'chunks', 'embedding', ARRAY[1,2]);
 SELECT (length(d) - length(replace(d, 'FROM _chunks', ''))) / length('FROM _chunks') AS hot_arms,
-       (length(d) - length(replace(d, 'iceberg_scan(', ''))) / length('iceberg_scan(') AS cold_arms
+       (length(d) - length(replace(d, 'duckdb.query(', ''))) / length('duckdb.query(') AS cold_arms
   FROM coldfront._vec_probed_viewdef('public', 'chunks', 'embedding', ARRAY[1,2]) AS d;
 
 -- It reparses, which is the whole contract: the rewrite substitutes this for the
@@ -107,4 +107,3 @@ DELETE FROM coldfront.vector_centroids WHERE table_name = 'chunks';
 DELETE FROM coldfront.vector_config WHERE table_name = 'chunks';
 DROP VIEW public.chunks;
 DROP TABLE public._chunks;
-DROP FUNCTION coldfront.chunks_write();

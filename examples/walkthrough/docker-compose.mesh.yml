@@ -1,7 +1,7 @@
 # ColdFront walkthrough: 2-node Spock mesh stack (Demo 4, Distributed).
 # Same image as the single-node walkthrough (docker/Dockerfile.duckdb15) but
 # MESH=on, so the entrypoint loads snowflake,spock,pg_duckdb,coldfront and writes
-# the mesh GUCs (wal_level logical, spock.*, snowflake.node, dblink_self). Both
+# the mesh GUCs (wal_level logical, spock.*, snowflake.node, loopback_dsn). Both
 # data nodes point at ONE shared Lakekeeper + SeaweedFS: the lake is the single
 # shared copy; only the bakery's claim metadata replicates node-to-node via Spock.
 #
@@ -77,6 +77,8 @@ services:
             POSTGRES_USER: lakekeeper
             POSTGRES_PASSWORD: lakekeeper
             POSTGRES_DB: lakekeeper
+        volumes:
+            - lkdata:/var/lib/postgresql/data
         healthcheck:
             test: ["CMD-SHELL", "pg_isready -U lakekeeper"]
             interval: 3s
@@ -116,4 +118,5 @@ services:
 volumes:
     pgdata1:
     pgdata2:
+    lkdata:
     s3data:

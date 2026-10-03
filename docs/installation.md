@@ -208,6 +208,9 @@ coldfront.iceberg_async_parquet = on
 coldfront.iceberg_bakery_patch  = on
 ```
 
+coldfront refuses to load any other way: `CREATE EXTENSION coldfront` fails on
+a server that does not preload it, with an error that names the setting.
+
 See [usage.md → Tuning Knobs](usage.md#tuning-knobs) for the remaining GUCs,
 and the README for the optional non-superuser role that the image sets up.
 

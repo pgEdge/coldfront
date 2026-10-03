@@ -42,7 +42,9 @@ Both paths walk through the same four demos:
 
 ## File Overview
 
-```
+The walkthrough directory contains the following files:
+
+```text
 examples/walkthrough/
 ├── install.sh              # Curl-pipe entry point (downloads files + sources)
 ├── guide.sh                # Interactive guide (four demos + menu)
@@ -53,8 +55,7 @@ examples/walkthrough/
 ├── Dockerfile.archiver     # Archiver + partitioner image (builds from source)
 ├── seaweedfs-s3.json       # SeaweedFS S3 gateway credentials
 └── config/
-    ├── archiver.yaml       # Archiver config (30-day tiering threshold)
-    └── partitioner.yaml    # Partitioner config (DSN + connection settings)
+    └── archiver.yaml       # Import input: the events table, 30-day hot window
 ```
 
 ### install.sh
@@ -89,30 +90,32 @@ The interactive guide. Sources `runner.sh` for terminal UX, brings up the
 Docker Compose stack, runs ColdFront setup SQL, then presents a menu for the
 four demos.
 
-Key behaviors:
+The guide has the following behaviors:
 
-- Polls for readiness (Postgres, Lakekeeper) rather than using fixed sleeps
-- Retries warehouse creation until SeaweedFS is live
-- Builds the `archiver` image at bring-up: the `tools` profile keeps it out of
-  `up --build`
-- `choose_volume` prompts for row count before the tiered demo and marks each
-  size against Docker's free disk (`peak_mb`, `fits`)
-- Idempotent teardown before each demo: safe to re-run at any point
+- It polls for readiness (Postgres, Lakekeeper) rather than using fixed sleeps.
+- It retries warehouse creation until SeaweedFS is live.
+- It builds the `archiver` image at bring-up, because the `tools` profile keeps
+  that image out of `up --build`.
+- `choose_volume` prompts for a row count before the tiered demo and marks each
+  size against Docker's free disk (`peak_mb`, `fits`).
+- It tears the stack down before each demo, so a demo is safe to re-run at any
+  point.
 - Non-interactive mode skips all prompts and runs a single demo, controlled by
-  `WALKTHROUGH_NONINTERACTIVE` and `WALKTHROUGH_DEMO`
+  `WALKTHROUGH_NONINTERACTIVE` and `WALKTHROUGH_DEMO`.
 
-Environment variables:
+The guide reads the following environment variables:
 
-- `COLDFRONT_PG_PORT`: Postgres port exposed on the host (default: `5432`)
-- `WALKTHROUGH_NONINTERACTIVE`: set to `1` to skip all prompts and run one demo
-  end-to-end (used by CI)
-- `WALKTHROUGH_DEMO`: which demo to run in non-interactive mode: `tiered`
-  (default), `decoupled`, `partitioner`, or `distributed`
-- `WALKTHROUGH_ROWS`: row count for the tiered demo in non-interactive mode
-  (default: `1000000`)
-- `WALKTHROUGH_TYPE_DELAY`: seconds between characters when the guide shows a
-  command (default `0`, printed at once); `0.03` gives a recording typed
-  commands
+- `COLDFRONT_PG_PORT` sets the Postgres port exposed on the host (default
+  `5432`).
+- `WALKTHROUGH_NONINTERACTIVE` set to `1` skips all prompts and runs one demo
+  end-to-end; CI uses it.
+- `WALKTHROUGH_DEMO` selects the demo in non-interactive mode: `tiered` (the
+  default), `decoupled`, `partitioner`, or `distributed`.
+- `WALKTHROUGH_ROWS` sets the row count for the tiered demo in non-interactive
+  mode (default `1000000`).
+- `WALKTHROUGH_TYPE_DELAY` sets the seconds between characters when the guide
+  shows a command (default `0`, printed at once); `0.03` gives a recording
+  typed commands.
 
 ### runner.sh
 
@@ -126,14 +129,14 @@ This file is standalone and could be reused for other interactive guides.
 
 Defines six services (five start by default; `archiver` is profile-gated):
 
-- `db`: PostgreSQL with the `coldfront` extension, built from source
-- `seaweedfs`: local S3-compatible object store (stands in for AWS S3, Azure
-  Blob, or GCS)
-- `lakekeeper-db`: Postgres instance backing the Lakekeeper catalog
-- `lakekeeper-migrate`: one-shot migration job for Lakekeeper
-- `lakekeeper`: Iceberg REST catalog
-- `archiver`: the ColdFront archiver + partitioner binary (profile: `tools`,
-  run on demand via `docker compose run`)
+- `db` runs PostgreSQL with the `coldfront` extension, built from source.
+- `seaweedfs` is a local S3-compatible object store that stands in for AWS S3,
+  Azure Blob, or GCS.
+- `lakekeeper-db` is the Postgres instance backing the Lakekeeper catalog.
+- `lakekeeper-migrate` is the one-shot migration job for Lakekeeper.
+- `lakekeeper` is the Iceberg REST catalog.
+- `archiver` holds the ColdFront archiver and partitioner binary (profile
+  `tools`, run on demand via `docker compose run`).
 
 The `db` and `archiver` services build from source. The build context is
 `../..` (the repo root, or `$WORK_DIR` after `install.sh` downloads the tarball
@@ -141,6 +144,9 @@ subset), so the Dockerfile can reach `docker/`, `extension/`, `cmd/`,
 `internal/`, and `go.*`.
 
 ## Running the Walkthrough
+
+The walkthrough runs either through the curl-pipe guide or from a clone of the
+repository.
 
 ### Interactive Guide (`curl ... | bash`)
 

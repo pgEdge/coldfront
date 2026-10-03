@@ -40,6 +40,8 @@ services:
             POSTGRES_USER: lakekeeper
             POSTGRES_PASSWORD: lakekeeper
             POSTGRES_DB: lakekeeper
+        volumes:
+            - lkdata:/var/lib/postgresql/data
         healthcheck:
             test: ["CMD-SHELL", "pg_isready -U lakekeeper"]
             interval: 3s
@@ -81,6 +83,12 @@ services:
         build:
             context: ../..
             dockerfile: examples/walkthrough/Dockerfile.archiver
+        environment:
+            PGHOST: db
+            PGPORT: 5432
+            PGDATABASE: coldfront
+            PGUSER: coldfront
+            PGPASSWORD: coldfront
         volumes:
             - ./config:/config:ro
         depends_on:
@@ -89,4 +97,5 @@ services:
 
 volumes:
     pgdata:
+    lkdata:
     s3data:

@@ -27,7 +27,7 @@ export's projection, and the SQL-side view rebuild. `view.Column.HotRef`
 decides this on the Go side and `coldfront._vec_companion` derives the same
 name on the SQL side; the two must agree. `coldfront._is_vec_companion` keeps
 the companion out of every column list that describes the user's table, so the
-Iceberg schema, the view, the INSERT lists and the cross-tier move each have
+Iceberg schema, the view, the `INSERT` lists and the cross-tier move each have
 exactly one column per user column. Teardown drops the companion.
 
 `STORED` is required: PostgreSQL rejects `VIRTUAL` for a user-defined
@@ -49,11 +49,11 @@ metric:
 
 pg_duckdb passes the operator symbol to DuckDB, which resolves `<=>` and `<->`
 as its own aliases of `list_cosine_distance` and `list_distance`. DuckDB has no
-`<#>`, so that operator fails with a parser error on any query DuckDB runs, and
-`list_negative_inner_product(…)` is the spelling that works there. The
-PostgreSQL function names match DuckDB's, so the function-call form resolves
-too and the probe can recognize the sort expression. The PostgreSQL bodies are
-real implementations that delegate to pgvector, because a hot-only
+`<#>`, so the read rewrite turns that operator into a call of the function
+behind it, `list_negative_inner_product`, which DuckDB has under the same name.
+The PostgreSQL function names match DuckDB's, so the function-call form
+resolves too and the probe can recognize the sort expression. The PostgreSQL
+bodies are real implementations that delegate to pgvector, because a hot-only
 (pre-cutover) view has no Iceberg scan to pull the query into DuckDB and
 PostgreSQL executes them itself.
 
@@ -77,10 +77,10 @@ id without sharing OIDs. The following table describes what each one holds:
 | `coldfront.vector_config` | The table holds `nlist`, `nprobe`, the live `generation`, and `addition_cap` (reserved, default 0) for each (schema, table, column). |
 | `coldfront.vector_centroids` | The table holds the centroids themselves, keyed additionally by `(generation, centroid_id)`, with a `parent_id` column that no code path sets. |
 
-Both are registered in Spock's `default` replication set by
-`coldfront._ensure_vector_state_replicated()`, gated on the Spock extension so
-vanilla is a no-op, and both are `pg_extension_config_dump`-marked: losing them
-makes every stored cluster id uninterpretable and forces a retrain.
+Both are put in Spock's `default` replication set by
+`coldfront.ensure_replicated()`, the one-time per-node mesh step, and both are
+`pg_extension_config_dump`-marked: losing them makes every stored cluster id
+uninterpretable and forces a retrain.
 
 `coldfront._unregister_iceberg`, which both `release_iceberg_table` and
 `drop_iceberg_table` call, deletes the table's rows from both tables. The
@@ -109,7 +109,7 @@ A table may have several vector columns. The Iceberg schema gets one cluster
 column per vector column, `_cf_vec_list_<column>`, leading the schema in column
 order, and every write path assigns all of them. The registry records the
 ordered list in `tiered_views.vec_columns`, and that order is a contract: a
-cold INSERT is positional, so the prefix must fill the cluster columns in
+cold `INSERT` is positional, so the prefix must fill the cluster columns in
 exactly the order the schema declares them. `_vec_list_prefix` raises rather
 than emitting a short prefix, because a short one would land every following
 value in the wrong column.
@@ -132,8 +132,8 @@ and the rewrite declines.
 The column is not part of the hot table and neither branch of the view projects
 it, so no query written against the view can name it. `_cf_vec_list_<column>`
 **leads** the Iceberg schema. Iceberg schema evolution appends, and a cold
-INSERT is positional, so a column added later has to land after everything both
-sides already agree on. Trailing the cluster column would put a user's
+`INSERT` is positional, so a column added later has to land after everything
+both sides already agree on. Trailing the cluster column would put a user's
 `ADD COLUMN` on the far side of an internal column and silently misalign every
 positional write.
 
@@ -194,35 +194,33 @@ A retrain cannot interleave with a cold write, because an operation that
 rewrites the table holds the table's claim and every cold write serializes on
 that same claim.
 
-### The Eight Paths
+### The Six Paths
 
 Every path that can put a row into a clustered table's Iceberg storage must
-derive that row's cluster assignment. The following table shows the eight paths
+derive that row's cluster assignment. The following table shows the six paths
 that do so, where each one lives, and its shape:
 
 | Path | Where | Shape |
 |---|---|---|
 | bulk archive | the Iceberg INSERT in `cmd/archiver`, not the staging SELECT | set-based |
-| tiered INSERT, cold half | the C rewrite (`build_cold_bulk_call`) | per statement |
-| tiered trigger INSERT | `coldfront._rebuild_write_trigger` (called by the archiver and by `_rebuild_tiered_view`) | per row |
-| slow per-row INSERT | `coldfront._tiered_insert_cold` | per row, cursor loop |
+| tiered INSERT, cold half | `coldfront._cold_row_literal`, through the `coldfront._cold_sink` aggregate | per row |
 | cross-tier move | `coldfront._move_row_literal` | per row |
 | replay drain | `coldfront.replay_archive_delta` | set-based |
 | decoupled INSERT | the C rewrite | per statement |
 | cold UPDATE that sets the vector | the C rewrite | expression text |
 
 The archiver derives in the statement that writes Iceberg rather than in the
-staging SELECT, because only the DuckDB statement can reach the centroids. The
-staging table holds the user's own columns.
+staging `SELECT`, because only the DuckDB statement can reach the centroids.
+The staging table holds the user's own columns.
 
-The decoupled INSERT is targeted, so it is re-emitted over a derived table:
+The decoupled `INSERT` is targeted, so it is re-emitted over a derived table:
 
 ```sql
 INSERT INTO <ice> (_cf_vec_list_<col>, <cols>)
 SELECT <lookup>, <cols> FROM (<source>) AS coldfront_src(<cols>)
 ```
 
-The cold UPDATE adds one SET item per clustered vector column it sets, before
+The cold `UPDATE` adds one SET item per clustered vector column it sets, before
 the statement's own WHERE, or at the end when it has none.
 `find_toplevel_where` locates that WHERE by tracking quotes before parens,
 because a literal can contain the word, a sublink has its own WHERE one level
@@ -235,13 +233,8 @@ The replay drain casts a vector to `real[]` in its scratch projection, because
 DuckDB reads that scratch over libpq and cannot scan the pgvector type.
 
 `pglocal` is attached only where a lookup will run: `_exec_iceberg_with_claim`
-attaches when the statement names it, the generated triggers emit the attach
-only for a clustered table, and the per-row paths guard on
+attaches when the statement names it, and the per-row paths guard on
 `coldfront._types_have_vector`.
-
-The generated trigger's placeholder list is apostrophe-escaped, because the
-INSERT template is itself a single-quoted string and the assignment expression
-contains the literals that name its configuration row.
 
 ## Training
 
@@ -292,7 +285,7 @@ Training ends with the loop's final step applied to the table rather than the
 sample: every cold row is assigned to its nearest centroid of the generation
 just written, in one claimed `UPDATE` whose `WHERE` is
 `cluster IS DISTINCT FROM nearest`, so only a row whose cluster changed is
-rewritten and a row with no cluster counts as changed. The UPDATE scores rows
+rewritten and a row with no cluster counts as changed. The `UPDATE` scores rows
 against the session's copy of the new centroids (`temp.main.cf_gen`), because
 the rows inserted into `vector_centroids` in this transaction are invisible
 over `pglocal` until commit; the formula is `_vec_nearest_expr`, the same one
@@ -359,9 +352,9 @@ sorting by cluster scatters a cluster's rows through key space.
 ColdFront sets these properties only at `CREATE TABLE` and never alters them,
 so a table that predates its vector column keeps the defaults.
 
-**Batch cold writes order by cluster.** The archiver's Iceberg INSERT appends
+**Batch cold writes order by cluster.** The archiver's Iceberg `INSERT` appends
 `ORDER BY 1` (the cluster leads the projection) plus the key, and the C bulk
-INSERT and the decoupled INSERT append `ORDER BY 1`, so each new file is
+`INSERT` and the decoupled `INSERT` append `ORDER BY 1`, so each new file is
 internally sorted and its own row groups prune. No existing file is touched:
 sorted regions accumulate, and a probe reads the matching row groups in each of
 them.
@@ -385,7 +378,7 @@ cluster per month instead of one.
 
 The two halves are iceberg-go's own, which is what makes the merge safe rather
 than merely correct on a good day. Reading through the scan applies the
-position deletes a cold UPDATE or DELETE left behind; writing through
+position deletes a cold `UPDATE` or `DELETE` left behind; writing through
 `WriteRecords` produces files with field ids, column statistics and the table's
 row-group limit. Touching the Parquet directly would have none of that, and
 would reinstate every deleted row. Nulls sort last, so rows another engine
@@ -490,8 +483,8 @@ table shows their defaults and effects:
 temporary table `cf_vector_status`, one row per registered clustered column. A
 procedure writing a table rather than a function returning rows, for the reason
 `vector_train` is one: pg_duckdb refuses to execute a DuckDB query inside a
-function unless an unsafe setting is on, and a single `INSERT … SELECT` over a
-DuckDB scan is planned as DuckDB's, which cannot write a PostgreSQL table.
+function unless an unsafe setting is on, and a single `INSERT … SELECT` over
+a DuckDB scan is planned as DuckDB's, which cannot write a PostgreSQL table.
 Session lifetime rather than `ON COMMIT DROP` because a bare `CALL` is its own
 transaction.
 
@@ -523,9 +516,9 @@ merge bounds it without changing what a probe reads.
 
 The following are properties of the code as it stands, not plans:
 
-- `coldfront._tiered_insert_cold` writes unsorted: its cursor loop appends in
-  cursor order and would need buffering to sort. The function is the fallback
-  path for a tiered INSERT that omits an IDENTITY column.
+- `coldfront._cold_sink` writes unsorted: it appends rows in the order the
+  statement delivers them and would need buffering to sort. It is the cold
+  half of every tiered `INSERT`.
 - The replay drain (`coldfront.replay_archive_delta`) and the cross-tier move
   also write without ordering by cluster.
 
@@ -540,10 +533,10 @@ produces silently wrong results or a hard failure:
   fine.
 - `'{…}'::real[]` does not work as the query vector. That form reaches DuckDB
   as a VARCHAR and fails to cast. The spelling is `ARRAY[…]::real[]`.
-- `embedding::vector <=> …` fails with `Type with name vector does not exist!`,
-  and materializing the read does not help. The unadorned form resolves, so
-  nothing needs the cast.
-- There is no PostgreSQL-side fallback. When a view embeds `iceberg_scan`,
+- `embedding::vector <=> …` fails with
+  `Type with name vector does not exist!`, and materializing the read does not
+  help. The unadorned form resolves, so nothing needs the cast.
+- There is no PostgreSQL-side fallback. When a view embeds a DuckDB read,
   DuckDB owns the whole query and a function it lacks is a hard error rather
   than a slow path. Every expression the product wants users to write has to
   resolve in DuckDB.

@@ -562,9 +562,11 @@ end process;
 \* UPDATE every Nth iteration). It replicates, and an AFTER UPDATE replica
 \* trigger on the peer re-runs _on_claim_apply's defer branch for that ticket:
 \* try the table lock; if it is free, the smaller same-node claim is an orphan,
-\* so reap it (forwarding what was deferred behind it) and ack. This is what
-\* unwedges a waiter whose peer's claim holder died AFTER deferring to it, when
-\* no further claim would otherwise ever reach that peer. Its own process, not
+\* so reap it (forwarding what was deferred behind it) and ack. A poke that
+\* reaps nothing changes nothing: the INSERT-time decision stands (acked, or
+\* deferred behind a live holder), so it adds no ack. This is what unwedges a
+\* waiter whose peer's claim holder died AFTER deferring to it, when no further
+\* claim would otherwise ever reach that peer. Its own process, not
 \* an Applier branch: weak fairness on one shared process would let endless
 \* pokes starve real applies and report a spurious violation.
 fair process Poker = "poker"
@@ -588,8 +590,9 @@ begin
                   \cup { <<d[2], dst>> :
                            d \in { y \in deferred :
                                      y[1] = dst /\ \E o \in orphans : y[3] = o.t } }
-                  \cup ( IF ~ \E own \in (claims[dst] \ orphans) :
-                                own.n = dst /\ own.t < c.t
+                  \cup ( IF orphans # {}
+                            /\ ~ \E own \in (claims[dst] \ orphans) :
+                                   own.n = dst /\ own.t < c.t
                          THEN { <<c.t, dst>> } ELSE {} );
           deferred := { y \in deferred :
                           ~ (y[1] = dst /\ \E o \in orphans : y[3] = o.t) };
@@ -623,7 +626,7 @@ begin
 end process;
 
 end algorithm; *)
-\* BEGIN TRANSLATION (chksum(pcal) = "a894b260" /\ chksum(tla) = "22c3e5e6")
+\* BEGIN TRANSLATION (chksum(pcal) = "9e63d7af" /\ chksum(tla) = "9d00a96b")
 VARIABLES pc, next_ticket, claims, acks, deferred, iceberg, decision, crashed, 
           crash_budget, registered
 
@@ -965,8 +968,9 @@ PokeLoop == /\ pc["poker"] = "PokeLoop"
                                      \cup { <<d[2], dst>> :
                                               d \in { y \in deferred :
                                                         y[1] = dst /\ \E o \in orphans : y[3] = o.t } }
-                                     \cup ( IF ~ \E own \in (claims[dst] \ orphans) :
-                                                   own.n = dst /\ own.t < c.t
+                                     \cup ( IF orphans # {}
+                                               /\ ~ \E own \in (claims[dst] \ orphans) :
+                                                      own.n = dst /\ own.t < c.t
                                             THEN { <<c.t, dst>> } ELSE {} )
                           /\ deferred' = { y \in deferred :
                                              ~ (y[1] = dst /\ \E o \in orphans : y[3] = o.t) }

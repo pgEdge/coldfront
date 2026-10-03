@@ -49,12 +49,33 @@ this project adheres to
   d3c3348271, so the month of a `timestamptz` partition column is its UTC month
   whatever the session's time zone.
 - `--version` on the archiver, the partitioner and the compactor.
+- `COPY <view> FROM` loads a tiered or decoupled table through its view. The
+  rows take the same path as an `INSERT`, in batches of
+  `coldfront.cold_write_batch_size` rows, with the identity values and defaults
+  an `INSERT` would give them. `COPY ... WHERE` and the `FREEZE`, `ON_ERROR`,
+  `REJECT_LIMIT` and `DEFAULT` options are refused.
+- An `INSERT`, `UPDATE` or `DELETE` nested in a `WITH` entry, on a tiered or
+  a decoupled view, goes through the same rewrite as a top-level one: the hot
+  statement becomes the entry's body, and the rewrite's own entries (a tiered
+  `INSERT`'s source and cold sink, a dual-tier write's cold half) join the
+  statement's `WITH` list. With a watermark, `RETURNING` on a nested `INSERT`
+  is refused, as on a top-level one; a hot `UPDATE` or `DELETE` keeps it.
+- `MERGE INTO` a tiered or decoupled view, on PostgreSQL 17 and later. A
+  tiered `MERGE` runs on the tier its `ON` condition bounds the partition
+  column to, in PostgreSQL against the hot table or in DuckDB against the
+  Iceberg table, and each `INSERT` action's row is checked to belong to that
+  tier; a `MERGE` that bounds neither tier is refused. A decoupled `MERGE` runs
+  in DuckDB. A `MERGE` nested in a `WITH` entry takes the same path as a
+  nested `UPDATE` or `DELETE`.
 
 ### Changed
 
 - The mesh bakery no longer needs the `dblink` extension. Claims, acks,
   releases and orphan reaping run over a libpq loopback connection that the
-  extension opens from `coldfront.dblink_self`.
+  extension opens from `coldfront.loopback_dsn`, which must name a unix socket.
+  A node that runs Spock refuses cold writes until that setting and
+  `snowflake.node` are set, instead of serializing them on the node-local
+  lock.
 - `coldfront.tiered_views` has an `is_writable` column and a unique constraint
   on `iceberg_table`. Every existing registration is writable, and one relation
   is registered per Iceberg table.
@@ -67,9 +88,107 @@ this project adheres to
   write: the ticket on the writing node, the same claim on its peer, the peer's
   ack, and the ledger cleared once the write commits. After the concurrent
   writes it lists the table's snapshot history.
+- Every `coldfront.*` setting is registered: typed, bounded, with its default
+  visible in `pg_settings`, and the prefix is reserved, so a mistyped name is
+  refused. `coldfront.peer_alive_window_ms` and the build marker
+  `coldfront.iceberg_bakery_patch` are superuser-only;
+  `coldfront.iceberg_async_parquet` stays session-settable.
+- One call, `coldfront.ensure_replicated()`, is the per-node mesh setup step.
+  It puts every ColdFront table that replicates by value in the node's default
+  replication set: the bakery's claims and acks, the registry and watermark,
+  the storage secret, the lifecycle config and the vector routing state. It
+  replaces `_ensure_claims_replicated()`, `_ensure_vector_state_replicated()`
+  and the `spock.repset_add_table` calls the setup asked for by hand, and
+  nothing calls it at run time.
+- The archiver, the partitioner and the compactor connect from the libpq
+  environment or `--dsn`, as psql does, and read everything else from the
+  server: the tables from `coldfront.partition_config`, the cold-store
+  credential from `coldfront.storage_secret` and the catalog from the
+  `coldfront.warehouse` and `coldfront.lakekeeper_endpoint` settings. A
+  deployment YAML is written into the server once with `import`, which also
+  takes its `s3:` or `azure:` stanza through `set_storage_secret`; a YAML
+  passed to any other run is checked against the server, value by value, and
+  refused if it disagrees. The compactor takes no YAML.
+
+- The bakery's dead-peer window `coldfront.peer_alive_window_ms` defaults to
+  10 s and is set together with `wal_sender_timeout`: the walsender asks a
+  peer for a reply every half of that timeout, so a claim refuses to run
+  unless the timeout is positive and below twice the window, naming both. The
+  image sets `wal_sender_timeout = 15s`. A peer counts as alive while its
+  walsender has a reply inside the window, whatever the walsender's state, so
+  a peer that has just reconnected is waited for rather than ruled dead.
 
 ### Fixed
 
+- A deployment YAML could name a warehouse other than the server's: the
+  archiver ignored the file's `iceberg.*` keys, the compactor acted on them,
+  and a file with both an `s3:` and an `azure:` stanza was refused by the
+  archiver and silently taken as Azure by the compactor. Both binaries now read
+  the catalog and the store from the server, and a file that disagrees with it
+  is refused.
+- The archiver registered a tiered table as two statements, the view and then
+  the registry row, so a mesh peer briefly had the view without the row its
+  hook needs, and a write there failed. The registration is one transaction.
+- A prepared `INSERT` into a tiered view whose source held a bound parameter
+  inside a sub-select or a function in `FROM` failed with "there is no
+  parameter $1". The parameter now carries through the rewrite wherever it
+  sits.
+- On a server that did not preload coldfront, `CREATE EXTENSION coldfront`
+  succeeded and every session then ran without the extension's hooks: no write
+  routing, no DDL mirroring, and no refusal of `DROP` or `TRUNCATE` on a tiered
+  table. The extension now refuses to load outside `shared_preload_libraries`,
+  so `CREATE EXTENSION` fails with an error that names the setting.
+- A write that reached a tiered view through its `INSTEAD OF INSERT` trigger
+  rather than the hook (a `COPY`, an `INSERT` nested in `WITH`, a session or a
+  node without the hook) wrote cold rows with NULL identity and default values
+  and without the table's claim. The trigger is gone: the hook is the only
+  write path.
+- A tiered `INSERT` whose `WITH` clause held an entry that modifies data
+  (`WITH moved AS (DELETE … RETURNING …) INSERT INTO <view> SELECT … FROM
+  moved`) failed with "`WITH` clause containing a data-modifying statement must
+  be at the top level", because the rewrite folded the clause into its source
+  sub-query. The clause's entries now open the rewritten statement. On a
+  decoupled view, where the source runs in DuckDB, such an entry is refused
+  with an error that says so instead of DuckDB's parser error.
+- A tiered `INSERT` with a second `INSERT` into the same view nested in its
+  `WITH` was rewritten into a statement with a syntax error. A statement that
+  writes a tiered view more than once is now refused.
+- A dual-tier `UPDATE` or `DELETE` with a leading `WITH` inside a plpgsql
+  function or `DO` block failed with a syntax error, because the rewrite put
+  its own `WITH` ahead of the statement's. The statement's entries now open
+  the rewritten statement.
+- A hot `UPDATE … FROM`, `DELETE … USING` or correlated sub-select on a
+  tiered view failed with "missing FROM-clause entry" when the statement gave
+  the view no alias, because the deparser qualifies the view's columns by its
+  name and the rewrite swapped the relation alone. The retargeted relation now
+  takes the view's name as its alias. A cold `UPDATE … FROM` or `DELETE …
+  USING` a PostgreSQL table failed in DuckDB, which did not know the table; it
+  is now read through `pglocal`, as an `INSERT`'s source is.
+- A tiered `INSERT … SELECT` ran its source once per tier. A source whose
+  rows differed between the two runs landed some rows in both tiers and others
+  in neither, and when the hot table had no identity column, or the statement
+  supplied one, a source table written earlier in the same transaction lost
+  its cold rows, with no error either way. The source now runs once and both
+  tiers read that result; an untyped literal in the source keeps the target
+  column's type, and `OVERRIDING SYSTEM VALUE` works.
+- On PostgreSQL 17 and 18, a transaction block in which a statement had failed
+  could not be ended in a database with the extension: `ROLLBACK`, `COMMIT`
+  and `ROLLBACK TO SAVEPOINT` failed with "ResourceOwnerEnlarge called after
+  release started", and the session stayed in the failed transaction until it
+  disconnected. They now end the block.
+- On a mesh, a column change, a hot-table rename or a view rename on a tiered
+  table failed to apply on the peers. Spock replicated the statement together
+  with the view and registry changes the originating node's DDL hook made, and
+  each peer's hook made them again, so the peers kept the old columns or name
+  and stopped receiving the originating node's later writes. Only the
+  statement replicates now, and each peer makes its own view and registry
+  changes.
+- The archiver gave two LIST values that map to the same child name, such as
+  `eu-west` and `eu_west`, a single child, archived that child's oldest
+  partition twice and failed the second cutover. It now refuses them before
+  creating anything, as the partitioner did. `partitioner set --period` did not
+  re-check the table name's length, so a name too long for daily partitions
+  could be switched to daily. `set` now checks it when the period changes.
 - After one cold write on a mesh, an app role could run any SQL as the loopback
   connection's user through the `coldfront_self` dblink connection the claim
   left open in its session, and by setting `coldfront.dblink_self` it could
@@ -119,6 +238,24 @@ this project adheres to
 - The walkthrough's guide ran whatever archiver image an earlier run had built,
   because the `archiver` service sits behind a Compose profile that
   `up --build` skips. The guide now builds that image at bring-up.
+- A read through a tiered view inside a transaction sees the transaction's own
+  cold writes (`UPDATE`, `INSERT` and `DELETE`), and a cross-tier move finds a
+  cold row the same transaction inserted. The view's cold branch and the
+  move read the Iceberg table through the catalog's table entry
+  (`duckdb.query`), as a decoupled view does; the plan is the same
+  `ICEBERG_SCAN` with the same pushdown.
+- The walkthrough's Lakekeeper database had no named volume, so `docker compose
+  down` without `-v` kept the PostgreSQL and object-store data and lost the
+  catalog: the next `up` had no warehouse and no table metadata. It has the
+  `lkdata` volume, and the teardown text names it.
+- The hint on a refused `TRUNCATE` of a tiered relation said to truncate each
+  tier, a statement the same check refuses. It names what the check allows:
+  the hot partitions one at a time and a `DELETE` through the view for the
+  cold rows, or the `DELETE` alone for an iceberg-only view.
+- The compactor's snapshot expiry reported its flags, not its result: the dry
+  run ignored `--expire-older-than` and the real run printed the
+  `--expire-retain-last` value as the kept count. Both now count the snapshots
+  the expiry keeps, the dry run from the staged metadata.
 
 ## [1.0.0-beta2] - 2026-08-08
 
@@ -128,8 +265,8 @@ this project adheres to
   purge or keep-files for the stored objects.
 - Vended object-store credentials, so cold access can use short-lived
   credentials issued by Lakekeeper instead of static keys.
-- Cross-tier row relocation: an UPDATE that moves a row's partition key across
-  the cutoff now moves the row between tiers.
+- Cross-tier row relocation: an `UPDATE` that moves a row's partition key
+  across the cutoff now moves the row between tiers.
 - Multi-arch base images: linux/amd64 and linux/arm64.
 - An interactive walkthrough with four demos, runnable in Codespaces.
 

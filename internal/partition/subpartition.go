@@ -67,6 +67,26 @@ func SubName(parent, value string) (string, error) {
 	return name, nil
 }
 
+// SubNames derives the level-1 child name of each value (SubName), in value
+// order, and rejects two values that map to the same name, so a pass fails
+// before it creates any child rather than giving one child to both values.
+func SubNames(parent string, values []string) ([]string, error) {
+	names := make([]string, len(values))
+	seen := make(map[string]string, len(values))
+	for i, v := range values {
+		name, err := SubName(parent, v)
+		if err != nil {
+			return nil, err
+		}
+		if prev, ok := seen[name]; ok {
+			return nil, fmt.Errorf("sub-partition name collision: values %q and %q both map to %q", prev, v, name)
+		}
+		seen[name] = v
+		names[i] = name
+	}
+	return names, nil
+}
+
 // EnsureListChild creates the level-1 LIST child <childName> as a partition of
 // <parent> for one list value, itself sub-partitioned BY RANGE on rangeCol. It
 // is idempotent (IF NOT EXISTS). The list value is emitted as a quoted string
@@ -118,20 +138,15 @@ var _ SubLifecycle = (*Manager)(nil)
 // that child — so premake, retention and the ExpireFunc seam are reused exactly,
 // only the parent and leaf-name prefix change. A newly appearing value gets its
 // forward window provisioned automatically on the next pass. Two values that
-// sanitize to the same child name fail loud rather than clobber one sub-tree.
+// sanitize to the same child name fail the pass before it creates any child.
 func RunReconcileTwoLevel(ctx context.Context, lc SubLifecycle, s Spec, values []string, now time.Time, expire ExpireFunc) error {
-	seen := make(map[string]string, len(values))
+	children, err := SubNames(s.Parent, values)
+	if err != nil {
+		return err
+	}
 	var behind []string
-	for _, v := range values {
-		child, err := SubName(s.Parent, v)
-		if err != nil {
-			return err
-		}
-		if prev, ok := seen[child]; ok {
-			return fmt.Errorf("sub-partition name collision: values %q and %q both map to %q", prev, v, child)
-		}
-		seen[child] = v
-
+	for i, v := range values {
+		child := children[i]
 		if err := lc.EnsureListChild(ctx, s.Parent, s.Schema, v, child, s.Column); err != nil {
 			return err
 		}

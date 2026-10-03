@@ -39,8 +39,7 @@ var testCfg = ViewConfig{
 	},
 }
 
-// A tiered table carrying an embedding. The view exposes the column as real[],
-// so that is what NEW.embedding is inside the INSTEAD OF trigger.
+// A tiered table with an embedding column, which the view exposes as real[].
 var vectorCfg = ViewConfig{
 	SourceSchema:    "public",
 	SourceTable:     "chunks",
@@ -124,7 +123,7 @@ func TestGenerateViewSQL_WithCutoff(t *testing.T) {
 	assert.Contains(t, sql, `"public"."_events"`)
 	assert.Contains(t, sql, `"ts" >= '2026-03-01`)
 	assert.Contains(t, sql, "UNION ALL")
-	assert.Contains(t, sql, "iceberg_scan")
+	assert.Contains(t, sql, "duckdb.query('SELECT * FROM ")
 	assert.Contains(t, sql, "r['id']::BIGINT")
 	// jsonb columns: the view exposes them as `json` on both sides (pg_duckdb
 	// takes over the whole query and DuckDB has no jsonb type; json works
@@ -220,12 +219,11 @@ func TestRecreate(t *testing.T) {
 	g := NewGenerator(db)
 	err := g.Recreate(context.Background(), testCfg)
 	require.NoError(t, err)
-	// Swap and view only: the write trigger is coldfront._rebuild_write_trigger's,
-	// built by the archiver after registration.
+	// The swap and the view.
 	require.Len(t, db.execSQL, 2)
 	assert.Contains(t, db.execSQL[0], `ALTER TABLE "public"."events" RENAME TO "_events"`)
 	assert.Contains(t, db.execSQL[1], `"public"."_events"`)
-	assert.Contains(t, db.execSQL[1], "iceberg_scan")
+	assert.Contains(t, db.execSQL[1], "duckdb.query('SELECT * FROM ")
 }
 
 // Complex identifiers: mixed case, hyphens, reserved keywords, embedded

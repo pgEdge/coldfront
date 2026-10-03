@@ -42,7 +42,7 @@ type runOpts struct {
 }
 
 func main() {
-	cfgPath := flag.String("config", "", "deployment YAML: DSN + iceberg/S3/azure storage creds")
+	dsn := flag.String("dsn", "", "PostgreSQL connection string (default: the libpq environment); the catalog and the cold-store credential are read from that server")
 	tableName := flag.String("table", "", "[schema.]table to maintain; schema (default public) maps to the Iceberg namespace (required)")
 	targetMB := flag.Int64("target-size-mb", 128, "compaction: target output Parquet file size in MiB")
 	dryRun := flag.Bool("dry-run", false, "plan only — report what would change, change nothing")
@@ -60,9 +60,10 @@ func main() {
 		return
 	}
 
-	if *cfgPath == "" || *tableName == "" {
-		fmt.Fprintln(os.Stderr, "usage: compactor --config <yaml> --table <name> [--target-size-mb N] [--dry-run]"+
-			" [--expire-snapshots [--expire-retain-last N]] [--orphans [--orphan-age D]]")
+	if *tableName == "" {
+		fmt.Fprintln(os.Stderr, "usage: compactor --table <name> [--dsn <dsn>] [--target-size-mb N] [--dry-run]"+
+			" [--expire-snapshots [--expire-older-than D] [--expire-retain-last N] [--expire-keep-files]]"+
+			" [--orphans [--orphan-age D]]")
 		os.Exit(2)
 	}
 	o := runOpts{
@@ -75,7 +76,7 @@ func main() {
 		orphans:    *orphans,
 		orphanAge:  *orphanAge,
 	}
-	if err := run(*cfgPath, *tableName, o); err != nil {
+	if err := run(*dsn, *tableName, o); err != nil {
 		fmt.Fprintf(os.Stderr, "compactor: %v\n", err)
 		os.Exit(1)
 	}
@@ -85,9 +86,9 @@ func main() {
 // when nothing is below target), then optional snapshot expiry and orphan-file deletion.
 // Each mutating step runs under the bakery claim; a pure --dry-run mutates nothing and
 // takes no claim.
-func run(cfgPath, tableName string, o runOpts) error {
+func run(dsn, tableName string, o runOpts) error {
 	ctx := context.Background()
-	cfg, err := LoadConfig(cfgPath)
+	cfg, err := loadServerConfig(ctx, dsn)
 	if err != nil {
 		return err
 	}
@@ -114,7 +115,7 @@ func run(cfgPath, tableName string, o runOpts) error {
 	schema, table := splitSchemaTable(tableName)
 	icebergRef := pgx.Identifier{"ice", schema, table}.Sanitize()
 
-	claim, closeConn := newClaimer(ctx, cfg.Postgres.DSN, icebergRef)
+	claim, closeConn := newClaimer(ctx, dsn, icebergRef)
 	defer closeConn()
 	if o.dryRun {
 		claim = func(fn func() error) error { return fn() }
@@ -122,25 +123,35 @@ func run(cfgPath, tableName string, o runOpts) error {
 
 	// Each step reads the table under its claim, so what it commits is planned
 	// against every cold write that committed before it, including one it waited for.
-	if err := claim(func() error { return doCompaction(ctx, cat, schema, table, o) }); err != nil {
-		return err
-	}
-	if o.expire {
-		if err := claim(func() error { return doExpire(ctx, cat, schema, table, o) }); err != nil {
-			return err
-		}
-	}
-	if o.orphans {
-		if err := claim(func() error { return doOrphans(ctx, cat, schema, table, o) }); err != nil {
+	for _, s := range steps(o) {
+		if err := claim(func() error { return s(ctx, cat, schema, table, o) }); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
+// step is one maintenance pass over a table: compaction, snapshot expiry or
+// orphan-file deletion.
+type step func(ctx context.Context, cat *rest.Catalog, ns, tableName string, o runOpts) error
+
+// steps lists the passes the flags enable, in the order run performs them:
+// compaction always, then snapshot expiry and orphan-file deletion when asked for.
+func steps(o runOpts) []step {
+	s := []step{doCompaction}
+	if o.expire {
+		s = append(s, doExpire)
+	}
+	if o.orphans {
+		s = append(s, doOrphans)
+	}
+	return s
+}
+
 // newClaimer returns a wrapper that runs fn under the bakery claim for icebergRef,
-// plus a closer for the one PG connection every step shares. The connection opens
-// on the first claim, so a pure dry-run never needs Postgres at all.
+// plus a closer for the one PG connection every step shares. The connection
+// opens on the first claim; a dry run takes no claim, so it opens none here
+// (loadServerConfig already read the settings and the secret row).
 func newClaimer(ctx context.Context, dsn, icebergRef string) (claim func(func() error) error, closeConn func()) {
 	var conn *pgx.Conn
 	claim = func(fn func() error) error {
@@ -195,24 +206,24 @@ func doCompaction(ctx context.Context, cat *rest.Catalog, ns, tableName string, 
 	return nil
 }
 
-// doExpire expires all but the most-recent --expire-retain-last snapshots under a claim.
+// doExpire expires the snapshots --expire-older-than and --expire-retain-last select, under a
+// claim; in dry-run it reports what the same expiry would do.
 func doExpire(ctx context.Context, cat *rest.Catalog, ns, tableName string, o runOpts) error {
 	tbl, err := loadTable(ctx, cat, ns, tableName)
 	if err != nil {
 		return err
 	}
-	have := len(tbl.Metadata().Snapshots())
-	if o.dryRun {
-		fmt.Fprintf(os.Stderr, "compactor: %s.%s — %d snapshot(s); would retain the most recent %d\n",
-			ns, tableName, have, o.retainLast)
-		return nil
-	}
-	expired, err := expireSnapshots(ctx, tbl, o.retainLast, o.olderThan, !o.keepFiles)
+	expired, kept, err := expireSnapshots(ctx, tbl, o.retainLast, o.olderThan, !o.keepFiles, o.dryRun)
 	if err != nil {
 		return err
 	}
-	fmt.Fprintf(os.Stderr, "compactor: %s.%s — expired %d snapshot(s), retained %d\n",
-		ns, tableName, expired, o.retainLast)
+	if o.dryRun {
+		fmt.Fprintf(os.Stderr, "compactor: %s.%s: %d snapshot(s); would expire %d and keep %d\n",
+			ns, tableName, expired+kept, expired, kept)
+		return nil
+	}
+	fmt.Fprintf(os.Stderr, "compactor: %s.%s: expired %d snapshot(s), kept %d\n",
+		ns, tableName, expired, kept)
 	return nil
 }
 

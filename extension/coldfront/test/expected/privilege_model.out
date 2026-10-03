@@ -49,13 +49,13 @@ ORDER BY proname;
 SELECT name, context
 FROM pg_settings
 WHERE name IN ('coldfront.warehouse', 'coldfront.lakekeeper_endpoint', 'coldfront.local_pg_dsn',
-               'coldfront.dblink_self')
+               'coldfront.loopback_dsn')
 ORDER BY name;
              name              |  context  
 -------------------------------+-----------
- coldfront.dblink_self         | superuser
  coldfront.lakekeeper_endpoint | superuser
  coldfront.local_pg_dsn        | superuser
+ coldfront.loopback_dsn        | superuser
  coldfront.warehouse           | superuser
 (4 rows)
 

@@ -22,6 +22,11 @@ SELECT coldfront._build_storage_secret_opts(ROW(
     'cf_storage','s3','admin','adminsecret','seaweedfs:8333','us-east-1','path',true,NULL,false
 )::coldfront.storage_secret);
 
+-- ---- pure opts builder: s3, virtual-hosted S3-compatible store over TLS
+SELECT coldfront._build_storage_secret_opts(ROW(
+    'cf_storage','s3','k','s','minio.example.com','us-east-1','vhost',true,NULL,false
+)::coldfront.storage_secret);
+
 -- ---- pure opts builder: azure CONFIG provider via CONNECTION_STRING (shared key
 -- rides inside AccountKey=… — duckdb-azure has no ACCOUNT_KEY param)
 SELECT coldfront._build_storage_secret_opts(ROW(

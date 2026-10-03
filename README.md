@@ -45,8 +45,9 @@ ColdFront provides two operating modes:
   extension handles every data-modifying statement on that view.
 
 Both modes coexist within one database, and you choose the mode per table at
-creation time. The SQL surface is identical for both modes: standard SELECT,
-INSERT, UPDATE, and DELETE against the relation.
+creation time. The SQL surface is identical for both modes: standard `SELECT`,
+`INSERT`, `UPDATE`, and `DELETE` against the relation, and `MERGE` on
+PostgreSQL 17 and later.
 
 Decoupled mode scales out horizontally across many PostgreSQL nodes that share
 one Lakekeeper catalog and one object store. The bakery protocol in the
@@ -108,12 +109,14 @@ you from an empty bucket to a working cold tier end-to-end.
 ColdFront reads its settings from two places. The server settings live in
 `postgresql.conf`: `shared_preload_libraries = 'pg_duckdb,coldfront'`,
 `coldfront.warehouse` and `coldfront.lakekeeper_endpoint`, plus
-`snowflake.node` and `coldfront.dblink_self` on every node of a mesh. The
-Docker image writes them on first start. The archiver, partitioner, and
-compactor read a deployment YAML, modeled on
-[config.example.yaml](config.example.yaml), for the database DSN, the Iceberg
-catalog, and the cold-store credentials, and each table's lifecycle lives in
-`coldfront.partition_config`. For every setting, see
+`snowflake.node` and `coldfront.loopback_dsn` on every node of a mesh. The
+Docker image writes them on first start. The archiver, partitioner and
+compactor connect from the libpq environment or `--dsn` and read everything
+else from the server: each table's lifecycle in `coldfront.partition_config`,
+the cold-store credential in `coldfront.storage_secret` and the catalog
+settings above. A deployment YAML, modeled on
+[config.example.yaml](config.example.yaml), is written into the server once
+with `import`. For every setting, see
 [Using ColdFront → One-Time Setup](docs/usage.md#one-time-setup) and
 [Tuning Knobs](docs/usage.md#tuning-knobs).
 
@@ -196,15 +199,15 @@ SELECT coldfront.grant_app_access('alice');
 
 grant_app_access grants only the minimum the cold path needs: membership in
 duckdb.postgres_role, SET on the duckdb.unsafe_allow_execution_inside_functions
-parameter, schema USAGE, SELECT on the registry and the watermark table, DML on
-the dual-write anchor table, DML on every registered view and the hot table
-behind it, and USAGE and SELECT on the hot table's sequences. Those objects are
-derived from the registry, not hardcoded, and the call also grants EXECUTE on a
-fixed allow-list of runtime cold-path functions. The call is idempotent and is
-not executable by PUBLIC, so an application role can never self-grant. The role
-is never granted pg_read_server_files or pg_write_server_files, so it has no
-host-file access. CREATE ROLE and GRANT both replicate over Spock, so you
-onboard a role once on any node and it propagates across the mesh.
+parameter, schema USAGE, `SELECT` on the registry and the watermark table, DML
+on the dual-write anchor table, DML on every registered view and the hot table
+behind it, and USAGE and `SELECT` on the hot table's sequences. Those objects
+are derived from the registry, not hardcoded, and the call also grants EXECUTE
+on a fixed allow-list of runtime cold-path functions. The call is idempotent
+and is not executable by PUBLIC, so an application role can never self-grant.
+The role is never granted pg_read_server_files or pg_write_server_files, so it
+has no host-file access. `CREATE ROLE` and `GRANT` both replicate over Spock,
+so you onboard a role once on any node and it propagates across the mesh.
 
 The Docker image sets `duckdb.postgres_role` to `coldfront_duckdb` and creates
 that role when it initializes a new data directory. To name a different role,

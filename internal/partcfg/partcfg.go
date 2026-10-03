@@ -66,11 +66,13 @@ ALTER TABLE coldfront.partition_config
     ADD COLUMN IF NOT EXISTS expiration_strategy text NOT NULL DEFAULT 'drop'`
 
 // ensureReplicatedSQL adds partition_config to Spock's default replication set
-// so the per-table config replicates by value across the mesh — the same
-// spock-gated, idempotent pattern as coldfront._ensure_claims_replicated. It is
-// a no-op without the spock extension (vanilla single node), and is safe under
-// pg_duckdb (no EXCEPTION block ⇒ no subtransaction). The nested IFs ensure the
-// spock.* relations are only referenced when spock is actually installed.
+// so the per-table config replicates by value across the mesh. The binaries do
+// this themselves because the partitioner runs on stock PostgreSQL without the
+// extension; coldfront.ensure_replicated(), the one-time per-node mesh step,
+// covers the same table on a node that has it. A no-op without the spock
+// extension (vanilla single node), and safe under pg_duckdb (no EXCEPTION
+// block, so no subtransaction). The nested IFs ensure the spock.* relations are
+// only referenced when spock is actually installed.
 const ensureReplicatedSQL = `
 DO $$
 BEGIN

@@ -249,15 +249,14 @@ The file reads:
 ```yaml {"ignore":"true"}
 # ColdFront walkthrough archiver config: Demo 1 (tiered).
 #
-# Runs INSIDE the compose network (docker compose run --rm archiver), so every
-# endpoint is a compose SERVICE NAME, not localhost. hot_period "30 days" keeps
-# the current month hot and tiers the older months to Iceberg/S3, deterministic
-# because the walkthrough seeds now()-relative timestamps.
-postgres:
-    dsn: "host=db port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
-iceberg:
-    warehouse: "wh"
-    lakekeeper_endpoint: "http://lakekeeper:8181/catalog"
+# An import input: `docker compose run --rm --no-deps archiver import --config
+# /config/archiver.yaml` writes it into the server once, the table into
+# coldfront.partition_config and the store into coldfront.storage_secret. The
+# archiver then runs with no file, connecting from the PG* environment the
+# compose service sets. Endpoints are compose SERVICE NAMES, since the archiver
+# runs inside the compose network. hot_period "30 days" keeps the current month
+# hot and tiers the older months to Iceberg/S3, deterministic because the
+# walkthrough seeds now()-relative timestamps.
 s3:
     endpoint: "seaweedfs:8333"
     region: "us-east-1"
@@ -278,10 +277,11 @@ runs.
 
 ### Step 7: Register the Table, Then Run the Archiver
 
-The archiver reads its managed-table set from `coldfront.partition_config`, not
-from the YAML at run time. Seed that table once from the YAML's
-`archiver.tables` block with `import` (equivalently, register one table by
-hand), then run the archiver: it moves every partition older than 30 days out
+The archiver reads its configuration from the server. `import` writes the YAML
+into it once: the table into `coldfront.partition_config` and the store into
+`coldfront.storage_secret`. Then run the archiver, which connects from the
+`PG*` environment the compose service sets and needs no file: it moves every
+partition older than 30 days out
 of the PostgreSQL heap into Parquet files in object storage and rebuilds
 `events` as a unified view over the hot remainder and the cold data.
 
@@ -294,7 +294,7 @@ docker compose \
 
 docker compose \
   -f examples/walkthrough/docker-compose.yml \
-  run --rm --no-deps archiver --config /config/archiver.yaml
+  run --rm --no-deps archiver
 ```
 
 The `--no-deps` flag reuses the already-running, data-loaded `db` container;
@@ -788,7 +788,6 @@ docker compose \
   -f examples/walkthrough/docker-compose.yml \
   run --rm --no-deps --entrypoint partitioner archiver \
   register \
-  --config /config/partitioner.yaml \
   --table part_demo \
   --period monthly \
   --retention "12 months"
@@ -796,30 +795,11 @@ docker compose \
 # Run a reconcile pass to premake forward partitions.
 docker compose \
   -f examples/walkthrough/docker-compose.yml \
-  run --rm --no-deps --entrypoint partitioner archiver \
-  --config /config/partitioner.yaml
+  run --rm --no-deps --entrypoint partitioner archiver
 ```
 
-The partitioner config at `examples/walkthrough/config/partitioner.yaml` uses a
-partition-only configuration with no `iceberg` or `s3` sections:
-
-```yaml {"ignore":"true"}
-# ColdFront walkthrough partitioner config: Demo 3 (standalone partitioner).
-#
-# PARTITION-ONLY: just postgres + archiver.tables. No iceberg/s3: this demo is
-# the "you don't need the cold tier" story: automated PostgreSQL range-partition
-# maintenance against stock Postgres. Runs INSIDE the compose network
-# (docker compose run --rm --entrypoint partitioner archiver), so the host is the
-# compose SERVICE NAME (db), not localhost.
-postgres:
-    dsn: "host=db port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
-archiver:
-    tables:
-        - source_table: part_demo
-          partition_column: ts
-          partition_period: monthly
-          retention_period: 12 months
-```
+The partitioner needs no file: it connects from the `PG*` environment the
+compose service sets and reads its tables from `coldfront.partition_config`.
 
 ### Verify the Partitions
 
@@ -910,12 +890,11 @@ SELECT spock.sub_create('sub_db1_from_db2', 'host=db2 user=coldfront dbname=cold
 -- On db2:
 SELECT spock.sub_create('sub_db2_from_db1', 'host=db1 user=coldfront dbname=coldfront port=5432');
 
--- On BOTH nodes - wait for the subscription to sync, then replicate the bakery's
--- claim + config tables and set the cold-store secret, before any cold write:
+-- On BOTH nodes - wait for the subscription to sync, then put the replicated
+-- ColdFront tables in the repset and set the cold-store secret, before any
+-- cold write:
 SELECT spock.sub_wait_for_sync(sub_name) FROM spock.subscription;
-SELECT coldfront._ensure_claims_replicated();
-SELECT spock.repset_add_table('default', 'coldfront.partition_config'::regclass, false);
-SELECT spock.repset_add_table('default', 'coldfront.storage_secret'::regclass, false);
+SELECT coldfront.ensure_replicated();
 SELECT coldfront.set_storage_secret('admin', 'adminsecret', 'seaweedfs:8333');
 ```
 
@@ -1067,8 +1046,9 @@ docker compose \
   down -v
 ```
 
-The `-v` flag removes the named volumes (`pgdata` and `s3data`). Omit the flag
-to keep the data for a later session.
+The `-v` flag removes the named volumes: `pgdata` (PostgreSQL), `lkdata` (the
+Lakekeeper catalog) and `s3data` (the object store). Omit the flag to keep the
+data for a later session.
 
 If you ran the distributed demo, tear down its separate mesh stack too:
 

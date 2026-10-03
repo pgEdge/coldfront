@@ -30,11 +30,13 @@ DUCKDB_ROLE="${COLDFRONT_DUCKDB_ROLE-coldfront_duckdb}"
 
 if [ ! -f "$PGDATA/PG_VERSION" ] && [ -n "${COLDFRONT_STANDBY_OF:-}" ]; then
     # ── Physical standby: base-backup the primary instead of initdb. ──
-    # A base backup carries everything a hot standby needs to serve cross-tier
-    # reads: the data, the coldfront GUCs (they live in postgresql.conf, not
-    # ALTER SYSTEM, so they ride the backup), the patched duckdb-iceberg cache
-    # (it sits inside PGDATA), and the DuckDB S3 secret (a pg_foreign_server row,
-    # physically replicated). -R writes standby.signal + primary_conninfo;
+    # A base backup carries the data, the coldfront GUCs (they live in
+    # postgresql.conf, not ALTER SYSTEM, so they ride the backup) and the patched
+    # duckdb-iceberg cache (it sits inside PGDATA). It does not carry the DuckDB
+    # persistent secret, whose file sits outside PGDATA: a standby materializes
+    # it from the replicated coldfront.storage_secret row
+    # (coldfront.materialize_storage_secret), as ci/probe-standby.sh does.
+    # -R writes standby.signal + primary_conninfo;
     # hot_standby defaults on, so the replica serves read queries.
     mkdir -p "$PGDATA"; chmod 700 "$PGDATA"
     echo "standby: waiting for primary ${COLDFRONT_STANDBY_OF} …"
@@ -100,7 +102,10 @@ max_replication_slots = 64
 max_wal_senders = 64
 track_commit_timestamp = on
 synchronous_commit = local
-wal_receiver_status_interval = 1s
+# The bakery rules a peer dead when its walsender's last reply is older than
+# coldfront.peer_alive_window_ms, and an idle peer replies only to the keepalive
+# the walsender sends every wal_sender_timeout/2.
+wal_sender_timeout = 15s
 spock.conflict_resolution = last_update_wins
 spock.enable_ddl_replication = on
 spock.allow_ddl_from_functions = on
@@ -111,7 +116,7 @@ snowflake.node = ${SNOWFLAKE_NODE}
 # DSN of the loopback that runs the R-A bakery's autonomous claim/ack/release
 # (unix socket). The bakery touches coldfront.claims only, never a tiered view,
 # so the lazy 'ice' attach never fires here.
-coldfront.dblink_self = 'host=/var/run/postgresql dbname=coldfront user=coldfront application_name=coldfront_dblink'
+coldfront.loopback_dsn = 'host=/var/run/postgresql dbname=coldfront user=coldfront application_name=coldfront_loopback'
 EOF
         # Servers with output_plugin_libraries (16.15, 17.11 and 18.6 here) accept only
         # the logical decoding output plugins it lists, and its default leaves out

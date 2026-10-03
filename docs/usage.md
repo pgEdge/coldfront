@@ -99,16 +99,19 @@ when it initializes a new data directory. A server built another way sets them
 itself, as [installation.md](installation.md#bare-metal-no-docker) shows:
 
 - `shared_preload_libraries = 'pg_duckdb,coldfront'` loads both extensions at
-  server start.
+  server start. coldfront refuses to load any other way: `CREATE EXTENSION
+  coldfront` fails on a server that does not preload it, with an error that
+  names the setting.
 - `coldfront.warehouse` and `coldfront.lakekeeper_endpoint` name the Lakekeeper
   warehouse and its catalog endpoint, which the Iceberg catalog `ice` attaches
   to. Only a superuser can set them, and while either is empty the catalog does
   not attach.
 - `coldfront.local_pg_dsn` is the connection string DuckDB uses to read
-  PostgreSQL tables from this server, which a cold `INSERT … SELECT` from a
-  PostgreSQL table needs. Only a superuser can set or read it. Set it before
-  calling `set_storage_secret()`, which installs the DuckDB `postgres`
-  extension this path loads only when the setting is present.
+  PostgreSQL tables from this server, which a decoupled table's
+  `INSERT … SELECT` from a PostgreSQL table needs, as does a cold write to a
+  table with a clustered vector column. Only a superuser can set or read it.
+  Set it before calling `set_storage_secret()`, which installs the DuckDB
+  `postgres` extension this path loads only when the setting is present.
 
 An application that connects as a non-superuser needs its role granted access
 with `coldfront.grant_app_access()`, which takes an existing role:
@@ -142,34 +145,52 @@ CREATE TABLE p_2026_04 PARTITION OF events
     FOR VALUES FROM ('2026-04-01') TO ('2026-05-01');
 ```
 
-The archiver reads its connection and cold-store settings from a YAML file:
+The archiver connects the way psql does, from the libpq environment (`PGHOST`,
+`PGDATABASE`, `PGUSER`, `PGPASSWORD`, `PGSERVICE`) or `--dsn`, and reads every
+other setting from the server: the tables from `coldfront.partition_config`,
+the cold-store credential from `coldfront.storage_secret`, and the catalog from
+the `coldfront.warehouse` and `coldfront.lakekeeper_endpoint` settings. It
+needs no file to run.
+
+A deployment YAML is a way to write that configuration into the server once,
+with `import`:
 
 ```yaml
-postgres:
-  dsn: "host=localhost dbname=mydb"
-iceberg:
-  warehouse: "wh"
-  lakekeeper_endpoint: "http://lakekeeper:8181/catalog"
 s3:
   endpoint: "seaweedfs:8333"
   access_key: "admin"
   secret_key: "adminsecret"
+archiver:
+  tables:
+    - source_table: events
+      partition_period: monthly
+      hot_period: "1 month"
 ```
 
-The archiver cannot run without `iceberg.warehouse` and
-`iceberg.lakekeeper_endpoint`. A config that sets an S3 endpoint or key, or an
-Azure connection string, without them fails to load. A config that sets none of
-these keys is partition-only, and a partition-only config rejects every tiered
-table. `s3.region` defaults to `us-east-1`.
-[Storage Backends](#storage-backends) describes the other `s3:` and `azure:`
-keys, and a deployment on [vended credentials](#vended-credentials) omits both
-sections.
+```bash
+./bin/archiver import --config config.yaml
+```
 
-Register the table in `coldfront.partition_config` (the in-DB per-table config;
-the YAML holds only the connection + cold-store settings):
+`import` writes the `s3:` or `azure:` stanza through `set_storage_secret` or
+`set_storage_secret_azure`, then upserts each table into
+`coldfront.partition_config`, validated as `register` validates one table, so
+the file and the server agree when it returns. A file may also name
+`iceberg.warehouse` and `iceberg.lakekeeper_endpoint`; the import checks those
+against the server settings, which live in `postgresql.conf`, before it writes
+anything, and refuses the file if they differ. From then on the server is the
+configuration: change it with `set`, `register`, `set_storage_secret` or
+`postgresql.conf`. A YAML passed to any later run is checked, value by value,
+against what the server holds, and any difference is refused with an error
+that says where configuration lives. A file that agrees, such as the output of
+`export`, runs. `s3.region` defaults to `us-east-1`;
+[Storage Backends](#storage-backends) describes the other `s3:` and `azure:`
+keys, and a deployment on [vended credentials](#vended-credentials) has no
+stanza to import.
+
+Register a single table in `coldfront.partition_config` without a file:
 
 ```bash
-./bin/archiver register --config config.yaml --table events \
+./bin/archiver register --table events \
     --period monthly --hot-period "1 month"
 # optional: --retention "5 years" DROPs cold data past that age
 # (must exceed --hot-period; omit = keep forever)
@@ -178,7 +199,7 @@ the YAML holds only the connection + cold-store settings):
 Run the archiver (typically via cron):
 
 ```bash
-./bin/archiver --config config.yaml
+./bin/archiver
 ```
 
 `--version` prints the version that `make build` stamps from `git describe`
@@ -186,21 +207,19 @@ Run the archiver (typically via cron):
 `go build` prints `unknown`. The partitioner and compactor accept the same
 flag.
 
-Without `--config`, the archiver reads `config.yaml` from the working
-directory. The partitioner has no default and exits with
-`--config is required`. The archiver also accepts `--debug-export-delay`, a
-test-only Go duration (such as `5s`) that holds each partition's capture window
-open between the bulk export and the replay, so that a test can race concurrent
-writes into it. Leave it unset in production.
+The archiver also accepts `--debug-export-delay`, a test-only Go duration
+(such as `5s`) that holds each partition's capture window open between the
+bulk export and the replay, so that a test can race concurrent writes into it.
+Leave it unset in production.
 
-The first run that finds a partition older than `hot_period` renames `events` →
-`_events`, creates the unified view `events`, and registers it; until then the
-archiver only premakes partitions, and the table stays a plain partitioned
+The first run that finds a partition older than `hot_period` renames `events`
+→ `_events`, creates the unified view `events`, and registers it; until then
+the archiver only premakes partitions, and the table stays a plain partitioned
 table. From then on every cycle (1) tiers partitions older than `hot_period`
 from hot PG to cold Iceberg and advances the watermark, and (2) if
 `retention_period` is set, drops cold Iceberg rows older than it. The data
-lifecycle is **hot → `hot_period` → cold → `retention_period` → gone**; omit
-`retention_period` to keep cold data forever.
+lifecycle is **hot → `hot_period` → cold → `retention_period` → gone**;
+omit `retention_period` to keep cold data forever.
 
 ### Inbound Foreign Keys
 
@@ -286,15 +305,16 @@ That single statement provisions:
 - a PG-side wrapper view `public.events` with proper PG-typed columns.
 
 - a `coldfront.tiered_views` registry row, so that the coldfront C hook
-  intercepts every INSERT, UPDATE, and DELETE on the view and rewrites each one
-  to a single `duckdb.raw_query(...)` against `ice.public.events`.
+  intercepts every `INSERT`, `UPDATE`, `DELETE`, and `MERGE` on the view and
+  rewrites each one to a single `duckdb.raw_query(...)` against
+  `ice.public.events`.
 
 
 In a mesh one node provisions: Spock's `ddl_sql` repset replicates the
 `CREATE VIEW`, and the `default` repset replicates the name-keyed registry row,
-which enables the write hook on every peer. Each node also needs the bakery
-enabled via `coldfront._ensure_claims_replicated()` - see the one-time mesh
-setup below.
+which enables the write hook on every peer. Each node also needs the one-time
+setup call `coldfront.ensure_replicated()` - see the one-time mesh setup
+below.
 
 ### Adopting a Table That Already Exists in the Catalog
 
@@ -317,7 +337,8 @@ view takes the table's name.
 
 Adoption is read-only unless asked otherwise, so reading someone else's lake
 table cannot become writing it by accident. Passing `p_writable => true`
-enables the same INSERT, UPDATE and DELETE rewrite a created table gets:
+enables the same `INSERT`, `UPDATE`, `DELETE` and `MERGE` rewrite a created
+table gets:
 
 ```sql
 SELECT coldfront.adopt_iceberg_table('public', 'orders', 'lake',
@@ -368,26 +389,22 @@ attached data). Build the partitioner with `make build` and run it from cron:
 
 ```bash
 go build -o bin/partitioner ./cmd/partitioner   # or: make build
-./bin/partitioner --config config.yaml
+./bin/partitioner
 ```
 
 A database set up this way can gain the cold tier later:
 `CREATE EXTENSION coldfront` adopts the `coldfront.partition_config` the
 partitioner created, registrations included.
 
-A partition-only config has no `iceberg:`, `s3:` or `azure:` section. Any one
-of them makes it a cold-tier config, which requires `iceberg.warehouse` and
-`iceberg.lakekeeper_endpoint` and which the partitioner rejects:
-
-```yaml
-postgres:
-  dsn: "host=localhost dbname=mydb"
-```
+The partitioner connects from the libpq environment or `--dsn`, like psql, and
+reads its tables from `coldfront.partition_config`; it needs no file. A
+partition-only deployment has no cold tier: a table with a `hot_period`
+belongs to the archiver, and the partitioner leaves it alone.
 
 Register each managed table in `coldfront.partition_config`:
 
 ```bash
-./bin/partitioner register --config config.yaml --table events \
+./bin/partitioner register --table events \
     --period monthly --retention "12 months" \
     --strategy drop   # drop (DETACH+DROP, destroy; default)
                       #   | detach (DETACH only, keep as a
@@ -401,7 +418,7 @@ Schedule one pass per period or more often - a cron line, or a systemd
 unit, so alerting is free):
 
 ```text
-17 * * * * postgres /usr/local/bin/partitioner --config /etc/coldfront/partitioner.yaml >> /var/log/coldfront-partitioner.log 2>&1
+17 * * * * postgres PGDATABASE=mydb /usr/local/bin/partitioner >> /var/log/coldfront-partitioner.log 2>&1
 ```
 
 Keep the following operational behavior in mind when scheduling it:
@@ -423,10 +440,10 @@ Keep the following operational behavior in mind when scheduling it:
   before shrinking `retention_period`. Set `expiration_strategy: detach` to
   instead leave the expired partition as a standalone table (detached from the
   parent, data preserved) and reclaim it yourself. A partition is expired only
-  once its *entire* range is older than `now − retention_period`, computed with
-  calendar-accurate PostgreSQL interval arithmetic (a real month, leap years
-  correct). `detach` is partition-only - the tiered archiver always drops after
-  exporting to cold.
+  once its *entire* range is older than `now − retention_period`, computed
+  with calendar-accurate PostgreSQL interval arithmetic (a real month, leap
+  years correct). `detach` is partition-only - the tiered archiver always drops
+  after exporting to cold.
 
 ### Primary Keys on Time-Partitioned Tables (id Mode)
 
@@ -470,8 +487,8 @@ Each level-1 child is named `<table>_<value>`, with the value lowercased and
 every character outside `a-z`, `0-9` and `_` replaced by `_`. That name must
 fit in 50 bytes, which leaves room for the daily leaf suffix within
 PostgreSQL's 63-byte identifier limit. A pass that meets a longer name fails,
-for tiered two-level tables as well. The partitioner also fails a pass in which
-two values map to the same name.
+for tiered two-level tables as well. The partitioner and the archiver also
+fail a pass in which two values map to the same name.
 
 ## Dropping an Iceberg Table (Both Modes)
 
@@ -536,27 +553,31 @@ reason: read access gives no authority to destroy.
 
 ## Managing Partitioned Tables (CLI)
 
-ColdFront splits configuration into two kinds. **Connection** config - the
-PostgreSQL DSN, and (tiered archiver only) the Iceberg/S3 connection - stays in
-a small per-node YAML and is never replicated. **Per-table lifecycle** lives in
+ColdFront's configuration lives in the server. **Per-table lifecycle** lives in
 `coldfront.partition_config`, a name-keyed table that replicates by value
 across a Spock mesh (like `tiered_views`/`archive_watermark`), so every node
-reads identical config - no per-node file syncing. Manage that table with the
-CLI below (both `partitioner` and `archiver` expose these subcommands; with no
-subcommand they do their normal reconcile/archive run).
+reads identical config - no per-node file syncing. The cold-store credential
+lives in `coldfront.storage_secret` and the catalog in the
+`coldfront.warehouse` and `coldfront.lakekeeper_endpoint` settings. The
+**connection** alone comes from outside, from the libpq environment or
+`--dsn`, as for psql. Manage the lifecycle table with the CLI below (both
+`partitioner` and `archiver` expose these subcommands; with no subcommand they
+do their normal reconcile/archive run).
 
 `register` is the primary way to manage tables: one command adds or adopts one
 table, validated on the spot. `import` and `export` are bulk helpers for
-(re)configuring a machine - seed a fresh node from a YAML, or dump the live
-config to git and replay it on another node - not the day-to-day path.
+(re)configuring a machine - write a deployment YAML into a fresh server, or
+dump the live config to git and replay it on another node - not the day-to-day
+path. A YAML passed to anything but `import` is checked against the server and
+refused if it disagrees in any value.
 `register` and `import` run the full validation; `set` re-runs it only when it
-changes the partition column, `hot_period`, `retention_period` or the
+changes the partition period or column, `hot_period`, `retention_period` or the
 sub-partition source, and otherwise relies on the table's CHECK constraints.
 
 The data lifecycle is **hot PG → `hot_period` → cold Iceberg →
-`retention_period` → dropped** (tiered) or **hot PG → `retention_period` →
-dropped** (partition-only). Setting `hot_period` makes a table tiered; omitting
-it makes it partition-only.
+`retention_period` → dropped** (tiered) or **hot PG → `retention_period`
+→ dropped** (partition-only). Setting `hot_period` makes a table tiered;
+omitting it makes it partition-only.
 
 ### What Registration Refuses
 
@@ -611,43 +632,44 @@ The following table describes the CLI subcommands:
 | `list` | Shows the managed tables and their lifecycle. |
 | `set` | Changes fields, or disables or enables a table with `--disable`/`--enable`. |
 | `remove` | Stops managing a table; the table itself is left intact. |
-| `import` | Bulk-loads a machine's tables from a YAML's `archiver.tables` (for provisioning or restore), validating each table as `register` does. |
+| `import` | Writes a deployment YAML into the server once: its `archiver.tables` as rows, validated as `register` validates each table, and its `s3:` or `azure:` stanza as the storage secret. |
 | `export` | Dumps the active (enabled) config to YAML or SQL, as a git-reviewable backup to replay on another node. |
 
 The following examples register, inspect, and change managed tables:
 
 ```bash
 # Partition-only: keep 3 future partitions, drop those older than 12 months.
-partitioner register --config cf.yaml --table events --period monthly --retention "12 months"
+partitioner register --table events --period monthly --retention "12 months"
 
 # Partition-only, but DETACH (preserve) expired partitions instead of dropping them.
-partitioner register --config cf.yaml --table events --period monthly \
+partitioner register --table events --period monthly \
     --retention "12 months" --strategy detach
 
 # Tiered: tier to cold Iceberg after 1 month, then drop cold data after 5 years.
-archiver register --config cf.yaml --table events --period monthly \
+archiver register --table events --period monthly \
     --hot-period "1 month" --retention "5 years"
 
 # id mode - a real single-column PRIMARY KEY (id) on a snowflake-keyed table.
-partitioner register --config cf.yaml --table events --period monthly \
+partitioner register --table events --period monthly \
     --column id --part-mode id --id-scheme snowflake --retention "1 year"
 
 # 2-level LIST(region) → RANGE(ts), tiered; region values come from a table.
-archiver register --config cf.yaml --table regional --period monthly --column ts \
+archiver register --table regional --period monthly --column ts \
     --hot-period "1 month" --sub-values-source "SELECT region FROM regions"
 
-partitioner list   --config cf.yaml                      # what's managed
-partitioner set    --config cf.yaml --table events --retention "24 months"
-partitioner set    --config cf.yaml --table events --disable   # pause (keeps the row)
-partitioner remove --config cf.yaml --table events       # unregister, keep the table
-partitioner import --config tables.yaml                  # register every table in a YAML at once
-partitioner export --config cf.yaml > managed.yaml       # active config, git-reviewable (--format sql for INSERTs)
+partitioner list                                   # what's managed
+partitioner set    --table events --retention "24 months"
+partitioner set    --table events --disable        # pause (keeps the row)
+partitioner remove --table events                  # unregister, keep the table
+partitioner import --config deploy.yaml            # write a deployment YAML into the server once
+partitioner export > managed.yaml                  # active config, git-reviewable (--format sql for INSERTs)
 ```
 
-Run `partitioner` (or `archiver`) with no arguments, `help`, or `--help` for
-the command overview; every subcommand has detailed `--help` with worked
-examples. The write commands accept `--print-sql` (emit the SQL without running
-it - review/commit it); `register` and `import` also accept `--dry-run`.
+Run `partitioner` (or `archiver`) with `help` or `--help` for the command
+overview, and with no arguments for its normal run; every subcommand has a
+detailed `--help` with worked examples. The write commands accept
+`--print-sql` (emit the SQL without running it - review/commit it; `import`
+prints its table `INSERT`s); `register` and `import` also accept `--dry-run`.
 `set --enable`/`--disable` (mutually exclusive) pause/resume a table without
 removing it; a disabled table is skipped by reconcile and omitted from
 `export`. Per table, only the cadence and a lifecycle boundary (`hot_period` or
@@ -657,11 +679,12 @@ whose `CHECK` constraints enforce the lifecycle rules at write time.
 
 The subcommands also take the following connection and table flags:
 
-- `--dsn` takes a PostgreSQL connection string on every subcommand and takes
-  precedence over `--config`, whose `postgres.dsn` is read only when `--dsn` is
-  unset.
-- `--config` names the deployment YAML, and on `import` it is required because
-  it names the file whose `archiver.tables` are imported.
+- `--dsn` takes a PostgreSQL connection string on every subcommand. Without
+  it the connection comes from the libpq environment, as for psql.
+- `--config` names a deployment YAML. On `import` it is required, since it
+  names the file to write into the server. On any other subcommand the file is
+  checked against the server, value by value, and refused if it disagrees; its
+  `postgres.dsn` connects when `--dsn` is unset.
 - `--schema` (default `public`) names the table's schema on `register`, `set`
   and `remove`.
 - `--premake` (default `3`) sets on `register` how many future partitions are
@@ -694,7 +717,9 @@ an explicit `source_schema` takes precedence over that prefix.
 
 ## Storage Backends
 
-Configure **exactly one** of the following cold-store backends.
+Configure **exactly one** of the following cold-store backends, through
+`set_storage_secret` or through the `s3:` or `azure:` stanza of a deployment
+YAML, which `import` writes through the same setters.
 
 ### S3
 
@@ -729,9 +754,9 @@ native `gcs` profile is service-account only and is **not** used.
 Azure ADLS Gen2 is a supported cold-store backend; the access key rides inside
 `connection_string`. Set the credential with `set_storage_secret_azure()`
 instead of `set_storage_secret()` - it takes a CONFIG-provider connection
-string. The storage-account access key rides inside `AccountKey=…`; the DuckDB
-azure secret has no separate account-key parameter, so shared-key auth lives
-entirely in the connection string:
+string. The storage-account access key rides inside `AccountKey=…`; the
+DuckDB azure secret has no separate account-key parameter, so shared-key auth
+lives entirely in the connection string:
 
 ```sql
 SELECT coldfront.set_storage_secret_azure(
@@ -760,10 +785,9 @@ SELECT coldfront.set_storage_secret_vended();
 
 This writes a `coldfront.storage_secret` row marked as vended, so nothing is
 materialized as a DuckDB secret; `ensure_attached()` then attaches the catalog
-with credential vending turned on. The archiver reads the same row and skips
-its own credential setup, so a vended deployment omits the `s3:`/`azure:` block
-from the archiver config entirely. The compactor likewise needs no credential
-in its config.
+with credential vending turned on. The archiver and the compactor read the
+same row, so a vended deployment has no `s3:` or `azure:` stanza to import and
+no credential in any file.
 
 Vended mode targets the two clouds that issue scoped credentials: AWS S3 (STS)
 and Azure ADLS Gen2 (SAS). The `set_storage_secret_vended()` call above enables
@@ -808,22 +832,30 @@ SELECT id, status, data->>'k' FROM events WHERE ts >= '2026-04-01';
 
 -- Inserts, updates, and deletes all go through the coldfront C hook,
 -- which rewrites the query into one PG-set-based statement (hot side)
--- + one duckdb.raw_query (cold side). For iceberg-only mode every write
+-- + duckdb.raw_query calls (cold side). For iceberg-only mode every write
 -- goes cold; for tiered mode the hook splits by ts vs the watermark.
 INSERT INTO events (ts, status, data) VALUES (now(), 'ok', '{"k":1}');
 UPDATE events SET status = 'fixed' WHERE id = 123;
 DELETE FROM events WHERE ts < '2025-01-01';
 
--- Bulk INSERT shapes are all set-based - no per-row work:
+-- Bulk INSERT shapes: the source is read once, the hot rows are one
+-- set-based INSERT and the cold rows are written in batches:
 INSERT INTO events (ts, status, data) VALUES (...), (...), (...);
 INSERT INTO events (ts, status, data) SELECT ts, status, data FROM staging;
 INSERT INTO events (ts, status, data) SELECT now() + i*'1s'::interval, 'ok', '{}'
                                        FROM generate_series(1, 1000) i;
+-- A WITH clause works in both positions; a nested INSERT takes no RETURNING:
+WITH moved AS (DELETE FROM staging RETURNING ts, status, data)
+INSERT INTO events (ts, status, data) SELECT ts, status, data FROM moved;
+WITH i AS (INSERT INTO events (ts, status, data) VALUES (now(), 'ok', '{}'))
+SELECT 1;
+-- COPY FROM loads the same way, one INSERT per cold_write_batch_size rows:
+COPY events (ts, status, data) FROM '/path/to/events.csv' WITH (FORMAT csv);
 
 -- Transactions work; ROLLBACK undoes Iceberg writes too
 BEGIN;
   UPDATE events SET status = 'pending' WHERE id = 1;
-  SELECT status FROM events WHERE id = 1;   -- sees 'pending' (read-your-own-write)
+  SELECT status FROM events WHERE id = 1;   -- sees 'pending' if row 1 is hot
 ROLLBACK;
 SELECT status FROM events WHERE id = 1;     -- back to whatever it was
 ```
@@ -832,11 +864,12 @@ SELECT status FROM events WHERE id = 1;     -- back to whatever it was
 
 The following PostgreSQL column types are supported:
 
-`bigint` · `integer` · `smallint` · `real` · `double precision` · `boolean` ·
-`timestamp with time zone` · `timestamp without time zone` · `date` ·
-`time without time zone` · `uuid` · `text` · `varchar(N)` · `char(N)` · `bytea`
-· `numeric(P,S)` (P ≤ 38) · `jsonb` / `json` · `interval` · `vector(N)` /
-`halfvec(N)` (pgvector; see [usage_vectors.md](usage_vectors.md))
+`bigint` · `integer` · `smallint` · `real` · `double precision` ·
+`boolean` · `timestamp with time zone` · `timestamp without time zone` ·
+`date` · `time without time zone` · `uuid` · `text` · `varchar(N)` ·
+`char(N)` · `bytea` · `numeric(P,S)` (P ≤ 38) · `jsonb` / `json` ·
+`interval` · `vector(N)` / `halfvec(N)` (pgvector; see
+[usage_vectors.md](usage_vectors.md))
 
 Anything else (unbounded `numeric`, `xml`, `tsvector`, range/multirange types,
 custom enums, arrays, composite types, pgvector's `sparsevec`) is rejected when
@@ -912,14 +945,32 @@ Keep the following caveats in mind when running either mode:
   commit by another session after the transaction's first cold read stays
   invisible until the transaction ends. The hot tier follows PostgreSQL's own
   isolation level, so at READ COMMITTED a later statement can see new hot rows
-  but not new cold ones. Read-your-own-write *within* one transaction works.
+  but not new cold ones. Within one transaction, a read of a tiered or
+  decoupled table sees the transaction's own writes on both tiers. The held
+  snapshot is also why the compactor's `--expire-older-than` must stay longer
+  than the longest transaction that reads the table (see
+  [compaction.md](compaction.md)).
+- One transaction block cannot hold both a PostgreSQL write and a cold-tier
+  write unless `duckdb.unsafe_allow_mixed_transactions` is on. pg_duckdb
+  refuses the pair ("Writing to DuckDB and Postgres tables in the same
+  transaction block is not supported"), at the PostgreSQL write when it comes
+  second and at `COMMIT` when it came first. A cold-tier write here is a
+  tiered `UPDATE` or `DELETE` whose `WHERE` bounds the cold tier, or any write
+  to a decoupled table. The statements that write both tiers themselves (a
+  dual-tier `UPDATE` or `DELETE`, a tiered `INSERT` with cold rows, a
+  cross-tier move) set the parameter `LOCAL` for the rest of their
+  transaction, so the block they ran in accepts later writes of either kind.
+  You can set it yourself, `SET LOCAL duckdb.unsafe_allow_mixed_transactions =
+  on`, at your own risk: pg_duckdb commits the Iceberg snapshot at
+  `PRE_COMMIT`, so a backend crash between that and the PostgreSQL commit
+  record keeps the cold write and loses the PostgreSQL writes.
 - In decoupled mode, pg_duckdb commits the Iceberg snapshot at PRE_COMMIT, so a
   backend crash after that but before the PG commit record leaves the Iceberg
   write committed and the PG side lost. A crash after the Parquet upload but
   before the commit POST leaves unreferenced objects, which the compactor's
   orphan pass reclaims.
 - In decoupled mode, concurrent writes from multiple PG nodes are serialized
-  PG-side by the bakery protocol: every iceberg-only INSERT goes through
+  PG-side by the bakery protocol: every iceberg-only `INSERT` goes through
   `coldfront._exec_iceberg_with_claim`, which holds a globally-ordered
   Snowflake ticket and waits for its turn before committing to Lakekeeper.
   There are no 409 conflicts and no app-level retries. The protocol is
@@ -927,26 +978,61 @@ Keep the following caveats in mind when running either mode:
   optimization; claims and acks replicate as Spock rows and it stays safe under
   Spock's asymmetric apply (modeled in
   [docs/formal/Bakery.tla](https://github.com/pgEdge/ColdFront/blob/main/docs/formal/Bakery.tla)).
-  The bakery requires the `snowflake` extension, the `coldfront.dblink_self`
-  GUC (the connection string of the node's loopback), and a one-time
-  `SELECT coldfront._ensure_claims_replicated()` call on every node after Spock
-  mesh setup; see
+  The bakery requires the `snowflake` extension, the `coldfront.loopback_dsn`
+  GUC (the node's loopback, a unix-socket DSN), and a one-time
+  `SELECT coldfront.ensure_replicated()` call on every node after Spock mesh
+  setup; see
   [architecture_decoupled.md](architecture_decoupled.md#concurrency-horizontal-scaling-the-bakery-protocol).
   Sync-rep is **not** required. The throughput ceiling is Lakekeeper's commit
   rate, not the writer count.
 - For direct table access, `_events` is the hot heap (tiered mode only).
   `ice.public.<name>` is the Iceberg table - only addressable via
-  `iceberg_scan(...)` or `duckdb.raw_query('… ice.… …')`, never via PG-native
-  3-part names.
-- When a tiered INSERT omits an IDENTITY column (e.g.
-  `INSERT INTO events (ts, status, data) VALUES …` where `id` is
-  `GENERATED ALWAYS AS IDENTITY`), the cold side falls back to a plpgsql cursor
-  loop that calls `nextval()` per row so cold ids share the hot side's
-  sequence. Correctness is full; throughput is lower than the set-based fast
-  path. Either supply `id` explicitly in the INSERT, or use a partition-column
-  predicate that proves the rows are all hot, to stay on the fast path. For
-  very large historical seeds (mostly-cold), prefer iceberg-only mode where ids
-  come from your source data.
+  `iceberg_scan(...)` or `duckdb.raw_query('… ice.… …')`, never via
+  PG-native 3-part names.
+- A tiered `INSERT` writes its cold rows through `coldfront._cold_sink`, which
+  renders each row in plpgsql and writes Iceberg in batches of
+  `coldfront.cold_write_batch_size` rows. An omitted IDENTITY column takes
+  `nextval()` on the hot table's sequence, so cold ids share it with the hot
+  side, and an omitted column with a DEFAULT takes it. The hot rows are one
+  set-based `INSERT`. For very large historical seeds (mostly-cold), prefer
+  iceberg-only mode where ids come from your source data.
+- `COPY <view> FROM` reads the rows with PostgreSQL's `COPY` reader and writes
+  them through that same `INSERT` path, `coldfront.cold_write_batch_size` rows
+  per `INSERT`. The format options are the reader's, and a supplied value for a
+  `GENERATED ALWAYS` identity column is kept, as `COPY` into a table keeps it.
+  `COPY ... WHERE` and the `FREEZE`, `ON_ERROR`, `REJECT_LIMIT` and `DEFAULT`
+  options are refused.
+- An `INSERT`, `UPDATE` or `DELETE` nested in a `WITH` entry goes through the
+  same rewrite as a top-level one. With a watermark an `INSERT`'s row may go
+  cold, so `RETURNING` on it is refused, as on a top-level `INSERT`; a hot
+  `UPDATE` or `DELETE` keeps `RETURNING`, a cold or dual-tier one cannot
+  return rows or read another `WITH` entry (its DuckDB half does not see
+  them), and a cross-tier move cannot be a `WITH` entry. A statement may write
+  a tiered view once, and the nested write may not have a `WITH` clause of
+  its own. On a decoupled view the source runs in DuckDB, so a `WITH` entry
+  that modifies data is refused (DuckDB 1.5 has no data-modifying `WITH`), and
+  a nested `INSERT` may not read another `WITH` entry. A statement that holds
+  a nested write and also reads a tiered view runs in DuckDB as a whole, and
+  pg_duckdb refuses it ("DuckDB does not support modifying CTEs"); read the
+  hot table, or split the statement.
+- `MERGE INTO <view>`, on PostgreSQL 17 and later (16 allows `MERGE` on tables
+  alone), runs on the tier its `ON` condition bounds the partition column to
+  (`AND t.ts >= '<cutoff>'` for the hot tier, `AND t.ts < '<cutoff>'` for the
+  cold tier): a hot `MERGE` runs in PostgreSQL against the hot table
+  and keeps `RETURNING`, a cold one in DuckDB against the Iceberg table. Each
+  tier sees its own rows alone, so a `MERGE` that bounds neither tier is
+  refused, and an `INSERT` action's row must belong to the statement's tier: a
+  hot `MERGE` refuses a row below the cutoff, a cold one a row at or after it;
+  insert such rows with `INSERT`, which splits them. A cold `INSERT` action
+  must give the identity column a value (`OVERRIDING SYSTEM VALUE` for a
+  `GENERATED ALWAYS` one), a cold `MERGE` cannot return rows and runs one
+  `UPDATE` or `DELETE` action per statement (duckdb-iceberg's limit), and a
+  `WHEN NOT MATCHED BY SOURCE` action must bound the same tier in its own
+  condition. A `MERGE` that sets the partition column is refused (run the
+  change as an `UPDATE`), as is one on a table with a clustered vector column
+  and one whose source reads the view. A `MERGE` nested in a `WITH` entry
+  takes the same path as a nested `UPDATE` or `DELETE`. On a decoupled view
+  every `MERGE` runs in DuckDB.
 - `TRUNCATE` on a registered relation, or on the hot table behind a tiered one,
   fails with an error, because the cold rows in Iceberg would stay visible
   through the view.
@@ -965,6 +1051,12 @@ The configuration below applies to each node in the mesh:
 wal_level = logical
 shared_preload_libraries = 'snowflake,spock,pg_duckdb,coldfront'
 
+# The bakery rules a peer dead when its walsender's last reply is older than
+# coldfront.peer_alive_window_ms (default 10 s), and an idle peer replies only
+# to the walsender's keepalive, every wal_sender_timeout/2. The claim refuses
+# to run unless wal_sender_timeout is positive and below twice the window.
+wal_sender_timeout = 15s
+
 # Spock prereq + DDL replication. The ddl_sql repset (and with it the
 # one-node provisioning promise for wrapper views) only works with DDL
 # replication on; allow_ddl_from_functions covers DDL issued inside
@@ -981,22 +1073,18 @@ spock.include_ddl_repset = on
 # without the setting refuses to start with this line in place.
 output_plugin_libraries = 'pgoutput, test_decoding, spock_output'
 
-# Spock's apply worker does not read this setting: on an idle link,
-# pg_stat_replication.reply_time refreshes only on the walsender's
-# reply-requested keepalive, every wal_sender_timeout/2 (30 s by default).
-wal_receiver_status_interval = 1s
-
 # Per-node - any distinct integer 1..1023 (must be unique per node; the value
 # is otherwise arbitrary - the bakery matches acks by spock node name, not by id).
 snowflake.node = 1
 
 # DSN of the node's loopback, which runs the bakery's autonomous claim
-# INSERT/DELETE. Unix socket avoids TCP overhead. The claim session only touches the
-# coldfront.claims/claim_acks heap tables, so it never attaches the
-# Iceberg catalog (the lazy catalog-attach hook fires only on a tiered
-# view). application_name=coldfront_dblink marks the session as bakery
+# INSERT/DELETE. It must name a unix socket: every onboarded role can read
+# this setting, so it must never need a password. The claim session only
+# touches the coldfront.claims/claim_acks heap tables, so it never attaches
+# the Iceberg catalog (the lazy catalog-attach hook fires only on a tiered
+# view). application_name=coldfront_loopback marks the session as bakery
 # traffic. Only a superuser can set it.
-coldfront.dblink_self = 'host=/tmp dbname=coldfront user=coldfront application_name=coldfront_dblink'
+coldfront.loopback_dsn = 'host=/tmp dbname=coldfront user=coldfront application_name=coldfront_loopback'
 
 coldfront.warehouse = 'wh'
 coldfront.lakekeeper_endpoint = 'http://lakekeeper:8181/catalog'
@@ -1009,18 +1097,22 @@ coldfront.iceberg_bakery_patch = on
 ```
 
 The bakery has no peer-ack timeout. R-A's only failure mode is a dead peer
-(would wait forever), closed by a liveness check inside the wait-loop: a peer
-whose `pg_stat_replication.reply_time` is older than
-`coldfront.peer_alive_window_ms` (default `5000`) is implicitly treated as
-already-acked. Raise this on slow/lossy WAN links if false-positive dead-peer
-rulings become a problem. An alive peer that has not acked is either deferring
-legitimately (R-A's defer rule) or about to ack - either way, waiting is
-correct, not a failure.
+(would wait forever), and a liveness check inside the wait loop closes it:
+the bakery treats a peer whose `pg_stat_replication.reply_time` is older than
+`coldfront.peer_alive_window_ms` as already acked, whatever the walsender's
+state (a peer that has just reconnected is catching up and still alive). The
+peer's apply worker sends that reply after it applies, every
+`spock.feedback_frequency` messages, and in answer to the walsender's
+keepalive; `wal_receiver_status_interval` plays no part, since Spock's apply
+worker does not read it. The window and `wal_sender_timeout` go together; set
+them as [Timeouts](#timeouts) below describes. An alive peer that has
+not acked is either deferring legitimately (R-A's defer rule) or about to
+ack, and waiting for it is correct, not a failure.
 
 A claim whose owner is gone (a hard backend crash) is reaped without operator
 action: by that node's next cold write, to any table, by a peer's arriving
-claim, or by the waiting peer's poke, a no-op UPDATE of its own claim row about
-once a second for as long as it waits. That poke is the only replication
+claim, or by the waiting peer's poke, a no-op `UPDATE` of its own claim row
+about once a second for as long as it waits. That poke is the only replication
 traffic the bakery generates while a writer waits, and there is none when
 nothing waits. See [architecture_decoupled.md](architecture_decoupled.md),
 *Orphan reaping*.
@@ -1031,8 +1123,8 @@ sync-rep cluster-wide if you want stronger durability for non-bakery writes,
 but it plays no part in iceberg-commit serialization.
 
 The one-time mesh setup must be done in this order on every node, because
-`coldfront._ensure_claims_replicated()` calls `spock.repset_add_table` and so
-requires the local Spock node to already exist:
+step 3 calls `spock.repset_add_table`, which requires the local Spock node to
+already exist:
 
 ```sql
 -- 1. Extensions, in dependency order. snowflake is a bakery prereq
@@ -1057,24 +1149,10 @@ SELECT spock.sub_create('sub_n1_from_n3', 'host=<n3> user=coldfront dbname=coldf
                         ARRAY['default','default_insert_only','ddl_sql'],
                         false, false, '{}', '0', false);
 
--- 3. **Required** on every node, after spock setup: register the R-A
--- bakery tables (coldfront.claims + coldfront.claim_acks) in the local
--- node's default repset.  Without this on a peer, the peer's ack INSERTs
--- never replicate back to the originating writer and every claim on the
--- originator waits forever at the ack barrier.
-SELECT coldfront._ensure_claims_replicated();
-
--- 4. On every node: replicate the cold-store secret by value, so a
--- set_storage_secret() call on one node reaches all peers.
--- (coldfront.partition_config self-registers the same way the first time
--- the archiver/partitioner touches it, so it needs no manual step.)
-SELECT spock.repset_add_table('default', 'coldfront.storage_secret'::regclass, false);
-
--- 5. On every node: replicate the registry + watermark, so a table
--- provisioned, tiered or adopted on one node is fully usable on peers
--- (both tables are name-keyed, so the rows are node-independent).
-SELECT spock.repset_add_table('default', 'coldfront.tiered_views'::regclass, false);
-SELECT spock.repset_add_table('default', 'coldfront.archive_watermark'::regclass, false);
+-- 3. **Required** on every node, after its subscriptions exist and before
+-- the first cold write, storage secret or table registration: put every
+-- ColdFront table that replicates by value in this node's default repset.
+SELECT coldfront.ensure_replicated();
 ```
 
 The subscriptions set
@@ -1082,22 +1160,94 @@ The subscriptions set
 already exist on every node from the coldfront extension, so no initial copy is
 needed.
 
-Verify before benching - insert a sentinel claim on each node and read it back
-from every other node. All N×(N-1) directions must show the row before traffic
-starts. `ci/journey.sh` `story_mesh_substrate` is a copyable reference.
+### Timeouts
+
+The following table lists the two settings that decide how long a cold write
+waits for a peer; set them together, on every node:
+
+| Setting | Recommended | Where | What it does |
+|---|---|---|---|
+| `wal_sender_timeout` | `15s` | `postgresql.conf` on every node; the image sets it in mesh mode | The node's walsender asks each peer for a reply after half of it (7.5 s) and drops a peer that has not replied for the whole of it. |
+| `coldfront.peer_alive_window_ms` | `10000` (the default) | `postgresql.conf`, superuser-only | The bakery treats a peer whose last reply is older than this as dead and stops waiting for its ack. |
+
+The rule: half of `wal_sender_timeout` must stay below the window, with a
+round trip to spare; the claim enforces the first part. An idle peer replies
+only when the walsender asks, so the
+PostgreSQL default of 60 s against a 10 s window would rule a live idle peer
+dead; a claim refuses to run with such settings and names both. With the
+recommended values a writer waits at most 10 s for a peer that is really
+dead, and the walsender disconnects a peer silent for 15 s, which then
+reconnects on its own.
+
+On a slow or lossy WAN raise both together and keep the rule, for example
+`wal_sender_timeout = 30s` with `coldfront.peer_alive_window_ms = 20000`.
+Both take effect on a reload (`ALTER SYSTEM SET ...;` then
+`SELECT pg_reload_conf();`), no restart: walsenders re-read the timeout, and
+each claim reads the window once.
+
+### What `coldfront.ensure_replicated()` Does
+
+The call is the one ColdFront-specific step of the mesh setup. It adds eight
+tables to the node's `default` replication set, each keyed by name, so a row is
+identical on every node and replicates by value:
+
+| Table | What replicates, and why a peer needs it |
+|---|---|
+| `coldfront.claims`, `coldfront.claim_acks` | The bakery's tickets and acknowledgements. A peer acknowledges an originator's claim by inserting into `claim_acks` on its own node, and the ack reaches the originator only if the table is in the peer's set. |
+| `coldfront.tiered_views` | The registry. A peer's hook recognizes a view by its row; without it the peer's writes through the view fail in PostgreSQL ("cannot insert into view") and its reads cannot attach the cold tier. |
+| `coldfront.archive_watermark` | The hot/cold cutoff a tiered write is routed by. |
+| `coldfront.storage_secret` | The cold-store credential, so one `set_storage_secret` call reaches every node. |
+| `coldfront.partition_config` | The per-table lifecycle. The archiver and the partitioner add this table themselves as well, because the partitioner runs without the extension. |
+| `coldfront.vector_config`, `coldfront.vector_centroids` | The cluster routing state, so every node resolves a vector to the same cluster. |
+
+Two tables stay local by design and are not added: `coldfront.deferred_acks`
+(each node's queue of the acks it owes) and `coldfront._dummy_dml_target`.
+
+The call runs on every node because a replication set is a property of the
+provider: each node sends the rows of the tables in its own set, and a node
+that skipped the step keeps its acks, registry rows and secret to itself. It
+cannot run at `CREATE EXTENSION` time, because `spock.repset_add_table` needs
+the local Spock node, and nothing runs it later on a node's behalf:
+provisioning a table, setting the secret and writing cold rows all assume it
+has run. It is idempotent, so running it again is harmless, and a node added to
+the mesh later runs the same three steps.
+
+A skipped step shows up late and away from the node that skipped it. If a peer
+never ran it, the originator of every cold write waits at the ack barrier for
+an ack that never arrives. If the node that registers a table never ran it,
+the view reaches each peer as replicated DDL but the registry row does not, so
+the peer's writes through the view fail with "cannot insert into view". A
+secret set on such a node stays on that node.
+
+Verify the step on every node. The query lists the eight tables:
+
+```sql
+SELECT c.relname
+  FROM spock.replication_set rs
+  JOIN spock.replication_set_table rst ON rst.set_id = rs.set_id
+  JOIN pg_class c ON c.oid = rst.set_reloid
+ WHERE rs.set_name = 'default' AND c.relnamespace = 'coldfront'::regnamespace
+ ORDER BY 1;
+```
+
+Then verify the mesh before benching - insert a sentinel claim on each node
+and read it back from every other node. All N×(N-1) directions must show the
+row before traffic starts. `ci/journey.sh` `story_mesh_substrate` is a
+copyable reference: it checks the membership above on every node and then the
+sentinels.
 
 ## Tuning Knobs
 
 The following GUCs adjust write behavior and execution; tune them as needed:
 
 - `coldfront.allow_mixed_writes` (bool, default `on`) controls what happens for
-  tiered-mode UPDATE/DELETE whose WHERE cannot be proven to target one tier.
-  `on` emits a dual-tier CTE; `off` rejects with an error and a hint. The
+  tiered-mode `UPDATE`/`DELETE` whose WHERE cannot be proven to target one
+  tier. `on` emits a dual-tier CTE; `off` rejects with an error and a hint. The
   setting is not relevant in decoupled mode (every write is single-tier by
   definition).
 - `coldfront.cold_write_batch_size` (int, default `10000`, minimum `1`) sets
-  how many rows the IDENTITY cursor loop (see [Caveats](#caveats)) gathers
-  before it writes them to Iceberg as one append. A larger value writes fewer,
+  how many cold rows a tiered `INSERT` gathers (see [Caveats](#caveats)) before
+  it writes them to Iceberg as one `INSERT`. A larger value writes fewer,
   larger Parquet files, and the remainder always flushes, so a small write
   stays one file.
 - `coldfront.vector_probe` (bool, default `on`) sets whether a recognized
@@ -1124,7 +1274,7 @@ The following GUCs adjust write behavior and execution; tune them as needed:
 To go further with ColdFront, consult the following guides:
 
 - The [Architecture](architecture.md) overview describes the tiered
-  architecture, the watermark, the archiver, transparent UPDATE/DELETE, and
+  architecture, the watermark, the archiver, transparent `UPDATE`/`DELETE`, and
   concurrency.
 - The [Decoupled Mode](architecture_decoupled.md) deep dive describes
   decoupled-mode internals, the ACID model, and distributed scaling.

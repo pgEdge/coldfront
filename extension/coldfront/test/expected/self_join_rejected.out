@@ -2,7 +2,7 @@
 -- to a tiered view. A second reference to the same view — a self-join
 -- (UPDATE … FROM v), DELETE … USING v, or a sub-select (… WHERE id IN
 -- (SELECT … FROM v)) — would be copied through verbatim and then fail
--- confusingly (PG cannot scan the iceberg_scan view; DuckDB does not know it).
+-- confusingly (PG cannot run the view's DuckDB read; DuckDB does not know it).
 -- The hook must reject these cleanly at parse-analyze, before planning. A
 -- structural multi-reference rewrite is out of scope. White-box: no Iceberg
 -- attached; single-reference DML is unaffected (see update_{hot,cold}_via_view).
@@ -21,16 +21,16 @@ INSERT INTO coldfront.archive_watermark(schema_name, table_name, cutoff_time)
 VALUES ('public', 'events', '2026-03-01'::timestamptz);
 -- Self-join via FROM — rejected.
 UPDATE public.events SET status = 'x' FROM public.events e2 WHERE public.events.id = e2.id;
-ERROR:  UPDATE/DELETE on tiered view "events" cannot reference it more than once
-HINT:  Self-joins, USING, and sub-selects over the same tiered view are not supported; reference it once.
+ERROR:  UPDATE on tiered view "events" cannot reference it more than once
+HINT:  Self-joins, USING, a MERGE source and sub-selects over the same tiered view are not supported; reference it once.
 -- DELETE … USING the same view — rejected.
 DELETE FROM public.events USING public.events e2 WHERE public.events.id = e2.id;
-ERROR:  UPDATE/DELETE on tiered view "events" cannot reference it more than once
-HINT:  Self-joins, USING, and sub-selects over the same tiered view are not supported; reference it once.
+ERROR:  DELETE on tiered view "events" cannot reference it more than once
+HINT:  Self-joins, USING, a MERGE source and sub-selects over the same tiered view are not supported; reference it once.
 -- Sub-select over the same view (the common, dangerous idiom) — rejected.
 UPDATE public.events SET status = 'x' WHERE id IN (SELECT id FROM public.events WHERE status = 'y');
-ERROR:  UPDATE/DELETE on tiered view "events" cannot reference it more than once
-HINT:  Self-joins, USING, and sub-selects over the same tiered view are not supported; reference it once.
+ERROR:  UPDATE on tiered view "events" cannot reference it more than once
+HINT:  Self-joins, USING, a MERGE source and sub-selects over the same tiered view are not supported; reference it once.
 -- A single reference is still fine: the hot-tier rewrite happens as usual.
 EXPLAIN (COSTS OFF)
   UPDATE public.events SET status = 'x' WHERE ts = '2026-04-01 00:00:00+00';

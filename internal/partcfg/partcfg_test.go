@@ -30,13 +30,15 @@ func (r *mockRows) Conn() *pgx.Conn                              { return nil }
 
 type mockDB struct {
 	execSQL   []string
+	execArgs  [][]any
 	rowsFunc  func() (pgx.Rows, error)
 	querySQL  string // last Query SQL — lets tests assert the ownership filter
 	queryArgs []any  // last Query args — $1 is the owner selector
 }
 
-func (m *mockDB) Exec(_ context.Context, sql string, _ ...any) (pgconn.CommandTag, error) {
+func (m *mockDB) Exec(_ context.Context, sql string, args ...any) (pgconn.CommandTag, error) {
 	m.execSQL = append(m.execSQL, sql)
+	m.execArgs = append(m.execArgs, args)
 	return pgconn.NewCommandTag("OK"), nil
 }
 func (m *mockDB) Query(_ context.Context, sql string, args ...any) (pgx.Rows, error) {

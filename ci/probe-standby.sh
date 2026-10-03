@@ -38,7 +38,6 @@ COMPOSE="docker compose -f docker-compose.matrix.yml"
 DB=coldfront-db-1
 SB="$CF_STANDBY"
 ARCHIVER="./bin/archiver"
-WAREHOUSE=wh
 
 # The generated config carries the cold-store credential, so it lives in a
 # directory nobody else can reach: an unpredictable name, mode 0700, owner-only
@@ -102,17 +101,10 @@ INSERT INTO events (ts, status, data) SELECT '2026-04-01'::timestamptz + (i*inte
 EOSQL
 # Pin the cutoff to 2026-04-15 (Apr hot, Jan-Mar cold) regardless of wall clock.
 ret_days=$(( ( $(date -u +%s) - $(date -u -d '2026-04-15' +%s) ) / 86400 ))
+# The binaries connect from the libpq environment; the YAML is the import input
+# that registers the table, and holds nothing the server already has.
+export PGHOST="$DB_IP" PGPORT=5432 PGDATABASE=coldfront PGUSER=coldfront PGPASSWORD=coldfront PGSSLMODE=disable
 cat > $TMPD/archiver.yaml <<EOF
-postgres:
-  dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
-iceberg:
-  warehouse: "${WAREHOUSE}"
-  lakekeeper_endpoint: "http://${LK_IP}:8181/catalog"
-s3:
-  endpoint: "${SW_IP}:8333"
-  region: "us-east-1"
-  access_key: "admin"
-  secret_key: "adminsecret"
 archiver:
   tables:
     - source_table: events
@@ -120,7 +112,7 @@ archiver:
       hot_period: "${ret_days} days"
 EOF
 make -s build >/dev/null 2>&1 || go build -o bin/archiver ./cmd/archiver
-if "$ARCHIVER" --config $TMPD/archiver.yaml >$TMPD/archiver.log 2>&1; then
+if "$ARCHIVER" import --config $TMPD/archiver.yaml >$TMPD/archiver.log 2>&1 && "$ARCHIVER" >>$TMPD/archiver.log 2>&1; then
     pass "archiver run (cold data created)"
 else
     fail "archiver run — see $TMPD/archiver.log"; tail -8 $TMPD/archiver.log; exit 1

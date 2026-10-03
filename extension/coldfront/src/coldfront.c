@@ -17,17 +17,22 @@
  * The hot rewrite is plain PG DML.  The cold rewrite wraps the DuckDB DML in
  * a SELECT so it doesn't trip pg_duckdb's mixed-write check (the PG
  * command-ID counter stays put), and duckdb.raw_query() runs as a regular C
- * function call.  In both cases the rewritten query contains no iceberg_scan
- * references, so pg_duckdb's planner hook leaves it alone.
+ * function call.  In both cases the rewritten query holds no DuckDB table
+ * function, so pg_duckdb's planner hook leaves it alone.
  *
  * INSERT is rewritten too (cf_emit_tiered_insert_path): with a watermark it
- * splits the rows by the partition column against the cutoff into a hot INSERT
- * into public._events and a cold duckdb.raw_query INSERT; with no watermark yet
+ * reads the source once and splits the rows by the partition column against
+ * the cutoff into a hot INSERT into public._events and the cold sink
+ * coldfront._cold_sink, which writes Iceberg in batches; with no watermark yet
  * every row is hot. Iceberg-only views short-circuit INSERT to the cold path.
- * The view's INSTEAD OF INSERT trigger does the same routing but is only a
- * fallback for when the extension is not loaded: with the hook active the
- * INSERT is rewritten off the view (cf_reparse_and_replace) before the trigger
- * could fire.
+ * The view has no INSTEAD OF trigger: the INSERT is rewritten off the view
+ * (cf_reparse_and_replace) before the rewriter sees it, and a write the hook
+ * does not rewrite fails in PostgreSQL. A MERGE runs on the tier its ON
+ * condition bounds (cf_emit_merge_path): retargeted to the hot table, or in
+ * DuckDB against the Iceberg table, each INSERT action guarding the inserted
+ * partition value per row. Any of the four nested in a WITH entry is rewritten
+ * in place, with the rewrite's own WITH entries lifted into the statement's
+ * list (cf_splice_nested_dml).
  *
  * ATTACH requirement: the DuckDB 'ice' catalog alias must be attached in the
  * current session before cold DML fires.  The hook calls
@@ -42,14 +47,17 @@
 #include <sys/stat.h>
 
 #include "access/attnum.h"
+#include "access/relation.h"
 #include "access/xact.h"
 #include "catalog/dependency.h"
 #include "catalog/namespace.h"
+#include "catalog/pg_authid.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type_d.h"
+#include "commands/copy.h"
 #include "commands/extension.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
@@ -69,6 +77,7 @@
 #include "storage/procarray.h"
 #include "tcop/tcopprot.h"
 #include "tcop/utility.h"
+#include "utils/acl.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/guc.h"
@@ -153,6 +162,10 @@ collect_params_walker(Node *node, void *ctx)
 
     if (node == NULL)
         return false;
+    /* A sub-Query (an INSERT's SELECT source, a sub-select) is walked too:
+     * expression_tree_walker stops at it. */
+    if (IsA(node, Query))
+        return query_tree_walker((Query *) node, collect_params_walker, ctx, 0);
     if (IsA(node, Param))
     {
         Param *p = (Param *) node;
@@ -226,17 +239,25 @@ static int  coldfront_vector_nprobe = 0;
  * postgresql.conf, where they
  * ride physical replication unchanged. local_pg_dsn is GUC_SUPERUSER_ONLY too:
  * it can carry libpq credentials, so non-superusers must not read it back.
- * dblink_self is the DSN of the bakery's loopback, which runs claim statements
+ * loopback_dsn is the DSN of the bakery's loopback, which runs claim statements
  * as its own user, so it is PGC_SUSET for the same reason: a role that could
  * set it would choose that user and its startup options. It stays readable
- * because the invoker-rights _bakery_armed() reads it on every cold write.
+ * because the invoker-rights _bakery_armed() reads it on every cold write, so
+ * it must name a unix socket, which needs no password (cf_loopback_get_conn).
  * The values are read through current_setting() or GetConfigOption(); these
  * backing vars exist only to anchor the GUC definitions.
  */
 static char *coldfront_warehouse          = NULL;
 static char *coldfront_lakekeeper_endpoint = NULL;
 static char *coldfront_local_pg_dsn       = NULL;
-static char *coldfront_dblink_self        = NULL;
+static char *coldfront_loopback_dsn       = NULL;
+/* The bakery's dead-peer window, the async-ordering switch and its build
+ * marker, and two per-session values the SQL keeps with set_config. */
+static int   coldfront_peer_alive_window_ms   = 10000;
+static bool  coldfront_iceberg_async_parquet  = false;
+static bool  coldfront_iceberg_bakery_patch   = false;
+static char *coldfront_claimed                = NULL;
+static bool  coldfront_async_downgrade_warned = false;
 
 static post_parse_analyze_hook_type prev_post_parse_analyze_hook = NULL;
 static planner_hook_type            prev_planner_hook            = NULL;
@@ -275,6 +296,8 @@ typedef struct {
 
 static char *insert_targetlist_collist(Query *query);
 static const char *skip_leading_collist(const char *rest);
+static char *rewrite_merge_inserts(const char *sql, Query *query,
+                                   TieredViewInfo *info, bool cold);
 static char *build_iceberg_only_insert_with_cluster(Query *query,
                                                    TieredViewInfo *info,
                                                    const char *source,
@@ -436,8 +459,8 @@ lookup_tiered_view(Oid relid, const char *vname, TieredViewInfo *info)
  * sub-select, a set-operation branch): pg_duckdb runs the whole statement in DuckDB
  * whichever branch names the view. Once the rewriter has expanded the view its RTE
  * is a subquery that keeps the view's relid, so the planner hook sees it too. Used
- * to lazily attach 'ice' before the read executes (the view body's
- * iceberg_scan('ice...') only resolves once the catalog is attached) and to gate
+ * to lazily attach 'ice' before the read executes (the view body's read of
+ * ice.<ns>.<table> only resolves once the catalog is attached) and to gate
  * the read rewrites. The cheap relkind syscache check gates the SPI lookup so plain
  * table queries (the OLTP hot path) never pay for it.
  */
@@ -475,9 +498,10 @@ query_reads_tiered_view(Query *query)
  * relation plus any self-join FROM/USING entry, sub-select, or CTE that resolves
  * to the same view.  QTW_EXAMINE_RTES_BEFORE makes the walker fire on each
  * RangeTblEntry; recursion into sub-Querys (RTE_SUBQUERY and SubLink subselects)
- * goes through the Query arm.  Used to reject DML that names a tiered view more
- * than once: the deparse rewrite only swaps the leading result-relation token,
- * so a second reference would be copied through verbatim and fail confusingly.
+ * goes through the Query arm.  cf_reject_multi_reference refuses DML that names
+ * a tiered view more than once by this count: the deparse rewrite only swaps
+ * the leading result-relation token, so a second reference would be copied
+ * through verbatim and fail confusingly.
  */
 typedef struct { Oid relid; int count; } ViewRefCount;
 
@@ -664,8 +688,9 @@ classify_qual(Node *qual, Index result_rel, AttrNumber partcol_attno,
         if (!sa_opname || strcmp(sa_opname, "=") != 0)
             return TIER_AMBIGUOUS;
 
-        /* v0.1 handles only ArrayExpr element lists; Const-array folding
-         * happens later in the planner so we should see ArrayExpr here. */
+        /* An IN list reaches the hook as an ArrayExpr of its elements; the
+         * planner folds it into a Const array later. Any other array shape is
+         * ambiguous. */
         if (!IsA(array, ArrayExpr))
             return TIER_AMBIGUOUS;
 
@@ -749,8 +774,22 @@ classify_qual(Node *qual, Index result_rel, AttrNumber partcol_attno,
 }
 
 /*
- * Entry point: classify the query's WHERE clause.  If nothing has been
- * archived yet, all rows are hot by definition.
+ * A MERGE's ON condition: its own field from PostgreSQL 17, the join tree's
+ * qualifier on 16.
+ */
+static Node *
+merge_on_condition(Query *query)
+{
+#if PG_VERSION_NUM >= 170000
+    return query->mergeJoinCondition;
+#else
+    return (Node *) query->jointree->quals;
+#endif
+}
+
+/*
+ * Entry point: classify the query's WHERE clause, a MERGE's ON condition.  If
+ * nothing has been archived yet, all rows are hot by definition.
  */
 static TierClass
 classify_tier(Query *query, TieredViewInfo *info)
@@ -773,7 +812,8 @@ classify_tier(Query *query, TieredViewInfo *info)
     if (partcol_attno == InvalidAttrNumber)
         return TIER_AMBIGUOUS;
 
-    return classify_qual((Node *) query->jointree->quals,
+    return classify_qual(query->commandType == CMD_MERGE ? merge_on_condition(query)
+                                                        : (Node *) query->jointree->quals,
                          (Index) query->resultRelation,
                          partcol_attno,
                          info->cutoff);
@@ -846,7 +886,8 @@ static const CfSubst cf_write_subst[] = {
  * arguments, pg_duckdb declares it PG-side, and the two agree on every fixed-width
  * bucket (a month or year width, which date_bin rejects, time_bucket accepts).
  * The JSON builders (jsonb_build_object, jsonb_agg) need more than a spelling and
- * are rewritten on the node tree instead: see cf_json_builder_mutator.
+ * are rewritten on the node tree instead, as is the <#> operator, which DuckDB
+ * lacks and whose function it has: see cf_json_builder_mutator.
  */
 static const CfSubst cf_read_subst[] = {
     { "::jsonb",             "::json",             false, false },
@@ -1204,6 +1245,25 @@ cf_json_builder_mutator(Node *node, void *ctx)
         }
         return (Node *) a;
     }
+    if (IsA(node, OpExpr))
+    {
+        OpExpr *op    = (OpExpr *) expression_tree_mutator(node, cf_json_builder_mutator, ctx);
+        char   *fname = get_func_name(op->opfuncid);
+
+        /* pg_duckdb hands an operator to DuckDB by its symbol. DuckDB has <=> and
+         * <-> as aliases of its own list_cosine_distance and list_distance and has
+         * no <#>, so that operator becomes a call of the function behind it, which
+         * DuckDB has under the same name. */
+        if (fname != NULL && list_length(op->args) == 2 &&
+            strcmp(fname, "list_negative_inner_product") == 0)  /* nosemgrep */
+        {
+            jc->changed = true;
+            return (Node *) makeFuncExpr(op->opfuncid, op->opresulttype, op->args,
+                                         op->opcollid, op->inputcollid,
+                                         COERCE_EXPLICIT_CALL);
+        }
+        return (Node *) op;
+    }
     return expression_tree_mutator(node, cf_json_builder_mutator, ctx);
 }
 
@@ -1211,20 +1271,26 @@ cf_json_builder_mutator(Node *node, void *ctx)
 
 /*
  * Result of deparsing + finding the leading target-relation prefix.
- * rest points into orig_sql, just past the matched prefix; verb is either
- * "UPDATE " or "DELETE FROM " (always ends with a space).
+ * rest points into orig_sql, just past the matched prefix; verb always ends
+ * with a space.
  *
  * pg_get_querydef() qualifies relation names only when the schema is not in
  * the search_path.  For the typical case of public.events with default
  * search_path, the deparsed string starts with "UPDATE events" or
  * "DELETE FROM events" (no schema prefix).  We try the unqualified form
  * first, then fall back to the schema-qualified form.
+ *
+ * alias is the view's name followed by a space when the statement reads a
+ * second relation or a sub-select and gave the view no alias: the deparser
+ * then qualifies the view's columns by its name, and the retargeted relation
+ * takes that name as its alias so they keep resolving. Otherwise "".
  */
 typedef struct {
     char       *orig_sql;   /* normalised, leading-whitespace-stripped */
     size_t      head_len;   /* bytes before the verb: a leading WITH clause, else 0 */
     const char *rest;       /* points into orig_sql, past the prefix   */
-    const char *verb;       /* "UPDATE " / "DELETE FROM " / "INSERT INTO " */
+    const char *verb;       /* "UPDATE " / "DELETE FROM " / "INSERT INTO " / "MERGE INTO " */
+    const char *alias;      /* "<view> " or "" */
 } DeparseResult;
 
 /*
@@ -1235,16 +1301,18 @@ typedef struct {
  * verbatim. cf_reject_multi_reference guarantees the result relation is named
  * once, so the first out-of-literal hit is the statement's own target. Only one
  * of the unqualified / schema-qualified spellings can match (the deparser emits
- * one form). Returns the match start and sets *matched to the spelling found;
- * elogs if neither is present.
+ * one form). The spellings end in a space, which the text has after the
+ * relation unless the statement ends there (a DELETE without WHERE). Returns
+ * the match start and sets *matched to the spelling found; elogs if neither is
+ * present.
  */
 static const char *
 find_dml_prefix(const char *orig_sql, const char *search_unqual,
                 const char *search_qual, const char *vname,
                 const char **matched)
 {
-    size_t      lu = strlen(search_unqual); /* nosemgrep */
-    size_t      lq = strlen(search_qual);   /* nosemgrep */
+    size_t      lu = strlen(search_unqual) - 1; /* nosemgrep */
+    size_t      lq = strlen(search_qual) - 1;   /* nosemgrep */
     const char *p;
     bool        in_squote = false;
 
@@ -1257,8 +1325,8 @@ find_dml_prefix(const char *orig_sql, const char *search_unqual,
         }
         if (in_squote)
             continue;
-        if (strncmp(p, search_unqual, lu) == 0) { *matched = search_unqual; return p; } /* nosemgrep */
-        if (strncmp(p, search_qual,   lq) == 0) { *matched = search_qual;   return p; } /* nosemgrep */
+        if (strncmp(p, search_unqual, lu) == 0 && (p[lu] == ' ' || p[lu] == '\0')) { *matched = search_unqual; return p; } /* nosemgrep */
+        if (strncmp(p, search_qual,   lq) == 0 && (p[lq] == ' ' || p[lq] == '\0')) { *matched = search_qual;   return p; } /* nosemgrep */
     }
 
     elog(ERROR,
@@ -1268,68 +1336,84 @@ find_dml_prefix(const char *orig_sql, const char *search_unqual,
     return NULL; /* unreachable */
 }
 
+/* pg_get_querydef's text on one line: newlines and tabs become spaces, and the
+ * leading indent goes. */
+static char *
+deparse_flat(Query *query)
+{
+    char *sql = pg_get_querydef(query, false), *p;
+
+    for (p = sql; *p; p++)
+        if (*p == '\n' || *p == '\t') *p = ' ';
+    while (*sql == ' ')
+        sql++;
+    return sql;
+}
+
+/* The two spellings pg_get_querydef can give the statement's verb and result
+ * relation, unqualified and schema-qualified. It quotes mixed-case and reserved
+ * identifiers, and quote_identifier returns a plain name unchanged. */
+static void
+dml_search_strings(Query *query, char *unqual, char *qual, size_t len,
+                   const char **verb)
+{
+    RangeTblEntry *rte = rt_fetch(query->resultRelation, query->rtable);
+    const char    *q_vname = quote_identifier(get_rel_name(rte->relid));
+    const char    *q_ns = quote_identifier(get_namespace_name(get_rel_namespace(rte->relid)));
+
+    *verb = query->commandType == CMD_UPDATE ? "UPDATE " :
+            query->commandType == CMD_DELETE ? "DELETE FROM " :
+            query->commandType == CMD_MERGE  ? "MERGE INTO " : "INSERT INTO ";
+    snprintf(unqual, len, "%s%s ", *verb, q_vname);
+    snprintf(qual, len, "%s%s.%s ", *verb, q_ns, q_vname);
+}
+
 static void
 deparse_and_find_prefix(Query *query, DeparseResult *dr)
 {
-    RangeTblEntry *rte;
-    char          *vname, *ns;
     char           search_unqual[256], search_qual[256];
     const char    *matched, *at;
+    RangeTblEntry *rte = rt_fetch(query->resultRelation, query->rtable);
 
-    dr->orig_sql = pg_get_querydef(query, false);
-    {
-        char *p;
-        for (p = dr->orig_sql; *p; p++)
-            if (*p == '\n' || *p == '\t') *p = ' ';
-    }
-    while (*dr->orig_sql == ' ')
-        dr->orig_sql++;
-
-    rte   = (RangeTblEntry *) list_nth(query->rtable, query->resultRelation - 1);
-    vname = get_rel_name(rte->relid);
-    ns    = get_namespace_name(get_rel_namespace(rte->relid));
-
-    /*
-     * pg_get_querydef quotes mixed-case / reserved identifiers; the search
-     * prefix must match. quote_identifier returns the input unchanged when
-     * no quoting is needed.
-     */
-    {
-        const char *q_vname = quote_identifier(vname);
-        const char *q_ns    = quote_identifier(ns);
-
-        if (query->commandType == CMD_UPDATE)
-        {
-            snprintf(search_unqual, sizeof(search_unqual), "UPDATE %s ",    q_vname);
-            snprintf(search_qual,   sizeof(search_qual),   "UPDATE %s.%s ", q_ns, q_vname);
-            dr->verb = "UPDATE ";
-        }
-        else if (query->commandType == CMD_DELETE)
-        {
-            snprintf(search_unqual, sizeof(search_unqual), "DELETE FROM %s ",    q_vname);
-            snprintf(search_qual,   sizeof(search_qual),   "DELETE FROM %s.%s ", q_ns, q_vname);
-            dr->verb = "DELETE FROM ";
-        }
-        else /* CMD_INSERT */
-        {
-            snprintf(search_unqual, sizeof(search_unqual), "INSERT INTO %s ",    q_vname);
-            snprintf(search_qual,   sizeof(search_qual),   "INSERT INTO %s.%s ", q_ns, q_vname);
-            dr->verb = "INSERT INTO ";
-        }
-    }
-
-    at = find_dml_prefix(dr->orig_sql, search_unqual, search_qual, vname, &matched);
-
+    dr->orig_sql = deparse_flat(query);
+    dml_search_strings(query, search_unqual, search_qual, sizeof(search_unqual), &dr->verb);
+    at = find_dml_prefix(dr->orig_sql, search_unqual, search_qual,
+                         get_rel_name(rte->relid), &matched);
     dr->head_len = (size_t) (at - dr->orig_sql);
-    dr->rest     = at + strlen(matched); /* nosemgrep */
+    dr->rest     = at + strlen(matched) - 1; /* nosemgrep */
+    if (*dr->rest == ' ')
+        dr->rest++;
+    dr->alias    = query->commandType != CMD_INSERT && rte->alias == NULL &&
+                   (list_length(query->rtable) > 1 || query->hasSubLinks)
+                   ? psprintf("%s ", quote_identifier(get_rel_name(rte->relid))) : "";
+}
+
+/*
+ * Open a rewritten statement's WITH clause: the statement's own entries
+ * (dr->head_len bytes, before the verb) come first, so an entry that modifies
+ * data stays at the top level where PostgreSQL requires it, and a comma leads
+ * into the rewrite's own entries.
+ */
+static void
+append_with_opener(StringInfo buf, const DeparseResult *dr)
+{
+    if (dr->head_len == 0)
+    {
+        appendStringInfoString(buf, "WITH ");
+        return;
+    }
+    appendBinaryStringInfo(buf, dr->orig_sql, dr->head_len);
+    while (buf->len > 0 && buf->data[buf->len - 1] == ' ')
+        buf->len--;
+    buf->data[buf->len] = '\0';
+    appendStringInfoString(buf, ", ");
 }
 
 /*
  * Prepend the statement's leading WITH clause (dr->head_len bytes, before the
- * verb) to a row source. Emitters that wrap the source in a parenthesised
- * derived table need this: that subquery is the only scope the CTEs are
- * visible from, on either engine. Returns source unchanged when there is no
- * leading clause.
+ * verb) to a row source. The decoupled INSERT ships its source to DuckDB inside
+ * a parenthesised derived table, the only scope its CTEs are visible from
+ * there. Returns source unchanged when there is no leading clause.
  */
 static const char *
 fold_leading_with(const DeparseResult *dr, const char *source)
@@ -1353,7 +1437,7 @@ build_hot_dml(DeparseResult *dr, TieredViewInfo *info)
     StringInfoData buf;
     initStringInfo(&buf);
     appendBinaryStringInfo(&buf, dr->orig_sql, dr->head_len);  /* leading WITH, if any */
-    appendStringInfo(&buf, "%s%s %s", dr->verb, info->hot_table, dr->rest);
+    appendStringInfo(&buf, "%s%s %s%s", dr->verb, info->hot_table, dr->alias, dr->rest);
     return buf.data;
 }
 
@@ -1371,7 +1455,7 @@ build_cold_dml(DeparseResult *dr, TieredViewInfo *info, Query *query)
 
     initStringInfo(&buf);
     appendBinaryStringInfo(&buf, dr->orig_sql, dr->head_len);  /* leading WITH, if any */
-    appendStringInfo(&buf, "%s%s %s", dr->verb, info->iceberg_table, dr->rest);
+    appendStringInfo(&buf, "%s%s %s%s", dr->verb, info->iceberg_table, dr->alias, dr->rest);
     sql = normalize_casts_for_duckdb(buf.data);
 
     /* A cold UPDATE that sets the embedding re-derives the cluster in the same
@@ -1393,8 +1477,7 @@ build_cold_dml(DeparseResult *dr, TieredViewInfo *info, Query *query)
 
 /*
  * Render a deparsed cold DML string as the SQL-text argument that
- * coldfront._exec_iceberg_with_claim(table, sql) — or _tiered_insert_cold's
- * source — receives.
+ * coldfront._exec_iceberg_with_claim(table, sql) receives.
  *
  * With no bound params (maxid==0) it is a plain quoted literal. With params it
  * is a format(<template>, $1, $2, ...) call: each out-of-literal $N becomes a
@@ -1406,22 +1489,14 @@ build_cold_dml(DeparseResult *dr, TieredViewInfo *info, Query *query)
  * literal is user data, left alone; a literal '%' is doubled so format() passes
  * it through.
  *
- * duckdb_target selects value rendering. true: the string reaches
- * duckdb.raw_query (emit_cold / emit_dual / the fast tiered-INSERT path), so it
- * mirrors the INSTEAD-OF trigger's DuckDB literals — bytea -> from_hex(%P$L) /
- * encode($K,'hex'); real[] (a vector column's view type) ->
- * CAST(%P$L AS FLOAT[]) / translate($K::text,'{}','[]');
- * json/jsonb/interval -> %P$L / $K::text; else %P$L / $K.
- * false: the string is embedded in a PostgreSQL cursor by
- * coldfront._tiered_insert_cold (the slow IDENTITY-omit path), executed by PG
- * not DuckDB. Most params render as plain %P$L / $K (PG coerces by the column
- * type); bytea renders as decode(%P$L,'hex') / encode($K,'hex') so the projected
- * cursor column is a real bytea independent of the caller's bytea_output GUC (a
- * plain %L would quote it under the session bytea_output and corrupt under
- * 'escape'). from_hex (DuckDB-only) would be wrong here — PG has no from_hex().
+ * The string reaches duckdb.raw_query (emit_cold / emit_dual), so a value
+ * renders as a DuckDB literal: bytea -> from_hex(%P$L) / encode($K,'hex');
+ * real[] (a vector column's view type) -> CAST(%P$L AS FLOAT[]) /
+ * translate($K::text,'{}','[]'); json/jsonb/interval -> %P$L / $K::text;
+ * else %P$L / $K.
  */
 static char *
-cold_sql_arg(const char *cold_dml, ColdParamSet *ps, bool duckdb_target)
+cold_sql_arg(const char *cold_dml, ColdParamSet *ps)
 {
     StringInfoData tmpl, args, out;
     const char    *p = cold_dml;
@@ -1470,32 +1545,24 @@ cold_sql_arg(const char *cold_dml, ColdParamSet *ps, bool duckdb_target)
                 {
                     pos_of_id[id - 1] = next_pos++;
                     if (t == BYTEAOID)
-                        /* hex string — GUC-independent (the caller's bytea_output
-                         * is irrelevant); both targets reconstruct the exact
-                         * bytes: DuckDB via from_hex, PG via decode. */
+                        /* hex string, independent of the caller's bytea_output;
+                         * from_hex rebuilds the exact bytes. */
                         appendStringInfo(&args, ", encode($%d,'hex')", id);
-                    else if (duckdb_target && t == FLOAT4ARRAYOID)
+                    else if (t == FLOAT4ARRAYOID)
                         /* A vector column reaches this path as real[], the type the
                          * view exposes. PG spells that {1,2,3} and DuckDB's list
                          * cast takes [1,2,3], so translate rewrites the delimiters
-                         * and the template supplies the cast. PG's own target needs
-                         * neither: it coerces the literal by the column type. */
+                         * and the template supplies the cast. */
                         appendStringInfo(&args, ", translate($%d::text,'{}','[]')", id);
-                    else if (duckdb_target &&
-                             (t == JSONOID || t == JSONBOID || t == INTERVALOID))
+                    else if (t == JSONOID || t == JSONBOID || t == INTERVALOID)
                         appendStringInfo(&args, ", $%d::text", id);
                     else
                         appendStringInfo(&args, ", $%d", id);
                 }
-                if (t == BYTEAOID && duckdb_target)
+                if (t == BYTEAOID)
                     appendStringInfo(&tmpl, "from_hex(%%%d$L)", pos_of_id[id - 1]);
-                else if (t == FLOAT4ARRAYOID && duckdb_target)
+                else if (t == FLOAT4ARRAYOID)
                     appendStringInfo(&tmpl, "CAST(%%%d$L AS FLOAT[])", pos_of_id[id - 1]);
-                else if (t == BYTEAOID)
-                    /* native PG (the _tiered_insert_cold cursor): rebuild a real
-                     * bytea from the hex arg so the projected column is bytea
-                     * regardless of the caller's bytea_output. */
-                    appendStringInfo(&tmpl, "decode(%%%d$L,'hex')", pos_of_id[id - 1]);
                 else
                     appendStringInfo(&tmpl, "%%%d$L", pos_of_id[id - 1]);
                 p = q;
@@ -1517,8 +1584,9 @@ cold_sql_arg(const char *cold_dml, ColdParamSet *ps, bool duckdb_target)
  * cold_sql_arg() output. This is the single chokepoint for ALL cold-tier writes
  * (tiered and iceberg-only): its plpgsql wrapper self-selects the cluster-wide
  * R-A bakery (mesh) or a local advisory lock (vanilla), runs the cold DML via
- * duckdb.raw_query, and releases the claim after pg_duckdb's iceberg COMMIT via
- * the C XactCallback. Callers wrap it in a SELECT (top level) or in
+ * duckdb.raw_query, and releases the claim at XACT_EVENT_COMMIT, after pg_duckdb
+ * has committed the Iceberg transaction at XACT_EVENT_PRE_COMMIT, via the C
+ * XactCallback. Callers wrap it in a SELECT (top level) or in
  * cold_anchor_update() (in plpgsql).
  */
 static char *
@@ -1748,37 +1816,25 @@ static char *
 emit_hot(Query *query, TieredViewInfo *info)
 {
     DeparseResult dr;
+    char         *sql;
+
     deparse_and_find_prefix(query, &dr);
-    return build_hot_dml(&dr, info);
+    sql = build_hot_dml(&dr, info);
+    if (query->commandType == CMD_MERGE && info->has_cutoff)
+        sql = rewrite_merge_inserts(sql, query, info, false);
+    return sql;
 }
 
 static char *
 emit_cold(Query *query, TieredViewInfo *info, ColdParamSet *ps, bool in_plpgsql)
 {
     DeparseResult  dr;
-    List          *saved_returning;
     char          *cold_dml, *call;
 
-    /*
-     * Save / NIL / restore the returningList around deparse instead of
-     * copyObject(query) — the deep-copy is hundreds of palloc'd nodes per
-     * cold UPDATE/DELETE, all to flip one field. This is on the parser-stage
-     * hot path, so it adds up under load.
-     *
-     * Provably safe: pg_get_querydef's only use of returningList is inside
-     * get_update_query_def / get_delete_query_def / get_insert_query_def,
-     * which read the list and call get_returning_clause to emit text. None
-     * stash a pointer past the call — the deparse_context is stack-local
-     * and dies when the function returns. Cold writes don't currently
-     * return rows (v0.1 cosmetic limit), so we strip RETURNING at the
-     * tree level.
-     */
-    saved_returning = query->returningList;
-    query->returningList = NIL;
     deparse_and_find_prefix(query, &dr);
-    query->returningList = saved_returning;
-
     cold_dml = build_cold_dml(&dr, info, query);
+    if (query->commandType == CMD_MERGE)
+        cold_dml = rewrite_merge_inserts(cold_dml, query, info, true);
 
     /* An iceberg-only INSERT into a clustered table is re-emitted so the cluster
      * is derived in the same statement: a row whose cluster disagrees with its
@@ -1794,14 +1850,10 @@ emit_cold(Query *query, TieredViewInfo *info, ColdParamSet *ps, bool in_plpgsql)
             cold_dml = normalize_casts_for_duckdb(with_cluster);
     }
 
-    /* INSERT … SELECT FROM pg_table needs each non-result PG-table
-     * reference prefixed with pglocal. so DuckDB can resolve via the
-     * postgres extension. UPDATE/DELETE never reference other PG tables
-     * (the rtable has only the result view), so this loop is a no-op
-     * for those verbs. INSERT … VALUES has no source rtable beyond the
-     * VALUES_LIST RTE, so also a no-op. */
-    if (query->commandType == CMD_INSERT)
-        cold_dml = prefix_pg_tables_with_pglocal(query, cold_dml);
+    /* A PostgreSQL table the statement reads (an INSERT's or a MERGE's source,
+     * an UPDATE's FROM, a DELETE's USING) gets the pglocal. prefix, so DuckDB
+     * resolves it through the postgres extension. */
+    cold_dml = prefix_pg_tables_with_pglocal(query, cold_dml);
 
     /* ALL cold-tier writes — tiered and iceberg-only alike — go through the
      * bakery wrapper. Every iceberg snapshot commit posts to the same
@@ -1811,7 +1863,7 @@ emit_cold(Query *query, TieredViewInfo *info, ColdParamSet *ps, bool in_plpgsql)
      * them; it self-selects the R-A bakery (multi-node mesh) or a local
      * advisory lock (vanilla single-node), so this is correct in every
      * deployment. (Tiered INSERT uses a separate path, emit_tiered_insert.) */
-    call = cold_exec_call(info->iceberg_table, cold_sql_arg(cold_dml, ps, true));
+    call = cold_exec_call(info->iceberg_table, cold_sql_arg(cold_dml, ps));
 
     /* Cause 2: inside plpgsql the statement must be a DML (cold_anchor_update);
      * at top level keep the byte-identical SELECT shape. */
@@ -1829,71 +1881,56 @@ emit_cold(Query *query, TieredViewInfo *info, ColdParamSet *ps, bool in_plpgsql)
  * emit_dual builds the dual-tier CTE used when coldfront.allow_mixed_writes
  * is on and the predicate is TIER_AMBIGUOUS.  Both sides run in the same
  * statement; pg_duckdb's XactCallback keeps the DuckDB transaction tied to
- * PG's, so ROLLBACK undoes both tiers (not crash-safe — orphaned S3 objects
+ * PG's, so ROLLBACK undoes both tiers (not crash-safe: orphaned S3 objects
  * on crash are Iceberg housekeeping's concern).
  *
  * The cold CTE is a SELECT (not DML), so PG would prune it as unreferenced
  * unless the outer query forces its execution.  We use a CROSS JOIN with
- * `cold` in the outer SELECT — see the body comment near the appendStringInfo
+ * `cold` in the outer SELECT; see the body comment near the appendStringInfo
  * call for why MATERIALIZED alone would not be enough.
  *
- * The hot CTE must have RETURNING so the outer SELECT can consume its
- * output.  If the user's UPDATE/DELETE already has a RETURNING list we keep
- * theirs; otherwise we append RETURNING *.  Cold RETURNING is not supported
- * in v0.1, so the outer SELECT only ever shows hot rows.
+ * The hot CTE gets RETURNING * so the outer SELECT can consume its output.
+ * The statement's own RETURNING is refused before this
+ * (reject_cold_returning), since the cold half returns no rows.
  */
 static char *
 emit_dual(Query *query, TieredViewInfo *info, ColdParamSet *ps, bool in_plpgsql)
 {
-    DeparseResult  dr_hot, dr_cold;
+    DeparseResult  dr;
     char          *hot_dml, *cold_dml, *call;
-    bool           has_returning = (query->returningList != NIL);
     StringInfoData buf;
-    List          *saved_returning;
 
-    /* Hot side: deparse with RETURNING intact. */
-    deparse_and_find_prefix(query, &dr_hot);
-    hot_dml = build_hot_dml(&dr_hot, info);
-
-    /*
-     * Cold side: NIL the returningList just for this deparse, then restore.
-     * Same safety argument as emit_cold — pg_get_querydef doesn't keep any
-     * post-call references into the list, so the Query is bit-identical
-     * after restoration. Saves a copyObject(query) per ambiguous UPDATE/
-     * DELETE on a tiered view.
-     */
-    saved_returning = query->returningList;
-    query->returningList = NIL;
-    deparse_and_find_prefix(query, &dr_cold);
-    query->returningList = saved_returning;
-    cold_dml = build_cold_dml(&dr_cold, info, query);
-    call = cold_exec_call(info->iceberg_table, cold_sql_arg(cold_dml, ps, true));
+    deparse_and_find_prefix(query, &dr);
+    hot_dml  = build_hot_dml(&dr, info);
+    cold_dml = build_cold_dml(&dr, info, query);
+    call     = cold_exec_call(info->iceberg_table, cold_sql_arg(cold_dml, ps));
 
     initStringInfo(&buf);
     if (in_plpgsql)
     {
-        /* Cause 2: the hot UPDATE/DELETE is the OUTER statement (DML tag ->
-         * plpgsql accepts it); the cold call rides in a data-modifying WITH-CTE
+        /* Cause 2: the hot UPDATE/DELETE is the statement itself (the DML tag
+         * plpgsql accepts, and the body a WITH entry keeps once
+         * cf_splice_nested_dml lifts the rest out), behind the statement's own
+         * WITH entries; the cold call rides in a data-modifying entry
          * (cold_anchor_update), which PG always runs to completion regardless of
          * references, so the cold write still happens when the hot side matches
-         * no rows. We keep the user's RETURNING if any; cold RETURNING is not
-         * supported in v0.1. */
-        appendStringInfo(&buf, "WITH cold AS (%s) %s",
-                         cold_anchor_update(call), hot_dml);
+         * no rows. */
+        append_with_opener(&buf, &dr);
+        appendStringInfo(&buf, "coldfront_cold AS (%s) %s%s %s%s",
+                         cold_anchor_update(call), dr.verb, info->hot_table,
+                         dr.alias, dr.rest);
     }
     else
     {
-        /* Top level (unchanged): the cold CTE is a SELECT, which PG would prune
-         * as unreferenced — MATERIALIZED only prevents inlining — so a CROSS
-         * JOIN with cold in the outer SELECT forces its execution while keeping
-         * the row set equal to hot. The hot CTE is DML and always runs. */
+        /* Top level: the cold CTE is a SELECT, which PG would prune as
+         * unreferenced (MATERIALIZED only prevents inlining), so a CROSS JOIN
+         * with it in the outer SELECT forces its execution while keeping the row
+         * set equal to the hot CTE's, which is DML and always runs. */
         appendStringInfo(&buf,
-            "WITH hot AS (%s%s)"
-            ", cold AS (SELECT %s)"
-            " SELECT h.* FROM hot h CROSS JOIN cold c",
-            hot_dml,
-            has_returning ? "" : " RETURNING *",
-            call);
+            "WITH coldfront_hot AS (%s RETURNING *)"
+            ", coldfront_cold AS (SELECT %s)"
+            " SELECT h.* FROM coldfront_hot h CROSS JOIN coldfront_cold c",
+            hot_dml, call);
     }
     return buf.data;
 }
@@ -1947,26 +1984,6 @@ skip_leading_collist(const char *rest)
 }
 
 /*
- * Build the cold-side SELECT list for the fast pglocal-streaming path,
- * projecting every underlying-table column in attnum order: the cold INSERT
- * supplies the full tuple, and a PG-side DEFAULT expression exists nowhere in
- * the Iceberg schema, so whatever fills one fills it here.  For each
- * underlying column:
- *
- *   - If it appears in the user's INSERT targetList → emit the bare
- *     identifier (gets value from `coldfront_src` alias).
- *   - Else if it has a DEFAULT expression → inline the DEFAULT text so
- *     DuckDB evaluates it (per-row for volatile defaults like now()).
- *   - Else → NULL::<type>.
- *
- * IDENTITY-omitted is handled upstream by tiered_insert_needs_loop()
- * routing to the slow loop; this fast path never sees that case.
- *
- * `hot_qualified` is the registry's hot_table value (e.g.
- * '"public"."_events"'). `targeted` is the user's targetList resnames.
- * Returns palloc'd CSV.
- */
-/*
  * Returns true iff `attname` matches (by string) any resname in `targeted`.
  */
 static bool
@@ -1982,95 +1999,6 @@ name_in_list(List *targeted, const char *attname)
 }
 
 /*
- * Append one cold-SELECT projection element to `sel`: the bare identifier when
- * the column is in the user's targetList, else the inlined DEFAULT expression,
- * else NULL::<type>.
- */
-static void
-append_cold_projection(StringInfo sel, bool in_target, const char *attname,
-                       const char *atttype, const char *default_expr)
-{
-    if (in_target)
-        appendStringInfoString(sel, quote_identifier(attname));
-    else if (default_expr != NULL)
-        appendStringInfo(sel, "(%s)", default_expr);
-    else
-        appendStringInfo(sel, "NULL::%s", atttype);
-}
-
-static char *
-build_cold_select_list(const char *hot_qualified, const char *iceberg_ref,
-                       List *targeted)
-{
-    StringInfoData sql, sel;
-    bool           first = true;
-    char          *vec_prefix = NULL;
-
-    initStringInfo(&sql);
-    appendStringInfo(&sql,
-        "SELECT a.attname, format_type(a.atttypid, a.atttypmod), "
-        "       pg_get_expr(d.adbin, d.adrelid) AS default_expr "
-        "FROM pg_attribute a "
-        "JOIN pg_class c ON c.oid = a.attrelid "
-        "JOIN pg_namespace n ON n.oid = c.relnamespace "
-        "LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
-        "WHERE n.nspname = (parse_ident(%s))[1] "
-        "AND c.relname = (parse_ident(%s))[2] "
-        "AND a.attnum > 0 AND NOT a.attisdropped "
-        "AND NOT coldfront._is_vec_companion(a.attname, a.attgenerated) "
-        "ORDER BY a.attnum",
-        quote_literal_cstr(hot_qualified),
-        quote_literal_cstr(hot_qualified));
-
-    initStringInfo(&sel);
-    if (SPI_connect() == SPI_OK_CONNECT)
-    {
-        if (SPI_execute(sql.data, true, 0) == SPI_OK_SELECT && SPI_processed > 0)
-        {
-            MemoryContext oldcxt = MemoryContextSwitchTo(CurTransactionContext);
-            uint64        i;
-            for (i = 0; i < SPI_processed; i++)
-            {
-                char *attname = SPI_getvalue(SPI_tuptable->vals[i],
-                                             SPI_tuptable->tupdesc, 1);
-                char *atttype = SPI_getvalue(SPI_tuptable->vals[i],
-                                             SPI_tuptable->tupdesc, 2);
-                char *default_expr = SPI_getvalue(SPI_tuptable->vals[i],
-                                                  SPI_tuptable->tupdesc, 3);
-                bool  in_target = name_in_list(targeted, attname);
-                if (!first) appendStringInfoString(&sel, ", ");
-                append_cold_projection(&sel, in_target, attname, atttype,
-                                       default_expr);
-                first = false;
-            }
-            /* The Iceberg schema leads with the cluster column and this INSERT
-             * is positional, so the projection leads with it too.  The
-             * expression comes from the extension rather than being spelled
-             * here: a row whose cluster disagrees with its vector is invisible
-             * to its own search and reports no error, so every write path
-             * derives from one definition.  Still inside the SPI call, and
-             * inside CurTransactionContext, so the result outlives SPI_finish. */
-            {
-                StringInfoData q;
-                initStringInfo(&q);
-                appendStringInfo(&q,
-                    "SELECT coldfront._vec_list_prefix_for_ref(%s, '')",
-                    quote_literal_cstr(iceberg_ref));
-                if (SPI_execute(q.data, true, 1) == SPI_OK_SELECT
-                    && SPI_processed == 1)
-                    vec_prefix = SPI_getvalue(SPI_tuptable->vals[0],
-                                              SPI_tuptable->tupdesc, 1);
-            }
-            MemoryContextSwitchTo(oldcxt);
-        }
-        SPI_finish();
-    }
-    if (vec_prefix != NULL)
-        return psprintf("%s%s", vec_prefix, sel.data);
-    return sel.data;
-}
-
-/*
  * Format a TimestampTz as the SQL literal `'<text>'::timestamptz` so it
  * embeds verbatim in a SQL string.  PG's timestamptz_out is locale-stable
  * and round-trips cleanly through cstring → timestamptz on both PG and
@@ -2082,83 +2010,6 @@ format_timestamptz_literal(TimestampTz ts)
     char *txt = DatumGetCString(DirectFunctionCall1(timestamptz_out,
                                                      TimestampTzGetDatum(ts)));
     return psprintf("'%s'::timestamptz", txt);
-}
-
-/*
- * Returns true iff `info->hot_table` has an IDENTITY column whose name
- * is NOT in the user's targetList. That's the one subcase that needs
- * PG-side nextval injection per row (the sequence has to advance in PG
- * context to stay coherent with the hot side's auto-allocations).
- *
- * Other omissions — columns with DEFAULT clauses, or plain columns —
- * don't need the loop: the fast path's cold SELECT inlines DEFAULT
- * expressions for those, and falls back to NULL::<type> for plain
- * columns (matching PG's semantics for omitted columns with no DEFAULT).
- */
-static bool
-tiered_insert_needs_loop(Query *query, TieredViewInfo *info)
-{
-    StringInfoData sql;
-    bool           result = false;
-
-    if (info->hot_table == NULL) return false;
-    if (SPI_connect() != SPI_OK_CONNECT) return false;
-
-    initStringInfo(&sql);
-    appendStringInfo(&sql,
-        "SELECT a.attname "
-        "FROM pg_attribute a "
-        "JOIN pg_class c ON c.oid = a.attrelid "
-        "JOIN pg_namespace n ON n.oid = c.relnamespace "
-        "WHERE n.nspname = (parse_ident(%s))[1] "
-        "AND c.relname = (parse_ident(%s))[2] "
-        "AND a.attidentity IN ('a','d') "
-        "AND a.attnum > 0 AND NOT a.attisdropped "
-        "LIMIT 1",
-        quote_literal_cstr(info->hot_table),
-        quote_literal_cstr(info->hot_table));
-
-    if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed == 1)
-    {
-        char     *idcol = SPI_getvalue(SPI_tuptable->vals[0],
-                                       SPI_tuptable->tupdesc, 1);
-        ListCell *lc;
-        bool      in_target = false;
-        foreach(lc, query->targetList)
-        {
-            TargetEntry *tle = (TargetEntry *) lfirst(lc);
-            if (!tle->resjunk && tle->resname != NULL
-                && strcmp(tle->resname, idcol) == 0)
-            {
-                in_target = true;
-                break;
-            }
-        }
-        result = !in_target;
-    }
-    SPI_finish();
-    return result;
-}
-
-/*
- * Build the hot-half DML: a full set-based PG INSERT into the hot table with
- * the hot filter (partition_col >= cutoff). Returns palloc'd.
- */
-static char *
-build_tiered_hot_dml(const char *hot_table, const char *col_list,
-                     const char *source, const char *partition_col,
-                     const char *cutoff_lit)
-{
-    StringInfoData hot;
-    initStringInfo(&hot);
-    appendStringInfo(&hot,
-        "INSERT INTO %s (%s) "
-        "SELECT %s FROM (%s) AS coldfront_src(%s) "
-        "WHERE %s >= %s",
-        hot_table, col_list,
-        col_list, source, col_list,
-        quote_identifier(partition_col), cutoff_lit);
-    return hot.data;
 }
 
 /*
@@ -2335,173 +2186,283 @@ build_iceberg_only_insert_with_cluster(Query *query, TieredViewInfo *info,
 }
 
 /*
- * Build the slow-path cold call (IDENTITY-omitted case): the target-name
- * ARRAY[...] plus the coldfront._tiered_insert_cold(...) call. Its source SQL
- * runs in a PG cursor (executed by PG, not DuckDB), so params render as NATIVE
- * PG (duckdb_target=false): no from_hex/::text — PG coerces the literals by the
- * projected column types. Returns palloc'd.
+ * The hot table's columns in attnum order, read once per rewritten INSERT:
+ * name, type, DEFAULT expression (NULL without one) and, for an identity
+ * column, its sequence (NULL otherwise). Vector companions are left out, as in
+ * every other place the cold tuple is built.
+ */
+typedef struct {
+    int    n;
+    char **name;
+    char **type;
+    char **dflt;
+    char **seq;
+} HotColumns;
+
+static void
+load_hot_columns(const char *hot_qualified, HotColumns *hc)
+{
+    StringInfoData sql;
+    const char    *lit = quote_literal_cstr(hot_qualified);
+
+    hc->n = 0;
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+        "SELECT a.attname, format_type(a.atttypid, a.atttypmod), "
+        "       pg_get_expr(d.adbin, d.adrelid), "
+        "       CASE WHEN a.attidentity <> '' "
+        "            THEN pg_get_serial_sequence(%s, a.attname) END "
+        "FROM pg_attribute a "
+        "JOIN pg_class c ON c.oid = a.attrelid "
+        "JOIN pg_namespace n ON n.oid = c.relnamespace "
+        "LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum "
+        "WHERE n.nspname = (parse_ident(%s))[1] "
+        "AND c.relname = (parse_ident(%s))[2] "
+        "AND a.attnum > 0 AND NOT a.attisdropped "
+        "AND NOT coldfront._is_vec_companion(a.attname, a.attgenerated) "
+        "ORDER BY a.attnum",
+        lit, lit, lit);
+    if (SPI_connect() != SPI_OK_CONNECT)
+        return;
+    if (SPI_execute(sql.data, true, 0) == SPI_OK_SELECT && SPI_processed > 0)
+    {
+        MemoryContext oldcxt = MemoryContextSwitchTo(CurTransactionContext);
+        uint64        i;
+
+        hc->n    = (int) SPI_processed;
+        hc->name = palloc(sizeof(char *) * hc->n);
+        hc->type = palloc(sizeof(char *) * hc->n);
+        hc->dflt = palloc(sizeof(char *) * hc->n);
+        hc->seq  = palloc(sizeof(char *) * hc->n);
+        for (i = 0; i < SPI_processed; i++)
+        {
+            HeapTuple tup = SPI_tuptable->vals[i];
+
+            hc->name[i] = SPI_getvalue(tup, SPI_tuptable->tupdesc, 1);
+            hc->type[i] = SPI_getvalue(tup, SPI_tuptable->tupdesc, 2);
+            hc->dflt[i] = SPI_getvalue(tup, SPI_tuptable->tupdesc, 3);
+            hc->seq[i]  = SPI_getvalue(tup, SPI_tuptable->tupdesc, 4);
+        }
+        MemoryContextSwitchTo(oldcxt);
+    }
+    SPI_finish();
+}
+
+/* The hot-table type of one target column, or NULL when the hot table has no
+ * column of that name. */
+static const char *
+hot_column_type(const HotColumns *hc, const char *name)
+{
+    int i;
+
+    for (i = 0; i < hc->n; i++)
+        if (strcmp(hc->name[i], name) == 0)
+            return hc->type[i];
+    return NULL;
+}
+
+/*
+ * The rewritten INSERT's source CTE: the user's source as a derived table
+ * named by the target columns, each cast to its hot-table type. PostgreSQL
+ * resolved those coercions when it analyzed the user's statement (an untyped
+ * literal against a jsonb column, say) and a derived table loses them, so the
+ * cast restates them. It cannot accept anything that analysis refused, since
+ * a refused statement never reaches this hook.
  */
 static char *
-build_cold_loop_call(Query *query, const char *vschema, const char *vname,
-                     const char *source, ColdParamSet *ps)
+build_src_cte(Query *query, const char *source, const char *col_list,
+              const HotColumns *hc)
 {
-    StringInfoData target_arr;
+    StringInfoData sel;
     ListCell      *lc;
     bool           first = true;
 
-    initStringInfo(&target_arr);
-    appendStringInfoString(&target_arr, "ARRAY[");
+    initStringInfo(&sel);
     foreach(lc, query->targetList)
     {
         TargetEntry *tle = (TargetEntry *) lfirst(lc);
+        const char  *type;
+
         if (tle->resjunk || tle->resname == NULL) continue;
-        if (!first) appendStringInfoString(&target_arr, ", ");
-        appendStringInfoString(&target_arr, quote_literal_cstr(tle->resname));
+        type = hot_column_type(hc, tle->resname);
+        if (!first) appendStringInfoString(&sel, ", ");
+        if (type != NULL)
+            appendStringInfo(&sel, "%s::%s AS %s", quote_identifier(tle->resname),
+                             type, quote_identifier(tle->resname));
+        else
+            appendStringInfoString(&sel, quote_identifier(tle->resname));
         first = false;
     }
-    appendStringInfoString(&target_arr, "]::text[]");
-
-    /* _tiered_insert_cold embeds its source SQL in a PG cursor (executed by
-     * PG, not DuckDB), so render params as NATIVE PG (duckdb_target=false):
-     * no from_hex/::text — PG coerces the literals by the projected column
-     * types. Its bigint result is never NULL, so the anchor matches 0 rows. */
-    {
-        StringInfoData callbuf;
-        initStringInfo(&callbuf);
-        appendStringInfo(&callbuf,
-            "coldfront._tiered_insert_cold(%s, %s, %s, %s)",
-            quote_literal_cstr(vschema),
-            quote_literal_cstr(vname),
-            target_arr.data,
-            cold_sql_arg(source, ps, false));
-        return callbuf.data;
-    }
+    return psprintf("SELECT %s FROM (%s) AS coldfront_src(%s)", sel.data, source, col_list);
 }
 
 /*
- * Build the fast-path cold call (bulk pglocal stream). DuckDB-iceberg INSERT is
- * positional with no column list, so the cold SELECT projects every underlying
- * column in attnum order — NULL::<type> for any column the user omitted.
- * tiered_insert_needs_loop() routed all IDENTITY/DEFAULT-omission cases to the
- * slow path already, so this NULL-padding is honest. Returns palloc'd.
+ * The cold rows' projection: every hot-table column in attnum order, named,
+ * so to_jsonb() of the row is what the sink renders. A target column is the
+ * source's value; an omitted identity column (or any identity column under
+ * OVERRIDING USER VALUE) takes the next value of its sequence, which the hot
+ * INSERT shares; an omitted column with a DEFAULT takes that expression,
+ * evaluated by PostgreSQL per row as a hot INSERT would; any other omitted
+ * column is NULL.
  */
 static char *
-build_cold_bulk_call(Query *query, TieredViewInfo *info, const char *source,
-                     const char *col_list, const char *cutoff_lit,
-                     ColdParamSet *ps)
+build_cold_projection(Query *query, const HotColumns *hc)
 {
-    StringInfoData cold;
-    char          *cold_select, *cold_pfx, *cold_norm;
-    List          *targeted_names = NIL;
+    StringInfoData sel;
+    List          *targeted = NIL;
     ListCell      *lc;
+    int            i;
 
     foreach(lc, query->targetList)
     {
         TargetEntry *tle = (TargetEntry *) lfirst(lc);
+
         if (!tle->resjunk && tle->resname != NULL)
-            targeted_names = lappend(targeted_names, tle->resname);
+            targeted = lappend(targeted, tle->resname);
     }
-    cold_select = build_cold_select_list(info->hot_table, info->iceberg_table,
-                                        targeted_names);
+    initStringInfo(&sel);
+    for (i = 0; i < hc->n; i++)
+    {
+        bool  in_target = name_in_list(targeted, hc->name[i]);
+        char *expr;
 
-    initStringInfo(&cold);
-    appendStringInfo(&cold,
-        "INSERT INTO %s "
-        "SELECT %s FROM (%s) AS coldfront_src(%s) "
-        "WHERE %s < %s",
-        info->iceberg_table,
-        cold_select, source, col_list,
-        quote_identifier(info->partition_col), cutoff_lit);
-    /* Ordered by cluster when there is one, so this write's own row groups each
-     * hold roughly one cluster and a probe skips the rest of the file.  The
-     * cluster leads the projection, hence ordinal 1. */
-    if (info->has_vector)
-        appendStringInfoString(&cold, " ORDER BY 1");
-    cold_pfx  = prefix_pg_tables_with_pglocal(query, cold.data);
-    cold_norm = normalize_casts_for_duckdb(cold_pfx);
+        if (hc->seq[i] != NULL &&
+            (!in_target || query->override == OVERRIDING_USER_VALUE))
+            expr = psprintf("nextval(%s::regclass)", quote_literal_cstr(hc->seq[i]));
+        else if (in_target)
+            expr = psprintf("coldfront_source.%s", quote_identifier(hc->name[i]));
+        else if (hc->dflt[i] != NULL)
+            expr = psprintf("(%s)", hc->dflt[i]);
+        else
+            expr = psprintf("NULL::%s", hc->type[i]);
+        /* to_jsonb() spells a bytea under the session's bytea_output; the sink's
+         * renderer takes the hex form, so the projection spells it that way
+         * whatever the setting is. */
+        if (strcmp(hc->type[i], "bytea") == 0)
+            expr = psprintf("('\\x' || encode(%s, 'hex'))", expr);
+        appendStringInfo(&sel, "%s%s AS %s", i > 0 ? ", " : "", expr,
+                         quote_identifier(hc->name[i]));
+    }
+    return sel.data;
+}
 
-    return cold_exec_call(info->iceberg_table, cold_sql_arg(cold_norm, ps, true));
+/* The hot half: a set-based INSERT into the hot table of the source rows at or
+ * above the cutoff. */
+static char *
+build_tiered_hot_dml(const char *hot_table, const char *col_list,
+                     const char *override, const char *partition_col,
+                     const char *cutoff_lit)
+{
+    return psprintf("INSERT INTO %s (%s) %sSELECT %s FROM coldfront_source WHERE %s >= %s",
+                    hot_table, col_list, override, col_list,
+                    quote_identifier(partition_col), cutoff_lit);
+}
+
+/* The cold half: coldfront._cold_sink over the source rows below the cutoff,
+ * each projected to every hot-table column (build_cold_projection). */
+static char *
+build_cold_sink_select(const char *vschema, const char *vname,
+                       const char *projection, const char *partition_col,
+                       const char *cutoff_lit)
+{
+    return psprintf("SELECT coldfront._cold_sink(%s, %s, to_jsonb(r)) AS n "
+                    "FROM (SELECT %s FROM coldfront_source WHERE coldfront_source.%s < %s) AS r",
+                    quote_literal_cstr(vschema), quote_literal_cstr(vname),
+                    projection, quote_identifier(partition_col), cutoff_lit);
+}
+
+/* The deparsed INSERT spells OVERRIDING SYSTEM VALUE or OVERRIDING USER VALUE
+ * between the column list and the source; the hot INSERT restates it, so the
+ * source text drops it. */
+static const char *
+skip_override_clause(const char *rest, OverridingKind override)
+{
+    const char *kw = override == OVERRIDING_SYSTEM_VALUE ? "OVERRIDING SYSTEM VALUE" :
+                     override == OVERRIDING_USER_VALUE   ? "OVERRIDING USER VALUE"   : NULL;
+
+    while (*rest == ' ') rest++;
+    if (kw != NULL && strncmp(rest, kw, strlen(kw)) == 0)
+    {
+        rest += strlen(kw);
+        while (*rest == ' ') rest++;
+    }
+    return rest;
 }
 
 /*
- * Wrap the hot DML and cold call into the final rewritten statement.
+ * Wrap the source CTE, the hot INSERT and the cold sink into one statement,
+ * behind the statement's own WITH entries (dr->head_len bytes), which stay at
+ * the top level: PostgreSQL allows an entry that modifies data nowhere else.
  *
- * Cause 2: in plpgsql the hot INSERT is the OUTER DML (plpgsql accepts it)
- * and the cold call rides in a data-modifying CTE that always runs to
- * completion; the old (hot_rows, cold_rows) report isn't available in that
- * shape. At top level keep the existing count-reporting shape unchanged
- * (fast/slow read the cold count differently). Returns palloc'd.
+ * At top level the hot INSERT and the sink are CTEs and the statement reports
+ * (hot_rows, cold_rows). In plpgsql, and for an INSERT nested in WITH, the hot
+ * INSERT is the statement itself (the DML tag plpgsql accepts, and the body
+ * the WITH entry keeps once cf_splice_nested_dml lifts the rest out), and
+ * the sink rides in a data-modifying CTE (cold_anchor_update) that always runs
+ * to completion; the sink's count is never NULL, so the anchor updates no row.
  */
 static char *
-wrap_tiered_result(bool in_plpgsql, bool need_loop, const char *hot_dml,
-                   const char *call)
+wrap_tiered_result(bool in_plpgsql, const DeparseResult *dr, const char *src_cte,
+                   const char *hot_dml, const char *cold_select)
 {
     StringInfoData buf;
+
     initStringInfo(&buf);
+    append_with_opener(&buf, dr);
+    appendStringInfo(&buf, "coldfront_source AS MATERIALIZED (%s), ", src_cte);
     if (in_plpgsql)
-        appendStringInfo(&buf, "WITH cold_call AS (%s) %s",
-                         cold_anchor_update(call), hot_dml);
-    else if (need_loop)
-        appendStringInfo(&buf,
-            "WITH hot_ins AS MATERIALIZED (%s RETURNING 1), "
-            "cold_call AS MATERIALIZED (SELECT %s AS n) "
-            "SELECT (SELECT count(*) FROM hot_ins) AS hot_rows, "
-            "       (SELECT n FROM cold_call) AS cold_rows",
-            hot_dml, call);
+        appendStringInfo(&buf, "coldfront_cold AS (%s) %s",
+                         cold_anchor_update(psprintf("(%s)", cold_select)), hot_dml);
     else
-        appendStringInfo(&buf,
-            "WITH hot_ins AS MATERIALIZED (%s RETURNING 1), "
-            "cold_call AS MATERIALIZED (SELECT %s) "
-            "SELECT (SELECT count(*) FROM hot_ins) AS hot_rows, "
-            "       (SELECT count(*) FROM cold_call) AS cold_rows",
-            hot_dml, call);
+        appendStringInfo(&buf, "coldfront_hot AS MATERIALIZED (%s RETURNING 1), "
+                         "coldfront_cold AS MATERIALIZED (%s) "
+                         "SELECT (SELECT count(*) FROM coldfront_hot) AS hot_rows, "
+                         "       (SELECT n FROM coldfront_cold) AS cold_rows",
+                         hot_dml, cold_select);
     return buf.data;
 }
 
 /*
- * emit_tiered_insert rewrites a tiered-view INSERT into a single SQL
- * statement that splits hot/cold by the partition-column watermark.
+ * emit_tiered_insert rewrites a tiered-view INSERT into one statement that
+ * reads the source once and splits that result by the partition column
+ * against the watermark:
  *
- * Hot half is always plain PG: `INSERT INTO _events (cols) SELECT cols
- * FROM (source) AS s(cols) WHERE partition_col >= cutoff`. Set-based,
- * IDENTITY auto-fills, full PG speed.
+ *   WITH <the INSERT's own WITH entries, if any>,
+ *        coldfront_source AS MATERIALIZED (<source, each column cast to its
+ *                                          hot type>),
+ *        coldfront_hot AS MATERIALIZED (INSERT INTO <hot> (cols) SELECT cols
+ *                                       FROM coldfront_source
+ *                                       WHERE <partcol> >= <cutoff> RETURNING 1),
+ *        coldfront_cold AS MATERIALIZED (SELECT coldfront._cold_sink(schema,
+ *                                        view, to_jsonb(r)) FROM (<every hot
+ *                                        column FROM coldfront_source WHERE
+ *                                        <partcol> < <cutoff>>) AS r)
+ *   SELECT hot_rows, cold_rows
  *
- * Cold half has two flavours, chosen at parse time:
- *
- *   (a) Bulk: `SELECT duckdb.raw_query('INSERT INTO ice... SELECT ...
- *       FROM (source-pglocal-prefixed) WHERE partition_col < cutoff')`.
- *       One raw_query per statement; DuckDB's postgres extension streams
- *       source rows over libpq. Used when no IDENTITY column exists or
- *       the user supplied an explicit value for it.
- *
- *   (b) plpgsql cold-loop: `SELECT coldfront._tiered_insert_cold(...)`.
- *       The helper opens a PG cursor, calls nextval() per cold row, and
- *       flushes batched raw_query INSERTs. Used only when the table has
- *       an IDENTITY column AND the user's INSERT omits it (so we have
- *       to mint ids server-side).
- *
- * Source is read twice — once PG-side for hot, once via either pglocal
- * (a) or the cold cursor (b) — sharing the same PG snapshot so the two
- * halves see consistent rows. RETURNING is not preserved; the rewritten
- * statement reports (hot_count, cold_count).
+ * The hot half is plain PG: set-based, IDENTITY and DEFAULT fill server-side.
+ * The cold half projects each row to the hot table's full column list
+ * (build_cold_projection) and hands it to the sink, which renders it as a
+ * DuckDB VALUES tuple and flushes every coldfront.cold_write_batch_size rows
+ * under the table's claim (coldfront--1.0.sql). Both halves read the one
+ * tuplestore, so a volatile source, or a row the transaction wrote before the
+ * INSERT, lands exactly once. Bound parameters ($N) stay in the source, which
+ * PostgreSQL runs, so they bind natively. RETURNING is not preserved; the
+ * top-level statement reports (hot_rows, cold_rows).
  */
 static char *
-emit_tiered_insert(Query *query, TieredViewInfo *info, ColdParamSet *ps, bool in_plpgsql)
+emit_tiered_insert(Query *query, TieredViewInfo *info, bool in_plpgsql)
 {
     DeparseResult  dr;
-    char          *col_list, *cutoff_lit, *hot_dml, *call;
-    const char    *source, *vname, *vschema;
-    List          *saved_returning;
-    bool           need_loop;
+    HotColumns     hc;
+    char          *col_list, *cutoff_lit, *src_cte, *hot_dml, *cold_select;
+    const char    *source, *vname, *vschema, *override;
 
-    saved_returning = query->returningList;
-    query->returningList = NIL;
     deparse_and_find_prefix(query, &dr);
-    query->returningList = saved_returning;
-
     col_list   = insert_targetlist_collist(query);
-    source     = fold_leading_with(&dr, skip_leading_collist(dr.rest));
+    source     = skip_override_clause(skip_leading_collist(dr.rest), query->override);
     cutoff_lit = format_timestamptz_literal(info->cutoff);
+    override   = query->override == OVERRIDING_SYSTEM_VALUE ? "OVERRIDING SYSTEM VALUE " :
+                 query->override == OVERRIDING_USER_VALUE   ? "OVERRIDING USER VALUE "   : "";
 
     {
         RangeTblEntry *rte = (RangeTblEntry *) list_nth(query->rtable,
@@ -2510,18 +2471,14 @@ emit_tiered_insert(Query *query, TieredViewInfo *info, ColdParamSet *ps, bool in
         vschema = get_namespace_name(get_rel_namespace(rte->relid));
     }
 
-    need_loop = tiered_insert_needs_loop(query, info);
-
-    hot_dml = build_tiered_hot_dml(info->hot_table, col_list, source,
-                                   info->partition_col, cutoff_lit);
-
-    if (need_loop)
-        call = build_cold_loop_call(query, vschema, vname, source, ps);
-    else
-        call = build_cold_bulk_call(query, info, source, col_list,
-                                    cutoff_lit, ps);
-
-    return wrap_tiered_result(in_plpgsql, need_loop, hot_dml, call);
+    load_hot_columns(info->hot_table, &hc);
+    src_cte     = build_src_cte(query, source, col_list, &hc);
+    hot_dml     = build_tiered_hot_dml(info->hot_table, col_list, override,
+                                       info->partition_col, cutoff_lit);
+    cold_select = build_cold_sink_select(vschema, vname,
+                                         build_cold_projection(query, &hc),
+                                         info->partition_col, cutoff_lit);
+    return wrap_tiered_result(in_plpgsql, &dr, src_cte, hot_dml, cold_select);
 }
 
 /*
@@ -2572,14 +2529,19 @@ ensure_pg_attached_via_spi(void)
 }
 
 /*
- * Refuse a RETURNING clause on any write that touches the cold tier.  The cold
- * tier cannot return affected rows: duckdb-iceberg's binder rejects RETURNING on
- * Iceberg writes ("not yet supported for updates of a Iceberg table"), and
- * pg_duckdb's only row-returning entry point (duckdb.query) is SELECT-only.
- * Erroring here is honest — the alternative is silently returning hot rows only
- * (dual), a void internal row (cold), or nothing (tiered INSERT).  Hot-only DML
- * keeps RETURNING (it is plain PG DML); this is called only on the cold/dual
- * paths.  Revisit when duckdb-iceberg adds RETURNING on writes (see BACKLOG §4).
+ * Refuse a RETURNING clause on any write that touches the cold tier. duckdb-iceberg
+ * 5edc45f0 (the pinned build) refuses RETURNING on every Iceberg write: a
+ * BinderException "RETURNING clause not yet supported for ..." from
+ * src/execution/operator/iceberg_insert.cpp, iceberg_update.cpp and
+ * iceberg_delete.cpp, and a NotImplementedException from
+ * merge_into/iceberg_merge_into.cpp; and pg_duckdb's row-returning entry
+ * point (duckdb.query) runs a SELECT alone. Without this refusal a dual write
+ * would return its hot rows alone, a cold write a void internal row, a tiered
+ * INSERT nothing. Hot-only DML keeps RETURNING (plain PostgreSQL DML); the
+ * cold, dual, tiered-INSERT and cross-tier-move paths call this, so the
+ * emitters behind them deparse a statement without RETURNING. The journey
+ * check "duckdb-iceberg refuses RETURNING on an Iceberg write" sends such a
+ * write to DuckDB directly and fails once the pin accepts it.
  */
 static void
 reject_cold_returning(Query *query, const char *vname)
@@ -2588,8 +2550,72 @@ reject_cold_returning(Query *query, const char *vname)
         ereport(ERROR,
                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                  errmsg("RETURNING is not supported for writes to the cold tier of \"%s\"", vname),
-                 errhint("The cold tier (Iceberg) cannot return affected rows — duckdb-iceberg "
+                 errhint("The cold tier (Iceberg) cannot return affected rows: duckdb-iceberg "
                          "does not support RETURNING on writes. Re-run without RETURNING.")));
+}
+
+/*
+ * Refuse a WITH entry that modifies data on a write that runs in DuckDB. DuckDB
+ * 1.5.4 (the pinned build) has no data-modifying WITH: its parser takes only a
+ * SELECT as an entry's body. DuckDB 2.0 (branch v2.0-cyanoptera) runs INSERT,
+ * UPDATE and DELETE entries, so on it the WITH can ship whole, the entry's
+ * write running through the pglocal attachment on the terms a source table
+ * read has (committed rows, the attachment's role). That also needs
+ * duckdb-postgres to return the rows of such a write, which it refuses
+ * ("RETURNING clause not yet supported", src/storage/postgres_delete.cpp).
+ * pg_regress cte_on_dml sends such a WITH to DuckDB directly and fails once
+ * the pin accepts it.
+ */
+static void
+reject_cold_modifying_cte(Query *query, const char *vname)
+{
+    if (query->hasModifyingCTE)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("a cold-tier write on \"%s\" cannot use a data-modifying WITH query", vname),
+                 errdetail("The cold tier runs the statement in DuckDB, where a WITH query must be a SELECT."),
+                 errhint("Run the WITH query's write as a separate statement.")));
+}
+
+/* True when the query reads a WITH entry it does not define itself. */
+static bool
+reads_outer_cte_walker(Node *node, void *ctx)
+{
+    if (node == NULL)
+        return false;
+    if (IsA(node, RangeTblEntry))
+    {
+        RangeTblEntry *rte = (RangeTblEntry *) node;
+        ListCell      *lc;
+
+        if (rte->rtekind != RTE_CTE)
+            return false;
+        foreach(lc, (List *) ctx)
+            if (strcmp(((CommonTableExpr *) lfirst(lc))->ctename, rte->ctename) == 0)
+                return false;
+        return true;
+    }
+    if (IsA(node, Query))
+        return query_tree_walker((Query *) node, reads_outer_cte_walker, ctx,
+                                 QTW_EXAMINE_RTES_BEFORE);
+    return expression_tree_walker(node, reads_outer_cte_walker, ctx);
+}
+
+/*
+ * Refuse a write that runs in DuckDB and reads a WITH entry it does not define:
+ * only a write nested in WITH can (the entries around it), and DuckDB does not
+ * see them.
+ */
+static void
+reject_cold_outer_cte(Query *query, const char *vname)
+{
+    if (query_tree_walker(query, reads_outer_cte_walker, (void *) query->cteList,
+                          QTW_EXAMINE_RTES_BEFORE))
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("a cold-tier write on \"%s\" nested in WITH cannot read another WITH entry", vname),
+                 errdetail("It runs in DuckDB, which does not see the statement's WITH entries."),
+                 errhint("Run it as its own statement.")));
 }
 
 /*
@@ -2607,42 +2633,24 @@ cf_emit_tiered_insert_path(Query *query, TieredViewInfo *info, ColdParamSet *ps,
     /* A watermark-split INSERT sends some rows to the cold tier,
      * which cannot return them — refuse RETURNING rather than drop it. */
     reject_cold_returning(query, vname);
-    ensure_ice_attached_once();
-    /* The fast cold path streams source rows via pglocal —
-     * needs the postgres ATTACH. The plpgsql cold-loop fast
-     * path doesn't, but the call is cheap when not needed
-     * (and a no-op if coldfront.local_pg_dsn is unset). */
-    if (query_has_pg_source_table(query))
-        ensure_pg_attached_via_spi();
-    /* Mixed-tier writes inside one PG tx (PG INSERT into _events
-     * plus DuckDB raw_query for ice) need pg_duckdb's mixed-
-     * write guard relaxed. */
-    (void) set_config_option("duckdb.unsafe_allow_mixed_transactions",
-                             "on",
-                             PGC_USERSET, PGC_S_SESSION,
-                             GUC_ACTION_LOCAL, true, 0, false);
-    return emit_tiered_insert(query, info, ps, in_plpgsql);
+    return emit_tiered_insert(query, info, in_plpgsql);
 }
 
-/* Build the rewritten SQL for a cold-tier UPDATE/DELETE/INSERT (TIER_COLD). */
+/* Build the rewritten SQL for a cold-tier UPDATE/DELETE/INSERT/MERGE (TIER_COLD). */
 static char *
 cf_emit_cold_path(Query *query, TieredViewInfo *info, ColdParamSet *ps,
                   bool in_plpgsql, const char *vname)
 {
     reject_cold_returning(query, vname);
+    reject_cold_modifying_cte(query, vname);
+    reject_cold_outer_cte(query, vname);
     ensure_ice_attached_once();
-    /* INSERT … SELECT FROM pg_source needs pglocal. Walk the
-     * rtable; if any non-result RTE_RELATION is present, the
-     * deparsed SELECT will reference it and DuckDB will need
-     * pglocal to resolve it. We skip the ATTACH call entirely
-     * for VALUES inserts and for INSERT … SELECT from
-     * generate_series / read_parquet / etc., because those
-     * work in pure DuckDB context and the ATTACH itself
-     * triggers a libpq-linkage error on some pg_duckdb builds
-     * (the pglocal-loopback / postgres-extension recursion noted
-     * on coldfront.ensure_pg_attached). */
-    if (query->commandType == CMD_INSERT &&
-        query_has_pg_source_table(query))
+    /* A PostgreSQL table the statement reads is served through pglocal, so
+     * that attachment is made first. A statement without one (VALUES,
+     * generate_series, read_parquet) runs in DuckDB alone, and the ATTACH
+     * itself fails on some pg_duckdb builds (the loopback recursion noted on
+     * coldfront.ensure_pg_attached), so it is skipped then. */
+    if (query_has_pg_source_table(query))
         ensure_pg_attached_via_spi();
     return emit_cold(query, info, ps, in_plpgsql);
 }
@@ -2668,6 +2676,8 @@ cf_emit_dual_path(Query *query, TieredViewInfo *info, ColdParamSet *ps,
     /* A dual-tier rewrite returns only hot rows; refuse RETURNING rather
      * than silently return a partial result set. */
     reject_cold_returning(query, vname);
+    reject_cold_modifying_cte(query, vname);
+    reject_cold_outer_cte(query, vname);
 
     /* Permissive: clear pg_duckdb's mixed-write guard for this
      * transaction (GUC_ACTION_LOCAL resets it at tx end) and emit
@@ -2729,7 +2739,7 @@ cf_reparse_and_replace(Query *query, const char *new_sql, ColdParamSet *ps)
  * have ts < cutoff), the rows it can return are exactly those the hot heap already
  * holds. Re-point the tiered-view reference at that heap and reparse: the read then
  * runs in plain PostgreSQL — full jsonb, no DuckDB round-trip — instead of pg_duckdb
- * planning the whole iceberg_scan UNION in DuckDB. The reparse re-resolves column
+ * planning the whole hot/cold UNION in DuckDB. The reparse re-resolves column
  * types (the view casts data::json; the heap is native jsonb).
  *
  * Conservative by construction — only the simple single-relation shape (no join, CTE,
@@ -2803,10 +2813,11 @@ cf_try_reroute_hot_read(Query *query)
 
 /*
  * Make a read DuckDB will run acceptable to it. A query against a tiered /
- * iceberg-only view runs entirely in DuckDB (the view body is an iceberg_scan
- * UNION), which has no jsonb type, no date_bin and no JSON builders. Two passes over
- * the analysed tree: the JSON builders are rewritten on the node tree
- * (cf_json_builder_mutator, where key/value pairing is exact), then the deparsed
+ * iceberg-only view runs entirely in DuckDB (the view body reads the Iceberg
+ * table), which has no jsonb type, no date_bin, no JSON builders and no <#>
+ * operator. Two passes over the analysed tree: the JSON builders and the <#>
+ * operator are rewritten on the node tree (cf_json_builder_mutator, where
+ * key/value pairing is exact and the operator's function is known), then the deparsed
  * text gets the read whitelist (normalize_for_read: the ::jsonb cast and the
  * functions verified equivalent in both engines), and the result is reparsed in
  * place. Nothing to rewrite ⇒ the query is left untouched (the common case: ->>/->
@@ -3122,8 +3133,8 @@ cf_maybe_inject_probe(Query *query)
  * Read path for a SELECT that touches a registered tiered view. First try to
  * reroute a provably-hot read to the heap (runs in plain PG). Otherwise the read
  * spans the cold tier: lazily attach
- * 'ice' (once per session) so the view body's iceberg_scan('ice...') resolves —
- * the version-agnostic cold-read attach (PG 16/17/18) — narrow a recognised
+ * 'ice' (once per session) so the view body's read of ice.<ns>.<table> resolves
+ * (the version-agnostic cold-read attach, PG 16/17/18), narrow a recognised
  * similarity search to its probed clusters, and rewrite the spellings DuckDB (which
  * runs the whole view query) lacks into ones it accepts. The relkind check inside
  * query_reads_tiered_view keeps plain queries off the SPI path.
@@ -3141,66 +3152,241 @@ cf_maybe_attach_for_read(Query *query)
     cf_normalize_read(query);
 }
 
+/* True when the DML `query` writes a registered tiered view; *rte and *info
+ * describe it. */
+static bool
+cf_dml_target_view(Query *query, RangeTblEntry **rte, TieredViewInfo *info)
+{
+    if (query->resultRelation == 0)
+        return false;
+    *rte = rt_fetch(query->resultRelation, query->rtable);
+    if ((*rte)->rtekind != RTE_RELATION ||
+        get_rel_relkind((*rte)->relid) != RELKIND_VIEW)
+        return false;
+    return lookup_tiered_view((*rte)->relid, get_rel_name((*rte)->relid), info);
+}
+
 /*
- * Resolve the DML target: decide whether `query` is an INSERT/UPDATE/DELETE on
- * a registered tiered view that this hook should rewrite. On the read path
- * (SELECT touching a tiered view) it lazily attaches 'ice' and returns false.
- * Returns true with *rte and *info populated when a rewrite is warranted.
+ * Resolve the DML target: decide whether `query` is an INSERT/UPDATE/DELETE/
+ * MERGE on a registered tiered view that this hook should rewrite. On the read
+ * path (SELECT touching a tiered view) it lazily attaches 'ice' and returns
+ * false. Returns true with *rte and *info populated when a rewrite is
+ * warranted.
  */
 static bool
 cf_resolve_tiered_dml_target(Query *query, RangeTblEntry **rte,
                              TieredViewInfo *info)
 {
-    /* Intercept INSERT, UPDATE and DELETE on registered tiered views.
+    /* Intercept INSERT, UPDATE, DELETE and MERGE on registered tiered views.
      * INSERT is rewritten in both modes: a tiered INSERT splits by the
      * watermark cutoff (cf_emit_tiered_insert_path), an iceberg-only INSERT
-     * goes straight to the cold path. The view's INSTEAD OF INSERT trigger is
-     * only the fallback used when the extension is not loaded. */
+     * goes straight to the cold path. A MERGE runs on the tier its ON
+     * condition bounds (cf_emit_merge_path). */
     if (query->commandType != CMD_UPDATE &&
         query->commandType != CMD_DELETE &&
-        query->commandType != CMD_INSERT)
+        query->commandType != CMD_INSERT &&
+        query->commandType != CMD_MERGE)
     {
         cf_maybe_attach_for_read(query);
         return false;
     }
 
-    if (query->resultRelation == 0)
-        return false;
-
-    *rte = (RangeTblEntry *) list_nth(query->rtable, query->resultRelation - 1);
-    if ((*rte)->rtekind != RTE_RELATION)
-        return false;
-    if (get_rel_relkind((*rte)->relid) != RELKIND_VIEW)
-        return false;
-
-    /* Check the catalog — only rewrite registered tiered views */
-    if (!lookup_tiered_view((*rte)->relid, get_rel_name((*rte)->relid), info))
-        return false;
-
-    return true;
+    return cf_dml_target_view(query, rte, info);
 }
 
 /*
- * Reject a multi-reference UPDATE/DELETE on a tiered view. The deparse-and-swap
- * rewrite substitutes only the leading result-relation reference. A second
- * reference to the SAME tiered view — a self-join (UPDATE … FROM v), DELETE …
- * USING v, or a sub-select (… WHERE id IN (SELECT … FROM v)) — would be copied
- * through verbatim and then fail confusingly (PG cannot scan the iceberg_scan
- * view; DuckDB does not know it). Reject it cleanly here; a structural
- * multi-reference rewrite is out of scope. (INSERT … SELECT routing is handled
- * separately by emit_tiered_insert.)
+ * The first WITH entry of `query` that is an INSERT, UPDATE, DELETE or MERGE
+ * on a registered tiered view, or NULL; *nwrites counts them all. Only a
+ * top-level statement can hold one (parse_cte.c, which admits a MERGE from
+ * PostgreSQL 17), and parse_sub_analyze runs no post_parse_analyze_hook for
+ * it, so the hook meets it here, inside the statement that holds it.
+ */
+static CommonTableExpr *
+cf_find_nested_dml(Query *query, RangeTblEntry **rte, TieredViewInfo *info,
+                   int *nwrites)
+{
+    CommonTableExpr *found = NULL;
+    ListCell        *lc;
+
+    *nwrites = 0;
+    foreach(lc, query->cteList)
+    {
+        CommonTableExpr *cte = (CommonTableExpr *) lfirst(lc);
+        Query           *q = (Query *) cte->ctequery;
+        RangeTblEntry   *r;
+        TieredViewInfo   i;
+
+        if ((q->commandType != CMD_INSERT && q->commandType != CMD_UPDATE &&
+             q->commandType != CMD_DELETE && q->commandType != CMD_MERGE) ||
+            !cf_dml_target_view(q, &r, &i))
+            continue;
+        if (found == NULL)
+        {
+            found = cte;
+            *rte = r;
+            *info = i;
+        }
+        (*nwrites)++;
+    }
+    return found;
+}
+
+/*
+ * Skip a quoted run ('…' or "…", a doubled quote included) or a balanced
+ * parenthesised run, quoted runs inside it included; p is at its first byte.
+ * The deparser never escapes a quote with a backslash, so quotes come in pairs.
+ */
+static const char *
+skip_quoted_or_parens(const char *p)
+{
+    char q = *p;
+    int  depth = 0;
+
+    if (q == '\'' || q == '"')
+    {
+        for (p++; *p; p++)
+            if (*p == q && *++p != q)
+                return p;
+        return p;
+    }
+    for (; *p; p++)
+    {
+        if (*p == '\'' || *p == '"')
+            p = skip_quoted_or_parens(p) - 1;
+        else if (*p == '(')
+            depth++;
+        else if (*p == ')' && --depth == 0)
+            return p + 1;
+    }
+    return p;
+}
+
+/* The start of the WITH entry whose body opens at `open`: past the last
+ * top-level comma before it, or past the WITH keyword. */
+static const char *
+with_entry_start(const char *sql, const char *open)
+{
+    const char *p = sql, *start = NULL;
+
+    while (p < open)
+    {
+        if (*p == '\'' || *p == '"' || *p == '(')
+        {
+            p = skip_quoted_or_parens(p);
+            continue;
+        }
+        if (*p == ',')
+            start = p + 1;
+        p++;
+    }
+    if (start == NULL)
+        start = sql + (strncmp(sql, "WITH RECURSIVE ", 15) == 0 ? 15 : 5);
+    while (*start == ' ')
+        start++;
+    return start;
+}
+
+/*
+ * Split a rewritten statement into the entries of its leading WITH clause
+ * (NULL without one) and the statement behind them. The clause is the
+ * rewrite's own, so each entry is `name AS [MATERIALIZED] (…)` with no SEARCH
+ * or CYCLE clause: it ends at its closing parenthesis, and the statement
+ * starts where no further entry follows.
+ */
+static const char *
+split_leading_with(const char *sql, const char **entries)
+{
+    const char *p, *start;
+    size_t      len;
+
+    *entries = NULL;
+    if (strncmp(sql, "WITH ", 5) != 0)
+        return sql;
+    start = sql + 5;
+    for (p = start;;)
+    {
+        while (*p && *p != '(')
+            p++;
+        p = skip_quoted_or_parens(p);
+        while (*p == ' ')
+            p++;
+        if (*p != ',')
+            break;
+        p++;
+    }
+    len = (size_t) (p - start);
+    while (len > 0 && start[len - 1] == ' ')
+        len--;
+    *entries = pnstrdup(start, len);
+    return p;
+}
+
+/*
+ * Splice the rewrite of a write nested in a WITH entry into the statement that
+ * holds it. The rewrite is a DML statement, possibly behind WITH entries of
+ * its own (the source and the cold sink of a tiered INSERT, the cold half of a
+ * dual-tier write): the DML becomes the entry's new body, and those entries
+ * are lifted into the outer WITH list just before it, after everything the
+ * write may read, where a data-modifying entry is legal. The entry is found in
+ * the deparsed statement at its verb on the view, the only one (a second write
+ * to a tiered view is refused before this), and its body is the parenthesised
+ * run around it.
+ */
+static char *
+cf_splice_nested_dml(Query *query, Query *inner, RangeTblEntry *rte,
+                     const char *rewritten)
+{
+    const char     *outer_sql = deparse_flat(query);
+    const char     *vname = get_rel_name(rte->relid);
+    char            search_unqual[256], search_qual[256];
+    const char     *verb, *matched, *at, *open, *close, *start, *lifted, *body;
+    StringInfoData  buf;
+
+    body = split_leading_with(rewritten, &lifted);
+    dml_search_strings(inner, search_unqual, search_qual, sizeof(search_unqual), &verb);
+    at = find_dml_prefix(outer_sql, search_unqual, search_qual, vname, &matched);
+    for (open = at; open > outer_sql && open[-1] == ' '; open--)
+        ;
+    if (open == outer_sql || *--open != '(')
+        elog(ERROR, "coldfront: cannot locate the WITH entry of the nested write in: %s",
+             outer_sql);
+    close = skip_quoted_or_parens(open);      /* past the entry's ')' */
+    start = with_entry_start(outer_sql, open);
+
+    initStringInfo(&buf);
+    appendBinaryStringInfo(&buf, outer_sql, start - outer_sql);
+    if (lifted != NULL)
+        appendStringInfo(&buf, "%s, ", lifted);
+    appendBinaryStringInfo(&buf, start, open + 1 - start);   /* <name> AS ( */
+    appendStringInfoString(&buf, body);
+    appendStringInfoString(&buf, close - 1);                 /* ) and the rest */
+    return buf.data;
+}
+
+/*
+ * Reject a multi-reference UPDATE/DELETE/MERGE on a tiered view. The
+ * deparse-and-swap rewrite substitutes only the leading result-relation
+ * reference. A second reference to the SAME tiered view, a self-join (UPDATE …
+ * FROM v), DELETE … USING v, a MERGE source, or a sub-select (… WHERE id IN
+ * (SELECT … FROM v)), would be copied through verbatim and then fail
+ * confusingly (PG cannot run the view's DuckDB read; DuckDB does not know it).
+ * Reject it cleanly here; a structural multi-reference rewrite is out of scope.
+ * (INSERT … SELECT routing is handled separately by emit_tiered_insert.)
  */
 static void
 cf_reject_multi_reference(Query *query, RangeTblEntry *rte)
 {
-    if ((query->commandType == CMD_UPDATE || query->commandType == CMD_DELETE) &&
+    if ((query->commandType == CMD_UPDATE || query->commandType == CMD_DELETE ||
+         query->commandType == CMD_MERGE) &&
         count_tiered_view_refs(query, rte->relid) > 1)
         ereport(ERROR,
                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                 errmsg("UPDATE/DELETE on tiered view \"%s\" cannot reference it more than once",
+                 errmsg("%s on tiered view \"%s\" cannot reference it more than once",
+                        query->commandType == CMD_UPDATE ? "UPDATE" :
+                        query->commandType == CMD_DELETE ? "DELETE" : "MERGE",
                         get_rel_name(rte->relid)),
-                 errhint("Self-joins, USING, and sub-selects over the same tiered view "
-                         "are not supported; reference it once.")));
+                 errhint("Self-joins, USING, a MERGE source and sub-selects over the same "
+                         "tiered view are not supported; reference it once.")));
 }
 
 /*
@@ -3287,8 +3473,8 @@ expr_refs_other_col_walker(Node *node, void *ctx)
  * cold tier is read through DuckDB, which can't correlate with Postgres tables);
  * bound params (e and WHERE are deparsed to literal text at parse-analyze, where
  * a param's value is not yet known); a multi-column SET; a VOLATILE e; an e that
- * references other columns; a bare-NULL e. (in_plpgsql is rejected by the caller
- * — the move's iceberg_scan read can't run nested inside a function/DO.)
+ * references other columns; a bare-NULL e. (in_plpgsql is rejected by the caller:
+ * the move's cold read can't run nested inside a function/DO.)
  */
 static void
 cf_reject_unsupported_move(Query *query, RangeTblEntry *rte,
@@ -3301,7 +3487,7 @@ cf_reject_unsupported_move(Query *query, RangeTblEntry *rte,
     reject_cold_returning(query, vname);
 
     /* The move replays the deparsed WHERE against one relation at a time (the hot
-     * heap, and iceberg_scan for the cold tier), so it cannot reference other
+     * heap, and the catalog read for the cold tier), so it cannot reference other
      * tables: the cold tier is read through DuckDB, which can't correlate with
      * Postgres tables. Reject UPDATE ... FROM and sub-query predicates with a clear
      * message rather than the opaque "missing FROM-clause entry" they fail with. */
@@ -3317,8 +3503,8 @@ cf_reject_unsupported_move(Query *query, RangeTblEntry *rte,
                  errmsg("a cross-tier move on tiered view \"%s\" cannot use bound parameters", vname),
                  errhint("Run the UPDATE with literal values for the partition column and WHERE clause.")));
 
-    /* Only the partition column may be SET in a move (v1). A second SET target
-     * would have to be re-projected across all four legs; defer that. */
+    /* Only the partition column may be SET in a move: a second SET target
+     * would have to be re-projected across all four legs. */
     foreach(lc, query->targetList)
     {
         TargetEntry *tle = (TargetEntry *) lfirst(lc);
@@ -3374,7 +3560,7 @@ cf_reject_unsupported_move(Query *query, RangeTblEntry *rte,
  * returns the rewrite "SELECT coldfront._cross_tier_move(schema, view, where, e)".
  * That function does the relocation: it arms its own GUCs, attaches 'ice', and
  * routes matched rows into the four tier cases. The work lives there (not in a
- * hook-installed Query) because cold→hot rows are read with iceberg_scan, which
+ * hook-installed Query) because cold→hot rows are read through DuckDB, which
  * pg_duckdb runs in DuckDB only as a standalone read — not as the modifying Query
  * the hook installs — and only inside a function with the unsafe-execution GUC.
  */
@@ -3412,10 +3598,274 @@ cf_emit_cross_tier_move_path(Query *query, RangeTblEntry *rte,
     return buf.data;
 }
 
+/* ---------- MERGE ------------------------------------------------------- */
+
+/* True when an UPDATE action of the MERGE sets the partition column. */
+static bool
+merge_sets_partcol(Query *query, AttrNumber partcol_attno)
+{
+    ListCell *lc, *lc2;
+
+    foreach(lc, query->mergeActionList)
+    {
+        MergeAction *action = lfirst_node(MergeAction, lc);
+
+        if (action->commandType != CMD_UPDATE)
+            continue;
+        foreach(lc2, action->targetList)
+        {
+            TargetEntry *tle = (TargetEntry *) lfirst(lc2);
+
+            if (!tle->resjunk && tle->resno == partcol_attno)
+                return true;
+        }
+    }
+    return false;
+}
+
 /*
- * Reject a multi-reference UPDATE/DELETE on a tiered view, then pick the emit
- * path (tiered-INSERT split, hot, cold, or dual) and return the rewritten SQL.
- * Returns NULL on the unreachable default tier (caller treats as a no-op).
+ * A cold MERGE's INSERT action builds its row in DuckDB, which can neither draw
+ * the next identity value nor evaluate a PostgreSQL DEFAULT, so every hot-table
+ * column that has one must be given a value. An identity column under
+ * OVERRIDING USER VALUE takes the next value, so it counts as left out.
+ */
+static void
+reject_cold_merge_insert_omissions(Query *query, TieredViewInfo *info,
+                                   const char *vname)
+{
+    HotColumns hc;
+    ListCell  *lc;
+    int        i;
+
+    load_hot_columns(info->hot_table, &hc);
+    foreach(lc, query->mergeActionList)
+    {
+        MergeAction *action = lfirst_node(MergeAction, lc);
+        List        *targeted = NIL;
+        ListCell    *lc2;
+
+        if (action->commandType != CMD_INSERT)
+            continue;
+        foreach(lc2, action->targetList)
+            targeted = lappend(targeted, ((TargetEntry *) lfirst(lc2))->resname);
+        for (i = 0; i < hc.n; i++)
+        {
+            bool given = name_in_list(targeted, hc.name[i]) &&
+                         !(hc.seq[i] != NULL && action->override == OVERRIDING_USER_VALUE);
+
+            if ((hc.seq[i] != NULL || hc.dflt[i] != NULL) && !given)
+                ereport(ERROR,
+                        (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                         errmsg("a MERGE into the cold tier of tiered view \"%s\" must give a value for column \"%s\"",
+                                vname, hc.name[i]),
+                         errdetail("The row is built in DuckDB, which cannot draw the column's next identity value or evaluate its default."),
+                         errhint("List \"%s\" in the INSERT action, with OVERRIDING SYSTEM VALUE for a GENERATED ALWAYS identity column.",
+                                 hc.name[i])));
+        }
+    }
+}
+
+#if PG_VERSION_NUM >= 170000
+/*
+ * A NOT MATCHED BY SOURCE action acts on the target rows no source row matches.
+ * The statement runs on one tier, and the other tier's rows, which the ON
+ * condition's bound keeps from matching, would be acted on by the statement
+ * PostgreSQL would run on the whole view, so the action's own condition must
+ * bound the same tier.
+ */
+static void
+reject_merge_by_source_other_tier(Query *query, TieredViewInfo *info,
+                                  AttrNumber partcol_attno, TierClass tier,
+                                  const char *vname, const char *cutoff_lit)
+{
+    ListCell *lc;
+
+    foreach(lc, query->mergeActionList)
+    {
+        MergeAction *action = lfirst_node(MergeAction, lc);
+
+        if (action->matchKind == MERGE_WHEN_NOT_MATCHED_BY_SOURCE &&
+            classify_qual(action->qual, (Index) query->resultRelation,
+                          partcol_attno, info->cutoff) != tier)
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("a WHEN NOT MATCHED BY SOURCE action on tiered view \"%s\" must bound \"%s\" to the %s tier, as the ON condition does",
+                            vname, info->partition_col, tier == TIER_HOT ? "hot" : "cold"),
+                     errdetail("The statement runs on that tier alone, and no source row matches the other tier's rows either."),
+                     errhint("Add \"AND %s %s %s\" to the action's condition.",
+                             info->partition_col, tier == TIER_HOT ? ">=" : "<", cutoff_lit)));
+    }
+}
+#endif
+
+/* The next `kw` in `p` outside literals, quoted identifiers and parentheses. */
+static const char *
+find_toplevel_keyword(const char *p, const char *kw)
+{
+    size_t len = strlen(kw); /* nosemgrep */
+
+    for (; *p; p++)
+    {
+        if (*p == '\'' || *p == '"' || *p == '(')
+            p = skip_quoted_or_parens(p) - 1;
+        else if (strncmp(p, kw, len) == 0) /* nosemgrep */
+            return p;
+    }
+    return NULL;
+}
+
+/* The end of the list element starting at `p`: its top-level comma, or the
+ * parenthesis that closes the list. */
+static const char *
+list_element_end(const char *p)
+{
+    for (; *p; p++)
+    {
+        if (*p == '\'' || *p == '"' || *p == '(')
+            p = skip_quoted_or_parens(p) - 1;
+        else if (*p == ',' || *p == ')')
+            return p;
+    }
+    return p;
+}
+
+/*
+ * The INSERT actions of a deparsed MERGE, in the statement's order. With a
+ * cutoff the partition-column value gets the tier's per-row guard: the hot
+ * statement runs in PostgreSQL, where coldfront._hot_only refuses a row below
+ * the cutoff; the cold one runs in DuckDB, where a CASE on error() refuses a
+ * row at or after it. A cold statement also loses each action's OVERRIDING
+ * clause, which DuckDB does not know. "THEN INSERT (" marks an action: the
+ * deparser spells keywords in upper case and quotes an identifier that is one,
+ * so no CASE branch reads that way.
+ */
+static char *
+rewrite_merge_inserts(const char *sql, Query *query, TieredViewInfo *info,
+                      bool cold)
+{
+    RangeTblEntry *rte = rt_fetch(query->resultRelation, query->rtable);
+    const char    *vname = get_rel_name(rte->relid);
+    AttrNumber     partcol_attno = info->has_cutoff ?
+                       get_attnum(rte->relid, info->partition_col) : InvalidAttrNumber;
+    const char    *p = sql;
+    StringInfoData buf;
+    ListCell      *lc;
+
+    initStringInfo(&buf);
+    foreach(lc, query->mergeActionList)
+    {
+        MergeAction *action = lfirst_node(MergeAction, lc);
+        const char  *at, *q, *vals, *e_end;
+        char        *e, *cutoff_lit;
+        int          k = -1, i = 0;
+        ListCell    *lc2;
+
+        if (action->commandType != CMD_INSERT || action->targetList == NIL)
+            continue;
+        foreach(lc2, action->targetList)
+        {
+            if (((TargetEntry *) lfirst(lc2))->resno == partcol_attno)
+                k = i;
+            i++;
+        }
+        at = find_toplevel_keyword(p, "THEN INSERT (");
+        if (at == NULL)
+            elog(ERROR, "coldfront: cannot locate an INSERT action in deparsed MERGE: %s", sql);
+        q = skip_quoted_or_parens(at + strlen("THEN INSERT ")); /* nosemgrep */
+        appendBinaryStringInfo(&buf, p, q - p);                  /* up to the column list's ) */
+        p = skip_override_clause(q, action->override);          /* at "VALUES (" */
+        if (cold)
+            appendStringInfoChar(&buf, ' ');
+        else
+            appendBinaryStringInfo(&buf, q, p - q);
+        if (k < 0)
+            continue;
+        vals = p + strlen("VALUES ("); /* nosemgrep */
+        for (i = 0; i < k; i++)
+            vals = list_element_end(vals) + 1;
+        while (*vals == ' ')
+            vals++;
+        e_end = list_element_end(vals);
+        e = pnstrdup(vals, e_end - vals);
+        cutoff_lit = format_timestamptz_literal(info->cutoff);
+        appendBinaryStringInfo(&buf, p, vals - p);
+        if (cold)
+            appendStringInfo(&buf, "CASE WHEN %s >= %s THEN error(%s || CAST(%s AS VARCHAR) || %s) ELSE %s END",
+                             e, cutoff_lit,
+                             quote_literal_cstr(psprintf("a MERGE into the cold tier of tiered view \"%s\" cannot insert a row with \"%s\" = ",
+                                                         vname, info->partition_col)),
+                             e,
+                             quote_literal_cstr(", which is at or after the cutoff; insert it with INSERT, which splits rows by the cutoff"),
+                             e);
+        else
+            appendStringInfo(&buf, "coldfront._hot_only(%s, %s, %s, %s)",
+                             e, cutoff_lit, quote_literal_cstr(vname),
+                             quote_literal_cstr(info->partition_col));
+        p = e_end;
+    }
+    appendStringInfoString(&buf, p);
+    return buf.data;
+}
+
+/*
+ * A MERGE runs on the tier its ON condition bounds the partition column to: a
+ * hot one is the statement retargeted to the hot table, a cold one runs in
+ * DuckDB against the Iceberg table, and either sees its tier's rows alone. A
+ * source row that matches a row of the other tier would look unmatched, so a
+ * MERGE that bounds neither tier is refused, and the INSERT actions guard the
+ * inserted partition value per row (rewrite_merge_inserts). A MERGE that sets
+ * the partition column is refused: a cross-tier move replays a single-relation
+ * WHERE per tier, and a MERGE's matched set is a join with its source.
+ */
+static char *
+cf_emit_merge_path(Query *query, RangeTblEntry *rte, TieredViewInfo *info,
+                   ColdParamSet *ps, bool in_plpgsql, const char *vname)
+{
+    TierClass tier;
+
+    if (info->has_vector)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("MERGE INTO \"%s\" is not supported on a table with a clustered vector column", vname),
+                 errhint("Use INSERT, UPDATE and DELETE, which assign each written row its cluster.")));
+
+    tier = classify_tier(query, info);
+    if (info->has_cutoff)
+    {
+        AttrNumber partcol_attno = get_attnum(rte->relid, info->partition_col);
+        char      *cutoff_lit = format_timestamptz_literal(info->cutoff);
+
+        if (merge_sets_partcol(query, partcol_attno))
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("a MERGE that sets partition column \"%s\" on tiered view \"%s\" is not supported",
+                            info->partition_col, vname),
+                     errhint("Run the change of \"%s\" as an UPDATE; with coldfront.allow_mixed_writes on it moves the rows across the cutoff.",
+                             info->partition_col)));
+        if (tier == TIER_AMBIGUOUS)
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("MERGE INTO tiered view \"%s\" must bound \"%s\" to one tier in its ON condition",
+                            vname, info->partition_col),
+                     errdetail("Each tier runs in its own engine and sees its own rows alone, so a source row matching a row of the other tier would look unmatched."),
+                     errhint("Add \"AND %s >= %s\" for the hot tier or \"AND %s < %s\" for the cold tier to ON, or split the statement by tier.",
+                             info->partition_col, cutoff_lit, info->partition_col, cutoff_lit)));
+#if PG_VERSION_NUM >= 170000
+        reject_merge_by_source_other_tier(query, info, partcol_attno, tier, vname, cutoff_lit);
+#endif
+        if (tier == TIER_COLD)
+            reject_cold_merge_insert_omissions(query, info, vname);
+    }
+    if (tier == TIER_HOT)
+        return emit_hot(query, info);
+    return cf_emit_cold_path(query, info, ps, in_plpgsql, vname);
+}
+
+/*
+ * Reject a multi-reference UPDATE/DELETE/MERGE on a tiered view, then pick the
+ * emit path (MERGE by its ON condition, tiered-INSERT split, hot, cold, or
+ * dual) and return the rewritten SQL. Returns NULL on the unreachable default
+ * tier (caller treats as a no-op).
  */
 static char *
 cf_dispatch_emit(Query *query, RangeTblEntry *rte, TieredViewInfo *info,
@@ -3425,6 +3875,9 @@ cf_dispatch_emit(Query *query, RangeTblEntry *rte, TieredViewInfo *info,
     TargetEntry *pc_tle;
 
     cf_reject_multi_reference(query, rte);
+
+    if (query->commandType == CMD_MERGE)
+        return cf_emit_merge_path(query, rte, info, ps, in_plpgsql, vname);
 
     /* A partition-column SET can move the row across the hot/cold cutoff — but
      * only once something is archived. With a cutoff: mixed writes off → reject;
@@ -3438,13 +3891,13 @@ cf_dispatch_emit(Query *query, RangeTblEntry *rte, TieredViewInfo *info,
     {
         if (!coldfront_allow_mixed_writes)
             reject_partition_col_update(info, vname);
-        /* The rewrite is a row-returning SELECT (the function returns void); inside
-         * a plpgsql function/DO a bare SELECT has no destination. Reject there for
-         * v1 (the top-level form is the supported path). */
+        /* The rewrite is a row-returning SELECT (the function returns void): inside
+         * a plpgsql function or DO block a bare SELECT has no destination, and as
+         * a WITH entry's body it would not run. The top-level form is the path. */
         if (in_plpgsql)
             ereport(ERROR,
                     (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                     errmsg("a cross-tier move of partition column \"%s\" on tiered view \"%s\" is not supported inside a function or DO block",
+                     errmsg("a cross-tier move of partition column \"%s\" on tiered view \"%s\" is not supported inside a function, a DO block or a WITH entry",
                             info->partition_col, vname),
                      errhint("Run the partition-column UPDATE as a top-level statement.")));
         return cf_emit_cross_tier_move_path(query, rte, info, ps, pc_tle, vname);
@@ -3626,12 +4079,15 @@ static void
 coldfront_post_parse_analyze(ParseState *pstate, Query *query,
                               JumbleState *jstate)
 {
-    TieredViewInfo  info;
-    char           *new_sql;
-    RangeTblEntry  *rte;
-    ColdParamSet    ps;
-    bool            in_plpgsql;
-    const char     *vname;
+    TieredViewInfo   info, nested_info;
+    char            *new_sql;
+    RangeTblEntry   *rte, *nested_rte;
+    ColdParamSet     ps;
+    bool             in_plpgsql, top;
+    const char      *vname;
+    CommonTableExpr *cte;
+    Query           *inner = query;
+    int              nwrites;
 
     /* Chain to any previous hook first */
     if (prev_post_parse_analyze_hook)
@@ -3648,8 +4104,26 @@ coldfront_post_parse_analyze(ParseState *pstate, Query *query,
     if (!coldfront_registry_present())
         return;
 
-    if (!cf_resolve_tiered_dml_target(query, &rte, &info))
+    /* The statement itself, or one write nested in its WITH, writes a tiered
+     * view. The rewrite stands in for one write: a second one would stay in the
+     * statement unrewritten, so it is refused. */
+    top = cf_resolve_tiered_dml_target(query, &rte, &info);
+    cte = cf_find_nested_dml(query, &nested_rte, &nested_info, &nwrites);
+    if (!top && cte == NULL)
         return;
+    if (nwrites + (top ? 1 : 0) > 1)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("a statement may write a tiered view only once"),
+                 errhint("Split the writes into separate statements.")));
+    if (top)
+        cte = NULL;
+    else
+    {
+        rte   = nested_rte;
+        info  = nested_info;
+        inner = (Query *) cte->ctequery;
+    }
 
     vname = get_rel_name(rte->relid);
 
@@ -3663,18 +4137,29 @@ coldfront_post_parse_analyze(ParseState *pstate, Query *query,
                         get_namespace_name(get_rel_namespace(rte->relid)), vname),
                  errhint("Release it with coldfront.release_iceberg_table() and adopt again with p_writable => true to arm INSERT/UPDATE/DELETE.")));
 
+    /* The rewrite's own WITH entries are lifted beside the statement's; a
+     * WITH clause on the nested write itself has no place to go. */
+    if (cte != NULL && inner->cteList != NIL)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("a write to tiered view \"%s\" nested in WITH cannot have a WITH clause of its own", vname),
+                 errhint("Move its entries to the statement's WITH clause.")));
+
     /* Bound params ($N) from a plpgsql / DO / PREPARE / extended-protocol
-     * caller, collected once (Cause 1). in_plpgsql gates the Cause-2
-     * statement shape — plpgsql installs p_post_columnref_hook on the
-     * ParseState; top-level (even parameterized) does not. See the
-     * architecture block at the top of this file and the
+     * caller, collected once over the whole statement (Cause 1). in_plpgsql
+     * gates the Cause-2 statement shape, a DML statement: plpgsql installs
+     * p_post_columnref_hook on the ParseState (top-level, even parameterized,
+     * does not), and a nested write needs that shape for the body of its WITH
+     * entry. See the architecture block at the top of this file and the
      * coldfront._dummy_dml_target comment in coldfront--1.0.sql. */
     collect_cold_params(query, &ps);
-    in_plpgsql = (pstate->p_post_columnref_hook != NULL);
+    in_plpgsql = cte != NULL || pstate->p_post_columnref_hook != NULL;
 
-    new_sql = cf_dispatch_emit(query, rte, &info, &ps, in_plpgsql, vname);
+    new_sql = cf_dispatch_emit(inner, rte, &info, &ps, in_plpgsql, vname);
     if (new_sql == NULL)
         return;     /* unreachable default tier */
+    if (cte != NULL)
+        new_sql = cf_splice_nested_dml(query, inner, rte, new_sql);
 
     /* Parse and analyze the rewritten SQL, guarded against re-entry */
     cf_reparse_and_replace(query, new_sql, &ps);
@@ -3692,17 +4177,21 @@ coldfront_post_parse_analyze(ParseState *pstate, Query *query,
  * Why deferred: pg_duckdb commits the iceberg snapshot at outer-tx-commit
  * time (via its own XactCallback). Releasing the claim before that commit
  * lands creates a window where the next bakery winner sees no claim and
- * races into Lakekeeper alongside us — 409 / silent loss. Conversely,
+ * races into Lakekeeper alongside us, and one of the two commits fails with
+ * HTTP 409 and aborts its transaction. Conversely,
  * releasing inside the same outer tx (so it's atomic with iceberg) makes
  * the release invisible to peers until commit, which is correct on COMMIT
  * but leaves a stale claim on ROLLBACK.
  *
- * The XactCallback runs after pg_duckdb's XactCallback (coldfront loads
- * after pg_duckdb in shared_preload_libraries; PG calls callbacks in
- * registration order), so on COMMIT the iceberg snapshot is durably
- * committed before we DELETE the claim. On ABORT, pg_duckdb has already
- * rolled back iceberg, and we still need to clean up our claim row (committed
- * on its own over the loopback) so the next writer doesn't block.
+ * pg_duckdb commits the Iceberg transaction at XACT_EVENT_PRE_COMMIT and this
+ * callback DELETEs the claim at XACT_EVENT_COMMIT, so on COMMIT the iceberg
+ * snapshot is durably committed before the claim goes. On ABORT this callback
+ * runs before pg_duckdb discards its staged Iceberg work (PostgreSQL calls the
+ * most recently registered callback first, and coldfront registers after
+ * pg_duckdb); that order is harmless, since duckdb-iceberg's rollback deletes
+ * staged data files and sends nothing to the catalog, and the claim row
+ * (committed on its own over the loopback) still has to go so the next writer
+ * does not block.
  *
  * Allocated in TopMemoryContext so it survives across PG xacts within one
  * backend session.
@@ -3710,7 +4199,7 @@ coldfront_post_parse_analyze(ParseState *pstate, Query *query,
 static List *coldfront_pending_releases = NIL;
 
 /* The node's loopback: one libpq connection per backend, opened lazily from the
- * GUC coldfront.dblink_self and kept for the backend's lifetime. Every bakery
+ * GUC coldfront.loopback_dsn and kept for the backend's lifetime. Every bakery
  * statement that must commit on its own runs here: the claim, the apply
  * trigger's acks and reaps, the waiter's poke, and the release. Only C holds it,
  * and SQL reaches it only through coldfront._loopback(), which PUBLIC cannot
@@ -3726,8 +4215,10 @@ static PGconn *coldfront_loopback_conn = NULL;
 static PGconn *
 cf_loopback_get_conn(int elevel)
 {
-    const char *connstr;
-    PGresult   *res;
+    const char       *connstr;
+    PGresult         *res;
+    PQconninfoOption *opts, *opt;
+    char             *parse_err = NULL;
 
     if (coldfront_loopback_conn != NULL &&
         PQstatus(coldfront_loopback_conn) == CONNECTION_OK)
@@ -3739,13 +4230,44 @@ cf_loopback_get_conn(int elevel)
         coldfront_loopback_conn = NULL;
     }
 
-    connstr = GetConfigOption("coldfront.dblink_self", true, false);
+    connstr = GetConfigOption("coldfront.loopback_dsn", true, false);
     if (connstr == NULL || connstr[0] == '\0')
     {
         ereport(elevel,
-                (errmsg("coldfront: coldfront.dblink_self is unset, so the bakery has no loopback connection")));
+                (errmsg("coldfront: coldfront.loopback_dsn is unset, so the bakery has no loopback connection")));
         return NULL;
     }
+
+    /* Every onboarded role can read the DSN (_bakery_armed reads it), so it must
+     * never need a password: a unix socket under peer or trust auth, never TCP. */
+    opts = PQconninfoParse(connstr, &parse_err);
+    if (opts == NULL)
+    {
+        char *msg = pstrdup(parse_err != NULL ? parse_err : "");
+
+        PQfreemem(parse_err);
+        ereport(elevel,
+                (errmsg("coldfront: coldfront.loopback_dsn is not a valid connection string: %s", msg)));
+        return NULL;
+    }
+    for (opt = opts; opt->keyword != NULL; opt++)
+    {
+        if (opt->val == NULL || opt->val[0] == '\0')
+            continue;
+        if ((strcmp(opt->keyword, "host") == 0 && opt->val[0] != '/') ||
+            strcmp(opt->keyword, "hostaddr") == 0)
+        {
+            char *kw = pstrdup(opt->keyword);
+            char *val = pstrdup(opt->val);
+
+            PQconninfoFree(opts);
+            ereport(elevel,
+                    (errmsg("coldfront: coldfront.loopback_dsn must name a unix socket (host=/directory), not %s=%s",
+                            kw, val)));
+            return NULL;
+        }
+    }
+    PQconninfoFree(opts);
 
     coldfront_loopback_conn = PQconnectdb(connstr);
     if (PQstatus(coldfront_loopback_conn) != CONNECTION_OK)
@@ -3809,10 +4331,11 @@ cf_loopback_exec(const char *sql, int elevel)
 }
 
 /*
- * Drain the per-session pending-release queue at outer-tx end. Runs after
- * pg_duckdb's XactCallback (registration-order chain), so on COMMIT the
- * iceberg snapshot has landed before we DELETE the claim, and on ABORT
- * pg_duckdb has already rolled back iceberg.
+ * Drain the per-session pending-release queue at outer-tx end. Runs at
+ * XACT_EVENT_COMMIT, after pg_duckdb's XACT_EVENT_PRE_COMMIT commit of the
+ * Iceberg transaction, so the iceberg snapshot has landed before we DELETE the
+ * claim; on ABORT it runs before pg_duckdb discards its staged work, which is
+ * harmless (see coldfront_xact_callback).
  *
  * We use libpq directly rather than SPI because SPI inside an
  * XACT_EVENT_COMMIT / XACT_EVENT_ABORT callback would try to start a
@@ -3951,7 +4474,14 @@ typedef struct {
 static bool
 coldfront_registry_present(void)
 {
-    Oid nsoid = get_namespace_oid("coldfront", true);
+    Oid nsoid;
+
+    /* The COMMIT or ROLLBACK that ends a failed transaction block reaches the
+     * hooks after the transaction's resources are released, when no catalog
+     * lookup can run, and it has nothing tiered to act on. */
+    if (!IsTransactionState())
+        return false;
+    nsoid = get_namespace_oid("coldfront", true);
     if (!OidIsValid(nsoid))
         return false;
     return OidIsValid(get_relname_relid("tiered_views", nsoid));
@@ -4010,12 +4540,14 @@ lookup_tiered_by_hot_oid(Oid relid, TieredDDLInfo *out)
 }
 
 /*
- * Returns true if relid is a registered tiered relation — either the hot table
- * or the transparent view. Used to block DROP/TRUNCATE on either side. Single
- * query, schema-safe via to_regclass (see lookup_tiered_by_hot_oid).
+ * Returns true if relid is a registered tiered relation, either the hot table
+ * or the transparent view. The utility hook blocks DROP/TRUNCATE on either side
+ * with it. When has_hot is given it reports whether the registration has a hot
+ * table (false for an iceberg-only view). Single query, schema-safe via
+ * to_regclass (see lookup_tiered_by_hot_oid).
  */
 static bool
-relid_is_tiered(Oid relid)
+relid_is_tiered(Oid relid, bool *has_hot)
 {
     bool           found = false;
     StringInfoData sql;
@@ -4027,7 +4559,7 @@ relid_is_tiered(Oid relid)
 
     initStringInfo(&sql);
     appendStringInfo(&sql,
-        "SELECT 1 FROM coldfront.tiered_views "
+        "SELECT hot_table IS NOT NULL FROM coldfront.tiered_views "
         "WHERE (schema_name = %s AND relname = %s) "
         "   OR (hot_table IS NOT NULL AND to_regclass(hot_table)::oid = %u) "
         "LIMIT 1",
@@ -4035,22 +4567,70 @@ relid_is_tiered(Oid relid)
         quote_literal_cstr(get_rel_name(relid)),
         relid);
     if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed == 1)
+    {
+        bool isnull;
+
         found = true;
+        if (has_hot)
+            *has_hot = DatumGetBool(SPI_getbinval(SPI_tuptable->vals[0],
+                                                  SPI_tuptable->tupdesc, 1,
+                                                  &isnull)) && !isnull;
+    }
     pfree(sql.data);
 
     SPI_finish();
     return found;
 }
 
-/* Run one void-returning coldfront helper via SPI with up to two text args. */
+#define CF_SPOCK_DDL_GUC "spock.enable_ddl_replication"
+
+/* Run one void-returning coldfront helper via SPI with up to two text args.
+ * The DDL hook issues its view and trigger DDL through here, and each peer's
+ * own hook issues the same DDL when it applies the user's replicated statement,
+ * so the helper runs with spock.enable_ddl_replication off and only the user's
+ * statement replicates. Spock reads the setting just after each statement it
+ * runs, which is inside this call whatever order the hooks load in. The nest
+ * level restores the setting on return, and an error restores it with the
+ * transaction. Without Spock the setting does not exist and nothing is set. */
 static void
 spi_exec_void(const char *sql)
 {
     if (SPI_connect() == SPI_OK_CONNECT)
     {
+        int nest = NewGUCNestLevel();
+
+        if (GetConfigOption(CF_SPOCK_DDL_GUC, true, false) != NULL)
+            (void) set_config_option(CF_SPOCK_DDL_GUC, "off",
+                                     PGC_USERSET, PGC_S_SESSION,
+                                     GUC_ACTION_SAVE, true, 0, false);
         SPI_execute(sql, false, 0);
+        AtEOXact_GUC(true, nest);
         SPI_finish();
     }
+}
+
+#define CF_SPOCK_REPAIR_GUC "spock.replication_repair_mode"
+
+/* Run one registry update via spi_exec_void with Spock's repair mode on, so the
+ * rows it changes do not replicate. The registry tables replicate for the
+ * archiver's writes, but each peer's own hook makes the same update when it
+ * applies the user's replicated statement, and a replicated copy keyed on the
+ * old name would find no row there. spock.repair_mode logs its on and off
+ * markers in the transaction's change stream, so the rest of the transaction
+ * replicates as usual. A session already in repair mode is left in it, and
+ * without the spock extension in this database nothing is set. */
+static void
+spi_exec_local_rows(const char *sql)
+{
+    const char *repair = GetConfigOption(CF_SPOCK_REPAIR_GUC, true, false);
+    bool        toggle = repair != NULL && strcmp(repair, "off") == 0 &&
+                         OidIsValid(get_extension_oid("spock", true));
+
+    if (toggle)
+        spi_exec_void("SELECT spock.repair_mode(true)");
+    spi_exec_void(sql);
+    if (toggle)
+        spi_exec_void("SELECT spock.repair_mode(false)");
 }
 
 /* Rebuild the transparent view + INSERT trigger from current catalog state.
@@ -4104,7 +4684,7 @@ update_hot_table(const char *schema, const char *relname, const char *new_hot_qu
         "SELECT coldfront._update_tiered_hot_table(%s, %s, %s)",
         quote_literal_cstr(schema), quote_literal_cstr(relname),
         quote_literal_cstr(new_hot_quoted));
-    spi_exec_void(sql.data);
+    spi_exec_local_rows(sql.data);
     pfree(sql.data);
 }
 
@@ -4121,7 +4701,7 @@ rename_tiered_view(const char *schema, const char *old_view_name, const char *ne
         "SELECT coldfront._rename_tiered_view(%s, %s, %s)",
         quote_literal_cstr(schema), quote_literal_cstr(old_view_name),
         quote_literal_cstr(new_view_name));
-    spi_exec_void(sql.data);
+    spi_exec_local_rows(sql.data);
     pfree(sql.data);
 }
 
@@ -4214,7 +4794,7 @@ cf_handle_drop(const CfUtilityCtx *u, DropStmt *ds)
             List     *names = (List *) lfirst(lc);
             RangeVar *rv    = makeRangeVarFromNameList(names);
             Oid       relid = RangeVarGetRelid(rv, NoLock, true);
-            if (relid_is_tiered(relid))
+            if (relid_is_tiered(relid, NULL))
             {
                 char *ns   = get_namespace_name(get_rel_namespace(relid));
                 char *name = get_rel_name(relid);
@@ -4241,16 +4821,18 @@ cf_handle_truncate(const CfUtilityCtx *u, TruncateStmt *ts)
     {
         RangeVar *rv    = (RangeVar *) lfirst(lc);
         Oid       relid = RangeVarGetRelid(rv, NoLock, true);
-        if (relid_is_tiered(relid))
+        bool      has_hot;
+        if (relid_is_tiered(relid, &has_hot))
         {
             char *ns   = get_namespace_name(get_rel_namespace(relid));
             char *name = get_rel_name(relid);
             ereport(ERROR,
                 (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-                 errmsg("coldfront: cannot TRUNCATE tiered table \"%s.%s\" — cold-tier rows would remain visible",
+                 errmsg("coldfront: cannot TRUNCATE tiered table \"%s.%s\": cold-tier rows would remain visible",
                         ns, name),
-                 errhint("Blocked by design: cold-tier rows live in Iceberg and would remain "
-                         "visible through the view. Truncate each tier explicitly.")));
+                 has_hot
+                     ? errhint("Truncate the hot partitions individually and delete the cold rows through the view.")
+                     : errhint("Delete the rows through the view.")));
         }
     }
     cf_call_through(u);
@@ -4372,7 +4954,7 @@ cf_match_rename_target(RenameStmt *rs, TieredDDLInfo *info, bool *via_hot,
          * view rename). The registry is keyed by the view's (schema,
          * relname), resolved from the view relid directly — no SPI. */
         *view_relid = RangeVarGetRelid(rs->relation, NoLock, true);
-        if (relid_is_tiered(*view_relid))
+        if (relid_is_tiered(*view_relid, NULL))
         {
             MemoryContext oldcxt = MemoryContextSwitchTo(CurTransactionContext);
             info->view_schema  = get_namespace_name(get_rel_namespace(*view_relid));
@@ -4484,6 +5066,189 @@ cf_handle_rename(const CfUtilityCtx *u, RenameStmt *rs)
         cf_handle_rename_relation(u, rs, &info, hot_relid, view_relid);
 }
 
+/* ---- COPY FROM on a registered view. ---- */
+
+static bool
+cf_copy_has_option(List *options, const char *name)
+{
+    ListCell *lc;
+
+    foreach(lc, options)
+        if (strcmp(((DefElem *) lfirst(lc))->defname, name) == 0)
+            return true;
+    return false;
+}
+
+/*
+ * COPY <view> FROM reads the rows with PostgreSQL's COPY reader and writes
+ * them in batches of coldfront.cold_write_batch_size rows, each batch one
+ * INSERT ... VALUES into the view with every value as a literal in its type's
+ * text form. That INSERT goes through the parse-analysis hook like any other,
+ * so the routing, the claim, the identity values and the defaults are the
+ * INSERT's, for a tiered and for a decoupled view alike. OVERRIDING SYSTEM
+ * VALUE because COPY into a table keeps a supplied value for a GENERATED
+ * ALWAYS identity column. The reader applies the format options; WHERE and
+ * the options that act after a row is read (FREEZE, ON_ERROR, REJECT_LIMIT,
+ * DEFAULT) have no row to act on here and are refused.
+ */
+static void
+cf_handle_copy(CfUtilityCtx *u, CopyStmt *stmt)
+{
+    static const char *refused[] = { "freeze", "on_error", "reject_limit", "default", NULL };
+    TieredViewInfo info;
+    Oid            relid;
+    Relation       rel;
+    TupleDesc      desc;
+    ParseState    *pstate;
+    CopyFromState  cstate;
+    ExprContext   *econtext;
+    MemoryContext  rowctx, oldctx;
+    StringInfoData sql;
+    FmgrInfo      *outfn;
+    Datum         *values;
+    bool          *nulls;
+    int           *attnum;          /* the COPY's columns, in its order, 1-based */
+    int            ncols = 0, prefix_len, c, i;
+    int            n = 0, batch = coldfront_cold_write_batch_size;
+    uint64         processed = 0;
+    ListCell      *lc;
+
+    relid = stmt->is_from && stmt->relation
+        ? RangeVarGetRelid(stmt->relation, NoLock, true) : InvalidOid;
+    if (!OidIsValid(relid) || get_rel_relkind(relid) != RELKIND_VIEW ||
+        !lookup_tiered_view(relid, get_rel_name(relid), &info))
+    {
+        cf_call_through(u);
+        return;
+    }
+
+    if (stmt->whereClause)
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("COPY ... WHERE is not supported on a tiered view"),
+                 errhint("Filter the rows before loading them.")));
+    for (i = 0; refused[i]; i++)
+        if (cf_copy_has_option(stmt->options, refused[i]))
+            ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("COPY option %s is not supported on a tiered view",
+                            refused[i])));
+
+    /* The checks DoCopy makes before it reads a server-side source. */
+    if (stmt->filename && stmt->is_program &&
+        !has_privs_of_role(GetUserId(), ROLE_PG_EXECUTE_SERVER_PROGRAM))
+        ereport(ERROR,
+                (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                 errmsg("permission denied to COPY to or from an external program"),
+                 errdetail("Only roles with privileges of the \"%s\" role may COPY to or from an external program.",
+                           "pg_execute_server_program")));
+    if (stmt->filename && !stmt->is_program &&
+        !has_privs_of_role(GetUserId(), ROLE_PG_READ_SERVER_FILES))
+        ereport(ERROR,
+                (errcode(ERRCODE_INSUFFICIENT_PRIVILEGE),
+                 errmsg("permission denied to COPY from a file"),
+                 errdetail("Only roles with privileges of the \"%s\" role may COPY from a file.",
+                           "pg_read_server_files")));
+    if (XactReadOnly)
+        PreventCommandIfReadOnly("COPY FROM");
+
+    rel  = relation_open(relid, AccessShareLock);
+    desc = RelationGetDescr(rel);
+
+    /* The INSERT's column list is the COPY's; BeginCopyFrom rejects a name
+     * that is not a column. */
+    attnum = palloc(sizeof(int) * desc->natts);
+    if (stmt->attlist)
+    {
+        foreach(lc, stmt->attlist)
+            for (i = 0; i < desc->natts; i++)
+                if (strcmp(NameStr(TupleDescAttr(desc, i)->attname), strVal(lfirst(lc))) == 0)
+                    attnum[ncols++] = i + 1;
+    }
+    else
+    {
+        for (i = 0; i < desc->natts; i++)
+            attnum[ncols++] = i + 1;
+    }
+    outfn = palloc(sizeof(FmgrInfo) * ncols);
+    initStringInfo(&sql);
+    appendStringInfo(&sql, "INSERT INTO %s.%s (",
+                     quote_identifier(get_namespace_name(get_rel_namespace(relid))),
+                     quote_identifier(get_rel_name(relid)));
+    for (c = 0; c < ncols; c++)
+    {
+        Form_pg_attribute att = TupleDescAttr(desc, attnum[c] - 1);
+        Oid               outoid;
+        bool              isvarlena;
+
+        getTypeOutputInfo(att->atttypid, &outoid, &isvarlena);
+        fmgr_info(outoid, &outfn[c]);
+        appendStringInfo(&sql, "%s%s", c ? ", " : "", quote_identifier(NameStr(att->attname)));
+    }
+    appendStringInfoString(&sql, ") OVERRIDING SYSTEM VALUE VALUES ");
+    prefix_len = sql.len;
+
+    pstate = make_parsestate(NULL);
+    pstate->p_sourcetext = u->queryString;
+    cstate = BeginCopyFrom(pstate, rel, NULL, stmt->filename, stmt->is_program,
+                           NULL, stmt->attlist, stmt->options);
+    econtext = CreateStandaloneExprContext();
+    rowctx = AllocSetContextCreate(CurrentMemoryContext, "coldfront copy row",
+                                   ALLOCSET_DEFAULT_SIZES);
+    values = palloc(sizeof(Datum) * desc->natts);
+    nulls  = palloc(sizeof(bool) * desc->natts);
+
+    for (;;)
+    {
+        bool more;
+
+        /* The reader allocates each row's values in the current context, and
+         * the rendered literals go there too; the statement text is copied. */
+        MemoryContextReset(rowctx);
+        oldctx = MemoryContextSwitchTo(rowctx);
+        more = NextCopyFrom(cstate, econtext, values, nulls);
+        if (more)
+        {
+            appendStringInfoString(&sql, n ? ", (" : "(");
+            for (c = 0; c < ncols; c++)
+            {
+                if (c)
+                    appendStringInfoString(&sql, ", ");
+                if (nulls[attnum[c] - 1])
+                    appendStringInfoString(&sql, "NULL");
+                else
+                    appendStringInfoString(&sql, quote_literal_cstr(
+                        OutputFunctionCall(&outfn[c], values[attnum[c] - 1])));
+            }
+            appendStringInfoChar(&sql, ')');
+            n++;
+            processed++;
+        }
+        MemoryContextSwitchTo(oldctx);
+
+        if (n > 0 && (n == batch || !more))
+        {
+            if (SPI_connect() != SPI_OK_CONNECT)
+                elog(ERROR, "coldfront: SPI_connect failed in COPY");
+            if (SPI_execute(sql.data, false, 0) < 0)
+                elog(ERROR, "coldfront: the INSERT of a COPY batch failed");
+            SPI_finish();
+            sql.len = prefix_len;
+            sql.data[prefix_len] = '\0';
+            n = 0;
+        }
+        if (!more)
+            break;
+    }
+
+    EndCopyFrom(cstate);
+    FreeExprContext(econtext, true);
+    MemoryContextDelete(rowctx);
+    relation_close(rel, NoLock);
+    if (u->qc)
+        SetQueryCompletion(u->qc, CMDTAG_COPY, processed);
+}
+
 /*
  * The coldfront ProcessUtility_hook. Intercepts DDL on registered tiered
  * relations: blocks DROP/TRUNCATE, mirrors schema/rename DDL to Iceberg, and
@@ -4493,14 +5258,14 @@ cf_handle_rename(const CfUtilityCtx *u, RenameStmt *rs)
  * DROP/TRUNCATE (blocked — never replicated, they error on the originator),
  * column DDL (ADD/DROP/ALTER-TYPE/RENAME COLUMN — mirrored to Iceberg), and
  * RENAME TABLE/VIEW. A replicated statement re-runs in the peer's apply
- * worker; the hook then does the peer's LOCAL registry update + view
- * rebuild, which is exactly right because the registry/view are per-node
- * (not Spock-replicated). The Iceberg cold tier, by contrast, is SHARED
- * (one Lakekeeper), so its column DDL must run exactly once: the mirror
- * (coldfront._mirror_iceberg_alter) self-skips when
- * session_replication_role = replica, leaving the apply worker to rebuild
- * its local view only. The SPI-issued mirror/rebuild DDL runs at
- * non-top-level context, which Spock filters out, so it never re-replicates.
+ * worker, and the hook then makes the peer's own registry update and view
+ * rebuild. The hook's SPI DDL runs with spock.enable_ddl_replication off
+ * (spi_exec_void) and its registry updates in Spock's repair mode
+ * (spi_exec_local_rows), so only the user's statement replicates. The
+ * Iceberg cold tier, by contrast, is SHARED (one Lakekeeper), so its column
+ * DDL must run exactly once: the mirror (coldfront._mirror_iceberg_alter)
+ * self-skips when session_replication_role = replica, leaving the apply
+ * worker to rebuild its local view only.
  */
 static void
 coldfront_process_utility(PlannedStmt *pstmt, const char *queryString,
@@ -4540,6 +5305,8 @@ coldfront_process_utility(PlannedStmt *pstmt, const char *queryString,
         cf_handle_alter_table(&u, (AlterTableStmt *) stmt);
     else if (IsA(stmt, RenameStmt))
         cf_handle_rename(&u, (RenameStmt *) stmt);
+    else if (IsA(stmt, CopyStmt))
+        cf_handle_copy(&u, (CopyStmt *) stmt);
     else
         cf_call_through(&u);
 }
@@ -4571,10 +5338,10 @@ register_gucs(void)
 
     DefineCustomIntVariable(
         "coldfront.cold_write_batch_size",
-        "Rows per cold-tier Iceberg flush batch in coldfront._tiered_insert_cold.",
-        "Each batch_size rows the tiered INSERT flushes one duckdb.raw_query — one "
-        "Iceberg append / Parquet file. Larger means fewer, bigger files; the "
-        "trailing remainder always flushes, so a small write stays a single file.",
+        "Rows per Iceberg write in a tiered INSERT's cold sink (coldfront._cold_sink).",
+        "Every batch_size cold rows the sink flushes one duckdb.raw_query INSERT. "
+        "Larger means fewer, bigger files; the trailing remainder always flushes, "
+        "so a small write stays a single file.",
         &coldfront_cold_write_batch_size,
         10000,              /* boot_val */
         1,                  /* min */
@@ -4649,15 +5416,83 @@ register_gucs(void)
         NULL, NULL, NULL);
 
     DefineCustomStringVariable(
-        "coldfront.dblink_self",
+        "coldfront.loopback_dsn",
         "libpq DSN of the loopback that runs the mesh bakery's claims, acks "
-        "and releases, each committed on its own.",
+        "and releases, each committed on its own; a unix socket.",
         NULL,
-        &coldfront_dblink_self,
+        &coldfront_loopback_dsn,
         "",
         PGC_SUSET,
         0,
         NULL, NULL, NULL);
+
+    /*
+     * The bakery's dead-peer window: a peer whose walsender has not replied
+     * within it counts as already acked (_claim_iceberg_lock), so an ordinary
+     * role must not be able to shrink it.
+     */
+    DefineCustomIntVariable(
+        "coldfront.peer_alive_window_ms",
+        "Milliseconds without a walsender reply after which the bakery treats a peer as dead.",
+        NULL,
+        &coldfront_peer_alive_window_ms,
+        10000,
+        1,
+        PG_INT32_MAX,
+        PGC_SUSET,
+        0,
+        NULL, NULL, NULL);
+
+    /*
+     * The async parquet ordering runs only with both on (_iceberg_async_active).
+     * The request flag is PGC_USERSET because _cross_tier_move and the Iceberg
+     * ALTER path SET LOCAL it off; the build marker states that the loaded
+     * duckdb-iceberg includes the bakery-aware patch, which only the deployment
+     * knows, so it is PGC_SUSET.
+     */
+    DefineCustomBoolVariable(
+        "coldfront.iceberg_async_parquet",
+        "Stage a cold write's Parquet before taking the bakery claim.",
+        NULL,
+        &coldfront_iceberg_async_parquet,
+        false,
+        PGC_USERSET,
+        0,
+        NULL, NULL, NULL);
+
+    DefineCustomBoolVariable(
+        "coldfront.iceberg_bakery_patch",
+        "The loaded duckdb-iceberg includes the bakery-aware commit refresh.",
+        NULL,
+        &coldfront_iceberg_bakery_patch,
+        false,
+        PGC_SUSET,
+        0,
+        NULL, NULL, NULL);
+
+    /* Per-session state the SQL keeps with set_config. */
+    DefineCustomStringVariable(
+        "coldfront._claimed",
+        "Iceberg tables this transaction holds a bakery claim on, one per line.",
+        NULL,
+        &coldfront_claimed,
+        "",
+        PGC_USERSET,
+        0,
+        NULL, NULL, NULL);
+
+    DefineCustomBoolVariable(
+        "coldfront._async_downgrade_warned",
+        "This session has logged its fall-back from the async ordering.",
+        NULL,
+        &coldfront_async_downgrade_warned,
+        false,
+        PGC_USERSET,
+        0,
+        NULL, NULL, NULL);
+
+    /* Every coldfront.* name is registered above, so a mistyped one is refused. */
+    MarkGUCPrefixReserved("coldfront");
 }
 
 /* ---------- planner hook: bound parameters on a tiered read ------------- */
@@ -4808,6 +5643,14 @@ coldfront_planner(Query *parse, const char *query_string, int cursor_options,
 void
 _PG_init(void)
 {
+    /* The hooks exist only in a preloaded library; a session that loaded it
+     * later would run the SQL without them. */
+    if (!process_shared_preload_libraries_in_progress)
+        ereport(ERROR,
+                (errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
+                 errmsg("coldfront must be loaded via shared_preload_libraries"),
+                 errhint("Add coldfront to shared_preload_libraries after pg_duckdb and restart the server.")));
+
     register_gucs();
 
     prev_post_parse_analyze_hook = post_parse_analyze_hook;
@@ -4824,9 +5667,10 @@ _PG_init(void)
     prev_process_utility_hook = ProcessUtility_hook;
     ProcessUtility_hook       = coldfront_process_utility;
 
-    /* Register the bakery release-deferral callback. Runs after pg_duckdb's
-     * XactCallback (coldfront appears later in shared_preload_libraries, so
-     * its _PG_init runs after pg_duckdb's, so its XactCallback is invoked
-     * later in PG's registration-ordered chain). */
+    /* Register the bakery release callback. The order the bakery needs is by
+     * event, not by registration: pg_duckdb commits the Iceberg transaction at
+     * XACT_EVENT_PRE_COMMIT and this callback releases the claim at
+     * XACT_EVENT_COMMIT. Within one event PostgreSQL runs the most recently
+     * registered callback first, so there coldfront's runs before pg_duckdb's. */
     RegisterXactCallback(coldfront_xact_callback, NULL);
 }

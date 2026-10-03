@@ -1,7 +1,8 @@
--- TRUNCATE on a tiered hot table must be blocked: the per-row capture trigger
--- does not fire on TRUNCATE, and cold-tier rows in Iceberg would remain
--- visible through the view. The block is intentional; the operator must
--- truncate each tier explicitly and deliberately.
+-- TRUNCATE on a tiered relation, or on the hot table behind one, is blocked:
+-- the cold rows in Iceberg would stay visible through the view. The hint
+-- names what empties the table instead: each hot partition on its own, which
+-- the hook allows, and a DELETE through the view for the cold rows. An
+-- iceberg-only view has no hot table, so its hint names the DELETE alone.
 
 CREATE EXTENSION IF NOT EXISTS pg_duckdb;
 CREATE EXTENSION IF NOT EXISTS coldfront;
@@ -10,16 +11,29 @@ SET TIME ZONE 'UTC';
 -- White-box: checks the hooks' SQL/DDL, not Iceberg I/O. Real cold I/O is ci/journey.sh; see README.md.
 SET coldfront.warehouse = '';
 SET coldfront.lakekeeper_endpoint = '';
-SET coldfront.dblink_self = '';
+SET coldfront.loopback_dsn = '';
 
-CREATE TABLE public._events (id int, ts timestamptz, status text);
+CREATE TABLE public._events (id int, ts timestamptz, status text) PARTITION BY RANGE (ts);
+CREATE TABLE public._events_2026 PARTITION OF public._events FOR VALUES FROM ('2026-01-01') TO ('2027-01-01');
 CREATE VIEW public.events AS SELECT * FROM public._events;
+INSERT INTO public._events VALUES (1, '2026-05-01 00:00:00+00', 'a');
 
 INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
 VALUES ('public', 'events', 'public._events', 'ice.default.events', 'ts');
 
--- TRUNCATE of the hot table is blocked.
+-- The hot table and the view are blocked; the hint names both tiers.
 TRUNCATE public._events;
+TRUNCATE public.events;
+
+-- A hot partition truncates on its own, as the hint says.
+TRUNCATE public._events_2026;
+SELECT count(*) FROM public._events;
+
+-- An iceberg-only view has no hot table; the hint names the DELETE alone.
+CREATE VIEW public.iceonly AS SELECT 1 AS id;
+INSERT INTO coldfront.tiered_views(schema_name, relname, iceberg_table, is_iceberg_only)
+VALUES ('public', 'iceonly', 'ice.default.iceonly', true);
+TRUNCATE public.iceonly;
 
 -- A non-tiered table truncates normally (control).
 CREATE TABLE public.plain (id int);
@@ -30,5 +44,5 @@ DROP TABLE public.plain;
 
 -- Cleanup.
 DELETE FROM coldfront.tiered_views;
-DROP VIEW public.events;
+DROP VIEW public.events, public.iceonly;
 DROP TABLE public._events;

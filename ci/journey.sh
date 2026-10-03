@@ -30,7 +30,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 source "$SCRIPT_DIR/lib.sh"
 
 HOST=""; MODE="tiered"; MESH=0; PEERS=""; STANDBY=""
-DB_IP=""; SW_IP=""; LK_IP=""; WAREHOUSE="wh"
+DB_IP=""; SW_IP=""; LK_IP=""
 # Cold-store backend: s3 (default) or azure (ADLS Gen2, DuckDB 1.5.x stack). The
 # journey STORIES are storage-agnostic — only the secret call and the archiver
 # config block differ. Real azure creds come from env (never committed): the
@@ -59,7 +59,6 @@ while [ $# -gt 0 ]; do case "$1" in
   --db-ip) DB_IP="$2"; shift 2;;
   --sw-ip) SW_IP="$2"; shift 2;;
   --lk-ip) LK_IP="$2"; shift 2;;
-  --warehouse) WAREHOUSE="$2"; shift 2;;
   --backend) BACKEND="$2"; shift 2;;
   --azure-conn) AZURE_CONN="$2"; shift 2;;
   --archiver) ARCHIVER="$2"; shift 2;;
@@ -91,26 +90,6 @@ storage_secret_sql() {
         printf "SELECT coldfront.set_storage_secret('%s','%s',NULL,'%s');" "$AWS_KEY" "$AWS_SECRET" "$AWS_REGION"
     else
         printf "SELECT coldfront.set_storage_secret('admin','adminsecret','%s:8333');" "$SW_IP"
-    fi
-}
-
-# storage_yaml — the cold-store block for an archiver YAML config, per backend.
-storage_yaml() {
-    if [ "$BACKEND" = vended ] || [ "$BACKEND" = azure-vended ]; then
-        # Vended: the YAML carries NO storage block. The archiver reads
-        # coldfront.storage_secret.vended and attaches with credential vending.
-        printf ''
-    elif [ "$BACKEND" = azure ]; then
-        printf 'azure:\n  connection_string: "%s"' "$AZURE_CONN"
-    elif [ "$BACKEND" = gcs ]; then
-        # GCS = the s3 block pointed at the interop endpoint over TLS, HMAC creds.
-        printf 's3:\n  endpoint: "storage.googleapis.com"\n  region: "us-east-1"\n  access_key: "%s"\n  secret_key: "%s"\n  use_ssl: true' "$GCS_KEY" "$GCS_SECRET"
-    elif [ "$BACKEND" = aws ]; then
-        # REAL AWS S3 = the s3 block with NO endpoint ⇒ archiver uses AWS-native
-        # vhost+HTTPS (region = the bucket's real Region).
-        printf 's3:\n  region: "%s"\n  access_key: "%s"\n  secret_key: "%s"' "$AWS_REGION" "$AWS_KEY" "$AWS_SECRET"
-    else
-        printf 's3:\n  endpoint: "%s:8333"\n  region: "us-east-1"\n  access_key: "admin"\n  secret_key: "adminsecret"' "$SW_IP"
     fi
 }
 
@@ -163,7 +142,7 @@ ice_spec() {
 assert_register_rejected() {
     local label="$1" tbl="$2" needle="$3" log
     log="$TMPD/reject-$(echo "$tbl" | tr -c 'a-zA-Z0-9_' '_').log"
-    if "$ARCHIVER" register --config $TMPD/archiver.yaml --table "$tbl" \
+    if "$ARCHIVER" register --table "$tbl" \
             --period monthly --hot-period "30 days" >"$log" 2>&1; then
         fail "$label: register accepted it"
     else
@@ -184,7 +163,7 @@ qdb() { local d="$1"; shift; docker exec -e PGUSER="$CF_DBUSER" -e PGDATABASE="$
 # on an unrelated table's failure. Only rows this call disabled are re-enabled,
 # so a table another story deliberately left disabled stays that way.
 archive_only() {
-    local keep="$1" cfg="$2" log="$3" others rc=0
+    local keep="$1" log="$2" others rc=0
     # Truncated, not appended: /tmp outlives a journey run, so a rejection grep
     # could otherwise match a previous run's output in the same file.
     : >"$log"
@@ -193,10 +172,25 @@ archive_only() {
                          WHERE enabled AND NOT ($keep);")
     [ -n "$others" ] && q "$HOST" "UPDATE coldfront.partition_config SET enabled=false
                                     WHERE (schema_name,table_name) IN ($others);" >/dev/null
-    "$ARCHIVER" --config "$cfg" >>"$log" 2>&1 || rc=$?
+    "$ARCHIVER" >>"$log" 2>&1 || rc=$?
     [ -n "$others" ] && q "$HOST" "UPDATE coldfront.partition_config SET enabled=true
                                     WHERE (schema_name,table_name) IN ($others);" >/dev/null
     return $rc
+}
+
+# The binaries connect the way psql does, from the libpq environment, and read
+# every other setting from the server: no YAML names a connection or a store.
+export PGHOST="$DB_IP" PGPORT=5432 PGDATABASE=coldfront PGUSER=coldfront PGPASSWORD=coldfront PGSSLMODE=disable
+
+# compactor runs the binary inside the database container. The compactor reads
+# the catalog endpoint and the cold-store credential from the server, which
+# names them as the compose network sees them (lakekeeper, seaweedfs), and those
+# names resolve only inside that network. PGOPTIONS passes through for a story
+# that gives the compactor's session a different setting.
+compactor() {
+    local -a env=(-e PGHOST=localhost -e PGUSER=coldfront -e PGPASSWORD=coldfront -e PGDATABASE=coldfront)
+    [ -n "${PGOPTIONS:-}" ] && env+=(-e "PGOPTIONS=$PGOPTIONS")
+    docker exec "${env[@]}" "$HOST" /usr/local/bin/compactor "$@"
 }
 
 step "JOURNEY  host=$HOST  mode=$MODE  mesh=$MESH  standby=${STANDBY:-none}"
@@ -222,6 +216,8 @@ EOSQL
     assert_eq "extensions present" "2" "$ext"
     local secret; secret=$(q "$HOST" "SELECT count(*) FROM coldfront.storage_secret;")
     assert_eq "storage secret row written" "1" "$secret"
+    # The compactor binary, for the compactor() wrapper (see its comment).
+    [ -x "$COMPACTOR" ] && docker cp "$COMPACTOR" "$HOST":/usr/local/bin/compactor >/dev/null 2>&1
     if [ "$BACKEND" = vended ] || [ "$BACKEND" = azure-vended ]; then
         assert_eq "storage secret is vended (no credential stored)" "t" \
             "$(q "$HOST" "SELECT vended FROM coldfront.storage_secret LIMIT 1;")"
@@ -275,10 +271,6 @@ EOSQL
     cat > $TMPD/archiver.yaml <<EOF
 postgres:
   dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
-iceberg:
-  warehouse: "${WAREHOUSE}"
-  lakekeeper_endpoint: "http://${LK_IP}:8181/catalog"
-$(storage_yaml)
 archiver:
   tables:
     - source_table: events
@@ -289,7 +281,7 @@ EOF
     if ! "$ARCHIVER" import --config $TMPD/archiver.yaml >$TMPD/archiver.log 2>&1; then
         fail "import events into partition_config — see $TMPD/archiver.log"; tail -5 $TMPD/archiver.log; return
     fi
-    if "$ARCHIVER" --config $TMPD/archiver.yaml >>$TMPD/archiver.log 2>&1; then
+    if "$ARCHIVER" >>$TMPD/archiver.log 2>&1; then
         pass "archiver first run completed"
     else
         fail "archiver first run — see $TMPD/archiver.log"; tail -5 $TMPD/archiver.log
@@ -329,25 +321,11 @@ story_cold_retention() {
     drop_date=$(date -u -d "$(date -u +%Y-%m-01) -3 month" +%Y-%m-%d)             # drop cutoff = start of now-3mo (m4 boundary)
     ret_days=$(( ( $(date -u +%s) - $(date -u -d "$hot_date" +%s) ) / 86400 ))
     ret_long=$(( ( $(date -u +%s) - $(date -u -d "$drop_date" +%s) ) / 86400 ))
-    cat > $TMPD/coldret.yaml <<EOF
-postgres:
-  dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
-iceberg:
-  warehouse: "${WAREHOUSE}"
-  lakekeeper_endpoint: "http://${LK_IP}:8181/catalog"
-$(storage_yaml)
-archiver:
-  tables:
-    - source_table: events
-      partition_period: monthly
-      hot_period: "${ret_days} days"
-      retention_period: "${ret_long} days"
-EOF
     # events is already managed (tiered); add the drop boundary via set.
-    if ! "$ARCHIVER" set --config $TMPD/coldret.yaml --table events --retention "${ret_long} days" >$TMPD/coldret.log 2>&1; then
+    if ! "$ARCHIVER" set --table events --retention "${ret_long} days" >$TMPD/coldret.log 2>&1; then
         fail "set retention on events — see $TMPD/coldret.log"; tail -5 $TMPD/coldret.log; return
     fi
-    if "$ARCHIVER" --config $TMPD/coldret.yaml >>$TMPD/coldret.log 2>&1; then
+    if "$ARCHIVER" >>$TMPD/coldret.log 2>&1; then
         pass "archiver cold-retention run completed"
     else
         fail "archiver cold-retention run — see $TMPD/coldret.log"; tail -5 $TMPD/coldret.log
@@ -389,8 +367,8 @@ story_provision_decoupled() {
 
 # ───────────────────────────────────────────────────────────────────────────
 # Decoupled CRUD — every DML on the wrapper view is rewritten by the C hook to
-# a single duckdb.raw_query against Iceberg (no INSTEAD OF trigger). Covers the
-# INSERT shapes, jsonb surfacing, UPDATE, DELETE.
+# a single duckdb.raw_query against Iceberg. Covers the INSERT shapes, jsonb
+# surfacing, UPDATE, DELETE.
 # ───────────────────────────────────────────────────────────────────────────
 story_decoupled_crud() {
     step "6. Decoupled CRUD (INSERT/SELECT/UPDATE/DELETE → Iceberg via the hook)"
@@ -405,21 +383,72 @@ UPDATE iceonly SET status='upd' WHERE id=1;
 SELECT 'UPD:'||status FROM iceonly WHERE id=1;
 DELETE FROM iceonly WHERE id=2;
 SELECT 'DEL:'||count(*) FROM iceonly WHERE id=2;
+COPY iceonly (id, ts, status, data) FROM stdin WITH (FORMAT csv);
+20,2026-01-01 10:00:00+00,copied,{}
+21,2026-01-01 10:00:01+00,copied,{}
+\.
+SELECT 'COPIED:'||count(*) FROM iceonly WHERE status='copied';
+WITH i AS (INSERT INTO iceonly VALUES (30,date_trunc('month',now()) + interval '10 hours 2 minutes 0 seconds','nested','{}')) SELECT 1;
+SELECT 'NESTED:'||count(*) FROM iceonly WHERE status='nested';
 EOSQL
 )
     assert_eq "decoupled INSERT + read (2 rows)"        "2"    "$(extract CNT "$O")"
+    assert_eq "decoupled COPY FROM lands through the hook (2 rows)" "2" "$(extract COPIED "$O")"
+    assert_eq "decoupled INSERT nested in WITH lands through the hook" "1" "$(extract NESTED "$O")"
+    # The source runs in DuckDB, which cannot run the write a WITH entry holds.
+    assert_err "decoupled INSERT refuses a leading WITH that modifies data" "data-modifying WITH" \
+        "$(q_may "$HOST" "CREATE TABLE iceonly_staging (id int, ts timestamptz, status text, data jsonb); WITH gone AS (DELETE FROM iceonly_staging RETURNING id, ts, status, data) INSERT INTO iceonly (id, ts, status, data) SELECT id, ts, status, data FROM gone; DROP TABLE iceonly_staging;")"
     assert_eq "decoupled jsonb surfaces as json"        "json" "$(extract JSONTYPE "$O")"
     assert_eq "decoupled jsonb round-trip (data->>a)"   "1"    "$(extract JSON "$O")"
     assert_eq "decoupled multi-row INSERT (3 rows)"     "3"    "$(extract MULTI "$O")"
     assert_eq "decoupled UPDATE visible"                "upd"  "$(extract UPD "$O")"
     assert_eq "decoupled DELETE visible (0 of id=2)"    "0"    "$(extract DEL "$O")"
+    # PostgreSQL 17 and later allow MERGE into a view.
+    if [ "$(q "$HOST" "SHOW server_version_num;")" -ge 170000 ]; then
+        O=$(qf "$HOST" <<'EOSQL'
+MERGE INTO iceonly t USING (VALUES (1, 'merged'), (40, 'merge_ins')) s(id, st) ON t.id = s.id
+WHEN MATCHED THEN UPDATE SET status = s.st
+WHEN NOT MATCHED THEN INSERT (id, ts, status, data) VALUES (s.id, date_trunc('month',now()) + interval '10 hours 3 minutes 0 seconds', s.st, '{}');
+SELECT 'MERGED:'||string_agg(status, ',' ORDER BY status) FROM iceonly WHERE id IN (1, 40);
+MERGE INTO iceonly t USING (VALUES (40)) s(id) ON t.id = s.id WHEN MATCHED THEN DELETE;
+SELECT 'MERGEDEL:'||count(*) FROM iceonly WHERE id = 40;
+WITH m AS (MERGE INTO iceonly t USING (VALUES (41, 'nested_merge')) s(id, st) ON t.id = s.id WHEN NOT MATCHED THEN INSERT (id, ts, status, data) VALUES (s.id, date_trunc('month',now()) + interval '10 hours 4 minutes 0 seconds', s.st, '{}')) SELECT 1;
+SELECT 'NESTEDMERGE:'||count(*) FROM iceonly WHERE id = 41;
+EOSQL
+)
+        assert_eq "decoupled MERGE ran its UPDATE and INSERT actions, and a second its DELETE, through the hook" "merge_ins,merged|0" "$(extract MERGED "$O")|$(extract MERGEDEL "$O")"
+        assert_eq "decoupled MERGE nested in WITH lands through the hook" "1" "$(extract NESTEDMERGE "$O")"
+    fi
+    # pg_duckdb (c04e6a2) refuses a PostgreSQL write after a decoupled write in one
+    # transaction block unless duckdb.unsafe_allow_mixed_transactions is on; the
+    # docs state the rule and leave the parameter to the user.
+    q "$HOST" "CREATE TABLE IF NOT EXISTS mixed_plain (x int);" >/dev/null 2>&1
+    O=$(qf "$HOST" 2>&1 <<'EOSQL'
+BEGIN;
+INSERT INTO iceonly VALUES (42, date_trunc('month',now()) + interval '10 hours 5 minutes 0 seconds', 'mixed', '{}');
+INSERT INTO mixed_plain VALUES (1);
+COMMIT;
+SELECT 'MIXED:' || (SELECT count(*) FROM iceonly WHERE id = 42) || ',' || (SELECT count(*) FROM mixed_plain);
+BEGIN;
+SET LOCAL duckdb.unsafe_allow_mixed_transactions = on;
+INSERT INTO iceonly VALUES (42, date_trunc('month',now()) + interval '10 hours 5 minutes 0 seconds', 'mixed', '{}');
+INSERT INTO mixed_plain VALUES (1);
+COMMIT;
+SELECT 'MIXEDON:' || (SELECT count(*) FROM iceonly WHERE id = 42) || ',' || (SELECT count(*) FROM mixed_plain);
+EOSQL
+)
+    assert_contains "decoupled: pg_duckdb refuses a plain-table write after a decoupled write in one transaction block" "same transaction block is not supported" "$O"
+    assert_eq "decoupled: that block committed nothing" "0,0" "$(extract MIXED "$O")"
+    assert_eq "decoupled: with duckdb.unsafe_allow_mixed_transactions on, the block commits both writes" "1,1" "$(extract MIXEDON "$O")"
+    q "$HOST" "DROP TABLE mixed_plain;" >/dev/null 2>&1
+    q "$HOST" "DELETE FROM iceonly WHERE id = 42;" >/dev/null 2>&1
 }
 
 # ───────────────────────────────────────────────────────────────────────────
 # Story 6b' — Decoupled CRUD from INSIDE plpgsql (a DO block). Every iceonly DML
 # is cold (emit_tiered_insert / emit_cold); a plpgsql var ⇒ a $N kept live via
 # format() (Cause 1), and inside plpgsql the rewrite is the DML-tagged carrier
-# shape (Cause 2). RED before / GREEN after. Exercises the jsonb param branch.
+# shape (Cause 2). Exercises the jsonb param branch.
 # ───────────────────────────────────────────────────────────────────────────
 story_decoupled_plpgsql() {
     step "6b'. Decoupled CRUD from inside plpgsql (DO block, bound params)"
@@ -448,8 +477,9 @@ EOSQL
 # table must all land. Vanilla serializes them with the local advisory-lock
 # bakery (_exec_iceberg_with_claim, v_armed=false → pg_advisory_xact_lock);
 # without it, concurrent Iceberg commits race Lakekeeper's assert-ref-snapshot
-# precondition and 409 (CatalogCommitConflict), silently losing rows. (Standing
-# rule: multi-writer no-409 probe in vanilla. The bakery is essential.)
+# precondition and 409 (CatalogCommitConflict), which aborts the losing
+# transaction. (Standing rule: multi-writer no-409 probe in vanilla. The bakery
+# is essential.)
 # ───────────────────────────────────────────────────────────────────────────
 # snapshot_count <iceberg-ref>: the table's snapshot count. A table nothing has
 # written to has none, and every commit adds one.
@@ -493,8 +523,33 @@ story_decoupled_concurrency() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────
-# Decoupled read-your-own-write — the wrapper view sources duckdb.query (not
-# iceberg_scan), so an in-transaction SELECT sees the same tx's prior write,
+# TC-201: a transaction block in which a statement failed still ends. The
+# ROLLBACK or COMMIT that ends it reaches coldfront's hooks after the
+# transaction's resources are released, and must still end the block, undo its
+# writes and leave the session usable; an aborted cold write leaves no claim.
+# failed_block_ends <view> <insert> <status>: <insert> writes rows whose status
+# is <status> through <view>.
+# ───────────────────────────────────────────────────────────────────────────
+failed_block_ends() {
+    local view="$1" ins="$2" status="$3" end O
+    for end in ROLLBACK COMMIT; do
+        O=$(qf "$HOST" <<EOSQL
+BEGIN;
+$ins;
+SELECT 1/0;
+$end;
+SELECT 'FB_AFTER:' || count(*) FROM $view WHERE status = '$status';
+EOSQL
+)
+        assert_eq "TC-201: $end ends a failed block on $view and undoes its writes" "0" "$(extract FB_AFTER "$O")"
+    done
+    assert_eq "TC-201: the failed blocks left no claim on $view" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.claims c JOIN coldfront.tiered_views tv ON tv.iceberg_table = c.iceberg_table WHERE tv.relname = '$view';")"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Decoupled read-your-own-write: the wrapper view reads through the catalog's
+# table entry, so an in-transaction SELECT sees the same tx's prior write,
 # and ROLLBACK undoes the Iceberg INSERT (pg_duckdb XactCallback ties the txns).
 # ───────────────────────────────────────────────────────────────────────────
 story_decoupled_ryw() {
@@ -509,6 +564,7 @@ EOSQL
 )
     assert_eq "in-tx SELECT sees just-inserted iceberg row" "1" "$(extract INTX "$O")"
     assert_eq "ROLLBACK undoes the iceberg INSERT"          "0" "$(extract POSTRB "$O")"
+    failed_block_ends iceonly "INSERT INTO iceonly VALUES (98, date_trunc('month',now()) + interval '12 hours', 'fb_blk', '{}')" fb_blk
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -815,14 +871,12 @@ EOSQL
     local ret_days; ret_days=$(hot_days)
     cat > $TMPD/typed.yaml <<EOF
 postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
-iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog" }
-$(storage_yaml)
 archiver: { tables: [ { source_table: typed, partition_period: monthly, hot_period: "${ret_days} days" } ] }
 EOF
     if ! "$ARCHIVER" import --config $TMPD/typed.yaml >$TMPD/typed.log 2>&1; then
         fail "import typed into partition_config — see $TMPD/typed.log"; tail -5 $TMPD/typed.log; return
     fi
-    if "$ARCHIVER" --config $TMPD/typed.yaml >>$TMPD/typed.log 2>&1; then
+    if "$ARCHIVER" >>$TMPD/typed.log 2>&1; then
         pass "typed table archived (Jan → cold)"
     else
         fail "typed archive — see $TMPD/typed.log"; tail -5 $TMPD/typed.log
@@ -877,8 +931,8 @@ EOSQL
 # ───────────────────────────────────────────────────────────────────────────
 # Story 5b — Embeddings round-trip. A pgvector column tiers as an Iceberg
 # list<float> and comes back element-for-element through the view, over all three
-# cold-write paths: the archiver's bulk export, the INSTEAD OF trigger's cold
-# INSERT, and the decoupled hook. The view exposes the column as real[], and PG
+# cold-write paths: the archiver's bulk export, the tiered INSERT's cold sink,
+# and the decoupled hook. The view exposes the column as real[], and PG
 # spells an array {1,2,3} where DuckDB's list cast takes only [1,2,3], so each
 # path has to rewrite the delimiters; comparing the stored value to a literal is
 # what catches a path that does not.
@@ -914,14 +968,12 @@ EOSQL
     local ret_days; ret_days=$(hot_days)
     cat > $TMPD/chunks.yaml <<EOF
 postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
-iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog" }
-$(storage_yaml)
 archiver: { tables: [ { source_table: chunks, partition_period: monthly, hot_period: "${ret_days} days" } ] }
 EOF
     if ! "$ARCHIVER" import --config $TMPD/chunks.yaml >$TMPD/chunks.log 2>&1; then
         fail "import chunks into partition_config — see $TMPD/chunks.log"; tail -5 $TMPD/chunks.log; return
     fi
-    if "$ARCHIVER" --config $TMPD/chunks.yaml >>$TMPD/chunks.log 2>&1; then
+    if "$ARCHIVER" >>$TMPD/chunks.log 2>&1; then
         pass "vector table archived (m4 → cold)"
     else
         fail "vector archive — see $TMPD/chunks.log"; tail -5 $TMPD/chunks.log; return
@@ -967,9 +1019,8 @@ EOSQL
     assert_eq "cross-tier read spans both tiers" "cold,hot" "$(extract VIEW_XB "$V")"
     assert_eq "cold vector read through the view (classified, now()-relative)" "true" "$(extract VIEW_VEC "$V")"
 
-    # Cold INSERT through the view trigger (ts < cutoff): a second write path,
-    # and the one that renders NEW.embedding::text. The vector literal exercises
-    # pgvector's implicit vector -> real[] cast on the way into the view column.
+    # Cold INSERT through the view (ts < cutoff): the hook's cold sink, which
+    # renders the vector from the row's jsonb payload.
     local CI; CI=$(qf "$HOST" <<'EOSQL'
 INSERT INTO chunks (ts, body, embedding)
 VALUES (date_trunc('month',now()) - interval '4 months' + interval '19 days', 'coldins', '[4,5.5,-6]'::vector);
@@ -978,7 +1029,7 @@ SELECT 'COLDINS_VEC:' || (r['embedding']::real[] = ARRAY[4,5.5,-6]::real[])::tex
   FROM iceberg_scan('ice.public.chunks') r WHERE r['body'] = 'coldins';
 EOSQL
 )
-    assert_eq "cold-INSERT-via-trigger vector round-trip" "true" "$(extract COLDINS_VEC "$CI")"
+    assert_eq "cold INSERT through the view: vector round-trip" "true" "$(extract COLDINS_VEC "$CI")"
 
     # The search itself: pgvector-shaped syntax over the view, ranking hot and cold
     # rows together in one statement. The query vector is one of the stored rows, so
@@ -992,6 +1043,17 @@ EOSQL
     assert_eq "top-k over both tiers finds the nearest row" "coldins" "$(extract NEAREST "$S")"
     assert_contains "top-k ranks the exact match first" "coldins," "$(extract RANKED "$S")"
 
+    # TC-215: <#> reaches DuckDB as the function it has under the same name
+    # (list_negative_inner_product), so it ranks hot and cold rows together like
+    # <=> does; the stored vector scores its own negative dot product.
+    local IP; IP=$(qf "$HOST" <<'EOSQL'
+SELECT 'IP_NEAREST:' || body FROM chunks ORDER BY embedding <#> ARRAY[4,5.5,-6]::real[] LIMIT 1;
+SELECT 'IP_VALUE:' || round((embedding <#> ARRAY[4,5.5,-6]::real[])::numeric, 2) FROM chunks WHERE body = 'coldins';
+EOSQL
+)
+    assert_eq "TC-215 <#> through the tiered view ranks the matching row first" "coldins" "$(extract IP_NEAREST "$IP")"
+    assert_eq "TC-215 <#> through the tiered view is the negative inner product" "-82.25" "$(extract IP_VALUE "$IP")"
+
     # Decoupled: no hot tier, its own generated trigger, its own type map. Shares
     # none of the archiver's plumbing, so it is a distinct path.
     local i
@@ -1003,9 +1065,11 @@ EOSQL
     local D; D=$(qf "$HOST" <<'EOSQL'
 INSERT INTO icevec VALUES (1, date_trunc('month',now()) + interval '11 hours', '[7,-8.25,9]'::vector);
 SELECT 'DEC_VEC:' || (embedding = ARRAY[7,-8.25,9]::real[])::text FROM icevec WHERE id = 1;
+SELECT 'DEC_IP:' || round((embedding <#> ARRAY[7,-8.25,9]::real[])::numeric, 2) FROM icevec WHERE id = 1;
 EOSQL
 )
     assert_eq "decoupled vector round-trip" "true" "$(extract DEC_VEC "$D")"
+    assert_eq "TC-215 <#> through the decoupled view is the negative inner product" "-198.06" "$(extract DEC_IP "$D")"
 
     # Decoupled declares its own schema, so the append has a second implementation.
     local DL; DL=$(qf "$HOST" <<'EOSQL'
@@ -1453,14 +1517,14 @@ story_vector_compaction() {
     local answer_before; answer_before=$(q "$HOST" "SET coldfront.vector_nprobe = 1; $probe_q;" | grep -vx SET | sort | tr '\n' ' ')
 
     local rows_before; rows_before=$(q "$HOST" "SELECT count(*) FROM chunks;")
-    local before; before=$("$COMPACTOR" --config $TMPD/chunks.yaml --table chunks --dry-run 2>&1)
+    local before; before=$(compactor --table chunks --dry-run 2>&1)
     if echo "$before" | grep -q "group(s)"; then
         pass "a clustered table with small files reports work to do"
     else
         fail "nothing to compact on the clustered table: $before"; return
     fi
 
-    if "$COMPACTOR" --config $TMPD/chunks.yaml --table chunks >$TMPD/compact-vec.log 2>&1; then
+    if compactor --table chunks >$TMPD/compact-vec.log 2>&1; then
         pass "the sort-key merge committed against a live catalog"
     else
         fail "compaction of chunks failed — see $TMPD/compact-vec.log"
@@ -1469,7 +1533,7 @@ story_vector_compaction() {
     assert_eq "the merge preserved every row" "$rows_before" "$(q "$HOST" "SELECT count(*) FROM chunks;")"
 
     # A merge that did not converge would rewrite the same table forever.
-    local again; again=$("$COMPACTOR" --config $TMPD/chunks.yaml --table chunks --dry-run 2>&1)
+    local again; again=$(compactor --table chunks --dry-run 2>&1)
     if echo "$again" | grep -q "nothing to compact"; then
         pass "a second pass over the merged table is a no-op"
     else
@@ -1544,6 +1608,10 @@ EOSQL
     # rows) rather than silently returning a partial/void result.
     local cr; cr=$(q_may "$HOST" "UPDATE events SET status='x' WHERE ts < date_trunc('month',now()) - interval '3 months' RETURNING id;")
     assert_err "cold-tier RETURNING rejected" "cold tier" "$cr"
+    # duckdb-iceberg 5edc45f0 refuses RETURNING on an Iceberg write itself, the
+    # constraint behind that refusal; this check fails once the pin accepts it.
+    assert_err "duckdb-iceberg refuses RETURNING on an Iceberg write" "RETURNING clause not yet supported" \
+        "$(q_may "$HOST" "SELECT coldfront.ensure_attached(); SELECT duckdb.raw_query('UPDATE \"ice\".\"public\".\"events\" SET status = status WHERE false RETURNING id');")"
     story_cross_tier_move
 }
 
@@ -1628,11 +1696,11 @@ require_compactor() {
 # the cold tier's many small Parquet files into fewer large ones via
 # apache/iceberg-go RewriteDataFiles, serialized through the bakery (the SAME
 # claim cold writes take — coldfront._claim_iceberg_external, formally cleared in
-# docs/formal). The compactor reads the SAME deployment YAML the archiver does
-# ($TMPD/archiver.yaml). We use the compactor's own --dry-run as the
-# file-count oracle: it reports group(s) before, "nothing to compact" after, and
-# all rows survive. Six same-day cold INSERTs guarantee >= MinInputFiles (5) small
-# files in one group regardless of prior stories.
+# docs/formal). The compactor reads its configuration from the server, as the
+# archiver does. We use the compactor's own --dry-run as the file-count oracle:
+# it reports group(s) before, "nothing to compact" after, and all rows survive.
+# Six same-day cold INSERTs guarantee >= MinInputFiles (5) small files in one
+# group regardless of prior stories.
 # ───────────────────────────────────────────────────────────────────────────
 story_compaction() {
     # The manifest-list format-version interop patch (docker/iceberg-manifest-list-
@@ -1652,20 +1720,20 @@ INSERT INTO events (ts, status, data) VALUES (date_trunc('month',now()) - interv
 EOSQL
     local rows_before; rows_before=$(q "$HOST" "SELECT count(*) FROM events;")
 
-    local before; before=$("$COMPACTOR" --config $TMPD/archiver.yaml --table events --dry-run 2>&1)
+    local before; before=$(compactor --table events --dry-run 2>&1)
     if echo "$before" | grep -q "group(s)"; then
         pass "TC-129: compactor dry-run reports groups of small files to compact (no files modified)"
     else
         fail "TC-129: compactor --dry-run found nothing to compact: $before"; return
     fi
 
-    if "$COMPACTOR" --config $TMPD/archiver.yaml --table events >$TMPD/compact.log 2>&1; then
+    if compactor --table events >$TMPD/compact.log 2>&1; then
         pass "TC-130: actual compaction merged small files (bakery-serialized, no 409)"
     else
         fail "TC-130: compaction failed — see $TMPD/compact.log"; tail -8 $TMPD/compact.log; return
     fi
 
-    local after; after=$("$COMPACTOR" --config $TMPD/archiver.yaml --table events --dry-run 2>&1)
+    local after; after=$(compactor --table events --dry-run 2>&1)
     if echo "$after" | grep -q "nothing to compact"; then
         pass "TC-128: no-op after compaction — all files now meet the target size"
     else
@@ -1693,7 +1761,7 @@ story_maintenance() {
     require_compactor || return
     local rows_before; rows_before=$(q "$HOST" "SELECT count(*) FROM events;")
 
-    local snaps; snaps=$("$COMPACTOR" --config $TMPD/archiver.yaml --table events --expire-snapshots --dry-run 2>&1)
+    local snaps; snaps=$(compactor --table events --expire-snapshots --dry-run 2>&1)
     local nsnap; nsnap=$(echo "$snaps" | grep -oE '[0-9]+ snapshot' | head -1 | grep -oE '[0-9]+')
     if [ "${nsnap:-0}" -gt 1 ]; then
         pass "TC-131: snapshot expiry sees >1 snapshot to expire (compaction + cold writes left $nsnap)"
@@ -1701,25 +1769,33 @@ story_maintenance() {
         fail "TC-131: expire --dry-run shows nothing to expire: $snaps"; return
     fi
 
+    # TC-220: the dry run stages the same expiry the real run commits and counts the
+    # result. With the default age (168 h) every snapshot here is minutes old, so it
+    # expires nothing and keeps them all.
+    assert_contains "TC-220: a default dry run expires nothing and keeps every snapshot" \
+        "would expire 0 and keep $nsnap" "$snaps"
+
     # TC-132: expire metadata only (--expire-keep-files), leaving freed files as orphans for --orphans.
     # --expire-older-than 0s: age-driven expiry, so expire all but the current snapshot now.
-    if "$COMPACTOR" --config $TMPD/archiver.yaml --table events \
+    if compactor --table events \
          --expire-snapshots --expire-older-than 0s --expire-retain-last 1 --expire-keep-files >$TMPD/expire.log 2>&1; then
         pass "TC-132: expire-keep-files expired snapshot metadata but left physical files intact"
     else
         fail "TC-132: expire failed — see $TMPD/expire.log"; tail -8 $TMPD/expire.log; return
     fi
 
-    local after; after=$("$COMPACTOR" --config $TMPD/archiver.yaml --table events --expire-snapshots --dry-run 2>&1)
+    local after; after=$(compactor --table events --expire-snapshots --dry-run 2>&1)
     local nafter; nafter=$(echo "$after" | grep -oE '[0-9]+ snapshot' | head -1 | grep -oE '[0-9]+')
     if [ "${nafter:-0}" -eq 1 ]; then
         pass "TC-131: snapshot expiry removed old snapshots down to the retain-last target"
     else
         fail "TC-131: snapshot count not at retain target after expire: $after"
     fi
+    assert_eq "TC-220: the real run reports the snapshots it kept" "$nafter" \
+        "$(grep -oE 'kept [0-9]+' $TMPD/expire.log | grep -oE '[0-9]+')"
 
     # The files those expired snapshots alone pinned are now orphans (referenced by nothing).
-    local orph; orph=$("$COMPACTOR" --config $TMPD/archiver.yaml --table events --orphans --orphan-age 0s --dry-run 2>&1)
+    local orph; orph=$(compactor --table events --orphans --orphan-age 0s --dry-run 2>&1)
     local norph; norph=$(echo "$orph" | grep -oE '[0-9]+ orphan' | head -1 | grep -oE '[0-9]+')
     if [ "${norph:-0}" -gt 0 ]; then
         pass "TC-133: orphan deletion dry-run reports $norph candidate files (real backend, no prefix-mismatch)"
@@ -1727,13 +1803,13 @@ story_maintenance() {
         fail "TC-133: no orphans detected after expire-keep-files: $orph"; return
     fi
 
-    if "$COMPACTOR" --config $TMPD/archiver.yaml --table events --orphans --orphan-age 0s >$TMPD/orphans.log 2>&1; then
+    if compactor --table events --orphans --orphan-age 0s >$TMPD/orphans.log 2>&1; then
         pass "TC-133: orphan files deleted (bakery-serialized)"
     else
         fail "TC-133: orphan deletion failed — see $TMPD/orphans.log"; tail -8 $TMPD/orphans.log; return
     fi
 
-    local orph2; orph2=$("$COMPACTOR" --config $TMPD/archiver.yaml --table events --orphans --orphan-age 0s --dry-run 2>&1)
+    local orph2; orph2=$(compactor --table events --orphans --orphan-age 0s --dry-run 2>&1)
     local norph2; norph2=$(echo "$orph2" | grep -oE '[0-9]+ orphan' | head -1 | grep -oE '[0-9]+')
     if [ "${norph2:-1}" -eq 0 ]; then
         pass "TC-133: no orphans remain after deletion"
@@ -1787,7 +1863,7 @@ SQL
         sleep 0.25
     done
     q "$HOST" "INSERT INTO cf_exp VALUES (2);" >/dev/null
-    "$COMPACTOR" --config $TMPD/archiver.yaml --table cf_exp --expire-snapshots --expire-older-than 0s \
+    compactor --table cf_exp --expire-snapshots --expire-older-than 0s \
         --expire-retain-last 1 --expire-keep-files >"$TMPD/cf.182x" 2>&1
     q "$HOST" "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = 'cf_tc182_gate';" >/dev/null
     wait "$a" "$g" 2>/dev/null
@@ -1852,7 +1928,7 @@ SQL
         [ "$(q "$HOST" "SELECT count(*) FROM pg_stat_activity WHERE application_name = 'cf_${tc}_writer' AND wait_event = 'PgSleep';")" = 1 ] && break
         sleep 0.25
     done
-    "$COMPACTOR" --config $TMPD/archiver.yaml --table "$t" "$@" >"$TMPD/cf.$tc" 2>&1 &
+    compactor --table "$t" "$@" >"$TMPD/cf.$tc" 2>&1 &
     c=$!
     for i in $(seq 1 24); do
         if [ "$(q "$HOST" "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%coldfront._claim_iceberg_external%' AND pid <> pg_backend_pid();")" = 1 ]; then
@@ -1871,13 +1947,12 @@ SQL
 }
 
 # ───────────────────────────────────────────────────────────────────────────
-# Story 6c — Cold + dual-tier DML issued from INSIDE plpgsql (a DO block). This
-# is the end-to-end test of BOTH fixes: plpgsql variable refs become $N bound
-# params (Cause 1, kept live via format()), and the rewrite must be a DML-tagged
-# statement plpgsql accepts rather than a bare SELECT (Cause 2, the
-# coldfront._dummy_dml_target carrier — only used here, in the in-plpgsql case).
-# RED before the fix (DuckDB param error, then "query has no destination"),
-# GREEN after, on every backend+topology. Cold = m4 (< the start-of-now-1mo cutoff).
+# Story 6c — Cold + dual-tier DML issued from INSIDE plpgsql (a DO block), the
+# end-to-end test of both plpgsql behaviours: plpgsql variable refs become $N
+# bound params (Cause 1, kept live via format()), and the rewrite is a
+# DML-tagged statement plpgsql accepts rather than a bare SELECT (Cause 2, the
+# coldfront._dummy_dml_target carrier, used in the in-plpgsql case alone). Runs
+# on every backend and topology. Cold = m4 (< the start-of-now-1mo cutoff).
 # ───────────────────────────────────────────────────────────────────────────
 story_writes_plpgsql() {
     step "6c. Cold + dual-tier DML from inside plpgsql (DO block, bound params)"
@@ -1904,9 +1979,8 @@ BEGIN UPDATE events SET status = v_new WHERE status = 'pp_dual'; END $$;
 SELECT 'PP_DUAL_HOT:'   || count(*) FROM _events WHERE status='pp_dual_done';
 SELECT 'PP_DUAL_TOTAL:' || count(*) FROM events  WHERE status='pp_dual_done';
 -- cold INSERT from plpgsql: events.id is GENERATED ALWAYS AS IDENTITY, so the
--- INSERT must omit it → the slow tiered-INSERT loop (coldfront._tiered_insert_cold,
--- whose source SQL runs in a PG cursor). The jsonb var exercises the native-PG
--- arg rendering (not the DuckDB from_hex/::text used on the raw_query paths).
+-- INSERT omits it and the cold sink takes nextval() for it. The jsonb var is a
+-- bound parameter of the source, which PostgreSQL binds natively.
 DO $$
 DECLARE v_st text := 'pp_ins'; v_data jsonb := '{"k":9}';
 BEGIN INSERT INTO events (ts, status, data) VALUES (date_trunc('month',now()) - interval '4 months' + interval '24 days' + interval '6 hours', v_st, v_data); END $$;
@@ -1957,6 +2031,21 @@ EOSQL
     assert_eq "concurrent mixed write updated the hot tier (4 m1 rows)"  "4" "$(q "$HOST" "SELECT count(*) FROM _events WHERE status='mixdone';")"
 }
 
+# assert_peers_agree <label> <sql>: on a mesh, every peer returns what HOST
+# returns for <sql>, read after a 3 s wait for Spock to apply HOST's last change.
+assert_peers_agree() {
+    [ "$MESH" = 1 ] || return 0
+    local PARR pc want; read -ra PARR <<< "$PEERS"
+    want=$(q "$HOST" "$2"); sleep 3
+    for pc in "${PARR[@]}"; do assert_eq "$1 on $pc" "$want" "$(q "$pc" "$2")"; done
+}
+
+# peer_exceptions: each peer's spock.exception_log row count, space-separated.
+peer_exceptions() {
+    local PARR pc; read -ra PARR <<< "$PEERS"
+    for pc in "${PARR[@]}"; do printf '%s ' "$(q "$pc" "SELECT count(*) FROM spock.exception_log;")"; done
+}
+
 # ───────────────────────────────────────────────────────────────────────────
 # Story 7 — Schema DDL. Column-shape changes (ADD/DROP/ALTER-TYPE/RENAME COLUMN)
 # are MIRRORED onto the Iceberg cold tier and the transparent view is rebuilt;
@@ -1964,40 +2053,58 @@ EOSQL
 # the PG side. Exercised on a scratch column so the table shape is restored for
 # later stories. Each cross-tier read after a change only succeeds if the Iceberg
 # schema actually followed it (else the rebuilt cold branch fails to resolve).
+# On a mesh, each change reaches every peer's hot table, view and registry and
+# leaves replication running (TC-198).
 # ───────────────────────────────────────────────────────────────────────────
 story_ddl() {
     step "7. Schema DDL mirrored to Iceberg (ADD/DROP/ALTER TYPE/RENAME COLUMN); rename table/view"
     local cutoff="date_trunc('month',now()) - interval '2 months'"   # m2 boundary
+    local cols="SELECT coalesce(string_agg(table_name || '.' || column_name || ':' || data_type, ',' ORDER BY table_name), '') FROM information_schema.columns WHERE table_schema='public' AND table_name IN ('_events','events') AND column_name IN ('cnt','ctr');"
+    local exc=""; [ "$MESH" = 1 ] && exc=$(peer_exceptions)
 
     # ADD COLUMN → mirrored; the cold UNION branch now projects it.
     q "$HOST" "ALTER TABLE _events ADD COLUMN cnt integer;" >/dev/null
     assert_gt "cold tier readable after ADD COLUMN (mirrored to Iceberg)" "0" "$(q "$HOST" "SELECT count(*) FROM events WHERE ts < $cutoff;")"
     assert_eq "view exposes the added column" "cnt" "$(q "$HOST" "SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='events' AND column_name='cnt';")"
     assert_eq "added column is NULL on historical cold rows" "" "$(q "$HOST" "SELECT cnt FROM events WHERE ts < $cutoff ORDER BY ts LIMIT 1;")"
+    assert_peers_agree "TC-198: ADD COLUMN reached the hot table and view" "$cols"
+    q "$HOST" "INSERT INTO _events (ts,status,data,cnt) VALUES (date_trunc('month',now()) - interval '1 month' + interval '11 days','ddl_peer','{}',7);" >/dev/null
+    assert_peers_agree "TC-198: a hot row written after the ADD COLUMN arrived" "SELECT cnt FROM events WHERE status='ddl_peer';"
+    q "$HOST" "DELETE FROM _events WHERE status='ddl_peer';" >/dev/null
 
     # ALTER COLUMN TYPE → mirrored safe promotion (INTEGER -> BIGINT).
     q "$HOST" "ALTER TABLE _events ALTER COLUMN cnt TYPE bigint;" >/dev/null
     assert_gt "cold tier readable after ALTER COLUMN TYPE" "0" "$(q "$HOST" "SELECT count(*) FROM events WHERE ts < $cutoff;")"
+    assert_peers_agree "TC-198: ALTER COLUMN TYPE reached the hot table and view" "$cols"
 
     # RENAME COLUMN → Iceberg column renamed too, or the rebuilt cold branch
     # (r['ctr']) could not resolve against the old Iceberg name.
     q "$HOST" "ALTER TABLE _events RENAME COLUMN cnt TO ctr;" >/dev/null
     assert_gt "cold tier readable after RENAME COLUMN (Iceberg col renamed)" "0" "$(q "$HOST" "SELECT count(*) FROM events WHERE ts < $cutoff;")"
     assert_eq "renamed column visible on the view" "ctr" "$(q "$HOST" "SELECT column_name FROM information_schema.columns WHERE table_schema='public' AND table_name='events' AND column_name='ctr';")"
+    assert_peers_agree "TC-198: RENAME COLUMN reached the hot table and view" "$cols"
 
     # DROP COLUMN → mirrored; restores the original shape for later stories.
     q "$HOST" "ALTER TABLE _events DROP COLUMN ctr;" >/dev/null
     assert_eq "scratch column dropped from the view" "0" "$(q "$HOST" "SELECT count(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='events' AND column_name IN ('cnt','ctr');")"
     assert_gt "cold tier readable after DROP COLUMN" "0" "$(q "$HOST" "SELECT count(*) FROM events WHERE ts < $cutoff;")"
+    assert_peers_agree "TC-198: DROP COLUMN reached the hot table and view" "$cols"
+    [ "$MESH" = 1 ] && assert_eq "TC-198: no peer logged an apply exception for the column DDL" "$exc" "$(peer_exceptions)"
 
     # Data-type correspondence is enforced: an unsupported type is rejected up front.
     assert_err "ADD COLUMN inet rejected (no Iceberg mapping)" "no Iceberg-compatible mapping" "$(q_may "$HOST" "ALTER TABLE _events ADD COLUMN ip inet;")"
 
     # RENAME VIEW is supported and must migrate the watermark so the cold branch survives.
+    local reg="SELECT concat_ws('/', (SELECT string_agg(relname, ',' ORDER BY relname) FROM pg_class WHERE relkind='v' AND relnamespace='public'::regnamespace AND relname IN ('events','events_v2')), (SELECT string_agg(relname, ',' ORDER BY relname) FROM coldfront.tiered_views WHERE schema_name='public' AND relname IN ('events','events_v2')), (SELECT string_agg(table_name, ',' ORDER BY table_name) FROM coldfront.archive_watermark WHERE schema_name='public' AND table_name IN ('events','events_v2')));"
+    [ "$MESH" = 1 ] && exc=$(peer_exceptions)
     q "$HOST" "ALTER VIEW events RENAME TO events_v2;" >/dev/null
     assert_gt "cold tier survives view rename" "0" "$(q "$HOST" "SELECT count(*) FROM events_v2 WHERE ts < $cutoff;")"
+    assert_peers_agree "TC-198: the view rename reached every peer's view and registry" "$reg"
+    assert_peers_agree "TC-198: a cold read through the renamed view agrees on every peer" "SELECT count(*) FROM events_v2 WHERE ts < $cutoff;"
     q "$HOST" "ALTER VIEW events_v2 RENAME TO events;" >/dev/null
     pass "view renamed back to events"
+    assert_peers_agree "TC-198: the rename back reached every peer's view and registry" "$reg"
+    [ "$MESH" = 1 ] && assert_eq "TC-198: no peer logged an apply exception for the view renames" "$exc" "$(peer_exceptions)"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -2110,19 +2217,13 @@ EOSQL
     # now + 14 days) so the m1 partition — the last hot one — is expired by this
     # cycle, deterministically.
     local ret_race=$(( ( $(date -u +%s) - $(date -u -d "$(date -u +%Y-%m-01) +14 days" +%s) ) / 86400 ))
-    cat > $TMPD/race.yaml <<EOF
-postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
-iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog" }
-$(storage_yaml)
-archiver: { tables: [ { source_table: events, partition_period: monthly, hot_period: "${ret_race} days" } ] }
-EOF
     # Widen events' hot window for this run so m1 expires now; restore it after
     # the run (one shared partition_config row) so later stories keep events' config.
     local prev_hot; prev_hot=$(q "$HOST" "SELECT hot_period::text FROM coldfront.partition_config WHERE schema_name='public' AND table_name='events';")
-    if ! "$ARCHIVER" set --config $TMPD/race.yaml --table events --hot-period "${ret_race} days" >$TMPD/race.log 2>&1; then
+    if ! "$ARCHIVER" set --table events --hot-period "${ret_race} days" >$TMPD/race.log 2>&1; then
         fail "set race hot-period on events — see $TMPD/race.log"; tail -5 $TMPD/race.log; return
     fi
-    "$ARCHIVER" --config $TMPD/race.yaml --debug-export-delay 4s >>$TMPD/race.log 2>&1 &
+    "$ARCHIVER" --debug-export-delay 4s >>$TMPD/race.log 2>&1 &
     local apid=$!
     local i
     for i in $(seq 1 30); do
@@ -2140,7 +2241,7 @@ EOSQL
     else fail "archiver errored during race window"; tail -5 $TMPD/race.log; fi
     # Restore events' hot_period (shared partition_config row) so later stories see
     # its original config; a failed restore would corrupt them, so fail loud.
-    "$ARCHIVER" set --config $TMPD/race.yaml --table events --hot-period "$prev_hot" >/dev/null 2>&1 \
+    "$ARCHIVER" set --table events --hot-period "$prev_hot" >/dev/null 2>&1 \
         || fail "restore events hot_period after race window"
     assert_eq "race UPDATEs survived (3 retagged in cold)" "3" "$(q "$HOST" "SELECT count(*) FROM events WHERE status='during_archive';")"
     assert_eq "race INSERT survived (1 new in cold)"       "1" "$(q "$HOST" "SELECT count(*) FROM events WHERE status='during_archive_insert';")"
@@ -2152,7 +2253,7 @@ EOSQL
 # Story 9b — Concurrency / no-409 (tiered): parallel COLD writers to one table
 # all land. By this point every partition is archived (cutoff past the start of
 # the current month), so below-cutoff INSERTs route through the cold path
-# (_tiered_insert_cold) and the same advisory-lock bakery serializes them.
+# (the cold sink) and the same advisory-lock bakery serializes them.
 # Parity with the decoupled
 # probe — the standing multi-writer no-409 rule applies to both modes.
 # ───────────────────────────────────────────────────────────────────────────
@@ -2185,11 +2286,631 @@ SELECT 'RB_TOTAL:' || count(*) FROM events WHERE status='rollback_me';
 EOSQL
 )
     assert_eq "rollback undoes hot+cold" "0" "$(extract RB_TOTAL "$O")"
-    if "$ARCHIVER" --config $TMPD/archiver.yaml >$TMPD/idem.log 2>&1; then
+    failed_block_ends events "INSERT INTO events (ts, status, data) VALUES (date_trunc('month',now()) - interval '1 month' + interval '9 days', 'fb_blk', '{}'), (date_trunc('month',now()) - interval '4 months' + interval '15 days', 'fb_blk', '{}')" fb_blk
+    if "$ARCHIVER" >$TMPD/idem.log 2>&1; then
         assert_contains "archiver idempotent (re-run no-op)" "nothing to tier or expire" "$(cat $TMPD/idem.log)"
     else
         fail "archiver idempotent re-run errored"
     fi
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# TC-202: a tiered INSERT ... SELECT reads its source once. The rewrite holds
+# the source in one CTE inside the statement and splits that result, so a
+# volatile source lands exactly once, rows the transaction wrote before the
+# INSERT reach the cold tier, an untyped literal keeps the target column's
+# type, OVERRIDING SYSTEM VALUE works, an omitted identity or default column is
+# filled on cold rows, cold rows flush per cold_write_batch_size, ROLLBACK
+# undoes both tiers and RETURNING is still refused when rows go cold. tc202 has
+# a BY DEFAULT identity and defaults; events supplies the GENERATED ALWAYS
+# identity and the jsonb column.
+# ───────────────────────────────────────────────────────────────────────────
+story_insert_single_pass() {
+    step "TC-202: a tiered INSERT ... SELECT reads its source once"
+    qf "$HOST" <<'EOSQL' >/dev/null 2>&1
+CREATE TABLE public.tc202 (id bigint GENERATED BY DEFAULT AS IDENTITY, ts timestamptz NOT NULL,
+    status text NOT NULL DEFAULT 'new', n int DEFAULT 7, b bytea, PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);
+DO $do$ DECLARE m date; BEGIN FOR i IN -4..1 LOOP
+  m := (date_trunc('month', now()) + make_interval(months => i))::date;
+  EXECUTE format('CREATE TABLE public.%I PARTITION OF public.tc202 FOR VALUES FROM (%L) TO (%L)',
+                 'tc202_p_' || to_char(m, 'YYYY_MM'), m, m + interval '1 month');
+END LOOP; END $do$;
+INSERT INTO public.tc202 (ts) SELECT date_trunc('month', now()) - interval '3 months' + i * interval '1 day' FROM generate_series(1, 5) i;
+INSERT INTO public.tc202 (ts) SELECT date_trunc('month', now()) - interval '1 month' + i * interval '1 day' FROM generate_series(1, 5) i;
+CREATE TABLE public.tc202_src (id bigint, ts timestamptz, status text);
+CREATE TABLE public.tc202_ticks (t int);
+CREATE FUNCTION public.tc202_tick() RETURNS int LANGUAGE plpgsql VOLATILE AS $f$
+BEGIN INSERT INTO public.tc202_ticks VALUES (1); RETURN 1; END $f$;
+EOSQL
+    if ! "$ARCHIVER" register --table tc202 --column ts --period monthly \
+            --hot-period "$(hot_days) days" >$TMPD/tc202.log 2>&1 \
+       || ! archive_only "schema_name='public' AND table_name='tc202'" $TMPD/tc202.log; then
+        fail "TC-202: register and archive tc202 (see $TMPD/tc202.log)"; tail -5 $TMPD/tc202.log; return
+    fi
+    local cut; cut=$(q "$HOST" "SELECT cutoff_time FROM coldfront.archive_watermark WHERE table_name = 'tc202';")
+    assert_eq "TC-202: tc202 is tiered with a watermark" "v|1" \
+        "$(q "$HOST" "SELECT relkind::text || '|' || (SELECT count(*) FROM coldfront.archive_watermark WHERE table_name = 'tc202') FROM pg_class WHERE relname = 'tc202' AND relnamespace = 'public'::regnamespace;")"
+    local cold="'$cut'::timestamptz - interval '10 days'" hot="'$cut'::timestamptz + interval '10 days'"
+    q "$HOST" "INSERT INTO public.tc202_src VALUES (1, $cold, 'src'), (2, $hot, 'src');" >/dev/null 2>&1
+
+    # The source runs once: a volatile function in its select list fires once per row.
+    q "$HOST" "INSERT INTO tc202 (ts, status) SELECT $cold + (public.tc202_tick() - 1) * interval '1 second', 'tick' FROM generate_series(1, 100);" >/dev/null 2>&1
+    assert_eq "TC-202: the source ran once (100 rows, 100 calls)" "100|100" \
+        "$(q "$HOST" "SELECT (SELECT count(*) FROM public.tc202_ticks) || '|' || (SELECT count(*) FROM tc202 WHERE status = 'tick');" | tail -1)"
+    # A source that differs between evaluations lands every row exactly once.
+    local rep; rep=$(q "$HOST" "INSERT INTO tc202 (ts, status) SELECT '$cut'::timestamptz + (random() * 20 - 10) * interval '1 day', 'rnd' FROM generate_series(1, 1000);" 2>/dev/null)
+    assert_eq "TC-202: a random source landed exactly once" "1000" "$(q "$HOST" "SELECT count(*) FROM tc202 WHERE status = 'rnd';" | tail -1)"
+    assert_eq "TC-202: the statement reported 1000 rows (hot + cold)" "1000" "$(( ${rep%%|*} + ${rep##*|} ))"
+    # Rows the transaction wrote before the INSERT reach the cold tier, with the identity supplied.
+    qf "$HOST" <<EOSQL >/dev/null 2>&1
+BEGIN;
+INSERT INTO public.tc202_src VALUES (3, $cold, 'txn'), (4, $hot, 'txn');
+INSERT INTO tc202 (id, ts, status) SELECT 900000 + id, ts, status FROM public.tc202_src WHERE status = 'txn';
+COMMIT;
+EOSQL
+    assert_eq "TC-202: rows written earlier in the transaction landed on both tiers" "2|1" \
+        "$(q "$HOST" "SELECT count(*) || '|' || count(*) FILTER (WHERE ts < '$cut') FROM tc202 WHERE status = 'txn';" | tail -1)"
+    # An untyped literal keeps the target column's type (jsonb on events).
+    q "$HOST" "INSERT INTO events (ts, status, data) SELECT ts, 'tc202_lit', '{}' FROM public.tc202_src WHERE status = 'src';" >/dev/null 2>&1
+    assert_eq "TC-202: an untyped literal landed on both tiers" "2" \
+        "$(q "$HOST" "SELECT count(*) FROM events WHERE status = 'tc202_lit' AND data = '{}';" | tail -1)"
+    # OVERRIDING SYSTEM VALUE supplies a GENERATED ALWAYS identity.
+    q "$HOST" "INSERT INTO events (id, ts, status, data) OVERRIDING SYSTEM VALUE SELECT 9000000 + id, ts, 'tc202_ovr', '{}'::jsonb FROM public.tc202_src WHERE status = 'src';" >/dev/null 2>&1
+    assert_eq "TC-202: OVERRIDING SYSTEM VALUE landed both rows with the supplied ids" "2" \
+        "$(q "$HOST" "SELECT count(*) FROM events WHERE status = 'tc202_ovr' AND id IN (9000001, 9000002);" | tail -1)"
+    # An omitted identity and omitted default columns are filled on cold rows.
+    q "$HOST" "INSERT INTO tc202 (ts) SELECT $cold - interval '30 days' + i * interval '1 hour' FROM generate_series(1, 3) i;" >/dev/null 2>&1
+    assert_eq "TC-202: cold rows got distinct ids and the column defaults" "3|3|3" \
+        "$(q "$HOST" "SELECT count(*) || '|' || count(DISTINCT id) || '|' || count(*) FILTER (WHERE status = 'new' AND n = 7) FROM tc202 WHERE ts BETWEEN $cold - interval '30 days' + interval '1 hour' AND $cold - interval '30 days' + interval '3 hours';" | tail -1)"
+    # Cold rows flush per cold_write_batch_size: exactly one batch, and one more than a batch.
+    q "$HOST" "SET coldfront.cold_write_batch_size = 5; INSERT INTO tc202 (ts, status) SELECT $cold, 'b5' FROM generate_series(1, 5); INSERT INTO tc202 (ts, status) SELECT $cold, 'b6' FROM generate_series(1, 6);" >/dev/null 2>&1
+    assert_eq "TC-202: a batch-sized and a batch-plus-one cold write both landed in full" "5|6" \
+        "$(q "$HOST" "SELECT count(*) FILTER (WHERE status = 'b5') || '|' || count(*) FILTER (WHERE status = 'b6') FROM tc202;" | tail -1)"
+    # The plpgsql statement shape reads the source once too.
+    q "$HOST" "TRUNCATE public.tc202_ticks; DO \$d\$ BEGIN INSERT INTO tc202 (ts, status) SELECT $cold + (public.tc202_tick() - 1) * interval '1 second', 'pl' FROM generate_series(1, 50); END \$d\$;" >/dev/null 2>&1
+    assert_eq "TC-202: inside plpgsql the source ran once (50 rows, 50 calls)" "50|50" \
+        "$(q "$HOST" "SELECT (SELECT count(*) FROM public.tc202_ticks) || '|' || (SELECT count(*) FROM tc202 WHERE status = 'pl');" | tail -1)"
+    # A prepared statement runs its cached plan in later transactions, which the
+    # hook never saw, and bytea reaches the sink whatever bytea_output is. The
+    # cold bytes are compared with a hot row's, since the read runs in DuckDB.
+    qf "$HOST" <<EOSQL >/dev/null 2>&1
+SET bytea_output = 'escape';
+INSERT INTO tc202 (ts, status, b) VALUES ($hot, 'prep_ref', '\\xcafe');
+PREPARE tc202_ins (timestamptz, bytea) AS INSERT INTO tc202 (ts, status, b) VALUES (\$1, 'prep', \$2);
+EXECUTE tc202_ins ($cold, '\\xcafe');
+EXECUTE tc202_ins ($cold, '\\xbeef');
+EOSQL
+    assert_eq "TC-202: a prepared cold INSERT ran twice from its cached plan with bytea intact" "2|2|1" \
+        "$(q "$HOST" "SELECT count(*) || '|' || count(*) FILTER (WHERE octet_length(b) = 2) || '|' || count(*) FILTER (WHERE b = (SELECT b FROM tc202 WHERE status = 'prep_ref')) FROM tc202 WHERE status = 'prep';" | tail -1)"
+    # ROLLBACK undoes both tiers; RETURNING is refused when rows go cold.
+    qf "$HOST" <<EOSQL >/dev/null 2>&1
+BEGIN;
+INSERT INTO tc202 (ts, status) SELECT ts, 'rb' FROM public.tc202_src WHERE status = 'src';
+ROLLBACK;
+EOSQL
+    assert_eq "TC-202: ROLLBACK undid the INSERT on both tiers" "0" "$(q "$HOST" "SELECT count(*) FROM tc202 WHERE status = 'rb';" | tail -1)"
+    assert_err "TC-202: RETURNING is refused when rows go cold" "cold tier" \
+        "$(q_may "$HOST" "INSERT INTO tc202 (ts, status) SELECT ts, 'ret' FROM public.tc202_src WHERE status = 'src' RETURNING id;")"
+    q "$HOST" "DELETE FROM events WHERE status IN ('tc202_lit', 'tc202_ovr');" >/dev/null 2>&1
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name = 'tc202'; DELETE FROM coldfront.tiered_views WHERE relname = 'tc202'; DELETE FROM coldfront.archive_watermark WHERE table_name = 'tc202';" >/dev/null 2>&1
+    q "$HOST" "DROP VIEW IF EXISTS public.tc202; DROP TABLE IF EXISTS public._tc202 CASCADE; DROP TABLE IF EXISTS public.tc202_src, public.tc202_ticks; DROP FUNCTION IF EXISTS public.tc202_tick();" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# TC-203: a tiered view has no INSTEAD OF INSERT trigger. The hook is the one
+# write path, and the extension has no builder for a trigger.
+# ───────────────────────────────────────────────────────────────────────────
+story_view_without_trigger() {
+    step "TC-203: a tiered view has no INSTEAD OF INSERT trigger"
+    assert_eq "TC-203: no trigger on the tiered view" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM pg_trigger WHERE tgrelid = 'public.events'::regclass AND NOT tgisinternal;")"
+    assert_eq "TC-203: the extension has no trigger builder" "t" \
+        "$(q "$HOST" "SELECT to_regproc('coldfront._rebuild_write_trigger') IS NULL;")"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# TC-204: coldfront refuses to load outside shared_preload_libraries. A scratch
+# server from the same binaries that preloads only pg_duckdb cannot create the
+# extension, so a node that skips the setting fails at CREATE EXTENSION instead
+# of running without the hooks.
+# ───────────────────────────────────────────────────────────────────────────
+story_preload_required() {
+    step "TC-204: CREATE EXTENSION coldfront fails on a server that does not preload it"
+    local d=/tmp/cf_nopreload O
+    if ! docker exec "$HOST" bash -c "rm -rf $d $d.log && initdb -D $d --auth=trust -U $CF_DBUSER -E UTF8 --locale=C >/dev/null 2>&1 && pg_ctl -D $d -l $d.log -w -o \"-p 5433 -c listen_addresses='' -c unix_socket_directories=/tmp -c logging_collector=off -c shared_preload_libraries=pg_duckdb\" start >/dev/null 2>&1"; then
+        fail "TC-204: the scratch server did not start"; docker exec "$HOST" bash -c "tail -5 $d.log; rm -rf $d $d.log"; return
+    fi
+    O=$(docker exec "$HOST" psql -h /tmp -p 5433 -U "$CF_DBUSER" -d postgres -tA -c "CREATE EXTENSION pg_duckdb;" -c "CREATE EXTENSION coldfront;" 2>&1 || true)
+    assert_err "TC-204: CREATE EXTENSION coldfront is refused without the preload" "must be loaded via shared_preload_libraries" "$O"
+    assert_eq "TC-204: nothing of the extension was created" "0" \
+        "$(docker exec "$HOST" psql -h /tmp -p 5433 -U "$CF_DBUSER" -d postgres -tA -c "SELECT count(*) FROM pg_extension WHERE extname = 'coldfront';")"
+    docker exec "$HOST" bash -c "pg_ctl -D $d -m immediate stop >/dev/null 2>&1; rm -rf $d $d.log"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# TC-205: COPY into a tiered view goes through the INSERT rewrite. The utility
+# hook reads the rows with PostgreSQL's COPY reader and writes each batch of
+# cold_write_batch_size rows as an INSERT into the view, so the routing, the
+# claim, the identity values and the defaults are the INSERT's.
+# ───────────────────────────────────────────────────────────────────────────
+story_copy_into_view() {
+    step "TC-205: COPY into a tiered view goes through the INSERT rewrite"
+    local cut rows O
+    cut=$(q "$HOST" "SELECT cutoff_time FROM coldfront.archive_watermark WHERE table_name = 'events';")
+    # Hot and cold rows in one CSV from stdin, the identity column omitted.
+    rows=$(q "$HOST" "SELECT string_agg(('$cut'::timestamptz + i * interval '1 day')::text || ',' || CASE WHEN i < 0 THEN 'tc205_cold' ELSE 'tc205_hot' END || ',{}', E'\n' ORDER BY i) FROM generate_series(-3, 2) i WHERE i <> 0;")
+    O=$(docker exec -i -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" "$HOST" "$CF_PSQL" -A 2>&1 <<EOSQL
+COPY events (ts, status, data) FROM stdin WITH (FORMAT csv);
+$rows
+\\.
+EOSQL
+)
+    assert_contains "TC-205: the command tag counts every row" "COPY 5" "$O"
+    assert_eq "TC-205: the two hot rows landed in the hot table" "2" \
+        "$(q "$HOST" "SELECT count(*) FROM public._events WHERE status = 'tc205_hot';")"
+    assert_eq "TC-205: the three cold rows landed cold, each with its own identity value" "3|3" \
+        "$(q "$HOST" "SELECT count(*) || '|' || count(DISTINCT id) FROM events WHERE status = 'tc205_cold' AND ts < '$cut';" | tail -1)"
+    # More cold rows than one batch holds: every row lands once.
+    rows=$(q "$HOST" "SELECT string_agg(('$cut'::timestamptz - i * interval '1 hour')::text || ',tc205_batch,{}', E'\n' ORDER BY i) FROM generate_series(1, 12) i;")
+    O=$(docker exec -i -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" "$HOST" "$CF_PSQL" -A 2>&1 <<EOSQL
+SET coldfront.cold_write_batch_size = 5;
+COPY events (ts, status, data) FROM stdin WITH (FORMAT csv);
+$rows
+\\.
+EOSQL
+)
+    assert_contains "TC-205: the command tag counts the rows of every batch" "COPY 12" "$O"
+    assert_eq "TC-205: twelve cold rows over three batches landed once each" "12|12" \
+        "$(q "$HOST" "SELECT count(*) || '|' || count(DISTINCT id) FROM events WHERE status = 'tc205_batch';" | tail -1)"
+    # A file on the server lands on both tiers, and ROLLBACK undoes a COPY on both.
+    rows=$(q "$HOST" "SELECT string_agg(('$cut'::timestamptz + i * interval '2 days')::text || ',tc205_file,{}', E'\n' ORDER BY i) FROM (VALUES (-1), (1)) AS v(i);")
+    docker exec -i "$HOST" bash -c "cat > /tmp/tc205.csv" <<< "$rows"
+    q "$HOST" "COPY events (ts, status, data) FROM '/tmp/tc205.csv' WITH (FORMAT csv);" >/dev/null 2>&1
+    assert_eq "TC-205: a server-side file landed on both tiers" "1|1" \
+        "$(q "$HOST" "SELECT (SELECT count(*) FROM public._events WHERE status = 'tc205_file') || '|' || (SELECT count(*) FROM events WHERE status = 'tc205_file' AND ts < '$cut');" | tail -1)"
+    qf "$HOST" <<EOSQL >/dev/null 2>&1
+BEGIN;
+COPY events (ts, status, data) FROM '/tmp/tc205.csv' WITH (FORMAT csv);
+ROLLBACK;
+EOSQL
+    assert_eq "TC-205: ROLLBACK undid the COPY on both tiers" "2" \
+        "$(q "$HOST" "SELECT count(*) FROM events WHERE status = 'tc205_file';" | tail -1)"
+    # An option the rewrite cannot honour is refused, not ignored.
+    assert_err "TC-205: COPY ... WHERE is refused" "not supported" \
+        "$(q_may "$HOST" "COPY events (ts, status, data) FROM '/tmp/tc205.csv' WITH (FORMAT csv) WHERE status = 'x';")"
+    q "$HOST" "DELETE FROM events WHERE status LIKE 'tc205%';" >/dev/null 2>&1
+    docker exec "$HOST" rm -f /tmp/tc205.csv
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# TC-206: an INSERT nested in WITH, and a leading WITH that modifies data, on a
+# tiered INSERT. The hook rewrites the nested INSERT in place and lifts the
+# rewrite's source and cold sink into the outer WITH list; a leading WITH's
+# entries open the rewritten statement, so the write one holds stays at the top
+# level where PostgreSQL requires it.
+# ───────────────────────────────────────────────────────────────────────────
+story_nested_insert() {
+    step "TC-206: an INSERT nested in WITH goes through the INSERT rewrite"
+    local cut O
+    cut=$(q "$HOST" "SELECT cutoff_time FROM coldfront.archive_watermark WHERE table_name = 'events';")
+    O=$(qf "$HOST" <<EOSQL
+WITH i AS (INSERT INTO events (ts, status, data) VALUES ('$cut'::timestamptz - interval '1 day', 'tc206_nested', '{}'), ('$cut'::timestamptz + interval '1 day', 'tc206_nested', '{}'))
+SELECT 'OUTER:' || 1;
+SELECT 'HOT:' || count(*) FROM public._events WHERE status = 'tc206_nested';
+SELECT 'COLD:' || count(*) FROM events WHERE status = 'tc206_nested' AND ts < '$cut';
+EOSQL
+)
+    assert_eq "TC-206: the outer statement ran" "1" "$(extract OUTER "$O")"
+    assert_eq "TC-206: the nested INSERT's hot row landed in the hot table" "1" "$(extract HOT "$O")"
+    assert_eq "TC-206: its cold row landed cold" "1" "$(extract COLD "$O")"
+    # The nested INSERT reads an entry before it, which the outer statement reads too.
+    O=$(qf "$HOST" <<EOSQL
+WITH a AS (SELECT '$cut'::timestamptz - i * interval '1 day' AS ts, 'tc206_cte' AS status, '{}'::jsonb AS data FROM generate_series(1, 3) i),
+     i AS (INSERT INTO events (ts, status, data) SELECT ts, status, data FROM a)
+SELECT 'READ:' || count(*) FROM a;
+SELECT 'CTE:' || count(*) || '|' || count(DISTINCT id) FROM events WHERE status = 'tc206_cte';
+EOSQL
+)
+    assert_eq "TC-206: the outer statement read the entry the nested INSERT read" "3" "$(extract READ "$O")"
+    assert_eq "TC-206: three cold rows landed once each, with distinct ids" "3|3" "$(extract CTE "$O")"
+    # A leading WITH that modifies data: a DELETE's rows move from a staging table to both tiers.
+    O=$(qf "$HOST" <<EOSQL
+CREATE TABLE tc206_staging (ts timestamptz, status text, data jsonb);
+INSERT INTO tc206_staging VALUES ('$cut'::timestamptz - interval '2 days', 'tc206_moved', '{}'), ('$cut'::timestamptz + interval '2 days', 'tc206_moved', '{}');
+WITH moved AS (DELETE FROM tc206_staging RETURNING ts, status, data)
+INSERT INTO events (ts, status, data) SELECT ts, status, data FROM moved;
+SELECT 'LEFT:' || count(*) FROM tc206_staging;
+SELECT 'MOVED:' || (SELECT count(*) FROM public._events WHERE status = 'tc206_moved') || '|' || (SELECT count(*) FROM events WHERE status = 'tc206_moved' AND ts < '$cut');
+DROP TABLE tc206_staging;
+EOSQL
+)
+    assert_eq "TC-206: the DELETE in WITH emptied the staging table" "0" "$(extract LEFT "$O")"
+    assert_eq "TC-206: its rows landed on both tiers" "1|1" "$(extract MOVED "$O")"
+    # A bound parameter inside the nested INSERT binds.
+    O=$(qf "$HOST" <<EOSQL
+PREPARE tc206(text) AS WITH i AS (INSERT INTO events (ts, status, data) VALUES ('$cut'::timestamptz - interval '3 days', \$1, '{}')) SELECT 1;
+EXECUTE tc206('tc206_param');
+SELECT 'PARAM:' || count(*) FROM events WHERE status = 'tc206_param' AND ts < '$cut';
+EOSQL
+)
+    assert_eq "TC-206: a parameter in the nested INSERT landed cold" "1" "$(extract PARAM "$O")"
+    qf "$HOST" <<EOSQL >/dev/null 2>&1
+BEGIN;
+WITH i AS (INSERT INTO events (ts, status, data) VALUES ('$cut'::timestamptz - interval '1 day', 'tc206_rb', '{}'), ('$cut'::timestamptz + interval '1 day', 'tc206_rb', '{}')) SELECT 1;
+ROLLBACK;
+EOSQL
+    assert_eq "TC-206: ROLLBACK undid the nested INSERT on both tiers" "0" "$(q "$HOST" "SELECT count(*) FROM events WHERE status = 'tc206_rb';" | tail -1)"
+    assert_err "TC-206: RETURNING is refused when a row may go cold" "cold tier" \
+        "$(q_may "$HOST" "WITH i AS (INSERT INTO events (ts, status, data) VALUES ('$cut'::timestamptz - interval '1 day', 'tc206_ret', '{}') RETURNING id) SELECT id FROM i;")"
+    q "$HOST" "DELETE FROM events WHERE status LIKE 'tc206%';" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# TC-207: an UPDATE or DELETE nested in WITH takes the path of a top-level one.
+# A hot one is a plain swap that keeps RETURNING; a cold one is the anchor
+# UPDATE that runs the DuckDB write; a dual one lifts its cold half into the
+# outer WITH list. What runs in DuckDB cannot read another WITH entry.
+# ───────────────────────────────────────────────────────────────────────────
+story_nested_update_delete() {
+    step "TC-207: an UPDATE or DELETE nested in WITH goes through the rewrite"
+    local cut O
+    cut=$(q "$HOST" "SELECT cutoff_time FROM coldfront.archive_watermark WHERE table_name = 'events';")
+    # One hot and one cold row per shape.
+    O=$(qf "$HOST" <<EOSQL
+INSERT INTO events (ts, status, data) SELECT '$cut'::timestamptz + i * interval '1 day', s, '{}' FROM (VALUES (1), (-1)) v(i), unnest(ARRAY['tc207_hot', 'tc207_cold', 'tc207_dual', 'tc207_cte', 'tc207_upd']) s;
+CREATE TABLE tc207_archive (id bigint);
+WITH d AS (DELETE FROM events WHERE status = 'tc207_hot' AND ts >= '$cut' RETURNING id)
+INSERT INTO tc207_archive SELECT id FROM d;
+SELECT 'HOTDEL:' || (SELECT count(*) FROM tc207_archive) || '|' || (SELECT count(*) FROM events WHERE status = 'tc207_hot');
+WITH d AS (DELETE FROM events WHERE status = 'tc207_cold' AND ts < '$cut') SELECT 1;
+SELECT 'COLDLEFT:' || count(*) FROM events WHERE status = 'tc207_cold';
+WITH d AS (DELETE FROM events WHERE status = 'tc207_dual') SELECT 1;
+SELECT 'DUALLEFT:' || count(*) FROM events WHERE status = 'tc207_dual';
+WITH u AS (UPDATE events SET status = 'tc207_upd_hot' WHERE status = 'tc207_upd' AND ts >= '$cut' RETURNING id) SELECT 'HOTUPD:' || count(*) FROM u;
+WITH u AS (UPDATE events SET status = 'tc207_upd_cold' WHERE status = 'tc207_upd' AND ts < '$cut') SELECT 1;
+SELECT 'UPD:' || string_agg(status, ',' ORDER BY status) FROM events WHERE status LIKE 'tc207_upd%';
+WITH ids AS (SELECT id FROM public._events WHERE status = 'tc207_cte'),
+     d AS (DELETE FROM events WHERE ts >= '$cut' AND id IN (SELECT id FROM ids) RETURNING id)
+SELECT 'CTEDEL:' || count(*) FROM d;
+DROP TABLE tc207_archive;
+EOSQL
+)
+    assert_eq "TC-207: a hot nested DELETE kept RETURNING and fed the outer INSERT" "1|1" "$(extract HOTDEL "$O")"
+    assert_eq "TC-207: a cold nested DELETE removed the cold row and left the hot one" "1" "$(extract COLDLEFT "$O")"
+    assert_eq "TC-207: a dual nested DELETE removed both tiers' rows" "0" "$(extract DUALLEFT "$O")"
+    assert_eq "TC-207: a hot nested UPDATE kept RETURNING" "1" "$(extract HOTUPD "$O")"
+    assert_eq "TC-207: the hot and the cold nested UPDATE both landed" "tc207_upd_cold,tc207_upd_hot" "$(extract UPD "$O")"
+    assert_eq "TC-207: a hot nested DELETE read an entry before it" "1" "$(extract CTEDEL "$O")"
+    # pg_duckdb runs a statement that reads the view's cold tier in DuckDB, and refuses a data-modifying entry there.
+    assert_err "TC-207: a nested write beside a read of the view is pg_duckdb's refusal" "does not support modifying CTEs" \
+        "$(q_may "$HOST" "WITH ids AS (SELECT id FROM events WHERE status = 'tc207_cte'), d AS (DELETE FROM events WHERE ts >= '$cut' AND id IN (SELECT id FROM ids)) SELECT 1;")"
+    assert_err "TC-207: RETURNING on a cold nested DELETE is refused" "cold tier" \
+        "$(q_may "$HOST" "WITH d AS (DELETE FROM events WHERE status = 'tc207_cte' AND ts < '$cut' RETURNING id) SELECT count(*) FROM d;")"
+    assert_err "TC-207: a cold nested DELETE cannot read another WITH entry" "cannot read another WITH entry" \
+        "$(q_may "$HOST" "WITH ids AS (SELECT id FROM events WHERE status = 'tc207_cte'), d AS (DELETE FROM events WHERE ts < '$cut' AND id IN (SELECT id FROM ids)) SELECT 1;")"
+    assert_err "TC-207: a nested cross-tier move is refused" "not supported" \
+        "$(q_may "$HOST" "WITH u AS (UPDATE events SET ts = ts - interval '400 days' WHERE status = 'tc207_cte' AND ts >= '$cut') SELECT 1;")"
+    assert_err "TC-207: a second write to the view in the statement is refused" "only once" \
+        "$(q_may "$HOST" "WITH d AS (DELETE FROM events WHERE status = 'tc207_cte') INSERT INTO events (ts, status, data) VALUES ('$cut'::timestamptz + interval '1 day', 'tc207_twice', '{}');")"
+    # Inside plpgsql a dual-tier UPDATE's own leading WITH opens the rewritten statement.
+    O=$(qf "$HOST" <<EOSQL
+INSERT INTO events (ts, status, data) SELECT '$cut'::timestamptz + i * interval '1 day', 'tc207_pl', '{}' FROM (VALUES (1), (-1)) v(i);
+DO \$\$ BEGIN WITH v AS (SELECT 'tc207_pl_done' AS s) UPDATE events SET status = (SELECT s FROM v) WHERE status = 'tc207_pl'; END \$\$;
+SELECT 'PLDUAL:' || count(*) FROM events WHERE status = 'tc207_pl_done';
+EOSQL
+)
+    assert_eq "TC-207: a dual UPDATE with a leading WITH inside plpgsql landed on both tiers" "2" "$(extract PLDUAL "$O")"
+    qf "$HOST" <<EOSQL >/dev/null 2>&1
+BEGIN;
+WITH d AS (DELETE FROM events WHERE status = 'tc207_cte' AND ts < '$cut') SELECT 1;
+ROLLBACK;
+EOSQL
+    assert_eq "TC-207: ROLLBACK undid a nested cold DELETE" "1" "$(q "$HOST" "SELECT count(*) FROM events WHERE status = 'tc207_cte' AND ts < '$cut';" | tail -1)"
+    q "$HOST" "DELETE FROM events WHERE status LIKE 'tc207%';" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# TC-208: MERGE INTO a tiered view. The ON condition's bound on the partition
+# column picks the tier: a hot MERGE runs in PostgreSQL against the hot table, a
+# cold one in DuckDB against the Iceberg table, and each tier's INSERT action
+# guards the inserted partition value per row, since the statement sees one
+# tier. A mixed MERGE, one that sets the partition column, and a NOT MATCHED BY
+# SOURCE action without the tier's bound are refused. The view's name is the
+# retargeted statement's alias when the user gave none, since the deparser
+# qualifies columns by it; UPDATE ... FROM and DELETE ... USING share that.
+# ───────────────────────────────────────────────────────────────────────────
+story_merge() {
+    step "TC-208: MERGE INTO a tiered view runs on the tier its ON condition bounds"
+    local cut hot cold pgv O h1 h2 c1 c2 c3 c4 c5
+    cut=$(q "$HOST" "SELECT cutoff_time FROM coldfront.archive_watermark WHERE table_name = 'events';")
+    hot=$(q "$HOST" "SELECT '$cut'::timestamptz + interval '2 days';")
+    cold=$(q "$HOST" "SELECT '$cut'::timestamptz - interval '2 days';")
+    pgv=$(q "$HOST" "SHOW server_version_num;")
+    if [ "$pgv" -lt 170000 ]; then
+        # PostgreSQL 16 allows MERGE on tables alone (transformMergeStmt), so the
+        # statement fails in parse analysis there, before any hook runs.
+        assert_err "TC-208: on PostgreSQL 16 a MERGE into the view is refused by PostgreSQL, ahead of the hook" "cannot execute MERGE on relation" \
+            "$(q_may "$HOST" "MERGE INTO events t USING (VALUES (0)) s(id) ON t.id = s.id AND t.ts >= '$cut' WHEN MATCHED THEN UPDATE SET status = 'tc208';")"
+        return
+    fi
+    # One hot and one cold row per status.
+    q "$HOST" "INSERT INTO events (ts, status, data) SELECT '$cut'::timestamptz + i * interval '1 day', s, '{}' FROM (VALUES (1), (-1)) v(i), unnest(ARRAY['tc208_h1', 'tc208_h2', 'tc208_c1', 'tc208_c2', 'tc208_c3', 'tc208_c4', 'tc208_c5', 'tc208_bs']) s;" >/dev/null 2>&1
+    h1=$(q "$HOST" "SELECT id FROM public._events WHERE status = 'tc208_h1';")
+    h2=$(q "$HOST" "SELECT id FROM public._events WHERE status = 'tc208_h2';")
+    c1=$(q "$HOST" "SELECT id FROM events WHERE status = 'tc208_c1' AND ts < '$cut';" | tail -1)
+    c2=$(q "$HOST" "SELECT id FROM events WHERE status = 'tc208_c2' AND ts < '$cut';" | tail -1)
+    c3=$(q "$HOST" "SELECT id FROM events WHERE status = 'tc208_c3' AND ts < '$cut';" | tail -1)
+    c4=$(q "$HOST" "SELECT id FROM events WHERE status = 'tc208_c4' AND ts < '$cut';" | tail -1)
+    c5=$(q "$HOST" "SELECT id FROM events WHERE status = 'tc208_c5' AND ts < '$cut';" | tail -1)
+    O=$(qf "$HOST" <<EOSQL
+MERGE INTO events t USING (VALUES ($h1, 'upd'), ($h2, 'del'), (0, 'ins')) s(id, op) ON t.id = s.id AND t.ts >= '$cut'
+WHEN MATCHED AND s.op = 'del' THEN DELETE
+WHEN MATCHED THEN UPDATE SET status = 'tc208_hot_upd'
+WHEN NOT MATCHED THEN INSERT (ts, status, data) VALUES ('$hot', 'tc208_hot_ins', '{}');
+SELECT 'HOT:' || string_agg(status, ',' ORDER BY status) FROM events WHERE id IN ($h1, $h2) OR status = 'tc208_hot_ins';
+SELECT 'HOTINS:' || count(*) FROM public._events WHERE status = 'tc208_hot_ins';
+MERGE INTO events USING (VALUES ($c1, 'upd'), (990001, 'ins')) s(id, op) ON events.id = s.id AND events.ts < '$cut'
+WHEN MATCHED THEN UPDATE SET status = 'tc208_cold_upd'
+WHEN NOT MATCHED THEN INSERT (id, ts, status, data) OVERRIDING SYSTEM VALUE VALUES (s.id, '$cold', 'tc208_cold_ins', '{}');
+MERGE INTO events USING (VALUES ($c2)) s(id) ON events.id = s.id AND events.ts < '$cut' WHEN MATCHED THEN DELETE;
+SELECT 'COLD:' || string_agg(status, ',' ORDER BY status) FROM events WHERE id IN ($c1, $c2, 990001);
+SELECT 'COLDHOT:' || count(*) FROM public._events WHERE id IN ($c1, $c2, 990001);
+EOSQL
+)
+    assert_eq "TC-208: a hot MERGE ran its UPDATE, DELETE and INSERT actions on the hot table" "tc208_hot_ins,tc208_hot_upd" "$(extract HOT "$O")"
+    assert_eq "TC-208: the hot MERGE's inserted row is in the hot table" "1" "$(extract HOTINS "$O")"
+    assert_eq "TC-208: a cold MERGE without an alias ran its UPDATE and INSERT actions, and a second its DELETE, on the Iceberg table" "tc208_cold_ins,tc208_cold_upd" "$(extract COLD "$O")"
+    assert_eq "TC-208: the cold MERGEs touched no hot row" "0" "$(extract COLDHOT "$O")"
+    assert_err "TC-208: a hot MERGE's INSERT of a row below the cutoff is refused" "hot tier" \
+        "$(q_may "$HOST" "MERGE INTO events t USING (VALUES (0)) s(id) ON t.id = s.id AND t.ts >= '$cut' WHEN NOT MATCHED THEN INSERT (ts, status, data) VALUES ('$cold', 'tc208_hot_bad', '{}');")"
+    assert_err "TC-208: a cold MERGE's INSERT of a row at or after the cutoff is refused" "cold tier" \
+        "$(q_may "$HOST" "MERGE INTO events USING (VALUES (990002)) s(id) ON events.id = s.id AND events.ts < '$cut' WHEN NOT MATCHED THEN INSERT (id, ts, status, data) OVERRIDING SYSTEM VALUE VALUES (s.id, '$hot', 'tc208_cold_bad', '{}');")"
+    assert_eq "TC-208: the refused cold INSERT wrote nothing" "0" "$(q "$HOST" "SELECT count(*) FROM events WHERE id = 990002;" | tail -1)"
+    assert_err "TC-208: a cold MERGE's INSERT must give the identity column a value" "give a value for column" \
+        "$(q_may "$HOST" "MERGE INTO events USING (VALUES (990003)) s(id) ON events.id = s.id AND events.ts < '$cut' WHEN NOT MATCHED THEN INSERT (ts, status, data) VALUES ('$cold', 'tc208_cold_noid', '{}');")"
+    assert_err "TC-208: a MERGE whose ON condition bounds no tier is refused" "one tier" \
+        "$(q_may "$HOST" "MERGE INTO events t USING (VALUES ($c3)) s(id) ON t.id = s.id WHEN MATCHED THEN UPDATE SET status = 'tc208_mixed';")"
+    assert_err "TC-208: a MERGE that sets the partition column is refused" "sets partition column" \
+        "$(q_may "$HOST" "MERGE INTO events t USING (VALUES ($h1)) s(id) ON t.id = s.id AND t.ts >= '$cut' WHEN MATCHED THEN UPDATE SET ts = t.ts - interval '400 days';")"
+    assert_err "TC-208: a cold MERGE with an UPDATE and a DELETE action meets duckdb-iceberg's one-action limit" "single UPDATE/DELETE action" \
+        "$(q_may "$HOST" "MERGE INTO events t USING (VALUES ($c3)) s(id) ON t.id = s.id AND t.ts < '$cut' WHEN MATCHED AND t.status = 'x' THEN DELETE WHEN MATCHED THEN UPDATE SET status = 'tc208_two';")"
+    assert_err "TC-208: a MERGE whose source reads the view is refused" "more than once" \
+        "$(q_may "$HOST" "MERGE INTO events t USING (SELECT id FROM events WHERE status = 'tc208_c3') s ON t.id = s.id AND t.ts < '$cut' WHEN MATCHED THEN UPDATE SET status = 'tc208_self';")"
+    if [ "$pgv" -ge 170000 ]; then
+        assert_eq "TC-208: a hot MERGE keeps RETURNING" "UPDATE|tc208_hot_ret" \
+            "$(q "$HOST" "MERGE INTO events t USING (VALUES ($h1)) s(id) ON t.id = s.id AND t.ts >= '$cut' WHEN MATCHED THEN UPDATE SET status = 'tc208_hot_ret' RETURNING merge_action(), t.status;" | grep '|')"
+        assert_err "TC-208: RETURNING on a cold MERGE is refused" "cold tier" \
+            "$(q_may "$HOST" "MERGE INTO events t USING (VALUES ($c3)) s(id) ON t.id = s.id AND t.ts < '$cut' WHEN MATCHED THEN UPDATE SET status = 'tc208_ret' RETURNING t.id;")"
+        assert_err "TC-208: a NOT MATCHED BY SOURCE action without the tier's bound is refused" "NOT MATCHED BY SOURCE" \
+            "$(q_may "$HOST" "MERGE INTO events t USING (VALUES (0)) s(id) ON t.id = s.id AND t.ts >= '$cut' WHEN NOT MATCHED BY SOURCE AND t.status = 'tc208_bs' THEN UPDATE SET status = 'tc208_bs_bad';")"
+        assert_eq "TC-208: a NOT MATCHED BY SOURCE action bounded to the hot tier ran on the hot row only" "1" \
+            "$(q "$HOST" "MERGE INTO events t USING (VALUES (0)) s(id) ON t.id = s.id AND t.ts >= '$cut' WHEN NOT MATCHED BY SOURCE AND t.ts >= '$cut' AND t.status = 'tc208_bs' THEN UPDATE SET status = 'tc208_bs_done'; SELECT count(*) FROM events WHERE status = 'tc208_bs_done';" | tail -1)"
+    fi
+    O=$(qf "$HOST" <<EOSQL
+DO \$\$ BEGIN MERGE INTO events t USING (VALUES ($c3)) s(id) ON t.id = s.id AND t.ts < '$cut' WHEN MATCHED THEN UPDATE SET status = 'tc208_pl_done'; END \$\$;
+SELECT 'PL:' || count(*) FROM events WHERE status = 'tc208_pl_done';
+CREATE TABLE public.tc208_src (id bigint, status text);
+INSERT INTO public.tc208_src VALUES ($c4, 'tc208_pgl_done'), ($h1, 'tc208_hot_src');
+MERGE INTO events t USING public.tc208_src s ON t.id = s.id AND t.ts < '$cut' WHEN MATCHED THEN UPDATE SET status = s.status;
+SELECT 'PGL:' || count(*) FROM events WHERE status = 'tc208_pgl_done';
+UPDATE events t SET status = 'tc208_updfrom_done' FROM public.tc208_src s WHERE t.id = s.id AND t.ts < '$cut';
+SELECT 'UPDFROM:' || count(*) FROM events WHERE status = 'tc208_updfrom_done';
+UPDATE events SET status = 'tc208_hotfrom_done' FROM public.tc208_src s WHERE events.id = s.id AND events.ts >= '$cut';
+SELECT 'HOTFROM:' || count(*) FROM public._events WHERE status = 'tc208_hotfrom_done';
+DELETE FROM events USING public.tc208_src s WHERE events.id = s.id AND events.ts >= '$cut';
+SELECT 'HOTUSING:' || count(*) FROM public._events WHERE id = $h1;
+DROP TABLE public.tc208_src;
+EOSQL
+)
+    assert_eq "TC-208: a cold MERGE inside plpgsql ran" "1" "$(extract PL "$O")"
+    assert_eq "TC-208: a cold MERGE read a PostgreSQL source table through pglocal" "1" "$(extract PGL "$O")"
+    assert_eq "TC-208: a cold UPDATE ... FROM a PostgreSQL table ran through pglocal" "1" "$(extract UPDFROM "$O")"
+    assert_eq "TC-208: a hot UPDATE ... FROM without an alias ran" "1" "$(extract HOTFROM "$O")"
+    assert_eq "TC-208: a hot DELETE ... USING without an alias ran" "0" "$(extract HOTUSING "$O")"
+    qf "$HOST" <<EOSQL >/dev/null 2>&1
+BEGIN;
+MERGE INTO events t USING (VALUES ($c5)) s(id) ON t.id = s.id AND t.ts < '$cut' WHEN MATCHED THEN DELETE;
+ROLLBACK;
+EOSQL
+    assert_eq "TC-208: ROLLBACK undid a cold MERGE" "1" "$(q "$HOST" "SELECT count(*) FROM events WHERE id = $c5;" | tail -1)"
+    q "$HOST" "DELETE FROM events WHERE status LIKE 'tc208%';" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# TC-209: a MERGE nested in a WITH entry (PostgreSQL 17 on) takes the path of a
+# top-level one, rewritten in place: a hot one is the entry's body and keeps
+# RETURNING, a cold one is the anchor UPDATE that runs the DuckDB write.
+# ───────────────────────────────────────────────────────────────────────────
+story_nested_merge() {
+    step "TC-209: a MERGE nested in WITH goes through the rewrite"
+    local cut hot cold pgv O h1 h2 c1 c2 c3
+    cut=$(q "$HOST" "SELECT cutoff_time FROM coldfront.archive_watermark WHERE table_name = 'events';")
+    hot=$(q "$HOST" "SELECT '$cut'::timestamptz + interval '2 days';")
+    cold=$(q "$HOST" "SELECT '$cut'::timestamptz - interval '2 days';")
+    pgv=$(q "$HOST" "SHOW server_version_num;")
+    if [ "$pgv" -lt 170000 ]; then
+        # PostgreSQL 16 refuses a MERGE as a WITH entry (parse_cte.c), before any hook runs.
+        assert_err "TC-209: on PostgreSQL 16 a MERGE in WITH is refused by PostgreSQL, ahead of the hook" "MERGE not supported in WITH query" \
+            "$(q_may "$HOST" "WITH m AS (MERGE INTO events t USING (VALUES (0)) s(id) ON t.id = s.id AND t.ts >= '$cut' WHEN MATCHED THEN UPDATE SET status = 'tc209') SELECT 1;")"
+        return
+    fi
+    # One hot and one cold row per status.
+    q "$HOST" "INSERT INTO events (ts, status, data) SELECT '$cut'::timestamptz + i * interval '1 day', s, '{}' FROM (VALUES (1), (-1)) v(i), unnest(ARRAY['tc209_h1', 'tc209_h2', 'tc209_c1', 'tc209_c2', 'tc209_c3']) s;" >/dev/null 2>&1
+    h1=$(q "$HOST" "SELECT id FROM public._events WHERE status = 'tc209_h1';")
+    h2=$(q "$HOST" "SELECT id FROM public._events WHERE status = 'tc209_h2';")
+    c1=$(q "$HOST" "SELECT id FROM events WHERE status = 'tc209_c1' AND ts < '$cut';" | tail -1)
+    c2=$(q "$HOST" "SELECT id FROM events WHERE status = 'tc209_c2' AND ts < '$cut';" | tail -1)
+    c3=$(q "$HOST" "SELECT id FROM events WHERE status = 'tc209_c3' AND ts < '$cut';" | tail -1)
+    O=$(qf "$HOST" <<EOSQL
+WITH m AS (MERGE INTO events t USING (VALUES ($h1)) s(id) ON t.id = s.id AND t.ts >= '$cut' WHEN MATCHED THEN UPDATE SET status = 'tc209_hot_upd' RETURNING merge_action() AS a, t.status)
+SELECT 'HOT:' || a || '|' || status FROM m;
+WITH a AS (SELECT 0 AS id),
+     m AS (MERGE INTO events t USING a ON t.id = a.id AND t.ts >= '$cut' WHEN NOT MATCHED THEN INSERT (ts, status, data) VALUES ('$hot', 'tc209_hot_ins', '{}') RETURNING t.id)
+SELECT 'HOTINS:' || count(*) FROM m;
+SELECT 'HOTINSROW:' || count(*) FROM public._events WHERE status = 'tc209_hot_ins';
+CREATE TABLE public.tc209_log (id bigint);
+WITH m AS (MERGE INTO events t USING (VALUES ($h2)) s(id) ON t.id = s.id AND t.ts >= '$cut' WHEN MATCHED THEN DELETE RETURNING t.id)
+INSERT INTO public.tc209_log SELECT id FROM m;
+SELECT 'LOG:' || (SELECT count(*) FROM public.tc209_log) || '|' || (SELECT count(*) FROM public._events WHERE id = $h2);
+DROP TABLE public.tc209_log;
+WITH m AS (MERGE INTO events USING (VALUES ($c1)) s(id) ON events.id = s.id AND events.ts < '$cut' WHEN MATCHED THEN UPDATE SET status = 'tc209_cold_upd') SELECT 1;
+SELECT 'COLD:' || status FROM events WHERE id = $c1;
+WITH m AS (MERGE INTO events t USING (VALUES (990011)) s(id) ON t.id = s.id AND t.ts < '$cut' WHEN NOT MATCHED THEN INSERT (id, ts, status, data) OVERRIDING SYSTEM VALUE VALUES (s.id, '$cold', 'tc209_cold_ins', '{}')) SELECT 1;
+SELECT 'COLDINS:' || count(*) FROM events WHERE id = 990011;
+DO \$\$ DECLARE x int; BEGIN WITH m AS (MERGE INTO events t USING (VALUES ($c2)) s(id) ON t.id = s.id AND t.ts < '$cut' WHEN MATCHED THEN UPDATE SET status = 'tc209_pl_done') SELECT 1 INTO x; END \$\$;
+SELECT 'PL:' || count(*) FROM events WHERE status = 'tc209_pl_done';
+EOSQL
+)
+    assert_eq "TC-209: a hot nested MERGE kept RETURNING" "UPDATE|tc209_hot_upd" "$(extract HOT "$O")"
+    assert_eq "TC-209: a hot nested MERGE read an entry before it and inserted through the guard" "1|1" "$(extract HOTINS "$O")|$(extract HOTINSROW "$O")"
+    assert_eq "TC-209: a hot nested MERGE's RETURNING fed the outer INSERT" "1|0" "$(extract LOG "$O")"
+    assert_eq "TC-209: a cold nested MERGE without an alias ran on the Iceberg table" "tc209_cold_upd" "$(extract COLD "$O")"
+    assert_eq "TC-209: a cold nested MERGE's INSERT action landed cold" "1" "$(extract COLDINS "$O")"
+    assert_eq "TC-209: a cold nested MERGE inside plpgsql ran" "1" "$(extract PL "$O")"
+    assert_err "TC-209: a hot nested MERGE's INSERT of a row below the cutoff is refused" "hot tier" \
+        "$(q_may "$HOST" "WITH m AS (MERGE INTO events t USING (VALUES (0)) s(id) ON t.id = s.id AND t.ts >= '$cut' WHEN NOT MATCHED THEN INSERT (ts, status, data) VALUES ('$cold', 'tc209_bad', '{}')) SELECT 1;")"
+    assert_err "TC-209: RETURNING on a cold nested MERGE is refused" "cold tier" \
+        "$(q_may "$HOST" "WITH m AS (MERGE INTO events t USING (VALUES ($c3)) s(id) ON t.id = s.id AND t.ts < '$cut' WHEN MATCHED THEN UPDATE SET status = 'x' RETURNING t.id) SELECT count(*) FROM m;")"
+    assert_err "TC-209: a cold nested MERGE cannot read another WITH entry" "cannot read another WITH entry" \
+        "$(q_may "$HOST" "WITH ids AS (SELECT $c3 AS id), m AS (MERGE INTO events t USING ids ON t.id = ids.id AND t.ts < '$cut' WHEN MATCHED THEN UPDATE SET status = 'x') SELECT 1;")"
+    assert_err "TC-209: a nested MERGE with a WITH clause of its own is refused" "WITH clause of its own" \
+        "$(q_may "$HOST" "WITH m AS (WITH s AS (SELECT $h1 AS id) MERGE INTO events t USING s ON t.id = s.id AND t.ts >= '$cut' WHEN MATCHED THEN UPDATE SET status = 'x') SELECT 1;")"
+    assert_err "TC-209: a second write to the view beside a nested MERGE is refused" "only once" \
+        "$(q_may "$HOST" "WITH m AS (MERGE INTO events t USING (VALUES ($h1)) s(id) ON t.id = s.id AND t.ts >= '$cut' WHEN MATCHED THEN UPDATE SET status = 'x') INSERT INTO events (ts, status, data) VALUES ('$hot', 'tc209_twice', '{}');")"
+    qf "$HOST" <<EOSQL >/dev/null 2>&1
+BEGIN;
+WITH m AS (MERGE INTO events t USING (VALUES ($c3)) s(id) ON t.id = s.id AND t.ts < '$cut' WHEN MATCHED THEN DELETE) SELECT 1;
+ROLLBACK;
+EOSQL
+    assert_eq "TC-209: ROLLBACK undid a cold nested MERGE" "1" "$(q "$HOST" "SELECT count(*) FROM events WHERE id = $c3;" | tail -1)"
+    q "$HOST" "DELETE FROM events WHERE status LIKE 'tc209%';" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# TC-210: a read through a tiered view sees the transaction's own cold writes.
+# The view's cold branch reads the Iceberg table through the catalog's table
+# entry, which includes the transaction's pending data and delete files, and
+# the cross-tier move reads the rows it moves the same way.
+# ───────────────────────────────────────────────────────────────────────────
+# ───────────────────────────────────────────────────────────────────────────
+# Story: the cold tier's snapshot is fixed for the transaction. pg_duckdb at the
+# pin opens one DuckDB transaction per PostgreSQL transaction block, at its first
+# DuckDB statement, and duckdb-iceberg resolves an attached table as of that
+# transaction's start, so a commit by another session after the transaction's
+# first cold read stays invisible until the transaction ends. usage.md states it
+# under Caveats; this check pins it, so a pin bump that changes it fails here,
+# which is the cue to change the docs.
+# ───────────────────────────────────────────────────────────────────────────
+story_snapshot_pinned() {
+    step "TC-224: a transaction keeps the snapshot of its first cold read"
+    local tbl ins del O first
+    if [ "$MODE" = tiered ]; then
+        local cut; cut=$(q "$HOST" "SELECT cutoff_time FROM coldfront.archive_watermark WHERE table_name = 'events';")
+        tbl=events
+        ins="INSERT INTO events (ts, status, data) VALUES ('$cut'::timestamptz - interval '3 days', 'tc224', '{}');"
+        del="DELETE FROM events WHERE status = 'tc224' AND ts < '$cut';"
+    else
+        tbl=iceonly
+        ins="INSERT INTO iceonly VALUES (224, now(), 'tc224', '{}');"
+        del="DELETE FROM iceonly WHERE status = 'tc224';"
+    fi
+    docker exec -i -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" "$HOST" "$CF_PSQL" -tA -v ON_ERROR_STOP=1 >"$TMPD/tc224.out" 2>&1 <<SQL &
+BEGIN;
+SELECT 'FIRST:' || count(*) FROM $tbl;
+SELECT pg_sleep(8);
+SELECT 'SECOND:' || count(*) FROM $tbl;
+COMMIT;
+SELECT 'AFTER:' || count(*) FROM $tbl;
+SQL
+    local reader=$!
+    sleep 3
+    q "$HOST" "$ins" >/dev/null 2>&1
+    wait "$reader"
+    O=$(cat "$TMPD/tc224.out"); first=$(extract FIRST "$O")
+    assert_eq "TC-224: a second cold read in the transaction sees the first read's snapshot" "$first" "$(extract SECOND "$O")"
+    assert_eq "TC-224: after COMMIT the other session's committed cold row is visible" "$((first + 1))" "$(extract AFTER "$O")"
+    q "$HOST" "$del" >/dev/null 2>&1
+}
+
+story_tiered_ryw() {
+    step "TC-210: a tiered read sees the transaction's own cold writes"
+    local cut cold O
+    cut=$(q "$HOST" "SELECT cutoff_time FROM coldfront.archive_watermark WHERE table_name = 'events';")
+    cold=$(q "$HOST" "SELECT '$cut'::timestamptz - interval '3 days';")
+    q "$HOST" "INSERT INTO events (ts, status, data) VALUES ('$cold', 'tc210_upd', '{}'), ('$cold', 'tc210_del', '{}');" >/dev/null 2>&1
+    O=$(qf "$HOST" <<EOSQL
+BEGIN;
+UPDATE events SET status = 'tc210_upd2' WHERE status = 'tc210_upd' AND ts < '$cut';
+SELECT 'UPD:' || count(*) FROM events WHERE status = 'tc210_upd2';
+INSERT INTO events (ts, status, data) VALUES ('$cold', 'tc210_ins', '{}');
+SELECT 'INS:' || count(*) FROM events WHERE status = 'tc210_ins';
+DELETE FROM events WHERE status = 'tc210_del' AND ts < '$cut';
+SELECT 'DEL:' || count(*) FROM events WHERE status = 'tc210_del';
+ROLLBACK;
+SELECT 'RB1:' || string_agg(status, ',' ORDER BY status) FROM events WHERE status LIKE 'tc210%';
+BEGIN;
+INSERT INTO events (ts, status, data) VALUES ('$cold', 'tc210_mv', '{}');
+UPDATE events SET ts = ts - interval '1 day' WHERE status = 'tc210_mv';
+SELECT 'MOVED:' || count(*) FROM events WHERE status = 'tc210_mv' AND ts = '$cold'::timestamptz - interval '1 day';
+ROLLBACK;
+SELECT 'RB2:' || count(*) FROM events WHERE status = 'tc210_mv';
+EOSQL
+)
+    assert_eq "TC-210: a read in the transaction sees its own cold UPDATE" "1" "$(extract UPD "$O")"
+    assert_eq "TC-210: a read in the transaction sees its own cold INSERT" "1" "$(extract INS "$O")"
+    assert_eq "TC-210: a read in the transaction sees its own cold DELETE" "0" "$(extract DEL "$O")"
+    assert_eq "TC-210: ROLLBACK undid the three cold writes" "tc210_del,tc210_upd" "$(extract RB1 "$O")"
+    assert_eq "TC-210: a cross-tier move finds the transaction's own pending cold row" "1" "$(extract MOVED "$O")"
+    assert_eq "TC-210: ROLLBACK undid the insert and the move" "0" "$(extract RB2 "$O")"
+    q "$HOST" "DELETE FROM events WHERE status LIKE 'tc210%' AND ts < '$cut';" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# TC-211: pg_duckdb (c04e6a2) refuses a transaction block that writes both a
+# PostgreSQL table and the cold tier unless duckdb.unsafe_allow_mixed_transactions
+# is on: at the PostgreSQL write when it comes second, at COMMIT when it came
+# first. A cold-only write sets nothing; the dual, split-INSERT and move paths
+# set it for their transaction. The checks pin the rule the docs state.
+# ───────────────────────────────────────────────────────────────────────────
+story_mixed_write_rule() {
+    step "TC-211: a cold-only write and a PostgreSQL write cannot share a transaction block"
+    local cut cold hot O1 O2 O3
+    cut=$(q "$HOST" "SELECT cutoff_time FROM coldfront.archive_watermark WHERE table_name = 'events';")
+    cold=$(q "$HOST" "SELECT '$cut'::timestamptz - interval '3 days';")
+    hot=$(q "$HOST" "SELECT '$cut'::timestamptz + interval '1 day';")
+    q "$HOST" "INSERT INTO events (ts, status, data) VALUES ('$cold', 'tc211_c', '{}'), ('$hot', 'tc211_h', '{}');" >/dev/null 2>&1
+    O1=$(qf "$HOST" 2>&1 <<EOSQL
+BEGIN;
+UPDATE events SET status = 'tc211_c2' WHERE status = 'tc211_c' AND ts < '$cut';
+UPDATE events SET status = 'tc211_h2' WHERE status = 'tc211_h' AND ts >= '$cut';
+COMMIT;
+SELECT 'AFTER:' || string_agg(status, ',' ORDER BY status) FROM events WHERE status LIKE 'tc211%';
+EOSQL
+)
+    assert_contains "TC-211: pg_duckdb refuses a PostgreSQL write after a cold-only write in one transaction block" "same transaction block is not supported" "$O1"
+    assert_eq "TC-211: that block left both rows as they were" "tc211_c,tc211_h" "$(extract AFTER "$O1")"
+    O2=$(qf "$HOST" 2>&1 <<EOSQL
+BEGIN;
+UPDATE events SET status = 'tc211_h2' WHERE status = 'tc211_h' AND ts >= '$cut';
+UPDATE events SET status = 'tc211_c2' WHERE status = 'tc211_c' AND ts < '$cut';
+COMMIT;
+SELECT 'AFTER:' || string_agg(status, ',' ORDER BY status) FROM events WHERE status LIKE 'tc211%';
+EOSQL
+)
+    assert_contains "TC-211: pg_duckdb refuses the COMMIT of a block that wrote a PostgreSQL table before the cold tier" "same transaction block is not supported" "$O2"
+    assert_eq "TC-211: that block left both rows as they were too" "tc211_c,tc211_h" "$(extract AFTER "$O2")"
+    O3=$(qf "$HOST" 2>&1 <<EOSQL
+BEGIN;
+SET LOCAL duckdb.unsafe_allow_mixed_transactions = on;
+UPDATE events SET status = 'tc211_c3' WHERE status = 'tc211_c' AND ts < '$cut';
+UPDATE events SET status = 'tc211_h3' WHERE status = 'tc211_h' AND ts >= '$cut';
+COMMIT;
+SELECT 'AFTER:' || string_agg(status, ',' ORDER BY status) FROM events WHERE status LIKE 'tc211%';
+EOSQL
+)
+    assert_eq "TC-211: with duckdb.unsafe_allow_mixed_transactions on, the same block commits both writes" "tc211_c3,tc211_h3" "$(extract AFTER "$O3")"
+    q "$HOST" "DELETE FROM events WHERE status LIKE 'tc211%' AND ts < '$cut';" >/dev/null 2>&1
+    q "$HOST" "DELETE FROM events WHERE status LIKE 'tc211%' AND ts >= '$cut';" >/dev/null 2>&1
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -2247,7 +2968,7 @@ story_mesh() {
 
     # R-A bakery under multi-node contention: concurrent cold writers on db1 AND
     # a peer to the SAME Iceberg table must both land. Here v_armed is true
-    # (snowflake.node + dblink_self set), so this exercises the Ricart-Agrawala
+    # (snowflake.node + loopback_dsn set), so this exercises the Ricart-Agrawala
     # claim protocol across nodes — not the local advisory lock — to avoid 409.
     rm -f $TMPD/ra.* 2>/dev/null
     q "$HOST" "INSERT INTO iceonly VALUES (6001,date_trunc('month',now()) + interval '2 months' + interval '1 days' + interval '10 hours 0 minutes 0 seconds','ra','{}');" >$TMPD/ra.1 2>&1 &
@@ -2296,6 +3017,127 @@ story_mesh_multiwriter() {
     assert_eq "all $((2 * N)) multi-writer-per-node cross-node cold writes landed" "$((2 * N))" \
         "$(q "$HOST" "SELECT count(*) FROM $tbl WHERE status='mw';")"
     rm -f $TMPD/mw.* 2>/dev/null
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story (mesh): the dead-peer test. A peer counts as alive while its walsender
+# on this node has a reply younger than coldfront.peer_alive_window_ms. That
+# reply is the peer's apply-worker feedback, which on an idle link comes only in
+# answer to the walsender's keepalive every wal_sender_timeout/2, so the claim
+# refuses to run unless wal_sender_timeout is positive and below twice the
+# window (TC-221), an idle mesh keeps every peer inside the window (TC-222), and
+# a peer that stops replying is ruled dead within the window and rejoins cleanly
+# once it answers again (TC-223).
+# ───────────────────────────────────────────────────────────────────────────
+story_mesh_dead_peer() {
+    step "12f. Mesh: the dead-peer test (the two timeouts, idle replies, a silent peer)"
+    local PARR; read -ra PARR <<< "$PEERS"
+    [ "${#PARR[@]}" -ge 1 ] || { fail "mesh: no --peers given"; return; }
+    local p1="${PARR[0]}" npeers="${#PARR[@]}" tbl out i sample
+    [ "$MODE" = tiered ] && tbl=events || tbl=iceonly
+    cold_stmt() {  # cold_stmt <tag> <k>: one cold-routed INSERT
+        if [ "$MODE" = tiered ]; then
+            echo "INSERT INTO events (ts,status,data) VALUES (date_trunc('month',now()) - interval '4 months' + interval '$2 hours','$1','{}');"
+        else
+            echo "INSERT INTO iceonly VALUES ($((9000 + $2)),date_trunc('month',now()) + interval '3 months' + interval '$2 minutes','$1','{}');"
+        fi
+    }
+    local alive_sql="SELECT count(*) FILTER (WHERE reply_time > now() - make_interval(secs => current_setting('coldfront.peer_alive_window_ms')::int / 1000.0)) || '/' || count(*) FROM pg_stat_replication;"
+    local window; window=$(q "$HOST" "SHOW coldfront.peer_alive_window_ms;")
+    assert_eq "TC-221: the image sets wal_sender_timeout to 15s for the 10 s window" "15s" "$(q "$HOST" "SHOW wal_sender_timeout;")"
+
+    # TC-221: a timeout of 60 s or 0 is refused by the claim, naming both settings.
+    # ALTER SYSTEM cannot share a transaction block with the reload, so two calls,
+    # and the new value is confirmed before the write (the reload is a signal).
+    set_wst() {  # set_wst <ALTER SYSTEM clause> <expected SHOW value>
+        q "$HOST" "ALTER SYSTEM $1;" >/dev/null; q "$HOST" "SELECT pg_reload_conf();" >/dev/null
+        for _ in $(seq 1 20); do [ "$(q "$HOST" "SHOW wal_sender_timeout;")" = "$2" ] && return 0; sleep 0.5; done
+        return 1
+    }
+    if set_wst "SET wal_sender_timeout = '60s'" 1min; then pass "TC-221: wal_sender_timeout set to 60 s for the test (SHOW prints 1min)"; else fail "TC-221: could not set wal_sender_timeout to 60 s"; fi
+    out=$(q_may "$HOST" "$(cold_stmt dp221 1)")
+    assert_contains "TC-221: a 60 s wal_sender_timeout is refused" "wal_sender_timeout is 60000 ms" "$out"
+    assert_contains "TC-221: the refusal names the window" "coldfront.peer_alive_window_ms is $window ms" "$out"
+    if set_wst "SET wal_sender_timeout = 0" 0; then pass "TC-221: wal_sender_timeout set to 0 for the test"; else fail "TC-221: could not set wal_sender_timeout to 0"; fi
+    out=$(q_may "$HOST" "$(cold_stmt dp221 2)")
+    assert_contains "TC-221: a disabled wal_sender_timeout is refused" "wal_sender_timeout is 0 ms" "$out"
+    if set_wst "RESET wal_sender_timeout" 15s; then pass "TC-221: the timeout is back to the image's value"; else fail "TC-221: the timeout did not return to 15s"; fi
+    assert_eq "TC-221: no row landed from the refused writes" "0" "$(q "$HOST" "SELECT count(*) FROM $tbl WHERE status='dp221';")"
+
+    # TC-222: on an idle link every peer's last reply stays inside the window.
+    local bad=0
+    for i in $(seq 1 20); do
+        sample=$(q "$HOST" "$alive_sql")
+        [ "$sample" = "$npeers/$npeers" ] || { bad=$((bad + 1)); echo "    sample $i: alive/total = $sample"; }
+        sleep 1
+    done
+    assert_eq "TC-222: every peer replied inside the window in all 20 samples of an idle link" "0" "$bad"
+
+    # TC-223: a paused peer stops replying; a cold write here is held only until
+    # the window rules it dead, and the peer rejoins once it runs again.
+    docker pause "$p1" >/dev/null
+    local t0 ms rc; t0=$(date +%s%N)
+    out=$(timeout 60 docker exec -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" "$HOST" "$CF_PSQL" -tA -c "$(cold_stmt dp223 1)" 2>&1); rc=$?
+    ms=$(( ($(date +%s%N) - t0) / 1000000 ))
+    docker unpause "$p1" >/dev/null
+    assert_eq "TC-223: a cold write completes while a peer is silent (${ms} ms)" "0" "$rc"
+    if [ "$ms" -lt $(( window + 15000 )) ]; then
+        pass "TC-223: the write was held at most the window plus a margin (${ms} ms)"
+    else
+        fail "TC-223: the write took ${ms} ms with the window at ${window} ms"
+    fi
+    for i in $(seq 1 60); do
+        sample=$(q "$HOST" "$alive_sql"); [ "$sample" = "$npeers/$npeers" ] && break; sleep 1
+    done
+    assert_eq "TC-223: the resumed peer replies again (after ${i} s)" "$npeers/$npeers" "$sample"
+    out=$(q_may "$p1" "$(cold_stmt dp223 2)")
+    assert_eq "TC-223: the resumed peer writes cold again" "" "$(echo "$out" | grep -i error)"
+    assert_eq "TC-223: both rows readable on $HOST" "2" "$(q "$HOST" "SELECT count(*) FROM $tbl WHERE status='dp223';")"
+    assert_eq "TC-223: both rows readable on the resumed peer" "2" "$(q "$p1" "SELECT count(*) FROM $tbl WHERE status='dp223';")"
+    for i in $(seq 1 20); do
+        sample=$(q "$HOST" "SELECT count(*) FROM coldfront.claims;")$(q "$p1" "SELECT count(*) FROM coldfront.claims;")
+        [ "$sample" = "00" ] && break; sleep 1
+    done
+    assert_eq "TC-223: no claim is left on either node" "00" "$sample"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story: snapshot expiry against an open reader. A transaction keeps the snapshot
+# of its first cold read (TC-224), and expiry deletes the files only the expired
+# snapshots reference, so an expiry shorter than an open transaction takes that
+# transaction's files away: its next scan fails with the object store's 404 (a
+# scan that already fetched the files answers from DuckDB's file cache instead).
+# compaction.md states the rule; this check pins the outcome at the pinned refs.
+# ───────────────────────────────────────────────────────────────────────────
+story_expiry_vs_reader() {
+    step "TC-225: expiring an open reader's snapshot fails its next scan"
+    require_compactor || return
+    local k O
+    q "$HOST" "SELECT coldfront.create_iceberg_table('public','tc225','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"ts\",\"type\":\"timestamptz\"}]'::jsonb, '{month(ts)}');" >/dev/null 2>&1
+    for k in 1 2 3 4 5 6; do q "$HOST" "INSERT INTO tc225 VALUES ($k, now());" >/dev/null 2>&1; done
+    # The first read is metadata-only, so the files are not yet cached; the
+    # second must fetch them. The reader runs without ON_ERROR_STOP so its
+    # COMMIT and the read after it still run.
+    docker exec -i -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" "$HOST" "$CF_PSQL" -tA >"$TMPD/tc225.out" 2>&1 <<SQL &
+BEGIN;
+SELECT 'FIRST:' || count(*) FROM tc225;
+SELECT pg_sleep(12);
+SELECT 'SECOND:' || sum(id) FROM tc225;
+COMMIT;
+SELECT 'AFTER:' || sum(id) FROM tc225;
+SQL
+    local reader=$!
+    sleep 3
+    compactor --table tc225 >"$TMPD/tc225.compact" 2>&1
+    compactor --table tc225 --expire-snapshots --expire-older-than 0s --expire-retain-last 1 >"$TMPD/tc225.expire" 2>&1
+    assert_contains "TC-225: the six small files were compacted" "compacted: 6 files -> 1" "$(cat "$TMPD/tc225.compact")"
+    assert_contains "TC-225: the six pre-compaction snapshots were expired" "expired 6 snapshot(s), kept 1" "$(cat "$TMPD/tc225.expire")"
+    wait "$reader"
+    O=$(cat "$TMPD/tc225.out")
+    assert_eq "TC-225: the reader's first, metadata-only read saw six rows" "6" "$(extract FIRST "$O")"
+    assert_contains "TC-225: its scan after the expiry fails with the object store's 404" "404" "$O"
+    assert_eq "TC-225: after COMMIT the same scan reads the compacted snapshot" "21" "$(extract AFTER "$O")"
+    q "$HOST" "SELECT coldfront.drop_iceberg_table('public','tc225', true);" >/dev/null 2>&1
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -2573,7 +3415,7 @@ SQL
     # TC-178: after a cold write as an app role, its session has no way into the
     # loopback: no named dblink connection is left open in it,
     # coldfront._loopback is not executable by it, and it cannot change
-    # coldfront.dblink_self, the loopback's connection string.
+    # coldfront.loopback_dsn, the loopback's connection string.
     q "$HOST" "DO \$\$ BEGIN IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = 'cf_tc178') THEN CREATE ROLE cf_tc178 NOSUPERUSER LOGIN; END IF; END \$\$;" >/dev/null 2>&1
     q "$HOST" "SELECT coldfront.grant_app_access('cf_tc178');" >/dev/null 2>&1
     out=$(sess "$HOST" 2>&1 <<'SQL'
@@ -2586,8 +3428,8 @@ SELECT 'named=' || count(*) FROM unnest(public.dblink_get_connections()) c;
 SELECT 'named=0';
 \endif
 SELECT 'can_exec=' || has_function_privilege('coldfront._loopback(text)', 'execute');
-SET coldfront.dblink_self = 'dbname=cf_tc178';
-SELECT 'dsn_set=' || (current_setting('coldfront.dblink_self') = 'dbname=cf_tc178');
+SET coldfront.loopback_dsn = 'dbname=cf_tc178';
+SELECT 'dsn_set=' || (current_setting('coldfront.loopback_dsn') = 'dbname=cf_tc178');
 SQL
 )
     assert_eq "TC-178 the app role's cold write landed" "1" "$(q "$HOST" "SELECT count(*) FROM cf_ct WHERE id = 1781;")"
@@ -2624,7 +3466,7 @@ SQL
     # TC-180: every loopback session on $HOST dies between two cold writes of one
     # session. The next write reconnects instead of failing, the session holds no
     # advisory lock afterwards, and a peer's claim still gets $HOST's ack.
-    loop_app=$(q "$HOST" "SELECT substring(current_setting('coldfront.dblink_self') from 'application_name=([^ ]+)');")
+    loop_app=$(q "$HOST" "SELECT substring(current_setting('coldfront.loopback_dsn') from 'application_name=([^ ]+)');")
     out=$(sess "$HOST" 2>&1 <<SQL
 INSERT INTO cf_ct VALUES (1801);
 SELECT 'killed=' || count(*) FROM (SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE application_name = '$loop_app') k;
@@ -2648,12 +3490,25 @@ SQL
     # call never reaches the shadow, and the write lands.
     q "$HOST" "DROP SCHEMA IF EXISTS cf_tc181 CASCADE; CREATE SCHEMA cf_tc181; CREATE TABLE cf_tc181.hits (who text); CREATE FUNCTION cf_tc181.pg_advisory_xact_lock(integer) RETURNS void LANGUAGE sql AS 'INSERT INTO cf_tc181.hits VALUES (current_user)';" >/dev/null 2>&1
     sess "$HOST" >/dev/null 2>&1 <<'SQL'
-SELECT set_config('coldfront.dblink_self', current_setting('coldfront.dblink_self') || ' options=''-csearch_path=cf_tc181''', false);
+SELECT set_config('coldfront.loopback_dsn', current_setting('coldfront.loopback_dsn') || ' options=''-csearch_path=cf_tc181''', false);
 INSERT INTO cf_ct VALUES (1811);
 SQL
     assert_eq "TC-181 the write over the redirected loopback landed" "1" "$(q "$HOST" "SELECT count(*) FROM cf_ct WHERE id = 1811;")"
     assert_eq "TC-181 the loopback never resolves a name outside pg_catalog" "0" "$(q "$HOST" "SELECT count(*) FROM cf_tc181.hits;")"
     q "$HOST" "DROP SCHEMA cf_tc181 CASCADE;" >/dev/null 2>&1
+
+    # TC-212: a node that runs Spock serializes cold writes through the bakery
+    # alone. With the loopback DSN empty it refuses a cold write, naming the
+    # setting, rather than taking the node-local lock that peers cannot see.
+    out=$(sess "$HOST" 2>&1 <<'SQL'
+SET coldfront.loopback_dsn = '';
+INSERT INTO cf_ct VALUES (2121);
+RESET coldfront.loopback_dsn;
+INSERT INTO cf_ct VALUES (2122);
+SQL
+)
+    assert_contains "TC-212 a Spock node with no loopback DSN refuses a cold write" "coldfront.loopback_dsn is not set" "$out"
+    assert_eq "TC-212 the refused write landed nothing and the next one landed" "0|1" "$(q "$HOST" "SELECT count(*) FILTER (WHERE id = 2121) || '|' || count(*) FILTER (WHERE id = 2122) FROM cf_ct;")"
 
     for t in cf_ct cf_cu; do
         q "$HOST" "SELECT coldfront.drop_iceberg_table('public','$t', true);" >/dev/null 2>&1
@@ -2704,7 +3559,7 @@ story_mesh_tiered() {
 
 # ───────────────────────────────────────────────────────────────────────────
 # Story 13 — Standby reads: a read-only physical replica serves cross-tier reads
-# (hot via physical replication, cold via iceberg_scan executed on the read-only
+# (hot via physical replication, cold via the DuckDB read executed on the read-only
 # backend) and rejects writes cleanly. The coldfront catalog (registry,
 # watermark, storage-secret row) arrives through the base
 # backup + WAL stream, so the replica is byte-identical to the primary (same
@@ -2746,9 +3601,9 @@ story_standby_reads() {
 
     # Reads MATCH the primary across tiers. The extension hook attaches 'ice'
     # lazily on the first tiered-view query in this read-only session;
-    # iceberg_scan then executes read-only on the replica.
+    # the DuckDB read then executes read-only on the replica.
     assert_eq "standby cross-tier read == primary" "$(q "$HOST" "SELECT count(*) FROM $vn;")" "$(q "$STANDBY" "SELECT count(*) FROM $vn;")"
-    assert_eq "standby cold-side read (iceberg_scan on replica) == primary" \
+    assert_eq "standby cold-side read (DuckDB read on replica) == primary" \
         "$(q "$HOST" "SELECT count(*) FROM $vn WHERE ts < date_trunc('month',now()) - interval '1 month';")" \
         "$(q "$STANDBY" "SELECT count(*) FROM $vn WHERE ts < date_trunc('month',now()) - interval '1 month';")"
 
@@ -2775,10 +3630,10 @@ story_standby_reads() {
         assert_err "cross-tier move on standby → coldfront refuses before the claim" \
             "cannot move rows across tiers (Iceberg write) on a read-only standby" "$m"
     fi
-    # The IDENTITY-omit cold loop is only reachable by calling it directly, so call
-    # it directly: the guard is the first statement, ahead of argument handling.
-    local c; c=$(q_may "$STANDBY" "SELECT coldfront._tiered_insert_cold('${vn%%.*}','${vn##*.}',ARRAY['ts']::text[],'SELECT now()');")
-    assert_err "cold insert loop on standby → coldfront refuses before the claim" \
+    # The cold sink's step function is reached through the INSERT rewrite, so call
+    # it directly: the guard is its first statement, ahead of every lookup.
+    local c; c=$(q_may "$STANDBY" "SELECT coldfront._cold_sink_step(NULL, '${vn%%.*}', '${vn##*.}', '{}'::jsonb);")
+    assert_err "cold sink on standby → coldfront refuses before the claim" \
         "cannot execute a cold (Iceberg) write on a read-only standby" "$c"
 
     # Provisioning POSTs CREATE TABLE to the catalog eagerly (see
@@ -2805,6 +3660,18 @@ story_standby_reads() {
         assert_eq "mesh: standby of db1 sees peer-originated hot row (origin $peer, via Spock→physical)" "1" "$seen"
         q "$HOST" "DELETE FROM $vn WHERE status='sb_xnode';" >/dev/null 2>&1
     fi
+
+    # TC-219: the compactor refuses a standby. On a single node the bakery is the
+    # node-local advisory lock, which PostgreSQL grants during recovery, and the
+    # compactor writes the Iceberg table itself, so only this refusal
+    # (_reject_on_standby in _claim_iceberg_external) stops a compactor pointed
+    # at the replica from rewriting the cold tier under the primary's writers. It
+    # runs inside the standby container, where the server's addresses resolve,
+    # as compactor() does on the primary.
+    docker cp "$COMPACTOR" "$STANDBY":/usr/local/bin/compactor >/dev/null 2>&1
+    local cout; cout=$(docker exec -e PGHOST=localhost -e PGUSER=coldfront -e PGPASSWORD=coldfront -e PGDATABASE=coldfront \
+        "$STANDBY" /usr/local/bin/compactor --table events 2>&1 || true)
+    assert_contains "TC-219 the compactor refuses to compact against a standby" "cannot compact (Iceberg write) on a read-only standby" "$cout"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -2821,6 +3688,16 @@ story_mesh_substrate() {
     local PARR; read -ra PARR <<< "$PEERS"
     [ "${#PARR[@]}" -ge 1 ] || { fail "mesh: no --peers given"; return; }
     local nodes=("$HOST" "${PARR[@]}") want="$(( ${#PARR[@]} + 1 ))" n t=90
+    # TC-213: the one-time setup call, coldfront.ensure_replicated() on every
+    # node, put each ColdFront table that replicates by value in that node's
+    # default replication set, and neither node-local table (deferred_acks,
+    # _dummy_dml_target). Membership belongs to the provider, so every node is
+    # checked, not only the one that will write.
+    for n in "${nodes[@]}"; do
+        assert_eq "TC-213 $n's default replication set holds the eight replicated coldfront tables" \
+            "archive_watermark,claim_acks,claims,partition_config,storage_secret,tiered_views,vector_centroids,vector_config" \
+            "$(q "$n" "SELECT string_agg(c.relname, ',' ORDER BY c.relname COLLATE \"C\") FROM spock.replication_set rs JOIN spock.replication_set_table rst ON rst.set_id = rs.set_id JOIN pg_class c ON c.oid = rst.set_reloid WHERE rs.set_name = 'default' AND c.relnamespace = 'coldfront'::regnamespace;")"
+    done
     q "$HOST" "DELETE FROM coldfront.claims WHERE iceberg_table='bakery_probe';" >/dev/null 2>&1
     for n in "${nodes[@]}"; do
         t=$((t + 1))
@@ -2992,8 +3869,6 @@ EOSQL
     local ret_days; ret_days=$(hot_days)  # cutoff = start of now-1mo
     cat > $TMPD/tl.yaml <<EOF
 postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
-iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog" }
-$(storage_yaml)
 archiver:
   tables:
     - source_table: regional
@@ -3005,7 +3880,7 @@ EOF
     if ! "$ARCHIVER" import --config $TMPD/tl.yaml >$TMPD/tl.log 2>&1; then
         fail "import regional (2-level) into partition_config — see $TMPD/tl.log"; tail -8 $TMPD/tl.log; return
     fi
-    if "$ARCHIVER" --config $TMPD/tl.yaml >>$TMPD/tl.log 2>&1; then
+    if "$ARCHIVER" >>$TMPD/tl.log 2>&1; then
         pass "2-level archiver run completed (no flat-partitioning Fatal)"
     else
         fail "2-level archiver run — see $TMPD/tl.log"; tail -8 $TMPD/tl.log; return
@@ -3037,9 +3912,33 @@ EOF
 
     # Idempotency / cross-region wipe guard: a second run must NOT lose cold rows
     # (a region-blind Phase-0 wipe would under-count here).
-    "$ARCHIVER" --config $TMPD/tl.yaml >$TMPD/tl2.log 2>&1
+    "$ARCHIVER" >$TMPD/tl2.log 2>&1
     assert_eq "re-run keeps all cold rows (region-scoped wipe)" "420" "$(q "$HOST" "SELECT count(*) FROM regional;")"
     assert_eq "re-run keeps eu cold rows" "240" "$(q "$HOST" "SELECT count(*) FROM regional WHERE region='eu' AND ts < date_trunc('month',now()) - interval '1 month';")"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story: two LIST values with one child name ('eu-west' and 'eu_west' both
+# name clash_eu_west) fail the archiver pass before it creates any partition,
+# as they fail a partitioner pass (TC-199).
+# ───────────────────────────────────────────────────────────────────────────
+story_twolevel_name_collision() {
+    step "TC-199: the archiver rejects two LIST values that map to one child name"
+    q "$HOST" "CREATE TABLE public.clash (id bigint GENERATED ALWAYS AS IDENTITY, region text NOT NULL,
+                   ts timestamptz NOT NULL, PRIMARY KEY (id, region, ts)) PARTITION BY LIST (region);
+               CREATE TABLE public.clash_eu_west PARTITION OF public.clash FOR VALUES IN ('eu-west') PARTITION BY RANGE (ts);" >/dev/null
+    if ! "$ARCHIVER" register --table clash --column ts --period monthly --hot-period "30 days" \
+            --sub-values-source "SELECT v FROM (VALUES ('eu-west'),('eu_west')) r(v)" >$TMPD/clash.log 2>&1; then
+        fail "TC-199: register clash (see $TMPD/clash.log)"; tail -5 $TMPD/clash.log
+    elif "$ARCHIVER" >>$TMPD/clash.log 2>&1; then
+        fail "TC-199: the archiver pass accepted the colliding values"
+    else
+        assert_contains "TC-199: the archiver named the collision" \
+            'values "eu-west" and "eu_west" both map to "clash_eu_west"' "$(cat $TMPD/clash.log)"
+    fi
+    assert_eq "TC-199: the pass created no partition under clash_eu_west" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM pg_inherits WHERE inhparent='public.clash_eu_west'::regclass;")"
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name='clash'; DROP TABLE public.clash;" >/dev/null 2>&1
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -3120,7 +4019,7 @@ EOSQL
     # Register + archive. Both must succeed: the (id, ts) PK is valid, so an
     # outbound FK must NOT defeat PK detection / delta capture. A regression
     # there (archiver bailing with "no primary key") fails this story loudly.
-    if "$ARCHIVER" register --config $TMPD/archiver.yaml --table fk_events \
+    if "$ARCHIVER" register --table fk_events \
             --period monthly --hot-period "${ret_days} days" >$TMPD/fk-reg.log 2>&1; then
         pass "fk_events registered (FK does not block registration)"
     else
@@ -3129,12 +4028,7 @@ EOSQL
     assert_eq "partition_config row written for fk_events" "1" \
         "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='fk_events';")"
 
-    cat > $TMPD/fk.yaml <<EOF
-postgres: { dsn: "${dsn}" }
-iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog" }
-$(storage_yaml)
-EOF
-    if "$ARCHIVER" --config $TMPD/fk.yaml >$TMPD/fk-arch.log 2>&1; then
+    if "$ARCHIVER" >$TMPD/fk-arch.log 2>&1; then
         pass "archiver completed on FK-constrained table"
     else
         fail "archiver failed on FK-constrained table"; tail -8 $TMPD/fk-arch.log
@@ -3246,25 +4140,20 @@ EOSQL
 
     q "$HOST" "INSERT INTO public.rb_events (ts, status) VALUES (date_trunc('month',now()) - interval '3 months' + interval '1 day', 'crash-row'), (now(), 'hot-row');" >/dev/null
 
-    if "$ARCHIVER" register --config $TMPD/archiver.yaml --table rb_events \
+    if "$ARCHIVER" register --table rb_events \
             --period monthly --hot-period "${ret_days} days" >$TMPD/rb-reg.log 2>&1; then
         pass "rb_events registered"
     else
         fail "rb_events register failed"; tail -5 $TMPD/rb-reg.log; return
     fi
 
-    cat > $TMPD/rb.yaml <<EOF
-postgres: { dsn: "${dsn}" }
-iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog" }
-$(storage_yaml)
-EOF
 
     # Hold the window open AFTER Phase 2 (bulk export+commit) and BEFORE Phase 3
     # (replay+cutover). Wait for the archiver to actually reach that hold (its log
     # marker) before killing, so the crash lands with cold rows already in Iceberg
     # but the partition not yet cut over -- the partial state Phase 0 must
     # self-heal. Fail loudly if it never gets there (else the test proves nothing).
-    "$ARCHIVER" --config $TMPD/rb.yaml --debug-export-delay 60s >$TMPD/rb-crash.log 2>&1 &
+    "$ARCHIVER" --debug-export-delay 60s >$TMPD/rb-crash.log 2>&1 &
     local arch_pid=$!
     local reached=0
     for _ in $(seq 1 60); do
@@ -3286,7 +4175,7 @@ EOF
         "$(q "$HOST" "SELECT count(*) FROM public.rb_events WHERE status='crash-row';")"
 
     # Re-run: Phase 0 wipes partial Iceberg data; full archive must complete.
-    if "$ARCHIVER" --config $TMPD/rb.yaml >$TMPD/rb-rerun.log 2>&1; then
+    if "$ARCHIVER" >$TMPD/rb-rerun.log 2>&1; then
         pass "archiver self-healed on re-run (Phase 0 wiped partial Iceberg data)"
     else
         fail "archiver re-run failed after crash"; tail -8 $TMPD/rb-rerun.log; return
@@ -3362,7 +4251,7 @@ EOSQL
 
     # Run partitioner — inbound FK must block the expired partition drop and fail fast.
     local pfk_out
-    pfk_out=$("$PARTITIONER" --config $TMPD/pfk.yaml 2>&1 || true)
+    pfk_out=$("$PARTITIONER" 2>&1 || true)
     assert_contains "partitioner fails fast on inbound FK (SQLSTATE 23503)" "23503" "$pfk_out"
 
     # Expired partition must still be attached — data safe in PG.
@@ -3372,7 +4261,7 @@ EOSQL
     # Fix: remove the referencing row then re-run.
     q "$HOST" "DELETE FROM public.pfk_log_refs WHERE log_ts < date_trunc('month',now()) - interval '2 months';" >/dev/null
 
-    if "$PARTITIONER" --config $TMPD/pfk.yaml >$TMPD/pfk-rerun.log 2>&1; then
+    if "$PARTITIONER" >$TMPD/pfk-rerun.log 2>&1; then
         pass "partitioner self-healed after FK reference removed"
     else
         fail "partitioner re-run failed after FK removed"; tail -8 $TMPD/pfk-rerun.log; return
@@ -3423,7 +4312,7 @@ EOSQL
     local ret_days; ret_days=$(hot_days)  # tier m3, keep m1
 
     # register (tiered) — validates the PK, INSERTs the row.
-    if "$ARCHIVER" register --config $TMPD/archiver.yaml --table cli_events \
+    if "$ARCHIVER" register --table cli_events \
             --period monthly --hot-period "${ret_days} days" >$TMPD/reg.log 2>&1; then
         pass "register cli_events (PK validated, row written)"
     else
@@ -3433,11 +4322,11 @@ EOSQL
         "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='cli_events';")"
 
     # list shows it.
-    "$ARCHIVER" list --config $TMPD/archiver.yaml >$TMPD/list.log 2>&1
+    "$ARCHIVER" list >$TMPD/list.log 2>&1
     if grep -q "cli_events" $TMPD/list.log; then pass "list shows cli_events"; else fail "list missing cli_events"; cat $TMPD/list.log; fi
 
     # register must reject the PK-less table (loud, before any row is written).
-    if "$ARCHIVER" register --config $TMPD/archiver.yaml --table cli_nopk \
+    if "$ARCHIVER" register --table cli_nopk \
             --period monthly --hot-period "1 month" >$TMPD/nopk.log 2>&1; then
         fail "register cli_nopk should have failed (no primary key)"
     else
@@ -3463,7 +4352,7 @@ EOF
         "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='cli_nopk';")"
 
     # retention must exceed hot-period — caught at register time, before any write.
-    if "$ARCHIVER" register --config $TMPD/archiver.yaml --table cli_events \
+    if "$ARCHIVER" register --table cli_events \
             --period monthly --hot-period "3 months" --retention "1 month" >$TMPD/rethot.log 2>&1; then
         fail "register should reject retention <= hot-period"
     else
@@ -3473,7 +4362,7 @@ EOF
     # Periods are native PG intervals: a compound form the old "N unit" parser
     # could never accept now validates (proves the textual parser is gone). --dry-run
     # runs the full conn-backed validation (interval cast) but writes no row.
-    if "$ARCHIVER" register --config $TMPD/archiver.yaml --table cli_events \
+    if "$ARCHIVER" register --table cli_events \
             --period monthly --retention "1 year 2 mons" --dry-run >$TMPD/iv.log 2>&1; then
         pass "register accepts a native PG interval (\"1 year 2 mons\")"
     else
@@ -3481,22 +4370,17 @@ EOF
     fi
     # A non-interval value is rejected by the interval validation (the column type
     # is the write-time backstop; ValidatePeriods gives the clean error first).
-    if "$ARCHIVER" register --config $TMPD/archiver.yaml --table cli_events \
+    if "$ARCHIVER" register --table cli_events \
             --period monthly --retention "banana" --dry-run >$TMPD/badiv.log 2>&1; then
         fail "register should reject a non-interval retention"
     else
         if grep -qi "interval" $TMPD/badiv.log; then pass "register rejects a non-interval period"; else fail "wrong reason"; tail -3 $TMPD/badiv.log; fi
     fi
 
-    # Run the archiver with a connection-only YAML (NO archiver.tables): it must
-    # drive entirely off coldfront.partition_config.
-    cat > $TMPD/conn.yaml <<EOF
-postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
-iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog" }
-$(storage_yaml)
-EOF
-    if "$ARCHIVER" --config $TMPD/conn.yaml >$TMPD/dbrun.log 2>&1; then
-        pass "archiver ran with no YAML tables"
+    # Run the archiver with no YAML: it drives entirely off
+    # coldfront.partition_config.
+    if "$ARCHIVER" >$TMPD/dbrun.log 2>&1; then
+        pass "archiver ran with no YAML at all"
     else
         fail "archiver DB-driven run — see $TMPD/dbrun.log"; tail -8 $TMPD/dbrun.log
     fi
@@ -3505,37 +4389,48 @@ EOF
     assert_eq "cli_events readable hot+cold after DB-driven tiering" "80" "$(q "$HOST" "SELECT count(*) FROM cli_events;")"
 
     # export round-trips the managed set to reviewable YAML.
-    "$ARCHIVER" export --config $TMPD/conn.yaml >$TMPD/export.log 2>&1
+    "$ARCHIVER" export >$TMPD/export.log 2>&1
     if grep -q "source_table: cli_events" $TMPD/export.log; then pass "export emits cli_events as YAML"; else fail "export missing cli_events"; tail -5 $TMPD/export.log; fi
 
-    # TC-118: archiver.tables in YAML is ignored at runtime — the archiver always
-    # resolves its table set from coldfront.partition_config regardless of what
-    # archiver.tables says in the config file.
-    cat > $TMPD/yaml-tables.yaml <<EOYAML
-postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
-iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog" }
-$(storage_yaml)
+    # TC-216: the server is the configuration. A YAML passed to a run is checked
+    # against it and any difference is refused with an error that says where
+    # configuration lives: one check per kind of value (a table, the store, a
+    # catalog setting). A file that agrees, here the archiver's own export, runs.
+    cat > $TMPD/drift-table.yaml <<EOYAML
 archiver:
   tables:
-    - source_table: bogus_table_yaml
+    - source_table: cli_events
       partition_period: monthly
       hot_period: "1 month"
       retention_period: "2 years"
 EOYAML
-    if "$ARCHIVER" --config $TMPD/yaml-tables.yaml >$TMPD/yaml-tables.log 2>&1; then
-        pass "TC-118: archiver ran with stale archiver.tables block in YAML"
+    cat > $TMPD/drift-store.yaml <<EOYAML
+s3:
+  endpoint: "nowhere:8333"
+  access_key: "someone"
+  secret_key: "else"
+EOYAML
+    cat > $TMPD/drift-catalog.yaml <<EOYAML
+iceberg:
+  warehouse: "some_other_warehouse"
+EOYAML
+    local f
+    for f in table store catalog; do
+        if "$ARCHIVER" --config $TMPD/drift-$f.yaml >$TMPD/drift-$f.log 2>&1; then
+            fail "TC-216: the archiver ran with a YAML whose $f disagrees with the server"
+        else
+            pass "TC-216: a YAML whose $f disagrees with the server is refused"
+        fi
+        assert_contains "TC-216: the $f refusal says where configuration lives" "coldfront.partition_config" "$(cat $TMPD/drift-$f.log)"
+    done
+    assert_contains "TC-216: the table refusal names the table" "archiver.tables[0] (public.cli_events)" "$(cat $TMPD/drift-table.log)"
+    assert_contains "TC-216: the store refusal names the stanza" "s3 in the YAML" "$(cat $TMPD/drift-store.log)"
+    assert_contains "TC-216: the catalog refusal names the key" "iceberg.warehouse in the YAML" "$(cat $TMPD/drift-catalog.log)"
+    "$ARCHIVER" export >$TMPD/agree.yaml 2>/dev/null
+    if "$ARCHIVER" >$TMPD/agree.log 2>&1; then
+        pass "TC-216: a YAML that agrees with the server (its own export) runs"
     else
-        fail "TC-118: archiver failed — see $TMPD/yaml-tables.log"; tail -8 $TMPD/yaml-tables.log
-    fi
-    if grep -q "from coldfront.partition_config" $TMPD/yaml-tables.log; then
-        pass "TC-118: archiver drove off partition_config (YAML archiver.tables ignored)"
-    else
-        fail "TC-118: archiver did not load from partition_config"; tail -5 $TMPD/yaml-tables.log
-    fi
-    if grep -qi "bogus_table_yaml" $TMPD/yaml-tables.log; then
-        fail "TC-118: archiver processed the YAML-only table (should be ignored)"
-    else
-        pass "TC-118: YAML archiver.tables block was not processed"
+        fail "TC-216: the export did not pass the check (see $TMPD/agree.log)"; tail -5 $TMPD/agree.log
     fi
 
     # TC-119: export, delete the row, then re-import the EXPORTED archiver.tables
@@ -3543,7 +4438,7 @@ EOYAML
     # exported block with a DSN before importing. import upserts (ON CONFLICT DO
     # UPDATE), so the rows still present are no-ops and cli_events is restored from
     # its exported entry, validating the serialization a hand-written YAML wouldn't.
-    "$ARCHIVER" export --config $TMPD/conn.yaml >$TMPD/export.yaml 2>&1
+    "$ARCHIVER" export >$TMPD/export.yaml 2>&1
     if grep -q "source_table: cli_events" $TMPD/export.yaml; then
         pass "TC-119: export produced YAML with cli_events"
     else
@@ -3551,8 +4446,6 @@ EOYAML
     fi
     cat > $TMPD/roundtrip.yaml <<EOF
 postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
-iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog" }
-$(storage_yaml)
 EOF
     cat $TMPD/export.yaml >>$TMPD/roundtrip.yaml
     # Snapshot the serialized config values before deletion; the round-trip must
@@ -3575,11 +4468,8 @@ EOF
     assert_eq "TC-119: restored values match pre-deletion snapshot (period|hot|retention|enabled)" \
         "$cfg_sig_before" "$cfg_sig_after"
 
-    # TC-120: set writes to partition_config only — the YAML config file is never
-    # touched. Capture a checksum before, run set, then verify both the DB
-    # change and the unchanged file.
-    local yaml_cksum; yaml_cksum=$(md5sum $TMPD/conn.yaml | awk '{print $1}')
-    if "$ARCHIVER" set --config $TMPD/conn.yaml --table cli_events --hot-period "45 days" >$TMPD/setf.log 2>&1; then
+    # TC-120: set writes partition_config.
+    if "$ARCHIVER" set --table cli_events --hot-period "45 days" >$TMPD/setf.log 2>&1; then
         pass "TC-120: set --hot-period succeeded"
     else
         fail "TC-120: set failed — see $TMPD/setf.log"; tail -3 $TMPD/setf.log
@@ -3589,11 +4479,6 @@ EOF
         pass "TC-120: partition_config.hot_period updated to 45 days"
     else
         fail "TC-120: partition_config.hot_period not updated (got: $hot_val)"
-    fi
-    if [ "$(md5sum $TMPD/conn.yaml | awk '{print $1}')" = "$yaml_cksum" ]; then
-        pass "TC-120: YAML file unchanged by set"
-    else
-        fail "TC-120: set modified the YAML file (it must not)"
     fi
 }
 
@@ -3613,7 +4498,7 @@ idmode_check() {
             --part-mode id --id-scheme "$scheme" --retention "60 months" >"$TMPD/$tbl-reg.log" 2>&1; then
         fail "$label id-mode: register failed"; tail -5 "$TMPD/$tbl-reg.log"; return
     fi
-    if ! "$PARTITIONER" --config $TMPD/part.yaml >"$TMPD/$tbl-run.log" 2>&1; then
+    if ! "$PARTITIONER" >"$TMPD/$tbl-run.log" 2>&1; then
         fail "$label id-mode: partitioner run failed"; tail -8 "$TMPD/$tbl-run.log"; return
     fi
     assert_gt "$label id-mode: partitioner premade RANGE(id) partitions" "1" \
@@ -3682,7 +4567,7 @@ END $do$;
 EOSQL
     "$PARTITIONER" register --dsn "$dsn" --schema pre --table events \
         --period monthly --retention "60 months" >/dev/null 2>&1
-    if "$PARTITIONER" --config $TMPD/pre.yaml >$TMPD/pre.log 2>&1; then
+    if "$PARTITIONER" >$TMPD/pre.log 2>&1; then
         pass "premake: reconcile completed over a differently-named future partition"
     else
         fail "premake: reconcile failed, see $TMPD/pre.log"; tail -8 $TMPD/pre.log
@@ -3715,7 +4600,7 @@ story_partitioner_multitable() {
             fail "multi-table: register mt.$t failed"; tail -5 "$TMPD/mt-$t-reg.log"; return
         fi
     done
-    if ! "$PARTITIONER" --config $TMPD/mt.yaml >$TMPD/mt-run.log 2>&1; then
+    if ! "$PARTITIONER" >$TMPD/mt-run.log 2>&1; then
         fail "multi-table: partitioner run failed"; tail -8 $TMPD/mt-run.log; return
     fi
     # BOTH tables get partitions — the collision bug left the second with zero.
@@ -3747,8 +4632,6 @@ story_partitioner_after_swap() {
     # _events is the partitioned hot table.
     assert_eq "precondition — events is a view"       "v" "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='events'  AND relnamespace='public'::regnamespace;")"
     assert_eq "precondition — _events is partitioned" "p" "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='_events' AND relnamespace='public'::regnamespace;")"
-    local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
-    printf 'postgres: { dsn: "%s" }\n' "$dsn" > $TMPD/partitioner.yaml
     # events is archiver-owned (tiered). Temporarily make it partition-only so the
     # standalone partitioner manages it and premakes a wide future window (6, vs the
     # archiver's 3) — proving it resolves the events VIEW to the real _events table
@@ -3757,10 +4640,10 @@ story_partitioner_after_swap() {
     prev_hot=$(q "$HOST" "SELECT hot_period::text       FROM coldfront.partition_config WHERE schema_name='public' AND table_name='events';")
     prev_ret=$(q "$HOST" "SELECT retention_period::text FROM coldfront.partition_config WHERE schema_name='public' AND table_name='events';")
     prev_pre=$(q "$HOST" "SELECT future_partitions      FROM coldfront.partition_config WHERE schema_name='public' AND table_name='events';")
-    if ! "$PARTITIONER" set --config $TMPD/partitioner.yaml --table events --hot-period "" --retention "60 months" --premake 6 >$TMPD/partitioner.log 2>&1; then
+    if ! "$PARTITIONER" set --table events --hot-period "" --retention "60 months" --premake 6 >$TMPD/partitioner.log 2>&1; then
         fail "set events partition-only — see $TMPD/partitioner.log"; tail -5 $TMPD/partitioner.log; return
     fi
-    if "$PARTITIONER" --config $TMPD/partitioner.yaml >>$TMPD/partitioner.log 2>&1; then
+    if "$PARTITIONER" >>$TMPD/partitioner.log 2>&1; then
         pass "partitioner ran off partition_config (events temporarily partition-only)"
     else
         fail "partitioner run failed"; tail -8 $TMPD/partitioner.log
@@ -3784,7 +4667,7 @@ story_partitioner_after_swap() {
         "$(q "$HOST" "SELECT count(*) FROM pg_inherits i JOIN pg_class c ON c.oid=i.inhrelid WHERE i.inhparent='public._events'::regclass AND c.relname='$fut';")"
     # Restore events' tiered config so later stories see it as the archiver owns it;
     # a failed restore would corrupt them, so fail loud.
-    "$ARCHIVER" set --config $TMPD/partitioner.yaml --table events --hot-period "$prev_hot" --retention "$prev_ret" --premake "$prev_pre" >/dev/null 2>&1 \
+    "$ARCHIVER" set --table events --hot-period "$prev_hot" --retention "$prev_ret" --premake "$prev_pre" >/dev/null 2>&1 \
         || fail "restore events tiered config after partitioner-after-swap test"
 }
 
@@ -3820,7 +4703,7 @@ story_partition_config_ownership() {
 
     # Archiver run: processes its tiered row (own.tier), never the partitioner's
     # partition-only row (own.po), and no longer aborts on a foreign row.
-    "$ARCHIVER" --config $TMPD/archiver.yaml >$TMPD/own-arch.log 2>&1 || true
+    "$ARCHIVER" >$TMPD/own-arch.log 2>&1 || true
     if grep -q "hot_period is required in tiered mode" $TMPD/own-arch.log; then
         fail "archiver still choked on the partition-only row"; tail -5 $TMPD/own-arch.log
     else
@@ -3838,7 +4721,7 @@ story_partition_config_ownership() {
     # Partitioner run: reconciles its partition-only row (own.po), never the
     # archiver's tiered row (own.tier), and no longer aborts on a foreign row.
     printf 'postgres: { dsn: "%s" }\n' "$dsn" > $TMPD/own-part.yaml
-    "$PARTITIONER" --config $TMPD/own-part.yaml >$TMPD/own-part.log 2>&1 || true
+    "$PARTITIONER" >$TMPD/own-part.log 2>&1 || true
     if grep -q "only valid in tiered mode" $TMPD/own-part.log; then
         fail "partitioner still choked on the tiered row"; tail -5 $TMPD/own-part.log
     else
@@ -3921,23 +4804,14 @@ INSERT INTO wrong_ep_tbl (ts)
     FROM generate_series(1, 10) i;
 EOSQL
     local ret_days; ret_days=$(hot_days)
-    if ! "$ARCHIVER" register --config $TMPD/archiver.yaml --table wrong_ep_tbl \
+    if ! "$ARCHIVER" register --table wrong_ep_tbl \
             --period monthly --hot-period "${ret_days} days" >$TMPD/wrong-ep.log 2>&1; then
         fail "TC-022: register wrong_ep_tbl — see $TMPD/wrong-ep.log"; tail -5 $TMPD/wrong-ep.log; return
     fi
-    cat > $TMPD/wrong-ep.yaml <<EOF
-postgres:
-  dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
-iceberg:
-  warehouse: "${WAREHOUSE}"
-  lakekeeper_endpoint: "http://${LK_IP}:8181/catalog"
-s3:
-  endpoint: "wronghost:8333"
-  region: "us-east-1"
-  access_key: "admin"
-  secret_key: "adminsecret"
-EOF
-    if "$ARCHIVER" --config $TMPD/wrong-ep.yaml >>$TMPD/wrong-ep.log 2>&1; then
+    # The store's endpoint lives in the storage secret, the one place every cold
+    # write and the archiver read it from; point it at a host that does not exist.
+    q "$HOST" "SELECT coldfront.set_storage_secret('admin','adminsecret','wronghost:8333');" >/dev/null 2>&1
+    if "$ARCHIVER" >>$TMPD/wrong-ep.log 2>&1; then
         fail "TC-022: archiver should have failed with a bad S3 endpoint"
     else
         if grep -qi "wronghost" $TMPD/wrong-ep.log; then
@@ -3946,6 +4820,7 @@ EOF
             fail "TC-022: archiver failed but expected 'wronghost' in error"; tail -5 $TMPD/wrong-ep.log
         fi
     fi
+    q "$HOST" "$(storage_secret_sql)" >/dev/null 2>&1
     # Clean up regardless of pass/fail so partition_config stays tidy for later stories.
     q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name='wrong_ep_tbl';" >/dev/null 2>&1
     q "$HOST" "DROP TABLE IF EXISTS public.wrong_ep_tbl CASCADE;" >/dev/null 2>&1
@@ -3980,7 +4855,7 @@ story_empty_partition() {
     q "$HOST" "CREATE TABLE IF NOT EXISTS public.${pname} PARTITION OF public._events FOR VALUES FROM ('${m12}') TO ('${m12_end}');" >/dev/null
     assert_eq "TC-024: empty partition created (0 rows)" "0" \
         "$(q "$HOST" "SELECT count(*) FROM public.${pname};")"
-    if "$ARCHIVER" --config $TMPD/archiver.yaml >$TMPD/empty-part.log 2>&1; then
+    if "$ARCHIVER" >$TMPD/empty-part.log 2>&1; then
         pass "TC-024: archiver completed with empty partition (exit 0)"
     else
         fail "TC-024: archiver failed on empty partition — see $TMPD/empty-part.log"; tail -8 $TMPD/empty-part.log
@@ -3995,9 +4870,11 @@ story_empty_partition() {
 # rebuilds the transparent UNION-ALL view. DML via the view must route to the
 # renamed table without error, and the table rename back to _events restores
 # the registry. Leaves the table and registry in the original state.
+# On a mesh both renames reach every peer's registry (TC-198).
 # ───────────────────────────────────────────────────────────────────────────
 story_rename_hot_table() {
     step "TC-040: rename hot table updates registry; DML via view works after rename"
+    local reg="SELECT to_regclass(hot_table)::text FROM coldfront.tiered_views WHERE schema_name='public' AND relname='events';"
     assert_eq "precondition: events is a view" "v" \
         "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='events' AND relnamespace='public'::regnamespace;")"
     assert_eq "precondition: _events is partitioned" "p" \
@@ -4006,6 +4883,7 @@ story_rename_hot_table() {
     q "$HOST" "ALTER TABLE public._events RENAME TO _events_renamed;" >/dev/null
     local hot_renamed; hot_renamed=$(q "$HOST" "SELECT hot_table FROM coldfront.tiered_views WHERE schema_name='public' AND relname='events';")
     assert_contains "TC-040: tiered_views.hot_table updated to _events_renamed" "_events_renamed" "$hot_renamed"
+    assert_peers_agree "TC-198: the hot-table rename reached the registry" "$reg"
 
     # INSERT via the view must route to the renamed hot table. Use a timestamp
     # in the CURRENT month (5 days in) — this partition was premade by
@@ -4013,12 +4891,14 @@ story_rename_hot_table() {
     q "$HOST" "INSERT INTO events (ts, status, data) VALUES (date_trunc('month',now()) + interval '5 days', 'rename_chk', '{}');" >/dev/null
     assert_eq "TC-040: row landed in _events_renamed after hot table rename" "1" \
         "$(q "$HOST" "SELECT count(*) FROM public._events_renamed WHERE status='rename_chk';")"
+    assert_peers_agree "TC-198: a row written through the view after the rename arrived" "SELECT count(*) FROM events WHERE status='rename_chk';"
     q "$HOST" "DELETE FROM public._events_renamed WHERE status='rename_chk';" >/dev/null
 
     # Rename back so later stories find _events as expected.
     q "$HOST" "ALTER TABLE public._events_renamed RENAME TO _events;" >/dev/null
     local hot_restored; hot_restored=$(q "$HOST" "SELECT hot_table FROM coldfront.tiered_views WHERE schema_name='public' AND relname='events';")
     assert_eq "TC-040: tiered_views.hot_table restored to _events" "public._events" "$hot_restored"
+    assert_peers_agree "TC-198: the rename back reached the registry" "$reg"
     pass "TC-040: hot table renamed and restored, registry updated both ways"
 }
 
@@ -4058,15 +4938,7 @@ story_partitioner_set_retention() {
 # ───────────────────────────────────────────────────────────────────────────
 story_partitioner_disable_enable() {
     step "TC-053: disable silently excludes from archiver; enable restores it"
-    cat > $TMPD/disen.yaml <<EOF
-postgres:
-  dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
-iceberg:
-  warehouse: "${WAREHOUSE}"
-  lakekeeper_endpoint: "http://${LK_IP}:8181/catalog"
-$(storage_yaml)
-EOF
-    if "$ARCHIVER" set --config $TMPD/disen.yaml --table events --disable >$TMPD/disen.log 2>&1; then
+    if "$ARCHIVER" set --table events --disable >$TMPD/disen.log 2>&1; then
         pass "TC-053: archiver set --disable succeeded"
     else
         fail "TC-053: archiver set --disable failed — see $TMPD/disen.log"; tail -5 $TMPD/disen.log
@@ -4076,14 +4948,14 @@ EOF
     # Disabled run: fresh log so the grep sees only this run. No-op archiver runs
     # may legitimately exit non-zero, so the run stays non-fatal (|| true); the log
     # assertion, not the exit code, proves events was excluded.
-    "$ARCHIVER" --config $TMPD/disen.yaml >$TMPD/disen-off.log 2>&1 || true
+    "$ARCHIVER" >$TMPD/disen-off.log 2>&1 || true
     if grep -q "\[events\]" $TMPD/disen-off.log; then
         fail "TC-053: [events] appeared in archiver log while disabled (should be silently excluded)"
     else
         pass "TC-053: [events] absent from archiver log (silently excluded via WHERE enabled)"
     fi
 
-    if "$ARCHIVER" set --config $TMPD/disen.yaml --table events --enable >$TMPD/disen-enable.log 2>&1; then
+    if "$ARCHIVER" set --table events --enable >$TMPD/disen-enable.log 2>&1; then
         pass "TC-053: archiver set --enable succeeded"
     else
         fail "TC-053: archiver set --enable failed (see $TMPD/disen-enable.log)"; tail -5 $TMPD/disen-enable.log
@@ -4092,14 +4964,14 @@ EOF
         "$(q "$HOST" "SELECT enabled FROM coldfront.partition_config WHERE schema_name='public' AND table_name='events';")"
     # Re-enabled run: fresh log (grep only this run); non-fatal, since no-op runs
     # may legitimately exit non-zero.
-    "$ARCHIVER" --config $TMPD/disen.yaml >$TMPD/disen-on.log 2>&1 || true
+    "$ARCHIVER" >$TMPD/disen-on.log 2>&1 || true
     if grep -q "\[events\]" $TMPD/disen-on.log; then
         pass "TC-053: [events] present in archiver log after re-enable"
     else
         fail "TC-053: [events] absent from archiver log even after re-enable (see $TMPD/disen-on.log)"; tail -8 $TMPD/disen-on.log
     fi
     # Ensure events is enabled regardless of test outcome (safety net for later stories).
-    "$ARCHIVER" set --config $TMPD/disen.yaml --table events --enable >/dev/null 2>&1 || true
+    "$ARCHIVER" set --table events --enable >/dev/null 2>&1 || true
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -4169,7 +5041,104 @@ EOF
         fail "TC-194: re-import of the exported YAML failed: see $TMPD/impexp.log"; tail -5 "$TMPD/impexp.log"
     fi
     assert_eq "TC-194: the re-imported registration matches" "monthly|ts|2 mons|1 year" "$(q "$HOST" "$row")"
+    # TC-218: import writes the file's cold-store stanza into the server through
+    # set_storage_secret, and refuses a file that sets two stores.
+    cat >"$TMPD/twostores.yaml" <<'EOF'
+s3:
+  endpoint: "a:8333"
+  access_key: "a"
+  secret_key: "a"
+azure:
+  connection_string: "AccountName=acct;AccountKey=Zm9v"
+EOF
+    if "$PARTITIONER" import --config "$TMPD/twostores.yaml" >"$TMPD/twostores.log" 2>&1; then
+        fail "TC-218: import accepted a YAML with both s3: and azure:"
+    else
+        pass "TC-218: import refuses a YAML with both s3: and azure:"
+    fi
+    assert_contains "TC-218: the refusal names the rule" "not both" "$(cat "$TMPD/twostores.log")"
+    if [ "$BACKEND" = s3 ]; then
+        cat >"$TMPD/store.yaml" <<EOF
+s3:
+  endpoint: "${SW_IP}:8333"
+  access_key: "admin2"
+  secret_key: "adminsecret"
+EOF
+        if "$ARCHIVER" import --config "$TMPD/store.yaml" >"$TMPD/store.log" 2>&1; then
+            pass "TC-218: import of a store-only YAML succeeded"
+        else
+            fail "TC-218: import of a store-only YAML failed (see $TMPD/store.log)"; tail -5 "$TMPD/store.log"
+        fi
+        assert_eq "TC-218: import wrote the s3 stanza into coldfront.storage_secret" "admin2|${SW_IP}:8333" \
+            "$(q "$HOST" "SELECT key_id || '|' || endpoint FROM coldfront.storage_secret;")"
+        q "$HOST" "$(storage_secret_sql)" >/dev/null
+    fi
+    # TC-226: a file whose iceberg keys disagree with the server is refused before
+    # anything is written, with or without --dry-run: those settings live in
+    # postgresql.conf, which the import cannot write, so it cannot make them agree.
+    cat >"$TMPD/catdrift.yaml" <<'EOYAML'
+iceberg:
+  warehouse: "not-the-server-warehouse"
+archiver:
+  tables:
+    - source_table: cli_catdrift
+      partition_period: monthly
+      retention_period: "12 months"
+EOYAML
+    q "$HOST" "CREATE TABLE IF NOT EXISTS cli_catdrift (id bigint, ts timestamptz NOT NULL, PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);" >/dev/null 2>&1
+    if "$PARTITIONER" import --config "$TMPD/catdrift.yaml" >"$TMPD/catdrift.log" 2>&1; then
+        fail "TC-226: import accepted a YAML whose iceberg.warehouse disagrees with the server"
+    else
+        pass "TC-226: import refuses a YAML whose iceberg.warehouse disagrees with the server"
+    fi
+    assert_contains "TC-226: the refusal names the key" "iceberg.warehouse in the YAML" "$(cat "$TMPD/catdrift.log")"
+    assert_eq "TC-226: the refused file wrote no table row" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name = 'cli_catdrift';")"
+    if "$PARTITIONER" import --config "$TMPD/catdrift.yaml" --dry-run >"$TMPD/catdrift-dry.log" 2>&1; then
+        fail "TC-226: a dry run accepted the same file"
+    else
+        pass "TC-226: a dry run refuses the same file"
+    fi
+    q "$HOST" "DROP TABLE IF EXISTS cli_catdrift;" >/dev/null 2>&1
     q "$HOST" "DELETE FROM coldfront.partition_config WHERE schema_name='impexp'; DROP SCHEMA impexp CASCADE;" >/dev/null 2>&1
+    # TC-227: the store stanza is written before the table rows, so an import
+    # whose storage-secret setter fails writes no row. A trigger that raises on
+    # coldfront.storage_secret stands in for the setter failing.
+    cat >"$TMPD/secretfail.yaml" <<'EOYAML'
+s3:
+  endpoint: "store.invalid:8333"
+  access_key: "refused"
+  secret_key: "refused"
+archiver:
+  tables:
+    - source_table: cli_secretfail
+      partition_period: monthly
+      retention_period: "12 months"
+EOYAML
+    qf "$HOST" <<'EOSQL' >"$TMPD/secretfail-setup.log" 2>&1
+CREATE TABLE public.cli_secretfail (id bigint, ts timestamptz NOT NULL, PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);
+CREATE FUNCTION public.tc227_refuse() RETURNS trigger LANGUAGE plpgsql AS $f$
+BEGIN RAISE EXCEPTION 'TC-227: storage secret refused'; END $f$;
+CREATE TRIGGER tc227_refuse BEFORE INSERT OR UPDATE ON coldfront.storage_secret
+    FOR EACH ROW EXECUTE FUNCTION public.tc227_refuse();
+EOSQL
+    if grep -q ERROR "$TMPD/secretfail-setup.log"; then
+        fail "TC-227: setup failed (see $TMPD/secretfail-setup.log)"; tail -3 "$TMPD/secretfail-setup.log"; return
+    fi
+    local secret_before
+    secret_before="$(q "$HOST" "SELECT storage_type || '|' || coalesce(key_id, '') || '|' || coalesce(endpoint, '') FROM coldfront.storage_secret;")"
+    if "$PARTITIONER" import --config "$TMPD/secretfail.yaml" >"$TMPD/secretfail.log" 2>&1; then
+        fail "TC-227: import succeeded although the storage-secret setter failed"
+    else
+        pass "TC-227: import fails when the storage-secret setter fails"
+    fi
+    q "$HOST" "DROP TRIGGER IF EXISTS tc227_refuse ON coldfront.storage_secret; DROP FUNCTION IF EXISTS public.tc227_refuse();" >/dev/null 2>&1
+    assert_contains "TC-227: the failure names the store stanza" "import s3 stanza" "$(cat "$TMPD/secretfail.log")"
+    assert_eq "TC-227: the failed import wrote no table row" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name = 'cli_secretfail';")"
+    assert_eq "TC-227: the storage secret is unchanged" "$secret_before" \
+        "$(q "$HOST" "SELECT storage_type || '|' || coalesce(key_id, '') || '|' || coalesce(endpoint, '') FROM coldfront.storage_secret;")"
+    q "$HOST" "DROP TABLE IF EXISTS public.cli_secretfail;" >/dev/null 2>&1
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -4214,8 +5183,7 @@ story_partitioner_stock_pg() {
     fi
 
     # And the job itself: a reconcile run creates the forward window.
-    printf 'postgres: { dsn: "%s" }\n' "$dsn" > $TMPD/stock.yaml
-    if "$PARTITIONER" --config $TMPD/stock.yaml >$TMPD/stock-run.log 2>&1; then
+    if "$PARTITIONER" --dsn "$dsn" >$TMPD/stock-run.log 2>&1; then
         assert_ne "TC-151: reconcile created partitions" "0" \
             "$(qdb $db "SELECT count(*) FROM pg_inherits WHERE inhparent='public.stockev'::regclass;")"
     else
@@ -4254,7 +5222,7 @@ story_composite_key_rejected() {
     ) PARTITION BY RANGE (region, ts);" >/dev/null
     # register succeeds: validatePKSuperset passes because the PK covers all
     # partition-key columns. The composite-key guard fires later in the archiver.
-    if "$ARCHIVER" register --config $TMPD/archiver.yaml --table composite_part \
+    if "$ARCHIVER" register --table composite_part \
             --period monthly --hot-period "1 month" --retention "5 years" >$TMPD/cp-reg.log 2>&1; then
         pass "TC-071: register composite_part succeeded (PK covers partition key)"
     else
@@ -4266,7 +5234,7 @@ story_composite_key_rejected() {
         "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='composite_part';")"
     # Archive run: detectPartitionColumns sees two columns and exits non-zero
     # before any Iceberg or S3 work is attempted.
-    if "$ARCHIVER" --config $TMPD/archiver.yaml >$TMPD/cp.log 2>&1; then
+    if "$ARCHIVER" >$TMPD/cp.log 2>&1; then
         fail "TC-071: archiver should have rejected the composite partition key"
     else
         if grep -qi "multi-column partition keys are not supported" $TMPD/cp.log; then
@@ -4403,14 +5371,14 @@ INSERT INTO public.tc066_ntz (id, created_at, val)
 VALUES (1, (date_trunc('month', now()) - interval '2 months' + interval '5 days')::timestamp, 'cold_ntz');
 EOSQL
     local ret_days; ret_days=$(hot_days)
-    if "$ARCHIVER" register --config $TMPD/archiver.yaml --table tc066_ntz \
+    if "$ARCHIVER" register --table tc066_ntz \
             --period monthly --hot-period "${ret_days} days" >$TMPD/ntz.log 2>&1; then
         pass "TC-066: register tc066_ntz succeeded (timestamp no-tz column accepted)"
     else
         fail "TC-066: register failed — see $TMPD/ntz.log"; tail -5 $TMPD/ntz.log
         q "$HOST" "DROP TABLE IF EXISTS public.tc066_ntz CASCADE;" >/dev/null 2>&1; return
     fi
-    if archive_only "schema_name='public' AND table_name='tc066_ntz'" $TMPD/archiver.yaml $TMPD/ntz.log; then
+    if archive_only "schema_name='public' AND table_name='tc066_ntz'" $TMPD/ntz.log; then
         pass "TC-066: archiver archived timestamp (no tz) partition column"
     else
         fail "TC-066: archive failed — see $TMPD/ntz.log"; tail -5 $TMPD/ntz.log
@@ -4456,14 +5424,14 @@ INSERT INTO public.tc067_date (id, order_date, val)
 VALUES (1, (date_trunc('month', now()) - interval '2 months' + interval '5 days')::date, 'cold_date');
 EOSQL
     local ret_days; ret_days=$(hot_days)
-    if "$ARCHIVER" register --config $TMPD/archiver.yaml --table tc067_date \
+    if "$ARCHIVER" register --table tc067_date \
             --period monthly --hot-period "${ret_days} days" >$TMPD/datecol.log 2>&1; then
         pass "TC-067: register tc067_date succeeded (date column accepted)"
     else
         fail "TC-067: register failed — see $TMPD/datecol.log"; tail -5 $TMPD/datecol.log
         q "$HOST" "DROP TABLE IF EXISTS public.tc067_date CASCADE;" >/dev/null 2>&1; return
     fi
-    if archive_only "schema_name='public' AND table_name='tc067_date'" $TMPD/archiver.yaml $TMPD/datecol.log; then
+    if archive_only "schema_name='public' AND table_name='tc067_date'" $TMPD/datecol.log; then
         pass "TC-067: archiver archived date partition column"
     else
         fail "TC-067: archive failed — see $TMPD/datecol.log"; tail -5 $TMPD/datecol.log
@@ -4499,7 +5467,7 @@ CREATE TABLE IF NOT EXISTS public.tc070_textpart_a
     PARTITION OF public.tc070_textpart FOR VALUES FROM ('a') TO ('n');
 INSERT INTO public.tc070_textpart VALUES (1, 'apple');
 EOSQL
-    if "$ARCHIVER" register --config $TMPD/archiver.yaml --table tc070_textpart \
+    if "$ARCHIVER" register --table tc070_textpart \
             --period monthly --hot-period "30 days" >$TMPD/textpart.log 2>&1; then
         pass "TC-070: register text-partitioned table succeeded (no strategy check at register)"
     else
@@ -4507,7 +5475,7 @@ EOSQL
     fi
     # The archive pass gets its own log so the rejection grep below cannot be
     # satisfied by the register output above.
-    if archive_only "schema_name='public' AND table_name='tc070_textpart'" $TMPD/archiver.yaml $TMPD/textpart-arch.log; then
+    if archive_only "schema_name='public' AND table_name='tc070_textpart'" $TMPD/textpart-arch.log; then
         fail "TC-070: archiver should have rejected text partition column"
     else
         if grep -qi "cannot parse partition bound\|unsupported partition\|unsupported.*column\|not supported\|unrecognized\|parse.*bound" $TMPD/textpart-arch.log; then
@@ -4567,14 +5535,12 @@ EOSQL
     local ret_days; ret_days=$(hot_days)
     cat > $TMPD/typed-ext.yaml <<EOF
 postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
-iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog" }
-$(storage_yaml)
 archiver: { tables: [ { source_table: typed_ext, partition_period: monthly, hot_period: "${ret_days} days" } ] }
 EOF
     local _archived=0
     if ! "$ARCHIVER" import --config $TMPD/typed-ext.yaml >$TMPD/typed-ext.log 2>&1; then
         fail "import typed_ext — see $TMPD/typed-ext.log"; tail -5 $TMPD/typed-ext.log
-    elif "$ARCHIVER" --config $TMPD/typed-ext.yaml >>$TMPD/typed-ext.log 2>&1; then
+    elif "$ARCHIVER" >>$TMPD/typed-ext.log 2>&1; then
         pass "typed_ext archived (m4 partition → cold)"
         _archived=1
     else
@@ -4694,15 +5660,7 @@ BEGIN
     WHERE conrelid='tc107.logs'::regclass AND contype='p' LIMIT 1;
     IF cname IS NOT NULL THEN EXECUTE 'ALTER TABLE tc107.logs DROP CONSTRAINT ' || cname; END IF;
 END \$\$;" >/dev/null 2>&1 || true
-    cat > $TMPD/tc107.yaml <<EOF
-postgres:
-  dsn: "${dsn}"
-iceberg:
-  warehouse: "${WAREHOUSE}"
-  lakekeeper_endpoint: "http://${LK_IP}:8181/catalog"
-$(storage_yaml)
-EOF
-    if archive_only "schema_name='tc107'" $TMPD/tc107.yaml $TMPD/tc107.log; then
+    if archive_only "schema_name='tc107'" $TMPD/tc107.log; then
         fail "TC-107: archiver exited 0 — the PK-less logs table should have failed it"
         tail -5 $TMPD/tc107.log
     else
@@ -4757,15 +5715,7 @@ EOSQL
     q "$HOST" "UPDATE coldfront.partition_config SET enabled=false WHERE schema_name='tc109' AND table_name='logs';" >/dev/null
     assert_eq "TC-109: logs disabled in partition_config" "f" \
         "$(q "$HOST" "SELECT enabled FROM coldfront.partition_config WHERE schema_name='tc109' AND table_name='logs';")"
-    cat > $TMPD/tc109.yaml <<EOF
-postgres:
-  dsn: "${dsn}"
-iceberg:
-  warehouse: "${WAREHOUSE}"
-  lakekeeper_endpoint: "http://${LK_IP}:8181/catalog"
-$(storage_yaml)
-EOF
-    if archive_only "schema_name='tc109'" $TMPD/tc109.yaml $TMPD/tc109.log; then
+    if archive_only "schema_name='tc109'" $TMPD/tc109.log; then
         pass "TC-109: archiver completed"
     else
         fail "TC-109: archiver failed — see $TMPD/tc109.log"; tail -5 $TMPD/tc109.log
@@ -4877,7 +5827,7 @@ INSERT INTO xb.events (ts, val) VALUES ('0044-03-15 00:00:00+00 BC', 'ides');
 EOSQL
     "$PARTITIONER" register --dsn "$dsn" --schema xb --table events \
         --period monthly --hot-period "30 days" --retention "5 years" >/dev/null 2>&1
-    if archive_only "schema_name='xb' AND table_name='events'" $TMPD/archiver.yaml $TMPD/xb.log; then
+    if archive_only "schema_name='xb' AND table_name='events'" $TMPD/xb.log; then
         pass "TC-145/TC-146/TC-147/TC-148/TC-149: exotic bounds: archiver completed without aborting"
     else
         fail "TC-145/TC-146/TC-147/TC-148/TC-149: exotic bounds: archiver aborted — see $TMPD/xb.log"; tail -8 $TMPD/xb.log
@@ -4972,7 +5922,7 @@ EOSQL
         "$(q "$HOST" "SELECT count(*) FROM ord.sales;")"
     "$PARTITIONER" register --dsn "$dsn" --schema ord --table sales \
         --period monthly --hot-period "30 days" >/dev/null 2>&1
-    if archive_only "schema_name='ord' AND table_name='sales'" $TMPD/archiver.yaml $TMPD/ord.log; then
+    if archive_only "schema_name='ord' AND table_name='sales'" $TMPD/ord.log; then
         pass "bound order: archive cycle completed"
     else
         fail "bound order: archiver failed, see $TMPD/ord.log"; tail -8 $TMPD/ord.log
@@ -4996,7 +5946,7 @@ EOSQL
     q "$HOST" "CREATE TABLE ord.sales_p_stale PARTITION OF ord._sales
                  FOR VALUES FROM ('2001-01-01') TO ('2001-02-01');" >/dev/null
     q "$HOST" "INSERT INTO ord.sales_p_stale (id, ts, amount) VALUES (9001, '2001-01-15', 1);" >/dev/null
-    if archive_only "schema_name='ord' AND table_name='sales'" $TMPD/archiver.yaml $TMPD/ord2.log; then
+    if archive_only "schema_name='ord' AND table_name='sales'" $TMPD/ord2.log; then
         fail "bound order: archiver dropped a non-empty stale partition; it must refuse"
     else
         pass "bound order: archiver refused a non-empty partition below the watermark"
@@ -5040,9 +5990,10 @@ story_case_collision_rejected() {
 # Story — names the partition naming scheme cannot carry are refused at register.
 # A leading "_" is the tiered hot table's prefix, and a partition is named
 # <name>_p_YYYY_MM (_p_YYYY_MM_DD daily), so the name must fit within 63 bytes.
+# `set --period` checks the name against the new suffix too (TC-200).
 # ───────────────────────────────────────────────────────────────────────────
 story_bad_source_names_rejected() {
-    step "TC-139/TC-142: unrepresentable table names rejected at register"
+    step "TC-139/TC-142/TC-200: unrepresentable table names rejected at register and set"
     local long53 long54
     long53=$(head -c 53 < /dev/zero | tr "\\0" a); long54="${long53}a"
     q "$HOST" "CREATE TABLE IF NOT EXISTS public._mytest (id bigint NOT NULL, ts timestamptz NOT NULL, PRIMARY KEY (id,ts)) PARTITION BY RANGE (ts);" >/dev/null
@@ -5053,12 +6004,21 @@ story_bad_source_names_rejected() {
         _mytest underscore
     assert_register_rejected "TC-142: register stated the 53-byte maximum for over-long names" "$long54" 53
     # The boundary must still be usable: 53 is exactly what monthly allows.
-    if "$ARCHIVER" register --config $TMPD/archiver.yaml --table "$long53" \
+    if "$ARCHIVER" register --table "$long53" \
             --period monthly --hot-period "30 days" >$TMPD/badname53.log 2>&1; then
         pass "TC-142: a 53-char name is accepted (the limit is not off by one)"
     else
         fail "TC-142: 53 chars must be accepted — see $TMPD/badname53.log"; tail -3 $TMPD/badname53.log
     fi
+    # set re-validates a period change: 53 bytes leave no room for the daily suffix.
+    if "$ARCHIVER" set --table "$long53" --period daily >$TMPD/badname53-set.log 2>&1; then
+        fail "TC-200: set --period daily accepted a 53-char name"
+    else
+        assert_contains "TC-200: set --period daily stated the 50-byte daily maximum" \
+            "maximum for daily partitioning is 50" "$(cat $TMPD/badname53-set.log)"
+    fi
+    assert_eq "TC-200: the refused set left the period monthly" "monthly" \
+        "$(q "$HOST" "SELECT partition_period FROM coldfront.partition_config WHERE table_name='${long53}';")"
 
     assert_eq "TC-139/TC-142: only the legal name reached partition_config" "1" \
         "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name IN ('_mytest','${long53}','${long54}');")"
@@ -5099,7 +6059,7 @@ story_unmappable_column_rejected() {
     fi
     # The same table is fine partition-only: --dry-run validates everything and
     # writes nothing, so the acceptance is asserted without leaving a config row.
-    if "$ARCHIVER" register --config $TMPD/archiver.yaml --table tc150_fts \
+    if "$ARCHIVER" register --table tc150_fts \
             --period monthly --retention "5 years" --dry-run >$TMPD/unmappable-po.log 2>&1; then
         pass "TC-150: the same table validates partition-only (no cold tier, no type check)"
     else
@@ -5131,7 +6091,7 @@ EOSQL
 )
     assert_eq "TC-114: TEMP table is visible inside its creating session" "true" \
         "$(extract INSESSION "$insession")"
-    if "$ARCHIVER" register --config $TMPD/archiver.yaml --table tc114_tempev \
+    if "$ARCHIVER" register --table tc114_tempev \
             --period monthly --hot-period "30 days" >$TMPD/temprej.log 2>&1; then
         fail "TC-114: register should fail (table not visible in new session)"
     else
@@ -5163,7 +6123,7 @@ CREATE TABLE IF NOT EXISTS public.tc115_region_ev_eu
     PARTITION OF public.tc115_region_ev FOR VALUES IN ('eu');
 INSERT INTO public.tc115_region_ev (region, ts) VALUES ('eu', now() - interval '6 months');
 EOSQL
-    if "$ARCHIVER" register --config $TMPD/archiver.yaml --table tc115_region_ev \
+    if "$ARCHIVER" register --table tc115_region_ev \
             --period monthly --hot-period "30 days" >$TMPD/listpart.log 2>&1; then
         pass "TC-115: register LIST table succeeded (no strategy check at register)"
     else
@@ -5171,7 +6131,7 @@ EOSQL
     fi
     # Own log for the archive pass: the grep below matches on "LIST", which the
     # register output also contains.
-    if archive_only "schema_name='public' AND table_name='tc115_region_ev'" $TMPD/archiver.yaml $TMPD/listpart-arch.log; then
+    if archive_only "schema_name='public' AND table_name='tc115_region_ev'" $TMPD/listpart-arch.log; then
         fail "TC-115: archiver should have rejected LIST-partitioned table"
     else
         if grep -qi "cannot parse partition bound\|FOR VALUES IN\|LIST\|unsupported\|unrecognized\|parse.*bound" $TMPD/listpart-arch.log; then
@@ -5199,7 +6159,7 @@ CREATE TABLE IF NOT EXISTS public.tc116_hash_ev_0
     PARTITION OF public.tc116_hash_ev FOR VALUES WITH (MODULUS 4, REMAINDER 0);
 INSERT INTO public.tc116_hash_ev VALUES (1, now() - interval '6 months');
 EOSQL
-    if "$ARCHIVER" register --config $TMPD/archiver.yaml --table tc116_hash_ev \
+    if "$ARCHIVER" register --table tc116_hash_ev \
             --period monthly --hot-period "30 days" >$TMPD/hashpart.log 2>&1; then
         pass "TC-116: register HASH table succeeded (no strategy check at register)"
     else
@@ -5207,7 +6167,7 @@ EOSQL
     fi
     # Own log for the archive pass: the grep below matches on "HASH", which the
     # register output also contains.
-    if archive_only "schema_name='public' AND table_name='tc116_hash_ev'" $TMPD/archiver.yaml $TMPD/hashpart-arch.log; then
+    if archive_only "schema_name='public' AND table_name='tc116_hash_ev'" $TMPD/hashpart-arch.log; then
         fail "TC-116: archiver should have rejected HASH-partitioned table"
     else
         if grep -qi "cannot parse partition bound\|MODULUS\|HASH\|unsupported" $TMPD/hashpart-arch.log; then
@@ -5258,15 +6218,7 @@ EOSQL
     "$PARTITIONER" register --dsn "$dsn" --schema sc2    --table sa_items --period monthly --hot-period "${ret_days} days" --retention "5 years" >/dev/null 2>&1
     assert_eq "TC-138: both sa_items registered as tiered" "2" \
         "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='sa_items' AND hot_period IS NOT NULL AND enabled;")"
-    cat > $TMPD/schema-coll.yaml <<EOF
-postgres:
-  dsn: "${dsn}"
-iceberg:
-  warehouse: "${WAREHOUSE}"
-  lakekeeper_endpoint: "http://${LK_IP}:8181/catalog"
-$(storage_yaml)
-EOF
-    if archive_only "table_name='sa_items'" $TMPD/schema-coll.yaml $TMPD/schema-coll.log; then
+    if archive_only "table_name='sa_items'" $TMPD/schema-coll.log; then
         pass "TC-138: archiver archived both schemas without conflict"
     else
         fail "TC-138: archiver failed — see $TMPD/schema-coll.log"; tail -5 $TMPD/schema-coll.log
@@ -5553,8 +6505,8 @@ story_compactor_error_paths() {
     step "TC-126: compactor missing --table flag exits 2 with usage message"
     local ec
 
-    # TC-126: --config present, --table absent → exit 2 + usage on stderr.
-    "$COMPACTOR" --config $TMPD/archiver.yaml >/dev/null 2>$TMPD/comp-miss.log
+    # TC-126: --table absent → exit 2 + usage on stderr.
+    compactor >/dev/null 2>$TMPD/comp-miss.log
     ec=$?
     assert_eq "TC-126: missing --table flag exits with code 2" "2" "$ec"
     assert_contains "TC-126: usage message printed on missing --table" "usage:" \
@@ -5562,7 +6514,7 @@ story_compactor_error_paths() {
 
     step "TC-127: compactor nonexistent table exits non-zero with error"
     # TC-127: --table names a table that has never been registered with Lakekeeper.
-    "$COMPACTOR" --config $TMPD/archiver.yaml --table nonexistent_xyz_table \
+    compactor --table nonexistent_xyz_table \
         >/dev/null 2>$TMPD/comp-noexist.log
     ec=$?
     if [ "$ec" -ne 0 ]; then
@@ -5585,7 +6537,7 @@ story_compactor_advanced() {
     # TC-134: pass --expire-snapshots and --orphans together with compaction.
     # After story_maintenance the events cold tier has 1 snapshot and 0 orphans,
     # so each step is a no-op — but all three code paths must exit 0 together.
-    if "$COMPACTOR" --config $TMPD/archiver.yaml --table events \
+    if compactor --table events \
             --expire-snapshots --expire-older-than 0s --expire-retain-last 1 \
             --orphans --orphan-age 0s >/dev/null 2>$TMPD/tc134.log; then
         pass "TC-134: compaction + expire-snapshots + orphans in one invocation exited 0"
@@ -5596,7 +6548,7 @@ story_compactor_advanced() {
 
     # TC-135: non-default --target-size-mb accepted; dry-run exits 0.
     local out135 ec135
-    out135=$("$COMPACTOR" --config $TMPD/archiver.yaml --table events \
+    out135=$(compactor --table events \
             --target-size-mb 512 --dry-run 2>&1)
     ec135=$?
     if [ "$ec135" -eq 0 ]; then
@@ -5613,16 +6565,9 @@ story_compactor_advanced() {
 story_compactor_wrong_creds() {
     require_compactor || return
     step "TC-136: compactor bad Lakekeeper endpoint — non-zero exit with error"
-    local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
-    cat >$TMPD/badlk.yaml <<EOF
-postgres:
-  dsn: "${dsn}"
-iceberg:
-  warehouse: "${WAREHOUSE}"
-  lakekeeper_endpoint: "http://127.0.0.1:19999/catalog"
-$(storage_yaml)
-EOF
-    if "$COMPACTOR" --config $TMPD/badlk.yaml --table events \
+    # The catalog endpoint is the server's coldfront.lakekeeper_endpoint setting;
+    # the compactor's own session gets one that answers nothing.
+    if PGOPTIONS="-c coldfront.lakekeeper_endpoint=http://127.0.0.1:19999/catalog" compactor --table events \
             >/dev/null 2>$TMPD/tc136.log; then
         fail "TC-136: expected non-zero exit with bad Lakekeeper endpoint, got 0"
     else
@@ -5668,7 +6613,7 @@ INSERT INTO public.tc137_conc (ts) VALUES
 EOSQL
     "$PARTITIONER" register --dsn "$dsn" --table tc137_conc \
         --period monthly --hot-period "30 days" >/dev/null 2>&1
-    if ! archive_only "table_name='tc137_conc'" $TMPD/archiver.yaml $TMPD/tc137a.log; then
+    if ! archive_only "table_name='tc137_conc'" $TMPD/tc137a.log; then
         fail "TC-137: initial archive of tc137_conc failed — see $TMPD/tc137a.log"
         tail -5 $TMPD/tc137a.log
         q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name='tc137_conc';" >/dev/null 2>&1
@@ -5682,10 +6627,10 @@ EOSQL
     local rows_before; rows_before=$(q "$HOST" "SELECT count(*) FROM tc137_conc;")
 
     # Two simultaneous compactors; bakery claim must serialise their commits.
-    "$COMPACTOR" --config $TMPD/archiver.yaml --table tc137_conc \
+    compactor --table tc137_conc \
         >/dev/null 2>$TMPD/tc137-c1.log &
     local pid1=$!
-    "$COMPACTOR" --config $TMPD/archiver.yaml --table tc137_conc \
+    compactor --table tc137_conc \
         >/dev/null 2>$TMPD/tc137-c2.log &
     local pid2=$!
     wait "$pid1"; local ec1=$?
@@ -5765,7 +6710,7 @@ EOSQL
         fi
     done
 
-    if archive_only "schema_name='qtn'" $TMPD/archiver.yaml $TMPD/qtn.log; then
+    if archive_only "schema_name='qtn'" $TMPD/qtn.log; then
         pass "TC-140/TC-143/TC-144: archiver completed for all three quoted-name tables"
     else
         fail "TC-140/TC-143/TC-144: archiver aborted — see $TMPD/qtn.log"
@@ -5865,12 +6810,7 @@ story_partitioned_cold_tables() {
     for i in 7 8; do q "$HOST" "INSERT INTO public.tccomp VALUES ($i, ($m) + interval '1 month' + interval '$i days', 'b');" >/dev/null 2>&1; done
     q "$HOST" "DELETE FROM public.tccomp WHERE id IN (1, 2, 7);" >/dev/null 2>&1
     assert_eq "TC-190: eight rows written, three deleted" "5" "$(q "$HOST" "SELECT count(*) FROM public.tccomp;")"
-    cat > $TMPD/tccomp.yaml <<EOF
-postgres: { dsn: "host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable" }
-iceberg:  { warehouse: "${WAREHOUSE}", lakekeeper_endpoint: "http://${LK_IP}:8181/catalog" }
-$(storage_yaml)
-EOF
-    if "$COMPACTOR" --config $TMPD/tccomp.yaml --table tccomp >$TMPD/tccomp.log 2>&1; then
+    if compactor --table tccomp >$TMPD/tccomp.log 2>&1; then
         pass "TC-190: compaction of a partitioned table with deletes succeeds"
     else
         fail "TC-190: compaction failed, see $TMPD/tccomp.log"; tail -3 $TMPD/tccomp.log
@@ -5961,6 +6901,58 @@ story_vector_probe_pruning() {
         "$(q "$HOST" "SELECT (SELECT count(*) FROM coldfront.vector_config WHERE table_name = 'tcvp') + (SELECT count(*) FROM coldfront.vector_centroids WHERE table_name = 'tcvp');")"
 }
 
+# ───────────────────────────────────────────────────────────────────────────
+# Story: TC-214. The archiver's first registration of a table is one
+# transaction: the rename of the heap, the view and the registry row commit
+# together, so a failure at the registry leaves the table as it was, and a mesh
+# peer, which applies the transaction as a unit, never has the view without the
+# row its hook resolves it by. The fixture is a trigger that refuses the table's
+# registry row. Vanilla only: the trigger would reach the peers as DDL.
+# ───────────────────────────────────────────────────────────────────────────
+story_bootstrap_atomic() {
+    [ "$MESH" = 1 ] && return
+    step "TC-214: the archiver's first registration of a table is one transaction"
+    _tc214_cleanup() {
+        q "$HOST" "DROP TRIGGER IF EXISTS tc214_refuse ON coldfront.tiered_views;" >/dev/null 2>&1
+        q "$HOST" "SELECT coldfront.drop_iceberg_table('public','tc214', true);" >/dev/null 2>&1
+        q "$HOST" "DELETE FROM coldfront.tiered_views WHERE relname='tc214'; DELETE FROM coldfront.archive_watermark WHERE table_name='tc214'; DELETE FROM coldfront.partition_config WHERE table_name='tc214';" >/dev/null 2>&1
+        q "$HOST" "DROP VIEW IF EXISTS public.tc214 CASCADE;" >/dev/null 2>&1
+        q "$HOST" "DROP TABLE IF EXISTS public._tc214 CASCADE;" >/dev/null 2>&1
+        q "$HOST" "DROP TABLE IF EXISTS public.tc214 CASCADE;" >/dev/null 2>&1
+        q "$HOST" "DROP FUNCTION IF EXISTS public.tc214_refuse();" >/dev/null 2>&1
+    }
+    trap _tc214_cleanup RETURN
+    qf "$HOST" <<'EOSQL' >/dev/null 2>&1
+CREATE TABLE public.tc214 (id bigint GENERATED BY DEFAULT AS IDENTITY, ts timestamptz NOT NULL, PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);
+DO $do$ DECLARE m date; BEGIN FOR i IN -3..0 LOOP
+  m := (date_trunc('month', now()) + make_interval(months => i))::date;
+  EXECUTE format('CREATE TABLE public.%I PARTITION OF public.tc214 FOR VALUES FROM (%L) TO (%L)',
+                 'tc214_p_' || to_char(m, 'YYYY_MM'), m, m + interval '1 month');
+END LOOP; END $do$;
+INSERT INTO public.tc214 (ts) SELECT date_trunc('month', now()) - interval '3 months' + i * interval '1 day' FROM generate_series(1, 5) i;
+CREATE FUNCTION public.tc214_refuse() RETURNS trigger LANGUAGE plpgsql AS $f$
+BEGIN RAISE EXCEPTION 'tc214: registry refused'; END $f$;
+CREATE TRIGGER tc214_refuse BEFORE INSERT ON coldfront.tiered_views
+    FOR EACH ROW WHEN (NEW.relname = 'tc214') EXECUTE FUNCTION public.tc214_refuse();
+EOSQL
+    if ! "$ARCHIVER" register --table tc214 --column ts --period monthly \
+            --hot-period "$(hot_days) days" >$TMPD/tc214.log 2>&1; then
+        fail "TC-214: register tc214 (see $TMPD/tc214.log)"; tail -5 $TMPD/tc214.log; return
+    fi
+    if archive_only "schema_name='public' AND table_name='tc214'" $TMPD/tc214.log; then
+        fail "TC-214: the pass succeeded with the registry row refused"; return
+    fi
+    assert_contains "TC-214: the pass failed at the registry row" "tc214: registry refused" "$(cat $TMPD/tc214.log)"
+    assert_eq "TC-214: the refused registration left the table under its own name, with no view and no renamed heap" "p|0" \
+        "$(q "$HOST" "SELECT (SELECT relkind::text FROM pg_class WHERE relname = 'tc214' AND relnamespace = 'public'::regnamespace) || '|' || (SELECT count(*) FROM pg_class WHERE relname = '_tc214' AND relnamespace = 'public'::regnamespace);")"
+    q "$HOST" "DROP TRIGGER tc214_refuse ON coldfront.tiered_views;" >/dev/null 2>&1
+    if ! archive_only "schema_name='public' AND table_name='tc214'" $TMPD/tc214.log; then
+        fail "TC-214: the pass after the refusal (see $TMPD/tc214.log)"; tail -5 $TMPD/tc214.log; return
+    fi
+    assert_eq "TC-214: the next pass registered the table: view, renamed heap and registry row" "v|1|1" \
+        "$(q "$HOST" "SELECT (SELECT relkind::text FROM pg_class WHERE relname = 'tc214' AND relnamespace = 'public'::regnamespace) || '|' || (SELECT count(*) FROM pg_class WHERE relname = '_tc214' AND relnamespace = 'public'::regnamespace) || '|' || (SELECT count(*) FROM coldfront.tiered_views WHERE schema_name = 'public' AND relname = 'tc214');")"
+}
+
 # ── orchestrate ────────────────────────────────────────────────────────────
 # Setup is shared. The story set then branches on mode: tiered exercises the
 # hot+cold partitioned path; decoupled exercises the all-Iceberg wrapper. (The
@@ -5982,6 +6974,7 @@ if [ "$MODE" = "tiered" ]; then
                             # manifests iceberg-go-readable
     story_maintenance       # iceberg-go ExpireSnapshots + DeleteOrphanFiles — reclaim the
                             # snapshot/small-file bloat compaction leaves (Lakekeeper can't)
+    story_expiry_vs_reader  # TC-225: an expiry shorter than an open transaction fails its next scan
     [ "$MESH" = 1 ] || story_start_snapshot_expired  # a write whose start snapshot expired fails as outdated
     story_compactor_claim_matches_writes  # the compactor waits for a cold write's claim on created and adopted tables
     story_writes_plpgsql
@@ -5994,15 +6987,28 @@ if [ "$MODE" = "tiered" ]; then
     story_concurrency
     story_concurrent_writers
     story_txn
+    story_insert_single_pass
+    story_view_without_trigger
+    story_preload_required
+    story_copy_into_view
+    story_nested_insert
+    story_nested_update_delete
+    story_merge
+    story_nested_merge
+    story_tiered_ryw
+    story_snapshot_pinned   # TC-224: a transaction keeps the snapshot of its first cold read
+    story_mixed_write_rule
     story_coexist
     story_cold_retention
     story_tiered_twolevel
+    story_twolevel_name_collision      # TC-199: colliding LIST child names fail the archiver pass
     story_partitioner_idmode
     story_partitioner_multitable
     story_premake_respects_existing_range  # premake provisions a range, not a name
     story_partitioner_after_swap
     story_fk_constraint
     story_archiver_rollback
+    story_bootstrap_atomic             # TC-214: a refused registry row leaves the table as it was
     story_partitioner_fk_drop
     story_register_cli
     story_partition_config_ownership   # each binary loads only its own rows
@@ -6025,7 +7031,7 @@ if [ "$MODE" = "tiered" ]; then
     story_register_idempotent          # TC-110: re-register updates values; no duplicate row
     story_unlogged_rejected            # TC-113: UNLOGGED rejected at register
     story_case_collision_rejected      # TC-141: name differing only by case rejected at register
-    story_bad_source_names_rejected    # TC-139/TC-142: leading underscore and over-long names rejected
+    story_bad_source_names_rejected    # TC-139/TC-142/TC-200: leading underscore and over-long names rejected
     story_unmappable_column_rejected   # TC-150: column type with no Iceberg mapping rejected at register
     story_quoted_table_names           # TC-140/TC-143/TC-144: dot, hyphen, space in table name
     story_temp_rejected                # TC-114: TEMP table invisible to archiver
@@ -6061,6 +7067,7 @@ story_drop_iceberg_table   # both modes, purge and keep-files (own throwaway tab
 [ "$MESH" = 1 ] && story_mesh_multiwriter   # >1 cold writer/node cross-node (tiered: events, decoupled: iceonly)
 [ "$MESH" = 1 ] && story_mesh_reaper        # orphan claims/acks reaped on the claim, apply and poke paths
 [ "$MESH" = 1 ] && story_mesh_claim_failures  # a failed claim step leaves no lock, claim or open loopback
+[ "$MESH" = 1 ] && story_mesh_dead_peer  # TC-221..223: a wal_sender_timeout the window does not cover is refused, idle replies inside the window, a silent peer ruled dead and rejoining
 [ -n "$STANDBY" ]    && story_standby_reads
 
 summary

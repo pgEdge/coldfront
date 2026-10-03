@@ -32,18 +32,18 @@ EXPLAIN (COSTS OFF, VERBOSE)
 -----------------------------------------------------------------------------------------------------------------------------------------------------
  Nested Loop
    Output: h.id, h.ts, h.status
-   CTE hot
+   CTE coldfront_hot
      ->  Update on public._events
            Output: _events.id, _events.ts, _events.status
            ->  Seq Scan on public._events
                  Output: 'x'::text, _events.ctid
                  Filter: (_events.id = 1)
-   CTE cold
+   CTE coldfront_cold
      ->  Result
            Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET status = ''x''::text   WHERE (id = 1)'::text)
-   ->  CTE Scan on cold c
+   ->  CTE Scan on coldfront_cold c
          Output: c._exec_iceberg_with_claim
-   ->  CTE Scan on hot h
+   ->  CTE Scan on coldfront_hot h
          Output: h.id, h.ts, h.status
 (15 rows)
 

@@ -86,11 +86,11 @@ DB_IP=$(ip "$DB"); LK_IP=$(ip coldfront-lakekeeper-1)
 # so the gcs warehouse must also be named "wh" (only its storage profile differs:
 # s3 @ GCS). azure has its own image/compose with the wh-azure GUC.
 case "$BACKEND" in
-  azure)  SW_IP=""; WAREHOUSE=wh-azure;;
-  azure-vended) SW_IP=""; WAREHOUSE=wh-azure;;
-  gcs)    SW_IP=""; WAREHOUSE=wh;;
-  aws)    SW_IP=""; WAREHOUSE=wh;;
-  *)      SW_IP=$(ip coldfront-seaweedfs-1); WAREHOUSE=wh;;   # s3 (static) + vended
+  azure)  SW_IP="";;
+  azure-vended) SW_IP="";;
+  gcs)    SW_IP="";;
+  aws)    SW_IP="";;
+  *)      SW_IP=$(ip coldfront-seaweedfs-1);;   # s3 (static) + vended
 esac
 
 # SeaweedFS backends: pre-create the bucket, matching every real backend (the
@@ -198,5 +198,5 @@ step "vanilla: run journey (backend=$BACKEND mode=$MODE standby=$STANDBY)"
 # Pass the azure connection string via the INHERITED env (COLDFRONT_AZURE_CONNECTION_STRING),
 # never as a CLI arg — argv is world-visible in `ps`, and the connection string carries the
 # storage account key. journey.sh reads it from the same env var.
-BACKEND_ARG=(--backend "$BACKEND" --warehouse "$WAREHOUSE")
+BACKEND_ARG=(--backend "$BACKEND")
 "$SCRIPT_DIR/../journey.sh" --host "$DB" --db-ip "$DB_IP" --sw-ip "$SW_IP" --lk-ip "$LK_IP" --mode "$MODE" "${BACKEND_ARG[@]}" "${STANDBY_ARG[@]}"

@@ -1,0 +1,39 @@
+-- A transaction block in which a statement failed still ends: ROLLBACK, COMMIT
+-- and ROLLBACK TO SAVEPOINT each leave the session usable, though they reach
+-- coldfront's hooks after the transaction's resources are released.
+CREATE EXTENSION IF NOT EXISTS pg_duckdb;
+NOTICE:  extension "pg_duckdb" already exists, skipping
+CREATE EXTENSION IF NOT EXISTS coldfront;
+NOTICE:  extension "coldfront" already exists, skipping
+BEGIN;
+SELECT 1/0;
+ERROR:  division by zero
+ROLLBACK;
+SELECT 'rollback ended the block' AS result;
+          result          
+--------------------------
+ rollback ended the block
+(1 row)
+
+BEGIN;
+SELECT 1/0;
+ERROR:  division by zero
+COMMIT;
+SELECT 'commit ended the block' AS result;
+         result         
+------------------------
+ commit ended the block
+(1 row)
+
+BEGIN;
+SAVEPOINT s;
+SELECT 1/0;
+ERROR:  division by zero
+ROLLBACK TO SAVEPOINT s;
+SELECT 'the block continues after the savepoint' AS result;
+                 result                  
+-----------------------------------------
+ the block continues after the savepoint
+(1 row)
+
+COMMIT;

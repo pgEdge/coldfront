@@ -1,56 +1,224 @@
--- Regression guard: a leading WITH (CTE) clause on INSERT into a tiered view.
--- emit_tiered_insert splits the row source across the PG hot half and the DuckDB
--- cold half; the CTE must reach both. The rewrite folds the WITH into the source
--- subquery so its CTEs scope to the derived table on each engine. White-box:
--- EXPLAIN VERBOSE shows the rewritten split; we do NOT execute.
+-- A WITH clause on an INSERT into a tiered view, in both positions PostgreSQL
+-- allows. A leading WITH's entries open the rewritten statement, ahead of the
+-- rewrite's own, so an entry that modifies data stays at the top level where
+-- PostgreSQL requires it. An INSERT nested in a WITH entry is rewritten in
+-- place, with the rewrite's source and cold sink lifted into the outer WITH
+-- list just before it. White-box: hot rows only, since the regress server has
+-- no warehouse; cold rows are ci/journey.sh's.
+-- Suppress the run-order-dependent "already exists" NOTICE: in the shared
+-- regress db an earlier test may have created the extensions, standalone not.
+SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS pg_duckdb;
-NOTICE:  extension "pg_duckdb" already exists, skipping
 CREATE EXTENSION IF NOT EXISTS coldfront;
-NOTICE:  extension "coldfront" already exists, skipping
+RESET client_min_messages;
 SET TIME ZONE 'UTC';
 SET coldfront.warehouse = '';
 SET coldfront.lakekeeper_endpoint = '';
 SET coldfront.local_pg_dsn = '';
+SET coldfront.loopback_dsn = '';
 CREATE TABLE public._events (id int, ts timestamptz, status text);
 CREATE VIEW public.events AS SELECT * FROM public._events;
 INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
 VALUES ('public', 'events', 'public._events', 'ice.default.events', 'ts');
 INSERT INTO coldfront.archive_watermark(schema_name, table_name, cutoff_time)
 VALUES ('public', 'events', '2026-03-01'::timestamptz);
--- INSERT ... SELECT FROM a CTE into the tiered view: the WITH must reach both the
--- hot (PG) and cold (DuckDB) halves, folded into the source derived table.
+CREATE TABLE public.staging (id int, ts timestamptz, status text);
+-- A leading WITH: the plan shows its entry at the top level beside the
+-- rewrite's, and the source reads it there.
 EXPLAIN (COSTS OFF, VERBOSE)
   WITH s AS (SELECT 7 AS id, '2026-05-01 00:00:00+00'::timestamptz AS ts, 'new' AS status)
   INSERT INTO public.events SELECT id, ts, status FROM s;
-                                                                                                                                                                                                                            QUERY PLAN                                                                                                                                                                                                                            
-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                      QUERY PLAN                                                                      
+------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
-   Output: $3, $4
-   CTE hot_ins
+   Output: $4, $5
+   CTE coldfront_source
+     ->  Result
+           Output: 7, 'Fri May 01 00:00:00 2026 UTC'::timestamp with time zone, 'new'::text
+   CTE coldfront_hot
      ->  Insert on public._events
            Output: 1
-           ->  Result
-                 Output: 7, 'Fri May 01 00:00:00 2026 UTC'::timestamp with time zone, 'new'::text
-   CTE cold_call
-     ->  Result
-           Output: _exec_iceberg_with_claim('ice.default.events'::text, 'INSERT INTO ice.default.events SELECT id, ts, status FROM (WITH s AS (          SELECT 7 AS id,             ''Fri May 01 00:00:00 2026 UTC''::timestamptz AS ts,             ''new''::text AS status         )  SELECT s.id,             s.ts,             s.status            FROM s) AS coldfront_src(id, ts, status) WHERE ts < ''Sun Mar 01 00:00:00 2026 UTC''::timestamptz'::text)
-   InitPlan 3 (returns $3)
+           ->  CTE Scan on coldfront_source
+                 Output: coldfront_source.id, coldfront_source.ts, coldfront_source.status
+                 Filter: (coldfront_source.ts >= 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
+   CTE coldfront_cold
      ->  Aggregate
-           Output: count(*)
-           ->  CTE Scan on hot_ins
-                 Output: hot_ins."?column?"
+           Output: _cold_sink('public'::text, 'events'::text, to_jsonb(ROW(coldfront_source_1.id, coldfront_source_1.ts, coldfront_source_1.status)))
+           ->  CTE Scan on coldfront_source coldfront_source_1
+                 Output: coldfront_source_1.id, coldfront_source_1.ts, coldfront_source_1.status
+                 Filter: (coldfront_source_1.ts < 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
    InitPlan 4 (returns $4)
      ->  Aggregate
            Output: count(*)
-           ->  CTE Scan on cold_call
-                 Output: cold_call._exec_iceberg_with_claim
-(20 rows)
+           ->  CTE Scan on coldfront_hot
+                 Output: coldfront_hot."?column?"
+   InitPlan 5 (returns $5)
+     ->  CTE Scan on coldfront_cold
+           Output: coldfront_cold.n
+(25 rows)
+
+-- An entry may take a name the rewrite's own entries once had.
+WITH src AS (SELECT 1 AS id, '2026-05-01 00:00:00+00'::timestamptz AS ts, 'src' AS status)
+INSERT INTO public.events SELECT id, ts, status FROM src;
+ hot_rows | cold_rows 
+----------+-----------
+        1 |         0
+(1 row)
+
+-- A recursive WITH.
+WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 3)
+INSERT INTO public.events (id, ts, status) SELECT 10 + i, '2026-05-01 00:00:00+00', 'recursive' FROM n;
+ hot_rows | cold_rows 
+----------+-----------
+        3 |         0
+(1 row)
+
+-- An entry that modifies data: the rows a DELETE returns move into the view.
+INSERT INTO public.staging VALUES (20, '2026-05-01 00:00:00+00', 'moved');
+WITH moved AS (DELETE FROM public.staging RETURNING id, ts, status)
+INSERT INTO public.events SELECT id, ts, status FROM moved;
+ hot_rows | cold_rows 
+----------+-----------
+        1 |         0
+(1 row)
+
+SELECT count(*) AS staging_left FROM public.staging;
+ staging_left 
+--------------
+            0
+(1 row)
+
+-- An INSERT nested in WITH: on its own, reading an entry before it, under a
+-- top-level INSERT into another table, with a bound parameter, and in plpgsql.
+WITH i AS (INSERT INTO public.events (id, ts, status) VALUES (30, '2026-05-01 00:00:00+00', 'nested'))
+SELECT 1 AS outer_ran;
+ outer_ran 
+-----------
+         1
+(1 row)
+
+WITH a AS (SELECT 31 AS id, '2026-05-01 00:00:00+00'::timestamptz AS ts, 'nested_cte' AS status),
+     i AS (INSERT INTO public.events SELECT id, ts, status FROM a)
+SELECT count(*) AS outer_read FROM a;
+ outer_read 
+------------
+          1
+(1 row)
+
+WITH i AS (INSERT INTO public.events (id, ts, status) VALUES (32, '2026-05-01 00:00:00+00', 'nested_under_insert'))
+INSERT INTO public.staging VALUES (32, '2026-05-01 00:00:00+00', 'outer');
+PREPARE nested(text) AS
+  WITH i AS (INSERT INTO public.events (id, ts, status) VALUES (33, '2026-05-01 00:00:00+00', $1))
+  SELECT 1;
+EXECUTE nested('nested_param');
+ ?column? 
+----------
+        1
+(1 row)
+
+DO $$ DECLARE x int; BEGIN
+  WITH i AS (INSERT INTO public.events (id, ts, status) VALUES (34, '2026-05-01 00:00:00+00', 'nested_plpgsql'))
+  SELECT 1 INTO x;
+END $$;
+SELECT id, ts, status FROM public._events ORDER BY id;
+ id |              ts              |       status        
+----+------------------------------+---------------------
+  1 | Fri May 01 00:00:00 2026 UTC | src
+ 11 | Fri May 01 00:00:00 2026 UTC | recursive
+ 12 | Fri May 01 00:00:00 2026 UTC | recursive
+ 13 | Fri May 01 00:00:00 2026 UTC | recursive
+ 20 | Fri May 01 00:00:00 2026 UTC | moved
+ 30 | Fri May 01 00:00:00 2026 UTC | nested
+ 31 | Fri May 01 00:00:00 2026 UTC | nested_cte
+ 32 | Fri May 01 00:00:00 2026 UTC | nested_under_insert
+ 33 | Fri May 01 00:00:00 2026 UTC | nested_param
+ 34 | Fri May 01 00:00:00 2026 UTC | nested_plpgsql
+(10 rows)
+
+SELECT id, status FROM public.staging ORDER BY id;
+ id | status 
+----+--------
+ 32 | outer
+(1 row)
+
+-- With a watermark a row may go cold, so RETURNING is refused as at the top
+-- level.
+WITH i AS (INSERT INTO public.events (id, ts, status) VALUES (40, '2026-05-01 00:00:00+00', 'returning') RETURNING id)
+SELECT id FROM i;
+ERROR:  RETURNING is not supported for writes to the cold tier of "events"
+HINT:  The cold tier (Iceberg) cannot return affected rows: duckdb-iceberg does not support RETURNING on writes. Re-run without RETURNING.
+-- The rewrite stands in for one write to the view: a second one in the same
+-- statement is refused.
+WITH i AS (INSERT INTO public.events (id, ts, status) VALUES (41, '2026-05-01 00:00:00+00', 'twice'))
+INSERT INTO public.events (id, ts, status) VALUES (42, '2026-05-01 00:00:00+00', 'twice');
+ERROR:  a statement may write a tiered view only once
+HINT:  Split the writes into separate statements.
+WITH i AS (INSERT INTO public.events (id, ts, status) VALUES (43, '2026-05-01 00:00:00+00', 'twice')),
+     j AS (INSERT INTO public.events (id, ts, status) VALUES (44, '2026-05-01 00:00:00+00', 'twice'))
+SELECT 1;
+ERROR:  a statement may write a tiered view only once
+HINT:  Split the writes into separate statements.
+SELECT count(*) AS rows_after FROM public._events;
+ rows_after 
+------------
+         10
+(1 row)
+
+-- Without a watermark every row is hot, and a nested INSERT keeps RETURNING.
+CREATE TABLE public._plain (id int, ts timestamptz, status text);
+CREATE VIEW public.plain AS SELECT * FROM public._plain;
+INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
+VALUES ('public', 'plain', 'public._plain', 'ice.default.plain', 'ts');
+WITH i AS (INSERT INTO public.plain (id, ts, status) VALUES (1, '2026-01-01 00:00:00+00', 'hot') RETURNING id, status)
+SELECT id, status FROM i;
+ id | status 
+----+--------
+  1 | hot
+(1 row)
 
 -- Cleanup.
 DELETE FROM coldfront.tiered_views;
 DELETE FROM coldfront.archive_watermark;
-DROP VIEW public.events;
-DROP TABLE public._events;
+DROP VIEW public.events, public.plain;
+DROP TABLE public._events, public._plain, public.staging;
+-- A decoupled view's INSERT runs its source in DuckDB, which does not see the
+-- statement's WITH entries. A nested INSERT is rewritten in place (EXPLAIN
+-- only: no warehouse) as long as it reads none of them, and a leading WITH that
+-- modifies data is refused, because DuckDB cannot run the write it holds.
+CREATE TABLE public._ice_base (id int, ts timestamptz, status text);
+CREATE VIEW public.iceplain AS SELECT * FROM public._ice_base;
+INSERT INTO coldfront.tiered_views(schema_name, relname, iceberg_table, is_iceberg_only)
+VALUES ('public', 'iceplain', 'ice.default.iceplain', true);
+EXPLAIN (COSTS OFF, VERBOSE)
+  WITH i AS (INSERT INTO public.iceplain (id, ts, status) VALUES (1, '2026-05-01 00:00:00+00', 'nested'))
+  SELECT 1;
+                                                                                                            QUERY PLAN                                                                                                             
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result
+   Output: 1
+   CTE i
+     ->  Update on coldfront._dummy_dml_target
+           ->  Seq Scan on coldfront._dummy_dml_target
+                 Output: _dummy_dml_target.anchor, _dummy_dml_target.ctid
+                 Filter: (_exec_iceberg_with_claim('ice.default.iceplain'::text, 'INSERT INTO ice.default.iceplain (id, ts, status)   VALUES (1, ''Fri May 01 00:00:00 2026 UTC''::timestamptz, ''nested''::text)'::text) IS NULL)
+(7 rows)
+
+WITH a AS (SELECT 2 AS id, '2026-05-01 00:00:00+00'::timestamptz AS ts, 'from_cte' AS status),
+     i AS (INSERT INTO public.iceplain SELECT id, ts, status FROM a)
+SELECT 1;
+ERROR:  a cold-tier write on "iceplain" nested in WITH cannot read another WITH entry
+DETAIL:  It runs in DuckDB, which does not see the statement's WITH entries.
+HINT:  Run it as its own statement.
+CREATE TABLE public.staging (id int, ts timestamptz, status text);
+WITH moved AS (DELETE FROM public.staging RETURNING id, ts, status)
+INSERT INTO public.iceplain SELECT id, ts, status FROM moved;
+ERROR:  a cold-tier write on "iceplain" cannot use a data-modifying WITH query
+DETAIL:  The cold tier runs the statement in DuckDB, where a WITH query must be a SELECT.
+HINT:  Run the WITH query's write as a separate statement.
+-- Cleanup.
+DELETE FROM coldfront.tiered_views;
+DROP VIEW public.iceplain;
+DROP TABLE public._ice_base, public.staging;
 -- The clustered iceberg-only INSERT is re-emitted so the cluster is derived in
 -- the same statement, and the CTE must survive that re-emission too: the WITH
 -- folds into the derived table the assignment reads from, the only scope its

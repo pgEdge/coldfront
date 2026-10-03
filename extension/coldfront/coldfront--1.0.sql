@@ -126,9 +126,10 @@ INSERT INTO coldfront._dummy_dml_target DEFAULT VALUES;
 
 -- Cold-tier S3 credential — the in-DB source of truth, set via
 -- coldfront.set_storage_secret(). As an extension-member table its DATA is NOT
--- carried by pg_dump (no pg_extension_config_dump), and it is added to the
--- Spock repset so the row replicates by value to every mesh node — unlike an
--- FDW user-mapping (which pg_dump DOES dump and which does not replicate).
+-- carried by pg_dump (no pg_extension_config_dump), and the one-time mesh step
+-- coldfront.ensure_replicated() adds it to the Spock repset, so the row
+-- replicates by value to every mesh node, unlike an FDW user-mapping (which
+-- pg_dump DOES dump and which does not replicate).
 --
 -- The row is materialized into a DuckDB PERSISTENT SECRET (see
 -- coldfront.materialize_storage_secret); DuckDB loads that at instance init, so
@@ -254,6 +255,56 @@ SELECT pg_extension_config_dump('coldfront.partition_config', '');
 SELECT pg_extension_config_dump('coldfront.vector_config', '');
 SELECT pg_extension_config_dump('coldfront.vector_centroids', '');
 
+-- ============================================================================
+-- ONE-TIME MESH SETUP
+-- ============================================================================
+-- coldfront.ensure_replicated(): run once on every node of a Spock mesh, after
+-- spock.node_create and the node's spock.sub_create calls and before the first
+-- cold write, storage secret or table registration. It puts every ColdFront
+-- table that replicates by value in the node's default replication set.
+-- Membership is a property of the provider, so each node adds the tables for
+-- the rows it will send; a peer's subscription then receives them. Nothing
+-- calls it at run time: a node that skipped it keeps its claim acks, registry
+-- rows, secret and lifecycle config to itself.
+--
+-- The tables, all keyed by name so a row is identical on every node:
+--   claims, claim_acks               the bakery's tickets and acknowledgements
+--   tiered_views                     the registry the hook resolves a view by
+--   archive_watermark                the hot/cold cutoff a tiered write routes by
+--   storage_secret                   the cold-store credential
+--   partition_config                 per-table lifecycle (the archiver and the
+--                                    partitioner add it themselves as well, since
+--                                    the partitioner runs without the extension)
+--   vector_config, vector_centroids  cluster routing state
+-- Two tables stay local by design and are not added: deferred_acks (each
+-- node's own queue of acks it owes) and _dummy_dml_target (each node's
+-- CREATE EXTENSION seeds its row).
+--
+-- Idempotent, and a no-op without the spock extension. spock.repset_add_table
+-- needs the local Spock node, which is why this cannot run at CREATE EXTENSION
+-- time. No EXCEPTION block: pg_duckdb rejects every subtransaction.
+CREATE FUNCTION coldfront.ensure_replicated() RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    t text;
+BEGIN
+    IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'spock') THEN
+        RETURN;
+    END IF;
+    FOREACH t IN ARRAY ARRAY['coldfront.claims', 'coldfront.claim_acks',
+                             'coldfront.tiered_views', 'coldfront.archive_watermark',
+                             'coldfront.storage_secret', 'coldfront.partition_config',
+                             'coldfront.vector_config', 'coldfront.vector_centroids'] LOOP
+        PERFORM spock.repset_add_table('default', t::regclass, false)
+        WHERE NOT EXISTS (
+            SELECT 1 FROM spock.replication_set rs
+              JOIN spock.replication_set_table rst ON rst.set_id = rs.set_id
+             WHERE rs.set_name = 'default' AND rst.set_reloid = t::regclass
+        );
+    END LOOP;
+END;
+$$;
+
 -- ensure_attached() issues ATTACH IF NOT EXISTS for the Lakekeeper catalog
 -- using the coldfront.warehouse and coldfront.lakekeeper_endpoint GUCs. Called
 -- lazily by the extension hook (coldfront.c) on the first query in a session
@@ -366,6 +417,25 @@ END;
 -- non-superuser. search_path pinned per SECURITY DEFINER hardening.
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog;
 
+-- coldfront._hot_only: the per-row guard a hot MERGE's INSERT action gets on its
+-- partition-column value. The hot MERGE runs in PostgreSQL against the hot table
+-- alone, so a row below the cutoff, which belongs in Iceberg, is refused rather
+-- than written to the wrong tier; any other value comes back unchanged. STABLE,
+-- so the planner does not fold a constant value and EXPLAIN shows the guard.
+CREATE OR REPLACE FUNCTION coldfront._hot_only(
+    p_value timestamptz, p_cutoff timestamptz, p_view text, p_col text
+) RETURNS timestamptz LANGUAGE plpgsql STABLE STRICT AS $$
+BEGIN
+  IF p_value < p_cutoff THEN
+    RAISE EXCEPTION 'a MERGE into the hot tier of tiered view "%" cannot insert a row with "%" = %, which is below the cutoff',
+      p_view, p_col, p_value
+      USING ERRCODE = 'feature_not_supported',
+            HINT = 'Insert the row with INSERT, which splits rows by the cutoff.';
+  END IF;
+  RETURN p_value;
+END;
+$$;
+
 -- grant_app_access(target_role) — ONE-CALL onboarding for a NON-superuser app
 -- role. Grants exactly the minimal privileges the transparent cold path needs
 -- and nothing more: duckdb.postgres_role membership (DuckDB execution), USAGE on
@@ -378,7 +448,7 @@ $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog;
 -- coverage. Schema/view/sequence lists are DERIVED from the registry (never
 -- hardcoded); the function-EXECUTE list is an explicit allow-list mirroring the
 -- runtime callsites in coldfront.c (ensure_attached/ensure_pg_attached via SPI,
--- _exec_iceberg_with_claim/_tiered_insert_cold emitted into rewrites,
+-- _exec_iceberg_with_claim/_cold_sink emitted into rewrites,
 -- _enqueue_release + the R-A bakery _claim_iceberg_lock on the cold-write
 -- path). Allow-list = fail safe: a missing entry breaks the app path loudly
 -- (the journey's story_app_privilege + ci/ops.sh check 3 are the tripwires), it
@@ -405,7 +475,7 @@ BEGIN
   -- DuckDB execution: pg_duckdb gates on membership of duckdb.postgres_role.
   EXECUTE format('GRANT %I TO %s', duckrole, tgt);
 
-  -- _cross_tier_move reads Iceberg with iceberg_scan inside a function, which
+  -- _cross_tier_move reads Iceberg through DuckDB inside a function, which
   -- pg_duckdb allows only under this parameter, and pg_duckdb defines it
   -- superuser-only. The app role runs that move under its own privileges, so it
   -- needs to set the parameter itself. Narrower than it looks: the deployment
@@ -424,7 +494,12 @@ BEGIN
     FROM pg_proc p
     WHERE p.pronamespace = 'coldfront'::regnamespace
       AND p.proname IN ('ensure_attached', 'ensure_pg_attached',
-                        '_exec_iceberg_with_claim', '_tiered_insert_cold',
+                        '_exec_iceberg_with_claim',
+                        -- the tiered INSERT's cold sink and its row renderer
+                        '_cold_sink', '_cold_sink_step', '_cold_sink_flush',
+                        '_cold_sink_final', '_cold_row_literal',
+                        -- the hot MERGE's per-row cutoff guard on INSERT actions
+                        '_hot_only',
                         -- cross-tier move: the hook rewrites a partition-column
                         -- UPDATE to SELECT _cross_tier_move(...), which serialises
                         -- cold rows via _move_row_literal.
@@ -463,8 +538,8 @@ BEGIN
   END LOOP;
 
   -- USAGE on the IDENTITY/serial sequences behind tiered hot tables: the cold
-  -- INSERT path (coldfront._tiered_insert_cold) shares the hot side's sequence
-  -- via nextval() AS THE INVOKER, so the app role needs USAGE on it. Derived from
+  -- INSERT rewrite calls nextval() on it AS THE INVOKER for each cold row, so
+  -- the app role needs USAGE on it. Derived from
   -- pg_depend (sequences owned-by 'a'/'i' of each registered hot table) — not
   -- hardcoded; to_regclass tolerates NULL/iceberg-only hot_table (-> no row).
   FOR r IN
@@ -811,245 +886,162 @@ BEGIN
 END;
 $$;
 
--- _tiered_insert_cold: cold-side handler for a tiered-view INSERT.
+-- ============================================================================
+-- The cold sink: the cold half of a tiered-view INSERT.
 --
--- The C hook splits the user's INSERT into two SQL halves wrapped in a
--- CTE: the hot half is a plain `INSERT INTO _events SELECT … FROM
--- (source) WHERE partition_col >= cutoff` (PG-native, set-based, IDENTITY
--- auto-fills); the cold half is `SELECT coldfront._tiered_insert_cold(…)`.
---
--- This function opens a cursor on `<source> WHERE partition_col < cutoff`
--- and walks rows one at a time. Per row, it calls nextval() on the
--- IDENTITY sequence (advancing the same shared sequence the hot
--- side uses, so the two tiers' ids never collide) and accumulates a
--- VALUES tuple. Every batch_size rows it flushes one duckdb.raw_query
--- with the accumulated VALUES — one Iceberg snapshot per batch.
---
--- Source is read once on the cold side via the cursor; the hot side
--- reads source independently via PG. Two scans over the same table; no
--- staging.
---
--- IDENTITY handling: when the user's target list omits the IDENTITY
--- column, nextval(seq) is injected positionally for that column. When
--- the user supplied it, their value flows through unchanged (and
--- nextval is not called).
-CREATE OR REPLACE FUNCTION coldfront._tiered_insert_cold(
-    p_view_schema text,
-    p_view_name   text,
-    p_target_cols text[],
-    p_source_sql  text
-) RETURNS bigint
-LANGUAGE plpgsql AS $$
+-- The C hook rewrites INSERT INTO <tiered view> ... into one statement that
+-- holds the source in a MATERIALIZED CTE, inserts the hot rows into the hot
+-- table from it, and aggregates the cold rows from it with _cold_sink. Each
+-- row reaches the sink as jsonb with one key per hot-table column, projected
+-- in the statement: the user's value, nextval() for an omitted identity
+-- column, the DEFAULT expression for an omitted column that has one, NULL
+-- otherwise. The sink renders and batches and does nothing else: the step
+-- function renders each row as a DuckDB VALUES tuple and flushes every
+-- coldfront.cold_write_batch_size rows as one INSERT under the table's claim,
+-- and the final function flushes the rest and returns the row count. The
+-- claim is taken once per table per transaction (_take_iceberg_claim), the
+-- same sequence as every other cold write. The state is NULL until the first
+-- row, so an aggregate over no cold rows writes nothing and returns 0.
+-- ============================================================================
+CREATE TYPE coldfront._cold_sink_state AS (
+    iceberg text,       -- the DuckDB ref the batches are written to
+    cols    text[],     -- hot-table columns in attnum order, vector companions excluded
+    types   text[],     -- their PG types, for _cold_row_literal
+    batch   int,        -- rows per flush
+    buf     text[],     -- rendered tuples waiting for a flush
+    total   bigint      -- rows rendered so far
+);
+
+-- coldfront._cold_row_literal: render one row (jsonb keyed by column name) as a
+-- DuckDB positional VALUES tuple in attnum order. bytea is rebuilt with
+-- from_hex on the hex text (callers pin bytea_output to hex), a vector is cast
+-- to FLOAT[], a NULL is NULL, everything else is a quoted literal DuckDB
+-- coerces to the storage type. Each vector's cluster column leads the tuple
+-- (_vec_list_prefix), derived from that row's own vector literal.
+CREATE FUNCTION coldfront._cold_row_literal(
+    p_payload jsonb, p_cols text[], p_types text[], p_schema text, p_view text
+) RETURNS text
+LANGUAGE plpgsql IMMUTABLE AS $$
 DECLARE
-    v_hot_table     text;
-    v_iceberg       text;
-    v_partcol       text;
-    v_cutoff        timestamptz;
-    v_hot_schema    text;
-    v_hot_relname   text;
-    v_identity_col  text;
-    v_identity_seq  text;
-    vec_cols        text[];
-    vec_exprs       text[];
-    full_cols       text[];
-    full_types      text[];
-    full_defaults   text[];
-    cursor_proj     text;
-    target_csv      text;
-    cur             refcursor;
-    rec             record;
-    payload         jsonb;
-    row_lit         text;
-    val_text        text;
-    cold_buf        text := '';
-    cold_count      int  := 0;
-    total           bigint := 0;
-    -- Rows accumulated per Iceberg append (one snapshot / Parquet file per flush).
-    -- Larger ⇒ far fewer, larger files; the only cost is the in-memory VALUES
-    -- string per flush. The sub-threshold remainder is always flushed after the
-    -- loop (see below), so a small write is one file and is never lost.
-    batch_size      int  := current_setting('coldfront.cold_write_batch_size')::int;  -- GUC, default 10000
-    i               int;
-    col             text;
+    row_lit   text := '';
+    col       text;
+    val_text  text;
+    i         int;
+    vec_cols  text[] := '{}';
+    vec_exprs text[] := '{}';
 BEGIN
-    -- The cold loop below reaches duckdb.raw_query directly rather than through
-    -- _exec_iceberg_with_claim, so it carries the standby guard itself.
-    PERFORM coldfront._reject_on_standby('execute a cold (Iceberg) write');
-    -- Mixed-tier writes inside one PG tx (PG hot INSERT plus DuckDB
-    -- raw_query writes for cold) need pg_duckdb's mixed-write guard
-    -- relaxed.
-    SET LOCAL duckdb.unsafe_allow_mixed_transactions = on;
-    -- Pin bytea text output to hex so to_jsonb(rec)->>bytea_col is a stable
-    -- '\xHEX' string that the per-row serialiser below rebuilds via from_hex().
-    SET LOCAL bytea_output = 'hex';
-
-    -- Lookup view registry + watermark.
-    SELECT tv.hot_table, tv.iceberg_table, tv.partition_col,
-           COALESCE(aw.cutoff_time, '-infinity'::timestamptz)
-    INTO v_hot_table, v_iceberg, v_partcol, v_cutoff
-    FROM coldfront.tiered_views tv
-    LEFT JOIN coldfront.archive_watermark aw ON aw.schema_name = p_view_schema AND aw.table_name = p_view_name
-    WHERE tv.schema_name = p_view_schema AND tv.relname = p_view_name;
-
-    IF v_hot_table IS NULL THEN
-        RAISE EXCEPTION 'coldfront._tiered_insert_cold: view % is not registered or is iceberg-only',
-            p_view_name;
-    END IF;
-
-    -- hot_table is stored quoted ("public"."_events"); parse_ident
-    -- handles the quoting/escaping that simple split_part wouldn't.
-    -- No EXCEPTION wrapper — pg_duckdb forbids plpgsql subtransactions
-    -- (SAVEPOINT) under its tx callback. parse_ident raises a clear
-    -- error of its own if the input is malformed.
-    v_hot_schema  := (parse_ident(v_hot_table))[1];
-    v_hot_relname := (parse_ident(v_hot_table))[2];
-
-    -- Serialise the whole cold-insert loop ONCE (it issues many batched
-    -- raw_query INSERTs in this single transaction; all commit together at
-    -- xact end). Same gate as _exec_iceberg_with_claim: mesh takes one R-A
-    -- claim (released by the C XactCallback at commit), vanilla one local
-    -- advisory xact lock. Taken before the loop so the whole batch sequence
-    -- commits under one serialization.
-    PERFORM coldfront._take_iceberg_claim(v_iceberg);
-
-    -- Identity column + its sequence (NULL if no IDENTITY column).
-    SELECT a.attname,
-           pg_get_serial_sequence(format('%I.%I', v_hot_schema, v_hot_relname),
-                                  a.attname)
-    INTO v_identity_col, v_identity_seq
-    FROM pg_attribute a
-    JOIN pg_class c     ON c.oid = a.attrelid
-    JOIN pg_namespace n ON n.oid = c.relnamespace
-    WHERE n.nspname = v_hot_schema AND c.relname = v_hot_relname
-      AND a.attidentity IN ('a', 'd')
-      AND a.attnum > 0 AND NOT a.attisdropped
-    LIMIT 1;
-
-    -- Full underlying column list + types + DEFAULT expressions, in
-    -- attnum order. The cold INSERT VALUES tuple must match this layout
-    -- positionally (DuckDB-iceberg has no DEFAULT/IDENTITY, no targeted
-    -- col-list). Defaults are picked up so omitted-with-DEFAULT columns
-    -- can be evaluated PG-side per row by including them in the cursor's
-    -- projection — same semantics as a hot-side INSERT.
-    SELECT array_agg(a.attname                                ORDER BY a.attnum),
-           array_agg(format_type(a.atttypid, a.atttypmod)      ORDER BY a.attnum),
-           array_agg(pg_get_expr(d.adbin, d.adrelid)           ORDER BY a.attnum)
-    INTO full_cols, full_types, full_defaults
-    FROM pg_attribute a
-    JOIN pg_class c     ON c.oid = a.attrelid
-    JOIN pg_namespace n ON n.oid = c.relnamespace
-    LEFT JOIN pg_attrdef d ON d.adrelid = a.attrelid AND d.adnum = a.attnum
-    WHERE n.nspname = v_hot_schema AND c.relname = v_hot_relname
-      AND a.attnum > 0 AND NOT a.attisdropped
-      AND NOT coldfront._is_vec_companion(a.attname, a.attgenerated);
-
-    target_csv := array_to_string(
-        ARRAY(SELECT quote_ident(c) FROM unnest(p_target_cols) c), ', ');
-
-    -- Cursor SELECT list: every underlying column in attnum order,
-    -- sourced from coldfront_src for user-targeted cols, IDENTITY-stub
-    -- for the IDENTITY column we'll override per row, DEFAULT
-    -- expression for omitted-with-DEFAULT, NULL otherwise.
-    cursor_proj := '';
-    FOR i IN 1 .. array_length(full_cols, 1) LOOP
-        col := full_cols[i];
-        IF i > 1 THEN cursor_proj := cursor_proj || ', '; END IF;
-        IF col = ANY(p_target_cols) THEN
-            cursor_proj := cursor_proj || format(
-                'coldfront_src.%I AS %I', col, col);
-        ELSIF v_identity_col IS NOT NULL AND col = v_identity_col THEN
-            cursor_proj := cursor_proj || format(
-                'NULL::%s AS %I', full_types[i], col);
-        ELSIF full_defaults[i] IS NOT NULL THEN
-            cursor_proj := cursor_proj || format(
-                '(%s) AS %I', full_defaults[i], col);
-        ELSE
-            cursor_proj := cursor_proj || format(
-                'NULL::%s AS %I', full_types[i], col);
-        END IF;
-    END LOOP;
-
-    -- Only the cluster lookup reads pglocal, so a table without a vector must not
-    -- pay for the attach.
-    IF coldfront._types_have_vector(full_types) THEN
-        PERFORM coldfront.ensure_pg_attached();
-    END IF;
-
-    OPEN cur FOR EXECUTE format(
-        'SELECT %s FROM (%s) AS coldfront_src(%s) WHERE %I < %L',
-        cursor_proj, p_source_sql, target_csv, v_partcol, v_cutoff);
-
-    LOOP
-        FETCH cur INTO rec;
-        EXIT WHEN NOT FOUND;
-
-        payload := to_jsonb(rec);
-        row_lit   := '';
-        vec_cols  := '{}';
-        vec_exprs := '{}';
-
-        -- The cursor already projected every underlying column with the
-        -- right value (user-supplied / DEFAULT / NULL stub for IDENTITY),
-        -- so per row we just emit literals from `rec`. The one override
-        -- is the IDENTITY column when the user omitted it: substitute
-        -- nextval() so cold ids share the hot side's sequence.
-        FOR i IN 1 .. array_length(full_cols, 1) LOOP
-            col := full_cols[i];
-            IF i > 1 THEN row_lit := row_lit || ', '; END IF;
-
-            IF v_identity_col IS NOT NULL
-               AND col = v_identity_col
-               AND NOT (v_identity_col = ANY(p_target_cols)) THEN
-                row_lit := row_lit || nextval(v_identity_seq)::text;
-            ELSIF payload ? col AND (payload->col) IS NOT NULL
-                  AND jsonb_typeof(payload->col) <> 'null' THEN
-                val_text := payload->>col;
-                IF coldfront._is_vector_type(full_types[i]) THEN
-                    vec_cols  := vec_cols  || col;
-                    vec_exprs := vec_exprs || coldfront._render_cold_value(val_text, full_types[i]);
-                    row_lit   := row_lit || vec_exprs[cardinality(vec_exprs)];
-                ELSE
-                    row_lit := row_lit || coldfront._render_cold_value(val_text, full_types[i]);
-                END IF;
+    FOR i IN 1 .. array_length(p_cols, 1) LOOP
+        col := p_cols[i];
+        IF i > 1 THEN row_lit := row_lit || ', '; END IF;
+        IF p_payload ? col AND jsonb_typeof(p_payload->col) <> 'null' THEN
+            val_text := p_payload->>col;
+            IF coldfront._is_vector_type(p_types[i]) THEN
+                vec_cols  := vec_cols  || col;
+                vec_exprs := vec_exprs || coldfront._render_cold_value(val_text, p_types[i]);
+                row_lit   := row_lit || vec_exprs[cardinality(vec_exprs)];
             ELSE
-                -- A NULL vector still owns its prefix slot: the Iceberg schema
-                -- declares one cluster column per vector column unconditionally,
-                -- so a shorter prefix would misalign the positional tuple.
-                IF coldfront._is_vector_type(full_types[i]) THEN
-                    vec_cols  := vec_cols  || col;
-                    vec_exprs := vec_exprs || 'NULL'::text;
-                END IF;
-                row_lit := row_lit || 'NULL';
+                row_lit := row_lit || coldfront._render_cold_value(val_text, p_types[i]);
             END IF;
-        END LOOP;
-
-        -- The cluster leads the tuple, derived from this row's own vector literal.
-        row_lit := coldfront._vec_list_prefix(p_view_schema, p_view_name, vec_cols, vec_exprs)
-                || row_lit;
-
-        cold_buf := cold_buf
-                 || (CASE WHEN cold_count = 0 THEN '' ELSE ', ' END)
-                 || '(' || row_lit || ')';
-        cold_count := cold_count + 1;
-        total      := total + 1;
-
-        IF cold_count >= batch_size THEN
-            PERFORM duckdb.raw_query(format(
-                'INSERT INTO %s VALUES %s', v_iceberg, cold_buf));
-            cold_buf   := '';
-            cold_count := 0;
+        ELSE
+            -- A NULL vector still owns its prefix slot: the Iceberg schema
+            -- declares one cluster column per vector column unconditionally,
+            -- so a shorter prefix would misalign the positional tuple.
+            IF coldfront._is_vector_type(p_types[i]) THEN
+                vec_cols  := vec_cols  || col;
+                vec_exprs := vec_exprs || 'NULL'::text;
+            END IF;
+            row_lit := row_lit || 'NULL';
         END IF;
     END LOOP;
-    CLOSE cur;
-
-    IF cold_count > 0 THEN
-        PERFORM duckdb.raw_query(format(
-            'INSERT INTO %s VALUES %s', v_iceberg, cold_buf));
-    END IF;
-
-    RETURN total;
+    RETURN coldfront._vec_list_prefix(p_schema, p_view, vec_cols, vec_exprs) || row_lit;
 END;
 $$;
+
+-- One batch to Iceberg, under the table's claim.
+CREATE FUNCTION coldfront._cold_sink_flush(s coldfront._cold_sink_state)
+RETURNS coldfront._cold_sink_state
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF cardinality(s.buf) > 0 THEN
+        PERFORM coldfront._take_iceberg_claim(s.iceberg);
+        PERFORM duckdb.raw_query(format('INSERT INTO %s VALUES %s',
+                                        s.iceberg, array_to_string(s.buf, ', ')));
+        s.buf := '{}';
+    END IF;
+    RETURN s;
+END;
+$$;
+
+-- The step function. The first row resolves the registry row and the hot
+-- table's columns, with the standby guard ahead of every lookup.
+CREATE FUNCTION coldfront._cold_sink_step(
+    s coldfront._cold_sink_state, p_schema text, p_view text, p_row jsonb
+) RETURNS coldfront._cold_sink_state
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_hot_table text;
+    v_iceberg   text;
+BEGIN
+    IF s.iceberg IS NULL THEN
+        PERFORM coldfront._reject_on_standby('execute a cold (Iceberg) write');
+        -- The statement may run from a cached plan (PREPARE, a plpgsql
+        -- function's later call) in a transaction the hook never saw, so the
+        -- catalog attach and pg_duckdb's mixed-write guard belong here, at
+        -- execution, ahead of the first flush.
+        PERFORM coldfront.ensure_attached();
+        SET LOCAL duckdb.unsafe_allow_mixed_transactions = on;
+        SELECT tv.hot_table, tv.iceberg_table INTO v_hot_table, v_iceberg
+          FROM coldfront.tiered_views tv
+         WHERE tv.schema_name = p_schema AND tv.relname = p_view
+           AND NOT tv.is_iceberg_only;
+        IF v_iceberg IS NULL THEN
+            RAISE EXCEPTION 'coldfront._cold_sink: view %.% is not a registered tiered view',
+                p_schema, p_view;
+        END IF;
+        SELECT v_iceberg,
+               array_agg(a.attname::text ORDER BY a.attnum),
+               array_agg(format_type(a.atttypid, a.atttypmod) ORDER BY a.attnum),
+               current_setting('coldfront.cold_write_batch_size')::int,
+               '{}'::text[], 0::bigint
+          INTO s
+          FROM pg_attribute a
+          JOIN pg_class c     ON c.oid = a.attrelid
+          JOIN pg_namespace n ON n.oid = c.relnamespace
+         WHERE n.nspname = (parse_ident(v_hot_table))[1]
+           AND c.relname = (parse_ident(v_hot_table))[2]
+           AND a.attnum > 0 AND NOT a.attisdropped
+           AND NOT coldfront._is_vec_companion(a.attname, a.attgenerated);
+        -- A cluster assignment reads the centroids over pglocal.
+        IF coldfront._types_have_vector(s.types) THEN
+            PERFORM coldfront.ensure_pg_attached();
+        END IF;
+    END IF;
+    s.buf   := s.buf || ('(' || coldfront._cold_row_literal(p_row, s.cols, s.types, p_schema, p_view) || ')');
+    s.total := s.total + 1;
+    IF cardinality(s.buf) >= s.batch THEN
+        s := coldfront._cold_sink_flush(s);
+    END IF;
+    RETURN s;
+END;
+$$;
+
+CREATE FUNCTION coldfront._cold_sink_final(s coldfront._cold_sink_state)
+RETURNS bigint
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF s.iceberg IS NULL THEN
+        RETURN 0;
+    END IF;
+    s := coldfront._cold_sink_flush(s);
+    RETURN s.total;
+END;
+$$;
+
+CREATE AGGREGATE coldfront._cold_sink(text, text, jsonb) (
+    SFUNC     = coldfront._cold_sink_step,
+    STYPE     = coldfront._cold_sink_state,
+    FINALFUNC = coldfront._cold_sink_final
+);
 
 -- coldfront._cross_tier_move: execute a partition-column UPDATE that crosses the
 -- hot/cold cutoff, relocating the matched rows between tiers. The C post-parse-
@@ -1065,22 +1057,23 @@ $$;
 --   stay-hot  hot,  e>=cut : in-place UPDATE of the hot heap.
 --   hot→cold  hot,  e<cut  : the row leaves the heap (DELETE) and is added to
 --                            Iceberg (INSERT).
---   cold→hot  cold, e>=cut : the row is read from Iceberg into the heap (INSERT
---                            … FROM iceberg_scan) and removed from Iceberg.
+--   cold→hot  cold, e>=cut : the row is read from Iceberg into the heap (a
+--                            cursor row, re-inserted by VALUE) and removed from Iceberg.
 --   stay-cold cold, e<cut  : removed from Iceberg and re-added with the new ts.
 -- Same-tier changes are in-place; crossings write the OTHER tier and remove from
 -- the origin (different relations) — no same-relation overlap.
 --
 -- Cold tier: ONE raw_query (DELETE-set + INSERT-set = one MetaTransaction = one
--- snapshot, the replay_archive_delta idiom; the single delete-bearing op pg_duckdb
--- allows per table per tx) under ONE claim (never per-row tickets). cold→hot reads
--- Iceberg with iceberg_scan, which pg_duckdb permits inside a function only with
--- duckdb.unsafe_allow_execution_inside_functions — the move needs it because the
--- legs are deparsed and run together here. The cold rows destined to stay/return
--- cold are serialised by VALUE from an iceberg_scan cursor (so no uncommitted-
--- staging visibility problem and no second claim); hot→cold rows are serialised
--- from a heap cursor. DELETE is by the OLD primary key; old/new keys differ (the
--- partition column changed) so it never hits a just-inserted row.
+-- snapshot, the replay_archive_delta idiom) under ONE claim (never per-row
+-- tickets). The cold rows are read through the catalog's table entry
+-- (duckdb.query over the Iceberg table), whose scan includes the transaction's
+-- own pending rows; pg_duckdb permits that read inside a function only with
+-- duckdb.unsafe_allow_execution_inside_functions, which the move needs because
+-- the legs are deparsed and run together here. The cold rows destined to
+-- stay/return cold are serialised by VALUE from that cursor before the one
+-- raw_query runs; hot→cold rows are serialised from a heap cursor. DELETE is by
+-- the OLD primary key; old/new keys differ (the partition column changed) so it
+-- never hits a just-inserted row.
 CREATE FUNCTION coldfront._cross_tier_move(
     p_view_schema text, p_view_name text, p_where text, p_newpc text
 ) RETURNS void
@@ -1095,9 +1088,9 @@ DECLARE
     v_cut_lit     text;          -- 'YYYY-…'::timestamptz of the cutoff
     v_pc          text;          -- quoted partition column
     v_cols        text;          -- heap col list (all live cols), quoted
-    v_cold_read   text;          -- iceberg_scan surface projection: r[col]::cast AS col
+    v_cold_read   text;          -- cold read projection: r[col]::cast AS col
     v_has_ident   boolean;
-    v_inner       text;          -- "SELECT v_cold_read FROM iceberg_scan(ice) r WHERE r[pc] < cut"
+    v_inner       text;          -- "SELECT v_cold_read FROM duckdb.query(...) AS t(r) WHERE r[pc] < cut"
     full_cols     text[];
     full_types    text[];
     pk_names      text[];
@@ -1142,7 +1135,7 @@ BEGIN
 
     -- All live heap columns in attnum order — names, types, and whether any is an
     -- identity column — in ONE catalog scan. v_cols (quoted list) and v_cold_read
-    -- (the iceberg_scan surface projection r[col]::cast AS col) derive from the
+    -- (the cold read projection r[col]::cast AS col) derive from the
     -- arrays, mirroring _rebuild_tiered_view's casts (one source of truth via
     -- _iceberg_view_cast_type / _iceberg_storage_type; view cast, else storage).
     SELECT array_agg(a.attname ORDER BY a.attnum),
@@ -1175,8 +1168,8 @@ BEGIN
     SELECT string_agg(quote_ident(nm), ', ' ORDER BY ord) INTO v_pk_list
     FROM unnest(pk_names) WITH ORDINALITY AS u(nm, ord);
 
-    v_inner := format('SELECT %s FROM iceberg_scan(%L) r WHERE r[%L] < %s',
-                      v_cold_read, v_iceberg, v_partcol, v_cut_lit);
+    v_inner := format('SELECT %s FROM duckdb.query(%L) AS t(r) WHERE r[%L] < %s',
+                      v_cold_read, format('SELECT * FROM %s', v_iceberg), v_partcol, v_cut_lit);
     PERFORM coldfront.ensure_attached();
     IF coldfront._types_have_vector(full_types) THEN
         PERFORM coldfront.ensure_pg_attached();
@@ -1187,8 +1180,8 @@ BEGIN
     -- partition, so a row LANDING hot (cold→hot, or stay-hot whose new ts crosses a
     -- hot-partition boundary) would otherwise raise PG's "no partition of relation
     -- _events". Collect the distinct new-ts values of all hot-landing rows from both
-    -- tiers — cold via iceberg_scan, hot via the heap — kept in SEPARATE queries so
-    -- one never mixes iceberg_scan (DuckDB) with pg_catalog (which pg_duckdb cannot
+    -- tiers (cold through DuckDB, hot via the heap) kept in SEPARATE queries so
+    -- one never mixes the DuckDB read with pg_catalog (which pg_duckdb cannot
     -- read), then check coverage against pg_inherits leaf bounds (split_part on the
     -- single-key FOR VALUES FROM ('lo') TO ('hi') rendering; no regex).
     EXECUTE format(
@@ -1219,10 +1212,10 @@ BEGIN
     -- mesh takes the R-A bakery, vanilla a local advisory xact lock.
     PERFORM coldfront._take_iceberg_claim(v_iceberg);
 
-    -- ── Capture the moved rows by VALUE (no iceberg_scan in any modifying stmt) ──
-    -- Affected COLD rows are read with a SELECT cursor over iceberg_scan (a pure
-    -- read, which pg_duckdb runs in DuckDB — a modifying INSERT…FROM iceberg_scan
-    -- would instead trip pg_duckdb's "cannot modify a Postgres table" path). Each
+    -- ── Capture the moved rows by VALUE (no DuckDB read in any modifying stmt) ──
+    -- Affected COLD rows are read with a SELECT cursor over the catalog read (a
+    -- pure read, which pg_duckdb runs in DuckDB; a modifying INSERT … FROM that
+    -- read would trip pg_duckdb's "cannot modify a Postgres table" path). Each
     -- affected cold row is DELETEd from Iceberg by its OLD pk; rows staying cold are
     -- re-added to Iceberg with the new ts; rows crossing to hot are added to the
     -- heap. cf_new_ts is computed in the cursor so e is evaluated once per row.
@@ -1294,53 +1287,16 @@ END;
 $fn$;
 
 -- coldfront._move_row_literal: render one captured row (jsonb of surface values +
--- cf_new_ts) as a DuckDB positional VALUES tuple for the Iceberg INSERT, in attnum
--- order: the partition column takes cf_new_ts; bytea is rebuilt with from_hex on the
--- hex text (bytea_output is pinned to hex by the caller); a NULL is NULL; everything
--- else is a quoted literal DuckDB coerces to the storage type. Mirrors
--- _tiered_insert_cold's per-row serialiser.
+-- cf_new_ts) as a DuckDB positional VALUES tuple for the Iceberg INSERT: the
+-- partition column takes cf_new_ts, and _cold_row_literal renders the tuple.
 CREATE FUNCTION coldfront._move_row_literal(
     p_payload jsonb, p_cols text[], p_types text[], p_partcol text,
     p_schema text, p_view text
 ) RETURNS text
-LANGUAGE plpgsql IMMUTABLE AS $$
-DECLARE
-    row_lit  text := '';
-    col      text;
-    val_text text;
-    i        int;
-    vec_cols  text[] := '{}';
-    vec_exprs text[] := '{}';
-BEGIN
-    FOR i IN 1 .. array_length(p_cols, 1) LOOP
-        col := p_cols[i];
-        IF i > 1 THEN row_lit := row_lit || ', '; END IF;
-        IF col = p_partcol THEN
-            row_lit := row_lit || quote_literal(p_payload->>'cf_new_ts');
-        ELSIF p_payload ? col AND jsonb_typeof(p_payload->col) <> 'null' THEN
-            val_text := p_payload->>col;
-            IF coldfront._is_vector_type(p_types[i]) THEN
-                vec_cols  := vec_cols  || col;
-                vec_exprs := vec_exprs || coldfront._render_cold_value(val_text, p_types[i]);
-                row_lit   := row_lit || vec_exprs[cardinality(vec_exprs)];
-            ELSE
-                row_lit := row_lit || coldfront._render_cold_value(val_text, p_types[i]);
-            END IF;
-        ELSE
-            -- A NULL vector still owns its prefix slot: the Iceberg schema
-            -- declares one cluster column per vector column unconditionally,
-            -- so a shorter prefix would misalign the positional tuple.
-            IF coldfront._is_vector_type(p_types[i]) THEN
-                vec_cols  := vec_cols  || col;
-                vec_exprs := vec_exprs || 'NULL'::text;
-            END IF;
-            row_lit := row_lit || 'NULL';
-        END IF;
-    END LOOP;
-    -- The cluster leads the tuple, derived from this row's own vector literal.
-    row_lit := coldfront._vec_list_prefix(p_schema, p_view, vec_cols, vec_exprs) || row_lit;
-    RETURN row_lit;
-END;
+LANGUAGE sql IMMUTABLE AS $$
+    SELECT coldfront._cold_row_literal(
+        jsonb_set(p_payload, ARRAY[p_partcol], to_jsonb(p_payload->>'cf_new_ts')),
+        p_cols, p_types, p_schema, p_view);
 $$;
 
 -- coldfront._move_pg_row_literal: the cold→hot counterpart of _move_row_literal —
@@ -1637,12 +1593,11 @@ $$;
 -- Decoupled (iceberg-only) operating mode.
 --
 -- Helpers below let an operator create a table that lives entirely in
--- Iceberg from row 1 — no PG heap, no hot tier, no archiver. The PG side is
--- a thin wrapper view that projects iceberg_scan() into PG-typed columns
--- plus an INSTEAD OF INSERT trigger that routes writes to
--- duckdb.raw_query('INSERT INTO ice...'). UPDATE/DELETE on the wrapper view
--- are intercepted by the coldfront post_parse_analyze hook (which short-
--- circuits to TIER_COLD when the registry row has is_iceberg_only=true).
+-- Iceberg from row 1: no PG heap, no hot tier, no archiver. The PG side is
+-- a thin wrapper view that projects the Iceberg table into PG-typed columns.
+-- INSERT/UPDATE/DELETE on the wrapper view are rewritten by the coldfront
+-- post_parse_analyze hook (which short-circuits to TIER_COLD when the
+-- registry row has is_iceberg_only=true).
 --
 -- The supported column types match the canonical map in
 -- cmd/archiver/main.go pgFormatTypeToDuckDB. Anything outside the set is
@@ -2088,29 +2043,6 @@ BEGIN
 END;
 $$;
 
--- Routing state replicates cluster-wide, for the reason the assignment itself
--- exists: every node has to resolve a vector to the same cluster id, or a row
--- written on one node is invisible to a probe issued on another. Gated on spock
--- like the claims tables, so vanilla is a no-op.
-CREATE FUNCTION coldfront._ensure_vector_state_replicated()
-RETURNS void LANGUAGE plpgsql AS $$
-DECLARE
-    t text;
-BEGIN
-    IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'spock') THEN
-        RETURN;
-    END IF;
-    FOREACH t IN ARRAY ARRAY['coldfront.vector_config', 'coldfront.vector_centroids'] LOOP
-        PERFORM spock.repset_add_table('default', t::regclass, false)
-        WHERE NOT EXISTS (
-            SELECT 1 FROM spock.replication_set rs
-              JOIN spock.replication_set_table rst ON rst.set_id = rs.set_id
-             WHERE rs.set_name = 'default' AND rst.set_reloid = t::regclass
-        );
-    END LOOP;
-END;
-$$;
-
 -- The distance operators a caller writes, on the real[] the view exposes.
 --
 -- Each function is named for the DuckDB function it has to become: pg_duckdb
@@ -2134,7 +2066,6 @@ DECLARE
     v_nsp  text;
     r      record;
 BEGIN
-    PERFORM coldfront._ensure_vector_state_replicated();
     SELECT n.nspname INTO v_nsp
     FROM pg_type t JOIN pg_namespace n ON n.oid = t.typnamespace
     WHERE t.typname = 'vector';
@@ -2347,8 +2278,9 @@ $$;
 -- key is what lets a compaction concatenate a group's files in key order rather
 -- than scrambling them.
 --
--- Set at CREATE TABLE: the catalog takes properties there, and this build has no
--- ALTER for them, so a table that predates its vector column keeps the defaults.
+-- Set at CREATE TABLE: the catalog takes properties there, and ColdFront never
+-- alters them afterwards, so a table that predates its vector column keeps the
+-- defaults.
 CREATE OR REPLACE FUNCTION coldfront._vec_layout_props(p_sort_key text, p_partitioned boolean)
 RETURNS text
 LANGUAGE sql IMMUTABLE PARALLEL SAFE AS $$
@@ -2578,8 +2510,8 @@ $$;
 -- payload is already bracketed (jsonb spells a vector as a string and a real[] as
 -- an array), while NEW.col::text on the view's real[] column is brace-delimited.
 
--- The literal for a value already serialised to text. Callers: the cursor loop in
--- _tiered_insert_cold and _move_row_literal, both reading a jsonb payload.
+-- The literal for a value already serialised to text. Caller: _cold_row_literal,
+-- reading a jsonb payload.
 CREATE OR REPLACE FUNCTION coldfront._render_cold_value(p_val_text text, p_pg_type text)
 RETURNS text
 LANGUAGE sql IMMUTABLE STRICT AS $$
@@ -2592,37 +2524,6 @@ LANGUAGE sql IMMUTABLE STRICT AS $$
         -- VARCHAR and the INSERT fails.
         WHEN coldfront._is_vector_type(p_pg_type) THEN format('CAST(%L AS FLOAT[])', p_val_text)
         ELSE quote_literal(p_val_text)
-    END;
-$$;
-
--- The INSTEAD OF trigger's cold INSERT is a format() template plus its args.
--- These two spell one column's half of each, for _rebuild_write_trigger.
--- Identity columns are the caller's business: they take NULL, since Iceberg has
--- no sequences.
-CREATE OR REPLACE FUNCTION coldfront._cold_placeholder(p_pg_type text)
-RETURNS text
-LANGUAGE sql IMMUTABLE STRICT AS $$
-    SELECT CASE
-        WHEN coldfront._iceberg_storage_type(p_pg_type) = 'BLOB' THEN 'from_hex(%L)'
-        WHEN coldfront._is_vector_type(p_pg_type)                THEN 'CAST(%L AS FLOAT[])'
-        ELSE '%L'
-    END;
-$$;
-
-CREATE OR REPLACE FUNCTION coldfront._cold_value(p_col text, p_pg_type text)
-RETURNS text
-LANGUAGE sql IMMUTABLE STRICT AS $$
-    SELECT CASE
-        WHEN coldfront._iceberg_storage_type(p_pg_type) = 'BLOB'
-            THEN format('encode(NEW.%I,%L)', p_col, 'hex')
-        -- The view exposes a vector as real[], so ::text yields {1,2,3}.
-        WHEN coldfront._is_vector_type(p_pg_type)
-            THEN format('translate(NEW.%I::text,%L,%L)', p_col, '{}', '[]')
-        -- VARCHAR-backed rich types are stored as their text form.
-        WHEN coldfront._iceberg_view_cast_type(p_pg_type) IN ('json', 'interval')
-            THEN format('NEW.%I::text', p_col)
-        -- Everything else round-trips through %L, double precision included.
-        ELSE format('NEW.%I', p_col)
     END;
 $$;
 
@@ -2798,15 +2699,11 @@ $$;
 --   p_vec_cols the vector columns those cluster columns belong to, or '{}'.
 --   p_writable whether the hook rewrites DML on the view or refuses it.
 --
--- The view sources duckdb.query('SELECT * FROM <ref>') rather than
--- iceberg_scan(<ref>). The pg_duckdb planner folds both into the same
--- iceberg_scan execution plan with predicate pushdown into Parquet row groups,
--- but they differ in transactional visibility: iceberg_scan re-resolves the table
--- from Lakekeeper on each call and always reads the committed snapshot, blind to
--- the same DuckDB session's pending writes, while duckdb.query goes through the
--- session's planner and sees in-progress transaction state. So a SELECT inside an
--- explicit BEGIN block sees the same transaction's prior INSERT/UPDATE/DELETE:
--- read-your-own-write works in decoupled mode.
+-- The view reads the table as duckdb.query('SELECT * FROM <ref>'): the catalog's
+-- table entry, whose scan includes the transaction's own pending data and
+-- delete files, so a SELECT inside a transaction block sees the same
+-- transaction's prior INSERT/UPDATE/DELETE. A tiered view's cold branch reads
+-- the same way (_rebuild_tiered_view, internal/view/view.go).
 CREATE OR REPLACE FUNCTION coldfront._register_iceberg_view(
     p_schema   text,
     p_relname  text,
@@ -3070,11 +2967,6 @@ BEGIN
     PERFORM coldfront._register_iceberg_view(p_schema, p_table, v_ice,
                                              v_cols, v_vec_cols, p_writable);
 
-    IF p_writable THEN
-        -- Cross-node bakery coordination, the same requirement a created table has.
-        PERFORM coldfront._ensure_claims_replicated();
-    END IF;
-
     RAISE NOTICE 'coldfront: adopted % as %.% (% columns, %)%',
         v_ice, p_schema, p_table, v_n,
         CASE WHEN p_writable THEN 'writable' ELSE 'read-only' END,
@@ -3288,13 +3180,6 @@ BEGIN
     --    libpq with no local materialisation.
     PERFORM coldfront._register_iceberg_view(p_schema, p_table, ice_ref,
                                              v_view_cols, v_vec_cols, true);
-
-    -- 3. Ensure claims is in Spock's default replication set so
-    --    cross-node bakery coordination (see below) works. Idempotent.
-    --    Claim rows themselves come and go on demand (INSERT in
-    --    _insert_claim, DELETE in coldfront_xact_callback), so the
-    --    table stays empty when no writers are mid-commit.
-    PERFORM coldfront._ensure_claims_replicated();
 END;
 $$;
 
@@ -3349,8 +3234,9 @@ END $$;
 -- table via pg_duckdb, every iceberg commit posts to Lakekeeper which does CAS
 -- on metadata_location. Concurrent writers that prepared their commit body
 -- against the same parent snapshot lose the race; whichever lands second
--- gets HTTP 409 CatalogCommitConflicts, and DuckDB-iceberg has no
--- writer-side rebase loop, so the loser's batch is silently dropped.
+-- gets HTTP 409 CatalogCommitConflicts, which duckdb-iceberg (5edc45f0) raises
+-- as "Failed to commit Iceberg transaction" and pg_duckdb turns into an ERROR
+-- at PRE_COMMIT: the losing transaction aborts and the batch has to be retried.
 --
 -- Architecture. Coordinate cluster-wide via:
 --  • coldfront.claims: one row per active claim, keyed by its ticket, the
@@ -3379,8 +3265,9 @@ END $$;
 --      alive peer has acked.
 --   4. Runs the actual iceberg INSERT (in user's PG transaction). Sole
 --      writer to Lakekeeper at this moment, no CAS race.
---   5. The C xact callback (coldfront_xact_callback) fires after pg_duckdb's
---      at PG commit/abort and DELETEs the claim over the same loopback; the
+--   5. The C xact callback (coldfront_xact_callback) DELETEs the claim at
+--      XACT_EVENT_COMMIT, after pg_duckdb committed the Iceberg transaction at
+--      XACT_EVENT_PRE_COMMIT (and at ABORT), over the same loopback; the
 --      DELETE trigger (_on_claim_release) forwards the acks deferred behind it.
 --
 -- Complexity is in the four primitives above. The body of each helper is
@@ -3435,20 +3322,18 @@ CREATE TABLE coldfront.deferred_acks (
 );
 
 -- Configuration: the libpq connection string of the loopback that runs the
--- bakery's autonomous transactions (see coldfront._loopback).
--- Operator sets this once per database (typically in postgresql.conf or
--- via ALTER DATABASE):
---    SET coldfront.dblink_self = 'host=/var/run/postgresql dbname=coldfront user=coldfront';
--- Default is empty; helpers raise a clear error if unset.
--- current_setting(name, missing_ok=true) returns NULL when the GUC isn't
--- defined; no EXCEPTION block needed (which would create a subtxn that
--- pg_duckdb's SubXactCallback hard-rejects).
-CREATE FUNCTION coldfront._dblink_self_connstr() RETURNS text
+-- bakery's autonomous transactions (see coldfront._loopback). It must name a
+-- unix socket: every onboarded role can read it, so it must never need a
+-- password. Set once per node in postgresql.conf:
+--    coldfront.loopback_dsn = 'host=/var/run/postgresql dbname=coldfront user=coldfront'
+-- Empty on a node outside a mesh; _take_iceberg_claim refuses a cold write on
+-- a node that runs Spock without it.
+CREATE FUNCTION coldfront._loopback_dsn() RETURNS text
 LANGUAGE sql STABLE AS
-$$ SELECT current_setting('coldfront.dblink_self', true) $$;
+$$ SELECT current_setting('coldfront.loopback_dsn') $$;
 
 -- coldfront._loopback runs one statement on this node's loopback: a libpq
--- connection the extension's C code opens from coldfront.dblink_self and keeps
+-- connection the extension's C code opens from coldfront.loopback_dsn and keeps
 -- for the backend's lifetime. The statement commits on its own and is tagged
 -- with this node as its origin, so Spock replicates it everywhere. Returns the
 -- first column of the first row as text, or NULL. A statement that fails
@@ -3459,45 +3344,6 @@ $$ SELECT current_setting('coldfront.dblink_self', true) $$;
 CREATE FUNCTION coldfront._loopback(p_sql text) RETURNS text
 LANGUAGE c STRICT AS 'coldfront', 'coldfront_loopback';
 REVOKE EXECUTE ON FUNCTION coldfront._loopback(text) FROM PUBLIC;
-
--- One-time setup: ensure claims is in Spock's default replication set so
--- peer nodes see our INSERT/DELETE on it. Idempotent via existence check.
--- No EXCEPTION block: pg_duckdb's SubXactCallback hard-rejects every
--- subtransaction in the session, even ones that don't touch DuckDB.
--- Called from coldfront.create_iceberg_table() on whichever node first
--- declares an iceberg table.
-CREATE FUNCTION coldfront._ensure_claims_replicated()
-RETURNS void LANGUAGE plpgsql AS $$
-BEGIN
-    -- Claims replication is a Spock-mesh concern only. In a vanilla single-node
-    -- deployment there is no spock extension (and the bakery uses a local
-    -- advisory lock, not cross-node claim rows), so this is a no-op. Gating on
-    -- the spock extension's presence keeps create_iceberg_table working
-    -- identically in vanilla and mesh (single shared path).
-    IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'spock') THEN
-        RETURN;
-    END IF;
-
-    -- coldfront.claims is replicated cluster-wide.
-    PERFORM spock.repset_add_table('default', 'coldfront.claims'::regclass, false)
-    WHERE NOT EXISTS (
-        SELECT 1 FROM spock.replication_set rs
-          JOIN spock.replication_set_table rst ON rst.set_id = rs.set_id
-         WHERE rs.set_name = 'default'
-           AND rst.set_reloid = 'coldfront.claims'::regclass
-    );
-    -- coldfront.claim_acks too — originator needs to see peers' acks.
-    PERFORM spock.repset_add_table('default', 'coldfront.claim_acks'::regclass, false)
-    WHERE NOT EXISTS (
-        SELECT 1 FROM spock.replication_set rs
-          JOIN spock.replication_set_table rst ON rst.set_id = rs.set_id
-         WHERE rs.set_name = 'default'
-           AND rst.set_reloid = 'coldfront.claim_acks'::regclass
-    );
-    -- coldfront.deferred_acks is INTENTIONALLY local-only (each node's
-    -- queue of acks-it-owes-to-others-once-it-releases).
-END;
-$$;
 
 -- Peer-side trigger: fires when spock applies an originator's claim INSERT or
 -- poke UPDATE to this node's coldfront.claims (REPLICA-only, not on the
@@ -3735,24 +3581,34 @@ CREATE FUNCTION coldfront._claim_iceberg_lock(
     p_iceberg_table text
 ) RETURNS bigint LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
 DECLARE
-    connstr           text     := coldfront._dblink_self_connstr();
+    connstr           text     := coldfront._loopback_dsn();
     my_node           int      := current_setting('snowflake.node')::int;
     -- Local spock node name, used for the ack-wait join and the liveness
     -- slot-name computation (see coldfront._my_spock_node_name).
     my_node_name      name     := coldfront._my_spock_node_name();
     my_ticket         bigint;
     v_poll            int      := 0;
-    -- coldfront.peer_alive_window_ms: a peer whose walsender hasn't
-    -- heartbeated within this window is treated as already-acked (R-A
-    -- dead-peer escape). Default 5000 ms matches spock's default
-    -- heartbeat cadence; raise it on slow/lossy WAN links if false-
-    -- positive dead-peer rulings become a problem. Read once per
-    -- claim — GUC changes take effect on the next claim.
-    peer_alive_window interval := make_interval(secs =>
-        COALESCE(NULLIF(current_setting('coldfront.peer_alive_window_ms', true), '')::int, 5000) / 1000.0);
+    -- coldfront.peer_alive_window_ms (superuser-only): a peer whose walsender
+    -- has not replied within this window is treated as already acked (the
+    -- R-A dead-peer escape); raise it on slow or lossy links, together with
+    -- wal_sender_timeout. Read once per claim, so a change applies to the
+    -- next claim.
+    peer_alive_window_ms int := current_setting('coldfront.peer_alive_window_ms')::int;
+    peer_alive_window interval := make_interval(secs => peer_alive_window_ms / 1000.0);
+    -- The server's wal_sender_timeout in ms (reset_val, which a session SET
+    -- cannot hide). The walsender asks a peer for a reply every half of it,
+    -- so it must not be 0 and half of it must be below the window, or an
+    -- idle live peer would be ruled dead.
+    wal_sender_timeout_ms int := (SELECT reset_val::int FROM pg_settings
+                                   WHERE name = 'wal_sender_timeout');
 BEGIN
     IF connstr IS NULL OR connstr = '' THEN
-        RAISE EXCEPTION 'coldfront: configure GUC coldfront.dblink_self with a libpq connstr (e.g. ''host=/var/run/postgresql dbname=coldfront user=coldfront'')';
+        RAISE EXCEPTION 'coldfront: configure coldfront.loopback_dsn with this server''s unix-socket DSN (e.g. ''host=/var/run/postgresql dbname=coldfront user=coldfront'')';
+    END IF;
+    IF wal_sender_timeout_ms = 0 OR wal_sender_timeout_ms / 2 >= peer_alive_window_ms THEN
+        RAISE EXCEPTION 'coldfront: wal_sender_timeout is % ms and coldfront.peer_alive_window_ms is % ms: the walsender asks a peer for a reply every wal_sender_timeout/2, so an idle live peer would be ruled dead',
+            wal_sender_timeout_ms, peer_alive_window_ms
+            USING HINT = 'Set wal_sender_timeout above 0 and below twice the window on every node, as the image does: ALTER SYSTEM SET wal_sender_timeout = ''15s''; SELECT pg_reload_conf();';
     END IF;
 
     -- Same-node serialization: hold a node-local advisory xact lock for this
@@ -3777,17 +3633,22 @@ BEGIN
     --       are per-node monotonic + timestamped, so a smaller ticket
     --       means nextval was called earlier on this node.
     --   (b) Peer-ack: every ALIVE peer must have acked my ticket.
-    --       "Alive" = walsender row in pg_stat_replication is
-    --       state='streaming' with reply_time within
-    --       coldfront.peer_alive_window_ms (default 5 s). A peer that
-    --       is stale (heartbeat gone past the window) is implicitly
-    --       treated as already-acked — this is R-A's dead-peer escape,
-    --       the only way out of waiting indefinitely. There is no
-    --       separate timeout: a peer that hasn't acked while alive is
-    --       either deferring (legitimate per R-A's defer rule) or
-    --       going to ack imminently. A same-node claim is released by
-    --       the C XactCallback in coldfront.c at commit or abort, and one
-    --       whose owner is gone is removed by the reaper.
+    --       "Alive" = a walsender row in pg_stat_replication for the peer
+    --       with reply_time within coldfront.peer_alive_window_ms, whatever
+    --       its state: a peer that has just reconnected is catching up and
+    --       still alive. reply_time is the peer's apply-worker feedback:
+    --       sent after it applies, every spock.feedback_frequency messages,
+    --       and in answer to the walsender's keepalive, every
+    --       wal_sender_timeout/2 on an idle link, which the check above
+    --       keeps inside the window. A peer whose last reply is older
+    --       than the window is implicitly treated as already-acked: this
+    --       is R-A's dead-peer escape, the only way out of waiting
+    --       indefinitely. There is no separate timeout: a peer that
+    --       hasn't acked while alive is either deferring (legitimate per
+    --       R-A's defer rule) or going to ack imminently. A same-node
+    --       claim is released by the C XactCallback in coldfront.c at
+    --       commit or abort, and one whose owner is gone is removed by
+    --       the reaper.
     LOOP
         EXIT WHEN NOT EXISTS (
             SELECT 1 FROM coldfront.claims c
@@ -3813,8 +3674,7 @@ BEGIN
                  -- IMMUTABLE so PG caches the call. No LIKE, no regex, no
                  -- node-name ambiguity (db1 vs db10).
                  SELECT 1 FROM pg_stat_replication r
-                  WHERE r.state = 'streaming'
-                    AND r.reply_time > now() - peer_alive_window
+                  WHERE r.reply_time > now() - peer_alive_window
                     AND r.application_name = spock.spock_gen_slot_name(
                           current_database()::name,
                           my_node_name,
@@ -3854,8 +3714,9 @@ $$;
 -- or on the waiting peer's poke (see _insert_claim and _on_claim_apply).
 -- C-bridge: enqueues a ticket for release at outer-tx-end. Drained by
 -- the coldfront XactCallback registered in _PG_init (coldfront.c), which
--- fires after pg_duckdb's XactCallback so the iceberg snapshot has
--- already committed (or rolled back) by the time we DELETE the claim.
+-- fires at XACT_EVENT_COMMIT, after pg_duckdb's XACT_EVENT_PRE_COMMIT commit
+-- of the Iceberg transaction, so the snapshot has landed by the time we DELETE
+-- the claim (and at ABORT, where nothing landed).
 CREATE FUNCTION coldfront._enqueue_release(p_ticket bigint)
 RETURNS void
 LANGUAGE c AS 'coldfront', 'coldfront_enqueue_release';
@@ -3877,19 +3738,21 @@ END;
 $$;
 
 -- coldfront._bakery_armed: TRUE when this node is configured for the multi-writer
--- Ricart-Agrawala bakery (both GUCs the protocol needs are set). FALSE means
--- vanilla single-node, which serializes cold writes with a local advisory xact
--- lock. The single source of truth for the gate.
+-- Ricart-Agrawala bakery (both GUCs the protocol needs are set). FALSE means a
+-- node without them: a vanilla single node, which serializes cold writes with a
+-- local advisory xact lock, or a node that runs Spock, which _take_iceberg_claim
+-- refuses. The single source of truth for the gate.
 CREATE FUNCTION coldfront._bakery_armed() RETURNS boolean
 LANGUAGE sql STABLE AS $$
     SELECT NULLIF(current_setting('snowflake.node', true), '') IS NOT NULL
-       AND NULLIF(current_setting('coldfront.dblink_self', true), '') IS NOT NULL
+       AND NULLIF(current_setting('coldfront.loopback_dsn'), '') IS NOT NULL
 $$;
 
 -- coldfront._take_iceberg_claim: acquire the per-iceberg-table cold-write mutex,
 -- held to transaction end. Mesh (_bakery_armed): take the R-A bakery claim and
--- enqueue its release for the C XactCallback. Vanilla: a transaction-scoped local
--- advisory lock (auto-released at xact end). Callers decide WHEN to call it
+-- enqueue its release for the C XactCallback. Vanilla (no Spock): a transaction-
+-- scoped local advisory lock (auto-released at xact end); a node that runs Spock
+-- without the bakery's settings is refused. Callers decide WHEN to call it
 -- relative to their own work; it deliberately omits the standby
 -- (pg_is_in_recovery) guard and any lock ordering, which stay in callers.
 -- A transaction holds one claim per table: the claim lasts until commit, so a
@@ -3901,14 +3764,23 @@ CREATE FUNCTION coldfront._take_iceberg_claim(p_iceberg_ref text) RETURNS void
 LANGUAGE plpgsql AS $$
 BEGIN
     IF coldfront._bakery_armed() THEN
-        IF p_iceberg_ref = ANY(string_to_array(current_setting('coldfront._claimed', true), E'\n')) THEN
+        IF p_iceberg_ref = ANY(string_to_array(current_setting('coldfront._claimed'), E'\n')) THEN
             RETURN;
         END IF;
         PERFORM coldfront._enqueue_release(coldfront._claim_iceberg_lock(p_iceberg_ref));
         PERFORM set_config('coldfront._claimed',
-                           concat_ws(E'\n', NULLIF(current_setting('coldfront._claimed', true), ''), p_iceberg_ref),
+                           concat_ws(E'\n', NULLIF(current_setting('coldfront._claimed'), ''), p_iceberg_ref),
                            true);
     ELSE
+        -- A node that runs Spock is a mesh node, and a mesh node serializes cold
+        -- writes through the bakery alone: without its settings, refuse rather
+        -- than take the node-local lock, which peers cannot see.
+        IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'spock') THEN
+            RAISE EXCEPTION 'coldfront: this node runs Spock, so a cold write needs the bakery, and % is not set',
+                CASE WHEN NULLIF(current_setting('coldfront.loopback_dsn'), '') IS NULL
+                     THEN 'coldfront.loopback_dsn' ELSE 'snowflake.node' END
+                USING HINT = 'Set coldfront.loopback_dsn to this server''s unix-socket DSN (e.g. ''host=/var/run/postgresql dbname=coldfront user=coldfront'') and snowflake.node to this node''s id.';
+        END IF;
         PERFORM pg_advisory_xact_lock(hashtext('coldfront_iceberg:' || p_iceberg_ref));
     END IF;
 END;
@@ -3928,13 +3800,14 @@ $$;
 -- (async WITH the patch) is safe. STABLE so the planner can fold it.
 CREATE FUNCTION coldfront._iceberg_async_active() RETURNS boolean
 LANGUAGE sql STABLE AS $$
-  SELECT COALESCE(NULLIF(current_setting('coldfront.iceberg_async_parquet', true), '')::boolean, false)
-     AND COALESCE(NULLIF(current_setting('coldfront.iceberg_bakery_patch',   true), '')::boolean, false)
+  SELECT current_setting('coldfront.iceberg_async_parquet')::boolean
+     AND current_setting('coldfront.iceberg_bakery_patch')::boolean
 $$;
 
 -- Serialise one cold-tier Iceberg write so concurrent committers never hit a
--- Lakekeeper 409 CatalogCommitConflict (duckdb-iceberg does not rebase → the
--- loser's data is silently dropped). This is THE chokepoint every cold write
+-- Lakekeeper 409 CatalogCommitConflict (duckdb-iceberg does not rebase: the
+-- losing transaction aborts and its batch has to be retried). This is THE
+-- chokepoint every cold write
 -- routes through, in every deployment.
 --
 -- The serializer is fundamentally a per-Iceberg-table mutex that scales by
@@ -3963,7 +3836,7 @@ $$;
 --     dependency. Taken BEFORE staging so a second backend on this node blocks
 --     before it captures parent_snapshot_id (no stale-parent 409); auto-released
 --     at commit. This is the path for plain PostgreSQL tiered deployments, which
---     have no snowflake.node / dblink_self configured.
+--     have no snowflake.node / loopback_dsn configured.
 --
 -- _bakery_armed() probes the two GUCs the R-A bakery requires. current_setting(...,true)
 -- returns NULL for an unrecognised GUC, so the probe is safe with no snowflake
@@ -3992,22 +3865,23 @@ BEGIN
     IF strpos(p_sql, 'pglocal.') > 0 THEN
         PERFORM coldfront.ensure_pg_attached();
     END IF;
-    -- This wrapper is the single-statement cold path; _tiered_insert_cold and
-    -- _cross_tier_move issue their own multi-statement cold writes and carry the
-    -- same guard. A hot write hits a PG heap, which PG rejects natively.
+    -- This wrapper is the single-statement cold path; the cold sink
+    -- (_cold_sink_step) and _cross_tier_move issue their own cold writes and
+    -- carry the same guard. A hot write hits a PG heap, which PG rejects natively.
     PERFORM coldfront._reject_on_standby('execute a cold (Iceberg) write');
     -- Fail-safe, not fail-silent: if async was REQUESTED but the bakery-aware
     -- patch is not asserted, we use the stock ordering (always safe) and note it
     -- ONCE per session. Running async on stock iceberg would let a peer capture a
-    -- stale parent and conflict → silent commit loss (docs/formal Bakery_race.cfg).
+    -- stale parent and conflict: a 409 that aborts the losing transaction
+    -- (docs/formal Bakery_race.cfg).
     -- RAISE LOG, not WARNING: this is a deployment-config advisory that belongs in
     -- the server log; it must NOT reach the client (a per-statement client message
     -- here would pollute output and break tools that scan write output for errors).
     IF NOT v_async
-       AND COALESCE(NULLIF(current_setting('coldfront.iceberg_async_parquet', true), '')::boolean, false)
-       AND current_setting('coldfront._async_downgrade_warned', true) IS DISTINCT FROM 'true' THEN
+       AND current_setting('coldfront.iceberg_async_parquet')::boolean
+       AND NOT current_setting('coldfront._async_downgrade_warned')::boolean THEN
         RAISE LOG 'coldfront: iceberg_async_parquet is on but iceberg_bakery_patch is not set — the loaded duckdb-iceberg is not the bakery-aware build; using the SAFE stock upload ordering instead of async. Set coldfront.iceberg_bakery_patch=on ONLY where duckdb-iceberg carries the bakery-aware-commit-refresh patch (the coldfront patched images set both GUCs).';
-        PERFORM set_config('coldfront._async_downgrade_warned', 'true', false);
+        PERFORM set_config('coldfront._async_downgrade_warned', 'on', false);
     END IF;
     IF v_armed AND v_async THEN
         -- Patched iceberg: upload parquet in the background, then take the claim
@@ -4305,193 +4179,11 @@ CREATE FUNCTION coldfront._rename_tiered_view(
      WHERE schema_name = p_schema AND table_name = p_old_view_name;
 $$;
 
--- coldfront._rebuild_write_trigger: (re)build a tiered view's INSTEAD OF INSERT
--- trigger from the registry, the watermark and the hot table's live columns.
---
--- The one generator of the trigger's positional lists: the archiver calls it at
--- bootstrap and _rebuild_tiered_view calls it after DDL, so the pairing of the
--- inner format()'s placeholders with their arguments is decided in exactly one
--- place, for every column type alike. CREATE OR REPLACE on both the function and
--- the trigger keeps it idempotent: the archiver re-runs bootstrap each cycle
--- against a view that already carries the previous trigger.
---
--- Iceberg-only views are a no-op: their trigger is create_iceberg_table's, built
--- from the declared jsonb columns rather than a hot heap.
-CREATE FUNCTION coldfront._rebuild_write_trigger(
-    p_schema    text,
-    p_view_name text
-)
-RETURNS void
-LANGUAGE plpgsql AS $$
-DECLARE
-    v_hot_table     text;          -- stored quoted, e.g. "public"."_events"
-    v_iceberg       text;          -- DuckDB ref, e.g. ice.myapp.events
-    v_partcol       text;
-    v_is_ice_only   boolean;
-    v_hot_schema    text;
-    v_hot_relname   text;
-    v_cutoff        timestamptz;
-    v_cutoff_lit    text;          -- UTC text literal of the cutoff
-    v_has_cutoff    boolean;
-
-    v_col_list      text := '';     -- hot INSERT target columns (non-identity)
-    v_hot_vals      text := '';     -- NEW."col" refs (non-identity)
-    v_cold_vals     text := '';     -- NEW."col"[::text] refs (non-identity)
-    v_placeholders  text := '';     -- %L / NULL per column, positional
-    v_vec_cols         text[] := '{}';
-    v_vec_placeholders text[] := '{}';
-    v_vec_refs         text[] := '{}';
-
-    v_func_sql      text;
-    v_funcname      text;           -- coldfront."<view>_write"
-    v_trigname      text;           -- "<view>_write_trigger"
-    r               record;
-    iter            int := 0;
-BEGIN
-    SELECT tv.hot_table, tv.iceberg_table, tv.partition_col, tv.is_iceberg_only
-    INTO v_hot_table, v_iceberg, v_partcol, v_is_ice_only
-    FROM coldfront.tiered_views tv
-    WHERE tv.schema_name = p_schema AND tv.relname = p_view_name;
-    IF NOT FOUND THEN
-        RAISE EXCEPTION 'coldfront._rebuild_write_trigger: view %.% not registered',
-            p_schema, p_view_name;
-    END IF;
-    IF v_is_ice_only OR v_hot_table IS NULL OR v_partcol IS NULL THEN
-        RETURN;
-    END IF;
-
-    -- hot_table is stored as a quoted identifier; parse_ident handles the
-    -- quoting/escaping. No EXCEPTION wrapper: pg_duckdb forbids subtxns.
-    v_hot_schema  := (parse_ident(v_hot_table))[1];
-    v_hot_relname := (parse_ident(v_hot_table))[2];
-
-    SELECT cutoff_time INTO v_cutoff
-    FROM coldfront.archive_watermark
-    WHERE schema_name = p_schema AND table_name = p_view_name;
-    v_has_cutoff := (v_cutoff IS NOT NULL);
-    IF v_has_cutoff THEN
-        v_cutoff_lit := to_char(v_cutoff AT TIME ZONE 'UTC', 'YYYY-MM-DD HH24:MI:SS+00');
-    END IF;
-
-    -- Placeholders are positional over ALL live columns incl. identity and
-    -- generated (NULL for those, %L otherwise): the cold INSERT supplies the
-    -- full tuple. An identity or generated column also stays out of the hot
-    -- INSERT list: PostgreSQL rejects a supplied value for either.
-    FOR r IN
-        SELECT a.attname,
-               format_type(a.atttypid, a.atttypmod) AS pg_type,
-               a.attidentity,
-               a.attgenerated
-        FROM pg_attribute a
-        JOIN pg_class c      ON c.oid = a.attrelid
-        JOIN pg_namespace nn ON nn.oid = c.relnamespace
-        WHERE nn.nspname = v_hot_schema
-          AND c.relname  = v_hot_relname
-          AND a.attnum > 0
-          AND NOT a.attisdropped
-          AND NOT coldfront._is_vec_companion(a.attname, a.attgenerated)
-        ORDER BY a.attnum
-    LOOP
-        IF coldfront._is_vector_type(r.pg_type) THEN
-            v_vec_cols         := v_vec_cols || r.attname;
-            v_vec_placeholders := v_vec_placeholders || coldfront._cold_placeholder(r.pg_type);
-            v_vec_refs         := v_vec_refs || coldfront._cold_value(r.attname, r.pg_type);
-        END IF;
-
-        IF iter > 0 THEN
-            v_placeholders := v_placeholders || ', ';
-        END IF;
-        iter := iter + 1;
-
-        IF r.attidentity = 'a' OR r.attgenerated <> '' THEN
-            v_placeholders := v_placeholders || 'NULL';
-        ELSE
-            IF v_col_list <> '' THEN
-                v_col_list := v_col_list || ', ';
-                v_hot_vals := v_hot_vals || ', ';
-                v_cold_vals := v_cold_vals || ', ';
-            END IF;
-            v_col_list := v_col_list || quote_ident(r.attname);
-            v_hot_vals := v_hot_vals || 'NEW.' || quote_ident(r.attname);
-            -- Cold-INSERT value and its format() placeholder: one shared decision
-            -- with create_iceberg_table.
-            v_placeholders := v_placeholders || coldfront._cold_placeholder(r.pg_type);
-            v_cold_vals    := v_cold_vals || coldfront._cold_value(r.attname, r.pg_type);
-        END IF;
-    END LOOP;
-
-    IF iter = 0 THEN
-        RAISE EXCEPTION 'coldfront._rebuild_write_trigger: hot table %.% has no live columns',
-            v_hot_schema, v_hot_relname;
-    END IF;
-
-    -- The cluster columns lead the Iceberg schema, so they lead this positional
-    -- VALUES list too, and each lookup's own %L makes that vector's value lead the
-    -- argument list with it.
-    IF cardinality(v_vec_cols) > 0 THEN
-        v_placeholders := coldfront._vec_list_prefix(p_schema, p_view_name, v_vec_cols,
-                                                    v_vec_placeholders) || v_placeholders;
-        v_cold_vals    := array_to_string(v_vec_refs, ', ') || ', ' || v_cold_vals;
-    END IF;
-
-    v_funcname := format('coldfront.%I', p_view_name || '_write');
-    v_trigname := p_view_name || '_write_trigger';
-
-    -- Double-formatted: the outer format() builds the function body; the body
-    -- itself calls format(...) at trigger time to fill %L placeholders with
-    -- NEW values. The INSERT template, placeholders, and iceberg ref must
-    -- survive THIS format() literally, so they are assembled by concatenation.
-    v_func_sql := format(
-$fn$CREATE OR REPLACE FUNCTION %s() RETURNS trigger AS $body$
-DECLARE
-  cutoff timestamptz;
-BEGIN
-  SELECT cutoff_time INTO cutoff FROM coldfront.archive_watermark WHERE schema_name = %L AND table_name = %L;
-  IF cutoff IS NULL THEN
-    cutoff := %s;
-  END IF;
-
-  IF TG_OP = 'INSERT' THEN
-    IF NEW.%I < cutoff THEN
-      PERFORM coldfront.ensure_attached();%s
-      PERFORM duckdb.raw_query(format(
-        %L,
-        %s
-      ));
-      RETURN NEW;
-    END IF;
-    INSERT INTO %I.%I (%s) VALUES (%s);
-    RETURN NEW;
-  END IF;
-  RETURN NULL;
-END;
-$body$ LANGUAGE plpgsql$fn$,
-        v_funcname,
-        p_schema, p_view_name,                                  -- watermark key literals (schema, name)
-        CASE WHEN v_has_cutoff
-             THEN quote_literal(v_cutoff_lit) || '::timestamptz'
-             ELSE '''-infinity''::timestamptz' END,             -- default cutoff
-        v_partcol,                                              -- NEW.<partcol>
-        CASE WHEN cardinality(v_vec_cols) = 0 THEN ''
-             ELSE E'\n      PERFORM coldfront.ensure_pg_attached();' END,
-        'INSERT INTO ' || v_iceberg || ' VALUES (' || v_placeholders || ')',
-        v_cold_vals,                                            -- args to inner format()
-        v_hot_schema, v_hot_relname, v_col_list, v_hot_vals);   -- hot INSERT
-
-    EXECUTE v_func_sql;
-    EXECUTE format(
-        'CREATE OR REPLACE TRIGGER %I INSTEAD OF INSERT ON %I.%I FOR EACH ROW EXECUTE FUNCTION %s()',
-        v_trigname, p_schema, p_view_name, v_funcname);
-END;
-$$;
-
 -- coldfront._rebuild_tiered_view: regenerate the transparent UNION-ALL view
--- and its INSTEAD OF INSERT trigger after a RENAME TABLE (hot heap) or RENAME
--- VIEW. Driven entirely from pg_catalog; the view projection is the runtime
--- equivalent of internal/view/view.go's GenerateViewSQL, and the trigger comes
--- from _rebuild_write_trigger, the same builder the archiver uses. (Also rebuilt
--- after a mirrored column-shape change, so the view's column set follows the hot
--- heap; and after a hot-table or view rename.)
+-- after a RENAME TABLE (hot heap) or RENAME VIEW. Driven entirely from
+-- pg_catalog; the view projection is the runtime equivalent of
+-- internal/view/view.go's GenerateViewSQL. (Also rebuilt after a mirrored
+-- column-shape change, so the view's column set follows the hot heap.)
 --
 -- Called by the coldfront DDL hook for tiered views (rows with a non-NULL
 -- hot_table). Iceberg-only views (is_iceberg_only = true, hot_table NULL) are
@@ -4501,11 +4193,10 @@ $$;
 -- View strategy: DROP VIEW IF EXISTS ... CASCADE then CREATE VIEW (never
 -- CREATE OR REPLACE). PG only lets CREATE OR REPLACE VIEW append columns at
 -- the end; a DDL that drops/renames/reorders/retypes a column would fail it.
--- DROP also removes the INSTEAD OF trigger (recreated below) and changes the
--- view OID — but the registry is keyed by (schema, relname), which the
--- DROP+CREATE leaves unchanged, so there is no row to re-point. On a VIEW
--- rename the hook migrates the registry key (old→new name) BEFORE calling this,
--- so p_view_name is always the current (post-rename) view name.
+-- DROP changes the view OID, but the registry is keyed by (schema, relname),
+-- which the DROP+CREATE leaves unchanged, so there is no row to re-point. On a
+-- VIEW rename the hook migrates the registry key (old→new name) BEFORE calling
+-- this, so p_view_name is always the current (post-rename) view name.
 CREATE FUNCTION coldfront._rebuild_tiered_view(
     p_schema     text,
     p_view_name  text
@@ -4557,7 +4248,7 @@ BEGIN
 
     -- hot_table is stored as a quoted identifier ("public"."_events").
     -- parse_ident handles the quoting/escaping (same pattern as
-    -- _tiered_insert_cold). No EXCEPTION wrapper — pg_duckdb forbids subtxns.
+    -- _cold_sink_step). No EXCEPTION wrapper: pg_duckdb forbids subtxns.
     v_hot_schema  := (parse_ident(v_hot_table))[1];
     v_hot_relname := (parse_ident(v_hot_table))[2];
 
@@ -4572,8 +4263,7 @@ BEGIN
     END IF;
 
     -- 3. Post-DDL column list from the HOT table, attnum order, live columns.
-    --    Build the hot/cold projections; the trigger's lists are
-    --    _rebuild_write_trigger's own pass.
+    --    Build the hot/cold projections.
     FOR r IN
         SELECT a.attname,
                format_type(a.atttypid, a.atttypmod) AS pg_type,
@@ -4638,24 +4328,20 @@ $ddl$CREATE VIEW %I.%I AS
   WHERE %I >= %L::timestamptz
   UNION ALL
   SELECT %s
-  FROM iceberg_scan(%L) r
+  FROM duckdb.query(%L) AS t(r)
   WHERE r[%L] < %L::timestamptz$ddl$,
             v_schema, v_view_name,
             v_hot_proj, v_hot_schema, v_hot_relname,
             v_partcol, v_cutoff_lit,
             v_cold_proj,
-            v_iceberg,
+            format('SELECT * FROM %s', v_iceberg),
             v_partcol, v_cutoff_lit);
     END IF;
 
     EXECUTE format('DROP VIEW IF EXISTS %I.%I CASCADE', v_schema, v_view_name);
     EXECUTE v_view_sql;
 
-    -- 5. The trigger, from the shared builder (the DROP above removed it with
-    --    the view).
-    PERFORM coldfront._rebuild_write_trigger(p_schema, p_view_name);
-
-    -- 6. The registry key (schema, relname) is unchanged by the DROP+CREATE
+    -- 5. The registry key (schema, relname) is unchanged by the DROP+CREATE
     --    above (the view name is stable), so there is nothing to re-point. The
     --    cross-tier-move path is the post_parse_analyze hook + coldfront._cross_tier_move;
     --    it needs no per-view object here.
