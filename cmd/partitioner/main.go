@@ -49,23 +49,25 @@ func main() {
 		return
 	}
 
-	cfgPath := flag.String("config", "", "path to the YAML config file")
+	cfgPath := flag.String("config", "", "deployment YAML, checked against the stored configuration; its postgres.dsn connects when --dsn is unset")
+	dsn := flag.String("dsn", "", "PostgreSQL connection string (default: the libpq environment)")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
 	if *showVersion {
 		fmt.Printf("%s %s (built %s)\n", filepath.Base(os.Args[0]), version.Version, version.BuildTime)
 		return
 	}
-	if *cfgPath == "" {
-		log.Fatal("--config is required")
+
+	cfg := &config.Config{}
+	if *cfgPath != "" {
+		c, err := config.Load(*cfgPath)
+		if err != nil {
+			log.Fatalf("load config: %v", err)
+		}
+		cfg = c
 	}
 
-	cfg, err := config.Load(*cfgPath)
-	if err != nil {
-		log.Fatalf("load config: %v", err)
-	}
-
-	conn, err := partition.Connect(ctx, cfg.Postgres.DSN)
+	conn, err := partcfg.Connect(ctx, *dsn, fileConfig(*cfgPath, cfg))
 	if err != nil {
 		log.Fatalf("connect: %v", err)
 	}
@@ -74,27 +76,39 @@ func main() {
 		log.Fatalf("ping: %v", err)
 	}
 
-	loadAndResolve(ctx, conn, cfg, *cfgPath)
+	loadAndResolve(ctx, conn, cfg)
 	validateTablePeriods(ctx, conn, cfg)
 	runReconcilePass(ctx, conn, cfg)
+}
+
+// fileConfig is the YAML to verify against the server, or nil when the run was
+// given none.
+func fileConfig(path string, cfg *config.Config) *config.Config {
+	if path == "" {
+		return nil
+	}
+	return cfg
 }
 
 // dispatchSubcommand handles the top-level help/overview and management
 // subcommands, routing the latter to the shared CLI. It returns true when the
 // invocation was fully handled (main should return); false means main should
-// fall through to its default reconcile run (--config). Preserves the
+// fall through to its default reconcile run. Preserves the
 // os.Exit(2)-for-unknown-subcommand vs log.Fatalf split and the Stdout/Stderr
 // usage destinations.
 func dispatchSubcommand(ctx context.Context) bool {
 	const defaultDesc = "run one partition-maintenance reconcile pass"
-	// Top-level help / overview — no args, or help/-h/--help — lists the
+	// No arguments is the default reconcile run. help/-h/--help lists the
 	// management subcommands so they are discoverable.
-	if len(os.Args) < 2 || os.Args[1] == "help" || os.Args[1] == "-h" || os.Args[1] == "--help" {
+	if len(os.Args) < 2 {
+		return false
+	}
+	if os.Args[1] == "help" || os.Args[1] == "-h" || os.Args[1] == "--help" {
 		partcfg.PrintTopLevelUsage(os.Stdout, "partitioner", defaultDesc)
 		return true
 	}
-	// A management subcommand routes to the shared CLI; with no subcommand the
-	// partitioner does its default reconcile run (--config below).
+	// A management subcommand routes to the shared CLI; a flag means the
+	// default reconcile run.
 	if !strings.HasPrefix(os.Args[1], "-") {
 		if partcfg.IsCommand(os.Args[1]) {
 			if err := partcfg.Run(ctx, os.Args[1], os.Args[2:]); err != nil {
@@ -112,13 +126,13 @@ func dispatchSubcommand(ctx context.Context) bool {
 // loadAndResolve loads the managed tables from the replicated
 // coldfront.partition_config table, writes them back onto cfg, and validates
 // the config.
-func loadAndResolve(ctx context.Context, conn *pgx.Conn, cfg *config.Config, cfgPath string) {
+func loadAndResolve(ctx context.Context, conn *pgx.Conn, cfg *config.Config) {
 	tables, err := partcfg.ResolveTables(ctx, conn, partcfg.PartitionOnly)
 	if err != nil {
 		log.Fatalf("resolve tables: %v", err)
 	}
 	if len(tables) == 0 {
-		log.Fatalf("no tables in coldfront.partition_config; add one with `partitioner register` or seed a YAML with `partitioner import --config %s`", cfgPath)
+		log.Fatalf("no tables in coldfront.partition_config; add one with `partitioner register` or write a YAML into the server with `partitioner import --config <yaml>`")
 	}
 	log.Printf("loaded %d table(s) from coldfront.partition_config", len(tables))
 	cfg.Archiver.Tables = tables

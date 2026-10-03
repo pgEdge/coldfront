@@ -100,9 +100,24 @@ this project adheres to
   replaces `_ensure_claims_replicated()`, `_ensure_vector_state_replicated()`
   and the `spock.repset_add_table` calls the setup asked for by hand, and
   nothing calls it at run time.
+- The archiver, the partitioner and the compactor connect from the libpq
+  environment or `--dsn`, as psql does, and read everything else from the
+  server: the tables from `coldfront.partition_config`, the cold-store
+  credential from `coldfront.storage_secret` and the catalog from the
+  `coldfront.warehouse` and `coldfront.lakekeeper_endpoint` settings. A
+  deployment YAML is written into the server once with `import`, which also
+  takes its `s3:` or `azure:` stanza through `set_storage_secret`; a YAML
+  passed to any other run is checked against the server, value by value, and
+  refused if it disagrees. The compactor takes no YAML.
 
 ### Fixed
 
+- A deployment YAML could name a warehouse other than the server's: the
+  archiver ignored the file's `iceberg.*` keys, the compactor acted on them,
+  and a file with both an `s3:` and an `azure:` stanza was refused by the
+  archiver and silently taken as Azure by the compactor. Both binaries now read
+  the catalog and the store from the server, and a file that disagrees with it
+  is refused.
 - The archiver registered a tiered table as two statements, the view and then
   the registry row, so a mesh peer briefly had the view without the row its
   hook needs, and a write there failed. The registration is one transaction.

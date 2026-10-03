@@ -83,6 +83,12 @@ services:
         build:
             context: ../..
             dockerfile: examples/walkthrough/Dockerfile.archiver
+        environment:
+            PGHOST: db
+            PGPORT: 5432
+            PGDATABASE: coldfront
+            PGUSER: coldfront
+            PGPASSWORD: coldfront
         volumes:
             - ./config:/config:ro
         depends_on:

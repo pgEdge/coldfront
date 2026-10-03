@@ -919,15 +919,16 @@ EOSQL
     explain "systemd timer fires one pass per period, on a single node. Here we run that"
     explain "same binary once, by hand, so you can watch the move happen:"
     explain "  ${DIM}It moves partitions older than 30 days PG → Parquet in S3, and rebuilds events as a unified hot+cold view.${RESET}"
-    # The archiver reads its managed-table set from coldfront.partition_config, not
-    # from the YAML at run time; seed it once from the YAML's archiver.tables block.
+    # The archiver reads its configuration from the server: the tables from
+    # coldfront.partition_config and the store from coldfront.storage_secret.
+    # import writes the YAML into both, once.
     if ! $COMPOSE run --rm --no-deps archiver import --config /config/archiver.yaml >/tmp/wt-archiver.log 2>&1; then
         error "Registering the table failed (archiver import): see /tmp/wt-archiver.log"
         grep -vE '^ Container ' /tmp/wt-archiver.log | tail -5 | sed 's/^/    /'
         return 1
     fi
     if [ "$NONINTERACTIVE" != 1 ]; then
-        show_cmd "docker compose run --rm --no-deps archiver --config /config/archiver.yaml"
+        show_cmd "docker compose run --rm --no-deps archiver"
         echo ""
         read -rp "Press Enter to run the archiver..." </dev/tty
         echo ""
@@ -937,7 +938,7 @@ EOSQL
     # network. Without it, `compose run` re-evaluates depends_on:db and can RECREATE
     # the db from its config hash, replacing the loaded db with a fresh one, so the
     # archiver's host=db then finds no `events` table.
-    $COMPOSE run --rm --no-deps archiver --config /config/archiver.yaml >>/tmp/wt-archiver.log 2>&1
+    $COMPOSE run --rm --no-deps archiver >>/tmp/wt-archiver.log 2>&1
     local rc=$?
     stop_spinner
     if [ "$rc" != 0 ]; then
@@ -1226,7 +1227,7 @@ EOSQL
     # --no-deps: reuse the already-running db (see the archiver note above): a plain
     # `compose run` can recreate the db from its config hash and wipe the loaded data.
     $COMPOSE run --rm --no-deps --entrypoint partitioner archiver \
-        register --config /config/partitioner.yaml --table part_demo \
+        register --table part_demo \
         --period monthly --retention "12 months" >/tmp/wt-part.log 2>&1
     local rc=$?
     stop_spinner
@@ -1246,13 +1247,13 @@ EOSQL
     explain "get dropped automatically. Here we run one pass by hand so you can see it work:"
     explain "  ${DIM}It reads the policy and creates the missing partitions (the current month plus the forward window) so writes never hit a gap.${RESET}"
     if [ "$NONINTERACTIVE" != 1 ]; then
-        show_cmd "partitioner --config /config/partitioner.yaml"
+        show_cmd "partitioner"
         echo ""
         read -rp "Press Enter to reconcile partitions..." </dev/tty
         echo ""
     fi
     start_spinner "Reconciling partitions"
-    $COMPOSE run --rm --no-deps --entrypoint partitioner archiver --config /config/partitioner.yaml >>/tmp/wt-part.log 2>&1
+    $COMPOSE run --rm --no-deps --entrypoint partitioner archiver >>/tmp/wt-part.log 2>&1
     rc=$?
     stop_spinner
     if [ "$rc" != 0 ]; then

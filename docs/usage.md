@@ -145,34 +145,50 @@ CREATE TABLE p_2026_04 PARTITION OF events
     FOR VALUES FROM ('2026-04-01') TO ('2026-05-01');
 ```
 
-The archiver reads its connection and cold-store settings from a YAML file:
+The archiver connects the way psql does, from the libpq environment (`PGHOST`,
+`PGDATABASE`, `PGUSER`, `PGPASSWORD`, `PGSERVICE`) or `--dsn`, and reads every
+other setting from the server: the tables from `coldfront.partition_config`,
+the cold-store credential from `coldfront.storage_secret`, and the catalog from
+the `coldfront.warehouse` and `coldfront.lakekeeper_endpoint` settings. It
+needs no file to run.
+
+A deployment YAML is a way to write that configuration into the server once,
+with `import`:
 
 ```yaml
-postgres:
-  dsn: "host=localhost dbname=mydb"
-iceberg:
-  warehouse: "wh"
-  lakekeeper_endpoint: "http://lakekeeper:8181/catalog"
 s3:
   endpoint: "seaweedfs:8333"
   access_key: "admin"
   secret_key: "adminsecret"
+archiver:
+  tables:
+    - source_table: events
+      partition_period: monthly
+      hot_period: "1 month"
 ```
 
-The archiver cannot run without `iceberg.warehouse` and
-`iceberg.lakekeeper_endpoint`. A config that sets an S3 endpoint or key, or an
-Azure connection string, without them fails to load. A config that sets none of
-these keys is partition-only, and a partition-only config rejects every tiered
-table. `s3.region` defaults to `us-east-1`.
-[Storage Backends](#storage-backends) describes the other `s3:` and `azure:`
-keys, and a deployment on [vended credentials](#vended-credentials) omits both
-sections.
+```bash
+./bin/archiver import --config config.yaml
+```
 
-Register the table in `coldfront.partition_config` (the in-DB per-table config;
-the YAML holds only the connection + cold-store settings):
+`import` upserts each table into `coldfront.partition_config`, validated as
+`register` validates one table, and writes the `s3:` or `azure:` stanza through
+`set_storage_secret`, so the file and the server agree when it returns. A file
+may also name `iceberg.warehouse` and `iceberg.lakekeeper_endpoint`; those are
+checked against the server settings, which are set in `postgresql.conf`, and
+the import fails if they differ. From then on the server is the configuration:
+change it with `set`, `register`, `set_storage_secret` or `postgresql.conf`. A
+YAML passed to any later run is checked, value by value, against what the
+server holds, and any difference is refused with an error that says where
+configuration lives. A file that agrees, such as the output of `export`, runs.
+`s3.region` defaults to `us-east-1`; [Storage Backends](#storage-backends)
+describes the other `s3:` and `azure:` keys, and a deployment on
+[vended credentials](#vended-credentials) has no stanza to import.
+
+Register a single table in `coldfront.partition_config` without a file:
 
 ```bash
-./bin/archiver register --config config.yaml --table events \
+./bin/archiver register --table events \
     --period monthly --hot-period "1 month"
 # optional: --retention "5 years" DROPs cold data past that age
 # (must exceed --hot-period; omit = keep forever)
@@ -181,7 +197,7 @@ the YAML holds only the connection + cold-store settings):
 Run the archiver (typically via cron):
 
 ```bash
-./bin/archiver --config config.yaml
+./bin/archiver
 ```
 
 `--version` prints the version that `make build` stamps from `git describe`
@@ -189,12 +205,10 @@ Run the archiver (typically via cron):
 `go build` prints `unknown`. The partitioner and compactor accept the same
 flag.
 
-Without `--config`, the archiver reads `config.yaml` from the working
-directory. The partitioner has no default and exits with
-`--config is required`. The archiver also accepts `--debug-export-delay`, a
-test-only Go duration (such as `5s`) that holds each partition's capture window
-open between the bulk export and the replay, so that a test can race concurrent
-writes into it. Leave it unset in production.
+The archiver also accepts `--debug-export-delay`, a test-only Go duration
+(such as `5s`) that holds each partition's capture window open between the
+bulk export and the replay, so that a test can race concurrent writes into it.
+Leave it unset in production.
 
 The first run that finds a partition older than `hot_period` renames `events` →
 `_events`, creates the unified view `events`, and registers it; until then the
@@ -371,26 +385,22 @@ attached data). Build the partitioner with `make build` and run it from cron:
 
 ```bash
 go build -o bin/partitioner ./cmd/partitioner   # or: make build
-./bin/partitioner --config config.yaml
+./bin/partitioner
 ```
 
 A database set up this way can gain the cold tier later:
 `CREATE EXTENSION coldfront` adopts the `coldfront.partition_config` the
 partitioner created, registrations included.
 
-A partition-only config has no `iceberg:`, `s3:` or `azure:` section. Any one
-of them makes it a cold-tier config, which requires `iceberg.warehouse` and
-`iceberg.lakekeeper_endpoint` and which the partitioner rejects:
-
-```yaml
-postgres:
-  dsn: "host=localhost dbname=mydb"
-```
+The partitioner connects from the libpq environment or `--dsn`, like psql, and
+reads its tables from `coldfront.partition_config`; it needs no file. A
+partition-only deployment has no cold tier: a table with a `hot_period`
+belongs to the archiver, and the partitioner leaves it alone.
 
 Register each managed table in `coldfront.partition_config`:
 
 ```bash
-./bin/partitioner register --config config.yaml --table events \
+./bin/partitioner register --table events \
     --period monthly --retention "12 months" \
     --strategy drop   # drop (DETACH+DROP, destroy; default)
                       #   | detach (DETACH only, keep as a
@@ -404,7 +414,7 @@ Schedule one pass per period or more often - a cron line, or a systemd
 unit, so alerting is free):
 
 ```text
-17 * * * * postgres /usr/local/bin/partitioner --config /etc/coldfront/partitioner.yaml >> /var/log/coldfront-partitioner.log 2>&1
+17 * * * * postgres PGDATABASE=mydb /usr/local/bin/partitioner >> /var/log/coldfront-partitioner.log 2>&1
 ```
 
 Keep the following operational behavior in mind when scheduling it:
@@ -539,19 +549,23 @@ reason: read access gives no authority to destroy.
 
 ## Managing Partitioned Tables (CLI)
 
-ColdFront splits configuration into two kinds. **Connection** config - the
-PostgreSQL DSN, and (tiered archiver only) the Iceberg/S3 connection - stays in
-a small per-node YAML and is never replicated. **Per-table lifecycle** lives in
+ColdFront's configuration lives in the server. **Per-table lifecycle** lives in
 `coldfront.partition_config`, a name-keyed table that replicates by value
 across a Spock mesh (like `tiered_views`/`archive_watermark`), so every node
-reads identical config - no per-node file syncing. Manage that table with the
-CLI below (both `partitioner` and `archiver` expose these subcommands; with no
-subcommand they do their normal reconcile/archive run).
+reads identical config - no per-node file syncing. The cold-store credential
+lives in `coldfront.storage_secret` and the catalog in the
+`coldfront.warehouse` and `coldfront.lakekeeper_endpoint` settings. The
+**connection** alone comes from outside, from the libpq environment or
+`--dsn`, as for psql. Manage the lifecycle table with the CLI below (both
+`partitioner` and `archiver` expose these subcommands; with no subcommand they
+do their normal reconcile/archive run).
 
 `register` is the primary way to manage tables: one command adds or adopts one
 table, validated on the spot. `import` and `export` are bulk helpers for
-(re)configuring a machine - seed a fresh node from a YAML, or dump the live
-config to git and replay it on another node - not the day-to-day path.
+(re)configuring a machine - write a deployment YAML into a fresh server, or
+dump the live config to git and replay it on another node - not the day-to-day
+path. A YAML passed to anything but `import` is checked against the server and
+refused if it disagrees in any value.
 `register` and `import` run the full validation; `set` re-runs it only when it
 changes the partition period or column, `hot_period`, `retention_period` or the
 sub-partition source, and otherwise relies on the table's CHECK constraints.
@@ -614,41 +628,41 @@ The following table describes the CLI subcommands:
 | `list` | Shows the managed tables and their lifecycle. |
 | `set` | Changes fields, or disables or enables a table with `--disable`/`--enable`. |
 | `remove` | Stops managing a table; the table itself is left intact. |
-| `import` | Bulk-loads a machine's tables from a YAML's `archiver.tables` (for provisioning or restore), validating each table as `register` does. |
+| `import` | Writes a deployment YAML into the server once: its `archiver.tables` as rows, validated as `register` validates each table, and its `s3:` or `azure:` stanza as the storage secret. |
 | `export` | Dumps the active (enabled) config to YAML or SQL, as a git-reviewable backup to replay on another node. |
 
 The following examples register, inspect, and change managed tables:
 
 ```bash
 # Partition-only: keep 3 future partitions, drop those older than 12 months.
-partitioner register --config cf.yaml --table events --period monthly --retention "12 months"
+partitioner register --table events --period monthly --retention "12 months"
 
 # Partition-only, but DETACH (preserve) expired partitions instead of dropping them.
-partitioner register --config cf.yaml --table events --period monthly \
+partitioner register --table events --period monthly \
     --retention "12 months" --strategy detach
 
 # Tiered: tier to cold Iceberg after 1 month, then drop cold data after 5 years.
-archiver register --config cf.yaml --table events --period monthly \
+archiver register --table events --period monthly \
     --hot-period "1 month" --retention "5 years"
 
 # id mode - a real single-column PRIMARY KEY (id) on a snowflake-keyed table.
-partitioner register --config cf.yaml --table events --period monthly \
+partitioner register --table events --period monthly \
     --column id --part-mode id --id-scheme snowflake --retention "1 year"
 
 # 2-level LIST(region) → RANGE(ts), tiered; region values come from a table.
-archiver register --config cf.yaml --table regional --period monthly --column ts \
+archiver register --table regional --period monthly --column ts \
     --hot-period "1 month" --sub-values-source "SELECT region FROM regions"
 
-partitioner list   --config cf.yaml                      # what's managed
-partitioner set    --config cf.yaml --table events --retention "24 months"
-partitioner set    --config cf.yaml --table events --disable   # pause (keeps the row)
-partitioner remove --config cf.yaml --table events       # unregister, keep the table
-partitioner import --config tables.yaml                  # register every table in a YAML at once
-partitioner export --config cf.yaml > managed.yaml       # active config, git-reviewable (--format sql for INSERTs)
+partitioner list                                   # what's managed
+partitioner set    --table events --retention "24 months"
+partitioner set    --table events --disable        # pause (keeps the row)
+partitioner remove --table events                  # unregister, keep the table
+partitioner import --config deploy.yaml            # write a deployment YAML into the server once
+partitioner export > managed.yaml                  # active config, git-reviewable (--format sql for INSERTs)
 ```
 
-Run `partitioner` (or `archiver`) with no arguments, `help`, or `--help` for
-the command overview; every subcommand has detailed `--help` with worked
+Run `partitioner` (or `archiver`) with `help` or `--help` for the command
+overview, and with no arguments for its normal run; every subcommand has detailed `--help` with worked
 examples. The write commands accept `--print-sql` (emit the SQL without running
 it - review/commit it); `register` and `import` also accept `--dry-run`.
 `set --enable`/`--disable` (mutually exclusive) pause/resume a table without
@@ -660,11 +674,12 @@ whose `CHECK` constraints enforce the lifecycle rules at write time.
 
 The subcommands also take the following connection and table flags:
 
-- `--dsn` takes a PostgreSQL connection string on every subcommand and takes
-  precedence over `--config`, whose `postgres.dsn` is read only when `--dsn` is
-  unset.
-- `--config` names the deployment YAML, and on `import` it is required because
-  it names the file whose `archiver.tables` are imported.
+- `--dsn` takes a PostgreSQL connection string on every subcommand. Without
+  it the connection comes from the libpq environment, as for psql.
+- `--config` names a deployment YAML. On `import` it is required, since it
+  names the file to write into the server. On any other subcommand the file is
+  checked against the server, value by value, and refused if it disagrees; its
+  `postgres.dsn` connects when `--dsn` is unset.
 - `--schema` (default `public`) names the table's schema on `register`, `set`
   and `remove`.
 - `--premake` (default `3`) sets on `register` how many future partitions are
@@ -697,7 +712,9 @@ an explicit `source_schema` takes precedence over that prefix.
 
 ## Storage Backends
 
-Configure **exactly one** of the following cold-store backends.
+Configure **exactly one** of the following cold-store backends, through
+`set_storage_secret` or through the `s3:` or `azure:` stanza of a deployment
+YAML, which `import` writes through the same setter.
 
 ### S3
 
@@ -763,10 +780,9 @@ SELECT coldfront.set_storage_secret_vended();
 
 This writes a `coldfront.storage_secret` row marked as vended, so nothing is
 materialized as a DuckDB secret; `ensure_attached()` then attaches the catalog
-with credential vending turned on. The archiver reads the same row and skips
-its own credential setup, so a vended deployment omits the `s3:`/`azure:` block
-from the archiver config entirely. The compactor likewise needs no credential
-in its config.
+with credential vending turned on. The archiver and the compactor read the
+same row, so a vended deployment has no `s3:` or `azure:` stanza to import and
+no credential in any file.
 
 Vended mode targets the two clouds that issue scoped credentials: AWS S3 (STS)
 and Azure ADLS Gen2 (SAS). The `set_storage_secret_vended()` call above enables

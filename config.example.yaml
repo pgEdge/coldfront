@@ -1,16 +1,34 @@
+# A ColdFront deployment YAML. It is an input to `import`, which writes it into
+# the server once:
+#
+#   ./bin/archiver import --config config.yaml
+#
+# After that the server is the configuration: the tables in
+# coldfront.partition_config, the cold-store credential in
+# coldfront.storage_secret, and the catalog in the coldfront.warehouse and
+# coldfront.lakekeeper_endpoint settings (postgresql.conf). The archiver, the
+# partitioner and the compactor connect the way psql does, from the libpq
+# environment (PGHOST, PGDATABASE, PGUSER, PGPASSWORD, PGSERVICE) or --dsn, and
+# need no file. A YAML passed to any later run is checked against the server
+# and refused if it disagrees in any value.
+
+# Optional: the connection `import` uses when PG* is not set and --dsn not given.
 postgres:
   dsn: "host=localhost port=5432 dbname=mydb user=myuser password=mypass sslmode=disable"
 
+# Optional: checked against the server settings of the same name; the import
+# fails if they differ, since those settings are set in postgresql.conf.
 iceberg:
-  warehouse: "wh"                                        # Lakekeeper warehouse name
-  lakekeeper_endpoint: "http://lakekeeper:8181/catalog"  # Lakekeeper REST catalog
+  warehouse: "wh"
+  lakekeeper_endpoint: "http://lakekeeper:8181/catalog"
 
-# Cold-store backend: configure EXACTLY ONE of s3 or azure. Any S3-compatible
-# store works under s3 — SeaweedFS/MinIO, real AWS S3, OR Google Cloud Storage
-# via its S3-interoperability endpoint (see the gcs example below).
+# Cold-store backend, written through coldfront.set_storage_secret: EXACTLY ONE
+# of s3 or azure, or neither for vended credentials. Any S3-compatible store
+# works under s3: SeaweedFS/MinIO, real AWS S3, or Google Cloud Storage through
+# its S3-interoperability endpoint (see the gcs example below).
 s3:
   endpoint: "seaweedfs:8333"    # S3-compatible store endpoint (no http://). OMIT
-                                # for real AWS S3 — see the AWS example below.
+                                # for real AWS S3 (see the AWS example below).
   region: "us-east-1"           # optional, default: "us-east-1"
   access_key: "admin"
   secret_key: "adminsecret"
@@ -19,14 +37,12 @@ s3:
                                 # IGNORED when endpoint is empty (real AWS S3 then
                                 # uses its native virtual-hosted addressing).
 
-# Real AWS S3 — OMIT endpoint so DuckDB uses AWS's native per-Region
+# Real AWS S3: OMIT endpoint so DuckDB uses AWS's native per-Region
 # virtual-hosted + HTTPS endpoint. This is REQUIRED for Regions launched after
 # 2019-03-20 (e.g. ap-south-2, eu-south-2): their DNS does not route path-style
-# requests and returns HTTP 400. Set region to your bucket's Region. The matching
-# persistent (cold-commit) secret must ALSO omit the endpoint:
-#   SELECT coldfront.set_storage_secret('<KEY>','<SECRET>', NULL, '<region>');
-# and the Lakekeeper warehouse storage-profile must be a real-AWS s3 profile
-# (path-style-access: false, no custom endpoint).
+# requests and returns HTTP 400. Set region to your bucket's Region, and give
+# the Lakekeeper warehouse a real-AWS s3 storage profile (path-style-access:
+# false, no custom endpoint).
 # s3:
 #   region: "ap-south-2"          # your bucket's Region (no endpoint!)
 #   access_key: "<AWS access key id>"
@@ -36,8 +52,7 @@ s3:
 # Google Cloud Storage = the s3 backend pointed at the GCS S3-interop endpoint
 # with an HMAC key pair (Console → Cloud Storage → Settings → Interoperability).
 # No separate gcs backend; Lakekeeper's warehouse must use an s3 profile with
-# endpoint https://storage.googleapis.com, flavor s3-compat, path-style. Verified
-# end-to-end (iceberg create/insert/read over GCS interop).
+# endpoint https://storage.googleapis.com, flavor s3-compat, path-style.
 # s3:
 #   endpoint: "storage.googleapis.com"
 #   region: "us-east-1"           # any region; GCS interop accepts the v4 sig
@@ -45,26 +60,23 @@ s3:
 #   secret_key: "<GCS HMAC secret>"
 #   use_ssl: true
 
-# azure:                        # Azure ADLS Gen2 cold tier (requires the DuckDB
-#                               # 1.5.x build — see DUCKDB_1.5_PATCHED.md). The access
-#                               # key rides inside the connection string; there
-#                               # is no separate account-key field. Leave s3.*
-#                               # empty when using azure.
+# azure:                        # Azure ADLS Gen2 cold tier. The access key rides
+#                               # inside the connection string; there is no
+#                               # separate account-key field. Leave s3.* empty
+#                               # when using azure.
 #   connection_string: "DefaultEndpointsProtocol=https;AccountName=<account>;AccountKey=<key>;EndpointSuffix=core.windows.net"
 
-# Vended credentials: OMIT both s3 and azure entirely. When the cold
-# store is vended (SELECT coldfront.set_storage_secret_vended();), Lakekeeper
-# issues short-lived per-table credentials at access time, so no credential lives
-# in this file, the database, or a DuckDB secret. Keep only the iceberg section
-# above. See docs/usage.md#vended-credentials.
+# Vended credentials: OMIT both s3 and azure, and run
+# SELECT coldfront.set_storage_secret_vended(); on the server instead. Lakekeeper
+# then issues short-lived per-table credentials at access time, so no credential
+# lives in this file, the database or a DuckDB secret. See
+# docs/usage.md#vended-credentials.
 
 archiver:
-  # Tiered tables live in coldfront.partition_config (replicated across a mesh);
-  # the archiver and partitioner read ONLY that table. Populate it with
-  # ./bin/archiver register (one table) or ./bin/archiver import --config <this
-  # file> (every table below, each validated exactly as register validates one).
-  # This tables: list is the import input and the export output format; it is not
-  # read at archive/partition time.
+  # Each table becomes a coldfront.partition_config row (replicated across a
+  # mesh), validated exactly as `./bin/archiver register` validates one table.
+  # This list is the import input and the export output; the binaries read the
+  # table, never this file, at archive and partition time.
   tables:
     - source_table: "events"        # or "myschema.events"
       partition_period: "monthly"   # "monthly" or "daily"

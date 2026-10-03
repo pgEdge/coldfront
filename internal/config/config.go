@@ -10,7 +10,13 @@ import (
 	"github.com/pgedge/coldfront/internal/partition"
 )
 
-// Config is the top-level archiver configuration parsed from YAML.
+// Config is a deployment YAML. It is an input to `import`, which writes its
+// tables and its cold-store stanza into the server, and otherwise a copy of what
+// the server holds, checked against it (partcfg.Verify) and refused on any
+// difference. A run needs no file: the connection comes from --dsn or the
+// libpq environment, the tables from coldfront.partition_config, the catalog
+// from the coldfront.warehouse and coldfront.lakekeeper_endpoint settings and
+// the credentials from coldfront.storage_secret.
 type Config struct {
 	Postgres PostgresConfig `yaml:"postgres"`
 	Iceberg  IcebergConfig  `yaml:"iceberg"`
@@ -19,13 +25,15 @@ type Config struct {
 	Archiver ArchiverConfig `yaml:"archiver"`
 }
 
-// PostgresConfig holds the PostgreSQL connection string.
+// PostgresConfig holds the PostgreSQL connection string, used when --dsn and
+// the libpq environment give none.
 type PostgresConfig struct {
 	DSN string `yaml:"dsn"`
 }
 
-// IcebergConfig identifies the Iceberg REST catalog (Lakekeeper) and
-// warehouse the archiver writes to.
+// IcebergConfig names the Lakekeeper warehouse and catalog endpoint. The server
+// settings coldfront.warehouse and coldfront.lakekeeper_endpoint are the
+// configuration; these values are only checked against them.
 type IcebergConfig struct {
 	Warehouse          string `yaml:"warehouse"`           // Lakekeeper warehouse name
 	LakekeeperEndpoint string `yaml:"lakekeeper_endpoint"` // e.g. http://lakekeeper:8181/catalog
@@ -125,23 +133,6 @@ func Load(path string) (*Config, error) {
 	return cfg, nil
 }
 
-// LoadTables reads a YAML config file for its archiver.tables. Each table is
-// validated on its own terms, tiered when it has a hot_period and partition-only
-// otherwise, and the connection and cold-tier sections are not read, so a file
-// that carries only tables, such as one `export` writes, loads.
-func LoadTables(path string) (*Config, error) {
-	cfg, err := parse(path)
-	if err != nil {
-		return nil, err
-	}
-	for i, t := range cfg.Archiver.Tables {
-		if err := validateTable(t, i, t.HotPeriod != ""); err != nil {
-			return nil, err
-		}
-	}
-	return cfg, nil
-}
-
 // parse reads and unmarshals a YAML config file and applies the defaults.
 func parse(path string) (*Config, error) {
 	data, err := os.ReadFile(path)
@@ -190,97 +181,27 @@ func applyTableDefaults(t *TableConfig) {
 	}
 }
 
-// Validate checks that all required fields are set and that enumerated
-// values (like partition_period) are within the allowed set. Returns the
-// first violation found; callers should treat a non-nil return as fatal.
+// Validate checks what the file can be checked for on its own: at most one
+// cold-store stanza, complete when present, and each table on its own terms,
+// tiered when it has a hot_period and partition-only otherwise. Whether the
+// server has a cold tier is the server's to say, after connecting. Returns the
+// first violation found; callers treat a non-nil return as fatal.
 func (c *Config) Validate() error {
-	if c.Postgres.DSN == "" {
-		return fmt.Errorf("postgres.dsn is required")
+	anyS3 := c.S3.Endpoint != "" || c.S3.AccessKey != "" || c.S3.SecretKey != ""
+	if c.Azure.ConnectionString != "" && anyS3 {
+		return fmt.Errorf("set either s3.* or azure.connection_string, not both")
 	}
-	icebergMode, anyS3 := c.coldTierMode()
-	if icebergMode {
-		if err := c.validateColdBackend(anyS3); err != nil {
+	if anyS3 {
+		if err := c.validateS3Fields(); err != nil {
 			return err
 		}
 	}
-	return c.validateTables(icebergMode)
-}
-
-// coldTierMode reports whether any cold-tier field is configured (icebergMode)
-// and, separately, whether any s3.* field is set (anyS3). A config with no
-// iceberg warehouse/endpoint and no S3 fields is a partition-only run (premake
-// + retention, no cold-tier archival). If ANY iceberg/S3 field is supplied,
-// every required one must be — a partial cold config fails loudly rather than
-// silently running half-configured.
-func (c *Config) coldTierMode() (icebergMode, anyS3 bool) {
-	anyS3 = c.S3.Endpoint != "" || c.S3.AccessKey != "" || c.S3.SecretKey != ""
-	icebergMode = c.Iceberg.Warehouse != "" || c.Iceberg.LakekeeperEndpoint != "" ||
-		anyS3 || c.Azure.ConnectionString != ""
-	return icebergMode, anyS3
-}
-
-// validateTables checks every table entry, returning the first violation.
-// Zero tables is allowed here: the managed-table set is resolved at startup from
-// the replicated coldfront.partition_config table, so a connection-only config
-// (no archiver.tables) is valid. archiver.tables is only an input to `import`;
-// the binaries fail loud when partition_config yields no rows.
-func (c *Config) validateTables(icebergMode bool) error {
 	for i, t := range c.Archiver.Tables {
-		if err := validateTable(t, i, icebergMode); err != nil {
+		if err := validateTable(t, i, t.HotPeriod != ""); err != nil {
 			return err
 		}
 	}
 	return nil
-}
-
-// validateColdBackend checks the iceberg/S3/Azure fields required when any
-// cold-tier field is configured. anyS3 reports whether any s3.* field is set.
-func (c *Config) validateColdBackend(anyS3 bool) error {
-	if err := c.validateIcebergCatalog(); err != nil {
-		return err
-	}
-	azureConfigured, err := c.validateBackendExclusivity(anyS3)
-	if err != nil {
-		return err
-	}
-	if azureConfigured {
-		return nil
-	}
-	// Neither S3 nor Azure credentials configured: they are vended by the
-	// Iceberg catalog (Lakekeeper) at read/write time (coldfront.storage_secret
-	// is vended). The warehouse + endpoint validated above are all the config
-	// needs; the archiver enforces the vended row when it attaches. A PARTIAL
-	// s3.* config (anyS3) still falls through to validateS3Fields and fails loud.
-	if !anyS3 {
-		return nil
-	}
-	return c.validateS3Fields()
-}
-
-// validateIcebergCatalog checks the Iceberg REST catalog fields required for
-// any cold-tier backend.
-func (c *Config) validateIcebergCatalog() error {
-	if c.Iceberg.Warehouse == "" {
-		return fmt.Errorf("iceberg.warehouse is required")
-	}
-	if c.Iceberg.LakekeeperEndpoint == "" {
-		return fmt.Errorf("iceberg.lakekeeper_endpoint is required")
-	}
-	return nil
-}
-
-// validateBackendExclusivity enforces that the cold backend is exactly one of
-// S3 or Azure — selected by which is configured. Mixing is a config error.
-// azureConfigured reports whether Azure is the selected backend (in which case
-// the S3 field checks are short-circuited).
-func (c *Config) validateBackendExclusivity(anyS3 bool) (azureConfigured bool, err error) {
-	if c.Azure.ConnectionString != "" {
-		if anyS3 {
-			return false, fmt.Errorf("set either s3.* or azure.connection_string, not both")
-		}
-		return true, nil
-	}
-	return false, nil
 }
 
 // validateS3Fields checks the s3.* fields required for an S3 cold backend.
@@ -303,16 +224,16 @@ func (c *Config) validateS3Fields() error {
 }
 
 // validateTable checks one table entry (index i) against the validation rules,
-// returning the first violation. icebergMode selects tiered vs partition-only
+// returning the first violation. tiered selects tiered vs partition-only
 // lifecycle semantics.
-func validateTable(t TableConfig, i int, icebergMode bool) error {
+func validateTable(t TableConfig, i int, tiered bool) error {
 	if t.SourceTable == "" {
 		return fmt.Errorf("archiver.tables[%d].source_table is required", i)
 	}
 	if err := validateTablePartitionPeriod(t, i); err != nil {
 		return err
 	}
-	if err := validateTableLifecycle(t, i, icebergMode); err != nil {
+	if err := validateTableLifecycle(t, i, tiered); err != nil {
 		return err
 	}
 	// part_mode / id_scheme: reuse BoundaryFor as the single validator of
@@ -320,7 +241,7 @@ func validateTable(t TableConfig, i int, icebergMode bool) error {
 	if _, err := partition.BoundaryFor(t.PartMode, t.IDScheme); err != nil {
 		return fmt.Errorf("archiver.tables[%d]: %w", i, err)
 	}
-	if err := validateTableExpiration(t, i, icebergMode); err != nil {
+	if err := validateTableExpiration(t, i, tiered); err != nil {
 		return err
 	}
 	return validateTableSubPartition(t, i)
@@ -361,8 +282,8 @@ func validateTableSubPartition(t TableConfig, i int) error {
 // cold data) is optional and must exceed hot_period. Partition-only:
 // retention_period (drop the hot partition) is required; hot_period is
 // meaningless without a cold tier.
-func validateTableLifecycle(t TableConfig, i int, icebergMode bool) error {
-	if icebergMode {
+func validateTableLifecycle(t TableConfig, i int, tiered bool) error {
+	if tiered {
 		// The cold tier is time-only (timestamp RANGE key, timestamptz Iceberg
 		// writes). id mode keys partitions on a non-time id, which the cold
 		// tier cannot express — reject it at config load rather than fail
@@ -380,9 +301,6 @@ func validateTableLifecycle(t TableConfig, i int, icebergMode bool) error {
 		// binary startup. config.Load has no DB, so it only enforces presence.
 		return nil
 	}
-	if t.HotPeriod != "" {
-		return fmt.Errorf("archiver.tables[%d].hot_period is only valid in tiered mode (no iceberg/s3 configured)", i)
-	}
 	if t.RetentionPeriod == "" {
 		return fmt.Errorf("archiver.tables[%d].retention_period is required", i)
 	}
@@ -392,14 +310,14 @@ func validateTableLifecycle(t TableConfig, i int, icebergMode bool) error {
 // validateTableExpiration enforces the expiration_strategy enum and the rule
 // that "detach" only makes sense partition-only (the tiered archiver drops
 // after exporting to cold, so it would be a silent no-op).
-func validateTableExpiration(t TableConfig, i int, icebergMode bool) error {
+func validateTableExpiration(t TableConfig, i int, tiered bool) error {
 	switch t.ExpirationStrategy {
 	case "", partition.StrategyDrop, partition.StrategyDetach:
 	default:
 		return fmt.Errorf("archiver.tables[%d].expiration_strategy %q must be %q or %q",
 			i, t.ExpirationStrategy, partition.StrategyDetach, partition.StrategyDrop)
 	}
-	if icebergMode && t.ExpirationStrategy == partition.StrategyDetach {
+	if tiered && t.ExpirationStrategy == partition.StrategyDetach {
 		return fmt.Errorf("archiver.tables[%d].expiration_strategy %q is only valid in partition-only mode",
 			i, partition.StrategyDetach)
 	}

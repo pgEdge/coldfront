@@ -17,10 +17,10 @@ claim.
 
 ## Usage
 
-Run the compactor against a deployment config, naming the table to maintain:
+Run the compactor against the database server, naming the table to maintain:
 
 ```text
-compactor --config <yaml> --table <[schema.]name> [flags]
+compactor --table <[schema.]name> [--dsn <dsn>] [flags]
 ```
 
 A bare table name means the `public` schema; the schema is also the table's
@@ -46,13 +46,17 @@ Compaction always runs (a no-op when no partition has enough small files);
 looks like this:
 
 ```text
-compactor --config deploy.yaml --table events --expire-snapshots --orphans
+compactor --table events --expire-snapshots --orphans
 ```
 
-The config is the same deployment YAML the archiver reads - `postgres.dsn` (for
-the bakery claim), `iceberg.{warehouse, lakekeeper_endpoint}`, and at most one
-cold-store stanza: `s3:` or `azure:` for static credentials, or none when the
-deployment uses vended credentials (`set_storage_secret_vended`).
+The compactor connects the way psql does, from the libpq environment (`PGHOST`,
+`PGDATABASE`, `PGUSER`, `PGPASSWORD`, `PGSERVICE`) or `--dsn`, and reads the
+rest from that server: the catalog from the `coldfront.warehouse` and
+`coldfront.lakekeeper_endpoint` settings and the cold-store credential from the
+`coldfront.storage_secret` row, the same configuration every cold write uses.
+It needs no file. A vended row gives it no credential, so Lakekeeper's vended
+credentials are the only ones it sees. It runs where those addresses resolve,
+which is wherever the database server itself reaches Lakekeeper and the store.
 
 ## Backends
 
@@ -110,8 +114,9 @@ tables directly. Build the binary with `make compactor`, which vets, lints
 
 To go further with ColdFront, consult the following documents:
 
-- The [Using ColdFront](usage.md) guide covers the deployment YAML the
-  compactor shares with the archiver.
+- The [Using ColdFront](usage.md) guide covers the server configuration the
+  compactor shares with the archiver, and the deployment YAML `import` writes
+  into it.
 - The [Vector Storage](architecture_vectors.md) deep dive describes the sort
   key the compactor applies to clustered tables.
 - The [Architecture](architecture.md) overview describes the bakery claim each

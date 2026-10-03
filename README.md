@@ -110,11 +110,13 @@ ColdFront reads its settings from two places. The server settings live in
 `postgresql.conf`: `shared_preload_libraries = 'pg_duckdb,coldfront'`,
 `coldfront.warehouse` and `coldfront.lakekeeper_endpoint`, plus
 `snowflake.node` and `coldfront.loopback_dsn` on every node of a mesh. The
-Docker image writes them on first start. The archiver, partitioner, and
-compactor read a deployment YAML, modeled on
-[config.example.yaml](config.example.yaml), for the database DSN, the Iceberg
-catalog, and the cold-store credentials, and each table's lifecycle lives in
-`coldfront.partition_config`. For every setting, see
+Docker image writes them on first start. The archiver, partitioner and
+compactor connect from the libpq environment or `--dsn` and read everything
+else from the server: each table's lifecycle in `coldfront.partition_config`,
+the cold-store credential in `coldfront.storage_secret` and the catalog
+settings above. A deployment YAML, modeled on
+[config.example.yaml](config.example.yaml), is written into the server once
+with `import`. For every setting, see
 [Using ColdFront → One-Time Setup](docs/usage.md#one-time-setup) and
 [Tuning Knobs](docs/usage.md#tuning-knobs).
 

@@ -34,7 +34,7 @@ var commands = []command{
 	{"list", "show the managed tables and their lifecycle", runList},
 	{"set", "change a managed table's fields, or --enable / --disable it", runSet},
 	{"remove", "stop managing a table (the table itself is left intact)", runRemove},
-	{"import", "seed the config table from a deployment YAML's archiver.tables", runImport},
+	{"import", "write a deployment YAML into the server, once (tables and store)", runImport},
 	{"export", "dump the active config to YAML or SQL (a git-reviewable copy)", runExport},
 }
 
@@ -76,13 +76,20 @@ func CommandNames() []string {
 
 // PrintTopLevelUsage prints the program synopsis + the subcommand overview, so
 // the management commands are discoverable from `<binary>` / `<binary> --help`.
-// defaultDesc says what the binary does with no subcommand (its --config run).
+// defaultDesc says what the binary does with no subcommand (its default run).
 func PrintTopLevelUsage(w io.Writer, prog, defaultDesc string) {
 	_, _ = fmt.Fprintf(w, `%s — coldfront partition lifecycle management.
 
 USAGE:
-  %s --config <yaml>      %s
+  %s [--dsn <dsn>]        %s
   %s <command> [flags]    manage the partition_config table (any node; replicates on a mesh)
+
+The connection is --dsn or the libpq environment (PGHOST, PGDATABASE, PGUSER,
+PGPASSWORD, PGSERVICE), as for psql. Configuration lives in the server:
+coldfront.partition_config, coldfront.storage_secret and the
+coldfront.warehouse and coldfront.lakekeeper_endpoint settings. A deployment
+YAML is for "import", which writes it into the server once; passed to any
+other run it is checked and refused if it disagrees.
 
 COMMANDS:
 `, prog, prog, defaultDesc, prog)
@@ -94,26 +101,45 @@ COMMANDS:
 	_, _ = fmt.Fprintf(w, "\nRun \"%s <command> --help\" for detailed help and examples.\n", prog)
 }
 
-// addConn registers the shared --dsn / --config connection flags on fs and
-// returns accessors. Management commands connect with --dsn directly, or read
-// the DSN from the same --config YAML the runtime uses.
+// addConn registers the shared --dsn / --config flags on fs and returns the
+// connector. The connection string is --dsn, else the YAML's postgres.dsn, else
+// the libpq environment (PGHOST, PGDATABASE, PGUSER, PGPASSWORD, PGSERVICE and
+// the rest), the way psql connects. A YAML given here is checked against the
+// server after connecting and refused when it disagrees.
 func addConn(fs *flag.FlagSet) func(context.Context) (*pgx.Conn, error) {
-	dsn := fs.String("dsn", "", "PostgreSQL connection string (or use --config)")
-	cfgPath := fs.String("config", "", "path to the deployment YAML; its postgres.dsn is used if --dsn is unset")
+	dsn := fs.String("dsn", "", "PostgreSQL connection string (default: the libpq environment, or postgres.dsn from --config)")
+	cfgPath := fs.String("config", "", "deployment YAML, checked against the stored configuration; its postgres.dsn connects when --dsn is unset")
 	return func(ctx context.Context) (*pgx.Conn, error) {
-		d := *dsn
-		if d == "" && *cfgPath != "" {
-			cfg, err := config.Load(*cfgPath)
+		var cfg *config.Config
+		if *cfgPath != "" {
+			c, err := config.Load(*cfgPath)
 			if err != nil {
 				return nil, fmt.Errorf("read --config: %w", err)
 			}
-			d = cfg.Postgres.DSN
+			cfg = c
 		}
-		if d == "" {
-			return nil, fmt.Errorf("a connection is required: pass --dsn or --config")
-		}
-		return openConn(ctx, d)
+		return Connect(ctx, *dsn, cfg)
 	}
+}
+
+// Connect opens the connection a binary runs on: dsn, else the YAML's
+// postgres.dsn, else the libpq environment. With a YAML it then refuses to
+// continue unless the file agrees with the stored configuration.
+func Connect(ctx context.Context, dsn string, cfg *config.Config) (*pgx.Conn, error) {
+	if dsn == "" && cfg != nil {
+		dsn = cfg.Postgres.DSN
+	}
+	conn, err := openConn(ctx, dsn)
+	if err != nil {
+		return nil, err
+	}
+	if cfg != nil {
+		if err := Verify(ctx, conn, cfg); err != nil {
+			_ = conn.Close(ctx)
+			return nil, err
+		}
+	}
+	return conn, nil
 }
 
 // runRegister adds (or adopts) a managed table: it validates the table is
@@ -390,22 +416,22 @@ by a calendar-aware interval comparison. --hot-period / --retention accept any
 PostgreSQL interval (e.g. "1 month", "90 days", "1 year 2 mons").
 
 USAGE:
-  <binary> register --table <name> --period <monthly|daily> [lifecycle flags] (--dsn <dsn> | --config <yaml>)
+  <binary> register --table <name> --period <monthly|daily> [lifecycle flags] [--dsn <dsn>]
 
 EXAMPLES:
   # Partition-only: keep a forward window, drop partitions older than 12 months.
-  partitioner register --config cf.yaml --table events --period monthly --retention "12 months"
+  partitioner register --table events --period monthly --retention "12 months"   # connects from PGHOST/PGDATABASE/PGUSER
 
   # Tiered: tier to cold Iceberg after 1 month, drop cold data after 5 years.
   archiver register --dsn "host=db dbname=app" --table events --period monthly \
       --hot-period "1 month" --retention "5 years"
 
   # id-mode (single-column PRIMARY KEY (id) on a snowflake-keyed table; partition-only).
-  partitioner register --config cf.yaml --table events --period monthly \
+  partitioner register --table events --period monthly \
       --column id --part-mode id --id-scheme snowflake --retention "1 year"
 
   # 2-level LIST(region)→RANGE(ts), tiered; region values come from a table.
-  archiver register --config cf.yaml --table regional --period monthly --column ts \
+  archiver register --table regional --period monthly --column ts \
       --hot-period "1 month" --sub-values-source "SELECT region FROM regions"
 
   # Print the SQL for review/commit instead of running it (GitOps).
@@ -425,10 +451,10 @@ func runList(ctx context.Context, args []string) error {
 		_, _ = fmt.Fprint(fs.Output(), `list — show the tables under partition lifecycle management.
 
 USAGE:
-  <binary> list (--dsn <dsn> | --config <yaml>)
+  <binary> list [--dsn <dsn>]
 
 EXAMPLES:
-  partitioner list --config cf.yaml             # connect via the deployment YAML's DSN
+  partitioner list                              # connects from the libpq environment
   archiver     list --dsn "host=db dbname=app"  # or pass a DSN directly
 
 FLAGS:
@@ -504,6 +530,20 @@ ON CONFLICT (schema_name, table_name) DO UPDATE SET
   id_scheme = EXCLUDED.id_scheme, hot_period = EXCLUDED.hot_period,
   retention_period = EXCLUDED.retention_period, sub_part_values_source = EXCLUDED.sub_part_values_source,
   expiration_strategy = EXCLUDED.expiration_strategy;`,
+		lit(r.schema), lit(r.table), lit(r.period), lit(r.column), r.premake,
+		lit(r.partMode), lit(r.idScheme), lit(r.hot), lit(r.retention), lit(r.subValues), lit(r.strategy))
+}
+
+// matchSQL is true when the stored row holds exactly the values insertSQL
+// would write, compared by PostgreSQL so an interval spelled two ways still
+// matches; false when the row differs or does not exist.
+func (r configRow) matchSQL() string {
+	return fmt.Sprintf(`SELECT EXISTS (SELECT 1 FROM coldfront.partition_config
+ WHERE schema_name = %s AND table_name = %s
+   AND partition_period IS NOT DISTINCT FROM %s AND partition_column IS NOT DISTINCT FROM %s
+   AND future_partitions = %d AND part_mode IS NOT DISTINCT FROM %s AND id_scheme IS NOT DISTINCT FROM %s
+   AND hot_period IS NOT DISTINCT FROM %s::interval AND retention_period IS NOT DISTINCT FROM %s::interval
+   AND sub_part_values_source IS NOT DISTINCT FROM %s AND expiration_strategy IS NOT DISTINCT FROM %s)`,
 		lit(r.schema), lit(r.table), lit(r.period), lit(r.column), r.premake,
 		lit(r.partMode), lit(r.idScheme), lit(r.hot), lit(r.retention), lit(r.subValues), lit(r.strategy))
 }
@@ -718,13 +758,13 @@ func runSet(ctx context.Context, args []string) error {
 	fs.Usage = simpleUsage(fs, "set", `set — change lifecycle fields on a managed table (only the flags you pass change).
 
 USAGE:
-  <binary> set --table <name> [field flags | --enable | --disable] (--dsn <dsn> | --config <yaml>)
+  <binary> set --table <name> [field flags | --enable | --disable] [--dsn <dsn>]
 
 EXAMPLES:
-  partitioner set --config cf.yaml --table events --retention "24 months"   # change retention
-  archiver     set --config cf.yaml --table events --hot-period "2 weeks"    # change tier age
-  partitioner set --config cf.yaml --table events --disable                  # pause (keep the row)
-  partitioner set --config cf.yaml --table events --print-sql --premake 6    # review the UPDATE`)
+  partitioner set --table events --retention "24 months"   # change retention
+  archiver     set --table events --hot-period "2 weeks"    # change tier age
+  partitioner set --table events --disable                  # pause (keep the row)
+  partitioner set --table events --print-sql --premake 6    # review the UPDATE`)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -852,11 +892,11 @@ The partitioned table itself is NOT dropped — only its lifecycle registration 
 removed. Drop the table separately if you intend to destroy the data.
 
 USAGE:
-  <binary> remove --table <name> (--dsn <dsn> | --config <yaml>)
+  <binary> remove --table <name> [--dsn <dsn>]
 
 EXAMPLES:
-  partitioner remove --config cf.yaml --table events              # unregister
-  partitioner remove --config cf.yaml --table events --print-sql  # review the DELETE first`)
+  partitioner remove --table events              # unregister
+  partitioner remove --table events --print-sql  # review the DELETE first`)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -889,26 +929,31 @@ EXAMPLES:
 	return nil
 }
 
-// runImport seeds partition_config from a deployment YAML's archiver.tables list.
+// runImport writes a deployment YAML into the server: its tables into
+// partition_config and its cold-store stanza into the storage secret.
 func runImport(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("import", flag.ContinueOnError)
-	cfgPath := fs.String("config", "", "deployment YAML to import: its archiver.tables become partition_config rows (required)")
-	dsn := fs.String("dsn", "", "connection DSN (default: postgres.dsn from --config)")
+	cfgPath := fs.String("config", "", "deployment YAML to import: its archiver.tables become partition_config rows and its s3: or azure: stanza the storage secret (required)")
+	dsn := fs.String("dsn", "", "connection DSN (default: postgres.dsn from --config, else the libpq environment)")
 	printSQL := fs.Bool("print-sql", false, "print the INSERTs instead of running them")
 	dryRun := fs.Bool("dry-run", false, "validate/parse but make no changes")
-	fs.Usage = simpleUsage(fs, "import", `import — load a deployment YAML's archiver.tables into coldfront.partition_config.
+	fs.Usage = simpleUsage(fs, "import", `import — write a deployment YAML into the server, once.
 
-Register every table in a config file in one shot, each validated exactly as
-`+"`register`"+` validates a single table (PK covers the partition key; retention
-exceeds hot-period). Connection config (DSN, iceberg/S3) is NOT imported — it
-stays per-node.
+Its archiver.tables become coldfront.partition_config rows, each validated
+exactly as `+"`register`"+` validates a single table (PK covers the partition key;
+retention exceeds hot-period). Its s3: or azure: stanza becomes the storage
+secret (coldfront.set_storage_secret). Its iceberg.warehouse and
+iceberg.lakekeeper_endpoint are checked against the server settings of the same
+name, which live in postgresql.conf. After the import the file and the server
+agree; from then on the server is the configuration, and a YAML passed to any
+run is refused if it disagrees.
 
 USAGE:
   <binary> import --config <yaml> [--dsn <dsn>]
 
 EXAMPLES:
-  partitioner import --config tables.yaml                 # import its tables
-  partitioner import --config tables.yaml --print-sql     # review the INSERTs first`)
+  partitioner import --config deploy.yaml                 # write its tables and secret into the server
+  partitioner import --config deploy.yaml --print-sql     # review the INSERTs first`)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
@@ -916,12 +961,12 @@ EXAMPLES:
 		fs.Usage()
 		return fmt.Errorf("--config is required (the YAML to import)")
 	}
-	cfg, err := config.LoadTables(*cfgPath)
+	cfg, err := config.Load(*cfgPath)
 	if err != nil {
 		return fmt.Errorf("read --config: %w", err)
 	}
-	if len(cfg.Archiver.Tables) == 0 {
-		return fmt.Errorf("no archiver.tables in %s", *cfgPath)
+	if len(cfg.Archiver.Tables) == 0 && cfg.S3.AccessKey == "" && cfg.Azure.ConnectionString == "" {
+		return fmt.Errorf("nothing to import in %s: no archiver.tables and no s3: or azure: stanza", *cfgPath)
 	}
 	if *printSQL {
 		for _, t := range cfg.Archiver.Tables {
@@ -933,17 +978,17 @@ EXAMPLES:
 	if d == "" {
 		d = cfg.Postgres.DSN
 	}
-	if d == "" {
-		return fmt.Errorf("no DSN: set postgres.dsn in --config or pass --dsn")
-	}
-	return applyImport(ctx, d, cfg.Archiver.Tables, *dryRun)
+	return applyImport(ctx, d, cfg, *dryRun)
 }
 
 // applyImport connects, ensures the config table, then writes every table
 // through writeRow — the same validated path `register` uses, so an imported
 // table is checked exactly as a singly-registered one (PK superset, retention
-// > hot). A failure names the offending table and stops the import.
-func applyImport(ctx context.Context, dsn string, tables []config.TableConfig, dryRun bool) error {
+// > hot). A failure names the offending table and stops the import. The
+// cold-store stanza, when the file has one, then becomes the storage secret,
+// and the whole file is verified against the server it was just written to.
+func applyImport(ctx context.Context, dsn string, cfg *config.Config, dryRun bool) error {
+	tables := cfg.Archiver.Tables
 	conn, err := openConn(ctx, dsn)
 	if err != nil {
 		return err
@@ -978,6 +1023,37 @@ func applyImport(ctx context.Context, dsn string, tables []config.TableConfig, d
 		return err
 	}
 	fmt.Printf("imported %d table(s) into coldfront.partition_config\n", len(tables))
+	if err := importSecret(ctx, conn, cfg); err != nil {
+		return err
+	}
+	return Verify(ctx, conn, cfg)
+}
+
+// importSecret writes the file's cold-store stanza into the server through the
+// setter the extension provides, which also materializes the DuckDB secret on
+// this node. The setters are upserts, so a repeated import is harmless. On its
+// own statement, outside the table transaction, because the setter's trigger
+// runs DuckDB secret DDL.
+func importSecret(ctx context.Context, db DBTX, cfg *config.Config) error {
+	switch {
+	case cfg.Azure.ConnectionString != "":
+		_, err := db.Exec(ctx, "SELECT coldfront.set_storage_secret_azure($1)", cfg.Azure.ConnectionString)
+		if err != nil {
+			return fmt.Errorf("import azure stanza: %w", err)
+		}
+		fmt.Println("storage secret set (azure)")
+	case cfg.S3.AccessKey != "":
+		urlStyle := cfg.S3.URLStyle
+		if urlStyle == "" {
+			urlStyle = "path"
+		}
+		_, err := db.Exec(ctx, "SELECT coldfront.set_storage_secret($1, $2, NULLIF($3, ''), $4, $5, $6)",
+			cfg.S3.AccessKey, cfg.S3.SecretKey, cfg.S3.Endpoint, cfg.S3.Region, urlStyle, cfg.S3.UseSSL)
+		if err != nil {
+			return fmt.Errorf("import s3 stanza: %w", err)
+		}
+		fmt.Println("storage secret set (s3)")
+	}
 	return nil
 }
 
@@ -996,11 +1072,11 @@ copy of what is being managed. NOTE: only ENABLED tables are exported — a tabl
 paused with "set --disable" is omitted (its disabled state is not round-tripped).
 
 USAGE:
-  <binary> export [--format yaml|sql] (--dsn <dsn> | --config <yaml>)
+  <binary> export [--format yaml|sql] [--dsn <dsn>]
 
 EXAMPLES:
-  partitioner export --config cf.yaml > managed.yaml      # active config as YAML
-  partitioner export --config cf.yaml --format sql        # active config as INSERT statements`)
+  partitioner export > managed.yaml                       # active config as YAML
+  partitioner export --format sql                         # active config as INSERT statements`)
 	if err := fs.Parse(args); err != nil {
 		return err
 	}

@@ -151,8 +151,8 @@ curl -sf -X POST \
 The walkthrough hero path uses SeaweedFS. To use a cloud store instead, replace
 the warehouse JSON above, the `set_storage_secret` call in Step 5 of
 [Demo 1](walkthrough_demos.md#demo-1-tiered-storage), and the `s3:` block in
-`examples/walkthrough/config/archiver.yaml`, which the archiver uses for its
-own connection to the store.
+`examples/walkthrough/config/archiver.yaml`, which `import` writes into the
+server as the storage secret.
 
 The following table shows the `set_storage_secret` signature for each supported
 store:

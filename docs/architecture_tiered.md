@@ -528,7 +528,7 @@ RANGE (time) key, since on a first run there is no LIST child to detect it
 from:
 
 ```sh
-archiver register --config cf.yaml --table events --period monthly \
+archiver register --table events --period monthly \
     --column ts --hot-period "1 month" \
     --sub-values-source "SELECT branch_id FROM branches"
 ```

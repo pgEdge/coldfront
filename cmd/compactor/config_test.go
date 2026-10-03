@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	iceio "github.com/apache/iceberg-go/io"
@@ -247,5 +248,69 @@ func TestStorageProps_AzureNeverGetsRegion(t *testing.T) {
 	}
 	if got, ok := p[iceio.S3Region]; ok {
 		t.Fatalf("azure must carry no s3.region, got %q", got)
+	}
+}
+
+// The compactor takes its configuration from the server: the two catalog
+// settings and the storage_secret row, mapped onto the Config the catalog
+// opener reads.
+func TestConfigFromServer_S3(t *testing.T) {
+	c, err := configFromServer("wh", "http://lakekeeper:8181/catalog", &secretRow{
+		storageType: "s3", keyID: "admin", secret: "adminsecret", endpoint: "seaweedfs:8333",
+		region: "us-east-1", urlStyle: "path"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Iceberg.Warehouse != "wh" || c.Iceberg.LakekeeperEndpoint != "http://lakekeeper:8181/catalog" {
+		t.Fatalf("catalog not mapped: %+v", c.Iceberg)
+	}
+	if c.S3.AccessKey != "admin" || c.S3.SecretKey != "adminsecret" || c.S3.Endpoint != "seaweedfs:8333" ||
+		c.S3.Region != "us-east-1" || c.S3.URLStyle != "path" || c.S3.UseSSL {
+		t.Fatalf("s3 not mapped: %+v", c.S3)
+	}
+	if c.Azure.ConnectionString != "" {
+		t.Fatalf("azure set on an s3 row: %q", c.Azure.ConnectionString)
+	}
+}
+
+func TestConfigFromServer_Azure(t *testing.T) {
+	c, err := configFromServer("wh", "http://lakekeeper:8181/catalog", &secretRow{
+		storageType: "azure", connectionString: "AccountName=acct;AccountKey=Zm9v"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if c.Azure.ConnectionString != "AccountName=acct;AccountKey=Zm9v" || c.S3.AccessKey != "" {
+		t.Fatalf("azure not mapped: %+v %+v", c.Azure, c.S3)
+	}
+}
+
+// A vended row stores no credential, so the props stay empty and Lakekeeper's
+// vended credentials are the only ones iceberg-go sees.
+func TestConfigFromServer_VendedHasNoCredentials(t *testing.T) {
+	c, err := configFromServer("wh", "http://lakekeeper:8181/catalog", &secretRow{
+		storageType: "s3", region: "us-east-1", urlStyle: "path", vended: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := c.storageProps()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(p) != 0 {
+		t.Fatalf("vended props must be empty, got %v", p)
+	}
+}
+
+func TestConfigFromServer_NoRow(t *testing.T) {
+	_, err := configFromServer("wh", "http://lakekeeper:8181/catalog", nil)
+	if err == nil || !strings.Contains(err.Error(), "set_storage_secret") {
+		t.Fatalf("expected the secret setter to be named, got %v", err)
+	}
+}
+
+func TestConfigFromServer_MissingSettings(t *testing.T) {
+	_, err := configFromServer("", "", &secretRow{storageType: "s3", keyID: "k", secret: "s"})
+	if err == nil || !strings.Contains(err.Error(), "coldfront.warehouse") {
+		t.Fatalf("expected the setting to be named, got %v", err)
 	}
 }

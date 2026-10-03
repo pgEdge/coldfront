@@ -57,8 +57,11 @@ func TestLoad_Defaults(t *testing.T) {
 	assert.Equal(t, 3, cfg.Archiver.Tables[0].FuturePartitions)
 }
 
-func TestLoadTables_TablesOnlyFile(t *testing.T) {
-	path := writeConfig(t, `
+func TestLoad_TablesOnlyFile(t *testing.T) {
+	// A file holding only archiver.tables, such as one `export` writes, loads: the
+	// connection comes from the environment and the cold tier from the server,
+	// so neither has to be in the file.
+	cfg, err := Load(writeConfig(t, `
 archiver:
   tables:
     - source_table: "sales.orders"
@@ -70,11 +73,9 @@ archiver:
       partition_column: "ts"
       partition_period: "daily"
       retention_period: "90 days"
-`)
-	_, err := Load(path)
-	require.ErrorContains(t, err, "postgres.dsn is required")
-	cfg, err := LoadTables(path)
+`))
 	require.NoError(t, err)
+	assert.Empty(t, cfg.Postgres.DSN)
 	require.Len(t, cfg.Archiver.Tables, 2)
 	assert.Equal(t, "sales", cfg.Archiver.Tables[0].SourceSchema)
 	assert.Equal(t, "orders", cfg.Archiver.Tables[0].SourceTable)
@@ -82,8 +83,8 @@ archiver:
 	assert.Equal(t, "public", cfg.Archiver.Tables[1].SourceSchema)
 }
 
-func TestLoadTables_StillValidatesTables(t *testing.T) {
-	_, err := LoadTables(writeConfig(t, `
+func TestLoad_StillValidatesTables(t *testing.T) {
+	_, err := Load(writeConfig(t, `
 archiver:
   tables:
     - source_table: "orders"
@@ -134,7 +135,9 @@ func TestLoad_InvalidYAML(t *testing.T) {
 	assert.Contains(t, err.Error(), "parse config")
 }
 
-func TestValidate_MissingDSN(t *testing.T) {
+func TestLoad_DSNOptional(t *testing.T) {
+	// The connection comes from --dsn or the libpq environment when the file
+	// does not name one.
 	cfg := `
 iceberg:
   warehouse: "wh"
@@ -149,9 +152,9 @@ archiver:
       partition_period: "monthly"
       retention_period: "1 month"
 `
-	_, err := Load(writeConfig(t, cfg))
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "postgres.dsn")
+	c, err := Load(writeConfig(t, cfg))
+	require.NoError(t, err)
+	assert.Empty(t, c.Postgres.DSN)
 }
 
 // Real AWS S3: s3.endpoint is OPTIONAL (omit it so DuckDB uses its native
@@ -203,7 +206,10 @@ archiver:
 	assert.Contains(t, err.Error(), "url_style")
 }
 
-func TestValidate_MissingWarehouse(t *testing.T) {
+func TestLoad_IcebergKeysOptional(t *testing.T) {
+	// The catalog is the server's coldfront.warehouse and
+	// coldfront.lakekeeper_endpoint settings; a file names them only to have
+	// them checked, so a cold-store stanza needs neither.
 	cfg := `
 postgres:
   dsn: "host=localhost"
@@ -220,8 +226,7 @@ archiver:
       retention_period: "1 month"
 `
 	_, err := Load(writeConfig(t, cfg))
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "iceberg.warehouse")
+	require.NoError(t, err)
 }
 
 func TestValidate_AzureMode(t *testing.T) {
@@ -353,11 +358,12 @@ archiver:
 ` + tail
 }
 
-func TestValidate_TieredRequiresHotPeriod(t *testing.T) {
-	// Tiered mode: hot_period (tier-to-cold age) is mandatory; retention is not.
+func TestValidate_TableWithoutHotPeriodNeedsRetention(t *testing.T) {
+	// hot_period is what makes a table tiered. Without it the table is
+	// partition-only, whatever else the file holds, and needs a retention_period.
 	_, err := Load(writeConfig(t, tieredCfg("")))
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "hot_period")
+	assert.Contains(t, err.Error(), "retention_period")
 }
 
 func TestValidate_TieredRetentionOptional(t *testing.T) {
@@ -404,20 +410,20 @@ archiver:
 	assert.Contains(t, err.Error(), "partition_column")
 }
 
-func TestValidate_PartitionOnlyRejectsHotPeriod(t *testing.T) {
-	cfg := `
-postgres:
-  dsn: "host=localhost dbname=mydb"
+func TestValidate_HotPeriodAloneMakesTableTiered(t *testing.T) {
+	// No cold-store stanza in the file: the table is still tiered because it has
+	// a hot_period, so the tiered rules apply (the cold tier is time-only).
+	_, err := Load(writeConfig(t, `
 archiver:
   tables:
-    - source_table: "events"
+    - source_table: "t"
       partition_period: "monthly"
-      retention_period: "12 months"
       hot_period: "1 month"
-`
-	_, err := Load(writeConfig(t, cfg))
+      part_mode: id
+      id_scheme: snowflake
+`))
 	require.Error(t, err)
-	assert.Contains(t, err.Error(), "hot_period")
+	assert.Contains(t, err.Error(), "part_mode")
 }
 
 func TestValidate_PartitionOnly_NoIcebergOK(t *testing.T) {
@@ -583,10 +589,10 @@ archiver:
 	assert.Contains(t, err.Error(), "values_source")
 }
 
-func TestValidate_PartialIcebergIsLoud(t *testing.T) {
-	// A warehouse but no endpoint/s3: a half-configured cold setup, which must
-	// fail loudly rather than be silently treated as partition-only.
-	cfg := `
+func TestLoad_LoneIcebergKeyLoads(t *testing.T) {
+	// A lone iceberg key is a value to check against the server, not a switch
+	// into cold-tier mode.
+	c, err := Load(writeConfig(t, `
 postgres:
   dsn: "host=localhost"
 iceberg:
@@ -596,8 +602,7 @@ archiver:
     - source_table: "t"
       partition_period: "monthly"
       retention_period: "1 month"
-`
-	_, err := Load(writeConfig(t, cfg))
-	require.Error(t, err)
-	assert.Contains(t, err.Error(), "lakekeeper_endpoint")
+`))
+	require.NoError(t, err)
+	assert.Equal(t, "wh", c.Iceberg.Warehouse)
 }

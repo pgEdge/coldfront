@@ -42,7 +42,7 @@ type runOpts struct {
 }
 
 func main() {
-	cfgPath := flag.String("config", "", "deployment YAML: DSN + iceberg/S3/azure storage creds")
+	dsn := flag.String("dsn", "", "PostgreSQL connection string (default: the libpq environment); the catalog and the cold-store credential are read from that server")
 	tableName := flag.String("table", "", "[schema.]table to maintain; schema (default public) maps to the Iceberg namespace (required)")
 	targetMB := flag.Int64("target-size-mb", 128, "compaction: target output Parquet file size in MiB")
 	dryRun := flag.Bool("dry-run", false, "plan only — report what would change, change nothing")
@@ -60,8 +60,8 @@ func main() {
 		return
 	}
 
-	if *cfgPath == "" || *tableName == "" {
-		fmt.Fprintln(os.Stderr, "usage: compactor --config <yaml> --table <name> [--target-size-mb N] [--dry-run]"+
+	if *tableName == "" {
+		fmt.Fprintln(os.Stderr, "usage: compactor --table <name> [--dsn <dsn>] [--target-size-mb N] [--dry-run]"+
 			" [--expire-snapshots [--expire-retain-last N]] [--orphans [--orphan-age D]]")
 		os.Exit(2)
 	}
@@ -75,7 +75,7 @@ func main() {
 		orphans:    *orphans,
 		orphanAge:  *orphanAge,
 	}
-	if err := run(*cfgPath, *tableName, o); err != nil {
+	if err := run(*dsn, *tableName, o); err != nil {
 		fmt.Fprintf(os.Stderr, "compactor: %v\n", err)
 		os.Exit(1)
 	}
@@ -85,9 +85,9 @@ func main() {
 // when nothing is below target), then optional snapshot expiry and orphan-file deletion.
 // Each mutating step runs under the bakery claim; a pure --dry-run mutates nothing and
 // takes no claim.
-func run(cfgPath, tableName string, o runOpts) error {
+func run(dsn, tableName string, o runOpts) error {
 	ctx := context.Background()
-	cfg, err := LoadConfig(cfgPath)
+	cfg, err := loadServerConfig(ctx, dsn)
 	if err != nil {
 		return err
 	}
@@ -114,7 +114,7 @@ func run(cfgPath, tableName string, o runOpts) error {
 	schema, table := splitSchemaTable(tableName)
 	icebergRef := pgx.Identifier{"ice", schema, table}.Sanitize()
 
-	claim, closeConn := newClaimer(ctx, cfg.Postgres.DSN, icebergRef)
+	claim, closeConn := newClaimer(ctx, dsn, icebergRef)
 	defer closeConn()
 	if o.dryRun {
 		claim = func(fn func() error) error { return fn() }
