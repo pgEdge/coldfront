@@ -385,9 +385,11 @@ comparing it with the OID of the registry's `hot_table` - never by string, so
 it is schema-agnostic - and a view by its schema and name, the registry's key.
 A view the hook rebuilds keeps the owner and the table-level grants the view
 had. The hook rebuilds the view and updates the registry as the extension's
-owner, once the ownership check PostgreSQL makes for the statement has passed,
-so the role running the statement needs no privilege on the view, its schema
-or the registry. The Iceberg change, which is cold I/O, runs as that role. The
+owner, once the ownership check PostgreSQL makes for the statement has passed.
+The role running the statement needs what PostgreSQL requires for the
+statement itself, `USAGE` on the schema of the relation it names included, but
+neither ownership of the view, nor `CREATE` on its schema, nor any privilege on
+the registry. The Iceberg change, which is cold I/O, runs as that role. The
 following table summarizes the DDL it handles:
 
 | DDL | Behavior |

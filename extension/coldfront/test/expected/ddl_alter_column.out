@@ -84,14 +84,14 @@ SELECT has_table_privilege('ddl_alter_reader', 'public.events', 'SELECT') AS can
  t          | t          | ddl_alter_owner
 (1 row)
 
--- 3. Whoever PostgreSQL lets alter the hot table makes the change, with no
---    privilege on the view or its schema: the hook rebuilds the view as the
---    extension's owner and gives it back its owner and grants. The Iceberg
---    change runs as the caller, who needs the cold access grant_app_access
---    gives an application role (here USAGE on schema coldfront). A role holding
---    the owner's privileges without the SET ROLE an ownership change needs, a
---    role owning the hot table but not the view, and a role owning neither,
---    refused before anything changes.
+-- 3. Whoever PostgreSQL lets alter the hot table makes the change, without
+--    owning the view or holding CREATE on its schema: the hook rebuilds the
+--    view as the extension's owner and gives it back its owner and grants. The
+--    Iceberg change runs as the caller, who needs the cold access
+--    grant_app_access gives an application role (here USAGE on schema
+--    coldfront). A role holding the owner's privileges without the SET ROLE an
+--    ownership change needs, a role owning the hot table but not the view, and
+--    a role owning neither, refused before anything changes.
 CREATE ROLE ddl_alter_member;
 CREATE ROLE ddl_alter_hot_owner;
 GRANT ddl_alter_owner TO ddl_alter_member WITH INHERIT TRUE, SET FALSE;
