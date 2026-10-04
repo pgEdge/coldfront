@@ -9,6 +9,7 @@
 - GitHub Actions CI must always be identical in steps to `run-ci-local.sh` — never let them diverge
 - MUST verify any mesh/distributed/bakery change against the TLA+ model before committing it. Scope (the cold-write serialization protocol): the bakery functions in `extension/coldfront/coldfront--1.0.sql` (`_claim_iceberg_lock`, `_insert_claim`, `_take_iceberg_claim`, `_exec_iceberg_with_claim`, `_enqueue_release`, `_on_claim_apply`, `_on_claim_release`, `ensure_replicated`), the C `XactCallback` in `extension/coldfront/src/coldfront.c` (`coldfront_xact_callback`, which releases the claim at `XACT_EVENT_COMMIT`, after pg_duckdb has committed the Iceberg transaction at `XACT_EVENT_PRE_COMMIT`), the `coldfront.iceberg_async_parquet` ordering, and the spock/`synchronous_*` GUCs gating claim replication. The one question: does the change alter the modeled protocol (claimant set, claim/conditional-update/release ordering, async-vs-stock parquet ordering, defer/drain steps)? If yes, model it first: update `docs/formal/Bakery.tla`, re-translate (`pcal.trans`), and re-run every TLC config (safe configs report "No error has been found"; `Bakery_race.cfg` still violates `NoLakekeeperConflict`, and `Bakery_adopt_race.cfg` still violates `NoDoubleRegistration`). If no (a pure refactor whose emitted claim/lock/release sequence is byte-identical, leaving the `.tla`/`.cfg` untouched), that equivalence argument IS the proof: do NOT re-run TLC, since an unchanged model only reprints the same verdicts. See `docs/formal/README.md`.
 - Update README.md as you implement functionality; update ARCHITECTURE.md in the same commit as the structural change it describes
+- For stochastic or randomized measurements (sampling, seeding, benchmarks), one run is not a result: repeat over several seeds and report the mean and spread before drawing a conclusion
 
 ## Git
 - NEVER overwrite or delete files without checking if they are committed
@@ -20,6 +21,9 @@
 - Prefer adding specific files by name (`git add src/foo/bar.go`) over `git add -A` or `git add .` — protects against accidentally staging secrets or large binaries
 - When splitting a commit, land deps/extras declarations AFTER the code that consumes them — every intermediate commit in history should represent a working state
 - Never push, force-push, or open PRs without explicit user instruction. Never skip hooks (`--no-verify` etc.) without explicit user instruction.
+- Before `gh pr create`, show the title, body and exact commit list and wait for approval of all three — a branch only carries the commits asked to go through it. Once a PR is open and under review, don't rebase, amend or push its branch without a separate go-ahead.
+- PR bodies are public: state what changes for someone using the repo (the version, the behavior, the check that pins it); never name internal test functions, mock structs, or local CI runs.
+- Fixes that come out of one audit or review pass land on one branch and one PR, one commit per item — never a branch per fix.
 
 ## Code Style
 - KISS: absolute minimum lines of code
@@ -52,6 +56,27 @@
 - The base image is identified by its recipe hash: `docker/Dockerfile.duckdb15-base` plus every file its `COPY` lines take from the tree. `ci/base-ref.sh <major>` prints the tag CI builds on, `pg<major>-r<hash>`. GitHub CI never builds the base: `require_base` in `ci/lib.sh` pulls that tag before any app build and stops the run when it is not published. A recipe change therefore blocks CI until `gh workflow run base-image.yml --ref <branch> -f push=true` publishes it, and blocks the merge until a full matrix passes on it; a local matrix on a locally built base proves the code, not what GitHub tests. `base-image.yml` never rebuilds a published (major, arch) and moves the floating `pg<major>` tags only when dispatched from `main`. The entrypoint is installed by the app layer alone, so an entrypoint change is not a recipe change.
 - `cmd/compactor/` is a separate Go module (apache/iceberg-go) — its heavy deps are quarantined from the lean archiver
 - `extension/coldfront/` — PGXS C extension. Requires `pg_config` and PG dev headers. Built inside the Docker image; users on bare-metal install with `make && make install`.
+- DuckDB's `row_number() OVER ()` is nondeterministic under parallel scan, so a downstream `REPEATABLE(n)` does not make a stochastic run reproducible; seed whatever actually varies, or accept the variance and average over it.
+
+## Upstream readiness
+
+Snapshots of upstream state for the next major moves. Re-verify before acting on either; both are dated and upstream moves independently of this repo.
+
+**PostgreSQL 19** (as of beta4, 2026-10-04; RC1 due early October):
+- `coldfront.c` needs two `#if PG_VERSION_NUM >= 190000` guards: `planner_hook`/`standard_planner` gained an `ExplainState *es` parameter (PG commit `c83ac02ec73`) for `coldfront_planner`, and `post_parse_analyze_hook` now passes `const JumbleState *` (`49cc0d41488`).
+- pg_duckdb vendors PostgreSQL's `ruleutils.c` per major; its PG 19 copy predates several upstream `ruleutils.c` commits, and pg_duckdb main/PR #1072 fail to build against beta4 headers. A `git merge-file` of PG's `REL_19_BETA4` `ruleutils.c` into the vendored copy applies conflict-free and compiles.
+- No pgEdge PG 19 image exists yet. The public release channel (RPM/deb) ships PG 19 beta packages, but `lolor_19` is missing, and the minimal image flavor requires it.
+- PR #89 (pg19-support) is stale: it predates `coldfront_planner`, conflicts with `main`, and its regress `.out` files are outdated.
+- PG 19 renames some `EXPLAIN` plan nodes (`InitPlan 1` → `InitPlan expr_1`), affecting the `cte_on_insert`, `param_cold_via_plpgsql`, `cold_write_json_agg` and `tiered_insert_single_pass` regress tests.
+
+**DuckDB 2.0 (Cyanoptera)** (as of 2026-10-04; stable projected second half of October 2026):
+- pg_duckdb has zero 2.0 work: latest release is v1.1.1, `main` still builds DuckDB v1.5.4, and there is no 2.0 issue, PR or branch upstream.
+- duckdb-iceberg's 2.0-line commit path is rewritten (a retry loop with `RefreshFromCatalog` firing reactively after a 409, rather than proactively before the first attempt). Our bakery patch's anchors (`RefreshExistingManifestList`, `GetTransactionRequest`) no longer exist there — the proactive pre-commit refresh needs reimplementing, not dropping.
+- Two of our interop patches (manifest-list `format-version`, lowercase parquet `file_format`) are still needed against the 2.0-line `main`.
+- The DuckDB temp-spill collision above (`duckdb#15173`, `pg_duckdb#887`) is fixed on the 2.0 line: spill files are instance-qualified, so the per-backend temp directory stops being a correctness requirement once the stack moves to 2.0.
+- Partitioned `INSERT` and `CREATE TABLE ... PARTITIONED BY (...)` already work at our current `ICEBERG_REF`; `docs/architecture.md` and the extension's partition-column notice calling this unsupported are stale and should be corrected independently of the 2.0 move.
+
+**DuckDB 1.5.6 (`v1.5-variegata` repin)** (checked 2026-10-04 at head `5dcf5070`): moving to the branch head forces a DuckDB newer than 1.5.4 for the whole stack — pg_duckdb loads extensions only for its exact DuckDB version, and pg_duckdb PR #1071 bumps to 1.5.5 while nothing upstream has tried 1.5.6 yet. All five `docker/iceberg-*-v15.patch` files still apply cleanly at the head and none of their fixes have landed upstream; `referenced_data_file` is still reader-only and `RETURNING` on a cold `INSERT`/`UPDATE`/`DELETE`/`MERGE` is still refused. The gains are vended-credential refresh, equality-delete scans with extra columns, truncated UTF-8 string bounds, an Azure SAS endpoint-suffix fix, and a `write.metadata.metrics` backport — treat a repin as a DuckDB stack move (base republish, full matrix), not a quick ref bump.
 
 ## Releases
 - Version scheme — two independent namespaces:
@@ -68,6 +93,7 @@
 - Lakekeeper provides the Iceberg REST catalog
 - Any S3-compatible object store (SeaweedFS, MinIO, AWS S3, GCS, etc.)
 - The archiver is a thin SQL orchestrator — no DuckDB/Iceberg/Arrow Go libraries
+- No HTTP calls from SQL or the coldfront C extension: duckdb-iceberg's catalog-API client (every cold write, `DROP TABLE`) is the one exception already in use; Lakekeeper's management API (warehouse config, table protection) is Go-only, called from the archiver/compactor
 
 ## Documentation
 - User docs live in `docs/` as a MkDocs site (pgEdge MkDocs structure); `README.md` is the GitHub landing/TOC. Build with `mkdocs build --strict` — it must pass with no warnings.
