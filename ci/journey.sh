@@ -978,8 +978,10 @@ EOSQL
     assert_contains "TC-232: a NaN already there is refused, naming the column's guard" "coldfront_guard_amount" "$(cat "$TMPD/tcval.log")"
     assert_eq "TC-232: the guard is validated after the bootstrap commits, so the view stays and the guard waits" "v|false" \
         "$(q "$HOST" "SELECT (SELECT relkind::text FROM pg_class WHERE oid = 'public.tcval'::regclass) || '|' || (SELECT convalidated::text FROM pg_constraint WHERE conrelid = 'public._tcval'::regclass AND conname = 'coldfront_guard_amount');")"
-    assert_err "TC-232: until the row is fixed, an ALTER TABLE through the DDL hook fails the same way" "coldfront_guard_amount" \
+    assert_contains "TC-232: an ALTER TABLE through the DDL hook leaves the waiting guard to the archiver" "ALTER TABLE" \
         "$(q_may "$HOST" "ALTER TABLE public._tcval ADD COLUMN note text;")"
+    assert_eq "TC-232: so the guard still waits" "false" \
+        "$(q "$HOST" "SELECT convalidated::text FROM pg_constraint WHERE conrelid = 'public._tcval'::regclass AND conname = 'coldfront_guard_amount';")"
     q "$HOST" "UPDATE public.tcval SET amount = 0 WHERE amount = 'NaN';" >/dev/null
     if archive_only "schema_name='public' AND table_name='tcval'" "$TMPD/tcval.log"; then
         fail "TC-236: the archive pass succeeded on a table holding infinity"; return
@@ -1062,6 +1064,12 @@ EOSQL
         "$(q_may "$HOST" "INSERT INTO public.tcval (ts, amount_old) VALUES ($hot + interval '3 days', 'NaN');")"
     assert_err "TC-231: and the new column has a guard of its own" '"coldfront_guard_amount"' \
         "$(q_may "$HOST" "INSERT INTO public.tcval (ts, amount) VALUES ($hot + interval '3 days', 'NaN');")"
+    # The ALTER that adds a column validates its guard, so a default the guard
+    # refuses fails the ALTER, and the cold tier's half of it is not committed.
+    assert_err "TC-231: an ADD COLUMN whose default its guard refuses fails" "coldfront_guard_fee" \
+        "$(q_may "$HOST" "ALTER TABLE public._tcval ADD COLUMN fee numeric(10,2) DEFAULT 'NaN';")"
+    assert_eq "TC-231: and neither tier has the column" "0|0" \
+        "$(q "$HOST" "SELECT count(*) FROM pg_attribute WHERE attrelid = 'public._tcval'::regclass AND attname = 'fee';")|$(q "$HOST" "SELECT coldfront.ensure_attached(); SELECT count(*) FROM duckdb.query('DESCRIBE ice.public.tcval') AS t(r) WHERE r['column_name']::text = 'fee';" | tail -1)"
 }
 
 # ───────────────────────────────────────────────────────────────────────────

@@ -132,10 +132,11 @@ row that breaks a guard stops the run before any partition is archived, with
 an error that names the guard, and stops every later run until the row is
 fixed. A column name longer than 47 bytes names its guard by a hash, so two
 long names that begin alike get a guard each. The DDL hook's view rebuild
-renames a guard with its column, adds the guard for a column that an `ALTER
-TABLE` adds, and validates every guard not yet valid inside the `ALTER TABLE`'s
-own transaction, under the lock that statement already holds. Unregistering
-the table drops the guards.
+renames a guard with its column and adds the guard for a column that an `ALTER
+TABLE` adds, validated in that statement under the lock it already holds, so a
+default the guard refuses fails the `ALTER TABLE`. A guard the archiver has not
+validated yet is left to the archiver. Unregistering the table drops the
+guards.
 
 ### The Archive Pipeline
 

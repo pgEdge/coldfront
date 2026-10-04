@@ -2832,15 +2832,15 @@ LANGUAGE sql IMMUTABLE STRICT AS $$
     END;
 $$;
 
--- Adds each guard the hot table's columns need and lack. NOT VALID records a
--- guard without scanning, so it adds nothing to the time a caller holds the
--- table's lock for other DDL. Rows written after it are checked, and
--- _validate_hot_guards checks the rows already there.
+-- Adds each guard the hot table's columns need and lack. Rows written after it
+-- are checked. p_validate checks the rows already there as each guard is added,
+-- inside the caller's transaction and under its lock; without it the guard is
+-- added NOT VALID, with no scan, and _validate_hot_guards checks those rows.
 --
 -- A column declared with more than one array dimension is refused here: no
 -- guard can help it, because pg_duckdb reads a column by its declared
 -- dimensions, and the cold tier stores one.
-CREATE FUNCTION coldfront._guard_hot_table(p_hot regclass)
+CREATE FUNCTION coldfront._guard_hot_table(p_hot regclass, p_validate boolean DEFAULT false)
 RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -2878,8 +2878,9 @@ BEGIN
                               AND starts_with(c.conname::text, coldfront._hot_guard_name('')))
          ORDER BY a.attnum
     LOOP
-        EXECUTE format('ALTER TABLE %s ADD CONSTRAINT %I CHECK (%s) NOT VALID',
-                       p_hot, coldfront._hot_guard_name(r.attname), r.chk);
+        EXECUTE format('ALTER TABLE %s ADD CONSTRAINT %I CHECK (%s)%s',
+                       p_hot, coldfront._hot_guard_name(r.attname), r.chk,
+                       CASE WHEN p_validate THEN '' ELSE ' NOT VALID' END);
     END LOOP;
 END;
 $$;
@@ -4586,10 +4587,11 @@ $ddl$CREATE VIEW %I.%I AS
     --    it needs no per-view object here.
 
     -- 6. A column the DDL added gets the guard its type needs, on every node,
-    --    since every node rebuilds its own view. The user's ALTER already holds
-    --    the table's lock, so the new guard is validated here and then.
-    PERFORM coldfront._guard_hot_table(format('%I.%I', v_hot_schema, v_hot_relname)::regclass);
-    PERFORM coldfront._validate_hot_guards(format('%I.%I', v_hot_schema, v_hot_relname)::regclass);
+    --    since every node rebuilds its own view. The guard is validated as it
+    --    is added, so the ALTER fails if a row breaks it, such as a default the
+    --    guard refuses. A guard the archiver added and has not validated yet is
+    --    left to the archiver.
+    PERFORM coldfront._guard_hot_table(format('%I.%I', v_hot_schema, v_hot_relname)::regclass, true);
 END;
 $$;
 

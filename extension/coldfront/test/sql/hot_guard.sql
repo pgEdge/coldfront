@@ -170,6 +170,25 @@ SELECT c.conrelid::regclass AS rel, c.conname, a.attname, c.convalidated
    AND c.contype = 'c' AND a.attname LIKE 'fee%'
  ORDER BY 1, 2;
 
+-- The guard of a column the DDL hook adds is validated by that ALTER, so a
+-- default the guard refuses fails it.
+SET session_replication_role = replica;
+ALTER TABLE public._guarded ADD COLUMN bad_fee numeric(8,3) DEFAULT 'NaN';
+ALTER TABLE public._guarded ADD COLUMN bad_due date DEFAULT 'infinity';
+SET session_replication_role = DEFAULT;
+
+-- A guard the archiver's first pass left waiting on a row that breaks it is the
+-- archiver's to validate: an ALTER through the DDL hook leaves it waiting.
+ALTER TABLE public._guarded DROP CONSTRAINT coldfront_guard_amount;
+INSERT INTO public._guarded (id, ts, amount) VALUES (9, '2026-01-09', 'NaN');
+SELECT coldfront._guard_hot_table('public._guarded'::regclass);
+SET session_replication_role = replica;
+ALTER TABLE public._guarded ADD COLUMN memo text;
+SET session_replication_role = DEFAULT;
+SELECT conname, convalidated FROM pg_constraint
+ WHERE conrelid = 'public._guarded'::regclass AND conname = 'coldfront_guard_amount';
+DELETE FROM public._guarded WHERE id = 9;
+
 -- Unregistering returns the hot table to its owner as it was, guards gone.
 SELECT coldfront._unregister_iceberg('public', 'guarded');
 SELECT count(*) AS checks FROM pg_constraint

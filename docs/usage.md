@@ -895,12 +895,13 @@ The archiver adds the constraints at the first archive pass that tiers a
 partition of the table, and validates them once that pass's bootstrap
 transaction has committed. A value written before then is accepted, and each
 archive pass stops with an error that names the constraint until the row is
-fixed; the next pass then validates the constraint and tiers the table. Until
-then, an `ALTER TABLE` that the DDL hook mirrors onto the cold tier fails with
-the same error, because the hook validates every constraint that is not yet
-valid. A renamed column's constraint takes the new column name, and a column
-whose name is longer than 47 bytes gets a constraint named after a hash of the
-name.
+fixed; the next pass then validates the constraint and tiers the table. A
+column that an `ALTER TABLE` adds through the DDL hook gets its constraint in
+the same statement, which PostgreSQL validates against every row of the hot
+table, so an `ADD COLUMN` whose default the constraint refuses, such as
+`DEFAULT 'NaN'`, fails. A renamed column's constraint takes the new column
+name, and a column whose name is longer than 47 bytes gets a constraint named
+after a hash of the name.
 
 A cold `UPDATE ... FROM`, a `MERGE` whose source is a PostgreSQL table, and an
 `INSERT ... SELECT` into a decoupled table read that PostgreSQL table through
