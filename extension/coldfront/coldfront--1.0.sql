@@ -1599,9 +1599,9 @@ $$;
 -- post_parse_analyze hook (which short-circuits to TIER_COLD when the
 -- registry row has is_iceberg_only=true).
 --
--- The supported column types match the canonical map in
--- cmd/archiver/main.go pgFormatTypeToDuckDB. Anything outside the set is
--- rejected at create time. See ARCHITECTURE_DECOUPLED.md for the full table.
+-- The supported column types are those coldfront._iceberg_storage_type maps,
+-- the map tiered mode uses as well. Anything outside the set is rejected at
+-- create time. See docs/architecture_decoupled.md for the full table.
 -- ============================================================================
 
 -- pgvector's vector/halfvec, with or without the dimension typmod. Both maps
@@ -2531,11 +2531,14 @@ $$;
 -- storage type used in CREATE TABLE on the attached catalog. Raises on any
 -- type that cannot round-trip cleanly — silent VARCHAR fallback would lose
 -- data identity at write time, so we refuse it.
-CREATE OR REPLACE FUNCTION coldfront._iceberg_storage_type(p_pg_type text)
+--
+-- p_column names the column in the refusal when the caller knows it.
+CREATE OR REPLACE FUNCTION coldfront._iceberg_storage_type(p_pg_type text, p_column text DEFAULT '')
 RETURNS text
 LANGUAGE plpgsql IMMUTABLE STRICT AS $$
 DECLARE
-    t text := lower(trim(p_pg_type));
+    t     text := lower(trim(p_pg_type));
+    v_col text := CASE WHEN p_column <> '' THEN format('column "%s": ', p_column) ELSE '' END;
 BEGIN
     -- Numeric / boolean
     IF t IN ('bigint', 'int8')             THEN RETURN 'BIGINT';   END IF;
@@ -2564,7 +2567,7 @@ BEGIN
         RETURN 'DECIMAL' || substring(t FROM '\(.*\)');
     END IF;
     IF t IN ('numeric', 'decimal') THEN
-        RAISE EXCEPTION 'coldfront: unbounded numeric not supported in iceberg; use numeric(P,S) with P<=38';
+        RAISE EXCEPTION 'coldfront: %unbounded numeric not supported in iceberg; use numeric(P,S) with P<=38', v_col;
     END IF;
     -- View-cast types: stored as VARCHAR, surfaced via wrapper view as native PG type
     IF t IN ('jsonb', 'json', 'interval') THEN RETURN 'VARCHAR'; END IF;
@@ -2575,7 +2578,7 @@ BEGIN
     -- planned by pg_duckdb, so no cast makes them readable. Store IP data as
     -- text and oid values as bigint instead.
 
-    RAISE EXCEPTION 'coldfront: PG type % has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, numeric(P,S), jsonb, json, interval, vector(N), halfvec(N). inet/cidr/oid unsupported (store IP data as text, oid values as bigint); sparsevec unsupported (keep it in the hot tier)', p_pg_type;
+    RAISE EXCEPTION 'coldfront: %PG type % has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, numeric(P,S), jsonb, json, interval, vector(N), halfvec(N). inet/cidr/oid unsupported (store IP data as text, oid values as bigint); sparsevec unsupported (keep it in the hot tier)', v_col, p_pg_type;
 END;
 $$;
 
@@ -3125,7 +3128,7 @@ BEGIN
             PERFORM coldfront.install_vector_ops();
             v_vec_cols := v_vec_cols || col_name;
         END IF;
-        storage_type := coldfront._iceberg_storage_type(pg_type);
+        storage_type := coldfront._iceberg_storage_type(pg_type, col_name);
 
         IF n > 0 THEN
             iceberg_cols := iceberg_cols || ', ';
@@ -4279,7 +4282,7 @@ BEGIN
         ORDER BY a.attnum
     LOOP
         cast_type := coldfront._iceberg_view_cast_type(r.pg_type);
-        cold_type := coldfront._iceberg_storage_type(r.pg_type);  -- Iceberg storage (BLOB, INTEGER, …)
+        cold_type := coldfront._iceberg_storage_type(r.pg_type, r.attname);  -- Iceberg storage (BLOB, INTEGER, …)
 
         -- VIEW PROJECTIONS (view.go GenerateViewSQL).
         IF n > 0 THEN
@@ -4408,10 +4411,10 @@ BEGIN
             END IF;
             IF op = 'add' THEN
                 ddl := ddl || format('ALTER TABLE %s ADD COLUMN IF NOT EXISTS %I %s',
-                    p_iceberg_table, col, coldfront._iceberg_storage_type(pg_type));
+                    p_iceberg_table, col, coldfront._iceberg_storage_type(pg_type, col));
             ELSE
                 ddl := ddl || format('ALTER TABLE %s ALTER COLUMN %I TYPE %s',
-                    p_iceberg_table, col, coldfront._iceberg_storage_type(pg_type));
+                    p_iceberg_table, col, coldfront._iceberg_storage_type(pg_type, col));
             END IF;
         ELSIF op = 'drop' THEN
             ddl := ddl || format('ALTER TABLE %s DROP COLUMN IF EXISTS %I', p_iceberg_table, col);

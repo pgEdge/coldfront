@@ -29,8 +29,7 @@ type ViewConfig struct {
 }
 
 // Column holds a column name, its DuckDB types, and key-participation flags.
-// Populated by archiver's getColumns from PG's format_type via
-// pgFormatTypeToDuckDB.
+// Populated by archiver's getColumns from the extension's type map.
 //
 // Type is the **storage** type — what we declare to Iceberg via CREATE TABLE
 // (BIGINT, VARCHAR, DECIMAL(20,5), …). For PG types Iceberg can't represent

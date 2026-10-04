@@ -922,6 +922,7 @@ EOSQL
     # rejection text, not just the type name (which the input itself contains).
     local IE; IE=$(q_may "$HOST" "SELECT coldfront.create_iceberg_table('public','ip_reject','[{\"name\":\"a\",\"type\":\"inet\"}]'::jsonb);")
     assert_contains "inet rejected at provisioning" "store IP data as text" "$IE"
+    assert_contains "the provisioning refusal names the column" 'column "a": PG type inet' "$IE"
     # oid archives but its column is unreadable through the pg_duckdb-planned
     # view after cutover, so it is rejected up front like inet; use bigint.
     local OE; OE=$(q_may "$HOST" "SELECT coldfront.create_iceberg_table('public','oid_reject','[{\"name\":\"a\",\"type\":\"oid\"}]'::jsonb);")
@@ -2101,7 +2102,7 @@ story_ddl() {
     assert_eq "TC-228: the re-added column is gone from the view" "0" "$(q "$HOST" "SELECT count(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='events' AND column_name='cnt';")"
 
     # Data-type correspondence is enforced: an unsupported type is rejected up front.
-    assert_err "ADD COLUMN inet rejected (no Iceberg mapping)" "no Iceberg-compatible mapping" "$(q_may "$HOST" "ALTER TABLE _events ADD COLUMN ip inet;")"
+    assert_err "ADD COLUMN inet rejected, naming the column" 'column "ip": PG type inet has no Iceberg-compatible mapping' "$(q_may "$HOST" "ALTER TABLE _events ADD COLUMN ip inet;")"
 
     # RENAME VIEW is supported and must migrate the watermark so the cold branch survives.
     local reg="SELECT concat_ws('/', (SELECT string_agg(relname, ',' ORDER BY relname) FROM pg_class WHERE relkind='v' AND relnamespace='public'::regnamespace AND relname IN ('events','events_v2')), (SELECT string_agg(relname, ',' ORDER BY relname) FROM coldfront.tiered_views WHERE schema_name='public' AND relname IN ('events','events_v2')), (SELECT string_agg(table_name, ',' ORDER BY table_name) FROM coldfront.archive_watermark WHERE schema_name='public' AND table_name IN ('events','events_v2')));"
@@ -6055,8 +6056,8 @@ story_unmappable_column_rejected() {
     assert_eq "TC-150: fixture carries a generated tsvector column" "tsvector" \
         "$(q "$HOST" "SELECT format_type(atttypid, atttypmod) FROM pg_attribute
                        WHERE attrelid='public.tc150_fts'::regclass AND attname='tsv';")"
-    assert_register_rejected "TC-150: register named the unstorable type" \
-        tc150_fts "PG type tsvector has no Iceberg-compatible mapping"
+    assert_register_rejected "TC-150: register named the column and its unstorable type" \
+        tc150_fts 'column "tsv": PG type tsvector has no Iceberg-compatible mapping'
     # The partitioner writes tiered rows through the same gate, and the archiver
     # is what later reads them, so the refusal must not be dodgeable by
     # registering from the binary that owns no cold tier.
@@ -6064,7 +6065,7 @@ story_unmappable_column_rejected() {
             --period monthly --hot-period "30 days" >$TMPD/unmappable-part.log 2>&1; then
         fail "TC-150: partitioner accepted a tiered row the archiver cannot process"
     else
-        assert_contains "TC-150: partitioner refused it too" "tsvector" "$(cat $TMPD/unmappable-part.log)"
+        assert_contains "TC-150: partitioner refused it too, naming the column" 'column "tsv": PG type tsvector' "$(cat $TMPD/unmappable-part.log)"
     fi
     # The same table is fine partition-only: --dry-run validates everything and
     # writes nothing, so the acceptance is asserted without leaving a config row.
@@ -6076,6 +6077,22 @@ story_unmappable_column_rejected() {
     fi
     assert_eq "TC-150: still nothing registered after both binaries tried" "0" \
         "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE table_name='tc150_fts';")"
+    # A tiered row written past the CLI reaches the archiver, which reads the
+    # table's columns through the same map on every pass and names the table and
+    # the column it cannot store.
+    if ! "$ARCHIVER" register --table tc150_fts \
+            --period monthly --retention "5 years" >"$TMPD/unmappable-po.log" 2>&1; then
+        fail "TC-150: partition-only register, see $TMPD/unmappable-po.log"; tail -3 "$TMPD/unmappable-po.log"
+    fi
+    q "$HOST" "UPDATE coldfront.partition_config SET hot_period = interval '30 days' WHERE table_name='tc150_fts';" >/dev/null
+    if archive_only "table_name='tc150_fts'" "$TMPD/unmappable-arch.log"; then
+        fail "TC-150: the archiver tiered a table holding a tsvector column"
+    else
+        assert_contains "TC-150: the archiver named the table and the column" \
+            'columns of public.tc150_fts: ERROR: coldfront: column "tsv": PG type tsvector has no Iceberg-compatible mapping' \
+            "$(cat "$TMPD/unmappable-arch.log")"
+    fi
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name='tc150_fts';" >/dev/null 2>&1
     q "$HOST" "DROP TABLE IF EXISTS public.tc150_fts CASCADE;" >/dev/null 2>&1
 }
 

@@ -11,7 +11,6 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
-	"regexp"
 	"sort"
 	"strings"
 	"syscall"
@@ -1316,9 +1315,7 @@ func bulkExportWithSnapshot(ctx context.Context, conn *pgx.Conn, t *config.Table
 	// directly (interval) get a PostgreSQL-side text-cast copy in a plain temp
 	// table first; then pg_duckdb scans that text-only table. The value lands as
 	// VARCHAR in Iceberg and the transparent view casts it back on read.
-	// (inet/cidr were the original Oid-869 offenders that motivated this detour
-	// but are no longer supported — see pgFormatTypeToDuckDB.) jsonb-only /
-	// plain tables skip the detour (single copy, fast path).
+	// jsonb-only / plain tables skip the detour (single copy, fast path).
 	// The projection belongs to whichever statement reads the real partition: it is
 	// what casts the VARCHAR-backed types and what reads a vector through its
 	// generated companion instead of the pgvector column pg_duckdb cannot scan.
@@ -1457,149 +1454,15 @@ func registerTieredView(ctx context.Context, db view.DBTX, schema, table, hotTab
 	return err
 }
 
-// pgFormatTypeToDuckDB maps PG's format_type(atttypid, atttypmod) output to:
+// getColumns introspects pg_catalog to return the column list for the source
+// table. Each Column.Type is the Iceberg storage type and Column.ViewCastType
+// the cast the view applies, both from the extension's type map
+// (coldfront._iceberg_storage_type and coldfront._iceberg_view_cast_type), the
+// map create_iceberg_table and the view rebuild use as well.
 //
-//	storage      — the DuckDB type used for the Iceberg CREATE TABLE column
-//	               declaration. pg_duckdb passes this through to
-//	               duckdb-iceberg's LogicalTypeToIcebergType to derive the
-//	               Iceberg primitive (e.g. DuckDB BIGINT → Iceberg long).
-//	viewCastType — the DuckDB type the view should expose by casting both
-//	               UNION branches. Empty for types whose storage form already
-//	               matches the surface type (BIGINT, TIMESTAMPTZ, DECIMAL(P,S),
-//	               …). Non-empty for types Iceberg cannot represent natively
-//	               (jsonb/json → json, interval → interval): storage is VARCHAR,
-//	               view casts to the rich type so applications see jsonb/interval,
-//	               not text. (Also bytea → bytea, double precision → double
-//	               precision: native storage BLOB/DOUBLE, cast only so the view's
-//	               hot-side spelling is PG-parseable.)
-//
-// Hard-errors on types with no Iceberg-compatible storage (unbounded numeric,
-// time-with-tz, custom enums, xml, tsvector, …) rather than silently falling
-// back to VARCHAR — silent type loss is a footgun for users with e.g.
-// numeric(20,5) financial columns who would discover the precision loss
-// months later when querying the cold tier.
-func pgFormatTypeToDuckDB(s string) (storage, viewCastType string, err error) {
-	// 1:1 mappings: format_type output → (storage, viewCastType). Most types'
-	// storage matches their PG surface so viewCastType is empty; the few rows
-	// with a non-empty viewCastType are documented inline. View-cast types use
-	// lowercase by convention (PG/DuckDB cast targets `::json`/`::interval` read
-	// more naturally than UPPERCASE); storage types stay UPPERCASE because
-	// they're CREATE-TABLE column declarations (BIGINT, VARCHAR, …).
-	if m, ok := pgTypeMap[s]; ok {
-		return m.storage, m.viewCast, nil
-	}
-
-	// inet/cidr are NOT supported. pg_duckdb cannot represent PG inet (Oid 869)
-	// anywhere in a query it plans, and every read through an Iceberg-backed view
-	// is planned by pg_duckdb (the view embeds a DuckDB read). It rejects the
-	// column *reference* at plan time, before any cast — so "store as VARCHAR,
-	// cast back to inet" is impossible. They fall through to the unsupported-type
-	// error below; users store IP data as text.
-
-	// VARCHAR(N) / CHAR(N) — PG's format_type emits "character varying(N)"
-	// or "character(N)". Iceberg/DuckDB don't enforce length anyway.
-	if strings.HasPrefix(s, "character varying") || strings.HasPrefix(s, "character(") || s == "character" {
-		return "VARCHAR", "", nil
-	}
-
-	// pgvector. format_type emits the dimension as a typmod (vector(1536))
-	// unless the column was declared without one. Both types widen losslessly
-	// to float4 and store as an Iceberg list<float>. The view cast is real[]
-	// rather than FLOAT[]: PG reads FLOAT as an alias for double precision, so
-	// ::FLOAT[] on the hot branch would widen to double precision[] and the two
-	// UNION branches would disagree on the column type. coldfront's SQL twin
-	// (_iceberg_storage_type / _iceberg_view_cast_type) returns the same pair
-	// for the decoupled path. sparsevec is absent deliberately: densifying it
-	// is a 100x storage blowup, so it stays hot-only and errors below.
-	if s == "vector" || strings.HasPrefix(s, "vector(") ||
-		s == "halfvec" || strings.HasPrefix(s, "halfvec(") {
-		return "FLOAT[]", "real[]", nil
-	}
-
-	// numeric(P,S) → DECIMAL(P,S). Iceberg supports decimal up to P=38.
-	if m := numericTypeRe.FindStringSubmatch(s); m != nil {
-		return "DECIMAL(" + m[1] + "," + m[2] + ")", "", nil
-	}
-	if s == "numeric" {
-		return "", "", fmt.Errorf(
-			"PG type %q is unbounded-precision; Iceberg requires DECIMAL(P,S) "+
-				"with explicit precision and scale. ALTER COLUMN ... TYPE numeric(P,S) "+
-				"to fix (P up to 38)", s)
-	}
-
-	return "", "", fmt.Errorf(
-		"PG type %q has no Iceberg-compatible mapping. Supported: bigint, integer, "+
-			"smallint, real, double precision, boolean, timestamp with/without time "+
-			"zone, date, time without time zone, uuid, text, character varying(N), "+
-			"character(N), bytea, numeric(P,S) with P<=38, json, jsonb, interval, "+
-			"vector(N), halfvec(N). "+
-			"inet/cidr/oid are not supported (pg_duckdb cannot process them in "+
-			"Iceberg-backed queries): store IP data as text and oid values as bigint. "+
-			"sparsevec is not supported: keep it in the hot tier", s)
-}
-
-// pgTypeMap holds the 1:1 PG-format_type → (storage, viewCast) mappings used by
-// pgFormatTypeToDuckDB. Non-trivial-mapping types (character varying(N),
-// numeric(P,S)) are handled by the suffix/regex logic in that function instead.
-var pgTypeMap = map[string]struct{ storage, viewCast string }{
-	// Numeric / boolean — storage matches surface; no cast needed.
-	"bigint":  {"BIGINT", ""},
-	"integer": {"INTEGER", ""},
-	// Iceberg has no 16-bit integer; widen to INTEGER (lossless). duckdb-iceberg
-	// rejects SMALLINT at CREATE TABLE. No view cast
-	// needed: INTEGER is itself a PG-parseable surface, and the view casts BOTH
-	// branches to the storage type, so bootstrap (hot-only) and post-cutover
-	// (hot+cold) views agree on the column type.
-	"smallint": {"INTEGER", ""},
-	"real":     {"REAL", ""},
-	// Iceberg/DuckDB storage is DOUBLE, but PG has no bare type named "double"
-	// (it's a shell type), so the transparent view's cold cast r['col']::DOUBLE
-	// fails to PARSE when CREATE VIEW validates the body. Surface via the
-	// PG-spelled "double precision" cast (pg_duckdb maps it back to DOUBLE); both
-	// branches then parse and unify.
-	"double precision": {"DOUBLE", "double precision"},
-	"boolean":          {"BOOLEAN", ""},
-
-	// Temporal — storage matches surface; no cast needed.
-	"timestamp with time zone":    {"TIMESTAMPTZ", ""},
-	"timestamp without time zone": {"TIMESTAMP", ""},
-	"date":                        {"DATE", ""},
-	"time without time zone":      {"TIME", ""},
-
-	// Identifiers / strings / binary — storage matches surface.
-	"uuid": {"UUID", ""},
-	"text": {"VARCHAR", ""},
-	// Iceberg/DuckDB storage is BLOB, which is not a PG-parseable cast name;
-	// surface via the PG-spelled "bytea" on both branches.
-	"bytea": {"BLOB", "bytea"},
-
-	// Iceberg has no JSON primitive — storage VARCHAR, surface json.
-	"jsonb": {"VARCHAR", "json"},
-	"json":  {"VARCHAR", "json"},
-
-	// Iceberg has no INTERVAL — storage VARCHAR, surface interval. PG interval ↔
-	// text is round-trip-clean (e.g. "1 day 02:00:00"), and DuckDB INTERVAL
-	// parses the same text. pg_duckdb maps DuckDB INTERVAL back to PG interval.
-	"interval": {"VARCHAR", "interval"},
-}
-
-var numericTypeRe = regexp.MustCompile(`^numeric\((\d+),\s*(\d+)\)$`)
-
-// getColumns introspects pg_catalog to return the column list for the
-// source table. Each Column.Type is the **DuckDB type name**, derived from
-// PG's format_type(atttypid, atttypmod) output via pgFormatTypeToDuckDB —
-// so callers can use it directly for both Iceberg CREATE TABLE column
-// declarations and view cold-side casts.
-//
-// Errors out at archiver startup on any column whose PG type has no
-// Iceberg-compatible mapping (rather than silently falling back to VARCHAR
-// and losing precision/format/identity at write time).
-//
-// ViewCastType is set for PG types Iceberg can't represent natively
-// (jsonb/json → json, interval → interval; storage VARCHAR), and for native
-// types whose storage name isn't PG-parseable (bytea → bytea, double precision
-// → double precision; storage BLOB/DOUBLE). The view layer emits ::ViewCastType
-// on both UNION branches so the application surface stays the right type.
+// A column whose type has no Iceberg-compatible mapping fails the query: the map
+// raises rather than falling back to VARCHAR and losing precision or identity at
+// write time.
 //
 // IsIdentity is attidentity = 'a' (GENERATED ALWAYS AS IDENTITY); IsPK is
 // participation in pg_index.indisprimary. Composite PKs handled transparently.
@@ -1625,56 +1488,45 @@ func getColumns(ctx context.Context, db querier, schema, tableName string) ([]vi
 }
 
 // scanColumns runs the column-metadata query (the FIRST of getColumns' two
-// queries) and maps each PG format_type to its DuckDB storage/view-cast form.
+// queries). A vector's generated companion is ColdFront's own column, not one of
+// the table's, so the extension's companion predicate keeps it out and the list
+// holds exactly one column per user column.
 func scanColumns(ctx context.Context, db querier, schema, actualName string) ([]view.Column, error) {
-	// format_type carries the typmod-decoded form (numeric(P,S), character
-	// varying(N), timestamp with time zone, …). attidentity is PG internal
-	// type "char"; cast to text for pgx compatibility.
+	// attidentity is PG internal type "char"; cast to text for pgx compatibility.
 	rows, err := db.Query(ctx /* nosemgrep */, `
 		SELECT a.attname,
-		       format_type(a.atttypid, a.atttypmod),
-		       a.attidentity::text,
-		       a.attgenerated::text
+		       coldfront._iceberg_storage_type(format_type(a.atttypid, a.atttypmod), a.attname),
+		       coldfront._iceberg_view_cast_type(format_type(a.atttypid, a.atttypmod)),
+		       a.attidentity::text
 		FROM pg_attribute a
 		JOIN pg_class c ON c.oid = a.attrelid
 		JOIN pg_namespace n ON n.oid = c.relnamespace
 		WHERE n.nspname = $1 AND c.relname = $2
 		  AND a.attnum > 0 AND NOT a.attisdropped
+		  AND NOT coldfront._is_vec_companion(a.attname, a.attgenerated)
 		ORDER BY a.attnum`, schema, actualName)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("columns of %s.%s: %w", schema, actualName, err)
 	}
 	defer rows.Close()
 
 	var cols []view.Column
 	for rows.Next() {
-		var name, pgFormatType, attidentity, attgenerated string
-		if err := rows.Scan(&name, &pgFormatType, &attidentity, &attgenerated); err != nil {
+		var col view.Column
+		var attidentity string
+		if err := rows.Scan(&col.Name, &col.Type, &col.ViewCastType, &attidentity); err != nil {
 			return nil, err
 		}
-		// A companion is ColdFront's own generated column, not a column of the
-		// table as far as the Iceberg schema and the view are concerned. Skipping
-		// it keeps exactly one column per user column. A generated column the user
-		// wrote is left alone and treated like any other.
-		if attgenerated != "" && strings.HasPrefix(name, vecCompanion("")) {
-			continue
-		}
-		storage, viewCastType, err := pgFormatTypeToDuckDB(pgFormatType)
-		if err != nil {
-			return nil, fmt.Errorf("column %s.%s.%s: %w", schema, actualName, name, err)
-		}
-		col := view.Column{
-			Name:         name,
-			Type:         storage,
-			ViewCastType: viewCastType,
-			IsIdentity:   attidentity == "a",
-		}
+		col.IsIdentity = attidentity == "a"
 		if col.IsVector() {
-			col.HotSource = vecCompanion(name)
+			col.HotSource = vecCompanion(col.Name)
 		}
 		cols = append(cols, col)
 	}
-	return cols, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("columns of %s.%s: %w", schema, actualName, err)
+	}
+	return cols, nil
 }
 
 // scanPrimaryKeys runs the primary-key query (the SECOND of getColumns' two

@@ -84,6 +84,9 @@ this project adheres to
   PostgreSQL schema and table names.
 - Registering a tiered table rejects a column whose type has no Iceberg
   mapping, instead of failing at the first archive cycle.
+- A refusal of a column type with no Iceberg mapping names the column, whether
+  it comes from registration, an archive pass, `create_iceberg_table()` or an
+  `ALTER TABLE` on a tiered table.
 - The walkthrough's distributed demo shows the bakery at work on one held
   write: the ticket on the writing node, the same claim on its peer, the peer's
   ack, and the ledger cleared once the write commits. After the concurrent

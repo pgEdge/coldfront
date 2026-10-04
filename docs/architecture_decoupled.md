@@ -124,9 +124,9 @@ PG-side wrapper view.
 ## Supported Column Types
 
 The supported column types are exactly the set that round-trips cleanly between
-PG and Iceberg (shared with tiered mode; see `pgFormatTypeToDuckDB` in
-[cmd/archiver/main.go](https://github.com/pgEdge/ColdFront/blob/main/cmd/archiver/main.go)).
-Anything outside this list is rejected at table-creation time.
+PG and Iceberg. Both modes take them from one type map,
+`coldfront._iceberg_storage_type`. Anything outside this list is rejected at
+table-creation time.
 
 The following table shows the supported types, their Iceberg/Parquet storage,
 and how each reads back:
@@ -217,8 +217,8 @@ The helper performs the following steps:
     duckdb.raw_query('CREATE TABLE ice.public.<name> (col1 STORAGE_TYPE, …) PARTITIONED BY (…)')
     ```
 
-    Column types are validated by `coldfront._iceberg_storage_type()`, which
-    mirrors the canonical map in `cmd/archiver/main.go pgFormatTypeToDuckDB`.
+    Column types are validated by `coldfront._iceberg_storage_type()`, the
+    type map the archiver also reads a tiered table's columns through.
     Anything outside the supported set (see
     [Supported Column Types](#supported-column-types) above) raises before any
     DDL is issued.

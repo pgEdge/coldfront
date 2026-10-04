@@ -608,9 +608,9 @@ field. Registration fails when:
 - a tiered table has a column whose type has no Iceberg equivalent (see
   [Supported Column Types](#supported-column-types)). Every column goes through
   the same type map the cold tier itself uses, so the answer comes back at the
-  prompt rather than hours later from cron. Partition-only tables are exempt:
-  nothing about them reaches Iceberg, so their column types are PostgreSQL's
-  business alone.
+  prompt rather than hours later from cron, and the refusal names the column.
+  Partition-only tables are exempt: nothing about them reaches Iceberg, so
+  their column types are PostgreSQL's business alone.
 
 Registration validates the table as it is at that moment, not continuously.
 Adding a `DEFAULT` partition to an already-registered table is therefore not

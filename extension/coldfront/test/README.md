@@ -74,6 +74,7 @@ extension's non-hook surface (third table below) and register no view.
 | `storage_secret_azure` | `_build_storage_secret_opts` secret bodies (s3 + azure branches) and the azure connection-string setter |
 | `privilege_model` | the privilege invariants that let a non-superuser app role run cold I/O (catalog introspection only) |
 | `partition_config_interval` | `partition_config.hot_period` / `retention_period` are native `interval` columns: valid intervals stored canonically, non-intervals rejected at INSERT |
+| `type_map` | `_iceberg_storage_type` and `_iceberg_view_cast_type`, the map the archiver and `create_iceberg_table` both read, give every supported column's `format_type` its storage type and view cast, and refuse the types with no Iceberg mapping, naming the column when the caller passes it |
 | `adopt_type_map` | `_pg_type_from_iceberg` maps every DuckDB column type an adopted table can carry, refuses the rest by name, and agrees with `_iceberg_storage_type` on both spellings of a type |
 | `adopt_iceberg_table` | what adoption refuses before it reads a catalog (arguments, a PG schema that does not exist, a name already taken, a reference already registered, no catalog configured), the wrapper view and registry row it ends in, and its inverse `release_iceberg_table` |
 
