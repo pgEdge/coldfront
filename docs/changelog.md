@@ -204,6 +204,10 @@ this project adheres to
   make the loopback run functions of its own as that user. An app role can no
   longer reach the loopback or set its connection string, and the loopback
   resolves names in `pg_catalog` only.
+- An app role could make the extension's `SECURITY DEFINER` functions run
+  functions of its own as the extension's owner, since they looked up type
+  names in the role's temporary schema before `pg_catalog`. They now search
+  that schema last.
 - The compactor read a table before taking its bakery claim. A run that had to
   wait for a cold write then had its commit refused and exited with an error,
   and an orphan-file pass with `--orphan-age 0s` could delete the files that

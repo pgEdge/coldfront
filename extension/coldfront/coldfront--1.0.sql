@@ -372,8 +372,9 @@ END;
 -- (non-superuser) app role over S3/httpfs — no server-file roles needed. Inputs
 -- are operator-trusted: warehouse/lakekeeper_endpoint are PGC_SUSET (a
 -- non-superuser cannot redirect this ATTACH). search_path pinned per SECURITY
--- DEFINER hardening; the body references only pg_catalog + schema-qualified duckdb.
-$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog;
+-- DEFINER hardening, pg_temp last so the caller's temporary types cannot stand in
+-- for pg_catalog's; the body references only pg_catalog + schema-qualified duckdb.
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp;
 
 -- ensure_pg_attached() loads DuckDB's `postgres` extension and ATTACHes the
 -- *local* PG instance as `pglocal`, so DuckDB-side SQL inside `raw_query` can
@@ -415,7 +416,7 @@ END;
 -- INSERT…SELECT (pglocal) write path work without server-file roles. local_pg_dsn
 -- is PGC_SUSET + GUC_SUPERUSER_ONLY, so the DSN cannot be set or read by a
 -- non-superuser. search_path pinned per SECURITY DEFINER hardening.
-$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp;
 
 -- coldfront._hot_only: the per-row guard a hot MERGE's INSERT action gets on its
 -- partition-column value. The hot MERGE runs in PostgreSQL against the hot table
@@ -3810,7 +3811,7 @@ END $$;
 -- itself still runs as the caller — _exec_iceberg_with_claim stays INVOKER.
 CREATE FUNCTION coldfront._claim_iceberg_lock(
     p_iceberg_table text
-) RETURNS bigint LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog AS $$
+) RETURNS bigint LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp AS $$
 DECLARE
     connstr           text     := coldfront._loopback_dsn();
     my_node           int      := current_setting('snowflake.node')::int;
