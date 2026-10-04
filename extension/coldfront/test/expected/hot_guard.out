@@ -321,18 +321,18 @@ SELECT c.conrelid::regclass AS rel, c.conname, a.attname, c.convalidated
 SET session_replication_role = replica;
 ALTER TABLE public._guarded ADD COLUMN bad_fee numeric(8,3) DEFAULT 'NaN';
 ERROR:  check constraint "coldfront_guard_bad_fee" of relation "_guarded_p1" is violated by some row
-CONTEXT:  SQL statement "ALTER TABLE _guarded ADD CONSTRAINT coldfront_guard_bad_fee CHECK (bad_fee <> 'NaN')"
+CONTEXT:  SQL statement "ALTER TABLE public._guarded ADD CONSTRAINT coldfront_guard_bad_fee CHECK (bad_fee <> 'NaN')"
 PL/pgSQL function _guard_hot_table(regclass,boolean) line 37 at EXECUTE
 SQL statement "SELECT coldfront._guard_hot_table(format('%I.%I', v_hot_schema, v_hot_relname)::regclass, true)"
-PL/pgSQL function _rebuild_tiered_view(text,text) line 149 at PERFORM
-SQL statement "SELECT coldfront._rebuild_tiered_view('public', 'guarded')"
+PL/pgSQL function coldfront._rebuild_tiered_view(text,text,text) line 154 at PERFORM
+SQL statement "SELECT coldfront._rebuild_tiered_view('public', 'guarded', 'ALTER VIEW public.guarded OWNER TO coldfront;')"
 ALTER TABLE public._guarded ADD COLUMN bad_due date DEFAULT 'infinity';
 ERROR:  check constraint "coldfront_guard_bad_due" of relation "_guarded_p1" is violated by some row
-CONTEXT:  SQL statement "ALTER TABLE _guarded ADD CONSTRAINT coldfront_guard_bad_due CHECK (isfinite(bad_due))"
+CONTEXT:  SQL statement "ALTER TABLE public._guarded ADD CONSTRAINT coldfront_guard_bad_due CHECK (isfinite(bad_due))"
 PL/pgSQL function _guard_hot_table(regclass,boolean) line 37 at EXECUTE
 SQL statement "SELECT coldfront._guard_hot_table(format('%I.%I', v_hot_schema, v_hot_relname)::regclass, true)"
-PL/pgSQL function _rebuild_tiered_view(text,text) line 149 at PERFORM
-SQL statement "SELECT coldfront._rebuild_tiered_view('public', 'guarded')"
+PL/pgSQL function coldfront._rebuild_tiered_view(text,text,text) line 154 at PERFORM
+SQL statement "SELECT coldfront._rebuild_tiered_view('public', 'guarded', 'ALTER VIEW public.guarded OWNER TO coldfront;')"
 SET session_replication_role = DEFAULT;
 -- A guard the archiver's first pass left waiting on a row that breaks it is the
 -- archiver's to validate: an ALTER through the DDL hook leaves it waiting.

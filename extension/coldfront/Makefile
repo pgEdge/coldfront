@@ -19,7 +19,7 @@ REGRESS     = load_order update_unregistered_view update_heap_table \
               dollar_quote_in_value mixed_case_identifier \
               cast_in_dquoted_identifier cast_normalize bad_tablename cte_on_dml cte_on_insert \
               ddl_noop_unregistered ddl_block_drop ddl_block_truncate \
-              ddl_alter_column ddl_rename_table ddl_rename_view \
+              ddl_alter_column ddl_alter_decoupled ddl_rename_table ddl_rename_view \
               ddl_partition_passthrough bakery_wraps_cold_writes \
               param_cold_via_plpgsql async_requires_patch \
               storage_secret_azure storage_secret_vended privilege_model definer_search_path \

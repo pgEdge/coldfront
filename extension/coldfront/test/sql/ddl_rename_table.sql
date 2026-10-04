@@ -28,7 +28,23 @@ SELECT attname FROM pg_attribute
  WHERE attrelid = 'public.events'::regclass AND attnum > 0 AND NOT attisdropped
  ORDER BY attnum;
 
+-- A role that owns the hot table renames it with no access to the view or to
+-- schema coldfront, holding only the CREATE on the schema that PostgreSQL
+-- requires for a rename: the hook updates the registry and rebuilds the view as
+-- the extension's owner, and the view keeps its owner.
+CREATE ROLE ddl_rename_hot_owner;
+GRANT CREATE ON SCHEMA public TO ddl_rename_hot_owner;
+ALTER TABLE public._events_v2 OWNER TO ddl_rename_hot_owner;
+SET ROLE ddl_rename_hot_owner;
+ALTER TABLE public._events_v2 RENAME TO _events_v3;
+RESET ROLE;
+SELECT hot_table, pg_get_userbyid((SELECT relowner FROM pg_class
+                                   WHERE oid = 'public.events'::regclass)) AS view_owner
+  FROM coldfront.tiered_views WHERE schema_name = 'public' AND relname = 'events';
+
 -- Cleanup.
 DELETE FROM coldfront.tiered_views;
 DROP VIEW public.events;
-DROP TABLE public._events_v2;
+DROP TABLE public._events_v3;
+REVOKE CREATE ON SCHEMA public FROM ddl_rename_hot_owner;
+DROP ROLE ddl_rename_hot_owner;

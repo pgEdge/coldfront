@@ -27,3 +27,34 @@ CREATE TABLE public.base (id int);
 CREATE VIEW public.base_v AS SELECT * FROM public.base;
 DROP VIEW public.base_v;
 DROP TABLE public.base;
+
+-- A role with no access to schema coldfront runs DDL on a table of its own: the
+-- hook reads the registry as the extension's owner, with search_path pinned to
+-- pg_catalog, pg_temp, so neither a function the role puts ahead of pg_catalog
+-- nor a temporary type of its own takes part in the lookup. A registered table
+-- gives the lookup a row to evaluate them on.
+CREATE TABLE public._other (ts timestamptz);
+INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
+VALUES ('public', 'other', 'public._other', 'ice.default.other', 'ts');
+CREATE ROLE ddl_plain_owner;
+GRANT CREATE ON SCHEMA public TO ddl_plain_owner;
+CREATE SCHEMA ddl_plain_fns AUTHORIZATION ddl_plain_owner;
+SET ROLE ddl_plain_owner;
+CREATE FUNCTION ddl_plain_fns.to_regclass(text) RETURNS regclass LANGUAGE plpgsql AS $$
+BEGIN RAISE NOTICE 'the caller''s to_regclass ran'; RETURN NULL; END $$;
+CREATE DOMAIN pg_temp.oid AS int CHECK (VALUE < 0);
+SET search_path = ddl_plain_fns, pg_catalog, public;
+CREATE TABLE public.mine (id int);
+ALTER TABLE public.mine ADD COLUMN extra int;
+ALTER TABLE public.mine RENAME COLUMN extra TO renamed;
+ALTER TABLE public.mine RENAME TO mine2;
+TRUNCATE public.mine2;
+DROP TABLE public.mine2;
+RESET search_path;
+DROP DOMAIN pg_temp.oid;
+RESET ROLE;
+DELETE FROM coldfront.tiered_views WHERE schema_name = 'public' AND relname = 'other';
+DROP TABLE public._other;
+DROP SCHEMA ddl_plain_fns CASCADE;
+REVOKE CREATE ON SCHEMA public FROM ddl_plain_owner;
+DROP ROLE ddl_plain_owner;

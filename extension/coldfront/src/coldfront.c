@@ -51,6 +51,7 @@
 #include "access/xact.h"
 #include "catalog/dependency.h"
 #include "catalog/namespace.h"
+#include "catalog/objectaddress.h"
 #include "catalog/pg_authid.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_collation.h"
@@ -73,6 +74,7 @@
 #include "optimizer/planner.h"
 #include "parser/analyze.h"
 #include "parser/parse_func.h"
+#include "parser/parse_type.h"
 #include "parser/parsetree.h"
 #include "storage/fd.h"
 #include "storage/procarray.h"
@@ -86,6 +88,7 @@
 #include "utils/memutils.h"
 #include "utils/regproc.h"
 #include "utils/ruleutils.h"
+#include "utils/syscache.h"
 #include "utils/timestamp.h"
 #include "fmgr.h"
 #include "libpq-fe.h"
@@ -272,6 +275,9 @@ static ProcessUtility_hook_type prev_process_utility_hook = NULL;
  * DDL hook uses — both are registered cluster-wide.
  */
 static bool coldfront_registry_present(void);
+/* Defined with it: run a registry read as the extension's owner. */
+static int  as_coldfront_owner(Oid *save_uid, int *save_sec);
+static void as_caller(Oid save_uid, int save_sec, int nest);
 
 /*
  * Re-entrancy guard for the DDL hook. _rebuild_tiered_view issues CREATE VIEW /
@@ -349,6 +355,9 @@ cf_load_registry(void)
 {
     MemoryContext oldcxt;
     uint64        i;
+    Oid           save_uid;
+    int           save_sec;
+    int           nest;
 
     cf_registry     = NIL;
     cf_registry_cid = GetCurrentCommandId(false);
@@ -370,6 +379,7 @@ cf_load_registry(void)
     if (SPI_connect() != SPI_OK_CONNECT)
         return;
 
+    nest = as_coldfront_owner(&save_uid, &save_sec);
     if (SPI_execute(
             "SELECT tv.schema_name, tv.relname, tv.hot_table, tv.iceberg_table, "
             "       tv.partition_col, tv.is_iceberg_only, aw.cutoff_time, "
@@ -413,6 +423,7 @@ cf_load_registry(void)
         }
         MemoryContextSwitchTo(oldcxt);
     }
+    as_caller(save_uid, save_sec, nest);
 
     SPI_finish();
 }
@@ -4498,44 +4509,78 @@ coldfront_registry_present(void)
 }
 
 /*
- * Find the tiered registry row whose HOT table resolves to relid. Populates
+ * Switch to the owner of schema coldfront, with search_path pinned to
+ * pg_catalog, pg_temp: the caller's functions are out of reach, and its
+ * temporary types come after pg_catalog's. The hooks read the registry this
+ * way, so a role using a table or view of its own needs no access to the
+ * schema, which calling a SECURITY DEFINER function there would need, and the
+ * DDL hook keeps a registered view and its registry rows in step with a user's
+ * DDL this way (spi_exec_ddl). Returns the GUC nest level for as_caller; an
+ * error restores both with the transaction.
+ */
+static int
+as_coldfront_owner(Oid *save_uid, int *save_sec)
+{
+    HeapTuple tup = SearchSysCache1(NAMESPACEOID,
+                                    ObjectIdGetDatum(get_namespace_oid("coldfront", false)));
+    int       nest;
+
+    if (!HeapTupleIsValid(tup))
+        elog(ERROR, "coldfront: cache lookup failed for schema coldfront");
+    GetUserIdAndSecContext(save_uid, save_sec);
+    SetUserIdAndSecContext(((Form_pg_namespace) GETSTRUCT(tup))->nspowner,
+                           *save_sec | SECURITY_LOCAL_USERID_CHANGE);
+    ReleaseSysCache(tup);
+    nest = NewGUCNestLevel();
+    (void) set_config_option("search_path", "pg_catalog, pg_temp", PGC_USERSET, PGC_S_SESSION,
+                             GUC_ACTION_SAVE, true, 0, false);
+    return nest;
+}
+
+static void
+as_caller(Oid save_uid, int save_sec, int nest)
+{
+    AtEOXact_GUC(true, nest);
+    SetUserIdAndSecContext(save_uid, save_sec);
+}
+
+/*
+ * Find the registry row that `match`, an SQL condition, selects. Populates
  * *out (palloc'd in CurTransactionContext) and returns true on a match.
  *
- * Matching is done in SQL: to_regclass(hot_table)::oid = relid. to_regclass
- * resolves the stored quoted-qualified name schema-aware (never assumes a
- * schema), so this is correct regardless of search_path or the incoming
- * RangeVar's qualification. One query, no SPI_tuptable clobbering.
+ * Matching is done in SQL with to_regclass, which resolves a stored name
+ * schema-aware (never assumes a schema), so this is correct regardless of
+ * search_path or the incoming RangeVar's qualification. One query, no
+ * SPI_tuptable clobbering, run as the extension's owner (as_coldfront_owner).
  */
 static bool
-lookup_tiered_by_hot_oid(Oid relid, TieredDDLInfo *out)
+lookup_ddl_info(const char *match, TieredDDLInfo *out)
 {
     bool           found = false;
     StringInfoData sql;
+    Oid            save_uid;
+    int            save_sec;
+    int            nest;
 
-    if (!OidIsValid(relid))
-        return false;
     if (SPI_connect() != SPI_OK_CONNECT)
         return false;
 
     initStringInfo(&sql);
     appendStringInfo(&sql,
         "SELECT schema_name, relname, hot_table, iceberg_table, partition_col "
-        "FROM coldfront.tiered_views "
-        "WHERE hot_table IS NOT NULL "
-        "  AND to_regclass(hot_table)::oid = %u "
-        "LIMIT 1",
-        relid);
+        "FROM coldfront.tiered_views WHERE %s LIMIT 1", match);
 
+    nest = as_coldfront_owner(&save_uid, &save_sec);
     if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed == 1)
     {
         MemoryContext oldcxt = MemoryContextSwitchTo(CurTransactionContext);
-        char   *pc;
+        char   *hot, *pc;
         out->view_schema   = pstrdup(SPI_getvalue(SPI_tuptable->vals[0],
                                                   SPI_tuptable->tupdesc, 1));
         out->view_relname  = pstrdup(SPI_getvalue(SPI_tuptable->vals[0],
                                                   SPI_tuptable->tupdesc, 2));
-        out->hot_table     = pstrdup(SPI_getvalue(SPI_tuptable->vals[0],
-                                                  SPI_tuptable->tupdesc, 3));
+        hot = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 3);
+        out->hot_table     = hot ? pstrdup(hot) : NULL;
         out->iceberg_table = pstrdup(SPI_getvalue(SPI_tuptable->vals[0],
                                                   SPI_tuptable->tupdesc, 4));
         pc = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 5);
@@ -4543,10 +4588,29 @@ lookup_tiered_by_hot_oid(Oid relid, TieredDDLInfo *out)
         MemoryContextSwitchTo(oldcxt);
         found = true;
     }
+    as_caller(save_uid, save_sec, nest);
 
     pfree(sql.data);
     SPI_finish();
     return found;
+}
+
+/* The tiered registry row whose HOT table resolves to relid. */
+static bool
+lookup_tiered_by_hot_oid(Oid relid, TieredDDLInfo *out)
+{
+    return OidIsValid(relid) && lookup_ddl_info(
+        psprintf("hot_table IS NOT NULL AND to_regclass(hot_table)::oid = %u", relid), out);
+}
+
+/* The decoupled registry row whose wrapper view is relid; out->hot_table is
+ * NULL, which is how the DDL helpers below tell a decoupled table apart. */
+static bool
+lookup_iceberg_only_by_view_oid(Oid relid, TieredDDLInfo *out)
+{
+    return OidIsValid(relid) && lookup_ddl_info(
+        psprintf("is_iceberg_only AND "
+                 "to_regclass(format('%%I.%%I', schema_name, relname))::oid = %u", relid), out);
 }
 
 /*
@@ -4554,13 +4618,16 @@ lookup_tiered_by_hot_oid(Oid relid, TieredDDLInfo *out)
  * or the transparent view. The utility hook blocks DROP/TRUNCATE on either side
  * with it. When has_hot is given it reports whether the registration has a hot
  * table (false for an iceberg-only view). Single query, schema-safe via
- * to_regclass (see lookup_tiered_by_hot_oid).
+ * to_regclass (see lookup_ddl_info), run as the extension's owner.
  */
 static bool
 relid_is_tiered(Oid relid, bool *has_hot)
 {
     bool           found = false;
     StringInfoData sql;
+    Oid            save_uid;
+    int            save_sec;
+    int            nest;
 
     if (!OidIsValid(relid))
         return false;
@@ -4576,6 +4643,7 @@ relid_is_tiered(Oid relid, bool *has_hot)
         quote_literal_cstr(get_namespace_name(get_rel_namespace(relid))),
         quote_literal_cstr(get_rel_name(relid)),
         relid);
+    nest = as_coldfront_owner(&save_uid, &save_sec);
     if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed == 1)
     {
         bool isnull;
@@ -4586,6 +4654,7 @@ relid_is_tiered(Oid relid, bool *has_hot)
                                                   SPI_tuptable->tupdesc, 1,
                                                   &isnull)) && !isnull;
     }
+    as_caller(save_uid, save_sec, nest);
     pfree(sql.data);
 
     SPI_finish();
@@ -4594,29 +4663,46 @@ relid_is_tiered(Oid relid, bool *has_hot)
 
 #define CF_SPOCK_DDL_GUC "spock.enable_ddl_replication"
 
-/* Run one void-returning coldfront helper via SPI with up to two text args.
- * The DDL hook issues its view and trigger DDL through here, and each peer's
- * own hook issues the same DDL when it applies the user's replicated statement,
- * so the helper runs with spock.enable_ddl_replication off and only the user's
- * statement replicates. Spock reads the setting just after each statement it
- * runs, which is inside this call whatever order the hooks load in. The nest
- * level restores the setting on return, and an error restores it with the
- * transaction. Without Spock the setting does not exist and nothing is set. */
+/* Run one void-returning coldfront helper via SPI, as the extension's owner
+ * (as_coldfront_owner): the view and registry changes that follow a user's DDL
+ * need no privilege of the user's beyond what PostgreSQL checks for the
+ * statement itself. The DDL hook issues a tiered view's DDL through here, and
+ * each peer's own hook issues the same DDL when it applies the user's
+ * replicated statement, so unless `replicate` is set the helper runs with
+ * spock.enable_ddl_replication off and only the user's statement replicates.
+ * Spock reads the setting just after each statement it runs, which is inside
+ * this call whatever order the hooks load in. The nest level restores the
+ * setting on return, and an error restores it with the transaction. Without
+ * Spock the setting does not exist and nothing is set.
+ *
+ * `replicate` leaves the setting as it is, so the helper's own DDL replicates.
+ * A decoupled view is rebuilt that way: PostgreSQL never runs the user's ALTER
+ * on the view, so no peer receives it, and each peer takes the rebuilt view as
+ * DDL, as it took the view's creation. Spock records the extension's owner as
+ * the role that ran that DDL, and each peer runs it as that role. */
 static void
-spi_exec_void(const char *sql)
+spi_exec_ddl(const char *sql, bool replicate)
 {
     if (SPI_connect() == SPI_OK_CONNECT)
     {
-        int nest = NewGUCNestLevel();
+        Oid save_uid;
+        int save_sec;
+        int nest = as_coldfront_owner(&save_uid, &save_sec);
 
-        if (GetConfigOption(CF_SPOCK_DDL_GUC, true, false) != NULL)
+        if (!replicate && GetConfigOption(CF_SPOCK_DDL_GUC, true, false) != NULL)
             (void) set_config_option(CF_SPOCK_DDL_GUC, "off",
                                      PGC_USERSET, PGC_S_SESSION,
                                      GUC_ACTION_SAVE, true, 0, false);
         SPI_execute(sql, false, 0);
-        AtEOXact_GUC(true, nest);
+        as_caller(save_uid, save_sec, nest);
         SPI_finish();
     }
+}
+
+static void
+spi_exec_void(const char *sql)
+{
+    spi_exec_ddl(sql, false);
 }
 
 #define CF_SPOCK_REPAIR_GUC "spock.replication_repair_mode"
@@ -4647,15 +4733,66 @@ spi_exec_local_rows(const char *sql)
  * Used after a column-shape change (ADD/DROP/ALTER-TYPE/RENAME COLUMN, mirrored
  * onto Iceberg by mirror_and_rebuild) and after a hot-table or view RENAME. The
  * view's columns/types are derived from the hot heap, so it always reflects the
- * post-DDL shape. */
+ * post-DDL shape. acl is the view's owner and grants (view_acl_sql) when the
+ * caller dropped the view before the rebuild; otherwise the rebuild reads them
+ * from the view it replaces. */
 static void
-rebuild_tiered_view(const char *schema, const char *relname)
+rebuild_tiered_view(const char *schema, const char *relname, const char *acl)
 {
     StringInfoData sql;
     initStringInfo(&sql);
-    appendStringInfo(&sql, "SELECT coldfront._rebuild_tiered_view(%s, %s)",
-        quote_literal_cstr(schema), quote_literal_cstr(relname));
+    appendStringInfo(&sql, "SELECT coldfront._rebuild_tiered_view(%s, %s, %s)",
+        quote_literal_cstr(schema), quote_literal_cstr(relname),
+        acl ? quote_literal_cstr(acl) : "NULL");
     spi_exec_void(sql.data);
+    pfree(sql.data);
+}
+
+/* The statements that give the view back its owner and grants once it is
+ * dropped and created again (coldfront._view_acl_sql), read while it exists,
+ * as the extension's owner, which runs them (spi_exec_ddl). */
+static char *
+view_acl_sql(const TieredDDLInfo *info)
+{
+    StringInfoData sql;
+    char          *acl = NULL;
+
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+        "SELECT coldfront._view_acl_sql(format('%%I.%%I', %s, %s)::regclass)",
+        quote_literal_cstr(info->view_schema), quote_literal_cstr(info->view_relname));
+    if (SPI_connect() == SPI_OK_CONNECT)
+    {
+        Oid save_uid;
+        int save_sec;
+        int nest = as_coldfront_owner(&save_uid, &save_sec);
+
+        if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed == 1)
+        {
+            char *v = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+
+            if (v != NULL)
+                acl = MemoryContextStrdup(CurTransactionContext, v);
+        }
+        as_caller(save_uid, save_sec, nest);
+        SPI_finish();
+    }
+    pfree(sql.data);
+    return acl;
+}
+
+/* Rebuild a decoupled table's wrapper view from its own columns plus actions
+ * (coldfront._rebuild_iceberg_view). Its DDL replicates; see spi_exec_ddl. */
+static void
+rebuild_iceberg_view(const TieredDDLInfo *info, const char *actions)
+{
+    StringInfoData sql;
+    initStringInfo(&sql);
+    appendStringInfo(&sql,
+        "SELECT coldfront._rebuild_iceberg_view(%s, %s, jsonb_build_array(%s))",
+        quote_literal_cstr(info->view_schema), quote_literal_cstr(info->view_relname),
+        actions);
+    spi_exec_ddl(sql.data, true);
     pfree(sql.data);
 }
 
@@ -4734,26 +4871,37 @@ quoted_qualified_name(Oid relid)
  * Spock apply worker, where the originator already evolved the SHARED catalog) —
  * then rebuild the per-node transparent view to the new column set. `actions` is
  * the body of a jsonb_build_array(...) call: comma-separated jsonb_build_object()
- * terms, each {op, col[, newcol]}. Runs under the re-entrancy guard so the
- * SPI-issued DDL does not re-enter this hook. Any unsupported type raises inside
- * the mirror, rolling the whole statement (hot tier included) back atomically.
+ * terms, each {op, col[, newcol][, type]}. Runs under the re-entrancy guard so
+ * the SPI-issued DDL does not re-enter this hook. Any unsupported type raises
+ * inside the mirror, rolling the whole statement (hot tier included) back
+ * atomically. A decoupled table (no hot table) has its wrapper view rebuilt from
+ * the view's own columns plus the actions; acl is a tiered view's owner and
+ * grants when the caller dropped the view first. The Iceberg change runs as the
+ * caller, as all cold I/O does, and the rebuild as the extension's owner.
  */
 static void
-mirror_and_rebuild(const TieredDDLInfo *info, const char *actions)
+mirror_and_rebuild(const TieredDDLInfo *info, const char *actions, const char *acl)
 {
     StringInfoData sql;
     initStringInfo(&sql);
     appendStringInfo(&sql,
         "SELECT coldfront._mirror_iceberg_alter(%s, %s, jsonb_build_array(%s))",
         quote_literal_cstr(info->iceberg_table),
-        quote_literal_cstr(info->hot_table),
+        info->hot_table ? quote_literal_cstr(info->hot_table) : "NULL",
         actions);
 
     coldfront_in_utility = true;
     PG_TRY();
     {
-        spi_exec_void(sql.data);
-        rebuild_tiered_view(info->view_schema, info->view_relname);
+        if (SPI_connect() == SPI_OK_CONNECT)
+        {
+            SPI_execute(sql.data, false, 0);
+            SPI_finish();
+        }
+        if (info->hot_table != NULL)
+            rebuild_tiered_view(info->view_schema, info->view_relname, acl);
+        else
+            rebuild_iceberg_view(info, actions);
     }
     PG_FINALLY();
     {
@@ -4848,10 +4996,29 @@ cf_handle_truncate(const CfUtilityCtx *u, TruncateStmt *ts)
     cf_call_through(u);
 }
 
+/* PostgreSQL's owner check for an ALTER TABLE, made before the DDL hook changes
+ * anything on the user's behalf: a decoupled table's ALTER never reaches
+ * PostgreSQL's own, and a tiered table's view is dropped before it. */
+static void
+require_owner(Oid relid)
+{
+    if (!object_ownercheck(RelationRelationId, relid, GetUserId()))
+        aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(get_rel_relkind(relid)),
+                       get_rel_name(relid));
+}
+
 /* Collect the column-shape subcommands to mirror into *actions (the body of a
- * jsonb_build_array(...) call); ignore the rest. Returns the count collected. */
+ * jsonb_build_array(...) call); ignore the rest. Returns the count collected.
+ *
+ * For a decoupled table (decoupled non-NULL) PostgreSQL runs none of the
+ * statement, so each add and type action carries the declared type, which no
+ * hot table holds, and what an Iceberg column and a view cannot take is
+ * refused: a default, constraint, collation or storage option on an added
+ * column, a USING clause or collation on a type change, and any other
+ * subcommand beside a column change. */
 static int
-cf_collect_alter_actions(AlterTableStmt *at, StringInfoData *actions)
+cf_collect_alter_actions(AlterTableStmt *at, StringInfoData *actions,
+                         const TieredDDLInfo *decoupled)
 {
     ListCell *lc;
     int       nacts = 0;
@@ -4860,13 +5027,16 @@ cf_collect_alter_actions(AlterTableStmt *at, StringInfoData *actions)
     foreach(lc, at->cmds)
     {
         AlterTableCmd *cmd = (AlterTableCmd *) lfirst(lc);
+        ColumnDef     *def = NULL;
         const char    *op  = NULL;
         const char    *col = NULL;
+        char          *type = NULL;
 
         if (cmd->subtype == AT_AddColumn)
         {
             op  = "add";
-            col = castNode(ColumnDef, cmd->def)->colname;
+            def = castNode(ColumnDef, cmd->def);
+            col = def->colname;
         }
         else if (cmd->subtype == AT_DropColumn)
         {
@@ -4876,16 +5046,49 @@ cf_collect_alter_actions(AlterTableStmt *at, StringInfoData *actions)
         else if (cmd->subtype == AT_AlterColumnType)
         {
             op  = "type";
+            def = castNode(ColumnDef, cmd->def);
             col = cmd->name;
         }
         if (op == NULL)
             continue;
 
-        appendStringInfo(actions, "%sjsonb_build_object('op', %s, 'col', %s)",
+        if (decoupled != NULL && def != NULL)
+        {
+            Oid   typid;
+            int32 typmod;
+
+            if (cmd->subtype == AT_AddColumn &&
+                (def->raw_default != NULL || def->cooked_default != NULL ||
+                 def->is_not_null || def->identity || def->generated ||
+                 def->collClause != NULL || def->constraints != NIL ||
+                 def->compression != NULL || def->storage_name != NULL))
+                ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("coldfront: an ADD COLUMN on decoupled table \"%s.%s\" takes a name and a type, with no default, constraint, collation, storage or compression option (column \"%s\")",
+                            decoupled->view_schema, decoupled->view_relname, col)));
+            if (cmd->subtype == AT_AlterColumnType &&
+                (def->raw_default != NULL || def->collClause != NULL))
+                ereport(ERROR,
+                    (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                     errmsg("coldfront: an ALTER COLUMN ... TYPE on decoupled table \"%s.%s\" takes a type alone, with no USING or COLLATE (column \"%s\")",
+                            decoupled->view_schema, decoupled->view_relname, col),
+                     errhint("Iceberg converts the stored values itself, for the widening it accepts.")));
+            typenameTypeIdAndMod(NULL, def->typeName, &typid, &typmod);
+            type = format_type_with_typemod(typid, typmod);
+        }
+
+        appendStringInfo(actions, "%sjsonb_build_object('op', %s, 'col', %s%s%s)",
                          nacts > 0 ? ", " : "",
-                         quote_literal_cstr(op), quote_literal_cstr(col));
+                         quote_literal_cstr(op), quote_literal_cstr(col),
+                         type ? ", 'type', " : "",
+                         type ? quote_literal_cstr(type) : "");
         nacts++;
     }
+    if (decoupled != NULL && nacts > 0 && nacts < list_length(at->cmds))
+        ereport(ERROR,
+            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+             errmsg("coldfront: on decoupled table \"%s.%s\", run a column change as an ALTER TABLE of its own",
+                    decoupled->view_schema, decoupled->view_relname)));
     return nacts;
 }
 
@@ -4898,7 +5101,9 @@ cf_collect_alter_actions(AlterTableStmt *at, StringInfoData *actions)
  * is rebuilt to the new column set. Every OTHER ALTER subtype — DETACH/ATTACH
  * PARTITION (the archiver's own cutover machinery), storage params, SET
  * STATISTICS, constraint / NOT NULL toggles — is PG-side only and passes
- * straight through untouched. */
+ * straight through untouched. A decoupled table's column change targets its
+ * wrapper view, which PostgreSQL cannot alter, so the change goes to the
+ * Iceberg table and the view is rebuilt, and PostgreSQL runs none of it. */
 static void
 cf_handle_alter_table(const CfUtilityCtx *u, AlterTableStmt *at)
 {
@@ -4906,21 +5111,31 @@ cf_handle_alter_table(const CfUtilityCtx *u, AlterTableStmt *at)
     TieredDDLInfo   info;
     StringInfoData  actions;
     int             nacts;
+    char           *acl;
 
-    if (!lookup_tiered_by_hot_oid(relid, &info))
+    if (!lookup_tiered_by_hot_oid(relid, &info) &&
+        !lookup_iceberg_only_by_view_oid(relid, &info))
     {
         cf_call_through(u);
         return;
     }
 
-    nacts = cf_collect_alter_actions(at, &actions);
+    require_owner(relid);
+    nacts = cf_collect_alter_actions(at, &actions, info.hot_table ? NULL : &info);
 
     if (nacts == 0)
     {
         /* No column-shape change → partition management / storage params /
-         * the archiver's DETACH. Not coldfront's business. */
+         * the archiver's DETACH / a view's owner. Not coldfront's business. */
         pfree(actions.data);
         cf_call_through(u);
+        return;
+    }
+
+    if (info.hot_table == NULL)
+    {
+        mirror_and_rebuild(&info, actions.data, NULL);
+        pfree(actions.data);
         return;
     }
 
@@ -4929,10 +5144,12 @@ cf_handle_alter_table(const CfUtilityCtx *u, AlterTableStmt *at)
      * view"). Drop the view first, run the hot ALTER, then mirror the change
      * onto Iceberg and rebuild the view. One transaction: an unsupported
      * column type (or any failure) raises inside the mirror and rolls the
-     * whole statement — view drop and hot change included — back atomically. */
+     * whole statement — view drop and hot change included — back atomically.
+     * The view's owner and grants are read before the drop takes them. */
+    acl = view_acl_sql(&info);
     drop_tiered_view(info.view_schema, info.view_relname);
     cf_call_through(u);
-    mirror_and_rebuild(&info, actions.data);
+    mirror_and_rebuild(&info, actions.data, acl);
     pfree(actions.data);
 }
 
@@ -4977,15 +5194,18 @@ cf_match_rename_target(RenameStmt *rs, TieredDDLInfo *info, bool *via_hot,
 }
 
 /* RENAME COLUMN on the HOT table is mirrored onto the Iceberg column so cold
- * reads keep resolving it by name. A column rename targeting the generated VIEW
- * is meaningless (the rebuild owns the view's column names) and is rejected. */
+ * reads keep resolving it by name. On a decoupled table's wrapper view, the
+ * one place its columns are named, the Iceberg column is renamed and the view
+ * rebuilt, and PostgreSQL runs nothing. A column rename targeting a tiered
+ * table's generated VIEW is meaningless (the rebuild owns the view's column
+ * names) and is rejected. */
 static void
 cf_handle_rename_column(const CfUtilityCtx *u, RenameStmt *rs,
                         TieredDDLInfo *info, bool via_hot, Oid view_relid)
 {
     StringInfoData acts;
 
-    if (!via_hot)
+    if (!via_hot && !lookup_iceberg_only_by_view_oid(view_relid, info))
     {
         char *ns   = get_namespace_name(get_rel_namespace(view_relid));
         char *name = get_rel_name(view_relid);
@@ -4997,12 +5217,15 @@ cf_handle_rename_column(const CfUtilityCtx *u, RenameStmt *rs,
                      "that onto the Iceberg cold tier and rebuilds the view.")));
     }
 
-    cf_call_through(u);   /* PG renames the hot column */
+    if (via_hot)
+        cf_call_through(u);   /* PG renames the hot column */
+    else
+        require_owner(view_relid);
     initStringInfo(&acts);
     appendStringInfo(&acts,
         "jsonb_build_object('op', 'rename', 'col', %s, 'newcol', %s)",
         quote_literal_cstr(rs->subname), quote_literal_cstr(rs->newname));
-    mirror_and_rebuild(info, acts.data);
+    mirror_and_rebuild(info, acts.data, NULL);
     pfree(acts.data);
 }
 
@@ -5033,7 +5256,7 @@ cf_handle_rename_relation(const CfUtilityCtx *u, RenameStmt *rs,
              * registry key is stable — update hot_table, then rebuild. */
             char *new_hot = quoted_qualified_name(hot_relid);
             update_hot_table(info->view_schema, info->view_relname, new_hot);
-            rebuild_tiered_view(info->view_schema, info->view_relname);
+            rebuild_tiered_view(info->view_schema, info->view_relname, NULL);
         }
         else
         {
@@ -5045,7 +5268,7 @@ cf_handle_rename_relation(const CfUtilityCtx *u, RenameStmt *rs,
             if (old_view_name != NULL &&
                 strcmp(old_view_name, rs->newname) != 0)
                 rename_tiered_view(info->view_schema, old_view_name, rs->newname);
-            rebuild_tiered_view(info->view_schema, rs->newname);
+            rebuild_tiered_view(info->view_schema, rs->newname, NULL);
         }
     }
     PG_FINALLY();

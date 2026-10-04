@@ -1,0 +1,210 @@
+-- Column changes on a decoupled table: the DDL hook applies each to the Iceberg
+-- table through the bakery and rebuilds the wrapper view from its current
+-- columns plus the change, keeping the view's grants and owner. White-box like
+-- ddl_alter_column: under the apply-worker role the Iceberg step is skipped, so
+-- the rebuild runs with no live catalog; ci/journey.sh runs the cold tier.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_duckdb;
+CREATE EXTENSION IF NOT EXISTS coldfront;
+CREATE EXTENSION IF NOT EXISTS vector;
+RESET client_min_messages;
+SET coldfront.warehouse = '';
+SET coldfront.lakekeeper_endpoint = '';
+SET coldfront.loopback_dsn = '';
+SELECT coldfront._register_iceberg_view('public', 'dk', '"ice"."default"."dk"',
+    '[{"name": "id", "cast": "bigint"}, {"name": "qty", "cast": "integer"},
+      {"name": "amount", "cast": "numeric(10,2)"}, {"name": "doc", "cast": "json"}]', '{}', true);
+ _register_iceberg_view 
+------------------------
+ 
+(1 row)
+
+CREATE ROLE dk_reader;
+CREATE ROLE dk_owner;
+GRANT SELECT, INSERT ON public.dk TO dk_reader;
+ALTER VIEW public.dk OWNER TO dk_owner;
+-- The four column changes, under the apply-worker role.
+SET session_replication_role = replica;
+ALTER TABLE public.dk ADD COLUMN note text;
+ALTER TABLE public.dk RENAME COLUMN note TO memo;
+ALTER TABLE public.dk ALTER COLUMN qty TYPE bigint;
+ALTER TABLE public.dk ALTER COLUMN amount TYPE numeric(12,2);
+SELECT attname, format_type(atttypid, atttypmod) AS type FROM pg_attribute
+ WHERE attrelid = 'public.dk'::regclass AND attnum > 0 ORDER BY attnum;
+ attname |       type        
+---------+-------------------
+ id      | bigint
+ qty     | bigint
+ amount  | numeric(12,2)
+ doc     | json
+ memo    | character varying
+(5 rows)
+
+SELECT pg_get_viewdef('public.dk'::regclass);
+                             pg_get_viewdef                             
+------------------------------------------------------------------------
+  SELECT (r['id'::text])::bigint AS id,                                +
+     (r['qty'::text])::bigint AS qty,                                  +
+     (r['amount'::text])::numeric(12,2) AS amount,                     +
+     (r['doc'::text])::json AS doc,                                    +
+     (r['memo'::text])::character varying AS memo                      +
+    FROM duckdb.query('SELECT * FROM "ice"."default"."dk"'::text) t(r);
+(1 row)
+
+ALTER TABLE public.dk DROP COLUMN memo;
+-- Column changes share a statement.
+ALTER TABLE public.dk ADD COLUMN a1 text, ADD COLUMN a2 date;
+SELECT string_agg(attname, ', ' ORDER BY attnum) AS columns FROM pg_attribute
+ WHERE attrelid = 'public.dk'::regclass AND attnum > 0;
+           columns            
+------------------------------
+ id, qty, amount, doc, a1, a2
+(1 row)
+
+ALTER TABLE public.dk DROP COLUMN a1, DROP COLUMN a2;
+SET session_replication_role = DEFAULT;
+SELECT attname, format_type(atttypid, atttypmod) AS type FROM pg_attribute
+ WHERE attrelid = 'public.dk'::regclass AND attnum > 0 ORDER BY attnum;
+ attname |     type      
+---------+---------------
+ id      | bigint
+ qty     | bigint
+ amount  | numeric(12,2)
+ doc     | json
+(4 rows)
+
+-- The view keeps its grants, its owner and its registration.
+SELECT has_table_privilege('dk_reader', 'public.dk', 'SELECT') AS can_select,
+       has_table_privilege('dk_reader', 'public.dk', 'INSERT') AS can_insert,
+       pg_get_userbyid(relowner) AS owner
+  FROM pg_class WHERE oid = 'public.dk'::regclass;
+ can_select | can_insert |  owner   
+------------+------------+----------
+ t          | t          | dk_owner
+(1 row)
+
+SELECT iceberg_table, is_iceberg_only, is_writable, vec_columns
+  FROM coldfront.tiered_views WHERE schema_name = 'public' AND relname = 'dk';
+    iceberg_table     | is_iceberg_only | is_writable | vec_columns 
+----------------------+-----------------+-------------+-------------
+ "ice"."default"."dk" | t               | t           | 
+(1 row)
+
+-- What an Iceberg column cannot take is refused, as is a type with no mapping
+-- and a statement that mixes a column change with another change.
+ALTER TABLE public.dk ADD COLUMN fee numeric(10,2) DEFAULT 0;
+ERROR:  coldfront: an ADD COLUMN on decoupled table "public.dk" takes a name and a type, with no default, constraint, collation, storage or compression option (column "fee")
+ALTER TABLE public.dk ADD COLUMN fee numeric(10,2) NOT NULL;
+ERROR:  coldfront: an ADD COLUMN on decoupled table "public.dk" takes a name and a type, with no default, constraint, collation, storage or compression option (column "fee")
+ALTER TABLE public.dk ADD COLUMN label text COLLATE "C";
+ERROR:  coldfront: an ADD COLUMN on decoupled table "public.dk" takes a name and a type, with no default, constraint, collation, storage or compression option (column "label")
+ALTER TABLE public.dk ADD COLUMN label text STORAGE EXTERNAL;
+ERROR:  coldfront: an ADD COLUMN on decoupled table "public.dk" takes a name and a type, with no default, constraint, collation, storage or compression option (column "label")
+ALTER TABLE public.dk ALTER COLUMN amount TYPE numeric(14,2) USING amount * 2;
+ERROR:  coldfront: an ALTER COLUMN ... TYPE on decoupled table "public.dk" takes a type alone, with no USING or COLLATE (column "amount")
+HINT:  Iceberg converts the stored values itself, for the widening it accepts.
+ALTER TABLE public.dk ADD COLUMN fee numeric(10,2), ALTER COLUMN qty SET DEFAULT 0;
+ERROR:  coldfront: on decoupled table "public.dk", run a column change as an ALTER TABLE of its own
+ALTER TABLE public.dk ADD COLUMN ip inet;
+ERROR:  coldfront: column "ip": PG type inet has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, numeric(P,S), jsonb, json, interval, vector(N), halfvec(N), and one-dimensional arrays of those types except timestamptz, jsonb, json, interval and the vector types. inet/cidr/oid unsupported (store IP data as text, oid values as bigint); sparsevec unsupported (keep it in the hot tier)
+CONTEXT:  PL/pgSQL function coldfront._iceberg_storage_type(text,text) line 67 at RAISE
+PL/pgSQL function _mirror_iceberg_alter(text,text,jsonb) line 60 at assignment
+SQL statement "SELECT coldfront._mirror_iceberg_alter('"ice"."default"."dk"', NULL, jsonb_build_array(jsonb_build_object('op', 'add', 'col', 'ip', 'type', 'inet')))"
+-- Only the view's owner changes its columns, as with any ALTER TABLE.
+SET ROLE dk_reader;
+ALTER TABLE public.dk ADD COLUMN note text;
+ERROR:  must be owner of view dk
+ALTER TABLE public.dk RENAME COLUMN qty TO quantity;
+ERROR:  must be owner of view dk
+RESET ROLE;
+-- A role holding the owner's privileges makes the change without the SET ROLE
+-- on the owner that giving the rebuilt view back would need as that role: the
+-- rebuild runs as the extension's owner. The Iceberg change runs as the
+-- caller, who needs the cold access grant_app_access gives an application role
+-- (here USAGE on schema coldfront and SELECT on the registry).
+CREATE ROLE dk_member;
+GRANT dk_owner TO dk_member WITH INHERIT TRUE, SET FALSE;
+GRANT USAGE ON SCHEMA coldfront TO dk_member;
+GRANT SELECT ON coldfront.tiered_views TO dk_member;
+SET session_replication_role = replica;
+SET ROLE dk_member;
+ALTER TABLE public.dk ADD COLUMN note text;
+ALTER TABLE public.dk RENAME COLUMN note TO memo;
+ALTER TABLE public.dk DROP COLUMN memo;
+RESET ROLE;
+SET session_replication_role = DEFAULT;
+REVOKE SELECT ON coldfront.tiered_views FROM dk_member;
+REVOKE USAGE ON SCHEMA coldfront FROM dk_member;
+SELECT has_table_privilege('dk_reader', 'public.dk', 'SELECT') AS can_select,
+       has_table_privilege('dk_reader', 'public.dk', 'INSERT') AS can_insert,
+       pg_get_userbyid(relowner) AS owner
+  FROM pg_class WHERE oid = 'public.dk'::regclass;
+ can_select | can_insert |  owner   
+------------+------------+----------
+ t          | t          | dk_owner
+(1 row)
+
+-- A vector column is neither added nor changed.
+ALTER TABLE public.dk ADD COLUMN v vector(3);
+ERROR:  coldfront: column "v" of "public.dk" is a vector column, which ALTER TABLE does not add or change on a decoupled table
+CONTEXT:  PL/pgSQL function _mirror_iceberg_alter(text,text,jsonb) line 25 at RAISE
+SQL statement "SELECT coldfront._mirror_iceberg_alter('"ice"."default"."dk"', NULL, jsonb_build_array(jsonb_build_object('op', 'add', 'col', 'v', 'type', 'vector(3)')))"
+ALTER TABLE public.dk ALTER COLUMN qty TYPE vector(3);
+ERROR:  coldfront: column "qty" of "public.dk" is a vector column, which ALTER TABLE does not add or change on a decoupled table
+CONTEXT:  PL/pgSQL function _mirror_iceberg_alter(text,text,jsonb) line 25 at RAISE
+SQL statement "SELECT coldfront._mirror_iceberg_alter('"ice"."default"."dk"', NULL, jsonb_build_array(jsonb_build_object('op', 'type', 'col', 'qty', 'type', 'vector(3)')))"
+SELECT coldfront._register_iceberg_view('public', 'dkv', '"ice"."default"."dkv"',
+    '[{"name": "id", "cast": "bigint"}, {"name": "emb", "cast": "real[]"}]', '{emb}', true);
+ _register_iceberg_view 
+------------------------
+ 
+(1 row)
+
+ALTER TABLE public.dkv DROP COLUMN emb;
+ERROR:  coldfront: column "emb" of "public.dkv" is a vector column, which ALTER TABLE does not add or change on a decoupled table
+CONTEXT:  PL/pgSQL function _mirror_iceberg_alter(text,text,jsonb) line 25 at RAISE
+SQL statement "SELECT coldfront._mirror_iceberg_alter('"ice"."default"."dkv"', NULL, jsonb_build_array(jsonb_build_object('op', 'drop', 'col', 'emb')))"
+ALTER TABLE public.dkv RENAME COLUMN emb TO emb2;
+ERROR:  coldfront: column "emb" of "public.dkv" is a vector column, which ALTER TABLE does not add or change on a decoupled table
+CONTEXT:  PL/pgSQL function _mirror_iceberg_alter(text,text,jsonb) line 25 at RAISE
+SQL statement "SELECT coldfront._mirror_iceberg_alter('"ice"."default"."dkv"', NULL, jsonb_build_array(jsonb_build_object('op', 'rename', 'col', 'emb', 'newcol', 'emb2')))"
+ALTER TABLE public.dkv ALTER COLUMN emb TYPE real[];
+ERROR:  coldfront: column "emb" of "public.dkv" is a vector column, which ALTER TABLE does not add or change on a decoupled table
+CONTEXT:  PL/pgSQL function _mirror_iceberg_alter(text,text,jsonb) line 25 at RAISE
+SQL statement "SELECT coldfront._mirror_iceberg_alter('"ice"."default"."dkv"', NULL, jsonb_build_array(jsonb_build_object('op', 'type', 'col', 'emb', 'type', 'real[]')))"
+-- A read-only table refuses every column change.
+SELECT coldfront._register_iceberg_view('public', 'dkr', '"ice"."default"."dkr"',
+    '[{"name": "id", "cast": "bigint"}]', '{}', false);
+ _register_iceberg_view 
+------------------------
+ 
+(1 row)
+
+ALTER TABLE public.dkr ADD COLUMN note text;
+ERROR:  coldfront: "public.dkr" is adopted read-only
+HINT:  Release it with coldfront.release_iceberg_table() and adopt again with p_writable => true to change its columns.
+CONTEXT:  PL/pgSQL function _mirror_iceberg_alter(text,text,jsonb) line 17 at RAISE
+SQL statement "SELECT coldfront._mirror_iceberg_alter('"ice"."default"."dkr"', NULL, jsonb_build_array(jsonb_build_object('op', 'add', 'col', 'note', 'type', 'text')))"
+ALTER TABLE public.dkr RENAME COLUMN id TO ident;
+ERROR:  coldfront: "public.dkr" is adopted read-only
+HINT:  Release it with coldfront.release_iceberg_table() and adopt again with p_writable => true to change its columns.
+CONTEXT:  PL/pgSQL function _mirror_iceberg_alter(text,text,jsonb) line 17 at RAISE
+SQL statement "SELECT coldfront._mirror_iceberg_alter('"ice"."default"."dkr"', NULL, jsonb_build_array(jsonb_build_object('op', 'rename', 'col', 'id', 'newcol', 'ident')))"
+-- Nothing refused changed a view.
+SELECT attrelid::regclass AS view, string_agg(attname, ', ' ORDER BY attnum) AS columns
+  FROM pg_attribute WHERE attrelid IN ('public.dk'::regclass, 'public.dkv'::regclass, 'public.dkr'::regclass)
+   AND attnum > 0
+ GROUP BY attrelid ORDER BY 1;
+ view |       columns        
+------+----------------------
+ dk   | id, qty, amount, doc
+ dkv  | id, emb
+ dkr  | id
+(3 rows)
+
+-- Cleanup. Unregister first: the DDL hook blocks DROP of a registered view.
+DELETE FROM coldfront.tiered_views WHERE schema_name = 'public' AND relname IN ('dk', 'dkv', 'dkr');
+DROP VIEW public.dk, public.dkv, public.dkr;
+DROP ROLE dk_member;
+DROP ROLE dk_reader;
+DROP ROLE dk_owner;
