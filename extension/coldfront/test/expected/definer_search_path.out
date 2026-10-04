@@ -1,0 +1,43 @@
+-- The SECURITY DEFINER helpers (ensure_attached, ensure_pg_attached,
+-- _claim_iceberg_lock) search the caller's temporary schema after pg_catalog.
+-- A role that may call them creates a temporary domain named text, whose CHECK
+-- reports the role it runs as. Inside a helper it would run as the extension's
+-- owner, so it must not run at all.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_duckdb;
+CREATE EXTENSION IF NOT EXISTS coldfront;
+RESET client_min_messages;
+\set VERBOSITY terse
+-- No catalog, no local attach, no loopback: each helper stops before any I/O.
+SET coldfront.warehouse = '';
+SET coldfront.lakekeeper_endpoint = '';
+SET coldfront.local_pg_dsn = '';
+SET coldfront.loopback_dsn = '';
+CREATE ROLE cf_definer_check NOSUPERUSER;
+GRANT USAGE ON SCHEMA coldfront TO cf_definer_check;
+SET ROLE cf_definer_check;
+CREATE FUNCTION pg_temp.ran_as(pg_catalog.text) RETURNS pg_catalog.bool
+LANGUAGE plpgsql AS $$
+BEGIN RAISE NOTICE 'the domain check ran as %', current_user; RETURN true; END $$;
+CREATE DOMAIN pg_temp.text AS pg_catalog.text CHECK (pg_temp.ran_as(VALUE));
+SELECT coldfront.ensure_attached();
+ ensure_attached 
+-----------------
+ 
+(1 row)
+
+SELECT coldfront.ensure_pg_attached();
+ ensure_pg_attached 
+--------------------
+ 
+(1 row)
+
+-- The vanilla cells this suite runs in load no snowflake, so the claim stops at
+-- its second declaration, snowflake.node; its first is a text.
+SELECT coldfront._claim_iceberg_lock('ice.default.t');
+ERROR:  unrecognized configuration parameter "snowflake.node"
+DROP DOMAIN pg_temp.text;
+DROP FUNCTION pg_temp.ran_as(pg_catalog.text);
+RESET ROLE;
+REVOKE USAGE ON SCHEMA coldfront FROM cf_definer_check;
+DROP ROLE cf_definer_check;

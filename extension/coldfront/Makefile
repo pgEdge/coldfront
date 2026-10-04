@@ -22,7 +22,7 @@ REGRESS     = load_order update_unregistered_view update_heap_table \
               ddl_alter_column ddl_rename_table ddl_rename_view \
               ddl_partition_passthrough bakery_wraps_cold_writes \
               param_cold_via_plpgsql async_requires_patch \
-              storage_secret_azure storage_secret_vended privilege_model \
+              storage_secret_azure storage_secret_vended privilege_model definer_search_path \
               partition_config_interval self_join_rejected returning_cold_rejected \
               schema_collision drop_iceberg_table \
               read_date_bin read_json_builders read_param_fold registry_snapshot \

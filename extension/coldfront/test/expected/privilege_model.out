@@ -36,12 +36,12 @@ WHERE pronamespace = 'coldfront'::regnamespace
                   '_claim_iceberg_lock',
                   '_exec_iceberg_with_claim')
 ORDER BY proname;
-         proname          | prosecdef |       proconfig        
---------------------------+-----------+------------------------
- _claim_iceberg_lock      | t         | search_path=pg_catalog
+         proname          | prosecdef |            proconfig            
+--------------------------+-----------+---------------------------------
+ _claim_iceberg_lock      | t         | search_path=pg_catalog, pg_temp
  _exec_iceberg_with_claim | f         | 
- ensure_attached          | t         | search_path=pg_catalog
- ensure_pg_attached       | t         | search_path=pg_catalog
+ ensure_attached          | t         | search_path=pg_catalog, pg_temp
+ ensure_pg_attached       | t         | search_path=pg_catalog, pg_temp
 (4 rows)
 
 -- (2) the endpoint/DSN GUCs the elevated helpers and the loopback trust are
