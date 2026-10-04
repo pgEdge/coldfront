@@ -20,7 +20,7 @@ a new table schema above the highest schema id. No released pg_duckdb tag
 includes DuckDB 1.5.x yet, so the stack is built from a pinned upstream PR plus
 ColdFront's patches - all from sources you can fetch.
 
-## What Gets Built
+## What the Build Produces
 
 `docker/Dockerfile.duckdb15-base` is the recipe; it fetches the requirements,
 applies ColdFront's patches, and compiles a set of components. The following
@@ -134,7 +134,7 @@ describes each variable:
 | `COLDFRONT_LAKEKEEPER` | `http://lakekeeper:8181/catalog` | The catalog endpoint written to `coldfront.lakekeeper_endpoint`. |
 | `COLDFRONT_SNOWFLAKE_NODE` | `1` | The `snowflake.node` value of a mesh member; every member needs a distinct one. |
 | `COLDFRONT_DUCKDB_ROLE` | `coldfront_duckdb` | The role written to `duckdb.postgres_role` and created `NOLOGIN`; an empty value keeps pg_duckdb's superuser-only default. |
-| `COLDFRONT_STANDBY_OF` | unset | The host of a primary. An empty data directory is then filled with `pg_basebackup` from that host and the server starts as a streaming standby. |
+| `COLDFRONT_STANDBY_OF` | unset | The host of a primary. The container then fills an empty data directory with `pg_basebackup` from that host and starts as a streaming standby. |
 | `COLDFRONT_DUCKDB_VERSION` | `v1.5.4` | The version directory under `$PGDATA/pg_duckdb/extensions/` that receives the patched DuckDB extensions. |
 | `COLDFRONT_DUCKDB_PLATFORM` | from `uname -m` | The platform directory under that version, `linux_amd64` or `linux_arm64`. |
 

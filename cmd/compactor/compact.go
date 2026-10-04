@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"iter"
+	"slices"
 	"strings"
 
 	"github.com/apache/arrow-go/v18/arrow"
@@ -37,6 +38,7 @@ type planResult struct {
 	plan    compaction.Plan
 	sorted  bool                // the table declares a sort key: merge, do not concatenate
 	sortKey iceberg.NestedField // the column to merge on, when sorted
+	keep    map[string]bool     // delete files that also apply to a data file the plan leaves out (see keptDeletes)
 	skipped string              // non-empty: why the rewrite must leave this table alone
 }
 
@@ -124,64 +126,81 @@ func planCompaction(ctx context.Context, cat *rest.Catalog, ns, name string, tar
 			TotalSizeBytes: g.TotalSizeBytes,
 		}
 	}
-	return tbl, &planResult{groups: groups, plan: plan, sorted: sorted, sortKey: sortKey}, nil
+	return tbl, &planResult{groups: groups, plan: plan, sorted: sorted, sortKey: sortKey,
+		keep: keptDeletes(tasks, groups)}, nil
+}
+
+// keptDeletes returns the delete files a rewrite of groups must leave in place:
+// every one attached to a data file no group rewrites. iceberg-go removes each
+// delete file attached to a file it rewrites and leaves it to the caller to keep
+// one that still applies to a file outside the rewrite. duckdb-iceberg 5edc45f0,
+// the DuckDB 1.5 line the base image builds, writes no referenced_data_file for a
+// v2 delete file, so iceberg-go attaches it to every data file of its partition, and a partition rewritten only in part would lose the deletes of the
+// files left in it. duckdb-iceberg's line for DuckDB 2.0 writes
+// referenced_data_file, which ties each delete file to the one data file it names.
+func keptDeletes(tasks []table.FileScanTask, groups []table.CompactionTaskGroup) map[string]bool {
+	rewritten := map[string]bool{}
+	for _, g := range groups {
+		for _, t := range g.Tasks {
+			rewritten[t.File.FilePath()] = true
+		}
+	}
+	kept := map[string]bool{}
+	for _, t := range tasks {
+		if rewritten[t.File.FilePath()] {
+			continue
+		}
+		for _, d := range t.DeleteFiles {
+			kept[d.FilePath()] = true
+		}
+	}
+	return kept
 }
 
 // rewrite executes the planned compaction as a single atomic rewrite snapshot
-// and commits it to the catalog.
+// and commits it to the catalog. Each group goes through iceberg-go's own group
+// executor, or through mergeGroup on a sorted table, and every delete file in
+// p.keep stays in the table.
+//
+// A sorted table merges each group on its sort column instead of concatenating
+// it. Concatenation preserves order only while a group's input ranges are
+// disjoint, which is true of a table built by one sorted pass and false as soon
+// as writes land clustered: a batch cold write orders its own rows, so each new
+// file spans the whole of key space and appending two of them interleaves two
+// sorted runs. The cost of that is a run count, and a probe reads at least one
+// row group per run, so bounding file count without merging the runs bounds the
+// wrong thing.
 //
 // MUST be called while the bakery claim for this table is held (see
 // withBakeryClaim): iceberg-go commits straight to Lakekeeper, so the held claim
 // is what serializes this against concurrent cold writers (no 409). Because
 // iceberg-go has no bakery-aware re-stamp patch, the claim is held across the
-// WHOLE read->rewrite->commit so the CAS parent is captured under the claim —
-// the stock-ordering discipline proved safe in docs/formal (Bakery.cfg).
+// WHOLE read->rewrite->commit so the commit's parent snapshot is captured under
+// the claim, the stock-ordering discipline proved safe in docs/formal
+// (Bakery.cfg).
 func rewrite(ctx context.Context, tbl *table.Table, p *planResult, targetSize int64) (*table.RewriteResult, error) {
-	if p.sorted {
-		return rewriteSorted(ctx, tbl, p.groups, p.sortKey, targetSize)
-	}
-	txn := tbl.NewTransaction()
-	opts := table.RewriteDataFilesOptions{}
+	var opts []table.CompactionGroupOption
 	if targetSize > 0 {
-		opts.GroupOptions = []table.CompactionGroupOption{table.WithCompactionTargetFileSize(targetSize)}
+		opts = append(opts, table.WithCompactionTargetFileSize(targetSize))
 	}
-	res, err := txn.RewriteDataFiles(ctx, p.groups, opts)
-	if err != nil {
-		return nil, fmt.Errorf("rewrite data files: %w", err)
-	}
-	if _, err := txn.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("commit rewrite: %w", err)
-	}
-	return res, nil
-}
-
-// rewriteSorted compacts a sorted table by merging each group on its sort column
-// instead of concatenating it, and stages every group on one rewrite snapshot.
-//
-// Concatenation preserves order only while a group's input ranges are disjoint,
-// which is true of a table built by one sorted pass and false as soon as writes
-// land clustered: a batch cold write orders its own rows, so each new file spans
-// the whole of key space and appending two of them interleaves two sorted runs.
-// The cost of that is a run count, and a probe reads at least one row group per
-// run, so bounding file count without merging the runs bounds the wrong thing.
-//
-// This drives the same two halves iceberg-go's own group executor drives, with a
-// sort between them, which is the seam its documentation points distributed
-// coordinators at. Reading through Scan.ReadTasks applies the position deletes a
-// cold UPDATE or DELETE left behind, and writing through WriteRecords produces
-// files with field ids, statistics and the table's row-group limit. Neither is
-// true of touching the Parquet directly.
-func rewriteSorted(ctx context.Context, tbl *table.Table, groups []table.CompactionTaskGroup,
-	field iceberg.NestedField, targetSize int64) (*table.RewriteResult, error) {
 	txn := tbl.NewTransaction()
 	rw := txn.NewRewrite(nil)
 	res := &table.RewriteResult{}
 
-	for _, g := range groups {
-		gr, err := mergeGroup(ctx, tbl, g, field, targetSize)
-		if err != nil {
-			return nil, err
+	for _, g := range p.groups {
+		var gr table.CompactionGroupResult
+		var err error
+		if p.sorted {
+			gr, err = mergeGroup(ctx, tbl, g, p.sortKey, targetSize)
+		} else {
+			gr, err = table.ExecuteCompactionGroup(ctx, tbl, g, opts...)
 		}
+		if err != nil {
+			return nil, fmt.Errorf("rewrite data files: %w", err)
+		}
+		gr.SafePosDeletes = slices.DeleteFunc(gr.SafePosDeletes, func(d iceberg.DataFile) bool {
+			return p.keep[d.FilePath()]
+		})
 		rw.ApplyResult(gr)
 		res.RewrittenGroups++
 		res.AddedDataFiles += len(gr.NewDataFiles)
@@ -190,9 +209,8 @@ func rewriteSorted(ctx context.Context, tbl *table.Table, groups []table.Compact
 		res.BytesBefore += gr.BytesBefore
 		res.BytesAfter += gr.BytesAfter
 	}
-
 	if err := rw.Commit(ctx); err != nil {
-		return nil, fmt.Errorf("stage sorted rewrite: %w", err)
+		return nil, fmt.Errorf("stage rewrite: %w", err)
 	}
 	if _, err := txn.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("commit rewrite: %w", err)
@@ -204,16 +222,31 @@ func rewriteSorted(ctx context.Context, tbl *table.Table, groups []table.Compact
 // writes the result back as new data files. A group is bin-packed to the
 // file-size target, so holding one is bounded by that target rather than by the
 // table.
+//
+// It drives the same two halves iceberg-go's own group executor drives, with a
+// sort between them, which is the interface its documentation points distributed
+// coordinators at. Reading through Scan.ReadTasks applies the position deletes a
+// cold UPDATE or DELETE left behind, and writing through WriteRecords produces
+// files with field ids, statistics and the table's row-group limit. Neither is
+// true of touching the Parquet directly.
 func mergeGroup(ctx context.Context, tbl *table.Table, group table.CompactionTaskGroup,
 	field iceberg.NestedField, targetSize int64) (table.CompactionGroupResult, error) {
 	var zero table.CompactionGroupResult
+	res := table.CompactionGroupResult{
+		PartitionKey:   group.PartitionKey,
+		SafePosDeletes: table.CollectSafePositionDeletes(group.Tasks),
+		BytesBefore:    group.TotalSizeBytes,
+	}
+	for _, t := range group.Tasks {
+		res.OldDataFiles = append(res.OldDataFiles, t.File)
+	}
 
 	unsorted, err := readGroupTable(ctx, tbl, group)
 	if err != nil {
 		return zero, err
 	}
 	if unsorted == nil {
-		return table.CompactionGroupResult{PartitionKey: group.PartitionKey}, nil
+		return res, nil // every row deleted: the files go and nothing replaces them
 	}
 	defer unsorted.Release()
 
@@ -223,23 +256,11 @@ func mergeGroup(ctx context.Context, tbl *table.Table, group table.CompactionTas
 	}
 	defer sorted.Release()
 
-	newFiles, bytesAfter, err := writeSorted(ctx, tbl, sorted, targetSize)
+	res.NewDataFiles, res.BytesAfter, err = writeSorted(ctx, tbl, sorted, targetSize)
 	if err != nil {
 		return zero, fmt.Errorf("write merged files for group %q: %w", group.PartitionKey, err)
 	}
-
-	oldFiles := make([]iceberg.DataFile, 0, len(group.Tasks))
-	for _, t := range group.Tasks {
-		oldFiles = append(oldFiles, t.File)
-	}
-	return table.CompactionGroupResult{
-		PartitionKey:   group.PartitionKey,
-		OldDataFiles:   oldFiles,
-		NewDataFiles:   newFiles,
-		SafePosDeletes: table.CollectSafePositionDeletes(group.Tasks),
-		BytesBefore:    group.TotalSizeBytes,
-		BytesAfter:     bytesAfter,
-	}, nil
+	return res, nil
 }
 
 // readGroupTable reads a group's tasks with their deletes applied into one Arrow

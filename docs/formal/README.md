@@ -294,18 +294,18 @@ The Go compactor (`cmd/compactor`, apache/iceberg-go) is a bakery claimant
 **indistinguishable from a cold writer at the protocol level**: it acquires a
 claim via `_claim_iceberg_lock` on the node it connects to, captures the parent
 snapshot under the held claim, issues one conditional commit POST to
-Lakekeeper - a *replace* (`RewriteDataFiles`: drop small data files, add the
-rewritten one), which has the same parent-snapshot conflict shape as the append
-modeled at `Decide` - then releases. The compactor adds no new protocol
+Lakekeeper - a *replace* (the iceberg-go rewrite: drop small data files, add
+the rewritten one), which has the same parent-snapshot conflict shape as the
+append modeled at `Decide` - then releases. The compactor adds no new protocol
 primitive, so it is covered by the existing proof as the **stock-ordering
 writer** (`AsyncParquet = FALSE`, `Bakery.cfg`). The compactor's two
 maintenance operations are the **same claimant**, so they need no new model:
 **`ExpireSnapshots`** issues another conditional commit (drop old snapshots -
-identical conflict shape) under the held claim, covered exactly like
-`RewriteDataFiles`; **`DeleteOrphanFiles`** holds the claim but makes **no
-Lakekeeper commit** (it only deletes unreferenced files), so it cannot cause a
-catalog conflict at all - strictly weaker than a committing claimant, hence
-trivially within `NoLakekeeperConflict`. All three reuse the existing
+identical conflict shape) under the held claim, covered exactly like the
+rewrite; **`DeleteOrphanFiles`** holds the claim but makes **no Lakekeeper
+commit** (it only deletes unreferenced files), so it cannot cause a catalog
+conflict at all - strictly weaker than a committing claimant, hence trivially
+within `NoLakekeeperConflict`. All three reuse the existing
 `coldfront._claim_iceberg_external` and are covered by the existing model and
 configs; no dedicated config is needed. (Lakekeeper itself does no Iceberg
 snapshot/orphan maintenance - it is a catalog - so this is the go-native path.)
@@ -447,9 +447,8 @@ Re-run the model after any change to the following:
 - The C-level XactCallback in `extension/coldfront/src/coldfront.c`
   (`coldfront_xact_callback`, `RegisterXactCallback` ordering).
 - The `cmd/compactor` bakery wrapper, meaning the claim/release that brackets
-  its iceberg-go `RewriteDataFiles` commit (the wrapper must stay
-  stock-ordering: claim held across read → rewrite → commit; no
-  async-parquet shortcut).
+  its iceberg-go rewrite commit (the wrapper must stay stock-ordering: claim
+  held across read → rewrite → commit; no async-parquet shortcut).
 
 If the protocol-level shape changes (e.g. swapping the bakery for a different
 coordination primitive), update the PlusCal source first, re-translate,

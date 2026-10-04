@@ -114,10 +114,9 @@ Docker image writes them on first start. The archiver, partitioner and
 compactor connect from the libpq environment or `--dsn` and read everything
 else from the server: each table's lifecycle in `coldfront.partition_config`,
 the cold-store credential in `coldfront.storage_secret` and the catalog
-settings above. A deployment YAML, modeled on
-[config.example.yaml](config.example.yaml), is written into the server once
-with `import`. For every setting, see the
-[One-Time Setup](docs/usage.md#one-time-setup) and
+settings above. The `import` command takes a deployment YAML, modeled on
+[config.example.yaml](config.example.yaml), and writes it into the server once.
+For every setting, see the [One-Time Setup](docs/usage.md#one-time-setup) and
 [Tuning Knobs](docs/usage.md#tuning-knobs) sections of the Using ColdFront
 guide.
 
@@ -146,11 +145,11 @@ INSERT INTO events VALUES (1, now(), 'hello');
 SELECT count(*) FROM events;
 ```
 
-A table that already exists in the Iceberg catalog is adopted rather than
-created: `coldfront.adopt_iceberg_table()` reads its schema from the catalog
-and gives it the same wrapper view and registry row, read-only unless writes
-are asked for. `coldfront.release_iceberg_table()` hands the table back with
-the Iceberg table untouched. See
+ColdFront can adopt a table that already exists in the Iceberg catalog rather
+than creating it: `coldfront.adopt_iceberg_table()` reads its schema from the
+catalog and gives it the same wrapper view and registry row, read-only unless
+you pass `p_writable => true`. `coldfront.release_iceberg_table()` hands the
+table back with the Iceberg table untouched. See
 [Adopting a Table That Already Exists in the Catalog](docs/usage.md#adopting-a-table-that-already-exists-in-the-catalog).
 
 To remove a table again, `coldfront.drop_iceberg_table()` unregisters it and

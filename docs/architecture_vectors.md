@@ -360,7 +360,7 @@ sorted regions accumulate, and a probe reads the matching row groups in each of
 them.
 
 **Compaction merges those regions rather than appending them.** A table with
-`coldfront.sort-key` is rewritten group by group through `rewriteSorted`
+`coldfront.sort-key` is rewritten group by group through `mergeGroup`
 (`cmd/compactor/compact.go`), which reads the group with `Scan.ReadTasks`,
 sorts it on the sort column, and writes it back with `WriteRecords`. Appending
 the files in key order, which is what the compactor did while the only

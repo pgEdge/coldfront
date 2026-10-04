@@ -2,11 +2,11 @@
 
 This document describes an alternate operating mode of the ColdFront project
 where a table lives entirely in Iceberg - no PG-native heap, no hot tier, no
-archiver. PostgreSQL becomes a stateless compute front-end; storage is owned by
-Lakekeeper + the underlying S3-compatible object store. Decoupled mode shares
-the same codebase, docker stack and extension as tiered mode. The shared
-mechanics - pg_duckdb Iceberg I/O, the rewrite hook, the bakery protocol, the
-registry - are in [architecture.md](architecture.md); tiered mode is in
+archiver. PostgreSQL becomes a stateless compute front-end. Lakekeeper and the
+underlying object store own the storage. Decoupled mode shares the same
+codebase, docker stack and extension as tiered mode. The shared mechanics -
+pg_duckdb Iceberg I/O, the rewrite hook, the bakery protocol, the registry -
+are in [architecture.md](architecture.md); tiered mode is in
 [architecture_tiered.md](architecture_tiered.md). This document covers what is
 specific to decoupled mode.
 

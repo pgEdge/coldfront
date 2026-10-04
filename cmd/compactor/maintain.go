@@ -24,12 +24,12 @@ func loadTable(ctx context.Context, cat *rest.Catalog, ns, name string) (*table.
 // current snapshot is always kept, and retainLast is a FLOOR, keep at least this many,
 // not a target). When deleteFiles is true (the default) it also deletes the manifests,
 // manifest lists, and data files that ONLY those expired snapshots referenced — which is
-// how the small Parquet files a prior RewriteDataFiles superseded are finally reclaimed
+// how the small Parquet files a prior compaction superseded are finally reclaimed
 // (they stay pinned by the pre-compaction snapshot until it is expired). When false (the
 // --expire-keep-files operator option, iceberg-go's WithPostCommit(false)), the metadata is
 // expired but the now-unreferenced files are left for a separate deleteOrphans pass. It is
 // an Iceberg commit guarded by AssertRefSnapshotID, so it MUST run while the bakery claim is
-// held: the same stock-ordering discipline RewriteDataFiles uses (docs/formal). In dryRun it
+// held: the same stock-ordering discipline the compaction rewrite uses (docs/formal). In dryRun it
 // stops at the staged metadata, which iceberg-go builds in memory and writes nowhere.
 // Returns the number of snapshots expired and the number kept, both counted from the
 // resulting metadata, so the table's own history.expire.* properties and the ref's

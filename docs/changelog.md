@@ -268,6 +268,12 @@ this project adheres to
   above the current one. The base image's fifth duckdb-iceberg patch, a port
   of upstream c1cfe2ef, numbers it above the highest schema id in the
   metadata.
+- A compaction removed the delete files of data files it left alone, so the
+  rows deleted from those files came back. iceberg-go removes every delete file
+  attached to a file it rewrites, and duckdb-iceberg on DuckDB 1.5 writes no
+  `referenced_data_file` for a delete file, so iceberg-go attaches each one to
+  every data file of its partition. The compactor keeps a delete file while any
+  data file it can apply to is left out of the rewrite.
 
 ## [1.0.0-beta2] - 2026-08-08
 

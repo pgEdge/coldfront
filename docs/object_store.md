@@ -225,12 +225,12 @@ curl -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
 !!! note "Why this step is required (decoupled mode)"
 
     `coldfront.create_iceberg_table()` (Section 5) runs `CREATE SCHEMA` and
-    `CREATE TABLE` in one transaction. The schema create is deferred to COMMIT
-    but the table-create POST is sent immediately, so against a namespace-less
-    warehouse it fails with HTTP 404. Pre-creating `public` makes the
-    in-transaction `CREATE SCHEMA IF NOT EXISTS` a no-op. (Tiered mode's
-    archiver creates the namespace itself, so this is only needed for the
-    decoupled demo below.)
+    `CREATE TABLE` in one transaction. duckdb-iceberg defers the schema create
+    to `COMMIT` but sends the table-create POST immediately, so against a
+    namespace-less warehouse it fails with HTTP 404. Pre-creating `public`
+    makes the in-transaction `CREATE SCHEMA IF NOT EXISTS` a no-op. (Tiered
+    mode's archiver creates the namespace itself, so this is only needed for
+    the decoupled demo below.)
 
 ---
 

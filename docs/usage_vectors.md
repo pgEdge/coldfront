@@ -29,7 +29,7 @@ SELECT coldfront.create_iceberg_table('public', 'chunks', '[
 ]'::jsonb);
 ```
 
-pgvector is installed for you the first time a table declares a vector column.
+ColdFront installs pgvector the first time a table declares a vector column.
 You do not need pgvector in a database that has none.
 
 A table that already exists in the catalog can be adopted instead, through
@@ -57,7 +57,7 @@ VALUES (now(), 'hello', '[0.1, 0.2, 0.3, …]'::vector);
 
 The value coerces to the column whether the row lands hot or cold, and an
 `UPDATE` that sets a new embedding works the same way. Nothing about writes
-changes when a table is clustered (below): assignments are maintained for you
+changes when a table is clustered (below): ColdFront maintains the assignments
 in the same statement as the write.
 
 ## Reading and Searching
@@ -80,8 +80,8 @@ SELECT id, body
 ```
 
 `<=>` (cosine), `<->` (Euclidean) and `<#>` (negative inner product) work on
-both tiers. Use `<=>` unless you have a reason not to; clustering is built on
-cosine.
+both tiers. Use `<=>` unless you have a reason not to. The clustering uses
+cosine distance.
 
 ### Three Rules for the Query Vector
 
@@ -291,9 +291,9 @@ SELECT table_name, rows_total, rows_unassigned, clusters_occupied,
 ```
 
 `probe_fraction` is the number to watch: the share of the cold rows a search
-reads on average. Lower is faster. `advice` is filled in only when something
-specific is holding that number up; the following table shows what each message
-means and what to do:
+reads on average. Lower is faster. `vector_status` fills in `advice` only when
+a specific cause keeps that number high. The following table shows what each
+message means and what to do:
 
 | What it says | What to do |
 |---|---|
@@ -355,7 +355,7 @@ policy choice: a Parquet file has one physical row order, and the clustering
 works by putting a cluster's rows next to each other so the reader can skip
 whole row groups. The first column in table order gets that order. A second
 column's clusters are scattered through it, so its row-group statistics cover
-most of the file and nothing gets skipped.
+most of the file and the reader skips no row groups.
 
 What a later column still gets is the filter. Its predicate cuts the rows that
 have to be *scored*, but not the rows that have to be *read*, and reading is
