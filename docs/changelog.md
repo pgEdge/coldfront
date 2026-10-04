@@ -73,6 +73,10 @@ this project adheres to
   `smallint[]` reads as `integer[]`. An adopted Iceberg table's list columns
   read as arrays. An array with more than one dimension, or a lower bound other
   than 1, is refused where it is written, since an Iceberg list holds neither.
+- An `ALTER TABLE` on a decoupled table's view adds, drops, renames or widens a
+  column of its Iceberg table, and the view follows, keeping its owner and
+  table-level grants. A vector column and a table adopted read-only are
+  refused.
 
 ### Changed
 
@@ -295,6 +299,15 @@ this project adheres to
   no infinity. The hot table now refuses it when it is written, and an archive
   pass refuses a table that already holds one, with an error that names the
   column's check constraint.
+- A column `ALTER TABLE` on a tiered table dropped every grant on its view and
+  left the view owned by whoever ran the `ALTER TABLE`, so an application role
+  lost access until `grant_app_access` ran again. The rebuilt view now keeps
+  the owner and table-level grants the view had.
+- A role with no access to schema `coldfront` could not read or write through
+  a view, or alter, rename, truncate or drop a table, even one of its own that
+  ColdFront does not manage: the hooks read the registry as that role, and the
+  statement failed with `permission denied for schema coldfront`. The hooks
+  now read it as the extension's owner.
 
 ## [1.0.0-beta2] - 2026-08-08
 

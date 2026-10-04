@@ -320,6 +320,34 @@ which enables the write hook on every peer. Each node also needs the one-time
 setup call `coldfront.ensure_replicated()` - see the one-time mesh setup
 below.
 
+### Changing a Decoupled Table's Columns
+
+An `ALTER TABLE` on the wrapper view adds, drops, renames or widens a column
+of the Iceberg table, and the view follows, with its owner and table-level
+grants kept; a column-level grant on the view is not kept. Only the view's
+owner can change its columns. The following statements change the columns of
+the table created above:
+
+```sql
+ALTER TABLE public.events ADD COLUMN qty integer;
+ALTER TABLE public.events ALTER COLUMN qty TYPE bigint;
+ALTER TABLE public.events RENAME COLUMN qty TO quantity;
+ALTER TABLE public.events DROP COLUMN quantity;
+```
+
+A column takes the same type map as at creation, though an array column cannot
+be added, because duckdb-iceberg does not add a nested column to an Iceberg
+table. A type change is limited to the widening Iceberg accepts: `integer` to
+`bigint`, `real` to `double precision`, `date` to `timestamp`, and a wider
+`numeric` precision. An added column takes a name and a type only: a default,
+a constraint, a collation, or a storage or compression option is refused, as
+is a `USING` or `COLLATE` clause on a type change, and a column change shares
+an `ALTER TABLE` only with other column changes. A vector column is neither
+added nor changed, a table adopted read-only refuses every column change, and
+an object built on the view, such as another view, makes a column change
+fail. In a mesh, the change runs on one node: the Iceberg table is shared, and
+the rebuilt view and registry row replicate.
+
 ### Adopting a Table That Already Exists in the Catalog
 
 A table another engine wrote needs no provisioning, only a wrapper view and a

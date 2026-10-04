@@ -103,6 +103,7 @@ notes:
 | SELECT (function-call form) | `SELECT … FROM iceberg_scan('ice.<ns>.<name>') r WHERE r['col'] = …` | Columns must use the `r['col']` accessor. In a fresh session, run `SELECT coldfront.ensure_attached();` first, or DuckDB treats the argument as a file path. |
 | SELECT (raw-query form) | `SELECT duckdb.raw_query('SELECT ... FROM ice.<ns>.<name> WHERE ...')` | The query returns a scalar or text result via pg_duckdb's NOTICE channel. |
 | ROLLBACK of writes | `BEGIN; raw_query(...); ROLLBACK;` | pg_duckdb's `XactCallback` ties the DuckDB and PG transactions together, so ROLLBACK undoes pending Iceberg writes. |
+| ALTER TABLE | `ALTER TABLE <view> ADD COLUMN <col> <type>`, `DROP COLUMN <col>`, `ALTER COLUMN <col> TYPE <type>` or `RENAME COLUMN <col> TO <new>` | The hook applies the change to the Iceberg table through the bakery and rebuilds the view from its own columns plus the change, keeping its owner and table-level grants; only the owner can make the change. A type change is limited to the widening duckdb-iceberg accepts, and an array column cannot be added. A vector column, a table adopted read-only, a default, constraint, collation, storage or compression option on an added column, a `USING` or `COLLATE` clause on a type change, and a subcommand other than a column change in the same statement are refused, and an object built on the view makes the change fail. |
 | DROP TABLE | `SELECT coldfront.drop_iceberg_table('<schema>', '<name>', <purge>)` | The function removes the wrapper view and every registration row, vector configuration included. A raw `DROP TABLE` through `duckdb.raw_query` drops only the catalog table and leaves those rows behind. |
 
 ### What Does Not Work
@@ -708,6 +709,9 @@ pointing at the same Lakekeeper endpoint and S3 bucket:
   `coldfront.tiered_views` registry row (see
   [Distributed Setup](usage.md#distributed-setup-3-node-mesh-decoupled-mode)),
   so one node provisions the table and replication enables every peer's hook.
+  A column `ALTER TABLE` reaches the peers the same way: the node that runs it
+  changes the shared Iceberg table, and its rebuilt view and registry row
+  replicate.
 
 ### Throughput Characterization
 

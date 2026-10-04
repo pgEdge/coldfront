@@ -2778,6 +2778,38 @@ LANGUAGE sql IMMUTABLE STRICT AS $$
     FROM (SELECT lower(trim(p_pg_type))) AS s(t);
 $$;
 
+-- The type a decoupled table's view casts a column to: its surface type where
+-- the storage type is not one PG parses (json, bytea, real[]), else the storage
+-- type itself. create_iceberg_table and the view rebuild after an ALTER TABLE
+-- project a column with it.
+CREATE FUNCTION coldfront._iceberg_view_cast(p_pg_type text, p_column text)
+RETURNS text
+LANGUAGE sql IMMUTABLE STRICT AS $$
+    SELECT COALESCE(NULLIF(coldfront._iceberg_view_cast_type(p_pg_type), ''),
+                    coldfront._iceberg_storage_type(p_pg_type, p_column));
+$$;
+
+-- The statements that give a view back its owner and grants once it has been
+-- dropped and created again: the view a rebuild creates belongs to whoever ran
+-- the ALTER TABLE and has no grants. The owner's own entry is implied by
+-- ownership and is left out.
+CREATE FUNCTION coldfront._view_acl_sql(p_view regclass)
+RETURNS text
+LANGUAGE sql STABLE STRICT AS $$
+    SELECT format('ALTER VIEW %I.%I OWNER TO %I;', n.nspname, c.relname, pg_get_userbyid(c.relowner))
+           || coalesce(string_agg(format(' GRANT %s ON %I.%I TO %s%s;', a.privilege_type, n.nspname, c.relname,
+                                         CASE WHEN a.grantee = 0 THEN 'PUBLIC'
+                                              ELSE quote_ident(pg_get_userbyid(a.grantee)) END,
+                                         CASE WHEN a.is_grantable THEN ' WITH GRANT OPTION' ELSE '' END),
+                                  '' ORDER BY a.grantee, a.privilege_type)
+                       FILTER (WHERE a.grantee IS NOT NULL), '')
+      FROM pg_class c
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+      LEFT JOIN LATERAL aclexplode(c.relacl) AS a ON a.grantee <> c.relowner
+     WHERE c.oid = p_view
+     GROUP BY n.nspname, c.relname, c.relowner;
+$$;
+
 -- ============================================================================
 -- The hot table's guards: a CHECK on each column of a tiered table's hot table
 -- whose type admits a value the cold tier cannot hold unchanged, so the value is
@@ -3364,12 +3396,9 @@ BEGIN
         n := n + 1;
 
         iceberg_cols := iceberg_cols || quote_ident(col_name) || ' ' || storage_type;
-        -- The view casts to the surface type where the storage type is not one
-        -- PG parses (json, bytea, real[]), else to the storage type itself.
         v_view_cols := v_view_cols || jsonb_build_object(
                            'name', col_name,
-                           'cast', COALESCE(NULLIF(coldfront._iceberg_view_cast_type(pg_type), ''),
-                                            storage_type));
+                           'cast', coldfront._iceberg_view_cast(pg_type, col_name));
     END LOOP;
 
     v_part := coldfront._partition_clause(p_columns, p_partition_cols);
@@ -4426,9 +4455,9 @@ $$;
 -- column-shape change, so the view's column set follows the hot heap.)
 --
 -- Called by the coldfront DDL hook for tiered views (rows with a non-NULL
--- hot_table). Iceberg-only views (is_iceberg_only = true, hot_table NULL) are
--- OUT OF SCOPE and short-circuit to a no-op: their column shape is owned by
--- create_iceberg_table(), not by a PG hot heap.
+-- hot_table). An iceberg-only view (is_iceberg_only = true, hot_table NULL) has
+-- no hot heap and short-circuits to a no-op here; _rebuild_iceberg_view
+-- rebuilds it after a column change.
 --
 -- View strategy: DROP VIEW IF EXISTS ... CASCADE then CREATE VIEW (never
 -- CREATE OR REPLACE). PG only lets CREATE OR REPLACE VIEW append columns at
@@ -4436,10 +4465,13 @@ $$;
 -- DROP changes the view OID, but the registry is keyed by (schema, relname),
 -- which the DROP+CREATE leaves unchanged, so there is no row to re-point. On a
 -- VIEW rename the hook migrates the registry key (old→new name) BEFORE calling
--- this, so p_view_name is always the current (post-rename) view name.
+-- this, so p_view_name is always the current (post-rename) view name. The new
+-- view gets back the owner and grants of the one it replaces, or p_acl when the
+-- hook dropped the view before calling this (_view_acl_sql).
 CREATE FUNCTION coldfront._rebuild_tiered_view(
     p_schema     text,
-    p_view_name  text
+    p_view_name  text,
+    p_acl        text DEFAULT NULL
 )
 RETURNS void
 LANGUAGE plpgsql
@@ -4460,6 +4492,8 @@ DECLARE
     v_hot_proj      text := '';     -- hot SELECT list
     v_cold_proj     text := '';     -- cold SELECT list
     v_view_sql      text;
+    v_acl           text := coalesce(p_acl, coldfront._view_acl_sql(
+                                to_regclass(format('%I.%I', p_schema, p_view_name))));
 
     r               record;
     n               int := 0;       -- live-column counter for projections
@@ -4580,6 +4614,9 @@ $ddl$CREATE VIEW %I.%I AS
 
     EXECUTE format('DROP VIEW IF EXISTS %I.%I CASCADE', v_schema, v_view_name);
     EXECUTE v_view_sql;
+    IF v_acl IS NOT NULL THEN
+        EXECUTE v_acl;
+    END IF;
 
     -- 5. The registry key (schema, relname) is unchanged by the DROP+CREATE
     --    above (the view name is stable), so there is nothing to re-point. The
@@ -4614,6 +4651,11 @@ $$;
 -- On a Spock apply worker (session_replication_role = replica) the SHARED Iceberg
 -- table was already evolved by the originator, so this is a NO-OP; the caller
 -- still rebuilds the per-node view.
+--
+-- p_hot_table NULL is a decoupled table, which PostgreSQL holds no columns of:
+-- each add and type action carries the declared type instead, and a table
+-- adopted read-only and a vector column, whose cluster columns the view does not
+-- show, are refused.
 CREATE FUNCTION coldfront._mirror_iceberg_alter(
     p_iceberg_table text,
     p_hot_table     text,
@@ -4623,12 +4665,31 @@ LANGUAGE plpgsql AS $$
 DECLARE
     v_hot_schema  text := (parse_ident(p_hot_table))[1];
     v_hot_relname text := (parse_ident(p_hot_table))[2];
+    v_reg         record;
     act           jsonb;
     op            text;
     col           text;
     pg_type       text;
     ddl           text := '';
 BEGIN
+    IF p_hot_table IS NULL THEN
+        SELECT schema_name, relname, is_writable, coalesce(vec_columns, '{}') AS vec_columns
+          INTO v_reg
+          FROM coldfront.tiered_views WHERE iceberg_table = p_iceberg_table AND is_iceberg_only;
+        IF NOT v_reg.is_writable THEN
+            RAISE EXCEPTION 'coldfront: "%.%" is adopted read-only', v_reg.schema_name, v_reg.relname
+                USING HINT = 'Release it with coldfront.release_iceberg_table() and adopt again with p_writable => true to change its columns.';
+        END IF;
+        SELECT a.act->>'col' INTO col FROM jsonb_array_elements(p_actions) AS a(act)
+         WHERE a.act->>'col' = ANY (v_reg.vec_columns)
+            OR coldfront._is_vector_type(coalesce(a.act->>'type', ''))
+         LIMIT 1;
+        IF FOUND THEN
+            RAISE EXCEPTION 'coldfront: column "%" of "%.%" is a vector column, which ALTER TABLE does not add or change on a decoupled table',
+                col, v_reg.schema_name, v_reg.relname;
+        END IF;
+    END IF;
+
     -- Apply worker: the shared catalog was already evolved by the originator.
     IF current_setting('session_replication_role') = 'replica' THEN
         RETURN;
@@ -4641,17 +4702,22 @@ BEGIN
 
         IF op IN ('add', 'type') THEN
             -- Post-ALTER column type from the hot heap (the same pg_catalog
-            -- lookup _rebuild_tiered_view uses), mapped to its Iceberg storage
-            -- type. _iceberg_storage_type RAISES for any unsupported PG type,
-            -- which rolls the whole ALTER back atomically (hot tier included).
-            SELECT format_type(a.atttypid, a.atttypmod) INTO pg_type
-            FROM pg_attribute a
-            JOIN pg_class c      ON c.oid = a.attrelid
-            JOIN pg_namespace nn ON nn.oid = c.relnamespace
-            WHERE nn.nspname = v_hot_schema AND c.relname = v_hot_relname
-              AND a.attname = col AND a.attnum > 0 AND NOT a.attisdropped;
-            IF pg_type IS NULL THEN
-                RAISE EXCEPTION 'coldfront: column "%" not found on hot table % after ALTER', col, p_hot_table;
+            -- lookup _rebuild_tiered_view uses), or the declared one for a
+            -- decoupled table, mapped to its Iceberg storage type.
+            -- _iceberg_storage_type RAISES for any unsupported PG type, which
+            -- rolls the whole ALTER back atomically (hot tier included).
+            IF p_hot_table IS NULL THEN
+                pg_type := act->>'type';
+            ELSE
+                SELECT format_type(a.atttypid, a.atttypmod) INTO pg_type
+                FROM pg_attribute a
+                JOIN pg_class c      ON c.oid = a.attrelid
+                JOIN pg_namespace nn ON nn.oid = c.relnamespace
+                WHERE nn.nspname = v_hot_schema AND c.relname = v_hot_relname
+                  AND a.attname = col AND a.attnum > 0 AND NOT a.attisdropped;
+                IF pg_type IS NULL THEN
+                    RAISE EXCEPTION 'coldfront: column "%" not found on hot table % after ALTER', col, p_hot_table;
+                END IF;
             END IF;
             IF op = 'add' THEN
                 ddl := ddl || format('ALTER TABLE %s ADD COLUMN IF NOT EXISTS %I %s',
@@ -4682,6 +4748,58 @@ BEGIN
     -- the INSERT trigger ensure_attached() before their duckdb.raw_query likewise.
     PERFORM coldfront.ensure_attached();
     PERFORM coldfront._exec_iceberg_with_claim(p_iceberg_table, ddl);
+END;
+$$;
+
+-- coldfront._rebuild_iceberg_view: the decoupled counterpart of
+-- _rebuild_tiered_view, run after _mirror_iceberg_alter has changed the Iceberg
+-- table. A decoupled table has no hot heap to read its columns from, so the new
+-- column list is the view's own columns, each with the type the view casts it
+-- to, changed by p_actions as _mirror_iceberg_alter takes them; an added or
+-- retyped column gets the cast create_iceberg_table gives it. The view is
+-- dropped and created from that list by _register_iceberg_view, as
+-- create_iceberg_table creates it, and gets back its owner and grants. The
+-- registry row is removed before the drop and restored by
+-- _register_iceberg_view, so a Spock peer applying the replicated DROP VIEW
+-- finds no registered view to protect (spi_exec_ddl in coldfront.c). The drop
+-- has no CASCADE: an object built on the view refuses the ALTER TABLE.
+CREATE FUNCTION coldfront._rebuild_iceberg_view(p_schema text, p_relname text, p_actions jsonb)
+RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_view regclass := format('%I.%I', p_schema, p_relname)::regclass;
+    v_acl  text     := coldfront._view_acl_sql(v_view);
+    v_reg  coldfront.tiered_views;
+    v_cols jsonb;
+    act    jsonb;
+BEGIN
+    SELECT * INTO v_reg FROM coldfront.tiered_views
+     WHERE schema_name = p_schema AND relname = p_relname;
+    SELECT jsonb_agg(jsonb_build_object('name', a.attname, 'cast', format_type(a.atttypid, a.atttypmod))
+                     ORDER BY a.attnum)
+      INTO v_cols
+      FROM pg_attribute a WHERE a.attrelid = v_view AND a.attnum > 0 AND NOT a.attisdropped;
+    FOR act IN SELECT * FROM jsonb_array_elements(p_actions) LOOP
+        IF act->>'op' = 'add' THEN
+            v_cols := v_cols || jsonb_build_array(jsonb_build_object(
+                'name', act->>'col', 'cast', coldfront._iceberg_view_cast(act->>'type', act->>'col')));
+        ELSE
+            SELECT coalesce(jsonb_agg(CASE
+                       WHEN c->>'name' <> act->>'col' THEN c
+                       WHEN act->>'op' = 'rename' THEN jsonb_build_object('name', act->>'newcol', 'cast', c->>'cast')
+                       ELSE jsonb_build_object('name', c->>'name',
+                                               'cast', coldfront._iceberg_view_cast(act->>'type', c->>'name'))
+                   END ORDER BY o) FILTER (WHERE act->>'op' <> 'drop' OR c->>'name' <> act->>'col'), '[]')
+              INTO v_cols
+              FROM jsonb_array_elements(v_cols) WITH ORDINALITY AS u(c, o);
+        END IF;
+    END LOOP;
+
+    DELETE FROM coldfront.tiered_views WHERE schema_name = p_schema AND relname = p_relname;
+    EXECUTE format('DROP VIEW %I.%I', p_schema, p_relname);
+    PERFORM coldfront._register_iceberg_view(p_schema, p_relname, v_reg.iceberg_table, v_cols,
+                                             coalesce(v_reg.vec_columns, '{}'), v_reg.is_writable);
+    EXECUTE v_acl;
 END;
 $$;
 

@@ -15,3 +15,24 @@ SELECT val FROM base_tbl WHERE id = 1;
 
 DROP VIEW plain_view;
 DROP TABLE base_tbl;
+-- A role with no access to schema coldfront reads and writes through a view of
+-- its own: the hooks read the registry as the extension's owner.
+CREATE ROLE dml_plain_owner;
+GRANT CREATE ON SCHEMA public TO dml_plain_owner;
+SET ROLE dml_plain_owner;
+CREATE TABLE public.own_tbl (id int, val text);
+CREATE VIEW public.own_view AS SELECT * FROM public.own_tbl;
+INSERT INTO public.own_view VALUES (1, 'a'), (2, 'b');
+UPDATE public.own_view SET val = 'c' WHERE id = 2;
+DELETE FROM public.own_view WHERE id = 1;
+SELECT * FROM public.own_view;
+ id | val 
+----+-----
+  2 | c
+(1 row)
+
+DROP VIEW public.own_view;
+DROP TABLE public.own_tbl;
+RESET ROLE;
+REVOKE CREATE ON SCHEMA public FROM dml_plain_owner;
+DROP ROLE dml_plain_owner;

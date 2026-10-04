@@ -379,14 +379,17 @@ for the build.
 ### Transparent DDL via coldfront
 
 A `ProcessUtility_hook` in the coldfront extension intercepts DDL that targets
-a registered tiered table's hot heap (matched by resolving the DDL target
-relation to an OID and comparing against the OID of the registry's
-`hot_table` - never by string, so it is schema-agnostic), as the following
-table summarizes:
+a registered tiered table's hot heap or a decoupled table's wrapper view. A
+hot heap is matched by resolving the DDL target relation to an OID and
+comparing it with the OID of the registry's `hot_table` - never by string, so
+it is schema-agnostic - and a view by its schema and name, the registry's key.
+A view the hook rebuilds keeps the owner and the table-level grants the view
+had. The following table summarizes the DDL it handles:
 
 | DDL | Behavior |
 |---|---|
 | `ALTER TABLE _t ADD/DROP COLUMN`, `ALTER COLUMN ... TYPE`, `RENAME COLUMN` | The DDL is mirrored to Iceberg: the hook drops the view (except for RENAME COLUMN), runs the hot-side change, then `coldfront._mirror_iceberg_alter` issues the matching Iceberg `ALTER` (one bakery-serialized, claim-first catalog change) and rebuilds the view, so both tiers evolve in one statement. Renaming a column of the view itself is rejected. Column types map through `coldfront._iceberg_storage_type`, so an unsupported type (e.g. `inet`) is rejected up front; `ALTER COLUMN TYPE` is limited to the safe promotions duckdb-iceberg accepts (int to bigint, float to double, date to timestamp, and decimal widening). |
+| `ALTER TABLE v ADD/DROP COLUMN`, `ALTER COLUMN ... TYPE`, `RENAME COLUMN` on a decoupled table | PostgreSQL runs none of the statement: it cannot add, drop or retype a view's column, and a rename has to reach the Iceberg table too. After the owner check, `coldfront._mirror_iceberg_alter` issues the Iceberg `ALTER` with the declared type, then `coldfront._rebuild_iceberg_view` rebuilds the view from its own columns plus the change. The type map and the promotions are the tiered row's. A vector column, a table adopted read-only, a default, constraint, collation, storage or compression option on an added column, a `USING` or `COLLATE` clause on a type change, and a subcommand other than a column change in the same statement are refused, and an object built on the view makes the change fail. |
 | `ALTER TABLE _t RENAME TO ...` | The rename is supported because it touches no Iceberg schema: the hook updates `tiered_views.hot_table` and rebuilds the view. |
 | `ALTER VIEW v RENAME TO ...` | The rename is supported: the hook migrates the name-keyed registry and `archive_watermark` rows to the new view name, then rebuilds the view (otherwise the lookups miss and the cold UNION branch silently disappears). |
 | `DROP TABLE _t` / `DROP VIEW v` | The statement is blocked by design, because it would orphan the Iceberg cold tier. Dismantling tiering is a deliberate operator action, never a side effect of a habitual statement: call `coldfront.drop_iceberg_table(schema, table, purge)`, which unregisters the table, drops the view, renames the hot table back, and drops the cold tier, deleting its objects only if `purge` says so. |

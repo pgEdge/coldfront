@@ -366,6 +366,86 @@ story_provision_decoupled() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# Story: TC-252..TC-257, column changes on a decoupled table. The DDL hook
+# applies each to the Iceberg table through the bakery and rebuilds the wrapper
+# view from its current columns plus the change, keeping its grants and owner.
+# What an Iceberg column cannot take, a vector column and a read-only table are
+# refused, and a refusal leaves both sides as they were.
+# ───────────────────────────────────────────────────────────────────────────
+story_decoupled_alter() {
+    step "TC-252..TC-257: ALTER TABLE changes a decoupled table's columns on both sides"
+    local desc="SELECT coldfront.ensure_attached(); SELECT string_agg(r['column_name']::text || ' ' || r['column_type']::text, ', ') FROM duckdb.query('DESCRIBE ice.public.tcalt') AS t(r);"
+    local view="SELECT string_agg(attname || ' ' || format_type(atttypid, atttypmod), ', ' ORDER BY attnum) FROM pg_attribute WHERE attrelid = 'public.tcalt'::regclass AND attnum > 0;"
+    local owner before
+    _tcalt_cleanup() {
+        local t
+        for t in tcalt tcalt_vec; do q "$HOST" "SELECT coldfront.drop_iceberg_table('public','$t', true);" >/dev/null 2>&1; done
+        q "$HOST" "SELECT coldfront.release_iceberg_table('public','tcalt_ro');" >/dev/null 2>&1
+        q "$HOST" "SELECT coldfront.ensure_attached(); SELECT duckdb.raw_query('DROP TABLE IF EXISTS ice.tcaltns.tcalt_ro');" >/dev/null 2>&1
+        q "$HOST" "DROP ROLE IF EXISTS tcalt_reader;" >/dev/null 2>&1
+    }
+    trap _tcalt_cleanup RETURN
+    q "$HOST" "SELECT coldfront.create_iceberg_table('public','tcalt','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"qty\",\"type\":\"integer\"},{\"name\":\"amount\",\"type\":\"numeric(10,2)\"},{\"name\":\"doc\",\"type\":\"jsonb\"},{\"name\":\"r\",\"type\":\"real\"},{\"name\":\"d\",\"type\":\"date\"}]'::jsonb);" >/dev/null
+    q "$HOST" "INSERT INTO public.tcalt VALUES (1, 2, 1.25, '{\"a\": 1}', 1.5, '2026-01-02');" >/dev/null
+    q "$HOST" "CREATE ROLE tcalt_reader; GRANT SELECT, INSERT ON public.tcalt TO tcalt_reader;" >/dev/null
+    owner=$(q "$HOST" "SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'public.tcalt'::regclass;")
+    # TC-252: ADD COLUMN.
+    assert_contains "TC-252: ADD COLUMN runs on a decoupled table" "ALTER TABLE" \
+        "$(q_may "$HOST" "ALTER TABLE public.tcalt ADD COLUMN note text;")"
+    assert_contains "TC-252: the Iceberg table has the column" "note VARCHAR" "$(q "$HOST" "$desc" | tail -1)"
+    q "$HOST" "INSERT INTO public.tcalt (id, note) VALUES (2, 'hello');" >/dev/null
+    assert_eq "TC-252: the view reads it, NULL in the rows written before it" "$(printf '1|\n2|hello')" \
+        "$(q "$HOST" "SELECT id, note FROM public.tcalt ORDER BY id;")"
+    # TC-253: RENAME COLUMN.
+    assert_contains "TC-253: RENAME COLUMN runs on a decoupled table" "ALTER TABLE" \
+        "$(q_may "$HOST" "ALTER TABLE public.tcalt RENAME COLUMN note TO memo;")"
+    assert_contains "TC-253: the Iceberg column has the new name" "memo VARCHAR" "$(q "$HOST" "$desc" | tail -1)"
+    assert_eq "TC-253: the view reads the values under it" "hello" "$(q "$HOST" "SELECT memo FROM public.tcalt WHERE id = 2;")"
+    # TC-254: ALTER COLUMN ... TYPE, the widening Iceberg accepts.
+    assert_contains "TC-254: integer widens to bigint" "ALTER TABLE" \
+        "$(q_may "$HOST" "ALTER TABLE public.tcalt ALTER COLUMN qty TYPE bigint;")"
+    assert_contains "TC-254: numeric(10,2) widens to numeric(12,2)" "ALTER TABLE" \
+        "$(q_may "$HOST" "ALTER TABLE public.tcalt ALTER COLUMN amount TYPE numeric(12,2);")"
+    assert_contains "TC-254: real widens to double precision" "ALTER TABLE" \
+        "$(q_may "$HOST" "ALTER TABLE public.tcalt ALTER COLUMN r TYPE double precision;")"
+    assert_contains "TC-254: date widens to timestamp" "ALTER TABLE" \
+        "$(q_may "$HOST" "ALTER TABLE public.tcalt ALTER COLUMN d TYPE timestamp;")"
+    assert_contains "TC-254: the Iceberg columns are wider" "qty BIGINT, amount DECIMAL(12,2), doc VARCHAR, r DOUBLE, d TIMESTAMP" "$(q "$HOST" "$desc" | tail -1)"
+    q "$HOST" "INSERT INTO public.tcalt (id, qty, amount) VALUES (3, 9000000000, 1234567890.12);" >/dev/null
+    assert_eq "TC-254: the view keeps the old values and takes values only the wider types hold" "$(printf '1|2|1.25|1.5|2026-01-02 00:00:00\n3|9000000000|1234567890.12||')" \
+        "$(q "$HOST" "SELECT id, qty, amount, r, d FROM public.tcalt WHERE id IN (1, 3) ORDER BY id;")"
+    # TC-255: DROP COLUMN.
+    assert_contains "TC-255: DROP COLUMN runs on a decoupled table" "ALTER TABLE" \
+        "$(q_may "$HOST" "ALTER TABLE public.tcalt DROP COLUMN memo;")"
+    assert_eq "TC-255: neither side has the column" "id bigint, qty bigint, amount numeric(12,2), doc json, r double precision, d timestamp without time zone|id BIGINT, qty BIGINT, amount DECIMAL(12,2), doc VARCHAR, r DOUBLE, d TIMESTAMP" \
+        "$(q "$HOST" "$view")|$(q "$HOST" "$desc" | tail -1)"
+    assert_eq "TC-255: the view reads every row" "3" "$(q "$HOST" "SELECT count(*) FROM public.tcalt;")"
+    # TC-256: the rebuilt view keeps its grants and its owner.
+    assert_eq "TC-256: the view keeps its grants and owner" "true|true|$owner" \
+        "$(q "$HOST" "SELECT has_table_privilege('tcalt_reader', 'public.tcalt', 'SELECT')::text || '|' || has_table_privilege('tcalt_reader', 'public.tcalt', 'INSERT')::text || '|' || pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'public.tcalt'::regclass;")"
+    # TC-257: what is refused, and that a refusal changes neither side.
+    before="$(q "$HOST" "$view")|$(q "$HOST" "$desc" | tail -1)"
+    assert_err "TC-257: a type with no Iceberg mapping is refused, naming the column" 'column "ip": PG type inet' \
+        "$(q_may "$HOST" "ALTER TABLE public.tcalt ADD COLUMN ip inet;")"
+    assert_err "TC-257: an array column is refused by duckdb-iceberg" "ADD COLUMN for Nested Types not supported" \
+        "$(q_may "$HOST" "ALTER TABLE public.tcalt ADD COLUMN tags integer[];")"
+    assert_err "TC-257: a narrowing type change is refused" "can't be altered to type 'INTEGER'" \
+        "$(q_may "$HOST" "ALTER TABLE public.tcalt ALTER COLUMN qty TYPE integer;")"
+    assert_err "TC-257: a default is refused" "takes a name and a type" \
+        "$(q_may "$HOST" "ALTER TABLE public.tcalt ADD COLUMN fee numeric(10,2) DEFAULT 0;")"
+    q "$HOST" "SELECT coldfront.create_iceberg_table('public','tcalt_vec','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"emb\",\"type\":\"vector(3)\"}]'::jsonb);" >/dev/null
+    assert_err "TC-257: a vector column is not added" "vector column" \
+        "$(q_may "$HOST" "ALTER TABLE public.tcalt_vec ADD COLUMN emb2 vector(3);")"
+    assert_err "TC-257: nor dropped" "vector column" \
+        "$(q_may "$HOST" "ALTER TABLE public.tcalt_vec DROP COLUMN emb;")"
+    adopt_fixture tcaltns tcalt_ro '(id BIGINT)'
+    q "$HOST" "SELECT coldfront.adopt_iceberg_table('public','tcalt_ro','tcaltns');" >/dev/null
+    assert_err "TC-257: a read-only table refuses a column change" "is adopted read-only" \
+        "$(q_may "$HOST" "ALTER TABLE public.tcalt_ro ADD COLUMN note text;")"
+    assert_eq "TC-257: the refusals changed neither side" "$before" "$(q "$HOST" "$view")|$(q "$HOST" "$desc" | tail -1)"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Decoupled CRUD — every DML on the wrapper view is rewritten by the C hook to
 # a single duckdb.raw_query against Iceberg. Covers the INSERT shapes, jsonb
 # surfacing, UPDATE, DELETE.
@@ -2494,6 +2574,11 @@ story_ddl() {
     local cutoff="date_trunc('month',now()) - interval '2 months'"   # m2 boundary
     local cols="SELECT coalesce(string_agg(table_name || '.' || column_name || ':' || data_type, ',' ORDER BY table_name), '') FROM information_schema.columns WHERE table_schema='public' AND table_name IN ('_events','events') AND column_name IN ('cnt','ctr');"
     local exc=""; [ "$MESH" = 1 ] && exc=$(peer_exceptions)
+    # TC-259: the view keeps its grants and owner through every column change.
+    local acl="SELECT has_table_privilege('tcddl_reader', 'public.events', 'SELECT')::text || '|' || has_table_privilege('tcddl_reader', 'public.events', 'INSERT')::text || '|' || pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'public.events'::regclass;"
+    local owner
+    q "$HOST" "CREATE ROLE tcddl_reader; GRANT SELECT, INSERT ON events TO tcddl_reader;" >/dev/null
+    owner=$(q "$HOST" "SELECT pg_get_userbyid(relowner) FROM pg_class WHERE oid = 'public.events'::regclass;")
 
     # ADD COLUMN → mirrored; the cold UNION branch now projects it.
     q "$HOST" "ALTER TABLE _events ADD COLUMN cnt integer;" >/dev/null
@@ -2547,6 +2632,9 @@ story_ddl() {
     pass "view renamed back to events"
     assert_peers_agree "TC-198: the rename back reached every peer's view and registry" "$reg"
     [ "$MESH" = 1 ] && assert_eq "TC-198: no peer logged an apply exception for the view renames" "$exc" "$(peer_exceptions)"
+    assert_eq "TC-259: the view kept its grants and owner through every column change and rename" "true|true|$owner" "$(q "$HOST" "$acl")"
+    assert_peers_agree "TC-259: and so did every peer's view" "$acl"
+    q "$HOST" "REVOKE ALL ON events FROM tcddl_reader; DROP ROLE tcddl_reader;" >/dev/null
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -3420,6 +3508,30 @@ story_mesh() {
         "$(cat $TMPD/ra.* 2>/dev/null | grep -cEi 'error|conflict|409')"
     assert_eq "concurrent cross-node cold writers both landed (R-A bakery, no 409)" "2" "$(q "$HOST" "SELECT count(*) FROM iceonly WHERE status='ra';")"
     rm -f $TMPD/ra.* 2>/dev/null
+
+    # TC-258: a column change on one node reaches every peer's view, which the
+    # Iceberg table, shared through the catalog, already reflects.
+    local exc col="SELECT coalesce(string_agg(attname, ','), '') FROM pg_attribute WHERE attrelid = 'public.iceonly'::regclass AND attname LIKE 'tc258%';"
+    local reg="SELECT is_iceberg_only::text || '|' || iceberg_table FROM coldfront.tiered_views WHERE schema_name = 'public' AND relname = 'iceonly';"
+    exc=$(peer_exceptions)
+    assert_contains "TC-258: ADD COLUMN on a decoupled table" "ALTER TABLE" \
+        "$(q_may "$HOST" "ALTER TABLE iceonly ADD COLUMN tc258 text;")"
+    assert_eq "TC-258: db1's view has the column" "tc258" "$(q "$HOST" "$col")"
+    assert_peers_agree "TC-258: every peer's view has the column" "$col"
+    q "$HOST" "INSERT INTO iceonly (id, ts, status, data, tc258) VALUES (2580, date_trunc('month',now()) + interval '2 months' + interval '3 days', 'tc258', '{}', 'x');" >/dev/null
+    assert_peers_agree "TC-258: and reads a value written on db1" "SELECT tc258 FROM iceonly WHERE id = 2580;"
+    assert_contains "TC-258: RENAME COLUMN on a decoupled table" "ALTER TABLE" \
+        "$(q_may "$HOST" "ALTER TABLE iceonly RENAME COLUMN tc258 TO tc258b;")"
+    assert_eq "TC-258: db1's view has the new name" "tc258b" "$(q "$HOST" "$col")"
+    assert_peers_agree "TC-258: the rename reached every peer's view" "$col"
+    assert_peers_agree "TC-258: and every peer reads the value under it" "SELECT tc258b FROM iceonly WHERE id = 2580;"
+    assert_peers_agree "TC-258: every peer's registry row survived the rebuilds" "$reg"
+    q "$HOST" "DELETE FROM iceonly WHERE id = 2580;" >/dev/null
+    assert_contains "TC-258: DROP COLUMN on a decoupled table" "ALTER TABLE" \
+        "$(q_may "$HOST" "ALTER TABLE iceonly DROP COLUMN tc258b;")"
+    assert_eq "TC-258: db1's view has lost the column" "" "$(q "$HOST" "$col")"
+    assert_peers_agree "TC-258: the DROP COLUMN reached every peer's view" "$col"
+    assert_eq "TC-258: no peer logged an apply exception for the column changes" "$exc" "$(peer_exceptions)"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -7540,6 +7652,7 @@ if [ "$MODE" = "tiered" ]; then
 else
     story_provision_decoupled
     story_decoupled_crud
+    story_decoupled_alter       # TC-252..TC-257: ALTER TABLE on a decoupled table, both sides
     story_decoupled_plpgsql
     story_decoupled_concurrency
     story_decoupled_ryw

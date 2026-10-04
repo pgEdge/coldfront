@@ -26,6 +26,12 @@ CREATE VIEW public.events AS SELECT * FROM public._events;
 INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
 VALUES ('public', 'events', 'public._events', 'ice.default.events', 'ts');
 
+-- The rebuilt view keeps the grants and the owner the view had.
+CREATE ROLE ddl_alter_reader;
+CREATE ROLE ddl_alter_owner;
+GRANT SELECT, INSERT ON public.events TO ddl_alter_reader;
+ALTER VIEW public.events OWNER TO ddl_alter_owner;
+
 -- 1. Unsupported column type is rejected up front (originator path), before any
 --    Iceberg I/O; the hot ALTER rolls back with it, so _events is unchanged.
 ALTER TABLE public._events ADD COLUMN bad inet;
@@ -52,6 +58,11 @@ SELECT attname FROM pg_attribute
 
 SET session_replication_role = DEFAULT;
 
+SELECT has_table_privilege('ddl_alter_reader', 'public.events', 'SELECT') AS can_select,
+       has_table_privilege('ddl_alter_reader', 'public.events', 'INSERT') AS can_insert,
+       pg_get_userbyid(relowner) AS owner
+  FROM pg_class WHERE oid = 'public.events'::regclass;
+
 -- 3. A non-tiered table's columns alter normally (control).
 CREATE TABLE public.plain (id int, val text);
 ALTER TABLE public.plain ADD COLUMN extra int;
@@ -66,3 +77,5 @@ DROP TABLE public.plain;
 DELETE FROM coldfront.tiered_views;
 DROP VIEW public.events;
 DROP TABLE public._events;
+DROP ROLE ddl_alter_reader;
+DROP ROLE ddl_alter_owner;
