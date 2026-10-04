@@ -84,12 +84,9 @@ requested steps, each under a bakery claim on that table:
   files, so a partition with fewer is left alone. When the table property
   `coldfront.sort-key` names a column, each group is sorted on that column as
   it is rewritten; if the column does not exist, compaction is skipped with a
-  `NOT compacted` warning and the other steps still run. Before planning, each
-  data file's position-delete files are scoped to its own partition, the only
-  ones that can reference its rows: iceberg-go attaches them by the delete
-  file's `file_path` bounds, which duckdb-iceberg writes under DuckDB's own
-  field id, so it would otherwise attach every delete file to every data file
-  and remove a skipped partition's delete files along with a rewritten one.
+  `NOT compacted` warning and the other steps still run. iceberg-go scopes each
+  position-delete file to its own partition, so a rewrite leaves a skipped
+  partition's delete files in place.
 - Snapshot expiry is age-driven: it drops snapshots older than
   `--expire-older-than` (always keeping the current snapshot and at least
   `--expire-retain-last`) and, by default, deletes the data and manifest files
