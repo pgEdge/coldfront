@@ -16,7 +16,7 @@ import (
 // (mesh) takes the Ricart-Agrawala claim via _claim_iceberg_lock and arms the
 // deferred release via _enqueue_release, or (vanilla) takes the local advisory
 // xact lock — the same chokepoint cold writes use. fn then performs the
-// iceberg-go RewriteDataFiles + Commit. Committing the PG transaction fires
+// iceberg-go rewrite + Commit. Committing the PG transaction fires
 // coldfront's C XactCallback, which releases the claim; on any error we roll
 // back (vanilla: advisory lock auto-releases; mesh: the claim is reaped).
 //

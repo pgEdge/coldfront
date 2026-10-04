@@ -1,6 +1,6 @@
 // Command compactor consolidates an Iceberg table's many small Parquet data
 // files into fewer large ones (data-file compaction) for ColdFront cold tiers,
-// via apache/iceberg-go's RewriteDataFiles.
+// via apache/iceberg-go's ExecuteCompactionGroup and RewriteFiles.
 //
 // It is a SEPARATE Go module from the archiver on purpose: iceberg-go pulls a
 // heavy dependency tree (arrow + cloud SDKs) that must never link into the lean

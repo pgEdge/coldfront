@@ -86,7 +86,13 @@ requested steps, each under a bakery claim on that table:
   column as it rewrites the group. If the column does not exist, the compactor
   skips with a `NOT compacted` warning and the other steps still run.
   iceberg-go scopes each position-delete file to its own partition, so a
-  rewrite leaves a skipped partition's delete files in place.
+  rewrite leaves a skipped partition's delete files in place. A delete file
+  also stays while any data file it can apply to is left out of the rewrite.
+  duckdb-iceberg on DuckDB 1.5 writes no `referenced_data_file` for a delete
+  file, so iceberg-go attaches it to every data file of its partition, and a
+  partition rewritten only in part keeps all of its delete files.
+  duckdb-iceberg's DuckDB 2.0 line writes `referenced_data_file`, which ties
+  each delete file to the one data file it names.
 - Snapshot expiry is age-driven: it drops snapshots older than
   `--expire-older-than` (always keeping the current snapshot and at least
   `--expire-retain-last`) and, by default, deletes the data and manifest files

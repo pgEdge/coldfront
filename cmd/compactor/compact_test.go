@@ -8,6 +8,7 @@ import (
 
 	"github.com/apache/iceberg-go"
 	"github.com/apache/iceberg-go/catalog"
+	"github.com/apache/iceberg-go/table"
 )
 
 func testSchema() *iceberg.Schema {
@@ -130,5 +131,27 @@ func TestPlanFiles_ScopesPositionDeletesToPartition(t *testing.T) {
 		if len(task.DeleteFiles) != 1 || task.DeleteFiles[0].FilePath() != want {
 			t.Errorf("%s has %d delete files, want %s alone", task.File.FilePath(), len(task.DeleteFiles), want)
 		}
+	}
+}
+
+// duckdb-iceberg writes no referenced_data_file for a delete file, so iceberg-go
+// attaches the delete file of the large file below to the five small files of
+// its partition as well. Rewriting the small files must keep it, or the large
+// file's deleted rows come back; rewriting every file may drop it.
+func TestKeptDeletes_KeepsADeleteFileThatAppliesToAFileLeftOut(t *testing.T) {
+	spec := *iceberg.UnpartitionedSpec
+	del := deleteFile(t, spec, "s3://b/t/data/deletes.parquet", nil)
+	task := func(name string) table.FileScanTask {
+		return table.FileScanTask{File: dataFile(t, spec, "s3://b/t/data/"+name+".parquet", nil),
+			DeleteFiles: []iceberg.DataFile{del}}
+	}
+	small := []table.FileScanTask{task("s1"), task("s2"), task("s3"), task("s4"), task("s5")}
+	all := append([]table.FileScanTask{task("large")}, small...)
+
+	if kept := keptDeletes(all, []table.CompactionTaskGroup{{Tasks: small}}); !kept[del.FilePath()] {
+		t.Error("the delete file of the large file left out of the rewrite was not kept")
+	}
+	if kept := keptDeletes(all, []table.CompactionTaskGroup{{Tasks: all}}); len(kept) != 0 {
+		t.Errorf("kept %v with every data file rewritten, want none", kept)
 	}
 }

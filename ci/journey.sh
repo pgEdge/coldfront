@@ -1694,7 +1694,7 @@ require_compactor() {
 
 # Story 6d — Compaction: the standalone Go compactor (cmd/compactor) consolidates
 # the cold tier's many small Parquet files into fewer large ones via
-# apache/iceberg-go RewriteDataFiles, serialized through the bakery (the SAME
+# apache/iceberg-go's rewrite, serialized through the bakery (the SAME
 # claim cold writes take — coldfront._claim_iceberg_external, formally cleared in
 # docs/formal). The compactor reads its configuration from the server, as the
 # archiver does. We use the compactor's own --dry-run as the file-count oracle:
@@ -1708,7 +1708,7 @@ story_compaction() {
     # format-version, so apache/iceberg-go reads the (v2) manifests instead of
     # defaulting to v1 and rejecting them at PlanFiles (manifest.go:629). This live
     # story validates that fix end-to-end.
-    step "6d. Compaction: iceberg-go RewriteDataFiles consolidates small cold files (bakery-serialized)"
+    step "6d. Compaction: the iceberg-go rewrite consolidates small cold files (bakery-serialized)"
     require_compactor || return
     qf "$HOST" <<'EOSQL'
 INSERT INTO events (ts, status, data) VALUES (date_trunc('month',now()) - interval '4 months' + interval '1 days' + interval '0 hours','cmp1','{}');
@@ -6827,9 +6827,33 @@ story_partitioned_cold_tables() {
     assert_eq "TC-190: the skipped month keeps its delete file" "1" \
         "$(q "$HOST" "SELECT coldfront.ensure_attached(); SELECT r['n'] FROM duckdb.query('SELECT count(*) AS n FROM iceberg_metadata(''ice.public.tccomp'') WHERE status <> ''DELETED'' AND content = ''POSITION_DELETES''') AS t(r);" | tail -1)"
 
+    # TC-229: a file the compactor leaves alone inside a partition it rewrites.
+    # Month A holds one file at or above 75% of the 1 MiB target and five small
+    # ones, and the DELETE removes a row from the large file. A delete file
+    # attaches to every data file of its partition, so the five small files the
+    # compactor rewrites have the large file's delete file attached, and that
+    # delete file must stay or the deleted row comes back.
+    q "$HOST" "SELECT coldfront.create_iceberg_table('public','tcskip','$cols'::jsonb, '{month(ts)}');" >/dev/null 2>&1
+    q "$HOST" "INSERT INTO public.tcskip SELECT i, ($m) + interval '1 day', md5(i::text) || md5((i * 7)::text) FROM generate_series(1, 27000) AS g(i);" >/dev/null 2>&1
+    for i in 1 2 3 4 5; do q "$HOST" "INSERT INTO public.tcskip VALUES ($((27000 + i)), ($m) + interval '$i days', 'small');" >/dev/null 2>&1; done
+    q "$HOST" "DELETE FROM public.tcskip WHERE id = 1;" >/dev/null 2>&1
+    assert_eq "TC-229: one large file and five small ones in one month" "6" "$(ice_files ice.public.tcskip '\.parquet')"
+    assert_eq "TC-229: 27005 rows written, one deleted" "27004" "$(q "$HOST" "SELECT count(*) FROM public.tcskip;")"
+    # The pinned duckdb-iceberg writes no referenced_data_file for the delete
+    # file, which is why it attaches to every data file of the month. This check
+    # fails once the pin writes one, as duckdb-iceberg's line for DuckDB 2.0 does.
+    local mf; mf=$(q "$HOST" "SELECT coldfront.ensure_attached(); SELECT r['p'] FROM duckdb.query('SELECT manifest_path AS p FROM iceberg_metadata(''ice.public.tcskip'') WHERE content = ''POSITION_DELETES'' LIMIT 1') AS t(r);" | tail -1)
+    assert_eq "TC-229: duckdb-iceberg writes no referenced_data_file for the delete file" "1/1" \
+        "$(q "$HOST" "SELECT coldfront.ensure_attached(); SELECT r['f'] FROM duckdb.query('SELECT (count(*) FILTER (WHERE json_extract_string(to_json(data_file), ''\$.referenced_data_file'') IS NULL))::varchar || ''/'' || count(*)::varchar AS f FROM read_avro(''$mf'') WHERE data_file.content = 1') AS t(r);" | tail -1)"
+    assert_contains "TC-229: the compactor rewrites the five small files and leaves the large one" \
+        "compacted: 5 files -> 1" "$(compactor --table tcskip --target-size-mb 1 2>&1)"
+    assert_eq "TC-229: the row deleted from the large file stays deleted" "0" "$(q "$HOST" "SELECT count(*) FROM public.tcskip WHERE id = 1;")"
+    assert_eq "TC-229: every other row survives the compaction" "27004" "$(q "$HOST" "SELECT count(*) FROM public.tcskip;")"
+
     q "$HOST" "SELECT coldfront.drop_iceberg_table('public','tcpart', true);" >/dev/null 2>&1
     q "$HOST" "SELECT coldfront.drop_iceberg_table('public','tcflat', true);" >/dev/null 2>&1
     q "$HOST" "SELECT coldfront.drop_iceberg_table('public','tccomp', true);" >/dev/null 2>&1
+    q "$HOST" "SELECT coldfront.drop_iceberg_table('public','tcskip', true);" >/dev/null 2>&1
 }
 
 # ───────────────────────────────────────────────────────────────────────────
