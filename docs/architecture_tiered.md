@@ -115,6 +115,23 @@ batches. An `INSERT` nested in a `WITH` entry is rewritten in place, and a
 `MERGE` runs on the tier its `ON` condition bounds. The view has no
 `INSTEAD OF` trigger, so a write the hook does not handle fails in PostgreSQL.
 
+The bootstrap also gives the hot table its guards: a check constraint, named
+`coldfront_guard_<column>`, on each column whose type admits a value the cold
+tier cannot hold unchanged. A `numeric` column refuses `NaN`, which pg_duckdb's
+scan and DuckDB's postgres extension both read as `0` and which Iceberg's
+decimal lacks; a `date`, `timestamp` or `timestamptz` column refuses `infinity`
+and `-infinity`, which Iceberg lacks and duckdb-iceberg refuses to write. Each
+guard is added `NOT VALID` inside the bootstrap transaction and validated after
+the transaction commits, so the validation scan runs under a `SHARE UPDATE
+EXCLUSIVE` lock, which lets writes continue. A row that breaks a guard stops
+the run before any partition is archived, with an error that names the guard,
+and stops every later run until the row is fixed. A column name longer than 47
+bytes names its guard by a hash, so two long names that begin alike get a
+guard each. The DDL hook's view rebuild renames a guard with its column, adds
+the guard for a column that an `ALTER TABLE` adds, and validates every guard
+not yet valid inside the `ALTER TABLE`'s own transaction, under the lock that
+statement already holds. Unregistering the table drops the guards.
+
 ### The Archive Pipeline
 
 Candidates are tiered oldest first, ordered by partition **bound**. The order

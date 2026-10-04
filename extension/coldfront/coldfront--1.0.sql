@@ -2679,6 +2679,112 @@ LANGUAGE sql IMMUTABLE STRICT AS $$
     FROM (SELECT lower(trim(p_pg_type))) AS s(t);
 $$;
 
+-- ============================================================================
+-- The hot table's guards: a CHECK on each column of a tiered table's hot table
+-- whose type admits a value the cold tier cannot hold unchanged, so the value is
+-- refused where it is written instead of failing every archive pass that meets
+-- it, or reaching the cold tier changed.
+--
+--   * numeric NaN. Two readers turn PostgreSQL rows into DuckDB rows: pg_duckdb's
+--     scan, which plans every read of a tiered view after its first archive and
+--     the archiver's bulk export, and DuckDB's postgres extension, which streams
+--     the archive's delta replay. Both, at pg_duckdb c04e6a2 with DuckDB v1.5.4,
+--     read a numeric NaN as 0 (pg_regress hot_guard, ci/journey.sh TC-234), and
+--     Iceberg's decimal has no NaN to keep.
+--   * date, timestamp and timestamptz infinity. Iceberg has none, and
+--     duckdb-iceberg refuses to write one.
+--
+-- The archiver adds the guards when it first tiers a partition of the table,
+-- the DDL hook's view rebuild adds one for a column it adds, and unregistering
+-- drops them.
+-- ============================================================================
+
+-- A guard's name, keyed on the column's name so every node of a mesh names a
+-- column's guard alike, whichever node added it. A column name too long to
+-- follow the prefix within a name's 63 bytes is replaced by a hash of it, so two
+-- long names that begin alike name two guards. A guard is found by this
+-- prefix and the column it constrains, which hold whatever its name.
+CREATE FUNCTION coldfront._hot_guard_name(p_col name)
+RETURNS name
+LANGUAGE sql IMMUTABLE STRICT AS $$
+    SELECT ('coldfront_guard_' || CASE WHEN octet_length(p_col) > 47
+                                       THEN left(encode(sha256(convert_to(p_col, 'UTF8')), 'hex'), 32)
+                                       ELSE p_col END)::name;
+$$;
+
+-- The condition a column's values must meet, or NULL when every value of its
+-- type reaches the cold tier unchanged. p_pg_type is format_type output.
+CREATE FUNCTION coldfront._hot_guard_check(p_col name, p_pg_type text)
+RETURNS text
+LANGUAGE sql IMMUTABLE STRICT AS $$
+    SELECT CASE
+        WHEN p_pg_type LIKE 'numeric%' THEN format('%I <> ''NaN''', p_col)
+        WHEN p_pg_type = 'date' OR p_pg_type LIKE 'timestamp%' THEN format('isfinite(%I)', p_col)
+    END;
+$$;
+
+-- Adds each guard the hot table's columns need and lack. NOT VALID records a
+-- guard without scanning, so it adds nothing to the time a caller holds the
+-- table's lock for other DDL. Rows written after it are checked, and
+-- _validate_hot_guards checks the rows already there.
+CREATE FUNCTION coldfront._guard_hot_table(p_hot regclass)
+RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    r record;
+BEGIN
+    -- A rename leaves a guard named after its column's old name; it takes the
+    -- new one here, which frees the old name for a column added under it.
+    FOR r IN
+        SELECT c.conname, coldfront._hot_guard_name(a.attname) AS want
+          FROM pg_constraint c
+          JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
+         WHERE c.conrelid = p_hot AND c.contype = 'c' AND cardinality(c.conkey) = 1
+           AND starts_with(c.conname::text, coldfront._hot_guard_name(''))
+           AND c.conname <> coldfront._hot_guard_name(a.attname)
+    LOOP
+        EXECUTE format('ALTER TABLE %s RENAME CONSTRAINT %I TO %I', p_hot, r.conname, r.want);
+    END LOOP;
+    FOR r IN
+        SELECT a.attname, g.chk
+          FROM pg_attribute a,
+               LATERAL coldfront._hot_guard_check(a.attname, format_type(a.atttypid, a.atttypmod)) AS g(chk)
+         WHERE a.attrelid = p_hot AND a.attnum > 0 AND NOT a.attisdropped
+           AND g.chk IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM pg_constraint c
+                            WHERE c.conrelid = p_hot AND c.contype = 'c'
+                              AND c.conkey = ARRAY[a.attnum]
+                              AND starts_with(c.conname::text, coldfront._hot_guard_name('')))
+         ORDER BY a.attnum
+    LOOP
+        EXECUTE format('ALTER TABLE %s ADD CONSTRAINT %I CHECK (%s) NOT VALID',
+                       p_hot, coldfront._hot_guard_name(r.attname), r.chk);
+    END LOOP;
+END;
+$$;
+
+-- Validates each guard of the hot table not yet validated. Validation scans the
+-- table under a lock that lets reads and writes go on, so the caller runs this in
+-- a transaction that holds no stronger lock on it. A row that breaks a guard
+-- fails the call with PostgreSQL's error, which names the guard and through it
+-- the column.
+CREATE FUNCTION coldfront._validate_hot_guards(p_hot regclass)
+RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_guard name;
+BEGIN
+    FOR v_guard IN
+        SELECT c.conname FROM pg_constraint c
+         WHERE c.conrelid = p_hot AND c.contype = 'c' AND NOT c.convalidated
+           AND starts_with(c.conname::text, coldfront._hot_guard_name(''))
+         ORDER BY c.conname
+    LOOP
+        EXECUTE format('ALTER TABLE %s VALIDATE CONSTRAINT %I', p_hot, v_guard);
+    END LOOP;
+END;
+$$;
+
 -- The reference a table in the attached catalog is registered and claimed under.
 -- Every part is quoted and embedded quotes are doubled, as pgx.Identifier.Sanitize
 -- spells the archiver's and the compactor's, so an Iceberg table has one
@@ -3976,6 +4082,7 @@ DECLARE
     v_iceberg_only boolean;
     v_hot_reg      regclass;
     v_companion    name;
+    v_guard        name;
 BEGIN
     SELECT hot_table, is_iceberg_only
       INTO v_hot, v_iceberg_only
@@ -4014,14 +4121,22 @@ BEGIN
         v_hot_reg := to_regclass(v_hot);
         IF v_hot_reg IS NOT NULL THEN
             -- The generated companions exist only to make a vector scannable
-            -- through the view. With the view gone the table is a plain table
-            -- again, so it goes back the shape its owner gave it.
+            -- through the view, and the guards only to keep the view's readers
+            -- and the cold tier exact. With the view gone the table is a plain
+            -- table again, so it goes back the shape its owner gave it.
             FOR v_companion IN
                 SELECT a.attname FROM pg_attribute a
                 WHERE a.attrelid = v_hot_reg AND a.attnum > 0 AND NOT a.attisdropped
                   AND coldfront._is_vec_companion(a.attname, a.attgenerated)
             LOOP
                 EXECUTE format('ALTER TABLE %s DROP COLUMN %I', v_hot_reg::text, v_companion);
+            END LOOP;
+            FOR v_guard IN
+                SELECT c.conname FROM pg_constraint c
+                WHERE c.conrelid = v_hot_reg AND c.contype = 'c'
+                  AND starts_with(c.conname::text, coldfront._hot_guard_name(''))
+            LOOP
+                EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I', v_hot_reg::text, v_guard);
             END LOOP;
             EXECUTE format('ALTER TABLE %s RENAME TO %I', v_hot_reg::text, p_table);
         END IF;
@@ -4348,6 +4463,12 @@ $ddl$CREATE VIEW %I.%I AS
     --    above (the view name is stable), so there is nothing to re-point. The
     --    cross-tier-move path is the post_parse_analyze hook + coldfront._cross_tier_move;
     --    it needs no per-view object here.
+
+    -- 6. A column the DDL added gets the guard its type needs, on every node,
+    --    since every node rebuilds its own view. The user's ALTER already holds
+    --    the table's lock, so the new guard is validated here and then.
+    PERFORM coldfront._guard_hot_table(format('%I.%I', v_hot_schema, v_hot_relname)::regclass);
+    PERFORM coldfront._validate_hot_guards(format('%I.%I', v_hot_schema, v_hot_relname)::regclass);
 END;
 $$;
 

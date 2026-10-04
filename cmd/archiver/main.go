@@ -629,6 +629,13 @@ func (ac *archiveCycle) bootstrapTieredView(ctx context.Context, columns []view.
 	if err := tx.Commit(ctx); err != nil {
 		return fmt.Errorf("commit bootstrap: %w", err)
 	}
+	// The guards Recreate added are validated in a transaction of their own:
+	// validation scans the hot table, and inside the bootstrap it would hold the
+	// rename's lock, and so block writes, for the whole scan. A row a guard
+	// refuses stops the cycle here, before any partition is tiered.
+	if _, err := ac.conn.Exec(ctx, "SELECT coldfront._validate_hot_guards($1::regclass)", hotTable); err != nil { // nosemgrep
+		return fmt.Errorf("validate hot guards: %w", err)
+	}
 	return nil
 }
 

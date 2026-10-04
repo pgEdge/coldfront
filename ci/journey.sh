@@ -930,6 +930,141 @@ EOSQL
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# Story: TC-231..TC-237, values the cold tier cannot hold. pg_duckdb's scan and
+# DuckDB's postgres extension read a numeric NaN as 0, Iceberg's decimal has no
+# NaN, and Iceberg has no date or timestamp infinity. A tiered table's columns
+# refuse those values where they are written, so none reaches a reader that
+# would change it and none stalls an archive pass.
+# ───────────────────────────────────────────────────────────────────────────
+story_unstorable_values() {
+    step "TC-231..TC-237: a tiered table refuses NaN and infinity rather than storing them changed"
+    local cold="ts < date_trunc('month',now()) - interval '3 months'"
+    local hot="date_trunc('month',now()) - interval '1 month'"
+    local m4="date_trunc('month',now()) - interval '4 months'"
+    _tcval_cleanup() {
+        q "$HOST" "SELECT coldfront.drop_iceberg_table('public','tcval', true);" >/dev/null 2>&1
+        q "$HOST" "SELECT coldfront.drop_iceberg_table('public','tcval_dec', true);" >/dev/null 2>&1
+        q "$HOST" "DELETE FROM coldfront.tiered_views WHERE relname IN ('tcval','tcval_dec'); DELETE FROM coldfront.archive_watermark WHERE table_name='tcval'; DELETE FROM coldfront.partition_config WHERE table_name='tcval';" >/dev/null 2>&1
+        q "$HOST" "DROP VIEW IF EXISTS public.tcval CASCADE;" >/dev/null 2>&1
+        q "$HOST" "DROP VIEW IF EXISTS public.tcval_dec CASCADE;" >/dev/null 2>&1
+        q "$HOST" "DROP TABLE IF EXISTS public._tcval CASCADE;" >/dev/null 2>&1
+        q "$HOST" "DROP TABLE IF EXISTS public.tcval CASCADE;" >/dev/null 2>&1
+        q "$HOST" "DROP TABLE IF EXISTS public.tcval_src;" >/dev/null 2>&1
+    }
+    trap _tcval_cleanup RETURN
+    qf "$HOST" <<'EOSQL' >/dev/null
+CREATE TABLE public.tcval (id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL,
+                           amount numeric(10,2), due date, seen timestamptz,
+                           PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);
+DO $do$ DECLARE m date; BEGIN
+  FOREACH m IN ARRAY ARRAY[(date_trunc('month',now()) - interval '4 months')::date,
+                           (date_trunc('month',now()) - interval '1 month')::date] LOOP
+    EXECUTE format('CREATE TABLE public.%I PARTITION OF public.tcval FOR VALUES FROM (%L) TO (%L)',
+                   'tcval_p_' || to_char(m, 'YYYY_MM'), m, m + interval '1 month');
+  END LOOP; END $do$;
+INSERT INTO public.tcval (ts, amount, due) VALUES
+  (date_trunc('month',now()) - interval '4 months' + interval '3 days', 'NaN', now()),
+  (date_trunc('month',now()) - interval '4 months' + interval '4 days', 2.50, 'infinity');
+EOSQL
+    if ! "$ARCHIVER" register --table tcval --column ts --period monthly \
+            --hot-period "$(hot_days) days" >"$TMPD/tcval.log" 2>&1; then
+        fail "TC-232: register tcval (see $TMPD/tcval.log)"; tail -5 "$TMPD/tcval.log"; return
+    fi
+    # TC-232 / TC-236: a table already holding NaN or infinity is refused at its
+    # first archive pass, which names the column's guard and tiers nothing.
+    if archive_only "schema_name='public' AND table_name='tcval'" "$TMPD/tcval.log"; then
+        fail "TC-232: the archive pass succeeded on a table holding NaN"; return
+    fi
+    assert_contains "TC-232: a NaN already there is refused, naming the column's guard" "coldfront_guard_amount" "$(cat "$TMPD/tcval.log")"
+    assert_eq "TC-232: the guard is validated after the bootstrap commits, so the view stays and the guard waits" "v|false" \
+        "$(q "$HOST" "SELECT (SELECT relkind::text FROM pg_class WHERE oid = 'public.tcval'::regclass) || '|' || (SELECT convalidated::text FROM pg_constraint WHERE conrelid = 'public._tcval'::regclass AND conname = 'coldfront_guard_amount');")"
+    assert_err "TC-232: until the row is fixed, an ALTER TABLE through the DDL hook fails the same way" "coldfront_guard_amount" \
+        "$(q_may "$HOST" "ALTER TABLE public._tcval ADD COLUMN note text;")"
+    q "$HOST" "UPDATE public.tcval SET amount = 0 WHERE amount = 'NaN';" >/dev/null
+    if archive_only "schema_name='public' AND table_name='tcval'" "$TMPD/tcval.log"; then
+        fail "TC-236: the archive pass succeeded on a table holding infinity"; return
+    fi
+    assert_contains "TC-236: an infinity already there is refused, naming the column's guard" "coldfront_guard_due" "$(cat "$TMPD/tcval.log")"
+    assert_eq "TC-232: nothing was tiered" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.archive_watermark WHERE table_name='tcval';")"
+    q "$HOST" "UPDATE public.tcval SET due = NULL WHERE NOT isfinite(due);" >/dev/null
+    if ! archive_only "schema_name='public' AND table_name='tcval'" "$TMPD/tcval.log"; then
+        fail "TC-232: the pass after the rows were fixed (see $TMPD/tcval.log)"; tail -5 "$TMPD/tcval.log"; return
+    fi
+    assert_eq "TC-232: once fixed, the month tiers" "0.00,2.50" \
+        "$(q "$HOST" "SELECT string_agg(amount::text, ',' ORDER BY amount) FROM public.tcval WHERE $cold;")"
+    # TC-231 / TC-235: written to the hot tier, the guards refuse them.
+    assert_err "TC-231: a hot INSERT of NaN is refused" "coldfront_guard_amount" \
+        "$(q_may "$HOST" "INSERT INTO public.tcval (ts, amount) VALUES ($hot + interval '1 day', 'NaN');")"
+    assert_err "TC-235: a hot INSERT of infinity is refused" "coldfront_guard_due" \
+        "$(q_may "$HOST" "INSERT INTO public.tcval (ts, due) VALUES ($hot + interval '1 day', '-infinity');")"
+    assert_err "TC-235: and so is one into a timestamptz column" "coldfront_guard_seen" \
+        "$(q_may "$HOST" "INSERT INTO public.tcval (ts, seen) VALUES ($hot + interval '1 day', 'infinity');")"
+    q "$HOST" "INSERT INTO public.tcval (ts, amount) VALUES ($hot + interval '2 days', 1);" >/dev/null
+    assert_err "TC-231: a hot UPDATE to NaN is refused" "coldfront_guard_amount" \
+        "$(q_may "$HOST" "UPDATE public.tcval SET amount = 'NaN' WHERE ts >= $hot;")"
+    assert_err "TC-235: a hot UPDATE to infinity is refused" "coldfront_guard_due" \
+        "$(q_may "$HOST" "UPDATE public.tcval SET due = 'infinity' WHERE ts >= $hot;")"
+    # TC-233 / TC-237: written to the cold tier, DuckDB's decimal cast refuses NaN
+    # and duckdb-iceberg refuses infinity.
+    assert_err "TC-233: a cold INSERT of NaN is refused" "Could not convert string" \
+        "$(q_may "$HOST" "INSERT INTO public.tcval (ts, amount) VALUES ($m4 + interval '5 days', 'NaN');")"
+    assert_err "TC-233: a cold UPDATE to NaN is refused" "Could not convert string" \
+        "$(q_may "$HOST" "UPDATE public.tcval SET amount = 'NaN' WHERE $cold;")"
+    assert_err "TC-237: a cold INSERT of infinity is refused" "Cannot write infinity" \
+        "$(q_may "$HOST" "INSERT INTO public.tcval (ts, due) VALUES ($m4 + interval '5 days', 'infinity');")"
+    assert_err "TC-237: a cold UPDATE to infinity is refused" "Cannot write infinity" \
+        "$(q_may "$HOST" "UPDATE public.tcval SET due = '-infinity' WHERE $cold;")"
+    assert_err "TC-237: and so is a cold INSERT of one into a timestamptz column" "Cannot write infinity" \
+        "$(q_may "$HOST" "INSERT INTO public.tcval (ts, seen) VALUES ($m4 + interval '5 days', 'infinity');")"
+    # The same refusals in a decoupled table, whose every write runs in DuckDB.
+    q "$HOST" "SELECT coldfront.create_iceberg_table('public','tcval_dec','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"amount\",\"type\":\"numeric(10,2)\"},{\"name\":\"due\",\"type\":\"date\"},{\"name\":\"seen\",\"type\":\"timestamptz\"}]'::jsonb);" >/dev/null
+    q "$HOST" "INSERT INTO public.tcval_dec VALUES (1, 1.50, now(), now());" >/dev/null
+    assert_err "TC-233: a decoupled INSERT of NaN is refused" "Could not convert string" \
+        "$(q_may "$HOST" "INSERT INTO public.tcval_dec (id, amount) VALUES (2, 'NaN');")"
+    assert_err "TC-233: a decoupled UPDATE to NaN is refused" "Could not convert string" \
+        "$(q_may "$HOST" "UPDATE public.tcval_dec SET amount = 'NaN' WHERE id = 1;")"
+    assert_err "TC-237: a decoupled INSERT of a date infinity is refused" "Cannot write infinity" \
+        "$(q_may "$HOST" "INSERT INTO public.tcval_dec (id, due) VALUES (2, 'infinity');")"
+    assert_err "TC-237: a decoupled UPDATE to a timestamptz infinity is refused" "Cannot write infinity" \
+        "$(q_may "$HOST" "UPDATE public.tcval_dec SET seen = '-infinity' WHERE id = 1;")"
+    assert_eq "TC-233: the decoupled table holds only its first row, unchanged" "1|1.50|true|true" \
+        "$(q "$HOST" "SELECT string_agg(id || '|' || amount || '|' || isfinite(due) || '|' || isfinite(seen), ',') FROM public.tcval_dec;")"
+    assert_eq "TC-233: the cold rows are unchanged" "0.00/finite,2.50/null" \
+        "$(q "$HOST" "SELECT string_agg(amount::text || '/' || CASE WHEN due IS NULL THEN 'null' WHEN isfinite(due) THEN 'finite' ELSE 'infinite' END, ',' ORDER BY amount) FROM public.tcval WHERE $cold;")"
+    # TC-234: DuckDB's postgres extension reads a numeric NaN as 0. It streams the
+    # archive's delta replay, whose hot table the guard keeps NaN out of, and it
+    # reads the PostgreSQL table a cold UPDATE ... FROM, a MERGE or a decoupled
+    # INSERT ... SELECT names, where NaN becomes 0 with no error. When these
+    # checks fail, that reader keeps or refuses NaN, and the docs' warning goes.
+    q "$HOST" "CREATE TABLE public.tcval_src (amount numeric(10,2)); INSERT INTO public.tcval_src VALUES ('NaN');" >/dev/null
+    assert_eq "TC-234: DuckDB's postgres extension reads NaN as 0" "0.00" \
+        "$(q "$HOST" "SELECT coldfront.ensure_pg_attached(); SELECT r['a'] FROM duckdb.query('SELECT amount::VARCHAR AS a FROM pglocal.public.tcval_src') AS t(r);" | tail -1)"
+    q "$HOST" "INSERT INTO public.tcval_dec (id, amount) SELECT 3, amount FROM public.tcval_src;" >/dev/null
+    assert_eq "TC-234: so a decoupled INSERT ... SELECT from such a table stores 0" "0.00" \
+        "$(q "$HOST" "SELECT amount FROM public.tcval_dec WHERE id = 3;")"
+    # PostgreSQL 17 and later allow MERGE into a view.
+    if [ "$(q "$HOST" "SHOW server_version_num;")" -ge 170000 ]; then
+        q "$HOST" "MERGE INTO public.tcval_dec d USING public.tcval_src s ON d.id = 4 WHEN NOT MATCHED THEN INSERT (id, amount) VALUES (4, s.amount);" >/dev/null
+        assert_eq "TC-234: and so does a MERGE from it" "0.00" \
+            "$(q "$HOST" "SELECT amount FROM public.tcval_dec WHERE id = 4;")"
+    fi
+    q "$HOST" "UPDATE public.tcval SET amount = s.amount FROM public.tcval_src s WHERE $cold AND tcval.amount = 2.50;" >/dev/null
+    assert_eq "TC-234: and so does a cold UPDATE ... FROM it" "0.00,0.00" \
+        "$(q "$HOST" "SELECT string_agg(amount::text, ',' ORDER BY amount) FROM public.tcval WHERE $cold;")"
+    # TC-231: a guard follows its column through a rename, so a column added
+    # later under the old name gets a guard of its own.
+    assert_contains "TC-231: a guarded column renames" "ALTER TABLE" \
+        "$(q_may "$HOST" "ALTER TABLE public._tcval RENAME COLUMN amount TO amount_old;")"
+    assert_contains "TC-231: and a column takes its old name" "ALTER TABLE" \
+        "$(q_may "$HOST" "ALTER TABLE public._tcval ADD COLUMN amount numeric(10,2);")"
+    assert_err "TC-231: the renamed column's guard has its new name" "coldfront_guard_amount_old" \
+        "$(q_may "$HOST" "INSERT INTO public.tcval (ts, amount_old) VALUES ($hot + interval '3 days', 'NaN');")"
+    assert_err "TC-231: and the new column has a guard of its own" '"coldfront_guard_amount"' \
+        "$(q_may "$HOST" "INSERT INTO public.tcval (ts, amount) VALUES ($hot + interval '3 days', 'NaN');")"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Story 5b — Embeddings round-trip. A pgvector column tiers as an Iceberg
 # list<float> and comes back element-for-element through the view, over all three
 # cold-write paths: the archiver's bulk export, the tiered INSERT's cold sink,
@@ -7022,6 +7157,7 @@ if [ "$MODE" = "tiered" ]; then
     [ "$MESH" = 1 ] && story_mesh_tiered    # cross-node tiered, while hot+cold coexist
     story_reads
     story_types
+    story_unstorable_values # TC-231..TC-237: NaN and infinity refused where they are written
     story_vector            # embeddings: vector → list<float> over all three cold-write paths
     story_writes
     story_compaction        # iceberg-go RewriteDataFiles; the manifest-list

@@ -881,6 +881,30 @@ a tiered table is registered, and when a decoupled table is created. ColdFront
 refuses silent fallback to `varchar` - losing precision/identity is worse than
 no support.
 
+Iceberg cannot hold a `numeric` `NaN`, or an `infinity` or `-infinity` in a
+`date`, `timestamp` or `timestamptz` column, so ColdFront refuses those values.
+A tiered table's hot table has a check constraint named
+`coldfront_guard_<column>` on each column of those types; an `INSERT` or
+`UPDATE` that stores one of the values fails with an error that names the
+constraint. A write that goes to the cold tier, in either mode, is refused by
+DuckDB.
+
+The archiver adds the constraints at the first archive pass that tiers a
+partition of the table, and validates them once that pass's bootstrap
+transaction has committed. A value written before then is accepted, and each
+archive pass stops with an error that names the constraint until the row is
+fixed; the next pass then validates the constraint and tiers the table. Until
+then, an `ALTER TABLE` that the DDL hook mirrors onto the cold tier fails with
+the same error, because the hook validates every constraint that is not yet
+valid. A renamed column's constraint takes the new column name, and a column
+whose name is longer than 47 bytes gets a constraint named after a hash of the
+name.
+
+A cold `UPDATE ... FROM`, a `MERGE` whose source is a PostgreSQL table, and an
+`INSERT ... SELECT` into a decoupled table read that PostgreSQL table through
+DuckDB's postgres extension, which reads a `numeric` `NaN` as `0`. ColdFront
+cannot refuse that value on that path, so filter it out of such a source.
+
 `char(N)` is stored and read as `varchar`. The data round-trips losslessly:
 values, comparisons, and `length()` match a hot PG table, where `length()`
 already ignores `char(N)` trailing padding. The only difference is cosmetic: a

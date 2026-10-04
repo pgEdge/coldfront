@@ -1,0 +1,242 @@
+-- The hot table's guards: a CHECK on each column of a tiered table's hot table
+-- whose type admits a value the cold tier cannot hold unchanged, numeric NaN and
+-- date, timestamp or timestamptz infinity, refusing it where it is written.
+-- White-box: no catalog, no Iceberg I/O; the archiver's onboarding and the cold
+-- tier are ci/journey.sh's.
+CREATE EXTENSION IF NOT EXISTS pg_duckdb;
+NOTICE:  extension "pg_duckdb" already exists, skipping
+CREATE EXTENSION IF NOT EXISTS coldfront;
+NOTICE:  extension "coldfront" already exists, skipping
+SET coldfront.warehouse = '';
+SET coldfront.lakekeeper_endpoint = '';
+SET coldfront.loopback_dsn = '';
+-- The defect the NaN guard keeps out of the hot table. pg_duckdb (c04e6a2,
+-- DuckDB v1.5.4) plans every read of a tiered view after its first archive and
+-- the archiver's bulk export, and its scan reads a numeric NaN as 0. When this
+-- output changes, pg_duckdb keeps or refuses NaN, and the NaN guard rests on
+-- DuckDB's postgres extension alone (ci/journey.sh TC-234).
+CREATE TABLE guard_scan_probe (n numeric(10,2));
+INSERT INTO guard_scan_probe VALUES ('NaN');
+SET duckdb.force_execution = true;
+SELECT n FROM guard_scan_probe;
+  n   
+------
+ 0.00
+(1 row)
+
+RESET duckdb.force_execution;
+DROP TABLE guard_scan_probe;
+-- A hot table as the archiver leaves it: partitioned, renamed, registered.
+CREATE TABLE public._guarded (id bigint, ts timestamptz NOT NULL, amount numeric(10,2),
+                              due date, logged timestamp, note text)
+    PARTITION BY RANGE (ts);
+CREATE TABLE public._guarded_p1 PARTITION OF public._guarded
+    FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+INSERT INTO public._guarded VALUES (1, '2026-01-05', 1.25, '2026-02-01', '2026-01-05 10:00', 'x');
+-- One guard per numeric, date or timestamp column and none for the others,
+-- recorded NOT VALID so adding them scans nothing; the partition inherits them.
+SELECT coldfront._guard_hot_table('public._guarded'::regclass);
+ _guard_hot_table 
+------------------
+ 
+(1 row)
+
+SELECT conrelid::regclass AS rel, conname, convalidated, pg_get_constraintdef(oid) AS def
+  FROM pg_constraint WHERE conname LIKE 'coldfront_guard_%' ORDER BY 1, 2;
+     rel     |        conname         | convalidated |                     def                      
+-------------+------------------------+--------------+----------------------------------------------
+ _guarded    | coldfront_guard_amount | f            | CHECK ((amount <> 'NaN'::numeric)) NOT VALID
+ _guarded    | coldfront_guard_due    | f            | CHECK (isfinite(due)) NOT VALID
+ _guarded    | coldfront_guard_logged | f            | CHECK (isfinite(logged)) NOT VALID
+ _guarded    | coldfront_guard_ts     | f            | CHECK (isfinite(ts)) NOT VALID
+ _guarded_p1 | coldfront_guard_amount | f            | CHECK ((amount <> 'NaN'::numeric)) NOT VALID
+ _guarded_p1 | coldfront_guard_due    | f            | CHECK (isfinite(due)) NOT VALID
+ _guarded_p1 | coldfront_guard_logged | f            | CHECK (isfinite(logged)) NOT VALID
+ _guarded_p1 | coldfront_guard_ts     | f            | CHECK (isfinite(ts)) NOT VALID
+(8 rows)
+
+-- A second call finds the guards and adds nothing.
+SELECT coldfront._guard_hot_table('public._guarded'::regclass);
+ _guard_hot_table 
+------------------
+ 
+(1 row)
+
+SELECT count(*) AS checks FROM pg_constraint
+ WHERE conrelid = 'public._guarded'::regclass AND contype = 'c';
+ checks 
+--------
+      4
+(1 row)
+
+-- Validation scans the rows already there, in a transaction of its own, under
+-- the lock VALIDATE CONSTRAINT takes, SHARE UPDATE EXCLUSIVE, which INSERT,
+-- UPDATE and DELETE do not wait for.
+BEGIN;
+SELECT coldfront._validate_hot_guards('public._guarded'::regclass);
+ _validate_hot_guards 
+----------------------
+ 
+(1 row)
+
+SELECT mode FROM pg_locks
+ WHERE locktype = 'relation' AND relation = 'public._guarded'::regclass
+   AND pid = pg_backend_pid()
+ ORDER BY mode;
+           mode           
+--------------------------
+ AccessShareLock
+ ShareUpdateExclusiveLock
+(2 rows)
+
+COMMIT;
+SELECT conrelid::regclass AS rel, conname, convalidated
+  FROM pg_constraint WHERE conname LIKE 'coldfront_guard_%' ORDER BY 1, 2;
+     rel     |        conname         | convalidated 
+-------------+------------------------+--------------
+ _guarded    | coldfront_guard_amount | t
+ _guarded    | coldfront_guard_due    | t
+ _guarded    | coldfront_guard_logged | t
+ _guarded    | coldfront_guard_ts     | t
+ _guarded_p1 | coldfront_guard_amount | t
+ _guarded_p1 | coldfront_guard_due    | t
+ _guarded_p1 | coldfront_guard_logged | t
+ _guarded_p1 | coldfront_guard_ts     | t
+(8 rows)
+
+-- NaN and infinity are refused where they are written, by INSERT and by UPDATE;
+-- NULL is neither.
+INSERT INTO public._guarded VALUES (2, '2026-01-06', 'NaN', NULL, NULL, 'y');
+ERROR:  new row for relation "_guarded_p1" violates check constraint "coldfront_guard_amount"
+DETAIL:  Failing row contains (2, Tue Jan 06 00:00:00 2026 PST, NaN, null, null, y).
+UPDATE public._guarded SET amount = 'NaN' WHERE id = 1;
+ERROR:  new row for relation "_guarded_p1" violates check constraint "coldfront_guard_amount"
+DETAIL:  Failing row contains (1, Mon Jan 05 00:00:00 2026 PST, NaN, 02-01-2026, Mon Jan 05 10:00:00 2026, x).
+INSERT INTO public._guarded VALUES (2, '2026-01-06', 1, 'infinity', NULL, 'y');
+ERROR:  new row for relation "_guarded_p1" violates check constraint "coldfront_guard_due"
+DETAIL:  Failing row contains (2, Tue Jan 06 00:00:00 2026 PST, 1.00, infinity, null, y).
+UPDATE public._guarded SET logged = '-infinity' WHERE id = 1;
+ERROR:  new row for relation "_guarded_p1" violates check constraint "coldfront_guard_logged"
+DETAIL:  Failing row contains (1, Mon Jan 05 00:00:00 2026 PST, 1.25, 02-01-2026, -infinity, x).
+INSERT INTO public._guarded VALUES (3, '2026-01-07', NULL, NULL, NULL, 'z');
+SELECT id, amount, due, logged FROM public._guarded ORDER BY id;
+ id | amount |    due     |          logged          
+----+--------+------------+--------------------------
+  1 |   1.25 | 02-01-2026 | Mon Jan 05 10:00:00 2026
+  3 |        |            | 
+(2 rows)
+
+-- A timestamptz column refuses infinity as well.
+CREATE TABLE public._guarded_tz (ts timestamptz NOT NULL, seen timestamptz) PARTITION BY RANGE (ts);
+CREATE TABLE public._guarded_tz_p1 PARTITION OF public._guarded_tz
+    FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+SELECT coldfront._guard_hot_table('public._guarded_tz'::regclass);
+ _guard_hot_table 
+------------------
+ 
+(1 row)
+
+INSERT INTO public._guarded_tz VALUES ('2026-01-05', 'infinity');
+ERROR:  new row for relation "_guarded_tz_p1" violates check constraint "coldfront_guard_seen"
+DETAIL:  Failing row contains (Mon Jan 05 00:00:00 2026 PST, infinity).
+INSERT INTO public._guarded_tz VALUES ('2026-01-05', '-infinity');
+ERROR:  new row for relation "_guarded_tz_p1" violates check constraint "coldfront_guard_seen"
+DETAIL:  Failing row contains (Mon Jan 05 00:00:00 2026 PST, -infinity).
+DROP TABLE public._guarded_tz;
+-- A guard is named after its column. A column name longer than the 47 bytes the
+-- prefix leaves is hashed instead, so two long names that share their first 47
+-- bytes get a guard each.
+CREATE TABLE public._guarded_long (ts timestamptz NOT NULL,
+    amount_in_the_reporting_currency_before_any_tax_a numeric(10,2),
+    amount_in_the_reporting_currency_before_any_tax_b numeric(10,2))
+    PARTITION BY RANGE (ts);
+SELECT coldfront._guard_hot_table('public._guarded_long'::regclass);
+ _guard_hot_table 
+------------------
+ 
+(1 row)
+
+SELECT a.attname, c.conname FROM pg_constraint c
+  JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
+ WHERE c.conrelid = 'public._guarded_long'::regclass AND c.contype = 'c'
+ ORDER BY a.attnum;
+                      attname                      |                     conname                      
+---------------------------------------------------+--------------------------------------------------
+ ts                                                | coldfront_guard_ts
+ amount_in_the_reporting_currency_before_any_tax_a | coldfront_guard_83edb444fef0dbd022b70b4e557a6528
+ amount_in_the_reporting_currency_before_any_tax_b | coldfront_guard_177eb92568a7a35cc5d3772ac0a212f4
+(3 rows)
+
+DROP TABLE public._guarded_long;
+-- A row that already holds NaN fails the validation, which names the guard and
+-- so the column.
+CREATE TABLE public._guarded_nan (ts timestamptz NOT NULL, amount numeric(10,2)) PARTITION BY RANGE (ts);
+CREATE TABLE public._guarded_nan_p1 PARTITION OF public._guarded_nan
+    FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+INSERT INTO public._guarded_nan VALUES ('2026-01-05', 'NaN');
+SELECT coldfront._guard_hot_table('public._guarded_nan'::regclass);
+ _guard_hot_table 
+------------------
+ 
+(1 row)
+
+SELECT coldfront._validate_hot_guards('public._guarded_nan'::regclass);
+ERROR:  check constraint "coldfront_guard_amount" of relation "_guarded_nan_p1" is violated by some row
+CONTEXT:  SQL statement "ALTER TABLE _guarded_nan VALIDATE CONSTRAINT coldfront_guard_amount"
+PL/pgSQL function _validate_hot_guards(regclass) line 11 at EXECUTE
+DROP TABLE public._guarded_nan;
+-- A column added through the DDL hook gets its guard from the view rebuild, which
+-- runs on every node. Under the apply-worker role the Iceberg mirror is skipped,
+-- so this needs no catalog.
+CREATE VIEW public.guarded AS SELECT * FROM public._guarded;
+INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
+VALUES ('public', 'guarded', 'public._guarded', 'ice.default.guarded', 'ts');
+SET session_replication_role = replica;
+ALTER TABLE public._guarded ADD COLUMN fee numeric(8,3);
+SET session_replication_role = DEFAULT;
+SELECT conname, convalidated FROM pg_constraint
+ WHERE conrelid = 'public._guarded'::regclass AND contype = 'c' ORDER BY conname;
+        conname         | convalidated 
+------------------------+--------------
+ coldfront_guard_amount | t
+ coldfront_guard_due    | t
+ coldfront_guard_fee    | t
+ coldfront_guard_logged | t
+ coldfront_guard_ts     | t
+(5 rows)
+
+-- A guard follows its column through a rename, on the partitions too, so a
+-- column that later takes the old name gets a guard of its own.
+SET session_replication_role = replica;
+ALTER TABLE public._guarded RENAME COLUMN fee TO fee_old;
+ALTER TABLE public._guarded ADD COLUMN fee numeric(8,3);
+SET session_replication_role = DEFAULT;
+SELECT c.conrelid::regclass AS rel, c.conname, a.attname, c.convalidated
+  FROM pg_constraint c
+  JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
+ WHERE c.conrelid IN ('public._guarded'::regclass, 'public._guarded_p1'::regclass)
+   AND c.contype = 'c' AND a.attname LIKE 'fee%'
+ ORDER BY 1, 2;
+     rel     |         conname         | attname | convalidated 
+-------------+-------------------------+---------+--------------
+ _guarded    | coldfront_guard_fee     | fee     | t
+ _guarded    | coldfront_guard_fee_old | fee_old | t
+ _guarded_p1 | coldfront_guard_fee     | fee     | t
+ _guarded_p1 | coldfront_guard_fee_old | fee_old | t
+(4 rows)
+
+-- Unregistering returns the hot table to its owner as it was, guards gone.
+SELECT coldfront._unregister_iceberg('public', 'guarded');
+ _unregister_iceberg 
+---------------------
+ 
+(1 row)
+
+SELECT count(*) AS checks FROM pg_constraint
+ WHERE conrelid = 'public.guarded'::regclass AND contype = 'c';
+ checks 
+--------
+      0
+(1 row)
+
+DROP TABLE public.guarded;

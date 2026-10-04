@@ -279,11 +279,20 @@ func GenerateVectorOpsSQL(cfg ViewConfig) string {
 	return ""
 }
 
+// GenerateGuardSQL adds to the hot table the guards its columns need: CHECKs
+// that refuse the values the view's readers and the cold tier would change (see
+// coldfront._guard_hot_table). The extension decides which columns need one.
+func GenerateGuardSQL(cfg ViewConfig) string {
+	return fmt.Sprintf("SELECT coldfront._guard_hot_table(%s::regclass)", sqlutil.Literal(cfg.fqHot()))
+}
+
 // Recreate performs the table→view swap (if needed) and recreates the view.
 func (g *Generator) Recreate(ctx context.Context, cfg ViewConfig) error {
 	stmts := []string{
 		GenerateSwapSQL(cfg),
-		GenerateVecCompanionSQL(cfg), // after the swap: it targets the renamed hot table
+		// After the swap: the guards and the companion target the renamed hot table.
+		GenerateGuardSQL(cfg),
+		GenerateVecCompanionSQL(cfg),
 		GenerateVectorOpsSQL(cfg),
 		GenerateViewSQL(cfg),
 	}

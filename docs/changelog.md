@@ -277,6 +277,18 @@ this project adheres to
   `referenced_data_file` for a delete file, so iceberg-go attaches each one to
   every data file of its partition. The compactor keeps a delete file while any
   data file it can apply to is left out of the rewrite.
+- A `numeric` `NaN` in a tiered table read back as `0` through the view once
+  the table had a cold tier, and was archived as `0`: pg_duckdb and DuckDB's
+  postgres extension read `NaN` as zero, and Iceberg's decimal has no `NaN`.
+  The hot table now refuses `NaN` when it is written, and an archive pass
+  refuses a table that already holds one, with an error that names the column's
+  check constraint.
+- An `infinity` in a tiered table's `date`, `timestamp` or `timestamptz`
+  column stopped every archive pass that reached its row with duckdb-iceberg's
+  "Cannot write infinity/-infinity", which names no column, because Iceberg has
+  no infinity. The hot table now refuses it when it is written, and an archive
+  pass refuses a table that already holds one, with an error that names the
+  column's check constraint.
 
 ## [1.0.0-beta2] - 2026-08-08
 
