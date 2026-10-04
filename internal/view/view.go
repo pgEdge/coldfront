@@ -29,8 +29,7 @@ type ViewConfig struct {
 }
 
 // Column holds a column name, its DuckDB types, and key-participation flags.
-// Populated by archiver's getColumns from PG's format_type via
-// pgFormatTypeToDuckDB.
+// Populated by archiver's getColumns from the extension's type map.
 //
 // Type is the **storage** type — what we declare to Iceberg via CREATE TABLE
 // (BIGINT, VARCHAR, DECIMAL(20,5), …). For PG types Iceberg can't represent
@@ -91,10 +90,14 @@ func (c Column) IsVector() bool { return c.Type == "FLOAT[]" }
 // this column on the PostgreSQL side, before pg_duckdb reads it, or "" when the
 // column exports as-is.
 //
-// Two cases need one, for different reasons. A VARCHAR-backed rich type
+// Three cases need one, for different reasons. A VARCHAR-backed rich type
 // (jsonb/json/interval) exports ::text because its Iceberg column is VARCHAR. A
 // vector exports ::real[] because pg_duckdb's PG reader cannot scan the pgvector
-// type at all, and ::text would stringify it into the wrong column type.
+// type at all, and ::text would stringify it into the wrong column type. A
+// numeric array exports ::text[] because pg_duckdb (c04e6a2) loses its precision
+// when it creates the DuckDB stage table, and refuses the column (pg_regress
+// array_cold_render); numeric's text is exact, and the Iceberg INSERT casts it
+// back to the column's DECIMAL.
 //
 // Types whose Iceberg storage is native (BLOB, DOUBLE) carry a ViewCastType only
 // to give the view a PG-parseable spelling, and must export unchanged:
@@ -105,6 +108,8 @@ func (c Column) ExportCast() string {
 		return "text"
 	case c.IsVector():
 		return "real[]"
+	case strings.HasPrefix(c.Type, "DECIMAL") && strings.HasSuffix(c.Type, "[]"):
+		return "text[]"
 	}
 	return ""
 }
@@ -280,11 +285,20 @@ func GenerateVectorOpsSQL(cfg ViewConfig) string {
 	return ""
 }
 
+// GenerateGuardSQL adds to the hot table the guards its columns need: CHECKs
+// that refuse the values the view's readers and the cold tier would change (see
+// coldfront._guard_hot_table). The extension decides which columns need one.
+func GenerateGuardSQL(cfg ViewConfig) string {
+	return fmt.Sprintf("SELECT coldfront._guard_hot_table(%s::regclass)", sqlutil.Literal(cfg.fqHot()))
+}
+
 // Recreate performs the table→view swap (if needed) and recreates the view.
 func (g *Generator) Recreate(ctx context.Context, cfg ViewConfig) error {
 	stmts := []string{
 		GenerateSwapSQL(cfg),
-		GenerateVecCompanionSQL(cfg), // after the swap: it targets the renamed hot table
+		// After the swap: the guards and the companion target the renamed hot table.
+		GenerateGuardSQL(cfg),
+		GenerateVecCompanionSQL(cfg),
 		GenerateVectorOpsSQL(cfg),
 		GenerateViewSQL(cfg),
 	}

@@ -67,6 +67,12 @@ this project adheres to
   tier; a `MERGE` that bounds neither tier is refused. A decoupled `MERGE` runs
   in DuckDB. A `MERGE` nested in a `WITH` entry takes the same path as a
   nested `UPDATE` or `DELETE`.
+- A one-dimensional array of a supported type tiers as an Iceberg list, except
+  an array of `timestamptz`, `jsonb`, `json`, `interval` or a vector type, and
+  reads back as an array of the type its element reads back as, so a
+  `smallint[]` reads as `integer[]`. An adopted Iceberg table's list columns
+  read as arrays. An array with more than one dimension, or a lower bound other
+  than 1, is refused where it is written, since an Iceberg list holds neither.
 
 ### Changed
 
@@ -84,6 +90,9 @@ this project adheres to
   PostgreSQL schema and table names.
 - Registering a tiered table rejects a column whose type has no Iceberg
   mapping, instead of failing at the first archive cycle.
+- A refusal of a column type with no Iceberg mapping names the column, whether
+  it comes from registration, an archive pass, `create_iceberg_table()` or an
+  `ALTER TABLE` on a tiered table.
 - The walkthrough's distributed demo shows the bakery at work on one held
   write: the ticket on the writing node, the same claim on its peer, the peer's
   ack, and the ledger cleared once the write commits. After the concurrent
@@ -274,6 +283,18 @@ this project adheres to
   `referenced_data_file` for a delete file, so iceberg-go attaches each one to
   every data file of its partition. The compactor keeps a delete file while any
   data file it can apply to is left out of the rewrite.
+- A `numeric` `NaN` in a tiered table read back as `0` through the view once
+  the table had a cold tier, and was archived as `0`: pg_duckdb and DuckDB's
+  postgres extension read `NaN` as zero, and Iceberg's decimal has no `NaN`.
+  The hot table now refuses `NaN` when it is written, and an archive pass
+  refuses a table that already holds one, with an error that names the column's
+  check constraint.
+- An `infinity` in a tiered table's `date`, `timestamp` or `timestamptz`
+  column stopped every archive pass that reached its row with duckdb-iceberg's
+  "Cannot write infinity/-infinity", which names no column, because Iceberg has
+  no infinity. The hot table now refuses it when it is written, and an archive
+  pass refuses a table that already holds one, with an error that names the
+  column's check constraint.
 
 ## [1.0.0-beta2] - 2026-08-08
 

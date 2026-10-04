@@ -498,6 +498,9 @@ BEGIN
                         -- the tiered INSERT's cold sink and its row renderer
                         '_cold_sink', '_cold_sink_step', '_cold_sink_flush',
                         '_cold_sink_final', '_cold_row_literal',
+                        -- an array column's shape check in that INSERT, and an
+                        -- array parameter's renderer in a cold write
+                        '_cold_list', '_render_cold_param',
                         -- the hot MERGE's per-row cutoff guard on INSERT actions
                         '_hot_only',
                         -- cross-tier move: the hook rewrites a partition-column
@@ -914,9 +917,9 @@ CREATE TYPE coldfront._cold_sink_state AS (
 
 -- coldfront._cold_row_literal: render one row (jsonb keyed by column name) as a
 -- DuckDB positional VALUES tuple in attnum order. bytea is rebuilt with
--- from_hex on the hex text (callers pin bytea_output to hex), a vector is cast
--- to FLOAT[], a NULL is NULL, everything else is a quoted literal DuckDB
--- coerces to the storage type. Each vector's cluster column leads the tuple
+-- from_hex from its hex digits, a vector is cast to FLOAT[], an array becomes a
+-- DuckDB list of its elements' literals, a NULL is NULL, everything else is a
+-- quoted literal DuckDB coerces to the storage type. Each vector's cluster column leads the tuple
 -- (_vec_list_prefix), derived from that row's own vector literal.
 CREATE FUNCTION coldfront._cold_row_literal(
     p_payload jsonb, p_cols text[], p_types text[], p_schema text, p_view text
@@ -1239,7 +1242,7 @@ BEGIN
                                                               p_view_schema, p_view_name) || ')');
         ELSE
             -- cold→hot: add to the heap (PG literal tuple, partition column = e).
-            heap_arr := heap_arr || ('(' || coldfront._move_pg_row_literal(payload, full_cols, v_partcol) || ')');
+            heap_arr := heap_arr || ('(' || coldfront._move_pg_row_literal(payload, full_cols, full_types, v_partcol) || ')');
         END IF;
     END LOOP;
     CLOSE cur;
@@ -1303,9 +1306,12 @@ $$;
 -- render a captured row as a positional VALUES tuple for the PG heap INSERT. The
 -- partition column takes cf_new_ts; every other value is an unknown-typed literal
 -- (quote_nullable) that PG coerces to the heap column type on INSERT (so bytea hex
--- and jsonb text round-trip with no per-type handling). NULL stays NULL.
+-- and jsonb text round-trip with no per-type handling), except an array, which
+-- the payload holds as a jsonb list and the heap takes as PostgreSQL array text.
+-- p_types are the heap columns' types, so a jsonb column's own list stays jsonb.
+-- NULL stays NULL.
 CREATE FUNCTION coldfront._move_pg_row_literal(
-    p_payload jsonb, p_cols text[], p_partcol text
+    p_payload jsonb, p_cols text[], p_types text[], p_partcol text
 ) RETURNS text
 LANGUAGE plpgsql IMMUTABLE AS $$
 DECLARE
@@ -1318,6 +1324,11 @@ BEGIN
         IF i > 1 THEN row_lit := row_lit || ', '; END IF;
         IF col = p_partcol THEN
             row_lit := row_lit || quote_nullable(p_payload->>'cf_new_ts');
+        ELSIF p_types[i] LIKE '%[]' AND jsonb_typeof(p_payload->col) = 'array' THEN
+            row_lit := row_lit || quote_literal(coalesce(
+                (SELECT array_agg(e ORDER BY o)
+                   FROM jsonb_array_elements_text(p_payload->col) WITH ORDINALITY AS u(e, o))::text,
+                '{}'));
         ELSE
             row_lit := row_lit || quote_nullable(p_payload->>col);
         END IF;
@@ -1599,9 +1610,9 @@ $$;
 -- post_parse_analyze hook (which short-circuits to TIER_COLD when the
 -- registry row has is_iceberg_only=true).
 --
--- The supported column types match the canonical map in
--- cmd/archiver/main.go pgFormatTypeToDuckDB. Anything outside the set is
--- rejected at create time. See ARCHITECTURE_DECOUPLED.md for the full table.
+-- The supported column types are those coldfront._iceberg_storage_type maps,
+-- the map tiered mode uses as well. Anything outside the set is rejected at
+-- create time. See docs/architecture_decoupled.md for the full table.
 -- ============================================================================
 
 -- pgvector's vector/halfvec, with or without the dimension typmod. Both maps
@@ -2506,20 +2517,30 @@ $$;
 
 -- Cold-value rendering, shared so the write paths cannot disagree. DuckDB's list
 -- cast accepts [1,2,3] and rejects PG's {1,2,3}, and whitespace between elements
--- is fine, which is what splits the two helpers below: a value taken from a jsonb
--- payload is already bracketed (jsonb spells a vector as a string and a real[] as
--- an array), while NEW.col::text on the view's real[] column is brace-delimited.
+-- is fine. A value taken from a jsonb payload is already bracketed: jsonb spells
+-- a vector as a string and an array as a JSON array.
 
--- The literal for a value already serialised to text. Caller: _cold_row_literal,
--- reading a jsonb payload.
+-- The literal for a value already serialised to text. Callers: _cold_row_literal,
+-- reading a jsonb payload, and _render_cold_param, rendering a bound parameter
+-- through its jsonb spelling.
 CREATE OR REPLACE FUNCTION coldfront._render_cold_value(p_val_text text, p_pg_type text)
 RETURNS text
 LANGUAGE sql IMMUTABLE STRICT AS $$
     SELECT CASE
-        -- p_val_text is PG bytea text '\xHEX' (callers pin bytea_output to hex).
-        -- DuckDB mis-parses the \x escape into a BLOB, so rebuild the bytes from
-        -- the hex digits.
-        WHEN p_pg_type = 'bytea' THEN format('from_hex(%L)', substr(p_val_text, 3))
+        -- An array is a DuckDB list of its elements, each rendered as a value of
+        -- the element type, so no element's text is parsed twice. p_val_text is
+        -- the array's jsonb spelling, whose escapes jsonb_array_elements_text
+        -- undoes; DuckDB's VARCHAR-to-list cast would read \t and \n in it as the
+        -- letters t and n. A list of string literals takes the column's type on
+        -- INSERT, on UPDATE and in a comparison, as one string literal does.
+        WHEN p_pg_type LIKE '%[]' THEN (
+            SELECT '[' || coalesce(string_agg(coalesce(coldfront._render_cold_value(e, left(p_pg_type, -2)), 'NULL'),
+                                              ', ' ORDER BY o), '') || ']'
+              FROM jsonb_array_elements_text(p_val_text::jsonb) WITH ORDINALITY AS u(e, o))
+        -- bytea arrives in the session's bytea_output, hex or escape, and bytea's
+        -- own input reads either. DuckDB mis-parses PG's \x escape into a BLOB,
+        -- so the bytes are rebuilt from their hex digits.
+        WHEN p_pg_type = 'bytea' THEN format('from_hex(%L)', encode(p_val_text::bytea, 'hex'))
         -- The Iceberg column is FLOAT[]; without the cast the literal stays a
         -- VARCHAR and the INSERT fails.
         WHEN coldfront._is_vector_type(p_pg_type) THEN format('CAST(%L AS FLOAT[])', p_val_text)
@@ -2527,16 +2548,77 @@ LANGUAGE sql IMMUTABLE STRICT AS $$
     END;
 $$;
 
+-- Whether an array has the shape an Iceberg list holds: one dimension, numbered
+-- from 1. NULL and an empty array have no dimension and pass.
+CREATE FUNCTION coldfront._is_list(p anyarray)
+RETURNS boolean
+LANGUAGE sql IMMUTABLE AS $$
+    SELECT array_ndims(p) IS NULL OR (array_ndims(p) = 1 AND array_lower(p, 1) = 1);
+$$;
+
+-- An array headed for the cold tier, refused unless it is a list. A cold write
+-- renders an array through its jsonb spelling, which keeps no lower bound, so
+-- the shape is checked here, while the value is still an array. p_col names the
+-- column, or is NULL for a bound parameter.
+CREATE FUNCTION coldfront._cold_list(p anyarray, p_col text)
+RETURNS anyarray
+LANGUAGE plpgsql IMMUTABLE AS $$
+BEGIN
+    IF NOT coldfront._is_list(p) THEN
+        RAISE EXCEPTION 'coldfront: % holds an array of % dimension(s) starting at element %; the cold tier stores one-dimensional arrays starting at element 1',
+            CASE WHEN p_col IS NULL THEN 'a bound parameter' ELSE format('column "%s"', p_col) END,
+            array_ndims(p), array_lower(p, 1);
+    END IF;
+    RETURN p;
+END;
+$$;
+
+-- A bound array parameter of a cold write as the DuckDB list _render_cold_value
+-- makes of an array column. The C hook's cold_sql_arg calls this at execution.
+CREATE FUNCTION coldfront._render_cold_param(p anyarray)
+RETURNS text
+LANGUAGE sql STABLE AS $$
+    SELECT coalesce(coldfront._render_cold_value(to_jsonb(coldfront._cold_list(p, NULL))::text,
+                                                 pg_typeof(p)::text),
+                    'NULL');
+$$;
+
 -- Map a PG type name (canonical or common alias) to the DuckDB/Iceberg
 -- storage type used in CREATE TABLE on the attached catalog. Raises on any
 -- type that cannot round-trip cleanly — silent VARCHAR fallback would lose
 -- data identity at write time, so we refuse it.
-CREATE OR REPLACE FUNCTION coldfront._iceberg_storage_type(p_pg_type text)
+--
+-- p_column names the column in the refusal when the caller knows it.
+CREATE OR REPLACE FUNCTION coldfront._iceberg_storage_type(p_pg_type text, p_column text DEFAULT '')
 RETURNS text
 LANGUAGE plpgsql IMMUTABLE STRICT AS $$
 DECLARE
-    t text := lower(trim(p_pg_type));
+    t      text := lower(trim(p_pg_type));
+    v_col  text := CASE WHEN p_column <> '' THEN format('column "%s": ', p_column) ELSE '' END;
+    v_elem text;
 BEGIN
+    -- A one-dimensional array of a native type stores as an Iceberg list of the
+    -- element's storage type. format_type spells an array type as its element
+    -- type's spelling followed by [], so the element is the name without its
+    -- last [] and maps as a column of its own would; an element the map refuses
+    -- refuses the array. First, because the scalar rules below would read
+    -- character varying(8)[] as a varchar and vector(3)[] as a vector.
+    IF t LIKE '%[]' THEN
+        v_elem := coldfront._iceberg_storage_type(left(t, -2), p_column);
+        IF v_elem LIKE '%[]' THEN
+            RAISE EXCEPTION 'coldfront: %PG type % has no Iceberg-compatible mapping: an array element cannot itself be an array or a vector', v_col, p_pg_type;
+        END IF;
+        IF v_elem = 'VARCHAR' AND coldfront._iceberg_view_cast_type(left(t, -2)) <> '' THEN
+            RAISE EXCEPTION 'coldfront: %PG type % has no Iceberg-compatible mapping: % is stored as text and read back through a cast, which an array element does not get', v_col, p_pg_type, left(t, -2);
+        END IF;
+        -- pg_duckdb (c04e6a2) cannot read a timestamptz[] column, and every read
+        -- of a tiered view after its first archive is a pg_duckdb scan of the hot
+        -- table (pg_regress type_map).
+        IF v_elem = 'TIMESTAMPTZ' THEN
+            RAISE EXCEPTION 'coldfront: %PG type % has no Iceberg-compatible mapping: pg_duckdb cannot read a timestamptz[] column (store timestamp[] in UTC instead)', v_col, p_pg_type;
+        END IF;
+        RETURN v_elem || '[]';
+    END IF;
     -- Numeric / boolean
     IF t IN ('bigint', 'int8')             THEN RETURN 'BIGINT';   END IF;
     IF t IN ('integer', 'int', 'int4')     THEN RETURN 'INTEGER';  END IF;
@@ -2564,7 +2646,7 @@ BEGIN
         RETURN 'DECIMAL' || substring(t FROM '\(.*\)');
     END IF;
     IF t IN ('numeric', 'decimal') THEN
-        RAISE EXCEPTION 'coldfront: unbounded numeric not supported in iceberg; use numeric(P,S) with P<=38';
+        RAISE EXCEPTION 'coldfront: %unbounded numeric not supported in iceberg; use numeric(P,S) with P<=38', v_col;
     END IF;
     -- View-cast types: stored as VARCHAR, surfaced via wrapper view as native PG type
     IF t IN ('jsonb', 'json', 'interval') THEN RETURN 'VARCHAR'; END IF;
@@ -2575,7 +2657,7 @@ BEGIN
     -- planned by pg_duckdb, so no cast makes them readable. Store IP data as
     -- text and oid values as bigint instead.
 
-    RAISE EXCEPTION 'coldfront: PG type % has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, numeric(P,S), jsonb, json, interval, vector(N), halfvec(N). inet/cidr/oid unsupported (store IP data as text, oid values as bigint); sparsevec unsupported (keep it in the hot tier)', p_pg_type;
+    RAISE EXCEPTION 'coldfront: %PG type % has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, numeric(P,S), jsonb, json, interval, vector(N), halfvec(N), and one-dimensional arrays of those types except timestamptz, jsonb, json, interval and the vector types. inet/cidr/oid unsupported (store IP data as text, oid values as bigint); sparsevec unsupported (keep it in the hot tier)', v_col, p_pg_type;
 END;
 $$;
 
@@ -2598,8 +2680,8 @@ $$;
 -- spellings.
 --
 -- p_column names the column in the refusal when the caller knows it. DuckDB
--- loads and DESCRIBEs a struct, map, variant or non-float list without
--- complaint, so this refusal is coldfront's and it is all the caller is told.
+-- loads and DESCRIBEs a struct, map, variant or nested list without complaint,
+-- so this refusal is coldfront's and it is all the caller is told.
 CREATE OR REPLACE FUNCTION coldfront._pg_type_from_iceberg(
     p_duckdb_type text,
     p_column      text DEFAULT ''
@@ -2607,12 +2689,25 @@ CREATE OR REPLACE FUNCTION coldfront._pg_type_from_iceberg(
 RETURNS text
 LANGUAGE plpgsql IMMUTABLE STRICT AS $$
 DECLARE
-    t    text := upper(trim(p_duckdb_type));
-    hint text := 'Supported: BOOLEAN, INTEGER, BIGINT, FLOAT, DOUBLE, DECIMAL(P,S), '
-                 'DATE, TIME, TIMESTAMP, TIMESTAMP WITH TIME ZONE, VARCHAR, UUID, '
-                 'BLOB, FLOAT[]. Leave the table where it is, or project the '
-                 'unsupported columns away into an Iceberg view first.';
+    t      text := upper(trim(p_duckdb_type));
+    hint   text := 'Supported: BOOLEAN, INTEGER, BIGINT, FLOAT, DOUBLE, DECIMAL(P,S), '
+                   'DATE, TIME, TIMESTAMP, TIMESTAMP WITH TIME ZONE, VARCHAR, UUID, '
+                   'BLOB, and lists of those types except TIMESTAMP WITH TIME ZONE. '
+                   'Leave the table where it is, or project the unsupported columns '
+                   'away into an Iceberg view first.';
+    v_elem text;
 BEGIN
+    -- A list reads as an array of its element's type. Whether a list<float> is a
+    -- clustered vector column is decided by its cluster sibling, not by its type.
+    -- A nested list and a list of timestamptz fall through to the refusal below,
+    -- as the forward map refuses the arrays they would read as. An element with
+    -- no mapping is refused by the inner call, in DESCRIBE's spelling.
+    IF t LIKE '%[]' THEN
+        v_elem := coldfront._pg_type_from_iceberg(left(trim(p_duckdb_type), -2), p_column);
+        IF v_elem NOT LIKE '%[]' AND v_elem <> 'timestamptz' THEN
+            RETURN v_elem || '[]';
+        END IF;
+    END IF;
     IF t = 'BOOLEAN'                 THEN RETURN 'boolean';          END IF;
     IF t = 'INTEGER'                 THEN RETURN 'integer';          END IF;
     IF t = 'BIGINT'                  THEN RETURN 'bigint';           END IF;
@@ -2627,10 +2722,6 @@ BEGIN
     IF t = 'VARCHAR'                 THEN RETURN 'text';             END IF;
     IF t = 'UUID'                    THEN RETURN 'uuid';             END IF;
     IF t = 'BLOB'                    THEN RETURN 'bytea';            END IF;
-    -- list<float>, the one list a wrapper view has a spelling for that both
-    -- engines read as 4-byte floats. Whether it is a clustered vector column is
-    -- decided by its cluster sibling, not by its type.
-    IF t IN ('FLOAT[]', 'REAL[]')    THEN RETURN 'real[]';           END IF;
     -- Precision and scale are carried through, canonically spelled, so the two
     -- input spellings compare equal.
     IF t ~ '^DECIMAL\s*\(\s*\d+\s*,\s*\d+\s*\)$' THEN
@@ -2656,6 +2747,17 @@ CREATE OR REPLACE FUNCTION coldfront._iceberg_view_cast_type(p_pg_type text)
 RETURNS text
 LANGUAGE sql IMMUTABLE STRICT AS $$
     SELECT CASE
+        -- An array reads as an array of its element's surface type. text is the
+        -- one element that reads under another spelling than its column would:
+        -- a text column reads as varchar, which every text operator accepts, but
+        -- the array operators (=, @>, &&) take varchar[] and text[] as different
+        -- types. First, because vector(3)[] would otherwise read as a vector.
+        WHEN t LIKE '%[]' THEN CASE
+            WHEN left(t, -2) = 'text' THEN 'text[]'
+            WHEN coldfront._iceberg_view_cast_type(left(t, -2)) <> ''
+                THEN coldfront._iceberg_view_cast_type(left(t, -2)) || '[]'
+            ELSE ''
+        END
         WHEN t IN ('jsonb', 'json') THEN 'json'  -- DuckDB has no jsonb, surface as json
         WHEN t = 'interval'         THEN 'interval'
         -- PG has no bare "double" type, so the view's cold cast r['col']::DOUBLE
@@ -2674,6 +2776,135 @@ LANGUAGE sql IMMUTABLE STRICT AS $$
         ELSE ''
     END
     FROM (SELECT lower(trim(p_pg_type))) AS s(t);
+$$;
+
+-- ============================================================================
+-- The hot table's guards: a CHECK on each column of a tiered table's hot table
+-- whose type admits a value the cold tier cannot hold unchanged, so the value is
+-- refused where it is written instead of failing every archive pass that meets
+-- it, or reaching the cold tier changed.
+--
+--   * numeric NaN. Two readers turn PostgreSQL rows into DuckDB rows: pg_duckdb's
+--     scan, which plans every read of a tiered view after its first archive and
+--     the archiver's bulk export, and DuckDB's postgres extension, which streams
+--     the archive's delta replay. Both, at pg_duckdb c04e6a2 with DuckDB v1.5.4,
+--     read a numeric NaN as 0 (pg_regress hot_guard, ci/journey.sh TC-234), and
+--     Iceberg's decimal has no NaN to keep.
+--   * date, timestamp and timestamptz infinity. Iceberg has none, and
+--     duckdb-iceberg refuses to write one.
+--   * an array that is not a list: more than one dimension, or a lower bound
+--     other than 1. An Iceberg list has neither, and both readers drop a lower
+--     bound (pg_regress hot_guard, ci/journey.sh TC-249). An array's elements
+--     meet the condition of their scalar type.
+--
+-- The archiver adds the guards when it first tiers a partition of the table,
+-- the DDL hook's view rebuild adds one for a column it adds, and unregistering
+-- drops them.
+-- ============================================================================
+
+-- A guard's name, keyed on the column's name so every node of a mesh names a
+-- column's guard alike, whichever node added it. A column name too long to
+-- follow the prefix within a name's 63 bytes is replaced by a hash of it, so two
+-- long names that begin alike name two guards. A guard is found by this
+-- prefix and the column it constrains, which hold whatever its name.
+CREATE FUNCTION coldfront._hot_guard_name(p_col name)
+RETURNS name
+LANGUAGE sql IMMUTABLE STRICT AS $$
+    SELECT ('coldfront_guard_' || CASE WHEN octet_length(p_col) > 47
+                                       THEN left(encode(sha256(convert_to(p_col, 'UTF8')), 'hex'), 32)
+                                       ELSE p_col END)::name;
+$$;
+
+-- The condition a column's values must meet, or NULL when every value of its
+-- type reaches the cold tier unchanged. p_pg_type is format_type output.
+CREATE FUNCTION coldfront._hot_guard_check(p_col name, p_pg_type text)
+RETURNS text
+LANGUAGE sql IMMUTABLE STRICT AS $$
+    SELECT CASE
+        WHEN p_pg_type LIKE '%[]' THEN format('coldfront._is_list(%I)', p_col) || CASE
+            WHEN p_pg_type LIKE 'numeric%' THEN format(' AND NOT (%I && ''{NaN}'')', p_col)
+            WHEN p_pg_type LIKE 'date%' OR p_pg_type LIKE 'timestamp%'
+                THEN format(' AND NOT (%I && ''{infinity,-infinity}'')', p_col)
+            ELSE ''
+        END
+        WHEN p_pg_type LIKE 'numeric%' THEN format('%I <> ''NaN''', p_col)
+        WHEN p_pg_type = 'date' OR p_pg_type LIKE 'timestamp%' THEN format('isfinite(%I)', p_col)
+    END;
+$$;
+
+-- Adds each guard the hot table's columns need and lack. Rows written after it
+-- are checked. p_validate checks the rows already there as each guard is added,
+-- inside the caller's transaction and under its lock; without it the guard is
+-- added NOT VALID, with no scan, and _validate_hot_guards checks those rows.
+--
+-- A column declared with more than one array dimension is refused here: no
+-- guard can help it, because pg_duckdb reads a column by its declared
+-- dimensions, and the cold tier stores one.
+CREATE FUNCTION coldfront._guard_hot_table(p_hot regclass, p_validate boolean DEFAULT false)
+RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    r record;
+BEGIN
+    SELECT a.attname, a.attndims INTO r
+      FROM pg_attribute a
+     WHERE a.attrelid = p_hot AND a.attnum > 0 AND NOT a.attisdropped AND a.attndims > 1
+     ORDER BY a.attnum LIMIT 1;
+    IF FOUND THEN
+        RAISE EXCEPTION 'coldfront: column "%" is declared with % array dimensions; pg_duckdb reads a column by its declared dimensions, and the cold tier stores one-dimensional arrays',
+            r.attname, r.attndims;
+    END IF;
+    -- A rename leaves a guard named after its column's old name; it takes the
+    -- new one here, which frees the old name for a column added under it.
+    FOR r IN
+        SELECT c.conname, coldfront._hot_guard_name(a.attname) AS want
+          FROM pg_constraint c
+          JOIN pg_attribute a ON a.attrelid = c.conrelid AND a.attnum = c.conkey[1]
+         WHERE c.conrelid = p_hot AND c.contype = 'c' AND cardinality(c.conkey) = 1
+           AND starts_with(c.conname::text, coldfront._hot_guard_name(''))
+           AND c.conname <> coldfront._hot_guard_name(a.attname)
+    LOOP
+        EXECUTE format('ALTER TABLE %s RENAME CONSTRAINT %I TO %I', p_hot, r.conname, r.want);
+    END LOOP;
+    FOR r IN
+        SELECT a.attname, g.chk
+          FROM pg_attribute a,
+               LATERAL coldfront._hot_guard_check(a.attname, format_type(a.atttypid, a.atttypmod)) AS g(chk)
+         WHERE a.attrelid = p_hot AND a.attnum > 0 AND NOT a.attisdropped
+           AND g.chk IS NOT NULL
+           AND NOT EXISTS (SELECT 1 FROM pg_constraint c
+                            WHERE c.conrelid = p_hot AND c.contype = 'c'
+                              AND c.conkey = ARRAY[a.attnum]
+                              AND starts_with(c.conname::text, coldfront._hot_guard_name('')))
+         ORDER BY a.attnum
+    LOOP
+        EXECUTE format('ALTER TABLE %s ADD CONSTRAINT %I CHECK (%s)%s',
+                       p_hot, coldfront._hot_guard_name(r.attname), r.chk,
+                       CASE WHEN p_validate THEN '' ELSE ' NOT VALID' END);
+    END LOOP;
+END;
+$$;
+
+-- Validates each guard of the hot table not yet validated. Validation scans the
+-- table under a lock that lets reads and writes go on, so the caller runs this in
+-- a transaction that holds no stronger lock on it. A row that breaks a guard
+-- fails the call with PostgreSQL's error, which names the guard and through it
+-- the column.
+CREATE FUNCTION coldfront._validate_hot_guards(p_hot regclass)
+RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_guard name;
+BEGIN
+    FOR v_guard IN
+        SELECT c.conname FROM pg_constraint c
+         WHERE c.conrelid = p_hot AND c.contype = 'c' AND NOT c.convalidated
+           AND starts_with(c.conname::text, coldfront._hot_guard_name(''))
+         ORDER BY c.conname
+    LOOP
+        EXECUTE format('ALTER TABLE %s VALIDATE CONSTRAINT %I', p_hot, v_guard);
+    END LOOP;
+END;
 $$;
 
 -- The reference a table in the attached catalog is registered and claimed under.
@@ -3125,7 +3356,7 @@ BEGIN
             PERFORM coldfront.install_vector_ops();
             v_vec_cols := v_vec_cols || col_name;
         END IF;
-        storage_type := coldfront._iceberg_storage_type(pg_type);
+        storage_type := coldfront._iceberg_storage_type(pg_type, col_name);
 
         IF n > 0 THEN
             iceberg_cols := iceberg_cols || ', ';
@@ -3973,6 +4204,7 @@ DECLARE
     v_iceberg_only boolean;
     v_hot_reg      regclass;
     v_companion    name;
+    v_guard        name;
 BEGIN
     SELECT hot_table, is_iceberg_only
       INTO v_hot, v_iceberg_only
@@ -4011,14 +4243,22 @@ BEGIN
         v_hot_reg := to_regclass(v_hot);
         IF v_hot_reg IS NOT NULL THEN
             -- The generated companions exist only to make a vector scannable
-            -- through the view. With the view gone the table is a plain table
-            -- again, so it goes back the shape its owner gave it.
+            -- through the view, and the guards only to keep the view's readers
+            -- and the cold tier exact. With the view gone the table is a plain
+            -- table again, so it goes back the shape its owner gave it.
             FOR v_companion IN
                 SELECT a.attname FROM pg_attribute a
                 WHERE a.attrelid = v_hot_reg AND a.attnum > 0 AND NOT a.attisdropped
                   AND coldfront._is_vec_companion(a.attname, a.attgenerated)
             LOOP
                 EXECUTE format('ALTER TABLE %s DROP COLUMN %I', v_hot_reg::text, v_companion);
+            END LOOP;
+            FOR v_guard IN
+                SELECT c.conname FROM pg_constraint c
+                WHERE c.conrelid = v_hot_reg AND c.contype = 'c'
+                  AND starts_with(c.conname::text, coldfront._hot_guard_name(''))
+            LOOP
+                EXECUTE format('ALTER TABLE %s DROP CONSTRAINT %I', v_hot_reg::text, v_guard);
             END LOOP;
             EXECUTE format('ALTER TABLE %s RENAME TO %I', v_hot_reg::text, p_table);
         END IF;
@@ -4279,7 +4519,7 @@ BEGIN
         ORDER BY a.attnum
     LOOP
         cast_type := coldfront._iceberg_view_cast_type(r.pg_type);
-        cold_type := coldfront._iceberg_storage_type(r.pg_type);  -- Iceberg storage (BLOB, INTEGER, …)
+        cold_type := coldfront._iceberg_storage_type(r.pg_type, r.attname);  -- Iceberg storage (BLOB, INTEGER, …)
 
         -- VIEW PROJECTIONS (view.go GenerateViewSQL).
         IF n > 0 THEN
@@ -4345,6 +4585,13 @@ $ddl$CREATE VIEW %I.%I AS
     --    above (the view name is stable), so there is nothing to re-point. The
     --    cross-tier-move path is the post_parse_analyze hook + coldfront._cross_tier_move;
     --    it needs no per-view object here.
+
+    -- 6. A column the DDL added gets the guard its type needs, on every node,
+    --    since every node rebuilds its own view. The guard is validated as it
+    --    is added, so the ALTER fails if a row breaks it, such as a default the
+    --    guard refuses. A guard the archiver added and has not validated yet is
+    --    left to the archiver.
+    PERFORM coldfront._guard_hot_table(format('%I.%I', v_hot_schema, v_hot_relname)::regclass, true);
 END;
 $$;
 
@@ -4408,10 +4655,10 @@ BEGIN
             END IF;
             IF op = 'add' THEN
                 ddl := ddl || format('ALTER TABLE %s ADD COLUMN IF NOT EXISTS %I %s',
-                    p_iceberg_table, col, coldfront._iceberg_storage_type(pg_type));
+                    p_iceberg_table, col, coldfront._iceberg_storage_type(pg_type, col));
             ELSE
                 ddl := ddl || format('ALTER TABLE %s ALTER COLUMN %I TYPE %s',
-                    p_iceberg_table, col, coldfront._iceberg_storage_type(pg_type));
+                    p_iceberg_table, col, coldfront._iceberg_storage_type(pg_type, col));
             END IF;
         ELSIF op = 'drop' THEN
             ddl := ddl || format('ALTER TABLE %s DROP COLUMN IF EXISTS %I', p_iceberg_table, col);

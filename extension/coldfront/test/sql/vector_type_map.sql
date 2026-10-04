@@ -8,10 +8,9 @@ CREATE EXTENSION IF NOT EXISTS pg_duckdb;
 CREATE EXTENSION IF NOT EXISTS coldfront;
 CREATE EXTENSION IF NOT EXISTS vector;
 
--- The decoupled path's type map is the twin of the archiver's Go map
--- (pgFormatTypeToDuckDB). Both must return the same pair or a column stores one
--- way and reads another, so these same literals are asserted on the Go side in
--- TestPgFormatTypeToDuckDB.
+-- The storage type and the view cast move together, or a column stores one way
+-- and reads another. The archiver takes a tiered table's pair from this map and
+-- create_iceberg_table a decoupled table's.
 SELECT t,
        coldfront._iceberg_storage_type(t)   AS storage,
        coldfront._iceberg_view_cast_type(t) AS view_cast
@@ -21,7 +20,7 @@ SELECT t,
 -- blowup, so it stays hot-only.
 SELECT coldfront._iceberg_storage_type('sparsevec(65536)');
 
--- format_type output is what both maps actually receive, dimension included.
+-- format_type output is what the map actually receives, dimension included.
 CREATE TABLE vec_map_probe (id bigint, embedding vector(3));
 SELECT format_type(atttypid, atttypmod) AS format_type
   FROM pg_attribute

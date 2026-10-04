@@ -608,9 +608,9 @@ field. Registration fails when:
 - a tiered table has a column whose type has no Iceberg equivalent (see
   [Supported Column Types](#supported-column-types)). Every column goes through
   the same type map the cold tier itself uses, so the answer comes back at the
-  prompt rather than hours later from cron. Partition-only tables are exempt:
-  nothing about them reaches Iceberg, so their column types are PostgreSQL's
-  business alone.
+  prompt rather than hours later from cron, and the refusal names the column.
+  Partition-only tables are exempt: nothing about them reaches Iceberg, so
+  their column types are PostgreSQL's business alone.
 
 Registration validates the table as it is at that moment, not continuously.
 Adding a `DEFAULT` partition to an already-registered table is therefore not
@@ -873,13 +873,41 @@ The following PostgreSQL column types are supported:
 `date` · `time without time zone` · `uuid` · `text` · `varchar(N)` ·
 `char(N)` · `bytea` · `numeric(P,S)` (P ≤ 38) · `jsonb` / `json` ·
 `interval` · `vector(N)` / `halfvec(N)` (pgvector; see
-[usage_vectors.md](usage_vectors.md))
+[usage_vectors.md](usage_vectors.md)) · one-dimensional arrays of most of
+these types (see [Arrays](#arrays))
 
 Anything else (unbounded `numeric`, `xml`, `tsvector`, range/multirange types,
-custom enums, arrays, composite types, pgvector's `sparsevec`) is rejected when
-a tiered table is registered, and when a decoupled table is created. ColdFront
-refuses silent fallback to `varchar` - losing precision/identity is worse than
-no support.
+custom enums, composite types, pgvector's `sparsevec`, and the arrays that
+[Arrays](#arrays) lists as refused at registration) is rejected when a tiered
+table is registered, and when a decoupled table is created. ColdFront refuses
+silent fallback to `varchar` - losing precision/identity is worse than no
+support.
+
+Iceberg cannot hold a `numeric` `NaN`, or an `infinity` or `-infinity` in a
+`date`, `timestamp` or `timestamptz` column, so ColdFront refuses those values,
+as array elements too. A tiered table's hot table has a check constraint named
+`coldfront_guard_<column>` on each column of those types and on each array
+column; an `INSERT` or `UPDATE` that stores one of the values fails with an
+error that names the constraint. A write that goes to the cold tier, in either
+mode, is refused by DuckDB.
+
+The archiver adds the constraints at the first archive pass that tiers a
+partition of the table, and validates them once that pass's bootstrap
+transaction has committed. A value written before then is accepted, and each
+archive pass stops with an error that names the constraint until the row is
+fixed; the next pass then validates the constraint and tiers the table. A
+column that an `ALTER TABLE` adds through the DDL hook gets its constraint in
+the same statement, which PostgreSQL validates against every row of the hot
+table, so an `ADD COLUMN` whose default the constraint refuses, such as
+`DEFAULT 'NaN'`, fails. A renamed column's constraint takes the new column
+name, and a column whose name is longer than 47 bytes gets a constraint named
+after a hash of the name.
+
+A cold `UPDATE ... FROM`, a `MERGE` whose source is a PostgreSQL table, and an
+`INSERT ... SELECT` into a decoupled table read that PostgreSQL table through
+DuckDB's postgres extension, which reads a `numeric` `NaN` as `0` and drops an
+array's lower bound. ColdFront cannot refuse those values on that path, so
+filter them out of such a source.
 
 `char(N)` is stored and read as `varchar`. The data round-trips losslessly:
 values, comparisons, and `length()` match a hot PG table, where `length()`
@@ -933,6 +961,60 @@ a join or sub-query stay in DuckDB, where the limits above apply.
 cross-tier read is planned by pg_duckdb - so no cast makes them readable. Store
 IP data as `text` and `oid` values as `bigint` (you can still index/compare
 them; cast on the hot side only if needed).
+
+### Arrays
+
+A one-dimensional array of a supported type tiers as an Iceberg list of that
+type. The following table shows how each array type is stored and how the view
+reads it back:
+
+| PG type | Iceberg/Parquet storage | Reads back as |
+|---|---|---|
+| `bigint[]`, `integer[]`, `real[]`, `double precision[]`, `boolean[]`, `date[]`, `time[]`, `timestamp[]`, `uuid[]`, `bytea[]`, `numeric(P,S)[]` | A list of the element's storage type. | The same type. |
+| `smallint[]` | A list of `INTEGER`. | `integer[]`, as a `smallint` column reads as `integer`. |
+| `text[]` | A list of `VARCHAR`. | `text[]`. |
+| `varchar(N)[]`, `char(N)[]` | A list of `VARCHAR`. | `character varying[]`, with `char(N)` elements unpadded. |
+
+The following arrays are refused when a tiered table is registered and when a
+decoupled table is created, with an error that names the column:
+
+- `timestamptz[]`, because pg_duckdb cannot read a `timestamptz[]` column of a
+  PostgreSQL table, which a tiered table's hot tier is; store `timestamp[]` in
+  UTC instead.
+- `jsonb[]`, `json[]` and `interval[]`, because those types are stored as text
+  and read back through a cast that an array element does not get.
+- arrays of `vector` or `halfvec`, because a vector is itself stored as a list,
+  and ColdFront stores an array as a list of scalar values.
+
+An Iceberg list has one dimension and numbers its elements from 1, so ColdFront
+refuses an array with more than one dimension or with a lower bound other than
+1, such as `'[0:2]={1,2,3}'`. The hot table's check constraint refuses such an
+array when it is written. A write to the cold tier refuses it too: a tiered
+`INSERT` with an error that names the column, and a bound parameter with an
+error that names no column. A tiered table with a column declared with more
+than one dimension, such as `integer[][]`, passes registration and is refused
+at its first archive pass, because pg_duckdb reads a column by its declared
+dimensions; a decoupled table refuses such a column when it is created. A
+decoupled table's array type is spelled as its element type followed by `[]`,
+such as `integer[]`; the spellings `integer[3]` and `integer ARRAY` are
+refused. `ALTER TABLE ... ADD COLUMN` cannot add an array column to a tiered
+table, because duckdb-iceberg does not add a nested column to an Iceberg table.
+
+A tiered `INSERT` accepts an array in any spelling, because its source runs in
+PostgreSQL. A cold `UPDATE` and a decoupled `INSERT` run in DuckDB, which does
+not read PostgreSQL's brace literal: a `'{a,b}'` literal reaches DuckDB as text
+and fails to cast. Write the array as `ARRAY['a', 'b']`, or pass it as a bound
+parameter.
+
+Reads through a view run in DuckDB once the table has a cold tier, and the
+following array operations work there:
+
+- `x = ANY(arr)`, `arr @> ARRAY[...]` and `arr && ARRAY[...]`.
+- subscripts and slices, which count from 1, such as `arr[1]` and `arr[1:2]`.
+- `array_length(arr, 1)` and `unnest(arr)`.
+
+A brace literal and a bound array parameter fail in such a read, as they do for
+a vector, and so does `cardinality()`, which DuckDB defines for maps only.
 
 ## Caveats
 

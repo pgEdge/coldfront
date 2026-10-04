@@ -69,80 +69,6 @@ func (m *mockQuerier) Query(ctx context.Context, sql string, args ...any) (pgx.R
 	return &mockRows{}, nil
 }
 
-func TestPgFormatTypeToDuckDB(t *testing.T) {
-	tests := []struct {
-		pg              string
-		wantStorage     string
-		wantViewCastTyp string
-		wantErr         bool
-	}{
-		// Storage matches surface — no view cast.
-		{pg: "bigint", wantStorage: "BIGINT"},
-		{pg: "integer", wantStorage: "INTEGER"},
-		{pg: "smallint", wantStorage: "INTEGER"}, // widened; INTEGER is its own surface
-		{pg: "real", wantStorage: "REAL"},
-		{pg: "double precision", wantStorage: "DOUBLE", wantViewCastTyp: "double precision"}, // ::double is a PG shell type
-		{pg: "boolean", wantStorage: "BOOLEAN"},
-		{pg: "timestamp with time zone", wantStorage: "TIMESTAMPTZ"},
-		{pg: "timestamp without time zone", wantStorage: "TIMESTAMP"},
-		{pg: "date", wantStorage: "DATE"},
-		{pg: "time without time zone", wantStorage: "TIME"},
-		{pg: "uuid", wantStorage: "UUID"},
-		{pg: "text", wantStorage: "VARCHAR"},
-		{pg: "character varying(255)", wantStorage: "VARCHAR"},
-		{pg: "character varying", wantStorage: "VARCHAR"},
-		{pg: "character(10)", wantStorage: "VARCHAR"},
-		{pg: "bytea", wantStorage: "BLOB", wantViewCastTyp: "bytea"}, // BLOB not PG-parseable
-		{pg: "numeric(20,5)", wantStorage: "DECIMAL(20,5)"},
-		{pg: "numeric(38, 10)", wantStorage: "DECIMAL(38,10)"},
-
-		// Storage + surface differ — view casts on both branches.
-		{pg: "jsonb", wantStorage: "VARCHAR", wantViewCastTyp: "json"},
-		{pg: "json", wantStorage: "VARCHAR", wantViewCastTyp: "json"},
-		{pg: "interval", wantStorage: "VARCHAR", wantViewCastTyp: "interval"},
-
-		// pgvector. Both widen losslessly to float4 and store as list<float>.
-		// The view cast is real[], not FLOAT[]: PG parses FLOAT as an alias for
-		// double precision, so ::FLOAT[] on the hot branch would widen to
-		// double precision[] and the two branches would disagree.
-		// coldfront._iceberg_storage_type / _iceberg_view_cast_type must return
-		// this same pair for the decoupled path; test/sql/vector_type_map.sql
-		// asserts these literals on that side.
-		{pg: "vector(1536)", wantStorage: "FLOAT[]", wantViewCastTyp: "real[]"},
-		{pg: "vector", wantStorage: "FLOAT[]", wantViewCastTyp: "real[]"},
-		{pg: "halfvec(768)", wantStorage: "FLOAT[]", wantViewCastTyp: "real[]"},
-		{pg: "halfvec", wantStorage: "FLOAT[]", wantViewCastTyp: "real[]"},
-		// sparsevec stays hot-only: densifying it is a 100x storage blowup.
-		{pg: "sparsevec(65536)", wantErr: true},
-
-		// Errors. inet/cidr/oid are rejected: pg_duckdb cannot process them in
-		// an Iceberg-backed query, and every tiered read is planned by pg_duckdb,
-		// so there is no cast that makes them readable (oid would archive fine but
-		// its column becomes unreadable through the view after cutover).
-		{pg: "inet", wantErr: true},
-		{pg: "cidr", wantErr: true},
-		{pg: "oid", wantErr: true},
-		{pg: "numeric", wantErr: true},
-		{pg: "time with time zone", wantErr: true},
-		{pg: "tsvector", wantErr: true},
-		{pg: "xml", wantErr: true},
-		{pg: "ltree", wantErr: true},
-		{pg: "some_custom_type", wantErr: true},
-	}
-	for _, tt := range tests {
-		t.Run(tt.pg, func(t *testing.T) {
-			storage, viewCastType, err := pgFormatTypeToDuckDB(tt.pg)
-			if tt.wantErr {
-				require.Error(t, err)
-				return
-			}
-			require.NoError(t, err)
-			assert.Equal(t, tt.wantStorage, storage)
-			assert.Equal(t, tt.wantViewCastTyp, viewCastType)
-		})
-	}
-}
-
 func TestParsePartitionKeyDef(t *testing.T) {
 	tests := []struct {
 		name string
@@ -273,6 +199,7 @@ func TestValidateFlatPartitioning_RejectsSubPartitioned(t *testing.T) {
 
 func TestGetColumns_PopulatesIdentityAndPK(t *testing.T) {
 	queryCalls := 0
+	var columnSQL string
 	db := &mockQuerier{
 		rowFunc: func(_ context.Context, _ string, _ ...any) pgx.Row {
 			// resolveTableName lookup.
@@ -281,27 +208,31 @@ func TestGetColumns_PopulatesIdentityAndPK(t *testing.T) {
 				return nil
 			}}
 		},
-		rowsFunc: func(_ context.Context, _ string, _ ...any) (pgx.Rows, error) {
+		rowsFunc: func(_ context.Context, sql string, _ ...any) (pgx.Rows, error) {
 			queryCalls++
 			if queryCalls == 1 {
-				// Column metadata.
+				// Column metadata: name, storage type, view cast, attidentity.
+				columnSQL = sql
 				return &mockRows{rows: []func(dest ...any) error{
 					func(dest ...any) error {
 						*(dest[0].(*string)) = "id"
-						*(dest[1].(*string)) = "bigint" // format_type output
-						*(dest[2].(*string)) = "a"
+						*(dest[1].(*string)) = "BIGINT"
+						*(dest[2].(*string)) = ""
+						*(dest[3].(*string)) = "a"
 						return nil
 					},
 					func(dest ...any) error {
 						*(dest[0].(*string)) = "ts"
-						*(dest[1].(*string)) = "timestamp with time zone"
+						*(dest[1].(*string)) = "TIMESTAMPTZ"
 						*(dest[2].(*string)) = ""
+						*(dest[3].(*string)) = ""
 						return nil
 					},
 					func(dest ...any) error {
 						*(dest[0].(*string)) = "data"
-						*(dest[1].(*string)) = "jsonb"
-						*(dest[2].(*string)) = ""
+						*(dest[1].(*string)) = "VARCHAR"
+						*(dest[2].(*string)) = "json"
+						*(dest[3].(*string)) = ""
 						return nil
 					},
 				}}, nil
@@ -326,6 +257,16 @@ func TestGetColumns_PopulatesIdentityAndPK(t *testing.T) {
 	assert.Equal(t, "data", cols[2].Name)
 	assert.Equal(t, "VARCHAR", cols[2].Type)
 	assert.Equal(t, "json", cols[2].ViewCastType)
+	// The extension's map decides, not a second copy in Go, and is given the
+	// column so a refusal names it; its companion predicate is what keeps a
+	// vector's generated real[] column out of the list.
+	for _, want := range []string{
+		"coldfront._iceberg_storage_type(format_type(a.atttypid, a.atttypmod), a.attname)",
+		"coldfront._iceberg_view_cast_type(format_type(a.atttypid, a.atttypmod))",
+		"coldfront._is_vec_companion(a.attname, a.attgenerated)",
+	} {
+		assert.Contains(t, columnSQL, want)
+	}
 }
 
 func TestGetColumns_PropagatesQueryError(t *testing.T) {

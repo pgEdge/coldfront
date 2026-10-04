@@ -274,7 +274,7 @@ func requireMappableColumns(ctx context.Context, db partition.RowQuerier, schema
 	// generated real[] column is not read as a user column.
 	var checked int
 	if err := db.QueryRow(ctx, `
-		SELECT count(coldfront._iceberg_storage_type(format_type(a.atttypid, a.atttypmod)))
+		SELECT count(coldfront._iceberg_storage_type(format_type(a.atttypid, a.atttypmod), a.attname))
 		FROM pg_attribute a
 		JOIN pg_class c ON c.oid = a.attrelid
 		JOIN pg_namespace n ON n.oid = c.relnamespace

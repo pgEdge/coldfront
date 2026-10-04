@@ -15,8 +15,10 @@ CREATE EXTENSION IF NOT EXISTS vector;
 SELECT coldfront._render_cold_value('[1,2,3]', 'vector(3)')    AS vec_tight,
        coldfront._render_cold_value('[1, 2, 3]', 'vector(3)')  AS vec_spaced;
 
--- bytea arrives as PG's '\xHEX'; the hex digits are what DuckDB rebuilds from.
+-- bytea arrives in the session's bytea_output, hex or escape; bytea's own input
+-- reads either, and from_hex rebuilds the same bytes from the hex digits.
 SELECT coldfront._render_cold_value('\xcafe', 'bytea')  AS blob,
+       coldfront._render_cold_value('\312\376', 'bytea') AS blob_escaped,
        coldfront._render_cold_value('2.5', 'double precision') AS dbl,
        coldfront._render_cold_value('a''b', 'text')     AS quoted;
 

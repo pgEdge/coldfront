@@ -177,6 +177,10 @@ func TestColumn_ExportCast(t *testing.T) {
 		{"double exports as-is", Column{Type: "DOUBLE", ViewCastType: "double precision"}, ""},
 		{"integer exports as-is", Column{Type: "INTEGER"}, ""},
 		{"vector exports as real[]", Column{Type: "FLOAT[]", ViewCastType: "real[]"}, "real[]"},
+		{"numeric array exports as text[]", Column{Type: "DECIMAL(10,2)[]"}, "text[]"},
+		{"text array exports as-is", Column{Type: "VARCHAR[]", ViewCastType: "text[]"}, ""},
+		{"bytea array exports as bytes", Column{Type: "BLOB[]", ViewCastType: "bytea[]"}, ""},
+		{"real array is not a vector", Column{Type: "REAL[]"}, ""},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.want, tt.col.ExportCast())
@@ -219,11 +223,18 @@ func TestRecreate(t *testing.T) {
 	g := NewGenerator(db)
 	err := g.Recreate(context.Background(), testCfg)
 	require.NoError(t, err)
-	// The swap and the view.
-	require.Len(t, db.execSQL, 2)
+	// The swap, the guards on the renamed hot table, and the view.
+	require.Len(t, db.execSQL, 3)
 	assert.Contains(t, db.execSQL[0], `ALTER TABLE "public"."events" RENAME TO "_events"`)
-	assert.Contains(t, db.execSQL[1], `"public"."_events"`)
-	assert.Contains(t, db.execSQL[1], "duckdb.query('SELECT * FROM ")
+	assert.Equal(t, GenerateGuardSQL(testCfg), db.execSQL[1])
+	assert.Contains(t, db.execSQL[2], `"public"."_events"`)
+	assert.Contains(t, db.execSQL[2], "duckdb.query('SELECT * FROM ")
+}
+
+// The guards go on the renamed hot table, and the extension decides which
+// columns need one, so every table gets the call.
+func TestGenerateGuardSQL(t *testing.T) {
+	assert.Equal(t, `SELECT coldfront._guard_hot_table('"public"."_events"'::regclass)`, GenerateGuardSQL(testCfg))
 }
 
 // Complex identifiers: mixed case, hyphens, reserved keywords, embedded

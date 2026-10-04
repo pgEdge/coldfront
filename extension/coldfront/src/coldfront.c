@@ -59,6 +59,7 @@
 #include "catalog/pg_type_d.h"
 #include "commands/copy.h"
 #include "commands/extension.h"
+#include "common/string.h"
 #include "executor/executor.h"
 #include "executor/spi.h"
 #include "lib/stringinfo.h"
@@ -1492,7 +1493,8 @@ build_cold_dml(DeparseResult *dr, TieredViewInfo *info, Query *query)
  * The string reaches duckdb.raw_query (emit_cold / emit_dual), so a value
  * renders as a DuckDB literal: bytea -> from_hex(%P$L) / encode($K,'hex');
  * real[] (a vector column's view type) -> CAST(%P$L AS FLOAT[]) /
- * translate($K::text,'{}','[]'); json/jsonb/interval -> %P$L / $K::text;
+ * translate($K::text,'{}','[]'); any other array -> %P$s /
+ * coldfront._render_cold_param($K); json/jsonb/interval -> %P$L / $K::text;
  * else %P$L / $K.
  */
 static char *
@@ -1554,6 +1556,11 @@ cold_sql_arg(const char *cold_dml, ColdParamSet *ps)
                          * cast takes [1,2,3], so translate rewrites the delimiters
                          * and the template supplies the cast. */
                         appendStringInfo(&args, ", translate($%d::text,'{}','[]')", id);
+                    else if (type_is_array(t))
+                        /* Any other array: coldfront._render_cold_param checks its
+                         * shape and renders the DuckDB list an array column's value
+                         * becomes, so the template takes the result as SQL. */
+                        appendStringInfo(&args, ", coldfront._render_cold_param($%d)", id);
                     else if (t == JSONOID || t == JSONBOID || t == INTERVALOID)
                         appendStringInfo(&args, ", $%d::text", id);
                     else
@@ -1563,6 +1570,8 @@ cold_sql_arg(const char *cold_dml, ColdParamSet *ps)
                     appendStringInfo(&tmpl, "from_hex(%%%d$L)", pos_of_id[id - 1]);
                 else if (t == FLOAT4ARRAYOID)
                     appendStringInfo(&tmpl, "CAST(%%%d$L AS FLOAT[])", pos_of_id[id - 1]);
+                else if (type_is_array(t))
+                    appendStringInfo(&tmpl, "%%%d$s", pos_of_id[id - 1]);
                 else
                     appendStringInfo(&tmpl, "%%%d$L", pos_of_id[id - 1]);
                 p = q;
@@ -2335,11 +2344,12 @@ build_cold_projection(Query *query, const HotColumns *hc)
             expr = psprintf("(%s)", hc->dflt[i]);
         else
             expr = psprintf("NULL::%s", hc->type[i]);
-        /* to_jsonb() spells a bytea under the session's bytea_output; the sink's
-         * renderer takes the hex form, so the projection spells it that way
-         * whatever the setting is. */
-        if (strcmp(hc->type[i], "bytea") == 0)
-            expr = psprintf("('\\x' || encode(%s, 'hex'))", expr);
+        /* An array reaches the sink as a jsonb list, which keeps no lower bound,
+         * so its shape is checked here, while it is still an array. format_type
+         * spells every array type with a trailing []. */
+        if (pg_str_endswith(hc->type[i], "[]"))
+            expr = psprintf("coldfront._cold_list(%s, %s)", expr,
+                            quote_literal_cstr(hc->name[i]));
         appendStringInfo(&sel, "%s%s AS %s", i > 0 ? ", " : "", expr,
                          quote_identifier(hc->name[i]));
     }
