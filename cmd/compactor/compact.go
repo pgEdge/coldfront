@@ -198,9 +198,6 @@ func rewrite(ctx context.Context, tbl *table.Table, p *planResult, targetSize in
 		if err != nil {
 			return nil, fmt.Errorf("rewrite data files: %w", err)
 		}
-		if len(gr.OldDataFiles) == 0 && len(gr.NewDataFiles) == 0 {
-			continue
-		}
 		gr.SafePosDeletes = slices.DeleteFunc(gr.SafePosDeletes, func(d iceberg.DataFile) bool {
 			return p.keep[d.FilePath()]
 		})
@@ -212,10 +209,6 @@ func rewrite(ctx context.Context, tbl *table.Table, p *planResult, targetSize in
 		res.BytesBefore += gr.BytesBefore
 		res.BytesAfter += gr.BytesAfter
 	}
-	if res.RewrittenGroups == 0 {
-		return res, nil
-	}
-
 	if err := rw.Commit(ctx); err != nil {
 		return nil, fmt.Errorf("stage rewrite: %w", err)
 	}
@@ -239,13 +232,21 @@ func rewrite(ctx context.Context, tbl *table.Table, p *planResult, targetSize in
 func mergeGroup(ctx context.Context, tbl *table.Table, group table.CompactionTaskGroup,
 	field iceberg.NestedField, targetSize int64) (table.CompactionGroupResult, error) {
 	var zero table.CompactionGroupResult
+	res := table.CompactionGroupResult{
+		PartitionKey:   group.PartitionKey,
+		SafePosDeletes: table.CollectSafePositionDeletes(group.Tasks),
+		BytesBefore:    group.TotalSizeBytes,
+	}
+	for _, t := range group.Tasks {
+		res.OldDataFiles = append(res.OldDataFiles, t.File)
+	}
 
 	unsorted, err := readGroupTable(ctx, tbl, group)
 	if err != nil {
 		return zero, err
 	}
 	if unsorted == nil {
-		return table.CompactionGroupResult{PartitionKey: group.PartitionKey}, nil
+		return res, nil // every row deleted: the files go and nothing replaces them
 	}
 	defer unsorted.Release()
 
@@ -255,23 +256,11 @@ func mergeGroup(ctx context.Context, tbl *table.Table, group table.CompactionTas
 	}
 	defer sorted.Release()
 
-	newFiles, bytesAfter, err := writeSorted(ctx, tbl, sorted, targetSize)
+	res.NewDataFiles, res.BytesAfter, err = writeSorted(ctx, tbl, sorted, targetSize)
 	if err != nil {
 		return zero, fmt.Errorf("write merged files for group %q: %w", group.PartitionKey, err)
 	}
-
-	oldFiles := make([]iceberg.DataFile, 0, len(group.Tasks))
-	for _, t := range group.Tasks {
-		oldFiles = append(oldFiles, t.File)
-	}
-	return table.CompactionGroupResult{
-		PartitionKey:   group.PartitionKey,
-		OldDataFiles:   oldFiles,
-		NewDataFiles:   newFiles,
-		SafePosDeletes: table.CollectSafePositionDeletes(group.Tasks),
-		BytesBefore:    group.TotalSizeBytes,
-		BytesAfter:     bytesAfter,
-	}, nil
+	return res, nil
 }
 
 // readGroupTable reads a group's tasks with their deletes applied into one Arrow

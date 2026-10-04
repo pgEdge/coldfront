@@ -6850,10 +6850,24 @@ story_partitioned_cold_tables() {
     assert_eq "TC-229: the row deleted from the large file stays deleted" "0" "$(q "$HOST" "SELECT count(*) FROM public.tcskip WHERE id = 1;")"
     assert_eq "TC-229: every other row survives the compaction" "27004" "$(q "$HOST" "SELECT count(*) FROM public.tcskip;")"
 
+    # TC-230: a sorted table whose rows are all deleted. A decoupled table with a
+    # vector column is sorted on its cluster column, so the compactor merges its
+    # group instead of concatenating it, reads no row, and must still remove the
+    # group's files.
+    q "$HOST" "SELECT coldfront.create_iceberg_table('public','tcempty','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"ts\",\"type\":\"timestamptz\"},{\"name\":\"embedding\",\"type\":\"vector(3)\"}]'::jsonb);" >/dev/null 2>&1
+    for i in 1 2 3 4 5; do q "$HOST" "INSERT INTO public.tcempty VALUES ($i, now(), ARRAY[$i,0,0]::real[]);" >/dev/null 2>&1; done
+    q "$HOST" "DELETE FROM public.tcempty WHERE id > 0;" >/dev/null 2>&1
+    assert_eq "TC-230: five files, every row deleted" "5/0" "$(ice_files ice.public.tcempty '\.parquet')/$(q "$HOST" "SELECT count(*) FROM public.tcempty;")"
+    assert_contains "TC-230: the compactor removes the five files and writes none" \
+        "compacted: 5 files -> 0" "$(compactor --table tcempty 2>&1)"
+    assert_eq "TC-230: no data file is left" "0" "$(ice_files ice.public.tcempty '\.parquet')"
+
+
     q "$HOST" "SELECT coldfront.drop_iceberg_table('public','tcpart', true);" >/dev/null 2>&1
     q "$HOST" "SELECT coldfront.drop_iceberg_table('public','tcflat', true);" >/dev/null 2>&1
     q "$HOST" "SELECT coldfront.drop_iceberg_table('public','tccomp', true);" >/dev/null 2>&1
     q "$HOST" "SELECT coldfront.drop_iceberg_table('public','tcskip', true);" >/dev/null 2>&1
+    q "$HOST" "SELECT coldfront.drop_iceberg_table('public','tcempty', true);" >/dev/null 2>&1
 }
 
 # ───────────────────────────────────────────────────────────────────────────
