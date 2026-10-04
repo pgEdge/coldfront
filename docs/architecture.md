@@ -388,8 +388,10 @@ had. The hook rebuilds the view and updates the registry as the extension's
 owner, once the ownership check PostgreSQL makes for the statement has passed.
 The role running the statement needs what PostgreSQL requires for the
 statement itself, `USAGE` on the schema of the relation it names included, but
-neither ownership of the view, nor `CREATE` on its schema, nor any privilege on
-the registry. The Iceberg change, which is cold I/O, runs as that role. The
+neither ownership of the view nor `CREATE` on its schema, and the hook's own
+registry lookups and updates need no privilege on the registry. The Iceberg
+change, which is cold I/O, runs as that role, so a column change also needs the
+cold access `grant_app_access` gives, `SELECT` on the registry included. The
 following table summarizes the DDL it handles:
 
 | DDL | Behavior |

@@ -304,10 +304,11 @@ this project adheres to
   lost access until `grant_app_access` ran again. The rebuilt view now keeps
   the owner and table-level grants the view had. The hook rebuilds it as the
   extension's owner, so a column change or a rename needs neither ownership of
-  the view, nor `CREATE` on its schema, nor any privilege on the registry: a
-  rename needs only what PostgreSQL checks for it, and a column change also
-  needs the cold access `grant_app_access` gives, since the Iceberg change
-  runs as the role that makes it.
+  the view nor `CREATE` on its schema, and the hook's own registry lookups and
+  updates need no privilege on the registry: a rename needs only what
+  PostgreSQL checks for it, and a column change also needs the cold access
+  `grant_app_access` gives, `SELECT` on the registry included, since the
+  Iceberg change runs as the role that makes it.
 - A role with no access to schema `coldfront` could not read or write through
   a view, or alter, rename, truncate or drop a table, even one of its own that
   ColdFront does not manage: the hooks read the registry as that role, and the
