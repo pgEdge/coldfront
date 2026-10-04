@@ -82,11 +82,11 @@ requested steps, each under a bakery claim on that table:
   larger files under their partition and preserving every row (existing deletes
   are applied). A partition, and each bin within it, needs at least five such
   files, so a partition with fewer is left alone. When the table property
-  `coldfront.sort-key` names a column, each group is sorted on that column as
-  it is rewritten; if the column does not exist, compaction is skipped with a
-  `NOT compacted` warning and the other steps still run. iceberg-go scopes each
-  position-delete file to its own partition, so a rewrite leaves a skipped
-  partition's delete files in place.
+  `coldfront.sort-key` names a column, the compactor sorts each group on that
+  column as it rewrites the group. If the column does not exist, the compactor
+  skips with a `NOT compacted` warning and the other steps still run.
+  iceberg-go scopes each position-delete file to its own partition, so a
+  rewrite leaves a skipped partition's delete files in place.
 - Snapshot expiry is age-driven: it drops snapshots older than
   `--expire-older-than` (always keeping the current snapshot and at least
   `--expire-retain-last`) and, by default, deletes the data and manifest files

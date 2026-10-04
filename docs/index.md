@@ -88,11 +88,11 @@ INSERT INTO events VALUES (1, now(), 'hello');
 SELECT count(*) FROM events;
 ```
 
-A table that already exists in the Iceberg catalog is adopted rather than
-created: `coldfront.adopt_iceberg_table()` reads its schema from the catalog
-and gives it the same wrapper view and registry row, read-only unless writes
-are asked for. `coldfront.release_iceberg_table()` hands the table back with
-the Iceberg table untouched. See
+ColdFront can adopt a table that already exists in the Iceberg catalog rather
+than creating it: `coldfront.adopt_iceberg_table()` reads its schema from the
+catalog and gives it the same wrapper view and registry row, read-only unless
+you pass `p_writable => true`. `coldfront.release_iceberg_table()` hands the
+table back with the Iceberg table untouched. See
 [Adopting a Table That Already Exists in the Catalog](usage.md#adopting-a-table-that-already-exists-in-the-catalog).
 
 To remove a table again, `coldfront.drop_iceberg_table()` unregisters it and

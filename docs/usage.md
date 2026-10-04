@@ -120,9 +120,10 @@ with `coldfront.grant_app_access()`, which takes an existing role:
 SELECT coldfront.grant_app_access('alice');
 ```
 
-The grants are derived from the registry at call time, so run the call again
-after a table is created, adopted or first tiered. The call fails while
-`duckdb.postgres_role` is unset, because only superusers can then run DuckDB.
+`coldfront.grant_app_access()` derives the grants from the registry when it
+runs, so run it again after you create or adopt a table, or tier one for the
+first time. The call fails while `duckdb.postgres_role` is unset, because only
+superusers can then run DuckDB.
 [Least-Privilege Application Roles](index.md#least-privilege-application-roles)
 lists what it grants.
 
@@ -338,10 +339,9 @@ exist. `p_namespace` is the Iceberg namespace the table lives in, which need
 not exist as a PostgreSQL schema; it defaults to `p_schema` when omitted. The
 view takes the table's name.
 
-Adoption is read-only unless asked otherwise, so reading someone else's lake
-table cannot become writing it by accident. Passing `p_writable => true`
-enables the same `INSERT`, `UPDATE`, `DELETE` and `MERGE` rewrite a created
-table gets:
+Adoption is read-only by default, so reading someone else's lake table cannot
+become writing it by accident. Passing `p_writable => true` enables the same
+`INSERT`, `UPDATE`, `DELETE` and `MERGE` rewrite a created table gets:
 
 ```sql
 SELECT coldfront.adopt_iceberg_table('public', 'orders', 'lake',
@@ -350,8 +350,8 @@ SELECT coldfront.adopt_iceberg_table('public', 'orders', 'lake',
 
 Because Iceberg records no PostgreSQL type, an adopted column reads as whatever
 its storage type maps to; a `jsonb` column comes back as `text`. Pass `p_types`
-to restore one, which is accepted where the override maps to the type the
-catalog already stores:
+to restore one, provided the override maps to the type the catalog already
+stores:
 
 ```sql
 SELECT coldfront.adopt_iceberg_table('public', 'orders', 'lake',
@@ -748,9 +748,10 @@ S3-interoperability endpoint with an
 [HMAC key pair](https://cloud.google.com/storage/docs/authentication/hmackeys)
 (`endpoint: storage.googleapis.com`, `use_ssl: true`,
 `access_key`/`secret_key` = the HMAC id/secret). Lakekeeper's warehouse uses an
-`s3` profile (`flavor: s3-compat`, `path-style`) at the same endpoint. This
-setup is verified end-to-end (iceberg read+write over interop). Lakekeeper's
-native `gcs` profile is service-account only and is **not** used.
+`s3` profile (`flavor: s3-compat`, `path-style`) at the same endpoint.
+ColdFront's test suite covers this setup end to end, reading and writing
+Iceberg through the interoperability endpoint. Lakekeeper's native `gcs`
+profile is service-account only and is **not** used.
 
 ### Azure ADLS Gen2
 
@@ -1125,9 +1126,8 @@ R-A ack barrier is what serializes iceberg commits. You can still enable
 sync-rep cluster-wide if you want stronger durability for non-bakery writes,
 but it plays no part in iceberg-commit serialization.
 
-The one-time mesh setup must be done in this order on every node, because
-step 3 calls `spock.repset_add_table`, which requires the local Spock node to
-already exist:
+Run this one-time mesh setup in this order on every node, because step 3 calls
+`spock.repset_add_table`, which requires the local Spock node to already exist:
 
 ```sql
 -- 1. Extensions, in dependency order. snowflake is a bakery prereq
@@ -1198,7 +1198,7 @@ identical on every node and replicates by value:
 |---|---|
 | `coldfront.claims`, `coldfront.claim_acks` | The bakery's tickets and acknowledgements. A peer acknowledges an originator's claim by inserting into `claim_acks` on its own node, and the ack reaches the originator only if the table is in the peer's set. |
 | `coldfront.tiered_views` | The registry. A peer's hook recognizes a view by its row; without it the peer's writes through the view fail in PostgreSQL ("cannot insert into view") and its reads cannot attach the cold tier. |
-| `coldfront.archive_watermark` | The hot/cold cutoff a tiered write is routed by. |
+| `coldfront.archive_watermark` | The hot/cold cutoff that routes each tiered write. |
 | `coldfront.storage_secret` | The cold-store credential, so one `set_storage_secret` call reaches every node. |
 | `coldfront.partition_config` | The per-table lifecycle. The archiver and the partitioner add this table themselves as well, because the partitioner runs without the extension. |
 | `coldfront.vector_config`, `coldfront.vector_centroids` | The cluster routing state, so every node resolves a vector to the same cluster. |
@@ -1260,9 +1260,9 @@ The following GUCs adjust write behavior and execution; tune them as needed:
 - `coldfront.vector_nprobe` (int, default `0`) sets how many clusters such a
   search reads, overriding the column's own `nprobe`. `0` uses the configured
   value; at or above the column's `nlist` the search is exhaustive.
-- `duckdb.force_execution` (default off) should be benchmarked before you turn
-  it on: on a mixed workload it helps `count(distinct)` and similar but
-  regresses index lookups, top-K with PK ordering, and JSON access.
+- Benchmark `duckdb.force_execution` (default off) before you turn it on: on a
+  mixed workload it helps `count(distinct)` and similar but regresses index
+  lookups, top-K with PK ordering, and JSON access.
 - `duckdb.temporary_directory` sets where DuckDB spills. Each backend gets its
   own subdirectory there, named after its process id, so concurrent spills
   cannot collide; one left by a departed backend is reclaimed. See

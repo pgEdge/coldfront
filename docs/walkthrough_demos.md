@@ -218,8 +218,8 @@ SELECT coldfront.set_storage_secret(
 );
 ```
 
-The cold-storage warehouse is now wired. Confirm the warehouse that setup
-created (`wh`) exists:
+With the credential stored, confirm the warehouse that setup created (`wh`)
+exists:
 
 ```bash
 curl -s localhost:8181/management/v1/warehouse \

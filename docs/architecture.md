@@ -167,8 +167,8 @@ The Iceberg catalog ATTACH is **lazy**: the coldfront C extension hook issues
 query that touches a tiered view** (read or write), per DuckDB cached
 connection. There is no setup step and no per-session boilerplate: both reads
 (the view's `duckdb.query`) and writes (`duckdb.raw_query`) work on a fresh
-psql session. Until a tiered view is touched no ATTACH is attempted, so a
-pre-bootstrap connection is never blocked by a missing warehouse.
+psql session. The hook attempts no `ATTACH` until a query touches a tiered
+view, so a missing warehouse never blocks a connection opened before bootstrap.
 
 ### Non-Superuser App Roles (Least Privilege)
 
