@@ -147,6 +147,7 @@ and how each reads back:
 | `jsonb` / `json` | `VARCHAR` | The view casts the value back to `json` (not `jsonb`, because Iceberg has no JSON primitive). |
 | `interval` | `VARCHAR` | The view casts the value back to `interval`. |
 | `vector(N)` / `halfvec(N)` | `FLOAT[]` (list of float) | The column reads back as `real[]`. |
+| A one-dimensional array of a type above, except `timestamptz`, `jsonb`, `json`, `interval` and the vector types | A list of the element's storage type | The column reads back as an array of the element's type; `smallint[]` reads as `integer[]`, and `varchar(N)[]` and `char(N)[]` read as `character varying[]`. |
 
 The following types are rejected rather than silently downgraded to `VARCHAR`,
 which would lose precision or identity:
@@ -158,9 +159,9 @@ which would lose precision or identity:
 - `numeric` without explicit `(P,S)`, because Iceberg requires bounded
   decimals.
 - custom enums, `xml`, `tsvector`/`tsquery`, range types, and multirange types.
-- composite types and arrays. (Arrays would map to Parquet `LIST<…>` only if
-  the element type is itself supported; that mapping is not yet implemented for
-  decoupled mode.)
+- composite types.
+- arrays of `timestamptz`, `jsonb`, `json`, `interval` or a vector type, and
+  arrays of arrays; [Arrays](usage.md#arrays) gives the reasons.
 - pgvector's `sparsevec`.
 - any type not enumerated above.
 
@@ -233,7 +234,8 @@ The helper performs the following steps:
 
     The projection wraps the struct accessor so applications see flat columns.
     Each column is cast to its view type where one exists (`json` for `jsonb`,
-    `interval`, `double precision`, `bytea`, `real[]` for vectors), and to its
+    `interval`, `double precision`, `bytea`, `real[]` for vectors, and
+    `text[]`, `double precision[]` and `bytea[]` for those arrays), and to its
     storage type otherwise, so a `text` column reads as `character varying`.
     The view reads via `duckdb.query()` so read-your-own-write inside an
     explicit transaction works; pg_duckdb's planner folds it into the same
@@ -332,13 +334,14 @@ each row:
 | string | `VARCHAR` | `text` | `varchar(N)`, `char(N)`, `jsonb`, `json`, `interval` |
 | uuid | `UUID` | `uuid` | |
 | binary, fixed[n] | `BLOB` | `bytea` | |
-| list of float | `FLOAT[]` | `real[]` | `vector(N)`, `halfvec(N)` |
+| list of a type above except timestamptz | the element's type followed by `[]`, such as `FLOAT[]` | an array of the element's PostgreSQL type, such as `real[]` | arrays of the collapsed inputs above, such as `smallint[]` and `varchar(N)[]`, and `vector(N)` and `halfvec(N)` for a list of float |
 
 Nanosecond timestamps are refused, because PostgreSQL stores microseconds; so
-are variant, geometry, struct, map, and lists of anything but float. The
-refusal names the column and the Iceberg type, except for `timestamptz_ns` and
-`geography`, which duckdb-iceberg refuses itself, with its own error, when the
-table loads.
+are variant, geometry, struct, map, a list of lists and a list of timestamptz,
+as the forward map refuses the arrays they would read as. The refusal names the
+column and the Iceberg type, or for a list of a type with no mapping, that
+element type, except for `timestamptz_ns` and `geography`, which duckdb-iceberg
+refuses itself, with its own error, when the table loads.
 
 `p_types` sets the type a column reads as, so a `jsonb` column that ColdFront
 created adopts as `jsonb` rather than `text`:

@@ -90,10 +90,14 @@ func (c Column) IsVector() bool { return c.Type == "FLOAT[]" }
 // this column on the PostgreSQL side, before pg_duckdb reads it, or "" when the
 // column exports as-is.
 //
-// Two cases need one, for different reasons. A VARCHAR-backed rich type
+// Three cases need one, for different reasons. A VARCHAR-backed rich type
 // (jsonb/json/interval) exports ::text because its Iceberg column is VARCHAR. A
 // vector exports ::real[] because pg_duckdb's PG reader cannot scan the pgvector
-// type at all, and ::text would stringify it into the wrong column type.
+// type at all, and ::text would stringify it into the wrong column type. A
+// numeric array exports ::text[] because pg_duckdb (c04e6a2) loses its precision
+// when it creates the DuckDB stage table, and refuses the column (pg_regress
+// array_cold_render); numeric's text is exact, and the Iceberg INSERT casts it
+// back to the column's DECIMAL.
 //
 // Types whose Iceberg storage is native (BLOB, DOUBLE) carry a ViewCastType only
 // to give the view a PG-parseable spelling, and must export unchanged:
@@ -104,6 +108,8 @@ func (c Column) ExportCast() string {
 		return "text"
 	case c.IsVector():
 		return "real[]"
+	case strings.HasPrefix(c.Type, "DECIMAL") && strings.HasSuffix(c.Type, "[]"):
+		return "text[]"
 	}
 	return ""
 }

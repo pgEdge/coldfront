@@ -54,7 +54,9 @@ SELECT p                                                                   AS pg
       'character(5)', 'char(5)', 'character',
       'numeric(12,2)', 'numeric(12, 2)', 'decimal(10,4)',
       'jsonb', 'json', 'interval',
-      'vector(3)', 'halfvec(3)'
+      'vector(3)', 'halfvec(3)',
+      'integer[]', 'smallint[]', 'real[]', 'double precision[]', 'text[]',
+      'varchar(8)[]', 'bytea[]', 'numeric(12,2)[]', 'timestamp[]'
   ]) WITH ORDINALITY AS u(p, ord)
  ORDER BY ord;
 
@@ -68,9 +70,24 @@ SELECT coldfront._pg_type_from_iceberg('GEOMETRY');
 SELECT coldfront._pg_type_from_iceberg('STRUCT(x INTEGER, y VARCHAR)');
 SELECT coldfront._pg_type_from_iceberg('MAP(VARCHAR, INTEGER)');
 
--- A list of anything but float: only list<float> has a wrapper-view spelling
--- both engines read the same way.
-SELECT coldfront._pg_type_from_iceberg('BIGINT[]');
+-- A list reads as an array of its element's PostgreSQL type, in either spelling
+-- of the element.
+SELECT d AS duckdb_type, coldfront._pg_type_from_iceberg(d) AS pg_type
+  FROM unnest(ARRAY[
+      'BIGINT[]', 'INTEGER[]', 'FLOAT[]', 'REAL[]', 'DOUBLE[]', 'BOOLEAN[]',
+      'DATE[]', 'TIME[]', 'TIMESTAMP[]', 'UUID[]', 'VARCHAR[]', 'BLOB[]',
+      'DECIMAL(12,2)[]', 'DECIMAL(12, 2)[]'
+  ]) WITH ORDINALITY AS u(d, ord)
+ ORDER BY ord;
+
+-- The lists the forward map refuses as arrays are refused here too: a nested
+-- list, a list of a type with no mapping, and a list of timestamptz.
+SELECT coldfront._pg_type_from_iceberg('INTEGER[][]');
+SELECT coldfront._pg_type_from_iceberg('STRUCT(x INTEGER)[]');
+SELECT coldfront._pg_type_from_iceberg('TIMESTAMP WITH TIME ZONE[]');
+-- A list's refusal names the element type that has no mapping, as DESCRIBE
+-- spelled it, and the column when the caller passes it.
+SELECT coldfront._pg_type_from_iceberg('STRUCT(x INTEGER)[]', 'pts');
 
 -- An unbounded DECIMAL never comes from DESCRIBE, which always spells out the
 -- precision and scale, and PostgreSQL cannot be told the width otherwise.

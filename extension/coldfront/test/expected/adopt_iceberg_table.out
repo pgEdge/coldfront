@@ -196,8 +196,8 @@ CONTEXT:  PL/pgSQL function _adopt_column_type(text,text,jsonb) line 11 at RAISE
 -- An unmappable column is refused by name whether or not p_types mentions it.
 SELECT coldfront._adopt_column_type('payload', 'STRUCT(x INTEGER)', NULL);
 ERROR:  coldfront: column "payload" has Iceberg type STRUCT(x INTEGER), which has no PostgreSQL mapping
-HINT:  Supported: BOOLEAN, INTEGER, BIGINT, FLOAT, DOUBLE, DECIMAL(P,S), DATE, TIME, TIMESTAMP, TIMESTAMP WITH TIME ZONE, VARCHAR, UUID, BLOB, FLOAT[]. Leave the table where it is, or project the unsupported columns away into an Iceberg view first.
-CONTEXT:  PL/pgSQL function _pg_type_from_iceberg(text,text) line 36 at RAISE
+HINT:  Supported: BOOLEAN, INTEGER, BIGINT, FLOAT, DOUBLE, DECIMAL(P,S), DATE, TIME, TIMESTAMP, TIMESTAMP WITH TIME ZONE, VARCHAR, UUID, BLOB, and lists of those types except TIMESTAMP WITH TIME ZONE. Leave the table where it is, or project the unsupported columns away into an Iceberg view first.
+CONTEXT:  PL/pgSQL function _pg_type_from_iceberg(text,text) line 45 at RAISE
 PL/pgSQL function _adopt_column_type(text,text,jsonb) line 4 during statement block local variable initialization
 -- The registration adoption ends in, exercised directly: the wrapper view casts
 -- each column to the type it was given, and the registry row carries the

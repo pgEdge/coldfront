@@ -73,36 +73,140 @@ DROP TABLE type_map_probe;
 -- query that reads them, and every read of a tiered table after its first
 -- archive is planned by pg_duckdb.
 SELECT coldfront._iceberg_storage_type('inet');
-ERROR:  coldfront: PG type inet has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, numeric(P,S), jsonb, json, interval, vector(N), halfvec(N). inet/cidr/oid unsupported (store IP data as text, oid values as bigint); sparsevec unsupported (keep it in the hot tier)
-CONTEXT:  PL/pgSQL function _iceberg_storage_type(text,text) line 44 at RAISE
+ERROR:  coldfront: PG type inet has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, numeric(P,S), jsonb, json, interval, vector(N), halfvec(N), and one-dimensional arrays of those types except timestamptz, jsonb, json, interval and the vector types. inet/cidr/oid unsupported (store IP data as text, oid values as bigint); sparsevec unsupported (keep it in the hot tier)
+CONTEXT:  PL/pgSQL function _iceberg_storage_type(text,text) line 67 at RAISE
 SELECT coldfront._iceberg_storage_type('cidr');
-ERROR:  coldfront: PG type cidr has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, numeric(P,S), jsonb, json, interval, vector(N), halfvec(N). inet/cidr/oid unsupported (store IP data as text, oid values as bigint); sparsevec unsupported (keep it in the hot tier)
-CONTEXT:  PL/pgSQL function _iceberg_storage_type(text,text) line 44 at RAISE
+ERROR:  coldfront: PG type cidr has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, numeric(P,S), jsonb, json, interval, vector(N), halfvec(N), and one-dimensional arrays of those types except timestamptz, jsonb, json, interval and the vector types. inet/cidr/oid unsupported (store IP data as text, oid values as bigint); sparsevec unsupported (keep it in the hot tier)
+CONTEXT:  PL/pgSQL function _iceberg_storage_type(text,text) line 67 at RAISE
 SELECT coldfront._iceberg_storage_type('oid');
-ERROR:  coldfront: PG type oid has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, numeric(P,S), jsonb, json, interval, vector(N), halfvec(N). inet/cidr/oid unsupported (store IP data as text, oid values as bigint); sparsevec unsupported (keep it in the hot tier)
-CONTEXT:  PL/pgSQL function _iceberg_storage_type(text,text) line 44 at RAISE
+ERROR:  coldfront: PG type oid has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, numeric(P,S), jsonb, json, interval, vector(N), halfvec(N), and one-dimensional arrays of those types except timestamptz, jsonb, json, interval and the vector types. inet/cidr/oid unsupported (store IP data as text, oid values as bigint); sparsevec unsupported (keep it in the hot tier)
+CONTEXT:  PL/pgSQL function _iceberg_storage_type(text,text) line 67 at RAISE
 SELECT coldfront._iceberg_storage_type('numeric');
 ERROR:  coldfront: unbounded numeric not supported in iceberg; use numeric(P,S) with P<=38
-CONTEXT:  PL/pgSQL function _iceberg_storage_type(text,text) line 33 at RAISE
+CONTEXT:  PL/pgSQL function _iceberg_storage_type(text,text) line 56 at RAISE
 SELECT coldfront._iceberg_storage_type('time with time zone');
-ERROR:  coldfront: PG type time with time zone has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, numeric(P,S), jsonb, json, interval, vector(N), halfvec(N). inet/cidr/oid unsupported (store IP data as text, oid values as bigint); sparsevec unsupported (keep it in the hot tier)
-CONTEXT:  PL/pgSQL function _iceberg_storage_type(text,text) line 44 at RAISE
+ERROR:  coldfront: PG type time with time zone has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, numeric(P,S), jsonb, json, interval, vector(N), halfvec(N), and one-dimensional arrays of those types except timestamptz, jsonb, json, interval and the vector types. inet/cidr/oid unsupported (store IP data as text, oid values as bigint); sparsevec unsupported (keep it in the hot tier)
+CONTEXT:  PL/pgSQL function _iceberg_storage_type(text,text) line 67 at RAISE
 SELECT coldfront._iceberg_storage_type('tsvector');
-ERROR:  coldfront: PG type tsvector has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, numeric(P,S), jsonb, json, interval, vector(N), halfvec(N). inet/cidr/oid unsupported (store IP data as text, oid values as bigint); sparsevec unsupported (keep it in the hot tier)
-CONTEXT:  PL/pgSQL function _iceberg_storage_type(text,text) line 44 at RAISE
+ERROR:  coldfront: PG type tsvector has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, numeric(P,S), jsonb, json, interval, vector(N), halfvec(N), and one-dimensional arrays of those types except timestamptz, jsonb, json, interval and the vector types. inet/cidr/oid unsupported (store IP data as text, oid values as bigint); sparsevec unsupported (keep it in the hot tier)
+CONTEXT:  PL/pgSQL function _iceberg_storage_type(text,text) line 67 at RAISE
 SELECT coldfront._iceberg_storage_type('xml');
-ERROR:  coldfront: PG type xml has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, numeric(P,S), jsonb, json, interval, vector(N), halfvec(N). inet/cidr/oid unsupported (store IP data as text, oid values as bigint); sparsevec unsupported (keep it in the hot tier)
-CONTEXT:  PL/pgSQL function _iceberg_storage_type(text,text) line 44 at RAISE
+ERROR:  coldfront: PG type xml has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, numeric(P,S), jsonb, json, interval, vector(N), halfvec(N), and one-dimensional arrays of those types except timestamptz, jsonb, json, interval and the vector types. inet/cidr/oid unsupported (store IP data as text, oid values as bigint); sparsevec unsupported (keep it in the hot tier)
+CONTEXT:  PL/pgSQL function _iceberg_storage_type(text,text) line 67 at RAISE
 CREATE TYPE type_map_mood AS ENUM ('ok');
 SELECT coldfront._iceberg_storage_type('type_map_mood');
-ERROR:  coldfront: PG type type_map_mood has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, numeric(P,S), jsonb, json, interval, vector(N), halfvec(N). inet/cidr/oid unsupported (store IP data as text, oid values as bigint); sparsevec unsupported (keep it in the hot tier)
-CONTEXT:  PL/pgSQL function _iceberg_storage_type(text,text) line 44 at RAISE
+ERROR:  coldfront: PG type type_map_mood has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, numeric(P,S), jsonb, json, interval, vector(N), halfvec(N), and one-dimensional arrays of those types except timestamptz, jsonb, json, interval and the vector types. inet/cidr/oid unsupported (store IP data as text, oid values as bigint); sparsevec unsupported (keep it in the hot tier)
+CONTEXT:  PL/pgSQL function _iceberg_storage_type(text,text) line 67 at RAISE
 DROP TYPE type_map_mood;
 -- Given the column, a refusal names it. The archiver, the partition CLI,
 -- create_iceberg_table and the DDL hook's mirror and view rebuild pass it.
 SELECT coldfront._iceberg_storage_type('inet', 'ip');
-ERROR:  coldfront: column "ip": PG type inet has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, numeric(P,S), jsonb, json, interval, vector(N), halfvec(N). inet/cidr/oid unsupported (store IP data as text, oid values as bigint); sparsevec unsupported (keep it in the hot tier)
-CONTEXT:  PL/pgSQL function _iceberg_storage_type(text,text) line 44 at RAISE
+ERROR:  coldfront: column "ip": PG type inet has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, numeric(P,S), jsonb, json, interval, vector(N), halfvec(N), and one-dimensional arrays of those types except timestamptz, jsonb, json, interval and the vector types. inet/cidr/oid unsupported (store IP data as text, oid values as bigint); sparsevec unsupported (keep it in the hot tier)
+CONTEXT:  PL/pgSQL function _iceberg_storage_type(text,text) line 67 at RAISE
 SELECT coldfront._iceberg_storage_type('numeric', 'amount');
 ERROR:  coldfront: column "amount": unbounded numeric not supported in iceberg; use numeric(P,S) with P<=38
-CONTEXT:  PL/pgSQL function _iceberg_storage_type(text,text) line 33 at RAISE
+CONTEXT:  PL/pgSQL function _iceberg_storage_type(text,text) line 56 at RAISE
+-- A one-dimensional array of a native type stores as an Iceberg list of the
+-- element's storage type, and reads back as an array of the element's surface
+-- type. text[] keeps its own spelling: the array operators (=, @>, &&) take
+-- varchar[] and text[] as different types.
+CREATE TABLE type_map_arrays (
+    a_bigint   bigint[],
+    a_integer  integer[],
+    a_smallint smallint[],
+    a_real     real[],
+    a_double   double precision[],
+    a_boolean  boolean[],
+    a_date     date[],
+    a_time     time[],
+    a_ts       timestamp[],
+    a_uuid     uuid[],
+    a_text     text[],
+    a_varchar  varchar(8)[],
+    a_char     char(4)[],
+    a_bytea    bytea[],
+    a_numeric  numeric(12,2)[]
+);
+SELECT a.attname,
+       format_type(a.atttypid, a.atttypmod)                                    AS format_type,
+       coldfront._iceberg_storage_type(format_type(a.atttypid, a.atttypmod))   AS storage,
+       coldfront._iceberg_view_cast_type(format_type(a.atttypid, a.atttypmod)) AS view_cast
+  FROM pg_attribute a
+ WHERE a.attrelid = 'type_map_arrays'::regclass AND a.attnum > 0
+ ORDER BY a.attnum;
+  attname   |          format_type          |     storage     |     view_cast      
+------------+-------------------------------+-----------------+--------------------
+ a_bigint   | bigint[]                      | BIGINT[]        | 
+ a_integer  | integer[]                     | INTEGER[]       | 
+ a_smallint | smallint[]                    | INTEGER[]       | 
+ a_real     | real[]                        | REAL[]          | 
+ a_double   | double precision[]            | DOUBLE[]        | double precision[]
+ a_boolean  | boolean[]                     | BOOLEAN[]       | 
+ a_date     | date[]                        | DATE[]          | 
+ a_time     | time without time zone[]      | TIME[]          | 
+ a_ts       | timestamp without time zone[] | TIMESTAMP[]     | 
+ a_uuid     | uuid[]                        | UUID[]          | 
+ a_text     | text[]                        | VARCHAR[]       | text[]
+ a_varchar  | character varying(8)[]        | VARCHAR[]       | 
+ a_char     | character(4)[]                | VARCHAR[]       | 
+ a_bytea    | bytea[]                       | BLOB[]          | bytea[]
+ a_numeric  | numeric(12,2)[]               | DECIMAL(12,2)[] | 
+(15 rows)
+
+DROP TABLE type_map_arrays;
+-- Refused arrays: an element that is itself an array or a vector, an element
+-- stored as text and read back through a cast, and an element the map refuses.
+SELECT coldfront._iceberg_storage_type('integer[][]');
+ERROR:  coldfront: PG type integer[][] has no Iceberg-compatible mapping: an array element cannot itself be an array or a vector
+CONTEXT:  PL/pgSQL function _iceberg_storage_type(text,text) line 16 at RAISE
+SELECT coldfront._iceberg_storage_type('vector(3)[]');
+ERROR:  coldfront: PG type vector(3)[] has no Iceberg-compatible mapping: an array element cannot itself be an array or a vector
+CONTEXT:  PL/pgSQL function _iceberg_storage_type(text,text) line 16 at RAISE
+SELECT coldfront._iceberg_storage_type('halfvec(3)[]');
+ERROR:  coldfront: PG type halfvec(3)[] has no Iceberg-compatible mapping: an array element cannot itself be an array or a vector
+CONTEXT:  PL/pgSQL function _iceberg_storage_type(text,text) line 16 at RAISE
+SELECT coldfront._iceberg_storage_type('jsonb[]');
+ERROR:  coldfront: PG type jsonb[] has no Iceberg-compatible mapping: jsonb is stored as text and read back through a cast, which an array element does not get
+CONTEXT:  PL/pgSQL function _iceberg_storage_type(text,text) line 19 at RAISE
+SELECT coldfront._iceberg_storage_type('json[]');
+ERROR:  coldfront: PG type json[] has no Iceberg-compatible mapping: json is stored as text and read back through a cast, which an array element does not get
+CONTEXT:  PL/pgSQL function _iceberg_storage_type(text,text) line 19 at RAISE
+SELECT coldfront._iceberg_storage_type('interval[]');
+ERROR:  coldfront: PG type interval[] has no Iceberg-compatible mapping: interval is stored as text and read back through a cast, which an array element does not get
+CONTEXT:  PL/pgSQL function _iceberg_storage_type(text,text) line 19 at RAISE
+SELECT coldfront._iceberg_storage_type('inet[]');
+ERROR:  coldfront: PG type inet has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, numeric(P,S), jsonb, json, interval, vector(N), halfvec(N), and one-dimensional arrays of those types except timestamptz, jsonb, json, interval and the vector types. inet/cidr/oid unsupported (store IP data as text, oid values as bigint); sparsevec unsupported (keep it in the hot tier)
+CONTEXT:  PL/pgSQL function _iceberg_storage_type(text,text) line 67 at RAISE
+PL/pgSQL function _iceberg_storage_type(text,text) line 14 at assignment
+-- An array type is spelled as format_type spells it, the element followed by
+-- []. A decoupled table's column list is the one input that can spell it
+-- otherwise, and those spellings are refused.
+SELECT coldfront._iceberg_storage_type('integer[3]');
+ERROR:  coldfront: PG type integer[3] has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, numeric(P,S), jsonb, json, interval, vector(N), halfvec(N), and one-dimensional arrays of those types except timestamptz, jsonb, json, interval and the vector types. inet/cidr/oid unsupported (store IP data as text, oid values as bigint); sparsevec unsupported (keep it in the hot tier)
+CONTEXT:  PL/pgSQL function _iceberg_storage_type(text,text) line 67 at RAISE
+SELECT coldfront._iceberg_storage_type('integer array');
+ERROR:  coldfront: PG type integer array has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, numeric(P,S), jsonb, json, interval, vector(N), halfvec(N), and one-dimensional arrays of those types except timestamptz, jsonb, json, interval and the vector types. inet/cidr/oid unsupported (store IP data as text, oid values as bigint); sparsevec unsupported (keep it in the hot tier)
+CONTEXT:  PL/pgSQL function _iceberg_storage_type(text,text) line 67 at RAISE
+-- An array's refusal names the column too, whichever part of the type refuses.
+SELECT coldfront._iceberg_storage_type('jsonb[]', 'docs');
+ERROR:  coldfront: column "docs": PG type jsonb[] has no Iceberg-compatible mapping: jsonb is stored as text and read back through a cast, which an array element does not get
+CONTEXT:  PL/pgSQL function _iceberg_storage_type(text,text) line 19 at RAISE
+SELECT coldfront._iceberg_storage_type('inet[]', 'ips');
+ERROR:  coldfront: column "ips": PG type inet has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, numeric(P,S), jsonb, json, interval, vector(N), halfvec(N), and one-dimensional arrays of those types except timestamptz, jsonb, json, interval and the vector types. inet/cidr/oid unsupported (store IP data as text, oid values as bigint); sparsevec unsupported (keep it in the hot tier)
+CONTEXT:  PL/pgSQL function _iceberg_storage_type(text,text) line 67 at RAISE
+PL/pgSQL function _iceberg_storage_type(text,text) line 14 at assignment
+-- timestamptz[] is refused because pg_duckdb (c04e6a2) cannot read the column,
+-- and every read of a tiered view after its first archive is a pg_duckdb scan of
+-- the hot table. The probe has a tiered view's shape: the DuckDB read in its
+-- second branch makes pg_duckdb plan the whole query, hot table included. When
+-- the probe reads the value, the refusal can go.
+SELECT coldfront._iceberg_storage_type('timestamp with time zone[]');
+ERROR:  coldfront: PG type timestamp with time zone[] has no Iceberg-compatible mapping: pg_duckdb cannot read a timestamptz[] column (store timestamp[] in UTC instead)
+CONTEXT:  PL/pgSQL function _iceberg_storage_type(text,text) line 25 at RAISE
+CREATE TABLE type_map_tstz (a timestamptz[]);
+INSERT INTO type_map_tstz VALUES ('{2026-01-02 03:04:05+00}');
+SELECT a FROM type_map_tstz
+UNION ALL
+SELECT NULL::timestamptz[] FROM duckdb.query('SELECT 1') AS t(r);
+ERROR:  (PGDuckDB/CreatePlan) Prepared query returned an error: Not implemented Error: Unsupported PostgreSQL type found in query: Oid=1185
+DROP TABLE type_map_tstz;

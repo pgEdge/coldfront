@@ -25,8 +25,8 @@ SELECT t,
 -- sparsevec is refused rather than densified: float4[65536] is a 100x storage
 -- blowup, so it stays hot-only.
 SELECT coldfront._iceberg_storage_type('sparsevec(65536)');
-ERROR:  coldfront: PG type sparsevec(65536) has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, numeric(P,S), jsonb, json, interval, vector(N), halfvec(N). inet/cidr/oid unsupported (store IP data as text, oid values as bigint); sparsevec unsupported (keep it in the hot tier)
-CONTEXT:  PL/pgSQL function _iceberg_storage_type(text,text) line 44 at RAISE
+ERROR:  coldfront: PG type sparsevec(65536) has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, numeric(P,S), jsonb, json, interval, vector(N), halfvec(N), and one-dimensional arrays of those types except timestamptz, jsonb, json, interval and the vector types. inet/cidr/oid unsupported (store IP data as text, oid values as bigint); sparsevec unsupported (keep it in the hot tier)
+CONTEXT:  PL/pgSQL function _iceberg_storage_type(text,text) line 67 at RAISE
 -- format_type output is what the map actually receives, dimension included.
 CREATE TABLE vec_map_probe (id bigint, embedding vector(3));
 SELECT format_type(atttypid, atttypmod) AS format_type

@@ -177,6 +177,10 @@ func TestColumn_ExportCast(t *testing.T) {
 		{"double exports as-is", Column{Type: "DOUBLE", ViewCastType: "double precision"}, ""},
 		{"integer exports as-is", Column{Type: "INTEGER"}, ""},
 		{"vector exports as real[]", Column{Type: "FLOAT[]", ViewCastType: "real[]"}, "real[]"},
+		{"numeric array exports as text[]", Column{Type: "DECIMAL(10,2)[]"}, "text[]"},
+		{"text array exports as-is", Column{Type: "VARCHAR[]", ViewCastType: "text[]"}, ""},
+		{"bytea array exports as bytes", Column{Type: "BLOB[]", ViewCastType: "bytea[]"}, ""},
+		{"real array is not a vector", Column{Type: "REAL[]"}, ""},
 	} {
 		t.Run(tt.name, func(t *testing.T) {
 			assert.Equal(t, tt.want, tt.col.ExportCast())

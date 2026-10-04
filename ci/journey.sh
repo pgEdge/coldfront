@@ -1065,6 +1065,295 @@ EOSQL
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# Story: TC-238..TC-251, arrays. A one-dimensional array of a native type tiers
+# as an Iceberg list and reads back unchanged whichever path moved it: the
+# archive, a read of the hot tier through the view, a cold INSERT through the
+# view under either bytea_output, a cold UPDATE with an ARRAY[...] literal or a
+# bound parameter, a cross-tier move each way, compaction, and the replay of
+# writes made during an archive. A shape a list cannot hold is refused where it
+# is written, a decoupled and an adopted table take arrays too, and the read
+# operators the docs name work through the view.
+# ───────────────────────────────────────────────────────────────────────────
+story_arrays() {
+    step "TC-238..TC-251: arrays tier as Iceberg lists and read back unchanged"
+    local cold="ts < date_trunc('month',now()) - interval '3 months'"
+    local m4="date_trunc('month',now()) - interval '4 months'"
+    local hot="date_trunc('month',now()) - interval '1 month'"
+    local cols="tags, nums, small, dbl, amounts, days, stamps, times, ids, blobs, flags, names, blob, bigs, reals"
+    local want
+    _tcarr_cleanup() {
+        local t
+        for t in tcarr tcarr_dec; do
+            q "$HOST" "SELECT coldfront.drop_iceberg_table('public','$t', true);" >/dev/null 2>&1
+        done
+        q "$HOST" "SELECT coldfront.release_iceberg_table('public','tcarr_adopt');" >/dev/null 2>&1
+        q "$HOST" "SELECT coldfront.ensure_attached(); SELECT duckdb.raw_query('DROP TABLE IF EXISTS ice.tcarrns.tcarr_adopt'); SELECT duckdb.raw_query('DROP TABLE IF EXISTS ice.public.tcarr_2d');" >/dev/null 2>&1
+        q "$HOST" "DELETE FROM coldfront.tiered_views WHERE relname IN ('tcarr','tcarr_dec','tcarr_adopt','tcarr_2d'); DELETE FROM coldfront.archive_watermark WHERE table_name IN ('tcarr','tcarr_2d'); DELETE FROM coldfront.partition_config WHERE table_name IN ('tcarr','tcarr_2d','tcarr_tz');" >/dev/null 2>&1
+        for t in tcarr tcarr_dec tcarr_adopt; do q "$HOST" "DROP VIEW IF EXISTS public.$t CASCADE;" >/dev/null 2>&1; done
+        for t in _tcarr tcarr tcarr_expect tcarr_2d _tcarr_2d tcarr_tz tcarr_src; do q "$HOST" "DROP TABLE IF EXISTS public.$t CASCADE;" >/dev/null 2>&1; done
+    }
+    trap _tcarr_cleanup RETURN
+    qf "$HOST" <<'EOSQL' >/dev/null
+CREATE TABLE public.tcarr (id bigint NOT NULL, ts timestamptz NOT NULL,
+    tags text[], nums integer[], small smallint[], dbl double precision[],
+    amounts numeric(10,2)[], days date[], stamps timestamp[], times time[],
+    ids uuid[], blobs bytea[], flags boolean[], names varchar(8)[], blob bytea, codes char(3)[],
+    bigs bigint[], reals real[], PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);
+DO $do$ DECLARE m date; BEGIN
+  FOREACH m IN ARRAY ARRAY[(date_trunc('month',now()) - interval '4 months')::date,
+                           (date_trunc('month',now()) - interval '1 month')::date] LOOP
+    EXECUTE format('CREATE TABLE public.%I PARTITION OF public.tcarr FOR VALUES FROM (%L) TO (%L)',
+                   'tcarr_p_' || to_char(m, 'YYYY_MM'), m, m + interval '1 month');
+  END LOOP; END $do$;
+-- The one row every path is compared against: text a list parser would read
+-- differently, NULL elements, and the edge values of each element type.
+CREATE TABLE public.tcarr_expect AS SELECT
+    ARRAY['plain', 'with,comma', 'with "quote"', 'back\slash', '{brace}', '[bracket]',
+          'NULL', NULL, '', E'tab\tx', E'nl\nx', 'a''b', 'ünï', ' lead', 'trail ']::text[] AS tags,
+    '{1,NULL,-2147483648}'::integer[] AS nums,
+    '{7,-32768}'::smallint[] AS small,
+    '{2.5,1e300,-0.5}'::double precision[] AS dbl,
+    '{1.25,NULL,-99999999.99}'::numeric(10,2)[] AS amounts,
+    '{2026-01-02,0001-01-01}'::date[] AS days,
+    '{2026-01-02 03:04:05.123456}'::timestamp[] AS stamps,
+    '{12:34:56.789,00:00:00}'::time[] AS times,
+    '{a0eebc99-9c0b-4ef8-bb6d-6bb9bd380a11,NULL}'::uuid[] AS ids,
+    ARRAY['\x0102'::bytea, '\x'::bytea, NULL] AS blobs,
+    '{t,f,NULL}'::boolean[] AS flags,
+    '{abc,"x y"}'::varchar(8)[] AS names,
+    '\xdeadbeef'::bytea AS blob,
+    '{ab,abc}'::char(3)[] AS codes,
+    '{9223372036854775807,NULL,-9223372036854775808}'::bigint[] AS bigs,
+    '{1.5,NULL,-0.25}'::real[] AS reals;
+INSERT INTO public.tcarr
+  SELECT 1, date_trunc('month',now()) - interval '4 months' + interval '3 days', * FROM public.tcarr_expect;
+INSERT INTO public.tcarr (id, ts, tags, nums) VALUES
+  (2, date_trunc('month',now()) - interval '4 months' + interval '4 days', '{}', '{}'),
+  (3, date_trunc('month',now()) - interval '4 months' + interval '5 days', NULL, NULL);
+INSERT INTO public.tcarr
+  SELECT 4, date_trunc('month',now()) - interval '1 month' + interval '3 days', * FROM public.tcarr_expect;
+EOSQL
+    if ! "$ARCHIVER" register --table tcarr --column ts --period monthly \
+            --hot-period "$(hot_days) days" >"$TMPD/tcarr.log" 2>&1; then
+        fail "TC-238: register a table with array columns (see $TMPD/tcarr.log)"; tail -5 "$TMPD/tcarr.log"; return
+    fi
+    if ! archive_only "schema_name='public' AND table_name='tcarr'" "$TMPD/tcarr.log"; then
+        fail "TC-238: archive a table with array columns (see $TMPD/tcarr.log)"; tail -5 "$TMPD/tcarr.log"; return
+    fi
+    want=$(q "$HOST" "SELECT $cols FROM public.tcarr_expect;")
+    # TC-238: the archive writes Iceberg lists, and they read back unchanged.
+    assert_eq "TC-238: the Iceberg table stores each array as a list" "VARCHAR[]|INTEGER[]|BLOB[]|DECIMAL(10,2)[]" \
+        "$(q "$HOST" "SELECT coldfront.ensure_attached(); SELECT string_agg(r['column_type']::text, '|' ORDER BY r['column_name']::text DESC) FROM duckdb.query('DESCRIBE ice.public.tcarr') AS t(r) WHERE r['column_name']::text IN ('tags', 'nums', 'amounts', 'blobs');" | tail -1)"
+    assert_eq "TC-238: an archived row's arrays read back unchanged" "$want" \
+        "$(q "$HOST" "SELECT $cols FROM public.tcarr WHERE id = 1;")"
+    assert_eq "TC-238: and the row is cold" "1" "$(q "$HOST" "SELECT count(*) FROM public.tcarr WHERE id = 1 AND $cold;")"
+    assert_eq "TC-238: the view reads each array as the type the docs give" \
+        "text[]|integer[]|integer[]|double precision[]|numeric(10,2)[]|date[]|timestamp without time zone[]|time without time zone[]|uuid[]|bytea[]|boolean[]|character varying[]|bytea|character varying[]|bigint[]|real[]" \
+        "$(q "$HOST" "SELECT string_agg(format_type(atttypid, atttypmod), '|' ORDER BY attnum) FROM pg_attribute WHERE attrelid = 'public.tcarr'::regclass AND attnum > 2;")"
+    assert_eq "TC-238: a char(N) array reads back unpadded, as a char(N) column does" "{ab,abc}" \
+        "$(q "$HOST" "SELECT codes FROM public.tcarr WHERE id = 1;")"
+    # TC-239: an empty array and a NULL one stay distinct.
+    assert_eq "TC-239: empty and NULL arrays stay distinct" "$(printf '{}|{}\n|')" \
+        "$(q "$HOST" "SELECT tags, nums FROM public.tcarr WHERE id IN (2, 3) ORDER BY id;")"
+    # TC-240: once the view reads through DuckDB, the hot row's arrays read back unchanged.
+    assert_eq "TC-240: a hot row's arrays read back unchanged through the view" "$want" \
+        "$(q "$HOST" "SELECT $cols FROM public.tcarr WHERE id = 4;")"
+    assert_eq "TC-240: its char(N) array reads back unpadded too" "{ab,abc}" \
+        "$(q "$HOST" "SELECT codes FROM public.tcarr WHERE id = 4;")"
+    # TC-241: a cold INSERT through the view, under either bytea_output.
+    q "$HOST" "INSERT INTO public.tcarr SELECT 10, $m4 + interval '6 days', * FROM public.tcarr_expect;" >/dev/null
+    q "$HOST" "SET bytea_output = escape; INSERT INTO public.tcarr SELECT 11, $m4 + interval '7 days', * FROM public.tcarr_expect;" >/dev/null
+    assert_eq "TC-241: a cold INSERT through the view writes the same arrays" "$want" \
+        "$(q "$HOST" "SELECT $cols FROM public.tcarr WHERE id = 10;")"
+    assert_eq "TC-241: and does under bytea_output = escape" "$want" \
+        "$(q "$HOST" "SELECT $cols FROM public.tcarr WHERE id = 11;")"
+    q "$HOST" "INSERT INTO public.tcarr (id, ts, tags, nums) VALUES (12, $m4 + interval '10 days', '{a,\"b c\"}', '{1,2}');" >/dev/null
+    assert_eq "TC-241: a tiered INSERT takes a brace literal, its source running in PostgreSQL" '{a,"b c"}|{1,2}' \
+        "$(q "$HOST" "SELECT tags, nums FROM public.tcarr WHERE id = 12;")"
+    # TC-242: a cold UPDATE writes an ARRAY[...] literal and bound parameters; a
+    # brace literal reaches DuckDB as text and is refused.
+    q "$HOST" "UPDATE public.tcarr SET tags = ARRAY['x', NULL, 'y,z'], nums = ARRAY[5] WHERE id = 10;" >/dev/null
+    assert_eq "TC-242: a cold UPDATE writes an ARRAY[...] literal" '{x,NULL,"y,z"}|{5}' \
+        "$(q "$HOST" "SELECT tags, nums FROM public.tcarr WHERE id = 10;")"
+    q "$HOST" "PREPARE tcarr_set(text[], numeric[], real[]) AS UPDATE public.tcarr SET tags = \$1, amounts = \$2, reals = \$3 WHERE id = 10; EXECUTE tcarr_set(ARRAY['p,q', 'r\"s', E'tab\\tx'], '{0.5,NULL}', '{2.5,NULL}');" >/dev/null
+    assert_eq "TC-242: a cold UPDATE writes bound array parameters" \
+        "$(q "$HOST" "SELECT ARRAY['p,q', 'r\"s', E'tab\\tx'], '{0.5,NULL}'::numeric(10,2)[], '{2.5,NULL}'::real[];")" \
+        "$(q "$HOST" "SELECT tags, amounts, reals FROM public.tcarr WHERE id = 10;")"
+    assert_err "TC-242: a brace literal in a cold UPDATE is refused" "can't be cast" \
+        "$(q_may "$HOST" "UPDATE public.tcarr SET tags = '{a,b}' WHERE id = 10;")"
+    # TC-243: a cross-tier move each way keeps the arrays.
+    q "$HOST" "UPDATE public.tcarr SET ts = $hot + interval '5 days' WHERE id = 11;" >/dev/null
+    assert_eq "TC-243: a row moved to the hot tier keeps its arrays" "$want|1" \
+        "$(q "$HOST" "SELECT $cols, (SELECT count(*) FROM public._tcarr WHERE id = 11) FROM public.tcarr WHERE id = 11;")"
+    q "$HOST" "UPDATE public.tcarr SET ts = $m4 + interval '8 days' WHERE id = 11;" >/dev/null
+    assert_eq "TC-243: moved back to the cold tier, it keeps them" "$want|0" \
+        "$(q "$HOST" "SELECT $cols, (SELECT count(*) FROM public._tcarr WHERE id = 11) FROM public.tcarr WHERE id = 11;")"
+    # TC-244: the read operators the docs name, on both tiers.
+    assert_eq "TC-244: = ANY finds an element" "1,4,11" \
+        "$(q "$HOST" "SELECT string_agg(id::text, ',' ORDER BY id) FROM public.tcarr WHERE 'with,comma' = ANY(tags);")"
+    assert_eq "TC-244: @> takes an ARRAY[...] of text" "1,4,11" \
+        "$(q "$HOST" "SELECT string_agg(id::text, ',' ORDER BY id) FROM public.tcarr WHERE tags @> ARRAY['plain', 'a''b'];")"
+    assert_eq "TC-244: && takes one too" "1,4,10,11" \
+        "$(q "$HOST" "SELECT string_agg(id::text, ',' ORDER BY id) FROM public.tcarr WHERE tags && ARRAY['p,q', 'plain'];")"
+    assert_eq "TC-244: subscripts and slices count from 1" "with,comma|{1,NULL}" \
+        "$(q "$HOST" "SELECT tags[2], nums[1:2] FROM public.tcarr WHERE id = 1;")"
+    assert_eq "TC-244: array_length and unnest" "15|15" \
+        "$(q "$HOST" "SELECT array_length(tags, 1), (SELECT count(*) FROM (SELECT unnest(tags) FROM public.tcarr WHERE id = 1) u) FROM public.tcarr WHERE id = 1;")"
+    assert_err "TC-244: a brace literal in a read is refused" "can't be cast" \
+        "$(q_may "$HOST" "SELECT count(*) FROM public.tcarr WHERE tags = '{a}';")"
+    assert_err "TC-244: an array parameter in a read is refused" "Could not convert Postgres parameter" \
+        "$(q_may "$HOST" "PREPARE tcarr_rd(text[]) AS SELECT count(*) FROM public.tcarr WHERE tags && \$1; EXECUTE tcarr_rd(ARRAY['x']);")"
+    assert_err "TC-244: cardinality is refused" "Cardinality can only operate on MAPs" \
+        "$(q_may "$HOST" "SELECT cardinality(tags) FROM public.tcarr WHERE id = 1;")"
+    # TC-245: a shape a list cannot hold, or an element its scalar type refuses,
+    # is refused on every write path, and nothing is written.
+    assert_err "TC-245: a hot array numbered from 0 is refused" "coldfront_guard_nums" \
+        "$(q_may "$HOST" "INSERT INTO public.tcarr (id, ts, nums) VALUES (20, $hot + interval '1 day', '[0:1]={1,2}');")"
+    assert_err "TC-245: a hot two-dimensional array is refused" "coldfront_guard_nums" \
+        "$(q_may "$HOST" "INSERT INTO public.tcarr (id, ts, nums) VALUES (20, $hot + interval '1 day', '{{1,2},{3,4}}');")"
+    assert_err "TC-245: a hot NaN element is refused" "coldfront_guard_amounts" \
+        "$(q_may "$HOST" "INSERT INTO public.tcarr (id, ts, amounts) VALUES (20, $hot + interval '1 day', '{1,NaN}');")"
+    assert_err "TC-245: a hot infinity element is refused" "coldfront_guard_days" \
+        "$(q_may "$HOST" "INSERT INTO public.tcarr (id, ts, days) VALUES (20, $hot + interval '1 day', '{infinity}');")"
+    assert_err "TC-245: and so is a timestamp one" "coldfront_guard_stamps" \
+        "$(q_may "$HOST" "INSERT INTO public.tcarr (id, ts, stamps) VALUES (20, $hot + interval '1 day', '{-infinity}');")"
+    assert_err "TC-245: a hot UPDATE to an array numbered from 0 is refused" "coldfront_guard_nums" \
+        "$(q_may "$HOST" "UPDATE public.tcarr SET nums = '[0:1]={1,2}' WHERE id = 4 AND ts >= $hot;")"
+    assert_err "TC-245: and so is one to a NaN element" "coldfront_guard_amounts" \
+        "$(q_may "$HOST" "UPDATE public.tcarr SET amounts = '{NaN}' WHERE id = 4 AND ts >= $hot;")"
+    assert_err "TC-245: a cold array numbered from 0 is refused" 'column "nums" holds an array of 1 dimension(s) starting at element 0' \
+        "$(q_may "$HOST" "INSERT INTO public.tcarr (id, ts, nums) VALUES (21, $m4 + interval '9 days', '[0:1]={1,2}');")"
+    assert_err "TC-245: a cold two-dimensional array is refused" 'column "nums" holds an array of 2 dimension(s)' \
+        "$(q_may "$HOST" "INSERT INTO public.tcarr (id, ts, nums) VALUES (21, $m4 + interval '9 days', '{{1,2},{3,4}}');")"
+    assert_err "TC-245: a bound parameter numbered from 0 is refused" 'a bound parameter holds an array of 1 dimension(s) starting at element 0' \
+        "$(q_may "$HOST" "PREPARE tcarr_bad(integer[]) AS UPDATE public.tcarr SET nums = \$1 WHERE id = 10; EXECUTE tcarr_bad('[0:1]={1,2}');")"
+    assert_err "TC-245: a cold NaN element is refused" "Could not convert string" \
+        "$(q_may "$HOST" "INSERT INTO public.tcarr (id, ts, amounts) VALUES (21, $m4 + interval '9 days', '{1,NaN}');")"
+    assert_err "TC-245: a cold infinity element is refused" "Cannot write infinity" \
+        "$(q_may "$HOST" "INSERT INTO public.tcarr (id, ts, days) VALUES (21, $m4 + interval '9 days', '{infinity}');")"
+    assert_err "TC-245: and so is a timestamp one" "Cannot write infinity" \
+        "$(q_may "$HOST" "INSERT INTO public.tcarr (id, ts, stamps) VALUES (21, $m4 + interval '9 days', '{-infinity}');")"
+    assert_err "TC-245: a bound real[] parameter numbered from 0 is refused" "can't be cast to the destination type FLOAT[]" \
+        "$(q_may "$HOST" "PREPARE tcarr_badr(real[]) AS UPDATE public.tcarr SET reals = \$1 WHERE id = 10; EXECUTE tcarr_badr('[0:1]={1,2}');")"
+    assert_eq "TC-245: nothing refused was written" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM public.tcarr WHERE id IN (20, 21);")"
+    # TC-246: compaction rewrites the list columns unchanged.
+    if require_compactor; then
+        if compactor --table tcarr >"$TMPD/tcarr-compact.log" 2>&1; then
+            assert_eq "TC-246: compaction keeps every array" "$want"$'\n'"$want" \
+                "$(q "$HOST" "SELECT $cols FROM public.tcarr WHERE id IN (1, 11) ORDER BY id;")"
+        else
+            fail "TC-246: compaction of a table with list columns (see $TMPD/tcarr-compact.log)"; tail -5 "$TMPD/tcarr-compact.log"
+        fi
+    fi
+    # TC-247: duckdb-iceberg (5edc45f0) adds no nested column to an Iceberg
+    # table, so ADD COLUMN of an array fails in the mirror, and the hot-side
+    # ALTER rolls back with it. When this refusal goes, the docs' limit does too.
+    assert_err "TC-247: ADD COLUMN of an array is refused by duckdb-iceberg" \
+        "ADD COLUMN for Nested Types not supported" \
+        "$(q_may "$HOST" "ALTER TABLE public._tcarr ADD COLUMN labels text[];")"
+    assert_eq "TC-247: and the hot table is unchanged" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM pg_attribute WHERE attrelid = 'public._tcarr'::regclass AND attname = 'labels';")"
+    # TC-248: what registration and the first archive pass refuse.
+    q "$HOST" "CREATE TABLE public.tcarr_tz (id bigint, ts timestamptz NOT NULL, stamps timestamptz[], PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);" >/dev/null
+    assert_register_rejected "TC-248: register refuses a timestamptz[] column, naming it" tcarr_tz \
+        'column "stamps": PG type timestamp with time zone[] has no Iceberg-compatible mapping: pg_duckdb cannot read a timestamptz[] column'
+    qf "$HOST" <<'EOSQL' >/dev/null
+CREATE TABLE public.tcarr_2d (id bigint, ts timestamptz NOT NULL, grid integer[][], PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);
+DO $do$ DECLARE m date; BEGIN
+  FOREACH m IN ARRAY ARRAY[(date_trunc('month',now()) - interval '4 months')::date,
+                           (date_trunc('month',now()) - interval '1 month')::date] LOOP
+    EXECUTE format('CREATE TABLE public.%I PARTITION OF public.tcarr_2d FOR VALUES FROM (%L) TO (%L)',
+                   'tcarr_2d_p_' || to_char(m, 'YYYY_MM'), m, m + interval '1 month');
+  END LOOP; END $do$;
+INSERT INTO public.tcarr_2d VALUES (1, date_trunc('month',now()) - interval '4 months' + interval '3 days', '{1,2}');
+EOSQL
+    if ! "$ARCHIVER" register --table tcarr_2d --column ts --period monthly \
+            --hot-period "$(hot_days) days" >"$TMPD/tcarr-2d.log" 2>&1; then
+        fail "TC-248: register tcarr_2d (see $TMPD/tcarr-2d.log)"; tail -5 "$TMPD/tcarr-2d.log"
+    elif archive_only "schema_name='public' AND table_name='tcarr_2d'" "$TMPD/tcarr-2d.log"; then
+        fail "TC-248: the archive pass tiered a column declared integer[][]"
+    else
+        assert_contains "TC-248: a column declared with two dimensions is refused at the first archive pass" \
+            'column "grid" is declared with 2 array dimensions' "$(cat "$TMPD/tcarr-2d.log")"
+        assert_eq "TC-248: and left the table as it was" "p|0" \
+            "$(q "$HOST" "SELECT (SELECT relkind::text FROM pg_class WHERE relname = 'tcarr_2d' AND relnamespace = 'public'::regnamespace) || '|' || (SELECT count(*) FROM coldfront.archive_watermark WHERE table_name = 'tcarr_2d');")"
+    fi
+    # TC-249: a decoupled table takes arrays written as ARRAY[...] and as bound
+    # parameters, and refuses a brace literal, which reaches DuckDB as text.
+    q "$HOST" "SELECT coldfront.create_iceberg_table('public','tcarr_dec','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"tags\",\"type\":\"text[]\"},{\"name\":\"nums\",\"type\":\"integer[]\"},{\"name\":\"amounts\",\"type\":\"numeric(10,2)[]\"}]'::jsonb);" >/dev/null
+    assert_eq "TC-249: the decoupled view reads the arrays as arrays" "text[]|integer[]|numeric(10,2)[]" \
+        "$(q "$HOST" "SELECT string_agg(format_type(atttypid, atttypmod), '|' ORDER BY attnum) FROM pg_attribute WHERE attrelid = 'public.tcarr_dec'::regclass AND attname IN ('tags', 'nums', 'amounts');")"
+    q "$HOST" "INSERT INTO public.tcarr_dec VALUES (1, ARRAY['with,comma', NULL, 'back\\slash', 'a''b'], ARRAY[1, NULL], ARRAY[1.25]);" >/dev/null
+    assert_eq "TC-249: an INSERT of ARRAY[...] literals reads back unchanged" \
+        "$(q "$HOST" "SELECT ARRAY['with,comma', NULL, 'back\\slash', 'a''b'], ARRAY[1, NULL], ARRAY[1.25]::numeric(10,2)[];")" \
+        "$(q "$HOST" "SELECT tags, nums, amounts FROM public.tcarr_dec WHERE id = 1;")"
+    q "$HOST" "PREPARE tcarr_dec_set(text[]) AS UPDATE public.tcarr_dec SET tags = \$1 WHERE id = 1; EXECUTE tcarr_dec_set('{p,\"q r\"}');" >/dev/null
+    assert_eq "TC-249: an UPDATE with a bound array parameter" '{p,"q r"}' \
+        "$(q "$HOST" "SELECT tags FROM public.tcarr_dec WHERE id = 1;")"
+    assert_err "TC-249: a brace literal in a decoupled INSERT is refused" "can't be cast" \
+        "$(q_may "$HOST" "INSERT INTO public.tcarr_dec VALUES (2, '{a}', NULL, NULL);")"
+    q "$HOST" "PREPARE tcarr_dec_ins(text[], integer[]) AS INSERT INTO public.tcarr_dec VALUES (3, \$1, \$2, NULL); EXECUTE tcarr_dec_ins(ARRAY['a,b', NULL], '{1,2}');" >/dev/null
+    assert_eq "TC-249: an INSERT with bound array parameters" '{"a,b",NULL}|{1,2}' \
+        "$(q "$HOST" "SELECT tags, nums FROM public.tcarr_dec WHERE id = 3;")"
+    # DuckDB's postgres extension drops an array's lower bound, as pg_duckdb's
+    # scan does (pg_regress hot_guard), and a decoupled INSERT ... SELECT reads
+    # its PostgreSQL source through it, so the array lands numbered from 1. When
+    # these checks fail, that reader keeps the bound, and the docs' warning goes.
+    q "$HOST" "CREATE TABLE public.tcarr_src (nums integer[]); INSERT INTO public.tcarr_src VALUES ('[0:1]={7,8}');" >/dev/null
+    assert_eq "TC-249: DuckDB's postgres extension drops an array's lower bound" "[7, 8]" \
+        "$(q "$HOST" "SELECT coldfront.ensure_pg_attached(); SELECT r['a'] FROM duckdb.query('SELECT nums::VARCHAR AS a FROM pglocal.public.tcarr_src') AS t(r);" | tail -1)"
+    q "$HOST" "INSERT INTO public.tcarr_dec (id, nums) SELECT 4, nums FROM public.tcarr_src;" >/dev/null
+    assert_eq "TC-249: so a decoupled INSERT ... SELECT from such a table stores it numbered from 1" "{7,8}" \
+        "$(q "$HOST" "SELECT nums FROM public.tcarr_dec WHERE id = 4;")"
+    # Creating a decoupled table refuses the arrays the type map refuses, naming
+    # the column.
+    assert_err "TC-249: creation refuses a jsonb[] column, naming it" 'column "docs": PG type jsonb[]' \
+        "$(q_may "$HOST" "SELECT coldfront.create_iceberg_table('public','tcarr_bad','[{\"name\":\"docs\",\"type\":\"jsonb[]\"}]'::jsonb);")"
+    assert_err "TC-249: and a timestamptz[] column" 'column "seen": PG type timestamptz[]' \
+        "$(q_may "$HOST" "SELECT coldfront.create_iceberg_table('public','tcarr_bad','[{\"name\":\"seen\",\"type\":\"timestamptz[]\"}]'::jsonb);")"
+    assert_err "TC-249: and a two-dimensional array" 'column "grid": PG type integer[][]' \
+        "$(q_may "$HOST" "SELECT coldfront.create_iceberg_table('public','tcarr_bad','[{\"name\":\"grid\",\"type\":\"integer[][]\"}]'::jsonb);")"
+    # TC-250: an Iceberg table with list columns adopts with array columns.
+    adopt_fixture tcarrns tcarr_adopt '(id BIGINT, tags VARCHAR[], nums INTEGER[], amounts DECIMAL(10,2)[])'
+    q "$HOST" "SELECT coldfront.ensure_attached(); SELECT duckdb.raw_query(\$\$INSERT INTO ice.tcarrns.tcarr_adopt VALUES (1, ['a', NULL], [1, 2], [1.25])\$\$);" >/dev/null 2>&1
+    q_may "$HOST" "SELECT coldfront.adopt_iceberg_table('public','tcarr_adopt','tcarrns');" >/dev/null
+    assert_eq "TC-250: list columns adopt as arrays" "text[]|integer[]|numeric(10,2)[]" \
+        "$(q "$HOST" "SELECT string_agg(format_type(atttypid, atttypmod), '|' ORDER BY attnum) FROM pg_attribute WHERE attrelid = 'public.tcarr_adopt'::regclass AND attname IN ('tags', 'nums', 'amounts');")"
+    assert_eq "TC-250: and their values read back" '{a,NULL}|{1,2}|{1.25}' \
+        "$(q "$HOST" "SELECT tags, nums, amounts FROM public.tcarr_adopt WHERE id = 1;")"
+    # TC-251: arrays written to a partition while it is archived reach the cold
+    # tier through the delta replay, which reads them with DuckDB's postgres
+    # extension. The hot window shrinks so the hot month expires, and the export
+    # waits long enough for the writes to land in it; only tcarr is archived.
+    local race_hot others apid rc i
+    race_hot=$(( ( $(date -u +%s) - $(date -u -d "$(date -u +%Y-%m-01) +14 days" +%s) ) / 86400 ))
+    q "$HOST" "UPDATE coldfront.partition_config SET hot_period = interval '$race_hot days' WHERE table_name = 'tcarr';" >/dev/null
+    others=$(q "$HOST" "SELECT string_agg(format('(%L,%L)', schema_name, table_name), ',') FROM coldfront.partition_config WHERE enabled AND table_name <> 'tcarr';")
+    [ -n "$others" ] && q "$HOST" "UPDATE coldfront.partition_config SET enabled = false WHERE (schema_name, table_name) IN ($others);" >/dev/null
+    "$ARCHIVER" --debug-export-delay 4s >"$TMPD/tcarr-race.log" 2>&1 &
+    apid=$!
+    for i in $(seq 1 30); do
+        grep "debug-export-delay" "$TMPD/tcarr-race.log" >/dev/null 2>&1 && break
+        sleep 1
+    done
+    assert_contains "TC-251: an INSERT lands in the archive's window" "1|0" \
+        "$(q_may "$HOST" "INSERT INTO public.tcarr SELECT 30, $hot + interval '6 days', * FROM public.tcarr_expect;")"
+    assert_contains "TC-251: and so does a hot UPDATE" "UPDATE 1" \
+        "$(q_may "$HOST" "UPDATE public.tcarr SET tags = ARRAY['during', 'a,b', NULL], nums = '{}' WHERE id = 4 AND ts >= $hot;")"
+    wait "$apid"; rc=$?
+    [ -n "$others" ] && q "$HOST" "UPDATE coldfront.partition_config SET enabled = true WHERE (schema_name, table_name) IN ($others);" >/dev/null
+    if [ "$rc" != 0 ]; then
+        fail "TC-251: the archive pass with writes in its window (see $TMPD/tcarr-race.log)"; tail -5 "$TMPD/tcarr-race.log"; return
+    fi
+    assert_eq "TC-251: the hot month is cold now" "0" "$(q "$HOST" "SELECT count(*) FROM public._tcarr;")"
+    assert_eq "TC-251: a row written during the archive reaches the cold tier unchanged" "$want" \
+        "$(q "$HOST" "SELECT $cols FROM public.tcarr WHERE id = 30;")"
+    assert_eq "TC-251: and so does an UPDATE made during it" '{during,"a,b",NULL}|{}' \
+        "$(q "$HOST" "SELECT tags, nums FROM public.tcarr WHERE id = 4;")"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Story 5b — Embeddings round-trip. A pgvector column tiers as an Iceberg
 # list<float> and comes back element-for-element through the view, over all three
 # cold-write paths: the archiver's bulk export, the tiered INSERT's cold sink,
@@ -7158,6 +7447,7 @@ if [ "$MODE" = "tiered" ]; then
     story_reads
     story_types
     story_unstorable_values # TC-231..TC-237: NaN and infinity refused where they are written
+    story_arrays            # TC-238..TC-251: arrays tier as Iceberg lists
     story_vector            # embeddings: vector → list<float> over all three cold-write paths
     story_writes
     story_compaction        # iceberg-go RewriteDataFiles; the manifest-list

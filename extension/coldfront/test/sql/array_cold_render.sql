@@ -1,0 +1,98 @@
+-- Arrays on the cold-write paths. The per-row paths, the cold sink and the
+-- cross-tier move, read an array out of a jsonb payload and render it through
+-- _render_cold_value as a DuckDB list of its elements, each rendered as a value
+-- of the element type; a bound array parameter of a cold write renders the same
+-- way. jsonb keeps no lower bound, so an array's shape is checked while it is
+-- still an array. White-box: EXPLAIN VERBOSE shows the rewritten SQL and nothing
+-- touches Iceberg (warehouse and endpoint left '').
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_duckdb;
+CREATE EXTENSION IF NOT EXISTS coldfront;
+RESET client_min_messages;
+
+SET TIME ZONE 'UTC';
+SET DateStyle = 'ISO, MDY';
+SET coldfront.warehouse = '';
+SET coldfront.lakekeeper_endpoint = '';
+
+-- Each element is a literal of its own, so no text is parsed twice. The escapes
+-- jsonb writes for a tab or a newline are undone by jsonb_array_elements_text,
+-- where DuckDB's string-to-list cast would read them as the letters t and n.
+SELECT coldfront._render_cold_value(
+         to_jsonb(ARRAY['plain', 'with,comma', 'with "quote"', 'back\slash', '{brace}',
+                        '[bracket]', 'NULL', NULL, '', E'tab\tx', E'nl\nx', 'a''b'])::text,
+         'text[]') AS text_list;
+SELECT coldfront._render_cold_value(to_jsonb(ARRAY[1, NULL, 3])::text, 'integer[]')  AS int_list,
+       coldfront._render_cold_value('[]', 'integer[]')                                AS empty_list,
+       coldfront._render_cold_value(to_jsonb(ARRAY[1.25, 2])::text, 'numeric(10,2)[]') AS numeric_list;
+
+-- A bytea element arrives in the session's bytea_output, and bytea's own input
+-- reads either form, so the bytes are the same under both.
+SET bytea_output = 'escape';
+SELECT coldfront._render_cold_value(to_jsonb(ARRAY['\x0102'::bytea, '\x'::bytea])::text, 'bytea[]') AS escape_output;
+RESET bytea_output;
+SELECT coldfront._render_cold_value(to_jsonb(ARRAY['\x0102'::bytea, '\x'::bytea])::text, 'bytea[]') AS hex_output;
+
+-- The shape an Iceberg list holds: one dimension, numbered from 1. NULL and an
+-- empty array have no dimension and pass.
+SELECT coldfront._is_list(ARRAY[1, 2])              AS one_dim,
+       coldfront._is_list('{}'::int[])              AS empty,
+       coldfront._is_list(NULL::int[])              AS null_array,
+       coldfront._is_list('[0:1]={1,2}'::int[])     AS from_zero,
+       coldfront._is_list('{{1,2},{3,4}}'::int[])   AS two_dims;
+SELECT coldfront._cold_list('[0:1]={1,2}'::int[], 'nums');
+SELECT coldfront._cold_list('{{1,2},{3,4}}'::int[], 'nums');
+
+-- A bound array parameter renders through the same renderer after the same check.
+SELECT coldfront._render_cold_param(ARRAY['a', NULL]::text[]) AS text_param,
+       coldfront._render_cold_param(NULL::int[])              AS null_param;
+SELECT coldfront._render_cold_param('[0:1]={1,2}'::int[]);
+
+-- The archiver stages a partition with CREATE TABLE ... USING duckdb AS SELECT,
+-- and pg_duckdb (c04e6a2) loses a numeric array's precision there and refuses
+-- the column, so the archiver exports a numeric array as text[]
+-- (view.Column.ExportCast). When the first statement below creates its table,
+-- that cast can go.
+CREATE TEMP TABLE stage_probe_src (a numeric(10,2)[]);
+INSERT INTO stage_probe_src VALUES ('{1.25,NULL}');
+CREATE TEMP TABLE stage_probe USING duckdb AS SELECT a FROM stage_probe_src;
+CREATE TEMP TABLE stage_probe USING duckdb AS SELECT a::text[] AS a FROM stage_probe_src;
+SELECT a FROM stage_probe;
+DROP TABLE stage_probe;
+DROP TABLE stage_probe_src;
+
+-- A tiered view with array columns.
+CREATE TABLE public._tags (id int, ts timestamptz, tags text[], nums integer[]);
+CREATE VIEW public.tags AS SELECT * FROM public._tags;
+INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
+VALUES ('public', 'tags', 'public._tags', 'ice.default.tags', 'ts');
+INSERT INTO coldfront.archive_watermark(schema_name, table_name, cutoff_time)
+VALUES ('public', 'tags', '2026-03-01'::timestamptz);
+
+-- The INSERT's cold half checks each array's shape in its projection.
+EXPLAIN (COSTS OFF, VERBOSE)
+  INSERT INTO public.tags VALUES (1, '2026-01-05', '{a,b}', '{1,2}');
+
+-- A cold write's bound array parameter is rendered by _render_cold_param at
+-- execution. force_generic_plan keeps $1 from folding to a constant.
+SET plan_cache_mode = force_generic_plan;
+PREPARE cold_tags(text[]) AS
+  UPDATE public.tags SET tags = $1 WHERE ts < '2026-03-01';
+EXPLAIN (COSTS OFF, VERBOSE) EXECUTE cold_tags('{x,y}');
+DEALLOCATE cold_tags;
+RESET plan_cache_mode;
+
+-- A row moving to the hot tier carries its arrays as jsonb lists, which the heap
+-- INSERT takes as PostgreSQL array text. A jsonb column's array stays jsonb.
+SELECT coldfront._move_pg_row_literal(
+    '{"id": 1, "cf_new_ts": "2026-06-01 00:00:00+00", "tags": ["a", null, "x,y"], "nums": [], "doc": [1, 2]}'::jsonb,
+    ARRAY['id', 'ts', 'tags', 'nums', 'doc'],
+    ARRAY['integer', 'timestamp with time zone', 'text[]', 'integer[]', 'jsonb'],
+    'ts') AS heap_row;
+
+-- Cleanup: this suite shares one database. Unregister first, since DROP on a
+-- table that still has a registered cold tier is blocked by design.
+DELETE FROM coldfront.tiered_views WHERE relname = 'tags';
+DELETE FROM coldfront.archive_watermark WHERE table_name = 'tags';
+DROP VIEW public.tags;
+DROP TABLE public._tags;

@@ -97,6 +97,54 @@ SELECT coldfront._guard_hot_table('public._guarded_nan'::regclass);
 SELECT coldfront._validate_hot_guards('public._guarded_nan'::regclass);
 DROP TABLE public._guarded_nan;
 
+-- Arrays. pg_duckdb (c04e6a2) reads an array's elements but not its lower bound,
+-- so an array numbered from 0 reads back numbered from 1. When this output keeps
+-- the bound, the shape guard rests on Iceberg alone, whose lists keep neither a
+-- lower bound nor a second dimension.
+CREATE TABLE guard_bound_probe (a int[]);
+INSERT INTO guard_bound_probe VALUES ('[0:1]={7,8}');
+SET duckdb.force_execution = true;
+SELECT a FROM guard_bound_probe;
+RESET duckdb.force_execution;
+DROP TABLE guard_bound_probe;
+
+-- An array column's guard keeps it a one-dimensional list numbered from 1, and
+-- refuses a NaN or infinity element as the scalar guards refuse the value.
+CREATE TABLE public._guarded_arr (ts timestamptz NOT NULL, nums integer[],
+                                  amounts numeric(10,2)[], days date[], stamps timestamp[])
+    PARTITION BY RANGE (ts);
+CREATE TABLE public._guarded_arr_p1 PARTITION OF public._guarded_arr
+    FOR VALUES FROM ('2026-01-01') TO ('2026-02-01');
+SELECT coldfront._guard_hot_table('public._guarded_arr'::regclass);
+SELECT conname, pg_get_constraintdef(oid) AS def FROM pg_constraint
+ WHERE conrelid = 'public._guarded_arr'::regclass AND contype = 'c' ORDER BY conname;
+INSERT INTO public._guarded_arr VALUES
+    ('2026-01-05', '{1,NULL}', '{1.25,NULL}', '{2026-01-01}'),
+    ('2026-01-06', '{}', NULL, NULL);
+INSERT INTO public._guarded_arr (ts, nums) VALUES ('2026-01-07', '[0:1]={7,8}');
+INSERT INTO public._guarded_arr (ts, nums) VALUES ('2026-01-07', '{{1,2},{3,4}}');
+INSERT INTO public._guarded_arr (ts, amounts) VALUES ('2026-01-07', '{1,NaN}');
+INSERT INTO public._guarded_arr (ts, days) VALUES ('2026-01-07', '{2026-01-01,infinity}');
+INSERT INTO public._guarded_arr (ts, stamps) VALUES ('2026-01-07', '{-infinity}');
+UPDATE public._guarded_arr SET nums = '[0:1]={7,8}' WHERE ts = '2026-01-05';
+UPDATE public._guarded_arr SET nums = '{{1,2},{3,4}}' WHERE ts = '2026-01-05';
+UPDATE public._guarded_arr SET amounts = '{NaN}' WHERE ts = '2026-01-05';
+UPDATE public._guarded_arr SET stamps = '{infinity}' WHERE ts = '2026-01-05';
+SELECT ts, nums, amounts, days, stamps FROM public._guarded_arr ORDER BY ts;
+DROP TABLE public._guarded_arr;
+
+-- A column declared with more than one dimension is refused: pg_duckdb reads a
+-- column by its declared dimensions, and the cold tier stores one. pg_duckdb
+-- (c04e6a2) refuses a one-dimensional value in a column declared with two;
+-- when this output changes, so does the reason the refusal gives.
+CREATE TABLE public._guarded_2d (ts timestamptz NOT NULL, grid integer[][]);
+INSERT INTO public._guarded_2d VALUES ('2026-01-05', '{1,2}');
+SET duckdb.force_execution = true;
+SELECT grid FROM public._guarded_2d;
+RESET duckdb.force_execution;
+SELECT coldfront._guard_hot_table('public._guarded_2d'::regclass);
+DROP TABLE public._guarded_2d;
+
 -- A column added through the DDL hook gets its guard from the view rebuild, which
 -- runs on every node. Under the apply-worker role the Iceberg mirror is skipped,
 -- so this needs no catalog.

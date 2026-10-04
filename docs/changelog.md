@@ -67,6 +67,12 @@ this project adheres to
   tier; a `MERGE` that bounds neither tier is refused. A decoupled `MERGE` runs
   in DuckDB. A `MERGE` nested in a `WITH` entry takes the same path as a
   nested `UPDATE` or `DELETE`.
+- A one-dimensional array of a supported type tiers as an Iceberg list, except
+  an array of `timestamptz`, `jsonb`, `json`, `interval` or a vector type, and
+  reads back as an array of the type its element reads back as, so a
+  `smallint[]` reads as `integer[]`. An adopted Iceberg table's list columns
+  read as arrays. An array with more than one dimension, or a lower bound other
+  than 1, is refused where it is written, since an Iceberg list holds neither.
 
 ### Changed
 

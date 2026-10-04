@@ -28,7 +28,7 @@ REGRESS     = load_order update_unregistered_view update_heap_table \
               read_date_bin read_json_builders read_param_fold registry_snapshot \
               type_map hot_guard adopt_type_map adopt_read_only adopt_iceberg_table \
               cold_write_json_agg duckdb_temp_dir \
-              vector_centroids vector_type_map vector_cold_render vector_param_render vector_ops vector_probe vector_status vector_multicolumn \
+              vector_centroids vector_type_map vector_cold_render array_cold_render vector_param_render vector_ops vector_probe vector_status vector_multicolumn \
               partition_clause failed_txn_block tiered_insert_single_pass tiered_view_no_trigger copy_tiered_view param_in_subquery merge_on_view delete_without_where update_from_without_alias settings_registered ensure_replicated read_inner_product
 REGRESS_OPTS = --inputdir=test --outputdir=test
 

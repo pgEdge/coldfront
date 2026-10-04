@@ -120,17 +120,22 @@ The bootstrap also gives the hot table its guards: a check constraint, named
 tier cannot hold unchanged. A `numeric` column refuses `NaN`, which pg_duckdb's
 scan and DuckDB's postgres extension both read as `0` and which Iceberg's
 decimal lacks; a `date`, `timestamp` or `timestamptz` column refuses `infinity`
-and `-infinity`, which Iceberg lacks and duckdb-iceberg refuses to write. Each
-guard is added `NOT VALID` inside the bootstrap transaction and validated after
-the transaction commits, so the validation scan runs under a `SHARE UPDATE
-EXCLUSIVE` lock, which lets writes continue. A row that breaks a guard stops
-the run before any partition is archived, with an error that names the guard,
-and stops every later run until the row is fixed. A column name longer than 47
-bytes names its guard by a hash, so two long names that begin alike get a
-guard each. The DDL hook's view rebuild renames a guard with its column, adds
-the guard for a column that an `ALTER TABLE` adds, and validates every guard
-not yet valid inside the `ALTER TABLE`'s own transaction, under the lock that
-statement already holds. Unregistering the table drops the guards.
+and `-infinity`, which Iceberg lacks and duckdb-iceberg refuses to write. An
+array column keeps the shape of an Iceberg list, one dimension numbered from 1,
+because both readers drop an array's lower bound; its elements meet their own
+type's condition. A column declared with more than one array dimension cannot
+be guarded, since pg_duckdb reads a column by its declared dimensions, so the
+bootstrap refuses it. Each guard is added `NOT VALID` inside the bootstrap
+transaction and validated after the transaction commits, so the validation
+scan runs under a `SHARE UPDATE EXCLUSIVE` lock, which lets writes continue. A
+row that breaks a guard stops the run before any partition is archived, with
+an error that names the guard, and stops every later run until the row is
+fixed. A column name longer than 47 bytes names its guard by a hash, so two
+long names that begin alike get a guard each. The DDL hook's view rebuild
+renames a guard with its column, adds the guard for a column that an `ALTER
+TABLE` adds, and validates every guard not yet valid inside the `ALTER TABLE`'s
+own transaction, under the lock that statement already holds. Unregistering
+the table drops the guards.
 
 ### The Archive Pipeline
 
