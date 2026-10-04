@@ -63,7 +63,69 @@ SELECT has_table_privilege('ddl_alter_reader', 'public.events', 'SELECT') AS can
        pg_get_userbyid(relowner) AS owner
   FROM pg_class WHERE oid = 'public.events'::regclass;
 
--- 3. A non-tiered table's columns alter normally (control).
+-- 3. Whoever PostgreSQL lets alter the hot table makes the change, with no
+--    privilege on the view or its schema: the hook rebuilds the view as the
+--    extension's owner and gives it back its owner and grants. The Iceberg
+--    change runs as the caller, who needs the cold access grant_app_access
+--    gives an application role (here USAGE on schema coldfront). A role holding
+--    the owner's privileges without the SET ROLE an ownership change needs, a
+--    role owning the hot table but not the view, and a role owning neither,
+--    refused before anything changes.
+CREATE ROLE ddl_alter_member;
+CREATE ROLE ddl_alter_hot_owner;
+GRANT ddl_alter_owner TO ddl_alter_member WITH INHERIT TRUE, SET FALSE;
+GRANT USAGE ON SCHEMA coldfront TO ddl_alter_member, ddl_alter_hot_owner;
+ALTER TABLE public._events OWNER TO ddl_alter_owner;
+SET session_replication_role = replica;
+SET ROLE ddl_alter_member;
+ALTER TABLE public._events ADD COLUMN by_member integer;
+RESET ROLE;
+ALTER TABLE public._events OWNER TO ddl_alter_hot_owner;
+SET ROLE ddl_alter_hot_owner;
+ALTER TABLE public._events RENAME COLUMN by_member TO by_hot_owner;
+RESET ROLE;
+SET ROLE ddl_alter_reader;
+ALTER TABLE public._events DROP COLUMN by_hot_owner;
+RESET ROLE;
+SET session_replication_role = DEFAULT;
+SELECT attname FROM pg_attribute
+ WHERE attrelid = 'public.events'::regclass AND attnum > 0 AND NOT attisdropped
+ ORDER BY attnum;
+SELECT has_table_privilege('ddl_alter_reader', 'public.events', 'SELECT') AS can_select,
+       has_table_privilege('ddl_alter_reader', 'public.events', 'INSERT') AS can_insert,
+       pg_get_userbyid(relowner) AS owner
+  FROM pg_class WHERE oid = 'public.events'::regclass;
+
+-- 4. The rebuild runs with search_path pinned to pg_catalog, pg_temp, so the
+--    caller's temporary types take no part in it, though its functions are
+--    compiled in the caller's session. A fresh session compiles them with the
+--    caller's domain named text in place; the domain's CHECK reports any role
+--    other than the caller it runs as.
+\c
+SET coldfront.warehouse = '';
+SET coldfront.lakekeeper_endpoint = '';
+SET coldfront.loopback_dsn = '';
+SET session_replication_role = replica;
+SET ROLE ddl_alter_hot_owner;
+CREATE FUNCTION pg_temp.ran_as(pg_catalog.text) RETURNS pg_catalog.bool
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF current_user <> 'ddl_alter_hot_owner' THEN
+        RAISE NOTICE 'the domain check ran as %', current_user;
+    END IF;
+    RETURN true;
+END $$;
+CREATE DOMAIN pg_temp.text AS pg_catalog.text CHECK (pg_temp.ran_as(VALUE));
+ALTER TABLE public._events ADD COLUMN probed integer;
+DROP DOMAIN pg_temp.text;
+DROP FUNCTION pg_temp.ran_as(pg_catalog.text);
+RESET ROLE;
+SET session_replication_role = DEFAULT;
+SELECT attname FROM pg_attribute
+ WHERE attrelid = 'public.events'::regclass AND attnum > 0 AND NOT attisdropped
+ ORDER BY attnum;
+
+-- 5. A non-tiered table's columns alter normally (control).
 CREATE TABLE public.plain (id int, val text);
 ALTER TABLE public.plain ADD COLUMN extra int;
 ALTER TABLE public.plain DROP COLUMN val;
@@ -77,5 +139,8 @@ DROP TABLE public.plain;
 DELETE FROM coldfront.tiered_views;
 DROP VIEW public.events;
 DROP TABLE public._events;
+REVOKE USAGE ON SCHEMA coldfront FROM ddl_alter_member, ddl_alter_hot_owner;
+DROP ROLE ddl_alter_member;
+DROP ROLE ddl_alter_hot_owner;
 DROP ROLE ddl_alter_reader;
 DROP ROLE ddl_alter_owner;

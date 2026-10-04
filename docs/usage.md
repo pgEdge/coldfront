@@ -325,8 +325,10 @@ below.
 An `ALTER TABLE` on the wrapper view adds, drops, renames or widens a column
 of the Iceberg table, and the view follows, with its owner and table-level
 grants kept; a column-level grant on the view is not kept. Only the view's
-owner can change its columns. The following statements change the columns of
-the table created above:
+owner, or a role holding its privileges, can change its columns, and that role
+needs the cold access `grant_app_access` gives, since the Iceberg change runs
+as that role. The following statements change the columns of the table created
+above:
 
 ```sql
 ALTER TABLE public.events ADD COLUMN qty integer;

@@ -4513,9 +4513,10 @@ coldfront_registry_present(void)
  * pg_catalog, pg_temp: the caller's functions are out of reach, and its
  * temporary types come after pg_catalog's. The hooks read the registry this
  * way, so a role using a table or view of its own needs no access to the
- * schema, which calling a SECURITY DEFINER function there would need. Returns
- * the GUC nest level for as_caller; an error restores both with the
- * transaction.
+ * schema, which calling a SECURITY DEFINER function there would need, and the
+ * DDL hook keeps a registered view and its registry rows in step with a user's
+ * DDL this way (spi_exec_ddl). Returns the GUC nest level for as_caller; an
+ * error restores both with the transaction.
  */
 static int
 as_coldfront_owner(Oid *save_uid, int *save_sec)
@@ -4662,32 +4663,38 @@ relid_is_tiered(Oid relid, bool *has_hot)
 
 #define CF_SPOCK_DDL_GUC "spock.enable_ddl_replication"
 
-/* Run one void-returning coldfront helper via SPI. The DDL hook issues a tiered
- * view's DDL through here, and each peer's own hook issues the same DDL when it
- * applies the user's replicated statement, so unless `replicate` is set the
- * helper runs with spock.enable_ddl_replication off and only the user's
- * statement replicates. Spock reads the setting just after each statement it
- * runs, which is inside this call whatever order the hooks load in. The nest
- * level restores the setting on return, and an error restores it with the
- * transaction. Without Spock the setting does not exist and nothing is set.
+/* Run one void-returning coldfront helper via SPI, as the extension's owner
+ * (as_coldfront_owner): the view and registry changes that follow a user's DDL
+ * need no privilege of the user's beyond what PostgreSQL checks for the
+ * statement itself. The DDL hook issues a tiered view's DDL through here, and
+ * each peer's own hook issues the same DDL when it applies the user's
+ * replicated statement, so unless `replicate` is set the helper runs with
+ * spock.enable_ddl_replication off and only the user's statement replicates.
+ * Spock reads the setting just after each statement it runs, which is inside
+ * this call whatever order the hooks load in. The nest level restores the
+ * setting on return, and an error restores it with the transaction. Without
+ * Spock the setting does not exist and nothing is set.
  *
  * `replicate` leaves the setting as it is, so the helper's own DDL replicates.
  * A decoupled view is rebuilt that way: PostgreSQL never runs the user's ALTER
  * on the view, so no peer receives it, and each peer takes the rebuilt view as
- * DDL, as it took the view's creation. */
+ * DDL, as it took the view's creation. Spock records the extension's owner as
+ * the role that ran that DDL, and each peer runs it as that role. */
 static void
 spi_exec_ddl(const char *sql, bool replicate)
 {
     if (SPI_connect() == SPI_OK_CONNECT)
     {
-        int nest = NewGUCNestLevel();
+        Oid save_uid;
+        int save_sec;
+        int nest = as_coldfront_owner(&save_uid, &save_sec);
 
         if (!replicate && GetConfigOption(CF_SPOCK_DDL_GUC, true, false) != NULL)
             (void) set_config_option(CF_SPOCK_DDL_GUC, "off",
                                      PGC_USERSET, PGC_S_SESSION,
                                      GUC_ACTION_SAVE, true, 0, false);
         SPI_execute(sql, false, 0);
-        AtEOXact_GUC(true, nest);
+        as_caller(save_uid, save_sec, nest);
         SPI_finish();
     }
 }
@@ -4742,7 +4749,8 @@ rebuild_tiered_view(const char *schema, const char *relname, const char *acl)
 }
 
 /* The statements that give the view back its owner and grants once it is
- * dropped and created again (coldfront._view_acl_sql), read while it exists. */
+ * dropped and created again (coldfront._view_acl_sql), read while it exists,
+ * as the extension's owner, which runs them (spi_exec_ddl). */
 static char *
 view_acl_sql(const TieredDDLInfo *info)
 {
@@ -4755,6 +4763,10 @@ view_acl_sql(const TieredDDLInfo *info)
         quote_literal_cstr(info->view_schema), quote_literal_cstr(info->view_relname));
     if (SPI_connect() == SPI_OK_CONNECT)
     {
+        Oid save_uid;
+        int save_sec;
+        int nest = as_coldfront_owner(&save_uid, &save_sec);
+
         if (SPI_execute(sql.data, true, 1) == SPI_OK_SELECT && SPI_processed == 1)
         {
             char *v = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
@@ -4762,6 +4774,7 @@ view_acl_sql(const TieredDDLInfo *info)
             if (v != NULL)
                 acl = MemoryContextStrdup(CurTransactionContext, v);
         }
+        as_caller(save_uid, save_sec, nest);
         SPI_finish();
     }
     pfree(sql.data);
@@ -4863,7 +4876,8 @@ quoted_qualified_name(Oid relid)
  * inside the mirror, rolling the whole statement (hot tier included) back
  * atomically. A decoupled table (no hot table) has its wrapper view rebuilt from
  * the view's own columns plus the actions; acl is a tiered view's owner and
- * grants when the caller dropped the view first.
+ * grants when the caller dropped the view first. The Iceberg change runs as the
+ * caller, as all cold I/O does, and the rebuild as the extension's owner.
  */
 static void
 mirror_and_rebuild(const TieredDDLInfo *info, const char *actions, const char *acl)
@@ -4879,7 +4893,11 @@ mirror_and_rebuild(const TieredDDLInfo *info, const char *actions, const char *a
     coldfront_in_utility = true;
     PG_TRY();
     {
-        spi_exec_void(sql.data);
+        if (SPI_connect() == SPI_OK_CONNECT)
+        {
+            SPI_execute(sql.data, false, 0);
+            SPI_finish();
+        }
         if (info->hot_table != NULL)
             rebuild_tiered_view(info->view_schema, info->view_relname, acl);
         else
@@ -4978,10 +4996,11 @@ cf_handle_truncate(const CfUtilityCtx *u, TruncateStmt *ts)
     cf_call_through(u);
 }
 
-/* A decoupled table's ALTER never reaches PostgreSQL's own ALTER TABLE, so the
- * owner check that would make is made here, before the Iceberg table changes. */
+/* PostgreSQL's owner check for an ALTER TABLE, made before the DDL hook changes
+ * anything on the user's behalf: a decoupled table's ALTER never reaches
+ * PostgreSQL's own, and a tiered table's view is dropped before it. */
 static void
-require_view_owner(Oid relid)
+require_owner(Oid relid)
 {
     if (!object_ownercheck(RelationRelationId, relid, GetUserId()))
         aclcheck_error(ACLCHECK_NOT_OWNER, get_relkind_objtype(get_rel_relkind(relid)),
@@ -5101,8 +5120,7 @@ cf_handle_alter_table(const CfUtilityCtx *u, AlterTableStmt *at)
         return;
     }
 
-    if (info.hot_table == NULL)
-        require_view_owner(relid);
+    require_owner(relid);
     nacts = cf_collect_alter_actions(at, &actions, info.hot_table ? NULL : &info);
 
     if (nacts == 0)
@@ -5202,7 +5220,7 @@ cf_handle_rename_column(const CfUtilityCtx *u, RenameStmt *rs,
     if (via_hot)
         cf_call_through(u);   /* PG renames the hot column */
     else
-        require_view_owner(view_relid);
+        require_owner(view_relid);
     initStringInfo(&acts);
     appendStringInfo(&acts,
         "jsonb_build_object('op', 'rename', 'col', %s, 'newcol', %s)",

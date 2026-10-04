@@ -65,6 +65,29 @@ ALTER TABLE public.dk ADD COLUMN note text;
 ALTER TABLE public.dk RENAME COLUMN qty TO quantity;
 RESET ROLE;
 
+-- A role holding the owner's privileges makes the change without the SET ROLE
+-- on the owner that giving the rebuilt view back would need as that role: the
+-- rebuild runs as the extension's owner. The Iceberg change runs as the
+-- caller, who needs the cold access grant_app_access gives an application role
+-- (here USAGE on schema coldfront and SELECT on the registry).
+CREATE ROLE dk_member;
+GRANT dk_owner TO dk_member WITH INHERIT TRUE, SET FALSE;
+GRANT USAGE ON SCHEMA coldfront TO dk_member;
+GRANT SELECT ON coldfront.tiered_views TO dk_member;
+SET session_replication_role = replica;
+SET ROLE dk_member;
+ALTER TABLE public.dk ADD COLUMN note text;
+ALTER TABLE public.dk RENAME COLUMN note TO memo;
+ALTER TABLE public.dk DROP COLUMN memo;
+RESET ROLE;
+SET session_replication_role = DEFAULT;
+REVOKE SELECT ON coldfront.tiered_views FROM dk_member;
+REVOKE USAGE ON SCHEMA coldfront FROM dk_member;
+SELECT has_table_privilege('dk_reader', 'public.dk', 'SELECT') AS can_select,
+       has_table_privilege('dk_reader', 'public.dk', 'INSERT') AS can_insert,
+       pg_get_userbyid(relowner) AS owner
+  FROM pg_class WHERE oid = 'public.dk'::regclass;
+
 -- A vector column is neither added nor changed.
 ALTER TABLE public.dk ADD COLUMN v vector(3);
 ALTER TABLE public.dk ALTER COLUMN qty TYPE vector(3);
@@ -89,5 +112,6 @@ SELECT attrelid::regclass AS view, string_agg(attname, ', ' ORDER BY attnum) AS 
 -- Cleanup. Unregister first: the DDL hook blocks DROP of a registered view.
 DELETE FROM coldfront.tiered_views WHERE schema_name = 'public' AND relname IN ('dk', 'dkv', 'dkr');
 DROP VIEW public.dk, public.dkv, public.dkr;
+DROP ROLE dk_member;
 DROP ROLE dk_reader;
 DROP ROLE dk_owner;

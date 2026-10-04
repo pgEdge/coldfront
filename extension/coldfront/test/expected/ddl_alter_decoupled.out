@@ -107,7 +107,7 @@ ALTER TABLE public.dk ADD COLUMN fee numeric(10,2), ALTER COLUMN qty SET DEFAULT
 ERROR:  coldfront: on decoupled table "public.dk", run a column change as an ALTER TABLE of its own
 ALTER TABLE public.dk ADD COLUMN ip inet;
 ERROR:  coldfront: column "ip": PG type inet has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, numeric(P,S), jsonb, json, interval, vector(N), halfvec(N), and one-dimensional arrays of those types except timestamptz, jsonb, json, interval and the vector types. inet/cidr/oid unsupported (store IP data as text, oid values as bigint); sparsevec unsupported (keep it in the hot tier)
-CONTEXT:  PL/pgSQL function _iceberg_storage_type(text,text) line 67 at RAISE
+CONTEXT:  PL/pgSQL function coldfront._iceberg_storage_type(text,text) line 67 at RAISE
 PL/pgSQL function _mirror_iceberg_alter(text,text,jsonb) line 60 at assignment
 SQL statement "SELECT coldfront._mirror_iceberg_alter('"ice"."default"."dk"', NULL, jsonb_build_array(jsonb_build_object('op', 'add', 'col', 'ip', 'type', 'inet')))"
 -- Only the view's owner changes its columns, as with any ALTER TABLE.
@@ -117,6 +117,33 @@ ERROR:  must be owner of view dk
 ALTER TABLE public.dk RENAME COLUMN qty TO quantity;
 ERROR:  must be owner of view dk
 RESET ROLE;
+-- A role holding the owner's privileges makes the change without the SET ROLE
+-- on the owner that giving the rebuilt view back would need as that role: the
+-- rebuild runs as the extension's owner. The Iceberg change runs as the
+-- caller, who needs the cold access grant_app_access gives an application role
+-- (here USAGE on schema coldfront and SELECT on the registry).
+CREATE ROLE dk_member;
+GRANT dk_owner TO dk_member WITH INHERIT TRUE, SET FALSE;
+GRANT USAGE ON SCHEMA coldfront TO dk_member;
+GRANT SELECT ON coldfront.tiered_views TO dk_member;
+SET session_replication_role = replica;
+SET ROLE dk_member;
+ALTER TABLE public.dk ADD COLUMN note text;
+ALTER TABLE public.dk RENAME COLUMN note TO memo;
+ALTER TABLE public.dk DROP COLUMN memo;
+RESET ROLE;
+SET session_replication_role = DEFAULT;
+REVOKE SELECT ON coldfront.tiered_views FROM dk_member;
+REVOKE USAGE ON SCHEMA coldfront FROM dk_member;
+SELECT has_table_privilege('dk_reader', 'public.dk', 'SELECT') AS can_select,
+       has_table_privilege('dk_reader', 'public.dk', 'INSERT') AS can_insert,
+       pg_get_userbyid(relowner) AS owner
+  FROM pg_class WHERE oid = 'public.dk'::regclass;
+ can_select | can_insert |  owner   
+------------+------------+----------
+ t          | t          | dk_owner
+(1 row)
+
 -- A vector column is neither added nor changed.
 ALTER TABLE public.dk ADD COLUMN v vector(3);
 ERROR:  coldfront: column "v" of "public.dk" is a vector column, which ALTER TABLE does not add or change on a decoupled table
@@ -178,5 +205,6 @@ SELECT attrelid::regclass AS view, string_agg(attname, ', ' ORDER BY attnum) AS 
 -- Cleanup. Unregister first: the DDL hook blocks DROP of a registered view.
 DELETE FROM coldfront.tiered_views WHERE schema_name = 'public' AND relname IN ('dk', 'dkv', 'dkr');
 DROP VIEW public.dk, public.dkv, public.dkr;
+DROP ROLE dk_member;
 DROP ROLE dk_reader;
 DROP ROLE dk_owner;
