@@ -4,6 +4,7 @@
 - Use Test Driven Development: write tests first, then implementation. Not after, not alongside — before.
 - Priority: smoke tests, integration tests, and endpoint tests over unit tests
 - Every public function should have a unit test
+- Never rig a test: never change its timing, ordering or inputs so it stops meeting the case where it fails. A failing test gets a product fix. An assertion is weakened only to a guarantee agreed beforehand, and the change says it is weaker. Before changing a test alongside a fix, confirm the changed test still fails on the unfixed code in every interleaving and input it can meet.
 - Run `make test` after every change
 - MUST run `./run-ci-local.sh` before every commit — it runs gofmt, golangci-lint, tests, build, Docker integration tests
 - GitHub Actions CI must always be identical in steps to `run-ci-local.sh` — never let them diverge
