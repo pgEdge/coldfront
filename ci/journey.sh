@@ -46,6 +46,8 @@ GCS_SECRET="${COLDFRONT_GCS_SECRET_KEY:-}"
 # vhost+HTTPS) and the bucket's real Region. Creds/Region from env (never committed).
 AWS_KEY="${COLDFRONT_AWS_ACCESS_KEY:-}"
 AWS_SECRET="${COLDFRONT_AWS_SECRET_KEY:-}"
+# Bakery ack hygiene (TC-161, TC-223): acks on a node whose claim is gone.
+CLAIMLESS_ACKS="SELECT count(*) FROM coldfront.claim_acks a WHERE NOT EXISTS (SELECT 1 FROM coldfront.claims c WHERE c.ticket = a.ticket);"
 AWS_REGION="${COLDFRONT_AWS_REGION:-}"
 ARCHIVER="${ARCHIVER:-./bin/archiver}"
 COMPACTOR="${COMPACTOR:-./bin/compactor}"
@@ -3653,6 +3655,15 @@ story_mesh_dead_peer() {
         [ "$sample" = "00" ] && break; sleep 1
     done
     assert_eq "TC-223: no claim is left on either node" "00" "$sample"
+    # The resumed peer acked the claim it missed while paused, which $HOST had
+    # already released: that ack must not outlive the claim anywhere.
+    local n
+    for n in "$HOST" "${PARR[@]}"; do
+        for i in $(seq 1 20); do
+            [ "$(q "$n" "$CLAIMLESS_ACKS")" = "0" ] && break; sleep 1
+        done
+        assert_eq "TC-223: the late ack from the resumed peer outlives no claim on $n" "0" "$(q "$n" "$CLAIMLESS_ACKS")"
+    done
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -3758,15 +3769,19 @@ story_mesh_reaper() {
     assert_eq "TC-160 orphan claim reaped on both nodes" "0" "$(orphan_gone_everywhere)"
 
     # TC-161: ack hygiene. The orphan's acks went with it, and the completed
-    # write's own acks went with its release. Allow replication to settle.
-    for i in $(seq 1 40); do
-        [ "$(q "$HOST" "SELECT count(*) FROM coldfront.claim_acks a WHERE NOT EXISTS (SELECT 1 FROM coldfront.claims c WHERE c.ticket = a.ticket);")" = "0" ] && break
-        sleep 0.25
+    # write's own acks went with its release, on every node: an ack arriving
+    # after its claim is gone is dropped where it lands. Allow replication to
+    # settle.
+    local leftover n
+    for n in "$HOST" "${PARR[@]}"; do
+        for i in $(seq 1 40); do
+            [ "$(q "$n" "$CLAIMLESS_ACKS")" = "0" ] && break
+            sleep 0.25
+        done
+        leftover=$(q "$n" "$CLAIMLESS_ACKS")
+        assert_eq "TC-161 no ack row outlives its claim on $n" "0" "$leftover"
+        [ "$leftover" = "0" ] || q "$n" "SELECT a.ticket, snowflake.get_node(a.ticket) AS node, to_timestamp(snowflake.get_epoch(a.ticket)) AS issued, a.ack_from_name FROM coldfront.claim_acks a WHERE NOT EXISTS (SELECT 1 FROM coldfront.claims c WHERE c.ticket = a.ticket) ORDER BY 1;"
     done
-    local leftover
-    leftover=$(q "$HOST" "SELECT count(*) FROM coldfront.claim_acks a WHERE NOT EXISTS (SELECT 1 FROM coldfront.claims c WHERE c.ticket = a.ticket);")
-    assert_eq "TC-161 no ack row outlives its claim" "0" "$leftover"
-    [ "$leftover" = "0" ] || q "$HOST" "SELECT a.ticket, snowflake.get_node(a.ticket) AS node, to_timestamp(snowflake.get_epoch(a.ticket)) AS issued, a.ack_from_name FROM coldfront.claim_acks a WHERE NOT EXISTS (SELECT 1 FROM coldfront.claims c WHERE c.ticket = a.ticket) ORDER BY 1;"
 
     # TC-162: apply path. The peer's arriving claim finds the orphan as the
     # smaller same-node claim on $HOST; the table lock is free, so $HOST reaps
@@ -4244,13 +4259,15 @@ story_mesh_substrate() {
     local nodes=("$HOST" "${PARR[@]}") want="$(( ${#PARR[@]} + 1 ))" n t=90
     # TC-213: the one-time setup call, coldfront.ensure_replicated() on every
     # node, put each ColdFront table that replicates by value in that node's
-    # default replication set, and neither node-local table (deferred_acks,
+    # default replication set, claim_acks in the insert-only set (each node
+    # deletes only its own copies), and neither node-local table (deferred_acks,
     # _dummy_dml_target). Membership belongs to the provider, so every node is
     # checked, not only the one that will write.
+    local repset_sql="SELECT rs.set_name || ':' || string_agg(c.relname, ',' ORDER BY c.relname COLLATE \"C\") FROM spock.replication_set rs JOIN spock.replication_set_table rst ON rst.set_id = rs.set_id JOIN pg_class c ON c.oid = rst.set_reloid WHERE c.relnamespace = 'coldfront'::regnamespace GROUP BY rs.set_name ORDER BY rs.set_name COLLATE \"C\";"
     for n in "${nodes[@]}"; do
-        assert_eq "TC-213 $n's default replication set holds the eight replicated coldfront tables" \
-            "archive_watermark,claim_acks,claims,partition_config,storage_secret,tiered_views,vector_centroids,vector_config" \
-            "$(q "$n" "SELECT string_agg(c.relname, ',' ORDER BY c.relname COLLATE \"C\") FROM spock.replication_set rs JOIN spock.replication_set_table rst ON rst.set_id = rs.set_id JOIN pg_class c ON c.oid = rst.set_reloid WHERE rs.set_name = 'default' AND c.relnamespace = 'coldfront'::regnamespace;")"
+        assert_eq "TC-213 $n's replication sets hold the eight replicated coldfront tables, claim_acks insert-only" \
+            "default:archive_watermark,claims,partition_config,storage_secret,tiered_views,vector_centroids,vector_config default_insert_only:claim_acks" \
+            "$(q "$n" "$repset_sql" | paste -sd' ')"
     done
     q "$HOST" "DELETE FROM coldfront.claims WHERE iceberg_table='bakery_probe';" >/dev/null 2>&1
     for n in "${nodes[@]}"; do

@@ -115,7 +115,7 @@ subs=$(m db1 "SELECT count(*) FROM spock.subscription;")
 
 # The one-time per-node step every mesh needs, before any cold write, secret or
 # registration: coldfront.ensure_replicated() puts each ColdFront table that
-# replicates by value in this node's default replication set. Membership is a
+# replicates by value in this node's replication sets. Membership is a
 # property of the provider, so every node runs it for its own rows: a peer acks
 # an originator's claim by INSERTing into claim_acks over its loopback, and the
 # ack reaches the originator only if claim_acks is in the peer's set; the same
@@ -126,7 +126,7 @@ for n in $NODES; do
     out=$(m "$n" "SELECT coldfront.ensure_replicated();")
     [ -z "$out" ] || { echo "coldfront.ensure_replicated() failed on $n: $out"; exit 1; }
 done
-pass "spock mesh formed (6 subs) + every replicated coldfront table in each node's default set"
+pass "spock mesh formed (6 subs) + every replicated coldfront table in each node's replication sets"
 
 step "mesh: bootstrap Lakekeeper + warehouse ($BACKEND)"
 curl -sf "http://$LK_IP:8181/management/v1/bootstrap" -X POST -H "Content-Type: application/json" \

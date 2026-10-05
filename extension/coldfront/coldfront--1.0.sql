@@ -261,11 +261,13 @@ SELECT pg_extension_config_dump('coldfront.vector_centroids', '');
 -- coldfront.ensure_replicated(): run once on every node of a Spock mesh, after
 -- spock.node_create and the node's spock.sub_create calls and before the first
 -- cold write, storage secret or table registration. It puts every ColdFront
--- table that replicates by value in the node's default replication set.
--- Membership is a property of the provider, so each node adds the tables for
--- the rows it will send; a peer's subscription then receives them. Nothing
--- calls it at run time: a node that skipped it keeps its claim acks, registry
--- rows, secret and lifecycle config to itself.
+-- table that replicates by value in the node's default replication set, except
+-- claim_acks, which goes in the insert-only set: an ack is inserted on the
+-- acking node and deleted by whichever node holds the copy, so no ack DELETE
+-- crosses the mesh. Membership is a property of the provider, so each node adds
+-- the tables for the rows it will send; a peer's subscription then receives
+-- them. Nothing calls it at run time: a node that skipped it keeps its claim
+-- acks, registry rows, secret and lifecycle config to itself.
 --
 -- The tables, all keyed by name so a row is identical on every node:
 --   claims, claim_acks               the bakery's tickets and acknowledgements
@@ -287,6 +289,7 @@ CREATE FUNCTION coldfront.ensure_replicated() RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
     t text;
+    s text;
 BEGIN
     IF NOT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'spock') THEN
         RETURN;
@@ -295,11 +298,12 @@ BEGIN
                              'coldfront.tiered_views', 'coldfront.archive_watermark',
                              'coldfront.storage_secret', 'coldfront.partition_config',
                              'coldfront.vector_config', 'coldfront.vector_centroids'] LOOP
-        PERFORM spock.repset_add_table('default', t::regclass, false)
+        s := CASE WHEN t = 'coldfront.claim_acks' THEN 'default_insert_only' ELSE 'default' END;
+        PERFORM spock.repset_add_table(s, t::regclass, false)
         WHERE NOT EXISTS (
             SELECT 1 FROM spock.replication_set rs
               JOIN spock.replication_set_table rst ON rst.set_id = rs.set_id
-             WHERE rs.set_name = 'default' AND rst.set_reloid = t::regclass
+             WHERE rs.set_name = s AND rst.set_reloid = t::regclass
         );
     END LOOP;
 END;
@@ -3507,8 +3511,12 @@ END $$;
 --    clock in milliseconds, so tickets from different nodes order by those
 --    clocks (see coldfront.claims below).
 --  • coldfront.claim_acks: each peer's ack of a claim, replicated back to the
---    claimant. coldfront.deferred_acks is each node's local queue of the acks
---    it owes until its own smaller-ticket claim is released.
+--    claimant. An ack lives as long as the claim it answers: the claimant keeps
+--    an arriving ack only while the claim is still in coldfront.claims
+--    (_on_ack_apply), and every node drops its copies of a claim's acks when
+--    the claim's DELETE reaches it (_on_claim_release). coldfront.deferred_acks
+--    is each node's local queue of the acks it owes until its own
+--    smaller-ticket claim is released.
 --  • the loopback (coldfront._loopback): required because the claim row INSERT
 --    must commit BEFORE the user's iceberg INSERT happens (else peers don't see our
 --    claim until our PG xact ends, defeating the bakery). pg_duckdb forbids
@@ -3559,7 +3567,8 @@ CREATE TABLE coldfront.claims (
 -- originator polls this table waiting for one row per live peer before
 -- entering the iceberg-commit phase.  Spock-replicated so peers'
 -- ack-INSERTs (from the peer-side trigger on coldfront.claims) reach
--- the originator.
+-- the originator. In Spock's insert-only set (ensure_replicated): each node
+-- deletes only the copies it holds, so no ack DELETE crosses the mesh.
 CREATE TABLE coldfront.claim_acks (
     ticket          bigint NOT NULL,
     ack_from_name   name   NOT NULL,
@@ -3685,7 +3694,7 @@ BEGIN
 
     -- A poke (UPDATE) that reaped nothing changes nothing: the INSERT-time
     -- decision stands, acked or deferred behind a live holder. A fresh ack here
-    -- could land after the waiter's release and outlive its claim.
+    -- would duplicate the INSERT's or break the defer rule.
     IF TG_OP = 'UPDATE' AND NOT v_reaped THEN
         RETURN NULL;
     END IF;
@@ -3731,13 +3740,36 @@ CREATE TRIGGER coldfront_claim_apply
     FOR EACH ROW EXECUTE FUNCTION coldfront._on_claim_apply();
 ALTER TABLE coldfront.claims ENABLE REPLICA TRIGGER coldfront_claim_apply;
 
--- Origin-side trigger: fires when this node's loopback DELETEs a row in
--- coldfront.claims, which is how the C XactCallback releases a claim we held
--- and how the reaper removes an orphan. Drains coldfront.deferred_acks: every ack
--- we had queued for our own pending claim now gets INSERTed into
--- coldfront.claim_acks (replicating to the original originator).
--- Default trigger mode: fires on origin only, NOT on spock-apply of a
--- peer's DELETE.
+-- Peer-side trigger: fires when spock applies a peer's ack INSERT (REPLICA-only;
+-- the acking node's own loopback INSERT is not checked, since the claim it
+-- answers is still uncommitted in that node's apply transaction). Only the
+-- claimant's wait loop reads acks, so a copy of another node's ack is dropped,
+-- and so is an ack for a claim this node has already released or reaped: a
+-- peer ruled dead acks the claims it missed once it catches up, and an orphan's
+-- ack can arrive after the reap. Modelled in docs/formal/Bakery.tla (ClaimLive,
+-- NoAckOutlivesClaim).
+CREATE FUNCTION coldfront._on_ack_apply() RETURNS trigger
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF snowflake.get_node(NEW.ticket) <> current_setting('snowflake.node')::int
+       OR NOT EXISTS (SELECT 1 FROM coldfront.claims WHERE ticket = NEW.ticket) THEN
+        RETURN NULL;
+    END IF;
+    RETURN NEW;
+END $$;
+
+CREATE TRIGGER coldfront_ack_apply
+    BEFORE INSERT ON coldfront.claim_acks
+    FOR EACH ROW EXECUTE FUNCTION coldfront._on_ack_apply();
+ALTER TABLE coldfront.claim_acks ENABLE REPLICA TRIGGER coldfront_ack_apply;
+
+-- Fires on every DELETE from coldfront.claims (ENABLE ALWAYS): this node's
+-- loopback releasing a claim we held or reaping an orphan, and spock applying a
+-- peer's DELETE. Every node drops its own copies of the claim's acks, which is
+-- why claim_acks is in the insert-only set. On the origin it also drains
+-- coldfront.deferred_acks: every ack we had queued for our own pending claim
+-- now gets INSERTed into coldfront.claim_acks (replicating to the original
+-- originator).
 CREATE FUNCTION coldfront._on_claim_release() RETURNS trigger
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -3755,10 +3787,13 @@ BEGIN
         RETURN NULL;
     END IF;
 
+    -- A deferral whose claim is gone (released past us, or reaped) is not
+    -- forwarded: its ack would have no reader.
     INSERT INTO coldfront.claim_acks (ticket, ack_from_name, iceberg_table)
-    SELECT ack_for_ticket, my_name, iceberg_table
-      FROM coldfront.deferred_acks
-     WHERE pending_ticket = OLD.ticket
+    SELECT d.ack_for_ticket, my_name, d.iceberg_table
+      FROM coldfront.deferred_acks d
+     WHERE d.pending_ticket = OLD.ticket
+       AND EXISTS (SELECT 1 FROM coldfront.claims c WHERE c.ticket = d.ack_for_ticket)
     ON CONFLICT DO NOTHING;
 
     DELETE FROM coldfront.deferred_acks WHERE pending_ticket = OLD.ticket;
@@ -3768,6 +3803,7 @@ END $$;
 CREATE TRIGGER coldfront_claim_release
     AFTER DELETE ON coldfront.claims
     FOR EACH ROW EXECUTE FUNCTION coldfront._on_claim_release();
+ALTER TABLE coldfront.claims ENABLE ALWAYS TRIGGER coldfront_claim_release;
 
 -- coldfront._insert_claim is the claim's own transaction: _claim_iceberg_lock
 -- runs it on the loopback, and every lock taken here ends with that
@@ -3789,9 +3825,11 @@ CREATE TRIGGER coldfront_claim_release
 -- reaped only when this session can take that table's lock: a live writer holds
 -- it, the caller included when its transaction claimed that table earlier. The
 -- epoch arm covers claims from before a restart. The orphan DELETE fires
--- _on_claim_release, which forwards whatever peers deferred behind the orphan,
--- and the acks CTE drops the orphan's own acks. It runs before our INSERT, so
--- it cannot reap us. Modelled in docs/formal/Bakery.tla (Reaper, BeginClaim).
+-- _on_claim_release, which drops the orphan's acks and forwards whatever peers
+-- deferred behind it, and the acks CTE drops any ack of this node's that has
+-- outlived its claim (one whose apply committed alongside the release). It runs
+-- before our INSERT, so it cannot reap us. Modelled in docs/formal/Bakery.tla
+-- (Reaper, BeginClaim).
 CREATE FUNCTION coldfront._insert_claim(p_iceberg_table text) RETURNS bigint
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -3816,7 +3854,9 @@ BEGIN
                 OR snowflake.get_epoch(ticket) < extract(epoch FROM pg_postmaster_start_time()))
         RETURNING ticket
     ), acks AS (
-        DELETE FROM coldfront.claim_acks a USING orphan o WHERE a.ticket = o.ticket
+        DELETE FROM coldfront.claim_acks a
+         WHERE snowflake.get_node(a.ticket) = my_node
+           AND NOT EXISTS (SELECT 1 FROM coldfront.claims c WHERE c.ticket = a.ticket)
     )
     INSERT INTO coldfront.claims (iceberg_table, ticket)
     VALUES (p_iceberg_table, snowflake.nextval())

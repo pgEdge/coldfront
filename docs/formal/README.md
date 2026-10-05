@@ -61,6 +61,14 @@ These properties must hold; TLC checks them as `INVARIANTS`:
   documentation.
 - `NoDoubleRegistration` states that at most one node registers a given Iceberg
   table. `Bakery_adopt.cfg` and `Bakery_adopt_race.cfg` check it.
+- `NoAckOutlivesClaim` states that every ack answers a claim its node still
+  holds. `Release` drops the claim's acks, and every ack write (the apply's
+  ack, the drain's forward, the reapers' forwards) is guarded by `ClaimLive`,
+  which models `coldfront._on_ack_apply` dropping an ack whose claim is gone
+  and `_on_claim_release` forwarding only deferrals whose claim still exists.
+  Without the guard the crash and reaper configs violate it: a peer's apply
+  decides to ack, the peer is ruled dead or the claim is reaped, the writer
+  releases, and the ack lands with no claim. Every config checks it.
 
 ### Liveness
 
@@ -264,6 +272,14 @@ mandatory for multi-writer-per-node cold writes.
 
 The model is a *protocol-level* abstraction. The following are represented
 faithfully because they affect protocol correctness:
+
+- The lifetime of an ack. `acks` is the originator's `coldfront.claim_acks`;
+  peers' copies are not modelled, since no step reads them (each node drops
+  its own copies when the claim's `DELETE` reaches it). The arrival check and
+  the insert in `_on_ack_apply` are one step here and two statements in one
+  apply transaction in SQL, so a release that commits between them leaves one
+  row on the originator; the node's next claim deletes it (the `acks` CTE in
+  `_insert_claim`).
 
 - The `coldfront.iceberg_async_parquet` flag's two mesh orderings in
   [_exec_iceberg_with_claim](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/coldfront--1.0.sql):

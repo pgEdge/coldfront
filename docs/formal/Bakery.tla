@@ -17,6 +17,9 @@
 (*   4. Writer proceeds to Decide (the CAS, under the held claim).         *)
 (*   5. On release: FORWARD the deferred acks (deferred -> acks) then      *)
 (*      DELETE them -- also two steps.                                     *)
+(*   An ack lives exactly as long as the claim it answers: the release     *)
+(*   drops the claim's acks, and every ack write (apply, forward) is       *)
+(*   guarded by ClaimLive -- see NoAckOutlivesClaim.                        *)
 (*                                                                         *)
 (* SafeAcks -- implementation atomicity, NOT a protocol change:            *)
 (*   The apply-time defer DECISION/WRITE and the release FORWARD/DELETE    *)
@@ -47,6 +50,7 @@
 (*   - NoLakekeeperConflict  (R-A: only one writer has all acks at a time *)
 (*                            per iceberg table -- no concurrent CAS races)*)
 (*   - TicketOrderPreserved, RollbackNoIceberg, UniqueTickets             *)
+(*   - NoAckOutlivesClaim    (every ack's claim is still live)            *)
 (*   LIVENESS:                                                            *)
 (*   - EventualProgress (every writer eventually decides): HOLDS under    *)
 (*     SafeAcks=TRUE (Bakery_fixed.cfg); VIOLATED under SafeAcks=FALSE *)
@@ -190,7 +194,13 @@ variables
   \* Acks received per ticket.  A pair <<t, nd>> in `acks` means peer NODE
   \* nd has acked the claim with ticket t.  Models coldfront.claim_acks
   \* (on the originator side, fully populated via spock replication of
-  \* peer-emitted ack rows).  `nd` is the node's identity: the concrete
+  \* peer-emitted ack rows).  Every write is guarded by ClaimLive: the
+  \* originator keeps an arriving ack only while the claim it answers is
+  \* live there (coldfront._on_ack_apply), so a late ack (from a peer ruled
+  \* dead, or for an orphan reaped first) is dropped on arrival, and a peer
+  \* forwards a deferred ack only while that claim is still in its own view
+  \* (_on_claim_release).  Peers' copies of acks are not modelled: no step
+  \* reads them.  `nd` is the node's identity: the concrete
   \* claim_acks row carries the acker's spock node NAME (unique per node),
   \* so the ack-wait match is a direct name equality with no id/name or
   \* hash resolution — the model's abstract node identity realised exactly.
@@ -266,6 +276,10 @@ define
   MyForwardable(self, t) ==
     { d \in deferred : d[1] = Nd(self) /\ d[3] = t }
 
+  \* A claim is live while its ticket is in its own node's view: that node
+  \* inserts it there first and removes it only at its release or reap.
+  ClaimLive(t) == \E nd \in Nodes : \E x \in claims[nd] : x.t = t /\ x.n = nd
+
   \* Safety properties (all HOLD).
   NoLakekeeperConflict ==
     \A w \in Writers : decision[w] # "lk_409"
@@ -294,6 +308,12 @@ define
   \* field reports. Expected VIOLATED without AdoptClaims and to hold with it.
   NoDoubleRegistration ==
     Cardinality(UNION { registered[nd] : nd \in Nodes }) <= 1
+
+  \* No ack outlives its claim. `acks` is the claim's node's view of
+  \* coldfront.claim_acks: an arriving ack is kept only while its claim is live
+  \* there (coldfront._on_ack_apply), and the claim's release or reap drops the
+  \* claim's acks in the same transaction (coldfront._on_claim_release).
+  NoAckOutlivesClaim == \A a \in acks : ClaimLive(a[1])
 
   \* LIVENESS — every writer eventually reaches a terminal decision.  A writer
   \* whose ack is dropped by the non-atomic defer/drain race is stranded at
@@ -381,7 +401,8 @@ begin
       acks := ( acks \ { a \in acks : \E o \in orphans : a[1] = o.t } )
               \cup { <<d[2], Nd(self)>> :
                        d \in { y \in deferred :
-                                 y[1] = Nd(self) /\ \E o \in orphans : y[3] = o.t } };
+                                 y[1] = Nd(self) /\ \E o \in orphans : y[3] = o.t
+                                 /\ ClaimLive(y[2]) } };
       deferred := { y \in deferred :
                       ~ (y[1] = Nd(self) /\ \E o \in orphans : y[3] = o.t) };
       claims := [nd \in Nodes |->
@@ -458,9 +479,13 @@ begin
     \* all nodes in this step. On abort the INSERT never commits, and a writer
     \* that crashes before this point never reaches it, so only a committed
     \* writer registers anywhere.
+    \* The claim DELETE fires _on_claim_release, which drops the claim's acks in
+    \* the same transaction; the trigger also fires where the DELETE is applied,
+    \* so every node drops its own copies and no ack DELETE replicates.
     await Live(self);
     claims := [nd \in Nodes |->
                 claims[nd] \ {[w |-> self, t |-> my_ticket, n |-> Nd(self)]}];
+    acks := { a \in acks : a[1] # my_ticket };
     if my_pf /\ decision[self] = "committed" then
       registered := [nd \in Nodes |-> registered[nd] \cup {self}];
     end if;
@@ -472,8 +497,12 @@ begin
     \* but BEFORE DrainDelete is NOT seen here.  With SameNodeLock FALSE this
     \* is the same-node race: if a same-node claim below the deferred ticket
     \* still holds, forwarding here clears that peer node too early.
+    \* A deferral whose claim is gone (released past this node, or reaped) is
+    \* not forwarded: _on_claim_release forwards only deferrals whose claim row
+    \* still exists.
     await Live(self);
-    acks := acks \cup { <<d[2], Nd(self)>> : d \in MyForwardable(self, my_ticket) };
+    acks := acks \cup { <<d[2], Nd(self)>> :
+                          d \in { y \in MyForwardable(self, my_ticket) : ClaimLive(y[2]) } };
 
   DrainDelete:
     \* _on_claim_release step 2 (the SEPARATE DELETE): delete the deferrals I
@@ -518,7 +547,8 @@ begin
             acks := ( acks \ { a \in acks : \E o \in orphans : a[1] = o.t } )
                     \cup { <<d[2], dst>> :
                              d \in { y \in deferred :
-                                       y[1] = dst /\ \E o \in orphans : y[3] = o.t } };
+                                       y[1] = dst /\ \E o \in orphans : y[3] = o.t
+                                       /\ ClaimLive(y[2]) } };
             deferred := { y \in deferred :
                             ~ (y[1] = dst /\ \E o \in orphans : y[3] = o.t) };
             claims := [nd \in Nodes |->
@@ -551,7 +581,11 @@ begin
             ELSE ap_defer)
       then
         deferred := deferred \cup { <<ap_dst, ap_ct, ap_behind>> };
-      else
+      elsif ClaimLive(ap_ct) then
+        \* The originator keeps an arriving ack only while the claim it answers
+        \* is still in its coldfront.claims (coldfront._on_ack_apply, a replica
+        \* trigger). An ack for a claim released or reaped since the apply
+        \* decided is dropped on arrival.
         acks := acks \cup { <<ap_ct, ap_dst>> };
       end if;
     end while;
@@ -589,7 +623,8 @@ begin
           acks := ( acks \ { a \in acks : \E o \in orphans : a[1] = o.t } )
                   \cup { <<d[2], dst>> :
                            d \in { y \in deferred :
-                                     y[1] = dst /\ \E o \in orphans : y[3] = o.t } }
+                                     y[1] = dst /\ \E o \in orphans : y[3] = o.t
+                                     /\ ClaimLive(y[2]) } }
                   \cup ( IF orphans # {}
                             /\ ~ \E own \in (claims[dst] \ orphans) :
                                    own.n = dst /\ own.t < c.t
@@ -626,7 +661,7 @@ begin
 end process;
 
 end algorithm; *)
-\* BEGIN TRANSLATION (chksum(pcal) = "9e63d7af" /\ chksum(tla) = "9d00a96b")
+\* BEGIN TRANSLATION (chksum(pcal) = "42f061e9" /\ chksum(tla) = "adf5f930")
 VARIABLES pc, next_ticket, claims, acks, deferred, iceberg, decision, crashed, 
           crash_budget, registered
 
@@ -673,6 +708,10 @@ MyForwardable(self, t) ==
   { d \in deferred : d[1] = Nd(self) /\ d[3] = t }
 
 
+
+ClaimLive(t) == \E nd \in Nodes : \E x \in claims[nd] : x.t = t /\ x.n = nd
+
+
 NoLakekeeperConflict ==
   \A w \in Writers : decision[w] # "lk_409"
 
@@ -700,6 +739,12 @@ TicketOrderPreserved ==
 
 NoDoubleRegistration ==
   Cardinality(UNION { registered[nd] : nd \in Nodes }) <= 1
+
+
+
+
+
+NoAckOutlivesClaim == \A a \in acks : ClaimLive(a[1])
 
 
 
@@ -801,7 +846,8 @@ BeginClaim(self) == /\ pc[self] = "BeginClaim"
                          /\ acks' = ( acks \ { a \in acks : \E o \in orphans : a[1] = o.t } )
                                     \cup { <<d[2], Nd(self)>> :
                                              d \in { y \in deferred :
-                                                       y[1] = Nd(self) /\ \E o \in orphans : y[3] = o.t } }
+                                                       y[1] = Nd(self) /\ \E o \in orphans : y[3] = o.t
+                                                       /\ ClaimLive(y[2]) } }
                          /\ deferred' = { y \in deferred :
                                             ~ (y[1] = Nd(self) /\ \E o \in orphans : y[3] = o.t) }
                          /\ claims' = [nd \in Nodes |->
@@ -871,19 +917,21 @@ Release(self) == /\ pc[self] = "Release"
                  /\ Live(self)
                  /\ claims' = [nd \in Nodes |->
                                 claims[nd] \ {[w |-> self, t |-> my_ticket[self], n |-> Nd(self)]}]
+                 /\ acks' = { a \in acks : a[1] # my_ticket[self] }
                  /\ IF my_pf[self] /\ decision[self] = "committed"
                        THEN /\ registered' = [nd \in Nodes |-> registered[nd] \cup {self}]
                        ELSE /\ TRUE
                             /\ UNCHANGED registered
                  /\ pc' = [pc EXCEPT ![self] = "DrainForward"]
-                 /\ UNCHANGED << next_ticket, acks, deferred, iceberg, 
-                                 decision, crashed, crash_budget, my_ticket, 
-                                 my_pf, parent_seen, parent_staged, ap_dst, 
-                                 ap_ct, ap_defer, ap_behind >>
+                 /\ UNCHANGED << next_ticket, deferred, iceberg, decision, 
+                                 crashed, crash_budget, my_ticket, my_pf, 
+                                 parent_seen, parent_staged, ap_dst, ap_ct, 
+                                 ap_defer, ap_behind >>
 
 DrainForward(self) == /\ pc[self] = "DrainForward"
                       /\ Live(self)
-                      /\ acks' = (acks \cup { <<d[2], Nd(self)>> : d \in MyForwardable(self, my_ticket[self]) })
+                      /\ acks' = (acks \cup { <<d[2], Nd(self)>> :
+                                                d \in { y \in MyForwardable(self, my_ticket[self]) : ClaimLive(y[2]) } })
                       /\ pc' = [pc EXCEPT ![self] = "DrainDelete"]
                       /\ UNCHANGED << next_ticket, claims, deferred, iceberg, 
                                       decision, crashed, crash_budget, 
@@ -920,7 +968,8 @@ ApplyLoop == /\ pc["applier"] = "ApplyLoop"
                            /\ acks' = ( acks \ { a \in acks : \E o \in orphans : a[1] = o.t } )
                                       \cup { <<d[2], dst>> :
                                                d \in { y \in deferred :
-                                                         y[1] = dst /\ \E o \in orphans : y[3] = o.t } }
+                                                         y[1] = dst /\ \E o \in orphans : y[3] = o.t
+                                                         /\ ClaimLive(y[2]) } }
                            /\ deferred' = { y \in deferred :
                                               ~ (y[1] = dst /\ \E o \in orphans : y[3] = o.t) }
                            /\ claims' = [nd \in Nodes |->
@@ -943,7 +992,10 @@ ApplyEmit == /\ pc["applier"] = "ApplyEmit"
                       ELSE ap_defer)
                    THEN /\ deferred' = (deferred \cup { <<ap_dst, ap_ct, ap_behind>> })
                         /\ acks' = acks
-                   ELSE /\ acks' = (acks \cup { <<ap_ct, ap_dst>> })
+                   ELSE /\ IF ClaimLive(ap_ct)
+                              THEN /\ acks' = (acks \cup { <<ap_ct, ap_dst>> })
+                              ELSE /\ TRUE
+                                   /\ acks' = acks
                         /\ UNCHANGED deferred
              /\ pc' = [pc EXCEPT !["applier"] = "ApplyLoop"]
              /\ UNCHANGED << next_ticket, claims, iceberg, decision, crashed, 
@@ -967,7 +1019,8 @@ PokeLoop == /\ pc["poker"] = "PokeLoop"
                           /\ acks' = ( acks \ { a \in acks : \E o \in orphans : a[1] = o.t } )
                                      \cup { <<d[2], dst>> :
                                               d \in { y \in deferred :
-                                                        y[1] = dst /\ \E o \in orphans : y[3] = o.t } }
+                                                        y[1] = dst /\ \E o \in orphans : y[3] = o.t
+                                                        /\ ClaimLive(y[2]) } }
                                      \cup ( IF orphans # {}
                                                /\ ~ \E own \in (claims[dst] \ orphans) :
                                                       own.n = dst /\ own.t < c.t

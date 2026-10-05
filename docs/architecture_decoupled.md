@@ -552,15 +552,21 @@ pointing at the same Lakekeeper endpoint and S3 bucket:
   [docs/formal/Bakery.tla](https://github.com/pgEdge/ColdFront/blob/main/docs/formal/Bakery.tla);
   the safety properties are verified via TLA+ (`Bakery.cfg`).
 
-    The protocol uses two tables, both in Spock's `default` repset:
+    The protocol uses two replicated tables:
 
     - Each writer inserts `(iceberg_table, ticket)` into `coldfront.claims`,
-      and the row is deleted on release.
+      in Spock's `default` set, and the row is deleted on release.
     - Peers insert `(ticket, ack_from_name, iceberg_table)` into
       `coldfront.claim_acks` to acknowledge an originator's claim, keyed by the
-      acker's Spock node name. The ack replicates back to the originator and is
-      deleted with the claim: only the originator's own wait loop ever reads
-      its acks, so a row has no reader once the claim is gone.
+      acker's Spock node name. Only the originator's own wait loop ever reads
+      acks, and an ack lives exactly as long as the claim it answers: the
+      originator keeps an arriving ack only while that claim is still in its
+      `coldfront.claims` (a late ack from a peer that was ruled dead, or for an
+      orphan already reaped, is dropped on arrival), every node drops its
+      copies of a claim's acks when the claim's `DELETE` reaches it, and a
+      deferred ack is forwarded only while its claim still exists. The table
+      is in Spock's `default_insert_only` set, so each node deletes only the
+      copies it holds and no ack `DELETE` crosses the mesh.
 
     Locally on every node, `coldfront.deferred_acks` queues acks the node has
     *deferred* because it has its own pending claim with a smaller ticket on
@@ -772,7 +778,7 @@ SELECT coldfront.ensure_replicated();
 ```
 
 The call is idempotent. It puts every ColdFront table that replicates by value
-in the node's default repset: the two bakery tables, the registry and the
+in the node's replication sets: the two bakery tables, the registry and the
 watermark, the storage secret, the lifecycle config and the vector routing
 state (the list and the reason for each table are in the
 [Distributed Setup](usage.md#what-coldfrontensure_replicated-does) section of

@@ -133,6 +133,11 @@ this project adheres to
 
 ### Fixed
 
+- A bakery acknowledgement could outlive the claim it answered: a peer ruled
+  dead acknowledged the claims it had missed once it caught up, and the rows
+  stayed on every node. A node keeps an acknowledgement only while it still
+  holds the claim, and `coldfront.claim_acks` moves to Spock's
+  insert-only replication set so each node deletes only its own copies.
 - A deployment YAML could name a warehouse other than the server's: the
   archiver ignored the file's `iceberg.*` keys, the compactor acted on them,
   and a file with both an `s3:` and an `azure:` stanza was refused by the

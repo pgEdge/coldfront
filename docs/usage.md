@@ -1266,7 +1266,7 @@ SELECT spock.sub_create('sub_n1_from_n3', 'host=<n3> user=coldfront dbname=coldf
 
 -- 3. **Required** on every node, after its subscriptions exist and before
 -- the first cold write, storage secret or table registration: put every
--- ColdFront table that replicates by value in this node's default repset.
+-- ColdFront table that replicates by value in this node's replication sets.
 SELECT coldfront.ensure_replicated();
 ```
 
@@ -1303,12 +1303,13 @@ each claim reads the window once.
 ### What `coldfront.ensure_replicated()` Does
 
 The call is the one ColdFront-specific step of the mesh setup. It adds eight
-tables to the node's `default` replication set, each keyed by name, so a row is
-identical on every node and replicates by value:
+tables to the node's replication sets (`claim_acks` to `default_insert_only`,
+the rest to `default`), each keyed by name, so a row is identical on every node
+and replicates by value:
 
 | Table | What replicates, and why a peer needs it |
 |---|---|
-| `coldfront.claims`, `coldfront.claim_acks` | The bakery's tickets and acknowledgements. A peer acknowledges an originator's claim by inserting into `claim_acks` on its own node, and the ack reaches the originator only if the table is in the peer's set. |
+| `coldfront.claims`, `coldfront.claim_acks` | The bakery's tickets and acknowledgements. A peer acknowledges an originator's claim by inserting into `claim_acks` on its own node, and the ack reaches the originator only if the table is in the peer's set. `claim_acks` goes in the insert-only set, because each node deletes only the ack copies it holds. |
 | `coldfront.tiered_views` | The registry. A peer's hook recognizes a view by its row; without it the peer's writes through the view fail in PostgreSQL ("cannot insert into view") and its reads cannot attach the cold tier. |
 | `coldfront.archive_watermark` | The hot/cold cutoff that routes each tiered write. |
 | `coldfront.storage_secret` | The cold-store credential, so one `set_storage_secret` call reaches every node. |
