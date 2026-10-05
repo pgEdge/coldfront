@@ -220,7 +220,8 @@ type validateDB interface {
 //     leading underscore, and short enough for the generated leaf names.
 //   - every relation in the partition tree is WAL-logged (see requireLogged).
 //   - the table has no DEFAULT partition (see requireNoDefaultPartition).
-//   - tiered only: every column has an Iceberg type (see requireMappableColumns).
+//   - tiered only: every column has an Iceberg type and a name DuckDB can parse
+//     (see requireMappableColumns).
 func validateRow(ctx context.Context, db validateDB, row configRow) error {
 	// After the archiver's first-run swap the source is a VIEW over "_"+name, so
 	// validate the PK / partition key against the real partitioned table. register
@@ -251,12 +252,13 @@ func validateRow(ctx context.Context, db validateDB, row configRow) error {
 }
 
 // requireMappableColumns rejects a tiered table carrying a column whose PG type
-// the cold tier cannot store, which otherwise registers cleanly and hard-errors
-// on the first archive cycle, hours later out of cron. Only a hot period makes a
-// table's column types Iceberg's problem. The extension's own type map decides,
-// in the database: it is the function every cold write and view rebuild already
-// goes through, and asking it keeps Iceberg out of partition-core (a stock-PG
-// partitioner node has no extension, and no cold tier to be wrong about).
+// the cold tier cannot store, or whose name DuckDB cannot parse, which otherwise
+// registers cleanly and hard-errors on the first archive cycle, hours later out
+// of cron. Only a hot period makes a table's columns Iceberg's problem. The
+// extension decides, in the database, with the type map every cold write and
+// view rebuild already goes through and the name check every cold-tier column
+// passes. Asking it keeps Iceberg out of partition-core (a stock-PG partitioner
+// node has no extension, and no cold tier to be wrong about).
 func requireMappableColumns(ctx context.Context, db partition.RowQuerier, schema, table, hot string) error {
 	if hot == "" {
 		return nil
@@ -269,12 +271,13 @@ func requireMappableColumns(ctx context.Context, db partition.RowQuerier, schema
 	if !coldTier {
 		return nil
 	}
-	// count() forces the per-column call, which RAISES on the first unstorable
-	// type. The companion filter is the extension's own predicate, so a vector's
-	// generated real[] column is not read as a user column.
+	// count() forces the per-column calls, which RAISE on the first name DuckDB
+	// cannot parse or unstorable type. The companion filter is the extension's own
+	// predicate, so a vector's generated real[] column is not read as a user column.
 	var checked int
 	if err := db.QueryRow(ctx, `
-		SELECT count(coldfront._iceberg_storage_type(format_type(a.atttypid, a.atttypmod), a.attname))
+		SELECT count(coldfront._require_duckdb_column_name(a.attname))
+		     + count(coldfront._iceberg_storage_type(format_type(a.atttypid, a.atttypmod), a.attname))
 		FROM pg_attribute a
 		JOIN pg_class c ON c.oid = a.attrelid
 		JOIN pg_namespace n ON n.oid = c.relnamespace

@@ -2666,6 +2666,28 @@ BEGIN
 END;
 $$;
 
+-- The name a column has in the cold tier, refused when DuckDB cannot parse it.
+-- pg_duckdb (c04e6a2) hands DuckDB a column name quoted the way PostgreSQL quotes
+-- it, so a name PostgreSQL leaves bare reaches DuckDB bare, quoted in the query
+-- or not, and DuckDB's parser takes some of those as keywords:
+-- duckdb/pg_duckdb#1019. Every query pg_duckdb runs against such a column then
+-- fails to parse. The list is every name PostgreSQL leaves bare that DuckDB
+-- 1.5.4's parser rejects. The duckdb_keyword_column regress test derives that set
+-- from both and fails when a pin move changes it, and fails once pg_duckdb keeps
+-- the quotes, when this goes.
+CREATE FUNCTION coldfront._require_duckdb_column_name(p_name text)
+RETURNS text
+LANGUAGE plpgsql IMMUTABLE STRICT AS $$
+BEGIN
+    IF p_name = ANY ('{anti,asof,at,by,describe,glob,lambda,pivot,pivot_longer,
+                       pivot_wider,positional,qualify,semi,show,summarize,unpack,
+                       unpivot}'::text[]) THEN
+        RAISE EXCEPTION 'coldfront: column "%": DuckDB cannot parse this name, which pg_duckdb passes to it unquoted (https://github.com/duckdb/pg_duckdb/issues/1019); rename the column', p_name;
+    END IF;
+    RETURN p_name;
+END;
+$$;
+
 -- The reverse of _iceberg_storage_type: the PostgreSQL type a wrapper view
 -- exposes an existing Iceberg column as. adopt_iceberg_table reads its columns
 -- from the catalog rather than from a caller's declaration, so this is what
@@ -3201,7 +3223,7 @@ BEGIN
         END IF;
 
         v_cols := v_cols || jsonb_build_object(
-                      'name', r.col_name,
+                      'name', coldfront._require_duckdb_column_name(r.col_name),
                       'cast', coldfront._adopt_column_type(r.col_name, r.duckdb_type, p_types));
         v_n := v_n + 1;
     END LOOP;
@@ -3400,7 +3422,8 @@ BEGIN
         END IF;
         n := n + 1;
 
-        iceberg_cols := iceberg_cols || quote_ident(col_name) || ' ' || storage_type;
+        iceberg_cols := iceberg_cols || quote_ident(coldfront._require_duckdb_column_name(col_name))
+                        || ' ' || storage_type;
         v_view_cols := v_view_cols || jsonb_build_object(
                            'name', col_name,
                            'cast', coldfront._iceberg_view_cast(pg_type, col_name));
@@ -4762,7 +4785,8 @@ BEGIN
             END IF;
             IF op = 'add' THEN
                 ddl := ddl || format('ALTER TABLE %s ADD COLUMN IF NOT EXISTS %I %s',
-                    p_iceberg_table, col, coldfront._iceberg_storage_type(pg_type, col));
+                    p_iceberg_table, coldfront._require_duckdb_column_name(col),
+                    coldfront._iceberg_storage_type(pg_type, col));
             ELSE
                 ddl := ddl || format('ALTER TABLE %s ALTER COLUMN %I TYPE %s',
                     p_iceberg_table, col, coldfront._iceberg_storage_type(pg_type, col));
@@ -4771,7 +4795,7 @@ BEGIN
             ddl := ddl || format('ALTER TABLE %s DROP COLUMN IF EXISTS %I', p_iceberg_table, col);
         ELSIF op = 'rename' THEN
             ddl := ddl || format('ALTER TABLE %s RENAME COLUMN %I TO %I',
-                p_iceberg_table, col, act->>'newcol');
+                p_iceberg_table, col, coldfront._require_duckdb_column_name(act->>'newcol'));
         ELSE
             RAISE EXCEPTION 'coldfront._mirror_iceberg_alter: unknown op "%"', op;
         END IF;

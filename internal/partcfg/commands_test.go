@@ -382,11 +382,12 @@ func TestRequireMappableColumns_AcceptsMappableTable(t *testing.T) {
 	if len(db.args) != 2 || db.args[0] != "public" || db.args[1] != "events" {
 		t.Errorf("schema/table not passed as args: %v", db.args)
 	}
-	// The extension's map decides, not a second copy in Go, and is given the
-	// column so a refusal names it; its companion predicate is what keeps a
-	// vector's generated real[] column out of the check.
+	// The extension's map and name check decide, not a second copy in Go, and
+	// are given the column so a refusal names it; its companion predicate is what
+	// keeps a vector's generated real[] column out of the check.
 	for _, want := range []string{
 		"coldfront._iceberg_storage_type(format_type(a.atttypid, a.atttypmod), a.attname)",
+		"coldfront._require_duckdb_column_name(a.attname)",
 		"coldfront._is_vec_companion",
 	} {
 		if !strings.Contains(db.asked[1], want) {

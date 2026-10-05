@@ -1469,7 +1469,8 @@ func registerTieredView(ctx context.Context, db view.DBTX, schema, table, hotTab
 //
 // A column whose type has no Iceberg-compatible mapping fails the query: the map
 // raises rather than falling back to VARCHAR and losing precision or identity at
-// write time.
+// write time. So does a column whose name DuckDB cannot parse
+// (coldfront._require_duckdb_column_name), which would fail every export.
 //
 // IsIdentity is attidentity = 'a' (GENERATED ALWAYS AS IDENTITY); IsPK is
 // participation in pg_index.indisprimary. Composite PKs handled transparently.
@@ -1501,7 +1502,7 @@ func getColumns(ctx context.Context, db querier, schema, tableName string) ([]vi
 func scanColumns(ctx context.Context, db querier, schema, actualName string) ([]view.Column, error) {
 	// attidentity is PG internal type "char"; cast to text for pgx compatibility.
 	rows, err := db.Query(ctx /* nosemgrep */, `
-		SELECT a.attname,
+		SELECT coldfront._require_duckdb_column_name(a.attname),
 		       coldfront._iceberg_storage_type(format_type(a.atttypid, a.atttypmod), a.attname),
 		       coldfront._iceberg_view_cast_type(format_type(a.atttypid, a.atttypmod)),
 		       a.attidentity::text

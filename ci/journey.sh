@@ -435,6 +435,10 @@ story_decoupled_alter() {
         "$(q_may "$HOST" "ALTER TABLE public.tcalt ALTER COLUMN qty TYPE integer;")"
     assert_err "TC-257: a default is refused" "takes a name and a type" \
         "$(q_may "$HOST" "ALTER TABLE public.tcalt ADD COLUMN fee numeric(10,2) DEFAULT 0;")"
+    assert_err "TC-257: an added column DuckDB cannot parse is refused" 'column "by": DuckDB cannot parse this name' \
+        "$(q_may "$HOST" "ALTER TABLE public.tcalt ADD COLUMN by int;")"
+    assert_err "TC-257: and so is a rename to one" 'column "at": DuckDB cannot parse this name' \
+        "$(q_may "$HOST" "ALTER TABLE public.tcalt RENAME COLUMN qty TO at;")"
     q "$HOST" "SELECT coldfront.create_iceberg_table('public','tcalt_vec','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"emb\",\"type\":\"vector(3)\"}]'::jsonb);" >/dev/null
     assert_err "TC-257: a vector column is not added" "vector column" \
         "$(q_may "$HOST" "ALTER TABLE public.tcalt_vec ADD COLUMN emb2 vector(3);")"
@@ -6658,6 +6662,80 @@ story_unmappable_column_rejected() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# Story: TC-260..TC-263, a column name DuckDB parses as a keyword is refused on
+# every path to a cold tier. pg_duckdb hands DuckDB each column name quoted the
+# way PostgreSQL quotes it, so by, which PostgreSQL leaves bare, reaches DuckDB
+# bare and fails to parse (duckdb/pg_duckdb#1019). Without the refusal such a
+# table registers and then every archive pass that tiers it fails. A DuckDB
+# keyword its parser takes as a name (columns) and a word PostgreSQL quotes
+# ("order") still register.
+# ───────────────────────────────────────────────────────────────────────────
+story_keyword_column_rejected() {
+    step "TC-260..TC-263: a column name DuckDB parses as a keyword is refused"
+    local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
+    local why='DuckDB cannot parse this name, which pg_duckdb passes to it unquoted (https://github.com/duckdb/pg_duckdb/issues/1019)'
+    _tc260_cleanup() {
+        q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name IN ('tc260_kw','tc260_ok','tc261_kw');" >/dev/null 2>&1
+        q "$HOST" "DROP TABLE IF EXISTS public.tc260_kw, public.tc260_ok, public.tc261_kw CASCADE;" >/dev/null 2>&1
+        q "$HOST" "SELECT coldfront.ensure_attached(); SELECT duckdb.raw_query('DROP TABLE IF EXISTS ice.public.tc261_kw'); SELECT duckdb.raw_query('DROP TABLE IF EXISTS ice.tc263ns.tc263_kw');" >/dev/null 2>&1
+    }
+    trap _tc260_cleanup RETURN
+    _tc260_unregistered() {
+        q "$HOST" "SELECT (to_regclass('public.$1') IS NULL)::text || '|' || (SELECT count(*) FROM coldfront.tiered_views WHERE relname = '$1');"
+    }
+    # TC-260: register refuses it, from the archiver and the partitioner alike.
+    q "$HOST" "CREATE TABLE public.tc260_kw (id bigint, ts timestamptz NOT NULL, by int,
+        PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);" >/dev/null
+    assert_register_rejected "TC-260: register named the column and the pg_duckdb bug" \
+        tc260_kw "column \"by\": $why"
+    if "$PARTITIONER" register --dsn "$dsn" --table tc260_kw \
+            --period monthly --hot-period "30 days" >"$TMPD/tc260-part.log" 2>&1; then
+        fail "TC-260: partitioner accepted a tiered row the archiver cannot process"
+    else
+        assert_contains "TC-260: partitioner refused it too" "column \"by\": $why" "$(cat "$TMPD/tc260-part.log")"
+    fi
+    q "$HOST" "CREATE TABLE public.tc260_ok (id bigint, ts timestamptz NOT NULL, columns int, \"order\" int,
+        PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);" >/dev/null
+    if "$ARCHIVER" register --table tc260_ok --period monthly --hot-period "30 days" \
+            --dry-run >"$TMPD/tc260-ok.log" 2>&1; then
+        pass "TC-260: columns and \"order\" validate for tiering"
+    else
+        fail "TC-260: a name DuckDB parses was refused, see $TMPD/tc260-ok.log"; tail -3 "$TMPD/tc260-ok.log"
+    fi
+    # TC-261: a column added after registration fails the archive pass, naming
+    # it, before anything reaches Iceberg; the row stays hot.
+    qf "$HOST" <<'EOSQL' >/dev/null
+CREATE TABLE public.tc261_kw (id bigint, ts timestamptz NOT NULL, PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);
+DO $do$ DECLARE m date := (date_trunc('month', now()) - interval '4 months')::date; BEGIN
+  EXECUTE format('CREATE TABLE public.%I PARTITION OF public.tc261_kw FOR VALUES FROM (%L) TO (%L)',
+                 'tc261_kw_p_' || to_char(m, 'YYYY_MM'), m, m + interval '1 month');
+END $do$;
+INSERT INTO public.tc261_kw VALUES (1, date_trunc('month', now()) - interval '4 months' + interval '3 days');
+EOSQL
+    if ! "$ARCHIVER" register --table tc261_kw --period monthly \
+            --hot-period "$(hot_days) days" >"$TMPD/tc261.log" 2>&1; then
+        fail "TC-261: register tc261_kw (see $TMPD/tc261.log)"; tail -5 "$TMPD/tc261.log"; return
+    fi
+    q "$HOST" "ALTER TABLE public.tc261_kw ADD COLUMN by int;" >/dev/null
+    if archive_only "schema_name='public' AND table_name='tc261_kw'" "$TMPD/tc261-arch.log"; then
+        fail "TC-261: the archive pass succeeded on a table with a by column"
+    else
+        assert_contains "TC-261: the archive pass named the table and the column" \
+            "columns of public.tc261_kw: ERROR: coldfront: column \"by\": $why" "$(cat "$TMPD/tc261-arch.log")"
+    fi
+    assert_eq "TC-261: the row stayed in the hot table" "1" "$(q "$HOST" "SELECT count(*) FROM public.tc261_kw;")"
+    # TC-262: create_iceberg_table refuses it, registering nothing.
+    assert_err "TC-262: create_iceberg_table refused the column" "column \"pivot\": $why" \
+        "$(q_may "$HOST" "SELECT coldfront.create_iceberg_table('public','tc262_kw','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"pivot\",\"type\":\"integer\"}]'::jsonb);")"
+    assert_eq "TC-262: no view and no registry row" "true|0" "$(_tc260_unregistered tc262_kw)"
+    # TC-263: adoption refuses a catalog table with such a column, registering nothing.
+    adopt_fixture tc263ns tc263_kw '(id BIGINT, "show" INT)'
+    assert_err "TC-263: adoption refused the column" "column \"show\": $why" \
+        "$(q_may "$HOST" "SELECT coldfront.adopt_iceberg_table('public','tc263_kw','tc263ns');")"
+    assert_eq "TC-263: no view and no registry row" "true|0" "$(_tc260_unregistered tc263_kw)"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Story — TC-114: TEMPORARY table invisible to archiver — register fails with
 # a "does not exist" error. TEMP tables are session-local; the archiver
 # connects in a new session and cannot see them.
@@ -7657,6 +7735,7 @@ if [ "$MODE" = "tiered" ]; then
     story_case_collision_rejected      # TC-141: name differing only by case rejected at register
     story_bad_source_names_rejected    # TC-139/TC-142/TC-200: leading underscore and over-long names rejected
     story_unmappable_column_rejected   # TC-150: column type with no Iceberg mapping rejected at register
+    story_keyword_column_rejected      # TC-260..TC-263: a column name DuckDB parses as a keyword refused on every path
     story_quoted_table_names           # TC-140/TC-143/TC-144: dot, hyphen, space in table name
     story_temp_rejected                # TC-114: TEMP table invisible to archiver
     story_list_partition_rejected      # TC-115: LIST partition accepted at register; rejected at archive

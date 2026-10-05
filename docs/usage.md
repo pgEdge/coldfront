@@ -641,6 +641,10 @@ field. Registration fails when:
   prompt rather than hours later from cron, and the refusal names the column.
   Partition-only tables are exempt: nothing about them reaches Iceberg, so
   their column types are PostgreSQL's business alone.
+- a tiered table has a column whose name DuckDB parses as a keyword, such as
+  `by`, `at` or `show` (see [Caveats](#caveats)). The archiver checks the
+  names again before it tiers or expires data, so a column added after
+  registration is refused there, before any table or data reaches Iceberg.
 
 Registration validates the table as it is at that moment, not continuously.
 Adding a `DEFAULT` partition to an already-registered table is therefore not
@@ -1152,6 +1156,22 @@ Keep the following caveats in mind when running either mode:
 - `TRUNCATE` on a registered relation, or on the hot table behind a tiered one,
   fails with an error, because the cold rows in Iceberg would stay visible
   through the view.
+- A column with a cold tier cannot have a name that PostgreSQL leaves unquoted
+  but DuckDB parses as a keyword. With DuckDB 1.5.4 those names are `anti`,
+  `asof`, `at`, `by`, `describe`, `glob`, `lambda`, `pivot`, `pivot_longer`,
+  `pivot_wider`, `positional`, `qualify`, `semi`, `show`, `summarize`,
+  `unpack` and `unpivot`. pg_duckdb passes a column name to DuckDB quoted the
+  way PostgreSQL quotes it, so such a name reaches DuckDB bare even when the
+  query quotes it, and every query pg_duckdb runs against the column fails
+  with a DuckDB `Parser Error`
+  ([duckdb/pg_duckdb#1019](https://github.com/duckdb/pg_duckdb/issues/1019)).
+  ColdFront refuses such a name wherever a column gets a cold tier: tiered
+  registration, an archive pass that tiers or expires data,
+  `coldfront.create_iceberg_table()`, `coldfront.adopt_iceberg_table()`, and
+  an `ADD COLUMN` or `RENAME COLUMN` on a table that already has a cold tier.
+  A DuckDB keyword that its parser accepts as a column name, such as `columns`,
+  is not refused. A table with such a column can still be registered
+  partition-only, without a hot period.
 
 ## Distributed Setup (3-Node Mesh, Decoupled Mode)
 
