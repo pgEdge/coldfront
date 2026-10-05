@@ -7403,9 +7403,15 @@ story_partitioned_cold_tables() {
     # The pinned duckdb-iceberg writes no referenced_data_file for the delete
     # file, which is why it attaches to every data file of the month. This check
     # fails once the pin writes one, as duckdb-iceberg's line for DuckDB 2.0 does.
-    local mf; mf=$(q "$HOST" "SELECT coldfront.ensure_attached(); SELECT r['p'] FROM duckdb.query('SELECT manifest_path AS p FROM iceberg_metadata(''ice.public.tcskip'') WHERE content = ''POSITION_DELETES'' LIMIT 1') AS t(r);" | tail -1)
-    assert_eq "TC-229: duckdb-iceberg writes no referenced_data_file for the delete file" "1/1" \
-        "$(q "$HOST" "SELECT coldfront.ensure_attached(); SELECT r['f'] FROM duckdb.query('SELECT (count(*) FILTER (WHERE json_extract_string(to_json(data_file), ''\$.referenced_data_file'') IS NULL))::varchar || ''/'' || count(*)::varchar AS f FROM read_avro(''$mf'') WHERE data_file.content = 1') AS t(r);" | tail -1)"
+    # It reads the manifest from the object store with the storage secret, which
+    # vended credentials do not provide, so the static-credential cells run it.
+    if vended_creds; then
+        note "TC-229: vended creds; skipping the manifest read of the referenced_data_file check"
+    else
+        local mf; mf=$(q "$HOST" "SELECT coldfront.ensure_attached(); SELECT r['p'] FROM duckdb.query('SELECT manifest_path AS p FROM iceberg_metadata(''ice.public.tcskip'') WHERE content = ''POSITION_DELETES'' LIMIT 1') AS t(r);" | tail -1)
+        assert_eq "TC-229: duckdb-iceberg writes no referenced_data_file for the delete file" "1/1" \
+            "$(q "$HOST" "SELECT coldfront.ensure_attached(); SELECT r['f'] FROM duckdb.query('SELECT (count(*) FILTER (WHERE json_extract_string(to_json(data_file), ''\$.referenced_data_file'') IS NULL))::varchar || ''/'' || count(*)::varchar AS f FROM read_avro(''$mf'') WHERE data_file.content = 1') AS t(r);" | tail -1)"
+    fi
     assert_contains "TC-229: the compactor rewrites the five small files and leaves the large one" \
         "compacted: 5 files -> 1" "$(compactor --table tcskip --target-size-mb 1 2>&1)"
     assert_eq "TC-229: the row deleted from the large file stays deleted" "0" "$(q "$HOST" "SELECT count(*) FROM public.tcskip WHERE id = 1;")"
