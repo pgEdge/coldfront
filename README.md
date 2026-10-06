@@ -186,7 +186,7 @@ The following table lists the ColdFront guides and what each one covers:
 | [Embeddings](docs/usage_vectors.md) | Covers storing and searching embeddings with the pgvector interface. |
 | [Usage](docs/usage.md) | Covers day-to-day use: both modes plus the standalone partition manager, one-time setup, reading and writing, supported types, the partition CLI, storage backends, distributed (mesh) setup, and tuning. |
 | [Installation](docs/installation.md) | Covers building from source (Docker or bare-metal), and testing and CI. |
-| [Object store setup](docs/object_store.md) | Gets ColdFront running on cloud S3 (virtual-hosted), end to end. |
+| [Configuring your Object Store](docs/object_store.md) | Gets ColdFront running on cloud S3 (virtual-hosted), end to end. |
 | [Compaction](docs/compaction.md) | Covers cold-tier table maintenance: compaction, snapshot expiry, and orphan-file removal. |
 | [Architecture](docs/architecture.md) | Describes the shared architecture and core mechanics. |
 | [Architecture: tiered](docs/architecture_tiered.md) | Describes tiered mode (hot PG plus cold Iceberg) in depth. |

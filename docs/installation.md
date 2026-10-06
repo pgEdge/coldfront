@@ -46,8 +46,9 @@ sudo apt-get install -y curl gnupg2 lsb-release
 Then add the repository:
 
 ```bash
-sudo curl -sSL https://apt.pgedge.com/repodeb/pgedge-release_latest_all.deb -o /tmp/pgedge-release.deb
-sudo dpkg -i /tmp/pgedge-release.deb && rm -f /tmp/pgedge-release.deb || true
+sudo curl -sSL https://apt.pgedge.com/repodeb/pgedge-release_latest_all.deb -o /tmp/pgedge-release.deb && \
+  sudo dpkg -i /tmp/pgedge-release.deb && \
+  sudo rm -f /tmp/pgedge-release.deb
 ```
 
 With the repository in place, install the meta-package for your PostgreSQL
@@ -72,50 +73,16 @@ sudo dnf install -y pgedge-coldfront_18
 On Ubuntu or Debian:
 
 ```bash
+sudo apt update
 sudo apt install -y pgedge-postgresql-18-coldfront
 ```
 
 Install the individual packages from the table instead of the meta-package
 only if you need a different combination than it provides.
 
-## Configuring ColdFront
-
-ColdFront reads its settings from two places. The server settings live in
-`postgresql.conf`:
-
-- `shared_preload_libraries = 'pg_duckdb,coldfront'`.
-- `coldfront.warehouse` and `coldfront.lakekeeper_endpoint`.
-- `snowflake.node` and `coldfront.loopback_dsn` on every node of a mesh.
-
-A package installation does not set these parameters for you; you must add
-them to the `postgresql.conf` file and restart PostgreSQL before creating
-the extensions.
-
-The archiver, partitioner, and compactor connect from the libpq environment
-or `--dsn` and read everything else from the server: each table's lifecycle
-in `coldfront.partition_config`, the cold-store credential in
-`coldfront.storage_secret`, and the catalog settings. The `import`
-command takes a deployment YAML, modeled on
-[config.example.yaml](https://github.com/pgEdge/ColdFront/blob/main/config.example.yaml),
-and writes it into the server once.
-
-For every setting, see the [One-Time Setup](usage.md#one-time-setup) and
-[Tuning Knobs](usage.md#tuning-knobs) sections of the Using ColdFront guide.
-
-After PostgreSQL restarts with `shared_preload_libraries` set, create both
-extensions in your database:
-
-```sql
-CREATE EXTENSION IF NOT EXISTS pg_duckdb;
-CREATE EXTENSION IF NOT EXISTS coldfront;
-```
-
-!!! warning "CREATE EXTENSION coldfront is required and easy to miss"
-
-    Preloading the library is not the same as creating the extension.
-    Skipping this step leaves `coldfront`'s schema and functions missing from
-    your database, and the next call fails with
-    `schema "coldfront" does not exist`.
+A package installation does not configure PostgreSQL. Follow the
+[One-Time Setup](usage.md#one-time-setup) section of the Using ColdFront guide
+to configure PostgreSQL and create the extensions.
 
 ## Building ColdFront from Source
 
