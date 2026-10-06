@@ -51,17 +51,18 @@ sudo curl -sSL https://apt.pgedge.com/repodeb/pgedge-release_latest_all.deb -o /
   sudo rm -f /tmp/pgedge-release.deb
 ```
 
-With the repository in place, install the meta-package for your PostgreSQL
-major version; it pulls in every other package ColdFront needs. The
-following table shows each package's purpose and its name on RHEL-family and
-Debian-family systems:
+With the repository in place, install the ColdFront extension package for
+your PostgreSQL major version. It depends on the pgEdge PostgreSQL server,
+pg_duckdb, and ColdFront's DuckDB extensions, so the package manager installs
+those as well. The following table shows each package's purpose and its name
+on RHEL-family and Debian-family systems:
 
 | Package | RHEL, Rocky Linux, AlmaLinux | Ubuntu, Debian |
 |---|---|---|
-| Meta-package (installs the following packages) | `pgedge-coldfront_<pg_version>` | `pgedge-postgresql-<pg_version>-coldfront` |
-| ColdFront extension | `pgedge-coldfront` | `pgedge-coldfront` |
+| ColdFront extension | `pgedge-coldfront_<pg_version>` | `pgedge-postgresql-<pg_version>-coldfront` |
 | ColdFront's DuckDB extensions | `pgedge-coldfront-duckdb-extensions` | `pgedge-coldfront-duckdb-extensions` |
 | pg_duckdb | `pgedge-pg-duckdb_<pg_version>` | `pgedge-postgresql-<pg_version>-pg-duckdb` |
+| ColdFront command-line tools (archiver, partitioner, compactor) | `pgedge-coldfront` | `pgedge-coldfront` |
 | Lakekeeper | `pgedge-lakekeeper` | `pgedge-lakekeeper` |
 
 For PostgreSQL 18 on RHEL, Rocky Linux, or AlmaLinux:
@@ -77,8 +78,9 @@ sudo apt update
 sudo apt install -y pgedge-postgresql-18-coldfront
 ```
 
-Install the individual packages from the table instead of the meta-package
-only if you need a different combination than it provides.
+The extension package does not install the command-line tools or Lakekeeper.
+Install `pgedge-coldfront` and `pgedge-lakekeeper` separately on the hosts
+that need them.
 
 A package installation does not configure PostgreSQL. Follow the
 [One-Time Setup](usage.md#one-time-setup) section of the Using ColdFront guide
