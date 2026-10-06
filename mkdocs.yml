@@ -56,28 +56,28 @@ copyright: Copyright &copy; 2026 pgEdge, Inc
 repo_url: https://github.com/pgEdge/ColdFront
 
 nav:
+  - pgEdge ColdFront: index.md
+  - Installing ColdFront: installation.md
   - Getting Started:
-      - Introduction: index.md
-      - Walkthrough: walkthrough.md
-      - Tiered Storage Demo: walkthrough_tiered.md
-      - Decoupled Mode Demo: walkthrough_decoupled.md
-      - Partitioner Demo: walkthrough_partitioner.md
-      - Distributed Demo: walkthrough_distributed.md
-      - Installation: installation.md
-      - Object Store Setup: object_store.md
+      - Getting Started with ColdFront: walkthrough.md
+      - Exploring Tiered Storage: walkthrough_tiered.md
+      - Exploring Decoupled Mode: walkthrough_decoupled.md
+      - Exploring the Standalone Partitioner: walkthrough_partitioner.md
+      - Exploring Distributed Mode: walkthrough_distributed.md
+      - Configuring your Object Store: object_store.md
 
   - Architecture:
-      - Overview: architecture.md
-      - Tiered Mode: architecture_tiered.md
-      - Decoupled Mode: architecture_decoupled.md
-      - Vector Storage: architecture_vectors.md
+      - pgEdge ColdFront - Architecture: architecture.md
+      - ColdFront - Tiered Operating Mode: architecture_tiered.md
+      - Decoupled (Iceberg-Only) Operating Mode: architecture_decoupled.md
+      - Vector Storage Architecture: architecture_vectors.md
 
   - Using ColdFront: usage.md
-  - Embeddings: usage_vectors.md
-  - Compaction: compaction.md
+  - Working with Embeddings: usage_vectors.md
+  - COMPACTOR - Cold-Tier Table Maintenance: compaction.md
 
   - Developer Resources:
-      - Formal Verification: formal/README.md
+      - Formal Model - ColdFront Decoupled-Mode Bakery (TLA+/PlusCal): formal/README.md
 
   - Changelog: changelog.md
   - License: LICENSE.md

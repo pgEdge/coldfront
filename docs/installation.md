@@ -1,13 +1,111 @@
-# Building ColdFront from Source
+# Installing ColdFront
+
+This guide covers installing ColdFront from the published package and
+building it from source.
+
+## Using a Package to Install ColdFront
+
+Before using a package to install ColdFront, you'll need to add the pgEdge
+package repository to your system.
+
+For RHEL, Rocky Linux, or AlmaLinux 10, first install EPEL:
+
+```bash
+sudo dnf -y install https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm
+```
+
+On RHEL 10, also enable the CodeReady Builder repository:
+
+```bash
+sudo subscription-manager repos --enable codeready-builder-for-rhel-10-$(arch)-rpms
+```
+
+On Rocky Linux 10 or AlmaLinux 10, enable the equivalent CRB repository instead:
+
+```bash
+sudo dnf config-manager --set-enabled crb
+```
+
+Version-specific commands for RHEL, OEL, Alma, and Rocky are available in the
+[pgEdge Enterprise Postgres documentation](https://docs.pgedge.com/enterprise/el/configure-repo/).
+On every EL variant, disable any PGDG repository so it does not shadow
+pgEdge's packages, then install the pgEdge repository itself:
+
+```bash
+sudo dnf config-manager --set-disabled 'pgdg*'
+sudo dnf install -y https://dnf.pgedge.com/reporpm/pgedge-release-latest.noarch.rpm
+```
+
+For Ubuntu or Debian, first install the repository prerequisites:
+
+```bash
+sudo apt-get update
+sudo apt-get install -y curl gnupg2 lsb-release
+```
+
+Then add the repository:
+
+```bash
+sudo curl -sSL https://apt.pgedge.com/repodeb/pgedge-release_latest_all.deb -o /tmp/pgedge-release.deb
+sudo dpkg -i /tmp/pgedge-release.deb && rm -f /tmp/pgedge-release.deb || true
+```
+
+With the repository in place, install the meta-package for your PostgreSQL
+major version; it pulls in every other package ColdFront needs. The
+following table shows each package's purpose and its name on RHEL-family and
+Debian-family systems:
+
+| Package | RHEL, Rocky Linux, AlmaLinux | Ubuntu, Debian |
+|---|---|---|
+| Meta-package (installs the following packages) | `pgedge-coldfront_<pg_version>` | `pgedge-postgresql-<pg_version>-coldfront` |
+| ColdFront extension | `pgedge-coldfront` | `pgedge-coldfront` |
+| ColdFront's DuckDB extensions | `pgedge-coldfront-duckdb-extensions` | `pgedge-coldfront-duckdb-extensions` |
+| pg_duckdb | `pgedge-pg-duckdb_<pg_version>` | `pgedge-postgresql-<pg_version>-pg-duckdb` |
+| Lakekeeper | `pgedge-lakekeeper` | `pgedge-lakekeeper` |
+
+For PostgreSQL 18 on RHEL, Rocky Linux, or AlmaLinux:
+
+```bash
+sudo dnf install -y pgedge-coldfront_18
+```
+
+On Ubuntu or Debian:
+
+```bash
+sudo apt install -y pgedge-postgresql-18-coldfront
+```
+
+Install the individual packages from the table instead of the meta-package
+only if you need a different combination than it provides.
+
+## Configuring ColdFront
+
+ColdFront reads its settings from two places. The server settings live in
+`postgresql.conf`:
+
+- `shared_preload_libraries = 'pg_duckdb,coldfront'`.
+- `coldfront.warehouse` and `coldfront.lakekeeper_endpoint`.
+- `snowflake.node` and `coldfront.loopback_dsn` on every node of a mesh.
+
+A package install does not set these for you - the Docker image is what
+writes them on first start - so add them to `postgresql.conf` yourself and
+restart PostgreSQL before creating the extensions.
+
+The archiver, partitioner, and compactor connect from the libpq environment
+or `--dsn` and read everything else from the server: each table's lifecycle
+in `coldfront.partition_config`, the cold-store credential in
+`coldfront.storage_secret`, and the catalog settings above. The `import`
+command takes a deployment YAML, modeled on
+[config.example.yaml](https://github.com/pgEdge/ColdFront/blob/main/config.example.yaml),
+and writes it into the server once.
+
+For every setting, see the [One-Time Setup](usage.md#one-time-setup) and
+[Tuning Knobs](usage.md#tuning-knobs) sections of the Using ColdFront guide.
+
+## Building ColdFront from Source
 
 This guide builds ColdFront from source, either in Docker on top of the
 published base image or on bare metal.
-
-!!! note "Most users should install from packages"
-
-    See [Installation](https://github.com/pgEdge/ColdFront/blob/main/README.md#installation)
-    in the README. This document is the **build-from-source** workflow: build
-    the patched DuckDB-1.5.x stack yourself, in Docker or bare-metal.
 
 ColdFront runs on a **DuckDB 1.5.x** stack: PostgreSQL + pg_duckdb (DuckDB
 1.5.4) and a **patched** duckdb-iceberg that includes ColdFront's five
@@ -312,5 +410,5 @@ To go further with ColdFront, consult the following guides:
 - The [Walkthrough](walkthrough.md) guide runs the demo stack hands-on.
 - The [Using ColdFront](usage.md) guide covers the one-time setup and both
   modes.
-- The [Object Store Setup](object_store.md) guide connects the cold tier to AWS
-  S3.
+- The [Configuring your Object Store](object_store.md) guide connects the cold
+  tier to AWS S3.

@@ -1,4 +1,4 @@
-# Get ColdFront Running on S3
+# Configuring your Object Store
 
 This walkthrough takes you from an empty S3 bucket to a working ColdFront cold
 tier in one sitting. You stand up the ColdFront stack (PostgreSQL + the
