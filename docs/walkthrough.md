@@ -1,7 +1,7 @@
 ---
 cwd: ../
 ---
-# ColdFront Guided Walkthrough
+# Getting Started with ColdFront
 
 If you are new to ColdFront, run the guided walkthrough.
 
@@ -16,7 +16,7 @@ shell.
 > not use it in production. Interfaces, on-disk formats, and behavior may
 > change without notice, and data loss is possible.
 
-## In GitHub Codespaces
+## Running in GitHub Codespaces
 
 [Open this repo in a Codespace](https://github.com/codespaces/new?repo=pgEdge/coldfront)
 and everything is preinstalled - Docker, psql, and the
@@ -28,7 +28,7 @@ minutes); everything after it is quick.
 If you prefer a terminal, `bash examples/walkthrough/guide.sh` runs the same
 demos as an interactive guide.
 
-## On Your Own Machine
+## Running on Your Own Machine
 
 You need Docker 24+ with Compose V2 (the `docker compose` plugin, not the
 legacy `docker-compose` binary), roughly 3 GB of free disk inside Docker's
@@ -60,15 +60,15 @@ bash examples/walkthrough/guide.sh
 
 Either way, the guide builds the Docker images on first run, brings up the
 stack, and walks through each demo interactively. This page and the
-[demos](walkthrough_demos.md) cover the same steps - run them from the doc or
-paste them into your shell.
+[demos](#next-steps) cover the same steps - run them from the doc or paste them
+into your shell.
 
 The guide prints each demo command and query before it runs it. To have the
 guide type each one a character at a time, as in a recording, set
 `WALKTHROUGH_TYPE_DELAY` to the delay in seconds between characters (for
 example, `0.03`). The default of `0` prints each command at once.
 
-## What Setup Does
+## Setting Up the Stack
 
 Setup runs before the demos begin. Setup starts the containers, waits for
 PostgreSQL and Lakekeeper to accept connections, and creates the Lakekeeper
@@ -86,8 +86,8 @@ The stack runs PostgreSQL 18 by default. To run 16 or 17, set `PG_MAJOR` before
 `up` and change the `pgdata` volume path in `docker-compose.yml` to match.
 
 Start the containers, then build the archiver image. That service is not part
-of `up`: it runs on demand in Step 7 and Demo 3, so `up --build` leaves it
-alone:
+of `up`: it runs on demand in the tiered and partitioner demos, so `up --build`
+leaves it alone:
 
 ```bash
 docker compose -f examples/walkthrough/docker-compose.yml \
@@ -99,8 +99,8 @@ docker compose -f examples/walkthrough/docker-compose.yml \
 If port 5432, 8181, or 8333 is already in use on your host, set
 `COLDFRONT_PG_PORT`, `COLDFRONT_LK_PORT`, or `COLDFRONT_S3_PORT` before `up`.
 If you remap the PG port, match it in the `psql` commands of the
-[demos](walkthrough_demos.md). If you remap the Lakekeeper port, match it in
-the `curl` commands on this page and in the demos.
+[demos](#next-steps). If you remap the Lakekeeper port, match it in the `curl`
+commands on this page and in the demos.
 
 Bootstrap Lakekeeper, create the `wh` warehouse backed by SeaweedFS, and seed
 the `public` namespace. The interactive guide retries the warehouse POST until
@@ -150,7 +150,7 @@ curl -sf -X POST \
 
 The walkthrough uses SeaweedFS by default. To use a cloud store instead,
 replace the warehouse JSON above, the `set_storage_secret` call in Step 5 of
-[Demo 1](walkthrough_demos.md#demo-1-tiered-storage), and the `s3:` block in
+the [tiered demo](walkthrough_tiered.md), and the `s3:` block in
 `examples/walkthrough/config/archiver.yaml`, which `import` writes into the
 server as the storage secret.
 
@@ -169,11 +169,43 @@ JSON for AWS S3; for GCS and Azure, see the
 [Storage Backends](usage.md#storage-backends) section of the Using ColdFront
 guide.
 
+## Tearing Down the Stack
+
+To stop the stack and remove all data volumes, run the following command:
+
+```bash
+docker compose \
+  -f examples/walkthrough/docker-compose.yml \
+  down -v
+```
+
+The `-v` flag removes the named volumes: `pgdata` (PostgreSQL), `lkdata` (the
+Lakekeeper catalog) and `s3data` (the object store). Omit the flag to keep the
+data for a later session.
+
+If you ran the [distributed demo](walkthrough_distributed.md), tear down its
+separate mesh stack too:
+
+```bash
+docker compose \
+  -f examples/walkthrough/docker-compose.mesh.yml \
+  down -v
+```
+
+In the interactive guide, the menu's R) Reset option drops the tables every
+demo created, in PostgreSQL and in the Iceberg catalog, and keeps the stack
+running. If the two-node cluster from the distributed demo is up, Reset first
+switches back to the single-node stack.
+
 ## Next Steps
 
 With the stack running, continue with the following guides:
 
-- The [Walkthrough Demos](walkthrough_demos.md) guide provides the tiered,
-  decoupled, partitioner, and distributed demos.
-- The [Object Store Setup](object_store.md) guide takes you from an empty
-  bucket to a working cold tier.
+- The [Tiered Storage Demo](walkthrough_tiered.md) adds ColdFront to an
+  existing database and moves its cold data to object storage.
+- The [Decoupled Mode Demo](walkthrough_decoupled.md) stores a table in Iceberg
+  from the first row and adopts a table that another engine wrote.
+- The [Partitioner Demo](walkthrough_partitioner.md) manages PostgreSQL range
+  partitions without any cold tier.
+- The [Distributed Demo](walkthrough_distributed.md) points two PostgreSQL
+  nodes at one shared lake.

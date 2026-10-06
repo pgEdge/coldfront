@@ -6,9 +6,12 @@ transparent Iceberg tiering, decoupled lake tables, and automated partition
 management, all through standard SQL.
 
 > The end-user walkthrough is at
-> [docs/walkthrough.md](../../docs/walkthrough.md), with the demos in
-> [docs/walkthrough_demos.md](../../docs/walkthrough_demos.md). This README
-> covers how the walkthrough is structured and how to run it.
+> [docs/walkthrough.md](../../docs/walkthrough.md), with one page per demo:
+> [tiered](../../docs/walkthrough_tiered.md),
+> [decoupled](../../docs/walkthrough_decoupled.md),
+> [partitioner](../../docs/walkthrough_partitioner.md), and
+> [distributed](../../docs/walkthrough_distributed.md). This README covers how
+> the walkthrough is structured and how to run it.
 
 ## How Users Reach the Walkthrough
 

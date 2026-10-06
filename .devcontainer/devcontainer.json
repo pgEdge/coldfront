@@ -12,7 +12,10 @@
     "codespaces": {
       "openFiles": [
         "docs/walkthrough.md",
-        "docs/walkthrough_demos.md"
+        "docs/walkthrough_tiered.md",
+        "docs/walkthrough_decoupled.md",
+        "docs/walkthrough_partitioner.md",
+        "docs/walkthrough_distributed.md"
       ]
     },
     "vscode": {

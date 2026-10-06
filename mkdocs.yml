@@ -59,7 +59,10 @@ nav:
   - Getting Started:
       - Introduction: index.md
       - Walkthrough: walkthrough.md
-      - Walkthrough Demos: walkthrough_demos.md
+      - Tiered Storage Demo: walkthrough_tiered.md
+      - Decoupled Mode Demo: walkthrough_decoupled.md
+      - Partitioner Demo: walkthrough_partitioner.md
+      - Distributed Demo: walkthrough_distributed.md
       - Installation: installation.md
       - Object Store Setup: object_store.md
 

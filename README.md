@@ -8,8 +8,11 @@ The ColdFront documentation consists of the following guides:
 
 - [Introduction](docs/index.md)
 - Getting Started
-    - [Running the Walkthrough](docs/walkthrough.md)
-    - [Exploring the Walkthrough Demos](docs/walkthrough_demos.md)
+    - [Getting Started with ColdFront](docs/walkthrough.md)
+    - [Exploring Tiered Storage](docs/walkthrough_tiered.md)
+    - [Exploring Decoupled Mode](docs/walkthrough_decoupled.md)
+    - [Exploring the Standalone Partitioner](docs/walkthrough_partitioner.md)
+    - [Exploring Distributed Mode](docs/walkthrough_distributed.md)
     - [Building ColdFront from Source](docs/installation.md)
     - [Setting Up an Object Store](docs/object_store.md)
 - Architecture
@@ -166,8 +169,8 @@ See [Vended Credentials](docs/usage.md#vended-credentials).
 The Quickstart covers a decoupled table from start to finish. The
 [Using ColdFront](docs/usage.md) guide covers both modes in depth, the
 standalone partition manager and its CLI, the storage backends, and the
-distributed setup; the [walkthrough demos](docs/walkthrough_demos.md) run each
-mode on a sample table.
+distributed setup; the [walkthrough](docs/walkthrough.md) demos run each mode
+on a sample table.
 
 ## Documentation
 
@@ -176,7 +179,10 @@ The following table lists the ColdFront guides and what each one covers:
 | Doc | Contents |
 |---|---|
 | [Walkthrough](docs/walkthrough.md) | Sets up the demo stack and runs ColdFront hands-on. |
-| [Walkthrough demos](docs/walkthrough_demos.md) | Walks through the tiered, decoupled, partitioner, and distributed demos. |
+| [Tiered storage demo](docs/walkthrough_tiered.md) | Adds ColdFront to an existing database and moves its cold data to object storage. |
+| [Decoupled mode demo](docs/walkthrough_decoupled.md) | Stores a table in Iceberg from the first row and adopts a table that another engine wrote. |
+| [Partitioner demo](docs/walkthrough_partitioner.md) | Manages PostgreSQL range partitions without any cold tier. |
+| [Distributed demo](docs/walkthrough_distributed.md) | Points two PostgreSQL nodes at one shared lake. |
 | [Embeddings](docs/usage_vectors.md) | Covers storing and searching embeddings with the pgvector interface. |
 | [Usage](docs/usage.md) | Covers day-to-day use: both modes plus the standalone partition manager, one-time setup, reading and writing, supported types, the partition CLI, storage backends, distributed (mesh) setup, and tuning. |
 | [Installation](docs/installation.md) | Covers building from source (Docker or bare-metal), and testing and CI. |
@@ -264,7 +270,9 @@ pgedge-coldfront/
 │   ├── entrypoint.sh
 │   └── seaweedfs-s3.json        ← SeaweedFS S3 auth config (example)
 ├── docs/                       ← MkDocs site (user docs; mkdocs.yml at repo root)
-│   ├── index.md · walkthrough.md · walkthrough_demos.md · installation.md
+│   ├── index.md · walkthrough.md · installation.md
+│   ├── walkthrough_tiered.md · walkthrough_decoupled.md
+│   ├── walkthrough_partitioner.md · walkthrough_distributed.md
 │   ├── object_store.md · usage.md · compaction.md
 │   ├── architecture.md · architecture_tiered.md · architecture_decoupled.md
 │   ├── architecture_vectors.md · usage_vectors.md · changelog.md

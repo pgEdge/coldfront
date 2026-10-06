@@ -39,7 +39,10 @@ FILES=(
     examples/walkthrough/config/archiver.yaml
     docker/Dockerfile.duckdb15
     docs/walkthrough.md
-    docs/walkthrough_demos.md
+    docs/walkthrough_tiered.md
+    docs/walkthrough_decoupled.md
+    docs/walkthrough_partitioner.md
+    docs/walkthrough_distributed.md
 )
 
 FAILED=0
@@ -105,8 +108,9 @@ case "$choice" in
     2)
         echo ""
         echo "  Open these files in your editor and run the commands in this terminal:"
-        echo "    $(pwd)/docs/walkthrough.md"
-        echo "    $(pwd)/docs/walkthrough_demos.md"
+        for f in "${FILES[@]}"; do
+            if [[ $f == docs/* ]]; then echo "    $(pwd)/$f"; fi
+        done
         echo ""
         ;;
     *)
