@@ -87,14 +87,14 @@ ColdFront reads its settings from two places. The server settings live in
 - `coldfront.warehouse` and `coldfront.lakekeeper_endpoint`.
 - `snowflake.node` and `coldfront.loopback_dsn` on every node of a mesh.
 
-A package install does not set these for you - the Docker image is what
-writes them on first start - so add them to `postgresql.conf` yourself and
-restart PostgreSQL before creating the extensions.
+A package installation does not set these parameters for you; you must add
+them to the `postgresql.conf` file and restart PostgreSQL before creating
+the extensions.
 
 The archiver, partitioner, and compactor connect from the libpq environment
 or `--dsn` and read everything else from the server: each table's lifecycle
 in `coldfront.partition_config`, the cold-store credential in
-`coldfront.storage_secret`, and the catalog settings above. The `import`
+`coldfront.storage_secret`, and the catalog settings. The `import`
 command takes a deployment YAML, modeled on
 [config.example.yaml](https://github.com/pgEdge/ColdFront/blob/main/config.example.yaml),
 and writes it into the server once.
@@ -102,10 +102,25 @@ and writes it into the server once.
 For every setting, see the [One-Time Setup](usage.md#one-time-setup) and
 [Tuning Knobs](usage.md#tuning-knobs) sections of the Using ColdFront guide.
 
+After PostgreSQL restarts with `shared_preload_libraries` set, create both
+extensions in your database:
+
+```sql
+CREATE EXTENSION IF NOT EXISTS pg_duckdb;
+CREATE EXTENSION IF NOT EXISTS coldfront;
+```
+
+!!! warning "CREATE EXTENSION coldfront is required and easy to miss"
+
+    Preloading the library is not the same as creating the extension.
+    Skipping this step leaves `coldfront`'s schema and functions missing from
+    your database, and the next call fails with
+    `schema "coldfront" does not exist`.
+
 ## Building ColdFront from Source
 
-This guide builds ColdFront from source, either in Docker on top of the
-published base image or on bare metal.
+This section walks you through building ColdFront from source, either in
+Docker on top of the published base image or on bare metal.
 
 ColdFront runs on a **DuckDB 1.5.x** stack: PostgreSQL + pg_duckdb (DuckDB
 1.5.4) and a **patched** duckdb-iceberg that includes ColdFront's five
@@ -118,7 +133,18 @@ a new table schema above the highest schema id. No released pg_duckdb tag
 includes DuckDB 1.5.x yet, so the stack is built from a pinned upstream PR plus
 ColdFront's patches - all from sources you can fetch.
 
-## What the Build Produces
+### Prerequisites
+
+The following table lists the prerequisites for each build path:
+
+| For | You need |
+|---|---|
+| Docker build (below) | Docker, network access (GitHub, ghcr.io, quay.io, curl.se, and the distribution's RPM repositories), a few GB of disk and RAM, and 30-60 minutes for the base compile. |
+| The archiver and partitioner (all paths) | Go 1.26.5+ (pinned in [go.mod](https://github.com/pgEdge/ColdFront/blob/main/go.mod)) and `make` (`make build` produces `./bin/archiver` and `./bin/partitioner`). |
+| The compactor and the CI gate | golangci-lint for `make compactor`; `./run-ci-local.sh` also needs Docker and mkdocs with mkdocs-material. |
+| Bare metal (near the end of this section) | `pg_config`, PostgreSQL server dev headers, libpq client headers and library (libpq-dev / libpq-devel), `make`, and `gcc`. |
+
+### What the Build Produces
 
 `docker/Dockerfile.duckdb15-base` is the recipe; it fetches the requirements,
 applies ColdFront's patches, and compiles a set of components. The following
@@ -163,7 +189,7 @@ canonical recipe - every source pin and compile step - is
 [`docker/Dockerfile.duckdb15-base`](https://github.com/pgEdge/ColdFront/blob/main/docker/Dockerfile.duckdb15-base)
 itself.
 
-## Build the Image (Docker)
+## Building the Image on Docker
 
 Build the stack in two stages, the prebuilt base and the thin app layer:
 
@@ -216,7 +242,7 @@ ColdFront guide: bootstrap Lakekeeper, create a table, tier it, and verify.
     need pull access to that image (or substitute an equivalent PostgreSQL base
     with the same layout).
 
-### Image Environment Variables
+### Using Environment Variables
 
 The entrypoint reads the following variables when the container starts. It
 writes the server settings they control into `postgresql.conf` only when the
@@ -239,7 +265,7 @@ describes each variable:
 The image is built for development and testing: `pg_hba.conf` trusts every
 connection from any address without a password.
 
-## Verify the Build
+### Verifying the Build
 
 A self-contained smoke test confirms the freshly built stack works end to end:
 pg_duckdb, the patched duckdb-iceberg, Lakekeeper, and the object store. The
@@ -296,18 +322,7 @@ cloud store, drop the `local-store` profile, point the warehouse at your own
 bucket, and follow the [One-Time Setup](usage.md#one-time-setup) section of the
 Using ColdFront guide for the full tier-and-verify journey.
 
-## Build Prerequisites
-
-The following table lists the prerequisites for each build path:
-
-| For | You need |
-|---|---|
-| Docker build (above) | Docker, network access (GitHub, ghcr.io, quay.io, curl.se, and the distribution's RPM repositories), a few GB of disk and RAM, and 30-60 minutes for the base compile. |
-| The archiver and partitioner (all paths) | Go 1.26.5+ (pinned in [go.mod](https://github.com/pgEdge/ColdFront/blob/main/go.mod)) and `make` (`make build` produces `./bin/archiver` and `./bin/partitioner`). |
-| The compactor and the CI gate | golangci-lint for `make compactor`; `./run-ci-local.sh` also needs Docker and mkdocs with mkdocs-material. |
-| Bare metal (below) | `pg_config`, PostgreSQL server dev headers, libpq client headers and library (libpq-dev / libpq-devel), `make`, and `gcc`. |
-
-## Bare Metal (No Docker)
+## Building ColdFront on Bare Metal
 
 The coldfront extension is a standard PGXS C extension:
 
