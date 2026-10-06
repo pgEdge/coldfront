@@ -10,8 +10,9 @@ independent.
 
 Run the steps in [Setting Up the Stack](walkthrough.md#setting-up-the-stack)
 before you start this demo. The demo also needs the extensions and storage
-secret from Steps 4 and 5 of the [tiered demo](walkthrough_tiered.md). If you
-start here, run those two steps first.
+secret from [Step 4](walkthrough_tiered.md#enabling-the-extensions) and
+[Step 5](walkthrough_tiered.md#pointing-coldfront-at-the-object-store) of the
+tiered demo. If you start here, run those two steps first.
 
 ## Creating an Iceberg-Only Table
 

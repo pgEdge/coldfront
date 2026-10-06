@@ -149,8 +149,9 @@ curl -sf -X POST \
 ### Using a Cloud Object Store
 
 The walkthrough uses SeaweedFS by default. To use a cloud store instead,
-replace the warehouse JSON above, the `set_storage_secret` call in Step 5 of
-the [tiered demo](walkthrough_tiered.md), and the `s3:` block in
+replace the warehouse JSON above, the `set_storage_secret` call in
+[Step 5](walkthrough_tiered.md#pointing-coldfront-at-the-object-store) of the
+tiered demo, and the `s3:` block in
 `examples/walkthrough/config/archiver.yaml`, which `import` writes into the
 server as the storage secret.
 

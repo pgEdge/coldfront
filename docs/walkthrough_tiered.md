@@ -15,7 +15,7 @@ The following table shows the eleven steps this demo covers:
 
 | Step | What you will do |
 |------|-----------------|
-| [1. Start the stack](#starting-the-stack-setup) | Bring up Postgres, Lakekeeper, and the object store. |
+| [1. Start the stack](#starting-the-stack) | Bring up Postgres, Lakekeeper, and the object store. |
 | [2. Create a table and load history](#creating-a-table-and-loading-months-of-history) | Create an ordinary partitioned table with months of data. |
 | [3. See the problem](#seeing-the-problem) | See that all rows sit in hot Postgres storage, which only grows. |
 | [4. Enable the extensions](#enabling-the-extensions) | Enable the two extensions that retrofit tiering onto the existing database. |
@@ -25,13 +25,14 @@ The following table shows the eleven steps this demo covers:
 | [8. Where it lives now](#checking-where-the-data-lives-now) | Inspect the hot/cold split: the rows and space in each tier. |
 | [9. Query across tiers](#querying-across-tiers) | Run one query on one table that reads hot and cold data together. |
 | [10. Write to cold data](#writing-to-cold-data) | UPDATE an archived row in place, with no rehydration. |
-| [11. Prove it stuck](#proving-it-stuck) | Reconnect and confirm the edit persisted in cold storage. |
+| [11. Confirm the edit persisted](#confirming-the-edit-persisted) | Reconnect and confirm the edit persisted in cold storage. |
 
-## Starting the Stack (Setup)
+## Starting the Stack
 
 Setup starts the infrastructure: PostgreSQL (your database), plus Lakekeeper
 and SeaweedFS. The cold-storage side sits idle until you point ColdFront at it
-in Step 5. Run the `docker compose up` command shown in
+in [Step 5](#pointing-coldfront-at-the-object-store). Run the
+`docker compose up` command shown in
 [Setting Up the Stack](walkthrough.md#setting-up-the-stack). Then confirm that
 the `db`, `lakekeeper-db`, and `lakekeeper` services report `healthy`:
 
@@ -40,8 +41,9 @@ docker compose -f examples/walkthrough/docker-compose.yml ps
 ```
 
 PostgreSQL is your existing database. The catalog and object store are also
-running - that is the cold-storage side, unused until Step 5. Locally the store
-is SeaweedFS; in production it is AWS S3, GCS, or Azure ADLS Gen2.
+running - that is the cold-storage side, unused until
+[Step 5](#pointing-coldfront-at-the-object-store). Locally the store is
+SeaweedFS; in production it is AWS S3, GCS, or Azure ADLS Gen2.
 
 ## Creating a Table and Loading Months of History
 
@@ -135,7 +137,8 @@ yet.
 
 This step measures how much hot Postgres storage that data occupies and
 confirms that none of it is in lower-cost storage yet. This is the baseline you
-will compare against after tiering in Step 8.
+will compare against after tiering in
+[Step 8](#checking-where-the-data-lives-now).
 
 `pg_total_relation_size()` on a partitioned parent counts only the empty parent
 itself and reports zero. Sum across `pg_partition_tree` to get the true heap
@@ -161,8 +164,8 @@ The query returns:
 ```
 
 Every row - all one million - occupies hot, expensive primary storage, and the
-table only grows. Remember this figure; Step 8 shows where it goes after
-tiering.
+table only grows. Remember this figure;
+[Step 8](#checking-where-the-data-lives-now) shows where it goes after tiering.
 
 ## Enabling the Extensions
 
@@ -371,7 +374,8 @@ SELECT * FROM coldfront.archive_watermark;
 
 This step accounts for every row after tiering: how many are still hot in
 PostgreSQL, how many are now cold in object storage, and how much space each
-tier uses. This is the direct payoff against the Step 3 baseline.
+tier uses. This is the direct payoff against the [Step 3](#seeing-the-problem)
+baseline.
 
 Count the hot rows still in the PostgreSQL heap:
 
@@ -379,7 +383,8 @@ Count the hot rows still in the PostgreSQL heap:
 SELECT count(*) AS hot_rows FROM _events;
 ```
 
-Measure the hot heap size (sum over the partition tree, as in Step 3):
+Measure the hot heap size (sum over the partition tree, as in
+[Step 3](#seeing-the-problem)):
 
 ```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT pg_size_pretty(
@@ -413,10 +418,10 @@ The hot share depends on the day you run the demo. The archiver moves a monthly
 partition to cold storage once its end is at least 30 days in the past, so the
 previous month stays hot until the 31st. A run on the 1st or the 31st keeps
 about 42,000 rows hot, and a run late in any other month about 83,000. Before
-tiering (Step 3), the table held one million rows, all hot, in approximately
-152 MB of Postgres heap. After tiering, only the last month or two remains in
-PostgreSQL; over 90% of the hot storage is gone while the total row count is
-unchanged.
+tiering ([Step 3](#seeing-the-problem)), the table held one million rows, all
+hot, in approximately 152 MB of Postgres heap. After tiering, only the last
+month or two remains in PostgreSQL; over 90% of the hot storage is gone while
+the total row count is unchanged.
 
 ## Querying Across Tiers
 
@@ -511,7 +516,7 @@ The updated row reads:
 The row's status flipped `warn` to `corrected`. That row is still sitting in
 object storage - ColdFront wrote through to it directly.
 
-## Proving It Stuck
+## Confirming the Edit Persisted
 
 This step opens a fresh `psql` connection (nothing cached from the session that
 did the write) and re-checks the row, the total row count, and the hot heap
