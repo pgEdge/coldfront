@@ -57,7 +57,7 @@ repo_url: https://github.com/pgEdge/ColdFront
 
 nav:
   - pgEdge ColdFront: index.md
-  - Installing ColdFront: installation.md
+  - Installing and Configuring ColdFront: installation.md
   - Getting Started:
       - Getting Started with ColdFront: walkthrough.md
       - Exploring Tiered Storage: walkthrough_tiered.md

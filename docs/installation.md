@@ -1,7 +1,7 @@
-# Installing ColdFront
+# Installing and Configuring ColdFront
 
-This guide covers installing ColdFront from the published package and
-building it from source.
+This guide covers installing ColdFront from the published package or
+building it from source, and configuring it once installed.
 
 ## Using a Package to Install ColdFront
 
