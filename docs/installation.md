@@ -48,9 +48,42 @@ The extension package does not install the command-line tools or Lakekeeper.
 Install `pgedge-coldfront` and `pgedge-lakekeeper` separately on the hosts
 that need them.
 
-A package installation does not configure PostgreSQL. Follow the
-[One-Time Setup](usage.md#one-time-setup) section of the Using ColdFront guide
-to configure PostgreSQL and create the extensions.
+### Configuring PostgreSQL
+
+A package installation does not configure PostgreSQL. Add the following
+settings to `postgresql.conf`, then restart PostgreSQL:
+
+```ini
+shared_preload_libraries = 'pg_duckdb,coldfront'
+duckdb.extension_directory = '/usr/lib/pgedge/coldfront/duckdb-extensions'
+duckdb.allow_unsigned_extensions = true
+duckdb.autoinstall_known_extensions = false
+coldfront.iceberg_async_parquet = on
+coldfront.iceberg_bakery_patch = on
+coldfront.warehouse = '<warehouse-name>'
+coldfront.lakekeeper_endpoint = 'http://<lakekeeper-host>:8181/catalog'
+coldfront.local_pg_dsn = 'host=/var/run/postgresql dbname=<db> user=<role>'
+```
+
+The three `duckdb.*` settings make pg_duckdb load ColdFront's patched DuckDB
+extensions from the directory where `pgedge-coldfront-duckdb-extensions`
+installs them. Without these settings, pg_duckdb downloads the unpatched
+upstream extensions, and concurrent cold writes can then fail with HTTP 409.
+The patched extensions are unsigned, so `duckdb.allow_unsigned_extensions` must
+be on. Keeping `duckdb.autoinstall_known_extensions` off stops DuckDB from
+downloading an unpatched upstream copy when an extension file is missing.
+
+The two `coldfront.iceberg_*` settings take effect only on a Spock mesh, where
+a node then uploads Parquet files outside the bakery claim and serializes only
+the catalog commit. The packaged duckdb-iceberg includes the patch that this
+ordering requires, and the
+[Distributed Setup](usage.md#distributed-setup-3-node-mesh-decoupled-mode)
+section of the Using ColdFront guide describes the mesh settings.
+
+The [One-Time Setup](usage.md#one-time-setup) section of the Using ColdFront
+guide describes the `coldfront.*` settings. Follow that section from the
+Lakekeeper bootstrap onward to create the warehouse, the extensions, and the
+cold-store credential.
 
 ## Building ColdFront from Source
 
