@@ -85,6 +85,50 @@ guide describes the `coldfront.*` settings. Follow that section from the
 Lakekeeper bootstrap onward to create the warehouse, the extensions, and the
 cold-store credential.
 
+### Setting Up Lakekeeper
+
+The `pgedge-lakekeeper` package installs the `lakekeeper` binary and a
+`lakekeeper` systemd service, but it does not enable or start the service.
+Lakekeeper stores its catalog in a PostgreSQL 15 or later database and reads
+its settings from `/etc/lakekeeper/lakekeeper.env`. The following steps
+prepare and start the service:
+
+1. Create a role and a database for the catalog:
+
+    ```sql
+    CREATE ROLE lakekeeper LOGIN PASSWORD 'change-me';
+    CREATE DATABASE lakekeeper OWNER lakekeeper;
+    ```
+
+    The migration in step 3 creates the `uuid-ossp`, `pgcrypto`, `pg_trgm`,
+    `btree_gin`, and `btree_gist` extensions, so either the role must be
+    allowed to run `CREATE EXTENSION` or a superuser must create them first.
+
+2. In `/etc/lakekeeper/lakekeeper.env`, set
+    `LAKEKEEPER__PG_DATABASE_URL_WRITE` to the database's connection string and
+    `LAKEKEEPER__PG_ENCRYPTION_KEY` to a random secret, such as the output of
+    `openssl rand -base64 32`. Lakekeeper encrypts stored credentials with the
+    key, so keep the key stable and backed up. Every node that shares the
+    catalog needs the same key.
+
+3. Run the one-time database migration as the `lakekeeper` user:
+
+    ```bash
+    set -a; . /etc/lakekeeper/lakekeeper.env; set +a
+    sudo -E -u lakekeeper /usr/bin/lakekeeper migrate
+    ```
+
+4. Enable and start the service:
+
+    ```bash
+    sudo systemctl enable --now lakekeeper
+    ```
+
+Lakekeeper listens on port 8181 on every address by default. Without an
+authorization backend in `lakekeeper.env`, the catalog accepts every request,
+so configure authentication before you expose the service beyond a trusted
+network.
+
 ## Building ColdFront from Source
 
 This section walks you through building ColdFront from source, either in
