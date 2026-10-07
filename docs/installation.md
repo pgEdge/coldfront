@@ -5,51 +5,17 @@ building it from source.
 
 ## Using a Package to Install ColdFront
 
-Before using a package to install ColdFront, you'll need to add the pgEdge
-package repository to your system.
+ColdFront's packages come from the pgEdge package repository. Before you
+install them, configure the repository by following the page for your platform
+in the Enterprise Postgres documentation:
 
-For RHEL, Rocky Linux, or AlmaLinux 10, first install EPEL:
+- For RHEL, Oracle Linux, AlmaLinux, and Rocky Linux, see
+  [Configuring the Repository on Enterprise Linux](https://docs.pgedge.com/enterprise/el/configure-repo/).
+- For Debian and Ubuntu, see
+  [Configuring the Repository on Debian and Ubuntu](https://docs.pgedge.com/enterprise/debian/configure-repo/).
 
-```bash
-sudo dnf -y install https://dl.fedoraproject.org/pub/epel/epel-release-latest-10.noarch.rpm
-```
-
-On RHEL 10, also enable the CodeReady Builder repository:
-
-```bash
-sudo subscription-manager repos --enable codeready-builder-for-rhel-10-$(arch)-rpms
-```
-
-On Rocky Linux 10 or AlmaLinux 10, enable the equivalent CRB repository instead:
-
-```bash
-sudo dnf config-manager --set-enabled crb
-```
-
-Version-specific commands for RHEL, OEL, Alma, and Rocky are available in the
-[pgEdge Enterprise Postgres documentation](https://docs.pgedge.com/enterprise/el/configure-repo/).
-On every EL variant, disable any PGDG repository so it does not shadow
-pgEdge's packages, then install the pgEdge repository itself:
-
-```bash
-sudo dnf config-manager --set-disabled 'pgdg*'
-sudo dnf install -y https://dnf.pgedge.com/reporpm/pgedge-release-latest.noarch.rpm
-```
-
-For Ubuntu or Debian, first install the repository prerequisites:
-
-```bash
-sudo apt-get update
-sudo apt-get install -y curl gnupg2 lsb-release
-```
-
-Then add the repository:
-
-```bash
-sudo curl -sSL https://apt.pgedge.com/repodeb/pgedge-release_latest_all.deb -o /tmp/pgedge-release.deb && \
-  sudo dpkg -i /tmp/pgedge-release.deb && \
-  sudo rm -f /tmp/pgedge-release.deb
-```
+Those pages cover the platform prerequisites, disabling any PGDG repository,
+and creating the pgEdge repository.
 
 With the repository in place, install the ColdFront extension package for
 your PostgreSQL major version. It depends on the pgEdge PostgreSQL server,
