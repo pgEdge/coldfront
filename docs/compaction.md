@@ -108,13 +108,16 @@ requested steps, each under a bakery claim on that table:
   table; the 168 h default does, and `0s` is for a table nothing is reading.
 - Orphan removal deletes files under the table location that no retained
   snapshot references, which covers files left by an interrupted write or by
-  `--expire-keep-files`. The `--orphan-age` window keeps a concurrent writer's
-  freshly-staged files from being removed.
+  `--expire-keep-files`. A cold write's data files are staged before its
+  transaction commits and referenced by no snapshot until then, so the
+  `--orphan-age` window is what keeps them: keep it longer than the longest
+  transaction that writes the table. The 72 h default does.
 
 Each mutating step holds the bakery claim across its catalog commit and
-releases it when its PostgreSQL transaction commits, so it cannot interleave
-with a cold write to the same table. Snapshot maintenance is the engine's job,
-not the catalog's: Lakekeeper does no Iceberg snapshot or orphan maintenance.
+releases it when its PostgreSQL transaction commits, so its commit cannot
+interleave with a cold write's commit to the same table. Snapshot maintenance
+is the engine's job, not the catalog's: Lakekeeper does no Iceberg snapshot or
+orphan maintenance.
 
 ## Requirements
 

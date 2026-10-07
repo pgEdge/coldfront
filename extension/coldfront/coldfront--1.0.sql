@@ -512,12 +512,14 @@ BEGIN
                         -- UPDATE to SELECT _cross_tier_move(...), which serialises
                         -- cold rows via _move_row_literal.
                         '_cross_tier_move', '_move_row_literal', '_move_pg_row_literal',
-                        '_enqueue_release',
+                        '_enqueue_release', '_enqueue_claim',
                         -- cold-write preconditions + serializer gate wrappers (the
-                        -- standby refusal, the armed-predicate, the claim-or-advisory
-                        -- acquire); app-role cold paths call these SECURITY INVOKER
-                        -- wrappers, which delegate to the DEFINER primitives below.
-                        '_reject_on_standby', '_bakery_armed', '_take_iceberg_claim',
+                        -- standby refusal, the armed-predicate, the Spock-without-
+                        -- bakery refusal, the claim-or-advisory acquire); app-role
+                        -- cold paths call these SECURITY INVOKER wrappers, which
+                        -- delegate to the DEFINER primitives below.
+                        '_reject_on_standby', '_bakery_armed', '_refuse_spock_without_bakery',
+                        '_take_iceberg_claim',
                         -- R-A bakery coordination (mesh cold writes); SECURITY
                         -- DEFINER, so the app role just needs EXECUTE — the
                         -- spock/loopback/pg_stat_replication access happens as owner.
@@ -905,11 +907,13 @@ $$;
 -- column, the DEFAULT expression for an omitted column that has one, NULL
 -- otherwise. The sink renders and batches and does nothing else: the step
 -- function renders each row as a DuckDB VALUES tuple and flushes every
--- coldfront.cold_write_batch_size rows as one INSERT under the table's claim,
--- and the final function flushes the rest and returns the row count. The
--- claim is taken once per table per transaction (_take_iceberg_claim), the
--- same sequence as every other cold write. The state is NULL until the first
--- row, so an aggregate over no cold rows writes nothing and returns 0.
+-- coldfront.cold_write_batch_size rows as one INSERT through
+-- _exec_iceberg_with_claim, and the final function flushes the rest and
+-- returns the row count. Each batch is an append, so in the async ordering
+-- every batch is staged inside the statement and the table's one claim is
+-- taken at the transaction's commit; in the stock ordering the claim comes
+-- before the first batch. The state is NULL until the first row, so an
+-- aggregate over no cold rows writes nothing and returns 0.
 -- ============================================================================
 CREATE TYPE coldfront._cold_sink_state AS (
     iceberg text,       -- the DuckDB ref the batches are written to
@@ -965,15 +969,14 @@ BEGIN
 END;
 $$;
 
--- One batch to Iceberg, under the table's claim.
+-- One batch to Iceberg, in the ordering every cold write uses.
 CREATE FUNCTION coldfront._cold_sink_flush(s coldfront._cold_sink_state)
 RETURNS coldfront._cold_sink_state
 LANGUAGE plpgsql AS $$
 BEGIN
     IF cardinality(s.buf) > 0 THEN
-        PERFORM coldfront._take_iceberg_claim(s.iceberg);
-        PERFORM duckdb.raw_query(format('INSERT INTO %s VALUES %s',
-                                        s.iceberg, array_to_string(s.buf, ', ')));
+        PERFORM coldfront._exec_iceberg_with_claim(s.iceberg,
+            format('INSERT INTO %s VALUES %s', s.iceberg, array_to_string(s.buf, ', ')));
         s.buf := '{}';
     END IF;
     RETURN s;
@@ -1060,7 +1063,7 @@ CREATE AGGREGATE coldfront._cold_sink(text, text, jsonb) (
 -- statement — so this runs at top level, in the user's one transaction.
 --
 -- It is the mixed-tier-update shape (hot tier = plain PG, cold tier = one
--- duckdb.raw_query under one bakery claim), with rows routed by (current tier,
+-- DuckDB statement through _exec_iceberg_with_claim), with rows routed by (current tier,
 -- e vs cutoff) into four disjoint cases handled separately:
 --   stay-hot  hot,  e>=cut : in-place UPDATE of the hot heap.
 --   hot→cold  hot,  e<cut  : the row leaves the heap (DELETE) and is added to
@@ -1071,9 +1074,11 @@ CREATE AGGREGATE coldfront._cold_sink(text, text, jsonb) (
 -- Same-tier changes are in-place; crossings write the OTHER tier and remove from
 -- the origin (different relations) — no same-relation overlap.
 --
--- Cold tier: ONE raw_query (DELETE-set + INSERT-set = one MetaTransaction = one
--- snapshot, the replay_archive_delta idiom) under ONE claim (never per-row
--- tickets). The cold rows are read through the catalog's table entry
+-- Cold tier: ONE statement (DELETE-set + INSERT-set = one MetaTransaction = one
+-- snapshot, the replay_archive_delta idiom) through _exec_iceberg_with_claim,
+-- under ONE claim (never per-row tickets), taken before the rows are read: the
+-- move removes rows by their old key and re-adds the values it read, so the
+-- read and the write have to see one head. The cold rows are read through the catalog's table entry
 -- (duckdb.query over the Iceberg table), whose scan includes the transaction's
 -- own pending rows; pg_duckdb permits that read inside a function only with
 -- duckdb.unsafe_allow_execution_inside_functions, which the move needs because
@@ -1116,13 +1121,12 @@ DECLARE
     v_hot_targets timestamptz[];
     v_uncovered   bigint;
 BEGIN
-    -- The cold leg below reaches duckdb.raw_query directly rather than through
-    -- _exec_iceberg_with_claim, so it carries the standby guard itself. The hook
-    -- rewrite that reaches here is a bare SELECT, which PG's read-only check passes.
+    -- The hook rewrite that reaches here is a bare SELECT, which PG's read-only
+    -- check passes, and the heap legs below run before the cold write's own
+    -- guard would, so the standby is refused here first.
     PERFORM coldfront._reject_on_standby('move rows across tiers (Iceberg write)');
     SET LOCAL duckdb.unsafe_allow_execution_inside_functions = on;
     SET LOCAL duckdb.unsafe_allow_mixed_transactions = on;
-    SET LOCAL coldfront.iceberg_async_parquet = off;
     SET LOCAL bytea_output = 'hex';
 
     SELECT tv.hot_table, tv.iceberg_table, tv.partition_col, aw.cutoff_time
@@ -1216,8 +1220,9 @@ BEGIN
         END IF;
     END IF;
 
-    -- One claim for the whole move (released at xact end by the C XactCallback);
-    -- mesh takes the R-A bakery, vanilla a local advisory xact lock.
+    -- One claim for the whole move, taken before the cold rows are read so no
+    -- other cold writer or compaction changes them between the read and the
+    -- write; _exec_iceberg_with_claim below finds it held.
     PERFORM coldfront._take_iceberg_claim(v_iceberg);
 
     -- ── Capture the moved rows by VALUE (no DuckDB read in any modifying stmt) ──
@@ -1280,7 +1285,7 @@ BEGIN
             array_to_string(heap_arr, ', '));
     END IF;
 
-    -- ── Cold tier: ONE raw_query (DELETE old keys + INSERT cold-destined) ────────
+    -- ── Cold tier: ONE statement (DELETE old keys + INSERT cold-destined) ────────
     IF array_length(del_arr, 1) > 0 THEN
         cold_sql := format('DELETE FROM %s WHERE (%s) IN (%s)', v_iceberg, v_pk_list, array_to_string(del_arr, ', '));
     END IF;
@@ -1289,7 +1294,7 @@ BEGIN
         cold_sql := cold_sql || format('INSERT INTO %s VALUES %s', v_iceberg, array_to_string(ins_arr, ', '));
     END IF;
     IF cold_sql <> '' THEN
-        PERFORM duckdb.raw_query(cold_sql);
+        PERFORM coldfront._exec_iceberg_with_claim(v_iceberg, cold_sql);
     END IF;
 END;
 $fn$;
@@ -1740,7 +1745,10 @@ $$;
 --
 -- The table's claim is held from the sample to the commit, as the compactor holds
 -- it across its read and rewrite: a cold write landing in between would carry an
--- assignment against the centroids this call replaces.
+-- assignment against the centroids this call replaces. An append staged in the
+-- async ordering assigns its rows before it claims, so one staged during the
+-- training commits after it with the generation it replaced; a retrain picks
+-- those rows up.
 CREATE PROCEDURE coldfront.vector_train(
     p_schema     text,
     p_table      text,
@@ -2217,7 +2225,10 @@ $$;
 -- nothing, and the expression yields NULL: unassigned, which a probe reads
 -- through the null arm of its predicate rather than missing. A retrain cannot
 -- interleave with a cold write, since vector_train holds the table's claim from
--- its sample to its commit and every cold write serialises on that same claim.
+-- its sample to its commit and every cold write serialises on that same claim;
+-- an append staged in the async ordering assigns against the generation live
+-- when it stages, so one staged during a retrain lands with the generation the
+-- retrain replaced, and the next retrain reassigns it.
 --
 -- The formula itself is _vec_nearest_expr, shared with vector_train, which scores
 -- the generation it has just trained from its own session: one formula, so a
@@ -4045,6 +4056,17 @@ CREATE FUNCTION coldfront._enqueue_release(p_ticket bigint)
 RETURNS void
 LANGUAGE c AS 'coldfront', 'coldfront_enqueue_release';
 
+-- C-bridge for the async ordering's appends: queue the table's claim for the
+-- same XactCallback to take at XACT_EVENT_PRE_COMMIT, through
+-- _take_iceberg_claim. coldfront registers its callback after pg_duckdb and
+-- PostgreSQL calls the latest registered first, so the claim is held when
+-- pg_duckdb commits the Iceberg transaction at its own PRE_COMMIT and released
+-- at COMMIT as above. An ABORT drops the queue: nothing was committed, and
+-- nothing was claimed.
+CREATE FUNCTION coldfront._enqueue_claim(p_iceberg_table text)
+RETURNS void
+LANGUAGE c AS 'coldfront', 'coldfront_enqueue_claim';
+
 -- coldfront._reject_on_standby: refuse a cold-tier mutation on a physical standby.
 -- PostgreSQL's read-only enforcement covers only its own writes; a cold write leaves
 -- PG entirely (DuckDB to object storage), so the cold tier relies on this explicit
@@ -4096,16 +4118,27 @@ BEGIN
                            concat_ws(E'\n', NULLIF(current_setting('coldfront._claimed'), ''), p_iceberg_ref),
                            true);
     ELSE
-        -- A node that runs Spock is a mesh node, and a mesh node serializes cold
-        -- writes through the bakery alone: without its settings, refuse rather
-        -- than take the node-local lock, which peers cannot see.
-        IF EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'spock') THEN
-            RAISE EXCEPTION 'coldfront: this node runs Spock, so a cold write needs the bakery, and % is not set',
-                CASE WHEN NULLIF(current_setting('coldfront.loopback_dsn'), '') IS NULL
-                     THEN 'coldfront.loopback_dsn' ELSE 'snowflake.node' END
-                USING HINT = 'Set coldfront.loopback_dsn to this server''s unix-socket DSN (e.g. ''host=/var/run/postgresql dbname=coldfront user=coldfront'') and snowflake.node to this node''s id.';
-        END IF;
+        PERFORM coldfront._refuse_spock_without_bakery();
         PERFORM pg_advisory_xact_lock(hashtext('coldfront_iceberg:' || p_iceberg_ref));
+    END IF;
+END;
+$$;
+
+-- A node that runs Spock is a mesh node, and a mesh node serializes cold writes
+-- through the bakery alone: without its settings, refuse rather than take the
+-- node-local lock, which peers cannot see. _take_iceberg_claim calls this where
+-- it would take the lock, and _exec_iceberg_with_claim calls it before it
+-- stages an append whose claim comes at commit, so the refusal names the
+-- statement rather than the COMMIT.
+CREATE FUNCTION coldfront._refuse_spock_without_bakery() RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+    IF NOT coldfront._bakery_armed()
+       AND EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'spock') THEN
+        RAISE EXCEPTION 'coldfront: this node runs Spock, so a cold write needs the bakery, and % is not set',
+            CASE WHEN NULLIF(current_setting('coldfront.loopback_dsn'), '') IS NULL
+                 THEN 'coldfront.loopback_dsn' ELSE 'snowflake.node' END
+            USING HINT = 'Set coldfront.loopback_dsn to this server''s unix-socket DSN (e.g. ''host=/var/run/postgresql dbname=coldfront user=coldfront'') and snowflake.node to this node''s id.';
     END IF;
 END;
 $$;
@@ -4134,53 +4167,48 @@ $$;
 -- chokepoint every cold write
 -- routes through, in every deployment.
 --
--- The serializer is fundamentally a per-Iceberg-table mutex that scales by
--- deployment, chosen by the v_armed gate:
+-- The serializer is a per-Iceberg-table mutex that _take_iceberg_claim picks by
+-- deployment: the Ricart-Agrawala bakery on a mesh node, a transaction-scoped
+-- local advisory lock on a vanilla node. Which one it is does not change the
+-- ordering here; the loaded duckdb-iceberg and the statement do:
 --
---   * Multi-node mesh (v_armed): the Ricart-Agrawala bakery. The upload ordering
---     adapts to the loaded duckdb-iceberg via coldfront.iceberg_async_parquet —
---     NEVER a 409 either way, only overlap-vs-serialized upload:
---       - patched iceberg (coldfront.iceberg_async_parquet ON AND the build
---         marker coldfront.iceberg_bakery_patch ON): stage the parquet FIRST
---         (writers overlap freely on S3), then claim the bakery only to wrap
---         pg_duckdb's deferred commit POST — the patch re-stamps parent_snapshot_id
---         at that POST, so the overlap is safe.
---       - stock iceberg (the default — OR async REQUESTED without the
---         iceberg_bakery_patch marker, which fails safe to here): claim the bakery
---         FIRST, then stage+commit inside the held ticket — stock stamps
---         parent_snapshot_id at stage time, so the upload must be serialized or a
---         peer captures a stale parent and 409s. _iceberg_async_active() gates the
---         async path on BOTH GUCs, so an unpatched deployment that flips only the
---         async flag can never silently 409 — it lands here and warns once.
---     The release is enqueued for the C XactCallback (fires on COMMIT and ABORT),
---     so an in-ticket staging failure can't orphan the claim.
+--   * An append (p_sql is an INSERT: the hook's cold INSERT, the archiver's
+--     export, the cold sink's batches) on patched iceberg
+--     (coldfront.iceberg_async_parquet ON AND the build marker
+--     coldfront.iceberg_bakery_patch ON) is staged FIRST, so writers on one node
+--     and across nodes overlap freely on S3, and the claim is queued for the C
+--     XactCallback to take at PRE_COMMIT, ahead of pg_duckdb's commit POST, so
+--     the serializer wraps that POST alone and an open transaction holds no
+--     claim. The patch re-stamps parent_snapshot_id at the POST, under the
+--     claim, and a new data file conflicts with nothing a peer or a compaction
+--     commits in between (docs/formal Bakery_async.cfg,
+--     Bakery_async_samenode.cfg and Bakery_async_single.cfg).
+--   * A write that references rows already in the table (DELETE, UPDATE, MERGE,
+--     the cross-tier move's bundle) takes the claim FIRST, whatever the build:
+--     its position deletes name data files by path, and a compaction or another
+--     such write committing between its scan and its commit would rewrite or
+--     delete those files, after which the deletes apply to nothing and the rows
+--     come back. Under the claim the scan and the commit see one head.
+--   * Stock iceberg (the default, OR async REQUESTED without the
+--     iceberg_bakery_patch marker, which fails safe to here) takes the claim
+--     FIRST for every write: stock stamps parent_snapshot_id at stage time, so
+--     the upload must be serialized or a second writer captures a stale parent
+--     and 409s. _iceberg_async_active() gates the async path on BOTH GUCs, so
+--     an unpatched deployment that flips only the async flag can never silently
+--     409: it lands here and logs once.
 --
---   * Vanilla single-node / no mesh (NOT v_armed): a transaction-scoped LOCAL
---     advisory lock is the same mutex without any Spock/snowflake/loopback
---     dependency. Taken BEFORE staging so a second backend on this node blocks
---     before it captures parent_snapshot_id (no stale-parent 409); auto-released
---     at commit. This is the path for plain PostgreSQL tiered deployments, which
---     have no snowflake.node / loopback_dsn configured.
---
--- _bakery_armed() probes the two GUCs the R-A bakery requires. current_setting(...,true)
--- returns NULL for an unrecognised GUC, so the probe is safe with no snowflake
--- extension loaded.
+-- On a mesh the release is enqueued for the C XactCallback (fires on COMMIT and
+-- ABORT), so an in-ticket staging failure can't orphan the claim; the advisory
+-- lock ends with the transaction.
 CREATE FUNCTION coldfront._exec_iceberg_with_claim(
     p_iceberg_table text,
     p_sql           text
 ) RETURNS void LANGUAGE plpgsql AS $$
 DECLARE
-    -- v_armed drives BOTH the acquire (via _take_iceberg_claim) and the async
-    -- vs stock upload ordering below, so it stays a local here.
-    v_armed   boolean := coldfront._bakery_armed();
-    -- Async-parquet upload ordering: stage the parquet OUTSIDE the claim (writers
-    -- overlap on S3), then take the claim only to wrap pg_duckdb's deferred commit
-    -- POST. Correct ONLY on the bakery-aware duckdb-iceberg build (it re-stamps
-    -- parent_snapshot_id at the POST, under the claim). _iceberg_async_active() is
-    -- TRUE only when BOTH coldfront.iceberg_async_parquet AND the build marker
-    -- coldfront.iceberg_bakery_patch are on; otherwise the stock ordering below is
-    -- used (always safe). Never a 409 either way.
     v_async   boolean := coldfront._iceberg_async_active();
+    -- Every statement here is generated by coldfront, and an append starts
+    -- with its verb; a DELETE-led bundle or an UPDATE does not.
+    v_append  boolean := upper(ltrim(p_sql)) LIKE 'INSERT %';
 BEGIN
     -- A cluster assignment reads the centroids over pglocal, so a statement that
     -- names it needs pglocal attached in this backend. Tested on the statement
@@ -4190,8 +4218,8 @@ BEGIN
         PERFORM coldfront.ensure_pg_attached();
     END IF;
     -- This wrapper is the single-statement cold path; the cold sink
-    -- (_cold_sink_step) and _cross_tier_move issue their own cold writes and
-    -- carry the same guard. A hot write hits a PG heap, which PG rejects natively.
+    -- (_cold_sink_step) issues its own cold writes and carries the same guard.
+    -- A hot write hits a PG heap, which PG rejects natively.
     PERFORM coldfront._reject_on_standby('execute a cold (Iceberg) write');
     -- Fail-safe, not fail-silent: if async was REQUESTED but the bakery-aware
     -- patch is not asserted, we use the stock ordering (always safe) and note it
@@ -4207,15 +4235,13 @@ BEGIN
         RAISE LOG 'coldfront: iceberg_async_parquet is on but iceberg_bakery_patch is not set — the loaded duckdb-iceberg is not the bakery-aware build; using the SAFE stock upload ordering instead of async. Set coldfront.iceberg_bakery_patch=on ONLY where duckdb-iceberg carries the bakery-aware-commit-refresh patch (the coldfront patched images set both GUCs).';
         PERFORM set_config('coldfront._async_downgrade_warned', 'on', false);
     END IF;
-    IF v_armed AND v_async THEN
-        -- Patched iceberg: upload parquet in the background, then take the claim
-        -- only to wrap pg_duckdb's deferred commit POST.
+    IF v_async AND v_append THEN
+        -- Patched iceberg: stage the parquet now, claim at PRE_COMMIT.
+        PERFORM coldfront._refuse_spock_without_bakery();
         PERFORM duckdb.raw_query(p_sql);
-        PERFORM coldfront._take_iceberg_claim(p_iceberg_table);
+        PERFORM coldfront._enqueue_claim(p_iceberg_table);
     ELSE
-        -- Stock (armed) or vanilla: acquire FIRST (mesh R-A claim or local
-        -- advisory, chosen inside the helper), then upload+commit inside it so no
-        -- peer can capture a stale parent_snapshot_id.
+        -- Acquire FIRST, then stage+commit inside the claim.
         PERFORM coldfront._take_iceberg_claim(p_iceberg_table);
         PERFORM duckdb.raw_query(p_sql);
     END IF;

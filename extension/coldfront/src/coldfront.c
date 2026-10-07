@@ -77,6 +77,7 @@
 #include "parser/parse_type.h"
 #include "parser/parsetree.h"
 #include "storage/fd.h"
+#include "storage/proc.h"
 #include "storage/procarray.h"
 #include "tcop/tcopprot.h"
 #include "tcop/utility.h"
@@ -86,9 +87,11 @@
 #include "utils/guc.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
+#include "utils/snapmgr.h"
 #include "utils/regproc.h"
 #include "utils/ruleutils.h"
 #include "utils/syscache.h"
+#include "utils/timeout.h"
 #include "utils/timestamp.h"
 #include "fmgr.h"
 #include "libpq-fe.h"
@@ -4216,8 +4219,19 @@ coldfront_post_parse_analyze(ParseState *pstate, Query *query,
  *
  * Allocated in TopMemoryContext so it survives across PG xacts within one
  * backend session.
+ *
+ * The async ordering's appends queue their CLAIM the same way
+ * (coldfront._enqueue_claim): the statement stages its parquet and the
+ * callback takes the queued claims at XACT_EVENT_PRE_COMMIT, through
+ * coldfront._take_iceberg_claim over SPI, while the transaction is still open
+ * and before pg_duckdb's own PRE_COMMIT callback commits the Iceberg
+ * transaction (the same registration order as above). So the serializer is
+ * held for the commit POST alone, and an open transaction with staged cold
+ * writes blocks no other writer. ABORT drops the queue: nothing was committed
+ * and nothing was claimed.
  */
 static List *coldfront_pending_releases = NIL;
+static List *coldfront_pending_claims   = NIL;    /* of char *: Iceberg refs */
 
 /* The node's loopback: one libpq connection per backend, opened lazily from the
  * GUC coldfront.loopback_dsn and kept for the backend's lifetime. Every bakery
@@ -4383,13 +4397,81 @@ cf_release_one_ticket(int64 ticket)
         PQclear(res);
 }
 
+/* Whether the statement that ends this transaction had statement_timeout
+ * running, by the rule enable_statement_timeout applies and the timer's own
+ * start time: PostgreSQL enables the timer in start_xact_command, so a timer
+ * started inside this transaction belongs to its latest statement, and a
+ * backend that commits without one (a background worker) never started it. A
+ * timer still running belongs to the CALL a procedure's COMMIT runs under,
+ * which keeps it. */
+static bool
+cf_statement_timeout_applies(void)
+{
+    TimestampTz started = get_timeout_start_time(STATEMENT_TIMEOUT);
+
+    return StatementTimeout > 0
+#if PG_VERSION_NUM >= 170000
+        && (TransactionTimeout == 0 || StatementTimeout < TransactionTimeout)
+#endif
+        && !get_timeout_active(STATEMENT_TIMEOUT)
+        && started > 0 && started >= GetCurrentTransactionStartTimestamp();
+}
+
+/* cf_take_pending_claims takes the claims the async ordering's appends queued,
+ * at PRE_COMMIT: the transaction is still open, so SPI runs here under a
+ * snapshot pushed for it (no statement is active at this point), and the ERROR
+ * a timeout or a refused claim raises aborts the transaction, whose ABORT
+ * event then drops the queue. PostgreSQL switches statement_timeout off before
+ * commit processing (finish_xact_command), so the wait for the claim, whose
+ * protocol has no timeout of its own, would be the one part of the statement
+ * the setting does not bound: the timer runs again, at the statement's own
+ * deadline, for the claims alone. */
+static void
+cf_take_pending_claims(void)
+{
+    ListCell *lc;
+    bool      bounded;
+
+    if (coldfront_pending_claims == NIL)
+        return;
+    bounded = cf_statement_timeout_applies();
+    if (bounded)
+        enable_timeout_at(STATEMENT_TIMEOUT, get_timeout_finish_time(STATEMENT_TIMEOUT));
+    PushActiveSnapshot(GetTransactionSnapshot());
+    if (SPI_connect() != SPI_OK_CONNECT)
+        elog(ERROR, "coldfront: SPI_connect failed while taking the cold writes' claims");
+    foreach(lc, coldfront_pending_claims)
+    {
+        Oid   argtypes[1] = { TEXTOID };
+        Datum values[1]   = { CStringGetTextDatum((char *) lfirst(lc)) };
+
+        if (SPI_execute_with_args("SELECT coldfront._take_iceberg_claim($1)",
+                                  1, argtypes, values, NULL, false, 0) != SPI_OK_SELECT)
+            elog(ERROR, "coldfront: taking the claim on %s failed", (char *) lfirst(lc));
+    }
+    SPI_finish();
+    PopActiveSnapshot();
+    if (bounded)
+        disable_timeout(STATEMENT_TIMEOUT, false);
+    list_free_deep(coldfront_pending_claims);
+    coldfront_pending_claims = NIL;
+}
+
 static void
 coldfront_xact_callback(XactEvent event, void *arg)
 {
     ListCell *lc;
 
+    if (event == XACT_EVENT_PRE_COMMIT)
+    {
+        cf_take_pending_claims();
+        return;
+    }
     if (event != XACT_EVENT_COMMIT && event != XACT_EVENT_ABORT)
         return;
+
+    list_free_deep(coldfront_pending_claims);
+    coldfront_pending_claims = NIL;
 
     /* The registry snapshot's context is a child of TopTransactionContext,
      * which this transaction's end frees. Drop the pointers with it, so the
@@ -4459,6 +4541,26 @@ coldfront_enqueue_release(PG_FUNCTION_ARGS)
     p = palloc(sizeof(*p));
     *p = ticket;
     coldfront_pending_releases = lappend(coldfront_pending_releases, p);
+    MemoryContextSwitchTo(old);
+
+    PG_RETURN_VOID();
+}
+
+/* Queue an Iceberg table's claim for the transaction callback to take at
+ * PRE_COMMIT; a table queued twice is claimed once. */
+PG_FUNCTION_INFO_V1(coldfront_enqueue_claim);
+Datum
+coldfront_enqueue_claim(PG_FUNCTION_ARGS)
+{
+    char           *table = text_to_cstring(PG_GETARG_TEXT_PP(0));
+    MemoryContext   old;
+    ListCell       *lc;
+
+    foreach(lc, coldfront_pending_claims)
+        if (strcmp((char *) lfirst(lc), table) == 0)
+            PG_RETURN_VOID();
+    old = MemoryContextSwitchTo(TopMemoryContext);
+    coldfront_pending_claims = lappend(coldfront_pending_claims, pstrdup(table));
     MemoryContextSwitchTo(old);
 
     PG_RETURN_VOID();

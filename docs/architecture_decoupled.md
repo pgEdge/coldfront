@@ -598,10 +598,21 @@ pointing at the same Lakekeeper endpoint and S3 bucket:
        that ticket, emitting any acks the node had been holding back.
 
     This is the stock ordering. With `coldfront.iceberg_async_parquet` and
-    `coldfront.iceberg_bakery_patch` both on, as the shipped image sets them, a
-    mesh writer stages the Parquet upload through `duckdb.raw_query` first and
-    takes the claim afterwards; only the commit POST runs under the claim, with
-    the parent snapshot re-stamped by the bakery-aware patch. With
+    `coldfront.iceberg_bakery_patch` both on, as the shipped image sets them, an
+    `INSERT` stages its Parquet upload through `duckdb.raw_query` inside the
+    statement and the C transaction callback takes the claim at PRE_COMMIT,
+    just before pg_duckdb's own PRE_COMMIT callback commits the Iceberg
+    transaction; only the commit POST runs under the claim, with the parent
+    snapshot re-stamped by the bakery-aware patch, and an open transaction
+    holds no claim. PostgreSQL switches `statement_timeout` off before commit
+    processing, so the callback runs the timer again, at the statement's own
+    deadline, while it waits for the claim: a wait that outlives the setting
+    fails with the statement-timeout error and the transaction rolls back. A
+    `DELETE`, `UPDATE` or `MERGE` references rows the table
+    already holds, so it takes the stock ordering on every build: its position
+    deletes name data files, and a compaction or another such write committing
+    between its scan and its commit would leave them pointing at nothing. A
+    vanilla node orders its advisory lock the same way. With
     `coldfront.iceberg_async_parquet` on and `coldfront.iceberg_bakery_patch`
     off, `coldfront._iceberg_async_active()` returns false, and the writer
     keeps the stock ordering and logs the downgrade once per session.

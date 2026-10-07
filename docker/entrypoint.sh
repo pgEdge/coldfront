@@ -62,10 +62,11 @@ shared_preload_libraries = '${PRELOAD}'
 # postgres_scanner + any non-bundled deps auto-install; it does NOT clobber the
 # pre-placed iceberg/avro (DuckDB skips install for extensions already present).
 # allow_unsigned ON so the locally-built (unsigned) extension loads; autoload ON
-# so ATTACH (TYPE ICEBERG, ...) lazily LOADs it; iceberg_async_parquet ON so the
-# mesh bakery uploads parquet in the background and serializes only the commit
-# POST (safe because the patch refreshes parent_snapshot_id at commit). Vanilla
-# ignores the flag (advisory lock, claim-first).
+# so ATTACH (TYPE ICEBERG, ...) lazily LOADs it; iceberg_async_parquet ON so
+# every cold write uploads its parquet before it takes the serializer (the
+# bakery claim on a mesh node, the advisory lock on a vanilla one) and only the
+# commit POST is serialized (safe because the patch refreshes
+# parent_snapshot_id at commit).
 #
 # iceberg_bakery_patch = on ASSERTS that the duckdb-iceberg in THIS image carries
 # the bakery-aware-commit-refresh patch (it does — the Dockerfile git-applies it).

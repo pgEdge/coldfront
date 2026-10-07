@@ -23,6 +23,8 @@ an explicit applier. The following table describes its files and their roles:
 | `Bakery.tla` | This file is the PlusCal source. It models the real Spock world: each node has its OWN local `claims[nd]` view, and INSERTs propagate via an explicit `Applier`. The model does not assume `synchronous_commit = remote_apply`. Coordination is Lamport's 1978 distributed mutual exclusion algorithm with Ricart-Agrawala's (1981; henceforth abbreviated R-A) deferred-reply optimization: peers ack each claim immediately unless they have a pending claim with smaller ticket, in which case they defer the ack until they release their own claim. The file also models the `coldfront.iceberg_async_parquet` flag (constants `AsyncParquet`/`RestampPatch`): the `Stage` label stages parquet OUTSIDE the claim (async ordering); `Prepare` captures the `parent_snapshot_id` UNDER the claim (stock at stage time, patched async re-stamped at the commit POST); the conditional commit at `Decide` asserts against it. Defer/drain atomicity is modeled too (constant `SafeAcks`): the apply-time defer DECISION and its WRITE (`ApplyDecide`/`ApplyEmit`), and the release drain's FORWARD and DELETE (`DrainForward`/`DrainDelete`), are SEPARATE steps, faithful to the non-atomic SQL. `SafeAcks=FALSE` lets them race (a deferral written behind a just-released claim is deleted unforwarded / orphaned - a dropped ack); `SafeAcks=TRUE` is the safe implementation: an atomic re-check of R-A's own defer rule against the claim, i.e. `SELECT … FOR UPDATE` on the claim row in `coldfront._on_claim_apply`. The orphan reaper is modeled as well (constant `Reaper`): a same-node claim whose writer has crashed holds no advisory lock, so `BeginClaim` deletes it in the step that inserts its own claim; the `Applier` does the same on its defer branch under `HoldsTableLock(nd)` (a live writer holds `coldfront_iceberg:<table>` from `WaitAcks` through `DrainDelete`, because the release runs in the COMMIT callback before PostgreSQL drops the xact lock); and a `Poker` process models the waiter's periodic no-op UPDATE of its own claim row, which re-runs the peer's defer branch and is what unwedges a waiter whose peer's holder died after deferring to it. Constant `NodeRetries` restricts the `Crasher` to writers whose node still has an unstarted writer (the node is touched again); FALSE allows the crash after which only the poke reaches the node. The `Crasher` cannot split `Release`/`DrainForward`/`DrainDelete`, which are one loopback transaction in the real code. |
 | `Bakery.cfg` | This TLC config checks 3 writers with no crashes against all four safety invariants, in stock ordering (`AsyncParquet=FALSE`, the default, with parquet staged inside the claim). The config passes: the bakery makes `NoLakekeeperConflict` and `TicketOrderPreserved` hold even with realistic asymmetric apply. |
 | `Bakery_async.cfg` | This config checks the patched async ordering (`AsyncParquet=TRUE, RestampPatch=TRUE`) that the DuckDB 1.5.x (duckdb15) image runs: parquet is staged outside the claim, and the bakery-aware patch re-stamps `parent_snapshot_id` at the commit POST under the claim. All four safety invariants HOLD; the test is non-vacuous, because it shares the stock config's under-claim window from `Prepare` to `Decide`, which R-A keeps empty. |
+| `Bakery_async_samenode.cfg` | This config checks the patched async ordering with several cold writers per node (`NodeParts={{a1,a2},{b1}}`, `SameNodeLock=TRUE`): the writers on one node stage their parquet concurrently, the node-local advisory lock admits one of them to the bakery at a time, and the commit POST re-stamps the parent under the claim. All four safety invariants HOLD. The cold sink, which stages several batches before its one claim, is this writer: `Stage` covers every upload a transaction makes before it claims. |
+| `Bakery_async_single.cfg` | This config checks the patched async ordering on one node with three writers (`NodeParts={{a1,a2,a3}}`), the vanilla deployment: `coldfront._take_iceberg_claim` takes the per-table advisory transaction lock alone there, which is `SameNodeLock`; the claim row the model inserts has no peer to see it and changes nothing a same-node writer does. With one node the `Applier` and the `Poker` never run. All four safety invariants HOLD. |
 | `Bakery_race.cfg` | This config checks the pre-patch async race (`AsyncParquet=TRUE, RestampPatch=FALSE`): async ordering WITHOUT the bakery-aware patch, where the stale tentative parent from the pre-claim stage is used at the POST. `NoLakekeeperConflict` is EXPECTED to be violated, which is the formal proof that the patch is mandatory for the async ordering. |
 | `Bakery_crash.cfg` | This config checks 3 writers with a budget of 1 crash, in stock ordering (crash safety is ordering-independent). The safety invariants still hold, and survivors proceed, because the dead-peer escape treats a crashed node as already acked. This config checks safety only; stranding under a crash appears only with same-node writers (`Bakery_wedge.cfg`). |
 | `Bakery_live.cfg` | This config checks the defer/drain race (`SafeAcks=FALSE`), the non-atomic implementation. `EventualProgress` is EXPECTED to be VIOLATED: a deferred ack written behind a just-released claim is dropped, stranding the min-ticket holder at `WaitAcks` forever, which is the N-writer wedge this race produces. The four safety invariants still HOLD (a dropped ack is a liveness failure, not a wrong commit). The config declares no `SYMMETRY`, because symmetry reduction is unsound with liveness checking. |
@@ -115,6 +117,14 @@ java -cp $TLA tlc2.TLC -workers auto -deadlock -config Bakery_async.cfg Bakery.t
 #       NoLakekeeperConflict is violated, which is the formal proof that the
 #       bakery-aware patch is mandatory for the async path.
 java -cp $TLA tlc2.TLC -workers auto -deadlock -config Bakery_race.cfg Bakery.tla
+
+# n. This run checks the patched async ordering with several writers per node
+#       (the cold sink's shape, several uploads before one claim).  All hold.
+java -cp $TLA tlc2.TLC -workers auto -deadlock -config Bakery_async_samenode.cfg Bakery.tla
+
+# o. This run checks the patched async ordering on a single node (the vanilla
+#       deployment's advisory lock).  All hold.
+java -cp $TLA tlc2.TLC -workers auto -deadlock -config Bakery_async_single.cfg Bakery.tla
 
 # d. This run has a budget of 1 crash.  Safety still holds; survivors proceed,
 #       because a crashed node counts as already acked.
@@ -210,6 +220,39 @@ hold. The check is non-vacuous: it shares the stock config's under-claim
 ticket defers its ack until it releases, so two writers never both clear
 `WaitAcks`). This is the ordering the DuckDB 1.5.x (duckdb15) image runs.
 
+### `Bakery_async_samenode.cfg` (Patched Async, Several Writers per Node)
+
+The patched-async config with two writers on one node reports a clean check
+with the following output:
+
+```text
+Model checking completed. No error has been found.
+568475 states generated, 194964 distinct states found, 0 states left on queue.
+```
+
+Two writers on one node stage their parquet concurrently, outside the claim;
+the node-local advisory lock (`SameNodeLock`) then admits one of them to the
+bakery at a time, and each re-stamps the parent under the claim. This is the
+cold sink's shape: several uploads, then one claim. Without the lock this
+topology violates `NoLakekeeperConflict` as `Bakery_samenode_race.cfg` does, so
+the check is non-vacuous.
+
+### `Bakery_async_single.cfg` (Patched Async, Single Node)
+
+The single-node patched-async config reports a clean check with the following
+output:
+
+```text
+Model checking completed. No error has been found.
+208013 states generated, 72608 distinct states found, 0 states left on queue.
+```
+
+Three writers on one node, with no peer: the vanilla deployment, whose
+serializer is the per-table advisory transaction lock (`SameNodeLock`) alone.
+Each writer stages outside the lock, takes it, re-stamps the parent under it
+and commits. The claim row the model still inserts has no peer to see it; the
+`Applier` and the `Poker` never run.
+
 ### `Bakery_race.cfg` (Pre-Patch Async - EXPECTED FAILURE)
 
 The pre-patch async config is expected to fail the check, reporting the
@@ -281,26 +324,38 @@ faithfully because they affect protocol correctness:
   row on the originator; the node's next claim deletes it (the `acks` CTE in
   `_insert_claim`).
 
-- The `coldfront.iceberg_async_parquet` flag's two mesh orderings in
-  [_exec_iceberg_with_claim](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/coldfront--1.0.sql):
-  stock (claim → stage+commit under the claim) and patched async (stage
-  parquet outside the claim → claim → re-stamp `parent_snapshot_id` at the
-  commit POST under the claim). The safety-critical invariant - the parent
-  snapshot the conditional commit checks is taken UNDER the held claim - is
-  captured at `Prepare` for both; the `AsyncParquet`/`RestampPatch` constants
-  select the ordering and whether the bakery-aware patch is present. In the
-  code, `coldfront._iceberg_async_active()` selects the async ordering only
-  when the build marker `coldfront.iceberg_bakery_patch` is also on. With the
-  flag alone, the writer keeps the stock ordering and logs the downgrade once
-  per session, so the `Bakery_race.cfg` combination runs only where the marker
-  is set on a stock binary.
+- The `coldfront.iceberg_async_parquet` flag's two orderings in
+  [_exec_iceberg_with_claim](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/coldfront--1.0.sql),
+  on a mesh node and a vanilla node alike: stock (claim → stage+commit under
+  the claim) and patched async (stage parquet outside the claim → claim →
+  re-stamp `parent_snapshot_id` at the commit POST under the claim). The
+  safety-critical invariant - the parent snapshot the conditional commit
+  checks is taken UNDER the held claim - is captured at `Prepare` for both; the
+  `AsyncParquet`/`RestampPatch` constants select the ordering and whether the
+  bakery-aware patch is present. `Stage` stands for every upload the
+  transaction makes before it claims, so the cold sink's batches and a
+  transaction's several `INSERT` statements are one `Stage`, and `BeginClaim`
+  is the C `XactCallback` taking the queued claims at `XACT_EVENT_PRE_COMMIT`,
+  before pg_duckdb's own PRE_COMMIT callback commits the Iceberg transaction
+  (coldfront registers its callback after pg_duckdb, and PostgreSQL calls the
+  latest registered first). The async ordering is taken by appends alone: a
+  `DELETE`, `UPDATE` or `MERGE` references data files by path, which the model
+  does not represent, and takes the stock ordering so its scan and its commit
+  see one head. In the code, `coldfront._iceberg_async_active()` selects the
+  async ordering only when the build marker `coldfront.iceberg_bakery_patch` is
+  also on. With the flag alone, the writer takes the stock ordering and logs
+  the downgrade once per session, so the `Bakery_race.cfg` combination runs
+  only where the marker is set on a stock binary.
 - The bakery's min-ticket spin in
   [_claim_iceberg_lock](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/coldfront--1.0.sql).
 - The deferred release, in which pg_duckdb commits the Iceberg transaction at
   `XACT_EVENT_PRE_COMMIT` and coldfront's XactCallback `DELETE`s the claim at
   `XACT_EVENT_COMMIT`, so the commit always precedes the release whatever order
   the two callbacks were registered in. The model represents this as the
-  iceberg append at `Decide` followed by the claim `DELETE` at `Release`.
+  iceberg append at `Decide` followed by the claim `DELETE` at `Release`. The
+  async ordering's deferred claim, taken by the same callback at PRE_COMMIT,
+  rests on the registration order: coldfront's callback runs first, so the
+  claim is held when pg_duckdb's commit runs.
 - pg_duckdb's iceberg `ROLLBACK` on PG ABORT (no append on the rollback
   branch), which the `RollbackNoIceberg` property requires.
 
@@ -363,21 +418,20 @@ view.
 A partition-column `UPDATE` that crosses the cutoff is rewritten to
 `coldfront._cross_tier_move`, which relocates rows between tiers. Its hot-tier
 work is plain PostgreSQL (heap `INSERT`/`UPDATE`/`DELETE` - no Iceberg, no
-claim). Its cold-tier work is **one** `duckdb.raw_query` issued through the
-**unchanged** path: a single `DELETE`-set plus `INSERT`-set in one DuckDB
-MetaTransaction - one Iceberg snapshot, one conditional commit POST to
-Lakekeeper - under **one** `_claim_iceberg_lock` held to transaction end
-(released by the C `XactCallback`). The move is therefore the **same
-stock-ordering single claimant** the cold writer is: one conditional commit
-(identical parent-snapshot conflict shape to the append modeled at `Decide`)
-under the held claim. The move forces `iceberg_async_parquet = off`
-(`AsyncParquet = FALSE`, `Bakery.cfg`) - the `DELETE`+`INSERT` bundle is not
-pg_duckdb's single deferred POST that the async re-stamp patch wraps. Each move
-takes exactly **one** claim (a second claim on the same table would reap the
-first, which `_take_iceberg_claim` prevents by reusing the transaction's
-claim), so the move never holds two tickets. The move adds no new protocol
-primitive, so it is covered by the existing model and configs; no dedicated
-config is needed.
+claim). Its cold-tier work is **one** statement issued through the
+**unchanged** `_exec_iceberg_with_claim`: a single `DELETE`-set plus
+`INSERT`-set in one DuckDB MetaTransaction - one Iceberg snapshot, one
+conditional commit POST to Lakekeeper - under **one** claim held to
+transaction end (released by the C `XactCallback`). The move is therefore the
+**same stock-ordering single claimant** the cold writer is: one conditional
+commit (identical parent-snapshot conflict shape to the append modeled at
+`Decide`) under the held claim, which it takes before it reads the rows it
+relocates, since the bundle removes rows by key and re-adds the values read
+(`AsyncParquet = FALSE`, `Bakery.cfg`). Each move takes exactly **one** claim (a second
+claim on the same table would reap the first, which `_take_iceberg_claim`
+prevents by reusing the transaction's claim), so the move never holds two
+tickets. The move adds no new protocol primitive, so it is covered by the
+existing model and configs; no dedicated config is needed.
 
 ### Partition Detach Fan-Out
 
@@ -436,12 +490,13 @@ models are only as useful as their fidelity.
 
 `MaxTickets = 6, MaxIcebergLen = 5, |Writers| = 3` is the default bound
 (`MaxCrashes` is 1 in the crash configs and 0 elsewhere; the same-node configs
-use `MaxTickets = 3` with writers `{a1, a2, b1}`, and the adopt configs use
-`MaxTickets = 2` and `MaxIcebergLen = 4` with writers `{a1, b1}`). Every config
-checks in seconds on a modern laptop. `SYMMETRY` on `Writers` (up to a ~6×
-reduction at 3 writers) is per-config: the liveness configs (`Bakery_live.cfg`,
-`Bakery_fixed.cfg`) run without it (symmetry reduction is unsound with liveness
-checking), and the same-node configs run without it (`a1`/`a2`/`b1` are not
+and the single-node config use `MaxTickets = 3` with writers `{a1, a2, b1}`
+and `{a1, a2, a3}`, and the adopt configs use `MaxTickets = 2` and
+`MaxIcebergLen = 4` with writers `{a1, b1}`). Every config checks in seconds on
+a modern laptop. `SYMMETRY` on `Writers` (up to a ~6× reduction at 3 writers)
+is per-config: the liveness configs (`Bakery_live.cfg`, `Bakery_fixed.cfg`)
+run without it (symmetry reduction is unsound with liveness checking), and the
+same-node and single-node configs run without it (`a1`/`a2`/`b1` are not
 interchangeable under `NodeParts`), and so do the two adopt configs; the other
 configs declare it.
 

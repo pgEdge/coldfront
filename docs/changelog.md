@@ -80,6 +80,16 @@ this project adheres to
 
 ### Changed
 
+- Every append to the cold tier (`INSERT`, `COPY`, the archiver's exports, the
+  tiered `INSERT`'s cold sink) uses the async ordering wherever the patched
+  duckdb-iceberg is loaded, on a single node as on a mesh: the statement
+  uploads its Parquet, and the serializer (the bakery claim, or the node's
+  advisory lock) is taken at the transaction's commit, so it wraps only the
+  catalog commit and an open transaction blocks no other writer;
+  `statement_timeout` bounds the wait for it. A `DELETE`,
+  `UPDATE` or `MERGE`, the cross-tier move and `coldfront.vector_train` keep
+  the claim-first ordering on every build, since their position deletes name
+  the data files a concurrent compaction could rewrite.
 - The mesh bakery no longer needs the `dblink` extension. Claims, acks,
   releases and orphan reaping run over a libpq loopback connection that the
   extension opens from `coldfront.loopback_dsn`, which must name a unix socket.
