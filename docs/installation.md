@@ -129,6 +129,34 @@ authorization backend in `lakekeeper.env`, the catalog accepts every request,
 so configure authentication before you expose the service beyond a trusted
 network.
 
+### Configuring ColdFront
+
+ColdFront has no configuration file, because the database holds its
+configuration. The server settings are the `postgresql.conf` lines above, each
+managed table is a row in `coldfront.partition_config`, and the cold-store
+credential is in `coldfront.storage_secret`. The archiver, partitioner, and
+compactor connect the way psql does, from the libpq environment (`PGHOST`,
+`PGDATABASE`, `PGUSER`, `PGPASSWORD`, `PGSERVICE`) or `--dsn`, and read every
+other setting from the server.
+
+You write that configuration with `coldfront.set_storage_secret()` and the
+`register` command, or in one step by importing a deployment YAML:
+
+```bash
+archiver import --config deploy.yaml
+```
+
+The `pgedge-coldfront` package installs an example deployment YAML at
+`/etc/pgedge/coldfront/config.yaml`. That file is only an example to edit and
+pass to `import`, and no ColdFront tool reads it unless `--config` names it.
+After an import, the server holds the configuration. A later run that is given
+a YAML checks the file against the server and refuses to run if any value
+differs. The only value such a run takes from the file is `postgres.dsn`, which
+connects when `--dsn` is unset. The
+[Managing Partitioned Tables (CLI)](usage.md#managing-partitioned-tables-cli)
+section of the Using ColdFront guide describes `register`, `import`, and
+`export`.
+
 ## Building ColdFront from Source
 
 This section walks you through building ColdFront from source, either in

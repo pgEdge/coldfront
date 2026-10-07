@@ -119,6 +119,8 @@ else from the server: each table's lifecycle in `coldfront.partition_config`,
 the cold-store credential in `coldfront.storage_secret` and the catalog
 settings above. The `import` command takes a deployment YAML, modeled on
 [config.example.yaml](config.example.yaml), and writes it into the server once.
+ColdFront has no configuration file. A YAML passed to any later run is checked
+against the server, and the run takes only `postgres.dsn` from the file.
 For every setting, see the [One-Time Setup](docs/usage.md#one-time-setup) and
 [Tuning Knobs](docs/usage.md#tuning-knobs) sections of the Using ColdFront
 guide.
