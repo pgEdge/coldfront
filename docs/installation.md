@@ -126,8 +126,8 @@ prepare and start the service:
 
 Lakekeeper listens on port 8181 on every address by default. Without an
 authorization backend in `lakekeeper.env`, the catalog accepts every request,
-so configure authentication before you expose the service beyond a trusted
-network.
+so configure authentication and authorization before you expose the service
+beyond a trusted network.
 
 ### Configuring ColdFront
 
