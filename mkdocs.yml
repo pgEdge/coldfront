@@ -65,7 +65,7 @@ nav:
           - Exploring Decoupled Mode: walkthrough_decoupled.md
           - Exploring the Standalone Partitioner: walkthrough_partitioner.md
           - Exploring Distributed Mode: walkthrough_distributed.md
-      - Configuring your Object Store: object_store.md
+      - Configuring an S3 Bucket as your Object Store: object_store.md
 
   - Architecture:
       - pgEdge ColdFront - Architecture: architecture.md

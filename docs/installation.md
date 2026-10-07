@@ -425,5 +425,5 @@ To go further with ColdFront, consult the following guides:
 - The [Walkthrough](walkthrough.md) guide runs the demo stack hands-on.
 - The [Using ColdFront](usage.md) guide covers the one-time setup and both
   modes.
-- The [Configuring your Object Store](object_store.md) guide connects the cold
-  tier to AWS S3.
+- The [Configuring an S3 Bucket as your Object Store](object_store.md)
+  guide connects the cold tier to AWS S3.

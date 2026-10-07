@@ -1,4 +1,4 @@
-# Configuring your Object Store
+# Configuring an S3 Bucket as your Object Store
 
 This walkthrough guides you from an empty S3 bucket to a working
 ColdFront cold tier. You stand up the ColdFront stack - PostgreSQL and
