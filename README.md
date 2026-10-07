@@ -19,11 +19,11 @@ The ColdFront documentation consists of the following guides:
     - [Architecture Overview](docs/architecture.md)
     - [Tiered Mode](docs/architecture_tiered.md)
     - [Decoupled Mode](docs/architecture_decoupled.md)
-    - [Vector Storage](docs/architecture_vectors.md)
 - [Using ColdFront](docs/usage.md)
 - [Storing and Searching Embeddings](docs/usage_vectors.md)
 - [Compacting the Cold Tier](docs/compaction.md)
 - Developer Resources
+    - [Vector Storage](docs/architecture_vectors.md)
     - [Verifying the Bakery Protocol](docs/formal/README.md)
 - [Release Notes](docs/changelog.md)
 
