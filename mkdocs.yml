@@ -60,10 +60,11 @@ nav:
   - Installing ColdFront: installation.md
   - Getting Started:
       - Getting Started with ColdFront: walkthrough.md
-      - Exploring Tiered Storage: walkthrough_tiered.md
-      - Exploring Decoupled Mode: walkthrough_decoupled.md
-      - Exploring the Standalone Partitioner: walkthrough_partitioner.md
-      - Exploring Distributed Mode: walkthrough_distributed.md
+      - ColdFront Walkthroughs:
+          - Exploring Tiered Storage: walkthrough_tiered.md
+          - Exploring Decoupled Mode: walkthrough_decoupled.md
+          - Exploring the Standalone Partitioner: walkthrough_partitioner.md
+          - Exploring Distributed Mode: walkthrough_distributed.md
       - Configuring your Object Store: object_store.md
 
   - Architecture:

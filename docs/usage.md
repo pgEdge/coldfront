@@ -14,7 +14,7 @@ Once the table exists, **the SQL surface is identical**: `SELECT`, `INSERT`,
 `UPDATE`, `DELETE` all work normally against the relation name (e.g. `events`),
 except that a write touching the cold tier rejects `RETURNING`.
 
-## Prerequisites (Both Modes)
+## Configuring the Prerequisite Services
 
 The setup needs three services: PostgreSQL with the pg_duckdb and coldfront
 extensions, Lakekeeper, and any S3-compatible object store (SeaweedFS, MinIO,
@@ -445,7 +445,7 @@ Register each managed table in `coldfront.partition_config`:
                       #     standalone table - data preserved)
 ```
 
-### Operating It
+### Operating the Partitioner
 
 Schedule one pass per period or more often - a cron line, or a systemd
 `oneshot` service plus timer (systemd then reports a failed pass as a failed
@@ -842,7 +842,7 @@ Vending requires a Lakekeeper warehouse configured to vend credentials:
   `assume-role-arn` for a bucket-scoped IAM role, and an `external-id` on the
   warehouse credential that the role's trust policy also requires. The full
   warehouse and IAM-role setup is in
-  [object_store.md](object_store.md#3b-create-the-s3-warehouse).
+  [object_store.md](object_store.md#configuring-lakekeeper).
 - On Azure ADLS Gen2, the warehouse is an `adls` warehouse with `sas-enabled`
   (on by default). Lakekeeper vends a per-container SAS token; the warehouse
   credential can be a `shared-access-key`, `client-credentials`, or
