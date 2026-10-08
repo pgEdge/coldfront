@@ -159,8 +159,8 @@ To go further with ColdFront, consult the following guides:
   partition manager, supported types, and tuning.
 - The [Embeddings](usage_vectors.md) guide covers storing and searching
   embeddings through the pgvector interface.
-- The [Object Store Setup](object_store.md) guide takes you from an empty
-  bucket to a working cold tier on cloud S3.
+- The [Configuring your Object Store](object_store.md) guide takes you from an
+  empty bucket to a working cold tier on cloud S3.
 - The [Compaction](compaction.md) guide covers cold-tier maintenance:
   compaction, snapshot expiry, and orphan-file removal.
 - The [Architecture](architecture.md) overview explains the shared mechanics

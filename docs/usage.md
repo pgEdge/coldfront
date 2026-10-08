@@ -95,8 +95,11 @@ endpoint such as GCS's needs `p_use_ssl => true`, and AWS S3 omits the endpoint
 and sets `p_region` to the bucket's Region.
 
 The image writes the server settings ColdFront needs into `postgresql.conf`
-when it initializes a new data directory. A server built another way sets them
-itself, as [installation.md](installation.md#bare-metal-no-docker) shows:
+when it initializes a new data directory. A server installed from packages or
+built another way sets them itself, as the
+[package](installation.md#configuring-postgresql) and
+[bare-metal](installation.md#building-coldfront-on-bare-metal) sections of
+installation.md show:
 
 - `shared_preload_libraries = 'pg_duckdb,coldfront'` loads both extensions at
   server start. coldfront refuses to load any other way: `CREATE EXTENSION

@@ -1,13 +1,166 @@
-# Building ColdFront from Source
+# Installing and Configuring ColdFront
 
-This guide builds ColdFront from source, either in Docker on top of the
-published base image or on bare metal.
+This guide covers installing ColdFront from the published package or
+building it from source, and configuring it once installed.
 
-!!! note "Most users should install from packages"
+## Using a Package to Install ColdFront
 
-    See [Installation](https://github.com/pgEdge/ColdFront/blob/main/README.md#installation)
-    in the README. This document is the **build-from-source** workflow: build
-    the patched DuckDB-1.5.x stack yourself, in Docker or bare-metal.
+ColdFront's packages come from the pgEdge package repository. Before you
+install them, configure the repository by following the page for your platform
+in the Enterprise Postgres documentation:
+
+- For RHEL, Oracle Linux, AlmaLinux, and Rocky Linux, see
+  [Configuring the Repository on Enterprise Linux](https://docs.pgedge.com/enterprise/el/configure-repo/).
+- For Debian and Ubuntu, see
+  [Configuring the Repository on Debian and Ubuntu](https://docs.pgedge.com/enterprise/debian/configure-repo/).
+
+Those pages cover the platform prerequisites, disabling any PGDG repository,
+and creating the pgEdge repository.
+
+With the repository in place, install the ColdFront extension package for
+your PostgreSQL major version. It depends on the pgEdge PostgreSQL server,
+pg_duckdb, and ColdFront's DuckDB extensions, so the package manager installs
+those as well. The following table shows each package's purpose and its name
+on RHEL-family and Debian-family systems:
+
+| Package | RHEL, Rocky Linux, AlmaLinux | Ubuntu, Debian |
+|---|---|---|
+| ColdFront extension | `pgedge-coldfront_<pg_version>` | `pgedge-postgresql-<pg_version>-coldfront` |
+| ColdFront's DuckDB extensions | `pgedge-coldfront-duckdb-extensions` | `pgedge-coldfront-duckdb-extensions` |
+| pg_duckdb | `pgedge-pg-duckdb_<pg_version>` | `pgedge-postgresql-<pg_version>-pg-duckdb` |
+| ColdFront command-line tools (archiver, partitioner, compactor) | `pgedge-coldfront` | `pgedge-coldfront` |
+| Lakekeeper | `pgedge-lakekeeper` | `pgedge-lakekeeper` |
+
+For PostgreSQL 18 on RHEL, Rocky Linux, or AlmaLinux:
+
+```bash
+sudo dnf install -y pgedge-coldfront_18
+```
+
+On Ubuntu or Debian:
+
+```bash
+sudo apt update
+sudo apt install -y pgedge-postgresql-18-coldfront
+```
+
+The extension package does not install the command-line tools or Lakekeeper.
+Install `pgedge-coldfront` and `pgedge-lakekeeper` separately on the hosts
+that need them.
+
+### Configuring PostgreSQL
+
+A package installation does not configure PostgreSQL. Add the following
+settings to `postgresql.conf`, then restart PostgreSQL:
+
+```ini
+shared_preload_libraries = 'pg_duckdb,coldfront'
+duckdb.extension_directory = '/usr/lib/pgedge/coldfront/duckdb-extensions'
+duckdb.allow_unsigned_extensions = true
+duckdb.autoinstall_known_extensions = false
+coldfront.iceberg_async_parquet = on
+coldfront.iceberg_bakery_patch = on
+coldfront.warehouse = '<warehouse-name>'
+coldfront.lakekeeper_endpoint = 'http://<lakekeeper-host>:8181/catalog'
+coldfront.local_pg_dsn = 'host=/var/run/postgresql dbname=<db> user=<role>'
+```
+
+The three `duckdb.*` settings make pg_duckdb load ColdFront's patched DuckDB
+extensions from the directory where `pgedge-coldfront-duckdb-extensions`
+installs them. Without these settings, pg_duckdb downloads the unpatched
+upstream extensions, and concurrent cold writes can then fail with HTTP 409.
+The patched extensions are unsigned, so `duckdb.allow_unsigned_extensions` must
+be on. Keeping `duckdb.autoinstall_known_extensions` off stops DuckDB from
+downloading an unpatched upstream copy when an extension file is missing.
+
+The two `coldfront.iceberg_*` settings take effect only on a Spock mesh, where
+a node then uploads Parquet files outside the bakery claim and serializes only
+the catalog commit. The packaged duckdb-iceberg includes the patch that this
+ordering requires, and the
+[Distributed Setup](usage.md#distributed-setup-3-node-mesh-decoupled-mode)
+section of the Using ColdFront guide describes the mesh settings.
+
+The [One-Time Setup](usage.md#one-time-setup) section of the Using ColdFront
+guide describes the `coldfront.*` settings. Follow that section from the
+Lakekeeper bootstrap onward to create the warehouse, the extensions, and the
+cold-store credential.
+
+### Setting Up Lakekeeper
+
+The `pgedge-lakekeeper` package installs the `lakekeeper` binary and a
+`lakekeeper` systemd service, but it does not enable or start the service.
+Lakekeeper stores its catalog in a PostgreSQL 15 or later database and reads
+its settings from `/etc/lakekeeper/lakekeeper.env`. The following steps
+prepare and start the service:
+
+1. Create a role and a database for the catalog:
+
+    ```sql
+    CREATE ROLE lakekeeper LOGIN PASSWORD 'change-me';
+    CREATE DATABASE lakekeeper OWNER lakekeeper;
+    ```
+
+    The migration in step 3 creates the `uuid-ossp`, `pgcrypto`, `pg_trgm`,
+    `btree_gin`, and `btree_gist` extensions, so either the role must be
+    allowed to run `CREATE EXTENSION` or a superuser must create them first.
+
+2. In `/etc/lakekeeper/lakekeeper.env`, set
+    `LAKEKEEPER__PG_DATABASE_URL_WRITE` to the database's connection string and
+    `LAKEKEEPER__PG_ENCRYPTION_KEY` to a random secret, such as the output of
+    `openssl rand -base64 32`. Lakekeeper encrypts stored credentials with the
+    key, so keep the key stable and backed up. Every node that shares the
+    catalog needs the same key.
+
+3. Run the one-time database migration as the `lakekeeper` user:
+
+    ```bash
+    set -a; . /etc/lakekeeper/lakekeeper.env; set +a
+    sudo -E -u lakekeeper /usr/bin/lakekeeper migrate
+    ```
+
+4. Enable and start the service:
+
+    ```bash
+    sudo systemctl enable --now lakekeeper
+    ```
+
+Lakekeeper listens on port 8181 on every address by default. Without an
+authorization backend in `lakekeeper.env`, the catalog accepts every request,
+so configure authentication and authorization before you expose the service
+beyond a trusted network.
+
+### Configuring ColdFront
+
+ColdFront has no configuration file, because the database holds its
+configuration. The server settings are the `postgresql.conf` lines above, each
+managed table is a row in `coldfront.partition_config`, and the cold-store
+credential is in `coldfront.storage_secret`. The archiver, partitioner, and
+compactor connect the way psql does, from the libpq environment (`PGHOST`,
+`PGDATABASE`, `PGUSER`, `PGPASSWORD`, `PGSERVICE`) or `--dsn`, and read every
+other setting from the server.
+
+You write that configuration with `coldfront.set_storage_secret()` and the
+`register` command, or in one step by importing a deployment YAML:
+
+```bash
+archiver import --config deploy.yaml
+```
+
+The `pgedge-coldfront` package installs an example deployment YAML at
+`/etc/pgedge/coldfront/config.yaml`. That file is only an example to edit and
+pass to `import`, and no ColdFront tool reads it unless `--config` names it.
+After an import, the server holds the configuration. A later run that is given
+a YAML checks the file against the server and refuses to run if any value
+differs. The only value such a run takes from the file is `postgres.dsn`, which
+connects when `--dsn` is unset. The
+[Managing Partitioned Tables (CLI)](usage.md#managing-partitioned-tables-cli)
+section of the Using ColdFront guide describes `register`, `import`, and
+`export`.
+
+## Building ColdFront from Source
+
+This section walks you through building ColdFront from source, either in
+Docker on top of the published base image or on bare metal.
 
 ColdFront runs on a **DuckDB 1.5.x** stack: PostgreSQL + pg_duckdb (DuckDB
 1.5.4) and a **patched** duckdb-iceberg that includes ColdFront's five
@@ -20,7 +173,18 @@ a new table schema above the highest schema id. No released pg_duckdb tag
 includes DuckDB 1.5.x yet, so the stack is built from a pinned upstream PR plus
 ColdFront's patches - all from sources you can fetch.
 
-## What the Build Produces
+### Prerequisites
+
+The following table lists the prerequisites for each build path:
+
+| For | You need |
+|---|---|
+| Docker build (below) | Docker, network access (GitHub, ghcr.io, quay.io, curl.se, and the distribution's RPM repositories), a few GB of disk and RAM, and 30-60 minutes for the base compile. |
+| The archiver and partitioner (all paths) | Go 1.26.5+ (pinned in [go.mod](https://github.com/pgEdge/ColdFront/blob/main/go.mod)) and `make` (`make build` produces `./bin/archiver` and `./bin/partitioner`). |
+| The compactor and the CI gate | golangci-lint for `make compactor`; `./run-ci-local.sh` also needs Docker and mkdocs with mkdocs-material. |
+| Bare metal (near the end of this section) | `pg_config`, PostgreSQL server dev headers, libpq client headers and library (libpq-dev / libpq-devel), `make`, and `gcc`. |
+
+### What the Build Produces
 
 `docker/Dockerfile.duckdb15-base` is the recipe; it fetches the requirements,
 applies ColdFront's patches, and compiles a set of components. The following
@@ -65,7 +229,7 @@ canonical recipe - every source pin and compile step - is
 [`docker/Dockerfile.duckdb15-base`](https://github.com/pgEdge/ColdFront/blob/main/docker/Dockerfile.duckdb15-base)
 itself.
 
-## Build the Image (Docker)
+## Building the Image on Docker
 
 Build the stack in two stages, the prebuilt base and the thin app layer:
 
@@ -118,7 +282,7 @@ ColdFront guide: bootstrap Lakekeeper, create a table, tier it, and verify.
     need pull access to that image (or substitute an equivalent PostgreSQL base
     with the same layout).
 
-### Image Environment Variables
+### Using Environment Variables
 
 The entrypoint reads the following variables when the container starts. It
 writes the server settings they control into `postgresql.conf` only when the
@@ -141,7 +305,7 @@ describes each variable:
 The image is built for development and testing: `pg_hba.conf` trusts every
 connection from any address without a password.
 
-## Verify the Build
+### Verifying the Build
 
 A self-contained smoke test confirms the freshly built stack works end to end:
 pg_duckdb, the patched duckdb-iceberg, Lakekeeper, and the object store. The
@@ -198,18 +362,7 @@ cloud store, drop the `local-store` profile, point the warehouse at your own
 bucket, and follow the [One-Time Setup](usage.md#one-time-setup) section of the
 Using ColdFront guide for the full tier-and-verify journey.
 
-## Build Prerequisites
-
-The following table lists the prerequisites for each build path:
-
-| For | You need |
-|---|---|
-| Docker build (above) | Docker, network access (GitHub, ghcr.io, quay.io, curl.se, and the distribution's RPM repositories), a few GB of disk and RAM, and 30-60 minutes for the base compile. |
-| The archiver and partitioner (all paths) | Go 1.26.5+ (pinned in [go.mod](https://github.com/pgEdge/ColdFront/blob/main/go.mod)) and `make` (`make build` produces `./bin/archiver` and `./bin/partitioner`). |
-| The compactor and the CI gate | golangci-lint for `make compactor`; `./run-ci-local.sh` also needs Docker and mkdocs with mkdocs-material. |
-| Bare metal (below) | `pg_config`, PostgreSQL server dev headers, libpq client headers and library (libpq-dev / libpq-devel), `make`, and `gcc`. |
-
-## Bare Metal (No Docker)
+## Building ColdFront on Bare Metal
 
 The coldfront extension is a standard PGXS C extension:
 
@@ -312,5 +465,5 @@ To go further with ColdFront, consult the following guides:
 - The [Walkthrough](walkthrough.md) guide runs the demo stack hands-on.
 - The [Using ColdFront](usage.md) guide covers the one-time setup and both
   modes.
-- The [Object Store Setup](object_store.md) guide connects the cold tier to AWS
-  S3.
+- The [Configuring your Object Store](object_store.md) guide connects the cold
+  tier to AWS S3.
