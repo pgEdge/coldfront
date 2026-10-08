@@ -57,27 +57,37 @@ repo_url: https://github.com/pgEdge/ColdFront
 
 nav:
   - pgEdge ColdFront: index.md
-  - Installing and Configuring ColdFront: installation.md
-  - Getting Started:
-      - Getting Started with ColdFront: walkthrough.md
+
+  - Architecture Guides:
+      - pgEdge ColdFront - Architecture: architecture.md
+      - Tiered Operating Mode: architecture_tiered.md
+      - Decoupled (Iceberg-Only) Operating Mode: architecture_decoupled.md
+      - Vector Storage Architecture: architecture_vectors.md
+
+  - Getting Started/Quick Start: walkthrough.md
+  - Installing ColdFront: installation.md
+  - Configuring this Project:
+      - Configuring ColdFront: configuration.md
+      - Advanced Configuration - Configuring your Object Store: object_store.md
+
+  - Exploring ColdFront:
       - Exploring Tiered Storage: walkthrough_tiered.md
       - Exploring Decoupled Mode: walkthrough_decoupled.md
       - Exploring the Standalone Partitioner: walkthrough_partitioner.md
       - Exploring Distributed Mode: walkthrough_distributed.md
-      - Configuring your Object Store: object_store.md
 
-  - Architecture:
-      - pgEdge ColdFront - Architecture: architecture.md
-      - ColdFront - Tiered Operating Mode: architecture_tiered.md
-      - Decoupled (Iceberg-Only) Operating Mode: architecture_decoupled.md
-      - Vector Storage Architecture: architecture_vectors.md
+  - Using the Project:
+      - Project Usage Instructions:
+          - Using ColdFront: usage.md
+          - Working with Embeddings: usage_vectors.md
 
-  - Using ColdFront: usage.md
-  - Working with Embeddings: usage_vectors.md
-  - COMPACTOR - Cold-Tier Table Maintenance: compaction.md
+  - Using Project Management Features:
+      - Performance - COMPACTOR - Cold-Tier Table Maintenance: compaction.md
 
   - Developer Resources:
       - Formal Model - ColdFront Decoupled-Mode Bakery (TLA+/PlusCal): formal/README.md
 
-  - Changelog: changelog.md
+  - Release Notes - Changelog: changelog.md
   - License: LICENSE.md
+
+  - Source: source.md

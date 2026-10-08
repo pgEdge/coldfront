@@ -1,4 +1,4 @@
-# ColdFront - Tiered Operating Mode
+# Tiered Operating Mode
 
 Tiered mode keeps recent rows in the PostgreSQL heap and archives older rows to
 Apache Iceberg, presenting both as one table through a `UNION ALL` view. An

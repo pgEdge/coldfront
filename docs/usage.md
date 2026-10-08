@@ -97,7 +97,7 @@ and sets `p_region` to the bucket's Region.
 The image writes the server settings ColdFront needs into `postgresql.conf`
 when it initializes a new data directory. A server installed from packages or
 built another way sets them itself, as the
-[package](installation.md#configuring-postgresql) and
+[package](configuration.md#configuring-postgresql) and
 [bare-metal](installation.md#building-coldfront-on-bare-metal) sections of
 installation.md show:
 
