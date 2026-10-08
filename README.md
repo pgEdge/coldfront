@@ -66,27 +66,39 @@ ColdFront runs inside PostgreSQL and rewrites each statement to the correct
 tier, so the application sees one relation:
 
 ```text
-                       Application
-                            │
-              SELECT / INSERT / UPDATE / DELETE
-              against one relation: "events"
-                            │
-                 PostgreSQL 16 / 17 / 18
-           events VIEW: reads union hot + cold
-       coldfront extension: routes writes by tier
-              ┌─────────────┴───────────────┐
-              │                             │
-          hot tier                      cold tier
-      _events: native PostgreSQL    pg_duckdb: in-process DuckDB
-      range partitions              Iceberg reads + writes
-              │                             │
-              │                     Lakekeeper (Iceberg REST catalog)
-              │                             │
-              │                     object store, S3 / Azure / GCS
-              │                     (Parquet data + Iceberg metadata)
-              │                             ▲
-              └──── Archiver (Go, cron) ────┘
-                    moves partitions past the hot window: hot → cold
+                            Application
+                                │
+                SELECT / INSERT / UPDATE / DELETE
+                    on one relation: "events"
+                                │
+   ┌────────────────────────────▼─────────────────────────────┐
+   │                 PostgreSQL 16 / 17 / 18                  │
+   │                                                          │
+   │  events view: reads return hot + cold rows               │
+   │  coldfront extension: routes writes by tier.             │
+   └───────────┬─────────────────────────────────┬────────────┘
+               │                                 │
+           HOT TIER                          COLD TIER
+    recent rows, local disk         older rows, object storage
+               │                                 │
+    ┌──────────▼───────────┐        ┌────────────▼────────────┐
+    │ _events              │        │ pg_duckdb               │
+    │ native PostgreSQL    │        │ in-process DuckDB       │
+    │ range partitions     │        │ Iceberg reads + writes  │
+    └──────────┬───────────┘        └────────────┬────────────┘
+               │                                 │
+               │                     ┌───────────▼─────────────┐
+               │                     │ Lakekeeper              │
+               │                     │ Iceberg REST catalog    │
+               │                     └───────────┬─────────────┘
+               │                                 │ 
+               │                                 │
+               │                     ┌───────────▼─────────────────────┐
+               │                     │ Object store, S3 / Azure / GCS  │
+               │                     │                                 │
+               └── Archiver (Go) ───▶│(Parquet data + Iceberg metadata)│
+                                     └─────────────────────────────────┘
+                   cron job: moves partitions out of the hot window: hot -> cold
 ```
 
 ## Installation
