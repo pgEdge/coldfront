@@ -595,8 +595,8 @@ To go further with ColdFront, consult the following guides:
 
 - The [Decoupled Mode Demo](walkthrough_decoupled.md) stores a table in Iceberg
   from the first row and adopts a table that another engine wrote.
-- The [Configuring your Object Store](object_store.md) guide takes you from an
-  empty bucket to a working cold tier on AWS S3.
+- The [Configuring your Object Store](object_store.md)
+  guide takes you from an empty bucket to a working cold tier on AWS S3.
 - The [Architecture](architecture.md) overview explains the shared mechanics
   and links to the per-mode deep dives.
 - The [Tearing Down the Stack](walkthrough.md#tearing-down-the-stack) section
