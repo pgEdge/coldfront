@@ -64,6 +64,20 @@ COMMIT;
 INSERT INTO public._cf_order VALUES (20, '2026-05-01', 'hot');
 UPDATE public.cf_order SET ts = '2026-01-05' WHERE id = 20;
 
+-- (6) The cold stream: a tiered INSERT whose source streams is one DuckDB
+--     write in the statement, and the claim at COMMIT meets the lock. The
+--     stream's second session connects to the regress database.
+SELECT set_config('coldfront.local_pg_dsn',
+                  format('host=%s dbname=%s user=%s',
+                         trim(split_part(current_setting('unix_socket_directories'), ',', 1)),
+                         current_database(), current_user), false) <> '' AS dsn_set;
+CREATE TABLE public.cf_order_src (id int, ts timestamptz, status text);
+INSERT INTO public.cf_order_src VALUES (30, '2026-01-06', 'stream'), (31, '2026-01-07', 'stream');
+BEGIN;
+INSERT INTO public.cf_order (id, ts, status) SELECT id, ts, status FROM public.cf_order_src;
+COMMIT;
+DROP TABLE public.cf_order_src;
+
 -- Cleanup.
 SELECT coldfront._loopback('SELECT pg_advisory_unlock_all()') IS NOT NULL AS lock_released;
 DELETE FROM coldfront.tiered_views;
@@ -75,3 +89,4 @@ RESET lock_timeout;
 RESET coldfront.iceberg_async_parquet;
 RESET coldfront.iceberg_bakery_patch;
 RESET coldfront.loopback_dsn;
+RESET coldfront.local_pg_dsn;

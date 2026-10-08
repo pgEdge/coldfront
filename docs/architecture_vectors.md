@@ -203,7 +203,8 @@ that do so, where each one lives, and its shape:
 | Path | Where | Shape |
 |---|---|---|
 | bulk archive | the Iceberg INSERT in `cmd/archiver`, not the staging SELECT | set-based |
-| tiered INSERT, cold half | `coldfront._cold_row_literal`, through the `coldfront._cold_sink` aggregate | per row |
+| tiered INSERT, cold half | `coldfront._tiered_cold_stream`, leading its one DuckDB INSERT | set-based |
+| tiered INSERT, cold half through the sink | `coldfront._cold_row_literal`, through the `coldfront._cold_sink` aggregate | per row |
 | cross-tier move | `coldfront._move_row_literal` | per row |
 | replay drain | `coldfront.replay_archive_delta` | set-based |
 | decoupled INSERT | the C rewrite | per statement |
@@ -518,7 +519,8 @@ The following are properties of the code as it stands, not plans:
 
 - `coldfront._cold_sink` writes unsorted: it appends rows in the order the
   statement delivers them and would need buffering to sort. It is the cold
-  half of every tiered `INSERT`.
+  half of a tiered `INSERT` whose source cannot stream; the stream orders its
+  write by the cluster.
 - The replay drain (`coldfront.replay_archive_delta`) and the cross-tier move
   also write without ordering by cluster.
 

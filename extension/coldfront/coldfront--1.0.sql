@@ -422,6 +422,31 @@ END;
 -- non-superuser. search_path pinned per SECURITY DEFINER hardening.
 $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp;
 
+-- ensure_stream_attached() attaches the local instance a second time, as
+-- `pgstream`, for the tiered INSERT's cold stream (coldfront._tiered_cold_stream).
+-- pglocal runs REPEATABLE READ, which DuckDB's postgres extension needs to
+-- give a parallel table scan one snapshot, and that pins the first read's
+-- snapshot for the rest of the DuckDB transaction; the stream wants each
+-- statement to read what its hot half read, so its attachment runs READ
+-- COMMITTED, and a stream is one connection with no parallel scan to keep
+-- consistent. The stream's query draws identity values and defaults in that
+-- session, so unlike pglocal's uses it writes: nextval() on the hot table's
+-- sequences. application_name tags the session and keeps the connection
+-- string distinct from pglocal's.
+CREATE OR REPLACE FUNCTION coldfront.ensure_stream_attached() RETURNS void AS $$
+DECLARE
+  dsn text := current_setting('coldfront.local_pg_dsn', true);
+BEGIN
+  IF dsn IS NOT NULL AND dsn <> '' THEN
+    PERFORM duckdb.raw_query('LOAD postgres');
+    PERFORM duckdb.raw_query(format(
+      'ATTACH IF NOT EXISTS %L AS pgstream (TYPE postgres, isolation_level ''READ COMMITTED'')',
+      dsn || ' application_name=coldfront_pgstream'
+    ));
+  END IF;
+END;
+$$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp;
+
 -- coldfront._hot_only: the per-row guard a hot MERGE's INSERT action gets on its
 -- partition-column value. The hot MERGE runs in PostgreSQL against the hot table
 -- alone, so a row below the cutoff, which belongs in Iceberg, is refused rather
@@ -498,8 +523,10 @@ BEGIN
     SELECT p.oid::regprocedure AS sig
     FROM pg_proc p
     WHERE p.pronamespace = 'coldfront'::regnamespace
-      AND p.proname IN ('ensure_attached', 'ensure_pg_attached',
+      AND p.proname IN ('ensure_attached', 'ensure_pg_attached', 'ensure_stream_attached',
                         '_exec_iceberg_with_claim',
+                        -- the tiered INSERT's cold stream and its execution-time check
+                        '_tiered_cold_stream', '_written_in_xact',
                         -- the tiered INSERT's cold sink and its row renderer
                         '_cold_sink', '_cold_sink_step', '_cold_sink_flush',
                         '_cold_sink_final', '_cold_row_literal',
@@ -897,7 +924,10 @@ END;
 $$;
 
 -- ============================================================================
--- The cold sink: the cold half of a tiered-view INSERT.
+-- The cold sink: the cold half of a tiered-view INSERT whose source the hook
+-- cannot read a second time from another session (emit_tiered_insert in
+-- coldfront.c lists the conditions), and the in-session fallback of the cold
+-- stream below.
 --
 -- The C hook rewrites INSERT INTO <tiered view> ... into one statement that
 -- holds the source in a MATERIALIZED CTE, inserts the hot rows into the hot
@@ -1053,6 +1083,83 @@ CREATE AGGREGATE coldfront._cold_sink(text, text, jsonb) (
     STYPE     = coldfront._cold_sink_state,
     FINALFUNC = coldfront._cold_sink_final
 );
+
+-- coldfront._written_in_xact: whether this transaction has written any of
+-- these tables, or a partition of one, read from the backend's statistics
+-- for the live transaction alone (coldfront.c). The cold stream reads its
+-- source from another session, which cannot see such rows; the hook asks
+-- before it emits the stream, and _tiered_cold_stream asks again at
+-- execution, since a cached plan runs in transactions the hook never saw.
+-- Without track_counts the answer is unknown, which counts as written.
+CREATE FUNCTION coldfront._written_in_xact(p_rels regclass[]) RETURNS boolean
+LANGUAGE c AS 'coldfront', 'coldfront_written_in_xact';
+
+-- coldfront._tiered_cold_stream: the cold half of a tiered-view INSERT whose
+-- source the hook proved safe to read from another session (emit_tiered_insert
+-- in coldfront.c). p_pg_sql is that read: the cold projection, every hot-table
+-- column with the identity values and defaults an INSERT would give, over the
+-- source below the cutoff, fully qualified. It runs in the pgstream session
+-- and its rows go straight into the Iceberg writer: INSERT INTO <ice> SELECT
+-- ... FROM postgres_query('pgstream', <p_pg_sql>), one DuckDB statement
+-- through _exec_iceberg_with_claim, led by the cluster assignment on a
+-- clustered table and ordered by it so this write's row groups each hold
+-- roughly one cluster. p_any_cold is false when the source has no cold row,
+-- and nothing runs: an all-hot INSERT stages nothing and takes no claim.
+-- p_sources are the tables the source reads. A cached plan runs in
+-- transactions the hook never saw, so two of its conditions are checked again
+-- here: when the transaction is not READ COMMITTED, or has written a source
+-- table, the other session's snapshot would not match the hot half's, so the
+-- same read runs in this session and its rows go through the cold sink.
+-- Returns the cold row count where this session counted it, 0 with no cold
+-- row and the sink's count after the fallback, and NULL when the rows
+-- streamed, since DuckDB keeps that count.
+CREATE FUNCTION coldfront._tiered_cold_stream(
+    p_schema text, p_view text, p_pg_sql text, p_sources regclass[], p_any_cold boolean
+) RETURNS bigint
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_hot     text;
+    v_iceberg text;
+    v_cols    text;
+    v_prefix  text;
+    v_count   bigint;
+BEGIN
+    IF NOT p_any_cold THEN
+        RETURN 0;
+    END IF;
+    IF current_setting('transaction_isolation') <> 'read committed'
+       OR coldfront._written_in_xact(p_sources) THEN
+        EXECUTE format('SELECT coldfront._cold_sink(%L, %L, to_jsonb(r)) FROM (%s) AS r',
+                       p_schema, p_view, p_pg_sql) INTO v_count;
+        RETURN v_count;
+    END IF;
+    SELECT tv.hot_table, tv.iceberg_table INTO v_hot, v_iceberg
+      FROM coldfront.tiered_views tv
+     WHERE tv.schema_name = p_schema AND tv.relname = p_view
+       AND NOT tv.is_iceberg_only;
+    IF v_iceberg IS NULL THEN
+        RAISE EXCEPTION 'coldfront._tiered_cold_stream: view %.% is not a registered tiered view',
+            p_schema, p_view;
+    END IF;
+    SELECT string_agg('s.' || quote_ident(a.attname), ', ' ORDER BY a.attnum) INTO v_cols
+      FROM pg_attribute a
+      JOIN pg_class c     ON c.oid = a.attrelid
+      JOIN pg_namespace n ON n.oid = c.relnamespace
+     WHERE n.nspname = (parse_ident(v_hot))[1]
+       AND c.relname = (parse_ident(v_hot))[2]
+       AND a.attnum > 0 AND NOT a.attisdropped
+       AND NOT coldfront._is_vec_companion(a.attname, a.attgenerated);
+    v_prefix := COALESCE(coldfront._vec_list_prefix_for_ref(v_iceberg, 's.'), '');
+    SET LOCAL duckdb.unsafe_allow_mixed_transactions = on;
+    PERFORM coldfront.ensure_attached();
+    PERFORM coldfront.ensure_stream_attached();
+    PERFORM coldfront._exec_iceberg_with_claim(v_iceberg, format(
+        'INSERT INTO %s SELECT %s%s FROM postgres_query(%L, %L) AS s%s',
+        v_iceberg, v_prefix, v_cols, 'pgstream', p_pg_sql,
+        CASE WHEN v_prefix <> '' THEN ' ORDER BY 1' ELSE '' END));
+    RETURN NULL;
+END;
+$$;
 
 -- coldfront._cross_tier_move: execute a partition-column UPDATE that crosses the
 -- hot/cold cutoff, relocating the matched rows between tiers. The C post-parse-

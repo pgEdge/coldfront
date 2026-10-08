@@ -80,6 +80,14 @@ this project adheres to
 
 ### Changed
 
+- A tiered `INSERT` streams its cold rows: the cold projection, identity values
+  and defaults included, runs in PostgreSQL in a second session and its rows go
+  straight into the Iceberg writer in one pass, with nothing rendered per row.
+  A source the hook cannot read a second time (a volatile or stable function, a
+  temporary table, a `WITH` entry, a table the transaction has written, a
+  transaction that is not READ COMMITTED) is read once for both tiers and its
+  cold rows go through `coldfront._cold_sink`. `cold_rows` in the statement's
+  result is `NULL` for a streamed `INSERT`.
 - Every append to the cold tier (`INSERT`, `COPY`, the archiver's exports, the
   tiered `INSERT`'s cold sink) uses the async ordering wherever the patched
   duckdb-iceberg is loaded, on a single node as on a mesh: the statement
@@ -204,9 +212,11 @@ this project adheres to
   rows differed between the two runs landed some rows in both tiers and others
   in neither, and when the hot table had no identity column, or the statement
   supplied one, a source table written earlier in the same transaction lost
-  its cold rows, with no error either way. The source now runs once and both
-  tiers read that result; an untyped literal in the source keeps the target
-  column's type, and `OVERRIDING SYSTEM VALUE` works.
+  its cold rows, with no error either way. Such a source now runs once and
+  both tiers read that result; a source is read a second time, by the cold
+  stream, only where the hook proves the second read sees the same rows. An
+  untyped literal in the source keeps the target column's type, and
+  `OVERRIDING SYSTEM VALUE` works.
 - On PostgreSQL 17 and 18, a transaction block in which a statement had failed
   could not be ended in a database with the extension: `ROLLBACK`, `COMMIT`
   and `ROLLBACK TO SAVEPOINT` failed with "ResourceOwnerEnlarge called after

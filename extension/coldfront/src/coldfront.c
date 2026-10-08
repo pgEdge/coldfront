@@ -55,6 +55,7 @@
 #include "catalog/pg_authid.h"
 #include "catalog/pg_class.h"
 #include "catalog/pg_collation.h"
+#include "catalog/pg_inherits.h"
 #include "catalog/pg_namespace.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type_d.h"
@@ -70,18 +71,22 @@
 #include "nodes/params.h"
 #include "nodes/pg_list.h"
 #include "miscadmin.h"
+#include "pgstat.h"
+#include "utils/pgstat_internal.h"
 #include "optimizer/optimizer.h"
 #include "optimizer/planner.h"
 #include "parser/analyze.h"
 #include "parser/parse_func.h"
 #include "parser/parse_type.h"
 #include "parser/parsetree.h"
+#include "rewrite/rewriteHandler.h"
 #include "storage/fd.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
 #include "tcop/tcopprot.h"
 #include "tcop/utility.h"
 #include "utils/acl.h"
+#include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/guc.h"
@@ -306,6 +311,7 @@ typedef struct {
 
 static char *insert_targetlist_collist(Query *query);
 static const char *skip_leading_collist(const char *rest);
+static const char *skip_override_clause(const char *rest, OverridingKind override);
 static char *rewrite_merge_inserts(const char *sql, Query *query,
                                    TieredViewInfo *info, bool cold);
 static char *build_iceberg_only_insert_with_cluster(Query *query,
@@ -1509,10 +1515,12 @@ build_cold_dml(DeparseResult *dr, TieredViewInfo *info, Query *query)
  * real[] (a vector column's view type) -> CAST(%P$L AS FLOAT[]) /
  * translate($K::text,'{}','[]'); any other array -> %P$s /
  * coldfront._render_cold_param($K); json/jsonb/interval -> %P$L / $K::text;
- * else %P$L / $K.
+ * else %P$L / $K. With for_pg the string is the tiered stream's read, which
+ * PostgreSQL runs: every value is %P$L / $K, a literal its own input reads
+ * back, coerced by the projection's casts.
  */
 static char *
-cold_sql_arg(const char *cold_dml, ColdParamSet *ps)
+cold_sql_arg(const char *cold_dml, ColdParamSet *ps, bool for_pg)
 {
     StringInfoData tmpl, args, out;
     const char    *p = cold_dml;
@@ -1560,7 +1568,9 @@ cold_sql_arg(const char *cold_dml, ColdParamSet *ps)
                 if (pos_of_id[id - 1] == 0)         /* first sight: assign pos + arg */
                 {
                     pos_of_id[id - 1] = next_pos++;
-                    if (t == BYTEAOID)
+                    if (for_pg)
+                        appendStringInfo(&args, ", $%d", id);
+                    else if (t == BYTEAOID)
                         /* hex string, independent of the caller's bytea_output;
                          * from_hex rebuilds the exact bytes. */
                         appendStringInfo(&args, ", encode($%d,'hex')", id);
@@ -1580,7 +1590,9 @@ cold_sql_arg(const char *cold_dml, ColdParamSet *ps)
                     else
                         appendStringInfo(&args, ", $%d", id);
                 }
-                if (t == BYTEAOID)
+                if (for_pg)
+                    appendStringInfo(&tmpl, "%%%d$L", pos_of_id[id - 1]);
+                else if (t == BYTEAOID)
                     appendStringInfo(&tmpl, "from_hex(%%%d$L)", pos_of_id[id - 1]);
                 else if (t == FLOAT4ARRAYOID)
                     appendStringInfo(&tmpl, "CAST(%%%d$L AS FLOAT[])", pos_of_id[id - 1]);
@@ -1635,13 +1647,13 @@ cold_exec_call(const char *iceberg_table, const char *arg_sql)
  * full rationale on the table in coldfront--1.0.sql.
  */
 static char *
-cold_anchor_update(const char *cold_call_expr)
+cold_anchor_update(const char *cold_call_expr, const char *test)
 {
     StringInfoData buf;
     initStringInfo(&buf);
     appendStringInfo(&buf,
-        "UPDATE coldfront._dummy_dml_target SET anchor = anchor WHERE %s IS NULL",
-        cold_call_expr);
+        "UPDATE coldfront._dummy_dml_target SET anchor = anchor WHERE %s %s",
+        cold_call_expr, test);
     return buf.data;
 }
 
@@ -1886,12 +1898,12 @@ emit_cold(Query *query, TieredViewInfo *info, ColdParamSet *ps, bool in_plpgsql)
      * them; it self-selects the R-A bakery (multi-node mesh) or a local
      * advisory lock (vanilla single-node), so this is correct in every
      * deployment. (Tiered INSERT uses a separate path, emit_tiered_insert.) */
-    call = cold_exec_call(info->iceberg_table, cold_sql_arg(cold_dml, ps));
+    call = cold_exec_call(info->iceberg_table, cold_sql_arg(cold_dml, ps, false));
 
     /* Cause 2: inside plpgsql the statement must be a DML (cold_anchor_update);
      * at top level keep the byte-identical SELECT shape. */
     if (in_plpgsql)
-        return cold_anchor_update(call);
+        return cold_anchor_update(call, "IS NULL");
     {
         StringInfoData buf;
         initStringInfo(&buf);
@@ -1926,7 +1938,7 @@ emit_dual(Query *query, TieredViewInfo *info, ColdParamSet *ps, bool in_plpgsql)
     deparse_and_find_prefix(query, &dr);
     hot_dml  = build_hot_dml(&dr, info);
     cold_dml = build_cold_dml(&dr, info, query);
-    call     = cold_exec_call(info->iceberg_table, cold_sql_arg(cold_dml, ps));
+    call     = cold_exec_call(info->iceberg_table, cold_sql_arg(cold_dml, ps, false));
 
     initStringInfo(&buf);
     if (in_plpgsql)
@@ -1940,7 +1952,7 @@ emit_dual(Query *query, TieredViewInfo *info, ColdParamSet *ps, bool in_plpgsql)
          * no rows. */
         append_with_opener(&buf, &dr);
         appendStringInfo(&buf, "coldfront_cold AS (%s) %s%s %s%s",
-                         cold_anchor_update(call), dr.verb, info->hot_table,
+                         cold_anchor_update(call, "IS NULL"), dr.verb, info->hot_table,
                          dr.alias, dr.rest);
     }
     else
@@ -2320,16 +2332,35 @@ build_src_cte(Query *query, const char *source, const char *col_list,
 }
 
 /*
- * The cold rows' projection: every hot-table column in attnum order, named,
- * so to_jsonb() of the row is what the sink renders. A target column is the
- * source's value; an omitted identity column (or any identity column under
- * OVERRIDING USER VALUE) takes the next value of its sequence, which the hot
- * INSERT shares; an omitted column with a DEFAULT takes that expression,
- * evaluated by PostgreSQL per row as a hot INSERT would; any other omitted
- * column is NULL.
+ * The PostgreSQL type a streamed column is sent as, one DuckDB's postgres
+ * extension maps to the Iceberg column's type. A vector is unknown to it and
+ * would arrive as text, so it goes as real[]; jsonb, json and interval are
+ * stored as VARCHAR and go as their text, the form the sink stores too.
+ */
+static const char *
+cf_stream_cast(const char *type)
+{
+    if (strncmp(type, "vector", 6) == 0 || strncmp(type, "halfvec", 7) == 0)
+        return "::real[]";
+    if (strcmp(type, "jsonb") == 0 || strcmp(type, "json") == 0 ||
+        strcmp(type, "interval") == 0)
+        return "::text";
+    return "";
+}
+
+/*
+ * The cold rows' projection: every hot-table column in attnum order, named.
+ * A target column is the source's value; an omitted identity column (or any
+ * identity column under OVERRIDING USER VALUE) takes the next value of its
+ * sequence, which the hot INSERT shares; an omitted column with a DEFAULT
+ * takes that expression, evaluated by PostgreSQL per row as a hot INSERT
+ * would; any other omitted column is NULL. For the sink the rows come from
+ * the materialized source, already cast, and to_jsonb() of the row is what it
+ * renders; for the stream they come from the source itself, so each is cast
+ * to its hot type and then to the type it is sent as (cf_stream_cast).
  */
 static char *
-build_cold_projection(Query *query, const HotColumns *hc)
+build_cold_projection(Query *query, const HotColumns *hc, bool stream)
 {
     StringInfoData sel;
     List          *targeted = NIL;
@@ -2346,12 +2377,16 @@ build_cold_projection(Query *query, const HotColumns *hc)
     initStringInfo(&sel);
     for (i = 0; i < hc->n; i++)
     {
-        bool  in_target = name_in_list(targeted, hc->name[i]);
-        char *expr;
+        bool        in_target = name_in_list(targeted, hc->name[i]);
+        const char *cast = stream ? cf_stream_cast(hc->type[i]) : "";
+        char       *expr;
 
         if (hc->seq[i] != NULL &&
             (!in_target || query->override == OVERRIDING_USER_VALUE))
             expr = psprintf("nextval(%s::regclass)", quote_literal_cstr(hc->seq[i]));
+        else if (in_target && stream)
+            expr = psprintf("coldfront_src.%s::%s", quote_identifier(hc->name[i]),
+                            hc->type[i]);
         else if (in_target)
             expr = psprintf("coldfront_source.%s", quote_identifier(hc->name[i]));
         else if (hc->dflt[i] != NULL)
@@ -2364,6 +2399,8 @@ build_cold_projection(Query *query, const HotColumns *hc)
         if (pg_str_endswith(hc->type[i], "[]"))
             expr = psprintf("coldfront._cold_list(%s, %s)", expr,
                             quote_literal_cstr(hc->name[i]));
+        if (cast[0] != '\0')
+            expr = psprintf("(%s)%s", expr, cast);
         appendStringInfo(&sel, "%s%s AS %s", i > 0 ? ", " : "", expr,
                          quote_identifier(hc->name[i]));
     }
@@ -2371,19 +2408,272 @@ build_cold_projection(Query *query, const HotColumns *hc)
 }
 
 /* The hot half: a set-based INSERT into the hot table of the source rows at or
- * above the cutoff. */
+ * above the cutoff, read from the sink shape's materialized source or, in the
+ * stream shape, from the source itself (select_list, from_clause). */
 static char *
 build_tiered_hot_dml(const char *hot_table, const char *col_list,
-                     const char *override, const char *partition_col,
+                     const char *override, const char *select_list,
+                     const char *from_clause, const char *pc_expr,
                      const char *cutoff_lit)
 {
-    return psprintf("INSERT INTO %s (%s) %sSELECT %s FROM coldfront_source WHERE %s >= %s",
-                    hot_table, col_list, override, col_list,
-                    quote_identifier(partition_col), cutoff_lit);
+    return psprintf("INSERT INTO %s (%s) %sSELECT %s %s WHERE %s >= %s",
+                    hot_table, col_list, override, select_list, from_clause,
+                    pc_expr, cutoff_lit);
 }
 
-/* The cold half: coldfront._cold_sink over the source rows below the cutoff,
- * each projected to every hot-table column (build_cold_projection). */
+/*
+ * Whether a tiered INSERT's cold half can stream, and the tables its source
+ * reads. The stream reads the source again from another session over libpq
+ * (coldfront._tiered_cold_stream), so it is sound only when that session sees
+ * what the hot half saw: coldfront.local_pg_dsn names it; the transaction is
+ * READ COMMITTED, so the hot half's snapshot is the statement's and not an
+ * older one; the source has no WITH entry; every function in it is IMMUTABLE,
+ * since a volatile one yields other rows and a stable one (now(), the
+ * timezone-dependent timestamptz arithmetic, a text-to-timestamptz cast) may
+ * yield other values in a session with other settings; it reads no temporary
+ * table, no view that reads one or calls such a function, nothing but tables;
+ * and this transaction has written none of those tables. Anything else goes
+ * to the sink shape, which reads the source once for both halves.
+ */
+typedef struct {
+    Oid   result_relid;   /* the view being written, or the view being expanded */
+    List *rels;           /* every table the source reads, views expanded */
+} StreamCheck;
+
+static bool cf_stream_blocker_walker(Node *node, void *ctx);
+
+/* A relation the source reads blocks the stream when the other session cannot
+ * see it as this one does: a temporary table; a view, through what it reads;
+ * anything that is not a table. A table is collected for the written-in-
+ * transaction check. A view's stored query names the view itself in its OLD
+ * and NEW entries, which are skipped as the target is. */
+static bool
+cf_rel_blocks_stream(Oid relid, StreamCheck *sc)
+{
+    char relkind = get_rel_relkind(relid);
+
+    if (get_rel_persistence(relid) == RELPERSISTENCE_TEMP)
+        return true;
+    if (relkind == RELKIND_VIEW)
+    {
+        Relation    rel = relation_open(relid, AccessShareLock);
+        Query      *vq  = get_view_query(rel);
+        StreamCheck inner = { relid, sc->rels };
+        bool        blocked;
+
+        blocked = contain_mutable_functions((Node *) vq) ||
+                  query_tree_walker(vq, cf_stream_blocker_walker, &inner,
+                                    QTW_EXAMINE_RTES_BEFORE);
+        relation_close(rel, NoLock);
+        sc->rels = inner.rels;
+        return blocked;
+    }
+    if (relkind != RELKIND_RELATION && relkind != RELKIND_PARTITIONED_TABLE &&
+        relkind != RELKIND_MATVIEW)
+        return true;
+    sc->rels = lappend_oid(sc->rels, relid);
+    return false;
+}
+
+static bool
+cf_stream_blocker_walker(Node *node, void *ctx)
+{
+    StreamCheck *sc = (StreamCheck *) ctx;
+
+    if (node == NULL)
+        return false;
+    if (IsA(node, RangeTblEntry))
+    {
+        RangeTblEntry *rte = (RangeTblEntry *) node;
+
+        switch (rte->rtekind)
+        {
+            case RTE_RELATION:
+                return rte->relid != sc->result_relid &&
+                       cf_rel_blocks_stream(rte->relid, sc);
+            case RTE_SUBQUERY:
+            case RTE_JOIN:
+            case RTE_FUNCTION:
+            case RTE_VALUES:
+            case RTE_RESULT:
+#if PG_VERSION_NUM >= 180000
+            case RTE_GROUP:
+#endif
+                return false;
+            default:        /* a WITH entry, XMLTABLE, a trigger's transition table */
+                return true;
+        }
+    }
+    if (IsA(node, Query))
+        return query_tree_walker((Query *) node, cf_stream_blocker_walker, ctx,
+                                 QTW_EXAMINE_RTES_BEFORE);
+    return expression_tree_walker(node, cf_stream_blocker_walker, ctx);
+}
+
+/* The tables as a regclass[] literal: the stream's p_sources. */
+static char *
+cf_regclass_array(List *rels)
+{
+    StringInfoData buf;
+    ListCell      *lc;
+
+    if (rels == NIL)
+        return "'{}'::regclass[]";
+    initStringInfo(&buf);
+    appendStringInfoString(&buf, "ARRAY[");
+    foreach(lc, rels)
+        appendStringInfo(&buf, "%s%u::oid::regclass",
+                         lc == list_head(rels) ? "" : ", ", lfirst_oid(lc));
+    appendStringInfoChar(&buf, ']');
+    return buf.data;
+}
+
+/*
+ * Whether this transaction has written any of these tables, or a partition of
+ * one. The backend's pending statistics entry for a table keeps the live
+ * transaction's counts on its subtransaction chain and folds them into the
+ * pending totals at commit, where they stay until the next flush, so only the
+ * chain says what this transaction did: the totals would also count a
+ * commit made a moment ago by this backend, and the copy find_tabstat_entry
+ * returns has the chain detached, so the entry is read in place. Without
+ * track_counts there is no answer, which counts as written. The hook calls
+ * this before it emits the stream, and coldfront._written_in_xact is the same
+ * function for _tiered_cold_stream's check at execution.
+ */
+static bool
+cf_written_in_xact(List *rels)
+{
+    ListCell *lc;
+
+    if (rels == NIL)
+        return false;
+    if (!pgstat_track_counts)
+        return true;
+    foreach(lc, rels)
+    {
+        List     *all = find_all_inheritors(lfirst_oid(lc), NoLock, NULL);
+        ListCell *lp;
+
+        foreach(lp, all)
+        {
+            PgStat_EntryRef        *ref = pgstat_fetch_pending_entry(PGSTAT_KIND_RELATION,
+                                                                     MyDatabaseId, lfirst_oid(lp));
+            PgStat_TableStatus     *ts = ref ? (PgStat_TableStatus *) ref->pending : NULL;
+            PgStat_TableXactStatus *trans;
+
+            for (trans = ts ? ts->trans : NULL; trans != NULL; trans = trans->upper)
+                if (trans->tuples_inserted + trans->tuples_updated + trans->tuples_deleted > 0)
+                    return true;
+        }
+    }
+    return false;
+}
+
+PG_FUNCTION_INFO_V1(coldfront_written_in_xact);
+Datum
+coldfront_written_in_xact(PG_FUNCTION_ARGS)
+{
+    ArrayType *arr = PG_GETARG_ARRAYTYPE_P(0);
+    Datum     *elems;
+    bool      *nulls;
+    int        n, i;
+    List      *rels = NIL;
+
+    deconstruct_array(arr, REGCLASSOID, sizeof(Oid), true, TYPALIGN_INT,
+                      &elems, &nulls, &n);
+    for (i = 0; i < n; i++)
+        if (!nulls[i])
+            rels = lappend_oid(rels, DatumGetObjectId(elems[i]));
+    PG_RETURN_BOOL(cf_written_in_xact(rels));
+}
+
+static bool
+cf_tiered_insert_streams(Query *query, Oid view_relid, List **sources)
+{
+    StreamCheck sc = { view_relid, NIL };
+
+    *sources = NIL;
+    if (coldfront_local_pg_dsn == NULL || coldfront_local_pg_dsn[0] == '\0')
+        return false;
+    if (IsolationUsesXactSnapshot() || query->cteList != NIL)
+        return false;
+    if (contain_mutable_functions((Node *) query))
+        return false;
+    if (query_tree_walker(query, cf_stream_blocker_walker, &sc, QTW_EXAMINE_RTES_BEFORE))
+        return false;
+    if (cf_written_in_xact(sc.rels))
+        return false;
+    *sources = sc.rels;
+    return true;
+}
+
+/* The row count of a VALUES source: the list's length, 1 when the one row's
+ * expressions sit in the target list, 0 for a SELECT source. */
+static int
+cf_values_rows(Query *query)
+{
+    ListCell *lc;
+    int       idx = 0;
+
+    foreach(lc, query->rtable)
+    {
+        RangeTblEntry *rte = (RangeTblEntry *) lfirst(lc);
+
+        idx++;
+        if (idx == query->resultRelation)
+            continue;
+        return rte->rtekind == RTE_VALUES ? list_length(rte->values_lists) : 0;
+    }
+    return 1;
+}
+
+/* The partition column of the source's derived table, cast to its hot type:
+ * an untyped literal is text there, which no comparison with the cutoff
+ * accepts. */
+static char *
+cf_pc_expr(TieredViewInfo *info, const HotColumns *hc)
+{
+    const char *type = hot_column_type(hc, info->partition_col);
+
+    return psprintf("coldfront_src.%s%s%s", quote_identifier(info->partition_col),
+                    type ? "::" : "", type ? type : "");
+}
+
+/*
+ * The stream's read, as the SQL-text argument coldfront._tiered_cold_stream
+ * receives (cold_sql_arg): the cold projection over the source below the
+ * cutoff. Deparsed with an empty search_path, so every relation, function and
+ * operator is schema-qualified whatever the other session's path is, and with
+ * ISO dates and PostgreSQL intervals, so its literals read the same under
+ * that session's DateStyle and IntervalStyle.
+ */
+static char *
+cf_stream_pg_select(Query *query, TieredViewInfo *info, const HotColumns *hc,
+                    const char *col_list, ColdParamSet *ps)
+{
+    DeparseResult dr;
+    const char   *source;
+    char         *sql;
+    int           nest = NewGUCNestLevel();
+
+    (void) set_config_option("search_path", "", PGC_USERSET, PGC_S_SESSION,
+                             GUC_ACTION_SAVE, true, 0, false);
+    (void) set_config_option("DateStyle", "ISO, YMD", PGC_USERSET, PGC_S_SESSION,
+                             GUC_ACTION_SAVE, true, 0, false);
+    (void) set_config_option("IntervalStyle", "postgres", PGC_USERSET, PGC_S_SESSION,
+                             GUC_ACTION_SAVE, true, 0, false);
+    deparse_and_find_prefix(query, &dr);
+    source = skip_override_clause(skip_leading_collist(dr.rest), query->override);
+    sql = psprintf("SELECT %s FROM (%s) AS coldfront_src(%s) WHERE %s < %s",
+                   build_cold_projection(query, hc, true), source, col_list,
+                   cf_pc_expr(info, hc), format_timestamptz_literal(info->cutoff));
+    AtEOXact_GUC(true, nest);
+    return cold_sql_arg(sql, ps, true);
+}
+
+/* The cold half of the sink shape: coldfront._cold_sink over the source rows
+ * below the cutoff, each projected to every hot-table column
+ * (build_cold_projection). */
 static char *
 build_cold_sink_select(const char *vschema, const char *vname,
                        const char *projection, const char *partition_col,
@@ -2414,29 +2704,35 @@ skip_override_clause(const char *rest, OverridingKind override)
 }
 
 /*
- * Wrap the source CTE, the hot INSERT and the cold sink into one statement,
- * behind the statement's own WITH entries (dr->head_len bytes), which stay at
- * the top level: PostgreSQL allows an entry that modifies data nowhere else.
+ * Wrap the hot INSERT and the cold half into one statement, behind the
+ * statement's own WITH entries (dr->head_len bytes), which stay at the top
+ * level: PostgreSQL allows an entry that modifies data nowhere else. The sink
+ * shape adds the materialized source (src_cte) that both halves read.
  *
- * At top level the hot INSERT and the sink are CTEs and the statement reports
- * (hot_rows, cold_rows). In plpgsql, and for an INSERT nested in WITH, the hot
- * INSERT is the statement itself (the DML tag plpgsql accepts, and the body
- * the WITH entry keeps once cf_splice_nested_dml lifts the rest out), and
- * the sink rides in a data-modifying CTE (cold_anchor_update) that always runs
- * to completion; the sink's count is never NULL, so the anchor updates no row.
+ * At top level the hot INSERT and the cold half are CTEs and the statement
+ * reports (hot_rows, cold_rows): the sink's count, or the stream's, which is
+ * NULL when the rows streamed (DuckDB keeps that count) and the count
+ * otherwise. In plpgsql, and for an INSERT nested in WITH, the hot INSERT is
+ * the statement itself (the DML tag plpgsql accepts, and the body the WITH
+ * entry keeps once cf_splice_nested_dml lifts the rest out), and the cold half
+ * rides in a data-modifying CTE (cold_anchor_update) that always runs to
+ * completion and updates no row: the sink's count is never NULL, and the
+ * stream's count is never negative, with NULL < 0 being no match.
  */
 static char *
 wrap_tiered_result(bool in_plpgsql, const DeparseResult *dr, const char *src_cte,
-                   const char *hot_dml, const char *cold_select)
+                   const char *hot_dml, const char *cold_select, const char *anchor_test)
 {
     StringInfoData buf;
 
     initStringInfo(&buf);
     append_with_opener(&buf, dr);
-    appendStringInfo(&buf, "coldfront_source AS MATERIALIZED (%s), ", src_cte);
+    if (src_cte != NULL)
+        appendStringInfo(&buf, "coldfront_source AS MATERIALIZED (%s), ", src_cte);
     if (in_plpgsql)
         appendStringInfo(&buf, "coldfront_cold AS (%s) %s",
-                         cold_anchor_update(psprintf("(%s)", cold_select)), hot_dml);
+                         cold_anchor_update(psprintf("(%s)", cold_select), anchor_test),
+                         hot_dml);
     else
         appendStringInfo(&buf, "coldfront_hot AS MATERIALIZED (%s RETURNING 1), "
                          "coldfront_cold AS MATERIALIZED (%s) "
@@ -2448,8 +2744,32 @@ wrap_tiered_result(bool in_plpgsql, const DeparseResult *dr, const char *src_cte
 
 /*
  * emit_tiered_insert rewrites a tiered-view INSERT into one statement that
- * reads the source once and splits that result by the partition column
- * against the watermark:
+ * splits the source by the partition column against the watermark, in one of
+ * two shapes.
+ *
+ * The stream shape, when cf_tiered_insert_streams proves the source safe to
+ * read twice:
+ *
+ *   WITH coldfront_hot AS MATERIALIZED (INSERT INTO <hot> (cols) SELECT <cols,
+ *                                       each cast to its hot type> FROM
+ *                                       (<source>) AS coldfront_src(cols)
+ *                                       WHERE <partcol> >= <cutoff> RETURNING 1),
+ *        coldfront_cold AS MATERIALIZED (SELECT coldfront._tiered_cold_stream(
+ *                                        schema, view, <the cold projection over
+ *                                        the source below the cutoff, as text>,
+ *                                        <the tables the source reads>,
+ *                                        <whether any row is cold>) AS n)
+ *   SELECT hot_rows, cold_rows
+ *
+ * The hot half is plain PG: set-based, IDENTITY and DEFAULT fill server-side.
+ * The cold half is one DuckDB statement: INSERT INTO <ice> SELECT ... FROM
+ * postgres_query('pgstream', <that text>), so the rows go from PostgreSQL into
+ * the Iceberg writer in one vectorized pass, with the identity values and
+ * defaults the projection draws in PostgreSQL. A VALUES source's cold test is
+ * the hot count against its row count; a SELECT source's is an EXISTS over
+ * the source, so an all-hot INSERT stages nothing and takes no claim.
+ *
+ * The sink shape, for every other source:
  *
  *   WITH <the INSERT's own WITH entries, if any>,
  *        coldfront_source AS MATERIALIZED (<source, each column cast to its
@@ -2463,22 +2783,23 @@ wrap_tiered_result(bool in_plpgsql, const DeparseResult *dr, const char *src_cte
  *                                        <partcol> < <cutoff>>) AS r)
  *   SELECT hot_rows, cold_rows
  *
- * The hot half is plain PG: set-based, IDENTITY and DEFAULT fill server-side.
- * The cold half projects each row to the hot table's full column list
- * (build_cold_projection) and hands it to the sink, which renders it as a
- * DuckDB VALUES tuple and flushes every coldfront.cold_write_batch_size rows
- * under the table's claim (coldfront--1.0.sql). Both halves read the one
- * tuplestore, so a volatile source, or a row the transaction wrote before the
- * INSERT, lands exactly once. Bound parameters ($N) stay in the source, which
- * PostgreSQL runs, so they bind natively. RETURNING is not preserved; the
- * top-level statement reports (hot_rows, cold_rows).
+ * Both halves read the one tuplestore, so a volatile source, or a row the
+ * transaction wrote before the INSERT, lands exactly once; the sink renders
+ * each row as a DuckDB VALUES tuple and writes a batch every
+ * coldfront.cold_write_batch_size rows (coldfront--1.0.sql).
+ *
+ * Bound parameters ($N) stay in the source, which PostgreSQL runs, so they
+ * bind natively; the stream's text carries them as format() arguments.
+ * RETURNING is not preserved.
  */
 static char *
-emit_tiered_insert(Query *query, TieredViewInfo *info, bool in_plpgsql)
+emit_tiered_insert(Query *query, TieredViewInfo *info, ColdParamSet *ps,
+                   bool in_plpgsql, Oid view_relid)
 {
     DeparseResult  dr;
     HotColumns     hc;
-    char          *col_list, *cutoff_lit, *src_cte, *hot_dml, *cold_select;
+    List          *sources;
+    char          *col_list, *cutoff_lit, *hot_dml, *cold_select;
     const char    *source, *vname, *vschema, *override;
 
     deparse_and_find_prefix(query, &dr);
@@ -2487,22 +2808,39 @@ emit_tiered_insert(Query *query, TieredViewInfo *info, bool in_plpgsql)
     cutoff_lit = format_timestamptz_literal(info->cutoff);
     override   = query->override == OVERRIDING_SYSTEM_VALUE ? "OVERRIDING SYSTEM VALUE " :
                  query->override == OVERRIDING_USER_VALUE   ? "OVERRIDING USER VALUE "   : "";
+    vname      = get_rel_name(view_relid);
+    vschema    = get_namespace_name(get_rel_namespace(view_relid));
+    load_hot_columns(info->hot_table, &hc);
 
+    if (cf_tiered_insert_streams(query, view_relid, &sources))
     {
-        RangeTblEntry *rte = (RangeTblEntry *) list_nth(query->rtable,
-                                                        query->resultRelation - 1);
-        vname   = get_rel_name(rte->relid);
-        vschema = get_namespace_name(get_rel_namespace(rte->relid));
+        const char *src_select = build_src_cte(query, source, col_list, &hc);
+        const char *pc_expr    = cf_pc_expr(info, &hc);
+        int         nvalues    = cf_values_rows(query);
+        char       *any_cold;
+
+        hot_dml  = build_tiered_hot_dml(info->hot_table, col_list, override,
+                                        src_select + strlen("SELECT "), "",
+                                        pc_expr, cutoff_lit);
+        any_cold = !in_plpgsql && nvalues > 0
+            ? psprintf("(SELECT count(*) FROM coldfront_hot) < %d", nvalues)
+            : psprintf("EXISTS (SELECT 1 FROM (%s) AS coldfront_src(%s) WHERE %s < %s)",
+                       source, col_list, pc_expr, cutoff_lit);
+        cold_select = psprintf("SELECT coldfront._tiered_cold_stream(%s, %s, %s, %s, %s) AS n",
+                               quote_literal_cstr(vschema), quote_literal_cstr(vname),
+                               cf_stream_pg_select(query, info, &hc, col_list, ps),
+                               cf_regclass_array(sources), any_cold);
+        return wrap_tiered_result(in_plpgsql, &dr, NULL, hot_dml, cold_select, "< 0");
     }
 
-    load_hot_columns(info->hot_table, &hc);
-    src_cte     = build_src_cte(query, source, col_list, &hc);
-    hot_dml     = build_tiered_hot_dml(info->hot_table, col_list, override,
-                                       info->partition_col, cutoff_lit);
+    hot_dml     = build_tiered_hot_dml(info->hot_table, col_list, override, col_list,
+                                       "FROM coldfront_source",
+                                       quote_identifier(info->partition_col), cutoff_lit);
     cold_select = build_cold_sink_select(vschema, vname,
-                                         build_cold_projection(query, &hc),
+                                         build_cold_projection(query, &hc, false),
                                          info->partition_col, cutoff_lit);
-    return wrap_tiered_result(in_plpgsql, &dr, src_cte, hot_dml, cold_select);
+    return wrap_tiered_result(in_plpgsql, &dr, build_src_cte(query, source, col_list, &hc),
+                              hot_dml, cold_select, "IS NULL");
 }
 
 /*
@@ -2648,8 +2986,8 @@ reject_cold_outer_cte(Query *query, const char *vname)
  * plain hot INSERT. With a watermark, some rows go cold (cannot RETURN them).
  */
 static char *
-cf_emit_tiered_insert_path(Query *query, TieredViewInfo *info, ColdParamSet *ps,
-                           bool in_plpgsql, const char *vname)
+cf_emit_tiered_insert_path(Query *query, Oid view_relid, TieredViewInfo *info,
+                           ColdParamSet *ps, bool in_plpgsql, const char *vname)
 {
     if (!info->has_cutoff)
         return emit_hot(query, info);
@@ -2657,7 +2995,7 @@ cf_emit_tiered_insert_path(Query *query, TieredViewInfo *info, ColdParamSet *ps,
     /* A watermark-split INSERT sends some rows to the cold tier,
      * which cannot return them — refuse RETURNING rather than drop it. */
     reject_cold_returning(query, vname);
-    return emit_tiered_insert(query, info, in_plpgsql);
+    return emit_tiered_insert(query, info, ps, in_plpgsql, view_relid);
 }
 
 /* Build the rewritten SQL for a cold-tier UPDATE/DELETE/INSERT/MERGE (TIER_COLD). */
@@ -3931,7 +4269,7 @@ cf_dispatch_emit(Query *query, RangeTblEntry *rte, TieredViewInfo *info,
      * Iceberg-only INSERT falls through to the unconditional cold path
      * (classify_tier short-circuits to TIER_COLD for iceberg-only). */
     if (query->commandType == CMD_INSERT && !info->is_iceberg_only)
-        return cf_emit_tiered_insert_path(query, info, ps, in_plpgsql, vname);
+        return cf_emit_tiered_insert_path(query, rte->relid, info, ps, in_plpgsql, vname);
 
     tier = classify_tier(query, info);
 

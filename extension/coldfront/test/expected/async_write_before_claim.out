@@ -134,6 +134,49 @@ CONTEXT:  SQL statement "SELECT pg_advisory_xact_lock(hashtext('coldfront_iceber
 PL/pgSQL function _take_iceberg_claim(text) line 13 at PERFORM
 SQL statement "SELECT coldfront._take_iceberg_claim(v_iceberg)"
 PL/pgSQL function _cross_tier_move(text,text,text,text) line 134 at PERFORM
+-- (6) The cold stream: a tiered INSERT whose source streams is one DuckDB
+--     write in the statement, and the claim at COMMIT meets the lock. The
+--     stream's second session connects to the regress database.
+SELECT set_config('coldfront.local_pg_dsn',
+                  format('host=%s dbname=%s user=%s',
+                         trim(split_part(current_setting('unix_socket_directories'), ',', 1)),
+                         current_database(), current_user), false) <> '' AS dsn_set;
+ dsn_set 
+---------
+ t
+(1 row)
+
+CREATE TABLE public.cf_order_src (id int, ts timestamptz, status text);
+INSERT INTO public.cf_order_src VALUES (30, '2026-01-06', 'stream'), (31, '2026-01-07', 'stream');
+BEGIN;
+INSERT INTO public.cf_order (id, ts, status) SELECT id, ts, status FROM public.cf_order_src;
+NOTICE:  result: Success	
+BOOLEAN	
+[ Rows: 0]
+
+
+NOTICE:  result: Success	
+BOOLEAN	
+[ Rows: 0]
+
+
+NOTICE:  result: Count	
+BIGINT	
+[ Rows: 1]
+2
+
+
+ hot_rows | cold_rows 
+----------+-----------
+        0 |          
+(1 row)
+
+COMMIT;
+ERROR:  canceling statement due to lock timeout
+CONTEXT:  SQL statement "SELECT pg_advisory_xact_lock(hashtext('coldfront_iceberg:' || p_iceberg_ref))"
+PL/pgSQL function _take_iceberg_claim(text) line 13 at PERFORM
+SQL statement "SELECT coldfront._take_iceberg_claim($1)"
+DROP TABLE public.cf_order_src;
 -- Cleanup.
 SELECT coldfront._loopback('SELECT pg_advisory_unlock_all()') IS NOT NULL AS lock_released;
  lock_released 
@@ -150,3 +193,4 @@ RESET lock_timeout;
 RESET coldfront.iceberg_async_parquet;
 RESET coldfront.iceberg_bakery_patch;
 RESET coldfront.loopback_dsn;
+RESET coldfront.local_pg_dsn;

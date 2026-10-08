@@ -1,10 +1,14 @@
--- A tiered INSERT ... SELECT reads its source once: the rewrite holds the source
--- in a MATERIALIZED CTE that the hot INSERT and the cold sink both read, casts
--- every column to the hot table's type (an untyped literal keeps the target's
--- type), fills an omitted identity column with nextval() and an omitted column
--- with its DEFAULT on the cold side, and keeps OVERRIDING SYSTEM VALUE on the
--- hot INSERT. White-box: EXPLAIN VERBOSE shows the rewritten shape; no Iceberg
--- I/O (warehouse and endpoint left '').
+-- The two shapes of a tiered INSERT. A source the hook cannot read a second
+-- time from another session (here a stable function, timestamptz plus an
+-- interval) is read once: the rewrite holds it in a MATERIALIZED CTE that the
+-- hot INSERT and the cold sink both read. A source it can read twice streams:
+-- the hot INSERT reads it, and the cold half is one call carrying the cold
+-- projection as text for the other session. Both cast every column to the hot
+-- table's type (an untyped literal keeps the target's type), fill an omitted
+-- identity column with nextval() and an omitted column with its DEFAULT on
+-- the cold side, and keep OVERRIDING SYSTEM VALUE on the hot INSERT.
+-- White-box: EXPLAIN VERBOSE shows the rewritten shape; no Iceberg I/O
+-- (warehouse and endpoint left '').
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS pg_duckdb;
 CREATE EXTENSION IF NOT EXISTS coldfront;
