@@ -59,7 +59,7 @@ tier, so the application sees one relation:
     │ _events              │        │ pg_duckdb               │
     │ native PostgreSQL    │        │ in-process DuckDB       │
     │ range partitions     │        │ Iceberg reads + writes  │
-    └──────────┬───────────         └────────────┬────────────┘
+    └──────────┬───────────┘        └────────────┬────────────┘
                │                                 │
                │                     ┌───────────▼─────────────┐
                │                     │ Lakekeeper              │
@@ -68,7 +68,7 @@ tier, so the application sees one relation:
                │                                 │ 
                │                                 │
                │                     ┌───────────▼─────────────────────┐
-               │                     │ Object store,S3 / Azure / GCS   │
+               │                     │ Object store, S3 / Azure / GCS  │
                │                     │                                 │
                └── Archiver (Go) ───▶│(Parquet data + Iceberg metadata)│
                                      └─────────────────────────────────┘
