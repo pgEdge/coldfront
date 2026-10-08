@@ -28,8 +28,8 @@ CREATE TABLE public.staging (id int, ts timestamptz, status text);
 EXPLAIN (COSTS OFF, VERBOSE)
   WITH s AS (SELECT 7 AS id, '2026-05-01 00:00:00+00'::timestamptz AS ts, 'new' AS status)
   INSERT INTO public.events SELECT id, ts, status FROM s;
-                                                                      QUERY PLAN                                                                      
-------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                                    QUERY PLAN                                                                                                                                     
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
    Output: $4, $5
    CTE coldfront_source
@@ -43,10 +43,17 @@ EXPLAIN (COSTS OFF, VERBOSE)
                  Filter: (coldfront_source.ts >= 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
    CTE coldfront_cold
      ->  Aggregate
-           Output: _cold_sink('public'::text, 'events'::text, to_jsonb(ROW(coldfront_source_1.id, coldfront_source_1.ts, coldfront_source_1.status)))
-           ->  CTE Scan on coldfront_source coldfront_source_1
-                 Output: coldfront_source_1.id, coldfront_source_1.ts, coldfront_source_1.status
-                 Filter: (coldfront_source_1.ts < 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
+           Output: _cold_sink('public'::text, 'events'::text, (string_agg((('('::text || _cold_row_literal(to_jsonb(r.*), '{id,ts,status}'::text[], '{integer,"timestamp with time zone",text}'::text[], 'public'::text, 'events'::text)) || ')'::text), ', '::text)), (count(*)))
+           ->  HashAggregate
+                 Output: string_agg((('('::text || _cold_row_literal(to_jsonb(r.*), '{id,ts,status}'::text[], '{integer,"timestamp with time zone",text}'::text[], 'public'::text, 'events'::text)) || ')'::text), ', '::text), count(*), r.coldfront_batch
+                 Group Key: r.coldfront_batch
+                 ->  Subquery Scan on r
+                       Output: r.coldfront_batch, r.*
+                       ->  WindowAgg
+                             Output: coldfront_source_1.id, coldfront_source_1.ts, coldfront_source_1.status, ((row_number() OVER (?) - 1) / (current_setting('coldfront.cold_write_batch_size'::text))::integer)
+                             ->  CTE Scan on coldfront_source coldfront_source_1
+                                   Output: coldfront_source_1.id, coldfront_source_1.ts, coldfront_source_1.status
+                                   Filter: (coldfront_source_1.ts < 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
    InitPlan 4 (returns $4)
      ->  Aggregate
            Output: count(*)
@@ -55,7 +62,7 @@ EXPLAIN (COSTS OFF, VERBOSE)
    InitPlan 5 (returns $5)
      ->  CTE Scan on coldfront_cold
            Output: coldfront_cold.n
-(25 rows)
+(32 rows)
 
 -- An entry may take a name the rewrite's own entries once had.
 WITH src AS (SELECT 1 AS id, '2026-05-01 00:00:00+00'::timestamptz AS ts, 'src' AS status)

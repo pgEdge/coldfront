@@ -527,9 +527,9 @@ BEGIN
                         '_exec_iceberg_with_claim',
                         -- the tiered INSERT's cold stream and its execution-time check
                         '_tiered_cold_stream', '_written_in_xact',
-                        -- the tiered INSERT's cold sink and its row renderer
-                        '_cold_sink', '_cold_sink_step', '_cold_sink_flush',
-                        '_cold_sink_final', '_cold_row_literal',
+                        -- the tiered INSERT's cold sink, its statement and its row renderer
+                        '_cold_sink', '_cold_sink_step', '_cold_sink_final',
+                        '_cold_sink_sql', '_cold_row_literal',
                         -- an array column's shape check in that INSERT, and an
                         -- array parameter's renderer in a cold write
                         '_cold_list', '_render_cold_param',
@@ -931,27 +931,25 @@ $$;
 --
 -- The C hook rewrites INSERT INTO <tiered view> ... into one statement that
 -- holds the source in a MATERIALIZED CTE, inserts the hot rows into the hot
--- table from it, and aggregates the cold rows from it with _cold_sink. Each
--- row reaches the sink as jsonb with one key per hot-table column, projected
--- in the statement: the user's value, nextval() for an omitted identity
--- column, the DEFAULT expression for an omitted column that has one, NULL
--- otherwise. The sink renders and batches and does nothing else: the step
--- function renders each row as a DuckDB VALUES tuple and flushes every
--- coldfront.cold_write_batch_size rows as one INSERT through
--- _exec_iceberg_with_claim, and the final function flushes the rest and
--- returns the row count. Each batch is an append, so in the async ordering
--- every batch is staged inside the statement and the table's one claim is
--- taken at the transaction's commit; in the stock ordering the claim comes
--- before the first batch. The state is NULL until the first row, so an
--- aggregate over no cold rows writes nothing and returns 0.
+-- table from it, and runs the statement _cold_sink_sql builds over the cold
+-- rows from it. Each row is projected to one key per hot-table column: the
+-- user's value, nextval() for an omitted identity column, the DEFAULT
+-- expression for an omitted column that has one, NULL otherwise; the
+-- statement renders each row as a DuckDB VALUES tuple (_cold_row_literal),
+-- gathers coldfront.cold_write_batch_size of them at a time with string_agg,
+-- and hands each batch to the _cold_sink aggregate, whose step writes it as
+-- one INSERT through _exec_iceberg_with_claim and whose final function returns
+-- the row count. The work per row is the rendering alone: the batches are
+-- built by string_agg, so a large load costs in proportion to its rows. Each
+-- batch is an append, so in the async ordering every batch is staged inside
+-- the statement and the table's one claim is taken at the transaction's
+-- commit; in the stock ordering the claim comes before the first batch. The
+-- state is NULL until the first batch, so an aggregate over no cold rows
+-- writes nothing and returns 0.
 -- ============================================================================
 CREATE TYPE coldfront._cold_sink_state AS (
     iceberg text,       -- the DuckDB ref the batches are written to
-    cols    text[],     -- hot-table columns in attnum order, vector companions excluded
-    types   text[],     -- their PG types, for _cold_row_literal
-    batch   int,        -- rows per flush
-    buf     text[],     -- rendered tuples waiting for a flush
-    total   bigint      -- rows rendered so far
+    total   bigint      -- rows written so far
 );
 
 -- coldfront._cold_row_literal: render one row (jsonb keyed by column name) as a
@@ -999,86 +997,66 @@ BEGIN
 END;
 $$;
 
--- One batch to Iceberg, in the ordering every cold write uses.
-CREATE FUNCTION coldfront._cold_sink_flush(s coldfront._cold_sink_state)
-RETURNS coldfront._cold_sink_state
-LANGUAGE plpgsql AS $$
-BEGIN
-    IF cardinality(s.buf) > 0 THEN
-        PERFORM coldfront._exec_iceberg_with_claim(s.iceberg,
-            format('INSERT INTO %s VALUES %s', s.iceberg, array_to_string(s.buf, ', ')));
-        s.buf := '{}';
-    END IF;
-    RETURN s;
-END;
+-- coldfront._cold_sink_sql: the statement that feeds the sink, over p_rows_sql,
+-- a query yielding the cold rows projected to every hot-table column (p_cols,
+-- in attnum order, with p_types their PG types). Each row is rendered as a
+-- VALUES tuple, the tuples are gathered coldfront.cold_write_batch_size at a
+-- time, read at execution so a cached plan follows the session's setting, and
+-- each batch reaches the aggregate with its row count. The C hook embeds the
+-- statement in a tiered INSERT's rewrite and _tiered_cold_stream runs it when
+-- it falls back to reading in this session, so the shape has one home.
+CREATE FUNCTION coldfront._cold_sink_sql(
+    p_schema text, p_view text, p_cols text[], p_types text[], p_rows_sql text
+) RETURNS text
+LANGUAGE sql IMMUTABLE AS $$
+    SELECT format(
+        'SELECT coldfront._cold_sink(%1$L, %2$L, b.tuples, b.n) AS n '
+        'FROM (SELECT string_agg(''('' || coldfront._cold_row_literal(to_jsonb(r), %3$L::text[], %4$L::text[], %1$L, %2$L) || '')'', '', '') AS tuples, '
+                     'count(*) AS n '
+                'FROM (SELECT r0.*, (row_number() OVER () - 1) / current_setting(''coldfront.cold_write_batch_size'')::int AS coldfront_batch '
+                      'FROM (%5$s) AS r0) AS r '
+               'GROUP BY r.coldfront_batch) AS b',
+        p_schema, p_view, p_cols, p_types, p_rows_sql);
 $$;
 
--- The step function. The first row resolves the registry row and the hot
--- table's columns, with the standby guard ahead of every lookup.
+-- The step function takes one rendered batch. The first call resolves the
+-- registry row, with the standby guard ahead of the lookup.
 CREATE FUNCTION coldfront._cold_sink_step(
-    s coldfront._cold_sink_state, p_schema text, p_view text, p_row jsonb
+    s coldfront._cold_sink_state, p_schema text, p_view text, p_tuples text, p_n bigint
 ) RETURNS coldfront._cold_sink_state
 LANGUAGE plpgsql AS $$
-DECLARE
-    v_hot_table text;
-    v_iceberg   text;
 BEGIN
     IF s.iceberg IS NULL THEN
         PERFORM coldfront._reject_on_standby('execute a cold (Iceberg) write');
         -- The statement may run from a cached plan (PREPARE, a plpgsql
         -- function's later call) in a transaction the hook never saw, so the
         -- catalog attach and pg_duckdb's mixed-write guard belong here, at
-        -- execution, ahead of the first flush.
+        -- execution, ahead of the first batch.
         PERFORM coldfront.ensure_attached();
         SET LOCAL duckdb.unsafe_allow_mixed_transactions = on;
-        SELECT tv.hot_table, tv.iceberg_table INTO v_hot_table, v_iceberg
+        SELECT tv.iceberg_table, 0::bigint INTO s
           FROM coldfront.tiered_views tv
          WHERE tv.schema_name = p_schema AND tv.relname = p_view
            AND NOT tv.is_iceberg_only;
-        IF v_iceberg IS NULL THEN
+        IF s.iceberg IS NULL THEN
             RAISE EXCEPTION 'coldfront._cold_sink: view %.% is not a registered tiered view',
                 p_schema, p_view;
         END IF;
-        SELECT v_iceberg,
-               array_agg(a.attname::text ORDER BY a.attnum),
-               array_agg(format_type(a.atttypid, a.atttypmod) ORDER BY a.attnum),
-               current_setting('coldfront.cold_write_batch_size')::int,
-               '{}'::text[], 0::bigint
-          INTO s
-          FROM pg_attribute a
-          JOIN pg_class c     ON c.oid = a.attrelid
-          JOIN pg_namespace n ON n.oid = c.relnamespace
-         WHERE n.nspname = (parse_ident(v_hot_table))[1]
-           AND c.relname = (parse_ident(v_hot_table))[2]
-           AND a.attnum > 0 AND NOT a.attisdropped
-           AND NOT coldfront._is_vec_companion(a.attname, a.attgenerated);
-        -- A cluster assignment reads the centroids over pglocal.
-        IF coldfront._types_have_vector(s.types) THEN
-            PERFORM coldfront.ensure_pg_attached();
-        END IF;
     END IF;
-    s.buf   := s.buf || ('(' || coldfront._cold_row_literal(p_row, s.cols, s.types, p_schema, p_view) || ')');
-    s.total := s.total + 1;
-    IF cardinality(s.buf) >= s.batch THEN
-        s := coldfront._cold_sink_flush(s);
-    END IF;
+    PERFORM coldfront._exec_iceberg_with_claim(s.iceberg,
+        format('INSERT INTO %s VALUES %s', s.iceberg, p_tuples));
+    s.total := s.total + p_n;
     RETURN s;
 END;
 $$;
 
 CREATE FUNCTION coldfront._cold_sink_final(s coldfront._cold_sink_state)
 RETURNS bigint
-LANGUAGE plpgsql AS $$
-BEGIN
-    IF s.iceberg IS NULL THEN
-        RETURN 0;
-    END IF;
-    s := coldfront._cold_sink_flush(s);
-    RETURN s.total;
-END;
+LANGUAGE sql AS $$
+    SELECT COALESCE(s.total, 0);
 $$;
 
-CREATE AGGREGATE coldfront._cold_sink(text, text, jsonb) (
+CREATE AGGREGATE coldfront._cold_sink(text, text, text, bigint) (
     SFUNC     = coldfront._cold_sink_step,
     STYPE     = coldfront._cold_sink_state,
     FINALFUNC = coldfront._cold_sink_final
@@ -1120,18 +1098,13 @@ LANGUAGE plpgsql AS $$
 DECLARE
     v_hot     text;
     v_iceberg text;
-    v_cols    text;
+    v_names   text[];
+    v_types   text[];
     v_prefix  text;
     v_count   bigint;
 BEGIN
     IF NOT p_any_cold THEN
         RETURN 0;
-    END IF;
-    IF current_setting('transaction_isolation') <> 'read committed'
-       OR coldfront._written_in_xact(p_sources) THEN
-        EXECUTE format('SELECT coldfront._cold_sink(%L, %L, to_jsonb(r)) FROM (%s) AS r',
-                       p_schema, p_view, p_pg_sql) INTO v_count;
-        RETURN v_count;
     END IF;
     SELECT tv.hot_table, tv.iceberg_table INTO v_hot, v_iceberg
       FROM coldfront.tiered_views tv
@@ -1141,7 +1114,9 @@ BEGIN
         RAISE EXCEPTION 'coldfront._tiered_cold_stream: view %.% is not a registered tiered view',
             p_schema, p_view;
     END IF;
-    SELECT string_agg('s.' || quote_ident(a.attname), ', ' ORDER BY a.attnum) INTO v_cols
+    SELECT array_agg(a.attname::text ORDER BY a.attnum),
+           array_agg(format_type(a.atttypid, a.atttypmod) ORDER BY a.attnum)
+      INTO v_names, v_types
       FROM pg_attribute a
       JOIN pg_class c     ON c.oid = a.attrelid
       JOIN pg_namespace n ON n.oid = c.relnamespace
@@ -1149,13 +1124,21 @@ BEGIN
        AND c.relname = (parse_ident(v_hot))[2]
        AND a.attnum > 0 AND NOT a.attisdropped
        AND NOT coldfront._is_vec_companion(a.attname, a.attgenerated);
+    IF current_setting('transaction_isolation') <> 'read committed'
+       OR coldfront._written_in_xact(p_sources) THEN
+        EXECUTE coldfront._cold_sink_sql(p_schema, p_view, v_names, v_types, p_pg_sql)
+           INTO v_count;
+        RETURN v_count;
+    END IF;
     v_prefix := COALESCE(coldfront._vec_list_prefix_for_ref(v_iceberg, 's.'), '');
     SET LOCAL duckdb.unsafe_allow_mixed_transactions = on;
     PERFORM coldfront.ensure_attached();
     PERFORM coldfront.ensure_stream_attached();
     PERFORM coldfront._exec_iceberg_with_claim(v_iceberg, format(
         'INSERT INTO %s SELECT %s%s FROM postgres_query(%L, %L) AS s%s',
-        v_iceberg, v_prefix, v_cols, 'pgstream', p_pg_sql,
+        v_iceberg, v_prefix,
+        (SELECT string_agg('s.' || quote_ident(c), ', ' ORDER BY o) FROM unnest(v_names) WITH ORDINALITY AS u(c, o)),
+        'pgstream', p_pg_sql,
         CASE WHEN v_prefix <> '' THEN ' ORDER BY 1' ELSE '' END));
     RETURN NULL;
 END;

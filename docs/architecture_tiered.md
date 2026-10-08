@@ -373,9 +373,16 @@ coldfront_hot AS MATERIALIZED (
   RETURNING 1
 ),
 coldfront_cold AS MATERIALIZED (
-  SELECT coldfront._cold_sink('public', 'events', to_jsonb(r)) AS n
-  FROM (SELECT nextval('_events_id_seq') AS id, ts, status, data
-        FROM coldfront_source WHERE ts < '<cutoff>'::timestamptz) AS r
+  SELECT coldfront._cold_sink('public', 'events', b.tuples, b.n) AS n
+  FROM (SELECT string_agg('(' || coldfront._cold_row_literal(to_jsonb(r), '{id,ts,status,data}',
+                            '{bigint,"timestamp with time zone",text,jsonb}', 'public', 'events') || ')',
+                          ', ') AS tuples,
+               count(*) AS n
+        FROM (SELECT r0.*, (row_number() OVER () - 1)
+                             / current_setting('coldfront.cold_write_batch_size')::int AS coldfront_batch
+              FROM (SELECT nextval('_events_id_seq') AS id, ts, status, data
+                    FROM coldfront_source WHERE ts < '<cutoff>'::timestamptz) AS r0) AS r
+        GROUP BY r.coldfront_batch) AS b
 )
 SELECT (SELECT count(*) FROM coldfront_hot) AS hot_rows,
        (SELECT n FROM coldfront_cold) AS cold_rows;
@@ -384,12 +391,14 @@ SELECT (SELECT count(*) FROM coldfront_hot) AS hot_rows,
 The source runs once, into the `coldfront_source` tuplestore, and both halves
 read it, so a volatile source lands every row exactly once and a row the
 transaction wrote before the `INSERT` reaches the cold tier. The cold half
-projects each row as the stream does and hands it to `coldfront._cold_sink`,
-which renders each row as a DuckDB `VALUES` tuple and writes every
-`coldfront.cold_write_batch_size` rows (default 10000) as one `INSERT` through
-`coldfront._exec_iceberg_with_claim`; its final step writes the rest. The sink
-renders in plpgsql, so a large load that cannot stream is slower than one
-that can.
+projects each row as the stream does, renders it as a DuckDB `VALUES` tuple
+(`coldfront._cold_row_literal`), gathers `coldfront.cold_write_batch_size` tuples
+(default 10000) at a time with `string_agg`, and hands each batch to the
+`coldfront._cold_sink` aggregate, which writes it as one `INSERT` through
+`coldfront._exec_iceberg_with_claim`. The statement is built by
+`coldfront._cold_sink_sql`, which the stream's fallback runs too. The work per
+row is the rendering in plpgsql, so a load that cannot stream costs in
+proportion to its rows and more per row than one that can.
 
 In both shapes each column of the source is cast to the hot table's type,
 which restates the coercions PostgreSQL applied when it analyzed the statement

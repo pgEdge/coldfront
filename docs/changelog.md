@@ -86,8 +86,9 @@ this project adheres to
   A source the hook cannot read a second time (a volatile or stable function, a
   temporary table, a `WITH` entry, a table the transaction has written, a
   transaction that is not READ COMMITTED) is read once for both tiers and its
-  cold rows go through `coldfront._cold_sink`. `cold_rows` in the statement's
-  result is `NULL` for a streamed `INSERT`.
+  cold rows go through `coldfront._cold_sink`, whose cost is in proportion to
+  the rows it renders. `cold_rows` in the
+  statement's result is `NULL` for a streamed `INSERT`.
 - Every append to the cold tier (`INSERT`, `COPY`, the archiver's exports, the
   tiered `INSERT`'s cold sink) uses the async ordering wherever the patched
   duckdb-iceberg is loaded, on a single node as on a mesh: the statement

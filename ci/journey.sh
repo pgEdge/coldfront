@@ -4207,7 +4207,7 @@ story_standby_reads() {
     fi
     # The cold sink's step function is reached through the INSERT rewrite, so call
     # it directly: the guard is its first statement, ahead of every lookup.
-    local c; c=$(q_may "$STANDBY" "SELECT coldfront._cold_sink_step(NULL, '${vn%%.*}', '${vn##*.}', '{}'::jsonb);")
+    local c; c=$(q_may "$STANDBY" "SELECT coldfront._cold_sink_step(NULL, '${vn%%.*}', '${vn##*.}', '', 0);")
     assert_err "cold sink on standby → coldfront refuses before the claim" \
         "cannot execute a cold (Iceberg) write on a read-only standby" "$c"
 

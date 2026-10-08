@@ -2671,18 +2671,50 @@ cf_stream_pg_select(Query *query, TieredViewInfo *info, const HotColumns *hc,
     return cold_sql_arg(sql, ps, true);
 }
 
-/* The cold half of the sink shape: coldfront._cold_sink over the source rows
- * below the cutoff, each projected to every hot-table column
- * (build_cold_projection). */
+/* The hot table's column names, or types, as a text[] literal. */
 static char *
-build_cold_sink_select(const char *vschema, const char *vname,
+cf_text_array(char **items, int n)
+{
+    StringInfoData buf;
+    int            i;
+
+    initStringInfo(&buf);
+    appendStringInfoString(&buf, "ARRAY[");
+    for (i = 0; i < n; i++)
+        appendStringInfo(&buf, "%s%s", i ? ", " : "", quote_literal_cstr(items[i]));
+    appendStringInfoString(&buf, "]::text[]");
+    return buf.data;
+}
+
+/* The cold half of the sink shape: the statement coldfront._cold_sink_sql
+ * builds over the source rows below the cutoff, each projected to every
+ * hot-table column (build_cold_projection). */
+static char *
+build_cold_sink_select(const char *vschema, const char *vname, const HotColumns *hc,
                        const char *projection, const char *partition_col,
                        const char *cutoff_lit)
 {
-    return psprintf("SELECT coldfront._cold_sink(%s, %s, to_jsonb(r)) AS n "
-                    "FROM (SELECT %s FROM coldfront_source WHERE coldfront_source.%s < %s) AS r",
-                    quote_literal_cstr(vschema), quote_literal_cstr(vname),
-                    projection, quote_identifier(partition_col), cutoff_lit);
+    char *sql = NULL;
+
+    if (SPI_connect() != SPI_OK_CONNECT)
+        elog(ERROR, "coldfront: SPI_connect failed while building the cold sink's statement");
+    if (SPI_execute(psprintf("SELECT coldfront._cold_sink_sql(%s, %s, %s, %s, %s)",
+                             quote_literal_cstr(vschema), quote_literal_cstr(vname),
+                             cf_text_array(hc->name, hc->n), cf_text_array(hc->type, hc->n),
+                             quote_literal_cstr(psprintf(
+                                 "SELECT %s FROM coldfront_source WHERE coldfront_source.%s < %s",
+                                 projection, quote_identifier(partition_col), cutoff_lit))),
+                    true, 1) == SPI_OK_SELECT && SPI_processed == 1)
+    {
+        MemoryContext oldcxt = MemoryContextSwitchTo(CurTransactionContext);
+
+        sql = SPI_getvalue(SPI_tuptable->vals[0], SPI_tuptable->tupdesc, 1);
+        MemoryContextSwitchTo(oldcxt);
+    }
+    SPI_finish();
+    if (sql == NULL)
+        elog(ERROR, "coldfront: coldfront._cold_sink_sql returned nothing");
+    return sql;
 }
 
 /* The deparsed INSERT spells OVERRIDING SYSTEM VALUE or OVERRIDING USER VALUE
@@ -2836,7 +2868,7 @@ emit_tiered_insert(Query *query, TieredViewInfo *info, ColdParamSet *ps,
     hot_dml     = build_tiered_hot_dml(info->hot_table, col_list, override, col_list,
                                        "FROM coldfront_source",
                                        quote_identifier(info->partition_col), cutoff_lit);
-    cold_select = build_cold_sink_select(vschema, vname,
+    cold_select = build_cold_sink_select(vschema, vname, &hc,
                                          build_cold_projection(query, &hc, false),
                                          info->partition_col, cutoff_lit);
     return wrap_tiered_result(in_plpgsql, &dr, build_src_cte(query, source, col_list, &hc),
