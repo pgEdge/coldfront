@@ -1,4 +1,4 @@
-# COMPACTOR - Cold-Tier Table Maintenance
+# Compacting the Cold Tier
 
 `cmd/compactor` keeps a cold-tier Iceberg table healthy: it compacts each
 partition's small Parquet files into fewer large ones, expires old snapshots,
@@ -126,10 +126,10 @@ tables directly. Build the binary with `make compactor`, which vets, lints
 
 To go further with ColdFront, consult the following documents:
 
-- The [Using ColdFront](usage.md) guide covers the server configuration the
+- The [Using ColdFront](using_coldfront/index.md) guide covers the server configuration the
   compactor shares with the archiver, and the deployment YAML `import` writes
   into it.
 - The [Vector Storage](architecture_vectors.md) deep dive describes the sort
   key the compactor applies to clustered tables.
-- The [Architecture](architecture.md) overview describes the bakery claim each
+- The [Architecture](architecture_guides/index.md) overview describes the bakery claim each
   compaction step takes.

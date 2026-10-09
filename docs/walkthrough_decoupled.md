@@ -178,10 +178,10 @@ To go further with ColdFront, consult the following guides:
 
 - The [Partitioner Demo](walkthrough_partitioner.md) manages PostgreSQL range
   partitions without any cold tier.
-- The [Using ColdFront](usage.md) guide covers both modes in depth, including
+- The [Using ColdFront](using_coldfront/index.md) guide covers both modes in depth, including
   the full one-time setup, supported column types, the partition manager CLI,
   and tuning options.
-- The [Architecture](architecture.md) overview explains the shared mechanics
+- The [Architecture](architecture_guides/index.md) overview explains the shared mechanics
   and links to the per-mode deep dives.
 - The [Tearing Down the Stack](walkthrough.md#tearing-down-the-stack) section
   describes how to stop the stack and remove its data.

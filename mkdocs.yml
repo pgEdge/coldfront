@@ -30,6 +30,7 @@ theme:
     - navigation.tracking
     - navigation.prune
     - navigation.top
+    - navigation.indexes
     - toc.follow
 
   palette:
@@ -57,27 +58,45 @@ repo_url: https://github.com/pgEdge/ColdFront
 
 nav:
   - pgEdge ColdFront: index.md
-  - Installing and Configuring ColdFront: installation.md
-  - Getting Started:
-      - Getting Started with ColdFront: walkthrough.md
+
+  - Architecture Guides:
+      - architecture_guides/index.md
+      - Tiered Operating Mode: architecture_tiered.md
+      - Decoupled (Iceberg-Only) Operating Mode: architecture_decoupled.md
+      - Vector Storage Architecture: architecture_vectors.md
+
+  - Getting Started/Quick Start: walkthrough.md
+  - Installing ColdFront: installation.md
+  - Configuring ColdFront:
+      - configuration.md
+      - Configuring Lakekeeper: one_time_setup.md
+      - Configuring your Object Store: object_store.md
+
+  - Exploring ColdFront:
       - Exploring Tiered Storage: walkthrough_tiered.md
       - Exploring Decoupled Mode: walkthrough_decoupled.md
       - Exploring the Standalone Partitioner: walkthrough_partitioner.md
       - Exploring Distributed Mode: walkthrough_distributed.md
-      - Configuring your Object Store: object_store.md
 
-  - Architecture:
-      - pgEdge ColdFront - Architecture: architecture.md
-      - ColdFront - Tiered Operating Mode: architecture_tiered.md
-      - Decoupled (Iceberg-Only) Operating Mode: architecture_decoupled.md
-      - Vector Storage Architecture: architecture_vectors.md
+  - Using ColdFront:
+      - using_coldfront/index.md
+      - Using ColdFront in Tiered Mode: usage_tiered.md
+      - Using ColdFront in Decoupled Mode: usage_decoupled.md
+      - Using ColdFront in Standalone Partitioned Mode: usage_partitioner.md
+      - Working with Embeddings: usage_vectors.md
 
-  - Using ColdFront: usage.md
-  - Working with Embeddings: usage_vectors.md
-  - COMPACTOR - Cold-Tier Table Maintenance: compaction.md
+  - Administration:
+      - Understanding ColdFront Caveats: caveats.md
+      - Using Vended Credentials: vended_credentials.md
+      - Reading and Writing ColdFront Tables: reading_writing.md
+      - Understanding Supported Column Types: supported_types.md
+      - Setting Up a Distributed Deployment: distributed_setup.md
+      - Compacting the Cold Tier: compaction.md
 
   - Developer Resources:
       - Formal Model - ColdFront Decoupled-Mode Bakery (TLA+/PlusCal): formal/README.md
 
-  - Changelog: changelog.md
+  - Release Notes - Changelog: changelog.md
   - License: LICENSE.md
+
+  - Source: source.md

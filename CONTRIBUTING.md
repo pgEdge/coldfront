@@ -5,8 +5,8 @@ Thanks for your interest in improving ColdFront.
 ## Getting started
 
 - Build and run the stack: [Installation](docs/installation.md).
-- Day-to-day usage and the two operating modes: [Usage](docs/usage.md).
-- Architecture: [Architecture](docs/architecture.md) (plus the tiered/decoupled
+- Day-to-day usage and the two operating modes: [Usage](docs/using_coldfront/index.md).
+- Architecture: [Architecture](docs/architecture_guides/index.md) (plus the tiered/decoupled
   deep dives).
 
 ## Development workflow

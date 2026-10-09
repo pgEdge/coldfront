@@ -556,5 +556,5 @@ To go further with ColdFront, consult the following documents:
   searching vector columns.
 - The [Compaction](compaction.md) guide covers the maintenance that restores
   cluster order.
-- The [Architecture](architecture.md) overview describes the mechanics both
+- The [Architecture](architecture_guides/index.md) overview describes the mechanics both
   modes share.
