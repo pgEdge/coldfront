@@ -2421,7 +2421,7 @@ story_compactor_claim_matches_writes() {
     compactor_runs_beside_write TC-183 cf_cw 2 'expired [1-9][0-9]* snapshot' \
         --expire-snapshots --expire-older-than 0s --expire-retain-last 1 --expire-keep-files
     compactor_runs_beside_write TC-184 cf_ad 5 'compacted: [0-9]+ files'
-    compactor_runs_beside_write TC-185 cf_or 1 'deleted [0-9]+ orphan' --orphans
+    compactor_runs_beside_write TC-185 cf_or 1 'deleted 0 orphan' --orphans
     for t in cf_cw cf_ad cf_or; do
         q "$HOST" "SELECT coldfront.drop_iceberg_table('public','$t', true);" >/dev/null 2>&1
     done
