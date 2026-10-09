@@ -74,7 +74,7 @@ ERROR:  canceling statement due to lock timeout
 CONTEXT:  SQL statement "SELECT pg_advisory_xact_lock(hashtext('coldfront_iceberg:' || p_iceberg_ref))"
 PL/pgSQL function _take_iceberg_claim(text) line 13 at PERFORM
 SQL statement "SELECT coldfront._take_iceberg_claim(p_iceberg_table)"
-PL/pgSQL function _exec_iceberg_with_claim(text,text) line 40 at PERFORM
+PL/pgSQL function _exec_iceberg_with_claim(text,text) line 54 at PERFORM
 -- (3) The stock ordering claims first for an append too.
 SET coldfront.iceberg_async_parquet = off;
 SELECT coldfront._exec_iceberg_with_claim('temp.main.cf_order',
@@ -83,7 +83,7 @@ ERROR:  canceling statement due to lock timeout
 CONTEXT:  SQL statement "SELECT pg_advisory_xact_lock(hashtext('coldfront_iceberg:' || p_iceberg_ref))"
 PL/pgSQL function _take_iceberg_claim(text) line 13 at PERFORM
 SQL statement "SELECT coldfront._take_iceberg_claim(p_iceberg_table)"
-PL/pgSQL function _exec_iceberg_with_claim(text,text) line 40 at PERFORM
+PL/pgSQL function _exec_iceberg_with_claim(text,text) line 54 at PERFORM
 SET coldfront.iceberg_async_parquet = on;
 -- (4) The cold sink: a tiered INSERT's cold rows, one row per batch, are all
 --     staged in the statement; the claim at COMMIT meets the lock.

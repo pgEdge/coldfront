@@ -11,6 +11,7 @@ SELECT name, vartype, context, boot_val, min_val
                name                | vartype |  context  | boot_val | min_val 
 -----------------------------------+---------+-----------+----------+---------
  coldfront._async_downgrade_warned | bool    | user      | off      | 
+ coldfront._claim_generations      | string  | user      |          | 
  coldfront._claimed                | string  | user      |          | 
  coldfront._stream_state           | string  | user      |          | 
  coldfront.allow_mixed_writes      | bool    | user      | on       | 
@@ -24,7 +25,7 @@ SELECT name, vartype, context, boot_val, min_val
  coldfront.vector_nprobe           | integer | user      | 0        | 0
  coldfront.vector_probe            | bool    | user      | on       | 
  coldfront.warehouse               | string  | superuser |          | 
-(14 rows)
+(15 rows)
 
 -- The bakery's dead-peer window is superuser-only and at least 1 ms.
 CREATE ROLE cf_settings_app;

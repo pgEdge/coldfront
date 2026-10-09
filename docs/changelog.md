@@ -101,6 +101,11 @@ this project adheres to
   `UPDATE` or `MERGE`, the cross-tier move and `coldfront.vector_train` keep
   the claim-first ordering on every build, since their position deletes name
   the data files a concurrent compaction could rewrite.
+- An append to a clustered vector table in the async ordering is checked at
+  commit against the live centroid generation: a retrain that committed while
+  its rows were being assigned fails the transaction with
+  `serialization_failure`, for the client to retry, so no row lands with a
+  cluster of a replaced generation.
 - The mesh bakery no longer needs the `dblink` extension. Claims, acks,
   releases and orphan reaping run over a libpq loopback connection that the
   extension opens from `coldfront.loopback_dsn`, which must name a unix socket.

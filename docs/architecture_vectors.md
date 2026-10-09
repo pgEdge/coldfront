@@ -160,8 +160,7 @@ expression that yields the vector as DuckDB sees it, it returns:
 (SELECT arg_min(c.centroid_id, list_cosine_distance(c.centroid, <vec_expr>))
    FROM pglocal.coldfront.vector_centroids c
   WHERE c.schema_name = … AND c.table_name = … AND c.column_name = …
-    AND c.generation = (SELECT vc.generation FROM pglocal.coldfront.vector_config vc
-                         WHERE …))
+    AND c.generation = getvariable('cf_gen_<hash of schema.table.column>'))
 ```
 
 A row whose cluster disagrees with its vector is invisible to its own search
@@ -180,19 +179,28 @@ with the DSN from the `coldfront.local_pg_dsn` GUC. As a consequence, the
 PostgreSQL table stays the only copy of the centroids, no path inlines a
 centroid set, and no path keeps a session copy it has no way to check.
 
-**The generation is resolved by the emitted SQL, not baked into it.** A
-statement generated once, such as a trigger body, keeps assigning against the
-live generation after a retrain instead of filtering on one that no longer
-exists.
+**The generation is a DuckDB session variable the write sets at execution,**
+from PostgreSQL's own read of the config (`coldfront._pin_claim_generation`,
+run by `coldfront._exec_iceberg_with_claim` before the statement). A statement
+generated once, such as a trigger body, keeps assigning against the live
+generation after a retrain, and the assignment uses the generation PostgreSQL
+chose whatever the second session's snapshot shows: a generation's centroids
+never change once trained, and a session that cannot see them yet leaves the
+row unassigned.
 
-Before any training the config has no generation, the inner query matches
-nothing, and the expression yields `NULL`. Unassigned is a legitimate value:
+Before any training the variable is `0` or unset, no centroid matches, and the
+expression yields `NULL`. Unassigned is a legitimate value:
 rows a foreign engine appended straight to Iceberg have none either, and the
 read path handles them explicitly.
 
-A retrain cannot interleave with a cold write, because an operation that
-rewrites the table holds the table's claim and every cold write serializes on
-that same claim.
+A write that takes the claim before it assigns cannot interleave with a retrain,
+because the retrain holds the table's claim from its sample to its commit. An
+append in the async ordering pins the generation when it stages and takes the
+claim at commit; there, under the claim, the commit callback compares the
+pinned generation with the live one and fails the transaction with
+`serialization_failure` (SQLSTATE 40001) if a retrain committed in between, so
+no row lands with a cluster of a replaced generation and the client retries, as
+under SERIALIZABLE.
 
 ### The Six Paths
 

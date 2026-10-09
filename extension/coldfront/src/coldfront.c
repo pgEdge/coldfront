@@ -270,6 +270,7 @@ static bool  coldfront_iceberg_async_parquet  = false;
 static bool  coldfront_iceberg_bakery_patch   = false;
 static char *coldfront_claimed                = NULL;
 static char *coldfront_stream_state           = NULL;
+static char *coldfront_claim_generations      = NULL;
 static bool  coldfront_async_downgrade_warned = false;
 
 static post_parse_analyze_hook_type prev_post_parse_analyze_hook = NULL;
@@ -4811,7 +4812,9 @@ cf_statement_timeout_applies(void)
  * at PRE_COMMIT: the transaction is still open, so SPI runs here under a
  * snapshot pushed for it (no statement is active at this point), and the ERROR
  * a timeout or a refused claim raises aborts the transaction, whose ABORT
- * event then drops the queue. PostgreSQL switches statement_timeout off before
+ * event then drops the queue. With the claims held, a clustered table's append
+ * is checked against the live centroid generation (_verify_claim_generation).
+ * PostgreSQL switches statement_timeout off before
  * commit processing (finish_xact_command), so the wait for the claim, whose
  * protocol has no timeout of its own, would be the one part of the statement
  * the setting does not bound: the timer runs again, at the statement's own
@@ -4838,6 +4841,17 @@ cf_take_pending_claims(void)
         if (SPI_execute_with_args("SELECT coldfront._take_iceberg_claim($1)",
                                   1, argtypes, values, NULL, false, 0) != SPI_OK_SELECT)
             elog(ERROR, "coldfront: taking the claim on %s failed", (char *) lfirst(lc));
+    }
+    PopActiveSnapshot();
+    PushActiveSnapshot(GetLatestSnapshot());
+    foreach(lc, coldfront_pending_claims)
+    {
+        Oid   argtypes[1] = { TEXTOID };
+        Datum values[1]   = { CStringGetTextDatum((char *) lfirst(lc)) };
+
+        if (SPI_execute_with_args("SELECT coldfront._verify_claim_generation($1)",
+                                  1, argtypes, values, NULL, true, 0) != SPI_OK_SELECT)
+            elog(ERROR, "coldfront: checking the centroid generation of %s failed", (char *) lfirst(lc));
     }
     SPI_finish();
     PopActiveSnapshot();
@@ -6201,6 +6215,16 @@ register_gucs(void)
         "Iceberg tables this transaction holds a bakery claim on, one per line.",
         NULL,
         &coldfront_claimed,
+        "",
+        PGC_USERSET,
+        0,
+        NULL, NULL, NULL);
+
+    DefineCustomStringVariable(
+        "coldfront._claim_generations",
+        "Per clustered table this transaction appended to in the async ordering, the centroid generation its rows were assigned against, one per line.",
+        NULL,
+        &coldfront_claim_generations,
         "",
         PGC_USERSET,
         0,

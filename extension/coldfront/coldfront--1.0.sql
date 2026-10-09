@@ -514,7 +514,7 @@ BEGIN
 
   -- coldfront schema + registry read + the dual-write anchor table.
   EXECUTE format('GRANT USAGE ON SCHEMA coldfront TO %s', tgt);
-  EXECUTE format('GRANT SELECT ON coldfront.tiered_views, coldfront.archive_watermark TO %s', tgt);
+  EXECUTE format('GRANT SELECT ON coldfront.tiered_views, coldfront.archive_watermark, coldfront.vector_config TO %s', tgt);
   EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON coldfront._dummy_dml_target TO %s', tgt);
 
   -- EXECUTE on the runtime cold-path functions only (allow-list mirrors coldfront.c).
@@ -541,6 +541,9 @@ BEGIN
                         -- cold rows via _move_row_literal.
                         '_cross_tier_move', '_move_row_literal', '_move_pg_row_literal',
                         '_enqueue_release', '_enqueue_claim',
+                        -- a clustered write's generation, pinned at staging and checked at commit
+                        '_pin_claim_generation', '_verify_claim_generation', '_generation_fingerprint',
+                        '_vec_generation_var',
                         -- cold-write preconditions + serializer gate wrappers (the
                         -- standby refusal, the armed-predicate, the Spock-without-
                         -- bakery refusal, the claim-or-advisory acquire); app-role
@@ -2340,19 +2343,24 @@ $$;
 --
 -- Two properties are deliberate. The centroids are read over pglocal, so the
 -- PostgreSQL table is the only copy and no path has to inline a centroid set or
--- keep a session copy it has no way to check. And the generation is resolved by
--- the emitted SQL rather than baked into it, so a statement generated once (a
--- trigger body) keeps assigning against the live generation after a retrain
--- instead of filtering on a generation that no longer exists.
+-- keep a session copy it has no way to check. And the generation is a DuckDB
+-- session variable (_vec_generation_var) that the write sets at execution from
+-- PostgreSQL's own read of the config (_pin_claim_generation, in
+-- _exec_iceberg_with_claim), so a statement generated once (a trigger body)
+-- keeps assigning against the live generation after a retrain, and the
+-- assignment uses the generation PostgreSQL chose whatever pglocal's snapshot
+-- shows: a generation's centroids never change once trained, and a session that
+-- cannot see them yet leaves the row unassigned.
 --
--- Before any training the config carries no generation, the inner query matches
--- nothing, and the expression yields NULL: unassigned, which a probe reads
--- through the null arm of its predicate rather than missing. A retrain cannot
--- interleave with a cold write, since vector_train holds the table's claim from
--- its sample to its commit and every cold write serialises on that same claim;
--- an append staged in the async ordering assigns against the generation live
--- when it stages, so one staged during a retrain lands with the generation the
--- retrain replaced, and the next retrain reassigns it.
+-- Before any training the variable is 0 or unset, no centroid matches, and the
+-- expression yields NULL: unassigned, which a probe reads through the null arm
+-- of its predicate rather than missing. A write that claims before it assigns
+-- cannot interleave with a retrain, since vector_train holds the table's claim
+-- from its sample to its commit; an append staged in the async ordering claims
+-- at commit, where the callback compares the generation it pinned with the live
+-- one and fails the transaction if a retrain replaced it
+-- (_verify_claim_generation), so no row lands with a cluster of a replaced
+-- generation.
 --
 -- The formula itself is _vec_nearest_expr, shared with vector_train, which scores
 -- the generation it has just trained from its own session: one formula, so a
@@ -2364,6 +2372,15 @@ LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
                   p_vec_expr, p_from);
 $$;
 
+-- The DuckDB session variable that holds a column's centroid generation for
+-- the assignment, a plain identifier whatever the names hold.
+CREATE OR REPLACE FUNCTION coldfront._vec_generation_var(
+    p_schema text, p_table text, p_column text)
+RETURNS text
+LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
+    SELECT 'cf_gen_' || md5(p_schema || '.' || p_table || '.' || p_column);
+$$;
+
 CREATE OR REPLACE FUNCTION coldfront._vec_list_expr(
     p_schema text, p_table text, p_column text, p_vec_expr text)
 RETURNS text
@@ -2371,10 +2388,9 @@ LANGUAGE sql IMMUTABLE STRICT PARALLEL SAFE AS $$
     SELECT coldfront._vec_nearest_expr(format(
         'pglocal.coldfront.vector_centroids c '
         'WHERE c.schema_name = %L AND c.table_name = %L AND c.column_name = %L '
-          'AND c.generation = (SELECT vc.generation FROM pglocal.coldfront.vector_config vc '
-                              'WHERE vc.schema_name = %L AND vc.table_name = %L '
-                                'AND vc.column_name = %L)',
-        p_schema, p_table, p_column, p_schema, p_table, p_column), p_vec_expr);
+          'AND c.generation = getvariable(%L)',
+        p_schema, p_table, p_column,
+        coldfront._vec_generation_var(p_schema, p_table, p_column)), p_vec_expr);
 $$;
 
 -- The cluster columns for an Iceberg ref, quoted and comma-joined in schema order.
@@ -4229,6 +4245,81 @@ CREATE FUNCTION coldfront._enqueue_claim(p_iceberg_table text)
 RETURNS void
 LANGUAGE c AS 'coldfront', 'coldfront_enqueue_claim';
 
+-- coldfront._generation_fingerprint: the trained generations of a table's
+-- vector columns as one text, "<column>=<generation>" per column, NULL before
+-- any training.
+CREATE FUNCTION coldfront._generation_fingerprint(p_schema text, p_table text)
+RETURNS text
+LANGUAGE sql STABLE AS $$
+    SELECT string_agg(column_name || '=' || generation, ',' ORDER BY column_name)
+      FROM coldfront.vector_config
+     WHERE schema_name = p_schema AND table_name = p_table AND generation > 0;
+$$;
+
+-- coldfront._pin_claim_generation: before a cold write to a clustered table
+-- stages, the generation of each vector column, read here from the config, is
+-- set as the DuckDB session variable the assignment filters the centroids by
+-- (_vec_list_expr), so the rows are assigned against the generation this
+-- session sees. Returns the table's fingerprint, "<column>=<generation>" per
+-- trained column, NULL for an untrained or unclustered table.
+CREATE FUNCTION coldfront._pin_claim_generation(p_iceberg_table text)
+RETURNS text
+LANGUAGE plpgsql AS $$
+DECLARE
+    v_schema text;
+    v_table  text;
+    v_fp     text;
+    r        record;
+BEGIN
+    SELECT tv.schema_name, tv.relname INTO v_schema, v_table
+      FROM coldfront.tiered_views tv
+     WHERE tv.iceberg_table = p_iceberg_table AND tv.vec_columns IS NOT NULL;
+    IF v_table IS NULL THEN
+        RETURN NULL;
+    END IF;
+    FOR r IN SELECT column_name, generation
+               FROM coldfront.vector_config
+              WHERE schema_name = v_schema AND table_name = v_table
+              ORDER BY column_name
+    LOOP
+        PERFORM duckdb.raw_query(format('SET VARIABLE %s = %s',
+            coldfront._vec_generation_var(v_schema, v_table, r.column_name), r.generation));
+        IF r.generation > 0 THEN
+            v_fp := concat_ws(',', v_fp, r.column_name || '=' || r.generation);
+        END IF;
+    END LOOP;
+    RETURN v_fp;
+END;
+$$;
+
+-- coldfront._verify_claim_generation: the commit callback's check, under the
+-- claim and at the latest snapshot, that the generation an async append pinned
+-- (coldfront._claim_generations, "<ref> <fingerprint>" per line) is the live
+-- one. Where a retrain replaced it, the transaction fails with
+-- serialization_failure, for the client to retry, and its ABORT releases the
+-- claims.
+CREATE FUNCTION coldfront._verify_claim_generation(p_iceberg_table text)
+RETURNS void
+LANGUAGE plpgsql STABLE AS $$
+DECLARE
+    v_schema text;
+    v_table  text;
+BEGIN
+    SELECT tv.schema_name, tv.relname INTO v_schema, v_table
+      FROM coldfront.tiered_views tv
+     WHERE tv.iceberg_table = p_iceberg_table;
+    IF EXISTS (SELECT 1
+                 FROM unnest(string_to_array(current_setting('coldfront._claim_generations'), E'\n')) AS l
+                WHERE split_part(l, ' ', 1) = p_iceberg_table
+                  AND split_part(l, ' ', 2)
+                      IS DISTINCT FROM coldfront._generation_fingerprint(v_schema, v_table)) THEN
+        RAISE EXCEPTION 'coldfront: a retrain of %.% committed while this transaction''s rows were being assigned to its clusters',
+            quote_ident(v_schema), quote_ident(v_table)
+            USING ERRCODE = 'serialization_failure', HINT = 'Retry the transaction.';
+    END IF;
+END;
+$$;
+
 -- coldfront._reject_on_standby: refuse a cold-tier mutation on a physical standby.
 -- PostgreSQL's read-only enforcement covers only its own writes; a cold write leaves
 -- PG entirely (DuckDB to object storage), so the cold tier relies on this explicit
@@ -4344,7 +4435,10 @@ $$;
 --     claim. The patch re-stamps parent_snapshot_id at the POST, under the
 --     claim, and a new data file conflicts with nothing a peer or a compaction
 --     commits in between (docs/formal Bakery_async.cfg,
---     Bakery_async_samenode.cfg and Bakery_async_single.cfg).
+--     Bakery_async_samenode.cfg and Bakery_async_single.cfg). An append to a
+--     clustered table pins the centroid generation its assignment uses
+--     (_pin_claim_generation); the callback checks that generation under the
+--     claim and fails the transaction where a retrain replaced it.
 --   * A write that references rows already in the table (DELETE, UPDATE, MERGE,
 --     the cross-tier move's bundle) takes the claim FIRST, whatever the build:
 --     its position deletes name data files by path, and a compaction or another
@@ -4371,7 +4465,13 @@ DECLARE
     -- Every statement here is generated by coldfront, and an append starts
     -- with its verb; a DELETE-led bundle or an UPDATE does not.
     v_append  boolean := upper(ltrim(p_sql)) LIKE 'INSERT %';
+    v_pinned  text;
 BEGIN
+    -- A cluster assignment filters the centroids by the generation this session
+    -- sets before the statement runs (_pin_claim_generation).
+    IF strpos(p_sql, 'getvariable(''cf_gen_') > 0 THEN
+        v_pinned := coldfront._pin_claim_generation(p_iceberg_table);
+    END IF;
     -- A cluster assignment reads the centroids over pglocal, so a statement that
     -- names it needs pglocal attached in this backend. Tested on the statement
     -- rather than the table: this wrapper is the one chokepoint every C-generated
@@ -4398,9 +4498,17 @@ BEGIN
         PERFORM set_config('coldfront._async_downgrade_warned', 'on', false);
     END IF;
     IF v_async AND v_append THEN
-        -- Patched iceberg: stage the parquet now, claim at PRE_COMMIT.
+        -- Patched iceberg: stage the parquet now, claim at PRE_COMMIT, where a
+        -- clustered table's pinned generation is checked against the live one
+        -- (_verify_claim_generation).
         PERFORM coldfront._refuse_spock_without_bakery();
         PERFORM duckdb.raw_query(p_sql);
+        IF v_pinned IS NOT NULL THEN
+            PERFORM set_config('coldfront._claim_generations',
+                               concat_ws(E'\n', NULLIF(current_setting('coldfront._claim_generations'), ''),
+                                         p_iceberg_table || ' ' || v_pinned),
+                               true);
+        END IF;
         PERFORM coldfront._enqueue_claim(p_iceberg_table);
     ELSE
         -- Acquire FIRST, then stage+commit inside the claim.
