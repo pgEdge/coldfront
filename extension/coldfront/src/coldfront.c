@@ -269,6 +269,7 @@ static int   coldfront_peer_alive_window_ms   = 10000;
 static bool  coldfront_iceberg_async_parquet  = false;
 static bool  coldfront_iceberg_bakery_patch   = false;
 static char *coldfront_claimed                = NULL;
+static char *coldfront_stream_state           = NULL;
 static bool  coldfront_async_downgrade_warned = false;
 
 static post_parse_analyze_hook_type prev_post_parse_analyze_hook = NULL;
@@ -2425,16 +2426,19 @@ build_tiered_hot_dml(const char *hot_table, const char *col_list,
 /*
  * Whether a tiered INSERT's cold half can stream, and the tables its source
  * reads. The stream reads the source again from another session over libpq
- * (coldfront._tiered_cold_stream), so it is sound only when that session sees
- * what the hot half saw: coldfront.local_pg_dsn names it; the transaction is
- * READ COMMITTED, so the hot half's snapshot is the statement's and not an
- * older one; the source has no WITH entry; every function in it is IMMUTABLE,
- * since a volatile one yields other rows and a stable one (now(), the
- * timezone-dependent timestamptz arithmetic, a text-to-timestamptz cast) may
- * yield other values in a session with other settings; it reads no temporary
- * table, no view that reads one or calls such a function, nothing but tables;
- * and this transaction has written none of those tables. Anything else goes
- * to the sink shape, which reads the source once for both halves.
+ * (coldfront._tiered_cold_stream), at this statement's snapshot, which the
+ * emitted SQL exports (coldfront._stream_snapshot) and that session imports
+ * before it reads. So it is sound when: coldfront.local_pg_dsn names the
+ * session; the transaction is not SERIALIZABLE, whose conflict detection would
+ * not see that session's read; the source has no WITH entry; every function in
+ * it is IMMUTABLE, since a volatile one yields other rows and a stable one
+ * (now(), the timezone-dependent timestamptz arithmetic, a text-to-timestamptz
+ * cast) may yield other values in a session with other settings; it reads no
+ * temporary table, no view that reads one or calls such a function, nothing
+ * but tables; and this transaction has written none of those tables, which
+ * the shared snapshot would not show. Anything else goes to the sink shape,
+ * which reads the source once for both halves, as does, at execution, a
+ * statement whose snapshot cannot be shared (_tiered_cold_stream).
  */
 typedef struct {
     Oid   result_relid;   /* the view being written, or the view being expanded */
@@ -2588,6 +2592,20 @@ coldfront_written_in_xact(PG_FUNCTION_ARGS)
     PG_RETURN_BOOL(cf_written_in_xact(rels));
 }
 
+/* The statement's snapshot, exported for the stream's second session, or NULL
+ * where it cannot be shared: a SERIALIZABLE transaction's conflict detection
+ * would not see that session's read, and a subtransaction cannot export one
+ * (pg_duckdb refuses every cold write there, so the statement then fails with
+ * pg_duckdb's error rather than a snapshot one). */
+PG_FUNCTION_INFO_V1(coldfront_stream_snapshot);
+Datum
+coldfront_stream_snapshot(PG_FUNCTION_ARGS)
+{
+    if (IsSubTransaction() || XactIsoLevel == XACT_SERIALIZABLE)
+        PG_RETURN_NULL();
+    PG_RETURN_TEXT_P(cstring_to_text(ExportSnapshot(GetActiveSnapshot())));
+}
+
 static bool
 cf_tiered_insert_streams(Query *query, Oid view_relid, List **sources)
 {
@@ -2596,7 +2614,7 @@ cf_tiered_insert_streams(Query *query, Oid view_relid, List **sources)
     *sources = NIL;
     if (coldfront_local_pg_dsn == NULL || coldfront_local_pg_dsn[0] == '\0')
         return false;
-    if (IsolationUsesXactSnapshot() || query->cteList != NIL)
+    if (XactIsoLevel == XACT_SERIALIZABLE || query->cteList != NIL)
         return false;
     if (contain_mutable_functions((Node *) query))
         return false;
@@ -2859,10 +2877,11 @@ emit_tiered_insert(Query *query, TieredViewInfo *info, ColdParamSet *ps,
             ? psprintf("(SELECT count(*) FROM coldfront_hot) < %d", nvalues)
             : psprintf("EXISTS (SELECT 1 FROM (%s) AS coldfront_src(%s) WHERE %s < %s)",
                        source, col_list, pc_expr, cutoff_lit);
-        cold_select = psprintf("SELECT coldfront._tiered_cold_stream(%s, %s, %s, %s, %s) AS n",
+        cold_select = psprintf("SELECT coldfront._tiered_cold_stream(%s, %s, %s, %s, %s, "
+                               "CASE WHEN %s THEN coldfront._stream_snapshot() END) AS n",
                                quote_literal_cstr(vschema), quote_literal_cstr(vname),
                                cf_stream_pg_select(query, info, &hc, col_list, ps),
-                               cf_regclass_array(sources), any_cold);
+                               cf_regclass_array(sources), any_cold, any_cold);
         return wrap_tiered_result(in_plpgsql, &dr, NULL, hot_dml, cold_select, "< 0");
     }
 
@@ -6182,6 +6201,16 @@ register_gucs(void)
         "Iceberg tables this transaction holds a bakery claim on, one per line.",
         NULL,
         &coldfront_claimed,
+        "",
+        PGC_USERSET,
+        0,
+        NULL, NULL, NULL);
+
+    DefineCustomStringVariable(
+        "coldfront._stream_state",
+        "The snapshot the tiered stream's second session reads at in this transaction: none yet, one of its own (used), or this transaction's (imported).",
+        NULL,
+        &coldfront_stream_state,
         "",
         PGC_USERSET,
         0,

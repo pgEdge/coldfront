@@ -5,8 +5,8 @@
 -- defaults drawn in that session. Observed end to end: a DuckDB temporary table
 -- stands in for the Iceberg table and is read back with duckdb.query. A source
 -- the hook cannot read twice (a volatile or stable function, a temporary table,
--- a WITH entry, a view over one, a table this transaction wrote, a transaction
--- that is not READ COMMITTED, no local_pg_dsn) goes through the cold sink in one
+-- a WITH entry, a view over one, a table this transaction wrote, a SERIALIZABLE
+-- transaction, no local_pg_dsn) goes through the cold sink in one
 -- pass, and a cached plan that meets such a transaction falls back inside the
 -- stream.
 SET client_min_messages = warning;
@@ -83,7 +83,9 @@ SELECT * FROM public.cf_stream_ids;
 -- (4) A prepared statement with a bound parameter streams from its cached plan
 --     and keeps the parameter live. Run again in a transaction that wrote the
 --     source table, the stream's check falls back to reading in this session,
---     so the row written in the transaction is tiered too.
+--     so the row written in the transaction is tiered too, and a SERIALIZABLE
+--     transaction, whose snapshot the stream cannot share, falls back the same
+--     way.
 PREPARE cf_prep(text) AS
   INSERT INTO public.cf_stream (ts, status) SELECT ts, $1 FROM public.cf_staging WHERE ts < '2026-03-01';
 EXECUTE cf_prep('prep1');
@@ -91,7 +93,7 @@ BEGIN;
 INSERT INTO public.cf_staging VALUES ('2026-01-20', 'cold4', NULL, NULL, NULL);
 EXECUTE cf_prep('prep2');
 COMMIT;
-BEGIN ISOLATION LEVEL REPEATABLE READ;
+BEGIN ISOLATION LEVEL SERIALIZABLE;
 EXECUTE cf_prep('prep3');
 COMMIT;
 SELECT status, count(*) FROM public.cf_stream_cold WHERE status LIKE 'prep%' GROUP BY status ORDER BY status;
@@ -131,7 +133,7 @@ EXPLAIN (COSTS OFF, VERBOSE)
   INSERT INTO public.cf_stream (ts, status) SELECT ts, status FROM public.cf_staging;
 INSERT INTO public.cf_stream (ts, status) SELECT ts, 'txn' FROM public.cf_staging WHERE status = 'cold5';
 COMMIT;
-BEGIN ISOLATION LEVEL REPEATABLE READ;
+BEGIN ISOLATION LEVEL SERIALIZABLE;
 EXPLAIN (COSTS OFF, VERBOSE)
   INSERT INTO public.cf_stream (ts, status) SELECT ts, status FROM public.cf_staging;
 COMMIT;

@@ -339,26 +339,35 @@ The query is deparsed with an empty `search_path`, so every relation, function
 and operator is schema-qualified whatever the second session's path is, and
 its literals and parameters are rendered by `coldfront._canonical_text`, whose
 ISO dates, full-precision floats and fixed interval shape read the same under
-that session's `DateStyle`, `IntervalStyle` and `extra_float_digits`. `pgstream` is attached at
-READ COMMITTED, so each statement's read takes a snapshot of its own and sees
-what the hot half saw; the `pglocal` attachment the other cold paths read
-through stays at REPEATABLE READ, which the extension needs to give a parallel
-table scan one snapshot. The hot half still reads the source as the caller, so
+that session's `DateStyle`, `IntervalStyle` and `extra_float_digits`. The
+second session reads at the statement's snapshot: the rewrite exports it with
+`coldfront._stream_snapshot()` as the statement runs, and `pgstream`, attached
+at REPEATABLE READ, imports it with `SET TRANSACTION SNAPSHOT` before its first
+read, so both halves see one state of the tables however other sessions commit
+meanwhile, and a REPEATABLE READ transaction's later statements stream from
+the snapshot they share. The hot half reads the source as the caller, so
 PostgreSQL checks the caller's `SELECT` privilege on it; the second session
 reads as the `coldfront.local_pg_dsn` user.
 
 The stream reads the source twice, once per half, so it is used only when the
-hook can prove the second read sees what the first did: the transaction is
-READ COMMITTED; the `INSERT` has no `WITH` clause; every function in the source
-is IMMUTABLE (a volatile one yields other rows, and a stable one such as
-`now()`, `ts + interval '1 day'` or a text-to-timestamptz cast may yield other
-values under the second session's settings); the source reads only tables, no
+hook can prove the second read sees what the first did: the transaction is not
+SERIALIZABLE, whose conflict detection would not see the second session's
+read; the `INSERT` has no `WITH` clause; every function in the source is
+IMMUTABLE (a volatile one yields other rows, and a stable one such as `now()`,
+`ts + interval '1 day'` or a text-to-timestamptz cast may yield other values
+under the second session's settings); the source reads only tables, no
 temporary table, no view over one or over such a function, no foreign table;
-this transaction has written none of those tables (or their partitions); and
-`coldfront.local_pg_dsn` is set. A cached plan runs in transactions the hook
-never saw, so the stream checks the isolation level and the written tables
-again at execution and, when either fails, runs the same query in the calling
-session and feeds its rows to the sink below.
+this transaction has written none of those tables (or their partitions), since
+its own writes are not in the shared snapshot; and `coldfront.local_pg_dsn` is
+set. The snapshot is shared once per transaction: a second table-reading
+`INSERT` in one READ COMMITTED transaction, or one after a `VALUES` source
+streamed in it, takes the sink. A `VALUES` source reads no table and streams
+without one. A statement in a subtransaction (a `SAVEPOINT`, a plpgsql
+`EXCEPTION` block) cannot export a snapshot, and pg_duckdb refuses every cold
+write there, so it fails with pg_duckdb's error rather than a snapshot one. A
+cached plan runs in transactions the hook never saw, so the stream
+checks these conditions again at execution and, when one fails, runs the same
+query in the calling session and feeds its rows to the sink below.
 
 Every other source takes the sink shape, which reads the source once:
 

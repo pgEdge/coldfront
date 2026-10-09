@@ -424,15 +424,14 @@ $$ LANGUAGE plpgsql SECURITY DEFINER SET search_path = pg_catalog, pg_temp;
 
 -- ensure_stream_attached() attaches the local instance a second time, as
 -- `pgstream`, for the tiered INSERT's cold stream (coldfront._tiered_cold_stream).
--- pglocal runs REPEATABLE READ, which DuckDB's postgres extension needs to
--- give a parallel table scan one snapshot, and that pins the first read's
--- snapshot for the rest of the DuckDB transaction; the stream wants each
--- statement to read what its hot half read, so its attachment runs READ
--- COMMITTED, and a stream is one connection with no parallel scan to keep
--- consistent. The stream's query draws identity values and defaults in that
--- session, so unlike pglocal's uses it writes: nextval() on the hot table's
--- sequences. application_name tags the session and keeps the connection
--- string distinct from pglocal's.
+-- The stream reads the source at the snapshot the calling statement exported,
+-- which SET TRANSACTION SNAPSHOT takes only in a REPEATABLE READ or
+-- SERIALIZABLE transaction, so the attachment runs REPEATABLE READ, and the
+-- session holds that snapshot for the rest of the DuckDB transaction, as
+-- pglocal's does. The stream's query draws identity values and defaults in
+-- that session, so unlike pglocal's uses it writes: nextval() on the hot
+-- table's sequences. application_name tags the session and keeps the
+-- connection string distinct from pglocal's.
 CREATE OR REPLACE FUNCTION coldfront.ensure_stream_attached() RETURNS void AS $$
 DECLARE
   dsn text := current_setting('coldfront.local_pg_dsn', true);
@@ -440,7 +439,7 @@ BEGIN
   IF dsn IS NOT NULL AND dsn <> '' THEN
     PERFORM duckdb.raw_query('LOAD postgres');
     PERFORM duckdb.raw_query(format(
-      'ATTACH IF NOT EXISTS %L AS pgstream (TYPE postgres, isolation_level ''READ COMMITTED'')',
+      'ATTACH IF NOT EXISTS %L AS pgstream (TYPE postgres, isolation_level ''REPEATABLE READ'')',
       dsn || ' application_name=coldfront_pgstream'
     ));
   END IF;
@@ -525,8 +524,8 @@ BEGIN
     WHERE p.pronamespace = 'coldfront'::regnamespace
       AND p.proname IN ('ensure_attached', 'ensure_pg_attached', 'ensure_stream_attached',
                         '_exec_iceberg_with_claim',
-                        -- the tiered INSERT's cold stream and its execution-time check
-                        '_tiered_cold_stream', '_written_in_xact',
+                        -- the tiered INSERT's cold stream, its snapshot and its execution-time check
+                        '_tiered_cold_stream', '_stream_snapshot', '_written_in_xact',
                         -- the tiered INSERT's cold sink, its statement and its row renderer
                         '_cold_sink', '_cold_sink_step', '_cold_sink_final',
                         '_cold_sink_sql', '_cold_row_literal',
@@ -1074,6 +1073,15 @@ CREATE AGGREGATE coldfront._cold_sink(text, text, text, bigint) (
 CREATE FUNCTION coldfront._written_in_xact(p_rels regclass[]) RETURNS boolean
 LANGUAGE c AS 'coldfront', 'coldfront_written_in_xact';
 
+-- coldfront._stream_snapshot: the statement's snapshot, exported for the
+-- stream's second session, or NULL where it cannot be shared: under
+-- SERIALIZABLE, whose conflict detection would not see that session's read,
+-- and inside a subtransaction, which cannot export one and where pg_duckdb
+-- refuses every cold write, so the statement fails with pg_duckdb's error
+-- rather than a snapshot one.
+CREATE FUNCTION coldfront._stream_snapshot() RETURNS text
+LANGUAGE c AS 'coldfront', 'coldfront_stream_snapshot';
+
 -- coldfront._tiered_cold_stream: the cold half of a tiered-view INSERT whose
 -- source the hook proved safe to read from another session (emit_tiered_insert
 -- in coldfront.c). p_pg_sql is that read: the cold projection, every hot-table
@@ -1085,16 +1093,26 @@ LANGUAGE c AS 'coldfront', 'coldfront_written_in_xact';
 -- clustered table and ordered by it so this write's row groups each hold
 -- roughly one cluster. p_any_cold is false when the source has no cold row,
 -- and nothing runs: an all-hot INSERT stages nothing and takes no claim.
--- p_sources are the tables the source reads. A cached plan runs in
--- transactions the hook never saw, so two of its conditions are checked again
--- here: when the transaction is not READ COMMITTED, or has written a source
--- table, the other session's snapshot would not match the hot half's, so the
--- same read runs in this session and its rows go through the cold sink.
--- Returns the cold row count where this session counted it, 0 with no cold
--- row and the sink's count after the fallback, and NULL when the rows
--- streamed, since DuckDB keeps that count.
+-- p_sources are the tables the source reads, and p_snapshot is the statement's
+-- snapshot, exported by coldfront._stream_snapshot in the same statement, or
+-- NULL where it could not be. The pgstream session reads the source at that
+-- snapshot, so both halves see one state of the tables however other sessions
+-- commit meanwhile: SET TRANSACTION SNAPSHOT imports it as the first statement
+-- of that session's transaction, which DuckDB holds open for the rest of this
+-- one. The transaction-local coldfront._stream_state records what the session
+-- then holds: 'imported', this transaction's snapshot, which a later statement
+-- shares only under REPEATABLE READ, where the snapshot is the transaction's;
+-- or 'used', a snapshot of its own, after a VALUES source, which reads no
+-- table and streams without one. A source that reads tables streams when its
+-- snapshot can be shared and this transaction has written none of the tables
+-- (its own writes are not in the snapshot); otherwise, as in a transaction the
+-- hook never saw (a cached plan), the same read runs in this session and its
+-- rows go through the cold sink. Returns the cold row count where this session
+-- counted it, 0 with no cold row and the sink's count after the fallback, and
+-- NULL when the rows streamed, since DuckDB keeps that count.
 CREATE FUNCTION coldfront._tiered_cold_stream(
-    p_schema text, p_view text, p_pg_sql text, p_sources regclass[], p_any_cold boolean
+    p_schema text, p_view text, p_pg_sql text, p_sources regclass[], p_any_cold boolean,
+    p_snapshot text
 ) RETURNS bigint
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -1104,6 +1122,8 @@ DECLARE
     v_types   text[];
     v_prefix  text;
     v_count   bigint;
+    v_state   text := current_setting('coldfront._stream_state');
+    v_shared  boolean := cardinality(p_sources) > 0;
 BEGIN
     IF NOT p_any_cold THEN
         RETURN 0;
@@ -1126,8 +1146,12 @@ BEGIN
        AND c.relname = (parse_ident(v_hot))[2]
        AND a.attnum > 0 AND NOT a.attisdropped
        AND NOT coldfront._is_vec_companion(a.attname, a.attgenerated);
-    IF current_setting('transaction_isolation') <> 'read committed'
-       OR coldfront._written_in_xact(p_sources) THEN
+    IF v_shared
+       AND (p_snapshot IS NULL
+            OR v_state = 'used'
+            OR (v_state = 'imported'
+                AND current_setting('transaction_isolation') <> 'repeatable read')
+            OR coldfront._written_in_xact(p_sources)) THEN
         EXECUTE coldfront._cold_sink_sql(p_schema, p_view, v_names, v_types, p_pg_sql)
            INTO v_count;
         RETURN v_count;
@@ -1136,6 +1160,14 @@ BEGIN
     SET LOCAL duckdb.unsafe_allow_mixed_transactions = on;
     PERFORM coldfront.ensure_attached();
     PERFORM coldfront.ensure_stream_attached();
+    IF v_state = '' THEN
+        IF v_shared THEN
+            PERFORM duckdb.raw_query(format('CALL postgres_execute(%L, %L)', 'pgstream',
+                                            format('SET TRANSACTION SNAPSHOT %L', p_snapshot)));
+        END IF;
+        PERFORM set_config('coldfront._stream_state',
+                           CASE WHEN v_shared THEN 'imported' ELSE 'used' END, true);
+    END IF;
     PERFORM coldfront._exec_iceberg_with_claim(v_iceberg, format(
         'INSERT INTO %s SELECT %s%s FROM postgres_query(%L, %L) AS s%s',
         v_iceberg, v_prefix,

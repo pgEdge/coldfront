@@ -1120,17 +1120,21 @@ Keep the following caveats in mind when running either mode:
   `coldfront.local_pg_dsn`, and its rows go straight into the Iceberg writer
   in one pass. An omitted IDENTITY column takes `nextval()` on the hot table's
   sequence, so cold ids share it with the hot side, and an omitted column with
-  a DEFAULT takes it. The hot rows are one set-based `INSERT`. The stream
-  reads the source once per tier, so a source it cannot read twice (a volatile
-  or stable function such as `now()`, a temporary table, a `WITH` entry, a
-  table the transaction has written, or a transaction that is not READ
-  COMMITTED) goes through `coldfront._cold_sink` instead, which renders each
-  row in plpgsql and writes Iceberg in batches of
-  `coldfront.cold_write_batch_size` rows, as does a server without
-  `coldfront.local_pg_dsn`. The statement's `cold_rows` column is `NULL` when
-  the cold rows streamed. A value that reaches the second session or DuckDB
-  as text is rendered in a form every reader takes as the same value, whatever
-  the caller's `DateStyle`, `IntervalStyle` or `extra_float_digits`.
+  a DEFAULT takes it. The hot rows are one set-based `INSERT`. The second
+  session reads the source at the statement's own snapshot, so both tiers see
+  one state of the tables whatever another session commits meanwhile, and a
+  REPEATABLE READ transaction reads its snapshot on both tiers. A source the
+  stream cannot read the same way twice (a volatile or stable function such as
+  `now()`, a temporary table, a `WITH` entry, a table the transaction has
+  written, a SERIALIZABLE transaction, or a second table-reading `INSERT` in
+  one READ COMMITTED transaction) goes through
+  `coldfront._cold_sink` instead, which renders each row in plpgsql and writes
+  Iceberg in batches of `coldfront.cold_write_batch_size` rows, as does a
+  server without `coldfront.local_pg_dsn`. The statement's `cold_rows` column
+  is `NULL` when the cold rows streamed. A value that reaches the second
+  session or DuckDB as text is rendered in a form every reader takes as the
+  same value, whatever the caller's `DateStyle`, `IntervalStyle` or
+  `extra_float_digits`.
 - `COPY <view> FROM` reads the rows with PostgreSQL's `COPY` reader and writes
   them through that same `INSERT` path, `coldfront.cold_write_batch_size` rows
   per `INSERT`. The format options are the reader's, and a supplied value for a

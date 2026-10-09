@@ -81,13 +81,15 @@ this project adheres to
 ### Changed
 
 - A tiered `INSERT` streams its cold rows: the cold projection, identity values
-  and defaults included, runs in PostgreSQL in a second session and its rows go
-  straight into the Iceberg writer in one pass, with nothing rendered per row.
-  A source the hook cannot read a second time (a volatile or stable function, a
-  temporary table, a `WITH` entry, a table the transaction has written, a
-  transaction that is not READ COMMITTED) is read once for both tiers and its
-  cold rows go through `coldfront._cold_sink`, whose cost is in proportion to
-  the rows it renders. `cold_rows` in the
+  and defaults included, runs in PostgreSQL in a second session, at the
+  statement's own snapshot, and its rows go straight into the Iceberg writer in
+  one pass, with nothing rendered per row. Both tiers see one state of the
+  source however other sessions commit meanwhile, and a REPEATABLE READ
+  transaction reads its snapshot on both. A source the hook cannot read a
+  second time (a volatile or stable function, a temporary table, a `WITH`
+  entry, a table the transaction has written, a SERIALIZABLE transaction) is
+  read once for both tiers and its cold rows go through `coldfront._cold_sink`,
+  whose cost is in proportion to the rows it renders. `cold_rows` in the
   statement's result is `NULL` for a streamed `INSERT`.
 - Every append to the cold tier (`INSERT`, `COPY`, the archiver's exports, the
   tiered `INSERT`'s cold sink) uses the async ordering wherever the patched

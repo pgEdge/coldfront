@@ -88,6 +88,11 @@ BOOLEAN
 [ Rows: 0]
 
 
+NOTICE:  result: Success	
+BOOLEAN	
+[ Rows: 0]
+
+
 NOTICE:  result: Count	
 BIGINT	
 [ Rows: 1]
