@@ -75,10 +75,10 @@ EXPLAIN (COSTS OFF, VERBOSE) EXECUTE dual_upd('x');
 EXPLAIN (COSTS OFF, VERBOSE)
   UPDATE public.events SET status = 'x' WHERE ts < '2026-03-01';
 
--- (8) tiered INSERT with an omitted IDENTITY column and a bytea param: the params
--- stay native in the source CTE, which PostgreSQL runs; the hot INSERT and the
--- cold projection each take nextval() for the identity, and the cold projection
--- spells the bytea as hex text, independent of the session's bytea_output.
+-- (8) tiered INSERT with an omitted IDENTITY column and a bytea param: the hot
+-- INSERT keeps the params native, and the cold stream's text carries them as
+-- format() arguments, each a literal the other session reads back and casts;
+-- both halves take nextval() for the identity.
 CREATE TABLE public._eid (id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz, data bytea);
 CREATE VIEW public.eid AS SELECT * FROM public._eid;
 INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)

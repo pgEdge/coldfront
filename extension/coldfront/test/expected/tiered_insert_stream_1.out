@@ -1,0 +1,607 @@
+-- A tiered INSERT whose source the hook can read a second time from another
+-- session streams its cold rows: the hot half is a set-based INSERT and the
+-- cold half is one DuckDB INSERT ... SELECT FROM postgres_query('pgstream', ...)
+-- through coldfront._exec_iceberg_with_claim, with the identity values and the
+-- defaults drawn in that session. Observed end to end: a DuckDB temporary table
+-- stands in for the Iceberg table and is read back with duckdb.query. A source
+-- the hook cannot read twice (a volatile or stable function, a temporary table,
+-- a WITH entry, a view over one, a table this transaction wrote, a SERIALIZABLE
+-- transaction, no local_pg_dsn) goes through the cold sink in one
+-- pass, and a cached plan that meets such a transaction falls back inside the
+-- stream.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_duckdb;
+CREATE EXTENSION IF NOT EXISTS coldfront;
+RESET client_min_messages;
+SET TIME ZONE 'UTC';
+SET coldfront.warehouse = '';
+SET coldfront.lakekeeper_endpoint = '';
+-- The regress database is not the one the image's local_pg_dsn names.
+SELECT set_config('coldfront.local_pg_dsn',
+                  format('host=%s dbname=%s user=%s',
+                         trim(split_part(current_setting('unix_socket_directories'), ',', 1)),
+                         current_database(), current_user), false) <> '' AS dsn_set;
+ dsn_set 
+---------
+ t
+(1 row)
+
+SELECT duckdb.raw_query('CREATE TEMP TABLE cf_stream (id BIGINT, ts TIMESTAMPTZ, status VARCHAR, n INTEGER, data VARCHAR, b BLOB, tags INTEGER[])') IS NOT NULL AS created;
+NOTICE:  result: Count	
+BIGINT	
+[ Rows: 0]
+
+
+ created 
+---------
+ t
+(1 row)
+
+CREATE TABLE public._cf_stream (id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL,
+                                status text NOT NULL DEFAULT 'new', n int DEFAULT 7,
+                                data jsonb, b bytea, tags int[]);
+CREATE VIEW public.cf_stream AS SELECT * FROM public._cf_stream;
+INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
+VALUES ('public', 'cf_stream', 'public._cf_stream', 'temp.main.cf_stream', 'ts');
+INSERT INTO coldfront.archive_watermark(schema_name, table_name, cutoff_time)
+VALUES ('public', 'cf_stream', '2026-03-01'::timestamptz);
+CREATE TABLE public.cf_staging (ts timestamptz, status text, data jsonb, b bytea, tags int[]);
+INSERT INTO public.cf_staging VALUES
+    ('2026-01-01', 'cold1', '{"a": 1}', '\xcafe', '{1,2}'),
+    ('2026-02-01', 'cold2', NULL, NULL, NULL),
+    ('2026-05-01', 'hot1', '{}', '\xbeef', '{3}');
+-- The rows of each tier, without the ids, which the two halves draw from one
+-- sequence in no fixed order. The cold read runs in DuckDB, so the two reads
+-- are separate views.
+CREATE VIEW public.cf_stream_hot AS
+    SELECT ts, status, n, data::text AS data, b, tags FROM public._cf_stream;
+CREATE VIEW public.cf_stream_cold AS
+    SELECT r['ts']::timestamptz AS ts, r['status']::text AS status, r['n']::int AS n,
+           r['data']::text AS data, r['b']::bytea AS b, r['tags']::int[] AS tags
+      FROM duckdb.query('SELECT * FROM temp.main.cf_stream') AS t(r);
+CREATE VIEW public.cf_stream_ids AS
+    SELECT count(*) AS rows, count(DISTINCT id) AS ids, min(id) AS min_id, max(id) AS max_id
+      FROM (SELECT id FROM public._cf_stream
+            UNION ALL
+            SELECT r['id']::bigint FROM duckdb.query('SELECT id FROM temp.main.cf_stream') AS t(r)) AS u;
+-- (1) A SELECT source over a table: the hot row goes to the heap, the two cold
+--     rows stream, every column type lands as the sink would store it, and
+--     the omitted identity and default columns are filled on both tiers.
+EXPLAIN (COSTS OFF, VERBOSE)
+  INSERT INTO public.cf_stream (ts, status, data, b, tags)
+  SELECT ts, status, data, b, tags FROM public.cf_staging;
+                                                                                                                                                                                                                                                                                                                                                                                                    QUERY PLAN                                                                                                                                                                                                                                                                                                                                                                                                     
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result
+   Output: $5, $6
+   CTE coldfront_hot
+     ->  Insert on public._cf_stream
+           Output: 1
+           ->  Seq Scan on public.cf_staging
+                 Output: nextval('_cf_stream_id_seq'), cf_staging.ts, cf_staging.status, 7, cf_staging.data, cf_staging.b, cf_staging.tags
+                 Filter: (cf_staging.ts >= 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
+   CTE coldfront_cold
+     ->  Result
+           Output: _tiered_cold_stream('public'::text, 'cf_stream'::text, 'SELECT nextval(''public._cf_stream_id_seq''::regclass) AS id, coldfront_src.ts::timestamp with time zone AS ts, coldfront_src.status::text AS status, (7) AS n, (coldfront_src.data::jsonb)::text AS data, coldfront_src.b::bytea AS b, coldfront._cold_list(coldfront_src.tags::integer[], ''tags'') AS tags FROM (SELECT cf_staging.ts,             cf_staging.status,             cf_staging.data,             cf_staging.b,             cf_staging.tags            FROM public.cf_staging) AS coldfront_src(ts, status, data, b, tags) WHERE coldfront_src.ts::timestamp with time zone < ''2026-03-01 00:00:00+00''::timestamptz'::text, '{cf_staging}'::regclass[], $2, CASE WHEN $3 THEN _stream_snapshot() ELSE NULL::text END)
+           InitPlan 2 (returns $2)
+             ->  Seq Scan on public.cf_staging cf_staging_1
+                   Filter: (cf_staging_1.ts < 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
+           InitPlan 3 (returns $3)
+             ->  Seq Scan on public.cf_staging cf_staging_2
+                   Filter: (cf_staging_2.ts < 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
+   InitPlan 5 (returns $5)
+     ->  Aggregate
+           Output: count(*)
+           ->  CTE Scan on coldfront_hot
+                 Output: coldfront_hot."?column?"
+   InitPlan 6 (returns $6)
+     ->  CTE Scan on coldfront_cold
+           Output: coldfront_cold.n
+(25 rows)
+
+INSERT INTO public.cf_stream (ts, status, data, b, tags)
+SELECT ts, status, data, b, tags FROM public.cf_staging;
+NOTICE:  result: Success	
+BOOLEAN	
+[ Rows: 0]
+
+
+NOTICE:  result: Success	
+BOOLEAN	
+[ Rows: 0]
+
+
+NOTICE:  result: Success	
+BOOLEAN	
+[ Rows: 0]
+
+
+NOTICE:  result: Count	
+BIGINT	
+[ Rows: 1]
+2
+
+
+ hot_rows | cold_rows 
+----------+-----------
+        1 |          
+(1 row)
+
+SELECT * FROM public.cf_stream_hot ORDER BY ts;
+              ts              | status | n | data |   b    | tags 
+------------------------------+--------+---+------+--------+------
+ Fri May 01 00:00:00 2026 UTC | hot1   | 7 | {}   | \xbeef | {3}
+(1 row)
+
+SELECT * FROM public.cf_stream_cold ORDER BY ts;
+              ts              | status | n |   data   |   b    | tags  
+------------------------------+--------+---+----------+--------+-------
+ Thu Jan 01 00:00:00 2026 UTC | cold1  | 7 | {"a": 1} | \xcafe | {1,2}
+ Sun Feb 01 00:00:00 2026 UTC | cold2  | 7 |          |        | 
+(2 rows)
+
+SELECT * FROM public.cf_stream_ids;
+ rows | ids | min_id | max_id 
+------+-----+--------+--------
+    3 |   3 |      1 |      3
+(1 row)
+
+-- (2) A VALUES source: the cold test is the hot count against the row count.
+--     With a cold row DuckDB writes (and reports it); with none it is never
+--     called, so an all-hot INSERT stages nothing.
+SET client_min_messages = notice;
+INSERT INTO public.cf_stream (ts, status) VALUES ('2026-01-10', 'cold3'), ('2026-06-10', 'hot2');
+NOTICE:  result: Success	
+BOOLEAN	
+[ Rows: 0]
+
+
+NOTICE:  result: Success	
+BOOLEAN	
+[ Rows: 0]
+
+
+NOTICE:  result: Count	
+BIGINT	
+[ Rows: 1]
+1
+
+
+ hot_rows | cold_rows 
+----------+-----------
+        1 |          
+(1 row)
+
+INSERT INTO public.cf_stream (ts, status) VALUES ('2026-06-11', 'hot3'), ('2026-06-12', 'hot4');
+ hot_rows | cold_rows 
+----------+-----------
+        2 |         0
+(1 row)
+
+SET client_min_messages = warning;
+SELECT status FROM public.cf_stream_hot WHERE status IN ('hot2', 'hot3', 'hot4') ORDER BY status;
+ status 
+--------
+ hot2
+ hot3
+ hot4
+(3 rows)
+
+SELECT status FROM public.cf_stream_cold WHERE status = 'cold3';
+ status 
+--------
+ cold3
+(1 row)
+
+-- (3) OVERRIDING SYSTEM VALUE supplies the identity on both tiers.
+INSERT INTO public.cf_stream (id, ts, status) OVERRIDING SYSTEM VALUE
+VALUES (901, '2026-01-11', 'ovr_cold'), (902, '2026-06-13', 'ovr_hot');
+ hot_rows | cold_rows 
+----------+-----------
+        1 |          
+(1 row)
+
+SELECT * FROM public.cf_stream_ids;
+ rows | ids | min_id | max_id 
+------+-----+--------+--------
+    9 |   9 |      1 |    902
+(1 row)
+
+-- (4) A prepared statement with a bound parameter streams from its cached plan
+--     and keeps the parameter live. Run again in a transaction that wrote the
+--     source table, the stream's check falls back to reading in this session,
+--     so the row written in the transaction is tiered too, and a SERIALIZABLE
+--     transaction, whose snapshot the stream cannot share, falls back the same
+--     way.
+PREPARE cf_prep(text) AS
+  INSERT INTO public.cf_stream (ts, status) SELECT ts, $1 FROM public.cf_staging WHERE ts < '2026-03-01';
+EXECUTE cf_prep('prep1');
+ hot_rows | cold_rows 
+----------+-----------
+        0 |          
+(1 row)
+
+BEGIN;
+INSERT INTO public.cf_staging VALUES ('2026-01-20', 'cold4', NULL, NULL, NULL);
+EXECUTE cf_prep('prep2');
+ hot_rows | cold_rows 
+----------+-----------
+        0 |         3
+(1 row)
+
+COMMIT;
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+EXECUTE cf_prep('prep3');
+ hot_rows | cold_rows 
+----------+-----------
+        0 |         3
+(1 row)
+
+COMMIT;
+SELECT status, count(*) FROM public.cf_stream_cold WHERE status LIKE 'prep%' GROUP BY status ORDER BY status;
+ status | count 
+--------+-------
+ prep1  |     2
+ prep2  |     3
+ prep3  |     3
+(3 rows)
+
+-- (5) COPY into the view goes through the same rewrite, batch by batch.
+SET coldfront.cold_write_batch_size = 2;
+COPY public.cf_stream (ts, status) FROM stdin WITH (FORMAT csv);
+RESET coldfront.cold_write_batch_size;
+SELECT status, count(*) FROM public.cf_stream_hot WHERE status LIKE 'copy%' GROUP BY status;
+  status  | count 
+----------+-------
+ copy_hot |     1
+(1 row)
+
+SELECT status, count(*) FROM public.cf_stream_cold WHERE status LIKE 'copy%' GROUP BY status;
+  status   | count 
+-----------+-------
+ copy_cold |     3
+(1 row)
+
+-- (6) Sources the hook sends to the sink in one pass: a volatile function, a
+--     stable one, a temporary table, a WITH entry, a view that calls a stable
+--     function, a table this transaction wrote, a transaction that is not READ
+--     COMMITTED, and a session without local_pg_dsn.
+EXPLAIN (COSTS OFF, VERBOSE)
+  INSERT INTO public.cf_stream (ts, status) SELECT ts, random()::text FROM public.cf_staging;
+                                                                                                                                                                 QUERY PLAN                                                                                                                                                                 
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result
+   Output: $4, $5
+   CTE coldfront_source
+     ->  Seq Scan on public.cf_staging
+           Output: cf_staging.ts, (random())::text
+   CTE coldfront_hot
+     ->  Insert on public._cf_stream
+           Output: 1
+           ->  CTE Scan on coldfront_source
+                 Output: nextval('_cf_stream_id_seq'), coldfront_source.ts, coldfront_source.status, 7, NULL::jsonb, NULL::bytea, NULL::integer[]
+                 Filter: (coldfront_source.ts >= 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
+   CTE coldfront_cold
+     ->  Aggregate
+           Output: _cold_sink('public'::text, 'cf_stream'::text, (string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text)), (count(*)))
+           ->  HashAggregate
+                 Output: string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text), count(*), r.coldfront_batch
+                 Group Key: r.coldfront_batch
+                 ->  Subquery Scan on r
+                       Output: r.coldfront_batch, r.*
+                       ->  WindowAgg
+                             Output: (nextval('_cf_stream_id_seq'::regclass)), coldfront_source_1.ts, coldfront_source_1.status, (7), (NULL::jsonb), (NULL::bytea), (NULL::integer[]), ((row_number() OVER (?) - 1) / (current_setting('coldfront.cold_write_batch_size'::text))::integer)
+                             ->  CTE Scan on coldfront_source coldfront_source_1
+                                   Output: nextval('_cf_stream_id_seq'::regclass), coldfront_source_1.ts, coldfront_source_1.status, 7, NULL::jsonb, NULL::bytea, NULL::integer[]
+                                   Filter: (coldfront_source_1.ts < 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
+   InitPlan 4 (returns $4)
+     ->  Aggregate
+           Output: count(*)
+           ->  CTE Scan on coldfront_hot
+                 Output: coldfront_hot."?column?"
+   InitPlan 5 (returns $5)
+     ->  CTE Scan on coldfront_cold
+           Output: coldfront_cold.n
+(32 rows)
+
+EXPLAIN (COSTS OFF, VERBOSE)
+  INSERT INTO public.cf_stream (ts, status) VALUES (now() - interval '1 year', 'stable');
+                                                                                                                                                                 QUERY PLAN                                                                                                                                                                 
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result
+   Output: $4, $5
+   CTE coldfront_source
+     ->  Result
+           Output: (now() - '@ 1 year'::interval), 'stable'::text
+   CTE coldfront_hot
+     ->  Insert on public._cf_stream
+           Output: 1
+           ->  CTE Scan on coldfront_source
+                 Output: nextval('_cf_stream_id_seq'), coldfront_source.ts, coldfront_source.status, 7, NULL::jsonb, NULL::bytea, NULL::integer[]
+                 Filter: (coldfront_source.ts >= 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
+   CTE coldfront_cold
+     ->  Aggregate
+           Output: _cold_sink('public'::text, 'cf_stream'::text, (string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text)), (count(*)))
+           ->  HashAggregate
+                 Output: string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text), count(*), r.coldfront_batch
+                 Group Key: r.coldfront_batch
+                 ->  Subquery Scan on r
+                       Output: r.coldfront_batch, r.*
+                       ->  WindowAgg
+                             Output: (nextval('_cf_stream_id_seq'::regclass)), coldfront_source_1.ts, coldfront_source_1.status, (7), (NULL::jsonb), (NULL::bytea), (NULL::integer[]), ((row_number() OVER (?) - 1) / (current_setting('coldfront.cold_write_batch_size'::text))::integer)
+                             ->  CTE Scan on coldfront_source coldfront_source_1
+                                   Output: nextval('_cf_stream_id_seq'::regclass), coldfront_source_1.ts, coldfront_source_1.status, 7, NULL::jsonb, NULL::bytea, NULL::integer[]
+                                   Filter: (coldfront_source_1.ts < 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
+   InitPlan 4 (returns $4)
+     ->  Aggregate
+           Output: count(*)
+           ->  CTE Scan on coldfront_hot
+                 Output: coldfront_hot."?column?"
+   InitPlan 5 (returns $5)
+     ->  CTE Scan on coldfront_cold
+           Output: coldfront_cold.n
+(32 rows)
+
+CREATE TEMP TABLE cf_tmp (ts timestamptz, status text);
+EXPLAIN (COSTS OFF, VERBOSE)
+  INSERT INTO public.cf_stream (ts, status) SELECT ts, status FROM cf_tmp;
+                                                                                                                                                                 QUERY PLAN                                                                                                                                                                 
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result
+   Output: $4, $5
+   CTE coldfront_source
+     ->  Seq Scan on pg_temp.cf_tmp
+           Output: cf_tmp.ts, cf_tmp.status
+   CTE coldfront_hot
+     ->  Insert on public._cf_stream
+           Output: 1
+           ->  CTE Scan on coldfront_source
+                 Output: nextval('_cf_stream_id_seq'), coldfront_source.ts, coldfront_source.status, 7, NULL::jsonb, NULL::bytea, NULL::integer[]
+                 Filter: (coldfront_source.ts >= 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
+   CTE coldfront_cold
+     ->  Aggregate
+           Output: _cold_sink('public'::text, 'cf_stream'::text, (string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text)), (count(*)))
+           ->  HashAggregate
+                 Output: string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text), count(*), r.coldfront_batch
+                 Group Key: r.coldfront_batch
+                 ->  Subquery Scan on r
+                       Output: r.coldfront_batch, r.*
+                       ->  WindowAgg
+                             Output: (nextval('_cf_stream_id_seq'::regclass)), coldfront_source_1.ts, coldfront_source_1.status, (7), (NULL::jsonb), (NULL::bytea), (NULL::integer[]), ((row_number() OVER (?) - 1) / (current_setting('coldfront.cold_write_batch_size'::text))::integer)
+                             ->  CTE Scan on coldfront_source coldfront_source_1
+                                   Output: nextval('_cf_stream_id_seq'::regclass), coldfront_source_1.ts, coldfront_source_1.status, 7, NULL::jsonb, NULL::bytea, NULL::integer[]
+                                   Filter: (coldfront_source_1.ts < 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
+   InitPlan 4 (returns $4)
+     ->  Aggregate
+           Output: count(*)
+           ->  CTE Scan on coldfront_hot
+                 Output: coldfront_hot."?column?"
+   InitPlan 5 (returns $5)
+     ->  CTE Scan on coldfront_cold
+           Output: coldfront_cold.n
+(32 rows)
+
+EXPLAIN (COSTS OFF, VERBOSE)
+  WITH s AS (SELECT ts, status FROM public.cf_staging)
+  INSERT INTO public.cf_stream (ts, status) SELECT ts, status FROM s;
+                                                                                                                                                                 QUERY PLAN                                                                                                                                                                 
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result
+   Output: $4, $5
+   CTE coldfront_source
+     ->  Seq Scan on public.cf_staging
+           Output: cf_staging.ts, cf_staging.status
+   CTE coldfront_hot
+     ->  Insert on public._cf_stream
+           Output: 1
+           ->  CTE Scan on coldfront_source
+                 Output: nextval('_cf_stream_id_seq'), coldfront_source.ts, coldfront_source.status, 7, NULL::jsonb, NULL::bytea, NULL::integer[]
+                 Filter: (coldfront_source.ts >= 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
+   CTE coldfront_cold
+     ->  Aggregate
+           Output: _cold_sink('public'::text, 'cf_stream'::text, (string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text)), (count(*)))
+           ->  HashAggregate
+                 Output: string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text), count(*), r.coldfront_batch
+                 Group Key: r.coldfront_batch
+                 ->  Subquery Scan on r
+                       Output: r.coldfront_batch, r.*
+                       ->  WindowAgg
+                             Output: (nextval('_cf_stream_id_seq'::regclass)), coldfront_source_1.ts, coldfront_source_1.status, (7), (NULL::jsonb), (NULL::bytea), (NULL::integer[]), ((row_number() OVER (?) - 1) / (current_setting('coldfront.cold_write_batch_size'::text))::integer)
+                             ->  CTE Scan on coldfront_source coldfront_source_1
+                                   Output: nextval('_cf_stream_id_seq'::regclass), coldfront_source_1.ts, coldfront_source_1.status, 7, NULL::jsonb, NULL::bytea, NULL::integer[]
+                                   Filter: (coldfront_source_1.ts < 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
+   InitPlan 4 (returns $4)
+     ->  Aggregate
+           Output: count(*)
+           ->  CTE Scan on coldfront_hot
+                 Output: coldfront_hot."?column?"
+   InitPlan 5 (returns $5)
+     ->  CTE Scan on coldfront_cold
+           Output: coldfront_cold.n
+(32 rows)
+
+CREATE VIEW public.cf_now_view AS SELECT now() AS ts, status FROM public.cf_staging;
+EXPLAIN (COSTS OFF, VERBOSE)
+  INSERT INTO public.cf_stream (ts, status) SELECT ts, status FROM public.cf_now_view;
+                                                                                                                                                                 QUERY PLAN                                                                                                                                                                 
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result
+   Output: $4, $5
+   CTE coldfront_source
+     ->  Seq Scan on public.cf_staging
+           Output: now(), cf_staging.status
+   CTE coldfront_hot
+     ->  Insert on public._cf_stream
+           Output: 1
+           ->  CTE Scan on coldfront_source
+                 Output: nextval('_cf_stream_id_seq'), coldfront_source.ts, coldfront_source.status, 7, NULL::jsonb, NULL::bytea, NULL::integer[]
+                 Filter: (coldfront_source.ts >= 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
+   CTE coldfront_cold
+     ->  Aggregate
+           Output: _cold_sink('public'::text, 'cf_stream'::text, (string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text)), (count(*)))
+           ->  HashAggregate
+                 Output: string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text), count(*), r.coldfront_batch
+                 Group Key: r.coldfront_batch
+                 ->  Subquery Scan on r
+                       Output: r.coldfront_batch, r.*
+                       ->  WindowAgg
+                             Output: (nextval('_cf_stream_id_seq'::regclass)), coldfront_source_1.ts, coldfront_source_1.status, (7), (NULL::jsonb), (NULL::bytea), (NULL::integer[]), ((row_number() OVER (?) - 1) / (current_setting('coldfront.cold_write_batch_size'::text))::integer)
+                             ->  CTE Scan on coldfront_source coldfront_source_1
+                                   Output: nextval('_cf_stream_id_seq'::regclass), coldfront_source_1.ts, coldfront_source_1.status, 7, NULL::jsonb, NULL::bytea, NULL::integer[]
+                                   Filter: (coldfront_source_1.ts < 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
+   InitPlan 4 (returns $4)
+     ->  Aggregate
+           Output: count(*)
+           ->  CTE Scan on coldfront_hot
+                 Output: coldfront_hot."?column?"
+   InitPlan 5 (returns $5)
+     ->  CTE Scan on coldfront_cold
+           Output: coldfront_cold.n
+(32 rows)
+
+BEGIN;
+INSERT INTO public.cf_staging VALUES ('2026-01-30', 'cold5', NULL, NULL, NULL);
+EXPLAIN (COSTS OFF, VERBOSE)
+  INSERT INTO public.cf_stream (ts, status) SELECT ts, status FROM public.cf_staging;
+                                                                                                                                                                 QUERY PLAN                                                                                                                                                                 
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result
+   Output: $4, $5
+   CTE coldfront_source
+     ->  Seq Scan on public.cf_staging
+           Output: cf_staging.ts, cf_staging.status
+   CTE coldfront_hot
+     ->  Insert on public._cf_stream
+           Output: 1
+           ->  CTE Scan on coldfront_source
+                 Output: nextval('_cf_stream_id_seq'), coldfront_source.ts, coldfront_source.status, 7, NULL::jsonb, NULL::bytea, NULL::integer[]
+                 Filter: (coldfront_source.ts >= 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
+   CTE coldfront_cold
+     ->  Aggregate
+           Output: _cold_sink('public'::text, 'cf_stream'::text, (string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text)), (count(*)))
+           ->  HashAggregate
+                 Output: string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text), count(*), r.coldfront_batch
+                 Group Key: r.coldfront_batch
+                 ->  Subquery Scan on r
+                       Output: r.coldfront_batch, r.*
+                       ->  WindowAgg
+                             Output: (nextval('_cf_stream_id_seq'::regclass)), coldfront_source_1.ts, coldfront_source_1.status, (7), (NULL::jsonb), (NULL::bytea), (NULL::integer[]), ((row_number() OVER (?) - 1) / (current_setting('coldfront.cold_write_batch_size'::text))::integer)
+                             ->  CTE Scan on coldfront_source coldfront_source_1
+                                   Output: nextval('_cf_stream_id_seq'::regclass), coldfront_source_1.ts, coldfront_source_1.status, 7, NULL::jsonb, NULL::bytea, NULL::integer[]
+                                   Filter: (coldfront_source_1.ts < 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
+   InitPlan 4 (returns $4)
+     ->  Aggregate
+           Output: count(*)
+           ->  CTE Scan on coldfront_hot
+                 Output: coldfront_hot."?column?"
+   InitPlan 5 (returns $5)
+     ->  CTE Scan on coldfront_cold
+           Output: coldfront_cold.n
+(32 rows)
+
+INSERT INTO public.cf_stream (ts, status) SELECT ts, 'txn' FROM public.cf_staging WHERE status = 'cold5';
+ hot_rows | cold_rows 
+----------+-----------
+        0 |         1
+(1 row)
+
+COMMIT;
+BEGIN ISOLATION LEVEL SERIALIZABLE;
+EXPLAIN (COSTS OFF, VERBOSE)
+  INSERT INTO public.cf_stream (ts, status) SELECT ts, status FROM public.cf_staging;
+                                                                                                                                                                 QUERY PLAN                                                                                                                                                                 
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result
+   Output: $4, $5
+   CTE coldfront_source
+     ->  Seq Scan on public.cf_staging
+           Output: cf_staging.ts, cf_staging.status
+   CTE coldfront_hot
+     ->  Insert on public._cf_stream
+           Output: 1
+           ->  CTE Scan on coldfront_source
+                 Output: nextval('_cf_stream_id_seq'), coldfront_source.ts, coldfront_source.status, 7, NULL::jsonb, NULL::bytea, NULL::integer[]
+                 Filter: (coldfront_source.ts >= 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
+   CTE coldfront_cold
+     ->  Aggregate
+           Output: _cold_sink('public'::text, 'cf_stream'::text, (string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text)), (count(*)))
+           ->  HashAggregate
+                 Output: string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text), count(*), r.coldfront_batch
+                 Group Key: r.coldfront_batch
+                 ->  Subquery Scan on r
+                       Output: r.coldfront_batch, r.*
+                       ->  WindowAgg
+                             Output: (nextval('_cf_stream_id_seq'::regclass)), coldfront_source_1.ts, coldfront_source_1.status, (7), (NULL::jsonb), (NULL::bytea), (NULL::integer[]), ((row_number() OVER (?) - 1) / (current_setting('coldfront.cold_write_batch_size'::text))::integer)
+                             ->  CTE Scan on coldfront_source coldfront_source_1
+                                   Output: nextval('_cf_stream_id_seq'::regclass), coldfront_source_1.ts, coldfront_source_1.status, 7, NULL::jsonb, NULL::bytea, NULL::integer[]
+                                   Filter: (coldfront_source_1.ts < 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
+   InitPlan 4 (returns $4)
+     ->  Aggregate
+           Output: count(*)
+           ->  CTE Scan on coldfront_hot
+                 Output: coldfront_hot."?column?"
+   InitPlan 5 (returns $5)
+     ->  CTE Scan on coldfront_cold
+           Output: coldfront_cold.n
+(32 rows)
+
+COMMIT;
+SET coldfront.local_pg_dsn = '';
+EXPLAIN (COSTS OFF, VERBOSE)
+  INSERT INTO public.cf_stream (ts, status) SELECT ts, status FROM public.cf_staging;
+                                                                                                                                                                 QUERY PLAN                                                                                                                                                                 
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result
+   Output: $4, $5
+   CTE coldfront_source
+     ->  Seq Scan on public.cf_staging
+           Output: cf_staging.ts, cf_staging.status
+   CTE coldfront_hot
+     ->  Insert on public._cf_stream
+           Output: 1
+           ->  CTE Scan on coldfront_source
+                 Output: nextval('_cf_stream_id_seq'), coldfront_source.ts, coldfront_source.status, 7, NULL::jsonb, NULL::bytea, NULL::integer[]
+                 Filter: (coldfront_source.ts >= 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
+   CTE coldfront_cold
+     ->  Aggregate
+           Output: _cold_sink('public'::text, 'cf_stream'::text, (string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text)), (count(*)))
+           ->  HashAggregate
+                 Output: string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text), count(*), r.coldfront_batch
+                 Group Key: r.coldfront_batch
+                 ->  Subquery Scan on r
+                       Output: r.coldfront_batch, r.*
+                       ->  WindowAgg
+                             Output: (nextval('_cf_stream_id_seq'::regclass)), coldfront_source_1.ts, coldfront_source_1.status, (7), (NULL::jsonb), (NULL::bytea), (NULL::integer[]), ((row_number() OVER (?) - 1) / (current_setting('coldfront.cold_write_batch_size'::text))::integer)
+                             ->  CTE Scan on coldfront_source coldfront_source_1
+                                   Output: nextval('_cf_stream_id_seq'::regclass), coldfront_source_1.ts, coldfront_source_1.status, 7, NULL::jsonb, NULL::bytea, NULL::integer[]
+                                   Filter: (coldfront_source_1.ts < 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
+   InitPlan 4 (returns $4)
+     ->  Aggregate
+           Output: count(*)
+           ->  CTE Scan on coldfront_hot
+                 Output: coldfront_hot."?column?"
+   InitPlan 5 (returns $5)
+     ->  CTE Scan on coldfront_cold
+           Output: coldfront_cold.n
+(32 rows)
+
+SELECT status FROM public.cf_stream_cold WHERE status = 'txn';
+ status 
+--------
+ txn
+(1 row)
+
+SELECT * FROM public.cf_stream_ids;
+ rows | ids | min_id | max_id 
+------+-----+--------+--------
+   22 |  22 |      1 |    902
+(1 row)
+
+-- Cleanup.
+DEALLOCATE cf_prep;
+DROP VIEW public.cf_now_view, public.cf_stream_hot, public.cf_stream_cold, public.cf_stream_ids;
+DELETE FROM coldfront.tiered_views;
+DELETE FROM coldfront.archive_watermark;
+DROP VIEW public.cf_stream;
+DROP TABLE public._cf_stream, public.cf_staging, cf_tmp;
+RESET coldfront.local_pg_dsn;

@@ -79,7 +79,7 @@ SELECT coldfront._render_cold_param(ARRAY['a', NULL]::text[]) AS text_param,
 SELECT coldfront._render_cold_param('[0:1]={1,2}'::int[]);
 ERROR:  coldfront: a bound parameter holds an array of 1 dimension(s) starting at element 0; the cold tier stores one-dimensional arrays starting at element 1
 CONTEXT:  PL/pgSQL function _cold_list(anyarray,text) line 4 at RAISE
-SQL function "_render_cold_param" during inlining
+SQL function "_render_cold_param" statement 1
 -- The archiver stages a partition with CREATE TABLE ... USING duckdb AS SELECT,
 -- and pg_duckdb (c04e6a2) loses a numeric array's precision there and refuses
 -- the column, so the archiver exports a numeric array as text[]
@@ -108,34 +108,38 @@ VALUES ('public', 'tags', '2026-03-01'::timestamptz);
 -- The INSERT's cold half checks each array's shape in its projection.
 EXPLAIN (COSTS OFF, VERBOSE)
   INSERT INTO public.tags VALUES (1, '2026-01-05', '{a,b}', '{1,2}');
-                                                                                                          QUERY PLAN                                                                                                           
--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                                                                                                                                                                                                                          QUERY PLAN                                                                                                                                                                                                                                                                                                                           
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
-   Output: $4, $5
-   CTE coldfront_source
-     ->  Result
-           Output: 1, '2026-01-05 00:00:00+00'::timestamp with time zone, '{a,b}'::text[], '{1,2}'::integer[]
+   Output: $5, $6
    CTE coldfront_hot
      ->  Insert on public._tags
            Output: 1
-           ->  CTE Scan on coldfront_source
-                 Output: coldfront_source.id, coldfront_source.ts, coldfront_source.tags, coldfront_source.nums
-                 Filter: (coldfront_source.ts >= '2026-03-01 00:00:00+00'::timestamp with time zone)
+           ->  Result
+                 Output: 1, '2026-01-05 00:00:00+00'::timestamp with time zone, '{a,b}'::text[], '{1,2}'::integer[]
+                 One-Time Filter: false
    CTE coldfront_cold
-     ->  Aggregate
-           Output: _cold_sink('public'::text, 'tags'::text, to_jsonb(ROW(coldfront_source_1.id, coldfront_source_1.ts, _cold_list(coldfront_source_1.tags, 'tags'::text), _cold_list(coldfront_source_1.nums, 'nums'::text))))
-           ->  CTE Scan on coldfront_source coldfront_source_1
-                 Output: coldfront_source_1.id, coldfront_source_1.ts, coldfront_source_1.tags, coldfront_source_1.nums
-                 Filter: (coldfront_source_1.ts < '2026-03-01 00:00:00+00'::timestamp with time zone)
-   InitPlan 4 (returns $4)
+     ->  Result
+           Output: _tiered_cold_stream('public'::text, 'tags'::text, 'SELECT coldfront_src.id::integer AS id, coldfront_src.ts::timestamp with time zone AS ts, coldfront._cold_list(coldfront_src.tags::text[], ''tags'') AS tags, coldfront._cold_list(coldfront_src.nums::integer[], ''nums'') AS nums FROM (VALUES (1, ''2026-01-05 00:00:00+00''::timestamp with time zone, ''{a,b}''::text[], ''{1,2}''::integer[])) AS coldfront_src(id, ts, tags, nums) WHERE coldfront_src.ts::timestamp with time zone < ''2026-03-01 00:00:00+00''::timestamptz'::text, '{}'::regclass[], ($2 < 1), CASE WHEN ($3 < 1) THEN _stream_snapshot() ELSE NULL::text END)
+           InitPlan 2 (returns $2)
+             ->  Aggregate
+                   Output: count(*)
+                   ->  CTE Scan on coldfront_hot
+                         Output: coldfront_hot."?column?"
+           InitPlan 3 (returns $3)
+             ->  Aggregate
+                   Output: count(*)
+                   ->  CTE Scan on coldfront_hot coldfront_hot_1
+                         Output: coldfront_hot_1."?column?"
+   InitPlan 5 (returns $5)
      ->  Aggregate
            Output: count(*)
-           ->  CTE Scan on coldfront_hot
-                 Output: coldfront_hot."?column?"
-   InitPlan 5 (returns $5)
+           ->  CTE Scan on coldfront_hot coldfront_hot_2
+                 Output: coldfront_hot_2."?column?"
+   InitPlan 6 (returns $6)
      ->  CTE Scan on coldfront_cold
            Output: coldfront_cold.n
-(25 rows)
+(29 rows)
 
 -- A cold write's bound array parameter is rendered by _render_cold_param at
 -- execution. force_generic_plan keeps $1 from folding to a constant.
@@ -143,10 +147,10 @@ SET plan_cache_mode = force_generic_plan;
 PREPARE cold_tags(text[]) AS
   UPDATE public.tags SET tags = $1 WHERE ts < '2026-03-01';
 EXPLAIN (COSTS OFF, VERBOSE) EXECUTE cold_tags('{x,y}');
-                                                                                                                                          QUERY PLAN                                                                                                                                           
------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                              QUERY PLAN                                                                                              
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
-   Output: _exec_iceberg_with_claim('ice.default.tags'::text, format('UPDATE ice.default.tags SET tags = %1$s   WHERE (ts < ''2026-03-01 00:00:00+00''::timestamptz)'::text, COALESCE(_render_cold_value((to_jsonb(_cold_list($1, NULL::text)))::text, (pg_typeof($1))::text), 'NULL'::text)))
+   Output: _exec_iceberg_with_claim('ice.default.tags'::text, format('UPDATE ice.default.tags SET tags = %1$s   WHERE (ts < ''2026-03-01 00:00:00+00''::timestamptz)'::text, _render_cold_param($1)))
 (2 rows)
 
 DEALLOCATE cold_tags;

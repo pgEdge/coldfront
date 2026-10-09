@@ -112,7 +112,9 @@ installation.md show:
 - `coldfront.local_pg_dsn` is the connection string DuckDB uses to read
   PostgreSQL tables from this server, which a decoupled table's
   `INSERT … SELECT` from a PostgreSQL table needs, as does a cold write to a
-  table with a clustered vector column. Only a superuser can set or read it.
+  table with a clustered vector column. A tiered `INSERT` streams its cold
+  rows through it, and renders them row by row when it is not set. Only a
+  superuser can set or read it.
   Set it before calling `set_storage_secret()`, which installs the DuckDB
   `postgres` extension this path loads only when the setting is present.
 
@@ -954,7 +956,8 @@ pg_duckdb has no fixed-length `char` type. Use `text` or `varchar` if
 blank-padded display matters.
 
 `json`, `jsonb` and `interval` are stored as `varchar` in Iceberg (no native
-primitive). On read, `interval` is view-cast back to the rich PG type; `json`
+primitive), an `interval` as `<months> months <days> days <seconds> seconds`,
+the text PostgreSQL and DuckDB both read as the same value. On read, `interval` is view-cast back to the rich PG type; `json`
 and `jsonb` come back as DuckDB's `json` (the equivalent of PG's `jsonb`), not
 the rich PG `jsonb` type, because Iceberg-backed reads run entirely in DuckDB.
 Queries like `data->>'key'` and `data->'key'` work, and ColdFront translates
@@ -1112,13 +1115,26 @@ Keep the following caveats in mind when running either mode:
   `ice.public.<name>` is the Iceberg table - only addressable via
   `iceberg_scan(...)` or `duckdb.raw_query('… ice.… …')`, never via
   PG-native 3-part names.
-- A tiered `INSERT` writes its cold rows through `coldfront._cold_sink`, which
-  renders each row in plpgsql and writes Iceberg in batches of
-  `coldfront.cold_write_batch_size` rows. An omitted IDENTITY column takes
-  `nextval()` on the hot table's sequence, so cold ids share it with the hot
-  side, and an omitted column with a DEFAULT takes it. The hot rows are one
-  set-based `INSERT`. For very large historical seeds (mostly-cold), prefer
-  iceberg-only mode where ids come from your source data.
+- A tiered `INSERT` streams its cold rows: the cold projection runs in
+  PostgreSQL, in a second session the DuckDB `postgres` extension opens from
+  `coldfront.local_pg_dsn`, and its rows go straight into the Iceberg writer
+  in one pass. An omitted IDENTITY column takes `nextval()` on the hot table's
+  sequence, so cold ids share it with the hot side, and an omitted column with
+  a DEFAULT takes it. The hot rows are one set-based `INSERT`. The second
+  session reads the source at the statement's own snapshot, so both tiers see
+  one state of the tables whatever another session commits meanwhile, and a
+  REPEATABLE READ transaction reads its snapshot on both tiers. A source the
+  stream cannot read the same way twice (a volatile or stable function such as
+  `now()`, a temporary table, a `WITH` entry, a table the transaction has
+  written, a SERIALIZABLE transaction, or a second table-reading `INSERT` in
+  one READ COMMITTED transaction) goes through
+  `coldfront._cold_sink` instead, which renders each row in plpgsql and writes
+  Iceberg in batches of `coldfront.cold_write_batch_size` rows, as does a
+  server without `coldfront.local_pg_dsn`. The statement's `cold_rows` column
+  is `NULL` when the cold rows streamed. A value that reaches the second
+  session or DuckDB as text is rendered in a form every reader takes as the
+  same value, whatever the caller's `DateStyle`, `IntervalStyle` or
+  `extra_float_digits`.
 - `COPY <view> FROM` reads the rows with PostgreSQL's `COPY` reader and writes
   them through that same `INSERT` path, `coldfront.cold_write_batch_size` rows
   per `INSERT`. The format options are the reader's, and a supplied value for a

@@ -343,33 +343,38 @@ ColdFront coordinates concurrent writes across the cluster as follows:
   iceberg-only `INSERT`/`UPDATE`/`DELETE`/`MERGE` wraps in
   `coldfront._exec_iceberg_with_claim`, which holds a globally-ordered
   Snowflake ticket via the Spock-replicated `coldfront.claims` table and waits
-  for its turn before issuing the iceberg commit. There are no 409s and no
-  app-level retry. See the
+  for its turn before issuing the iceberg commit. The bakery produces no 409s
+  and needs no retry in the application. See the
   [Concurrency](architecture_decoupled.md#concurrency-horizontal-scaling-the-bakery-protocol)
   section of the Decoupled Mode page for the full design and benchmarks.
 
 ### Cold-Write Strategy: Stock vs Patched duckdb-iceberg
 
-Most cold writes run through `_exec_iceberg_with_claim`; the tiered `INSERT`'s
-cold sink and the cross-tier move take the claim through `_take_iceberg_claim`
-themselves. What differs is *when* the bakery ticket is held. The async
-ordering is used only on a mesh node with the bakery enabled, and only when
-**both** `coldfront.iceberg_async_parquet` (default `off`) and the build marker
-`coldfront.iceberg_bakery_patch` (asserting the loaded duckdb-iceberg includes
-the patch) are on (`coldfront._iceberg_async_active()`); a vanilla node always
-takes its lock before uploading. The following table shows the two orderings:
+Every cold write runs through `_exec_iceberg_with_claim`. What differs is
+*when* the serializer (the bakery ticket on a mesh node, the advisory lock on a
+vanilla node) is held. The async ordering is used on every topology, for
+appends, when **both** `coldfront.iceberg_async_parquet` (default `off`) and
+the build marker `coldfront.iceberg_bakery_patch` (asserting the loaded
+duckdb-iceberg includes the patch) are on (`coldfront._iceberg_async_active()`).
+The following table shows the two orderings:
 
-| Ordering | duckdb-iceberg | Behavior |
+| Ordering | Applies to | Behavior |
 |---|---|---|
-| stock (default) | stock upstream | The writer takes the bakery ticket first, *then* uploads parquet and commits inside the ticket. This ordering is correct on an unpatched binary, but the whole parquet upload happens under the lock, so concurrent writers serialize on upload and commit. |
-| async (both GUCs `on`) | patched (`iceberg-bakery-aware-commit-refresh-v15.patch`) | The writer uploads parquet in the background *first*, then takes the ticket only for the Lakekeeper commit. Concurrent writers' uploads overlap; only the short commit POST is serialized. |
+| stock (default) | every write on stock upstream duckdb-iceberg; a `DELETE`, `UPDATE` or `MERGE` (the cross-tier move and `vector_train`'s assignment included) on every build | The writer takes the serializer first, *then* uploads parquet and commits inside it. On an unpatched binary this is what keeps a second writer from capturing a stale parent. A write that references rows the table holds needs it on every build: its position deletes name data files by path, and a compaction or another such write committing between its scan and its commit would rewrite or remove those files, after which the deletes apply to nothing and the rows come back. |
+| async (both GUCs `on`) | appends (`INSERT`, `COPY`, the archiver's exports, the tiered `INSERT`'s cold sink) on the patched build (`iceberg-bakery-aware-commit-refresh-v15.patch`) | The statement uploads its parquet and queues the claim; the extension's transaction callback takes it at PRE_COMMIT, just before pg_duckdb's own PRE_COMMIT callback commits the Iceberg transaction, and releases it at COMMIT. Uploads overlap on one node and across nodes, an open transaction blocks no other writer, and only the short commit POST is serialized. A new data file conflicts with nothing committed in between. An append to a clustered table is checked at commit against the live centroid generation and fails with `serialization_failure` if a retrain replaced it (see [architecture_vectors.md](architecture_vectors.md)). |
 
-The code path and the application-visible behavior are identical, so the GUCs
-are purely a performance knob. The patch relocates parent-snapshot stamping
-from upload time into PG's pre-commit phase (inside the bakery ticket, against
-a freshly-fetched table), so overlapping uploads cannot commit a stale parent.
-Async requested without the build marker downgrades safely to the stock
-ordering, noted once per session with a server LOG line - never a silent 409.
+For every write but a clustered table's append, the code path and the
+application-visible behavior are identical, so the GUCs are a performance knob;
+a clustered append in the async ordering can fail with `serialization_failure`
+when a retrain overlaps it, which the claim-first ordering, waiting for the
+retrain instead, cannot. The patch refreshes the table from the catalog
+in PG's pre-commit phase (inside the serializer) and re-derives every pending
+snapshot of the transaction from that head, so overlapping uploads and several
+batches alike cannot commit a stale parent. A staged file is referenced by no
+snapshot until its transaction commits, which is what the compactor's
+`--orphan-age` window is for. Async requested without the build marker
+downgrades safely to the stock ordering, noted once per session with a server
+LOG line - never a silent 409.
 The Docker image ships the patched binary and sets both GUCs on
 (`docker/entrypoint.sh`); bare-metal users on a stock binary leave both `off`
 and lose only the upload overlap. See
@@ -649,14 +654,16 @@ pg_duckdb has a fully-native, in-process Postgres-table reader for analytics on
 PG heap data, but that machinery is **not reachable** from the write path into
 an attached Iceberg catalog.
 
-As the workarounds in use today, a tiered `INSERT` renders its cold rows in the
-backend (`coldfront._cold_sink`) and writes them to Iceberg in batched
-`duckdb.raw_query` `INSERT`s, and a decoupled `INSERT … SELECT` from a
-PostgreSQL table reads it through the DuckDB `postgres` extension's
-`pglocal.<schema>.<table>` ATTACH, pipelining rows over libpq (loopback) →
-DuckDB executor → Iceberg writer → S3. Neither is the in-process reader:
-the first pays for the per-row rendering, the second for the libpq round-trip
-per row batch.
+As the workarounds in use today, a tiered `INSERT` streams its cold rows
+through `postgres_query('pgstream', …)` and a decoupled `INSERT … SELECT`
+from a PostgreSQL table reads it through the `pglocal.<schema>.<table>`
+ATTACH, both of the DuckDB `postgres` extension, pipelining rows over libpq
+(loopback) → DuckDB executor → Iceberg writer → S3; a tiered `INSERT` whose
+source cannot be read from a second session renders its cold rows in the
+backend (`coldfront._cold_sink`) and writes them in batched `duckdb.raw_query`
+`INSERT`s. None is the in-process reader: the streams pay for the libpq
+round-trip per row batch and for reading the source once per tier, the sink
+for the per-row rendering.
 
 The desired end-state is a way to drive the native in-process reader straight
 into the Iceberg writer - e.g. a `COPY` form:

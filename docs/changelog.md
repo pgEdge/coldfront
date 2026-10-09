@@ -80,6 +80,32 @@ this project adheres to
 
 ### Changed
 
+- A tiered `INSERT` streams its cold rows: the cold projection, identity values
+  and defaults included, runs in PostgreSQL in a second session, at the
+  statement's own snapshot, and its rows go straight into the Iceberg writer in
+  one pass, with nothing rendered per row. Both tiers see one state of the
+  source however other sessions commit meanwhile, and a REPEATABLE READ
+  transaction reads its snapshot on both. A source the hook cannot read a
+  second time (a volatile or stable function, a temporary table, a `WITH`
+  entry, a table the transaction has written, a SERIALIZABLE transaction) is
+  read once for both tiers and its cold rows go through `coldfront._cold_sink`,
+  whose cost is in proportion to the rows it renders. `cold_rows` in the
+  statement's result is `NULL` for a streamed `INSERT`.
+- Every append to the cold tier (`INSERT`, `COPY`, the archiver's exports, the
+  tiered `INSERT`'s cold sink) uses the async ordering wherever the patched
+  duckdb-iceberg is loaded, on a single node as on a mesh: the statement
+  uploads its Parquet, and the serializer (the bakery claim, or the node's
+  advisory lock) is taken at the transaction's commit, so it wraps only the
+  catalog commit and an open transaction blocks no other writer;
+  `statement_timeout` bounds the wait for it. A `DELETE`,
+  `UPDATE` or `MERGE`, the cross-tier move and `coldfront.vector_train` keep
+  the claim-first ordering on every build, since their position deletes name
+  the data files a concurrent compaction could rewrite.
+- An append to a clustered vector table in the async ordering is checked at
+  commit against the live centroid generation: a retrain that committed while
+  its rows were being assigned fails the transaction with
+  `serialization_failure`, for the client to retry, so no row lands with a
+  cluster of a replaced generation.
 - The mesh bakery no longer needs the `dblink` extension. Claims, acks,
   releases and orphan reaping run over a libpq loopback connection that the
   extension opens from `coldfront.loopback_dsn`, which must name a unix socket.
@@ -133,6 +159,14 @@ this project adheres to
 
 ### Fixed
 
+- A value a cold write renders as text, a statement's parameter, a streamed
+  column or a stored `interval`, took the caller's `DateStyle`, `IntervalStyle`
+  and `extra_float_digits`, so a day-first date landed as another date, a
+  mixed-sign interval as another interval and a double with fewer digits. Every
+  such value is rendered in one canonical form (ISO dates and timestamps,
+  full-precision floats, an interval as
+  `<months> months <days> days <seconds> seconds`) that PostgreSQL and DuckDB
+  read back as the same value whatever the session's settings.
 - A tiered table with a column whose name DuckDB parses as a keyword, such as
   `by`, `at` or `show`, registered cleanly and then failed every archive pass,
   because pg_duckdb passes the name to DuckDB unquoted
@@ -194,9 +228,11 @@ this project adheres to
   rows differed between the two runs landed some rows in both tiers and others
   in neither, and when the hot table had no identity column, or the statement
   supplied one, a source table written earlier in the same transaction lost
-  its cold rows, with no error either way. The source now runs once and both
-  tiers read that result; an untyped literal in the source keeps the target
-  column's type, and `OVERRIDING SYSTEM VALUE` works.
+  its cold rows, with no error either way. Such a source now runs once and
+  both tiers read that result; a source is read a second time, by the cold
+  stream, only where the hook proves the second read sees the same rows. An
+  untyped literal in the source keeps the target column's type, and
+  `OVERRIDING SYSTEM VALUE` works.
 - On PostgreSQL 17 and 18, a transaction block in which a statement had failed
   could not be ended in a database with the extension: `ROLLBACK`, `COMMIT`
   and `ROLLBACK TO SAVEPOINT` failed with "ResourceOwnerEnlarge called after

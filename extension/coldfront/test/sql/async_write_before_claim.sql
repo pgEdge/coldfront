@@ -1,0 +1,92 @@
+-- Where a cold write's claim sits relative to its DuckDB statement. With the
+-- async ordering (coldfront.iceberg_async_parquet and coldfront.iceberg_bakery_patch
+-- both on) an append is staged inside its statement and its claim is taken at
+-- COMMIT; a write that references rows already in the table, and every write on
+-- the stock ordering, takes the claim first. Observed end to end: a DuckDB
+-- temporary table stands in for the Iceberg table, another backend (the bakery's
+-- loopback, pointed at this server) holds the table's advisory lock, and
+-- lock_timeout ends the claim. pg_duckdb reports each DuckDB write as a NOTICE,
+-- so a write that ran before the claim shows and one the claim preceded does not.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_duckdb;
+CREATE EXTENSION IF NOT EXISTS coldfront;
+RESET client_min_messages;
+
+SET TIME ZONE 'UTC';
+SET coldfront.warehouse = '';
+SET coldfront.lakekeeper_endpoint = '';
+SET coldfront.local_pg_dsn = '';
+SET coldfront.iceberg_async_parquet = on;
+SET coldfront.iceberg_bakery_patch = on;
+SET lock_timeout = '500ms';
+SELECT set_config('coldfront.loopback_dsn',
+                  format('host=%s dbname=%s user=%s',
+                         trim(split_part(current_setting('unix_socket_directories'), ',', 1)),
+                         current_database(), current_user), false) <> '' AS loopback_set;
+SELECT duckdb.raw_query('CREATE TEMP TABLE cf_order (id INTEGER, ts TIMESTAMPTZ, status VARCHAR)') IS NOT NULL AS created;
+SELECT coldfront._loopback(format('SELECT pg_advisory_lock(hashtext(%L))',
+                                  'coldfront_iceberg:temp.main.cf_order')) IS NOT NULL AS lock_held_elsewhere;
+
+-- (1) An append on the async ordering: the write runs in the statement, and
+--     the claim at COMMIT meets the held lock.
+BEGIN;
+SELECT coldfront._exec_iceberg_with_claim('temp.main.cf_order',
+    'INSERT INTO temp.main.cf_order VALUES (1, ''2026-01-01'', ''async'')');
+COMMIT;
+
+-- (2) A DELETE references rows the table holds, so the claim comes first and
+--     nothing is written.
+SELECT coldfront._exec_iceberg_with_claim('temp.main.cf_order',
+    'DELETE FROM temp.main.cf_order WHERE id = 1');
+
+-- (3) The stock ordering claims first for an append too.
+SET coldfront.iceberg_async_parquet = off;
+SELECT coldfront._exec_iceberg_with_claim('temp.main.cf_order',
+    'INSERT INTO temp.main.cf_order VALUES (2, ''2026-01-01'', ''stock'')');
+SET coldfront.iceberg_async_parquet = on;
+
+-- (4) The cold sink: a tiered INSERT's cold rows, one row per batch, are all
+--     staged in the statement; the claim at COMMIT meets the lock.
+CREATE TABLE public._cf_order (id int PRIMARY KEY, ts timestamptz, status text);
+CREATE VIEW public.cf_order AS SELECT * FROM public._cf_order;
+INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
+VALUES ('public', 'cf_order', 'public._cf_order', 'temp.main.cf_order', 'ts');
+INSERT INTO coldfront.archive_watermark(schema_name, table_name, cutoff_time)
+VALUES ('public', 'cf_order', '2026-03-01'::timestamptz);
+SET coldfront.cold_write_batch_size = 1;
+BEGIN;
+INSERT INTO public.cf_order (id, ts, status)
+VALUES (10, '2026-01-01', 'sink'), (11, '2026-01-02', 'sink'), (12, '2026-01-03', 'sink');
+COMMIT;
+
+-- (5) The cross-tier move removes rows by key and re-adds what it read, so its
+--     claim comes before its reads: no write happens.
+INSERT INTO public._cf_order VALUES (20, '2026-05-01', 'hot');
+UPDATE public.cf_order SET ts = '2026-01-05' WHERE id = 20;
+
+-- (6) The cold stream: a tiered INSERT whose source streams is one DuckDB
+--     write in the statement, and the claim at COMMIT meets the lock. The
+--     stream's second session connects to the regress database.
+SELECT set_config('coldfront.local_pg_dsn',
+                  format('host=%s dbname=%s user=%s',
+                         trim(split_part(current_setting('unix_socket_directories'), ',', 1)),
+                         current_database(), current_user), false) <> '' AS dsn_set;
+CREATE TABLE public.cf_order_src (id int, ts timestamptz, status text);
+INSERT INTO public.cf_order_src VALUES (30, '2026-01-06', 'stream'), (31, '2026-01-07', 'stream');
+BEGIN;
+INSERT INTO public.cf_order (id, ts, status) SELECT id, ts, status FROM public.cf_order_src;
+COMMIT;
+DROP TABLE public.cf_order_src;
+
+-- Cleanup.
+SELECT coldfront._loopback('SELECT pg_advisory_unlock_all()') IS NOT NULL AS lock_released;
+DELETE FROM coldfront.tiered_views;
+DELETE FROM coldfront.archive_watermark;
+DROP VIEW public.cf_order;
+DROP TABLE public._cf_order;
+RESET coldfront.cold_write_batch_size;
+RESET lock_timeout;
+RESET coldfront.iceberg_async_parquet;
+RESET coldfront.iceberg_bakery_patch;
+RESET coldfront.loopback_dsn;
+RESET coldfront.local_pg_dsn;

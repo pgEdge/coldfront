@@ -171,7 +171,10 @@ Call `vector_train` again when the data has grown or you want a different
 keep their identities, so only the rows whose nearest centroid changed are
 rewritten; with a new `nlist`, nearly every row is. Either way the centroids
 and the assignments change together, so a search is never wrong in between; it
-is only slower until the next compaction.
+is only slower until the next compaction. A cold write that overlaps the
+retrain, with its rows assigned before the retrain commits and its own commit
+after, fails with `serialization_failure` (SQLSTATE 40001) and nothing of it
+lands; retry it, as a client retries under SERIALIZABLE.
 
 ### Time Partitioning
 

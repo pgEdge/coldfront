@@ -561,7 +561,7 @@ EOSQL
 # ───────────────────────────────────────────────────────────────────────────
 # Decoupled concurrency / no-409 — parallel cold writers to ONE iceberg-only
 # table must all land. Vanilla serializes them with the local advisory-lock
-# bakery (_exec_iceberg_with_claim, v_armed=false → pg_advisory_xact_lock);
+# bakery (_exec_iceberg_with_claim; _bakery_armed() false → pg_advisory_xact_lock);
 # without it, concurrent Iceberg commits race Lakekeeper's assert-ref-snapshot
 # precondition and 409 (CatalogCommitConflict), which aborts the losing
 # transaction. (Standing rule: multi-writer no-409 probe in vanilla. The bakery
@@ -2399,14 +2399,15 @@ SQL
 # Story 6g: the compactor claims the reference cold writes claim, on a table
 # create_iceberg_table() made (TC-183) and on one adoption registered (TC-184),
 # as on the archiver's. Every registration stores one spelling, each part
-# quoted, and it is the one the compactor builds, so a cold write holding the
-# table's claim makes the compactor's claim wait. Each step then reads the table
-# under its claim, so it works from the write it waited for: expiry (TC-183),
-# compaction (TC-184), and orphan cleanup (TC-185), which with no age window
-# would otherwise delete that write's files.
+# quoted, and it is the one the compactor builds. An append's claim is taken at
+# its COMMIT, so a transaction with a staged cold write holds nothing the
+# compactor waits on: expiry (TC-183), compaction (TC-184) and orphan cleanup
+# (TC-185) run beside the open write, and the write still lands on the result,
+# its staged file kept by the --orphan-age window that protects every
+# in-flight write.
 # ───────────────────────────────────────────────────────────────────────────
 story_compactor_claim_matches_writes() {
-    step "6g. The compactor waits for a cold write's claim on created and adopted tables"
+    step "6g. The compactor runs beside an open cold write on created and adopted tables"
     require_compactor || return
     local col='[{"name":"id","type":"bigint"}]' t
     for t in cf_cw cf_ad cf_or; do
@@ -2417,22 +2418,22 @@ story_compactor_claim_matches_writes() {
     assert_eq "TC-183: the archiver, create_iceberg_table() and adoption register one spelling" \
         '"ice"."public"."cf_ad" "ice"."public"."cf_cw" "ice"."public"."events"' \
         "$(q "$HOST" "SELECT string_agg(iceberg_table, ' ' ORDER BY relname) FROM coldfront.tiered_views WHERE schema_name = 'public' AND relname IN ('cf_ad', 'cf_cw', 'events');")"
-    compactor_waits_for_write TC-183 cf_cw 2 'expired [1-9][0-9]* snapshot' \
+    compactor_runs_beside_write TC-183 cf_cw 2 'expired [1-9][0-9]* snapshot' \
         --expire-snapshots --expire-older-than 0s --expire-retain-last 1 --expire-keep-files
-    compactor_waits_for_write TC-184 cf_ad 5 'compacted: [0-9]+ files'
-    compactor_waits_for_write TC-185 cf_or 1 'deleted [0-9]+ orphan' --orphans --orphan-age 0s
+    compactor_runs_beside_write TC-184 cf_ad 5 'compacted: [0-9]+ files'
+    compactor_runs_beside_write TC-185 cf_or 1 'deleted 0 orphan' --orphans
     for t in cf_cw cf_ad cf_or; do
         q "$HOST" "SELECT coldfront.drop_iceberg_table('public','$t', true);" >/dev/null 2>&1
     done
 }
 
-# compactor_waits_for_write <TC> <table> <writes> <ERE> [flags...]: after <writes>
-# single-row cold writes to public.<table>, one more holds the table's claim for
-# 8 s while the compactor runs with <flags>. The compactor's claim waits on the
-# lock the write holds; once the write commits, the compactor succeeds, its
-# output matches <ERE>, and every write is still there.
-compactor_waits_for_write() {
-    local tc=$1 t=$2 n=$3 pat=$4 w c ec i waited=0
+# compactor_runs_beside_write <TC> <table> <writes> <ERE> [flags...]: after
+# <writes> single-row cold writes to public.<table>, one more stays open for 8 s
+# with its append staged and its claim due at COMMIT, while the compactor runs
+# with <flags>. The compactor finishes while the write is still open, its output
+# matches <ERE>, and every write is still there once the write commits.
+compactor_runs_beside_write() {
+    local tc=$1 t=$2 n=$3 pat=$4 w c ec i open=0
     shift 4
     for i in $(seq 1 "$n"); do echo "INSERT INTO $t VALUES ($i);"; done | qf "$HOST" >/dev/null 2>&1
     qf "$HOST" >/dev/null 2>&1 <<SQL &
@@ -2449,16 +2450,11 @@ SQL
     done
     compactor --table "$t" "$@" >"$TMPD/cf.$tc" 2>&1 &
     c=$!
-    for i in $(seq 1 24); do
-        if [ "$(q "$HOST" "SELECT count(*) FROM pg_stat_activity WHERE wait_event_type = 'Lock' AND query LIKE '%coldfront._claim_iceberg_external%' AND pid <> pg_backend_pid();")" = 1 ]; then
-            waited=1; break
-        fi
-        sleep 0.25
-    done
     wait "$c"; ec=$?
+    open=$(q "$HOST" "SELECT count(*) FROM pg_stat_activity WHERE application_name = 'cf_${tc}_writer' AND wait_event = 'PgSleep';")
     wait "$w"
-    assert_eq "$tc: the compactor's claim waits for the cold write's" 1 "$waited"
-    assert_eq "$tc: the compactor finishes once the write commits" 0 "$ec"
+    assert_eq "$tc: the compactor finished while the cold write was still open" 1 "$open"
+    assert_eq "$tc: the compactor succeeded" 0 "$ec"
     [ "$ec" = 0 ] || tail -5 "$TMPD/cf.$tc"
     assert_eq "$tc: the compactor did its work" 1 "$(grep -c -E "$pat" "$TMPD/cf.$tc")"
     assert_eq "$tc: every write is still there" "$((n + 1))" "$(q "$HOST" "SELECT count(*) FROM $t;")"
@@ -3503,7 +3499,7 @@ story_mesh() {
     assert_eq "write from peer $p1 visible on db1" "1" "$(q "$HOST" "SELECT count(*) FROM iceonly WHERE status='from_peer';")"
 
     # R-A bakery under multi-node contention: concurrent cold writers on db1 AND
-    # a peer to the SAME Iceberg table must both land. Here v_armed is true
+    # a peer to the SAME Iceberg table must both land. Here _bakery_armed() is true
     # (snowflake.node + loopback_dsn set), so this exercises the Ricart-Agrawala
     # claim protocol across nodes — not the local advisory lock — to avoid 409.
     rm -f $TMPD/ra.* 2>/dev/null
@@ -3883,7 +3879,8 @@ story_mesh_claim_failures() {
     ref_t=$(q "$HOST" "SELECT iceberg_table FROM coldfront.tiered_views WHERE relname = 'cf_ct';")
 
     # TC-174: a claim times out while another session holds the table's claim
-    # key. The session holds no advisory lock afterwards, and its next write
+    # key. An append's claim is taken at its COMMIT, which is where the timeout
+    # fires. The session holds no advisory lock afterwards, and its next write
     # clears what the timed-out attempt and an orphan planted on another table
     # left on the node.
     q "$HOST" "INSERT INTO coldfront.claims (iceberg_table, ticket) VALUES ('${ref_t}_tc174', snowflake.nextval());" >/dev/null
@@ -3897,7 +3894,9 @@ SQL
     sleep 1
     out=$(sess "$HOST" 2>&1 <<SQL
 SET statement_timeout = '1s';
+BEGIN;
 INSERT INTO cf_ct VALUES (1741);
+COMMIT;
 RESET statement_timeout;
 SELECT 'locks=' || count(*) FROM pg_locks WHERE locktype = 'advisory' AND pid = pg_backend_pid();
 SELECT pg_sleep(4);
@@ -3911,7 +3910,9 @@ SQL
     assert_eq "TC-174 no claim is left on the node for either table" "0" "$(node_claims "$ref_t")"
 
     # TC-175: one transaction writes cf_ct twice; a peer's write to cf_ct arrives
-    # between the two and stays behind the transaction's claim until COMMIT.
+    # between the two and lands at once. An append's claim is taken at its
+    # COMMIT, so an open transaction holds nothing a peer waits on, and all
+    # three writes land.
     sess "$HOST" >"$TMPD/cf.175a" 2>&1 <<SQL &
 BEGIN;
 INSERT INTO cf_ct VALUES (1751);
@@ -3927,12 +3928,13 @@ SQL
     p_done=$(date +%s.%N)
     wait "$a" 2>/dev/null
     a_commit=$(sed -n 's/^a_commit=//p' "$TMPD/cf.175a")
-    assert_eq "TC-175 a second write to the same table keeps the transaction's claim" "1" "$(later "$p_done" "$a_commit")"
+    assert_eq "TC-175 a peer's write lands while the transaction is still open" "0" "$(later "$p_done" "$a_commit")"
     assert_eq "TC-175 no write errored" "0" "$(cat "$TMPD"/cf.175? | grep -c ERROR)"
     assert_eq "TC-175 all three writes landed" "3" "$(q "$HOST" "SELECT count(*) FROM cf_ct WHERE id BETWEEN 1751 AND 1753;")"
 
     # TC-176: one transaction writes cf_cu, then cf_ct; a peer's write to cf_cu
-    # arrives between the two and stays behind the cf_cu claim until COMMIT.
+    # arrives between the two and lands at once, as in TC-175, and every write
+    # on both tables lands.
     sess "$HOST" >"$TMPD/cf.176a" 2>&1 <<SQL &
 BEGIN;
 INSERT INTO cf_cu VALUES (1761);
@@ -3948,7 +3950,7 @@ SQL
     p_done=$(date +%s.%N)
     wait "$a" 2>/dev/null
     a_commit=$(sed -n 's/^a_commit=//p' "$TMPD/cf.176a")
-    assert_eq "TC-176 a write to a second table keeps the transaction's claim on the first" "1" "$(later "$p_done" "$a_commit")"
+    assert_eq "TC-176 a peer's write to the first table lands while the transaction is still open" "0" "$(later "$p_done" "$a_commit")"
     assert_eq "TC-176 no write errored" "0" "$(cat "$TMPD"/cf.176? | grep -c ERROR)"
     assert_eq "TC-176 all three writes landed" "3" \
         "$(q "$HOST" "SELECT (SELECT count(*) FROM cf_cu WHERE id IN (1761, 1763)) + (SELECT count(*) FROM cf_ct WHERE id = 1762);")"
@@ -4205,7 +4207,7 @@ story_standby_reads() {
     fi
     # The cold sink's step function is reached through the INSERT rewrite, so call
     # it directly: the guard is its first statement, ahead of every lookup.
-    local c; c=$(q_may "$STANDBY" "SELECT coldfront._cold_sink_step(NULL, '${vn%%.*}', '${vn##*.}', '{}'::jsonb);")
+    local c; c=$(q_may "$STANDBY" "SELECT coldfront._cold_sink_step(NULL, '${vn%%.*}', '${vn##*.}', '', 0);")
     assert_err "cold sink on standby → coldfront refuses before the claim" \
         "cannot execute a cold (Iceberg) write on a read-only standby" "$c"
 

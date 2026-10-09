@@ -31,8 +31,9 @@ catalog, the object store, and the archiver:
 │  coldfront extension: post_parse_analyze_hook             │
 │  ├── INSERT: splits hot/cold by partition_col vs cutoff;  │
 │  │     hot side is plain set-based PG INSERT into _events,│
-│  │     cold side is the cold sink, batched DuckDB INSERTs │
-│  │     under one claim (the _cold_sink aggregate)         │
+│  │     cold side streams into the Iceberg writer, or goes │
+│  │     through the cold sink when the source cannot be    │
+│  │     read twice (the _cold_sink aggregate)              │
 │  ├── UPDATE/DELETE: classifies WHERE against the watermark│
 │  │     and rewrites to target one tier or both            │
 │  └── errors on ambiguous predicates in strict mode        │
@@ -109,8 +110,8 @@ CREATE OR REPLACE VIEW events AS
 The rename is conditional, so it converts the table on the first run and no-ops
 afterwards; the `CREATE OR REPLACE VIEW` keeps the view's OID across runs. The
 C hook rewrites an `INSERT` on the view by the watermark cutoff, into a hot
-`INSERT` of the at/after-cutoff rows into `_events` and the cold sink for the
-older rows, and the utility hook feeds a `COPY FROM` into the same rewrite in
+`INSERT` of the at/after-cutoff rows into `_events` and a cold stream, or the
+cold sink, for the older rows, and the utility hook feeds a `COPY FROM` into the same rewrite in
 batches. An `INSERT` nested in a `WITH` entry is rewritten in place, and a
 `MERGE` runs on the tier its `ON` condition bounds. The view has no
 `INSTEAD OF` trigger, so a write the hook does not handle fails in PostgreSQL.
@@ -283,15 +284,97 @@ The `post_parse_analyze_hook` (see the
 [Application Interface](architecture.md#application-interface) section of the
 Architecture overview) intercepts `INSERT` on a registered tiered view and
 rewrites it into a single statement that splits the input by the
-partition-column watermark:
+partition-column watermark. The hot half is always a plain set-based
+`INSERT INTO _events`, in which IDENTITY and DEFAULT columns fill server-side.
+The cold half takes one of two shapes.
+
+The stream, the default:
 
 ```sql
 INSERT INTO events (ts, status, data) SELECT ts, status, data FROM staging;
 
 -- Rewritten by the hook to (schematically):
+WITH coldfront_hot AS MATERIALIZED (
+  INSERT INTO _events (ts, status, data)
+  SELECT ts::timestamptz, status::text, data::jsonb
+  FROM (<source>) AS coldfront_src(ts, status, data)
+  WHERE coldfront_src.ts::timestamptz >= '<cutoff>'::timestamptz
+  RETURNING 1
+),
+coldfront_cold AS MATERIALIZED (
+  SELECT coldfront._tiered_cold_stream('public', 'events',
+    'SELECT nextval(''public._events_id_seq''::regclass) AS id, ts::timestamptz AS ts,
+            status::text AS status, (data::jsonb)::text AS data
+     FROM (<source, fully qualified>) AS coldfront_src(ts, status, data)
+     WHERE coldfront_src.ts::timestamptz < ''<cutoff>''::timestamptz',
+    ARRAY['public.staging'::regclass],
+    EXISTS (SELECT 1 FROM (<source>) AS coldfront_src(ts, status, data)
+            WHERE coldfront_src.ts::timestamptz < '<cutoff>'::timestamptz)) AS n
+)
+SELECT (SELECT count(*) FROM coldfront_hot) AS hot_rows,
+       (SELECT n FROM coldfront_cold) AS cold_rows;
+```
+
+`coldfront._tiered_cold_stream` runs one DuckDB statement,
+`INSERT INTO ice.public.events SELECT ... FROM postgres_query('pgstream', <that
+query>)`, through `coldfront._exec_iceberg_with_claim`: the cold projection
+runs in PostgreSQL, in a second session the DuckDB `postgres` extension holds
+open as `pgstream`, and its rows go over libpq straight into the Iceberg
+writer in one vectorized pass, with no row rendered in the backend. The
+projection names every hot-table column, with `nextval()` on the hot table's
+sequence for an omitted IDENTITY column and the DEFAULT expression for an
+omitted column that has one, so cold ids share the hot side's sequence. A
+vector column is sent as `real[]`, which the extension maps to the Iceberg
+`list<float>`, and a `jsonb`, `json` or `interval` column as its text, the
+form the Iceberg `VARCHAR` column holds. On a clustered table the cluster
+assignment leads the select list and orders the write, so each row group holds
+roughly one cluster. The last argument is the cold test: for a `SELECT` source
+an `EXISTS` over it, for a `VALUES` source the hot count against the row count,
+so an `INSERT` whose rows are all hot stages nothing and takes no claim.
+`cold_rows` is `NULL` when the rows streamed, since DuckDB keeps that count,
+and the count otherwise: `0` for an all-hot `INSERT`, the sink's count after
+the fallback below.
+
+The query is deparsed with an empty `search_path`, so every relation, function
+and operator is schema-qualified whatever the second session's path is, and
+its literals and parameters are rendered by `coldfront._canonical_text`, whose
+ISO dates, full-precision floats and fixed interval shape read the same under
+that session's `DateStyle`, `IntervalStyle` and `extra_float_digits`. The
+second session reads at the statement's snapshot: the rewrite exports it with
+`coldfront._stream_snapshot()` as the statement runs, and `pgstream`, attached
+at REPEATABLE READ, imports it with `SET TRANSACTION SNAPSHOT` before its first
+read, so both halves see one state of the tables however other sessions commit
+meanwhile, and a REPEATABLE READ transaction's later statements stream from
+the snapshot they share. The hot half reads the source as the caller, so
+PostgreSQL checks the caller's `SELECT` privilege on it; the second session
+reads as the `coldfront.local_pg_dsn` user.
+
+The stream reads the source twice, once per half, so it is used only when the
+hook can prove the second read sees what the first did: the transaction is not
+SERIALIZABLE, whose conflict detection would not see the second session's
+read; the `INSERT` has no `WITH` clause; every function in the source is
+IMMUTABLE (a volatile one yields other rows, and a stable one such as `now()`,
+`ts + interval '1 day'` or a text-to-timestamptz cast may yield other values
+under the second session's settings); the source reads only tables, no
+temporary table, no view over one or over such a function, no foreign table;
+this transaction has written none of those tables (or their partitions), since
+its own writes are not in the shared snapshot; and `coldfront.local_pg_dsn` is
+set. The snapshot is shared once per transaction: a second table-reading
+`INSERT` in one READ COMMITTED transaction, or one after a `VALUES` source
+streamed in it, takes the sink. A `VALUES` source reads no table and streams
+without one. A statement in a subtransaction (a `SAVEPOINT`, a plpgsql
+`EXCEPTION` block) cannot export a snapshot, and pg_duckdb refuses every cold
+write there, so it fails with pg_duckdb's error rather than a snapshot one. A
+cached plan runs in transactions the hook never saw, so the stream
+checks these conditions again at execution and, when one fails, runs the same
+query in the calling session and feeds its rows to the sink below.
+
+Every other source takes the sink shape, which reads the source once:
+
+```sql
 WITH coldfront_source AS MATERIALIZED (
   SELECT ts::timestamptz AS ts, status::text AS status, data::jsonb AS data
-  FROM (<source>) AS s(ts, status, data)
+  FROM (<source>) AS coldfront_src(ts, status, data)
 ),
 coldfront_hot AS MATERIALIZED (
   INSERT INTO _events (ts, status, data)
@@ -300,9 +383,16 @@ coldfront_hot AS MATERIALIZED (
   RETURNING 1
 ),
 coldfront_cold AS MATERIALIZED (
-  SELECT coldfront._cold_sink('public', 'events', to_jsonb(r)) AS n
-  FROM (SELECT nextval('_events_id_seq') AS id, ts, status, data
-        FROM coldfront_source WHERE ts < '<cutoff>'::timestamptz) AS r
+  SELECT coldfront._cold_sink('public', 'events', b.tuples, b.n) AS n
+  FROM (SELECT string_agg('(' || coldfront._cold_row_literal(to_jsonb(r), '{id,ts,status,data}',
+                            '{bigint,"timestamp with time zone",text,jsonb}', 'public', 'events') || ')',
+                          ', ') AS tuples,
+               count(*) AS n
+        FROM (SELECT r0.*, (row_number() OVER () - 1)
+                             / current_setting('coldfront.cold_write_batch_size')::int AS coldfront_batch
+              FROM (SELECT nextval('_events_id_seq') AS id, ts, status, data
+                    FROM coldfront_source WHERE ts < '<cutoff>'::timestamptz) AS r0) AS r
+        GROUP BY r.coldfront_batch) AS b
 )
 SELECT (SELECT count(*) FROM coldfront_hot) AS hot_rows,
        (SELECT n FROM coldfront_cold) AS cold_rows;
@@ -310,23 +400,20 @@ SELECT (SELECT count(*) FROM coldfront_hot) AS hot_rows,
 
 The source runs once, into the `coldfront_source` tuplestore, and both halves
 read it, so a volatile source lands every row exactly once and a row the
-transaction wrote before the `INSERT` reaches the cold tier. Each column of
-`coldfront_source` is cast to the hot table's type, which restates the
-coercions PostgreSQL applied when it analyzed the statement (an untyped literal
-against a `jsonb` column keeps that type), and `OVERRIDING SYSTEM VALUE` stays
-on the hot `INSERT`.
+transaction wrote before the `INSERT` reaches the cold tier. The cold half
+projects each row as the stream does, renders it as a DuckDB `VALUES` tuple
+(`coldfront._cold_row_literal`), gathers `coldfront.cold_write_batch_size` tuples
+(default 10000) at a time with `string_agg`, and hands each batch to the
+`coldfront._cold_sink` aggregate, which writes it as one `INSERT` through
+`coldfront._exec_iceberg_with_claim`. The statement is built by
+`coldfront._cold_sink_sql`, which the stream's fallback runs too. The work per
+row is the rendering in plpgsql, so a load that cannot stream costs in
+proportion to its rows and more per row than one that can.
 
-The hot half is plain set-based `INSERT INTO _events`: IDENTITY and DEFAULT
-columns fill server-side at full PG speed. The cold half projects each row to
-the hot table's full column list, with `nextval()` on the hot table's sequence
-for an omitted IDENTITY column and the DEFAULT expression for an omitted column
-that has one, both evaluated by PostgreSQL per row, and hands it to
-`coldfront._cold_sink`. That aggregate renders each row as a DuckDB `VALUES`
-tuple and flushes every `coldfront.cold_write_batch_size` rows (default 10000)
-as one `INSERT` under the table's claim, taken once per table per transaction;
-its final step flushes the rest. Throughput is bounded by the per-row rendering
-in plpgsql, so for very large mostly-cold seeds, prefer iceberg-only mode where
-ids come from the source data.
+In both shapes each column of the source is cast to the hot table's type,
+which restates the coercions PostgreSQL applied when it analyzed the statement
+(an untyped literal against a `jsonb` column keeps that type), and
+`OVERRIDING SYSTEM VALUE` stays on the hot `INSERT`.
 
 A `WITH` clause on the `INSERT` keeps its entries at the top of the rewritten
 statement, ahead of the three above, so an entry that modifies data (`WITH

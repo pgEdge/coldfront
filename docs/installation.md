@@ -73,10 +73,10 @@ The patched extensions are unsigned, so `duckdb.allow_unsigned_extensions` must
 be on. Keeping `duckdb.autoinstall_known_extensions` off stops DuckDB from
 downloading an unpatched upstream copy when an extension file is missing.
 
-The two `coldfront.iceberg_*` settings take effect only on a Spock mesh, where
-a node then uploads Parquet files outside the bakery claim and serializes only
-the catalog commit. The packaged duckdb-iceberg includes the patch that this
-ordering requires, and the
+The two `coldfront.iceberg_*` settings make a node upload the Parquet files of
+an `INSERT` or `COPY` outside its write lock (the bakery claim on a Spock mesh,
+an advisory lock on a single node) and serialize only the catalog commit. The
+packaged duckdb-iceberg includes the patch that this ordering requires, and the
 [Distributed Setup](usage.md#distributed-setup-3-node-mesh-decoupled-mode)
 section of the Using ColdFront guide describes the mesh settings.
 
