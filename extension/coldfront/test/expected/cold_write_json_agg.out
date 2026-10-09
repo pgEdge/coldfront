@@ -61,8 +61,8 @@ WHERE ts < '2019-01-01'::timestamptz;
 EXPLAIN (COSTS OFF, VERBOSE)
 INSERT INTO public.events
 SELECT 9, '2019-01-01'::timestamptz, jsonb_agg(k ORDER BY k) FROM public.src;
-                                                                                                                                    QUERY PLAN                                                                                                                                    
-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                                        QUERY PLAN                                                                                                                                        
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
    Output: (InitPlan 4).col1, (InitPlan 5).col1
    CTE coldfront_source
@@ -81,9 +81,9 @@ SELECT 9, '2019-01-01'::timestamptz, jsonb_agg(k ORDER BY k) FROM public.src;
                  Filter: (coldfront_source.ts >= 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
    CTE coldfront_cold
      ->  Aggregate
-           Output: _cold_sink('public'::text, 'events'::text, (string_agg((('('::text || _cold_row_literal(to_jsonb(r.*), '{id,ts,data}'::text[], '{integer,"timestamp with time zone",jsonb}'::text[], 'public'::text, 'events'::text)) || ')'::text), ', '::text)), (count(*)))
+           Output: _cold_sink('public'::text, 'events'::text, (string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,data}'::text[], '{integer,"timestamp with time zone",jsonb}'::text[], 'public'::text, 'events'::text)) || ')'::text), ', '::text)), (count(*)))
            ->  HashAggregate
-                 Output: string_agg((('('::text || _cold_row_literal(to_jsonb(r.*), '{id,ts,data}'::text[], '{integer,"timestamp with time zone",jsonb}'::text[], 'public'::text, 'events'::text)) || ')'::text), ', '::text), count(*), r.coldfront_batch
+                 Output: string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,data}'::text[], '{integer,"timestamp with time zone",jsonb}'::text[], 'public'::text, 'events'::text)) || ')'::text), ', '::text), count(*), r.coldfront_batch
                  Group Key: r.coldfront_batch
                  ->  Subquery Scan on r
                        Output: r.coldfront_batch, r.*

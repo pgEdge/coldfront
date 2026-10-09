@@ -79,7 +79,7 @@ SELECT coldfront._render_cold_param(ARRAY['a', NULL]::text[]) AS text_param,
 SELECT coldfront._render_cold_param('[0:1]={1,2}'::int[]);
 ERROR:  coldfront: a bound parameter holds an array of 1 dimension(s) starting at element 0; the cold tier stores one-dimensional arrays starting at element 1
 CONTEXT:  PL/pgSQL function _cold_list(anyarray,text) line 4 at RAISE
-SQL function "_render_cold_param" during inlining
+SQL function "_render_cold_param" statement 1
 -- The archiver stages a partition with CREATE TABLE ... USING duckdb AS SELECT,
 -- and pg_duckdb (c04e6a2) loses a numeric array's precision there and refuses
 -- the column, so the archiver exports a numeric array as text[]
@@ -142,10 +142,10 @@ SET plan_cache_mode = force_generic_plan;
 PREPARE cold_tags(text[]) AS
   UPDATE public.tags SET tags = $1 WHERE ts < '2026-03-01';
 EXPLAIN (COSTS OFF, VERBOSE) EXECUTE cold_tags('{x,y}');
-                                                                                                                                          QUERY PLAN                                                                                                                                           
------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                              QUERY PLAN                                                                                              
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
-   Output: _exec_iceberg_with_claim('ice.default.tags'::text, format('UPDATE ice.default.tags SET tags = %1$s   WHERE (ts < ''2026-03-01 00:00:00+00''::timestamptz)'::text, COALESCE(_render_cold_value((to_jsonb(_cold_list($1, NULL::text)))::text, (pg_typeof($1))::text), 'NULL'::text)))
+   Output: _exec_iceberg_with_claim('ice.default.tags'::text, format('UPDATE ice.default.tags SET tags = %1$s   WHERE (ts < ''2026-03-01 00:00:00+00''::timestamptz)'::text, _render_cold_param($1)))
 (2 rows)
 
 DEALLOCATE cold_tags;

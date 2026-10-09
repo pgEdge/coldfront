@@ -956,7 +956,8 @@ pg_duckdb has no fixed-length `char` type. Use `text` or `varchar` if
 blank-padded display matters.
 
 `json`, `jsonb` and `interval` are stored as `varchar` in Iceberg (no native
-primitive). On read, `interval` is view-cast back to the rich PG type; `json`
+primitive), an `interval` as `<months> months <days> days <seconds> seconds`,
+the text PostgreSQL and DuckDB both read as the same value. On read, `interval` is view-cast back to the rich PG type; `json`
 and `jsonb` come back as DuckDB's `json` (the equivalent of PG's `jsonb`), not
 the rich PG `jsonb` type, because Iceberg-backed reads run entirely in DuckDB.
 Queries like `data->>'key'` and `data->'key'` work, and ColdFront translates
@@ -1127,9 +1128,9 @@ Keep the following caveats in mind when running either mode:
   row in plpgsql and writes Iceberg in batches of
   `coldfront.cold_write_batch_size` rows, as does a server without
   `coldfront.local_pg_dsn`. The statement's `cold_rows` column is `NULL` when
-  the cold rows streamed. A `DateStyle` whose output is ambiguous to read
-  back, `SQL` with `DMY`, is not one the second session may differ in: the
-  stream renders its dates in ISO form.
+  the cold rows streamed. A value that reaches the second session or DuckDB
+  as text is rendered in a form every reader takes as the same value, whatever
+  the caller's `DateStyle`, `IntervalStyle` or `extra_float_digits`.
 - `COPY <view> FROM` reads the rows with PostgreSQL's `COPY` reader and writes
   them through that same `INSERT` path, `coldfront.cold_write_batch_size` rows
   per `INSERT`. The format options are the reader's, and a supplied value for a

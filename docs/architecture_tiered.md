@@ -337,8 +337,9 @@ the fallback below.
 
 The query is deparsed with an empty `search_path`, so every relation, function
 and operator is schema-qualified whatever the second session's path is, and
-with ISO dates and PostgreSQL-style intervals, so its literals read the same
-under that session's `DateStyle` and `IntervalStyle`. `pgstream` is attached at
+its literals and parameters are rendered by `coldfront._canonical_text`, whose
+ISO dates, full-precision floats and fixed interval shape read the same under
+that session's `DateStyle`, `IntervalStyle` and `extra_float_digits`. `pgstream` is attached at
 READ COMMITTED, so each statement's read takes a snapshot of its own and sees
 what the hot half saw; the `pglocal` attachment the other cold paths read
 through stays at REPEATABLE READ, which the extension needs to give a parallel

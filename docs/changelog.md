@@ -152,6 +152,14 @@ this project adheres to
 
 ### Fixed
 
+- A value a cold write renders as text, a statement's parameter, a streamed
+  column or a stored `interval`, took the caller's `DateStyle`, `IntervalStyle`
+  and `extra_float_digits`, so a day-first date landed as another date, a
+  mixed-sign interval as another interval and a double with fewer digits. Every
+  such value is rendered in one canonical form (ISO dates and timestamps,
+  full-precision floats, an interval as
+  `<months> months <days> days <seconds> seconds`) that PostgreSQL and DuckDB
+  read back as the same value whatever the session's settings.
 - A tiered table with a column whose name DuckDB parses as a keyword, such as
   `by`, `at` or `show`, registered cleanly and then failed every archive pass,
   because pg_duckdb passes the name to DuckDB unquoted

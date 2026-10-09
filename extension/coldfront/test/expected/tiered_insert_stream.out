@@ -258,8 +258,8 @@ SELECT status, count(*) FROM public.cf_stream_cold WHERE status LIKE 'copy%' GRO
 --     COMMITTED, and a session without local_pg_dsn.
 EXPLAIN (COSTS OFF, VERBOSE)
   INSERT INTO public.cf_stream (ts, status) SELECT ts, random()::text FROM public.cf_staging;
-                                                                                                                                                             QUERY PLAN                                                                                                                                                             
-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                                                                 QUERY PLAN                                                                                                                                                                 
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
    Output: (InitPlan 4).col1, (InitPlan 5).col1
    CTE coldfront_source
@@ -273,9 +273,9 @@ EXPLAIN (COSTS OFF, VERBOSE)
                  Filter: (coldfront_source.ts >= 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
    CTE coldfront_cold
      ->  Aggregate
-           Output: _cold_sink('public'::text, 'cf_stream'::text, (string_agg((('('::text || _cold_row_literal(to_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text)), (count(*)))
+           Output: _cold_sink('public'::text, 'cf_stream'::text, (string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text)), (count(*)))
            ->  HashAggregate
-                 Output: string_agg((('('::text || _cold_row_literal(to_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text), count(*), r.coldfront_batch
+                 Output: string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text), count(*), r.coldfront_batch
                  Group Key: r.coldfront_batch
                  ->  Subquery Scan on r
                        Output: r.coldfront_batch, r.*
@@ -297,8 +297,8 @@ EXPLAIN (COSTS OFF, VERBOSE)
 
 EXPLAIN (COSTS OFF, VERBOSE)
   INSERT INTO public.cf_stream (ts, status) VALUES (now() - interval '1 year', 'stable');
-                                                                                                                                                             QUERY PLAN                                                                                                                                                             
-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                                                                 QUERY PLAN                                                                                                                                                                 
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
    Output: (InitPlan 4).col1, (InitPlan 5).col1
    CTE coldfront_source
@@ -312,9 +312,9 @@ EXPLAIN (COSTS OFF, VERBOSE)
                  Filter: (coldfront_source.ts >= 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
    CTE coldfront_cold
      ->  Aggregate
-           Output: _cold_sink('public'::text, 'cf_stream'::text, (string_agg((('('::text || _cold_row_literal(to_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text)), (count(*)))
+           Output: _cold_sink('public'::text, 'cf_stream'::text, (string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text)), (count(*)))
            ->  HashAggregate
-                 Output: string_agg((('('::text || _cold_row_literal(to_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text), count(*), r.coldfront_batch
+                 Output: string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text), count(*), r.coldfront_batch
                  Group Key: r.coldfront_batch
                  ->  Subquery Scan on r
                        Output: r.coldfront_batch, r.*
@@ -337,8 +337,8 @@ EXPLAIN (COSTS OFF, VERBOSE)
 CREATE TEMP TABLE cf_tmp (ts timestamptz, status text);
 EXPLAIN (COSTS OFF, VERBOSE)
   INSERT INTO public.cf_stream (ts, status) SELECT ts, status FROM cf_tmp;
-                                                                                                                                                             QUERY PLAN                                                                                                                                                             
-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                                                                 QUERY PLAN                                                                                                                                                                 
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
    Output: (InitPlan 4).col1, (InitPlan 5).col1
    CTE coldfront_source
@@ -352,9 +352,9 @@ EXPLAIN (COSTS OFF, VERBOSE)
                  Filter: (coldfront_source.ts >= 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
    CTE coldfront_cold
      ->  Aggregate
-           Output: _cold_sink('public'::text, 'cf_stream'::text, (string_agg((('('::text || _cold_row_literal(to_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text)), (count(*)))
+           Output: _cold_sink('public'::text, 'cf_stream'::text, (string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text)), (count(*)))
            ->  HashAggregate
-                 Output: string_agg((('('::text || _cold_row_literal(to_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text), count(*), r.coldfront_batch
+                 Output: string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text), count(*), r.coldfront_batch
                  Group Key: r.coldfront_batch
                  ->  Subquery Scan on r
                        Output: r.coldfront_batch, r.*
@@ -377,8 +377,8 @@ EXPLAIN (COSTS OFF, VERBOSE)
 EXPLAIN (COSTS OFF, VERBOSE)
   WITH s AS (SELECT ts, status FROM public.cf_staging)
   INSERT INTO public.cf_stream (ts, status) SELECT ts, status FROM s;
-                                                                                                                                                             QUERY PLAN                                                                                                                                                             
-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                                                                 QUERY PLAN                                                                                                                                                                 
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
    Output: (InitPlan 4).col1, (InitPlan 5).col1
    CTE coldfront_source
@@ -392,9 +392,9 @@ EXPLAIN (COSTS OFF, VERBOSE)
                  Filter: (coldfront_source.ts >= 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
    CTE coldfront_cold
      ->  Aggregate
-           Output: _cold_sink('public'::text, 'cf_stream'::text, (string_agg((('('::text || _cold_row_literal(to_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text)), (count(*)))
+           Output: _cold_sink('public'::text, 'cf_stream'::text, (string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text)), (count(*)))
            ->  HashAggregate
-                 Output: string_agg((('('::text || _cold_row_literal(to_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text), count(*), r.coldfront_batch
+                 Output: string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text), count(*), r.coldfront_batch
                  Group Key: r.coldfront_batch
                  ->  Subquery Scan on r
                        Output: r.coldfront_batch, r.*
@@ -417,8 +417,8 @@ EXPLAIN (COSTS OFF, VERBOSE)
 CREATE VIEW public.cf_now_view AS SELECT now() AS ts, status FROM public.cf_staging;
 EXPLAIN (COSTS OFF, VERBOSE)
   INSERT INTO public.cf_stream (ts, status) SELECT ts, status FROM public.cf_now_view;
-                                                                                                                                                             QUERY PLAN                                                                                                                                                             
-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                                                                 QUERY PLAN                                                                                                                                                                 
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
    Output: (InitPlan 4).col1, (InitPlan 5).col1
    CTE coldfront_source
@@ -432,9 +432,9 @@ EXPLAIN (COSTS OFF, VERBOSE)
                  Filter: (coldfront_source.ts >= 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
    CTE coldfront_cold
      ->  Aggregate
-           Output: _cold_sink('public'::text, 'cf_stream'::text, (string_agg((('('::text || _cold_row_literal(to_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text)), (count(*)))
+           Output: _cold_sink('public'::text, 'cf_stream'::text, (string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text)), (count(*)))
            ->  HashAggregate
-                 Output: string_agg((('('::text || _cold_row_literal(to_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text), count(*), r.coldfront_batch
+                 Output: string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text), count(*), r.coldfront_batch
                  Group Key: r.coldfront_batch
                  ->  Subquery Scan on r
                        Output: r.coldfront_batch, r.*
@@ -458,8 +458,8 @@ BEGIN;
 INSERT INTO public.cf_staging VALUES ('2026-01-30', 'cold5', NULL, NULL, NULL);
 EXPLAIN (COSTS OFF, VERBOSE)
   INSERT INTO public.cf_stream (ts, status) SELECT ts, status FROM public.cf_staging;
-                                                                                                                                                             QUERY PLAN                                                                                                                                                             
-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                                                                 QUERY PLAN                                                                                                                                                                 
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
    Output: (InitPlan 4).col1, (InitPlan 5).col1
    CTE coldfront_source
@@ -473,9 +473,9 @@ EXPLAIN (COSTS OFF, VERBOSE)
                  Filter: (coldfront_source.ts >= 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
    CTE coldfront_cold
      ->  Aggregate
-           Output: _cold_sink('public'::text, 'cf_stream'::text, (string_agg((('('::text || _cold_row_literal(to_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text)), (count(*)))
+           Output: _cold_sink('public'::text, 'cf_stream'::text, (string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text)), (count(*)))
            ->  HashAggregate
-                 Output: string_agg((('('::text || _cold_row_literal(to_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text), count(*), r.coldfront_batch
+                 Output: string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text), count(*), r.coldfront_batch
                  Group Key: r.coldfront_batch
                  ->  Subquery Scan on r
                        Output: r.coldfront_batch, r.*
@@ -505,8 +505,8 @@ COMMIT;
 BEGIN ISOLATION LEVEL REPEATABLE READ;
 EXPLAIN (COSTS OFF, VERBOSE)
   INSERT INTO public.cf_stream (ts, status) SELECT ts, status FROM public.cf_staging;
-                                                                                                                                                             QUERY PLAN                                                                                                                                                             
-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                                                                 QUERY PLAN                                                                                                                                                                 
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
    Output: (InitPlan 4).col1, (InitPlan 5).col1
    CTE coldfront_source
@@ -520,9 +520,9 @@ EXPLAIN (COSTS OFF, VERBOSE)
                  Filter: (coldfront_source.ts >= 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
    CTE coldfront_cold
      ->  Aggregate
-           Output: _cold_sink('public'::text, 'cf_stream'::text, (string_agg((('('::text || _cold_row_literal(to_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text)), (count(*)))
+           Output: _cold_sink('public'::text, 'cf_stream'::text, (string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text)), (count(*)))
            ->  HashAggregate
-                 Output: string_agg((('('::text || _cold_row_literal(to_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text), count(*), r.coldfront_batch
+                 Output: string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text), count(*), r.coldfront_batch
                  Group Key: r.coldfront_batch
                  ->  Subquery Scan on r
                        Output: r.coldfront_batch, r.*
@@ -546,8 +546,8 @@ COMMIT;
 SET coldfront.local_pg_dsn = '';
 EXPLAIN (COSTS OFF, VERBOSE)
   INSERT INTO public.cf_stream (ts, status) SELECT ts, status FROM public.cf_staging;
-                                                                                                                                                             QUERY PLAN                                                                                                                                                             
-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                                                                 QUERY PLAN                                                                                                                                                                 
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
    Output: (InitPlan 4).col1, (InitPlan 5).col1
    CTE coldfront_source
@@ -561,9 +561,9 @@ EXPLAIN (COSTS OFF, VERBOSE)
                  Filter: (coldfront_source.ts >= 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
    CTE coldfront_cold
      ->  Aggregate
-           Output: _cold_sink('public'::text, 'cf_stream'::text, (string_agg((('('::text || _cold_row_literal(to_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text)), (count(*)))
+           Output: _cold_sink('public'::text, 'cf_stream'::text, (string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text)), (count(*)))
            ->  HashAggregate
-                 Output: string_agg((('('::text || _cold_row_literal(to_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text), count(*), r.coldfront_batch
+                 Output: string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,status,n,data,b,tags}'::text[], '{bigint,"timestamp with time zone",text,integer,jsonb,bytea,integer[]}'::text[], 'public'::text, 'cf_stream'::text)) || ')'::text), ', '::text), count(*), r.coldfront_batch
                  Group Key: r.coldfront_batch
                  ->  Subquery Scan on r
                        Output: r.coldfront_batch, r.*

@@ -1514,10 +1514,12 @@ build_cold_dml(DeparseResult *dr, TieredViewInfo *info, Query *query)
  * renders as a DuckDB literal: bytea -> from_hex(%P$L) / encode($K,'hex');
  * real[] (a vector column's view type) -> CAST(%P$L AS FLOAT[]) /
  * translate($K::text,'{}','[]'); any other array -> %P$s /
- * coldfront._render_cold_param($K); json/jsonb/interval -> %P$L / $K::text;
- * else %P$L / $K. With for_pg the string is the tiered stream's read, which
- * PostgreSQL runs: every value is %P$L / $K, a literal its own input reads
- * back, coerced by the projection's casts.
+ * coldfront._render_cold_param($K); else %P$L /
+ * coldfront._canonical_text($K), a text every reader takes as the same value
+ * whatever the caller's DateStyle, IntervalStyle and extra_float_digits. With
+ * for_pg the string is the tiered stream's read, which PostgreSQL runs in
+ * another session: every value is that canonical text, coerced by the
+ * projection's casts.
  */
 static char *
 cold_sql_arg(const char *cold_dml, ColdParamSet *ps, bool for_pg)
@@ -1568,27 +1570,23 @@ cold_sql_arg(const char *cold_dml, ColdParamSet *ps, bool for_pg)
                 if (pos_of_id[id - 1] == 0)         /* first sight: assign pos + arg */
                 {
                     pos_of_id[id - 1] = next_pos++;
-                    if (for_pg)
-                        appendStringInfo(&args, ", $%d", id);
-                    else if (t == BYTEAOID)
+                    if (!for_pg && t == BYTEAOID)
                         /* hex string, independent of the caller's bytea_output;
                          * from_hex rebuilds the exact bytes. */
                         appendStringInfo(&args, ", encode($%d,'hex')", id);
-                    else if (t == FLOAT4ARRAYOID)
+                    else if (!for_pg && t == FLOAT4ARRAYOID)
                         /* A vector column reaches this path as real[], the type the
                          * view exposes. PG spells that {1,2,3} and DuckDB's list
                          * cast takes [1,2,3], so translate rewrites the delimiters
                          * and the template supplies the cast. */
                         appendStringInfo(&args, ", translate($%d::text,'{}','[]')", id);
-                    else if (type_is_array(t))
+                    else if (!for_pg && type_is_array(t))
                         /* Any other array: coldfront._render_cold_param checks its
                          * shape and renders the DuckDB list an array column's value
                          * becomes, so the template takes the result as SQL. */
                         appendStringInfo(&args, ", coldfront._render_cold_param($%d)", id);
-                    else if (t == JSONOID || t == JSONBOID || t == INTERVALOID)
-                        appendStringInfo(&args, ", $%d::text", id);
                     else
-                        appendStringInfo(&args, ", $%d", id);
+                        appendStringInfo(&args, ", coldfront._canonical_text($%d)", id);
                 }
                 if (for_pg)
                     appendStringInfo(&tmpl, "%%%d$L", pos_of_id[id - 1]);
@@ -2334,16 +2332,17 @@ build_src_cte(Query *query, const char *source, const char *col_list,
 /*
  * The PostgreSQL type a streamed column is sent as, one DuckDB's postgres
  * extension maps to the Iceberg column's type. A vector is unknown to it and
- * would arrive as text, so it goes as real[]; jsonb, json and interval are
- * stored as VARCHAR and go as their text, the form the sink stores too.
+ * would arrive as text, so it goes as real[]; jsonb and json are stored as
+ * VARCHAR and go as their text. An interval is stored as VARCHAR too and goes
+ * as coldfront._canonical_text's shape (build_cold_projection), the one text
+ * both parsers read back as the same value.
  */
 static const char *
 cf_stream_cast(const char *type)
 {
     if (strncmp(type, "vector", 6) == 0 || strncmp(type, "halfvec", 7) == 0)
         return "::real[]";
-    if (strcmp(type, "jsonb") == 0 || strcmp(type, "json") == 0 ||
-        strcmp(type, "interval") == 0)
+    if (strcmp(type, "jsonb") == 0 || strcmp(type, "json") == 0)
         return "::text";
     return "";
 }
@@ -2399,7 +2398,9 @@ build_cold_projection(Query *query, const HotColumns *hc, bool stream)
         if (pg_str_endswith(hc->type[i], "[]"))
             expr = psprintf("coldfront._cold_list(%s, %s)", expr,
                             quote_literal_cstr(hc->name[i]));
-        if (cast[0] != '\0')
+        if (stream && strcmp(hc->type[i], "interval") == 0)
+            expr = psprintf("coldfront._canonical_text((%s)::interval)", expr);
+        else if (cast[0] != '\0')
             expr = psprintf("(%s)%s", expr, cast);
         appendStringInfo(&sel, "%s%s AS %s", i > 0 ? ", " : "", expr,
                          quote_identifier(hc->name[i]));

@@ -530,6 +530,8 @@ BEGIN
                         -- the tiered INSERT's cold sink, its statement and its row renderer
                         '_cold_sink', '_cold_sink_step', '_cold_sink_final',
                         '_cold_sink_sql', '_cold_row_literal',
+                        -- the canonical text of a value another session or DuckDB reads
+                        '_canonical_text', '_canonical_jsonb',
                         -- an array column's shape check in that INSERT, and an
                         -- array parameter's renderer in a cold write
                         '_cold_list', '_render_cold_param',
@@ -1011,7 +1013,7 @@ CREATE FUNCTION coldfront._cold_sink_sql(
 LANGUAGE sql IMMUTABLE AS $$
     SELECT format(
         'SELECT coldfront._cold_sink(%1$L, %2$L, b.tuples, b.n) AS n '
-        'FROM (SELECT string_agg(''('' || coldfront._cold_row_literal(to_jsonb(r), %3$L::text[], %4$L::text[], %1$L, %2$L) || '')'', '', '') AS tuples, '
+        'FROM (SELECT string_agg(''('' || coldfront._cold_row_literal(coldfront._canonical_jsonb(r), %3$L::text[], %4$L::text[], %1$L, %2$L) || '')'', '', '') AS tuples, '
                      'count(*) AS n '
                 'FROM (SELECT r0.*, (row_number() OVER () - 1) / current_setting(''coldfront.cold_write_batch_size'')::int AS coldfront_batch '
                       'FROM (%5$s) AS r0) AS r '
@@ -1328,7 +1330,7 @@ BEGIN
     LOOP
         FETCH cur INTO rec;
         EXIT WHEN NOT FOUND;
-        payload := to_jsonb(rec);
+        payload := coldfront._canonical_jsonb(rec);
         -- OLD primary key, each part cast to its Iceberg storage type so DuckDB's
         -- row IN matches the typed columns (a bare string literal would not coerce).
         SELECT string_agg(quote_literal(payload->>nm) || '::' || typ, ', ' ORDER BY ord)
@@ -1355,7 +1357,7 @@ BEGIN
         'DELETE FROM %1$I.%2$I h WHERE (%5$s) AND %3$s >= %4$s AND (%6$s) < %4$s RETURNING h.*, (%6$s) AS cf_new_ts',
         v_hot_schema, v_hot_relname, v_pc, v_cut_lit, p_where, p_newpc)
     LOOP
-        payload := to_jsonb(rec);
+        payload := coldfront._canonical_jsonb(rec);
         ins_arr := ins_arr || ('(' || coldfront._move_row_literal(payload, full_cols, full_types, v_partcol,
                                                               p_view_schema, p_view_name) || ')');
     END LOOP;
@@ -2621,6 +2623,42 @@ BEGIN
 END;
 $$;
 
+-- ============================================================================
+-- Canonical text. A value that leaves the caller's session as text (a cold
+-- write's rendered parameter, a streamed row's text column, a cold VARCHAR
+-- holding an interval) is read back by another session, or by DuckDB, under
+-- settings of their own, so it is rendered in a form every reader takes as
+-- the same value: ISO dates and timestamps, floats at full precision, and an
+-- interval as "<months> months <days> days <seconds> seconds" with a
+-- non-negative field first. That interval shape is the one both parsers
+-- accept: DuckDB 1.5.4 rejects an ISO 8601 duration and any '+' sign, and
+-- PostgreSQL's sql_standard style spreads a leading '-' over the unsigned
+-- fields after it. Display conversion stays with the reading session.
+-- ============================================================================
+CREATE FUNCTION coldfront._canonical_text(p anyelement) RETURNS text
+LANGUAGE sql STABLE STRICT
+SET DateStyle = 'ISO, YMD' SET extra_float_digits = 3 AS $$
+    SELECT p::text
+$$;
+
+CREATE FUNCTION coldfront._canonical_text(p interval) RETURNS text
+LANGUAGE sql IMMUTABLE STRICT AS $$
+    SELECT string_agg(f.v || ' ' || f.u, ' ' ORDER BY f.v < 0, f.o)
+      FROM (VALUES (1, EXTRACT(YEAR FROM p) * 12 + EXTRACT(MONTH FROM p), 'months'),
+                   (2, EXTRACT(DAY FROM p), 'days'),
+                   (3, trim_scale(EXTRACT(HOUR FROM p) * 3600 + EXTRACT(MINUTE FROM p) * 60
+                                  + EXTRACT(SECOND FROM p)), 'seconds')) AS f(o, v, u)
+$$;
+
+-- A row for the cold sink: to_jsonb under fixed settings, the interval in ISO
+-- 8601, which _render_cold_value reads back in the caller's session and
+-- renders in the shape above.
+CREATE FUNCTION coldfront._canonical_jsonb(p anyelement) RETURNS jsonb
+LANGUAGE sql STABLE STRICT
+SET DateStyle = 'ISO, YMD' SET IntervalStyle = iso_8601 SET extra_float_digits = 3 AS $$
+    SELECT to_jsonb(p)
+$$;
+
 -- Cold-value rendering, shared so the write paths cannot disagree. DuckDB's list
 -- cast accepts [1,2,3] and rejects PG's {1,2,3}, and whitespace between elements
 -- is fine. A value taken from a jsonb payload is already bracketed: jsonb spells
@@ -2647,6 +2685,7 @@ LANGUAGE sql IMMUTABLE STRICT AS $$
         -- own input reads either. DuckDB mis-parses PG's \x escape into a BLOB,
         -- so the bytes are rebuilt from their hex digits.
         WHEN p_pg_type = 'bytea' THEN format('from_hex(%L)', encode(p_val_text::bytea, 'hex'))
+        WHEN p_pg_type = 'interval' THEN quote_literal(coldfront._canonical_text(p_val_text::interval))
         -- The Iceberg column is FLOAT[]; without the cast the literal stays a
         -- VARCHAR and the INSERT fails.
         WHEN coldfront._is_vector_type(p_pg_type) THEN format('CAST(%L AS FLOAT[])', p_val_text)
@@ -2683,7 +2722,8 @@ $$;
 -- makes of an array column. The C hook's cold_sql_arg calls this at execution.
 CREATE FUNCTION coldfront._render_cold_param(p anyarray)
 RETURNS text
-LANGUAGE sql STABLE AS $$
+LANGUAGE sql STABLE
+SET DateStyle = 'ISO, YMD' SET extra_float_digits = 3 AS $$
     SELECT coalesce(coldfront._render_cold_value(to_jsonb(coldfront._cold_list(p, NULL))::text,
                                                  pg_typeof(p)::text),
                     'NULL');
