@@ -1,3 +1,13 @@
+# HARD RULES: Design Tenets
+
+Every change keeps all five. A change that cannot is raised before it is made, never worked around.
+
+- Transparent to the user: a ColdFront table is used exactly as a native PostgreSQL table. For every supported feature the SQL, the result, the errors and the transaction semantics are what PostgreSQL gives; no new syntax, no extra step, no ColdFront function in the user's statement. A feature outside that set is refused with a clear error, never approximated.
+- Async where possible: a write does its work inside the statement and takes the serializer (the bakery claim, or the node's advisory lock) at commit, for the catalog commit alone. Claim-first is the exception, for a write whose position deletes name data files a concurrent commit could rewrite.
+- Streaming where possible: rows flow from their source to the cold tier in one pass through the DuckDB pipeline, never materialized or rendered row by row. A row-at-a-time path is the fallback for the cases where streaming is proven unsafe, and the fallback must be linear in the row count.
+- One isolation level across both tiers: the transaction isolation PostgreSQL gives a session applies to its cold-tier reads and writes as to its hot-tier ones. The two halves of a statement see one snapshot, and nothing on the cold side sees what the hot side of the same transaction cannot.
+- Interoperable Iceberg: a ColdFront table is a standard Apache Iceberg table that any other Iceberg tool can read, write and compact, and whose writes by those tools ColdFront reads. Nothing ColdFront writes needs a private layout, property or metadata field, and a commit by another tool is a normal event, never a corruption.
+
 # Development Preferences
 
 ## Process
