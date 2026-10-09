@@ -34,7 +34,7 @@ You do not need pgvector in a database that has none.
 
 A table that already exists in the catalog can be adopted instead, through
 `coldfront.adopt_iceberg_table()` (see
-[Adopting a Table That Already Exists in the Catalog](usage.md#adopting-a-table-that-already-exists-in-the-catalog)).
+[Adopting a Table That Already Exists in the Catalog](usage_decoupled.md#adopting-a-table-that-already-exists-in-the-catalog)).
 Adoption registers a clustered vector column for each Iceberg column named
 `_cf_vec_list_<column>`, which is where ColdFront keeps each row's cluster. No
 `coldfront.vector_config` row and no centroids come back with an adopted
@@ -429,5 +429,5 @@ To go further with ColdFront, consult the following documents:
   state, cluster assignment, and probe rewrite behind this guide.
 - The [Compaction](compaction.md) guide covers the maintenance that keeps
   clustered tables in cluster order.
-- The [Using ColdFront](usage.md) guide covers the table setup both modes
+- The [Using ColdFront](using_coldfront/index.md) guide covers the table setup both modes
   share.

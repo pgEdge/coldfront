@@ -14,11 +14,11 @@ navigation above is reorganized into the standard pgEdge structure.
     - [Exploring Distributed Mode](walkthrough_distributed.md)
     - [Configuring your Object Store](object_store.md)
 - Architecture
-    - [pgEdge ColdFront - Architecture](architecture.md)
+    - [pgEdge ColdFront - Architecture](architecture_guides/index.md)
     - [ColdFront - Tiered Operating Mode](architecture_tiered.md)
     - [Decoupled (Iceberg-Only) Operating Mode](architecture_decoupled.md)
     - [Vector Storage Architecture](architecture_vectors.md)
-- [Using ColdFront](usage.md)
+- [Using ColdFront](using_coldfront/index.md)
 - [Working with Embeddings](usage_vectors.md)
 - [COMPACTOR - Cold-Tier Table Maintenance](compaction.md)
 - Developer Resources

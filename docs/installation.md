@@ -1,6 +1,6 @@
 # Installing ColdFront
 
-This guide covers installing ColdFront from the published package or
+This guide details installing ColdFront from the published package or
 building it from source. See [Configuring ColdFront](configuration.md)
 for setting up PostgreSQL, Lakekeeper, and ColdFront itself once
 installed.
@@ -8,16 +8,16 @@ installed.
 ## Using a Package to Install ColdFront
 
 ColdFront's packages come from the pgEdge package repository. Before you
-install them, configure the repository by following the page for your platform
-in the Enterprise Postgres documentation:
+can use a package, you must configure the pgEdge repository by following
+the steps in the Enterprise Postgres documentation:
 
 - For RHEL, Oracle Linux, AlmaLinux, and Rocky Linux, see
   [Configuring the Repository on Enterprise Linux](https://docs.pgedge.com/enterprise/el/configure-repo/).
 - For Debian and Ubuntu, see
   [Configuring the Repository on Debian and Ubuntu](https://docs.pgedge.com/enterprise/debian/configure-repo/).
 
-Those pages cover the platform prerequisites, disabling any PGDG repository,
-and creating the pgEdge repository.
+The documentation details the platform prerequisites, disabling any PGDG
+repository, and creating the pgEdge repository.
 
 With the repository in place, install the ColdFront extension package for
 your PostgreSQL major version. It depends on the pgEdge PostgreSQL server,
@@ -160,8 +160,8 @@ publishes it. The floating `pg<major>` tag moves to the same image only when
 the base-image workflow is dispatched from `main` with `push=true` and both
 architectures.
 
-Then follow the [One-Time Setup](usage.md#one-time-setup) section of the Using
-ColdFront guide: bootstrap Lakekeeper, create a table, tier it, and verify.
+Then follow the [Configuring Lakekeeper](one_time_setup.md) guide:
+bootstrap it, create a table, tier it, and verify.
 
 !!! note "pg_duckdb pin"
 
@@ -252,8 +252,8 @@ SQL
 
 A row count of 1 read back through Iceberg confirms the full path. For a real
 cloud store, drop the `local-store` profile, point the warehouse at your own
-bucket, and follow the [One-Time Setup](usage.md#one-time-setup) section of the
-Using ColdFront guide for the full tier-and-verify journey.
+bucket, and follow the [Configuring Lakekeeper](one_time_setup.md) guide
+for the full tier-and-verify journey.
 
 ## Building ColdFront on Bare Metal
 
@@ -287,9 +287,9 @@ coldfront.iceberg_bakery_patch  = on
 coldfront refuses to load any other way: `CREATE EXTENSION coldfront` fails on
 a server that does not preload it, with an error that names the setting.
 
-See the [Tuning Knobs](usage.md#tuning-knobs) section of the Using ColdFront
-guide for the remaining GUCs, and the README for the optional non-superuser
-role that the image sets up.
+See the [Configuring PostgreSQL](configuration.md#configuring-postgresql)
+section of the Configuring ColdFront guide for the remaining GUCs, and
+the README for the optional non-superuser role that the image sets up.
 
 ## Testing & CI
 
@@ -355,10 +355,12 @@ SeaweedFS-only.
 
 To go further with ColdFront, consult the following guides:
 
-- The [Configuring ColdFront](configuration.md) guide covers PostgreSQL,
-  Lakekeeper, and ColdFront's own configuration.
+- The [Configuring ColdFront](configuration.md) guide details PostgreSQL
+  and ColdFront's own configuration.
+- The [Configuring Lakekeeper](one_time_setup.md) guide installs,
+  configures, and bootstraps it, then installs the extensions each
+  database needs.
 - The [Walkthrough](walkthrough.md) guide runs the demo stack hands-on.
-- The [Using ColdFront](usage.md) guide covers the one-time setup and both
-  modes.
+- The [Using ColdFront](using_coldfront/index.md) guide documents both operating modes.
 - The [Configuring your Object Store](object_store.md)
   guide connects the cold tier to AWS S3.

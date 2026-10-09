@@ -1,7 +1,16 @@
 # Configuring ColdFront
 
-This guide covers configuring PostgreSQL, Lakekeeper, and ColdFront
-itself, regardless of which installation path you used.
+After installing ColdFront packages or building from source, several
+components still need configuring before the cold tier comes online:
+
+- PostgreSQL and ColdFront's own configuration, detailed in this
+  guide, regardless of which installation path you followed.
+- your object store, documented in
+  [Configuring your Object Store](object_store.md).
+- installing, configuring, and bootstrapping Lakekeeper, and the
+  one-time per-database setup that ties everything together,
+  documented in the [Configuring Lakekeeper](one_time_setup.md)
+  guide.
 
 ## Configuring PostgreSQL
 
@@ -20,94 +29,79 @@ coldfront.lakekeeper_endpoint = 'http://<lakekeeper-host>:8181/catalog'
 coldfront.local_pg_dsn = 'host=/var/run/postgresql dbname=<db> user=<role>'
 ```
 
-The three `duckdb.*` settings make pg_duckdb load ColdFront's patched DuckDB
-extensions from the directory where `pgedge-coldfront-duckdb-extensions`
-installs them. Without these settings, pg_duckdb downloads the unpatched
-upstream extensions, and concurrent cold writes can then fail with HTTP 409.
-The patched extensions are unsigned, so `duckdb.allow_unsigned_extensions` must
-be on. Keeping `duckdb.autoinstall_known_extensions` off stops DuckDB from
-downloading an unpatched upstream copy when an extension file is missing.
+Together, the three `duckdb.*` settings point pg_duckdb at the directory
+where `pgedge-coldfront-duckdb-extensions` installs ColdFront's patched
+DuckDB extensions, rather than letting it fetch the unpatched upstream
+build - the same substitution that reintroduces HTTP 409 failures under
+concurrent cold writes. The patched extensions are unsigned, so
+`duckdb.allow_unsigned_extensions` must stay on; and because a missing
+extension file would otherwise trigger that same fallback,
+`duckdb.autoinstall_known_extensions` stays off.
 
 The two `coldfront.iceberg_*` settings take effect only on a Spock mesh, where
 a node then uploads Parquet files outside the bakery claim and serializes only
 the catalog commit. The packaged duckdb-iceberg includes the patch that this
-ordering requires, and the
-[Distributed Setup](usage.md#distributed-setup-3-node-mesh-decoupled-mode)
-section of the Using ColdFront guide describes the mesh settings.
+ordering requires, and the [Distributed Setup](distributed_setup.md) guide
+describes the mesh settings.
 
-The [One-Time Setup](usage.md#one-time-setup) section of the Using ColdFront
-guide describes the `coldfront.*` settings. Follow that section from the
-Lakekeeper bootstrap onward to create the warehouse, the extensions, and the
-cold-store credential.
+ColdFront also exposes the following settings, which adjust write
+behavior and execution; tune them as needed:
 
-## Setting Up Lakekeeper
-
-The `pgedge-lakekeeper` package installs the `lakekeeper` binary and a
-`lakekeeper` systemd service, but it does not enable or start the service.
-Lakekeeper stores its catalog in a PostgreSQL 15 or later database and reads
-its settings from `/etc/lakekeeper/lakekeeper.env`. The following steps
-prepare and start the service:
-
-1. Create a role and a database for the catalog:
-
-    ```sql
-    CREATE ROLE lakekeeper LOGIN PASSWORD 'change-me';
-    CREATE DATABASE lakekeeper OWNER lakekeeper;
-    ```
-
-    The migration in step 3 creates the `uuid-ossp`, `pgcrypto`, `pg_trgm`,
-    `btree_gin`, and `btree_gist` extensions, so either the role must be
-    allowed to run `CREATE EXTENSION` or a superuser must create them first.
-
-2. In `/etc/lakekeeper/lakekeeper.env`, set
-    `LAKEKEEPER__PG_DATABASE_URL_WRITE` to the database's connection string and
-    `LAKEKEEPER__PG_ENCRYPTION_KEY` to a random secret, such as the output of
-    `openssl rand -base64 32`. Lakekeeper encrypts stored credentials with the
-    key, so keep the key stable and backed up. Every node that shares the
-    catalog needs the same key.
-
-3. Run the one-time database migration as the `lakekeeper` user:
-
-    ```bash
-    set -a; . /etc/lakekeeper/lakekeeper.env; set +a
-    sudo -E -u lakekeeper /usr/bin/lakekeeper migrate
-    ```
-
-4. Enable and start the service:
-
-    ```bash
-    sudo systemctl enable --now lakekeeper
-    ```
-
-Lakekeeper listens on port 8181 on every address by default. Without an
-authorization backend in `lakekeeper.env`, the catalog accepts every request,
-so configure authentication and authorization before you expose the service
-beyond a trusted network.
+| Setting | Description |
+|---|---|
+| `coldfront.allow_mixed_writes` | Controls tiered-mode `UPDATE`/`DELETE` whose WHERE cannot be proven to target one tier. `on` emits a dual-tier CTE; `off` rejects with an error and a hint. Not relevant in decoupled mode (every write is single-tier by definition). The default is `on`. |
+| `coldfront.cold_write_batch_size` | Sets how many cold rows a tiered `INSERT` gathers (see [Caveats](caveats.md)) before writing them to Iceberg as one `INSERT`. A larger value writes fewer, larger Parquet files; the remainder always flushes, so a small write stays one file. The default is `10000`, with a minimum of `1`. |
+| `coldfront.vector_probe` | Sets whether a recognized similarity search reads only the clusters nearest its query vector. `off` gives an exact scan of the whole corpus. Affects only a table with a trained vector column ([usage_vectors.md](usage_vectors.md)). The default is `on`. |
+| `coldfront.vector_nprobe` | Sets how many clusters such a search reads, overriding the column's own `nprobe`; at or above the column's `nlist` the search is exhaustive. The default is `0`, which uses the configured value. |
+| `duckdb.force_execution` | Benchmark before enabling: on a mixed workload it helps `count(distinct)` and similar but regresses index lookups, top-K with PK ordering, and JSON access. The default is `off`. |
+| `duckdb.temporary_directory` | Sets where DuckDB spills. Each backend gets its own subdirectory there, named after its process id, so concurrent spills cannot collide; one left by a departed backend is reclaimed. See [architecture.md](architecture_guides/index.md#duckdb-spill-files-are-not-namespaced-per-instance). |
+| `duckdb.max_temp_directory_size` | A cap per connection, not a cluster total. For a total budget, divide it by the concurrent sessions, or give the temp path its own filesystem or quota. The default is 90% of free space per session. |
 
 ## Writing ColdFront's Configuration
 
-ColdFront has no configuration file, because the database holds its
-configuration. The server settings are the `postgresql.conf` lines above, each
-managed table is a row in `coldfront.partition_config`, and the cold-store
-credential is in `coldfront.storage_secret`. The archiver, partitioner, and
-compactor connect the way psql does, from the libpq environment (`PGHOST`,
-`PGDATABASE`, `PGUSER`, `PGPASSWORD`, `PGSERVICE`) or `--dsn`, and read every
-other setting from the server.
+Server-level settings live in `postgresql.conf`, each managed table's
+configuration is a row in `coldfront.partition_config`, and the
+cold-store credential lives in `coldfront.storage_secret`.
 
-You write that configuration with `coldfront.set_storage_secret()` and the
-`register` command, or in one step by importing a deployment YAML:
+Write the configuration with `coldfront.set_storage_secret()` and the
+`register` command. `set_storage_secret()` writes the following to
+`coldfront.storage_secret`; the
+[Configuring your Object Store](object_store.md) guide shares the exact
+values for each supported backend:
+
+- `<access-key-id>` - your object store's access key.
+- `<secret-key>` - the matching secret.
+- `<endpoint>` - your object store's endpoint.
+
+```sql
+SELECT coldfront.set_storage_secret('<access-key-id>', '<secret-key>', '<endpoint>');
+```
+
+`register` writes the following to `coldfront.partition_config`:
+
+- `<table>` - the table name.
+- `<period>` - the partition cadence, e.g. `monthly`.
+- `<hot-period>` - how long a partition stays hot before the archiver
+  moves it to the cold tier.
+
+```bash
+./bin/archiver register --table <table> \
+    --period <period> --hot-period "<hot-period>"
+```
+
+Or do both in one step by importing a deployment YAML:
 
 ```bash
 archiver import --config deploy.yaml
 ```
 
 The `pgedge-coldfront` package installs an example deployment YAML at
-`/etc/pgedge/coldfront/config.yaml`. That file is only an example to edit and
-pass to `import`, and no ColdFront tool reads it unless `--config` names it.
+`/etc/pgedge/coldfront/config.yaml`. The file is only an example; edit it and pass it to `import` - no
+ColdFront tool reads it unless `--config` names it.
 After an import, the server holds the configuration. A later run that is given
 a YAML checks the file against the server and refuses to run if any value
 differs. The only value such a run takes from the file is `postgres.dsn`, which
 connects when `--dsn` is unset. The
-[Managing Partitioned Tables (CLI)](usage.md#managing-partitioned-tables-cli)
-section of the Using ColdFront guide describes `register`, `import`, and
-`export`.
+[Managing Partitioned Tables (CLI)](usage_partitioner.md#managing-partitioned-tables-cli)
+section of the Using ColdFront in Standalone Partitioned Mode guide describes
+`register`, `import`, and `export`.

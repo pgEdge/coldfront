@@ -6,7 +6,7 @@ archiver moves rows hot→cold on a cron.
 
 This document covers the **tiered-specific** design. The shared mechanics -
 pg_duckdb Iceberg I/O, the rewrite hook, the bakery protocol, the registry, DDL
-handling, infrastructure - live in [architecture.md](architecture.md); the
+handling, infrastructure - live in [architecture.md](architecture_guides/index.md); the
 all-Iceberg alternative is
 [architecture_decoupled.md](architecture_decoupled.md).
 
@@ -65,7 +65,7 @@ A single Go binary runs via cron. The binary converts an existing partitioned
 table into a tiered table on first run, then manages the ongoing lifecycle. The
 archiver is a thin SQL orchestrator - no DuckDB/Iceberg/Arrow Go libraries; all
 Iceberg I/O goes through `pg_duckdb` (see the
-[Core Mechanics](architecture.md#core-mechanics-pg_duckdb) section of the
+[Core Mechanics](architecture_guides/index.md#core-mechanics-pg_duckdb) section of the
 Architecture overview).
 
 ### Prerequisites
@@ -75,7 +75,7 @@ The archiver requires the following before its first run:
 - PostgreSQL 16+ with pg_duckdb.
 - Lakekeeper, bootstrapped with a warehouse.
 - a configured storage secret (see the
-  [Session Setup](architecture.md#session-setup) section of the Architecture
+  [Session Setup](architecture_guides/index.md#session-setup) section of the Architecture
   overview).
 - static `s3:` or `azure:` credentials in the archiver config, unless the cold
   store uses vended credentials.
@@ -169,7 +169,7 @@ six-phase pipeline:
 
 2. The bulk export copies the partition PG → Iceberg under a captured
    snapshot, using the temp table bridge (see the
-   [Temp Table Bridge](architecture.md#temp-table-bridge-pg-iceberg) section of
+   [Temp Table Bridge](architecture_guides/index.md#temp-table-bridge-pg-iceberg) section of
    the Architecture overview) and a single bakery-claimed Iceberg `INSERT`.
    Each cycle has already created the Iceberg namespace and table, if missing,
    before the per-partition loop.
@@ -280,7 +280,7 @@ the flat path.
 ## Transparent `INSERT`
 
 The `post_parse_analyze_hook` (see the
-[Application Interface](architecture.md#application-interface) section of the
+[Application Interface](architecture_guides/index.md#application-interface) section of the
 Architecture overview) intercepts `INSERT` on a registered tiered view and
 rewrites it into a single statement that splits the input by the
 partition-column watermark:
@@ -467,7 +467,7 @@ them. Strict mode avoids this path entirely.
 
 A cold-only `UPDATE` or `DELETE` sets nothing, so a transaction block that
 holds one cannot also write a PostgreSQL table unless the session sets the
-parameter itself; the [Caveats](usage.md#caveats) state the rule.
+parameter itself; the [Caveats](caveats.md) state the rule.
 
 ### Strict (`off`)
 
@@ -479,7 +479,7 @@ applications to supply a tier-deterministic WHERE clause.
 ## Tiered Tables in a Spock Mesh
 
 The bakery protocol that serializes cold writes cluster-wide is described in
-the [Concurrency](architecture.md#concurrency-and-pgedge-spock-deployments)
+the [Concurrency](architecture_guides/index.md#concurrency-and-pgedge-spock-deployments)
 section of the Architecture overview. This section covers what is specific to
 a *tiered* table across a mesh.
 
@@ -497,7 +497,7 @@ So alongside the bakery substrate (`coldfront.claims` /
 `coldfront.claim_acks`), **both `coldfront.tiered_views` and
 `coldfront.archive_watermark` are in the Spock replication set**:
 `coldfront.ensure_replicated()`, the one-time per-node mesh step described in
-[usage.md](usage.md#what-coldfrontensure_replicated-does), adds them with the
+[distributed_setup.md](distributed_setup.md#what-coldfrontensure_replicated-does), adds them with the
 rest. The archiver runs on one node and registers a table, its view and its
 registry row, in one transaction, so a peer applies them together and only gets
 these rows by replication; without `tiered_views` a peer cannot read the cold
@@ -506,7 +506,7 @@ tier, and `INSERT`/`UPDATE`/`DELETE`/DDL-blocking stop recognizing the view.
 Both tables are **name-keyed** - `tiered_views` by `(schema_name, relname)`,
 `archive_watermark` by `table_name` - so each row replicates verbatim and
 correct on every node, with no OID divergence to reason about. See the
-[Registry Keying](architecture.md#registry-keying-by-name-not-oid) section of
+[Registry Keying](architecture_guides/index.md#registry-keying-by-name-not-oid) section of
 the Architecture overview.
 
 ## Partition Scheme Compatibility
@@ -623,7 +623,7 @@ not make deletes less expensive.
 These are specific to the dual-tier model. Cross-cutting limitations (the
 planner-level takeover, jsonb-as-json, single-node execution, S3 compatibility,
 one-time secret setup) are in the
-[Known Limitations](architecture.md#known-limitations) section of the
+[Known Limitations](architecture_guides/index.md#known-limitations) section of the
 Architecture overview.
 
 The dual-tier model has the following limitations:
@@ -676,9 +676,9 @@ The dual-tier model has the following limitations:
 
 To go further with ColdFront, consult the following documents:
 
-- The [Architecture](architecture.md) overview describes the mechanics both
+- The [Architecture](architecture_guides/index.md) overview describes the mechanics both
   modes share.
 - The [Decoupled Mode](architecture_decoupled.md) deep dive describes the
   bakery protocol that serializes cold writes.
-- The [Using ColdFront](usage.md) guide covers tiering a table and managing it
+- The [Using ColdFront](using_coldfront/index.md) guide covers tiering a table and managing it
   with the partition CLI.

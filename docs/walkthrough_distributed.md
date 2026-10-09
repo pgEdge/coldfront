@@ -223,10 +223,10 @@ number and no fork.
 
 To go further with ColdFront, consult the following guides:
 
-- The [Using ColdFront](usage.md) guide covers both modes in depth, including
+- The [Using ColdFront](using_coldfront/index.md) guide covers both modes in depth, including
   the full one-time setup, supported column types, the partition manager CLI,
   and tuning options.
-- The [Architecture](architecture.md) overview explains the shared mechanics
+- The [Architecture](architecture_guides/index.md) overview explains the shared mechanics
   and links to the per-mode deep dives.
 - The [Compaction](compaction.md) guide covers cold-tier maintenance:
   compaction, snapshot expiry, and orphan-file removal.

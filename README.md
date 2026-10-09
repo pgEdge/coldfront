@@ -16,11 +16,11 @@ The ColdFront documentation consists of the following guides:
     - [Building ColdFront from Source](docs/installation.md)
     - [Setting Up an Object Store](docs/object_store.md)
 - Architecture
-    - [Architecture Overview](docs/architecture.md)
+    - [Architecture Overview](docs/architecture_guides/index.md)
     - [Tiered Mode](docs/architecture_tiered.md)
     - [Decoupled Mode](docs/architecture_decoupled.md)
     - [Vector Storage](docs/architecture_vectors.md)
-- [Using ColdFront](docs/usage.md)
+- [Using ColdFront](docs/using_coldfront/index.md)
 - [Storing and Searching Embeddings](docs/usage_vectors.md)
 - [Compacting the Cold Tier](docs/compaction.md)
 - Developer Resources
@@ -133,9 +133,10 @@ settings above. The `import` command takes a deployment YAML, modeled on
 [config.example.yaml](config.example.yaml), and writes it into the server once.
 ColdFront has no configuration file. A YAML passed to any later run is checked
 against the server, and the run takes only `postgres.dsn` from the file.
-For every setting, see the [One-Time Setup](docs/usage.md#one-time-setup) and
-[Tuning Knobs](docs/usage.md#tuning-knobs) sections of the Using ColdFront
-guide.
+For every setting, see the
+[Configuring Lakekeeper](docs/one_time_setup.md) guide and the
+[Configuring PostgreSQL](docs/configuration.md#configuring-postgresql)
+section of the Configuring ColdFront guide.
 
 ## Quickstart
 
@@ -147,7 +148,7 @@ docker compose --profile local-store up -d --build
 ```
 
 Bootstrap Lakekeeper and create a warehouse (see the one-time setup in the
-[Using ColdFront](docs/usage.md) guide), then create a table in psql:
+[Using ColdFront](docs/using_coldfront/index.md) guide), then create a table in psql:
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS pg_duckdb;
@@ -167,28 +168,33 @@ than creating it: `coldfront.adopt_iceberg_table()` reads its schema from the
 catalog and gives it the same wrapper view and registry row, read-only unless
 you pass `p_writable => true`. `coldfront.release_iceberg_table()` hands the
 table back with the Iceberg table untouched. See
-[Adopting a Table That Already Exists in the Catalog](docs/usage.md#adopting-a-table-that-already-exists-in-the-catalog).
+[Adopting a Table That Already Exists in the Catalog](docs/usage_decoupled.md#adopting-a-table-that-already-exists-in-the-catalog).
 
 To remove a table again, `coldfront.drop_iceberg_table()` unregisters it and
 drops the Iceberg table, deleting the stored objects only when asked to. See
-[Dropping an Iceberg Table](docs/usage.md#dropping-an-iceberg-table-both-modes).
+[Dropping an Iceberg Table](docs/usage_decoupled.md#dropping-an-iceberg-table-both-modes).
 
 For compliance environments that cannot store an object-store credential,
 `coldfront.set_storage_secret_vended()` runs with no credential in the
 database: Lakekeeper issues short-lived per-table credentials at access time.
-See [Vended Credentials](docs/usage.md#vended-credentials).
+See [Vended Credentials](docs/vended_credentials.md).
 
 ## Using ColdFront
 
-The Quickstart covers a decoupled table from start to finish. The
-[Using ColdFront](docs/usage.md) guide covers both modes in depth, the
-standalone partition manager and its CLI, the storage backends, and the
-distributed setup; the [walkthrough](docs/walkthrough.md) demos run each mode
-on a sample table.
+The Quickstart walks through a decoupled table from start to finish.
+[Using ColdFront in Tiered Mode](docs/usage_tiered.md),
+[Using ColdFront in Decoupled Mode](docs/usage_decoupled.md), and
+[Using ColdFront in Standalone Partitioned Mode](docs/usage_partitioner.md)
+document each mode in depth; the [Using ColdFront](docs/using_coldfront/index.md) guide
+helps you pick one, and the [walkthrough](docs/walkthrough.md) demos run
+each mode on a sample table. Operational topics shared across modes -
+caveats, vended credentials, reading and writing, supported types, and
+distributed (mesh) setup - are documented under Administration.
 
 ## Documentation
 
-The following table lists the ColdFront guides and what each one covers:
+The following table lists the ColdFront guides and what each one
+documents:
 
 | Doc | Contents |
 |---|---|
@@ -197,12 +203,22 @@ The following table lists the ColdFront guides and what each one covers:
 | [Decoupled mode demo](docs/walkthrough_decoupled.md) | Stores a table in Iceberg from the first row and adopts a table that another engine wrote. |
 | [Partitioner demo](docs/walkthrough_partitioner.md) | Manages PostgreSQL range partitions without any cold tier. |
 | [Distributed demo](docs/walkthrough_distributed.md) | Points two PostgreSQL nodes at one shared lake. |
-| [Embeddings](docs/usage_vectors.md) | Covers storing and searching embeddings with the pgvector interface. |
-| [Usage](docs/usage.md) | Covers day-to-day use: both modes plus the standalone partition manager, one-time setup, reading and writing, supported types, the partition CLI, storage backends, distributed (mesh) setup, and tuning. |
-| [Installation](docs/installation.md) | Covers building from source (Docker or bare-metal), and testing and CI. |
-| [Configuring your Object Store](docs/object_store.md) | Gets ColdFront running on cloud S3 (virtual-hosted), end to end. |
-| [Compaction](docs/compaction.md) | Covers cold-tier table maintenance: compaction, snapshot expiry, and orphan-file removal. |
-| [Architecture](docs/architecture.md) | Describes the shared architecture and core mechanics. |
+| [Embeddings](docs/usage_vectors.md) | Documents storing and searching embeddings with the pgvector interface. |
+| [Usage](docs/using_coldfront/index.md) | Compares the three operating modes and links to each mode's guide. |
+| [Tiered mode usage](docs/usage_tiered.md) | Documents archiving aging partitions to Iceberg while recent rows stay in the PostgreSQL heap. |
+| [Decoupled mode usage](docs/usage_decoupled.md) | Documents tables that live entirely in Iceberg from the first row, and dropping or releasing a registered table. |
+| [Standalone partitioner usage](docs/usage_partitioner.md) | Documents managing PostgreSQL partitions with no cold tier at all, and the partition CLI shared with tiered mode. |
+| [Caveats](docs/caveats.md) | Documents cross-tier isolation, mixed transactions, and other sharp edges shared between tiered and decoupled tables. |
+| [Vended Credentials](docs/vended_credentials.md) | Documents running with no stored object-store credential, for AWS S3 and Azure ADLS Gen2. |
+| [Reading and Writing](docs/reading_writing.md) | Documents the SQL surface shared between tiered and decoupled tables. |
+| [Supported Column Types](docs/supported_types.md) | Documents the PostgreSQL column types, including arrays, that a cold tier supports. |
+| [Distributed Setup](docs/distributed_setup.md) | Documents running a multi-writer decoupled-mode Spock mesh against one shared lake. |
+| [Installation](docs/installation.md) | Documents installing from a package or building from source (Docker or bare-metal), and testing and CI. |
+| [Configuring ColdFront](docs/configuration.md) | Documents configuring PostgreSQL and ColdFront's own configuration. |
+| [Configuring Lakekeeper](docs/one_time_setup.md) | Installs, configures, and bootstraps Lakekeeper, then installs the extensions each database needs. |
+| [Configuring your Object Store](docs/object_store.md) | Gets ColdFront running end to end, for any of four supported backends: S3-compatible, virtual-hosted cloud S3, GCS, or Azure ADLS Gen2. |
+| [Compaction](docs/compaction.md) | Documents cold-tier table maintenance: compaction, snapshot expiry, and orphan-file removal. |
+| [Architecture](docs/architecture_guides/index.md) | Describes the shared architecture and core mechanics. |
 | [Architecture: tiered](docs/architecture_tiered.md) | Describes tiered mode (hot PG plus cold Iceberg) in depth. |
 | [Architecture: decoupled](docs/architecture_decoupled.md) | Describes decoupled (iceberg-only) mode in depth. |
 | [Architecture: vectors](docs/architecture_vectors.md) | Describes vector storage internals: type mapping, routing state, cluster assignment, and layout. |
@@ -239,7 +255,7 @@ For how the non-superuser path works - the `SECURITY DEFINER` attach helpers,
 the `PGC_SUSET` / `GUC_SUPERUSER_ONLY` config hardening, the
 `duckdb.postgres_role` default that the image sets up, and how least privilege
 holds across a Spock mesh - see
-[Architecture: non-superuser app roles](docs/architecture.md#non-superuser-app-roles-least-privilege).
+[Architecture: non-superuser app roles](docs/architecture_guides/index.md#non-superuser-app-roles-least-privilege).
 
 ## Caveats
 

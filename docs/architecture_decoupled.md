@@ -6,7 +6,7 @@ archiver. PostgreSQL becomes a stateless compute front-end. Lakekeeper and the
 underlying object store own the storage. Decoupled mode shares the same
 codebase, docker stack and extension as tiered mode. The shared mechanics -
 pg_duckdb Iceberg I/O, the rewrite hook, the bakery protocol, the registry -
-are in [architecture.md](architecture.md); tiered mode is in
+are in [architecture.md](architecture_guides/index.md); tiered mode is in
 [architecture_tiered.md](architecture_tiered.md). This document covers what is
 specific to decoupled mode.
 
@@ -162,7 +162,7 @@ which would lose precision or identity:
 - custom enums, `xml`, `tsvector`/`tsquery`, range types, and multirange types.
 - composite types.
 - arrays of `timestamptz`, `jsonb`, `json`, `interval` or a vector type, and
-  arrays of arrays; [Arrays](usage.md#arrays) gives the reasons.
+  arrays of arrays; [Arrays](supported_types.md#arrays) gives the reasons.
 - pgvector's `sparsevec`.
 - any type not enumerated above.
 
@@ -201,8 +201,8 @@ DELETE FROM events WHERE id = 1;
 The fourth argument, `p_partition_cols`, is the table's Iceberg partitioning as
 a `text[]` of `PARTITIONED BY` terms, passed to DuckDB as written; the terms,
 and how a term with a comma or a quoted name is written in the array literal,
-are in the [Mode 2](usage.md#mode-2-decoupled-iceberg-only) section of the
-Using ColdFront guide. DuckDB refuses an unknown transform, a bad argument or a
+are in the [Using ColdFront in Decoupled Mode](usage_decoupled.md) guide.
+DuckDB refuses an unknown transform, a bad argument or a
 column outside the schema at `CREATE TABLE`. The one check DuckDB leaves to the
 first `INSERT`, a time transform on a column that is not a timestamp or date
 (for `hour`, not a timestamp), `coldfront._partition_clause()` makes at the
@@ -517,7 +517,7 @@ Three properties are worth knowing:
 
 ## ACID Model
 
-(This section summarizes material from [architecture.md](architecture.md)
+(This section summarizes material from [architecture.md](architecture_guides/index.md)
 §Concurrency and §Known Limitations applied to the decoupled scenario.)
 
 The following table shows the status of each ACID property in decoupled mode:
@@ -713,8 +713,8 @@ pointing at the same Lakekeeper endpoint and S3 bucket:
 - For DDL, Spock's `ddl_sql` repset replicates `CREATE/ALTER/DROP` of the
   wrapper view, and the `default` repset replicates the
   `coldfront.tiered_views` registry row (see
-  [Distributed Setup](usage.md#distributed-setup-3-node-mesh-decoupled-mode)),
-  so one node provisions the table and replication enables every peer's hook.
+  [Distributed Setup](distributed_setup.md)), so one node provisions the
+  table and replication enables every peer's hook.
   A column `ALTER TABLE` reaches the peers the same way: the node that runs it
   changes the shared Iceberg table, and its rebuilt view and registry row
   replicate.
@@ -781,8 +781,7 @@ The call is idempotent. It puts every ColdFront table that replicates by value
 in the node's replication sets: the two bakery tables, the registry and the
 watermark, the storage secret, the lifecycle config and the vector routing
 state (the list and the reason for each table are in the
-[Distributed Setup](usage.md#what-coldfrontensure_replicated-does) section of
-the Using ColdFront guide).
+[Distributed Setup](distributed_setup.md#what-coldfrontensure_replicated-does) guide).
 If it has not run on a peer, that peer's ack `INSERT`s are local-only and never
 replicate back to the originating writer: every claim on the originator waits
 at the ack barrier for an ack that never arrives.
@@ -836,16 +835,16 @@ Decoupled mode has the following limitations:
 - A transaction block that writes a decoupled table cannot also write a
   PostgreSQL table unless `duckdb.unsafe_allow_mixed_transactions` is on:
   pg_duckdb refuses the PostgreSQL write, or the `COMMIT` when that write came
-  first. The [Caveats](usage.md#caveats) describe the rule and the risk of
-  setting the parameter.
+  first. The [Caveats](caveats.md) describe the rule and the risk of setting
+  the parameter.
 
 ## Next Steps
 
 To go further with ColdFront, consult the following documents:
 
-- The [Architecture](architecture.md) overview describes the mechanics both
+- The [Architecture](architecture_guides/index.md) overview describes the mechanics both
   modes share.
 - The [Formal Verification](formal/README.md) document describes the TLA+ model
   of the bakery protocol and how to check it.
-- The [Using ColdFront](usage.md) guide covers creating decoupled tables and
+- The [Using ColdFront](using_coldfront/index.md) guide covers creating decoupled tables and
   setting up a distributed mesh.
