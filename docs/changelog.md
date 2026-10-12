@@ -168,9 +168,9 @@ this project adheres to
   `<months> months <days> days <seconds> seconds`) that PostgreSQL and DuckDB
   read back as the same value whatever the session's settings.
 - A tiered table with a column whose name DuckDB parses as a keyword, such as
-  `by`, `at` or `show`, registered cleanly and then failed every archive pass,
-  and a table with such a name archived and then failed every read, because
-  pg_duckdb passes the name to DuckDB unquoted
+  `by`, `at` or `show`, registered cleanly and then failed every archive pass.
+  A table with such a name archived and then failed every read. Both failures
+  come from pg_duckdb passing the name to DuckDB unquoted
   ([duckdb/pg_duckdb#1019](https://github.com/duckdb/pg_duckdb/issues/1019)).
   Registration, an archive pass that tiers or expires data,
   `coldfront.create_iceberg_table()`, `coldfront.adopt_iceberg_table()`, and a

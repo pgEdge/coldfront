@@ -648,9 +648,9 @@ field. Registration fails when:
   their column types are PostgreSQL's business alone.
 - a tiered table's name, or the name of one of its columns, is one DuckDB
   parses as a keyword, such as `by`, `at` or `show` (see [Caveats](#caveats)).
-  The archiver checks the column names again before it tiers or expires data,
-  so a column added after
-  registration is refused there, before any table or data reaches Iceberg.
+  The archiver checks the column names again before it tiers or expires data;
+  it refuses a column added after registration before any table or data reaches
+  Iceberg.
 
 Registration validates the table as it is at that moment, not continuously.
 Adding a `DEFAULT` partition to an already-registered table is therefore not
@@ -1182,19 +1182,19 @@ Keep the following caveats in mind when running either mode:
   `pivot_longer`, `pivot_wider`, `positional`, `qualify`, `semi`, `show`,
   `summarize`, `unpack` and `unpivot`. pg_duckdb passes a table or column name
   to DuckDB quoted the way PostgreSQL quotes it, so such a name reaches DuckDB
-  bare even when the query quotes it, and every query pg_duckdb runs against
-  the table or column fails with a DuckDB `Parser Error`
+  bare even when the query quotes it. Every query pg_duckdb runs against the
+  table or column then fails with a DuckDB `Parser Error`
   ([duckdb/pg_duckdb#1019](https://github.com/duckdb/pg_duckdb/issues/1019)).
   ColdFront refuses such a column name wherever a column gets a cold tier:
   tiered registration, an archive pass that tiers or expires data,
-  `coldfront.create_iceberg_table()`, `coldfront.adopt_iceberg_table()`, and
-  an `ADD COLUMN` or `RENAME COLUMN` on a table that already has a cold tier.
-  It refuses such a table name at tiered registration, in
-  `coldfront.create_iceberg_table()` and `coldfront.adopt_iceberg_table()`,
-  and in a `RENAME` of the view or the hot table of a table that already has a
-  cold tier. A DuckDB keyword that its parser accepts as a name, such as
-  `columns`, is not refused. A table with such a name or column can still be
-  registered partition-only, without a hot period.
+  `coldfront.create_iceberg_table()`, `coldfront.adopt_iceberg_table()`, and an
+  `ADD COLUMN` or `RENAME COLUMN` on a table that already has a cold tier.
+  ColdFront refuses such a table name at tiered registration, in
+  `coldfront.create_iceberg_table()` and `coldfront.adopt_iceberg_table()`, and
+  in a `RENAME` of the view or the hot table of a table that already has a cold
+  tier. Partition-only registration, without a hot period, accepts a table with
+  such a name or column. ColdFront does not refuse a DuckDB keyword that the
+  DuckDB parser accepts as a name, such as `columns`.
 
 ## Distributed Setup (3-Node Mesh, Decoupled Mode)
 
