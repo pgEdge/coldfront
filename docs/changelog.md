@@ -169,12 +169,13 @@ this project adheres to
   read back as the same value whatever the session's settings.
 - A tiered table with a column whose name DuckDB parses as a keyword, such as
   `by`, `at` or `show`, registered cleanly and then failed every archive pass,
-  because pg_duckdb passes the name to DuckDB unquoted
+  and a table with such a name archived and then failed every read, because
+  pg_duckdb passes the name to DuckDB unquoted
   ([duckdb/pg_duckdb#1019](https://github.com/duckdb/pg_duckdb/issues/1019)).
   Registration, an archive pass that tiers or expires data,
-  `coldfront.create_iceberg_table()`, `coldfront.adopt_iceberg_table()` and a
-  column change on a table that has a cold tier refuse such a name, naming the
-  column and the upstream bug.
+  `coldfront.create_iceberg_table()`, `coldfront.adopt_iceberg_table()`, and a
+  column change or rename on a table that has a cold tier refuse such a name,
+  naming the table or column and the upstream bug.
 - A bakery acknowledgement could outlive the claim it answered: a peer ruled
   dead acknowledged the claims it had missed once it caught up, and the rows
   stayed on every node. A node keeps an acknowledgement only while it still

@@ -6664,22 +6664,27 @@ story_unmappable_column_rejected() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────
-# Story: TC-260..TC-263, a column name DuckDB parses as a keyword is refused on
-# every path to a cold tier. pg_duckdb hands DuckDB each column name quoted the
-# way PostgreSQL quotes it, so by, which PostgreSQL leaves bare, reaches DuckDB
-# bare and fails to parse (duckdb/pg_duckdb#1019). Without the refusal such a
-# table registers and then every archive pass that tiers it fails. A DuckDB
-# keyword its parser takes as a name (columns) and a word PostgreSQL quotes
-# ("order") still register.
+# Story: TC-260..TC-263, TC-265, a table or column name DuckDB parses as a
+# keyword is refused on every path to a cold tier. pg_duckdb hands DuckDB each
+# identifier quoted the way PostgreSQL quotes it, so by, which PostgreSQL leaves
+# bare, reaches DuckDB bare and fails to parse (duckdb/pg_duckdb#1019). Without
+# the refusal a table with such a column registers and then every archive pass
+# that tiers it fails, and a table with such a name archives and then every read
+# of its view fails. A DuckDB keyword its parser takes as a name (columns) and a
+# word PostgreSQL quotes ("order") still register.
 # ───────────────────────────────────────────────────────────────────────────
-story_keyword_column_rejected() {
-    step "TC-260..TC-263: a column name DuckDB parses as a keyword is refused"
+story_keyword_name_rejected() {
+    step "TC-260..TC-263, TC-265: a table or column name DuckDB parses as a keyword is refused"
     local dsn="host=${DB_IP} port=5432 dbname=coldfront user=coldfront password=coldfront sslmode=disable"
     local why='DuckDB cannot parse this name, which pg_duckdb passes to it unquoted (https://github.com/duckdb/pg_duckdb/issues/1019)'
+    # The keyword names are the objects a missing refusal leaves behind.
     _tc260_cleanup() {
-        q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name IN ('tc260_kw','tc260_ok','tc261_kw');" >/dev/null 2>&1
-        q "$HOST" "DROP TABLE IF EXISTS public.tc260_kw, public.tc260_ok, public.tc261_kw CASCADE;" >/dev/null 2>&1
-        q "$HOST" "SELECT coldfront.ensure_attached(); SELECT duckdb.raw_query('DROP TABLE IF EXISTS ice.public.tc261_kw'); SELECT duckdb.raw_query('DROP TABLE IF EXISTS ice.tc263ns.tc263_kw');" >/dev/null 2>&1
+        q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name IN ('tc260_kw','tc260_ok','at','tc261_kw','tc265','qualify');
+                   DELETE FROM coldfront.tiered_views WHERE relname IN ('tc265','qualify','pivot','show');
+                   DELETE FROM coldfront.archive_watermark WHERE table_name IN ('tc265','qualify');" >/dev/null 2>&1
+        q "$HOST" "DROP VIEW IF EXISTS public.tc265, public.qualify, public.pivot, public.\"show\";" >/dev/null 2>&1
+        q "$HOST" "DROP TABLE IF EXISTS public.tc260_kw, public.tc260_ok, public.\"at\", public.tc261_kw, public._tc265, public.glob CASCADE;" >/dev/null 2>&1
+        q "$HOST" "SELECT coldfront.ensure_attached(); SELECT duckdb.raw_query('DROP TABLE IF EXISTS ice.public.tc261_kw'); SELECT duckdb.raw_query('DROP TABLE IF EXISTS ice.public.tc265'); SELECT duckdb.raw_query('DROP TABLE IF EXISTS ice.public.\"pivot\"'); SELECT duckdb.raw_query('DROP TABLE IF EXISTS ice.tc263ns.tc263_kw'); SELECT duckdb.raw_query('DROP TABLE IF EXISTS ice.tc263ns.\"show\"');" >/dev/null 2>&1
     }
     trap _tc260_cleanup RETURN
     _tc260_unregistered() {
@@ -6704,6 +6709,12 @@ story_keyword_column_rejected() {
     else
         fail "TC-260: a name DuckDB parses was refused, see $TMPD/tc260-ok.log"; tail -3 "$TMPD/tc260-ok.log"
     fi
+    # A table named such a word: the name is the view's, which pg_duckdb expands
+    # on every read.
+    q "$HOST" "CREATE TABLE public.\"at\" (id bigint, ts timestamptz NOT NULL,
+        PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);" >/dev/null
+    assert_register_rejected "TC-260: register named the table and the pg_duckdb bug" \
+        at "table \"at\": $why"
     # TC-261: a column added after registration fails the archive pass, naming
     # it, before anything reaches Iceberg; the row stays hot.
     qf "$HOST" <<'EOSQL' >/dev/null
@@ -6730,11 +6741,43 @@ EOSQL
     assert_err "TC-262: create_iceberg_table refused the column" "column \"pivot\": $why" \
         "$(q_may "$HOST" "SELECT coldfront.create_iceberg_table('public','tc262_kw','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"pivot\",\"type\":\"integer\"}]'::jsonb);")"
     assert_eq "TC-262: no view and no registry row" "true|0" "$(_tc260_unregistered tc262_kw)"
-    # TC-263: adoption refuses a catalog table with such a column, registering nothing.
+    assert_err "TC-262: create_iceberg_table refused the table name" "table \"pivot\": $why" \
+        "$(q_may "$HOST" "SELECT coldfront.create_iceberg_table('public','pivot','[{\"name\":\"id\",\"type\":\"bigint\"}]'::jsonb);")"
+    assert_eq "TC-262: no view and no registry row for it" "true|0" "$(_tc260_unregistered pivot)"
+    # TC-263: adoption refuses a catalog table with such a column or name,
+    # registering nothing.
     adopt_fixture tc263ns tc263_kw '(id BIGINT, "show" INT)'
     assert_err "TC-263: adoption refused the column" "column \"show\": $why" \
         "$(q_may "$HOST" "SELECT coldfront.adopt_iceberg_table('public','tc263_kw','tc263ns');")"
     assert_eq "TC-263: no view and no registry row" "true|0" "$(_tc260_unregistered tc263_kw)"
+    adopt_fixture tc263ns show '(id BIGINT)'
+    assert_err "TC-263: adoption refused the table name" "table \"show\": $why" \
+        "$(q_may "$HOST" "SELECT coldfront.adopt_iceberg_table('public','show','tc263ns');")"
+    assert_eq "TC-263: no view and no registry row for it" "true|0" "$(_tc260_unregistered show)"
+    # TC-265: on an archived table, renaming the view or the hot table to such a
+    # word is refused and rolls back, leaving the view reading the cold row.
+    qf "$HOST" <<'EOSQL' >/dev/null
+CREATE TABLE public.tc265 (id bigint, ts timestamptz NOT NULL, PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);
+DO $do$ DECLARE m date := (date_trunc('month', now()) - interval '4 months')::date; BEGIN
+  EXECUTE format('CREATE TABLE public.%I PARTITION OF public.tc265 FOR VALUES FROM (%L) TO (%L)',
+                 'tc265_p_' || to_char(m, 'YYYY_MM'), m, m + interval '1 month');
+END $do$;
+INSERT INTO public.tc265 VALUES (1, date_trunc('month', now()) - interval '4 months' + interval '3 days');
+EOSQL
+    if ! "$ARCHIVER" register --table tc265 --period monthly \
+            --hot-period "$(hot_days) days" >"$TMPD/tc265.log" 2>&1 ||
+       ! archive_only "schema_name='public' AND table_name='tc265'" "$TMPD/tc265-arch.log"; then
+        fail "TC-265: register and archive tc265 (see $TMPD/tc265.log, $TMPD/tc265-arch.log)"; return
+    fi
+    assert_err "TC-265: renaming the view to one is refused" "table \"qualify\": $why" \
+        "$(q_may "$HOST" "ALTER VIEW public.tc265 RENAME TO qualify;")"
+    assert_err "TC-265: and so is renaming the hot table to one" "table \"glob\": $why" \
+        "$(q_may "$HOST" "ALTER TABLE public._tc265 RENAME TO glob;")"
+    assert_eq "TC-265: the view and the hot table kept their names" "_tc265,tc265" \
+        "$(q "$HOST" "SELECT string_agg(relname, ',' ORDER BY relname) FROM pg_class
+                       WHERE relnamespace = 'public'::regnamespace
+                         AND relname IN ('tc265', '_tc265', 'qualify', 'glob');")"
+    assert_eq "TC-265: the view reads the archived row" "1" "$(q "$HOST" "SELECT count(*) FROM public.tc265;")"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -7737,7 +7780,7 @@ if [ "$MODE" = "tiered" ]; then
     story_case_collision_rejected      # TC-141: name differing only by case rejected at register
     story_bad_source_names_rejected    # TC-139/TC-142/TC-200: leading underscore and over-long names rejected
     story_unmappable_column_rejected   # TC-150: column type with no Iceberg mapping rejected at register
-    story_keyword_column_rejected      # TC-260..TC-263: a column name DuckDB parses as a keyword refused on every path
+    story_keyword_name_rejected        # TC-260..TC-263, TC-265: a table or column name DuckDB parses as a keyword refused on every path
     story_quoted_table_names           # TC-140/TC-143/TC-144: dot, hyphen, space in table name
     story_temp_rejected                # TC-114: TEMP table invisible to archiver
     story_list_partition_rejected      # TC-115: LIST partition accepted at register; rejected at archive

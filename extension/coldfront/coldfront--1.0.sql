@@ -2855,23 +2855,25 @@ BEGIN
 END;
 $$;
 
--- The name a column has in the cold tier, refused when DuckDB cannot parse it.
--- pg_duckdb (c04e6a2) hands DuckDB a column name quoted the way PostgreSQL quotes
--- it, so a name PostgreSQL leaves bare reaches DuckDB bare, quoted in the query
--- or not, and DuckDB's parser takes some of those as keywords:
--- duckdb/pg_duckdb#1019. Every query pg_duckdb runs against such a column then
--- fails to parse. The list is every name PostgreSQL leaves bare that DuckDB
--- 1.5.4's parser rejects. The duckdb_keyword_column regress test derives that set
--- from both and fails when a pin move changes it, and fails once pg_duckdb keeps
--- the quotes, when this goes.
-CREATE FUNCTION coldfront._require_duckdb_column_name(p_name text)
+-- The name a table or column (p_kind) has in the cold tier, refused when DuckDB
+-- cannot parse it. pg_duckdb (c04e6a2) hands DuckDB each identifier quoted the
+-- way PostgreSQL quotes it, so a name PostgreSQL leaves bare reaches DuckDB bare,
+-- quoted in the query or not, and DuckDB's parser takes some of those as
+-- keywords: duckdb/pg_duckdb#1019. A column's name reaches it in every query
+-- pg_duckdb runs against the column, and a table's as the alias of the view
+-- pg_duckdb expands and the qualifier of the hot table's columns, so every read
+-- then fails to parse. The list is every name PostgreSQL leaves bare that DuckDB
+-- 1.5.4's parser rejects, in both places alike. The duckdb_keyword_name regress
+-- test derives that set from both parsers and fails when a pin move changes it,
+-- and fails once pg_duckdb keeps the quotes, when this goes.
+CREATE FUNCTION coldfront._require_duckdb_name(p_kind text, p_name text)
 RETURNS text
 LANGUAGE plpgsql IMMUTABLE STRICT AS $$
 BEGIN
     IF p_name = ANY ('{anti,asof,at,by,describe,glob,lambda,pivot,pivot_longer,
                        pivot_wider,positional,qualify,semi,show,summarize,unpack,
                        unpivot}'::text[]) THEN
-        RAISE EXCEPTION 'coldfront: column "%": DuckDB cannot parse this name, which pg_duckdb passes to it unquoted (https://github.com/duckdb/pg_duckdb/issues/1019); rename the column', p_name;
+        RAISE EXCEPTION 'coldfront: % "%": DuckDB cannot parse this name, which pg_duckdb passes to it unquoted (https://github.com/duckdb/pg_duckdb/issues/1019); rename the %', p_kind, p_name, p_kind;
     END IF;
     RETURN p_name;
 END;
@@ -3363,6 +3365,7 @@ BEGIN
         RAISE EXCEPTION 'coldfront.adopt_iceberg_table: p_writable must be true or false'
             USING HINT = 'Omit it to adopt read-only.';
     END IF;
+    PERFORM coldfront._require_duckdb_name('table', p_table);
 
     -- Refused before the claim below, so a standby stays out of the bakery.
     PERFORM coldfront._reject_on_standby('adopt an Iceberg table');
@@ -3412,7 +3415,7 @@ BEGIN
         END IF;
 
         v_cols := v_cols || jsonb_build_object(
-                      'name', coldfront._require_duckdb_column_name(r.col_name),
+                      'name', coldfront._require_duckdb_name('column', r.col_name),
                       'cast', coldfront._adopt_column_type(r.col_name, r.duckdb_type, p_types));
         v_n := v_n + 1;
     END LOOP;
@@ -3584,6 +3587,7 @@ BEGIN
     IF p_columns IS NULL OR jsonb_array_length(p_columns) = 0 THEN
         RAISE EXCEPTION 'coldfront.create_iceberg_table: p_columns must be a non-empty jsonb array of {name,type}';
     END IF;
+    PERFORM coldfront._require_duckdb_name('table', p_table);
 
     -- Provisioning combines DuckDB writes (CREATE TABLE on Iceberg) with PG
     -- writes (CREATE VIEW, INSERT INTO coldfront.tiered_views). pg_duckdb
@@ -3611,7 +3615,7 @@ BEGIN
         END IF;
         n := n + 1;
 
-        iceberg_cols := iceberg_cols || quote_ident(coldfront._require_duckdb_column_name(col_name))
+        iceberg_cols := iceberg_cols || quote_ident(coldfront._require_duckdb_name('column', col_name))
                         || ' ' || storage_type;
         v_view_cols := v_view_cols || jsonb_build_object(
                            'name', col_name,
@@ -4779,10 +4783,13 @@ $$;
 -- Update the registry's hot_table after an ALTER TABLE ... RENAME of the hot
 -- heap. p_new_hot_table is the new quoted qualified name (built by the C hook
 -- from the post-rename catalog state). Keyed on the view's (schema, relname),
--- which a hot-table rename does not change.
+-- which a hot-table rename does not change. A new name DuckDB cannot parse is
+-- refused, which rolls the rename back.
 CREATE FUNCTION coldfront._update_tiered_hot_table(
     p_schema text, p_view_name text, p_new_hot_table text
 ) RETURNS void LANGUAGE sql AS $$
+    SELECT coldfront._require_duckdb_name('table', relname)
+      FROM pg_class WHERE oid = p_new_hot_table::regclass;
     UPDATE coldfront.tiered_views
        SET hot_table = p_new_hot_table
      WHERE schema_name = p_schema AND relname = p_view_name;
@@ -4796,10 +4803,12 @@ $$;
 -- v_has_cutoff would be false, and the rebuilt view would drop its cold (Iceberg)
 -- UNION branch entirely — silently hiding all archived data. Called by the DDL
 -- hook's view-rename branch BEFORE the rebuild so it reads the migrated rows.
--- Idempotent (no-op for whichever row does not exist yet).
+-- Idempotent (no-op for whichever row does not exist yet). A new name DuckDB
+-- cannot parse is refused, which rolls the rename back.
 CREATE FUNCTION coldfront._rename_tiered_view(
     p_schema text, p_old_view_name text, p_new_view_name text
 ) RETURNS void LANGUAGE sql AS $$
+    SELECT coldfront._require_duckdb_name('table', p_new_view_name);
     UPDATE coldfront.tiered_views
        SET relname = p_new_view_name
      WHERE schema_name = p_schema AND relname = p_old_view_name;
@@ -5081,7 +5090,7 @@ BEGIN
             END IF;
             IF op = 'add' THEN
                 ddl := ddl || format('ALTER TABLE %s ADD COLUMN IF NOT EXISTS %I %s',
-                    p_iceberg_table, coldfront._require_duckdb_column_name(col),
+                    p_iceberg_table, coldfront._require_duckdb_name('column', col),
                     coldfront._iceberg_storage_type(pg_type, col));
             ELSE
                 ddl := ddl || format('ALTER TABLE %s ALTER COLUMN %I TYPE %s',
@@ -5091,7 +5100,7 @@ BEGIN
             ddl := ddl || format('ALTER TABLE %s DROP COLUMN IF EXISTS %I', p_iceberg_table, col);
         ELSIF op = 'rename' THEN
             ddl := ddl || format('ALTER TABLE %s RENAME COLUMN %I TO %I',
-                p_iceberg_table, col, coldfront._require_duckdb_column_name(act->>'newcol'));
+                p_iceberg_table, col, coldfront._require_duckdb_name('column', act->>'newcol'));
         ELSE
             RAISE EXCEPTION 'coldfront._mirror_iceberg_alter: unknown op "%"', op;
         END IF;

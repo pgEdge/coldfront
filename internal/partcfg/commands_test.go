@@ -298,8 +298,9 @@ func TestRequireNoDefaultPartition_PropagatesQueryError(t *testing.T) {
 	}
 }
 
-// coldTierDB answers the two questions the column guard asks: does this database
-// have the extension, then what does its type map say about the table's columns.
+// coldTierDB answers the two questions the tiering guard asks: does this database
+// have the extension, then what do its type map and name check say about the
+// table and its columns.
 // checkErr stands in for the RAISE the extension throws on a type Iceberg cannot
 // store.
 type coldTierDB struct {
@@ -333,12 +334,12 @@ func (d *coldTierDB) QueryRow(_ context.Context, sql string, args ...any) pgx.Ro
 // for it.
 var errUnmappable = errors.New("ERROR: coldfront: PG type tsvector has no Iceberg-compatible mapping")
 
-func TestRequireMappableColumns_RejectsUnmappableType(t *testing.T) {
+func TestRequireTierable_RejectsUnmappableType(t *testing.T) {
 	// The rejection carries the extension's own wording (which type), the table
 	// it came from, and the partition-only alternative, which is open at
 	// registration and gone by archive time.
 	db := &coldTierDB{installed: true, checkErr: errUnmappable}
-	err := requireMappableColumns(context.Background(), db, "public", "events", "1 month")
+	err := requireTierable(context.Background(), db, "public", "events", "events", "1 month")
 	if err == nil {
 		t.Fatal("expected rejection")
 	}
@@ -349,12 +350,12 @@ func TestRequireMappableColumns_RejectsUnmappableType(t *testing.T) {
 	}
 }
 
-func TestRequireMappableColumns_SkipsPartitionOnlyRow(t *testing.T) {
+func TestRequireTierable_SkipsPartitionOnlyRow(t *testing.T) {
 	// No hot period, no cold tier: the column types are PostgreSQL's business
 	// alone, and a table that registers today must keep registering. The same
 	// unmappable table passes, without the database being asked at all.
 	db := &coldTierDB{installed: true, checkErr: errUnmappable}
-	if err := requireMappableColumns(context.Background(), db, "public", "events", ""); err != nil {
+	if err := requireTierable(context.Background(), db, "public", "events", "events", ""); err != nil {
 		t.Fatalf("a partition-only row must not be type-checked: %v", err)
 	}
 	if len(db.asked) != 0 {
@@ -362,11 +363,11 @@ func TestRequireMappableColumns_SkipsPartitionOnlyRow(t *testing.T) {
 	}
 }
 
-func TestRequireMappableColumns_SkipsDatabaseWithoutTheExtension(t *testing.T) {
+func TestRequireTierable_SkipsDatabaseWithoutTheExtension(t *testing.T) {
 	// A stock-PG partitioner node has no cold tier, so there is nothing for the
 	// row to be wrong about, and nothing to ask.
 	db := &coldTierDB{installed: false, checkErr: errUnmappable}
-	if err := requireMappableColumns(context.Background(), db, "public", "events", "1 month"); err != nil {
+	if err := requireTierable(context.Background(), db, "public", "events", "events", "1 month"); err != nil {
 		t.Fatalf("a database with no cold tier must not be type-checked: %v", err)
 	}
 	if len(db.asked) != 1 {
@@ -374,20 +375,23 @@ func TestRequireMappableColumns_SkipsDatabaseWithoutTheExtension(t *testing.T) {
 	}
 }
 
-func TestRequireMappableColumns_AcceptsMappableTable(t *testing.T) {
+func TestRequireTierable_AcceptsMappableTable(t *testing.T) {
 	db := &coldTierDB{installed: true}
-	if err := requireMappableColumns(context.Background(), db, "public", "events", "1 month"); err != nil {
+	// After the first archive the columns live on the hot table, "_events", but
+	// the name pg_duckdb sees is the view's, the registered name.
+	if err := requireTierable(context.Background(), db, "public", "events", "_events", "1 month"); err != nil {
 		t.Fatalf("a fully mappable table must pass: %v", err)
 	}
-	if len(db.args) != 2 || db.args[0] != "public" || db.args[1] != "events" {
-		t.Errorf("schema/table not passed as args: %v", db.args)
+	if len(db.args) != 3 || db.args[0] != "public" || db.args[1] != "_events" || db.args[2] != "events" {
+		t.Errorf("schema, base table and registered name not passed as args: %v", db.args)
 	}
 	// The extension's map and name check decide, not a second copy in Go, and
-	// are given the column so a refusal names it; its companion predicate is what
-	// keeps a vector's generated real[] column out of the check.
+	// are given the table and the column so a refusal names it; its companion
+	// predicate is what keeps a vector's generated real[] column out of the check.
 	for _, want := range []string{
 		"coldfront._iceberg_storage_type(format_type(a.atttypid, a.atttypmod), a.attname)",
-		"coldfront._require_duckdb_column_name(a.attname)",
+		"coldfront._require_duckdb_name('column', a.attname)",
+		"coldfront._require_duckdb_name('table', $3::text)",
 		"coldfront._is_vec_companion",
 	} {
 		if !strings.Contains(db.asked[1], want) {

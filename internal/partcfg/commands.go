@@ -220,8 +220,8 @@ type validateDB interface {
 //     leading underscore, and short enough for the generated leaf names.
 //   - every relation in the partition tree is WAL-logged (see requireLogged).
 //   - the table has no DEFAULT partition (see requireNoDefaultPartition).
-//   - tiered only: every column has an Iceberg type and a name DuckDB can parse
-//     (see requireMappableColumns).
+//   - tiered only: every column has an Iceberg type, and the table and every
+//     column have a name DuckDB can parse (see requireTierable).
 func validateRow(ctx context.Context, db validateDB, row configRow) error {
 	// After the archiver's first-run swap the source is a VIEW over "_"+name, so
 	// validate the PK / partition key against the real partitioned table. register
@@ -245,21 +245,24 @@ func validateRow(ctx context.Context, db validateDB, row configRow) error {
 	if err := validatePKSuperset(ctx, db, row.schema, base, row.column, row.subValues != ""); err != nil {
 		return err
 	}
-	if err := requireMappableColumns(ctx, db, row.schema, base, row.hot); err != nil {
+	if err := requireTierable(ctx, db, row.schema, row.table, base, row.hot); err != nil {
 		return err
 	}
 	return partition.ValidatePeriods(ctx, db, row.hot, row.retention)
 }
 
-// requireMappableColumns rejects a tiered table carrying a column whose PG type
-// the cold tier cannot store, or whose name DuckDB cannot parse, which otherwise
-// registers cleanly and hard-errors on the first archive cycle, hours later out
-// of cron. Only a hot period makes a table's columns Iceberg's problem. The
-// extension decides, in the database, with the type map every cold write and
-// view rebuild already goes through and the name check every cold-tier column
-// passes. Asking it keeps Iceberg out of partition-core (a stock-PG partitioner
-// node has no extension, and no cold tier to be wrong about).
-func requireMappableColumns(ctx context.Context, db partition.RowQuerier, schema, table, hot string) error {
+// requireTierable rejects a tiered table the cold tier cannot hold: a column
+// whose PG type it cannot store, or a table or column name DuckDB cannot parse.
+// Such a table otherwise registers cleanly and hard-errors on the first archive
+// cycle, hours later out of cron, or on the first read of its view. Only a hot
+// period makes a table Iceberg's problem. The extension decides, in the
+// database, with the type map every cold write and view rebuild already goes
+// through and the name check every cold-tier name passes. Asking it keeps
+// Iceberg out of partition-core (a stock-PG partitioner node has no extension,
+// and no cold tier to be wrong about). The columns are read from base, the
+// partitioned table, and the table name checked is the registered one, which
+// the view takes.
+func requireTierable(ctx context.Context, db partition.RowQuerier, schema, table, base, hot string) error {
 	if hot == "" {
 		return nil
 	}
@@ -276,7 +279,8 @@ func requireMappableColumns(ctx context.Context, db partition.RowQuerier, schema
 	// predicate, so a vector's generated real[] column is not read as a user column.
 	var checked int
 	if err := db.QueryRow(ctx, `
-		SELECT count(coldfront._require_duckdb_column_name(a.attname))
+		SELECT count(coldfront._require_duckdb_name('table', $3::text))
+		     + count(coldfront._require_duckdb_name('column', a.attname))
 		     + count(coldfront._iceberg_storage_type(format_type(a.atttypid, a.atttypmod), a.attname))
 		FROM pg_attribute a
 		JOIN pg_class c ON c.oid = a.attrelid
@@ -284,7 +288,7 @@ func requireMappableColumns(ctx context.Context, db partition.RowQuerier, schema
 		WHERE n.nspname = $1::text AND c.relname = $2::text
 		  AND a.attnum > 0 AND NOT a.attisdropped
 		  AND NOT coldfront._is_vec_companion(a.attname, a.attgenerated)`,
-		schema, table).Scan(&checked); err != nil {
+		schema, base, table).Scan(&checked); err != nil {
 		return fmt.Errorf("%s.%s cannot be tiered: %w. Registering it without a "+
 			"hot period manages partitions only, with no cold tier", schema, table, err)
 	}
