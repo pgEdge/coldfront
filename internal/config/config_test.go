@@ -606,3 +606,64 @@ archiver:
 	require.NoError(t, err)
 	assert.Equal(t, "wh", c.Iceberg.Warehouse)
 }
+
+// After the defaults, a file can give two values the partition_config CHECK
+// constraints refuse that the other table rules let through: a negative
+// future_partitions, and an id_scheme outside id mode. Both are refused naming
+// the entry and the key.
+func TestLoad_RefusesWhatTheChecksRefuse(t *testing.T) {
+	for tail, want := range map[string]string{
+		"      future_partitions: -1": `archiver.tables[0]: future_partitions must be at least 1, got -1`,
+		"      id_scheme: snowflake":  `archiver.tables[0]: id_scheme is only valid when part_mode is "id"`,
+	} {
+		_, err := Load(writeConfig(t, tieredCfg("      retention_period: \"1 year\"\n"+tail)))
+		assert.EqualError(t, err, want)
+	}
+}
+
+// ValidateTable refuses every value a coldfront.partition_config CHECK
+// constraint refuses, naming the setting through name and the values it takes,
+// so no entry point passes the database's constraint error through.
+func TestValidateTable_RefusesWhatTheChecksRefuse(t *testing.T) {
+	key := func(k string) string { return k }
+	valid := TableConfig{SourceTable: "t", PartitionPeriod: "monthly", RetentionPeriod: "1 year",
+		FuturePartitions: 3, PartMode: "timestamp", ExpirationStrategy: "drop"}
+	require.NoError(t, ValidateTable(valid, key))
+	cases := []struct {
+		name string
+		edit func(*TableConfig)
+		want string
+	}{
+		{"source_table", func(c *TableConfig) { c.SourceTable = "" }, `source_table is required`},
+		{"partition_period", func(c *TableConfig) { c.PartitionPeriod = "" }, `partition_period is required`},
+		{"pc_period_enum", func(c *TableConfig) { c.PartitionPeriod = "yearly" },
+			`partition_period "yearly" must be "monthly" or "daily"`},
+		{"pc_future_pos", func(c *TableConfig) { c.FuturePartitions = 0 }, `future_partitions must be at least 1, got 0`},
+		{"pc_partmode_enum", func(c *TableConfig) { c.PartMode = "hourly" }, `part_mode "hourly" must be "timestamp" or "id"`},
+		{"pc_scheme_enum", func(c *TableConfig) { c.PartMode, c.IDScheme = "id", "uuidv4" },
+			`id_scheme "uuidv4" must be "uuidv7" or "snowflake"`},
+		{"pc_id_scheme without a scheme", func(c *TableConfig) { c.PartMode = "id" },
+			`id_scheme is required when part_mode is "id"`},
+		{"pc_id_scheme outside id mode", func(c *TableConfig) { c.IDScheme = "snowflake" },
+			`id_scheme is only valid when part_mode is "id"`},
+		{"pc_destroy", func(c *TableConfig) { c.RetentionPeriod = "" },
+			`set retention_period (and/or hot_period): a managed table needs a destroy boundary`},
+		{"pc_cold_timeonly", func(c *TableConfig) { c.HotPeriod, c.PartMode, c.IDScheme = "1 month", "id", "snowflake" },
+			`part_mode "id" is only valid in partition-only mode (no hot_period): the cold tier is time-only`},
+		{"pc_strategy_enum", func(c *TableConfig) { c.ExpirationStrategy = "archive" },
+			`expiration_strategy "archive" must be "detach" or "drop"`},
+		{"pc_strategy_part", func(c *TableConfig) { c.HotPeriod, c.ExpirationStrategy = "1 month", "detach" },
+			`expiration_strategy "detach" is only valid in partition-only mode (no hot_period)`},
+		{"pc_2level_col", func(c *TableConfig) { c.SubPartition = &SubPartitionConfig{ValuesSource: "SELECT 1"} },
+			`partition_column is required for 2-level tables (with sub_partition.values_source)`},
+		{"values_source", func(c *TableConfig) { c.PartitionColumn, c.SubPartition = "ts", &SubPartitionConfig{} },
+			`sub_partition.values_source is required`},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			tc := valid
+			c.edit(&tc)
+			assert.EqualError(t, ValidateTable(tc, key), c.want)
+		})
+	}
+}

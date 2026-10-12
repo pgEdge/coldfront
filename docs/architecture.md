@@ -488,14 +488,16 @@ encode the structural lifecycle rules (a destroy boundary is required; `id`
 mode forbids a hot tier - the cold tier is time-only; 2-level needs an explicit
 RANGE column; `expiration_strategy` is `drop`|`detach`, and `detach` - expire
 by detaching only, not dropping - is allowed partition-only), so an invalid row
-is rejected at write time. The one rule that is *operator-config policy* rather
-than a storage invariant - `retention_period` must exceed `hot_period` - is
-validated at the `register`/`set` CLI boundary and at binary startup
-(`partition.ValidatePeriods`, a calendar-aware interval comparison),
-deliberately **not** a CHECK. The standalone partitioner self-materializes the
-table on stock PostgreSQL via `EnsureTable`, needing no extension. Connection
-config (DSN, Iceberg/S3 credentials) is deliberately **not** stored here - it
-is per-node and must never be replicated.
+is rejected at write time. `register`, `set` and `import` check the same rules
+first (`config.ValidateTable`) and name the setting they refuse, so the
+constraints refuse only a write made by other means. The one rule that is
+*operator-config policy* rather than a storage invariant - `retention_period`
+must exceed `hot_period` - is validated at the `register`/`set` CLI boundary
+and at binary startup (`partition.ValidatePeriods`, a calendar-aware interval
+comparison), deliberately **not** a CHECK. The standalone partitioner
+self-materializes the table on stock PostgreSQL via `EnsureTable`, needing no
+extension. Connection config (DSN, Iceberg/S3 credentials) is deliberately
+**not** stored here - it is per-node and must never be replicated.
 
 The *config* replicates by value; the partition **lifecycle DDL** must also
 reach every node. `CREATE … PARTITION OF …` and `DROP TABLE` are ordinary

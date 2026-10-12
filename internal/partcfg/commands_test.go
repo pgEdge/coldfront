@@ -399,3 +399,34 @@ func TestRequireTierable_AcceptsMappableTable(t *testing.T) {
 		}
 	}
 }
+
+// register refuses every value the coldfront.partition_config CHECK constraints
+// refuse, naming the flag and the values it takes, before it prints SQL or
+// connects: the --dsn cannot be parsed, so reaching the connection fails with a
+// different error.
+func TestRegister_RefusesValuesBeforeConnecting(t *testing.T) {
+	cases := []struct {
+		args []string
+		want string
+	}{
+		{[]string{"--period", "yearly", "--retention", "1 year"}, `--period "yearly" must be "monthly" or "daily"`},
+		{[]string{"--period", "yearly", "--retention", "1 year", "--print-sql"}, `--period "yearly" must be "monthly" or "daily"`},
+		{[]string{"--part-mode", "hourly", "--retention", "1 year"}, `--part-mode "hourly" must be "timestamp" or "id"`},
+		{[]string{"--part-mode", "id", "--id-scheme", "uuidv4", "--retention", "1 year"}, `--id-scheme "uuidv4" must be "uuidv7" or "snowflake"`},
+		{[]string{"--part-mode", "id", "--retention", "1 year"}, `--id-scheme is required when --part-mode is "id"`},
+		{[]string{"--part-mode", "timestamp", "--id-scheme", "snowflake", "--retention", "1 year"}, `--id-scheme is only valid when --part-mode is "id"`},
+		{[]string{"--premake", "0", "--retention", "1 year"}, `--premake must be at least 1, got 0`},
+		{[]string{"--premake", "-1", "--retention", "1 year"}, `--premake must be at least 1, got -1`},
+		{[]string{"--sub-values-source", "SELECT region FROM regions", "--retention", "1 year"}, `--column is required for 2-level tables (with --sub-values-source)`},
+		{[]string{"--strategy", "archive", "--retention", "1 year"}, `--strategy "archive" must be "detach" or "drop"`},
+		{[]string{"--strategy", "detach", "--hot-period", "1 month"}, `--strategy "detach" is only valid in partition-only mode (no --hot-period)`},
+		{[]string{"--part-mode", "id", "--id-scheme", "snowflake", "--hot-period", "1 month"}, `--part-mode "id" is only valid in partition-only mode (no --hot-period): the cold tier is time-only`},
+		{nil, `set --retention (and/or --hot-period): a managed table needs a destroy boundary`},
+	}
+	for _, c := range cases {
+		args := append([]string{"--dsn", "postgres://%zz", "--table", "events", "--period", "monthly"}, c.args...)
+		if err := Run(context.Background(), "register", args); err == nil || err.Error() != c.want {
+			t.Errorf("register %v: got %v, want %q", c.args, err, c.want)
+		}
+	}
+}

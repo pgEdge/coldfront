@@ -6780,6 +6780,113 @@ EOSQL
     assert_eq "TC-265: the view reads the archived row" "1" "$(q "$HOST" "SELECT count(*) FROM public.tc265;")"
 }
 
+# assert_refused <label> <check> <needle> <command...>: the command must fail
+# saying <needle> before its value reaches the database (no SQLSTATE in its
+# output). <check> is the partition_config CHECK constraint the value would
+# otherwise have reached, collected in REFUSED_CHECKS.
+assert_refused() {
+    local label="$1" check="$2" needle="$3" out; shift 3
+    REFUSED_CHECKS+=("$check")
+    if out=$("$@" 2>&1); then
+        fail "$label: accepted"
+    elif [[ "$out" == *SQLSTATE* ]]; then
+        fail "$label: the database refused it: $out"
+    else
+        assert_contains "$label" "$needle" "$out"
+    fi
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story: register, set and import refuse a setting the CHECK constraints on
+# coldfront.partition_config refuse, naming the flag or key and the values it
+# takes, rather than passing the constraint error through. set judges the row it
+# would leave, so a flag is refused for what it meets in the stored row. The
+# last step reads the CHECK constraints from the catalog: one added without a
+# case here fails the story.
+# ───────────────────────────────────────────────────────────────────────────
+story_config_values_rejected() {
+    step "TC-266..TC-269: a setting partition_config's CHECK constraints refuse is named before it is written"
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE schema_name = 'public' AND table_name = 'cfv';
+               DROP TABLE IF EXISTS public.cfv;
+               CREATE TABLE public.cfv (id bigint NOT NULL, ts timestamptz NOT NULL, PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);" >/dev/null
+    REFUSED_CHECKS=()
+    local po=(--table cfv --period monthly --retention "1 year") tiered=(--table cfv --period monthly --hot-period "1 month")
+
+    assert_refused "TC-266: archiver register names --period" pc_period_enum \
+        '--period "yearly" must be "monthly" or "daily"' "$ARCHIVER" register "${po[@]}" --period yearly
+    assert_refused "TC-266: partitioner register names --period" pc_period_enum \
+        '--period "yearly" must be "monthly" or "daily"' "$PARTITIONER" register "${po[@]}" --period yearly
+    assert_refused "TC-266: register names --part-mode" pc_partmode_enum \
+        '--part-mode "hourly" must be "timestamp" or "id"' "$PARTITIONER" register "${po[@]}" --part-mode hourly
+    assert_refused "TC-266: register names --id-scheme" pc_scheme_enum \
+        '--id-scheme "uuidv4" must be "uuidv7" or "snowflake"' \
+        "$PARTITIONER" register "${po[@]}" --part-mode id --id-scheme uuidv4
+    assert_refused "TC-266: register requires --id-scheme in id mode" pc_id_scheme \
+        '--id-scheme is required when --part-mode is "id"' "$PARTITIONER" register "${po[@]}" --part-mode id
+    assert_refused "TC-266: register refuses --id-scheme outside id mode" pc_id_scheme \
+        '--id-scheme is only valid when --part-mode is "id"' "$PARTITIONER" register "${po[@]}" --id-scheme snowflake
+    assert_refused "TC-266: register names --premake 0" pc_future_pos \
+        '--premake must be at least 1, got 0' "$PARTITIONER" register "${po[@]}" --premake 0
+    assert_refused "TC-266: register names a negative --premake" pc_future_pos \
+        '--premake must be at least 1, got -1' "$PARTITIONER" register "${po[@]}" --premake -1
+    assert_refused "TC-266: register requires --column for a 2-level table" pc_2level_col \
+        '--column is required for 2-level tables (with --sub-values-source)' \
+        "$PARTITIONER" register "${po[@]}" --sub-values-source "SELECT 'eu'"
+    assert_refused "TC-266: register names --strategy" pc_strategy_enum \
+        '--strategy "archive" must be "detach" or "drop"' "$PARTITIONER" register "${po[@]}" --strategy archive
+    assert_refused "TC-266: register refuses detach on a tiered table" pc_strategy_part \
+        '--strategy "detach" is only valid in partition-only mode (no --hot-period)' \
+        "$ARCHIVER" register "${tiered[@]}" --strategy detach
+    assert_refused "TC-266: register refuses id mode on a tiered table" pc_cold_timeonly \
+        '--part-mode "id" is only valid in partition-only mode (no --hot-period): the cold tier is time-only' \
+        "$ARCHIVER" register "${tiered[@]}" --part-mode id --id-scheme snowflake
+    assert_refused "TC-266: register requires a destroy boundary" pc_destroy \
+        'set --retention (and/or --hot-period): a managed table needs a destroy boundary' \
+        "$PARTITIONER" register --table cfv --period monthly
+
+    printf 'archiver: { tables: [ { source_table: cfv, partition_period: monthly, retention_period: "1 year", future_partitions: -1 } ] }\n' >"$TMPD/cfv-premake.yaml"
+    printf 'archiver: { tables: [ { source_table: cfv, partition_period: monthly, retention_period: "1 year", id_scheme: snowflake } ] }\n' >"$TMPD/cfv-scheme.yaml"
+    assert_refused "TC-268: import names a negative future_partitions" pc_future_pos \
+        'archiver.tables[0]: future_partitions must be at least 1, got -1' \
+        "$PARTITIONER" import --config "$TMPD/cfv-premake.yaml"
+    assert_refused "TC-268: import refuses an id_scheme outside id mode" pc_id_scheme \
+        'archiver.tables[0]: id_scheme is only valid when part_mode is "id"' \
+        "$PARTITIONER" import --config "$TMPD/cfv-scheme.yaml"
+    assert_eq "TC-266/TC-268: no refused register or import wrote a row" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE schema_name = 'public' AND table_name = 'cfv';")"
+
+    if ! "$PARTITIONER" register "${po[@]}" >"$TMPD/cfv-reg.log" 2>&1; then
+        fail "TC-267: register cfv (see $TMPD/cfv-reg.log)"; tail -3 "$TMPD/cfv-reg.log"; return
+    fi
+    local row="SELECT row(p.*)::text FROM coldfront.partition_config p WHERE schema_name = 'public' AND table_name = 'cfv';"
+    local before; before=$(q "$HOST" "$row")
+    assert_refused "TC-267: set names --period" pc_period_enum \
+        '--period "yearly" must be "monthly" or "daily"' "$PARTITIONER" set --table cfv --period yearly
+    assert_refused "TC-267: set names --premake" pc_future_pos \
+        '--premake must be at least 1, got 0' "$PARTITIONER" set --table cfv --premake 0
+    assert_refused "TC-267: set names --strategy" pc_strategy_enum \
+        '--strategy "archive" must be "detach" or "drop"' "$PARTITIONER" set --table cfv --strategy archive
+    assert_refused "TC-267: set refuses clearing the only destroy boundary" pc_destroy \
+        'set --retention (and/or --hot-period): a managed table needs a destroy boundary' \
+        "$PARTITIONER" set --table cfv --retention ""
+    assert_refused "TC-267: set refuses a 2-level source on a row without a column" pc_2level_col \
+        '--column is required for 2-level tables (with --sub-values-source)' \
+        "$PARTITIONER" set --table cfv --sub-values-source "SELECT 'eu'"
+    assert_refused "TC-267: set refuses detach with a hot period" pc_strategy_part \
+        '--strategy "detach" is only valid in partition-only mode (no --hot-period)' \
+        "$ARCHIVER" set --table cfv --strategy detach --hot-period "1 month"
+    assert_eq "TC-267: the refused sets left the row as registered" "$before" "$(q "$HOST" "$row")"
+    assert_contains "TC-267: set names an unmanaged table as such" "is not managed" \
+        "$("$PARTITIONER" set --table cfv_unmanaged --premake 4 2>&1)"
+
+    assert_eq "TC-269: every partition_config CHECK constraint has a case above" \
+        "$(q "$HOST" "SELECT string_agg(conname, ' ' ORDER BY conname) FROM pg_constraint
+                       WHERE conrelid = 'coldfront.partition_config'::regclass AND contype = 'c';")" \
+        "$(printf '%s\n' "${REFUSED_CHECKS[@]}" | LC_ALL=C sort -u | paste -sd' ' -)"
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE schema_name = 'public' AND table_name = 'cfv';
+               DROP TABLE public.cfv;" >/dev/null
+}
+
 # ───────────────────────────────────────────────────────────────────────────
 # Story — TC-114: TEMPORARY table invisible to archiver — register fails with
 # a "does not exist" error. TEMP tables are session-local; the archiver
@@ -7781,6 +7888,7 @@ if [ "$MODE" = "tiered" ]; then
     story_bad_source_names_rejected    # TC-139/TC-142/TC-200: leading underscore and over-long names rejected
     story_unmappable_column_rejected   # TC-150: column type with no Iceberg mapping rejected at register
     story_keyword_name_rejected        # TC-260..TC-263, TC-265: a table or column name DuckDB parses as a keyword refused on every path
+    story_config_values_rejected       # TC-266..TC-269: register, set and import name a value partition_config's CHECKs refuse
     story_quoted_table_names           # TC-140/TC-143/TC-144: dot, hyphen, space in table name
     story_temp_rejected                # TC-114: TEMP table invisible to archiver
     story_list_partition_rejected      # TC-115: LIST partition accepted at register; rejected at archive

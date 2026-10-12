@@ -140,11 +140,12 @@ const tableConfigColumns = `schema_name, table_name, partition_period, partition
 	retention_period::text, sub_part_values_source, expiration_strategy`
 
 // loadRow returns the single partition_config row for schema.table, with
-// found=false when no such row exists. Ownership-agnostic (used to re-read a row
-// mid-transaction for validation).
+// found=false when no such row exists, and locks it until the caller's
+// transaction ends, so set validates the row no concurrent set can change
+// before its UPDATE. Ownership-agnostic.
 func loadRow(ctx context.Context, db DBTX, schema, table string) (config.TableConfig, bool, error) {
 	rows, err := db.Query(ctx, `SELECT `+tableConfigColumns+`
-		FROM coldfront.partition_config WHERE schema_name=$1 AND table_name=$2`, schema, table)
+		FROM coldfront.partition_config WHERE schema_name=$1 AND table_name=$2 FOR UPDATE`, schema, table)
 	if err != nil {
 		return config.TableConfig{}, false, fmt.Errorf("query partition_config: %w", err)
 	}

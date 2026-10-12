@@ -197,8 +197,8 @@ func (c *Config) Validate() error {
 		}
 	}
 	for i, t := range c.Archiver.Tables {
-		if err := validateTable(t, i, t.HotPeriod != ""); err != nil {
-			return err
+		if err := ValidateTable(t, func(key string) string { return key }); err != nil {
+			return fmt.Errorf("archiver.tables[%d]: %w", i, err)
 		}
 	}
 	return nil
@@ -223,103 +223,113 @@ func (c *Config) validateS3Fields() error {
 	return nil
 }
 
-// validateTable checks one table entry (index i) against the validation rules,
-// returning the first violation. tiered selects tiered vs partition-only
-// lifecycle semantics.
-func validateTable(t TableConfig, i int, tiered bool) error {
+// ValidateTable checks one table entry against every rule the CHECK constraints
+// on coldfront.partition_config enforce, and that the entry names its table and
+// cadence, so a value the database would refuse is refused by name first. A
+// table with a hot_period is tiered, one without is partition-only. name turns
+// a YAML key into the name the caller's user gives that setting: Validate keeps
+// the key, and the register and set commands pass their flag names. Returns the
+// first violation.
+func ValidateTable(t TableConfig, name func(key string) string) error {
 	if t.SourceTable == "" {
-		return fmt.Errorf("archiver.tables[%d].source_table is required", i)
+		return fmt.Errorf("%s is required", name("source_table"))
 	}
-	if err := validateTablePartitionPeriod(t, i); err != nil {
+	switch t.PartitionPeriod {
+	case partition.PeriodMonthly, partition.PeriodDaily:
+	case "":
+		return fmt.Errorf("%s is required", name("partition_period"))
+	default:
+		return fmt.Errorf("%s %q must be %q or %q", name("partition_period"), t.PartitionPeriod,
+			partition.PeriodMonthly, partition.PeriodDaily)
+	}
+	if t.FuturePartitions < 1 {
+		return fmt.Errorf("%s must be at least 1, got %d", name("future_partitions"), t.FuturePartitions)
+	}
+	if err := validateTablePartMode(t, name); err != nil {
 		return err
 	}
-	if err := validateTableLifecycle(t, i, tiered); err != nil {
+	if err := validateTableLifecycle(t, name); err != nil {
 		return err
 	}
-	// part_mode / id_scheme: reuse BoundaryFor as the single validator of
-	// the valid set, so config and the partition core never drift.
-	if _, err := partition.BoundaryFor(t.PartMode, t.IDScheme); err != nil {
-		return fmt.Errorf("archiver.tables[%d]: %w", i, err)
-	}
-	if err := validateTableExpiration(t, i, tiered); err != nil {
-		return err
-	}
-	return validateTableSubPartition(t, i)
+	return validateTableSubPartition(t, name)
 }
 
-// validateTablePartitionPeriod enforces that partition_period is set and is one
-// of the allowed cadences.
-func validateTablePartitionPeriod(t TableConfig, i int) error {
-	if t.PartitionPeriod == "" {
-		return fmt.Errorf("archiver.tables[%d].partition_period is required", i)
-	}
-	if t.PartitionPeriod != partition.PeriodMonthly && t.PartitionPeriod != partition.PeriodDaily {
-		return fmt.Errorf("archiver.tables[%d].partition_period must be %q or %q",
-			i, partition.PeriodMonthly, partition.PeriodDaily)
+// validateTablePartMode checks part_mode and id_scheme, which go together: id
+// mode needs the encoding of its ids, and a timestamp table has none.
+func validateTablePartMode(t TableConfig, name func(string) string) error {
+	switch t.PartMode {
+	case "", partition.PartModeTimestamp:
+		if t.IDScheme != "" {
+			return fmt.Errorf("%s is only valid when %s is %q", name("id_scheme"), name("part_mode"), partition.PartModeID)
+		}
+	case partition.PartModeID:
+		switch t.IDScheme {
+		case partition.IDSchemeUUIDv7, partition.IDSchemeSnowflake:
+		case "":
+			return fmt.Errorf("%s is required when %s is %q", name("id_scheme"), name("part_mode"), partition.PartModeID)
+		default:
+			return fmt.Errorf("%s %q must be %q or %q", name("id_scheme"), t.IDScheme,
+				partition.IDSchemeUUIDv7, partition.IDSchemeSnowflake)
+		}
+	default:
+		return fmt.Errorf("%s %q must be %q or %q", name("part_mode"), t.PartMode,
+			partition.PartModeTimestamp, partition.PartModeID)
 	}
 	return nil
 }
 
 // validateTableSubPartition checks the fields a 2-level LIST→RANGE table
 // requires. A nil SubPartition is a flat table and passes.
-func validateTableSubPartition(t TableConfig, i int) error {
+func validateTableSubPartition(t TableConfig, name func(string) string) error {
 	if t.SubPartition == nil {
 		return nil
 	}
 	if t.SubPartition.ValuesSource == "" {
-		return fmt.Errorf("archiver.tables[%d].sub_partition.values_source is required", i)
+		return fmt.Errorf("%s is required", name("sub_partition.values_source"))
 	}
 	// 2-level tables need the RANGE (time) column explicitly: on a first
 	// run no LIST child exists yet to auto-detect it from.
 	if t.PartitionColumn == "" {
-		return fmt.Errorf("archiver.tables[%d].partition_column is required for 2-level (sub_partition) tables", i)
+		return fmt.Errorf("%s is required for 2-level tables (with %s)",
+			name("partition_column"), name("sub_partition.values_source"))
 	}
 	return nil
 }
 
-// validateTableLifecycle enforces the mode-dependent lifecycle thresholds.
-// Tiered: hot_period (tier-to-cold age) is required; retention_period (drop
-// cold data) is optional and must exceed hot_period. Partition-only:
-// retention_period (drop the hot partition) is required; hot_period is
-// meaningless without a cold tier.
-func validateTableLifecycle(t TableConfig, i int, tiered bool) error {
-	if tiered {
-		// The cold tier is time-only (timestamp RANGE key, timestamptz Iceberg
-		// writes). id mode keys partitions on a non-time id, which the cold
-		// tier cannot express — reject it at config load rather than fail
-		// cryptically at runtime. (2-level LIST→RANGE is supported: the RANGE
-		// level is still time, region is just a column.)
-		if t.PartMode != "" && t.PartMode != partition.PartModeTimestamp {
-			return fmt.Errorf("archiver.tables[%d].part_mode %q is only valid in partition-only mode; the cold tier is time-only", i, t.PartMode)
-		}
-		if t.HotPeriod == "" {
-			return fmt.Errorf("archiver.tables[%d].hot_period is required in tiered mode", i)
-		}
-		// Interval syntax and the retention>hot ordering are PostgreSQL interval
-		// semantics (calendar-aware), so they're validated against a live
-		// connection — partition.ValidatePeriods, run at register time and at
-		// binary startup. config.Load has no DB, so it only enforces presence.
-		return nil
-	}
-	if t.RetentionPeriod == "" {
-		return fmt.Errorf("archiver.tables[%d].retention_period is required", i)
-	}
-	return nil
-}
-
-// validateTableExpiration enforces the expiration_strategy enum and the rule
-// that "detach" only makes sense partition-only (the tiered archiver drops
-// after exporting to cold, so it would be a silent no-op).
-func validateTableExpiration(t TableConfig, i int, tiered bool) error {
+// validateTableLifecycle enforces the expiration_strategy enum and the
+// mode-dependent lifecycle thresholds. Tiered: retention_period (drop cold
+// data) is optional and must exceed hot_period. Partition-only:
+// retention_period (drop the hot partition) is required. "detach" is valid
+// only partition-only: the tiered archiver drops after exporting to cold, so it
+// would be a silent no-op. Interval syntax and the retention>hot ordering are
+// PostgreSQL interval semantics (calendar-aware), so they are validated against
+// a live connection, by partition.ValidatePeriods at register time and at
+// binary startup.
+func validateTableLifecycle(t TableConfig, name func(string) string) error {
 	switch t.ExpirationStrategy {
 	case "", partition.StrategyDrop, partition.StrategyDetach:
 	default:
-		return fmt.Errorf("archiver.tables[%d].expiration_strategy %q must be %q or %q",
-			i, t.ExpirationStrategy, partition.StrategyDetach, partition.StrategyDrop)
+		return fmt.Errorf("%s %q must be %q or %q", name("expiration_strategy"), t.ExpirationStrategy,
+			partition.StrategyDetach, partition.StrategyDrop)
 	}
-	if tiered && t.ExpirationStrategy == partition.StrategyDetach {
-		return fmt.Errorf("archiver.tables[%d].expiration_strategy %q is only valid in partition-only mode",
-			i, partition.StrategyDetach)
+	if t.HotPeriod == "" {
+		if t.RetentionPeriod == "" {
+			return fmt.Errorf("set %s (and/or %s): a managed table needs a destroy boundary",
+				name("retention_period"), name("hot_period"))
+		}
+		return nil
+	}
+	// The cold tier is time-only (timestamp RANGE key, timestamptz Iceberg
+	// writes). id mode keys partitions on a non-time id, which the cold tier
+	// cannot express. (2-level LIST→RANGE is supported: the RANGE level is
+	// still time, region is just a column.)
+	if t.PartMode == partition.PartModeID {
+		return fmt.Errorf("%s %q is only valid in partition-only mode (no %s): the cold tier is time-only",
+			name("part_mode"), t.PartMode, name("hot_period"))
+	}
+	if t.ExpirationStrategy == partition.StrategyDetach {
+		return fmt.Errorf("%s %q is only valid in partition-only mode (no %s)",
+			name("expiration_strategy"), t.ExpirationStrategy, name("hot_period"))
 	}
 	return nil
 }

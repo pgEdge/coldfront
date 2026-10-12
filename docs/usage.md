@@ -607,10 +607,10 @@ table, validated on the spot. `import` and `export` are bulk helpers for
 (re)configuring a machine - write a deployment YAML into a fresh server, or
 dump the live config to git and replay it on another node - not the day-to-day
 path. A YAML passed to anything but `import` is checked against the server and
-refused if it disagrees in any value.
-`register` and `import` run the full validation; `set` re-runs it only when it
-changes the partition period or column, `hot_period`, `retention_period` or the
-sub-partition source, and otherwise relies on the table's CHECK constraints.
+refused if it disagrees in any value. `register` and `import` run the full
+validation. `set` checks every value of the row that it would leave; it re-runs
+the rest of the validation only when it changes the partition period or column,
+`hot_period`, `retention_period` or the sub-partition source.
 
 The data lifecycle is **hot PG → `hot_period` → cold Iceberg →
 `retention_period` → dropped** (tiered) or **hot PG → `retention_period`
@@ -622,6 +622,22 @@ omitting it makes it partition-only.
 `register` and `import` run the same validation, so a table that one rejects
 cannot be added by the other; `set` re-runs it when it changes a validated
 field. Registration fails when:
+
+- a setting has a value that the table's `CHECK` constraints refuse. The
+  refusal names the flag, or on `import` the key, and the values that the
+  setting accepts; `set` checks the row that its change would leave.
+  Registration refuses:
+
+    - a `--period` other than `monthly` or `daily`.
+    - a `--premake` below 1.
+    - a `--part-mode` other than `timestamp` or `id`.
+    - an `--id-scheme` other than `uuidv7` or `snowflake`, or one without
+      `--part-mode id`.
+    - `--part-mode id` without an `--id-scheme`.
+    - a `--strategy` other than `drop` or `detach`.
+    - `--part-mode id` or `--strategy detach` with a `--hot-period`.
+    - a `--sub-values-source` without a `--column`.
+    - a table with neither a `--hot-period` nor a `--retention`.
 
 - any relation in the partition tree is `UNLOGGED`, because that data is
   truncated after a crash and replicates nowhere, so archiving it would
@@ -717,8 +733,9 @@ prints its table `INSERT`s); `register` and `import` also accept `--dry-run`.
 removing it; a disabled table is skipped by reconcile and omitted from
 `export`. Per table, only the cadence and a lifecycle boundary (`hot_period` or
 `retention_period`) are required; `partition_column` is auto-detected from
-`pg_catalog` for flat tables (required for 2-level). `register` writes a row
-whose `CHECK` constraints enforce the lifecycle rules at write time.
+`pg_catalog` for flat tables (required for 2-level). `register` checks the
+lifecycle rules before it writes the row, and the table's `CHECK` constraints
+enforce them again at write time.
 
 The subcommands also take the following connection and table flags:
 

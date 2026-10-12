@@ -166,16 +166,22 @@ func runRegister(ctx context.Context, args []string) error {
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
-	if err := validateRegisterFlags(fs, *table, *period, *hot, *retention, *strategy); err != nil {
+	if *table == "" || *period == "" {
+		fs.Usage()
+		return fmt.Errorf("--table and --period are required")
+	}
+	t := config.TableConfig{
+		SourceSchema: *schema, SourceTable: *table, PartitionPeriod: *period, PartitionColumn: *column,
+		FuturePartitions: *premake, PartMode: *partMode, IDScheme: *idScheme,
+		HotPeriod: *hot, RetentionPeriod: *retention, ExpirationStrategy: *strategy,
+	}
+	if *subValues != "" {
+		t.SubPartition = &config.SubPartitionConfig{ValuesSource: *subValues}
+	}
+	if err := config.ValidateTable(t, flagName); err != nil {
 		return err
 	}
-
-	row := configRow{
-		schema: *schema, table: *table, period: *period, column: *column,
-		premake: *premake, partMode: *partMode, idScheme: *idScheme,
-		hot: *hot, retention: *retention, subValues: *subValues,
-		strategy: *strategy,
-	}
+	row := rowFrom(t)
 	if *printSQL {
 		fmt.Println(row.insertSQL())
 		return nil
@@ -389,28 +395,17 @@ func writeRow(ctx context.Context, db validateDB, row configRow, dryRun bool) er
 	return nil
 }
 
-// validateRegisterFlags checks the register flag combination before any DB work:
-// required flags are present, a destroy boundary is set, and --strategy is valid
-// (detach is partition-only). It prints usage on the required-flag failure, matching
-// the flag package's own convention.
-func validateRegisterFlags(fs *flag.FlagSet, table, period, hot, retention, strategy string) error {
-	if table == "" || period == "" {
-		fs.Usage()
-		return fmt.Errorf("--table and --period are required")
-	}
-	if retention == "" && hot == "" {
-		return fmt.Errorf("set --retention (and/or --hot-period): a managed table needs a destroy boundary")
-	}
-	switch strategy {
-	case partition.StrategyDrop, partition.StrategyDetach:
-	default:
-		return fmt.Errorf("--strategy %q must be %q or %q", strategy, partition.StrategyDetach, partition.StrategyDrop)
-	}
-	if strategy == partition.StrategyDetach && hot != "" {
-		return fmt.Errorf("--strategy detach is only valid in partition-only mode (no --hot-period)")
-	}
-	return nil
+// flagNames maps each partition_config setting, by its YAML key, to the
+// register and set flag that gives it, so config.ValidateTable names a refused
+// value the way the user passed it.
+var flagNames = map[string]string{
+	"source_table": "--table", "partition_period": "--period", "partition_column": "--column",
+	"future_partitions": "--premake", "part_mode": "--part-mode", "id_scheme": "--id-scheme",
+	"hot_period": "--hot-period", "retention_period": "--retention", "expiration_strategy": "--strategy",
+	"sub_partition.values_source": "--sub-values-source",
 }
+
+func flagName(key string) string { return flagNames[key] }
 
 func registerUsage(fs *flag.FlagSet) func() {
 	return func() {
@@ -418,10 +413,11 @@ func registerUsage(fs *flag.FlagSet) func() {
 
 Validates the table is partitioned and that its PRIMARY KEY covers the partition
 key (required for race-safe cutover), then writes a coldfront.partition_config
-row. Lifecycle rules are enforced at write time — structural rules by CHECK
-constraints, period syntax by the interval column type, and retention > hot-period
-by a calendar-aware interval comparison. --hot-period / --retention accept any
-PostgreSQL interval (e.g. "1 month", "90 days", "1 year 2 mons").
+row. Lifecycle rules are checked before the write: structural rules here, with
+the table's CHECK constraints behind them, period syntax by the interval column
+type, and retention > hot-period by a calendar-aware interval comparison.
+--hot-period / --retention accept any PostgreSQL interval (e.g. "1 month",
+"90 days", "1 year 2 mons").
 
 USAGE:
   <binary> register --table <name> --period <monthly|daily> [lifecycle flags] [--dsn <dsn>]
@@ -794,13 +790,13 @@ EXAMPLES:
 		fmt.Println(sql)
 		return nil
 	}
-	return execSet(ctx, connect, *schema, *table, sql, setTouchesValidatedField(fs))
+	return execSet(ctx, connect, *schema, *table, sql, fs, vals)
 }
 
 // setTouchesValidatedField reports whether the `set` invocation changed a field
 // the shared validation covers (cadence, partition key, tier/drop ages, or the
-// 2-level source), so execSet knows to re-validate the resulting row rather
-// than trust the DB CHECK constraints alone.
+// 2-level source), so execSet also runs validateRow's database checks on the
+// resulting row.
 func setTouchesValidatedField(fs *flag.FlagSet) bool {
 	touched := false
 	fs.Visit(func(f *flag.Flag) {
@@ -824,9 +820,38 @@ func collectSetClauses(fs *flag.FlagSet, vals setVals) []string {
 	return sets
 }
 
-// execSet connects, ensures the config table, and runs the UPDATE; a zero
-// row-count means the table isn't managed.
-func execSet(ctx context.Context, connect func(context.Context) (*pgx.Conn, error), schema, table, sql string, validate bool) error {
+// applySet gives the stored row t each field the set invocation passed, making
+// it the row the UPDATE would leave.
+func applySet(fs *flag.FlagSet, v setVals, t *config.TableConfig) {
+	fs.Visit(func(f *flag.Flag) {
+		switch f.Name {
+		case "period":
+			t.PartitionPeriod = v.period
+		case "column":
+			t.PartitionColumn = v.column
+		case "premake":
+			t.FuturePartitions = v.premake
+		case "hot-period":
+			t.HotPeriod = v.hot
+		case "retention":
+			t.RetentionPeriod = v.retention
+		case "sub-values-source":
+			t.SubPartition = nil
+			if v.subValues != "" {
+				t.SubPartition = &config.SubPartitionConfig{ValuesSource: v.subValues}
+			}
+		case "strategy":
+			t.ExpirationStrategy = v.strategy
+		}
+	})
+}
+
+// execSet connects and, in one transaction, reads the stored row under the lock
+// the UPDATE takes, validates the row the change would leave, then runs the
+// UPDATE: a value the partition_config CHECK constraints would refuse is named
+// before it is written. A change to a field validateRow covers also runs its
+// database checks.
+func execSet(ctx context.Context, connect func(context.Context) (*pgx.Conn, error), schema, table, sql string, fs *flag.FlagSet, vals setVals) error {
 	conn, err := connect(ctx)
 	if err != nil {
 		return err
@@ -835,28 +860,11 @@ func execSet(ctx context.Context, connect func(context.Context) (*pgx.Conn, erro
 	if err := EnsureTable(ctx, conn); err != nil {
 		return err
 	}
-	if validate {
-		return execSetValidated(ctx, conn, schema, table, sql)
-	}
-	if err := execUpdate(ctx, conn, schema, table, sql); err != nil {
-		return err
-	}
-	fmt.Printf("updated %s.%s\n", schema, table)
-	return nil
-}
-
-// execSetValidated applies the UPDATE in a transaction, re-reads the resulting
-// row, and runs the shared validation; a change that would leave the row invalid
-// rolls back.
-func execSetValidated(ctx context.Context, conn *pgx.Conn, schema, table, sql string) error {
 	tx, err := conn.Begin(ctx)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
-	if err := execUpdate(ctx, tx, schema, table, sql); err != nil {
-		return err
-	}
 	row, found, err := loadRow(ctx, tx, schema, table)
 	if err != nil {
 		return err
@@ -864,25 +872,22 @@ func execSetValidated(ctx context.Context, conn *pgx.Conn, schema, table, sql st
 	if !found {
 		return fmt.Errorf("%s.%s is not managed (no partition_config row)", schema, table)
 	}
-	if err := validateRow(ctx, tx, rowFrom(row)); err != nil {
+	applySet(fs, vals, &row)
+	if err := config.ValidateTable(row, flagName); err != nil {
 		return err
+	}
+	if setTouchesValidatedField(fs) {
+		if err := validateRow(ctx, tx, rowFrom(row)); err != nil {
+			return err
+		}
+	}
+	if _, err := tx.Exec(ctx, sql); err != nil { // nosemgrep
+		return fmt.Errorf("set %s.%s: %w", schema, table, err)
 	}
 	if err := tx.Commit(ctx); err != nil {
 		return err
 	}
 	fmt.Printf("updated %s.%s\n", schema, table)
-	return nil
-}
-
-// execUpdate runs the SET UPDATE and errors if no managed row matched.
-func execUpdate(ctx context.Context, db DBTX, schema, table, sql string) error {
-	tag, err := db.Exec(ctx, sql) // nosemgrep
-	if err != nil {
-		return fmt.Errorf("set %s.%s: %w", schema, table, err)
-	}
-	if tag.RowsAffected() == 0 {
-		return fmt.Errorf("%s.%s is not managed (no partition_config row)", schema, table)
-	}
 	return nil
 }
 

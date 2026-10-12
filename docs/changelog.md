@@ -176,6 +176,14 @@ this project adheres to
   `coldfront.create_iceberg_table()`, `coldfront.adopt_iceberg_table()`, and a
   column change or rename on a table that has a cold tier refuse such a name,
   naming the table or column and the upstream bug.
+- `register` and `set` passed most invalid settings, such as `--period yearly`,
+  `--premake 0` or `--strategy archive`, to the database. The database refused
+  such a setting with a `CHECK` constraint violation (SQLSTATE 23514), and
+  `register --print-sql` printed it. On `import`, a negative
+  `future_partitions` or an `id_scheme` without `part_mode: id` reached the
+  database the same way. `register`, `set` and `import` refuse every setting
+  that the database refuses, naming the flag or key and the values that it
+  takes; `set` checks the row that its change would leave.
 - A bakery acknowledgement could outlive the claim it answered: a peer ruled
   dead acknowledged the claims it had missed once it caught up, and the rows
   stayed on every node. A node keeps an acknowledgement only while it still
