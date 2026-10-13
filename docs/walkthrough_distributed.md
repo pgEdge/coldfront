@@ -44,7 +44,7 @@ If port 5442, 5443, 8191, or 8343 is already in use on your host, set
 or `COLDFRONT_MESH_S3_PORT` before `up`.
 
 Next, run the `curl` block from
-[Setting Up the Stack](walkthrough.md#setting-up-the-stack) with port 8191 in
+[Setting Up the Stack](exploring_coldfront/index.md#setting-up-the-stack) with port 8191 in
 place of 8181. That creates the `wh` warehouse and `public` namespace on the
 mesh's own Lakekeeper.
 
@@ -230,5 +230,5 @@ To go further with ColdFront, consult the following guides:
   and links to the per-mode deep dives.
 - The [Compaction](compaction.md) guide covers cold-tier maintenance:
   compaction, snapshot expiry, and orphan-file removal.
-- The [Tearing Down the Stack](walkthrough.md#tearing-down-the-stack) section
+- The [Tearing Down the Stack](exploring_coldfront/index.md#tearing-down-the-stack) section
   describes how to stop the stack and remove its data.

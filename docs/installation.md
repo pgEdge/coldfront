@@ -1,9 +1,9 @@
 # Installing ColdFront
 
-This guide details installing ColdFront from the published package or
-building it from source. See [Configuring ColdFront](configuration.md)
-for setting up PostgreSQL, Lakekeeper, and ColdFront itself once
-installed.
+This guide details installing ColdFront with a pgEdge package or
+building it from source. After installing ColdFront, see
+[Configuring ColdFront](configuration.md) for detailed information about
+setting up PostgreSQL, Lakekeeper, and ColdFront itself.
 
 ## Using a Package to Install ColdFront
 
@@ -16,7 +16,7 @@ the steps in the Enterprise Postgres documentation:
 - For Debian and Ubuntu, see
   [Configuring the Repository on Debian and Ubuntu](https://docs.pgedge.com/enterprise/debian/configure-repo/).
 
-The documentation details the platform prerequisites, disabling any PGDG
+The documentation details the platform requirements, disabling the PGDG
 repository, and creating the pgEdge repository.
 
 With the repository in place, install the ColdFront extension package for
@@ -57,14 +57,20 @@ Docker on top of the published base image or on bare metal.
 
 ColdFront runs on a **DuckDB 1.5.x** stack: PostgreSQL + pg_duckdb (DuckDB
 1.5.4) and a **patched** duckdb-iceberg that includes ColdFront's five
-patches - the bakery-aware commit-refresh patch (the no-409 guarantee for
-concurrent cold-tier writers), two strict-reader interop patches (so
-apache/iceberg-go, the cold-tier compactor, can read the manifests
-duckdb-iceberg writes), a port of an upstream fix that computes the time
-partitions of a `timestamptz` column in UTC, and a port of another that numbers
-a new table schema above the highest schema id. No released pg_duckdb tag
-includes DuckDB 1.5.x yet, so the stack is built from a pinned upstream PR plus
-ColdFront's patches - all from sources you can fetch.
+patches:
+
+- the bakery-aware commit-refresh patch (the no-409 guarantee for
+  concurrent cold-tier writers).
+- two strict-reader interop patches, so apache/iceberg-go, the cold-tier
+  compactor, can read the manifests duckdb-iceberg writes.
+- a port of an upstream fix that computes the time partitions of a
+  `timestamptz` column in UTC.
+- a port of another that numbers a new table schema above the highest
+  schema id.
+
+No released pg_duckdb tag includes DuckDB 1.5.x yet, so the stack is built
+from a pinned upstream PR plus ColdFront's patches - all from sources you
+can fetch.
 
 ### Prerequisites
 
@@ -77,10 +83,11 @@ The following table lists the prerequisites for each build path:
 | The compactor and the CI gate | golangci-lint for `make compactor`; `./run-ci-local.sh` also needs Docker and mkdocs with mkdocs-material. |
 | Bare metal (near the end of this section) | `pg_config`, PostgreSQL server dev headers, libpq client headers and library (libpq-dev / libpq-devel), `make`, and `gcc`. |
 
-### What the Build Produces
+### Preparing the DuckDB Base Image
 
-`docker/Dockerfile.duckdb15-base` is the recipe; it fetches the requirements,
-applies ColdFront's patches, and compiles a set of components. The following
+[`docker/Dockerfile.duckdb15-base`](https://github.com/pgEdge/ColdFront/blob/main/docker/Dockerfile.duckdb15-base)
+contains the recipe for the base image: it fetches the requirements, applies
+ColdFront's patches, and compiles a set of components. The following
 table shows each component and its source:
 
 | Component | Source |
@@ -360,7 +367,7 @@ To go further with ColdFront, consult the following guides:
 - The [Configuring Lakekeeper](one_time_setup.md) guide installs,
   configures, and bootstraps it, then installs the extensions each
   database needs.
-- The [Walkthrough](walkthrough.md) guide runs the demo stack hands-on.
+- The [Walkthrough](exploring_coldfront/index.md) guide runs the demo stack hands-on.
 - The [Using ColdFront](using_coldfront/index.md) guide documents both operating modes.
 - The [Configuring your Object Store](object_store.md)
   guide connects the cold tier to AWS S3.

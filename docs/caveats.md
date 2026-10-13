@@ -136,3 +136,8 @@ Keep the following caveats in mind when running either mode:
   tier. Partition-only registration, without a hot period, accepts a table with
   such a name or column. ColdFront does not refuse a DuckDB keyword that the
   DuckDB parser accepts as a name, such as `columns`.
+- Iceberg on Azure ADLS Gen2 requires Blob soft-delete, container soft-delete,
+  and change feed (blob events) to be OFF on the storage account. Lakekeeper
+  warehouse creation otherwise fails with HTTP 409 ("This endpoint does not
+  support BlobStorageEvents or SoftDelete"). Disable those features on the
+  storage account before using it as a cold tier.

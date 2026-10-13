@@ -7,7 +7,7 @@ navigation above is reorganized into the standard pgEdge structure.
 - [pgEdge ColdFront](index.md)
 - [Installing and Configuring ColdFront](installation.md)
 - Getting Started
-    - [Getting Started with ColdFront](walkthrough.md)
+    - [Getting Started with ColdFront](exploring_coldfront/index.md)
     - [Exploring Tiered Storage](walkthrough_tiered.md)
     - [Exploring Decoupled Mode](walkthrough_decoupled.md)
     - [Exploring the Standalone Partitioner](walkthrough_partitioner.md)

@@ -65,14 +65,16 @@ nav:
       - Decoupled (Iceberg-Only) Operating Mode: architecture_decoupled.md
       - Vector Storage Architecture: architecture_vectors.md
 
-  - Getting Started/Quick Start: walkthrough.md
   - Installing ColdFront: installation.md
   - Configuring ColdFront:
       - configuration.md
       - Configuring Lakekeeper: one_time_setup.md
       - Configuring your Object Store: object_store.md
 
+  - Connecting to ColdFront: connecting.md
+
   - Exploring ColdFront:
+      - exploring_coldfront/index.md
       - Exploring Tiered Storage: walkthrough_tiered.md
       - Exploring Decoupled Mode: walkthrough_decoupled.md
       - Exploring the Standalone Partitioner: walkthrough_partitioner.md

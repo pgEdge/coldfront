@@ -8,7 +8,7 @@ database full of data, add ColdFront to it, and let the archiver relocate the
 cold majority to object storage - without migrating to a new database or
 changing a line of application SQL.
 
-Run the steps in [Setting Up the Stack](walkthrough.md#setting-up-the-stack)
+Run the steps in [Setting Up the Stack](exploring_coldfront/index.md#setting-up-the-stack)
 before you start this demo.
 
 The following table shows the eleven steps this demo covers:
@@ -33,7 +33,7 @@ Setup starts the infrastructure: PostgreSQL (your database), plus Lakekeeper
 and SeaweedFS. The cold-storage side sits idle until you point ColdFront at it
 in [Step 5](#pointing-coldfront-at-the-object-store). Run the
 `docker compose up` command shown in
-[Setting Up the Stack](walkthrough.md#setting-up-the-stack). Then confirm that
+[Setting Up the Stack](exploring_coldfront/index.md#setting-up-the-stack). Then confirm that
 the `db`, `lakekeeper-db`, and `lakekeeper` services report `healthy`:
 
 ```bash
@@ -599,5 +599,5 @@ To go further with ColdFront, consult the following guides:
   guide takes you from an empty bucket to a working cold tier on AWS S3.
 - The [Architecture](architecture_guides/index.md) overview explains the shared mechanics
   and links to the per-mode deep dives.
-- The [Tearing Down the Stack](walkthrough.md#tearing-down-the-stack) section
+- The [Tearing Down the Stack](exploring_coldfront/index.md#tearing-down-the-stack) section
   describes how to stop the stack and remove its data.

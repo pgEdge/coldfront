@@ -1,6 +1,6 @@
 # Configuring Lakekeeper
 
-The setup needs three services configured once per deployment:
+ColdFront requires three services configured once per deployment:
 PostgreSQL with the pg_duckdb and coldfront extensions, Lakekeeper, and
 any object store (SeaweedFS, MinIO, AWS S3, GCS, or Azure ADLS Gen2).
 This guide brings up and bootstraps Lakekeeper, then installs and
@@ -14,8 +14,7 @@ Choose how you are running it below.
 
 Bring up the end-user stack first (the example uses SeaweedFS, gated
 behind the `local-store` compose profile; host ports are published so
-the `localhost` commands below work directly). For the image build
-itself, see [installation.md](installation.md):
+the `localhost` commands below work directly):
 
 ```bash
 docker compose --profile local-store up -d --build
@@ -247,7 +246,7 @@ SELECT coldfront.grant_app_access('alice');
 runs, so run it again after you create or adopt a table, or tier one for the
 first time. The call fails while `duckdb.postgres_role` is unset, because only
 superusers can then run DuckDB.
-[Least-Privilege Application Roles](index.md#least-privilege-application-roles)
+[Connecting to ColdFront](connecting.md#least-privilege-application-roles)
 lists what it grants.
 
 For a real cloud-S3 setup, see [object_store.md](object_store.md).

@@ -3,14 +3,14 @@
 After installing ColdFront packages or building from source, several
 components still need configuring before the cold tier comes online:
 
-- PostgreSQL and ColdFront's own configuration, detailed in this
+- PostgreSQL and ColdFront's configuration is detailed in this
   guide, regardless of which installation path you followed.
-- your object store, documented in
-  [Configuring your Object Store](object_store.md).
 - installing, configuring, and bootstrapping Lakekeeper, and the
   one-time per-database setup that ties everything together,
   documented in the [Configuring Lakekeeper](one_time_setup.md)
   guide.
+- your object store, documented in
+  [Configuring your Object Store](object_store.md).
 
 ## Configuring PostgreSQL
 

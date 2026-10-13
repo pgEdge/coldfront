@@ -8,7 +8,7 @@ tier. If all you need is automated partition maintenance on stock PostgreSQL,
 the partitioner is the whole product - no Iceberg, no DuckDB, no archiver cold
 path.
 
-Run the steps in [Setting Up the Stack](walkthrough.md#setting-up-the-stack)
+Run the steps in [Setting Up the Stack](exploring_coldfront/index.md#setting-up-the-stack)
 before you start this demo.
 
 ## Creating the Demo Table
@@ -78,5 +78,5 @@ To go further with ColdFront, consult the following guides:
 - The [Using ColdFront](using_coldfront/index.md) guide covers both modes in depth, including
   the full one-time setup, supported column types, the partition manager CLI,
   and tuning options.
-- The [Tearing Down the Stack](walkthrough.md#tearing-down-the-stack) section
+- The [Tearing Down the Stack](exploring_coldfront/index.md#tearing-down-the-stack) section
   describes how to stop the stack and remove its data.

@@ -8,7 +8,7 @@ PostgreSQL holds a thin wrapper view and a registry entry. This is a fresh
 table - there is no migration from the tiered demo, and the two modes are
 independent.
 
-Run the steps in [Setting Up the Stack](walkthrough.md#setting-up-the-stack)
+Run the steps in [Setting Up the Stack](exploring_coldfront/index.md#setting-up-the-stack)
 before you start this demo. The demo also needs the extensions and storage
 secret from [Step 4](walkthrough_tiered.md#enabling-the-extensions) and
 [Step 5](walkthrough_tiered.md#pointing-coldfront-at-the-object-store) of the
@@ -183,5 +183,5 @@ To go further with ColdFront, consult the following guides:
   and tuning options.
 - The [Architecture](architecture_guides/index.md) overview explains the shared mechanics
   and links to the per-mode deep dives.
-- The [Tearing Down the Stack](walkthrough.md#tearing-down-the-stack) section
+- The [Tearing Down the Stack](exploring_coldfront/index.md#tearing-down-the-stack) section
   describes how to stop the stack and remove its data.

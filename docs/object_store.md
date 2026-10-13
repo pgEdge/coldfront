@@ -368,7 +368,7 @@ SELECT coldfront.set_storage_secret_azure(
 `set_storage_secret_azure()` writes the same `coldfront.storage_secret` row
 (replicated, `pg_dump`-excluded) and materializes a `TYPE azure` PERSISTENT
 SECRET. The Azure cold tier is subject to the soft-delete / change-feed
-restriction in [Caveats](index.md#caveats).
+restriction in [Caveats](caveats.md).
 
 A vended-credentials variant is also available: set `sas-enabled` on the
 warehouse (on by default) and Lakekeeper vends a per-container SAS
