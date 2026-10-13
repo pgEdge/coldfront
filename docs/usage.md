@@ -829,6 +829,11 @@ SELECT coldfront.set_storage_secret_azure(
 SECRET. The Azure cold tier is subject to the soft-delete / change-feed
 restriction in [Caveats](index.md#caveats).
 
+The storage account must have hierarchical namespace enabled, for example with
+`az storage account create --hns true`. A StorageV2 account without
+hierarchical namespace is not an ADLS Gen2 account, and Lakekeeper's `adls`
+warehouse fails on it.
+
 ## Vended Credentials
 
 Vended credentials let a deployment run with no object-store credential stored
