@@ -1179,6 +1179,78 @@ EOSQL
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# Story: TC-273, a tab or a newline inside a string literal reaches either tier
+# unchanged through every rewritten write: a hot-only, a cold and a dual-tier
+# UPDATE, a tiered INSERT through the cold sink and through the stream, a write
+# nested in a WITH entry, and a decoupled INSERT. Each value is compared with
+# the one PostgreSQL makes of the same literal, both read raw.
+# ───────────────────────────────────────────────────────────────────────────
+story_whitespace_in_value() {
+    step "TC-273: a literal's tabs and newlines survive every rewritten write"
+    local cold="ts < date_trunc('month',now()) - interval '3 months'"
+    local hot="date_trunc('month',now()) - interval '1 month'"
+    local m4="date_trunc('month',now()) - interval '4 months'"
+    _tcws_cleanup() {
+        q "$HOST" "SELECT coldfront.drop_iceberg_table('public','tcws', true);" >/dev/null 2>&1
+        q "$HOST" "SELECT coldfront.drop_iceberg_table('public','tcws_dec', true);" >/dev/null 2>&1
+        q "$HOST" "DELETE FROM coldfront.tiered_views WHERE relname IN ('tcws','tcws_dec'); DELETE FROM coldfront.archive_watermark WHERE table_name='tcws'; DELETE FROM coldfront.partition_config WHERE table_name='tcws';" >/dev/null 2>&1
+        q "$HOST" "DROP VIEW IF EXISTS public.tcws CASCADE;" >/dev/null 2>&1
+        q "$HOST" "DROP VIEW IF EXISTS public.tcws_dec CASCADE;" >/dev/null 2>&1
+        q "$HOST" "DROP TABLE IF EXISTS public._tcws CASCADE;" >/dev/null 2>&1
+        q "$HOST" "DROP TABLE IF EXISTS public.tcws CASCADE;" >/dev/null 2>&1
+    }
+    trap _tcws_cleanup RETURN
+    qf "$HOST" <<'EOSQL' >/dev/null
+CREATE TABLE public.tcws (id bigint NOT NULL, ts timestamptz NOT NULL, note text,
+                          PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);
+DO $do$ DECLARE m date; BEGIN
+  FOREACH m IN ARRAY ARRAY[(date_trunc('month',now()) - interval '4 months')::date,
+                           (date_trunc('month',now()) - interval '1 month')::date] LOOP
+    EXECUTE format('CREATE TABLE public.%I PARTITION OF public.tcws FOR VALUES FROM (%L) TO (%L)',
+                   'tcws_p_' || to_char(m, 'YYYY_MM'), m, m + interval '1 month');
+  END LOOP; END $do$;
+INSERT INTO public.tcws VALUES
+  (1, date_trunc('month',now()) - interval '4 months' + interval '3 days', 'cold'),
+  (2, date_trunc('month',now()) - interval '1 month' + interval '1 day', 'hot');
+EOSQL
+    if ! "$ARCHIVER" register --table tcws --column ts --period monthly \
+            --hot-period "$(hot_days) days" >"$TMPD/tcws.log" 2>&1; then
+        fail "TC-273: register tcws (see $TMPD/tcws.log)"; tail -5 "$TMPD/tcws.log"; return
+    fi
+    if ! archive_only "schema_name='public' AND table_name='tcws'" "$TMPD/tcws.log"; then
+        fail "TC-273: archive tcws (see $TMPD/tcws.log)"; tail -5 "$TMPD/tcws.log"; return
+    fi
+    local want want2 note="SELECT note FROM public.tcws WHERE id ="
+    want=$(q "$HOST" "SELECT E'tab\\there nl\\nhere';")
+    want2=$(q "$HOST" "SELECT E'dual\\tx\\ny';")
+    q "$HOST" "UPDATE public.tcws SET note = E'tab\\there nl\\nhere' WHERE ts >= $hot AND id = 2;" >/dev/null
+    assert_eq "TC-273: a hot-only UPDATE" "$want" "$(q "$HOST" "$note 2;")"
+    q "$HOST" "UPDATE public.tcws SET note = E'tab\\there nl\\nhere' WHERE $cold AND id = 1;" >/dev/null
+    assert_eq "TC-273: a cold UPDATE" "$want" "$(q "$HOST" "$note 1;")"
+    q "$HOST" "UPDATE public.tcws SET note = E'dual\\tx\\ny' WHERE id IN (1, 2);" >/dev/null
+    assert_eq "TC-273: a dual-tier UPDATE, on both tiers" "$want2"$'\n'"$want2" \
+        "$(q "$HOST" "SELECT note FROM public.tcws WHERE id IN (1, 2) ORDER BY id;")"
+    # now() in the VALUES sends the INSERT through the cold sink; literal
+    # timestamps let it stream.
+    q "$HOST" "INSERT INTO public.tcws VALUES (3, $m4 + interval '5 days', E'tab\\there nl\\nhere'), (4, $hot + interval '2 days', E'tab\\there nl\\nhere');" >/dev/null
+    assert_eq "TC-273: a tiered INSERT through the cold sink, on both tiers" "$want"$'\n'"$want" \
+        "$(q "$HOST" "SELECT note FROM public.tcws WHERE id IN (3, 4) ORDER BY id;")"
+    local m4lit hotlit
+    m4lit=$(q "$HOST" "SELECT ($m4 + interval '6 days')::text;")
+    hotlit=$(q "$HOST" "SELECT ($hot + interval '3 days')::text;")
+    q "$HOST" "INSERT INTO public.tcws VALUES (5, '$m4lit', E'tab\\there nl\\nhere'), (6, '$hotlit', E'tab\\there nl\\nhere');" >/dev/null
+    assert_eq "TC-273: a tiered INSERT through the stream, on both tiers" "$want"$'\n'"$want" \
+        "$(q "$HOST" "SELECT note FROM public.tcws WHERE id IN (5, 6) ORDER BY id;")"
+    q "$HOST" "WITH i AS (INSERT INTO public.tcws VALUES (7, '$hotlit', E'tab\\there nl\\nhere')) SELECT 1;" >/dev/null
+    assert_eq "TC-273: an INSERT nested in a WITH entry" "$want" "$(q "$HOST" "$note 7;")"
+    q "$HOST" "WITH u AS (UPDATE public.tcws SET note = E'tab\\there nl\\nhere' WHERE $cold AND id = 1) SELECT 1;" >/dev/null
+    assert_eq "TC-273: a cold UPDATE nested in a WITH entry" "$want" "$(q "$HOST" "$note 1;")"
+    q "$HOST" "SELECT coldfront.create_iceberg_table('public', 'tcws_dec', '[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"note\",\"type\":\"text\"}]'::jsonb);
+               INSERT INTO public.tcws_dec VALUES (1, E'tab\\there nl\\nhere');" >/dev/null
+    assert_eq "TC-273: a decoupled INSERT" "$want" "$(q "$HOST" "SELECT note FROM public.tcws_dec WHERE id = 1;")"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Story: TC-238..TC-251, arrays. A one-dimensional array of a native type tiers
 # as an Iceberg list and reads back unchanged whichever path moved it: the
 # archive, a read of the hot tier through the view, a cold INSERT through the
@@ -1406,9 +1478,9 @@ EOSQL
     q "$HOST" "SELECT coldfront.create_iceberg_table('public','tcarr_dec','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"tags\",\"type\":\"text[]\"},{\"name\":\"nums\",\"type\":\"integer[]\"},{\"name\":\"amounts\",\"type\":\"numeric(10,2)[]\"}]'::jsonb);" >/dev/null
     assert_eq "TC-249: the decoupled view reads the arrays as arrays" "text[]|integer[]|numeric(10,2)[]" \
         "$(q "$HOST" "SELECT string_agg(format_type(atttypid, atttypmod), '|' ORDER BY attnum) FROM pg_attribute WHERE attrelid = 'public.tcarr_dec'::regclass AND attname IN ('tags', 'nums', 'amounts');")"
-    q "$HOST" "INSERT INTO public.tcarr_dec VALUES (1, ARRAY['with,comma', NULL, 'back\\slash', 'a''b'], ARRAY[1, NULL], ARRAY[1.25]);" >/dev/null
+    q "$HOST" "INSERT INTO public.tcarr_dec VALUES (1, ARRAY['with,comma', NULL, 'back\\slash', 'a''b', E'tab\\tx', E'nl\\nx'], ARRAY[1, NULL], ARRAY[1.25]);" >/dev/null
     assert_eq "TC-249: an INSERT of ARRAY[...] literals reads back unchanged" \
-        "$(q "$HOST" "SELECT ARRAY['with,comma', NULL, 'back\\slash', 'a''b'], ARRAY[1, NULL], ARRAY[1.25]::numeric(10,2)[];")" \
+        "$(q "$HOST" "SELECT ARRAY['with,comma', NULL, 'back\\slash', 'a''b', E'tab\\tx', E'nl\\nx'], ARRAY[1, NULL], ARRAY[1.25]::numeric(10,2)[];")" \
         "$(q "$HOST" "SELECT tags, nums, amounts FROM public.tcarr_dec WHERE id = 1;")"
     q "$HOST" "PREPARE tcarr_dec_set(text[]) AS UPDATE public.tcarr_dec SET tags = \$1 WHERE id = 1; EXECUTE tcarr_dec_set('{p,\"q r\"}');" >/dev/null
     assert_eq "TC-249: an UPDATE with a bound array parameter" '{p,"q r"}' \
@@ -7912,6 +7984,7 @@ if [ "$MODE" = "tiered" ]; then
     story_types
     story_unstorable_values # TC-231..TC-237: NaN and infinity refused where they are written
     story_arrays            # TC-238..TC-251: arrays tier as Iceberg lists
+    story_whitespace_in_value # TC-273: a literal's tabs and newlines survive every rewritten write
     story_vector            # embeddings: vector → list<float> over all three cold-write paths
     story_writes
     story_compaction        # iceberg-go RewriteDataFiles; the manifest-list

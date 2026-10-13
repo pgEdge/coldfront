@@ -197,6 +197,12 @@ this project adheres to
   `import` refuse such a column, naming the flag or key and the table's
   partition key. On a two-level table, the commands refuse only a column that
   the table lacks.
+- A tab or a newline inside a string literal of a write through a tiered or
+  decoupled view reached the tier as a space, with no error. The rewrite put
+  the statement on one line for its result-relation search and replaced every
+  tab and newline, inside literals too. A value bound as a parameter was
+  unaffected. The rewrite replaces only the newlines outside quotes, so a
+  literal keeps its tabs and newlines on either tier.
 - A bakery acknowledgement could outlive the claim it answered: a peer ruled
   dead acknowledged the claims it had missed once it caught up, and the rows
   stayed on every node. A node keeps an acknowledgement only while it still

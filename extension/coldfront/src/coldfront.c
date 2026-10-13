@@ -1359,15 +1359,32 @@ find_dml_prefix(const char *orig_sql, const char *search_unqual,
     return NULL; /* unreachable */
 }
 
-/* pg_get_querydef's text on one line: newlines and tabs become spaces, and the
- * leading indent goes. */
+/* pg_get_querydef's text on one line: a newline outside quotes becomes a
+ * space, and the leading indent goes. A literal or a quoted identifier keeps
+ * its newlines and tabs: the deparser quotes with '' and "" only, doubles a
+ * quote inside and never escapes one, and emits no tab of its own. */
 static char *
 deparse_flat(Query *query)
 {
     char *sql = pg_get_querydef(query, false), *p;
+    char  quote = 0;
 
     for (p = sql; *p; p++)
-        if (*p == '\n' || *p == '\t') *p = ' ';
+    {
+        if (quote)
+        {
+            if (*p != quote)
+                continue;
+            if (p[1] == quote)
+                p++;
+            else
+                quote = 0;
+        }
+        else if (*p == '\'' || *p == '"')
+            quote = *p;
+        else if (*p == '\n')
+            *p = ' ';
+    }
     while (*sql == ' ')
         sql++;
     return sql;
