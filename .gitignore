@@ -24,6 +24,7 @@ REPO_READY_AUDIT.md
 
 # MkDocs build output
 site/
+.venv-docs/
 
 # pg_regress expected outputs — tracked; the global *.out would exclude them.
 !extension/coldfront/test/expected/*.out

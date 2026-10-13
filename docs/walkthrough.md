@@ -165,10 +165,8 @@ store:
 | GCS (HMAC) | `SELECT coldfront.set_storage_secret(p_key_id => '<hmac-key>', p_secret => '<hmac-secret>', p_endpoint => 'storage.googleapis.com', p_region => 'us-east-1', p_url_style => 'path', p_use_ssl => true);` |
 | Azure ADLS Gen2 | `SELECT coldfront.set_storage_secret_azure('AccountName=<account>;AccountKey=<key>;EndpointSuffix=core.windows.net');` |
 
-The [Configuring your Object Store](object_store.md) guide shows the matching
-warehouse JSON for AWS S3; for GCS and Azure, see the
-[Storage Backends](usage.md#storage-backends) section of the Using ColdFront
-guide.
+The [Configuring your Object Store](object_store.md) guide shows the
+matching Lakekeeper warehouse JSON for each of these backends.
 
 ## Tearing Down the Stack
 
