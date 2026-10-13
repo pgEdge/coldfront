@@ -1,6 +1,11 @@
 # Understanding ColdFront Caveats
 
-Keep the following caveats in mind when running either mode:
+A tiered or decoupled table behaves like an ordinary PostgreSQL table, but
+the hot/cold split and the cold tier's DuckDB execution show through in a
+few places: SQL statements that need special handling (`jsonb` operators,
+`WITH`, `MERGE`, `TRUNCATE`, `COPY`), transaction and isolation semantics
+that differ from native PostgreSQL, and a few naming and infrastructure
+requirements. Keep the following in mind when running either mode:
 
 - `jsonb` reads come back as `json`. The `->`/`->>` operators work, and
   ColdFront translates the `::jsonb` cast, `jsonb_array_length`,

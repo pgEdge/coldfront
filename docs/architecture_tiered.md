@@ -584,8 +584,9 @@ So alongside the bakery substrate (`coldfront.claims` /
 `coldfront.claim_acks`), **both `coldfront.tiered_views` and
 `coldfront.archive_watermark` are in the Spock replication set**:
 `coldfront.ensure_replicated()`, the one-time per-node mesh step described in
-[distributed_setup.md](distributed_setup.md#what-coldfrontensure_replicated-does), adds them with the
-rest. The archiver runs on one node and registers a table, its view and its
+[Configuring a Distributed Deployment](distributed_setup.md#what-coldfrontensure_replicated-does),
+adds them with the rest. The archiver runs on one node and registers a
+table, its view and its
 registry row, in one transaction, so a peer applies them together and only gets
 these rows by replication; without `tiered_views` a peer cannot read the cold
 tier, and `INSERT`/`UPDATE`/`DELETE`/DDL-blocking stop recognizing the view.

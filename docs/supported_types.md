@@ -1,41 +1,70 @@
-# Understanding Supported Column Types
+# Supported Column Types
 
 The following PostgreSQL column types are supported:
 
-`bigint` · `integer` · `smallint` · `real` · `double precision` ·
-`boolean` · `timestamp with time zone` · `timestamp without time zone` ·
-`date` · `time without time zone` · `uuid` · `text` · `varchar(N)` ·
-`char(N)` · `bytea` · `numeric(P,S)` (P ≤ 38) · `jsonb` / `json` ·
-`interval` · `vector(N)` / `halfvec(N)` (pgvector; see
-[usage_vectors.md](usage_vectors.md)) · one-dimensional arrays of most of
-these types (see [Arrays](#arrays))
+- `bigint`.
+- `integer`.
+- `smallint`.
+- `real`.
+- `double precision`.
+- `boolean`.
+- `timestamp with time zone`.
+- `timestamp without time zone`.
+- `date`.
+- `time without time zone`.
+- `uuid`.
+- `text`.
+- `varchar(N)`.
+- `char(N)`.
+- `bytea`.
+- `numeric(P,S)` (P ≤ 38).
+- `jsonb` / `json`.
+- `interval`.
+- `vector(N)` / `halfvec(N)` (pgvector; see [usage_vectors.md](usage_vectors.md)).
+- one-dimensional arrays of most of these types (see
+  [Supported Array Types](#supported-array-types)).
 
-Anything else (unbounded `numeric`, `xml`, `tsvector`, range/multirange types,
-custom enums, composite types, pgvector's `sparsevec`, and the arrays that
-[Arrays](#arrays) lists as refused at registration) is rejected when a tiered
-table is registered, and when a decoupled table is created. ColdFront refuses
-silent fallback to `varchar` - losing precision/identity is worse than no
-support.
+Other data types (unbounded `numeric`, `xml`, `tsvector`, range/multirange types,
+custom enums, composite types, pgvector's `sparsevec`, `inet`, `cidr`, `oid`,
+and the arrays that [Supported Array Types](#supported-array-types) lists
+as refused at registration) is
+rejected when a tiered table is registered, and when a decoupled table is
+created. ColdFront refuses silent fallback to `varchar` - losing
+precision/identity is worse than no support. `inet`/`cidr`/`oid` are
+rejected because pg_duckdb cannot process them in any Iceberg-backed query,
+so no cast makes them readable; store IP data as `text` and `oid` values as
+`bigint` instead (you can still index/compare them; cast on the hot side
+only if needed).
 
-Iceberg cannot hold a `numeric` `NaN`, or an `infinity` or `-infinity` in a
-`date`, `timestamp` or `timestamptz` column, so ColdFront refuses those values,
-as array elements too. A tiered table's hot table has a check constraint named
-`coldfront_guard_<column>` on each column of those types and on each array
-column; an `INSERT` or `UPDATE` that stores one of the values fails with an
-error that names the constraint. A write that goes to the cold tier, in either
-mode, is refused by DuckDB.
+A few supported types need a closer look:
 
-The archiver adds the constraints at the first archive pass that tiers a
-partition of the table, and validates them once that pass's bootstrap
-transaction has committed. A value written before then is accepted, and each
-archive pass stops with an error that names the constraint until the row is
-fixed; the next pass then validates the constraint and tiers the table. A
-column that an `ALTER TABLE` adds through the DDL hook gets its constraint in
-the same statement, which PostgreSQL validates against every row of the hot
-table, so an `ADD COLUMN` whose default the constraint refuses, such as
-`DEFAULT 'NaN'`, fails. A renamed column's constraint takes the new column
-name, and a column whose name is longer than 47 bytes gets a constraint named
-after a hash of the name.
+- Iceberg cannot hold a `numeric` `NaN`, or an `infinity` or `-infinity`
+  value in a `date`, `timestamp with time zone` or `timestamp without time
+  zone` column, as array elements too. ColdFront refuses those values with
+  a check constraint named `coldfront_guard_<column>`; a write that goes to
+  the cold tier, in either mode, is refused by DuckDB.
+- `char(N)` is stored and read as `varchar`. Values, comparisons, and
+  `length()` round-trip losslessly, but a cold read comes back unpadded
+  with `pg_typeof varchar`, because pg_duckdb has no fixed-length `char`
+  type. Use `text` or `varchar` if blank-padded display matters.
+- `json` and `jsonb` are stored as `varchar` in Iceberg (no native
+  primitive); reads come back as DuckDB's `json`, not the rich PG `jsonb`
+  type, because Iceberg-backed reads run entirely in DuckDB.
+- `interval` is stored as `varchar` in Iceberg, as `<months> months <days>
+  days <seconds> seconds`, the text PostgreSQL and DuckDB both read as the
+  same value; it is view-cast back to the rich PG type on read.
+
+The archiver adds the `NaN`/infinity constraints at the first archive pass
+that tiers a partition of the table, and validates them once that pass's
+bootstrap transaction has committed. A value written before then is accepted,
+and each archive pass stops with an error that names the constraint until the
+row is fixed; the next pass then validates the constraint and tiers the
+table. A column that an `ALTER TABLE` adds through the DDL hook gets its
+constraint in the same statement, which PostgreSQL validates against every
+row of the hot table, so an `ADD COLUMN` whose default the constraint
+refuses, such as `DEFAULT 'NaN'`, fails. A renamed column's constraint takes
+the new column name, and a column whose name is longer than 47 bytes gets a
+constraint named after a hash of the name.
 
 A cold `UPDATE ... FROM`, a `MERGE` whose source is a PostgreSQL table, and an
 `INSERT ... SELECT` into a decoupled table read that PostgreSQL table through
@@ -43,31 +72,19 @@ DuckDB's postgres extension, which reads a `numeric` `NaN` as `0` and drops an
 array's lower bound. ColdFront cannot refuse those values on that path, so
 filter them out of such a source.
 
-`char(N)` is stored and read as `varchar`. The data round-trips losslessly:
-values, comparisons, and `length()` match a hot PG table, where `length()`
-already ignores `char(N)` trailing padding. The only difference is cosmetic: a
-cold `char(N)` column reads back unpadded with `pg_typeof varchar`, because
-pg_duckdb has no fixed-length `char` type. Use `text` or `varchar` if
-blank-padded display matters.
-
-`json`, `jsonb` and `interval` are stored as `varchar` in Iceberg (no native
-primitive), an `interval` as `<months> months <days> days <seconds> seconds`,
-the text PostgreSQL and DuckDB both read as the same value. On read,
-`interval` is view-cast back to the rich PG type; `json`
-and `jsonb` come back as DuckDB's `json` (the equivalent of PG's `jsonb`), not
-the rich PG `jsonb` type, because Iceberg-backed reads run entirely in DuckDB.
-Queries like `data->>'key'` and `data->'key'` work, and ColdFront translates
-the `::jsonb` cast, `jsonb_array_length`, `jsonb_build_object` / `jsonb_agg`
-(and their `json_` twins, which DuckDB also lacks) and `date_bin` on read: the
-builders become the `concat` / `to_json` / `array_agg` form both engines
-evaluate identically (the result is JSON-equal to jsonb's rendering, in compact
-form and in argument order), and `date_bin` becomes DuckDB's `time_bucket`,
-which takes the same arguments and agrees on every fixed-width bucket. The
-jsonb-only operators (`?`, `@>`, `<@`, `#>`, `#>>`) and most jsonb functions
-(`jsonb_typeof`, `jsonb_extract_path`, `jsonb_extract_path_text`, `jsonb_set`,
-`jsonb_path_*`, `jsonb_each`, `jsonb_object_keys`) are not supported on tiered
-or decoupled data: DuckDB either lacks them or its same-named function differs
-in signature or result. Reach into the document with `->`/`->>`.
+Queries like `data->>'key'` and `data->'key'` work against `jsonb`, and
+ColdFront translates the `::jsonb` cast, `jsonb_array_length`,
+`jsonb_build_object` / `jsonb_agg` (and their `json_` twins, which DuckDB
+also lacks) and `date_bin` on read: the builders become the `concat` /
+`to_json` / `array_agg` form both engines evaluate identically (the result
+is JSON-equal to jsonb's rendering, in compact form and in argument order),
+and `date_bin` becomes DuckDB's `time_bucket`, which takes the same
+arguments and agrees on every fixed-width bucket. The jsonb-only operators
+(`?`, `@>`, `<@`, `#>`, `#>>`) and most jsonb functions (`jsonb_typeof`,
+`jsonb_extract_path`, `jsonb_extract_path_text`, `jsonb_set`, `jsonb_path_*`,
+`jsonb_each`, `jsonb_object_keys`) are not supported on tiered or decoupled
+data: DuckDB either lacks them or its same-named function differs in
+signature or result. Reach into the document with `->`/`->>`.
 
 These limits apply only to reads that go through a tiered or iceberg-only view,
 which pg_duckdb plans entirely in DuckDB. Ordinary (non-tiered) PostgreSQL
@@ -92,13 +109,7 @@ DuckDB entirely. Such a read returns `data` as native `jsonb` rather than the
 view's `json`. Reads that span tiers, are cold-only, or reach the view through
 a join or sub-query stay in DuckDB, where the limits above apply.
 
-`inet`/`cidr`/`oid` are **not supported**: pg_duckdb cannot process them
-(`inet` Oid 869, `oid` Oid 26) in any Iceberg-backed query, and every
-cross-tier read is planned by pg_duckdb - so no cast makes them readable. Store
-IP data as `text` and `oid` values as `bigint` (you can still index/compare
-them; cast on the hot side only if needed).
-
-### Arrays
+### Supported Array Types
 
 A one-dimensional array of a supported type tiers as an Iceberg list of that
 type. The following table shows how each array type is stored and how the view

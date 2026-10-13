@@ -1,8 +1,8 @@
-# Setting Up a Distributed Deployment
+# Configuring a Distributed Deployment
 
-For multi-writer iceberg workloads, run ColdFront on N PG nodes in a Spock mesh
-against the same Lakekeeper + S3. The bakery serializes commits PG-side so
-writers never collide at the catalog.
+For multi-writer iceberg workloads, run ColdFront on PostgreSQL nodes in a
+Spock mesh against the same Lakekeeper + S3. The bakery serializes commits
+PostgreSQL-side so writers never collide at the catalog.
 
 ### Per-Node `postgresql.conf`
 
@@ -57,8 +57,10 @@ coldfront.iceberg_async_parquet = on
 coldfront.iceberg_bakery_patch = on
 ```
 
-The bakery has no peer-ack timeout. R-A's only failure mode is a dead peer
-(would wait forever), and a liveness check inside the wait loop closes it:
+The bakery has no peer-ack timeout. The
+[Ricart-Agrawala (R-A)](formal/README.md) deferred-reply protocol's only
+failure mode is a dead peer (would wait forever), and a liveness check
+inside the wait loop closes it:
 the bakery treats a peer whose `pg_stat_replication.reply_time` is older than
 `coldfront.peer_alive_window_ms` as already acked, whatever the walsender's
 state (a peer that has just reconnected is catching up and still alive). The
@@ -79,7 +81,8 @@ nothing waits. See [architecture_decoupled.md](architecture_decoupled.md),
 *Orphan reaping*.
 
 Sync-rep (`synchronous_standby_names`) is **not required** by the bakery - the
-R-A ack barrier is what serializes iceberg commits. You can still enable
+R-A ack barrier (the wait, before a claim commits, for every live peer to
+acknowledge it) is what serializes iceberg commits. You can still enable
 sync-rep cluster-wide if you want stronger durability for non-bakery writes,
 but it plays no part in iceberg-commit serialization.
 
@@ -122,13 +125,13 @@ needed.
 
 ### Timeouts
 
-The following table lists the two settings that decide how long a cold write
-waits for a peer; set them together, on every node:
+The following table lists the two `postgresql.conf` settings that decide
+how long a cold write waits for a peer; set them together, on every node:
 
-| Setting | Recommended | Where | What it does |
-|---|---|---|---|
-| `wal_sender_timeout` | `15s` | `postgresql.conf` on every node; the image sets it in mesh mode | The node's walsender asks each peer for a reply after half of it (7.5 s) and drops a peer that has not replied for the whole of it. |
-| `coldfront.peer_alive_window_ms` | `10000` (the default) | `postgresql.conf`, superuser-only | The bakery treats a peer whose last reply is older than this as dead and stops waiting for its ack. |
+| Setting | Notes |
+|---|---|
+| `wal_sender_timeout` | Recommended `15s`, set in `postgresql.conf` on every node (the image sets it if you are running in mesh mode). The node's walsender asks each peer for a reply after half of it (7.5 s) and drops a peer that has not replied for the whole of it. |
+| `coldfront.peer_alive_window_ms` | Recommended `10000` (the default), set in `postgresql.conf`, by a superuser only. The bakery treats a peer whose last reply is older than this as dead and stops waiting for its ack. |
 
 The rule: half of `wal_sender_timeout` must stay below the window, with a
 round trip to spare; the claim enforces the first part. An idle peer replies
@@ -191,7 +194,7 @@ SELECT c.relname
  ORDER BY 1;
 ```
 
-Then verify the mesh before benching - insert a sentinel claim on each node
+Then verify the mesh before benchmarking - insert a sentinel claim on each node
 and read it back from every other node. All N×(N-1) directions must show the
 row before traffic starts. `ci/journey.sh` `story_mesh_substrate` is a
 copyable reference: it checks the membership above on every node and then the

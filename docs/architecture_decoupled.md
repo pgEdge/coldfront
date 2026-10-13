@@ -162,7 +162,8 @@ which would lose precision or identity:
 - custom enums, `xml`, `tsvector`/`tsquery`, range types, and multirange types.
 - composite types.
 - arrays of `timestamptz`, `jsonb`, `json`, `interval` or a vector type, and
-  arrays of arrays; [Arrays](supported_types.md#arrays) gives the reasons.
+  arrays of arrays; [Supported Array Types](supported_types.md#supported-array-types)
+  gives the reasons.
 - pgvector's `sparsevec`.
 - any type not enumerated above.
 
@@ -724,7 +725,7 @@ pointing at the same Lakekeeper endpoint and S3 bucket:
 - For DDL, Spock's `ddl_sql` repset replicates `CREATE/ALTER/DROP` of the
   wrapper view, and the `default` repset replicates the
   `coldfront.tiered_views` registry row (see
-  [Distributed Setup](distributed_setup.md)), so one node provisions the
+  [Configuring a Distributed Deployment](distributed_setup.md)), so one node provisions the
   table and replication enables every peer's hook.
   A column `ALTER TABLE` reaches the peers the same way: the node that runs it
   changes the shared Iceberg table, and its rebuilt view and registry row
@@ -792,7 +793,7 @@ The call is idempotent. It puts every ColdFront table that replicates by value
 in the node's replication sets: the two bakery tables, the registry and the
 watermark, the storage secret, the lifecycle config and the vector routing
 state (the list and the reason for each table are in the
-[Distributed Setup](distributed_setup.md#what-coldfrontensure_replicated-does) guide).
+[Configuring a Distributed Deployment](distributed_setup.md#what-coldfrontensure_replicated-does) guide).
 If it has not run on a peer, that peer's ack `INSERT`s are local-only and never
 replicate back to the originating writer: every claim on the originator waits
 at the ack barrier for an ack that never arrives.

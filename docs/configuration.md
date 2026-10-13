@@ -42,7 +42,8 @@ The two `coldfront.iceberg_*` settings make a node upload the Parquet files of
 an `INSERT` or `COPY` outside its write lock (the bakery claim on a Spock mesh,
 an advisory lock on a single node) and serialize only the catalog commit. The
 packaged duckdb-iceberg includes the patch that this ordering requires, and the
-[Distributed Setup](distributed_setup.md) guide describes the mesh settings.
+[Configuring a Distributed Deployment](distributed_setup.md) guide describes
+the mesh settings.
 
 ColdFront also exposes the following settings, which adjust write
 behavior and execution; tune them as needed:

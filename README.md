@@ -7,24 +7,35 @@
 The ColdFront documentation consists of the following guides:
 
 - [Introduction](docs/index.md)
-- Getting Started
-    - [Exploring ColdFront](docs/exploring_coldfront/index.md)
+- Architecture Guides
+    - [Architecture Overview](docs/architecture_guides/index.md)
+    - [Tiered Operating Mode](docs/architecture_tiered.md)
+    - [Decoupled (Iceberg-Only) Operating Mode](docs/architecture_decoupled.md)
+    - [Vector Storage Architecture](docs/architecture_vectors.md)
+- Installing and Configuring ColdFront
+    - [Installing ColdFront](docs/installation.md)
+    - [Configuring ColdFront](docs/configuration.md)
+        - [Configuring Lakekeeper](docs/one_time_setup.md)
+        - [Configuring your Object Store](docs/object_store.md)
+        - [Configuring a Distributed Deployment](docs/distributed_setup.md)
+- [Using ColdFront](docs/using_coldfront/index.md)
+    - [Using ColdFront in Tiered Mode](docs/usage_tiered.md)
+    - [Using ColdFront in Decoupled Mode](docs/usage_decoupled.md)
+    - [Using ColdFront in Standalone Partitioned Mode](docs/usage_partitioner.md)
+    - [Working with Embeddings](docs/usage_vectors.md)
+- [Exploring ColdFront Modes](docs/exploring_coldfront/index.md)
     - [Exploring Tiered Storage](docs/walkthrough_tiered.md)
     - [Exploring Decoupled Mode](docs/walkthrough_decoupled.md)
     - [Exploring the Standalone Partitioner](docs/walkthrough_partitioner.md)
     - [Exploring Distributed Mode](docs/walkthrough_distributed.md)
-    - [Building ColdFront from Source](docs/installation.md)
-    - [Setting Up an Object Store](docs/object_store.md)
-- Architecture
-    - [Architecture Overview](docs/architecture_guides/index.md)
-    - [Tiered Mode](docs/architecture_tiered.md)
-    - [Decoupled Mode](docs/architecture_decoupled.md)
-    - [Vector Storage](docs/architecture_vectors.md)
-- [Using ColdFront](docs/using_coldfront/index.md)
-- [Storing and Searching Embeddings](docs/usage_vectors.md)
-- [Compacting the Cold Tier](docs/compaction.md)
+- [Connecting to ColdFront](docs/connecting.md)
+- Administration
+    - [Understanding ColdFront Caveats](docs/caveats.md)
+    - [Using Vended Credentials](docs/vended_credentials.md)
+    - [Supported Column Types](docs/supported_types.md)
+    - [Compacting the Cold Tier](docs/compaction.md)
 - Developer Resources
-    - [Verifying the Bakery Protocol](docs/formal/README.md)
+    - [Formal Model - ColdFront Decoupled-Mode Bakery](docs/formal/README.md)
 - [Release Notes](docs/changelog.md)
 
 ColdFront keeps tables in PostgreSQL and cold data in Apache Iceberg (Parquet
@@ -117,8 +128,9 @@ or install bare-metal. Then continue with the
 
 ### Setting Up on Cloud S3?
 
-Once the image is built, the **[S3 setup guide](docs/object_store.md)** takes
-you from an empty bucket to a working cold tier end-to-end.
+When the image is built, the
+**[Configuring your Object Store](docs/object_store.md)** guide takes you from
+an empty bucket to a working cold tier end-to-end.
 
 ## Configuration
 
@@ -144,11 +156,15 @@ section of the Configuring ColdFront guide.
 [Using ColdFront in Tiered Mode](docs/usage_tiered.md),
 [Using ColdFront in Decoupled Mode](docs/usage_decoupled.md), and
 [Using ColdFront in Standalone Partitioned Mode](docs/usage_partitioner.md)
-document each mode in depth; the [Using ColdFront](docs/using_coldfront/index.md) guide
-helps you pick one, and the [walkthrough](docs/exploring_coldfront/index.md) demos run
-each mode on a sample table. Operational topics shared across modes -
-caveats, vended credentials, reading and writing, supported types, and
-distributed (mesh) setup - are documented under Administration.
+document each mode in depth; the
+[Using ColdFront](docs/using_coldfront/index.md) guide helps you pick one, and
+the [walkthrough](docs/exploring_coldfront/index.md) demos run each mode on a
+sample table. Operational topics shared across modes -
+[caveats](docs/caveats.md), [vended credentials](docs/vended_credentials.md),
+[supported column types](docs/supported_types.md), and
+[compaction](docs/compaction.md) - are documented under Administration; to run
+ColdFront on more than one node, see
+[Configuring a Distributed Deployment](docs/distributed_setup.md).
 
 ## Documentation
 
@@ -157,31 +173,30 @@ documents:
 
 | Doc | Contents |
 |---|---|
-| [Walkthrough](docs/exploring_coldfront/index.md) | Sets up the demo stack and runs ColdFront hands-on. |
-| [Tiered storage demo](docs/walkthrough_tiered.md) | Adds ColdFront to an existing database and moves its cold data to object storage. |
-| [Decoupled mode demo](docs/walkthrough_decoupled.md) | Stores a table in Iceberg from the first row and adopts a table that another engine wrote. |
-| [Partitioner demo](docs/walkthrough_partitioner.md) | Manages PostgreSQL range partitions without any cold tier. |
-| [Distributed demo](docs/walkthrough_distributed.md) | Points two PostgreSQL nodes at one shared lake. |
-| [Embeddings](docs/usage_vectors.md) | Documents storing and searching embeddings with the pgvector interface. |
-| [Usage](docs/using_coldfront/index.md) | Compares the three operating modes and links to each mode's guide. |
-| [Tiered mode usage](docs/usage_tiered.md) | Documents archiving aging partitions to Iceberg while recent rows stay in the PostgreSQL heap. |
-| [Decoupled mode usage](docs/usage_decoupled.md) | Documents tables that live entirely in Iceberg from the first row, and dropping or releasing a registered table. |
-| [Standalone partitioner usage](docs/usage_partitioner.md) | Documents managing PostgreSQL partitions with no cold tier at all, and the partition CLI shared with tiered mode. |
-| [Caveats](docs/caveats.md) | Documents cross-tier isolation, mixed transactions, and other edge cases shared between tiered and decoupled tables. |
-| [Vended Credentials](docs/vended_credentials.md) | Documents running with no stored object-store credential, for AWS S3 and Azure ADLS Gen2. |
-| [Reading and Writing](docs/reading_writing.md) | Documents the SQL surface shared between tiered and decoupled tables. |
-| [Supported Column Types](docs/supported_types.md) | Documents the PostgreSQL column types, including arrays, that a cold tier supports. |
-| [Distributed Setup](docs/distributed_setup.md) | Documents running a multi-writer decoupled-mode Spock mesh against one shared lake. |
-| [Installation](docs/installation.md) | Documents installing from a package or building from source (Docker or bare-metal), and testing and CI. |
+| [Architecture Overview](docs/architecture_guides/index.md) | Describes the shared architecture and core mechanics. |
+| [Tiered Operating Mode](docs/architecture_tiered.md) | Describes tiered mode (hot PostgreSQL plus cold Iceberg) in depth. |
+| [Decoupled (Iceberg-Only) Operating Mode](docs/architecture_decoupled.md) | Describes decoupled (Iceberg-only) mode in depth. |
+| [Vector Storage Architecture](docs/architecture_vectors.md) | Describes vector storage internals: type mapping, routing state, cluster assignment, and layout. |
+| [Installing ColdFront](docs/installation.md) | Documents installing from a package or building from source (Docker or bare-metal), and testing and CI. |
 | [Configuring ColdFront](docs/configuration.md) | Documents configuring PostgreSQL and ColdFront's own configuration. |
 | [Configuring Lakekeeper](docs/one_time_setup.md) | Installs, configures, and bootstraps Lakekeeper, then installs the extensions each database needs. |
 | [Configuring your Object Store](docs/object_store.md) | Gets ColdFront running end to end, for any of four supported backends: S3-compatible, virtual-hosted cloud S3, GCS, or Azure ADLS Gen2. |
+| [Configuring a Distributed Deployment](docs/distributed_setup.md) | Documents running a multi-writer decoupled-mode Spock mesh against one shared lake. |
+| [Using ColdFront](docs/using_coldfront/index.md) | Compares the three operating modes, documents the shared SQL surface, and links to each mode's guide. |
+| [Using ColdFront in Tiered Mode](docs/usage_tiered.md) | Documents archiving aging partitions to Iceberg while recent rows stay in the PostgreSQL heap. |
+| [Using ColdFront in Decoupled Mode](docs/usage_decoupled.md) | Documents tables that live entirely in Iceberg from the first row, and dropping or releasing a registered table. |
+| [Using ColdFront in Standalone Partitioned Mode](docs/usage_partitioner.md) | Documents managing PostgreSQL partitions with no cold tier at all, and the partition CLI shared with tiered mode. |
+| [Working with Embeddings](docs/usage_vectors.md) | Documents storing and searching embeddings with the pgvector interface. |
+| [Exploring ColdFront Modes](docs/exploring_coldfront/index.md) | Sets up the demo stack and runs ColdFront hands-on. |
+| [Exploring Tiered Storage](docs/walkthrough_tiered.md) | Adds ColdFront to an existing database and moves its cold data to object storage. |
+| [Exploring Decoupled Mode](docs/walkthrough_decoupled.md) | Stores a table in Iceberg from the first row and adopts a table that another engine wrote. |
+| [Exploring the Standalone Partitioner](docs/walkthrough_partitioner.md) | Manages PostgreSQL range partitions without any cold tier. |
+| [Exploring Distributed Mode](docs/walkthrough_distributed.md) | Points two PostgreSQL nodes at one shared lake. |
 | [Connecting to ColdFront](docs/connecting.md) | Documents onboarding an application role with least privilege. |
-| [Compaction](docs/compaction.md) | Documents cold-tier table maintenance: compaction, snapshot expiry, and orphan-file removal. |
-| [Architecture](docs/architecture_guides/index.md) | Describes the shared architecture and core mechanics. |
-| [Architecture: tiered](docs/architecture_tiered.md) | Describes tiered mode (hot PG plus cold Iceberg) in depth. |
-| [Architecture: decoupled](docs/architecture_decoupled.md) | Describes decoupled (iceberg-only) mode in depth. |
-| [Architecture: vectors](docs/architecture_vectors.md) | Describes vector storage internals: type mapping, routing state, cluster assignment, and layout. |
+| [Understanding ColdFront Caveats](docs/caveats.md) | Documents cross-tier isolation, mixed transactions, and other edge cases shared between tiered and decoupled tables. |
+| [Using Vended Credentials](docs/vended_credentials.md) | Documents running with no stored object-store credential, for AWS S3 and Azure ADLS Gen2. |
+| [Supported Column Types](docs/supported_types.md) | Documents the PostgreSQL column types, including arrays, that a cold tier supports. |
+| [Compacting the Cold Tier](docs/compaction.md) | Documents cold-tier table maintenance: compaction, snapshot expiry, and orphan-file removal. |
 
 ## Connecting to ColdFront
 

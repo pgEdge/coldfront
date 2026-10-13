@@ -65,20 +65,13 @@ nav:
       - Decoupled (Iceberg-Only) Operating Mode: architecture_decoupled.md
       - Vector Storage Architecture: architecture_vectors.md
 
-  - Installing ColdFront: installation.md
-  - Configuring ColdFront:
-      - configuration.md
-      - Configuring Lakekeeper: one_time_setup.md
-      - Configuring your Object Store: object_store.md
-
-  - Connecting to ColdFront: connecting.md
-
-  - Exploring ColdFront:
-      - exploring_coldfront/index.md
-      - Exploring Tiered Storage: walkthrough_tiered.md
-      - Exploring Decoupled Mode: walkthrough_decoupled.md
-      - Exploring the Standalone Partitioner: walkthrough_partitioner.md
-      - Exploring Distributed Mode: walkthrough_distributed.md
+  - Installing and Configuring ColdFront:
+      - Installing ColdFront: installation.md
+      - Configuring ColdFront:
+          - configuration.md
+          - Configuring Lakekeeper: one_time_setup.md
+          - Configuring your Object Store: object_store.md
+          - Configuring a Distributed Deployment: distributed_setup.md
 
   - Using ColdFront:
       - using_coldfront/index.md
@@ -87,12 +80,19 @@ nav:
       - Using ColdFront in Standalone Partitioned Mode: usage_partitioner.md
       - Working with Embeddings: usage_vectors.md
 
+  - Exploring ColdFront Modes:
+      - exploring_coldfront/index.md
+      - Exploring Tiered Storage: walkthrough_tiered.md
+      - Exploring Decoupled Mode: walkthrough_decoupled.md
+      - Exploring the Standalone Partitioner: walkthrough_partitioner.md
+      - Exploring Distributed Mode: walkthrough_distributed.md
+
+  - Connecting to ColdFront: connecting.md
+
   - Administration:
       - Understanding ColdFront Caveats: caveats.md
       - Using Vended Credentials: vended_credentials.md
-      - Reading and Writing ColdFront Tables: reading_writing.md
-      - Understanding Supported Column Types: supported_types.md
-      - Setting Up a Distributed Deployment: distributed_setup.md
+      - Supported Column Types: supported_types.md
       - Compacting the Cold Tier: compaction.md
 
   - Developer Resources:

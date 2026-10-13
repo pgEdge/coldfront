@@ -51,7 +51,7 @@ In a mesh one node provisions: Spock's `ddl_sql` repset replicates the
 `CREATE VIEW`, and the `default` repset replicates the name-keyed registry row,
 which enables the write hook on every peer. Each node also needs the
 one-time setup call `coldfront.ensure_replicated()` - see
-[Distributed Setup](distributed_setup.md).
+[Configuring a Distributed Deployment](distributed_setup.md).
 
 ## Changing a Decoupled Table's Columns
 
@@ -130,8 +130,8 @@ because the grant reads the registry at call time.
 
 In a mesh one node adopts. The wrapper view replicates through Spock's
 `ddl_sql` repset and the registry row through the `default` repset (see
-[Distributed Setup](distributed_setup.md)),
-so every peer reads and writes the table under the same name, and a peer's own
+[Configuring a Distributed Deployment](distributed_setup.md)), so every peer
+reads and writes the table under the same name, and a peer's own
 adopt is refused as already registered. Adoption takes the table's bakery
 claim around that check and the registry write, so two nodes adopting the
 same table at the same moment are serialized: the second waits, then reads
