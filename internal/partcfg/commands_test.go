@@ -232,6 +232,71 @@ func TestRequireLogged_PropagatesQueryError(t *testing.T) {
 	}
 }
 
+// keyDB answers requirePartitionColumn's one-row query: the table's partition
+// key definition, and whether the column exists and is that key.
+type keyDB struct {
+	keydef        string
+	exists, isKey bool
+	err           error
+	queried       bool
+}
+
+func (k *keyDB) QueryRow(context.Context, string, ...any) pgx.Row {
+	k.queried = true
+	return &mockRow{scan: func(dest ...any) error {
+		if k.err != nil {
+			return k.err
+		}
+		*(dest[0].(*string)), *(dest[1].(*bool)), *(dest[2].(*bool)) = k.keydef, k.exists, k.isKey
+		return nil
+	}}
+}
+
+// A flat table's column must be its partition key and a 2-level table's a
+// column it has; the refusal names the flag, or on import the key.
+func TestRequirePartitionColumn_RefusesAColumnTheTableIsNotPartitionedOn(t *testing.T) {
+	const notKey = ` is not the partition key of public.vreg, which is partitioned by RANGE (ts)`
+	yamlKey := func(key string) string { return key }
+	cases := []struct {
+		name     string
+		db       *keyDB
+		column   string
+		twoLevel bool
+		keyName  func(string) string
+		want     string
+	}{
+		{"no such column", &keyDB{keydef: "RANGE (ts)"}, "no_such_col", false, flagName, `--column "no_such_col"` + notKey},
+		{"a column that is not the key", &keyDB{keydef: "RANGE (ts)", exists: true}, "val", false, flagName, `--column "val"` + notKey},
+		{"named by its YAML key", &keyDB{keydef: "RANGE (ts)"}, "no_such_col", false, yamlKey, `partition_column "no_such_col"` + notKey},
+		{"the partition key", &keyDB{keydef: "RANGE (ts)", exists: true, isKey: true}, "ts", false, flagName, ""},
+		{"2-level, no such column", &keyDB{keydef: "LIST (region)"}, "no_such_col", true, flagName, `--column "no_such_col" is not a column of public.vreg`},
+		{"2-level, a column of the table", &keyDB{keydef: "LIST (region)", exists: true}, "ts", true, flagName, ""},
+		{"not partitioned, left to validatePKSuperset", &keyDB{err: pgx.ErrNoRows}, "ts", false, flagName, ""},
+		{"query error", &keyDB{err: errors.New("boom")}, "ts", false, flagName, "read the partition key of public.vreg: boom"},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := requirePartitionColumn(context.Background(), c.db, "public", "vreg", "vreg", c.column, c.twoLevel, c.keyName)
+			if c.want == "" {
+				if err != nil {
+					t.Fatalf("refused: %v", err)
+				}
+				return
+			}
+			if err == nil || err.Error() != c.want {
+				t.Fatalf("got %v, want %q", err, c.want)
+			}
+		})
+	}
+}
+
+func TestRequirePartitionColumn_LeavesAnEmptyColumnToAutoDetection(t *testing.T) {
+	db := &keyDB{err: errors.New("must not query")}
+	if err := requirePartitionColumn(context.Background(), db, "public", "vreg", "vreg", "", false, flagName); err != nil || db.queried {
+		t.Fatalf("an empty column was checked: err=%v queried=%v", err, db.queried)
+	}
+}
+
 func TestRequireNoCaseCollision_RejectsDifferentCase(t *testing.T) {
 	// The error names the row already holding the folded name.
 	db := &persistDB{scalar: "public.events"}

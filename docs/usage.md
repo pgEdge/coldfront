@@ -639,6 +639,10 @@ field. Registration fails when:
     - a `--sub-values-source` without a `--column`.
     - a table with neither a `--hot-period` nor a `--retention`.
 
+- `--column`, or `partition_column` on `import`, names a column that is not the
+  table's partition key. On a two-level table, registration refuses only a
+  column that the table lacks. The refusal names the flag or key and, for a
+  flat table, the table's partition key.
 - any relation in the partition tree is `UNLOGGED`, because that data is
   truncated after a crash and replicates nowhere, so archiving it would
   preserve rows PostgreSQL never promised to keep.

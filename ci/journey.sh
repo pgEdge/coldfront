@@ -6892,6 +6892,50 @@ story_config_values_rejected() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# Story: register, import and set refuse a partition column the table is not
+# partitioned on, naming the flag or key: a flat table's column must be its
+# partition key, and a 2-level table's a column it has. Stored, such a column
+# is ignored by the partitioner and used by the archiver in place of the key.
+# ───────────────────────────────────────────────────────────────────────────
+story_partition_column_checked() {
+    step "TC-271/TC-272: a partition column the table is not partitioned on is refused by name"
+    local rows="schema_name = 'public' AND table_name IN ('pcc', 'pcc2')"
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE $rows;
+               DROP TABLE IF EXISTS public.pcc, public.pcc2;
+               CREATE TABLE public.pcc (id bigint NOT NULL, ts timestamptz NOT NULL, val int, PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);
+               CREATE TABLE public.pcc2 (region text NOT NULL, ts timestamptz NOT NULL, PRIMARY KEY (region, ts)) PARTITION BY LIST (region);" >/dev/null
+    local po=(--table pcc --period monthly --retention "1 year")
+    local key='is not the partition key of public.pcc, which is partitioned by RANGE (ts)'
+
+    assert_refused "TC-271: archiver register names a --column the table lacks" "" \
+        "--column \"no_such_col\" $key" "$ARCHIVER" register "${po[@]}" --column no_such_col
+    assert_refused "TC-271: partitioner register names a --column the table lacks" "" \
+        "--column \"no_such_col\" $key" "$PARTITIONER" register "${po[@]}" --column no_such_col
+    assert_refused "TC-271: register names a --column that is not the partition key" "" \
+        "--column \"val\" $key" "$PARTITIONER" register "${po[@]}" --column val
+    assert_refused "TC-271: register names a 2-level --column the table lacks" "" \
+        '--column "no_such_col" is not a column of public.pcc2' \
+        "$PARTITIONER" register --table pcc2 --period monthly --retention "1 year" \
+            --column no_such_col --sub-values-source "SELECT 'eu'"
+    printf 'archiver: { tables: [ { source_table: pcc, partition_period: monthly, retention_period: "1 year", partition_column: no_such_col } ] }\n' >"$TMPD/pcc.yaml"
+    assert_refused "TC-271: import names a partition_column that is not the partition key" "" \
+        "partition_column \"no_such_col\" $key" "$PARTITIONER" import --config "$TMPD/pcc.yaml"
+    assert_eq "TC-271: no refused register or import wrote a row" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE $rows;")"
+
+    if ! "$PARTITIONER" register "${po[@]}" --column ts >"$TMPD/pcc-reg.log" 2>&1; then
+        fail "TC-272: register pcc --column ts (see $TMPD/pcc-reg.log)"; tail -3 "$TMPD/pcc-reg.log"; return
+    fi
+    local row="SELECT row(p.*)::text FROM coldfront.partition_config p WHERE schema_name = 'public' AND table_name = 'pcc';"
+    local before; before=$(q "$HOST" "$row")
+    assert_refused "TC-272: set names a --column that is not the partition key" "" \
+        "--column \"val\" $key" "$PARTITIONER" set --table pcc --column val
+    assert_eq "TC-272: the refused set left the row unchanged" "$before" "$(q "$HOST" "$row")"
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE $rows;
+               DROP TABLE public.pcc, public.pcc2;" >/dev/null
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Story — TC-114: TEMPORARY table invisible to archiver — register fails with
 # a "does not exist" error. TEMP tables are session-local; the archiver
 # connects in a new session and cannot see them.
@@ -7908,6 +7952,7 @@ if [ "$MODE" = "tiered" ]; then
     story_unmappable_column_rejected   # TC-150: column type with no Iceberg mapping rejected at register
     story_keyword_name_rejected        # TC-260..TC-263, TC-265: a table or column name DuckDB parses as a keyword refused on every path
     story_config_values_rejected       # TC-266..TC-269: register, set and import name a value partition_config's CHECKs refuse
+    story_partition_column_checked     # TC-271/TC-272: register, import and set refuse a column the table is not partitioned on
     story_quoted_table_names           # TC-140/TC-143/TC-144: dot, hyphen, space in table name
     story_temp_rejected                # TC-114: TEMP table invisible to archiver
     story_list_partition_rejected      # TC-115: LIST partition accepted at register; rejected at archive

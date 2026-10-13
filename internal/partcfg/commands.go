@@ -204,7 +204,7 @@ func registerToDB(ctx context.Context, connect func(context.Context) (*pgx.Conn,
 			return err
 		}
 	}
-	return writeRow(ctx, conn, row, dryRun)
+	return writeRow(ctx, conn, row, flagName, dryRun)
 }
 
 // validateDB is a *pgx.Conn or pgx.Tx: the union of the query methods the row
@@ -216,7 +216,9 @@ type validateDB interface {
 
 // validateRow is the ONE validation gate every partition_config write passes:
 // register, import, and set all run it, so no command can persist a row the
-// others would reject.
+// others would reject. name gives the flag or YAML key that a refusal names.
+//   - the partition column, when given, is the table's partition key, or a
+//     column of a 2-level table (see requirePartitionColumn).
 //   - PK-superset: the cutover keys delta capture by the source PK, so the PK
 //     must cover the partition key column(s). 2-level adds the RANGE column (the
 //     LIST column comes from the catalog).
@@ -228,7 +230,7 @@ type validateDB interface {
 //   - the table has no DEFAULT partition (see requireNoDefaultPartition).
 //   - tiered only: every column has an Iceberg type, and the table and every
 //     column have a name DuckDB can parse (see requireTierable).
-func validateRow(ctx context.Context, db validateDB, row configRow) error {
+func validateRow(ctx context.Context, db validateDB, row configRow, name func(key string) string) error {
 	// After the archiver's first-run swap the source is a VIEW over "_"+name, so
 	// validate the PK / partition key against the real partitioned table. register
 	// runs pre-swap and resolves to the source unchanged, so every writer (register
@@ -248,6 +250,9 @@ func validateRow(ctx context.Context, db validateDB, row configRow) error {
 	if err := requireNoDefaultPartition(ctx, db, row.schema, base); err != nil {
 		return err
 	}
+	if err := requirePartitionColumn(ctx, db, row.schema, row.table, base, row.column, row.subValues != "", name); err != nil {
+		return err
+	}
 	if err := validatePKSuperset(ctx, db, row.schema, base, row.column, row.subValues != ""); err != nil {
 		return err
 	}
@@ -255,6 +260,46 @@ func validateRow(ctx context.Context, db validateDB, row configRow) error {
 		return err
 	}
 	return partition.ValidatePeriods(ctx, db, row.hot, row.retention)
+}
+
+// requirePartitionColumn rejects a partition column the table is not
+// partitioned on. A flat table's column must be its partition key: the
+// partitioner premakes partitions by the table's own key, while the archiver
+// tiers by the stored column. A 2-level table's column, the RANGE key of LIST
+// children that may not exist yet, must be a column of the table. An empty
+// column is auto-detected at run time. The columns are read from base, the
+// partitioned table; a table that is not partitioned returns no row here, and
+// validatePKSuperset refuses it next.
+func requirePartitionColumn(ctx context.Context, db partition.RowQuerier, schema, table, base, column string,
+	twoLevel bool, name func(key string) string) error {
+	if column == "" {
+		return nil
+	}
+	var keydef string
+	var exists, isKey bool
+	err := db.QueryRow(ctx, `
+		SELECT pg_get_partkeydef(c.oid), a.attnum IS NOT NULL,
+		       coalesce(pt.partnatts = 1 AND pt.partattrs[0] = a.attnum, false)
+		FROM pg_partitioned_table pt
+		JOIN pg_class c ON c.oid = pt.partrelid
+		JOIN pg_namespace n ON n.oid = c.relnamespace
+		LEFT JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = $3::text
+		     AND a.attnum > 0 AND NOT a.attisdropped
+		WHERE n.nspname = $1::text AND c.relname = $2::text`, schema, base, column).Scan(&keydef, &exists, &isKey)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("read the partition key of %s.%s: %w", schema, table, err)
+	}
+	if twoLevel && !exists {
+		return fmt.Errorf("%s %q is not a column of %s.%s", name("partition_column"), column, schema, table)
+	}
+	if !twoLevel && !isKey {
+		return fmt.Errorf("%s %q is not the partition key of %s.%s, which is partitioned by %s",
+			name("partition_column"), column, schema, table, keydef)
+	}
+	return nil
 }
 
 // requireTierable rejects a tiered table the cold tier cannot hold: a column
@@ -379,8 +424,9 @@ func requireLogged(ctx context.Context, db partition.RowQuerier, schema, table s
 // (import over a transaction, so a bulk import is all-or-nothing), so an imported
 // table is checked exactly as a singly-registered one. The caller has already
 // ensured the config table exists (skipped under dryRun, which writes nothing).
-func writeRow(ctx context.Context, db validateDB, row configRow, dryRun bool) error {
-	if err := validateRow(ctx, db, row); err != nil {
+// name is passed through to validateRow.
+func writeRow(ctx context.Context, db validateDB, row configRow, name func(key string) string, dryRun bool) error {
+	if err := validateRow(ctx, db, row, name); err != nil {
 		return err
 	}
 	insertSQL := row.insertSQL()
@@ -411,11 +457,13 @@ func registerUsage(fs *flag.FlagSet) func() {
 	return func() {
 		_, _ = fmt.Fprint(fs.Output(), `register — add (or adopt) a partitioned table to partition lifecycle management.
 
-Validates the table is partitioned and that its PRIMARY KEY covers the partition
-key (required for race-safe cutover), then writes a coldfront.partition_config
-row. Lifecycle rules are checked before the write: structural rules here, with
-the table's CHECK constraints behind them, period syntax by the interval column
-type, and retention > hot-period by a calendar-aware interval comparison.
+Validates the table is partitioned, that --column, when given, is its partition
+key (on a 2-level table, one of its columns), and that its PRIMARY KEY covers
+the partition key (required for race-safe cutover), then writes a
+coldfront.partition_config row. Lifecycle rules are checked before the write:
+structural rules here, with the table's CHECK constraints behind them, period
+syntax by the interval column type, and retention > hot-period by a
+calendar-aware interval comparison.
 --hot-period / --retention accept any PostgreSQL interval (e.g. "1 month",
 "90 days", "1 year 2 mons").
 
@@ -877,7 +925,7 @@ func execSet(ctx context.Context, connect func(context.Context) (*pgx.Conn, erro
 		return err
 	}
 	if setTouchesValidatedField(fs) {
-		if err := validateRow(ctx, tx, rowFrom(row)); err != nil {
+		if err := validateRow(ctx, tx, rowFrom(row), flagName); err != nil {
 			return err
 		}
 	}
@@ -1055,7 +1103,7 @@ func importTables(ctx context.Context, conn *pgx.Conn, tables []config.TableConf
 // that fails. With dryRun it validates and writes nothing.
 func writeRows(ctx context.Context, db validateDB, tables []config.TableConfig, dryRun bool) error {
 	for _, t := range tables {
-		if err := writeRow(ctx, db, rowFrom(t), dryRun); err != nil {
+		if err := writeRow(ctx, db, rowFrom(t), func(key string) string { return key }, dryRun); err != nil {
 			return fmt.Errorf("import %s: %w", t.SourceTable, err)
 		}
 	}

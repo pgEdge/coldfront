@@ -190,6 +190,13 @@ this project adheres to
   the orphan step, after compaction had run. The compactor refuses a value of 0
   or less for either flag before it connects. The refusal names the flag and
   the values that it takes.
+- `register` stored a `--column` that was not the table's partition key, even
+  one that the table did not have. `set --column` and the `partition_column`
+  key on `import` did the same. The partitioner ignored the stored column, and
+  the archiver used it in place of the partition key. `register`, `set` and
+  `import` refuse such a column, naming the flag or key and the table's
+  partition key. On a two-level table, the commands refuse only a column that
+  the table lacks.
 - A bakery acknowledgement could outlive the claim it answered: a peer ruled
   dead acknowledged the claims it had missed once it caught up, and the rows
   stayed on every node. A node keeps an acknowledgement only while it still
