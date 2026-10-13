@@ -184,6 +184,12 @@ this project adheres to
   database the same way. `register`, `set` and `import` refuse every setting
   that the database refuses, naming the flag or key and the values that it
   takes; `set` checks the row that its change would leave.
+- The compactor accepted a `--target-size-mb` of 0 or less and used a default
+  target size instead. An `--orphan-age` of 0 let an orphan pass delete files
+  that a cold write had staged but not committed. A negative age failed only in
+  the orphan step, after compaction had run. The compactor refuses a value of 0
+  or less for either flag before it connects. The refusal names the flag and
+  the values that it takes.
 - A bakery acknowledgement could outlive the claim it answered: a peer ruled
   dead acknowledged the claims it had missed once it caught up, and the rows
   stayed on every node. A node keeps an acknowledgement only while it still

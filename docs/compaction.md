@@ -31,13 +31,13 @@ run and how aggressively each reclaims:
 
 | Flag | Default | Effect |
 |---|---|---|
-| `--target-size-mb N` | 128 | Sets the compaction target file size; files below 75% of it are rewritten. |
+| `--target-size-mb N` | 128 | Sets the compaction target file size; files below 75% of it are rewritten. The compactor refuses a value below 1. |
 | `--expire-snapshots` | off | Expires old snapshots and, by default, deletes the files they alone pinned. |
 | `--expire-older-than D` | 168h | With `--expire-snapshots`, expires snapshots older than D; lower the value to reclaim sooner, but keep it longer than any transaction that reads the table (see below). |
 | `--expire-retain-last N` | 1 | With `--expire-snapshots`, always keeps at least the N most recent snapshots. |
 | `--expire-keep-files` | off | With `--expire-snapshots`, expires metadata only and leaves the freed files for an `--orphans` pass. |
 | `--orphans` | off | Deletes files under the table location that no retained snapshot references. |
-| `--orphan-age D` | 72h | With `--orphans`, deletes only files older than D, which protects in-flight writes; never set the value to 0 in production. |
+| `--orphan-age D` | 72h | With `--orphans`, deletes only files older than D, which protects in-flight writes; the compactor refuses a value of 0 or less. |
 | `--version` |  | Prints the version and exits. |
 | `--dry-run` | off | Reports what each step would do and changes nothing; for snapshot expiry it stages the same expiry the real run commits and reports how many snapshots it would expire and keep. |
 

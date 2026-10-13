@@ -2314,7 +2314,10 @@ story_maintenance() {
         "$(grep -oE 'kept [0-9]+' $TMPD/expire.log | grep -oE '[0-9]+')"
 
     # The files those expired snapshots alone pinned are now orphans (referenced by nothing).
-    local orph; orph=$(compactor --table events --orphans --orphan-age 0s --dry-run 2>&1)
+    # --orphan-age 1s counts only files more than a second old; the wait puts every
+    # file the expiry orphaned past that age.
+    sleep 2
+    local orph; orph=$(compactor --table events --orphans --orphan-age 1s --dry-run 2>&1)
     local norph; norph=$(echo "$orph" | grep -oE '[0-9]+ orphan' | head -1 | grep -oE '[0-9]+')
     if [ "${norph:-0}" -gt 0 ]; then
         pass "TC-133: orphan deletion dry-run reports $norph candidate files (real backend, no prefix-mismatch)"
@@ -2322,13 +2325,13 @@ story_maintenance() {
         fail "TC-133: no orphans detected after expire-keep-files: $orph"; return
     fi
 
-    if compactor --table events --orphans --orphan-age 0s >$TMPD/orphans.log 2>&1; then
+    if compactor --table events --orphans --orphan-age 1s >$TMPD/orphans.log 2>&1; then
         pass "TC-133: orphan files deleted (bakery-serialized)"
     else
         fail "TC-133: orphan deletion failed — see $TMPD/orphans.log"; tail -8 $TMPD/orphans.log; return
     fi
 
-    local orph2; orph2=$(compactor --table events --orphans --orphan-age 0s --dry-run 2>&1)
+    local orph2; orph2=$(compactor --table events --orphans --orphan-age 1s --dry-run 2>&1)
     local norph2; norph2=$(echo "$orph2" | grep -oE '[0-9]+ orphan' | head -1 | grep -oE '[0-9]+')
     if [ "${norph2:-1}" -eq 0 ]; then
         pass "TC-133: no orphans remain after deletion"
@@ -6783,10 +6786,11 @@ EOSQL
 # assert_refused <label> <check> <needle> <command...>: the command must fail
 # saying <needle> before its value reaches the database (no SQLSTATE in its
 # output). <check> is the partition_config CHECK constraint the value would
-# otherwise have reached, collected in REFUSED_CHECKS.
+# otherwise have reached, collected in REFUSED_CHECKS; it is empty for a value
+# no constraint covers.
 assert_refused() {
     local label="$1" check="$2" needle="$3" out; shift 3
-    REFUSED_CHECKS+=("$check")
+    if [ -n "$check" ]; then REFUSED_CHECKS+=("$check"); fi
     if out=$("$@" 2>&1); then
         fail "$label: accepted"
     elif [[ "$out" == *SQLSTATE* ]]; then
@@ -7344,19 +7348,20 @@ story_compactor_error_paths() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────
-# Story — TC-134/TC-135: compactor advanced flags — combine all three
-# maintenance steps in one invocation and use a non-default --target-size-mb.
+# Story: TC-134/TC-135/TC-270, compactor advanced flags. All three maintenance
+# steps run in one invocation, a non-default --target-size-mb is accepted, and
+# a size or orphan age the compactor cannot honour is refused.
 # ───────────────────────────────────────────────────────────────────────────
 story_compactor_advanced() {
     require_compactor || return
-    step "TC-134/TC-135: compactor advanced flags — all-in-one and custom target size"
+    step "TC-134/TC-135/TC-270: compactor all-in-one run, custom target size and refused values"
 
     # TC-134: pass --expire-snapshots and --orphans together with compaction.
     # After story_maintenance the events cold tier has 1 snapshot and 0 orphans,
     # so each step is a no-op — but all three code paths must exit 0 together.
     if compactor --table events \
             --expire-snapshots --expire-older-than 0s --expire-retain-last 1 \
-            --orphans --orphan-age 0s >/dev/null 2>$TMPD/tc134.log; then
+            --orphans --orphan-age 1s >/dev/null 2>$TMPD/tc134.log; then
         pass "TC-134: compaction + expire-snapshots + orphans in one invocation exited 0"
     else
         fail "TC-134: all-in-one invocation failed — see $TMPD/tc134.log"
@@ -7373,6 +7378,20 @@ story_compactor_advanced() {
     else
         fail "TC-135: --target-size-mb 512 dry-run failed (exit $ec135): $out135"
     fi
+
+    # TC-270: a target below 1 MiB, one whose byte count overflows, and an orphan
+    # age of 0 or less, which reaches files a writer has staged but not committed,
+    # are refused by flag name before the compactor connects.
+    local v
+    for v in 0 -5 8796093022208; do
+        assert_refused "TC-270: --target-size-mb $v is refused" "" \
+            "--target-size-mb must be between 1 and 8796093022207, got $v" \
+            compactor --table events --target-size-mb "$v" --dry-run
+    done
+    for v in 0s -1h; do
+        assert_refused "TC-270: --orphan-age $v is refused" "" "--orphan-age must be positive" \
+            compactor --table events --orphans --orphan-age "$v" --dry-run
+    done
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -7900,7 +7919,7 @@ if [ "$MODE" = "tiered" ]; then
     story_partition_order_by_bound     # tier in bound order; refuse a non-empty stale partition
     story_schema_collision             # TC-138: same table name in two schemas — distinct Iceberg namespaces
     story_compactor_error_paths        # TC-126/TC-127: missing --table flag; nonexistent table
-    story_compactor_advanced           # TC-134/TC-135: all-in-one invocation; custom --target-size-mb
+    story_compactor_advanced           # TC-134/TC-135/TC-270: all-in-one invocation; custom and refused flag values
     story_compactor_wrong_creds        # TC-136: unreachable Lakekeeper endpoint rejected
     story_compactor_concurrent         # TC-137: concurrent compactors — bakery serialises both
     story_pg_restart                   # TC-063: PG restart; DuckDB secret reloads; cold reads work

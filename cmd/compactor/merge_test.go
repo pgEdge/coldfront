@@ -134,7 +134,7 @@ func TestRewriteSorted_MergesOverlappingRuns(t *testing.T) {
 	if !ok {
 		t.Fatal("sort column missing from schema")
 	}
-	if _, err := rewrite(ctx, tbl, &planResult{groups: groupsFor(t, ctx, tbl), sorted: true, sortKey: field}, 0); err != nil {
+	if _, err := rewrite(ctx, tbl, &planResult{groups: groupsFor(t, ctx, tbl), sorted: true, sortKey: field}, 128<<20); err != nil {
 		t.Fatalf("rewrite: %v", err)
 	}
 
@@ -163,7 +163,7 @@ func TestRewriteSorted_UnassignedRowsSortLast(t *testing.T) {
 	tbl = appendRun(t, ctx, tbl, []int64{3, 4}, []int32{2, -1})
 
 	field, _ := tbl.Schema().FindFieldByName("list")
-	if _, err := rewrite(ctx, tbl, &planResult{groups: groupsFor(t, ctx, tbl), sorted: true, sortKey: field}, 0); err != nil {
+	if _, err := rewrite(ctx, tbl, &planResult{groups: groupsFor(t, ctx, tbl), sorted: true, sortKey: field}, 128<<20); err != nil {
 		t.Fatalf("rewrite: %v", err)
 	}
 	merged, err := cat.LoadTable(ctx, catalog.ToIdentifier("ns", "t"))
@@ -189,7 +189,7 @@ func TestRewriteSorted_PreservesRowsWithNoSortableOrder(t *testing.T) {
 	tbl = appendRun(t, ctx, tbl, []int64{1, 2, 3}, []int32{4, 8, 12})
 
 	field, _ := tbl.Schema().FindFieldByName("list")
-	if _, err := rewrite(ctx, tbl, &planResult{groups: groupsFor(t, ctx, tbl), sorted: true, sortKey: field}, 0); err != nil {
+	if _, err := rewrite(ctx, tbl, &planResult{groups: groupsFor(t, ctx, tbl), sorted: true, sortKey: field}, 128<<20); err != nil {
 		t.Fatalf("rewrite: %v", err)
 	}
 	merged, err := cat.LoadTable(ctx, catalog.ToIdentifier("ns", "t"))
@@ -217,7 +217,7 @@ func TestRewriteSorted_RowsStayIntact(t *testing.T) {
 	tbl = appendRun(t, ctx, tbl, []int64{40, 50, 60}, []int32{1, 6, 11})
 
 	field, _ := tbl.Schema().FindFieldByName("list")
-	if _, err := rewrite(ctx, tbl, &planResult{groups: groupsFor(t, ctx, tbl), sorted: true, sortKey: field}, 0); err != nil {
+	if _, err := rewrite(ctx, tbl, &planResult{groups: groupsFor(t, ctx, tbl), sorted: true, sortKey: field}, 128<<20); err != nil {
 		t.Fatalf("rewrite: %v", err)
 	}
 	merged, err := cat.LoadTable(ctx, catalog.ToIdentifier("ns", "t"))
