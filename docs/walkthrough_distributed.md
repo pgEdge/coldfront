@@ -138,13 +138,19 @@ has to retry. ColdFront's bakery protocol prevents that: each cold write takes
 a globally-ordered ticket (replicated via Spock, verified in the TLA+ model
 under `docs/formal/`) and waits its turn.
 
+An `INSERT` adds new data files without changing existing rows. The `INSERT`
+uploads its Parquet files first and takes a claim on the table only for the
+commit. An `UPDATE`, `DELETE` or `MERGE` changes rows that already exist in the
+lake. These statements take the claim before reading the rows and hold the
+claim until the transaction commits.
+
 The bookkeeping is ordinary rows in `coldfront.claims` and
-`coldfront.claim_acks`, and a write's commit clears them, so the way to read
-them is to hold a transaction open. In one session on `db1`:
+`coldfront.claim_acks`, and a write's commit clears them. To read these rows,
+run an `UPDATE` in one session on `db1` and leave the transaction open:
 
 ```sql {"ignore":"true"}
 BEGIN;
-INSERT INTO events_lake VALUES (301, now(), 'held', '{"n":"db1"}');
+UPDATE events_lake SET status = 'held' WHERE id = 3;
 -- leave the transaction open
 ```
 
@@ -168,18 +174,17 @@ nodes (the Ricart-Agrawala rule):
 SELECT ticket, ack_from_name AS acked_by FROM coldfront.claim_acks;
 ```
 
-The row itself is not in the lake yet: the Iceberg snapshot is written when the
-transaction commits, under the claim, so on `db2` the count of rows with
-`id = 301` is still 0. Now `COMMIT` in the first session. The release deletes
-the claim and its acks, both deletes replicate, and the row is readable from
-`db2`:
+The change is not in the lake yet, because the commit writes the Iceberg
+snapshot under the claim. On `db2`, the row with `id = 3` still has the status
+`warn`. Next, run `COMMIT` in the first session on `db1`. The release deletes
+the claim and its acks, both deletes replicate, and `db2` reads the new status:
 
 ```sql {"ignore":"true"}
 -- On db2:
-SELECT (SELECT count(*) FROM coldfront.claims)           AS claims,
-       (SELECT count(*) FROM coldfront.claim_acks)       AS acks,
-       (SELECT count(*) FROM events_lake WHERE id = 301) AS rows_with_id_301;
--- 0 | 0 | 1
+SELECT (SELECT count(*) FROM coldfront.claims)       AS claims,
+       (SELECT count(*) FROM coldfront.claim_acks)   AS acks,
+       (SELECT status FROM events_lake WHERE id = 3) AS status_of_id_3;
+-- 0 | 0 | held
 ```
 
 Tickets are never reused, so an empty ledger is the steady state between

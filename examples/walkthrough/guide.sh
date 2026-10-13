@@ -306,17 +306,17 @@ hold_cold_write() {
         -v ON_ERROR_STOP=1 -q >"$HELD_DIR/log" 2>&1 <<EOF &
 BEGIN;
 $sql
-\\! touch "$HELD_DIR/inserted"
+\\! touch "$HELD_DIR/written"
 \\! until [ -f "$HELD_DIR/commit" ]; do sleep 0.2; done
 COMMIT;
 EOF
     HELD_PID=$!
     for (( i=0; i<150; i++ )); do
-        [ -f "$HELD_DIR/inserted" ] && return 0
+        [ -f "$HELD_DIR/written" ] && return 0
         kill -0 "$HELD_PID" 2>/dev/null || break
         sleep 0.2
     done
-    error "The held write did not complete its INSERT: $(tail -3 "$HELD_DIR/log" 2>/dev/null)"
+    error "The held write did not complete: $(tail -3 "$HELD_DIR/log" 2>/dev/null)"
     release_cold_write >/dev/null 2>&1
     return 1
 }
@@ -1388,17 +1388,20 @@ demo_distributed() {
     explain "serializes them cluster-wide: each write takes a globally-ordered ticket"
     explain "(Spock-replicated, TLA+-verified) and waits its turn. Every write lands, no retries."
     echo ""
-    explain "First, one write in slow motion. We open a transaction on db1, insert a row,"
+    explain "First, one write in slow motion. An INSERT only adds new files, so it uploads"
+    explain "its Parquet first and claims the table just for its commit. An UPDATE changes"
+    explain "rows already in the lake, so it claims the table before it reads them and"
+    explain "holds the claim until it commits. We open a transaction on db1, update a row,"
     explain "and hold the transaction open. The bakery's bookkeeping is ordinary rows in"
     explain "coldfront.claims and coldfront.claim_acks, and the write's commit clears them,"
     explain "so this is the moment to read them:"
     if [ "$NONINTERACTIVE" != 1 ]; then
-        show_cmd "psql (db1):  BEGIN; INSERT INTO events_lake VALUES (301, now(), 'held', '{\"n\":\"db1\"}');   -- held open, no COMMIT yet"
+        show_cmd "psql (db1):  BEGIN; UPDATE events_lake SET status = 'held' WHERE id = 3;   -- held open, no COMMIT yet"
         echo ""
         read -rp "Press Enter to open the transaction..." </dev/tty
         echo ""
     fi
-    hold_cold_write "$MESH_PG1_PORT" "INSERT INTO events_lake VALUES (301, now(), 'held', '{\"n\":\"db1\"}');" || return 1
+    hold_cold_write "$MESH_PG1_PORT" "UPDATE events_lake SET status = 'held' WHERE id = 3;" || return 1
     local node1 node2
     node1=$(mpg "$MESH_PG1_PORT" "SELECT current_setting('snowflake.node');")
     node2=$(mpg "$MESH_PG2_PORT" "SELECT current_setting('snowflake.node');")
@@ -1415,9 +1418,9 @@ demo_distributed() {
     explain "writers across nodes (the Ricart-Agrawala rule):"
     wait_for_value "$MESH_PG1_PORT" "SELECT count(*) FROM coldfront.claim_acks;" 1 "db2's ack did not reach db1."
     mshow db1 "$MESH_PG1_PORT" "SELECT ticket, ack_from_name AS acked_by, iceberg_table FROM coldfront.claim_acks;"
-    explain "The row itself is not in the lake yet: the Iceberg snapshot is written when the"
-    explain "transaction commits, under the claim. db2 cannot see it:"
-    mshow db2 "$MESH_PG2_PORT" "SELECT count(*) AS rows_with_id_301 FROM events_lake WHERE id = 301;"
+    explain "The change itself is not in the lake yet: the Iceberg snapshot is written when"
+    explain "the transaction commits, under the claim. db2 still reads the old status:"
+    mshow db2 "$MESH_PG2_PORT" "SELECT id, status FROM events_lake WHERE id = 3;"
     if [ "$NONINTERACTIVE" != 1 ]; then
         show_cmd "psql (db1):  COMMIT;"
         echo ""
@@ -1430,10 +1433,10 @@ demo_distributed() {
     fi
     explain "Committed. The release deletes the claim, its acks go with it, and both deletes"
     explain "replicate. Tickets are never reused, so an empty ledger is the steady state"
-    explain "between writes, and the row is now in the lake for db2 to read:"
+    explain "between writes, and the change is now in the lake for db2 to read:"
     wait_for_value "$MESH_PG2_PORT" "SELECT count(*) FROM coldfront.claims;" 0 "The release did not replicate to db2."
     mshow db1 "$MESH_PG1_PORT" "SELECT (SELECT count(*) FROM coldfront.claims) AS claims, (SELECT count(*) FROM coldfront.claim_acks) AS acks;"
-    mshow db2 "$MESH_PG2_PORT" "SELECT (SELECT count(*) FROM coldfront.claims) AS claims, (SELECT count(*) FROM coldfront.claim_acks) AS acks, (SELECT count(*) FROM events_lake WHERE id = 301) AS rows_with_id_301;"
+    mshow db2 "$MESH_PG2_PORT" "SELECT (SELECT count(*) FROM coldfront.claims) AS claims, (SELECT count(*) FROM coldfront.claim_acks) AS acks, (SELECT status FROM events_lake WHERE id = 3) AS status_of_id_3;"
     if [ "$NONINTERACTIVE" != 1 ]; then prompt_continue; fi
 
     explain "Now at full speed, with contention:"
