@@ -1035,7 +1035,7 @@ story_unstorable_values() {
         q "$HOST" "DROP VIEW IF EXISTS public.tcval_dec CASCADE;" >/dev/null 2>&1
         q "$HOST" "DROP TABLE IF EXISTS public._tcval CASCADE;" >/dev/null 2>&1
         q "$HOST" "DROP TABLE IF EXISTS public.tcval CASCADE;" >/dev/null 2>&1
-        q "$HOST" "DROP TABLE IF EXISTS public.tcval_src;" >/dev/null 2>&1
+        q "$HOST" "DROP TABLE IF EXISTS public.tcval_src, public.tcval_nan;" >/dev/null 2>&1
     }
     trap _tcval_cleanup RETURN
     qf "$HOST" <<'EOSQL' >/dev/null
@@ -1105,6 +1105,26 @@ EOSQL
         "$(q_may "$HOST" "UPDATE public.tcval SET due = '-infinity' WHERE $cold;")"
     assert_err "TC-237: and so is a cold INSERT of one into a timestamptz column" "Cannot write infinity" \
         "$(q_may "$HOST" "INSERT INTO public.tcval (ts, seen) VALUES ($m4 + interval '5 days', 'infinity');")"
+    # The INSERTs above call now(), so they write through the cold sink. One with
+    # no stable function streams its cold rows through DuckDB's postgres
+    # extension, which reads a numeric NaN as 0 (TC-234), so a numeric goes as
+    # its text and DuckDB's decimal cast refuses NaN there too, from VALUES, a
+    # table and COPY alike. An infinity crosses unchanged and duckdb-iceberg
+    # refuses it.
+    local m4lit; m4lit=$(q "$HOST" "SELECT ($m4 + interval '6 days')::text;")
+    q "$HOST" "CREATE TABLE public.tcval_nan (ts timestamptz, amount numeric(10,2)); INSERT INTO public.tcval_nan VALUES ('$m4lit', 'NaN');" >/dev/null
+    assert_contains "TC-233: a cold INSERT of literals streams" "_tiered_cold_stream(" \
+        "$(q "$HOST" "EXPLAIN (VERBOSE, COSTS OFF) INSERT INTO public.tcval (ts, amount) VALUES ('$m4lit', 'NaN');")"
+    assert_err "TC-233: a streamed cold INSERT of NaN is refused" "Could not convert string" \
+        "$(q_may "$HOST" "INSERT INTO public.tcval (ts, amount) VALUES ('$m4lit', 'NaN');")"
+    assert_contains "TC-233: so does a cold INSERT ... SELECT from a table" "_tiered_cold_stream(" \
+        "$(q "$HOST" "EXPLAIN (VERBOSE, COSTS OFF) INSERT INTO public.tcval (ts, amount) SELECT ts, amount FROM public.tcval_nan;")"
+    assert_err "TC-233: a streamed INSERT ... SELECT of NaN is refused" "Could not convert string" \
+        "$(q_may "$HOST" "INSERT INTO public.tcval (ts, amount) SELECT ts, amount FROM public.tcval_nan;")"
+    assert_err "TC-233: a COPY of a cold NaN is refused" "Could not convert string" \
+        "$(printf '%s,NaN\n' "$m4lit" | docker exec -i -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" "$HOST" "$CF_PSQL" -tA -c "COPY public.tcval (ts, amount) FROM STDIN WITH (FORMAT csv);" 2>&1)"
+    assert_err "TC-237: a streamed cold INSERT of infinity is refused" "Cannot write infinity" \
+        "$(q_may "$HOST" "INSERT INTO public.tcval (ts, due) VALUES ('$m4lit', 'infinity');")"
     # The same refusals in a decoupled table, whose every write runs in DuckDB.
     q "$HOST" "SELECT coldfront.create_iceberg_table('public','tcval_dec','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"amount\",\"type\":\"numeric(10,2)\"},{\"name\":\"due\",\"type\":\"date\"},{\"name\":\"seen\",\"type\":\"timestamptz\"}]'::jsonb);" >/dev/null
     q "$HOST" "INSERT INTO public.tcval_dec VALUES (1, 1.50, now(), now());" >/dev/null
@@ -1323,6 +1343,14 @@ EOSQL
         "$(q_may "$HOST" "PREPARE tcarr_bad(integer[]) AS UPDATE public.tcarr SET nums = \$1 WHERE id = 10; EXECUTE tcarr_bad('[0:1]={1,2}');")"
     assert_err "TC-245: a cold NaN element is refused" "Could not convert string" \
         "$(q_may "$HOST" "INSERT INTO public.tcarr (id, ts, amounts) VALUES (21, $m4 + interval '9 days', '{1,NaN}');")"
+    # Those INSERTs call now(), so they write through the cold sink; with a
+    # literal timestamp the cold rows stream (TC-233), and the stream refuses
+    # the same values.
+    local m4lit; m4lit=$(q "$HOST" "SELECT ($m4 + interval '9 days')::text;")
+    assert_err "TC-245: a streamed cold NaN element is refused" "Could not convert string" \
+        "$(q_may "$HOST" "INSERT INTO public.tcarr (id, ts, amounts) VALUES (21, '$m4lit', '{1,NaN}');")"
+    assert_err "TC-245: a streamed cold array numbered from 0 is refused" 'column "nums" holds an array of 1 dimension(s) starting at element 0' \
+        "$(q_may "$HOST" "INSERT INTO public.tcarr (id, ts, nums) VALUES (21, '$m4lit', '[0:1]={1,2}');")"
     assert_err "TC-245: a cold infinity element is refused" "Cannot write infinity" \
         "$(q_may "$HOST" "INSERT INTO public.tcarr (id, ts, days) VALUES (21, $m4 + interval '9 days', '{infinity}');")"
     assert_err "TC-245: and so is a timestamp one" "Cannot write infinity" \

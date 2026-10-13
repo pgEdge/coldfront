@@ -2337,7 +2337,10 @@ build_src_cte(Query *query, const char *source, const char *col_list,
  * would arrive as text, so it goes as real[]; jsonb and json are stored as
  * VARCHAR and go as their text. An interval is stored as VARCHAR too and goes
  * as coldfront._canonical_text's shape (build_cold_projection), the one text
- * both parsers read back as the same value.
+ * both parsers read back as the same value. A numeric, or an array of one, goes
+ * as its text: DuckDB's cast of that text to the Iceberg decimal refuses NaN,
+ * as it refuses the cold sink's literal, where the extension (duckdb-postgres
+ * 6b2b12ca, DuckDB v1.5.4) would read a numeric NaN as 0 (ci/journey.sh TC-234).
  */
 static const char *
 cf_stream_cast(const char *type)
@@ -2346,6 +2349,8 @@ cf_stream_cast(const char *type)
         return "::real[]";
     if (strcmp(type, "jsonb") == 0 || strcmp(type, "json") == 0)
         return "::text";
+    if (strncmp(type, "numeric", 7) == 0)
+        return pg_str_endswith(type, "[]") ? "::text[]" : "::text";
     return "";
 }
 

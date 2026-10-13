@@ -326,14 +326,16 @@ sequence for an omitted IDENTITY column and the DEFAULT expression for an
 omitted column that has one, so cold ids share the hot side's sequence. A
 vector column is sent as `real[]`, which the extension maps to the Iceberg
 `list<float>`, and a `jsonb`, `json` or `interval` column as its text, the
-form the Iceberg `VARCHAR` column holds. On a clustered table the cluster
-assignment leads the select list and orders the write, so each row group holds
-roughly one cluster. The last argument is the cold test: for a `SELECT` source
-an `EXISTS` over it, for a `VALUES` source the hot count against the row count,
-so an `INSERT` whose rows are all hot stages nothing and takes no claim.
-`cold_rows` is `NULL` when the rows streamed, since DuckDB keeps that count,
-and the count otherwise: `0` for an all-hot `INSERT`, the sink's count after
-the fallback below.
+form the Iceberg `VARCHAR` column holds. A `numeric` column, or an array of
+one, is sent as its text, which DuckDB casts to the Iceberg decimal: the
+extension reads a `numeric` `NaN` as `0`, while the cast refuses `NaN` as the
+cold sink does. On a clustered table the cluster assignment leads the select
+list and orders the write, so each row group holds roughly one cluster. The
+last argument is the cold test: for a `SELECT` source an `EXISTS` over it, for
+a `VALUES` source the hot count against the row count, so an `INSERT` whose
+rows are all hot stages nothing and takes no claim. `cold_rows` is `NULL` when
+the rows streamed, since DuckDB keeps that count, and the count otherwise: `0`
+for an all-hot `INSERT`, the sink's count after the fallback below.
 
 The query is deparsed with an empty `search_path`, so every relation, function
 and operator is schema-qualified whatever the second session's path is, and

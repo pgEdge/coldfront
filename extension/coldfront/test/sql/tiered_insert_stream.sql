@@ -110,7 +110,42 @@ RESET coldfront.cold_write_batch_size;
 SELECT status, count(*) FROM public.cf_stream_hot WHERE status LIKE 'copy%' GROUP BY status;
 SELECT status, count(*) FROM public.cf_stream_cold WHERE status LIKE 'copy%' GROUP BY status;
 
--- (6) Sources the hook sends to the sink in one pass: a volatile function, a
+-- (6) A numeric streams as its text, which DuckDB casts to the decimal column,
+--     so a NaN is refused as the cold sink refuses it, as a value and as an
+--     element, from VALUES, a table and COPY alike. Sent as a numeric, DuckDB's
+--     postgres extension would read it as 0 (ci/journey.sh TC-234).
+CREATE FUNCTION pg_temp.cf_streams(p_sql text) RETURNS boolean LANGUAGE plpgsql AS $$
+DECLARE l text;
+BEGIN
+    FOR l IN EXECUTE 'EXPLAIN (COSTS OFF, VERBOSE) ' || p_sql LOOP
+        IF position('_tiered_cold_stream(' IN l) > 0 THEN RETURN true; END IF;
+    END LOOP;
+    RETURN false;
+END $$;
+SELECT duckdb.raw_query('CREATE TEMP TABLE cf_stream_num (ts TIMESTAMPTZ, amount DECIMAL(10,2), amounts DECIMAL(10,2)[])') IS NOT NULL AS created;
+CREATE TABLE public._cf_stream_num (ts timestamptz NOT NULL, amount numeric(10,2), amounts numeric(10,2)[]);
+CREATE VIEW public.cf_stream_num AS SELECT * FROM public._cf_stream_num;
+INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
+VALUES ('public', 'cf_stream_num', 'public._cf_stream_num', 'temp.main.cf_stream_num', 'ts');
+INSERT INTO coldfront.archive_watermark(schema_name, table_name, cutoff_time)
+VALUES ('public', 'cf_stream_num', '2026-03-01'::timestamptz);
+CREATE TABLE public.cf_staging_num (ts timestamptz, amount numeric(10,2));
+INSERT INTO public.cf_staging_num VALUES ('2026-01-05', 'NaN');
+SELECT pg_temp.cf_streams($q$INSERT INTO public.cf_stream_num (ts, amount) VALUES ('2026-01-03', 'NaN')$q$) AS values_streams,
+       pg_temp.cf_streams($q$INSERT INTO public.cf_stream_num (ts, amount) SELECT ts, amount FROM public.cf_staging_num$q$) AS select_streams;
+INSERT INTO public.cf_stream_num VALUES ('2026-01-01', 12345678.95, '{1.5,NULL,-2.25}'), ('2026-01-02', -0.01, '{}');
+\set VERBOSITY terse
+INSERT INTO public.cf_stream_num (ts, amount) VALUES ('2026-01-03', 'NaN');
+INSERT INTO public.cf_stream_num (ts, amounts) VALUES ('2026-01-04', '{1,NaN}');
+INSERT INTO public.cf_stream_num (ts, amount) SELECT ts, amount FROM public.cf_staging_num;
+COPY public.cf_stream_num (ts, amount) FROM stdin WITH (FORMAT csv);
+2026-01-06 00:00:00+00,NaN
+\.
+\set VERBOSITY default
+SELECT r['ts']::timestamptz AS ts, r['amount']::text AS amount, r['amounts']::text AS amounts
+  FROM duckdb.query('SELECT ts, amount::VARCHAR AS amount, amounts::VARCHAR AS amounts FROM temp.main.cf_stream_num ORDER BY ts') AS t(r);
+
+-- (7) Sources the hook sends to the sink in one pass: a volatile function, a
 --     stable one, a temporary table, a WITH entry, a view that calls a stable
 --     function, a table this transaction wrote, a transaction that is not READ
 --     COMMITTED, and a session without local_pg_dsn.
@@ -148,6 +183,6 @@ DEALLOCATE cf_prep;
 DROP VIEW public.cf_now_view, public.cf_stream_hot, public.cf_stream_cold, public.cf_stream_ids;
 DELETE FROM coldfront.tiered_views;
 DELETE FROM coldfront.archive_watermark;
-DROP VIEW public.cf_stream;
-DROP TABLE public._cf_stream, public.cf_staging, cf_tmp;
+DROP VIEW public.cf_stream, public.cf_stream_num;
+DROP TABLE public._cf_stream, public.cf_staging, cf_tmp, public._cf_stream_num, public.cf_staging_num;
 RESET coldfront.local_pg_dsn;
