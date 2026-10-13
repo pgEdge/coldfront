@@ -370,7 +370,7 @@ jobs:
                   source packaging/coldfront-duckdb-extensions/common.sh
                   echo "version=${DUCKDB_VERSION}" >> "$GITHUB_OUTPUT"
             - name: Download built extensions
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: duckdb-ext-${{ matrix.arch }}
                   path: ext
@@ -458,7 +458,7 @@ jobs:
                   echo "after:  $(df -h / | awk 'NR==2{print $4" free"}')"
             - name: Stage binaries tarball (coldfront-bin only)
               if: matrix.component_name == 'packaging/coldfront-bin'
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: release-artifacts
                   path: go-dist
@@ -556,7 +556,7 @@ jobs:
                   echo "after:  $(df -h / | awk 'NR==2{print $4" free"}')"
             - name: Stage binaries tarball (coldfront-bin only)
               if: matrix.component_name == 'packaging/coldfront-bin'
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: release-artifacts
                   path: go-dist
@@ -630,7 +630,7 @@ jobs:
                   IMAGE: ${{ matrix.image }}
               run: echo "os_version=${IMAGE##*:}" >> "$GITHUB_OUTPUT"
             - name: Stage prebuilt extensions (${{ matrix.arch }})
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: duckdb-ext-${{ matrix.arch }}
                   path: release-artifacts/duckdb-extensions
@@ -693,7 +693,7 @@ jobs:
                   IMAGE: ${{ matrix.image }}
               run: echo "distro=${IMAGE##*:}" >> "$GITHUB_OUTPUT"
             - name: Stage prebuilt extensions (${{ matrix.arch }})
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   name: duckdb-ext-${{ matrix.arch }}
                   path: release-artifacts/duckdb-extensions
@@ -755,7 +755,7 @@ jobs:
               id: ts
               run: echo "dnf_ts=$(date -u +'%Y%m%d-%H%M%S')" >> "$GITHUB_OUTPUT"
             - name: Download all RPM cell artifacts
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   pattern: rpm__*
                   path: rpm-artifacts
@@ -836,7 +836,7 @@ jobs:
               id: ts
               run: echo "apt_ts=$(date -u +'%Y%m%d-%H%M%S')" >> "$GITHUB_OUTPUT"
             - name: Download all DEB cell artifacts
-              uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+              uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
               with:
                   pattern: deb__*
                   path: deb-artifacts
