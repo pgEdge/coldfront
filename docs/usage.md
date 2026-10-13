@@ -955,7 +955,10 @@ as array elements too. A tiered table's hot table has a check constraint named
 `coldfront_guard_<column>` on each column of those types and on each array
 column; an `INSERT` or `UPDATE` that stores one of the values fails with an
 error that names the constraint. A write that goes to the cold tier, in either
-mode, is refused by DuckDB.
+mode, is refused by DuckDB, unless the write reads the value from a PostgreSQL
+table, as
+[Reading a PostgreSQL Table in a Cold-Tier Write](#reading-a-postgresql-table-in-a-cold-tier-write)
+describes.
 
 The archiver adds the constraints at the first archive pass that tiers a
 partition of the table, and validates them once that pass's bootstrap
@@ -968,12 +971,6 @@ table, so an `ADD COLUMN` whose default the constraint refuses, such as
 `DEFAULT 'NaN'`, fails. A renamed column's constraint takes the new column
 name, and a column whose name is longer than 47 bytes gets a constraint named
 after a hash of the name.
-
-A cold `UPDATE ... FROM`, a `MERGE` whose source is a PostgreSQL table, and an
-`INSERT ... SELECT` into a decoupled table read that PostgreSQL table through
-DuckDB's postgres extension, which reads a `numeric` `NaN` as `0` and drops an
-array's lower bound. ColdFront cannot refuse those values on that path, so
-filter them out of such a source.
 
 `char(N)` is stored and read as `varchar`. The data round-trips losslessly:
 values, comparisons, and `length()` match a hot PG table, where `length()`
@@ -1058,14 +1055,17 @@ refuses an array with more than one dimension or with a lower bound other than
 1, such as `'[0:2]={1,2,3}'`. The hot table's check constraint refuses such an
 array when it is written. A write to the cold tier refuses it too: a tiered
 `INSERT` with an error that names the column, and a bound parameter with an
-error that names no column. A tiered table with a column declared with more
-than one dimension, such as `integer[][]`, passes registration and is refused
-at its first archive pass, because pg_duckdb reads a column by its declared
-dimensions; a decoupled table refuses such a column when it is created. A
-decoupled table's array type is spelled as its element type followed by `[]`,
-such as `integer[]`; the spellings `integer[3]` and `integer ARRAY` are
-refused. `ALTER TABLE ... ADD COLUMN` cannot add an array column to a tiered
-table, because duckdb-iceberg does not add a nested column to an Iceberg table.
+error that names no column. A write that reads the array from a PostgreSQL
+table stores it renumbered from 1 instead, as
+[Reading a PostgreSQL Table in a Cold-Tier Write](#reading-a-postgresql-table-in-a-cold-tier-write)
+describes. A tiered table with a column declared with more than one dimension,
+such as `integer[][]`, passes registration and is refused at its first archive
+pass, because pg_duckdb reads a column by its declared dimensions; a decoupled
+table refuses such a column when it is created. A decoupled table's array type
+is spelled as its element type followed by `[]`, such as `integer[]`; the
+spellings `integer[3]` and `integer ARRAY` are refused.
+`ALTER TABLE ... ADD COLUMN` cannot add an array column to a tiered table,
+because duckdb-iceberg does not add a nested column to an Iceberg table.
 
 A tiered `INSERT` accepts an array in any spelling, because its source runs in
 PostgreSQL. A cold `UPDATE` and a decoupled `INSERT` run in DuckDB, which does
@@ -1083,10 +1083,83 @@ following array operations work there:
 A brace literal and a bound array parameter fail in such a read, as they do for
 a vector, and so does `cardinality()`, which DuckDB defines for maps only.
 
+### Reading a PostgreSQL Table in a Cold-Tier Write
+
+A cold-tier write that reads an ordinary PostgreSQL table can store a value
+that differs from the value in that table, without raising an error.
+
+!!! warning "Such a write stores a numeric NaN as 0"
+
+    When a cold-tier write reads a `numeric` value from a PostgreSQL table, the
+    write stores a `NaN` from that table in the cold tier as `0`. ColdFront
+    raises no error, so check the source table before the write, as this
+    section shows.
+
+The following writes read a PostgreSQL table this way:
+
+- an `INSERT ... SELECT` from a PostgreSQL table into a decoupled table.
+- an `UPDATE ... FROM` or a `DELETE ... USING` that names a PostgreSQL table,
+  on a decoupled table or on the cold rows of a tiered table.
+- a `MERGE` whose source is a PostgreSQL table, on a decoupled table or on the
+  cold tier of a tiered table.
+
+ColdFront runs these writes in DuckDB, and DuckDB reads the PostgreSQL table
+through its `postgres` extension. As the extension reads the table, it changes
+two kinds of value:
+
+- a `numeric` `NaN`, which the extension reads as `0`, also inside an array.
+- an array that starts at an element other than 1, which the extension
+  renumbers from 1, so `'[0:1]={7,8}'` arrives as `{7,8}`.
+
+The write stores the changed value, and the conditions of the write compare the
+changed value. PostgreSQL treats a `NaN` as greater than every number, so
+`s.amount > 100` holds for a `NaN` in PostgreSQL, but in such a write the
+condition sees `0` and does not hold. A condition that names `NaN`, such as
+`s.amount <> 'NaN'`, fails in such a write, because DuckDB does not accept
+`'NaN'` as a `numeric` value.
+
+The extension reads the following values unchanged:
+
+- a `real` or `double precision` `NaN`, `Infinity` or `-Infinity`.
+- a `date`, `timestamp` or `timestamptz` `infinity` or `-infinity`, which the
+  write then refuses to store, as every write to the cold tier does.
+
+The following writes refuse these values instead:
+
+- an `INSERT` or `COPY` into a tiered table, because PostgreSQL runs its source
+  and ColdFront hands each `numeric` value to DuckDB as text, so DuckDB refuses
+  a `NaN` and ColdFront refuses an array that does not start at 1.
+- a write to the hot rows of a tiered table, because PostgreSQL runs that
+  write, and the check constraints of the hot table refuse both values.
+- a `NaN` written as a literal or as a bound parameter, because DuckDB refuses
+  `'NaN'` as a `numeric` value.
+
+To keep these values out of the cold tier, check the source table in PostgreSQL
+before the write, and fix or remove the rows that the check finds. The
+following query counts those rows in a source table `staging` with a `numeric`
+column `amount`, a `numeric` array `amounts` and an array `tags`:
+
+```sql
+SELECT count(*)
+  FROM staging
+ WHERE amount = 'NaN'
+    OR 'NaN' = ANY (amounts)
+    OR array_lower(tags, 1) <> 1;
+```
+
+In the query, list every `numeric` column of your source table as `amount` is
+listed, every `numeric` array as `amounts` is, and every array column as `tags`
+is. A count of `0` means that the write stores those columns unchanged.
+
 ## Caveats
 
 Keep the following caveats in mind when running either mode:
 
+- A cold-tier write that reads an ordinary PostgreSQL table, such as an
+  `UPDATE ... FROM` or a `MERGE` from one, stores a `numeric` `NaN` from that
+  table as `0` and stores an array renumbered to start at 1, with no error.
+  [Reading a PostgreSQL Table in a Cold-Tier Write](#reading-a-postgresql-table-in-a-cold-tier-write)
+  lists the writes that do this and shows how to check a source table first.
 - `jsonb` reads come back as `json`. The `->`/`->>` operators work, and
   ColdFront translates the `::jsonb` cast, `jsonb_array_length`,
   `jsonb_build_object` / `jsonb_agg` and `date_bin`; other jsonb operators and

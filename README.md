@@ -249,6 +249,13 @@ warehouse creation otherwise fails with HTTP 409 ("This endpoint does not
 support BlobStorageEvents or SoftDelete"). Disable those features on the
 storage account before using it as a cold tier.
 
+A cold-tier write that reads an ordinary PostgreSQL table, such as an
+`UPDATE ... FROM` or a `MERGE` from one, stores a `numeric` `NaN` from that
+table as `0` and stores an array renumbered to start at 1, with no error. The
+[Using ColdFront](docs/usage.md#reading-a-postgresql-table-in-a-cold-tier-write)
+guide lists the writes that do this and shows how to check a source table
+first.
+
 ## Project Structure
 
 The repository is laid out as follows:
