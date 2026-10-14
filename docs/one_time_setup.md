@@ -249,4 +249,5 @@ superusers can then run DuckDB.
 [Connecting to ColdFront](connecting.md#least-privilege-application-roles)
 lists what it grants.
 
-For a real cloud-S3 setup, see [object_store.md](object_store.md).
+For a real cloud-S3 setup, see
+[Configuring your Object Store](object_store.md).

@@ -20,7 +20,8 @@ The following PostgreSQL column types are supported:
 - `numeric(P,S)` (P ≤ 38).
 - `jsonb` / `json`.
 - `interval`.
-- `vector(N)` / `halfvec(N)` (pgvector; see [usage_vectors.md](usage_vectors.md)).
+- `vector(N)` / `halfvec(N)` (pgvector; see
+  [Working with Embeddings](usage_vectors.md)).
 - one-dimensional arrays of most of these types (see
   [Supported Array Types](#supported-array-types)).
 

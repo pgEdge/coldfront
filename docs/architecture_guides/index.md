@@ -7,10 +7,11 @@ rewrites reads and writes to hit the right tier, and **all Iceberg I/O goes
 through `pg_duckdb` running in-process inside PostgreSQL** - no external query
 engine, no Go Iceberg libraries.
 
-For mode-specific design, see [architecture_tiered.md](../architecture_tiered.md)
-(hot PG + cold Iceberg) ·
-[architecture_decoupled.md](../architecture_decoupled.md) (all-Iceberg) ·
-[architecture_vectors.md](../architecture_vectors.md) (vector storage).
+For mode-specific design, see
+[Tiered Operating Mode](../architecture_tiered.md) (hot PostgreSQL plus cold
+Iceberg),
+[Decoupled (Iceberg-Only) Operating Mode](../architecture_decoupled.md), and
+[Vector Storage Architecture](../architecture_vectors.md).
 
 ## Operating Modes and Topologies
 
@@ -33,8 +34,8 @@ path in the hook takes, mostly through `_exec_iceberg_with_claim`. Decoupled
 mode always classifies as `TIER_COLD` and never reaches `emit_hot`; vanilla and
 mesh differ only in how that claim serializes cold writes. This document covers
 the shared mechanics and the tiered path; see
-[architecture_decoupled.md](../architecture_decoupled.md) for the decoupled mode's
-ACID model and distributed scaling story.
+[Decoupled (Iceberg-Only) Operating Mode](../architecture_decoupled.md) for the
+decoupled mode's ACID model and distributed scaling story.
 
 ### Read Target: Primary or Physical Standby
 
@@ -106,7 +107,7 @@ How rows move through this depends on the storage mode: the tiered hot heap +
 archiver + `UNION ALL` data-flow is in the
 [Data Flow](../architecture_tiered.md#data-flow) section of the Tiered Mode page;
 the all-Iceberg flow is in
-[architecture_decoupled.md](../architecture_decoupled.md).
+[Decoupled (Iceberg-Only) Operating Mode](../architecture_decoupled.md).
 
 ## Core Mechanics: pg_duckdb
 
@@ -290,7 +291,7 @@ How the hook splits a write is mode-specific:
   in the Tiered Mode page.
 - In decoupled mode, the hook always classifies `TIER_COLD`, so every write is
   a single-tier Iceberg write. See
-  [architecture_decoupled.md](../architecture_decoupled.md).
+  [Decoupled (Iceberg-Only) Operating Mode](../architecture_decoupled.md).
 
 ### Cold-Tier DML from Inside PL/pgSQL (Functions, DO Blocks, Triggers)
 
@@ -359,7 +360,7 @@ The following table shows the two orderings:
 | Ordering | Applies to | Behavior |
 |---|---|---|
 | stock (default) | every write on stock upstream duckdb-iceberg; a `DELETE`, `UPDATE` or `MERGE` (the cross-tier move and `vector_train`'s assignment included) on every build | The writer takes the serializer first, *then* uploads parquet and commits inside it. On an unpatched binary this is what keeps a second writer from capturing a stale parent. A write that references rows the table holds needs it on every build: its position deletes name data files by path, and a compaction or another such write committing between its scan and its commit would rewrite or remove those files, after which the deletes apply to nothing and the rows come back. |
-| async (both GUCs `on`) | appends (`INSERT`, `COPY`, the archiver's exports, the tiered `INSERT`'s cold sink) on the patched build (`iceberg-bakery-aware-commit-refresh-v15.patch`) | The statement uploads its parquet and queues the claim; the extension's transaction callback takes it at PRE_COMMIT, just before pg_duckdb's own PRE_COMMIT callback commits the Iceberg transaction, and releases it at COMMIT. Uploads overlap on one node and across nodes, an open transaction blocks no other writer, and only the short commit POST is serialized. A new data file conflicts with nothing committed in between. An append to a clustered table is checked at commit against the live centroid generation and fails with `serialization_failure` if a retrain replaced it (see [architecture_vectors.md](../architecture_vectors.md)). |
+| async (both GUCs `on`) | appends (`INSERT`, `COPY`, the archiver's exports, the tiered `INSERT`'s cold sink) on the patched build (`iceberg-bakery-aware-commit-refresh-v15.patch`) | The statement uploads its parquet and queues the claim; the extension's transaction callback takes it at PRE_COMMIT, just before pg_duckdb's own PRE_COMMIT callback commits the Iceberg transaction, and releases it at COMMIT. Uploads overlap on one node and across nodes, an open transaction blocks no other writer, and only the short commit POST is serialized. A new data file conflicts with nothing committed in between. An append to a clustered table is checked at commit against the live centroid generation and fails with `serialization_failure` if a retrain replaced it (see [Vector Storage Architecture](../architecture_vectors.md)). |
 
 For every write but a clustered table's append, the code path and the
 application-visible behavior are identical, so the GUCs are a performance knob;
@@ -521,7 +522,7 @@ mode (the archiver those with a `hot_period`, the partitioner those without),
 and exit with an error when they find none; tables enter it via `register`, or
 from a YAML `archiver.tables` list fed to `import`. Both expose a management
 CLI - `register` / `list` / `set` / `remove` / `import` / `export` - documented
-in [usage_partitioner.md](../usage_partitioner.md#managing-partitioned-tables-cli).
+in [Managing Partitioned Tables (CLI)](../usage_partitioner.md#managing-partitioned-tables-cli).
 
 ## Known Limitations
 

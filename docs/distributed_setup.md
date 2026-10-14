@@ -77,8 +77,8 @@ action: by that node's next cold write, to any table, by a peer's arriving
 claim, or by the waiting peer's poke, a no-op `UPDATE` of its own claim row
 about once a second for as long as it waits. That poke is the only replication
 traffic the bakery generates while a writer waits, and there is none when
-nothing waits. See [architecture_decoupled.md](architecture_decoupled.md),
-*Orphan reaping*.
+nothing waits. See *Orphan reaping* in
+[The Bakery Protocol](architecture_decoupled.md#concurrency-horizontal-scaling-the-bakery-protocol).
 
 Sync-rep (`synchronous_standby_names`) is **not required** by the bakery - the
 R-A ack barrier (the wait, before a claim commits, for every live peer to

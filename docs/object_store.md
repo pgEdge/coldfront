@@ -44,7 +44,7 @@ S3, and GCS):
 > credentials instead, where the warehouse issues short-lived per-table
 > credentials at access time. Vended credentials are available for AWS S3
 > and Azure ADLS Gen2, but not for GCS or other S3-compatible stores; see
-> [vended_credentials.md](vended_credentials.md).
+> [Using Vended Credentials](vended_credentials.md).
 
 For AWS S3 and S3-compatible stores, grant the key permission to read,
 write, and list the bucket (`GetObject` / `PutObject` / `DeleteObject` /
@@ -71,8 +71,8 @@ DuckDB never aborts a failed multipart upload, so add an
 `AbortIncompleteMultipartUpload` lifecycle rule to the bucket to delete
 leftover parts.
 
-You also need the ColdFront image, built once by following
-[installation.md](installation.md), which notes the registry access the
+You also need the ColdFront image, built once by following the steps in
+[Installing ColdFront](installation.md), which notes the registry access the
 base image needs. Run the commands below from the repo root.
 
 No prior ColdFront knowledge is required to perform the steps on this
@@ -240,9 +240,10 @@ SELECT coldfront.set_storage_secret('AKIAEXAMPLE...', '<your-secret-key>', NULL,
     that shape for cloud S3.
 
 A vended-credentials variant is also available. To run ColdFront with no stored
-credential ([vended_credentials.md](vended_credentials.md)), the warehouse issues
-per-table temporary credentials from AWS Security Token Service (STS) instead
-of handing the client a static key. Two things change from the warehouse above.
+credential (see [Using Vended Credentials](vended_credentials.md)), the
+warehouse issues per-table temporary credentials from AWS Security Token
+Service (STS) instead of handing the client a static key. Two things change
+from the warehouse above.
 
 First, create an IAM role scoped to the bucket. Lakekeeper assumes the role per
 table and vends the resulting short-lived key, secret, and session token to

@@ -22,7 +22,7 @@ requirements. Keep the following in mind when running either mode:
   decoupled table sees the transaction's own writes on both tiers. The held
   snapshot is also why the compactor's `--expire-older-than` must stay longer
   than the longest transaction that reads the table (see
-  [compaction.md](compaction.md)).
+  [Compacting the Cold Tier](compaction.md)).
 - One transaction block cannot hold both a PostgreSQL write and a cold-tier
   write unless `duckdb.unsafe_allow_mixed_transactions` is on. pg_duckdb
   refuses the pair ("Writing to DuckDB and Postgres tables in the same
@@ -55,7 +55,7 @@ requirements. Keep the following in mind when running either mode:
   GUC (the node's loopback, a unix-socket DSN), and a one-time
   `SELECT coldfront.ensure_replicated()` call on every node after Spock mesh
   setup; see
-  [architecture_decoupled.md](architecture_decoupled.md#concurrency-horizontal-scaling-the-bakery-protocol).
+  [The Bakery Protocol](architecture_decoupled.md#concurrency-horizontal-scaling-the-bakery-protocol).
   Sync-rep is **not** required. The throughput ceiling is Lakekeeper's commit
   rate, not the writer count.
 - For direct table access, `_events` is the hot heap (tiered mode only).

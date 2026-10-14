@@ -32,8 +32,8 @@ Vending requires a Lakekeeper warehouse configured to vend credentials:
 - On AWS S3, the warehouse uses `flavor: aws` with `sts-enabled: true`, an
   `assume-role-arn` for a bucket-scoped IAM role, and an `external-id` on the
   warehouse credential that the role's trust policy also requires. The full
-  warehouse and IAM-role setup is in
-  [object_store.md](object_store.md#configuring-lakekeeper).
+  warehouse and IAM-role setup is in the Configuring Lakekeeper section of
+  [Configuring your Object Store](object_store.md#configuring-lakekeeper).
 - On Azure ADLS Gen2, the warehouse is an `adls` warehouse with `sas-enabled`
   (on by default). Lakekeeper vends a per-container SAS token; the warehouse
   credential can be a `shared-access-key`, `client-credentials`, or
