@@ -27,7 +27,7 @@ The following PostgreSQL column types are supported:
 Other data types (unbounded `numeric`, `xml`, `tsvector`, range/multirange types,
 custom enums, composite types, pgvector's `sparsevec`, `inet`, `cidr`, `oid`,
 and the arrays that [Supported Array Types](#supported-array-types) lists
-as refused at registration) is
+as refused at registration) are
 rejected when a tiered table is registered, and when a decoupled table is
 created. ColdFront refuses silent fallback to `varchar` - losing
 precision/identity is worse than no support. `inet`/`cidr`/`oid` are
@@ -42,7 +42,8 @@ A few supported types need a closer look:
   value in a `date`, `timestamp with time zone` or `timestamp without time
   zone` column, as array elements too. ColdFront refuses those values with
   a check constraint named `coldfront_guard_<column>`; a write that goes to
-  the cold tier, in either mode, is refused by DuckDB.
+  the cold tier, in either mode, is refused by DuckDB, unless the write reads a
+  `numeric` `NaN` from a PostgreSQL table and stores it as `0`.
 - `char(N)` is stored and read as `varchar`. Values, comparisons, and
   `length()` round-trip losslessly, but a cold read comes back unpadded
   with `pg_typeof varchar`, because pg_duckdb has no fixed-length `char`
@@ -66,11 +67,31 @@ refuses, such as `DEFAULT 'NaN'`, fails. A renamed column's constraint takes
 the new column name, and a column whose name is longer than 47 bytes gets a
 constraint named after a hash of the name.
 
-A cold `UPDATE ... FROM`, a `MERGE` whose source is a PostgreSQL table, and an
-`INSERT ... SELECT` into a decoupled table read that PostgreSQL table through
-DuckDB's postgres extension, which reads a `numeric` `NaN` as `0` and drops an
-array's lower bound. ColdFront cannot refuse those values on that path, so
-filter them out of such a source.
+A cold `UPDATE ... FROM` or `DELETE ... USING`, a `MERGE` whose source is a
+PostgreSQL table, and an `INSERT ... SELECT` into a decoupled table read that
+PostgreSQL table through DuckDB's postgres extension, which reads a `numeric`
+`NaN` as `0`, also inside an array, and drops an array's lower bound. ColdFront
+cannot refuse those values on that path: the write stores the changed values
+with no error, and its conditions compare the changed values. A condition that
+names `'NaN'` fails in such a write, because DuckDB does not accept `'NaN'` as
+a `numeric` value. To keep those values out of the cold tier, check the source
+table in PostgreSQL before the write, and fix or remove the rows that hold
+them.
+
+The following query counts those rows in a source table `staging` with a
+`numeric` column `amount`, a `numeric` array `amounts` and an array `tags`:
+
+```sql
+SELECT count(*)
+  FROM staging
+ WHERE amount = 'NaN'
+    OR 'NaN' = ANY (amounts)
+    OR array_lower(tags, 1) <> 1;
+```
+
+List every `numeric` column, `numeric` array and array column of your source
+table the same way; a count of `0` means that the write stores those columns
+unchanged.
 
 Queries like `data->>'key'` and `data->'key'` work against `jsonb`, and
 ColdFront translates the `::jsonb` cast, `jsonb_array_length`,
@@ -138,8 +159,9 @@ refuses an array with more than one dimension or with a lower bound other than
 1, such as `'[0:2]={1,2,3}'`. The hot table's check constraint refuses such an
 array when it is written. A write to the cold tier refuses it too: a tiered
 `INSERT` with an error that names the column, and a bound parameter with an
-error that names no column. A tiered table with a column declared with more
-than one dimension, such as `integer[][]`, passes registration and is refused
+error that names no column. A write that reads the array from a PostgreSQL
+table stores it renumbered from 1 instead. A tiered table with a column
+declared with more than one dimension, such as `integer[][]`, passes registration and is refused
 at its first archive pass, because pg_duckdb reads a column by its declared
 dimensions; a decoupled table refuses such a column when it is created. A
 decoupled table's array type is spelled as its element type followed by `[]`,

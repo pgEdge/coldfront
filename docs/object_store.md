@@ -25,8 +25,11 @@ profile differ by backend:
   [HMAC key pair](https://cloud.google.com/storage/docs/authentication/hmackeys)
   (GCS has no native Lakekeeper profile; it is configured as an S3
   backend pointed at GCS's S3-interoperability endpoint).
-- **Azure ADLS Gen2** needs a storage account, a filesystem (container)
-  in that account, and the account's access key.
+- **Azure ADLS Gen2** needs a storage account with hierarchical namespace
+  enabled (for example, `az storage account create --hns true`), a filesystem
+  (container) in that account, and the account's access key. A StorageV2
+  account without hierarchical namespace is not an ADLS Gen2 account, and
+  Lakekeeper's `adls` warehouse fails on it.
 
 For any backend that takes a long-term key (S3-compatible, virtual-hosted
 S3, and GCS):

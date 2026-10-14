@@ -1035,7 +1035,7 @@ story_unstorable_values() {
         q "$HOST" "DROP VIEW IF EXISTS public.tcval_dec CASCADE;" >/dev/null 2>&1
         q "$HOST" "DROP TABLE IF EXISTS public._tcval CASCADE;" >/dev/null 2>&1
         q "$HOST" "DROP TABLE IF EXISTS public.tcval CASCADE;" >/dev/null 2>&1
-        q "$HOST" "DROP TABLE IF EXISTS public.tcval_src;" >/dev/null 2>&1
+        q "$HOST" "DROP TABLE IF EXISTS public.tcval_src, public.tcval_nan;" >/dev/null 2>&1
     }
     trap _tcval_cleanup RETURN
     qf "$HOST" <<'EOSQL' >/dev/null
@@ -1105,6 +1105,26 @@ EOSQL
         "$(q_may "$HOST" "UPDATE public.tcval SET due = '-infinity' WHERE $cold;")"
     assert_err "TC-237: and so is a cold INSERT of one into a timestamptz column" "Cannot write infinity" \
         "$(q_may "$HOST" "INSERT INTO public.tcval (ts, seen) VALUES ($m4 + interval '5 days', 'infinity');")"
+    # The INSERTs above call now(), so they write through the cold sink. One with
+    # no stable function streams its cold rows through DuckDB's postgres
+    # extension, which reads a numeric NaN as 0 (TC-234), so a numeric goes as
+    # its text and DuckDB's decimal cast refuses NaN there too, from VALUES, a
+    # table and COPY alike. An infinity crosses unchanged and duckdb-iceberg
+    # refuses it.
+    local m4lit; m4lit=$(q "$HOST" "SELECT ($m4 + interval '6 days')::text;")
+    q "$HOST" "CREATE TABLE public.tcval_nan (ts timestamptz, amount numeric(10,2)); INSERT INTO public.tcval_nan VALUES ('$m4lit', 'NaN');" >/dev/null
+    assert_contains "TC-233: a cold INSERT of literals streams" "_tiered_cold_stream(" \
+        "$(q "$HOST" "EXPLAIN (VERBOSE, COSTS OFF) INSERT INTO public.tcval (ts, amount) VALUES ('$m4lit', 'NaN');")"
+    assert_err "TC-233: a streamed cold INSERT of NaN is refused" "Could not convert string" \
+        "$(q_may "$HOST" "INSERT INTO public.tcval (ts, amount) VALUES ('$m4lit', 'NaN');")"
+    assert_contains "TC-233: so does a cold INSERT ... SELECT from a table" "_tiered_cold_stream(" \
+        "$(q "$HOST" "EXPLAIN (VERBOSE, COSTS OFF) INSERT INTO public.tcval (ts, amount) SELECT ts, amount FROM public.tcval_nan;")"
+    assert_err "TC-233: a streamed INSERT ... SELECT of NaN is refused" "Could not convert string" \
+        "$(q_may "$HOST" "INSERT INTO public.tcval (ts, amount) SELECT ts, amount FROM public.tcval_nan;")"
+    assert_err "TC-233: a COPY of a cold NaN is refused" "Could not convert string" \
+        "$(printf '%s,NaN\n' "$m4lit" | docker exec -i -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" "$HOST" "$CF_PSQL" -tA -c "COPY public.tcval (ts, amount) FROM STDIN WITH (FORMAT csv);" 2>&1)"
+    assert_err "TC-237: a streamed cold INSERT of infinity is refused" "Cannot write infinity" \
+        "$(q_may "$HOST" "INSERT INTO public.tcval (ts, due) VALUES ('$m4lit', 'infinity');")"
     # The same refusals in a decoupled table, whose every write runs in DuckDB.
     q "$HOST" "SELECT coldfront.create_iceberg_table('public','tcval_dec','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"amount\",\"type\":\"numeric(10,2)\"},{\"name\":\"due\",\"type\":\"date\"},{\"name\":\"seen\",\"type\":\"timestamptz\"}]'::jsonb);" >/dev/null
     q "$HOST" "INSERT INTO public.tcval_dec VALUES (1, 1.50, now(), now());" >/dev/null
@@ -1156,6 +1176,78 @@ EOSQL
         "$(q_may "$HOST" "ALTER TABLE public._tcval ADD COLUMN fee numeric(10,2) DEFAULT 'NaN';")"
     assert_eq "TC-231: and neither tier has the column" "0|0" \
         "$(q "$HOST" "SELECT count(*) FROM pg_attribute WHERE attrelid = 'public._tcval'::regclass AND attname = 'fee';")|$(q "$HOST" "SELECT coldfront.ensure_attached(); SELECT count(*) FROM duckdb.query('DESCRIBE ice.public.tcval') AS t(r) WHERE r['column_name']::text = 'fee';" | tail -1)"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story: TC-273, a tab or a newline inside a string literal reaches either tier
+# unchanged through every rewritten write: a hot-only, a cold and a dual-tier
+# UPDATE, a tiered INSERT through the cold sink and through the stream, a write
+# nested in a WITH entry, and a decoupled INSERT. Each value is compared with
+# the one PostgreSQL makes of the same literal, both read raw.
+# ───────────────────────────────────────────────────────────────────────────
+story_whitespace_in_value() {
+    step "TC-273: a literal's tabs and newlines survive every rewritten write"
+    local cold="ts < date_trunc('month',now()) - interval '3 months'"
+    local hot="date_trunc('month',now()) - interval '1 month'"
+    local m4="date_trunc('month',now()) - interval '4 months'"
+    _tcws_cleanup() {
+        q "$HOST" "SELECT coldfront.drop_iceberg_table('public','tcws', true);" >/dev/null 2>&1
+        q "$HOST" "SELECT coldfront.drop_iceberg_table('public','tcws_dec', true);" >/dev/null 2>&1
+        q "$HOST" "DELETE FROM coldfront.tiered_views WHERE relname IN ('tcws','tcws_dec'); DELETE FROM coldfront.archive_watermark WHERE table_name='tcws'; DELETE FROM coldfront.partition_config WHERE table_name='tcws';" >/dev/null 2>&1
+        q "$HOST" "DROP VIEW IF EXISTS public.tcws CASCADE;" >/dev/null 2>&1
+        q "$HOST" "DROP VIEW IF EXISTS public.tcws_dec CASCADE;" >/dev/null 2>&1
+        q "$HOST" "DROP TABLE IF EXISTS public._tcws CASCADE;" >/dev/null 2>&1
+        q "$HOST" "DROP TABLE IF EXISTS public.tcws CASCADE;" >/dev/null 2>&1
+    }
+    trap _tcws_cleanup RETURN
+    qf "$HOST" <<'EOSQL' >/dev/null
+CREATE TABLE public.tcws (id bigint NOT NULL, ts timestamptz NOT NULL, note text,
+                          PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);
+DO $do$ DECLARE m date; BEGIN
+  FOREACH m IN ARRAY ARRAY[(date_trunc('month',now()) - interval '4 months')::date,
+                           (date_trunc('month',now()) - interval '1 month')::date] LOOP
+    EXECUTE format('CREATE TABLE public.%I PARTITION OF public.tcws FOR VALUES FROM (%L) TO (%L)',
+                   'tcws_p_' || to_char(m, 'YYYY_MM'), m, m + interval '1 month');
+  END LOOP; END $do$;
+INSERT INTO public.tcws VALUES
+  (1, date_trunc('month',now()) - interval '4 months' + interval '3 days', 'cold'),
+  (2, date_trunc('month',now()) - interval '1 month' + interval '1 day', 'hot');
+EOSQL
+    if ! "$ARCHIVER" register --table tcws --column ts --period monthly \
+            --hot-period "$(hot_days) days" >"$TMPD/tcws.log" 2>&1; then
+        fail "TC-273: register tcws (see $TMPD/tcws.log)"; tail -5 "$TMPD/tcws.log"; return
+    fi
+    if ! archive_only "schema_name='public' AND table_name='tcws'" "$TMPD/tcws.log"; then
+        fail "TC-273: archive tcws (see $TMPD/tcws.log)"; tail -5 "$TMPD/tcws.log"; return
+    fi
+    local want want2 note="SELECT note FROM public.tcws WHERE id ="
+    want=$(q "$HOST" "SELECT E'tab\\there nl\\nhere';")
+    want2=$(q "$HOST" "SELECT E'dual\\tx\\ny';")
+    q "$HOST" "UPDATE public.tcws SET note = E'tab\\there nl\\nhere' WHERE ts >= $hot AND id = 2;" >/dev/null
+    assert_eq "TC-273: a hot-only UPDATE" "$want" "$(q "$HOST" "$note 2;")"
+    q "$HOST" "UPDATE public.tcws SET note = E'tab\\there nl\\nhere' WHERE $cold AND id = 1;" >/dev/null
+    assert_eq "TC-273: a cold UPDATE" "$want" "$(q "$HOST" "$note 1;")"
+    q "$HOST" "UPDATE public.tcws SET note = E'dual\\tx\\ny' WHERE id IN (1, 2);" >/dev/null
+    assert_eq "TC-273: a dual-tier UPDATE, on both tiers" "$want2"$'\n'"$want2" \
+        "$(q "$HOST" "SELECT note FROM public.tcws WHERE id IN (1, 2) ORDER BY id;")"
+    # now() in the VALUES sends the INSERT through the cold sink; literal
+    # timestamps let it stream.
+    q "$HOST" "INSERT INTO public.tcws VALUES (3, $m4 + interval '5 days', E'tab\\there nl\\nhere'), (4, $hot + interval '2 days', E'tab\\there nl\\nhere');" >/dev/null
+    assert_eq "TC-273: a tiered INSERT through the cold sink, on both tiers" "$want"$'\n'"$want" \
+        "$(q "$HOST" "SELECT note FROM public.tcws WHERE id IN (3, 4) ORDER BY id;")"
+    local m4lit hotlit
+    m4lit=$(q "$HOST" "SELECT ($m4 + interval '6 days')::text;")
+    hotlit=$(q "$HOST" "SELECT ($hot + interval '3 days')::text;")
+    q "$HOST" "INSERT INTO public.tcws VALUES (5, '$m4lit', E'tab\\there nl\\nhere'), (6, '$hotlit', E'tab\\there nl\\nhere');" >/dev/null
+    assert_eq "TC-273: a tiered INSERT through the stream, on both tiers" "$want"$'\n'"$want" \
+        "$(q "$HOST" "SELECT note FROM public.tcws WHERE id IN (5, 6) ORDER BY id;")"
+    q "$HOST" "WITH i AS (INSERT INTO public.tcws VALUES (7, '$hotlit', E'tab\\there nl\\nhere')) SELECT 1;" >/dev/null
+    assert_eq "TC-273: an INSERT nested in a WITH entry" "$want" "$(q "$HOST" "$note 7;")"
+    q "$HOST" "WITH u AS (UPDATE public.tcws SET note = E'tab\\there nl\\nhere' WHERE $cold AND id = 1) SELECT 1;" >/dev/null
+    assert_eq "TC-273: a cold UPDATE nested in a WITH entry" "$want" "$(q "$HOST" "$note 1;")"
+    q "$HOST" "SELECT coldfront.create_iceberg_table('public', 'tcws_dec', '[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"note\",\"type\":\"text\"}]'::jsonb);
+               INSERT INTO public.tcws_dec VALUES (1, E'tab\\there nl\\nhere');" >/dev/null
+    assert_eq "TC-273: a decoupled INSERT" "$want" "$(q "$HOST" "SELECT note FROM public.tcws_dec WHERE id = 1;")"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -1323,6 +1415,14 @@ EOSQL
         "$(q_may "$HOST" "PREPARE tcarr_bad(integer[]) AS UPDATE public.tcarr SET nums = \$1 WHERE id = 10; EXECUTE tcarr_bad('[0:1]={1,2}');")"
     assert_err "TC-245: a cold NaN element is refused" "Could not convert string" \
         "$(q_may "$HOST" "INSERT INTO public.tcarr (id, ts, amounts) VALUES (21, $m4 + interval '9 days', '{1,NaN}');")"
+    # Those INSERTs call now(), so they write through the cold sink; with a
+    # literal timestamp the cold rows stream (TC-233), and the stream refuses
+    # the same values.
+    local m4lit; m4lit=$(q "$HOST" "SELECT ($m4 + interval '9 days')::text;")
+    assert_err "TC-245: a streamed cold NaN element is refused" "Could not convert string" \
+        "$(q_may "$HOST" "INSERT INTO public.tcarr (id, ts, amounts) VALUES (21, '$m4lit', '{1,NaN}');")"
+    assert_err "TC-245: a streamed cold array numbered from 0 is refused" 'column "nums" holds an array of 1 dimension(s) starting at element 0' \
+        "$(q_may "$HOST" "INSERT INTO public.tcarr (id, ts, nums) VALUES (21, '$m4lit', '[0:1]={1,2}');")"
     assert_err "TC-245: a cold infinity element is refused" "Cannot write infinity" \
         "$(q_may "$HOST" "INSERT INTO public.tcarr (id, ts, days) VALUES (21, $m4 + interval '9 days', '{infinity}');")"
     assert_err "TC-245: and so is a timestamp one" "Cannot write infinity" \
@@ -1378,9 +1478,9 @@ EOSQL
     q "$HOST" "SELECT coldfront.create_iceberg_table('public','tcarr_dec','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"tags\",\"type\":\"text[]\"},{\"name\":\"nums\",\"type\":\"integer[]\"},{\"name\":\"amounts\",\"type\":\"numeric(10,2)[]\"}]'::jsonb);" >/dev/null
     assert_eq "TC-249: the decoupled view reads the arrays as arrays" "text[]|integer[]|numeric(10,2)[]" \
         "$(q "$HOST" "SELECT string_agg(format_type(atttypid, atttypmod), '|' ORDER BY attnum) FROM pg_attribute WHERE attrelid = 'public.tcarr_dec'::regclass AND attname IN ('tags', 'nums', 'amounts');")"
-    q "$HOST" "INSERT INTO public.tcarr_dec VALUES (1, ARRAY['with,comma', NULL, 'back\\slash', 'a''b'], ARRAY[1, NULL], ARRAY[1.25]);" >/dev/null
+    q "$HOST" "INSERT INTO public.tcarr_dec VALUES (1, ARRAY['with,comma', NULL, 'back\\slash', 'a''b', E'tab\\tx', E'nl\\nx'], ARRAY[1, NULL], ARRAY[1.25]);" >/dev/null
     assert_eq "TC-249: an INSERT of ARRAY[...] literals reads back unchanged" \
-        "$(q "$HOST" "SELECT ARRAY['with,comma', NULL, 'back\\slash', 'a''b'], ARRAY[1, NULL], ARRAY[1.25]::numeric(10,2)[];")" \
+        "$(q "$HOST" "SELECT ARRAY['with,comma', NULL, 'back\\slash', 'a''b', E'tab\\tx', E'nl\\nx'], ARRAY[1, NULL], ARRAY[1.25]::numeric(10,2)[];")" \
         "$(q "$HOST" "SELECT tags, nums, amounts FROM public.tcarr_dec WHERE id = 1;")"
     q "$HOST" "PREPARE tcarr_dec_set(text[]) AS UPDATE public.tcarr_dec SET tags = \$1 WHERE id = 1; EXECUTE tcarr_dec_set('{p,\"q r\"}');" >/dev/null
     assert_eq "TC-249: an UPDATE with a bound array parameter" '{p,"q r"}' \
@@ -2314,7 +2414,10 @@ story_maintenance() {
         "$(grep -oE 'kept [0-9]+' $TMPD/expire.log | grep -oE '[0-9]+')"
 
     # The files those expired snapshots alone pinned are now orphans (referenced by nothing).
-    local orph; orph=$(compactor --table events --orphans --orphan-age 0s --dry-run 2>&1)
+    # --orphan-age 1s counts only files more than a second old; the wait puts every
+    # file the expiry orphaned past that age.
+    sleep 2
+    local orph; orph=$(compactor --table events --orphans --orphan-age 1s --dry-run 2>&1)
     local norph; norph=$(echo "$orph" | grep -oE '[0-9]+ orphan' | head -1 | grep -oE '[0-9]+')
     if [ "${norph:-0}" -gt 0 ]; then
         pass "TC-133: orphan deletion dry-run reports $norph candidate files (real backend, no prefix-mismatch)"
@@ -2322,13 +2425,13 @@ story_maintenance() {
         fail "TC-133: no orphans detected after expire-keep-files: $orph"; return
     fi
 
-    if compactor --table events --orphans --orphan-age 0s >$TMPD/orphans.log 2>&1; then
+    if compactor --table events --orphans --orphan-age 1s >$TMPD/orphans.log 2>&1; then
         pass "TC-133: orphan files deleted (bakery-serialized)"
     else
         fail "TC-133: orphan deletion failed — see $TMPD/orphans.log"; tail -8 $TMPD/orphans.log; return
     fi
 
-    local orph2; orph2=$(compactor --table events --orphans --orphan-age 0s --dry-run 2>&1)
+    local orph2; orph2=$(compactor --table events --orphans --orphan-age 1s --dry-run 2>&1)
     local norph2; norph2=$(echo "$orph2" | grep -oE '[0-9]+ orphan' | head -1 | grep -oE '[0-9]+')
     if [ "${norph2:-1}" -eq 0 ]; then
         pass "TC-133: no orphans remain after deletion"
@@ -6783,10 +6886,11 @@ EOSQL
 # assert_refused <label> <check> <needle> <command...>: the command must fail
 # saying <needle> before its value reaches the database (no SQLSTATE in its
 # output). <check> is the partition_config CHECK constraint the value would
-# otherwise have reached, collected in REFUSED_CHECKS.
+# otherwise have reached, collected in REFUSED_CHECKS; it is empty for a value
+# no constraint covers.
 assert_refused() {
     local label="$1" check="$2" needle="$3" out; shift 3
-    REFUSED_CHECKS+=("$check")
+    if [ -n "$check" ]; then REFUSED_CHECKS+=("$check"); fi
     if out=$("$@" 2>&1); then
         fail "$label: accepted"
     elif [[ "$out" == *SQLSTATE* ]]; then
@@ -6885,6 +6989,50 @@ story_config_values_rejected() {
         "$(printf '%s\n' "${REFUSED_CHECKS[@]}" | LC_ALL=C sort -u | paste -sd' ' -)"
     q "$HOST" "DELETE FROM coldfront.partition_config WHERE schema_name = 'public' AND table_name = 'cfv';
                DROP TABLE public.cfv;" >/dev/null
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story: register, import and set refuse a partition column the table is not
+# partitioned on, naming the flag or key: a flat table's column must be its
+# partition key, and a 2-level table's a column it has. Stored, such a column
+# is ignored by the partitioner and used by the archiver in place of the key.
+# ───────────────────────────────────────────────────────────────────────────
+story_partition_column_checked() {
+    step "TC-271/TC-272: a partition column the table is not partitioned on is refused by name"
+    local rows="schema_name = 'public' AND table_name IN ('pcc', 'pcc2')"
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE $rows;
+               DROP TABLE IF EXISTS public.pcc, public.pcc2;
+               CREATE TABLE public.pcc (id bigint NOT NULL, ts timestamptz NOT NULL, val int, PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);
+               CREATE TABLE public.pcc2 (region text NOT NULL, ts timestamptz NOT NULL, PRIMARY KEY (region, ts)) PARTITION BY LIST (region);" >/dev/null
+    local po=(--table pcc --period monthly --retention "1 year")
+    local key='is not the partition key of public.pcc, which is partitioned by RANGE (ts)'
+
+    assert_refused "TC-271: archiver register names a --column the table lacks" "" \
+        "--column \"no_such_col\" $key" "$ARCHIVER" register "${po[@]}" --column no_such_col
+    assert_refused "TC-271: partitioner register names a --column the table lacks" "" \
+        "--column \"no_such_col\" $key" "$PARTITIONER" register "${po[@]}" --column no_such_col
+    assert_refused "TC-271: register names a --column that is not the partition key" "" \
+        "--column \"val\" $key" "$PARTITIONER" register "${po[@]}" --column val
+    assert_refused "TC-271: register names a 2-level --column the table lacks" "" \
+        '--column "no_such_col" is not a column of public.pcc2' \
+        "$PARTITIONER" register --table pcc2 --period monthly --retention "1 year" \
+            --column no_such_col --sub-values-source "SELECT 'eu'"
+    printf 'archiver: { tables: [ { source_table: pcc, partition_period: monthly, retention_period: "1 year", partition_column: no_such_col } ] }\n' >"$TMPD/pcc.yaml"
+    assert_refused "TC-271: import names a partition_column that is not the partition key" "" \
+        "partition_column \"no_such_col\" $key" "$PARTITIONER" import --config "$TMPD/pcc.yaml"
+    assert_eq "TC-271: no refused register or import wrote a row" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.partition_config WHERE $rows;")"
+
+    if ! "$PARTITIONER" register "${po[@]}" --column ts >"$TMPD/pcc-reg.log" 2>&1; then
+        fail "TC-272: register pcc --column ts (see $TMPD/pcc-reg.log)"; tail -3 "$TMPD/pcc-reg.log"; return
+    fi
+    local row="SELECT row(p.*)::text FROM coldfront.partition_config p WHERE schema_name = 'public' AND table_name = 'pcc';"
+    local before; before=$(q "$HOST" "$row")
+    assert_refused "TC-272: set names a --column that is not the partition key" "" \
+        "--column \"val\" $key" "$PARTITIONER" set --table pcc --column val
+    assert_eq "TC-272: the refused set left the row unchanged" "$before" "$(q "$HOST" "$row")"
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE $rows;
+               DROP TABLE public.pcc, public.pcc2;" >/dev/null
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -7344,19 +7492,20 @@ story_compactor_error_paths() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────
-# Story — TC-134/TC-135: compactor advanced flags — combine all three
-# maintenance steps in one invocation and use a non-default --target-size-mb.
+# Story: TC-134/TC-135/TC-270, compactor advanced flags. All three maintenance
+# steps run in one invocation, a non-default --target-size-mb is accepted, and
+# a size or orphan age the compactor cannot honour is refused.
 # ───────────────────────────────────────────────────────────────────────────
 story_compactor_advanced() {
     require_compactor || return
-    step "TC-134/TC-135: compactor advanced flags — all-in-one and custom target size"
+    step "TC-134/TC-135/TC-270: compactor all-in-one run, custom target size and refused values"
 
     # TC-134: pass --expire-snapshots and --orphans together with compaction.
     # After story_maintenance the events cold tier has 1 snapshot and 0 orphans,
     # so each step is a no-op — but all three code paths must exit 0 together.
     if compactor --table events \
             --expire-snapshots --expire-older-than 0s --expire-retain-last 1 \
-            --orphans --orphan-age 0s >/dev/null 2>$TMPD/tc134.log; then
+            --orphans --orphan-age 1s >/dev/null 2>$TMPD/tc134.log; then
         pass "TC-134: compaction + expire-snapshots + orphans in one invocation exited 0"
     else
         fail "TC-134: all-in-one invocation failed — see $TMPD/tc134.log"
@@ -7373,6 +7522,20 @@ story_compactor_advanced() {
     else
         fail "TC-135: --target-size-mb 512 dry-run failed (exit $ec135): $out135"
     fi
+
+    # TC-270: a target below 1 MiB, one whose byte count overflows, and an orphan
+    # age of 0 or less, which reaches files a writer has staged but not committed,
+    # are refused by flag name before the compactor connects.
+    local v
+    for v in 0 -5 8796093022208; do
+        assert_refused "TC-270: --target-size-mb $v is refused" "" \
+            "--target-size-mb must be between 1 and 8796093022207, got $v" \
+            compactor --table events --target-size-mb "$v" --dry-run
+    done
+    for v in 0s -1h; do
+        assert_refused "TC-270: --orphan-age $v is refused" "" "--orphan-age must be positive" \
+            compactor --table events --orphans --orphan-age "$v" --dry-run
+    done
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -7821,6 +7984,7 @@ if [ "$MODE" = "tiered" ]; then
     story_types
     story_unstorable_values # TC-231..TC-237: NaN and infinity refused where they are written
     story_arrays            # TC-238..TC-251: arrays tier as Iceberg lists
+    story_whitespace_in_value # TC-273: a literal's tabs and newlines survive every rewritten write
     story_vector            # embeddings: vector → list<float> over all three cold-write paths
     story_writes
     story_compaction        # iceberg-go RewriteDataFiles; the manifest-list
@@ -7889,6 +8053,7 @@ if [ "$MODE" = "tiered" ]; then
     story_unmappable_column_rejected   # TC-150: column type with no Iceberg mapping rejected at register
     story_keyword_name_rejected        # TC-260..TC-263, TC-265: a table or column name DuckDB parses as a keyword refused on every path
     story_config_values_rejected       # TC-266..TC-269: register, set and import name a value partition_config's CHECKs refuse
+    story_partition_column_checked     # TC-271/TC-272: register, import and set refuse a column the table is not partitioned on
     story_quoted_table_names           # TC-140/TC-143/TC-144: dot, hyphen, space in table name
     story_temp_rejected                # TC-114: TEMP table invisible to archiver
     story_list_partition_rejected      # TC-115: LIST partition accepted at register; rejected at archive
@@ -7900,7 +8065,7 @@ if [ "$MODE" = "tiered" ]; then
     story_partition_order_by_bound     # tier in bound order; refuse a non-empty stale partition
     story_schema_collision             # TC-138: same table name in two schemas — distinct Iceberg namespaces
     story_compactor_error_paths        # TC-126/TC-127: missing --table flag; nonexistent table
-    story_compactor_advanced           # TC-134/TC-135: all-in-one invocation; custom --target-size-mb
+    story_compactor_advanced           # TC-134/TC-135/TC-270: all-in-one invocation; custom and refused flag values
     story_compactor_wrong_creds        # TC-136: unreachable Lakekeeper endpoint rejected
     story_compactor_concurrent         # TC-137: concurrent compactors — bakery serialises both
     story_pg_restart                   # TC-063: PG restart; DuckDB secret reloads; cold reads work

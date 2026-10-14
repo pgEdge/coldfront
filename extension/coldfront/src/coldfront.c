@@ -1359,15 +1359,32 @@ find_dml_prefix(const char *orig_sql, const char *search_unqual,
     return NULL; /* unreachable */
 }
 
-/* pg_get_querydef's text on one line: newlines and tabs become spaces, and the
- * leading indent goes. */
+/* pg_get_querydef's text on one line: a newline outside quotes becomes a
+ * space, and the leading indent goes. A literal or a quoted identifier keeps
+ * its newlines and tabs: the deparser quotes with '' and "" only, doubles a
+ * quote inside and never escapes one, and emits no tab of its own. */
 static char *
 deparse_flat(Query *query)
 {
     char *sql = pg_get_querydef(query, false), *p;
+    char  quote = 0;
 
     for (p = sql; *p; p++)
-        if (*p == '\n' || *p == '\t') *p = ' ';
+    {
+        if (quote)
+        {
+            if (*p != quote)
+                continue;
+            if (p[1] == quote)
+                p++;
+            else
+                quote = 0;
+        }
+        else if (*p == '\'' || *p == '"')
+            quote = *p;
+        else if (*p == '\n')
+            *p = ' ';
+    }
     while (*sql == ' ')
         sql++;
     return sql;
@@ -2337,7 +2354,10 @@ build_src_cte(Query *query, const char *source, const char *col_list,
  * would arrive as text, so it goes as real[]; jsonb and json are stored as
  * VARCHAR and go as their text. An interval is stored as VARCHAR too and goes
  * as coldfront._canonical_text's shape (build_cold_projection), the one text
- * both parsers read back as the same value.
+ * both parsers read back as the same value. A numeric, or an array of one, goes
+ * as its text: DuckDB's cast of that text to the Iceberg decimal refuses NaN,
+ * as it refuses the cold sink's literal, where the extension (duckdb-postgres
+ * 6b2b12ca, DuckDB v1.5.4) would read a numeric NaN as 0 (ci/journey.sh TC-234).
  */
 static const char *
 cf_stream_cast(const char *type)
@@ -2346,6 +2366,8 @@ cf_stream_cast(const char *type)
         return "::real[]";
     if (strcmp(type, "jsonb") == 0 || strcmp(type, "json") == 0)
         return "::text";
+    if (strncmp(type, "numeric", 7) == 0)
+        return pg_str_endswith(type, "[]") ? "::text[]" : "::text";
     return "";
 }
 

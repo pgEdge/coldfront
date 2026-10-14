@@ -15,6 +15,7 @@ import (
 	"context"
 	"flag"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"time"
@@ -51,7 +52,7 @@ func main() {
 	olderThan := flag.Duration("expire-older-than", 168*time.Hour, "with --expire-snapshots: expire snapshots older than this, keeping --expire-retain-last (default 7d; lower it to reclaim compaction bloat sooner)")
 	keepFiles := flag.Bool("expire-keep-files", false, "with --expire-snapshots: expire metadata only, leave freed files for an --orphans pass (iceberg-go WithPostCommit(false))")
 	orphans := flag.Bool("orphans", false, "also delete orphan files (under the table location, referenced by no retained snapshot)")
-	orphanAge := flag.Duration("orphan-age", 72*time.Hour, "with --orphans: only delete files older than this (in-flight-write safety; never 0 in production)")
+	orphanAge := flag.Duration("orphan-age", 72*time.Hour, "with --orphans: only delete files older than this (in-flight-write safety; must be positive)")
 	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
 
@@ -64,6 +65,10 @@ func main() {
 		fmt.Fprintln(os.Stderr, "usage: compactor --table <name> [--dsn <dsn>] [--target-size-mb N] [--dry-run]"+
 			" [--expire-snapshots [--expire-older-than D] [--expire-retain-last N] [--expire-keep-files]]"+
 			" [--orphans [--orphan-age D]]")
+		os.Exit(2)
+	}
+	if err := checkFlags(*targetMB, *orphanAge); err != nil {
+		fmt.Fprintf(os.Stderr, "compactor: %v\n", err)
 		os.Exit(2)
 	}
 	o := runOpts{
@@ -80,6 +85,20 @@ func main() {
 		fmt.Fprintf(os.Stderr, "compactor: %v\n", err)
 		os.Exit(1)
 	}
+}
+
+// checkFlags refuses, before anything connects, a --target-size-mb below 1 or
+// one whose byte count overflows int64, and an --orphan-age of 0 or less, which
+// lets an orphan pass delete files a writer has staged but not yet committed.
+func checkFlags(targetMB int64, orphanAge time.Duration) error {
+	const maxMB = math.MaxInt64 >> 20
+	if targetMB < 1 || targetMB > maxMB {
+		return fmt.Errorf("--target-size-mb must be between 1 and %d, got %d", maxMB, targetMB)
+	}
+	if orphanAge <= 0 {
+		return fmt.Errorf("--orphan-age must be positive, got %s", orphanAge)
+	}
+	return nil
 }
 
 // run executes the requested maintenance for one table: compaction (always; a no-op

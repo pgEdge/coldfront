@@ -105,11 +105,9 @@ func planCompaction(ctx context.Context, cat *rest.Catalog, ns, name string, tar
 	}
 
 	cfg := compaction.DefaultConfig()
-	if targetSize > 0 {
-		cfg.TargetFileSizeBytes = targetSize
-		cfg.MinFileSizeBytes = targetSize * 3 / 4 // a file >= 75% of target is "optimal"
-		cfg.MaxFileSizeBytes = targetSize * 9 / 5 // and one > 180% is oversized
-	}
+	cfg.TargetFileSizeBytes = targetSize
+	cfg.MinFileSizeBytes = targetSize * 3 / 4 // a file >= 75% of target is "optimal"
+	cfg.MaxFileSizeBytes = targetSize * 9 / 5 // and one > 180% is oversized
 	if err := cfg.Validate(); err != nil {
 		return nil, nil, fmt.Errorf("compaction config: %w", err)
 	}
@@ -179,10 +177,6 @@ func keptDeletes(tasks []table.FileScanTask, groups []table.CompactionTaskGroup)
 // the claim, the stock-ordering discipline proved safe in docs/formal
 // (Bakery.cfg).
 func rewrite(ctx context.Context, tbl *table.Table, p *planResult, targetSize int64) (*table.RewriteResult, error) {
-	var opts []table.CompactionGroupOption
-	if targetSize > 0 {
-		opts = append(opts, table.WithCompactionTargetFileSize(targetSize))
-	}
 	txn := tbl.NewTransaction()
 	rw := txn.NewRewrite(nil)
 	res := &table.RewriteResult{}
@@ -193,7 +187,7 @@ func rewrite(ctx context.Context, tbl *table.Table, p *planResult, targetSize in
 		if p.sorted {
 			gr, err = mergeGroup(ctx, tbl, g, p.sortKey, targetSize)
 		} else {
-			gr, err = table.ExecuteCompactionGroup(ctx, tbl, g, opts...)
+			gr, err = table.ExecuteCompactionGroup(ctx, tbl, g, table.WithCompactionTargetFileSize(targetSize))
 		}
 		if err != nil {
 			return nil, fmt.Errorf("rewrite data files: %w", err)
@@ -328,10 +322,7 @@ func sortedByField(ctx context.Context, unsorted arrow.Table, field iceberg.Nest
 // writeSorted writes the table back through WriteRecords, clustered and
 // bin-packed to targetSize, returning the new data files and their total size.
 func writeSorted(ctx context.Context, tbl *table.Table, sorted arrow.Table, targetSize int64) ([]iceberg.DataFile, int64, error) {
-	writeOpts := []table.WriteRecordOption{table.WithClusteredWrite()}
-	if targetSize > 0 {
-		writeOpts = append(writeOpts, table.WithTargetFileSize(targetSize))
-	}
+	writeOpts := []table.WriteRecordOption{table.WithClusteredWrite(), table.WithTargetFileSize(targetSize)}
 	rdr := array.NewTableReader(sorted, 0)
 	defer rdr.Release()
 

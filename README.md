@@ -209,6 +209,12 @@ See [Understanding ColdFront Caveats](docs/caveats.md) for ColdFront
 behaviors you should be aware of, including a storage-account setting
 Azure ADLS Gen2 requires before you use it as a cold tier.
 
+A cold-tier write that reads an ordinary PostgreSQL table, such as an
+`UPDATE ... FROM` or a `MERGE` from one, stores a `numeric` `NaN` from that
+table as `0` and stores an array renumbered to start at 1, with no error.
+[Supported Column Types](docs/supported_types.md) lists the writes that do
+this and shows how to check a source table first.
+
 ## Project Structure
 
 The repository is laid out as follows:
