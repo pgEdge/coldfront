@@ -6,9 +6,8 @@
 
 The ColdFront documentation consists of the following guides:
 
-- [Introduction](docs/index.md)
-- Architecture Guides
-    - [Architecture Overview](docs/architecture_guides/index.md)
+- [pgEdge ColdFront](docs/index.md)
+- [Architecture Guides](docs/architecture_guides/index.md)
     - [Tiered Operating Mode](docs/architecture_tiered.md)
     - [Decoupled (Iceberg-Only) Operating Mode](docs/architecture_decoupled.md)
     - [Vector Storage Architecture](docs/architecture_vectors.md)
@@ -35,8 +34,9 @@ The ColdFront documentation consists of the following guides:
     - [Supported Column Types](docs/supported_types.md)
     - [Compacting the Cold Tier](docs/compaction.md)
 - Developer Resources
-    - [Formal Model - ColdFront Decoupled-Mode Bakery](docs/formal/README.md)
-- [Release Notes](docs/changelog.md)
+    - [Formal Model - ColdFront Decoupled-Mode Bakery (TLA+/PlusCal)](docs/formal/README.md)
+- [Release Notes - Changelog](docs/changelog.md)
+- [License](docs/LICENSE.md)
 
 ColdFront keeps tables in PostgreSQL and cold data in Apache Iceberg (Parquet
 on S3-compatible, Azure, or GCS storage), and the cold tier is both readable
