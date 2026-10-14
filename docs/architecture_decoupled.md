@@ -25,10 +25,10 @@ this document, concern by concern:
 | `coldfront.tiered_views` row | The row is required for each managed table. | The row is required (with `is_iceberg_only = true`), and `create_iceberg_table()` registers it. |
 | Required at runtime | `pg_duckdb`, `coldfront`, Lakekeeper, an S3-compatible store or Azure ADLS Gen2 | `pg_duckdb`, `coldfront` (lazy catalog ATTACH, DML rewrite, and write serialization), Lakekeeper, an S3-compatible store or Azure ADLS Gen2 |
 
-The coldfront extension provides the lazy catalog-attach glue: the C extension
-hook intercepts the first query that touches a tiered view (read or write) and,
-if the Iceberg catalog `ice` is not yet attached in this session, issues the
-following against the GUCs `coldfront.warehouse` and
+The `coldfront` extension provides the lazy catalog-attach glue: the C
+extension hook intercepts the first query that touches a tiered view (read or
+write) and, if the Iceberg catalog `ice` is not yet attached in this session,
+issues the following against the GUCs `coldfront.warehouse` and
 `coldfront.lakekeeper_endpoint`:
 
 ```sql
@@ -88,7 +88,7 @@ attaches the catalog and `ice.public.*` becomes available.
 
 ## Interface
 
-With the coldfront extension loaded and the storage secret set, the wrapper
+With the `coldfront` extension loaded and the storage secret set, the wrapper
 view supports the operations below.
 
 ### What Works

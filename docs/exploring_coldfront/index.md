@@ -94,7 +94,7 @@ Setup runs before the demos begin. Setup starts the containers, waits for
 PostgreSQL and Lakekeeper to accept connections, and creates the Lakekeeper
 warehouse and namespace. The stack includes the following services:
 
-- PostgreSQL 16, 17, or 18 with the pg_duckdb and coldfront extensions.
+- PostgreSQL 16, 17, or 18 with the pg_duckdb and `coldfront` extensions.
 - SeaweedFS, a local S3-compatible object store standing in for a real cloud
   bucket.
 - Lakekeeper, the Iceberg REST catalog that tracks table metadata and file

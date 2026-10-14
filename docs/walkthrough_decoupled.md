@@ -56,7 +56,7 @@ DELETE FROM events_lake WHERE id = 2;
 SELECT count(*) AS after_delete FROM events_lake;
 ```
 
-All four DML operations reach the Iceberg table transparently. The coldfront
+All four DML operations reach the Iceberg table transparently. The `coldfront`
 extension intercepts each statement on the view and rewrites it to the Iceberg
 path via pg_duckdb.
 

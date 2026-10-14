@@ -436,7 +436,7 @@ use.
   older data to Apache Iceberg on a watermark, presented to the application as
   a single unified view.
 - Decoupled mode stores a table entirely in Iceberg from the first row, with
-  PostgreSQL holding a thin wrapper view and the coldfront extension handling
+  PostgreSQL holding a thin wrapper view and the `coldfront` extension handling
   every data-modifying statement on that view.
 - Horizontal scale-out for decoupled mode across multiple PostgreSQL nodes
   sharing one Lakekeeper catalog and one object store, serialised by the bakery

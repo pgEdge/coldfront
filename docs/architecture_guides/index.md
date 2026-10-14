@@ -162,7 +162,7 @@ into a fresh instance) and the bakery's transient claim tables (`claims` /
 re-established a restored node serves hot reads but fails cold I/O cleanly.
 `ci/ops.sh` Check 4 exercises exactly this.
 
-The Iceberg catalog ATTACH is **lazy**: the coldfront C extension hook issues
+The Iceberg catalog ATTACH is **lazy**: the `coldfront` C extension hook issues
 `ATTACH IF NOT EXISTS` against Lakekeeper - using the cluster's
 `coldfront.warehouse` and `coldfront.lakekeeper_endpoint` GUCs - on the **first
 query that touches a tiered view** (read or write), per DuckDB cached
@@ -245,7 +245,7 @@ WHERE r['ts'] < '2026-03-01'::timestamptz;
 ## Application Interface
 
 Applications use the transparent view exactly like a table. A
-`post_parse_analyze_hook` in the coldfront extension intercepts
+`post_parse_analyze_hook` in the `coldfront` extension intercepts
 `INSERT`/`UPDATE`/`DELETE`/`MERGE` whose target is a registered relation -
 resolved in `coldfront.tiered_views` by name (`schema_name`, `relname`) - and
 rewrites the parsed `Query` so it lands in the correct tier; cold-side writes
@@ -338,7 +338,7 @@ ColdFront coordinates concurrent writes across the cluster as follows:
   lock acquisition (10 attempts, exponential backoff from 100 ms to 51.2 s).
 - Hot writes are replicated by Spock normally (standard PG DML).
 - Cold writes via `duckdb.raw_query()` from multiple nodes are serialized
-  PG-side by the **bakery protocol** in the coldfront extension - every
+  PG-side by the **bakery protocol** in the `coldfront` extension - every
   iceberg-only `INSERT`/`UPDATE`/`DELETE`/`MERGE` wraps in
   `coldfront._exec_iceberg_with_claim`, which holds a globally-ordered
   Snowflake ticket via the Spock-replicated `coldfront.claims` table and waits
@@ -382,20 +382,20 @@ for the build.
 
 ### Transparent DDL via coldfront
 
-A `ProcessUtility_hook` in the coldfront extension intercepts DDL that targets
-a registered tiered table's hot heap or a decoupled table's wrapper view. A
-hot heap is matched by resolving the DDL target relation to an OID and
+A `ProcessUtility_hook` in the `coldfront` extension intercepts DDL that
+targets a registered tiered table's hot heap or a decoupled table's wrapper
+view. A hot heap is matched by resolving the DDL target relation to an OID and
 comparing it with the OID of the registry's `hot_table` - never by string, so
 it is schema-agnostic - and a view by its schema and name, the registry's key.
 A view the hook rebuilds keeps the owner and the table-level grants the view
 had. The hook rebuilds the view and updates the registry as the extension's
 owner, once the ownership check PostgreSQL makes for the statement has passed.
-The role running the statement needs what PostgreSQL requires for the
-statement itself, `USAGE` on the schema of the relation it names included, but
-neither ownership of the view nor `CREATE` on its schema, and the hook's own
-registry lookups and updates need no privilege on the registry. The Iceberg
-change, which is cold I/O, runs as that role, so a column change also needs the
-cold access `grant_app_access` gives, `SELECT` on the registry included. The
+The role running the statement needs what PostgreSQL requires for the statement
+itself, `USAGE` on the schema of the relation it names included, but neither
+ownership of the view nor `CREATE` on its schema, and the hook's own registry
+lookups and updates need no privilege on the registry. The Iceberg change,
+which is cold I/O, runs as that role, so a column change also needs the cold
+access `grant_app_access` gives, `SELECT` on the registry included. The
 following table summarizes the DDL it handles:
 
 | DDL | Behavior |

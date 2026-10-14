@@ -1,7 +1,7 @@
 # Configuring Lakekeeper
 
 ColdFront requires three services configured once per deployment:
-PostgreSQL with the pg_duckdb and coldfront extensions, Lakekeeper, and
+PostgreSQL with the pg_duckdb and `coldfront` extensions, Lakekeeper, and
 any object store (SeaweedFS, MinIO, AWS S3, GCS, or Azure ADLS Gen2).
 This guide brings up and bootstraps Lakekeeper, then installs and
 configures the PostgreSQL side; do this before creating any table.

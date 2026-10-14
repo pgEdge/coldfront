@@ -120,8 +120,8 @@ SELECT coldfront.ensure_replicated();
 
 The subscriptions set
 `synchronize_structure := false, synchronize_data := false` because the tables
-already exist on every node from the coldfront extension, so no initial copy is
-needed.
+already exist on every node from the `coldfront` extension, so no initial copy
+is needed.
 
 ### Timeouts
 

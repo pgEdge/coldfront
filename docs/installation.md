@@ -153,7 +153,7 @@ expensive, stable compiles (pg_duckdb on DuckDB 1.5.4 + the patched
 duckdb-iceberg) live in the prebuilt **base**, published to
 `ghcr.io/pgedge/coldfront-duckdb-base:pg{16,17,18}`; the **app** build
 ([`docker/Dockerfile.duckdb15`](https://github.com/pgEdge/ColdFront/blob/main/docker/Dockerfile.duckdb15))
-`FROM`s it and compiles the coldfront extension in seconds. If you build the
+`FROM`s it and compiles the `coldfront` extension in seconds. If you build the
 base yourself (step 1) the app layer `FROM`s your local image; otherwise it
 `FROM`s the published `ghcr.io/pgedge/coldfront-duckdb-base:pg<major>`. Rebuild
 the published base via the
@@ -264,7 +264,7 @@ for the full tier-and-verify journey.
 
 ## Building ColdFront on Bare Metal
 
-The coldfront extension is a standard PGXS C extension:
+The `coldfront` extension is a standard PGXS C extension:
 
 ```bash
 cd extension/coldfront
