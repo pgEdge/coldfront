@@ -55,7 +55,7 @@ behavior and execution; tune them as needed:
 | `coldfront.vector_probe` | Sets whether a recognized similarity search reads only the clusters nearest its query vector. `off` gives an exact scan of the whole corpus. Affects only a table with a trained vector column ([usage_vectors.md](usage_vectors.md)). The default is `on`. |
 | `coldfront.vector_nprobe` | Sets how many clusters such a search reads, overriding the column's own `nprobe`; at or above the column's `nlist` the search is exhaustive. The default is `0`, which uses the configured value. |
 | `duckdb.force_execution` | Benchmark before enabling: on a mixed workload it helps `count(distinct)` and similar but regresses index lookups, top-K with PK ordering, and JSON access. The default is `off`. |
-| `duckdb.temporary_directory` | Sets where DuckDB spills. Each backend gets its own subdirectory there, named after its process id, so concurrent spills cannot collide; one left by a departed backend is reclaimed. See [architecture.md](architecture_guides/index.md#duckdb-spill-files-are-not-namespaced-per-instance). |
+| `duckdb.temporary_directory` | Sets where DuckDB spills. Each backend gets its own subdirectory there, named after its process id, so concurrent spills cannot collide; one left by a departed backend is reclaimed. See [DuckDB: Spill Files Are Not Namespaced per Instance](architecture_guides/index.md#duckdb-spill-files-are-not-namespaced-per-instance). |
 | `duckdb.max_temp_directory_size` | A cap per connection, not a cluster total. For a total budget, divide it by the concurrent sessions, or give the temp path its own filesystem or quota. The default is 90% of free space per session. |
 
 ## Writing ColdFront's Configuration

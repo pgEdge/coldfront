@@ -479,7 +479,10 @@ You drive tiered tables with the `archiver` binary against a small YAML config
 (Postgres DSN, your warehouse name, and your backend's credentials); each
 table's lifecycle is registered with `archiver register`. The credential and
 warehouse you set up above are exactly what it needs. See
-[usage.md](using_coldfront/index.md) for the archiver config and the partition CLI.
+[Writing ColdFront's Configuration](configuration.md#writing-coldfronts-configuration)
+for the archiver configuration and
+[Managing Partitioned Tables (CLI)](usage_partitioner.md#managing-partitioned-tables-cli)
+for the partition CLI.
 
 ---
 

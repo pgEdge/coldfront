@@ -250,12 +250,18 @@ pgedge-coldfront/
 │   ├── entrypoint.sh
 │   └── seaweedfs-s3.json        ← SeaweedFS S3 auth config (example)
 ├── docs/                       ← MkDocs site (user docs; mkdocs.yml at repo root)
-│   ├── index.md · walkthrough.md · installation.md
+│   ├── index.md · installation.md · configuration.md
+│   ├── one_time_setup.md · object_store.md · distributed_setup.md
+│   ├── usage_tiered.md · usage_decoupled.md · usage_partitioner.md
+│   ├── usage_vectors.md · connecting.md · caveats.md
+│   ├── vended_credentials.md · supported_types.md · compaction.md
 │   ├── walkthrough_tiered.md · walkthrough_decoupled.md
 │   ├── walkthrough_partitioner.md · walkthrough_distributed.md
-│   ├── object_store.md · usage.md · compaction.md
-│   ├── architecture.md · architecture_tiered.md · architecture_decoupled.md
-│   ├── architecture_vectors.md · usage_vectors.md · changelog.md
+│   ├── architecture_tiered.md · architecture_decoupled.md
+│   ├── architecture_vectors.md · changelog.md · LICENSE.md
+│   ├── architecture_guides/    ← Architecture Guides landing page (index.md)
+│   ├── exploring_coldfront/    ← Exploring ColdFront Modes landing page (index.md)
+│   ├── using_coldfront/        ← Using ColdFront landing page (index.md)
 │   └── formal/                 ← TLA+ model of the bakery protocol (Bakery.tla)
 ├── examples/walkthrough/       ← interactive walkthrough (guide.sh, its compose stack and configs)
 ├── docker-compose.yml          ← END-USER single-node stack (ports published)

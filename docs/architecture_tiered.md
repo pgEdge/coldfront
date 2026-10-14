@@ -6,9 +6,10 @@ archiver moves rows hot→cold on a cron.
 
 This document covers the **tiered-specific** design. The shared mechanics -
 pg_duckdb Iceberg I/O, the rewrite hook, the bakery protocol, the registry, DDL
-handling, infrastructure - live in [architecture.md](architecture_guides/index.md); the
-all-Iceberg alternative is
-[architecture_decoupled.md](architecture_decoupled.md).
+handling, infrastructure - live in the
+[Architecture Overview](architecture_guides/index.md); the all-Iceberg
+alternative is
+[Decoupled (Iceberg-Only) Operating Mode](architecture_decoupled.md).
 
 ## Data Flow
 

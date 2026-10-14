@@ -6,9 +6,9 @@ archiver. PostgreSQL becomes a stateless compute front-end. Lakekeeper and the
 underlying object store own the storage. Decoupled mode shares the same
 codebase, docker stack and extension as tiered mode. The shared mechanics -
 pg_duckdb Iceberg I/O, the rewrite hook, the bakery protocol, the registry -
-are in [architecture.md](architecture_guides/index.md); tiered mode is in
-[architecture_tiered.md](architecture_tiered.md). This document covers what is
-specific to decoupled mode.
+are in the [Architecture Overview](architecture_guides/index.md); tiered mode
+is in [Tiered Operating Mode](architecture_tiered.md). This document covers
+what is specific to decoupled mode.
 
 ## What "Decoupled" Means
 
@@ -522,8 +522,9 @@ Three properties are worth knowing:
 
 ## ACID Model
 
-(This section summarizes material from [architecture.md](architecture_guides/index.md)
-§Concurrency and §Known Limitations applied to the decoupled scenario.)
+(This section summarizes material from the
+[Architecture Overview](architecture_guides/index.md) §Concurrency and §Known
+Limitations applied to the decoupled scenario.)
 
 The following table shows the status of each ACID property in decoupled mode:
 
@@ -705,9 +706,9 @@ pointing at the same Lakekeeper endpoint and S3 bucket:
     `spock.feedback_frequency` messages, and in answer to the walsender's
     keepalive, which on an idle link comes every `wal_sender_timeout/2`, so
     the claim refuses to run unless `wal_sender_timeout` is positive and
-    below twice the window; usage.md gives the default and the rule. An
-    *alive*
-    peer that has not acked is either deferring (R-A's defer rule, legitimate)
+    below twice the window;
+    [Timeouts](distributed_setup.md#timeouts) gives the default and the
+    rule. An *alive* peer that has not acked is either deferring (R-A's defer rule, legitimate)
     or about to ack - either way, waiting is correct. A same-node claim is
     released by the C XactCallback in
     [extension/coldfront/src/coldfront.c](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/src/coldfront.c)
@@ -750,7 +751,7 @@ settings:
 wal_level = logical
 shared_preload_libraries = 'snowflake,spock,pg_duckdb,coldfront'
 
-# Set together with coldfront.peer_alive_window_ms (see usage.md).
+# Set together with coldfront.peer_alive_window_ms (see distributed_setup.md).
 wal_sender_timeout = 15s
 
 # Sync-rep is NOT required by the bakery - R-A's ack barrier replaces it.
