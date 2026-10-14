@@ -175,17 +175,17 @@ view, so a missing warehouse never blocks a connection opened before bootstrap.
 pg_duckdb force-disables DuckDB's `LocalFileSystem` for any role that lacks
 both `pg_read_server_files` and `pg_write_server_files` (see
 [Upstream requests](#pg_duckdb-non-superuser-localfilesystem-blocks-side-loaded-extensions)),
-which would block the side-loaded iceberg/postgres DuckDB extensions from
-loading on `ATTACH`. So `coldfront.ensure_attached()` / `ensure_pg_attached()`
-are `SECURITY DEFINER` with a pinned `search_path`: the extension load +
-`ATTACH` run elevated (gates key off `GetUserId()`, the effective user), and
-because the DuckDB instance is per-backend the attach persists for the
-session - every subsequent cold read / `_exec_iceberg_with_claim` then runs
-as the **app role** over S3/httpfs, never touching `LocalFileSystem`. The app
-role needs only `duckdb.postgres_role` membership, object grants, and SET on
-the superuser-only `duckdb.unsafe_allow_execution_inside_functions`
-parameter, which the cross-tier move needs; **no superuser, no
-`pg_{read,write}_server_files`**.
+which would block the side-loaded `iceberg` and `postgres` DuckDB extensions
+from loading on `ATTACH`. So `coldfront.ensure_attached()` /
+`ensure_pg_attached()` are `SECURITY DEFINER` with a pinned `search_path`: the
+extension load + `ATTACH` run elevated (gates key off `GetUserId()`, the
+effective user), and because the DuckDB instance is per-backend the attach
+persists for the session - every subsequent cold read /
+`_exec_iceberg_with_claim` then runs as the **app role** over S3/httpfs, never
+touching `LocalFileSystem`. The app role needs only `duckdb.postgres_role`
+membership, object grants, and SET on the superuser-only
+`duckdb.unsafe_allow_execution_inside_functions` parameter, which the
+cross-tier move needs; **no superuser, no `pg_{read,write}_server_files`**.
 
 Because the attach helpers run elevated, the deployment-config GUCs they
 consume (`coldfront.warehouse`, `coldfront.lakekeeper_endpoint`,

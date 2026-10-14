@@ -69,7 +69,7 @@ constraint named after a hash of the name.
 
 A cold `UPDATE ... FROM` or `DELETE ... USING`, a `MERGE` whose source is a
 PostgreSQL table, and an `INSERT ... SELECT` into a decoupled table read that
-PostgreSQL table through DuckDB's postgres extension, which reads a `numeric`
+PostgreSQL table through DuckDB's `postgres` extension, which reads a `numeric`
 `NaN` as `0`, also inside an array, and drops an array's lower bound. ColdFront
 cannot refuse those values on that path: the write stores the changed values
 with no error, and its conditions compare the changed values. A condition that

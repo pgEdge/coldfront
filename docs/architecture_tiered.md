@@ -119,7 +119,7 @@ batches. An `INSERT` nested in a `WITH` entry is rewritten in place, and a
 The bootstrap also gives the hot table its guards: a check constraint, named
 `coldfront_guard_<column>`, on each column whose type admits a value the cold
 tier cannot hold unchanged. A `numeric` column refuses `NaN`, which pg_duckdb's
-scan and DuckDB's postgres extension both read as `0` and which Iceberg's
+scan and DuckDB's `postgres` extension both read as `0` and which Iceberg's
 decimal lacks; a `date`, `timestamp` or `timestamptz` column refuses `infinity`
 and `-infinity`, which Iceberg lacks and duckdb-iceberg refuses to write. An
 array column keeps the shape of an Iceberg list, one dimension numbered from 1,
