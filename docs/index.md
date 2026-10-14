@@ -1,8 +1,8 @@
 # pgEdge ColdFront
 
 ColdFront keeps tables in PostgreSQL and cold data in Apache Iceberg (Parquet
-on S3-compatible, Azure, or GCS storage), and the cold tier is both readable
-and writable through the same SQL with no application changes. The application
+on S3-compatible, Azure, or GCS storage). The cold tier is both readable and
+writable through the same SQL, with no application changes. The application
 queries every table as an ordinary PostgreSQL relation, and both operating
 modes present the same standard SQL surface.
 
