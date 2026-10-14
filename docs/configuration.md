@@ -7,7 +7,7 @@ components still need configuring before the cold tier comes online:
   guide, regardless of which installation path you followed.
 - installing, configuring, and bootstrapping Lakekeeper, and the
   one-time per-database setup that ties everything together,
-  documented in the [Configuring Lakekeeper](one_time_setup.md)
+  documented in the [Configuring Lakekeeper](configure_lakekeeper.md)
   guide.
 - your object store, documented in
   [Configuring your Object Store](object_store.md).

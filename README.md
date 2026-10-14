@@ -15,7 +15,7 @@ The ColdFront documentation consists of the following guides:
 - Installing and Configuring ColdFront
     - [Installing ColdFront](docs/installation.md)
     - [Configuring ColdFront](docs/configuration.md)
-        - [Configuring Lakekeeper](docs/one_time_setup.md)
+        - [Configuring Lakekeeper](docs/configure_lakekeeper.md)
         - [Configuring your Object Store](docs/object_store.md)
         - [Configuring a Distributed Deployment](docs/distributed_setup.md)
 - [Using ColdFront](docs/using_coldfront/index.md)
@@ -147,7 +147,7 @@ settings above. The `import` command takes a deployment YAML, modeled on
 ColdFront has no configuration file. A YAML passed to any later run is checked
 against the server, and the run takes only `postgres.dsn` from the file.
 For every setting, see the
-[Configuring Lakekeeper](docs/one_time_setup.md) guide and the
+[Configuring Lakekeeper](docs/configure_lakekeeper.md) guide and the
 [Configuring PostgreSQL](docs/configuration.md#configuring-postgresql)
 section of the Configuring ColdFront guide.
 
@@ -179,7 +179,7 @@ documents:
 | [Vector Storage Architecture](docs/architecture_vectors.md) | Describes vector storage internals: type mapping, routing state, cluster assignment, and layout. |
 | [Installing ColdFront](docs/installation.md) | Documents installing from a package or building from source (Docker or bare-metal), and testing and CI. |
 | [Configuring ColdFront](docs/configuration.md) | Documents configuring PostgreSQL and ColdFront's own configuration. |
-| [Configuring Lakekeeper](docs/one_time_setup.md) | Installs, configures, and bootstraps Lakekeeper, then installs the extensions each database needs. |
+| [Configuring Lakekeeper](docs/configure_lakekeeper.md) | Installs, configures, and bootstraps Lakekeeper, then installs the extensions each database needs. |
 | [Configuring your Object Store](docs/object_store.md) | Gets ColdFront running end to end, for any of four supported backends: S3-compatible, virtual-hosted cloud S3, GCS, or Azure ADLS Gen2. |
 | [Configuring a Distributed Deployment](docs/distributed_setup.md) | Documents running a multi-writer decoupled-mode Spock mesh against one shared lake. |
 | [Using ColdFront](docs/using_coldfront/index.md) | Compares the three operating modes, documents the shared SQL surface, and links to each mode's guide. |
@@ -251,7 +251,7 @@ pgedge-coldfront/
 │   └── seaweedfs-s3.json        ← SeaweedFS S3 auth config (example)
 ├── docs/                       ← MkDocs site (user docs; mkdocs.yml at repo root)
 │   ├── index.md · installation.md · configuration.md
-│   ├── one_time_setup.md · object_store.md · distributed_setup.md
+│   ├── configure_lakekeeper.md · object_store.md · distributed_setup.md
 │   ├── usage_tiered.md · usage_decoupled.md · usage_partitioner.md
 │   ├── usage_vectors.md · connecting.md · caveats.md
 │   ├── vended_credentials.md · supported_types.md · compaction.md

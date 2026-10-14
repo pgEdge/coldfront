@@ -1,7 +1,7 @@
 # Using ColdFront in Tiered Mode
 
 Before you begin, configure PostgreSQL, Lakekeeper, and your object store by
-following [Configuring ColdFront](configuration.md), [Configuring Lakekeeper](one_time_setup.md),
+following [Configuring ColdFront](configuration.md), [Configuring Lakekeeper](configure_lakekeeper.md),
 and [Configuring your Object Store](object_store.md); tiered mode archives
 aging partitions to the cold tier those guides set up. This page walks
 through creating a tiered table, registering it with the archiver, running

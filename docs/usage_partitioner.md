@@ -3,7 +3,7 @@
 This mode needs only a working PostgreSQL instance, optionally in a Spock
 mesh; it uses no Lakekeeper, no object store, no pg_duckdb, and no
 coldfront extension. A database set up this way can gain the cold tier
-later by following [Configuring ColdFront](configuration.md), [Configuring Lakekeeper](one_time_setup.md),
+later by following [Configuring ColdFront](configuration.md), [Configuring Lakekeeper](configure_lakekeeper.md),
 and [Configuring your Object Store](object_store.md). This page walks
 through building and registering the `partitioner` binary, operating it
 day to day, giving a time-partitioned table a real primary key, and

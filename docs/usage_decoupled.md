@@ -1,7 +1,7 @@
 # Using ColdFront in Decoupled Mode
 
 Before you begin, configure PostgreSQL, Lakekeeper, and your object store by
-following [Configuring ColdFront](configuration.md), [Configuring Lakekeeper](one_time_setup.md),
+following [Configuring ColdFront](configuration.md), [Configuring Lakekeeper](configure_lakekeeper.md),
 and [Configuring your Object Store](object_store.md); every row of a
 decoupled table lives in the cold tier those guides set up, from the first
 row. This page walks through creating a decoupled table with

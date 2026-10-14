@@ -167,7 +167,7 @@ publishes it. The floating `pg<major>` tag moves to the same image only when
 the base-image workflow is dispatched from `main` with `push=true` and both
 architectures.
 
-Then follow the [Configuring Lakekeeper](one_time_setup.md) guide:
+Then follow the [Configuring Lakekeeper](configure_lakekeeper.md) guide:
 bootstrap it, create a table, tier it, and verify.
 
 !!! note "pg_duckdb pin"
@@ -259,7 +259,7 @@ SQL
 
 A row count of 1 read back through Iceberg confirms the full path. For a real
 cloud store, drop the `local-store` profile, point the warehouse at your own
-bucket, and follow the [Configuring Lakekeeper](one_time_setup.md) guide
+bucket, and follow the [Configuring Lakekeeper](configure_lakekeeper.md) guide
 for the full tier-and-verify journey.
 
 ## Building ColdFront on Bare Metal
@@ -364,7 +364,7 @@ To go further with ColdFront, consult the following guides:
 
 - The [Configuring ColdFront](configuration.md) guide details PostgreSQL
   and ColdFront's own configuration.
-- The [Configuring Lakekeeper](one_time_setup.md) guide installs,
+- The [Configuring Lakekeeper](configure_lakekeeper.md) guide installs,
   configures, and bootstraps it, then installs the extensions each
   database needs.
 - The [Walkthrough](exploring_coldfront/index.md) guide runs the demo stack hands-on.

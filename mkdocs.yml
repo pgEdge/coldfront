@@ -69,7 +69,7 @@ nav:
       - Installing ColdFront: installation.md
       - Configuring ColdFront:
           - configuration.md
-          - Configuring Lakekeeper: one_time_setup.md
+          - Configuring Lakekeeper: configure_lakekeeper.md
           - Configuring your Object Store: object_store.md
           - Configuring a Distributed Deployment: distributed_setup.md
 

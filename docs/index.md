@@ -103,7 +103,7 @@ following guides:
   from a package or building it from source.
 - The [Configuring ColdFront](configuration.md) guide documents PostgreSQL
   and ColdFront's own configuration.
-- The [Configuring Lakekeeper](one_time_setup.md) guide installs,
+- The [Configuring Lakekeeper](configure_lakekeeper.md) guide installs,
   configures, and bootstraps it, then installs the extensions
   each database needs.
 - The [Configuring your Object Store](object_store.md) guide takes you from
