@@ -278,14 +278,15 @@ PostgreSQL and create the extensions:
     coldfront.lakekeeper_endpoint = 'http://<lakekeeper-host>:8181/catalog'
     ```
 
-    `duckdb.extension_directory`, `duckdb.allow_unsigned_extensions`, and
-    `duckdb.autoinstall_known_extensions` make pg_duckdb load ColdFront's
-    patched DuckDB extensions. Without them, pg_duckdb can fetch the unpatched
-    upstream extensions instead. `duckdb.postgres_role` lets the application
-    roles you grant access to run DuckDB; without it, only superusers can.
-    `coldfront.warehouse` names the `wh` warehouse that
-    [Connecting ColdFront to Lakekeeper and Object Storage](#connecting-coldfront-to-lakekeeper-and-object-storage)
-    creates.
+    - `duckdb.extension_directory`, `duckdb.allow_unsigned_extensions`, and
+      `duckdb.autoinstall_known_extensions` make pg_duckdb load ColdFront's
+      patched DuckDB extensions. Without them, pg_duckdb can fetch the
+      unpatched upstream extensions instead.
+    - `duckdb.postgres_role` lets the application roles you grant access to run
+      DuckDB; without it, only superusers can.
+    - `coldfront.warehouse` names the `wh` warehouse that
+      [Connecting ColdFront to Lakekeeper and Object Storage](#connecting-coldfront-to-lakekeeper-and-object-storage)
+      creates.
 
 2. Restart PostgreSQL. `CREATE EXTENSION coldfront` fails on a server that
     does not preload the extension:
@@ -306,6 +307,9 @@ PostgreSQL and create the extensions:
 
     You create the role once for the PostgreSQL server. Run the
     `CREATE EXTENSION` commands in each database that uses ColdFront.
+
+When the extensions are created, continue with
+[Connecting a Package or Bare-Metal Installation to Lakekeeper and an Object Store](#connecting-a-package-or-bare-metal-installation-to-lakekeeper-and-an-object-store).
 
 ### Installing and Configuring ColdFront in a Docker Container
 
@@ -362,6 +366,9 @@ without a password. For information about the image's environment variables
 and a smoke test, see
 [Building the Image on Docker](docs/installation.md#building-the-image-on-docker).
 
+When the extensions are created, continue with
+[Connecting a Docker Installation to Lakekeeper and an Object Store](#connecting-a-docker-installation-to-lakekeeper-and-an-object-store).
+
 ### Installing and Configuring ColdFront on Bare Metal
 
 Before building ColdFront on bare metal, install the pg_duckdb PostgreSQL
@@ -412,15 +419,15 @@ PostgreSQL server development headers, the libpq headers and library, `make`,
     coldfront.lakekeeper_endpoint = 'http://<lakekeeper-host>:8181/catalog'
     ```
 
-    The locally built `iceberg` extension is unsigned, so
-    `duckdb.allow_unsigned_extensions` must be on.
-    `duckdb.autoinstall_known_extensions` stays off so that pg_duckdb never
-    fetches the unpatched upstream extensions in place of yours.
-    `duckdb.postgres_role` lets the application roles you grant access to run
-    DuckDB; without it, only superusers can. `coldfront.warehouse` names the
-    `wh` warehouse that
-    [Connecting ColdFront to Lakekeeper and Object Storage](#connecting-coldfront-to-lakekeeper-and-object-storage)
-    creates.
+    - `duckdb.allow_unsigned_extensions` must be on, because the locally built
+      `iceberg` extension is unsigned.
+    - `duckdb.autoinstall_known_extensions` stays off so that pg_duckdb never
+      fetches the unpatched upstream extensions in place of yours.
+    - `duckdb.postgres_role` lets the application roles you grant access to run
+      DuckDB; without it, only superusers can.
+    - `coldfront.warehouse` names the `wh` warehouse that
+      [Connecting ColdFront to Lakekeeper and Object Storage](#connecting-coldfront-to-lakekeeper-and-object-storage)
+      creates.
 
 6. Restart PostgreSQL. `CREATE EXTENSION coldfront` fails on a server that
     does not preload the extension.
@@ -437,8 +444,11 @@ PostgreSQL server development headers, the libpq headers and library, `make`,
     You create the role once for the PostgreSQL server. Run the
     `CREATE EXTENSION` commands in each database that uses ColdFront.
 
-For the full steps, see
+For more information, see
 [Building ColdFront on Bare Metal](docs/installation.md#building-coldfront-on-bare-metal).
+
+When the extensions are created, continue with
+[Connecting a Package or Bare-Metal Installation to Lakekeeper and an Object Store](#connecting-a-package-or-bare-metal-installation-to-lakekeeper-and-an-object-store).
 
 ### Connecting ColdFront to Lakekeeper and Object Storage
 
