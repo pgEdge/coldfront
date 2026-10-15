@@ -469,13 +469,22 @@ the host.
 
 1. Start an object store. If you're walking through this installation to
     evaluate ColdFront, you can use SeaweedFS, a free S3-compatible store, on
-    the host. The repository's `seaweedfs-s3.json` sets its credentials to
-    `admin` and `adminsecret`:
+    the host. Install SeaweedFS as described in its
+    [Getting Started](https://github.com/seaweedfs/seaweedfs/wiki/Getting-Started)
+    guide; the [releases page](https://github.com/seaweedfs/seaweedfs/releases)
+    has prebuilt `weed` binaries. Then create an S3 credentials file with the
+    access key `admin` and the secret key `adminsecret`, in the format shown in
+    [S3 Configuration](https://github.com/seaweedfs/seaweedfs/wiki/Amazon-S3-API#s3-configuration),
+    and start SeaweedFS with its S3 gateway:
 
     ```bash
-    weed server -s3 -dir=/var/lib/seaweedfs \
-      -s3.config=docker/seaweedfs-s3.json
+    sudo mkdir -p /var/lib/seaweedfs
+    sudo weed server -s3 -dir=/var/lib/seaweedfs -s3.config=/etc/seaweedfs/s3.json
     ```
+
+    The ColdFront repository's
+    [`docker/seaweedfs-s3.json`](docker/seaweedfs-s3.json) is a ready-made
+    credentials file you can copy to `/etc/seaweedfs/s3.json`.
 
     If you would like to evaluate ColdFront on AWS S3, Google Cloud Storage,
     or Azure ADLS Gen2, create a bucket or container there instead. The
