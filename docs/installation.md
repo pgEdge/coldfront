@@ -286,6 +286,7 @@ does. Then set the following in `postgresql.conf`:
 shared_preload_libraries = 'pg_duckdb,coldfront'
 # The locally built iceberg extension is unsigned.
 duckdb.allow_unsigned_extensions = true
+duckdb.postgres_role          = 'coldfront_duckdb'
 coldfront.warehouse           = '<warehouse-name>'
 coldfront.lakekeeper_endpoint = 'http://<lakekeeper-host>:8181/catalog'
 coldfront.local_pg_dsn        = 'host=/var/run/postgresql dbname=<db> user=<role>'
@@ -296,6 +297,14 @@ coldfront.iceberg_bakery_patch  = on
 
 coldfront refuses to load any other way: `CREATE EXTENSION coldfront` fails on
 a server that does not preload it, with an error that names the setting.
+
+`duckdb.postgres_role` names the role whose members may run DuckDB. Without
+it, only superusers can, and `coldfront.grant_app_access()` fails. Create the
+role before you grant access to an application role:
+
+```sql
+CREATE ROLE coldfront_duckdb NOLOGIN;
+```
 
 See the [Configuring PostgreSQL](configuration.md#configuring-postgresql)
 section of the Configuring ColdFront guide for the remaining GUCs, and

@@ -22,6 +22,7 @@ shared_preload_libraries = 'pg_duckdb,coldfront'
 duckdb.extension_directory = '/usr/lib/pgedge/coldfront/duckdb-extensions'
 duckdb.allow_unsigned_extensions = true
 duckdb.autoinstall_known_extensions = false
+duckdb.postgres_role = 'coldfront_duckdb'
 coldfront.iceberg_async_parquet = on
 coldfront.iceberg_bakery_patch = on
 coldfront.warehouse = '<warehouse-name>'
@@ -29,7 +30,8 @@ coldfront.lakekeeper_endpoint = 'http://<lakekeeper-host>:8181/catalog'
 coldfront.local_pg_dsn = 'host=/var/run/postgresql dbname=<db> user=<role>'
 ```
 
-Together, the three `duckdb.*` settings point pg_duckdb at the directory
+Together, `duckdb.extension_directory`, `duckdb.allow_unsigned_extensions`, and
+`duckdb.autoinstall_known_extensions` point pg_duckdb at the directory
 where `pgedge-coldfront-duckdb-extensions` installs ColdFront's patched
 DuckDB extensions, rather than letting it fetch the unpatched upstream
 build - the same substitution that reintroduces HTTP 409 failures under
@@ -37,6 +39,14 @@ concurrent cold writes. The patched extensions are unsigned, so
 `duckdb.allow_unsigned_extensions` must stay on; and because a missing
 extension file would otherwise trigger that same fallback,
 `duckdb.autoinstall_known_extensions` stays off.
+
+`duckdb.postgres_role` names the role whose members may run DuckDB. Without
+it, only superusers can, and `coldfront.grant_app_access()` fails. Create the
+role before you grant access to an application role:
+
+```sql
+CREATE ROLE coldfront_duckdb NOLOGIN;
+```
 
 The two `coldfront.iceberg_*` settings make a node upload the Parquet files of
 an `INSERT` or `COPY` outside its write lock (the bakery claim on a Spock mesh,
