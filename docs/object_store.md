@@ -23,8 +23,9 @@ profile differ by backend:
   Region, and a long-term access key and secret.
 - **Google Cloud Storage** needs a bucket and an
   [HMAC key pair](https://cloud.google.com/storage/docs/authentication/hmackeys)
-  (GCS has no native Lakekeeper profile; it is configured as an S3
-  backend pointed at GCS's S3-interoperability endpoint).
+  (this guide configures GCS as an S3 backend pointed at GCS's
+  S3-interoperability endpoint, rather than Lakekeeper's native `gcs`
+  profile).
 - **Azure ADLS Gen2** needs a storage account with hierarchical namespace
   enabled (for example, `az storage account create --hns true`), a filesystem
   (container) in that account, and the account's access key. A StorageV2
@@ -297,9 +298,10 @@ above with `SELECT coldfront.set_storage_secret_vended();`.
 
 ### Google Cloud Storage
 
-Google Cloud Storage is *not a separate Lakekeeper profile*: it uses an
-`s3` storage profile pointed at GCS's S3-interoperability endpoint,
-with an HMAC key pair standing in for an access key:
+Lakekeeper also has a native `gcs` storage profile, but this guide uses an
+`s3` storage profile pointed at GCS's S3-interoperability endpoint, with an
+HMAC key pair standing in for an access key. That matches the S3-style
+credential that `coldfront.set_storage_secret()` stores for GCS:
 
 ```bash
 WID=$(curl -s -X POST http://localhost:8181/management/v1/warehouse \
