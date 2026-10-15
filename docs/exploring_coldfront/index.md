@@ -133,8 +133,8 @@ curl -sf -X POST http://localhost:8181/management/v1/bootstrap \
   -H 'Content-Type: application/json' \
   -d '{"accept-terms-of-use":true}'
 
-# Create the warehouse (retried by guide.sh until 200)
-curl -sf -X POST http://localhost:8181/management/v1/warehouse \
+# Create the warehouse and save its ID (retried by guide.sh until 200)
+WID=$(curl -sf -X POST http://localhost:8181/management/v1/warehouse \
   -H 'Content-Type: application/json' \
   -d '{
     "warehouse-name": "wh",
@@ -154,12 +154,10 @@ curl -sf -X POST http://localhost:8181/management/v1/warehouse \
       "aws-access-key-id": "admin",
       "aws-secret-access-key": "adminsecret"
     }
-  }'
+  }' \
+  | grep -oE '"warehouse-id":"[^"]+"' | cut -d'"' -f4)
 
 # Seed the public namespace
-WID=$(curl -s http://localhost:8181/management/v1/warehouse \
-  | grep -oE '"warehouse-id":"[^"]+"' \
-  | head -1 | cut -d'"' -f4)
 curl -sf -X POST \
   "http://localhost:8181/catalog/v1/${WID}/namespaces" \
   -H 'Content-Type: application/json' \

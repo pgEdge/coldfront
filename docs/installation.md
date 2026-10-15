@@ -225,7 +225,7 @@ and seed the `public` namespace:
 curl -sf -X POST http://localhost:8181/management/v1/bootstrap \
   -H 'Content-Type: application/json' -d '{"accept-terms-of-use":true}'
 
-curl -s -X POST http://localhost:8181/management/v1/warehouse \
+WID=$(curl -s -X POST http://localhost:8181/management/v1/warehouse \
   -H 'Content-Type: application/json' -d '{
     "warehouse-name":"wh",
     "storage-profile":{"type":"s3","bucket":"iceberg","region":"us-east-1",
@@ -233,10 +233,9 @@ curl -s -X POST http://localhost:8181/management/v1/warehouse \
       "flavor":"s3-compat","sts-enabled":false,"remote-signing-enabled":false},
     "storage-credential":{"type":"s3","credential-type":"access-key",
       "aws-access-key-id":"admin","aws-secret-access-key":"adminsecret"}
-  }'
+  }' \
+  | grep -oE '"warehouse-id":"[^"]+"' | cut -d'"' -f4)
 
-WID=$(curl -s http://localhost:8181/management/v1/warehouse \
-  | grep -oE '"warehouse-id":"[^"]+"' | head -1 | cut -d'"' -f4)
 curl -s -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
   -H 'Content-Type: application/json' -d '{"namespace":["public"]}'
 ```

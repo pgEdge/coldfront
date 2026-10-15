@@ -134,8 +134,9 @@ running on the same host. For another store, change the `storage-profile` and
 curl -X POST http://localhost:8181/management/v1/bootstrap \
   -H "Content-Type: application/json" -d '{"accept-terms-of-use":true}'
 
-# 2. Create the warehouse (replace <store-endpoint> as described above)
-curl -X POST http://localhost:8181/management/v1/warehouse \
+# 2. Create the warehouse and save its ID (replace <store-endpoint> as
+#    described above)
+WID=$(curl -s -X POST http://localhost:8181/management/v1/warehouse \
   -H "Content-Type: application/json" -d '{
     "warehouse-name": "wh",
     "storage-profile": {
@@ -148,7 +149,8 @@ curl -X POST http://localhost:8181/management/v1/warehouse \
       "type": "s3", "credential-type": "access-key",
       "aws-access-key-id": "admin", "aws-secret-access-key": "adminsecret"
     }
-  }'
+  }' \
+  | grep -oE '"warehouse-id":"[^"]+"' | cut -d'"' -f4)
 
 # 3. Create the Iceberg namespace in the new warehouse.
 #    REQUIRED for decoupled (iceberg-only) mode: the Iceberg CREATE SCHEMA is
@@ -159,8 +161,6 @@ curl -X POST http://localhost:8181/management/v1/warehouse \
 #    function's in-txn CREATE SCHEMA IF NOT EXISTS a no-op so the table create
 #    succeeds. The archiver (tiered mode) creates the namespace itself and does
 #    not need this.
-WID=$(curl -s http://localhost:8181/management/v1/warehouse \
-  | grep -oE '"warehouse-id":"[^"]+"' | head -1 | cut -d'"' -f4)
 curl -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
   -H "Content-Type: application/json" -d '{"namespace":["public"]}'
 ```
