@@ -300,6 +300,7 @@ does. Then set the following in `postgresql.conf`:
 shared_preload_libraries = 'pg_duckdb,coldfront'
 # The locally built iceberg extension is unsigned.
 duckdb.allow_unsigned_extensions = true
+duckdb.autoinstall_known_extensions = false
 duckdb.postgres_role          = 'coldfront_duckdb'
 coldfront.warehouse           = '<warehouse-name>'
 coldfront.lakekeeper_endpoint = 'http://<lakekeeper-host>:8181/catalog'
