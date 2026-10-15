@@ -19,14 +19,37 @@ the steps in the Enterprise Postgres documentation:
 The documentation details the platform requirements, disabling the PGDG
 repository, and creating the pgEdge repository.
 
-With the repository in place, install the ColdFront extension package for
-your PostgreSQL major version. It depends on the pgEdge PostgreSQL server,
-pg_duckdb, and ColdFront's DuckDB extensions, so the package manager installs
-those as well. The following table shows each package's purpose and its name
-on RHEL-family and Debian-family systems:
+With the repository in place, install pgEdge Enterprise Postgres and start the
+server. On RHEL, Rocky Linux, or AlmaLinux, the package does not create a
+database cluster, so create and start one as root:
+
+```bash
+sudo dnf install -y pgedge-enterprise-postgres_18
+sudo /usr/pgsql-18/bin/postgresql-18-setup initdb
+sudo systemctl enable --now postgresql-18
+```
+
+On Ubuntu or Debian, the package creates and starts the `18/main` cluster;
+`sudo pg_lsclusters` shows it:
+
+```bash
+sudo apt update
+sudo apt install -y pgedge-enterprise-postgres-18
+```
+
+For details, see the pgEdge Enterprise Postgres installation guide for
+[Enterprise Linux](https://docs.pgedge.com/enterprise/el/installing/) or
+[Debian and Ubuntu](https://docs.pgedge.com/enterprise/debian/installing/).
+
+With PostgreSQL running, install the ColdFront extension package for your
+PostgreSQL major version. It depends on pg_duckdb and ColdFront's DuckDB
+extensions, so the package manager installs those as well. The following table
+shows each package's purpose and its name on RHEL-family and Debian-family
+systems:
 
 | Package | RHEL, Rocky Linux, AlmaLinux | Ubuntu, Debian |
 |---|---|---|
+| pgEdge Enterprise Postgres | `pgedge-enterprise-postgres_<pg_version>` | `pgedge-enterprise-postgres-<pg_version>` |
 | ColdFront extension | `pgedge-coldfront_<pg_version>` | `pgedge-postgresql-<pg_version>-coldfront` |
 | ColdFront's DuckDB extensions | `pgedge-coldfront-duckdb-extensions` | `pgedge-coldfront-duckdb-extensions` |
 | pg_duckdb | `pgedge-pg-duckdb_<pg_version>` | `pgedge-postgresql-<pg_version>-pg-duckdb` |
@@ -42,27 +65,12 @@ sudo dnf install -y pgedge-coldfront_18
 On Ubuntu or Debian:
 
 ```bash
-sudo apt update
 sudo apt install -y pgedge-postgresql-18-coldfront
 ```
 
 The extension package does not install the command-line tools or Lakekeeper.
 Install `pgedge-coldfront` and `pgedge-lakekeeper` separately on the hosts
 that need them.
-
-The package installs the PostgreSQL server but, on RHEL-family systems, does
-not create a database cluster. Initialize and start PostgreSQL 18 as root:
-
-```bash
-sudo /usr/pgsql-18/bin/postgresql-18-setup initdb
-sudo systemctl enable --now postgresql-18
-```
-
-On Ubuntu and Debian, the package creates and starts the `18/main` cluster;
-`sudo pg_lsclusters` shows it. For details, see the pgEdge Enterprise Postgres
-installation guide for
-[Enterprise Linux](https://docs.pgedge.com/enterprise/el/installing/) or
-[Debian and Ubuntu](https://docs.pgedge.com/enterprise/debian/installing/).
 
 ## Building ColdFront from Source
 
