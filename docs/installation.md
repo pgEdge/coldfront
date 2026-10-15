@@ -50,6 +50,20 @@ The extension package does not install the command-line tools or Lakekeeper.
 Install `pgedge-coldfront` and `pgedge-lakekeeper` separately on the hosts
 that need them.
 
+The package installs the PostgreSQL server but, on RHEL-family systems, does
+not create a database cluster. Initialize and start PostgreSQL 18 as root:
+
+```bash
+sudo /usr/pgsql-18/bin/postgresql-18-setup initdb
+sudo systemctl enable --now postgresql-18
+```
+
+On Ubuntu and Debian, the package creates and starts the `18/main` cluster;
+`sudo pg_lsclusters` shows it. For details, see the pgEdge Enterprise Postgres
+installation guide for
+[Enterprise Linux](https://docs.pgedge.com/enterprise/el/installing/) or
+[Debian and Ubuntu](https://docs.pgedge.com/enterprise/debian/installing/).
+
 ## Building ColdFront from Source
 
 This section walks you through building ColdFront from source, either in
