@@ -396,7 +396,7 @@ Regardless of backend, pre-create the `public` namespace under the warehouse,
 using the ID that the warehouse-create command saved in `WID`:
 
 ```bash
-[ -n "$WID" ] || { echo "no warehouse id - did the warehouse create succeed?"; exit 1; }
+[ -n "$WID" ] || echo "No warehouse ID - check that the warehouse create succeeded."
 
 curl -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
   -H "Content-Type: application/json" \

@@ -236,6 +236,7 @@ WID=$(curl -s -X POST http://localhost:8181/management/v1/warehouse \
   }' \
   | grep -oE '"warehouse-id":"[^"]+"' | cut -d'"' -f4)
 
+[ -n "$WID" ] || echo "No warehouse ID - check that the warehouse create succeeded."
 curl -s -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
   -H 'Content-Type: application/json' -d '{"namespace":["public"]}'
 ```
