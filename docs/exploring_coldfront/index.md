@@ -158,11 +158,14 @@ WID=$(curl -sf -X POST http://localhost:8181/management/v1/warehouse \
   | grep -oE '"warehouse-id":"[^"]+"' | cut -d'"' -f4)
 
 # Seed the public namespace
-[ -n "$WID" ] || echo "No warehouse ID - check that the warehouse create succeeded."
-curl -sf -X POST \
-  "http://localhost:8181/catalog/v1/${WID}/namespaces" \
-  -H 'Content-Type: application/json' \
-  -d '{"namespace":["public"]}'
+if [ -z "$WID" ]; then
+  echo "No warehouse ID - check that the warehouse create succeeded."
+else
+  curl -sf -X POST \
+    "http://localhost:8181/catalog/v1/${WID}/namespaces" \
+    -H 'Content-Type: application/json' \
+    -d '{"namespace":["public"]}'
+fi
 ```
 
 ### Using a Cloud Object Store

@@ -173,9 +173,12 @@ WID=$(curl -s -X POST http://localhost:8181/management/v1/warehouse \
 #    function's in-txn CREATE SCHEMA IF NOT EXISTS a no-op so the table create
 #    succeeds. The archiver (tiered mode) creates the namespace itself and does
 #    not need this.
-[ -n "$WID" ] || echo "No warehouse ID - check that the warehouse create succeeded."
-curl -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
-  -H "Content-Type: application/json" -d '{"namespace":["public"]}'
+if [ -z "$WID" ]; then
+  echo "No warehouse ID - check that the warehouse create succeeded."
+else
+  curl -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
+    -H "Content-Type: application/json" -d '{"namespace":["public"]}'
+fi
 ```
 
 ## Configuring PostgreSQL for Lakekeeper
