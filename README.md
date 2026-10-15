@@ -190,13 +190,22 @@ build it from source in a Docker container or on bare metal.
 
 ### Installing and Configuring ColdFront with Packages
 
-ColdFront packages come from the pgEdge package repository. First, configure
-the repository for your platform, as described in the
-[pgEdge Enterprise Postgres guide](https://docs.pgedge.com/enterprise/).
+In the sections that follow, we'll walk you through installing PostgreSQL and
+ColdFront using packages. ColdFront packages come from the pgEdge package
+repository, so first configure the repository for your platform, as described
+in the [pgEdge Enterprise Postgres guide](https://docs.pgedge.com/enterprise/).
 
-Next, install pgEdge Enterprise Postgres and start the server. On RHEL, Rocky
-Linux, or AlmaLinux, the package does not create a database cluster, so create
-and start one:
+If you already have a pgEdge Enterprise Postgres server installed that you
+would like to use, configure the pgEdge repository and install only ColdFront,
+continuing with
+[Installing the ColdFront Packages](#installing-the-coldfront-packages).
+ColdFront packages from pgEdge require pgEdge's PostgreSQL build.
+
+#### Installing PostgreSQL with Packages
+
+Before installing ColdFront, you will need to install pgEdge Enterprise Postgres
+and start the server. On RHEL, Rocky Linux, or AlmaLinux, the package does not
+create a database cluster, so create and start one:
 
 ```bash
 sudo dnf install -y pgedge-enterprise-postgres_18
@@ -224,26 +233,33 @@ The command prints the PostgreSQL version. A connection error means the server
 is not running; check `sudo systemctl status postgresql-18` on RHEL-family
 systems or `sudo pg_lsclusters` on Ubuntu and Debian.
 
-Then, install the ColdFront extension package for your PostgreSQL major
-version. The package manager also installs pg_duckdb and ColdFront's DuckDB
-extensions.
+#### Installing the ColdFront Packages
+
+Install the ColdFront extension package for your PostgreSQL major version, the
+ColdFront command-line tools (the archiver, the partitioner, and the
+compactor), and Lakekeeper (the Iceberg catalog). The package manager also
+installs pg_duckdb and ColdFront's DuckDB extensions.
 
 For PostgreSQL 18 on RHEL, Rocky Linux, or AlmaLinux:
 
 ```bash
-sudo dnf install -y pgedge-coldfront_18
+sudo dnf install -y pgedge-coldfront_18 pgedge-coldfront pgedge-lakekeeper
 ```
 
 For PostgreSQL 18 on Ubuntu or Debian:
 
 ```bash
-sudo apt install -y pgedge-postgresql-18-coldfront
+sudo apt install -y pgedge-postgresql-18-coldfront pgedge-coldfront \
+  pgedge-lakekeeper
 ```
 
-The extension package does not include the command-line tools or Lakekeeper.
-Install `pgedge-coldfront` and `pgedge-lakekeeper` on the hosts that need
-them. For repository setup and every package name, see
+The `pgedge-lakekeeper` package installs Lakekeeper but does not start it; you
+configure and start it later, in
+[Connecting ColdFront to Lakekeeper and Object Storage](#connecting-coldfront-to-lakekeeper-and-object-storage).
+For repository setup and every package name, see
 [Using a Package to Install ColdFront](docs/installation.md#using-a-package-to-install-coldfront).
+
+#### Configuring PostgreSQL and Creating the Extensions
 
 After installing the packages, use the following steps to configure
 PostgreSQL and create the extensions:
@@ -456,8 +472,9 @@ the host.
     [Configuring your Object Store](docs/object_store.md) guide covers
     configuration of each one, including production stores.
 
-2. Install Lakekeeper. With the pgEdge repository configured, install the
-    `pgedge-lakekeeper` package:
+2. Install Lakekeeper. If you installed ColdFront from packages, Lakekeeper is
+    already installed; continue with step 3. On bare metal with the pgEdge
+    repository configured, install the `pgedge-lakekeeper` package:
 
     ```bash
     sudo dnf install -y pgedge-lakekeeper        # RHEL, Rocky Linux, AlmaLinux
