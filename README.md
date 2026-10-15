@@ -226,7 +226,7 @@ and create the extensions:
     duckdb.allow_unsigned_extensions = true
     duckdb.autoinstall_known_extensions = false
     duckdb.postgres_role = 'coldfront_duckdb'
-    coldfront.warehouse = '<warehouse-name>'
+    coldfront.warehouse = 'wh'
     coldfront.lakekeeper_endpoint = 'http://<lakekeeper-host>:8181/catalog'
     ```
 
@@ -235,6 +235,9 @@ and create the extensions:
     patched DuckDB extensions. Without them, pg_duckdb can fetch the unpatched
     upstream extensions instead. `duckdb.postgres_role` lets the application
     roles you grant access to run DuckDB; without it, only superusers can.
+    `coldfront.warehouse` names the `wh` warehouse that
+    [Connecting ColdFront to Lakekeeper and Object Storage](#connecting-coldfront-to-lakekeeper-and-object-storage)
+    creates.
 
 2. Restart PostgreSQL. `CREATE EXTENSION coldfront` fails on a server that
     does not preload the extension.
@@ -348,14 +351,16 @@ golangci-lint.
     shared_preload_libraries = 'pg_duckdb,coldfront'
     duckdb.allow_unsigned_extensions = true
     duckdb.postgres_role = 'coldfront_duckdb'
-    coldfront.warehouse = '<warehouse-name>'
+    coldfront.warehouse = 'wh'
     coldfront.lakekeeper_endpoint = 'http://<lakekeeper-host>:8181/catalog'
     ```
 
     The locally built `iceberg` extension is unsigned, so
     `duckdb.allow_unsigned_extensions` must be on. `duckdb.postgres_role` lets
     the application roles you grant access to run DuckDB; without it, only
-    superusers can.
+    superusers can. `coldfront.warehouse` names the `wh` warehouse that
+    [Connecting ColdFront to Lakekeeper and Object Storage](#connecting-coldfront-to-lakekeeper-and-object-storage)
+    creates.
 
 6. Restart PostgreSQL. `CREATE EXTENSION coldfront` fails on a server that
     does not preload the extension.
