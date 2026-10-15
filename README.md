@@ -225,20 +225,25 @@ and create the extensions:
     duckdb.extension_directory = '/usr/lib/pgedge/coldfront/duckdb-extensions'
     duckdb.allow_unsigned_extensions = true
     duckdb.autoinstall_known_extensions = false
+    duckdb.postgres_role = 'coldfront_duckdb'
     coldfront.warehouse = '<warehouse-name>'
     coldfront.lakekeeper_endpoint = 'http://<lakekeeper-host>:8181/catalog'
     ```
 
-    The three `duckdb.*` settings make pg_duckdb load ColdFront's patched
-    DuckDB extensions. Without them, pg_duckdb can fetch the unpatched
-    upstream extensions instead.
+    `duckdb.extension_directory`, `duckdb.allow_unsigned_extensions`, and
+    `duckdb.autoinstall_known_extensions` make pg_duckdb load ColdFront's
+    patched DuckDB extensions. Without them, pg_duckdb can fetch the unpatched
+    upstream extensions instead. `duckdb.postgres_role` lets the application
+    roles you grant access to run DuckDB; without it, only superusers can.
 
 2. Restart PostgreSQL. `CREATE EXTENSION coldfront` fails on a server that
     does not preload the extension.
 
-3. Connect to the database and create the extensions:
+3. Connect to the database, create the role that `duckdb.postgres_role`
+    names, and create the extensions:
 
     ```sql
+    CREATE ROLE coldfront_duckdb NOLOGIN;
     CREATE EXTENSION pg_duckdb;
     CREATE EXTENSION coldfront;
     ```
@@ -342,19 +347,24 @@ golangci-lint.
     ```ini
     shared_preload_libraries = 'pg_duckdb,coldfront'
     duckdb.allow_unsigned_extensions = true
+    duckdb.postgres_role = 'coldfront_duckdb'
     coldfront.warehouse = '<warehouse-name>'
     coldfront.lakekeeper_endpoint = 'http://<lakekeeper-host>:8181/catalog'
     ```
 
     The locally built `iceberg` extension is unsigned, so
-    `duckdb.allow_unsigned_extensions` must be on.
+    `duckdb.allow_unsigned_extensions` must be on. `duckdb.postgres_role` lets
+    the application roles you grant access to run DuckDB; without it, only
+    superusers can.
 
 6. Restart PostgreSQL. `CREATE EXTENSION coldfront` fails on a server that
     does not preload the extension.
 
-7. Connect to the database and create the extensions:
+7. Connect to the database, create the role that `duckdb.postgres_role`
+    names, and create the extensions:
 
     ```sql
+    CREATE ROLE coldfront_duckdb NOLOGIN;
     CREATE EXTENSION pg_duckdb;
     CREATE EXTENSION coldfront;
     ```
