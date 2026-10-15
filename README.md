@@ -464,6 +464,7 @@ the host.
       }' \
       | grep -oE '"warehouse-id":"[^"]+"' | cut -d'"' -f4)
 
+    [ -n "$WID" ] || echo "No warehouse ID - check that the warehouse create succeeded."
     curl -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
       -H "Content-Type: application/json" -d '{"namespace":["public"]}'
     ```
@@ -520,6 +521,7 @@ to evaluate ColdFront without a cloud account.
     this namespace:
 
     ```bash
+    [ -n "$WID" ] || echo "No warehouse ID - check that the warehouse create succeeded."
     curl -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
       -H "Content-Type: application/json" -d '{"namespace":["public"]}'
     ```
