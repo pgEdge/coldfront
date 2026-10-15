@@ -95,7 +95,7 @@ The following table lists the prerequisites for each build path:
 | Docker build (below) | Docker, network access (GitHub, ghcr.io, quay.io, curl.se, and the distribution's RPM repositories), a few GB of disk and RAM, and 30-60 minutes for the base compile. |
 | The archiver and partitioner (all paths) | Go 1.26.5+ (pinned in [go.mod](https://github.com/pgEdge/ColdFront/blob/main/go.mod)) and `make` (`make build` produces `./bin/archiver` and `./bin/partitioner`). |
 | The compactor and the CI gate | golangci-lint for `make compactor`; `./run-ci-local.sh` also needs Docker and mkdocs with mkdocs-material. |
-| Bare metal (near the end of this section) | `pg_config`, PostgreSQL server dev headers, libpq client headers and library (libpq-dev / libpq-devel), `make`, and `gcc`. |
+| Bare metal (near the end of this section) | A PostgreSQL 16, 17, or 18 server, `pg_config`, PostgreSQL server dev headers, libpq client headers and library (libpq-dev / libpq-devel), `make`, and `gcc`. |
 
 ### Preparing the DuckDB Base Image
 
