@@ -184,7 +184,9 @@ When Lakekeeper is bootstrapped, install the extensions and set the
 cold-tier credentials, once per database. Replace `<store-endpoint>` with the
 store's address as PostgreSQL reaches it, without the `http://` prefix:
 `seaweedfs:8333` in the Docker stack, or `localhost:8333` for SeaweedFS on the
-same host:
+same host. If you use `coldfront.local_pg_dsn`, described below, set it before
+you run these statements: `set_storage_secret()` installs the DuckDB
+`postgres` extension that the setting needs only when the setting is present.
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS pg_duckdb;
@@ -228,8 +230,6 @@ installation.md show:
   table with a clustered vector column. A tiered `INSERT` streams its cold
   rows through it, and renders them row by row when it is not set. Only a
   superuser can set or read it.
-  Set it before calling `set_storage_secret()`, which installs the DuckDB
-  `postgres` extension this path loads only when the setting is present.
 
 An application that connects as a non-superuser needs its role granted access
 with `coldfront.grant_app_access()`, which takes an existing role. Replace
