@@ -208,10 +208,11 @@ installation.md show:
   `postgres` extension this path loads only when the setting is present.
 
 An application that connects as a non-superuser needs its role granted access
-with `coldfront.grant_app_access()`, which takes an existing role:
+with `coldfront.grant_app_access()`, which takes an existing role. Replace
+`<role_name>` with the name of the role your application connects as:
 
 ```sql
-SELECT coldfront.grant_app_access('alice');
+SELECT coldfront.grant_app_access('<role_name>');
 ```
 
 `coldfront.grant_app_access()` derives the grants from the registry when it

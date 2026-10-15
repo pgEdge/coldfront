@@ -8,10 +8,11 @@ least privilege.
 
 Application roles need no superuser and no server-file access, yet they read
 and write the cold tier through the same transparent view. Onboarding an
-application role requires a single call:
+application role requires a single call. Replace `<role_name>` with the name of
+an existing role that your application connects as:
 
 ```sql
-SELECT coldfront.grant_app_access('alice');
+SELECT coldfront.grant_app_access('<role_name>');
 ```
 
 grant_app_access grants only the minimum the cold path needs:
