@@ -533,10 +533,11 @@ to evaluate ColdFront without a cloud account.
 #### Granting Access to Application Roles
 
 After connecting ColdFront to Lakekeeper and an object store, you must grant
-access to each application role that connects as a non-superuser:
+access to each application role that connects as a non-superuser. Replace
+`<role_name>` with the name of the role:
 
 ```sql
-SELECT coldfront.grant_app_access('<role>');
+SELECT coldfront.grant_app_access('<role_name>');
 ```
 
 Run this command again after you create, adopt, or first tier a table. The
