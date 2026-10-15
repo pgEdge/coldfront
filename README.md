@@ -473,9 +473,12 @@ the host.
       }' \
       | grep -oE '"warehouse-id":"[^"]+"' | cut -d'"' -f4)
 
-    [ -n "$WID" ] || echo "No warehouse ID - check that the warehouse create succeeded."
-    curl -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
-      -H "Content-Type: application/json" -d '{"namespace":["public"]}'
+    if [ -z "$WID" ]; then
+      echo "No warehouse ID - check that the warehouse create succeeded."
+    else
+      curl -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
+        -H "Content-Type: application/json" -d '{"namespace":["public"]}'
+    fi
     ```
 
     If you're using a different type of object store, change the
@@ -530,9 +533,12 @@ to evaluate ColdFront without a cloud account.
     this namespace:
 
     ```bash
-    [ -n "$WID" ] || echo "No warehouse ID - check that the warehouse create succeeded."
-    curl -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
-      -H "Content-Type: application/json" -d '{"namespace":["public"]}'
+    if [ -z "$WID" ]; then
+      echo "No warehouse ID - check that the warehouse create succeeded."
+    else
+      curl -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
+        -H "Content-Type: application/json" -d '{"namespace":["public"]}'
+    fi
     ```
 
 4. Store the SeaweedFS credential in each database that uses ColdFront:
