@@ -330,9 +330,9 @@ Before building ColdFront on bare metal, install the pg_duckdb PostgreSQL
 extension (built on DuckDB 1.5.4) and a patched duckdb-iceberg DuckDB
 extension. For the prerequisites and the patches, see
 [Building ColdFront from Source](docs/installation.md#building-coldfront-from-source).
-You also need `pg_config`, the PostgreSQL server development headers, the
-libpq headers and library, `make`, `gcc`, Go 1.26.5 or later, and
-golangci-lint.
+You also need a running PostgreSQL 16, 17, or 18 server, `pg_config`, the
+PostgreSQL server development headers, the libpq headers and library, `make`,
+`gcc`, Go 1.26.5 or later, and golangci-lint.
 
 1. Clone the repository:
 
