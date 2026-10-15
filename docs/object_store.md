@@ -152,7 +152,7 @@ Create a warehouse with a path-style profile pointed at your store's
 endpoint:
 
 ```bash
-curl -X POST http://localhost:8181/management/v1/warehouse \
+WID=$(curl -s -X POST http://localhost:8181/management/v1/warehouse \
   -H "Content-Type: application/json" \
   -d '{
     "warehouse-name": "wh",
@@ -173,8 +173,9 @@ curl -X POST http://localhost:8181/management/v1/warehouse \
       "aws-access-key-id": "<your-access-key-id>",
       "aws-secret-access-key": "<your-secret-key>"
     }
-  }'
-# => HTTP 201
+  }' \
+  | grep -oE '"warehouse-id":"[^"]+"' | cut -d'"' -f4)
+echo "$WID"   # => the new warehouse's ID
 ```
 
 `region` defaults to `us-east-1` if your store does not use Region
@@ -202,7 +203,7 @@ flags matter:
 Create the warehouse with those flags set:
 
 ```bash
-curl -X POST http://localhost:8181/management/v1/warehouse \
+WID=$(curl -s -X POST http://localhost:8181/management/v1/warehouse \
   -H "Content-Type: application/json" \
   -d '{
     "warehouse-name": "wh",
@@ -222,8 +223,9 @@ curl -X POST http://localhost:8181/management/v1/warehouse \
       "aws-access-key-id": "AKIAEXAMPLE...",
       "aws-secret-access-key": "<your-secret-key>"
     }
-  }'
-# => HTTP 201
+  }' \
+  | grep -oE '"warehouse-id":"[^"]+"' | cut -d'"' -f4)
+echo "$WID"   # => the new warehouse's ID
 ```
 
 The `key-prefix` is an arbitrary path inside the bucket. `coldfront` is only an
@@ -300,7 +302,7 @@ Google Cloud Storage is *not a separate Lakekeeper profile*: it uses an
 with an HMAC key pair standing in for an access key:
 
 ```bash
-curl -X POST http://localhost:8181/management/v1/warehouse \
+WID=$(curl -s -X POST http://localhost:8181/management/v1/warehouse \
   -H "Content-Type: application/json" \
   -d '{
     "warehouse-name": "wh",
@@ -321,8 +323,9 @@ curl -X POST http://localhost:8181/management/v1/warehouse \
       "aws-access-key-id": "<your-hmac-access-key-id>",
       "aws-secret-access-key": "<your-hmac-secret>"
     }
-  }'
-# => HTTP 201
+  }' \
+  | grep -oE '"warehouse-id":"[^"]+"' | cut -d'"' -f4)
+echo "$WID"   # => the new warehouse's ID
 ```
 
 Lakekeeper's native `gcs` profile is service-account only and is
@@ -344,7 +347,7 @@ Azure ADLS Gen2 uses its own Lakekeeper warehouse type, `adls`, naming
 a storage account and a filesystem (container) within it:
 
 ```bash
-curl -X POST http://localhost:8181/management/v1/warehouse \
+WID=$(curl -s -X POST http://localhost:8181/management/v1/warehouse \
   -H "Content-Type: application/json" \
   -d '{
     "warehouse-name": "wh",
@@ -358,8 +361,9 @@ curl -X POST http://localhost:8181/management/v1/warehouse \
       "credential-type": "shared-access-key",
       "key": "<your-account-key>"
     }
-  }'
-# => HTTP 201
+  }' \
+  | grep -oE '"warehouse-id":"[^"]+"' | cut -d'"' -f4)
+echo "$WID"   # => the new warehouse's ID
 ```
 
 The warehouse's `storage-credential` is Lakekeeper's own credential for
@@ -388,13 +392,11 @@ use `SELECT coldfront.set_storage_secret_vended('azure');` instead of
 
 ### Pre-Creating the Namespace
 
-Regardless of backend, resolve the warehouse id and pre-create the
-`public` namespace under it:
+Regardless of backend, pre-create the `public` namespace under the warehouse,
+using the ID that the warehouse-create command saved in `WID`:
 
 ```bash
-WID=$(curl -s http://localhost:8181/management/v1/warehouse \
-  | grep -oE '"warehouse-id":"[^"]+"' | head -1 | cut -d'"' -f4)
-[ -n "$WID" ] || { echo "no warehouse id - did the warehouse create return 201?"; exit 1; }
+[ -n "$WID" ] || { echo "no warehouse id - did the warehouse create succeed?"; exit 1; }
 
 curl -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
   -H "Content-Type: application/json" \
