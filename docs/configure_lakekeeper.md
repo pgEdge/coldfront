@@ -62,8 +62,17 @@ This repository's own packaging templates make convenient starting
 points for the environment file and systemd unit, since you already
 have the repo cloned to build the `coldfront` extension:
 `packaging/lakekeeper/common/lakekeeper.env` and
-`packaging/lakekeeper/common/lakekeeper.service`. Copy them into
-`/etc/lakekeeper/lakekeeper.env` and the systemd unit directory.
+`packaging/lakekeeper/common/lakekeeper.service`. Copy them into place, with
+the environment file readable only by root and the `lakekeeper` group, as the
+package installs it:
+
+```bash
+sudo install -D -m 0640 -g lakekeeper packaging/lakekeeper/common/lakekeeper.env \
+  /etc/lakekeeper/lakekeeper.env
+sudo install -m 0644 packaging/lakekeeper/common/lakekeeper.service \
+  /etc/systemd/system/lakekeeper.service
+sudo systemctl daemon-reload
+```
 
 ## Preparing and Starting Lakekeeper
 
@@ -90,11 +99,13 @@ installed it:
     key, so keep the key stable and backed up. Every node that shares the
     catalog needs the same key.
 
-3. Run the one-time database migration as the `lakekeeper` user:
+3. Run the one-time database migration as the `lakekeeper` user. The
+    command reads the environment file as that user, because the file is not
+    readable by other accounts:
 
     ```bash
-    set -a; . /etc/lakekeeper/lakekeeper.env; set +a
-    sudo -E -u lakekeeper /usr/bin/lakekeeper migrate
+    sudo -u lakekeeper sh -c \
+      'set -a; . /etc/lakekeeper/lakekeeper.env; set +a; exec /usr/bin/lakekeeper migrate'
     ```
 
 4. Enable and start the service:
