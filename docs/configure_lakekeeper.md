@@ -108,16 +108,28 @@ installed it:
       'set -a; . /etc/lakekeeper/lakekeeper.env; set +a; exec /usr/bin/lakekeeper migrate'
     ```
 
-4. Enable and start the service:
+4. Secure the listener before you start the service. By default, Lakekeeper
+    listens on port 8181 on every address and, with no authorization backend,
+    accepts every request. Do not start it that way:
+
+    - If every client runs on the same host, set the following in
+      `/etc/lakekeeper/lakekeeper.env`:
+
+        ```bash
+        LAKEKEEPER__BIND_IP=127.0.0.1
+        ```
+
+    - If clients connect from other hosts, configure
+      [authentication](https://docs.lakekeeper.io/docs/latest/authentication/)
+      and an enforcing
+      [authorization](https://docs.lakekeeper.io/docs/latest/authorization/)
+      backend, and limit access to port 8181 with a firewall.
+
+5. Enable and start the service:
 
     ```bash
     sudo systemctl enable --now lakekeeper
     ```
-
-Lakekeeper listens on port 8181 on every address by default. Without an
-authorization backend in `lakekeeper.env`, the catalog accepts every request,
-so configure authentication and authorization before you expose the service
-beyond a trusted network.
 
 ## Bootstrapping Lakekeeper
 
