@@ -423,12 +423,20 @@ the host.
     ```
 
 4. In `/etc/lakekeeper/lakekeeper.env`, set the catalog's connection string
-    and an encryption key. Keep the key stable and backed up:
+    and an encryption key, and bind Lakekeeper to the loopback address. Keep
+    the key stable and backed up:
 
     ```bash
     LAKEKEEPER__PG_DATABASE_URL_WRITE=postgresql://lakekeeper:change-me@127.0.0.1:5432/lakekeeper
     LAKEKEEPER__PG_ENCRYPTION_KEY=<output of: openssl rand -base64 32>
+    LAKEKEEPER__BIND_IP=127.0.0.1
     ```
+
+    By default, Lakekeeper listens on every address and accepts every request.
+    The loopback bind keeps it reachable only from this host. To accept clients
+    from other hosts, configure authentication and authorization first, as
+    described in
+    [Preparing and Starting Lakekeeper](docs/configure_lakekeeper.md#preparing-and-starting-lakekeeper).
 
 5. Run the one-time migration as the `lakekeeper` user, then start
     Lakekeeper. The migration reads the environment file as that user, because
