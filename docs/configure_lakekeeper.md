@@ -72,7 +72,7 @@ The `pgedge-lakekeeper` package installs the `lakekeeper` binary and a
 `lakekeeper` systemd service, but it does not enable or start the
 service.
 
-### Building from Source
+### Installing the Upstream Binary
 
 Download the matching upstream prebuilt release directly - there is no
 source build; the release ships a single stripped binary (glibc 2.34 or

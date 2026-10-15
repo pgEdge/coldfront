@@ -52,7 +52,7 @@ or by registering the table directly:
 
 See [Writing ColdFront's Configuration](configuration.md#writing-coldfronts-configuration)
 for how `register` and `import` write this, and what the server checks, and
-[Managing Partitioned Tables (CLI)](usage_partitioner.md#managing-partitioned-tables-cli)
+[Managing Partitioned Tables (CLI)](using_coldfront/index.md#managing-partitioned-tables-cli)
 for `list`, `set`, `remove`, and `export`, which the archiver shares with the
 partitioner.
 
@@ -82,7 +82,7 @@ lifecycle is **hot → `hot_period` → cold → `retention_period` → gone**;
 omit `retention_period` to keep cold data forever.
 
 To remove a tiered table's cold tier entirely rather than waiting out its
-retention period, see [Dropping an Iceberg Table](usage_decoupled.md#dropping-an-iceberg-table-both-modes).
+retention period, see [Dropping an Iceberg Table](using_coldfront/index.md#dropping-an-iceberg-table).
 
 ## Inbound Foreign Keys
 

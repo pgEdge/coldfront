@@ -129,7 +129,7 @@ PG-side wrapper view.
 ## Supported Column Types
 
 The supported column types are exactly the set that round-trips cleanly between
-PG and Iceberg. Both modes take them from one type map,
+PG and Iceberg. Tiered and decoupled tables take them from one type map,
 `coldfront._iceberg_storage_type`. Anything outside this list is rejected at
 table-creation time.
 
@@ -445,7 +445,7 @@ Adoption inherits three limits:
 
 ## Wrapper Helper: `coldfront.drop_iceberg_table()`
 
-Drops the Iceberg table backing a registered relation, in either mode:
+Drops the Iceberg table backing a registered tiered or decoupled relation:
 
 ```sql
 -- catalog entry and stored objects both go
@@ -455,9 +455,9 @@ SELECT coldfront.drop_iceberg_table('public', 'events', true);
 SELECT coldfront.drop_iceberg_table('public', 'events', false);
 ```
 
-One verb covers both modes because in both the thing being dropped is the
-Iceberg table. What that means for PostgreSQL differs, because the modes
-differ, and the function says which path it took in a NOTICE:
+One verb covers tiered and decoupled tables because, for each, the thing being
+dropped is the Iceberg table. What that means for PostgreSQL differs, because
+the modes differ, and the function says which path it took in a NOTICE:
 
 - For an iceberg-only table, the Iceberg table is the whole relation, so
   nothing remains. This is the inverse of `create_iceberg_table()`.
@@ -810,8 +810,8 @@ mandatory in any multi-node setup.
 
 ## When to Use Decoupled vs Tiered
 
-The two modes suit different workloads; the guidance below summarizes when each
-one fits.
+Decoupled and tiered modes suit different workloads; the guidance below
+summarizes when each one fits.
 
 Decoupled (iceberg-only) is the right choice when:
 

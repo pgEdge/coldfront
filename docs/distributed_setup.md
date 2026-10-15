@@ -4,7 +4,7 @@ For multi-writer iceberg workloads, run ColdFront on PostgreSQL nodes in a
 Spock mesh against the same Lakekeeper + S3. The bakery serializes commits
 PostgreSQL-side so writers never collide at the catalog.
 
-### Per-Node `postgresql.conf`
+## Per-Node `postgresql.conf`
 
 The configuration below applies to each node in the mesh:
 
@@ -123,7 +123,7 @@ The subscriptions set
 already exist on every node from the `coldfront` extension, so no initial copy
 is needed.
 
-### Timeouts
+## Timeouts
 
 The following table lists the two `postgresql.conf` settings that decide
 how long a cold write waits for a peer; set them together, on every node:
@@ -148,7 +148,7 @@ Both take effect on a reload (`ALTER SYSTEM SET ...;` then
 `SELECT pg_reload_conf();`), no restart: walsenders re-read the timeout, and
 each claim reads the window once.
 
-### What `coldfront.ensure_replicated()` Does
+## What `coldfront.ensure_replicated()` Does
 
 The call is the one ColdFront-specific step of the mesh setup. It adds eight
 tables to the node's replication sets (`claim_acks` to `default_insert_only`,

@@ -118,11 +118,16 @@ The command brings up four containers:
 - a one-shot migrate job that applies Lakekeeper's schema migrations
   and then exits.
 
-The command also starts a bundled SeaweedFS object-store emulator,
-gated behind the `local-store` profile, reserved for credential-free
-local evaluation of the S3-compatible path. If you are connecting to a
-real S3-compatible store, AWS S3, GCS, or Azure, you connect to it
-directly and never need SeaweedFS.
+The command does not start the bundled SeaweedFS object-store emulator,
+which runs only under the `local-store` profile. For credential-free local
+evaluation of the S3-compatible path, start the stack with the profile:
+
+```bash
+docker compose --profile local-store up -d --build
+```
+
+If you are connecting to a real S3-compatible store, AWS S3, GCS, or Azure,
+connect to it directly and leave the profile off.
 
 ---
 
@@ -482,7 +487,7 @@ table's lifecycle is registered with `archiver register`. The credential and
 warehouse you set up above are exactly what it needs. See
 [Writing ColdFront's Configuration](configuration.md#writing-coldfronts-configuration)
 for the archiver configuration and
-[Managing Partitioned Tables (CLI)](usage_partitioner.md#managing-partitioned-tables-cli)
+[Managing Partitioned Tables (CLI)](using_coldfront/index.md#managing-partitioned-tables-cli)
 for the partition CLI.
 
 ---

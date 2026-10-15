@@ -368,6 +368,7 @@ To go further with ColdFront, consult the following guides:
   configures, and bootstraps it, then installs the extensions each
   database needs.
 - The [Walkthrough](exploring_coldfront/index.md) guide runs the demo stack hands-on.
-- The [Using ColdFront](using_coldfront/index.md) guide documents both operating modes.
+- The [Using ColdFront](using_coldfront/index.md) guide documents the tiered,
+  decoupled, and standalone partitioned modes.
 - The [Configuring your Object Store](object_store.md)
   guide connects the cold tier to AWS S3.

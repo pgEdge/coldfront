@@ -43,7 +43,8 @@ A few supported types need a closer look:
   value in a `date`, `timestamp with time zone` or `timestamp without time
   zone` column, as array elements too. ColdFront refuses those values with
   a check constraint named `coldfront_guard_<column>`; a write that goes to
-  the cold tier, in either mode, is refused by DuckDB, unless the write reads a
+  the cold tier of a tiered or decoupled table is refused by DuckDB, unless the
+  write reads a
   `numeric` `NaN` from a PostgreSQL table and stores it as `0`.
 - `char(N)` is stored and read as `varchar`. Values, comparisons, and
   `length()` round-trip losslessly, but a cold read comes back unpadded
@@ -131,7 +132,7 @@ DuckDB entirely. Such a read returns `data` as native `jsonb` rather than the
 view's `json`. Reads that span tiers, are cold-only, or reach the view through
 a join or sub-query stay in DuckDB, where the limits above apply.
 
-### Supported Array Types
+## Supported Array Types
 
 A one-dimensional array of a supported type tiers as an Iceberg list of that
 type. The following table shows how each array type is stored and how the view

@@ -1,8 +1,8 @@
 # Working with Embeddings
 
 ColdFront stores embeddings in the cold tier as Iceberg `list<float>` and keeps
-the pgvector interface you already write. A vector column works in both modes:
-a tiered table whose recent rows stay in PostgreSQL, and a decoupled table that
+the pgvector interface you already write. A vector column works in a tiered
+table, whose recent rows stay in PostgreSQL, and in a decoupled table, which
 lives entirely in Iceberg.
 
 ## Creating a Table
@@ -432,5 +432,5 @@ To go further with ColdFront, consult the following documents:
   state, cluster assignment, and probe rewrite behind this guide.
 - The [Compaction](compaction.md) guide covers the maintenance that keeps
   clustered tables in cluster order.
-- The [Using ColdFront](using_coldfront/index.md) guide covers the table setup both modes
-  share.
+- The [Using ColdFront](using_coldfront/index.md) guide covers the table setup
+  that tiered and decoupled tables share.

@@ -526,7 +526,8 @@ a partition-column SET separately by the `coldfront.allow_mixed_writes` GUC:
   value.
 
 Before anything is archived (no cutoff) every row is hot, so a partition-column
-`UPDATE` is a plain hot `UPDATE` in either mode.
+`UPDATE` is a plain hot `UPDATE` whether `coldfront.allow_mixed_writes` is on
+or off.
 
 ## Write Modes: Strict vs Permissive (`allow_mixed_writes`)
 

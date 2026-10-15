@@ -142,58 +142,13 @@ Lakekeeper.
 One relation can be registered per Iceberg table. A namespace that needs
 quoting, such as `Lake-EU`, works.
 
-## Dropping an Iceberg Table (Both Modes)
+## Handing an Adopted Table Back
 
-`coldfront.drop_iceberg_table()` removes the Iceberg table backing a registered
-relation. The function is the only sanctioned way to do so: a plain
-`DROP TABLE` or `DROP VIEW` on a registered relation stays blocked, because it
-would leave the cold tier behind with nothing pointing at it.
-
-The call takes the schema, the table, and an explicit purge decision:
-
-```sql
--- drop the catalog entry and delete the stored objects
-SELECT coldfront.drop_iceberg_table('public', 'events', true);
-
--- drop the catalog entry and leave the objects in the object store
-SELECT coldfront.drop_iceberg_table('public', 'events', false);
-```
-
-What remains afterwards depends on the mode, and the call reports which path it
-took:
-
-- in decoupled mode the Iceberg table is the whole relation, so nothing remains
-  in PostgreSQL.
-- in [tiered mode](usage_tiered.md) the Iceberg table is the cold tier, so the
-  cold tier is removed and the hot table returns under the relation's own
-  name, as an ordinary partitioned table holding the data that had not yet
-  aged out.
-
-In tiered mode the call also deletes the table's `partition_config` row, which
-stops the archiver from tiering it again on the next run.
-
-There is no default for the purge argument, because the two outcomes are
-irreversible in opposite directions. Passing `true` deletes the Parquet and
-metadata objects, which for the cold tier are the only copy of that data.
-Passing `false` keeps those objects but removes the catalog entry that
-ColdFront would need to reach them again, so nothing reclaims them afterwards;
-use it when another system is taking ownership of the files.
-
-ColdFront has no guard of its own against dropping the wrong table. The
-preventive control lives in Lakekeeper: table protection has to be enabled
-manually, per table, and a protected table cannot be dropped at all, whether or
-not purge is requested. This function cannot override a hold.
-
-Deletion is not instantaneous. The catalog entry disappears with the call, and
-Lakekeeper's own background queue removes the objects shortly afterwards, so a
-listing taken immediately after the call can still show them.
-
-### Handing an Adopted Table Back
-
-An adopted table is released rather than dropped, because ColdFront does not
-own it. `coldfront.release_iceberg_table()` removes the wrapper view, the
-registry row and the relation's vector configuration, and performs no Iceberg
-I/O, so the table keeps every row and stays in the catalog:
+An adopted table is released rather than
+[dropped](using_coldfront/index.md#dropping-an-iceberg-table),
+because ColdFront does not own it. `coldfront.release_iceberg_table()` removes
+the wrapper view, the registry row and the relation's vector configuration, and
+performs no Iceberg I/O, so the table keeps every row and stays in the catalog:
 
 ```sql
 SELECT coldfront.release_iceberg_table('public', 'orders');

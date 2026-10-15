@@ -5,8 +5,8 @@ cwd: ../
 
 Decoupled mode stores a table entirely in Iceberg from the first row.
 PostgreSQL holds a thin wrapper view and a registry entry. This is a fresh
-table - there is no migration from the tiered demo, and the two modes are
-independent.
+table - there is no migration from the tiered demo, and tiered and decoupled
+tables are independent.
 
 Run the steps in [Setting Up the Stack](exploring_coldfront/index.md#setting-up-the-stack)
 before you start this demo. The demo also needs the extensions and storage
@@ -178,9 +178,9 @@ To go further with ColdFront, consult the following guides:
 
 - The [Partitioner Demo](walkthrough_partitioner.md) manages PostgreSQL range
   partitions without any cold tier.
-- The [Using ColdFront](using_coldfront/index.md) guide covers both modes in depth, including
-  the full one-time setup, supported column types, the partition manager CLI,
-  and tuning options.
+- The [Using ColdFront](using_coldfront/index.md) guide compares the tiered,
+  decoupled, and standalone partitioned modes, and covers dropping Iceberg
+  tables and the partition management CLI.
 - The [Architecture](architecture_guides/index.md) overview explains the shared mechanics
   and links to the per-mode deep dives.
 - The [Tearing Down the Stack](exploring_coldfront/index.md#tearing-down-the-stack) section

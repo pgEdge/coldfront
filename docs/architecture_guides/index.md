@@ -522,7 +522,7 @@ mode (the archiver those with a `hot_period`, the partitioner those without),
 and exit with an error when they find none; tables enter it via `register`, or
 from a YAML `archiver.tables` list fed to `import`. Both expose a management
 CLI - `register` / `list` / `set` / `remove` / `import` / `export` - documented
-in [Managing Partitioned Tables (CLI)](../usage_partitioner.md#managing-partitioned-tables-cli).
+in [Managing Partitioned Tables (CLI)](../using_coldfront/index.md#managing-partitioned-tables-cli).
 
 ## Known Limitations
 
@@ -807,5 +807,6 @@ To go further with ColdFront, consult the following documents:
   iceberg-only tables, their ACID model, and the bakery protocol.
 - The [Vector Storage](../architecture_vectors.md) deep dive describes how
   embeddings are stored, assigned to clusters, and searched.
-- The [Using ColdFront](../using_coldfront/index.md) guide covers day-to-day use of both modes.
+- The [Using ColdFront](../using_coldfront/index.md) guide covers day-to-day
+  use of the tiered, decoupled, and standalone partitioned modes.
 

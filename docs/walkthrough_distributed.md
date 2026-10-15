@@ -228,9 +228,9 @@ number and no fork.
 
 To go further with ColdFront, consult the following guides:
 
-- The [Using ColdFront](using_coldfront/index.md) guide covers both modes in depth, including
-  the full one-time setup, supported column types, the partition manager CLI,
-  and tuning options.
+- The [Using ColdFront](using_coldfront/index.md) guide compares the tiered,
+  decoupled, and standalone partitioned modes, and covers dropping Iceberg
+  tables and the partition management CLI.
 - The [Architecture](architecture_guides/index.md) overview explains the shared mechanics
   and links to the per-mode deep dives.
 - The [Compaction](compaction.md) guide covers cold-tier maintenance:
