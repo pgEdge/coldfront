@@ -1,43 +1,63 @@
 ---
-cwd: ../
+cwd: ../../
 ---
-# Getting Started with ColdFront
+# Exploring ColdFront - Getting Started
 
-If you are new to ColdFront, run the guided walkthrough.
+This walkthrough is the foundation step for the mode-specific guides that
+follow:
 
-The walkthrough is a self-contained, step-by-step tour of ColdFront's three
-operating modes - tiered storage (hot PostgreSQL + cold Iceberg), decoupled
-mode (Iceberg-only from the first row), and the standalone partitioner - plus a
-distributed demo that runs two nodes over one shared lake. Every command on
-this page is real: click it to run in Codespaces, or copy it into a local
-shell.
+- [Exploring Tiered Storage](../walkthrough_tiered.md)
+- [Exploring Decoupled Mode](../walkthrough_decoupled.md)
+- [Exploring the Standalone Partitioner](../walkthrough_partitioner.md)
+- [Exploring Distributed Mode](../walkthrough_distributed.md)
+
+It is a self-contained, step-by-step tour of ColdFront's three operating
+modes, using Docker containers deployed with the Compose files in the
+ColdFront repository. The walkthrough demonstrates:
+
+- tiered storage, which keeps recent data in PostgreSQL and archives older
+  data to cold Iceberg.
+- decoupled mode, which stores a table entirely in Iceberg from the first
+  row.
+- the standalone partitioner, which manages PostgreSQL partitions with no
+  cold tier at all.
+- a distributed demo that runs two nodes over one shared lake.
 
 > **Beta software** - ColdFront is beta software under active development. Do
 > not use it in production. Interfaces, on-disk formats, and behavior may
 > change without notice, and data loss is possible.
 
-## Running in GitHub Codespaces
+!!! tip "Running in GitHub Codespaces"
 
-[Open this repo in a Codespace](https://github.com/codespaces/new?repo=pgEdge/coldfront)
-and everything is preinstalled - Docker, psql, and the
-[Runme extension](https://marketplace.visualstudio.com/items?itemName=stateful.runme)
-that turns each code block below into a runnable cell. Click **Run** on each
-cell as you read. The first cell builds the Docker images (two to five
-minutes); everything after it is quick.
+    [Open this repo in a Codespace](https://github.com/codespaces/new?repo=pgEdge/coldfront)
+    and select `Get Started` to deploy this walkthrough in a Codespace
+    environment. Docker, psql, and the
+    [Runme extension](https://marketplace.visualstudio.com/items?itemName=stateful.runme)
+    are preinstalled, and turn each code block below into a runnable cell.
+    Click **Run** on each cell as you read. The first cell builds the Docker
+    images (two to five minutes); each subsequent step is quicker.
 
-If you prefer a terminal, `bash examples/walkthrough/guide.sh` runs the same
-demos as an interactive guide.
+If you prefer a terminal, run
+[`examples/walkthrough/guide.sh`](https://github.com/pgEdge/ColdFront/blob/main/examples/walkthrough/guide.sh).
+It brings up the stack, then presents the same four demos as an
+interactive menu - tiered, decoupled, partitioner, and distributed -
+plus options to reset the demo tables or tear the stack down.
 
-## Running on Your Own Machine
+## Walking Through on your own System
 
-You need Docker 24+ with Compose V2 (the `docker compose` plugin, not the
-legacy `docker-compose` binary), roughly 3 GB of free disk inside Docker's
-virtual disk (the images alone are about 2.5 GB), and `curl`, `bash`, and
-`psql` on the host. The interactive guide also needs `ss` on Linux or `lsof` on
-macOS, which it uses to find free ports.
+Before performing the walkthrough, confirm that your system meets the
+following prerequisites:
 
-The fastest path is the one-liner, which downloads the walkthrough files and
-launches the interactive guide:
+- Docker 24+ with Compose V2 (the `docker compose` plugin, not the legacy
+  `docker-compose` binary).
+- roughly 3 GB of free disk inside Docker's virtual disk (the images alone
+  are about 2.5 GB).
+- `curl`, `bash`, and `psql` reside on the host.
+- `ss` on Linux or `lsof` on macOS, which the interactive guide uses to find
+  free ports.
+
+The following curl command downloads the walkthrough files and launches the
+interactive guide:
 
 ```bash {"ignore":"true"}
 curl -fsSL \
@@ -74,7 +94,7 @@ Setup runs before the demos begin. Setup starts the containers, waits for
 PostgreSQL and Lakekeeper to accept connections, and creates the Lakekeeper
 warehouse and namespace. The stack includes the following services:
 
-- PostgreSQL 16, 17, or 18 with the pg_duckdb and coldfront extensions.
+- PostgreSQL 16, 17, or 18 with the pg_duckdb and `coldfront` extensions.
 - SeaweedFS, a local S3-compatible object store standing in for a real cloud
   bucket.
 - Lakekeeper, the Iceberg REST catalog that tracks table metadata and file
@@ -113,8 +133,8 @@ curl -sf -X POST http://localhost:8181/management/v1/bootstrap \
   -H 'Content-Type: application/json' \
   -d '{"accept-terms-of-use":true}'
 
-# Create the warehouse (retried by guide.sh until 200)
-curl -sf -X POST http://localhost:8181/management/v1/warehouse \
+# Create the warehouse and save its ID (retried by guide.sh until 200)
+WID=$(curl -sf -X POST http://localhost:8181/management/v1/warehouse \
   -H 'Content-Type: application/json' \
   -d '{
     "warehouse-name": "wh",
@@ -134,23 +154,25 @@ curl -sf -X POST http://localhost:8181/management/v1/warehouse \
       "aws-access-key-id": "admin",
       "aws-secret-access-key": "adminsecret"
     }
-  }'
+  }' \
+  | grep -oE '"warehouse-id":"[^"]+"' | cut -d'"' -f4)
 
 # Seed the public namespace
-WID=$(curl -s http://localhost:8181/management/v1/warehouse \
-  | grep -oE '"warehouse-id":"[^"]+"' \
-  | head -1 | cut -d'"' -f4)
-curl -sf -X POST \
-  "http://localhost:8181/catalog/v1/${WID}/namespaces" \
-  -H 'Content-Type: application/json' \
-  -d '{"namespace":["public"]}'
+if [ -z "$WID" ]; then
+  echo "No warehouse ID - check that the warehouse create succeeded."
+else
+  curl -sf -X POST \
+    "http://localhost:8181/catalog/v1/${WID}/namespaces" \
+    -H 'Content-Type: application/json' \
+    -d '{"namespace":["public"]}'
+fi
 ```
 
 ### Using a Cloud Object Store
 
 The walkthrough uses SeaweedFS by default. To use a cloud store instead,
 replace the warehouse JSON above, the `set_storage_secret` call in
-[Step 5](walkthrough_tiered.md#pointing-coldfront-at-the-object-store) of the
+[Step 5](../walkthrough_tiered.md#pointing-coldfront-at-the-object-store) of the
 tiered demo, and the `s3:` block in
 `examples/walkthrough/config/archiver.yaml`, which `import` writes into the
 server as the storage secret.
@@ -165,10 +187,8 @@ store:
 | GCS (HMAC) | `SELECT coldfront.set_storage_secret(p_key_id => '<hmac-key>', p_secret => '<hmac-secret>', p_endpoint => 'storage.googleapis.com', p_region => 'us-east-1', p_url_style => 'path', p_use_ssl => true);` |
 | Azure ADLS Gen2 | `SELECT coldfront.set_storage_secret_azure('AccountName=<account>;AccountKey=<key>;EndpointSuffix=core.windows.net');` |
 
-The [Configuring your Object Store](object_store.md) guide shows the matching
-warehouse JSON for AWS S3; for GCS and Azure, see the
-[Storage Backends](usage.md#storage-backends) section of the Using ColdFront
-guide.
+The [Configuring your Object Store](../object_store.md) guide shows the
+matching Lakekeeper warehouse JSON for each of these backends.
 
 ## Tearing Down the Stack
 
@@ -184,7 +204,7 @@ The `-v` flag removes the named volumes: `pgdata` (PostgreSQL), `lkdata` (the
 Lakekeeper catalog) and `s3data` (the object store). Omit the flag to keep the
 data for a later session.
 
-If you ran the [distributed demo](walkthrough_distributed.md), tear down its
+If you ran the [distributed demo](../walkthrough_distributed.md), tear down its
 separate mesh stack too:
 
 ```bash
@@ -200,13 +220,13 @@ switches back to the single-node stack.
 
 ## Next Steps
 
-With the stack running, continue with the following guides:
+With the stack running, continue with the following walkthroughs:
 
-- The [Tiered Storage Demo](walkthrough_tiered.md) adds ColdFront to an
+- The [Tiered Storage Demo](../walkthrough_tiered.md) adds ColdFront to an
   existing database and moves its cold data to object storage.
-- The [Decoupled Mode Demo](walkthrough_decoupled.md) stores a table in Iceberg
+- The [Decoupled Mode Demo](../walkthrough_decoupled.md) stores a table in Iceberg
   from the first row and adopts a table that another engine wrote.
-- The [Partitioner Demo](walkthrough_partitioner.md) manages PostgreSQL range
+- The [Partitioner Demo](../walkthrough_partitioner.md) manages PostgreSQL range
   partitions without any cold tier.
-- The [Distributed Demo](walkthrough_distributed.md) points two PostgreSQL
+- The [Distributed Demo](../walkthrough_distributed.md) points two PostgreSQL
   nodes at one shared lake.

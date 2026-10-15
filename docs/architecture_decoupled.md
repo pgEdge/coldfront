@@ -6,9 +6,9 @@ archiver. PostgreSQL becomes a stateless compute front-end. Lakekeeper and the
 underlying object store own the storage. Decoupled mode shares the same
 codebase, docker stack and extension as tiered mode. The shared mechanics -
 pg_duckdb Iceberg I/O, the rewrite hook, the bakery protocol, the registry -
-are in [architecture.md](architecture.md); tiered mode is in
-[architecture_tiered.md](architecture_tiered.md). This document covers what is
-specific to decoupled mode.
+are in the [Architecture Overview](architecture_guides/index.md); tiered mode
+is in [Tiered Operating Mode](architecture_tiered.md). This document covers
+what is specific to decoupled mode.
 
 ## What "Decoupled" Means
 
@@ -25,10 +25,10 @@ this document, concern by concern:
 | `coldfront.tiered_views` row | The row is required for each managed table. | The row is required (with `is_iceberg_only = true`), and `create_iceberg_table()` registers it. |
 | Required at runtime | `pg_duckdb`, `coldfront`, Lakekeeper, an S3-compatible store or Azure ADLS Gen2 | `pg_duckdb`, `coldfront` (lazy catalog ATTACH, DML rewrite, and write serialization), Lakekeeper, an S3-compatible store or Azure ADLS Gen2 |
 
-The coldfront extension provides the lazy catalog-attach glue: the C extension
-hook intercepts the first query that touches a tiered view (read or write) and,
-if the Iceberg catalog `ice` is not yet attached in this session, issues the
-following against the GUCs `coldfront.warehouse` and
+The `coldfront` extension provides the lazy catalog-attach glue: the C
+extension hook intercepts the first query that touches a tiered view (read or
+write) and, if the Iceberg catalog `ice` is not yet attached in this session,
+issues the following against the GUCs `coldfront.warehouse` and
 `coldfront.lakekeeper_endpoint`:
 
 ```sql
@@ -80,8 +80,7 @@ because the DSN can hold credentials. `set_storage_secret` installs the
 attaches `pglocal` when such a write runs. With the GUC unset, that write
 fails, because DuckDB has no `pglocal` catalog to resolve. The extension reads
 a `numeric` `NaN` as `0` and renumbers an array to start at 1, so such a write
-can store a changed value, as
-[Reading a PostgreSQL Table in a Cold-Tier Write](usage.md#reading-a-postgresql-table-in-a-cold-tier-write)
+can store a changed value, as [Supported Column Types](supported_types.md)
 describes.
 
 After that, the first query touching a tiered view in any session lazily
@@ -89,7 +88,7 @@ attaches the catalog and `ice.public.*` becomes available.
 
 ## Interface
 
-With the coldfront extension loaded and the storage secret set, the wrapper
+With the `coldfront` extension loaded and the storage secret set, the wrapper
 view supports the operations below.
 
 ### What Works
@@ -101,7 +100,7 @@ notes:
 |---|---|---|
 | Lazy catalog ATTACH | The C hook calls `ensure_attached()` on the first query that touches a tiered view. | The ATTACH costs one round-trip on the first Iceberg query per session. |
 | CREATE TABLE | `SELECT duckdb.raw_query('CREATE TABLE ice.<ns>.<name> (...)')` | The statement is DuckDB SQL in attached-catalog syntax. |
-| INSERT | The C hook rewrites an `INSERT INTO <view>` whose source is `VALUES (…)`, `SELECT … FROM <pg_table>` or `SELECT … FROM generate_series(…)` to one `SELECT coldfront._exec_iceberg_with_claim(<ref>, 'INSERT INTO ice.<ns>.<name> …')`. Source-table references get the prefix `pglocal.<schema>.<table>`, so DuckDB's postgres extension streams the source via libpq into the Iceberg writer. That attachment needs `coldfront.local_pg_dsn` (see [Bootstrap Sequence](#bootstrap-sequence)). A `WITH` entry that modifies data is refused, because DuckDB 1.5 has no data-modifying `WITH`. An `INSERT` nested in a `WITH` entry is rewritten in place when it reads no other entry, since DuckDB does not see them. | Each INSERT produces a single Iceberg snapshot, regardless of row count. |
+| INSERT | The C hook rewrites an `INSERT INTO <view>` whose source is `VALUES (…)`, `SELECT … FROM <pg_table>` or `SELECT … FROM generate_series(…)` to one `SELECT coldfront._exec_iceberg_with_claim(<ref>, 'INSERT INTO ice.<ns>.<name> …')`. Source-table references get the prefix `pglocal.<schema>.<table>`, so DuckDB's `postgres` extension streams the source via libpq into the Iceberg writer. That attachment needs `coldfront.local_pg_dsn` (see [Bootstrap Sequence](#bootstrap-sequence)). A `WITH` entry that modifies data is refused, because DuckDB 1.5 has no data-modifying `WITH`. An `INSERT` nested in a `WITH` entry is rewritten in place when it reads no other entry, since DuckDB does not see them. | Each INSERT produces a single Iceberg snapshot, regardless of row count. |
 | UPDATE | The hook rewrites `UPDATE <view> SET … WHERE …` to `SELECT coldfront._exec_iceberg_with_claim(<ref>, 'UPDATE ice.<ns>.<name> SET ... WHERE ...')`. | Iceberg applies the update as merge-on-read. |
 | DELETE | The hook rewrites `DELETE FROM <view> WHERE …` to `SELECT coldfront._exec_iceberg_with_claim(<ref>, 'DELETE FROM ice.<ns>.<name> WHERE ...')`. | Iceberg records the delete in position-delete files. |
 | MERGE (PostgreSQL 17 and later) | The hook rewrites `MERGE INTO <view> USING … ON … WHEN …` to `SELECT coldfront._exec_iceberg_with_claim(<ref>, 'MERGE INTO ice.<ns>.<name> …')`, the source's PostgreSQL tables prefixed with `pglocal.<schema>.<table>` and each `INSERT` action's `OVERRIDING` clause dropped. Nested in a `WITH` entry it is rewritten in place when it reads no other entry, since DuckDB does not see them. | duckdb-iceberg runs one `UPDATE` or `DELETE` action per statement, and no `RETURNING`. |
@@ -130,7 +129,7 @@ PG-side wrapper view.
 ## Supported Column Types
 
 The supported column types are exactly the set that round-trips cleanly between
-PG and Iceberg. Both modes take them from one type map,
+PG and Iceberg. Tiered and decoupled tables take them from one type map,
 `coldfront._iceberg_storage_type`. Anything outside this list is rejected at
 table-creation time.
 
@@ -167,7 +166,8 @@ which would lose precision or identity:
 - custom enums, `xml`, `tsvector`/`tsquery`, range types, and multirange types.
 - composite types.
 - arrays of `timestamptz`, `jsonb`, `json`, `interval` or a vector type, and
-  arrays of arrays; [Arrays](usage.md#arrays) gives the reasons.
+  arrays of arrays; [Supported Array Types](supported_types.md#supported-array-types)
+  gives the reasons.
 - pgvector's `sparsevec`.
 - any type not enumerated above.
 
@@ -206,8 +206,8 @@ DELETE FROM events WHERE id = 1;
 The fourth argument, `p_partition_cols`, is the table's Iceberg partitioning as
 a `text[]` of `PARTITIONED BY` terms, passed to DuckDB as written; the terms,
 and how a term with a comma or a quoted name is written in the array literal,
-are in the [Mode 2](usage.md#mode-2-decoupled-iceberg-only) section of the
-Using ColdFront guide. DuckDB refuses an unknown transform, a bad argument or a
+are in the [Using ColdFront in Decoupled Mode](usage_decoupled.md) guide.
+DuckDB refuses an unknown transform, a bad argument or a
 column outside the schema at `CREATE TABLE`. The one check DuckDB leaves to the
 first `INSERT`, a time transform on a column that is not a timestamp or date
 (for `hour`, not a timestamp), `coldfront._partition_clause()` makes at the
@@ -445,7 +445,7 @@ Adoption inherits three limits:
 
 ## Wrapper Helper: `coldfront.drop_iceberg_table()`
 
-Drops the Iceberg table backing a registered relation, in either mode:
+Drops the Iceberg table backing a registered tiered or decoupled relation:
 
 ```sql
 -- catalog entry and stored objects both go
@@ -455,9 +455,9 @@ SELECT coldfront.drop_iceberg_table('public', 'events', true);
 SELECT coldfront.drop_iceberg_table('public', 'events', false);
 ```
 
-One verb covers both modes because in both the thing being dropped is the
-Iceberg table. What that means for PostgreSQL differs, because the modes
-differ, and the function says which path it took in a NOTICE:
+One verb covers tiered and decoupled tables because, for each, the thing being
+dropped is the Iceberg table. What that means for PostgreSQL differs, because
+the modes differ, and the function says which path it took in a NOTICE:
 
 - For an iceberg-only table, the Iceberg table is the whole relation, so
   nothing remains. This is the inverse of `create_iceberg_table()`.
@@ -522,8 +522,9 @@ Three properties are worth knowing:
 
 ## ACID Model
 
-(This section summarizes material from [architecture.md](architecture.md)
-§Concurrency and §Known Limitations applied to the decoupled scenario.)
+(This section summarizes material from the
+[Architecture Overview](architecture_guides/index.md) §Concurrency and §Known
+Limitations applied to the decoupled scenario.)
 
 The following table shows the status of each ACID property in decoupled mode:
 
@@ -705,9 +706,9 @@ pointing at the same Lakekeeper endpoint and S3 bucket:
     `spock.feedback_frequency` messages, and in answer to the walsender's
     keepalive, which on an idle link comes every `wal_sender_timeout/2`, so
     the claim refuses to run unless `wal_sender_timeout` is positive and
-    below twice the window; usage.md gives the default and the rule. An
-    *alive*
-    peer that has not acked is either deferring (R-A's defer rule, legitimate)
+    below twice the window;
+    [Timeouts](distributed_setup.md#timeouts) gives the default and the
+    rule. An *alive* peer that has not acked is either deferring (R-A's defer rule, legitimate)
     or about to ack - either way, waiting is correct. A same-node claim is
     released by the C XactCallback in
     [extension/coldfront/src/coldfront.c](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/src/coldfront.c)
@@ -729,8 +730,8 @@ pointing at the same Lakekeeper endpoint and S3 bucket:
 - For DDL, Spock's `ddl_sql` repset replicates `CREATE/ALTER/DROP` of the
   wrapper view, and the `default` repset replicates the
   `coldfront.tiered_views` registry row (see
-  [Distributed Setup](usage.md#distributed-setup-3-node-mesh-decoupled-mode)),
-  so one node provisions the table and replication enables every peer's hook.
+  [Configuring a Distributed Deployment](distributed_setup.md)), so one node provisions the
+  table and replication enables every peer's hook.
   A column `ALTER TABLE` reaches the peers the same way: the node that runs it
   changes the shared Iceberg table, and its rebuilt view and registry row
   replicate.
@@ -750,7 +751,7 @@ settings:
 wal_level = logical
 shared_preload_libraries = 'snowflake,spock,pg_duckdb,coldfront'
 
-# Set together with coldfront.peer_alive_window_ms (see usage.md).
+# Set together with coldfront.peer_alive_window_ms (see distributed_setup.md).
 wal_sender_timeout = 15s
 
 # Sync-rep is NOT required by the bakery - R-A's ack barrier replaces it.
@@ -797,8 +798,7 @@ The call is idempotent. It puts every ColdFront table that replicates by value
 in the node's replication sets: the two bakery tables, the registry and the
 watermark, the storage secret, the lifecycle config and the vector routing
 state (the list and the reason for each table are in the
-[Distributed Setup](usage.md#what-coldfrontensure_replicated-does) section of
-the Using ColdFront guide).
+[Configuring a Distributed Deployment](distributed_setup.md#what-coldfrontensure_replicated-does) guide).
 If it has not run on a peer, that peer's ack `INSERT`s are local-only and never
 replicate back to the originating writer: every claim on the originator waits
 at the ack barrier for an ack that never arrives.
@@ -810,8 +810,8 @@ mandatory in any multi-node setup.
 
 ## When to Use Decoupled vs Tiered
 
-The two modes suit different workloads; the guidance below summarizes when each
-one fits.
+Decoupled and tiered modes suit different workloads; the guidance below
+summarizes when each one fits.
 
 Decoupled (iceberg-only) is the right choice when:
 
@@ -852,16 +852,16 @@ Decoupled mode has the following limitations:
 - A transaction block that writes a decoupled table cannot also write a
   PostgreSQL table unless `duckdb.unsafe_allow_mixed_transactions` is on:
   pg_duckdb refuses the PostgreSQL write, or the `COMMIT` when that write came
-  first. The [Caveats](usage.md#caveats) describe the rule and the risk of
-  setting the parameter.
+  first. The [Caveats](caveats.md) describe the rule and the risk of setting
+  the parameter.
 
 ## Next Steps
 
 To go further with ColdFront, consult the following documents:
 
-- The [Architecture](architecture.md) overview describes the mechanics both
+- The [Architecture](architecture_guides/index.md) overview describes the mechanics both
   modes share.
 - The [Formal Verification](formal/README.md) document describes the TLA+ model
   of the bakery protocol and how to check it.
-- The [Using ColdFront](usage.md) guide covers creating decoupled tables and
+- The [Using ColdFront](using_coldfront/index.md) guide covers creating decoupled tables and
   setting up a distributed mesh.

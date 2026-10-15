@@ -1,10 +1,12 @@
 # pgEdge ColdFront
 
-ColdFront keeps tables in PostgreSQL and cold data in Apache Iceberg (Parquet
-on S3-compatible, Azure, or GCS storage), and the cold tier is both readable
-and writable through the same SQL with no application changes. The application
-queries every table as an ordinary PostgreSQL relation, and both operating
-modes present the same standard SQL surface.
+ColdFront keeps tables in PostgreSQL and, in its tiered and decoupled modes,
+keeps cold data in Apache Iceberg (Parquet on S3-compatible, Azure, or GCS
+storage). The cold tier is both readable and writable through the same SQL,
+with no application changes. The application
+queries every table as an ordinary PostgreSQL relation, with standard
+`SELECT`, `INSERT`, `UPDATE`, and `DELETE`, and `MERGE` on PostgreSQL 17 and
+later.
 
 !!! warning "Beta software"
 
@@ -12,26 +14,33 @@ modes present the same standard SQL surface.
     production. Interfaces, on-disk formats, and behavior may change without
     notice, and data loss is possible.
 
-ColdFront provides two operating modes:
+ColdFront provides three operating modes:
 
 - Tiered mode keeps recent data in native PostgreSQL partitions and archives
   older data to Iceberg on a watermark; the application reads a single unified
   view, and the archiver moves rows from hot to cold on a schedule.
 - Decoupled mode stores the table entirely in Iceberg from the first row;
-  PostgreSQL holds a thin wrapper view and a registry row, and the coldfront
+  PostgreSQL holds a thin wrapper view and a registry row, and the `coldfront`
   extension handles every data-modifying statement on that view.
+- Standalone partitioned mode manages time- or id-based PostgreSQL range
+  partitions with no cold tier; the `partitioner` binary creates upcoming
+  partitions and detaches and drops partitions past retention, on stock
+  PostgreSQL with no DuckDB or Iceberg.
 
-Both modes coexist within one database, and you choose the mode per table at
-creation time. The SQL surface is identical for both modes: standard `SELECT`,
-`INSERT`, `UPDATE`, and `DELETE` against the relation, and `MERGE` on
-PostgreSQL 17 and later.
+Tables in different modes can share one database, and you choose the mode for
+each table: tiered when you register an existing partitioned table with a hot
+period, standalone partitioned when you register one without a hot period,
+and decoupled when you create or adopt an Iceberg table.
 
 Decoupled mode scales out horizontally across many PostgreSQL nodes that share
 one Lakekeeper catalog and one object store. The bakery protocol in the
-coldfront extension serializes Iceberg commits on the PostgreSQL side using
+`coldfront` extension serializes Iceberg commits on the PostgreSQL side using
 Spock-replicated Snowflake tickets, so concurrent writers never collide at the
-catalog. The protocol implements Lamport mutual exclusion with the
-Ricart-Agrawala deferred-reply optimization, and the
+catalog. The protocol implements
+[Lamport mutual exclusion](https://en.wikipedia.org/wiki/Lamport%27s_distributed_mutual_exclusion_algorithm)
+with the
+[Ricart-Agrawala](https://en.wikipedia.org/wiki/Ricart%E2%80%93Agrawala_algorithm)
+deferred-reply optimization, and the
 [formal model](formal/README.md) verifies its safety with TLA+.
 
 ## How It Works
@@ -75,112 +84,37 @@ tier, so the application sees one relation:
                    cron job: moves partitions out of the hot window: hot -> cold
 ```
 
-## Quickstart
+!!! tip "New to ColdFront?"
 
-Build the image (see the [Installation](installation.md) guide) and bring up
-the stack:
+    If you are new to ColdFront, review the guided
+    [walkthroughs](exploring_coldfront/index.md) to see all three modes in action
+    with copy-pasteable commands.
 
-```bash
-docker compose --profile local-store up -d --build
-```
+## Exploring ColdFront with Walkthroughs
 
-Bootstrap Lakekeeper and create a warehouse (see the one-time setup in the
-[Using ColdFront](usage.md) guide), then create a table in psql:
+Use the walkthroughs in the [Exploring ColdFront](exploring_coldfront/index.md)
+section to learn more about ColdFront. Perform the steps on the
+[Exploring ColdFront - Getting Started](exploring_coldfront/index.md) page
+first, which brings up the stack; then continue to the detailed guide for
+the mode you want to try:
 
-```sql
-CREATE EXTENSION IF NOT EXISTS pg_duckdb;
-CREATE EXTENSION IF NOT EXISTS coldfront;
-SELECT coldfront.set_storage_secret('admin', 'adminsecret', 'seaweedfs:8333');
-
--- Decoupled (iceberg-only) table, stored entirely in Iceberg on S3:
-SELECT coldfront.create_iceberg_table('public', 'events',
-  '[{"name":"id","type":"bigint"},{"name":"ts","type":"timestamptz"},{"name":"note","type":"text"}]'::jsonb,
-  '{month(ts)}');
-INSERT INTO events VALUES (1, now(), 'hello');
-SELECT count(*) FROM events;
-```
-
-ColdFront can adopt a table that already exists in the Iceberg catalog rather
-than creating it: `coldfront.adopt_iceberg_table()` reads its schema from the
-catalog and gives it the same wrapper view and registry row, read-only unless
-you pass `p_writable => true`. `coldfront.release_iceberg_table()` hands the
-table back with the Iceberg table untouched. See
-[Adopting a Table That Already Exists in the Catalog](usage.md#adopting-a-table-that-already-exists-in-the-catalog).
-
-To remove a table again, `coldfront.drop_iceberg_table()` unregisters it and
-drops the Iceberg table, deleting the stored objects only when asked to. See
-[Dropping an Iceberg Table](usage.md#dropping-an-iceberg-table-both-modes).
-
-For compliance environments that cannot store an object-store credential,
-`coldfront.set_storage_secret_vended()` runs with no credential in the
-database: Lakekeeper issues short-lived per-table credentials at access time.
-See [Vended Credentials](usage.md#vended-credentials).
-
-## Least-Privilege Application Roles
-
-Application roles need no superuser and no server-file access, yet they read
-and write the cold tier through the same transparent view. Onboarding an
-application role is a single call:
-
-```sql
-SELECT coldfront.grant_app_access('alice');
-```
-
-grant_app_access grants only the minimum the cold path needs: membership in
-duckdb.postgres_role, SET on the duckdb.unsafe_allow_execution_inside_functions
-parameter, schema USAGE, `SELECT` on the registry and the watermark table, DML
-on the dual-write anchor table, DML on every registered view and the hot table
-behind it, and USAGE and `SELECT` on the hot table's sequences. Those objects
-are derived from the registry, not hardcoded, and the call also grants EXECUTE
-on a fixed allow-list of runtime cold-path functions. The call is idempotent
-and is not executable by PUBLIC, so an application role can never self-grant.
-The role is never granted pg_read_server_files or pg_write_server_files, so it
-has no host-file access. `CREATE ROLE` and `GRANT` both replicate over Spock,
-so you onboard a role once on any node and it propagates across the mesh.
-
-The Docker image sets `duckdb.postgres_role` to `coldfront_duckdb` and creates
-that role when it initializes a new data directory. To name a different role,
-set the container's `COLDFRONT_DUCKDB_ROLE` environment variable before that
-first start. An empty value keeps pg_duckdb's default, under which only
-superusers run DuckDB, so grant_app_access then fails with an error.
-
-For how the non-superuser path works - the `SECURITY DEFINER` attach helpers,
-the `PGC_SUSET` / `GUC_SUPERUSER_ONLY` config hardening, the
-`duckdb.postgres_role` default that the image sets up, and how least privilege
-holds across a Spock mesh - see
-[Architecture: non-superuser app roles](architecture.md#non-superuser-app-roles-least-privilege).
-
-## Caveats
-
-Iceberg on Azure ADLS Gen2 requires Blob soft-delete, container soft-delete,
-and change feed (blob events) to be OFF on the storage account. Lakekeeper
-warehouse creation otherwise fails with HTTP 409 ("This endpoint does not
-support BlobStorageEvents or SoftDelete"). Disable those features on the
-storage account before using it as a cold tier.
-
-A cold-tier write that reads an ordinary PostgreSQL table, such as an
-`UPDATE ... FROM` or a `MERGE` from one, stores a `numeric` `NaN` from that
-table as `0` and stores an array renumbered to start at 1, with no error. The
-[Using ColdFront](usage.md#reading-a-postgresql-table-in-a-cold-tier-write)
-guide lists the writes that do this and shows how to check a source table
-first.
+- [Exploring Tiered Storage](walkthrough_tiered.md)
+- [Exploring Decoupled Mode](walkthrough_decoupled.md)
+- [Exploring the Standalone Partitioner](walkthrough_partitioner.md)
+- [Exploring Distributed Mode](walkthrough_distributed.md)
 
 ## Next Steps
 
-If you are new to ColdFront, run the [guided walkthrough](walkthrough.md) to
-see all three modes in action with copy-pasteable commands.
+For details about installing and configuring ColdFront, consult the
+following guides:
 
-To go further with ColdFront, consult the following guides:
-
-- The [Installation](installation.md) guide covers building ColdFront and
-  bringing up the stack.
-- The [Using ColdFront](usage.md) guide covers both modes, the standalone
-  partition manager, supported types, and tuning.
-- The [Embeddings](usage_vectors.md) guide covers storing and searching
-  embeddings through the pgvector interface.
-- The [Configuring your Object Store](object_store.md) guide takes you from an
-  empty bucket to a working cold tier on cloud S3.
-- The [Compaction](compaction.md) guide covers cold-tier maintenance:
-  compaction, snapshot expiry, and orphan-file removal.
-- The [Architecture](architecture.md) overview explains the shared mechanics
-  and links to the per-mode deep dives.
+- The [Installation](installation.md) guide details installing ColdFront
+  from a package or building it from source.
+- The [Configuring ColdFront](configuration.md) guide documents PostgreSQL
+  and ColdFront's own configuration.
+- The [Configuring Lakekeeper](configure_lakekeeper.md) guide installs,
+  configures, and bootstraps it, then installs the extensions
+  each database needs.
+- The [Configuring your Object Store](object_store.md) guide takes you from
+  an empty bucket or container to a working cold tier, for any of four
+  supported backends.

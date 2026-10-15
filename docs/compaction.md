@@ -1,4 +1,4 @@
-# COMPACTOR - Cold-Tier Table Maintenance
+# Compacting the Cold Tier
 
 `cmd/compactor` keeps a cold-tier Iceberg table healthy: it compacts each
 partition's small Parquet files into fewer large ones, expires old snapshots,
@@ -15,7 +15,12 @@ claim.
 
 [apache/iceberg-go]: https://github.com/apache/iceberg-go
 
-## Usage
+Build the compactor binary with `make compactor`, which vets, lints
+(golangci-lint required), tests, and builds `./bin/compactor`:
+
+```bash
+make compactor
+```
 
 Run the compactor against the database server, naming the table to maintain:
 
@@ -118,21 +123,3 @@ releases it when its PostgreSQL transaction commits, so its commit cannot
 interleave with a cold write's commit to the same table. Snapshot maintenance
 is the engine's job, not the catalog's: Lakekeeper does no Iceberg snapshot or
 orphan maintenance.
-
-## Requirements
-
-The compactor (`cmd/compactor`, apache/iceberg-go) reads the cold-tier Iceberg
-tables directly. Build the binary with `make compactor`, which vets, lints
-(golangci-lint required), tests, and builds `./bin/compactor`.
-
-## Next Steps
-
-To go further with ColdFront, consult the following documents:
-
-- The [Using ColdFront](usage.md) guide covers the server configuration the
-  compactor shares with the archiver, and the deployment YAML `import` writes
-  into it.
-- The [Vector Storage](architecture_vectors.md) deep dive describes the sort
-  key the compactor applies to clustered tables.
-- The [Architecture](architecture.md) overview describes the bakery claim each
-  compaction step takes.
