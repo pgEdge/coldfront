@@ -29,13 +29,25 @@ sudo /usr/pgsql-18/bin/postgresql-18-setup initdb
 sudo systemctl enable --now postgresql-18
 ```
 
-On Ubuntu or Debian, the package creates and starts the `18/main` cluster;
-`sudo pg_lsclusters` shows it:
+On Ubuntu or Debian, install the package, then check for a cluster with
+`sudo pg_lsclusters`. If it lists no `18/main` cluster, create and start one:
 
 ```bash
 sudo apt update
 sudo apt install -y pgedge-enterprise-postgres-18
+sudo pg_lsclusters
+sudo pg_createcluster 18 main --start      # only if pg_lsclusters lists none
 ```
+
+On either platform, confirm that the server is running before you continue:
+
+```bash
+sudo -u postgres psql -c "SELECT version();"
+```
+
+The command prints the PostgreSQL version. A connection error means the server
+is not running; check `sudo systemctl status postgresql-18` on RHEL-family
+systems or `sudo pg_lsclusters` on Ubuntu and Debian.
 
 For details, see the pgEdge Enterprise Postgres installation guide for
 [Enterprise Linux](https://docs.pgedge.com/enterprise/el/installing/) or
