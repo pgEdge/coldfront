@@ -21,44 +21,8 @@ docker compose --profile local-store up -d --build
 ```
 
 Lakekeeper is now reachable at `localhost:8181` with no further setup.
-Bootstrap it, create the warehouse, and pre-create the Iceberg
-namespace:
-
-```bash
-# 1. Bootstrap Lakekeeper
-curl -X POST http://localhost:8181/management/v1/bootstrap \
-  -H "Content-Type: application/json" -d '{"accept-terms-of-use":true}'
-
-# 2. Create warehouse (adjust endpoint/credentials for your S3 store)
-curl -X POST http://localhost:8181/management/v1/warehouse \
-  -H "Content-Type: application/json" -d '{
-    "warehouse-name": "wh",
-    "storage-profile": {
-      "type": "s3", "bucket": "iceberg", "region": "us-east-1",
-      "endpoint": "http://seaweedfs:8333", "path-style-access": true,
-      "flavor": "s3-compat", "sts-enabled": false,
-      "remote-signing-enabled": false
-    },
-    "storage-credential": {
-      "type": "s3", "credential-type": "access-key",
-      "aws-access-key-id": "admin", "aws-secret-access-key": "adminsecret"
-    }
-  }'
-
-# 3. Create the Iceberg namespace in the new warehouse.
-#    REQUIRED for decoupled (iceberg-only) mode: the Iceberg CREATE SCHEMA is
-#    deferred to transaction COMMIT but the CREATE TABLE POST is sent
-#    immediately, so coldfront.create_iceberg_table - which runs both in one
-#    transaction - would fail with HTTP 404 against a cold warehouse.
-#    Pre-creating the namespace here (its own committed REST call) makes the
-#    function's in-txn CREATE SCHEMA IF NOT EXISTS a no-op so the table create
-#    succeeds. The archiver (tiered mode) creates the namespace itself and does
-#    not need this.
-WID=$(curl -s http://localhost:8181/management/v1/warehouse \
-  | grep -oE '"warehouse-id":"[^"]+"' | head -1 | cut -d'"' -f4)
-curl -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
-  -H "Content-Type: application/json" -d '{"namespace":["public"]}'
-```
+Continue with [Bootstrapping Lakekeeper](#bootstrapping-lakekeeper), and use
+`http://seaweedfs:8333` as the store endpoint.
 
 ## Installing Lakekeeper
 
@@ -147,20 +111,25 @@ beyond a trusted network.
 ## Bootstrapping Lakekeeper
 
 Bootstrap Lakekeeper, create the warehouse, and pre-create the Iceberg
-namespace:
+namespace. In the warehouse command, replace `<store-endpoint>` with the
+address Lakekeeper uses to reach your store: `http://seaweedfs:8333` for the
+SeaweedFS store in the Docker stack, or `http://localhost:8333` for SeaweedFS
+running on the same host. For another store, change the `storage-profile` and
+`storage-credential` as shown in
+[Configuring your Object Store](object_store.md#configuring-lakekeeper).
 
 ```bash
 # 1. Bootstrap Lakekeeper
 curl -X POST http://localhost:8181/management/v1/bootstrap \
   -H "Content-Type: application/json" -d '{"accept-terms-of-use":true}'
 
-# 2. Create warehouse (adjust endpoint/credentials for your S3 store)
+# 2. Create the warehouse (replace <store-endpoint> as described above)
 curl -X POST http://localhost:8181/management/v1/warehouse \
   -H "Content-Type: application/json" -d '{
     "warehouse-name": "wh",
     "storage-profile": {
       "type": "s3", "bucket": "iceberg", "region": "us-east-1",
-      "endpoint": "http://seaweedfs:8333", "path-style-access": true,
+      "endpoint": "<store-endpoint>", "path-style-access": true,
       "flavor": "s3-compat", "sts-enabled": false,
       "remote-signing-enabled": false
     },
@@ -187,14 +156,17 @@ curl -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
 
 ## Configuring PostgreSQL for Lakekeeper
 
-Once Lakekeeper is bootstrapped, install the extensions and set the
-cold-tier credentials, once per database:
+When Lakekeeper is bootstrapped, install the extensions and set the
+cold-tier credentials, once per database. Replace `<store-endpoint>` with the
+store's address as PostgreSQL reaches it, without the `http://` prefix:
+`seaweedfs:8333` in the Docker stack, or `localhost:8333` for SeaweedFS on the
+same host:
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS pg_duckdb;
 CREATE EXTENSION IF NOT EXISTS coldfront;
 
-SELECT coldfront.set_storage_secret('admin', 'adminsecret', 'seaweedfs:8333');
+SELECT coldfront.set_storage_secret('admin', 'adminsecret', '<store-endpoint>');
 ```
 
 The secret is stored in the `coldfront.storage_secret` table (excluded from
