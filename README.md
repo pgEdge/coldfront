@@ -32,17 +32,16 @@ The ColdFront documentation consists of the following guides:
           Documents running a multi-writer decoupled-mode Spock mesh against
           one shared lake.
 - [Using ColdFront](docs/using_coldfront/index.md) - Compares the three
-  operating modes, documents the shared SQL surface, and links to each mode's
-  guide.
+  operating modes, documents the shared SQL surface, and covers dropping an
+  Iceberg table and the partition management CLI.
     - [Using ColdFront in Tiered Mode](docs/usage_tiered.md) - Documents
       archiving aging partitions to Iceberg while recent rows stay in the
       PostgreSQL heap.
     - [Using ColdFront in Decoupled Mode](docs/usage_decoupled.md) - Documents
-      tables that live entirely in Iceberg from the first row, and dropping or
-      releasing a registered table.
+      tables that live entirely in Iceberg from the first row, including
+      adopting a table from the catalog and handing it back.
     - [Using ColdFront in Standalone Partitioned Mode](docs/usage_partitioner.md) -
-      Documents managing PostgreSQL partitions with no cold tier at all, and
-      the partition CLI shared with tiered mode.
+      Documents managing PostgreSQL partitions with no cold tier at all.
     - [Working with Embeddings](docs/usage_vectors.md) - Documents storing and
       searching embeddings with the pgvector interface.
 - [Exploring ColdFront Modes](docs/exploring_coldfront/index.md) - Sets up the
