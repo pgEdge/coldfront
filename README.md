@@ -215,10 +215,23 @@ Install `pgedge-coldfront` and `pgedge-lakekeeper` on the hosts that need
 them. For repository setup and every package name, see
 [Using a Package to Install ColdFront](docs/installation.md#using-a-package-to-install-coldfront).
 
-After installing the packages, use the following steps to configure PostgreSQL
-and create the extensions:
+After installing the packages, use the following steps to start PostgreSQL,
+configure it, and create the extensions:
 
-1. Add the following settings to `postgresql.conf`:
+1. Initialize and start PostgreSQL. On RHEL, Rocky Linux, or AlmaLinux, the
+    package does not create a database cluster, so create and start one:
+
+    ```bash
+    sudo /usr/pgsql-18/bin/postgresql-18-setup initdb
+    sudo systemctl enable --now postgresql-18
+    ```
+
+    On Ubuntu or Debian, the package creates and starts the `18/main` cluster;
+    `sudo pg_lsclusters` shows it.
+
+2. Add the following settings to `postgresql.conf`. The file is in
+    `/var/lib/pgsql/18/data/` on RHEL-family systems, and in
+    `/etc/postgresql/18/main/` on Ubuntu and Debian:
 
     ```ini
     shared_preload_libraries = 'pg_duckdb,coldfront'
@@ -239,11 +252,16 @@ and create the extensions:
     [Connecting ColdFront to Lakekeeper and Object Storage](#connecting-coldfront-to-lakekeeper-and-object-storage)
     creates.
 
-2. Restart PostgreSQL. `CREATE EXTENSION coldfront` fails on a server that
-    does not preload the extension.
+3. Restart PostgreSQL. `CREATE EXTENSION coldfront` fails on a server that
+    does not preload the extension:
 
-3. Connect to the database, create the role that `duckdb.postgres_role`
-    names, and create the extensions:
+    ```bash
+    sudo systemctl restart postgresql-18           # RHEL, Rocky Linux, AlmaLinux
+    sudo systemctl restart postgresql@18-main      # Ubuntu, Debian
+    ```
+
+4. Connect as the `postgres` superuser with `sudo -u postgres psql`, create
+    the role that `duckdb.postgres_role` names, and create the extensions:
 
     ```sql
     CREATE ROLE coldfront_duckdb NOLOGIN;
