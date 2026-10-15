@@ -371,15 +371,19 @@ PostgreSQL server development headers, the libpq headers and library, `make`,
     ```ini
     shared_preload_libraries = 'pg_duckdb,coldfront'
     duckdb.allow_unsigned_extensions = true
+    duckdb.autoinstall_known_extensions = false
     duckdb.postgres_role = 'coldfront_duckdb'
     coldfront.warehouse = 'wh'
     coldfront.lakekeeper_endpoint = 'http://<lakekeeper-host>:8181/catalog'
     ```
 
     The locally built `iceberg` extension is unsigned, so
-    `duckdb.allow_unsigned_extensions` must be on. `duckdb.postgres_role` lets
-    the application roles you grant access to run DuckDB; without it, only
-    superusers can. `coldfront.warehouse` names the `wh` warehouse that
+    `duckdb.allow_unsigned_extensions` must be on.
+    `duckdb.autoinstall_known_extensions` stays off so that pg_duckdb never
+    fetches the unpatched upstream extensions in place of yours.
+    `duckdb.postgres_role` lets the application roles you grant access to run
+    DuckDB; without it, only superusers can. `coldfront.warehouse` names the
+    `wh` warehouse that
     [Connecting ColdFront to Lakekeeper and Object Storage](#connecting-coldfront-to-lakekeeper-and-object-storage)
     creates.
 
