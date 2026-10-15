@@ -269,6 +269,9 @@ configure it, and create the extensions:
     CREATE EXTENSION coldfront;
     ```
 
+    You create the role once for the PostgreSQL server. Run the
+    `CREATE EXTENSION` commands in each database that uses ColdFront.
+
 ### Installing and Configuring ColdFront in a Docker Container
 
 The Docker build adds a thin ColdFront layer to a published base image. The
@@ -391,6 +394,9 @@ PostgreSQL server development headers, the libpq headers and library, `make`,
     CREATE EXTENSION pg_duckdb;
     CREATE EXTENSION coldfront;
     ```
+
+    You create the role once for the PostgreSQL server. Run the
+    `CREATE EXTENSION` commands in each database that uses ColdFront.
 
 For the full steps, see
 [Building ColdFront on Bare Metal](docs/installation.md#building-coldfront-on-bare-metal).
