@@ -567,6 +567,70 @@ EOSQL
 # transaction. (Standing rule: multi-writer no-409 probe in vanilla. The bakery
 # is essential.)
 # ───────────────────────────────────────────────────────────────────────────
+# await_writers <label> <pid>...: wait for background cold writers, at most
+# WRITER_WAIT seconds. While every peer is alive the bakery waits for an ack
+# without a timeout of its own, so a writer it never lets through would hold the
+# run until the job's timeout. Past the bound, every node's bakery state is
+# printed, the sessions still running are ended, and the check fails.
+WRITER_WAIT=180
+await_writers() {
+    local label="$1" end=$((SECONDS + WRITER_WAIT)) left p n; shift
+    while :; do
+        left=0
+        for p in "$@"; do kill -0 "$p" 2>/dev/null && left=$((left + 1)); done
+        [ "$left" -eq 0 ] && break
+        if [ "$SECONDS" -ge "$end" ]; then
+            fail "$label: $left writer(s) still running after ${WRITER_WAIT}s"
+            bakery_state
+            for n in $HOST $PEERS; do
+                q_may "$n" "SELECT count(pg_terminate_backend(pid)) FROM pg_stat_activity
+                             WHERE datname = current_database() AND backend_type = 'client backend'
+                               AND state <> 'idle' AND pid <> pg_backend_pid();" >/dev/null
+            done
+            sleep 2
+            kill "$@" 2>/dev/null
+            break
+        fi
+        sleep 1
+    done
+    for p in "$@"; do wait "$p"; done
+}
+
+# bakery_state: what a stuck writer waits on, from every node: the claims, acks
+# and deferrals, the sessions that are not idle with the advisory locks they
+# hold or wait for (keyed as lockkey shows), each walsender's last reply, and,
+# on a mesh, every claim's node and Spock's apply exceptions; then the server
+# log's recent errors, from the logging collector's file under $PGDATA/log.
+bakery_state() {
+    local n
+    for n in $HOST $PEERS; do
+        echo "---- bakery state on $n"
+        qf "$n" <<'EOSQL'
+SELECT 'claim', ticket, iceberg_table FROM coldfront.claims ORDER BY ticket;
+SELECT 'ack', ticket, ack_from_name FROM coldfront.claim_acks ORDER BY ticket, ack_from_name;
+SELECT 'deferred', pending_ticket, ack_for_ticket FROM coldfront.deferred_acks ORDER BY 2, 3;
+SELECT 'lockkey', iceberg_table, hashtext('coldfront_iceberg:' || iceberg_table)::bigint & 4294967295,
+       hashtext('coldfront_claim:' || iceberg_table)::bigint & 4294967295
+  FROM coldfront.tiered_views;
+SELECT 'session', a.pid, a.backend_type, a.wait_event_type || ':' || a.wait_event, now() - a.xact_start,
+       (SELECT string_agg(l.mode || CASE WHEN l.granted THEN '' ELSE ' waiting' END || ' ' || l.objid, ', ')
+          FROM pg_locks l WHERE l.pid = a.pid AND l.locktype = 'advisory'),
+       left(regexp_replace(a.query, '\s+', ' ', 'g'), 120)
+  FROM pg_stat_activity a
+ WHERE a.datname = current_database() AND a.state <> 'idle' AND a.pid <> pg_backend_pid();
+SELECT 'walsender', application_name, state, now() - reply_time FROM pg_stat_replication;
+EOSQL
+        if [ "$MESH" = 1 ]; then
+            qf "$n" <<'EOSQL'
+SELECT 'claim-node', ticket, snowflake.get_node(ticket) FROM coldfront.claims ORDER BY ticket;
+SELECT 'exception', row_to_json(e) FROM spock.exception_log e;
+EOSQL
+        fi
+        docker exec "$n" sh -c 'tail -n 400 "$PGDATA"/log/*.log' 2>/dev/null \
+            | grep -E 'ERROR|FATAL|PANIC|WARNING' | tail -10
+    done
+}
+
 # snapshot_count <iceberg-ref>: the table's snapshot count. A table nothing has
 # written to has none, and every commit adds one.
 snapshot_count() {
@@ -581,7 +645,7 @@ story_decoupled_concurrency() {
         q "$HOST" "INSERT INTO iceonly VALUES (${k}00,date_trunc('month',now()) + interval '1 month' + interval '$((k-1)) days' + interval '10 hours','conc','{}');" >$TMPD/conc.$k 2>&1 &
         pids+=("$!")
     done
-    local p; for p in "${pids[@]}"; do wait "$p"; done
+    await_writers "8 concurrent cold writers" "${pids[@]}"
     assert_eq "no concurrent cold writer errored (no 409/abort)" "0" \
         "$(cat $TMPD/conc.* 2>/dev/null | grep -cEi 'error|conflict|409')"
     assert_eq "8 concurrent cold writers all landed (no 409/loss)" "8" \
@@ -599,7 +663,7 @@ story_decoupled_concurrency() {
         q "$HOST" "INSERT INTO icefirst VALUES ($k);" >"$TMPD/first.$k" 2>&1 &
         pids+=("$!")
     done
-    for p in "${pids[@]}"; do wait "$p"; done
+    await_writers "8 concurrent first writes" "${pids[@]}"
     assert_eq "no concurrent first write errored" "0" \
         "$(cat "$TMPD"/first.* 2>/dev/null | grep -cEi 'error|conflict|409')"
     assert_eq "8 concurrent first writes into a never-written table all landed" "8" \
@@ -2639,7 +2703,7 @@ EOSQL
         q "$HOST" "UPDATE events SET status='mixdone' WHERE status='mixseed${k}';" >$TMPD/mix.$k 2>&1 &
         pids+=("$!")
     done
-    local p; for p in "${pids[@]}"; do wait "$p"; done
+    await_writers "4 concurrent mixed-tier writers" "${pids[@]}"
     assert_eq "no concurrent mixed-tier writer errored (no 409/abort)" "0" \
         "$(cat $TMPD/mix.* 2>/dev/null | grep -cEi 'error|conflict|409')"
     rm -f $TMPD/mix.* 2>/dev/null
@@ -2900,7 +2964,7 @@ story_concurrent_writers() {
         q "$HOST" "INSERT INTO events (ts,status,data) VALUES (date_trunc('month',now()) - interval '1 month' + interval '$((19+k)) days' + interval '9 hours','tconc','{}');" >$TMPD/tconc.$k 2>&1 &
         pids+=("$!")
     done
-    local p; for p in "${pids[@]}"; do wait "$p"; done
+    await_writers "8 concurrent tiered cold writers" "${pids[@]}"
     assert_eq "no concurrent tiered COLD writer errored (no 409/abort)" "0" \
         "$(cat $TMPD/tconc.* 2>/dev/null | grep -cEi 'error|conflict|409')"
     assert_eq "8 concurrent tiered COLD writers all landed (no 409/loss)" "8" \
@@ -3607,8 +3671,9 @@ story_mesh() {
     # claim protocol across nodes — not the local advisory lock — to avoid 409.
     rm -f $TMPD/ra.* 2>/dev/null
     q "$HOST" "INSERT INTO iceonly VALUES (6001,date_trunc('month',now()) + interval '2 months' + interval '1 days' + interval '10 hours 0 minutes 0 seconds','ra','{}');" >$TMPD/ra.1 2>&1 &
+    local ra1=$!
     q "$p1"   "INSERT INTO iceonly VALUES (6002,date_trunc('month',now()) + interval '2 months' + interval '1 days' + interval '10 hours 0 minutes 1 seconds','ra','{}');" >$TMPD/ra.2 2>&1 &
-    wait
+    await_writers "2 concurrent cross-node cold writers" "$ra1" "$!"
     assert_eq "no cross-node cold writer errored (R-A bakery, no 409)" "0" \
         "$(cat $TMPD/ra.* 2>/dev/null | grep -cEi 'error|conflict|409')"
     assert_eq "concurrent cross-node cold writers both landed (R-A bakery, no 409)" "2" "$(q "$HOST" "SELECT count(*) FROM iceonly WHERE status='ra';")"
@@ -3670,7 +3735,7 @@ story_mesh_multiwriter() {
         q "$p1"   "$b" >"$TMPD/mw.b$k" 2>&1 &
         pids+=("$!")
     done
-    for k in "${pids[@]}"; do wait "$k"; done
+    await_writers "$((2 * N)) multi-writer-per-node cross-node cold writers" "${pids[@]}"
     assert_eq "no multi-writer-per-node cross-node cold writer errored (no 409)" "0" \
         "$(cat $TMPD/mw.* 2>/dev/null | grep -cEi 'error|conflict|409')"
     assert_eq "all $((2 * N)) multi-writer-per-node cross-node cold writes landed" "$((2 * N))" \

@@ -106,8 +106,18 @@ topo_standby() {
 
 # topo_teardown  — the EXIT trap shared by topo/*.sh and the probe: unless --keep
 # (KEEP=1), remove the standby (if any) and tear the compose stack down. Reads the
-# caller's $KEEP and $COMPOSE.
+# caller's $KEEP and $COMPOSE. A failed cell first prints its servers' crash
+# lines: a backend that crashed reads on the client side only as a lost
+# connection, and the server's lines name the signal and the statement. The
+# servers log to $PGDATA/log through the logging collector, not to stdout.
 topo_teardown() {
+    local rc=$? c
+    if [ "$rc" -ne 0 ]; then
+        for c in $($COMPOSE ps -q 2>/dev/null) ${CF_STANDBY:-}; do
+            docker exec "$c" sh -c 'cat "$PGDATA"/log/*.log' 2>/dev/null \
+                | grep -E 'terminated by signal|Failed process was running|terminate called|PANIC' | tail -20
+        done
+    fi
     [ "${KEEP:-0}" = 1 ] && return 0
     docker rm -f "$CF_STANDBY" >/dev/null 2>&1 || true
     $COMPOSE down -v >/dev/null 2>&1 || true
