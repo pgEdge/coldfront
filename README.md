@@ -448,7 +448,7 @@ the host.
     curl -X POST http://localhost:8181/management/v1/bootstrap \
       -H "Content-Type: application/json" -d '{"accept-terms-of-use":true}'
 
-    curl -X POST http://localhost:8181/management/v1/warehouse \
+    WID=$(curl -s -X POST http://localhost:8181/management/v1/warehouse \
       -H "Content-Type: application/json" -d '{
         "warehouse-name": "wh",
         "storage-profile": {
@@ -461,10 +461,9 @@ the host.
           "type": "s3", "credential-type": "access-key",
           "aws-access-key-id": "admin", "aws-secret-access-key": "adminsecret"
         }
-      }'
+      }' \
+      | grep -oE '"warehouse-id":"[^"]+"' | cut -d'"' -f4)
 
-    WID=$(curl -s http://localhost:8181/management/v1/warehouse \
-      | grep -oE '"warehouse-id":"[^"]+"' | head -1 | cut -d'"' -f4)
     curl -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
       -H "Content-Type: application/json" -d '{"namespace":["public"]}'
     ```
@@ -496,10 +495,11 @@ to evaluate ColdFront without a cloud account.
       -H "Content-Type: application/json" -d '{"accept-terms-of-use":true}'
     ```
 
-2. Create the `wh` warehouse on the SeaweedFS store:
+2. Create the `wh` warehouse on the SeaweedFS store, and save its ID for the
+    next step:
 
     ```bash
-    curl -X POST http://localhost:8181/management/v1/warehouse \
+    WID=$(curl -s -X POST http://localhost:8181/management/v1/warehouse \
       -H "Content-Type: application/json" -d '{
         "warehouse-name": "wh",
         "storage-profile": {
@@ -512,15 +512,14 @@ to evaluate ColdFront without a cloud account.
           "type": "s3", "credential-type": "access-key",
           "aws-access-key-id": "admin", "aws-secret-access-key": "adminsecret"
         }
-      }'
+      }' \
+      | grep -oE '"warehouse-id":"[^"]+"' | cut -d'"' -f4)
     ```
 
 3. Create the `public` namespace in the warehouse; decoupled mode requires
     this namespace:
 
     ```bash
-    WID=$(curl -s http://localhost:8181/management/v1/warehouse \
-      | grep -oE '"warehouse-id":"[^"]+"' | head -1 | cut -d'"' -f4)
     curl -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
       -H "Content-Type: application/json" -d '{"namespace":["public"]}'
     ```
