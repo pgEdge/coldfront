@@ -369,7 +369,9 @@ tier in an object store, through a Lakekeeper warehouse.
 
 ColdFront can store its Iceberg tables in AWS S3, in an S3-compatible store
 such as SeaweedFS or MinIO, in Google Cloud Storage, or in Azure ADLS Gen2. You
-will need to connect ColdFront to a store once for each deployment.
+set up the object store and the Lakekeeper warehouse once for each deployment.
+The store's credential is kept in each database, so you repeat the credential
+step in every database that uses ColdFront.
 
 #### Connecting a Package or Bare-Metal Installation to Lakekeeper and an Object Store
 
@@ -469,7 +471,7 @@ the host.
     `storage-profile` and `storage-credential` as shown in the store's section
     of [Configuring your Object Store](docs/object_store.md#configuring-lakekeeper).
 
-7. Store the SeaweedFS credential in the database:
+7. Store the SeaweedFS credential in each database that uses ColdFront:
 
     ```sql
     SELECT coldfront.set_storage_secret('admin', 'adminsecret',
@@ -521,7 +523,7 @@ to evaluate ColdFront without a cloud account.
       -H "Content-Type: application/json" -d '{"namespace":["public"]}'
     ```
 
-4. Store the SeaweedFS credential in the database:
+4. Store the SeaweedFS credential in each database that uses ColdFront:
 
     ```sql
     SELECT coldfront.set_storage_secret('admin', 'adminsecret',
