@@ -408,8 +408,8 @@ the host.
     repository:
 
     ```bash
-    sudo install -D -m 0640 packaging/lakekeeper/common/lakekeeper.env \
-      /etc/lakekeeper/lakekeeper.env
+    sudo install -D -m 0640 -g lakekeeper \
+      packaging/lakekeeper/common/lakekeeper.env /etc/lakekeeper/lakekeeper.env
     sudo install -m 0644 packaging/lakekeeper/common/lakekeeper.service \
       /etc/systemd/system/lakekeeper.service
     sudo systemctl daemon-reload
@@ -430,11 +430,13 @@ the host.
     LAKEKEEPER__PG_ENCRYPTION_KEY=<output of: openssl rand -base64 32>
     ```
 
-5. Run the one-time migration, then start Lakekeeper:
+5. Run the one-time migration as the `lakekeeper` user, then start
+    Lakekeeper. The migration reads the environment file as that user, because
+    the file is not readable by other accounts:
 
     ```bash
-    set -a; . /etc/lakekeeper/lakekeeper.env; set +a
-    sudo -E -u lakekeeper /usr/bin/lakekeeper migrate
+    sudo -u lakekeeper sh -c \
+      'set -a; . /etc/lakekeeper/lakekeeper.env; set +a; exec /usr/bin/lakekeeper migrate'
     sudo systemctl enable --now lakekeeper
     ```
 
