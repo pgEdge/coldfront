@@ -39,8 +39,8 @@ catalog. The protocol implements
 [Lamport mutual exclusion](https://en.wikipedia.org/wiki/Lamport%27s_distributed_mutual_exclusion_algorithm)
 with the
 [Ricart-Agrawala](https://en.wikipedia.org/wiki/Ricart%E2%80%93Agrawala_algorithm)
-deferred-reply optimization, and the [formal model](formal/README.md) verifies its
-safety with TLA+.
+deferred-reply optimization, and the
+[formal model](formal/README.md) verifies its safety with TLA+.
 
 ## How It Works
 
