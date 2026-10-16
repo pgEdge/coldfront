@@ -3963,12 +3963,17 @@ ALTER TABLE coldfront.claims ENABLE REPLICA TRIGGER coldfront_claim_apply;
 -- and so is an ack for a claim this node has already released or reaped: a
 -- peer ruled dead acks the claims it missed once it catches up, and an orphan's
 -- ack can arrive after the reap. Modelled in docs/formal/Bakery.tla (ClaimLive,
--- NoAckOutlivesClaim).
+-- NoAckOutlivesClaim). Dropping an ack for one of this node's own tickets is
+-- logged, so a writer left waiting for an ack shows whether it arrived.
 CREATE FUNCTION coldfront._on_ack_apply() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
-    IF snowflake.get_node(NEW.ticket) <> current_setting('snowflake.node')::int
-       OR NOT EXISTS (SELECT 1 FROM coldfront.claims WHERE ticket = NEW.ticket) THEN
+    IF snowflake.get_node(NEW.ticket) <> current_setting('snowflake.node')::int THEN
+        RETURN NULL;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM coldfront.claims WHERE ticket = NEW.ticket) THEN
+        RAISE LOG 'coldfront: dropped the ack of ticket % from %: no claim with that ticket here',
+            NEW.ticket, NEW.ack_from_name;
         RETURN NULL;
     END IF;
     RETURN NEW;

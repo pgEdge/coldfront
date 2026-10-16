@@ -597,10 +597,14 @@ await_writers() {
 }
 
 # bakery_state: what a stuck writer waits on, from every node: the claims, acks
-# and deferrals, the sessions that are not idle with the advisory locks they
-# hold or wait for (keyed as lockkey shows), each walsender's last reply, and,
-# on a mesh, every claim's node and Spock's apply exceptions; then the server
-# log's recent errors, from the logging collector's file under $PGDATA/log.
+# and deferrals, the busy sessions and every background worker with the
+# advisory locks they hold or wait for (keyed as lockkey shows), and each
+# walsender's last reply. On a mesh it adds every claim's node, when each claim
+# and ack row committed, how far the node has applied each peer's changes
+# (Spock's lag tracker, the replication origins, the logical slots), the
+# conflicts Spock resolved on the bakery tables and its apply exceptions. Last
+# come the server log's recent errors and the acks _on_ack_apply dropped, from
+# the logging collector's file under $PGDATA/log.
 bakery_state() {
     local n
     for n in $HOST $PEERS; do
@@ -617,17 +621,25 @@ SELECT 'session', a.pid, a.backend_type, a.wait_event_type || ':' || a.wait_even
           FROM pg_locks l WHERE l.pid = a.pid AND l.locktype = 'advisory'),
        left(regexp_replace(a.query, '\s+', ' ', 'g'), 120)
   FROM pg_stat_activity a
- WHERE a.datname = current_database() AND a.state <> 'idle' AND a.pid <> pg_backend_pid();
+ WHERE a.datname = current_database() AND a.pid <> pg_backend_pid()
+   AND (a.state IS DISTINCT FROM 'idle' OR a.backend_type <> 'client backend');
 SELECT 'walsender', application_name, state, now() - reply_time FROM pg_stat_replication;
 EOSQL
         if [ "$MESH" = 1 ]; then
             qf "$n" <<'EOSQL'
 SELECT 'claim-node', ticket, snowflake.get_node(ticket) FROM coldfront.claims ORDER BY ticket;
+SELECT 'claim-commit', ticket, pg_xact_commit_timestamp(xmin) FROM coldfront.claims ORDER BY ticket;
+SELECT 'ack-commit', ticket, ack_from_name, pg_xact_commit_timestamp(xmin) FROM coldfront.claim_acks ORDER BY ticket, ack_from_name;
+SELECT 'applied', origin_name, receiver_name, commit_timestamp, last_received_lsn FROM spock.lag_tracker ORDER BY 2, 3;
+SELECT 'origin', external_id, remote_lsn FROM pg_replication_origin_status ORDER BY 2;
+SELECT 'slot', slot_name, active, confirmed_flush_lsn, pg_current_wal_lsn() FROM pg_replication_slots WHERE slot_type = 'logical' ORDER BY 2;
+SELECT 'resolution', log_time, relname, conflict_type, conflict_resolution FROM spock.resolutions
+ WHERE relname LIKE '%claim%' ORDER BY id DESC LIMIT 10;
 SELECT 'exception', row_to_json(e) FROM spock.exception_log e;
 EOSQL
         fi
         docker exec "$n" sh -c 'tail -n 400 "$PGDATA"/log/*.log' 2>/dev/null \
-            | grep -E 'ERROR|FATAL|PANIC|WARNING' | tail -10
+            | grep -E 'ERROR|FATAL|PANIC|WARNING|dropped the ack' | tail -10
     done
 }
 
