@@ -322,7 +322,13 @@ faithfully because they affect protocol correctness:
   the insert in `_on_ack_apply` are one step here and two statements in one
   apply transaction in SQL, so a release that commits between them leaves one
   row on the originator; the node's next claim deletes it (the `acks` CTE in
-  `_insert_claim`).
+  `_insert_claim`). The Applier sees a claim the moment its node inserts it,
+  while PostgreSQL ships a commit to peers before it is visible on its own
+  node, so an ack can reach the claimant before its claim row; `_on_ack_apply`
+  drops an ack whose claim it cannot see only when the table's claim key, which
+  `_insert_claim` holds until its transaction has ended, is free. A late ack
+  that arrives while a later claim's insert holds that key is kept, and the
+  same cleanup removes it.
 
 - The `coldfront.iceberg_async_parquet` flag's two orderings in
   [_exec_iceberg_with_claim](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/coldfront--1.0.sql),
