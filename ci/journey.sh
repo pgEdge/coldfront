@@ -123,6 +123,30 @@ ice_deletes() {
     q "$HOST" "SELECT coldfront.ensure_attached(); SELECT r['n'] FROM duckdb.query('SELECT count(*) AS n FROM iceberg_metadata(''$1'') WHERE status <> ''DELETED'' AND content LIKE ''%DELETES''') AS t(r);" | tail -1
 }
 
+# fingerprint <relation> <predicate>: a stable signature of the rows a predicate
+# selects — count, sum(id), min/max(ts) — read THROUGH the relation (the unified
+# view), so it spans both tiers. A story fingerprints a dataset before an
+# operation (tiering, dump/restore, expiry, replication) and again after; equal
+# signatures prove no row was lost, duplicated or drifted. Assumes the relation
+# has the journey's id + ts columns (events and the throwaway tiered tables do).
+fingerprint() {
+    q "$HOST" "SELECT count(*)||'|'||coalesce(sum(id),0)||'|'||coalesce(min(ts)::text,'')||'|'||coalesce(max(ts)::text,'') FROM $1 WHERE $2;" | tail -1
+}
+
+# container_for_ip <ip>: the running container that owns <ip>, so an
+# outage story never hardcodes a compose service name (the topology passes IPs,
+# not names). Empty if none matches. Used by the graceful-degradation stories to
+# find the object store / catalog container to pause.
+container_for_ip() {
+    local c
+    for c in $(docker ps -q); do
+        if docker inspect -f '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{"\n"}}{{end}}' "$c" 2>/dev/null | grep -qx "$1"; then
+            docker inspect -f '{{.Name}}' "$c" | sed 's#^/##'; return 0
+        fi
+    done
+    return 1
+}
+
 # vec_misplaced <table> <column>: cold rows whose cluster is not the nearest live
 # centroid, scored in PostgreSQL with the pgvector operator, independently of the
 # generator the write paths use. A row with no embedding is skipped; a row with
@@ -8033,6 +8057,577 @@ EOSQL
         "$(q "$HOST" "SELECT (SELECT relkind::text FROM pg_class WHERE relname = 'tc214' AND relnamespace = 'public'::regnamespace) || '|' || (SELECT count(*) FROM pg_class WHERE relname = '_tc214' AND relnamespace = 'public'::regnamespace) || '|' || (SELECT count(*) FROM coldfront.tiered_views WHERE schema_name = 'public' AND relname = 'tc214');")"
 }
 
+# ═══════════════════════════════════════════════════════════════════════════
+# P0 graceful-degradation / durability stories (automation gap analysis, 2026-10).
+#
+# These inject a real outage of the object store or the catalog, or round-trip a
+# tiered database through pg_dump/restore. They run ONLY against the s3
+# (SeaweedFS) backend on a single node — the one place the store/catalog is a
+# local container this script may pause — and self-skip elsewhere. The outage
+# primitive is `docker pause`, which freezes the container so connections hang; a
+# bounded statement_timeout turns that hang into a clean cancellation, which is
+# exactly the "degrades, never wedges" contract. Every story unpauses its target
+# on every exit path.
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Guard shared by the outage stories: s3 backend, single node, real (non-vended)
+# credentials, and a resolvable store/catalog container. Prints a NOTE and
+# returns 1 (skip) otherwise.
+_p0_outage_supported() {
+    local what="$1"
+    if [ "$BACKEND" != s3 ]; then note "$what: requires the s3 (SeaweedFS) backend (current: $BACKEND) — skipped"; return 1; fi
+    if [ "$MESH" = 1 ]; then note "$what: skipped in mesh mode (a shared-store pause would stall every peer)"; return 1; fi
+    if vended_creds; then note "$what: skipped under vended credentials"; return 1; fi
+    return 0
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Destructive C3 — the object store fails mid cold-write. A cold INSERT with the
+# store unreachable must fail cleanly: no half-committed row, no leaked bakery
+# claim, and a later write (store restored) succeeds. Uses a throwaway
+# iceberg-only table so nothing another story reads is touched.
+# ───────────────────────────────────────────────────────────────────────────
+story_s3_down_cold_write() {
+    step "C3: object store down mid cold-write — clean failure, no half-row, no leaked claim"
+    _p0_outage_supported "C3" || return
+    local store; store=$(container_for_ip "$SW_IP") || { note "C3: could not resolve the store container for $SW_IP — skipped"; return; }
+    local claims0; claims0=$(q "$HOST" "SELECT count(*) FROM coldfront.claims;")
+    # Fresh throwaway cold table with one row written while the store is up.
+    q "$HOST" "SELECT coldfront.create_iceberg_table('public','s3down','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"label\",\"type\":\"text\"}]'::jsonb);" >/dev/null 2>&1
+    q "$HOST" "INSERT INTO public.s3down (id,label) VALUES (1,'up');" >/dev/null 2>&1
+    assert_eq "C3: seed row present with the store up" "1" "$(q "$HOST" "SELECT count(*) FROM public.s3down;")"
+    docker pause "$store" >/dev/null
+    # The write must not hang indefinitely; statement_timeout turns the stalled
+    # upload/commit into a clean cancellation.
+    local out; out=$(q_may "$HOST" "SET statement_timeout='20s'; INSERT INTO public.s3down (id,label) VALUES (2,'s3down');")
+    docker unpause "$store" >/dev/null
+    assert_ne "C3: the cold INSERT did not silently succeed while the store was down" "" "$out"
+    assert_eq "C3: no half-committed row (count still 1)" "1" "$(q "$HOST" "SELECT count(*) FROM public.s3down WHERE id=2 OR label='s3down';" | tail -1)"
+    assert_eq "C3: no leaked bakery claim after the failed write" "$claims0" "$(q "$HOST" "SELECT count(*) FROM coldfront.claims;")"
+    # Recovery: with the store back, a write lands.
+    if q "$HOST" "INSERT INTO public.s3down (id,label) VALUES (3,'recovered');" >/dev/null 2>&1; then
+        assert_eq "C3: a cold write succeeds once the store is back" "recovered" \
+            "$(q "$HOST" "SELECT label FROM public.s3down WHERE id=3;" | tail -1)"
+    else
+        fail "C3: cold write did not recover after the store returned"
+    fi
+    q "$HOST" "SELECT coldfront.drop_iceberg_table('public','s3down', true);" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Gap G-03 — object store down during live queries. Hot-tier reads keep working
+# (heap only, no S3); a cold-tier read degrades cleanly — it errors within the
+# statement timeout rather than hanging — and recovers when the store returns.
+# Tiered mode only (needs the `events` hot+cold table from story_provision_tiered).
+# ───────────────────────────────────────────────────────────────────────────
+story_s3_down_query_degrades() {
+    step "G-03: object store down during queries — hot reads OK, cold reads degrade cleanly"
+    [ "$MODE" = tiered ] || { note "G-03: tiered-only (needs the events hot+cold table)"; return; }
+    _p0_outage_supported "G-03" || return
+    local store; store=$(container_for_ip "$SW_IP") || { note "G-03: could not resolve the store container for $SW_IP — skipped"; return; }
+    local cold_pred="ts >= date_trunc('month',now()) - interval '3 months' AND ts < date_trunc('month',now()) - interval '1 month'"
+    local hot_pred="ts >= date_trunc('month',now())"
+    assert_gt "G-03: cold rows exist before the outage" "0" "$(q "$HOST" "SELECT count(*) FROM events WHERE $cold_pred;")"
+    docker pause "$store" >/dev/null
+    local hot; hot=$(q_may "$HOST" "SET statement_timeout='20s'; SELECT count(*) FROM events WHERE $hot_pred;")
+    local cold; cold=$(q_may "$HOST" "SET statement_timeout='20s'; SELECT count(*) FROM events WHERE $cold_pred;")
+    docker unpause "$store" >/dev/null
+    # Hot read returns a plain integer; cold read returns an error string (DuckDB/
+    # IO/timeout), never a silent wrong answer and never an indefinite hang.
+    case "$hot" in ''|*[!0-9]*) fail "G-03: hot-tier read did not succeed with the store down — got: $hot";; *) pass "G-03: hot-tier read succeeded with the store down ($hot rows)";; esac
+    case "$cold" in ''|*[0-9]) fail "G-03: cold-tier read returned a value with the store down — expected a clean error, got: $cold";; *) pass "G-03: cold-tier read degraded with a clean error, no hang";; esac
+    local after; after=$(q_may "$HOST" "SELECT count(*) FROM events WHERE $cold_pred;")
+    case "$after" in ''|*[!0-9]*) fail "G-03: cold-tier read did not recover after the store returned — got: $after";; *) pass "G-03: cold-tier read recovered once the store was back ($after rows)";; esac
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Gap G-02 — catalog (Lakekeeper) down must not block PostgreSQL connections. A
+# new session connects and runs a hot-tier query with the catalog paused (the
+# login path must not block on a catalog round-trip); a cold-tier read degrades
+# cleanly; both recover when the catalog returns. Tiered, s3, single node.
+# ───────────────────────────────────────────────────────────────────────────
+story_lakekeeper_down_login() {
+    step "G-02: catalog down must not block connections — login + hot reads OK, cold degrades"
+    [ "$MODE" = tiered ] || { note "G-02: tiered-only (needs the events hot+cold table)"; return; }
+    _p0_outage_supported "G-02" || return
+    local cat; cat=$(container_for_ip "$LK_IP") || { note "G-02: could not resolve the catalog container for $LK_IP — skipped"; return; }
+    local cold_pred="ts >= date_trunc('month',now()) - interval '3 months' AND ts < date_trunc('month',now()) - interval '1 month'"
+    docker pause "$cat" >/dev/null
+    # A FRESH connection (new docker exec psql) must come back promptly — this is
+    # the login-trigger-must-not-block assertion. statement_timeout bounds it so a
+    # blocked login shows up as an error, not a hung test.
+    local login; login=$(q_may "$HOST" "SET statement_timeout='20s'; SELECT 1;")
+    local hot; hot=$(q_may "$HOST" "SET statement_timeout='20s'; SELECT count(*) FROM events WHERE ts >= date_trunc('month',now());")
+    local cold; cold=$(q_may "$HOST" "SET statement_timeout='20s'; SELECT count(*) FROM events WHERE $cold_pred;")
+    docker unpause "$cat" >/dev/null
+    assert_contains "G-02: a new session connects with the catalog down" "1" "$login"
+    case "$hot" in ''|*[!0-9]*) fail "G-02: hot-tier read did not succeed with the catalog down — got: $hot";; *) pass "G-02: hot-tier read succeeded with the catalog down ($hot rows)";; esac
+    case "$cold" in ''|*[0-9]) note "G-02: cold-tier read returned a value with the catalog down (catalog metadata was cached) — got: $cold";; *) pass "G-02: cold-tier read degraded cleanly with the catalog down";; esac
+    local after; after=$(q_may "$HOST" "SELECT count(*) FROM events WHERE $cold_pred;")
+    case "$after" in ''|*[!0-9]*) fail "G-02: cold-tier read did not recover after the catalog returned — got: $after";; *) pass "G-02: reads recovered once the catalog was back ($after rows)";; esac
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Destructive I11 / H3 — pg_dump a tiered database, restore it into a fresh
+# database, and confirm the cold tier is intact. Before the storage secret is
+# re-set, a cold read must fail cleanly (H3); after it is set, the cold
+# fingerprint (count + sum(id)) must match the original (I11). The restore shares
+# the same catalog + object store, so a match proves the dump carried the view,
+# the registry and the watermark faithfully.
+# ───────────────────────────────────────────────────────────────────────────
+story_dump_restore_roundtrip() {
+    step "I11/H3: pg_dump -> restore into a fresh DB — cold tier intact, secret re-attaches"
+    [ "$MODE" = tiered ] || { note "I11/H3: tiered-only (needs the events hot+cold table)"; return; }
+    if [ "$MESH" = 1 ]; then note "I11/H3: skipped in mesh mode (a fresh DB churns Spock)"; return; fi
+    if vended_creds; then note "I11/H3: skipped under vended credentials (no secret to re-set)"; return; fi
+    local cold_pred="ts >= date_trunc('month',now()) - interval '3 months' AND ts < date_trunc('month',now()) - interval '1 month'"
+    local orig; orig=$(q "$HOST" "SELECT count(*)||'|'||coalesce(sum(id),0) FROM events WHERE $cold_pred;" | tail -1)
+    assert_contains "I11/H3: original has cold rows to compare" "|" "$orig"
+    local rdb="coldfront_restore"
+    docker exec -e PGUSER="$CF_DBUSER" "$HOST" dropdb -U "$CF_DBUSER" --if-exists "$rdb" >/dev/null 2>&1
+    if ! docker exec -e PGUSER="$CF_DBUSER" "$HOST" createdb -U "$CF_DBUSER" "$rdb" >/dev/null 2>&1; then
+        fail "I11/H3: could not create the restore database"; return
+    fi
+    # Dump the live DB and load it into the fresh one, both inside the container.
+    if ! docker exec -e PGUSER="$CF_DBUSER" "$HOST" sh -c "pg_dump -U '$CF_DBUSER' -d '$CF_DBNAME' | psql -q -U '$CF_DBUSER' -d '$rdb'" >"$TMPD/restore.log" 2>&1; then
+        fail "I11/H3: dump/restore pipeline failed — see $TMPD/restore.log"; tail -8 "$TMPD/restore.log"
+        docker exec -e PGUSER="$CF_DBUSER" "$HOST" dropdb -U "$CF_DBUSER" --if-exists "$rdb" >/dev/null 2>&1; return
+    fi
+    # Queries against the restore DB go through the same container, different -d.
+    local qr; qr() { docker exec -e PGUSER="$CF_DBUSER" -e PGDATABASE="$rdb" "$HOST" "$CF_PSQL" -tA -c "$*" 2>&1; }
+    assert_eq "I11/H3: both extensions present in the restore" "2" \
+        "$(qr "SELECT count(*) FROM pg_extension WHERE extname IN ('pg_duckdb','coldfront');" | tail -1)"
+    assert_eq "I11/H3: the storage secret did NOT come across (UNLOGGED)" "0" \
+        "$(qr "SELECT count(*) FROM coldfront.storage_secret;" | tail -1)"
+    # H3: a cold read before the secret is re-set fails cleanly.
+    local pre; pre=$(qr "SET statement_timeout='20s'; SELECT count(*) FROM events WHERE $cold_pred;")
+    case "$pre" in ''|*[0-9]) note "I11/H3: cold read returned a value before re-setting the secret — got: $pre";; *) pass "I11/H3: cold read fails cleanly before the secret is re-set";; esac
+    # Re-set the secret, then the cold fingerprint must match the original.
+    docker exec -e PGUSER="$CF_DBUSER" -e PGDATABASE="$rdb" "$HOST" "$CF_PSQL" -tA -c "$(storage_secret_sql)" >/dev/null 2>&1
+    local restored; restored=$(qr "SET statement_timeout='60s'; SELECT count(*)||'|'||coalesce(sum(id),0) FROM events WHERE $cold_pred;" | tail -1)
+    assert_eq "I11/H3: cold fingerprint matches the original after restore + re-secret" "$orig" "$restored"
+    docker exec -e PGUSER="$CF_DBUSER" "$HOST" dropdb -U "$CF_DBUSER" --if-exists "$rdb" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Destructive H2 — a row on an exact month boundary lands in exactly one
+# partition/tier, never double-counted or dropped. Fixed UTC-boundary literals
+# are the point of the test (not a calendar-relative cutoff), so this is the one
+# place a story uses literal timestamps deliberately. Self-contained decoupled
+# table, month(ts) partitioned.
+# ───────────────────────────────────────────────────────────────────────────
+story_boundary_row() {
+    step "H2: a row on an exact month boundary lands in exactly one partition"
+    q "$HOST" "SELECT coldfront.create_iceberg_table('public','edge','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"ts\",\"type\":\"timestamptz\"}]'::jsonb, '{month(ts)}');" >/dev/null 2>&1
+    q "$HOST" "INSERT INTO public.edge VALUES (1,'2026-02-01 00:00:00+00'),(2,'2026-01-31 23:59:59.999+00');" >/dev/null 2>&1
+    assert_eq "H2: both rows stored" "2" "$(q "$HOST" "SELECT count(*) FROM public.edge;" | tail -1)"
+    assert_eq "H2: the 00:00:00 boundary row is in February only (id=1)" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM public.edge WHERE ts >= '2026-02-01 00:00:00+00' AND ts < '2026-03-01 00:00:00+00';" | tail -1)"
+    assert_eq "H2: the 23:59:59.999 row is in January only (id=2)" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM public.edge WHERE ts >= '2026-01-01 00:00:00+00' AND ts < '2026-02-01 00:00:00+00';" | tail -1)"
+    assert_eq "H2: boundary row not duplicated across months" "2" "$(q "$HOST" "SELECT count(DISTINCT id) FROM public.edge;" | tail -1)"
+    q "$HOST" "SELECT coldfront.drop_iceberg_table('public','edge', true);" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Destructive E3 — two archivers on one table at once. The bakery/claim must
+# serialize them so the cold tier is written once: every seeded row is present
+# through the view exactly once (no loss, no duplicate). Contention that one
+# archiver handles cleanly (a non-zero exit on a lock it could not take) is fine;
+# the assertion is on the DATA, not the exit codes.
+# ───────────────────────────────────────────────────────────────────────────
+story_two_archivers() {
+    step "E3: two archivers on one table — serialized, no duplicate cold rows"
+    if [ "$MESH" = 1 ]; then note "E3: skipped in mesh mode"; return; fi
+    qf "$HOST" <<'EOSQL' >/dev/null
+SET search_path = public;
+CREATE TABLE IF NOT EXISTS e3tbl (id bigint NOT NULL, ts timestamptz NOT NULL, PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);
+DO $do$
+DECLARE m date;
+BEGIN
+  m := (date_trunc('month', now()) - interval '2 months')::date;
+  EXECUTE format('CREATE TABLE IF NOT EXISTS public.%I PARTITION OF public.e3tbl FOR VALUES FROM (%L) TO (%L)',
+                 'e3tbl_p_' || to_char(m, 'YYYY_MM'), m, (m + interval '1 month'));
+END $do$;
+INSERT INTO public.e3tbl (id, ts)
+  SELECT g, date_trunc('month', now()) - interval '2 months' + interval '5 days' + (g * interval '1 minute')
+  FROM generate_series(1, 50) g;
+EOSQL
+    local ret_days; ret_days=$(hot_days)
+    if ! "$ARCHIVER" register --table e3tbl --period monthly --hot-period "${ret_days} days" >"$TMPD/e3.log" 2>&1; then
+        fail "E3: register e3tbl — see $TMPD/e3.log"; tail -5 "$TMPD/e3.log"
+        q "$HOST" "DROP TABLE IF EXISTS public.e3tbl CASCADE;" >/dev/null 2>&1; return
+    fi
+    # Isolate e3tbl so both archivers target only it, then launch them together.
+    local others
+    others=$(q "$HOST" "SELECT string_agg(format('(%L,%L)', schema_name, table_name), ',') FROM coldfront.partition_config WHERE enabled AND NOT (schema_name='public' AND table_name='e3tbl');")
+    [ -n "$others" ] && q "$HOST" "UPDATE coldfront.partition_config SET enabled=false WHERE (schema_name,table_name) IN ($others);" >/dev/null
+    "$ARCHIVER" >"$TMPD/e3a.log" 2>&1 & local pa=$!
+    "$ARCHIVER" >"$TMPD/e3b.log" 2>&1 & local pb=$!
+    wait "$pa"; wait "$pb"
+    [ -n "$others" ] && q "$HOST" "UPDATE coldfront.partition_config SET enabled=true WHERE (schema_name,table_name) IN ($others);" >/dev/null
+    assert_eq "E3: every seeded row present through the view" "50" "$(q "$HOST" "SELECT count(*) FROM public.e3tbl;" | tail -1)"
+    assert_eq "E3: distinct ids equal row count (no duplicate cold rows)" "50" "$(q "$HOST" "SELECT count(DISTINCT id) FROM public.e3tbl;" | tail -1)"
+    q "$HOST" "SELECT coldfront.drop_iceberg_table('public','e3tbl', true);" >/dev/null 2>&1
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name='e3tbl';" >/dev/null 2>&1
+    q "$HOST" "DROP VIEW  IF EXISTS public.e3tbl;" >/dev/null 2>&1
+    q "$HOST" "DROP TABLE IF EXISTS public._e3tbl CASCADE;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Destructive I2 — fingerprint a dataset before tiering and again after: the
+# count + sum(id) + min/max(ts) signature must be identical, proving the cold
+# move changed nothing. Rows span several months so some land cold and some stay
+# hot; the view must answer with the full set either way.
+# ───────────────────────────────────────────────────────────────────────────
+story_fingerprint_roundtrip() {
+    step "I2: fingerprint before vs after tiering — the cold move changes nothing"
+    if [ "$MESH" = 1 ]; then note "I2: skipped in mesh mode"; return; fi
+    qf "$HOST" <<'EOSQL' >/dev/null
+SET search_path = public;
+CREATE TABLE IF NOT EXISTS fp_tbl (id bigint NOT NULL, ts timestamptz NOT NULL, PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);
+DO $do$
+DECLARE m date;
+BEGIN
+  FOR m IN SELECT generate_series(date_trunc('month', now()) - interval '3 months', date_trunc('month', now()), interval '1 month')::date LOOP
+    EXECUTE format('CREATE TABLE IF NOT EXISTS public.%I PARTITION OF public.fp_tbl FOR VALUES FROM (%L) TO (%L)',
+                   'fp_tbl_p_' || to_char(m, 'YYYY_MM'), m, (m + interval '1 month'));
+  END LOOP;
+END $do$;
+INSERT INTO public.fp_tbl (id, ts)
+  SELECT g, date_trunc('month', now()) - interval '3 months' + (g * interval '17 hours')
+  FROM generate_series(1, 120) g;
+EOSQL
+    local before; before=$(fingerprint "public.fp_tbl" "true")
+    assert_contains "I2: before-fingerprint captured" "|" "$before"
+    local ret_days; ret_days=$(hot_days)
+    if ! "$ARCHIVER" register --table fp_tbl --period monthly --hot-period "${ret_days} days" >"$TMPD/fp.log" 2>&1; then
+        fail "I2: register fp_tbl — see $TMPD/fp.log"; tail -5 "$TMPD/fp.log"
+        q "$HOST" "DROP TABLE IF EXISTS public.fp_tbl CASCADE;" >/dev/null 2>&1; return
+    fi
+    if ! archive_only "schema_name='public' AND table_name='fp_tbl'" "$TMPD/fp.log"; then
+        fail "I2: archive fp_tbl — see $TMPD/fp.log"; tail -5 "$TMPD/fp.log"
+    fi
+    local after; after=$(fingerprint "public.fp_tbl" "true")
+    assert_eq "I2: fingerprint identical before and after tiering (no loss/dup/drift)" "$before" "$after"
+    assert_gt "I2: some rows actually moved to cold" "0" "$(ice_files ice.public.fp_tbl '\.parquet')"
+    q "$HOST" "SELECT coldfront.drop_iceberg_table('public','fp_tbl', true);" >/dev/null 2>&1
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name='fp_tbl';" >/dev/null 2>&1
+    q "$HOST" "DROP VIEW  IF EXISTS public.fp_tbl;" >/dev/null 2>&1
+    q "$HOST" "DROP TABLE IF EXISTS public._fp_tbl CASCADE;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Destructive H4 — a cross-tier move during an archive. While the archiver holds
+# the post-export / pre-cutover window (--debug-export-delay), an UPDATE moves a
+# hot row's ts into the cold partition being archived. The safe invariant,
+# whichever tier wins the race: the row is counted exactly once — no loss (total
+# unchanged), no duplication (distinct ids == total). A clean refusal of the
+# concurrent move is also safe (noted, not failed); only loss/dup is a failure.
+# ───────────────────────────────────────────────────────────────────────────
+story_move_during_archive() {
+    step "H4: cross-tier move during an archive — row ends up in exactly one tier"
+    if [ "$MESH" = 1 ]; then note "H4: skipped in mesh mode (cutover fans out to peers)"; return; fi
+    _mv_cleanup() {
+        q "$HOST" "DELETE FROM coldfront.partition_config  WHERE table_name='mv_events';" >/dev/null 2>&1
+        q "$HOST" "DELETE FROM coldfront.archive_watermark WHERE table_name='mv_events';" >/dev/null 2>&1
+        q "$HOST" "DROP VIEW  IF EXISTS public.mv_events CASCADE;" >/dev/null 2>&1
+        q "$HOST" "DROP TABLE IF EXISTS public._mv_events CASCADE;" >/dev/null 2>&1
+        q "$HOST" "DROP TABLE IF EXISTS public.mv_events CASCADE;" >/dev/null 2>&1
+    }
+    trap _mv_cleanup RETURN
+    qf "$HOST" <<'EOSQL' >/dev/null
+SET search_path = public;
+CREATE TABLE IF NOT EXISTS public.mv_events (
+    id bigint NOT NULL, ts timestamptz NOT NULL, status text, PRIMARY KEY (id, ts)
+) PARTITION BY RANGE (ts);
+DO $do$
+DECLARE m date;
+BEGIN
+  m := date_trunc('month', now()) - interval '3 months';
+  EXECUTE format('CREATE TABLE IF NOT EXISTS %I PARTITION OF mv_events FOR VALUES FROM (%L) TO (%L)', 'mv_events_p_cold', m, m + interval '1 month');
+  m := date_trunc('month', now());
+  EXECUTE format('CREATE TABLE IF NOT EXISTS %I PARTITION OF mv_events FOR VALUES FROM (%L) TO (%L)', 'mv_events_p_hot', m, m + interval '1 month');
+END $do$;
+-- 20 cold rows, 20 hot rows; id 999 is the hot row we move into the cold month.
+INSERT INTO public.mv_events (id, ts, status) SELECT g, date_trunc('month',now()) - interval '3 months' + interval '2 days' + (g*interval '1 hour'), 'cold' FROM generate_series(1,20) g;
+INSERT INTO public.mv_events (id, ts, status) SELECT 100+g, now() - (g*interval '1 hour'), 'hot' FROM generate_series(1,19) g;
+INSERT INTO public.mv_events (id, ts, status) VALUES (999, now() - interval '30 minutes', 'mover');
+EOSQL
+    local total; total=$(q "$HOST" "SELECT count(*) FROM public.mv_events;" | tail -1)
+    assert_eq "H4: 40 rows seeded" "40" "$total"
+    local ret_days; ret_days=$(hot_days)
+    if ! "$ARCHIVER" register --table mv_events --period monthly --hot-period "${ret_days} days" >"$TMPD/mv.log" 2>&1; then
+        fail "H4: register mv_events — see $TMPD/mv.log"; tail -5 "$TMPD/mv.log"; return
+    fi
+    # Hold the post-export / pre-cutover window; move id 999 into the cold month
+    # while it is open, then let the archiver finish.
+    "$ARCHIVER" --debug-export-delay 25s >"$TMPD/mv-arch.log" 2>&1 &
+    local apid=$!
+    local reached=0 _
+    for _ in $(seq 1 60); do
+        grep -q "debug-export-delay" "$TMPD/mv-arch.log" 2>/dev/null && { reached=1; break; }
+        kill -0 "$apid" 2>/dev/null || break
+        sleep 1
+    done
+    if [ "$reached" != 1 ]; then
+        fail "H4: archiver never reached the pre-cutover window"; tail -8 "$TMPD/mv-arch.log"
+        kill "$apid" 2>/dev/null || true; wait "$apid" 2>/dev/null || true; return
+    fi
+    # The cross-cutoff move, issued mid-cutover. Either it lands (row moves tier)
+    # or it is cleanly refused — both are safe; only loss/dup fails below.
+    local mv; mv=$(q_may "$HOST" "SET statement_timeout='10s'; UPDATE public.mv_events SET ts = date_trunc('month',now()) - interval '3 months' + interval '5 days' WHERE id=999;")
+    case "$mv" in *ERROR*|*error*) note "H4: the concurrent move was refused (safe): ${mv##*$'\n'}";; *) note "H4: the concurrent move was accepted";; esac
+    wait "$apid" 2>/dev/null || true
+    # Safe invariant: no loss, no duplication — regardless of which tier won.
+    local after; after=$(q "$HOST" "SELECT count(*) FROM public.mv_events;" | tail -1)
+    local distinct; distinct=$(q "$HOST" "SELECT count(DISTINCT id) FROM public.mv_events;" | tail -1)
+    assert_eq "H4: no row lost or duplicated after the move-during-archive (total)" "$total" "$after"
+    assert_eq "H4: every id present exactly once (no duplication)" "$total" "$distinct"
+    assert_eq "H4: the moved row (id 999) is readable exactly once" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM public.mv_events WHERE id=999;" | tail -1)"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Destructive I1 — bulk-load several months into a plain partitioned table, then
+# tier it; every row lands in exactly one tier (view count == seeded, distinct ==
+# seeded), some rows reach cold, and the hot heap shrank (the split is real).
+# ───────────────────────────────────────────────────────────────────────────
+story_bulk_tier_fidelity() {
+    step "I1: bulk load then tier — every row in exactly one tier, none lost/duplicated"
+    if [ "$MESH" = 1 ]; then note "I1: skipped in mesh mode"; return; fi
+    qf "$HOST" <<'EOSQL' >/dev/null
+SET search_path = public;
+CREATE TABLE IF NOT EXISTS bulk_t (id bigint NOT NULL, ts timestamptz NOT NULL, payload text, PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);
+DO $do$
+DECLARE m date;
+BEGIN
+  FOR m IN SELECT generate_series(date_trunc('month',now()) - interval '5 months', date_trunc('month',now()), interval '1 month')::date LOOP
+    EXECUTE format('CREATE TABLE IF NOT EXISTS public.%I PARTITION OF public.bulk_t FOR VALUES FROM (%L) TO (%L)',
+                   'bulk_t_p_' || to_char(m,'YYYY_MM'), m, (m + interval '1 month'));
+  END LOOP;
+END $do$;
+INSERT INTO public.bulk_t (id, ts, payload)
+  SELECT g, date_trunc('month',now()) - interval '5 months' + (g * interval '38 minutes'), 'row-'||g
+  FROM generate_series(1,3000) g;
+EOSQL
+    local total; total=$(q "$HOST" "SELECT count(*) FROM public.bulk_t;" | tail -1)
+    assert_eq "I1: 3000 rows seeded" "3000" "$total"
+    local ret_days; ret_days=$(hot_days)
+    if ! "$ARCHIVER" register --table bulk_t --period monthly --hot-period "${ret_days} days" >"$TMPD/bulk.log" 2>&1; then
+        fail "I1: register — see $TMPD/bulk.log"; tail -5 "$TMPD/bulk.log"; q "$HOST" "DROP TABLE IF EXISTS public.bulk_t CASCADE;" >/dev/null 2>&1; return
+    fi
+    archive_only "schema_name='public' AND table_name='bulk_t'" "$TMPD/bulk.log" || { fail "I1: archive — see $TMPD/bulk.log"; tail -5 "$TMPD/bulk.log"; }
+    assert_eq "I1: view still returns every row" "$total" "$(q "$HOST" "SELECT count(*) FROM public.bulk_t;" | tail -1)"
+    assert_eq "I1: distinct ids == total (no loss, no duplicate)" "$total" "$(q "$HOST" "SELECT count(DISTINCT id) FROM public.bulk_t;" | tail -1)"
+    assert_gt "I1: some rows reached cold" "0" "$(ice_files ice.public.bulk_t '\.parquet')"
+    assert_eq "I1: an old cold row reads back correctly" "row-1" "$(q "$HOST" "SELECT payload FROM public.bulk_t WHERE id=1;" | tail -1)"
+    q "$HOST" "SELECT coldfront.drop_iceberg_table('public','bulk_t', true);" >/dev/null 2>&1
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name='bulk_t';" >/dev/null 2>&1
+    q "$HOST" "DROP VIEW IF EXISTS public.bulk_t;" >/dev/null 2>&1; q "$HOST" "DROP TABLE IF EXISTS public._bulk_t CASCADE;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Destructive I4 — NULLs, empty string, min/max bigint and unicode/emoji survive
+# the move to cold byte-for-byte. Read each value back by SQL equality.
+# ───────────────────────────────────────────────────────────────────────────
+story_null_extreme_fidelity() {
+    step "I4: NULLs & extreme values survive tiering exactly"
+    if [ "$MESH" = 1 ]; then note "I4: skipped in mesh mode"; return; fi
+    q "$HOST" "SELECT coldfront.create_iceberg_table('public','edge4','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"n\",\"type\":\"bigint\"},{\"name\":\"s\",\"type\":\"text\"}]'::jsonb);" >/dev/null 2>&1
+    qf "$HOST" <<'EOSQL' >/dev/null
+INSERT INTO public.edge4 (id,n,s) VALUES
+  (1, NULL, NULL),
+  (2, 9223372036854775807, ''),
+  (3, -9223372036854775808, 'héllo🌍'),
+  (4, 0, 'tab	and newline
+here');
+EOSQL
+    assert_eq "I4: NULLs preserved (n and s both null for id=1)" "t" \
+        "$(q "$HOST" "SELECT (n IS NULL AND s IS NULL) FROM public.edge4 WHERE id=1;" | tail -1)"
+    assert_eq "I4: max bigint exact" "9223372036854775807" "$(q "$HOST" "SELECT n FROM public.edge4 WHERE id=2;" | tail -1)"
+    assert_eq "I4: min bigint exact" "-9223372036854775808" "$(q "$HOST" "SELECT n FROM public.edge4 WHERE id=3;" | tail -1)"
+    assert_eq "I4: empty string stays empty, not null" "t" "$(q "$HOST" "SELECT (s = '' AND s IS NOT NULL) FROM public.edge4 WHERE id=2;" | tail -1)"
+    assert_eq "I4: unicode/emoji exact" "héllo🌍" "$(q "$HOST" "SELECT s FROM public.edge4 WHERE id=3;" | tail -1)"
+    q "$HOST" "SELECT coldfront.drop_iceberg_table('public','edge4', true);" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Destructive I5 + I6 — cross-tier query parity: the same filter, range and
+# per-group aggregates return identical answers before and after tiering. The
+# view must answer exactly as the plain table did.
+# ───────────────────────────────────────────────────────────────────────────
+story_cross_tier_query_parity() {
+    step "I5/I6: query + group-by parity before vs after tiering"
+    if [ "$MESH" = 1 ]; then note "I5/I6: skipped in mesh mode"; return; fi
+    qf "$HOST" <<'EOSQL' >/dev/null
+SET search_path = public;
+CREATE TABLE IF NOT EXISTS par_t (id bigint NOT NULL, ts timestamptz NOT NULL, grp text, val int, PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);
+DO $do$
+DECLARE m date;
+BEGIN
+  FOR m IN SELECT generate_series(date_trunc('month',now()) - interval '3 months', date_trunc('month',now()), interval '1 month')::date LOOP
+    EXECUTE format('CREATE TABLE IF NOT EXISTS public.%I PARTITION OF public.par_t FOR VALUES FROM (%L) TO (%L)',
+                   'par_t_p_' || to_char(m,'YYYY_MM'), m, (m + interval '1 month'));
+  END LOOP;
+END $do$;
+INSERT INTO public.par_t (id, ts, grp, val)
+  SELECT g, date_trunc('month',now()) - interval '3 months' + (g * interval '47 minutes'), 'g'||(g%4), g
+  FROM generate_series(1,200) g;
+EOSQL
+    local q_filter="SELECT count(*) FROM public.par_t WHERE val > 100;"
+    local q_sum="SELECT coalesce(sum(val),0) FROM public.par_t;"
+    local q_grp="SELECT grp||':'||sum(val) FROM public.par_t GROUP BY grp ORDER BY grp;"
+    local f0 s0 g0; f0=$(q "$HOST" "$q_filter" | tail -1); s0=$(q "$HOST" "$q_sum" | tail -1); g0=$(q "$HOST" "$q_grp" | tr '\n' ',')
+    local ret_days; ret_days=$(hot_days)
+    if ! "$ARCHIVER" register --table par_t --period monthly --hot-period "${ret_days} days" >"$TMPD/par.log" 2>&1; then
+        fail "I5/I6: register — see $TMPD/par.log"; tail -5 "$TMPD/par.log"; q "$HOST" "DROP TABLE IF EXISTS public.par_t CASCADE;" >/dev/null 2>&1; return
+    fi
+    archive_only "schema_name='public' AND table_name='par_t'" "$TMPD/par.log" || { fail "I5/I6: archive — see $TMPD/par.log"; tail -5 "$TMPD/par.log"; }
+    assert_eq "I5: filtered count identical after tiering" "$f0" "$(q "$HOST" "$q_filter" | tail -1)"
+    assert_eq "I5: total sum identical after tiering" "$s0" "$(q "$HOST" "$q_sum" | tail -1)"
+    assert_eq "I6: per-group sums identical after tiering" "$g0" "$(q "$HOST" "$q_grp" | tr '\n' ',')"
+    q "$HOST" "SELECT coldfront.drop_iceberg_table('public','par_t', true);" >/dev/null 2>&1
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name='par_t';" >/dev/null 2>&1
+    q "$HOST" "DROP VIEW IF EXISTS public.par_t;" >/dev/null 2>&1; q "$HOST" "DROP TABLE IF EXISTS public._par_t CASCADE;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Destructive I9 — retention exactness: the rows that should survive an expiry
+# are byte-identical before and after it, and only the targeted range is gone —
+# no collateral deletion of neighbours.
+# ───────────────────────────────────────────────────────────────────────────
+story_retention_exactness() {
+    step "I9: retention expiry removes only the targeted range; survivors unchanged"
+    if [ "$MESH" = 1 ]; then note "I9: skipped in mesh mode"; return; fi
+    qf "$HOST" <<'EOSQL' >/dev/null
+SET search_path = public;
+CREATE TABLE IF NOT EXISTS ret_t (id bigint NOT NULL, ts timestamptz NOT NULL, PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);
+DO $do$
+DECLARE m date;
+BEGIN
+  FOR m IN SELECT generate_series(date_trunc('month',now()) - interval '5 months', date_trunc('month',now()), interval '1 month')::date LOOP
+    EXECUTE format('CREATE TABLE IF NOT EXISTS public.%I PARTITION OF public.ret_t FOR VALUES FROM (%L) TO (%L)',
+                   'ret_t_p_' || to_char(m,'YYYY_MM'), m, (m + interval '1 month'));
+  END LOOP;
+END $do$;
+INSERT INTO public.ret_t (id, ts)
+  SELECT g, date_trunc('month',now()) - interval '5 months' + (g * interval '50 minutes')
+  FROM generate_series(1,300) g;
+EOSQL
+    local ret_days; ret_days=$(hot_days)
+    "$ARCHIVER" register --table ret_t --period monthly --hot-period "${ret_days} days" >"$TMPD/ret.log" 2>&1 || { fail "I9: register — see $TMPD/ret.log"; q "$HOST" "DROP TABLE IF EXISTS public.ret_t CASCADE;" >/dev/null 2>&1; return; }
+    archive_only "schema_name='public' AND table_name='ret_t'" "$TMPD/ret.log" || { fail "I9: archive"; tail -5 "$TMPD/ret.log"; }
+    # Survivors = rows newer than 4 months (the range we will NOT expire).
+    local keep_pred="ts >= date_trunc('month',now()) - interval '4 months'"
+    local survivors0; survivors0=$(fingerprint "public.ret_t" "$keep_pred")
+    local total0; total0=$(q "$HOST" "SELECT count(*) FROM public.ret_t;" | tail -1)
+    # Expire everything older than 4 months (retention), then re-check survivors.
+    "$ARCHIVER" set --table ret_t --retention "4 months" >"$TMPD/ret.log" 2>&1 || note "I9: set retention returned nonzero (see log)"
+    archive_only "schema_name='public' AND table_name='ret_t'" "$TMPD/ret.log" || note "I9: expiry pass returned nonzero"
+    assert_eq "I9: survivors byte-identical after expiry (count|sum(id)|min|max)" "$survivors0" "$(fingerprint "public.ret_t" "$keep_pred")"
+    assert_eq "I9: the expired (older) range is gone" "0" "$(q "$HOST" "SELECT count(*) FROM public.ret_t WHERE ts < date_trunc('month',now()) - interval '4 months';" | tail -1)"
+    local after_total; after_total=$(q "$HOST" "SELECT count(*) FROM public.ret_t;" | tail -1)
+    assert_gt "I9: expiry actually removed rows (total shrank)" "$after_total" "$total0"
+    q "$HOST" "SELECT coldfront.drop_iceberg_table('public','ret_t', true);" >/dev/null 2>&1
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name='ret_t';" >/dev/null 2>&1
+    q "$HOST" "DROP VIEW IF EXISTS public.ret_t;" >/dev/null 2>&1; q "$HOST" "DROP TABLE IF EXISTS public._ret_t CASCADE;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Gap G-07 — GDPR right-to-delete: a single DELETE keyed on a NON-partition
+# column removes a subject's rows from BOTH tiers at once (the marquee claim:
+# "DELETE FROM t WHERE customer_id = N works regardless of hot or cold"). The
+# subject has one cold row and one hot row; after the one statement both are
+# gone, every other subject is untouched, and the total drops by exactly two.
+# ───────────────────────────────────────────────────────────────────────────
+story_gdpr_right_to_delete() {
+    step "G-07: single-statement cross-tier DELETE (GDPR right-to-delete)"
+    if [ "$MESH" = 1 ]; then note "G-07: skipped in mesh mode"; return; fi
+    qf "$HOST" <<'EOSQL' >/dev/null
+SET search_path = public;
+CREATE TABLE IF NOT EXISTS gdpr_t (id bigint NOT NULL, ts timestamptz NOT NULL, customer_id bigint, PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);
+DO $do$
+DECLARE m date;
+BEGIN
+  m := date_trunc('month',now()) - interval '3 months';
+  EXECUTE format('CREATE TABLE IF NOT EXISTS public.%I PARTITION OF public.gdpr_t FOR VALUES FROM (%L) TO (%L)', 'gdpr_t_p_cold', m, m + interval '1 month');
+  m := date_trunc('month',now());
+  EXECUTE format('CREATE TABLE IF NOT EXISTS public.%I PARTITION OF public.gdpr_t FOR VALUES FROM (%L) TO (%L)', 'gdpr_t_p_hot', m, m + interval '1 month');
+END $do$;
+INSERT INTO public.gdpr_t (id, ts, customer_id) VALUES
+  (1, date_trunc('month',now()) - interval '3 months' + interval '5 days', 12345),
+  (2, now() - interval '1 hour', 12345),
+  (3, date_trunc('month',now()) - interval '3 months' + interval '6 days', 999),
+  (4, now() - interval '2 hours', 999);
+EOSQL
+    local ret_days; ret_days=$(hot_days)
+    "$ARCHIVER" register --table gdpr_t --period monthly --hot-period "${ret_days} days" >"$TMPD/gdpr.log" 2>&1 || { fail "G-07: register — see $TMPD/gdpr.log"; q "$HOST" "DROP TABLE IF EXISTS public.gdpr_t CASCADE;" >/dev/null 2>&1; return; }
+    archive_only "schema_name='public' AND table_name='gdpr_t'" "$TMPD/gdpr.log" || { fail "G-07: archive"; tail -5 "$TMPD/gdpr.log"; }
+    assert_eq "G-07: subject 12345 has rows in both tiers before delete" "2" "$(q "$HOST" "SELECT count(*) FROM public.gdpr_t WHERE customer_id=12345;" | tail -1)"
+    assert_gt "G-07: some of the data is cold (the split is real)" "0" "$(ice_files ice.public.gdpr_t '\.parquet')"
+    local before; before=$(q "$HOST" "SELECT count(*) FROM public.gdpr_t;" | tail -1)
+    # The one statement — no partition predicate, spans both tiers.
+    local del; del=$(q_may "$HOST" "DELETE FROM public.gdpr_t WHERE customer_id=12345;")
+    case "$del" in *ERROR*|*error*) fail "G-07: the cross-tier GDPR delete was refused — got: ${del##*$'\n'}";; *) pass "G-07: the single DELETE ran across both tiers";; esac
+    assert_eq "G-07: subject 12345 gone from the unified view" "0" "$(q "$HOST" "SELECT count(*) FROM public.gdpr_t WHERE customer_id=12345;" | tail -1)"
+    assert_eq "G-07: the cold-tier row (id=1) is gone too" "0" "$(q "$HOST" "SELECT count(*) FROM public.gdpr_t WHERE id=1;" | tail -1)"
+    assert_eq "G-07: other subjects untouched" "2" "$(q "$HOST" "SELECT count(*) FROM public.gdpr_t WHERE customer_id=999;" | tail -1)"
+    assert_eq "G-07: total dropped by exactly the two deleted rows" "$((before-2))" "$(q "$HOST" "SELECT count(*) FROM public.gdpr_t;" | tail -1)"
+    q "$HOST" "SELECT coldfront.drop_iceberg_table('public','gdpr_t', true);" >/dev/null 2>&1
+    q "$HOST" "DELETE FROM coldfront.partition_config WHERE table_name='gdpr_t';" >/dev/null 2>&1
+    q "$HOST" "DROP VIEW IF EXISTS public.gdpr_t;" >/dev/null 2>&1; q "$HOST" "DROP TABLE IF EXISTS public._gdpr_t CASCADE;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Destructive C2 — a cross-node UPDATE and DELETE race on one cold row. The
+# bakery serializes them; whichever commits last wins, and EVERY node must
+# converge on that one state (gone, or present with the update) — never split
+# state (one node says present, another gone). Decoupled+mesh, explicit id.
+# ───────────────────────────────────────────────────────────────────────────
+story_mesh_update_delete_convergence() {
+    step "C2: cross-node UPDATE + DELETE on one cold row converge to one state"
+    { [ "$MESH" = 1 ] && [ "$MODE" = decoupled ]; } || { note "C2: mesh+decoupled only"; return; }
+    local PARR; read -ra PARR <<< "$PEERS"
+    [ "${#PARR[@]}" -ge 1 ] || { fail "C2: no --peers given"; return; }
+    local p1="${PARR[0]}" p2="${PARR[1]:-$HOST}" id=55001
+    q "$HOST" "INSERT INTO iceonly VALUES ($id, date_trunc('month',now()) + interval '3 months', 'orig', '{}');" >/dev/null 2>&1
+    sleep 3
+    assert_peers_agree "C2: the seed row replicated to every node" "SELECT coalesce(max(status),'<none>') FROM iceonly WHERE id=$id;"
+    # One node updates, another deletes — back to back; the bakery serializes them.
+    q "$p1" "UPDATE iceonly SET status='upd' WHERE id=$id;" >/dev/null 2>&1
+    q "$p2" "DELETE FROM iceonly WHERE id=$id;" >/dev/null 2>&1
+    sleep 3
+    # The invariant: all nodes AGREE on the final state (which winner is fine).
+    assert_peers_agree "C2: nodes converge on one final state for the contested row" \
+        "SELECT count(*) || ':' || coalesce(string_agg(status, ','), '') FROM iceonly WHERE id=$id;"
+    q "$HOST" "DELETE FROM iceonly WHERE id=$id;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Gap S-03 — cold writes succeed and replicate under each synchronous_commit
+# setting the bakery's claim replication is gated on (CLAUDE.md lists the
+# synchronous_* GUCs as in-scope). For local and remote_apply, the write lands
+# on the writer and reaches every peer. Decoupled+mesh, explicit id.
+# ───────────────────────────────────────────────────────────────────────────
+story_mesh_synchronous_commit() {
+    step "S-03: cold writes under synchronous_commit variants succeed + replicate"
+    { [ "$MESH" = 1 ] && [ "$MODE" = decoupled ]; } || { note "S-03: mesh+decoupled only"; return; }
+    local PARR; read -ra PARR <<< "$PEERS"
+    [ "${#PARR[@]}" -ge 1 ] || { fail "S-03: no --peers given"; return; }
+    local n=0 sc
+    for sc in local remote_apply; do
+        n=$((n + 1)); local id=$((57000 + n))
+        local out; out=$(q_may "$HOST" "SET synchronous_commit='$sc'; INSERT INTO iceonly VALUES ($id, date_trunc('month',now()) + interval '3 months', 'sc-$sc', '{}');")
+        case "$out" in *ERROR*|*error*) fail "S-03: cold write failed under synchronous_commit=$sc — ${out##*$'\n'}";; *) pass "S-03: cold write succeeded under synchronous_commit=$sc";; esac
+        assert_eq "S-03: writer sees the row (synchronous_commit=$sc)" "sc-$sc" \
+            "$(q "$HOST" "SELECT status FROM iceonly WHERE id=$id;" | tail -1)"
+        assert_peers_agree "S-03: peers see the row (synchronous_commit=$sc)" \
+            "SELECT coalesce(max(status),'<none>') FROM iceonly WHERE id=$id;"
+        q "$HOST" "DELETE FROM iceonly WHERE id=$id;" >/dev/null 2>&1
+    done
+}
+
 # ── orchestrate ────────────────────────────────────────────────────────────
 # Setup is shared. The story set then branches on mode: tiered exercises the
 # hot+cold partitioned path; decoupled exercises the all-Iceberg wrapper. (The
@@ -8156,5 +8751,27 @@ story_drop_iceberg_table   # both modes, purge and keep-files (own throwaway tab
 [ "$MESH" = 1 ] && story_mesh_claim_failures  # a failed claim step leaves no lock, claim or open loopback
 [ "$MESH" = 1 ] && story_mesh_dead_peer  # TC-221..223: a wal_sender_timeout the window does not cover is refused, idle replies inside the window, a silent peer ruled dead and rejoining
 [ -n "$STANDBY" ]    && story_standby_reads
+
+# Automation-gap-analysis coverage stories (2026-10). Each self-skips where it
+# cannot run (backend, mesh, vended credentials, mode), so they run identically
+# under ci/matrix.sh and run-ci-local.sh — no CI-vs-local divergence.
+# P0 — graceful degradation / durability (s3, single node).
+story_s3_down_cold_write       # Destructive C3: store down mid cold-write
+story_s3_down_query_degrades   # Gap G-03: store down during queries
+story_lakekeeper_down_login    # Gap G-02: catalog down must not block connections
+story_dump_restore_roundtrip   # Destructive I11/H3: pg_dump -> restore round-trip
+# P1 — data-fidelity (single node).
+story_boundary_row             # Destructive H2: exact month-boundary row
+story_two_archivers            # Destructive E3: two archivers, no duplicate cold rows
+story_fingerprint_roundtrip    # Destructive I2: fingerprint identical before/after tiering
+story_move_during_archive      # Destructive H4: cross-tier move during cutover window
+story_bulk_tier_fidelity       # Destructive I1: bulk load then tier, no loss/dup
+story_null_extreme_fidelity    # Destructive I4: NULLs & extreme values survive
+story_cross_tier_query_parity  # Destructive I5/I6: query + group-by parity
+story_retention_exactness      # Destructive I9: expiry removes only the targeted range
+# P2 — workflow + mesh (mesh stories self-skip outside mesh/decoupled).
+story_gdpr_right_to_delete        # Gap G-07: single-statement cross-tier DELETE
+story_mesh_update_delete_convergence  # Destructive C2: cross-node UPDATE/DELETE converge
+story_mesh_synchronous_commit         # Gap S-03: cold writes under synchronous_commit variants
 
 summary

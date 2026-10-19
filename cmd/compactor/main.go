@@ -67,7 +67,7 @@ func main() {
 			" [--orphans [--orphan-age D]]")
 		os.Exit(2)
 	}
-	if err := checkFlags(*targetMB, *orphanAge); err != nil {
+	if err := checkFlags(*targetMB, *orphanAge, *retainLast, *olderThan); err != nil {
 		fmt.Fprintf(os.Stderr, "compactor: %v\n", err)
 		os.Exit(2)
 	}
@@ -88,15 +88,24 @@ func main() {
 }
 
 // checkFlags refuses, before anything connects, a --target-size-mb below 1 or
-// one whose byte count overflows int64, and an --orphan-age of 0 or less, which
-// lets an orphan pass delete files a writer has staged but not yet committed.
-func checkFlags(targetMB int64, orphanAge time.Duration) error {
+// one whose byte count overflows int64; an --orphan-age of 0 or less, which lets
+// an orphan pass delete files a writer has staged but not yet committed; an
+// --expire-retain-last below 1, which would leave zero snapshots retained and
+// could expire the current one; and a negative --expire-older-than (0s is valid —
+// it selects every snapshot for expiry).
+func checkFlags(targetMB int64, orphanAge time.Duration, retainLast int, olderThan time.Duration) error {
 	const maxMB = math.MaxInt64 >> 20
 	if targetMB < 1 || targetMB > maxMB {
 		return fmt.Errorf("--target-size-mb must be between 1 and %d, got %d", maxMB, targetMB)
 	}
 	if orphanAge <= 0 {
 		return fmt.Errorf("--orphan-age must be positive, got %s", orphanAge)
+	}
+	if retainLast < 1 {
+		return fmt.Errorf("--expire-retain-last must be at least 1, got %d", retainLast)
+	}
+	if olderThan < 0 {
+		return fmt.Errorf("--expire-older-than must not be negative, got %s", olderThan)
 	}
 	return nil
 }
