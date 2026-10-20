@@ -91,10 +91,13 @@ following steps prepare and start the service, whichever way you
 installed it:
 
 1. Connect as a PostgreSQL superuser, such as `postgres` (for example, with
-    `sudo -u postgres psql`), and create a role and a database for the catalog:
+    `sudo -u postgres psql`), and create a role and a database for the catalog.
+    Replace `<password>` with a generated password, such as the output of
+    `openssl rand -hex 32`; a hex value needs no escaping in the connection
+    string in step 2:
 
     ```sql
-    CREATE ROLE lakekeeper LOGIN PASSWORD 'change-me';
+    CREATE ROLE lakekeeper LOGIN PASSWORD '<password>';
     CREATE DATABASE lakekeeper OWNER lakekeeper;
     ```
 
@@ -103,7 +106,9 @@ installed it:
     allowed to run `CREATE EXTENSION` or a superuser must create them first.
 
 2. In `/etc/lakekeeper/lakekeeper.env`, set
-    `LAKEKEEPER__PG_DATABASE_URL_WRITE` to the database's connection string and
+    `LAKEKEEPER__PG_DATABASE_URL_WRITE` to the database's connection string,
+    with the same password (for example,
+    `postgresql://lakekeeper:<password>@127.0.0.1:5432/lakekeeper`), and
     `LAKEKEEPER__PG_ENCRYPTION_KEY` to a random secret, such as the output of
     `openssl rand -base64 32`. Lakekeeper encrypts stored credentials with the
     key, so keep the key stable and backed up. Every node that shares the
