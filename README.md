@@ -432,8 +432,8 @@ PostgreSQL server development headers, the libpq headers and library, `make`,
 6. Restart PostgreSQL. `CREATE EXTENSION coldfront` fails on a server that
     does not preload the extension.
 
-7. Connect to the database, create the role that `duckdb.postgres_role`
-    names, and create the extensions:
+7. Connect as a PostgreSQL superuser, such as `postgres`, create the role
+    that `duckdb.postgres_role` names, and create the extensions:
 
     ```sql
     CREATE ROLE coldfront_duckdb NOLOGIN;
