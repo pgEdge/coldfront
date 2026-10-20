@@ -290,6 +290,12 @@ else
 fi
 ```
 
+If you run these commands again after the warehouse exists, the create
+request fails and `WID` is empty. Set `WID` to the `warehouse-id` of the `wh`
+warehouse in the output of
+`curl -s http://localhost:8181/management/v1/warehouse`, then rerun the
+namespace request.
+
 Create the extensions, set the cold-store secret, create a decoupled table,
 insert a row, and read it back through Iceberg:
 
