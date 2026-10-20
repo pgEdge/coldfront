@@ -105,8 +105,7 @@ the mode you want to try:
 
 ## Next Steps
 
-For details about installing and configuring ColdFront, consult the
-following guides:
+To install, configure, and use ColdFront, consult the following guides:
 
 - The [Installation](installation.md) guide details installing ColdFront
   from a package or building it from source.
@@ -118,3 +117,11 @@ following guides:
 - The [Configuring your Object Store](object_store.md) guide takes you from
   an empty bucket or container to a working cold tier, for any of four
   supported backends.
+- The [Using ColdFront](using_coldfront/index.md) guide compares the three
+  operating modes and links to each mode's guide.
+- The [Connecting to ColdFront](connecting.md) guide onboards an application
+  role with least privilege.
+- The [Understanding ColdFront Caveats](caveats.md) guide lists the behaviors
+  that differ from native PostgreSQL.
+- The [Architecture Guides](architecture_guides/index.md) describe how
+  ColdFront works, with a deep dive for each mode.
