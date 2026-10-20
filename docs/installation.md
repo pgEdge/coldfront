@@ -7,9 +7,12 @@ setting up PostgreSQL, Lakekeeper, and ColdFront itself.
 
 ## Using a Package to Install ColdFront
 
-ColdFront's packages come from the pgEdge package repository. Before you
-can use a package, you must configure the pgEdge repository by following
-the steps in the Enterprise Postgres documentation:
+ColdFront's packages come from the pgEdge package repository. Access to the
+repository requires a certificate from pgEdge; request one and install it as
+described in the
+[pgEdge Enterprise Postgres documentation](https://docs.pgedge.com/enterprise/).
+Then configure the pgEdge repository by following the steps in the Enterprise
+Postgres documentation:
 
 - For RHEL, Oracle Linux, AlmaLinux, and Rocky Linux, see
   [Configuring the Repository on Enterprise Linux](https://docs.pgedge.com/enterprise/el/configure-repo/).
