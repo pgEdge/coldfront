@@ -6,69 +6,113 @@
 
 The ColdFront documentation consists of the following guides:
 
-- [Introduction](docs/index.md)
-- Architecture Guides
-    - [Architecture Overview](docs/architecture_guides/index.md)
-    - [Tiered Operating Mode](docs/architecture_tiered.md)
-    - [Decoupled (Iceberg-Only) Operating Mode](docs/architecture_decoupled.md)
-    - [Vector Storage Architecture](docs/architecture_vectors.md)
+- [pgEdge ColdFront](docs/index.md)
+- [Architecture Guides](docs/architecture_guides/index.md) - Describes the
+  shared architecture and core mechanics.
+    - [Tiered Operating Mode](docs/architecture_tiered.md) - Describes tiered
+      mode (hot PostgreSQL plus cold Iceberg) in depth.
+    - [Decoupled (Iceberg-Only) Operating Mode](docs/architecture_decoupled.md) -
+      Describes decoupled (Iceberg-only) mode in depth.
+    - [Vector Storage Architecture](docs/architecture_vectors.md) - Describes
+      vector storage internals: type mapping, routing state, cluster
+      assignment, and layout.
 - Installing and Configuring ColdFront
-    - [Installing ColdFront](docs/installation.md)
-    - [Configuring ColdFront](docs/configuration.md)
-        - [Configuring Lakekeeper](docs/configure_lakekeeper.md)
-        - [Configuring your Object Store](docs/object_store.md)
-        - [Configuring a Distributed Deployment](docs/distributed_setup.md)
-- [Using ColdFront](docs/using_coldfront/index.md)
-    - [Using ColdFront in Tiered Mode](docs/usage_tiered.md)
-    - [Using ColdFront in Decoupled Mode](docs/usage_decoupled.md)
-    - [Using ColdFront in Standalone Partitioned Mode](docs/usage_partitioner.md)
-    - [Working with Embeddings](docs/usage_vectors.md)
-- [Exploring ColdFront Modes](docs/exploring_coldfront/index.md)
-    - [Exploring Tiered Storage](docs/walkthrough_tiered.md)
-    - [Exploring Decoupled Mode](docs/walkthrough_decoupled.md)
-    - [Exploring the Standalone Partitioner](docs/walkthrough_partitioner.md)
-    - [Exploring Distributed Mode](docs/walkthrough_distributed.md)
-- [Connecting to ColdFront](docs/connecting.md)
+    - [Installing ColdFront](docs/installation.md) - Documents installing from
+      a package or building from source (Docker or bare-metal), and testing and
+      CI.
+    - [Configuring ColdFront](docs/configuration.md) - Documents configuring
+      PostgreSQL and ColdFront's own configuration.
+        - [Configuring Lakekeeper](docs/configure_lakekeeper.md) - Installs,
+          configures, and bootstraps Lakekeeper, then installs the extensions
+          each database needs.
+        - [Configuring your Object Store](docs/object_store.md) - Gets
+          ColdFront running end to end, for any of four supported backends:
+          S3-compatible, virtual-hosted cloud S3, GCS, or Azure ADLS Gen2.
+        - [Configuring a Distributed Deployment](docs/distributed_setup.md) -
+          Documents running a multi-writer decoupled-mode Spock mesh against
+          one shared lake.
+- [Using ColdFront](docs/using_coldfront/index.md) - Compares the three
+  operating modes, documents the shared SQL surface, and covers dropping an
+  Iceberg table and the partition management CLI.
+    - [Using ColdFront in Tiered Mode](docs/usage_tiered.md) - Documents
+      archiving aging partitions to Iceberg while recent rows stay in the
+      PostgreSQL heap.
+    - [Using ColdFront in Decoupled Mode](docs/usage_decoupled.md) - Documents
+      tables that live entirely in Iceberg from the first row, including
+      adopting a table from the catalog and handing it back.
+    - [Using ColdFront in Standalone Partitioned Mode](docs/usage_partitioner.md) -
+      Documents managing PostgreSQL partitions with no cold tier at all.
+    - [Working with Embeddings](docs/usage_vectors.md) - Documents storing and
+      searching embeddings with the pgvector interface.
+- [Exploring ColdFront Modes](docs/exploring_coldfront/index.md) - Sets up the
+  demo stack and runs ColdFront hands-on.
+    - [Exploring Tiered Storage](docs/walkthrough_tiered.md) - Adds ColdFront
+      to an existing database and moves its cold data to object storage.
+    - [Exploring Decoupled Mode](docs/walkthrough_decoupled.md) - Stores a
+      table in Iceberg from the first row and adopts a table that another
+      engine wrote.
+    - [Exploring the Standalone Partitioner](docs/walkthrough_partitioner.md) -
+      Manages PostgreSQL range partitions without any cold tier.
+    - [Exploring Distributed Mode](docs/walkthrough_distributed.md) - Points
+      two PostgreSQL nodes at one shared lake.
+- [Connecting to ColdFront](docs/connecting.md) - Documents onboarding an
+  application role with least privilege.
 - Administration
-    - [Understanding ColdFront Caveats](docs/caveats.md)
-    - [Using Vended Credentials](docs/vended_credentials.md)
-    - [Supported Column Types](docs/supported_types.md)
-    - [Compacting the Cold Tier](docs/compaction.md)
+    - [Understanding ColdFront Caveats](docs/caveats.md) - Documents cross-tier
+      isolation, mixed transactions, and other edge cases shared between tiered
+      and decoupled tables.
+    - [Using Vended Credentials](docs/vended_credentials.md) - Documents
+      running with no stored object-store credential, for AWS S3 and Azure ADLS
+      Gen2.
+    - [Supported Column Types](docs/supported_types.md) - Documents the
+      PostgreSQL column types, including arrays, that a cold tier supports.
+    - [Compacting the Cold Tier](docs/compaction.md) - Documents cold-tier
+      table maintenance: compaction, snapshot expiry, and orphan-file removal.
 - Developer Resources
-    - [Formal Model - ColdFront Decoupled-Mode Bakery](docs/formal/README.md)
-- [Release Notes](docs/changelog.md)
+    - [Formal Model - ColdFront Decoupled-Mode Bakery (TLA+/PlusCal)](docs/formal/README.md)
+- [Release Notes - Changelog](docs/changelog.md)
+- [License](docs/LICENSE.md)
 
-ColdFront keeps tables in PostgreSQL and cold data in Apache Iceberg (Parquet
-on S3-compatible, Azure, or GCS storage), and the cold tier is both readable
-and writable through the same SQL with no application changes. The application
-queries every table as an ordinary PostgreSQL relation, and both operating
-modes present the same standard SQL surface.
+ColdFront keeps tables in PostgreSQL and, in its tiered and decoupled modes,
+keeps cold data in Apache Iceberg (Parquet on S3-compatible, Azure, or GCS
+storage). The cold tier is both readable and writable through the same SQL,
+with no application changes. The application
+queries every table as an ordinary PostgreSQL relation, with standard
+`SELECT`, `INSERT`, `UPDATE`, and `DELETE`, and `MERGE` on PostgreSQL 17 and
+later.
 
 > [!WARNING]
 > ColdFront is beta software under active development. Do not use it in
 > production. Interfaces, on-disk formats, and behavior may change without
 > notice, and data loss is possible.
 
-ColdFront provides two operating modes:
+ColdFront provides three operating modes:
 
 - Tiered mode keeps recent data in native PostgreSQL partitions and archives
   older data to Iceberg on a watermark; the application reads a single unified
   view, and the archiver moves rows from hot to cold on a schedule.
 - Decoupled mode stores the table entirely in Iceberg from the first row;
-  PostgreSQL holds a thin wrapper view and a registry row, and the coldfront
+  PostgreSQL holds a thin wrapper view and a registry row, and the `coldfront`
   extension handles every data-modifying statement on that view.
+- Standalone partitioned mode manages time- or id-based PostgreSQL range
+  partitions with no cold tier; the `partitioner` binary creates upcoming
+  partitions and detaches and drops partitions past retention, on stock
+  PostgreSQL with no DuckDB or Iceberg.
 
-Both modes coexist within one database, and you choose the mode per table at
-creation time. The SQL surface is identical for both modes: standard `SELECT`,
-`INSERT`, `UPDATE`, and `DELETE` against the relation, and `MERGE` on
-PostgreSQL 17 and later.
+Tables in different modes can share one database, and you choose the mode for
+each table: tiered when you register an existing partitioned table with a hot
+period, standalone partitioned when you register one without a hot period,
+and decoupled when you create or adopt an Iceberg table.
 
 Decoupled mode scales out horizontally across many PostgreSQL nodes that share
 one Lakekeeper catalog and one object store. The bakery protocol in the
-coldfront extension serializes Iceberg commits on the PostgreSQL side using
+`coldfront` extension serializes Iceberg commits on the PostgreSQL side using
 Spock-replicated Snowflake tickets, so concurrent writers never collide at the
-catalog. The protocol implements Lamport mutual exclusion with the
-Ricart-Agrawala deferred-reply optimization, and the
+catalog. The protocol implements
+[Lamport mutual exclusion](https://en.wikipedia.org/wiki/Lamport%27s_distributed_mutual_exclusion_algorithm)
+with the
+[Ricart-Agrawala](https://en.wikipedia.org/wiki/Ricart%E2%80%93Agrawala_algorithm)
+deferred-reply optimization, and the
 [formal model](docs/formal/README.md) verifies its safety with TLA+.
 
 ## How It Works
@@ -112,110 +156,611 @@ tier, so the application sees one relation:
                    cron job: moves partitions out of the hot window: hot -> cold
 ```
 
-## Installation
+ColdFront stores its settings in the server and has no configuration file.
+Settings live in two places:
 
-If you are new to ColdFront, run the [guided walkthrough](docs/exploring_coldfront/index.md)
-to see all three modes in action with copy-pasteable commands.
+- `postgresql.conf` holds the server settings:
+    - You must set `shared_preload_libraries`, `coldfront.warehouse`, and
+      `coldfront.lakekeeper_endpoint` on each server.
+    - `shared_preload_libraries` must include `pg_duckdb` and `coldfront`.
+    - You must also set `snowflake.node` and `coldfront.loopback_dsn` on each
+      node of a Spock mesh.
+- Tables in the `coldfront` schema hold additional parameters:
+    - `coldfront.partition_config` holds each table's lifecycle.
+    - `coldfront.storage_secret` holds the cold-store credential.
 
-ColdFront is open source under the PostgreSQL License and runs on PostgreSQL
-16, 17, and 18: stock PostgreSQL for a single node, and pgEdge's PostgreSQL
-build with Spock, which the Docker image is based on, for distributed mode. The
-full build workflow lives in the
-**[Installation guide](docs/installation.md)**: build the thin ColdFront layer
-on top of the published DuckDB 1.5.x base image (or build the base yourself),
-or install bare-metal. Then continue with the
-[walkthrough](docs/exploring_coldfront/index.md).
+The archiver, partitioner, and compactor connect through the libpq environment
+or `--dsn`, and read the settings from the server. A deployment YAML file is
+only an input for loading settings: run `archiver import --config <file>` once
+to write it into the server, and model the file on
+[config.example.yaml](config.example.yaml). After that, a run that you pass a
+YAML file checks it against the server and takes only its `postgres.dsn`,
+which supplies the connection when you don't pass `--dsn`.
 
-### Setting Up on Cloud S3?
+To review a list of available settings, see:
 
-When the image is built, the
-**[Configuring your Object Store](docs/object_store.md)** guide takes you from
-an empty bucket to a working cold tier end-to-end.
+- The [Configuring Lakekeeper](docs/configure_lakekeeper.md) guide.
+- The [Configuring PostgreSQL](docs/configuration.md#configuring-postgresql)
+  section of the Configuring ColdFront guide.
 
-## Configuration
+## Installing and Configuring ColdFront
 
-ColdFront reads its settings from two places. The server settings live in
-`postgresql.conf`: `shared_preload_libraries = 'pg_duckdb,coldfront'`,
-`coldfront.warehouse` and `coldfront.lakekeeper_endpoint`, plus
-`snowflake.node` and `coldfront.loopback_dsn` on every node of a mesh. The
-Docker image writes them on first start. The archiver, partitioner and
-compactor connect from the libpq environment or `--dsn` and read everything
-else from the server: each table's lifecycle in `coldfront.partition_config`,
-the cold-store credential in `coldfront.storage_secret` and the catalog
-settings above. The `import` command takes a deployment YAML, modeled on
-[config.example.yaml](config.example.yaml), and writes it into the server once.
-ColdFront has no configuration file. A YAML passed to any later run is checked
-against the server, and the run takes only `postgres.dsn` from the file.
-For every setting, see the
-[Configuring Lakekeeper](docs/configure_lakekeeper.md) guide and the
-[Configuring PostgreSQL](docs/configuration.md#configuring-postgresql)
-section of the Configuring ColdFront guide.
+ColdFront runs on PostgreSQL 16, 17, and 18. A single node needs only stock
+PostgreSQL. Distributed mode needs pgEdge's PostgreSQL build with Spock, which
+the Docker image is based on. You can install ColdFront from pgEdge packages or
+build it from source in a Docker container or on bare metal.
 
-## Using ColdFront
+### Installing and Configuring ColdFront with Packages
 
-[Using ColdFront in Tiered Mode](docs/usage_tiered.md),
-[Using ColdFront in Decoupled Mode](docs/usage_decoupled.md), and
-[Using ColdFront in Standalone Partitioned Mode](docs/usage_partitioner.md)
-document each mode in depth; the
-[Using ColdFront](docs/using_coldfront/index.md) guide helps you pick one, and
-the [walkthrough](docs/exploring_coldfront/index.md) demos run each mode on a
-sample table. Operational topics shared across modes -
-[caveats](docs/caveats.md), [vended credentials](docs/vended_credentials.md),
-[supported column types](docs/supported_types.md), and
-[compaction](docs/compaction.md) - are documented under Administration; to run
-ColdFront on more than one node, see
-[Configuring a Distributed Deployment](docs/distributed_setup.md).
+In the sections that follow, we'll walk you through installing PostgreSQL and
+ColdFront using packages. ColdFront packages come from the pgEdge package
+repository, which requires a certificate from pgEdge. First, request a
+certificate and install it, then configure the repository for your platform,
+as described in the
+[pgEdge Enterprise Postgres guide](https://docs.pgedge.com/enterprise/).
 
-## Documentation
+If you already have a pgEdge Enterprise Postgres server installed that you
+would like to use, configure the pgEdge repository and install only ColdFront,
+continuing with
+[Installing the ColdFront Packages](#installing-the-coldfront-packages).
+ColdFront packages from pgEdge require pgEdge's PostgreSQL build.
 
-The following table lists the ColdFront guides and what each one
-documents:
+#### Installing PostgreSQL with Packages
 
-| Doc | Contents |
-|---|---|
-| [Architecture Overview](docs/architecture_guides/index.md) | Describes the shared architecture and core mechanics. |
-| [Tiered Operating Mode](docs/architecture_tiered.md) | Describes tiered mode (hot PostgreSQL plus cold Iceberg) in depth. |
-| [Decoupled (Iceberg-Only) Operating Mode](docs/architecture_decoupled.md) | Describes decoupled (Iceberg-only) mode in depth. |
-| [Vector Storage Architecture](docs/architecture_vectors.md) | Describes vector storage internals: type mapping, routing state, cluster assignment, and layout. |
-| [Installing ColdFront](docs/installation.md) | Documents installing from a package or building from source (Docker or bare-metal), and testing and CI. |
-| [Configuring ColdFront](docs/configuration.md) | Documents configuring PostgreSQL and ColdFront's own configuration. |
-| [Configuring Lakekeeper](docs/configure_lakekeeper.md) | Installs, configures, and bootstraps Lakekeeper, then installs the extensions each database needs. |
-| [Configuring your Object Store](docs/object_store.md) | Gets ColdFront running end to end, for any of four supported backends: S3-compatible, virtual-hosted cloud S3, GCS, or Azure ADLS Gen2. |
-| [Configuring a Distributed Deployment](docs/distributed_setup.md) | Documents running a multi-writer decoupled-mode Spock mesh against one shared lake. |
-| [Using ColdFront](docs/using_coldfront/index.md) | Compares the three operating modes, documents the shared SQL surface, and links to each mode's guide. |
-| [Using ColdFront in Tiered Mode](docs/usage_tiered.md) | Documents archiving aging partitions to Iceberg while recent rows stay in the PostgreSQL heap. |
-| [Using ColdFront in Decoupled Mode](docs/usage_decoupled.md) | Documents tables that live entirely in Iceberg from the first row, and dropping or releasing a registered table. |
-| [Using ColdFront in Standalone Partitioned Mode](docs/usage_partitioner.md) | Documents managing PostgreSQL partitions with no cold tier at all, and the partition CLI shared with tiered mode. |
-| [Working with Embeddings](docs/usage_vectors.md) | Documents storing and searching embeddings with the pgvector interface. |
-| [Exploring ColdFront Modes](docs/exploring_coldfront/index.md) | Sets up the demo stack and runs ColdFront hands-on. |
-| [Exploring Tiered Storage](docs/walkthrough_tiered.md) | Adds ColdFront to an existing database and moves its cold data to object storage. |
-| [Exploring Decoupled Mode](docs/walkthrough_decoupled.md) | Stores a table in Iceberg from the first row and adopts a table that another engine wrote. |
-| [Exploring the Standalone Partitioner](docs/walkthrough_partitioner.md) | Manages PostgreSQL range partitions without any cold tier. |
-| [Exploring Distributed Mode](docs/walkthrough_distributed.md) | Points two PostgreSQL nodes at one shared lake. |
-| [Connecting to ColdFront](docs/connecting.md) | Documents onboarding an application role with least privilege. |
-| [Understanding ColdFront Caveats](docs/caveats.md) | Documents cross-tier isolation, mixed transactions, and other edge cases shared between tiered and decoupled tables. |
-| [Using Vended Credentials](docs/vended_credentials.md) | Documents running with no stored object-store credential, for AWS S3 and Azure ADLS Gen2. |
-| [Supported Column Types](docs/supported_types.md) | Documents the PostgreSQL column types, including arrays, that a cold tier supports. |
-| [Compacting the Cold Tier](docs/compaction.md) | Documents cold-tier table maintenance: compaction, snapshot expiry, and orphan-file removal. |
+Before installing ColdFront, you will need to install pgEdge Enterprise Postgres
+and start the server. On RHEL, Rocky Linux, or AlmaLinux, the package does not
+create a database cluster, so create and start one:
 
-## Connecting to ColdFront
+```bash
+sudo dnf install -y pgedge-enterprise-postgres_18
+sudo /usr/pgsql-18/bin/postgresql-18-setup initdb
+sudo systemctl enable --now postgresql-18
+```
 
-See [Connecting to ColdFront](docs/connecting.md) for onboarding an
-application role with least privilege.
+On Ubuntu or Debian, install the package, then check for a cluster with
+`sudo pg_lsclusters`. If it lists no `18/main` cluster, create and start one:
 
-## Caveats
+```bash
+sudo apt update
+sudo apt install -y pgedge-enterprise-postgres-18
+sudo pg_lsclusters
+sudo pg_createcluster 18 main --start      # only if pg_lsclusters lists none
+```
 
-See [Understanding ColdFront Caveats](docs/caveats.md) for ColdFront
-behaviors you should be aware of, including a storage-account setting
-Azure ADLS Gen2 requires before you use it as a cold tier.
+On either platform, confirm that the server is running before you continue:
 
-A cold-tier write that reads an ordinary PostgreSQL table, such as an
-`UPDATE ... FROM` or a `MERGE` from one, stores a `numeric` `NaN` from that
-table as `0` and stores an array renumbered to start at 1, with no error.
-[Supported Column Types](docs/supported_types.md) lists the writes that do
-this and shows how to check a source table first.
+```bash
+sudo -u postgres psql -c "SELECT version();"
+```
 
-## Project Structure
+The command prints the PostgreSQL version. A connection error means the server
+is not running; check `sudo systemctl status postgresql-18` on RHEL-family
+systems or `sudo pg_lsclusters` on Ubuntu and Debian.
+
+#### Installing the ColdFront Packages
+
+Install the ColdFront extension package for your PostgreSQL major version, the
+ColdFront command-line tools (the archiver, the partitioner, and the
+compactor), and Lakekeeper (the Iceberg catalog). The package manager also
+installs pg_duckdb and ColdFront's DuckDB extensions.
+
+For PostgreSQL 18 on RHEL, Rocky Linux, or AlmaLinux:
+
+```bash
+sudo dnf install -y pgedge-coldfront_18 pgedge-coldfront pgedge-lakekeeper
+```
+
+For PostgreSQL 18 on Ubuntu or Debian:
+
+```bash
+sudo apt install -y pgedge-postgresql-18-coldfront pgedge-coldfront \
+  pgedge-lakekeeper
+```
+
+The `pgedge-lakekeeper` package installs Lakekeeper but does not start it; you
+configure and start it later, in
+[Connecting ColdFront to Lakekeeper and Object Storage](#connecting-coldfront-to-lakekeeper-and-object-storage).
+For repository setup and every package name, see
+[Using a Package to Install ColdFront](docs/installation.md#using-a-package-to-install-coldfront).
+
+#### Configuring PostgreSQL and Creating the Extensions
+
+After installing the packages, use the following steps to configure
+PostgreSQL and create the extensions:
+
+1. Add the following settings to `postgresql.conf`. The file is in
+    `/var/lib/pgsql/18/data/` on RHEL-family systems, and in
+    `/etc/postgresql/18/main/` on Ubuntu and Debian:
+
+    ```ini
+    shared_preload_libraries = 'pg_duckdb,coldfront'
+    duckdb.extension_directory = '/usr/lib/pgedge/coldfront/duckdb-extensions'
+    duckdb.allow_unsigned_extensions = true
+    duckdb.autoinstall_known_extensions = false
+    duckdb.postgres_role = 'coldfront_duckdb'
+    coldfront.warehouse = 'wh'
+    coldfront.lakekeeper_endpoint = 'http://<lakekeeper-host>:8181/catalog'
+    ```
+
+    - `duckdb.extension_directory`, `duckdb.allow_unsigned_extensions`, and
+      `duckdb.autoinstall_known_extensions` make pg_duckdb load ColdFront's
+      patched DuckDB extensions. Without them, pg_duckdb can fetch the
+      unpatched upstream extensions instead.
+    - `duckdb.postgres_role` lets the application roles you grant access to run
+      DuckDB; without it, only superusers can.
+    - `coldfront.warehouse` names the `wh` warehouse that
+      [Connecting ColdFront to Lakekeeper and Object Storage](#connecting-coldfront-to-lakekeeper-and-object-storage)
+      creates.
+
+2. Restart PostgreSQL. `CREATE EXTENSION coldfront` fails on a server that
+    does not preload the extension:
+
+    ```bash
+    sudo systemctl restart postgresql-18           # RHEL, Rocky Linux, AlmaLinux
+    sudo systemctl restart postgresql@18-main      # Ubuntu, Debian
+    ```
+
+3. Connect as the `postgres` superuser with `sudo -u postgres psql`, create
+    the role that `duckdb.postgres_role` names, and create the extensions:
+
+    ```sql
+    CREATE ROLE coldfront_duckdb NOLOGIN;
+    CREATE EXTENSION pg_duckdb;
+    CREATE EXTENSION coldfront;
+    ```
+
+    You create the role once for the PostgreSQL server. Run the
+    `CREATE EXTENSION` commands in each database that uses ColdFront.
+
+When the extensions are created, continue with
+[Connecting a Package or Bare-Metal Installation to Lakekeeper and an Object Store](#connecting-a-package-or-bare-metal-installation-to-lakekeeper-and-an-object-store).
+
+### Installing and Configuring ColdFront in a Docker Container
+
+The Docker build adds a thin ColdFront layer to a published base image. The
+base image already includes pg_duckdb and the patched duckdb-iceberg
+extension. You need Docker and network access. To build the command-line
+tools, you also need Go 1.26.5 or later and golangci-lint.
+
+The Docker image writes the server settings into `postgresql.conf` on first
+start. It reads the warehouse name and the Lakekeeper endpoint from the
+`COLDFRONT_WAREHOUSE` and `COLDFRONT_LAKEKEEPER` environment variables in
+`docker-compose.yml`. The defaults, `wh` and `http://lakekeeper:8181/catalog`,
+match the warehouse that [Configuring Lakekeeper](docs/configure_lakekeeper.md)
+creates.
+
+1. Clone the repository:
+
+    ```bash
+    git clone https://github.com/pgEdge/coldfront.git
+    cd coldfront
+    ```
+
+2. Build the command-line tools. `make build` builds the archiver and the
+    partitioner, and `make compactor` builds the compactor:
+
+    ```bash
+    make build
+    make compactor
+    ```
+
+3. Build the ColdFront layer and start the stack. The `local-store` profile
+    adds a SeaweedFS object store to the stack. The stack uses PostgreSQL 18
+    unless you set `PG_MAJOR`. The command publishes each port on the loopback
+    address only, because PostgreSQL trusts every connection and Lakekeeper
+    runs without authentication:
+
+    ```bash
+    COLDFRONT_PG_PORT=127.0.0.1:5432 COLDFRONT_LK_PORT=127.0.0.1:8181 \
+    COLDFRONT_S3_PORT=127.0.0.1:8333 \
+      docker compose --profile local-store up -d --build
+    ```
+
+4. Connect to the database:
+
+    ```bash
+    psql -h localhost -U coldfront -d coldfront
+    ```
+
+5. Create the extensions:
+
+    ```sql
+    CREATE EXTENSION pg_duckdb;
+    CREATE EXTENSION coldfront;
+    ```
+
+The deployed image is for development and testing. It trusts every connection
+without a password. For information about the image's environment variables
+and a smoke test, see
+[Building the Image on Docker](docs/installation.md#building-the-image-on-docker).
+
+When the extensions are created, continue with
+[Connecting a Docker Installation to Lakekeeper and an Object Store](#connecting-a-docker-installation-to-lakekeeper-and-an-object-store).
+
+### Installing and Configuring ColdFront on Bare Metal
+
+Before building ColdFront on bare metal, install the pg_duckdb PostgreSQL
+extension (built on DuckDB 1.5.4) and a patched duckdb-iceberg DuckDB
+extension. For the prerequisites and the patches, see
+[Building ColdFront from Source](docs/installation.md#building-coldfront-from-source).
+You also need a running PostgreSQL 16, 17, or 18 server, `pg_config`, the
+PostgreSQL server development headers, the libpq headers and library, `make`,
+`gcc`, Go 1.26.5 or later, and golangci-lint.
+
+1. Clone the repository:
+
+    ```bash
+    git clone https://github.com/pgEdge/coldfront.git
+    cd coldfront
+    ```
+
+2. Build and install the `coldfront` extension. `pg_config` must be on your
+    `PATH`:
+
+    ```bash
+    cd extension/coldfront
+    make
+    sudo make install PG_CONFIG="$(command -v pg_config)"
+    ```
+
+3. Build the command-line tools. `make build` builds the archiver and the
+    partitioner, and `make compactor` builds the compactor:
+
+    ```bash
+    cd ../..
+    make build
+    make compactor
+    ```
+
+4. Copy the DuckDB extensions you built into the directory that pg_duckdb
+    loads them from. Copy `iceberg`, `avro`, `azure`, and `postgres_scanner`
+    into `$PGDATA/pg_duckdb/extensions/v1.5.4/linux_<arch>/`, where `<arch>` is
+    `amd64` or `arm64`.
+
+5. Add the following settings to `postgresql.conf`:
+
+    ```ini
+    shared_preload_libraries = 'pg_duckdb,coldfront'
+    duckdb.allow_unsigned_extensions = true
+    duckdb.autoinstall_known_extensions = false
+    duckdb.postgres_role = 'coldfront_duckdb'
+    coldfront.warehouse = 'wh'
+    coldfront.lakekeeper_endpoint = 'http://<lakekeeper-host>:8181/catalog'
+    ```
+
+    - `duckdb.allow_unsigned_extensions` must be on, because the locally built
+      `iceberg` extension is unsigned.
+    - `duckdb.autoinstall_known_extensions` stays off so that pg_duckdb never
+      fetches the unpatched upstream extensions in place of yours.
+    - `duckdb.postgres_role` lets the application roles you grant access to run
+      DuckDB; without it, only superusers can.
+    - `coldfront.warehouse` names the `wh` warehouse that
+      [Connecting ColdFront to Lakekeeper and Object Storage](#connecting-coldfront-to-lakekeeper-and-object-storage)
+      creates.
+
+6. Restart PostgreSQL. `CREATE EXTENSION coldfront` fails on a server that
+    does not preload the extension.
+
+7. Connect as a PostgreSQL superuser, such as `postgres`, create the role
+    that `duckdb.postgres_role` names, and create the extensions:
+
+    ```sql
+    CREATE ROLE coldfront_duckdb NOLOGIN;
+    CREATE EXTENSION pg_duckdb;
+    CREATE EXTENSION coldfront;
+    ```
+
+    You create the role once for the PostgreSQL server. Run the
+    `CREATE EXTENSION` commands in each database that uses ColdFront.
+
+For more information, see
+[Building ColdFront on Bare Metal](docs/installation.md#building-coldfront-on-bare-metal).
+
+When the extensions are created, continue with
+[Connecting a Package or Bare-Metal Installation to Lakekeeper and an Object Store](#connecting-a-package-or-bare-metal-installation-to-lakekeeper-and-an-object-store).
+
+### Connecting ColdFront to Lakekeeper and Object Storage
+
+After configuring the server and creating the extensions, you're ready to
+connect ColdFront to Lakekeeper and an object store. ColdFront stores the cold
+tier in an object store, through a Lakekeeper warehouse.
+
+ColdFront can store its Iceberg tables in AWS S3, in an S3-compatible store
+such as SeaweedFS or MinIO, in Google Cloud Storage, or in Azure ADLS Gen2. You
+set up the object store and the Lakekeeper warehouse once for each deployment.
+The store's credential is kept in each database, so you repeat the credential
+step in every database that uses ColdFront.
+
+#### Connecting a Package or Bare-Metal Installation to Lakekeeper and an Object Store
+
+A package or bare-metal installation runs Lakekeeper and an object store on
+the host.
+
+1. Start an object store. If you're walking through this installation to
+    evaluate ColdFront, you can use SeaweedFS, a free S3-compatible store, on
+    the host. Install SeaweedFS as described in its
+    [Getting Started](https://github.com/seaweedfs/seaweedfs/wiki/Getting-Started)
+    guide; the [releases page](https://github.com/seaweedfs/seaweedfs/releases)
+    has prebuilt `weed` binaries. Then create an S3 credentials file with the
+    access key `admin` and the secret key `adminsecret`, in the format shown in
+    [S3 Configuration](https://github.com/seaweedfs/seaweedfs/wiki/Amazon-S3-API#s3-configuration),
+    and start SeaweedFS with its S3 gateway:
+
+    ```bash
+    sudo mkdir -p /var/lib/seaweedfs
+    sudo weed server -s3 -dir=/var/lib/seaweedfs -s3.config=/etc/seaweedfs/s3.json
+    ```
+
+    The ColdFront repository's
+    [`docker/seaweedfs-s3.json`](docker/seaweedfs-s3.json) is a ready-made
+    credentials file you can copy to `/etc/seaweedfs/s3.json`.
+
+    If you would like to evaluate ColdFront on AWS S3, Google Cloud Storage,
+    or Azure ADLS Gen2, create a bucket or container there instead. The
+    [Configuring your Object Store](docs/object_store.md) guide covers
+    configuration of each one, including production stores.
+
+2. Install Lakekeeper. If you installed ColdFront from packages, Lakekeeper is
+    already installed; continue with step 3. On bare metal with the pgEdge
+    repository configured, install the `pgedge-lakekeeper` package:
+
+    ```bash
+    sudo dnf install -y pgedge-lakekeeper        # RHEL, Rocky Linux, AlmaLinux
+    sudo apt install -y pgedge-lakekeeper        # Ubuntu, Debian
+    ```
+
+    If you're not using the pgEdge repository, install the upstream binary as
+    described in
+    [Installing Lakekeeper](docs/configure_lakekeeper.md#installing-lakekeeper).
+    Then copy the environment file and the systemd unit from the ColdFront
+    repository:
+
+    ```bash
+    sudo install -D -m 0640 -g lakekeeper \
+      packaging/lakekeeper/common/lakekeeper.env /etc/lakekeeper/lakekeeper.env
+    sudo install -m 0644 packaging/lakekeeper/common/lakekeeper.service \
+      /etc/systemd/system/lakekeeper.service
+    sudo systemctl daemon-reload
+    ```
+
+3. Connect as a PostgreSQL superuser, such as `postgres` (for example, with
+    `sudo -u postgres psql`), and create a role and a database for the
+    Lakekeeper catalog. Replace `<password>` with a generated password, such
+    as the output of `openssl rand -hex 32`; a hex value needs no escaping in
+    the connection string in step 4:
+
+    ```sql
+    CREATE ROLE lakekeeper LOGIN PASSWORD '<password>';
+    CREATE DATABASE lakekeeper OWNER lakekeeper;
+    ```
+
+4. In `/etc/lakekeeper/lakekeeper.env`, set the catalog's connection string,
+    with the same password, and an encryption key, and bind Lakekeeper to the
+    loopback address. Keep the key stable and backed up:
+
+    ```bash
+    LAKEKEEPER__PG_DATABASE_URL_WRITE=postgresql://lakekeeper:<password>@127.0.0.1:5432/lakekeeper
+    LAKEKEEPER__PG_ENCRYPTION_KEY=<output of: openssl rand -base64 32>
+    LAKEKEEPER__BIND_IP=127.0.0.1
+    ```
+
+    By default, Lakekeeper listens on every address and accepts every request.
+    The loopback bind keeps it reachable only from this host. To accept clients
+    from other hosts, configure authentication and authorization first, as
+    described in
+    [Preparing and Starting Lakekeeper](docs/configure_lakekeeper.md#preparing-and-starting-lakekeeper).
+
+5. Run the one-time migration as the `lakekeeper` user, then start
+    Lakekeeper. The migration reads the environment file as that user, because
+    the file is not readable by other accounts:
+
+    ```bash
+    sudo -u lakekeeper sh -c \
+      'set -a; . /etc/lakekeeper/lakekeeper.env; set +a; exec /usr/bin/lakekeeper migrate'
+    sudo systemctl enable --now lakekeeper
+    ```
+
+6. Bootstrap Lakekeeper, create the `wh` warehouse on the SeaweedFS store, and
+    create the `public` namespace; decoupled mode requires this namespace. The
+    warehouse name must match `coldfront.warehouse`:
+
+    ```bash
+    curl -X POST http://localhost:8181/management/v1/bootstrap \
+      -H "Content-Type: application/json" -d '{"accept-terms-of-use":true}'
+
+    WID=$(curl -s -X POST http://localhost:8181/management/v1/warehouse \
+      -H "Content-Type: application/json" -d '{
+        "warehouse-name": "wh",
+        "storage-profile": {
+          "type": "s3", "bucket": "iceberg", "region": "us-east-1",
+          "endpoint": "http://localhost:8333", "path-style-access": true,
+          "flavor": "s3-compat", "sts-enabled": false,
+          "remote-signing-enabled": false
+        },
+        "storage-credential": {
+          "type": "s3", "credential-type": "access-key",
+          "aws-access-key-id": "admin", "aws-secret-access-key": "adminsecret"
+        }
+      }' \
+      | grep -oE '"warehouse-id":"[^"]+"' | cut -d'"' -f4)
+
+    if [ -z "$WID" ]; then
+      echo "No warehouse ID - check that the warehouse create succeeded."
+    else
+      curl -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
+        -H "Content-Type: application/json" -d '{"namespace":["public"]}'
+    fi
+    ```
+
+    If you run these commands again after the warehouse exists, the create
+    request fails and `WID` is empty. Set `WID` to the `warehouse-id` of the
+    `wh` warehouse in the output of
+    `curl -s http://localhost:8181/management/v1/warehouse`, then rerun the
+    namespace request.
+
+    If you're using a different type of object store, change the
+    `storage-profile` and `storage-credential` as shown in the store's section
+    of [Configuring your Object Store](docs/object_store.md#configuring-lakekeeper).
+
+7. Store the SeaweedFS credential in each database that uses ColdFront:
+
+    ```sql
+    SELECT coldfront.set_storage_secret('admin', 'adminsecret',
+                                        'localhost:8333');
+    ```
+
+    If you use `coldfront.local_pg_dsn`, set it before this call. Another store
+    takes its own arguments, and Azure ADLS Gen2 uses
+    `coldfront.set_storage_secret_azure()` instead.
+
+#### Connecting a Docker Installation to Lakekeeper and an Object Store
+
+The Docker stack includes a SeaweedFS store, so you can use it as the cold tier
+to evaluate ColdFront without a cloud account.
+
+1. Bootstrap Lakekeeper:
+
+    ```bash
+    curl -X POST http://localhost:8181/management/v1/bootstrap \
+      -H "Content-Type: application/json" -d '{"accept-terms-of-use":true}'
+    ```
+
+2. Create the `wh` warehouse on the SeaweedFS store, and save its ID for the
+    next step:
+
+    ```bash
+    WID=$(curl -s -X POST http://localhost:8181/management/v1/warehouse \
+      -H "Content-Type: application/json" -d '{
+        "warehouse-name": "wh",
+        "storage-profile": {
+          "type": "s3", "bucket": "iceberg", "region": "us-east-1",
+          "endpoint": "http://seaweedfs:8333", "path-style-access": true,
+          "flavor": "s3-compat", "sts-enabled": false,
+          "remote-signing-enabled": false
+        },
+        "storage-credential": {
+          "type": "s3", "credential-type": "access-key",
+          "aws-access-key-id": "admin", "aws-secret-access-key": "adminsecret"
+        }
+      }' \
+      | grep -oE '"warehouse-id":"[^"]+"' | cut -d'"' -f4)
+    ```
+
+3. Create the `public` namespace in the warehouse; decoupled mode requires
+    this namespace:
+
+    ```bash
+    if [ -z "$WID" ]; then
+      echo "No warehouse ID - check that the warehouse create succeeded."
+    else
+      curl -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
+        -H "Content-Type: application/json" -d '{"namespace":["public"]}'
+    fi
+    ```
+
+    If you run these commands again after the warehouse exists, the create
+    request fails and `WID` is empty. Set `WID` to the `warehouse-id` of the
+    `wh` warehouse in the output of
+    `curl -s http://localhost:8181/management/v1/warehouse`, then rerun the
+    namespace request.
+
+4. Store the SeaweedFS credential in each database that uses ColdFront:
+
+    ```sql
+    SELECT coldfront.set_storage_secret('admin', 'adminsecret',
+                                        'seaweedfs:8333');
+    ```
+
+#### Granting Access to Application Roles
+
+After connecting ColdFront to Lakekeeper and an object store, you must grant
+access to each application role that connects as a non-superuser. Replace
+`<role_name>` with the name of the role:
+
+```sql
+SELECT coldfront.grant_app_access('<role_name>');
+```
+
+Run this command again after you create, adopt, or first tier a table. The
+[Connecting to ColdFront](docs/connecting.md) guide describes the privileges
+granted to the role.
+
+## Support & Resources
+
+After you install, configure, and connect ColdFront, use the following
+resources to learn more:
+
+- To try each of the three modes with commands you can copy and run, follow
+  the [guided walkthrough](docs/exploring_coldfront/index.md).
+- For information about using ColdFront, see
+  [Using ColdFront](docs/using_coldfront/index.md), which helps you choose a
+  mode and create your first table. Each mode has its own guide:
+    - [Tiered Mode](docs/usage_tiered.md)
+    - [Decoupled Mode](docs/usage_decoupled.md)
+    - [Standalone Partitioned Mode](docs/usage_partitioner.md)
+- To run ColdFront on more than one node, see
+  [Configuring a Distributed Deployment](docs/distributed_setup.md).
+- To review ColdFront caveats, see
+  [Understanding ColdFront Caveats](docs/caveats.md).
+
+For more information about pgEdge products, visit
+[docs.pgedge.com](https://docs.pgedge.com).
+
+To report an issue with the software, visit
+[GitHub Issues](https://github.com/pgEdge/ColdFront/issues).
+
+## For Developers
+
+We welcome your contributions to ColdFront. For more information, see
+[CONTRIBUTING.md](CONTRIBUTING.md). The following sections describe
+ColdFront's dependencies, its version numbers, and the layout of the
+repository.
+
+### Author
+
+Jimmy Angelakos created ColdFront.
+
+### Dependencies
+
+The following table lists the services and components ColdFront runs against:
+
+| Component | Version | Purpose |
+|-----------|---------|---------|
+| PostgreSQL | 16, 17, or 18 | Provides the database with native partitioning; stock PostgreSQL serves a single node, and the Docker image and distributed mode use pgEdge's PostgreSQL build with Spock. |
+| pg_duckdb | commit c04e6a2 (PR #1025), on DuckDB 1.5.4 | Runs Iceberg reads and writes through in-process DuckDB. |
+| duckdb-iceberg | `v1.5-variegata` @ `5edc45f0`, patched | Provides Iceberg catalog and I/O for DuckDB, with ColdFront's five patches applied (see [docker/Dockerfile.duckdb15-base](docker/Dockerfile.duckdb15-base)). |
+| Lakekeeper | latest | Provides the Iceberg REST catalog (a Rust binary). |
+| S3-compatible store | any | Stores the cold data; SeaweedFS, MinIO, AWS S3, and GCS all work. |
+| Azure ADLS Gen2 | any | Stores the cold data instead of an S3 store, through `set_storage_secret_azure` and an `adls` warehouse. |
+
+Building from source needs the Go toolchain (the version is pinned in
+[go.mod](go.mod)). The Go module dependencies are the source of truth in
+[go.mod](go.mod) / [go.sum](go.sum); the archiver and partitioner build as
+static, CGO-free binaries on `pgx/v5`, and the compactor is a separate module
+([cmd/compactor/go.mod](cmd/compactor/go.mod)) built on `apache/iceberg-go`.
+
+### Versioning
+
+ColdFront has two independent version numbers, each following its own
+convention:
+
+- Release tags use three-part [Semantic Versioning](https://semver.org)
+  (`vMAJOR.MINOR.PATCH`, for example `v1.0.0`); Git tags, GitHub releases,
+  container image tags, and the changelog all use this form. Three parts are
+  required because ColdFront is a Go module, and the toolchain recognizes only
+  full `vX.Y.Z` tags as releases. The patch field keeps a bugfix-only release
+  (`v1.0.1`) distinct from a feature release (`v1.1.0`), which matters for a
+  data-writing extension, where a release that keeps the same behavior and adds
+  one safety fix must be easy to recognize.
+- The PostgreSQL extension uses the conventional two-part version in its
+  control file (`default_version = '1.0'`) and upgrade-script filenames
+  (`coldfront--1.0--1.1.sql`), as is standard for PostgreSQL extensions.
+
+The two map cleanly: extension `1.0` ships inside release `v1.0.0`, and a patch
+release may keep the same extension version or bump it with an upgrade script
+when the SQL changes.
+
+### Project Structure
 
 The repository is laid out as follows:
 
@@ -275,65 +820,8 @@ pgedge-coldfront/
 └── DUCKDB_1.5_UNPATCHED.md     ← building/running the base unpatched, and the consequences
 ```
 
-## Dependencies
-
-The following table lists the services and components ColdFront runs against:
-
-| Component | Version | Purpose |
-|-----------|---------|---------|
-| PostgreSQL | 16, 17, or 18 | Provides the database with native partitioning; stock PostgreSQL serves a single node, and the Docker image and distributed mode use pgEdge's PostgreSQL build with Spock. |
-| pg_duckdb | commit c04e6a2 (PR #1025), on DuckDB 1.5.4 | Runs Iceberg reads and writes through in-process DuckDB. |
-| duckdb-iceberg | `v1.5-variegata` @ `5edc45f0`, patched | Provides Iceberg catalog and I/O for DuckDB, with ColdFront's five patches applied (see [docker/Dockerfile.duckdb15-base](docker/Dockerfile.duckdb15-base)). |
-| Lakekeeper | latest | Provides the Iceberg REST catalog (a Rust binary). |
-| S3-compatible store | any | Stores the cold data; SeaweedFS, MinIO, AWS S3, and GCS all work. |
-| Azure ADLS Gen2 | any | Stores the cold data instead of an S3 store, through `set_storage_secret_azure` and an `adls` warehouse. |
-
-Building from source needs the Go toolchain (the version is pinned in
-[go.mod](go.mod)). The Go module dependencies are the source of truth in
-[go.mod](go.mod) / [go.sum](go.sum); the archiver and partitioner build as
-static, CGO-free binaries on `pgx/v5`, and the compactor is a separate module
-([cmd/compactor/go.mod](cmd/compactor/go.mod)) built on `apache/iceberg-go`.
-
-## Versioning
-
-ColdFront has two independent version numbers, each following its own
-convention:
-
-- Release tags use three-part [Semantic Versioning](https://semver.org)
-  (`vMAJOR.MINOR.PATCH`, for example `v1.0.0`); Git tags, GitHub releases,
-  container image tags, and the changelog all use this form. Three parts are
-  required because ColdFront is a Go module, and the toolchain recognizes only
-  full `vX.Y.Z` tags as releases. The patch field keeps a bugfix-only release
-  (`v1.0.1`) distinct from a feature release (`v1.1.0`), which matters for a
-  data-writing extension, where a release that keeps the same behavior and adds
-  one safety fix must be easy to recognize.
-- The PostgreSQL extension uses the conventional two-part version in its
-  control file (`default_version = '1.0'`) and upgrade-script filenames
-  (`coldfront--1.0--1.1.sql`), as is standard for PostgreSQL extensions.
-
-The two map cleanly: extension `1.0` ships inside release `v1.0.0`, and a patch
-release may keep the same extension version or bump it with an upgrade script
-when the SQL changes.
-
-## Support & Resources
-
-For more information about pgEdge products, visit
-[docs.pgedge.com](https://docs.pgedge.com).
-
-To report an issue with the software, visit
-[GitHub Issues](https://github.com/pgEdge/ColdFront/issues).
-
-## Contributing
-
-We welcome your project contributions; for more information, see
-[CONTRIBUTING.md](CONTRIBUTING.md).
-
-## Author
-
-Jimmy Angelakos created ColdFront.
-
 ## License
 
-This project is licensed under the [PostgreSQL License](LICENSE.md). The
-redistributed third-party components and their notices are listed in
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+ColdFront is open source, licensed under the
+[PostgreSQL License](LICENSE.md). The redistributed third-party components and
+their notices are listed in [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
