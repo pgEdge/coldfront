@@ -323,7 +323,8 @@ The `coldfront` extension is a standard PGXS C extension:
 
 ```bash
 cd extension/coldfront
-make && make install        # needs pg_config + PG server dev headers on PATH
+make                # needs pg_config and the PostgreSQL server dev headers on PATH
+sudo make install PG_CONFIG="$(command -v pg_config)"
 ```
 
 You separately need pg_duckdb (DuckDB 1.5.4) and the **patched** iceberg DuckDB
