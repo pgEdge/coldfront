@@ -344,10 +344,14 @@ creates.
 
 3. Build the ColdFront layer and start the stack. The `local-store` profile
     adds a SeaweedFS object store to the stack. The stack uses PostgreSQL 18
-    unless you set `PG_MAJOR`:
+    unless you set `PG_MAJOR`. The command publishes each port on the loopback
+    address only, because PostgreSQL trusts every connection and Lakekeeper
+    runs without authentication:
 
     ```bash
-    docker compose --profile local-store up -d --build
+    COLDFRONT_PG_PORT=127.0.0.1:5432 COLDFRONT_LK_PORT=127.0.0.1:8181 \
+    COLDFRONT_S3_PORT=127.0.0.1:8333 \
+      docker compose --profile local-store up -d --build
     ```
 
 4. Connect to the database:
