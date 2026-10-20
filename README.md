@@ -523,19 +523,21 @@ the host.
 
 3. Connect as a PostgreSQL superuser, such as `postgres` (for example, with
     `sudo -u postgres psql`), and create a role and a database for the
-    Lakekeeper catalog:
+    Lakekeeper catalog. Replace `<password>` with a generated password, such
+    as the output of `openssl rand -hex 32`; a hex value needs no escaping in
+    the connection string in step 4:
 
     ```sql
-    CREATE ROLE lakekeeper LOGIN PASSWORD 'change-me';
+    CREATE ROLE lakekeeper LOGIN PASSWORD '<password>';
     CREATE DATABASE lakekeeper OWNER lakekeeper;
     ```
 
-4. In `/etc/lakekeeper/lakekeeper.env`, set the catalog's connection string
-    and an encryption key, and bind Lakekeeper to the loopback address. Keep
-    the key stable and backed up:
+4. In `/etc/lakekeeper/lakekeeper.env`, set the catalog's connection string,
+    with the same password, and an encryption key, and bind Lakekeeper to the
+    loopback address. Keep the key stable and backed up:
 
     ```bash
-    LAKEKEEPER__PG_DATABASE_URL_WRITE=postgresql://lakekeeper:change-me@127.0.0.1:5432/lakekeeper
+    LAKEKEEPER__PG_DATABASE_URL_WRITE=postgresql://lakekeeper:<password>@127.0.0.1:5432/lakekeeper
     LAKEKEEPER__PG_ENCRYPTION_KEY=<output of: openssl rand -base64 32>
     LAKEKEEPER__BIND_IP=127.0.0.1
     ```
