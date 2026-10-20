@@ -370,7 +370,7 @@ this project adheres to
   data file it can apply to is left out of the rewrite.
 - A `numeric` `NaN` in a tiered table read back as `0` through the view once
   the table had a cold tier, and was archived as `0`: pg_duckdb and DuckDB's
-  postgres extension read `NaN` as zero, and Iceberg's decimal has no `NaN`.
+  `postgres` extension read `NaN` as zero, and Iceberg's decimal has no `NaN`.
   The hot table now refuses `NaN` when it is written, and an archive pass
   refuses a table that already holds one, with an error that names the column's
   check constraint.
@@ -436,7 +436,7 @@ use.
   older data to Apache Iceberg on a watermark, presented to the application as
   a single unified view.
 - Decoupled mode stores a table entirely in Iceberg from the first row, with
-  PostgreSQL holding a thin wrapper view and the coldfront extension handling
+  PostgreSQL holding a thin wrapper view and the `coldfront` extension handling
   every data-modifying statement on that view.
 - Horizontal scale-out for decoupled mode across multiple PostgreSQL nodes
   sharing one Lakekeeper catalog and one object store, serialised by the bakery

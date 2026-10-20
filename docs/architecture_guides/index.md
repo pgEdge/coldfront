@@ -7,10 +7,11 @@ rewrites reads and writes to hit the right tier, and **all Iceberg I/O goes
 through `pg_duckdb` running in-process inside PostgreSQL** - no external query
 engine, no Go Iceberg libraries.
 
-For mode-specific design, see [architecture_tiered.md](architecture_tiered.md)
-(hot PG + cold Iceberg) ·
-[architecture_decoupled.md](architecture_decoupled.md) (all-Iceberg) ·
-[architecture_vectors.md](architecture_vectors.md) (vector storage).
+For mode-specific design, see
+[Tiered Operating Mode](../architecture_tiered.md) (hot PostgreSQL plus cold
+Iceberg),
+[Decoupled (Iceberg-Only) Operating Mode](../architecture_decoupled.md), and
+[Vector Storage Architecture](../architecture_vectors.md).
 
 ## Operating Modes and Topologies
 
@@ -33,8 +34,8 @@ path in the hook takes, mostly through `_exec_iceberg_with_claim`. Decoupled
 mode always classifies as `TIER_COLD` and never reaches `emit_hot`; vanilla and
 mesh differ only in how that claim serializes cold writes. This document covers
 the shared mechanics and the tiered path; see
-[architecture_decoupled.md](architecture_decoupled.md) for the decoupled mode's
-ACID model and distributed scaling story.
+[Decoupled (Iceberg-Only) Operating Mode](../architecture_decoupled.md) for the
+decoupled mode's ACID model and distributed scaling story.
 
 ### Read Target: Primary or Physical Standby
 
@@ -104,9 +105,9 @@ The following table describes each component, its role, and its license:
 
 How rows move through this depends on the storage mode: the tiered hot heap +
 archiver + `UNION ALL` data-flow is in the
-[Data Flow](architecture_tiered.md#data-flow) section of the Tiered Mode page;
+[Data Flow](../architecture_tiered.md#data-flow) section of the Tiered Mode page;
 the all-Iceberg flow is in
-[architecture_decoupled.md](architecture_decoupled.md).
+[Decoupled (Iceberg-Only) Operating Mode](../architecture_decoupled.md).
 
 ## Core Mechanics: pg_duckdb
 
@@ -161,7 +162,7 @@ into a fresh instance) and the bakery's transient claim tables (`claims` /
 re-established a restored node serves hot reads but fails cold I/O cleanly.
 `ci/ops.sh` Check 4 exercises exactly this.
 
-The Iceberg catalog ATTACH is **lazy**: the coldfront C extension hook issues
+The Iceberg catalog ATTACH is **lazy**: the `coldfront` C extension hook issues
 `ATTACH IF NOT EXISTS` against Lakekeeper - using the cluster's
 `coldfront.warehouse` and `coldfront.lakekeeper_endpoint` GUCs - on the **first
 query that touches a tiered view** (read or write), per DuckDB cached
@@ -175,17 +176,17 @@ view, so a missing warehouse never blocks a connection opened before bootstrap.
 pg_duckdb force-disables DuckDB's `LocalFileSystem` for any role that lacks
 both `pg_read_server_files` and `pg_write_server_files` (see
 [Upstream requests](#pg_duckdb-non-superuser-localfilesystem-blocks-side-loaded-extensions)),
-which would block the side-loaded iceberg/postgres DuckDB extensions from
-loading on `ATTACH`. So `coldfront.ensure_attached()` / `ensure_pg_attached()`
-are `SECURITY DEFINER` with a pinned `search_path`: the extension load +
-`ATTACH` run elevated (gates key off `GetUserId()`, the effective user), and
-because the DuckDB instance is per-backend the attach persists for the
-session - every subsequent cold read / `_exec_iceberg_with_claim` then runs
-as the **app role** over S3/httpfs, never touching `LocalFileSystem`. The app
-role needs only `duckdb.postgres_role` membership, object grants, and SET on
-the superuser-only `duckdb.unsafe_allow_execution_inside_functions`
-parameter, which the cross-tier move needs; **no superuser, no
-`pg_{read,write}_server_files`**.
+which would block the side-loaded `iceberg` and `postgres` DuckDB extensions
+from loading on `ATTACH`. So `coldfront.ensure_attached()` /
+`ensure_pg_attached()` are `SECURITY DEFINER` with a pinned `search_path`: the
+extension load + `ATTACH` run elevated (gates key off `GetUserId()`, the
+effective user), and because the DuckDB instance is per-backend the attach
+persists for the session - every subsequent cold read /
+`_exec_iceberg_with_claim` then runs as the **app role** over S3/httpfs, never
+touching `LocalFileSystem`. The app role needs only `duckdb.postgres_role`
+membership, object grants, and SET on the superuser-only
+`duckdb.unsafe_allow_execution_inside_functions` parameter, which the
+cross-tier move needs; **no superuser, no `pg_{read,write}_server_files`**.
 
 Because the attach helpers run elevated, the deployment-config GUCs they
 consume (`coldfront.warehouse`, `coldfront.lakekeeper_endpoint`,
@@ -211,7 +212,7 @@ with the privilege it requires. `_exec_iceberg_with_claim` deliberately stays
 `SECURITY INVOKER` - it runs the caller's cold DML, which must execute as the
 caller. This `SECURITY DEFINER` setting is **protocol-neutral**: it changes the
 PG execution privilege, not the claim/ack/lock/ticket protocol, re-verified
-against [the TLA+ model](formal/Bakery.tla) (all safe configs pass; the race
+against [the TLA+ model](../formal/Bakery.tla) (all safe configs pass; the race
 config still violates `NoLakekeeperConflict`).
 
 See README "Security"; the setting is asserted by the journey's
@@ -244,7 +245,7 @@ WHERE r['ts'] < '2026-03-01'::timestamptz;
 ## Application Interface
 
 Applications use the transparent view exactly like a table. A
-`post_parse_analyze_hook` in the coldfront extension intercepts
+`post_parse_analyze_hook` in the `coldfront` extension intercepts
 `INSERT`/`UPDATE`/`DELETE`/`MERGE` whose target is a registered relation -
 resolved in `coldfront.tiered_views` by name (`schema_name`, `relname`) - and
 rewrites the parsed `Query` so it lands in the correct tier; cold-side writes
@@ -256,9 +257,8 @@ The same parse-analyze hook prepares a `SELECT` that DuckDB will run, wherever
 in the statement the view is named (a CTE, a sub-select, a set-operation
 branch): `date_bin`, the `::jsonb` cast, `jsonb_array_length` and the JSON
 builders (`jsonb_build_object`, `jsonb_agg` and their `json_` twins) are
-rewritten into spellings both engines accept (see the
-[Supported Column Types](usage.md#supported-column-types) section of the Using
-ColdFront guide). A
+rewritten into spellings both engines accept (see
+[Supported Column Types](../supported_types.md)). A
 `planner_hook` folds bound parameters into such a read before pg_duckdb plans
 it when a parameter sits where DuckDB cannot type a placeholder (a direct
 argument of a pg_duckdb function, any argument of a table function); the plan
@@ -267,8 +267,7 @@ above any custom plan, so under the plan cache's cost-based selection the read
 is planned from its values on every execution.
 `plan_cache_mode = force_generic_plan` bypasses that selection and picks the
 value-less generic plan, which fails with `only works with DuckDB execution`
-(see the [Supported Column Types](usage.md#supported-column-types) section of
-the Using ColdFront guide).
+(see [Supported Column Types](../supported_types.md)).
 
 The following table maps each operation to its interface and routing path:
 
@@ -287,12 +286,12 @@ How the hook splits a write is mode-specific:
 
 - In tiered mode, the hook routes by the partition-column watermark - hot heap
   vs cold Iceberg, with dual-tier writes for ambiguous predicates. See
-  [Transparent `INSERT`](architecture_tiered.md#transparent-insert) and
-  [Transparent `UPDATE`/`DELETE`](architecture_tiered.md#transparent-updatedelete)
+  [Transparent `INSERT`](../architecture_tiered.md#transparent-insert) and
+  [Transparent `UPDATE`/`DELETE`](../architecture_tiered.md#transparent-updatedelete)
   in the Tiered Mode page.
 - In decoupled mode, the hook always classifies `TIER_COLD`, so every write is
   a single-tier Iceberg write. See
-  [architecture_decoupled.md](architecture_decoupled.md).
+  [Decoupled (Iceberg-Only) Operating Mode](../architecture_decoupled.md).
 
 ### Cold-Tier DML from Inside PL/pgSQL (Functions, DO Blocks, Triggers)
 
@@ -339,13 +338,13 @@ ColdFront coordinates concurrent writes across the cluster as follows:
   lock acquisition (10 attempts, exponential backoff from 100 ms to 51.2 s).
 - Hot writes are replicated by Spock normally (standard PG DML).
 - Cold writes via `duckdb.raw_query()` from multiple nodes are serialized
-  PG-side by the **bakery protocol** in the coldfront extension - every
+  PG-side by the **bakery protocol** in the `coldfront` extension - every
   iceberg-only `INSERT`/`UPDATE`/`DELETE`/`MERGE` wraps in
   `coldfront._exec_iceberg_with_claim`, which holds a globally-ordered
   Snowflake ticket via the Spock-replicated `coldfront.claims` table and waits
   for its turn before issuing the iceberg commit. The bakery produces no 409s
   and needs no retry in the application. See the
-  [Concurrency](architecture_decoupled.md#concurrency-horizontal-scaling-the-bakery-protocol)
+  [Concurrency](../architecture_decoupled.md#concurrency-horizontal-scaling-the-bakery-protocol)
   section of the Decoupled Mode page for the full design and benchmarks.
 
 ### Cold-Write Strategy: Stock vs Patched duckdb-iceberg
@@ -361,7 +360,7 @@ The following table shows the two orderings:
 | Ordering | Applies to | Behavior |
 |---|---|---|
 | stock (default) | every write on stock upstream duckdb-iceberg; a `DELETE`, `UPDATE` or `MERGE` (the cross-tier move and `vector_train`'s assignment included) on every build | The writer takes the serializer first, *then* uploads parquet and commits inside it. On an unpatched binary this is what keeps a second writer from capturing a stale parent. A write that references rows the table holds needs it on every build: its position deletes name data files by path, and a compaction or another such write committing between its scan and its commit would rewrite or remove those files, after which the deletes apply to nothing and the rows come back. |
-| async (both GUCs `on`) | appends (`INSERT`, `COPY`, the archiver's exports, the tiered `INSERT`'s cold sink) on the patched build (`iceberg-bakery-aware-commit-refresh-v15.patch`) | The statement uploads its parquet and queues the claim; the extension's transaction callback takes it at PRE_COMMIT, just before pg_duckdb's own PRE_COMMIT callback commits the Iceberg transaction, and releases it at COMMIT. Uploads overlap on one node and across nodes, an open transaction blocks no other writer, and only the short commit POST is serialized. A new data file conflicts with nothing committed in between. An append to a clustered table is checked at commit against the live centroid generation and fails with `serialization_failure` if a retrain replaced it (see [architecture_vectors.md](architecture_vectors.md)). |
+| async (both GUCs `on`) | appends (`INSERT`, `COPY`, the archiver's exports, the tiered `INSERT`'s cold sink) on the patched build (`iceberg-bakery-aware-commit-refresh-v15.patch`) | The statement uploads its parquet and queues the claim; the extension's transaction callback takes it at PRE_COMMIT, just before pg_duckdb's own PRE_COMMIT callback commits the Iceberg transaction, and releases it at COMMIT. Uploads overlap on one node and across nodes, an open transaction blocks no other writer, and only the short commit POST is serialized. A new data file conflicts with nothing committed in between. An append to a clustered table is checked at commit against the live centroid generation and fails with `serialization_failure` if a retrain replaced it (see [Vector Storage Architecture](../architecture_vectors.md)). |
 
 For every write but a clustered table's append, the code path and the
 application-visible behavior are identical, so the GUCs are a performance knob;
@@ -383,20 +382,20 @@ for the build.
 
 ### Transparent DDL via coldfront
 
-A `ProcessUtility_hook` in the coldfront extension intercepts DDL that targets
-a registered tiered table's hot heap or a decoupled table's wrapper view. A
-hot heap is matched by resolving the DDL target relation to an OID and
+A `ProcessUtility_hook` in the `coldfront` extension intercepts DDL that
+targets a registered tiered table's hot heap or a decoupled table's wrapper
+view. A hot heap is matched by resolving the DDL target relation to an OID and
 comparing it with the OID of the registry's `hot_table` - never by string, so
 it is schema-agnostic - and a view by its schema and name, the registry's key.
 A view the hook rebuilds keeps the owner and the table-level grants the view
 had. The hook rebuilds the view and updates the registry as the extension's
 owner, once the ownership check PostgreSQL makes for the statement has passed.
-The role running the statement needs what PostgreSQL requires for the
-statement itself, `USAGE` on the schema of the relation it names included, but
-neither ownership of the view nor `CREATE` on its schema, and the hook's own
-registry lookups and updates need no privilege on the registry. The Iceberg
-change, which is cold I/O, runs as that role, so a column change also needs the
-cold access `grant_app_access` gives, `SELECT` on the registry included. The
+The role running the statement needs what PostgreSQL requires for the statement
+itself, `USAGE` on the schema of the relation it names included, but neither
+ownership of the view nor `CREATE` on its schema, and the hook's own registry
+lookups and updates need no privilege on the registry. The Iceberg change,
+which is cold I/O, runs as that role, so a column change also needs the cold
+access `grant_app_access` gives, `SELECT` on the registry included. The
 following table summarizes the DDL it handles:
 
 | DDL | Behavior |
@@ -438,7 +437,7 @@ to be usable on a peer is covered next.
 The tiered-specific cross-node behavior - what replicates so a tiered table is
 usable on every peer, and why both the registry and the watermark join the
 replication set - is in the
-[Tiered Tables in a Spock Mesh](architecture_tiered.md#tiered-tables-in-a-spock-mesh)
+[Tiered Tables in a Spock Mesh](../architecture_tiered.md#tiered-tables-in-a-spock-mesh)
 section of the Tiered Mode page.
 
 ### Registry Keying: By Name, Not OID
@@ -463,7 +462,7 @@ node-independent, so the registry row is identical on every node and the
 replication set copies it by value (an OID is node-local and could not be).
 That is what makes cross-node tiered tables work with no per-node
 re-resolution - see the
-[Tiered Tables in a Spock Mesh](architecture_tiered.md#tiered-tables-in-a-spock-mesh)
+[Tiered Tables in a Spock Mesh](../architecture_tiered.md#tiered-tables-in-a-spock-mesh)
 section of the Tiered Mode page.
 
 Lower-level operations that genuinely need an OID - catalog lookups, the DDL
@@ -523,14 +522,14 @@ mode (the archiver those with a `hot_period`, the partitioner those without),
 and exit with an error when they find none; tables enter it via `register`, or
 from a YAML `archiver.tables` list fed to `import`. Both expose a management
 CLI - `register` / `list` / `set` / `remove` / `import` / `export` - documented
-in [usage.md](usage.md#managing-partitioned-tables-cli).
+in [Managing Partitioned Tables (CLI)](../using_coldfront/index.md#managing-partitioned-tables-cli).
 
 ## Known Limitations
 
 These apply to both storage modes. Tiered-only limitations (cold `RETURNING`,
 dual-tier command tag, crash-safety of permissive writes, partition-scheme
 constraints, autovacuum-vs-cutover) are in the
-[Tiered-Specific Limitations](architecture_tiered.md#tiered-specific-limitations)
+[Tiered-Specific Limitations](../architecture_tiered.md#tiered-specific-limitations)
 section of the Tiered Mode page.
 
 The cross-cutting limitations are:
@@ -733,7 +732,8 @@ and the directory and reporting what that freed. That sweep runs once per
 session and costs single-digit milliseconds per spill file, so even a directory
 abandoned with 600 GB in it (about 600 files at DuckDB's file size) is a couple
 of seconds on the one statement that finds it. See the
-[Tuning Knobs](usage.md#tuning-knobs) section of the Using ColdFront guide.
+[Configuring PostgreSQL](../configuration.md#configuring-postgresql) section
+of the Configuring ColdFront guide.
 
 The PID is what makes that reclaim possible, and is why ColdFront does not
 apply pg_duckdb#887, which names the directory with a random uuid and removes
@@ -801,11 +801,12 @@ with fleet benchmarking rather than as a patch ColdFront maintains.
 
 To go further with ColdFront, consult the following documents:
 
-- The [Tiered Mode](architecture_tiered.md) deep dive describes the archive
+- The [Tiered Mode](../architecture_tiered.md) deep dive describes the archive
   pipeline, transparent DML, and tiered tables in a Spock mesh.
-- The [Decoupled Mode](architecture_decoupled.md) deep dive describes
+- The [Decoupled Mode](../architecture_decoupled.md) deep dive describes
   iceberg-only tables, their ACID model, and the bakery protocol.
-- The [Vector Storage](architecture_vectors.md) deep dive describes how
+- The [Vector Storage](../architecture_vectors.md) deep dive describes how
   embeddings are stored, assigned to clusters, and searched.
-- The [Using ColdFront](usage.md) guide covers day-to-day use of both modes.
+- The [Using ColdFront](../using_coldfront/index.md) guide covers day-to-day
+  use of the tiered, decoupled, and standalone partitioned modes.
 

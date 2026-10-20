@@ -15,3 +15,9 @@
     --md-footer-logo-dark-mode: block;
     --md-footer-logo-light-mode: none;
 }
+
+/* Keep inline code (e.g. GUC names) from wrapping mid-word inside
+   narrow table columns; prose cells wrap normally. */
+.md-typeset table code {
+    white-space: nowrap;
+}

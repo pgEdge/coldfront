@@ -99,7 +99,8 @@ an assignment already stored keeps meaning what it meant, and the primary key
 rejects a repeated `centroid_id` within one generation.
 
 `coldfront.tiered_views.vec_columns` records which columns are clustered, in
-order. The list cannot be derived afterwards in either mode: the view exposes
+order. The list cannot be derived afterwards for a tiered or a decoupled
+table: the view exposes
 `real[]` rather than the pgvector type, and a decoupled table names its types
 without holding them.
 
@@ -566,5 +567,5 @@ To go further with ColdFront, consult the following documents:
   searching vector columns.
 - The [Compaction](compaction.md) guide covers the maintenance that restores
   cluster order.
-- The [Architecture](architecture.md) overview describes the mechanics both
+- The [Architecture](architecture_guides/index.md) overview describes the mechanics both
   modes share.
