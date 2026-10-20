@@ -13,12 +13,21 @@ Choose how you are running it below.
 ## With Docker
 
 Bring up the end-user stack first (the example uses SeaweedFS, gated
-behind the `local-store` compose profile; host ports are published so
-the `localhost` commands below work directly):
+behind the `local-store` compose profile). The stack is for development and
+testing on one host: PostgreSQL trusts every connection, and Lakekeeper runs
+without authentication. The command therefore publishes each port on the
+loopback address only, so the `localhost` commands below work and other hosts
+cannot connect:
 
 ```bash
-docker compose --profile local-store up -d --build
+COLDFRONT_PG_PORT=127.0.0.1:5432 COLDFRONT_LK_PORT=127.0.0.1:8181 \
+COLDFRONT_S3_PORT=127.0.0.1:8333 \
+  docker compose --profile local-store up -d --build
 ```
+
+Before you let other hosts connect, configure authentication and an enforcing
+authorization backend for Lakekeeper, require passwords in PostgreSQL's
+`pg_hba.conf`, and limit access to the ports with a firewall.
 
 Lakekeeper is now reachable at `localhost:8181` with no further setup.
 Continue with [Bootstrapping Lakekeeper](#bootstrapping-lakekeeper), and use
