@@ -391,7 +391,8 @@ PostgreSQL server development headers, the libpq headers and library, `make`,
 
     ```bash
     cd extension/coldfront
-    make && make install
+    make
+    sudo make install PG_CONFIG="$(command -v pg_config)"
     ```
 
 3. Build the command-line tools. `make build` builds the archiver and the
