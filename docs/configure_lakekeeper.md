@@ -81,7 +81,8 @@ reads its settings from `/etc/lakekeeper/lakekeeper.env`. The
 following steps prepare and start the service, whichever way you
 installed it:
 
-1. Create a role and a database for the catalog:
+1. Connect as a PostgreSQL superuser, such as `postgres` (for example, with
+    `sudo -u postgres psql`), and create a role and a database for the catalog:
 
     ```sql
     CREATE ROLE lakekeeper LOGIN PASSWORD 'change-me';
