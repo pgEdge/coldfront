@@ -170,10 +170,12 @@ Settings live in two places:
     - `coldfront.storage_secret` holds the cold-store credential.
 
 The archiver, partitioner, and compactor connect through the libpq environment
-or `--dsn`, and read the settings from the server. To load a deployment YAML
-into the server, run `archiver import --config <file>` once. Model the file on
-[config.example.yaml](config.example.yaml). A later run checks any YAML you
-pass against the server and uses only its `postgres.dsn`.
+or `--dsn`, and read the settings from the server. A deployment YAML file is
+only an input for loading settings: run `archiver import --config <file>` once
+to write it into the server, and model the file on
+[config.example.yaml](config.example.yaml). After that, a run that you pass a
+YAML file checks it against the server and takes only its `postgres.dsn`,
+which supplies the connection when you don't pass `--dsn`.
 
 To review a list of available settings, see:
 
