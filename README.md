@@ -192,8 +192,10 @@ build it from source in a Docker container or on bare metal.
 
 In the sections that follow, we'll walk you through installing PostgreSQL and
 ColdFront using packages. ColdFront packages come from the pgEdge package
-repository, so first configure the repository for your platform, as described
-in the [pgEdge Enterprise Postgres guide](https://docs.pgedge.com/enterprise/).
+repository, which requires a certificate from pgEdge. First, request a
+certificate and install it, then configure the repository for your platform,
+as described in the
+[pgEdge Enterprise Postgres guide](https://docs.pgedge.com/enterprise/).
 
 If you already have a pgEdge Enterprise Postgres server installed that you
 would like to use, configure the pgEdge repository and install only ColdFront,
