@@ -517,7 +517,9 @@ the host.
     sudo systemctl daemon-reload
     ```
 
-3. Create a role and a database for the Lakekeeper catalog:
+3. Connect as a PostgreSQL superuser, such as `postgres` (for example, with
+    `sudo -u postgres psql`), and create a role and a database for the
+    Lakekeeper catalog:
 
     ```sql
     CREATE ROLE lakekeeper LOGIN PASSWORD 'change-me';
