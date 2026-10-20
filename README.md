@@ -580,6 +580,12 @@ the host.
     fi
     ```
 
+    If you run these commands again after the warehouse exists, the create
+    request fails and `WID` is empty. Set `WID` to the `warehouse-id` of the
+    `wh` warehouse in the output of
+    `curl -s http://localhost:8181/management/v1/warehouse`, then rerun the
+    namespace request.
+
     If you're using a different type of object store, change the
     `storage-profile` and `storage-credential` as shown in the store's section
     of [Configuring your Object Store](docs/object_store.md#configuring-lakekeeper).
@@ -639,6 +645,12 @@ to evaluate ColdFront without a cloud account.
         -H "Content-Type: application/json" -d '{"namespace":["public"]}'
     fi
     ```
+
+    If you run these commands again after the warehouse exists, the create
+    request fails and `WID` is empty. Set `WID` to the `warehouse-id` of the
+    `wh` warehouse in the output of
+    `curl -s http://localhost:8181/management/v1/warehouse`, then rerun the
+    namespace request.
 
 4. Store the SeaweedFS credential in each database that uses ColdFront:
 
