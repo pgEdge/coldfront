@@ -114,5 +114,5 @@ a YAML checks the file against the server and refuses to run if any value
 differs. The only value such a run takes from the file is `postgres.dsn`, which
 connects when `--dsn` is unset. The
 [Managing Partitioned Tables (CLI)](using_coldfront/index.md#managing-partitioned-tables-cli)
-section of the Using ColdFront in Standalone Partitioned Mode guide describes
+section of the Using ColdFront guide describes
 `register`, `import`, and `export`.
