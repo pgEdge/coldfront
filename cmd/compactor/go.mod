@@ -1,6 +1,6 @@
 module github.com/pgedge/coldfront/cmd/compactor
 
-go 1.26.5
+go 1.26.10
 
 require (
 	github.com/apache/arrow-go/v18 v18.8.0
