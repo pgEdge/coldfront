@@ -3962,14 +3962,24 @@ ALTER TABLE coldfront.claims ENABLE REPLICA TRIGGER coldfront_claim_apply;
 -- claimant's wait loop reads acks, so a copy of another node's ack is dropped,
 -- and so is an ack for a claim this node has already released or reaped: a
 -- peer ruled dead acks the claims it missed once it catches up, and an orphan's
--- ack can arrive after the reap. Modelled in docs/formal/Bakery.tla (ClaimLive,
--- NoAckOutlivesClaim).
+-- ack can arrive after the reap. PostgreSQL ships a commit to peers once its
+-- record is flushed and makes it visible on its own node a step later, so a
+-- peer's ack can arrive while this node's claim insert is still committing;
+-- _insert_claim holds the table's claim key from before the ticket until that
+-- transaction has ended, so an ack whose claim is not visible is dropped only
+-- when the key is free. A late ack that arrives while a later claim's insert
+-- holds the key is kept, and the next claim's cleanup removes it. Modelled in
+-- docs/formal/Bakery.tla (ClaimLive, NoAckOutlivesClaim).
 CREATE FUNCTION coldfront._on_ack_apply() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
-    IF snowflake.get_node(NEW.ticket) <> current_setting('snowflake.node')::int
-       OR NOT EXISTS (SELECT 1 FROM coldfront.claims WHERE ticket = NEW.ticket) THEN
+    IF snowflake.get_node(NEW.ticket) <> current_setting('snowflake.node')::int THEN
         RETURN NULL;
+    END IF;
+    IF NOT EXISTS (SELECT 1 FROM coldfront.claims WHERE ticket = NEW.ticket) THEN
+        IF pg_try_advisory_xact_lock_shared(hashtext('coldfront_claim:' || NEW.iceberg_table)) THEN
+            RETURN NULL;
+        END IF;
     END IF;
     RETURN NEW;
 END $$;

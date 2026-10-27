@@ -1,0 +1,140 @@
+-- The two shapes of a tiered INSERT. A source the hook cannot read a second
+-- time from another session (here a stable function, timestamptz plus an
+-- interval) is read once: the rewrite holds it in a MATERIALIZED CTE that the
+-- hot INSERT and the cold sink both read. A source it can read twice streams:
+-- the hot INSERT reads it, and the cold half is one call carrying the cold
+-- projection as text for the other session. Both cast every column to the hot
+-- table's type (an untyped literal keeps the target's type), fill an omitted
+-- identity column with nextval() and an omitted column with its DEFAULT on
+-- the cold side, and keep OVERRIDING SYSTEM VALUE on the hot INSERT.
+-- White-box: EXPLAIN VERBOSE shows the rewritten shape; no Iceberg I/O
+-- (warehouse and endpoint left '').
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_duckdb;
+CREATE EXTENSION IF NOT EXISTS coldfront;
+RESET client_min_messages;
+SET TIME ZONE 'UTC';
+SET coldfront.warehouse = '';
+SET coldfront.lakekeeper_endpoint = '';
+CREATE TABLE public._events (id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL,
+                             status text NOT NULL DEFAULT 'new', data jsonb);
+CREATE VIEW public.events AS SELECT * FROM public._events;
+INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
+VALUES ('public', 'events', 'public._events', 'ice.default.events', 'ts');
+INSERT INTO coldfront.archive_watermark(schema_name, table_name, cutoff_time)
+VALUES ('public', 'events', '2026-03-01'::timestamptz);
+-- The identity and the defaulted column are omitted, and the literal is untyped.
+EXPLAIN (COSTS OFF, VERBOSE)
+  INSERT INTO public.events (ts, data)
+  SELECT '2026-01-01'::timestamptz + i * interval '1 day', '{}' FROM generate_series(1, 3) i;
+                                                                                                                                             QUERY PLAN                                                                                                                                              
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result
+   Output: (InitPlan 4).col1, (InitPlan 5).col1
+   CTE coldfront_source
+     ->  Function Scan on pg_catalog.generate_series i
+           Output: ('Thu Jan 01 00:00:00 2026 UTC'::timestamp with time zone + ((i.i)::double precision * '@ 1 day'::interval)), '{}'::jsonb
+           Function Call: generate_series(1, 3)
+   CTE coldfront_hot
+     ->  Insert on public._events
+           Output: 1
+           ->  CTE Scan on coldfront_source
+                 Output: nextval('_events_id_seq'), coldfront_source.ts, 'new'::text, coldfront_source.data
+                 Filter: (coldfront_source.ts >= 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
+   CTE coldfront_cold
+     ->  Aggregate
+           Output: _cold_sink('public'::text, 'events'::text, (string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,status,data}'::text[], '{bigint,"timestamp with time zone",text,jsonb}'::text[], 'public'::text, 'events'::text)) || ')'::text), ', '::text)), (count(*)))
+           ->  HashAggregate
+                 Output: string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,status,data}'::text[], '{bigint,"timestamp with time zone",text,jsonb}'::text[], 'public'::text, 'events'::text)) || ')'::text), ', '::text), count(*), r.coldfront_batch
+                 Group Key: r.coldfront_batch
+                 ->  Subquery Scan on r
+                       Output: r.coldfront_batch, r.*
+                       ->  WindowAgg
+                             Output: (nextval('_events_id_seq'::regclass)), coldfront_source_1.ts, ('new'::text), coldfront_source_1.data, ((row_number() OVER (?) - 1) / (current_setting('coldfront.cold_write_batch_size'::text))::integer)
+                             ->  CTE Scan on coldfront_source coldfront_source_1
+                                   Output: nextval('_events_id_seq'::regclass), coldfront_source_1.ts, 'new'::text, coldfront_source_1.data
+                                   Filter: (coldfront_source_1.ts < 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
+   InitPlan 4
+     ->  Aggregate
+           Output: count(*)
+           ->  CTE Scan on coldfront_hot
+                 Output: coldfront_hot."?column?"
+   InitPlan 5
+     ->  CTE Scan on coldfront_cold
+           Output: coldfront_cold.n
+(33 rows)
+
+-- OVERRIDING SYSTEM VALUE supplies the identity; the cold side takes it as given.
+EXPLAIN (COSTS OFF, VERBOSE)
+  INSERT INTO public.events (id, ts, status, data) OVERRIDING SYSTEM VALUE
+  SELECT i, '2026-01-01'::timestamptz, 'old', '{}'::jsonb FROM generate_series(1, 3) i;
+                                                                                                                                                                                                                                                                                                                                                   QUERY PLAN                                                                                                                                                                                                                                                                                                                                                   
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result
+   Output: (InitPlan 5).col1, (InitPlan 6).col1
+   CTE coldfront_hot
+     ->  Insert on public._events
+           Output: 1
+           ->  Result
+                 Output: (i)::bigint, 'Thu Jan 01 00:00:00 2026 UTC'::timestamp with time zone, 'old'::text, '{}'::jsonb
+                 One-Time Filter: false
+   CTE coldfront_cold
+     ->  Result
+           Output: _tiered_cold_stream('public'::text, 'events'::text, 'SELECT coldfront_src.id::bigint AS id, coldfront_src.ts::timestamp with time zone AS ts, coldfront_src.status::text AS status, (coldfront_src.data::jsonb)::text AS data FROM (SELECT i.i,             ''2026-01-01 00:00:00+00''::timestamp with time zone AS timestamptz,             ''old'',             ''{}''::jsonb AS jsonb            FROM generate_series(1, 3) i(i)) AS coldfront_src(id, ts, status, data) WHERE coldfront_src.ts::timestamp with time zone < ''2026-03-01 00:00:00+00''::timestamptz'::text, '{}'::regclass[], (InitPlan 2).col1, CASE WHEN (InitPlan 3).col1 THEN _stream_snapshot() ELSE NULL::text END)
+           InitPlan 2
+             ->  Function Scan on pg_catalog.generate_series i
+                   Function Call: generate_series(1, 3)
+           InitPlan 3
+             ->  Function Scan on pg_catalog.generate_series i_1
+                   Function Call: generate_series(1, 3)
+   InitPlan 5
+     ->  Aggregate
+           Output: count(*)
+           ->  CTE Scan on coldfront_hot
+                 Output: coldfront_hot."?column?"
+   InitPlan 6
+     ->  CTE Scan on coldfront_cold
+           Output: coldfront_cold.n
+(25 rows)
+
+-- VALUES takes the same shape.
+EXPLAIN (COSTS OFF, VERBOSE)
+  INSERT INTO public.events (ts, status) VALUES ('2026-01-01', 'a'), ('2026-05-01', 'b');
+                                                                                                                                                                                                                                                                                                                              QUERY PLAN                                                                                                                                                                                                                                                                                                                              
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result
+   Output: (InitPlan 5).col1, (InitPlan 6).col1
+   CTE coldfront_hot
+     ->  Insert on public._events
+           Output: 1
+           ->  Values Scan on "*VALUES*"
+                 Output: nextval('_events_id_seq'), "*VALUES*".column1, "*VALUES*".column2, NULL::jsonb
+                 Filter: ("*VALUES*".column1 >= 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
+   CTE coldfront_cold
+     ->  Result
+           Output: _tiered_cold_stream('public'::text, 'events'::text, 'SELECT nextval(''public._events_id_seq''::regclass) AS id, coldfront_src.ts::timestamp with time zone AS ts, coldfront_src.status::text AS status, (NULL::jsonb)::text AS data FROM (VALUES (''2026-01-01 00:00:00+00''::timestamp with time zone,''a''::text), (''2026-05-01 00:00:00+00''::timestamp with time zone,''b''::text)) AS coldfront_src(ts, status) WHERE coldfront_src.ts::timestamp with time zone < ''2026-03-01 00:00:00+00''::timestamptz'::text, '{}'::regclass[], ((InitPlan 2).col1 < 2), CASE WHEN ((InitPlan 3).col1 < 2) THEN _stream_snapshot() ELSE NULL::text END)
+           InitPlan 2
+             ->  Aggregate
+                   Output: count(*)
+                   ->  CTE Scan on coldfront_hot
+                         Output: coldfront_hot."?column?"
+           InitPlan 3
+             ->  Aggregate
+                   Output: count(*)
+                   ->  CTE Scan on coldfront_hot coldfront_hot_1
+                         Output: coldfront_hot_1."?column?"
+   InitPlan 5
+     ->  Aggregate
+           Output: count(*)
+           ->  CTE Scan on coldfront_hot coldfront_hot_2
+                 Output: coldfront_hot_2."?column?"
+   InitPlan 6
+     ->  CTE Scan on coldfront_cold
+           Output: coldfront_cold.n
+(29 rows)
+
+-- Cleanup.
+DELETE FROM coldfront.tiered_views;
+DELETE FROM coldfront.archive_watermark;
+DROP VIEW public.events;
+DROP TABLE public._events;
