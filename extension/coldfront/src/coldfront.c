@@ -1263,6 +1263,11 @@ cf_json_agg(Aggref *agg, Oid elemtype, Oid arrtype)
  */
 #define CF_JSON_ANCHOR "{\"\\u0000\":"
 
+/* Most path elements one #> or #>> may hold that PostgreSQL reads as an array index
+ * and a JSON Pointer does not (-1, 01, +1): the rewrite tries both for each, which
+ * doubles the expression it builds. */
+#define CF_JSON_EITHER_MAX 8
+
 /* A call of nsp.name, resolved as the parser resolves it. */
 static Node *
 cf_call(const char *nsp, const char *name, List *args)
@@ -1338,6 +1343,7 @@ cf_json_path(Node *d, ArrayType *path, bool as_text)
     bool          *nulls;
     int            n;
     int            i;
+    int            either = 0;
     StringInfoData ptr;
     Node          *cur = d;
 
@@ -1358,6 +1364,11 @@ cf_json_path(Node *d, ArrayType *path, bool as_text)
             cf_pointer_token(&ptr, s);
             continue;
         }
+        if (++either > CF_JSON_EITHER_MAX)
+            ereport(ERROR,
+                    (errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+                     errmsg("coldfront: JSON path holds more than %d elements that may be an "
+                            "array index or an object key", CF_JSON_EITHER_MAX)));
         if (ptr.len > 0)
             cur = cf_duck_call("json_extract", list_make2(cur, cf_text_const(ptr.data)));
         resetStringInfo(&ptr);

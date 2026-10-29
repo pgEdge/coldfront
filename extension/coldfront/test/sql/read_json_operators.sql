@@ -258,6 +258,13 @@ RESET duckdb.force_execution;
 SELECT name, generic_plans, custom_plans FROM pg_prepared_statements
  WHERE name IN ('jpath', 'jkey', 'jkeys', 'jdoc', 'jdocpath') ORDER BY name;
 
+-- (K) A path element PostgreSQL may read as an array index or as an object key
+-- (-1, 01, +1) doubles the rewritten expression, so a path holds at most eight.
+SET duckdb.force_execution = true;
+SELECT count(data #> '{-1,-1,-1,-1,-1,-1,-1,-1}') AS eight FROM public.docs;
+SELECT count(data #> '{-1,-1,-1,-1,-1,-1,-1,-1,-1}') AS nine FROM public.docs;
+RESET duckdb.force_execution;
+
 -- Cleanup.
 DEALLOCATE jdocpath;
 DEALLOCATE jpath;

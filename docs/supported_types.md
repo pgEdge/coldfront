@@ -114,18 +114,19 @@ functions, which return PostgreSQL's answers. The rewrite covers:
 - the `jsonb_contains` and `jsonb_contained` functions.
 
 The path of `#>` and `#>>` and the keys of `?`, `?|` and `?&` must be constants
-or bound parameters, not columns. PostgreSQL has no `json` form of `?`, `?|`,
-`?&`, `@>` and `<@`, only a `jsonb` one. Cast the view's `json` column to
-`jsonb` first, as in `data::jsonb ? 'k'`. Two kinds of result differ from
-PostgreSQL's. DuckDB writes a returned container or number in its own form,
-such as `{"b":"c"}`, or `1.5` for `1.50`. The `->>` operator returns values in
-the same form. The `@>` and `<@` operators never match an integer against the
-same value written as a decimal. For example, a stored `{"p": 10.0}` does not
-contain `{"p": 10}`, because DuckDB compares JSON numbers by kind. ColdFront
-does not support most other jsonb functions on tiered or decoupled data, such
-as `jsonb_typeof`, `jsonb_set`, `jsonb_path_*`, `jsonb_each` and
-`jsonb_object_keys`. DuckDB either lacks these functions, or its function of
-the same name differs in signature or result.
+or bound parameters, not columns. A path can hold at most eight negative,
+signed or zero-padded index elements, such as `-1`, `+1` or `01`. PostgreSQL
+has no `json` form of `?`, `?|`, `?&`, `@>` and `<@`, only a `jsonb` one. Cast
+the view's `json` column to `jsonb` first, as in `data::jsonb ? 'k'`. Two kinds
+of result differ from PostgreSQL's. DuckDB writes a returned container or
+number in its own form, such as `{"b":"c"}`, or `1.5` for `1.50`. The `->>`
+operator returns values in the same form. The `@>` and `<@` operators never
+match an integer against the same value written as a decimal. For example, a
+stored `{"p": 10.0}` does not contain `{"p": 10}`, because DuckDB compares JSON
+numbers by kind. ColdFront does not support most other jsonb functions on
+tiered or decoupled data, such as `jsonb_typeof`, `jsonb_set`, `jsonb_path_*`,
+`jsonb_each` and `jsonb_object_keys`. DuckDB either lacks these functions, or
+its function of the same name differs in signature or result.
 
 These limits apply only to reads that go through a tiered or iceberg-only view,
 which pg_duckdb plans entirely in DuckDB. Ordinary (non-tiered) PostgreSQL
