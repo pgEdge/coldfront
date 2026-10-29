@@ -10,9 +10,13 @@ tables:
 
 - `jsonb` reads come back as `json`. The `->`/`->>` operators work, and
   ColdFront translates the `::jsonb` cast, `jsonb_array_length`,
-  `jsonb_build_object` / `jsonb_agg` and `date_bin`; other jsonb operators and
-  functions are unsupported on cold or cross-tier reads. A hot-only read of the
-  view runs in PostgreSQL with full jsonb (see
+  `jsonb_build_object` / `jsonb_agg` and `date_bin`. ColdFront also rewrites
+  the `#>`, `#>>`, `?`, `?|`, `?&`, `@>` and `<@` operators and the functions
+  behind them. A path or key for these operators must be a constant or a bound
+  parameter. The `@>` and `<@` operators never match an integer against the
+  same value written as a decimal. Other jsonb operators and functions are
+  unsupported on cold or cross-tier reads. A hot-only read of the view runs in
+  PostgreSQL with full jsonb (see
   [Supported Column Types](supported_types.md)).
 - Cross-tier isolation differs from PG-native isolation. The cold tier keeps
   one Iceberg snapshot for the whole transaction, even at READ COMMITTED, so a

@@ -76,7 +76,9 @@
 #include "optimizer/optimizer.h"
 #include "optimizer/planner.h"
 #include "parser/analyze.h"
+#include "parser/parse_collate.h"
 #include "parser/parse_func.h"
+#include "parser/parse_oper.h"
 #include "parser/parse_type.h"
 #include "parser/parsetree.h"
 #include "rewrite/rewriteHandler.h"
@@ -90,6 +92,7 @@
 #include "utils/builtins.h"
 #include "utils/datum.h"
 #include "utils/guc.h"
+#include "utils/json.h"
 #include "utils/lsyscache.h"
 #include "utils/memutils.h"
 #include "utils/snapmgr.h"
@@ -288,6 +291,8 @@ static bool coldfront_registry_present(void);
 /* Defined with it: run a registry read as the extension's owner. */
 static int  as_coldfront_owner(Oid *save_uid, int *save_sec);
 static void as_caller(Oid save_uid, int save_sec, int nest);
+/* Defined with the planner hook: does a tree hold a bound parameter? */
+static bool has_extern_param_walker(Node *node, void *ctx);
 
 /*
  * Re-entrancy guard for the DDL hook. _rebuild_tiered_view issues CREATE VIEW /
@@ -909,8 +914,9 @@ static const CfSubst cf_write_subst[] = {
  * arguments, pg_duckdb declares it PG-side, and the two agree on every fixed-width
  * bucket (a month or year width, which date_bin rejects, time_bucket accepts).
  * The JSON builders (jsonb_build_object, jsonb_agg) need more than a spelling and
- * are rewritten on the node tree instead, as is the <#> operator, which DuckDB
- * lacks and whose function it has: see cf_json_builder_mutator.
+ * are rewritten on the node tree instead, as are the <#> operator, which DuckDB
+ * lacks and whose function it has, and the json/jsonb operators DuckDB lacks (#>,
+ * #>>, ?, ?|, ?&, @>, <@): see cf_json_builder_mutator.
  */
 static const CfSubst cf_read_subst[] = {
     { "::jsonb",             "::json",             false, false },
@@ -1097,7 +1103,9 @@ normalize_for_read(const char *sql)
  * argument List; the emitted function OIDs come from the catalog, once per backend.
  * A VARIADIC array argument cannot be paired and is left alone.
  */
-typedef struct { bool changed; } JsonBuilderCtx;
+/* defer: keep a json operator whose operand holds a bound parameter for the planner
+ * hook (cf_json_operator); false when the planner hook itself rewrites. */
+typedef struct { bool changed; bool defer; } JsonBuilderCtx;
 
 static Oid cf_to_json_oid       = InvalidOid;
 static Oid cf_concat_oid        = InvalidOid;
@@ -1227,6 +1235,287 @@ cf_json_agg(Aggref *agg, Oid elemtype, Oid arrtype)
                                  InvalidOid, InvalidOid, COERCE_EXPLICIT_CALL);
 }
 
+/* ---------- read-path JSON operators ----------------------------------- */
+
+/*
+ * DuckDB has no #>, #>>, ?, ?| or ?& (its parser has no '#' or '?' operator
+ * character) and no jsonb containment, so each of these operators, and the
+ * json_/jsonb_ function behind it, becomes calls of the JSON functions pg_duckdb
+ * declares and hands to DuckDB by name, answering as PostgreSQL does:
+ *   d #> '{a,0}'  json_extract(d, '/a/0'): a JSON Pointer token is an array index
+ *                 or an object key by what it meets, as a path element is. An
+ *                 element PostgreSQL also takes as an index and the pointer does
+ *                 not (-1, 01, +1) tries both, COALESCE(json_extract(d, -1),
+ *                 json_extract(d, '/-1')).
+ *   d #>> path    the same, with json_extract_string as the last step.
+ *   d ? 'k'       a top-level key, a top-level string element or the bare string:
+ *                 json_exists(d, '/k') OR json_contains(W(d), '{"\u0000":["k"]}')
+ *                 OR json_contains(W(d), '{"\u0000":"k"}').
+ *   d ?| / ?& ks  the ? test of each non-NULL key, ORed or ANDed.
+ *   l @> r        json_contains(W(l), W(r)), or W(l) holding [r] for a scalar r.
+ * W(x) is ('{"\u0000":' || x::text || '}')::json. json_contains matches its needle
+ * at any depth, and under a key no jsonb can hold, only at x's root. It compares
+ * numbers by kind, so an integer never matches the same value written as a
+ * decimal (documented). A key the pointer would take as an array index ("0", "-")
+ * is a quoted JSONPath key instead, which only an object has. The path or keys must
+ * be a constant when the rewrite runs, so an operator with a bound parameter in an
+ * operand is rewritten by the planner hook, which has the value (cf_json_operator).
+ */
+#define CF_JSON_ANCHOR "{\"\\u0000\":"
+
+/* A call of nsp.name, resolved as the parser resolves it. */
+static Node *
+cf_call(const char *nsp, const char *name, List *args)
+{
+    List *fname = list_make2(makeString(pstrdup(nsp)), makeString(pstrdup(name)));
+
+    return ParseFuncOrColumn(make_parsestate(NULL), fname, args, NULL,
+                             makeFuncCall(fname, args, COERCE_EXPLICIT_CALL, -1), false, -1);
+}
+
+/* A call of pg_duckdb's function `name`. */
+static Node *
+cf_duck_call(const char *name, List *args)
+{
+    return cf_call(get_namespace_name(get_extension_schema(get_extension_oid("pg_duckdb", false))),
+                   name, args);
+}
+
+/* x as json: a jsonb value is cast. */
+static Node *
+cf_as_json(Node *x)
+{
+    return exprType(x) == JSONOID ? x : cf_cast_via_io(x, JSONOID);
+}
+
+/* l op r, resolved as the parser resolves it. */
+static Node *
+cf_op(const char *op, Node *l, Node *r)
+{
+    return (Node *) make_op(make_parsestate(NULL),
+                            list_make2(makeString("pg_catalog"), makeString(pstrdup(op))),
+                            l, r, NULL, -1);
+}
+
+/* (open || x::text || close)::json */
+static Node *
+cf_json_wrap(const char *open, Node *x, const char *close)
+{
+    return cf_cast_via_io(cf_op("||", cf_op("||", cf_text_const(open), cf_cast_via_io(x, TEXTOID)),
+                                cf_text_const(close)),
+                          JSONOID);
+}
+
+/* True when a JSON Pointer token addresses an array element: "-", "0", "12". */
+static bool
+cf_pointer_index(const char *s)
+{
+    return strcmp(s, "-") == 0 || strcmp(s, "0") == 0 ||  /* nosemgrep */
+           (*s >= '1' && *s <= '9' && strspn(s, "0123456789") == strlen(s)); /* nosemgrep */
+}
+
+/* Append s as a JSON Pointer token, '~' and '/' escaped. */
+static void
+cf_pointer_token(StringInfo buf, const char *s)
+{
+    appendStringInfoChar(buf, '/');
+    for (; *s; s++)
+    {
+        if (*s == '~')
+            appendStringInfoString(buf, "~0");
+        else if (*s == '/')
+            appendStringInfoString(buf, "~1");
+        else
+            appendStringInfoChar(buf, *s);
+    }
+}
+
+/* d #> path, or d #>> path when as_text, for a path without a NULL element. */
+static Node *
+cf_json_path(Node *d, ArrayType *path, bool as_text)
+{
+    Datum         *elems;
+    bool          *nulls;
+    int            n;
+    int            i;
+    StringInfoData ptr;
+    Node          *cur = d;
+
+    deconstruct_array_builtin(path, TEXTOID, &elems, &nulls, &n);
+    initStringInfo(&ptr);
+    for (i = 0; i < n; i++)
+    {
+        char         *s  = TextDatumGetCString(elems[i]);
+        const char   *fn = (as_text && i == n - 1) ? "json_extract_string" : "json_extract";
+        char         *end;
+        int           idx;
+        CoalesceExpr *c;
+
+        errno = 0;
+        idx   = strtoint(s, &end, 10);
+        if (end == s || *end != '\0' || errno != 0 || cf_pointer_index(s))
+        {
+            cf_pointer_token(&ptr, s);
+            continue;
+        }
+        if (ptr.len > 0)
+            cur = cf_duck_call("json_extract", list_make2(cur, cf_text_const(ptr.data)));
+        resetStringInfo(&ptr);
+        cf_pointer_token(&ptr, s);
+        c = makeNode(CoalesceExpr);
+        c->args = list_make2(cf_duck_call(fn, list_make2(cur, makeConst(INT4OID, -1, InvalidOid,
+                                                                        sizeof(int32), Int32GetDatum(idx),
+                                                                        false, true))),
+                             cf_duck_call(fn, list_make2(copyObject(cur), cf_text_const(ptr.data))));
+        c->coalescetype   = exprType(linitial(c->args));
+        c->coalescecollid = exprCollation(linitial(c->args));
+        c->location       = -1;
+        cur = (Node *) c;
+        resetStringInfo(&ptr);
+    }
+    if (ptr.len > 0 || cur == d)
+        cur = cf_duck_call(as_text ? "json_extract_string" : "json_extract",
+                           list_make2(cur, cf_text_const(ptr.data)));
+    return as_text ? cf_cast_via_io(cur, TEXTOID) : cur;
+}
+
+/* d ? k */
+static Node *
+cf_json_has_key(Node *d, const char *k)
+{
+    StringInfoData path;
+    StringInfoData key;
+
+    initStringInfo(&path);
+    if (cf_pointer_index(k))
+        appendStringInfo(&path, "$.\"%s\"", k);
+    else
+        cf_pointer_token(&path, k);
+    initStringInfo(&key);
+    escape_json(&key, k);
+    return (Node *) makeBoolExpr(OR_EXPR, list_make3(
+        cf_duck_call("json_exists", list_make2(d, cf_text_const(path.data))),
+        cf_duck_call("json_contains",
+                     list_make2(cf_json_wrap(CF_JSON_ANCHOR, copyObject(d), "}"),
+                                cf_cast_via_io(cf_text_const(psprintf(CF_JSON_ANCHOR "[%s]}", key.data)),
+                                               JSONOID))),
+        cf_duck_call("json_contains",
+                     list_make2(cf_json_wrap(CF_JSON_ANCHOR, copyObject(d), "}"),
+                                cf_cast_via_io(cf_text_const(psprintf(CF_JSON_ANCHOR "%s}", key.data)),
+                                               JSONOID)))), -1);
+}
+
+/* d ?| keys, or d ?& keys when all. */
+static Node *
+cf_json_has_keys(Node *d, ArrayType *keys, bool all)
+{
+    Datum    *elems;
+    bool     *nulls;
+    int       n;
+    int       i;
+    List     *tests = NIL;
+    NullTest *t;
+
+    deconstruct_array_builtin(keys, TEXTOID, &elems, &nulls, &n);
+    for (i = 0; i < n; i++)
+        if (!nulls[i])
+            tests = lappend(tests, cf_json_has_key(copyObject(d), TextDatumGetCString(elems[i])));
+    if (tests != NIL)
+        return (Node *) makeBoolExpr(all ? AND_EXPR : OR_EXPR, tests, -1);
+    /* No key: false for ?| (d IS NULL AND NULL), true for ?& (d IS NOT NULL OR
+     * NULL), and NULL for a NULL document. */
+    t = makeNode(NullTest);
+    t->arg          = (Expr *) d;
+    t->nulltesttype = all ? IS_NOT_NULL : IS_NULL;
+    t->location     = -1;
+    return (Node *) makeBoolExpr(all ? OR_EXPR : AND_EXPR,
+                                 list_make2(t, makeBoolConst(false, true)), -1);
+}
+
+/* l @> r */
+static Node *
+cf_json_contains(Node *l, Node *r)
+{
+    Node *in_array = cf_duck_call("json_contains",
+                                  list_make2(cf_json_wrap(CF_JSON_ANCHOR, copyObject(l), "}"),
+                                             cf_json_wrap(CF_JSON_ANCHOR "[", copyObject(r), "]}")));
+    List *scalar   = list_make3(cf_op("<>", cf_duck_call("json_type", list_make1(copyObject(r))),
+                                      cf_text_const("OBJECT")),
+                                cf_op("<>", cf_duck_call("json_type", list_make1(copyObject(r))),
+                                      cf_text_const("ARRAY")),
+                                in_array);
+
+    return (Node *) makeBoolExpr(OR_EXPR, list_make2(
+        cf_duck_call("json_contains", list_make2(cf_json_wrap(CF_JSON_ANCHOR, l, "}"),
+                                                 cf_json_wrap(CF_JSON_ANCHOR, r, "}"))),
+        makeBoolExpr(AND_EXPR, scalar, -1)), -1);
+}
+
+/*
+ * The rewrite of a call of the function behind a json/jsonb operator DuckDB lacks,
+ * or NULL. opno is the operator the call came from, if any, to name in an error.
+ * The rewrite needs the value of an operand that holds a bound parameter. With
+ * defer, such a call becomes the json operator (#>, #>>) or a coldfront._jsonb_*
+ * stand-in, which survive the reparse, and the planner hook, which has the value,
+ * brings it back here (cf_json_waits).
+ */
+static Node *
+cf_json_operator(Oid funcid, Oid opno, List *args, Oid restype, bool defer)
+{
+    Oid         ns = get_func_namespace(funcid);
+    const char *f  = get_func_name(funcid);
+    bool        path;
+    bool        as_text;
+    bool        contains;
+    Const      *c;
+
+    if (list_length(args) != 2)
+        return NULL;
+    if (ns == get_namespace_oid("coldfront", true) && *f == '_')
+        f++;                                /* a stand-in for the function it names */
+    else if (ns != PG_CATALOG_NAMESPACE)
+        return NULL;
+    path     = strcmp(f, "json_extract_path") == 0 || strcmp(f, "jsonb_extract_path") == 0; /* nosemgrep */
+    as_text  = strcmp(f, "json_extract_path_text") == 0 ||                                 /* nosemgrep */
+               strcmp(f, "jsonb_extract_path_text") == 0;                                  /* nosemgrep */
+    contains = strcmp(f, "jsonb_contains") == 0 || strcmp(f, "jsonb_contained") == 0;      /* nosemgrep */
+    if (!path && !as_text && !contains && strcmp(f, "jsonb_exists") != 0 &&                /* nosemgrep */
+        strcmp(f, "jsonb_exists_any") != 0 && strcmp(f, "jsonb_exists_all") != 0)         /* nosemgrep */
+        return NULL;
+    if (strcmp(f, "jsonb_contained") == 0)  /* nosemgrep */
+    {
+        args = list_make2(lsecond(args), linitial(args));
+        f    = "jsonb_contains";
+    }
+    if (defer && has_extern_param_walker((Node *) args, NULL))
+    {
+        if (path || as_text)
+            return cf_op(as_text ? "#>>" : "#>", cf_as_json(linitial(args)), lsecond(args));
+        return cf_call("coldfront", psprintf("_%s", f),
+                       list_make2(cf_as_json(linitial(args)),
+                                  contains ? cf_as_json(lsecond(args)) : lsecond(args)));
+    }
+    args = (List *) eval_const_expressions(NULL, (Node *) copyObject(args));
+    if (contains)
+        return cf_json_contains(linitial(args), lsecond(args));
+    c = (Const *) lsecond(args);
+    if (!IsA(c, Const))
+        ereport(ERROR,
+                (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                 errmsg("%s on a tiered or decoupled view needs its path or key as a constant "
+                        "or a bound parameter",
+                        OidIsValid(opno) ? get_opname(opno) : f)));
+    if (c->constisnull ||
+        ((path || as_text) && array_contains_nulls(DatumGetArrayTypeP(c->constvalue))))
+        return (Node *) makeNullConst(restype, -1, InvalidOid);
+    if (path || as_text)
+        return cf_json_path(linitial(args), DatumGetArrayTypeP(c->constvalue), as_text);
+    if (strcmp(f, "jsonb_exists") == 0)     /* nosemgrep */
+        return cf_json_has_key(linitial(args), TextDatumGetCString(c->constvalue));
+    return cf_json_has_keys(linitial(args), DatumGetArrayTypeP(c->constvalue),
+                            strcmp(f, "jsonb_exists_all") == 0);  /* nosemgrep */
+}
+
 static Node *
 cf_json_builder_mutator(Node *node, void *ctx)
 {
@@ -1239,6 +1528,7 @@ cf_json_builder_mutator(Node *node, void *ctx)
     if (IsA(node, FuncExpr))
     {
         FuncExpr *f = (FuncExpr *) expression_tree_mutator(node, cf_json_builder_mutator, ctx);
+        Node     *rw;
 
         if (!f->funcvariadic &&
             cf_is_pg_catalog_func(f->funcid, "jsonb_build_object", "json_build_object"))
@@ -1246,6 +1536,13 @@ cf_json_builder_mutator(Node *node, void *ctx)
             cf_resolve_json_builder_oids();
             jc->changed = true;
             return cf_json_object(f->args);
+        }
+        if ((rw = cf_json_operator(f->funcid, InvalidOid, f->args, f->funcresulttype,
+                                   jc->defer)) != NULL)
+        {
+            assign_expr_collations(make_parsestate(NULL), rw);
+            jc->changed = true;
+            return rw;
         }
         return (Node *) f;
     }
@@ -1272,6 +1569,7 @@ cf_json_builder_mutator(Node *node, void *ctx)
     {
         OpExpr *op    = (OpExpr *) expression_tree_mutator(node, cf_json_builder_mutator, ctx);
         char   *fname = get_func_name(op->opfuncid);
+        Node   *rw;
 
         /* pg_duckdb hands an operator to DuckDB by its symbol. DuckDB has <=> and
          * <-> as aliases of its own list_cosine_distance and list_distance and has
@@ -1284,6 +1582,13 @@ cf_json_builder_mutator(Node *node, void *ctx)
             return (Node *) makeFuncExpr(op->opfuncid, op->opresulttype, op->args,
                                          op->opcollid, op->inputcollid,
                                          COERCE_EXPLICIT_CALL);
+        }
+        if ((rw = cf_json_operator(op->opfuncid, op->opno, op->args, op->opresulttype,
+                                   jc->defer)) != NULL)
+        {
+            assign_expr_collations(make_parsestate(NULL), rw);
+            jc->changed = true;
+            return rw;
         }
         return (Node *) op;
     }
@@ -3251,10 +3556,11 @@ cf_try_reroute_hot_read(Query *query)
 /*
  * Make a read DuckDB will run acceptable to it. A query against a tiered /
  * iceberg-only view runs entirely in DuckDB (the view body reads the Iceberg
- * table), which has no jsonb type, no date_bin, no JSON builders and no <#>
- * operator. Two passes over the analysed tree: the JSON builders and the <#>
- * operator are rewritten on the node tree (cf_json_builder_mutator, where
- * key/value pairing is exact and the operator's function is known), then the deparsed
+ * table), which has no jsonb type, no date_bin, no JSON builders, no <#> and none
+ * of the json/jsonb operators #>, #>>, ?, ?|, ?&, @>, <@. Two passes over the
+ * analysed tree: the JSON builders and those operators are rewritten on the node
+ * tree (cf_json_builder_mutator, where key/value pairing is exact and the
+ * operator's function and constant operand are known), then the deparsed
  * text gets the read whitelist (normalize_for_read: the ::jsonb cast and the
  * functions verified equivalent in both engines), and the result is reparsed in
  * place. Nothing to rewrite ⇒ the query is left untouched (the common case: ->>/->
@@ -3264,7 +3570,7 @@ cf_try_reroute_hot_read(Query *query)
 static void
 cf_normalize_read(Query *query)
 {
-    JsonBuilderCtx jc   = { false };
+    JsonBuilderCtx jc   = { false, true };
     Query         *tree = query_tree_mutator(query, cf_json_builder_mutator, &jc, 0);
     char          *sql  = pg_get_querydef(tree, false);
     char          *norm = normalize_for_read(sql);
@@ -6283,17 +6589,20 @@ register_gucs(void)
  * placeholders from their context (ts > $1), but not one that is a direct argument
  * of a DuckDB function with several overloads (time_bucket's origin) or any argument
  * of a table function (generate_series), so such a prepared tiered read fails to
- * plan. The values are known here: the plan cache hands the planner bound_params for
- * every custom plan, and a custom plan serves exactly that execution, so when a
- * parameter sits in one of those two places every parameter is folded to a Const
- * before pg_duckdb plans (what eval_const_expressions would do later for a
- * PostgreSQL plan). The generic-plan build carries no values; it is answered with a
- * PostgreSQL plan priced above any custom plan, so the cache keeps choosing the
- * value-bearing custom plans and never runs the generic one (plan_cache_mode =
- * force_generic_plan does run it, and pg_duckdb's read functions then refuse
- * PostgreSQL execution). A read whose parameters DuckDB types on its own is left
- * alone and keeps its generic plan. A DuckDB function is recognised as one the
- * pg_duckdb extension owns: every function it declares stands for a DuckDB one.
+ * plan, and a json operator the read rewrite kept for a parameter's value
+ * (cf_json_operator) cannot reach DuckDB until it is rewritten. The values are known
+ * here: the plan cache hands the planner bound_params for every custom plan, and a
+ * custom plan serves exactly that execution, so when a parameter sits in one of
+ * those three places every parameter is folded to a Const before pg_duckdb plans
+ * (what eval_const_expressions would do later for a PostgreSQL plan), and the read
+ * rewrite runs on the json operators it kept. The generic-plan build carries no
+ * values; it is answered with a PostgreSQL plan priced above any custom plan, so
+ * the cache keeps choosing the value-bearing custom plans and never runs the
+ * generic one (plan_cache_mode = force_generic_plan does run it, and pg_duckdb's
+ * read functions then refuse PostgreSQL execution). A read whose parameters DuckDB
+ * types on its own is left alone and keeps its generic plan. A DuckDB function is
+ * recognised as one the pg_duckdb extension owns: every function it declares stands
+ * for a DuckDB one.
  */
 #define CF_GENERIC_PLAN_COST 1.0e10
 
@@ -6319,7 +6628,26 @@ has_extern_param_walker(Node *node, void *ctx)
     return expression_tree_walker(node, has_extern_param_walker, ctx);
 }
 
-/* True if a PARAM_EXTERN sits where DuckDB cannot type a placeholder. */
+/* True for a call the read rewrite kept for its parameter's value: a
+ * coldfront._jsonb_* stand-in, or #> / #>> with an operand that holds a bound
+ * parameter (cf_json_operator). */
+static bool
+cf_json_waits(Oid funcid, List *args)
+{
+    Oid         ns = get_func_namespace(funcid);
+    const char *f  = get_func_name(funcid);
+
+    if (f == NULL)
+        return false;
+    if (ns == get_namespace_oid("coldfront", true))
+        return strncmp(f, "_jsonb_", 7) == 0;   /* nosemgrep */
+    return ns == PG_CATALOG_NAMESPACE &&
+           (strcmp(f, "json_extract_path") == 0 || strcmp(f, "json_extract_path_text") == 0) && /* nosemgrep */
+           has_extern_param_walker((Node *) args, NULL);
+}
+
+/* True if a PARAM_EXTERN sits where DuckDB cannot type a placeholder, or where the
+ * read rewrite needs its value. */
 static bool
 param_needs_value_walker(Node *node, void *ctx)
 {
@@ -6329,6 +6657,9 @@ param_needs_value_walker(Node *node, void *ctx)
         return false;
     if (IsA(node, Param))
         return nv->in_table_func && is_extern_param(node);
+    if ((IsA(node, OpExpr) && cf_json_waits(((OpExpr *) node)->opfuncid, ((OpExpr *) node)->args)) ||
+        (IsA(node, FuncExpr) && cf_json_waits(((FuncExpr *) node)->funcid, ((FuncExpr *) node)->args)))
+        return true;
     if (IsA(node, RangeTblEntry))
     {
         RangeTblEntry *rte = (RangeTblEntry *) node;
@@ -6404,7 +6735,8 @@ coldfront_planner(Query *parse, const char *query_string, int cursor_options,
         if (OidIsValid(nv.duckdb_ext) &&
             query_tree_walker(parse, param_needs_value_walker, &nv, QTW_EXAMINE_RTES_BEFORE))
         {
-            FoldParamsCtx fc = { bound_params };
+            FoldParamsCtx  fc = { bound_params };
+            JsonBuilderCtx jc = { false, false };
 
             if (bound_params == NULL)
             {
@@ -6414,6 +6746,7 @@ coldfront_planner(Query *parse, const char *query_string, int cursor_options,
                 return generic;
             }
             parse = query_tree_mutator(parse, fold_params_mutator, &fc, 0);
+            parse = query_tree_mutator(parse, cf_json_builder_mutator, &jc, 0);
         }
     }
     if (prev_planner_hook)

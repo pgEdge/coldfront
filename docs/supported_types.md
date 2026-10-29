@@ -102,12 +102,30 @@ also lacks) and `date_bin` on read: the builders become the `concat` /
 `to_json` / `array_agg` form both engines evaluate identically (the result
 is JSON-equal to jsonb's rendering, in compact form and in argument order),
 and `date_bin` becomes DuckDB's `time_bucket`, which takes the same
-arguments and agrees on every fixed-width bucket. The jsonb-only operators
-(`?`, `@>`, `<@`, `#>`, `#>>`) and most jsonb functions (`jsonb_typeof`,
-`jsonb_extract_path`, `jsonb_extract_path_text`, `jsonb_set`, `jsonb_path_*`,
-`jsonb_each`, `jsonb_object_keys`) are not supported on tiered or decoupled
-data: DuckDB either lacks them or its same-named function differs in
-signature or result. Reach into the document with `->`/`->>`.
+arguments and agrees on every fixed-width bucket.
+
+ColdFront also rewrites the JSON operators that DuckDB lacks into DuckDB's JSON
+functions, which return PostgreSQL's answers. The rewrite covers:
+
+- the `#>`, `#>>`, `?`, `?|`, `?&`, `@>` and `<@` operators.
+- the `json_extract_path` and `jsonb_extract_path` functions and their `_text`
+  forms.
+- the `jsonb_exists`, `jsonb_exists_any` and `jsonb_exists_all` functions.
+- the `jsonb_contains` and `jsonb_contained` functions.
+
+The path of `#>` and `#>>` and the keys of `?`, `?|` and `?&` must be constants
+or bound parameters, not columns. PostgreSQL has no `json` form of `?`, `?|`,
+`?&`, `@>` and `<@`, only a `jsonb` one. Cast the view's `json` column to
+`jsonb` first, as in `data::jsonb ? 'k'`. Two kinds of result differ from
+PostgreSQL's. DuckDB writes a returned container or number in its own form,
+such as `{"b":"c"}`, or `1.5` for `1.50`. The `->>` operator returns values in
+the same form. The `@>` and `<@` operators never match an integer against the
+same value written as a decimal. For example, a stored `{"p": 10.0}` does not
+contain `{"p": 10}`, because DuckDB compares JSON numbers by kind. ColdFront
+does not support most other jsonb functions on tiered or decoupled data, such
+as `jsonb_typeof`, `jsonb_set`, `jsonb_path_*`, `jsonb_each` and
+`jsonb_object_keys`. DuckDB either lacks these functions, or its function of
+the same name differs in signature or result.
 
 These limits apply only to reads that go through a tiered or iceberg-only view,
 which pg_duckdb plans entirely in DuckDB. Ordinary (non-tiered) PostgreSQL
@@ -120,9 +138,11 @@ their context (`ts > $1`); one that is a direct argument of a DuckDB function
 with several overloads (`time_bucket`'s origin, so `date_bin`'s) or any
 argument of a table function (`generate_series`) it cannot, so ColdFront plans
 such a read from the bound values on every execution instead of caching a
-generic plan. Under `plan_cache_mode = force_generic_plan` those reads cannot
-run: the forced generic plan has no values and fails with
-`only works with DuckDB execution`.
+generic plan. The rewrite of `#>`, `#>>`, `?`, `?|`, `?&`, `@>` and `<@` also
+needs the value of any parameter in an operand. ColdFront plans such a read
+from the bound values on every execution as well. Under
+`plan_cache_mode = force_generic_plan` those reads cannot run: the forced
+generic plan has no values and fails with `only works with DuckDB execution`.
 
 A hot-only read is the exception. When a `SELECT` reads a tiered view directly
 (no join, CTE, or sub-query) and its `WHERE` provably restricts to the hot

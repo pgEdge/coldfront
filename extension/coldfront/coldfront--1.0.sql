@@ -2671,6 +2671,22 @@ BEGIN
 END;
 $$;
 
+-- Stand-ins for the jsonb operators ?, ?|, ?& and @> on a read DuckDB runs when an
+-- operand holds a bound parameter. The read rewrite turns each operator into
+-- DuckDB's JSON functions and needs the operand's value to do so, which only the
+-- planner has; until then the stand-in keeps the rewritten read valid for
+-- PostgreSQL, which has these operators on jsonb alone where the read has json,
+-- and the planner hook rewrites it once the value is bound. Each body gives the
+-- operator's own answer.
+CREATE OR REPLACE FUNCTION coldfront._jsonb_exists(json, text)
+RETURNS boolean LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1::jsonb ? $2 $$;
+CREATE OR REPLACE FUNCTION coldfront._jsonb_exists_any(json, text[])
+RETURNS boolean LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1::jsonb ?| $2 $$;
+CREATE OR REPLACE FUNCTION coldfront._jsonb_exists_all(json, text[])
+RETURNS boolean LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1::jsonb ?& $2 $$;
+CREATE OR REPLACE FUNCTION coldfront._jsonb_contains(json, json)
+RETURNS boolean LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1::jsonb @> $2::jsonb $$;
+
 -- ============================================================================
 -- Canonical text. A value that leaves the caller's session as text (a cold
 -- write's rendered parameter, a streamed row's text column, a cold VARCHAR
