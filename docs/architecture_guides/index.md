@@ -552,12 +552,11 @@ The cross-cutting limitations are:
   branch cannot produce a PG `jsonb` directly. The view generator casts `jsonb`
   columns to DuckDB-safe `json` on both sides: hot emits `"col"::json`, cold
   emits `r['col']::json`, the UNION unifies on `json`. The `->>` and `->`
-  operators reach DuckDB unchanged. ColdFront's read rewrite turns `#>`, `#>>`,
-  `?`, `?|`, `?&`, `@>` and `<@` into DuckDB's JSON functions (see
-  [Supported Column Types](../supported_types.md)). The jsonb-only operators
-  need `data::jsonb` in the caller's query, because PostgreSQL has no `json`
-  form of them. Storage in Iceberg remains VARCHAR (Iceberg has no JSON type
-  either). The cold sink sends the incoming value as its text form.
+  operators reach DuckDB unchanged. ColdFront's read rewrite translates the
+  JSON operators that DuckDB lacks. For the operator list and the `data::jsonb`
+  cast rule, see [Supported Column Types](../supported_types.md). Storage in
+  Iceberg remains VARCHAR (Iceberg has no JSON type either). The cold sink
+  sends the incoming value as its text form.
 
 - Lakekeeper remote signing may not work with all S3-compatible stores; the
   workaround is `ACCESS_DELEGATION_MODE NONE` with a direct DuckDB S3 secret.
