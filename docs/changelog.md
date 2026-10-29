@@ -355,6 +355,18 @@ this project adheres to
   it, since DuckDB has `<=>` and `<->` as operators of its own and no `<#>`.
   The read now spells it as the function DuckDB has under the same name,
   `list_negative_inner_product`; `<=>` and `<->` are unchanged.
+- The JSON operators `#>`, `#>>`, `?`, `?|`, `?&`, `@>` and `<@` failed
+  whenever DuckDB ran a tiered or decoupled read. DuckDB has no JSON form of
+  these operators, so `#>` failed with "syntax error at or near #". The read
+  rewrite turned the documented `data::jsonb` cast into `json`, so `?` failed
+  with "operator does not exist: json ? text". The read rewrite now turns each
+  operator, and the function behind each operator, into DuckDB's JSON
+  functions. A path or key must be a constant or a bound parameter. ColdFront
+  plans a read from its bound values on every execution when a parameter is an
+  operand of these operators. The rewritten reads return PostgreSQL's answers
+  with two exceptions. DuckDB writes a returned container or number in its own
+  form. The `@>` and `<@` operators never match an integer against the same
+  value written as a decimal.
 - Once a `DROP COLUMN` returned a tiered table to an earlier schema, the next
   column change failed in the Iceberg mirror with "Attempted to add schema
   with id N, but this already exists in the table!" and rolled back the

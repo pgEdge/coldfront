@@ -489,6 +489,23 @@ EOSQL
     assert_eq "decoupled multi-row INSERT (3 rows)"     "3"    "$(extract MULTI "$O")"
     assert_eq "decoupled UPDATE visible"                "upd"  "$(extract UPD "$O")"
     assert_eq "decoupled DELETE visible (0 of id=2)"    "0"    "$(extract DEL "$O")"
+    # The json/jsonb operators DuckDB lacks on an iceberg-only view: a path into an
+    # array, and a key and containment test through the ::jsonb cast, the key also
+    # as a bound parameter.
+    O=$(qf "$HOST" <<'EOSQL'
+INSERT INTO iceonly VALUES (50,date_trunc('month',now()) + interval '10 hours 4 minutes 0 seconds','jsonops','{"k":1,"a":[1,2]}');
+SELECT 'OPS_PATH:'||(data #> '{a,0}')::text FROM iceonly WHERE id=50;
+SELECT 'OPS_HASKEY:'||count(*) FROM iceonly WHERE id=50 AND (data::jsonb) ? 'k';
+SELECT 'OPS_CONTAIN:'||((data::jsonb) @> '{"a":[2]}')::text FROM iceonly WHERE id=50;
+PREPARE ops_key(text) AS SELECT 'OPS_PKEY:'||count(*) FROM iceonly WHERE id=50 AND (data::jsonb) ? $1;
+EXECUTE ops_key('k');
+DELETE FROM iceonly WHERE id=50;
+EOSQL
+)
+    assert_eq "decoupled #> into an array"             "1"    "$(extract OPS_PATH "$O")"
+    assert_eq "decoupled ? through the ::jsonb cast"   "1"    "$(extract OPS_HASKEY "$O")"
+    assert_eq "decoupled @> through the ::jsonb cast"  "true" "$(extract OPS_CONTAIN "$O")"
+    assert_eq "decoupled ? with a bound key"           "1"    "$(extract OPS_PKEY "$O")"
     # PostgreSQL 17 and later allow MERGE into a view.
     if [ "$(q "$HOST" "SHOW server_version_num;")" -ge 170000 ]; then
         O=$(qf "$HOST" <<'EOSQL'
@@ -958,6 +975,19 @@ SELECT 'JSONB_HOT_M:'  || (data->>'m') FROM events WHERE ts >= date_trunc('month
 SELECT 'CAST_COLD:' || ((data::jsonb)->>'m') FROM events WHERE ts < date_trunc('month',now()) - interval '2 months' AND status='ok' ORDER BY ts LIMIT 1;
 SELECT 'CAST_HOT:'  || ((data::jsonb)->>'m') FROM events WHERE ts >= date_trunc('month',now()) - interval '2 months' AND status='ok' ORDER BY ts LIMIT 1;
 SELECT 'ALEN_COLD:' || jsonb_array_length('[10,20,30]'::jsonb) FROM events WHERE ts < date_trunc('month',now()) - interval '2 months' AND status='ok' ORDER BY ts LIMIT 1;
+-- The json/jsonb operators DuckDB lacks, rewritten into its JSON functions, on
+-- rows read from Iceberg.
+SELECT 'OP_PATH_COLD:'    || (data #>> '{m}') FROM events WHERE ts < date_trunc('month',now()) - interval '2 months' AND status='ok' ORDER BY ts LIMIT 1;
+SELECT 'OP_HASKEY_COLD:'  || count(*) FROM events WHERE ts < date_trunc('month',now()) - interval '2 months' AND (data::jsonb) ? 'm';
+SELECT 'OP_ANYKEY_COLD:'  || count(*) FROM events WHERE ts < date_trunc('month',now()) - interval '2 months' AND (data::jsonb) ?| '{zz,m}';
+SELECT 'OP_CONTAIN_COLD:' || count(*) FROM events WHERE ts < date_trunc('month',now()) - interval '2 months' AND (data::jsonb) @> '{"m":"m4"}';
+-- The same with the path, key or document as a bound parameter.
+PREPARE op_path(text[]) AS SELECT 'OP_PPATH_COLD:' || (data #>> $1) FROM events WHERE ts < date_trunc('month',now()) - interval '2 months' AND status='ok' ORDER BY ts LIMIT 1;
+PREPARE op_key(text) AS SELECT 'OP_PKEY_COLD:' || count(*) FROM events WHERE ts < date_trunc('month',now()) - interval '2 months' AND (data::jsonb) ? $1;
+PREPARE op_doc(jsonb) AS SELECT 'OP_PDOC_COLD:' || count(*) FROM events WHERE ts < date_trunc('month',now()) - interval '2 months' AND (data::jsonb) @> $1;
+EXECUTE op_path('{m}');
+EXECUTE op_key('m');
+EXECUTE op_doc('{"m":"m4"}');
 EOSQL
 )
     assert_eq "total rows (hot+cold via view)" "280"  "$(extract RO_TOTAL "$O")"
@@ -969,6 +999,13 @@ EOSQL
     assert_eq "::jsonb cast translated, cold" "m4" "$(extract CAST_COLD "$O")"
     assert_eq "::jsonb cast translated, hot"  "m2" "$(extract CAST_HOT "$O")"
     assert_eq "jsonb_array_length→json_array_length" "3" "$(extract ALEN_COLD "$O")"
+    assert_eq "#>> on cold rows"                       "m4"  "$(extract OP_PATH_COLD "$O")"
+    assert_eq "? on cold rows (m4+m3)"                 "180" "$(extract OP_HASKEY_COLD "$O")"
+    assert_eq "?| on cold rows (m4+m3)"                "180" "$(extract OP_ANYKEY_COLD "$O")"
+    assert_eq "@> on cold rows (m4 only)"              "100" "$(extract OP_CONTAIN_COLD "$O")"
+    assert_eq "#>> with a bound path on cold rows"     "m4"  "$(extract OP_PPATH_COLD "$O")"
+    assert_eq "? with a bound key on cold rows"        "180" "$(extract OP_PKEY_COLD "$O")"
+    assert_eq "@> with a bound document on cold rows"  "100" "$(extract OP_PDOC_COLD "$O")"
 
     # Hot-tier read routing: a read whose WHERE provably restricts to the hot tier
     # (ts >= the watermark) is rewritten to the hot heap and runs in plain PostgreSQL,
