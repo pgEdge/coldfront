@@ -3830,20 +3830,22 @@ story_mesh_dead_peer() {
             "$(q "$i" "SELECT count(*) FROM coldfront.peer_slots WHERE subscriber = coldfront._my_spock_node_name();")"
     done
 
-    # TC-276: a peer that has published no slot cannot be told from the others,
-    # so a claim refuses to run and names it, and the peer's ensure_replicated()
-    # publishes its slots again. The rows are removed on $HOST, and the removal
-    # replicates, as a peer that skipped the step has published nothing anywhere.
+    # TC-276: a peer whose slot this node does not hold cannot be told from the
+    # others, so a claim refuses to run and names it, and the peer's
+    # ensure_replicated() publishes its slots again. The rows are removed on
+    # $HOST alone, with the table out of its replication set for that one
+    # statement, which is the state of a node that lacks them. The republish is
+    # waited for on the peer's slots, not with a sleep.
     local p1name p1subs; p1name=$(q "$p1" "SELECT coldfront._my_spock_node_name();"); p1subs=$(q "$p1" "SELECT count(*) FROM spock.subscription;")
+    q "$HOST" "SELECT spock.repset_remove_table('default', 'coldfront.peer_slots'::regclass);" >/dev/null
     q "$HOST" "DELETE FROM coldfront.peer_slots WHERE subscriber = '$p1name';" >/dev/null
+    q "$HOST" "SELECT spock.repset_add_table('default', 'coldfront.peer_slots'::regclass, false);" >/dev/null
     out=$(q_may "$HOST" "$(cold_stmt dp276 3)")
-    assert_contains "TC-276: a cold write refuses to run while a peer has published no slot" "no published subscription slot for peer $p1name" "$out"
+    assert_contains "TC-276: a cold write refuses to run while a peer's slot is not held" "no published subscription slot for peer $p1name" "$out"
     assert_eq "TC-276: no row landed from the refused write" "0" "$(q "$HOST" "SELECT count(*) FROM $tbl WHERE status='dp276';")"
     q "$p1" "SELECT coldfront.ensure_replicated();" >/dev/null
-    for i in $(seq 1 40); do
-        [ "$(q "$HOST" "SELECT count(*) FROM coldfront.peer_slots WHERE subscriber = '$p1name';")" = "$p1subs" ] && break; sleep 0.5
-    done
-    assert_eq "TC-276: the peer's ensure_replicated() published its slots again (poll $i)" "$p1subs" \
+    q "$p1" "SET statement_timeout = '60s'; SELECT spock.wait_slot_confirm_lsn(NULL, NULL);" >/dev/null
+    assert_eq "TC-276: the peer's ensure_replicated() published its slots again" "$p1subs" \
         "$(q "$HOST" "SELECT count(*) FROM coldfront.peer_slots WHERE subscriber = '$p1name';")"
     out=$(q_may "$HOST" "$(cold_stmt dp276 4)")
     assert_eq "TC-276: the cold write runs once the slot is published" "" "$(echo "$out" | grep -i error)"

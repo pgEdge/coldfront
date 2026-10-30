@@ -246,8 +246,9 @@ CREATE TABLE IF NOT EXISTS coldfront.vector_centroids (
 -- pg_extension_config_dump marks their contents to be dumped. Deliberately NOT
 -- carried: coldfront.storage_secret (a credential — re-establish after restore
 -- with coldfront.set_storage_secret) and the bakery's claims / claim_acks /
--- deferred_acks / peer_slots (transient, per-node mesh state; a restored node
--- publishes its slots again in ensure_replicated).
+-- deferred_acks (transient, per-node mesh state). peer_slots is carried, where
+-- it is created: it is the mesh's topology, and a node restored without it
+-- would refuse every cold write until each peer published again.
 SELECT pg_extension_config_dump('coldfront.tiered_views', '');
 SELECT pg_extension_config_dump('coldfront.archive_watermark', '');
 SELECT pg_extension_config_dump('coldfront.partition_config', '');
@@ -3828,27 +3829,25 @@ CREATE TABLE coldfront.peer_slots (
     slot_name  name NOT NULL,
     PRIMARY KEY (subscriber, provider, slot_name)
 );
+SELECT pg_extension_config_dump('coldfront.peer_slots', '');
 
--- coldfront._publish_peer_slots: this node's rows of coldfront.peer_slots, one
--- per subscription in spock.subscription, keyed by the provider's node name. A
--- row whose subscription is gone is deleted. plpgsql, so the spock references
--- resolve at call time (see _my_spock_node_name).
+-- coldfront._publish_peer_slots: replaces this node's rows of
+-- coldfront.peer_slots with one per subscription in spock.subscription, keyed
+-- by the provider's node name. Deleting and inserting the rows, rather than
+-- inserting the missing ones, makes every call send them all again, so a peer
+-- that lacks them, one restored without them, say, gets them from this call.
+-- plpgsql, so the spock references resolve at call time (see
+-- _my_spock_node_name).
 CREATE FUNCTION coldfront._publish_peer_slots() RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
     my_name name := coldfront._my_spock_node_name();
 BEGIN
-    DELETE FROM coldfront.peer_slots ps
-     WHERE ps.subscriber = my_name
-       AND NOT EXISTS (SELECT 1 FROM spock.subscription s
-                         JOIN spock.node pn ON pn.node_id = s.sub_origin
-                        WHERE pn.node_name = ps.provider
-                          AND s.sub_slot_name = ps.slot_name);
+    DELETE FROM coldfront.peer_slots WHERE subscriber = my_name;
     INSERT INTO coldfront.peer_slots (subscriber, provider, slot_name)
     SELECT my_name, pn.node_name, s.sub_slot_name
       FROM spock.subscription s
-      JOIN spock.node pn ON pn.node_id = s.sub_origin
-    ON CONFLICT DO NOTHING;
+      JOIN spock.node pn ON pn.node_id = s.sub_origin;
 END $$;
 
 -- Deferred acks queue, LOCAL to each node (NOT replicated).  When a peer

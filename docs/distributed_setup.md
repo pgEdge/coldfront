@@ -154,8 +154,8 @@ each claim reads the window once.
 The call is the one ColdFront-specific step of the mesh setup. It adds nine
 tables to the node's replication sets (`claim_acks` to `default_insert_only`,
 the rest to `default`), each keyed by name, so a row is identical on every node
-and replicates by value, and it fills this node's rows of
-`coldfront.peer_slots` from `spock.subscription`:
+and replicates by value, and it replaces this node's rows of
+`coldfront.peer_slots` with one per row of `spock.subscription`:
 
 | Table | What replicates, and why a peer needs it |
 |---|---|
