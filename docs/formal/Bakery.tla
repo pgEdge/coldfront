@@ -32,6 +32,25 @@
 (*   so it never defers behind a released claim.  R-A is unchanged; only   *)
 (*   the implementation's atomicity differs.                              *)
 (*                                                                         *)
+(* AtomicAckCheck -- implementation atomicity, NOT a protocol change:      *)
+(*   PostgreSQL ships a commit to peers once its record is flushed and     *)
+(*   makes it visible on its own node a step later, so a peer's ack can    *)
+(*   reach the claimant while the claim's insert is still committing       *)
+(*   (BeginClaim puts the claim in `inflight`; ClaimVisible moves it into  *)
+(*   the node's view).  coldfront._on_ack_apply keeps an ack whose claim   *)
+(*   it cannot see only while the table's claim key, which _insert_claim   *)
+(*   holds to the end of its transaction, is still held.                   *)
+(*   AtomicAckCheck=FALSE reads the claim and then the key in two          *)
+(*   statements (ApplyEmit, ApplyKey): the insert can complete between     *)
+(*   them, so the trigger sees "not visible" then "key free" and drops a   *)
+(*   live ack -- the claimant waits for it forever.  AtomicAckCheck=TRUE   *)
+(*   takes the key (blocking) when the claim is not visible and reads the  *)
+(*   claim again under it, so "still not visible" means gone.  The         *)
+(*   direct ack path has the check; a forwarded ack (DrainForward and      *)
+(*   the reaper forwards) passes the same trigger, and for an in-flight    *)
+(*   claim its outcome under AtomicAckCheck is keep, which the model       *)
+(*   writes at once: the claimant reads acks only after ClaimVisible.      *)
+(*                                                                         *)
 (* SAME-NODE SERIALIZATION -- modelled directly by NodeParts + SameNodeLock.*)
 (* NodeParts partitions writers into nodes (many writers MAY share one), so *)
 (* claims are keyed by NODE and a writer clears the bakery only when BOTH   *)
@@ -54,7 +73,9 @@
 (*   LIVENESS:                                                            *)
 (*   - EventualProgress (every writer eventually decides): HOLDS under    *)
 (*     SafeAcks=TRUE (Bakery_fixed.cfg); VIOLATED under SafeAcks=FALSE *)
-(*     (Bakery_live.cfg) -- the dropped-ack wedge.                     *)
+(*     (Bakery_live.cfg) -- the dropped-ack wedge; VIOLATED under       *)
+(*     AtomicAckCheck=FALSE (Bakery_ack_race.cfg) -- the ack dropped    *)
+(*     while its claim commits.                                           *)
 (***************************************************************************)
 (* Execution privilege (protocol-neutral).  In the implementation the       *)
 (* coordination function _claim_iceberg_lock is SECURITY DEFINER             *)
@@ -133,7 +154,13 @@ CONSTANTS Writers,
                           \* (decide, then separately write) that drops acks — the bug.
                           \* The PROTOCOL (R-A) is identical either way; only the
                           \* implementation's atomicity differs.
-          Reaper,         \* the orphan reaper in coldfront._insert_claim: TRUE
+          AtomicAckCheck, \* coldfront._on_ack_apply on the claimant: TRUE reads the
+                          \* claim again under the table's claim key when it is not
+                          \* visible, so an ack is dropped only for a claim that is
+                          \* gone. FALSE reads the claim and then the key in two
+                          \* statements, between which the claim's insert can
+                          \* complete: a live ack is dropped and never comes again.
+          Reaper,       \* the orphan reaper in coldfront._insert_claim: TRUE
                           \* deletes same-node claims whose owner is gone in the SAME
                           \* statement that inserts our claim. Sound because the holder
                           \* of the node-local advisory xact lock is us: PG released the
@@ -172,6 +199,7 @@ ASSUME /\ Writers # {}
        /\ AsyncParquet  \in BOOLEAN
        /\ RestampPatch  \in BOOLEAN
        /\ SafeAcks      \in BOOLEAN
+       /\ AtomicAckCheck \in BOOLEAN
        /\ AdoptClaims   \in BOOLEAN
        /\ SameNodeLock  \in BOOLEAN
 
@@ -190,6 +218,12 @@ variables
   \* across nodes is the realistic spock behaviour, and R-A's deferred-ack
   \* mechanism compensates by gating min-equivalent on per-peer-node acks.
   claims = [nd \in Nodes |-> {}],
+
+  \* Per-NODE claims whose insert has flushed its commit record but has not
+  \* yet ended: the walsender ships the claim from here, so peers see it, while
+  \* a session on the node does not, and _insert_claim still holds the table's
+  \* claim key. ClaimVisible moves the claim into the node's view.
+  inflight = [nd \in Nodes |-> {}],
 
   \* Acks received per ticket.  A pair <<t, nd>> in `acks` means peer NODE
   \* nd has acked the claim with ticket t.  Models coldfront.claim_acks
@@ -267,7 +301,8 @@ define
   \* _on_claim_apply succeeds exactly when this is FALSE, which proves every
   \* same-node claim on that node is ownerless.
   HoldsTableLock(nd) ==
-    \E w \in nd : Live(w) /\ pc[w] \in {"WaitAcks", "RegisterUnderClaim",
+    \E w \in nd : Live(w) /\ pc[w] \in {"ClaimVisible", "WaitAcks",
+                                          "RegisterUnderClaim",
                                           "Prepare", "Decide",
                                           "Release", "DrainForward", "DrainDelete"}
 
@@ -276,9 +311,18 @@ define
   MyForwardable(self, t) ==
     { d \in deferred : d[1] = Nd(self) /\ d[3] = t }
 
-  \* A claim is live while its ticket is in its own node's view: that node
-  \* inserts it there first and removes it only at its release or reap.
-  ClaimLive(t) == \E nd \in Nodes : \E x \in claims[nd] : x.t = t /\ x.n = nd
+  \* A claim is live from the flush of its insert, when peers start to see it,
+  \* until its own node removes it at its release or reap.
+  ClaimLive(t) == \E nd \in Nodes :
+                    \E x \in claims[nd] \cup inflight[nd] : x.t = t /\ x.n = nd
+
+  \* The claim as a session on its own node sees it: coldfront._on_ack_apply's
+  \* read of coldfront.claims.
+  VisibleAtHome(t) == \E nd \in Nodes : \E x \in claims[nd] : x.t = t /\ x.n = nd
+
+  \* The claim's insert is between its flush and its end: _insert_claim still
+  \* holds the table's claim key.
+  InFlight(t) == \E nd \in Nodes : \E x \in inflight[nd] : x.t = t
 
   \* Safety properties (all HOLD).
   NoLakekeeperConflict ==
@@ -387,7 +431,7 @@ begin
     await Live(self) /\ \E p \in Writers : p # self /\ Live(p);
     await next_ticket <= MaxTickets;
     await (~ SameNodeLock)
-          \/ ~ \E x \in claims[Nd(self)] :
+          \/ ~ \E x \in claims[Nd(self)] \cup inflight[Nd(self)] :
                  x.n = Nd(self) /\ x.w # self /\ (Live(x.w) \/ ~ Reaper);
     with orphans = IF Reaper
                      THEN { x \in claims[Nd(self)] :
@@ -405,12 +449,24 @@ begin
                                  /\ ClaimLive(y[2]) } };
       deferred := { y \in deferred :
                       ~ (y[1] = Nd(self) /\ \E o \in orphans : y[3] = o.t) };
-      claims := [nd \in Nodes |->
-                   (claims[nd] \ orphans) \cup
-                   (IF nd = Nd(self)
-                      THEN {[w |-> self, t |-> my_ticket, n |-> Nd(self)]}
-                      ELSE {})];
+      claims := [nd \in Nodes |-> claims[nd] \ orphans];
+      \* The insert's commit record is flushed: peers are shipped the claim
+      \* from here, while this node's own sessions see it only at ClaimVisible.
+      inflight[Nd(self)] := inflight[Nd(self)] \cup
+                              {[w |-> self, t |-> my_ticket, n |-> Nd(self)]};
     end with;
+
+  ClaimVisible:
+    \* The insert's transaction ends: the claim becomes visible on its own node
+    \* and the claim key _insert_claim held is released. No Live guard: the
+    \* commit record is already flushed, so the row appears whether or not the
+    \* writer is still there (a terminate reaches the writer, blocked in PQexec,
+    \* only after the loopback has answered; a hard kill restarts the instance,
+    \* which recovers the commit).
+    claims[Nd(self)] := claims[Nd(self)] \cup
+                          {[w |-> self, t |-> my_ticket, n |-> Nd(self)]};
+    inflight[Nd(self)] := inflight[Nd(self)] \
+                            {[w |-> self, t |-> my_ticket, n |-> Nd(self)]};
 
   WaitAcks:
     \* Clear the bakery when I am BOTH the smallest active claim on my own node
@@ -518,7 +574,7 @@ end process;
 (*-----------------------------------------------------------------------*)
 fair process Applier = "applier"
 variables ap_dst = NoTicket, ap_ct = NoTicket, ap_defer = FALSE,
-          ap_behind = NoTicket;
+          ap_behind = NoTicket, ap_recheck = FALSE;
 begin
   ApplyLoop:
     while TRUE do
@@ -531,8 +587,12 @@ begin
       \* ap_behind is the smallest same-node pending claim the deferral keys to
       \* (ORDER BY ticket LIMIT 1 in the SQL).
       with src \in Nodes, dst \in Nodes do
-        await dst # src /\ NodeLive(dst);
-        with c \in { x \in claims[src] : x \notin claims[dst] /\ x.n = src } do
+        \* _on_claim_apply takes the table's claim key shared before it reads
+        \* dst's own claims, so it waits while a dst insert holds the key: an
+        \* in-flight dst claim is seen, and deferred behind, once visible.
+        await dst # src /\ NodeLive(dst) /\ inflight[dst] = {};
+        with c \in { x \in claims[src] \cup inflight[src] :
+                       x \notin claims[dst] /\ x.n = src } do
           \* Reaper, apply path: only when about to DEFER (a smaller same-node
           \* claim exists) and only when pg_try_advisory_xact_lock would succeed
           \* (no live writer on dst holds the table lock). Then every same-node
@@ -581,13 +641,41 @@ begin
             ELSE ap_defer)
       then
         deferred := deferred \cup { <<ap_dst, ap_ct, ap_behind>> };
-      elsif ClaimLive(ap_ct) then
-        \* The originator keeps an arriving ack only while the claim it answers
-        \* is still in its coldfront.claims (coldfront._on_ack_apply, a replica
-        \* trigger). An ack for a claim released or reaped since the apply
-        \* decided is dropped on arrival.
+      \* The ack reaches the originator, where coldfront._on_ack_apply (a replica
+      \* trigger) keeps it only while the claim it answers is in that node's
+      \* coldfront.claims: an ack for a claim released or reaped since the apply
+      \* decided is dropped on arrival.
+      elsif AtomicAckCheck then
+        \* A claim that is not visible is read again under the table's claim
+        \* key, which the claim's insert holds to its end: the step is enabled
+        \* once no insert of the claim is in flight, so "not visible" means gone.
+        await ~ InFlight(ap_ct);
+        if VisibleAtHome(ap_ct) then
+          acks := acks \cup { <<ap_ct, ap_dst>> };
+        end if;
+      elsif VisibleAtHome(ap_ct) then
+        \* The two-statement check, first statement: the claim is in the
+        \* claimant's view, the ack is kept.
+        acks := acks \cup { <<ap_ct, ap_dst>> };
+      elsif InFlight(ap_ct) then
+        \* Not visible while its insert is still committing: the second
+        \* statement reads the key in a later step (ApplyKey). Not visible and
+        \* not in flight is a claim that is gone: dropped here.
+        ap_recheck := TRUE;
+      end if;
+      if ~ ap_recheck then
+        goto ApplyLoop;
+      end if;
+
+    ApplyKey:
+      \* The second statement, pg_try_advisory_xact_lock_shared on the claim
+      \* key. Still held: the insert is still committing and the ack is kept.
+      \* Free: the ack is dropped, for a claim whose insert completed between
+      \* the two statements as much as for one that is gone.
+      if InFlight(ap_ct) then
         acks := acks \cup { <<ap_ct, ap_dst>> };
       end if;
+      ap_recheck := FALSE;
     end while;
 end process;
 
@@ -648,7 +736,10 @@ begin
           \* DELETE's own statement. A crash inside it aborts the DELETE too,
           \* which is a crash AT Release (allowed). A crash between the labels
           \* would leave claim-gone-but-deferral-stranded, unreachable in reality.
-          await ~ crashed[w] /\ pc[w] \notin {"DrainForward", "DrainDelete"}
+          \* ClaimVisible is excluded for the reason given there: the insert's
+          \* commit completes whatever happens to the writer, so a crash while it
+          \* commits is a crash at WaitAcks.
+          await ~ crashed[w] /\ pc[w] \notin {"ClaimVisible", "DrainForward", "DrainDelete"}
                 /\ (~ NodeRetries
                     \/ \E v \in Nd(w) : v # w /\ pc[v] \in {"Start", "Stage"});
           crashed[w] := TRUE;
@@ -661,9 +752,9 @@ begin
 end process;
 
 end algorithm; *)
-\* BEGIN TRANSLATION (chksum(pcal) = "42f061e9" /\ chksum(tla) = "adf5f930")
-VARIABLES pc, next_ticket, claims, acks, deferred, iceberg, decision, crashed, 
-          crash_budget, registered
+\* BEGIN TRANSLATION (chksum(pcal) = "b2909478" /\ chksum(tla) = "40ea0d99")
+VARIABLES pc, next_ticket, claims, inflight, acks, deferred, iceberg, 
+          decision, crashed, crash_budget, registered
 
 (* define statement *)
 Live(w)        == ~ crashed[w]
@@ -698,7 +789,8 @@ SmallestOnMyNode(self, t) ==
 
 
 HoldsTableLock(nd) ==
-  \E w \in nd : Live(w) /\ pc[w] \in {"WaitAcks", "RegisterUnderClaim",
+  \E w \in nd : Live(w) /\ pc[w] \in {"ClaimVisible", "WaitAcks",
+                                        "RegisterUnderClaim",
                                         "Prepare", "Decide",
                                         "Release", "DrainForward", "DrainDelete"}
 
@@ -709,7 +801,16 @@ MyForwardable(self, t) ==
 
 
 
-ClaimLive(t) == \E nd \in Nodes : \E x \in claims[nd] : x.t = t /\ x.n = nd
+ClaimLive(t) == \E nd \in Nodes :
+                  \E x \in claims[nd] \cup inflight[nd] : x.t = t /\ x.n = nd
+
+
+
+VisibleAtHome(t) == \E nd \in Nodes : \E x \in claims[nd] : x.t = t /\ x.n = nd
+
+
+
+InFlight(t) == \E nd \in Nodes : \E x \in inflight[nd] : x.t = t
 
 
 NoLakekeeperConflict ==
@@ -765,17 +866,19 @@ SurvivorProgress ==
     <>( crashed[w] \/ decision[w] \in {"committed", "rolled_back", "lk_409"} )
 
 VARIABLES my_ticket, my_pf, parent_seen, parent_staged, ap_dst, ap_ct, 
-          ap_defer, ap_behind
+          ap_defer, ap_behind, ap_recheck
 
-vars == << pc, next_ticket, claims, acks, deferred, iceberg, decision, 
-           crashed, crash_budget, registered, my_ticket, my_pf, parent_seen, 
-           parent_staged, ap_dst, ap_ct, ap_defer, ap_behind >>
+vars == << pc, next_ticket, claims, inflight, acks, deferred, iceberg, 
+           decision, crashed, crash_budget, registered, my_ticket, my_pf, 
+           parent_seen, parent_staged, ap_dst, ap_ct, ap_defer, ap_behind, 
+           ap_recheck >>
 
 ProcSet == (Writers) \cup {"applier"} \cup {"poker"} \cup {"crasher"}
 
 Init == (* Global variables *)
         /\ next_ticket = 1
         /\ claims = [nd \in Nodes |-> {}]
+        /\ inflight = [nd \in Nodes |-> {}]
         /\ acks = {}
         /\ deferred = {}
         /\ iceberg = << [w |-> 0, t |-> 0, parent |-> 0, kind |-> "initial"] >>
@@ -793,6 +896,7 @@ Init == (* Global variables *)
         /\ ap_ct = NoTicket
         /\ ap_defer = FALSE
         /\ ap_behind = NoTicket
+        /\ ap_recheck = FALSE
         /\ pc = [self \in ProcSet |-> CASE self \in Writers -> "Start"
                                         [] self = "applier" -> "ApplyLoop"
                                         [] self = "poker" -> "PokeLoop"
@@ -801,10 +905,11 @@ Init == (* Global variables *)
 Start(self) == /\ pc[self] = "Start"
                /\ Live(self)
                /\ pc' = [pc EXCEPT ![self] = "Stage"]
-               /\ UNCHANGED << next_ticket, claims, acks, deferred, iceberg, 
-                               decision, crashed, crash_budget, registered, 
-                               my_ticket, my_pf, parent_seen, parent_staged, 
-                               ap_dst, ap_ct, ap_defer, ap_behind >>
+               /\ UNCHANGED << next_ticket, claims, inflight, acks, deferred, 
+                               iceberg, decision, crashed, crash_budget, 
+                               registered, my_ticket, my_pf, parent_seen, 
+                               parent_staged, ap_dst, ap_ct, ap_defer, 
+                               ap_behind, ap_recheck >>
 
 Stage(self) == /\ pc[self] = "Stage"
                /\ Live(self)
@@ -813,10 +918,10 @@ Stage(self) == /\ pc[self] = "Stage"
                      ELSE /\ TRUE
                           /\ UNCHANGED parent_staged
                /\ pc' = [pc EXCEPT ![self] = "Preflight"]
-               /\ UNCHANGED << next_ticket, claims, acks, deferred, iceberg, 
-                               decision, crashed, crash_budget, registered, 
-                               my_ticket, my_pf, parent_seen, ap_dst, ap_ct, 
-                               ap_defer, ap_behind >>
+               /\ UNCHANGED << next_ticket, claims, inflight, acks, deferred, 
+                               iceberg, decision, crashed, crash_budget, 
+                               registered, my_ticket, my_pf, parent_seen, 
+                               ap_dst, ap_ct, ap_defer, ap_behind, ap_recheck >>
 
 Preflight(self) == /\ pc[self] = "Preflight"
                    /\ Live(self)
@@ -825,17 +930,17 @@ Preflight(self) == /\ pc[self] = "Preflight"
                          ELSE /\ TRUE
                               /\ my_pf' = my_pf
                    /\ pc' = [pc EXCEPT ![self] = "BeginClaim"]
-                   /\ UNCHANGED << next_ticket, claims, acks, deferred, 
-                                   iceberg, decision, crashed, crash_budget, 
-                                   registered, my_ticket, parent_seen, 
-                                   parent_staged, ap_dst, ap_ct, ap_defer, 
-                                   ap_behind >>
+                   /\ UNCHANGED << next_ticket, claims, inflight, acks, 
+                                   deferred, iceberg, decision, crashed, 
+                                   crash_budget, registered, my_ticket, 
+                                   parent_seen, parent_staged, ap_dst, ap_ct, 
+                                   ap_defer, ap_behind, ap_recheck >>
 
 BeginClaim(self) == /\ pc[self] = "BeginClaim"
                     /\ Live(self) /\ \E p \in Writers : p # self /\ Live(p)
                     /\ next_ticket <= MaxTickets
                     /\ (~ SameNodeLock)
-                       \/ ~ \E x \in claims[Nd(self)] :
+                       \/ ~ \E x \in claims[Nd(self)] \cup inflight[Nd(self)] :
                               x.n = Nd(self) /\ x.w # self /\ (Live(x.w) \/ ~ Reaper)
                     /\ LET orphans == IF Reaper
                                         THEN { x \in claims[Nd(self)] :
@@ -850,26 +955,37 @@ BeginClaim(self) == /\ pc[self] = "BeginClaim"
                                                        /\ ClaimLive(y[2]) } }
                          /\ deferred' = { y \in deferred :
                                             ~ (y[1] = Nd(self) /\ \E o \in orphans : y[3] = o.t) }
-                         /\ claims' = [nd \in Nodes |->
-                                         (claims[nd] \ orphans) \cup
-                                         (IF nd = Nd(self)
-                                            THEN {[w |-> self, t |-> my_ticket'[self], n |-> Nd(self)]}
-                                            ELSE {})]
-                    /\ pc' = [pc EXCEPT ![self] = "WaitAcks"]
+                         /\ claims' = [nd \in Nodes |-> claims[nd] \ orphans]
+                         /\ inflight' = [inflight EXCEPT ![Nd(self)] = inflight[Nd(self)] \cup
+                                                                         {[w |-> self, t |-> my_ticket'[self], n |-> Nd(self)]}]
+                    /\ pc' = [pc EXCEPT ![self] = "ClaimVisible"]
                     /\ UNCHANGED << iceberg, decision, crashed, crash_budget, 
                                     registered, my_pf, parent_seen, 
                                     parent_staged, ap_dst, ap_ct, ap_defer, 
-                                    ap_behind >>
+                                    ap_behind, ap_recheck >>
+
+ClaimVisible(self) == /\ pc[self] = "ClaimVisible"
+                      /\ claims' = [claims EXCEPT ![Nd(self)] = claims[Nd(self)] \cup
+                                                                  {[w |-> self, t |-> my_ticket[self], n |-> Nd(self)]}]
+                      /\ inflight' = [inflight EXCEPT ![Nd(self)] = inflight[Nd(self)] \
+                                                                      {[w |-> self, t |-> my_ticket[self], n |-> Nd(self)]}]
+                      /\ pc' = [pc EXCEPT ![self] = "WaitAcks"]
+                      /\ UNCHANGED << next_ticket, acks, deferred, iceberg, 
+                                      decision, crashed, crash_budget, 
+                                      registered, my_ticket, my_pf, 
+                                      parent_seen, parent_staged, ap_dst, 
+                                      ap_ct, ap_defer, ap_behind, ap_recheck >>
 
 WaitAcks(self) == /\ pc[self] = "WaitAcks"
                   /\ Live(self)
                      /\ SmallestOnMyNode(self, my_ticket[self])
                      /\ AllPeerNodesAcked(self, my_ticket[self])
                   /\ pc' = [pc EXCEPT ![self] = "RegisterUnderClaim"]
-                  /\ UNCHANGED << next_ticket, claims, acks, deferred, iceberg, 
-                                  decision, crashed, crash_budget, registered, 
-                                  my_ticket, my_pf, parent_seen, parent_staged, 
-                                  ap_dst, ap_ct, ap_defer, ap_behind >>
+                  /\ UNCHANGED << next_ticket, claims, inflight, acks, 
+                                  deferred, iceberg, decision, crashed, 
+                                  crash_budget, registered, my_ticket, my_pf, 
+                                  parent_seen, parent_staged, ap_dst, ap_ct, 
+                                  ap_defer, ap_behind, ap_recheck >>
 
 RegisterUnderClaim(self) == /\ pc[self] = "RegisterUnderClaim"
                             /\ Live(self)
@@ -878,12 +994,12 @@ RegisterUnderClaim(self) == /\ pc[self] = "RegisterUnderClaim"
                                   ELSE /\ TRUE
                                        /\ my_pf' = my_pf
                             /\ pc' = [pc EXCEPT ![self] = "Prepare"]
-                            /\ UNCHANGED << next_ticket, claims, acks, 
-                                            deferred, iceberg, decision, 
+                            /\ UNCHANGED << next_ticket, claims, inflight, 
+                                            acks, deferred, iceberg, decision, 
                                             crashed, crash_budget, registered, 
                                             my_ticket, parent_seen, 
                                             parent_staged, ap_dst, ap_ct, 
-                                            ap_defer, ap_behind >>
+                                            ap_defer, ap_behind, ap_recheck >>
 
 Prepare(self) == /\ pc[self] = "Prepare"
                  /\ Live(self)
@@ -891,10 +1007,11 @@ Prepare(self) == /\ pc[self] = "Prepare"
                        THEN /\ parent_seen' = [parent_seen EXCEPT ![self] = IcebergHead]
                        ELSE /\ parent_seen' = [parent_seen EXCEPT ![self] = parent_staged[self]]
                  /\ pc' = [pc EXCEPT ![self] = "Decide"]
-                 /\ UNCHANGED << next_ticket, claims, acks, deferred, iceberg, 
-                                 decision, crashed, crash_budget, registered, 
-                                 my_ticket, my_pf, parent_staged, ap_dst, 
-                                 ap_ct, ap_defer, ap_behind >>
+                 /\ UNCHANGED << next_ticket, claims, inflight, acks, deferred, 
+                                 iceberg, decision, crashed, crash_budget, 
+                                 registered, my_ticket, my_pf, parent_staged, 
+                                 ap_dst, ap_ct, ap_defer, ap_behind, 
+                                 ap_recheck >>
 
 Decide(self) == /\ pc[self] = "Decide"
                 /\ Live(self)
@@ -908,10 +1025,10 @@ Decide(self) == /\ pc[self] = "Decide"
                    \/ /\ decision' = [decision EXCEPT ![self] = "rolled_back"]
                       /\ UNCHANGED iceberg
                 /\ pc' = [pc EXCEPT ![self] = "Release"]
-                /\ UNCHANGED << next_ticket, claims, acks, deferred, crashed, 
-                                crash_budget, registered, my_ticket, my_pf, 
-                                parent_seen, parent_staged, ap_dst, ap_ct, 
-                                ap_defer, ap_behind >>
+                /\ UNCHANGED << next_ticket, claims, inflight, acks, deferred, 
+                                crashed, crash_budget, registered, my_ticket, 
+                                my_pf, parent_seen, parent_staged, ap_dst, 
+                                ap_ct, ap_defer, ap_behind, ap_recheck >>
 
 Release(self) == /\ pc[self] = "Release"
                  /\ Live(self)
@@ -923,43 +1040,44 @@ Release(self) == /\ pc[self] = "Release"
                        ELSE /\ TRUE
                             /\ UNCHANGED registered
                  /\ pc' = [pc EXCEPT ![self] = "DrainForward"]
-                 /\ UNCHANGED << next_ticket, deferred, iceberg, decision, 
-                                 crashed, crash_budget, my_ticket, my_pf, 
-                                 parent_seen, parent_staged, ap_dst, ap_ct, 
-                                 ap_defer, ap_behind >>
+                 /\ UNCHANGED << next_ticket, inflight, deferred, iceberg, 
+                                 decision, crashed, crash_budget, my_ticket, 
+                                 my_pf, parent_seen, parent_staged, ap_dst, 
+                                 ap_ct, ap_defer, ap_behind, ap_recheck >>
 
 DrainForward(self) == /\ pc[self] = "DrainForward"
                       /\ Live(self)
                       /\ acks' = (acks \cup { <<d[2], Nd(self)>> :
                                                 d \in { y \in MyForwardable(self, my_ticket[self]) : ClaimLive(y[2]) } })
                       /\ pc' = [pc EXCEPT ![self] = "DrainDelete"]
-                      /\ UNCHANGED << next_ticket, claims, deferred, iceberg, 
-                                      decision, crashed, crash_budget, 
+                      /\ UNCHANGED << next_ticket, claims, inflight, deferred, 
+                                      iceberg, decision, crashed, crash_budget, 
                                       registered, my_ticket, my_pf, 
                                       parent_seen, parent_staged, ap_dst, 
-                                      ap_ct, ap_defer, ap_behind >>
+                                      ap_ct, ap_defer, ap_behind, ap_recheck >>
 
 DrainDelete(self) == /\ pc[self] = "DrainDelete"
                      /\ Live(self)
                      /\ deferred' = { x \in deferred : ~ (x[1] = Nd(self) /\ x[3] = my_ticket[self]) }
                      /\ pc' = [pc EXCEPT ![self] = "Done"]
-                     /\ UNCHANGED << next_ticket, claims, acks, iceberg, 
-                                     decision, crashed, crash_budget, 
+                     /\ UNCHANGED << next_ticket, claims, inflight, acks, 
+                                     iceberg, decision, crashed, crash_budget, 
                                      registered, my_ticket, my_pf, parent_seen, 
                                      parent_staged, ap_dst, ap_ct, ap_defer, 
-                                     ap_behind >>
+                                     ap_behind, ap_recheck >>
 
 Writer(self) == Start(self) \/ Stage(self) \/ Preflight(self)
-                   \/ BeginClaim(self) \/ WaitAcks(self)
-                   \/ RegisterUnderClaim(self) \/ Prepare(self)
-                   \/ Decide(self) \/ Release(self) \/ DrainForward(self)
-                   \/ DrainDelete(self)
+                   \/ BeginClaim(self) \/ ClaimVisible(self)
+                   \/ WaitAcks(self) \/ RegisterUnderClaim(self)
+                   \/ Prepare(self) \/ Decide(self) \/ Release(self)
+                   \/ DrainForward(self) \/ DrainDelete(self)
 
 ApplyLoop == /\ pc["applier"] = "ApplyLoop"
              /\ \E src \in Nodes:
                   \E dst \in Nodes:
-                    /\ dst # src /\ NodeLive(dst)
-                    /\ \E c \in { x \in claims[src] : x \notin claims[dst] /\ x.n = src }:
+                    /\ dst # src /\ NodeLive(dst) /\ inflight[dst] = {}
+                    /\ \E c \in { x \in claims[src] \cup inflight[src] :
+                                    x \notin claims[dst] /\ x.n = src }:
                          LET orphans == IF Reaper
                                            /\ \E own \in claims[dst] : own.n = dst /\ own.t < c.t
                                            /\ ~ HoldsTableLock(dst)
@@ -982,28 +1100,53 @@ ApplyLoop == /\ pc["applier"] = "ApplyLoop"
                                                     {y \in claims'[dst] : y.n = dst /\ y.t < c.t} })
                                               ELSE NoTicket)
              /\ pc' = [pc EXCEPT !["applier"] = "ApplyEmit"]
-             /\ UNCHANGED << next_ticket, iceberg, decision, crashed, 
+             /\ UNCHANGED << next_ticket, inflight, iceberg, decision, crashed, 
                              crash_budget, registered, my_ticket, my_pf, 
-                             parent_seen, parent_staged >>
+                             parent_seen, parent_staged, ap_recheck >>
 
 ApplyEmit == /\ pc["applier"] = "ApplyEmit"
              /\ IF (IF SafeAcks
                       THEN \E own \in claims[ap_dst] : own.n = ap_dst /\ own.t < ap_ct
                       ELSE ap_defer)
                    THEN /\ deferred' = (deferred \cup { <<ap_dst, ap_ct, ap_behind>> })
-                        /\ acks' = acks
-                   ELSE /\ IF ClaimLive(ap_ct)
-                              THEN /\ acks' = (acks \cup { <<ap_ct, ap_dst>> })
-                              ELSE /\ TRUE
-                                   /\ acks' = acks
+                        /\ UNCHANGED << acks, ap_recheck >>
+                   ELSE /\ IF AtomicAckCheck
+                              THEN /\ ~ InFlight(ap_ct)
+                                   /\ IF VisibleAtHome(ap_ct)
+                                         THEN /\ acks' = (acks \cup { <<ap_ct, ap_dst>> })
+                                         ELSE /\ TRUE
+                                              /\ acks' = acks
+                                   /\ UNCHANGED ap_recheck
+                              ELSE /\ IF VisibleAtHome(ap_ct)
+                                         THEN /\ acks' = (acks \cup { <<ap_ct, ap_dst>> })
+                                              /\ UNCHANGED ap_recheck
+                                         ELSE /\ IF InFlight(ap_ct)
+                                                    THEN /\ ap_recheck' = TRUE
+                                                    ELSE /\ TRUE
+                                                         /\ UNCHANGED ap_recheck
+                                              /\ acks' = acks
                         /\ UNCHANGED deferred
-             /\ pc' = [pc EXCEPT !["applier"] = "ApplyLoop"]
-             /\ UNCHANGED << next_ticket, claims, iceberg, decision, crashed, 
-                             crash_budget, registered, my_ticket, my_pf, 
-                             parent_seen, parent_staged, ap_dst, ap_ct, 
+             /\ IF ~ ap_recheck'
+                   THEN /\ pc' = [pc EXCEPT !["applier"] = "ApplyLoop"]
+                   ELSE /\ pc' = [pc EXCEPT !["applier"] = "ApplyKey"]
+             /\ UNCHANGED << next_ticket, claims, inflight, iceberg, decision, 
+                             crashed, crash_budget, registered, my_ticket, 
+                             my_pf, parent_seen, parent_staged, ap_dst, ap_ct, 
                              ap_defer, ap_behind >>
 
-Applier == ApplyLoop \/ ApplyEmit
+ApplyKey == /\ pc["applier"] = "ApplyKey"
+            /\ IF InFlight(ap_ct)
+                  THEN /\ acks' = (acks \cup { <<ap_ct, ap_dst>> })
+                  ELSE /\ TRUE
+                       /\ acks' = acks
+            /\ ap_recheck' = FALSE
+            /\ pc' = [pc EXCEPT !["applier"] = "ApplyLoop"]
+            /\ UNCHANGED << next_ticket, claims, inflight, deferred, iceberg, 
+                            decision, crashed, crash_budget, registered, 
+                            my_ticket, my_pf, parent_seen, parent_staged, 
+                            ap_dst, ap_ct, ap_defer, ap_behind >>
+
+Applier == ApplyLoop \/ ApplyEmit \/ ApplyKey
 
 PokeLoop == /\ pc["poker"] = "PokeLoop"
             /\ Reaper
@@ -1029,17 +1172,17 @@ PokeLoop == /\ pc["poker"] = "PokeLoop"
                                              ~ (y[1] = dst /\ \E o \in orphans : y[3] = o.t) }
                           /\ claims' = [nd \in Nodes |-> claims[nd] \ orphans]
             /\ pc' = [pc EXCEPT !["poker"] = "PokeLoop"]
-            /\ UNCHANGED << next_ticket, iceberg, decision, crashed, 
+            /\ UNCHANGED << next_ticket, inflight, iceberg, decision, crashed, 
                             crash_budget, registered, my_ticket, my_pf, 
                             parent_seen, parent_staged, ap_dst, ap_ct, 
-                            ap_defer, ap_behind >>
+                            ap_defer, ap_behind, ap_recheck >>
 
 Poker == PokeLoop
 
 CrashLoop == /\ pc["crasher"] = "CrashLoop"
              /\ IF crash_budget > 0
                    THEN /\ \/ /\ \E w \in Writers:
-                                   /\ ~ crashed[w] /\ pc[w] \notin {"DrainForward", "DrainDelete"}
+                                   /\ ~ crashed[w] /\ pc[w] \notin {"ClaimVisible", "DrainForward", "DrainDelete"}
                                       /\ (~ NodeRetries
                                           \/ \E v \in Nd(w) : v # w /\ pc[v] \in {"Start", "Stage"})
                                    /\ crashed' = [crashed EXCEPT ![w] = TRUE]
@@ -1049,10 +1192,10 @@ CrashLoop == /\ pc["crasher"] = "CrashLoop"
                         /\ pc' = [pc EXCEPT !["crasher"] = "CrashLoop"]
                    ELSE /\ pc' = [pc EXCEPT !["crasher"] = "Done"]
                         /\ UNCHANGED << crashed, crash_budget >>
-             /\ UNCHANGED << next_ticket, claims, acks, deferred, iceberg, 
-                             decision, registered, my_ticket, my_pf, 
+             /\ UNCHANGED << next_ticket, claims, inflight, acks, deferred, 
+                             iceberg, decision, registered, my_ticket, my_pf, 
                              parent_seen, parent_staged, ap_dst, ap_ct, 
-                             ap_defer, ap_behind >>
+                             ap_defer, ap_behind, ap_recheck >>
 
 Crasher == CrashLoop
 

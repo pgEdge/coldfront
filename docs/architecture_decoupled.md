@@ -568,7 +568,9 @@ pointing at the same Lakekeeper endpoint and S3 bucket:
       acks, and an ack lives exactly as long as the claim it answers: the
       originator keeps an arriving ack only while that claim is still in its
       `coldfront.claims` (a late ack from a peer that was ruled dead, or for an
-      orphan already reaped, is dropped on arrival), every node drops its
+      orphan already reaped, is dropped on arrival, and one that arrives while
+      the claim's insert is still committing waits for the insert to end
+      before it is read), every node drops its
       copies of a claim's acks when the claim's `DELETE` reaches it, and a
       deferred ack is forwarded only while its claim still exists. The table
       is in Spock's `default_insert_only` set, so each node deletes only the

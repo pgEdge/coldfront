@@ -4122,41 +4122,65 @@ SQL
 
 # ───────────────────────────────────────────────────────────────────────────
 # Story (mesh): an ack that arrives while its claim's insert is still committing
-# on the claimant is kept. PostgreSQL ships a commit to peers once its record is
-# flushed and makes it visible on its own node a step later, so a peer's ack can
-# reach the claimant before the claimant can see its own claim row; an ack
-# dropped then never comes again, and the writer waits for it for good. The
-# window is held open here: a session takes the table's claim key and inserts a
-# claim for this node's ticket, as _insert_claim does, and pauses instead of
-# committing while a peer sends an ack for that ticket.
+# on the claimant is decided once the insert has ended. PostgreSQL ships a
+# commit to peers once its record is flushed and makes it visible on its own
+# node a step later, so a peer's ack can reach the claimant before the claimant
+# can see its own claim row; an ack dropped then never comes again, and the
+# writer waits for it for good. _on_ack_apply therefore waits for the table's
+# claim key, which the insert holds to its end, and reads the claim again under
+# it. The window is held open here: a session takes the key and inserts a claim
+# for this node's ticket, as _insert_claim does, while a peer sends an ack for
+# that ticket. The holder is the one vantage point for "before the insert
+# ended": it watches for a session waiting on its key and for the ack's row,
+# reports which it saw, and commits.
 # ───────────────────────────────────────────────────────────────────────────
 story_mesh_ack_in_flight() {
-    step "TC-274: a peer's ack that arrives before the claim is visible on its node is kept"
+    step "TC-274: a peer's ack that arrives before the claim is visible on its node waits for the insert, then is kept"
     local PARR; read -ra PARR <<< "$PEERS"
     [ "${#PARR[@]}" -ge 1 ] || { fail "mesh: no --peers given"; return; }
-    local p1="${PARR[0]}" ref='"ice"."public"."ackprobe"' ticket peer i
+    local p1="${PARR[0]}" ref='"ice"."public"."ackprobe"' ticket peer i key seen
     peer=$(q "$p1" "SELECT coldfront._my_spock_node_name();")
     ticket=$(q "$HOST" "SELECT snowflake.nextval();")
+    key="hashtext('coldfront_claim:$ref')::bigint & 4294967295"
+    # The holder commits once a session waits on its key or the ack's row is
+    # there (20 s at most), and reports both facts as it saw them just before.
     qf "$HOST" >"$TMPD/ackprobe.log" 2>&1 <<EOSQL &
 BEGIN;
 SELECT pg_advisory_xact_lock(hashtext('coldfront_claim:$ref'));
 INSERT INTO coldfront.claims (iceberg_table, ticket) VALUES ('$ref', $ticket);
-SELECT pg_sleep(10);
+DO \$\$
+DECLARE i int := 0; waiter boolean; rows int;
+BEGIN
+    LOOP
+        waiter := EXISTS (SELECT 1 FROM pg_locks
+                           WHERE locktype = 'advisory' AND NOT granted AND objid = $key);
+        rows := (SELECT count(*) FROM coldfront.claim_acks WHERE ticket = $ticket);
+        EXIT WHEN waiter OR rows > 0 OR i >= 400;
+        PERFORM pg_sleep(0.05);
+        i := i + 1;
+    END LOOP;
+    RAISE NOTICE 'tc274 waiter=% rows=%', waiter::int, rows;
+END \$\$;
 COMMIT;
 EOSQL
     local holder=$!
     for i in $(seq 1 40); do
-        [ "$(q "$HOST" "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted AND objid = hashtext('coldfront_claim:$ref')::bigint & 4294967295;")" = "1" ] && break
+        [ "$(q "$HOST" "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND granted AND objid = $key;")" = "1" ] && break
         sleep 0.25
     done
     q "$p1" "INSERT INTO coldfront.claim_acks (ticket, ack_from_name, iceberg_table) VALUES ($ticket, '$peer', '$ref');" >/dev/null
-    for i in $(seq 1 32); do
-        [ "$(q "$HOST" "SELECT count(*) FROM coldfront.claim_acks WHERE ticket = $ticket;")" = "1" ] && break
+    wait "$holder"
+    seen=$(grep -o 'tc274 waiter=[01] rows=[0-9]*' "$TMPD/ackprobe.log")
+    assert_eq "TC-274: the ack waits on the claim key while the claim's insert is still committing" "1" \
+        "$(echo "$seen" | sed -n 's/.*waiter=\([01]\).*/\1/p')"
+    assert_eq "TC-274: and is not on the claimant before the insert has ended" "0" \
+        "$(echo "$seen" | sed -n 's/.*rows=\([0-9]*\).*/\1/p')"
+    for i in $(seq 1 40); do
+        [ "$(q "$HOST" "SELECT count(*) FROM coldfront.claim_acks WHERE ticket = $ticket AND ack_from_name = '$peer';")" = "1" ] && break
         sleep 0.25
     done
-    assert_eq "TC-274: the ack that arrived while the claim was committing is on the claimant" "1" \
+    assert_eq "TC-274: the ack is on the claimant once the insert has ended" "1" \
         "$(q "$HOST" "SELECT count(*) FROM coldfront.claim_acks WHERE ticket = $ticket AND ack_from_name = '$peer';")"
-    wait "$holder"
     q "$HOST" "DELETE FROM coldfront.claims WHERE ticket = $ticket;" >/dev/null
 }
 
@@ -8300,7 +8324,7 @@ story_drop_iceberg_table   # both modes, purge and keep-files (own throwaway tab
 [ "$MESH" = 1 ] && [ "$MODE" = decoupled ] && story_mesh   # tiered+mesh runs story_mesh_tiered (above)
 [ "$MESH" = 1 ] && story_mesh_multiwriter   # >1 cold writer/node cross-node (tiered: events, decoupled: iceonly)
 [ "$MESH" = 1 ] && story_mesh_reaper        # orphan claims/acks reaped on the claim, apply and poke paths
-[ "$MESH" = 1 ] && story_mesh_ack_in_flight # TC-274: an ack arriving before its claim is visible on the claimant is kept
+[ "$MESH" = 1 ] && story_mesh_ack_in_flight # TC-274: an ack arriving before its claim is visible on the claimant waits for the insert, then is kept
 [ "$MESH" = 1 ] && story_mesh_claim_failures  # a failed claim step leaves no lock, claim or open loopback
 [ "$MESH" = 1 ] && story_mesh_dead_peer  # TC-221..223: a wal_sender_timeout the window does not cover is refused, idle replies inside the window, a silent peer ruled dead and rejoining
 [ -n "$STANDBY" ]    && story_standby_reads

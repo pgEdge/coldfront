@@ -4029,12 +4029,14 @@ ALTER TABLE coldfront.claims ENABLE REPLICA TRIGGER coldfront_claim_apply;
 -- peer ruled dead acks the claims it missed once it catches up, and an orphan's
 -- ack can arrive after the reap. PostgreSQL ships a commit to peers once its
 -- record is flushed and makes it visible on its own node a step later, so a
--- peer's ack can arrive while this node's claim insert is still committing;
--- _insert_claim holds the table's claim key from before the ticket until that
--- transaction has ended, so an ack whose claim is not visible is dropped only
--- when the key is free. A late ack that arrives while a later claim's insert
--- holds the key is kept, and the next claim's cleanup removes it. Modelled in
--- docs/formal/Bakery.tla (ClaimLive, NoAckOutlivesClaim).
+-- peer's ack can arrive while this node's claim insert is still committing. An
+-- ack whose claim is not visible therefore waits for the table's claim key,
+-- which _insert_claim holds from before the ticket until its transaction has
+-- ended, and reads the claim again under it: a commit makes its row visible
+-- before it releases the key, so a claim still absent then is gone. The wait
+-- is the rest of a commit already under way, and an ack whose claim is visible
+-- takes no lock. Modelled in docs/formal/Bakery.tla (AtomicAckCheck,
+-- NoAckOutlivesClaim).
 CREATE FUNCTION coldfront._on_ack_apply() RETURNS trigger
 LANGUAGE plpgsql AS $$
 BEGIN
@@ -4042,7 +4044,8 @@ BEGIN
         RETURN NULL;
     END IF;
     IF NOT EXISTS (SELECT 1 FROM coldfront.claims WHERE ticket = NEW.ticket) THEN
-        IF pg_try_advisory_xact_lock_shared(hashtext('coldfront_claim:' || NEW.iceberg_table)) THEN
+        PERFORM pg_advisory_xact_lock_shared(hashtext('coldfront_claim:' || NEW.iceberg_table));
+        IF NOT EXISTS (SELECT 1 FROM coldfront.claims WHERE ticket = NEW.ticket) THEN
             RETURN NULL;
         END IF;
     END IF;

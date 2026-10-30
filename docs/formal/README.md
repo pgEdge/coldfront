@@ -29,6 +29,7 @@ an explicit applier. The following table describes its files and their roles:
 | `Bakery_crash.cfg` | This config checks 3 writers with a budget of 1 crash, in stock ordering (crash safety is ordering-independent). The safety invariants still hold, and survivors proceed, because the dead-peer escape treats a crashed node as already acked. This config checks safety only; stranding under a crash appears only with same-node writers (`Bakery_wedge.cfg`). |
 | `Bakery_live.cfg` | This config checks the defer/drain race (`SafeAcks=FALSE`), the non-atomic implementation. `EventualProgress` is EXPECTED to be VIOLATED: a deferred ack written behind a just-released claim is dropped, stranding the min-ticket holder at `WaitAcks` forever, which is the N-writer wedge this race produces. The four safety invariants still HOLD (a dropped ack is a liveness failure, not a wrong commit). The config declares no `SYMMETRY`, because symmetry reduction is unsound with liveness checking. |
 | `Bakery_fixed.cfg` | This config checks the fix (`SafeAcks=TRUE`), the atomic defer/drain (`FOR UPDATE` on the claim row). `EventualProgress` HOLDS *and* all four safety invariants hold, which is the formal proof that the fix restores liveness without weakening safety. |
+| `Bakery_ack_race.cfg` | This config checks the two-statement ack arrival check (`AtomicAckCheck=FALSE`): `coldfront._on_ack_apply` reads the claim, then the table's claim key, and the claim's insert can complete between the two. `EventualProgress` is EXPECTED to be VIOLATED: an ack that arrives while its claim is still committing is dropped although the claim is live, and the claimant waits for it forever. The four safety invariants still HOLD. `Bakery_fixed.cfg` (`AtomicAckCheck=TRUE`, the claim read again under the key) checks the fix. |
 | `Bakery_samenode_race.cfg` | This config checks multiple cold writers per node with no same-node lock (`NodeParts={{a1,a2},{b1}}`, `SameNodeLock=FALSE`). Two same-node claims `a1<a2` below a peer's `b1`: the node defers `b1` behind its smallest same-node claim `a1` and, on `a1`'s release, forwards the ack for `b1` without re-deferring behind `a2` (still held, still `< b1`), so `a2` and `b1` both clear the bakery. `NoLakekeeperConflict` is EXPECTED to be violated, which reproduces the multi-writer-per-node race in the model. |
 | `Bakery_samenode.cfg` | This config checks the fix (`SameNodeLock=TRUE`): `coldfront._claim_iceberg_lock`'s node-local advisory xact lock, so at most one same-node writer is in the bakery at a time. `a1` and `a2` never coexist; the topology collapses to one active claim per node and all four safety invariants HOLD, which is the formal proof that the node-local lock is mandatory for multi-writer-per-node cold writes. |
 | `Bakery_wedge.cfg` | This config checks the orphan-claim wedge with the reaper OFF (`Reaper=FALSE`, `NodeParts={{a1,a2},{b1}}`, 1 crash). A same-node writer crashes holding its claim; its row stays in `coldfront.claims` with no owner. `SurvivorProgress` is EXPECTED to be violated: the surviving writer never decides. Safety still holds. This is the first config to check liveness under crash at all; `Bakery_crash.cfg` checks only safety. |
@@ -82,7 +83,11 @@ TLC checks these properties as `PROPERTIES`:
   themselves crash mid-bakery (they can never decide). `EventualProgress` is
   also the defer/drain race check: `Bakery_fixed.cfg` (`SafeAcks=TRUE`) HOLDS
   it; `Bakery_live.cfg` (`SafeAcks=FALSE`) VIOLATES it - the dropped-ack wedge
-  that strands the min-ticket holder at `WaitAcks` forever.
+  that strands the min-ticket holder at `WaitAcks` forever. It is the ack
+  arrival check too: `Bakery_ack_race.cfg` (`AtomicAckCheck=FALSE`) VIOLATES
+  it, an ack that arrives while its claim's insert is still committing is
+  dropped by the two-statement check and the claimant waits for it forever;
+  `Bakery_fixed.cfg` (`AtomicAckCheck=TRUE`) HOLDS it.
 - `SurvivorProgress` states that every writer eventually decides *or crashes*.
   `EventualProgress` is unusable with `MaxCrashes > 0`, since a crashed writer
   never decides; this is the form a crash config can check. `Bakery_wedge.cfg`
@@ -138,6 +143,13 @@ java -cp $TLA tlc2.TLC -workers auto -deadlock -config Bakery_live.cfg Bakery.tl
 # f. This run checks the fix (SafeAcks=TRUE, FOR UPDATE on the claim row).
 #       All hold: EventualProgress AND the four safety invariants.
 java -cp $TLA tlc2.TLC -workers auto -deadlock -config Bakery_fixed.cfg Bakery.tla
+
+# f2. This run checks the two-statement ack arrival check
+#       (AtomicAckCheck=FALSE).  EXPECTED FAILURE: EventualProgress is
+#       violated, an ack that arrives while its claim's insert is still
+#       committing is dropped and the claimant waits for it forever.
+#       Bakery_fixed.cfg (AtomicAckCheck=TRUE) checks the fix.
+java -cp $TLA tlc2.TLC -workers auto -deadlock -config Bakery_ack_race.cfg Bakery.tla
 
 # g. This run checks multiple cold writers per node with NO same-node lock
 #      (SameNodeLock=FALSE).  It is EXPECTED to violate NoLakekeeperConflict,
@@ -196,7 +208,7 @@ The stock-ordering config reports a clean check with the following output:
 
 ```text
 Model checking completed. No error has been found.
-116332 states generated, 38570 distinct states found, 0 states left on queue.
+159115 states generated, 49872 distinct states found, 0 states left on queue.
 ```
 
 All four safety invariants hold for the stock ordering (parquet staged inside
@@ -210,7 +222,7 @@ The patched-async config reports a clean check with the following output:
 
 ```text
 Model checking completed. No error has been found.
-339258 states generated, 113262 distinct states found, 0 states left on queue.
+448701 states generated, 142140 distinct states found, 0 states left on queue.
 ```
 
 The patched async ordering - parquet staged OUTSIDE the claim, parent
@@ -227,7 +239,7 @@ with the following output:
 
 ```text
 Model checking completed. No error has been found.
-568475 states generated, 194964 distinct states found, 0 states left on queue.
+698917 states generated, 231400 distinct states found, 0 states left on queue.
 ```
 
 Two writers on one node stage their parquet concurrently, outside the claim;
@@ -244,7 +256,7 @@ output:
 
 ```text
 Model checking completed. No error has been found.
-208013 states generated, 72608 distinct states found, 0 states left on queue.
+224339 states generated, 78428 distinct states found, 0 states left on queue.
 ```
 
 Three writers on one node, with no peer: the vanilla deployment, whose
@@ -261,7 +273,7 @@ following output:
 ```text
 Error: Invariant NoLakekeeperConflict is violated.
 …
-26659 states generated, 9430 distinct states found, 2073 states left on queue.
+48255 states generated, 15740 distinct states found, 3055 states left on queue.
 ```
 
 The failure is expected. With the async ordering but WITHOUT the bakery-aware
@@ -283,7 +295,7 @@ following output:
 ```text
 Error: Invariant NoLakekeeperConflict is violated.
 …
-134609 states generated, 43418 distinct states found, 4695 states left on queue.
+38940 states generated, 11669 distinct states found, 2155 states left on queue.
 ```
 
 The failure is expected. With two cold writers `a1 < a2` on one node and `b1`
@@ -301,7 +313,7 @@ The same-node-lock config reports a clean check with the following output:
 
 ```text
 Model checking completed. No error has been found.
-174206 states generated, 59106 distinct states found, 0 states left on queue.
+215932 states generated, 70630 distinct states found, 0 states left on queue.
 ```
 
 `SameNodeLock=TRUE` models `coldfront._claim_iceberg_lock`'s node-local
@@ -322,13 +334,22 @@ faithfully because they affect protocol correctness:
   the insert in `_on_ack_apply` are one step here and two statements in one
   apply transaction in SQL, so a release that commits between them leaves one
   row on the originator; the node's next claim deletes it (the `acks` CTE in
-  `_insert_claim`). The Applier sees a claim the moment its node inserts it,
-  while PostgreSQL ships a commit to peers before it is visible on its own
-  node, so an ack can reach the claimant before its claim row; `_on_ack_apply`
-  drops an ack whose claim it cannot see only when the table's claim key, which
-  `_insert_claim` holds until its transaction has ended, is free. A late ack
-  that arrives while a later claim's insert holds that key is kept, and the
-  same cleanup removes it.
+  `_insert_claim`). PostgreSQL ships a commit to peers before it is visible on
+  its own node, so an ack can reach the claimant before its claim row:
+  `BeginClaim` puts the claim in `inflight`, where the Applier ships it, and
+  `ClaimVisible` moves it into the node's view. `_on_ack_apply` keeps an ack
+  whose claim it cannot see only while the table's claim key, which
+  `_insert_claim` holds until its transaction has ended, is still held.
+  `AtomicAckCheck=FALSE` is the two-statement check, the claim and then the
+  key (`ApplyEmit`, `ApplyKey`): the insert can complete between them, and the
+  ack is dropped although the claim is live. `AtomicAckCheck=TRUE` takes the
+  key when the claim is not visible and reads the claim again under it. The
+  claim-arrival trigger `_on_claim_apply` takes the same key shared before it
+  reads the node's own claims, so the Applier waits while a `dst` insert is in
+  flight. A forwarded ack (the drain's and the reapers' forwards) passes the
+  same trigger; its outcome for an in-flight claim under `AtomicAckCheck` is
+  keep, which the model writes at once, since the claimant reads acks only
+  after `ClaimVisible`.
 
 - The `coldfront.iceberg_async_parquet` flag's two orderings in
   [_exec_iceberg_with_claim](https://github.com/pgEdge/ColdFront/blob/main/extension/coldfront/coldfront--1.0.sql),
@@ -516,7 +537,7 @@ Re-run the model after any change to the following:
 - The bakery functions in `extension/coldfront/coldfront--1.0.sql`
   (`_claim_iceberg_lock`, `_insert_claim`, `_take_iceberg_claim`,
   `_exec_iceberg_with_claim`, `_enqueue_release`, `_on_claim_apply`,
-  `_on_claim_release`, `ensure_replicated`).
+  `_on_ack_apply`, `_on_claim_release`, `ensure_replicated`).
 - The `_exec_iceberg_with_claim` ordering or the
   `coldfront.iceberg_async_parquet` flag's meaning (which parquet-stage point /
   where `parent_snapshot_id` is stamped relative to the claim), which means
