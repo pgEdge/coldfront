@@ -27,7 +27,10 @@ and verified*. The cold-tier compactor's own story lives in
 All seven duckdb-iceberg patches apply cleanly to a **pristine** `duckdb-iceberg`
 @ `5edc45f0` (branch `v1.5-variegata`), and the pg_duckdb patch to a pristine
 pg_duckdb @ `c04e6a2`; `docker/Dockerfile.duckdb15-base` `git apply --check`s
-each before applying, failing the build loudly on patch rot.
+each before applying, failing the build loudly on patch rot. The extension
+package (`packaging/coldfront-duckdb-extensions/build-extensions.sh`) applies
+the same duckdb-iceberg patches, taking the list from that recipe through
+`packaging/apply-base-patches.sh`.
 
 ---
 
