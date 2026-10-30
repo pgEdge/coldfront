@@ -246,7 +246,9 @@ CREATE TABLE IF NOT EXISTS coldfront.vector_centroids (
 -- pg_extension_config_dump marks their contents to be dumped. Deliberately NOT
 -- carried: coldfront.storage_secret (a credential — re-establish after restore
 -- with coldfront.set_storage_secret) and the bakery's claims / claim_acks /
--- deferred_acks (transient, per-node mesh state).
+-- deferred_acks (transient, per-node mesh state). peer_slots is carried, where
+-- it is created: it is the mesh's topology, and a node restored without it
+-- would refuse every cold write until each peer published again.
 SELECT pg_extension_config_dump('coldfront.tiered_views', '');
 SELECT pg_extension_config_dump('coldfront.archive_watermark', '');
 SELECT pg_extension_config_dump('coldfront.partition_config', '');
@@ -266,11 +268,16 @@ SELECT pg_extension_config_dump('coldfront.vector_centroids', '');
 -- acking node and deleted by whichever node holds the copy, so no ack DELETE
 -- crosses the mesh. Membership is a property of the provider, so each node adds
 -- the tables for the rows it will send; a peer's subscription then receives
--- them. Nothing calls it at run time: a node that skipped it keeps its claim
--- acks, registry rows, secret and lifecycle config to itself.
+-- them. It also publishes the slot name of each of this node's subscriptions
+-- (coldfront.peer_slots), so it is run again on a node whose subscriptions
+-- change. Nothing calls it at run time: a node that skipped it keeps its claim
+-- acks, registry rows, secret and lifecycle config to itself, and has
+-- published no slot, so every peer's claim refuses to run and names it.
 --
 -- The tables, all keyed by name so a row is identical on every node:
 --   claims, claim_acks               the bakery's tickets and acknowledgements
+--   peer_slots                       the slot name of each subscription, by
+--                                    which a provider finds a peer's walsender
 --   tiered_views                     the registry the hook resolves a view by
 --   archive_watermark                the hot/cold cutoff a tiered write routes by
 --   storage_secret                   the cold-store credential
@@ -295,6 +302,7 @@ BEGIN
         RETURN;
     END IF;
     FOREACH t IN ARRAY ARRAY['coldfront.claims', 'coldfront.claim_acks',
+                             'coldfront.peer_slots',
                              'coldfront.tiered_views', 'coldfront.archive_watermark',
                              'coldfront.storage_secret', 'coldfront.partition_config',
                              'coldfront.vector_config', 'coldfront.vector_centroids'] LOOP
@@ -306,6 +314,7 @@ BEGIN
              WHERE rs.set_name = s AND rst.set_reloid = t::regclass
         );
     END LOOP;
+    PERFORM coldfront._publish_peer_slots();
 END;
 $$;
 
@@ -3808,6 +3817,46 @@ CREATE TABLE coldfront.claim_acks (
     PRIMARY KEY (ticket, ack_from_name)
 );
 
+-- The slot through which each node receives each provider's claims, published
+-- by the subscriber: "subscriber streams from provider through slot_name", one
+-- row per pair, for the subscription whose sets include default, the set the
+-- claims travel in. Spock sets that name as the application_name of the
+-- walsender that serves the subscription, so the provider's alive check in
+-- _claim_iceberg_lock finds the walsender of each peer by the name the peer
+-- published, whatever the subscription is called. Spock-replicated
+-- (ensure_replicated, which also fills this node's rows).
+CREATE TABLE coldfront.peer_slots (
+    subscriber name NOT NULL,
+    provider   name NOT NULL,
+    slot_name  name NOT NULL,
+    PRIMARY KEY (subscriber, provider)
+);
+SELECT pg_extension_config_dump('coldfront.peer_slots', '');
+
+-- coldfront._publish_peer_slots: replaces this node's rows of
+-- coldfront.peer_slots, one per provider, with the slot of the enabled
+-- subscription that carries the provider's claims (the first by name when
+-- several do). A disabled subscription keeps its slot with no walsender behind
+-- it, so publishing it would make the peer look dead.
+-- Deleting and inserting the rows, rather than inserting the missing ones,
+-- makes every call send them all again, so a peer that lacks them or holds an
+-- old one, a node restored from a dump, say, gets them from this call. plpgsql,
+-- so the spock references resolve at call time (see _my_spock_node_name).
+CREATE FUNCTION coldfront._publish_peer_slots() RETURNS void
+LANGUAGE plpgsql AS $$
+DECLARE
+    my_name name := coldfront._my_spock_node_name();
+BEGIN
+    DELETE FROM coldfront.peer_slots WHERE subscriber = my_name;
+    INSERT INTO coldfront.peer_slots (subscriber, provider, slot_name)
+    SELECT DISTINCT ON (pn.node_name) my_name, pn.node_name, s.sub_slot_name
+      FROM spock.subscription s
+      JOIN spock.node pn ON pn.node_id = s.sub_origin
+     WHERE s.sub_enabled
+       AND 'default' = ANY (s.sub_replication_sets)
+     ORDER BY pn.node_name, s.sub_name;
+END $$;
+
 -- Deferred acks queue, LOCAL to each node (NOT replicated).  When a peer
 -- receives an originator's claim while peer has its own smaller-ticket
 -- claim pending on the same iceberg_table, the peer-side trigger queues
@@ -4126,9 +4175,10 @@ CREATE FUNCTION coldfront._claim_iceberg_lock(
 DECLARE
     connstr           text     := coldfront._loopback_dsn();
     my_node           int      := current_setting('snowflake.node')::int;
-    -- Local spock node name, used for the ack-wait join and the liveness
-    -- slot-name computation (see coldfront._my_spock_node_name).
+    -- Local spock node name, used for the ack-wait join and the peer_slots
+    -- lookup of the alive check (see coldfront._my_spock_node_name).
     my_node_name      name     := coldfront._my_spock_node_name();
+    v_missing         text;
     my_ticket         bigint;
     v_poll            int      := 0;
     -- coldfront.peer_alive_window_ms (superuser-only): a peer whose walsender
@@ -4152,6 +4202,22 @@ BEGIN
         RAISE EXCEPTION 'coldfront: wal_sender_timeout is % ms and coldfront.peer_alive_window_ms is % ms: the walsender asks a peer for a reply every wal_sender_timeout/2, so an idle live peer would be ruled dead',
             wal_sender_timeout_ms, peer_alive_window_ms
             USING HINT = 'Set wal_sender_timeout above 0 and below twice the window on every node, as the image does: ALTER SYSTEM SET wal_sender_timeout = ''15s''; SELECT pg_reload_conf();';
+    END IF;
+    -- Every peer must have published the slot of its subscription from this
+    -- node (coldfront.peer_slots), and that slot must exist here, or its
+    -- walsender cannot be told from the others and the peer would count as
+    -- dead: refuse rather than skip its ack. A published slot this node does
+    -- not have is a row from before the peer recreated its subscription, as a
+    -- node restored from a dump holds.
+    SELECT string_agg(n.node_name, ', ' ORDER BY n.node_name) INTO v_missing
+      FROM spock.node n
+     WHERE n.node_id <> (SELECT node_id FROM spock.local_node)
+       AND NOT EXISTS (SELECT 1 FROM coldfront.peer_slots ps
+                         JOIN pg_replication_slots rs ON rs.slot_name = ps.slot_name
+                        WHERE ps.subscriber = n.node_name AND ps.provider = my_node_name);
+    IF v_missing IS NOT NULL THEN
+        RAISE EXCEPTION 'coldfront: no published subscription slot for peer %', v_missing
+            USING HINT = 'Run SELECT coldfront.ensure_replicated(); on that node, after its subscriptions exist: it publishes the slot of its subscription from this node, which must exist here.';
     END IF;
 
     -- Same-node serialization: hold a node-local advisory xact lock for this
@@ -4207,22 +4273,15 @@ BEGIN
                     AND a.ack_from_name = n.node_name
                )
                AND EXISTS (
-                 -- Per-peer alive check: match the walsender on us serving
-                 -- this peer's apply worker by computing the EXACT slot
-                 -- name spock uses for the peer's subscription from us.
-                 -- spock.spock_gen_slot_name replicates spock's
-                 -- gen_slot_name + shorten_hash logic, so this handles
-                 -- both the non-hashed form (sub name ≤16 chars) and the
-                 -- 8-prefix+7-hex-hash form (sub name >16 chars, e.g. db10+).
-                 -- IMMUTABLE so PG caches the call. No LIKE, no regex, no
-                 -- node-name ambiguity (db1 vs db10).
-                 SELECT 1 FROM pg_stat_replication r
-                  WHERE r.reply_time > now() - peer_alive_window
-                    AND r.application_name = spock.spock_gen_slot_name(
-                          current_database()::name,
-                          my_node_name,
-                          ('sub_' || n.node_name || '_from_' || my_node_name)::name
-                        )
+                 -- Per-peer alive check: the walsender on us that serves this
+                 -- peer's apply worker, found by the slot name the peer
+                 -- published for its subscription from us (coldfront.peer_slots),
+                 -- which Spock also sets as that walsender's application_name.
+                 SELECT 1 FROM coldfront.peer_slots ps
+                   JOIN pg_stat_replication r ON r.application_name = ps.slot_name
+                  WHERE ps.subscriber = n.node_name
+                    AND ps.provider = my_node_name
+                    AND r.reply_time > now() - peer_alive_window
                )
         );
         -- Waiter's poke: every ~1 s, re-touch our own claim row. The no-op UPDATE

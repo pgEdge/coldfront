@@ -3817,6 +3817,54 @@ story_mesh_dead_peer() {
     }
     local alive_sql="SELECT count(*) FILTER (WHERE reply_time > now() - make_interval(secs => current_setting('coldfront.peer_alive_window_ms')::int / 1000.0)) || '/' || count(*) FROM pg_stat_replication;"
     local window; window=$(q "$HOST" "SHOW coldfront.peer_alive_window_ms;")
+
+    # TC-275: each peer published the slot name of its subscription from $HOST
+    # (coldfront.peer_slots, filled by ensure_replicated), and that name is a
+    # walsender on $HOST with a reply inside the window. This is the lookup the
+    # bakery's alive check makes, with the subscriptions named as this mesh
+    # names them, not as any ColdFront convention would.
+    assert_eq "TC-275: every peer's published slot is a live walsender on $HOST" "$npeers" \
+        "$(q "$HOST" "SELECT count(*) FROM spock.node n JOIN coldfront.peer_slots ps ON ps.subscriber = n.node_name AND ps.provider = coldfront._my_spock_node_name() JOIN pg_stat_replication r ON r.application_name = ps.slot_name WHERE n.node_id <> (SELECT node_id FROM spock.local_node) AND r.reply_time > now() - make_interval(secs => current_setting('coldfront.peer_alive_window_ms')::int / 1000.0);")"
+    for i in "${PARR[@]}"; do
+        assert_eq "TC-275: $i published one slot per subscription" "$(q "$i" "SELECT count(*) FROM spock.subscription;")" \
+            "$(q "$i" "SELECT count(*) FROM coldfront.peer_slots WHERE subscriber = coldfront._my_spock_node_name();")"
+    done
+
+    # TC-276: a peer whose slot this node does not hold cannot be told from the
+    # others, so a claim refuses to run and names it, and the peer's
+    # ensure_replicated() publishes its slots again. The rows are removed on
+    # $HOST alone, with the table out of its replication set for that one
+    # statement, which is the state of a node that lacks them. The republish is
+    # waited for on the peer's slots, not with a sleep.
+    local p1name p1subs; p1name=$(q "$p1" "SELECT coldfront._my_spock_node_name();"); p1subs=$(q "$p1" "SELECT count(*) FROM spock.subscription;")
+    q "$HOST" "SELECT spock.repset_remove_table('default', 'coldfront.peer_slots'::regclass);" >/dev/null
+    q "$HOST" "DELETE FROM coldfront.peer_slots WHERE subscriber = '$p1name';" >/dev/null
+    q "$HOST" "SELECT spock.repset_add_table('default', 'coldfront.peer_slots'::regclass, false);" >/dev/null
+    out=$(q_may "$HOST" "$(cold_stmt dp276 3)")
+    assert_contains "TC-276: a cold write refuses to run while a peer's slot is not held" "no published subscription slot for peer $p1name" "$out"
+    assert_eq "TC-276: no row landed from the refused write" "0" "$(q "$HOST" "SELECT count(*) FROM $tbl WHERE status='dp276';")"
+    q "$p1" "SELECT coldfront.ensure_replicated();" >/dev/null
+    q "$p1" "SET statement_timeout = '60s'; SELECT spock.wait_slot_confirm_lsn(NULL, NULL);" >/dev/null
+    assert_eq "TC-276: the peer's ensure_replicated() published its slots again" "$p1subs" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.peer_slots WHERE subscriber = '$p1name';")"
+    out=$(q_may "$HOST" "$(cold_stmt dp276 4)")
+    assert_eq "TC-276: the cold write runs once the slot is published" "" "$(echo "$out" | grep -i error)"
+    assert_eq "TC-276: its row landed" "1" "$(q "$HOST" "SELECT count(*) FROM $tbl WHERE status='dp276';")"
+    # A row that names a slot this node does not have, as a node restored from
+    # an old dump holds, is refused the same way rather than making the peer
+    # look dead, and the peer's republish replaces it.
+    q "$HOST" "SELECT spock.repset_remove_table('default', 'coldfront.peer_slots'::regclass);" >/dev/null
+    q "$HOST" "UPDATE coldfront.peer_slots SET slot_name = 'spk_stale' WHERE subscriber = '$p1name';" >/dev/null
+    q "$HOST" "SELECT spock.repset_add_table('default', 'coldfront.peer_slots'::regclass, false);" >/dev/null
+    out=$(q_may "$HOST" "$(cold_stmt dp276 5)")
+    assert_contains "TC-276: a cold write refuses to run while a peer's published slot does not exist here" "no published subscription slot for peer $p1name" "$out"
+    q "$p1" "SELECT coldfront.ensure_replicated();" >/dev/null
+    q "$p1" "SET statement_timeout = '60s'; SELECT spock.wait_slot_confirm_lsn(NULL, NULL);" >/dev/null
+    assert_eq "TC-276: the republish replaced the stale row" "0" "$(q "$HOST" "SELECT count(*) FROM coldfront.peer_slots WHERE slot_name = 'spk_stale';")"
+    out=$(q_may "$HOST" "$(cold_stmt dp276 6)")
+    assert_eq "TC-276: the cold write runs once the slot is published again" "" "$(echo "$out" | grep -i error)"
+    assert_eq "TC-276: both rows landed" "2" "$(q "$HOST" "SELECT count(*) FROM $tbl WHERE status='dp276';")"
+
     assert_eq "TC-221: the image sets wal_sender_timeout to 15s for the 10 s window" "15s" "$(q "$HOST" "SHOW wal_sender_timeout;")"
 
     # TC-221: a timeout of 60 s or 0 is refused by the claim, naming both settings.
@@ -4022,9 +4070,19 @@ COMMIT;
 SQL
     local holder=$!
     sleep 1
+    # The peer waits for $HOST's ack only while it counts $HOST as alive, so the
+    # write must be held until the lock drops; a write that returns at once
+    # means the peer ruled $HOST dead and skipped its ack.
+    local t0 held; t0=$(date +%s%N)
     tq 90 "$p1" "$w_c" >"$TMPD/reap.c" 2>&1; rc=$?
+    held=$(( ($(date +%s%N) - t0) / 1000000 ))
     wait "$holder" 2>/dev/null
     assert_eq "TC-163 peer deferred behind an orphan is unwedged by its own poke once the lock drops" "0" "$rc"
+    if [ "$held" -ge 5000 ]; then
+        pass "TC-163 the peer's write was held while $HOST deferred it (${held} ms)"
+    else
+        fail "TC-163 the peer's write was not held by $HOST's deferral (${held} ms): the peer did not count $HOST as alive"
+    fi
     assert_eq "TC-163 orphan claim reaped on both nodes" "0" "$(orphan_gone_everywhere)"
 
     # TC-191: epoch path. A same-node claim on another table whose ticket predates
@@ -4528,8 +4586,8 @@ story_mesh_substrate() {
     # checked, not only the one that will write.
     local repset_sql="SELECT rs.set_name || ':' || string_agg(c.relname, ',' ORDER BY c.relname COLLATE \"C\") FROM spock.replication_set rs JOIN spock.replication_set_table rst ON rst.set_id = rs.set_id JOIN pg_class c ON c.oid = rst.set_reloid WHERE c.relnamespace = 'coldfront'::regnamespace GROUP BY rs.set_name ORDER BY rs.set_name COLLATE \"C\";"
     for n in "${nodes[@]}"; do
-        assert_eq "TC-213 $n's replication sets hold the eight replicated coldfront tables, claim_acks insert-only" \
-            "default:archive_watermark,claims,partition_config,storage_secret,tiered_views,vector_centroids,vector_config default_insert_only:claim_acks" \
+        assert_eq "TC-213 $n's replication sets hold the nine replicated coldfront tables, claim_acks insert-only" \
+            "default:archive_watermark,claims,partition_config,peer_slots,storage_secret,tiered_views,vector_centroids,vector_config default_insert_only:claim_acks" \
             "$(q "$n" "$repset_sql" | paste -sd' ')"
     done
     q "$HOST" "DELETE FROM coldfront.claims WHERE iceberg_table='bakery_probe';" >/dev/null 2>&1

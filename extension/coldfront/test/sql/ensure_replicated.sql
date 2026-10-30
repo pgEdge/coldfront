@@ -7,3 +7,6 @@ CREATE EXTENSION IF NOT EXISTS coldfront;
 RESET client_min_messages;
 
 SELECT coldfront.ensure_replicated();
+
+-- Without a Spock node there is no subscription whose slot it could publish.
+SELECT count(*) FROM coldfront.peer_slots;

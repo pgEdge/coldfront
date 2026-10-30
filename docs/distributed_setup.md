@@ -97,11 +97,8 @@ CREATE EXTENSION IF NOT EXISTS spock;
 CREATE EXTENSION IF NOT EXISTS pg_duckdb;
 CREATE EXTENSION IF NOT EXISTS coldfront;
 
--- 2. Spock node + full-mesh subscriptions (each node has N-1 subs). Name each
--- subscription sub_<subscriber>_from_<provider> (on n1: sub_n1_from_n2): the
--- bakery's peer-liveness check looks the walsender up by that name, and a peer
--- whose subscription is named any other way counts as dead and is treated as
--- already acked.
+-- 2. Spock node + full-mesh subscriptions (each node has N-1 subs), named as
+-- you like.
 SELECT spock.node_create('n<i>', 'host=<this_node_priv_ip> user=coldfront dbname=coldfront port=5432');
 
 -- on n1 (n2 and n3 symmetric):
@@ -114,7 +111,9 @@ SELECT spock.sub_create('sub_n1_from_n3', 'host=<n3> user=coldfront dbname=coldf
 
 -- 3. **Required** on every node, after its subscriptions exist and before
 -- the first cold write, storage secret or table registration: put every
--- ColdFront table that replicates by value in this node's replication sets.
+-- ColdFront table that replicates by value in this node's replication sets,
+-- and publish the slot name of each of this node's subscriptions. Run it
+-- again on a node whose subscriptions change.
 SELECT coldfront.ensure_replicated();
 ```
 
@@ -134,7 +133,9 @@ how long a cold write waits for a peer; set them together, on every node:
 | `coldfront.peer_alive_window_ms` | Recommended `10000` (the default), set in `postgresql.conf`, by a superuser only. The bakery treats a peer whose last reply is older than this as dead and stops waiting for its ack. |
 
 The rule: half of `wal_sender_timeout` must stay below the window, with a
-round trip to spare; the claim enforces the first part. An idle peer replies
+round trip to spare; the claim enforces the first part. The reply's time is
+the peer's clock, so the window also covers the clock skew between nodes. An
+idle peer replies
 only when the walsender asks, so the
 PostgreSQL default of 60 s against a 10 s window would rule a live idle peer
 dead; a claim refuses to run with such settings and names both. With the
@@ -150,14 +151,16 @@ each claim reads the window once.
 
 ## What `coldfront.ensure_replicated()` Does
 
-The call is the one ColdFront-specific step of the mesh setup. It adds eight
+The call is the one ColdFront-specific step of the mesh setup. It adds nine
 tables to the node's replication sets (`claim_acks` to `default_insert_only`,
 the rest to `default`), each keyed by name, so a row is identical on every node
-and replicates by value:
+and replicates by value, and it replaces this node's rows of
+`coldfront.peer_slots` with one per row of `spock.subscription`:
 
 | Table | What replicates, and why a peer needs it |
 |---|---|
 | `coldfront.claims`, `coldfront.claim_acks` | The bakery's tickets and acknowledgements. A peer acknowledges an originator's claim by inserting into `claim_acks` on its own node, and the ack reaches the originator only if the table is in the peer's set. `claim_acks` goes in the insert-only set, because each node deletes only the ack copies it holds. |
+| `coldfront.peer_slots` | For each provider, the slot name of the node's subscription that carries the provider's claims (its sets include `default`), keyed by subscriber and provider node name. Spock sets that name as the `application_name` of the walsender that serves the subscription, so a provider's bakery finds the walsender of each peer by the name the peer published, and a subscription can have any name. |
 | `coldfront.tiered_views` | The registry. A peer's hook recognizes a view by its row; without it the peer's writes through the view fail in PostgreSQL ("cannot insert into view") and its reads cannot attach the cold tier. |
 | `coldfront.archive_watermark` | The hot/cold cutoff that routes each tiered write. |
 | `coldfront.storage_secret` | The cold-store credential, so one `set_storage_secret` call reaches every node. |
@@ -173,17 +176,22 @@ that skipped the step keeps its acks, registry rows and secret to itself. It
 cannot run at `CREATE EXTENSION` time, because `spock.repset_add_table` needs
 the local Spock node, and nothing runs it later on a node's behalf:
 provisioning a table, setting the secret and writing cold rows all assume it
-has run. It is idempotent, so running it again is harmless, and a node added to
-the mesh later runs the same three steps.
+has run. It is idempotent, so running it again is harmless. A node added to
+the mesh later runs the same three steps, and every node that subscribes from
+it runs the call again, so the slot of the new subscription is published.
 
-A skipped step shows up late and away from the node that skipped it. If a peer
-never ran it, the originator of every cold write waits at the ack barrier for
-an ack that never arrives. If the node that registers a table never ran it,
-the view reaches each peer as replicated DDL but the registry row does not, so
-the peer's writes through the view fail with "cannot insert into view". A
-secret set on such a node stays on that node.
+A skipped step shows up away from the node that skipped it. If a peer never
+ran it, it has published no slot, and every cold write on the other nodes
+refuses to run and names that peer. The same refusal follows when the slot a
+peer published does not exist on the node, which is what a node restored from
+a dump taken before the peer recreated its subscription holds; the peer's
+`ensure_replicated()` replaces the row. If the node that registers a table
+never ran it, the view reaches each peer as replicated DDL but the registry
+row does not, so the peer's writes through the view fail with "cannot insert
+into view". A secret set on such a node stays on that node.
 
-Verify the step on every node. The query lists the eight tables:
+Verify the step on every node. The query lists the eight tables of the
+`default` set; `claim_acks` is in `default_insert_only`:
 
 ```sql
 SELECT c.relname
