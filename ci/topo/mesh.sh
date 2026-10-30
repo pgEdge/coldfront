@@ -94,8 +94,10 @@ step "mesh: Spock bootstrap (3 nodes, 6 subs)"
 for n in $NODES; do
     m "$n" "SELECT CASE WHEN EXISTS(SELECT 1 FROM spock.node WHERE node_name='$n') THEN 'exists' ELSE spock.node_create('$n','host=$n user=coldfront dbname=coldfront port=5432')::text END;" >/dev/null
 done
+# Subscriptions follow no ColdFront naming convention, sub_n<subscriber>_n<provider>:
+# a name ColdFront is told, never one it assumes.
 for a in $NODES; do for b in $NODES; do [ "$a" = "$b" ] && continue
-    m "$a" "SELECT spock.sub_create('sub_${a}_from_${b}','host=$b user=coldfront dbname=coldfront port=5432');" >/dev/null 2>&1
+    m "$a" "SELECT spock.sub_create('sub_n${a#db}_n${b#db}','host=$b user=coldfront dbname=coldfront port=5432');" >/dev/null 2>&1
 done; done
 # A subscription that never starts leaves sub_wait_for_sync waiting forever, so
 # the wait is bounded and a timeout reports every subscription's status and the

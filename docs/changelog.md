@@ -367,6 +367,17 @@ this project adheres to
   with two exceptions. DuckDB writes a returned container or number in its own
   form. The `@>` and `<@` operators never match an integer against the same
   value written as a decimal.
+- The bakery's dead-peer check looked a peer's walsender up by a subscription
+  name it assumed, `sub_<peer>_from_<node>`. On a mesh whose subscriptions are
+  named any other way every peer counted as dead, no cold write waited for a
+  peer's ack, and concurrent cold writes from different nodes failed with
+  Lakekeeper's `409 CatalogCommitConflicts`. Each node now publishes the slot
+  name of each of its subscriptions in `coldfront.peer_slots` through
+  `coldfront.ensure_replicated()`, the check finds a peer's walsender by the
+  name that peer published, and a claim refuses to run, naming the peer, while
+  a peer has published no slot for its subscription from this node. A
+  subscription can have any name, and `ensure_replicated()` is run again on a
+  node whose subscriptions change.
 - Once a `DROP COLUMN` returned a tiered table to an earlier schema, the next
   column change failed in the Iceberg mirror with "Attempted to add schema
   with id N, but this already exists in the table!" and rolled back the

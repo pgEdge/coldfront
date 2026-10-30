@@ -11,3 +11,10 @@ SELECT coldfront.ensure_replicated();
  
 (1 row)
 
+-- Without a Spock node there is no subscription whose slot it could publish.
+SELECT count(*) FROM coldfront.peer_slots;
+ count 
+-------
+     0
+(1 row)
+

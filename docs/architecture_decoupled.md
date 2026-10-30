@@ -701,7 +701,12 @@ pointing at the same Lakekeeper endpoint and S3 bucket:
     peer (would block forever), and ColdFront closes it via a liveness check on
     `pg_stat_replication.reply_time`: ColdFront treats a peer whose walsender
     has been silent longer than `coldfront.peer_alive_window_ms` as already
-    acked, whatever the walsender's state. The peer's apply worker sends that
+    acked, whatever the walsender's state. The walsender that serves a peer is
+    the one whose `application_name` is the slot name the peer published in
+    `coldfront.peer_slots` (its `spock.subscription.sub_slot_name` for its
+    subscription from this node, filled by `coldfront.ensure_replicated()`), so
+    a subscription can have any name, and a claim refuses to run while a peer
+    has published none. The peer's apply worker sends that
     reply after it applies, every
     `spock.feedback_frequency` messages, and in answer to the walsender's
     keepalive, which on an idle link comes every `wal_sender_timeout/2`, so
@@ -795,13 +800,13 @@ SELECT coldfront.ensure_replicated();
 ```
 
 The call is idempotent. It puts every ColdFront table that replicates by value
-in the node's replication sets: the two bakery tables, the registry and the
-watermark, the storage secret, the lifecycle config and the vector routing
-state (the list and the reason for each table are in the
-[Configuring a Distributed Deployment](distributed_setup.md#what-coldfrontensure_replicated-does) guide).
-If it has not run on a peer, that peer's ack `INSERT`s are local-only and never
-replicate back to the originating writer: every claim on the originator waits
-at the ack barrier for an ack that never arrives.
+in the node's replication sets: the bakery's claims, acks and published slot
+names, the registry and the watermark, the storage secret, the lifecycle config
+and the vector routing state (the list and the reason for each table are in the
+[Configuring a Distributed Deployment](distributed_setup.md#what-coldfrontensure_replicated-does) guide),
+and it publishes the slot name of each of the node's subscriptions. If it has
+not run on a peer, that peer has published no slot, and every claim on the
+other nodes refuses to run and names it.
 
 Nothing runs it later on a node's behalf. `coldfront.create_iceberg_table()`
 and `coldfront.adopt_iceberg_table(p_writable => true)` assume it has run on
