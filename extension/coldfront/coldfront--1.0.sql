@@ -3834,8 +3834,10 @@ CREATE TABLE coldfront.peer_slots (
 SELECT pg_extension_config_dump('coldfront.peer_slots', '');
 
 -- coldfront._publish_peer_slots: replaces this node's rows of
--- coldfront.peer_slots, one per provider, with the slot of the subscription
--- that carries the provider's claims (the first by name when several do).
+-- coldfront.peer_slots, one per provider, with the slot of the enabled
+-- subscription that carries the provider's claims (the first by name when
+-- several do). A disabled subscription keeps its slot with no walsender behind
+-- it, so publishing it would make the peer look dead.
 -- Deleting and inserting the rows, rather than inserting the missing ones,
 -- makes every call send them all again, so a peer that lacks them or holds an
 -- old one, a node restored from a dump, say, gets them from this call. plpgsql,
@@ -3850,7 +3852,8 @@ BEGIN
     SELECT DISTINCT ON (pn.node_name) my_name, pn.node_name, s.sub_slot_name
       FROM spock.subscription s
       JOIN spock.node pn ON pn.node_id = s.sub_origin
-     WHERE 'default' = ANY (s.sub_replication_sets)
+     WHERE s.sub_enabled
+       AND 'default' = ANY (s.sub_replication_sets)
      ORDER BY pn.node_name, s.sub_name;
 END $$;
 
