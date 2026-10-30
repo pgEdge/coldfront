@@ -706,7 +706,8 @@ pointing at the same Lakekeeper endpoint and S3 bucket:
     `coldfront.peer_slots` (its `spock.subscription.sub_slot_name` for its
     subscription from this node, filled by `coldfront.ensure_replicated()`), so
     a subscription can have any name, and a claim refuses to run while a peer
-    has published none. The peer's apply worker sends that
+    has published none, or one that names a slot this node does not have. The
+    peer's apply worker sends that
     reply after it applies, every
     `spock.feedback_frequency` messages, and in answer to the walsender's
     keepalive, which on an idle link comes every `wal_sender_timeout/2`, so

@@ -3850,6 +3850,20 @@ story_mesh_dead_peer() {
     out=$(q_may "$HOST" "$(cold_stmt dp276 4)")
     assert_eq "TC-276: the cold write runs once the slot is published" "" "$(echo "$out" | grep -i error)"
     assert_eq "TC-276: its row landed" "1" "$(q "$HOST" "SELECT count(*) FROM $tbl WHERE status='dp276';")"
+    # A row that names a slot this node does not have, as a node restored from
+    # an old dump holds, is refused the same way rather than making the peer
+    # look dead, and the peer's republish replaces it.
+    q "$HOST" "SELECT spock.repset_remove_table('default', 'coldfront.peer_slots'::regclass);" >/dev/null
+    q "$HOST" "UPDATE coldfront.peer_slots SET slot_name = 'spk_stale' WHERE subscriber = '$p1name';" >/dev/null
+    q "$HOST" "SELECT spock.repset_add_table('default', 'coldfront.peer_slots'::regclass, false);" >/dev/null
+    out=$(q_may "$HOST" "$(cold_stmt dp276 5)")
+    assert_contains "TC-276: a cold write refuses to run while a peer's published slot does not exist here" "no published subscription slot for peer $p1name" "$out"
+    q "$p1" "SELECT coldfront.ensure_replicated();" >/dev/null
+    q "$p1" "SET statement_timeout = '60s'; SELECT spock.wait_slot_confirm_lsn(NULL, NULL);" >/dev/null
+    assert_eq "TC-276: the republish replaced the stale row" "0" "$(q "$HOST" "SELECT count(*) FROM coldfront.peer_slots WHERE slot_name = 'spk_stale';")"
+    out=$(q_may "$HOST" "$(cold_stmt dp276 6)")
+    assert_eq "TC-276: the cold write runs once the slot is published again" "" "$(echo "$out" | grep -i error)"
+    assert_eq "TC-276: both rows landed" "2" "$(q "$HOST" "SELECT count(*) FROM $tbl WHERE status='dp276';")"
 
     assert_eq "TC-221: the image sets wal_sender_timeout to 15s for the 10 s window" "15s" "$(q "$HOST" "SHOW wal_sender_timeout;")"
 

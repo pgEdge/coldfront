@@ -3817,27 +3817,29 @@ CREATE TABLE coldfront.claim_acks (
     PRIMARY KEY (ticket, ack_from_name)
 );
 
--- The slot name of each subscription in the mesh, published by its subscriber:
--- "subscriber streams from provider through slot_name". Spock sets that name as
--- the application_name of the walsender that serves the subscription, so the
--- provider's alive check in _claim_iceberg_lock finds the walsender of each
--- peer by the name the peer published, whatever the subscription is called.
--- Spock-replicated (ensure_replicated, which also fills this node's rows).
+-- The slot through which each node receives each provider's claims, published
+-- by the subscriber: "subscriber streams from provider through slot_name", one
+-- row per pair, for the subscription whose sets include default, the set the
+-- claims travel in. Spock sets that name as the application_name of the
+-- walsender that serves the subscription, so the provider's alive check in
+-- _claim_iceberg_lock finds the walsender of each peer by the name the peer
+-- published, whatever the subscription is called. Spock-replicated
+-- (ensure_replicated, which also fills this node's rows).
 CREATE TABLE coldfront.peer_slots (
     subscriber name NOT NULL,
     provider   name NOT NULL,
     slot_name  name NOT NULL,
-    PRIMARY KEY (subscriber, provider, slot_name)
+    PRIMARY KEY (subscriber, provider)
 );
 SELECT pg_extension_config_dump('coldfront.peer_slots', '');
 
 -- coldfront._publish_peer_slots: replaces this node's rows of
--- coldfront.peer_slots with one per subscription in spock.subscription, keyed
--- by the provider's node name. Deleting and inserting the rows, rather than
--- inserting the missing ones, makes every call send them all again, so a peer
--- that lacks them, one restored without them, say, gets them from this call.
--- plpgsql, so the spock references resolve at call time (see
--- _my_spock_node_name).
+-- coldfront.peer_slots, one per provider, with the slot of the subscription
+-- that carries the provider's claims (the first by name when several do).
+-- Deleting and inserting the rows, rather than inserting the missing ones,
+-- makes every call send them all again, so a peer that lacks them or holds an
+-- old one, a node restored from a dump, say, gets them from this call. plpgsql,
+-- so the spock references resolve at call time (see _my_spock_node_name).
 CREATE FUNCTION coldfront._publish_peer_slots() RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -3845,9 +3847,11 @@ DECLARE
 BEGIN
     DELETE FROM coldfront.peer_slots WHERE subscriber = my_name;
     INSERT INTO coldfront.peer_slots (subscriber, provider, slot_name)
-    SELECT my_name, pn.node_name, s.sub_slot_name
+    SELECT DISTINCT ON (pn.node_name) my_name, pn.node_name, s.sub_slot_name
       FROM spock.subscription s
-      JOIN spock.node pn ON pn.node_id = s.sub_origin;
+      JOIN spock.node pn ON pn.node_id = s.sub_origin
+     WHERE 'default' = ANY (s.sub_replication_sets)
+     ORDER BY pn.node_name, s.sub_name;
 END $$;
 
 -- Deferred acks queue, LOCAL to each node (NOT replicated).  When a peer
@@ -4197,16 +4201,20 @@ BEGIN
             USING HINT = 'Set wal_sender_timeout above 0 and below twice the window on every node, as the image does: ALTER SYSTEM SET wal_sender_timeout = ''15s''; SELECT pg_reload_conf();';
     END IF;
     -- Every peer must have published the slot of its subscription from this
-    -- node (coldfront.peer_slots), or its walsender cannot be told from the
-    -- others and the peer would count as dead: refuse rather than skip its ack.
+    -- node (coldfront.peer_slots), and that slot must exist here, or its
+    -- walsender cannot be told from the others and the peer would count as
+    -- dead: refuse rather than skip its ack. A published slot this node does
+    -- not have is a row from before the peer recreated its subscription, as a
+    -- node restored from a dump holds.
     SELECT string_agg(n.node_name, ', ' ORDER BY n.node_name) INTO v_missing
       FROM spock.node n
      WHERE n.node_id <> (SELECT node_id FROM spock.local_node)
        AND NOT EXISTS (SELECT 1 FROM coldfront.peer_slots ps
+                         JOIN pg_replication_slots rs ON rs.slot_name = ps.slot_name
                         WHERE ps.subscriber = n.node_name AND ps.provider = my_node_name);
     IF v_missing IS NOT NULL THEN
         RAISE EXCEPTION 'coldfront: no published subscription slot for peer %', v_missing
-            USING HINT = 'Run SELECT coldfront.ensure_replicated(); on that node, after its subscriptions exist.';
+            USING HINT = 'Run SELECT coldfront.ensure_replicated(); on that node, after its subscriptions exist: it publishes the slot of its subscription from this node, which must exist here.';
     END IF;
 
     -- Same-node serialization: hold a node-local advisory xact lock for this

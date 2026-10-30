@@ -375,9 +375,9 @@ this project adheres to
   name of each of its subscriptions in `coldfront.peer_slots` through
   `coldfront.ensure_replicated()`, the check finds a peer's walsender by the
   name that peer published, and a claim refuses to run, naming the peer, while
-  a peer has published no slot for its subscription from this node. A
-  subscription can have any name, and `ensure_replicated()` is run again on a
-  node whose subscriptions change.
+  a peer has published no slot for its subscription from this node, or one the
+  node does not have. A subscription can have any name, and
+  `ensure_replicated()` is run again on a node whose subscriptions change.
 - Once a `DROP COLUMN` returned a tiered table to an earlier schema, the next
   column change failed in the Iceberg mirror with "Attempted to add schema
   with id N, but this already exists in the table!" and rolled back the

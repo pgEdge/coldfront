@@ -160,7 +160,7 @@ and replicates by value, and it replaces this node's rows of
 | Table | What replicates, and why a peer needs it |
 |---|---|
 | `coldfront.claims`, `coldfront.claim_acks` | The bakery's tickets and acknowledgements. A peer acknowledges an originator's claim by inserting into `claim_acks` on its own node, and the ack reaches the originator only if the table is in the peer's set. `claim_acks` goes in the insert-only set, because each node deletes only the ack copies it holds. |
-| `coldfront.peer_slots` | The slot name of each of the node's subscriptions, keyed by subscriber and provider node name. Spock sets that name as the `application_name` of the walsender that serves the subscription, so a provider's bakery finds the walsender of each peer by the name the peer published, and a subscription can have any name. |
+| `coldfront.peer_slots` | For each provider, the slot name of the node's subscription that carries the provider's claims (its sets include `default`), keyed by subscriber and provider node name. Spock sets that name as the `application_name` of the walsender that serves the subscription, so a provider's bakery finds the walsender of each peer by the name the peer published, and a subscription can have any name. |
 | `coldfront.tiered_views` | The registry. A peer's hook recognizes a view by its row; without it the peer's writes through the view fail in PostgreSQL ("cannot insert into view") and its reads cannot attach the cold tier. |
 | `coldfront.archive_watermark` | The hot/cold cutoff that routes each tiered write. |
 | `coldfront.storage_secret` | The cold-store credential, so one `set_storage_secret` call reaches every node. |
@@ -182,10 +182,13 @@ it runs the call again, so the slot of the new subscription is published.
 
 A skipped step shows up away from the node that skipped it. If a peer never
 ran it, it has published no slot, and every cold write on the other nodes
-refuses to run and names that peer. If the node that registers a table never
-ran it, the view reaches each peer as replicated DDL but the registry row does
-not, so the peer's writes through the view fail with "cannot insert into view".
-A secret set on such a node stays on that node.
+refuses to run and names that peer. The same refusal follows when the slot a
+peer published does not exist on the node, which is what a node restored from
+a dump taken before the peer recreated its subscription holds; the peer's
+`ensure_replicated()` replaces the row. If the node that registers a table
+never ran it, the view reaches each peer as replicated DDL but the registry
+row does not, so the peer's writes through the view fail with "cannot insert
+into view". A secret set on such a node stays on that node.
 
 Verify the step on every node. The query lists the eight tables of the
 `default` set; `claim_acks` is in `default_insert_only`:
