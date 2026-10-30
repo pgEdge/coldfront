@@ -2,6 +2,7 @@
 set -euo pipefail
 
 RHEL="$(rpm --eval %rhel)"
+CWD="$(pwd)"
 
 prepare() {
   setup_dnf_build_env
@@ -19,6 +20,9 @@ prepare() {
     git checkout -q FETCH_HEAD
     git submodule update --init --recursive --depth 1
     git apply "$OLDPWD/docker/pg_duckdb-extract-field-quoting.patch"
+    # The base recipe's DuckDB patches (the brotli decoder fix for
+    # CVE-2026-111497), applied before .git goes below.
+    bash "${CWD}/packaging/apply-base-patches.sh" duckdb third_party/duckdb
     # GitHub auto-tarballs omit submodules, and pg_duckdb's Makefile gates the
     # DuckDB build on a `.git/modules/third_party/duckdb/HEAD` marker. Drop the
     # heavy .git history but leave that marker so `make` treats the submodule as

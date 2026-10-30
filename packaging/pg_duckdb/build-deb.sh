@@ -27,6 +27,8 @@ prepare() {
     git checkout -q FETCH_HEAD
     git submodule update --init --recursive --depth 1
     git apply "$CWD/docker/pg_duckdb-extract-field-quoting.patch"
+    # See build-rpm.sh: the base recipe's DuckDB patches.
+    bash "${CWD}/packaging/apply-base-patches.sh" duckdb third_party/duckdb
     # See build-rpm.sh: GitHub tarballs omit submodules and the Makefile gates
     # the DuckDB build on a `.git/modules/third_party/duckdb/HEAD` marker. Drop
     # .git but leave the marker so `make` treats the submodule as checked out.

@@ -28,6 +28,9 @@ In `docker/Dockerfile.duckdb15-base`, drop the `COPY` + `git apply --check` +
 
 The pg_duckdb patch, `docker/pg_duckdb-extract-field-quoting.patch`, stays in
 both builds: without it a crafted `EXTRACT` field name runs as SQL on DuckDB.
+`duckdb-brotli-block-switch-v15.patch` stays in both builds too: it is the
+brotli decoder fix for CVE-2026-111497 in pg_duckdb's DuckDB, not a
+duckdb-iceberg change.
 Everything else — libcurl, vcpkg deps, the pins, the extension config, the
 runtime stage — is identical. In `docker/entrypoint.sh`, leave
 `coldfront.iceberg_bakery_patch` **unset** (and optionally

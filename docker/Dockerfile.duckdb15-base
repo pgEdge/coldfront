@@ -78,6 +78,13 @@ RUN cd /build/pg_duckdb \
  && git apply --check /tmp/pg_duckdb-extract-field-quoting.patch \
  && git apply        /tmp/pg_duckdb-extract-field-quoting.patch
 
+# CVE-2026-111497: DuckDB v1.5.4 vendors brotli 1.1.0, whose decoder its Parquet
+# reader runs on every BROTLI page. The patch ports brotli 1.1.1's fix (see its
+# header); git apply --check fails the build loudly on patch rot.
+COPY docker/duckdb-brotli-block-switch-v15.patch /tmp/duckdb-brotli-v15.patch
+RUN git -C /build/pg_duckdb/third_party/duckdb apply --check /tmp/duckdb-brotli-v15.patch \
+ && git -C /build/pg_duckdb/third_party/duckdb apply         /tmp/duckdb-brotli-v15.patch
+
 # pgEdge propagates -fexcess-precision=standard into CXXFLAGS, which gcc rejects
 # for C++. Strip it after PGXS is included (no-op if absent).
 RUN printf '\noverride CXXFLAGS := $(filter-out -fexcess-precision=standard,$(CXXFLAGS))\n' \

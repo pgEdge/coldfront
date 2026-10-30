@@ -1,7 +1,8 @@
 # PATCHED — duckdb-iceberg patches & build (DuckDB 1.5.x)
 
 ColdFront runs on a **custom-built DuckDB 1.5.4 base image** that carries a
-small set of patches against `duckdb-iceberg` `v1.5-variegata`. This is the one
+small set of patches against `duckdb-iceberg` `v1.5-variegata`, and one against
+DuckDB itself. This is the one
 home for *what* we patch, *why*, *how the base is built*, and *how it is wired
 and verified*. The cold-tier compactor's own story lives in
 [docs/compaction.md](docs/compaction.md).
@@ -23,14 +24,18 @@ and verified*. The cold-tier compactor's own story lives in
 | **The vended secret is kept across binds** | `docker/iceberg-vended-secret-keep-v15.patch` | a repeat bind of a table in one transaction keeps the table's vended storage secret instead of dropping and re-creating it | a statement that reads a table twice under vended credentials (a self-join, a `UNION`, the vector probe's two arms) can have a manifest read land in the gap, find no secret, and go unsigned to the default endpoint: an HTTP 403 that **fails the query** at random, and that **aborts the backend** when the manifest-read patch below is missing too |
 | **A failed manifest read fails the query** (port of upstream 45f323eb) | `docker/iceberg-manifest-read-error-v15.patch` | the shared scan state's destructor catches a manifest-read task's error instead of letting it escape | any failed manifest read (a missing manifest, a store error, the 403 above) is `std::terminate`: **the backend aborts** with signal 6 and the postmaster restarts every server process |
 | **EXTRACT field quoting** (pg_duckdb; the fix of CVE-2026-15741) | `docker/pg_duckdb-extract-field-quoting.patch` | pg_duckdb's vendored ruleutils copies quote the field name of `EXTRACT(field FROM x)` when they deparse a query for DuckDB | a crafted field name reaches DuckDB as SQL and **runs there** with the session's attachments and secrets, from any read of a tiered or decoupled view |
+| **Brotli decoder fix** (port of google/brotli da980636, CVE-2026-111497) | `docker/duckdb-brotli-block-switch-v15.patch` | the brotli 1.1.0 decoder DuckDB v1.5.4 vendors, which its Parquet reader runs on every `BROTLI` page, stops a crafted stream at an invalid block switch, as brotli 1.1.1 does | a crafted Parquet file read through DuckDB drives the decoder into the **out-of-bounds write** of CVE-2026-111497, inside the PostgreSQL backend |
 
 All seven duckdb-iceberg patches apply cleanly to a **pristine** `duckdb-iceberg`
-@ `5edc45f0` (branch `v1.5-variegata`), and the pg_duckdb patch to a pristine
-pg_duckdb @ `c04e6a2`; `docker/Dockerfile.duckdb15-base` `git apply --check`s
-each before applying, failing the build loudly on patch rot. The extension
-package (`packaging/coldfront-duckdb-extensions/build-extensions.sh`) applies
-the same duckdb-iceberg patches, taking the list from that recipe through
-`packaging/apply-base-patches.sh`.
+@ `5edc45f0` (branch `v1.5-variegata`), the pg_duckdb patch to a pristine
+pg_duckdb @ `c04e6a2`, and the brotli patch to pg_duckdb's DuckDB submodule at
+v1.5.4 (`08e34c4`); `docker/Dockerfile.duckdb15-base` `git apply --check`s each
+before applying, failing the build loudly on patch rot. The extension package
+(`packaging/coldfront-duckdb-extensions/build-extensions.sh`) applies the same
+duckdb-iceberg patches, taking the list from that recipe through
+`packaging/apply-base-patches.sh`. The pg_duckdb packages
+(`packaging/pg_duckdb/build-rpm.sh`, `build-deb.sh`) take the brotli patch the
+same way.
 
 ---
 
@@ -257,7 +262,7 @@ port) only.
 | Component | Pin | Notes |
 |---|---|---|
 | pg_duckdb | **merged PR #1025** (`c04e6a2`) | no released tag carries 1.5.x; `git checkout c04e6a2`. Its duckdb submodule is the v1.5.4 tag (`08e34c4`). Patched with `docker/pg_duckdb-extract-field-quoting.patch`. |
-| DuckDB | **v1.5.4 tag** (`08e34c4`) | pinned by pg_duckdb @ `c04e6a2`; the iceberg build re-pins ITS duckdb submodule to the same tag so the extension ABI matches the engine. The `duckdb.*` GUCs + PRE_COMMIT iceberg-commit deferral ColdFront relies on are unchanged. |
+| DuckDB | **v1.5.4 tag** (`08e34c4`) | pinned by pg_duckdb @ `c04e6a2`; the iceberg build re-pins ITS duckdb submodule to the same tag so the extension ABI matches the engine. The `duckdb.*` GUCs + PRE_COMMIT iceberg-commit deferral ColdFront relies on are unchanged. pg_duckdb's copy is compiled with `docker/duckdb-brotli-block-switch-v15.patch` applied; it changes only brotli's decoder, so the engine reports v1.5.4 and matches the extensions' ABI. |
 | duckdb-iceberg | **`v1.5-variegata` @ `5edc45f0`** | extension code the seven patches target — kept fixed, so the patches apply unchanged. The build re-pins its duckdb submodule to the v1.5.4 tag (the branch tracks duckdb `main`, which drifts off the release; verified: `5edc45f0` compiles clean against v1.5.4). Transaction code lives in `src/catalog/rest/transaction/`. |
 | avro | **`7f423d69`** | the pin `v1.5-variegata` uses. |
 | azure | **`v1.5-variegata` @ `563589b2`** | the ABI-matched sibling of iceberg's branch. **NOT `main`** — azure `main` collides at link (`multiple definition of duckdb::FileFlags::FILE_FLAGS_NULL_IF_NOT_EXISTS`). |
@@ -284,11 +289,13 @@ requirements (each a real build failure if missing):
   (`make release`, `OVERRIDE_GIT_DESCRIBE=v1.5.4`) so they are ABI-safe; build
   config is `docker/iceberg-azure-extension-config-v15.cmake`.
 - The seven duckdb-iceberg patches and the pg_duckdb patch are `COPY`'d in and
-  `git apply --check`'d then applied (see the Dockerfile's patch blocks).
+  `git apply --check`'d then applied (see the Dockerfile's patch blocks). The
+  brotli patch is applied the same way to pg_duckdb's DuckDB submodule before
+  `make`, so the shipped `libduckdb.so` has the fixed decoder.
 
 Cold base build is ~30–60 min (vcpkg compiles the Azure SDK + libpq from
-source); incremental rebuilds after a patch change recompile only the iceberg
-extension.
+source); incremental rebuilds after an iceberg patch change recompile only the
+iceberg extension, and a brotli patch change recompiles pg_duckdb and DuckDB.
 
 ## 9. Install / GUCs / image wiring (base/app split)
 
@@ -409,6 +416,6 @@ writer is never the victim.
 
 No code change — flip to stock by unsetting `coldfront.iceberg_bakery_patch`
 (the gate goes false → claim-first even if the async flag stays on). To run a
-genuinely unpatched base, omit the patch `git apply` steps in the base build —
+genuinely unpatched base, omit the duckdb-iceberg patch `git apply` steps in the base build —
 see [DUCKDB_1.5_UNPATCHED.md](DUCKDB_1.5_UNPATCHED.md), including the
 consequence that the compactor will not work.

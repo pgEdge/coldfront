@@ -437,6 +437,12 @@ this project adheres to
   reaches DuckDB as SQL. The base image and the pg_duckdb packages apply
   ColdFront's `pg_duckdb-extract-field-quoting` patch, which quotes the field
   name as PostgreSQL's fix for CVE-2026-15741 does.
+- DuckDB 1.5.4 includes brotli 1.1.0, whose decoder has an out-of-bounds write
+  on a crafted stream (CVE-2026-111497), and DuckDB's Parquet reader runs that
+  decoder on every Brotli-compressed page, so a crafted Parquet file read
+  through DuckDB reached it inside the PostgreSQL backend. The base image and
+  the pg_duckdb packages build DuckDB with brotli 1.1.1's fix, which refuses the
+  stream.
 - A decoupled `INSERT ... SELECT`, a cold `UPDATE ... FROM` and a cold
   `DELETE ... USING` read a `numeric` `NaN` in their PostgreSQL table as `0`,
   with no error, so the write stored `0` or matched rows against `0`. Such a

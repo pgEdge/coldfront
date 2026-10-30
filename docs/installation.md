@@ -154,9 +154,10 @@ table shows each component and its source:
 | Base images | `ghcr.io/pgedge/pgedge-postgres:<pg>-spock5-minimal` and `quay.io/pypa/manylinux_2_28_<arch>` |
 
 The base build runs as three Docker stages: the first builds libcurl and
-pg_duckdb, with ColdFront's pg_duckdb patch applied; the second clones
-duckdb-iceberg at the pinned ref, applies
-ColdFront's seven patches, and compiles the iceberg, avro, azure, and
+pg_duckdb, with ColdFront's pg_duckdb patch applied and its brotli patch
+applied to pg_duckdb's DuckDB; the second clones duckdb-iceberg at the pinned
+ref, applies ColdFront's seven patches, and compiles the iceberg, avro, azure,
+and
 postgres_scanner extensions under vcpkg; the third assembles the runtime. The
 build `git apply --check`s each patch before applying it, so it fails loudly on
 patch rot rather than silently shipping stock iceberg (which fails with HTTP
@@ -197,6 +198,14 @@ session's attachments and secrets. The patch quotes the field name, as
 PostgreSQL's own `ruleutils.c` does since its fix for CVE-2026-15741; a valid
 field such as `year` stays bare, and any other string is refused as a unit. The
 pg_duckdb packages built from `packaging/pg_duckdb` apply the same patch.
+
+ColdFront also applies one patch to DuckDB itself.
+`duckdb-brotli-block-switch-v15` ports brotli 1.1.1's decoder fix for
+CVE-2026-111497 into the brotli 1.1.0 that DuckDB 1.5.4 includes, which
+DuckDB's Parquet reader runs on every Brotli-compressed page. With it, a
+crafted Parquet file is refused instead of driving the decoder out of bounds
+inside a PostgreSQL backend. The pg_duckdb RPM and Debian packages are built
+with the same patch.
 
 ## Building the Image on Docker
 
@@ -353,6 +362,7 @@ sudo make install PG_CONFIG="$(command -v pg_config)"
 You separately need pg_duckdb (DuckDB 1.5.4) and the **patched** iceberg DuckDB
 extension installed in your PostgreSQL. Follow the compile steps in
 [`docker/Dockerfile.duckdb15-base`](https://github.com/pgEdge/ColdFront/blob/main/docker/Dockerfile.duckdb15-base),
+including the brotli patch it applies to pg_duckdb's DuckDB before compiling,
 and copy the built iceberg, avro, azure, and postgres_scanner extensions into
 `$PGDATA/pg_duckdb/extensions/v1.5.4/linux_<arch>/`, as
 [`docker/entrypoint.sh`](https://github.com/pgEdge/ColdFront/blob/main/docker/entrypoint.sh)

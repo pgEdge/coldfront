@@ -727,7 +727,7 @@ The following table lists the services and components ColdFront runs against:
 | Component | Version | Purpose |
 |-----------|---------|---------|
 | PostgreSQL | 16, 17, or 18 | Provides the database with native partitioning; stock PostgreSQL serves a single node, and the Docker image and distributed mode use pgEdge's PostgreSQL build with Spock. |
-| pg_duckdb | commit c04e6a2 (PR #1025), on DuckDB 1.5.4, patched | Runs Iceberg reads and writes through in-process DuckDB, with ColdFront's `EXTRACT` field-quoting patch applied (see [docker/Dockerfile.duckdb15-base](docker/Dockerfile.duckdb15-base)). |
+| pg_duckdb | commit c04e6a2 (PR #1025), on DuckDB 1.5.4, patched | Runs Iceberg reads and writes through in-process DuckDB, with ColdFront's `EXTRACT` field-quoting patch applied, and ColdFront's brotli decoder fix for CVE-2026-111497 applied to its DuckDB (see [docker/Dockerfile.duckdb15-base](docker/Dockerfile.duckdb15-base)). |
 | duckdb-iceberg | `v1.5-variegata` @ `5edc45f0`, patched | Provides Iceberg catalog and I/O for DuckDB, with ColdFront's seven patches applied (see [docker/Dockerfile.duckdb15-base](docker/Dockerfile.duckdb15-base)). |
 | Lakekeeper | latest | Provides the Iceberg REST catalog (a Rust binary). |
 | S3-compatible store | any | Stores the cold data; SeaweedFS, MinIO, AWS S3, and GCS all work. |
@@ -791,6 +791,7 @@ pgedge-coldfront/
 │   ├── Dockerfile.duckdb15-base ← DuckDB 1.5.x base (pg_duckdb on DuckDB 1.5.4 + patched iceberg)
 │   ├── Dockerfile.duckdb15      ← thin coldfront app layer (ARG PG_MAJOR=16|17|18)
 │   ├── iceberg-*.patch          ← duckdb-iceberg patches (bakery commit-refresh + strict-reader interop)
+│   ├── duckdb-*.patch           ← DuckDB patch (the brotli decoder fix)
 │   ├── iceberg-azure-extension-config-v15.cmake ← Azure ADLS extension build config
 │   ├── entrypoint.sh
 │   └── seaweedfs-s3.json        ← SeaweedFS S3 auth config (example)
