@@ -20,8 +20,10 @@ and verified*. The cold-tier compactor's own story lives in
 | **Strict-reader interop** (upstreamable) | `docker/iceberg-manifest-list-format-version-v15.patch`, `docker/iceberg-data-file-format-v15.patch` | make the manifests duckdb-iceberg *writes* readable by strict Apache readers (apache/iceberg-go) | the cold-tier **compactor cannot read the table** - see [docs/compaction.md](docs/compaction.md). pg_duckdb's own reads/writes are unaffected. |
 | **TIMESTAMPTZ transforms in UTC** (port of upstream d3c3348271) | `docker/iceberg-timestamptz-utc-transforms-v15.patch` | year/month/day/hour of a TIMESTAMPTZ partition column are computed on the UTC instant, as the Iceberg spec, duckdb-iceberg's own pruning and iceberg-go take them | a session outside UTC files rows within the zone offset of a boundary in the neighbouring partition, and a UTC-bounded read on the column **prunes them away** |
 | **Schema ids from the highest existing id** (port of upstream c1cfe2ef) | `docker/iceberg-schema-id-allocation-v15.patch` | a new table schema is numbered one above the highest schema id in the metadata, not above the current schema's | once a `DROP COLUMN` returns a table to an earlier schema, the next column change fails with "Attempted to add schema with id N, but this already exists in the table!" and **the table can take no further column change** |
+| **The vended secret is kept across binds** | `docker/iceberg-vended-secret-keep-v15.patch` | a repeat bind of a table in one transaction keeps the table's vended storage secret instead of dropping and re-creating it | a statement that reads a table twice under vended credentials (a self-join, a `UNION`, the vector probe's two arms) can have a manifest read land in the gap, find no secret, and go unsigned to the default endpoint: an HTTP 403 that **aborts the backend** at the pinned ref |
+| **A failed manifest read fails the query** (port of upstream PR #1305) | `docker/iceberg-manifest-read-error-v15.patch` | the shared scan state's destructor catches a manifest-read task's error instead of letting it escape | any failed manifest read (a missing manifest, a store error, the 403 above) is `std::terminate`: **the backend aborts** with signal 6 and the postmaster restarts every server process |
 
-All five patches apply cleanly to a **pristine** `duckdb-iceberg` @ `5edc45f0`
+All seven patches apply cleanly to a **pristine** `duckdb-iceberg` @ `5edc45f0`
 (branch `v1.5-variegata`); `docker/Dockerfile.duckdb15-base`
 `git apply --check`s each before applying, failing the build loudly on patch
 rot.
@@ -192,7 +194,47 @@ that registered the schema inline (`RENAME COLUMN`, `SET DEFAULT`) through
 it. `ci/journey.sh` TC-228, a second add-and-drop cycle on one tiered table,
 fails without it. Dropped when `ICEBERG_REF` reaches a ref that has the fix.
 
-## 6. NOT shipped — no `Commit(ClientContext&)` rewrite
+## 6. The vended secret is kept across binds (one patch)
+
+`iceberg-vended-secret-keep-v15.patch`. Under `ACCESS_DELEGATION_MODE
+VENDED_CREDENTIALS`, every scan bind of a table
+(`IcebergTableEntry::GetScanFunction`, `PrepareIcebergScanFromEntry`,
+`GetVendedCredentials`) creates the table's temporary storage secret again,
+under a name fixed for the transaction, with `REPLACE_ON_CONFLICT`. DuckDB
+v1.5.4 replaces a secret by dropping it and then writing the new one
+(`CatalogSetSecretStorage::StoreSecret`), so for a moment the table has no
+secret. A statement that reads the table twice in one transaction (a
+self-join, a `UNION`, the two arms of ColdFront's vector probe) binds it
+twice; the first bind's manifest reads run on DuckDB's worker threads and
+look the secret up when they open a file, and one that opens a manifest in
+the gap finds none, goes unsigned to DuckDB's default endpoint
+(`<bucket>.s3.amazonaws.com`) and gets an HTTP 403, which the destructor
+below turned into a backend abort. The patch sets both secret inputs to
+`IGNORE_ON_CONFLICT`: a repeat bind keeps the secret already there, which
+every bind of the transaction builds from the same cached table load, and
+the transaction still drops its secrets at its end. The race has no
+deterministic trigger, so no CI check covers it; measured by hand on
+2026-10-06, 7,200 double-read sessions passed with the patch against 3 to 4
+aborts per 1,200 without. Dropped when `ICEBERG_REF` reaches a ref that
+keeps the secret.
+
+## 7. A failed manifest read fails the query, not the backend (one patch, a port)
+
+`iceberg-manifest-read-error-v15.patch` ports upstream duckdb-iceberg PR
+#1305 (merged into `main` on 2026-08-08, not on `v1.5-variegata` up to
+`5dcf5070`). The shared scan state's destructor
+(`~IcebergMultiFileListSharedState`) drains the manifest-read tasks with
+`WorkOnTasks()`, which rethrows an error a task pushed (a missing manifest,
+a store error, a refused connection, the 403 above). An exception leaving a
+destructor is `std::terminate`: the backend aborts with signal 6, and the
+postmaster ends every other server process and runs crash recovery. The
+patch wraps the call in `try`/`catch`, as upstream did; the error still
+fails the query on the regular scan path. `ci/journey.sh` TC-264 (one
+manifest deleted from the store, a read that must fail with the store's
+HTTP 404 while no backend aborts) fails without it. Dropped when
+`ICEBERG_REF` reaches a ref that has the fix.
+
+## 8. NOT shipped — no `Commit(ClientContext&)` rewrite
 
 v1.5's `IcebergTransaction::Commit` already copies the caller's `ClientConfig`
 into its commit-time connection, so `s3_access_key_id` etc. are available; a

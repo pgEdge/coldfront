@@ -16,13 +16,15 @@ DuckDB 1.5).
 ## The build delta (vs the patched base)
 
 In `docker/Dockerfile.duckdb15-base`, drop the `COPY` + `git apply --check` +
-`git apply` of all five patches:
+`git apply` of all seven patches:
 
 - `iceberg-bakery-aware-commit-refresh-v15.patch`
 - `iceberg-manifest-list-format-version-v15.patch`
 - `iceberg-data-file-format-v15.patch`
 - `iceberg-timestamptz-utc-transforms-v15.patch`
 - `iceberg-schema-id-allocation-v15.patch`
+- `iceberg-vended-secret-keep-v15.patch`
+- `iceberg-manifest-read-error-v15.patch`
 
 Everything else — libcurl, vcpkg deps, the pins, the extension config, the
 runtime stage — is identical. In `docker/entrypoint.sh`, leave

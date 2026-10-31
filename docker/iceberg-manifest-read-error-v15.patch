@@ -1,0 +1,47 @@
+# iceberg-manifest-read-error-v15.patch
+# iceberg-manifest-read-error-v15.patch
+#
+# Applies to: duckdb-iceberg @ 5edc45f0 (branch v1.5-variegata), DuckDB v1.5.x.
+#
+# A port of upstream duckdb-iceberg PR #1305 ("Prevent std::terminate when
+# manifest-read tasks fail during scan state destruction"), merged into main on
+# 2026-08-08 and not on v1.5-variegata (checked up to 5dcf5070). Upstream's
+# file is src/planning/scan_plan/iceberg_scan_plan_state.cpp; at this ref the
+# destructor is IcebergMultiFileListSharedState's.
+#
+# Problem: the destructor calls the manifest-read task executor's
+# WorkOnTasks(), which rethrows an error a task pushed: a missing manifest, a
+# store error, a refused connection, an unsigned read's 403. An exception
+# leaving a destructor is std::terminate: the backend aborts with signal 6 and
+# the postmaster ends every other server process, reinitializes shared memory
+# and runs crash recovery.
+#
+# Fix: the call is wrapped in try/catch, as upstream did. The error still
+# fails the query on the regular scan path, where it is reported.
+#
+# ci/journey.sh TC-264 fails without this patch: with one manifest of a table
+# deleted from the store, a read of the table must fail with the store's HTTP
+# 404 while no backend aborts. Drop the patch when ICEBERG_REF moves to a ref
+# that has the fix: git apply --check then fails on the removed lines.
+#
+diff --git a/src/planning/iceberg_multi_file_list.cpp b/src/planning/iceberg_multi_file_list.cpp
+index 7f3bd4ad9..0169a78ad 100644
+--- a/src/planning/iceberg_multi_file_list.cpp
++++ b/src/planning/iceberg_multi_file_list.cpp
+@@ -125,8 +125,14 @@ IcebergMultiFileListSharedState::IcebergMultiFileListSharedState(ClientContext &
+ 
+ IcebergMultiFileListSharedState::~IcebergMultiFileListSharedState() {
+ 	if (data_manifest_read_state) {
+-		//! FIXME: this could throw, if the tasks encountered an error
+-		data_manifest_read_state->executor.WorkOnTasks();
++		try {
++			data_manifest_read_state->executor.WorkOnTasks();
++		} catch (...) {
++			//! WorkOnTasks rethrows errors pushed by the manifest-read tasks. Destructors are implicitly
++			//! noexcept (and this one can run while another exception is already unwinding), so letting the
++			//! error escape calls std::terminate and aborts the whole process. Errors are still reported on
++			//! the regular scan path (GetFile/FinishScanTasks); here they can only be swallowed.
++		}
+ 	}
+ }
+ 
