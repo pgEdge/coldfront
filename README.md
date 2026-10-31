@@ -812,7 +812,7 @@ pgedge-coldfront/
 ├── docker-compose.yml          ← END-USER single-node stack (ports published)
 ├── docker-compose.matrix.yml   ← CI only: single-node vanilla matrix
 ├── docker-compose.matrix-azure.yml ← CI only: vanilla matrix on Azure ADLS
-├── docker-compose.aws-vended.yml ← CI only: Lakekeeper's AWS identity for the aws-vended lane
+├── docker-compose.cloud.yml    ← CI only: Lakekeeper's federated identity for the aws-vended and azure-vended lanes
 ├── docker-compose.mesh.yml     ← CI only: 3-node Spock mesh
 ├── docker-compose.mesh-azure.yml ← CI only: 3-node Spock mesh on Azure ADLS
 ├── run-ci-local.sh             ← pre-commit gate (ci/matrix.sh --quick)

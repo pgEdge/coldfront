@@ -183,7 +183,9 @@ backend_ready() {
         # token or, locally, the caller's session
         aws-vended) [ -n "${COLDFRONT_AWS_DATA_ROLE_ARN:-}" ] && [ -n "${COLDFRONT_AWS_EXTERNAL_ID:-}" ] && [ -n "${COLDFRONT_AWS_BUCKET:-}" ];;
         azure)  [ -n "${COLDFRONT_AZURE_CONNECTION_STRING:-}" ];;
-        azure-vended) [ -n "${COLDFRONT_AZURE_KEY:-}" ];;
+        # with the account's key, or with the managed identity and a token (the
+        # cloud-azure environment, whose account has key access off)
+        azure-vended) [ -n "${COLDFRONT_AZURE_ACCOUNT:-}" ] && { [ -n "${COLDFRONT_AZURE_KEY:-}" ] || [ -n "${COLDFRONT_AZURE_TOKEN_FILE:-}" ]; };;
         gcs)    [ -n "${COLDFRONT_GCS_ACCESS_KEY:-}" ];;
         *)      return 1;;
     esac
@@ -237,6 +239,7 @@ case "$SCOPE" in
   backend)
     backend_ready "$BE_ONLY" || { echo "matrix.sh: backend $BE_ONLY has no identifiers in the environment"; exit 2; }
     for pg in ${PG_ONLY:-18}; do
+      case "$BE_ONLY" in azure|azure-vended) prebuild_duckdb15 "$pg" || { CELL_FAIL=$((CELL_FAIL + 1)); continue; };; esac
       for mode in tiered decoupled; do
         for tgt in primary standby; do
           run_cell "pg${pg}·vanilla·${mode}·${tgt}·${BE_ONLY}" vcell "$pg" "$mode" "$BE_ONLY" "$tgt"

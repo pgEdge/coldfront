@@ -34,5 +34,26 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - name: ci/cloud.sh sweep
-        run: ci/cloud.sh sweep
+      - name: ci/cloud.sh aws sweep
+        run: ci/cloud.sh aws sweep
+
+  azure:
+    name: sweep (azure)
+    environment:
+      name: cloud-azure
+      deployment: false
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      COLDFRONT_AZURE_ACCOUNT: ${{ vars.COLDFRONT_AZURE_ACCOUNT }}
+      COLDFRONT_AZURE_FILESYSTEM: ${{ vars.COLDFRONT_AZURE_FILESYSTEM }}
+      COLDFRONT_AZURE_CLIENT_ID: ${{ vars.COLDFRONT_AZURE_CLIENT_ID }}
+      COLDFRONT_AZURE_TENANT_ID: ${{ vars.COLDFRONT_AZURE_TENANT_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: ci/cloud.sh azure sweep
+        run: ci/cloud.sh azure sweep

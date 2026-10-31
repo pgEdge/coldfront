@@ -1,0 +1,14 @@
+# CI override for the cloud lanes with a federated identity (aws-vended,
+# azure-vended without a storage key), used alongside the lane's own compose
+# file. Lakekeeper's identity comes from the environment file ci/topo/vanilla.sh
+# writes: the GitHub role (AWS) or the managed identity's client and tenant IDs
+# (Azure) and the job's OIDC token, mounted read-only at /oidc, or for a local
+# AWS run the caller's own session. Lakekeeper assumes the role or signs the
+# delegation keys from that identity and vends per-table credentials to DuckDB;
+# nothing here reaches the database container.
+services:
+  lakekeeper:
+    env_file:
+      - ${CF_LK_ENV_DIR}/lakekeeper.env
+    volumes:
+      - ${CF_LK_TOKEN_DIR}:/oidc:ro

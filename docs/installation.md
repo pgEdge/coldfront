@@ -395,12 +395,15 @@ gitleaks secret scan, a go-licenses check, and the path-filtered walkthrough
 workflow, which the local gate does not.
 
 On `main` only, GitHub also runs the `aws-vended` cells against a real AWS
-bucket (`ci/matrix.sh --backend aws-vended`, inside `ci/cloud.sh`). The job
-holds no cloud credential: it requests a GitHub OIDC token, Lakekeeper assumes
-an IAM role from it and vends per-table credentials to DuckDB. The account's
-identifiers are the variables of the `cloud-aws` environment, whose branch
-rule allows `main` alone. Each cell writes under its own prefix and purges it
-at teardown, the job purges every prefix again when it ends, and an hourly
+bucket and the `azure-vended` cells against a real ADLS Gen2 account
+(`ci/matrix.sh --backend <backend>`, inside `ci/cloud.sh <cloud>`). The jobs
+hold no cloud credential: each requests a GitHub OIDC token, and Lakekeeper
+assumes an IAM role from it (AWS) or signs user-delegation SAS tokens as a
+managed identity (Azure, on an account with key access off), vending
+per-table credentials to DuckDB. The accounts' identifiers are the variables
+of the `cloud-aws` and `cloud-azure` environments, whose branch rules allow
+`main` alone. Each cell writes under its own prefix and purges it at
+teardown, the job purges every prefix again when it ends, and an hourly
 workflow
 ([.github/workflows/sweep.yml](https://github.com/pgEdge/ColdFront/blob/main/.github/workflows/sweep.yml))
 removes anything older than six hours and fails if it found something.
@@ -433,7 +436,7 @@ it then requires; a lane turned on without the rest fails instead of staying
 | `vended` | SeaweedFS STS credential vending (hermetic, vanilla only) | None; this backend always runs. | None |
 | `aws`   | Real AWS S3 (native virtual-hosted addressing over HTTPS) | `COLDFRONT_AWS_ACCESS_KEY` | `COLDFRONT_AWS_SECRET_KEY`, `_BUCKET`, `_REGION` |
 | `azure` | Real Azure ADLS Gen2 | `COLDFRONT_AZURE_CONNECTION_STRING` | `COLDFRONT_AZURE_ACCOUNT`, `_FILESYSTEM`, `_KEY` |
-| `azure-vended` | Real Azure ADLS Gen2 with SAS vending (vanilla only) | `COLDFRONT_AZURE_KEY` | `COLDFRONT_AZURE_ACCOUNT`, `_FILESYSTEM` |
+| `azure-vended` | Real Azure ADLS Gen2 with SAS vending (vanilla only) | `COLDFRONT_AZURE_ACCOUNT` | `COLDFRONT_AZURE_FILESYSTEM`, and either `COLDFRONT_AZURE_KEY` (the account's key as the warehouse credential) or, in CI, the job's OIDC token with `COLDFRONT_AZURE_CLIENT_ID` and `_TENANT_ID` (the managed identity, on an account with key access off) |
 | `aws-vended` | Real AWS S3 with STS vending and no stored key (vanilla only) | `COLDFRONT_AWS_DATA_ROLE_ARN` | `COLDFRONT_AWS_EXTERNAL_ID`, `_BUCKET`, `_REGION`; in CI also `_CI_ROLE_ARN` and the job's OIDC token, locally the caller's own AWS session |
 | `gcs`   | Real GCS via S3 interoperability (HMAC) | `COLDFRONT_GCS_ACCESS_KEY` | `COLDFRONT_GCS_SECRET_KEY`, `_BUCKET` |
 

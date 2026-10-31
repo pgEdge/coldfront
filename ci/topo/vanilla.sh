@@ -38,10 +38,18 @@ esac; done
 if [ "$BACKEND" = azure ] || [ "$BACKEND" = azure-vended ]; then
   : "${COLDFRONT_AZURE_ACCOUNT:?--backend azure needs COLDFRONT_AZURE_ACCOUNT}"
   : "${COLDFRONT_AZURE_FILESYSTEM:?--backend azure needs COLDFRONT_AZURE_FILESYSTEM}"
-  : "${COLDFRONT_AZURE_KEY:?--backend azure needs COLDFRONT_AZURE_KEY}"
 fi
 if [ "$BACKEND" = azure ]; then
+  : "${COLDFRONT_AZURE_KEY:?--backend azure needs COLDFRONT_AZURE_KEY}"
   : "${COLDFRONT_AZURE_CONNECTION_STRING:?--backend azure needs COLDFRONT_AZURE_CONNECTION_STRING}"
+fi
+# azure-vended runs with the account's storage key as Lakekeeper's credential,
+# or, on an account with key access off, with Lakekeeper's own identity: the
+# managed identity's client and tenant IDs and the job's OIDC token.
+if [ "$BACKEND" = azure-vended ] && [ -z "${COLDFRONT_AZURE_KEY:-}" ]; then
+  : "${COLDFRONT_AZURE_TOKEN_FILE:?--backend azure-vended needs COLDFRONT_AZURE_KEY or COLDFRONT_AZURE_TOKEN_FILE}"
+  : "${COLDFRONT_AZURE_CLIENT_ID:?--backend azure-vended with a token needs COLDFRONT_AZURE_CLIENT_ID}"
+  : "${COLDFRONT_AZURE_TENANT_ID:?--backend azure-vended with a token needs COLDFRONT_AZURE_TENANT_ID}"
 fi
 # GCS is the s3 path pointed at the GCS S3-interop endpoint with an HMAC key pair
 # + a bucket (no separate backend; Lakekeeper uses an s3 profile @ storage.googleapis.com).
@@ -78,29 +86,44 @@ require_base "$PG" || exit 1    # exports COLDFRONT_BASE for the same build
 COMPOSE="docker compose -f $COMPOSE_FILE"
 DB=coldfront-db-1
 
-CELL_PREFIX=""
-if [ "$BACKEND" = aws-vended ]; then
-  # Lakekeeper's identity, as an environment file the aws-vended compose override
-  # reads: the GitHub role and the token file in CI (COLDFRONT_AWS_TOKEN_FILE,
-  # mounted at /oidc), otherwise the caller's own session. The container runs as
-  # another user, so the directory and file are world-readable.
-  CF_LK_AWS_DIR=$(mktemp -d /tmp/coldfront-aws.XXXXXX); chmod 755 "$CF_LK_AWS_DIR"; export CF_LK_AWS_DIR
+# A cloud lane with a federated identity: Lakekeeper's identity goes in an
+# environment file the cloud compose override reads, the token directory is
+# mounted at /oidc, and the cell writes under its own prefix, which the teardown
+# purges. The container runs as another user, so the directory and file are
+# world-readable.
+CELL_PREFIX=""; TOKEN_FILE=""
+case "$BACKEND" in
+  aws-vended)   TOKEN_FILE="${COLDFRONT_AWS_TOKEN_FILE:-}";;
+  azure-vended) TOKEN_FILE="${COLDFRONT_AZURE_TOKEN_FILE:-}";;
+esac
+if [ "$BACKEND" = aws-vended ] || { [ "$BACKEND" = azure-vended ] && [ -n "$TOKEN_FILE" ]; }; then
+  CF_LK_ENV_DIR=$(mktemp -d /tmp/coldfront-cloud.XXXXXX); chmod 755 "$CF_LK_ENV_DIR"; export CF_LK_ENV_DIR
   {
-    echo "LAKEKEEPER__ENABLE_AWS_SYSTEM_CREDENTIALS=true"
-    echo "AWS_REGION=$COLDFRONT_AWS_REGION"
-    if [ -n "${COLDFRONT_AWS_TOKEN_FILE:-}" ]; then
-      echo "AWS_ROLE_ARN=${COLDFRONT_AWS_CI_ROLE_ARN:?COLDFRONT_AWS_TOKEN_FILE needs COLDFRONT_AWS_CI_ROLE_ARN}"
-      echo "AWS_WEB_IDENTITY_TOKEN_FILE=/oidc/$(basename "$COLDFRONT_AWS_TOKEN_FILE")"
+    if [ "$BACKEND" = aws-vended ]; then
+      echo "LAKEKEEPER__ENABLE_AWS_SYSTEM_CREDENTIALS=true"
+      echo "AWS_REGION=$COLDFRONT_AWS_REGION"
+      if [ -n "$TOKEN_FILE" ]; then
+        # The GitHub role, assumed with the job's token.
+        echo "AWS_ROLE_ARN=${COLDFRONT_AWS_CI_ROLE_ARN:?COLDFRONT_AWS_TOKEN_FILE needs COLDFRONT_AWS_CI_ROLE_ARN}"
+        echo "AWS_WEB_IDENTITY_TOKEN_FILE=/oidc/$(basename "$TOKEN_FILE")"
+      else
+        # A local run: the caller's own session.
+        aws configure export-credentials --format env | sed 's/^export //'
+      fi
     else
-      aws configure export-credentials --format env | sed 's/^export //'
+      # The managed identity, through workload identity federation.
+      echo "LAKEKEEPER__ENABLE_AZURE_SYSTEM_CREDENTIALS=true"
+      echo "AZURE_CLIENT_ID=$COLDFRONT_AZURE_CLIENT_ID"
+      echo "AZURE_TENANT_ID=$COLDFRONT_AZURE_TENANT_ID"
+      echo "AZURE_FEDERATED_TOKEN_FILE=/oidc/$(basename "$TOKEN_FILE")"
     fi
-  } > "$CF_LK_AWS_DIR/lakekeeper.env"
-  chmod 644 "$CF_LK_AWS_DIR/lakekeeper.env"
-  CF_LK_AWS_TOKEN_DIR="${COLDFRONT_AWS_TOKEN_FILE:+$(dirname "$COLDFRONT_AWS_TOKEN_FILE")}"
-  export CF_LK_AWS_TOKEN_DIR="${CF_LK_AWS_TOKEN_DIR:-$CF_LK_AWS_DIR}"
+  } > "$CF_LK_ENV_DIR/lakekeeper.env"
+  chmod 644 "$CF_LK_ENV_DIR/lakekeeper.env"
+  CF_LK_TOKEN_DIR="${TOKEN_FILE:+$(dirname "$TOKEN_FILE")}"
+  export CF_LK_TOKEN_DIR="${CF_LK_TOKEN_DIR:-$CF_LK_ENV_DIR}"
   CELL_PREFIX=$(cell_prefix)
   [ -n "${COLDFRONT_CI_PREFIXES:-}" ] && echo "$CELL_PREFIX/" >> "$COLDFRONT_CI_PREFIXES"
-  COMPOSE="$COMPOSE -f docker-compose.aws-vended.yml"
+  COMPOSE="$COMPOSE -f docker-compose.cloud.yml"
 fi
 
 trap topo_teardown EXIT
@@ -153,7 +176,15 @@ curl -sf "http://$LK_IP:8181/management/v1/bootstrap" -X POST -H "Content-Type: 
 # Backend-specific warehouse profile + credential. s3 validates by writing a
 # probe object (SeaweedFS may still be warming up → retry); azure (ADLS Gen2)
 # validates against the real account (identifiers + key from COLDFRONT_AZURE_*).
-if [ "$BACKEND" = azure ] || [ "$BACKEND" = azure-vended ]; then
+if [ "$BACKEND" = azure-vended ] && [ -n "$TOKEN_FILE" ]; then
+  # The managed identity signs the delegation keys; the warehouse holds no key,
+  # and the cell's prefix is its key-prefix under the filesystem.
+  WH_BODY="{
+    \"warehouse-name\":\"wh-azure\",
+    \"storage-profile\":{\"type\":\"adls\",\"filesystem\":\"${COLDFRONT_AZURE_FILESYSTEM}\",\"account-name\":\"${COLDFRONT_AZURE_ACCOUNT}\",\"key-prefix\":\"${CELL_PREFIX}\"},
+    \"storage-credential\":{\"type\":\"az\",\"credential-type\":\"azure-system-identity\"}
+  }"
+elif [ "$BACKEND" = azure ] || [ "$BACKEND" = azure-vended ]; then
   WH_BODY="{
     \"warehouse-name\":\"wh-azure\",
     \"storage-profile\":{\"type\":\"adls\",\"filesystem\":\"${COLDFRONT_AZURE_FILESYSTEM}\",\"account-name\":\"${COLDFRONT_AZURE_ACCOUNT}\"},
