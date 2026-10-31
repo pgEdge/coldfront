@@ -154,3 +154,75 @@ jobs:
           go install github.com/google/go-licenses@latest
           "$(go env GOPATH)/bin/go-licenses" check ./cmd/... ./internal/... \
             --ignore github.com/pgedge/coldfront
+
+  # The real-AWS lane, on main only: the cloud-aws environment allows no other
+  # branch, and its variables are identifiers, not secrets. The job gets a
+  # federated identity through its OIDC token (id-token: write), which only
+  # Lakekeeper uses: it assumes the data role and vends per-table credentials.
+  # Every cell writes under its own prefix and purges it at teardown; the
+  # job-end step purges them again under `if: always()`, so a failed or
+  # cancelled job leaves nothing in the bucket.
+  cloud-aws:
+    name: cloud (aws-vended, PG 18)
+    if: github.event_name != 'pull_request'
+    environment:
+      name: cloud-aws
+      deployment: false
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      PG_ONLY: '18'
+      COLDFRONT_AWS_BUCKET: ${{ vars.COLDFRONT_AWS_BUCKET }}
+      COLDFRONT_AWS_REGION: ${{ vars.COLDFRONT_AWS_REGION }}
+      COLDFRONT_AWS_CI_ROLE_ARN: ${{ vars.COLDFRONT_AWS_CI_ROLE_ARN }}
+      COLDFRONT_AWS_DATA_ROLE_ARN: ${{ vars.COLDFRONT_AWS_DATA_ROLE_ARN }}
+      COLDFRONT_AWS_EXTERNAL_ID: ${{ vars.COLDFRONT_AWS_EXTERNAL_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install golangci-lint (the compactor build gate)
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
+            | sh -s -- -b "$(go env GOPATH)/bin" v2.12.2
+
+      - name: Log in to GHCR (pull base image)
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: aws-vended cells
+        run: ci/cloud.sh run -- ci/matrix.sh --backend aws-vended
+      - name: purge the cells' prefixes
+        if: always()
+        run: ci/cloud.sh finish
+
+  sweep-aws:
+    name: sweep (aws)
+    if: github.event_name != 'pull_request'
+    environment:
+      name: cloud-aws
+      deployment: false
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      COLDFRONT_AWS_BUCKET: ${{ vars.COLDFRONT_AWS_BUCKET }}
+      COLDFRONT_AWS_REGION: ${{ vars.COLDFRONT_AWS_REGION }}
+      COLDFRONT_AWS_CI_ROLE_ARN: ${{ vars.COLDFRONT_AWS_CI_ROLE_ARN }}
+      COLDFRONT_AWS_DATA_ROLE_ARN: ${{ vars.COLDFRONT_AWS_DATA_ROLE_ARN }}
+      COLDFRONT_AWS_EXTERNAL_ID: ${{ vars.COLDFRONT_AWS_EXTERNAL_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: ci/cloud.sh sweep
+        run: ci/cloud.sh sweep

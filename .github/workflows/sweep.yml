@@ -1,0 +1,38 @@
+name: Sweep
+
+# Removes anything a cloud CI run left behind. Every cell purges its own prefix
+# at teardown and every cloud job purges its prefixes at job end, so the sweep
+# finds something only when a runner died without running either; it then
+# deletes the leftovers and fails, so the leak is seen. It runs hourly and on
+# demand, on main only, with the same federated identity as the cloud jobs.
+
+on:
+  schedule:
+    - cron: '30 * * * *'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  aws:
+    name: sweep (aws)
+    environment:
+      name: cloud-aws
+      deployment: false
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      COLDFRONT_AWS_BUCKET: ${{ vars.COLDFRONT_AWS_BUCKET }}
+      COLDFRONT_AWS_REGION: ${{ vars.COLDFRONT_AWS_REGION }}
+      COLDFRONT_AWS_CI_ROLE_ARN: ${{ vars.COLDFRONT_AWS_CI_ROLE_ARN }}
+      COLDFRONT_AWS_DATA_ROLE_ARN: ${{ vars.COLDFRONT_AWS_DATA_ROLE_ARN }}
+      COLDFRONT_AWS_EXTERNAL_ID: ${{ vars.COLDFRONT_AWS_EXTERNAL_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: ci/cloud.sh sweep
+        run: ci/cloud.sh sweep

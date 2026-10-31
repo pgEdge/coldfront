@@ -121,6 +121,52 @@ topo_teardown() {
     [ "${KEEP:-0}" = 1 ] && return 0
     docker rm -f "$CF_STANDBY" >/dev/null 2>&1 || true
     $COMPOSE down -v >/dev/null 2>&1 || true
+    # A cloud cell's prefix is purged after its writers are gone (AWS documents
+    # that aborting an upload during a part upload "might or might not
+    # succeed"), and a purge that leaves anything fails the cell.
+    if [ -n "${CELL_PREFIX:-}" ]; then
+        s3_purge "$COLDFRONT_AWS_BUCKET" "$CELL_PREFIX/" || { echo "purge of $CELL_PREFIX failed" >&2; exit 1; }
+    fi
+}
+
+# ── Cloud cells ───────────────────────────────────────────────────────────────
+# cell_prefix: the key prefix one cloud cell writes under (the warehouse's
+# key-prefix), and the only thing its purge removes:
+# coldfront-ci/<UTC yyyymmddThhmmssZ>-<random>.
+cell_prefix() { printf 'coldfront-ci/%s-%s' "$(date -u +%Y%m%dT%H%M%SZ)" "$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n')"; }
+
+# s3cli <args...>: the AWS CLI from AWS's own image, pinned by digest, so a
+# host's CLI packaging cannot break a purge (Ubuntu's 2.31.35 build on Python
+# 3.14 fails on list-objects-v2 before it sends a request). Credentials reach it
+# through the environment only: static keys, or AWS_CONFIG_FILE and AWS_PROFILE
+# for the token-based role chain, whose directory (COLDFRONT_AWS_DIR) is mounted
+# at its own path so the config's file paths hold inside the container.
+S3CLI_IMAGE="public.ecr.aws/aws-cli/aws-cli:2.37.9@sha256:92de75724b6a746951f0e8b915d86bbccd7cb55aff96cd0cb4f7017272160780"
+s3cli() {
+    docker run --rm ${COLDFRONT_AWS_DIR:+-v "$COLDFRONT_AWS_DIR:$COLDFRONT_AWS_DIR:ro"} \
+        -e AWS_CONFIG_FILE -e AWS_PROFILE -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
+        -e AWS_REGION="${COLDFRONT_AWS_REGION:-}" "$S3CLI_IMAGE" "$@"
+}
+
+# s3_purge <bucket> <prefix>: abort every incomplete multipart upload and
+# delete every object under one cell's prefix, then list both again and fail
+# unless nothing is left. Refuses a prefix that is not exactly one cell's: an
+# empty one would empty the bucket, and one without its trailing slash would
+# also match a longer sibling. In an unversioned bucket a delete is final, so an
+# empty listing means no versions or delete markers either.
+s3_purge() {
+    local bucket="$1" prefix="$2" key upload_id objects uploads
+    [[ $prefix =~ ^coldfront-ci/[0-9]{8}T[0-9]{6}Z-[0-9a-f]+/$ ]] || { echo "s3_purge: refusing prefix '$prefix'" >&2; return 1; }
+    s3cli s3api list-multipart-uploads --bucket "$bucket" --prefix "$prefix" \
+        --query 'Uploads[].[Key, UploadId] || `[]`' --output text |
+    while IFS=$'\t' read -r key upload_id; do
+        [ -n "$key" ] && s3cli s3api abort-multipart-upload --bucket "$bucket" --key "$key" --upload-id "$upload_id" </dev/null
+    done
+    s3cli s3 rm "s3://$bucket/$prefix" --recursive --only-show-errors
+    objects=$(s3cli s3api list-objects-v2 --bucket "$bucket" --prefix "$prefix" --query 'length(Contents || `[]`)' --output json)
+    uploads=$(s3cli s3api list-multipart-uploads --bucket "$bucket" --prefix "$prefix" --query 'length(Uploads || `[]`)' --output json)
+    echo "purged $prefix: $objects objects and $uploads incomplete uploads left"
+    [ "$objects" = 0 ] && [ "$uploads" = 0 ]
 }
 
 # create_warehouse_and_seed <lk_ip> <wh_body>  — POST the (backend-specific) Lakekeeper

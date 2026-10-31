@@ -60,12 +60,48 @@ if [ "$BACKEND" = aws ]; then
   : "${COLDFRONT_AWS_BUCKET:?--backend aws needs COLDFRONT_AWS_BUCKET}"
   : "${COLDFRONT_AWS_REGION:?--backend aws needs COLDFRONT_AWS_REGION}"
 fi
+# aws-vended is real AWS S3 with no credential anywhere in the stack: Lakekeeper
+# assumes the data role from its own identity (the GitHub role through the job's
+# OIDC token in CI, the caller's session locally) and vends per-table STS
+# credentials to DuckDB. The identifiers are the cloud-aws environment's
+# variables; the cell writes under its own prefix, which the teardown purges.
+if [ "$BACKEND" = aws-vended ]; then
+  : "${COLDFRONT_AWS_BUCKET:?--backend aws-vended needs COLDFRONT_AWS_BUCKET}"
+  : "${COLDFRONT_AWS_REGION:?--backend aws-vended needs COLDFRONT_AWS_REGION}"
+  : "${COLDFRONT_AWS_DATA_ROLE_ARN:?--backend aws-vended needs COLDFRONT_AWS_DATA_ROLE_ARN}"
+  : "${COLDFRONT_AWS_EXTERNAL_ID:?--backend aws-vended needs COLDFRONT_AWS_EXTERNAL_ID}"
+fi
 
 cd "$ROOT"
 export PG_MAJOR="$PG"           # consumed by docker-compose.matrix.yml build arg + entrypoint
 require_base "$PG" || exit 1    # exports COLDFRONT_BASE for the same build
 COMPOSE="docker compose -f $COMPOSE_FILE"
 DB=coldfront-db-1
+
+CELL_PREFIX=""
+if [ "$BACKEND" = aws-vended ]; then
+  # Lakekeeper's identity, as an environment file the aws-vended compose override
+  # reads: the GitHub role and the token file in CI (COLDFRONT_AWS_TOKEN_FILE,
+  # mounted at /oidc), otherwise the caller's own session. The container runs as
+  # another user, so the directory and file are world-readable.
+  CF_LK_AWS_DIR=$(mktemp -d /tmp/coldfront-aws.XXXXXX); chmod 755 "$CF_LK_AWS_DIR"; export CF_LK_AWS_DIR
+  {
+    echo "LAKEKEEPER__ENABLE_AWS_SYSTEM_CREDENTIALS=true"
+    echo "AWS_REGION=$COLDFRONT_AWS_REGION"
+    if [ -n "${COLDFRONT_AWS_TOKEN_FILE:-}" ]; then
+      echo "AWS_ROLE_ARN=${COLDFRONT_AWS_CI_ROLE_ARN:?COLDFRONT_AWS_TOKEN_FILE needs COLDFRONT_AWS_CI_ROLE_ARN}"
+      echo "AWS_WEB_IDENTITY_TOKEN_FILE=/oidc/$(basename "$COLDFRONT_AWS_TOKEN_FILE")"
+    else
+      aws configure export-credentials --format env | sed 's/^export //'
+    fi
+  } > "$CF_LK_AWS_DIR/lakekeeper.env"
+  chmod 644 "$CF_LK_AWS_DIR/lakekeeper.env"
+  CF_LK_AWS_TOKEN_DIR="${COLDFRONT_AWS_TOKEN_FILE:+$(dirname "$COLDFRONT_AWS_TOKEN_FILE")}"
+  export CF_LK_AWS_TOKEN_DIR="${CF_LK_AWS_TOKEN_DIR:-$CF_LK_AWS_DIR}"
+  CELL_PREFIX=$(cell_prefix)
+  [ -n "${COLDFRONT_CI_PREFIXES:-}" ] && echo "$CELL_PREFIX/" >> "$COLDFRONT_CI_PREFIXES"
+  COMPOSE="$COMPOSE -f docker-compose.aws-vended.yml"
+fi
 
 trap topo_teardown EXIT
 
@@ -90,6 +126,7 @@ case "$BACKEND" in
   azure-vended) SW_IP="";;
   gcs)    SW_IP="";;
   aws)    SW_IP="";;
+  aws-vended) SW_IP="";;
   *)      SW_IP=$(ip coldfront-seaweedfs-1);;   # s3 (static) + vended
 esac
 
@@ -138,6 +175,15 @@ elif [ "$BACKEND" = aws ]; then
     \"warehouse-name\":\"wh\",
     \"storage-profile\":{\"type\":\"s3\",\"bucket\":\"${COLDFRONT_AWS_BUCKET}\",\"key-prefix\":\"coldfront-ci-aws\",\"region\":\"${COLDFRONT_AWS_REGION}\",\"path-style-access\":false,\"flavor\":\"aws\",\"sts-enabled\":false,\"remote-signing-enabled\":false},
     \"storage-credential\":{\"type\":\"s3\",\"credential-type\":\"access-key\",\"aws-access-key-id\":\"${COLDFRONT_AWS_ACCESS_KEY}\",\"aws-secret-access-key\":\"${COLDFRONT_AWS_SECRET_KEY}\"}
+  }"
+elif [ "$BACKEND" = aws-vended ]; then
+  # Real AWS S3 with vended credentials: the warehouse holds no key. Lakekeeper
+  # assumes the data role with the external ID from its own identity and vends
+  # per-table STS credentials; the cell's prefix is the warehouse's key-prefix.
+  WH_BODY="{
+    \"warehouse-name\":\"wh\",
+    \"storage-profile\":{\"type\":\"s3\",\"bucket\":\"${COLDFRONT_AWS_BUCKET}\",\"key-prefix\":\"${CELL_PREFIX}\",\"region\":\"${COLDFRONT_AWS_REGION}\",\"path-style-access\":false,\"flavor\":\"aws\",\"sts-enabled\":true,\"assume-role-arn\":\"${COLDFRONT_AWS_DATA_ROLE_ARN}\",\"remote-signing-enabled\":false},
+    \"storage-credential\":{\"type\":\"s3\",\"credential-type\":\"aws-system-identity\",\"external-id\":\"${COLDFRONT_AWS_EXTERNAL_ID}\"}
   }"
 elif [ "$BACKEND" = vended ]; then
   # Vended: SeaweedFS issues per-table STS creds. sts-enabled + assume-role-arn

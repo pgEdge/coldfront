@@ -77,7 +77,7 @@ esac; done
 storage_secret_sql() {
     if [ "$BACKEND" = azure-vended ]; then
         printf "SELECT coldfront.set_storage_secret_vended('azure');"
-    elif [ "$BACKEND" = vended ]; then
+    elif [ "$BACKEND" = vended ] || [ "$BACKEND" = aws-vended ]; then
         # Vended creds: no credential stored. Lakekeeper issues per-table
         # STS creds and ensure_attached() uses ACCESS_DELEGATION_MODE VENDED_CREDENTIALS.
         printf "SELECT coldfront.set_storage_secret_vended();"
@@ -101,7 +101,7 @@ storage_secret_sql() {
 # vending is scoped to a table resolved through the catalog, so a bare path has
 # nothing to vend against. Reads through the catalog, and every PG-side and
 # catalog-side assertion, are unaffected.
-vended_creds() { [ "$BACKEND" = vended ] || [ "$BACKEND" = azure-vended ]; }
+vended_creds() { [ "$BACKEND" = vended ] || [ "$BACKEND" = azure-vended ] || [ "$BACKEND" = aws-vended ]; }
 
 # hot_days — the hot_period, in days, that pins the tier cutoff at the start of
 # last month: everything older than that month is cold, the last two months are
@@ -220,7 +220,7 @@ EOSQL
     assert_eq "storage secret row written" "1" "$secret"
     # The compactor binary, for the compactor() wrapper (see its comment).
     [ -x "$COMPACTOR" ] && docker cp "$COMPACTOR" "$HOST":/usr/local/bin/compactor >/dev/null 2>&1
-    if [ "$BACKEND" = vended ] || [ "$BACKEND" = azure-vended ]; then
+    if vended_creds; then
         assert_eq "storage secret is vended (no credential stored)" "t" \
             "$(q "$HOST" "SELECT vended FROM coldfront.storage_secret LIMIT 1;")"
     fi

@@ -394,12 +394,23 @@ every push to `main`, and `--full` nightly and on demand. GitHub also runs a
 gitleaks secret scan, a go-licenses check, and the path-filtered walkthrough
 workflow, which the local gate does not.
 
+On `main` only, GitHub also runs the `aws-vended` cells against a real AWS
+bucket (`ci/matrix.sh --backend aws-vended`, inside `ci/cloud.sh`). The job
+holds no cloud credential: it requests a GitHub OIDC token, Lakekeeper assumes
+an IAM role from it and vends per-table credentials to DuckDB. The account's
+identifiers are the variables of the `cloud-aws` environment, whose branch
+rule allows `main` alone. Each cell writes under its own prefix and purges it
+at teardown, the job purges every prefix again when it ends, and an hourly
+workflow
+([.github/workflows/sweep.yml](https://github.com/pgEdge/ColdFront/blob/main/.github/workflows/sweep.yml))
+removes anything older than six hours and fails if it found something.
+
 ### Full Matrix
 
 `ci/matrix.sh --full` is the release gate, covering PG {16, 17, 18} × {vanilla,
 mesh (3-node Spock)} × {tiered, decoupled} × {primary, standby} × {s3, aws,
-azure, gcs, vended, azure-vended}, where the two vended backends run on vanilla
-only. The ops-hardening and probe-snowflake cells run once, on PG18. The mesh
+azure, gcs, vended, azure-vended, aws-vended}, where the three vended backends
+run on vanilla only. The ops-hardening and probe-snowflake cells run once, on PG18. The mesh
 cells add the cross-node stories - hot visibility via Spock, cold visibility
 via the shared Lakekeeper catalog, the R-A bakery serializing concurrent cold
 writers (same-node and cross-node) with no 409, and an N×(N-1) probe that the
@@ -423,6 +434,7 @@ it then requires; a lane turned on without the rest fails instead of staying
 | `aws`   | Real AWS S3 (native virtual-hosted addressing over HTTPS) | `COLDFRONT_AWS_ACCESS_KEY` | `COLDFRONT_AWS_SECRET_KEY`, `_BUCKET`, `_REGION` |
 | `azure` | Real Azure ADLS Gen2 | `COLDFRONT_AZURE_CONNECTION_STRING` | `COLDFRONT_AZURE_ACCOUNT`, `_FILESYSTEM`, `_KEY` |
 | `azure-vended` | Real Azure ADLS Gen2 with SAS vending (vanilla only) | `COLDFRONT_AZURE_KEY` | `COLDFRONT_AZURE_ACCOUNT`, `_FILESYSTEM` |
+| `aws-vended` | Real AWS S3 with STS vending and no stored key (vanilla only) | `COLDFRONT_AWS_DATA_ROLE_ARN` | `COLDFRONT_AWS_EXTERNAL_ID`, `_BUCKET`, `_REGION`; in CI also `_CI_ROLE_ARN` and the job's OIDC token, locally the caller's own AWS session |
 | `gcs`   | Real GCS via S3 interoperability (HMAC) | `COLDFRONT_GCS_ACCESS_KEY` | `COLDFRONT_GCS_SECRET_KEY`, `_BUCKET` |
 
 In GitHub Actions these come from repo secrets; an unset secret arrives empty,

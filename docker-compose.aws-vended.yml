@@ -1,0 +1,13 @@
+# CI override for the aws-vended lane, used only alongside
+# docker-compose.matrix.yml. Lakekeeper's identity for the AWS account comes
+# from the environment file ci/topo/vanilla.sh writes: in a GitHub job the
+# GitHub role and the job's OIDC token (mounted read-only at /oidc), in a local
+# run the caller's own session. Lakekeeper assumes the data role from that
+# identity and vends per-table credentials to DuckDB; nothing here reaches the
+# database container.
+services:
+  lakekeeper:
+    env_file:
+      - ${CF_LK_AWS_DIR}/lakekeeper.env
+    volumes:
+      - ${CF_LK_AWS_TOKEN_DIR}:/oidc:ro
