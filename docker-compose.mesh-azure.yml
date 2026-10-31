@@ -77,7 +77,7 @@ services:
       retries: 20
 
   lakekeeper-migrate:
-    image: quay.io/lakekeeper/catalog:latest
+    image: quay.io/lakekeeper/catalog:v0.14.2@sha256:9ad8de17a4d291d355215791ee7410409dcaea83cee04ed9279725b6905a4b85
     command: migrate
     depends_on:
       lakekeeper-db:
@@ -88,7 +88,7 @@ services:
       LAKEKEEPER__PG_ENCRYPTION_KEY: deadbeefdeadbeefdeadbeefdeadbeef
 
   lakekeeper:
-    image: quay.io/lakekeeper/catalog:latest
+    image: quay.io/lakekeeper/catalog:v0.14.2@sha256:9ad8de17a4d291d355215791ee7410409dcaea83cee04ed9279725b6905a4b85
     command: serve
     depends_on:
       lakekeeper-migrate:
