@@ -109,9 +109,10 @@ if [ "$BACKEND" = aws-vended ] || { [ "$BACKEND" = azure-vended ] && [ -n "$TOKE
       else
         # A local run: the caller's own session, exported into this shell as
         # well, because the purge's CLI container reads the environment only
-        # and has neither the caller's profile nor a config file.
+        # and has neither the caller's profile nor a config file. An inherited
+        # session token is cleared first: long-term keys export none.
         creds=$(aws configure export-credentials --format env) || exit 1
-        eval "$creds"; unset AWS_PROFILE AWS_CONFIG_FILE
+        unset AWS_PROFILE AWS_CONFIG_FILE AWS_SESSION_TOKEN; eval "$creds"
         sed 's/^export //' <<< "$creds"
       fi
     else
