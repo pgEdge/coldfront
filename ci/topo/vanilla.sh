@@ -107,8 +107,12 @@ if [ "$BACKEND" = aws-vended ] || { [ "$BACKEND" = azure-vended ] && [ -n "$TOKE
         echo "AWS_ROLE_ARN=${COLDFRONT_AWS_CI_ROLE_ARN:?COLDFRONT_AWS_TOKEN_FILE needs COLDFRONT_AWS_CI_ROLE_ARN}"
         echo "AWS_WEB_IDENTITY_TOKEN_FILE=/oidc/$(basename "$TOKEN_FILE")"
       else
-        # A local run: the caller's own session.
-        aws configure export-credentials --format env | sed 's/^export //'
+        # A local run: the caller's own session, exported into this shell as
+        # well, because the purge's CLI container reads the environment only
+        # and has neither the caller's profile nor a config file.
+        creds=$(aws configure export-credentials --format env) || exit 1
+        eval "$creds"; unset AWS_PROFILE AWS_CONFIG_FILE
+        sed 's/^export //' <<< "$creds"
       fi
     else
       # The managed identity, through workload identity federation.
