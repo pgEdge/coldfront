@@ -121,13 +121,13 @@ topo_teardown() {
     [ "${KEEP:-0}" = 1 ] && return 0
     docker rm -f "$CF_STANDBY" >/dev/null 2>&1 || true
     $COMPOSE down -v >/dev/null 2>&1 || true
-    # The cloud lanes' identity file (a local run's session keys among them)
-    # goes with the stack it served.
-    [ -n "${CF_LK_ENV_DIR:-}" ] && rm -rf -- "$CF_LK_ENV_DIR"
-    # A cloud cell's prefix is purged after its writers are gone (AWS documents
-    # that aborting an upload during a part upload "might or might not
-    # succeed"), and a purge that leaves anything fails the cell.
+    # A cloud cell's leftovers, both made by the topology that set CELL_PREFIX:
+    # the identity directory (a local run's session keys among them), then the
+    # prefix, purged after its writers are gone (AWS documents that aborting an
+    # upload during a part upload "might or might not succeed"); a purge that
+    # leaves anything fails the cell.
     if [ -n "${CELL_PREFIX:-}" ]; then
+        rm -rf -- "$CF_LK_ENV_DIR"
         cloud_purge "$CELL_PREFIX/" || { echo "purge of $CELL_PREFIX failed" >&2; exit 1; }
     fi
 }
