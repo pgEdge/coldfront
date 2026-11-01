@@ -105,7 +105,7 @@ This section walks you through building ColdFront from source, either in
 Docker on top of the published base image or on bare metal.
 
 ColdFront runs on a **DuckDB 1.5.x** stack: PostgreSQL + pg_duckdb (DuckDB
-1.5.4) and a **patched** duckdb-iceberg that includes ColdFront's five
+1.5.4) and a **patched** duckdb-iceberg that includes ColdFront's seven
 patches:
 
 - the bakery-aware commit-refresh patch (the no-409 guarantee for
@@ -116,6 +116,10 @@ patches:
   `timestamptz` column in UTC.
 - a port of another that numbers a new table schema above the highest
   schema id.
+- a patch that keeps a table's vended storage secret across binds, so a
+  statement that reads the table twice never has a read go out unsigned.
+- a port of an upstream fix that makes a failed manifest read fail the query
+  instead of aborting the backend.
 
 No released pg_duckdb tag includes DuckDB 1.5.x yet, so the stack is built
 from a pinned upstream PR plus ColdFront's patches - all from sources you
@@ -151,7 +155,7 @@ table shows each component and its source:
 
 The base build runs as three Docker stages: the first builds libcurl and
 pg_duckdb; the second clones duckdb-iceberg at the pinned ref, applies
-ColdFront's five patches, and compiles the iceberg, avro, azure, and
+ColdFront's seven patches, and compiles the iceberg, avro, azure, and
 postgres_scanner extensions under vcpkg; the third assembles the runtime. The
 build `git apply --check`s each patch before applying it, so it fails loudly on
 patch rot rather than silently shipping stock iceberg (which fails with HTTP
@@ -175,7 +179,10 @@ make the manifests duckdb-iceberg writes readable by strict Apache readers such
 as apache/iceberg-go, the cold-tier compactor; they are inert to pg_duckdb's
 own reads. The fourth is what makes a partitioned cold table correct when
 written from a session whose time zone is not UTC. The fifth lets a table take
-a new column after a change that returned it to an earlier schema. The
+a new column after a change that returned it to an earlier schema. The sixth
+keeps a table's vended secret across the binds of one transaction, so a read
+on another thread never goes out unsigned. The seventh makes a failed manifest
+read fail the query rather than abort the backend. The
 canonical recipe - every source pin and compile step - is
 [`docker/Dockerfile.duckdb15-base`](https://github.com/pgEdge/ColdFront/blob/main/docker/Dockerfile.duckdb15-base)
 itself.
