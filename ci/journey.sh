@@ -7680,13 +7680,10 @@ story_duckdb_temp_dirs() {
 
 # ───────────────────────────────────────────────────────────────────────────
 # Story (vanilla, SeaweedFS-backed): a manifest missing from the object store
-# fails the read with the store's error and leaves the backend alive.
-# duckdb-iceberg reads a table's manifests on worker threads and keeps a task's
-# error for the scan to report; the shared scan state's destructor drains those
-# tasks too, and an error escaping it is std::terminate: a backend abort and a
-# restart of every server process (docker/iceberg-manifest-read-error-v15.patch
-# contains it). One manifest of an eight-manifest table is deleted through
-# SeaweedFS's filer API, under which the S3 bucket is stored.
+# fails the read with the store's error and leaves the backend alive
+# (docker/iceberg-manifest-read-error-v15.patch). One manifest of an
+# eight-manifest table is deleted through SeaweedFS's filer API, under which
+# the S3 bucket is stored.
 # ───────────────────────────────────────────────────────────────────────────
 story_missing_manifest() {
     step "TC-264: a read whose manifest is missing from the store fails with the store's error, and the backend lives"
