@@ -121,6 +121,9 @@ topo_teardown() {
     [ "${KEEP:-0}" = 1 ] && return 0
     docker rm -f "$CF_STANDBY" >/dev/null 2>&1 || true
     $COMPOSE down -v >/dev/null 2>&1 || true
+    # The cloud lanes' identity file (a local run's session keys among them)
+    # goes with the stack it served.
+    [ -n "${CF_LK_ENV_DIR:-}" ] && rm -rf -- "$CF_LK_ENV_DIR"
     # A cloud cell's prefix is purged after its writers are gone (AWS documents
     # that aborting an upload during a part upload "might or might not
     # succeed"), and a purge that leaves anything fails the cell.
