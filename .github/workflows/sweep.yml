@@ -4,7 +4,8 @@ name: Sweep
 # at teardown and every cloud job purges its prefixes at job end, so the sweep
 # finds something only when a runner died without running either; it then
 # deletes the leftovers and fails, so the leak is seen. It runs hourly and on
-# demand, on main only, with the same federated identity as the cloud jobs.
+# demand, on main only (the condition on each job, and the environments allow
+# no other branch), with the same federated identity as the cloud jobs.
 
 on:
   schedule:
@@ -17,6 +18,7 @@ permissions:
 jobs:
   aws:
     name: sweep (aws)
+    if: github.ref == 'refs/heads/main'
     environment:
       name: cloud-aws
       deployment: false
@@ -39,6 +41,7 @@ jobs:
 
   azure:
     name: sweep (azure)
+    if: github.ref == 'refs/heads/main'
     environment:
       name: cloud-azure
       deployment: false

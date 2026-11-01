@@ -155,8 +155,9 @@ jobs:
           "$(go env GOPATH)/bin/go-licenses" check ./cmd/... ./internal/... \
             --ignore github.com/pgedge/coldfront
 
-  # The real-AWS lane, on main only: the cloud-aws environment allows no other
-  # branch, and its variables are identifiers, not secrets. The job gets a
+  # The real-AWS lane, on main only: the condition says so, the cloud-aws
+  # environment allows no other branch either, and its variables are
+  # identifiers, not secrets. The job gets a
   # federated identity through its OIDC token (id-token: write), which only
   # Lakekeeper uses: it assumes the data role and vends per-table credentials.
   # Every cell writes under its own prefix and purges it at teardown; the
@@ -164,7 +165,7 @@ jobs:
   # cancelled job leaves nothing in the bucket.
   cloud-aws:
     name: cloud (aws-vended, PG 18)
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     environment:
       name: cloud-aws
       deployment: false
@@ -206,7 +207,7 @@ jobs:
 
   sweep-aws:
     name: sweep (aws)
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     environment:
       name: cloud-aws
       deployment: false
@@ -229,7 +230,7 @@ jobs:
 
   cloud-azure:
     name: cloud (azure-vended, PG 18)
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     environment:
       name: cloud-azure
       deployment: false
@@ -270,7 +271,7 @@ jobs:
 
   sweep-azure:
     name: sweep (azure)
-    if: github.event_name != 'pull_request'
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
     environment:
       name: cloud-azure
       deployment: false
