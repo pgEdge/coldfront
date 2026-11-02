@@ -81,7 +81,8 @@ region = $COLDFRONT_AWS_REGION
 EOF
     chmod 644 "$DIR/config"
     export AWS_CONFIG_FILE="$DIR/config" AWS_PROFILE=data COLDFRONT_AWS_TOKEN_FILE="$TOKEN"
-    echo "identity: $(s3cli sts get-caller-identity --query Arn --output text)"
+    local arn; arn=$(s3cli sts get-caller-identity --query Arn --output text) || { echo "cloud.sh: the role chain failed" >&2; exit 1; }
+    echo "identity: $arn"
 }
 
 # list_prefixes: every cell prefix in the store, one `coldfront-ci/<ts>-<id>/`
@@ -91,6 +92,10 @@ list_prefixes() {
         s3cli s3api list-objects-v2 --bucket "$COLDFRONT_AWS_BUCKET" --prefix coldfront-ci/ --delimiter / \
             --query 'CommonPrefixes[].[Prefix] || `[]`' --output text
     else
+        # A missing coldfront-ci directory is an empty listing; any other failed answer fails the caller.
+        local there; there=$(azcli storage fs directory exists --file-system "$COLDFRONT_AZURE_FILESYSTEM" --name coldfront-ci \
+                              --account-name "$COLDFRONT_AZURE_ACCOUNT" --auth-mode login --query exists) || return 1
+        [ "$there" = false ] && return 0
         azcli storage fs directory list --file-system "$COLDFRONT_AZURE_FILESYSTEM" --path coldfront-ci --recursive false \
             --account-name "$COLDFRONT_AZURE_ACCOUNT" --auth-mode login --query '[].name' | sed 's#$#/#'
     fi
@@ -115,6 +120,7 @@ case "${1:-}" in
   sweep)
     setup
     cutoff=$(date -u -d '-6 hours' +%Y%m%dT%H%M%SZ); n=0
+    prefixes=$(LC_ALL=C list_prefixes) || { echo "::error::sweep: the listing failed" >&2; exit 1; }
     while read -r p; do
         [ -n "$p" ] || continue
         ts=${p#coldfront-ci/}; ts=${ts%%-*}
@@ -122,7 +128,7 @@ case "${1:-}" in
         echo "::error::sweep: $p is older than 6 hours and still in the store"
         cloud_purge "$p" || exit 1
         n=$((n + 1))
-    done < <(LC_ALL=C list_prefixes)
+    done <<< "$prefixes"
     [ "$n" -eq 0 ] || { echo "sweep: purged $n prefix(es) an earlier run left behind" >&2; exit 1; }
     echo "sweep: nothing older than 6 hours under coldfront-ci/";;
   *) echo "usage: ci/cloud.sh <aws|azure> run -- <command...> | finish | sweep" >&2; exit 2;;
