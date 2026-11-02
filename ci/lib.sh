@@ -110,6 +110,8 @@ topo_standby() {
 # lines: a backend that crashed reads on the client side only as a lost
 # connection, and the server's lines name the signal and the statement. The
 # servers log to $PGDATA/log through the logging collector, not to stdout.
+# When CELL_PREFIX is set, also purge the cloud prefix and remove its identity
+# directory; a failed purge exits with status 1.
 topo_teardown() {
     local rc=$? c purged
     if [ "$rc" -ne 0 ]; then
@@ -153,8 +155,8 @@ s3cli() {
 }
 
 # s3_purge <bucket> <prefix>: abort every incomplete multipart upload and
-# delete every object under one cell's prefix, then list both again and fail
-# unless nothing is left. Refuses a prefix that is not exactly one cell's: an
+# delete every object under one cell's prefix, then list both again and succeed
+# only if both counts are zero. Refuses a prefix that is not exactly one cell's: an
 # empty one would empty the bucket, and one without its trailing slash would
 # also match a longer sibling. In an unversioned bucket a delete is final, so an
 # empty listing means no versions or delete markers either.
@@ -192,10 +194,8 @@ az_login() {
 }
 
 # adls_purge <prefix>: delete one cell's directory under the filesystem and
-# fail unless it is gone. `directory delete` is recursive; `exists` answers
-# false only for a missing path and fails on anything else (a 403 included), so
-# a permission problem never reads as a clean result. The same prefix guard as
-# s3_purge, minus the slash the S3 key prefix carries.
+# succeed only if the final existence check returns false. Deletion is recursive.
+# The prefix guard accepts one cell's prefix, with or without a trailing slash.
 adls_purge() {
     local dir="${1%/}"
     [[ $dir =~ ^coldfront-ci/[0-9]{8}T[0-9]{6}Z-[0-9a-f]+$ ]] || { echo "adls_purge: refusing prefix '$1'" >&2; return 1; }
@@ -211,7 +211,8 @@ adls_purge() {
 }
 
 # cloud_purge <prefix>: the purge of the cell's cloud, chosen by the backend
-# the topology runs with.
+# the topology runs with. Returns nonzero for an unsupported backend or when
+# the selected purge fails.
 cloud_purge() {
     case "${BACKEND:-}" in
         aws-vended)   s3_purge "$COLDFRONT_AWS_BUCKET" "$1";;

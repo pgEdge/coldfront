@@ -167,12 +167,10 @@ mcell() {
     "$SCRIPT_DIR/topo/mesh.sh" "${a[@]}"
 }
 
-# backend_ready <backend>  — THE gating policy (identical here and in GitHub CI):
-# s3 is hermetic (SeaweedFS in-compose), so it ALWAYS runs — that is the default
-# coverage when no cloud creds are present. The real cloud stores — real AWS S3
-# (aws), Azure ADLS (azure), and GCS (gcs) — run ONLY when their credential env
-# vars are present; absent, they are reported PENDING and never run (no real
-# cloud calls without explicit creds).
+# backend_ready <backend> — return success for the hermetic s3 and vended lanes,
+# or when the selected cloud backend's gating environment variables are present.
+# This is a preliminary check; topology setup can require additional variables.
+# Unknown backends return nonzero.
 backend_ready() {
     case "$1" in
         s3)     return 0;;
@@ -195,8 +193,8 @@ backend_ready() {
 # ever silently omitted; PENDING states what creds would flip it to RUN. The full
 # grid is PG{16,17,18} × {vanilla,mesh} × {tiered,decoupled} × {primary,standby} ×
 # {s3,aws,azure,gcs} = 96 cells, every one on the DuckDB 1.5.x patched-iceberg
-# image, plus the vended lanes (S3 STS + Azure SAS credential vending)
-# vanilla-only: +24 cells.
+# image, plus 36 vanilla cells across the three vended lanes. Their mesh cells
+# are shown as DEFERRED.
 coverage_table() {
     step "MATRIX COVERAGE (full grid = 96 cells, all on DuckDB 1.5.x)"
     local pg topo mode tgt be st cell_st
