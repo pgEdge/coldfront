@@ -115,9 +115,10 @@ case "${1:-}" in
     exit "$rc";;
   finish)
     setup
-    # The cells' containers first: a cancelled job leaves them running, mid-write.
-    docker ps -q --filter name=coldfront- | xargs -r docker rm -f >/dev/null
     rc=0
+    # The cells' containers first: a cancelled job leaves them running, mid-write.
+    docker ps -q --filter name=coldfront- | xargs -r docker rm -f >/dev/null \
+        || { echo "::error::finish: a cell's container could not be stopped"; rc=1; }
     while read -r p; do
         [ -n "$p" ] && { cloud_purge "$p" || rc=1; }
     done < "$COLDFRONT_CI_PREFIXES"
