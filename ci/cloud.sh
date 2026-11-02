@@ -80,7 +80,8 @@ role_session_name = coldfront-ci
 region = $COLDFRONT_AWS_REGION
 EOF
     chmod 644 "$DIR/config"
-    export AWS_CONFIG_FILE="$DIR/config" AWS_PROFILE=data COLDFRONT_AWS_TOKEN_FILE="$TOKEN"
+    printf 'AWS_CONFIG_FILE=%s\nAWS_PROFILE=data\n' "$DIR/config" > "$DIR/cli.env"
+    export COLDFRONT_CLI_ENV="$DIR/cli.env" COLDFRONT_AWS_TOKEN_FILE="$TOKEN"
     local arn; arn=$(s3cli sts get-caller-identity --query Arn --output text) || { echo "cloud.sh: the role chain failed" >&2; exit 1; }
     echo "identity: $arn"
 }

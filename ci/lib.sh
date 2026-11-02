@@ -111,7 +111,7 @@ topo_standby() {
 # connection, and the server's lines name the signal and the statement. The
 # servers log to $PGDATA/log through the logging collector, not to stdout.
 topo_teardown() {
-    local rc=$? c
+    local rc=$? c purged
     if [ "$rc" -ne 0 ]; then
         for c in $($COMPOSE ps -q 2>/dev/null) ${CF_STANDBY:-}; do
             docker exec "$c" sh -c 'cat "$PGDATA"/log/*.log' 2>/dev/null \
@@ -122,13 +122,14 @@ topo_teardown() {
     docker rm -f "$CF_STANDBY" >/dev/null 2>&1 || true
     $COMPOSE down -v >/dev/null 2>&1 || true
     # A cloud cell's leftovers, both made by the topology that set CELL_PREFIX:
-    # the identity directory (a local run's session keys among them), then the
-    # prefix, purged after its writers are gone (AWS documents that aborting an
-    # upload during a part upload "might or might not succeed"); a purge that
-    # leaves anything fails the cell.
+    # the prefix, purged after its writers are gone (AWS documents that aborting
+    # an upload during a part upload "might or might not succeed") and before
+    # the identity directory goes, since a local run's purge reads its session
+    # there; a purge that leaves anything fails the cell.
     if [ -n "${CELL_PREFIX:-}" ]; then
+        cloud_purge "$CELL_PREFIX/"; purged=$?
         rm -rf -- "$CF_LK_ENV_DIR"
-        cloud_purge "$CELL_PREFIX/" || { echo "purge of $CELL_PREFIX failed" >&2; exit 1; }
+        [ "$purged" -eq 0 ] || { echo "purge of $CELL_PREFIX failed" >&2; exit 1; }
     fi
 }
 
@@ -140,15 +141,15 @@ cell_prefix() { printf 'coldfront-ci/%s-%s' "$(date -u +%Y%m%dT%H%M%SZ)" "$(head
 
 # s3cli <args...>: the AWS CLI from AWS's own image, pinned by digest, so a
 # host's CLI packaging cannot break a purge (Ubuntu's 2.31.35 build on Python
-# 3.14 fails on list-objects-v2 before it sends a request). Credentials reach it
-# through the environment only: static keys, or AWS_CONFIG_FILE and AWS_PROFILE
-# for the token-based role chain, whose directory (COLDFRONT_CLOUD_DIR) is mounted
-# at its own path so the config's file paths hold inside the container.
+# 3.14 fails on list-objects-v2 before it sends a request). Its identity is the
+# env file COLDFRONT_CLI_ENV names and nothing from the caller's shell: a local
+# cell's session keys, or AWS_CONFIG_FILE and AWS_PROFILE for the token-based
+# role chain, whose directory (COLDFRONT_CLOUD_DIR) is mounted at its own path
+# so the config's file paths hold inside the container.
 S3CLI_IMAGE="public.ecr.aws/aws-cli/aws-cli:2.37.9@sha256:92de75724b6a746951f0e8b915d86bbccd7cb55aff96cd0cb4f7017272160780"
 s3cli() {
     docker run --rm ${COLDFRONT_CLOUD_DIR:+-v "$COLDFRONT_CLOUD_DIR:$COLDFRONT_CLOUD_DIR:ro"} \
-        -e AWS_CONFIG_FILE -e AWS_PROFILE -e AWS_ACCESS_KEY_ID -e AWS_SECRET_ACCESS_KEY -e AWS_SESSION_TOKEN \
-        -e AWS_REGION="${COLDFRONT_AWS_REGION:-}" "$S3CLI_IMAGE" "$@"
+        --env-file "${COLDFRONT_CLI_ENV:?}" -e AWS_REGION="${COLDFRONT_AWS_REGION:-}" "$S3CLI_IMAGE" "$@"
 }
 
 # s3_purge <bucket> <prefix>: abort every incomplete multipart upload and

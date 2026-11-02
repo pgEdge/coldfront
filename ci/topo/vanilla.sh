@@ -91,7 +91,7 @@ DB=coldfront-db-1
 # run's session keys stay private to the caller; the token directory, which
 # the container reads, is mounted at /oidc; and the cell writes under its own
 # prefix, which the teardown purges.
-CELL_PREFIX=""; TOKEN_FILE=""; creds=""
+CELL_PREFIX=""; TOKEN_FILE=""
 case "$BACKEND" in
   aws-vended)   TOKEN_FILE="${COLDFRONT_AWS_TOKEN_FILE:-}";;
   azure-vended) TOKEN_FILE="${COLDFRONT_AZURE_TOKEN_FILE:-}";;
@@ -101,12 +101,8 @@ if [ -n "$TOKEN_FILE" ]; then
   : "${COLDFRONT_CLOUD_DIR:?a cell with a token file runs under ci/cloud.sh run}"
   [ "$BACKEND" = aws-vended ] && : "${COLDFRONT_AWS_CI_ROLE_ARN:?COLDFRONT_AWS_TOKEN_FILE needs COLDFRONT_AWS_CI_ROLE_ARN}"
 elif [ "$BACKEND" = aws-vended ]; then
-  # A local run: the caller's own session, exported into this shell as well,
-  # because the purge's CLI container reads the environment only and has
-  # neither the caller's profile nor a config file. An inherited session token
-  # is cleared first: long-term keys export none.
-  creds=$(aws configure export-credentials --format env) || exit 1
-  unset AWS_PROFILE AWS_CONFIG_FILE AWS_SESSION_TOKEN; eval "$creds"
+  # A local run: the caller's own session, for Lakekeeper and the purge alike.
+  creds=$(aws configure export-credentials --format env-no-export) || exit 1
 fi
 if [ "$BACKEND" = aws-vended ] || { [ "$BACKEND" = azure-vended ] && [ -n "$TOKEN_FILE" ]; }; then
   CF_LK_ENV_DIR=$(mktemp -d /tmp/coldfront-cloud.XXXXXX); export CF_LK_ENV_DIR
@@ -119,7 +115,7 @@ if [ "$BACKEND" = aws-vended ] || { [ "$BACKEND" = azure-vended ] && [ -n "$TOKE
         echo "AWS_ROLE_ARN=$COLDFRONT_AWS_CI_ROLE_ARN"
         echo "AWS_WEB_IDENTITY_TOKEN_FILE=/oidc/$(basename "$TOKEN_FILE")"
       else
-        sed 's/^export //' <<< "$creds"
+        printf '%s\n' "$creds"
       fi
     else
       # The managed identity, through workload identity federation.
@@ -129,6 +125,8 @@ if [ "$BACKEND" = aws-vended ] || { [ "$BACKEND" = azure-vended ] && [ -n "$TOKE
       echo "AZURE_FEDERATED_TOKEN_FILE=/oidc/$(basename "$TOKEN_FILE")"
     fi
   } > "$CF_LK_ENV_DIR/lakekeeper.env"
+  # The purge's identity: ci/cloud.sh's env file in CI, the session written above locally.
+  COLDFRONT_CLI_ENV="${COLDFRONT_CLI_ENV:-$CF_LK_ENV_DIR/lakekeeper.env}"
   CF_LK_TOKEN_DIR="${TOKEN_FILE:+$(dirname "$TOKEN_FILE")}"
   export CF_LK_TOKEN_DIR="${CF_LK_TOKEN_DIR:-$CF_LK_ENV_DIR}"
   CELL_PREFIX=$(cell_prefix)
