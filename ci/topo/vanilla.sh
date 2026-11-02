@@ -91,11 +91,23 @@ DB=coldfront-db-1
 # mounted at /oidc, and the cell writes under its own prefix, which the teardown
 # purges. The container runs as another user, so the directory and file are
 # world-readable.
-CELL_PREFIX=""; TOKEN_FILE=""
+CELL_PREFIX=""; TOKEN_FILE=""; creds=""
 case "$BACKEND" in
   aws-vended)   TOKEN_FILE="${COLDFRONT_AWS_TOKEN_FILE:-}";;
   azure-vended) TOKEN_FILE="${COLDFRONT_AZURE_TOKEN_FILE:-}";;
 esac
+# Whatever can be missing is checked before the cell creates anything.
+if [ -n "$TOKEN_FILE" ]; then
+  : "${COLDFRONT_CLOUD_DIR:?a cell with a token file runs under ci/cloud.sh run}"
+  [ "$BACKEND" = aws-vended ] && : "${COLDFRONT_AWS_CI_ROLE_ARN:?COLDFRONT_AWS_TOKEN_FILE needs COLDFRONT_AWS_CI_ROLE_ARN}"
+elif [ "$BACKEND" = aws-vended ]; then
+  # A local run: the caller's own session, exported into this shell as well,
+  # because the purge's CLI container reads the environment only and has
+  # neither the caller's profile nor a config file. An inherited session token
+  # is cleared first: long-term keys export none.
+  creds=$(aws configure export-credentials --format env) || exit 1
+  unset AWS_PROFILE AWS_CONFIG_FILE AWS_SESSION_TOKEN; eval "$creds"
+fi
 if [ "$BACKEND" = aws-vended ] || { [ "$BACKEND" = azure-vended ] && [ -n "$TOKEN_FILE" ]; }; then
   CF_LK_ENV_DIR=$(mktemp -d /tmp/coldfront-cloud.XXXXXX); chmod 755 "$CF_LK_ENV_DIR"; export CF_LK_ENV_DIR
   {
@@ -104,15 +116,9 @@ if [ "$BACKEND" = aws-vended ] || { [ "$BACKEND" = azure-vended ] && [ -n "$TOKE
       echo "AWS_REGION=$COLDFRONT_AWS_REGION"
       if [ -n "$TOKEN_FILE" ]; then
         # The GitHub role, assumed with the job's token.
-        echo "AWS_ROLE_ARN=${COLDFRONT_AWS_CI_ROLE_ARN:?COLDFRONT_AWS_TOKEN_FILE needs COLDFRONT_AWS_CI_ROLE_ARN}"
+        echo "AWS_ROLE_ARN=$COLDFRONT_AWS_CI_ROLE_ARN"
         echo "AWS_WEB_IDENTITY_TOKEN_FILE=/oidc/$(basename "$TOKEN_FILE")"
       else
-        # A local run: the caller's own session, exported into this shell as
-        # well, because the purge's CLI container reads the environment only
-        # and has neither the caller's profile nor a config file. An inherited
-        # session token is cleared first: long-term keys export none.
-        creds=$(aws configure export-credentials --format env) || exit 1
-        unset AWS_PROFILE AWS_CONFIG_FILE AWS_SESSION_TOKEN; eval "$creds"
         sed 's/^export //' <<< "$creds"
       fi
     else
