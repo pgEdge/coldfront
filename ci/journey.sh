@@ -3935,14 +3935,16 @@ story_mesh_dead_peer() {
 # Story: snapshot expiry against an open reader. A transaction keeps the snapshot
 # of its first cold read (TC-224), and expiry deletes the files only the expired
 # snapshots reference, so an expiry shorter than an open transaction takes that
-# transaction's files away: its next scan fails with the object store's 404 (a
-# scan that already fetched the files answers from DuckDB's file cache instead).
+# transaction's files away: its next scan fails with the object store's not-found
+# error, HTTP 404 from an S3 store and BlobNotFound from Azure (a scan that
+# already fetched the files answers from DuckDB's file cache instead).
 # compaction.md states the rule; this check pins the outcome at the pinned refs.
 # ───────────────────────────────────────────────────────────────────────────
 story_expiry_vs_reader() {
     step "TC-225: expiring an open reader's snapshot fails its next scan"
     require_compactor || return
-    local k O
+    local k O nf=404
+    [ "${BACKEND%-vended}" = azure ] && nf=BlobNotFound
     q "$HOST" "SELECT coldfront.create_iceberg_table('public','tc225','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"ts\",\"type\":\"timestamptz\"}]'::jsonb, '{month(ts)}');" >/dev/null 2>&1
     for k in 1 2 3 4 5 6; do q "$HOST" "INSERT INTO tc225 VALUES ($k, now());" >/dev/null 2>&1; done
     # The first read is metadata-only, so the files are not yet cached; the
@@ -3965,7 +3967,7 @@ SQL
     wait "$reader"
     O=$(cat "$TMPD/tc225.out")
     assert_eq "TC-225: the reader's first, metadata-only read saw six rows" "6" "$(extract FIRST "$O")"
-    assert_contains "TC-225: its scan after the expiry fails with the object store's 404" "404" "$O"
+    assert_contains "TC-225: its scan after the expiry fails with the object store's not-found error" "$nf" "$O"
     assert_eq "TC-225: after COMMIT the same scan reads the compacted snapshot" "21" "$(extract AFTER "$O")"
     q "$HOST" "SELECT coldfront.drop_iceberg_table('public','tc225', true);" >/dev/null 2>&1
 }
