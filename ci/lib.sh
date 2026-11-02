@@ -111,7 +111,7 @@ topo_standby() {
 # connection, and the server's lines name the signal and the statement. The
 # servers log to $PGDATA/log through the logging collector, not to stdout.
 topo_teardown() {
-    local rc=$? c purged
+    local rc=$? c purged down=0
     if [ "$rc" -ne 0 ]; then
         for c in $($COMPOSE ps -q 2>/dev/null) ${CF_STANDBY:-}; do
             docker exec "$c" sh -c 'cat "$PGDATA"/log/*.log' 2>/dev/null \
@@ -120,14 +120,19 @@ topo_teardown() {
     fi
     [ "${KEEP:-0}" = 1 ] && return 0
     docker rm -f "$CF_STANDBY" >/dev/null 2>&1 || true
-    $COMPOSE down -v >/dev/null 2>&1 || true
+    $COMPOSE down -v >/dev/null 2>&1 || down=$?
     # A cloud cell's leftovers, both made by the topology that set CELL_PREFIX:
-    # the prefix, purged after its writers are gone (AWS documents that aborting
-    # an upload during a part upload "might or might not succeed") and before
-    # the identity directory goes, since a local run's purge reads its session
-    # there; a purge that leaves anything fails the cell.
+    # the prefix, purged only once its writers are gone (AWS documents that
+    # aborting an upload during a part upload "might or might not succeed"), so
+    # a stack that did not come down leaves it, and before the identity
+    # directory goes, since a local run's purge reads its session there; a
+    # purge that leaves anything fails the cell.
     if [ -n "${CELL_PREFIX:-}" ]; then
-        cloud_purge "$CELL_PREFIX/"; purged=$?
+        if [ "$down" -ne 0 ]; then
+            echo "compose down failed, so $CELL_PREFIX is not purged" >&2; purged=1
+        else
+            cloud_purge "$CELL_PREFIX/"; purged=$?
+        fi
         rm -rf -- "$CF_LK_ENV_DIR"
         [ "$purged" -eq 0 ] || { echo "purge of $CELL_PREFIX failed" >&2; exit 1; }
     fi
