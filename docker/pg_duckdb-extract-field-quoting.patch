@@ -1,0 +1,91 @@
+# pg_duckdb-extract-field-quoting.patch
+#
+# Applies to: pg_duckdb @ c04e6a2d (DuckDB 1.5.4), the vendored ruleutils copies
+# src/vendor/pg_ruleutils_14.c to pg_ruleutils_18.c.
+#
+# Problem: pg_duckdb turns the query it runs on DuckDB into SQL text with its
+# vendored copies of PostgreSQL's ruleutils.c, whose EXTRACT(field FROM x) form
+# writes the field name as it is. PostgreSQL's parser accepts any string as the
+# field, so a query such as
+#   SELECT EXTRACT('year FROM ts) + (SELECT ...) + extract(year' FROM ts) ...
+# reaches DuckDB as SQL with the string spliced in, and the spliced part runs
+# there with the session's attachments and secrets. Every read of a tiered or
+# decoupled view goes through this deparse, so a role that may read such a view
+# but may not run DuckDB SQL can run it this way.
+#
+# Fix: the field name goes through quote_identifier, as PostgreSQL's own
+# ruleutils.c does since commit a3832a75710 (CVE-2026-15741). A valid field
+# (year, epoch, dow, ...) is a plain lowercase word and stays bare, so the SQL
+# DuckDB gets is unchanged for it; any other string is quoted, DuckDB rejects it
+# as a field name, and pg_duckdb hands the query back to PostgreSQL, which
+# rejects the unit.
+#
+# The extract_field_quoting regress test fails without this patch. Drop the
+# patch when the pg_duckdb pin moves to a commit whose vendored copies quote
+# the field: git apply --check then fails on the changed lines.
+#
+diff --git a/src/vendor/pg_ruleutils_14.c b/src/vendor/pg_ruleutils_14.c
+index bb063dc..6807b5f 100644
+--- a/src/vendor/pg_ruleutils_14.c
++++ b/src/vendor/pg_ruleutils_14.c
+@@ -10216,7 +10216,7 @@ get_func_sql_syntax(FuncExpr *expr, deparse_context *context)
+ 				Assert(IsA(con, Const) &&
+ 					   con->consttype == TEXTOID &&
+ 					   !con->constisnull);
+-				appendStringInfoString(buf, TextDatumGetCString(con->constvalue));
++				appendStringInfoString(buf, quote_identifier(TextDatumGetCString(con->constvalue)));
+ 			}
+ 			appendStringInfoString(buf, " FROM ");
+ 			get_rule_expr((Node *) lsecond(expr->args), context, false);
+diff --git a/src/vendor/pg_ruleutils_15.c b/src/vendor/pg_ruleutils_15.c
+index 18b5419..83b0959 100644
+--- a/src/vendor/pg_ruleutils_15.c
++++ b/src/vendor/pg_ruleutils_15.c
+@@ -10418,7 +10418,7 @@ get_func_sql_syntax(FuncExpr *expr, deparse_context *context)
+ 				Assert(IsA(con, Const) &&
+ 					   con->consttype == TEXTOID &&
+ 					   !con->constisnull);
+-				appendStringInfoString(buf, TextDatumGetCString(con->constvalue));
++				appendStringInfoString(buf, quote_identifier(TextDatumGetCString(con->constvalue)));
+ 			}
+ 			appendStringInfoString(buf, " FROM ");
+ 			get_rule_expr((Node *) lsecond(expr->args), context, false);
+diff --git a/src/vendor/pg_ruleutils_16.c b/src/vendor/pg_ruleutils_16.c
+index 200df3d..39bf19b 100644
+--- a/src/vendor/pg_ruleutils_16.c
++++ b/src/vendor/pg_ruleutils_16.c
+@@ -10467,7 +10467,7 @@ get_func_sql_syntax(FuncExpr *expr, deparse_context *context)
+ 				Assert(IsA(con, Const) &&
+ 					   con->consttype == TEXTOID &&
+ 					   !con->constisnull);
+-				appendStringInfoString(buf, TextDatumGetCString(con->constvalue));
++				appendStringInfoString(buf, quote_identifier(TextDatumGetCString(con->constvalue)));
+ 			}
+ 			appendStringInfoString(buf, " FROM ");
+ 			get_rule_expr((Node *) lsecond(expr->args), context, false);
+diff --git a/src/vendor/pg_ruleutils_17.c b/src/vendor/pg_ruleutils_17.c
+index e666d2d..784fb8f 100644
+--- a/src/vendor/pg_ruleutils_17.c
++++ b/src/vendor/pg_ruleutils_17.c
+@@ -10880,7 +10880,7 @@ get_func_sql_syntax(FuncExpr *expr, deparse_context *context)
+ 				Assert(IsA(con, Const) &&
+ 					   con->consttype == TEXTOID &&
+ 					   !con->constisnull);
+-				appendStringInfoString(buf, TextDatumGetCString(con->constvalue));
++				appendStringInfoString(buf, quote_identifier(TextDatumGetCString(con->constvalue)));
+ 			}
+ 			appendStringInfoString(buf, " FROM ");
+ 			get_rule_expr((Node *) lsecond(expr->args), context, false);
+diff --git a/src/vendor/pg_ruleutils_18.c b/src/vendor/pg_ruleutils_18.c
+index abb9bf2..232265d 100644
+--- a/src/vendor/pg_ruleutils_18.c
++++ b/src/vendor/pg_ruleutils_18.c
+@@ -11272,7 +11272,7 @@ get_func_sql_syntax(FuncExpr *expr, deparse_context *context)
+ 				Assert(IsA(con, Const) &&
+ 					   con->consttype == TEXTOID &&
+ 					   !con->constisnull);
+-				appendStringInfoString(buf, TextDatumGetCString(con->constvalue));
++				appendStringInfoString(buf, quote_identifier(TextDatumGetCString(con->constvalue)));
+ 			}
+ 			appendStringInfoString(buf, " FROM ");
+ 			get_rule_expr((Node *) lsecond(expr->args), context, false);

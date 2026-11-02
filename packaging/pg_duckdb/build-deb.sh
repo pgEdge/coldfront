@@ -26,6 +26,7 @@ prepare() {
     git fetch -q --depth 1 origin "${PG_DUCKDB_COMMIT}"
     git checkout -q FETCH_HEAD
     git submodule update --init --recursive --depth 1
+    git apply --check "${PG_DUCKDB_PATCH}" && git apply "${PG_DUCKDB_PATCH}"
     # See build-rpm.sh: GitHub tarballs omit submodules and the Makefile gates
     # the DuckDB build on a `.git/modules/third_party/duckdb/HEAD` marker. Drop
     # .git but leave the marker so `make` treats the submodule as checked out.

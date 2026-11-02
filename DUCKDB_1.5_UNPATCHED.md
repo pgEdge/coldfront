@@ -26,6 +26,8 @@ In `docker/Dockerfile.duckdb15-base`, drop the `COPY` + `git apply --check` +
 - `iceberg-vended-secret-keep-v15.patch`
 - `iceberg-manifest-read-error-v15.patch`
 
+The pg_duckdb patch, `docker/pg_duckdb-extract-field-quoting.patch`, stays in
+both builds: without it a crafted `EXTRACT` field name runs as SQL on DuckDB.
 Everything else — libcurl, vcpkg deps, the pins, the extension config, the
 runtime stage — is identical. In `docker/entrypoint.sh`, leave
 `coldfront.iceberg_bakery_patch` **unset** (and optionally

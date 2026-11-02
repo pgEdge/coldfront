@@ -21,12 +21,13 @@ and verified*. The cold-tier compactor's own story lives in
 | **TIMESTAMPTZ transforms in UTC** (port of upstream d3c3348271) | `docker/iceberg-timestamptz-utc-transforms-v15.patch` | year/month/day/hour of a TIMESTAMPTZ partition column are computed on the UTC instant, as the Iceberg spec, duckdb-iceberg's own pruning and iceberg-go take them | a session outside UTC files rows within the zone offset of a boundary in the neighbouring partition, and a UTC-bounded read on the column **prunes them away** |
 | **Schema ids from the highest existing id** (port of upstream c1cfe2ef) | `docker/iceberg-schema-id-allocation-v15.patch` | a new table schema is numbered one above the highest schema id in the metadata, not above the current schema's | once a `DROP COLUMN` returns a table to an earlier schema, the next column change fails with "Attempted to add schema with id N, but this already exists in the table!" and **the table can take no further column change** |
 | **The vended secret is kept across binds** | `docker/iceberg-vended-secret-keep-v15.patch` | a repeat bind of a table in one transaction keeps the table's vended storage secret instead of dropping and re-creating it | a statement that reads a table twice under vended credentials (a self-join, a `UNION`, the vector probe's two arms) can have a manifest read land in the gap, find no secret, and go unsigned to the default endpoint: an HTTP 403 that **fails the query** at random, and that **aborts the backend** when the manifest-read patch below is missing too |
-| **A failed manifest read fails the query** (port of upstream PR #1305) | `docker/iceberg-manifest-read-error-v15.patch` | the shared scan state's destructor catches a manifest-read task's error instead of letting it escape | any failed manifest read (a missing manifest, a store error, the 403 above) is `std::terminate`: **the backend aborts** with signal 6 and the postmaster restarts every server process |
+| **A failed manifest read fails the query** (port of upstream 45f323eb) | `docker/iceberg-manifest-read-error-v15.patch` | the shared scan state's destructor catches a manifest-read task's error instead of letting it escape | any failed manifest read (a missing manifest, a store error, the 403 above) is `std::terminate`: **the backend aborts** with signal 6 and the postmaster restarts every server process |
+| **EXTRACT field quoting** (pg_duckdb; the fix of CVE-2026-15741) | `docker/pg_duckdb-extract-field-quoting.patch` | pg_duckdb's vendored ruleutils copies quote the field name of `EXTRACT(field FROM x)` when they deparse a query for DuckDB | a crafted field name reaches DuckDB as SQL and **runs there** with the session's attachments and secrets, from any read of a tiered or decoupled view |
 
-All seven patches apply cleanly to a **pristine** `duckdb-iceberg` @ `5edc45f0`
-(branch `v1.5-variegata`); `docker/Dockerfile.duckdb15-base`
-`git apply --check`s each before applying, failing the build loudly on patch
-rot.
+All seven duckdb-iceberg patches apply cleanly to a **pristine** `duckdb-iceberg`
+@ `5edc45f0` (branch `v1.5-variegata`), and the pg_duckdb patch to a pristine
+pg_duckdb @ `c04e6a2`; `docker/Dockerfile.duckdb15-base` `git apply --check`s
+each before applying, failing the build loudly on patch rot.
 
 ---
 
@@ -252,9 +253,9 @@ port) only.
 
 | Component | Pin | Notes |
 |---|---|---|
-| pg_duckdb | **merged PR #1025** (`c04e6a2`) | no released tag carries 1.5.x; `git checkout c04e6a2`. Its duckdb submodule is the v1.5.4 tag (`08e34c4`). |
+| pg_duckdb | **merged PR #1025** (`c04e6a2`) | no released tag carries 1.5.x; `git checkout c04e6a2`. Its duckdb submodule is the v1.5.4 tag (`08e34c4`). Patched with `docker/pg_duckdb-extract-field-quoting.patch`. |
 | DuckDB | **v1.5.4 tag** (`08e34c4`) | pinned by pg_duckdb @ `c04e6a2`; the iceberg build re-pins ITS duckdb submodule to the same tag so the extension ABI matches the engine. The `duckdb.*` GUCs + PRE_COMMIT iceberg-commit deferral ColdFront relies on are unchanged. |
-| duckdb-iceberg | **`v1.5-variegata` @ `5edc45f0`** | extension code the five patches target — kept fixed, so the patches apply unchanged. The build re-pins its duckdb submodule to the v1.5.4 tag (the branch tracks duckdb `main`, which drifts off the release; verified: `5edc45f0` compiles clean against v1.5.4). Transaction code lives in `src/catalog/rest/transaction/`. |
+| duckdb-iceberg | **`v1.5-variegata` @ `5edc45f0`** | extension code the seven patches target — kept fixed, so the patches apply unchanged. The build re-pins its duckdb submodule to the v1.5.4 tag (the branch tracks duckdb `main`, which drifts off the release; verified: `5edc45f0` compiles clean against v1.5.4). Transaction code lives in `src/catalog/rest/transaction/`. |
 | avro | **`7f423d69`** | the pin `v1.5-variegata` uses. |
 | azure | **`v1.5-variegata` @ `563589b2`** | the ABI-matched sibling of iceberg's branch. **NOT `main`** — azure `main` collides at link (`multiple definition of duckdb::FileFlags::FILE_FLAGS_NULL_IF_NOT_EXISTS`). |
 | postgres_scanner | duckdb-postgres **`6b2b12ca`** | the `postgres` ext; built bundled (ABI-matched, stamped v1.5.4), **shipped** in the image (never downloaded). Its vcpkg `libpq` build needs **flex** + **bison**. |
@@ -279,8 +280,8 @@ requirements (each a real build failure if missing):
 - iceberg/avro/azure/postgres_scanner are built **bundled** against one DuckDB
   (`make release`, `OVERRIDE_GIT_DESCRIBE=v1.5.4`) so they are ABI-safe; build
   config is `docker/iceberg-azure-extension-config-v15.cmake`.
-- The bakery + two interop patches are `COPY`'d in and `git apply --check`'d
-  then applied (see the Dockerfile's patch block).
+- The seven duckdb-iceberg patches and the pg_duckdb patch are `COPY`'d in and
+  `git apply --check`'d then applied (see the Dockerfile's patch blocks).
 
 Cold base build is ~30–60 min (vcpkg compiles the Azure SDK + libpq from
 source); incremental rebuilds after a patch change recompile only the iceberg

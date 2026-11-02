@@ -75,6 +75,13 @@ RUN git clone https://github.com/duckdb/pg_duckdb /build/pg_duckdb \
  && cd /build/pg_duckdb \
  && git checkout c04e6a2dcf4e999abb921da1ba2f8335dad644e0 \
  && git submodule update --init --recursive
+# The EXTRACT field-quoting patch: pg_duckdb's vendored ruleutils copies quote
+# the field name of EXTRACT(field FROM x) when they deparse a query for DuckDB,
+# so a crafted field cannot reach DuckDB as SQL. See the patch header.
+COPY docker/pg_duckdb-extract-field-quoting.patch /tmp/pg_duckdb-extract-field-quoting.patch
+RUN cd /build/pg_duckdb \
+ && git apply --check /tmp/pg_duckdb-extract-field-quoting.patch \
+ && git apply        /tmp/pg_duckdb-extract-field-quoting.patch
 
 # pgEdge propagates -fexcess-precision=standard into CXXFLAGS, which gcc rejects
 # for C++. Strip it after PGXS is included (no-op if absent).

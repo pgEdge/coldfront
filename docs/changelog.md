@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and
 this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- A crafted `EXTRACT` field name in a query that runs on DuckDB no longer
+  reaches DuckDB as SQL. The base image and the pg_duckdb packages apply
+  ColdFront's `pg_duckdb-extract-field-quoting` patch, which quotes the field
+  name as PostgreSQL's fix for CVE-2026-15741 does.
+
 ## [1.0.0-rc1] - 2026-09-28
 
 ### Added

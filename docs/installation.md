@@ -146,7 +146,7 @@ table shows each component and its source:
 | Component | Source |
 |---|---|
 | libcurl 8.12.0 | The recipe builds libcurl from source from `curl.se`, because DuckDB 1.5.4 httpfs needs curl 7.77 or later at compile time and the pgEdge base ships 7.76.1. |
-| pg_duckdb (DuckDB 1.5.4) | `github.com/duckdb/pg_duckdb`, PR #1025 |
+| pg_duckdb (DuckDB 1.5.4) | `github.com/duckdb/pg_duckdb`, PR #1025, with ColdFront's `EXTRACT` field-quoting patch applied |
 | duckdb-iceberg | `github.com/duckdb/duckdb-iceberg`, `v1.5-variegata` @ `5edc45f0` |
 | DuckDB 1.5.4 | `github.com/duckdb/duckdb`, tag `v1.5.4`, which replaces duckdb-iceberg's own DuckDB submodule |
 | duckdb-avro, duckdb-azure, duckdb-postgres | `github.com/duckdb/duckdb-avro` @ `7f423d69`, `github.com/duckdb/duckdb-azure` @ `563589b2`, and `github.com/duckdb/duckdb-postgres` @ `6b2b12ca`, pinned in `docker/iceberg-azure-extension-config-v15.cmake` |
@@ -154,7 +154,8 @@ table shows each component and its source:
 | Base images | `ghcr.io/pgedge/pgedge-postgres:<pg>-spock5-minimal` and `quay.io/pypa/manylinux_2_28_<arch>` |
 
 The base build runs as three Docker stages: the first builds libcurl and
-pg_duckdb; the second clones duckdb-iceberg at the pinned ref, applies
+pg_duckdb, with ColdFront's pg_duckdb patch applied; the second clones
+duckdb-iceberg at the pinned ref, applies
 ColdFront's seven patches, and compiles the iceberg, avro, azure, and
 postgres_scanner extensions under vcpkg; the third assembles the runtime. The
 build `git apply --check`s each patch before applying it, so it fails loudly on
@@ -186,6 +187,16 @@ read fail the query rather than abort the backend. The
 canonical recipe - every source pin and compile step - is
 [`docker/Dockerfile.duckdb15-base`](https://github.com/pgEdge/ColdFront/blob/main/docker/Dockerfile.duckdb15-base)
 itself.
+
+ColdFront applies one patch to pg_duckdb, `pg_duckdb-extract-field-quoting`.
+pg_duckdb turns the query it runs on DuckDB into SQL text with its vendored
+copies of PostgreSQL's `ruleutils.c`, and those copies write the field name of
+`EXTRACT(field FROM x)` as it is. PostgreSQL's parser accepts any string as the
+field, so an unquoted field would reach DuckDB as SQL and run there with the
+session's attachments and secrets. The patch quotes the field name, as
+PostgreSQL's own `ruleutils.c` does since its fix for CVE-2026-15741; a valid
+field such as `year` stays bare, and any other string is refused as a unit. The
+pg_duckdb packages built from `packaging/pg_duckdb` apply the same patch.
 
 ## Building the Image on Docker
 

@@ -727,7 +727,7 @@ The following table lists the services and components ColdFront runs against:
 | Component | Version | Purpose |
 |-----------|---------|---------|
 | PostgreSQL | 16, 17, or 18 | Provides the database with native partitioning; stock PostgreSQL serves a single node, and the Docker image and distributed mode use pgEdge's PostgreSQL build with Spock. |
-| pg_duckdb | commit c04e6a2 (PR #1025), on DuckDB 1.5.4 | Runs Iceberg reads and writes through in-process DuckDB. |
+| pg_duckdb | commit c04e6a2 (PR #1025), on DuckDB 1.5.4, patched | Runs Iceberg reads and writes through in-process DuckDB, with ColdFront's `EXTRACT` field-quoting patch applied (see [docker/Dockerfile.duckdb15-base](docker/Dockerfile.duckdb15-base)). |
 | duckdb-iceberg | `v1.5-variegata` @ `5edc45f0`, patched | Provides Iceberg catalog and I/O for DuckDB, with ColdFront's seven patches applied (see [docker/Dockerfile.duckdb15-base](docker/Dockerfile.duckdb15-base)). |
 | Lakekeeper | latest | Provides the Iceberg REST catalog (a Rust binary). |
 | S3-compatible store | any | Stores the cold data; SeaweedFS, MinIO, AWS S3, and GCS all work. |

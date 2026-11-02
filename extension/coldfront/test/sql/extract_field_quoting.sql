@@ -1,0 +1,21 @@
+-- A crafted EXTRACT field name is refused, not run. pg_duckdb c04e6a2 turns
+-- the query it runs on DuckDB into SQL text with its vendored ruleutils copies,
+-- and PostgreSQL's parser accepts any string as the field of
+-- EXTRACT(field FROM x), so an unquoted field would be spliced into the DuckDB
+-- statement as SQL; docker/pg_duckdb-extract-field-quoting.patch quotes it.
+-- A heap table under duckdb.force_execution takes the same deparse as a tiered
+-- view's cold read, with no Iceberg I/O.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_duckdb;
+RESET client_min_messages;
+CREATE TABLE extract_field_t (ts timestamptz);
+INSERT INTO extract_field_t VALUES ('2026-03-04 05:06:07+00');
+SET duckdb.force_execution = true;
+-- A valid field is a plain word, stays bare and runs on DuckDB.
+SELECT EXTRACT(year FROM ts) AS plain FROM extract_field_t;
+-- Spliced in bare, this field would run as SQL on DuckDB and return 4094
+-- (2026 + 42 + 2026). Quoted, DuckDB rejects it as a field, pg_duckdb hands
+-- the query back to PostgreSQL, and PostgreSQL rejects the unit.
+SELECT EXTRACT('year FROM ts) + 42 + extract(year' FROM ts) AS injected FROM extract_field_t;
+RESET duckdb.force_execution;
+DROP TABLE extract_field_t;
