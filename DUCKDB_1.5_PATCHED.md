@@ -266,8 +266,8 @@ The base build *is* the recipe; read it as the source of truth. Its non-obvious
 requirements (each a real build failure if missing):
 
 - **libcurl ≥ 7.77** built from source in the pg_duckdb stage (the
-  `CURLSSLOPT_AUTO_CLIENT_CERT` symbol). The bundled httplib client is what
-  runs at runtime — libcurl is a *compile-time* dependency of httpfs only.
+  `CURLSSLOPT_AUTO_CLIENT_CERT` symbol). httpfs's curl client, which
+  `coldfront.ensure_attached()` selects, runs on it at runtime.
 - **`gcc-toolset-14-libasan-devel` + `-libubsan-devel`** in the iceberg-builder
   (`manylinux_2_28_x86_64`, gcc-toolset-14). The extension's
   `extension_configuration` phase builds a Debug `duckdb_platform_binary` that

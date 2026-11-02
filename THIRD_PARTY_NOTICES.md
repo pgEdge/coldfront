@@ -38,8 +38,8 @@ California — under the PostgreSQL License (full text in
 
 ## curl License
 
-libcurl is bundled in the image (linked by DuckDB's `httpfs`; the runtime HTTP
-client is httplib). It is distributed under the curl License:
+libcurl is bundled in the image (linked by DuckDB's `httpfs`, whose curl client
+is the runtime HTTP client). It is distributed under the curl License:
 
 > Copyright (C) Daniel Stenberg, daniel@haxx.se, and many contributors.
 >
