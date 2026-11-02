@@ -107,8 +107,9 @@ requested steps, each under a bakery claim on that table:
   A transaction that has read the table keeps the snapshot of its first cold
   read until it ends, and expiry does not know about that transaction: if
   expiry removes the snapshot and deletes its files meanwhile, the
-  transaction's next scan fails with the object store's HTTP 404 (a scan that
-  already fetched the files answers from DuckDB's file cache instead). Keep
+  transaction's next scan fails with the object store's not-found error, HTTP
+  404 from an S3 store and BlobNotFound from Azure (a scan that already fetched
+  the files answers from DuckDB's file cache instead). Keep
   `--expire-older-than` longer than the longest transaction that reads the
   table; the 168 h default does, and `0s` is for a table nothing is reading.
 - Orphan removal deletes files under the table location that no retained

@@ -344,20 +344,15 @@ BEGIN
       'AUTHORIZATION_TYPE NONE, ACCESS_DELEGATION_MODE %s)',
       wh, ep, mode
     ));
-    -- Pin DuckDB's BUNDLED httpfs client (cpp-httplib + mbedtls), not the system
-    -- libcurl DuckDB 1.5 defaults to. The libcurl client's threaded resolver calls
-    -- glibc getaddrinfo, whose IPv6 check_pf() netlink probe is fragile under a
-    -- copy-on-write Iceberg DELETE's concurrent S3 connections resolving an
-    -- object-store HOSTNAME (AWS S3, GCS); bare-IP stores (SeaweedFS) skip
-    -- getaddrinfo, which is why CI never hit it. curl 8.11.1 made this a hard crash
-    -- via CVE-2025-0665 (resolver double-closed an fd → glibc SIGABRT); the base now
-    -- builds curl 8.12.0 (CVE-fixed), but we still pin httplib: it resolves in-thread
-    -- (no resolver-thread churn), keeps DuckDB fully parallel, and is what stock
-    -- pg_duckdb 1.1.1 used. This SET is the SINGLE home of the httplib pin —
-    -- cmd/archiver calls ensure_attached() to reuse it.
-    -- Background: https://curl.se/docs/CVE-2025-0665.html
+    -- httpfs's curl client with its connection cache on. httpfs keeps one HTTP
+    -- client per open file, and the curl implementation alone parks that client's
+    -- connection in a cross-file cache when the file closes, so the parquet,
+    -- manifest and manifest-list requests of one cold statement share a TLS
+    -- connection to the store. The image links curl 8.12.0. This is the single
+    -- home of the client choice: cmd/archiver calls ensure_attached() for it.
     -- Run AFTER the ATTACH (httpfs loaded); GLOBAL = this backend's instance; idempotent.
-    PERFORM duckdb.raw_query($q$SET GLOBAL httpfs_client_implementation = 'httplib'$q$);
+    PERFORM duckdb.raw_query($q$SET GLOBAL httpfs_client_implementation = 'curl'$q$);
+    PERFORM duckdb.raw_query($q$SET GLOBAL httpfs_connection_caching = true$q$);
     -- Skip the metadata-log time-travel read at table load. When a table's
     -- metadata is newer than the transaction start (guaranteed for every
     -- bakery-serialized writer that waited on a peer's commit), duckdb-iceberg

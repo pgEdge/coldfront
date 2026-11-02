@@ -55,8 +55,9 @@ prepare() {
   # bullseye ships libcurl 7.74, too old to compile the DuckDB 1.5.x httpfs
   # (CURLSSLOPT_AUTO_CLIENT_CERT, curl >= 7.77). Build it to a build-local prefix
   # and expose it to find_package(CURL); we do NOT rpath it, so the produced .so
-  # resolves libcurl.so.4 from the system at runtime (the curl path is unused —
-  # ColdFront forces httplib). These exports persist into dpkg-buildpackage below.
+  # resolves libcurl.so.4 from the system at runtime, bullseye's 7.74, which
+  # httpfs's curl client (the one ColdFront selects) then runs on. These exports
+  # persist into dpkg-buildpackage below.
   DISTRO=$(lsb_release -cs)
   if [ "$DISTRO" = "bullseye" ]; then
     echo "bullseye: building curl ${CURL_VERSION} from source (build-time only)..."

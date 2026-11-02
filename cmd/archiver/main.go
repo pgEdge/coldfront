@@ -250,13 +250,9 @@ func execDuckDB(ctx context.Context, conn *pgx.Conn, sql string) error {
 // the persistent DuckDB secret the stored storage_secret row materialized, so
 // nothing is created here. coldfront.ensure_attached()
 // is the sole ATTACH: it derives the access-delegation mode from the stored
-// storage_secret row (VENDED_CREDENTIALS when vended, else NONE) and pins the
-// bundled httplib HTTP client. The system libcurl client DuckDB 1.5 defaults to
-// uses a threaded resolver that races glibc's getaddrinfo netlink fd under a
-// copy-on-write Iceberg DELETE against an object-store hostname (never a bare-IP
-// store, which is why CI on SeaweedFS never hit it); curl 8.11.1 made that a hard
-// SIGABRT via CVE-2025-0665. The base now builds curl 8.12.0 (CVE-fixed), but
-// httplib stays pinned: it resolves in-thread, so DuckDB stays fully parallel.
+// storage_secret row (VENDED_CREDENTIALS when vended, else NONE) and selects
+// httpfs's curl client with its connection cache on, so one cold statement's
+// store requests share a TLS connection.
 func attachIceberg(ctx context.Context, conn *pgx.Conn) error {
 	if _, err := conn.Exec(ctx, "SELECT coldfront.ensure_attached()"); err != nil { // nosemgrep
 		return fmt.Errorf("attach iceberg catalog via ensure_attached: %w", err)
