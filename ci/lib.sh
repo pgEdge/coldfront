@@ -147,6 +147,20 @@ topo_teardown() {
 # coldfront-ci/<UTC yyyymmddThhmmssZ>-<random>.
 cell_prefix() { printf 'coldfront-ci/%s-%s' "$(date -u +%Y%m%dT%H%M%SZ)" "$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n')"; }
 
+# pull_image <image>: pull with a retry, because a public registry refuses a
+# pull over its per-second quota (ECR Public: one unauthenticated pull per
+# second) and the refusal is momentary. Five attempts, the waits growing from
+# 5 to 20 seconds.
+pull_image() {
+    local i
+    for i in 1 2 3 4 5; do
+        docker pull -q "$1" >/dev/null && return 0
+        [ "$i" -lt 5 ] && sleep $((i * 5))
+    done
+    echo "pull_image: $1 could not be pulled" >&2
+    return 1
+}
+
 # s3cli <args...>: the AWS CLI from AWS's own image, pinned by digest, so a
 # host's CLI packaging cannot break a purge (Ubuntu's 2.31.35 build on Python
 # 3.14 fails on list-objects-v2 before it sends a request). Its identity is the

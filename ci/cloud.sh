@@ -61,6 +61,7 @@ setup() {
     if [ "$CLOUD" = azure ]; then
         export COLDFRONT_AZURE_TOKEN_FILE="$TOKEN"
         mkdir -p "$DIR/azure" && chmod 777 "$DIR/azure"
+        pull_image "$AZCLI_IMAGE" || exit 1
         az_login || { echo "cloud.sh: the federated login failed" >&2; exit 1; }
         echo "identity: $(azcli account show --query user.name 2>/dev/null || echo "$COLDFRONT_AZURE_CLIENT_ID")"
         return
@@ -82,6 +83,7 @@ EOF
     chmod 644 "$DIR/config"
     printf 'AWS_CONFIG_FILE=%s\nAWS_PROFILE=data\n' "$DIR/config" > "$DIR/cli.env"
     export COLDFRONT_CLI_ENV="$DIR/cli.env" COLDFRONT_AWS_TOKEN_FILE="$TOKEN"
+    pull_image "$S3CLI_IMAGE" || exit 1
     local arn; arn=$(s3cli sts get-caller-identity --query Arn --output text) || { echo "cloud.sh: the role chain failed" >&2; exit 1; }
     echo "identity: $arn"
 }
