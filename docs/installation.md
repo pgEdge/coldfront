@@ -444,7 +444,7 @@ it then requires; a lane turned on without the rest fails instead of staying
 | `aws`   | Real AWS S3 (native virtual-hosted addressing over HTTPS) | `COLDFRONT_AWS_ACCESS_KEY` | `COLDFRONT_AWS_SECRET_KEY`, `_BUCKET`, `_REGION` |
 | `azure` | Real Azure ADLS Gen2 | `COLDFRONT_AZURE_CONNECTION_STRING` | `COLDFRONT_AZURE_ACCOUNT`, `_FILESYSTEM`, `_KEY` |
 | `azure-vended` | Real Azure ADLS Gen2 with SAS vending (vanilla only) | `COLDFRONT_AZURE_ACCOUNT` | `COLDFRONT_AZURE_FILESYSTEM`, and either `COLDFRONT_AZURE_KEY` (the account's key as the warehouse credential) or, in CI, the job's OIDC token with `COLDFRONT_AZURE_CLIENT_ID` and `_TENANT_ID` (the managed identity, on an account with key access off) |
-| `aws-vended` | Real AWS S3 with STS vending and no stored key (vanilla only) | `COLDFRONT_AWS_DATA_ROLE_ARN` | `COLDFRONT_AWS_EXTERNAL_ID`, `_BUCKET`, `_REGION`; in CI also `_CI_ROLE_ARN` and the job's OIDC token, locally the caller's own AWS session |
+| `aws-vended` | Real AWS S3 with STS vending and no stored key (vanilla only) | `COLDFRONT_AWS_DATA_ROLE_ARN` | `COLDFRONT_AWS_EXTERNAL_ID`, `_BUCKET`, `_REGION`; in CI also `_CI_ROLE_ARN` and the job's OIDC token, locally the caller's own AWS session, which must be allowed to assume the data role and to list and delete under the bucket's `coldfront-ci/` prefix, since the cell purges its prefix as the caller |
 | `gcs`   | Real GCS via S3 interoperability (HMAC) | `COLDFRONT_GCS_ACCESS_KEY` | `COLDFRONT_GCS_SECRET_KEY`, `_BUCKET` |
 
 In GitHub Actions these come from repo secrets; an unset secret arrives empty,
