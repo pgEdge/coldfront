@@ -87,10 +87,10 @@ COMPOSE="docker compose -f $COMPOSE_FILE"
 DB=coldfront-db-1
 
 # A cloud lane with a federated identity: Lakekeeper's identity goes in an
-# environment file the cloud compose override reads, the token directory is
-# mounted at /oidc, and the cell writes under its own prefix, which the teardown
-# purges. The container runs as another user, so the directory and file are
-# world-readable.
+# environment file the cloud compose override reads on the host, so a local
+# run's session keys stay private to the caller; the token directory, which
+# the container reads, is mounted at /oidc; and the cell writes under its own
+# prefix, which the teardown purges.
 CELL_PREFIX=""; TOKEN_FILE=""; creds=""
 case "$BACKEND" in
   aws-vended)   TOKEN_FILE="${COLDFRONT_AWS_TOKEN_FILE:-}";;
@@ -109,7 +109,7 @@ elif [ "$BACKEND" = aws-vended ]; then
   unset AWS_PROFILE AWS_CONFIG_FILE AWS_SESSION_TOKEN; eval "$creds"
 fi
 if [ "$BACKEND" = aws-vended ] || { [ "$BACKEND" = azure-vended ] && [ -n "$TOKEN_FILE" ]; }; then
-  CF_LK_ENV_DIR=$(mktemp -d /tmp/coldfront-cloud.XXXXXX); chmod 755 "$CF_LK_ENV_DIR"; export CF_LK_ENV_DIR
+  CF_LK_ENV_DIR=$(mktemp -d /tmp/coldfront-cloud.XXXXXX); export CF_LK_ENV_DIR
   {
     if [ "$BACKEND" = aws-vended ]; then
       echo "LAKEKEEPER__ENABLE_AWS_SYSTEM_CREDENTIALS=true"
@@ -129,7 +129,6 @@ if [ "$BACKEND" = aws-vended ] || { [ "$BACKEND" = azure-vended ] && [ -n "$TOKE
       echo "AZURE_FEDERATED_TOKEN_FILE=/oidc/$(basename "$TOKEN_FILE")"
     fi
   } > "$CF_LK_ENV_DIR/lakekeeper.env"
-  chmod 644 "$CF_LK_ENV_DIR/lakekeeper.env"
   CF_LK_TOKEN_DIR="${TOKEN_FILE:+$(dirname "$TOKEN_FILE")}"
   export CF_LK_TOKEN_DIR="${CF_LK_TOKEN_DIR:-$CF_LK_ENV_DIR}"
   CELL_PREFIX=$(cell_prefix)
