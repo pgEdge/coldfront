@@ -1,7 +1,7 @@
 -- A table or column name DuckDB cannot parse is refused wherever ColdFront gives
 -- it a cold tier. pg_duckdb c04e6a2 hands DuckDB each identifier quoted the way
 -- PostgreSQL quotes it, so a name PostgreSQL leaves bare reaches DuckDB bare, and
--- DuckDB's parser takes some of those as keywords (duckdb/pg_duckdb#1019).
+-- DuckDB's parser takes some of those as keywords.
 -- White-box like ddl_alter_column: each refusal comes before any Iceberg call, so
 -- no catalog is needed. ci/journey.sh covers registration, the archive pass,
 -- adoption and a rename on an archived table.

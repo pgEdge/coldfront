@@ -1372,11 +1372,6 @@ func bulkExportWithSnapshot(ctx context.Context, conn *pgx.Conn, t *config.Table
 	return snapshotStr, nil
 }
 
-// (Old exportPartition + retryOnConflict were replaced by archivePartition's
-// 5-phase pipeline. Catalog-conflict retry is no longer needed because the
-// bulk export is one autocommit DuckDB transaction; if Iceberg rejects it,
-// the whole archive cycle errors out and cron retries.)
-
 // icebergRef is the DuckDB reference for a source table's cold Iceberg table.
 // The PG schema is the Iceberg namespace, so the ref is ice.<schema>.<table>
 // and same-named tables in different PG schemas resolve to distinct tables.

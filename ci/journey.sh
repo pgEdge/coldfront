@@ -7008,7 +7008,7 @@ story_unmappable_column_rejected() {
 # Story: TC-260..TC-263, TC-265, a table or column name DuckDB parses as a
 # keyword is refused on every path to a cold tier. pg_duckdb hands DuckDB each
 # identifier quoted the way PostgreSQL quotes it, so by, which PostgreSQL leaves
-# bare, reaches DuckDB bare and fails to parse (duckdb/pg_duckdb#1019). Without
+# bare, reaches DuckDB bare and fails to parse. Without
 # the refusal a table with such a column registers and then every archive pass
 # that tiers it fails, and a table with such a name archives and then every read
 # of its view fails. A DuckDB keyword its parser takes as a name (columns) and a

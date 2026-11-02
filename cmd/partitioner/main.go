@@ -175,8 +175,8 @@ func runReconcilePass(ctx context.Context, conn *pgx.Conn, cfg *config.Config) {
 // reconcileFailed. main() only sums the failures.
 func reconcileTable(ctx context.Context, mgr *partition.Manager, t config.TableConfig, now time.Time) bool {
 	// Resolve the real partitioned table: after the archiver's first-run swap the
-	// registered name is a VIEW over "_"+name, so premake against the table itself
-	// (issue #12). No-op for partition-only tables that were never swapped.
+	// registered name is a VIEW over "_"+name, so premake against the table itself.
+	// No-op for partition-only tables that were never swapped.
 	t.SourceTable = mgr.ResolveSourceTable(ctx, t.SourceSchema, t.SourceTable)
 	spec, err := specFromTable(t)
 	if err != nil {
