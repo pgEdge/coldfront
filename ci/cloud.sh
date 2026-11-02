@@ -112,6 +112,8 @@ case "${1:-}" in
     exit "$rc";;
   finish)
     setup
+    # The cells' containers first: a cancelled job leaves them running, mid-write.
+    docker ps -q --filter name=coldfront- | xargs -r docker rm -f >/dev/null
     rc=0
     while read -r p; do
         [ -n "$p" ] && { cloud_purge "$p" || rc=1; }
