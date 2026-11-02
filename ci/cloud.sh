@@ -122,16 +122,16 @@ case "${1:-}" in
   sweep)
     setup
     cutoff=$(date -u -d '-6 hours' +%Y%m%dT%H%M%SZ); n=0
-    prefixes=$(LC_ALL=C list_prefixes) || { echo "::error::sweep: the listing failed" >&2; exit 1; }
+    prefixes=$(LC_ALL=C list_prefixes) || { echo "::error::sweep: the listing failed"; exit 1; }
     while read -r p; do
         [ -n "$p" ] || continue
         ts=${p#coldfront-ci/}; ts=${ts%%-*}
         [[ $ts =~ ^[0-9]{8}T[0-9]{6}Z$ ]] && [[ $ts < $cutoff ]] || continue
         echo "::error::sweep: $p is older than 6 hours and still in the store"
-        cloud_purge "$p" || exit 1
+        cloud_purge "$p" || echo "::error::sweep: purge of $p failed"
         n=$((n + 1))
     done <<< "$prefixes"
-    [ "$n" -eq 0 ] || { echo "sweep: purged $n prefix(es) an earlier run left behind" >&2; exit 1; }
+    [ "$n" -eq 0 ] || { echo "sweep: $n prefix(es) an earlier run left behind" >&2; exit 1; }
     echo "sweep: nothing older than 6 hours under coldfront-ci/";;
   *) echo "usage: ci/cloud.sh <aws|azure> run -- <command...> | finish | sweep" >&2; exit 2;;
 esac
