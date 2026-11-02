@@ -18,7 +18,7 @@ prepare() {
     git fetch -q --depth 1 origin "${PG_DUCKDB_COMMIT}"
     git checkout -q FETCH_HEAD
     git submodule update --init --recursive --depth 1
-    git apply --check "${PG_DUCKDB_PATCH}" && git apply "${PG_DUCKDB_PATCH}"
+    git apply "$OLDPWD/docker/pg_duckdb-extract-field-quoting.patch"
     # GitHub auto-tarballs omit submodules, and pg_duckdb's Makefile gates the
     # DuckDB build on a `.git/modules/third_party/duckdb/HEAD` marker. Drop the
     # heavy .git history but leave that marker so `make` treats the submodule as

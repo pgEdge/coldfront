@@ -15,17 +15,13 @@ PER_PG_VERSION=true
 export PG_VERSION="${PG_VERSION:-17.7}"
 export PG_MAJOR_VERSION="$(echo "$PG_VERSION" | cut -d. -f1)"
 
-# pg_duckdb pinned to c04e6a2 (DuckDB 1.5.4). No released pg_duckdb tag has
-# 1.5.x; this commit pins its duckdb submodule to v1.5.4. This is an UPSTREAM
-# pin, independent of the ColdFront release tag: do NOT derive it from
-# COMPONENT_BRANCH (the builder-action always sets that to the ColdFront tag,
-# which is not a pg_duckdb ref). Override only via PG_DUCKDB_COMMIT.
+# pg_duckdb pinned to the merged PR #1025 commit (DuckDB 1.5.4). No released
+# pg_duckdb tag carries 1.5.x; this commit pins its duckdb submodule to v1.5.4.
+# This is an UPSTREAM pin, independent of the ColdFront release tag — do NOT
+# derive it from COMPONENT_BRANCH (the builder-action always sets that to the
+# ColdFront tag, which is not a pg_duckdb ref). Override only via PG_DUCKDB_COMMIT.
 export PG_DUCKDB_REPO="https://github.com/duckdb/pg_duckdb"
 export PG_DUCKDB_COMMIT="${PG_DUCKDB_COMMIT:-c04e6a2dcf4e999abb921da1ba2f8335dad644e0}"
-# The patch the base image applies to that commit as well
-# (docker/Dockerfile.duckdb15-base): see its header.
-PG_DUCKDB_PATCH="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)/docker/pg_duckdb-extract-field-quoting.patch"
-export PG_DUCKDB_PATCH
 export PG_DUCKDB_VERSION="${COMPONENT_VERSION:-1.5.4}"
 export PG_DUCKDB_BUILDNUM="${COMPONENT_BUILDNUM:-1}"
 
