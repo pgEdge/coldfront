@@ -89,8 +89,11 @@ EOF
 # per line, for the sweep.
 list_prefixes() {
     if [ "$CLOUD" = aws ]; then
-        s3cli s3api list-objects-v2 --bucket "$COLDFRONT_AWS_BUCKET" --prefix coldfront-ci/ --delimiter / \
-            --query 'CommonPrefixes[].[Prefix] || `[]`' --output text
+        # Objects and incomplete multipart uploads list separately, and a prefix can hold only the latter.
+        { s3cli s3api list-objects-v2 --bucket "$COLDFRONT_AWS_BUCKET" --prefix coldfront-ci/ --delimiter / \
+              --query 'CommonPrefixes[].[Prefix] || `[]`' --output text &&
+          s3cli s3api list-multipart-uploads --bucket "$COLDFRONT_AWS_BUCKET" --prefix coldfront-ci/ --delimiter / \
+              --query 'CommonPrefixes[].[Prefix] || `[]`' --output text; } | sort -u
     else
         # A missing coldfront-ci directory is an empty listing; any other failed answer fails the caller.
         local there; there=$(azcli storage fs directory exists --file-system "$COLDFRONT_AZURE_FILESYSTEM" --name coldfront-ci \
