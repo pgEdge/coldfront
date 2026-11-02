@@ -126,10 +126,13 @@ topo_teardown() {
     # aborting an upload during a part upload "might or might not succeed"), so
     # a stack that did not come down leaves it, and before the identity
     # directory goes, since a local run's purge reads its session there; a
-    # purge that leaves anything fails the cell.
+    # purge that leaves anything fails the cell. An Azure cell logs the CLI in
+    # again first: its session lasts about an hour, the token file stays fresh.
     if [ -n "${CELL_PREFIX:-}" ]; then
         if [ "$down" -ne 0 ]; then
             echo "compose down failed, so $CELL_PREFIX is not purged" >&2; purged=1
+        elif [ "$BACKEND" = azure-vended ] && ! az_login; then
+            echo "the Azure login before the purge failed" >&2; purged=1
         else
             cloud_purge "$CELL_PREFIX/"; purged=$?
         fi
