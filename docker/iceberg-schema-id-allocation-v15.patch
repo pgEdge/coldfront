@@ -2,10 +2,10 @@
 #
 # Applies to: duckdb-iceberg @ 5edc45f0 (branch v1.5-variegata), DuckDB v1.5.x.
 #
-# A port of upstream duckdb-iceberg c1cfe2ef ("fix: Allocate new schema ids from
-# the highest existing id instead of the current one", PR #1438, issue #1436),
-# which is on main only: v1.5-variegata does not have it (checked up to
-# 5dcf5070), nor does the duckdb-iceberg that DuckDB v1.5.5 ships (45163a28).
+# A port of upstream duckdb-iceberg c1cfe2ef ("Allocate new schema ids from the
+# highest existing id, not the current one"), which is on main only:
+# v1.5-variegata does not have it (checked up to 5dcf5070), nor does the
+# duckdb-iceberg that DuckDB v1.5.5 ships (45163a28).
 #
 # Problem: every ALTER path copies the current schema and numbers the copy one
 # above the current schema's id, and AddSchemaOrGetExisting reuses an existing

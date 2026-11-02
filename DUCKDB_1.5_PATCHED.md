@@ -221,9 +221,9 @@ keeps the secret.
 
 ## 7. A failed manifest read fails the query, not the backend (one patch, a port)
 
-`iceberg-manifest-read-error-v15.patch` ports upstream duckdb-iceberg PR
-#1305 (merged into `main` on 2026-08-08, not on `v1.5-variegata` up to
-`5dcf5070`). The shared scan state's destructor
+`iceberg-manifest-read-error-v15.patch` ports upstream duckdb-iceberg
+45f323eb (on `main`, not on `v1.5-variegata` up to `5dcf5070`). The shared
+scan state's destructor
 (`~IcebergMultiFileListSharedState`) drains the manifest-read tasks with
 `WorkOnTasks()`, which rethrows an error a task pushed (a missing manifest,
 a store error, a refused connection, the 403 above). An exception leaving a
@@ -259,7 +259,7 @@ port) only.
 | avro | **`7f423d69`** | the pin `v1.5-variegata` uses. |
 | azure | **`v1.5-variegata` @ `563589b2`** | the ABI-matched sibling of iceberg's branch. **NOT `main`** — azure `main` collides at link (`multiple definition of duckdb::FileFlags::FILE_FLAGS_NULL_IF_NOT_EXISTS`). |
 | postgres_scanner | duckdb-postgres **`6b2b12ca`** | the `postgres` ext; built bundled (ABI-matched, stamped v1.5.4), **shipped** in the image (never downloaded). Its vcpkg `libpq` build needs **flex** + **bison**. |
-| libcurl | **build 8.12.0** (≥ 7.77) | **REQUIRED** — DuckDB 1.5.4 httpfs uses `CURLSSLOPT_AUTO_CLIENT_CERT` (≥ 7.77); the pgEdge base ships 7.76.1. 8.12.0 fixes CVE-2025-0665 (the 8.11.1 resolver SIGABRT); runtime still pins httplib regardless. |
+| libcurl | **build 8.12.0** (≥ 7.77) | **REQUIRED** — DuckDB 1.5.4 httpfs uses `CURLSSLOPT_AUTO_CLIENT_CERT` (≥ 7.77); the pgEdge base ships 7.76.1. 8.12.0 fixes CVE-2025-0665 (the 8.11.1 resolver SIGABRT). It is the runtime client too: `coldfront.ensure_attached` selects httpfs's curl client with `httpfs_connection_caching` on. |
 
 ## 8. Build — `docker/Dockerfile.duckdb15-base`
 
@@ -296,7 +296,7 @@ always test current source.
 
 | File | Role |
 |---|---|
-| `docker/Dockerfile.duckdb15-base` | base: pg_duckdb 1.5.4 (PR #1025) + libcurl 8.12 + patched iceberg/avro/azure/postgres_scanner; runtime stage = the 4 extensions + entrypoint, **no coldfront**. |
+| `docker/Dockerfile.duckdb15-base` | base: pg_duckdb 1.5.4 (`c04e6a2`, patched) + libcurl 8.12 + patched iceberg/avro/azure/postgres_scanner; runtime stage = the 4 extensions + entrypoint, **no coldfront**. |
 | `docker/Dockerfile.duckdb15` | app: a `cf-build` stage compiles coldfront (PG devel only — coldfront links libpq, not pg_duckdb), then `FROM ${COLDFRONT_BASE}` copies the `.so`/SQL on top. |
 | `docker/entrypoint.sh` | first-init: reads `COLDFRONT_DUCKDB_VERSION` (v1.5.4, set by the base image), pre-places the extensions under `$PGDATA/pg_duckdb/extensions/<version>/<platform>/`, writes the GUCs. |
 | `docker/iceberg-azure-extension-config-v15.cmake` | the bundled-build extension config (iceberg + avro + azure + postgres_scanner). |

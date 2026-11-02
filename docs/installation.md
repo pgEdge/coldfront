@@ -173,7 +173,7 @@ describes what each one does:
 | `iceberg-timestamptz-utc-transforms-v15` | Computes the year/month/day/hour partition of a `timestamptz` column on the UTC instant rather than in the session's time zone (a port of upstream duckdb-iceberg d3c3348271). |
 | `iceberg-schema-id-allocation-v15` | Numbers a new table schema one above the highest schema id in the metadata rather than above the current one, so a column change after a `DROP COLUMN` that returned the table to an earlier schema is accepted (a port of upstream duckdb-iceberg c1cfe2ef). |
 | `iceberg-vended-secret-keep-v15` | Keeps a table's vended storage secret when the same transaction binds the table again, instead of replacing it, so a manifest read running on another thread never finds the secret missing between the drop and the write and goes unsigned to the default endpoint. |
-| `iceberg-manifest-read-error-v15` | Makes a failed manifest read fail the query rather than abort the backend: the shared scan state's destructor no longer lets the task error escape (a port of upstream duckdb-iceberg PR #1305). |
+| `iceberg-manifest-read-error-v15` | Makes a failed manifest read fail the query rather than abort the backend: the shared scan state's destructor no longer lets the task error escape (a port of upstream duckdb-iceberg 45f323eb). |
 
 The bakery patch is mandatory for the no-409 guarantee. The two interop patches
 make the manifests duckdb-iceberg writes readable by strict Apache readers such

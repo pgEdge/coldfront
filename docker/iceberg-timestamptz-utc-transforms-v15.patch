@@ -3,8 +3,8 @@
 # Applies to: duckdb-iceberg @ 5edc45f0 (branch v1.5-variegata), DuckDB v1.5.x.
 #
 # A port of upstream duckdb-iceberg d3c3348271 ("fix: use UTC semantics for Iceberg
-# TIMESTAMPTZ transforms", PR #1361), which is on main only: v1.5-variegata does not
-# carry it (checked up to 890b78a9), nor does the duckdb-iceberg that DuckDB v1.5.5
+# TIMESTAMPTZ transforms"), which is on main only: v1.5-variegata does not
+# have it (checked up to 890b78a9), nor does the duckdb-iceberg that DuckDB v1.5.5
 # ships (45163a28).
 #
 # Problem: a partitioned write computes year/month/day/hour of a TIMESTAMPTZ column
