@@ -30,13 +30,14 @@ ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 source "$SCRIPT_DIR/lib.sh"
 cd "$ROOT"
 
-SCOPE=""
+SCOPE=""; BE_ONLY=""
 while [ $# -gt 0 ]; do case "$1" in
   --quick) SCOPE="quick"; shift;;
   --full)  SCOPE="full";  shift;;
+  --backend) SCOPE="backend"; BE_ONLY="$2"; shift 2;;   # one backend's vanilla cells, no preflight (a cloud job)
   *) echo "matrix.sh: unknown arg $1"; exit 2;;
 esac; done
-[ -n "$SCOPE" ] || { echo "usage: ci/matrix.sh --quick|--full"; exit 2; }
+[ -n "$SCOPE" ] || { echo "usage: ci/matrix.sh --quick|--full|--backend <backend>"; exit 2; }
 
 # ── Preflight (host-side, once) ──────────────────────────────────────────────
 preflight() {
@@ -177,8 +178,14 @@ backend_ready() {
         s3)     return 0;;
         vended) return 0;;   # hermetic: SeaweedFS STS in-compose, no cloud creds
         aws)    [ -n "${COLDFRONT_AWS_ACCESS_KEY:-}" ];;
+        # real AWS S3 with vended credentials: the cloud-aws environment's
+        # identifiers (no key anywhere); Lakekeeper's identity is the job's OIDC
+        # token or, locally, the caller's session
+        aws-vended) [ -n "${COLDFRONT_AWS_DATA_ROLE_ARN:-}" ] && [ -n "${COLDFRONT_AWS_EXTERNAL_ID:-}" ] && [ -n "${COLDFRONT_AWS_BUCKET:-}" ];;
         azure)  [ -n "${COLDFRONT_AZURE_CONNECTION_STRING:-}" ];;
-        azure-vended) [ -n "${COLDFRONT_AZURE_KEY:-}" ];;
+        # with the account's key, or with the managed identity and a token (the
+        # cloud-azure environment, whose account has key access off)
+        azure-vended) [ -n "${COLDFRONT_AZURE_ACCOUNT:-}" ] && { [ -n "${COLDFRONT_AZURE_KEY:-}" ] || [ -n "${COLDFRONT_AZURE_TOKEN_FILE:-}" ]; };;
         gcs)    [ -n "${COLDFRONT_GCS_ACCESS_KEY:-}" ];;
         *)      return 1;;
     esac
@@ -194,10 +201,11 @@ coverage_table() {
     step "MATRIX COVERAGE (full grid = 96 cells, all on DuckDB 1.5.x)"
     local pg topo mode tgt be st cell_st
     for pg in 18 17 16; do
-      for be in s3 aws azure gcs vended azure-vended; do
+      for be in s3 aws azure gcs vended azure-vended aws-vended; do
         if backend_ready "$be"; then st="RUN"; else
           case "$be" in
             aws)   st="PENDING (needs COLDFRONT_AWS_* creds)";;
+            aws-vended) st="PENDING (needs the cloud-aws environment's COLDFRONT_AWS_* identifiers)";;
             azure) st="PENDING (needs COLDFRONT_AZURE_* creds)";;
             azure-vended) st="PENDING (needs COLDFRONT_AZURE_* creds)";;
             gcs)   st="PENDING (needs COLDFRONT_GCS_* creds)";;
@@ -208,8 +216,8 @@ coverage_table() {
           for mode in tiered decoupled; do
             for tgt in primary standby; do
               cell_st="$st"
-              # vended + azure-vended are vanilla-only; their mesh cells are deferred (row/flag replicates by value).
-              { [ "$be" = vended ] || [ "$be" = azure-vended ]; } && [ "$topo" = mesh ] && cell_st="DEFERRED (vanilla-only)"
+              # the vended lanes are vanilla-only; their mesh cells are deferred (row/flag replicates by value).
+              { [ "$be" = vended ] || [ "$be" = azure-vended ] || [ "$be" = aws-vended ]; } && [ "$topo" = mesh ] && cell_st="DEFERRED (vanilla-only)"
               printf '    pg%-2s · %-7s · %-9s · %-7s · %-6s : %s\n' "$pg" "$topo" "$mode" "$tgt" "$be" "$cell_st"
             done
           done
@@ -219,11 +227,25 @@ coverage_table() {
 }
 
 # ── Drive ─────────────────────────────────────────────────────────────────────
-preflight
+# A cloud job runs one backend's cells and skips the host-side checks, which the
+# quick job runs for the same commit, so no linter or docs tool runs next to a
+# cloud identity.
+[ "$SCOPE" = backend ] || preflight
 
 case "$SCOPE" in
   quick)
     run_cell "pg18·vanilla·tiered·primary·s3" vcell 18 tiered s3 primary regress
+    ;;
+  backend)
+    backend_ready "$BE_ONLY" || { echo "matrix.sh: backend $BE_ONLY has no identifiers in the environment"; exit 2; }
+    for pg in ${PG_ONLY:-18}; do
+      case "$BE_ONLY" in azure|azure-vended) prebuild_duckdb15 "$pg" || { CELL_FAIL=$((CELL_FAIL + 1)); continue; };; esac
+      for mode in tiered decoupled; do
+        for tgt in primary standby; do
+          run_cell "pg${pg}·vanilla·${mode}·${tgt}·${BE_ONLY}" vcell "$pg" "$mode" "$BE_ONLY" "$tgt"
+        done
+      done
+    done
     ;;
   full)
     # The whole grid: PG{16,17,18} × {vanilla,mesh} × {tiered,decoupled} ×
@@ -245,7 +267,7 @@ case "$SCOPE" in
       # Azure SAS vending (creds-gated). Both vanilla only: their mesh cells are
       # deferred: the storage_secret row (incl. its vended flag) replicates by
       # value, so the static mesh cells already cover that path.
-      for be in s3 aws azure gcs vended azure-vended; do
+      for be in s3 aws azure gcs vended azure-vended aws-vended; do
         if ! backend_ready "$be"; then
           step "BACKEND $be (pg${pg}) — PENDING (creds absent; set its COLDFRONT_* env to RUN)"
           continue
@@ -255,7 +277,7 @@ case "$SCOPE" in
             reg=""
             [ "$be" = s3 ] && [ "$mode" = tiered ] && [ "$tgt" = primary ] && reg=regress
             run_cell "pg${pg}·vanilla·${mode}·${tgt}·${be}" vcell "$pg" "$mode" "$be" "$tgt" "$reg"
-            if [ "$be" = vended ] || [ "$be" = azure-vended ]; then
+            if [ "$be" = vended ] || [ "$be" = azure-vended ] || [ "$be" = aws-vended ]; then
               [ "$mode" = tiered ] && [ "$tgt" = primary ] && \
                 step "pg${pg}·mesh·*·*·${be} DEFERRED (vanilla-only; static mesh cells cover storage_secret row/flag replication)"
             else

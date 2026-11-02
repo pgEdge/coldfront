@@ -105,7 +105,7 @@ RUN dnf install -y --setopt=install_weak_deps=False \
         flex bison \
     && dnf clean all
 WORKDIR /build
-# ICEBERG_REF is the extension code the five patches target (kept fixed so they
+# ICEBERG_REF is the extension code the seven patches target (kept fixed so they
 # apply unchanged). Its duckdb submodule tracks duckdb main, which drifts off the
 # release, so after init we pin that submodule to the v1.5.4 TAG — the same engine
 # pg_duckdb links — and build the extension against it.
@@ -150,6 +150,16 @@ COPY docker/iceberg-timestamptz-utc-transforms-v15.patch /tmp/iceberg-tstz-utc-v
 # current schema's, so a column change after a DROP COLUMN that returned the
 # table to an earlier schema is accepted. See the patch header.
 COPY docker/iceberg-schema-id-allocation-v15.patch /tmp/iceberg-schema-id-v15.patch
+# Vended-secret patch: a repeat bind of a table in one transaction keeps the
+# table's vended storage secret instead of dropping and re-creating it, so a
+# manifest read on another thread never finds the secret missing and goes
+# unsigned to the default endpoint. See the patch header.
+COPY docker/iceberg-vended-secret-keep-v15.patch /tmp/iceberg-vended-secret-v15.patch
+# Manifest-read error patch, a port of upstream PR #1305 (on main only): the
+# shared scan state's destructor catches a manifest-read task's error, so a
+# failed read fails the query instead of aborting the backend.
+# See the patch header.
+COPY docker/iceberg-manifest-read-error-v15.patch /tmp/iceberg-manifest-read-v15.patch
 RUN cd /build/duckdb-iceberg \
  && git apply --check /tmp/iceberg-bakery-v15.patch \
  && git apply        /tmp/iceberg-bakery-v15.patch \
@@ -160,7 +170,11 @@ RUN cd /build/duckdb-iceberg \
  && git apply --check /tmp/iceberg-tstz-utc-v15.patch \
  && git apply        /tmp/iceberg-tstz-utc-v15.patch \
  && git apply --check /tmp/iceberg-schema-id-v15.patch \
- && git apply        /tmp/iceberg-schema-id-v15.patch
+ && git apply        /tmp/iceberg-schema-id-v15.patch \
+ && git apply --check /tmp/iceberg-vended-secret-v15.patch \
+ && git apply        /tmp/iceberg-vended-secret-v15.patch \
+ && git apply --check /tmp/iceberg-manifest-read-v15.patch \
+ && git apply        /tmp/iceberg-manifest-read-v15.patch
 # vcpkg triplet is derived from the build arch (uname -m): x86_64→x64-linux,
 # aarch64→arm64-linux. Host and target match here (the stage runs on the target
 # arch, native or emulated), so HOST and TARGET triplets are the same value.

@@ -159,6 +159,14 @@ this project adheres to
 
 ### Fixed
 
+- A read of an Iceberg table under vended credentials could abort the server
+  process, and with it every other session until the server had recovered. The
+  duckdb-iceberg build re-created a table's vended secret on every bind in a
+  transaction, so a statement that read the table twice (a self-join, a
+  `UNION`, a probed vector search) could have a manifest read find no secret
+  for a moment, go unsigned to the default endpoint and fail with HTTP 403,
+  and the scan state's destructor let that failure escape. The build keeps the
+  secret across binds, and a failed manifest read fails the query instead.
 - A value a cold write renders as text, a statement's parameter, a streamed
   column or a stored `interval`, took the caller's `DateStyle`, `IntervalStyle`
   and `extra_float_digits`, so a day-first date landed as another date, a

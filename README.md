@@ -728,7 +728,7 @@ The following table lists the services and components ColdFront runs against:
 |-----------|---------|---------|
 | PostgreSQL | 16, 17, or 18 | Provides the database with native partitioning; stock PostgreSQL serves a single node, and the Docker image and distributed mode use pgEdge's PostgreSQL build with Spock. |
 | pg_duckdb | commit c04e6a2 (PR #1025), on DuckDB 1.5.4 | Runs Iceberg reads and writes through in-process DuckDB. |
-| duckdb-iceberg | `v1.5-variegata` @ `5edc45f0`, patched | Provides Iceberg catalog and I/O for DuckDB, with ColdFront's five patches applied (see [docker/Dockerfile.duckdb15-base](docker/Dockerfile.duckdb15-base)). |
+| duckdb-iceberg | `v1.5-variegata` @ `5edc45f0`, patched | Provides Iceberg catalog and I/O for DuckDB, with ColdFront's seven patches applied (see [docker/Dockerfile.duckdb15-base](docker/Dockerfile.duckdb15-base)). |
 | Lakekeeper | latest | Provides the Iceberg REST catalog (a Rust binary). |
 | S3-compatible store | any | Stores the cold data; SeaweedFS, MinIO, AWS S3, and GCS all work. |
 | Azure ADLS Gen2 | any | Stores the cold data instead of an S3 store, through `set_storage_secret_azure` and an `adls` warehouse. |
@@ -812,6 +812,7 @@ pgedge-coldfront/
 ├── docker-compose.yml          ← END-USER single-node stack (ports published)
 ├── docker-compose.matrix.yml   ← CI only: single-node vanilla matrix
 ├── docker-compose.matrix-azure.yml ← CI only: vanilla matrix on Azure ADLS
+├── docker-compose.cloud.yml    ← CI only: Lakekeeper's federated identity for the aws-vended and azure-vended lanes
 ├── docker-compose.mesh.yml     ← CI only: 3-node Spock mesh
 ├── docker-compose.mesh-azure.yml ← CI only: 3-node Spock mesh on Azure ADLS
 ├── run-ci-local.sh             ← pre-commit gate (ci/matrix.sh --quick)

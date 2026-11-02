@@ -16,13 +16,15 @@ DuckDB 1.5).
 ## The build delta (vs the patched base)
 
 In `docker/Dockerfile.duckdb15-base`, drop the `COPY` + `git apply --check` +
-`git apply` of all five patches:
+`git apply` of all seven patches:
 
 - `iceberg-bakery-aware-commit-refresh-v15.patch`
 - `iceberg-manifest-list-format-version-v15.patch`
 - `iceberg-data-file-format-v15.patch`
 - `iceberg-timestamptz-utc-transforms-v15.patch`
 - `iceberg-schema-id-allocation-v15.patch`
+- `iceberg-vended-secret-keep-v15.patch`
+- `iceberg-manifest-read-error-v15.patch`
 
 Everything else — libcurl, vcpkg deps, the pins, the extension config, the
 runtime stage — is identical. In `docker/entrypoint.sh`, leave
@@ -98,6 +100,24 @@ table can take no further column change in either tier. The fifth patch, a
 port of upstream c1cfe2ef, numbers a new schema one above the highest id in
 the metadata.
 
+## Consequence 5: vended credentials fail a read at random
+
+Without `iceberg-vended-secret-keep-v15.patch`, every bind of a table under
+`ACCESS_DELEGATION_MODE VENDED_CREDENTIALS` drops and re-creates the table's
+storage secret. A statement that reads the table twice in one transaction (a
+self-join, a `UNION`, a probed vector search) binds it twice, and a manifest
+read of the first bind, running on another thread, can find no secret in the
+gap: it goes unsigned to the default endpoint and fails with HTTP 403. With
+Consequence 6 in place as well, that failure is an abort of the backend.
+
+## Consequence 6: a failed manifest read aborts the backend
+
+Without `iceberg-manifest-read-error-v15.patch`, the shared scan state's
+destructor rethrows a manifest-read task's error (a missing manifest, a store
+error, a refused connection, the 403 above), which is `std::terminate`: the
+backend dies with signal 6, and the postmaster ends every other server
+process, reinitializes shared memory and runs crash recovery.
+
 ## When unpatched is acceptable
 
 - You don't run the compactor (low cold-write volume, or you compact externally
@@ -109,7 +129,10 @@ the metadata.
   (Consequence 3: every tiered cold table is partitioned by time), **and**
 - no tiered table's column list ever returns to an earlier shape, such as a
   column added and then dropped (Consequence 4: after that the table can take
-  no further column change).
+  no further column change), **and**
+- no deployment uses vended credentials (Consequence 5), **and**
+- a storage error on a cold read may take the whole server through crash
+  recovery, every session with it (Consequence 6).
 
 Otherwise run the patched base ([DUCKDB_1.5_PATCHED.md](DUCKDB_1.5_PATCHED.md))
 — the default.

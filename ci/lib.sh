@@ -111,7 +111,7 @@ topo_standby() {
 # connection, and the server's lines name the signal and the statement. The
 # servers log to $PGDATA/log through the logging collector, not to stdout.
 topo_teardown() {
-    local rc=$? c
+    local rc=$? c purged down=0
     if [ "$rc" -ne 0 ]; then
         for c in $($COMPOSE ps -q 2>/dev/null) ${CF_STANDBY:-}; do
             docker exec "$c" sh -c 'cat "$PGDATA"/log/*.log' 2>/dev/null \
@@ -120,7 +120,112 @@ topo_teardown() {
     fi
     [ "${KEEP:-0}" = 1 ] && return 0
     docker rm -f "$CF_STANDBY" >/dev/null 2>&1 || true
-    $COMPOSE down -v >/dev/null 2>&1 || true
+    $COMPOSE down -v >/dev/null 2>&1 || down=$?
+    # A cloud cell's leftovers, both made by the topology that set CELL_PREFIX:
+    # the prefix, purged only once its writers are gone (AWS documents that
+    # aborting an upload during a part upload "might or might not succeed"), so
+    # a stack that did not come down leaves it, and before the identity
+    # directory goes, since a local run's purge reads its session there; a
+    # purge that leaves anything fails the cell. An Azure cell logs the CLI in
+    # again first: its session lasts about an hour, the token file stays fresh.
+    if [ -n "${CELL_PREFIX:-}" ]; then
+        if [ "$down" -ne 0 ]; then
+            echo "compose down failed, so $CELL_PREFIX is not purged" >&2; purged=1
+        elif [ "$BACKEND" = azure-vended ] && ! az_login; then
+            echo "the Azure login before the purge failed" >&2; purged=1
+        else
+            cloud_purge "$CELL_PREFIX/"; purged=$?
+        fi
+        rm -rf -- "$CF_LK_ENV_DIR"
+        [ "$purged" -eq 0 ] || { echo "purge of $CELL_PREFIX failed" >&2; exit 1; }
+    fi
+}
+
+# ── Cloud cells ───────────────────────────────────────────────────────────────
+# cell_prefix: the key prefix one cloud cell writes under (the warehouse's
+# key-prefix), and the only thing its purge removes:
+# coldfront-ci/<UTC yyyymmddThhmmssZ>-<random>.
+cell_prefix() { printf 'coldfront-ci/%s-%s' "$(date -u +%Y%m%dT%H%M%SZ)" "$(head -c 4 /dev/urandom | od -An -tx1 | tr -d ' \n')"; }
+
+# s3cli <args...>: the AWS CLI from AWS's own image, pinned by digest, so a
+# host's CLI packaging cannot break a purge (Ubuntu's 2.31.35 build on Python
+# 3.14 fails on list-objects-v2 before it sends a request). Its identity is the
+# env file COLDFRONT_CLI_ENV names and nothing from the caller's shell: a local
+# cell's session keys, or AWS_CONFIG_FILE and AWS_PROFILE for the token-based
+# role chain, whose directory (COLDFRONT_CLOUD_DIR) is mounted at its own path
+# so the config's file paths hold inside the container.
+S3CLI_IMAGE="public.ecr.aws/aws-cli/aws-cli:2.37.9@sha256:92de75724b6a746951f0e8b915d86bbccd7cb55aff96cd0cb4f7017272160780"
+s3cli() {
+    docker run --rm ${COLDFRONT_CLOUD_DIR:+-v "$COLDFRONT_CLOUD_DIR:$COLDFRONT_CLOUD_DIR:ro"} \
+        --env-file "${COLDFRONT_CLI_ENV:?}" -e AWS_REGION="${COLDFRONT_AWS_REGION:-}" "$S3CLI_IMAGE" "$@"
+}
+
+# s3_purge <bucket> <prefix>: abort every incomplete multipart upload and
+# delete every object under one cell's prefix, then list both again and fail
+# unless nothing is left. Refuses a prefix that is not exactly one cell's: an
+# empty one would empty the bucket, and one without its trailing slash would
+# also match a longer sibling. In an unversioned bucket a delete is final, so an
+# empty listing means no versions or delete markers either.
+s3_purge() {
+    local bucket="$1" prefix="$2" key upload_id objects uploads
+    [[ $prefix =~ ^coldfront-ci/[0-9]{8}T[0-9]{6}Z-[0-9a-f]+/$ ]] || { echo "s3_purge: refusing prefix '$prefix'" >&2; return 1; }
+    s3cli s3api list-multipart-uploads --bucket "$bucket" --prefix "$prefix" \
+        --query 'Uploads[].[Key, UploadId] || `[]`' --output text |
+    while IFS=$'\t' read -r key upload_id; do
+        [ -n "$key" ] && s3cli s3api abort-multipart-upload --bucket "$bucket" --key "$key" --upload-id "$upload_id" </dev/null
+    done
+    s3cli s3 rm "s3://$bucket/$prefix" --recursive --only-show-errors
+    objects=$(s3cli s3api list-objects-v2 --bucket "$bucket" --prefix "$prefix" --query 'length(Contents || `[]`)' --output json)
+    uploads=$(s3cli s3api list-multipart-uploads --bucket "$bucket" --prefix "$prefix" --query 'length(Uploads || `[]`)' --output json)
+    echo "purged $prefix: $objects objects and $uploads incomplete uploads left"
+    [ "$objects" = 0 ] && [ "$uploads" = 0 ]
+}
+
+# azcli <args...>: the Azure CLI from Microsoft's image, pinned by digest. Its
+# login state lives in COLDFRONT_CLOUD_DIR/azure, mounted read-write, so one
+# federated login (az_login) serves the calls that follow it; the token
+# directory is mounted at its own path for the login.
+AZCLI_IMAGE="mcr.microsoft.com/azure-cli:2.91.0@sha256:933eb8dcb81aecb6f77e03c5b8660f0a1dfa9e1d16525763a27f86ff3b83a044"
+azcli() {
+    docker run --rm -v "$COLDFRONT_CLOUD_DIR:$COLDFRONT_CLOUD_DIR" -e AZURE_CONFIG_DIR="$COLDFRONT_CLOUD_DIR/azure" \
+        -e AZURE_CORE_OUTPUT=tsv "$AZCLI_IMAGE" az "$@"
+}
+
+# az_login: sign the CLI in as the managed identity with the job's OIDC token.
+# The token lives a few minutes, the session it opens about an hour, so each
+# subcommand of ci/cloud.sh logs in once with a fresh token.
+az_login() {
+    azcli login --service-principal --username "$COLDFRONT_AZURE_CLIENT_ID" --tenant "$COLDFRONT_AZURE_TENANT_ID" \
+        --federated-token "$(cat "$COLDFRONT_AZURE_TOKEN_FILE")" --allow-no-subscriptions >/dev/null
+}
+
+# adls_purge <prefix>: delete one cell's directory under the filesystem and
+# fail unless it is gone. `directory delete` is recursive; `exists` answers
+# false only for a missing path and fails on anything else (a 403 included), so
+# a permission problem never reads as a clean result. The same prefix guard as
+# s3_purge, minus the slash the S3 key prefix carries.
+adls_purge() {
+    local dir="${1%/}"
+    [[ $dir =~ ^coldfront-ci/[0-9]{8}T[0-9]{6}Z-[0-9a-f]+$ ]] || { echo "adls_purge: refusing prefix '$1'" >&2; return 1; }
+    if [ "$(azcli storage fs directory exists --file-system "$COLDFRONT_AZURE_FILESYSTEM" --name "$dir" \
+             --account-name "$COLDFRONT_AZURE_ACCOUNT" --auth-mode login --query exists)" = true ]; then
+        azcli storage fs directory delete --file-system "$COLDFRONT_AZURE_FILESYSTEM" --name "$dir" \
+            --account-name "$COLDFRONT_AZURE_ACCOUNT" --auth-mode login --yes >/dev/null
+    fi
+    local left; left=$(azcli storage fs directory exists --file-system "$COLDFRONT_AZURE_FILESYSTEM" --name "$dir" \
+                        --account-name "$COLDFRONT_AZURE_ACCOUNT" --auth-mode login --query exists)
+    echo "purged $dir: directory present afterwards: $left"
+    [ "$left" = false ]
+}
+
+# cloud_purge <prefix>: the purge of the cell's cloud, chosen by the backend
+# the topology runs with.
+cloud_purge() {
+    case "${BACKEND:-}" in
+        aws-vended)   s3_purge "$COLDFRONT_AWS_BUCKET" "$1";;
+        azure-vended) adls_purge "$1";;
+        *) echo "cloud_purge: no cloud for backend '${BACKEND:-}'" >&2; return 1;;
+    esac
 }
 
 # create_warehouse_and_seed <lk_ip> <wh_body>  — POST the (backend-specific) Lakekeeper

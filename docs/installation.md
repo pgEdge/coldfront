@@ -105,7 +105,7 @@ This section walks you through building ColdFront from source, either in
 Docker on top of the published base image or on bare metal.
 
 ColdFront runs on a **DuckDB 1.5.x** stack: PostgreSQL + pg_duckdb (DuckDB
-1.5.4) and a **patched** duckdb-iceberg that includes ColdFront's five
+1.5.4) and a **patched** duckdb-iceberg that includes ColdFront's seven
 patches:
 
 - the bakery-aware commit-refresh patch (the no-409 guarantee for
@@ -116,6 +116,10 @@ patches:
   `timestamptz` column in UTC.
 - a port of another that numbers a new table schema above the highest
   schema id.
+- a patch that keeps a table's vended storage secret across binds, so a
+  statement that reads the table twice never has a read go out unsigned.
+- a port of an upstream fix that makes a failed manifest read fail the query
+  instead of aborting the backend.
 
 No released pg_duckdb tag includes DuckDB 1.5.x yet, so the stack is built
 from a pinned upstream PR plus ColdFront's patches - all from sources you
@@ -151,14 +155,14 @@ table shows each component and its source:
 
 The base build runs as three Docker stages: the first builds libcurl and
 pg_duckdb; the second clones duckdb-iceberg at the pinned ref, applies
-ColdFront's five patches, and compiles the iceberg, avro, azure, and
+ColdFront's seven patches, and compiles the iceberg, avro, azure, and
 postgres_scanner extensions under vcpkg; the third assembles the runtime. The
 build `git apply --check`s each patch before applying it, so it fails loudly on
 patch rot rather than silently shipping stock iceberg (which fails with HTTP
 409 under concurrency and writes manifests strict Apache readers reject).
 
-ColdFront applies five patches to duckdb-iceberg. The following table describes
-what each one does:
+ColdFront applies seven patches to duckdb-iceberg. The following table
+describes what each one does:
 
 | Patch | What it does |
 |---|---|
@@ -167,13 +171,18 @@ what each one does:
 | `iceberg-data-file-format-v15` | Upper-cases the data-file format in the manifest to match the spec enum strict readers check case-sensitively. |
 | `iceberg-timestamptz-utc-transforms-v15` | Computes the year/month/day/hour partition of a `timestamptz` column on the UTC instant rather than in the session's time zone (a port of upstream duckdb-iceberg d3c3348271). |
 | `iceberg-schema-id-allocation-v15` | Numbers a new table schema one above the highest schema id in the metadata rather than above the current one, so a column change after a `DROP COLUMN` that returned the table to an earlier schema is accepted (a port of upstream duckdb-iceberg c1cfe2ef). |
+| `iceberg-vended-secret-keep-v15` | Keeps a table's vended storage secret when the same transaction binds the table again, instead of replacing it, so a manifest read running on another thread never finds the secret missing between the drop and the write and goes unsigned to the default endpoint. |
+| `iceberg-manifest-read-error-v15` | Makes a failed manifest read fail the query rather than abort the backend: the shared scan state's destructor no longer lets the task error escape (a port of upstream duckdb-iceberg PR #1305). |
 
 The bakery patch is mandatory for the no-409 guarantee. The two interop patches
 make the manifests duckdb-iceberg writes readable by strict Apache readers such
 as apache/iceberg-go, the cold-tier compactor; they are inert to pg_duckdb's
 own reads. The fourth is what makes a partitioned cold table correct when
 written from a session whose time zone is not UTC. The fifth lets a table take
-a new column after a change that returned it to an earlier schema. The
+a new column after a change that returned it to an earlier schema. The sixth
+keeps a table's vended secret across the binds of one transaction, so a read
+on another thread never goes out unsigned. The seventh makes a failed manifest
+read fail the query rather than abort the backend. The
 canonical recipe - every source pin and compile step - is
 [`docker/Dockerfile.duckdb15-base`](https://github.com/pgEdge/ColdFront/blob/main/docker/Dockerfile.duckdb15-base)
 itself.
@@ -392,12 +401,26 @@ every push to `main`, and `--full` nightly and on demand. GitHub also runs a
 gitleaks secret scan, a go-licenses check, and the path-filtered walkthrough
 workflow, which the local gate does not.
 
+On `main` only, GitHub also runs the `aws-vended` cells against a real AWS
+bucket and the `azure-vended` cells against a real ADLS Gen2 account
+(`ci/matrix.sh --backend <backend>`, inside `ci/cloud.sh <cloud>`). The jobs
+hold no cloud credential: each requests a GitHub OIDC token, and Lakekeeper
+assumes an IAM role from it (AWS) or signs user-delegation SAS tokens as a
+managed identity (Azure, on an account with key access off), vending
+per-table credentials to DuckDB. The accounts' identifiers are the variables
+of the `cloud-aws` and `cloud-azure` environments, whose branch rules allow
+`main` alone. Each cell writes under its own prefix and purges it at
+teardown, the job purges every prefix again when it ends, and an hourly
+workflow
+([.github/workflows/sweep.yml](https://github.com/pgEdge/ColdFront/blob/main/.github/workflows/sweep.yml))
+removes anything older than six hours and fails if it found something.
+
 ### Full Matrix
 
 `ci/matrix.sh --full` is the release gate, covering PG {16, 17, 18} × {vanilla,
 mesh (3-node Spock)} × {tiered, decoupled} × {primary, standby} × {s3, aws,
-azure, gcs, vended, azure-vended}, where the two vended backends run on vanilla
-only. The ops-hardening and probe-snowflake cells run once, on PG18. The mesh
+azure, gcs, vended, azure-vended, aws-vended}, where the three vended backends
+run on vanilla only. The ops-hardening and probe-snowflake cells run once, on PG18. The mesh
 cells add the cross-node stories - hot visibility via Spock, cold visibility
 via the shared Lakekeeper catalog, the R-A bakery serializing concurrent cold
 writers (same-node and cross-node) with no 409, and an N×(N-1) probe that the
@@ -420,7 +443,8 @@ it then requires; a lane turned on without the rest fails instead of staying
 | `vended` | SeaweedFS STS credential vending (hermetic, vanilla only) | None; this backend always runs. | None |
 | `aws`   | Real AWS S3 (native virtual-hosted addressing over HTTPS) | `COLDFRONT_AWS_ACCESS_KEY` | `COLDFRONT_AWS_SECRET_KEY`, `_BUCKET`, `_REGION` |
 | `azure` | Real Azure ADLS Gen2 | `COLDFRONT_AZURE_CONNECTION_STRING` | `COLDFRONT_AZURE_ACCOUNT`, `_FILESYSTEM`, `_KEY` |
-| `azure-vended` | Real Azure ADLS Gen2 with SAS vending (vanilla only) | `COLDFRONT_AZURE_KEY` | `COLDFRONT_AZURE_ACCOUNT`, `_FILESYSTEM` |
+| `azure-vended` | Real Azure ADLS Gen2 with SAS vending (vanilla only) | `COLDFRONT_AZURE_ACCOUNT` | `COLDFRONT_AZURE_FILESYSTEM`, and either `COLDFRONT_AZURE_KEY` (the account's key as the warehouse credential) or, in CI, the job's OIDC token with `COLDFRONT_AZURE_CLIENT_ID` and `_TENANT_ID` (the managed identity, on an account with key access off) |
+| `aws-vended` | Real AWS S3 with STS vending and no stored key (vanilla only) | `COLDFRONT_AWS_DATA_ROLE_ARN` | `COLDFRONT_AWS_EXTERNAL_ID`, `_BUCKET` (with versioning never enabled, since the purge deletes without version ids), `_REGION`; in CI also `_CI_ROLE_ARN` and the job's OIDC token, locally the caller's own AWS session, which must be allowed to assume the data role and, since the cell purges its prefix as the caller, `s3:ListBucket` and `s3:ListBucketMultipartUploads` on the bucket and `s3:DeleteObject` and `s3:AbortMultipartUpload` on the objects under `coldfront-ci/` |
 | `gcs`   | Real GCS via S3 interoperability (HMAC) | `COLDFRONT_GCS_ACCESS_KEY` | `COLDFRONT_GCS_SECRET_KEY`, `_BUCKET` |
 
 In GitHub Actions these come from repo secrets; an unset secret arrives empty,

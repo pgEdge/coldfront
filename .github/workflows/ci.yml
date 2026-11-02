@@ -154,3 +154,139 @@ jobs:
           go install github.com/google/go-licenses@latest
           "$(go env GOPATH)/bin/go-licenses" check ./cmd/... ./internal/... \
             --ignore github.com/pgedge/coldfront
+
+  # The real-AWS lane, on main only: the condition says so, the cloud-aws
+  # environment allows no other branch either, and its variables are
+  # identifiers, not secrets. The job gets a
+  # federated identity through its OIDC token (id-token: write), which only
+  # Lakekeeper uses: it assumes the data role and vends per-table credentials.
+  # Every cell writes under its own prefix and purges it at teardown; the
+  # job-end step purges them again under `if: always()`, so a failed or
+  # cancelled job leaves nothing in the bucket.
+  cloud-aws:
+    name: cloud (aws-vended, PG 18)
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    environment:
+      name: cloud-aws
+      deployment: false
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      PG_ONLY: '18'
+      COLDFRONT_AWS_BUCKET: ${{ vars.COLDFRONT_AWS_BUCKET }}
+      COLDFRONT_AWS_REGION: ${{ vars.COLDFRONT_AWS_REGION }}
+      COLDFRONT_AWS_CI_ROLE_ARN: ${{ vars.COLDFRONT_AWS_CI_ROLE_ARN }}
+      COLDFRONT_AWS_DATA_ROLE_ARN: ${{ vars.COLDFRONT_AWS_DATA_ROLE_ARN }}
+      COLDFRONT_AWS_EXTERNAL_ID: ${{ vars.COLDFRONT_AWS_EXTERNAL_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install golangci-lint (the compactor build gate)
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
+            | sh -s -- -b "$(go env GOPATH)/bin" v2.12.2
+
+      - name: Log in to GHCR (pull base image)
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: aws-vended cells
+        run: ci/cloud.sh aws run -- ci/matrix.sh --backend aws-vended
+      - name: purge the cells' prefixes
+        if: always()
+        run: ci/cloud.sh aws finish
+
+  sweep-aws:
+    name: sweep (aws)
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    environment:
+      name: cloud-aws
+      deployment: false
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      COLDFRONT_AWS_BUCKET: ${{ vars.COLDFRONT_AWS_BUCKET }}
+      COLDFRONT_AWS_REGION: ${{ vars.COLDFRONT_AWS_REGION }}
+      COLDFRONT_AWS_CI_ROLE_ARN: ${{ vars.COLDFRONT_AWS_CI_ROLE_ARN }}
+      COLDFRONT_AWS_DATA_ROLE_ARN: ${{ vars.COLDFRONT_AWS_DATA_ROLE_ARN }}
+      COLDFRONT_AWS_EXTERNAL_ID: ${{ vars.COLDFRONT_AWS_EXTERNAL_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: ci/cloud.sh aws sweep
+        run: ci/cloud.sh aws sweep
+
+  cloud-azure:
+    name: cloud (azure-vended, PG 18)
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    environment:
+      name: cloud-azure
+      deployment: false
+    permissions:
+      contents: read
+      packages: read
+      id-token: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      PG_ONLY: '18'
+      COLDFRONT_AZURE_ACCOUNT: ${{ vars.COLDFRONT_AZURE_ACCOUNT }}
+      COLDFRONT_AZURE_FILESYSTEM: ${{ vars.COLDFRONT_AZURE_FILESYSTEM }}
+      COLDFRONT_AZURE_CLIENT_ID: ${{ vars.COLDFRONT_AZURE_CLIENT_ID }}
+      COLDFRONT_AZURE_TENANT_ID: ${{ vars.COLDFRONT_AZURE_TENANT_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Set up Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+          cache: true
+
+      - name: Install golangci-lint (the compactor build gate)
+        run: |
+          curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
+            | sh -s -- -b "$(go env GOPATH)/bin" v2.12.2
+
+      - name: Log in to GHCR (pull base image)
+        run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
+      - name: azure-vended cells
+        run: ci/cloud.sh azure run -- ci/matrix.sh --backend azure-vended
+      - name: purge the cells' prefixes
+        if: always()
+        run: ci/cloud.sh azure finish
+
+  sweep-azure:
+    name: sweep (azure)
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+    environment:
+      name: cloud-azure
+      deployment: false
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      COLDFRONT_AZURE_ACCOUNT: ${{ vars.COLDFRONT_AZURE_ACCOUNT }}
+      COLDFRONT_AZURE_FILESYSTEM: ${{ vars.COLDFRONT_AZURE_FILESYSTEM }}
+      COLDFRONT_AZURE_CLIENT_ID: ${{ vars.COLDFRONT_AZURE_CLIENT_ID }}
+      COLDFRONT_AZURE_TENANT_ID: ${{ vars.COLDFRONT_AZURE_TENANT_ID }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: ci/cloud.sh azure sweep
+        run: ci/cloud.sh azure sweep

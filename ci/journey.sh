@@ -77,7 +77,7 @@ esac; done
 storage_secret_sql() {
     if [ "$BACKEND" = azure-vended ]; then
         printf "SELECT coldfront.set_storage_secret_vended('azure');"
-    elif [ "$BACKEND" = vended ]; then
+    elif [ "$BACKEND" = vended ] || [ "$BACKEND" = aws-vended ]; then
         # Vended creds: no credential stored. Lakekeeper issues per-table
         # STS creds and ensure_attached() uses ACCESS_DELEGATION_MODE VENDED_CREDENTIALS.
         printf "SELECT coldfront.set_storage_secret_vended();"
@@ -101,7 +101,7 @@ storage_secret_sql() {
 # vending is scoped to a table resolved through the catalog, so a bare path has
 # nothing to vend against. Reads through the catalog, and every PG-side and
 # catalog-side assertion, are unaffected.
-vended_creds() { [ "$BACKEND" = vended ] || [ "$BACKEND" = azure-vended ]; }
+vended_creds() { [ "$BACKEND" = vended ] || [ "$BACKEND" = azure-vended ] || [ "$BACKEND" = aws-vended ]; }
 
 # hot_days — the hot_period, in days, that pins the tier cutoff at the start of
 # last month: everything older than that month is cold, the last two months are
@@ -220,7 +220,7 @@ EOSQL
     assert_eq "storage secret row written" "1" "$secret"
     # The compactor binary, for the compactor() wrapper (see its comment).
     [ -x "$COMPACTOR" ] && docker cp "$COMPACTOR" "$HOST":/usr/local/bin/compactor >/dev/null 2>&1
-    if [ "$BACKEND" = vended ] || [ "$BACKEND" = azure-vended ]; then
+    if vended_creds; then
         assert_eq "storage secret is vended (no credential stored)" "t" \
             "$(q "$HOST" "SELECT vended FROM coldfront.storage_secret LIMIT 1;")"
     fi
@@ -7678,6 +7678,35 @@ story_duckdb_temp_dirs() {
     docker exec "$HOST" bash -c "rm -rf $base/999002 ${livepid:+$base/$livepid}"
 }
 
+# ───────────────────────────────────────────────────────────────────────────
+# Story (vanilla, SeaweedFS-backed): a manifest missing from the object store
+# fails the read with the store's error and leaves the backend alive
+# (docker/iceberg-manifest-read-error-v15.patch). One manifest of an
+# eight-manifest table is deleted through SeaweedFS's filer API, under which
+# the S3 bucket is stored.
+# ───────────────────────────────────────────────────────────────────────────
+story_missing_manifest() {
+    step "TC-264: a read whose manifest is missing from the store fails with the store's error, and the backend lives"
+    local i dir files target out before after
+    q "$HOST" "SELECT coldfront.create_iceberg_table('public','tcmr','[{\"name\":\"id\",\"type\":\"integer\"},{\"name\":\"note\",\"type\":\"text\"}]'::jsonb);" >/dev/null 2>&1
+    for i in 1 2 3 4 5 6 7 8; do q "$HOST" "INSERT INTO public.tcmr VALUES ($i, 'm$i');" >/dev/null 2>&1; done
+    assert_eq "TC-264: eight commits, eight data files" "8" "$(ice_files ice.public.tcmr '\.parquet')"
+    # The table's metadata directory in the filer, from one data file's path.
+    dir=$(q "$HOST" "SELECT coldfront.ensure_attached(); SELECT r['p'] FROM duckdb.query('SELECT file_path AS p FROM iceberg_metadata(''ice.public.tcmr'') LIMIT 1') AS t(r);" | tail -1)
+    dir="/buckets/${dir#s3://}"; dir="${dir%/data/*}/metadata"
+    files=$(curl -sf -H 'Accept: application/json' "http://$SW_IP:8888$dir/" | grep -oE '"FullPath":"[^"]*-m0\.avro"' | cut -d'"' -f4)
+    assert_eq "TC-264: eight manifests in the store" "8" "$(printf '%s\n' "$files" | grep -c .)"
+    target=$(printf '%s\n' "$files" | head -1)
+    before=$(docker exec "$HOST" sh -c 'cat "$PGDATA"/log/*.log 2>/dev/null' | grep -c 'was terminated by signal')
+    curl -sf -X DELETE "http://$SW_IP:8888$target" >/dev/null
+    out=$(q_may "$HOST" "SELECT count(*) FROM public.tcmr;")
+    assert_err "TC-264: the read fails with the store's HTTP 404" "404" "$out"
+    after=$(docker exec "$HOST" sh -c 'cat "$PGDATA"/log/*.log 2>/dev/null' | grep -c 'was terminated by signal')
+    assert_eq "TC-264: no backend aborted" "$before" "$after"
+    assert_eq "TC-264: a new session answers" "1" "$(q "$HOST" "SELECT 1;")"
+    q "$HOST" "SELECT coldfront.drop_iceberg_table('public','tcmr', false);" >/dev/null 2>&1
+}
+
 story_drop_iceberg_table() {
     step "drop_iceberg_table: decoupled and tiered, purge and keep-files"
     DIT_WH=$(curl -s "http://${LK_IP}:8181/management/v1/warehouse" \
@@ -8321,6 +8350,7 @@ story_partitioned_cold_tables  # TC-186..TC-189: partition fan-out, UTC months, 
 story_row_group_pruning        # TC-192: a time band skips the row groups outside it
 story_vector_probe_pruning     # TC-193: a vector probe skips the row groups of the clusters it does not visit
 story_drop_iceberg_table   # both modes, purge and keep-files (own throwaway tables)
+[ "$MESH" != 1 ] && { [ "$BACKEND" = s3 ] || [ "$BACKEND" = vended ]; } && story_missing_manifest   # TC-264: a missing manifest fails the read, not the backend
 [ "$MESH" = 1 ] && [ "$MODE" = decoupled ] && story_mesh   # tiered+mesh runs story_mesh_tiered (above)
 [ "$MESH" = 1 ] && story_mesh_multiwriter   # >1 cold writer/node cross-node (tiered: events, decoupled: iceonly)
 [ "$MESH" = 1 ] && story_mesh_reaper        # orphan claims/acks reaped on the claim, apply and poke paths
