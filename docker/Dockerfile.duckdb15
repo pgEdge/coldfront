@@ -1,12 +1,9 @@
-# ColdFront image on the DuckDB 1.5.x stack — the THIN coldfront layer on top of
+# ColdFront image on the DuckDB 1.5.x stack: the thin coldfront layer on top of
 # the prebuilt coldfront-duckdb-base. The base (docker/Dockerfile.duckdb15-base)
-# carries the expensive, STABLE compiles — pg_duckdb 1.5.4 (PR #1025) and the
+# holds the expensive, stable compiles, pg_duckdb (DuckDB 1.5.4, patched) and the
 # patched duckdb-iceberg extensions (iceberg/avro/azure/postgres_scanner,
-# v1.5-variegata + the bakery-aware commit-refresh patch). This build only
-# compiles the coldfront C extension (seconds), so CI and local builds are fast
-# and always test the CURRENT coldfront source.
-#
-# This is the canonical ColdFront app layer. All proven in DUCKDB_1.5_PATCHED.md.
+# v1.5-variegata). This build only compiles the coldfront C extension (seconds),
+# so CI and local builds are fast and always test the current coldfront source.
 #
 # COLDFRONT_BASE is the prebuilt ghcr.io/pgedge base image. Before building,
 # either pull it from ghcr.io/pgedge/coldfront-duckdb-base or build it locally
@@ -37,10 +34,10 @@ RUN DESTDIR=/out make -C /build/coldfront install with_llvm=no
 # ─── app runtime: coldfront extension on top of the base ─────────────────────────
 # pg_duckdb 1.5.4, the iceberg/avro/azure/postgres_scanner extensions, libcurl
 # 8.12, COLDFRONT_DUCKDB_* env and /data are inherited from the base. This stage
-# adds coldfront's .so + SQL/control (distinct filenames — no overwrite of
-# pg_duckdb) and the entrypoint.
+# adds coldfront's .so + SQL/control (distinct filenames, so nothing of
+# pg_duckdb is overwritten) and the entrypoint.
 #
-# entrypoint.sh carries frequently-changing runtime config (e.g. the
+# entrypoint.sh holds frequently-changing runtime config (e.g. the
 # duckdb.postgres_role default) and lives only here, in the fast app layer, so
 # every build, local and GitHub CI alike, runs the branch's current entrypoint
 # and an entrypoint change never needs a base rebuild.
@@ -52,15 +49,15 @@ COPY --from=cf-build /out/usr/pgsql-${PG_MAJOR}/share/extension/ /usr/pgsql-${PG
 COPY docker/entrypoint.sh /usr/local/bin/coldfront-entrypoint.sh
 RUN chmod +x /usr/local/bin/coldfront-entrypoint.sh
 # pgvector, from the same pgEdge repo the base is built from. A tiered vector
-# table carries the type on its hot side, and both the cold read and cold write
+# table has the type on its hot side, and both the cold read and cold write
 # paths rely on pgvector's implicit vector -> real[] cast. It sits in the app
 # layer for the same reason as entrypoint.sh: baked only into the separately
 # published base, a stale base would silently lack it and local CI would diverge
 # from GitHub CI.
 RUN dnf install -y --setopt=install_weak_deps=False pgedge-pgvector_${PG_MAJOR} \
     && dnf clean all
-# License + third-party notices travel with the binaries we redistribute (DuckDB
-# family is MIT — the notice must accompany the distributed Software).
+# License + third-party notices travel with the binaries we redistribute (the
+# DuckDB family is MIT: the notice must accompany the distributed Software).
 COPY THIRD_PARTY_NOTICES.md LICENSE.md /usr/share/doc/coldfront/
 USER postgres
 ENTRYPOINT ["/usr/local/bin/coldfront-entrypoint.sh"]

@@ -110,7 +110,7 @@ services:
         ports:
             - "${COLDFRONT_MESH_LK_PORT:-8191}:8181"
         healthcheck:
-            test: ["CMD", "/home/nonroot/lakekeeper", "healthcheck"]  # full path (see #31)
+            test: ["CMD", "/home/nonroot/lakekeeper", "healthcheck"]  # full path: the bare name is not on the image PATH
             interval: 3s
             timeout: 2s
             retries: 10

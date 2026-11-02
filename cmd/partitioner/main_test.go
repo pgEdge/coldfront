@@ -38,11 +38,11 @@ func TestSpecFromTable(t *testing.T) {
 		got.Period != partition.PeriodMonthly || got.Premake != 3 {
 		t.Fatalf("unexpected spec: %+v", got)
 	}
-	// specFromTable no longer parses the period — it carries the raw PG interval
-	// literal onto the Spec verbatim; the cutoff is resolved later in Postgres
-	// (Manager.ExpiryCutoff). Interval *validity* is Postgres's call, enforced at
-	// register/startup (partition.ValidatePeriods) and exercised in ci/journey.sh,
-	// so there is no Go-side "bad retention string" rejection here anymore.
+	// specFromTable copies the raw PG interval literal onto the Spec verbatim;
+	// the cutoff is resolved later in Postgres (Manager.ExpiryCutoff). Interval
+	// *validity* is Postgres's call, enforced at register/startup
+	// (partition.ValidatePeriods) and exercised in ci/journey.sh, so there is no
+	// Go-side "bad retention string" rejection here.
 	if got.RetentionInterval != "12 months" {
 		t.Fatalf("retention interval = %q, want %q", got.RetentionInterval, "12 months")
 	}

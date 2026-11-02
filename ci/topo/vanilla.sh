@@ -271,11 +271,11 @@ step "vanilla: build archiver"
 make -s build >/dev/null 2>&1 || go build -o bin/archiver ./cmd/archiver
 
 # The compactor is a separate iceberg-go module that `make build` does NOT build.
-# Journey stories 6d/6e drive it; without it a missing ./bin/compactor read as a cryptic
-# "No such file or directory" and masked real compactor regressions (issue #17). Build it
-# here, and abort if the build fails since 6d/6e depend on it.
+# Journey stories 6d/6e drive it; without it a missing ./bin/compactor reads as
+# "No such file or directory" and hides a compactor regression. Build it here,
+# and abort if the build fails since 6d/6e depend on it.
 step "vanilla: build compactor (separate iceberg-go module; journey 6d/6e need it)"
-make -s compactor || { echo "vanilla.sh: compactor build failed — stories 6d/6e require ./bin/compactor"; exit 1; }
+make -s compactor || { echo "vanilla.sh: compactor build failed: stories 6d/6e require ./bin/compactor"; exit 1; }
 
 topo_standby "$DB"
 

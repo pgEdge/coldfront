@@ -8,15 +8,15 @@ build story is [DUCKDB_1.5_PATCHED.md](DUCKDB_1.5_PATCHED.md).
 
 The *same* 1.5.x stack — pg_duckdb PR #1025 + `duckdb-iceberg` `v1.5-variegata`
 @ `5edc45f0` + avro/azure/postgres_scanner, libcurl 8.12, the same
-vcpkg/libasan toolchain and version pins — built with the five ColdFront
-patches **omitted**. It is still a locally-built (unsigned) extension; there is
+vcpkg/libasan toolchain and version pins — built with the seven ColdFront
+duckdb-iceberg patches **omitted**. It is still a locally-built (unsigned) extension; there is
 no signed upstream 1.5.x iceberg to auto-install (no released pg_duckdb bundles
 DuckDB 1.5).
 
 ## The build delta (vs the patched base)
 
 In `docker/Dockerfile.duckdb15-base`, drop the `COPY` + `git apply --check` +
-`git apply` of all seven patches:
+`git apply` of all seven duckdb-iceberg patches:
 
 - `iceberg-bakery-aware-commit-refresh-v15.patch`
 - `iceberg-manifest-list-format-version-v15.patch`
@@ -26,6 +26,8 @@ In `docker/Dockerfile.duckdb15-base`, drop the `COPY` + `git apply --check` +
 - `iceberg-vended-secret-keep-v15.patch`
 - `iceberg-manifest-read-error-v15.patch`
 
+The pg_duckdb patch, `docker/pg_duckdb-extract-field-quoting.patch`, stays in
+both builds: without it a crafted `EXTRACT` field name runs as SQL on DuckDB.
 Everything else — libcurl, vcpkg deps, the pins, the extension config, the
 runtime stage — is identical. In `docker/entrypoint.sh`, leave
 `coldfront.iceberg_bakery_patch` **unset** (and optionally

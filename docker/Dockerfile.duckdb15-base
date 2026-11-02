@@ -1,19 +1,15 @@
-# ColdFront DuckDB 1.5.x BASE image — the expensive, STABLE layer: libcurl 8.12 +
-# pg_duckdb (DuckDB 1.5.4, PR #1025) + the patched duckdb-iceberg extensions
-# (iceberg/avro/azure/postgres_scanner, v1.5-variegata + the bakery-aware
-# commit-refresh patch). It does NOT contain the coldfront extension — that thin,
-# fast-changing layer is added by docker/Dockerfile.duckdb15 (the "app" build)
-# which does `FROM` this image. Rebuilt only when the pg_duckdb PR ref, the
-# iceberg ref, or the bakery patch changes.
-#
-# This is the prebuilt, stable layer; the thin coldfront app
-# (docker/Dockerfile.duckdb15) does FROM it. The base-image workflow
-# (.github/workflows/base-image.yml) builds and pushes it to
-# ghcr.io/pgedge/coldfront-duckdb-base with the workflow GITHUB_TOKEN.
+# ColdFront DuckDB 1.5.x base image: the stable layer, libcurl 8.12.0, pg_duckdb
+# (DuckDB 1.5.4, patched) and the patched duckdb-iceberg extensions (iceberg,
+# avro, azure and postgres_scanner from v1.5-variegata). The coldfront extension
+# is not in it: docker/Dockerfile.duckdb15 (the app build) does FROM this image
+# and adds it. The base-image workflow (.github/workflows/base-image.yml) builds
+# and pushes it to ghcr.io/pgedge/coldfront-duckdb-base with the workflow
+# GITHUB_TOKEN, under the tag ci/base-ref.sh prints, whose hash covers this file
+# and every file its COPY lines take from the tree.
 #
 # The image is arch-aware: it builds natively for the host arch (amd64 on x86_64,
-# arm64 on aarch64). The manylinux base, vcpkg triplet, and DuckDB extension dir
-# are all derived from the target arch — no manual edits to switch arches.
+# arm64 on aarch64). The manylinux base, the vcpkg triplet and the DuckDB
+# extension dir are derived from the target arch.
 #
 #   # native (host arch):
 #   docker build -f docker/Dockerfile.duckdb15-base --build-arg PG_MAJOR=18 \
@@ -36,7 +32,7 @@ ARG PGEDGE_TAG=${PG_MAJOR}-spock5-minimal
 # cross-build under emulation on an x86_64 host.
 ARG TARGETARCH=amd64
 
-# ─── build stage: libcurl 8.12 + pg_duckdb (DuckDB 1.5.4, PR #1025) ──────────────
+# ─── build stage: libcurl 8.12 + pg_duckdb (DuckDB 1.5.4, patched) ───────────────
 FROM ghcr.io/pgedge/pgedge-postgres:${PGEDGE_TAG} AS build
 ARG PG_MAJOR
 USER root
@@ -51,16 +47,15 @@ RUN dnf install -y --setopt=install_weak_deps=False \
 ENV PATH=/usr/pgsql-${PG_MAJOR}/bin:$PATH
 ENV PG_CONFIG=/usr/pgsql-${PG_MAJOR}/bin/pg_config
 
-# libcurl 8.12.0 — built ONLY to satisfy DuckDB 1.5.4 httpfs's COMPILE-TIME
-# dependency: its CMake does find_package(CURL REQUIRED) and curl_client.cpp
-# references CURLSSLOPT_AUTO_CLIENT_CERT (curl >= 7.77); the base ships 7.76.1.
-# 8.12.0 fixes CVE-2025-0665 (the 8.11.1 threaded resolver double-closed an fd
-# after a name resolve, racing glibc getaddrinfo's netlink fd → SIGABRT). At
-# RUNTIME we STILL force DuckDB's BUNDLED httplib/mbedtls client anyway
-# (httpfs_client_implementation='httplib', set in coldfront.ensure_attached) —
-# httplib resolves in-thread (no resolver-thread churn) and is what stock
-# pg_duckdb 1.1.1 used; keeping the libcurl client out of the cold path is
-# belt-and-suspenders now that the linked curl is the CVE-fixed release.
+# libcurl 8.12.0, built from source because DuckDB 1.5.4 httpfs needs curl 7.77
+# or later at compile time (its CMake does find_package(CURL REQUIRED) and
+# curl_client.cpp uses CURLSSLOPT_AUTO_CLIENT_CERT) and the pgEdge base ships
+# 7.76.1. It is the runtime client as well: coldfront.ensure_attached sets
+# httpfs_client_implementation = 'curl' with httpfs_connection_caching on, so a
+# session's store requests reuse their connections across files. 8.12.0 has the
+# fix for CVE-2025-0665 (8.11.1's threaded resolver double-closed a descriptor
+# after a name resolve and raced glibc getaddrinfo's netlink descriptor, a
+# SIGABRT).
 WORKDIR /curl
 RUN wget -q https://curl.se/download/curl-8.12.0.tar.gz && tar xf curl-8.12.0.tar.gz \
  && cd curl-8.12.0 \
@@ -68,13 +63,20 @@ RUN wget -q https://curl.se/download/curl-8.12.0.tar.gz && tar xf curl-8.12.0.ta
         --without-libpsl --without-libssh2 --without-nghttp2 --without-brotli --without-zstd \
  && make -j"$(nproc)" && make install && ldconfig
 
-# pg_duckdb at the merged PR #1025 commit (DuckDB 1.5.4). No released pg_duckdb
-# tag carries 1.5.x; this commit pins its duckdb submodule to the v1.5.4 tag.
+# pg_duckdb at c04e6a2 (DuckDB 1.5.4): no released pg_duckdb tag has 1.5.x, and
+# this commit pins its duckdb submodule to the v1.5.4 tag.
 WORKDIR /build
 RUN git clone https://github.com/duckdb/pg_duckdb /build/pg_duckdb \
  && cd /build/pg_duckdb \
  && git checkout c04e6a2dcf4e999abb921da1ba2f8335dad644e0 \
  && git submodule update --init --recursive
+# The EXTRACT field-quoting patch: pg_duckdb's vendored ruleutils copies quote
+# the field name of EXTRACT(field FROM x) when they deparse a query for DuckDB,
+# so a crafted field cannot reach DuckDB as SQL. See the patch header.
+COPY docker/pg_duckdb-extract-field-quoting.patch /tmp/pg_duckdb-extract-field-quoting.patch
+RUN cd /build/pg_duckdb \
+ && git apply --check /tmp/pg_duckdb-extract-field-quoting.patch \
+ && git apply        /tmp/pg_duckdb-extract-field-quoting.patch
 
 # pgEdge propagates -fexcess-precision=standard into CXXFLAGS, which gcc rejects
 # for C++. Strip it after PGXS is included (no-op if absent).
@@ -107,8 +109,8 @@ RUN dnf install -y --setopt=install_weak_deps=False \
 WORKDIR /build
 # ICEBERG_REF is the extension code the seven patches target (kept fixed so they
 # apply unchanged). Its duckdb submodule tracks duckdb main, which drifts off the
-# release, so after init we pin that submodule to the v1.5.4 TAG — the same engine
-# pg_duckdb links — and build the extension against it.
+# release, so after init the build replaces that submodule with the v1.5.4 tag,
+# the engine pg_duckdb links, and builds the extension against it.
 RUN git clone --filter=blob:none --no-checkout https://github.com/duckdb/duckdb-iceberg \
  && git -C duckdb-iceberg fetch --depth 80 origin v1.5-variegata \
  && git -C duckdb-iceberg checkout ${ICEBERG_REF} \
@@ -118,47 +120,45 @@ RUN git clone --filter=blob:none --no-checkout https://github.com/duckdb/duckdb-
  && git clone https://github.com/microsoft/vcpkg /build/vcpkg \
  && /build/vcpkg/bootstrap-vcpkg.sh -disableMetrics
 COPY docker/iceberg-azure-extension-config-v15.cmake /build/duckdb-iceberg/extension_config.cmake
-# The bakery-aware-commit-refresh patch (v1.5 port) — ESSENTIAL: coldfront's
-# no-409 guarantee for concurrent cold writers, and the as-of-start rewind that
-# lets writers queued behind the first commit into a never-written table
-# proceed. git apply --check fails the
-# build loudly on patch rot instead of silently shipping stock iceberg (which
-# 409s under concurrency). See DUCKDB_1.5_PATCHED.md + the patch header.
+# The bakery-aware commit-refresh patch: coldfront's no-409 guarantee for
+# concurrent cold writers, and the as-of-start rewind that lets writers queued
+# behind the first commit into a never-written table proceed. Each patch is
+# checked with git apply --check before it is applied, so a patch that does not
+# apply fails the build instead of the image shipping stock iceberg (which fails
+# with HTTP 409 under concurrent writers). See the patch header.
 COPY docker/iceberg-bakery-aware-commit-refresh-v15.patch /tmp/iceberg-bakery-v15.patch
-# The manifest-list format-version interop patch — adds the (spec-optional)
-# "format-version" key to the manifest-list Avro metadata so strict Apache
+# The manifest-list format-version interop patch adds the spec-optional
+# "format-version" key to the manifest-list Avro metadata, so strict Apache
 # readers (iceberg-go, the coldfront compactor) parse the entries as v2 instead
-# of defaulting to v1 and rejecting the v2 manifest files. Upstreamable.
-# Inert to pg_duckdb reads (its ManifestListReader takes the version from table
-# metadata, not this key). See the patch header + COMPACTOR.md.
+# of defaulting to v1 and rejecting the v2 manifest files. Inert to pg_duckdb
+# reads (its ManifestListReader takes the version from the table metadata, not
+# this key). See the patch header.
 COPY docker/iceberg-manifest-list-format-version-v15.patch /tmp/iceberg-mlist-fmtver-v15.patch
-# (The manifest-FILE content="data"/"deletes" interop fix is upstream as of this
-# ICEBERG_REF (commit f343c518, "Write delete manifests with content='deletes'
-# file metadata"), so ColdFront no longer carries a patch for it.)
-# Data-file 'file_format' interop patch: upper-case the data-file 'file_format' in the manifest
-# (spec enum is PARQUET, duckdb writes lowercase "parquet"); strict readers
-# (iceberg-go's compaction scan) match it case-sensitively. Inert to pg_duckdb
-# reads (reader stores verbatim; ducklake lowercases). See the patch header.
+# The data-file file_format interop patch upper-cases the data-file file_format
+# in the manifest (the spec enum is PARQUET, duckdb writes "parquet"); strict
+# readers (iceberg-go's compaction scan) match it case-sensitively. Inert to
+# pg_duckdb reads (the reader stores it verbatim; ducklake lowercases). See the
+# patch header.
 COPY docker/iceberg-data-file-format-v15.patch /tmp/iceberg-fileformat-v15.patch
-# TIMESTAMPTZ transform patch, a port of upstream d3c3348271 (on main only):
-# year/month/day/hour of a TIMESTAMPTZ partition column are computed on the UTC
-# instant, as the Iceberg spec, duckdb-iceberg's own pruning and iceberg-go take
-# them, not in the session's time zone. See the patch header.
+# TIMESTAMPTZ transform patch, a port of upstream d3c3348271, which is on main
+# only: year/month/day/hour of a TIMESTAMPTZ partition column are computed on
+# the UTC instant, as the Iceberg spec, duckdb-iceberg's own pruning and
+# iceberg-go take them, not in the session's time zone. See the patch header.
 COPY docker/iceberg-timestamptz-utc-transforms-v15.patch /tmp/iceberg-tstz-utc-v15.patch
-# Schema id patch, a port of upstream c1cfe2ef (on main only): a new table schema
-# is numbered one above the highest schema id in the metadata, not above the
-# current schema's, so a column change after a DROP COLUMN that returned the
-# table to an earlier schema is accepted. See the patch header.
+# Schema id patch, a port of upstream c1cfe2ef, which is on main only: a new
+# table schema is numbered one above the highest schema id in the metadata, not
+# above the current schema's, so a column change after a DROP COLUMN that
+# returned the table to an earlier schema is accepted. See the patch header.
 COPY docker/iceberg-schema-id-allocation-v15.patch /tmp/iceberg-schema-id-v15.patch
 # Vended-secret patch: a repeat bind of a table in one transaction keeps the
 # table's vended storage secret instead of dropping and re-creating it, so a
 # manifest read on another thread never finds the secret missing and goes
 # unsigned to the default endpoint. See the patch header.
 COPY docker/iceberg-vended-secret-keep-v15.patch /tmp/iceberg-vended-secret-v15.patch
-# Manifest-read error patch, a port of upstream PR #1305 (on main only): the
-# shared scan state's destructor catches a manifest-read task's error, so a
-# failed read fails the query instead of aborting the backend.
-# See the patch header.
+# Manifest-read error patch, a port of upstream 45f323eb, which is on main
+# only: the shared scan state's destructor catches a manifest-read task's error,
+# so a failed read fails the query instead of aborting the backend. See the
+# patch header.
 COPY docker/iceberg-manifest-read-error-v15.patch /tmp/iceberg-manifest-read-v15.patch
 RUN cd /build/duckdb-iceberg \
  && git apply --check /tmp/iceberg-bakery-v15.patch \
@@ -217,8 +217,8 @@ RUN realname=$(basename /tmp/curl/libcurl.so.4.*) \
 COPY --from=iceberg-builder /build/duckdb-iceberg/build/release/extension/iceberg/iceberg.duckdb_extension                 /opt/coldfront/iceberg/iceberg.duckdb_extension
 COPY --from=iceberg-builder /build/duckdb-iceberg/build/release/extension/avro/avro.duckdb_extension                       /opt/coldfront/iceberg/avro.duckdb_extension
 COPY --from=iceberg-builder /build/duckdb-iceberg/build/release/extension/azure/azure.duckdb_extension                     /opt/coldfront/iceberg/azure.duckdb_extension
-# postgres_scanner (the 'postgres' ext) — shipped so install_extension('postgres')
-# resolves it locally; the terrible-link runtime download is removed entirely.
+# postgres_scanner (the 'postgres' extension), shipped so install_extension('postgres')
+# resolves it locally and nothing is downloaded at runtime.
 COPY --from=iceberg-builder /build/duckdb-iceberg/build/release/extension/postgres_scanner/postgres_scanner.duckdb_extension /opt/coldfront/iceberg/postgres_scanner.duckdb_extension
 # DuckDB's platform string is linux_<arch> with the SAME arch tokens buildx uses
 # (amd64/arm64), so the extension dir is just linux_${TARGETARCH}. The entrypoint
@@ -233,7 +233,7 @@ ENV PG_MAJOR=${PG_MAJOR}
 LABEL org.opencontainers.image.title="coldfront-duckdb-base" \
       org.opencontainers.image.vendor="pgEdge" \
       org.opencontainers.image.source="https://github.com/pgEdge/ColdFront" \
-      org.opencontainers.image.description="ColdFront DuckDB 1.5.4 base (pg_duckdb PR#1025 + patched duckdb-iceberg with the bakery-aware commit-refresh patch)."
+      org.opencontainers.image.description="ColdFront DuckDB 1.5.4 base: pg_duckdb at c04e6a2 with the EXTRACT field-quoting patch, and duckdb-iceberg v1.5-variegata at 5edc45f0 with ColdFront's seven patches."
 
 USER postgres
 # The entrypoint itself is installed by the app layer (docker/Dockerfile.duckdb15).

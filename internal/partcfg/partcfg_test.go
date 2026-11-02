@@ -166,8 +166,8 @@ func TestLoadTables(t *testing.T) {
 	}
 }
 
-// TestLoadTables_PassesOwnerFilter pins issue #14: each binary must scope its
-// load by ownership. The mock ignores the WHERE clause itself, so we assert the
+// TestLoadTables_PassesOwnerFilter checks that each binary scopes its load by
+// ownership. The mock ignores the WHERE clause itself, so we assert the
 // owner selector reaches the query as $1 (the real Postgres filter is proven
 // end-to-end in ci/journey.sh). int(owner): AllOwners=0, Tiered=1, PartitionOnly=2.
 func TestLoadTables_PassesOwnerFilter(t *testing.T) {

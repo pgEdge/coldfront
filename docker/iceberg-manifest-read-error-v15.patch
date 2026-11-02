@@ -1,11 +1,10 @@
 # iceberg-manifest-read-error-v15.patch
-# iceberg-manifest-read-error-v15.patch
 #
 # Applies to: duckdb-iceberg @ 5edc45f0 (branch v1.5-variegata), DuckDB v1.5.x.
 #
-# A port of upstream duckdb-iceberg PR #1305 ("Prevent std::terminate when
-# manifest-read tasks fail during scan state destruction"), merged into main on
-# 2026-08-08 and not on v1.5-variegata (checked up to 5dcf5070). Upstream's
+# A port of upstream duckdb-iceberg 45f323eb ("Prevent std::terminate when
+# manifest-read tasks fail during scan state destruction"), which is on main
+# only: v1.5-variegata does not have it (checked up to 5dcf5070). Upstream's
 # file is src/planning/scan_plan/iceberg_scan_plan_state.cpp; at this ref the
 # destructor is IcebergMultiFileListSharedState's.
 #

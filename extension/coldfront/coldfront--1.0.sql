@@ -2879,7 +2879,7 @@ $$;
 -- cannot parse it. pg_duckdb (c04e6a2) hands DuckDB each identifier quoted the
 -- way PostgreSQL quotes it, so a name PostgreSQL leaves bare reaches DuckDB bare,
 -- quoted in the query or not, and DuckDB's parser takes some of those as
--- keywords: duckdb/pg_duckdb#1019. A column's name reaches it in every query
+-- keywords. A column's name reaches it in every query
 -- pg_duckdb runs against the column, and a table's as the alias of the view
 -- pg_duckdb expands and the qualifier of the hot table's columns, so every read
 -- then fails to parse. The list is every name PostgreSQL leaves bare that DuckDB

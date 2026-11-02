@@ -852,7 +852,7 @@ EOSQL
     # choose_volume so the user can pick smaller (choose_volume itself already
     # blocks a too-big fixed/custom pick). generate_events reports the real
     # error (e.g. disk-full) and returns non-zero, the primary failure signal;
-    # the row-count check below is belt-and-suspenders for a silent short load.
+    # the row-count check below is a second, independent check for a silent short load.
     # NON-INTERACTIVE never loops: on failure it errors and returns (CI must not
     # hang), and empties the partial table first so a rolled-back load can't be
     # mistaken for a valid post-run state.
