@@ -149,7 +149,7 @@ table shows each component and its source:
 | pg_duckdb (DuckDB 1.5.4) | `github.com/duckdb/pg_duckdb`, PR #1025, with ColdFront's `EXTRACT` field-quoting patch applied |
 | duckdb-iceberg | `github.com/duckdb/duckdb-iceberg`, `v1.5-variegata` @ `5edc45f0` |
 | DuckDB 1.5.4 | `github.com/duckdb/duckdb`, tag `v1.5.4`, which replaces duckdb-iceberg's own DuckDB submodule |
-| duckdb-avro, duckdb-azure, duckdb-postgres | `github.com/duckdb/duckdb-avro` @ `7f423d69`, `github.com/duckdb/duckdb-azure` @ `563589b2`, and `github.com/duckdb/duckdb-postgres` @ `6b2b12ca`, pinned in `docker/iceberg-azure-extension-config-v15.cmake` |
+| duckdb-avro, duckdb-azure, duckdb-postgres | `github.com/duckdb/duckdb-avro` @ `7f423d69`, `github.com/duckdb/duckdb-azure` @ `563589b2`, and `github.com/duckdb/duckdb-postgres` @ `4053b617`, pinned in `docker/iceberg-azure-extension-config-v15.cmake` |
 | vcpkg | `github.com/microsoft/vcpkg` |
 | Base images | `ghcr.io/pgedge/pgedge-postgres:<pg>-spock5-minimal` and `quay.io/pypa/manylinux_2_28_<arch>` |
 

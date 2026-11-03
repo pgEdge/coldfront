@@ -41,11 +41,14 @@ A few supported types need a closer look:
 
 - Iceberg cannot hold a `numeric` `NaN`, or an `infinity` or `-infinity`
   value in a `date`, `timestamp with time zone` or `timestamp without time
-  zone` column, as array elements too. ColdFront refuses those values with
-  a check constraint named `coldfront_guard_<column>`; a write that goes to
-  the cold tier of a tiered or decoupled table is refused by DuckDB, unless the
-  write reads a
-  `numeric` `NaN` from a PostgreSQL table and stores it as `0`.
+  zone` column, as array elements too. The hot tier of a tiered table refuses
+  those values with a check constraint named `coldfront_guard_<column>`. The
+  cold tier refuses an infinity, and stores a `numeric` `NaN` that a write
+  carries from PostgreSQL as `NULL`: the rows a tiered `INSERT` sends to the
+  cold tier, a PostgreSQL table that a cold write names, and a bound
+  parameter. A `'NaN'` literal in a statement that DuckDB runs, such as a
+  decoupled `INSERT` or a cold `UPDATE`, is refused by DuckDB, which does not
+  accept it as a `numeric` value.
 - `char(N)` is stored and read as `varchar`. Values, comparisons, and
   `length()` round-trip losslessly, but a cold read comes back unpadded
   with `pg_typeof varchar`, because pg_duckdb has no fixed-length `char`
@@ -72,13 +75,15 @@ constraint named after a hash of the name.
 A cold `UPDATE ... FROM` or `DELETE ... USING`, a `MERGE` whose source is a
 PostgreSQL table, and an `INSERT ... SELECT` into a decoupled table read that
 PostgreSQL table through DuckDB's `postgres` extension, which reads a `numeric`
-`NaN` as `0`, also inside an array, and drops an array's lower bound. ColdFront
-cannot refuse those values on that path: the write stores the changed values
-with no error, and its conditions compare the changed values. A condition that
-names `'NaN'` fails in such a write, because DuckDB does not accept `'NaN'` as
-a `numeric` value. To keep those values out of the cold tier, check the source
-table in PostgreSQL before the write, and fix or remove the rows that hold
-them.
+`NaN` as `NULL`, also inside an array, and drops an array's lower bound.
+ColdFront cannot refuse those values on that path: the write stores `NULL` for
+the `NaN` and the array numbered from 1, with no error, and its conditions
+compare the changed values. An unbounded `numeric` column reads as `double
+precision`, so its `NaN` fails the cast to a `numeric(P,S)` column instead. A
+condition that names `'NaN'` fails in such a write, because DuckDB does not
+accept `'NaN'` as a `numeric` value. To keep those values out of the cold
+tier, check the source table in PostgreSQL before the write, and fix or remove
+the rows that hold them.
 
 The following query counts those rows in a source table `staging` with a
 `numeric` column `amount`, a `numeric` array `amounts` and an array `tags`:

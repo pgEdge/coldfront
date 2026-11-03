@@ -79,9 +79,9 @@ because the DSN can hold credentials. `set_storage_secret` installs the
 `postgres` extension when the GUC is set, and `coldfront.ensure_pg_attached()`
 attaches `pglocal` when such a write runs. With the GUC unset, that write
 fails, because DuckDB has no `pglocal` catalog to resolve. The extension reads
-a `numeric` `NaN` as `0` and renumbers an array to start at 1, so such a write
-can store a changed value, as [Supported Column Types](supported_types.md)
-describes.
+a `numeric` `NaN` as `NULL` and renumbers an array to start at 1, so such a
+write can store a changed value, as
+[Supported Column Types](supported_types.md) describes.
 
 After that, the first query touching a tiered view in any session lazily
 attaches the catalog and `ice.public.*` becomes available.

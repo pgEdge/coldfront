@@ -14,6 +14,13 @@ this project adheres to
   reaches DuckDB as SQL. The base image and the pg_duckdb packages apply
   ColdFront's `pg_duckdb-extract-field-quoting` patch, which quotes the field
   name as PostgreSQL's fix for CVE-2026-15741 does.
+- A cold-tier write that read a `numeric` `NaN` from a PostgreSQL table
+  stored it as `0`, with no error: a decoupled `INSERT ... SELECT`, a cold
+  `UPDATE ... FROM`, `DELETE ... USING` or `MERGE`, and a tiered `INSERT`
+  whose rows go to the cold tier. The cold tier now stores a `numeric` `NaN`
+  as `NULL` wherever a write carries one from PostgreSQL, a bound parameter
+  included. The base image builds DuckDB's `postgres` extension at
+  duckdb-postgres `4053b617`, which reads the value as `NULL` instead of `0`.
 
 ## [1.0.0-rc1] - 2026-09-28
 

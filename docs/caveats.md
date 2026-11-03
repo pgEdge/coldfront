@@ -153,6 +153,6 @@ tables:
   storage account before using it as a cold tier.
 - A cold-tier write that reads an ordinary PostgreSQL table, such as an
   `UPDATE ... FROM` or a `MERGE` from one, stores a `numeric` `NaN` from that
-  table as `0` and stores an array renumbered to start at 1, with no error.
+  table as `NULL` and stores an array renumbered to start at 1, with no error.
   [Supported Column Types](supported_types.md) lists the writes that do this
   and shows how to check a source table first.

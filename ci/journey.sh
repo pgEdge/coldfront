@@ -1129,14 +1129,16 @@ EOSQL
 }
 
 # ───────────────────────────────────────────────────────────────────────────
-# Story: TC-231..TC-237, values the cold tier cannot hold. pg_duckdb's scan and
-# DuckDB's postgres extension read a numeric NaN as 0, Iceberg's decimal has no
-# NaN, and Iceberg has no date or timestamp infinity. A tiered table's columns
-# refuse those values where they are written, so none reaches a reader that
-# would change it and none stalls an archive pass.
+# Story: TC-231..TC-237, values the cold tier cannot hold. pg_duckdb's scan
+# reads a numeric NaN as 0, DuckDB's postgres extension reads one as NULL,
+# Iceberg's decimal has no NaN, and Iceberg has no date or timestamp infinity.
+# A tiered table's hot tier refuses those values where they are written, so
+# none reaches a reader that would change it and none stalls an archive pass.
+# A cold write refuses an infinity and stores a NaN it reads from a PostgreSQL
+# table, a tiered INSERT's rows included, as NULL.
 # ───────────────────────────────────────────────────────────────────────────
 story_unstorable_values() {
-    step "TC-231..TC-237: a tiered table refuses NaN and infinity rather than storing them changed"
+    step "TC-231..TC-237: the hot tier refuses NaN and infinity; the cold tier refuses infinity and stores NaN as NULL"
     local cold="ts < date_trunc('month',now()) - interval '3 months'"
     local hot="date_trunc('month',now()) - interval '1 month'"
     local m4="date_trunc('month',now()) - interval '4 months'"
@@ -1206,11 +1208,14 @@ EOSQL
         "$(q_may "$HOST" "UPDATE public.tcval SET amount = 'NaN' WHERE ts >= $hot;")"
     assert_err "TC-235: a hot UPDATE to infinity is refused" "coldfront_guard_due" \
         "$(q_may "$HOST" "UPDATE public.tcval SET due = 'infinity' WHERE ts >= $hot;")"
-    # TC-233 / TC-237: written to the cold tier, DuckDB's decimal cast refuses NaN
-    # and duckdb-iceberg refuses infinity.
-    assert_err "TC-233: a cold INSERT of NaN is refused" "Could not convert string" \
-        "$(q_may "$HOST" "INSERT INTO public.tcval (ts, amount) VALUES ($m4 + interval '5 days', 'NaN');")"
-    assert_err "TC-233: a cold UPDATE to NaN is refused" "Could not convert string" \
+    # TC-233 / TC-237: written to the cold tier, a NaN the sink carries is stored
+    # as NULL, DuckDB refuses a 'NaN' literal in the SQL it runs, and
+    # duckdb-iceberg refuses infinity.
+    q "$HOST" "INSERT INTO public.tcval (ts, amount) VALUES ($m4 + interval '5 days', 'NaN');" >/dev/null
+    assert_eq "TC-233: a cold INSERT of NaN through the sink stores NULL" "t" \
+        "$(q "$HOST" "SELECT amount IS NULL FROM public.tcval WHERE ts = $m4 + interval '5 days';")"
+    q "$HOST" "DELETE FROM public.tcval WHERE ts = $m4 + interval '5 days';" >/dev/null
+    assert_err "TC-233: a cold UPDATE to a 'NaN' literal is refused" "Could not convert string" \
         "$(q_may "$HOST" "UPDATE public.tcval SET amount = 'NaN' WHERE $cold;")"
     assert_err "TC-237: a cold INSERT of infinity is refused" "Cannot write infinity" \
         "$(q_may "$HOST" "INSERT INTO public.tcval (ts, due) VALUES ($m4 + interval '5 days', 'infinity');")"
@@ -1220,30 +1225,29 @@ EOSQL
         "$(q_may "$HOST" "INSERT INTO public.tcval (ts, seen) VALUES ($m4 + interval '5 days', 'infinity');")"
     # The INSERTs above call now(), so they write through the cold sink. One with
     # no stable function streams its cold rows through DuckDB's postgres
-    # extension, which reads a numeric NaN as 0 (TC-234), so a numeric goes as
-    # its text and DuckDB's decimal cast refuses NaN there too, from VALUES, a
+    # extension, which reads a numeric NaN as NULL (TC-234), from VALUES, a
     # table and COPY alike. An infinity crosses unchanged and duckdb-iceberg
     # refuses it.
     local m4lit; m4lit=$(q "$HOST" "SELECT ($m4 + interval '6 days')::text;")
     q "$HOST" "CREATE TABLE public.tcval_nan (ts timestamptz, amount numeric(10,2)); INSERT INTO public.tcval_nan VALUES ('$m4lit', 'NaN');" >/dev/null
     assert_contains "TC-233: a cold INSERT of literals streams" "_tiered_cold_stream(" \
         "$(q "$HOST" "EXPLAIN (VERBOSE, COSTS OFF) INSERT INTO public.tcval (ts, amount) VALUES ('$m4lit', 'NaN');")"
-    assert_err "TC-233: a streamed cold INSERT of NaN is refused" "Could not convert string" \
-        "$(q_may "$HOST" "INSERT INTO public.tcval (ts, amount) VALUES ('$m4lit', 'NaN');")"
+    q "$HOST" "INSERT INTO public.tcval (ts, amount) VALUES ('$m4lit', 'NaN');" >/dev/null
     assert_contains "TC-233: so does a cold INSERT ... SELECT from a table" "_tiered_cold_stream(" \
         "$(q "$HOST" "EXPLAIN (VERBOSE, COSTS OFF) INSERT INTO public.tcval (ts, amount) SELECT ts, amount FROM public.tcval_nan;")"
-    assert_err "TC-233: a streamed INSERT ... SELECT of NaN is refused" "Could not convert string" \
-        "$(q_may "$HOST" "INSERT INTO public.tcval (ts, amount) SELECT ts, amount FROM public.tcval_nan;")"
-    assert_err "TC-233: a COPY of a cold NaN is refused" "Could not convert string" \
-        "$(printf '%s,NaN\n' "$m4lit" | docker exec -i -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" "$HOST" "$CF_PSQL" -tA -c "COPY public.tcval (ts, amount) FROM STDIN WITH (FORMAT csv);" 2>&1)"
+    q "$HOST" "INSERT INTO public.tcval (ts, amount) SELECT ts, amount FROM public.tcval_nan;" >/dev/null
+    printf '%s,NaN\n' "$m4lit" | docker exec -i -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" "$HOST" "$CF_PSQL" -tA -c "COPY public.tcval (ts, amount) FROM STDIN WITH (FORMAT csv);" >/dev/null
+    assert_eq "TC-233: a streamed NaN is stored as NULL, from VALUES, a table and COPY" "3|3" \
+        "$(q "$HOST" "SELECT count(*) || '|' || count(*) FILTER (WHERE amount IS NULL) FROM public.tcval WHERE ts = '$m4lit';")"
+    q "$HOST" "DELETE FROM public.tcval WHERE ts = '$m4lit';" >/dev/null
     assert_err "TC-237: a streamed cold INSERT of infinity is refused" "Cannot write infinity" \
         "$(q_may "$HOST" "INSERT INTO public.tcval (ts, due) VALUES ('$m4lit', 'infinity');")"
     # The same refusals in a decoupled table, whose every write runs in DuckDB.
     q "$HOST" "SELECT coldfront.create_iceberg_table('public','tcval_dec','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"amount\",\"type\":\"numeric(10,2)\"},{\"name\":\"due\",\"type\":\"date\"},{\"name\":\"seen\",\"type\":\"timestamptz\"}]'::jsonb);" >/dev/null
     q "$HOST" "INSERT INTO public.tcval_dec VALUES (1, 1.50, now(), now());" >/dev/null
-    assert_err "TC-233: a decoupled INSERT of NaN is refused" "Could not convert string" \
+    assert_err "TC-233: a decoupled INSERT of a 'NaN' literal is refused" "Could not convert string" \
         "$(q_may "$HOST" "INSERT INTO public.tcval_dec (id, amount) VALUES (2, 'NaN');")"
-    assert_err "TC-233: a decoupled UPDATE to NaN is refused" "Could not convert string" \
+    assert_err "TC-233: a decoupled UPDATE to a 'NaN' literal is refused" "Could not convert string" \
         "$(q_may "$HOST" "UPDATE public.tcval_dec SET amount = 'NaN' WHERE id = 1;")"
     assert_err "TC-237: a decoupled INSERT of a date infinity is refused" "Cannot write infinity" \
         "$(q_may "$HOST" "INSERT INTO public.tcval_dec (id, due) VALUES (2, 'infinity');")"
@@ -1253,26 +1257,30 @@ EOSQL
         "$(q "$HOST" "SELECT string_agg(id || '|' || amount || '|' || isfinite(due) || '|' || isfinite(seen), ',') FROM public.tcval_dec;")"
     assert_eq "TC-233: the cold rows are unchanged" "0.00/finite,2.50/null" \
         "$(q "$HOST" "SELECT string_agg(amount::text || '/' || CASE WHEN due IS NULL THEN 'null' WHEN isfinite(due) THEN 'finite' ELSE 'infinite' END, ',' ORDER BY amount) FROM public.tcval WHERE $cold;")"
-    # TC-234: DuckDB's postgres extension reads a numeric NaN as 0. It streams the
+    # TC-234: DuckDB's postgres extension (duckdb-postgres 4053b617) reads a
+    # numeric NaN as NULL. It streams a tiered INSERT's cold rows and the
     # archive's delta replay, whose hot table the guard keeps NaN out of, and it
-    # reads the PostgreSQL table a cold UPDATE ... FROM, a MERGE or a decoupled
-    # INSERT ... SELECT names, where NaN becomes 0 with no error. When these
-    # checks fail, that reader keeps or refuses NaN, and the docs' warning goes.
+    # reads the PostgreSQL table a cold UPDATE ... FROM or DELETE ... USING, a
+    # MERGE or a decoupled INSERT ... SELECT names, so each of those stores NULL
+    # for a NaN. When the first check fails, the extension keeps or refuses NaN.
     q "$HOST" "CREATE TABLE public.tcval_src (amount numeric(10,2)); INSERT INTO public.tcval_src VALUES ('NaN');" >/dev/null
-    assert_eq "TC-234: DuckDB's postgres extension reads NaN as 0" "0.00" \
-        "$(q "$HOST" "SELECT coldfront.ensure_pg_attached(); SELECT r['a'] FROM duckdb.query('SELECT amount::VARCHAR AS a FROM pglocal.public.tcval_src') AS t(r);" | tail -1)"
+    assert_eq "TC-234: DuckDB's postgres extension reads NaN as NULL" "NULL" \
+        "$(q "$HOST" "SELECT coldfront.ensure_pg_attached(); SELECT coalesce(r['a']::text, 'NULL') FROM duckdb.query('SELECT amount::VARCHAR AS a FROM pglocal.public.tcval_src') AS t(r);" | tail -1)"
     q "$HOST" "INSERT INTO public.tcval_dec (id, amount) SELECT 3, amount FROM public.tcval_src;" >/dev/null
-    assert_eq "TC-234: so a decoupled INSERT ... SELECT from such a table stores 0" "0.00" \
-        "$(q "$HOST" "SELECT amount FROM public.tcval_dec WHERE id = 3;")"
+    assert_eq "TC-234: so a decoupled INSERT ... SELECT from such a table stores NULL" "t" \
+        "$(q "$HOST" "SELECT amount IS NULL FROM public.tcval_dec WHERE id = 3;")"
     # PostgreSQL 17 and later allow MERGE into a view.
     if [ "$(q "$HOST" "SHOW server_version_num;")" -ge 170000 ]; then
         q "$HOST" "MERGE INTO public.tcval_dec d USING public.tcval_src s ON d.id = 4 WHEN NOT MATCHED THEN INSERT (id, amount) VALUES (4, s.amount);" >/dev/null
-        assert_eq "TC-234: and so does a MERGE from it" "0.00" \
-            "$(q "$HOST" "SELECT amount FROM public.tcval_dec WHERE id = 4;")"
+        assert_eq "TC-234: and so does a MERGE from it" "t" \
+            "$(q "$HOST" "SELECT amount IS NULL FROM public.tcval_dec WHERE id = 4;")"
     fi
     q "$HOST" "UPDATE public.tcval SET amount = s.amount FROM public.tcval_src s WHERE $cold AND tcval.amount = 2.50;" >/dev/null
-    assert_eq "TC-234: and so does a cold UPDATE ... FROM it" "0.00,0.00" \
-        "$(q "$HOST" "SELECT string_agg(amount::text, ',' ORDER BY amount) FROM public.tcval WHERE $cold;")"
+    assert_eq "TC-234: and so does a cold UPDATE ... FROM it" "0.00,null" \
+        "$(q "$HOST" "SELECT string_agg(coalesce(amount::text, 'null'), ',' ORDER BY amount) FROM public.tcval WHERE $cold;")"
+    q "$HOST" "DELETE FROM public.tcval USING public.tcval_src s WHERE $cold AND tcval.amount = s.amount;" >/dev/null
+    assert_eq "TC-234: a cold DELETE ... USING it compares NULL and removes no row" "0.00,null" \
+        "$(q "$HOST" "SELECT string_agg(coalesce(amount::text, 'null'), ',' ORDER BY amount) FROM public.tcval WHERE $cold;")"
     # TC-231: a guard follows its column through a rename, so a column added
     # later under the old name gets a guard of its own.
     assert_contains "TC-231: a guarded column renames" "ALTER TABLE" \
@@ -1389,7 +1397,7 @@ story_arrays() {
         q "$HOST" "SELECT coldfront.ensure_attached(); SELECT duckdb.raw_query('DROP TABLE IF EXISTS ice.tcarrns.tcarr_adopt'); SELECT duckdb.raw_query('DROP TABLE IF EXISTS ice.public.tcarr_2d');" >/dev/null 2>&1
         q "$HOST" "DELETE FROM coldfront.tiered_views WHERE relname IN ('tcarr','tcarr_dec','tcarr_adopt','tcarr_2d'); DELETE FROM coldfront.archive_watermark WHERE table_name IN ('tcarr','tcarr_2d'); DELETE FROM coldfront.partition_config WHERE table_name IN ('tcarr','tcarr_2d','tcarr_tz');" >/dev/null 2>&1
         for t in tcarr tcarr_dec tcarr_adopt; do q "$HOST" "DROP VIEW IF EXISTS public.$t CASCADE;" >/dev/null 2>&1; done
-        for t in _tcarr tcarr tcarr_expect tcarr_2d _tcarr_2d tcarr_tz tcarr_src; do q "$HOST" "DROP TABLE IF EXISTS public.$t CASCADE;" >/dev/null 2>&1; done
+        for t in _tcarr tcarr tcarr_expect tcarr_2d _tcarr_2d tcarr_tz tcarr_src tcarr_nan; do q "$HOST" "DROP TABLE IF EXISTS public.$t CASCADE;" >/dev/null 2>&1; done
     }
     trap _tcarr_cleanup RETURN
     qf "$HOST" <<'EOSQL' >/dev/null
@@ -1526,14 +1534,18 @@ EOSQL
         "$(q_may "$HOST" "INSERT INTO public.tcarr (id, ts, nums) VALUES (21, $m4 + interval '9 days', '{{1,2},{3,4}}');")"
     assert_err "TC-245: a bound parameter numbered from 0 is refused" 'a bound parameter holds an array of 1 dimension(s) starting at element 0' \
         "$(q_may "$HOST" "PREPARE tcarr_bad(integer[]) AS UPDATE public.tcarr SET nums = \$1 WHERE id = 10; EXECUTE tcarr_bad('[0:1]={1,2}');")"
-    assert_err "TC-245: a cold NaN element is refused" "Could not convert string" \
-        "$(q_may "$HOST" "INSERT INTO public.tcarr (id, ts, amounts) VALUES (21, $m4 + interval '9 days', '{1,NaN}');")"
+    q "$HOST" "INSERT INTO public.tcarr (id, ts, amounts) VALUES (21, $m4 + interval '9 days', '{1,NaN}');" >/dev/null
+    assert_eq "TC-245: a cold NaN element is stored as NULL" "{1.00,NULL}" \
+        "$(q "$HOST" "SELECT amounts FROM public.tcarr WHERE id = 21;")"
+    q "$HOST" "DELETE FROM public.tcarr WHERE id = 21;" >/dev/null
     # Those INSERTs call now(), so they write through the cold sink; with a
     # literal timestamp the cold rows stream (TC-233), and the stream refuses
-    # the same values.
+    # the same shapes and stores the same NULL.
     local m4lit; m4lit=$(q "$HOST" "SELECT ($m4 + interval '9 days')::text;")
-    assert_err "TC-245: a streamed cold NaN element is refused" "Could not convert string" \
-        "$(q_may "$HOST" "INSERT INTO public.tcarr (id, ts, amounts) VALUES (21, '$m4lit', '{1,NaN}');")"
+    q "$HOST" "INSERT INTO public.tcarr (id, ts, amounts) VALUES (21, '$m4lit', '{1,NaN}');" >/dev/null
+    assert_eq "TC-245: a streamed cold NaN element is stored as NULL" "{1.00,NULL}" \
+        "$(q "$HOST" "SELECT amounts FROM public.tcarr WHERE id = 21;")"
+    q "$HOST" "DELETE FROM public.tcarr WHERE id = 21;" >/dev/null
     assert_err "TC-245: a streamed cold array numbered from 0 is refused" 'column "nums" holds an array of 1 dimension(s) starting at element 0' \
         "$(q_may "$HOST" "INSERT INTO public.tcarr (id, ts, nums) VALUES (21, '$m4lit', '[0:1]={1,2}');")"
     assert_err "TC-245: a cold infinity element is refused" "Cannot write infinity" \
@@ -1613,6 +1625,10 @@ EOSQL
     q "$HOST" "INSERT INTO public.tcarr_dec (id, nums) SELECT 4, nums FROM public.tcarr_src;" >/dev/null
     assert_eq "TC-249: so a decoupled INSERT ... SELECT from such a table stores it numbered from 1" "{7,8}" \
         "$(q "$HOST" "SELECT nums FROM public.tcarr_dec WHERE id = 4;")"
+    q "$HOST" "CREATE TABLE public.tcarr_nan (amounts numeric(10,2)[]); INSERT INTO public.tcarr_nan VALUES ('{1,NaN}');" >/dev/null
+    q "$HOST" "INSERT INTO public.tcarr_dec (id, amounts) SELECT 5, amounts FROM public.tcarr_nan;" >/dev/null
+    assert_eq "TC-234: a NaN element read from a PostgreSQL table is stored as NULL, as a NaN value is" "{1.00,NULL}" \
+        "$(q "$HOST" "SELECT amounts FROM public.tcarr_dec WHERE id = 5;")"
     # Creating a decoupled table refuses the arrays the type map refuses, naming
     # the column.
     assert_err "TC-249: creation refuses a jsonb[] column, naming it" 'column "docs": PG type jsonb[]' \
