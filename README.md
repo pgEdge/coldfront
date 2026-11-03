@@ -320,7 +320,7 @@ When the extensions are created, continue with
 The Docker build adds a thin ColdFront layer to a published base image. The
 base image already includes pg_duckdb and the patched duckdb-iceberg
 extension. You need Docker and network access. To build the command-line
-tools, you also need Go 1.26.5 or later and golangci-lint.
+tools, you also need Go 1.26.10 or later and golangci-lint.
 
 The Docker image writes the server settings into `postgresql.conf` on first
 start. It reads the warehouse name and the Lakekeeper endpoint from the
@@ -385,7 +385,7 @@ extension. For the prerequisites and the patches, see
 [Building ColdFront from Source](docs/installation.md#building-coldfront-from-source).
 You also need a running PostgreSQL 16, 17, or 18 server, `pg_config`, the
 PostgreSQL server development headers, the libpq headers and library, `make`,
-`gcc`, Go 1.26.5 or later, and golangci-lint.
+`gcc`, Go 1.26.10 or later, and golangci-lint.
 
 1. Clone the repository:
 
