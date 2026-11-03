@@ -115,7 +115,8 @@ SELECT status, count(*) FROM public.cf_stream_cold WHERE status LIKE 'copy%' GRO
 --     as NULL (ci/journey.sh TC-234), and a NaN element is replaced by NULL
 --     before the array goes as its text, whose cast to the decimal list keeps
 --     a wide element exact. A bound NaN parameter of a cold UPDATE renders as
---     NULL too.
+--     NULL too; the UPDATE's timestamptz literal reaches DuckDB in ISO
+--     whatever the session's DateStyle, which pg_regress sets to Postgres.
 CREATE FUNCTION pg_temp.cf_streams(p_sql text) RETURNS boolean LANGUAGE plpgsql AS $$
 DECLARE l text;
 BEGIN
@@ -142,7 +143,7 @@ INSERT INTO public.cf_stream_num (ts, amount) SELECT ts, amount FROM public.cf_s
 COPY public.cf_stream_num (ts, amount) FROM stdin WITH (FORMAT csv);
 2026-01-06 00:00:00+00,NaN
 \.
-PREPARE cf_nan_param (numeric) AS UPDATE public.cf_stream_num SET amount = $1 WHERE amount = -0.01;
+PREPARE cf_nan_param (numeric) AS UPDATE public.cf_stream_num SET amount = $1 WHERE ts = '2026-01-02';
 EXECUTE cf_nan_param('NaN');
 DEALLOCATE cf_nan_param;
 SELECT r['ts']::timestamptz AS ts, r['amount']::text AS amount, r['amounts']::text AS amounts

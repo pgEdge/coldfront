@@ -327,18 +327,19 @@ sequence for an omitted IDENTITY column and the DEFAULT expression for an
 omitted column that has one, so cold ids share the hot side's sequence. A
 vector column is sent as `real[]`, which the extension maps to the Iceberg
 `list<float>`, and a `jsonb`, `json` or `interval` column as its text, the
-form the Iceberg `VARCHAR` column holds. A `numeric` array is sent as its text,
-with a `NaN` element replaced by `NULL`, which DuckDB casts to the Iceberg
-decimal list; the array reaches the extension without its precision and scale,
-which the extension would read as `double precision`. The extension reads a
-`numeric` `NaN` as `NULL`, so a streamed `NaN` is stored as `NULL`, as a value
-and as an element. On a clustered table the cluster assignment leads the select
-list and orders the write, so each row group holds roughly one cluster. The
-last argument is the cold test: for a `SELECT` source an `EXISTS` over it, for
-a `VALUES` source the hot count against the row count, so an `INSERT` whose
-rows are all hot stages nothing and takes no claim. `cold_rows` is `NULL` when
-the rows streamed, since DuckDB keeps that count, and the count otherwise: `0`
-for an all-hot `INSERT`, the sink's count after the fallback below.
+form the Iceberg `VARCHAR` column holds. The stream sends a `numeric` array as
+its text, with a `NaN` element replaced by `NULL`, and DuckDB casts the text to
+the Iceberg decimal list; the array reaches the extension without its precision
+and scale, which the extension would read as `double precision`. The extension
+reads a `numeric` `NaN` as `NULL`, so the cold tier stores a streamed `NaN` as
+`NULL`, as a value and as an element. On a clustered table the cluster
+assignment leads the select list and orders the write, so each row group holds
+roughly one cluster. The last argument is the cold test: for a `SELECT` source
+an `EXISTS` over it, for a `VALUES` source the hot count against the row count,
+so an `INSERT` whose rows are all hot stages nothing and takes no claim.
+`cold_rows` is `NULL` when the rows streamed, since DuckDB keeps that count,
+and the count otherwise: `0` for an all-hot `INSERT`, the sink's count after
+the fallback below.
 
 The query is deparsed with an empty `search_path`, so every relation, function
 and operator is schema-qualified whatever the second session's path is, and
@@ -465,7 +466,9 @@ keeps `RETURNING`, a cold one is the anchor `UPDATE` that runs the DuckDB
 write. When a statement gives the view no alias, the deparser qualifies its
 columns by the view's name, so the retargeted relation takes that name as its
 alias; an `UPDATE … FROM`, a `DELETE … USING` and a correlated sub-select
-are handled the same way.
+are handled the same way. The hook deparses the statement under ISO dates and
+PostgreSQL intervals, so a literal reads the same in DuckDB whatever the
+session's `DateStyle` and `IntervalStyle`.
 
 `COPY <view> FROM` takes the same path. The utility hook reads the rows with
 PostgreSQL's `COPY` reader (`BeginCopyFrom`, `NextCopyFrom`), collects

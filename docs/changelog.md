@@ -21,6 +21,12 @@ this project adheres to
   as `NULL` wherever a write carries one from PostgreSQL, a bound parameter
   included. The base image builds DuckDB's `postgres` extension at
   duckdb-postgres `4053b617`, which reads the value as `NULL` instead of `0`.
+- A timestamp or interval literal in a cold `UPDATE`, `DELETE` or `MERGE`
+  reached DuckDB spelled in the session's `DateStyle` and `IntervalStyle`, so
+  under a style other than ISO the statement failed with a DuckDB conversion
+  error. ColdFront now renders the statement with ISO timestamps and
+  PostgreSQL intervals whatever the session's settings, as it already
+  rendered the tiered `INSERT` stream.
 
 ## [1.0.0-rc1] - 2026-09-28
 

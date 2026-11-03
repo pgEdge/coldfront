@@ -46,9 +46,9 @@ A few supported types need a closer look:
   cold tier refuses an infinity, and stores a `numeric` `NaN` that a write
   carries from PostgreSQL as `NULL`: the rows a tiered `INSERT` sends to the
   cold tier, a PostgreSQL table that a cold write names, and a bound
-  parameter. A `'NaN'` literal in a statement that DuckDB runs, such as a
-  decoupled `INSERT` or a cold `UPDATE`, is refused by DuckDB, which does not
-  accept it as a `numeric` value.
+  parameter. DuckDB refuses a `'NaN'` literal in a statement that DuckDB
+  runs, such as a decoupled `INSERT` or a cold `UPDATE`, because DuckDB's
+  decimal has no `NaN`.
 - `char(N)` is stored and read as `varchar`. Values, comparisons, and
   `length()` round-trip losslessly, but a cold read comes back unpadded
   with `pg_typeof varchar`, because pg_duckdb has no fixed-length `char`

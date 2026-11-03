@@ -24,8 +24,8 @@ duckdb_extension_load(postgres_scanner
     # stream into Iceberg). Built here so it is shipped in the image and never
     # downloaded at runtime: extensions.duckdb.org has no reliably-cached v1.5.4
     # build, and install_extension would block on the network. Pinned to the
-    # v1.5-variegata commit at which a numeric NaN reads as NULL instead of 0
-    # (ci/journey.sh TC-234), built against DuckDB v1.5.4.
+    # v1.5-variegata commit at which a numeric NaN reads as NULL (ci/journey.sh
+    # TC-234), built against DuckDB v1.5.4.
     GIT_TAG 4053b617c863dfb435c9be9dacf1ec0e3dacde80
     SUBMODULES database-connector)
 endif()

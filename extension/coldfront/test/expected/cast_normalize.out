@@ -37,10 +37,10 @@ EXPLAIN (COSTS OFF, VERBOSE)
       c_dp      = 1.5::double precision,
       evt_jsonb = jsonb_set(jsonb_build_object('k', 1), '{x}', '"v"'::jsonb)
   WHERE ts < '2019-01-01'::timestamp with time zone;
-                                                                                                                                                                  QUERY PLAN                                                                                                                                                                  
-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                                                            QUERY PLAN                                                                                                                                                             
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
-   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET c_tsn = ''Mon Jun 01 00:00:00 2020''::timestamp, c_vc = ''x''::varchar, c_dp = (1.5)::double, evt_jsonb = json_set(json_object(''k'', 1), ''{x}''::text[], ''"v"''::json)   WHERE (ts < ''Tue Jan 01 00:00:00 2019 UTC''::timestamptz)'::text)
+   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET c_tsn = ''2020-06-01 00:00:00''::timestamp, c_vc = ''x''::varchar, c_dp = (1.5)::double, evt_jsonb = json_set(json_object(''k'', 1), ''{x}''::text[], ''"v"''::json)   WHERE (ts < ''2019-01-01 00:00:00+00''::timestamptz)'::text)
 (2 rows)
 
 -- (A2) pgvector's cast: DuckDB knows no `vector`, and the Iceberg column is
@@ -50,10 +50,10 @@ EXPLAIN (COSTS OFF, VERBOSE)
 EXPLAIN (COSTS OFF, VERBOSE)
   UPDATE public.events SET emb = '[1,2,3]'::vector(3)
   WHERE ts < '2019-01-01'::timestamp with time zone;
-                                                                                          QUERY PLAN                                                                                           
------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                       QUERY PLAN                                                                                        
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
-   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET emb = ''[1,2,3]''::FLOAT[]   WHERE (ts < ''Tue Jan 01 00:00:00 2019 UTC''::timestamptz)'::text)
+   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET emb = ''[1,2,3]''::FLOAT[]   WHERE (ts < ''2019-01-01 00:00:00+00''::timestamptz)'::text)
 (2 rows)
 
 -- (B) Parity against the live DuckDB: the rewrite targets are accepted; `jsonb`

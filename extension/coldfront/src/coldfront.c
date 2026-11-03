@@ -1678,13 +1678,23 @@ find_dml_prefix(const char *orig_sql, const char *search_unqual,
 /* pg_get_querydef's text on one line: a newline outside quotes becomes a
  * space, and the leading indent goes. A literal or a quoted identifier keeps
  * its newlines and tabs: the deparser quotes with '' and "" only, doubles a
- * quote inside and never escapes one, and emits no tab of its own. */
+ * quote inside and never escapes one, and emits no tab of its own. The text
+ * goes to DuckDB or to the stream's session, so it is deparsed under ISO
+ * dates and PostgreSQL intervals, which read the same there whatever this
+ * session's DateStyle and IntervalStyle. */
 static char *
 deparse_flat(Query *query)
 {
-    char *sql = pg_get_querydef(query, false), *p;
+    int   nest = NewGUCNestLevel();
+    char *sql, *p;
     char  quote = 0;
 
+    (void) set_config_option("DateStyle", "ISO, YMD", PGC_USERSET, PGC_S_SESSION,
+                             GUC_ACTION_SAVE, true, 0, false);
+    (void) set_config_option("IntervalStyle", "postgres", PGC_USERSET, PGC_S_SESSION,
+                             GUC_ACTION_SAVE, true, 0, false);
+    sql = pg_get_querydef(query, false);
+    AtEOXact_GUC(true, nest);
     for (p = sql; *p; p++)
     {
         if (quote)
@@ -2371,17 +2381,15 @@ name_in_list(List *targeted, const char *attname)
 }
 
 /*
- * Format a TimestampTz as the SQL literal `'<text>'::timestamptz` so it
- * embeds verbatim in a SQL string.  PG's timestamptz_out is locale-stable
- * and round-trips cleanly through cstring → timestamptz on both PG and
- * DuckDB.  Returns palloc'd.
+ * Format a TimestampTz as the SQL literal `'<text>'::timestamptz`, in ISO form
+ * whatever the session's DateStyle: the literal goes to DuckDB and to the
+ * stream's session as well as to this one, and all three read ISO as the same
+ * instant. Returns palloc'd.
  */
 static char *
 format_timestamptz_literal(TimestampTz ts)
 {
-    char *txt = DatumGetCString(DirectFunctionCall1(timestamptz_out,
-                                                     TimestampTzGetDatum(ts)));
-    return psprintf("'%s'::timestamptz", txt);
+    return psprintf("'%s'::timestamptz", timestamptz_to_str(ts));
 }
 
 /*
@@ -3010,9 +3018,10 @@ cf_pc_expr(TieredViewInfo *info, const HotColumns *hc)
  * The stream's read, as the SQL-text argument coldfront._tiered_cold_stream
  * receives (cold_sql_arg): the cold projection over the source below the
  * cutoff. Deparsed with an empty search_path, so every relation, function and
- * operator is schema-qualified whatever the other session's path is, and with
- * ISO dates and PostgreSQL intervals, so its literals read the same under
- * that session's DateStyle and IntervalStyle.
+ * operator is schema-qualified whatever the other session's path is; its
+ * literals are ISO dates and PostgreSQL intervals, as every deparsed
+ * statement's are (deparse_flat), so they read the same under that session's
+ * DateStyle and IntervalStyle.
  */
 static char *
 cf_stream_pg_select(Query *query, TieredViewInfo *info, const HotColumns *hc,
@@ -3024,10 +3033,6 @@ cf_stream_pg_select(Query *query, TieredViewInfo *info, const HotColumns *hc,
     int           nest = NewGUCNestLevel();
 
     (void) set_config_option("search_path", "", PGC_USERSET, PGC_S_SESSION,
-                             GUC_ACTION_SAVE, true, 0, false);
-    (void) set_config_option("DateStyle", "ISO, YMD", PGC_USERSET, PGC_S_SESSION,
-                             GUC_ACTION_SAVE, true, 0, false);
-    (void) set_config_option("IntervalStyle", "postgres", PGC_USERSET, PGC_S_SESSION,
                              GUC_ACTION_SAVE, true, 0, false);
     deparse_and_find_prefix(query, &dr);
     source = skip_override_clause(skip_leading_collist(dr.rest), query->override);

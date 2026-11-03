@@ -21,10 +21,10 @@ VALUES ('public', 'events', '2026-03-01'::timestamptz);
 -- NOT a dual write. The original now()-expression is preserved for execution.
 EXPLAIN (COSTS OFF, VERBOSE)
   UPDATE public.events SET status = 'x' WHERE ts < now() - interval '100 years';
-                                                                                  QUERY PLAN                                                                                   
--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                 QUERY PLAN                                                                                  
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
-   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET status = ''x''::text   WHERE (ts < (now() - ''@ 100 years''::interval))'::text)
+   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET status = ''x''::text   WHERE (ts < (now() - ''100 years''::interval))'::text)
 (2 rows)
 
 -- Stable, recent (>= cutoff) → HOT: rewritten to a plain UPDATE on the hot heap.

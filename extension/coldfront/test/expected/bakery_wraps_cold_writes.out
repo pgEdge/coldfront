@@ -21,19 +21,19 @@ VALUES ('public', 'events', '2026-03-01'::timestamptz);
 -- coldfront._exec_iceberg_with_claim, NOT bare duckdb.raw_query.
 EXPLAIN (COSTS OFF, VERBOSE)
   UPDATE public.events SET status = 'x' WHERE ts = '2026-01-15 01:00:00+00';
-                                                                                       QUERY PLAN                                                                                        
------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                    QUERY PLAN                                                                                     
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
-   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET status = ''x''::text   WHERE (ts = ''Thu Jan 15 01:00:00 2026 UTC''::timestamptz)'::text)
+   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET status = ''x''::text   WHERE (ts = ''2026-01-15 01:00:00+00''::timestamptz)'::text)
 (2 rows)
 
 -- (2) Tiered cold DELETE: same.
 EXPLAIN (COSTS OFF, VERBOSE)
   DELETE FROM public.events WHERE ts = '2026-01-15 01:00:00+00';
-                                                                             QUERY PLAN                                                                              
----------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                          QUERY PLAN                                                                           
+---------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
-   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'DELETE FROM ice.default.events   WHERE (ts = ''Thu Jan 15 01:00:00 2026 UTC''::timestamptz)'::text)
+   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'DELETE FROM ice.default.events   WHERE (ts = ''2026-01-15 01:00:00+00''::timestamptz)'::text)
 (2 rows)
 
 -- (3) Ambiguous predicate → dual-tier CTE: the cold branch must be wrapped in
