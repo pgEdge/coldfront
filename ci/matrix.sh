@@ -195,8 +195,8 @@ backend_ready() {
 # ever silently omitted; PENDING states what creds would flip it to RUN. The full
 # grid is PG{16,17,18} × {vanilla,mesh} × {tiered,decoupled} × {primary,standby} ×
 # {s3,aws,azure,gcs} = 96 cells, every one on the DuckDB 1.5.x patched-iceberg
-# image, plus the vended lanes (S3 STS + Azure SAS credential vending)
-# vanilla-only: +24 cells.
+# image, plus the three vended lanes (S3 STS, Azure SAS and AWS STS credential
+# vending) vanilla-only: +36 cells.
 coverage_table() {
     step "MATRIX COVERAGE (full grid = 96 cells, all on DuckDB 1.5.x)"
     local pg topo mode tgt be st cell_st
@@ -301,7 +301,7 @@ case "$SCOPE" in
         ;;
     esac
     coverage_table
-    echo -e "\n  NOTE: s3 and vended (both SeaweedFS-backed) are hermetic and always RUN; vended (S3 STS credential vending) is vanilla-only, its mesh cells deferred. The real cloud stores aws/azure/gcs (and azure-vended, Azure SAS vending) RUN only when their COLDFRONT_* creds are present, else PENDING (tracked, never skipped silently)."
+    echo -e "\n  NOTE: s3 and vended (both SeaweedFS-backed) are hermetic and always RUN; vended (S3 STS credential vending) is vanilla-only, its mesh cells deferred. The real cloud stores aws/azure/gcs (and azure-vended, Azure SAS vending, and aws-vended, AWS STS vending) RUN only when their COLDFRONT_* creds are present, else PENDING (tracked, never skipped silently)."
     ;;
 esac
 
