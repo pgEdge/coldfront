@@ -1675,25 +1675,35 @@ find_dml_prefix(const char *orig_sql, const char *search_unqual,
     return NULL; /* unreachable */
 }
 
-/* pg_get_querydef's text on one line: a newline outside quotes becomes a
- * space, and the leading indent goes. A literal or a quoted identifier keeps
- * its newlines and tabs: the deparser quotes with '' and "" only, doubles a
- * quote inside and never escapes one, and emits no tab of its own. The text
- * goes to DuckDB or to the stream's session, so it is deparsed under ISO
- * dates and PostgreSQL intervals, which read the same there whatever this
- * session's DateStyle and IntervalStyle. */
-static char *
-deparse_flat(Query *query)
+/* A GUC nest level under ISO dates and PostgreSQL intervals, so text rendered
+ * inside it reads as the same value in DuckDB and in another session whatever
+ * this session's DateStyle and IntervalStyle. The caller closes it with
+ * AtEOXact_GUC(true, nest). */
+static int
+iso_style_nest(void)
 {
-    int   nest = NewGUCNestLevel();
-    char *sql, *p;
-    char  quote = 0;
+    int nest = NewGUCNestLevel();
 
     (void) set_config_option("DateStyle", "ISO, YMD", PGC_USERSET, PGC_S_SESSION,
                              GUC_ACTION_SAVE, true, 0, false);
     (void) set_config_option("IntervalStyle", "postgres", PGC_USERSET, PGC_S_SESSION,
                              GUC_ACTION_SAVE, true, 0, false);
-    sql = pg_get_querydef(query, false);
+    return nest;
+}
+
+/* pg_get_querydef's text on one line: a newline outside quotes becomes a
+ * space, and the leading indent goes. A literal or a quoted identifier keeps
+ * its newlines and tabs: the deparser quotes with '' and "" only, doubles a
+ * quote inside and never escapes one, and emits no tab of its own. The text
+ * goes to DuckDB or to the stream's session, so it is deparsed under
+ * iso_style_nest. */
+static char *
+deparse_flat(Query *query)
+{
+    int   nest = iso_style_nest();
+    char *sql  = pg_get_querydef(query, false), *p;
+    char  quote = 0;
+
     AtEOXact_GUC(true, nest);
     for (p = sql; *p; p++)
     {
@@ -2565,7 +2575,8 @@ build_iceberg_only_insert_with_cluster(Query *query, TieredViewInfo *info,
  * The hot table's columns in attnum order, read once per rewritten INSERT:
  * name, type, DEFAULT expression (NULL without one) and, for an identity
  * column, its sequence (NULL otherwise). Vector companions are left out, as in
- * every other place the cold tuple is built.
+ * every other place the cold tuple is built. The DEFAULT text is read under
+ * iso_style_nest, because the stream's session parses it too.
  */
 typedef struct {
     int    n;
@@ -2580,6 +2591,8 @@ load_hot_columns(const char *hot_qualified, HotColumns *hc)
 {
     StringInfoData sql;
     const char    *lit = quote_literal_cstr(hot_qualified);
+    int            nest;
+    bool           ok;
 
     hc->n = 0;
     initStringInfo(&sql);
@@ -2600,7 +2613,10 @@ load_hot_columns(const char *hot_qualified, HotColumns *hc)
         lit, lit, lit);
     if (SPI_connect() != SPI_OK_CONNECT)
         return;
-    if (SPI_execute(sql.data, true, 0) == SPI_OK_SELECT && SPI_processed > 0)
+    nest = iso_style_nest();
+    ok   = SPI_execute(sql.data, true, 0) == SPI_OK_SELECT;
+    AtEOXact_GUC(true, nest);
+    if (ok && SPI_processed > 0)
     {
         MemoryContext oldcxt = MemoryContextSwitchTo(CurTransactionContext);
         uint64        i;
@@ -3020,9 +3036,9 @@ cf_pc_expr(TieredViewInfo *info, const HotColumns *hc)
  * receives (cold_sql_arg): the cold projection over the source below the
  * cutoff. Deparsed with an empty search_path, so every relation, function and
  * operator is schema-qualified whatever the other session's path is; its
- * literals are ISO dates and PostgreSQL intervals, as every deparsed
- * statement's are (deparse_flat), so they read the same under that session's
- * DateStyle and IntervalStyle.
+ * literals and the column defaults it fills in are ISO dates and PostgreSQL
+ * intervals (deparse_flat, load_hot_columns), so they read the same under that
+ * session's DateStyle and IntervalStyle.
  */
 static char *
 cf_stream_pg_select(Query *query, TieredViewInfo *info, const HotColumns *hc,

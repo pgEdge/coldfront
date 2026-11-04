@@ -27,11 +27,12 @@ this project adheres to
   write now stores `NULL` and matches no row against it. The base image builds
   DuckDB's `postgres` extension at duckdb-postgres `4053b617`, which reads the
   value as `NULL` instead of `0`.
-- A timestamp or interval literal in a cold `UPDATE` or `DELETE` reached DuckDB
-  spelled in the session's `DateStyle` and `IntervalStyle`, so under a style
-  other than ISO the statement failed with a DuckDB conversion error. ColdFront
-  now renders the statement with ISO timestamps and PostgreSQL intervals
-  whatever the session's settings.
+- A timestamp or interval literal in a decoupled `INSERT`, or in a cold
+  `UPDATE` or `DELETE`, reached DuckDB spelled in the session's `DateStyle` and
+  `IntervalStyle`. Under a `DateStyle` other than ISO, or an `IntervalStyle`
+  that DuckDB does not read, the statement failed with a DuckDB conversion
+  error. ColdFront now renders the statement with ISO timestamps and PostgreSQL
+  intervals whatever the session's settings.
 
 ## [1.0.0-rc1] - 2026-09-28
 
