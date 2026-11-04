@@ -465,8 +465,9 @@ write. When a statement gives the view no alias, the deparser qualifies its
 columns by the view's name, so the retargeted relation takes that name as its
 alias; an `UPDATE … FROM`, a `DELETE … USING` and a correlated sub-select
 are handled the same way. The hook deparses the statement under ISO dates and
-PostgreSQL intervals, so a literal reads the same in DuckDB whatever the
-session's `DateStyle` and `IntervalStyle`.
+PostgreSQL's verbose interval style, the one interval spelling DuckDB reads
+whatever the signs of an interval's fields, so a literal reads the same in
+DuckDB whatever the session's `DateStyle` and `IntervalStyle`.
 
 `COPY <view> FROM` takes the same path. The utility hook reads the rows with
 PostgreSQL's `COPY` reader (`BeginCopyFrom`, `NextCopyFrom`), collects

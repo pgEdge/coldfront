@@ -1675,9 +1675,12 @@ find_dml_prefix(const char *orig_sql, const char *search_unqual,
     return NULL; /* unreachable */
 }
 
-/* A GUC nest level under ISO dates and PostgreSQL intervals, so text rendered
- * inside it reads as the same value in DuckDB and in another session whatever
- * this session's DateStyle and IntervalStyle. The caller closes it with
+/* A GUC nest level under ISO dates and PostgreSQL's verbose intervals, so text
+ * rendered inside it reads as the same value in DuckDB and in another session
+ * whatever this session's DateStyle and IntervalStyle. DuckDB v1.5.4 reads the
+ * verbose style whatever the signs of an interval's fields, and refuses the
+ * '+' the postgres style puts before a positive field that follows a negative
+ * one (pg_regress cold_render_canonical). The caller closes the level with
  * AtEOXact_GUC(true, nest). */
 static int
 iso_style_nest(void)
@@ -1686,8 +1689,8 @@ iso_style_nest(void)
 
     (void) set_config_option("DateStyle", "ISO, YMD", PGC_USERSET, PGC_S_SESSION,
                              GUC_ACTION_SAVE, true, 0, false);
-    (void) set_config_option("IntervalStyle", "postgres", PGC_USERSET, PGC_S_SESSION,
-                             GUC_ACTION_SAVE, true, 0, false);
+    (void) set_config_option("IntervalStyle", "postgres_verbose", PGC_USERSET,
+                             PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
     return nest;
 }
 
@@ -3036,7 +3039,7 @@ cf_pc_expr(TieredViewInfo *info, const HotColumns *hc)
  * receives (cold_sql_arg): the cold projection over the source below the
  * cutoff. Deparsed with an empty search_path, so every relation, function and
  * operator is schema-qualified whatever the other session's path is; its
- * literals and the column defaults it fills in are ISO dates and PostgreSQL
+ * literals and the column defaults it fills in are ISO dates and verbose
  * intervals (deparse_flat, load_hot_columns), so they read the same under that
  * session's DateStyle and IntervalStyle.
  */
