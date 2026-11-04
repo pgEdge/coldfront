@@ -328,18 +328,17 @@ omitted column that has one, so cold ids share the hot side's sequence. A
 vector column is sent as `real[]`, which the extension maps to the Iceberg
 `list<float>`, and a `jsonb`, `json` or `interval` column as its text, the
 form the Iceberg `VARCHAR` column holds. The stream sends a `numeric` array as
-its text, with a `NaN` element replaced by `NULL`, and DuckDB casts the text to
-the Iceberg decimal list; the array reaches the extension without its precision
-and scale, which the extension would read as `double precision`. The extension
-reads a `numeric` `NaN` as `NULL`, so the cold tier stores a streamed `NaN` as
-`NULL`, as a value and as an element. On a clustered table the cluster
-assignment leads the select list and orders the write, so each row group holds
-roughly one cluster. The last argument is the cold test: for a `SELECT` source
-an `EXISTS` over it, for a `VALUES` source the hot count against the row count,
-so an `INSERT` whose rows are all hot stages nothing and takes no claim.
-`cold_rows` is `NULL` when the rows streamed, since DuckDB keeps that count,
-and the count otherwise: `0` for an all-hot `INSERT`, the sink's count after
-the fallback below.
+its text, which DuckDB casts to the Iceberg decimal list; the array reaches the
+extension without its precision and scale, which the extension would read as
+`double precision`. The projection replaces a `numeric` `NaN` with `NULL`, as a
+value and as an element, because Iceberg's decimal has no `NaN`. On a clustered
+table the cluster assignment leads the select list and orders the write, so
+each row group holds roughly one cluster. The last argument is the cold test:
+for a `SELECT` source an `EXISTS` over it, for a `VALUES` source the hot count
+against the row count, so an `INSERT` whose rows are all hot stages nothing and
+takes no claim. `cold_rows` is `NULL` when the rows streamed, since DuckDB
+keeps that count, and the count otherwise: `0` for an all-hot `INSERT`, the
+sink's count after the fallback below.
 
 The query is deparsed with an empty `search_path`, so every relation, function
 and operator is schema-qualified whatever the second session's path is, and
@@ -408,14 +407,13 @@ The source runs once, into the `coldfront_source` tuplestore, and both halves
 read it, so a volatile source lands every row exactly once and a row the
 transaction wrote before the `INSERT` reaches the cold tier. The cold half
 projects each row as the stream does, renders it as a DuckDB `VALUES` tuple
-(`coldfront._cold_row_literal`), a `numeric` `NaN` as `NULL`, gathers
-`coldfront.cold_write_batch_size` tuples (default 10000) at a time with
-`string_agg`, and hands each batch to the `coldfront._cold_sink` aggregate,
-which writes it as one `INSERT` through `coldfront._exec_iceberg_with_claim`.
-The statement is built by `coldfront._cold_sink_sql`, which the stream's
-fallback runs too. The work per row is the rendering in plpgsql, so a load
-that cannot stream costs in proportion to its rows and more per row than one
-that can.
+(`coldfront._cold_row_literal`), gathers `coldfront.cold_write_batch_size` tuples
+(default 10000) at a time with `string_agg`, and hands each batch to the
+`coldfront._cold_sink` aggregate, which writes it as one `INSERT` through
+`coldfront._exec_iceberg_with_claim`. The statement is built by
+`coldfront._cold_sink_sql`, which the stream's fallback runs too. The work per
+row is the rendering in plpgsql, so a load that cannot stream costs in
+proportion to its rows and more per row than one that can.
 
 In both shapes each column of the source is cast to the hot table's type,
 which restates the coercions PostgreSQL applied when it analyzed the statement

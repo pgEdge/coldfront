@@ -1861,9 +1861,7 @@ build_cold_dml(DeparseResult *dr, TieredViewInfo *info, Query *query)
  * translate($K::text,'{}','[]'); any other array -> %P$s /
  * coldfront._render_cold_param($K); else %P$L /
  * coldfront._canonical_text($K), a text every reader takes as the same value
- * whatever the caller's DateStyle, IntervalStyle and extra_float_digits, with
- * a numeric NaN as NULL, which the cold tier stores for one (ci/journey.sh
- * TC-234). With
+ * whatever the caller's DateStyle, IntervalStyle and extra_float_digits. With
  * for_pg the string is the tiered stream's read, which PostgreSQL runs in
  * another session: every value is that canonical text, coerced by the
  * projection's casts.
@@ -1932,8 +1930,6 @@ cold_sql_arg(const char *cold_dml, ColdParamSet *ps, bool for_pg)
                          * shape and renders the DuckDB list an array column's value
                          * becomes, so the template takes the result as SQL. */
                         appendStringInfo(&args, ", coldfront._render_cold_param($%d)", id);
-                    else if (!for_pg && t == NUMERICOID)
-                        appendStringInfo(&args, ", nullif(coldfront._canonical_text($%d), 'NaN')", id);
                     else
                         appendStringInfo(&args, ", coldfront._canonical_text($%d)", id);
                 }
@@ -2682,8 +2678,10 @@ build_src_cte(Query *query, const char *source, const char *col_list,
  * would arrive as text, so it goes as real[]; jsonb and json are stored as
  * VARCHAR and go as their text. An interval is stored as VARCHAR too and goes
  * as coldfront._canonical_text's shape (build_cold_projection), the one text
- * both parsers read back as the same value. A numeric array is wrapped by the
- * caller (build_cold_projection).
+ * both parsers read back as the same value. A numeric array goes as its text:
+ * coldfront._cold_list returns it without its precision and scale, which the
+ * extension (duckdb-postgres 4053b617) reads as a list of double, and DuckDB's
+ * cast of the text to the Iceberg decimal list keeps every digit.
  */
 static const char *
 cf_stream_cast(const char *type)
@@ -2692,6 +2690,8 @@ cf_stream_cast(const char *type)
         return "::real[]";
     if (strcmp(type, "jsonb") == 0 || strcmp(type, "json") == 0)
         return "::text";
+    if (strncmp(type, "numeric", 7) == 0 && pg_str_endswith(type, "[]"))
+        return "::text[]";
     return "";
 }
 
@@ -2746,17 +2746,18 @@ build_cold_projection(Query *query, const HotColumns *hc, bool stream)
         if (pg_str_endswith(hc->type[i], "[]"))
             expr = psprintf("coldfront._cold_list(%s, %s)", expr,
                             quote_literal_cstr(hc->name[i]));
-        /* A numeric array goes as its text: coldfront._cold_list returns it
-         * without its precision and scale, which DuckDB's postgres extension
-         * (duckdb-postgres 4053b617) reads as a list of double, and DuckDB's
-         * cast of the text to the Iceberg decimal list keeps every digit. A
-         * NaN element becomes NULL first, as the extension reads a NaN value
-         * (ci/journey.sh TC-234). */
+        /* Iceberg's decimal has no NaN: a cold row's numeric NaN is stored as
+         * NULL, as a value and as an element, as DuckDB's postgres extension
+         * reads one from a PostgreSQL table (ci/journey.sh TC-234). The cast to
+         * the column's type keeps its precision and scale, which the stream
+         * relies on, and types a default such as 0, which pg_get_expr prints
+         * without the column's cast. */
+        if (strncmp(hc->type[i], "numeric", 7) == 0)
+            expr = pg_str_endswith(hc->type[i], "[]")
+                ? psprintf("array_replace((%s)::%s, 'NaN', NULL)", expr, hc->type[i])
+                : psprintf("nullif((%s)::%s, 'NaN')", expr, hc->type[i]);
         if (stream && strcmp(hc->type[i], "interval") == 0)
             expr = psprintf("coldfront._canonical_text((%s)::interval)", expr);
-        else if (stream && strncmp(hc->type[i], "numeric", 7) == 0 &&
-                 pg_str_endswith(hc->type[i], "[]"))
-            expr = psprintf("array_replace(%s, 'NaN', NULL)::text[]", expr);
         else if (cast[0] != '\0')
             expr = psprintf("(%s)%s", expr, cast);
         appendStringInfo(&sel, "%s%s AS %s", i > 0 ? ", " : "", expr,

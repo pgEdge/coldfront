@@ -34,14 +34,6 @@ SELECT coldfront._render_cold_value(to_jsonb(ARRAY[1, NULL, 3])::text, 'integer[
  ['1', NULL, '3'] | []         | ['1.25', '2']
 (1 row)
 
--- A numeric NaN is stored as NULL, as a value and as an element.
-SELECT coldfront._render_cold_value('NaN', 'numeric(10,2)')                                     AS nan_value,
-       coldfront._render_cold_value(to_jsonb(ARRAY['NaN'::numeric, 1.25])::text, 'numeric(10,2)[]') AS nan_list;
- nan_value |    nan_list    
------------+----------------
- NULL      | [NULL, '1.25']
-(1 row)
-
 -- A bytea element arrives in the session's bytea_output, and bytea's own input
 -- reads either form, so the bytes are the same under both.
 SET bytea_output = 'escape';

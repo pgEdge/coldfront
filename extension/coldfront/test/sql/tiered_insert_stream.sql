@@ -110,13 +110,16 @@ RESET coldfront.cold_write_batch_size;
 SELECT status, count(*) FROM public.cf_stream_hot WHERE status LIKE 'copy%' GROUP BY status;
 SELECT status, count(*) FROM public.cf_stream_cold WHERE status LIKE 'copy%' GROUP BY status;
 
--- (6) A numeric NaN streams as NULL, as a value and as an element, from VALUES,
---     a table and COPY alike: DuckDB's postgres extension reads a numeric NaN
---     as NULL (ci/journey.sh TC-234), and a NaN element is replaced by NULL
---     before the array goes as its text, whose cast to the decimal list keeps
---     a wide element exact. A bound NaN parameter of a cold UPDATE renders as
---     NULL too; the UPDATE's timestamptz literal reaches DuckDB in ISO
---     whatever the session's DateStyle, which pg_regress sets to Postgres.
+-- (6) A cold row's numeric NaN is stored as NULL, as a value and as an element,
+--     whether the row streams, from VALUES, a table and COPY alike, or goes
+--     through the sink, from a volatile source. A numeric array streams as its
+--     text, whose cast to the decimal list keeps a wide element exact, and a
+--     wide numeric value keeps every digit too. A numeric column the INSERT
+--     omits takes its default, an integer one such as 0 included. A cold
+--     UPDATE's bound NaN parameter reaches DuckDB as the literal 'NaN', which
+--     DuckDB refuses, as a value and as an element. A cold UPDATE's
+--     timestamptz literal reaches DuckDB in ISO whatever the session's
+--     DateStyle, which pg_regress sets to Postgres.
 CREATE FUNCTION pg_temp.cf_streams(p_sql text) RETURNS boolean LANGUAGE plpgsql AS $$
 DECLARE l text;
 BEGIN
@@ -125,8 +128,9 @@ BEGIN
     END LOOP;
     RETURN false;
 END $$;
-SELECT duckdb.raw_query('CREATE TEMP TABLE cf_stream_num (ts TIMESTAMPTZ, amount DECIMAL(10,2), amounts DECIMAL(38,10)[])') IS NOT NULL AS created;
-CREATE TABLE public._cf_stream_num (ts timestamptz NOT NULL, amount numeric(10,2), amounts numeric(38,10)[]);
+SELECT duckdb.raw_query('CREATE TEMP TABLE cf_stream_num (ts TIMESTAMPTZ, amount DECIMAL(10,2), amounts DECIMAL(38,10)[], fee DECIMAL(38,10), fees DECIMAL(12,2)[])') IS NOT NULL AS created;
+CREATE TABLE public._cf_stream_num (ts timestamptz NOT NULL, amount numeric(10,2), amounts numeric(38,10)[],
+                                    fee numeric(38,10) DEFAULT 0, fees numeric(12,2)[] DEFAULT ARRAY[0]);
 CREATE VIEW public.cf_stream_num AS SELECT * FROM public._cf_stream_num;
 INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
 VALUES ('public', 'cf_stream_num', 'public._cf_stream_num', 'temp.main.cf_stream_num', 'ts');
@@ -135,19 +139,28 @@ VALUES ('public', 'cf_stream_num', '2026-03-01'::timestamptz);
 CREATE TABLE public.cf_staging_num (ts timestamptz, amount numeric(10,2));
 INSERT INTO public.cf_staging_num VALUES ('2026-01-05', 'NaN');
 SELECT pg_temp.cf_streams($q$INSERT INTO public.cf_stream_num (ts, amount) VALUES ('2026-01-03', 'NaN')$q$) AS values_streams,
-       pg_temp.cf_streams($q$INSERT INTO public.cf_stream_num (ts, amount) SELECT ts, amount FROM public.cf_staging_num$q$) AS select_streams;
-INSERT INTO public.cf_stream_num VALUES ('2026-01-01', 12345678.95, '{12345678901234567890.1234567890,NULL,-2.25}'), ('2026-01-02', -0.01, '{}');
+       pg_temp.cf_streams($q$INSERT INTO public.cf_stream_num (ts, amount) SELECT ts, amount FROM public.cf_staging_num$q$) AS select_streams,
+       pg_temp.cf_streams($q$INSERT INTO public.cf_stream_num (ts, amount, amounts) SELECT '2026-01-07'::timestamptz, CASE WHEN random() >= 0 THEN 'NaN'::numeric END, '{1,NaN}'::numeric[]$q$) AS volatile_streams;
+INSERT INTO public.cf_stream_num VALUES ('2026-01-01', 12345678.95, '{12345678901234567890.1234567890,NULL,-2.25}', 12345678901234567890.1234567890), ('2026-01-02', -0.01, '{}', 0);
 INSERT INTO public.cf_stream_num (ts, amount) VALUES ('2026-01-03', 'NaN');
 INSERT INTO public.cf_stream_num (ts, amounts) VALUES ('2026-01-04', '{1,NaN}');
 INSERT INTO public.cf_stream_num (ts, amount) SELECT ts, amount FROM public.cf_staging_num;
 COPY public.cf_stream_num (ts, amount) FROM stdin WITH (FORMAT csv);
 2026-01-06 00:00:00+00,NaN
 \.
+INSERT INTO public.cf_stream_num (ts, amount, amounts) SELECT '2026-01-07'::timestamptz, CASE WHEN random() >= 0 THEN 'NaN'::numeric END, '{1,NaN}'::numeric[];
+\set VERBOSITY terse
 PREPARE cf_nan_param (numeric) AS UPDATE public.cf_stream_num SET amount = $1 WHERE ts = '2026-01-02';
 EXECUTE cf_nan_param('NaN');
+PREPARE cf_nan_list (numeric[]) AS UPDATE public.cf_stream_num SET amounts = $1 WHERE ts = '2026-01-02';
+EXECUTE cf_nan_list('{1,NaN}');
+\set VERBOSITY default
 DEALLOCATE cf_nan_param;
-SELECT r['ts']::timestamptz AS ts, r['amount']::text AS amount, r['amounts']::text AS amounts
-  FROM duckdb.query('SELECT ts, amount::VARCHAR AS amount, amounts::VARCHAR AS amounts FROM temp.main.cf_stream_num ORDER BY ts') AS t(r);
+DEALLOCATE cf_nan_list;
+UPDATE public.cf_stream_num SET amount = 1.25 WHERE ts = '2026-01-02';
+SELECT r['ts']::timestamptz AS ts, r['amount']::text AS amount, r['amounts']::text AS amounts,
+       r['fee']::text AS fee, r['fees']::text AS fees
+  FROM duckdb.query('SELECT ts, amount::VARCHAR AS amount, amounts::VARCHAR AS amounts, fee::VARCHAR AS fee, fees::VARCHAR AS fees FROM temp.main.cf_stream_num ORDER BY ts') AS t(r);
 
 -- (7) Sources the hook sends to the sink in one pass: a volatile function, a
 --     stable one, a temporary table, a WITH entry, a view that calls a stable

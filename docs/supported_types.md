@@ -43,12 +43,12 @@ A few supported types need a closer look:
   value in a `date`, `timestamp with time zone` or `timestamp without time
   zone` column, as array elements too. The hot tier of a tiered table refuses
   those values with a check constraint named `coldfront_guard_<column>`. The
-  cold tier refuses an infinity, and stores a `numeric` `NaN` that a write
-  carries from PostgreSQL as `NULL`: the rows a tiered `INSERT` sends to the
-  cold tier, a PostgreSQL table that a cold write names, and a bound
-  parameter. DuckDB refuses a `'NaN'` literal in a statement that DuckDB
-  runs, such as a decoupled `INSERT` or a cold `UPDATE`, because DuckDB's
-  decimal has no `NaN`.
+  cold tier refuses an infinity, and stores a `numeric` `NaN` from PostgreSQL
+  as `NULL`. Such a `NaN` comes from the rows that a tiered `INSERT` sends to
+  the cold tier, or from a PostgreSQL table that a cold write reads. DuckDB
+  refuses a `'NaN'` literal or bound parameter in a statement that DuckDB runs,
+  such as a decoupled `INSERT` or a cold `UPDATE`, because DuckDB's decimal has
+  no `NaN`.
 - `char(N)` is stored and read as `varchar`. Values, comparisons, and
   `length()` round-trip losslessly, but a cold read comes back unpadded
   with `pg_typeof varchar`, because pg_duckdb has no fixed-length `char`

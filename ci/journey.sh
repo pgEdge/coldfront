@@ -1225,9 +1225,9 @@ EOSQL
         "$(q_may "$HOST" "INSERT INTO public.tcval (ts, seen) VALUES ($m4 + interval '5 days', 'infinity');")"
     # The INSERTs above call now(), so they write through the cold sink. One with
     # no stable function streams its cold rows through DuckDB's postgres
-    # extension, which reads a numeric NaN as NULL (TC-234), from VALUES, a
-    # table and COPY alike. An infinity crosses unchanged and duckdb-iceberg
-    # refuses it.
+    # extension, and the cold projection stores a numeric NaN as NULL there as
+    # in the sink, from VALUES, a table and COPY alike. An infinity crosses
+    # unchanged and duckdb-iceberg refuses it.
     local m4lit; m4lit=$(q "$HOST" "SELECT ($m4 + interval '6 days')::text;")
     q "$HOST" "CREATE TABLE public.tcval_nan (ts timestamptz, amount numeric(10,2)); INSERT INTO public.tcval_nan VALUES ('$m4lit', 'NaN');" >/dev/null
     assert_contains "TC-233: a cold INSERT of literals streams" "_tiered_cold_stream(" \
@@ -1258,11 +1258,13 @@ EOSQL
     assert_eq "TC-233: the cold rows are unchanged" "0.00/finite,2.50/null" \
         "$(q "$HOST" "SELECT string_agg(amount::text || '/' || CASE WHEN due IS NULL THEN 'null' WHEN isfinite(due) THEN 'finite' ELSE 'infinite' END, ',' ORDER BY amount) FROM public.tcval WHERE $cold;")"
     # TC-234: DuckDB's postgres extension (duckdb-postgres 4053b617) reads a
-    # numeric NaN as NULL. It streams a tiered INSERT's cold rows and the
-    # archive's delta replay, whose hot table the guard keeps NaN out of, and it
-    # reads the PostgreSQL table a cold UPDATE ... FROM or DELETE ... USING, a
-    # MERGE or a decoupled INSERT ... SELECT names, so each of those stores NULL
-    # for a NaN. When the first check fails, the extension keeps or refuses NaN.
+    # numeric NaN as NULL. A cold UPDATE ... FROM or DELETE ... USING, a MERGE
+    # and a decoupled INSERT ... SELECT read the PostgreSQL table they name
+    # through it, so each of those stores NULL for a NaN. The extension also
+    # streams a tiered INSERT's cold rows, whose NaN the cold projection has
+    # made NULL, and the archive's delta replay, whose hot table the guard
+    # keeps NaN out of. When the first check fails, the extension keeps or
+    # refuses NaN.
     q "$HOST" "CREATE TABLE public.tcval_src (amount numeric(10,2)); INSERT INTO public.tcval_src VALUES ('NaN');" >/dev/null
     assert_eq "TC-234: DuckDB's postgres extension reads NaN as NULL" "NULL" \
         "$(q "$HOST" "SELECT coldfront.ensure_pg_attached(); SELECT coalesce(r['a']::text, 'NULL') FROM duckdb.query('SELECT amount::VARCHAR AS a FROM pglocal.public.tcval_src') AS t(r);" | tail -1)"

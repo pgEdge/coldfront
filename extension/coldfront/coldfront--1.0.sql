@@ -963,8 +963,8 @@ CREATE TYPE coldfront._cold_sink_state AS (
 -- coldfront._cold_row_literal: render one row (jsonb keyed by column name) as a
 -- DuckDB positional VALUES tuple in attnum order. bytea is rebuilt with
 -- from_hex from its hex digits, a vector is cast to FLOAT[], an array becomes a
--- DuckDB list of its elements' literals, a NULL and a numeric NaN are NULL,
--- everything else is a quoted literal DuckDB coerces to the storage type. Each vector's cluster column leads the tuple
+-- DuckDB list of its elements' literals, a NULL is NULL, everything else is a
+-- quoted literal DuckDB coerces to the storage type. Each vector's cluster column leads the tuple
 -- (_vec_list_prefix), derived from that row's own vector literal.
 CREATE FUNCTION coldfront._cold_row_literal(
     p_payload jsonb, p_cols text[], p_types text[], p_schema text, p_view text
@@ -2754,9 +2754,6 @@ LANGUAGE sql IMMUTABLE STRICT AS $$
         -- so the bytes are rebuilt from their hex digits.
         WHEN p_pg_type = 'bytea' THEN format('from_hex(%L)', encode(p_val_text::bytea, 'hex'))
         WHEN p_pg_type = 'interval' THEN quote_literal(coldfront._canonical_text(p_val_text::interval))
-        -- Iceberg's decimal has no NaN; the cold tier stores one as NULL, as
-        -- DuckDB's postgres extension reads it (ci/journey.sh TC-234).
-        WHEN p_pg_type LIKE 'numeric%' AND p_val_text = 'NaN' THEN 'NULL'
         -- The Iceberg column is FLOAT[]; without the cast the literal stays a
         -- VARCHAR and the INSERT fails.
         WHEN coldfront._is_vector_type(p_pg_type) THEN format('CAST(%L AS FLOAT[])', p_val_text)
