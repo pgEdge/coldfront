@@ -18,8 +18,8 @@ Source0:	%{sname}-%{version}-%{_arch}.tar.gz
 # nothing to compile here, so no BuildRequires beyond syft (installed by
 # setup_dnf_build_env) for the SBOM.
 BuildArch:	%{_arch}
-# The tools run as the coldfront service account (created in %pre), which also
-# owns the group of the credential-bearing config. shadow-utils = useradd/groupadd.
+# The tools run as the coldfront service account (created in %pre).
+# shadow-utils = useradd/groupadd.
 Requires(pre):	shadow-utils
 
 %description
@@ -43,19 +43,14 @@ gpg --armor --detach-sign --local-user "$KEY_ID" --output %{_builddir}/%{sname}-
 install -D -m 0755 archiver    %{buildroot}%{_bindir}/archiver
 install -D -m 0755 partitioner %{buildroot}%{_bindir}/partitioner
 install -D -m 0755 compactor   %{buildroot}%{_bindir}/compactor
-# Ship the example deployment config as the default config file. The tools take
-# `-config <path>`; point them at this. Installed %config(noreplace) so an admin's
-# edited copy survives upgrades (a new default lands as config.yaml.rpmnew).
-# Owned coldfront:coldfront 0600 (%attr in %files): it holds the Postgres DSN +
-# object-store credentials, so restrict it to the coldfront service account
-# (root retains access regardless — it bypasses file permissions).
-install -D -m 0600 config.example.yaml %{buildroot}%{_sysconfdir}/pgedge/coldfront/config.yaml
+# The example deployment YAML, a model for the file `import` takes, is
+# documentation: %doc copies examples/ into the package's doc directory.
+install -D -m 0644 config.example.yaml examples/config.example.yaml
 install -D -m 0644 %{sname}-sbom.json     %{buildroot}%{_datadir}/pgedge-%{sname}/%{sname}-sbom.json
 install -D -m 0644 %{sname}-sbom.json.asc %{buildroot}%{_datadir}/pgedge-%{sname}/%{sname}-sbom.json.asc
 
 %pre
-# Create the coldfront group and system user — the tools' service account and the
-# owner group of the credential-bearing config below.
+# Create the coldfront group and system user, the tools' service account.
 getent group coldfront >/dev/null || groupadd -r coldfront
 getent passwd coldfront >/dev/null || \
     useradd -r -g coldfront -d /var/lib/coldfront -s /sbin/nologin \
@@ -64,13 +59,10 @@ exit 0
 
 %files
 %license LICENSE.md
-%doc README.md
+%doc README.md examples
 %{_bindir}/archiver
 %{_bindir}/partitioner
 %{_bindir}/compactor
-%dir %{_sysconfdir}/pgedge
-%dir %{_sysconfdir}/pgedge/coldfront
-%attr(0600, coldfront, coldfront) %config(noreplace) %{_sysconfdir}/pgedge/coldfront/config.yaml
 %{_datadir}/pgedge-%{sname}/%{sname}-sbom.json
 %{_datadir}/pgedge-%{sname}/%{sname}-sbom.json.asc
 

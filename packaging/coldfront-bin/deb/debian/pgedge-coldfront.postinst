@@ -12,12 +12,5 @@ if ! getent passwd coldfront >/dev/null; then
         --disabled-password --gecos "ColdFront tiered storage" coldfront
 fi
 
-# The config carries the Postgres DSN + object-store credentials — restrict it to
-# coldfront:coldfront now that the user exists (dpkg unpacks conffiles root:root).
-if [ -f /etc/pgedge/coldfront/config.yaml ]; then
-    chown coldfront:coldfront /etc/pgedge/coldfront/config.yaml 2>/dev/null || true
-    chmod 0600 /etc/pgedge/coldfront/config.yaml || true
-fi
-
 #DEBHELPER#
 exit 0

@@ -14,6 +14,9 @@ this project adheres to
   the cold tier. Such a row failed the statement with a DuckDB conversion
   error. When the `INSERT` read the row from a PostgreSQL table, it could store
   the `NaN` as `0` instead.
+- The `pgedge-coldfront` package installs the example deployment YAML as
+  `/usr/share/doc/pgedge-coldfront/examples/config.example.yaml`, and no longer
+  as `/etc/pgedge/coldfront/config.yaml`, a file no ColdFront tool reads.
 
 ### Fixed
 

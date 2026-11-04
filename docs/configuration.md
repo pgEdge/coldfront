@@ -107,8 +107,12 @@ archiver import --config deploy.yaml
 ```
 
 The `pgedge-coldfront` package installs an example deployment YAML at
-`/etc/pgedge/coldfront/config.yaml`. The file is only an example; edit it and pass it to `import` - no
-ColdFront tool reads it unless `--config` names it.
+`/usr/share/doc/pgedge-coldfront/examples/config.example.yaml`. The file is
+only an example; edit a copy of it and pass the copy to `import` - no ColdFront
+tool reads it unless `--config` names it. A system set to skip package
+documentation, as many container images are, does not install the file. The
+repository and each release tarball include the same file,
+[`config.example.yaml`](https://github.com/pgEdge/ColdFront/blob/main/config.example.yaml).
 After an import, the server holds the configuration. A later run that is given
 a YAML checks the file against the server and refuses to run if any value
 differs. The only value such a run takes from the file is `postgres.dsn`, which
