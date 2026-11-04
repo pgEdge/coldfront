@@ -1675,16 +1675,39 @@ find_dml_prefix(const char *orig_sql, const char *search_unqual,
     return NULL; /* unreachable */
 }
 
+/* A GUC nest level under ISO dates and PostgreSQL's verbose intervals, so text
+ * rendered inside it reads as the same value in DuckDB and in another session
+ * whatever this session's DateStyle and IntervalStyle. DuckDB v1.5.4 reads the
+ * verbose style whatever the signs of an interval's fields, and refuses the
+ * '+' the postgres style puts before a positive field that follows a negative
+ * one (pg_regress cold_render_canonical). The caller closes the level with
+ * AtEOXact_GUC(true, nest). */
+static int
+iso_style_nest(void)
+{
+    int nest = NewGUCNestLevel();
+
+    (void) set_config_option("DateStyle", "ISO, YMD", PGC_USERSET, PGC_S_SESSION,
+                             GUC_ACTION_SAVE, true, 0, false);
+    (void) set_config_option("IntervalStyle", "postgres_verbose", PGC_USERSET,
+                             PGC_S_SESSION, GUC_ACTION_SAVE, true, 0, false);
+    return nest;
+}
+
 /* pg_get_querydef's text on one line: a newline outside quotes becomes a
  * space, and the leading indent goes. A literal or a quoted identifier keeps
  * its newlines and tabs: the deparser quotes with '' and "" only, doubles a
- * quote inside and never escapes one, and emits no tab of its own. */
+ * quote inside and never escapes one, and emits no tab of its own. The text
+ * goes to DuckDB or to the stream's session, so it is deparsed under
+ * iso_style_nest. */
 static char *
 deparse_flat(Query *query)
 {
-    char *sql = pg_get_querydef(query, false), *p;
+    int   nest = iso_style_nest();
+    char *sql  = pg_get_querydef(query, false), *p;
     char  quote = 0;
 
+    AtEOXact_GUC(true, nest);
     for (p = sql; *p; p++)
     {
         if (quote)
@@ -2367,17 +2390,15 @@ name_in_list(List *targeted, const char *attname)
 }
 
 /*
- * Format a TimestampTz as the SQL literal `'<text>'::timestamptz` so it
- * embeds verbatim in a SQL string.  PG's timestamptz_out is locale-stable
- * and round-trips cleanly through cstring → timestamptz on both PG and
- * DuckDB.  Returns palloc'd.
+ * Format a TimestampTz as the SQL literal `'<text>'::timestamptz`, in ISO form
+ * whatever the session's DateStyle: the literal goes to DuckDB and to the
+ * stream's session as well as to this one, and all three read ISO as the same
+ * instant. Returns palloc'd.
  */
 static char *
 format_timestamptz_literal(TimestampTz ts)
 {
-    char *txt = DatumGetCString(DirectFunctionCall1(timestamptz_out,
-                                                     TimestampTzGetDatum(ts)));
-    return psprintf("'%s'::timestamptz", txt);
+    return psprintf("'%s'::timestamptz", timestamptz_to_str(ts));
 }
 
 /*
@@ -2557,7 +2578,8 @@ build_iceberg_only_insert_with_cluster(Query *query, TieredViewInfo *info,
  * The hot table's columns in attnum order, read once per rewritten INSERT:
  * name, type, DEFAULT expression (NULL without one) and, for an identity
  * column, its sequence (NULL otherwise). Vector companions are left out, as in
- * every other place the cold tuple is built.
+ * every other place the cold tuple is built. The DEFAULT text is read under
+ * iso_style_nest, because the stream's session parses it too.
  */
 typedef struct {
     int    n;
@@ -2572,6 +2594,8 @@ load_hot_columns(const char *hot_qualified, HotColumns *hc)
 {
     StringInfoData sql;
     const char    *lit = quote_literal_cstr(hot_qualified);
+    int            nest;
+    bool           ok;
 
     hc->n = 0;
     initStringInfo(&sql);
@@ -2592,7 +2616,10 @@ load_hot_columns(const char *hot_qualified, HotColumns *hc)
         lit, lit, lit);
     if (SPI_connect() != SPI_OK_CONNECT)
         return;
-    if (SPI_execute(sql.data, true, 0) == SPI_OK_SELECT && SPI_processed > 0)
+    nest = iso_style_nest();
+    ok   = SPI_execute(sql.data, true, 0) == SPI_OK_SELECT;
+    AtEOXact_GUC(true, nest);
+    if (ok && SPI_processed > 0)
     {
         MemoryContext oldcxt = MemoryContextSwitchTo(CurTransactionContext);
         uint64        i;
@@ -2670,10 +2697,10 @@ build_src_cte(Query *query, const char *source, const char *col_list,
  * would arrive as text, so it goes as real[]; jsonb and json are stored as
  * VARCHAR and go as their text. An interval is stored as VARCHAR too and goes
  * as coldfront._canonical_text's shape (build_cold_projection), the one text
- * both parsers read back as the same value. A numeric, or an array of one, goes
- * as its text: DuckDB's cast of that text to the Iceberg decimal refuses NaN,
- * as it refuses the cold sink's literal, where the extension (duckdb-postgres
- * 6b2b12ca, DuckDB v1.5.4) would read a numeric NaN as 0 (ci/journey.sh TC-234).
+ * both parsers read back as the same value. A numeric array goes as its text:
+ * coldfront._cold_list returns it without its precision and scale, which the
+ * extension (duckdb-postgres 4053b617) reads as a list of double, and DuckDB's
+ * cast of the text to the Iceberg decimal list keeps every digit.
  */
 static const char *
 cf_stream_cast(const char *type)
@@ -2682,8 +2709,8 @@ cf_stream_cast(const char *type)
         return "::real[]";
     if (strcmp(type, "jsonb") == 0 || strcmp(type, "json") == 0)
         return "::text";
-    if (strncmp(type, "numeric", 7) == 0)
-        return pg_str_endswith(type, "[]") ? "::text[]" : "::text";
+    if (strncmp(type, "numeric", 7) == 0 && pg_str_endswith(type, "[]"))
+        return "::text[]";
     return "";
 }
 
@@ -2738,6 +2765,16 @@ build_cold_projection(Query *query, const HotColumns *hc, bool stream)
         if (pg_str_endswith(hc->type[i], "[]"))
             expr = psprintf("coldfront._cold_list(%s, %s)", expr,
                             quote_literal_cstr(hc->name[i]));
+        /* Iceberg's decimal has no NaN: a cold row's numeric NaN is stored as
+         * NULL, as a value and as an element, as DuckDB's postgres extension
+         * reads one from a PostgreSQL table (ci/journey.sh TC-234). The cast to
+         * the column's type keeps its precision and scale, which the stream
+         * relies on, and types a default such as 0, which pg_get_expr prints
+         * without the column's cast. */
+        if (strncmp(hc->type[i], "numeric", 7) == 0)
+            expr = pg_str_endswith(hc->type[i], "[]")
+                ? psprintf("array_replace((%s)::%s, 'NaN', NULL)", expr, hc->type[i])
+                : psprintf("nullif((%s)::%s, 'NaN')", expr, hc->type[i]);
         if (stream && strcmp(hc->type[i], "interval") == 0)
             expr = psprintf("coldfront._canonical_text((%s)::interval)", expr);
         else if (cast[0] != '\0')
@@ -3001,9 +3038,10 @@ cf_pc_expr(TieredViewInfo *info, const HotColumns *hc)
  * The stream's read, as the SQL-text argument coldfront._tiered_cold_stream
  * receives (cold_sql_arg): the cold projection over the source below the
  * cutoff. Deparsed with an empty search_path, so every relation, function and
- * operator is schema-qualified whatever the other session's path is, and with
- * ISO dates and PostgreSQL intervals, so its literals read the same under
- * that session's DateStyle and IntervalStyle.
+ * operator is schema-qualified whatever the other session's path is; its
+ * literals and the column defaults it fills in are ISO dates and verbose
+ * intervals (deparse_flat, load_hot_columns), so they read the same under that
+ * session's DateStyle and IntervalStyle.
  */
 static char *
 cf_stream_pg_select(Query *query, TieredViewInfo *info, const HotColumns *hc,
@@ -3015,10 +3053,6 @@ cf_stream_pg_select(Query *query, TieredViewInfo *info, const HotColumns *hc,
     int           nest = NewGUCNestLevel();
 
     (void) set_config_option("search_path", "", PGC_USERSET, PGC_S_SESSION,
-                             GUC_ACTION_SAVE, true, 0, false);
-    (void) set_config_option("DateStyle", "ISO, YMD", PGC_USERSET, PGC_S_SESSION,
-                             GUC_ACTION_SAVE, true, 0, false);
-    (void) set_config_option("IntervalStyle", "postgres", PGC_USERSET, PGC_S_SESSION,
                              GUC_ACTION_SAVE, true, 0, false);
     deparse_and_find_prefix(query, &dr);
     source = skip_override_clause(skip_leading_collist(dr.rest), query->override);

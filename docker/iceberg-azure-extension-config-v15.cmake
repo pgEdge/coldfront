@@ -23,9 +23,10 @@ duckdb_extension_load(postgres_scanner
     # The 'postgres' extension (pglocal write path: DuckDB reads PG tables to
     # stream into Iceberg). Built here so it is shipped in the image and never
     # downloaded at runtime: extensions.duckdb.org has no reliably-cached v1.5.4
-    # build, and install_extension would block on the network. Pinned to a fixed
-    # commit, built against DuckDB v1.5.4.
-    GIT_TAG 6b2b12cad3afef61e8a4637e714e8a88895fed1a
+    # build, and install_extension would block on the network. Pinned to the
+    # v1.5-variegata commit at which a numeric NaN reads as NULL (ci/journey.sh
+    # TC-234), built against DuckDB v1.5.4.
+    GIT_TAG 4053b617c863dfb435c9be9dacf1ec0e3dacde80
     SUBMODULES database-connector)
 endif()
 

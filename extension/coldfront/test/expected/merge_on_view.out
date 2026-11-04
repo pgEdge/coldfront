@@ -96,10 +96,10 @@ BOOLEAN
 [ Rows: 0]
 
 
-                                                                                                                                                                                                                                                                                                                                             QUERY PLAN                                                                                                                                                                                                                                                                                                                                             
-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                                                                                                                                                                                                                                       QUERY PLAN                                                                                                                                                                                                                                                                                                                                       
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
-   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'MERGE INTO ice.default.events events    USING pglocal.public.src s    ON ((events.id = s.id) AND (events.ts < ''Thu Jan 01 00:00:00 2026 UTC''::timestamptz))    WHEN MATCHED     AND (s.status = ''del''::text)     THEN DELETE    WHEN NOT MATCHED     THEN INSERT (id, ts, status) VALUES (s.id, CASE WHEN s.ts >= ''Sun Mar 01 00:00:00 2026 UTC''::timestamptz THEN error(''a MERGE into the cold tier of tiered view "events" cannot insert a row with "ts" = '' || CAST(s.ts AS VARCHAR) || '', which is at or after the cutoff; insert it with INSERT, which splits rows by the cutoff'') ELSE s.ts END, s.status)'::text)
+   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'MERGE INTO ice.default.events events    USING pglocal.public.src s    ON ((events.id = s.id) AND (events.ts < ''2026-01-01 00:00:00+00''::timestamptz))    WHEN MATCHED     AND (s.status = ''del''::text)     THEN DELETE    WHEN NOT MATCHED     THEN INSERT (id, ts, status) VALUES (s.id, CASE WHEN s.ts >= ''2026-03-01 00:00:00+00''::timestamptz THEN error(''a MERGE into the cold tier of tiered view "events" cannot insert a row with "ts" = '' || CAST(s.ts AS VARCHAR) || '', which is at or after the cutoff; insert it with INSERT, which splits rows by the cutoff'') ELSE s.ts END, s.status)'::text)
 (2 rows)
 
 -- Inside plpgsql a hot MERGE is the retargeted statement itself.
@@ -154,15 +154,15 @@ BOOLEAN
 [ Rows: 0]
 
 
-                                                                                                                                              QUERY PLAN                                                                                                                                              
-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                                           QUERY PLAN                                                                                                                                           
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
    Output: 1
    CTE m
      ->  Update on coldfront._dummy_dml_target
            ->  Seq Scan on coldfront._dummy_dml_target
                  Output: _dummy_dml_target.anchor, _dummy_dml_target.ctid
-                 Filter: (_exec_iceberg_with_claim('ice.default.events'::text, 'MERGE INTO ice.default.events t    USING pglocal.public.src s    ON ((t.id = s.id) AND (t.ts < ''Thu Jan 01 00:00:00 2026 UTC''::timestamptz))    WHEN MATCHED     THEN UPDATE SET status = s.status'::text) IS NULL)
+                 Filter: (_exec_iceberg_with_claim('ice.default.events'::text, 'MERGE INTO ice.default.events t    USING pglocal.public.src s    ON ((t.id = s.id) AND (t.ts < ''2026-01-01 00:00:00+00''::timestamptz))    WHEN MATCHED     THEN UPDATE SET status = s.status'::text) IS NULL)
 (7 rows)
 
 -- What runs in DuckDB cannot return rows or read another WITH entry; a nested
@@ -195,7 +195,7 @@ MERGE INTO public.events t USING public.src s ON t.id = s.id
 WHEN MATCHED THEN UPDATE SET status = s.status;
 ERROR:  MERGE INTO tiered view "events" must bound "ts" to one tier in its ON condition
 DETAIL:  Each tier runs in its own engine and sees its own rows alone, so a source row matching a row of the other tier would look unmatched.
-HINT:  Add "AND ts >= 'Sun Mar 01 00:00:00 2026 UTC'::timestamptz" for the hot tier or "AND ts < 'Sun Mar 01 00:00:00 2026 UTC'::timestamptz" for the cold tier to ON, or split the statement by tier.
+HINT:  Add "AND ts >= '2026-03-01 00:00:00+00'::timestamptz" for the hot tier or "AND ts < '2026-03-01 00:00:00+00'::timestamptz" for the cold tier to ON, or split the statement by tier.
 MERGE INTO public.events t USING public.src s ON t.id = s.id AND t.ts >= '2026-05-01 00:00:00+00'
 WHEN MATCHED THEN UPDATE SET ts = s.ts;
 ERROR:  a MERGE that sets partition column "ts" on tiered view "events" is not supported

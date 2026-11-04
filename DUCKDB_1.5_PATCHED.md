@@ -258,7 +258,7 @@ port) only.
 | duckdb-iceberg | **`v1.5-variegata` @ `5edc45f0`** | extension code the seven patches target — kept fixed, so the patches apply unchanged. The build re-pins its duckdb submodule to the v1.5.4 tag (the branch tracks duckdb `main`, which drifts off the release; verified: `5edc45f0` compiles clean against v1.5.4). Transaction code lives in `src/catalog/rest/transaction/`. |
 | avro | **`7f423d69`** | the pin `v1.5-variegata` uses. |
 | azure | **`v1.5-variegata` @ `563589b2`** | the ABI-matched sibling of iceberg's branch. **NOT `main`** — azure `main` collides at link (`multiple definition of duckdb::FileFlags::FILE_FLAGS_NULL_IF_NOT_EXISTS`). |
-| postgres_scanner | duckdb-postgres **`6b2b12ca`** | the `postgres` ext; built bundled (ABI-matched, stamped v1.5.4), **shipped** in the image (never downloaded). Its vcpkg `libpq` build needs **flex** + **bison**. |
+| postgres_scanner | duckdb-postgres **`v1.5-variegata` @ `4053b617`** | the `postgres` ext; the commit at which a numeric `NaN` reads as `NULL` (its `pg_numeric_nan_as_null` default). Built bundled (ABI-matched, stamped v1.5.4), **shipped** in the image (never downloaded). Its vcpkg `libpq` build needs **flex** + **bison**. |
 | libcurl | **build 8.12.0** (≥ 7.77) | **REQUIRED** — DuckDB 1.5.4 httpfs uses `CURLSSLOPT_AUTO_CLIENT_CERT` (≥ 7.77); the pgEdge base ships 7.76.1. 8.12.0 fixes CVE-2025-0665 (the 8.11.1 resolver SIGABRT). It is the runtime client too: `coldfront.ensure_attached` selects httpfs's curl client with `httpfs_connection_caching` on. |
 
 ## 8. Build — `docker/Dockerfile.duckdb15-base`

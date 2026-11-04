@@ -8,12 +8,34 @@ this project adheres to
 
 ## [Unreleased]
 
+### Changed
+
+- A tiered `INSERT` stores a `numeric` `NaN` as `NULL` in a row that goes to
+  the cold tier. Such a row failed the statement with a DuckDB conversion
+  error. When the `INSERT` read the row from a PostgreSQL table, it could store
+  the `NaN` as `0` instead.
+
 ### Fixed
 
 - A crafted `EXTRACT` field name in a query that runs on DuckDB no longer
   reaches DuckDB as SQL. The base image and the pg_duckdb packages apply
   ColdFront's `pg_duckdb-extract-field-quoting` patch, which quotes the field
   name as PostgreSQL's fix for CVE-2026-15741 does.
+- A decoupled `INSERT ... SELECT`, a cold `UPDATE ... FROM` and a cold
+  `DELETE ... USING` read a `numeric` `NaN` in their PostgreSQL table as `0`,
+  with no error, so the write stored `0` or matched rows against `0`. Such a
+  write now stores `NULL` and matches no row against it. The base image builds
+  DuckDB's `postgres` extension at duckdb-postgres `4053b617`, which reads the
+  value as `NULL` instead of `0`.
+- A timestamp or interval literal in a decoupled `INSERT`, a tiered
+  `INSERT ... SELECT`, or a cold `UPDATE` or `DELETE` that stays in one tier
+  reached DuckDB spelled in the session's `DateStyle` and `IntervalStyle`.
+  Under a `DateStyle` other than ISO, or an `IntervalStyle` that DuckDB does
+  not read, the statement failed with a DuckDB conversion error. ColdFront now
+  renders those statements with ISO timestamps and verbose PostgreSQL
+  intervals whatever the session's settings. In them, an interval literal with
+  mixed signs, such as `interval '-1 month +2 days'`, failed under every style
+  but the verbose one and now works under all of them.
 
 ## [1.0.0-rc1] - 2026-09-28
 

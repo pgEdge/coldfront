@@ -18,6 +18,13 @@ tables:
   unsupported on cold or cross-tier reads. A hot-only read of the view runs in
   PostgreSQL with full jsonb (see
   [Supported Column Types](supported_types.md)).
+- A read through a view, and a cross-tier move of the partition column, run
+  their statement through pg_duckdb, which renders an interval literal in the
+  session's `IntervalStyle`. DuckDB reads the `postgres_verbose` style whatever
+  the signs of an interval's fields, and the `postgres` style unless a positive
+  field follows a negative one; it refuses the `sql_standard` and `iso_8601`
+  styles. Set `IntervalStyle` to `postgres_verbose` in a session whose reads or
+  cross-tier moves spell out such an interval.
 - Cross-tier isolation differs from PG-native isolation. The cold tier keeps
   one Iceberg snapshot for the whole transaction, even at READ COMMITTED, so a
   commit by another session after the transaction's first cold read stays
@@ -153,6 +160,6 @@ tables:
   storage account before using it as a cold tier.
 - A cold-tier write that reads an ordinary PostgreSQL table, such as an
   `UPDATE ... FROM` or a `MERGE` from one, stores a `numeric` `NaN` from that
-  table as `0` and stores an array renumbered to start at 1, with no error.
+  table as `NULL` and stores an array renumbered to start at 1, with no error.
   [Supported Column Types](supported_types.md) lists the writes that do this
   and shows how to check a source table first.

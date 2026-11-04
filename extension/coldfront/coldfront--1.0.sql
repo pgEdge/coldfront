@@ -3057,9 +3057,10 @@ $$;
 --   * numeric NaN. Two readers turn PostgreSQL rows into DuckDB rows: pg_duckdb's
 --     scan, which plans every read of a tiered view after its first archive and
 --     the archiver's bulk export, and DuckDB's postgres extension, which streams
---     the archive's delta replay. Both, at pg_duckdb c04e6a2 with DuckDB v1.5.4,
---     read a numeric NaN as 0 (pg_regress hot_guard, ci/journey.sh TC-234), and
---     Iceberg's decimal has no NaN to keep.
+--     the archive's delta replay. The scan, at pg_duckdb c04e6a2 with DuckDB
+--     v1.5.4, reads a numeric NaN as 0 (pg_regress hot_guard), the extension,
+--     at duckdb-postgres 4053b617, reads one as NULL (ci/journey.sh TC-234),
+--     and Iceberg's decimal has no NaN to keep.
 --   * date, timestamp and timestamptz infinity. Iceberg has none, and
 --     duckdb-iceberg refuses to write one.
 --   * an array that is not a list: more than one dimension, or a lower bound

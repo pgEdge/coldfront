@@ -3,8 +3,11 @@
 -- are, and a cold interval is stored as ISO 8601 text. A tiered INSERT carries
 -- a timestamp, an interval and a double to the cold tier through the stream
 -- (its parameters, then its columns), through the sink, and a cold UPDATE
--- carries them as its parameters. Observed end to end: a DuckDB temporary
--- table stands in for the Iceberg table and is read back with duckdb.query.
+-- carries them as its parameters. A column the INSERT omits takes its date
+-- default, which the stream sends as text too, and a cold UPDATE's interval
+-- literal with mixed signs reaches DuckDB in the one spelling it reads.
+-- Observed end to end: a DuckDB temporary table stands in for the Iceberg
+-- table and is read back with duckdb.query.
 SET client_min_messages = warning;
 CREATE EXTENSION IF NOT EXISTS pg_duckdb;
 CREATE EXTENSION IF NOT EXISTS coldfront;
@@ -17,10 +20,10 @@ SELECT set_config('coldfront.local_pg_dsn',
                   format('host=%s dbname=%s user=%s',
                          trim(split_part(current_setting('unix_socket_directories'), ',', 1)),
                          current_database(), current_user), false) <> '' AS dsn_set;
-SELECT duckdb.raw_query('CREATE TEMP TABLE cf_canon (id BIGINT, ts TIMESTAMPTZ, iv VARCHAR, x DOUBLE)') IS NOT NULL AS created;
+SELECT duckdb.raw_query('CREATE TEMP TABLE cf_canon (id BIGINT, ts TIMESTAMPTZ, iv VARCHAR, x DOUBLE, d DATE)') IS NOT NULL AS created;
 
 CREATE TABLE public._cf_canon (id bigint GENERATED ALWAYS AS IDENTITY, ts timestamptz NOT NULL,
-                               iv interval, x double precision);
+                               iv interval, x double precision, d date DEFAULT '2026-01-02');
 CREATE VIEW public.cf_canon AS SELECT * FROM public._cf_canon;
 INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
 VALUES ('public', 'cf_canon', 'public._cf_canon', 'temp.main.cf_canon', 'ts');
@@ -31,7 +34,8 @@ INSERT INTO public.cf_canon_src VALUES
     ('cold', '2026-03-01 08:00:00+00', '-1 days -02:03:04', 0.1::float8 + 0.2::float8),
     ('hot',  '2026-04-01 08:00:00+00', '1 year 2 mons -3 days 04:05:06.5', 1e-7);
 CREATE VIEW public.cf_canon_cold AS
-    SELECT r['ts']::timestamptz AS ts, r['iv']::text AS iv, r['x']::float8 AS x
+    SELECT r['ts']::timestamptz AS ts, r['iv']::text AS iv, r['x']::float8 AS x,
+           r['d']::date AS d
       FROM duckdb.query('SELECT * FROM temp.main.cf_canon') AS t(r);
 
 -- The caller's settings: day-first dates, SQL-standard intervals, and floats
@@ -60,8 +64,9 @@ INSERT INTO public.cf_canon (ts, iv, x) SELECT ts, iv, x FROM public.cf_canon_sr
 CREATE TEMP TABLE cf_canon_got AS SELECT * FROM public.cf_canon_cold;
 SELECT ts = '2026-03-01 08:00:00+00'::timestamptz AS ts_kept, iv,
        iv::interval = interval '-1 days -02:03:04' AS iv_kept,
-       x = 0.1::float8 + 0.2::float8 AS x_kept
-  FROM cf_canon_got ORDER BY 1, 2, 3, 4;
+       x = 0.1::float8 + 0.2::float8 AS x_kept,
+       d = '2026-01-02'::date AS d_kept
+  FROM cf_canon_got ORDER BY 1, 2, 3, 4, 5;
 SELECT count(*) AS hot_rows FROM public._cf_canon;
 
 -- (4) A cold UPDATE's parameters: the interval it sets and the timestamp it
@@ -69,6 +74,16 @@ SELECT count(*) AS hot_rows FROM public._cf_canon;
 PREPARE cf_canon_upd(interval, timestamptz) AS UPDATE public.cf_canon SET iv = $1 WHERE ts = $2;
 EXECUTE cf_canon_upd('1 year 2 mons -3 days 04:05:06.5', '2026-03-01 08:00:00+00');
 SELECT iv, count(*) FROM public.cf_canon_cold GROUP BY iv ORDER BY iv;
+
+-- (5) A cold UPDATE's interval literal with mixed signs, in its predicate. The
+--     bound is 2026-02-17; a reading that negates every field gives 2026-02-13,
+--     so a row dated between the two tells the readings apart.
+INSERT INTO public.cf_canon (ts, iv, x) VALUES ('2026-02-15 08:00:00+00', '1 day', 0);
+UPDATE public.cf_canon SET x = 42
+ WHERE ts < '2026-03-15 00:00:00+00'::timestamptz
+   AND ts > '2026-03-15 00:00:00+00'::timestamptz + interval '-1 month +2 days';
+SELECT count(*) FILTER (WHERE x = 42) AS rows_matched, count(*) AS cold_rows
+  FROM public.cf_canon_cold;
 
 RESET DateStyle;
 RESET IntervalStyle;

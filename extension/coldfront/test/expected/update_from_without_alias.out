@@ -69,10 +69,10 @@ BOOLEAN
 [ Rows: 0]
 
 
-                                                                                                                        QUERY PLAN                                                                                                                        
-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                     QUERY PLAN                                                                                                                     
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
-   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events events SET status = s.status    FROM pglocal.public.src s   WHERE ((events.id = s.id) AND (events.ts < ''Thu Jan 01 00:00:00 2026 UTC''::timestamptz))'::text)
+   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events events SET status = s.status    FROM pglocal.public.src s   WHERE ((events.id = s.id) AND (events.ts < ''2026-01-01 00:00:00+00''::timestamptz))'::text)
 (2 rows)
 
 EXPLAIN (COSTS OFF, VERBOSE)
@@ -88,10 +88,10 @@ BOOLEAN
 [ Rows: 0]
 
 
-                                                                                                                QUERY PLAN                                                                                                                
-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                             QUERY PLAN                                                                                                             
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
-   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'DELETE FROM ice.default.events events    USING pglocal.public.src s   WHERE ((events.id = s.id) AND (events.ts < ''Thu Jan 01 00:00:00 2026 UTC''::timestamptz))'::text)
+   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'DELETE FROM ice.default.events events    USING pglocal.public.src s   WHERE ((events.id = s.id) AND (events.ts < ''2026-01-01 00:00:00+00''::timestamptz))'::text)
 (2 rows)
 
 -- Cleanup.
