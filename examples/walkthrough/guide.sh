@@ -1177,7 +1177,7 @@ demo_decoupled() {
     explain "no data to replicate. ColdFront serializes their writes so they never collide"
     explain "(a Spock-replicated, TLA+-verified protocol)."
     explain "  ${DIM}Seeing that live (write on node A, read on node B, concurrent writes with no${RESET}"
-    explain "  ${DIM}conflicts) is its own story: the Distributed walkthrough (coming as #4).${RESET}"
+    explain "  ${DIM}conflicts) is its own story: the Distributed walkthrough (demo 4).${RESET}"
     echo ""
 
     # Exit cleanup is interactive-only: CI / NONINTERACTIVE runs assert on the
