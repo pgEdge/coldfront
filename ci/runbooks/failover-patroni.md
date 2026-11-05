@@ -8,8 +8,9 @@ verifies only that a **physical standby serves reads correctly**
 the journey). What happens *after* Patroni promotes a replica is a Patroni
 concern, and no promotion tests are built.
 
-This runbook records the one requirement ColdFront places on the HA layer, and
-two limitations operators must account for.
+This runbook records the one requirement ColdFront places on the HA layer, the
+step a promoted node needs with static credentials, and two limitations
+operators must account for.
 
 ## The one requirement: coldfront GUCs in `postgresql.conf`, not `ALTER SYSTEM`
 
@@ -24,18 +25,25 @@ backup and a promotion:
   (`postgresql.auto.conf` also rides a base backup) but splitting config across
   two files is how nodes drift.
 - **The cold-tier S3 secret** is a row in the `coldfront.storage_secret` table
-  (set once via `coldfront.set_storage_secret`). It lives in the catalog, so it
-  is **physically replicated** to every standby and present immediately on
-  promotion — no re-creation step. (On promotion, DuckDB re-materializes its
-  persistent secret from this row at instance init.)
+  (set once via `coldfront.set_storage_secret`). The row lives in the catalog,
+  so it is **physically replicated** to every standby. With static credentials,
+  DuckDB takes the credential from its persistent secret, not from the row. The
+  persistent secret is a file under the OS user's home directory outside
+  PGDATA, and DuckDB loads it when a session starts its DuckDB instance. Only
+  `coldfront.materialize_storage_secret()` and the row's `INSERT`/`UPDATE`
+  trigger write that file, on the node where they run, so neither physical
+  replication nor promotion writes it.
 - **The coldfront catalog** (`coldfront.tiered_views`,
   `coldfront.archive_watermark`, `coldfront.storage_secret`) is ordinary table
   data → physically replicated, byte-identical (same OIDs) on every replica.
 
-A consequence (documented, not tested): a **vanilla** promotion "just works."
-The secret rides physical replication, and vanilla cold writes serialise on a
-node-local advisory lock, so a freshly promoted single node needs no
-coordination state to begin accepting writes.
+A consequence (documented, not tested): with static credentials, a **vanilla**
+promotion needs the secret file on the new primary. Run
+`SELECT coldfront.materialize_storage_secret();` there, then reconnect each
+session opened before the call. DuckDB reads the file only when a session
+starts its DuckDB instance. Vanilla cold writes serialise on a node-local
+advisory lock, so a freshly promoted single node needs no coordination state to
+begin accepting writes.
 
 ## Limitation 1 — Iceberg reads on a replica are snapshot-consistent, not linearizable
 

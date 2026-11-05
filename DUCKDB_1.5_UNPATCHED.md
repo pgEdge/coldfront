@@ -1,8 +1,9 @@
-# DUCKDB_1.5_UNPATCHED — stock duckdb-iceberg 1.5.x (no ColdFront patches)
+# DUCKDB_1.5_UNPATCHED: stock duckdb-iceberg 1.5.x (no ColdFront duckdb-iceberg patches)
 
-How to build and run the DuckDB 1.5.x base **without** ColdFront's patches, and
-the four consequences of doing so. The patched base is the default and the full
-build story is [DUCKDB_1.5_PATCHED.md](DUCKDB_1.5_PATCHED.md).
+How to build and run the DuckDB 1.5.x base **without** ColdFront's
+duckdb-iceberg patches, and the six consequences of doing so. The patched base
+is the default and the full build story is
+[DUCKDB_1.5_PATCHED.md](DUCKDB_1.5_PATCHED.md).
 
 ## What "unpatched 1.5" is
 

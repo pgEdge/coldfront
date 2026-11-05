@@ -82,6 +82,12 @@ package's purpose and its name on RHEL-family and Debian-family systems:
 | ColdFront command-line tools (archiver, partitioner, compactor) | `pgedge-coldfront` | `pgedge-coldfront` |
 | Lakekeeper | `pgedge-lakekeeper` | `pgedge-lakekeeper` |
 
+The pg_duckdb packages and ColdFront's DuckDB extensions package are patched
+builds, not the upstream releases. Together they include ColdFront's patches to
+duckdb-iceberg, to pg_duckdb, and to DuckDB itself.
+[Preparing the DuckDB Base Image](#preparing-the-duckdb-base-image) describes
+each patch and why ColdFront applies it.
+
 For PostgreSQL 18 on RHEL, Rocky Linux, or AlmaLinux:
 
 ```bash
@@ -121,6 +127,11 @@ patches:
 - a port of an upstream fix that makes a failed manifest read fail the query
   instead of aborting the backend.
 
+ColdFront also patches pg_duckdb and the DuckDB that pg_duckdb compiles, to
+close two security vulnerabilities. [Patching pg_duckdb](#patching-pg_duckdb)
+and [Patching DuckDB](#patching-duckdb) explain each patch and the
+vulnerability it closes.
+
 No released pg_duckdb tag includes DuckDB 1.5.x yet, so the stack is built
 from a pinned upstream PR plus ColdFront's patches - all from sources you
 can fetch.
@@ -146,7 +157,7 @@ table shows each component and its source:
 | Component | Source |
 |---|---|
 | libcurl 8.12.0 | The recipe builds libcurl from source from `curl.se`, because DuckDB 1.5.4 httpfs needs curl 7.77 or later at compile time and the pgEdge base ships 7.76.1. |
-| pg_duckdb (DuckDB 1.5.4) | `github.com/duckdb/pg_duckdb`, PR #1025, with ColdFront's `EXTRACT` field-quoting patch applied |
+| pg_duckdb (DuckDB 1.5.4) | `github.com/duckdb/pg_duckdb`, PR #1025, with ColdFront's `EXTRACT` field-quoting patch applied, and with ColdFront's brotli patch applied to the DuckDB it compiles |
 | duckdb-iceberg | `github.com/duckdb/duckdb-iceberg`, `v1.5-variegata` @ `5edc45f0` |
 | DuckDB 1.5.4 | `github.com/duckdb/duckdb`, tag `v1.5.4`, which replaces duckdb-iceberg's own DuckDB submodule |
 | duckdb-avro, duckdb-azure, duckdb-postgres | `github.com/duckdb/duckdb-avro` @ `7f423d69`, `github.com/duckdb/duckdb-azure` @ `563589b2`, and `github.com/duckdb/duckdb-postgres` @ `4053b617`, pinned in `docker/iceberg-azure-extension-config-v15.cmake` |
@@ -162,6 +173,8 @@ postgres_scanner extensions under vcpkg; the third assembles the runtime. The
 build `git apply --check`s each patch before applying it, so it fails loudly on
 patch rot rather than silently shipping stock iceberg (which fails with HTTP
 409 under concurrency and writes manifests strict Apache readers reject).
+
+#### Patching duckdb-iceberg
 
 ColdFront applies seven patches to duckdb-iceberg. The following table
 describes what each one does:
@@ -189,6 +202,8 @@ canonical recipe - every source pin and compile step - is
 [`docker/Dockerfile.duckdb15-base`](https://github.com/pgEdge/ColdFront/blob/main/docker/Dockerfile.duckdb15-base)
 itself.
 
+#### Patching pg_duckdb
+
 ColdFront applies one patch to pg_duckdb, `pg_duckdb-extract-field-quoting`.
 pg_duckdb turns the query it runs on DuckDB into SQL text with its vendored
 copies of PostgreSQL's `ruleutils.c`, and those copies write the field name of
@@ -199,13 +214,17 @@ PostgreSQL's own `ruleutils.c` does since its fix for CVE-2026-15741; a valid
 field such as `year` stays bare, and any other string is refused as a unit. The
 pg_duckdb packages built from `packaging/pg_duckdb` apply the same patch.
 
-ColdFront also applies one patch to DuckDB itself.
-`duckdb-brotli-block-switch-v15` ports brotli 1.1.1's decoder fix for
-CVE-2026-111497 into the brotli 1.1.0 that DuckDB 1.5.4 includes, which
-DuckDB's Parquet reader runs on every Brotli-compressed page. With it, a
-crafted Parquet file is refused instead of driving the decoder out of bounds
-inside a PostgreSQL backend. The pg_duckdb RPM and Debian packages are built
-with the same patch.
+#### Patching DuckDB
+
+ColdFront patches DuckDB because no DuckDB release up to and including 2.0.0
+fixes CVE-2026-111497. The vulnerability is an out-of-bounds write in the
+decoder of brotli 1.1.0, which DuckDB 1.5.4 includes. DuckDB's Parquet reader
+decodes every Brotli-compressed page with that decoder. A crafted Parquet file
+read through DuckDB can therefore trigger the out-of-bounds write inside a
+PostgreSQL backend. The `duckdb-brotli-block-switch-v15` patch ports brotli
+1.1.1's fix into the copy of DuckDB 1.5.4 that pg_duckdb compiles. The patched
+decoder refuses the crafted stream. The pg_duckdb RPM and Debian packages apply
+the same patch.
 
 ## Building the Image on Docker
 
@@ -362,8 +381,9 @@ sudo make install PG_CONFIG="$(command -v pg_config)"
 You separately need pg_duckdb (DuckDB 1.5.4) and the **patched** iceberg DuckDB
 extension installed in your PostgreSQL. Follow the compile steps in
 [`docker/Dockerfile.duckdb15-base`](https://github.com/pgEdge/ColdFront/blob/main/docker/Dockerfile.duckdb15-base),
-including the brotli patch it applies to pg_duckdb's DuckDB before compiling,
-and copy the built iceberg, avro, azure, and postgres_scanner extensions into
+including the brotli patch it applies to pg_duckdb's DuckDB before compiling
+(see [Patching DuckDB](#patching-duckdb)), and copy the built iceberg, avro,
+azure, and postgres_scanner extensions into
 `$PGDATA/pg_duckdb/extensions/v1.5.4/linux_<arch>/`, as
 [`docker/entrypoint.sh`](https://github.com/pgEdge/ColdFront/blob/main/docker/entrypoint.sh)
 does. Then set the following in `postgresql.conf`:

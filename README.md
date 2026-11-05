@@ -380,8 +380,9 @@ When the extensions are created, continue with
 ### Installing and Configuring ColdFront on Bare Metal
 
 Before building ColdFront on bare metal, install the pg_duckdb PostgreSQL
-extension (built on DuckDB 1.5.4) and a patched duckdb-iceberg DuckDB
-extension. For the prerequisites and the patches, see
+extension (built on DuckDB 1.5.4, with ColdFront's pg_duckdb and DuckDB patches
+applied) and a patched duckdb-iceberg DuckDB extension. For the prerequisites
+and the patches, see
 [Building ColdFront from Source](docs/installation.md#building-coldfront-from-source).
 You also need a running PostgreSQL 16, 17, or 18 server, `pg_config`, the
 PostgreSQL server development headers, the libpq headers and library, `make`,
@@ -727,7 +728,7 @@ The following table lists the services and components ColdFront runs against:
 | Component | Version | Purpose |
 |-----------|---------|---------|
 | PostgreSQL | 16, 17, or 18 | Provides the database with native partitioning; stock PostgreSQL serves a single node, and the Docker image and distributed mode use pgEdge's PostgreSQL build with Spock. |
-| pg_duckdb | commit c04e6a2 (PR #1025), on DuckDB 1.5.4, patched | Runs Iceberg reads and writes through in-process DuckDB, with ColdFront's `EXTRACT` field-quoting patch applied, and ColdFront's brotli decoder fix for CVE-2026-111497 applied to its DuckDB (see [docker/Dockerfile.duckdb15-base](docker/Dockerfile.duckdb15-base)). |
+| pg_duckdb | commit c04e6a2 (PR #1025), on DuckDB 1.5.4, patched | Runs Iceberg reads and writes through in-process DuckDB, with ColdFront's `EXTRACT` field-quoting patch applied. ColdFront also applies brotli's fix for CVE-2026-111497 to the DuckDB that pg_duckdb compiles, because no DuckDB release up to and including 2.0.0 has that fix (see [Patching DuckDB](docs/installation.md#patching-duckdb)). |
 | duckdb-iceberg | `v1.5-variegata` @ `5edc45f0`, patched | Provides Iceberg catalog and I/O for DuckDB, with ColdFront's seven patches applied (see [docker/Dockerfile.duckdb15-base](docker/Dockerfile.duckdb15-base)). |
 | Lakekeeper | latest | Provides the Iceberg REST catalog (a Rust binary). |
 | S3-compatible store | any | Stores the cold data; SeaweedFS, MinIO, AWS S3, and GCS all work. |
@@ -790,8 +791,9 @@ pgedge-coldfront/
 ├── docker/
 │   ├── Dockerfile.duckdb15-base ← DuckDB 1.5.x base (pg_duckdb on DuckDB 1.5.4 + patched iceberg)
 │   ├── Dockerfile.duckdb15      ← thin coldfront app layer (ARG PG_MAJOR=16|17|18)
-│   ├── iceberg-*.patch          ← duckdb-iceberg patches (bakery commit-refresh + strict-reader interop)
-│   ├── duckdb-*.patch           ← DuckDB patch (the brotli decoder fix)
+│   ├── iceberg-*.patch          ← duckdb-iceberg patches (bakery commit-refresh, strict-reader interop, bug fixes)
+│   ├── pg_duckdb-*.patch        ← pg_duckdb patch (EXTRACT field-name quoting)
+│   ├── duckdb-*.patch           ← DuckDB patch (brotli decoder fix for CVE-2026-111497)
 │   ├── iceberg-azure-extension-config-v15.cmake ← Azure ADLS extension build config
 │   ├── entrypoint.sh
 │   └── seaweedfs-s3.json        ← SeaweedFS S3 auth config (example)

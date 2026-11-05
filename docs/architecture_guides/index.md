@@ -61,6 +61,10 @@ and exercised in the journey by `story_standby_reads` (the `·standby` matrix
 cells). Failover/promotion is delegated to Patroni and is out of scope for the
 test matrix - see
 [ci/runbooks/failover-patroni.md](https://github.com/pgEdge/ColdFront/blob/main/ci/runbooks/failover-patroni.md).
+With static credentials, run `SELECT coldfront.materialize_storage_secret();`
+on the new primary after a promotion, then reconnect each session opened before
+the call. Neither physical replication nor promotion writes the DuckDB secret
+file.
 
 ## System Overview
 
@@ -97,7 +101,7 @@ The following table describes each component, its role, and its license:
 | Component | Role | License |
 |-----------|------|---------|
 | PostgreSQL 16+ | Provides heap storage and range partitioning for the tiered hot tier. ColdFront works uniformly on PG 16, 17, and 18, because the cold-tier secret is a DuckDB persistent secret loaded at instance init, with no version-gated mechanism. | PostgreSQL |
-| pg_duckdb | Runs DuckDB in-process for Iceberg reads, writes, and analytics; the build is pg_duckdb at commit c04e6a2 (PR #1025) on DuckDB 1.5.4. The bundled `duckdb-iceberg` includes the bakery-aware commit-refresh patch (async parquet overlap, no 409); see [Cold-Write Strategy](#cold-write-strategy-stock-vs-patched-duckdb-iceberg). | MIT |
+| pg_duckdb | Runs DuckDB in-process for Iceberg reads, writes, and analytics; the build is pg_duckdb at commit c04e6a2 (PR #1025) on DuckDB 1.5.4. The bundled `duckdb-iceberg` includes the bakery-aware commit-refresh patch (async parquet overlap, no 409); see [Cold-Write Strategy](#cold-write-strategy-stock-vs-patched-duckdb-iceberg). ColdFront also applies brotli's fix for CVE-2026-111497 to the DuckDB that pg_duckdb compiles, because no DuckDB release up to and including 2.0.0 has that fix; see [Patching DuckDB](../installation.md#patching-duckdb). | MIT |
 | coldfront | This PGXS C extension's `post_parse_analyze_hook` rewrites INSERT/UPDATE/DELETE/MERGE on registered views to the correct tier and, on a SELECT DuckDB will run, the spellings DuckDB lacks (`date_bin`, `::jsonb`, the JSON builders, the JSON operators); `planner_hook` folds bound parameters into such a read; `ProcessUtility_hook` handles DDL; the hook lazily ATTACHes the Iceberg catalog on the first query touching a tiered view. | PostgreSQL |
 | Lakekeeper | Provides the Iceberg REST catalog as a single Rust binary. | Apache 2.0 |
 | S3-compatible store or Azure ADLS Gen2 | Stores the cold data; any S3-compatible store works, including SeaweedFS, MinIO, AWS S3, and GCS, and Azure ADLS Gen2 works through `set_storage_secret_azure`. | Varies |

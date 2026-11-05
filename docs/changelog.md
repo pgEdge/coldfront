@@ -166,6 +166,17 @@ this project adheres to
 
 ### Fixed
 
+- A crafted `EXTRACT` field name in a query that runs on DuckDB no longer
+  reaches DuckDB as SQL. The base image and the pg_duckdb packages apply
+  ColdFront's `pg_duckdb-extract-field-quoting` patch, which quotes the field
+  name as PostgreSQL's fix for CVE-2026-15741 does.
+- A crafted Parquet file read through DuckDB can no longer trigger an
+  out-of-bounds write in DuckDB's brotli decoder (CVE-2026-111497) inside the
+  PostgreSQL backend. DuckDB 1.5.4 includes brotli 1.1.0, whose decoder
+  DuckDB's Parquet reader runs on every Brotli-compressed page. No DuckDB
+  release up to and including 2.0.0 has the fix, so ColdFront patches DuckDB
+  itself. The base image and the pg_duckdb packages apply the
+  `duckdb-brotli-block-switch-v15` patch, a port of brotli 1.1.1's fix.
 - A read of an Iceberg table under vended credentials could abort the server
   process, and with it every other session until the server had recovered. The
   duckdb-iceberg build re-created a table's vended secret on every bind in a
@@ -433,16 +444,6 @@ this project adheres to
   ColdFront does not manage: the hooks read the registry as that role, and the
   statement failed with `permission denied for schema coldfront`. The hooks
   now read it as the extension's owner.
-- A crafted `EXTRACT` field name in a query that runs on DuckDB no longer
-  reaches DuckDB as SQL. The base image and the pg_duckdb packages apply
-  ColdFront's `pg_duckdb-extract-field-quoting` patch, which quotes the field
-  name as PostgreSQL's fix for CVE-2026-15741 does.
-- DuckDB 1.5.4 includes brotli 1.1.0, whose decoder has an out-of-bounds write
-  on a crafted stream (CVE-2026-111497), and DuckDB's Parquet reader runs that
-  decoder on every Brotli-compressed page, so a crafted Parquet file read
-  through DuckDB reached it inside the PostgreSQL backend. The base image and
-  the pg_duckdb packages build DuckDB with brotli 1.1.1's fix, which refuses the
-  stream.
 - A decoupled `INSERT ... SELECT`, a cold `UPDATE ... FROM` and a cold
   `DELETE ... USING` read a `numeric` `NaN` in their PostgreSQL table as `0`,
   with no error, so the write stored `0` or matched rows against `0`. Such a
