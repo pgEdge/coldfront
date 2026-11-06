@@ -72,8 +72,8 @@ Because the script leaves an existing file alone, run
 `coldfront.storage_secret` row changes on the primary; for a switch to vended
 credentials, the function also removes the old file. A session reads the
 secret file when its first DuckDB query starts its DuckDB instance, so a
-session whose instance started before the file was written cannot read cold
-data until it reconnects.
+session whose instance started before the file was written or replaced keeps
+the credential it loaded, or none, until it reconnects.
 
 ## Limitation 1 — Iceberg reads on a replica are snapshot-consistent, not linearizable
 

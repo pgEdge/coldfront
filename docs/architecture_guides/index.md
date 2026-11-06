@@ -51,11 +51,14 @@ home directory, outside PGDATA. At each start, the ColdFront image runs
 `coldfront-materialize-secret.sh`, which writes that file from the replicated
 `storage_secret` row when the file is absent. On a replica that the image does
 not start, run the same script once; the Patroni runbook runs it as a callback.
-After the row changes on the primary, run
-`SELECT coldfront.materialize_storage_secret()` on each replica. A session
+Replaying a change to the row does not write the file on a replica. When the
+secret is first set or later changed on the primary, a replica that is already
+running has no file or an outdated one, and keeps it through a promotion, until
+you run `SELECT coldfront.materialize_storage_secret()` on that replica. A
+session
 reads the secret file when its first DuckDB query starts its DuckDB instance,
-so a session whose instance started before the file was written cannot read
-cold data until it reconnects. Cold
+so a session whose instance started before the file was written or replaced
+keeps the credential it loaded, or none, until it reconnects. Cold
 **writes** are refused on a standby: every cold write path in
 the hook calls `coldfront._reject_on_standby`, which raises when
 `pg_is_in_recovery()`, before it takes the claim, so a read replica can never
