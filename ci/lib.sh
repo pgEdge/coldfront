@@ -86,6 +86,22 @@ standby_up() {
     return 1
 }
 
+# boot_secret_wait <container>: wait up to 30 s for the entrypoint's boot step
+# to log that it wrote the DuckDB storage secret on <container>. The log spans
+# restarts, and a line from an earlier boot still means the file is there,
+# because a restart keeps the container's writable layer. A session reads the
+# secret directory once, when its first DuckDB query starts its DuckDB
+# instance, so a session whose instance started before the write never loads
+# the secret.
+boot_secret_wait() {
+    local _
+    for _ in $(seq 1 30); do
+        docker logs "$1" 2>&1 | grep -F 'coldfront: wrote the DuckDB storage secret' >/dev/null && return 0
+        sleep 1
+    done
+    return 1
+}
+
 # The single read-only-replica container name — shared by the probe and both topo
 # scripts (they never run concurrently, so one name is safe and avoids divergence).
 CF_STANDBY="${CF_STANDBY:-coldfront-standby}"

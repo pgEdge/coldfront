@@ -16,6 +16,9 @@ services:
       MESH: "off"
       COLDFRONT_WAREHOUSE: wh-azure
       COLDFRONT_LAKEKEEPER: http://lakekeeper:8181/catalog
+    # A named volume, so a recreated db keeps its data directory (journey TC-277).
+    volumes:
+      - pgdata:/var/lib/pgsql/${PG_MAJOR:-18}/data
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U coldfront"]
       interval: 3s
@@ -62,3 +65,6 @@ services:
       timeout: 5s
       retries: 20
       start_period: 30s
+
+volumes:
+  pgdata:

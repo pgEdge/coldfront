@@ -47,7 +47,8 @@ USER root
 COPY --from=cf-build /out/usr/pgsql-${PG_MAJOR}/lib/             /usr/pgsql-${PG_MAJOR}/lib/
 COPY --from=cf-build /out/usr/pgsql-${PG_MAJOR}/share/extension/ /usr/pgsql-${PG_MAJOR}/share/extension/
 COPY docker/entrypoint.sh /usr/local/bin/coldfront-entrypoint.sh
-RUN chmod +x /usr/local/bin/coldfront-entrypoint.sh
+COPY docker/coldfront-materialize-secret.sh /usr/local/bin/coldfront-materialize-secret.sh
+RUN chmod +x /usr/local/bin/coldfront-entrypoint.sh /usr/local/bin/coldfront-materialize-secret.sh
 # pgvector, from the same pgEdge repo the base is built from. A tiered vector
 # table has the type on its hot side, and both the cold read and cold write
 # paths rely on pgvector's implicit vector -> real[] cast. It sits in the app

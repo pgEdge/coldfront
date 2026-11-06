@@ -45,10 +45,21 @@ read-only cross-tier reads**. The hot tier arrives by physical replication; the
 cold tier is read by DuckDB executing on the read-only backend. A base
 backup contains the coldfront catalog (`tiered_views`, `archive_watermark`,
 `storage_secret`) and the GUCs (in `postgresql.conf`, not `ALTER SYSTEM`), so a
-replica is byte-identical to its primary (same OIDs). The DuckDB persistent
-secret file sits under the OS user's home directory, outside PGDATA, so with
-static credentials run `SELECT coldfront.materialize_storage_secret()` once on
-the replica. Cold **writes** are refused on a standby: every cold write path in
+replica is byte-identical to its primary (same OIDs). With static credentials,
+DuckDB reads the credential from a persistent secret file under the OS user's
+home directory, outside PGDATA. At each start, the ColdFront image runs
+`coldfront-materialize-secret.sh`, which writes that file from the replicated
+`storage_secret` row when the file is absent. On a replica that the image does
+not start, run the same script once; the Patroni runbook runs it as a callback.
+Replaying a change to the row does not write the file on a replica. When the
+secret is first set or later changed on the primary, a replica that is already
+running has no file or an outdated one, and keeps it through a promotion, until
+you run `SELECT coldfront.materialize_storage_secret()` on that replica. A
+session
+reads the secret file when its first DuckDB query starts its DuckDB instance,
+so a session whose instance started before the file was written or replaced
+keeps the credential it loaded, or none, until it reconnects. Cold
+**writes** are refused on a standby: every cold write path in
 the hook calls `coldfront._reject_on_standby`, which raises when
 `pg_is_in_recovery()`, before it takes the claim, so a read replica can never
 become an uncoordinated writer to the shared Iceberg table (hot writes hit a PG
@@ -61,10 +72,8 @@ and exercised in the journey by `story_standby_reads` (the `·standby` matrix
 cells). Failover/promotion is delegated to Patroni and is out of scope for the
 test matrix - see
 [ci/runbooks/failover-patroni.md](https://github.com/pgEdge/ColdFront/blob/main/ci/runbooks/failover-patroni.md).
-With static credentials, run `SELECT coldfront.materialize_storage_secret();`
-on the new primary after a promotion, then reconnect each session opened before
-the call. Neither physical replication nor promotion writes the DuckDB secret
-file.
+A promotion keeps the replica's DuckDB secret file, so a replica that already
+has the file needs no step when Patroni promotes it.
 
 ## System Overview
 

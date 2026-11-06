@@ -6,6 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and
 this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- With static credentials, a ColdFront container recreated on its data volume
+  and a new standby could not read cold data until someone ran
+  `coldfront.materialize_storage_secret()` on them, because DuckDB keeps the
+  secret file outside PGDATA. The image now runs
+  `coldfront-materialize-secret.sh` at every start, which writes the file when
+  it is absent. On a node that Patroni starts, the Patroni runbook runs the
+  same script as a callback.
+
 ## [1.0.0-beta3] - 2026-11-04
 
 ### Added
