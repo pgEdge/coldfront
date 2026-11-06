@@ -6,19 +6,7 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and
 this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
-
-### Fixed
-
-- With static credentials, a ColdFront container recreated on its data volume
-  and a new standby could not read cold data until someone ran
-  `coldfront.materialize_storage_secret()` on them, because DuckDB keeps the
-  secret file outside PGDATA. The image now runs
-  `coldfront-materialize-secret.sh` at every start, which writes the file when
-  it is absent. On a node that Patroni starts, the Patroni runbook runs the
-  same script as a callback.
-
-## [1.0.0-beta3] - 2026-11-04
+## [1.0.0-beta3] - 2026-11-06
 
 ### Added
 
@@ -471,6 +459,13 @@ this project adheres to
   intervals whatever the session's settings. In them, an interval literal with
   mixed signs, such as `interval '-1 month +2 days'`, failed under every style
   but the verbose one and now works under all of them.
+- With static credentials, a ColdFront container recreated on its data volume
+  and a new standby could not read cold data until someone ran
+  `coldfront.materialize_storage_secret()` on them, because DuckDB keeps the
+  secret file outside PGDATA. The image now runs
+  `coldfront-materialize-secret.sh` at every start, which writes the file when
+  it is absent. On a node that Patroni starts, the Patroni runbook runs the
+  same script as a callback.
 
 ## [1.0.0-beta2] - 2026-08-08
 
