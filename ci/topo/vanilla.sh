@@ -83,7 +83,7 @@ fi
 cd "$ROOT"
 export PG_MAJOR="$PG"           # consumed by docker-compose.matrix.yml build arg + entrypoint
 require_base "$PG" || exit 1    # exports COLDFRONT_BASE for the same build
-COMPOSE="docker compose -f $COMPOSE_FILE"
+export COMPOSE="docker compose -f $COMPOSE_FILE"   # journey TC-277 recreates db with it
 DB=coldfront-db-1
 
 # A cloud lane with a federated identity: Lakekeeper's identity goes in an

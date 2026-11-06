@@ -4527,11 +4527,17 @@ story_standby_reads() {
     assert_eq "registered view OID identical (physical replication)" \
         "$(q "$HOST" "SELECT '$vn'::regclass::oid;")" "$(q "$STANDBY" "SELECT '$vn'::regclass::oid;")"
 
-    # The persistent-secret FILE lives outside PGDATA, so it does not ride the
-    # base backup — materialize it on the replica from the (physically
-    # replicated) storage_secret row. SELECT + a DuckDB file write, no PG write,
-    # so it's allowed on a read-only standby.
-    q "$STANDBY" "SELECT coldfront.materialize_storage_secret();" >/dev/null 2>&1
+    # The DuckDB secret file lives outside PGDATA, and WAL replay fires no
+    # trigger. The vanilla topology base-backs this standby before story 1 sets
+    # the secret, so its first boot found no row; a restart runs the
+    # entrypoint's boot step again, which writes the file from the replicated
+    # storage_secret row on the read-only standby. The mesh topology sets the
+    # secret first, so there the first boot already wrote it.
+    if ! vended_creds; then
+        docker restart "$STANDBY" >/dev/null
+        if boot_secret_wait "$STANDBY"; then pass "standby boot step wrote the DuckDB storage secret"
+        else fail "standby boot step did not write the DuckDB storage secret"; fi
+    fi
 
     # Reads MATCH the primary across tiers. The extension hook attaches 'ice'
     # lazily on the first tiered-view query in this read-only session;
@@ -6277,6 +6283,38 @@ story_pg_restart() {
         "$(q "$HOST" "SELECT count(*) FROM coldfront.storage_secret;")"
     local after; after=$(q "$HOST" "SELECT count(*) FROM events WHERE ts >= date_trunc('month',now()) - interval '3 months' AND ts < date_trunc('month',now()) - interval '1 month';")
     assert_eq "TC-063: cold row count unchanged after PG restart" "$before" "$after"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story TC-277: the db container is recreated on its data volume, as an image
+# upgrade or `compose up -d` after a config change does. DuckDB keeps a static
+# credential's persistent secret under $HOME, in the container's writable layer,
+# so the new container starts without it and the entrypoint's boot step writes
+# it from the storage_secret row. Runs last: the new container can come back on
+# another IP.
+# ───────────────────────────────────────────────────────────────────────────
+story_pg_recreate() {
+    step "TC-277: container recreated on its data volume; the boot step writes the DuckDB secret; cold reads work"
+    if [ "$MESH" = 1 ]; then note "TC-277: skipping in mesh mode (the mesh compose keeps no data volume)"; return; fi
+    [ -n "${COMPOSE:-}" ] || { fail "TC-277: the topology did not export COMPOSE"; return; }
+    local vn cold before i=0
+    [ "$MODE" = tiered ] && vn="public.events" || vn="public.iceonly"
+    cold="SELECT count(*) FROM $vn WHERE ts < date_trunc('month',now()) - interval '1 month';"
+    before=$(q "$HOST" "$cold")
+    assert_gt "TC-277: cold rows present before the recreation" "0" "$before"
+    # The boot step looks for the file in DuckDB's default secret directory.
+    assert_eq "TC-277: DuckDB keeps persistent secrets in \$HOME/.duckdb/stored_secrets" \
+        "$(docker exec "$HOST" sh -c 'echo "$HOME/.duckdb/stored_secrets"')" \
+        "$(q "$HOST" "SELECT r['d'] FROM duckdb.query('SELECT current_setting(''secret_directory'') AS d') AS t(r);")"
+    $COMPOSE up -d --force-recreate --no-deps db >/dev/null 2>&1
+    until q "$HOST" "SELECT 1" >/dev/null 2>&1; do
+        i=$((i + 1)); [ "$i" -gt 60 ] && { fail "TC-277: postgres did not come back after the recreation"; return; }; sleep 1
+    done
+    if ! vended_creds; then
+        if boot_secret_wait "$HOST"; then pass "TC-277: boot step wrote the DuckDB storage secret"
+        else fail "TC-277: boot step did not write the DuckDB storage secret"; fi
+    fi
+    assert_eq "TC-277: cold row count unchanged after the recreation" "$before" "$(q "$HOST" "$cold")"
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -8378,5 +8416,6 @@ story_drop_iceberg_table   # both modes, purge and keep-files (own throwaway tab
 [ "$MESH" = 1 ] && story_mesh_claim_failures  # a failed claim step leaves no lock, claim or open loopback
 [ "$MESH" = 1 ] && story_mesh_dead_peer  # TC-221..223: a wal_sender_timeout the window does not cover is refused, idle replies inside the window, a silent peer ruled dead and rejoining
 [ -n "$STANDBY" ]    && story_standby_reads
+story_pg_recreate          # TC-277: last, the recreated db can come back on another IP
 
 summary

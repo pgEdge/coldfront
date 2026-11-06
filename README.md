@@ -796,6 +796,7 @@ pgedge-coldfront/
 │   ├── duckdb-*.patch           ← DuckDB patch (brotli decoder fix for CVE-2026-111497)
 │   ├── iceberg-azure-extension-config-v15.cmake ← Azure ADLS extension build config
 │   ├── entrypoint.sh
+│   ├── coldfront-materialize-secret.sh ← writes the DuckDB storage secret when absent (boot step, Patroni callback)
 │   └── seaweedfs-s3.json        ← SeaweedFS S3 auth config (example)
 ├── docs/                       ← MkDocs site (user docs; mkdocs.yml at repo root)
 │   ├── index.md · installation.md · configuration.md

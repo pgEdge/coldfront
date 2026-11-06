@@ -33,9 +33,9 @@ if [ ! -f "$PGDATA/PG_VERSION" ] && [ -n "${COLDFRONT_STANDBY_OF:-}" ]; then
     # A base backup carries the data, the coldfront GUCs (they live in
     # postgresql.conf, not ALTER SYSTEM, so they ride the backup) and the patched
     # duckdb-iceberg cache (it sits inside PGDATA). It does not carry the DuckDB
-    # persistent secret, whose file sits outside PGDATA: a standby materializes
-    # it from the replicated coldfront.storage_secret row
-    # (coldfront.materialize_storage_secret), as ci/probe-standby.sh does.
+    # persistent secret, whose file sits outside PGDATA: the step before
+    # `exec postgres` below writes it from the replicated
+    # coldfront.storage_secret row.
     # -R writes standby.signal + primary_conninfo;
     # hot_standby defaults on, so the replica serves read queries.
     mkdir -p "$PGDATA"; chmod 700 "$PGDATA"
@@ -174,5 +174,10 @@ EOF
     fi
     "$PGBIN/pg_ctl" -D "$PGDATA" -m fast -w stop
 fi
+
+# The DuckDB secret file lives in the container's writable layer, so at every
+# start, once the server accepts connections, write it if it is absent.
+PATH="$PGBIN:$PATH" PGUSER=coldfront PGDATABASE=coldfront \
+    /usr/local/bin/coldfront-materialize-secret.sh &
 
 exec "$PGBIN/postgres" -D "$PGDATA" "$@"

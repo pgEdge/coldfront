@@ -142,11 +142,10 @@ for _ in $(seq 1 30); do
 done
 assert_eq "standby caught up (hot partition via physical replication)" "$PRIMARY_HOT" "$(sb_psql -c 'SELECT count(*) FROM public.p_2026_04;')"
 
-# The persistent-secret file is outside PGDATA, so it did not ride the base
-# backup — materialize it on the replica from the (physically replicated)
-# storage_secret row. SELECT + a DuckDB file write, no PG write, so it is
-# allowed on a read-only standby.
-sb_psql -c "SELECT coldfront.materialize_storage_secret();" >/dev/null 2>&1
+# The DuckDB secret file is outside PGDATA, so it did not come with the base
+# backup: the entrypoint's boot step writes it from the replicated
+# storage_secret row once the standby accepts connections.
+if boot_secret_wait "$SB"; then pass "standby boot step wrote the DuckDB storage secret"; else fail "standby boot step did not write the DuckDB storage secret"; fi
 
 # ── 5. THE GATE — iceberg reads on the read-only standby ───────────────────
 step "5. GATE — pg_duckdb iceberg_scan on the read-only standby"

@@ -9,7 +9,7 @@ the journey). What happens *after* Patroni promotes a replica is a Patroni
 concern, and no promotion tests are built.
 
 This runbook records the one requirement ColdFront places on the HA layer, the
-step a promoted node needs with static credentials, and two limitations
+callbacks a Patroni node needs with static credentials, and two limitations
 operators must account for.
 
 ## The one requirement: coldfront GUCs in `postgresql.conf`, not `ALTER SYSTEM`
@@ -37,13 +37,43 @@ backup and a promotion:
   `coldfront.archive_watermark`, `coldfront.storage_secret`) is ordinary table
   data → physically replicated, byte-identical (same OIDs) on every replica.
 
-A consequence (documented, not tested): with static credentials, a **vanilla**
-promotion needs the secret file on the new primary. Run
-`SELECT coldfront.materialize_storage_secret();` there, then reconnect each
-session opened before the call. DuckDB reads the file only when a session
-starts its DuckDB instance. Vanilla cold writes serialise on a node-local
-advisory lock, so a freshly promoted single node needs no coordination state to
-begin accepting writes.
+Vanilla cold writes serialise on a node-local advisory lock, so a freshly
+promoted single node needs no coordination state to begin accepting writes.
+
+## Writing the DuckDB Secret on a Patroni Node
+
+With static credentials, a node needs the secret file before its sessions read
+cold data, and a promotion keeps whatever file the replica has. The ColdFront
+image runs `coldfront-materialize-secret.sh` at each start, but Patroni starts
+PostgreSQL itself, so the image's entrypoint never runs on a Patroni node. Run
+the same script as a Patroni callback instead:
+
+```yaml
+postgresql:
+  callbacks:
+    on_start: env PGUSER=coldfront PGDATABASE=coldfront /usr/local/bin/coldfront-materialize-secret.sh
+    on_role_change: env PGUSER=coldfront PGDATABASE=coldfront /usr/local/bin/coldfront-materialize-secret.sh
+```
+
+Patroni fires `on_start` when it starts PostgreSQL in the same role, and
+`on_role_change` when it starts PostgreSQL in a new role or promotes it, so the
+two callbacks together run the script on every start. Patroni also kills a
+callback that is still running when the next one fires, so the
+`on_role_change` run on a promotion replaces an `on_start` run that the
+promotion cut short. The script waits until the server accepts
+connections, writes the file only when it is absent, and ignores the arguments
+Patroni passes. It connects through the libpq environment (`PGHOST`, `PGUSER`,
+`PGDATABASE`), so name a superuser and the database that holds the coldfront
+extension, as the example does. Outside the ColdFront image, install the script
+from [`docker/coldfront-materialize-secret.sh`](../../docker/coldfront-materialize-secret.sh).
+
+Because the script leaves an existing file alone, run
+`SELECT coldfront.materialize_storage_secret();` on each replica after the
+`coldfront.storage_secret` row changes on the primary; for a switch to vended
+credentials, the function also removes the old file. A session reads the
+secret file when its first DuckDB query starts its DuckDB instance, so a
+session whose instance started before the file was written cannot read cold
+data until it reconnects.
 
 ## Limitation 1 — Iceberg reads on a replica are snapshot-consistent, not linearizable
 
