@@ -432,9 +432,10 @@ built on the prebuilt
 ### Pre-Commit Gate
 
 `./run-ci-local.sh` runs `ci/matrix.sh --quick`: gofmt, go vet, golangci-lint,
-unit tests, build, the compactor module gate (vet, lint, test, build),
-`mkdocs build --strict`, the base recipe hash check, the pg_regress unit layer,
-and the full journey on one representative cell (PG18 · vanilla · tiered · s3).
+shellcheck, hadolint, actionlint, unit tests, build, the compactor module gate
+(vet, lint, test, build), `mkdocs build --strict`, the base recipe hash check,
+the pg_regress unit layer, and the full journey on one representative cell
+(PG18 · vanilla · tiered · s3).
 The gate is fast and runs on every commit. GitHub Actions
 ([.github/workflows/ci.yml](https://github.com/pgEdge/ColdFront/blob/main/.github/workflows/ci.yml))
 runs the identical `ci/matrix.sh` harness: `--quick` on every pull request and

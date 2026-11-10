@@ -49,7 +49,7 @@ if [ "$BACKEND" = aws ]; then
   : "${COLDFRONT_AWS_REGION:?--backend aws needs COLDFRONT_AWS_REGION}"
 fi
 
-cd "$ROOT"
+cd "$ROOT" || exit 1
 export PG_MAJOR="$PG"
 require_base "$PG" || exit 1
 COMPOSE="docker compose -f $COMPOSE_FILE"

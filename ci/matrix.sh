@@ -1,7 +1,8 @@
 #!/bin/bash
 # ci/matrix.sh — the ColdFront CI gate.
 #
-# Runs the host-side preflight ONCE (gofmt, go vet, golangci-lint, unit tests, build),
+# Runs the host-side preflight ONCE (gofmt, go vet, golangci-lint, shellcheck,
+# hadolint, actionlint, unit tests, build),
 # then exercises the canonical user journey (ci/journey.sh) across deployment
 # cells. The journey is the single spec; a "cell" is one
 # PG-major × topology × mode × target combination. Per-cell the topology script
@@ -28,7 +29,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=ci/lib.sh
 source "$SCRIPT_DIR/lib.sh"
-cd "$ROOT"
+cd "$ROOT" || exit 1
 
 SCOPE=""; BE_ONLY=""
 while [ $# -gt 0 ]; do case "$1" in
@@ -40,6 +41,10 @@ esac; done
 [ -n "$SCOPE" ] || { echo "usage: ci/matrix.sh --quick|--full|--backend <backend>"; exit 2; }
 
 # ── Preflight (host-side, once) ──────────────────────────────────────────────
+# lint <docker run args...>: run a pinned linter image over the tree, read-only,
+# so the local gate and GitHub run the same linter versions.
+lint() { docker run --rm -v "$ROOT:/mnt:ro" -w /mnt "$@"; }
+
 preflight() {
     step "preflight 1: gofmt"
     if [ -n "$(gofmt -l .)" ]; then gofmt -d .; fail "code is not formatted"; exit 1; fi
@@ -58,11 +63,30 @@ preflight() {
     if ! "$linter" run ./...; then fail "golangci-lint found issues"; exit 1; fi
     pass "lint clean"
 
-    step "preflight 4: unit tests"
+    step "preflight 4: shellcheck"
+    local scripts
+    mapfile -t scripts < <({ git ls-files '*.sh'; git grep -InE '^#!.*[/ ](ba|da)?sh( |$)' | awk -F: '$2 == 1 {print $1}'; } | sort -u)
+    if ! lint koalaman/shellcheck:v0.11.0 -x --source-path=SCRIPTDIR -S warning "${scripts[@]}"; then
+        fail "shellcheck found issues"; exit 1
+    fi
+    pass "shellcheck clean (${#scripts[@]} scripts)"
+
+    step "preflight 5: hadolint"
+    local dockerfiles
+    mapfile -t dockerfiles < <(git ls-files '*Dockerfile*')
+    if ! lint hadolint/hadolint:v2.15.1 hadolint "${dockerfiles[@]}"; then fail "hadolint found issues"; exit 1; fi
+    pass "hadolint clean (${#dockerfiles[@]} Dockerfiles)"
+
+    step "preflight 6: actionlint"
+    # -u 0: the image's default user (guest) cannot read an owner-only checkout.
+    if ! lint -u 0 -e SHELLCHECK_OPTS='-S warning' rhysd/actionlint:1.7.12; then fail "actionlint found issues"; exit 1; fi
+    pass "actionlint clean"
+
+    step "preflight 7: unit tests"
     if ! make test 2>&1; then fail "unit tests"; exit 1; fi
     pass "unit tests"
 
-    step "preflight 5: build"
+    step "preflight 8: build"
     if ! make build 2>&1; then fail "build"; exit 1; fi
     pass "build ($(ls -lh bin/archiver 2>/dev/null | awk '{print $5}'))"
     if ! bin/archiver --version | grep -q . || ! bin/partitioner --version | grep -q .; then
@@ -70,19 +94,19 @@ preflight() {
     fi
     pass "--version ($(bin/archiver --version))"
 
-    step "preflight 6: compactor module (separate go.mod — iceberg-go)"
+    step "preflight 9: compactor module (separate go.mod — iceberg-go)"
     if ! make compactor GOLANGCI="$linter" 2>&1; then fail "compactor module"; exit 1; fi
     pass "compactor (vet, lint, test, build $(ls -lh bin/compactor 2>/dev/null | awk '{print $5}'))"
     if ! bin/compactor --version | grep -q .; then fail "compactor --version"; exit 1; fi
 
-    step "preflight 7: docs (mkdocs build --strict)"
+    step "preflight 10: docs (mkdocs build --strict)"
     if ! command -v mkdocs >/dev/null 2>&1; then
         fail "mkdocs not found (pip install mkdocs-material)"; exit 1
     fi
     if ! mkdocs build --strict 2>&1; then fail "mkdocs build --strict"; exit 1; fi
     pass "docs build --strict"
 
-    step "preflight 8: base recipe hash (ci/base-ref.sh)"
+    step "preflight 11: base recipe hash (ci/base-ref.sh)"
     local tag tmp
     tag="$(ci/base-ref.sh)"
     tmp="$(mktemp -d)"; mkdir -p "$tmp/ci"; cp ci/base-ref.sh "$tmp/ci/"; cp -r docker "$tmp/"

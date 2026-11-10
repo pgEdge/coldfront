@@ -9,11 +9,12 @@
 # .github/workflows/release.yml for the ready-to-use snippet.
 
 # Build once per PostgreSQL major version (fan-out across the matrix).
+# shellcheck disable=SC2034  # read by pgedge-detect-build-matrix
 PER_PG_VERSION=true
 
 # Default PostgreSQL version and derived values
 export PG_VERSION="${PG_VERSION:-17.7}"
-export PG_MAJOR_VERSION="$(echo "$PG_VERSION" | cut -d. -f1)"
+export PG_MAJOR_VERSION="${PG_VERSION%%.*}"
 
 # pg_duckdb pinned to the merged PR #1025 commit (DuckDB 1.5.4). No released
 # pg_duckdb tag carries 1.5.x; this commit pins its duckdb submodule to v1.5.4.

@@ -32,7 +32,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 # shellcheck source=ci/lib.sh
 source "$SCRIPT_DIR/lib.sh"
-cd "$ROOT"
+cd "$ROOT" || exit 1
 
 PG="${PG_MAJOR:-18}"; KEEP=0
 while [ $# -gt 0 ]; do case "$1" in

@@ -4,7 +4,8 @@ name: CI
 # steps never diverge from local. Two jobs:
 #
 #   quick — every push + PR. ci/matrix.sh --quick = preflight (gofmt/vet/lint/
-#           unit tests/build) + ONE hermetic cell (PG18 · vanilla · tiered ·
+#           shellcheck/hadolint/actionlint/unit tests/build) + ONE hermetic
+#           cell (PG18 · vanilla · tiered ·
 #           primary · s3) on SeaweedFS + the pg_regress unit layer. No cloud
 #           creds, no real cloud calls. This is the fast gate and is exactly
 #           what run-ci-local.sh runs.

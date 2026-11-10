@@ -1849,8 +1849,7 @@ EOSQL
     # Two vector columns on one table. Each gets its own cluster column and its own
     # assignment; only the first gets the file sort order, so only its probe prunes.
     # Its own table, so nothing above depends on the second column existing.
-    local i2
-    for i2 in 1 2 3 4 5; do
+    for _ in 1 2 3 4 5; do
         q_may "$HOST" "SELECT coldfront.create_iceberg_table('public','icetwo','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"ts\",\"type\":\"timestamptz\"},{\"name\":\"embedding\",\"type\":\"vector(3)\"},{\"name\":\"summary\",\"type\":\"vector(2)\"}]'::jsonb);" >/dev/null 2>&1
         [ "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname='icetwo' AND relkind='v';")" = "1" ] && break
         sleep 2
@@ -8227,9 +8226,9 @@ story_vector_probe_pruning() {
     # probed read has two ICEBERG_SCAN nodes, the probe arm first and the
     # unassigned arm second, each read on its own (strict jsonpath: lax .**
     # yields every array element twice).
-    local counters s1 t1 s2 t2
+    local counters s1 t1 t2
     counters=$(q "$HOST" "SELECT duckdb.raw_query('SET custom_profiling_settings = ''{\"OPERATOR_TYPE\": \"true\", \"OPERATOR_ROW_GROUPS_SCANNED\": \"true\", \"OPERATOR_TOTAL_ROW_GROUPS_TO_SCAN\": \"true\"}'''); SELECT duckdb.raw_query('SET enable_profiling = ''json'''); SELECT duckdb.raw_query('SET profiling_output = ''/tmp/tc193.json'''); SELECT id FROM public.tcvp ORDER BY embedding <=> ARRAY[100,100,100]::real[] LIMIT 1; SELECT duckdb.raw_query('SET enable_profiling = ''no_output'''); SELECT string_agg((j->>'operator_row_groups_scanned') || ' ' || (j->>'operator_total_row_groups_to_scan'), ' ' ORDER BY o) FROM jsonb_path_query(pg_read_file('/tmp/tc193.json')::jsonb, 'strict \$.** ? (@.operator_name == \"ICEBERG_SCAN\")') WITH ORDINALITY AS t(j, o);" | tail -1)
-    read -r s1 t1 s2 t2 <<< "$counters"
+    read -r s1 t1 _ t2 <<< "$counters"
     assert_gt "TC-193: the file holds more than one row group" 1 "$t1"
     assert_gt "TC-193: the probe arm read at least one row group" 0 "$s1"
     assert_gt "TC-193: the probe arm skipped the row groups of the cluster it did not visit" "$s1" "$t1"

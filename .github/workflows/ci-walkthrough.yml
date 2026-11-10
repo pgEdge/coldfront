@@ -1,6 +1,7 @@
 name: CI - Walkthrough
 on:
   push:
+    branches: [main]
     paths: ['examples/walkthrough/**', '.devcontainer/**', 'docs/walkthrough*.md', '.github/workflows/ci-walkthrough.yml']
   pull_request:
     paths: ['examples/walkthrough/**', '.devcontainer/**', 'docs/walkthrough*.md', '.github/workflows/ci-walkthrough.yml']
@@ -20,8 +21,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - name: Run ShellCheck
-        run: shellcheck -x --source-path=examples/walkthrough examples/walkthrough/*.sh
       - name: Validate Docker Compose
         run: |
           docker compose -f examples/walkthrough/docker-compose.yml config --quiet
