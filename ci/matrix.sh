@@ -78,7 +78,8 @@ preflight() {
     pass "hadolint clean (${#dockerfiles[@]} Dockerfiles)"
 
     step "preflight 6: actionlint"
-    if ! lint -e SHELLCHECK_OPTS='-S warning' rhysd/actionlint:1.7.12; then fail "actionlint found issues"; exit 1; fi
+    # -u 0: the image's default user (guest) cannot read an owner-only checkout.
+    if ! lint -u 0 -e SHELLCHECK_OPTS='-S warning' rhysd/actionlint:1.7.12; then fail "actionlint found issues"; exit 1; fi
     pass "actionlint clean"
 
     step "preflight 7: unit tests"

@@ -99,8 +99,8 @@ Tests prove the behaviour that a change claims, and a dependency workaround
 proves that it is still needed. A change meets these conditions:
 
 - A bug fix includes a test that fails on the unfixed code.
-- A changed test still fails on the unfixed code in every interleaving and
-  input that the test can meet.
+- A test changed alongside a fix still fails on the unfixed code in every
+  interleaving and input that the test can meet.
 - A workaround for a dependency names the dependency and the pinned version
   that shows the defect, and includes a test that runs the dependency without
   the workaround and fails once the defect is gone.

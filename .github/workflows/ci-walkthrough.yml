@@ -1,6 +1,7 @@
 name: CI - Walkthrough
 on:
   push:
+    branches: [main]
     paths: ['examples/walkthrough/**', '.devcontainer/**', 'docs/walkthrough*.md', '.github/workflows/ci-walkthrough.yml']
   pull_request:
     paths: ['examples/walkthrough/**', '.devcontainer/**', 'docs/walkthrough*.md', '.github/workflows/ci-walkthrough.yml']
