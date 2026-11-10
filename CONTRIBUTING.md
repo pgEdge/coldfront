@@ -30,6 +30,40 @@ Thanks for your interest in improving ColdFront.
 - Open the PR against `main` and complete the
   [pull-request checklist](.github/PULL_REQUEST_TEMPLATE.md).
 
+## Reviewing Pull Requests
+
+Every change to `main` goes through a pull request. A pull request merges into
+`main` when the pull request meets these requirements:
+
+- The description links the GitHub issue that the change resolves.
+- CI passes, including the tests and the linters described in
+  [Checking Code Style](#checking-code-style).
+- CodeRabbit and Codacy have reviewed the pull request, and the author has
+  fixed each finding or answered each finding on the pull request with a
+  reason.
+- A code owner listed in [.github/CODEOWNERS](.github/CODEOWNERS), other than
+  the author, has approved the latest commit.
+
+[REVIEW.md](REVIEW.md) describes what a defect looks like in ColdFront and
+what the reviewer checks.
+
+A code owner may merge their own pull request without a second approval when
+the change alters no code or behaviour, such as a version bump, a changelog
+cleanup, or a typo fix in a comment or a document. In the CI workflows under
+`.github/workflows/` and in the release and packaging scripts, such a pull
+request may change only version numbers. CI and the automated reviews must
+still pass, and the author adds a comment to the pull request that explains why
+the pull request merged without review.
+
+## Checking Code Style
+
+CI checks Go code with gofmt, go vet, and golangci-lint, the shell scripts
+with shellcheck, the Dockerfiles with hadolint, and the GitHub workflows with
+actionlint. CI also builds the documentation with `mkdocs build --strict` and
+scans the commit history for secrets with gitleaks. On each pull request,
+CodeRabbit runs shellcheck, hadolint, yamllint, markdownlint, and semgrep, and
+Codacy runs its static analysis.
+
 ## Versioning
 
 ColdFront uses two independent version numbers. Release tags follow three-part
