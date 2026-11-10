@@ -134,7 +134,7 @@ jobs:
             - name: Vet
               run: go vet ./...
             - name: Run GoReleaser
-              uses: goreleaser/goreleaser-action@9a127d869fb706213d29cdf8eef3a4ea2b869415 # v7
+              uses: goreleaser/goreleaser-action@3d82dc1587053cd8272fa3801faaebfc2e8a12ac # v7
               with:
                   distribution: goreleaser
                   version: "~> v2"
