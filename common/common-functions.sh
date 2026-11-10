@@ -315,9 +315,11 @@ configure_pgedge_apt_repo(){
 detect_os_type(){
   if command -v dnf &>/dev/null || command -v yum &>/dev/null; then
     echo "Detected RPM-based system"
+    # shellcheck source=/dev/null
     source "$(dirname "$0")/../${COMPONENT_NAME}/build-rpm.sh"
   elif command -v apt-get &>/dev/null; then
     echo "Detected Debian-based system"
+    # shellcheck source=/dev/null
     source "$(dirname "$0")/../${COMPONENT_NAME}/build-deb.sh"
   else
     echo "Unsupported platform: No known package manager found" >&2

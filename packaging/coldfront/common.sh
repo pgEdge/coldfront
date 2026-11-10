@@ -2,11 +2,12 @@
 # common.sh - Common environment variables for the ColdFront extension package.
 
 # Build once per PostgreSQL major version (fan-out across the matrix).
+# shellcheck disable=SC2034  # read by pgedge-detect-build-matrix
 PER_PG_VERSION=true
 
 # Default PostgreSQL version and derived values
 export PG_VERSION="${PG_VERSION:-17.7}"
-export PG_MAJOR_VERSION="$(echo "$PG_VERSION" | cut -d. -f1)"
+export PG_MAJOR_VERSION="${PG_VERSION%%.*}"
 
 # The coldfront extension source lives in THIS repo (extension/coldfront), so
 # there is no upstream repo/branch to fetch. The package version is the

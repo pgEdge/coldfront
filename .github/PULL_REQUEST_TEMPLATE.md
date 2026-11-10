@@ -4,8 +4,8 @@
 
 ## Checklist
 
-- [ ] `./run-ci-local.sh` passes (gofmt, golangci-lint, build, pg_regress,
-  journey)
+- [ ] `./run-ci-local.sh` passes (gofmt, golangci-lint, shellcheck, hadolint,
+  actionlint, build, pg_regress, journey)
 - [ ] Tests added/updated (test-first)
 - [ ] Docs updated where applicable (README / USAGE / INSTALL / ARCHITECTURE)
 - [ ] Bakery / mesh / distributed changes: TLA+ model updated and TLC

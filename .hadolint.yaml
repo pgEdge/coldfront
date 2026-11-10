@@ -1,0 +1,10 @@
+# Rules the current Dockerfiles break. docker/Dockerfile.duckdb15-base is the
+# base image recipe, so any edit to it, an inline ignore comment included,
+# needs a base image republish.
+failure-threshold: warning
+ignored:
+  - DL3002  # Build stages run as root, and each final stage switches to postgres.
+  - DL3003  # A build step changes into a cloned source tree within one RUN.
+  - DL3006  # The manylinux stage aliases pull untagged images.
+  - DL3029  # The manylinux stage aliases pick one image per architecture.
+  - DL3041  # dnf installs packages without a pinned version.

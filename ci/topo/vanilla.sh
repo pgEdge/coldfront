@@ -80,7 +80,7 @@ if [ "$BACKEND" = aws-vended ]; then
   : "${COLDFRONT_AWS_EXTERNAL_ID:?--backend aws-vended needs COLDFRONT_AWS_EXTERNAL_ID}"
 fi
 
-cd "$ROOT"
+cd "$ROOT" || exit 1
 export PG_MAJOR="$PG"           # consumed by docker-compose.matrix.yml build arg + entrypoint
 require_base "$PG" || exit 1    # exports COLDFRONT_BASE for the same build
 export COMPOSE="docker compose -f $COMPOSE_FILE"   # journey TC-277 recreates db with it

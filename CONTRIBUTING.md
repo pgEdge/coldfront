@@ -14,9 +14,9 @@ Thanks for your interest in improving ColdFront.
 - **Test-driven.** Write the test first, then the implementation. Prioritise
   smoke / integration / endpoint tests over unit tests.
 - **Run the gate before every commit:** `./run-ci-local.sh` — gofmt,
-  golangci-lint, unit tests, build, the pg_regress layer, and the canonical
-  user journey. GitHub Actions runs the identical `ci/matrix.sh` harness, so
-  local and CI never diverge.
+  golangci-lint, shellcheck, hadolint, actionlint, unit tests, build, the
+  pg_regress layer, and the canonical user journey. GitHub Actions runs the
+  identical `ci/matrix.sh` harness, so local and CI never diverge.
 - **Bakery / mesh / distributed changes** must be modelled and verified in the
   TLA+ spec **first** ([docs/formal/](docs/formal/)) before the code change
   lands.

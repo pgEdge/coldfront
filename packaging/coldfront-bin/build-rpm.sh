@@ -1,6 +1,7 @@
 #!/bin/bash
 set -euo pipefail
 
+# shellcheck disable=SC2034  # setup_dnf_build_env (common-functions.sh) reads $RHEL under `set -u`.
 RHEL="$(rpm --eval %rhel)"
 ARCH=$(uname -m)                       # x86_64 | aarch64 (rpm arch)
 case "$ARCH" in

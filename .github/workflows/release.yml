@@ -25,7 +25,8 @@
 #   3. Push RPMs to dnf.pgedge.com and DEBs to apt.pgedge.com, back up to S3,
 #      and publish a promotion manifest + Slack notification.
 #
-# common-functions.sh is supplied by pgedge-builder-action at build time.
+# pgedge-builder-action runs common/build.sh, which sources the committed copy
+# of the shared build helpers in common/common-functions.sh.
 # -------------------------------------------------------------------------
 
 name: Release

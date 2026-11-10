@@ -6,6 +6,7 @@ set -euo pipefail
 # where <component> is a packaging dir under the repo root that holds a
 # common.sh + build-rpm.sh / build-deb.sh (e.g. "packaging/pg_duckdb").
 COMPONENT_NAME=$1
+# shellcheck source=/dev/null
 source "$(dirname "$0")/../${COMPONENT_NAME}/common.sh"
 
 # common-functions.sh is a committed copy of the shared pgEdge build helpers
@@ -14,6 +15,7 @@ source "$(dirname "$0")/../${COMPONENT_NAME}/common.sh"
 # same pattern as ai-dba-workbench's packaging/scripts/common-functions.sh.
 COMMON_FILE="$(dirname "$0")/common-functions.sh"
 if [ -f "$COMMON_FILE" ]; then
+  # shellcheck source=common/common-functions.sh
   source "$COMMON_FILE"
 else
   echo "Error: $COMMON_FILE not found!" >&2

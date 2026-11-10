@@ -32,7 +32,7 @@ while [ $# -gt 0 ]; do case "$1" in
   *) echo "probe-standby.sh: unknown arg $1"; exit 2;;
 esac; done
 
-cd "$ROOT"
+cd "$ROOT" || exit 1
 export PG_MAJOR="$PG"
 COMPOSE="docker compose -f docker-compose.matrix.yml"
 DB=coldfront-db-1
