@@ -1,6 +1,7 @@
 # pgEdge ColdFront
 
 [![CI](https://github.com/pgEdge/ColdFront/actions/workflows/ci.yml/badge.svg)](https://github.com/pgEdge/ColdFront/actions/workflows/ci.yml)
+[![Codacy Badge](https://app.codacy.com/project/badge/Grade/c94e04e8ba8b4cfe844924be75778a22)](https://app.codacy.com/gh/pgEdge/coldfront/dashboard?utm_source=gh&utm_medium=referral&utm_content=&utm_campaign=Badge_grade)
 
 ## Table of Contents
 
