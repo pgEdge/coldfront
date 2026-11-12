@@ -266,7 +266,7 @@ create the Iceberg namespace:
 
     For other store types, change the `storage-profile` and
     `storage-credential` as shown in
-    [Configuring your Object Store](object_store.md#configuring-lakekeeper).
+    [Configuring your Object Store](object_store.md).
 
     ```bash
     WID=$(curl -s -X POST http://localhost:8181/management/v1/warehouse \

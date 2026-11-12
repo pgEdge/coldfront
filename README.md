@@ -602,7 +602,7 @@ the host.
 
     If you're using a different type of object store, change the
     `storage-profile` and `storage-credential` as shown in the store's section
-    of [Configuring your Object Store](docs/object_store.md#configuring-lakekeeper).
+    of [Configuring your Object Store](docs/object_store.md).
 
 7. Store the SeaweedFS credential in each database that uses ColdFront:
 
