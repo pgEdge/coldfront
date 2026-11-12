@@ -263,10 +263,12 @@ of a static key. Use the following steps in place of the steps above:
     }
     ```
 
-2. Create the warehouse with `sts-enabled: true` and `assume-role-arn` in the
+2. Create the warehouse with the warehouse command from
+    [Configuring AWS S3](#configuring-aws-s3), keeping its `WID=$(...)`
+    assignment, but with `sts-enabled: true` and `assume-role-arn` in the
     `storage-profile`, and the matching `external-id` in the
     `storage-credential`. The `storage-credential` keeps your long-term access
-    key, which Lakekeeper uses to assume the role:
+    key, which Lakekeeper uses to assume the role. The changed fields are:
 
     ```json
     "storage-profile": {
@@ -442,8 +444,9 @@ fi
 
 A decoupled (Iceberg-only) table has no PostgreSQL hot tier: every row lives
 in Iceberg on your object store, and you read and write it through a
-PostgreSQL relation. Creating one is the quickest way to prove that the whole
-path works:
+PostgreSQL relation. Creating a decoupled table and writing a few rows to it
+is the quickest way to confirm that PostgreSQL, Lakekeeper, and your object
+store work together:
 
 ```sql
 SELECT coldfront.create_iceberg_table(
@@ -490,12 +493,18 @@ export AWS_DEFAULT_REGION=eu-west-1
 aws s3 ls s3://my-iceberg-bucket/coldfront/ --recursive
 ```
 
-Iceberg stores each table under your `key-prefix` (S3-family backends) or
-the filesystem root (Azure) as `coldfront/<table-uuid>/`, with a `data/`
-directory for Parquet files and a `metadata/` directory for metadata JSON,
-`*.avro` manifests, and snapshot files. The paths use UUIDs, not table names,
-so look for `cold_demo` under a UUID path beneath your `key-prefix`. A
-namespace created on a Lakekeeper release before 0.13 keeps the
+Iceberg names each table's directory with a UUID, not the table's name, so
+look for `cold_demo` under a UUID path. Each table is stored under your
+`key-prefix` (S3-family backends) or the filesystem root (Azure) in the
+following layout:
+
+```text
+coldfront/<table-uuid>/
+├── data/        Parquet data files
+└── metadata/    metadata JSON, *.avro manifests, and snapshot files
+```
+
+A namespace created on a Lakekeeper release before 0.13 keeps the older
 `coldfront/<namespace-uuid>/<table-uuid>/` layout.
 
 If something failed, work through the following checklist:
