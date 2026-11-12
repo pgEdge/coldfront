@@ -351,9 +351,11 @@ creates.
     repositories, so place your repository client certificate and key at the
     repo root as `client.crt` and `client.key`, or set `REPO_CLIENT_CRT` and
     `REPO_CLIENT_KEY` to their paths; the build mounts them as secrets and
-    never stores them in the image. The command publishes each port on the
-    loopback address only, because PostgreSQL trusts every connection and
-    Lakekeeper runs without authentication:
+    never stores them in the image. If either file is outside the repo
+    (including through a symlink), also set `BUILDX_BAKE_ENTITLEMENTS_FS=0`,
+    because Compose will not otherwise read it. The command publishes each
+    port on the loopback address only, because PostgreSQL trusts every
+    connection and Lakekeeper runs without authentication:
 
     ```bash
     COLDFRONT_PG_PORT=127.0.0.1:5432 COLDFRONT_LK_PORT=127.0.0.1:8181 \
