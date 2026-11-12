@@ -45,10 +45,6 @@ On a Docker deployment, open the session in the PostgreSQL container:
 docker exec -it "$(docker compose ps -q db)" psql -U coldfront -d <database>
 ```
 
-The commands on this page reach Lakekeeper's management API at
-`http://localhost:8181`; if Lakekeeper runs on another host or port, use that
-address instead.
-
 ## Configuring a Storage Backend
 
 Before you start, create the bucket or container and its access credential
@@ -56,6 +52,17 @@ with your provider's own tools; the sections below assume that they exist.
 Then, follow the section for your backend to grant the bucket permissions
 where needed, create the Lakekeeper warehouse, and store the ColdFront
 credential.
+
+Each backend section uses two kinds of commands:
+
+- Run the `curl` commands in a terminal shell on a host that can reach
+  Lakekeeper's management API. The commands use `http://localhost:8181`; if
+  Lakekeeper runs on another host or port, use that address instead. Keep the
+  same shell open until you create the namespace, because the warehouse
+  command saves the warehouse's ID in the `WID` shell variable that the
+  namespace command uses.
+- Run the SQL statements in the psql session that you opened in
+  [Before You Begin](#before-you-begin).
 
 !!! warning "Only long-term keys work"
 
@@ -80,11 +87,17 @@ An S3-compatible store, such as SeaweedFS or MinIO, needs a bucket, the
 store's endpoint URL, and a long-term access key and secret. Use the following
 steps to configure it:
 
-1. Grant the identity that owns your access key the same permissions as the
-    [AWS S3 example policy](#configuring-aws-s3): `GetObject`, `PutObject`,
-    `DeleteObject`, and `ListBucket` on the bucket, and
-    `AbortMultipartUpload`. Use your store's own access control to grant
-    them. If your store supports lifecycle rules, add an
+1. Use your store's own access control to grant the identity that owns your
+    access key the same permissions as the
+    [AWS S3 example policy](#configuring-aws-s3):
+
+    - `GetObject`
+    - `PutObject`
+    - `DeleteObject`
+    - `ListBucket`
+    - `AbortMultipartUpload`
+
+    If your store supports lifecycle rules, add an
     `AbortIncompleteMultipartUpload` rule to delete the leftover parts of
     failed multipart uploads, which DuckDB never aborts.
 
@@ -228,12 +241,15 @@ of a static key. Use the following steps in place of the steps above:
 
 1. Create an IAM role scoped to the bucket. Lakekeeper assumes the role for
     each table and vends the resulting short-lived key, secret, and session
-    token to ColdFront. The role's permission policy grants `GetObject`,
-    `PutObject`, `DeleteObject`, and `ListBucket` (plus the multipart
-    actions) on the bucket and `arn:aws:s3:::my-iceberg-bucket/*`. Its trust
-    policy lets the warehouse credential's own IAM identity assume the role,
-    gated by an `ExternalId` that Lakekeeper must present (confused-deputy
-    protection):
+    token to ColdFront. Give the role two policies:
+
+    - A permission policy that grants `GetObject`, `PutObject`,
+      `DeleteObject`, and `ListBucket`, plus the multipart actions, on the
+      bucket and on `arn:aws:s3:::my-iceberg-bucket/*`.
+    - A trust policy that lets the IAM identity of the warehouse credential
+      assume the role only when Lakekeeper presents a shared `ExternalId`,
+      which protects against the confused-deputy problem, as in the following
+      example:
 
     ```json
     {
@@ -247,10 +263,10 @@ of a static key. Use the following steps in place of the steps above:
     }
     ```
 
-2. Create the warehouse as in step 2 above, with `sts-enabled: true` and
-    `assume-role-arn` in the `storage-profile`, and the matching
-    `external-id` in the `storage-credential`, which stays the warehouse's
-    own long-term key:
+2. Create the warehouse with `sts-enabled: true` and `assume-role-arn` in the
+    `storage-profile`, and the matching `external-id` in the
+    `storage-credential`. The `storage-credential` keeps your long-term access
+    key, which Lakekeeper uses to assume the role:
 
     ```json
     "storage-profile": {
@@ -280,12 +296,15 @@ Then, continue with [Creating the Namespace](#creating-the-namespace).
 
 ### Configuring Google Cloud Storage
 
-Google Cloud Storage needs a bucket and an
+Google Cloud Storage requires a bucket and an
 [HMAC key pair](https://cloud.google.com/storage/docs/authentication/hmackeys).
-Lakekeeper's native `gcs` storage profile is service-account only, so this
-guide uses an `s3` storage profile pointed at GCS's S3-interoperability
-endpoint, with the HMAC key pair standing in for an access key. GCS has no STS
-equivalent on that endpoint, so it has no vended-credentials variant.
+ColdFront reaches GCS through its S3-interoperability endpoint, so the
+warehouse uses an `s3` storage profile, with the HMAC key pair in place of an
+access key. This guide does not use Lakekeeper's native `gcs` profile, because
+that profile accepts only service accounts.
+
+GCS has no vended-credentials variant, because its S3-interoperability
+endpoint has no STS equivalent.
 
 Use the following steps to configure Google Cloud Storage:
 
@@ -318,8 +337,7 @@ Use the following steps to configure Google Cloud Storage:
     echo "$WID"
     ```
 
-2. In each database, store the ColdFront credential the same way as for any
-    other S3-compatible endpoint:
+2. In each database, store the ColdFront credential:
 
     ```sql
     SELECT coldfront.set_storage_secret('<your-hmac-access-key-id>', '<your-hmac-secret>',
@@ -330,12 +348,20 @@ Then, continue with [Creating the Namespace](#creating-the-namespace).
 
 ### Configuring Azure ADLS Gen2
 
-Azure ADLS Gen2 needs a storage account with hierarchical namespace enabled
-(for example, `az storage account create --hns true`), a filesystem
-(container) in that account, and the account's access key. A StorageV2
-account without hierarchical namespace is not an ADLS Gen2 account, and
-Lakekeeper's `adls` warehouse fails on it. The Azure cold tier is also subject
-to the soft-delete and change-feed restriction in [Caveats](caveats.md).
+Azure ADLS Gen2 requires the following resources:
+
+- A storage account with hierarchical namespace enabled (for example,
+  `az storage account create --hns true`). A StorageV2 account without
+  hierarchical namespace is not an ADLS Gen2 account, and Lakekeeper cannot
+  create an `adls` warehouse on it.
+- A filesystem (container) in that account.
+- The account's access key.
+
+!!! hint
+
+    Turn off Blob soft-delete, container soft-delete, and change feed on the
+    storage account before you create the warehouse. Otherwise, Lakekeeper
+    fails to create the warehouse with HTTP 409; see [Caveats](caveats.md).
 
 Use the following steps to configure Azure ADLS Gen2:
 
@@ -390,7 +416,9 @@ SELECT coldfront.set_storage_secret_vended('azure');
 ## Creating the Namespace
 
 Whichever backend you configured, create the `public` namespace under the
-warehouse, using the ID that the warehouse command saved in `WID`:
+warehouse, using the ID that the warehouse command saved in `WID`. Decoupled
+mode needs the namespace before you create a table; in tiered mode, the
+archiver creates it itself.
 
 ```bash
 if [ -z "$WID" ]; then
@@ -402,17 +430,13 @@ else
 fi
 ```
 
-Decoupled mode requires the namespace: `coldfront.create_iceberg_table()`
-creates the namespace and the table in one transaction, but sends the table
-request before the namespace is committed, so the table create fails with
-HTTP 404 if the namespace does not already exist. In tiered mode, the
-archiver creates the namespace itself.
+!!! hint
 
-If you run the warehouse command again after the warehouse exists, the create
-request fails and `WID` is empty. Set `WID` to the `warehouse-id` of the `wh`
-warehouse in the output of
-`curl -s http://localhost:8181/management/v1/warehouse`, then rerun the
-namespace request.
+    If you run the warehouse command again after the warehouse exists, the
+    create request fails and `WID` is empty. Set `WID` to the `warehouse-id`
+    of the `wh` warehouse in the output of
+    `curl -s http://localhost:8181/management/v1/warehouse`, then rerun the
+    namespace request.
 
 ## Testing with Decoupled Mode
 

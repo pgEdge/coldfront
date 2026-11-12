@@ -286,12 +286,8 @@ described in your backend's section of
     ```
 
 3. For the SeaweedFS store, create the `public` namespace in the new
-    warehouse. Decoupled
-    (Iceberg-only) mode requires this step: `coldfront.create_iceberg_table`
-    creates the namespace and the table in one transaction, but sends the
-    table request before the namespace is committed, so the table create
-    fails with HTTP 404 if the namespace does not already exist. In tiered
-    mode, the archiver creates the namespace itself.
+    warehouse. Decoupled mode needs the namespace before you create a table;
+    in tiered mode, the archiver creates it itself.
 
     ```bash
     if [ -z "$WID" ]; then
@@ -302,11 +298,13 @@ described in your backend's section of
     fi
     ```
 
-If you run these commands again after the warehouse exists, the create
-request fails and `WID` is empty. Set `WID` to the `warehouse-id` of the `wh`
-warehouse in the output of
-`curl -s http://localhost:8181/management/v1/warehouse`, then rerun the
-namespace request.
+!!! hint
+
+    If you run these commands again after the warehouse exists, the create
+    request fails and `WID` is empty. Set `WID` to the `warehouse-id` of the
+    `wh` warehouse in the output of
+    `curl -s http://localhost:8181/management/v1/warehouse`, then rerun the
+    namespace request.
 
 ## Configuring PostgreSQL for Lakekeeper
 
