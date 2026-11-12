@@ -477,35 +477,48 @@ and
 
 ## Verifying the Configuration
 
-You can confirm that the objects landed in your object store with the
-backend's own client:
-
-| Backend | Example verification command |
-|---|---|
-| S3-compatible / AWS S3 | `aws s3 ls s3://my-iceberg-bucket/coldfront/ --recursive` |
-| Google Cloud Storage | `gsutil ls -r gs://my-iceberg-bucket/coldfront/` |
-| Azure ADLS Gen2 | `az storage blob list --account-name myaccount --container-name my-iceberg-fs --prefix coldfront --output table` |
-
-For AWS S3, export your Region first:
-
-```bash
-export AWS_DEFAULT_REGION=eu-west-1
-aws s3 ls s3://my-iceberg-bucket/coldfront/ --recursive
-```
-
-Iceberg names each table's directory with a UUID, not the table's name, so
-look for `cold_demo` under a UUID path. Each table is stored under your
-`key-prefix` (S3-family backends) or the filesystem root (Azure) in the
-following layout:
+Iceberg names each table's directory with a UUID, not the table's name. Each
+table is stored in the following layout, under your `key-prefix` on an
+S3-family backend (`coldfront/` in the examples) or directly under the
+filesystem root on Azure:
 
 ```text
-coldfront/<table-uuid>/
+<key-prefix>/<table-uuid>/
 ├── data/        Parquet data files
 └── metadata/    metadata JSON, *.avro manifests, and snapshot files
 ```
 
 A namespace created on a Lakekeeper release before 0.13 keeps the older
-`coldfront/<namespace-uuid>/<table-uuid>/` layout.
+`<key-prefix>/<namespace-uuid>/<table-uuid>/` layout.
+
+Use the following steps to confirm that the `cold_demo` table's objects landed
+in your object store:
+
+1. Find the table's directory by asking Lakekeeper for the table's metadata
+    location, in the shell where `WID` is set. The path before `/metadata/`
+    is the table's directory:
+
+    ```bash
+    curl -s "http://localhost:8181/catalog/v1/$WID/namespaces/public/tables/cold_demo" \
+      | grep -oE '"metadata-location":"[^"]+"'
+    ```
+
+2. List the objects in that directory with the backend's own client,
+    replacing `<table-uuid>` with the UUID from step 1, or with the
+    `<namespace-uuid>/<table-uuid>` path for an older namespace:
+
+    | Backend | Example verification command |
+    |---|---|
+    | S3-compatible / AWS S3 | `aws s3 ls s3://my-iceberg-bucket/coldfront/<table-uuid>/ --recursive` |
+    | Google Cloud Storage | `gsutil ls -r gs://my-iceberg-bucket/coldfront/<table-uuid>/` |
+    | Azure ADLS Gen2 | `az storage blob list --account-name myaccount --container-name my-iceberg-fs --prefix <table-uuid> --output table` |
+
+    For AWS S3, export your Region first:
+
+    ```bash
+    export AWS_DEFAULT_REGION=eu-west-1
+    aws s3 ls s3://my-iceberg-bucket/coldfront/<table-uuid>/ --recursive
+    ```
 
 If something failed, work through the following checklist:
 
