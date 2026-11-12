@@ -31,8 +31,9 @@ Before you configure your backend, complete the following steps:
   uses ColdFront, as described in
   [Configuring PostgreSQL for Lakekeeper](configure_lakekeeper.md#configuring-postgresql-for-lakekeeper).
 
-Then, open a psql session in each database that uses ColdFront. On a package
-or bare-metal deployment, connect as a superuser, such as `postgres`:
+Then, open a psql session in each database that uses ColdFront, replacing
+`<database>` with the database's name. On a package or bare-metal deployment,
+connect as a superuser, such as `postgres`:
 
 ```bash
 sudo -u postgres psql -d <database>
@@ -41,7 +42,7 @@ sudo -u postgres psql -d <database>
 On a Docker deployment, open the session in the PostgreSQL container:
 
 ```bash
-docker exec -it "$(docker compose ps -q db)" psql -U coldfront -d coldfront
+docker exec -it "$(docker compose ps -q db)" psql -U coldfront -d <database>
 ```
 
 The commands on this page reach Lakekeeper's management API at
@@ -50,8 +51,11 @@ address instead.
 
 ## Configuring a Storage Backend
 
-Follow the section for your backend to create the bucket or container and its
-credential, the Lakekeeper warehouse, and the ColdFront credential.
+Before you start, create the bucket or container and its access credential
+with your provider's own tools; the sections below assume that they exist.
+Then, follow the section for your backend to grant the bucket permissions
+where needed, create the Lakekeeper warehouse, and store the ColdFront
+credential.
 
 !!! warning "Only long-term keys work"
 
