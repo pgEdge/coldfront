@@ -65,7 +65,7 @@ require_base() {
 # paths for compose and set REPO_SECRET_ARGS for `docker build`.
 require_repo_client() {
     local root crt key
-    root="$(cd "${BASH_SOURCE[0]%/*}/.." && pwd)"
+    root="$(cd "${BASH_SOURCE[0]%/*}/.." && pwd -P)"
     crt="${REPO_CLIENT_CRT:-$root/client.crt}"
     key="${REPO_CLIENT_KEY:-$root/client.key}"
     if [ ! -r "$crt" ] || [ ! -r "$key" ]; then
@@ -73,8 +73,10 @@ require_repo_client() {
         echo "  put client.crt and client.key at the repo root, or set REPO_CLIENT_CRT and REPO_CLIENT_KEY to their paths" >&2
         return 1
     fi
-    REPO_CLIENT_CRT="$(cd "$(dirname "$crt")" && pwd)/$(basename "$crt")"
-    REPO_CLIENT_KEY="$(cd "$(dirname "$key")" && pwd)/$(basename "$key")"
+    # Physical paths: bake follows symlinks, so a link at the repo root that
+    # points outside it counts as outside.
+    REPO_CLIENT_CRT="$(realpath "$crt")"
+    REPO_CLIENT_KEY="$(realpath "$key")"
     export REPO_CLIENT_CRT REPO_CLIENT_KEY
     # compose (buildx bake) won't read secret files outside the project dir
     # without fs.read, and compose has no --allow flag.
