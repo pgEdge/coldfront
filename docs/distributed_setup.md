@@ -1,12 +1,63 @@
 # Configuring a Distributed Deployment
 
-For multi-writer iceberg workloads, run ColdFront on PostgreSQL nodes in a
-Spock mesh against the same Lakekeeper + S3. The bakery serializes commits
-PostgreSQL-side so writers never collide at the catalog.
+For workloads in which multiple nodes write to Iceberg tables, run ColdFront on
+PostgreSQL nodes in a Spock mesh that share one Lakekeeper catalog and one
+object store. ColdFront's bakery protocol serializes Iceberg commits within
+PostgreSQL, so concurrent writers never conflict at the catalog.
 
-## Per-Node `postgresql.conf`
+## Before You Begin
 
-The configuration below applies to each node in the mesh:
+Before you configure the mesh, make sure that every node meets the following
+requirements:
+
+- PostgreSQL and ColdFront are installed and configured as described in
+  [Installing ColdFront](installation.md) and
+  [Configuring PostgreSQL](configuration.md#configuring-postgresql).
+- The Spock and Snowflake extensions are installed. pgEdge Enterprise Postgres
+  and the ColdFront Docker image include both; on bare metal, install
+  [Spock](https://docs.pgedge.com/spock-v5/v5-0-14/install_spock/) and
+  [Snowflake](https://docs.pgedge.com/snowflake/) before you continue.
+- The node uses the same Lakekeeper warehouse and object store as every other
+  node, so `coldfront.warehouse` and `coldfront.lakekeeper_endpoint` have the
+  same values on every node. Lakekeeper is bootstrapped as described in
+  [Configuring Lakekeeper](configure_lakekeeper.md), runs on its own
+  PostgreSQL server rather than on a mesh node, and the warehouse and its
+  namespace exist as described in
+  [Configuring your Object Store](object_store.md).
+
+The mesh also depends on the following:
+
+- Each node can reach every other node's PostgreSQL port, and the role in the
+  subscription connection strings (`coldfront` in the examples) can connect to
+  every peer.
+- Each node can reach itself over a Unix socket without a password, for
+  `coldfront.loopback_dsn`.
+- The database has the same name on every node (`coldfront` in the examples).
+- The nodes' clocks are synchronized, for example with NTP, because the peer
+  liveness window described in [Timeouts](#timeouts) also covers the clock
+  skew between nodes.
+
+## Updating the postgresql.conf File on Each Node
+
+Each node needs the mesh settings below in `postgresql.conf`, alongside the
+ColdFront settings from
+[Configuring PostgreSQL](configuration.md#configuring-postgresql). When you
+add them:
+
+- Replace the single-node `shared_preload_libraries` value.
+- Give `snowflake.node` a different value on each node.
+- Restart PostgreSQL on each node afterward; `shared_preload_libraries` and
+  `wal_level` take effect only at server start.
+
+!!! hint
+
+    On Docker, the ColdFront entrypoint writes these settings for you. Start
+    each node container with `MESH=on` and a distinct
+    `COLDFRONT_SNOWFLAKE_NODE`; the [Installing ColdFront](installation.md)
+    guide lists both environment variables.
+
+Ensure that the following parameters are set on each node of the replication
+mesh:
 
 ```ini
 wal_level = logical
@@ -57,6 +108,59 @@ coldfront.iceberg_async_parquet = on
 coldfront.iceberg_bakery_patch = on
 ```
 
+## Forming the Mesh
+
+Run the following one-time setup on every node, in this order; step 3 calls
+`spock.repset_add_table`, which requires the local Spock node from step 2:
+
+1. Create the extensions in dependency order. ColdFront's bakery needs
+    `snowflake`, because its claim tickets come from `snowflake.nextval`:
+
+    ```sql
+    CREATE EXTENSION IF NOT EXISTS snowflake;
+    CREATE EXTENSION IF NOT EXISTS spock;
+    CREATE EXTENSION IF NOT EXISTS pg_duckdb;
+    CREATE EXTENSION IF NOT EXISTS coldfront;
+    ```
+
+2. Create the node's Spock node, then one subscription to each other node,
+    so that each node has N-1 subscriptions in a full mesh. The node and
+    subscription names are yours to choose. For example, on `n1` in a
+    three-node mesh (`n2` and `n3` are symmetric):
+
+    ```sql
+    SELECT spock.node_create('n1', 'host=<this_node_priv_ip> user=coldfront dbname=coldfront port=5432');
+
+    SELECT spock.sub_create('sub_n1_from_n2', 'host=<n2> user=coldfront dbname=coldfront port=5432',
+                            ARRAY['default','default_insert_only','ddl_sql'],
+                            false, false, '{}', '0', false);
+    SELECT spock.sub_create('sub_n1_from_n3', 'host=<n3> user=coldfront dbname=coldfront port=5432',
+                            ARRAY['default','default_insert_only','ddl_sql'],
+                            false, false, '{}', '0', false);
+    ```
+
+    Each subscription sets the following arguments:
+
+    - `ARRAY['default','default_insert_only','ddl_sql']` subscribes to the
+      replication sets that carry ColdFront's tables and the replicated DDL.
+    - The first `false` (`synchronize_structure`) and second `false`
+      (`synchronize_data`) skip the initial copy, because the `coldfront`
+      extension already created the tables on every node.
+    - `'{}'` (`forward_origins`), `'0'` (`apply_delay`), and the final `false`
+      (`force_text_transfer`) keep Spock's defaults.
+
+3. Run `coldfront.ensure_replicated()`, after the node's subscriptions exist
+    and before the first cold write, storage secret, or table registration.
+    The call adds every ColdFront table that replicates by value to this
+    node's replication sets, and publishes the slot name of each of this
+    node's subscriptions. Run it again on a node whose subscriptions change:
+
+    ```sql
+    SELECT coldfront.ensure_replicated();
+    ```
+
+## How the Bakery Handles Peers
+
 The bakery has no peer-ack timeout. The
 [Ricart-Agrawala (R-A)](formal/README.md) deferred-reply protocol's only
 failure mode is a dead peer (would wait forever), and a liveness check
@@ -85,42 +189,6 @@ R-A ack barrier (the wait, before a claim commits, for every live peer to
 acknowledge it) is what serializes iceberg commits. You can still enable
 sync-rep cluster-wide if you want stronger durability for non-bakery writes,
 but it plays no part in iceberg-commit serialization.
-
-Run this one-time mesh setup in this order on every node, because step 3 calls
-`spock.repset_add_table`, which requires the local Spock node to already exist:
-
-```sql
--- 1. Extensions, in dependency order. snowflake is a bakery prereq
--- (claim tickets come from snowflake.nextval).
-CREATE EXTENSION IF NOT EXISTS snowflake;
-CREATE EXTENSION IF NOT EXISTS spock;
-CREATE EXTENSION IF NOT EXISTS pg_duckdb;
-CREATE EXTENSION IF NOT EXISTS coldfront;
-
--- 2. Spock node + full-mesh subscriptions (each node has N-1 subs), named as
--- you like.
-SELECT spock.node_create('n<i>', 'host=<this_node_priv_ip> user=coldfront dbname=coldfront port=5432');
-
--- on n1 (n2 and n3 symmetric):
-SELECT spock.sub_create('sub_n1_from_n2', 'host=<n2> user=coldfront dbname=coldfront port=5432',
-                        ARRAY['default','default_insert_only','ddl_sql'],
-                        false, false, '{}', '0', false);
-SELECT spock.sub_create('sub_n1_from_n3', 'host=<n3> user=coldfront dbname=coldfront port=5432',
-                        ARRAY['default','default_insert_only','ddl_sql'],
-                        false, false, '{}', '0', false);
-
--- 3. **Required** on every node, after its subscriptions exist and before
--- the first cold write, storage secret or table registration: put every
--- ColdFront table that replicates by value in this node's replication sets,
--- and publish the slot name of each of this node's subscriptions. Run it
--- again on a node whose subscriptions change.
-SELECT coldfront.ensure_replicated();
-```
-
-The subscriptions set
-`synchronize_structure := false, synchronize_data := false` because the tables
-already exist on every node from the `coldfront` extension, so no initial copy
-is needed.
 
 ## Timeouts
 
