@@ -241,8 +241,10 @@ COLDFRONT_S3_PORT=127.0.0.1:8333 \
 ```
 
 Then, continue with [Bootstrapping Lakekeeper](#bootstrapping-lakekeeper).
-Either way, use `http://seaweedfs:8333` as the store endpoint when you
-bootstrap.
+When the stack runs the SeaweedFS store, which it does only with the
+`local-store` profile, use `http://seaweedfs:8333` as the store endpoint when
+you bootstrap. For any other store, see
+[Configuring your Object Store](object_store.md).
 
 ## Bootstrapping Lakekeeper
 
@@ -315,6 +317,12 @@ prefix:
 
 - `seaweedfs:8333` for the SeaweedFS store in the Docker stack.
 - `localhost:8333` for SeaweedFS running on the same host.
+
+For Azure ADLS Gen2, use `set_storage_secret_azure()` instead of
+`set_storage_secret()`, as described in
+[Configuring your Object Store](object_store.md); for vended credentials, use
+`set_storage_secret_vended()`, as described in
+[Using Vended Credentials](vended_credentials.md).
 
 If you use `coldfront.local_pg_dsn`, described below, set it before you run
 these statements. `set_storage_secret()` installs the DuckDB `postgres`

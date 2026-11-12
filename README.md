@@ -511,8 +511,8 @@ the host.
     sudo apt install -y pgedge-lakekeeper        # Ubuntu, Debian
     ```
 
-    If you're not using the pgEdge repository, install the upstream binary as
-    described in
+    If you're not using the pgEdge repository, install the upstream binary and
+    create the `lakekeeper` user as described in steps 1 and 2 of
     [Installing and Configuring Lakekeeper on Bare Metal](docs/configure_lakekeeper.md#installing-and-configuring-lakekeeper-on-bare-metal).
     Then copy the environment file and the systemd unit from the ColdFront
     repository:
@@ -549,7 +549,7 @@ the host.
     By default, Lakekeeper listens on every address and accepts every request.
     The loopback bind keeps it reachable only from this host. To accept clients
     from other hosts, configure authentication and authorization first, as
-    described in
+    described in step 5 of
     [Installing and Configuring Lakekeeper with Packages](docs/configure_lakekeeper.md#installing-and-configuring-lakekeeper-with-packages).
 
 5. Run the one-time migration as the `lakekeeper` user, then start
