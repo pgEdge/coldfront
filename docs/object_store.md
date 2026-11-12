@@ -8,18 +8,50 @@ on Docker, then point them at your object store.
 ColdFront supports four cold-store backends; configure exactly one of them for
 each deployment:
 
-- S3-compatible stores, such as SeaweedFS and MinIO.
-- Virtual-hosted cloud S3 (AWS).
-- Google Cloud Storage.
-- Azure ADLS Gen2.
+- [S3-compatible stores](#configuring-an-s3-compatible-store), such as
+  SeaweedFS and MinIO.
+- [Virtual-hosted cloud S3 (AWS)](#configuring-aws-s3).
+- [Google Cloud Storage](#configuring-google-cloud-storage).
+- [Azure ADLS Gen2](#configuring-azure-adls-gen2).
 
 For each backend, this guide covers the bucket or container setup, the
 Lakekeeper warehouse, and the ColdFront credential.
 
-## Prerequisites
+## Before You Begin
 
-Before you begin, decide which backend you are using, and create the bucket
-or container and its credential as described in that backend's section.
+Before you configure your backend, complete the following steps:
+
+- Configure PostgreSQL as described in
+  [Configuring PostgreSQL](configuration.md#configuring-postgresql).
+- Install, configure, and start Lakekeeper as described in
+  [Configuring Lakekeeper](configure_lakekeeper.md), and bootstrap it as
+  described in step 1 of
+  [Bootstrapping Lakekeeper](configure_lakekeeper.md#bootstrapping-lakekeeper).
+- Create the `pg_duckdb` and `coldfront` extensions in each database that
+  uses ColdFront, as described in
+  [Configuring PostgreSQL for Lakekeeper](configure_lakekeeper.md#configuring-postgresql-for-lakekeeper).
+
+Then, open a psql session in each database that uses ColdFront. On a package
+or bare-metal deployment, connect as a superuser, such as `postgres`:
+
+```bash
+sudo -u postgres psql -d <database>
+```
+
+On a Docker deployment, open the session in the PostgreSQL container:
+
+```bash
+docker exec -it "$(docker compose ps -q db)" psql -U coldfront -d coldfront
+```
+
+The commands on this page reach Lakekeeper's management API at
+`http://localhost:8181`; if Lakekeeper runs on another host or port, use that
+address instead.
+
+## Configuring a Storage Backend
+
+Follow the section for your backend to create the bucket or container and its
+credential, the Lakekeeper warehouse, and the ColdFront credential.
 
 !!! warning "Only long-term keys work"
 
@@ -35,145 +67,24 @@ or container and its credential as described in that backend's section.
     and Azure ADLS Gen2, but not for GCS or other S3-compatible stores; see
     [Using Vended Credentials](vended_credentials.md).
 
-For AWS S3 and S3-compatible stores, grant the key permission to read, write,
-and list the bucket (`GetObject`, `PutObject`, `DeleteObject`, and
-`ListBucket`) and to abort a failed multipart upload
-(`AbortMultipartUpload`), as in the following example policy:
-
-```json
-{
-  "Version": "2012-10-17",
-  "Statement": [
-    {
-      "Effect": "Allow",
-      "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket", "s3:AbortMultipartUpload"],
-      "Resource": [
-        "arn:aws:s3:::my-iceberg-bucket",
-        "arn:aws:s3:::my-iceberg-bucket/*"
-      ]
-    }
-  ]
-}
-```
-
-DuckDB never aborts a failed multipart upload, so add an
-`AbortIncompleteMultipartUpload` lifecycle rule to the bucket to delete
-leftover parts.
-
 The examples on this page use placeholder bucket, account, and credential
 values; substitute your own.
 
-## Preparing Your Installation
-
-Before you configure a backend, Lakekeeper must be running and bootstrapped,
-and you need a psql session in each database that uses ColdFront. The
-commands on this page reach Lakekeeper's management API at
-`http://localhost:8181`; if Lakekeeper runs on another host or port, use that
-address instead.
-
-### With Packages or on Bare Metal
-
-Use the following steps to prepare a package or bare-metal installation:
-
-1. Set ColdFront's server settings in `postgresql.conf` and restart
-    PostgreSQL, as described in
-    [Configuring PostgreSQL](configuration.md#configuring-postgresql).
-    Without them, `CREATE EXTENSION coldfront` fails, and the Iceberg catalog
-    does not attach.
-
-2. Install, configure, and start Lakekeeper as described in
-    [Installing and Configuring Lakekeeper with Packages](configure_lakekeeper.md#installing-and-configuring-lakekeeper-with-packages)
-    or
-    [Installing and Configuring Lakekeeper on Bare Metal](configure_lakekeeper.md#installing-and-configuring-lakekeeper-on-bare-metal).
-
-3. Bootstrap Lakekeeper as described in step 1 of
-    [Bootstrapping Lakekeeper](configure_lakekeeper.md#bootstrapping-lakekeeper).
-    Skip the warehouse step there; you create the warehouse for your backend
-    on this page.
-
-4. Open a psql session in each database that uses ColdFront as a superuser,
-    such as `postgres`:
-
-    ```bash
-    sudo -u postgres psql -d <database>
-    ```
-
-### On Docker
-
-!!! warning
-
-    The Docker stack is for development and testing on one host: PostgreSQL
-    trusts every connection, and Lakekeeper runs without authentication.
-    Before you let other hosts connect, configure authentication and an
-    enforcing authorization backend for Lakekeeper, require passwords in
-    PostgreSQL's `pg_hba.conf`, and limit access to the ports with a firewall.
-
-Use the following steps to prepare the Docker stack:
-
-1. If the stack is not already running, start it from the root of your
-    ColdFront repository clone. The command publishes each port on the
-    loopback address only, so other hosts cannot connect:
-
-    ```bash
-    COLDFRONT_PG_PORT=127.0.0.1:5432 COLDFRONT_LK_PORT=127.0.0.1:8181 \
-      docker compose up -d --build
-    ```
-
-    If port 5432 or 8181 is already in use on the host, change the port after
-    the colon, such as `COLDFRONT_PG_PORT=127.0.0.1:55432`. If you move
-    Lakekeeper, use its port in place of `8181` in every `curl` command on
-    this page.
-
-    The command starts PostgreSQL, with pg_duckdb and ColdFront preloaded;
-    Lakekeeper; Lakekeeper's catalog database; and a one-shot job that
-    applies Lakekeeper's schema migrations and then exits. It does not start
-    the bundled SeaweedFS store, which runs only with the `local-store`
-    profile; leave the profile off when you connect to your own store.
-
-2. Wait for PostgreSQL and Lakekeeper to report `healthy`:
-
-    ```bash
-    until docker compose ps db | grep -q '(healthy)'; do sleep 2; done
-    until docker compose ps lakekeeper | grep -q '(healthy)'; do sleep 2; done
-    ```
-
-3. Bootstrap Lakekeeper as described in step 1 of
-    [Bootstrapping Lakekeeper](configure_lakekeeper.md#bootstrapping-lakekeeper).
-    Skip the warehouse step there; you create the warehouse for your backend
-    on this page.
-
-4. Open a psql session in the PostgreSQL container:
-
-    ```bash
-    docker exec -it "$(docker compose ps -q db)" psql -U coldfront -d coldfront
-    ```
-
-## Creating the Extensions
-
-In each database that uses ColdFront, create both extensions before you store
-the backend's credential:
-
-```sql
-CREATE EXTENSION IF NOT EXISTS pg_duckdb;
-CREATE EXTENSION IF NOT EXISTS coldfront;
-```
-
-!!! warning "CREATE EXTENSION coldfront is required and easy to miss"
-
-    Preloading the `coldfront` library does not register the extension's
-    schema and functions in your database, so you must run
-    `CREATE EXTENSION coldfront` once in each database. Without it, the
-    credential call fails with `schema "coldfront" does not exist`.
-
-Then, follow the section for your backend.
-
-## Configuring an S3-Compatible Store
+### Configuring an S3-Compatible Store
 
 An S3-compatible store, such as SeaweedFS or MinIO, needs a bucket, the
 store's endpoint URL, and a long-term access key and secret. Use the following
 steps to configure it:
 
-1. Create a warehouse with a path-style profile pointed at your store's
+1. Grant the identity that owns your access key the same permissions as the
+    [AWS S3 example policy](#configuring-aws-s3): `GetObject`, `PutObject`,
+    `DeleteObject`, and `ListBucket` on the bucket, and
+    `AbortMultipartUpload`. Use your store's own access control to grant
+    them. If your store supports lifecycle rules, add an
+    `AbortIncompleteMultipartUpload` rule to delete the leftover parts of
+    failed multipart uploads, which DuckDB never aborts.
+
+2. Create a warehouse with a path-style profile pointed at your store's
     endpoint. The command saves the warehouse's ID in `WID`. The `key-prefix`
     is an arbitrary path inside the bucket; `coldfront` is only an example.
     If your store does not use regions, keep `us-east-1`:
@@ -205,7 +116,7 @@ steps to configure it:
     echo "$WID"
     ```
 
-2. In each database, store the ColdFront credential with the store's
+3. In each database, store the ColdFront credential with the store's
     endpoint, without the `https://` prefix. The last argument is `true`
     because the example endpoint uses TLS:
 
@@ -216,7 +127,7 @@ steps to configure it:
 
 Then, continue with [Creating the Namespace](#creating-the-namespace).
 
-## Configuring AWS S3
+### Configuring AWS S3
 
 AWS S3 needs a bucket, the bucket's Region, and a long-term access key and
 secret. The AWS warehouse profile uses the following flags:
@@ -232,7 +143,32 @@ secret. The AWS warehouse profile uses the following flags:
 
 Use the following steps to configure AWS S3:
 
-1. Create the warehouse with those flags set. The command saves the
+1. Grant the IAM user that owns your access key permission to read, write,
+    and list the bucket (`GetObject`, `PutObject`, `DeleteObject`, and
+    `ListBucket`) and to abort a failed multipart upload
+    (`AbortMultipartUpload`), as in the following example policy:
+
+    ```json
+    {
+      "Version": "2012-10-17",
+      "Statement": [
+        {
+          "Effect": "Allow",
+          "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject", "s3:ListBucket", "s3:AbortMultipartUpload"],
+          "Resource": [
+            "arn:aws:s3:::my-iceberg-bucket",
+            "arn:aws:s3:::my-iceberg-bucket/*"
+          ]
+        }
+      ]
+    }
+    ```
+
+    DuckDB never aborts a failed multipart upload, so also add an
+    `AbortIncompleteMultipartUpload` lifecycle rule to the bucket to delete
+    leftover parts.
+
+2. Create the warehouse with those flags set. The command saves the
     warehouse's ID in `WID`. The `key-prefix` is an arbitrary path inside the
     bucket; `coldfront` is only an example:
 
@@ -262,7 +198,7 @@ Use the following steps to configure AWS S3:
     echo "$WID"
     ```
 
-2. In each database, store the ColdFront credential with a `NULL` endpoint
+3. In each database, store the ColdFront credential with a `NULL` endpoint
     and your bucket's Region:
 
     ```sql
@@ -279,7 +215,7 @@ Use the following steps to configure AWS S3:
 
 Then, continue with [Creating the Namespace](#creating-the-namespace).
 
-### Using Vended Credentials with AWS S3
+#### Using Vended Credentials with AWS S3
 
 To run ColdFront with no stored credential (see
 [Using Vended Credentials](vended_credentials.md)), the warehouse issues
@@ -307,7 +243,7 @@ of a static key. Use the following steps in place of the steps above:
     }
     ```
 
-2. Create the warehouse as in step 1 above, with `sts-enabled: true` and
+2. Create the warehouse as in step 2 above, with `sts-enabled: true` and
     `assume-role-arn` in the `storage-profile`, and the matching
     `external-id` in the `storage-credential`, which stays the warehouse's
     own long-term key:
@@ -338,7 +274,7 @@ of a static key. Use the following steps in place of the steps above:
 
 Then, continue with [Creating the Namespace](#creating-the-namespace).
 
-## Configuring Google Cloud Storage
+### Configuring Google Cloud Storage
 
 Google Cloud Storage needs a bucket and an
 [HMAC key pair](https://cloud.google.com/storage/docs/authentication/hmackeys).
@@ -388,7 +324,7 @@ Use the following steps to configure Google Cloud Storage:
 
 Then, continue with [Creating the Namespace](#creating-the-namespace).
 
-## Configuring Azure ADLS Gen2
+### Configuring Azure ADLS Gen2
 
 Azure ADLS Gen2 needs a storage account with hierarchical namespace enabled
 (for example, `az storage account create --hns true`), a filesystem
@@ -436,7 +372,7 @@ Use the following steps to configure Azure ADLS Gen2:
 
 Then, continue with [Creating the Namespace](#creating-the-namespace).
 
-### Using Vended Credentials with Azure ADLS Gen2
+#### Using Vended Credentials with Azure ADLS Gen2
 
 With `sas-enabled` set on the warehouse, which is the default, Lakekeeper
 vends a per-container SAS token, and the warehouse credential can be a

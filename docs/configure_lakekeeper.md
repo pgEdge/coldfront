@@ -248,8 +248,11 @@ you bootstrap. For any other store, see
 
 ## Bootstrapping Lakekeeper
 
-Use the following steps to bootstrap Lakekeeper, create the warehouse, and
-create the Iceberg namespace:
+Use the following steps to bootstrap Lakekeeper and, for the SeaweedFS store,
+create the warehouse and the Iceberg namespace. For any other store, perform
+step 1 only, then create the warehouse, the namespace, and the credential as
+described in your backend's section of
+[Configuring your Object Store](object_store.md):
 
 1. Bootstrap Lakekeeper:
 
@@ -258,15 +261,11 @@ create the Iceberg namespace:
       -H "Content-Type: application/json" -d '{"accept-terms-of-use":true}'
     ```
 
-2. Create the warehouse and save its ID in `WID`. Replace `<store-endpoint>`
+2. For the SeaweedFS store, create the warehouse and save its ID in `WID`. Replace `<store-endpoint>`
     with the address Lakekeeper uses to reach your store:
 
     - `http://seaweedfs:8333` for the SeaweedFS store in the Docker stack.
     - `http://localhost:8333` for SeaweedFS running on the same host.
-
-    For other store types, change the `storage-profile` and
-    `storage-credential` as shown in
-    [Configuring your Object Store](object_store.md).
 
     ```bash
     WID=$(curl -s -X POST http://localhost:8181/management/v1/warehouse \
@@ -286,7 +285,8 @@ create the Iceberg namespace:
       | grep -oE '"warehouse-id":"[^"]+"' | cut -d'"' -f4)
     ```
 
-3. Create the `public` namespace in the new warehouse. Decoupled
+3. For the SeaweedFS store, create the `public` namespace in the new
+    warehouse. Decoupled
     (Iceberg-only) mode requires this step: `coldfront.create_iceberg_table`
     creates the namespace and the table in one transaction, but sends the
     table request before the namespace is committed, so the table create
@@ -311,30 +311,30 @@ namespace request.
 ## Configuring PostgreSQL for Lakekeeper
 
 After bootstrapping Lakekeeper, install the extensions and set the cold-tier
-credentials in each database that uses ColdFront. Replace `<store-endpoint>`
-with the store's address as PostgreSQL reaches it, without the `http://`
-prefix:
+credential in each database that uses ColdFront. If you use
+`coldfront.local_pg_dsn`, described below, set it before you set the
+credential. `set_storage_secret()` installs the DuckDB `postgres` extension
+that the setting needs, but only when the setting is already present.
 
-- `seaweedfs:8333` for the SeaweedFS store in the Docker stack.
-- `localhost:8333` for SeaweedFS running on the same host.
-
-For Azure ADLS Gen2, use `set_storage_secret_azure()` instead of
-`set_storage_secret()`, as described in
-[Configuring your Object Store](object_store.md); for vended credentials, use
-`set_storage_secret_vended()`, as described in
-[Using Vended Credentials](vended_credentials.md).
-
-If you use `coldfront.local_pg_dsn`, described below, set it before you run
-these statements. `set_storage_secret()` installs the DuckDB `postgres`
-extension that the setting needs, but only when the setting is already
-present.
+Install the extensions:
 
 ```sql
 CREATE EXTENSION IF NOT EXISTS pg_duckdb;
 CREATE EXTENSION IF NOT EXISTS coldfront;
+```
 
+For the SeaweedFS store, set the credential. Replace `<store-endpoint>` with
+the store's address as PostgreSQL reaches it, without the `http://` prefix:
+
+- `seaweedfs:8333` for the SeaweedFS store in the Docker stack.
+- `localhost:8333` for SeaweedFS running on the same host.
+
+```sql
 SELECT coldfront.set_storage_secret('admin', 'adminsecret', '<store-endpoint>');
 ```
+
+For any other store, set the credential as described in your backend's
+section of [Configuring your Object Store](object_store.md).
 
 `set_storage_secret()` stores the secret in the `coldfront.storage_secret`
 table and creates a DuckDB persistent secret from it, which loads when DuckDB
