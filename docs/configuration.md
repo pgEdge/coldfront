@@ -1,21 +1,20 @@
 # Configuring ColdFront
 
-After installing ColdFront packages or building from source, several
-components still need configuring before the cold tier comes online:
+After installing the ColdFront packages or building ColdFront from source,
+configure the following components before the cold tier comes online:
 
-- PostgreSQL and ColdFront's configuration is detailed in this
-  guide, regardless of which installation path you followed.
-- installing, configuring, and bootstrapping Lakekeeper, and the
-  one-time per-database setup that ties everything together,
-  documented in the [Configuring Lakekeeper](configure_lakekeeper.md)
-  guide.
-- your object store, documented in
-  [Configuring your Object Store](object_store.md).
+- PostgreSQL and ColdFront, described below.
+- Lakekeeper, including its installation, its bootstrap, and the one-time
+  setup for each database, described in the
+  [Configuring Lakekeeper](configure_lakekeeper.md) guide.
+- Your object store, described in the
+  [Configuring your Object Store](object_store.md) guide.
 
 ## Configuring PostgreSQL
 
-A package installation does not configure PostgreSQL. Add the following
-settings to `postgresql.conf`, then restart PostgreSQL:
+The ColdFront packages do not configure PostgreSQL. After a package
+installation, add the following settings to `postgresql.conf`, then restart
+PostgreSQL:
 
 ```ini
 shared_preload_libraries = 'pg_duckdb,coldfront'
@@ -30,93 +29,115 @@ coldfront.lakekeeper_endpoint = 'http://<lakekeeper-host>:8181/catalog'
 coldfront.local_pg_dsn = 'host=/var/run/postgresql dbname=<db> user=<role>'
 ```
 
-Together, `duckdb.extension_directory`, `duckdb.allow_unsigned_extensions`, and
-`duckdb.autoinstall_known_extensions` point pg_duckdb at the directory
-where `pgedge-coldfront-duckdb-extensions` installs ColdFront's patched
-DuckDB extensions, rather than letting it fetch the unpatched upstream
-build - the same substitution that reintroduces HTTP 409 failures under
-concurrent cold writes. The patched extensions are unsigned, so
-`duckdb.allow_unsigned_extensions` must stay on; and because a missing
-extension file would otherwise trigger that same fallback,
-`duckdb.autoinstall_known_extensions` stays off.
+Building from source on Docker sets these values for you: the entrypoint
+writes them from environment variables. When you build from source on bare metal,
+you set them manually during [installation](installation.md). The descriptions
+and the tuning settings that follow apply to every installation.
+
+The `duckdb.*` extension settings make pg_duckdb load ColdFront's
+patched DuckDB extensions instead of fetching the unpatched upstream build,
+which fails with HTTP 409 errors under concurrent cold writes:
+
+- `duckdb.extension_directory` points pg_duckdb at the directory where the
+  `pgedge-coldfront-duckdb-extensions` package installs the patched
+  extensions.
+- `duckdb.allow_unsigned_extensions` must stay on, because the patched
+  extensions are unsigned.
+- `duckdb.autoinstall_known_extensions` must stay off, so that a missing
+  extension file causes an error instead of a download of the upstream
+  build.
 
 `duckdb.postgres_role` names the role whose members may run DuckDB. Without
-it, only superusers can, and `coldfront.grant_app_access()` fails. Create the
-role before you grant access to an application role:
+it, only superusers can run DuckDB, and `coldfront.grant_app_access()` fails.
+Create the role before you grant access to an application role:
 
 ```sql
 CREATE ROLE coldfront_duckdb NOLOGIN;
 ```
 
-The two `coldfront.iceberg_*` settings make a node upload the Parquet files of
-an `INSERT` or `COPY` outside its write lock (the bakery claim on a Spock mesh,
-an advisory lock on a single node) and serialize only the catalog commit. The
-packaged duckdb-iceberg includes the patch that this ordering requires, and the
+Keep both `coldfront.iceberg_*` settings on. Together, they let an `INSERT`
+or `COPY` upload its Parquet files before taking the write lock, so
+concurrent writes wait only for the short catalog commit. The packaged
+duckdb-iceberg includes the patch that this ordering requires. The
 [Configuring a Distributed Deployment](distributed_setup.md) guide describes
-the mesh settings.
+the additional settings for a Spock mesh.
 
-ColdFront also exposes the following settings, which adjust write
-behavior and execution; tune them as needed:
+ColdFront also exposes the following settings, which adjust write behavior
+and execution; tune them as needed:
 
 | Setting | Description |
 |---|---|
-| `coldfront.allow_mixed_writes` | Controls tiered-mode `UPDATE`/`DELETE` whose WHERE cannot be proven to target one tier. `on` emits a dual-tier CTE; `off` rejects with an error and a hint. Not relevant in decoupled mode (every write is single-tier by definition). The default is `on`. |
-| `coldfront.cold_write_batch_size` | Sets how many cold rows a tiered `INSERT` gathers (see [Caveats](caveats.md)) before writing them to Iceberg as one `INSERT`. A larger value writes fewer, larger Parquet files; the remainder always flushes, so a small write stays one file. The default is `10000`, with a minimum of `1`. |
-| `coldfront.vector_probe` | Sets whether a recognized similarity search reads only the clusters nearest its query vector. `off` gives an exact scan of the whole corpus. Affects only a table with a trained vector column (see [Working with Embeddings](usage_vectors.md)). The default is `on`. |
-| `coldfront.vector_nprobe` | Sets how many clusters such a search reads, overriding the column's own `nprobe`; at or above the column's `nlist` the search is exhaustive. The default is `0`, which uses the configured value. |
-| `duckdb.force_execution` | Benchmark before enabling: on a mixed workload it helps `count(distinct)` and similar but regresses index lookups, top-K with PK ordering, and JSON access. The default is `off`. |
-| `duckdb.temporary_directory` | Sets where DuckDB spills. Each backend gets its own subdirectory there, named after its process id, so concurrent spills cannot collide; one left by a departed backend is reclaimed. See [DuckDB: Spill Files Are Not Namespaced per Instance](architecture_guides/index.md#duckdb-spill-files-are-not-namespaced-per-instance). |
-| `duckdb.max_temp_directory_size` | A cap per connection, not a cluster total. For a total budget, divide it by the concurrent sessions, or give the temp path its own filesystem or quota. The default is 90% of free space per session. |
+| `coldfront.allow_mixed_writes` | Controls a tiered-mode `UPDATE` or `DELETE` whose `WHERE` clause cannot be proven to target one tier. `on` runs the statement against both tiers; `off` rejects it with an error and a hint. Decoupled mode ignores this setting, because every write there targets one tier. The default is `on`. |
+| `coldfront.cold_write_batch_size` | Sets how many cold rows a tiered `INSERT` gathers before writing them to Iceberg as one `INSERT` (see [Caveats](caveats.md)). A larger value writes fewer, larger Parquet files; the remaining rows are always written, so a small write produces one file. The default is `10000`, and the minimum is `1`. |
+| `coldfront.vector_probe` | Sets whether a similarity search reads only the clusters nearest its query vector; `off` scans the whole corpus for an exact result. Applies only to a table with a trained vector column (see [Working with Embeddings](usage_vectors.md)). The default is `on`. |
+| `coldfront.vector_nprobe` | Sets how many clusters a similarity search reads, overriding the column's own `nprobe`; a value at or above the column's `nlist` searches every cluster. The default is `0`, which uses the column's value. |
+| `duckdb.force_execution` | Sets whether DuckDB runs every query. On a mixed workload, it speeds up `count(distinct)` and similar aggregates but slows index lookups, top-K queries ordered by primary key, and JSON access, so benchmark before you enable it. The default is `off`. |
+| `duckdb.temporary_directory` | Sets where DuckDB writes spill files. Each backend writes to its own subdirectory, named after its process ID, so concurrent spills cannot collide; a subdirectory left by a backend that has exited is reclaimed. See [DuckDB: Spill Files Are Not Namespaced per Instance](architecture_guides/index.md#duckdb-spill-files-are-not-namespaced-per-instance). |
+| `duckdb.max_temp_directory_size` | Caps the disk space that spill files can use for each connection, not for the whole cluster. For a cluster-wide budget, divide the budget by the number of concurrent sessions, or give the spill directory its own filesystem or quota. The default is 90% of the free space, for each session. |
 
 ## Writing ColdFront's Configuration
 
-Server-level settings live in `postgresql.conf`, each managed table's
-configuration is a row in `coldfront.partition_config`, and the
-cold-store credential lives in `coldfront.storage_secret`.
+ColdFront keeps its configuration in three places:
 
-Write the configuration with `coldfront.set_storage_secret()` and the
-`register` command. `set_storage_secret()` writes the following to
-`coldfront.storage_secret`; the
-[Configuring your Object Store](object_store.md) guide shares the exact
-values for each supported backend:
+- Server-level settings are in `postgresql.conf`.
+- The configuration of each managed table is a row in
+  `coldfront.partition_config`.
+- The object store credential is in `coldfront.storage_secret`.
 
-- `<access-key-id>` - your object store's access key.
-- `<secret-key>` - the matching secret.
-- `<endpoint>` - your object store's endpoint.
+You can write the table configuration and the credential with two commands,
+or with one import of a deployment YAML file.
 
-```sql
-SELECT coldfront.set_storage_secret('<access-key-id>', '<secret-key>', '<endpoint>');
-```
+### Using Commands
 
-`register` writes the following to `coldfront.partition_config`:
+Use the following steps to write the configuration with commands:
 
-- `<table>` - the table name.
-- `<period>` - the partition cadence, e.g. `monthly`.
-- `<hot-period>` - how long a partition stays hot before the archiver
-  moves it to the cold tier.
+1. Store the object store credential in `coldfront.storage_secret`. The
+   [Configuring your Object Store](object_store.md) guide lists the values
+   for each supported backend:
 
-```bash
-./bin/archiver register --table <table> \
-    --period <period> --hot-period "<hot-period>"
-```
+    - `<access-key-id>` is your object store's access key.
+    - `<secret-key>` is the matching secret.
+    - `<endpoint>` is your object store's endpoint.
 
-Or do both in one step by importing a deployment YAML:
+    ```sql
+    SELECT coldfront.set_storage_secret('<access-key-id>', '<secret-key>', '<endpoint>');
+    ```
+
+2. Register each table in `coldfront.partition_config`:
+
+    - `<table>` is the table name.
+    - `<period>` is the partition cadence; for example, `monthly`.
+    - `<hot-period>` is how long a partition stays hot before the archiver
+      moves it to the cold tier.
+
+    ```bash
+    archiver register --table <table> \
+        --period <period> --hot-period "<hot-period>"
+    ```
+
+### Importing a Deployment YAML File
+
+Use the following command to write the same configuration in one step:
 
 ```bash
 archiver import --config deploy.yaml
 ```
 
-The `pgedge-coldfront` package installs an example deployment YAML at
-`/usr/share/doc/pgedge-coldfront/examples/config.example.yaml`. The file is
-only an example; edit a copy of it and pass the copy to `import` - no ColdFront
-tool reads it unless `--config` names it. A system set to skip package
-documentation, as many container images are, does not install the file. The
-repository and each release tarball include the same file,
-[`config.example.yaml`](https://github.com/pgEdge/ColdFront/blob/main/config.example.yaml).
-After an import, the server holds the configuration. A later run that is given
-a YAML checks the file against the server and refuses to run if any value
-differs. The only value such a run takes from the file is `postgres.dsn`, which
-connects when `--dsn` is unset. The
+The `pgedge-coldfront` package installs an example file at
+`/usr/share/doc/pgedge-coldfront/examples/config.example.yaml`. Edit a copy of
+the example and pass the copy to `import`; no ColdFront tool reads a YAML file
+unless `--config` names it. A system set to skip package documentation, as
+many container images are, does not install the example. The repository and
+each release tarball include the same
+[`config.example.yaml`](https://github.com/pgEdge/ColdFront/blob/main/config.example.yaml)
+file.
+
+After an import, the server holds the configuration. When a later run is
+given a YAML file, it compares the file with the server and refuses to run if
+any value differs. The only value such a run takes from the file is
+`postgres.dsn`, which it uses to connect when `--dsn` is not set.
+
+The
 [Managing Partitioned Tables (CLI)](using_coldfront/index.md#managing-partitioned-tables-cli)
-section of the Using ColdFront guide describes
-`register`, `import`, and `export`.
+section of the Using ColdFront guide describes the `register`, `import`, and
+`export` commands.
