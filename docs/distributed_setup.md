@@ -110,11 +110,13 @@ coldfront.iceberg_bakery_patch = on
 
 ## Forming the Mesh
 
-Run the following one-time setup on every node, in this order; step 3 calls
-`spock.repset_add_table`, which requires the local Spock node from step 2:
+Form the mesh in four stages. Finish each stage on every node before you start
+the next one, because each stage depends on the previous stage having run
+everywhere:
 
-1. Create the extensions in dependency order. ColdFront's bakery needs
-    `snowflake`, because its claim tickets come from `snowflake.nextval`:
+1. On every node, create the extensions in dependency order. ColdFront's
+    bakery needs `snowflake`, because its claim tickets come from
+    `snowflake.nextval`:
 
     ```sql
     CREATE EXTENSION IF NOT EXISTS snowflake;
@@ -123,14 +125,21 @@ Run the following one-time setup on every node, in this order; step 3 calls
     CREATE EXTENSION IF NOT EXISTS coldfront;
     ```
 
-2. Create the node's Spock node, then one subscription to each other node,
-    so that each node has N-1 subscriptions in a full mesh. The node and
-    subscription names are yours to choose. For example, on `n1` in a
-    three-node mesh (`n2` and `n3` are symmetric):
+2. On every node, create the node's Spock node. The node names are yours to
+    choose; for example, on `n1`:
 
     ```sql
     SELECT spock.node_create('n1', 'host=<this_node_priv_ip> user=coldfront dbname=coldfront port=5432');
+    ```
 
+    A subscription can be created only after its provider is a Spock node, so
+    create every node before any subscription.
+
+3. On every node, create one subscription to each other node, so that each
+    node has N-1 subscriptions in a full mesh. For example, on `n1` in a
+    three-node mesh (`n2` and `n3` are symmetric):
+
+    ```sql
     SELECT spock.sub_create('sub_n1_from_n2', 'host=<n2> user=coldfront dbname=coldfront port=5432',
                             ARRAY['default','default_insert_only','ddl_sql'],
                             false, false, '{}', '0', false);
@@ -149,11 +158,14 @@ Run the following one-time setup on every node, in this order; step 3 calls
     - `'{}'` (`forward_origins`), `'0'` (`apply_delay`), and the final `false`
       (`force_text_transfer`) keep Spock's defaults.
 
-3. Run `coldfront.ensure_replicated()`, after the node's subscriptions exist
-    and before the first cold write, storage secret, or table registration.
-    The call adds every ColdFront table that replicates by value to this
-    node's replication sets, and publishes the slot name of each of this
-    node's subscriptions. Run it again on a node whose subscriptions change:
+4. When every node's subscriptions exist, run `coldfront.ensure_replicated()`
+    on every node, before the first cold write, storage secret, or table
+    registration. The call adds every ColdFront table that replicates by value
+    to this node's replication sets, and publishes the slot name of each of
+    this node's subscriptions. Because the subscriptions skip the initial
+    copy, a peer that subscribes after a node runs the call never receives
+    the slot names that node published, so create every subscription first.
+    Run the call again on a node whose subscriptions change:
 
     ```sql
     SELECT coldfront.ensure_replicated();
@@ -245,8 +257,8 @@ cannot run at `CREATE EXTENSION` time, because `spock.repset_add_table` needs
 the local Spock node, and nothing runs it later on a node's behalf:
 provisioning a table, setting the secret and writing cold rows all assume it
 has run. It is idempotent, so running it again is harmless. A node added to
-the mesh later runs the same three steps, and every node that subscribes from
-it runs the call again, so the slot of the new subscription is published.
+the mesh later runs the same stages, and every node that subscribes from it
+runs the call again, so the slot of the new subscription is published.
 
 A skipped step shows up away from the node that skipped it. If a peer never
 ran it, it has published no slot, and every cold write on the other nodes
