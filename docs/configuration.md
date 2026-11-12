@@ -29,10 +29,13 @@ coldfront.lakekeeper_endpoint = 'http://<lakekeeper-host>:8181/catalog'
 coldfront.local_pg_dsn = 'host=/var/run/postgresql dbname=<db> user=<role>'
 ```
 
-Building from source on Docker sets these values for you: the entrypoint
-writes them from environment variables. When you build from source on bare metal,
-you set them manually during [installation](installation.md). The descriptions
-and the tuning settings that follow apply to every installation.
+Building from source on Docker configures PostgreSQL for you: the
+entrypoint writes its own settings when it initializes the data directory,
+taking the warehouse, the Lakekeeper endpoint, and the DuckDB role from
+environment variables. When you build from source on bare metal, you set the
+values manually during [installation](installation.md). The descriptions that
+follow cover the package settings; the tuning settings apply to every
+installation.
 
 The `duckdb.*` extension settings make pg_duckdb load ColdFront's
 patched DuckDB extensions instead of fetching the unpatched upstream build,
@@ -77,7 +80,7 @@ and execution; tune them as needed:
 
 ## Writing ColdFront's Configuration
 
-ColdFront keeps its configuration in three places:
+ColdFront stores its configuration in three places:
 
 - Server-level settings are in `postgresql.conf`.
 - The configuration of each managed table is a row in
@@ -86,6 +89,10 @@ ColdFront keeps its configuration in three places:
 
 You can write the table configuration and the credential with two commands,
 or with one import of a deployment YAML file.
+
+The examples use the `archiver` command that the `pgedge-coldfront` package
+installs. After a build from source, run `./bin/archiver` from the source
+directory instead.
 
 ### Using Commands
 
