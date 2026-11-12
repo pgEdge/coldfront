@@ -1,9 +1,9 @@
 # Configuring your Object Store
 
 This guide takes you from an empty bucket or container to a working ColdFront
-cold tier. You prepare PostgreSQL and the Lakekeeper Iceberg catalog, whether
-you installed them with packages, on bare metal, or on Docker, then point them
-at your object store.
+cold tier. Before you create it, you prepare PostgreSQL and the Lakekeeper
+Iceberg catalog, whether you installed them with packages, on bare metal, or
+on Docker, then point them at your object store.
 
 ColdFront supports four cold-store backends; configure exactly one of them for
 each deployment:
@@ -75,17 +75,23 @@ address instead.
 
 Use the following steps to prepare a package or bare-metal installation:
 
-1. Install, configure, and start Lakekeeper as described in
+1. Set ColdFront's server settings in `postgresql.conf` and restart
+    PostgreSQL, as described in
+    [Configuring PostgreSQL](configuration.md#configuring-postgresql).
+    Without them, `CREATE EXTENSION coldfront` fails, and the Iceberg catalog
+    does not attach.
+
+2. Install, configure, and start Lakekeeper as described in
     [Installing and Configuring Lakekeeper with Packages](configure_lakekeeper.md#installing-and-configuring-lakekeeper-with-packages)
     or
     [Installing and Configuring Lakekeeper on Bare Metal](configure_lakekeeper.md#installing-and-configuring-lakekeeper-on-bare-metal).
 
-2. Bootstrap Lakekeeper as described in step 1 of
+3. Bootstrap Lakekeeper as described in step 1 of
     [Bootstrapping Lakekeeper](configure_lakekeeper.md#bootstrapping-lakekeeper).
     Skip the warehouse step there; you create the warehouse for your backend
     on this page.
 
-3. Open a psql session in each database that uses ColdFront as a superuser,
+4. Open a psql session in each database that uses ColdFront as a superuser,
     such as `postgres`:
 
     ```bash
@@ -94,14 +100,29 @@ Use the following steps to prepare a package or bare-metal installation:
 
 ### On Docker
 
+!!! warning
+
+    The Docker stack is for development and testing on one host: PostgreSQL
+    trusts every connection, and Lakekeeper runs without authentication.
+    Before you let other hosts connect, configure authentication and an
+    enforcing authorization backend for Lakekeeper, require passwords in
+    PostgreSQL's `pg_hba.conf`, and limit access to the ports with a firewall.
+
 Use the following steps to prepare the Docker stack:
 
 1. If the stack is not already running, start it from the root of your
-    ColdFront repository clone:
+    ColdFront repository clone. The command publishes each port on the
+    loopback address only, so other hosts cannot connect:
 
     ```bash
-    docker compose up -d --build
+    COLDFRONT_PG_PORT=127.0.0.1:5432 COLDFRONT_LK_PORT=127.0.0.1:8181 \
+      docker compose up -d --build
     ```
+
+    If port 5432 or 8181 is already in use on the host, change the port after
+    the colon, such as `COLDFRONT_PG_PORT=127.0.0.1:55432`. If you move
+    Lakekeeper, use its port in place of `8181` in every `curl` command on
+    this page.
 
     The command starts PostgreSQL, with pg_duckdb and ColdFront preloaded;
     Lakekeeper; Lakekeeper's catalog database; and a one-shot job that
@@ -109,16 +130,11 @@ Use the following steps to prepare the Docker stack:
     the bundled SeaweedFS store, which runs only with the `local-store`
     profile; leave the profile off when you connect to your own store.
 
-    If a local PostgreSQL already uses port 5432, set `COLDFRONT_PG_PORT` to
-    another host port, such as `COLDFRONT_PG_PORT=55432`. If port 8181 is
-    taken, set `COLDFRONT_LK_PORT` the same way, and use that port in place of
-    `8181` in every `curl` command on this page.
-
-2. Wait for PostgreSQL to report `healthy`. The container name depends on
-    your directory, so the command looks it up:
+2. Wait for PostgreSQL and Lakekeeper to report `healthy`:
 
     ```bash
-    docker inspect -f '{{.State.Health.Status}}' "$(docker compose ps -q db)"
+    until docker compose ps db | grep -q '(healthy)'; do sleep 2; done
+    until docker compose ps lakekeeper | grep -q '(healthy)'; do sleep 2; done
     ```
 
 3. Bootstrap Lakekeeper as described in step 1 of
