@@ -57,6 +57,34 @@ require_base() {
         return 1
     fi
     export COLDFRONT_BASE="$ref"
+    require_repo_client || return 1
+}
+
+# require_repo_client: resolve the pgEdge repo client cert (REPO_CLIENT_CRT /
+# REPO_CLIENT_KEY, default <repo>/client.{crt,key}), fail if missing, export the
+# paths for compose and set REPO_SECRET_ARGS for `docker build`.
+require_repo_client() {
+    local root crt key
+    root="$(cd "${BASH_SOURCE[0]%/*}/.." && pwd)"
+    crt="${REPO_CLIENT_CRT:-$root/client.crt}"
+    key="${REPO_CLIENT_KEY:-$root/client.key}"
+    if [ ! -r "$crt" ] || [ ! -r "$key" ]; then
+        echo "pgEdge repository client certificate not found: need $crt and $key" >&2
+        echo "  put client.crt and client.key at the repo root, or set REPO_CLIENT_CRT and REPO_CLIENT_KEY to their paths" >&2
+        return 1
+    fi
+    REPO_CLIENT_CRT="$(cd "$(dirname "$crt")" && pwd)/$(basename "$crt")"
+    REPO_CLIENT_KEY="$(cd "$(dirname "$key")" && pwd)/$(basename "$key")"
+    export REPO_CLIENT_CRT REPO_CLIENT_KEY
+    # compose (buildx bake) won't read secret files outside the project dir
+    # without fs.read, and compose has no --allow flag.
+    case "$REPO_CLIENT_CRT:$REPO_CLIENT_KEY" in
+        "$root"/*:"$root"/*) ;;
+        *) export BUILDX_BAKE_ENTITLEMENTS_FS=0;;
+    esac
+    # shellcheck disable=SC2034  # read by the scripts that source this file
+    REPO_SECRET_ARGS=(--secret "id=repo_client_crt,src=$REPO_CLIENT_CRT"
+                      --secret "id=repo_client_key,src=$REPO_CLIENT_KEY")
 }
 
 # summary  — print pass/fail tally; returns nonzero if any FAIL (drives matrix exit code).

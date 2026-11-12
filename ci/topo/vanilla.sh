@@ -255,7 +255,7 @@ if [ "$REGRESS" = 1 ]; then
     # coldfront.warehouse/lakekeeper_endpoint to '' so ensure_attached() is a no-op
     # and Lakekeeper isn't needed here.
     BUILD_IMG="coldfront-regress:pg${PG}"
-    docker build -f docker/Dockerfile.duckdb15 --build-arg PG_MAJOR="$PG" --target cf-build -t "$BUILD_IMG" . >/dev/null 2>&1
+    docker build -f docker/Dockerfile.duckdb15 --build-arg PG_MAJOR="$PG" --target cf-build "${REPO_SECRET_ARGS[@]}" -t "$BUILD_IMG" . >/dev/null 2>&1
     NET=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' "$DB")
     if docker run --rm --network "$NET" \
            -e PGHOST=db -e PGPORT=5432 -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" \

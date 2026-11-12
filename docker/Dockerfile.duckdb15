@@ -11,7 +11,15 @@
 #   docker build -f docker/Dockerfile.duckdb15-base --build-arg PG_MAJOR=18 \
 #       -t ghcr.io/pgedge/coldfront-duckdb-base:pg18 .
 #
-#   docker build -f docker/Dockerfile.duckdb15 --build-arg PG_MAJOR=18 -t coldfront-duckdb15:pg18 .
+#   docker build -f docker/Dockerfile.duckdb15 --build-arg PG_MAJOR=18 \
+#       --secret id=repo_client_crt,src=client.crt \
+#       --secret id=repo_client_key,src=client.key \
+#       -t coldfront-duckdb15:pg18 .
+#
+# The pgEdge repos need a client cert (mTLS). It comes in as BuildKit secrets,
+# mounted only into the installing RUNs; each RUN's trap deletes the installed
+# copy and disables the repos, so no layer holds it. Compose reads it from
+# REPO_CLIENT_CRT / REPO_CLIENT_KEY (default ./client.crt, ./client.key).
 ARG PG_MAJOR=18
 ARG PGEDGE_TAG=${PG_MAJOR}-spock5-minimal
 ARG COLDFRONT_BASE=ghcr.io/pgedge/coldfront-duckdb-base:pg${PG_MAJOR}
@@ -23,9 +31,15 @@ ARG COLDFRONT_BASE=ghcr.io/pgedge/coldfront-duckdb-base:pg${PG_MAJOR}
 FROM ghcr.io/pgedge/pgedge-postgres:${PGEDGE_TAG} AS cf-build
 ARG PG_MAJOR
 USER root
-RUN dnf install -y --setopt=install_weak_deps=False \
-        pgedge-postgresql${PG_MAJOR}-devel gcc make redhat-rpm-config diffutils \
-    && dnf clean all
+# Repos are gated and disabled in the parent; see the header.
+RUN --mount=type=secret,id=repo_client_crt,required=true \
+    --mount=type=secret,id=repo_client_key,required=true \
+    set -eu; \
+    trap 'rm -f /etc/pki/pgedge/client.crt /etc/pki/pgedge/client.key; dnf config-manager --set-disabled "pgedge*" >/dev/null 2>&1 || true' EXIT; \
+    pgedge-subscription-manager install /run/secrets/repo_client_crt /run/secrets/repo_client_key --force; \
+    dnf install -y --setopt=install_weak_deps=False \
+        pgedge-postgresql${PG_MAJOR}-devel gcc make redhat-rpm-config diffutils; \
+    dnf clean all
 ENV PATH=/usr/pgsql-${PG_MAJOR}/bin:$PATH
 ENV PG_CONFIG=/usr/pgsql-${PG_MAJOR}/bin/pg_config
 COPY extension/coldfront /build/coldfront
@@ -55,8 +69,20 @@ RUN chmod +x /usr/local/bin/coldfront-entrypoint.sh /usr/local/bin/coldfront-mat
 # layer for the same reason as entrypoint.sh: baked only into the separately
 # published base, a stale base would silently lack it and local CI would diverge
 # from GitHub CI.
-RUN dnf install -y --setopt=install_weak_deps=False pgedge-pgvector_${PG_MAJOR} \
-    && dnf clean all
+#
+# An older base has a pre-gating pgedge-release (repo enabled, no
+# pgedge-subscription-manager): disable it and upgrade pgedge-release first.
+RUN --mount=type=secret,id=repo_client_crt,required=true \
+    --mount=type=secret,id=repo_client_key,required=true \
+    set -eu; \
+    trap 'rm -f /etc/pki/pgedge/client.crt /etc/pki/pgedge/client.key; dnf config-manager --set-disabled "pgedge*" >/dev/null 2>&1 || true' EXIT; \
+    dnf config-manager --set-disabled "pgedge*" >/dev/null 2>&1 || true; \
+    command -v pgedge-subscription-manager >/dev/null 2>&1 \
+        || dnf install -y --disablerepo="pgedge*" \
+           https://downloads.pgedge.com/reporpm/pgedge-release-latest.noarch.rpm; \
+    pgedge-subscription-manager install /run/secrets/repo_client_crt /run/secrets/repo_client_key --force; \
+    dnf install -y --setopt=install_weak_deps=False pgedge-pgvector_${PG_MAJOR}; \
+    dnf clean all
 # License + third-party notices travel with the binaries we redistribute (the
 # DuckDB family is MIT: the notice must accompany the distributed Software).
 COPY THIRD_PARTY_NOTICES.md LICENSE.md /usr/share/doc/coldfront/

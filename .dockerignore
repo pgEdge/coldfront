@@ -5,6 +5,9 @@
 .dockerignore
 
 # local-only: credentials, bench/scale harnesses, demos (never in an image)
+# pgEdge repo client cert: passed only as BuildKit secrets, never in the context
+**/client.crt
+**/client.key
 scale-test/
 scale-test-*.sh
 bench-*.sh

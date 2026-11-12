@@ -34,6 +34,7 @@ esac; done
 
 cd "$ROOT" || exit 1
 export PG_MAJOR="$PG"
+require_repo_client || exit 1   # the compose build's repository secrets
 COMPOSE="docker compose -f docker-compose.matrix.yml"
 DB=coldfront-db-1
 SB="$CF_STANDBY"

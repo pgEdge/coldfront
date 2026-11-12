@@ -35,7 +35,8 @@ trap teardown EXIT
 # snowflake.node, so snowflake.nextval()/get_epoch() work without a Spock mesh.
 step "probe-snowflake: build + start a snowflake-capable node (pg${PG}, MESH=on)"
 docker rm -f "$SF" >/dev/null 2>&1 || true
-docker build -f docker/Dockerfile.duckdb15 --build-arg PG_MAJOR="$PG" -t "$IMG" . >/dev/null 2>&1 \
+require_repo_client || { fail "build $IMG"; exit 1; }
+docker build -f docker/Dockerfile.duckdb15 --build-arg PG_MAJOR="$PG" "${REPO_SECRET_ARGS[@]}" -t "$IMG" . >/dev/null 2>&1 \
     || { fail "build $IMG"; exit 1; }
 docker run -d --name "$SF" -e PG_MAJOR="$PG" -e MESH=on "$IMG" >/dev/null 2>&1 || { fail "run $SF"; exit 1; }
 # The image declares no HEALTHCHECK (health is compose-defined), so a bare

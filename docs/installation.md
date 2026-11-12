@@ -240,7 +240,8 @@ docker build -f docker/Dockerfile.duckdb15-base --build-arg PG_MAJOR=18 \
   -t ghcr.io/pgedge/coldfront-duckdb-base:pg18 .
 
 # 2. Build the thin coldfront app layer + bring up the stack (seconds - it only
-#    compiles the coldfront extension on top of the base).
+#    compiles the coldfront extension on top of the base). Needs your pgEdge
+#    repo client cert at ./client.crt + ./client.key, or REPO_CLIENT_CRT/_KEY.
 docker compose up -d --build      # end-user single-node stack (ports published)
 # (CI uses docker-compose.matrix.yml / docker-compose.mesh.yml - NOT for end-user setup)
 ```

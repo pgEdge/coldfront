@@ -15,7 +15,7 @@
 # otherwise arbitrary — the bakery matches acks by spock node name, not by id.
 services:
   db1:
-    build: { context: ., dockerfile: docker/Dockerfile.duckdb15, args: { PG_MAJOR: "${PG_MAJOR:-18}", COLDFRONT_BASE: "${COLDFRONT_BASE:-ghcr.io/pgedge/coldfront-duckdb-base:pg${PG_MAJOR:-18}}" } }
+    build: { context: ., dockerfile: docker/Dockerfile.duckdb15, args: { PG_MAJOR: "${PG_MAJOR:-18}", COLDFRONT_BASE: "${COLDFRONT_BASE:-ghcr.io/pgedge/coldfront-duckdb-base:pg${PG_MAJOR:-18}}" }, secrets: [repo_client_crt, repo_client_key] }
     hostname: db1
     environment:
       PG_MAJOR: "${PG_MAJOR:-18}"
@@ -30,7 +30,7 @@ services:
       retries: 25
 
   db2:
-    build: { context: ., dockerfile: docker/Dockerfile.duckdb15, args: { PG_MAJOR: "${PG_MAJOR:-18}", COLDFRONT_BASE: "${COLDFRONT_BASE:-ghcr.io/pgedge/coldfront-duckdb-base:pg${PG_MAJOR:-18}}" } }
+    build: { context: ., dockerfile: docker/Dockerfile.duckdb15, args: { PG_MAJOR: "${PG_MAJOR:-18}", COLDFRONT_BASE: "${COLDFRONT_BASE:-ghcr.io/pgedge/coldfront-duckdb-base:pg${PG_MAJOR:-18}}" }, secrets: [repo_client_crt, repo_client_key] }
     hostname: db2
     environment:
       PG_MAJOR: "${PG_MAJOR:-18}"
@@ -45,7 +45,7 @@ services:
       retries: 25
 
   db3:
-    build: { context: ., dockerfile: docker/Dockerfile.duckdb15, args: { PG_MAJOR: "${PG_MAJOR:-18}", COLDFRONT_BASE: "${COLDFRONT_BASE:-ghcr.io/pgedge/coldfront-duckdb-base:pg${PG_MAJOR:-18}}" } }
+    build: { context: ., dockerfile: docker/Dockerfile.duckdb15, args: { PG_MAJOR: "${PG_MAJOR:-18}", COLDFRONT_BASE: "${COLDFRONT_BASE:-ghcr.io/pgedge/coldfront-duckdb-base:pg${PG_MAJOR:-18}}" }, secrets: [repo_client_crt, repo_client_key] }
     hostname: db3
     environment:
       PG_MAJOR: "${PG_MAJOR:-18}"
@@ -108,3 +108,10 @@ services:
       timeout: 5s
       retries: 20
       start_period: 30s
+
+# pgEdge repo client cert for the image build, mounted as BuildKit secrets (never in a layer).
+secrets:
+  repo_client_crt:
+    file: ${REPO_CLIENT_CRT:-./client.crt}
+  repo_client_key:
+    file: ${REPO_CLIENT_KEY:-./client.key}
