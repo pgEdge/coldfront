@@ -236,7 +236,10 @@ git clone <coldfront-repo> && cd coldfront
 # 1. Build the base (fetches the deps above, applies our patches, compiles
 #    pg_duckdb on DuckDB 1.5.4 + the patched duckdb-iceberg). ~30–60 min,
 #    needs network + a few GB of disk/RAM. Repeat with =16 / =17 for those majors.
+#    Needs your pgEdge repo client cert (build secrets, never in the image).
 docker build -f docker/Dockerfile.duckdb15-base --build-arg PG_MAJOR=18 \
+  --secret id=repo_client_crt,src=client.crt \
+  --secret id=repo_client_key,src=client.key \
   -t ghcr.io/pgedge/coldfront-duckdb-base:pg18 .
 
 # 2. Build the thin coldfront app layer + bring up the stack (seconds - it only
