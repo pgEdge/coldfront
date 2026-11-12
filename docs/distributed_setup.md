@@ -256,9 +256,13 @@ that skipped the step keeps its acks, registry rows and secret to itself. It
 cannot run at `CREATE EXTENSION` time, because `spock.repset_add_table` needs
 the local Spock node, and nothing runs it later on a node's behalf:
 provisioning a table, setting the secret and writing cold rows all assume it
-has run. It is idempotent, so running it again is harmless. A node added to
-the mesh later runs the same stages, and every node that subscribes from it
-runs the call again, so the slot of the new subscription is published.
+has run. It is idempotent, so running it again is harmless.
+
+This page describes forming a new mesh. Adding a node to a running mesh also
+requires the new node to receive the ColdFront rows that already exist on its
+peers, such as the table registry and the storage secret; the subscriptions
+on this page skip the initial copy, so following these stages alone does not
+provide those rows, and this page does not cover that procedure.
 
 A skipped step shows up away from the node that skipped it. If a peer never
 ran it, it has published no slot, and every cold write on the other nodes
