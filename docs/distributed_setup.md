@@ -33,8 +33,8 @@ The mesh also depends on the following:
 - Each node can reach itself over a Unix socket without a password, for
   `coldfront.loopback_dsn`.
 - The database has the same name on every node (`coldfront` in the examples).
-- The nodes' clocks are synchronized, for example with NTP, because the peer
-  liveness window described in [Timeouts](#timeouts) also covers the clock
+- You must ensure that the nodes' clocks are synchronized with NTP, because the
+  peer liveness window described in [Timeouts](#timeouts) also covers the clock
   skew between nodes.
 
 ## Updating the postgresql.conf File on Each Node
