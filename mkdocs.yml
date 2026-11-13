@@ -94,6 +94,7 @@ nav:
       - Using Vended Credentials: vended_credentials.md
       - Supported Column Types: supported_types.md
       - Compacting the Cold Tier: compaction.md
+      - Testing and Continuous Integration: testing_ci.md
 
   - Developer Resources:
       - Formal Model - ColdFront Decoupled-Mode Bakery (TLA+/PlusCal): formal/README.md

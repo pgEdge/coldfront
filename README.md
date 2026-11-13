@@ -69,6 +69,9 @@ The ColdFront documentation consists of the following guides:
       PostgreSQL column types, including arrays, that a cold tier supports.
     - [Compacting the Cold Tier](docs/compaction.md) - Documents cold-tier
       table maintenance: compaction, snapshot expiry, and orphan-file removal.
+    - [Testing and Continuous Integration](docs/testing_ci.md) - Documents the
+      pre-commit gate, the full test matrix, storage-backend gating, and
+      publishing the base image.
 - Developer Resources
     - [Formal Model - ColdFront Decoupled-Mode Bakery (TLA+/PlusCal)](docs/formal/README.md)
 - [Release Notes - Changelog](docs/changelog.md)
@@ -380,7 +383,7 @@ creates.
 The deployed image is for development and testing. It trusts every connection
 without a password. For information about the image's environment variables
 and a smoke test, see
-[Building the Image on Docker](docs/installation.md#building-the-image-on-docker).
+[Building ColdFront from Source on Docker](docs/installation.md#building-coldfront-from-source-on-docker).
 
 When the extensions are created, continue with
 [Connecting a Docker Installation to Lakekeeper and an Object Store](#connecting-a-docker-installation-to-lakekeeper-and-an-object-store).
@@ -389,9 +392,11 @@ When the extensions are created, continue with
 
 Before building ColdFront on bare metal, install the pg_duckdb PostgreSQL
 extension (built on DuckDB 1.5.4, with ColdFront's pg_duckdb and DuckDB patches
-applied) and a patched duckdb-iceberg DuckDB extension. For the prerequisites
-and the patches, see
-[Building ColdFront from Source](docs/installation.md#building-coldfront-from-source).
+applied) and a patched duckdb-iceberg DuckDB extension. For the prerequisites,
+see
+[Building ColdFront from Source on Bare Metal](docs/installation.md#building-coldfront-from-source-on-bare-metal);
+for the patches, see
+[Understanding ColdFront's DuckDB Stack](docs/installation.md#understanding-coldfronts-duckdb-stack).
 You also need a running PostgreSQL 16, 17, or 18 server, `pg_config`, the
 PostgreSQL server development headers, the libpq headers and library, `make`,
 `gcc`, Go 1.26.10 or later, and golangci-lint.
@@ -463,7 +468,7 @@ PostgreSQL server development headers, the libpq headers and library, `make`,
     `CREATE EXTENSION` commands in each database that uses ColdFront.
 
 For more information, see
-[Building ColdFront on Bare Metal](docs/installation.md#building-coldfront-on-bare-metal).
+[Building ColdFront from Source on Bare Metal](docs/installation.md#building-coldfront-from-source-on-bare-metal).
 
 When the extensions are created, continue with
 [Connecting a Package or Bare-Metal Installation to Lakekeeper and an Object Store](#connecting-a-package-or-bare-metal-installation-to-lakekeeper-and-an-object-store).
@@ -518,9 +523,9 @@ the host.
     sudo apt install -y pgedge-lakekeeper        # Ubuntu, Debian
     ```
 
-    If you're not using the pgEdge repository, install the upstream binary as
-    described in
-    [Installing Lakekeeper](docs/configure_lakekeeper.md#installing-lakekeeper).
+    If you're not using the pgEdge repository, install the upstream binary and
+    create the `lakekeeper` user as described in steps 1 and 2 of
+    [Installing and Configuring Lakekeeper on Bare Metal](docs/configure_lakekeeper.md#installing-and-configuring-lakekeeper-on-bare-metal).
     Then copy the environment file and the systemd unit from the ColdFront
     repository:
 
@@ -556,8 +561,8 @@ the host.
     By default, Lakekeeper listens on every address and accepts every request.
     The loopback bind keeps it reachable only from this host. To accept clients
     from other hosts, configure authentication and authorization first, as
-    described in
-    [Preparing and Starting Lakekeeper](docs/configure_lakekeeper.md#preparing-and-starting-lakekeeper).
+    described in step 5 of
+    [Installing and Configuring Lakekeeper with Packages](docs/configure_lakekeeper.md#installing-and-configuring-lakekeeper-with-packages).
 
 5. Run the one-time migration as the `lakekeeper` user, then start
     Lakekeeper. The migration reads the environment file as that user, because
@@ -609,7 +614,7 @@ the host.
 
     If you're using a different type of object store, change the
     `storage-profile` and `storage-credential` as shown in the store's section
-    of [Configuring your Object Store](docs/object_store.md#configuring-lakekeeper).
+    of [Configuring your Object Store](docs/object_store.md).
 
 7. Store the SeaweedFS credential in each database that uses ColdFront:
 
