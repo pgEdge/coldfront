@@ -495,3 +495,31 @@ func TestRegister_RefusesValuesBeforeConnecting(t *testing.T) {
 		}
 	}
 }
+
+// set refuses a contradictory or empty change before it connects: the --dsn is
+// unparseable, so a path that reached the connection would fail with a different
+// error. Covers the `set` guards that had no test (validation matrix V33/V34).
+func TestSet_RefusesContradictoryOrEmptyChangeBeforeConnecting(t *testing.T) {
+	cases := []struct {
+		args []string
+		want string
+	}{
+		{[]string{"--enable", "--disable"}, "--enable and --disable are mutually exclusive"},
+		{nil, "nothing to change: pass a field flag or --enable/--disable"},
+	}
+	for _, c := range cases {
+		args := append([]string{"--dsn", "postgres://%zz", "--table", "events"}, c.args...)
+		if err := Run(context.Background(), "set", args); err == nil || err.Error() != c.want {
+			t.Errorf("set %v: got %v, want %q", c.args, err, c.want)
+		}
+	}
+}
+
+// export refuses an unknown --format before it connects (validation matrix V40).
+func TestExport_RefusesUnknownFormatBeforeConnecting(t *testing.T) {
+	const want = "--format must be yaml or sql"
+	args := []string{"--dsn", "postgres://%zz", "--format", "xml"}
+	if err := Run(context.Background(), "export", args); err == nil || err.Error() != want {
+		t.Errorf("export --format xml: got %v, want %q", err, want)
+	}
+}
