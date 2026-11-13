@@ -237,7 +237,7 @@ The image writes the server settings ColdFront needs into `postgresql.conf`
 when it initializes a new data directory. A server installed from packages or
 built another way sets them itself, as the
 [package](configuration.md#configuring-postgresql) and
-[bare-metal](installation.md#building-coldfront-on-bare-metal) sections of
+[bare-metal](installation.md#building-coldfront-from-source-on-bare-metal) sections of
 installation.md show:
 
 - `shared_preload_libraries = 'pg_duckdb,coldfront'` loads both extensions at
