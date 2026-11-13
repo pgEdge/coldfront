@@ -516,9 +516,9 @@ the host.
     sudo apt install -y pgedge-lakekeeper        # Ubuntu, Debian
     ```
 
-    If you're not using the pgEdge repository, install the upstream binary as
-    described in
-    [Installing Lakekeeper](docs/configure_lakekeeper.md#installing-lakekeeper).
+    If you're not using the pgEdge repository, install the upstream binary and
+    create the `lakekeeper` user as described in steps 1 and 2 of
+    [Installing and Configuring Lakekeeper on Bare Metal](docs/configure_lakekeeper.md#installing-and-configuring-lakekeeper-on-bare-metal).
     Then copy the environment file and the systemd unit from the ColdFront
     repository:
 
@@ -554,8 +554,8 @@ the host.
     By default, Lakekeeper listens on every address and accepts every request.
     The loopback bind keeps it reachable only from this host. To accept clients
     from other hosts, configure authentication and authorization first, as
-    described in
-    [Preparing and Starting Lakekeeper](docs/configure_lakekeeper.md#preparing-and-starting-lakekeeper).
+    described in step 5 of
+    [Installing and Configuring Lakekeeper with Packages](docs/configure_lakekeeper.md#installing-and-configuring-lakekeeper-with-packages).
 
 5. Run the one-time migration as the `lakekeeper` user, then start
     Lakekeeper. The migration reads the environment file as that user, because
@@ -607,7 +607,7 @@ the host.
 
     If you're using a different type of object store, change the
     `storage-profile` and `storage-credential` as shown in the store's section
-    of [Configuring your Object Store](docs/object_store.md#configuring-lakekeeper).
+    of [Configuring your Object Store](docs/object_store.md).
 
 7. Store the SeaweedFS credential in each database that uses ColdFront:
 
