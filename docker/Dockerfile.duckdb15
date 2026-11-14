@@ -21,14 +21,20 @@
 # copy and disables the repos, so no layer holds it. Compose reads it from
 # REPO_CLIENT_CRT / REPO_CLIENT_KEY (default ./client.crt, ./client.key).
 ARG PG_MAJOR=18
-ARG PGEDGE_TAG=${PG_MAJOR}-spock5-minimal
 ARG COLDFRONT_BASE=ghcr.io/pgedge/coldfront-duckdb-base:pg${PG_MAJOR}
+
+# The pgEdge Postgres image for each major, by immutable tag. One alias per
+# major, picked by PG_MAJOR, because a FROM cannot nest ARG expansion; the
+# unused aliases are never pulled.
+FROM ghcr.io/pgedge/pgedge-postgres:16.16-spock5.0.14-minimal-1 AS pgedge-16
+FROM ghcr.io/pgedge/pgedge-postgres:17.12-spock5.0.14-minimal-1 AS pgedge-17
+FROM ghcr.io/pgedge/pgedge-postgres:18.7-spock5.0.14-minimal-1  AS pgedge-18
 
 # ─── coldfront compile stage: PG devel headers only (no pg_duckdb linkage) ───────
 # coldfront.c includes only PostgreSQL server headers + libpq-fe.h and links -lpq;
 # it does NOT link pg_duckdb, so this stage needs just the PG devel toolchain and
 # builds in seconds (the heavy pg_duckdb/iceberg compiles live in the base).
-FROM ghcr.io/pgedge/pgedge-postgres:${PGEDGE_TAG} AS cf-build
+FROM pgedge-${PG_MAJOR} AS cf-build
 ARG PG_MAJOR
 USER root
 # Repos are gated and disabled in the parent; see the header.
