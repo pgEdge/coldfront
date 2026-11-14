@@ -43,6 +43,19 @@ q_may() { local c="$1"; shift; docker exec -e PGUSER="$CF_DBUSER" -e PGDATABASE=
 # extract KEY "$BLOCK"  — pull the value from a "KEY:value" line in a captured block.
 extract() { echo "$2" | grep "^$1:" | head -1 | cut -d: -f2-; }
 
+# run_logged <cmd...>: run quietly; on failure print the tail of its output.
+run_logged() {
+    local log rc=0
+    log="$(mktemp)"
+    "$@" >"$log" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "failed (rc=$rc): $*" >&2
+        tail -n 80 "$log" >&2
+    fi
+    rm -f "$log"
+    return "$rc"
+}
+
 # require_base <pg>: resolve the base image the tree's recipe maps to
 # (ci/base-ref.sh), make sure it is present locally or pullable, and export it
 # as COLDFRONT_BASE for the app build. A base that is neither stops the run here

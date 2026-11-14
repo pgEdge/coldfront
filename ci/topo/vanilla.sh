@@ -138,12 +138,13 @@ trap topo_teardown EXIT
 
 step "vanilla: build + up ($COMPOSE_FILE)"
 $COMPOSE down -v >/dev/null 2>&1 || true
-$COMPOSE up -d --build >/dev/null 2>&1
+# shellcheck disable=SC2086  # COMPOSE is a command line
+run_logged $COMPOSE up -d --build || true
 for _ in $(seq 1 30); do
     [ "$(docker inspect -f '{{.State.Health.Status}}' "$DB" 2>/dev/null)" = "healthy" ] && break
     sleep 2
 done
-[ "$(docker inspect -f '{{.State.Health.Status}}' "$DB" 2>/dev/null)" = "healthy" ] || { echo "db not healthy"; exit 1; }
+[ "$(docker inspect -f '{{.State.Health.Status}}' "$DB" 2>/dev/null)" = "healthy" ] || { echo "db not healthy"; docker logs --tail 40 "$DB" 2>&1; exit 1; }
 
 ip() { docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$1"; }
 DB_IP=$(ip "$DB"); LK_IP=$(ip coldfront-lakekeeper-1)
@@ -255,7 +256,7 @@ if [ "$REGRESS" = 1 ]; then
     # coldfront.warehouse/lakekeeper_endpoint to '' so ensure_attached() is a no-op
     # and Lakekeeper isn't needed here.
     BUILD_IMG="coldfront-regress:pg${PG}"
-    docker build -f docker/Dockerfile.duckdb15 --build-arg PG_MAJOR="$PG" --target cf-build "${REPO_SECRET_ARGS[@]}" -t "$BUILD_IMG" . >/dev/null 2>&1
+    run_logged docker build -f docker/Dockerfile.duckdb15 --build-arg PG_MAJOR="$PG" --target cf-build "${REPO_SECRET_ARGS[@]}" -t "$BUILD_IMG" . || true
     NET=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' "$DB")
     if docker run --rm --network "$NET" \
            -e PGHOST=db -e PGPORT=5432 -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" \
