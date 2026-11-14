@@ -65,7 +65,9 @@ require_base() {
     ref="$("${BASH_SOURCE[0]%/*}/base-ref.sh" "$pg")" || return 1
     if ! docker image inspect "$ref" >/dev/null 2>&1 && ! err="$(docker pull "$ref" 2>&1)"; then
         echo "base image $ref is not available (${err##*$'\n'})" >&2
-        echo "  build it locally:  docker build -f docker/Dockerfile.duckdb15-base --build-arg PG_MAJOR=$pg -t $ref ." >&2
+        echo "  build it locally:  docker build -f docker/Dockerfile.duckdb15-base --build-arg PG_MAJOR=$pg \\" >&2
+        echo "                       --secret id=repo_client_crt,src=${REPO_CLIENT_CRT:-client.crt} \\" >&2
+        echo "                       --secret id=repo_client_key,src=${REPO_CLIENT_KEY:-client.key} -t $ref ." >&2
         echo "  or publish it:     gh workflow run base-image.yml --ref ${GITHUB_HEAD_REF:-${GITHUB_REF_NAME:-$(git rev-parse --abbrev-ref HEAD)}} -f push=true" >&2
         return 1
     fi

@@ -9,6 +9,8 @@
 # either pull it from ghcr.io/pgedge/coldfront-duckdb-base or build it locally
 # first (it is then used from the local image cache):
 #   docker build -f docker/Dockerfile.duckdb15-base --build-arg PG_MAJOR=18 \
+#       --secret id=repo_client_crt,src=client.crt \
+#       --secret id=repo_client_key,src=client.key \
 #       -t ghcr.io/pgedge/coldfront-duckdb-base:pg18 .
 #
 #   docker build -f docker/Dockerfile.duckdb15 --build-arg PG_MAJOR=18 \
