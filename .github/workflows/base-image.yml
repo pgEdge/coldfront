@@ -108,6 +108,20 @@ jobs:
             echo "exists=true" >> "$GITHUB_OUTPUT"
             echo "$REPO:$VTAG is already published; nothing to build"
           fi
+      # The base build needs the pgEdge repo client cert; BuildKit mounts it as a secret, never into a layer.
+      - name: Write the repository client certificate
+        if: steps.exists.outputs.exists != 'true'
+        env:
+          REPO_CLIENT_CRT_PEM: ${{ secrets.PGEDGE_REPO_CLIENT_CRT }}
+          REPO_CLIENT_KEY_PEM: ${{ secrets.PGEDGE_REPO_CLIENT_KEY }}
+        run: |
+          set -o errexit -o pipefail -o nounset
+          : "${REPO_CLIENT_CRT_PEM:?is empty or unset}"
+          : "${REPO_CLIENT_KEY_PEM:?is empty or unset}"
+          install -d -m 0700 "${RUNNER_TEMP}/pgedge-certs"
+          install -m 0600 /dev/null "${RUNNER_TEMP}/pgedge-certs/client.key"
+          printf '%s\n' "$REPO_CLIENT_CRT_PEM" > "${RUNNER_TEMP}/pgedge-certs/client.crt"
+          printf '%s\n' "$REPO_CLIENT_KEY_PEM" > "${RUNNER_TEMP}/pgedge-certs/client.key"
       - name: Build base image (linux/${{ matrix.arch }})
         if: steps.exists.outputs.exists != 'true'
         run: |
@@ -117,6 +131,8 @@ jobs:
             --platform linux/${{ matrix.arch }} \
             --build-arg TARGETARCH=${{ matrix.arch }} \
             --build-arg PG_MAJOR=${{ matrix.pg }} \
+            --secret id=repo_client_crt,src="${RUNNER_TEMP}/pgedge-certs/client.crt" \
+            --secret id=repo_client_key,src="${RUNNER_TEMP}/pgedge-certs/client.key" \
             -f docker/Dockerfile.duckdb15-base \
             -t "$REPO:$VTAG" \
             --load .

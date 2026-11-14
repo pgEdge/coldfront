@@ -43,6 +43,19 @@ q_may() { local c="$1"; shift; docker exec -e PGUSER="$CF_DBUSER" -e PGDATABASE=
 # extract KEY "$BLOCK"  — pull the value from a "KEY:value" line in a captured block.
 extract() { echo "$2" | grep "^$1:" | head -1 | cut -d: -f2-; }
 
+# run_logged <cmd...>: run quietly; on failure print the tail of its output.
+run_logged() {
+    local log rc=0
+    log="$(mktemp)"
+    "$@" >"$log" 2>&1 || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        echo "failed (rc=$rc): $*" >&2
+        tail -n 80 "$log" >&2
+    fi
+    rm -f "$log"
+    return "$rc"
+}
+
 # require_base <pg>: resolve the base image the tree's recipe maps to
 # (ci/base-ref.sh), make sure it is present locally or pullable, and export it
 # as COLDFRONT_BASE for the app build. A base that is neither stops the run here
@@ -52,11 +65,43 @@ require_base() {
     ref="$("${BASH_SOURCE[0]%/*}/base-ref.sh" "$pg")" || return 1
     if ! docker image inspect "$ref" >/dev/null 2>&1 && ! err="$(docker pull "$ref" 2>&1)"; then
         echo "base image $ref is not available (${err##*$'\n'})" >&2
-        echo "  build it locally:  docker build -f docker/Dockerfile.duckdb15-base --build-arg PG_MAJOR=$pg -t $ref ." >&2
+        echo "  build it locally:  docker build -f docker/Dockerfile.duckdb15-base --build-arg PG_MAJOR=$pg \\" >&2
+        echo "                       --secret id=repo_client_crt,src=${REPO_CLIENT_CRT:-client.crt} \\" >&2
+        echo "                       --secret id=repo_client_key,src=${REPO_CLIENT_KEY:-client.key} -t $ref ." >&2
         echo "  or publish it:     gh workflow run base-image.yml --ref ${GITHUB_HEAD_REF:-${GITHUB_REF_NAME:-$(git rev-parse --abbrev-ref HEAD)}} -f push=true" >&2
         return 1
     fi
     export COLDFRONT_BASE="$ref"
+    require_repo_client || return 1
+}
+
+# require_repo_client: resolve the pgEdge repo client cert (REPO_CLIENT_CRT /
+# REPO_CLIENT_KEY, default <repo>/client.{crt,key}), fail if missing, export the
+# paths for compose and set REPO_SECRET_ARGS for `docker build`.
+require_repo_client() {
+    local root crt key
+    root="$(cd "${BASH_SOURCE[0]%/*}/.." && pwd -P)"
+    crt="${REPO_CLIENT_CRT:-$root/client.crt}"
+    key="${REPO_CLIENT_KEY:-$root/client.key}"
+    if [ ! -r "$crt" ] || [ ! -r "$key" ]; then
+        echo "pgEdge repository client certificate not found: need $crt and $key" >&2
+        echo "  put client.crt and client.key at the repo root, or set REPO_CLIENT_CRT and REPO_CLIENT_KEY to their paths" >&2
+        return 1
+    fi
+    # Physical paths: bake follows symlinks, so a link at the repo root that
+    # points outside it counts as outside.
+    REPO_CLIENT_CRT="$(realpath "$crt")"
+    REPO_CLIENT_KEY="$(realpath "$key")"
+    export REPO_CLIENT_CRT REPO_CLIENT_KEY
+    # compose (buildx bake) won't read secret files outside the project dir
+    # without fs.read, and compose has no --allow flag.
+    case "$REPO_CLIENT_CRT:$REPO_CLIENT_KEY" in
+        "$root"/*:"$root"/*) ;;
+        *) export BUILDX_BAKE_ENTITLEMENTS_FS=0;;
+    esac
+    # shellcheck disable=SC2034  # read by the scripts that source this file
+    REPO_SECRET_ARGS=(--secret "id=repo_client_crt,src=$REPO_CLIENT_CRT"
+                      --secret "id=repo_client_key,src=$REPO_CLIENT_KEY")
 }
 
 # summary  — print pass/fail tally; returns nonzero if any FAIL (drives matrix exit code).

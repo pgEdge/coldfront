@@ -66,6 +66,26 @@ jobs:
       # SeaweedFS-only: --quick never touches a cloud STORAGE backend, so this job
       # gets no cloud storage credentials by design. It still logs in to GHCR —
       # only to PULL the coldfront-duckdb-base image the app builds FROM.
+      # The image build needs the pgEdge repo client cert; BuildKit mounts it as a secret, never into a layer.
+      - name: Write the repository client certificate
+        env:
+          REPO_CLIENT_CRT_PEM: ${{ secrets.PGEDGE_REPO_CLIENT_CRT }}
+          REPO_CLIENT_KEY_PEM: ${{ secrets.PGEDGE_REPO_CLIENT_KEY }}
+        run: |
+          set -o errexit -o pipefail -o nounset
+          : "${REPO_CLIENT_CRT_PEM:?is empty or unset}"
+          : "${REPO_CLIENT_KEY_PEM:?is empty or unset}"
+          install -d -m 0700 "${RUNNER_TEMP}/pgedge-certs"
+          install -m 0600 /dev/null "${RUNNER_TEMP}/pgedge-certs/client.key"
+          printf '%s\n' "$REPO_CLIENT_CRT_PEM" > "${RUNNER_TEMP}/pgedge-certs/client.crt"
+          printf '%s\n' "$REPO_CLIENT_KEY_PEM" > "${RUNNER_TEMP}/pgedge-certs/client.key"
+          {
+            echo "REPO_CLIENT_CRT=${RUNNER_TEMP}/pgedge-certs/client.crt"
+            echo "REPO_CLIENT_KEY=${RUNNER_TEMP}/pgedge-certs/client.key"
+            # compose (buildx bake) won't read secret files outside the project dir otherwise; it has no --allow flag.
+            echo "BUILDX_BAKE_ENTITLEMENTS_FS=0"
+          } >> "$GITHUB_ENV"
+
       - name: Log in to GHCR (pull base image)
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
       - name: ci/matrix.sh --quick
@@ -114,6 +134,26 @@ jobs:
 
       - name: Install mkdocs (for docs --strict preflight)
         run: pipx install mkdocs && pipx inject mkdocs mkdocs-material
+
+      # The image build needs the pgEdge repo client cert; BuildKit mounts it as a secret, never into a layer.
+      - name: Write the repository client certificate
+        env:
+          REPO_CLIENT_CRT_PEM: ${{ secrets.PGEDGE_REPO_CLIENT_CRT }}
+          REPO_CLIENT_KEY_PEM: ${{ secrets.PGEDGE_REPO_CLIENT_KEY }}
+        run: |
+          set -o errexit -o pipefail -o nounset
+          : "${REPO_CLIENT_CRT_PEM:?is empty or unset}"
+          : "${REPO_CLIENT_KEY_PEM:?is empty or unset}"
+          install -d -m 0700 "${RUNNER_TEMP}/pgedge-certs"
+          install -m 0600 /dev/null "${RUNNER_TEMP}/pgedge-certs/client.key"
+          printf '%s\n' "$REPO_CLIENT_CRT_PEM" > "${RUNNER_TEMP}/pgedge-certs/client.crt"
+          printf '%s\n' "$REPO_CLIENT_KEY_PEM" > "${RUNNER_TEMP}/pgedge-certs/client.key"
+          {
+            echo "REPO_CLIENT_CRT=${RUNNER_TEMP}/pgedge-certs/client.crt"
+            echo "REPO_CLIENT_KEY=${RUNNER_TEMP}/pgedge-certs/client.key"
+            # compose (buildx bake) won't read secret files outside the project dir otherwise; it has no --allow flag.
+            echo "BUILDX_BAKE_ENTITLEMENTS_FS=0"
+          } >> "$GITHUB_ENV"
 
       - name: Log in to GHCR (pull base image)
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
@@ -198,6 +238,26 @@ jobs:
           curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
             | sh -s -- -b "$(go env GOPATH)/bin" v2.12.2
 
+      # The image build needs the pgEdge repo client cert; BuildKit mounts it as a secret, never into a layer.
+      - name: Write the repository client certificate
+        env:
+          REPO_CLIENT_CRT_PEM: ${{ secrets.PGEDGE_REPO_CLIENT_CRT }}
+          REPO_CLIENT_KEY_PEM: ${{ secrets.PGEDGE_REPO_CLIENT_KEY }}
+        run: |
+          set -o errexit -o pipefail -o nounset
+          : "${REPO_CLIENT_CRT_PEM:?is empty or unset}"
+          : "${REPO_CLIENT_KEY_PEM:?is empty or unset}"
+          install -d -m 0700 "${RUNNER_TEMP}/pgedge-certs"
+          install -m 0600 /dev/null "${RUNNER_TEMP}/pgedge-certs/client.key"
+          printf '%s\n' "$REPO_CLIENT_CRT_PEM" > "${RUNNER_TEMP}/pgedge-certs/client.crt"
+          printf '%s\n' "$REPO_CLIENT_KEY_PEM" > "${RUNNER_TEMP}/pgedge-certs/client.key"
+          {
+            echo "REPO_CLIENT_CRT=${RUNNER_TEMP}/pgedge-certs/client.crt"
+            echo "REPO_CLIENT_KEY=${RUNNER_TEMP}/pgedge-certs/client.key"
+            # compose (buildx bake) won't read secret files outside the project dir otherwise; it has no --allow flag.
+            echo "BUILDX_BAKE_ENTITLEMENTS_FS=0"
+          } >> "$GITHUB_ENV"
+
       - name: Log in to GHCR (pull base image)
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin
       - name: aws-vended cells
@@ -261,6 +321,26 @@ jobs:
         run: |
           curl -sSfL https://raw.githubusercontent.com/golangci/golangci-lint/HEAD/install.sh \
             | sh -s -- -b "$(go env GOPATH)/bin" v2.12.2
+
+      # The image build needs the pgEdge repo client cert; BuildKit mounts it as a secret, never into a layer.
+      - name: Write the repository client certificate
+        env:
+          REPO_CLIENT_CRT_PEM: ${{ secrets.PGEDGE_REPO_CLIENT_CRT }}
+          REPO_CLIENT_KEY_PEM: ${{ secrets.PGEDGE_REPO_CLIENT_KEY }}
+        run: |
+          set -o errexit -o pipefail -o nounset
+          : "${REPO_CLIENT_CRT_PEM:?is empty or unset}"
+          : "${REPO_CLIENT_KEY_PEM:?is empty or unset}"
+          install -d -m 0700 "${RUNNER_TEMP}/pgedge-certs"
+          install -m 0600 /dev/null "${RUNNER_TEMP}/pgedge-certs/client.key"
+          printf '%s\n' "$REPO_CLIENT_CRT_PEM" > "${RUNNER_TEMP}/pgedge-certs/client.crt"
+          printf '%s\n' "$REPO_CLIENT_KEY_PEM" > "${RUNNER_TEMP}/pgedge-certs/client.key"
+          {
+            echo "REPO_CLIENT_CRT=${RUNNER_TEMP}/pgedge-certs/client.crt"
+            echo "REPO_CLIENT_KEY=${RUNNER_TEMP}/pgedge-certs/client.key"
+            # compose (buildx bake) won't read secret files outside the project dir otherwise; it has no --allow flag.
+            echo "BUILDX_BAKE_ENTITLEMENTS_FS=0"
+          } >> "$GITHUB_ENV"
 
       - name: Log in to GHCR (pull base image)
         run: echo "${{ secrets.GITHUB_TOKEN }}" | docker login ghcr.io -u "${{ github.actor }}" --password-stdin

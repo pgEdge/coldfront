@@ -437,11 +437,16 @@ always uses the current source:
    patched duckdb-iceberg that
    [Understanding ColdFront's DuckDB Stack](#understanding-coldfronts-duckdb-stack)
    describes. The build takes 30 to 60 minutes and needs network access and a
-   few GB of disk space and RAM:
+   few GB of disk space and RAM. The build installs from the pgEdge package
+   repositories, so the command passes your repository client certificate and
+   key, `client.crt` and `client.key` at the repo root, as build secrets; the
+   build never stores them in the image:
 
     ```bash
     docker build -f docker/Dockerfile.duckdb15-base \
       --build-arg PG_MAJOR="$PG_MAJOR" \
+      --secret id=repo_client_crt,src=client.crt \
+      --secret id=repo_client_key,src=client.key \
       -t "ghcr.io/pgedge/coldfront-duckdb-base:pg$PG_MAJOR" .
     ```
 
@@ -453,9 +458,15 @@ always uses the current source:
    [`docker/Dockerfile.duckdb15`](https://github.com/pgEdge/ColdFront/blob/main/docker/Dockerfile.duckdb15),
    starts from your local base image if you built one in step 2, or from the
    published image otherwise, and compiles only the `coldfront` extension.
-   The commands publish each port on the loopback address only, because the
-   PostgreSQL server trusts every connection and Lakekeeper runs without
-   authentication:
+   The app build also installs from the pgEdge package repositories, so place
+   your repository client certificate and key at the repo root as `client.crt`
+   and `client.key`, or set `REPO_CLIENT_CRT` and `REPO_CLIENT_KEY` to their
+   paths; the build mounts them as secrets and never stores them in the image.
+   If either file is outside the repo (including through a symlink), also run
+   `export BUILDX_BAKE_ENTITLEMENTS_FS=0`, because Compose will not otherwise
+   read it. The commands publish each port on the loopback address only,
+   because the PostgreSQL server trusts every connection and Lakekeeper runs
+   without authentication:
 
     ```bash
     export COLDFRONT_PG_PORT=127.0.0.1:5432 COLDFRONT_LK_PORT=127.0.0.1:8181 \

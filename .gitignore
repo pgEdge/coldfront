@@ -73,3 +73,7 @@ github_token_do_not_merge.txt
 *-token.txt
 *_token*.txt
 
+
+# pgEdge repo client cert used by the image builds
+client.crt
+client.key

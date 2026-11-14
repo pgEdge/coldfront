@@ -13,12 +13,21 @@
 #
 #   # native (host arch):
 #   docker build -f docker/Dockerfile.duckdb15-base --build-arg PG_MAJOR=18 \
+#       --secret id=repo_client_crt,src=client.crt \
+#       --secret id=repo_client_key,src=client.key \
 #       -t ghcr.io/pgedge/coldfront-duckdb-base:pg18 .
 #
 #   # cross-build arm64 under emulation on an x86_64 host (needs buildx + QEMU:
 #   #   docker run --privileged --rm tonistiigi/binfmt --install arm64):
 #   docker buildx build --platform linux/arm64 -f docker/Dockerfile.duckdb15-base \
-#       --build-arg PG_MAJOR=18 -t coldfront-duckdb-base:pg18-arm64 --load .
+#       --build-arg PG_MAJOR=18 \
+#       --secret id=repo_client_crt,src=client.crt \
+#       --secret id=repo_client_key,src=client.key \
+#       -t coldfront-duckdb-base:pg18-arm64 --load .
+#
+# The pgEdge repos need a client cert (mTLS). It comes in as BuildKit secrets,
+# mounted only into the installing RUNs; each RUN's trap deletes the installed
+# copy and disables the repos, so no layer holds it.
 ARG PG_MAJOR=18
 ARG PGEDGE_TAG=${PG_MAJOR}-spock5-minimal
 
@@ -36,13 +45,19 @@ ARG TARGETARCH=amd64
 FROM ghcr.io/pgedge/pgedge-postgres:${PGEDGE_TAG} AS build
 ARG PG_MAJOR
 USER root
-RUN dnf install -y --setopt=install_weak_deps=False \
+# Repos are gated and disabled in the parent; see the header.
+RUN --mount=type=secret,id=repo_client_crt,required=true \
+    --mount=type=secret,id=repo_client_key,required=true \
+    set -eu; \
+    trap 'rm -f /etc/pki/pgedge/client.crt /etc/pki/pgedge/client.key; dnf config-manager --set-disabled "pgedge*" >/dev/null 2>&1 || true' EXIT; \
+    pgedge-subscription-manager install /run/secrets/repo_client_crt /run/secrets/repo_client_key --force; \
+    dnf install -y --setopt=install_weak_deps=False \
         pgedge-postgresql${PG_MAJOR}-devel \
         gcc gcc-c++ make cmake ninja-build git \
         redhat-rpm-config \
         openssl-devel libcurl-devel lz4-devel zlib-devel libicu-devel \
-        pkgconf-pkg-config python3 wget tar gzip \
-    && dnf clean all
+        pkgconf-pkg-config python3 wget tar gzip; \
+    dnf clean all
 
 ENV PATH=/usr/pgsql-${PG_MAJOR}/bin:$PATH
 ENV PG_CONFIG=/usr/pgsql-${PG_MAJOR}/bin/pg_config
@@ -202,10 +217,16 @@ FROM ghcr.io/pgedge/pgedge-postgres:${PGEDGE_TAG}
 ARG PG_MAJOR
 ARG TARGETARCH
 USER root
-RUN dnf update -y \
-    && dnf install -y --setopt=install_weak_deps=False --allowerasing \
-        libcurl lz4 pgedge-postgresql${PG_MAJOR}-contrib openssl \
-    && dnf clean all
+# Repos are gated and disabled in the parent; see the header.
+RUN --mount=type=secret,id=repo_client_crt,required=true \
+    --mount=type=secret,id=repo_client_key,required=true \
+    set -eu; \
+    trap 'rm -f /etc/pki/pgedge/client.crt /etc/pki/pgedge/client.key; dnf config-manager --set-disabled "pgedge*" >/dev/null 2>&1 || true' EXIT; \
+    pgedge-subscription-manager install /run/secrets/repo_client_crt /run/secrets/repo_client_key --force; \
+    dnf update -y; \
+    dnf install -y --setopt=install_weak_deps=False --allowerasing \
+        libcurl lz4 pgedge-postgresql${PG_MAJOR}-contrib openssl; \
+    dnf clean all
 
 # pg_duckdb 1.5.4 + bundled libduckdb 1.5.4 + extension SQL/control (NO coldfront)
 COPY --from=build /out/usr/pgsql-${PG_MAJOR}/lib/             /usr/pgsql-${PG_MAJOR}/lib/
