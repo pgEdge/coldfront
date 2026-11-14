@@ -154,15 +154,15 @@ BOOLEAN
 [ Rows: 0]
 
 
-                                                                                                                                           QUERY PLAN                                                                                                                                           
-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                                            QUERY PLAN                                                                                                                                             
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
    Output: 1
    CTE m
      ->  Update on coldfront._dummy_dml_target
            ->  Seq Scan on coldfront._dummy_dml_target
                  Output: _dummy_dml_target.anchor, _dummy_dml_target.ctid
-                 Filter: (_exec_iceberg_with_claim('ice.default.events'::text, 'MERGE INTO ice.default.events t    USING pglocal.public.src s    ON ((t.id = s.id) AND (t.ts < ''2026-01-01 00:00:00+00''::timestamptz))    WHEN MATCHED     THEN UPDATE SET status = s.status'::text) IS NULL)
+                 Filter: (_exec_iceberg_with_claim('ice.default.events'::text, 'MERGE INTO ice.default.events AS t    USING pglocal.public.src s    ON ((t.id = s.id) AND (t.ts < ''2026-01-01 00:00:00+00''::timestamptz))    WHEN MATCHED     THEN UPDATE SET status = s.status'::text) IS NULL)
 (7 rows)
 
 -- What runs in DuckDB cannot return rows or read another WITH entry; a nested
