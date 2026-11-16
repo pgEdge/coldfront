@@ -91,8 +91,9 @@ RUN chmod +x /usr/local/bin/coldfront-entrypoint.sh /usr/local/bin/coldfront-mat
 # published base, a stale base would silently lack it and local CI would diverge
 # from GitHub CI.
 #
-# An older base has a pre-gating pgedge-release (repo enabled, no
-# pgedge-subscription-manager): disable it and upgrade pgedge-release first.
+# A base with pgedge-release 1.x has the repo enabled and no
+# pgedge-subscription-manager: disable the repo first, and install the current
+# pgedge-release before installing the cert.
 RUN --mount=type=secret,id=repo_client_crt \
     --mount=type=secret,id=repo_client_key \
     set -eu; \
