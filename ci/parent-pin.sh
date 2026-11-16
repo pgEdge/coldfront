@@ -11,7 +11,8 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
-digest() { docker buildx imagetools inspect --format '{{.Manifest.Digest}}' "$1"; }
+# The sha256 of an image's raw manifest is its digest.
+digest() { docker buildx imagetools inspect --raw "$1" | sha256sum; }
 
 mapfile -t pins < <(sed -nE 's/^FROM (ghcr\.io\/pgedge\/pgedge-postgres:[^ ]+).*/\1/p' docker/Dockerfile.duckdb15)
 [ "${#pins[@]}" -gt 0 ] || { echo "no pgEdge Postgres pin in docker/Dockerfile.duckdb15" >&2; exit 1; }
