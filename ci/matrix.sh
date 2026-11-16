@@ -160,7 +160,7 @@ prebuild_duckdb15() {
     step "prebuild coldfront-duckdb15:pg${pg} (azure image)"
     require_base "$pg" || { fail "prebuild coldfront-duckdb15:pg${pg}"; return 1; }
     if docker build -f docker/Dockerfile.duckdb15 --build-arg PG_MAJOR="$pg" \
-           --build-arg COLDFRONT_BASE="$COLDFRONT_BASE" \
+           --build-arg COLDFRONT_BASE="$COLDFRONT_BASE" "${REPO_SECRET_ARGS[@]}" \
            -t "coldfront-duckdb15:pg${pg}" . >/dev/null 2>&1; then
         pass "image coldfront-duckdb15:pg${pg}"
     else

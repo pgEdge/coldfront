@@ -64,12 +64,13 @@ m() { local n="$1"; shift; docker exec -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF
 
 step "mesh: build + up ($COMPOSE_FILE, pg$PG)"
 $COMPOSE down -v >/dev/null 2>&1 || true
-$COMPOSE up -d --build >/dev/null 2>&1
+# shellcheck disable=SC2086  # COMPOSE is a command line
+run_logged $COMPOSE up -d --build || true
 for _ in $(seq 1 60); do
     h=0; for n in $NODES; do [ "$(docker inspect -f '{{.State.Health.Status}}' "coldfront-${n}-1" 2>/dev/null)" = "healthy" ] && h=$((h+1)); done
     [ "$h" = 3 ] && break; sleep 2
 done
-[ "${h:-0}" = 3 ] || { echo "not all nodes healthy ($h/3)"; exit 1; }
+[ "${h:-0}" = 3 ] || { echo "not all nodes healthy ($h/3)"; for n in $NODES; do docker logs --tail 20 "coldfront-${n}-1" 2>&1; done; exit 1; }
 
 ip() { docker inspect -f '{{range.NetworkSettings.Networks}}{{.IPAddress}}{{end}}' "$1"; }
 DB1_IP=$(ip "$PRIMARY"); LK_IP=$(ip coldfront-lakekeeper-1)

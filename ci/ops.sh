@@ -41,6 +41,7 @@ while [ $# -gt 0 ]; do case "$1" in
   *) echo "ops.sh: unknown arg $1"; exit 2;;
 esac; done
 export PG_MAJOR="$PG"
+require_repo_client || exit 1   # the compose build's repository secrets
 COMPOSE_FILE="docker-compose.matrix.yml"
 COMPOSE="docker compose -f $COMPOSE_FILE"
 DB=coldfront-db-1; LK=coldfront-lakekeeper-1; SW=coldfront-seaweedfs-1

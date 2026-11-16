@@ -6,10 +6,13 @@
 # golangci-lint, shellcheck, hadolint, actionlint, unit tests, build), brings
 # up the stack, runs the pg_regress
 # unit layer, and
-# walks the canonical user journey (ci/journey.sh) — which now includes the
-# race-window regression. The full deployment matrix is `ci/matrix.sh --full`.
+# walks the canonical user journey (ci/journey.sh). The full deployment matrix
+# is `ci/matrix.sh --full`.
 #
 # Per CLAUDE.md, GitHub Actions must run the identical ci/matrix.sh steps.
 set -euo pipefail
 cd "$(dirname "$0")"
+# With no pgEdge repo client cert present, the image build goes without one
+# (ci/lib.sh). GitHub Actions calls ci/matrix.sh itself and never sets this.
+export REPO_NO_CLIENT_CERT=1
 exec ./ci/matrix.sh --quick
