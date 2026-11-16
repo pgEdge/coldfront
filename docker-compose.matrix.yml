@@ -17,6 +17,7 @@ services:
       args:
         PG_MAJOR: ${PG_MAJOR:-18}
         COLDFRONT_BASE: ${COLDFRONT_BASE:-ghcr.io/pgedge/coldfront-duckdb-base:pg${PG_MAJOR:-18}}
+        REPO_NO_CLIENT_CERT: ${REPO_NO_CLIENT_CERT:-}
     environment:
       PG_MAJOR: ${PG_MAJOR:-18}
       MESH: "off"

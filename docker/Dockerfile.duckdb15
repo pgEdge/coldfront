@@ -22,6 +22,9 @@
 # mounted only into the installing RUNs; each RUN's trap deletes the installed
 # copy and disables the repos, so no layer holds it. Compose reads it from
 # REPO_CLIENT_CRT / REPO_CLIENT_KEY (default ./client.crt, ./client.key).
+# Without the secrets the build stops, unless REPO_NO_CLIENT_CERT=1: the build
+# then drops the repo's client cert options and installs without one.
+# run-ci-local.sh sets it, and ci/lib.sh passes it on when no cert is present.
 ARG PG_MAJOR=18
 ARG COLDFRONT_BASE=ghcr.io/pgedge/coldfront-duckdb-base:pg${PG_MAJOR}
 
@@ -38,13 +41,22 @@ FROM ghcr.io/pgedge/pgedge-postgres:18.7-spock5.0.14-minimal-1  AS pgedge-18
 # builds in seconds (the heavy pg_duckdb/iceberg compiles live in the base).
 FROM pgedge-${PG_MAJOR} AS cf-build
 ARG PG_MAJOR
+ARG REPO_NO_CLIENT_CERT
 USER root
 # Repos are gated and disabled in the parent; see the header.
-RUN --mount=type=secret,id=repo_client_crt,required=true \
-    --mount=type=secret,id=repo_client_key,required=true \
+RUN --mount=type=secret,id=repo_client_crt \
+    --mount=type=secret,id=repo_client_key \
     set -eu; \
     trap 'rm -f /etc/pki/pgedge/client.crt /etc/pki/pgedge/client.key; dnf config-manager --set-disabled "pgedge*" >/dev/null 2>&1 || true' EXIT; \
-    pgedge-subscription-manager install /run/secrets/repo_client_crt /run/secrets/repo_client_key --force; \
+    if [ -s /run/secrets/repo_client_crt ] && [ -s /run/secrets/repo_client_key ]; then \
+        pgedge-subscription-manager install /run/secrets/repo_client_crt /run/secrets/repo_client_key --force; \
+    elif [ "${REPO_NO_CLIENT_CERT:-}" = 1 ]; then \
+        sed -i '/^sslclient/d' /etc/yum.repos.d/pgedge.repo; \
+        dnf config-manager --set-enabled pgedge pgedge-noarch; \
+    else \
+        echo "pgEdge repository client certificate required: pass the repo_client_crt and repo_client_key build secrets" >&2; \
+        exit 1; \
+    fi; \
     dnf install -y --setopt=install_weak_deps=False \
         pgedge-postgresql${PG_MAJOR}-devel gcc make redhat-rpm-config diffutils; \
     dnf clean all
@@ -65,6 +77,7 @@ RUN DESTDIR=/out make -C /build/coldfront install with_llvm=no
 # and an entrypoint change never needs a base rebuild.
 FROM ${COLDFRONT_BASE}
 ARG PG_MAJOR
+ARG REPO_NO_CLIENT_CERT
 USER root
 COPY --from=cf-build /out/usr/pgsql-${PG_MAJOR}/lib/             /usr/pgsql-${PG_MAJOR}/lib/
 COPY --from=cf-build /out/usr/pgsql-${PG_MAJOR}/share/extension/ /usr/pgsql-${PG_MAJOR}/share/extension/
@@ -80,15 +93,23 @@ RUN chmod +x /usr/local/bin/coldfront-entrypoint.sh /usr/local/bin/coldfront-mat
 #
 # An older base has a pre-gating pgedge-release (repo enabled, no
 # pgedge-subscription-manager): disable it and upgrade pgedge-release first.
-RUN --mount=type=secret,id=repo_client_crt,required=true \
-    --mount=type=secret,id=repo_client_key,required=true \
+RUN --mount=type=secret,id=repo_client_crt \
+    --mount=type=secret,id=repo_client_key \
     set -eu; \
     trap 'rm -f /etc/pki/pgedge/client.crt /etc/pki/pgedge/client.key; dnf config-manager --set-disabled "pgedge*" >/dev/null 2>&1 || true' EXIT; \
     dnf config-manager --set-disabled "pgedge*" >/dev/null 2>&1 || true; \
-    command -v pgedge-subscription-manager >/dev/null 2>&1 \
-        || dnf install -y --disablerepo="pgedge*" \
-           https://downloads.pgedge.com/reporpm/pgedge-release-latest.noarch.rpm; \
-    pgedge-subscription-manager install /run/secrets/repo_client_crt /run/secrets/repo_client_key --force; \
+    if [ -s /run/secrets/repo_client_crt ] && [ -s /run/secrets/repo_client_key ]; then \
+        command -v pgedge-subscription-manager >/dev/null 2>&1 \
+            || dnf install -y --disablerepo="pgedge*" \
+               https://downloads.pgedge.com/reporpm/pgedge-release-latest.noarch.rpm; \
+        pgedge-subscription-manager install /run/secrets/repo_client_crt /run/secrets/repo_client_key --force; \
+    elif [ "${REPO_NO_CLIENT_CERT:-}" = 1 ]; then \
+        sed -i '/^sslclient/d' /etc/yum.repos.d/pgedge.repo; \
+        dnf config-manager --set-enabled pgedge pgedge-noarch; \
+    else \
+        echo "pgEdge repository client certificate required: pass the repo_client_crt and repo_client_key build secrets" >&2; \
+        exit 1; \
+    fi; \
     dnf install -y --setopt=install_weak_deps=False pgedge-pgvector_${PG_MAJOR}; \
     dnf clean all
 # License + third-party notices travel with the binaries we redistribute (the

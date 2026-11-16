@@ -76,14 +76,24 @@ require_base() {
 }
 
 # require_repo_client: resolve the pgEdge repo client cert (REPO_CLIENT_CRT /
-# REPO_CLIENT_KEY, default <repo>/client.{crt,key}), fail if missing, export the
-# paths for compose and set REPO_SECRET_ARGS for `docker build`.
+# REPO_CLIENT_KEY, default <repo>/client.{crt,key}), export the paths for
+# compose and set REPO_SECRET_ARGS for `docker build`. With no cert it fails,
+# unless REPO_NO_CLIENT_CERT=1 (run-ci-local.sh sets it): the build then goes
+# without one.
 require_repo_client() {
     local root crt key
     root="$(cd "${BASH_SOURCE[0]%/*}/.." && pwd -P)"
     crt="${REPO_CLIENT_CRT:-$root/client.crt}"
     key="${REPO_CLIENT_KEY:-$root/client.key}"
-    if [ ! -r "$crt" ] || [ ! -r "$key" ]; then
+    if [ ! -s "$crt" ] || [ ! -s "$key" ]; then
+        if [ "${REPO_NO_CLIENT_CERT:-}" = 1 ]; then
+            echo "no pgEdge repository client certificate: building without one" >&2
+            # compose's file-based secrets need a file to read: /dev/null is an empty one.
+            export REPO_CLIENT_CRT=/dev/null REPO_CLIENT_KEY=/dev/null BUILDX_BAKE_ENTITLEMENTS_FS=0
+            # shellcheck disable=SC2034  # read by the scripts that source this file
+            REPO_SECRET_ARGS=(--build-arg REPO_NO_CLIENT_CERT=1)
+            return 0
+        fi
         echo "pgEdge repository client certificate not found: need $crt and $key" >&2
         echo "  put client.crt and client.key at the repo root, or set REPO_CLIENT_CRT and REPO_CLIENT_KEY to their paths" >&2
         return 1

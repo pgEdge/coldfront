@@ -69,6 +69,12 @@ gate is fast enough to run on every commit and performs the following checks:
 - The full user journey on one representative cell: PostgreSQL 18, vanilla,
   tiered mode, and the `s3` backend.
 
+The CI scripts read the pgEdge repository client certificate from `client.crt`
+and `client.key` at the repository root. The `REPO_CLIENT_CRT` and
+`REPO_CLIENT_KEY` variables name other paths. When no certificate is present,
+`./run-ci-local.sh` builds the image without one; a direct `ci/matrix.sh` run
+and GitHub Actions stop instead.
+
 GitHub Actions
 ([.github/workflows/ci.yml](https://github.com/pgEdge/ColdFront/blob/main/.github/workflows/ci.yml))
 runs the same `ci/matrix.sh` harness: `--quick` on every pull request and every
