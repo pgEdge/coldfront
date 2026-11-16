@@ -1,3 +1,28 @@
-# Code owners — requested for review on every pull request.
-# See https://docs.github.com/articles/about-code-owners
-* @vyruss
+# Code owners under the Code Review and Commit Policy v2.0.
+# coldfront is Tier 3. The last matching line wins.
+
+# Tier 3: every change needs a code owner's approval.
+*  @vyruss
+
+# Workflows, release, packaging and signing: a code owner or build-packaging.
+/.github/workflows/  @vyruss @pgEdge/build-packaging
+/.github/actions/  @vyruss @pgEdge/build-packaging
+action.yml  @vyruss @pgEdge/build-packaging
+action.yaml  @vyruss @pgEdge/build-packaging
+.goreleaser*.yml  @vyruss @pgEdge/build-packaging
+.goreleaser*.yaml  @vyruss @pgEdge/build-packaging
+*.spec  @vyruss @pgEdge/build-packaging
+debian/  @vyruss @pgEdge/build-packaging
+rpm/  @vyruss @pgEdge/build-packaging
+packaging/  @vyruss @pgEdge/build-packaging
+release*.sh  @vyruss @pgEdge/build-packaging
+sign*.sh  @vyruss @pgEdge/build-packaging
+sign*.py  @vyruss @pgEdge/build-packaging
+Dockerfile*  @vyruss @pgEdge/build-packaging
+
+# Ownership and AI review configuration: code owners only.
+/CODEOWNERS  @vyruss
+/.github/CODEOWNERS  @vyruss
+/docs/CODEOWNERS  @vyruss
+/REVIEW.md  @vyruss
+/.coderabbit.yaml  @vyruss
