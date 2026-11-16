@@ -158,6 +158,24 @@ jobs:
                       echo "OK: $bin statically linked"
                     done
                   done
+            - name: Verify the Linux amd64 binaries report their version
+              run: |
+                  set -euo pipefail
+                  tmp="$(mktemp -d)"
+                  tar xzf dist/coldfront_*_linux_amd64.tar.gz -C "$tmp"
+                  for bin in archiver partitioner compactor; do
+                    out="$("$tmp/$bin" --version)"
+                    case "$out" in
+                      *unknown*) echo "ERROR: $bin reports no version: $out" >&2; exit 1;;
+                    esac
+                    if [ "$GITHUB_REF_TYPE" = tag ]; then
+                      case "$out" in
+                        "$bin $GITHUB_REF_NAME "*) ;;
+                        *) echo "ERROR: $bin reports '$out', not $GITHUB_REF_NAME" >&2; exit 1;;
+                      esac
+                    fi
+                    echo "OK: $out"
+                  done
             - name: Upload release artifacts (for packaging)
               uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
               with:

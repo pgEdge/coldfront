@@ -17,6 +17,8 @@ before:
     - go install github.com/google/go-licenses@latest
     - sh -c '$(go env GOPATH)/bin/go-licenses report ./cmd/archiver ./cmd/partitioner --ignore github.com/pgedge/coldfront > THIRD_PARTY_GO.txt'
 
+# Each build stamps what --version prints: the version from `git describe` and
+# the build time, the same two values `make build` stamps.
 builds:
   - id: archiver
     binary: archiver
@@ -27,6 +29,8 @@ builds:
       - -trimpath
     ldflags:
       - -s -w
+      - -X github.com/pgedge/coldfront/internal/version.Version={{ .Summary }}
+      - -X github.com/pgedge/coldfront/internal/version.BuildTime={{ .Date }}
     goos:
       - linux
       - darwin
@@ -43,6 +47,8 @@ builds:
       - -trimpath
     ldflags:
       - -s -w
+      - -X github.com/pgedge/coldfront/internal/version.Version={{ .Summary }}
+      - -X github.com/pgedge/coldfront/internal/version.BuildTime={{ .Date }}
     goos:
       - linux
       - darwin
@@ -63,6 +69,8 @@ builds:
       - -trimpath
     ldflags:
       - -s -w
+      - -X main.Version={{ .Summary }}
+      - -X main.BuildTime={{ .Date }}
     goos:
       - linux
       - darwin

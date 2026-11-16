@@ -6,6 +6,14 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and
 this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Fixed
+
+- The archiver, partitioner, and compactor in the release tarballs and
+  packages printed `unknown (built unknown)` for `--version`. The release
+  build stamps the version and the build time, as `make build` does.
+
 ## [1.0.0-beta3] - 2026-11-06
 
 ### Added

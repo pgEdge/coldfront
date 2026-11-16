@@ -62,10 +62,10 @@ Run the archiver (typically via cron):
 ./bin/archiver
 ```
 
-`--version` prints the version that `make build` stamps from `git describe`
-(the release tag, or the commit it was built from) and exits; a plain
-`go build` prints `unknown`. The partitioner and compactor accept the same
-flag.
+`--version` prints the version that `make build` and the release build stamp
+from `git describe` (the release tag, or the commit it was built from) and
+exits; a plain `go build` prints `unknown`. The partitioner and compactor
+accept the same flag.
 
 The archiver also accepts `--debug-export-delay`, a test-only Go duration
 (such as `5s`) that holds each partition's capture window open between the
