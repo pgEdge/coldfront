@@ -82,6 +82,12 @@ push to `main`, and `--full` nightly and on demand. GitHub also runs a gitleaks
 secret scan, a go-licenses check, and the path-filtered walkthrough workflow,
 which the local gate does not run.
 
+Each nightly and on-demand run also executes `ci/parent-pin.sh`. The script
+compares the pgEdge Postgres images pinned in
+[`docker/Dockerfile.duckdb15`](https://github.com/pgEdge/ColdFront/blob/main/docker/Dockerfile.duckdb15)
+with the images that the floating tags point at, and fails when a pin is
+behind.
+
 On the `main` branch only, GitHub also runs two sets of PostgreSQL 18 cells
 against real cloud storage: the `aws-vended` cells against an AWS S3 bucket,
 and the `azure-vended` cells against an Azure Data Lake Storage (ADLS) Gen2

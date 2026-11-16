@@ -160,6 +160,19 @@ jobs:
       - name: ci/matrix.sh --full
         run: ci/matrix.sh --full
 
+  # docker/Dockerfile.duckdb15 pins the pgEdge Postgres images by immutable tag.
+  # This job fails when a floating tag points at a different image than its pin.
+  parent-pin:
+    name: parent image pins
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: ci/parent-pin.sh
+        run: ci/parent-pin.sh
+
   secret-scan:
     name: secret scan (gitleaks)
     if: github.event_name == 'push' || github.event_name == 'pull_request'
