@@ -135,6 +135,11 @@ following:
   `./bin/partitioner`.
 - golangci-lint, to build the compactor with `make compactor`.
 
+The source build needs no pgEdge packages and no repository certificate. A
+single node runs on community PostgreSQL, such as the packages from the
+[PostgreSQL Global Development Group (PGDG) repository](https://www.postgresql.org/download/linux/redhat/).
+Distributed mode needs pgEdge's PostgreSQL build with Spock.
+
 ### Preparing pg_duckdb and the DuckDB Extensions
 
 When the prerequisites are in place, start by building and installing pg_duckdb
@@ -142,16 +147,23 @@ on DuckDB 1.5.4 and the patched DuckDB extensions, with the patches that
 [Understanding ColdFront's DuckDB Stack](#understanding-coldfronts-duckdb-stack)
 describes. The following steps reproduce the compile steps in
 [`docker/Dockerfile.duckdb15-base`](https://github.com/pgEdge/ColdFront/blob/main/docker/Dockerfile.duckdb15-base)
-on a RHEL-family host running PostgreSQL 18; adjust the package names and the
+on a Rocky Linux 9 host running PostgreSQL 18; adjust the package names and the
 PostgreSQL major version for your system.
 
-1. Install the build tools and libraries:
+1. Enable the CodeReady Builder (CRB) repository, which provides `ninja-build`,
+   and install the build tools and libraries. On community PostgreSQL from the
+   PGDG repository, install `postgresql18-devel` in place of
+   `pgedge-postgresql18-devel`:
 
     ```bash
+    sudo dnf config-manager --set-enabled crb
     sudo dnf install -y pgedge-postgresql18-devel gcc gcc-c++ make cmake \
       ninja-build git redhat-rpm-config openssl-devel libcurl-devel \
       lz4-devel zlib-devel libicu-devel pkgconf-pkg-config python3 \
-      perl-IPC-Cmd flex bison autoconf libtool zip unzip wget tar
+      perl-IPC-Cmd perl-FindBin perl-Time-Piece flex bison autoconf \
+      libtool zip unzip wget tar gcc-toolset-14-gcc \
+      gcc-toolset-14-gcc-c++ gcc-toolset-14-libasan-devel \
+      gcc-toolset-14-libubsan-devel
     export PATH=/usr/pgsql-18/bin:$PATH
     export PG_CONFIG=/usr/pgsql-18/bin/pg_config
     ```
@@ -250,7 +262,8 @@ PostgreSQL major version for your system.
     loop with a nonzero status without closing your terminal. If a patch
     fails, fix it before you continue to the next step.
 
-6. Build the iceberg, avro, azure, and postgres_scanner extensions:
+6. Build the iceberg, avro, azure, and postgres_scanner extensions with GCC 14,
+   because the system compiler, GCC 11, cannot compile the avro extension:
 
     ```bash
     case "$(uname -m)" in
@@ -263,8 +276,16 @@ PostgreSQL major version for your system.
     export USE_MERGED_VCPKG_MANIFEST=1
     export EXT_CONFIG=$PWD/extension_config.cmake
     export OVERRIDE_GIT_DESCRIBE=v1.5.4
-    make -j"$(nproc)" release
+    export CMAKE_BUILD_PARALLEL_LEVEL=$(nproc)
+    (
+      source /opt/rh/gcc-toolset-14/enable
+      make -j"$(nproc)" release
+    )
     ```
+
+    The parentheses run the build in a subshell, so GCC 14 applies to this step
+    only. `CMAKE_BUILD_PARALLEL_LEVEL` sets the number of parallel compile
+    jobs, because the build otherwise compiles on one core.
 
 7. Copy the built extensions into the pg_duckdb extension directory under the
    PostgreSQL data directory, as
