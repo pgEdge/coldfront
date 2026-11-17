@@ -6,7 +6,18 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and
 this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## [Unreleased]
+## [1.0.0-beta4] - 2026-11-17
+
+### Changed
+
+- The packages and the base image are built on PostgreSQL 16.16, 17.12 and
+  18.7, which fix CVE-2026-6460. PostgreSQL's fix needs C-language extensions
+  rebuilt on those versions for full protection, so this release rebuilds
+  `coldfront` and `pg_duckdb` on them. An installation built from source needs
+  both extensions rebuilt once the server is upgraded.
+- The image build needs your pgEdge repository client certificate, passed as
+  build secrets, and starts from pgEdge Postgres images named by immutable
+  tag.
 
 ### Fixed
 
