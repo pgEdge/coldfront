@@ -12,7 +12,4 @@
 # Per CLAUDE.md, GitHub Actions must run the identical ci/matrix.sh steps.
 set -euo pipefail
 cd "$(dirname "$0")"
-# With no pgEdge repo client cert present, the image build goes without one
-# (ci/lib.sh). GitHub Actions calls ci/matrix.sh itself and never sets this.
-export REPO_NO_CLIENT_CERT=1
 exec ./ci/matrix.sh --quick

@@ -66,52 +66,12 @@ require_base() {
     if ! docker image inspect "$ref" >/dev/null 2>&1 && ! err="$(docker pull "$ref" 2>&1)"; then
         echo "base image $ref is not available (${err##*$'\n'})" >&2
         echo "  build it locally:  docker build -f docker/Dockerfile.duckdb15-base --build-arg PG_MAJOR=$pg \\" >&2
-        echo "                       --secret id=repo_client_crt,src=${REPO_CLIENT_CRT:-client.crt} \\" >&2
-        echo "                       --secret id=repo_client_key,src=${REPO_CLIENT_KEY:-client.key} -t $ref ." >&2
+        echo "                       --secret id=repo_client_crt,src=client.crt \\" >&2
+        echo "                       --secret id=repo_client_key,src=client.key -t $ref ." >&2
         echo "  or publish it:     gh workflow run base-image.yml --ref ${GITHUB_HEAD_REF:-${GITHUB_REF_NAME:-$(git rev-parse --abbrev-ref HEAD)}} -f push=true" >&2
         return 1
     fi
     export COLDFRONT_BASE="$ref"
-    require_repo_client || return 1
-}
-
-# require_repo_client: resolve the pgEdge repo client cert (REPO_CLIENT_CRT /
-# REPO_CLIENT_KEY, default <repo>/client.{crt,key}), export the paths for
-# compose and set REPO_SECRET_ARGS for `docker build`. With no cert it fails,
-# unless REPO_NO_CLIENT_CERT=1 (run-ci-local.sh sets it): the build then goes
-# without one.
-require_repo_client() {
-    local root crt key
-    root="$(cd "${BASH_SOURCE[0]%/*}/.." && pwd -P)"
-    crt="${REPO_CLIENT_CRT:-$root/client.crt}"
-    key="${REPO_CLIENT_KEY:-$root/client.key}"
-    if [ ! -s "$crt" ] || [ ! -s "$key" ]; then
-        if [ "${REPO_NO_CLIENT_CERT:-}" = 1 ]; then
-            echo "no pgEdge repository client certificate: building without one" >&2
-            # compose's file-based secrets need a file to read: /dev/null is an empty one.
-            export REPO_CLIENT_CRT=/dev/null REPO_CLIENT_KEY=/dev/null BUILDX_BAKE_ENTITLEMENTS_FS=0
-            # shellcheck disable=SC2034  # read by the scripts that source this file
-            REPO_SECRET_ARGS=(--build-arg REPO_NO_CLIENT_CERT=1)
-            return 0
-        fi
-        echo "pgEdge repository client certificate not found: need $crt and $key" >&2
-        echo "  put client.crt and client.key at the repo root, or set REPO_CLIENT_CRT and REPO_CLIENT_KEY to their paths" >&2
-        return 1
-    fi
-    # Physical paths: bake follows symlinks, so a link at the repo root that
-    # points outside it counts as outside.
-    REPO_CLIENT_CRT="$(realpath "$crt")"
-    REPO_CLIENT_KEY="$(realpath "$key")"
-    export REPO_CLIENT_CRT REPO_CLIENT_KEY
-    # compose (buildx bake) won't read secret files outside the project dir
-    # without fs.read, and compose has no --allow flag.
-    case "$REPO_CLIENT_CRT:$REPO_CLIENT_KEY" in
-        "$root"/*:"$root"/*) ;;
-        *) export BUILDX_BAKE_ENTITLEMENTS_FS=0;;
-    esac
-    # shellcheck disable=SC2034  # read by the scripts that source this file
-    REPO_SECRET_ARGS=(--secret "id=repo_client_crt,src=$REPO_CLIENT_CRT"
-                      --secret "id=repo_client_key,src=$REPO_CLIENT_KEY")
 }
 
 # summary  — print pass/fail tally; returns nonzero if any FAIL (drives matrix exit code).

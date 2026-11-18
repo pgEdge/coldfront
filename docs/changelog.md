@@ -6,6 +6,22 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and
 this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Each release tags the base image it builds on with the release version, as
+  `ghcr.io/pgedge/coldfront-duckdb-base:pg<major>-<version>` for PostgreSQL
+  16, 17, and 18, with `-amd64` and `-arm64` forms. Set `COLDFRONT_BASE` to
+  build the app image on one of these tags.
+
+### Changed
+
+- The app image build no longer needs a pgEdge repository client certificate.
+  The published base image now includes pgvector and the PostgreSQL
+  development headers the build compiles `coldfront` against, so only a build
+  of the base image installs from the pgEdge package repositories.
+
 ## [1.0.0-beta4] - 2026-11-17
 
 ### Changed

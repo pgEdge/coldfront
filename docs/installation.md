@@ -400,7 +400,8 @@ components. The following table shows each component and its source:
 | DuckDB 1.5.4 | `github.com/duckdb/duckdb`, tag `v1.5.4`, which replaces duckdb-iceberg's own DuckDB submodule |
 | duckdb-avro, duckdb-azure, duckdb-postgres | `github.com/duckdb/duckdb-avro` @ `7f423d69`, `github.com/duckdb/duckdb-azure` @ `563589b2`, and `github.com/duckdb/duckdb-postgres` @ `4053b617`, pinned in `docker/iceberg-azure-extension-config-v15.cmake` |
 | vcpkg | `github.com/microsoft/vcpkg` |
-| Base images | `ghcr.io/pgedge/pgedge-postgres:<pg>-spock5-minimal` and `quay.io/pypa/manylinux_2_28_<arch>` |
+| pgvector and the PostgreSQL development headers | The `pgedge-pgvector_<pg>` and `pgedge-postgresql<pg>-devel` packages from the pgEdge package repositories |
+| Base images | `ghcr.io/pgedge/pgedge-postgres`, at the immutable `-minimal` tag the recipe names for each PostgreSQL major, and `quay.io/pypa/manylinux_2_28_<arch>` |
 
 The base image is built in three Docker stages:
 
@@ -410,7 +411,12 @@ The base image is built in three Docker stages:
    ColdFront's patches (see [Patching duckdb-iceberg](#patching-duckdb-iceberg)),
    and compiles the iceberg, avro, azure, and postgres_scanner extensions with
    vcpkg.
-3. The third stage assembles the runtime image.
+3. The third stage assembles the runtime image and installs pgvector and the
+   PostgreSQL development headers.
+
+The app image compiles the `coldfront` extension against the headers in the
+base image. Every install from the pgEdge package repositories happens in this
+recipe, so the app image build needs no repository client certificate.
 
 The build checks that each patch applies cleanly before applying it. If a patch
 no longer applies, the build stops with an error instead of producing an image
@@ -426,9 +432,9 @@ Iceberg readers reject.
 
 !!! note "Base foundation"
 
-    The base is `FROM ghcr.io/pgedge/pgedge-postgres:<pg>-spock5-minimal`; you
-    need pull access to that image (or substitute an equivalent PostgreSQL base
-    with the same layout).
+    The base is `FROM ghcr.io/pgedge/pgedge-postgres`, at an immutable
+    `-minimal` tag for each PostgreSQL major; you need pull access to that
+    image (or substitute an equivalent PostgreSQL base with the same layout).
 
 ### Building and Starting the ColdFront Containers
 
@@ -472,22 +478,27 @@ always uses the current source:
     ```
 
     pgEdge also publishes the base image as
-    `ghcr.io/pgedge/coldfront-duckdb-base:pg16`, `:pg17`, and `:pg18`. If you
-    skip this step, the next step uses the published image.
+    `ghcr.io/pgedge/coldfront-duckdb-base:pg16`, `:pg17`, and `:pg18`, and
+    tags the image each release builds on with the release version, for
+    example `ghcr.io/pgedge/coldfront-duckdb-base:pg18-v1.0.0`. If you skip
+    this step, the next step uses the published image and needs no repository
+    client certificate. To build on another published image, such as the
+    release tag of the version you checked out, set `COLDFRONT_BASE` to its
+    full name. Docker builds on a published image that is already in your
+    local image cache without checking for a newer one, so after you update
+    your checkout, pull the image again:
+
+    ```bash
+    docker pull "ghcr.io/pgedge/coldfront-duckdb-base:pg$PG_MAJOR"
+    ```
 
 3. Build the app image and start the stack. The app image, built from
    [`docker/Dockerfile.duckdb15`](https://github.com/pgEdge/ColdFront/blob/main/docker/Dockerfile.duckdb15),
    starts from your local base image if you built one in step 2, or from the
    published image otherwise, and compiles only the `coldfront` extension.
-   The app build also installs from the pgEdge package repositories, so place
-   your repository client certificate and key at the repo root as `client.crt`
-   and `client.key`, or set `REPO_CLIENT_CRT` and `REPO_CLIENT_KEY` to their
-   paths; the build mounts them as secrets and never stores them in the image.
-   If either file is outside the repo (including through a symlink), also run
-   `export BUILDX_BAKE_ENTITLEMENTS_FS=0`, because Compose will not otherwise
-   read it. The commands publish each port on the loopback address only,
-   because the PostgreSQL server trusts every connection and Lakekeeper runs
-   without authentication:
+   The commands publish each port on the loopback address only, because the
+   PostgreSQL server trusts every connection and Lakekeeper runs without
+   authentication:
 
     ```bash
     export COLDFRONT_PG_PORT=127.0.0.1:5432 COLDFRONT_LK_PORT=127.0.0.1:8181 \

@@ -606,9 +606,10 @@ library.
 
 A two-layer image serves every deployment: a prebuilt **base**
 (`docker/Dockerfile.duckdb15-base`) including pg_duckdb (PR #1025) on DuckDB
-1.5.4 + the patched duckdb-iceberg on a pgEdge `*-spock5-minimal` base (Spock +
-Snowflake), and a thin **app** layer (`docker/Dockerfile.duckdb15`,
-`--build-arg PG_MAJOR=16|17|18`) that compiles coldfront on top. The same image
+1.5.4 + the patched duckdb-iceberg + pgvector + the PG devel headers on a
+pgEdge `minimal` base (Spock + Snowflake), and a thin **app** layer
+(`docker/Dockerfile.duckdb15`, `--build-arg PG_MAJOR=16|17|18`) that compiles
+coldfront on top. The same image
 plays both topology roles - vanilla leaves spock/snowflake out of
 `shared_preload_libraries`; mesh loads them (`MESH=on`, set by the entrypoint).
 
