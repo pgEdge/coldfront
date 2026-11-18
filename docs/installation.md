@@ -482,7 +482,15 @@ always uses the current source:
     tags the image each release builds on with the release version, for
     example `ghcr.io/pgedge/coldfront-duckdb-base:pg18-v1.0.0`. If you skip
     this step, the next step uses the published image and needs no repository
-    client certificate.
+    client certificate. To build on another published image, such as the
+    release tag of the version you checked out, set `COLDFRONT_BASE` to its
+    full name. Docker builds on a published image that is already in your
+    local image cache without checking for a newer one, so after you update
+    your checkout, pull the image again:
+
+    ```bash
+    docker pull "ghcr.io/pgedge/coldfront-duckdb-base:pg$PG_MAJOR"
+    ```
 
 3. Build the app image and start the stack. The app image, built from
    [`docker/Dockerfile.duckdb15`](https://github.com/pgEdge/ColdFront/blob/main/docker/Dockerfile.duckdb15),

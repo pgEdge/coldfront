@@ -12,7 +12,8 @@ this project adheres to
 
 - Each release tags the base image it builds on with the release version, as
   `ghcr.io/pgedge/coldfront-duckdb-base:pg<major>-<version>` for PostgreSQL
-  16, 17, and 18, with `-amd64` and `-arm64` forms.
+  16, 17, and 18, with `-amd64` and `-arm64` forms. Set `COLDFRONT_BASE` to
+  build the app image on one of these tags.
 
 ### Changed
 
