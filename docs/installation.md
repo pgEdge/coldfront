@@ -478,9 +478,11 @@ always uses the current source:
     ```
 
     pgEdge also publishes the base image as
-    `ghcr.io/pgedge/coldfront-duckdb-base:pg16`, `:pg17`, and `:pg18`. If you
-    skip this step, the next step uses the published image and needs no
-    repository client certificate.
+    `ghcr.io/pgedge/coldfront-duckdb-base:pg16`, `:pg17`, and `:pg18`, and
+    tags the image each release builds on with the release version, for
+    example `ghcr.io/pgedge/coldfront-duckdb-base:pg18-v1.0.0`. If you skip
+    this step, the next step uses the published image and needs no repository
+    client certificate.
 
 3. Build the app image and start the stack. The app image, built from
    [`docker/Dockerfile.duckdb15`](https://github.com/pgEdge/ColdFront/blob/main/docker/Dockerfile.duckdb15),

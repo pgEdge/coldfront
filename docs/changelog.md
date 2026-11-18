@@ -8,6 +8,12 @@ this project adheres to
 
 ## [Unreleased]
 
+### Added
+
+- Each release tags the base image it builds on with the release version, as
+  `ghcr.io/pgedge/coldfront-duckdb-base:pg<major>-<version>` for PostgreSQL
+  16, 17, and 18, with `-amd64` and `-arm64` forms.
+
 ### Changed
 
 - The app image build no longer needs a pgEdge repository client certificate.
