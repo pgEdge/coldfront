@@ -247,7 +247,7 @@ create_warehouse_and_seed "$LK_IP" "$WH_BODY"   # POST warehouse + seed 'default
 
 if [ "$REGRESS" = 1 ]; then
     step "vanilla: pg_regress installcheck (unit layer)"
-    # The runtime image is lean (no make/pg_regress). Run the unit layer from the
+    # The runtime image has no make or compiler. Run the unit layer from the
     # app Dockerfile's cf-build stage — it has the PG devel toolchain, pg_regress,
     # and the coldfront extension source at /build/coldfront, and builds in seconds
     # FROM the base image, which includes the PG devel headers and pg_regress. pg_regress
