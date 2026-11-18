@@ -5,69 +5,40 @@
 # v1.5-variegata). This build only compiles the coldfront C extension (seconds),
 # so CI and local builds are fast and always test the current coldfront source.
 #
-# COLDFRONT_BASE is the prebuilt ghcr.io/pgedge base image. Before building,
-# either pull it from ghcr.io/pgedge/coldfront-duckdb-base or build it locally
-# first (it is then used from the local image cache):
-#   docker build -f docker/Dockerfile.duckdb15-base --build-arg PG_MAJOR=18 \
-#       --secret id=repo_client_crt,src=client.crt \
-#       --secret id=repo_client_key,src=client.key \
-#       -t ghcr.io/pgedge/coldfront-duckdb-base:pg18 .
+# COLDFRONT_BASE is the prebuilt ghcr.io/pgedge base image. It is pulled from
+# ghcr.io/pgedge/coldfront-duckdb-base, or used from the local image cache when
+# built locally first (docker/Dockerfile.duckdb15-base has the command):
 #
 #   docker build -f docker/Dockerfile.duckdb15 --build-arg PG_MAJOR=18 \
-#       --secret id=repo_client_crt,src=client.crt \
-#       --secret id=repo_client_key,src=client.key \
 #       -t coldfront-duckdb15:pg18 .
 #
-# The pgEdge repos need a client cert (mTLS). It comes in as BuildKit secrets,
-# mounted only into the installing RUNs; each RUN's trap deletes the installed
-# copy and disables the repos, so no layer holds it. Compose reads it from
-# REPO_CLIENT_CRT / REPO_CLIENT_KEY (default ./client.crt, ./client.key).
-# Without the secrets the build stops, unless REPO_NO_CLIENT_CERT=1: the build
-# then drops the repo's client cert options and installs without one.
-# run-ci-local.sh sets it, and ci/lib.sh passes it on when no cert is present.
+# The base includes the PG devel headers, and the compiler comes from the
+# distribution's public repositories, so this build installs nothing from the
+# pgEdge repositories and needs no repository client cert.
 ARG PG_MAJOR=18
 ARG COLDFRONT_BASE=ghcr.io/pgedge/coldfront-duckdb-base:pg${PG_MAJOR}
 
-# The pgEdge Postgres image for each major, by immutable tag. One alias per
-# major, picked by PG_MAJOR, because a FROM cannot nest ARG expansion; the
-# unused aliases are never pulled.
-FROM ghcr.io/pgedge/pgedge-postgres:16.16-spock5.0.14-minimal-1 AS pgedge-16
-FROM ghcr.io/pgedge/pgedge-postgres:17.12-spock5.0.14-minimal-1 AS pgedge-17
-FROM ghcr.io/pgedge/pgedge-postgres:18.7-spock5.0.14-minimal-1  AS pgedge-18
-
 # ─── coldfront compile stage: PG devel headers only (no pg_duckdb linkage) ───────
 # coldfront.c includes only PostgreSQL server headers + libpq-fe.h and links -lpq;
-# it does NOT link pg_duckdb, so this stage needs just the PG devel toolchain and
-# builds in seconds (the heavy pg_duckdb/iceberg compiles live in the base).
-FROM pgedge-${PG_MAJOR} AS cf-build
+# it does NOT link pg_duckdb, so this stage needs just the base's PG headers and a
+# compiler, and builds in seconds (the heavy pg_duckdb/iceberg compiles live in
+# the base). diffutils is for the regress run's installcheck.
+FROM ${COLDFRONT_BASE} AS cf-build
 ARG PG_MAJOR
-ARG REPO_NO_CLIENT_CERT
 USER root
-# Repos are gated and disabled in the parent; see the header.
-RUN --mount=type=secret,id=repo_client_crt \
-    --mount=type=secret,id=repo_client_key \
-    set -eu; \
-    trap 'rm -f /etc/pki/pgedge/client.crt /etc/pki/pgedge/client.key; dnf config-manager --set-disabled "pgedge*" >/dev/null 2>&1 || true' EXIT; \
-    if [ -s /run/secrets/repo_client_crt ] && [ -s /run/secrets/repo_client_key ]; then \
-        pgedge-subscription-manager install /run/secrets/repo_client_crt /run/secrets/repo_client_key --force; \
-    elif [ "${REPO_NO_CLIENT_CERT:-}" = 1 ]; then \
-        sed -i '/^sslclient/d' /etc/yum.repos.d/pgedge.repo; \
-        dnf config-manager --set-enabled pgedge pgedge-noarch; \
-    else \
-        echo "pgEdge repository client certificate required: pass the repo_client_crt and repo_client_key build secrets" >&2; \
-        exit 1; \
-    fi; \
-    dnf install -y --setopt=install_weak_deps=False \
-        pgedge-postgresql${PG_MAJOR}-devel gcc make redhat-rpm-config diffutils; \
-    dnf clean all
+# ci/topo/vanilla.sh runs this stage as a container for the regress run. The
+# base names the entrypoint that only the final stage installs, so clear it.
+ENTRYPOINT []
+RUN dnf install -y --setopt=install_weak_deps=False gcc make redhat-rpm-config diffutils \
+ && dnf clean all
 ENV PATH=/usr/pgsql-${PG_MAJOR}/bin:$PATH
 ENV PG_CONFIG=/usr/pgsql-${PG_MAJOR}/bin/pg_config
 COPY extension/coldfront /build/coldfront
 RUN DESTDIR=/out make -C /build/coldfront install with_llvm=no
 
 # ─── app runtime: coldfront extension on top of the base ─────────────────────────
-# pg_duckdb 1.5.4, the iceberg/avro/azure/postgres_scanner extensions, libcurl
-# 8.12, COLDFRONT_DUCKDB_* env and /data are inherited from the base. This stage
+# pg_duckdb 1.5.4, the iceberg/avro/azure/postgres_scanner extensions, pgvector,
+# libcurl 8.12, COLDFRONT_DUCKDB_* env and /data are inherited from the base. This stage
 # adds coldfront's .so + SQL/control (distinct filenames, so nothing of
 # pg_duckdb is overwritten) and the entrypoint.
 #
@@ -77,42 +48,12 @@ RUN DESTDIR=/out make -C /build/coldfront install with_llvm=no
 # and an entrypoint change never needs a base rebuild.
 FROM ${COLDFRONT_BASE}
 ARG PG_MAJOR
-ARG REPO_NO_CLIENT_CERT
 USER root
 COPY --from=cf-build /out/usr/pgsql-${PG_MAJOR}/lib/             /usr/pgsql-${PG_MAJOR}/lib/
 COPY --from=cf-build /out/usr/pgsql-${PG_MAJOR}/share/extension/ /usr/pgsql-${PG_MAJOR}/share/extension/
 COPY docker/entrypoint.sh /usr/local/bin/coldfront-entrypoint.sh
 COPY docker/coldfront-materialize-secret.sh /usr/local/bin/coldfront-materialize-secret.sh
 RUN chmod +x /usr/local/bin/coldfront-entrypoint.sh /usr/local/bin/coldfront-materialize-secret.sh
-# pgvector, from the same pgEdge repo the base is built from. A tiered vector
-# table has the type on its hot side, and both the cold read and cold write
-# paths rely on pgvector's implicit vector -> real[] cast. It sits in the app
-# layer for the same reason as entrypoint.sh: baked only into the separately
-# published base, a stale base would silently lack it and local CI would diverge
-# from GitHub CI.
-#
-# A base with pgedge-release 1.x has the repo enabled and no
-# pgedge-subscription-manager: disable the repo first, and install the current
-# pgedge-release before installing the cert.
-RUN --mount=type=secret,id=repo_client_crt \
-    --mount=type=secret,id=repo_client_key \
-    set -eu; \
-    trap 'rm -f /etc/pki/pgedge/client.crt /etc/pki/pgedge/client.key; dnf config-manager --set-disabled "pgedge*" >/dev/null 2>&1 || true' EXIT; \
-    dnf config-manager --set-disabled "pgedge*" >/dev/null 2>&1 || true; \
-    if [ -s /run/secrets/repo_client_crt ] && [ -s /run/secrets/repo_client_key ]; then \
-        command -v pgedge-subscription-manager >/dev/null 2>&1 \
-            || dnf install -y --disablerepo="pgedge*" \
-               https://downloads.pgedge.com/reporpm/pgedge-release-latest.noarch.rpm; \
-        pgedge-subscription-manager install /run/secrets/repo_client_crt /run/secrets/repo_client_key --force; \
-    elif [ "${REPO_NO_CLIENT_CERT:-}" = 1 ]; then \
-        sed -i '/^sslclient/d' /etc/yum.repos.d/pgedge.repo; \
-        dnf config-manager --set-enabled pgedge pgedge-noarch; \
-    else \
-        echo "pgEdge repository client certificate required: pass the repo_client_crt and repo_client_key build secrets" >&2; \
-        exit 1; \
-    fi; \
-    dnf install -y --setopt=install_weak_deps=False pgedge-pgvector_${PG_MAJOR}; \
-    dnf clean all
 # License + third-party notices travel with the binaries we redistribute (the
 # DuckDB family is MIT: the notice must accompany the distributed Software).
 COPY THIRD_PARTY_NOTICES.md LICENSE.md /usr/share/doc/coldfront/

@@ -250,13 +250,13 @@ if [ "$REGRESS" = 1 ]; then
     # The runtime image is lean (no make/pg_regress). Run the unit layer from the
     # app Dockerfile's cf-build stage — it has the PG devel toolchain, pg_regress,
     # and the coldfront extension source at /build/coldfront, and builds in seconds
-    # FROM the pgEdge base. It needs NO pg_duckdb / no private base image: pg_regress
+    # FROM the base image, which includes the PG devel headers and pg_regress. pg_regress
     # only drives SQL against the RUNNING db (built from the app image, which already
     # has pg_duckdb + coldfront) over the compose network. The fixtures set
     # coldfront.warehouse/lakekeeper_endpoint to '' so ensure_attached() is a no-op
     # and Lakekeeper isn't needed here.
     BUILD_IMG="coldfront-regress:pg${PG}"
-    run_logged docker build -f docker/Dockerfile.duckdb15 --build-arg PG_MAJOR="$PG" --target cf-build "${REPO_SECRET_ARGS[@]}" -t "$BUILD_IMG" . || true
+    run_logged docker build -f docker/Dockerfile.duckdb15 --build-arg PG_MAJOR="$PG" --build-arg COLDFRONT_BASE="$COLDFRONT_BASE" --target cf-build -t "$BUILD_IMG" . || true
     NET=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' "$DB")
     if docker run --rm --network "$NET" \
            -e PGHOST=db -e PGPORT=5432 -e PGUSER="$CF_DBUSER" -e PGDATABASE="$CF_DBNAME" \

@@ -1,6 +1,7 @@
 #!/bin/bash
 # ci/parent-pin.sh: fail when a pgEdge Postgres image pinned in
-# docker/Dockerfile.duckdb15 differs from the image its floating tag points at.
+# docker/Dockerfile.duckdb15-base differs from the image its floating tag points
+# at.
 #
 # A pin is an immutable tag, <major>.<minor>-spock<x.y.z>-<flavor>-<epoch>, so
 # every build starts from the same image. The floating tag of the same major,
@@ -14,8 +15,8 @@ cd "$(dirname "$0")/.."
 # The sha256 of an image's raw manifest is its digest.
 digest() { docker buildx imagetools inspect --raw "$1" | sha256sum; }
 
-mapfile -t pins < <(sed -nE 's/^FROM (ghcr\.io\/pgedge\/pgedge-postgres:[^ ]+).*/\1/p' docker/Dockerfile.duckdb15)
-[ "${#pins[@]}" -gt 0 ] || { echo "no pgEdge Postgres pin in docker/Dockerfile.duckdb15" >&2; exit 1; }
+mapfile -t pins < <(sed -nE 's/^FROM (ghcr\.io\/pgedge\/pgedge-postgres:[^ ]+).*/\1/p' docker/Dockerfile.duckdb15-base)
+[ "${#pins[@]}" -gt 0 ] || { echo "no pgEdge Postgres pin in docker/Dockerfile.duckdb15-base" >&2; exit 1; }
 
 rc=0
 for pin in "${pins[@]}"; do

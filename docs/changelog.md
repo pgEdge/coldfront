@@ -6,6 +6,15 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/), and
 this project adheres to
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Changed
+
+- The app image build no longer needs a pgEdge repository client certificate.
+  The published base image now includes pgvector and the PostgreSQL
+  development headers the build compiles `coldfront` against, so only a build
+  of the base image installs from the pgEdge package repositories.
+
 ## [1.0.0-beta4] - 2026-11-17
 
 ### Changed

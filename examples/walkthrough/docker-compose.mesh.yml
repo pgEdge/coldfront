@@ -20,9 +20,9 @@ services:
         build:
             context: ../..
             dockerfile: docker/Dockerfile.duckdb15
-            secrets: [repo_client_crt, repo_client_key]
             args:
                 PG_MAJOR: ${PG_MAJOR:-18}
+                COLDFRONT_BASE: ${COLDFRONT_BASE:-ghcr.io/pgedge/coldfront-duckdb-base:pg${PG_MAJOR:-18}}
         hostname: db1
         environment:
             PG_MAJOR: ${PG_MAJOR:-18}
@@ -44,9 +44,9 @@ services:
         build:
             context: ../..
             dockerfile: docker/Dockerfile.duckdb15
-            secrets: [repo_client_crt, repo_client_key]
             args:
                 PG_MAJOR: ${PG_MAJOR:-18}
+                COLDFRONT_BASE: ${COLDFRONT_BASE:-ghcr.io/pgedge/coldfront-duckdb-base:pg${PG_MAJOR:-18}}
         hostname: db2
         environment:
             PG_MAJOR: ${PG_MAJOR:-18}
@@ -122,10 +122,3 @@ volumes:
     pgdata2:
     lkdata:
     s3data:
-
-# pgEdge repo client cert for the image build, mounted as BuildKit secrets (never in a layer).
-secrets:
-    repo_client_crt:
-        file: ${REPO_CLIENT_CRT:-../../client.crt}
-    repo_client_key:
-        file: ${REPO_CLIENT_KEY:-../../client.key}

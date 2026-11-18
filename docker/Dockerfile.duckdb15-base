@@ -1,11 +1,16 @@
 # ColdFront DuckDB 1.5.x base image: the stable layer, libcurl 8.12.0, pg_duckdb
-# (DuckDB 1.5.4, patched) and the patched duckdb-iceberg extensions (iceberg,
-# avro, azure and postgres_scanner from v1.5-variegata). The coldfront extension
-# is not in it: docker/Dockerfile.duckdb15 (the app build) does FROM this image
-# and adds it. The base-image workflow (.github/workflows/base-image.yml) builds
-# and pushes it to ghcr.io/pgedge/coldfront-duckdb-base with the workflow
-# GITHUB_TOKEN, under the tag ci/base-ref.sh prints, whose hash covers this file
-# and every file its COPY lines take from the tree.
+# (DuckDB 1.5.4, patched), the patched duckdb-iceberg extensions (iceberg,
+# avro, azure and postgres_scanner from v1.5-variegata), pgvector, and the
+# PostgreSQL devel headers the coldfront extension is compiled against. The
+# coldfront extension is not in it: docker/Dockerfile.duckdb15 (the app build)
+# does FROM this image and adds it. The base-image workflow
+# (.github/workflows/base-image.yml) builds and pushes it to
+# ghcr.io/pgedge/coldfront-duckdb-base with the workflow GITHUB_TOKEN, under the
+# tag ci/base-ref.sh prints, whose hash covers this file and every file its COPY
+# lines take from the tree.
+#
+# Every install from the pgEdge package repositories happens in this recipe, so
+# the app build needs no repository client cert.
 #
 # The image is arch-aware: it builds natively for the host arch (amd64 on x86_64,
 # arm64 on aarch64). The manylinux base, the vcpkg triplet and the DuckDB
@@ -29,7 +34,6 @@
 # mounted only into the installing RUNs; each RUN's trap deletes the installed
 # copy and disables the repos, so no layer holds it.
 ARG PG_MAJOR=18
-ARG PGEDGE_TAG=${PG_MAJOR}-spock5-minimal
 
 # Target arch, auto-detected by buildx (amd64 on x86_64 hosts, arm64 on aarch64).
 # TARGETARCH is a built-in buildx ARG, populated for free from --platform / the
@@ -41,8 +45,15 @@ ARG PGEDGE_TAG=${PG_MAJOR}-spock5-minimal
 # cross-build under emulation on an x86_64 host.
 ARG TARGETARCH=amd64
 
+# The pgEdge Postgres image for each major, by immutable tag. One alias per
+# major, picked by PG_MAJOR, because a FROM cannot nest ARG expansion; the
+# unused aliases are never pulled.
+FROM ghcr.io/pgedge/pgedge-postgres:16.16-spock5.0.14-minimal-1 AS pgedge-16
+FROM ghcr.io/pgedge/pgedge-postgres:17.12-spock5.0.14-minimal-1 AS pgedge-17
+FROM ghcr.io/pgedge/pgedge-postgres:18.7-spock5.0.14-minimal-1  AS pgedge-18
+
 # ─── build stage: libcurl 8.12 + pg_duckdb (DuckDB 1.5.4, patched) ───────────────
-FROM ghcr.io/pgedge/pgedge-postgres:${PGEDGE_TAG} AS build
+FROM pgedge-${PG_MAJOR} AS build
 ARG PG_MAJOR
 USER root
 # Repos are gated and disabled in the parent; see the header.
@@ -213,11 +224,16 @@ RUN cd /build/duckdb-iceberg && bash -c 'source /opt/rh/gcc-toolset-*/enable 2>/
     make -j$(nproc) release'
 
 # ─── base runtime stage (pg_duckdb + iceberg, NO coldfront) ──────────────────────
-FROM ghcr.io/pgedge/pgedge-postgres:${PGEDGE_TAG}
+FROM pgedge-${PG_MAJOR}
 ARG PG_MAJOR
 ARG TARGETARCH
 USER root
 # Repos are gated and disabled in the parent; see the header.
+#
+# pgvector: a tiered vector table has the type on its hot side, and both the
+# cold read and cold write paths rely on pgvector's implicit vector -> real[]
+# cast. The devel package: the app build compiles coldfront against its headers
+# and pgxs, and the regress run uses its pg_regress.
 RUN --mount=type=secret,id=repo_client_crt,required=true \
     --mount=type=secret,id=repo_client_key,required=true \
     set -eu; \
@@ -225,7 +241,8 @@ RUN --mount=type=secret,id=repo_client_crt,required=true \
     pgedge-subscription-manager install /run/secrets/repo_client_crt /run/secrets/repo_client_key --force; \
     dnf update -y; \
     dnf install -y --setopt=install_weak_deps=False --allowerasing \
-        libcurl lz4 pgedge-postgresql${PG_MAJOR}-contrib openssl; \
+        libcurl lz4 pgedge-postgresql${PG_MAJOR}-contrib pgedge-pgvector_${PG_MAJOR} \
+        pgedge-postgresql${PG_MAJOR}-devel openssl; \
     dnf clean all
 
 # pg_duckdb 1.5.4 + bundled libduckdb 1.5.4 + extension SQL/control (NO coldfront)
