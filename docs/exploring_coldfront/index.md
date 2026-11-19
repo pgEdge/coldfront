@@ -34,8 +34,8 @@ and select <code>Create codespace</code>. Docker, psql, and the
 <a href="https://marketplace.visualstudio.com/items?itemName=stateful.runme">Runme extension</a>
 are preinstalled. When VS Code asks whether you trust the authors of the files
 in the folder, select <code>Trust Folder &amp; Continue</code>; Runme then
-opens this page as a notebook in which each code block is a runnable cell. To
-run a cell, click the triangle to the left of the cell.</p>
+opens this page as a notebook in which the walkthrough's commands are runnable
+cells. To run a cell, click the triangle to the left of the cell.</p>
 <p>Start with the first cell in
 <a href="#setting-up-the-stack">Setting Up the Stack</a>, which builds the
 Docker images (two to five minutes) and starts the containers; each later step
