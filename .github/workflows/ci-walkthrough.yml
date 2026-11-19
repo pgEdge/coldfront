@@ -2,9 +2,9 @@ name: CI - Walkthrough
 on:
   push:
     branches: [main]
-    paths: ['examples/walkthrough/**', '.devcontainer/**', 'docs/walkthrough*.md', '.github/workflows/ci-walkthrough.yml']
+    paths: ['examples/walkthrough/**', '.devcontainer/**', 'docs/walkthrough*.md', 'docs/exploring_coldfront/**', '.github/workflows/ci-walkthrough.yml']
   pull_request:
-    paths: ['examples/walkthrough/**', '.devcontainer/**', 'docs/walkthrough*.md', '.github/workflows/ci-walkthrough.yml']
+    paths: ['examples/walkthrough/**', '.devcontainer/**', 'docs/walkthrough*.md', 'docs/exploring_coldfront/**', '.github/workflows/ci-walkthrough.yml']
   workflow_dispatch:
 
 concurrency:
@@ -41,19 +41,19 @@ jobs:
             compose: docker-compose.mesh.yml
     steps:
       - uses: actions/checkout@v7
-      # The demo builds on the base image this tree's recipe maps to, as ci/matrix.sh does.
-      - name: Resolve the base image
-        run: |
-          set -o errexit -o pipefail -o nounset
-          ref="$(ci/base-ref.sh 18)"
-          echo "COLDFRONT_BASE=$ref" >> "$GITHUB_ENV"
-
       - name: Log in to GHCR
         uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550  # v4.8.0
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
+      # The demo builds on the base image this tree's recipe maps to, as ci/matrix.sh does.
+      - name: Resolve the base image
+        run: |
+          set -o errexit -o pipefail -o nounset
+          . ci/lib.sh
+          require_base 18
+          echo "COLDFRONT_BASE=$COLDFRONT_BASE" >> "$GITHUB_ENV"
       - name: Install prerequisites
         run: sudo apt-get update -qq && sudo apt-get install -y -qq postgresql-client jq iproute2
       - name: Run setup + the ${{ matrix.demo }} demo non-interactively

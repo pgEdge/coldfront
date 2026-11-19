@@ -107,7 +107,7 @@ SELECT order_id, customer, amount FROM orders ORDER BY order_id;
 
 The call reports what it registered:
 
-```text
+```text {"ignore":"true"}
 NOTICE:  coldfront: adopted "ice"."lake"."orders" as public.orders (5 columns, read-only)
 ```
 
@@ -119,7 +119,7 @@ UPDATE orders SET amount = 0 WHERE order_id = 1;
 
 The refusal reads:
 
-```text
+```text {"ignore":"true"}
 ERROR:  coldfront: "public.orders" is adopted read-only
 HINT:  Release it with coldfront.release_iceberg_table() and adopt again with p_writable => true to arm INSERT/UPDATE/DELETE.
 ```

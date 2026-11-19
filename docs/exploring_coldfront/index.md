@@ -27,15 +27,16 @@ ColdFront repository. The walkthrough demonstrates:
 > not use it in production. Interfaces, on-disk formats, and behavior may
 > change without notice, and data loss is possible.
 
-!!! tip "Running in GitHub Codespaces"
-
-    [Open this repo in a Codespace](https://github.com/codespaces/new?repo=pgEdge/coldfront)
-    and select `Get Started` to deploy this walkthrough in a Codespace
-    environment. Docker, psql, and the
-    [Runme extension](https://marketplace.visualstudio.com/items?itemName=stateful.runme)
-    are preinstalled, and turn each code block below into a runnable cell.
-    Click **Run** on each cell as you read. The first cell builds the Docker
-    images (two to five minutes); each subsequent step is quicker.
+<div class="admonition tip">
+<p class="admonition-title"><strong>Running in GitHub Codespaces</strong></p>
+<p><a href="https://github.com/codespaces/new?repo=pgEdge/coldfront">Open this repo in a Codespace</a>
+and select <code>Get Started</code> to deploy this walkthrough in a Codespace
+environment. Docker, psql, and the
+<a href="https://marketplace.visualstudio.com/items?itemName=stateful.runme">Runme extension</a>
+are preinstalled, and turn each code block below into a runnable cell. Click
+<strong>Run</strong> on each cell as you read. The first cell builds the Docker
+images (two to five minutes); each subsequent step is quicker.</p>
+</div>
 
 If you prefer a terminal, run
 [`examples/walkthrough/guide.sh`](https://github.com/pgEdge/ColdFront/blob/main/examples/walkthrough/guide.sh).

@@ -15,7 +15,7 @@ The following table shows the eleven steps this demo covers:
 
 | Step | What you will do |
 |------|-----------------|
-| [1. Start the stack](#starting-the-stack) | Bring up Postgres, Lakekeeper, and the object store. |
+| [1. Check the stack](#checking-the-stack) | Confirm that Postgres, Lakekeeper, and the object store are running. |
 | [2. Create a table and load history](#creating-a-table-and-loading-months-of-history) | Create an ordinary partitioned table with months of data. |
 | [3. See the problem](#seeing-the-problem) | See that all rows sit in hot Postgres storage, which only grows. |
 | [4. Enable the extensions](#enabling-the-extensions) | Enable the two extensions that retrofit tiering onto the existing database. |
@@ -27,7 +27,7 @@ The following table shows the eleven steps this demo covers:
 | [10. Write to cold data](#writing-to-cold-data) | UPDATE an archived row in place, with no rehydration. |
 | [11. Confirm the edit persisted](#confirming-the-edit-persisted) | Reconnect and confirm the edit persisted in cold storage. |
 
-## Starting the Stack
+## Checking the Stack
 
 Setup starts the infrastructure: PostgreSQL (your database), plus Lakekeeper
 and SeaweedFS. The cold-storage side sits idle until you point ColdFront at it

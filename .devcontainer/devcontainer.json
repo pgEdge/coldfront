@@ -9,24 +9,15 @@
   },
   "postCreateCommand": "bash .devcontainer/post-create.sh",
   "customizations": {
-    "codespaces": {
-      "openFiles": [
-        "docs/walkthrough.md",
-        "docs/walkthrough_tiered.md",
-        "docs/walkthrough_decoupled.md",
-        "docs/walkthrough_partitioner.md",
-        "docs/walkthrough_distributed.md"
-      ]
-    },
     "vscode": {
       "settings": {
         "terminal.integrated.defaultProfile.linux": "bash",
-        "workbench.startupEditor": "none"
+        "workbench.startupEditor": "none",
+        "runme.flags.startFile": "docs/exploring_coldfront/index.md"
       },
       "extensions": [
         "stateful.runme"
       ]
     }
-  },
-  "postAttachCommand": "code docs/walkthrough.md 2>/dev/null || true"
+  }
 }

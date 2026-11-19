@@ -6,8 +6,8 @@ transparent Iceberg tiering, decoupled lake tables, and automated partition
 management, all through standard SQL.
 
 > The end-user walkthrough is at
-> [docs/walkthrough.md](../../docs/walkthrough.md), with one page per demo:
-> [tiered](../../docs/walkthrough_tiered.md),
+> [docs/exploring_coldfront/index.md](../../docs/exploring_coldfront/index.md),
+> with one page per demo: [tiered](../../docs/walkthrough_tiered.md),
 > [decoupled](../../docs/walkthrough_decoupled.md),
 > [partitioner](../../docs/walkthrough_partitioner.md), and
 > [distributed](../../docs/walkthrough_distributed.md). This README covers how
@@ -24,9 +24,10 @@ on git. There are two primary entrypoints:
 
 2. GitHub Codespaces: opens a pre-configured environment with Docker-in-Docker
    and all tools pre-installed. The devcontainer checks prerequisites during
-   creation and opens `docs/walkthrough.md` on attach: every code block in it
-   is executable via the pre-installed Runme extension. The interactive guide
-   is the terminal alternative: `bash examples/walkthrough/guide.sh`.
+   creation, and the pre-installed Runme extension opens
+   `docs/exploring_coldfront/index.md` as a notebook in which every code block
+   is a runnable cell. The interactive guide is the terminal alternative:
+   `bash examples/walkthrough/guide.sh`.
 
 If a user runs the `curl ... | bash` install inside Codespaces, `install.sh`
 detects the `$CODESPACES` environment variable and exits as a no-op: the
@@ -175,9 +176,10 @@ What happens:
 ### GitHub Codespaces
 
 Open a Codespace from the repository and select the walkthrough devcontainer
-when prompted. The devcontainer handles prerequisites during creation and opens
-`docs/walkthrough.md` on attach, with the Runme extension installed so its code
-blocks run in place. For the interactive guide instead, run
+when prompted. The devcontainer handles prerequisites during creation, and its
+`runme.flags.startFile` setting has the Runme extension open
+`docs/exploring_coldfront/index.md` as a notebook, so its code blocks run in
+place. For the interactive guide instead, run
 `bash examples/walkthrough/guide.sh` in the terminal. Running `curl ... | bash`
 inside Codespaces is a no-op: `install.sh` detects `$CODESPACES` and exits.
 

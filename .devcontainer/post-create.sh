@@ -14,5 +14,5 @@ bash examples/walkthrough/setup.sh
 
 echo ""
 echo "Setup complete!"
-echo "  Walkthrough:       docs/walkthrough.md is open - click 'Run' on each cell as you read"
+echo "  Walkthrough:       docs/exploring_coldfront/index.md is open - click 'Run' on each cell as you read"
 echo "  Interactive Guide: bash examples/walkthrough/guide.sh (terminal alternative)"

@@ -38,7 +38,7 @@ FILES=(
     examples/walkthrough/seaweedfs-s3.json
     examples/walkthrough/config/archiver.yaml
     docker/Dockerfile.duckdb15
-    docs/walkthrough.md
+    docs/exploring_coldfront/index.md
     docs/walkthrough_tiered.md
     docs/walkthrough_decoupled.md
     docs/walkthrough_partitioner.md
