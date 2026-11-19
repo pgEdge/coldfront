@@ -7,6 +7,17 @@ setting up PostgreSQL, Lakekeeper, and ColdFront itself.
 
 ## Using a Package to Install ColdFront
 
+The ColdFront packages provide everything that a build from source prepares by
+hand, so a package installation needs no compiler, Go toolchain, or
+PostgreSQL development headers. The packages install the compiled `coldfront`
+extension, the `archiver`, `partitioner`, and `compactor` command-line tools,
+and the Lakekeeper catalog. The extension package depends on pg_duckdb and
+ColdFront's DuckDB extensions, so the package manager installs them as well.
+Both are patched builds rather than the upstream releases; they include
+ColdFront's patches to duckdb-iceberg, pg_duckdb, and DuckDB.
+[Understanding ColdFront's DuckDB Stack](#understanding-coldfronts-duckdb-stack)
+describes each patch and why ColdFront applies it.
+
 pgEdge publishes ColdFront packages for PostgreSQL 16, 17, and 18 in the pgEdge
 Enterprise Postgres repository, which requires a certificate from pgEdge. The
 packages require pgEdge's PostgreSQL build. The pgEdge Enterprise Postgres
@@ -15,15 +26,6 @@ repository through starting Lakekeeper, on
 [Enterprise Linux](https://docs.pgedge.com/enterprise/el/components/coldfront/)
 and on
 [Debian and Ubuntu](https://docs.pgedge.com/enterprise/debian/components/coldfront/).
-
-!!! hint
-
-    The ColdFront extension package depends on pg_duckdb and ColdFront's
-    DuckDB extensions, so the package manager installs them as well. Both are
-    patched builds rather than the upstream releases; they include ColdFront's
-    patches to duckdb-iceberg, pg_duckdb, and DuckDB.
-    [Understanding ColdFront's DuckDB Stack](#understanding-coldfronts-duckdb-stack)
-    describes each patch and why ColdFront applies it.
 
 ## Building ColdFront from Source on Bare Metal
 
