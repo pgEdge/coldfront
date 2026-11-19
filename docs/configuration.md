@@ -12,9 +12,8 @@ configure the following components before the cold tier comes online:
 
 ## Configuring PostgreSQL
 
-The ColdFront packages do not configure PostgreSQL. After a package
-installation, add the following settings to `postgresql.conf`, then restart
-PostgreSQL:
+ColdFront needs the following settings in `postgresql.conf`. PostgreSQL reads
+the settings at server start, so restart PostgreSQL after you change them:
 
 ```ini
 shared_preload_libraries = 'pg_duckdb,coldfront'
@@ -29,13 +28,26 @@ coldfront.lakekeeper_endpoint = 'http://<lakekeeper-host>:8181/catalog'
 coldfront.local_pg_dsn = 'host=/var/run/postgresql dbname=<db> user=<role>'
 ```
 
-Building from source on Docker configures PostgreSQL for you: the
-entrypoint writes its own settings when it initializes the data directory,
-taking the warehouse, the Lakekeeper endpoint, and the DuckDB role from
-environment variables. When you build from source on bare metal, you set the
-values manually during [installation](installation.md). The descriptions that
-follow cover the package settings; the tuning settings apply to every
-installation.
+How you apply the settings depends on how you installed ColdFront:
+
+- The ColdFront packages do not configure PostgreSQL. The pgEdge Enterprise
+  Postgres documentation describes adding the settings, restarting PostgreSQL,
+  and creating the role and the extensions on
+  [Enterprise Linux](https://docs.pgedge.com/enterprise/el/components/coldfront/#configuring-postgresql-for-coldfront)
+  and on
+  [Debian and Ubuntu](https://docs.pgedge.com/enterprise/debian/components/coldfront/#configuring-postgresql-for-coldfront).
+- Building from source on Docker configures PostgreSQL for you; the entrypoint
+  writes its own settings when it initializes the data directory, taking the
+  warehouse, the Lakekeeper endpoint, and the DuckDB role from environment
+  variables.
+- When you build from source on bare metal, you set the values manually, as
+  described in
+  [Building and Configuring the ColdFront Extension](installation.md#building-and-configuring-the-coldfront-extension).
+  A bare-metal build copies the DuckDB extensions into pg_duckdb's default
+  extension directory, so the build omits `duckdb.extension_directory`.
+
+The descriptions that follow cover the package and bare-metal settings; the
+tuning settings apply to every installation.
 
 The `duckdb.*` extension settings make pg_duckdb load ColdFront's
 patched DuckDB extensions instead of fetching the unpatched upstream build,
