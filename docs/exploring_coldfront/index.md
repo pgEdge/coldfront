@@ -30,12 +30,18 @@ ColdFront repository. The walkthrough demonstrates:
 <div class="admonition tip">
 <p class="admonition-title"><strong>Running in GitHub Codespaces</strong></p>
 <p><a href="https://github.com/codespaces/new?repo=pgEdge/coldfront">Open this repo in a Codespace</a>
-and select <code>Get Started</code> to deploy this walkthrough in a Codespace
-environment. Docker, psql, and the
+and select <code>Create codespace</code>. Docker, psql, and the
 <a href="https://marketplace.visualstudio.com/items?itemName=stateful.runme">Runme extension</a>
-are preinstalled, and turn each code block below into a runnable cell. Click
-<strong>Run</strong> on each cell as you read. The first cell builds the Docker
-images (two to five minutes); each subsequent step is quicker.</p>
+are preinstalled. When VS Code asks whether you trust the authors of the files
+in the folder, select <code>Trust Folder &amp; Continue</code>; Runme then
+opens this page as a notebook in which each code block is a runnable cell. To
+run a cell, click the triangle to the left of the cell.</p>
+<p>Start with the first cell in
+<a href="#setting-up-the-stack">Setting Up the Stack</a>, which builds the
+Docker images (two to five minutes) and starts the containers; each later step
+is quicker. Then continue with the demo pages. Run the cells in
+<a href="#tearing-down-the-stack">Tearing Down the Stack</a> only when you
+finish, because they remove the demo data.</p>
 </div>
 
 If you prefer a terminal, run
