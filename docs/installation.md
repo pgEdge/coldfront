@@ -7,118 +7,25 @@ setting up PostgreSQL, Lakekeeper, and ColdFront itself.
 
 ## Using a Package to Install ColdFront
 
-ColdFront's packages come from the pgEdge package repository. Before you
-install the packages, set up access to the repository:
+pgEdge publishes ColdFront packages for PostgreSQL 16, 17, and 18 in the pgEdge
+Enterprise Postgres repository. The ColdFront packages provide everything that
+a build from source requires you to install manually, so a package installation
+needs no compiler, Go toolchain, or PostgreSQL development headers. The
+packages install the compiled `coldfront` extension, the `archiver`,
+`partitioner`, and `compactor` command-line tools, and the Lakekeeper catalog.
+The extension package depends on pg_duckdb and ColdFront's DuckDB extensions,
+so the package manager installs them as well. Both are patched builds rather
+than the upstream releases; they include ColdFront's patches to duckdb-iceberg,
+pg_duckdb, and DuckDB.
+[Understanding ColdFront's DuckDB Stack](#understanding-coldfronts-duckdb-stack)
+describes each patch and why ColdFront applies it.
 
-1. Request and install a certificate from pgEdge, as described in the
-   [pgEdge Enterprise Postgres documentation](https://docs.pgedge.com/enterprise/).
-2. Configure the pgEdge repository by following the steps in the Enterprise
-   Postgres documentation:
-
-    - For RHEL, Oracle Linux, AlmaLinux, and Rocky Linux, see
-      [Configuring the Repository on Enterprise Linux](https://docs.pgedge.com/enterprise/el/configure-repo/).
-    - For Debian and Ubuntu, see
-      [Configuring the Repository on Debian and Ubuntu](https://docs.pgedge.com/enterprise/debian/configure-repo/).
-
-If you already have a PostgreSQL server installed that you would like to use,
-configure the pgEdge repository and install only ColdFront, continuing with
-[Installing the ColdFront Packages](#installing-the-coldfront-packages).
-ColdFront packages from pgEdge require pgEdge's PostgreSQL build.
-
-### Installing PostgreSQL with Packages
-
-After you configure the pgEdge repository, install pgEdge Enterprise Postgres
-and start the server. The following steps walk you through the installation:
-
-1. Install pgEdge Enterprise Postgres. On RHEL, Rocky Linux, or AlmaLinux, the
-   package does not create a database cluster, so the installation is followed
-   by commands that create and start the cluster:
-
-    ```bash
-    sudo dnf install -y pgedge-enterprise-postgres_18
-    sudo /usr/pgsql-18/bin/postgresql-18-setup initdb
-    sudo systemctl enable --now postgresql-18
-    ```
-
-    On Ubuntu or Debian, install the package, then check for a cluster with
-    `sudo pg_lsclusters`:
-
-    ```bash
-    sudo apt update
-    sudo apt install -y pgedge-enterprise-postgres-18
-    sudo pg_lsclusters
-    ```
-
-2. Confirm that the server is running before you continue:
-
-    ```bash
-    sudo -u postgres psql -c "SELECT version();"
-    ```
-
-    The command displays the PostgreSQL version. If the server is not running
-    and `sudo pg_lsclusters` lists no `18/main` cluster, use the following
-    command to create and start the cluster:
-
-    ```bash
-    sudo pg_createcluster 18 main --start
-    ```
-
-    !!! hint
-
-        A connection error means the server is not running; check
-        `sudo systemctl status postgresql-18` on RHEL-family systems or
-        `sudo pg_lsclusters` on Ubuntu and Debian.
-
-For details, see the pgEdge Enterprise Postgres installation guide for
-[Enterprise Linux](https://docs.pgedge.com/enterprise/el/installing/) or
-[Debian and Ubuntu](https://docs.pgedge.com/enterprise/debian/installing/).
-
-### Installing the ColdFront Packages
-
-With PostgreSQL running, install the ColdFront packages for your PostgreSQL
-major version:
-
-1. Install the ColdFront extension. On RHEL, Rocky Linux, or AlmaLinux, use
-   the command:
-
-    ```bash
-    sudo dnf install -y pgedge-coldfront_18
-    ```
-
-    On Ubuntu or Debian, use the command:
-
-    ```bash
-    sudo apt install -y pgedge-postgresql-18-coldfront
-    ```
-
-    For another PostgreSQL major version, replace `18` in the package name
-    with that version.
-
-2. Install the ColdFront command-line tools and the Lakekeeper catalog. On
-   RHEL, Rocky Linux, or AlmaLinux, use the command:
-
-    ```bash
-    sudo dnf install -y pgedge-coldfront pgedge-lakekeeper
-    ```
-
-    On Ubuntu or Debian, use the command:
-
-    ```bash
-    sudo apt install -y pgedge-coldfront pgedge-lakekeeper
-    ```
-
-The `pgedge-lakekeeper` package installs Lakekeeper but does not start it; you
-configure and start it as described in
-[Configuring Lakekeeper](configure_lakekeeper.md).
-
-!!! hint
-
-    The ColdFront extension package depends on pg_duckdb and ColdFront's
-    DuckDB extensions, so the package manager installs them as well. Both are
-    patched builds rather than the upstream releases; they include ColdFront's
-    patches to duckdb-iceberg, pg_duckdb, and DuckDB.
-    [Understanding ColdFront's DuckDB Stack](#understanding-coldfronts-duckdb-stack)
-    describes each patch and why ColdFront applies it.
+The pgEdge Enterprise Postgres repository requires a certificate from pgEdge.
+The pgEdge Enterprise Postgres documentation describes the complete package
+installation, from configuring the repository through starting Lakekeeper, on
+[Enterprise Linux](https://docs.pgedge.com/enterprise/el/components/coldfront/)
+and on
+[Debian and Ubuntu](https://docs.pgedge.com/enterprise/debian/components/coldfront/).
 
 ## Building ColdFront from Source on Bare Metal
 
