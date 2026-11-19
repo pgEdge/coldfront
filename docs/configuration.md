@@ -46,8 +46,8 @@ How you apply the settings depends on how you installed ColdFront:
   A bare-metal build copies the DuckDB extensions into pg_duckdb's default
   extension directory, so the build omits `duckdb.extension_directory`.
 
-The descriptions that follow cover the package and bare-metal settings; the
-tuning settings apply to every installation.
+The sections that follow describe the package and bare-metal configuration
+steps; the tuning settings apply to every installation.
 
 The `duckdb.*` extension settings make pg_duckdb load ColdFront's
 patched DuckDB extensions instead of fetching the unpatched upstream build,
