@@ -47,7 +47,7 @@ How you apply the settings depends on how you installed ColdFront:
   extension directory, so the build omits `duckdb.extension_directory`.
 
 The sections that follow describe the package and bare-metal configuration
-steps; the tuning settings apply to every installation.
+steps; the tuning settings apply to all installation methods.
 
 The `duckdb.*` extension settings make pg_duckdb load ColdFront's
 patched DuckDB extensions instead of fetching the unpatched upstream build,
