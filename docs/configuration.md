@@ -12,8 +12,8 @@ configure the following components before the cold tier comes online:
 
 ## Configuring PostgreSQL
 
-ColdFront needs the following settings in `postgresql.conf`. PostgreSQL reads
-the settings at server start, so restart PostgreSQL after you change them:
+ColdFront requires the following settings in `postgresql.conf`. PostgreSQL
+reads the settings at server start; restart PostgreSQL after you change them:
 
 ```ini
 shared_preload_libraries = 'pg_duckdb,coldfront'
