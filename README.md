@@ -205,9 +205,8 @@ installing and starting Lakekeeper on
 [Enterprise Linux](https://docs.pgedge.com/enterprise/el/components/coldfront/)
 and on
 [Debian and Ubuntu](https://docs.pgedge.com/enterprise/debian/components/coldfront/).
-
-When you complete those steps, continue with
-[Connecting a Package or Bare-Metal Installation to Lakekeeper and an Object Store](#connecting-a-package-or-bare-metal-installation-to-lakekeeper-and-an-object-store).
+Those pages then link to the ColdFront guides for bootstrapping Lakekeeper,
+configuring the object store, and writing ColdFront's configuration.
 
 ### Installing and Configuring ColdFront in a Docker Container
 
@@ -354,7 +353,7 @@ For more information, see
 [Building ColdFront from Source on Bare Metal](docs/installation.md#building-coldfront-from-source-on-bare-metal).
 
 When the extensions are created, continue with
-[Connecting a Package or Bare-Metal Installation to Lakekeeper and an Object Store](#connecting-a-package-or-bare-metal-installation-to-lakekeeper-and-an-object-store).
+[Connecting a Bare-Metal Installation to Lakekeeper and an Object Store](#connecting-a-bare-metal-installation-to-lakekeeper-and-an-object-store).
 
 ### Connecting ColdFront to Lakekeeper and Object Storage
 
@@ -368,10 +367,9 @@ set up the object store and the Lakekeeper warehouse once for each deployment.
 The store's credential is kept in each database, so you repeat the credential
 step in every database that uses ColdFront.
 
-#### Connecting a Package or Bare-Metal Installation to Lakekeeper and an Object Store
+#### Connecting a Bare-Metal Installation to Lakekeeper and an Object Store
 
-A package or bare-metal installation runs Lakekeeper and an object store on
-the host.
+A bare-metal installation runs Lakekeeper and an object store on the host.
 
 1. Start an object store. If you're walking through this installation to
     evaluate ColdFront, you can use SeaweedFS, a free S3-compatible store, on
@@ -397,14 +395,8 @@ the host.
     [Configuring your Object Store](docs/object_store.md) guide covers
     configuration of each one, including production stores.
 
-2. Install Lakekeeper. To install Lakekeeper from the `pgedge-lakekeeper`
-    package, follow the Lakekeeper steps in the pgEdge Enterprise Postgres
-    documentation for
-    [Enterprise Linux](https://docs.pgedge.com/enterprise/el/components/coldfront/#installing-and-configuring-lakekeeper)
-    or
-    [Debian and Ubuntu](https://docs.pgedge.com/enterprise/debian/components/coldfront/#installing-and-configuring-lakekeeper),
-    and then continue with step 6. Otherwise, install the upstream binary and
-    create the `lakekeeper` user as described in steps 1 and 2 of
+2. Install Lakekeeper. Install the upstream binary and create the
+    `lakekeeper` user as described in steps 1 and 2 of
     [Installing and Configuring Lakekeeper on Bare Metal](docs/configure_lakekeeper.md#installing-and-configuring-lakekeeper-on-bare-metal).
     Then copy the environment file and the systemd unit from the ColdFront
     repository:
