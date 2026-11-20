@@ -121,9 +121,10 @@ jobs:
         run: ci/matrix.sh --full
 
   # docker/Dockerfile.duckdb15-base pins the pgEdge Postgres images by immutable tag.
-  # This job fails when a floating tag points at a different image than its pin.
+  # This job fails when pgEdge publishes a newer image for a pinned major, and
+  # names it. Builds keep using the pin until it is changed.
   parent-pin:
-    name: parent image pins
+    name: newer pgEdge image check
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     timeout-minutes: 5
