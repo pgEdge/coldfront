@@ -48,9 +48,9 @@ ARG TARGETARCH=amd64
 # The pgEdge Postgres image for each major, by immutable tag. One alias per
 # major, picked by PG_MAJOR, because a FROM cannot nest ARG expansion; the
 # unused aliases are never pulled.
-FROM ghcr.io/pgedge/pgedge-postgres:16.16-spock5.0.14-minimal-1 AS pgedge-16
-FROM ghcr.io/pgedge/pgedge-postgres:17.12-spock5.0.14-minimal-1 AS pgedge-17
-FROM ghcr.io/pgedge/pgedge-postgres:18.7-spock5.0.14-minimal-1  AS pgedge-18
+FROM ghcr.io/pgedge/pgedge-postgres:16.16-spock5.0.14-minimal-2 AS pgedge-16
+FROM ghcr.io/pgedge/pgedge-postgres:17.12-spock5.0.14-minimal-2 AS pgedge-17
+FROM ghcr.io/pgedge/pgedge-postgres:18.7-spock5.0.14-minimal-2  AS pgedge-18
 
 # ─── build stage: libcurl 8.12 + pg_duckdb (DuckDB 1.5.4, patched) ───────────────
 FROM pgedge-${PG_MAJOR} AS build
