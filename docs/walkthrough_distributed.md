@@ -44,8 +44,8 @@ If port 5442, 5443, 8191, or 8343 is already in use on your host, set
 or `COLDFRONT_MESH_S3_PORT` before `up`.
 
 Next, run the `curl` block from
-[Setting Up the Stack](exploring_coldfront/index.md#setting-up-the-stack) with port 8191 in
-place of 8181. That creates the `wh` warehouse and `public` namespace on the
+[Starting the Stack by Hand](exploring_coldfront/index.md#starting-the-stack-by-hand)
+with port 8191 in place of 8181. That creates the `wh` warehouse and `public` namespace on the
 mesh's own Lakekeeper.
 
 Then create the extensions and form the mesh, running each statement on the

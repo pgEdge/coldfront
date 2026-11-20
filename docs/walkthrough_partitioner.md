@@ -8,7 +8,10 @@ tier. If all you need is automated partition maintenance on stock PostgreSQL,
 the partitioner is the whole product - no Iceberg, no DuckDB, no archiver cold
 path.
 
-Run the steps in [Setting Up the Stack](exploring_coldfront/index.md#setting-up-the-stack)
+Start the stack as described in
+[Starting the Stack in a Codespace](exploring_coldfront/index.md#starting-the-stack-in-a-codespace)
+or
+[Starting the Stack on Your Own System](exploring_coldfront/index.md#starting-the-stack-on-your-own-system)
 before you start this demo.
 
 ## Creating the Demo Table

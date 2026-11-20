@@ -8,7 +8,10 @@ PostgreSQL holds a thin wrapper view and a registry entry. This is a fresh
 table - there is no migration from the tiered demo, and tiered and decoupled
 tables are independent.
 
-Run the steps in [Setting Up the Stack](exploring_coldfront/index.md#setting-up-the-stack)
+Start the stack as described in
+[Starting the Stack in a Codespace](exploring_coldfront/index.md#starting-the-stack-in-a-codespace)
+or
+[Starting the Stack on Your Own System](exploring_coldfront/index.md#starting-the-stack-on-your-own-system)
 before you start this demo. The demo also needs the extensions and storage
 secret from [Step 4](walkthrough_tiered.md#enabling-the-extensions) and
 [Step 5](walkthrough_tiered.md#pointing-coldfront-at-the-object-store) of the

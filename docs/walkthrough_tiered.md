@@ -8,7 +8,10 @@ database full of data, add ColdFront to it, and let the archiver relocate the
 cold majority to object storage - without migrating to a new database or
 changing a line of application SQL.
 
-Run the steps in [Setting Up the Stack](exploring_coldfront/index.md#setting-up-the-stack)
+Start the stack as described in
+[Starting the Stack in a Codespace](exploring_coldfront/index.md#starting-the-stack-in-a-codespace)
+or
+[Starting the Stack on Your Own System](exploring_coldfront/index.md#starting-the-stack-on-your-own-system)
 before you start this demo.
 
 The following table shows the eleven steps this demo covers:
@@ -31,10 +34,10 @@ The following table shows the eleven steps this demo covers:
 
 Setup starts the infrastructure: PostgreSQL (your database), plus Lakekeeper
 and SeaweedFS. The cold-storage side sits idle until you point ColdFront at it
-in [Step 5](#pointing-coldfront-at-the-object-store). Run the
-`docker compose up` command shown in
-[Setting Up the Stack](exploring_coldfront/index.md#setting-up-the-stack). Then confirm that
-the `db`, `lakekeeper-db`, and `lakekeeper` services report `healthy`:
+in [Step 5](#pointing-coldfront-at-the-object-store). When you have
+started the stack as described in
+[Exploring ColdFront - Getting Started](exploring_coldfront/index.md), confirm
+that the `db`, `lakekeeper-db`, and `lakekeeper` services report `healthy`:
 
 ```bash
 docker compose -f examples/walkthrough/docker-compose.yml ps
