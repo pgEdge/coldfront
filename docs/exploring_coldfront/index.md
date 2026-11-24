@@ -255,8 +255,11 @@ When the commands finish, the stack is running; continue with
 
 Each demo page runs the same commands in either environment. In a Codespace,
 open the demo page and click the triangle beside each cell in order. On your
-own system, paste each command into a terminal at the repository root, or
-choose the demo from the interactive guide's menu.
+own system, work from the repository root, or from the `coldfront-walkthrough`
+directory if you used the installer: paste each shell command into a terminal
+and each SQL block into a psql session that you open with
+`psql postgresql://coldfront@localhost:5432/coldfront`, or choose the demo from
+the interactive guide's menu.
 
 The walkthrough includes the following demos:
 

@@ -20,9 +20,13 @@ the last.
 
 Start the stack as described in
 [Starting the Stack on Your Own System](exploring_coldfront/index.md#starting-the-stack-on-your-own-system).
-Then paste each command into a terminal at the repository root, in order. To
-have the interactive guide run the same steps for you, run
-`bash examples/walkthrough/guide.sh` and choose `3) Partitioner`.
+Then run each step in order from the repository root, or from the
+`coldfront-walkthrough` directory if you used the installer: paste each shell
+command into a terminal, and paste each SQL block into a psql session that you
+open with `psql postgresql://coldfront@localhost:5432/coldfront`. To have the
+interactive guide run the same steps for you, run
+`bash examples/walkthrough/guide.sh` from that directory and choose
+`3) Partitioner`.
 
 ## Creating the Demo Table
 

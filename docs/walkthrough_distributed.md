@@ -33,9 +33,10 @@ The sections that follow show what the guide does, so you can follow along.
 
 ## Running This Demo on Your Own System
 
-On your own system, run the same command from the repository root and choose
-`4) Distributed`, or reproduce the demo by hand: paste the commands in the
-sections that follow into a terminal and into psql sessions against each
+On your own system, run the same command from the repository root, or from
+the `coldfront-walkthrough` directory if you used the installer, and choose
+`4) Distributed`. To reproduce the demo by hand instead, paste the commands in
+the sections that follow into a terminal and into psql sessions against each
 node.
 
 ## Bringing Up the Two-Node Mesh

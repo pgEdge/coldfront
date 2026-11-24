@@ -8,12 +8,6 @@ PostgreSQL holds a thin wrapper view and a registry entry. This is a fresh
 table - there is no migration from the tiered demo, and tiered and decoupled
 tables are independent.
 
-The demo needs the extensions and storage secret from
-[Step 4](walkthrough_tiered.md#enabling-the-extensions) and
-[Step 5](walkthrough_tiered.md#pointing-coldfront-at-the-object-store) of the
-tiered demo. If you start here, run those two steps first, in either
-environment.
-
 ## Running This Demo in a Codespace
 
 Start the stack as described in
@@ -26,9 +20,21 @@ the last.
 
 Start the stack as described in
 [Starting the Stack on Your Own System](exploring_coldfront/index.md#starting-the-stack-on-your-own-system).
-Then paste each command into a terminal at the repository root, in order. To
-have the interactive guide run the same steps for you, run
-`bash examples/walkthrough/guide.sh` and choose `2) Decoupled`.
+Then run each step in order from the repository root, or from the
+`coldfront-walkthrough` directory if you used the installer: paste each shell
+command into a terminal, and paste each SQL block into a psql session that you
+open with `psql postgresql://coldfront@localhost:5432/coldfront`. To have the
+interactive guide run the same steps for you, run
+`bash examples/walkthrough/guide.sh` from that directory and choose
+`2) Decoupled`.
+
+## Before You Start
+
+This demo needs the extensions and storage secret that
+[Step 4](walkthrough_tiered.md#enabling-the-extensions) and
+[Step 5](walkthrough_tiered.md#pointing-coldfront-at-the-object-store) of the
+tiered demo create. If you start here, run those two steps after you start the
+stack and before you continue, in either environment.
 
 ## Creating an Iceberg-Only Table
 
