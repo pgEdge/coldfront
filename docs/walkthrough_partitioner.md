@@ -18,23 +18,49 @@ The following table shows the three steps this demo performs:
 
 ## Running This Demo in a Codespace
 
-Start the stack as described in
-[Starting the Stack in a Codespace](exploring_coldfront/index.md#starting-the-stack-in-a-codespace).
-Then open this page from the Explorer; Runme opens the page as a notebook.
-Click the triangle to the left of each cell, in order, from the first step to
-the last.
+Create the Codespace and trust the folder as described in
+[Preparing a Codespace](exploring_coldfront/index.md#preparing-a-codespace),
+then open this page from the Explorer. Runme opens the page as a notebook; to
+run a cell, click the triangle to the left of the cell.
+
+If the stack is already running from another demo, skip to the first step.
+Otherwise, run the following cell to start the containers and build the
+archiver image. The first run builds the Docker images, which takes two to five
+minutes:
+
+```bash
+docker compose -f examples/walkthrough/docker-compose.yml \
+  up -d --build
+docker compose -f examples/walkthrough/docker-compose.yml \
+  build archiver
+```
+
+Then click the triangle beside each cell that follows, in order.
 
 ## Running This Demo on Your Own System
 
-Start the stack as described in
-[Starting the Stack on Your Own System](exploring_coldfront/index.md#starting-the-stack-on-your-own-system).
-Then run each step in order from the repository root, or from the
-`coldfront-walkthrough` directory if you used the installer: paste each shell
-command into a terminal, and paste each SQL block into a psql session that you
-open with `psql postgresql://coldfront@localhost:5432/coldfront`. To have the
-interactive guide run the same steps for you, run
-`bash examples/walkthrough/guide.sh` from that directory and choose
-`3) Partitioner`.
+Prepare your system as described in
+[Preparing Your Own System](exploring_coldfront/index.md#preparing-your-own-system).
+Then work from the repository root, or from the `coldfront-walkthrough`
+directory if you used the installer: paste each shell command into a terminal,
+and paste each SQL block into a psql session that you open with
+`psql postgresql://coldfront@localhost:5432/coldfront`. To have the interactive
+guide run this demo for you instead, run `bash examples/walkthrough/guide.sh`
+from that directory and choose `3) Partitioner`.
+
+If the stack is already running from another demo, skip to the first step.
+Otherwise, use the following commands to start the containers and build the
+archiver image:
+
+```bash {"ignore":"true"}
+docker compose -f examples/walkthrough/docker-compose.yml \
+  up -d --build
+docker compose -f examples/walkthrough/docker-compose.yml \
+  build archiver
+```
+
+If port 5432, 8181, or 8333 is already in use on your host, see
+[Changing the Demo Ports](exploring_coldfront/index.md#changing-the-demo-ports).
 
 ## Creating the Demo Table
 
@@ -93,6 +119,13 @@ A table registered with `--strategy detach` keeps its expired partitions as
 standalone tables instead of dropping them. The
 [Managing Partitioned Tables (CLI)](using_coldfront/index.md#managing-partitioned-tables-cli)
 section describes the partition CLI and shows more `register` examples.
+
+## When You Finish
+
+Keep the stack running if you plan to run another demo; every demo except the
+distributed demo reuses it. To stop the stack and remove its data, run the
+commands in
+[Tearing Down the Stack](exploring_coldfront/index.md#tearing-down-the-stack).
 
 ## Next Steps
 

@@ -63,9 +63,9 @@ If port 5442, 5443, 8191, or 8343 is already in use on your host, set
 or `COLDFRONT_MESH_S3_PORT` before `up`.
 
 Next, run the `curl` block from
-[Starting the Stack by Hand](exploring_coldfront/index.md#starting-the-stack-by-hand)
-with port 8191 in place of 8181. That creates the `wh` warehouse and `public`
-namespace on the mesh's own Lakekeeper.
+[Running This Demo on Your Own System](walkthrough_tiered.md#running-this-demo-on-your-own-system)
+on the tiered demo page, with port 8191 in place of 8181. That creates the `wh`
+warehouse and `public` namespace on the mesh's own Lakekeeper.
 
 Then create the extensions and form the mesh, running each statement on the
 node its comment names:
@@ -242,6 +242,12 @@ SQL
 
 Twelve writes from two nodes produce twelve snapshots, with no missing sequence
 number and no fork.
+
+## When You Finish
+
+To stop the two-node stack and remove its data, run the mesh command in
+[Tearing Down the Stack](exploring_coldfront/index.md#tearing-down-the-stack).
+The interactive guide's menu returns you to the single-node stack.
 
 ## Next Steps
 

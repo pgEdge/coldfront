@@ -22,31 +22,159 @@ The following table shows the seven steps this demo performs:
 
 ## Running This Demo in a Codespace
 
-Start the stack as described in
-[Starting the Stack in a Codespace](exploring_coldfront/index.md#starting-the-stack-in-a-codespace).
-Then open this page from the Explorer; Runme opens the page as a notebook.
-Click the triangle to the left of each cell, in order, from the first step to
-the last.
+Create the Codespace and trust the folder as described in
+[Preparing a Codespace](exploring_coldfront/index.md#preparing-a-codespace),
+then open this page from the Explorer. Runme opens the page as a notebook; to
+run a cell, click the triangle to the left of the cell.
+
+If the stack is already running from another demo, skip to the first step.
+Otherwise, run the following cell to start the containers and build the
+archiver image. The first run builds the Docker images, which takes two to five
+minutes:
+
+```bash
+docker compose -f examples/walkthrough/docker-compose.yml \
+  up -d --build
+docker compose -f examples/walkthrough/docker-compose.yml \
+  build archiver
+```
+
+Run the following cell to bootstrap Lakekeeper, create the `wh` warehouse
+backed by SeaweedFS, and seed the `public` namespace. The cell makes one
+attempt, so run it again if the warehouse request fails:
+
+```bash
+# Bootstrap Lakekeeper (one-time per fresh stack)
+curl -sf -X POST http://localhost:8181/management/v1/bootstrap \
+  -H 'Content-Type: application/json' \
+  -d '{"accept-terms-of-use":true}'
+
+# Create the warehouse and save its ID (retried by guide.sh until 200)
+WID=$(curl -sf -X POST http://localhost:8181/management/v1/warehouse \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "warehouse-name": "wh",
+    "storage-profile": {
+      "type": "s3",
+      "bucket": "iceberg",
+      "region": "us-east-1",
+      "endpoint": "http://seaweedfs:8333",
+      "path-style-access": true,
+      "flavor": "s3-compat",
+      "sts-enabled": false,
+      "remote-signing-enabled": false
+    },
+    "storage-credential": {
+      "type": "s3",
+      "credential-type": "access-key",
+      "aws-access-key-id": "admin",
+      "aws-secret-access-key": "adminsecret"
+    }
+  }' \
+  | grep -oE '"warehouse-id":"[^"]+"' | cut -d'"' -f4)
+
+# Seed the public namespace
+if [ -z "$WID" ]; then
+  echo "No warehouse ID - check that the warehouse create succeeded."
+else
+  curl -sf -X POST \
+    "http://localhost:8181/catalog/v1/${WID}/namespaces" \
+    -H 'Content-Type: application/json' \
+    -d '{"namespace":["public"]}'
+fi
+```
+
+Then click the triangle beside each cell that follows, in order.
 
 ## Running This Demo on Your Own System
 
-Start the stack as described in
-[Starting the Stack on Your Own System](exploring_coldfront/index.md#starting-the-stack-on-your-own-system).
-Then run each step in order from the repository root, or from the
-`coldfront-walkthrough` directory if you used the installer: paste each shell
-command into a terminal, and paste each SQL block into a psql session that you
-open with `psql postgresql://coldfront@localhost:5432/coldfront`. To have the
-interactive guide run the same steps for you, run
-`bash examples/walkthrough/guide.sh` from that directory and choose
-`2) Decoupled`.
+Prepare your system as described in
+[Preparing Your Own System](exploring_coldfront/index.md#preparing-your-own-system).
+Then work from the repository root, or from the `coldfront-walkthrough`
+directory if you used the installer: paste each shell command into a terminal,
+and paste each SQL block into a psql session that you open with
+`psql postgresql://coldfront@localhost:5432/coldfront`. To have the interactive
+guide run this demo for you instead, run `bash examples/walkthrough/guide.sh`
+from that directory and choose `2) Decoupled`.
 
-## Before You Start
+If the stack is already running from another demo, skip to the first step.
+Otherwise, use the following commands to start the containers and build the
+archiver image, and then bootstrap Lakekeeper:
 
-This demo needs the extensions and storage secret that
-[Step 4](walkthrough_tiered.md#enabling-the-extensions) and
-[Step 5](walkthrough_tiered.md#pointing-coldfront-at-the-object-store) of the
-tiered demo create. If you start here, run those two steps after you start the
-stack and before you continue, in either environment.
+```bash {"ignore":"true"}
+docker compose -f examples/walkthrough/docker-compose.yml \
+  up -d --build
+docker compose -f examples/walkthrough/docker-compose.yml \
+  build archiver
+```
+
+```bash {"ignore":"true"}
+# Bootstrap Lakekeeper (one-time per fresh stack)
+curl -sf -X POST http://localhost:8181/management/v1/bootstrap \
+  -H 'Content-Type: application/json' \
+  -d '{"accept-terms-of-use":true}'
+
+# Create the warehouse and save its ID (retried by guide.sh until 200)
+WID=$(curl -sf -X POST http://localhost:8181/management/v1/warehouse \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "warehouse-name": "wh",
+    "storage-profile": {
+      "type": "s3",
+      "bucket": "iceberg",
+      "region": "us-east-1",
+      "endpoint": "http://seaweedfs:8333",
+      "path-style-access": true,
+      "flavor": "s3-compat",
+      "sts-enabled": false,
+      "remote-signing-enabled": false
+    },
+    "storage-credential": {
+      "type": "s3",
+      "credential-type": "access-key",
+      "aws-access-key-id": "admin",
+      "aws-secret-access-key": "adminsecret"
+    }
+  }' \
+  | grep -oE '"warehouse-id":"[^"]+"' | cut -d'"' -f4)
+
+# Seed the public namespace
+if [ -z "$WID" ]; then
+  echo "No warehouse ID - check that the warehouse create succeeded."
+else
+  curl -sf -X POST \
+    "http://localhost:8181/catalog/v1/${WID}/namespaces" \
+    -H 'Content-Type: application/json' \
+    -d '{"namespace":["public"]}'
+fi
+```
+
+If port 5432, 8181, or 8333 is already in use on your host, see
+[Changing the Demo Ports](exploring_coldfront/index.md#changing-the-demo-ports).
+
+## Preparing the Database
+
+This demo needs the `pg_duckdb` and `coldfront` extensions and the object store
+credential. If you ran the tiered demo on this stack, both are already in
+place, and running these steps again changes nothing.
+
+Run the following SQL to create both extensions:
+
+```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
+CREATE EXTENSION IF NOT EXISTS pg_duckdb;
+CREATE EXTENSION IF NOT EXISTS coldfront;
+```
+
+Register the local SeaweedFS credentials:
+
+```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
+SELECT coldfront.set_storage_secret(
+  'admin', 'adminsecret', 'seaweedfs:8333'
+);
+```
+
+The [tiered demo](walkthrough_tiered.md#enabling-the-extensions) describes
+what each extension does and how to use a real object store instead.
 
 ## Creating an Iceberg-Only Table
 
@@ -205,6 +333,13 @@ There are two things to take from this demo. A `VARCHAR` column comes back as
 text rather than as `jsonb` unless `p_types` says otherwise, because Iceberg
 records no PostgreSQL type. The bakery serializes ColdFront's own writers, not
 an external engine writing the same table.
+
+## When You Finish
+
+Keep the stack running if you plan to run another demo; every demo except the
+distributed demo reuses it. To stop the stack and remove its data, run the
+commands in
+[Tearing Down the Stack](exploring_coldfront/index.md#tearing-down-the-stack).
 
 ## Next Steps
 

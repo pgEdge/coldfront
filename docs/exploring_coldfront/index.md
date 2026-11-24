@@ -1,19 +1,21 @@
 ---
 cwd: ../../
 ---
-# Exploring ColdFront - Getting Started
+# Exploring ColdFront
 
-This walkthrough is the foundation step for the mode-specific guides that
-follow:
+Each of the following demos starts the stack it needs and runs from start to
+finish on its own page:
 
 - [Exploring Tiered Storage](../walkthrough_tiered.md)
 - [Exploring Decoupled Mode](../walkthrough_decoupled.md)
 - [Exploring the Standalone Partitioner](../walkthrough_partitioner.md)
 - [Exploring Distributed Mode](../walkthrough_distributed.md)
 
-It is a self-contained, step-by-step tour of ColdFront's three operating
-modes, using Docker containers deployed with the Compose files in the
-ColdFront repository. The walkthrough demonstrates:
+You can use the Exploring pages to take a self-contained, step-by-step tour of
+ColdFront's three operating modes in a GitHub Codespace, or deploy the
+walkthrough on your own system. Either way, the walkthrough runs in Docker
+containers deployed with the Compose files in the ColdFront repository, and
+demonstrates:
 
 - tiered storage, which keeps recent data in PostgreSQL and archives older
   data to cold Iceberg.
@@ -27,9 +29,8 @@ ColdFront repository. The walkthrough demonstrates:
 > not use it in production. Interfaces, on-disk formats, and behavior may
 > change without notice, and data loss is possible.
 
-You can run the walkthrough in a GitHub Codespace or on your own system. Each
-path starts the same demo stack; the demo pages then run the same commands in
-either environment.
+Both paths start the same demo stack, and the demo pages run the same commands
+in either environment.
 
 ## Understanding the Demo Stack
 
@@ -47,11 +48,11 @@ containers. The stack includes the following services:
 The stack runs PostgreSQL 18 by default. To run 16 or 17, set `PG_MAJOR` before
 `up` and change the `pgdata` volume path in `docker-compose.yml` to match.
 
-## Starting the Stack in a Codespace
+## Preparing a Codespace
 
 A Codespace runs the walkthrough in your browser, with nothing to install on
-your own system. Use the following steps to create the Codespace and open this
-page as a runnable notebook:
+your own system. Use the following steps to create the Codespace and open the
+Exploring pages as runnable notebooks:
 
 1. [Open this repo in a Codespace](https://github.com/codespaces/new?repo=pgEdge/coldfront)
    and select `Create codespace`. Docker, psql, and the
@@ -62,76 +63,14 @@ page as a runnable notebook:
    in which the walkthrough's commands are runnable cells; to run a cell, click
    the triangle to the left of the cell.
 
-Run the following cell to start the containers and build the archiver image.
-The archiver runs on demand in the tiered and partitioner demos, so `up` does
-not start it. The first run builds the Docker images, which takes two to five
-minutes:
-
-```bash
-docker compose -f examples/walkthrough/docker-compose.yml \
-  up -d --build
-docker compose -f examples/walkthrough/docker-compose.yml \
-  build archiver
-```
-
-Run the following cell to bootstrap Lakekeeper, create the `wh` warehouse
-backed by SeaweedFS, and seed the `public` namespace. The cell makes one
-attempt, so run it again if the warehouse request fails:
-
-```bash
-# Bootstrap Lakekeeper (one-time per fresh stack)
-curl -sf -X POST http://localhost:8181/management/v1/bootstrap \
-  -H 'Content-Type: application/json' \
-  -d '{"accept-terms-of-use":true}'
-
-# Create the warehouse and save its ID (retried by guide.sh until 200)
-WID=$(curl -sf -X POST http://localhost:8181/management/v1/warehouse \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "warehouse-name": "wh",
-    "storage-profile": {
-      "type": "s3",
-      "bucket": "iceberg",
-      "region": "us-east-1",
-      "endpoint": "http://seaweedfs:8333",
-      "path-style-access": true,
-      "flavor": "s3-compat",
-      "sts-enabled": false,
-      "remote-signing-enabled": false
-    },
-    "storage-credential": {
-      "type": "s3",
-      "credential-type": "access-key",
-      "aws-access-key-id": "admin",
-      "aws-secret-access-key": "adminsecret"
-    }
-  }' \
-  | grep -oE '"warehouse-id":"[^"]+"' | cut -d'"' -f4)
-
-# Seed the public namespace
-if [ -z "$WID" ]; then
-  echo "No warehouse ID - check that the warehouse create succeeded."
-else
-  curl -sf -X POST \
-    "http://localhost:8181/catalog/v1/${WID}/namespaces" \
-    -H 'Content-Type: application/json' \
-    -d '{"namespace":["public"]}'
-fi
-```
-
-If you run the bootstrap again after the warehouse exists, the create
-request fails and `WID` is empty. Set `WID` to the `warehouse-id` of the `wh`
-warehouse in the output of
-`curl -s http://localhost:8181/management/v1/warehouse`, then rerun the
-namespace request.
-
-When both cells finish, the stack is running; continue with
+When the Codespace is ready, open a demo page from the Explorer. Each demo page
+starts the stack in its first cells, so continue with
 [Running the Demos](#running-the-demos).
 
-## Starting the Stack on Your Own System
+## Preparing Your Own System
 
 On your own system, the interactive guide starts the stack and runs the demos
-for you, or you can start the stack by hand. Before you start, confirm that
+for you, or you can run each demo page by hand. Before you start, confirm that
 your system meets the following prerequisites:
 
 - Docker 24+ with Compose V2 (the `docker compose` plugin, not the legacy
@@ -175,91 +114,39 @@ guide type each one a character at a time, as in a recording, set
 `WALKTHROUGH_TYPE_DELAY` to the delay in seconds between characters (for
 example, `0.03`). The default of `0` prints each command at once.
 
-### Starting the Stack by Hand
+### Running the Demos by Hand
 
-To start the stack without the guide, clone the
-[ColdFront repository](https://github.com/pgEdge/ColdFront) and run the
-following commands from its root. The first command starts the containers and
-builds the archiver image, which runs on demand in the tiered and partitioner
-demos:
+To run the demos without the guide, clone the
+[ColdFront repository](https://github.com/pgEdge/ColdFront), and then follow
+the section for your own system on each demo page from the repository root.
+Each demo page starts the stack, so continue with
+[Running the Demos](#running-the-demos).
 
-```bash {"ignore":"true"}
-docker compose -f examples/walkthrough/docker-compose.yml \
-  up -d --build
-docker compose -f examples/walkthrough/docker-compose.yml \
-  build archiver
-```
+### Changing the Demo Ports
 
 If port 5432, 8181, or 8333 is already in use on your host, set
-`COLDFRONT_PG_PORT`, `COLDFRONT_LK_PORT`, or `COLDFRONT_S3_PORT` before `up`.
-If you remap the PG port, match it in the `psql` commands of the demos. If you
-remap the Lakekeeper port, match it in the following `curl` commands and in
-the demos.
-
-The following commands bootstrap Lakekeeper, create the `wh` warehouse backed
-by SeaweedFS, and seed the `public` namespace. The interactive guide retries
-the warehouse request until SeaweedFS is ready; the commands make one attempt,
-so run them again if the warehouse request fails:
-
-```bash {"ignore":"true"}
-# Bootstrap Lakekeeper (one-time per fresh stack)
-curl -sf -X POST http://localhost:8181/management/v1/bootstrap \
-  -H 'Content-Type: application/json' \
-  -d '{"accept-terms-of-use":true}'
-
-# Create the warehouse and save its ID (retried by guide.sh until 200)
-WID=$(curl -sf -X POST http://localhost:8181/management/v1/warehouse \
-  -H 'Content-Type: application/json' \
-  -d '{
-    "warehouse-name": "wh",
-    "storage-profile": {
-      "type": "s3",
-      "bucket": "iceberg",
-      "region": "us-east-1",
-      "endpoint": "http://seaweedfs:8333",
-      "path-style-access": true,
-      "flavor": "s3-compat",
-      "sts-enabled": false,
-      "remote-signing-enabled": false
-    },
-    "storage-credential": {
-      "type": "s3",
-      "credential-type": "access-key",
-      "aws-access-key-id": "admin",
-      "aws-secret-access-key": "adminsecret"
-    }
-  }' \
-  | grep -oE '"warehouse-id":"[^"]+"' | cut -d'"' -f4)
-
-# Seed the public namespace
-if [ -z "$WID" ]; then
-  echo "No warehouse ID - check that the warehouse create succeeded."
-else
-  curl -sf -X POST \
-    "http://localhost:8181/catalog/v1/${WID}/namespaces" \
-    -H 'Content-Type: application/json' \
-    -d '{"namespace":["public"]}'
-fi
-```
-
-If you run the bootstrap again after the warehouse exists, the create
-request fails and `WID` is empty. Set `WID` to the `warehouse-id` of the `wh`
-warehouse in the output of
-`curl -s http://localhost:8181/management/v1/warehouse`, then rerun the
-namespace request.
-
-When the commands finish, the stack is running; continue with
-[Running the Demos](#running-the-demos).
+`COLDFRONT_PG_PORT`, `COLDFRONT_LK_PORT`, or `COLDFRONT_S3_PORT` before the
+`docker compose up` command on a demo page. If you remap the PG port, match it
+in the `psql` commands of the demos. If you remap the Lakekeeper port, match it
+in the `curl` commands of the demos.
 
 ## Running the Demos
 
-Each demo page runs the same commands in either environment. In a Codespace,
-open the demo page and click the triangle beside each cell in order. On your
-own system, work from the repository root, or from the `coldfront-walkthrough`
-directory if you used the installer: paste each shell command into a terminal
-and each SQL block into a psql session that you open with
+Each demo page starts the stack, runs the demo, and ends with a When You Finish
+section. If the stack is already running from another demo, skip the start
+steps on the next page. In a Codespace, open the demo page and click the
+triangle beside each cell in order. On your own system, work from the
+repository root, or from the `coldfront-walkthrough` directory if you used the
+installer: paste each shell command into a terminal and each SQL block into a
+psql session that you open with
 `psql postgresql://coldfront@localhost:5432/coldfront`, or choose the demo from
 the interactive guide's menu.
+
+If you run a demo page's Lakekeeper bootstrap after the `wh` warehouse exists,
+the create request fails and `WID` is empty. Set `WID` to the `warehouse-id` of
+the `wh` warehouse in the output of
+`curl -s http://localhost:8181/management/v1/warehouse`, then rerun the
+namespace request.
 
 The walkthrough includes the following demos:
 
@@ -277,8 +164,8 @@ The walkthrough includes the following demos:
 ## Using a Cloud Object Store
 
 The walkthrough uses SeaweedFS by default. To use a cloud store instead,
-replace the warehouse JSON in the bootstrap commands, the `set_storage_secret`
-call in
+replace the warehouse JSON in the bootstrap commands on the demo pages, the
+`set_storage_secret` call in
 [Step 5](../walkthrough_tiered.md#pointing-coldfront-at-the-object-store) of
 the tiered demo, and the `s3:` block in
 `examples/walkthrough/config/archiver.yaml`, which `import` writes into the
