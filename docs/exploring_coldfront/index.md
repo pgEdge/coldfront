@@ -11,10 +11,10 @@ environment afterwards:
   recent data in PostgreSQL and archiving older data to cold Iceberg.
 - [Exploring Decoupled Mode](../walkthrough_decoupled.md) demonstrates storing
   a table entirely in Iceberg from the first row.
-- [Exploring the Standalone Partitioner](../walkthrough_partitioner.md)
-  demonstrates managing PostgreSQL partitions with no cold tier at all.
 - [Exploring Distributed Mode](../walkthrough_distributed.md) demonstrates
   running two PostgreSQL nodes over one shared lake.
+- [Exploring the Standalone Partitioner](../walkthrough_partitioner.md)
+  demonstrates managing PostgreSQL partitions with no cold tier at all.
 
 You can use the Exploring pages to take a self-contained, step-by-step tour of
 ColdFront's three operating modes in a GitHub Codespace, or deploy the
@@ -24,6 +24,20 @@ containers deployed with the Compose files in the ColdFront repository.
 > **Beta software** - ColdFront is beta software under active development. Do
 > not use it in production. Interfaces, on-disk formats, and behavior may
 > change without notice, and data loss is possible.
+
+## Choosing How to Run the Walkthrough
+
+You can run the walkthrough in three ways:
+
+- in a GitHub Codespace, where each demo page opens as a notebook and you run
+  each code block with a click; see
+  [Running the Walkthrough in a Codespace](#running-the-walkthrough-in-a-codespace).
+- on the command line of your own system, where the interactive guide runs
+  each step for you and shows its output; see
+  [Running the Walkthrough on the Command Line](#running-the-walkthrough-on-the-command-line).
+- manually on your own system, following each demo page and pasting its
+  commands into a terminal and a psql session; see
+  [Running the Walkthrough Manually](#running-the-walkthrough-manually).
 
 ## Understanding the Demo Stack
 
@@ -41,7 +55,7 @@ containers. The stack includes the following services:
 The stack runs PostgreSQL 18 by default. To run 16 or 17, set `PG_MAJOR` before
 `up` and change the `pgdata` volume path in `docker-compose.yml` to match.
 
-## Preparing a Codespace
+## Running the Walkthrough in a Codespace
 
 A Codespace runs the walkthrough in your browser, with nothing to install on
 your own system.
@@ -72,13 +86,11 @@ output appears below the cell:
 The distributed demo is the exception. Its page shows how to run the demo with
 the interactive guide from a terminal in the Codespace.
 
-## Preparing Your Own System
+## Running the Walkthrough on the Command Line
 
-The walkthroughs are designed to be performed manually on your own system, or
-in a Codespace. If you would like to perform the walkthrough manually on your
-own system, confirm that your system meets the following prerequisites, and
-then continue with
-[Downloading the Walkthrough Files](#downloading-the-walkthrough-files):
+On the command line, the interactive guide runs each walkthrough for you on
+your own system and shows the output of each step. Before you start, confirm
+that your system meets the following prerequisites:
 
 - Docker 24+ with Compose V2 (the `docker compose` plugin, not the legacy
   `docker-compose` binary).
@@ -88,13 +100,32 @@ then continue with
 - `ss` on Linux or `lsof` on macOS, which the interactive guide uses to find
   free ports.
 
+### Downloading the Walkthrough Files
+
+Clone the [ColdFront repository](https://github.com/pgEdge/ColdFront), or use
+the walkthrough installer (`examples/walkthrough/install.sh`) to download only
+the walkthrough files. Use the following command to download the installer
+from GitHub and run it:
+
+```bash {"ignore":"true"}
+curl -fsSL \
+  https://raw.githubusercontent.com/pgEdge/ColdFront/main/examples/walkthrough/install.sh \
+  | bash
+```
+
+The installer downloads the walkthrough files from the `main` branch into a
+`coldfront-walkthrough` directory in the current directory, and checks that
+Docker, Docker Compose, `curl`, and `psql` are installed. The installer then
+asks how to continue; choose `1) Interactive Guide` to start the guide. The
+[walkthrough README](https://github.com/pgEdge/ColdFront/blob/main/examples/walkthrough/README.md)
+describes the installer's options, such as choosing another directory or
+branch.
+
 ### Using the Interactive Guide
 
-The interactive guide runs each walkthrough for you on your own system. A
-Codespace does not need the installer or this section. The demo pages run as
-notebooks, and the distributed demo's page shows how to start the guide in the
-Codespace. To start the guide, run the following command from the repository
-root or the `coldfront-walkthrough` directory:
+If you cloned the repository, or quit the guide and want to start it again,
+run the following command from the repository root or the
+`coldfront-walkthrough` directory:
 
 ```bash {"ignore":"true"}
 bash examples/walkthrough/guide.sh
@@ -114,30 +145,23 @@ guide type each one a character at a time, as in a recording, set
 `WALKTHROUGH_TYPE_DELAY` to the delay in seconds between characters (for
 example, `0.03`). The default of `0` prints each command at once.
 
-### Downloading the Walkthrough Files
+## Running the Walkthrough Manually
 
-Clone the [ColdFront repository](https://github.com/pgEdge/ColdFront), or use
-the walkthrough installer (`examples/walkthrough/install.sh`) to download only
-the walkthrough files. The following command downloads the installer from
-GitHub and runs it; the installer writes the files to a
-`coldfront-walkthrough` directory under the current directory and then starts
-the interactive guide. Quit the guide if you want to follow the demo pages
-yourself:
+To run the walkthrough by hand, follow each demo page and paste its commands
+into a terminal and a psql session. Your system needs the prerequisites listed
+in
+[Running the Walkthrough on the Command Line](#running-the-walkthrough-on-the-command-line).
 
-```bash {"ignore":"true"}
-curl -fsSL \
-  https://raw.githubusercontent.com/pgEdge/ColdFront/main/examples/walkthrough/install.sh \
-  | bash
-```
+To get the walkthrough files, clone the
+[ColdFront repository](https://github.com/pgEdge/ColdFront), or run the
+installer command in
+[Downloading the Walkthrough Files](#downloading-the-walkthrough-files) and
+choose `2) Exit` when the installer asks how to continue.
 
-The installer downloads the walkthrough files from the `main` branch. The
-[walkthrough README](https://github.com/pgEdge/ColdFront/blob/main/examples/walkthrough/README.md)
-describes the installer's options, such as choosing another directory or
-branch.
-
-Run every demo command from the repository root, or from the
-`coldfront-walkthrough` directory if you used the installer, and then continue
-with [Running the Demos](#running-the-demos).
+Work from the repository root, or from the `coldfront-walkthrough` directory if
+you used the installer. Open a demo page and follow its Running This Demo on
+Your Own System section, which starts the stack, and then run each step in
+order.
 
 ### Changing the Demo Ports
 

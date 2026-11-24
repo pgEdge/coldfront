@@ -100,8 +100,8 @@ the guide for the mode you want to try:
 
 - [Exploring Tiered Storage](walkthrough_tiered.md)
 - [Exploring Decoupled Mode](walkthrough_decoupled.md)
-- [Exploring the Standalone Partitioner](walkthrough_partitioner.md)
 - [Exploring Distributed Mode](walkthrough_distributed.md)
+- [Exploring the Standalone Partitioner](walkthrough_partitioner.md)
 
 ## Next Steps
 

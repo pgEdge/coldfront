@@ -263,6 +263,8 @@ volumes before it starts.
 
 To go further with ColdFront, consult the following guides:
 
+- The [Partitioner Demo](walkthrough_partitioner.md) manages PostgreSQL range
+  partitions without any cold tier.
 - The [Using ColdFront](using_coldfront/index.md) guide compares the tiered,
   decoupled, and standalone partitioned modes, and covers dropping Iceberg
   tables and the partition management CLI.

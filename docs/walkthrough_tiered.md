@@ -27,7 +27,7 @@ The following table shows the eleven steps this demo performs:
 ## Running This Demo in a Codespace
 
 Create the Codespace as described in
-[Preparing a Codespace](exploring_coldfront/index.md#preparing-a-codespace).
+[Running the Walkthrough in a Codespace](exploring_coldfront/index.md#running-the-walkthrough-in-a-codespace).
 The Codespace opens the Exploring ColdFront page; click Exploring Tiered
 Storage to open this page as a notebook. To run a cell, click the triangle to
 the left of the cell.
@@ -98,7 +98,7 @@ Then click the triangle beside each cell that follows, in order.
 ## Running This Demo on Your Own System
 
 Prepare your system as described in
-[Preparing Your Own System](exploring_coldfront/index.md#preparing-your-own-system),
+[Running the Walkthrough Manually](exploring_coldfront/index.md#running-the-walkthrough-manually),
 and then work from the repository root, or from the `coldfront-walkthrough`
 directory if you used the installer.
 

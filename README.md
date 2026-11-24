@@ -52,10 +52,10 @@ The ColdFront documentation consists of the following guides:
     - [Exploring Decoupled Mode](docs/walkthrough_decoupled.md) - Stores a
       table in Iceberg from the first row and adopts a table that another
       engine wrote.
-    - [Exploring the Standalone Partitioner](docs/walkthrough_partitioner.md) -
-      Manages PostgreSQL range partitions without any cold tier.
     - [Exploring Distributed Mode](docs/walkthrough_distributed.md) - Points
       two PostgreSQL nodes at one shared lake.
+    - [Exploring the Standalone Partitioner](docs/walkthrough_partitioner.md) -
+      Manages PostgreSQL range partitions without any cold tier.
 - [Connecting to ColdFront](docs/connecting.md) - Documents onboarding an
   application role with least privilege.
 - Administration

@@ -21,7 +21,7 @@ The following table shows the seven steps this demo performs:
 ## Running This Demo in a Codespace
 
 Create the Codespace as described in
-[Preparing a Codespace](exploring_coldfront/index.md#preparing-a-codespace).
+[Running the Walkthrough in a Codespace](exploring_coldfront/index.md#running-the-walkthrough-in-a-codespace).
 The Codespace opens the Exploring ColdFront page; click Exploring Decoupled
 Mode to open this page as a notebook. To run a cell, click the triangle to the
 left of the cell.
@@ -92,7 +92,7 @@ Then click the triangle beside each cell that follows, in order.
 ## Running This Demo on Your Own System
 
 Prepare your system as described in
-[Preparing Your Own System](exploring_coldfront/index.md#preparing-your-own-system),
+[Running the Walkthrough Manually](exploring_coldfront/index.md#running-the-walkthrough-manually),
 and then work from the repository root, or from the `coldfront-walkthrough`
 directory if you used the installer.
 
@@ -277,9 +277,9 @@ SELECT duckdb.raw_query($$
 
 ### Adopting the Table Read-Only
 
-Adoption takes one call and no column list; the schema comes from the catalog.
-The view goes in the PostgreSQL schema `public`; `lake` is the Iceberg
-namespace, and no PostgreSQL schema of that name is needed:
+Adoption takes one call and no column list. The view goes in the PostgreSQL
+schema `public`; `lake` is the Iceberg namespace, and no PostgreSQL schema of
+that name is needed:
 
 ```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT coldfront.adopt_iceberg_table('public', 'orders', 'lake');
@@ -308,10 +308,11 @@ HINT:  Release it with coldfront.release_iceberg_table() and adopt again with p_
 
 ### Enabling Writes
 
-Adoption binds the name once, so enabling writes is a release followed by a
-second adopt with `p_writable => true`, which gives the view the same DML
-rewrite a created table gets. Every write below is one bakery-serialized
-Iceberg snapshot:
+Adoption binds the name once, so to enable writes, you release the table with
+`coldfront.release_iceberg_table()` and adopt it again with
+`coldfront.adopt_iceberg_table()` and `p_writable => true`. The second
+adoption gives the view the same DML rewrite that a created table gets. Every
+write below is one bakery-serialized Iceberg snapshot:
 
 ```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT coldfront.release_iceberg_table('public', 'orders');
@@ -342,17 +343,19 @@ SELECT order_id, meta->>'tier' AS tier FROM orders ORDER BY order_id;
 
 ### Handing the Table Back
 
-Release removes the view and the registry row and performs no Iceberg I/O, so
-the table keeps every row and stays in the catalog:
+The `coldfront.release_iceberg_table()` function removes the view and the
+registry row and performs no Iceberg I/O, so the table keeps every row and
+stays in the catalog:
 
 ```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT coldfront.release_iceberg_table('public', 'orders');
 ```
 
-There are two things to take from this demo. A `VARCHAR` column comes back as
-text rather than as `jsonb` unless `p_types` says otherwise, because Iceberg
-records no PostgreSQL type. The bakery serializes ColdFront's own writers, not
-an external engine writing the same table.
+Keep two points in mind when you adopt a table. Iceberg records no PostgreSQL
+type, so a `VARCHAR` column comes back as `text`, not `jsonb`, unless you set
+its type with `p_types`. The bakery also serializes only ColdFront's own
+writers; it does not coordinate with another engine that writes the same
+table.
 
 ## When You Finish
 
@@ -373,8 +376,8 @@ for a later session.
 
 To go further with ColdFront, consult the following guides:
 
-- The [Partitioner Demo](walkthrough_partitioner.md) manages PostgreSQL range
-  partitions without any cold tier.
+- The [Distributed Demo](walkthrough_distributed.md) points two PostgreSQL
+  nodes at one shared lake.
 - The [Using ColdFront](using_coldfront/index.md) guide compares the tiered,
   decoupled, and standalone partitioned modes, and covers dropping Iceberg
   tables and the partition management CLI.
