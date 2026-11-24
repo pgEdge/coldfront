@@ -12,22 +12,31 @@ are serialized cluster-wide so they never collide.
 
 This demo uses a different stack from the single-node walkthrough - two
 `MESH=on` nodes (`db1`, `db2`) plus a shared Lakekeeper and object store. The
-interactive guide automates the whole switch. It first removes the single-node
-stack and its volumes with `docker compose down -v`, since a laptop rarely has
-room for both, so the data from the single-node demos does not survive the
-switch:
+demo is not click-runnable: it needs that two-node stack and separate psql
+sessions against each node (`db1` on port 5442, `db2` on 5443), so the code
+blocks on this page are shown for reading and hand-pasting. The interactive
+guide automates the switch. The guide first removes the single-node stack and
+its volumes with `docker compose down -v`, so the data from the single-node
+demos does not survive the switch.
 
-> **This demo is not click-runnable.** It needs a different two-node stack and
-> separate psql sessions against each node (`db1` on port 5442, `db2` on 5443),
-> so the blocks below are shown for reading and hand-pasting. The easiest way
-> to run it is the interactive guide:
+## Running This Demo in a Codespace
+
+In a Codespace, run the demo with the interactive guide. Open a terminal in
+the Codespace, and then run the following command and choose
+`4) Distributed`:
 
 ```bash {"ignore":"true"}
-bash examples/walkthrough/guide.sh   # then choose: 4) Distributed
+bash examples/walkthrough/guide.sh
 ```
 
-The sections below show what that option does, so you can follow along or
-reproduce it by hand.
+The sections that follow show what the guide does, so you can follow along.
+
+## Running This Demo on Your Own System
+
+On your own system, run the same command from the repository root and choose
+`4) Distributed`, or reproduce the demo by hand: paste the commands in the
+sections that follow into a terminal and into psql sessions against each
+node.
 
 ## Bringing Up the Two-Node Mesh
 
@@ -45,8 +54,8 @@ or `COLDFRONT_MESH_S3_PORT` before `up`.
 
 Next, run the `curl` block from
 [Starting the Stack by Hand](exploring_coldfront/index.md#starting-the-stack-by-hand)
-with port 8191 in place of 8181. That creates the `wh` warehouse and `public` namespace on the
-mesh's own Lakekeeper.
+with port 8191 in place of 8181. That creates the `wh` warehouse and `public`
+namespace on the mesh's own Lakekeeper.
 
 Then create the extensions and form the mesh, running each statement on the
 node its comment names:

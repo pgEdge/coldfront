@@ -8,12 +8,6 @@ database full of data, add ColdFront to it, and let the archiver relocate the
 cold majority to object storage - without migrating to a new database or
 changing a line of application SQL.
 
-Start the stack as described in
-[Starting the Stack in a Codespace](exploring_coldfront/index.md#starting-the-stack-in-a-codespace)
-or
-[Starting the Stack on Your Own System](exploring_coldfront/index.md#starting-the-stack-on-your-own-system)
-before you start this demo.
-
 The following table shows the eleven steps this demo covers:
 
 | Step | What you will do |
@@ -29,6 +23,22 @@ The following table shows the eleven steps this demo covers:
 | [9. Query across tiers](#querying-across-tiers) | Run one query on one table that reads hot and cold data together. |
 | [10. Write to cold data](#writing-to-cold-data) | UPDATE an archived row in place, with no rehydration. |
 | [11. Confirm the edit persisted](#confirming-the-edit-persisted) | Reconnect and confirm the edit persisted in cold storage. |
+
+## Running This Demo in a Codespace
+
+Start the stack as described in
+[Starting the Stack in a Codespace](exploring_coldfront/index.md#starting-the-stack-in-a-codespace).
+Then open this page from the Explorer; Runme opens the page as a notebook.
+Click the triangle to the left of each cell, in order, from the first step to
+the last.
+
+## Running This Demo on Your Own System
+
+Start the stack as described in
+[Starting the Stack on Your Own System](exploring_coldfront/index.md#starting-the-stack-on-your-own-system).
+Then paste each command into a terminal at the repository root, in order. To
+have the interactive guide run the same steps for you, run
+`bash examples/walkthrough/guide.sh` and choose `1) Tiered storage`.
 
 ## Checking the Stack
 

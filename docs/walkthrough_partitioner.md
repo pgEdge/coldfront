@@ -8,11 +8,21 @@ tier. If all you need is automated partition maintenance on stock PostgreSQL,
 the partitioner is the whole product - no Iceberg, no DuckDB, no archiver cold
 path.
 
+## Running This Demo in a Codespace
+
 Start the stack as described in
-[Starting the Stack in a Codespace](exploring_coldfront/index.md#starting-the-stack-in-a-codespace)
-or
-[Starting the Stack on Your Own System](exploring_coldfront/index.md#starting-the-stack-on-your-own-system)
-before you start this demo.
+[Starting the Stack in a Codespace](exploring_coldfront/index.md#starting-the-stack-in-a-codespace).
+Then open this page from the Explorer; Runme opens the page as a notebook.
+Click the triangle to the left of each cell, in order, from the first step to
+the last.
+
+## Running This Demo on Your Own System
+
+Start the stack as described in
+[Starting the Stack on Your Own System](exploring_coldfront/index.md#starting-the-stack-on-your-own-system).
+Then paste each command into a terminal at the repository root, in order. To
+have the interactive guide run the same steps for you, run
+`bash examples/walkthrough/guide.sh` and choose `3) Partitioner`.
 
 ## Creating the Demo Table
 
