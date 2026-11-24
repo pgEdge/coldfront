@@ -18,10 +18,11 @@ The following table shows the three steps this demo performs:
 
 ## Running This Demo in a Codespace
 
-Create the Codespace and trust the folder as described in
-[Preparing a Codespace](exploring_coldfront/index.md#preparing-a-codespace),
-then open this page from the Explorer. Runme opens the page as a notebook; to
-run a cell, click the triangle to the left of the cell.
+Create the Codespace as described in
+[Preparing a Codespace](exploring_coldfront/index.md#preparing-a-codespace).
+The Codespace opens the Exploring ColdFront page; click Exploring the
+Standalone Partitioner to open this page as a notebook. To run a cell, click
+the triangle to the left of the cell.
 
 If the stack is already running from another demo, skip to the first step.
 Otherwise, run the following cell to start the containers and build the

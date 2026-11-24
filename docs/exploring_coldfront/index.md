@@ -44,21 +44,15 @@ The stack runs PostgreSQL 18 by default. To run 16 or 17, set `PG_MAJOR` before
 ## Preparing a Codespace
 
 A Codespace runs the walkthrough in your browser, with nothing to install on
-your own system. Use the following steps to create the Codespace and open the
-Exploring pages as runnable notebooks:
-
-1. [Open this repo in a Codespace](https://github.com/codespaces/new?repo=pgEdge/coldfront)
-   and select `Create codespace`. Docker, psql, and the
-   [Runme extension](https://marketplace.visualstudio.com/items?itemName=stateful.runme)
-   are preinstalled.
-2. When VS Code asks whether you trust the authors of the files in the folder,
-   select `Trust Folder & Continue`. Runme then opens this page as a notebook
-   in which the walkthrough's commands are runnable cells; to run a cell, click
-   the triangle to the left of the cell.
-
-When the Codespace is ready, open a demo page from the Explorer. Each demo page
-starts the stack in its first cells, so continue with
-[Running the Demos](#running-the-demos).
+your own system.
+<a href="https://github.com/codespaces/new?repo=pgEdge/coldfront" target="_blank" rel="noopener">Open this repo in a Codespace</a>
+(the link opens in a new tab), select `Create codespace`, and select
+`Trust Folder & Continue` when VS Code asks whether you trust the authors of
+the files in the folder. Docker, psql, and the
+[Runme extension](https://marketplace.visualstudio.com/items?itemName=stateful.runme)
+are preinstalled. The Codespace opens this page as a notebook; click a demo in
+the list at the top of the page to open that demo as a notebook, and then
+click the triangle to the left of each cell to run the cell.
 
 ## Preparing Your Own System
 
