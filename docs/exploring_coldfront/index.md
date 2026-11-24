@@ -16,10 +16,20 @@ environment afterwards:
 - [Exploring the Standalone Partitioner](../walkthrough_partitioner.md)
   demonstrates managing PostgreSQL partitions with no cold tier at all.
 
-You can use the Exploring pages to take a self-contained, step-by-step tour of
-ColdFront's three operating modes in a GitHub Codespace, or deploy the
-walkthrough on your own system. Either way, the walkthrough runs in Docker
-containers deployed with the Compose files in the ColdFront repository.
+The walkthrough runs ColdFront and the services it depends on in Docker
+containers, deployed with the Compose files in the ColdFront repository. The
+stack includes the following services:
+
+- PostgreSQL 16, 17, or 18 with the pg_duckdb and `coldfront` extensions.
+- SeaweedFS, a local S3-compatible object store standing in for a real cloud
+  bucket.
+- Lakekeeper, the Iceberg REST catalog that tracks table metadata and file
+  locations.
+- Lakekeeper's own PostgreSQL database (`lakekeeper-db`), plus a one-shot
+  `lakekeeper-migrate` job that applies its schema migrations and exits.
+
+The stack runs PostgreSQL 18 by default. To run 16 or 17, set `PG_MAJOR` and
+change the `pgdata` volume path in `docker-compose.yml` to match.
 
 > **Beta software** - ColdFront is beta software under active development. Do
 > not use it in production. Interfaces, on-disk formats, and behavior may
@@ -38,22 +48,6 @@ You can run the walkthrough in three ways:
 - manually on your own system, following each demo page and pasting its
   commands into a terminal and a psql session; see
   [Running the Walkthrough Manually](#running-the-walkthrough-manually).
-
-## Understanding the Demo Stack
-
-The walkthrough runs ColdFront and the services it depends on in Docker
-containers. The stack includes the following services:
-
-- PostgreSQL 16, 17, or 18 with the pg_duckdb and `coldfront` extensions.
-- SeaweedFS, a local S3-compatible object store standing in for a real cloud
-  bucket.
-- Lakekeeper, the Iceberg REST catalog that tracks table metadata and file
-  locations.
-- Lakekeeper's own PostgreSQL database (`lakekeeper-db`), plus a one-shot
-  `lakekeeper-migrate` job that applies its schema migrations and exits.
-
-The stack runs PostgreSQL 18 by default. To run 16 or 17, set `PG_MAJOR` before
-`up` and change the `pgdata` volume path in `docker-compose.yml` to match.
 
 ## Running the Walkthrough in a Codespace
 
