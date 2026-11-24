@@ -28,6 +28,10 @@ coldfront.lakekeeper_endpoint = 'http://<lakekeeper-host>:8181/catalog'
 coldfront.local_pg_dsn = 'host=/var/run/postgresql dbname=<db> user=<role>'
 ```
 
+If `shared_preload_libraries` already lists libraries, such as
+`pg_stat_statements`, add `pg_duckdb` and `coldfront` to the existing list
+instead of replacing it.
+
 How you apply the settings depends on how you installed ColdFront:
 
 - The ColdFront packages do not configure PostgreSQL. The pgEdge Enterprise
