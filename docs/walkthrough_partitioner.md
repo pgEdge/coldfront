@@ -134,9 +134,9 @@ section describes the partition CLI and shows more `register` examples.
 
 ## When You Finish
 
-Keep the stack running if you plan to run another demo; every demo except the
-distributed demo reuses it. To stop the stack and remove its data, run the
-following command:
+When you finish the demo, use the following command to stop the stack and
+remove its data. Each demo starts its own stack, so the next demo you run
+starts fresh:
 
 ```bash
 docker compose \
