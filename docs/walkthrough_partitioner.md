@@ -111,8 +111,8 @@ docker compose \
   run --rm --no-deps --entrypoint partitioner archiver
 ```
 
-The partitioner needs no file: it connects from the `PG*` environment the
-compose service sets and reads its tables from `coldfront.partition_config`.
+The partitioner needs no file. It connects from the `PG*` environment that the
+Compose service sets, and reads its tables from `coldfront.partition_config`.
 
 ## Verifying the Partitions
 

@@ -69,7 +69,7 @@ output appears below the cell:
 
 ![A finished cell in a Codespace, with its run triangle, check mark, and output](../img/codespace_run_cell.png)
 
-The distributed demo is the exception: its page shows how to run the demo with
+The distributed demo is the exception. Its page shows how to run the demo with
 the interactive guide from a terminal in the Codespace.
 
 ## Preparing Your Own System
@@ -91,7 +91,7 @@ then continue with
 ### Using the Interactive Guide
 
 The interactive guide runs each walkthrough for you on your own system. A
-Codespace does not need the installer or this section: the demo pages run as
+Codespace does not need the installer or this section. The demo pages run as
 notebooks, and the distributed demo's page shows how to start the guide in the
 Codespace. To start the guide, run the following command from the repository
 root or the `coldfront-walkthrough` directory:

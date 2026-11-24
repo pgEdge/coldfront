@@ -4,9 +4,7 @@ cwd: ../
 # Exploring Decoupled Mode
 
 Decoupled mode stores a table entirely in Iceberg from the first row.
-PostgreSQL holds a thin wrapper view and a registry entry. This is a fresh
-table - there is no migration from the tiered demo, and tiered and decoupled
-tables are independent.
+PostgreSQL holds a thin wrapper view and a registry entry.
 
 The following table shows the seven steps this demo performs:
 
@@ -15,10 +13,10 @@ The following table shows the seven steps this demo performs:
 | [1. Creating an Iceberg-only table](#creating-an-iceberg-only-table) | Create a table whose rows live in Iceberg from the first row, with one SQL call. |
 | [2. Reading and writing the lake table](#reading-and-writing-the-lake-table) | Insert and query rows as you would in any PostgreSQL table. |
 | [3. Standing in for the external writer](#standing-in-for-the-external-writer) | Use DuckDB to write an Iceberg table, as another engine would. |
-| [4. Adopting it read-only](#adopting-it-read-only) | Wrap the existing Iceberg table in a read-only PostgreSQL view. |
+| [4. Adopting the table read-only](#adopting-the-table-read-only) | Wrap the existing Iceberg table in a read-only PostgreSQL view. |
 | [5. Enabling writes](#enabling-writes) | Adopt the table again as writable, so INSERT, UPDATE, and DELETE work. |
 | [6. Restoring a type Iceberg cannot record](#restoring-a-type-iceberg-cannot-record) | Restore the PostgreSQL type of a column that Iceberg stores as text. |
-| [7. Handing it back](#handing-it-back) | Release the table; its rows stay in the lake. |
+| [7. Handing the table back](#handing-the-table-back) | Release the table; its rows stay in the lake. |
 
 ## Running This Demo in a Codespace
 
@@ -237,24 +235,33 @@ path via pg_duckdb.
 
 ## Adopting a Table Already in the Lake
 
-Not every Iceberg table starts in ColdFront. A table another engine wrote needs
-no provisioning, only a wrapper view and a registry row. Adoption builds both
-from the schema the catalog already holds.
+ColdFront can also use an Iceberg table that another engine has already
+written. Instead of creating the table, ColdFront adopts it. Adoption reads
+the table's schema from the Iceberg catalog and adds the wrapper view and
+registry entry that make the table available in PostgreSQL.
 
 ### Standing In for the External Writer
 
-These three statements are the only ones in this walkthrough written in DuckDB
-SQL, because they represent what some other engine already did to your lake.
-The namespace create commits on its own, ahead of the table create, because
-DuckDB defers an Iceberg `CREATE SCHEMA` to commit while posting `CREATE TABLE`
-immediately:
+In a real deployment, another engine writes this table to the lake. The next
+two code blocks stand in for that engine. They use DuckDB, through
+`duckdb.raw_query()`, to create an Iceberg namespace and a table and to insert
+two rows. These are the only DuckDB SQL statements in the walkthrough. Each
+code block first calls `coldfront.ensure_attached()`, which attaches the
+Iceberg catalog to DuckDB.
+
+The first code block creates the `ice.lake` namespace on its own. DuckDB sends
+an Iceberg `CREATE TABLE` to the catalog immediately, but defers
+`CREATE SCHEMA` until the transaction commits, so the namespace must exist
+before the next code block creates the table in it:
 
 ```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT coldfront.ensure_attached();
 SELECT duckdb.raw_query('CREATE SCHEMA IF NOT EXISTS ice.lake');
 ```
 
-The table has a `VARCHAR` column holding JSON, which matters in a moment:
+The second code block creates the `ice.lake.orders` table and inserts two
+rows. The `meta` column is a `VARCHAR` that holds JSON, which matters when you
+restore its type later in this demo:
 
 ```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT coldfront.ensure_attached();
@@ -268,7 +275,7 @@ SELECT duckdb.raw_query($$
     (2, now(), 'globex', 249.50, '{"tier":"silver"}')$$);
 ```
 
-### Adopting It Read-Only
+### Adopting the Table Read-Only
 
 Adoption takes one call and no column list; the schema comes from the catalog.
 The view goes in the PostgreSQL schema `public`; `lake` is the Iceberg
@@ -333,7 +340,7 @@ SELECT coldfront.adopt_iceberg_table('public', 'orders', 'lake',
 SELECT order_id, meta->>'tier' AS tier FROM orders ORDER BY order_id;
 ```
 
-### Handing It Back
+### Handing the Table Back
 
 Release removes the view and the registry row and performs no Iceberg I/O, so
 the table keeps every row and stays in the catalog:

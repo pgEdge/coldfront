@@ -171,11 +171,12 @@ If port 5432, 8181, or 8333 is already in use on your host, see
 
 ## Checking the Stack
 
-The stack runs PostgreSQL and the cold-storage side: the Lakekeeper catalog and
-the SeaweedFS object store. The cold-storage side sits idle until you point
-ColdFront at it in [Step 5](#pointing-coldfront-at-the-object-store) (Pointing
-ColdFront at the Object Store). Use the following command to confirm that the
-`db`, `lakekeeper-db`, and `lakekeeper` services report `healthy`:
+The stack runs PostgreSQL, the Lakekeeper catalog, and the SeaweedFS object
+store; the catalog and the object store form the cold-storage side. The
+cold-storage side sits idle until you point ColdFront at it in
+[Step 5](#pointing-coldfront-at-the-object-store) (Pointing ColdFront at the
+Object Store). Use the following command to confirm that the `db`,
+`lakekeeper-db`, and `lakekeeper` services report `healthy`:
 
 ```bash
 docker compose -f examples/walkthrough/docker-compose.yml ps
@@ -359,7 +360,7 @@ The response confirms that the warehouse exists:
 
 ## Showing the Archiver Policy
 
-The archiver policy is one rule in a YAML file: data older than 30 days belongs
+The archiver policy is one rule in a YAML file. Data older than 30 days belongs
 in low-cost object storage; the most recent data stays hot in PostgreSQL.
 Nothing moves yet - this step shows the boundary.
 
@@ -402,8 +403,9 @@ runs.
 
 ## Running the Archiver
 
-The archiver reads its configuration from the server. `import` writes the YAML
-into it once: the table into `coldfront.partition_config` and the store into
+The archiver reads its configuration from the server. The `import` command
+writes the YAML into the server once; the table goes into
+`coldfront.partition_config`, and the store goes into
 `coldfront.storage_secret`. Then run the archiver, which connects from the
 `PG*` environment the compose service sets and needs no file. The archiver
 moves every partition older than 30 days out of the PostgreSQL heap into
@@ -477,8 +479,8 @@ s3://iceberg/<table-uuid>/metadata/00023-<uuid>.gz.metadata.json
 
 Real `.parquet` objects are in the bucket. The cold rows are no longer in
 PostgreSQL - they are objects in object storage. Each month's files sit under
-their own `month_ts_<n>=` directory: the cold table is partitioned by month,
-the way the hot table is.
+their own `month_ts_<n>=` directory, because the cold table is partitioned by
+month, the way the hot table is.
 
 ### Confirming That the Table Changed Shape
 
@@ -586,16 +588,16 @@ The query returns:
 (3 rows)
 ```
 
-The timestamps track your load: the rows are 63.072 seconds apart (730 days
+The timestamps track your load. The rows are 63.072 seconds apart (730 days
 divided by one million), and row 1 sits one such step short of 730 days before
 the load. It is one table and one query, and no application change is required.
 
 ## Writing to Cold Data
 
 This step takes a specific row from a cold (archived) month and updates it
-through the same `events` view. Watch for what does not happen: no rehydration
-of the partition back into PostgreSQL, no ETL job, no restore from archive, and
-no second tool.
+through the same `events` view. Notice what does not happen. The partition is
+not rehydrated into PostgreSQL, and there is no ETL job, no restore from
+archive, and no second tool.
 
 Capture a cold row's id in a separate query. A sub-select over the tiered view
 inside the same DML statement is rejected by the extension, because the rewrite
@@ -647,9 +649,9 @@ did the write) and re-checks the row, the total row count, and the hot heap
 size. This confirms that the cold edit is durable persistent state and that the
 data did not quietly return to PostgreSQL to make the edit possible.
 
-Each runnable cell on this page already opens a fresh connection, so
-cell-runners can run the checks below. In a local shell, open a new terminal
-and connect with a fresh session first:
+In a Codespace, each code block opens its own connection, so you can run the
+checks below as they are. In a local shell, open a new terminal and connect
+with a fresh session first:
 
 ```bash {"ignore":"true"}
 PGOPTIONS='-c client_min_messages=warning' \

@@ -12,7 +12,7 @@ are serialized cluster-wide so they never collide.
 
 This demo uses a different stack from the single-node walkthrough - two
 `MESH=on` nodes (`db1`, `db2`) plus a shared Lakekeeper and object store. The
-demo is not click-runnable: it needs that two-node stack and separate psql
+demo is not click-runnable. It needs that two-node stack and separate psql
 sessions against each node (`db1` on port 5442, `db2` on 5443), so the code
 blocks on this page are shown for reading and hand-pasting. The interactive
 guide automates the switch. The guide first removes the single-node stack and
@@ -146,14 +146,14 @@ FROM pg_class WHERE relname = 'events_lake';   -- v, 0 bytes
 ```
 
 `db2` returns every row `db1` wrote and stores zero bytes for the table - it
-reads straight from the shared lake. That is the point of distributed mode: add
-a node for compute over one copy of the data, with no storage to replicate.
+reads straight from the shared lake. That is the point of distributed mode; you
+add a node for compute over one copy of the data, with no storage to replicate.
 
 ## Serializing Concurrent Writes (The Bakery)
 
 Two nodes committing the same Iceberg table at once would normally collide -
 the catalog rejects the second commit with a `409 Conflict` and the application
-has to retry. ColdFront's bakery protocol prevents that: each cold write takes
+has to retry. ColdFront's bakery protocol prevents that. Each cold write takes
 a globally-ordered ticket (replicated via Spock, verified in the TLA+ model
 under `docs/formal/`) and waits its turn.
 
@@ -174,7 +174,7 @@ UPDATE events_lake SET status = 'held' WHERE id = 3;
 ```
 
 In a second session, the claim is on `db1`, keyed by a ticket that also names
-the issuing node (a Snowflake id), and it is already on `db2`: the claim is
+the issuing node (a Snowflake id), and it is already on `db2`. The claim is
 written over its own connection and committed at once, so it replicates while
 the transaction that took it is still open:
 
@@ -218,9 +218,9 @@ INSERT INTO events_lake VALUES (201, now(), 'storm', '{"n":"db2"}');   -- db2
 ```
 
 Every write lands, with no conflicts and no application-level retry. Two layers
-serialize them: a node-local advisory lock keeps one cold writer per node in
+serialize them. A node-local advisory lock keeps one cold writer per node in
 the bakery at a time, and the cross-node Ricart-Agrawala claim protocol orders
-writers across nodes. The durable record is the lake's own: every commit adds
+writers across nodes. The durable record is the lake's own; every commit adds
 one snapshot to the table's metadata, in a single chain of sequence numbers.
 Resolve the table's metadata location from the mesh stack's Lakekeeper (port
 8191), as in the tiered demo, and list the history from either node:
@@ -256,7 +256,7 @@ docker compose \
 The `-v` flag removes the stack's data volumes; omit the flag to keep the data
 for a later session. To start that session, run the command in
 [Bringing Up the Two-Node Mesh](#bringing-up-the-two-node-mesh), not the
-interactive guide: the guide's distributed demo removes both stacks' data
+interactive guide; the guide's distributed demo removes both stacks' data
 volumes before it starts.
 
 ## Next Steps
