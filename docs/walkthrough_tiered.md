@@ -12,17 +12,17 @@ The following table shows the eleven steps this demo performs:
 
 | Step | What you will do |
 |------|-----------------|
-| [1. Check the stack](#checking-the-stack) | Confirm that Postgres, Lakekeeper, and the object store are running. |
-| [2. Create a table and load history](#creating-a-table-and-loading-months-of-history) | Create an ordinary partitioned table with months of data. |
-| [3. See the problem](#seeing-the-problem) | See that all rows sit in hot Postgres storage, which only grows. |
-| [4. Enable the extensions](#enabling-the-extensions) | Enable the two extensions that add tiered storage to the existing database. |
-| [5. Point at object storage](#pointing-coldfront-at-the-object-store) | Tell ColdFront where cold data lives. |
-| [6. Show the archiver policy](#showing-the-archiver-policy) | Review the policy, where `hot_period: 30 days` sets the hot/cold boundary. |
-| [7. Run the archiver](#registering-the-table-and-running-the-archiver) | Move everything older than 30 days to object storage. |
-| [8. Where it lives now](#checking-where-the-data-lives-now) | Inspect the hot/cold split: the rows and space in each tier. |
-| [9. Query across tiers](#querying-across-tiers) | Run one query on one table that reads hot and cold data together. |
-| [10. Write to cold data](#writing-to-cold-data) | UPDATE an archived row in place, with no rehydration. |
-| [11. Confirm the edit persisted](#confirming-the-edit-persisted) | Reconnect and confirm the edit persisted in cold storage. |
+| [1. Checking the stack](#checking-the-stack) | Confirm that Postgres, Lakekeeper, and the object store are running. |
+| [2. Creating a table and loading data](#creating-a-table-and-loading-data) | Create an ordinary partitioned table with months of data. |
+| [3. Seeing the problem](#seeing-the-problem) | See that all rows sit in hot Postgres storage, which only grows. |
+| [4. Enabling the extensions](#enabling-the-extensions) | Enable the two extensions that add tiered storage to the existing database. |
+| [5. Pointing ColdFront at the object store](#pointing-coldfront-at-the-object-store) | Tell ColdFront where cold data lives. |
+| [6. Showing the archiver policy](#showing-the-archiver-policy) | Review the policy, where `hot_period: 30 days` sets the hot/cold boundary. |
+| [7. Running the archiver](#running-the-archiver) | Move everything older than 30 days to object storage. |
+| [8. Checking where the data lives now](#checking-where-the-data-lives-now) | Inspect the hot/cold split: the rows and space in each tier. |
+| [9. Querying across tiers](#querying-across-tiers) | Run one query on one table that reads hot and cold data together. |
+| [10. Writing to cold data](#writing-to-cold-data) | UPDATE an archived row in place, with no rehydration. |
+| [11. Confirming the edit persisted](#confirming-the-edit-persisted) | Reconnect and confirm the edit persisted in cold storage. |
 
 ## Running This Demo in a Codespace
 
@@ -188,7 +188,7 @@ docker compose -f examples/walkthrough/docker-compose.yml ps
 S3-compatible store.</p>
 </div>
 
-## Creating a Table and Loading Months of History
+## Creating a Table and Loading Data
 
 In this step, you create an ordinary range-partitioned PostgreSQL table and
 fill the table with months of sample data. The table stands in for a table in
@@ -401,7 +401,7 @@ The `hot_period: 30 days` value is the hot/cold line. Any partition whose data
 is entirely older than 30 days will move to object storage when the archiver
 runs.
 
-## Registering the Table and Running the Archiver
+## Running the Archiver
 
 The archiver reads its configuration from the server. `import` writes the YAML
 into it once: the table into `coldfront.partition_config` and the store into
