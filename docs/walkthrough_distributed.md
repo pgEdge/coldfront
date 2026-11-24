@@ -254,8 +254,10 @@ docker compose \
 ```
 
 The `-v` flag removes the stack's data volumes; omit the flag to keep the data
-for a later session. The interactive guide's menu returns you to the
-single-node stack.
+for a later session. To start that session, run the command in
+[Bringing Up the Two-Node Mesh](#bringing-up-the-two-node-mesh), not the
+interactive guide: the guide's distributed demo removes both stacks' data
+volumes before it starts.
 
 ## Next Steps
 

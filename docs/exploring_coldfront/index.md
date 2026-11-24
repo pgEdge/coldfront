@@ -50,9 +50,27 @@ your own system.
 `Trust Folder & Continue` when VS Code asks whether you trust the authors of
 the files in the folder. Docker, psql, and the
 [Runme extension](https://marketplace.visualstudio.com/items?itemName=stateful.runme)
-are preinstalled. The Codespace opens this page as a notebook; click a demo in
-the list at the top of the page to open that demo as a notebook, and then
-click the triangle to the left of each cell to run the cell.
+are preinstalled.
+
+Setting up the Codespace takes a few minutes. When the Codespace is ready, it
+opens this page as a notebook, with the list of demos at the top:
+
+![The Exploring ColdFront page open as a notebook in a Codespace](../img/codespace_exploring_page.png)
+
+Click a demo in the list to open that demo as a notebook. For example, the
+Exploring Tiered Storage link opens the tiered demo:
+
+![The tiered demo open as a notebook in a Codespace](../img/codespace_tiered_page.png)
+
+To run a cell, point to the cell and click the triangle that appears to its
+left. While the cell runs, the triangle becomes a stop button. When the cell
+finishes, a check mark and the run time appear under the commands, and the
+output appears below the cell:
+
+![A finished cell in a Codespace, with its run triangle, check mark, and output](../img/codespace_run_cell.png)
+
+The distributed demo is the exception: its page shows how to run the demo with
+the interactive guide from a terminal in the Codespace.
 
 ## Preparing Your Own System
 
@@ -87,8 +105,9 @@ presents the four demos as a menu - tiered, decoupled, partitioner, and
 distributed - plus options to reset the demo tables or tear the stack down. In
 the guide's menu, the R) Reset option drops the tables every demo created, in
 PostgreSQL and in the Iceberg catalog, and keeps the stack running. If the
-two-node cluster from the distributed demo is up, Reset first switches back to
-the single-node stack.
+two-node cluster from the distributed demo is up, Reset first removes the
+cluster and its data volumes, including any data that you added, and then
+brings back the single-node stack.
 
 The guide prints each demo command and query before it runs it. To have the
 guide type each one a character at a time, as in a recording, set
