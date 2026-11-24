@@ -27,7 +27,7 @@ Create the Codespace and trust the folder as described in
 then open this page from the Explorer. Runme opens the page as a notebook; to
 run a cell, click the triangle to the left of the cell.
 
-If the stack is already running from another demo, skip to the first step.
+If the stack is already running from another demo, skip the next cell.
 Otherwise, run the following cell to start the containers and build the
 archiver image. The first run builds the Docker images, which takes two to five
 minutes:
@@ -40,8 +40,10 @@ docker compose -f examples/walkthrough/docker-compose.yml \
 ```
 
 Run the following cell to bootstrap Lakekeeper, create the `wh` warehouse
-backed by SeaweedFS, and seed the `public` namespace. The cell makes one
-attempt, so run it again if the warehouse request fails:
+backed by SeaweedFS, and seed the `public` namespace. Skip the cell only if the
+output of `curl -s http://localhost:8181/management/v1/warehouse` already
+lists `"name":"wh"`; the partitioner demo does not create the warehouse. The
+cell makes one attempt, so run it again if the warehouse request fails:
 
 ```bash
 # Bootstrap Lakekeeper (one-time per fresh stack)
@@ -97,9 +99,12 @@ and paste each SQL block into a psql session that you open with
 guide run this demo for you instead, run `bash examples/walkthrough/guide.sh`
 from that directory and choose `2) Decoupled`.
 
-If the stack is already running from another demo, skip to the first step.
-Otherwise, use the following commands to start the containers and build the
-archiver image, and then bootstrap Lakekeeper:
+Use the following commands to start the containers and build the archiver
+image, and then bootstrap Lakekeeper. If the stack is already running from
+another demo, skip the `docker compose` commands. Skip the bootstrap commands
+only if the output of `curl -s http://localhost:8181/management/v1/warehouse`
+already lists `"name":"wh"`; the partitioner demo does not create the
+warehouse:
 
 ```bash {"ignore":"true"}
 docker compose -f examples/walkthrough/docker-compose.yml \

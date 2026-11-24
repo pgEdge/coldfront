@@ -25,9 +25,6 @@ containers deployed with the Compose files in the ColdFront repository.
 > not use it in production. Interfaces, on-disk formats, and behavior may
 > change without notice, and data loss is possible.
 
-Both paths start the same demo stack, and the demo pages run the same commands
-in either environment.
-
 ## Understanding the Demo Stack
 
 The walkthrough runs ColdFront and the services it depends on in Docker
@@ -65,9 +62,10 @@ starts the stack in its first cells, so continue with
 
 ## Preparing Your Own System
 
-On your own system, the interactive guide starts the stack and runs the demos
-for you, or you can run each demo page by hand. Before you start, confirm that
-your system meets the following prerequisites:
+The walkthroughs are designed to be performed manually on your own system, or
+in a Codespace. If you would like to perform the walkthrough manually on your
+own system, confirm that your system meets the following prerequisites, and
+then continue with [Running the Demos by Hand](#running-the-demos-by-hand):
 
 - Docker 24+ with Compose V2 (the `docker compose` plugin, not the legacy
   `docker-compose` binary).
@@ -76,6 +74,14 @@ your system meets the following prerequisites:
 - `curl`, `bash`, and `psql` reside on the host.
 - `ss` on Linux or `lsof` on macOS, which the interactive guide uses to find
   free ports.
+
+### Running the Demos by Hand
+
+To run the demos without the guide, clone the
+[ColdFront repository](https://github.com/pgEdge/ColdFront), and then follow
+the section for your own system on each demo page from the repository root.
+Each demo page starts the stack, so continue with
+[Running the Demos](#running-the-demos).
 
 ### Using the Interactive Guide
 
@@ -109,14 +115,6 @@ The guide prints each demo command and query before it runs it. To have the
 guide type each one a character at a time, as in a recording, set
 `WALKTHROUGH_TYPE_DELAY` to the delay in seconds between characters (for
 example, `0.03`). The default of `0` prints each command at once.
-
-### Running the Demos by Hand
-
-To run the demos without the guide, clone the
-[ColdFront repository](https://github.com/pgEdge/ColdFront), and then follow
-the section for your own system on each demo page from the repository root.
-Each demo page starts the stack, so continue with
-[Running the Demos](#running-the-demos).
 
 ### Changing the Demo Ports
 
