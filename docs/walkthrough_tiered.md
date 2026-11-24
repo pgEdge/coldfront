@@ -171,12 +171,11 @@ If port 5432, 8181, or 8333 is already in use on your host, see
 
 ## Checking the Stack
 
-The stack runs PostgreSQL, which stands in for your existing database, and the
-cold-storage side: the Lakekeeper catalog and the SeaweedFS object store. The
-cold-storage side sits idle until you point ColdFront at it in
-[Step 5](#pointing-coldfront-at-the-object-store) (Pointing ColdFront at the
-Object Store). Use the following command to confirm that the `db`,
-`lakekeeper-db`, and `lakekeeper` services report `healthy`:
+The stack runs PostgreSQL and the cold-storage side: the Lakekeeper catalog and
+the SeaweedFS object store. The cold-storage side sits idle until you point
+ColdFront at it in [Step 5](#pointing-coldfront-at-the-object-store) (Pointing
+ColdFront at the Object Store). Use the following command to confirm that the
+`db`, `lakekeeper-db`, and `lakekeeper` services report `healthy`:
 
 ```bash
 docker compose -f examples/walkthrough/docker-compose.yml ps
