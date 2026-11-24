@@ -3,27 +3,23 @@ cwd: ../../
 ---
 # Exploring ColdFront
 
-Each of the following demos starts the stack it needs and runs from start to
-finish on its own page:
+Each of the following walkthroughs contains the steps to deploy the stack,
+demonstrate the benefits of each deployment architecture, and clean up the
+environment afterwards:
 
-- [Exploring Tiered Storage](../walkthrough_tiered.md)
-- [Exploring Decoupled Mode](../walkthrough_decoupled.md)
+- [Exploring Tiered Storage](../walkthrough_tiered.md) demonstrates keeping
+  recent data in PostgreSQL and archiving older data to cold Iceberg.
+- [Exploring Decoupled Mode](../walkthrough_decoupled.md) demonstrates storing
+  a table entirely in Iceberg from the first row.
 - [Exploring the Standalone Partitioner](../walkthrough_partitioner.md)
-- [Exploring Distributed Mode](../walkthrough_distributed.md)
+  demonstrates managing PostgreSQL partitions with no cold tier at all.
+- [Exploring Distributed Mode](../walkthrough_distributed.md) demonstrates
+  running two PostgreSQL nodes over one shared lake.
 
 You can use the Exploring pages to take a self-contained, step-by-step tour of
 ColdFront's three operating modes in a GitHub Codespace, or deploy the
 walkthrough on your own system. Either way, the walkthrough runs in Docker
-containers deployed with the Compose files in the ColdFront repository, and
-demonstrates:
-
-- tiered storage, which keeps recent data in PostgreSQL and archives older
-  data to cold Iceberg.
-- decoupled mode, which stores a table entirely in Iceberg from the first
-  row.
-- the standalone partitioner, which manages PostgreSQL partitions with no
-  cold tier at all.
-- a distributed demo that runs two nodes over one shared lake.
+containers deployed with the Compose files in the ColdFront repository.
 
 > **Beta software** - ColdFront is beta software under active development. Do
 > not use it in production. Interfaces, on-disk formats, and behavior may
