@@ -90,7 +90,12 @@ bash examples/walkthrough/guide.sh
 
 The guide builds the Docker images on first run, brings up the stack, and
 presents the four demos as a menu - tiered, decoupled, partitioner, and
-distributed - plus options to reset the demo tables or tear the stack down.
+distributed - plus options to reset the demo tables or tear the stack down. In
+the guide's menu, the R) Reset option drops the tables every demo created, in
+PostgreSQL and in the Iceberg catalog, and keeps the stack running. If the
+two-node cluster from the distributed demo is up, Reset first switches back to
+the single-node stack.
+
 The guide prints each demo command and query before it runs it. To have the
 guide type each one a character at a time, as in a recording, set
 `WALKTHROUGH_TYPE_DELAY` to the delay in seconds between characters (for
@@ -158,31 +163,3 @@ store:
 
 The [Configuring your Object Store](../object_store.md) guide shows the
 matching Lakekeeper warehouse JSON for each of these backends.
-
-## Tearing Down the Stack
-
-To stop the stack and remove all data volumes, run the following command:
-
-```bash
-docker compose \
-  -f examples/walkthrough/docker-compose.yml \
-  down -v
-```
-
-The `-v` flag removes the named volumes: `pgdata` (PostgreSQL), `lkdata` (the
-Lakekeeper catalog) and `s3data` (the object store). Omit the flag to keep the
-data for a later session.
-
-If you ran the [distributed demo](../walkthrough_distributed.md), tear down its
-separate mesh stack too:
-
-```bash
-docker compose \
-  -f examples/walkthrough/docker-compose.mesh.yml \
-  down -v
-```
-
-In the interactive guide, the menu's R) Reset option drops the tables every
-demo created, in PostgreSQL and in the Iceberg catalog, and keeps the stack
-running. If the two-node cluster from the distributed demo is up, Reset first
-switches back to the single-node stack.

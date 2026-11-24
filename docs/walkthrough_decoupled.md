@@ -353,8 +353,6 @@ docker compose \
 
 The `-v` flag removes the stack's data volumes; omit the flag to keep the data
 for a later session.
-[Tearing Down the Stack](exploring_coldfront/index.md#tearing-down-the-stack)
-describes the volumes and the interactive guide's reset option.
 
 ## Next Steps
 
@@ -367,5 +365,3 @@ To go further with ColdFront, consult the following guides:
   tables and the partition management CLI.
 - The [Architecture](architecture_guides/index.md) overview explains the shared mechanics
   and links to the per-mode deep dives.
-- The [Tearing Down the Stack](exploring_coldfront/index.md#tearing-down-the-stack) section
-  describes how to stop the stack and remove its data.

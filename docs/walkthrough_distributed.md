@@ -268,5 +268,3 @@ To go further with ColdFront, consult the following guides:
   and links to the per-mode deep dives.
 - The [Compaction](compaction.md) guide covers cold-tier maintenance:
   compaction, snapshot expiry, and orphan-file removal.
-- The [Tearing Down the Stack](exploring_coldfront/index.md#tearing-down-the-stack) section
-  describes how to stop the stack and remove its data.
