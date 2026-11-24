@@ -8,6 +8,18 @@ PostgreSQL holds a thin wrapper view and a registry entry. This is a fresh
 table - there is no migration from the tiered demo, and tiered and decoupled
 tables are independent.
 
+The following table shows the seven steps this demo performs:
+
+| Step | What you will do |
+|------|-----------------|
+| [1. Create an Iceberg-only table](#creating-an-iceberg-only-table) | Create a table whose rows live in Iceberg from the first row, with one SQL call. |
+| [2. Read and write the lake table](#reading-and-writing-the-lake-table) | Insert and query rows as you would in any PostgreSQL table. |
+| [3. Stand in for another engine](#standing-in-for-the-external-writer) | Use DuckDB to write an Iceberg table, as another engine would. |
+| [4. Adopt the table read-only](#adopting-it-read-only) | Wrap the existing Iceberg table in a read-only PostgreSQL view. |
+| [5. Enable writes](#enabling-writes) | Adopt the table again as writable, so INSERT, UPDATE, and DELETE work. |
+| [6. Restore a column type](#restoring-a-type-iceberg-cannot-record) | Restore the PostgreSQL type of a column that Iceberg stores as text. |
+| [7. Hand the table back](#handing-it-back) | Release the table; its rows stay in the lake. |
+
 ## Running This Demo in a Codespace
 
 Start the stack as described in

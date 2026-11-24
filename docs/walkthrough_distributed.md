@@ -19,6 +19,15 @@ guide automates the switch. The guide first removes the single-node stack and
 its volumes with `docker compose down -v`, so the data from the single-node
 demos does not survive the switch.
 
+The following table shows the four steps this demo performs:
+
+| Step | What you will do |
+|------|-----------------|
+| [1. Bring up the mesh](#bringing-up-the-two-node-mesh) | Start the two-node stack and form the Spock mesh. |
+| [2. See the mesh](#seeing-the-mesh) | Confirm that both nodes exist and that each subscribes to the other. |
+| [3. Write on one node, read on the other](#writing-on-one-node-reading-on-the-other) | Create a lake table on `db1` and read its rows on `db2`. |
+| [4. Serialize concurrent writes](#serializing-concurrent-writes-the-bakery) | Watch the bakery protocol order cold writes from both nodes so that they never conflict. |
+
 ## Running This Demo in a Codespace
 
 In a Codespace, run the demo with the interactive guide. Open a terminal in

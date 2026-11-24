@@ -3,12 +3,12 @@ cwd: ../
 ---
 # Exploring Tiered Storage
 
-Tiered storage is a brownfield retrofit: you begin with a plain PostgreSQL
-database full of data, add ColdFront to it, and let the archiver relocate the
-cold majority to object storage - without migrating to a new database or
-changing a line of application SQL.
+Tiered storage adds ColdFront to an existing PostgreSQL database. You begin
+with a plain database full of data, add ColdFront to it, and let the archiver
+move the cold majority of the rows to object storage, without migrating to a
+new database or changing a line of application SQL.
 
-The following table shows the eleven steps this demo covers:
+The following table shows the eleven steps this demo performs:
 
 | Step | What you will do |
 |------|-----------------|

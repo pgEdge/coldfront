@@ -8,6 +8,14 @@ tier. If all you need is automated partition maintenance on stock PostgreSQL,
 the partitioner is the whole product - no Iceberg, no DuckDB, no archiver cold
 path.
 
+The following table shows the three steps this demo performs:
+
+| Step | What you will do |
+|------|-----------------|
+| [1. Create the demo table](#creating-the-demo-table) | Create a partitioned table with no partitions. |
+| [2. Register and reconcile](#registering-and-reconciling) | Register the table with the partitioner and run one reconcile pass. |
+| [3. Verify the partitions](#verifying-the-partitions) | Confirm that the pass created this month's partition and the next three. |
+
 ## Running This Demo in a Codespace
 
 Start the stack as described in
