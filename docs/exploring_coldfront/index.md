@@ -151,18 +151,17 @@ in the `curl` commands of the demos.
 
 Open any demo page and follow the section for your environment. Each page
 starts the stack, runs the demo, and ends with a When You Finish section, so
-you can run the demos in any order. If the stack is already running from
-another demo, each page explains which start steps to skip.
+you can run the demos in any order.
 
 ## Using a Cloud Object Store
 
 The walkthrough uses SeaweedFS by default. To use a cloud store instead,
 replace the warehouse JSON in the bootstrap commands on the demo pages, the
 `set_storage_secret` call in
-[Step 5](../walkthrough_tiered.md#pointing-coldfront-at-the-object-store) of
-the tiered demo, and the `s3:` block in
-`examples/walkthrough/config/archiver.yaml`, which `import` writes into the
-server as the storage secret.
+[Step 5](../walkthrough_tiered.md#pointing-coldfront-at-the-object-store)
+(Pointing ColdFront at the Object Store) of the tiered demo, and the `s3:`
+block in `examples/walkthrough/config/archiver.yaml`, which `import` writes
+into the server as the storage secret.
 
 The following table shows the `set_storage_secret` signature for each supported
 store:

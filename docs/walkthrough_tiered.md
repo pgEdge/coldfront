@@ -15,10 +15,10 @@ The following table shows the eleven steps this demo performs:
 | [1. Check the stack](#checking-the-stack) | Confirm that Postgres, Lakekeeper, and the object store are running. |
 | [2. Create a table and load history](#creating-a-table-and-loading-months-of-history) | Create an ordinary partitioned table with months of data. |
 | [3. See the problem](#seeing-the-problem) | See that all rows sit in hot Postgres storage, which only grows. |
-| [4. Enable the extensions](#enabling-the-extensions) | Enable the two extensions that retrofit tiering onto the existing database. |
+| [4. Enable the extensions](#enabling-the-extensions) | Enable the two extensions that add tiered storage to the existing database. |
 | [5. Point at object storage](#pointing-coldfront-at-the-object-store) | Tell ColdFront where cold data lives. |
 | [6. Show the archiver policy](#showing-the-archiver-policy) | Review the policy, where `hot_period: 30 days` sets the hot/cold boundary. |
-| [7. Run the archiver](#registering-the-table-then-running-the-archiver) | Move everything older than 30 days to object storage. |
+| [7. Run the archiver](#registering-the-table-and-running-the-archiver) | Move everything older than 30 days to object storage. |
 | [8. Where it lives now](#checking-where-the-data-lives-now) | Inspect the hot/cold split: the rows and space in each tier. |
 | [9. Query across tiers](#querying-across-tiers) | Run one query on one table that reads hot and cold data together. |
 | [10. Write to cold data](#writing-to-cold-data) | UPDATE an archived row in place, with no rehydration. |
@@ -32,10 +32,14 @@ The Codespace opens the Exploring ColdFront page; click Exploring Tiered
 Storage to open this page as a notebook. To run a cell, click the triangle to
 the left of the cell.
 
-If the stack is already running from another demo, skip the next cell.
-Otherwise, run the following cell to start the containers and build the
-archiver image. The first run builds the Docker images, which takes two to five
-minutes:
+<div class="admonition hint">
+<p class="admonition-title">Hint</p>
+<p>The first time you start the stack, Docker builds the images, which can take
+several minutes. If you start the stack again, Docker reuses the images and the
+stack starts within a minute.</p>
+</div>
+
+Run the following cell to start the containers:
 
 ```bash
 docker compose -f examples/walkthrough/docker-compose.yml \
@@ -45,10 +49,8 @@ docker compose -f examples/walkthrough/docker-compose.yml \
 ```
 
 Run the following cell to bootstrap Lakekeeper, create the `wh` warehouse
-backed by SeaweedFS, and seed the `public` namespace. Skip the cell only if the
-output of `curl -s http://localhost:8181/management/v1/warehouse` already
-lists `"name":"wh"`; the partitioner demo does not create the warehouse. The
-cell makes one attempt, so run it again if the warehouse request fails:
+backed by SeaweedFS, and seed the `public` namespace. The cell makes one
+attempt, so run it again if the warehouse request fails:
 
 ```bash
 # Bootstrap Lakekeeper (one-time per fresh stack)
@@ -96,20 +98,25 @@ Then click the triangle beside each cell that follows, in order.
 ## Running This Demo on Your Own System
 
 Prepare your system as described in
-[Preparing Your Own System](exploring_coldfront/index.md#preparing-your-own-system).
-Then work from the repository root, or from the `coldfront-walkthrough`
-directory if you used the installer: paste each shell command into a terminal,
-and paste each SQL block into a psql session that you open with
-`psql postgresql://coldfront@localhost:5432/coldfront`. To have the interactive
-guide run this demo for you instead, run `bash examples/walkthrough/guide.sh`
-from that directory and choose `1) Tiered storage`.
+[Preparing Your Own System](exploring_coldfront/index.md#preparing-your-own-system),
+and then work from the repository root, or from the `coldfront-walkthrough`
+directory if you used the installer.
 
-Use the following commands to start the containers and build the archiver
-image, and then bootstrap Lakekeeper. If the stack is already running from
-another demo, skip the `docker compose` commands. Skip the bootstrap commands
-only if the output of `curl -s http://localhost:8181/management/v1/warehouse`
-already lists `"name":"wh"`; the partitioner demo does not create the
-warehouse:
+As you work through the walkthrough:
+
+- paste each shell command into a terminal.
+- paste each SQL block into a psql session that you open with
+  `psql postgresql://coldfront@localhost:5432/coldfront`.
+
+<div class="admonition hint">
+<p class="admonition-title">Hint</p>
+<p>The first time you start the stack, Docker builds the images, which can take
+several minutes. If you start the stack again, Docker reuses the images and the
+stack starts within a minute.</p>
+</div>
+
+Use the following commands to start the containers and then bootstrap
+Lakekeeper:
 
 ```bash {"ignore":"true"}
 docker compose -f examples/walkthrough/docker-compose.yml \
@@ -164,36 +171,29 @@ If port 5432, 8181, or 8333 is already in use on your host, see
 
 ## Checking the Stack
 
-Setup starts the infrastructure: PostgreSQL (your database), plus Lakekeeper
-and SeaweedFS. The cold-storage side sits idle until you point ColdFront at it
-in [Step 5](#pointing-coldfront-at-the-object-store). When you have
-started the stack, confirm that the `db`, `lakekeeper-db`, and `lakekeeper`
-services report `healthy`:
+The stack runs PostgreSQL, which stands in for your existing database, and the
+cold-storage side: the Lakekeeper catalog and the SeaweedFS object store. The
+cold-storage side sits idle until you point ColdFront at it in
+[Step 5](#pointing-coldfront-at-the-object-store) (Pointing ColdFront at the
+Object Store). Use the following command to confirm that the `db`,
+`lakekeeper-db`, and `lakekeeper` services report `healthy`:
 
 ```bash
 docker compose -f examples/walkthrough/docker-compose.yml ps
 ```
 
-PostgreSQL is your existing database. The catalog and object store are also
-running - that is the cold-storage side, unused until
-[Step 5](#pointing-coldfront-at-the-object-store). Locally the store is
-SeaweedFS; in production it is AWS S3, GCS, or Azure ADLS Gen2.
+<div class="admonition hint">
+<p class="admonition-title">Hint</p>
+<p>In production, the object store is AWS S3, GCS, Azure ADLS Gen2, or another
+S3-compatible store.</p>
+</div>
 
 ## Creating a Table and Loading Months of History
 
-This step stands in for the database you already run: an ordinary
-range-partitioned PostgreSQL table, filled with months of accumulated data.
-Nothing here is ColdFront-specific.
-
-If you are running the cells from this page, skip ahead - every SQL cell below
-opens its own connection. Following along in a local shell instead, connect
-once with the walkthrough credentials (notices suppressed so the output stays
-clean) and paste each SQL block into the session:
-
-```bash {"ignore":"true"}
-PGOPTIONS='-c client_min_messages=warning' \
-  psql -h localhost -p 5432 -U coldfront -d coldfront
-```
+In this step, you create an ordinary range-partitioned PostgreSQL table and
+fill the table with months of sample data. The table stands in for a table in
+a database that you already run; nothing in this step is specific to
+ColdFront.
 
 Create the partitioned table with 25 monthly partitions covering about two
 years of history plus the current month:
@@ -229,8 +229,7 @@ BEGIN
 END $do$;
 ```
 
-The loop creates 25 monthly partitions spanning about two years. Months older
-than 30 days will tier to cold; the last month or two stays hot.
+Months older than 30 days will tier to cold; the last month or two stays hot.
 
 Insert approximately one million rows spread evenly across the partition window
 (roughly two years, 730 days, from `now()`):
@@ -245,18 +244,13 @@ SELECT i,
 FROM generate_series(1, 1000000) i;
 ```
 
-The interactive guide asks for the row count instead of loading one million
-rows. It offers a suggested size that fits Docker's free disk with headroom
-(the default), 1M, 10M, or 50M rows, or a custom count. When a size would not
-fit, the guide warns and asks again.
-
-Confirm all rows landed:
+Use the following query to confirm that the table holds all one million rows:
 
 ```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT count(*) FROM events;
 ```
 
-The count confirms that all rows landed:
+The query returns the row count:
 
 ```text {"ignore":"true"}
   count
@@ -272,7 +266,8 @@ yet.
 This step measures how much hot Postgres storage that data occupies and
 confirms that none of it is in lower-cost storage yet. This is the baseline you
 will compare against after tiering in
-[Step 8](#checking-where-the-data-lives-now).
+[Step 8](#checking-where-the-data-lives-now) (Checking Where the Data Lives
+Now).
 
 `pg_total_relation_size()` on a partitioned parent counts only the empty parent
 itself and reports zero. Sum across `pg_partition_tree` to get the true heap
@@ -298,16 +293,15 @@ The query returns:
 ```
 
 Every row - all one million - occupies hot, expensive primary storage, and the
-table only grows. Remember this figure;
-[Step 8](#checking-where-the-data-lives-now) shows where it goes after tiering.
+table only grows. Remember this figure for comparison after tiering.
 
 ## Enabling the Extensions
 
-This step retrofits tiering onto the database you already have, using two
+This step adds tiered storage to the existing database by creating two
 extensions. `pg_duckdb` gives PostgreSQL an in-process engine that can read
-Parquet in object storage. `coldfront` adds the layer that routes each query to
-the right tier and rewrites DML. There is no migration and no new database -
-these install onto the running one.
+Parquet files in object storage. `coldfront` adds the layer that routes each
+query to the right tier and rewrites DML. The extensions install into the
+running database, with no migration and no new database.
 
 Run the following SQL to create both extensions:
 
@@ -340,9 +334,7 @@ proxy, and no data movement yet.
 ## Pointing ColdFront at the Object Store
 
 This step tells ColdFront where cold data goes and how to authenticate to it.
-The credentials below are throwaway values for the local SeaweedFS emulator. In
-production, pass your real bucket's key, secret, and endpoint here -
-application SQL is unchanged when you swap stores.
+The credentials below are throwaway values for the local SeaweedFS emulator.
 
 Register the local SeaweedFS credentials:
 
@@ -372,7 +364,7 @@ The archiver policy is one rule in a YAML file: data older than 30 days belongs
 in low-cost object storage; the most recent data stays hot in PostgreSQL.
 Nothing moves yet - this step shows the boundary.
 
-Inspect the archiver configuration:
+Use the following command to inspect the archiver configuration:
 
 ```bash
 cat examples/walkthrough/config/archiver.yaml
@@ -409,15 +401,15 @@ The `hot_period: 30 days` value is the hot/cold line. Any partition whose data
 is entirely older than 30 days will move to object storage when the archiver
 runs.
 
-## Registering the Table, Then Running the Archiver
+## Registering the Table and Running the Archiver
 
 The archiver reads its configuration from the server. `import` writes the YAML
 into it once: the table into `coldfront.partition_config` and the store into
 `coldfront.storage_secret`. Then run the archiver, which connects from the
-`PG*` environment the compose service sets and needs no file: it moves every
-partition older than 30 days out
-of the PostgreSQL heap into Parquet files in object storage and rebuilds
-`events` as a unified view over the hot remainder and the cold data.
+`PG*` environment the compose service sets and needs no file. The archiver
+moves every partition older than 30 days out of the PostgreSQL heap into
+Parquet files in object storage, and rebuilds `events` as a unified view over
+the hot remainder and the cold data.
 
 The following commands import the table and run the archiver:
 
@@ -441,7 +433,7 @@ The archiver connects inside the Compose network (service name `db`, not
 exports them to Iceberg via pg_duckdb, and replaces the `events` table with a
 unified view that queries both tiers.
 
-### Proving the Cold Rows Are Really in S3 as Parquet
+### Confirming That the Cold Rows Are in S3 as Parquet
 
 The `iceberg_metadata()` table function resolves its argument as a filesystem
 path, so a REST-catalog table cannot be addressed by name directly. Resolve the
@@ -489,9 +481,9 @@ PostgreSQL - they are objects in object storage. Each month's files sit under
 their own `month_ts_<n>=` directory: the cold table is partitioned by month,
 the way the hot table is.
 
-### Proving the Table Changed Shape
+### Confirming That the Table Changed Shape
 
-Inspect the relation type:
+Use the following command to inspect the relation type:
 
 ```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 \d events
@@ -506,10 +498,11 @@ SELECT * FROM coldfront.archive_watermark;
 
 ## Checking Where the Data Lives Now
 
-This step accounts for every row after tiering: how many are still hot in
-PostgreSQL, how many are now cold in object storage, and how much space each
-tier uses. This is the direct payoff against the [Step 3](#seeing-the-problem)
-baseline.
+In this step, you count the rows in each tier after tiering and measure the
+space that the hot tier uses. The queries show how many rows are still hot in
+PostgreSQL and how many are now cold in object storage, so you can compare the
+result with the baseline from [Step 3](#seeing-the-problem) (Seeing the
+Problem).
 
 Count the hot rows still in the PostgreSQL heap:
 
@@ -517,8 +510,7 @@ Count the hot rows still in the PostgreSQL heap:
 SELECT count(*) AS hot_rows FROM _events;
 ```
 
-Measure the hot heap size (sum over the partition tree, as in
-[Step 3](#seeing-the-problem)):
+Measure the hot heap size by summing over the partition tree:
 
 ```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT pg_size_pretty(
@@ -552,10 +544,9 @@ The hot share depends on the day you run the demo. The archiver moves a monthly
 partition to cold storage once its end is at least 30 days in the past, so the
 previous month stays hot until the 31st. A run on the 1st or the 31st keeps
 about 42,000 rows hot, and a run late in any other month about 83,000. Before
-tiering ([Step 3](#seeing-the-problem)), the table held one million rows, all
-hot, in approximately 152 MB of Postgres heap. After tiering, only the last
-month or two remains in PostgreSQL; over 90% of the hot storage is gone while
-the total row count is unchanged.
+tiering, the table held one million rows, all hot, in approximately 152 MB of
+Postgres heap. After tiering, only the last month or two remains in PostgreSQL;
+over 90% of the hot storage is gone while the total row count is unchanged.
 
 ## Querying Across Tiers
 

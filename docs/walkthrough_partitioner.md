@@ -24,10 +24,14 @@ The Codespace opens the Exploring ColdFront page; click Exploring the
 Standalone Partitioner to open this page as a notebook. To run a cell, click
 the triangle to the left of the cell.
 
-If the stack is already running from another demo, skip to the first step.
-Otherwise, run the following cell to start the containers and build the
-archiver image. The first run builds the Docker images, which takes two to five
-minutes:
+<div class="admonition hint">
+<p class="admonition-title">Hint</p>
+<p>The first time you start the stack, Docker builds the images, which can take
+several minutes. If you start the stack again, Docker reuses the images and the
+stack starts within a minute.</p>
+</div>
+
+Run the following cell to start the containers:
 
 ```bash
 docker compose -f examples/walkthrough/docker-compose.yml \
@@ -41,17 +45,24 @@ Then click the triangle beside each cell that follows, in order.
 ## Running This Demo on Your Own System
 
 Prepare your system as described in
-[Preparing Your Own System](exploring_coldfront/index.md#preparing-your-own-system).
-Then work from the repository root, or from the `coldfront-walkthrough`
-directory if you used the installer: paste each shell command into a terminal,
-and paste each SQL block into a psql session that you open with
-`psql postgresql://coldfront@localhost:5432/coldfront`. To have the interactive
-guide run this demo for you instead, run `bash examples/walkthrough/guide.sh`
-from that directory and choose `3) Partitioner`.
+[Preparing Your Own System](exploring_coldfront/index.md#preparing-your-own-system),
+and then work from the repository root, or from the `coldfront-walkthrough`
+directory if you used the installer.
 
-If the stack is already running from another demo, skip to the first step.
-Otherwise, use the following commands to start the containers and build the
-archiver image:
+As you work through the walkthrough:
+
+- paste each shell command into a terminal.
+- paste each SQL block into a psql session that you open with
+  `psql postgresql://coldfront@localhost:5432/coldfront`.
+
+<div class="admonition hint">
+<p class="admonition-title">Hint</p>
+<p>The first time you start the stack, Docker builds the images, which can take
+several minutes. If you start the stack again, Docker reuses the images and the
+stack starts within a minute.</p>
+</div>
+
+Use the following commands to start the containers:
 
 ```bash {"ignore":"true"}
 docker compose -f examples/walkthrough/docker-compose.yml \
