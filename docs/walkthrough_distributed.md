@@ -245,9 +245,17 @@ number and no fork.
 
 ## When You Finish
 
-To stop the two-node stack and remove its data, run the mesh command in
-[Tearing Down the Stack](exploring_coldfront/index.md#tearing-down-the-stack).
-The interactive guide's menu returns you to the single-node stack.
+To stop the two-node stack and remove its data, run the following command:
+
+```bash
+docker compose \
+  -f examples/walkthrough/docker-compose.mesh.yml \
+  down -v
+```
+
+The `-v` flag removes the stack's data volumes; omit the flag to keep the data
+for a later session. The interactive guide's menu returns you to the
+single-node stack.
 
 ## Next Steps
 

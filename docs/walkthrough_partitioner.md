@@ -124,8 +124,18 @@ section describes the partition CLI and shows more `register` examples.
 
 Keep the stack running if you plan to run another demo; every demo except the
 distributed demo reuses it. To stop the stack and remove its data, run the
-commands in
-[Tearing Down the Stack](exploring_coldfront/index.md#tearing-down-the-stack).
+following command:
+
+```bash
+docker compose \
+  -f examples/walkthrough/docker-compose.yml \
+  down -v
+```
+
+The `-v` flag removes the stack's data volumes; omit the flag to keep the data
+for a later session.
+[Tearing Down the Stack](exploring_coldfront/index.md#tearing-down-the-stack)
+describes the volumes and the interactive guide's reset option.
 
 ## Next Steps
 

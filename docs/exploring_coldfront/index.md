@@ -65,7 +65,8 @@ starts the stack in its first cells, so continue with
 The walkthroughs are designed to be performed manually on your own system, or
 in a Codespace. If you would like to perform the walkthrough manually on your
 own system, confirm that your system meets the following prerequisites, and
-then continue with [Running the Demos by Hand](#running-the-demos-by-hand):
+then continue with
+[Downloading the Walkthrough Files](#downloading-the-walkthrough-files):
 
 - Docker 24+ with Compose V2 (the `docker compose` plugin, not the legacy
   `docker-compose` binary).
@@ -75,21 +76,35 @@ then continue with [Running the Demos by Hand](#running-the-demos-by-hand):
 - `ss` on Linux or `lsof` on macOS, which the interactive guide uses to find
   free ports.
 
-### Running the Demos by Hand
-
-To run the demos without the guide, clone the
-[ColdFront repository](https://github.com/pgEdge/ColdFront), and then follow
-the section for your own system on each demo page from the repository root.
-Each demo page starts the stack, so continue with
-[Running the Demos](#running-the-demos).
-
 ### Using the Interactive Guide
 
-The interactive guide builds the Docker images on first run, brings up the
-stack, and presents the four demos as a menu - tiered, decoupled, partitioner,
-and distributed - plus options to reset the demo tables or tear the stack
-down. The following command downloads the walkthrough files and launches the
-guide:
+The interactive guide runs each walkthrough for you on your own system. A
+Codespace does not need the installer or this section: the demo pages run as
+notebooks, and the distributed demo's page shows how to start the guide in the
+Codespace. To start the guide, run the following command from the repository
+root or the `coldfront-walkthrough` directory:
+
+```bash {"ignore":"true"}
+bash examples/walkthrough/guide.sh
+```
+
+The guide builds the Docker images on first run, brings up the stack, and
+presents the four demos as a menu - tiered, decoupled, partitioner, and
+distributed - plus options to reset the demo tables or tear the stack down.
+The guide prints each demo command and query before it runs it. To have the
+guide type each one a character at a time, as in a recording, set
+`WALKTHROUGH_TYPE_DELAY` to the delay in seconds between characters (for
+example, `0.03`). The default of `0` prints each command at once.
+
+### Downloading the Walkthrough Files
+
+Clone the [ColdFront repository](https://github.com/pgEdge/ColdFront), or use
+the walkthrough installer (`examples/walkthrough/install.sh`) to download only
+the walkthrough files. The following command downloads the installer from
+GitHub and runs it; the installer writes the files to a
+`coldfront-walkthrough` directory under the current directory and then starts
+the interactive guide. Quit the guide if you want to follow the demo pages
+yourself:
 
 ```bash {"ignore":"true"}
 curl -fsSL \
@@ -97,24 +112,14 @@ curl -fsSL \
   | bash
 ```
 
-The installer writes the files to a `coldfront-walkthrough` directory under the
-current directory, and downloads them from the `main` branch. Set
-`WALKTHROUGH_DIR` to choose another directory, or `WALKTHROUGH_BRANCH` to
-download the files and build sources from another branch. Both variables must
-reach `bash`, so set them after the pipe, as in
-`| WALKTHROUGH_DIR=cf-demo bash`.
+The installer downloads the walkthrough files from the `main` branch. The
+[walkthrough README](https://github.com/pgEdge/ColdFront/blob/main/examples/walkthrough/README.md)
+describes the installer's options, such as choosing another directory or
+branch.
 
-If you already have the repository cloned, run the guide from the repository
-root instead:
-
-```bash {"ignore":"true"}
-bash examples/walkthrough/guide.sh
-```
-
-The guide prints each demo command and query before it runs it. To have the
-guide type each one a character at a time, as in a recording, set
-`WALKTHROUGH_TYPE_DELAY` to the delay in seconds between characters (for
-example, `0.03`). The default of `0` prints each command at once.
+Run every demo command from the repository root, or from the
+`coldfront-walkthrough` directory if you used the installer, and then continue
+with [Running the Demos](#running-the-demos).
 
 ### Changing the Demo Ports
 
@@ -126,34 +131,10 @@ in the `curl` commands of the demos.
 
 ## Running the Demos
 
-Each demo page starts the stack, runs the demo, and ends with a When You Finish
-section. If the stack is already running from another demo, skip the start
-steps on the next page. In a Codespace, open the demo page and click the
-triangle beside each cell in order. On your own system, work from the
-repository root, or from the `coldfront-walkthrough` directory if you used the
-installer: paste each shell command into a terminal and each SQL block into a
-psql session that you open with
-`psql postgresql://coldfront@localhost:5432/coldfront`, or choose the demo from
-the interactive guide's menu.
-
-If you run a demo page's Lakekeeper bootstrap after the `wh` warehouse exists,
-the create request fails and `WID` is empty. Set `WID` to the `warehouse-id` of
-the `wh` warehouse in the output of
-`curl -s http://localhost:8181/management/v1/warehouse`, then rerun the
-namespace request.
-
-The walkthrough includes the following demos:
-
-- The [Tiered Storage Demo](../walkthrough_tiered.md) adds ColdFront to an
-  existing database and moves its cold data to object storage.
-- The [Decoupled Mode Demo](../walkthrough_decoupled.md) stores a table in
-  Iceberg from the first row and adopts a table that another engine wrote.
-- The [Partitioner Demo](../walkthrough_partitioner.md) manages PostgreSQL
-  range partitions without any cold tier.
-- The [Distributed Demo](../walkthrough_distributed.md) points two PostgreSQL
-  nodes at one shared lake. The demo needs its own two-node stack, so its page
-  is not click-runnable; run it with the interactive guide in either
-  environment.
+Open any demo page and follow the section for your environment. Each page
+starts the stack, runs the demo, and ends with a When You Finish section, so
+you can run the demos in any order. If the stack is already running from
+another demo, each page explains which start steps to skip.
 
 ## Using a Cloud Object Store
 
