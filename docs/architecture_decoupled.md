@@ -183,12 +183,18 @@ needs `r['col']` accessor, every write needs a
 `duckdb.raw_query('… DuckDB SQL …')` envelope. To make an Iceberg-only
 table as easy to use as a PG table, ColdFront ships a single helper that
 provisions an Iceberg-only table together with a PG-side wrapper view and a
-registry row that makes the C hook to handle every DML on the view. After that,
-applications use **plain PG syntax** against the named relation:
+registry row that makes the C hook to handle every DML on the view.
+
+The table's schema needs its Iceberg namespace first, created in a transaction
+that commits before the helper runs:
 
 ```sql
 SELECT coldfront.create_iceberg_namespace('public');
+```
 
+After that, applications use **plain PG syntax** against the named relation:
+
+```sql
 SELECT coldfront.create_iceberg_table(
     'public', 'events',
     '[
