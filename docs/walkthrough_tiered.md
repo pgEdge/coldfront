@@ -47,8 +47,11 @@ created before returning to the menu.
 Create the Codespace as described in
 [Running the Walkthrough in a Codespace](exploring_coldfront/index.md#running-the-walkthrough-in-a-codespace).
 The Codespace opens the Exploring ColdFront page; click Exploring Tiered
-Storage to open this page as a notebook. To run a code block, click the
-triangle to the left of the code block.
+Storage to open this page as a notebook:
+
+![Exploring Tiered Storage open as a notebook in a Codespace](img/codespace_tiered_page.png)
+
+To run a code block, click the triangle to the left of the code block.
 
 <div class="admonition hint">
 <p class="admonition-title">Hint</p>
@@ -115,6 +118,9 @@ Then click the triangle beside each code block that follows, in order,
 starting with the first step, [Checking the Stack](#checking-the-stack).
 
 ## Running the Walkthrough Manually
+
+If you are using a Codespace, run the code blocks in the previous section
+instead of the commands in this section.
 
 Prepare your system as described in
 [Running the Walkthrough Manually](exploring_coldfront/index.md#running-the-walkthrough-manually),

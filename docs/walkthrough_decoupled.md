@@ -37,8 +37,11 @@ before returning to the menu.
 Create the Codespace as described in
 [Running the Walkthrough in a Codespace](exploring_coldfront/index.md#running-the-walkthrough-in-a-codespace).
 The Codespace opens the Exploring ColdFront page; click Exploring Decoupled
-Mode to open this page as a notebook. To run a code block, click the triangle
-to the left of the code block.
+Mode to open this page as a notebook:
+
+![Exploring Decoupled Mode open as a notebook in a Codespace](img/codespace_decoupled_page.png)
+
+To run a code block, click the triangle to the left of the code block.
 
 <div class="admonition hint">
 <p class="admonition-title">Hint</p>
@@ -105,6 +108,9 @@ Then click the triangle beside each code block that follows, in order, starting
 with the first step, [Preparing the Database](#preparing-the-database).
 
 ## Running the Walkthrough Manually
+
+If you are using a Codespace, run the code blocks in the previous section
+instead of the commands in this section.
 
 Prepare your system as described in
 [Running the Walkthrough Manually](exploring_coldfront/index.md#running-the-walkthrough-manually),

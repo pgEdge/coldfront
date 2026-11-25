@@ -35,8 +35,11 @@ before returning to the menu.
 Create the Codespace as described in
 [Running the Walkthrough in a Codespace](exploring_coldfront/index.md#running-the-walkthrough-in-a-codespace).
 The Codespace opens the Exploring ColdFront page; click Exploring the
-Standalone Partitioner to open this page as a notebook. To run a code block,
-click the triangle to the left of the code block.
+Standalone Partitioner to open this page as a notebook:
+
+![Exploring the Standalone Partitioner open as a notebook in a Codespace](img/codespace_partitioner_page.png)
+
+To run a code block, click the triangle to the left of the code block.
 
 <div class="admonition hint">
 <p class="admonition-title">Hint</p>
@@ -54,10 +57,18 @@ docker compose -f examples/walkthrough/docker-compose.yml \
   build archiver
 ```
 
+When the code block finishes, a check mark and the run time appear under the
+commands, and the Compose output appears below the code block:
+
+![The finished start-up code block in a Codespace, with its check mark, run time, and Compose output](img/codespace_partitioner_startup.png)
+
 Then click the triangle beside each code block that follows, in order, starting
 with the first step, [Creating the Demo Table](#creating-the-demo-table).
 
 ## Running the Walkthrough Manually
+
+If you are using a Codespace, run the code blocks in the previous section
+instead of the commands in this section.
 
 Prepare your system as described in
 [Running the Walkthrough Manually](exploring_coldfront/index.md#running-the-walkthrough-manually),

@@ -54,6 +54,11 @@ In a Codespace, open a terminal, run the following command, and choose
 bash examples/walkthrough/guide.sh
 ```
 
+When the single-node stack is ready, the guide shows its menu in the Codespace
+terminal:
+
+![The interactive guide's menu in a Codespace terminal, after the stack is ready](img/codespace_distributed_guide.png)
+
 ## Running the Walkthrough Manually
 
 Prepare your system as described in
