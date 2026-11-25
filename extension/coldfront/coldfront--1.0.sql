@@ -3563,7 +3563,36 @@ BEGIN
 END;
 $$;
 
--- create_iceberg_table: provision an iceberg-only table end-to-end.
+-- create_iceberg_namespace: create the Iceberg namespace ice.<p_namespace> when
+-- the catalog does not have it. create_iceberg_table puts its table in the
+-- namespace named after its schema and needs that namespace in the catalog
+-- first. duckdb-iceberg (ICEBERG_REF 5edc45f0) sends a namespace create when the
+-- DuckDB transaction commits and a table create as soon as the statement runs,
+-- and Lakekeeper refuses a table in a namespace it does not have, so a
+-- namespace and its first table cannot be created in one transaction. The
+-- namespace reaches the catalog when the calling transaction commits, and a
+-- rollback leaves the catalog without it. The call is a DuckDB write, which
+-- pg_duckdb (c04e6a2) refuses in a transaction that also writes to PostgreSQL,
+-- so the call has a transaction to itself. The name is quoted as _iceberg_ref
+-- quotes it, so the two functions name one namespace.
+CREATE FUNCTION coldfront.create_iceberg_namespace(p_namespace text) RETURNS void
+LANGUAGE plpgsql AS $$
+BEGIN
+    -- The namespace create leaves PostgreSQL entirely, so this guard is the one
+    -- that keeps it off a replica.
+    PERFORM coldfront._reject_on_standby('create an Iceberg namespace');
+    IF p_namespace IS NULL OR p_namespace = '' THEN
+        RAISE EXCEPTION 'coldfront.create_iceberg_namespace: p_namespace must be a non-empty name';
+    END IF;
+    PERFORM coldfront.ensure_attached();
+    PERFORM duckdb.raw_query(format('CREATE SCHEMA IF NOT EXISTS "ice"."%s"',
+                                    replace(p_namespace, '"', '""')));
+END;
+$$;
+
+-- create_iceberg_table: provision an iceberg-only table end-to-end. The Iceberg
+-- namespace ice.<p_schema> must already be in the catalog, where
+-- create_iceberg_namespace puts it.
 --
 --   p_schema         PG schema for the wrapper view (e.g. 'public').
 --   p_table          relation/view name (e.g. 'events'). Iceberg table is
@@ -3601,8 +3630,8 @@ DECLARE
     pg_type          text;
     storage_type     text;
 BEGIN
-    -- The Iceberg CREATE SCHEMA / CREATE TABLE below precede this function's PG
-    -- writes, so this guard is the one that keeps catalog writes off a replica.
+    -- The Iceberg CREATE TABLE below precedes this function's PG writes, so
+    -- this guard is the one that keeps catalog writes off a replica.
     PERFORM coldfront._reject_on_standby('create an Iceberg table');
 
     IF p_columns IS NULL OR jsonb_array_length(p_columns) = 0 THEN
@@ -3660,14 +3689,14 @@ BEGIN
                        coldfront._vec_sort_key(v_vec_cols[1], NULL), v_part <> '');
     END IF;
 
-    -- 1. Iceberg table on the attached catalog (create namespace first;
-    -- CREATE SCHEMA IF NOT EXISTS is idempotent and cheap on Lakekeeper).
+    -- 1. Iceberg table on the attached catalog, in a namespace the catalog
+    -- already has (create_iceberg_namespace). Without the namespace DuckDB
+    -- refuses the statement with 'Schema with name "<p_schema>" does not exist'.
     -- IF NOT EXISTS on the table itself makes the helper safe to call again
     -- against an existing table — useful for distributed setups where each
     -- node registers the same shared Iceberg table independently. PARTITIONED BY
     -- precedes WITH, as DuckDB parses the statement.
     PERFORM coldfront.ensure_attached();
-    PERFORM duckdb.raw_query(format('CREATE SCHEMA IF NOT EXISTS ice.%I', p_schema));
     PERFORM duckdb.raw_query(format(
         'CREATE TABLE IF NOT EXISTS %s (%s)%s%s', ice_ref, iceberg_cols, v_part, v_props));
 

@@ -93,7 +93,7 @@ example, `0.03`). The default of `0` prints each command at once.
 
 Setup runs before the demos begin. Setup starts the containers, waits for
 PostgreSQL and Lakekeeper to accept connections, and creates the Lakekeeper
-warehouse and namespace. The stack includes the following services:
+warehouse. The stack includes the following services:
 
 - PostgreSQL 16, 17, or 18 with the pg_duckdb and `coldfront` extensions.
 - SeaweedFS, a local S3-compatible object store standing in for a real cloud
@@ -123,10 +123,9 @@ If you remap the PG port, match it in the `psql` commands of the
 [demos](#next-steps). If you remap the Lakekeeper port, match it in the `curl`
 commands on this page and in the demos.
 
-Bootstrap Lakekeeper, create the `wh` warehouse backed by SeaweedFS, and seed
-the `public` namespace. The interactive guide retries the warehouse POST until
-SeaweedFS is ready. This cell makes one attempt, so run it again if the
-warehouse POST fails:
+Bootstrap Lakekeeper and create the `wh` warehouse backed by SeaweedFS. The
+interactive guide retries the warehouse POST until SeaweedFS is ready. This
+cell makes one attempt, so run it again if the warehouse POST fails:
 
 ```bash
 # Bootstrap Lakekeeper (one-time per fresh stack)
@@ -134,8 +133,8 @@ curl -sf -X POST http://localhost:8181/management/v1/bootstrap \
   -H 'Content-Type: application/json' \
   -d '{"accept-terms-of-use":true}'
 
-# Create the warehouse and save its ID (retried by guide.sh until 200)
-WID=$(curl -sf -X POST http://localhost:8181/management/v1/warehouse \
+# Create the warehouse (retried by guide.sh until 200)
+curl -sf -X POST http://localhost:8181/management/v1/warehouse \
   -H 'Content-Type: application/json' \
   -d '{
     "warehouse-name": "wh",
@@ -156,24 +155,8 @@ WID=$(curl -sf -X POST http://localhost:8181/management/v1/warehouse \
       "aws-secret-access-key": "adminsecret"
     }
   }' \
-  | grep -oE '"warehouse-id":"[^"]+"' | cut -d'"' -f4)
-
-# Seed the public namespace
-if [ -z "$WID" ]; then
-  echo "No warehouse ID - check that the warehouse create succeeded."
-else
-  curl -sf -X POST \
-    "http://localhost:8181/catalog/v1/${WID}/namespaces" \
-    -H 'Content-Type: application/json' \
-    -d '{"namespace":["public"]}'
-fi
+  || echo "The warehouse create failed - it already exists, or SeaweedFS is not ready yet."
 ```
-
-If you run these commands again after the warehouse exists, the create
-request fails and `WID` is empty. Set `WID` to the `warehouse-id` of the `wh`
-warehouse in the output of
-`curl -s http://localhost:8181/management/v1/warehouse`, then rerun the
-namespace request.
 
 ### Using a Cloud Object Store
 

@@ -347,21 +347,17 @@ story_cold_retention() {
 # ───────────────────────────────────────────────────────────────────────────
 story_provision_decoupled() {
     step "2. Provision decoupled (iceberg-only) table"
-    # The Iceberg namespace is pre-seeded at warehouse provisioning (see
-    # ci/topo/*.sh): DuckDB 1.5.x defers an Iceberg CREATE SCHEMA to COMMIT but
-    # POSTs CREATE TABLE eagerly, so create_iceberg_table — which runs both in
-    # ONE plpgsql transaction — would 404 on a cold warehouse (the table POST
-    # references a namespace not yet committed). With the namespace already
-    # committed, its in-txn CREATE SCHEMA IF NOT EXISTS no-ops and CREATE TABLE
-    # succeeds. The loop is a thin safety net in case seeding raced the warehouse.
-    # Partitioned by month(ts), so every decoupled story writes and reads a
-    # partitioned table.
-    local i
-    for i in 1 2 3 4 5; do
-        q_may "$HOST" "SELECT coldfront.create_iceberg_table('public','iceonly','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"ts\",\"type\":\"timestamptz\"},{\"name\":\"status\",\"type\":\"text\"},{\"name\":\"data\",\"type\":\"jsonb\"}]'::jsonb, '{month(ts)}');" >/dev/null 2>&1
-        [ "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname='iceonly' AND relkind='v' AND relnamespace='public'::regnamespace;")" = "1" ] && break
-        sleep 2
-    done
+    # The first table of a decoupled run. Nothing has created the warehouse's
+    # public namespace, so the documented step does: create_iceberg_namespace in
+    # a statement of its own, then the table. Partitioned by month(ts), so every
+    # decoupled story writes and reads a partitioned table.
+    local out
+    assert_eq "no public namespace in the catalog before the first table" "0" "$(ns_listed public)"
+    out=$(q_may "$HOST" "SELECT coldfront.create_iceberg_namespace('public');")
+    case "$out" in *ERROR*) fail "create_iceberg_namespace('public'): $out";; esac
+    assert_eq "create_iceberg_namespace put public in the catalog" "1" "$(ns_listed public)"
+    out=$(q_may "$HOST" "SELECT coldfront.create_iceberg_table('public','iceonly','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"ts\",\"type\":\"timestamptz\"},{\"name\":\"status\",\"type\":\"text\"},{\"name\":\"data\",\"type\":\"jsonb\"}]'::jsonb, '{month(ts)}');")
+    case "$out" in *ERROR*) fail "create_iceberg_table('public','iceonly'): $out";; esac
     assert_eq "iceonly wrapper view created" "v" "$(q "$HOST" "SELECT relkind FROM pg_class WHERE relname='iceonly' AND relnamespace='public'::regnamespace;")"
     assert_eq "iceberg-only registry row present" "1" "$(q "$HOST" "SELECT count(*) FROM coldfront.tiered_views WHERE is_iceberg_only AND iceberg_table='\"ice\".\"public\".\"iceonly\"';")"
     assert_eq "no hot table for iceberg-only view" "" "$(q "$HOST" "SELECT hot_table FROM coldfront.tiered_views WHERE iceberg_table='\"ice\".\"public\".\"iceonly\"';")"
@@ -756,7 +752,8 @@ EOSQL
 # separately (two psql invocations, not one multi-statement -c): on the attached
 # catalog the schema create is deferred to transaction COMMIT while the table
 # create POSTs eagerly, so one transaction would 404 against a namespace that is
-# not committed yet. Same trap docs/usage.md documents for create_iceberg_table.
+# not committed yet. coldfront.create_iceberg_namespace is a call of its own for
+# the same reason (TC-280).
 # ───────────────────────────────────────────────────────────────────────────
 # adopt_fixture <namespace> <table> <ddl-tail>: ddl-tail is everything the
 # CREATE TABLE carries after the table name: the parenthesised column list, plus
@@ -1806,12 +1803,9 @@ EOSQL
 
     # Decoupled: no hot tier, its own generated trigger, its own type map. Shares
     # none of the archiver's plumbing, so it is a distinct path.
-    local i
-    for i in 1 2 3 4 5; do
-        q_may "$HOST" "SELECT coldfront.create_iceberg_table('public','icevec','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"ts\",\"type\":\"timestamptz\"},{\"name\":\"embedding\",\"type\":\"vector(3)\"}]'::jsonb);" >/dev/null 2>&1
-        [ "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname='icevec' AND relkind='v' AND relnamespace='public'::regnamespace;")" = "1" ] && break
-        sleep 2
-    done
+    local out
+    out=$(q_may "$HOST" "SELECT coldfront.create_iceberg_table('public','icevec','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"ts\",\"type\":\"timestamptz\"},{\"name\":\"embedding\",\"type\":\"vector(3)\"}]'::jsonb);")
+    case "$out" in *ERROR*) fail "create_iceberg_table('public','icevec'): $out";; esac
     local D; D=$(qf "$HOST" <<'EOSQL'
 INSERT INTO icevec VALUES (1, date_trunc('month',now()) + interval '11 hours', '[7,-8.25,9]'::vector);
 SELECT 'DEC_VEC:' || (embedding = ARRAY[7,-8.25,9]::real[])::text FROM icevec WHERE id = 1;
@@ -1849,11 +1843,8 @@ EOSQL
     # Two vector columns on one table. Each gets its own cluster column and its own
     # assignment; only the first gets the file sort order, so only its probe prunes.
     # Its own table, so nothing above depends on the second column existing.
-    for _ in 1 2 3 4 5; do
-        q_may "$HOST" "SELECT coldfront.create_iceberg_table('public','icetwo','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"ts\",\"type\":\"timestamptz\"},{\"name\":\"embedding\",\"type\":\"vector(3)\"},{\"name\":\"summary\",\"type\":\"vector(2)\"}]'::jsonb);" >/dev/null 2>&1
-        [ "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname='icetwo' AND relkind='v';")" = "1" ] && break
-        sleep 2
-    done
+    out=$(q_may "$HOST" "SELECT coldfront.create_iceberg_table('public','icetwo','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"ts\",\"type\":\"timestamptz\"},{\"name\":\"embedding\",\"type\":\"vector(3)\"},{\"name\":\"summary\",\"type\":\"vector(2)\"}]'::jsonb);")
+    case "$out" in *ERROR*) fail "create_iceberg_table('public','icetwo'): $out";; esac
     q "$HOST" "INSERT INTO coldfront.vector_config (schema_name, table_name, column_name, nlist, nprobe) VALUES ('public','icetwo','embedding',2,1),('public','icetwo','summary',2,1);" >/dev/null
     q "$HOST" "INSERT INTO coldfront.vector_centroids (schema_name, table_name, column_name, generation, centroid_id, centroid) VALUES ('public','icetwo','embedding',1,0,ARRAY[1,0,0]::real[]),('public','icetwo','embedding',1,1,ARRAY[0,0,1]::real[]),('public','icetwo','summary',1,0,ARRAY[1,0]::real[]),('public','icetwo','summary',1,1,ARRAY[0,1]::real[]);" >/dev/null
     q "$HOST" "UPDATE coldfront.vector_config SET generation = 1 WHERE table_name = 'icetwo';" >/dev/null
@@ -4576,11 +4567,16 @@ story_standby_reads() {
         "cannot execute a cold (Iceberg) write on a read-only standby" "$c"
 
     # Provisioning POSTs CREATE TABLE to the catalog eagerly (see
-    # story_provision_decoupled) and precedes its own PG writes, so coldfront's own
+    # TC-280) and precedes its own PG writes, so coldfront's own
     # refusal is what keeps catalog writes off a replica.
     local p; p=$(q_may "$STANDBY" "SELECT coldfront.create_iceberg_table('public','sb_reject','[{\"name\":\"id\",\"type\":\"bigint\"}]'::jsonb);")
     assert_err "provisioning on standby → coldfront refuses before the catalog POST" \
         "cannot create an Iceberg table on a read-only standby" "$p"
+    # The namespace call's create reaches the catalog when its transaction
+    # commits, which a read-only transaction on a replica also does.
+    p=$(q_may "$STANDBY" "SELECT coldfront.create_iceberg_namespace('sb_reject');")
+    assert_err "namespace call on standby → coldfront refuses" \
+        "cannot create an Iceberg namespace on a read-only standby" "$p"
 
     # Mesh + tiered: the standby is a physical replica of db1 (HOST). A peer's HOT
     # write reaches db1 via Spock (logical) and then the standby via physical
@@ -7770,9 +7766,8 @@ story_drop_iceberg_table() {
                | grep -oE '"warehouse-id":"[^"]+"' | head -1 | cut -d'"' -f4)
     [ -n "$DIT_WH" ] || { fail "drop_iceberg_table: could not resolve the warehouse id"; return; }
 
-    # The Iceberg namespace must be committed before any CREATE TABLE references
-    # it (DuckDB defers CREATE SCHEMA to COMMIT; see story_provision_decoupled).
-    q "$HOST" "SELECT coldfront.ensure_attached(); SELECT duckdb.raw_query('CREATE SCHEMA IF NOT EXISTS ice.dropprobe');" >/dev/null 2>&1
+    # The namespace is in the catalog before any table names it (TC-280).
+    q "$HOST" "SELECT coldfront.create_iceberg_namespace('dropprobe');" >/dev/null 2>&1
     q "$HOST" "CREATE SCHEMA IF NOT EXISTS dropprobe;" >/dev/null 2>&1
 
     dit_case "decoupled/purge" dpurge decoupled true
@@ -7781,6 +7776,111 @@ story_drop_iceberg_table() {
     dit_case "tiered/keep"     tkeep  tiered    false
 
     q "$HOST" "DROP SCHEMA IF EXISTS dropprobe CASCADE;" >/dev/null 2>&1
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story: TC-278..TC-285, the Iceberg namespace as a call of its own.
+# coldfront.create_iceberg_namespace creates the namespace a decoupled table
+# lives in, and create_iceberg_table needs it in the catalog first. Each
+# namespace is asserted absent first, so the story cannot pass on one an earlier
+# step left behind.
+# ───────────────────────────────────────────────────────────────────────────
+# ns_listed <namespace>: 1 when the catalog lists the namespace, 0 when it does
+# not, and a message that equals neither when the catalog cannot be read.
+ns_listed() {
+    local wid body
+    wid=$(curl -s "http://${LK_IP}:8181/management/v1/warehouse" \
+            | grep -oE '"warehouse-id":"[^"]+"' | head -1 | cut -d'"' -f4)
+    body=$(curl -sf "http://${LK_IP}:8181/catalog/v1/${wid}/namespaces") || { echo "catalog unreadable"; return; }
+    printf '%s' "$body" | grep -c "\[\"$1\"\]" || true
+}
+
+story_create_iceberg_namespace() {
+    step "TC-278..TC-285: create_iceberg_namespace, then create_iceberg_table"
+    local cols='[{"name":"id","type":"bigint"}]' out
+    q "$HOST" "CREATE SCHEMA IF NOT EXISTS nsstep; CREATE SCHEMA IF NOT EXISTS nstxn;" >/dev/null 2>&1
+
+    # TC-278: without the namespace call, a table in a schema whose namespace the
+    # catalog does not have is refused, and the refused call leaves nothing.
+    assert_eq "TC-278: no nsstep namespace before the calls" "0" "$(ns_listed nsstep)"
+    assert_err "TC-278: create_iceberg_table without the namespace is refused" "Schema with name \"nsstep\" does not exist" \
+        "$(q_may "$HOST" "SELECT coldfront.create_iceberg_table('nsstep','t','$cols'::jsonb);")"
+    assert_eq "TC-278: the refused call created no wrapper view" "t" "$(q "$HOST" "SELECT to_regclass('nsstep.t') IS NULL;")"
+    assert_eq "TC-278: the refused call left no nsstep namespace" "0" "$(ns_listed nsstep)"
+
+    # TC-279: the namespace call, in a statement of its own, puts the namespace
+    # in the catalog, a second call changes nothing, and the table create then
+    # succeeds.
+    out=$(q_may "$HOST" "SELECT coldfront.create_iceberg_namespace('nsstep');")
+    case "$out" in *ERROR*) fail "TC-279: create_iceberg_namespace('nsstep'): $out";; esac
+    assert_eq "TC-279: the call created the nsstep namespace" "1" "$(ns_listed nsstep)"
+    out=$(q_may "$HOST" "SELECT coldfront.create_iceberg_namespace('nsstep');")
+    case "$out" in *ERROR*) fail "TC-279: a second create_iceberg_namespace('nsstep'): $out";; esac
+    out=$(q_may "$HOST" "SELECT coldfront.create_iceberg_table('nsstep','t','$cols'::jsonb);")
+    case "$out" in *ERROR*) fail "TC-279: create_iceberg_table after the namespace call: $out";; esac
+    assert_eq "TC-279: wrapper view created" "v" \
+        "$(q "$HOST" "SELECT relkind FROM pg_class WHERE oid = to_regclass('nsstep.t');")"
+    q "$HOST" "INSERT INTO nsstep.t VALUES (1),(2);" >/dev/null 2>&1
+    assert_eq "TC-279: rows written through the view read back" "2" "$(q "$HOST" "SELECT count(*) FROM nsstep.t;")"
+
+    # TC-280: duckdb-iceberg 5edc45f0 sends a namespace create when the DuckDB
+    # transaction commits and a table create as soon as the statement runs, so
+    # the catalog refuses a table in a namespace created in the same transaction.
+    # That ordering is why the namespace is a call of its own. This check fails
+    # once the pin creates both in one transaction.
+    assert_err "TC-280: duckdb-iceberg cannot create a namespace and its table in one transaction" "NoSuchNamespace" \
+        "$(q_may "$HOST" "BEGIN; SELECT coldfront.ensure_attached(); SELECT duckdb.raw_query('CREATE SCHEMA IF NOT EXISTS ice.nsdeferred'); SELECT duckdb.raw_query('CREATE TABLE ice.nsdeferred.t (id BIGINT)'); COMMIT;")"
+    assert_eq "TC-280: the refused transaction left no nsdeferred namespace" "0" "$(ns_listed nsdeferred)"
+
+    # TC-281: the two functions meet the same ordering. The namespace call and
+    # the table call in one transaction are refused, and nothing is left.
+    assert_eq "TC-281: no nstxn namespace before the calls" "0" "$(ns_listed nstxn)"
+    assert_err "TC-281: the namespace and its first table in one transaction are refused" "NoSuchNamespace" \
+        "$(q_may "$HOST" "BEGIN; SELECT coldfront.create_iceberg_namespace('nstxn'); SELECT coldfront.create_iceberg_table('nstxn','t','$cols'::jsonb); COMMIT;")"
+    assert_eq "TC-281: the refused transaction left no nstxn namespace" "0" "$(ns_listed nstxn)"
+
+    # TC-282: the namespace create belongs to its transaction, so a ROLLBACK
+    # leaves the catalog without it. psql stops a multi-statement string at its
+    # first error, so the ROLLBACK tag in the output means the call ran.
+    out=$(q_may "$HOST" "BEGIN; SELECT coldfront.create_iceberg_namespace('nstxn'); ROLLBACK;")
+    assert_contains "TC-282: the call ran, up to the ROLLBACK" "ROLLBACK" "$out"
+    assert_eq "TC-282: no nstxn namespace after the ROLLBACK" "0" "$(ns_listed nstxn)"
+
+    # TC-283: the call quotes the name, so one DuckDB reads as a keyword when it
+    # is bare is created as written.
+    assert_eq "TC-283: no pivot namespace before the call" "0" "$(ns_listed pivot)"
+    out=$(q_may "$HOST" "SELECT coldfront.create_iceberg_namespace('pivot');")
+    case "$out" in *ERROR*) fail "TC-283: create_iceberg_namespace('pivot'): $out";; esac
+    assert_eq "TC-283: the call created the pivot namespace" "1" "$(ns_listed pivot)"
+
+    # TC-284: a session whose table create failed for the missing namespace
+    # creates the table once the namespace is there, without reconnecting. One
+    # psql session runs the three statements.
+    q "$HOST" "CREATE SCHEMA IF NOT EXISTS nsretry;" >/dev/null 2>&1
+    assert_eq "TC-284: no nsretry namespace before the calls" "0" "$(ns_listed nsretry)"
+    out=$(qf "$HOST" 2>&1 <<EOSQL
+SELECT coldfront.create_iceberg_table('nsretry','t','$cols'::jsonb);
+SELECT coldfront.create_iceberg_namespace('nsretry');
+SELECT coldfront.create_iceberg_table('nsretry','t','$cols'::jsonb);
+EOSQL
+)
+    assert_contains "TC-284: the first try failed for the missing namespace" \
+        "Schema with name \"nsretry\" does not exist" "$out"
+    assert_eq "TC-284: the second try in that session created the table" "v" \
+        "$(q "$HOST" "SELECT relkind FROM pg_class WHERE oid = to_regclass('nsretry.t');")"
+
+    # TC-285: the call needs a transaction of its own. pg_duckdb c04e6a2 refuses
+    # a DuckDB write in a transaction that also writes to PostgreSQL, and the
+    # refused transaction leaves neither the schema nor the namespace.
+    assert_err "TC-285: a PostgreSQL write and the namespace call in one transaction are refused" \
+        "Writing to DuckDB and Postgres tables in the same transaction block is not supported" \
+        "$(q_may "$HOST" "BEGIN; CREATE SCHEMA nsmix; SELECT coldfront.create_iceberg_namespace('nsmix'); COMMIT;")"
+    assert_eq "TC-285: the refused transaction left no nsmix schema" "f" "$(q "$HOST" "SELECT to_regnamespace('nsmix') IS NOT NULL;")"
+    assert_eq "TC-285: the refused transaction left no nsmix namespace" "0" "$(ns_listed nsmix)"
+
+    q "$HOST" "SELECT coldfront.drop_iceberg_table('nsstep','t', true);" >/dev/null 2>&1
+    q "$HOST" "SELECT coldfront.drop_iceberg_table('nsretry','t', true);" >/dev/null 2>&1
+    q "$HOST" "DROP SCHEMA IF EXISTS nsstep CASCADE; DROP SCHEMA IF EXISTS nstxn CASCADE; DROP SCHEMA IF EXISTS nsretry CASCADE; DROP SCHEMA IF EXISTS nsmix CASCADE;" >/dev/null 2>&1
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -8207,12 +8307,9 @@ story_row_group_pruning() {
 # ───────────────────────────────────────────────────────────────────────────
 story_vector_probe_pruning() {
     step "TC-193: a vector probe skips the row groups of the clusters it does not visit"
-    local i
-    for i in 1 2 3 4 5; do
-        q_may "$HOST" "SELECT coldfront.create_iceberg_table('public','tcvp','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"ts\",\"type\":\"timestamptz\"},{\"name\":\"embedding\",\"type\":\"vector(3)\"}]'::jsonb);" >/dev/null 2>&1
-        [ "$(q "$HOST" "SELECT count(*) FROM pg_class WHERE relname='tcvp' AND relkind='v';")" = "1" ] && break
-        sleep 2
-    done
+    local out
+    out=$(q_may "$HOST" "SELECT coldfront.create_iceberg_table('public','tcvp','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"ts\",\"type\":\"timestamptz\"},{\"name\":\"embedding\",\"type\":\"vector(3)\"}]'::jsonb);")
+    case "$out" in *ERROR*) fail "create_iceberg_table('public','tcvp'): $out";; esac
     # Two clusters far apart; a probe visits one of them.
     q "$HOST" "INSERT INTO coldfront.vector_config (schema_name, table_name, column_name, nlist, nprobe) VALUES ('public','tcvp','embedding',2,1);" >/dev/null
     q "$HOST" "INSERT INTO coldfront.vector_centroids (schema_name, table_name, column_name, generation, centroid_id, centroid) VALUES ('public','tcvp','embedding',1,0,ARRAY[100,100,100]::real[]),('public','tcvp','embedding',1,1,ARRAY[-100,-100,-100]::real[]);" >/dev/null
@@ -8407,6 +8504,7 @@ story_partitioned_cold_tables  # TC-186..TC-189: partition fan-out, UTC months, 
 story_row_group_pruning        # TC-192: a time band skips the row groups outside it
 story_vector_probe_pruning     # TC-193: a vector probe skips the row groups of the clusters it does not visit
 story_drop_iceberg_table   # both modes, purge and keep-files (own throwaway tables)
+story_create_iceberg_namespace  # TC-278..TC-285: the namespace call, then a table in it, alone and inside a transaction
 [ "$MESH" != 1 ] && { [ "$BACKEND" = s3 ] || [ "$BACKEND" = vended ]; } && story_missing_manifest   # TC-264: a missing manifest fails the read, not the backend
 [ "$MESH" = 1 ] && [ "$MODE" = decoupled ] && story_mesh   # tiered+mesh runs story_mesh_tiered (above)
 [ "$MESH" = 1 ] && story_mesh_multiwriter   # >1 cold writer/node cross-node (tiered: events, decoupled: iceonly)

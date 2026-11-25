@@ -58,11 +58,18 @@ Each backend section uses two kinds of commands:
 - Run the `curl` commands in a terminal shell on a host that can reach
   Lakekeeper's management API. The commands use `http://localhost:8181`; if
   Lakekeeper runs on another host or port, use that address instead. Keep the
-  same shell open until you create the namespace, because the warehouse
+  same shell open until you verify the configuration, because the warehouse
   command saves the warehouse's ID in the `WID` shell variable that the
-  namespace command uses.
+  verification command uses.
 - Run the SQL statements in the psql session that you opened in
   [Before You Begin](#before-you-begin).
+
+!!! hint
+
+    If you run the warehouse command again after the warehouse exists, the
+    create request fails and `WID` is empty. Set `WID` to the `warehouse-id`
+    of the `wh` warehouse in the output of
+    `curl -s http://localhost:8181/management/v1/warehouse`.
 
 !!! warning "Only long-term keys work"
 
@@ -142,7 +149,8 @@ steps to configure it:
       'my-store.example.com:9000', 'us-east-1', 'path', true);
     ```
 
-Then, continue with [Creating the Namespace](#creating-the-namespace).
+Then, continue with
+[Testing with Decoupled Mode](#testing-with-decoupled-mode).
 
 ### Configuring AWS S3
 
@@ -230,7 +238,8 @@ Use the following steps to configure AWS S3:
         `use_ssl`, which default to path-style over plain HTTP; do not use
         that form for AWS S3.
 
-Then, continue with [Creating the Namespace](#creating-the-namespace).
+Then, continue with
+[Testing with Decoupled Mode](#testing-with-decoupled-mode).
 
 #### Using Vended Credentials with AWS S3
 
@@ -294,7 +303,8 @@ of a static key. Use the following steps in place of the steps above:
     SELECT coldfront.set_storage_secret_vended();
     ```
 
-Then, continue with [Creating the Namespace](#creating-the-namespace).
+Then, continue with
+[Testing with Decoupled Mode](#testing-with-decoupled-mode).
 
 ### Configuring Google Cloud Storage
 
@@ -346,7 +356,8 @@ Use the following steps to configure Google Cloud Storage:
       'storage.googleapis.com', 'us-east-1', 'path', true);
     ```
 
-Then, continue with [Creating the Namespace](#creating-the-namespace).
+Then, continue with
+[Testing with Decoupled Mode](#testing-with-decoupled-mode).
 
 ### Configuring Azure ADLS Gen2
 
@@ -402,7 +413,8 @@ Use the following steps to configure Azure ADLS Gen2:
         'DefaultEndpointsProtocol=https;AccountName=myaccount;AccountKey=<your-account-key>;EndpointSuffix=core.windows.net');
     ```
 
-Then, continue with [Creating the Namespace](#creating-the-namespace).
+Then, continue with
+[Testing with Decoupled Mode](#testing-with-decoupled-mode).
 
 #### Using Vended Credentials with Azure ADLS Gen2
 
@@ -415,31 +427,6 @@ each database, enable vended credentials instead of step 2 above:
 SELECT coldfront.set_storage_secret_vended('azure');
 ```
 
-## Creating the Namespace
-
-Whichever backend you configured, create the `public` namespace under the
-warehouse, using the ID that the warehouse command saved in `WID`. Decoupled
-mode needs the namespace before you create a table; in tiered mode, the
-archiver creates it itself.
-
-```bash
-if [ -z "$WID" ]; then
-  echo "No warehouse ID - check that the warehouse create succeeded."
-else
-  curl -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
-    -H "Content-Type: application/json" \
-    -d '{"namespace":["public"]}'
-fi
-```
-
-!!! hint
-
-    If you run the warehouse command again after the warehouse exists, the
-    create request fails and `WID` is empty. Set `WID` to the `warehouse-id`
-    of the `wh` warehouse in the output of
-    `curl -s http://localhost:8181/management/v1/warehouse`, then rerun the
-    namespace request.
-
 ## Testing with Decoupled Mode
 
 A decoupled (Iceberg-only) table has no PostgreSQL hot tier: every row lives
@@ -449,6 +436,9 @@ is the quickest way to confirm that PostgreSQL, Lakekeeper, and your object
 store work together:
 
 ```sql
+-- The Iceberg namespace of the table's schema, created once per schema:
+SELECT coldfront.create_iceberg_namespace('public');
+
 SELECT coldfront.create_iceberg_table(
   'public', 'cold_demo',
   '[
@@ -532,8 +522,8 @@ If something failed, work through the following checklist:
   launched after 2019-03-20).
 - For Azure, check that the connection string passed to
   `set_storage_secret_azure()` has the right `AccountName` and `AccountKey`.
-- Check that the namespace `public` exists in Lakekeeper before
-  `create_iceberg_table` runs. Without the namespace, the decoupled create
-  fails with HTTP 404.
+- Check that `coldfront.create_iceberg_namespace('public')` ran before
+  `create_iceberg_table`. Without the namespace, the decoupled create fails
+  with the error `Schema with name "public" does not exist`.
 - Check that the key is a long-term key, not an SSO or temporary session-token
   credential (S3-family backends).

@@ -162,7 +162,7 @@ else
     \"storage-credential\":{\"type\":\"s3\",\"credential-type\":\"access-key\",\"aws-access-key-id\":\"admin\",\"aws-secret-access-key\":\"adminsecret\"}
   }"
 fi
-create_warehouse_and_seed "$LK_IP" "$WH_BODY"   # POST warehouse + seed 'default' namespace (ci/lib.sh)
+create_warehouse "$LK_IP" "$WH_BODY"   # POST warehouse (ci/lib.sh)
 
 step "mesh: set cold-tier storage secret on all nodes ($BACKEND)"
 # set_storage_secret[_azure] writes the in-DB row (replicated via the repset

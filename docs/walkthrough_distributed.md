@@ -45,8 +45,7 @@ or `COLDFRONT_MESH_S3_PORT` before `up`.
 
 Next, run the `curl` block from
 [Setting Up the Stack](exploring_coldfront/index.md#setting-up-the-stack) with port 8191 in
-place of 8181. That creates the `wh` warehouse and `public` namespace on the
-mesh's own Lakekeeper.
+place of 8181. That creates the `wh` warehouse on the mesh's own Lakekeeper.
 
 Then create the extensions and form the mesh, running each statement on the
 node its comment names:
@@ -97,6 +96,13 @@ SELECT sub_name  FROM spock.subscription;              -- one per node
 ```
 
 ## Writing on One Node, Reading on the Other
+
+Create the `public` namespace in the shared catalog, once, from either node:
+
+```sql {"ignore":"true"}
+-- On db1:
+SELECT coldfront.create_iceberg_namespace('public');
+```
 
 Create a lake-native table on `db1` and register it on `db2` as well (the call
 is idempotent and the registry is keyed by name, so each node ends up with an

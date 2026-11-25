@@ -8,6 +8,29 @@ row. This page walks through creating a decoupled table with
 `coldfront.create_iceberg_table()`, changing its columns, and adopting a
 table that another engine already wrote into the catalog.
 
+A decoupled table lives in the Iceberg namespace named after its PostgreSQL
+schema, and the catalog needs that namespace before the first table in the
+schema. Create the namespace once per schema with
+`coldfront.create_iceberg_namespace()`:
+
+```sql
+SELECT coldfront.create_iceberg_namespace('public');
+```
+
+Run the call in a transaction of its own. The namespace reaches the catalog
+when that transaction commits, and a rollback leaves the catalog without the
+namespace. A transaction that also writes to PostgreSQL, such as one that
+creates the schema, fails with the error
+`Writing to DuckDB and Postgres tables in the same transaction block is not supported`
+and changes nothing. The call changes nothing when the namespace already
+exists. The catalog is shared across a mesh, so one node makes the call. In
+tiered mode, the archiver creates the namespace itself.
+
+Without the namespace, `coldfront.create_iceberg_table()` fails with the error
+`Schema with name "public" does not exist`. When two sessions create the same
+namespace at the same moment, the later commit fails with HTTP 409, and the
+call succeeds when repeated.
+
 A single call creates a decoupled table:
 
 ```sql

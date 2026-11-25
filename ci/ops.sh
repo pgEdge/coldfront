@@ -64,11 +64,11 @@ for _ in $(seq 1 30); do [ "$(docker inspect -f '{{.State.Health.Status}}' "$DB"
 LK_IP=$(ip "$LK"); SW_IP=$(ip "$SW")
 NET=$(docker inspect -f '{{range $k,$v := .NetworkSettings.Networks}}{{$k}}{{end}}' "$DB")
 
-step "ops: bootstrap Lakekeeper + warehouse + namespace (s3)"
+step "ops: bootstrap Lakekeeper + warehouse (s3)"
 curl -sf "http://$LK_IP:8181/management/v1/bootstrap" -X POST -H "Content-Type: application/json" \
      -d '{"accept-terms-of-use":true}' >/dev/null 2>&1 || true
 WH_BODY="{\"warehouse-name\":\"wh\",\"storage-profile\":{\"type\":\"s3\",\"bucket\":\"iceberg\",\"region\":\"us-east-1\",\"endpoint\":\"http://${SW_IP}:8333\",\"path-style-access\":true,\"flavor\":\"s3-compat\",\"sts-enabled\":false,\"remote-signing-enabled\":false},\"storage-credential\":{\"type\":\"s3\",\"credential-type\":\"access-key\",\"aws-access-key-id\":\"admin\",\"aws-secret-access-key\":\"adminsecret\"}}"
-create_warehouse_and_seed "$LK_IP" "$WH_BODY"
+create_warehouse "$LK_IP" "$WH_BODY"
 
 step "ops: setup (extensions, storage secret) + provision a hot + a cold relation"
 qf "$DB" >/dev/null <<EOSQL
@@ -79,7 +79,8 @@ SELECT coldfront.set_storage_secret('admin','adminsecret','${SW_IP}:8333');
 CREATE TABLE IF NOT EXISTS hot1 (id bigint);
 INSERT INTO hot1 VALUES (1);
 -- cold relation: a decoupled iceberg-only view whose reads/writes funnel through
--- the 'ice' catalog (Lakekeeper) + S3
+-- the 'ice' catalog (Lakekeeper) + S3, in a namespace created first
+SELECT coldfront.create_iceberg_namespace('public');
 SELECT coldfront.create_iceberg_table('public','cold1','[{"name":"id","type":"bigint"}]'::jsonb);
 INSERT INTO cold1 VALUES (1);
 EOSQL
