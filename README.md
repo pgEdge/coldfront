@@ -591,8 +591,9 @@ the host.
     ```
 
     A successful request prints the `warehouse-id` of the new warehouse. If the
-    request prints an error, for example because SeaweedFS is not ready yet,
-    run the request again before you continue.
+    request prints an error because SeaweedFS is not ready yet, run the request
+    again before you continue. If the error says that the `wh` warehouse
+    already exists, continue without running the request again.
 
     If you're using a different type of object store, change the
     `storage-profile` and `storage-credential` as shown in the store's section
@@ -641,8 +642,9 @@ to evaluate ColdFront without a cloud account.
     ```
 
     A successful request prints the `warehouse-id` of the new warehouse. If the
-    request prints an error, for example because SeaweedFS is not ready yet,
-    run the request again before you continue.
+    request prints an error because SeaweedFS is not ready yet, run the request
+    again before you continue. If the error says that the `wh` warehouse
+    already exists, continue without running the request again.
 
 3. Store the SeaweedFS credential in each database that uses ColdFront:
 
