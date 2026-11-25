@@ -24,7 +24,9 @@ Download the walkthrough files and start the interactive guide as described in
 [Running the Interactive Walkthrough on the Command Line](exploring_coldfront/index.md#running-the-interactive-walkthrough-on-the-command-line),
 and then choose `2) Decoupled` from the guide's menu. The guide describes
 each step, shows each command before execution, and waits for you to press
-Enter before continuing.
+Enter before continuing:
+
+![The interactive guide's menu with 2) Decoupled chosen, and the first step of the decoupled walkthrough](img/walkthrough_guide_decoupled.png)
 
 The sections that follow explain each step as the walkthrough executes.
 When the walkthrough ends, the guide offers to drop the `events_lake` table
