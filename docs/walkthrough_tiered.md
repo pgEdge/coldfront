@@ -18,7 +18,7 @@ The following table shows the eleven steps this demo performs:
 | [4. Enabling the extensions](#enabling-the-extensions) | Enable the two extensions that add tiered storage to the existing database. |
 | [5. Pointing ColdFront at the object store](#pointing-coldfront-at-the-object-store) | Tell ColdFront where cold data lives. |
 | [6. Showing the archiver policy](#showing-the-archiver-policy) | Review the policy, where `hot_period: 30 days` sets the hot/cold boundary. |
-| [7. Running the archiver](#running-the-archiver) | Move everything older than 30 days to object storage. |
+| [7. Running the archiver](#running-the-archiver) | Move each monthly partition whose data is all older than 30 days to object storage. |
 | [8. Checking where the data lives now](#checking-where-the-data-lives-now) | Inspect the hot/cold split: the rows and space in each tier. |
 | [9. Querying across tiers](#querying-across-tiers) | Run one query on one table that reads hot and cold data together. |
 | [10. Writing to cold data](#writing-to-cold-data) | UPDATE an archived row in place, with no rehydration. |
@@ -718,8 +718,9 @@ corrected in place, no rehydration, no separate system.
 ## When You Finish
 
 When you finish the demo, use the following command to stop the stack and
-remove its data. Each demo starts its own stack, so the next demo you run
-starts fresh:
+remove its data. The tiered, decoupled, and partitioner demos share this stack
+and its data volumes, so removing the data means the next demo you run starts
+fresh:
 
 ```bash
 docker compose \

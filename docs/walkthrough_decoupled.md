@@ -360,8 +360,9 @@ table.
 ## When You Finish
 
 When you finish the demo, use the following command to stop the stack and
-remove its data. Each demo starts its own stack, so the next demo you run
-starts fresh:
+remove its data. The tiered, decoupled, and partitioner demos share this stack
+and its data volumes, so removing the data means the next demo you run starts
+fresh:
 
 ```bash
 docker compose \
