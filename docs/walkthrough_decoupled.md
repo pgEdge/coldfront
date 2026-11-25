@@ -18,7 +18,7 @@ The following table shows the seven steps this demo performs:
 | [6. Restoring a type Iceberg cannot record](#restoring-a-type-iceberg-cannot-record) | Restore the PostgreSQL type of a column that Iceberg stores as text. |
 | [7. Handing the table back](#handing-the-table-back) | Release the table; its rows stay in the lake. |
 
-## Running This Demo in a Codespace
+## Running the Walkthrough in a Codespace
 
 Create the Codespace as described in
 [Running the Walkthrough in a Codespace](exploring_coldfront/index.md#running-the-walkthrough-in-a-codespace).
@@ -89,7 +89,7 @@ fi
 
 Then click the triangle beside each cell that follows, in order.
 
-## Running This Demo on Your Own System
+## Running the Walkthrough Manually
 
 Prepare your system as described in
 [Running the Walkthrough Manually](exploring_coldfront/index.md#running-the-walkthrough-manually),

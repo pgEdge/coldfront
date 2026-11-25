@@ -17,7 +17,7 @@ You can run the walkthrough in three ways:
 
 - on the command line of your own system, where the interactive guide runs
   each step for you and shows its output; see
-  [Running the Walkthrough on the Command Line](#running-the-walkthrough-on-the-command-line).
+  [Running the Interactive Walkthrough on the Command Line](#running-the-interactive-walkthrough-on-the-command-line).
 - in a GitHub Codespace, where each demo page opens as a notebook and you run
   each code block with a click; see
   [Running the Walkthrough in a Codespace](#running-the-walkthrough-in-a-codespace).
@@ -51,7 +51,9 @@ The stack includes the following services:
 <p class="admonition-title">Hint</p>
 <p>The stack runs PostgreSQL 18 by default. To run 16 or 17, set
 <code>PG_MAJOR</code> and change the <code>pgdata</code> volume path in
-<code>docker-compose.yml</code> to match.</p>
+<code>docker-compose.yml</code> to match. For the distributed walkthrough, also
+change the <code>pgdata1</code> and <code>pgdata2</code> volume paths in
+<code>docker-compose.mesh.yml</code>.</p>
 </div>
 
 Before you run the walkthrough on the command line or manually, confirm that
@@ -65,7 +67,7 @@ your system meets the following prerequisites:
 - `ss` on Linux or `lsof` on macOS, which the interactive guide uses to find
   free ports.
 
-## Running the Walkthrough on the Command Line
+## Running the Interactive Walkthrough on the Command Line
 
 On the command line, the interactive guide walks you through the deployment of
 each ColdFront mode on your own system. For each mode, the guide shows the
@@ -92,6 +94,9 @@ The installer downloads the walkthrough files from the `main` branch into a
 run the following command from the repository root or the
 <code>coldfront-walkthrough</code> directory:</p>
 <pre><code>bash examples/walkthrough/guide.sh</code></pre>
+<p>If the two-node cluster from the distributed walkthrough is still running,
+the guide removes the cluster and its data volumes when it starts, without
+asking first.</p>
 </div>
 
 The installer then checks that the prerequisites are installed and asks how to
@@ -184,9 +189,9 @@ curl -fsSL \
 When the installer asks how to continue, choose `2) Exit` to continue manually.
 
 Work from the repository root, or from the `coldfront-walkthrough` directory if
-you used the installer. Each demo page includes a `Running This Demo Manually`
-section that starts the stack; complete that section before performing each
-step on the page in order.
+you used the installer. Each walkthrough page includes a
+`Running the Walkthrough Manually` section that starts the stack; complete
+that section before performing each step on the page in order.
 
 ## Changing the Demo Ports
 

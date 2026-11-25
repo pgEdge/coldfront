@@ -16,7 +16,7 @@ The following table shows the three steps this demo performs:
 | [2. Registering and reconciling](#registering-and-reconciling) | Register the table with the partitioner and run one reconcile pass. |
 | [3. Verifying the partitions](#verifying-the-partitions) | Confirm that the pass created this month's partition and the next three. |
 
-## Running This Demo in a Codespace
+## Running the Walkthrough in a Codespace
 
 Create the Codespace as described in
 [Running the Walkthrough in a Codespace](exploring_coldfront/index.md#running-the-walkthrough-in-a-codespace).
@@ -42,7 +42,7 @@ docker compose -f examples/walkthrough/docker-compose.yml \
 
 Then click the triangle beside each cell that follows, in order.
 
-## Running This Demo on Your Own System
+## Running the Walkthrough Manually
 
 Prepare your system as described in
 [Running the Walkthrough Manually](exploring_coldfront/index.md#running-the-walkthrough-manually),

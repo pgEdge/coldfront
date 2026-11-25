@@ -28,7 +28,7 @@ The following table shows the four steps this demo performs:
 | [3. Writing on one node, reading on the other](#writing-on-one-node-reading-on-the-other) | Create a lake table on `db1` and read its rows on `db2`. |
 | [4. Serializing concurrent writes (the bakery)](#serializing-concurrent-writes-the-bakery) | Watch the bakery protocol order cold writes from both nodes so that they never conflict. |
 
-## Running This Demo in a Codespace
+## Running the Walkthrough in a Codespace
 
 In a Codespace, run the demo with the interactive guide. Open a terminal in
 the Codespace, and then run the following command and choose
@@ -40,7 +40,7 @@ bash examples/walkthrough/guide.sh
 
 The sections that follow show what the guide does, so you can follow along.
 
-## Running This Demo on Your Own System
+## Running the Walkthrough Manually
 
 On your own system, run the same command from the repository root, or from
 the `coldfront-walkthrough` directory if you used the installer, and choose
@@ -63,7 +63,7 @@ If port 5442, 5443, 8191, or 8343 is already in use on your host, set
 or `COLDFRONT_MESH_S3_PORT` before `up`.
 
 Next, run the `curl` block from
-[Running This Demo on Your Own System](walkthrough_tiered.md#running-this-demo-on-your-own-system)
+[Running the Walkthrough Manually](walkthrough_tiered.md#running-the-walkthrough-manually)
 on the tiered demo page, with port 8191 in place of 8181. That creates the `wh`
 warehouse and `public` namespace on the mesh's own Lakekeeper.
 

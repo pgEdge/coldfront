@@ -24,7 +24,25 @@ The following table shows the eleven steps this demo performs:
 | [10. Writing to cold data](#writing-to-cold-data) | UPDATE an archived row in place, with no rehydration. |
 | [11. Confirming the edit persisted](#confirming-the-edit-persisted) | Reconnect and confirm the edit persisted in cold storage. |
 
-## Running This Demo in a Codespace
+## Running the Interactive Walkthrough on the Command Line
+
+Download the walkthrough files and start the interactive guide as described in
+[Running the Interactive Walkthrough on the Command Line](exploring_coldfront/index.md#running-the-interactive-walkthrough-on-the-command-line),
+and then choose `1) Tiered storage` from the guide's menu. The guide describes
+each step, shows each command before execution, and waits for you to press
+Enter before continuing.
+
+After the first step, the guide asks how much data to generate. The row
+counts and sizes in the guide's output depend on that choice, so they differ
+from the output that this page describes:
+
+![The interactive guide's first tiered storage step and its prompt for how much data to generate](img/walkthrough_guide_tiered.png)
+
+The sections that follow explain each step as the walkthrough executes. When
+the walkthrough ends, the guide offers to drop the tables that the walkthrough
+created before returning to the menu.
+
+## Running the Walkthrough in a Codespace
 
 Create the Codespace as described in
 [Running the Walkthrough in a Codespace](exploring_coldfront/index.md#running-the-walkthrough-in-a-codespace).
@@ -95,7 +113,7 @@ fi
 
 Then click the triangle beside each cell that follows, in order.
 
-## Running This Demo on Your Own System
+## Running the Walkthrough Manually
 
 Prepare your system as described in
 [Running the Walkthrough Manually](exploring_coldfront/index.md#running-the-walkthrough-manually),
