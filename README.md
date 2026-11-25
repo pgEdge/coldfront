@@ -479,6 +479,10 @@ A bare-metal installation runs Lakekeeper and an object store on the host.
       }'
     ```
 
+    A successful request prints the `warehouse-id` of the new warehouse. If the
+    request prints an error, for example because SeaweedFS is not ready yet,
+    run the request again before you continue.
+
     If you're using a different type of object store, change the
     `storage-profile` and `storage-credential` as shown in the store's section
     of [Configuring your Object Store](docs/object_store.md).
@@ -524,6 +528,10 @@ to evaluate ColdFront without a cloud account.
         }
       }'
     ```
+
+    A successful request prints the `warehouse-id` of the new warehouse. If the
+    request prints an error, for example because SeaweedFS is not ready yet,
+    run the request again before you continue.
 
 3. Store the SeaweedFS credential in each database that uses ColdFront:
 

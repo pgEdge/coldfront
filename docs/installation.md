@@ -480,6 +480,10 @@ SeaweedFS S3 emulator that the stack includes under the `local-store` profile:
       }'
     ```
 
+    A successful request prints the `warehouse-id` of the new warehouse. If the
+    request prints an error, for example because SeaweedFS is not ready yet,
+    run the request again before you continue.
+
 4. Create the extensions, set the cold-store secret, create the `public`
    namespace and a decoupled table, insert a row, and read it back through
    Iceberg:
