@@ -10,16 +10,16 @@ over that one shared copy. A write on one node is readable on the other with
 nothing copied between them, and concurrent cold writes from different nodes
 are serialized cluster-wide so they never collide.
 
-This demo uses a different stack from the single-node walkthrough - two
+This walkthrough uses a different stack from the single-node walkthroughs - two
 `MESH=on` nodes (`db1`, `db2`) plus a shared Lakekeeper and object store. The
-demo is not click-runnable. It needs that two-node stack and separate psql
-sessions against each node (`db1` on port 5442, `db2` on 5443), so the code
-blocks on this page are shown for reading and hand-pasting. The interactive
-guide automates the switch. The guide first removes the single-node stack and
-its volumes with `docker compose down -v`, so the data from the single-node
-demos does not survive the switch.
+walkthrough is not click-runnable. It needs that two-node stack and separate
+psql sessions against each node (`db1` on port 5442, `db2` on 5443), so the
+code blocks on this page are shown for reading and hand-pasting. The
+interactive guide automates the switch. The guide first removes the single-node
+stack and its volumes with `docker compose down -v`, so the data from the
+single-node walkthroughs does not survive the switch.
 
-The following table shows the four steps this demo performs:
+The following table shows the four steps this walkthrough performs:
 
 | Step | What you will do |
 |------|-----------------|
@@ -28,11 +28,27 @@ The following table shows the four steps this demo performs:
 | [3. Writing on one node, reading on the other](#writing-on-one-node-reading-on-the-other) | Create a lake table on `db1` and read its rows on `db2`. |
 | [4. Serializing concurrent writes (the bakery)](#serializing-concurrent-writes-the-bakery) | Watch the bakery protocol order cold writes from both nodes so that they never conflict. |
 
+## Running the Interactive Walkthrough on the Command Line
+
+Download the walkthrough files and start the interactive guide as described in
+[Running the Interactive Walkthrough on the Command Line](exploring_coldfront/index.md#running-the-interactive-walkthrough-on-the-command-line),
+and then choose `4) Distributed` from the guide's menu. The guide describes
+each step, shows each command before execution, and waits for you to press
+Enter before continuing:
+
+![The interactive guide's menu with 4) Distributed chosen, and the start of the distributed walkthrough](img/walkthrough_guide_distributed.png)
+
+The sections that follow explain each step as the walkthrough executes.
+Before the first step, the guide removes the single-node stack and its
+volumes, and then brings up the two-node cluster. When the walkthrough ends,
+the cluster keeps running; choose another walkthrough from the menu to switch
+back to the single-node stack, or choose `Q) Quit`, which offers to remove
+everything.
+
 ## Running the Walkthrough in a Codespace
 
-In a Codespace, run the demo with the interactive guide. Open a terminal in
-the Codespace, and then run the following command and choose
-`4) Distributed`:
+In a Codespace, run the walkthrough with the interactive guide. Open a terminal
+in the Codespace, run the following command, and choose `4) Distributed`:
 
 ```bash {"ignore":"true"}
 bash examples/walkthrough/guide.sh
@@ -42,11 +58,16 @@ The sections that follow show what the guide does, so you can follow along.
 
 ## Running the Walkthrough Manually
 
-On your own system, run the same command from the repository root, or from
-the `coldfront-walkthrough` directory if you used the installer, and choose
-`4) Distributed`. To reproduce the demo by hand instead, paste the commands in
-the sections that follow into a terminal and into psql sessions against each
-node.
+Prepare your system as described in
+[Running the Walkthrough Manually](exploring_coldfront/index.md#running-the-walkthrough-manually),
+and then work from the repository root, or from the `coldfront-walkthrough`
+directory if you used the installer. Paste the commands in the sections that
+follow into a terminal, and paste the SQL into a psql session against each
+node (`db1` on port 5442 and `db2` on port 5443).
+
+Start with the first step,
+[Bringing Up the Two-Node Mesh](#bringing-up-the-two-node-mesh), which starts
+the two-node stack.
 
 ## Bringing Up the Two-Node Mesh
 
@@ -64,8 +85,8 @@ or `COLDFRONT_MESH_S3_PORT` before `up`.
 
 Next, run the `curl` block from
 [Running the Walkthrough Manually](walkthrough_tiered.md#running-the-walkthrough-manually)
-on the tiered demo page, with port 8191 in place of 8181. That creates the `wh`
-warehouse and `public` namespace on the mesh's own Lakekeeper.
+on the tiered walkthrough page, with port 8191 in place of 8181. That creates
+the `wh` warehouse and `public` namespace on the mesh's own Lakekeeper.
 
 Then create the extensions and form the mesh, running each statement on the
 node its comment names:
@@ -223,7 +244,7 @@ the bakery at a time, and the cross-node Ricart-Agrawala claim protocol orders
 writers across nodes. The durable record is the lake's own; every commit adds
 one snapshot to the table's metadata, in a single chain of sequence numbers.
 Resolve the table's metadata location from the mesh stack's Lakekeeper (port
-8191), as in the tiered demo, and list the history from either node:
+8191), as in the tiered walkthrough, and list the history from either node:
 
 ```bash {"ignore":"true"}
 WH_ID=$(curl -s http://localhost:8191/management/v1/warehouse \
@@ -256,15 +277,15 @@ docker compose \
 The `-v` flag removes the stack's data volumes; omit the flag to keep the data
 for a later session. To start that session, run the command in
 [Bringing Up the Two-Node Mesh](#bringing-up-the-two-node-mesh), not the
-interactive guide; the guide's distributed demo removes both stacks' data
-volumes before it starts.
+interactive guide; the guide's distributed walkthrough removes both stacks'
+data volumes before it starts.
 
 ## Next Steps
 
 To go further with ColdFront, consult the following guides:
 
-- The [Partitioner Demo](walkthrough_partitioner.md) manages PostgreSQL range
-  partitions without any cold tier.
+- The [Exploring the Standalone Partitioner](walkthrough_partitioner.md)
+  walkthrough manages PostgreSQL range partitions without any cold tier.
 - The [Using ColdFront](using_coldfront/index.md) guide compares the tiered,
   decoupled, and standalone partitioned modes, and covers dropping Iceberg
   tables and the partition management CLI.

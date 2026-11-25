@@ -6,7 +6,7 @@ cwd: ../
 Decoupled mode stores a table entirely in Iceberg from the first row.
 PostgreSQL holds a thin wrapper view and a registry entry.
 
-The following table shows the seven steps this demo performs:
+The following table shows the seven steps this walkthrough performs:
 
 | Step | What you will do |
 |------|-----------------|
@@ -18,13 +18,25 @@ The following table shows the seven steps this demo performs:
 | [6. Restoring a type Iceberg cannot record](#restoring-a-type-iceberg-cannot-record) | Restore the PostgreSQL type of a column that Iceberg stores as text. |
 | [7. Handing the table back](#handing-the-table-back) | Release the table; its rows stay in the lake. |
 
+## Running the Interactive Walkthrough on the Command Line
+
+Download the walkthrough files and start the interactive guide as described in
+[Running the Interactive Walkthrough on the Command Line](exploring_coldfront/index.md#running-the-interactive-walkthrough-on-the-command-line),
+and then choose `2) Decoupled` from the guide's menu. The guide describes
+each step, shows each command before execution, and waits for you to press
+Enter before continuing.
+
+The sections that follow explain each step as the walkthrough executes.
+When the walkthrough ends, the guide offers to drop the `events_lake` table
+before returning to the menu.
+
 ## Running the Walkthrough in a Codespace
 
 Create the Codespace as described in
 [Running the Walkthrough in a Codespace](exploring_coldfront/index.md#running-the-walkthrough-in-a-codespace).
 The Codespace opens the Exploring ColdFront page; click Exploring Decoupled
-Mode to open this page as a notebook. To run a cell, click the triangle to the
-left of the cell.
+Mode to open this page as a notebook. To run a code block, click the triangle
+to the left of the code block.
 
 <div class="admonition hint">
 <p class="admonition-title">Hint</p>
@@ -33,7 +45,7 @@ several minutes. If you start the stack again, Docker reuses the images and the
 stack starts within a minute.</p>
 </div>
 
-Run the following cell to start the containers:
+Run the following code block to start the containers:
 
 ```bash
 docker compose -f examples/walkthrough/docker-compose.yml \
@@ -42,8 +54,8 @@ docker compose -f examples/walkthrough/docker-compose.yml \
   build archiver
 ```
 
-Run the following cell to bootstrap Lakekeeper, create the `wh` warehouse
-backed by SeaweedFS, and seed the `public` namespace. The cell makes one
+Run the following code block to bootstrap Lakekeeper, create the `wh` warehouse
+backed by SeaweedFS, and seed the `public` namespace. The code block makes one
 attempt, so run it again if the warehouse request fails:
 
 ```bash
@@ -87,7 +99,8 @@ else
 fi
 ```
 
-Then click the triangle beside each cell that follows, in order.
+Then click the triangle beside each code block that follows, in order, starting
+with the first step, [Preparing the Database](#preparing-the-database).
 
 ## Running the Walkthrough Manually
 
@@ -161,13 +174,16 @@ fi
 ```
 
 If port 5432, 8181, or 8333 is already in use on your host, see
-[Changing the Demo Ports](exploring_coldfront/index.md#changing-the-demo-ports).
+[Changing Port Assignments](exploring_coldfront/index.md#changing-port-assignments).
+
+When the stack is running, continue with the first step,
+[Preparing the Database](#preparing-the-database).
 
 ## Preparing the Database
 
-This demo needs the `pg_duckdb` and `coldfront` extensions and the object store
-credential. If you ran the tiered demo on this stack, both are already in
-place, and running these steps again changes nothing.
+This walkthrough needs the `pg_duckdb` and `coldfront` extensions and the
+object store credential. If you ran the tiered walkthrough on this stack, both
+are already in place, and running these steps again changes nothing.
 
 Run the following SQL to create both extensions:
 
@@ -184,7 +200,7 @@ SELECT coldfront.set_storage_secret(
 );
 ```
 
-The [tiered demo](walkthrough_tiered.md#enabling-the-extensions) describes
+The [tiered walkthrough](walkthrough_tiered.md#enabling-the-extensions) describes
 what each extension does and how to use a real object store instead.
 
 ## Creating an Iceberg-Only Table
@@ -261,7 +277,7 @@ SELECT duckdb.raw_query('CREATE SCHEMA IF NOT EXISTS ice.lake');
 
 The second code block creates the `ice.lake.orders` table and inserts two
 rows. The `meta` column is a `VARCHAR` that holds JSON, which matters when you
-restore its type later in this demo:
+restore its type later in this walkthrough:
 
 ```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT coldfront.ensure_attached();
@@ -359,10 +375,10 @@ table.
 
 ## When You Finish
 
-When you finish the demo, use the following command to stop the stack and
-remove its data. The tiered, decoupled, and partitioner demos share this stack
-and its data volumes, so removing the data means the next demo you run starts
-fresh:
+When you finish the walkthrough, use the following command to stop the stack
+and remove its data. The tiered, decoupled, and partitioner walkthroughs share
+this stack and its data volumes, so removing the data means the next
+walkthrough you run starts fresh:
 
 ```bash
 docker compose \
@@ -377,8 +393,8 @@ for a later session.
 
 To go further with ColdFront, consult the following guides:
 
-- The [Distributed Demo](walkthrough_distributed.md) points two PostgreSQL
-  nodes at one shared lake.
+- The [Exploring Distributed Mode](walkthrough_distributed.md) walkthrough points
+  two PostgreSQL nodes at one shared lake.
 - The [Using ColdFront](using_coldfront/index.md) guide compares the tiered,
   decoupled, and standalone partitioned modes, and covers dropping Iceberg
   tables and the partition management CLI.

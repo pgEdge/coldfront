@@ -18,11 +18,11 @@ You can run the walkthrough in three ways:
 - on the command line of your own system, where the interactive guide runs
   each step for you and shows its output; see
   [Running the Interactive Walkthrough on the Command Line](#running-the-interactive-walkthrough-on-the-command-line).
-- in a GitHub Codespace, where each demo page opens as a notebook and you run
-  each code block with a click; see
+- in a GitHub Codespace, where each walkthrough page opens as a notebook and
+  you run each code block with a click; see
   [Running the Walkthrough in a Codespace](#running-the-walkthrough-in-a-codespace).
-- manually on your own system, reviewing each demo page and pasting each code
-  block into a terminal or a psql session; see
+- manually on your own system, reviewing each walkthrough page and pasting each
+  code block into a terminal or a psql session; see
   [Running the Walkthrough Manually](#running-the-walkthrough-manually).
 
 The walkthroughs include detailed demonstrations of each of the following
@@ -105,21 +105,22 @@ continue; choose `1) Interactive Guide` to start the guide:
 ![The installer's prerequisite check and its prompt to start the interactive guide or exit](../img/walkthrough_installer.png)
 
 The guide builds the Docker images on first run, brings up the stack, and
-presents the four demos as a menu - tiered, decoupled, partitioner, and
-distributed - plus options to reset the demo tables or tear the stack down:
+presents the four walkthroughs as a menu - tiered, decoupled, partitioner, and
+distributed - plus options to reset the walkthrough tables or tear the stack
+down:
 
-![The interactive guide's menu of demos after the stack is ready](../img/walkthrough_guide_menu.png)
+![The interactive guide's menu of walkthroughs after the stack is ready](../img/walkthrough_guide_menu.png)
 
-The guide prints each demo command and query before execution. To have the
-guide type each one a character at a time, as in a recording, set
+The guide prints each walkthrough command and query before execution. To have
+the guide type each one a character at a time, as in a recording, set
 `WALKTHROUGH_TYPE_DELAY` to the delay in seconds between characters (for
 example, `0.03`). The default of `0` prints each command at once.
 
-The `R) Reset` option drops the tables every demo created, in PostgreSQL and in
-the Iceberg catalog, and keeps the stack running. If the two-node cluster from
-the distributed demo is up, Reset first removes the cluster and its data
-volumes, including any data that you added, and then brings back the
-single-node stack.
+The `R) Reset` option drops the tables every walkthrough created, in PostgreSQL
+and in the Iceberg catalog, and keeps the stack running. If the two-node
+cluster from the distributed walkthrough is up, Reset first removes the cluster
+and its data volumes, including any data that you added, and then brings back
+the single-node stack.
 
 <div class="admonition hint">
 <p class="admonition-title">Hint</p>
@@ -151,10 +152,10 @@ Exploring ColdFront page:
 
 ![The Exploring ColdFront page open as a notebook in a Codespace](../img/codespace_exploring_page.png)
 
-Select a demo to continue; for example, the Exploring Tiered Storage link opens
-the tiered demo:
+Select a walkthrough to continue; for example, the Exploring Tiered Storage
+link opens the tiered walkthrough:
 
-![The tiered demo open as a notebook in a Codespace](../img/codespace_tiered_page.png)
+![The tiered walkthrough open as a notebook in a Codespace](../img/codespace_tiered_page.png)
 
 At the top of each walkthrough, a list of steps describes the actions that the
 walkthrough performs.
@@ -167,14 +168,14 @@ output appears below the code block:
 
 ![A finished cell in a Codespace, with its run triangle, check mark, and output](../img/codespace_run_cell.png)
 
-The distributed demo is the exception. Its page shows how to run the demo with
-the interactive guide from a terminal in the Codespace.
+The distributed walkthrough is the exception. Its page shows how to run the
+walkthrough with the interactive guide from a terminal in the Codespace.
 
 ## Running the Walkthrough Manually
 
-To run the walkthrough manually, review each demo page, pasting each code block
-into a terminal or a psql session. Your system needs the prerequisites listed
-at the start of this page.
+To run the walkthrough manually, review each walkthrough page, pasting each
+code block into a terminal or a psql session. Your system needs the
+prerequisites listed at the start of this page.
 
 To get the walkthrough files, clone the
 [ColdFront repository](https://github.com/pgEdge/ColdFront), or use the
@@ -193,23 +194,23 @@ you used the installer. Each walkthrough page includes a
 `Running the Walkthrough Manually` section that starts the stack; complete
 that section before performing each step on the page in order.
 
-## Changing the Demo Ports
+## Changing Port Assignments
 
 If port 5432, 8181, or 8333 is already in use on your host, set
 `COLDFRONT_PG_PORT`, `COLDFRONT_LK_PORT`, or `COLDFRONT_S3_PORT` before the
-`docker compose up` command on a demo page. If you remap the PG port, match it
-in the `psql` commands of the demos. If you remap the Lakekeeper port, match it
-in the `curl` commands of the demos.
+`docker compose up` command on a walkthrough page. If you remap the PG port,
+match it in the `psql` commands of the walkthroughs. If you remap the
+Lakekeeper port, match it in the `curl` commands of the walkthroughs.
 
 ## Using a Cloud Object Store
 
 The walkthrough uses SeaweedFS by default. To use a cloud store instead,
-replace the warehouse JSON in the bootstrap commands on the demo pages, the
-`set_storage_secret` call in
+replace the warehouse JSON in the bootstrap commands on the walkthrough pages,
+the `set_storage_secret` call in
 [Step 5](../walkthrough_tiered.md#pointing-coldfront-at-the-object-store)
-(Pointing ColdFront at the Object Store) of the tiered demo, and the `s3:`
-block in `examples/walkthrough/config/archiver.yaml`, which `import` writes
-into the server as the storage secret.
+(Pointing ColdFront at the Object Store) of the tiered walkthrough, and the
+`s3:` block in `examples/walkthrough/config/archiver.yaml`, which `import`
+writes into the server as the storage secret.
 
 The following table shows the `set_storage_secret` signature for each supported
 store:

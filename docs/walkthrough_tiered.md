@@ -8,7 +8,7 @@ with a plain database full of data, add ColdFront to it, and let the archiver
 move the cold majority of the rows to object storage, without migrating to a
 new database or changing a line of application SQL.
 
-The following table shows the eleven steps this demo performs:
+The following table shows the eleven steps this walkthrough performs:
 
 | Step | What you will do |
 |------|-----------------|
@@ -47,8 +47,8 @@ created before returning to the menu.
 Create the Codespace as described in
 [Running the Walkthrough in a Codespace](exploring_coldfront/index.md#running-the-walkthrough-in-a-codespace).
 The Codespace opens the Exploring ColdFront page; click Exploring Tiered
-Storage to open this page as a notebook. To run a cell, click the triangle to
-the left of the cell.
+Storage to open this page as a notebook. To run a code block, click the
+triangle to the left of the code block.
 
 <div class="admonition hint">
 <p class="admonition-title">Hint</p>
@@ -57,7 +57,7 @@ several minutes. If you start the stack again, Docker reuses the images and the
 stack starts within a minute.</p>
 </div>
 
-Run the following cell to start the containers:
+Run the following code block to start the containers:
 
 ```bash
 docker compose -f examples/walkthrough/docker-compose.yml \
@@ -66,8 +66,8 @@ docker compose -f examples/walkthrough/docker-compose.yml \
   build archiver
 ```
 
-Run the following cell to bootstrap Lakekeeper, create the `wh` warehouse
-backed by SeaweedFS, and seed the `public` namespace. The cell makes one
+Run the following code block to bootstrap Lakekeeper, create the `wh` warehouse
+backed by SeaweedFS, and seed the `public` namespace. The code block makes one
 attempt, so run it again if the warehouse request fails:
 
 ```bash
@@ -111,7 +111,8 @@ else
 fi
 ```
 
-Then click the triangle beside each cell that follows, in order.
+Then click the triangle beside each code block that follows, in order,
+starting with the first step, [Checking the Stack](#checking-the-stack).
 
 ## Running the Walkthrough Manually
 
@@ -185,7 +186,10 @@ fi
 ```
 
 If port 5432, 8181, or 8333 is already in use on your host, see
-[Changing the Demo Ports](exploring_coldfront/index.md#changing-the-demo-ports).
+[Changing Port Assignments](exploring_coldfront/index.md#changing-port-assignments).
+
+When the stack is running, continue with the first step,
+[Checking the Stack](#checking-the-stack).
 
 ## Checking the Stack
 
@@ -444,8 +448,8 @@ docker compose \
 
 The `--no-deps` flag reuses the already-running, data-loaded `db` container;
 without it, `docker compose run` re-evaluates `depends_on` and can recreate
-`db` from its config hash, restarting the database in the middle of the demo
-(the `pgdata` volume keeps the rows).
+`db` from its config hash, restarting the database in the middle of the
+walkthrough (the `pgdata` volume keeps the rows).
 
 The archiver connects inside the Compose network (service name `db`, not
 `localhost`), detaches the partitions older than 30 days from PostgreSQL,
@@ -559,13 +563,14 @@ Together, the three queries give the following hot/cold split:
   Total                     1,000,000
 ```
 
-The hot share depends on the day you run the demo. The archiver moves a monthly
-partition to cold storage once its end is at least 30 days in the past, so the
-previous month stays hot until the 31st. A run on the 1st or the 31st keeps
-about 42,000 rows hot, and a run late in any other month about 83,000. Before
-tiering, the table held one million rows, all hot, in approximately 152 MB of
-Postgres heap. After tiering, only the last month or two remains in PostgreSQL;
-over 90% of the hot storage is gone while the total row count is unchanged.
+The hot share depends on the day you run the walkthrough. The archiver moves a
+monthly partition to cold storage once its end is at least 30 days in the past,
+so the previous month stays hot until the 31st. A run on the 1st or the 31st
+keeps about 42,000 rows hot, and a run late in any other month about 83,000.
+Before tiering, the table held one million rows, all hot, in approximately
+152 MB of Postgres heap. After tiering, only the last month or two remains in
+PostgreSQL; over 90% of the hot storage is gone while the total row count is
+unchanged.
 
 ## Querying Across Tiers
 
@@ -667,9 +672,10 @@ did the write) and re-checks the row, the total row count, and the hot heap
 size. This confirms that the cold edit is durable persistent state and that the
 data did not quietly return to PostgreSQL to make the edit possible.
 
-In a Codespace, each code block opens its own connection, so you can run the
-checks below as they are. In a local shell, open a new terminal and connect
-with a fresh session first:
+In a Codespace, each code block opens its own connection, and the interactive
+guide opens a new session for each check, so neither method needs an extra
+step. When you run the walkthrough manually, open a new terminal and start a
+new psql session before you run the checks:
 
 ```bash {"ignore":"true"}
 PGOPTIONS='-c client_min_messages=warning' \
@@ -735,10 +741,10 @@ corrected in place, no rehydration, no separate system.
 
 ## When You Finish
 
-When you finish the demo, use the following command to stop the stack and
-remove its data. The tiered, decoupled, and partitioner demos share this stack
-and its data volumes, so removing the data means the next demo you run starts
-fresh:
+When you finish the walkthrough, use the following command to stop the stack
+and remove its data. The tiered, decoupled, and partitioner walkthroughs share
+this stack and its data volumes, so removing the data means the next
+walkthrough you run starts fresh:
 
 ```bash
 docker compose \
@@ -753,8 +759,9 @@ for a later session.
 
 To go further with ColdFront, consult the following guides:
 
-- The [Decoupled Mode Demo](walkthrough_decoupled.md) stores a table in Iceberg
-  from the first row and adopts a table that another engine wrote.
+- The [Exploring Decoupled Mode](walkthrough_decoupled.md) walkthrough stores a
+  table in Iceberg from the first row and adopts a table that another engine
+  wrote.
 - The [Configuring your Object Store](object_store.md)
   guide takes you from an empty bucket to a working cold tier on AWS S3.
 - The [Architecture](architecture_guides/index.md) overview explains the shared mechanics
