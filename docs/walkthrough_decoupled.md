@@ -192,8 +192,11 @@ output shows.
 ### Preparing the Database
 
 This walkthrough requires the `pg_duckdb` and `coldfront` extensions and the
-object store credential. If you ran the tiered walkthrough on this stack, both
-are already in place, and running these steps again changes nothing.
+object store credential. If you ran the tiered walkthrough on this stack with
+the local SeaweedFS store, both are already in place, and running these steps
+again changes nothing. If you configured a cloud object store instead, skip
+the `set_storage_secret` call, because the call replaces the stored credential
+with the SeaweedFS credential.
 
 Run the following SQL to create both extensions:
 

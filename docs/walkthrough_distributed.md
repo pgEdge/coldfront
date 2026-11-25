@@ -88,19 +88,28 @@ docker compose -f examples/walkthrough/docker-compose.mesh.yml up -d --build
 
 If port 5442, 5443, 8191, or 8343 is already in use on your host, set
 `COLDFRONT_MESH_PG1_PORT`, `COLDFRONT_MESH_PG2_PORT`, `COLDFRONT_MESH_LK_PORT`,
-or `COLDFRONT_MESH_S3_PORT` before `up`.
+or `COLDFRONT_MESH_S3_PORT` before `up`. The shell commands on this page read
+the same variables, so set them in the terminal where you run those commands.
+When you open a psql session on a node, connect to the port that you set for
+that node.
 
-Next, use the following commands to bootstrap the mesh's own Lakekeeper on
-port 8191, create the `wh` warehouse, and seed the `public` namespace:
+Next, use the following commands to wait for the mesh's own Lakekeeper,
+bootstrap it, create the `wh` warehouse, and seed the `public` namespace:
 
 ```bash {"ignore":"true"}
+# Use the mesh Lakekeeper port (8191 unless you set COLDFRONT_MESH_LK_PORT)
+LK_PORT=${COLDFRONT_MESH_LK_PORT:-8191}
+
+# Wait until Lakekeeper is ready to accept requests
+until curl -sf "http://localhost:${LK_PORT}/health" >/dev/null; do sleep 2; done
+
 # Bootstrap Lakekeeper (one-time per fresh stack)
-curl -sf -X POST http://localhost:8191/management/v1/bootstrap \
+curl -sf -X POST http://localhost:${LK_PORT}/management/v1/bootstrap \
   -H 'Content-Type: application/json' \
   -d '{"accept-terms-of-use":true}'
 
 # Create the warehouse and save its ID (retried by guide.sh until 200)
-WID=$(curl -sf -X POST http://localhost:8191/management/v1/warehouse \
+WID=$(curl -sf -X POST http://localhost:${LK_PORT}/management/v1/warehouse \
   -H 'Content-Type: application/json' \
   -d '{
     "warehouse-name": "wh",
@@ -128,7 +137,7 @@ if [ -z "$WID" ]; then
   echo "No warehouse ID - check that the warehouse create succeeded."
 else
   curl -sf -X POST \
-    "http://localhost:8191/catalog/v1/${WID}/namespaces" \
+    "http://localhost:${LK_PORT}/catalog/v1/${WID}/namespaces" \
     -H 'Content-Type: application/json' \
     -d '{"namespace":["public"]}'
 fi
@@ -287,9 +296,9 @@ parallel, as the interactive guide does:
 
 ```bash {"ignore":"true"}
 for i in 1 2 3 4 5; do
-  psql "postgresql://coldfront@localhost:5442/coldfront" -c \
+  psql "postgresql://coldfront@localhost:${COLDFRONT_MESH_PG1_PORT:-5442}/coldfront" -c \
     "INSERT INTO events_lake VALUES (10$i, now(), 'storm', '{\"n\":\"db1\"}');" &
-  psql "postgresql://coldfront@localhost:5443/coldfront" -c \
+  psql "postgresql://coldfront@localhost:${COLDFRONT_MESH_PG2_PORT:-5443}/coldfront" -c \
     "INSERT INTO events_lake VALUES (20$i, now(), 'storm', '{\"n\":\"db2\"}');" &
 done
 wait
@@ -300,18 +309,19 @@ serialize them. A node-local advisory lock keeps one cold writer per node in
 the bakery at a time, and the cross-node Ricart-Agrawala claim protocol orders
 writers across nodes. The durable record is the lake's own; every commit adds
 one snapshot to the table's metadata, in a single chain of sequence numbers.
-Resolve the table's metadata location from the mesh stack's Lakekeeper (port
-8191), as in the tiered walkthrough, and list the history from either node:
+Resolve the table's metadata location from the mesh stack's Lakekeeper, as in
+the tiered walkthrough, and list the history from either node:
 
 ```bash {"ignore":"true"}
-WH_ID=$(curl -s http://localhost:8191/management/v1/warehouse \
+LK_PORT=${COLDFRONT_MESH_LK_PORT:-8191}
+WH_ID=$(curl -s "http://localhost:${LK_PORT}/management/v1/warehouse" \
   | grep -o '"warehouse-id":"[^"]*"' | head -1 | cut -d'"' -f4)
 META_LOC=$(curl -s \
-  "http://localhost:8191/catalog/v1/${WH_ID}/namespaces/public/tables/events_lake" \
+  "http://localhost:${LK_PORT}/catalog/v1/${WH_ID}/namespaces/public/tables/events_lake" \
   -H 'accept: application/json' \
   | grep -o '"metadata-location":"[^"]*"' | head -1 | cut -d'"' -f4)
 
-psql "postgresql://coldfront@localhost:5443/coldfront" -P pager=off <<SQL
+psql "postgresql://coldfront@localhost:${COLDFRONT_MESH_PG2_PORT:-5443}/coldfront" -P pager=off <<SQL
 SELECT sequence_number, snapshot_id, timestamp_ms
 FROM iceberg_snapshots('${META_LOC}')
 ORDER BY sequence_number;
