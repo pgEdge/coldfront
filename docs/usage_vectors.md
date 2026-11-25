@@ -19,7 +19,8 @@ CREATE TABLE chunks (
 ) PARTITION BY RANGE (ts);
 ```
 
-Declare a decoupled table in one call:
+Declare a decoupled table in one call, after creating its namespace as
+[Using ColdFront in Decoupled Mode](usage_decoupled.md) describes:
 
 ```sql
 SELECT coldfront.create_iceberg_table('public', 'chunks', '[

@@ -456,15 +456,14 @@ A bare-metal installation runs Lakekeeper and an object store on the host.
     sudo systemctl enable --now lakekeeper
     ```
 
-6. Bootstrap Lakekeeper, create the `wh` warehouse on the SeaweedFS store, and
-    create the `public` namespace; decoupled mode requires this namespace. The
-    warehouse name must match `coldfront.warehouse`:
+6. Bootstrap Lakekeeper and create the `wh` warehouse on the SeaweedFS store.
+    The warehouse name must match `coldfront.warehouse`:
 
     ```bash
     curl -X POST http://localhost:8181/management/v1/bootstrap \
       -H "Content-Type: application/json" -d '{"accept-terms-of-use":true}'
 
-    WID=$(curl -s -X POST http://localhost:8181/management/v1/warehouse \
+    curl -s -X POST http://localhost:8181/management/v1/warehouse \
       -H "Content-Type: application/json" -d '{
         "warehouse-name": "wh",
         "storage-profile": {
@@ -477,22 +476,8 @@ A bare-metal installation runs Lakekeeper and an object store on the host.
           "type": "s3", "credential-type": "access-key",
           "aws-access-key-id": "admin", "aws-secret-access-key": "adminsecret"
         }
-      }' \
-      | grep -oE '"warehouse-id":"[^"]+"' | cut -d'"' -f4)
-
-    if [ -z "$WID" ]; then
-      echo "No warehouse ID - check that the warehouse create succeeded."
-    else
-      curl -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
-        -H "Content-Type: application/json" -d '{"namespace":["public"]}'
-    fi
+      }'
     ```
-
-    If you run these commands again after the warehouse exists, the create
-    request fails and `WID` is empty. Set `WID` to the `warehouse-id` of the
-    `wh` warehouse in the output of
-    `curl -s http://localhost:8181/management/v1/warehouse`, then rerun the
-    namespace request.
 
     If you're using a different type of object store, change the
     `storage-profile` and `storage-credential` as shown in the store's section
@@ -521,11 +506,10 @@ to evaluate ColdFront without a cloud account.
       -H "Content-Type: application/json" -d '{"accept-terms-of-use":true}'
     ```
 
-2. Create the `wh` warehouse on the SeaweedFS store, and save its ID for the
-    next step:
+2. Create the `wh` warehouse on the SeaweedFS store:
 
     ```bash
-    WID=$(curl -s -X POST http://localhost:8181/management/v1/warehouse \
+    curl -s -X POST http://localhost:8181/management/v1/warehouse \
       -H "Content-Type: application/json" -d '{
         "warehouse-name": "wh",
         "storage-profile": {
@@ -538,29 +522,10 @@ to evaluate ColdFront without a cloud account.
           "type": "s3", "credential-type": "access-key",
           "aws-access-key-id": "admin", "aws-secret-access-key": "adminsecret"
         }
-      }' \
-      | grep -oE '"warehouse-id":"[^"]+"' | cut -d'"' -f4)
+      }'
     ```
 
-3. Create the `public` namespace in the warehouse; decoupled mode requires
-    this namespace:
-
-    ```bash
-    if [ -z "$WID" ]; then
-      echo "No warehouse ID - check that the warehouse create succeeded."
-    else
-      curl -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
-        -H "Content-Type: application/json" -d '{"namespace":["public"]}'
-    fi
-    ```
-
-    If you run these commands again after the warehouse exists, the create
-    request fails and `WID` is empty. Set `WID` to the `warehouse-id` of the
-    `wh` warehouse in the output of
-    `curl -s http://localhost:8181/management/v1/warehouse`, then rerun the
-    namespace request.
-
-4. Store the SeaweedFS credential in each database that uses ColdFront:
+3. Store the SeaweedFS credential in each database that uses ColdFront:
 
     ```sql
     SELECT coldfront.set_storage_secret('admin', 'adminsecret',

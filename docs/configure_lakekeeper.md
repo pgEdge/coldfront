@@ -169,9 +169,8 @@ you bootstrap. For any other store, see
 ## Bootstrapping Lakekeeper
 
 Use the following steps to bootstrap Lakekeeper and, for the SeaweedFS store,
-create the warehouse and the Iceberg namespace. For any other store, perform
-step 1 only, then create the warehouse, the namespace, and the credential as
-described in your backend's section of
+create the warehouse. For any other store, perform step 1 only, then create
+the warehouse and the credential as described in your backend's section of
 [Configuring your Object Store](object_store.md):
 
 1. Bootstrap Lakekeeper:
@@ -205,26 +204,14 @@ described in your backend's section of
       | grep -oE '"warehouse-id":"[^"]+"' | cut -d'"' -f4)
     ```
 
-3. For the SeaweedFS store, create the `public` namespace in the new
-    warehouse. Decoupled mode needs the namespace before you create a table;
-    in tiered mode, the archiver creates it itself.
-
-    ```bash
-    if [ -z "$WID" ]; then
-      echo "No warehouse ID - check that the warehouse create succeeded."
-    else
-      curl -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
-        -H "Content-Type: application/json" -d '{"namespace":["public"]}'
-    fi
-    ```
-
 !!! hint
 
-    If you run these commands again after the warehouse exists, the create
-    request fails and `WID` is empty. Set `WID` to the `warehouse-id` of the
-    `wh` warehouse in the output of
-    `curl -s http://localhost:8181/management/v1/warehouse`, then rerun the
-    namespace request.
+    The verification steps in
+    [Configuring your Object Store](object_store.md#verifying-the-configuration)
+    use `WID`. If you run these commands again after the warehouse exists, the
+    create request fails and `WID` is empty. Set `WID` to the `warehouse-id`
+    of the `wh` warehouse in the output of
+    `curl -s http://localhost:8181/management/v1/warehouse`.
 
 ## Configuring PostgreSQL for Lakekeeper
 

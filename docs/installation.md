@@ -461,16 +461,15 @@ SeaweedFS S3 emulator that the stack includes under the `local-store` profile:
     until docker compose ps lakekeeper | grep -q '(healthy)'; do sleep 2; done
     ```
 
-3. Bootstrap Lakekeeper, create the `wh` warehouse against the SeaweedFS
+3. Bootstrap Lakekeeper and create the `wh` warehouse against the SeaweedFS
    credentials in
-   [`docker/seaweedfs-s3.json`](https://github.com/pgEdge/ColdFront/blob/main/docker/seaweedfs-s3.json),
-   and seed the `public` namespace:
+   [`docker/seaweedfs-s3.json`](https://github.com/pgEdge/ColdFront/blob/main/docker/seaweedfs-s3.json):
 
     ```bash
     curl -sf -X POST http://localhost:8181/management/v1/bootstrap \
       -H 'Content-Type: application/json' -d '{"accept-terms-of-use":true}'
 
-    WID=$(curl -s -X POST http://localhost:8181/management/v1/warehouse \
+    curl -s -X POST http://localhost:8181/management/v1/warehouse \
       -H 'Content-Type: application/json' -d '{
         "warehouse-name":"wh",
         "storage-profile":{"type":"s3","bucket":"iceberg","region":"us-east-1",
@@ -478,31 +477,19 @@ SeaweedFS S3 emulator that the stack includes under the `local-store` profile:
           "flavor":"s3-compat","sts-enabled":false,"remote-signing-enabled":false},
         "storage-credential":{"type":"s3","credential-type":"access-key",
           "aws-access-key-id":"admin","aws-secret-access-key":"adminsecret"}
-      }' \
-      | grep -oE '"warehouse-id":"[^"]+"' | cut -d'"' -f4)
-
-    if [ -z "$WID" ]; then
-      echo "No warehouse ID - check that the warehouse create succeeded."
-    else
-      curl -s -X POST "http://localhost:8181/catalog/v1/$WID/namespaces" \
-        -H 'Content-Type: application/json' -d '{"namespace":["public"]}'
-    fi
+      }'
     ```
 
-    If you run these commands again after the warehouse exists, the create
-    request fails and `WID` is empty. Set `WID` to the `warehouse-id` of the
-    `wh` warehouse in the output of `curl -s
-    http://localhost:8181/management/v1/warehouse`, then rerun the namespace
-    request.
-
-4. Create the extensions, set the cold-store secret, create a decoupled table,
-   insert a row, and read it back through Iceberg:
+4. Create the extensions, set the cold-store secret, create the `public`
+   namespace and a decoupled table, insert a row, and read it back through
+   Iceberg:
 
     ```bash
     psql -h localhost -U coldfront -d coldfront <<'SQL'
     CREATE EXTENSION IF NOT EXISTS pg_duckdb;
     CREATE EXTENSION IF NOT EXISTS coldfront;
     SELECT coldfront.set_storage_secret('admin', 'adminsecret', 'seaweedfs:8333');
+    SELECT coldfront.create_iceberg_namespace('public');
     SELECT coldfront.create_iceberg_table('public', 'events',
       '[{"name":"id","type":"bigint"},{"name":"ts","type":"timestamptz"},{"name":"note","type":"text"}]'::jsonb,
       '{month(ts)}');
@@ -522,8 +509,8 @@ the `local-store` profile and complete the following steps:
    requests, as
    [Bootstrapping Lakekeeper](configure_lakekeeper.md#bootstrapping-lakekeeper)
    describes.
-2. Create a Lakekeeper warehouse that points at your bucket, and an Iceberg
-   namespace in that warehouse, as the same section describes.
+2. Create a Lakekeeper warehouse that points at your bucket, as the same
+   section describes.
 3. Create the `pg_duckdb` and `coldfront` extensions in each database that
    uses ColdFront, as
    [Configuring PostgreSQL for Lakekeeper](configure_lakekeeper.md#configuring-postgresql-for-lakekeeper)
