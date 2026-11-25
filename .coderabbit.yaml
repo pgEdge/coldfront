@@ -3,8 +3,6 @@ language: "en-US"
 reviews:
   auto_review:
     enabled: true
-    incremental: true
-  drafts: false
   high_level_summary: false
   poem: false
   sequence_diagrams: false
