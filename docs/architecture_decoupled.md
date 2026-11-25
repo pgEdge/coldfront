@@ -187,6 +187,8 @@ registry row that makes the C hook to handle every DML on the view. After that,
 applications use **plain PG syntax** against the named relation:
 
 ```sql
+SELECT coldfront.create_iceberg_namespace('public');
+
 SELECT coldfront.create_iceberg_table(
     'public', 'events',
     '[
