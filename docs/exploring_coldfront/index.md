@@ -3,9 +3,23 @@ cwd: ../../
 ---
 # Exploring ColdFront
 
-Each of the following walkthroughs contains the steps to deploy the stack,
-demonstrate the benefits of each deployment architecture, and clean up the
-environment afterwards:
+Each walkthrough contains the steps to deploy the stack, demonstrate the
+benefits of its deployment architecture, and clean up the environment
+afterwards.
+
+You can run the walkthrough in three ways:
+
+- in a GitHub Codespace, where each demo page opens as a notebook and you run
+  each code block with a click; see
+  [Running the Walkthrough in a Codespace](#running-the-walkthrough-in-a-codespace).
+- on the command line of your own system, where the interactive guide runs
+  each step for you and shows its output; see
+  [Running the Walkthrough on the Command Line](#running-the-walkthrough-on-the-command-line).
+- manually on your own system, following each demo page and pasting its
+  commands into a terminal and a psql session; see
+  [Running the Walkthrough Manually](#running-the-walkthrough-manually).
+
+The walkthroughs include:
 
 - [Exploring Tiered Storage](../walkthrough_tiered.md) demonstrates keeping
   recent data in PostgreSQL and archiving older data to cold Iceberg.
@@ -34,20 +48,6 @@ change the `pgdata` volume path in `docker-compose.yml` to match.
 > **Beta software** - ColdFront is beta software under active development. Do
 > not use it in production. Interfaces, on-disk formats, and behavior may
 > change without notice, and data loss is possible.
-
-## Choosing How to Run the Walkthrough
-
-You can run the walkthrough in three ways:
-
-- in a GitHub Codespace, where each demo page opens as a notebook and you run
-  each code block with a click; see
-  [Running the Walkthrough in a Codespace](#running-the-walkthrough-in-a-codespace).
-- on the command line of your own system, where the interactive guide runs
-  each step for you and shows its output; see
-  [Running the Walkthrough on the Command Line](#running-the-walkthrough-on-the-command-line).
-- manually on your own system, following each demo page and pasting its
-  commands into a terminal and a psql session; see
-  [Running the Walkthrough Manually](#running-the-walkthrough-manually).
 
 ## Running the Walkthrough in a Codespace
 
