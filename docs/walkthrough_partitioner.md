@@ -3,10 +3,10 @@ cwd: ../
 ---
 # Exploring the Standalone Partitioner
 
-The partitioner binary manages PostgreSQL range partitions without any cold
-tier. If all you need is automated partition maintenance on stock PostgreSQL,
-the partitioner is the whole product - no Iceberg, no DuckDB, no archiver cold
-path.
+The standalone partitioner manages PostgreSQL range partitions on stock
+PostgreSQL, with no cold tier. When you need only automated partition
+maintenance, the partitioner runs on its own, without Iceberg, DuckDB, or the
+archiver's cold path.
 
 The following table shows the three steps this walkthrough performs:
 
@@ -92,9 +92,18 @@ If port 5432, 8181, or 8333 is already in use on your host, see
 When the stack is running, continue with the first step,
 [Creating the Demo Table](#creating-the-demo-table).
 
-## Creating the Demo Table
+## Performing the Walkthrough Steps
 
-Create a partitioned table with no existing partitions:
+Every method of running the walkthrough performs the following steps in
+order. If you are running the walkthrough manually, paste each code block into
+a terminal or a psql session. If you are using the interactive guide or a
+Codespace, the following sections explain what each step does and what its
+output shows.
+
+### Creating the Demo Table
+
+Use the following statements to create a range-partitioned table that has no
+partitions yet. Until a partition exists, an `INSERT` into the table fails:
 
 ```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SET search_path = public;
@@ -107,11 +116,12 @@ CREATE TABLE part_demo (
 ) PARTITION BY RANGE (ts);
 ```
 
-## Registering and Reconciling
+### Registering and Reconciling
 
-Register the table with the partitioner (monthly period, 12-month retention)
-and run a reconcile pass. Both commands run inside the Compose network against
-service name `db`:
+Use the following commands to register the table with the partitioner and run
+one reconcile pass. The registration sets a monthly period and a 12-month
+retention. Both commands run in a container on the Compose network and connect
+to the `db` service:
 
 ```bash
 # Register the table.
@@ -129,21 +139,26 @@ docker compose \
   run --rm --no-deps --entrypoint partitioner archiver
 ```
 
-The partitioner needs no file. It connects from the `PG*` environment that the
-Compose service sets, and reads its tables from `coldfront.partition_config`.
+The partitioner does not need a configuration file. The partitioner reads its
+connection settings from the `PG*` environment variables that the Compose
+service sets, and reads its list of tables from `coldfront.partition_config`.
 
-## Verifying the Partitions
+### Verifying the Partitions
 
-Each reconcile pass premakes the next three monthly partitions ahead of now
-(three is the `register --premake` default) and ensures a partition covering
-today always exists. Each pass also drops any partition older than the
-retention period:
+Each reconcile pass ensures that a partition covering today exists and creates
+the next three monthly partitions; three is the default for
+`register --premake`. Each pass also drops any partition older than the
+retention period. Use the following query to count the partitions that the
+pass created:
 
 ```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT count(*) AS partitions
 FROM pg_inherits
 WHERE inhparent = 'part_demo'::regclass;
 ```
+
+The query returns 4, one partition for the current month and one for each of
+the next three months.
 
 A table registered with `--strategy detach` keeps its expired partitions as
 standalone tables instead of dropping them. The

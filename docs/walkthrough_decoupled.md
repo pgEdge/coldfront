@@ -181,9 +181,17 @@ If port 5432, 8181, or 8333 is already in use on your host, see
 When the stack is running, continue with the first step,
 [Preparing the Database](#preparing-the-database).
 
-## Preparing the Database
+## Performing the Walkthrough Steps
 
-This walkthrough needs the `pg_duckdb` and `coldfront` extensions and the
+Every method of running the walkthrough performs the following steps in
+order. If you are running the walkthrough manually, paste each code block into
+a terminal or a psql session. If you are using the interactive guide or a
+Codespace, the following sections explain what each step does and what its
+output shows.
+
+### Preparing the Database
+
+This walkthrough requires the `pg_duckdb` and `coldfront` extensions and the
 object store credential. If you ran the tiered walkthrough on this stack, both
 are already in place, and running these steps again changes nothing.
 
@@ -205,7 +213,7 @@ SELECT coldfront.set_storage_secret(
 The [tiered walkthrough](walkthrough_tiered.md#enabling-the-extensions) describes
 what each extension does and how to use a real object store instead.
 
-## Creating an Iceberg-Only Table
+### Creating an Iceberg-Only Table
 
 One SQL call provisions the Iceberg table and the PostgreSQL view. The `public`
 namespace was seeded during setup, and the call wraps both steps in a single
@@ -227,7 +235,7 @@ SELECT coldfront.create_iceberg_table(
 After the call returns, `events_lake` is a view; every row lives in Iceberg on
 S3.
 
-## Reading and Writing the Lake Table
+### Reading and Writing the Lake Table
 
 `events_lake` behaves like any PostgreSQL table:
 
@@ -251,14 +259,14 @@ All four DML operations reach the Iceberg table transparently. The `coldfront`
 extension intercepts each statement on the view and rewrites it to the Iceberg
 path via pg_duckdb.
 
-## Adopting a Table Already in the Lake
+### Adopting a Table Already in the Lake
 
 ColdFront can also use an Iceberg table that another engine has already
 written. Instead of creating the table, ColdFront adopts it. Adoption reads
 the table's schema from the Iceberg catalog and adds the wrapper view and
 registry entry that make the table available in PostgreSQL.
 
-### Standing In for the External Writer
+#### Standing In for the External Writer
 
 In a real deployment, another engine writes this table to the lake. The next
 two code blocks stand in for that engine. They use DuckDB, through
@@ -293,7 +301,7 @@ SELECT duckdb.raw_query($$
     (2, now(), 'globex', 249.50, '{"tier":"silver"}')$$);
 ```
 
-### Adopting the Table Read-Only
+#### Adopting the Table Read-Only
 
 Adoption takes one call and no column list. The view goes in the PostgreSQL
 schema `public`; `lake` is the Iceberg namespace, and no PostgreSQL schema of
@@ -324,7 +332,7 @@ ERROR:  coldfront: "public.orders" is adopted read-only
 HINT:  Release it with coldfront.release_iceberg_table() and adopt again with p_writable => true to arm INSERT/UPDATE/DELETE.
 ```
 
-### Enabling Writes
+#### Enabling Writes
 
 Adoption binds the name once, so to enable writes, you release the table with
 `coldfront.release_iceberg_table()` and adopt it again with
@@ -344,7 +352,7 @@ DELETE FROM orders WHERE order_id = 1;
 SELECT order_id, customer, amount FROM orders ORDER BY order_id;
 ```
 
-### Restoring a Type Iceberg Cannot Record
+#### Restoring a Type Iceberg Cannot Record
 
 The `meta` column reads as text, because Iceberg stores JSON as `VARCHAR` and
 records no PostgreSQL type. `p_types` restores the column's type, and the
@@ -359,7 +367,7 @@ SELECT coldfront.adopt_iceberg_table('public', 'orders', 'lake',
 SELECT order_id, meta->>'tier' AS tier FROM orders ORDER BY order_id;
 ```
 
-### Handing the Table Back
+#### Handing the Table Back
 
 The `coldfront.release_iceberg_table()` function removes the view and the
 registry row and performs no Iceberg I/O, so the table keeps every row and

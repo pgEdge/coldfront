@@ -4,20 +4,19 @@ cwd: ../
 # Exploring Distributed Mode
 
 Distributed mode points two or more PostgreSQL nodes at the *same* lake. The
-nodes form an active-active [Spock](https://github.com/pgEdge/spock) mesh; the
-table data lives once, in Iceberg, and each node adds query and write capacity
-over that one shared copy. A write on one node is readable on the other with
-nothing copied between them, and concurrent cold writes from different nodes
-are serialized cluster-wide so they never collide.
+nodes form an active-active [Spock](https://github.com/pgEdge/spock) mesh, but
+they do not each store a copy of the table. The table data is stored once, in
+Iceberg, and each node adds query and write capacity over that single shared
+copy. Rows that one node writes are readable on the other node as soon as the
+write commits, because both nodes read the same files in the lake. When nodes
+write to the same table at the same time, ColdFront orders the writes across
+the cluster so that the writes never conflict.
 
-This walkthrough uses a different stack from the single-node walkthroughs - two
-`MESH=on` nodes (`db1`, `db2`) plus a shared Lakekeeper and object store. The
-walkthrough is not click-runnable. It needs that two-node stack and separate
-psql sessions against each node (`db1` on port 5442, `db2` on 5443), so the
-code blocks on this page are shown for reading and hand-pasting. The
-interactive guide automates the switch. The guide first removes the single-node
-stack and its volumes with `docker compose down -v`, so the data from the
-single-node walkthroughs does not survive the switch.
+This walkthrough uses its own stack, which has two `MESH=on` PostgreSQL nodes
+(`db1` and `db2`) that share one Lakekeeper catalog and one object store. Each
+step runs SQL on a specific node, so the code blocks on this page do not run in
+a Codespace notebook. Run the walkthrough with the interactive guide, or paste
+each code block into a psql session on the node that the block names.
 
 The following table shows the four steps this walkthrough performs:
 
@@ -47,14 +46,13 @@ everything.
 
 ## Running the Walkthrough in a Codespace
 
-In a Codespace, run the walkthrough with the interactive guide. Open a terminal
-in the Codespace, run the following command, and choose `4) Distributed`:
+In a Codespace, open a terminal, run the following command, and choose
+`4) Distributed`. The guide then runs the walkthrough as described in
+[Running the Interactive Walkthrough on the Command Line](#running-the-interactive-walkthrough-on-the-command-line):
 
 ```bash {"ignore":"true"}
 bash examples/walkthrough/guide.sh
 ```
-
-The sections that follow show what the guide does, so you can follow along.
 
 ## Running the Walkthrough Manually
 
@@ -69,11 +67,20 @@ Start with the first step,
 [Bringing Up the Two-Node Mesh](#bringing-up-the-two-node-mesh), which starts
 the two-node stack.
 
-## Bringing Up the Two-Node Mesh
+## Performing the Walkthrough Steps
 
-Start the mesh stack, then form the Spock mesh - create a node on each member,
-subscribe each to the other, and set up the cold-write coordination on both.
-First, start the mesh stack and build its images:
+Every method of running the walkthrough performs the following steps in
+order. If you are running the walkthrough manually, paste each code block into
+a terminal or a psql session. If you are using the interactive guide or a
+Codespace, the following sections explain what each step does and what its
+output shows.
+
+### Bringing Up the Two-Node Mesh
+
+Start the mesh stack, and then form the Spock mesh. To form the mesh, create a
+node on each member, subscribe each node to the other, and set up the
+cold-write coordination on both nodes. First, start the mesh stack and build
+its images:
 
 ```bash {"ignore":"true"}
 docker compose -f examples/walkthrough/docker-compose.mesh.yml up -d --build
@@ -83,10 +90,49 @@ If port 5442, 5443, 8191, or 8343 is already in use on your host, set
 `COLDFRONT_MESH_PG1_PORT`, `COLDFRONT_MESH_PG2_PORT`, `COLDFRONT_MESH_LK_PORT`,
 or `COLDFRONT_MESH_S3_PORT` before `up`.
 
-Next, run the `curl` block from
-[Running the Walkthrough Manually](walkthrough_tiered.md#running-the-walkthrough-manually)
-on the tiered walkthrough page, with port 8191 in place of 8181. That creates
-the `wh` warehouse and `public` namespace on the mesh's own Lakekeeper.
+Next, use the following commands to bootstrap the mesh's own Lakekeeper on
+port 8191, create the `wh` warehouse, and seed the `public` namespace:
+
+```bash {"ignore":"true"}
+# Bootstrap Lakekeeper (one-time per fresh stack)
+curl -sf -X POST http://localhost:8191/management/v1/bootstrap \
+  -H 'Content-Type: application/json' \
+  -d '{"accept-terms-of-use":true}'
+
+# Create the warehouse and save its ID (retried by guide.sh until 200)
+WID=$(curl -sf -X POST http://localhost:8191/management/v1/warehouse \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "warehouse-name": "wh",
+    "storage-profile": {
+      "type": "s3",
+      "bucket": "iceberg",
+      "region": "us-east-1",
+      "endpoint": "http://seaweedfs:8333",
+      "path-style-access": true,
+      "flavor": "s3-compat",
+      "sts-enabled": false,
+      "remote-signing-enabled": false
+    },
+    "storage-credential": {
+      "type": "s3",
+      "credential-type": "access-key",
+      "aws-access-key-id": "admin",
+      "aws-secret-access-key": "adminsecret"
+    }
+  }' \
+  | grep -oE '"warehouse-id":"[^"]+"' | cut -d'"' -f4)
+
+# Seed the public namespace
+if [ -z "$WID" ]; then
+  echo "No warehouse ID - check that the warehouse create succeeded."
+else
+  curl -sf -X POST \
+    "http://localhost:8191/catalog/v1/${WID}/namespaces" \
+    -H 'Content-Type: application/json' \
+    -d '{"namespace":["public"]}'
+fi
+```
 
 Then create the extensions and form the mesh, running each statement on the
 node its comment names:
@@ -123,24 +169,25 @@ SELECT coldfront.set_storage_secret('admin', 'adminsecret', 'seaweedfs:8333');
 
 The nodes reach each other over the Compose network (service names `db1`/`db2`,
 port 5432). The bakery replicates only small coordination metadata between
-nodes - never the table data, which stays in the lake. The `set_storage_secret`
+nodes, never the table data, which stays in the lake. The `set_storage_secret`
 call is what lets each node's DuckDB write Parquet to the shared object store;
 without it, cold writes fail to authenticate.
 
-## Seeing the Mesh
+### Seeing the Mesh
 
-Both nodes are present, each subscribed to the other:
+Use the following query to confirm that both nodes exist and that each
+subscribes to the other:
 
 ```sql {"ignore":"true"}
 SELECT node_name FROM spock.node ORDER BY node_name;   -- db1, db2
 SELECT sub_name  FROM spock.subscription;              -- one per node
 ```
 
-## Writing on One Node, Reading on the Other
+### Writing on One Node, Reading on the Other
 
-Create a lake-native table on `db1` and register it on `db2` as well (the call
-is idempotent and the registry is keyed by name, so each node ends up with an
-identical local view):
+Use the following call to create a lake-native table on `db1`, and then run the
+same call on `db2`. The call is idempotent, and the registry is keyed by table
+name, so each node ends up with an identical local view:
 
 ```sql {"ignore":"true"}
 -- On db1, then on db2 - same call:
@@ -151,7 +198,8 @@ SELECT coldfront.create_iceberg_table(
 );
 ```
 
-Write three rows on `db1`, then read them back on `db2`:
+Use the following statements to write three rows on `db1` and read them back on
+`db2`:
 
 ```sql {"ignore":"true"}
 -- db1:
@@ -166,17 +214,18 @@ SELECT relkind, pg_size_pretty(pg_relation_size('events_lake')) AS pg_bytes
 FROM pg_class WHERE relname = 'events_lake';   -- v, 0 bytes
 ```
 
-`db2` returns every row `db1` wrote and stores zero bytes for the table - it
-reads straight from the shared lake. That is the point of distributed mode; you
-add a node for compute over one copy of the data, with no storage to replicate.
+`db2` returns every row that `db1` wrote and stores zero bytes for the table,
+because `db2` reads the rows directly from the shared lake. In distributed
+mode, each node that you add contributes compute over one copy of the data,
+with no storage to replicate.
 
-## Serializing Concurrent Writes (The Bakery)
+### Serializing Concurrent Writes (The Bakery)
 
-Two nodes committing the same Iceberg table at once would normally collide -
-the catalog rejects the second commit with a `409 Conflict` and the application
-has to retry. ColdFront's bakery protocol prevents that. Each cold write takes
-a globally-ordered ticket (replicated via Spock, verified in the TLA+ model
-under `docs/formal/`) and waits its turn.
+When two nodes commit to the same Iceberg table at the same time, the catalog
+normally rejects the second commit with a `409 Conflict`, and the application
+has to retry. ColdFront's bakery protocol prevents the conflict. Each cold
+write takes a globally ordered ticket, which Spock replicates to every node,
+and waits its turn. The TLA+ model under `docs/formal/` verifies the protocol.
 
 An `INSERT` adds new data files without changing existing rows. The `INSERT`
 uploads its Parquet files first and takes a claim on the table only for the
@@ -194,10 +243,11 @@ UPDATE events_lake SET status = 'held' WHERE id = 3;
 -- leave the transaction open
 ```
 
-In a second session, the claim is on `db1`, keyed by a ticket that also names
-the issuing node (a Snowflake id), and it is already on `db2`. The claim is
-written over its own connection and committed at once, so it replicates while
-the transaction that took it is still open:
+Open a second session, and run the following query on `db1` and then on `db2`.
+Both nodes return the same claim row. The ticket is a Snowflake ID that also
+names the issuing node. ColdFront writes the claim over a separate connection
+and commits it at once, so the claim replicates while the transaction that
+took it is still open:
 
 ```sql {"ignore":"true"}
 -- On db1, then on db2 - the same row on both:
@@ -228,14 +278,21 @@ SELECT (SELECT count(*) FROM coldfront.claims)       AS claims,
 ```
 
 Tickets are never reused, so an empty ledger is the steady state between
-writes. Now fire many writers at once - several on each node, on both nodes,
-all into the same table:
+writes.
 
-```sql {"ignore":"true"}
--- concurrently, on BOTH nodes at the same instant:
-INSERT INTO events_lake VALUES (101, now(), 'storm', '{"n":"db1"}');   -- db1
-INSERT INTO events_lake VALUES (201, now(), 'storm', '{"n":"db2"}');   -- db2
--- ...5 concurrent on db1 (101-105) and 5 on db2 (201-205)
+To see the protocol order concurrent writes, run several `INSERT` statements
+at the same time on both nodes, for example five on `db1` (IDs 101 to 105) and
+five on `db2` (IDs 201 to 205). The following loop starts the ten writes in
+parallel, as the interactive guide does:
+
+```bash {"ignore":"true"}
+for i in 1 2 3 4 5; do
+  psql "postgresql://coldfront@localhost:5442/coldfront" -c \
+    "INSERT INTO events_lake VALUES (10$i, now(), 'storm', '{\"n\":\"db1\"}');" &
+  psql "postgresql://coldfront@localhost:5443/coldfront" -c \
+    "INSERT INTO events_lake VALUES (20$i, now(), 'storm', '{\"n\":\"db2\"}');" &
+done
+wait
 ```
 
 Every write lands, with no conflicts and no application-level retry. Two layers

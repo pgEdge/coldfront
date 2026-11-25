@@ -191,7 +191,15 @@ If port 5432, 8181, or 8333 is already in use on your host, see
 When the stack is running, continue with the first step,
 [Checking the Stack](#checking-the-stack).
 
-## Checking the Stack
+## Performing the Walkthrough Steps
+
+Every method of running the walkthrough performs the following steps in
+order. If you are running the walkthrough manually, paste each code block into
+a terminal or a psql session. If you are using the interactive guide or a
+Codespace, the following sections explain what each step does and what its
+output shows.
+
+### Checking the Stack
 
 The stack runs PostgreSQL, the Lakekeeper catalog, and the SeaweedFS object
 store; the catalog and the object store form the cold-storage side. The
@@ -210,7 +218,7 @@ docker compose -f examples/walkthrough/docker-compose.yml ps
 S3-compatible store.</p>
 </div>
 
-## Creating a Table and Loading Data
+### Creating a Table and Loading Data
 
 In this step, you create an ordinary range-partitioned PostgreSQL table and
 fill the table with months of sample data. The table stands in for a table in
@@ -280,10 +288,10 @@ The query returns the row count:
  1000000
 ```
 
-Months of data now live in an ordinary PostgreSQL table - no ColdFront involved
-yet.
+Months of data now live in an ordinary PostgreSQL table, with no ColdFront
+involved yet.
 
-## Seeing the Problem
+### Seeing the Problem
 
 This step measures how much hot Postgres storage that data occupies and
 confirms that none of it is in lower-cost storage yet. This is the baseline you
@@ -314,10 +322,10 @@ The query returns:
  152 MB
 ```
 
-Every row - all one million - occupies hot, expensive primary storage, and the
-table only grows. Remember this figure for comparison after tiering.
+All one million rows occupy hot, expensive primary storage, and the table only
+grows. Remember this figure for comparison after tiering.
 
-## Enabling the Extensions
+### Enabling the Extensions
 
 This step adds tiered storage to the existing database by creating two
 extensions. `pg_duckdb` gives PostgreSQL an in-process engine that can read
@@ -350,10 +358,10 @@ The output lists both:
 (3 rows)
 ```
 
-Two extensions - that is the entire ColdFront install. There is no sidecar, no
-proxy, and no data movement yet.
+The two extensions are the entire ColdFront installation. There is no sidecar,
+no proxy, and no data movement yet.
 
-## Pointing ColdFront at the Object Store
+### Pointing ColdFront at the Object Store
 
 This step tells ColdFront where cold data goes and how to authenticate to it.
 The credentials below are throwaway values for the local SeaweedFS emulator.
@@ -380,11 +388,11 @@ The response confirms that the warehouse exists:
 "name":"wh"
 ```
 
-## Showing the Archiver Policy
+### Showing the Archiver Policy
 
 The archiver policy is one rule in a YAML file. Data older than 30 days belongs
 in low-cost object storage; the most recent data stays hot in PostgreSQL.
-Nothing moves yet - this step shows the boundary.
+Nothing moves yet; this step shows only the boundary.
 
 Use the following command to inspect the archiver configuration:
 
@@ -423,7 +431,7 @@ The `hot_period: 30 days` value is the hot/cold line. Any partition whose data
 is entirely older than 30 days will move to object storage when the archiver
 runs.
 
-## Running the Archiver
+### Running the Archiver
 
 The archiver reads its configuration from the server. The `import` command
 writes the YAML into the server once; the table goes into
@@ -456,7 +464,7 @@ The archiver connects inside the Compose network (service name `db`, not
 exports them to Iceberg via pg_duckdb, and replaces the `events` table with a
 unified view that queries both tiers.
 
-### Confirming That the Cold Rows Are in S3 as Parquet
+#### Confirming That the Cold Rows Are in S3 as Parquet
 
 The `iceberg_metadata()` table function resolves its argument as a filesystem
 path, so a REST-catalog table cannot be addressed by name directly. Resolve the
@@ -500,11 +508,11 @@ s3://iceberg/<table-uuid>/metadata/00023-<uuid>.gz.metadata.json
 ```
 
 Real `.parquet` objects are in the bucket. The cold rows are no longer in
-PostgreSQL - they are objects in object storage. Each month's files sit under
+PostgreSQL; they are objects in object storage. Each month's files sit under
 their own `month_ts_<n>=` directory, because the cold table is partitioned by
 month, the way the hot table is.
 
-### Confirming That the Table Changed Shape
+#### Confirming That the Table Changed Shape
 
 Use the following command to inspect the relation type:
 
@@ -519,7 +527,7 @@ the following query to see the recorded hot/cold cutoff:
 SELECT * FROM coldfront.archive_watermark;
 ```
 
-## Checking Where the Data Lives Now
+### Checking Where the Data Lives Now
 
 In this step, you count the rows in each tier after tiering and measure the
 space that the hot tier uses. The queries show how many rows are still hot in
@@ -572,13 +580,13 @@ Before tiering, the table held one million rows, all hot, in approximately
 PostgreSQL; over 90% of the hot storage is gone while the total row count is
 unchanged.
 
-## Querying Across Tiers
+### Querying Across Tiers
 
 This step runs one ordinary query against `events` that spans both tiers, then
 queries the hot-only table for contrast. The application issuing this query
 cannot tell which rows came from the heap and which came from object storage.
 
-Query the whole table - hot and cold together:
+Use the following query to read the whole table, hot and cold rows together:
 
 ```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT count(*) AS total FROM events;
@@ -615,7 +623,7 @@ The timestamps track your load. The rows are 63.072 seconds apart (730 days
 divided by one million), and row 1 sits one such step short of 730 days before
 the load. It is one table and one query, and no application change is required.
 
-## Writing to Cold Data
+### Writing to Cold Data
 
 This step takes a specific row from a cold (archived) month and updates it
 through the same `events` view. Notice what does not happen. The partition is
@@ -662,10 +670,10 @@ The updated row reads:
   1 | 2024-10-01 14:44:24.687844+00 | corrected
 ```
 
-The row's status flipped `warn` to `corrected`. That row is still sitting in
-object storage - ColdFront wrote through to it directly.
+The row's status flipped `warn` to `corrected`. That row is still in object
+storage; ColdFront wrote the change directly to object storage.
 
-## Confirming the Edit Persisted
+### Confirming the Edit Persisted
 
 This step opens a fresh `psql` connection (nothing cached from the session that
 did the write) and re-checks the row, the total row count, and the hot heap
