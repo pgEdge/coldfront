@@ -499,6 +499,16 @@ A bare-metal installation runs Lakekeeper and an object store on the host.
     takes its own arguments, and Azure ADLS Gen2 uses
     `coldfront.set_storage_secret_azure()` instead.
 
+8. Create the `public` namespace in the warehouse; decoupled mode requires
+    this namespace for tables in the `public` schema. Run the call in a
+    statement of its own, and repeat it for each other schema that holds a
+    decoupled table. In tiered mode, the archiver creates the namespace
+    itself:
+
+    ```sql
+    SELECT coldfront.create_iceberg_namespace('public');
+    ```
+
 #### Connecting a Docker Installation to Lakekeeper and an Object Store
 
 The Docker stack includes a SeaweedFS store, so you can use it as the cold tier
@@ -540,6 +550,16 @@ to evaluate ColdFront without a cloud account.
     ```sql
     SELECT coldfront.set_storage_secret('admin', 'adminsecret',
                                         'seaweedfs:8333');
+    ```
+
+4. Create the `public` namespace in the warehouse; decoupled mode requires
+    this namespace for tables in the `public` schema. Run the call in a
+    statement of its own, and repeat it for each other schema that holds a
+    decoupled table. In tiered mode, the archiver creates the namespace
+    itself:
+
+    ```sql
+    SELECT coldfront.create_iceberg_namespace('public');
     ```
 
 #### Granting Access to Application Roles

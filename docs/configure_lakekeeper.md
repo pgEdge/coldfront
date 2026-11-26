@@ -283,6 +283,15 @@ include the following settings:
   rows through this connection, and renders them row by row when the setting
   is empty. Only a superuser can set or read `coldfront.local_pg_dsn`.
 
+Decoupled mode needs the Iceberg namespace named after a table's schema before
+you create the table; in tiered mode, the archiver creates the namespace
+itself. Create the namespace once for each schema that holds a decoupled
+table, in a statement of its own:
+
+```sql
+SELECT coldfront.create_iceberg_namespace('public');
+```
+
 If your application connects as a role that is not a superuser, grant that
 role access to ColdFront. Replace `<role_name>` with the name of the existing
 role that your application connects as:
