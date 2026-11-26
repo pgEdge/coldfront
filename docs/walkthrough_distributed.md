@@ -325,9 +325,9 @@ parallel, as the interactive guide does:
 
 ```bash {"ignore":"true"}
 for i in 1 2 3 4 5; do
-  psql "postgresql://coldfront@localhost:${COLDFRONT_MESH_PG1_PORT:-5442}/coldfront" -c \
+  psql "postgresql://coldfront@localhost:${COLDFRONT_MESH_PG1_PORT:-5442}/coldfront?options=-cclient_min_messages%3Dwarning" -c \
     "INSERT INTO events_lake VALUES (10$i, now(), 'storm', '{\"n\":\"db1\"}');" &
-  psql "postgresql://coldfront@localhost:${COLDFRONT_MESH_PG2_PORT:-5443}/coldfront" -c \
+  psql "postgresql://coldfront@localhost:${COLDFRONT_MESH_PG2_PORT:-5443}/coldfront?options=-cclient_min_messages%3Dwarning" -c \
     "INSERT INTO events_lake VALUES (20$i, now(), 'storm', '{\"n\":\"db2\"}');" &
 done
 wait
@@ -350,7 +350,7 @@ META_LOC=$(curl -s \
   -H 'accept: application/json' \
   | grep -o '"metadata-location":"[^"]*"' | head -1 | cut -d'"' -f4)
 
-psql "postgresql://coldfront@localhost:${COLDFRONT_MESH_PG2_PORT:-5443}/coldfront" -P pager=off <<SQL
+psql "postgresql://coldfront@localhost:${COLDFRONT_MESH_PG2_PORT:-5443}/coldfront?options=-cclient_min_messages%3Dwarning" -P pager=off <<SQL
 SELECT sequence_number, snapshot_id, timestamp_ms
 FROM iceberg_snapshots('${META_LOC}')
 ORDER BY sequence_number;

@@ -323,7 +323,9 @@ SELECT coldfront.adopt_iceberg_table('public', 'orders', 'lake');
 SELECT order_id, customer, amount FROM orders ORDER BY order_id;
 ```
 
-The call reports what it registered:
+The call reports what it registered in a `NOTICE`. The connection settings on
+this page hide notices, so the message appears only in a session that shows
+them, such as a plain `psql` session:
 
 ```text {"ignore":"true"}
 NOTICE:  coldfront: adopted "ice"."lake"."orders" as public.orders (5 columns, read-only)
