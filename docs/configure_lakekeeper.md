@@ -18,94 +18,14 @@ matches how you install Lakekeeper:
 
 ## Installing and Configuring Lakekeeper with Packages
 
-The `pgedge-lakekeeper` package installs the `lakekeeper` binary, a
-`lakekeeper` system user, and a `lakekeeper` systemd service, but it does not
-configure, enable, or start the service. Lakekeeper stores its catalog in a
-PostgreSQL 15 or later database and reads its settings from
-`/etc/lakekeeper/lakekeeper.env`.
-
-Use the following steps to install, configure, and start Lakekeeper:
-
-1. If you did not install the `pgedge-lakekeeper` package with the
-    [ColdFront packages](installation.md), install it now from the pgEdge
-    repository.
-
-    On RHEL, Rocky Linux, or AlmaLinux:
-
-    ```bash
-    sudo dnf install -y pgedge-lakekeeper
-    ```
-
-    On Ubuntu or Debian:
-
-    ```bash
-    sudo apt install -y pgedge-lakekeeper
-    ```
-
-2. Connect as a PostgreSQL superuser, such as `postgres` (for example, with
-    `sudo -u postgres psql`), and create a role and a database for the catalog.
-    Replace `<password>` with a generated password, such as the output of
-    `openssl rand -hex 32`; a hex value needs no escaping in the connection
-    string in step 3:
-
-    ```sql
-    CREATE ROLE lakekeeper LOGIN PASSWORD '<password>';
-    CREATE DATABASE lakekeeper OWNER lakekeeper;
-    ```
-
-    !!! hint
-
-        The migration in step 4 creates the `uuid-ossp`, `pgcrypto`,
-        `pg_trgm`, `btree_gin`, and `btree_gist` extensions. Either allow the
-        `lakekeeper` role to run `CREATE EXTENSION`, or create the extensions
-        as a superuser before you run the migration.
-
-3. In `/etc/lakekeeper/lakekeeper.env`, set the catalog database's
-    connection string and an encryption key:
-
-    ```bash
-    LAKEKEEPER__PG_DATABASE_URL_WRITE=postgresql://lakekeeper:<password>@127.0.0.1:5432/lakekeeper
-    LAKEKEEPER__PG_ENCRYPTION_KEY=<encryption-key>
-    ```
-
-    - Replace `<password>` with the password from step 2, and adjust the host
-      and port if the catalog database is on another server.
-    - Replace `<encryption-key>` with a random secret, such as the output of
-      `openssl rand -base64 32`. Lakekeeper encrypts stored credentials with
-      the key, so keep the key stable and backed up. Every node that shares
-      the catalog needs the same key.
-
-4. Run the one-time database migration as the `lakekeeper` user. The
-    command reads the environment file as that user, because the file is not
-    readable by other accounts:
-
-    ```bash
-    sudo -u lakekeeper sh -c \
-      'set -a; . /etc/lakekeeper/lakekeeper.env; set +a; exec /usr/bin/lakekeeper migrate'
-    ```
-
-5. Secure the listener before you start the service. By default, Lakekeeper
-    listens on port 8181 on every address and, with no authorization backend,
-    accepts every request. Do not start it that way:
-
-    - If every client runs on the same host, set the following in
-      `/etc/lakekeeper/lakekeeper.env`:
-
-        ```bash
-        LAKEKEEPER__BIND_IP=127.0.0.1
-        ```
-
-    - If clients connect from other hosts, configure
-      [authentication](https://docs.lakekeeper.io/docs/latest/authentication/)
-      and an enforcing
-      [authorization](https://docs.lakekeeper.io/docs/latest/authorization/)
-      backend, and limit access to port 8181 with a firewall.
-
-6. Enable and start the service:
-
-    ```bash
-    sudo systemctl enable --now lakekeeper
-    ```
+The `pgedge-lakekeeper` package from the pgEdge Enterprise Postgres repository
+installs the `lakekeeper` binary, a `lakekeeper` system user, and a
+`lakekeeper` systemd service, but it does not configure, enable, or start the
+service. The pgEdge Enterprise Postgres documentation describes installing,
+configuring, and starting Lakekeeper from the package on
+[Enterprise Linux](https://docs.pgedge.com/enterprise/el/components/coldfront/#installing-and-configuring-lakekeeper)
+and on
+[Debian and Ubuntu](https://docs.pgedge.com/enterprise/debian/components/coldfront/#installing-and-configuring-lakekeeper).
 
 Then, bootstrap Lakekeeper as described in
 [Bootstrapping Lakekeeper](#bootstrapping-lakekeeper).
@@ -357,10 +277,9 @@ The arguments after the secret are optional:
 
 The image writes the server settings ColdFront needs into `postgresql.conf`
 when it initializes a new data directory. A server installed from packages or
-built another way sets them itself, as the
-[package](configuration.md#configuring-postgresql) and
-[bare-metal](installation.md#building-coldfront-from-source-on-bare-metal) sections of
-installation.md show:
+built another way needs the settings in
+[Configuring PostgreSQL](configuration.md#configuring-postgresql), which
+include the following settings:
 
 - `shared_preload_libraries = 'pg_duckdb,coldfront'` loads both extensions at
   server start. coldfront refuses to load any other way: `CREATE EXTENSION
