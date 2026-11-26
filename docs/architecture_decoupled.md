@@ -192,7 +192,8 @@ that commits before the helper runs:
 SELECT coldfront.create_iceberg_namespace('public');
 ```
 
-After that, applications use **plain PG syntax** against the named relation:
+After the helper runs, applications use **plain PG syntax** against the named
+relation:
 
 ```sql
 SELECT coldfront.create_iceberg_table(

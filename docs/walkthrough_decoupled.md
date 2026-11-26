@@ -226,15 +226,12 @@ what each extension does and how to use a real object store instead.
 
 ### Creating an Iceberg-Only Table
 
-The table lives in the Iceberg namespace named after its schema, so create the
-`public` namespace first, in a statement of its own:
+Decoupled mode requires the Iceberg namespace named after the table's schema.
+Without the namespace, `coldfront.create_iceberg_table()` fails.
 
-```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
-SELECT coldfront.create_iceberg_namespace('public');
-```
-
-One SQL call provisions the Iceberg table and the PostgreSQL view, and the call
-wraps both steps in a single transaction:
+One SQL call provisions the Iceberg table and the PostgreSQL view. The `public`
+namespace was seeded during setup, and the call wraps both steps in a single
+transaction:
 
 ```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT coldfront.create_iceberg_table(

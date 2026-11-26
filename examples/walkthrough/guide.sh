@@ -11,9 +11,9 @@ OS="$(uname -s)"
 PG_PORT="${COLDFRONT_PG_PORT:-5432}"
 LK_PORT="${COLDFRONT_LK_PORT:-8181}"
 LK_URL="http://localhost:${LK_PORT}"
-# The Iceberg namespace mirrors the PG schema the demos use, so it is addressed
-# under that name. One constant keeps the metadata lookup and the purge helper
-# from drifting apart.
+# The Iceberg namespace mirrors the PG schema the demos use, so it has to be
+# seeded and addressed under that name. One constant keeps the bootstrap, the
+# metadata lookup, and the purge helper from drifting apart.
 LK_NS="public"
 
 # Mesh (Demo 4): a separate 2-node stack, brought up on demand. Ports are picked
@@ -393,13 +393,16 @@ ensure_coldfront_setup() {
     fi
 }
 
-# ensure_warehouse <lk_url>: bootstrap Lakekeeper, then POST warehouse 'wh'
-# (retrying until config?warehouse=wh resolves: the POST validates its S3 profile
-# against SeaweedFS and 4xx/5xxs until the S3 endpoint is live). Shared by
-# phase_a_bringup (single-node) and mesh_bringup (2-node); both create the same
+# ensure_warehouse_and_namespace <lk_url>: bootstrap Lakekeeper, then POST
+# warehouse 'wh' (retrying until config?warehouse=wh resolves: the POST validates
+# its S3 profile against SeaweedFS and 4xx/5xxs until the S3 endpoint is live) and
+# create the LK_NS namespace. Seeding it is required, not cosmetic: DuckDB defers
+# an Iceberg CREATE SCHEMA to COMMIT while POSTing CREATE TABLE eagerly, so
+# create_iceberg_table 404s unless the namespace is already committed. Shared
+# by phase_a_bringup (single-node) and mesh_bringup (2-node); both seed the same
 # warehouse against their own Lakekeeper on the SeaweedFS at http://seaweedfs:8333.
-ensure_warehouse() {
-    local lk="$1" ok=0
+ensure_warehouse_and_namespace() {
+    local lk="$1" ok=0 wid
     curl -sf -X POST "$lk/management/v1/bootstrap" \
         -H 'Content-Type: application/json' -d '{"accept-terms-of-use":true}' >/dev/null 2>&1 || true
     for _ in $(seq 1 40); do
@@ -415,7 +418,11 @@ ensure_warehouse() {
             }' >/dev/null 2>&1 || true
         sleep 3
     done
-    [ "$ok" = 1 ]
+    [ "$ok" = 1 ] || return 1
+    wid=$(curl -s "$lk/management/v1/warehouse" | grep -oE '"warehouse-id":"[^"]+"' | head -1 | cut -d'"' -f4)
+    curl -sf -X POST "$lk/catalog/v1/$wid/namespaces" \
+        -H 'Content-Type: application/json' -d "{\"namespace\":[\"${LK_NS}\"]}" >/dev/null 2>&1 || true
+    return 0
 }
 
 phase_a_bringup() {
@@ -455,15 +462,15 @@ phase_a_bringup() {
     [ "$ok" = 1 ] || { error "Lakekeeper did not become ready"; $COMPOSE logs lakekeeper | tail -20; exit 1; }
     info "[3/4] Lakekeeper is ready"
 
-    start_spinner "[4/4] Creating the warehouse"
-    if ! ensure_warehouse "$LK_URL"; then
+    start_spinner "[4/4] Creating the warehouse + namespace"
+    if ! ensure_warehouse_and_namespace "$LK_URL"; then
         stop_spinner
         error "Warehouse 'wh' did not become resolvable in Lakekeeper"
         $COMPOSE logs lakekeeper seaweedfs | tail -20
         exit 1
     fi
     stop_spinner
-    info "[4/4] Warehouse 'wh' ready"
+    info "[4/4] Warehouse 'wh' + namespace '${LK_NS}' ready"
     echo ""
 }
 
@@ -530,10 +537,10 @@ mesh_bringup() {
         if curl -sf "$MESH_LK_URL/health" >/dev/null 2>&1 || curl -sf "$MESH_LK_URL/management/v1/info" >/dev/null 2>&1; then ok=1; break; fi
         sleep 3
     done
-    [ "$ok" = 1 ] && { ensure_warehouse "$MESH_LK_URL" || ok=0; }
+    [ "$ok" = 1 ] && { ensure_warehouse_and_namespace "$MESH_LK_URL" || ok=0; }
     stop_spinner
     [ "$ok" = 1 ] || { error "Shared Lakekeeper/warehouse did not become ready"; $MESH_COMPOSE logs lakekeeper seaweedfs | tail -20; return 1; }
-    info "[4/6] Shared lake ready (warehouse 'wh')"
+    info "[4/6] Shared lake ready (warehouse 'wh', namespace '${LK_NS}')"
 
     start_spinner "[5/6] Installing ColdFront + forming the Spock mesh"
     # Extensions on both nodes, one per call (a chained CREATE aborts the rest on
@@ -1060,18 +1067,6 @@ demo_decoupled() {
     # coldfront cold-tier DROP block) and drops the Iceberg table so re-runs start clean.
     teardown_decoupled
 
-    # The Iceberg namespace the table lives in, once per schema, in a statement
-    # of its own so the catalog has it before the table names it.
-    local out
-    explain "A lake-native table lives in an Iceberg namespace named after its schema, so"
-    explain "we first create that namespace, once per schema:"
-    if [ "$NONINTERACTIVE" != 1 ]; then
-        show_cmd "SELECT coldfront.create_iceberg_namespace('public');"
-        echo ""
-    fi
-    out=$(pg "SELECT coldfront.create_iceberg_namespace('public');" 2>&1) \
-        || { error "create_iceberg_namespace did not succeed: $out"; return 1; }
-
     # Step 2: create the lake-native table (one call).
     explain "Now we create a lake-native table in a single call. It builds a view plus a"
     explain "registry row and NO Postgres heap, the rows will have nowhere to live but the lake:"
@@ -1083,8 +1078,18 @@ demo_decoupled() {
         read -rp "Press Enter to create the lake-native table..." </dev/tty
         echo ""
     fi
-    out=$(pg "SELECT coldfront.create_iceberg_table('public','events_lake','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"ts\",\"type\":\"timestamptz\"},{\"name\":\"status\",\"type\":\"text\"},{\"name\":\"data\",\"type\":\"jsonb\"}]'::jsonb);" 2>&1) \
-        || { error "create_iceberg_table did not succeed: $out"; return 1; }
+    # The Iceberg namespace is pre-seeded in Phase A. DuckDB 1.5.x defers an
+    # Iceberg CREATE SCHEMA to COMMIT but POSTs CREATE TABLE eagerly, so
+    # create_iceberg_table (both in ONE plpgsql txn) would 404 on a cold
+    # warehouse. With the namespace already committed this no-ops; the loop is a
+    # thin safety net in case seeding raced the warehouse.
+    local i ok=0
+    for i in 1 2 3 4 5; do
+        pg "SELECT coldfront.create_iceberg_table('public','events_lake','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"ts\",\"type\":\"timestamptz\"},{\"name\":\"status\",\"type\":\"text\"},{\"name\":\"data\",\"type\":\"jsonb\"}]'::jsonb);" >/dev/null 2>&1
+        if [ "$(pg "SELECT count(*) FROM pg_class WHERE relname='events_lake' AND relkind='v';")" = "1" ]; then ok=1; break; fi
+        sleep 2
+    done
+    [ "$ok" = 1 ] || { error "create_iceberg_table did not succeed"; return 1; }
     explain "Confirm what it created, events_lake is a VIEW (relkind = v), not a table:"
     show_query "SELECT relkind FROM pg_class WHERE relname='events_lake';"
     info "relkind = v: events_lake is a VIEW, no heap table was created. The data has nowhere to live but the lake."
@@ -1334,15 +1339,6 @@ demo_distributed() {
 
     # ── Beat 2: cross-node visibility ──────────────────────────────────────
     header "Write on one node, read on the other"
-    explain "The shared catalog needs the Iceberg namespace the table lives in. db1 creates"
-    explain "it, once for the whole cluster:"
-    if [ "$NONINTERACTIVE" != 1 ]; then
-        show_cmd "psql (db1) -c \"SELECT coldfront.create_iceberg_namespace('public');\""
-        echo ""
-    fi
-    local i ok=0 out
-    out=$(mpg "$MESH_PG1_PORT" "SELECT coldfront.create_iceberg_namespace('public');" 2>&1) \
-        || { error "create_iceberg_namespace did not succeed on db1: $out"; return 1; }
     explain "We create a lake-native table on db1, the same one-call create as the"
     explain "Decoupled demo, columns passed as JSON:"
     if [ "$NONINTERACTIVE" != 1 ]; then
@@ -1351,8 +1347,13 @@ demo_distributed() {
         read -rp "Press Enter to create the table on db1..." </dev/tty
         echo ""
     fi
-    out=$(mpg "$MESH_PG1_PORT" "$_CREATE_EVENTS_LAKE" 2>&1) \
-        || { error "create_iceberg_table did not succeed on db1: $out"; return 1; }
+    local i ok=0
+    for i in 1 2 3 4 5; do
+        mpg "$MESH_PG1_PORT" "$_CREATE_EVENTS_LAKE" >/dev/null 2>&1
+        if [ "$(mpg "$MESH_PG1_PORT" "SELECT count(*) FROM pg_class WHERE relname='events_lake' AND relkind='v';")" = "1" ]; then ok=1; break; fi
+        sleep 2
+    done
+    [ "$ok" = 1 ] || { error "create_iceberg_table did not succeed on db1"; return 1; }
     info "events_lake created on db1: a VIEW over the shared Iceberg table, no Postgres heap."
 
     explain "Now register the same table on db2 so that node can read AND write it. The"

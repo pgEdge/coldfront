@@ -21,8 +21,9 @@ requirements:
   node, so `coldfront.warehouse` and `coldfront.lakekeeper_endpoint` have the
   same values on every node. Lakekeeper is bootstrapped as described in
   [Configuring Lakekeeper](configure_lakekeeper.md), runs on its own
-  PostgreSQL server rather than on a mesh node, and the warehouse exists as
-  described in [Configuring your Object Store](object_store.md).
+  PostgreSQL server rather than on a mesh node, and the warehouse and its
+  namespace exist as described in
+  [Configuring your Object Store](object_store.md).
 
 The mesh also depends on the following:
 
