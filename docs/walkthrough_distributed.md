@@ -294,6 +294,17 @@ SELECT (SELECT count(*) FROM coldfront.claims)       AS claims,
 Tickets are never reused, so an empty ledger is the steady state between
 writes.
 
+If you brought up the mesh with the interactive guide, the guide may have
+published the nodes on other ports. Use the following commands to set the port
+variables from the running mesh before you run the loop:
+
+```bash {"ignore":"true"}
+export COLDFRONT_MESH_PG1_PORT=$(docker compose \
+  -f examples/walkthrough/docker-compose.mesh.yml port db1 5432 | cut -d: -f2)
+export COLDFRONT_MESH_PG2_PORT=$(docker compose \
+  -f examples/walkthrough/docker-compose.mesh.yml port db2 5432 | cut -d: -f2)
+```
+
 To see the protocol order concurrent writes, run several `INSERT` statements
 at the same time on both nodes, for example five on `db1` (IDs 101 to 105) and
 five on `db2` (IDs 201 to 205). The following loop starts the ten writes in
