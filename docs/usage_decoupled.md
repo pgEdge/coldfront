@@ -17,6 +17,9 @@ schema. Create the namespace once per schema with
 SELECT coldfront.create_iceberg_namespace('public');
 ```
 
+The setup guides create the `public` namespace with a REST request to
+Lakekeeper, which has the same effect.
+
 Run the call in a transaction of its own. The namespace reaches the catalog
 when that transaction commits, and a rollback leaves the catalog without the
 namespace. A transaction that also writes to PostgreSQL, such as one that

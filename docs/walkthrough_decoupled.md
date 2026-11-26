@@ -61,13 +61,14 @@ docker compose -f examples/walkthrough/docker-compose.yml \
 ```
 
 Run the second code block to prepare Lakekeeper, the Iceberg catalog. When the
-warehouse request succeeds, the output displays the `warehouse-id` of the new
-`wh` warehouse. If the output shows an error because SeaweedFS is not ready
-yet, run the block again. If the error says that the `wh` warehouse already
-exists, continue without running the block again.
+bootstrap succeeds, the output displays the new `public` namespace:
 
-The code block bootstraps Lakekeeper and creates the `wh` warehouse that stores
-its tables in SeaweedFS:
+![The finished bootstrap code block in a Codespace, with the public namespace in its output](img/codespace_bootstrap.png)
+
+The code block bootstraps Lakekeeper, creates the `wh` warehouse that stores
+its tables in SeaweedFS, and creates the `public` namespace in that warehouse.
+The code block makes one attempt, so run the block again if the warehouse
+request fails:
 
 ```bash
 # Bootstrap Lakekeeper (one-time per fresh stack)
@@ -75,8 +76,8 @@ curl -sf -X POST http://localhost:8181/management/v1/bootstrap \
   -H 'Content-Type: application/json' \
   -d '{"accept-terms-of-use":true}'
 
-# Create the warehouse (retried by guide.sh until 200)
-curl -s -X POST http://localhost:8181/management/v1/warehouse \
+# Create the warehouse and save its ID (retried by guide.sh until 200)
+WID=$(curl -sf -X POST http://localhost:8181/management/v1/warehouse \
   -H 'Content-Type: application/json' \
   -d '{
     "warehouse-name": "wh",
@@ -96,7 +97,18 @@ curl -s -X POST http://localhost:8181/management/v1/warehouse \
       "aws-access-key-id": "admin",
       "aws-secret-access-key": "adminsecret"
     }
-  }'
+  }' \
+  | grep -oE '"warehouse-id":"[^"]+"' | cut -d'"' -f4)
+
+# Seed the public namespace
+if [ -z "$WID" ]; then
+  echo "No warehouse ID - check that the warehouse create succeeded."
+else
+  curl -sf -X POST \
+    "http://localhost:8181/catalog/v1/${WID}/namespaces" \
+    -H 'Content-Type: application/json' \
+    -d '{"namespace":["public"]}'
+fi
 ```
 
 Then click the triangle beside each code block that follows, in order, starting
@@ -136,8 +148,8 @@ curl -sf -X POST http://localhost:8181/management/v1/bootstrap \
   -H 'Content-Type: application/json' \
   -d '{"accept-terms-of-use":true}'
 
-# Create the warehouse (retried by guide.sh until 200)
-curl -s -X POST http://localhost:8181/management/v1/warehouse \
+# Create the warehouse and save its ID (retried by guide.sh until 200)
+WID=$(curl -sf -X POST http://localhost:8181/management/v1/warehouse \
   -H 'Content-Type: application/json' \
   -d '{
     "warehouse-name": "wh",
@@ -157,7 +169,18 @@ curl -s -X POST http://localhost:8181/management/v1/warehouse \
       "aws-access-key-id": "admin",
       "aws-secret-access-key": "adminsecret"
     }
-  }'
+  }' \
+  | grep -oE '"warehouse-id":"[^"]+"' | cut -d'"' -f4)
+
+# Seed the public namespace
+if [ -z "$WID" ]; then
+  echo "No warehouse ID - check that the warehouse create succeeded."
+else
+  curl -sf -X POST \
+    "http://localhost:8181/catalog/v1/${WID}/namespaces" \
+    -H 'Content-Type: application/json' \
+    -d '{"namespace":["public"]}'
+fi
 ```
 
 If port 5432, 8181, or 8333 is already in use on your host, see
@@ -203,15 +226,12 @@ what each extension does and how to use a real object store instead.
 
 ### Creating an Iceberg-Only Table
 
-The table lives in the Iceberg namespace named after its schema, so create the
-`public` namespace first, in a statement of its own:
+Decoupled mode requires the Iceberg namespace named after the table's schema.
+Without the namespace, `coldfront.create_iceberg_table()` fails.
 
-```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
-SELECT coldfront.create_iceberg_namespace('public');
-```
-
-One SQL call provisions the Iceberg table and the PostgreSQL view, and the call
-wraps both steps in a single transaction:
+One SQL call provisions the Iceberg table and the PostgreSQL view. The `public`
+namespace was seeded during setup, and the call wraps both steps in a single
+transaction:
 
 ```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT coldfront.create_iceberg_table(

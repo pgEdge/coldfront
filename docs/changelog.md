@@ -15,8 +15,7 @@ this project adheres to
   16, 17, and 18, with `-amd64` and `-arm64` forms. Set `COLDFRONT_BASE` to
   build the app image on one of these tags.
 - `coldfront.create_iceberg_namespace()` creates the Iceberg namespace of a
-  decoupled table's schema with one SQL call. The setup guides use the call
-  in place of a REST request to Lakekeeper.
+  decoupled table's schema with one SQL call.
 
 ### Changed
 
@@ -24,15 +23,9 @@ this project adheres to
   The published base image now includes pgvector and the PostgreSQL
   development headers the build compiles `coldfront` against, so only a build
   of the base image installs from the pgEdge package repositories.
-
-### Fixed
-
-- The guides for decoupled mode created only the `public` namespace, so
-  `coldfront.create_iceberg_table()` in any other schema failed with HTTP 404.
-  The guides now create the namespace of the table's schema with
-  `coldfront.create_iceberg_namespace()`. Without the namespace,
-  `coldfront.create_iceberg_table()` now fails with the error
-  `Schema with name "<schema>" does not exist`.
+- Without the Iceberg namespace of its schema,
+  `coldfront.create_iceberg_table()` fails with the error
+  `Schema with name "<schema>" does not exist` in place of HTTP 404.
 
 ## [1.0.0-beta4] - 2026-11-17
 

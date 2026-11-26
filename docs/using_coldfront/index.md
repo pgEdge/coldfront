@@ -7,7 +7,7 @@ compares tiered and decoupled modes, which use the cold Iceberg tier:
 | | Tiered (hot + cold) | Decoupled (iceberg-only) |
 |---|---|---|
 | Where rows live | Recent rows are hot in the PG heap, and archived rows are cold in Iceberg. | Every row is in Iceberg. |
-| Setup | Create a partitioned table and let the archiver convert it on the first run that finds a partition older than `hot_period`. | One SQL call, `coldfront.create_iceberg_table(...)`, sets up the table, after `coldfront.create_iceberg_namespace(...)` creates the namespace of its schema. |
+| Setup | Create a partitioned table and let the archiver convert it on the first run that finds a partition older than `hot_period`. | One SQL call, `coldfront.create_iceberg_table(...)`, sets up the table. |
 | Archiver | The archiver is required; it runs from cron and moves old partitions to cold. | The archiver is not used. |
 | Best when | The workload has a recent-row OLTP part that benefits from PG indexes and transactional ergonomics. | The workload is purely analytic or append-mostly, and you want zero PG storage and stateless compute. |
 

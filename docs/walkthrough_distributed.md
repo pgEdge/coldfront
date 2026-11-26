@@ -106,7 +106,7 @@ When you open a psql session on a node, connect to the port that you set for
 that node.
 
 Next, use the following commands to wait for the mesh's own Lakekeeper,
-bootstrap it, and create the `wh` warehouse:
+bootstrap it, create the `wh` warehouse, and seed the `public` namespace:
 
 ```bash {"ignore":"true"}
 # Use the mesh Lakekeeper port (8191 unless you set COLDFRONT_MESH_LK_PORT)
@@ -120,8 +120,8 @@ curl -sf -X POST http://localhost:${LK_PORT}/management/v1/bootstrap \
   -H 'Content-Type: application/json' \
   -d '{"accept-terms-of-use":true}'
 
-# Create the warehouse (retried by guide.sh until 200)
-curl -s -X POST http://localhost:${LK_PORT}/management/v1/warehouse \
+# Create the warehouse and save its ID (retried by guide.sh until 200)
+WID=$(curl -sf -X POST http://localhost:${LK_PORT}/management/v1/warehouse \
   -H 'Content-Type: application/json' \
   -d '{
     "warehouse-name": "wh",
@@ -141,13 +141,19 @@ curl -s -X POST http://localhost:${LK_PORT}/management/v1/warehouse \
       "aws-access-key-id": "admin",
       "aws-secret-access-key": "adminsecret"
     }
-  }'
-```
+  }' \
+  | grep -oE '"warehouse-id":"[^"]+"' | cut -d'"' -f4)
 
-A successful warehouse request prints the `warehouse-id` of the new warehouse.
-If the request prints an error because SeaweedFS is not ready yet, run the
-commands again. If the error says that the `wh` warehouse already exists,
-continue without running the commands again.
+# Seed the public namespace
+if [ -z "$WID" ]; then
+  echo "No warehouse ID - check that the warehouse create succeeded."
+else
+  curl -sf -X POST \
+    "http://localhost:${LK_PORT}/catalog/v1/${WID}/namespaces" \
+    -H 'Content-Type: application/json' \
+    -d '{"namespace":["public"]}'
+fi
+```
 
 Then create the extensions and form the mesh, running each statement on the
 node its comment names:
@@ -200,12 +206,9 @@ SELECT sub_name  FROM spock.subscription;              -- one per node
 
 ### Writing on One Node, Reading on the Other
 
-Create the `public` namespace in the shared catalog, once, from either node:
-
-```sql {"ignore":"true"}
--- On db1:
-SELECT coldfront.create_iceberg_namespace('public');
-```
+A lake-native table requires the Iceberg namespace named after its schema; the
+setup seeded the `public` namespace. Without the namespace,
+`coldfront.create_iceberg_table()` fails.
 
 Use the following call to create a lake-native table on `db1`, and then run the
 same call on `db2`. The call is idempotent, and the registry is keyed by table
