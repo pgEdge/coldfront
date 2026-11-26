@@ -130,8 +130,9 @@ directory if you used the installer.
 As you work through the walkthrough:
 
 - paste each shell command into a terminal.
-- paste each SQL block into a psql session that you open with
-  `psql postgresql://coldfront@localhost:5432/coldfront`.
+- paste each SQL block into a psql session that you open with the following
+  command, which hides the informational notices that pg_duckdb prints:
+  `psql "postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning"`.
 
 <div class="admonition hint">
 <p class="admonition-title">Hint</p>
@@ -199,11 +200,11 @@ When the stack is running, continue with the first step,
 
 ## Performing the Walkthrough Steps
 
-Every method of running the walkthrough performs the following steps in
-order. If you are running the walkthrough manually, paste each code block into
-a terminal or a psql session. If you are using the interactive guide or a
-Codespace, the following sections explain what each step does and what its
-output shows.
+The following sections explain what each step does and what its output shows.
+If you are running the walkthrough manually, paste each code block into a
+terminal or a psql session, in order. The interactive guide follows the same
+sequence but may combine or skip some steps, so its output can differ from the
+output on this page.
 
 ### Checking the Stack
 
@@ -580,7 +581,8 @@ Together, the three queries give the following hot/cold split:
 The hot share depends on the day you run the walkthrough. The archiver moves a
 monthly partition to cold storage once its end is at least 30 days in the past,
 so the previous month stays hot until the 31st. A run on the 1st or the 31st
-keeps about 42,000 rows hot, and a run late in any other month about 83,000.
+keeps about 42,000 rows (about 6.6 MB) hot, and a run late in any other month
+up to about 83,000 rows (about 12 MB).
 Before tiering, the table held one million rows, all hot, in approximately
 152 MB of Postgres heap. After tiering, only the last month or two remains in
 PostgreSQL; over 90% of the hot storage is gone while the total row count is
@@ -662,7 +664,8 @@ Update the archived row through the same table using the captured id:
 UPDATE events SET status = 'corrected' WHERE id = 1;
 ```
 
-Read the row back immediately:
+The statement prints an empty result set, `(0 rows)`, instead of `UPDATE 1`.
+The next query shows that the row changed. Read the row back immediately:
 
 ```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT id, ts, status FROM events WHERE id = 1;
@@ -738,7 +741,8 @@ SELECT pg_size_pretty(
 ) AS hot_size;
 ```
 
-The query returns:
+A run on the 1st or the 31st returns about 6.6 MB, and a run late in any other
+month about 12 MB:
 
 ```text {"ignore":"true"}
  hot_size

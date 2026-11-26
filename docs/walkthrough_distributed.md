@@ -65,8 +65,14 @@ Prepare your system as described in
 [Running the Walkthrough Manually](exploring_coldfront/index.md#running-the-walkthrough-manually),
 and then work from the repository root, or from the `coldfront-walkthrough`
 directory if you used the installer. Paste the commands in the sections that
-follow into a terminal, and paste the SQL into a psql session against each
-node (`db1` on port 5442 and `db2` on port 5443).
+follow into a terminal, and paste the SQL into a psql session on the node that
+each code block names. Use the following commands to open a session on each
+node:
+
+```bash {"ignore":"true"}
+psql "postgresql://coldfront@localhost:5442/coldfront?options=-cclient_min_messages%3Dwarning"   # db1
+psql "postgresql://coldfront@localhost:5443/coldfront?options=-cclient_min_messages%3Dwarning"   # db2
+```
 
 Start with the first step,
 [Bringing Up the Two-Node Mesh](#bringing-up-the-two-node-mesh), which starts
@@ -74,11 +80,11 @@ the two-node stack.
 
 ## Performing the Walkthrough Steps
 
-Every method of running the walkthrough performs the following steps in
-order. If you are running the walkthrough manually, paste each code block into
-a terminal or a psql session. If you are using the interactive guide or a
-Codespace, the following sections explain what each step does and what its
-output shows.
+The following sections explain what each step does and what its output shows.
+If you are running the walkthrough manually, paste each code block into a
+terminal or a psql session, in order. The interactive guide follows the same
+sequence but may combine or skip some steps, so its output can differ from the
+output on this page.
 
 ### Bringing Up the Two-Node Mesh
 
@@ -279,9 +285,16 @@ SELECT ticket, ack_from_name AS acked_by FROM coldfront.claim_acks;
 ```
 
 The change is not in the lake yet, because the commit writes the Iceberg
-snapshot under the claim. On `db2`, the row with `id = 3` still has the status
-`warn`. Next, run `COMMIT` in the first session on `db1`. The release deletes
-the claim and its acks, both deletes replicate, and `db2` reads the new status:
+snapshot under the claim. Use the following query to confirm that the row with
+`id = 3` still has the status `warn` on `db2`:
+
+```sql {"ignore":"true"}
+-- On db2:
+SELECT id, status FROM events_lake WHERE id = 3;   -- 3 | warn
+```
+
+Next, run `COMMIT` in the first session on `db1`. The release deletes the claim
+and its acks, both deletes replicate, and `db2` reads the new status:
 
 ```sql {"ignore":"true"}
 -- On db2:

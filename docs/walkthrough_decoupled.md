@@ -6,17 +6,18 @@ cwd: ../
 Decoupled mode stores a table entirely in Iceberg from the first row.
 PostgreSQL holds a thin wrapper view and a registry entry.
 
-The following table shows the seven steps this walkthrough performs:
+The following table shows the eight steps this walkthrough performs:
 
 | Step | What you will do |
 |------|-----------------|
-| [1. Creating an Iceberg-only table](#creating-an-iceberg-only-table) | Create a table whose rows live in Iceberg from the first row, with one SQL call. |
-| [2. Reading and writing the lake table](#reading-and-writing-the-lake-table) | Insert and query rows as you would in any PostgreSQL table. |
-| [3. Standing in for the external writer](#standing-in-for-the-external-writer) | Use DuckDB to write an Iceberg table, as another engine would. |
-| [4. Adopting the table read-only](#adopting-the-table-read-only) | Wrap the existing Iceberg table in a read-only PostgreSQL view. |
-| [5. Enabling writes](#enabling-writes) | Adopt the table again as writable, so INSERT, UPDATE, and DELETE work. |
-| [6. Restoring a type Iceberg cannot record](#restoring-a-type-iceberg-cannot-record) | Restore the PostgreSQL type of a column that Iceberg stores as text. |
-| [7. Handing the table back](#handing-the-table-back) | Release the table; its rows stay in the lake. |
+| [1. Preparing the database](#preparing-the-database) | Create the extensions and register the object store credential. |
+| [2. Creating an Iceberg-only table](#creating-an-iceberg-only-table) | Create a table whose rows live in Iceberg from the first row, with one SQL call. |
+| [3. Reading and writing the lake table](#reading-and-writing-the-lake-table) | Insert and query rows as you would in any PostgreSQL table. |
+| [4. Standing in for the external writer](#standing-in-for-the-external-writer) | Use DuckDB to write an Iceberg table, as another engine would. |
+| [5. Adopting the table read-only](#adopting-the-table-read-only) | Wrap the existing Iceberg table in a read-only PostgreSQL view. |
+| [6. Enabling writes](#enabling-writes) | Adopt the table again as writable, so INSERT, UPDATE, and DELETE work. |
+| [7. Restoring a type Iceberg cannot record](#restoring-a-type-iceberg-cannot-record) | Restore the PostgreSQL type of a column that Iceberg stores as text. |
+| [8. Handing the table back](#handing-the-table-back) | Release the table; its rows stay in the lake. |
 
 ## Running the Interactive Walkthrough on the Command Line
 
@@ -120,8 +121,9 @@ directory if you used the installer.
 As you work through the walkthrough:
 
 - paste each shell command into a terminal.
-- paste each SQL block into a psql session that you open with
-  `psql postgresql://coldfront@localhost:5432/coldfront`.
+- paste each SQL block into a psql session that you open with the following
+  command, which hides the informational notices that pg_duckdb prints:
+  `psql "postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning"`.
 
 <div class="admonition hint">
 <p class="admonition-title">Hint</p>
@@ -189,11 +191,11 @@ When the stack is running, continue with the first step,
 
 ## Performing the Walkthrough Steps
 
-Every method of running the walkthrough performs the following steps in
-order. If you are running the walkthrough manually, paste each code block into
-a terminal or a psql session. If you are using the interactive guide or a
-Codespace, the following sections explain what each step does and what its
-output shows.
+The following sections explain what each step does and what its output shows.
+If you are running the walkthrough manually, paste each code block into a
+terminal or a psql session, in order. The interactive guide follows the same
+sequence but may combine or skip some steps, so its output can differ from the
+output on this page.
 
 ### Preparing the Database
 
@@ -268,14 +270,13 @@ All four DML operations reach the Iceberg table transparently. The `coldfront`
 extension intercepts each statement on the view and rewrites it to the Iceberg
 path via pg_duckdb.
 
-### Adopting a Table Already in the Lake
+### Standing In for the External Writer
 
 ColdFront can also use an Iceberg table that another engine has already
 written. Instead of creating the table, ColdFront adopts it. Adoption reads
 the table's schema from the Iceberg catalog and adds the wrapper view and
-registry entry that make the table available in PostgreSQL.
-
-#### Standing In for the External Writer
+registry entry that make the table available in PostgreSQL. This step and the
+four that follow adopt such a table and then hand it back.
 
 In a real deployment, another engine writes this table to the lake. The next
 two code blocks stand in for that engine. They use DuckDB, through
@@ -310,7 +311,7 @@ SELECT duckdb.raw_query($$
     (2, now(), 'globex', 249.50, '{"tier":"silver"}')$$);
 ```
 
-#### Adopting the Table Read-Only
+### Adopting the Table Read-Only
 
 Adoption takes one call and no column list. The view goes in the PostgreSQL
 schema `public`; `lake` is the Iceberg namespace, and no PostgreSQL schema of
@@ -341,7 +342,7 @@ ERROR:  coldfront: "public.orders" is adopted read-only
 HINT:  Release it with coldfront.release_iceberg_table() and adopt again with p_writable => true to arm INSERT/UPDATE/DELETE.
 ```
 
-#### Enabling Writes
+### Enabling Writes
 
 Adoption binds the name once, so to enable writes, you release the table with
 `coldfront.release_iceberg_table()` and adopt it again with
@@ -361,7 +362,7 @@ DELETE FROM orders WHERE order_id = 1;
 SELECT order_id, customer, amount FROM orders ORDER BY order_id;
 ```
 
-#### Restoring a Type Iceberg Cannot Record
+### Restoring a Type Iceberg Cannot Record
 
 The `meta` column reads as text, because Iceberg stores JSON as `VARCHAR` and
 records no PostgreSQL type. `p_types` restores the column's type, and the
@@ -376,7 +377,7 @@ SELECT coldfront.adopt_iceberg_table('public', 'orders', 'lake',
 SELECT order_id, meta->>'tier' AS tier FROM orders ORDER BY order_id;
 ```
 
-#### Handing the Table Back
+### Handing the Table Back
 
 The `coldfront.release_iceberg_table()` function removes the view and the
 registry row and performs no Iceberg I/O, so the table keeps every row and

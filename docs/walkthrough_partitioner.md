@@ -78,8 +78,9 @@ directory if you used the installer.
 As you work through the walkthrough:
 
 - paste each shell command into a terminal.
-- paste each SQL block into a psql session that you open with
-  `psql postgresql://coldfront@localhost:5432/coldfront`.
+- paste each SQL block into a psql session that you open with the following
+  command, which hides the informational notices that pg_duckdb prints:
+  `psql "postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning"`.
 
 <div class="admonition hint">
 <p class="admonition-title">Hint</p>
@@ -105,11 +106,11 @@ When the stack is running, continue with the first step,
 
 ## Performing the Walkthrough Steps
 
-Every method of running the walkthrough performs the following steps in
-order. If you are running the walkthrough manually, paste each code block into
-a terminal or a psql session. If you are using the interactive guide or a
-Codespace, the following sections explain what each step does and what its
-output shows.
+The following sections explain what each step does and what its output shows.
+If you are running the walkthrough manually, paste each code block into a
+terminal or a psql session, in order. The interactive guide follows the same
+sequence but may combine or skip some steps, so its output can differ from the
+output on this page.
 
 ### Creating the Demo Table
 
