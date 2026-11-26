@@ -121,7 +121,7 @@ curl -sf -X POST http://localhost:${LK_PORT}/management/v1/bootstrap \
   -d '{"accept-terms-of-use":true}'
 
 # Create the warehouse (retried by guide.sh until 200)
-curl -sf -X POST http://localhost:${LK_PORT}/management/v1/warehouse \
+curl -s -X POST http://localhost:${LK_PORT}/management/v1/warehouse \
   -H 'Content-Type: application/json' \
   -d '{
     "warehouse-name": "wh",
@@ -141,9 +141,13 @@ curl -sf -X POST http://localhost:${LK_PORT}/management/v1/warehouse \
       "aws-access-key-id": "admin",
       "aws-secret-access-key": "adminsecret"
     }
-  }' \
-  || echo "The warehouse create failed - it already exists, or SeaweedFS is not ready yet."
+  }'
 ```
+
+A successful warehouse request prints the `warehouse-id` of the new warehouse.
+If the request prints an error because SeaweedFS is not ready yet, run the
+commands again. If the error says that the `wh` warehouse already exists,
+continue without running the commands again.
 
 Then create the extensions and form the mesh, running each statement on the
 node its comment names:
