@@ -69,6 +69,11 @@ docker compose -f examples/walkthrough/docker-compose.yml \
   build archiver
 ```
 
+When the code block finishes, a check mark and the run time appear under the
+commands, and the Compose output appears below the code block:
+
+![The finished start-up code block in a Codespace, with its check mark, run time, and Compose output](img/codespace_startup.png)
+
 Run the following code block to bootstrap Lakekeeper, create the `wh` warehouse
 backed by SeaweedFS, and seed the `public` namespace. The code block makes one
 attempt, so run it again if the warehouse request fails:
@@ -113,6 +118,10 @@ else
     -d '{"namespace":["public"]}'
 fi
 ```
+
+When the bootstrap succeeds, the output shows the new `public` namespace:
+
+![The finished bootstrap code block in a Codespace, with the public namespace in its output](img/codespace_bootstrap.png)
 
 Then click the triangle beside each code block that follows, in order,
 starting with the first step, [Checking the Stack](#checking-the-stack).
