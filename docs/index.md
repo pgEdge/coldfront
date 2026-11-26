@@ -98,7 +98,7 @@ needs. Prepare a Codespace or your own system as described on the
 [Exploring ColdFront](exploring_coldfront/index.md) page, and then continue to
 the guide for the mode you want to try:
 
-- [Exploring Tiered Storage](walkthrough_tiered.md)
+- [Exploring Tiered Mode](walkthrough_tiered.md)
 - [Exploring Decoupled Mode](walkthrough_decoupled.md)
 - [Exploring Distributed Mode](walkthrough_distributed.md)
 - [Exploring the Standalone Partitioner](walkthrough_partitioner.md)

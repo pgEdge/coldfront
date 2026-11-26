@@ -80,9 +80,9 @@ nav:
       - Using ColdFront in Standalone Partitioned Mode: usage_partitioner.md
       - Working with Embeddings: usage_vectors.md
 
-  - Exploring ColdFront Modes:
+  - Exploring ColdFront:
       - exploring_coldfront/index.md
-      - Exploring Tiered Storage: walkthrough_tiered.md
+      - Exploring Tiered Mode: walkthrough_tiered.md
       - Exploring Decoupled Mode: walkthrough_decoupled.md
       - Exploring Distributed Mode: walkthrough_distributed.md
       - Exploring the Standalone Partitioner: walkthrough_partitioner.md

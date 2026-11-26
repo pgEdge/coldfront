@@ -29,7 +29,7 @@ The walkthroughs include detailed demonstrations of each of the following
 topics:
 
 - keeping recent data in PostgreSQL and archiving older data to cold Iceberg;
-  see [Exploring Tiered Storage](../walkthrough_tiered.md).
+  see [Exploring Tiered Mode](../walkthrough_tiered.md).
 - storing a table entirely in Iceberg from the first row; see
   [Exploring Decoupled Mode](../walkthrough_decoupled.md).
 - running two PostgreSQL nodes over one shared lake; see
@@ -152,7 +152,7 @@ Exploring ColdFront page:
 
 ![The Exploring ColdFront page open as a notebook in a Codespace](../img/codespace_exploring_page.png)
 
-Select a walkthrough to continue; for example, the Exploring Tiered Storage
+Select a walkthrough to continue; for example, the Exploring Tiered Mode
 link opens the tiered walkthrough:
 
 ![The tiered walkthrough open as a notebook in a Codespace](../img/codespace_tiered_page.png)

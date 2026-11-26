@@ -1,7 +1,7 @@
 ---
 cwd: ../
 ---
-# Exploring Tiered Storage
+# Exploring Tiered Mode
 
 Tiered storage adds ColdFront to an existing PostgreSQL database. You begin
 with a plain database full of data, add ColdFront to it, and let the archiver
@@ -47,9 +47,9 @@ created before returning to the menu.
 Create the Codespace as described in
 [Running the Walkthrough in a Codespace](exploring_coldfront/index.md#running-the-walkthrough-in-a-codespace).
 The Codespace opens the Exploring ColdFront page; click Exploring Tiered
-Storage to open this page as a notebook:
+Mode to open this page as a notebook:
 
-![Exploring Tiered Storage open as a notebook in a Codespace](img/codespace_tiered_page.png)
+![Exploring Tiered Mode open as a notebook in a Codespace](img/codespace_tiered_page.png)
 
 To run a code block, click the triangle to the left of the code block.
 
