@@ -45,17 +45,17 @@ The ColdFront documentation consists of the following guides:
       Documents managing PostgreSQL partitions with no cold tier at all.
     - [Working with Embeddings](docs/usage_vectors.md) - Documents storing and
       searching embeddings with the pgvector interface.
-- [Exploring ColdFront Modes](docs/exploring_coldfront/index.md) - Sets up the
-  demo stack and runs ColdFront hands-on.
-    - [Exploring Tiered Storage](docs/walkthrough_tiered.md) - Adds ColdFront
+- [Exploring ColdFront](docs/exploring_coldfront/index.md) - Runs each
+  ColdFront mode hands-on in a self-contained walkthrough.
+    - [Exploring Tiered Mode](docs/walkthrough_tiered.md) - Adds ColdFront
       to an existing database and moves its cold data to object storage.
     - [Exploring Decoupled Mode](docs/walkthrough_decoupled.md) - Stores a
       table in Iceberg from the first row and adopts a table that another
       engine wrote.
-    - [Exploring the Standalone Partitioner](docs/walkthrough_partitioner.md) -
-      Manages PostgreSQL range partitions without any cold tier.
     - [Exploring Distributed Mode](docs/walkthrough_distributed.md) - Points
       two PostgreSQL nodes at one shared lake.
+    - [Exploring the Standalone Partitioner](docs/walkthrough_partitioner.md) -
+      Manages PostgreSQL range partitions without any cold tier.
 - [Connecting to ColdFront](docs/connecting.md) - Documents onboarding an
   application role with least privilege.
 - Administration
@@ -704,7 +704,7 @@ pgedge-coldfront/
 │   ├── architecture_tiered.md · architecture_decoupled.md
 │   ├── architecture_vectors.md · changelog.md · LICENSE.md
 │   ├── architecture_guides/    ← Architecture Guides landing page (index.md)
-│   ├── exploring_coldfront/    ← Exploring ColdFront Modes landing page (index.md)
+│   ├── exploring_coldfront/    ← Exploring ColdFront landing page (index.md)
 │   ├── using_coldfront/        ← Using ColdFront landing page (index.md)
 │   └── formal/                 ← TLA+ model of the bakery protocol (Bakery.tla)
 ├── examples/walkthrough/       ← interactive walkthrough (guide.sh, its compose stack and configs)
