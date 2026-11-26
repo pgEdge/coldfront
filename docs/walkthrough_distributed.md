@@ -46,18 +46,19 @@ everything.
 
 ## Running the Walkthrough in a Codespace
 
-In a Codespace, open a terminal, run the following command, and choose
-`4) Distributed`. The guide then runs the walkthrough as described in
-[Running the Interactive Walkthrough on the Command Line](#running-the-interactive-walkthrough-on-the-command-line):
+In a Codespace, open a terminal and start the interactive guide, then choose
+`4) Distributed` from its menu. When the single-node stack is ready, the guide
+displays its menu in the Codespace terminal:
+
+![The interactive guide's menu in a Codespace terminal, after the stack is ready](img/codespace_distributed_guide.png)
+
+The guide then runs the walkthrough as described in
+[Running the Interactive Walkthrough on the Command Line](#running-the-interactive-walkthrough-on-the-command-line).
+Use the following command to start the guide:
 
 ```bash {"ignore":"true"}
 bash examples/walkthrough/guide.sh
 ```
-
-When the single-node stack is ready, the guide shows its menu in the Codespace
-terminal:
-
-![The interactive guide's menu in a Codespace terminal, after the stack is ready](img/codespace_distributed_guide.png)
 
 ## Running the Walkthrough Manually
 
@@ -74,7 +75,7 @@ psql "postgresql://coldfront@localhost:5442/coldfront?options=-cclient_min_messa
 psql "postgresql://coldfront@localhost:5443/coldfront?options=-cclient_min_messages%3Dwarning"   # db2
 ```
 
-Start with the first step,
+Start with the first step in the walkthrough,
 [Bringing Up the Two-Node Mesh](#bringing-up-the-two-node-mesh), which starts
 the two-node stack.
 

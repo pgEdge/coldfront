@@ -39,16 +39,16 @@ Standalone Partitioner to open this page as a notebook:
 
 ![Exploring the Standalone Partitioner open as a notebook in a Codespace](img/codespace_partitioner_page.png)
 
-To run a code block, click the triangle to the left of the code block.
+Run the first code block to start the containers. To run a code block, click
+the triangle to the left of the code block. When the code block finishes, a
+check mark and the run time appear under the commands, and the Compose output
+appears below the code block:
 
-<div class="admonition hint">
-<p class="admonition-title">Hint</p>
-<p>The first time you start the stack, Docker builds the images, which can take
-several minutes. If you start the stack again, Docker reuses the images and the
-stack starts within a minute.</p>
-</div>
+![The finished start-up code block in a Codespace, with its check mark, run time, and Compose output](img/codespace_partitioner_startup.png)
 
-Run the following code block to start the containers:
+Commands in the first code block build the images, start PostgreSQL,
+Lakekeeper, and SeaweedFS in the background, and build the archiver image,
+which also contains the partitioner that this walkthrough runs:
 
 ```bash
 docker compose -f examples/walkthrough/docker-compose.yml \
@@ -57,13 +57,9 @@ docker compose -f examples/walkthrough/docker-compose.yml \
   build archiver
 ```
 
-When the code block finishes, a check mark and the run time appear under the
-commands, and the Compose output appears below the code block:
-
-![The finished start-up code block in a Codespace, with its check mark, run time, and Compose output](img/codespace_partitioner_startup.png)
-
 Then click the triangle beside each code block that follows, in order, starting
-with the first step, [Creating the Demo Table](#creating-the-demo-table).
+with the first step in the walkthrough,
+[Creating the Demo Table](#creating-the-demo-table).
 
 ## Running the Walkthrough Manually
 
@@ -82,13 +78,6 @@ As you work through the walkthrough:
   command, which hides the informational notices that pg_duckdb prints:
   `psql "postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning"`.
 
-<div class="admonition hint">
-<p class="admonition-title">Hint</p>
-<p>The first time you start the stack, Docker builds the images, which can take
-several minutes. If you start the stack again, Docker reuses the images and the
-stack starts within a minute.</p>
-</div>
-
 Use the following commands to start the containers:
 
 ```bash {"ignore":"true"}
@@ -101,7 +90,7 @@ docker compose -f examples/walkthrough/docker-compose.yml \
 If port 5432, 8181, or 8333 is already in use on your host, see
 [Changing Port Assignments](exploring_coldfront/index.md#changing-port-assignments).
 
-When the stack is running, continue with the first step,
+When the stack is running, continue with the first step in the walkthrough,
 [Creating the Demo Table](#creating-the-demo-table).
 
 ## Performing the Walkthrough Steps

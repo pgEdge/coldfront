@@ -51,16 +51,16 @@ Mode to open this page as a notebook:
 
 ![Exploring Tiered Mode open as a notebook in a Codespace](img/codespace_tiered_page.png)
 
-To run a code block, click the triangle to the left of the code block.
+Run the first code block to start the containers. To run a code block, click
+the triangle to the left of the code block. When the code block finishes, a
+check mark and the run time appear under the commands, and the Compose output
+appears below the code block:
 
-<div class="admonition hint">
-<p class="admonition-title">Hint</p>
-<p>The first time you start the stack, Docker builds the images, which can take
-several minutes. If you start the stack again, Docker reuses the images and the
-stack starts within a minute.</p>
-</div>
+![The finished start-up code block in a Codespace, with its check mark, run time, and Compose output](img/codespace_startup.png)
 
-Run the following code block to start the containers:
+Commands in the first code block build the images, start PostgreSQL,
+Lakekeeper, and SeaweedFS in the background, and build the archiver image,
+which the walkthrough uses later to move cold data:
 
 ```bash
 docker compose -f examples/walkthrough/docker-compose.yml \
@@ -69,14 +69,15 @@ docker compose -f examples/walkthrough/docker-compose.yml \
   build archiver
 ```
 
-When the code block finishes, a check mark and the run time appear under the
-commands, and the Compose output appears below the code block:
+Run the second code block to prepare Lakekeeper, the Iceberg catalog. When the
+bootstrap succeeds, the output displays the new `public` namespace:
 
-![The finished start-up code block in a Codespace, with its check mark, run time, and Compose output](img/codespace_startup.png)
+![The finished bootstrap code block in a Codespace, with the public namespace in its output](img/codespace_bootstrap.png)
 
-Run the following code block to bootstrap Lakekeeper, create the `wh` warehouse
-backed by SeaweedFS, and seed the `public` namespace. The code block makes one
-attempt, so run it again if the warehouse request fails:
+The code block bootstraps Lakekeeper, creates the `wh` warehouse that stores
+its tables in SeaweedFS, and creates the `public` namespace in that warehouse.
+The code block makes one attempt, so run the block again if the warehouse
+request fails:
 
 ```bash
 # Bootstrap Lakekeeper (one-time per fresh stack)
@@ -119,12 +120,9 @@ else
 fi
 ```
 
-When the bootstrap succeeds, the output shows the new `public` namespace:
-
-![The finished bootstrap code block in a Codespace, with the public namespace in its output](img/codespace_bootstrap.png)
-
-Then click the triangle beside each code block that follows, in order,
-starting with the first step, [Checking the Stack](#checking-the-stack).
+Then click the triangle beside each code block that follows, in order, starting
+with the first step in the walkthrough,
+[Checking the Stack](#checking-the-stack).
 
 ## Running the Walkthrough Manually
 
@@ -142,13 +140,6 @@ As you work through the walkthrough:
 - paste each SQL block into a psql session that you open with the following
   command, which hides the informational notices that pg_duckdb prints:
   `psql "postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning"`.
-
-<div class="admonition hint">
-<p class="admonition-title">Hint</p>
-<p>The first time you start the stack, Docker builds the images, which can take
-several minutes. If you start the stack again, Docker reuses the images and the
-stack starts within a minute.</p>
-</div>
 
 Use the following commands to start the containers and then bootstrap
 Lakekeeper:
@@ -204,7 +195,7 @@ fi
 If port 5432, 8181, or 8333 is already in use on your host, see
 [Changing Port Assignments](exploring_coldfront/index.md#changing-port-assignments).
 
-When the stack is running, continue with the first step,
+When the stack is running, continue with the first step in the walkthrough,
 [Checking the Stack](#checking-the-stack).
 
 ## Performing the Walkthrough Steps

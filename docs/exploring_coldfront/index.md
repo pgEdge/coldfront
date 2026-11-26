@@ -67,6 +67,13 @@ your system meets the following prerequisites:
 - `ss` on Linux or `lsof` on macOS, which the interactive guide uses to find
   free ports.
 
+<div class="admonition hint">
+<p class="admonition-title">Hint</p>
+<p>The first time you start the stack, Docker builds the images, which can take
+several minutes. If you start the stack again, Docker reuses the images and the
+stack starts within a minute.</p>
+</div>
+
 ## Running the Interactive Walkthrough on the Command Line
 
 On the command line, the interactive guide walks you through the deployment of
