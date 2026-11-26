@@ -93,15 +93,15 @@ tier, so the application sees one relation:
 ## Exploring ColdFront with Walkthroughs
 
 Use the walkthroughs in the [Exploring ColdFront](exploring_coldfront/index.md)
-section to learn more about ColdFront. Perform the steps on the
-[Exploring ColdFront - Getting Started](exploring_coldfront/index.md) page
-first, which brings up the stack; then continue to the detailed guide for
-the mode you want to try:
+section to learn more about ColdFront. Each walkthrough starts the stack it
+needs. Prepare a Codespace or your own system as described on the
+[Exploring ColdFront](exploring_coldfront/index.md) page, and then continue to
+the guide for the mode you want to try:
 
-- [Exploring Tiered Storage](walkthrough_tiered.md)
+- [Exploring Tiered Mode](walkthrough_tiered.md)
 - [Exploring Decoupled Mode](walkthrough_decoupled.md)
-- [Exploring the Standalone Partitioner](walkthrough_partitioner.md)
 - [Exploring Distributed Mode](walkthrough_distributed.md)
+- [Exploring the Standalone Partitioner](walkthrough_partitioner.md)
 
 ## Next Steps
 

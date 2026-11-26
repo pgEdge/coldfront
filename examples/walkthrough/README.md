@@ -9,8 +9,8 @@ management, all through standard SQL.
 > [docs/exploring_coldfront/index.md](../../docs/exploring_coldfront/index.md),
 > with one page per demo: [tiered](../../docs/walkthrough_tiered.md),
 > [decoupled](../../docs/walkthrough_decoupled.md),
-> [partitioner](../../docs/walkthrough_partitioner.md), and
-> [distributed](../../docs/walkthrough_distributed.md). This README covers how
+> [distributed](../../docs/walkthrough_distributed.md), and
+> [partitioner](../../docs/walkthrough_partitioner.md). This README covers how
 > the walkthrough is structured and how to run it.
 
 ## How Users Reach the Walkthrough

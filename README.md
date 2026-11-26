@@ -18,9 +18,9 @@ The ColdFront documentation consists of the following guides:
       vector storage internals: type mapping, routing state, cluster
       assignment, and layout.
 - Installing and Configuring ColdFront
-    - [Installing ColdFront](docs/installation.md) - Documents installing from
-      a package or building from source (Docker or bare-metal), and testing and
-      CI.
+    - [Installing ColdFront](docs/installation.md) - Links to the package
+      installation guides and documents building from source (Docker or
+      bare-metal) and ColdFront's DuckDB stack.
     - [Configuring ColdFront](docs/configuration.md) - Documents configuring
       PostgreSQL and ColdFront's own configuration.
         - [Configuring Lakekeeper](docs/configure_lakekeeper.md) - Installs,
@@ -45,17 +45,17 @@ The ColdFront documentation consists of the following guides:
       Documents managing PostgreSQL partitions with no cold tier at all.
     - [Working with Embeddings](docs/usage_vectors.md) - Documents storing and
       searching embeddings with the pgvector interface.
-- [Exploring ColdFront Modes](docs/exploring_coldfront/index.md) - Sets up the
-  demo stack and runs ColdFront hands-on.
-    - [Exploring Tiered Storage](docs/walkthrough_tiered.md) - Adds ColdFront
+- [Exploring ColdFront](docs/exploring_coldfront/index.md) - Runs each
+  ColdFront mode hands-on in a self-contained walkthrough.
+    - [Exploring Tiered Mode](docs/walkthrough_tiered.md) - Adds ColdFront
       to an existing database and moves its cold data to object storage.
     - [Exploring Decoupled Mode](docs/walkthrough_decoupled.md) - Stores a
       table in Iceberg from the first row and adopts a table that another
       engine wrote.
-    - [Exploring the Standalone Partitioner](docs/walkthrough_partitioner.md) -
-      Manages PostgreSQL range partitions without any cold tier.
     - [Exploring Distributed Mode](docs/walkthrough_distributed.md) - Points
       two PostgreSQL nodes at one shared lake.
+    - [Exploring the Standalone Partitioner](docs/walkthrough_partitioner.md) -
+      Manages PostgreSQL range partitions without any cold tier.
 - [Connecting to ColdFront](docs/connecting.md) - Documents onboarding an
   application role with least privilege.
 - Administration
@@ -196,128 +196,27 @@ build it from source in a Docker container or on bare metal.
 
 ### Installing and Configuring ColdFront with Packages
 
-In the sections that follow, we'll walk you through installing PostgreSQL and
-ColdFront using packages. ColdFront packages come from the pgEdge package
-repository, which requires a certificate from pgEdge. First, request a
-certificate and install it, then configure the repository for your platform,
-as described in the
-[pgEdge Enterprise Postgres guide](https://docs.pgedge.com/enterprise/).
+pgEdge publishes ColdFront packages for PostgreSQL 16, 17, and 18 in the pgEdge
+Enterprise Postgres repository. The ColdFront packages provide everything that
+a build from source requires you to install manually, so a package installation
+needs no compiler, Go toolchain, or PostgreSQL development headers. The
+packages install the compiled `coldfront` extension, the `archiver`,
+`partitioner`, and `compactor` command-line tools, and the Lakekeeper catalog.
+The extension package depends on pg_duckdb and ColdFront's DuckDB extensions,
+so the package manager installs them as well. Both are patched builds rather
+than the upstream releases; they include ColdFront's patches to duckdb-iceberg,
+pg_duckdb, and DuckDB.
+[Understanding ColdFront's DuckDB Stack](docs/installation.md#understanding-coldfronts-duckdb-stack)
+describes each patch and why ColdFront applies it.
 
-If you already have a pgEdge Enterprise Postgres server installed that you
-would like to use, configure the pgEdge repository and install only ColdFront,
-continuing with
-[Installing the ColdFront Packages](#installing-the-coldfront-packages).
-ColdFront packages from pgEdge require pgEdge's PostgreSQL build.
-
-#### Installing PostgreSQL with Packages
-
-Before installing ColdFront, you will need to install pgEdge Enterprise Postgres
-and start the server. On RHEL, Rocky Linux, or AlmaLinux, the package does not
-create a database cluster, so create and start one:
-
-```bash
-sudo dnf install -y pgedge-enterprise-postgres_18
-sudo /usr/pgsql-18/bin/postgresql-18-setup initdb
-sudo systemctl enable --now postgresql-18
-```
-
-On Ubuntu or Debian, install the package, then check for a cluster with
-`sudo pg_lsclusters`. If it lists no `18/main` cluster, create and start one:
-
-```bash
-sudo apt update
-sudo apt install -y pgedge-enterprise-postgres-18
-sudo pg_lsclusters
-sudo pg_createcluster 18 main --start      # only if pg_lsclusters lists none
-```
-
-On either platform, confirm that the server is running before you continue:
-
-```bash
-sudo -u postgres psql -c "SELECT version();"
-```
-
-The command prints the PostgreSQL version. A connection error means the server
-is not running; check `sudo systemctl status postgresql-18` on RHEL-family
-systems or `sudo pg_lsclusters` on Ubuntu and Debian.
-
-#### Installing the ColdFront Packages
-
-Install the ColdFront extension package for your PostgreSQL major version, the
-ColdFront command-line tools (the archiver, the partitioner, and the
-compactor), and Lakekeeper (the Iceberg catalog). The package manager also
-installs pg_duckdb and ColdFront's DuckDB extensions.
-
-For PostgreSQL 18 on RHEL, Rocky Linux, or AlmaLinux:
-
-```bash
-sudo dnf install -y pgedge-coldfront_18 pgedge-coldfront pgedge-lakekeeper
-```
-
-For PostgreSQL 18 on Ubuntu or Debian:
-
-```bash
-sudo apt install -y pgedge-postgresql-18-coldfront pgedge-coldfront \
-  pgedge-lakekeeper
-```
-
-The `pgedge-lakekeeper` package installs Lakekeeper but does not start it; you
-configure and start it later, in
-[Connecting ColdFront to Lakekeeper and Object Storage](#connecting-coldfront-to-lakekeeper-and-object-storage).
-For repository setup and every package name, see
-[Using a Package to Install ColdFront](docs/installation.md#using-a-package-to-install-coldfront).
-
-#### Configuring PostgreSQL and Creating the Extensions
-
-After installing the packages, use the following steps to configure
-PostgreSQL and create the extensions:
-
-1. Add the following settings to `postgresql.conf`. The file is in
-    `/var/lib/pgsql/18/data/` on RHEL-family systems, and in
-    `/etc/postgresql/18/main/` on Ubuntu and Debian:
-
-    ```ini
-    shared_preload_libraries = 'pg_duckdb,coldfront'
-    duckdb.extension_directory = '/usr/lib/pgedge/coldfront/duckdb-extensions'
-    duckdb.allow_unsigned_extensions = true
-    duckdb.autoinstall_known_extensions = false
-    duckdb.postgres_role = 'coldfront_duckdb'
-    coldfront.warehouse = 'wh'
-    coldfront.lakekeeper_endpoint = 'http://<lakekeeper-host>:8181/catalog'
-    ```
-
-    - `duckdb.extension_directory`, `duckdb.allow_unsigned_extensions`, and
-      `duckdb.autoinstall_known_extensions` make pg_duckdb load ColdFront's
-      patched DuckDB extensions. Without them, pg_duckdb can fetch the
-      unpatched upstream extensions instead.
-    - `duckdb.postgres_role` lets the application roles you grant access to run
-      DuckDB; without it, only superusers can.
-    - `coldfront.warehouse` names the `wh` warehouse that
-      [Connecting ColdFront to Lakekeeper and Object Storage](#connecting-coldfront-to-lakekeeper-and-object-storage)
-      creates.
-
-2. Restart PostgreSQL. `CREATE EXTENSION coldfront` fails on a server that
-    does not preload the extension:
-
-    ```bash
-    sudo systemctl restart postgresql-18           # RHEL, Rocky Linux, AlmaLinux
-    sudo systemctl restart postgresql@18-main      # Ubuntu, Debian
-    ```
-
-3. Connect as the `postgres` superuser with `sudo -u postgres psql`, create
-    the role that `duckdb.postgres_role` names, and create the extensions:
-
-    ```sql
-    CREATE ROLE coldfront_duckdb NOLOGIN;
-    CREATE EXTENSION pg_duckdb;
-    CREATE EXTENSION coldfront;
-    ```
-
-    You create the role once for the PostgreSQL server. Run the
-    `CREATE EXTENSION` commands in each database that uses ColdFront.
-
-When the extensions are created, continue with
-[Connecting a Package or Bare-Metal Installation to Lakekeeper and an Object Store](#connecting-a-package-or-bare-metal-installation-to-lakekeeper-and-an-object-store).
+The pgEdge Enterprise Postgres repository requires a certificate from pgEdge.
+The pgEdge Enterprise Postgres documentation describes the complete package
+installation, from configuring the repository through starting Lakekeeper, on
+[Enterprise Linux](https://docs.pgedge.com/enterprise/el/components/coldfront/)
+and on
+[Debian and Ubuntu](https://docs.pgedge.com/enterprise/debian/components/coldfront/).
+Those pages then link to the ColdFront guides for bootstrapping Lakekeeper,
+configuring the object store, and writing ColdFront's configuration.
 
 ### Installing and Configuring ColdFront in a Docker Container
 
@@ -464,7 +363,7 @@ For more information, see
 [Building ColdFront from Source on Bare Metal](docs/installation.md#building-coldfront-from-source-on-bare-metal).
 
 When the extensions are created, continue with
-[Connecting a Package or Bare-Metal Installation to Lakekeeper and an Object Store](#connecting-a-package-or-bare-metal-installation-to-lakekeeper-and-an-object-store).
+[Connecting a Bare-Metal Installation to Lakekeeper and an Object Store](#connecting-a-bare-metal-installation-to-lakekeeper-and-an-object-store).
 
 ### Connecting ColdFront to Lakekeeper and Object Storage
 
@@ -478,10 +377,9 @@ set up the object store and the Lakekeeper warehouse once for each deployment.
 The store's credential is kept in each database, so you repeat the credential
 step in every database that uses ColdFront.
 
-#### Connecting a Package or Bare-Metal Installation to Lakekeeper and an Object Store
+#### Connecting a Bare-Metal Installation to Lakekeeper and an Object Store
 
-A package or bare-metal installation runs Lakekeeper and an object store on
-the host.
+A bare-metal installation runs Lakekeeper and an object store on the host.
 
 1. Start an object store. If you're walking through this installation to
     evaluate ColdFront, you can use SeaweedFS, a free S3-compatible store, on
@@ -507,17 +405,8 @@ the host.
     [Configuring your Object Store](docs/object_store.md) guide covers
     configuration of each one, including production stores.
 
-2. Install Lakekeeper. If you installed ColdFront from packages, Lakekeeper is
-    already installed; continue with step 3. On bare metal with the pgEdge
-    repository configured, install the `pgedge-lakekeeper` package:
-
-    ```bash
-    sudo dnf install -y pgedge-lakekeeper        # RHEL, Rocky Linux, AlmaLinux
-    sudo apt install -y pgedge-lakekeeper        # Ubuntu, Debian
-    ```
-
-    If you're not using the pgEdge repository, install the upstream binary and
-    create the `lakekeeper` user as described in steps 1 and 2 of
+2. Install Lakekeeper. Install the upstream binary and create the
+    `lakekeeper` user as described in steps 1 and 2 of
     [Installing and Configuring Lakekeeper on Bare Metal](docs/configure_lakekeeper.md#installing-and-configuring-lakekeeper-on-bare-metal).
     Then copy the environment file and the systemd unit from the ColdFront
     repository:
@@ -554,8 +443,8 @@ the host.
     By default, Lakekeeper listens on every address and accepts every request.
     The loopback bind keeps it reachable only from this host. To accept clients
     from other hosts, configure authentication and authorization first, as
-    described in step 5 of
-    [Installing and Configuring Lakekeeper with Packages](docs/configure_lakekeeper.md#installing-and-configuring-lakekeeper-with-packages).
+    described in step 7 of
+    [Installing and Configuring Lakekeeper on Bare Metal](docs/configure_lakekeeper.md#installing-and-configuring-lakekeeper-on-bare-metal).
 
 5. Run the one-time migration as the `lakekeeper` user, then start
     Lakekeeper. The migration reads the environment file as that user, because
@@ -790,7 +679,7 @@ pgedge-coldfront/
 │   ├── architecture_tiered.md · architecture_decoupled.md
 │   ├── architecture_vectors.md · changelog.md · LICENSE.md
 │   ├── architecture_guides/    ← Architecture Guides landing page (index.md)
-│   ├── exploring_coldfront/    ← Exploring ColdFront Modes landing page (index.md)
+│   ├── exploring_coldfront/    ← Exploring ColdFront landing page (index.md)
 │   ├── using_coldfront/        ← Using ColdFront landing page (index.md)
 │   └── formal/                 ← TLA+ model of the bakery protocol (Bakery.tla)
 ├── examples/walkthrough/       ← interactive walkthrough (guide.sh, its compose stack and configs)
