@@ -45,14 +45,14 @@ EXPLAIN (COSTS OFF, VERBOSE)
 -- by default so the dual-tier CTE is emitted.
 EXPLAIN (COSTS OFF, VERBOSE)
   UPDATE public.events SET status = 'has $MTQ$ in dual' WHERE status = 'ok';
-                                                                                             QUERY PLAN                                                                                             
-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                        QUERY PLAN                                                                                         
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Update on public._events
    CTE coldfront_cold
      ->  Update on coldfront._dummy_dml_target
            ->  Seq Scan on coldfront._dummy_dml_target
                  Output: _dummy_dml_target.anchor, _dummy_dml_target.ctid
-                 Filter: (_exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET status = ''has $MTQ$ in dual''::text   WHERE (status = ''ok''::text)'::text) IS NULL)
+                 Filter: (_exec_dual_cold('ice.default.events'::text, 'UPDATE ice.default.events SET status = ''has $MTQ$ in dual''::text   WHERE (status = ''ok''::text)'::text) IS NULL)
    ->  Seq Scan on public._events
          Output: 'has $MTQ$ in dual'::text, _events.ctid
          Filter: (_events.status = 'ok'::text)

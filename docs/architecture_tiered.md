@@ -546,7 +546,7 @@ The hook emits a dual-tier CTE:
 ```sql
 WITH coldfront_cold AS (
     UPDATE coldfront._dummy_dml_target SET anchor = anchor
-     WHERE coldfront._exec_iceberg_with_claim(
+     WHERE coldfront._exec_dual_cold(
                'ice.public.events',
                'UPDATE ice.public.events SET ... WHERE ...') IS NULL)
 UPDATE _events SET ... WHERE ...;
@@ -555,14 +555,18 @@ UPDATE _events SET ... WHERE ...;
 The hot `UPDATE` is the statement itself. The cold write runs in a
 data-modifying `WITH` entry, which PG always runs to completion, so the cold
 write happens when no hot row matches; the entry's own `UPDATE` matches no row
-and writes nothing. The hook also sets
-`duckdb.unsafe_allow_mixed_transactions = on` LOCAL for the current
-transaction to clear pg_duckdb's pre-commit mixed-write check. pg_duckdb's
-`XactCallback` ties DuckDB's transaction to PG's, so `ROLLBACK` undoes both
-tiers - but the path is **not crash-safe**: a backend crash between the Iceberg
-upload and the PG commit can leave orphaned object-storage files referenced by
-an uncommitted snapshot. Iceberg housekeeping (orphan-file expiry) reclaims
-them. Strict mode avoids this path entirely.
+and writes nothing. ColdFront's planner hook sets
+`duckdb.unsafe_allow_mixed_transactions = on` LOCAL whenever it plans the
+statement, ahead of pg_duckdb's mixed-write check at planning. The cold call,
+`coldfront._exec_dual_cold`, sets the parameter again whenever the statement
+runs, then makes the cold write through `coldfront._exec_iceberg_with_claim`.
+The second setting clears pg_duckdb's pre-commit check when a prepared
+statement or a PL/pgSQL function runs a saved plan without planning it again.
+pg_duckdb's `XactCallback` ties DuckDB's transaction to PG's, so `ROLLBACK`
+undoes both tiers - but the path is **not crash-safe**: a backend crash between
+the Iceberg upload and the PG commit can leave orphaned object-storage files
+referenced by an uncommitted snapshot. Iceberg housekeeping (orphan-file
+expiry) reclaims them. Strict mode avoids this path entirely.
 
 A cold-only `UPDATE` or `DELETE` sets nothing, so a transaction block that
 holds one cannot also write a PostgreSQL table unless the session sets the

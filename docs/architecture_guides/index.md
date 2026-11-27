@@ -339,8 +339,10 @@ inside a plpgsql function / `DO` block / trigger, via two mechanisms:
     false, **zero rows match - the carrier is never written: no dead rows, no
     WAL, no bloat.** For dual-tier and tiered-INSERT the hot DML is the outer
     statement and this same UPDATE runs inside a data-modifying `WITH`-CTE. A
-    dual-tier write has this form at the top level too, and a top-level
-    cold-only write keeps the plain
+    dual-tier write has this form at the top level too, and calls
+    `coldfront._exec_dual_cold`, which sets
+    `duckdb.unsafe_allow_mixed_transactions` and then calls
+    `_exec_iceberg_with_claim`. A top-level cold-only write keeps the plain
     `SELECT coldfront._exec_iceberg_with_claim(...)` shape.
 
 "Inside plpgsql" is detected via `pstate->p_post_columnref_hook != NULL`

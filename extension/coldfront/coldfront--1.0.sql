@@ -105,6 +105,8 @@ CREATE TABLE IF NOT EXISTS coldfront.archive_watermark (
 --   UPDATE coldfront._dummy_dml_target SET anchor = anchor
 --    WHERE coldfront._exec_iceberg_with_claim(...) IS NULL
 --
+-- (a dual-tier write calls coldfront._exec_dual_cold(...) there)
+--
 -- That is a DML (plpgsql accepts it), and the cold call runs exactly once — in
 -- the WHERE qual, evaluated against the single row. _exec_iceberg_with_claim
 -- returns VOID, and `void IS NULL` is ALWAYS false, so the WHERE matches zero
@@ -529,7 +531,7 @@ BEGIN
     FROM pg_proc p
     WHERE p.pronamespace = 'coldfront'::regnamespace
       AND p.proname IN ('ensure_attached', 'ensure_pg_attached', 'ensure_stream_attached',
-                        '_exec_iceberg_with_claim',
+                        '_exec_iceberg_with_claim', '_exec_dual_cold',
                         -- the tiered INSERT's cold stream, its snapshot and its execution-time check
                         '_tiered_cold_stream', '_stream_snapshot', '_written_in_xact',
                         -- the tiered INSERT's cold sink, its statement and its row renderer
@@ -4634,6 +4636,21 @@ BEGIN
         PERFORM coldfront._take_iceberg_claim(p_iceberg_table);
         PERFORM duckdb.raw_query(p_sql);
     END IF;
+END;
+$$;
+
+-- _exec_dual_cold runs the cold half of a dual-tier UPDATE or DELETE. That
+-- statement writes both tiers, so each run clears pg_duckdb's pre-commit
+-- mixed-write check, including a run of a plan saved in an earlier
+-- transaction (a prepared statement, a PL/pgSQL function's cached plan), which
+-- is not planned again, so coldfront_planner does not see it. SET LOCAL in the
+-- body, not a SET clause on the function, because the setting has to last
+-- until COMMIT.
+CREATE FUNCTION coldfront._exec_dual_cold(p_iceberg_table text, p_sql text)
+RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+    SET LOCAL duckdb.unsafe_allow_mixed_transactions = on;
+    PERFORM coldfront._exec_iceberg_with_claim(p_iceberg_table, p_sql);
 END;
 $$;
 

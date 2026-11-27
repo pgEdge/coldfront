@@ -38,6 +38,11 @@ this project adheres to
   example, a primary-key lookup with a time range that spans the watermark
   and leaves a single hot partition lost the write. The cold half now runs in
   a data-modifying `WITH` entry, which PostgreSQL always runs to completion.
+- A dual-tier `UPDATE` or `DELETE` run from a prepared statement, or from a
+  PL/pgSQL function already called in an earlier transaction, failed at
+  `COMMIT` inside a transaction block with "Writing to DuckDB and Postgres
+  tables in the same transaction block is not supported", and both tiers
+  rolled back.
 
 ## [1.0.0-beta4] - 2026-11-17
 

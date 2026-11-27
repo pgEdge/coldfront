@@ -1979,14 +1979,18 @@ cold_sql_arg(const char *cold_dml, ColdParamSet *ps, bool for_pg)
  * duckdb.raw_query, and releases the claim at XACT_EVENT_COMMIT, after pg_duckdb
  * has committed the Iceberg transaction at XACT_EVENT_PRE_COMMIT, via the C
  * XactCallback. Callers wrap it in a SELECT (a top-level cold-only write) or in
- * cold_anchor_update() (in plpgsql, and in every dual-tier write).
+ * cold_anchor_update() (in plpgsql, and in every dual-tier write). A dual-tier
+ * write passes mixed and calls coldfront._exec_dual_cold, which sets
+ * duckdb.unsafe_allow_mixed_transactions each time it runs and then calls
+ * _exec_iceberg_with_claim.
  */
 static char *
-cold_exec_call(const char *iceberg_table, const char *arg_sql)
+cold_exec_call(const char *iceberg_table, const char *arg_sql, bool mixed)
 {
     StringInfoData buf;
     initStringInfo(&buf);
-    appendStringInfo(&buf, "coldfront._exec_iceberg_with_claim(%s, %s)",
+    appendStringInfo(&buf, "coldfront.%s(%s, %s)",
+                     mixed ? "_exec_dual_cold" : "_exec_iceberg_with_claim",
                      quote_literal_cstr(iceberg_table), arg_sql);
     return buf.data;
 }
@@ -1997,7 +2001,8 @@ cold_exec_call(const char *iceberg_table, const char *arg_sql)
  * raise "query has no destination for result data" inside a function / DO
  * block). The call runs
  * exactly once in the WHERE qual, evaluated against the single row of
- * coldfront._dummy_dml_target; because _exec_iceberg_with_claim returns void and
+ * coldfront._dummy_dml_target; because the call (_exec_iceberg_with_claim, or
+ * _exec_dual_cold in a dual-tier write) returns void and
  * `void IS NULL` is always false, zero rows match and the table is NEVER written
  * (no dead rows, no WAL, no bloat). Used standalone for pure-cold, and as the
  * data-modifying WITH-CTE body for the dual / tiered-INSERT cases (a
@@ -2256,7 +2261,7 @@ emit_cold(Query *query, TieredViewInfo *info, ColdParamSet *ps, bool in_plpgsql)
      * them; it self-selects the R-A bakery (multi-node mesh) or a local
      * advisory lock (vanilla single-node), so this is correct in every
      * deployment. (Tiered INSERT uses a separate path, emit_tiered_insert.) */
-    call = cold_exec_call(info->iceberg_table, cold_sql_arg(cold_dml, ps, false));
+    call = cold_exec_call(info->iceberg_table, cold_sql_arg(cold_dml, ps, false), false);
 
     /* Cause 2: inside plpgsql the statement must be a DML (cold_anchor_update);
      * at top level keep the byte-identical SELECT shape. */
@@ -2296,7 +2301,7 @@ emit_dual(Query *query, TieredViewInfo *info, ColdParamSet *ps)
 
     deparse_and_find_prefix(query, &dr);
     cold_dml = build_cold_dml(&dr, info, query);
-    call     = cold_exec_call(info->iceberg_table, cold_sql_arg(cold_dml, ps, false));
+    call     = cold_exec_call(info->iceberg_table, cold_sql_arg(cold_dml, ps, false), true);
 
     initStringInfo(&buf);
     append_with_opener(&buf, &dr);
@@ -3446,13 +3451,8 @@ cf_emit_dual_path(Query *query, TieredViewInfo *info, ColdParamSet *ps,
     reject_cold_modifying_cte(query, vname);
     reject_cold_outer_cte(query, vname);
 
-    /* Permissive: clear pg_duckdb's mixed-write guard for this
-     * transaction (GUC_ACTION_LOCAL resets it at tx end) and emit
-     * a dual-tier CTE. */
-    (void) set_config_option("duckdb.unsafe_allow_mixed_transactions",
-                             "on",
-                             PGC_USERSET, PGC_S_SESSION,
-                             GUC_ACTION_LOCAL, true, 0, false);
+    /* Permissive: emit a dual-tier CTE. coldfront_planner and
+     * coldfront._exec_dual_cold clear pg_duckdb's mixed-write guard for it. */
     ensure_ice_attached_once();
     return emit_dual(query, info, ps);
 }
@@ -6607,7 +6607,7 @@ register_gucs(void)
     MarkGUCPrefixReserved("coldfront");
 }
 
-/* ---------- planner hook: bound parameters on a tiered read ------------- */
+/* ---- planner hook: bound parameters on a tiered read, dual-tier writes ---- */
 
 /*
  * pg_duckdb deparses a PARAM_EXTERN as a bare $N placeholder. DuckDB types most
@@ -6747,10 +6747,62 @@ fold_params_mutator(Node *node, void *ctx)
     return expression_tree_mutator(node, fold_params_mutator, ctx);
 }
 
+/* Whether the expression calls coldfront._exec_dual_cold. */
+static bool
+calls_dual_cold_walker(Node *node, void *ctx)
+{
+    if (node == NULL)
+        return false;
+    if (IsA(node, FuncExpr))
+    {
+        Oid         fn   = ((FuncExpr *) node)->funcid;
+        const char *name = get_func_name(fn);
+
+        if (name != NULL && strcmp(name, "_exec_dual_cold") == 0 &&
+            get_func_namespace(fn) == get_namespace_oid("coldfront", true))
+            return true;
+    }
+    return expression_tree_walker(node, calls_dual_cold_walker, ctx);
+}
+
+/* Whether the statement holds a dual-tier write as emit_dual builds it: a
+ * coldfront_cold WITH entry that calls coldfront._exec_dual_cold. The entry is
+ * in the top-level WITH list whatever the statement's verb, the dual-tier
+ * UPDATE or DELETE itself or, once cf_splice_nested_dml lifts it out of a
+ * nested WITH entry, the INSERT, MERGE, UPDATE, DELETE or SELECT around it. */
+static bool
+is_dual_tier_write(Query *parse)
+{
+    ListCell *lc;
+
+    foreach(lc, parse->cteList)
+    {
+        CommonTableExpr *cte = lfirst_node(CommonTableExpr, lc);
+
+        if (strcmp(cte->ctename, "coldfront_cold") == 0 &&
+            query_tree_walker(castNode(Query, cte->ctequery), calls_dual_cold_walker, NULL, 0))
+            return true;
+    }
+    return false;
+}
+
 static PlannedStmt *
 coldfront_planner(Query *parse, const char *query_string, int cursor_options,
                   ParamListInfo bound_params)
 {
+    /* A dual-tier write writes both tiers, so clear pg_duckdb's mixed-write
+     * guard for this transaction (GUC_ACTION_LOCAL resets it at tx end) before
+     * pg_duckdb's planner hook, which runs after this one when coldfront follows
+     * pg_duckdb in shared_preload_libraries, refuses the statement because an
+     * earlier statement in the block wrote DuckDB. Set at every
+     * planning, including a prepared statement's or a PL/pgSQL statement's plan
+     * made again in a later transaction; coldfront._exec_dual_cold sets it again
+     * when a saved plan runs without planning, for pg_duckdb's pre-commit check. */
+    if (is_dual_tier_write(parse))
+        (void) set_config_option("duckdb.unsafe_allow_mixed_transactions",
+                                 "on",
+                                 PGC_USERSET, PGC_S_SESSION,
+                                 GUC_ACTION_LOCAL, true, 0, false);
     if (parse->commandType == CMD_SELECT && coldfront_registry_present() &&
         query_tree_walker(parse, has_extern_param_walker, NULL, 0) &&
         query_reads_tiered_view(parse))
@@ -6795,9 +6847,9 @@ _PG_init(void)
     prev_post_parse_analyze_hook = post_parse_analyze_hook;
     post_parse_analyze_hook      = coldfront_post_parse_analyze;
 
-    /* Bound parameters on a tiered read (coldfront_planner). Chains pg_duckdb's
-     * planner_hook (coldfront loads later, so prev == pg_duckdb's): the fold runs
-     * before DuckDB plans. */
+    /* Bound parameters on a tiered read and the dual-tier write's mixed-write
+     * setting (coldfront_planner). Chains pg_duckdb's planner_hook (coldfront
+     * loads later, so prev == pg_duckdb's): both run before pg_duckdb plans. */
     prev_planner_hook = planner_hook;
     planner_hook      = coldfront_planner;
 

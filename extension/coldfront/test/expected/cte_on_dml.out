@@ -109,15 +109,15 @@ EXPLAIN (COSTS OFF, VERBOSE)
 EXPLAIN (COSTS OFF, VERBOSE)
   WITH u AS (UPDATE public.events SET status = 'dual' WHERE id = 1)
   SELECT 1;
-                                                                               QUERY PLAN                                                                               
-------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                          QUERY PLAN                                                                           
+---------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
    Output: 1
    CTE coldfront_cold
      ->  Update on coldfront._dummy_dml_target
            ->  Seq Scan on coldfront._dummy_dml_target
                  Output: _dummy_dml_target.anchor, _dummy_dml_target.ctid
-                 Filter: (_exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET status = ''dual''::text   WHERE (id = 1)'::text) IS NULL)
+                 Filter: (_exec_dual_cold('ice.default.events'::text, 'UPDATE ice.default.events SET status = ''dual''::text   WHERE (id = 1)'::text) IS NULL)
    CTE u
      ->  Update on public._events
            ->  Seq Scan on public._events

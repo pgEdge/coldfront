@@ -30,7 +30,8 @@ coldfront.local_pg_dsn = 'host=/var/run/postgresql dbname=<db> user=<role>'
 
 If `shared_preload_libraries` already lists libraries, such as
 `pg_stat_statements`, add `pg_duckdb` and `coldfront` to the existing list
-instead of replacing it.
+instead of replacing it. List `coldfront` after `pg_duckdb`, so that
+ColdFront's planner hook runs before pg_duckdb's.
 
 How you apply the settings depends on how you installed ColdFront:
 

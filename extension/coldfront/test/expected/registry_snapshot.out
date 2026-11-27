@@ -44,13 +44,13 @@ UPDATE coldfront.archive_watermark SET cutoff_time = '2018-01-01'::timestamptz
  WHERE table_name = 'events';
 EXPLAIN (COSTS OFF)
   UPDATE public.events SET status = 'y' WHERE ts < '2019-01-01'::timestamptz;
-                                                                                                QUERY PLAN                                                                                                 
------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                            QUERY PLAN                                                                                            
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Update on _events
    CTE coldfront_cold
      ->  Update on _dummy_dml_target
            ->  Seq Scan on _dummy_dml_target
-                 Filter: (_exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET status = ''y''::text   WHERE (ts < ''2019-01-01 00:00:00+00''::timestamptz)'::text) IS NULL)
+                 Filter: (_exec_dual_cold('ice.default.events'::text, 'UPDATE ice.default.events SET status = ''y''::text   WHERE (ts < ''2019-01-01 00:00:00+00''::timestamptz)'::text) IS NULL)
    ->  Seq Scan on _events
          Filter: (ts < 'Tue Jan 01 00:00:00 2019 UTC'::timestamp with time zone)
 (7 rows)
