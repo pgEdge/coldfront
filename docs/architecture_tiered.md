@@ -544,16 +544,19 @@ When the predicate is AMBIGUOUS the hook picks one of two behaviors from the
 The hook emits a dual-tier CTE:
 
 ```sql
-WITH coldfront_hot AS (UPDATE _events SET ... WHERE ... RETURNING *)
-   , coldfront_cold AS (SELECT coldfront._exec_iceberg_with_claim(
-                            'ice.public.events',
-                            'UPDATE ice.public.events SET ... WHERE ...'))
-SELECT h.* FROM coldfront_hot h CROSS JOIN coldfront_cold c;
+WITH coldfront_cold AS (
+    UPDATE coldfront._dummy_dml_target SET anchor = anchor
+     WHERE coldfront._exec_iceberg_with_claim(
+               'ice.public.events',
+               'UPDATE ice.public.events SET ... WHERE ...') IS NULL)
+UPDATE _events SET ... WHERE ...;
 ```
 
-The CROSS JOIN forces PG to execute the cold CTE (a pure-SELECT CTE that is not
-otherwise referenced would be pruned even with MATERIALIZED). The hook also
-sets `duckdb.unsafe_allow_mixed_transactions = on` LOCAL for the current
+The hot `UPDATE` is the statement itself. The cold write runs in a
+data-modifying `WITH` entry, which PG always runs to completion, so the cold
+write happens when no hot row matches; the entry's own `UPDATE` matches no row
+and writes nothing. The hook also sets
+`duckdb.unsafe_allow_mixed_transactions = on` LOCAL for the current
 transaction to clear pg_duckdb's pre-commit mixed-write check. pg_duckdb's
 `XactCallback` ties DuckDB's transaction to PG's, so `ROLLBACK` undoes both
 tiers - but the path is **not crash-safe**: a backend crash between the Iceberg
@@ -732,16 +735,16 @@ The dual-tier model has the following limitations:
   refuses `RETURNING` on Iceberg writes and pg_duckdb's row-returning entry
   point is `SELECT`-only. Hot-only DML keeps `RETURNING` (it is plain PG DML).
 
-- An ambiguous dual-tier `UPDATE` returns the command tag `SELECT n` rather
-  than `UPDATE n`, because the rewrite produces a `SELECT` wrapper around a DML
-  CTE. The row count reflects hot rows only. A watermark-split `INSERT` reports
-  `SELECT 1` for the same reason and returns one `(hot_rows, cold_rows)` row. A
-  top-level cold-only `UPDATE` or `DELETE` and a cross-tier move become a plain
-  `SELECT` of one function call, a shape for which PostgreSQL keeps the
-  statement's own tag with the rows returned, so they report `UPDATE 1` or
-  `DELETE 1` whatever the number of cold rows written. Inside PL/pgSQL, a
-  cold-only write reports `UPDATE 0`, so `FOUND` is false, and a dual-tier
-  write or a split `INSERT` counts its hot rows.
+- An ambiguous dual-tier `UPDATE` or `DELETE` returns its own command tag,
+  `UPDATE n` or `DELETE n`. The row count reflects hot rows only, because the
+  cold half returns no count to PostgreSQL. A watermark-split `INSERT` reports
+  `SELECT 1`, because the rewrite produces a `SELECT` wrapper around a DML
+  CTE, and returns one `(hot_rows, cold_rows)` row. A top-level cold-only
+  `UPDATE` or `DELETE` and a cross-tier move become a plain `SELECT` of one
+  function call, a shape for which PostgreSQL keeps the statement's own tag
+  with the rows returned, so they report `UPDATE 1` or `DELETE 1` whatever the
+  number of cold rows written. Inside PL/pgSQL, a cold-only write reports
+  `UPDATE 0`, so `FOUND` is false, and a split `INSERT` counts its hot rows.
 
 - An `UPDATE`/`DELETE` that references the same tiered view more than once - a
   self-join (`UPDATE events ... FROM events e2`), `DELETE ... USING events`, or

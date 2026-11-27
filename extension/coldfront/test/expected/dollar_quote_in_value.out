@@ -45,24 +45,18 @@ EXPLAIN (COSTS OFF, VERBOSE)
 -- by default so the dual-tier CTE is emitted.
 EXPLAIN (COSTS OFF, VERBOSE)
   UPDATE public.events SET status = 'has $MTQ$ in dual' WHERE status = 'ok';
-                                                                                     QUERY PLAN                                                                                     
-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
- Nested Loop
-   Output: h.id, h.ts, h.status
-   CTE coldfront_hot
-     ->  Update on public._events
-           Output: _events.id, _events.ts, _events.status
-           ->  Seq Scan on public._events
-                 Output: 'has $MTQ$ in dual'::text, _events.ctid
-                 Filter: (_events.status = 'ok'::text)
+                                                                                             QUERY PLAN                                                                                             
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Update on public._events
    CTE coldfront_cold
-     ->  Result
-           Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET status = ''has $MTQ$ in dual''::text   WHERE (status = ''ok''::text)'::text)
-   ->  CTE Scan on coldfront_cold c
-         Output: c._exec_iceberg_with_claim
-   ->  CTE Scan on coldfront_hot h
-         Output: h.id, h.ts, h.status
-(15 rows)
+     ->  Update on coldfront._dummy_dml_target
+           ->  Seq Scan on coldfront._dummy_dml_target
+                 Output: _dummy_dml_target.anchor, _dummy_dml_target.ctid
+                 Filter: (_exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET status = ''has $MTQ$ in dual''::text   WHERE (status = ''ok''::text)'::text) IS NULL)
+   ->  Seq Scan on public._events
+         Output: 'has $MTQ$ in dual'::text, _events.ctid
+         Filter: (_events.status = 'ok'::text)
+(9 rows)
 
 -- Cleanup. Unregister before dropping: the DDL hook blocks DROP of a
 -- registered tiered table/view.

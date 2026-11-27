@@ -26,6 +26,18 @@ this project adheres to
 - Without the Iceberg namespace of its schema,
   `coldfront.create_iceberg_table()` fails with the error
   `Schema with name "<schema>" does not exist` in place of HTTP 404.
+- A top-level dual-tier `UPDATE` or `DELETE` reports its own command tag with
+  the hot rows it changed (`UPDATE n`, `DELETE n`) and returns no result set.
+  The statement reported `SELECT n` and returned the hot rows it changed.
+
+### Fixed
+
+- A top-level dual-tier `UPDATE` or `DELETE` could skip its cold half without
+  an error when no hot row matched, so a row in the cold tier stayed
+  unchanged. The planner's join order decided whether the cold half ran. For
+  example, a primary-key lookup with a time range that spans the watermark
+  and leaves a single hot partition lost the write. The cold half now runs in
+  a data-modifying `WITH` entry, which PostgreSQL always runs to completion.
 
 ## [1.0.0-beta4] - 2026-11-17
 

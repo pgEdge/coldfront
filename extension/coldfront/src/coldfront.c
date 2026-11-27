@@ -7,16 +7,17 @@
  * watermark:
  *
  *   WHERE ts >= cutoff  → hot:  UPDATE public._events SET ... WHERE ...
- *   WHERE ts <  cutoff  → cold: SELECT duckdb.raw_query($MTQ$
- *                                 UPDATE ice.default.events SET ... WHERE ...
- *                               $MTQ$)
- *   predicate can't prove one tier → ERROR (would otherwise split a write
- *                                           across both tiers non-atomically:
- *                                           Iceberg writes are not WAL-logged).
+ *   WHERE ts <  cutoff  → cold: SELECT coldfront._exec_iceberg_with_claim(
+ *                                 'ice.default.events',
+ *                                 'UPDATE ice.default.events SET ... WHERE ...')
+ *   predicate can't prove one tier → with coldfront.allow_mixed_writes on, both:
+ *                                    the hot DML is the statement and the cold
+ *                                    call runs in a data-modifying WITH entry;
+ *                                    off, ERROR.
  *
  * The hot rewrite is plain PG DML.  The cold rewrite wraps the DuckDB DML in
  * a SELECT so it doesn't trip pg_duckdb's mixed-write check (the PG
- * command-ID counter stays put), and duckdb.raw_query() runs as a regular C
+ * command-ID counter stays put), and duckdb.raw_query() runs inside a regular
  * function call.  In both cases the rewritten query holds no DuckDB table
  * function, so pg_duckdb's planner hook leaves it alone.
  *
@@ -138,11 +139,11 @@ static bool coldfront_in_rewrite = false;
  *       (those are plpgsql source constructs, fixed before this hook runs and
  *       unreachable from it), and the cold "table" is a DuckDB-attached object,
  *       not a PG relation, so PG can't tag a real UPDATE/DELETE against it.
- *       Handled only where needed: when — and only when — this statement is
- *       parsed inside plpgsql, the hook wraps the cold call as a DML over the
- *       dummy carrier coldfront._dummy_dml_target (see cold_anchor_update + that
- *       table's comment in coldfront--1.0.sql). At top level the SELECT shape is
- *       kept byte-for-byte.
+ *       Handled only where needed: when this statement is parsed inside
+ *       plpgsql, and in every dual-tier write, the hook wraps the cold call as
+ *       a DML over the dummy carrier coldfront._dummy_dml_target (see
+ *       cold_anchor_update + that table's comment in coldfront--1.0.sql). A
+ *       top-level cold-only write keeps the SELECT shape byte-for-byte.
  *
  * Detecting "are we inside plpgsql?" without interfering with anything: when
  * plpgsql parses one of its statements it installs p_post_columnref_hook on the
@@ -1977,8 +1978,8 @@ cold_sql_arg(const char *cold_dml, ColdParamSet *ps, bool for_pg)
  * R-A bakery (mesh) or a local advisory lock (vanilla), runs the cold DML via
  * duckdb.raw_query, and releases the claim at XACT_EVENT_COMMIT, after pg_duckdb
  * has committed the Iceberg transaction at XACT_EVENT_PRE_COMMIT, via the C
- * XactCallback. Callers wrap it in a SELECT (top level) or in
- * cold_anchor_update() (in plpgsql).
+ * XactCallback. Callers wrap it in a SELECT (a top-level cold-only write) or in
+ * cold_anchor_update() (in plpgsql, and in every dual-tier write).
  */
 static char *
 cold_exec_call(const char *iceberg_table, const char *arg_sql)
@@ -1991,9 +1992,10 @@ cold_exec_call(const char *iceberg_table, const char *arg_sql)
 }
 
 /*
- * Cause-2 carrier (in-plpgsql only): turn a cold call expression into a
- * DML-tagged statement plpgsql accepts (a bare SELECT would raise "query has no
- * destination for result data" inside a function / DO block). The call runs
+ * Cause-2 carrier (in plpgsql, and in every dual-tier write): turn a cold call
+ * expression into a DML-tagged statement plpgsql accepts (a bare SELECT would
+ * raise "query has no destination for result data" inside a function / DO
+ * block). The call runs
  * exactly once in the WHERE qual, evaluated against the single row of
  * coldfront._dummy_dml_target; because _exec_iceberg_with_claim returns void and
  * `void IS NULL` is always false, zero rows match and the table is NEVER written
@@ -2275,54 +2277,32 @@ emit_cold(Query *query, TieredViewInfo *info, ColdParamSet *ps, bool in_plpgsql)
  * PG's, so ROLLBACK undoes both tiers (not crash-safe: orphaned S3 objects
  * on crash are Iceberg housekeeping's concern).
  *
- * The cold CTE is a SELECT (not DML), so PG would prune it as unreferenced
- * unless the outer query forces its execution.  We use a CROSS JOIN with
- * `cold` in the outer SELECT; see the body comment near the appendStringInfo
- * call for why MATERIALIZED alone would not be enough.
+ * The hot UPDATE/DELETE is the statement itself (the DML tag the client and
+ * plpgsql get, counting the hot rows, and the body a WITH entry keeps once
+ * cf_splice_nested_dml lifts the rest out), behind the statement's own WITH
+ * entries; the cold call rides in a data-modifying entry (cold_anchor_update),
+ * which PG always runs to completion regardless of references, so the cold
+ * write still happens when the hot side matches no rows.
  *
- * The hot CTE gets RETURNING * so the outer SELECT can consume its output.
  * The statement's own RETURNING is refused before this
  * (reject_cold_returning), since the cold half returns no rows.
  */
 static char *
-emit_dual(Query *query, TieredViewInfo *info, ColdParamSet *ps, bool in_plpgsql)
+emit_dual(Query *query, TieredViewInfo *info, ColdParamSet *ps)
 {
     DeparseResult  dr;
-    char          *hot_dml, *cold_dml, *call;
+    char          *cold_dml, *call;
     StringInfoData buf;
 
     deparse_and_find_prefix(query, &dr);
-    hot_dml  = build_hot_dml(&dr, info);
     cold_dml = build_cold_dml(&dr, info, query);
     call     = cold_exec_call(info->iceberg_table, cold_sql_arg(cold_dml, ps, false));
 
     initStringInfo(&buf);
-    if (in_plpgsql)
-    {
-        /* Cause 2: the hot UPDATE/DELETE is the statement itself (the DML tag
-         * plpgsql accepts, and the body a WITH entry keeps once
-         * cf_splice_nested_dml lifts the rest out), behind the statement's own
-         * WITH entries; the cold call rides in a data-modifying entry
-         * (cold_anchor_update), which PG always runs to completion regardless of
-         * references, so the cold write still happens when the hot side matches
-         * no rows. */
-        append_with_opener(&buf, &dr);
-        appendStringInfo(&buf, "coldfront_cold AS (%s) %s%s %s%s",
-                         cold_anchor_update(call, "IS NULL"), dr.verb, info->hot_table,
-                         dr.alias, dr.rest);
-    }
-    else
-    {
-        /* Top level: the cold CTE is a SELECT, which PG would prune as
-         * unreferenced (MATERIALIZED only prevents inlining), so a CROSS JOIN
-         * with it in the outer SELECT forces its execution while keeping the row
-         * set equal to the hot CTE's, which is DML and always runs. */
-        appendStringInfo(&buf,
-            "WITH coldfront_hot AS (%s RETURNING *)"
-            ", coldfront_cold AS (SELECT %s)"
-            " SELECT h.* FROM coldfront_hot h CROSS JOIN coldfront_cold c",
-            hot_dml, call);
-    }
+    append_with_opener(&buf, &dr);
+    appendStringInfo(&buf, "coldfront_cold AS (%s) %s%s %s%s",
+                     cold_anchor_update(call, "IS NULL"), dr.verb, info->hot_table,
+                     dr.alias, dr.rest);
     return buf.data;
 }
 
@@ -3446,7 +3426,7 @@ cf_emit_cold_path(Query *query, TieredViewInfo *info, ColdParamSet *ps,
  * when coldfront.allow_mixed_writes is on). */
 static char *
 cf_emit_dual_path(Query *query, TieredViewInfo *info, ColdParamSet *ps,
-                  bool in_plpgsql, const char *vname)
+                  const char *vname)
 {
     if (!coldfront_allow_mixed_writes)
         ereport(ERROR,
@@ -3474,7 +3454,7 @@ cf_emit_dual_path(Query *query, TieredViewInfo *info, ColdParamSet *ps,
                              PGC_USERSET, PGC_S_SESSION,
                              GUC_ACTION_LOCAL, true, 0, false);
     ensure_ice_attached_once();
-    return emit_dual(query, info, ps, in_plpgsql);
+    return emit_dual(query, info, ps);
 }
 
 /* Parse and analyze the rewritten SQL, guarded against re-entry, and replace
@@ -4704,7 +4684,7 @@ cf_dispatch_emit(Query *query, RangeTblEntry *rte, TieredViewInfo *info,
     if (tier == TIER_COLD)
         return cf_emit_cold_path(query, info, ps, in_plpgsql, vname);
     if (tier == TIER_AMBIGUOUS)
-        return cf_emit_dual_path(query, info, ps, in_plpgsql, vname);
+        return cf_emit_dual_path(query, info, ps, vname);
     return NULL;        /* unreachable */
 }
 

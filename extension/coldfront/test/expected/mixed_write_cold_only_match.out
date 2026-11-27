@@ -1,0 +1,93 @@
+-- A mixed-tier UPDATE or DELETE (no condition on the partition column,
+-- coldfront.allow_mixed_writes on) whose matching rows are all in the cold tier
+-- writes them. The hot table has a primary key and fresh statistics, so the
+-- planner expects one hot row and the hot side matches none. Observed end to
+-- end: a DuckDB temporary table stands in for the Iceberg table, pg_duckdb
+-- reports each DuckDB write as a NOTICE with its row count, and the table is
+-- read back afterwards.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_duckdb;
+CREATE EXTENSION IF NOT EXISTS coldfront;
+SET TIME ZONE 'UTC';
+SET coldfront.warehouse = '';
+SET coldfront.lakekeeper_endpoint = '';
+SET coldfront.local_pg_dsn = '';
+SELECT duckdb.raw_query('CREATE TEMP TABLE cf_mixed (id INTEGER, ts TIMESTAMPTZ, status VARCHAR)') IS NOT NULL AS created;
+ created 
+---------
+ t
+(1 row)
+
+SELECT duckdb.raw_query($$INSERT INTO temp.main.cf_mixed VALUES
+    (1, '2026-01-01', 'cold'), (2, '2026-01-02', 'cold'), (3, '2026-01-03', 'cold')$$) IS NOT NULL AS seeded;
+ seeded 
+--------
+ t
+(1 row)
+
+RESET client_min_messages;
+CREATE TABLE public._cf_mixed (id int, ts timestamptz, status text, PRIMARY KEY (id, ts))
+    PARTITION BY RANGE (ts);
+CREATE TABLE public._cf_mixed_2026_04 PARTITION OF public._cf_mixed
+    FOR VALUES FROM ('2026-04-01') TO ('2026-05-01');
+INSERT INTO public._cf_mixed
+SELECT g, '2026-04-10'::timestamptz + g * interval '1 second', 'hot' FROM generate_series(10, 1009) g;
+ANALYZE public._cf_mixed;
+CREATE VIEW public.cf_mixed AS SELECT * FROM public._cf_mixed;
+INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
+VALUES ('public', 'cf_mixed', 'public._cf_mixed', 'temp.main.cf_mixed', 'ts');
+INSERT INTO coldfront.archive_watermark(schema_name, table_name, cutoff_time)
+VALUES ('public', 'cf_mixed', '2026-03-01'::timestamptz);
+-- (1) An UPDATE by id of a row only the cold tier holds.
+UPDATE public.cf_mixed SET status = 'updated' WHERE id = 1;
+NOTICE:  result: Count	
+BIGINT	
+[ Rows: 1]
+1
+
+
+-- (2) A DELETE by id of a row only the cold tier holds.
+DELETE FROM public.cf_mixed WHERE id = 2;
+NOTICE:  result: Count	
+BIGINT	
+[ Rows: 1]
+1
+
+
+-- (3) A row in each tier: both halves write.
+UPDATE public.cf_mixed SET status = 'both' WHERE id IN (3, 10);
+NOTICE:  result: Count	
+BIGINT	
+[ Rows: 1]
+1
+
+
+SELECT id, status FROM public._cf_mixed WHERE id = 10;
+ id | status 
+----+--------
+ 10 | both
+(1 row)
+
+-- The cold tier after the three statements.
+SELECT r['id'] AS id, r['status'] AS status
+  FROM duckdb.query('SELECT id, status FROM temp.main.cf_mixed ORDER BY id') AS r;
+ id | status  
+----+---------
+  1 | updated
+  3 | both
+(2 rows)
+
+-- Cleanup.
+DELETE FROM coldfront.tiered_views;
+DELETE FROM coldfront.archive_watermark;
+DROP VIEW public.cf_mixed;
+DROP TABLE public._cf_mixed;
+SET client_min_messages = warning;
+SELECT duckdb.raw_query('DROP TABLE temp.main.cf_mixed') IS NOT NULL AS dropped;
+ dropped 
+---------
+ t
+(1 row)
+
+RESET client_min_messages;
+RESET coldfront.local_pg_dsn;

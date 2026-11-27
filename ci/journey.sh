@@ -1371,6 +1371,60 @@ EOSQL
 }
 
 # ───────────────────────────────────────────────────────────────────────────
+# Story: TC-286, a mixed-tier UPDATE or DELETE (a time range that spans the
+# watermark) whose matching rows are all in the cold tier writes them. The
+# range leaves one hot partition, with a primary key and fresh statistics, so
+# the planner expects one hot row and the hot side matches none.
+# ───────────────────────────────────────────────────────────────────────────
+story_mixed_write_cold_only_match() {
+    step "TC-286: a mixed-tier write whose rows are all cold writes them"
+    _tcmx_cleanup() {
+        q "$HOST" "SELECT coldfront.drop_iceberg_table('public','tcmx', true);" >/dev/null 2>&1
+        q "$HOST" "DELETE FROM coldfront.tiered_views WHERE relname = 'tcmx'; DELETE FROM coldfront.archive_watermark WHERE table_name='tcmx'; DELETE FROM coldfront.partition_config WHERE table_name='tcmx';" >/dev/null 2>&1
+        q "$HOST" "DROP VIEW IF EXISTS public.tcmx CASCADE;" >/dev/null 2>&1
+        q "$HOST" "DROP TABLE IF EXISTS public._tcmx CASCADE;" >/dev/null 2>&1
+        q "$HOST" "DROP TABLE IF EXISTS public.tcmx CASCADE;" >/dev/null 2>&1
+    }
+    trap _tcmx_cleanup RETURN
+    qf "$HOST" <<'EOSQL' >/dev/null
+CREATE TABLE public.tcmx (id bigint NOT NULL, ts timestamptz NOT NULL, note text,
+                          PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);
+DO $do$ DECLARE m date; BEGIN
+  FOREACH m IN ARRAY ARRAY[(date_trunc('month',now()) - interval '4 months')::date,
+                           (date_trunc('month',now()) - interval '1 month')::date] LOOP
+    EXECUTE format('CREATE TABLE public.%I PARTITION OF public.tcmx FOR VALUES FROM (%L) TO (%L)',
+                   'tcmx_p_' || to_char(m, 'YYYY_MM'), m, m + interval '1 month');
+  END LOOP; END $do$;
+INSERT INTO public.tcmx VALUES
+  (1, date_trunc('month',now()) - interval '4 months' + interval '3 days', 'cold'),
+  (2, date_trunc('month',now()) - interval '4 months' + interval '4 days', 'cold');
+INSERT INTO public.tcmx
+SELECT g, date_trunc('month',now()) - interval '1 month' + interval '1 day' + g * interval '1 second', 'hot'
+  FROM generate_series(10, 1009) g;
+EOSQL
+    if ! "$ARCHIVER" register --table tcmx --column ts --period monthly \
+            --hot-period "$(hot_days) days" >"$TMPD/tcmx.log" 2>&1; then
+        fail "TC-286: register tcmx (see $TMPD/tcmx.log)"; tail -5 "$TMPD/tcmx.log"; return
+    fi
+    if ! archive_only "schema_name='public' AND table_name='tcmx'" "$TMPD/tcmx.log"; then
+        fail "TC-286: archive tcmx (see $TMPD/tcmx.log)"; tail -5 "$TMPD/tcmx.log"; return
+    fi
+    q "$HOST" "ANALYZE public._tcmx;" >/dev/null
+    # Literal bounds, so the planner prunes the hot side to last month's
+    # partition: from the start of the archived month to the start of this one.
+    local lo hi range
+    lo=$(q "$HOST" "SELECT (date_trunc('month',now()) - interval '4 months')::text;")
+    hi=$(q "$HOST" "SELECT date_trunc('month',now())::text;")
+    range="ts >= '$lo' AND ts < '$hi'"
+    q "$HOST" "UPDATE public.tcmx SET note = 'updated' WHERE id = 1 AND $range;" >/dev/null
+    assert_eq "TC-286: a mixed-tier UPDATE of a row only the cold tier holds" "updated" \
+        "$(q "$HOST" "SELECT note FROM public.tcmx WHERE id = 1;")"
+    q "$HOST" "DELETE FROM public.tcmx WHERE id = 2 AND $range;" >/dev/null
+    assert_eq "TC-286: a mixed-tier DELETE of a row only the cold tier holds" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM public.tcmx WHERE id = 2;")"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
 # Story: TC-238..TC-251, arrays. A one-dimensional array of a native type tiers
 # as an Iceberg list and reads back unchanged whichever path moved it: the
 # archive, a read of the hot tier through the view, a cold INSERT through the
@@ -2690,7 +2744,7 @@ SQL
 # end-to-end test of both plpgsql behaviours: plpgsql variable refs become $N
 # bound params (Cause 1, kept live via format()), and the rewrite is a
 # DML-tagged statement plpgsql accepts rather than a bare SELECT (Cause 2, the
-# coldfront._dummy_dml_target carrier, used in the in-plpgsql case alone). Runs
+# coldfront._dummy_dml_target carrier). Runs
 # on every backend and topology. Cold = m4 (< the start-of-now-1mo cutoff).
 # ───────────────────────────────────────────────────────────────────────────
 story_writes_plpgsql() {
@@ -5696,7 +5750,14 @@ story_app_privilege() {
     assert_eq "app role reads tiered hot+cold (== superuser)" "$total" "$(q "$HOST" "SET ROLE japp; SELECT count(*) FROM events;" | tail -1)"
     q "$HOST" "SET ROLE japp; INSERT INTO events (ts,status,data) VALUES (date_trunc('month',now()) - interval '4 months' + interval '17 days' + interval '9 hours','japp_priv','{}');" >/dev/null 2>&1
     assert_eq "app role cold write landed (read-your-write)" "1" "$(q "$HOST" "SELECT count(*) FROM events WHERE status='japp_priv';")"
-    q "$HOST" "DELETE FROM events WHERE status='japp_priv';" >/dev/null 2>&1
+    # No bound on ts makes a dual-tier write: the hot UPDATE is the statement, so
+    # its tag counts hot rows (none match), and the cold half runs through
+    # coldfront._dummy_dml_target, which grant_app_access opens to the role.
+    assert_eq "app role dual-tier UPDATE reports UPDATE n, counting hot rows" "UPDATE 0" \
+        "$(q "$HOST" "SET ROLE japp; UPDATE public.events SET status = 'japp_dual' WHERE status = 'japp_priv';" | tail -1)"
+    assert_eq "app role dual-tier UPDATE changed the cold row" "1" \
+        "$(q "$HOST" "SELECT count(*) FROM public.events WHERE status = 'japp_dual';")"
+    q "$HOST" "DELETE FROM events WHERE status IN ('japp_priv', 'japp_dual');" >/dev/null 2>&1
 
     if [ "$MESH" = 1 ] && [ -n "${PEERS:-}" ]; then
         local PARR p1; read -ra PARR <<< "$PEERS"; p1="${PARR[0]}"
@@ -8404,6 +8465,7 @@ if [ "$MODE" = "tiered" ]; then
     story_unstorable_values # TC-231..TC-237: NaN and infinity refused where they are written
     story_arrays            # TC-238..TC-251: arrays tier as Iceberg lists
     story_whitespace_in_value # TC-273: a literal's tabs and newlines survive every rewritten write
+    story_mixed_write_cold_only_match # TC-286: a mixed-tier write whose rows are all cold writes them
     story_vector            # embeddings: vector → list<float> over all three cold-write paths
     story_writes
     story_compaction        # iceberg-go RewriteDataFiles; the manifest-list

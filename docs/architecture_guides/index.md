@@ -338,8 +338,9 @@ inside a plpgsql function / `DO` block / trigger, via two mechanisms:
     `_exec_iceberg_with_claim` returns `void` and `void IS NULL` is always
     false, **zero rows match - the carrier is never written: no dead rows, no
     WAL, no bloat.** For dual-tier and tiered-INSERT the hot DML is the outer
-    statement and this same UPDATE runs inside a data-modifying `WITH`-CTE. At
-    the top level the rewrite keeps the plain
+    statement and this same UPDATE runs inside a data-modifying `WITH`-CTE. A
+    dual-tier write has this form at the top level too, and a top-level
+    cold-only write keeps the plain
     `SELECT coldfront._exec_iceberg_with_claim(...)` shape.
 
 "Inside plpgsql" is detected via `pstate->p_post_columnref_hook != NULL`

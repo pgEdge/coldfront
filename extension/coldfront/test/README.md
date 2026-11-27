@@ -23,6 +23,7 @@ extension's non-hook surface (third table below) and register no view.
 | `update_hot_via_view` | hot-tier UPDATE → plain PG DML on `_events` (also executed) |
 | `update_cold_via_view` | cold-tier UPDATE → `SELECT _exec_iceberg_with_claim('…UPDATE ice…')` |
 | `allow_mixed_writes` | ambiguous predicate → dual-tier CTE (permissive mode) |
+| `mixed_write_cold_only_match` | a dual-tier UPDATE or DELETE whose matching rows are all cold writes them, with a hot table the planner expects one row from (executed against a DuckDB temporary table and read back) |
 | `update_ambiguous_rejected` | ambiguous predicate + strict mode → error with hint |
 | `update_partition_key_blocked` | strict mode: UPDATE assigning the partition column → error, whichever tier the WHERE selects |
 | `update_partition_key_move` | permissive mode: partition-key UPDATE → a single `_cross_tier_move(...)` call relocating rows across the cutoff |
