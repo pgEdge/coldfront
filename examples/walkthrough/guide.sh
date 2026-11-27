@@ -1152,10 +1152,10 @@ demo_decoupled() {
     info "Refused, and the hint says exactly what to pass to enable writes."
 
     explain "Adoption binds the name once, so enabling writes is a release and a second adopt with"
-    explain "p_writable => true. Iceberg records no Postgres type, so p_types restores the jsonb the"
-    explain "VARCHAR column holds:"
+    explain "p_writable => true. Iceberg records no Postgres type, so p_types reads the VARCHAR"
+    explain "column as the json it holds:"
     run_sql_shown "SELECT coldfront.release_iceberg_table('public', 'orders');" "" || return
-    run_sql_shown "SELECT coldfront.adopt_iceberg_table('public','orders','lake', p_writable => true, p_types => '{\"meta\":\"jsonb\"}'::jsonb);" "" || return
+    run_sql_shown "SELECT coldfront.adopt_iceberg_table('public','orders','lake', p_writable => true, p_types => '{\"meta\":\"json\"}'::jsonb);" "" || return
     run_sql_shown "INSERT INTO orders VALUES (3, now(), 'initech', 42.00, '{\"tier\":\"bronze\"}');" "" || return
     run_sql_shown "DELETE FROM orders WHERE order_id = 1;" "" || return
     explain "Row 3 added, row 1 gone, and the meta column now answers to the json operators:"

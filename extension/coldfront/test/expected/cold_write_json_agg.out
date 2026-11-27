@@ -1,9 +1,10 @@
 -- A JSON aggregate on the cold write path. DuckDB has neither jsonb_agg nor
 -- json_agg, and its json_group_array is a macro that refuses the ORDER BY an
 -- aggregate carries, so the rewrite target is to_json(array_agg(...)): both
--- engines have those, and array_agg keeps the ORDER BY. The substitution adds a
--- closing paren at the aggregate's own, which is what the map's `wrap` flag
--- does. Two halves:
+-- engines have those, and array_agg keeps the ORDER BY. The cold half of the
+-- write gets the read rewrite, which builds that form. The values here go to a
+-- json column, which takes the text DuckDB computes; a cold write refuses such a
+-- value for a jsonb column (cold_write_jsonb_form). Two halves:
 --   (A) white-box: the deparsed cold SQL carries to_json(array_agg(...)) for an
 --       UPDATE (with and without ORDER BY) and for an INSERT ... SELECT.
 --   (B) parity: DuckDB accepts the target and rejects what it replaces.
@@ -16,7 +17,7 @@ CREATE EXTENSION IF NOT EXISTS coldfront;
 SET TIME ZONE 'UTC';
 SET coldfront.warehouse = '';
 SET coldfront.lakekeeper_endpoint = '';
-CREATE TABLE public._events (id int, ts timestamptz, data jsonb);
+CREATE TABLE public._events (id int, ts timestamptz, data jsonb, j json);
 CREATE VIEW public.events AS SELECT * FROM public._events;
 CREATE TABLE public.src (k text);
 INSERT INTO public.src VALUES ('b'), ('a');
@@ -27,71 +28,72 @@ VALUES ('public', 'events', '2026-03-01'::timestamptz);
 -- (A1) Cold UPDATE, aggregate carrying ORDER BY: the ORDER BY rides along inside
 -- array_agg, which is an aggregate in DuckDB (json_group_array is not).
 EXPLAIN (COSTS OFF, VERBOSE)
-UPDATE public.events SET data = (SELECT jsonb_agg(k ORDER BY k) FROM public.src)
+UPDATE public.events SET j = (SELECT jsonb_agg(k ORDER BY k)::json FROM public.src)
 WHERE ts < '2019-01-01'::timestamptz;
-                                                                                                                          QUERY PLAN                                                                                                                           
----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                                 QUERY PLAN                                                                                                                                 
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
-   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events events SET data = ( SELECT to_json(array_agg(src.k ORDER BY src.k)) AS json_agg            FROM src)   WHERE (ts < ''2019-01-01 00:00:00+00''::timestamptz)'::text)
+   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events events SET j = ( SELECT ((to_json(array_agg(src.k ORDER BY src.k)))::json)::json AS json_agg            FROM src)   WHERE (ts < ''2019-01-01 00:00:00+00''::timestamptz)'::text)
 (2 rows)
 
 -- (A2) Cold UPDATE, no ORDER BY.
 EXPLAIN (COSTS OFF, VERBOSE)
-UPDATE public.events SET data = (SELECT jsonb_agg(k) FROM public.src)
+UPDATE public.events SET j = (SELECT jsonb_agg(k)::json FROM public.src)
 WHERE ts < '2019-01-01'::timestamptz;
-                                                                                                                   QUERY PLAN                                                                                                                   
-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                         QUERY PLAN                                                                                                                          
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
-   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events events SET data = ( SELECT to_json(array_agg(src.k)) AS json_agg            FROM src)   WHERE (ts < ''2019-01-01 00:00:00+00''::timestamptz)'::text)
+   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events events SET j = ( SELECT ((to_json(array_agg(src.k)))::json)::json AS json_agg            FROM src)   WHERE (ts < ''2019-01-01 00:00:00+00''::timestamptz)'::text)
 (2 rows)
 
--- (A3) The json_ spelling reaches DuckDB the same way: the catch-all leaves it
--- alone (no jsonb token), so it needs its own entry.
+-- (A3) The json_ spelling takes the same rewrite.
 EXPLAIN (COSTS OFF, VERBOSE)
-UPDATE public.events SET data = (SELECT json_agg(k)::jsonb FROM public.src)
+UPDATE public.events SET j = (SELECT json_agg(k) FROM public.src)
 WHERE ts < '2019-01-01'::timestamptz;
-                                                                                                                       QUERY PLAN                                                                                                                       
---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                 QUERY PLAN                                                                                                                  
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
-   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events events SET data = ( SELECT (to_json(array_agg(src.k)))::json AS json_agg            FROM src)   WHERE (ts < ''2019-01-01 00:00:00+00''::timestamptz)'::text)
+   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events events SET j = ( SELECT to_json(array_agg(src.k)) AS json_agg            FROM src)   WHERE (ts < ''2019-01-01 00:00:00+00''::timestamptz)'::text)
 (2 rows)
 
 -- (A4) INSERT ... SELECT: the source runs in PostgreSQL, once, so the aggregate
 -- stays jsonb_agg and both halves read its result.
 EXPLAIN (COSTS OFF, VERBOSE)
 INSERT INTO public.events
-SELECT 9, '2019-01-01'::timestamptz, jsonb_agg(k ORDER BY k) FROM public.src;
-                                                                                                                                        QUERY PLAN                                                                                                                                        
-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+SELECT 9, '2019-01-01'::timestamptz, jsonb_agg(k ORDER BY k), NULL FROM public.src;
+                                                                                                                                           QUERY PLAN                                                                                                                                            
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
    Output: (InitPlan 4).col1, (InitPlan 5).col1
    CTE coldfront_source
-     ->  Aggregate
-           Output: 9, 'Tue Jan 01 00:00:00 2019 UTC'::timestamp with time zone, jsonb_agg(src.k ORDER BY src.k)
-           ->  Sort
-                 Output: src.k
-                 Sort Key: src.k
-                 ->  Seq Scan on public.src
+     ->  Subquery Scan on coldfront_src
+           Output: coldfront_src.id, coldfront_src.ts, coldfront_src.data, (coldfront_src.j)::json
+           ->  Aggregate
+                 Output: 9, 'Tue Jan 01 00:00:00 2019 UTC'::timestamp with time zone, jsonb_agg(src.k ORDER BY src.k), NULL::text
+                 ->  Sort
                        Output: src.k
+                       Sort Key: src.k
+                       ->  Seq Scan on public.src
+                             Output: src.k
    CTE coldfront_hot
      ->  Insert on public._events
            Output: 1
            ->  CTE Scan on coldfront_source
-                 Output: coldfront_source.id, coldfront_source.ts, coldfront_source.data
+                 Output: coldfront_source.id, coldfront_source.ts, coldfront_source.data, coldfront_source.j
                  Filter: (coldfront_source.ts >= 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
    CTE coldfront_cold
      ->  Aggregate
-           Output: _cold_sink('public'::text, 'events'::text, (string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,data}'::text[], '{integer,"timestamp with time zone",jsonb}'::text[], 'public'::text, 'events'::text)) || ')'::text), ', '::text)), (count(*)))
+           Output: _cold_sink('public'::text, 'events'::text, (string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,data,j}'::text[], '{integer,"timestamp with time zone",jsonb,json}'::text[], 'public'::text, 'events'::text)) || ')'::text), ', '::text)), (count(*)))
            ->  HashAggregate
-                 Output: string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,data}'::text[], '{integer,"timestamp with time zone",jsonb}'::text[], 'public'::text, 'events'::text)) || ')'::text), ', '::text), count(*), r.coldfront_batch
+                 Output: string_agg((('('::text || _cold_row_literal(_canonical_jsonb(r.*), '{id,ts,data,j}'::text[], '{integer,"timestamp with time zone",jsonb,json}'::text[], 'public'::text, 'events'::text)) || ')'::text), ', '::text), count(*), r.coldfront_batch
                  Group Key: r.coldfront_batch
                  ->  Subquery Scan on r
                        Output: r.coldfront_batch, r.*
                        ->  WindowAgg
-                             Output: coldfront_source_1.id, coldfront_source_1.ts, coldfront_source_1.data, ((row_number() OVER w1 - 1) / (current_setting('coldfront.cold_write_batch_size'::text))::integer)
+                             Output: coldfront_source_1.id, coldfront_source_1.ts, (coldfront_source_1.data)::text, (coldfront_source_1.j)::text, ((row_number() OVER w1 - 1) / (current_setting('coldfront.cold_write_batch_size'::text))::integer)
                              Window: w1 AS (ROWS UNBOUNDED PRECEDING)
                              ->  CTE Scan on coldfront_source coldfront_source_1
-                                   Output: coldfront_source_1.id, coldfront_source_1.ts, coldfront_source_1.data
+                                   Output: coldfront_source_1.id, coldfront_source_1.ts, coldfront_source_1.data, coldfront_source_1.j
                                    Filter: (coldfront_source_1.ts < 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
    InitPlan 4
      ->  Aggregate
@@ -101,18 +103,17 @@ SELECT 9, '2019-01-01'::timestamptz, jsonb_agg(k ORDER BY k) FROM public.src;
    InitPlan 5
      ->  CTE Scan on coldfront_cold
            Output: coldfront_cold.n
-(38 rows)
+(40 rows)
 
--- (A5) An aggregate nested inside an object builder: the added paren must land
--- at the aggregate's own close, leaving the builder's intact.
+-- (A5) An aggregate nested inside an object builder: each is rewritten in place.
 EXPLAIN (COSTS OFF, VERBOSE)
 UPDATE public.events
-SET data = (SELECT jsonb_build_object('all', jsonb_agg(k ORDER BY k)) FROM public.src)
+SET j = (SELECT jsonb_build_object('all', jsonb_agg(k ORDER BY k))::json FROM public.src)
 WHERE ts < '2019-01-01'::timestamptz;
-                                                                                                                                          QUERY PLAN                                                                                                                                          
-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                                                                                                   QUERY PLAN                                                                                                                                                                                                   
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
-   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events events SET data = ( SELECT json_object(''all'', to_json(array_agg(src.k ORDER BY src.k))) AS json_build_object            FROM src)   WHERE (ts < ''2019-01-01 00:00:00+00''::timestamptz)'::text)
+   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events events SET j = ( SELECT ((concat(''{''::text, (to_json((''all'')::text))::text, '':''::text, COALESCE(((to_json(array_agg(src.k ORDER BY src.k)))::json)::text, ''null''::text), ''}''::text))::json)::json AS json_build_object            FROM src)   WHERE (ts < ''2019-01-01 00:00:00+00''::timestamptz)'::text)
 (2 rows)
 
 -- (A6) A hot-tier UPDATE is plain PostgreSQL DML: jsonb_agg stays, and the
@@ -135,26 +136,25 @@ WHERE ts >= '2026-06-01'::timestamptz;
 
 -- (A7) The aggregate's name inside a string literal is not a call: left intact.
 EXPLAIN (COSTS OFF, VERBOSE)
-UPDATE public.events SET data = to_jsonb('jsonb_agg(x)'::text)
+UPDATE public.events SET j = to_jsonb('jsonb_agg(x) ' || id)::json
 WHERE ts < '2019-01-01'::timestamptz;
-                                                                                             QUERY PLAN                                                                                              
------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                    QUERY PLAN                                                                                                     
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
-   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET data = to_json(''jsonb_agg(x)''::text)   WHERE (ts < ''2019-01-01 00:00:00+00''::timestamptz)'::text)
+   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET j = (to_json((''jsonb_agg(x) ''::text || id)))::json   WHERE (ts < ''2019-01-01 00:00:00+00''::timestamptz)'::text)
 (2 rows)
 
 -- (A8) The reverse nesting of (A5): a builder inside the aggregate, with an
--- operator applied to the builder's result. The builder's own paren also counts
--- toward the depth, so the added paren still lands at the aggregate's close,
--- keeping the operator and the ORDER BY inside array_agg.
+-- operator applied to the builder's result, which stays inside array_agg with
+-- the ORDER BY.
 EXPLAIN (COSTS OFF, VERBOSE)
 UPDATE public.events
-SET data = (SELECT jsonb_agg(jsonb_build_object('k', k) ->> 'k' ORDER BY k) FROM public.src)
+SET j = (SELECT jsonb_agg(jsonb_build_object('k', k) ->> 'k' ORDER BY k)::json FROM public.src)
 WHERE ts < '2019-01-01'::timestamptz;
-                                                                                                                                             QUERY PLAN                                                                                                                                              
------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                                                                                                           QUERY PLAN                                                                                                                                                                                                           
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
-   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events events SET data = ( SELECT to_json(array_agg((json_object(''k'', src.k) ->> ''k''::text) ORDER BY src.k)) AS json_agg            FROM src)   WHERE (ts < ''2019-01-01 00:00:00+00''::timestamptz)'::text)
+   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events events SET j = ( SELECT ((to_json(array_agg(((concat(''{''::text, (to_json((''k'')::text))::text, '':''::text, COALESCE((to_json(src.k))::text, ''null''::text), ''}''::text))::json ->> ''k''::text) ORDER BY src.k)))::json)::json AS json_agg            FROM src)   WHERE (ts < ''2019-01-01 00:00:00+00''::timestamptz)'::text)
 (2 rows)
 
 -- (B) Parity against the live DuckDB: the target is accepted (ordered and not),
@@ -166,12 +166,6 @@ SELECT duckdb.raw_query($$ SELECT to_json(array_agg(x ORDER BY x)) FROM (VALUES 
 (1 row)
 
 SELECT duckdb.raw_query($$ SELECT to_json(array_agg(x)) FROM (VALUES ('b'),('a')) v(x) $$);
- raw_query 
------------
- 
-(1 row)
-
-SELECT duckdb.raw_query($$ SELECT to_json(array_agg(json_object('k', x) ->> 'k' ORDER BY x)) FROM (VALUES ('b'),('a')) v(x) $$);
  raw_query 
 -----------
  

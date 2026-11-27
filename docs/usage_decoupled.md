@@ -104,10 +104,11 @@ table. A type change is limited to the widening Iceberg accepts: `integer` to
 a constraint, a collation, or a storage or compression option is refused, as
 is a `USING` or `COLLATE` clause on a type change, and a column change shares
 an `ALTER TABLE` only with other column changes. A vector column is neither
-added nor changed, a table adopted read-only refuses every column change, and
-an object built on the view, such as another view, makes a column change
-fail. In a mesh, the change runs on one node: the Iceberg table is shared, and
-the rebuilt view and registry row replicate.
+added nor changed, no column changes to `jsonb`, a table adopted read-only
+refuses every column change, an adopted table refuses a `jsonb` column, and an
+object built on the view, such as another view, makes a column change fail.
+In a mesh, the change runs on one node: the Iceberg table is shared, and the
+rebuilt view and registry row replicate.
 
 ## Adopting a Table That Already Exists in the Catalog
 
@@ -138,14 +139,16 @@ SELECT coldfront.adopt_iceberg_table('public', 'orders', 'lake',
 ```
 
 Because Iceberg records no PostgreSQL type, an adopted column reads as whatever
-its storage type maps to; a `jsonb` column comes back as `text`. Pass `p_types`
-to restore one, provided the override maps to the type the catalog already
-stores:
+its storage type maps to; a `json` or `jsonb` column comes back as `text`. Pass
+`p_types` to restore one, provided the override maps to the type the catalog
+already stores. `p_types` restores a JSON column as `json`; ColdFront refuses a
+`jsonb` override because it compares `jsonb` values as the text PostgreSQL
+writes, and another engine may have written an adopted table:
 
 ```sql
 SELECT coldfront.adopt_iceberg_table('public', 'orders', 'lake',
                                      p_writable => true,
-                                     p_types    => '{"meta":"jsonb"}'::jsonb);
+                                     p_types    => '{"meta":"json"}'::jsonb);
 ```
 
 Adoption binds the name once. A second call under a registered name is refused

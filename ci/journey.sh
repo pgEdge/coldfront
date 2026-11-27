@@ -415,7 +415,7 @@ story_decoupled_alter() {
     # TC-255: DROP COLUMN.
     assert_contains "TC-255: DROP COLUMN runs on a decoupled table" "ALTER TABLE" \
         "$(q_may "$HOST" "ALTER TABLE public.tcalt DROP COLUMN memo;")"
-    assert_eq "TC-255: neither side has the column" "id bigint, qty bigint, amount numeric(12,2), doc json, r double precision, d timestamp without time zone|id BIGINT, qty BIGINT, amount DECIMAL(12,2), doc VARCHAR, r DOUBLE, d TIMESTAMP" \
+    assert_eq "TC-255: neither side has the column" "id bigint, qty bigint, amount numeric(12,2), doc jsonb, r double precision, d timestamp without time zone|id BIGINT, qty BIGINT, amount DECIMAL(12,2), doc VARCHAR, r DOUBLE, d TIMESTAMP" \
         "$(q "$HOST" "$view")|$(q "$HOST" "$desc" | tail -1)"
     assert_eq "TC-255: the view reads every row" "3" "$(q "$HOST" "SELECT count(*) FROM public.tcalt;")"
     # TC-256: the rebuilt view keeps its grants and its owner.
@@ -450,7 +450,7 @@ story_decoupled_alter() {
 # ───────────────────────────────────────────────────────────────────────────
 # Decoupled CRUD — every DML on the wrapper view is rewritten by the C hook to
 # a single duckdb.raw_query against Iceberg. Covers the INSERT shapes, jsonb
-# surfacing, UPDATE, DELETE.
+# reads and comparisons, UPDATE, DELETE.
 # ───────────────────────────────────────────────────────────────────────────
 story_decoupled_crud() {
     step "6. Decoupled CRUD (INSERT/SELECT/UPDATE/DELETE → Iceberg via the hook)"
@@ -459,6 +459,12 @@ INSERT INTO iceonly VALUES (1,date_trunc('month',now()) + interval '10 hours 0 m
 SELECT 'CNT:'||count(*) FROM iceonly;
 SELECT 'JSONTYPE:'||pg_typeof(data)::text FROM iceonly LIMIT 1;
 SELECT 'JSON:'||(data->>'a') FROM iceonly WHERE id=1;
+SELECT 'JB_EQ:'||count(*) FROM iceonly WHERE data = '{"a":1}';
+SELECT 'JB_AGGCMP:'||((SELECT jsonb_agg(status ORDER BY id) FROM iceonly) IS DISTINCT FROM (SELECT jsonb_agg(status ORDER BY id) FROM iceonly WHERE id = 1))::text;
+CREATE TABLE iceonly_copy AS SELECT id, data FROM iceonly;
+SELECT 'JB_COPYTYPE:'||atttypid::regtype::text FROM pg_attribute WHERE attrelid = 'iceonly_copy'::regclass AND attname = 'data';
+SELECT 'JB_COPYDATA:'||string_agg(data::text, ' ' ORDER BY id) FROM iceonly_copy;
+DROP TABLE iceonly_copy;
 INSERT INTO iceonly VALUES (10,date_trunc('month',now()) + interval '10 hours 1 minutes 0 seconds','multi','{}'),(11,date_trunc('month',now()) + interval '10 hours 1 minutes 1 seconds','multi','{}'),(12,date_trunc('month',now()) + interval '10 hours 1 minutes 2 seconds','multi','{}');
 SELECT 'MULTI:'||count(*) FROM iceonly WHERE status='multi';
 UPDATE iceonly SET status='upd' WHERE id=1;
@@ -480,8 +486,12 @@ EOSQL
     # The source runs in DuckDB, which cannot run the write a WITH entry holds.
     assert_err "decoupled INSERT refuses a leading WITH that modifies data" "data-modifying WITH" \
         "$(q_may "$HOST" "CREATE TABLE iceonly_staging (id int, ts timestamptz, status text, data jsonb); WITH gone AS (DELETE FROM iceonly_staging RETURNING id, ts, status, data) INSERT INTO iceonly (id, ts, status, data) SELECT id, ts, status, data FROM gone; DROP TABLE iceonly_staging;")"
-    assert_eq "decoupled jsonb surfaces as json"        "json" "$(extract JSONTYPE "$O")"
+    assert_eq "decoupled jsonb column reads as jsonb"   "jsonb" "$(extract JSONTYPE "$O")"
     assert_eq "decoupled jsonb round-trip (data->>a)"   "1"    "$(extract JSON "$O")"
+    assert_eq "decoupled jsonb = a constant in another spelling" "1" "$(extract JB_EQ "$O")"
+    assert_eq "decoupled jsonb_agg IS DISTINCT FROM jsonb_agg" "true" "$(extract JB_AGGCMP "$O")"
+    assert_eq "a table created from the read has a jsonb column" "jsonb" "$(extract JB_COPYTYPE "$O")"
+    assert_eq "and holds the documents as jsonb renders them" '{"a": 1} {"a": 2}' "$(extract JB_COPYDATA "$O")"
     assert_eq "decoupled multi-row INSERT (3 rows)"     "3"    "$(extract MULTI "$O")"
     assert_eq "decoupled UPDATE visible"                "upd"  "$(extract UPD "$O")"
     assert_eq "decoupled DELETE visible (0 of id=2)"    "0"    "$(extract DEL "$O")"
@@ -842,16 +852,26 @@ EOSQL
         'but the catalog stores DECIMAL(12,2)' "$O"
     assert_eq "TC-169: the refused override registered nothing" "0" \
         "$(q "$HOST" "SELECT count(*) FROM coldfront.tiered_views WHERE relname='orders';")"
-    O=$(q_may "$HOST" "SELECT coldfront.adopt_iceberg_table('public','orders','lake', p_types => '{\"metaa\":\"jsonb\"}');")
+    O=$(q_may "$HOST" "SELECT coldfront.adopt_iceberg_table('public','orders','lake', p_types => '{\"metaa\":\"json\"}');")
     assert_contains "TC-169: an override naming no column is refused" \
         'p_types names "metaa"' "$O"
     assert_eq "TC-169: the misspelled override registered nothing" "0" \
         "$(q "$HOST" "SELECT count(*) FROM coldfront.tiered_views WHERE relname='orders';")"
-    q "$HOST" "SELECT coldfront.adopt_iceberg_table('public','orders','lake', p_writable => true, p_types => '{\"meta\":\"jsonb\"}');" >/dev/null 2>&1
+    O=$(q_may "$HOST" "SELECT coldfront.adopt_iceberg_table('public','orders','lake', p_types => '{\"meta\":\"jsonb\"}');")
+    assert_contains "TC-169: a jsonb override is refused" \
+        'which an adopted column cannot have' "$O"
+    assert_eq "TC-169: the jsonb override registered nothing" "0" \
+        "$(q "$HOST" "SELECT count(*) FROM coldfront.tiered_views WHERE relname='orders';")"
+    q "$HOST" "SELECT coldfront.adopt_iceberg_table('public','orders','lake', p_writable => true, p_types => '{\"meta\":\"json\"}');" >/dev/null 2>&1
     assert_eq "TC-169: p_types reads the VARCHAR column as json" "json" \
         "$(q "$HOST" "SELECT pg_typeof(meta)::text FROM orders LIMIT 1;")"
     assert_eq "TC-169: the json operators work on it" "bronze" \
         "$(q "$HOST" "SELECT meta->>'tier' FROM orders WHERE order_id=3;")"
+    assert_eq "TC-169: the registry marks the table adopted" "t" \
+        "$(q "$HOST" "SELECT is_adopted FROM coldfront.tiered_views WHERE relname='orders';")"
+    O=$(q_may "$HOST" "ALTER TABLE orders ADD COLUMN extra jsonb;")
+    assert_contains "TC-169: an adopted table takes no jsonb column" \
+        'cannot be jsonb, because the table is adopted' "$O"
 
     # TC-170: one relation per ref, so the same table cannot answer to two names.
     q "$HOST" "CREATE SCHEMA IF NOT EXISTS reporting;" >/dev/null 2>&1
@@ -954,10 +974,10 @@ story_adopt_mesh() {
 }
 
 # ───────────────────────────────────────────────────────────────────────────
-# Story 4 — Reads + jsonb surfacing (proven assertions from run-ci-local).
+# Story 4: reads and jsonb.
 # ───────────────────────────────────────────────────────────────────────────
 story_reads() {
-    step "4. Reads (hot/cold/cross-tier, jsonb surfacing)"
+    step "4. Reads (hot/cold/cross-tier, jsonb)"
     local O; O=$(qf "$HOST" <<'EOSQL'
 SELECT 'RO_TOTAL:' || count(*) FROM events;
 SELECT 'RO_HOT:'   || count(*) FROM events WHERE ts >= date_trunc('month',now()) - interval '2 months';
@@ -965,10 +985,8 @@ SELECT 'RO_COLD:'  || count(*) FROM events WHERE ts  < date_trunc('month',now())
 SELECT 'JSONB_TYPE:'   || pg_typeof(data)::text FROM events LIMIT 1;
 SELECT 'JSONB_COLD_M:' || (data->>'m') FROM events WHERE ts < date_trunc('month',now()) - interval '2 months' AND status='ok' ORDER BY ts LIMIT 1;
 SELECT 'JSONB_HOT_M:'  || (data->>'m') FROM events WHERE ts >= date_trunc('month',now()) - interval '2 months' AND status='ok' ORDER BY ts LIMIT 1;
--- Read-path jsonb→json whitelist. The whole view query runs in DuckDB; the hook
--- translates the ::jsonb cast (so an explicit cast does not hit DuckDB's missing
--- jsonb type) and jsonb_array_length (verified identical in both engines). Cold and
--- hot, on real Iceberg data.
+-- A ::jsonb cast and jsonb_array_length on a read DuckDB runs, cold and hot, on
+-- real Iceberg data.
 SELECT 'CAST_COLD:' || ((data::jsonb)->>'m') FROM events WHERE ts < date_trunc('month',now()) - interval '2 months' AND status='ok' ORDER BY ts LIMIT 1;
 SELECT 'CAST_HOT:'  || ((data::jsonb)->>'m') FROM events WHERE ts >= date_trunc('month',now()) - interval '2 months' AND status='ok' ORDER BY ts LIMIT 1;
 SELECT 'ALEN_COLD:' || jsonb_array_length('[10,20,30]'::jsonb) FROM events WHERE ts < date_trunc('month',now()) - interval '2 months' AND status='ok' ORDER BY ts LIMIT 1;
@@ -990,12 +1008,12 @@ EOSQL
     assert_eq "total rows (hot+cold via view)" "280"  "$(extract RO_TOTAL "$O")"
     assert_eq "rows ts>=now-2mo (m2 cold + m1 hot)" "100" "$(extract RO_HOT "$O")"
     assert_eq "cold rows ts<now-2mo (m4+m3, read from Iceberg)" "180" "$(extract RO_COLD "$O")"
-    assert_eq "data surfaces as json" "json" "$(extract JSONB_TYPE "$O")"
-    assert_eq "json cold round-trip"  "m4"  "$(extract JSONB_COLD_M "$O")"
-    assert_eq "json hot round-trip"   "m2"  "$(extract JSONB_HOT_M "$O")"
-    assert_eq "::jsonb cast translated, cold" "m4" "$(extract CAST_COLD "$O")"
-    assert_eq "::jsonb cast translated, hot"  "m2" "$(extract CAST_HOT "$O")"
-    assert_eq "jsonb_array_length→json_array_length" "3" "$(extract ALEN_COLD "$O")"
+    assert_eq "data reads as jsonb" "jsonb" "$(extract JSONB_TYPE "$O")"
+    assert_eq "jsonb cold round-trip" "m4"  "$(extract JSONB_COLD_M "$O")"
+    assert_eq "jsonb hot round-trip"  "m2"  "$(extract JSONB_HOT_M "$O")"
+    assert_eq "::jsonb cast, cold" "m4" "$(extract CAST_COLD "$O")"
+    assert_eq "::jsonb cast, hot"  "m2" "$(extract CAST_HOT "$O")"
+    assert_eq "jsonb_array_length on a cold read" "3" "$(extract ALEN_COLD "$O")"
     assert_eq "#>> on cold rows"                       "m4"  "$(extract OP_PATH_COLD "$O")"
     assert_eq "? on cold rows (m4+m3)"                 "180" "$(extract OP_HASKEY_COLD "$O")"
     assert_eq "?| on cold rows (m4+m3)"                "180" "$(extract OP_ANYKEY_COLD "$O")"
@@ -1368,6 +1386,219 @@ EOSQL
     q "$HOST" "SELECT coldfront.create_iceberg_table('public', 'tcws_dec', '[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"note\",\"type\":\"text\"}]'::jsonb);
                INSERT INTO public.tcws_dec VALUES (1, E'tab\\there nl\\nhere');" >/dev/null
     assert_eq "TC-273: a decoupled INSERT" "$want" "$(q "$HOST" "SELECT note FROM public.tcws_dec WHERE id = 1;")"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story: TC-286, json and jsonb values. A jsonb string, a JSON null beside a SQL
+# NULL, and a json document's own spelling read back unchanged whichever path
+# wrote them: the archive, a tiered INSERT through the cold sink, through the
+# stream and through the stream's fallback to the sink, a cross-tier move each
+# way and within the cold tier, a cold UPDATE with a constant and with bound
+# parameters, and a decoupled INSERT.
+# ───────────────────────────────────────────────────────────────────────────
+story_json_values() {
+    step "TC-286: json and jsonb values read back unchanged whichever path wrote them"
+    local cold="ts < date_trunc('month',now()) - interval '3 months'"
+    local hot="date_trunc('month',now()) - interval '1 month'"
+    local m4="date_trunc('month',now()) - interval '4 months'"
+    _tcjs_cleanup() {
+        q "$HOST" "SELECT coldfront.drop_iceberg_table('public','tcjs', true);" >/dev/null 2>&1
+        q "$HOST" "SELECT coldfront.drop_iceberg_table('public','tcjs_dec', true);" >/dev/null 2>&1
+        q "$HOST" "DELETE FROM coldfront.tiered_views WHERE relname IN ('tcjs','tcjs_dec'); DELETE FROM coldfront.archive_watermark WHERE table_name='tcjs'; DELETE FROM coldfront.partition_config WHERE table_name='tcjs';" >/dev/null 2>&1
+        q "$HOST" "DROP VIEW IF EXISTS public.tcjs CASCADE;" >/dev/null 2>&1
+        q "$HOST" "DROP VIEW IF EXISTS public.tcjs_dec CASCADE;" >/dev/null 2>&1
+        q "$HOST" "DROP TABLE IF EXISTS public._tcjs CASCADE;" >/dev/null 2>&1
+        q "$HOST" "DROP TABLE IF EXISTS public.tcjs CASCADE;" >/dev/null 2>&1
+        q "$HOST" "DROP TABLE IF EXISTS public.tcjs_expect CASCADE;" >/dev/null 2>&1
+    }
+    trap _tcjs_cleanup RETURN
+    qf "$HOST" <<'EOSQL' >/dev/null
+-- n and r are the names the write paths give a row internally.
+CREATE TABLE public.tcjs (id bigint NOT NULL, ts timestamptz NOT NULL, doc jsonb, raw json, n int, r int,
+                          PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);
+DO $do$ DECLARE m date; BEGIN
+  FOREACH m IN ARRAY ARRAY[(date_trunc('month',now()) - interval '4 months')::date,
+                           (date_trunc('month',now()) - interval '1 month')::date] LOOP
+    EXECUTE format('CREATE TABLE public.%I PARTITION OF public.tcjs FOR VALUES FROM (%L) TO (%L)',
+                   'tcjs_p_' || to_char(m, 'YYYY_MM'), m, m + interval '1 month');
+  END LOOP; END $do$;
+-- The rows every path is compared against: a string, a string of digits, a
+-- JSON null, a SQL NULL, an object and a number. raw holds what json keeps and
+-- jsonb would rewrite: the spacing, the key order and a repeated key.
+CREATE TABLE public.tcjs_expect (k int, doc jsonb, raw json);
+INSERT INTO public.tcjs_expect VALUES
+  (1, '"abc"', '"abc"'),
+  (2, '"123"', '"123"'),
+  (3, 'null', 'null'),
+  (4, NULL, NULL),
+  (5, '{"b": 1, "a": "x"}', '{"b":1,   "a":"x", "a":"y"}'),
+  (6, '1.50', '[1.50,  "two", null]');
+INSERT INTO public.tcjs
+  SELECT k, date_trunc('month',now()) - interval '4 months' + interval '3 days', doc, raw FROM public.tcjs_expect;
+EOSQL
+    if ! "$ARCHIVER" register --table tcjs --column ts --period monthly \
+            --hot-period "$(hot_days) days" >"$TMPD/tcjs.log" 2>&1; then
+        fail "TC-286: register tcjs (see $TMPD/tcjs.log)"; tail -5 "$TMPD/tcjs.log"; return
+    fi
+    if ! archive_only "schema_name='public' AND table_name='tcjs'" "$TMPD/tcjs.log"; then
+        fail "TC-286: archive tcjs (see $TMPD/tcjs.log)"; tail -5 "$TMPD/tcjs.log"; return
+    fi
+    local want m4lit hotlit
+    want=$(q "$HOST" "SELECT doc, raw FROM public.tcjs_expect ORDER BY k;")
+    m4lit=$(q "$HOST" "SELECT ($m4 + interval '6 days')::text;")
+    hotlit=$(q "$HOST" "SELECT ($hot + interval '3 days')::text;")
+    # The six rows under ids $1 + 1 to $1 + 6. Each path writes its own ids, and
+    # a read of them parses no other row's documents.
+    _tcjs_rows() { q "$HOST" "SELECT doc, raw FROM public.tcjs WHERE id BETWEEN $1 + 1 AND $1 + 6 ORDER BY id;"; }
+    # Writes six rows under ids $1 + 1 to $1 + 6 at the literal timestamp $2,
+    # which lets the cold ones stream, and prints the statement's
+    # hot_rows|cold_rows. The sink counts its cold rows and the stream leaves
+    # the count to DuckDB, so the row tells which of the two wrote them.
+    _tcjs_put() { q "$HOST" "INSERT INTO public.tcjs SELECT $1 + k, '$2', doc, raw FROM public.tcjs_expect;"; }
+    assert_eq "TC-286: archived rows read back unchanged" "$want" "$(_tcjs_rows 0)"
+    assert_eq "TC-286: and they left the hot table" "0" "$(q "$HOST" "SELECT count(*) FROM public._tcjs WHERE id <= 6;")"
+    assert_eq "TC-286: an INSERT that calls now() writes its cold rows through the sink" "0|6" \
+        "$(q "$HOST" "INSERT INTO public.tcjs SELECT 10 + k, $m4 + interval '5 days', doc, raw FROM public.tcjs_expect;")"
+    assert_eq "TC-286: and the sink's rows read back unchanged" "$want" "$(_tcjs_rows 10)"
+    assert_eq "TC-286: an INSERT at a literal timestamp streams its cold rows" "0|" "$(_tcjs_put 20 "$m4lit")"
+    assert_eq "TC-286: and the streamed rows read back unchanged" "$want" "$(_tcjs_rows 20)"
+    # A second table-reading INSERT in one READ COMMITTED transaction falls
+    # back to the sink, which reads the stream's projection in this session.
+    assert_eq "TC-286: the second INSERT of a transaction falls back to the sink" "0|"$'\n'"0|6" \
+        "$(q "$HOST" "BEGIN; INSERT INTO public.tcjs SELECT 60 + k, '$m4lit', doc, raw FROM public.tcjs_expect; INSERT INTO public.tcjs SELECT 70 + k, '$m4lit', doc, raw FROM public.tcjs_expect; COMMIT;" | grep -F '|')"
+    assert_eq "TC-286: and its rows read back unchanged" "$want" "$(_tcjs_rows 70)"
+    _tcjs_put 30 "$m4lit" >/dev/null
+    q "$HOST" "UPDATE public.tcjs SET ts = $hot + interval '5 days' WHERE id BETWEEN 31 AND 36;" >/dev/null
+    assert_eq "TC-286: rows moved to the hot tier read back unchanged" "$want" "$(_tcjs_rows 30)"
+    assert_eq "TC-286: and they are hot" "6" "$(q "$HOST" "SELECT count(*) FROM public._tcjs WHERE id BETWEEN 31 AND 36;")"
+    _tcjs_put 40 "$hotlit" >/dev/null
+    q "$HOST" "UPDATE public.tcjs SET ts = $m4 + interval '8 days' WHERE id BETWEEN 41 AND 46;" >/dev/null
+    assert_eq "TC-286: rows moved to the cold tier read back unchanged" "$want" "$(_tcjs_rows 40)"
+    assert_eq "TC-286: and they are cold" "0" "$(q "$HOST" "SELECT count(*) FROM public._tcjs WHERE id BETWEEN 41 AND 46;")"
+    _tcjs_put 50 "$m4lit" >/dev/null
+    q "$HOST" "UPDATE public.tcjs SET ts = $m4 + interval '9 days' WHERE id BETWEEN 51 AND 56;" >/dev/null
+    assert_eq "TC-286: rows moved within the cold tier read back unchanged" "$want" "$(_tcjs_rows 50)"
+    assert_eq "TC-286: and they have the new timestamp" "6" \
+        "$(q "$HOST" "SELECT count(*) FROM public.tcjs WHERE id BETWEEN 51 AND 56 AND ts = $m4 + interval '9 days';")"
+    q "$HOST" "UPDATE public.tcjs SET doc = '\"xyz\"', raw = '\"x  y\"' WHERE $cold AND id = 1;" >/dev/null
+    assert_eq "TC-286: a cold UPDATE writes constants" '"xyz"|"x  y"' \
+        "$(q "$HOST" "SELECT doc, raw FROM public.tcjs WHERE id = 1;")"
+    q "$HOST" "PREPARE tcjs_set(jsonb, json) AS UPDATE public.tcjs SET doc = \$1, raw = \$2 WHERE $cold AND id = 2; EXECUTE tcjs_set('\"p q\"', '{\"z\":1,  \"a\":2}');" >/dev/null
+    assert_eq "TC-286: a cold UPDATE writes bound parameters" '"p q"|{"z":1,  "a":2}' \
+        "$(q "$HOST" "SELECT doc, raw FROM public.tcjs WHERE id = 2;")"
+    q "$HOST" "PREPARE tcjs_set(jsonb, json) AS UPDATE public.tcjs SET doc = \$1, raw = \$2 WHERE $cold AND id = 5; EXECUTE tcjs_set('null', 'null');" >/dev/null
+    assert_eq "TC-286: and a JSON null in each" 'null|null' \
+        "$(q "$HOST" "SELECT doc, raw FROM public.tcjs WHERE id = 5;")"
+    q "$HOST" "SELECT coldfront.create_iceberg_table('public', 'tcjs_dec', '[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"doc\",\"type\":\"jsonb\"},{\"name\":\"raw\",\"type\":\"json\"}]'::jsonb);
+               INSERT INTO public.tcjs_dec SELECT k, doc, raw FROM public.tcjs_expect;" >/dev/null
+    assert_eq "TC-286: a decoupled INSERT" "$want" "$(q "$HOST" "SELECT doc, raw FROM public.tcjs_dec ORDER BY id;")"
+}
+
+# ───────────────────────────────────────────────────────────────────────────
+# Story: TC-287, the jsonb text a cold write stores. A read compares stored
+# jsonb as the text PostgreSQL renders, so a cold write takes only a value that
+# is that text already: a constant, a parameter or a jsonb column. Any other
+# value is refused. Each check reads the VARCHAR the Iceberg table holds.
+# ───────────────────────────────────────────────────────────────────────────
+story_jsonb_write_form() {
+    step "TC-287: a cold write stores jsonb as the text PostgreSQL renders"
+    local cold="ts < date_trunc('month',now()) - interval '3 months'"
+    local hot="ts >= date_trunc('month',now()) - interval '2 months'"
+    local refused='takes only a constant, a parameter or a jsonb column in a cold write'
+    _tcjw_cleanup() {
+        q "$HOST" "SELECT coldfront.drop_iceberg_table('public','tcjw', true);" >/dev/null 2>&1
+        q "$HOST" "SELECT coldfront.drop_iceberg_table('public','tcjw_dec', true);" >/dev/null 2>&1
+        q "$HOST" "DELETE FROM coldfront.tiered_views WHERE relname IN ('tcjw','tcjw_dec'); DELETE FROM coldfront.archive_watermark WHERE table_name='tcjw'; DELETE FROM coldfront.partition_config WHERE table_name='tcjw';" >/dev/null 2>&1
+        q "$HOST" "DROP VIEW IF EXISTS public.tcjw CASCADE;" >/dev/null 2>&1
+        q "$HOST" "DROP VIEW IF EXISTS public.tcjw_dec CASCADE;" >/dev/null 2>&1
+        q "$HOST" "DROP TABLE IF EXISTS public._tcjw CASCADE;" >/dev/null 2>&1
+        q "$HOST" "DROP TABLE IF EXISTS public.tcjw CASCADE;" >/dev/null 2>&1
+        q "$HOST" "DROP TABLE IF EXISTS public.tcjw_src CASCADE;" >/dev/null 2>&1
+    }
+    trap _tcjw_cleanup RETURN
+    qf "$HOST" <<'EOSQL' >/dev/null
+CREATE TABLE public.tcjw (id bigint NOT NULL, ts timestamptz NOT NULL, doc jsonb, alt jsonb, raw json,
+                          PRIMARY KEY (id, ts)) PARTITION BY RANGE (ts);
+DO $do$ DECLARE m date; BEGIN
+  FOREACH m IN ARRAY ARRAY[(date_trunc('month',now()) - interval '4 months')::date,
+                           (date_trunc('month',now()) - interval '1 month')::date] LOOP
+    EXECUTE format('CREATE TABLE public.%I PARTITION OF public.tcjw FOR VALUES FROM (%L) TO (%L)',
+                   'tcjw_p_' || to_char(m, 'YYYY_MM'), m, m + interval '1 month');
+  END LOOP; END $do$;
+-- Rows 1 to 4 are archived and row 11 stays hot.
+INSERT INTO public.tcjw
+  SELECT i, date_trunc('month',now()) - interval '4 months' + i * interval '1 day',
+         '{"k": 1}', '{"z": 1}', '{"b":1,   "a":2}'
+    FROM generate_series(1, 4) i;
+INSERT INTO public.tcjw
+  VALUES (11, date_trunc('month',now()) - interval '1 month' + interval '2 days', '{"k": 1}', '{"z": 1}', NULL);
+CREATE TABLE public.tcjw_src (id bigint, k text, doc jsonb);
+INSERT INTO public.tcjw_src VALUES (1, 'b', '{"s": [1, 2]}'), (2, 'a', '{"s": [3]}');
+EOSQL
+    if ! "$ARCHIVER" register --table tcjw --column ts --period monthly \
+            --hot-period "$(hot_days) days" >"$TMPD/tcjw.log" 2>&1; then
+        fail "TC-287: register tcjw (see $TMPD/tcjw.log)"; tail -5 "$TMPD/tcjw.log"; return
+    fi
+    if ! archive_only "schema_name='public' AND table_name='tcjw'" "$TMPD/tcjw.log"; then
+        fail "TC-287: archive tcjw (see $TMPD/tcjw.log)"; tail -5 "$TMPD/tcjw.log"; return
+    fi
+    # The VARCHAR the Iceberg table $1 holds in doc for row $2.
+    _tcjw_stored() { q "$HOST" "SELECT coldfront.ensure_attached(); SELECT r['doc']::text FROM duckdb.query('SELECT doc FROM ice.public.$1 WHERE id = $2') r;" | tail -1; }
+    local upd="UPDATE public.tcjw SET doc =" rows="SELECT string_agg(id || '=' || doc::text, ' ' ORDER BY id) FROM public.tcjw;" before
+
+    q "$HOST" "$upd '{\"y\":1,   \"x\":2}' WHERE $cold AND id = 1;" >/dev/null
+    q "$HOST" "$upd alt WHERE $cold AND id = 2;" >/dev/null
+    q "$HOST" "PREPARE tcjw_par(jsonb) AS $upd \$1 WHERE $cold AND id = 3; EXECUTE tcjw_par('{\"b\":1,   \"a\":2}');" >/dev/null
+    q "$HOST" "$upd '{\"a\": 2,\"b\":1}' WHERE $cold AND id = 4;" >/dev/null
+    assert_eq "TC-287: a constant, another jsonb column and a parameter are stored as PostgreSQL renders them" \
+        '{"x": 2, "y": 1}|{"z": 1}|{"a": 2, "b": 1}' "$(_tcjw_stored tcjw 1)|$(_tcjw_stored tcjw 2)|$(_tcjw_stored tcjw 3)"
+    assert_eq "TC-287: the stored values compare and group as jsonb does" "2|1" \
+        "$(q "$HOST" "SELECT count(*), count(DISTINCT doc) FROM public.tcjw WHERE doc = '{\"b\":1,\"a\":2}';")"
+
+    before=$(q "$HOST" "$rows")
+    assert_err "TC-287: a built object is refused" "$refused" \
+        "$(q_may "$HOST" "$upd jsonb_build_object('b', 1) WHERE $cold AND id = 1;")"
+    assert_err "TC-287: the || operator on the row's document is refused" "$refused" \
+        "$(q_may "$HOST" "$upd doc || '{\"x\": 1}' WHERE $cold AND id = 1;")"
+    assert_err "TC-287: a json column's text is refused" "$refused" \
+        "$(q_may "$HOST" "$upd raw WHERE $cold AND id = 1;")"
+    assert_err "TC-287: an UPDATE of both tiers with a built value is refused" "$refused" \
+        "$(q_may "$HOST" "$upd jsonb_build_object('both', id) WHERE id IN (1, 11);")"
+    assert_eq "TC-287: the refused statements changed nothing" "$before" "$(q "$HOST" "$rows")"
+    q "$HOST" "$upd doc || '{\"x\": 1}' WHERE $hot AND id = 11;" >/dev/null
+    assert_eq "TC-287: on the hot tier PostgreSQL computes the value" '{"k": 1, "x": 1}' \
+        "$(q "$HOST" "SELECT doc FROM public._tcjw WHERE id = 11;")"
+
+    # A cold write's condition compares jsonb as a read DuckDB runs does, so it
+    # changes the rows a read with that condition returns, and an ordering of
+    # jsonb in it is refused.
+    q "$HOST" "UPDATE public.tcjw SET alt = '{\"m\": 1}' WHERE $cold AND doc = '{\"b\":1,\"a\":2}';" >/dev/null
+    q "$HOST" "UPDATE public.tcjw SET alt = '{\"m\": 2}' WHERE $cold AND doc -> 'x' = '2';" >/dev/null
+    assert_eq "TC-287: a cold UPDATE whose condition compares a stored document, and one DuckDB computes" "3,4|1" \
+        "$(q "$HOST" "SELECT string_agg(id::text, ',' ORDER BY id) FROM public.tcjw WHERE alt = '{\"m\": 1}';")|$(q "$HOST" "SELECT string_agg(id::text, ',' ORDER BY id) FROM public.tcjw WHERE alt = '{\"m\": 2}';")"
+    assert_err "TC-287: a cold DELETE that orders jsonb values is refused" "on a jsonb value is not supported" \
+        "$(q_may "$HOST" "DELETE FROM public.tcjw WHERE $cold AND doc > '9';")"
+
+    # A decoupled table takes the same rule.
+    q "$HOST" "SELECT coldfront.create_iceberg_table('public', 'tcjw_dec', '[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"doc\",\"type\":\"jsonb\"}]'::jsonb);
+               INSERT INTO public.tcjw_dec VALUES (1, '{\"b\":1,   \"a\":2}');
+               INSERT INTO public.tcjw_dec SELECT id + 10, doc FROM public.tcjw_src;" >/dev/null
+    assert_eq "TC-287: a decoupled INSERT of a constant and of a PostgreSQL table's jsonb column" '{"a": 2, "b": 1}|{"s": [1, 2]}' \
+        "$(_tcjw_stored tcjw_dec 1)|$(_tcjw_stored tcjw_dec 11)"
+    assert_err "TC-287: a decoupled INSERT of a built value is refused" "$refused" \
+        "$(q_may "$HOST" "INSERT INTO public.tcjw_dec VALUES (2, jsonb_build_object('b', 1));")"
+    assert_err "TC-287: a decoupled INSERT that builds the value from a source row is refused" "$refused" \
+        "$(q_may "$HOST" "INSERT INTO public.tcjw_dec SELECT id + 20, jsonb_build_object('k', k) FROM public.tcjw_src;")"
+    assert_eq "TC-287: the decoupled table holds the rows written and no other" "1,11,12" \
+        "$(q "$HOST" "SELECT string_agg(id::text, ',' ORDER BY id) FROM public.tcjw_dec;")"
+    # PostgreSQL 17 is the first to run a MERGE on a view.
+    if [ "$(q "$HOST" "SHOW server_version_num;")" -ge 170000 ]; then
+        q "$HOST" "MERGE INTO public.tcjw_dec d USING public.tcjw_src s ON d.id = s.id
+                   WHEN MATCHED THEN UPDATE SET doc = s.doc;" >/dev/null
+        assert_eq "TC-287: a MERGE writes a source table's jsonb column as it is" '{"s": [1, 2]}' "$(_tcjw_stored tcjw_dec 1)"
+        assert_err "TC-287: a MERGE that builds the value is refused" "$refused" \
+            "$(q_may "$HOST" "MERGE INTO public.tcjw_dec d USING public.tcjw_src s ON d.id = s.id WHEN MATCHED THEN UPDATE SET doc = jsonb_build_object('k', s.k);")"
+    fi
 }
 
 # ───────────────────────────────────────────────────────────────────────────
@@ -8404,6 +8635,8 @@ if [ "$MODE" = "tiered" ]; then
     story_unstorable_values # TC-231..TC-237: NaN and infinity refused where they are written
     story_arrays            # TC-238..TC-251: arrays tier as Iceberg lists
     story_whitespace_in_value # TC-273: a literal's tabs and newlines survive every rewritten write
+    story_json_values       # TC-286: json and jsonb values read back unchanged on every write path
+    story_jsonb_write_form  # TC-287: a cold write stores jsonb as the text PostgreSQL renders
     story_vector            # embeddings: vector → list<float> over all three cold-write paths
     story_writes
     story_compaction        # iceberg-go RewriteDataFiles; the manifest-list

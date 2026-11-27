@@ -370,14 +370,14 @@ SELECT order_id, customer, amount FROM orders ORDER BY order_id;
 ### Restoring a Type Iceberg Cannot Record
 
 The `meta` column reads as text, because Iceberg stores JSON as `VARCHAR` and
-records no PostgreSQL type. `p_types` restores the column's type, and the
+records no PostgreSQL type. `p_types` restores the column as `json`, and the
 override is accepted because it maps to what the catalog stores:
 
 ```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT coldfront.release_iceberg_table('public', 'orders');
 SELECT coldfront.adopt_iceberg_table('public', 'orders', 'lake',
                                      p_writable => true,
-                                     p_types    => '{"meta":"jsonb"}'::jsonb);
+                                     p_types    => '{"meta":"json"}'::jsonb);
 
 SELECT order_id, meta->>'tier' AS tier FROM orders ORDER BY order_id;
 ```
@@ -393,7 +393,7 @@ SELECT coldfront.release_iceberg_table('public', 'orders');
 ```
 
 Keep two points in mind when you adopt a table. Iceberg records no PostgreSQL
-type, so a `VARCHAR` column comes back as `text`, not `jsonb`, unless you set
+type, so a `VARCHAR` column comes back as `text`, not `json`, unless you set
 its type with `p_types`. The bakery also serializes only ColdFront's own
 writers; it does not coordinate with another engine that writes the same
 table.

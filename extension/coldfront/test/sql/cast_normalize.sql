@@ -1,11 +1,9 @@
 -- Parity / drift guard for normalize_casts_for_duckdb. Two halves:
 --   (A) white-box: a cold UPDATE whose casts + jsonb functions exercise the
 --       normalizer; EXPLAIN VERBOSE shows the rewritten cold SQL carries the DuckDB
---       spellings (::timestamp/::varchar/::double, json_object/json_set, ::json),
+--       spellings (::timestamp/::varchar/::double, ::json),
 --       the timestamptz bound, and the evt_jsonb identifier left intact.
---   (B) parity: DuckDB itself rejects `jsonb` (so ::jsonb→::json is required) but
---       accepts the rewrite targets. If a future DuckDB changes what it accepts,
---       or a new storage type needs a rewrite, this surfaces it.
+--   (B) parity: the live DuckDB accepts each rewrite target.
 -- White-box: we do NOT exercise Iceberg I/O.
 
 -- Suppress NOTICEs: raw_query echoes each DuckDB result as a (version-dependent)
@@ -32,14 +30,14 @@ VALUES ('public', 'events', '2026-03-01'::timestamptz);
 -- (A) Cold UPDATE (ts < cutoff): the deparsed cold SQL must carry DuckDB spellings.
 -- Casts: timestamp without time zone → timestamp, character varying → varchar,
 -- double precision → double; the timestamptz bound stays timestamptz. jsonb → json
--- everywhere: ::jsonb → ::json, jsonb_set → json_set, jsonb_build_object →
--- json_object — but the column name evt_jsonb (jsonb embedded) is left intact.
+-- in a cast, ::jsonb → ::json, but the column name evt_jsonb (jsonb embedded) is
+-- left intact.
 EXPLAIN (COSTS OFF, VERBOSE)
   UPDATE public.events
   SET c_tsn     = '2020-06-01 00:00:00'::timestamp without time zone,
       c_vc      = 'x'::character varying,
       c_dp      = 1.5::double precision,
-      evt_jsonb = jsonb_set(jsonb_build_object('k', 1), '{x}', '"v"'::jsonb)
+      evt_jsonb = '{"k": 1}'::jsonb
   WHERE ts < '2019-01-01'::timestamp with time zone;
 
 -- (A2) pgvector's cast: DuckDB knows no `vector`, and the Iceberg column is
@@ -50,16 +48,15 @@ EXPLAIN (COSTS OFF, VERBOSE)
   UPDATE public.events SET emb = '[1,2,3]'::vector(3)
   WHERE ts < '2019-01-01'::timestamp with time zone;
 
--- (B) Parity against the live DuckDB: the rewrite targets are accepted; `jsonb`
--- is rejected (which is why the map rewrites it). A void row = accepted.
+-- (B) Parity against the live DuckDB: the rewrite targets are accepted. A void
+-- row = accepted.
 SELECT duckdb.raw_query($$ SELECT NULL::json $$);
+SELECT duckdb.raw_query($$ SELECT "json"('{"a": 1}'::json) $$);
 SELECT duckdb.raw_query($$ SELECT '[1,2,3]'::FLOAT[] $$);
 SELECT duckdb.raw_query($$ SELECT NULL::vector $$);
-SELECT duckdb.raw_query($$ SELECT json_object('k', 1) $$);
 SELECT duckdb.raw_query($$ SELECT NULL::timestamp $$);
 SELECT duckdb.raw_query($$ SELECT NULL::varchar $$);
 SELECT duckdb.raw_query($$ SELECT NULL::double $$);
-SELECT duckdb.raw_query($$ SELECT NULL::jsonb $$);
 
 -- Cleanup.
 DELETE FROM coldfront.tiered_views;

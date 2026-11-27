@@ -3,9 +3,9 @@
 -- containment operator, so the read rewrite turns each into the JSON functions
 -- pg_duckdb hands to DuckDB (json_extract, json_extract_string, json_exists,
 -- json_contains, json_type). White-box: DuckDB executes the rewritten read against
--- the heap (duckdb.force_execution) through a view that casts jsonb to json, as a
--- tiered view does, and PostgreSQL runs the same operators on the heap; no
--- Iceberg I/O.
+-- the heap (duckdb.force_execution) through a view that casts the column as the
+-- view generator does (coldfront._iceberg_view_cast_type), and PostgreSQL runs
+-- the same operators on the heap; no Iceberg I/O.
 -- Suppress the run-order-dependent "already exists" NOTICE: in the shared regress
 -- db an earlier test may have created the extensions, standalone not.
 SET client_min_messages = warning;
@@ -18,7 +18,8 @@ SET coldfront.warehouse = '';
 SET coldfront.lakekeeper_endpoint = '';
 
 CREATE TABLE public._docs (id int, ts timestamptz, data jsonb);
-CREATE VIEW public.docs AS SELECT id, ts, data::json AS data FROM public._docs;
+SELECT format('CREATE VIEW public.docs AS SELECT id, ts, data::%s AS data FROM public._docs',
+              coldfront._iceberg_view_cast_type('jsonb')) \gexec
 INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
 VALUES ('public', 'docs', 'public._docs', 'ice.default.docs', 'ts');
 INSERT INTO coldfront.archive_watermark(schema_name, table_name, cutoff_time)
@@ -33,9 +34,11 @@ INSERT INTO public._docs VALUES
   (4, '2026-01-04', '5'),
   (5, '2026-01-05', NULL);
 
--- (A) A path into an array, and a key test through the ::jsonb cast.
+-- (A) A path into an array, and a key test on the column and through a ::jsonb
+-- cast.
 SET duckdb.force_execution = true;
 SELECT data #> '{a,0}' AS a0 FROM public.docs WHERE id = 1;
+SELECT id FROM public.docs WHERE data ? 'k' ORDER BY id;
 SELECT id FROM public.docs WHERE (data::jsonb) ? 'k' ORDER BY id;
 RESET duckdb.force_execution;
 
@@ -59,8 +62,8 @@ SELECT id, data #>> '{a,0}' AS a0, data #>> '{a,-1}' AS alast, data #>> '{a,01}'
        data #>> '{n}' AS jnull, data #>> '{a,NULL}' AS nullelem, data #> '{0}' AS first
   FROM public._docs ORDER BY id;
 
--- An empty path is the whole value; DuckDB renders a container compactly, as it
--- does for ->.
+-- An empty path is the whole value. #>> returns text, which for a container is
+-- DuckDB's compact rendering; #> returns jsonb, which PostgreSQL renders.
 SET duckdb.force_execution = true;
 SELECT id, data #>> '{}' AS whole, data #> '{o}' AS o FROM public.docs WHERE id IN (1, 3) ORDER BY id;
 RESET duckdb.force_execution;
@@ -116,8 +119,8 @@ DELETE FROM public._docs WHERE id = 6;
 
 -- (E) The function spellings of the same operators.
 SET duckdb.force_execution = true;
-SELECT id, json_extract_path_text(data, 'a', '-1') AS f1, jsonb_extract_path_text(data::jsonb, 'o', 'b') AS f2,
-       jsonb_exists(data::jsonb, 'k') AS f3
+SELECT id, json_extract_path_text(data::json, 'a', '-1') AS f1, jsonb_extract_path_text(data, 'o', 'b') AS f2,
+       jsonb_exists(data, 'k') AS f3
   FROM public.docs ORDER BY id;
 RESET duckdb.force_execution;
 SELECT id, json_extract_path_text(data::json, 'a', '-1') AS f1, jsonb_extract_path_text(data, 'o', 'b') AS f2,

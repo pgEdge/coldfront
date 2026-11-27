@@ -1,0 +1,486 @@
+-- A jsonb column read through a registered view is jsonb to PostgreSQL, so SQL
+-- that compares jsonb values gives the answers through the view that it gives on
+-- a heap table: =, <>, IS DISTINCT FROM, DISTINCT, GROUP BY, UNION and a join, on
+-- the column, on an explicit ::jsonb cast and on jsonb_agg / jsonb_build_object.
+-- Each answer is compared with PostgreSQL's own on a heap table holding the same
+-- rows.
+-- The view reads a Parquet file whose doc column is VARCHAR, which is how the cold
+-- tier stores jsonb, through the cast the view generator emits
+-- (coldfront._iceberg_view_cast_type), so DuckDB runs every read and no filter
+-- is evaluated by PostgreSQL; no Iceberg I/O.
+-- Suppress the run-order-dependent "already exists" NOTICE: in the shared regress
+-- db an earlier test may have created the extensions, standalone not.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_duckdb;
+CREATE EXTENSION IF NOT EXISTS coldfront;
+SET TIME ZONE 'UTC';
+SET coldfront.warehouse = '';
+SET coldfront.lakekeeper_endpoint = '';
+
+-- Without coldfront's alias, pg_duckdb (c04e6a2) hands a jsonb cast to DuckDB
+-- (v1.5.4) under a name DuckDB has no type for. This session has read no
+-- registered view yet, so the alias is absent. The read fails for as long as
+-- coldfront._ensure_jsonb_alias is needed.
+SELECT r['j']::jsonb AS j FROM duckdb.query($$ SELECT '{"a": 1}'::JSON AS j $$) r;
+
+-- Rows 1 and 3 are one document written in two key orders and spacings. Rows 7
+-- and 8 are one number written with and without a fractional zero. Rows 9 and 10
+-- are two decimals that differ only past the 17th significant digit.
+CREATE TABLE public._jdocs (id int, name text, doc jsonb);
+INSERT INTO public._jdocs VALUES
+  (1, 'a', '{"k": 1, "t": "x"}'),
+  (2, 'b', '{"k": 2}'),
+  (3, 'c', '{"t":"x","k":1}'),
+  (4, 'd', '[1, 2]'),
+  (5, 'e', '{"o": {"b": 1}, "a": [1, 2]}'),
+  (6, 'f', NULL),
+  (7, 'g', '{"n": 1}'),
+  (8, 'h', '{"n": 1.0}'),
+  (9, 'i', '{"d": 0.1234567890123456789}'),
+  (10, 'j', '{"d": 0.1234567890123456788}');
+-- The file holds each document as the text PostgreSQL renders the jsonb as, which
+-- is what a cold write stores.
+SELECT duckdb.raw_query(format(
+         'COPY (SELECT * FROM (VALUES %s) v(id, name, doc)) TO %L (FORMAT parquet)',
+         string_agg(format('(%s, %L, %s)', id, name,
+                           COALESCE(quote_literal(doc::text), 'NULL::VARCHAR')), ', ' ORDER BY id),
+         '/tmp/cf_read_jsonb_type.parquet'))
+FROM public._jdocs;
+SELECT format('CREATE VIEW public.jdocs AS SELECT r[''id'']::integer AS id, r[''name'']::text AS name, '
+              'r[''doc'']::%s AS doc FROM read_parquet(%L) r',
+              coldfront._iceberg_view_cast_type('jsonb'), '/tmp/cf_read_jsonb_type.parquet') \gexec
+INSERT INTO coldfront.tiered_views(schema_name, relname, iceberg_table, is_iceberg_only)
+VALUES ('public', 'jdocs', 'ice.default.jdocs', true);
+RESET client_min_messages;
+
+-- (A) The types PostgreSQL resolves, which decide whether a comparison parses. The
+-- json_ builders return json, as they do on a heap table.
+SELECT doc, doc::jsonb AS cast_jsonb, jsonb_build_object('n', name) AS obj FROM public.jdocs \gdesc
+SELECT jsonb_agg(name) AS agg, json_agg(name) AS json_agg FROM public.jdocs \gdesc
+
+-- Each check compares the view's answer with PostgreSQL's answer on the heap. The
+-- first check of a section runs both reads as top-level statements, the way a
+-- caller's SQL does: it captures the view's answer, compares, and unsets the
+-- capture so a read that fails leaves the comparison nothing to pass on. The
+-- others go through same(q), which runs the query q, %1$s being the table, on
+-- the view and on the heap and compares the rows in order. Its reads run inside
+-- a function, which pg_duckdb allows under the setting the function carries.
+CREATE FUNCTION public.jdocs_same(q text) RETURNS boolean LANGUAGE plpgsql
+SET duckdb.unsafe_allow_execution_inside_functions = true AS $$
+DECLARE r record; v text := ''; h text := '';
+BEGIN
+  FOR r IN EXECUTE format(q, 'public.jdocs') LOOP v := v || r::text || ';'; END LOOP;
+  FOR r IN EXECUTE format(q, 'public._jdocs') LOOP h := h || r::text || ';'; END LOOP;
+  RETURN v = h;
+END $$;
+-- same answers false when the two reads differ.
+SELECT public.jdocs_same('SELECT %1$L::text') AS same_sees_a_difference;
+-- (B) Comparisons of the column. The constant is written in another key order and
+-- spacing than the stored text.
+SELECT COALESCE(string_agg(id::text, ',' ORDER BY id), 'none') AS v FROM public.jdocs WHERE doc = '{"t":"x","k":1}' \gset
+SELECT :'v' = (SELECT COALESCE(string_agg(id::text, ',' ORDER BY id), 'none') FROM public._jdocs WHERE doc = '{"t":"x","k":1}') AS eq_constant;
+\unset v
+SELECT public.jdocs_same($q$SELECT id FROM %1$s WHERE doc <> '{"k": 2}' ORDER BY id$q$) AS ne_constant,
+       public.jdocs_same($q$SELECT id FROM %1$s WHERE doc IS DISTINCT FROM '{"k": 2}'::jsonb ORDER BY id$q$) AS distinct_from_constant,
+       public.jdocs_same($q$SELECT id FROM %1$s WHERE doc::jsonb = '[1,2]'::jsonb ORDER BY id$q$) AS eq_through_cast,
+       public.jdocs_same($q$SELECT id FROM %1$s WHERE doc IN ('{"k": 2}', '[1, 2]') ORDER BY id$q$) AS in_list,
+       public.jdocs_same($q$SELECT id FROM %1$s WHERE doc IN (SELECT doc FROM public._jdocs WHERE id <= 2) ORDER BY id$q$) AS in_subquery,
+       public.jdocs_same($q$SELECT id, CASE doc WHEN '{"k": 2}' THEN 'two' WHEN '{"t":"x","k":1}' THEN 'one' ELSE 'other' END
+                              FROM %1$s ORDER BY id$q$) AS simple_case;
+-- The same two shapes with a value DuckDB computes, and with the heap reading
+-- the view, where DuckDB builds the semi join from the view's side.
+SELECT public.jdocs_same($q$SELECT id FROM public._jdocs WHERE doc IN (SELECT doc FROM %1$s WHERE id <= 6) ORDER BY id$q$) AS heap_in_view_subquery,
+       public.jdocs_same($q$SELECT id FROM public._jdocs WHERE doc NOT IN (SELECT doc FROM %1$s WHERE id IN (1, 2)) ORDER BY id$q$) AS heap_not_in_view_subquery,
+       public.jdocs_same($q$SELECT id, CASE doc -> 'o' WHEN '{"b": 1}' THEN 'y' ELSE 'n' END FROM %1$s ORDER BY id$q$) AS simple_case_extracted;
+
+-- A jsonb operator or function the read rewrite does not translate is refused
+-- rather than handed to DuckDB, whose operator of the same name answers
+-- differently (|| concatenates the text) or which has none.
+SELECT doc || '{"x": 1}' FROM public.jdocs WHERE id = 2;
+SELECT doc - 'k' FROM public.jdocs WHERE id = 2;
+SELECT jsonb_typeof(doc) FROM public.jdocs WHERE id = 2;
+SELECT (doc -> 'k')::int FROM public.jdocs WHERE id = 2;
+SELECT id FROM public.jdocs WHERE doc = ANY ('{"{\"k\": 2}"}'::jsonb[]);
+SELECT id FROM public.jdocs WHERE doc @> ANY (ARRAY['{"k": 2}'::jsonb]);
+-- A sub-select whose column the rewrite cannot reach (a UNION, a VALUES list),
+-- a row comparison, and an operator other than = under ANY are refused too.
+SELECT id FROM public.jdocs WHERE doc IN (SELECT doc FROM public.jdocs WHERE id <= 2
+                                          UNION SELECT doc FROM public.jdocs WHERE id = 5);
+SELECT id FROM public.jdocs WHERE doc IN (VALUES ('{"k": 2}'::jsonb));
+SELECT id FROM public.jdocs WHERE (id, doc) IN (SELECT id, doc FROM public.jdocs);
+SELECT id FROM public.jdocs WHERE doc @> ANY (SELECT doc FROM public.jdocs WHERE id = 1);
+-- An IN list whose operand is volatile is refused too: comparing the operand
+-- with each element would evaluate it once per element.
+SELECT count(*) FROM public.jdocs WHERE CASE WHEN random() < 0.5 THEN '0'::jsonb ELSE '1'::jsonb END IN ('0'::jsonb, '1'::jsonb);
+-- An equality written with EXISTS is rewritten and answers as PostgreSQL.
+SELECT public.jdocs_same($q$SELECT id FROM %1$s a WHERE EXISTS (SELECT 1 FROM %1$s b WHERE b.id IN (1, 2) AND b.doc = a.doc)
+                             ORDER BY id$q$) AS exists_subquery;
+
+-- A view over the registered view: the read rewrite reaches the outer query's
+-- comparison, and the first read of a session through it attaches.
+CREATE VIEW public.jdocs_outer AS SELECT id, name, doc, doc -> 'o' AS o FROM public.jdocs;
+\c -
+SET coldfront.warehouse = '';
+SET coldfront.lakekeeper_endpoint = '';
+SELECT COALESCE(string_agg(id::text, ',' ORDER BY id), 'none') AS v FROM public.jdocs_outer WHERE o = '{"b": 1}' \gset
+SELECT :'v' = (SELECT COALESCE(string_agg(id::text, ',' ORDER BY id), 'none') FROM public._jdocs
+                WHERE doc -> 'o' = '{"b": 1}') AS outer_view_comparison;
+\unset v
+SELECT doc || '{"z": 1}' FROM public.jdocs_outer WHERE id = 2;
+-- date_bin and pg_typeof are rewritten on this path too, and answer as PostgreSQL
+-- does: pg_typeof names text where DuckDB would name varchar.
+SELECT date_bin('1 day', TIMESTAMPTZ '2026-01-01 05:00+00', TIMESTAMPTZ '2000-01-01') AS v
+  FROM public.jdocs_outer WHERE id = 1 \gset
+SELECT :'v'::timestamptz = date_bin('1 day', TIMESTAMPTZ '2026-01-01 05:00+00', TIMESTAMPTZ '2000-01-01') AS outer_view_date_bin;
+\unset v
+SELECT pg_typeof(name) AS name, pg_typeof(id) AS id FROM public.jdocs_outer WHERE id = 1;
+-- pg_typeof of a set-returning argument is refused: it would lose the rows the
+-- argument sets.
+SELECT pg_typeof(generate_series(1, 2)) FROM public.jdocs WHERE id = 1;
+-- date_bin with a bound origin on this path, over seven executions.
+PREPARE outer_bin(timestamptz) AS
+  SELECT date_bin('1 hour', TIMESTAMPTZ '2026-01-01 05:30+00', $1) AS b FROM public.jdocs_outer WHERE id = 1;
+EXECUTE outer_bin('2000-01-01 00:20+00') \g /dev/null
+EXECUTE outer_bin('2000-01-01 00:20+00') \g /dev/null
+EXECUTE outer_bin('2000-01-01 00:20+00') \g /dev/null
+EXECUTE outer_bin('2000-01-01 00:20+00') \g /dev/null
+EXECUTE outer_bin('2000-01-01 00:20+00') \g /dev/null
+EXECUTE outer_bin('2000-01-01 00:20+00') \g /dev/null
+EXECUTE outer_bin('2000-01-01 00:20+00') \gset
+SELECT :'b'::timestamptz = date_bin('1 hour', TIMESTAMPTZ '2026-01-01 05:30+00',
+                                    TIMESTAMPTZ '2000-01-01 00:20+00') AS outer_view_date_bin_param;
+\unset b
+DEALLOCATE outer_bin;
+-- A sub-select that sorts by a jsonb column is refused, here and on a direct read
+-- alike.
+SELECT id FROM public.jdocs_outer WHERE doc IN (SELECT doc FROM public.jdocs ORDER BY doc LIMIT 2);
+SELECT id FROM public.jdocs WHERE doc IN (SELECT doc FROM public.jdocs ORDER BY doc LIMIT 2);
+-- A sub-select that de-duplicates or groups the compared column is answered.
+SELECT public.jdocs_same($q$SELECT id FROM %1$s WHERE doc IN (SELECT DISTINCT doc FROM %1$s WHERE id <= 2) ORDER BY id$q$) AS in_distinct_subquery,
+       public.jdocs_same($q$SELECT id FROM %1$s WHERE doc IN (SELECT doc FROM %1$s WHERE id <= 2 GROUP BY doc) ORDER BY id$q$) AS in_grouped_subquery;
+-- One whose HAVING or ORDER BY also names the column is refused.
+SELECT id FROM public.jdocs WHERE doc IN (SELECT doc FROM public.jdocs GROUP BY doc HAVING doc ->> 't' = 'x');
+-- A cursor's statement reads the view as a SELECT does.
+BEGIN;
+DECLARE c CURSOR FOR SELECT id, pg_typeof(id) AS t, doc = '{"t":"x","k":1}' AS eq FROM public.jdocs WHERE id <= 3 ORDER BY id;
+FETCH ALL FROM c;
+ROLLBACK;
+DROP VIEW public.jdocs_outer;
+
+-- (C) De-duplication and grouping, over the rows whose equal documents are stored
+-- as equal text.
+SELECT count(*) AS v FROM (SELECT DISTINCT doc FROM public.jdocs WHERE id <= 6) s \gset
+SELECT :v = (SELECT count(*) FROM (SELECT DISTINCT doc FROM public._jdocs WHERE id <= 6) s) AS distinct_docs;
+\unset v
+SELECT public.jdocs_same($q$SELECT count(*) AS n FROM %1$s WHERE id <= 6 GROUP BY doc ORDER BY n$q$) AS group_by_doc,
+       public.jdocs_same($q$SELECT count(*) FROM (SELECT doc FROM %1$s WHERE id <= 3
+                                                  UNION SELECT doc FROM %1$s WHERE id BETWEEN 2 AND 5) s$q$) AS union_docs,
+       public.jdocs_same($q$SELECT a.id, b.id FROM %1$s a JOIN public._jdocs b ON a.doc = b.doc
+                              WHERE a.id <= 6 AND b.id <= 6 ORDER BY a.id, b.id$q$) AS join_on_doc;
+-- The same join written with USING or NATURAL is refused: PostgreSQL deparses
+-- those by column name, so the comparison cannot be rewritten.
+SELECT count(*) FROM public.jdocs a JOIN public._jdocs b USING (doc);
+SELECT count(*) FROM public.jdocs a NATURAL JOIN public._jdocs b;
+-- pg_duckdb (c04e6a2) alone loses rows of a join on a jsonb key: it hands the
+-- min/max filter DuckDB derives from the key, taken in text order, to the
+-- PostgreSQL scan, which applies jsonb's ordering. _jdocs is a heap table no view
+-- is registered for, so coldfront leaves the read to it. The two counts differ
+-- for as long as pg_duckdb does that.
+SET duckdb.force_execution = true;
+SELECT count(*) AS pg_duckdb_alone FROM public._jdocs a JOIN public._jdocs b ON a.doc = b.doc;
+RESET duckdb.force_execution;
+SELECT count(*) AS postgresql FROM public._jdocs a JOIN public._jdocs b ON a.doc = b.doc;
+
+-- (D) Values built in the query: two aggregates compared with each other, bare and
+-- through the cast, and a built object compared with another.
+SELECT ((SELECT jsonb_agg(name ORDER BY id) FROM public.jdocs)
+        IS DISTINCT FROM (SELECT jsonb_agg(name ORDER BY id) FROM public.jdocs WHERE id = 1))::text AS v \gset
+SELECT :'v'::boolean = ((SELECT jsonb_agg(name ORDER BY id) FROM public._jdocs)
+        IS DISTINCT FROM (SELECT jsonb_agg(name ORDER BY id) FROM public._jdocs WHERE id = 1)) AS agg_distinct_from_agg;
+\unset v
+SELECT public.jdocs_same($q$SELECT (SELECT jsonb_agg(name ORDER BY id) FROM %1$s)::jsonb
+                                   = (SELECT jsonb_agg(name ORDER BY id) FROM %1$s WHERE id <= 99)::jsonb$q$) AS agg_eq_agg_through_cast,
+       public.jdocs_same($q$SELECT id FROM %1$s WHERE jsonb_build_object('n', name) = jsonb_build_object('n', 'b')
+                             ORDER BY id$q$) AS object_eq_object,
+       public.jdocs_same($q$SELECT count(*) FROM (SELECT DISTINCT jsonb_build_object('k', doc -> 'k') FROM %1$s) s$q$) AS distinct_objects;
+
+-- (E) The text the read returns is the text PostgreSQL renders the jsonb as.
+SELECT string_agg(COALESCE(doc::text, 'NULL'), ' | ' ORDER BY id) AS v FROM public.jdocs \gset
+SELECT :'v' = (SELECT string_agg(COALESCE(doc::text, 'NULL'), ' | ' ORDER BY id) FROM public._jdocs) AS same_text;
+\unset v
+
+-- (F) Comparisons with a value DuckDB computes, which it renders in its own
+-- spacing: one extracted from a stored document, or built in the query.
+SELECT COALESCE(string_agg(id::text, ',' ORDER BY id), 'none') AS v FROM public.jdocs WHERE doc = jsonb_build_object('k', 2) \gset
+SELECT :'v' = (SELECT COALESCE(string_agg(id::text, ',' ORDER BY id), 'none') FROM public._jdocs
+                WHERE doc = jsonb_build_object('k', 2)) AS stored_eq_built;
+\unset v
+SELECT public.jdocs_same($q$SELECT id FROM %1$s WHERE doc -> 'o' = '{"b": 1}' ORDER BY id$q$) AS extracted_object_eq_constant,
+       public.jdocs_same($q$SELECT id FROM %1$s WHERE doc -> 'a' = '[1, 2]' ORDER BY id$q$) AS extracted_array_eq_constant,
+       public.jdocs_same($q$SELECT id FROM %1$s WHERE doc -> 'o' <> '{"b": 1}' ORDER BY id$q$) AS extracted_ne_constant,
+       public.jdocs_same($q$SELECT id FROM %1$s WHERE doc -> 'a' IS DISTINCT FROM '[1, 2]' ORDER BY id$q$) AS extracted_distinct_from_constant,
+       public.jdocs_same($q$SELECT id FROM %1$s WHERE doc -> 'o' IN ('{"b": 1}', '{"b": 9}') ORDER BY id$q$) AS extracted_in_list,
+       public.jdocs_same($q$SELECT id FROM %1$s WHERE doc -> 'a' NOT IN ('[1, 2]', '[9]') ORDER BY id$q$) AS extracted_not_in_list,
+       public.jdocs_same($q$SELECT id FROM %1$s WHERE doc -> 'o' IS NOT NULL AND NULLIF(doc -> 'o', '{"b": 1}') IS NULL
+                             ORDER BY id$q$) AS extracted_nullif;
+-- An object built from constant keys in another order than jsonb keeps them, with
+-- a key given twice, and with a longer key first.
+SELECT public.jdocs_same($q$SELECT id FROM %1$s WHERE doc = jsonb_build_object('t', 'x', 'k', 1) ORDER BY id$q$) AS built_keys_reordered,
+       public.jdocs_same($q$SELECT id FROM %1$s WHERE doc = jsonb_build_object('k', 9, 't', 'x', 'k', 1) ORDER BY id$q$) AS built_duplicate_key,
+       public.jdocs_same($q$SELECT id FROM %1$s WHERE id <= 2 AND jsonb_build_object('aa', 1, 'b', 2) = '{"aa": 1, "b": 2}'
+                             ORDER BY id$q$) AS built_key_length_order;
+-- A repeated key whose earlier value is not a constant is refused: PostgreSQL
+-- evaluates that value and keeps the last one, and DuckDB would keep both.
+SELECT jsonb_build_object('k', name::int, 'k', 1) FROM public.jdocs WHERE id = 1;
+-- A jsonb parameter compares as a constant does, through seven executions, which
+-- cross the plan cache's switch from custom to generic planning after the fifth.
+PREPARE by_doc(jsonb) AS
+  SELECT COALESCE(string_agg(id::text, ',' ORDER BY id), 'none') AS v FROM public.jdocs WHERE doc = $1;
+PREPARE by_doc_heap(jsonb) AS
+  SELECT COALESCE(string_agg(id::text, ',' ORDER BY id), 'none') AS h FROM public._jdocs WHERE doc = $1;
+EXECUTE by_doc('{"t":"x","k":1}') \gset
+EXECUTE by_doc_heap('{"t":"x","k":1}') \gset
+SELECT :'v' = :'h' AS prepared_1;
+\unset v
+EXECUTE by_doc('{"k": 2}') \gset
+EXECUTE by_doc_heap('{"k": 2}') \gset
+SELECT :'v' = :'h' AS prepared_2;
+\unset v
+EXECUTE by_doc('[1,2]') \gset
+EXECUTE by_doc_heap('[1,2]') \gset
+SELECT :'v' = :'h' AS prepared_3;
+\unset v
+EXECUTE by_doc('{"k": 3}') \gset
+EXECUTE by_doc_heap('{"k": 3}') \gset
+SELECT :'v' = :'h' AS prepared_4;
+\unset v
+EXECUTE by_doc('{"o":{"b":1},"a":[1,2]}') \gset
+EXECUTE by_doc_heap('{"o":{"b":1},"a":[1,2]}') \gset
+SELECT :'v' = :'h' AS prepared_5;
+\unset v
+EXECUTE by_doc('{"k": 2}') \gset
+EXECUTE by_doc_heap('{"k": 2}') \gset
+SELECT :'v' = :'h' AS prepared_6;
+\unset v
+EXECUTE by_doc('{"t":"x","k":1}') \gset
+EXECUTE by_doc_heap('{"t":"x","k":1}') \gset
+SELECT :'v' = :'h' AS prepared_7;
+\unset v
+SELECT name, generic_plans, custom_plans FROM pg_prepared_statements WHERE name = 'by_doc';
+DEALLOCATE by_doc;
+DEALLOCATE by_doc_heap;
+-- pg_duckdb (c04e6a2) alone cannot take a jsonb parameter, which is why coldfront
+-- folds one into the read (param_needs_value_walker) and plans each execution
+-- from its value. The statement fails for as long as that is needed.
+SET duckdb.force_execution = true;
+PREPARE alone(jsonb) AS SELECT count(*) FROM public._jdocs WHERE doc = $1;
+EXECUTE alone('{"k": 2}');
+RESET duckdb.force_execution;
+DEALLOCATE alone;
+
+-- (G) Numbers. Two stored documents, constants or parameters compare as the text
+-- PostgreSQL renders them in, in which a number keeps its integer or decimal
+-- spelling and every digit.
+-- A whole number written as 1 and as 1.0: jsonb holds them equal, and the view
+-- holds them different, in a comparison and in DISTINCT. Each line shows the
+-- view's answer beside jsonb's on the heap.
+SELECT COALESCE(string_agg(id::text, ',' ORDER BY id), 'none') AS v FROM public.jdocs WHERE doc = '{"n": 1.0}' \gset
+SELECT :'v' AS view_answer, (SELECT COALESCE(string_agg(id::text, ',' ORDER BY id), 'none') FROM public._jdocs
+                              WHERE doc = '{"n": 1.0}') AS jsonb_answer;
+\unset v
+SELECT count(*) AS v FROM (SELECT DISTINCT doc FROM public.jdocs WHERE id IN (7, 8)) s \gset
+SELECT :v AS view_answer, (SELECT count(*) FROM (SELECT DISTINCT doc FROM public._jdocs WHERE id IN (7, 8)) s) AS jsonb_answer;
+\unset v
+-- Two decimals that differ only past the 17th significant digit compare as jsonb
+-- compares them: with a constant, in an IN list, IN (SELECT ...) and a simple
+-- CASE, in a join with a heap table, through a sub-select and with a parameter.
+SELECT public.jdocs_same($q$SELECT id FROM %1$s WHERE doc = '{"d": 0.1234567890123456788}' ORDER BY id$q$) AS decimal_constant,
+       public.jdocs_same($q$SELECT id FROM %1$s WHERE doc IN ('{"k": 2}', '{"d": 0.1234567890123456788}') ORDER BY id$q$) AS decimal_in_list,
+       public.jdocs_same($q$SELECT id FROM %1$s WHERE doc IN (SELECT doc FROM public._jdocs WHERE id = 10) ORDER BY id$q$) AS decimal_in_subquery,
+       public.jdocs_same($q$SELECT id, CASE doc WHEN '{"d": 0.1234567890123456788}' THEN 'y' ELSE 'n' END
+                              FROM %1$s WHERE id >= 9 ORDER BY id$q$) AS decimal_case,
+       public.jdocs_same($q$SELECT a.id, b.id FROM %1$s a JOIN public._jdocs b ON a.doc = b.doc
+                              WHERE a.id >= 9 AND b.id >= 9 ORDER BY a.id, b.id$q$) AS decimal_join,
+       public.jdocs_same($q$SELECT id FROM (SELECT id, doc FROM %1$s) s WHERE s.doc = '{"d": 0.1234567890123456788}'
+                             ORDER BY id$q$) AS decimal_sub_select;
+PREPARE by_decimal(jsonb) AS
+  SELECT COALESCE(string_agg(id::text, ',' ORDER BY id), 'none') AS v FROM public.jdocs WHERE doc = $1;
+EXECUTE by_decimal('{"d": 0.1234567890123456788}') \gset
+SELECT :'v' = (SELECT COALESCE(string_agg(id::text, ',' ORDER BY id), 'none') FROM public._jdocs
+                WHERE doc = '{"d": 0.1234567890123456788}') AS decimal_parameter;
+\unset v
+DEALLOCATE by_decimal;
+
+-- A registered view with no watermark yet reads its hot table alone. When the
+-- statement still runs in DuckDB, because a rewritten date_bin is DuckDB's
+-- time_bucket, a view over the registered one gets the read rewrite too, here
+-- one created before the registration, so its body was not rewritten.
+CREATE TABLE public._jhot (id int, ts timestamptz, doc jsonb);
+INSERT INTO public._jhot VALUES (1, '2026-01-01 05:00+00', '{"o": {"b": 1}}'), (2, '2026-01-01 06:00+00', '{"o": {"b": 2}}');
+CREATE VIEW public.jhot AS SELECT id, ts, doc FROM public._jhot;
+CREATE VIEW public.jhot_flag AS SELECT id, doc -> 'o' = '{"b": 1}' AS is_b FROM public.jhot;
+INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
+VALUES ('public', 'jhot', 'public._jhot', 'ice.default.jhot', 'ts');
+SELECT string_agg(e.id || ':' || f.is_b, ',' ORDER BY e.id) AS v
+  FROM public.jhot e JOIN public.jhot_flag f ON f.id = e.id
+ WHERE date_bin('1 day', e.ts, TIMESTAMPTZ '2000-01-01 00:00+00') IS NOT NULL \gset
+SELECT :'v' = (SELECT string_agg(id || ':' || (doc -> 'o' = '{"b": 1}'), ',' ORDER BY id) FROM public._jhot) AS hot_view_inner_comparison;
+\unset v
+-- The same through a DuckDB-only aggregate, and through a table pg_duckdb keeps
+-- in DuckDB, with the document a bound parameter.
+SELECT string_agg(e.id || ':' || f.is_b, ',' ORDER BY e.id) AS v, approx_count_distinct(e.id) AS n
+  FROM public.jhot e JOIN public.jhot_flag f ON f.id = e.id \gset
+SELECT :'v' = (SELECT string_agg(id || ':' || (doc -> 'o' = '{"b": 1}'), ',' ORDER BY id) FROM public._jhot) AS hot_view_inner_comparison_agg;
+\unset v
+\unset n
+CREATE TEMP TABLE jhot_ids (id int) USING duckdb;
+INSERT INTO jhot_ids VALUES (1), (2);
+PREPARE hot_dk(jsonb) AS
+  SELECT string_agg(e.id::text, ',' ORDER BY e.id) AS v FROM public.jhot e JOIN jhot_ids k ON k.id = e.id WHERE e.doc @> $1;
+EXECUTE hot_dk('{"o": {"b": 1}}');
+DEALLOCATE hot_dk;
+DROP TABLE jhot_ids;
+-- A read of the view that PostgreSQL runs answers pg_typeof itself, as a regtype
+-- whose argument it evaluates. A rewrite that hands the read to DuckDB, here
+-- date_bin's time_bucket, makes pg_typeof name the type PostgreSQL resolved.
+SELECT pg_typeof(e.doc)::oid = 'jsonb'::regtype::oid AS hot_typeof_oid, pg_typeof(pg_typeof(e.doc)) AS hot_typeof_type
+  FROM public.jhot e JOIN public.jhot_flag f ON f.id = e.id WHERE e.id = 1;
+SELECT pg_typeof(1 / (e.id - e.id)) FROM public.jhot e JOIN public.jhot_flag f ON f.id = e.id WHERE e.id = 1;
+SELECT pg_typeof(e.doc) AS hot_duckdb_typeof FROM public.jhot e JOIN public.jhot_flag f ON f.id = e.id
+ WHERE e.id = 1 AND date_bin('1 day', e.ts, TIMESTAMPTZ '2000-01-01 00:00+00') IS NOT NULL;
+DROP VIEW public.jhot_flag;
+DELETE FROM coldfront.tiered_views WHERE schema_name = 'public' AND relname = 'jhot';
+DROP VIEW public.jhot;
+DROP TABLE public._jhot;
+
+-- (H) What PostgreSQL receives. A value the statement types as jsonb arrives as
+-- jsonb, whichever way the row is consumed: a PL/pgSQL record or a table created
+-- from the read; an array of jsonb arrives as jsonb[]. A json_ builder's result
+-- arrives as json.
+SET duckdb.unsafe_allow_execution_inside_functions = true;
+DO $$
+DECLARE r record;
+BEGIN
+  SELECT doc, doc::jsonb AS cast_jsonb, doc -> 'k' AS arrow, jsonb_build_object('n', name) AS obj
+    INTO r FROM public.jdocs WHERE id = 1;
+  RAISE NOTICE 'received: doc=% cast=% arrow=% object=%',
+        pg_typeof(r.doc), pg_typeof(r.cast_jsonb), pg_typeof(r.arrow), pg_typeof(r.obj);
+  SELECT jsonb_agg(name ORDER BY id) AS agg, json_agg(name ORDER BY id) AS jagg INTO r FROM public.jdocs;
+  RAISE NOTICE 'received: jsonb_agg=% json_agg=%', pg_typeof(r.agg), pg_typeof(r.jagg);
+  SELECT array_agg(doc ORDER BY id) AS arr, array_agg(doc -> 'k' ORDER BY id) AS arrow INTO r FROM public.jdocs;
+  RAISE NOTICE 'received: array_agg=% array_agg_arrow=%', pg_typeof(r.arr), pg_typeof(r.arrow);
+END $$;
+-- pg_duckdb (c04e6a2) alone returns a jsonb column as json: _jdocs is a heap
+-- table no view is registered for, so coldfront leaves the read to it. The read
+-- returns json for as long as coldfront's cast above the scan (cf_return_jsonb)
+-- is needed.
+SET duckdb.force_execution = true;
+DO $$
+DECLARE r record;
+BEGIN
+  SELECT doc INTO r FROM public._jdocs WHERE id = 1;
+  RAISE NOTICE 'pg_duckdb alone returns: %', pg_typeof(r.doc);
+END $$;
+RESET duckdb.force_execution;
+RESET duckdb.unsafe_allow_execution_inside_functions;
+CREATE TABLE public.jdocs_copy AS SELECT id, doc FROM public.jdocs;
+SELECT atttypid::regtype AS copied_as FROM pg_attribute
+ WHERE attrelid = 'public.jdocs_copy'::regclass AND attname = 'doc';
+SELECT NOT EXISTS ((SELECT id, doc FROM public.jdocs_copy EXCEPT ALL SELECT id, doc FROM public._jdocs)
+                   UNION ALL
+                   (SELECT id, doc FROM public._jdocs EXCEPT ALL SELECT id, doc FROM public.jdocs_copy)) AS copy_matches;
+-- The text a client is sent is PostgreSQL's rendering of the jsonb.
+SELECT id, doc FROM public.jdocs WHERE id IN (1, 5) ORDER BY id;
+SELECT id, doc FROM public._jdocs WHERE id IN (1, 5) ORDER BY id;
+SELECT array_agg(doc -> 'o' ORDER BY id) AS v FROM public.jdocs \gset
+SELECT :'v' = (SELECT array_agg(doc -> 'o' ORDER BY id)::text FROM public._jdocs) AS same_array_text;
+\unset v
+
+-- (I) pg_typeof names the type PostgreSQL resolved, as it does on the heap. A
+-- value PostgreSQL has no type for, an uncast DuckDB column, is named by DuckDB.
+SELECT pg_typeof(id) AS id, pg_typeof(name) AS name, pg_typeof(doc) AS doc, pg_typeof(doc -> 'k') AS arrow,
+       pg_typeof(jsonb_build_object('n', name)) AS object
+  FROM public.jdocs WHERE id = 1;
+SELECT pg_typeof(id) AS id, pg_typeof(name) AS name, pg_typeof(doc) AS doc, pg_typeof(doc -> 'k') AS arrow,
+       pg_typeof(jsonb_build_object('n', name)) AS object
+  FROM public._jdocs WHERE id = 1;
+SELECT pg_typeof(jsonb_agg(name)) AS agg FROM public.jdocs;
+SELECT pg_typeof(jsonb_agg(name)) AS agg FROM public._jdocs;
+SELECT pg_typeof(q['n']) AS uncast FROM public.jdocs, duckdb.query($$ SELECT 1::BIGINT AS n $$) q WHERE id = 1;
+
+-- (J) Ordering. DuckDB orders jsonb values by their text, which is not jsonb's
+-- order: an array sorts before every object, and an object with fewer pairs
+-- before one with more, whatever its keys. Where DuckDB runs the read, every
+-- ordering of a value that holds jsonb is refused: an ORDER BY at any level, in
+-- a window or in an aggregate, the ordering operators, GREATEST and LEAST, a row
+-- comparison, min and max, and each of these over an array, a row or a
+-- domain that holds jsonb.
+SELECT id FROM public.jdocs ORDER BY doc, id;
+SELECT id FROM public.jdocs ORDER BY doc -> 'n' DESC, id;
+SELECT doc FROM public.jdocs WHERE id < 6 UNION SELECT doc FROM public.jdocs WHERE id > 8 ORDER BY 1;
+SELECT DISTINCT ON (name) name, doc FROM public.jdocs ORDER BY name, doc;
+SELECT id FROM (SELECT id, doc FROM public.jdocs ORDER BY doc LIMIT 3) s;
+SELECT id, rank() OVER (ORDER BY doc) FROM public.jdocs;
+SELECT array_agg(id ORDER BY doc) FROM public.jdocs;
+SELECT id FROM public.jdocs WHERE doc < '{"k": 2}';
+SELECT id FROM public.jdocs WHERE doc >= '{"k": 2}';
+SELECT id FROM public.jdocs WHERE doc <= '{"k": 2}';
+SELECT id FROM public.jdocs WHERE doc > '{"k": 2}';
+SELECT greatest(doc, '{}') FROM public.jdocs;
+SELECT least(doc, '{}') FROM public.jdocs;
+SELECT id FROM public.jdocs WHERE (id, doc) < (2, '{}'::jsonb);
+SELECT id FROM public.jdocs ORDER BY ROW(doc, id);
+SELECT id FROM public.jdocs WHERE ARRAY[doc] < ARRAY['{"k": 2}'::jsonb];
+SELECT greatest(ARRAY[doc], ARRAY['{}'::jsonb]) FROM public.jdocs;
+SELECT id FROM public.jdocs WHERE ARRAY[doc] < ANY (SELECT ARRAY['{"k": 2}'::jsonb]);
+SELECT max(ARRAY[doc]) FROM public.jdocs;
+SELECT min(ARRAY[doc]) OVER () FROM public.jdocs;
+CREATE DOMAIN public.jdom AS jsonb;
+SELECT id FROM public.jdocs ORDER BY doc::public.jdom;
+SELECT id FROM public.jdocs WHERE doc::public.jdom < '{}';
+SELECT greatest(doc::public.jdom, '{}') FROM public.jdocs;
+DROP DOMAIN public.jdom;
+-- Equality of an array or a row that holds jsonb compares its jsonb parts by
+-- their text in DuckDB, and is refused as well.
+SELECT id FROM public.jdocs WHERE ARRAY[doc] = ARRAY['{"k": 2}'::jsonb];
+SELECT id FROM public.jdocs WHERE ARRAY[doc] IS DISTINCT FROM ARRAY['{"k": 2}'::jsonb];
+SELECT id FROM public.jdocs WHERE ARRAY[doc] = ANY (SELECT ARRAY['{"k": 2}'::jsonb]);
+-- A scroll cursor reads the rows in both directions, and its EXPLAIN runs with
+-- the cast above the scan.
+BEGIN;
+DECLARE jc SCROLL CURSOR FOR SELECT id, doc FROM public.jdocs ORDER BY id;
+DECLARE hc SCROLL CURSOR FOR SELECT id, doc FROM public._jdocs ORDER BY id;
+MOVE LAST IN jc;
+MOVE LAST IN hc;
+FETCH BACKWARD 3 FROM jc;
+FETCH BACKWARD 3 FROM hc;
+ROLLBACK;
+EXPLAIN (COSTS OFF, VERBOSE) DECLARE ec SCROLL CURSOR FOR SELECT doc FROM public.jdocs \g /dev/null
+
+-- (K) A read PostgreSQL runs itself, here of a registered view over a heap table
+-- that calls no DuckDB function, is answered as on the heap: PostgreSQL compares
+-- and orders jsonb as jsonb, has every jsonb operator, and builds an object with
+-- a repeated key.
+CREATE VIEW public.jdocs_pg AS SELECT id, name, doc FROM public._jdocs;
+INSERT INTO coldfront.tiered_views(schema_name, relname, iceberg_table, is_iceberg_only)
+VALUES ('public', 'jdocs_pg', 'ice.default.jdocs_pg', true);
+SELECT (SELECT array_agg(id) FROM (SELECT id FROM public.jdocs_pg ORDER BY doc, id) s)
+     = (SELECT array_agg(id) FROM (SELECT id FROM public._jdocs ORDER BY doc, id) s) AS pg_order_by,
+       (SELECT array_agg(id ORDER BY id) FROM public.jdocs_pg WHERE doc < '{"k": 2}')
+     = (SELECT array_agg(id ORDER BY id) FROM public._jdocs WHERE doc < '{"k": 2}') AS pg_less_than,
+       (SELECT array_agg(doc || '{"z": 0}' ORDER BY id) FROM public.jdocs_pg WHERE id <= 5)
+     = (SELECT array_agg(doc || '{"z": 0}' ORDER BY id) FROM public._jdocs WHERE id <= 5) AS pg_concat,
+       (SELECT count(*) FROM public.jdocs_pg WHERE doc = '{"n": 1.0}')
+     = (SELECT count(*) FROM public._jdocs WHERE doc = '{"n": 1.0}') AS pg_equal,
+       (SELECT count(*) FROM public.jdocs_pg WHERE doc IN ('{"n": 1}', '{"t":"x","k":1}'))
+     = (SELECT count(*) FROM public._jdocs WHERE doc IN ('{"n": 1}', '{"t":"x","k":1}')) AS pg_in_list,
+       (SELECT count(*) FROM public.jdocs_pg WHERE jsonb_build_object('k', id, 'k', 1) = '{"k": 1}')
+     = (SELECT count(*) FROM public._jdocs WHERE jsonb_build_object('k', id, 'k', 1) = '{"k": 1}') AS pg_repeated_key;
+DELETE FROM coldfront.tiered_views WHERE schema_name = 'public' AND relname = 'jdocs_pg';
+DROP VIEW public.jdocs_pg;
+
+DROP TABLE public.jdocs_copy;
+DELETE FROM coldfront.tiered_views WHERE schema_name = 'public' AND relname = 'jdocs';
+DROP VIEW public.jdocs;
+DROP TABLE public._jdocs;
+DROP FUNCTION public.jdocs_same(text);

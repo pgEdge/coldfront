@@ -1,0 +1,248 @@
+-- A cold write stores a jsonb value as the text PostgreSQL renders it in, which is
+-- what a read compares. DuckDB cannot produce that text, so the value a cold
+-- UPDATE, INSERT or MERGE assigns to a jsonb column must be that text already:
+-- a constant, a parameter, a jsonb column, or a CASE or COALESCE that picks one
+-- of those. Any other value is refused, with an error that names the column.
+-- White-box: EXPLAIN shows the statement each accepted shape becomes; no Iceberg
+-- I/O.
+SET client_min_messages = warning;
+CREATE EXTENSION IF NOT EXISTS pg_duckdb;
+CREATE EXTENSION IF NOT EXISTS coldfront;
+SET TIME ZONE 'UTC';
+SET coldfront.warehouse = '';
+SET coldfront.lakekeeper_endpoint = '';
+CREATE TABLE public._events (id int, ts timestamptz, data jsonb, alt jsonb, note text, j json);
+CREATE VIEW public.events AS SELECT * FROM public._events;
+CREATE TABLE public._dv (id int, doc jsonb);
+CREATE VIEW public.dv AS SELECT * FROM public._dv;
+CREATE DOMAIN public.jdoc AS jsonb;
+CREATE TABLE public.src (id int, k text, doc jsonb, dd public.jdoc);
+INSERT INTO coldfront.tiered_views(schema_name, relname, hot_table, iceberg_table, partition_col)
+VALUES ('public', 'events', 'public._events', 'ice.default.events', 'ts');
+INSERT INTO coldfront.tiered_views(schema_name, relname, iceberg_table, is_iceberg_only)
+VALUES ('public', 'dv', 'ice.default.dv', true);
+INSERT INTO coldfront.archive_watermark(schema_name, table_name, cutoff_time)
+VALUES ('public', 'events', '2026-03-01'::timestamptz);
+-- Accepted. A constant reaches DuckDB in jsonb's rendering, whatever its spelling.
+EXPLAIN (COSTS OFF, VERBOSE)
+UPDATE public.events SET data = '{"b":1,   "a":2}' WHERE ts < '2019-01-01'::timestamptz;
+                                                                                           QUERY PLAN                                                                                           
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result
+   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET data = ''{"a": 2, "b": 1}''::json   WHERE (ts < ''2019-01-01 00:00:00+00''::timestamptz)'::text)
+(2 rows)
+
+-- Another jsonb column, and a CASE and a COALESCE that pick one or a constant.
+EXPLAIN (COSTS OFF, VERBOSE)
+UPDATE public.events SET data = alt WHERE ts < '2019-01-01'::timestamptz;
+                                                                               QUERY PLAN                                                                                
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result
+   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET data = alt   WHERE (ts < ''2019-01-01 00:00:00+00''::timestamptz)'::text)
+(2 rows)
+
+EXPLAIN (COSTS OFF, VERBOSE)
+UPDATE public.events SET data = CASE WHEN id > 5 THEN alt ELSE COALESCE(data, '{}') END
+WHERE ts < '2019-01-01'::timestamptz;
+                                                                                                                                  QUERY PLAN                                                                                                                                   
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result
+   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET data =         CASE             WHEN (id > 5) THEN alt             ELSE COALESCE(data, ''{}''::json)         END   WHERE (ts < ''2019-01-01 00:00:00+00''::timestamptz)'::text)
+(2 rows)
+
+-- A jsonb column of a PostgreSQL table, in a MERGE and in a decoupled INSERT, and
+-- a column of a domain over jsonb.
+EXPLAIN (COSTS OFF, VERBOSE)
+MERGE INTO public.dv d USING public.src s ON d.id = s.id
+WHEN MATCHED THEN UPDATE SET doc = s.doc
+WHEN NOT MATCHED THEN INSERT VALUES (s.id, s.doc);
+ERROR:  cannot execute MERGE on relation "dv"
+DETAIL:  This operation is not supported for views.
+EXPLAIN (COSTS OFF, VERBOSE)
+INSERT INTO public.dv SELECT id, doc FROM public.src;
+                                                                                                  QUERY PLAN                                                                                                   
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result
+   Output: _exec_iceberg_with_claim('ice.default.dv'::text, 'INSERT INTO ice.default.dv (id, doc)  SELECT pglocal.public.src.id,             pglocal.public.src.doc            FROM pglocal.public.src'::text)
+(2 rows)
+
+EXPLAIN (COSTS OFF, VERBOSE)
+INSERT INTO public.dv SELECT id, dd FROM public.src;
+                                                                                                  QUERY PLAN                                                                                                  
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result
+   Output: _exec_iceberg_with_claim('ice.default.dv'::text, 'INSERT INTO ice.default.dv (id, doc)  SELECT pglocal.public.src.id,             pglocal.public.src.dd            FROM pglocal.public.src'::text)
+(2 rows)
+
+-- A bound parameter.
+PREPARE dv_set(jsonb, int) AS UPDATE public.dv SET doc = $1 WHERE id = $2;
+EXPLAIN (COSTS OFF, VERBOSE) EXECUTE dv_set('{"b":1,   "a":2}', 4);
+                                                                                              QUERY PLAN                                                                                              
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result
+   Output: _exec_iceberg_with_claim('ice.default.dv'::text, format('UPDATE ice.default.dv SET doc = %1$L   WHERE (id = %2$L)'::text, _canonical_text('{"a": 2, "b": 1}'::jsonb), _canonical_text(4)))
+(2 rows)
+
+DEALLOCATE dv_set;
+-- On the hot tier PostgreSQL computes the value, so any expression is accepted.
+EXPLAIN (COSTS OFF, VERBOSE)
+UPDATE public.events SET data = data || '{"x": 1}' WHERE ts >= '2026-03-02'::timestamptz;
+                                        QUERY PLAN                                        
+------------------------------------------------------------------------------------------
+ Update on public._events
+   ->  Seq Scan on public._events
+         Output: (data || '{"x": 1}'::jsonb), ctid
+         Filter: (_events.ts >= 'Mon Mar 02 00:00:00 2026 UTC'::timestamp with time zone)
+(4 rows)
+
+-- Refused, naming the column: a built object, with or without the row's columns;
+-- a sub-select; text cast to jsonb; an operator; a value extracted from the row;
+-- a volatile function; a json column; a MERGE and a decoupled INSERT that build a
+-- value; and an UPDATE on both tiers.
+UPDATE public.events SET data = jsonb_build_object('b', 1, 'a', 2) WHERE ts < '2019-01-01'::timestamptz;
+ERROR:  coldfront: jsonb column "data" of "events" takes only a constant, a parameter or a jsonb column in a cold write
+DETAIL:  ColdFront stores a jsonb value as the text PostgreSQL renders, and DuckDB would store another text for this value.
+UPDATE public.events SET data = jsonb_build_object('id', id, 'note', note), note = 'x'
+WHERE ts < '2019-01-01'::timestamptz;
+ERROR:  coldfront: jsonb column "data" of "events" takes only a constant, a parameter or a jsonb column in a cold write
+DETAIL:  ColdFront stores a jsonb value as the text PostgreSQL renders, and DuckDB would store another text for this value.
+UPDATE public.events SET data = (SELECT jsonb_agg(k ORDER BY k) FROM public.src)
+WHERE ts < '2019-01-01'::timestamptz;
+ERROR:  coldfront: jsonb column "data" of "events" takes only a constant, a parameter or a jsonb column in a cold write
+DETAIL:  ColdFront stores a jsonb value as the text PostgreSQL renders, and DuckDB would store another text for this value.
+UPDATE public.events SET data = '{"b":1,   "a":2}'::text::jsonb WHERE ts < '2019-01-01'::timestamptz;
+ERROR:  coldfront: jsonb column "data" of "events" takes only a constant, a parameter or a jsonb column in a cold write
+DETAIL:  ColdFront stores a jsonb value as the text PostgreSQL renders, and DuckDB would store another text for this value.
+UPDATE public.events SET data = data || '{"x": 1}' WHERE ts < '2019-01-01'::timestamptz;
+ERROR:  coldfront: jsonb column "data" of "events" takes only a constant, a parameter or a jsonb column in a cold write
+DETAIL:  ColdFront stores a jsonb value as the text PostgreSQL renders, and DuckDB would store another text for this value.
+UPDATE public.events e SET data = e.data -> 'k' WHERE e.ts < '2019-01-01'::timestamptz;
+ERROR:  coldfront: jsonb column "data" of "events" takes only a constant, a parameter or a jsonb column in a cold write
+DETAIL:  ColdFront stores a jsonb value as the text PostgreSQL renders, and DuckDB would store another text for this value.
+UPDATE public.events SET data = jsonb_build_object('r', random()) WHERE ts < '2019-01-01'::timestamptz;
+ERROR:  coldfront: jsonb column "data" of "events" takes only a constant, a parameter or a jsonb column in a cold write
+DETAIL:  ColdFront stores a jsonb value as the text PostgreSQL renders, and DuckDB would store another text for this value.
+UPDATE public.events SET data = j WHERE ts < '2019-01-01'::timestamptz;
+ERROR:  coldfront: jsonb column "data" of "events" takes only a constant, a parameter or a jsonb column in a cold write
+DETAIL:  ColdFront stores a jsonb value as the text PostgreSQL renders, and DuckDB would store another text for this value.
+MERGE INTO public.dv d USING public.src s ON d.id = s.id
+WHEN NOT MATCHED THEN INSERT VALUES (s.id, jsonb_build_object('new', true));
+ERROR:  cannot execute MERGE on relation "dv"
+DETAIL:  This operation is not supported for views.
+INSERT INTO public.dv VALUES (1, jsonb_build_object('b', 1, 'a', 2)), (2, '{"z": 1}');
+ERROR:  coldfront: jsonb column "doc" of "dv" takes only a constant, a parameter or a jsonb column in a cold write
+DETAIL:  ColdFront stores a jsonb value as the text PostgreSQL renders, and DuckDB would store another text for this value.
+INSERT INTO public.dv SELECT id, k::jsonb FROM public.src;
+ERROR:  coldfront: jsonb column "doc" of "dv" takes only a constant, a parameter or a jsonb column in a cold write
+DETAIL:  ColdFront stores a jsonb value as the text PostgreSQL renders, and DuckDB would store another text for this value.
+UPDATE public.events SET data = jsonb_build_object('b', 1, 'a', 2) WHERE id = 7;
+ERROR:  coldfront: jsonb column "data" of "events" takes only a constant, a parameter or a jsonb column in a cold write
+DETAIL:  ColdFront stores a jsonb value as the text PostgreSQL renders, and DuckDB would store another text for this value.
+-- The refusal holds in a WITH entry and in PL/pgSQL.
+WITH w AS (UPDATE public.dv SET doc = jsonb_build_object('a', 1) WHERE id = 1) SELECT 1;
+ERROR:  coldfront: jsonb column "doc" of "dv" takes only a constant, a parameter or a jsonb column in a cold write
+DETAIL:  ColdFront stores a jsonb value as the text PostgreSQL renders, and DuckDB would store another text for this value.
+DO $$ BEGIN UPDATE public.dv SET doc = jsonb_build_object('a', 1) WHERE id = 1; END $$;
+ERROR:  coldfront: jsonb column "doc" of "dv" takes only a constant, a parameter or a jsonb column in a cold write
+DETAIL:  ColdFront stores a jsonb value as the text PostgreSQL renders, and DuckDB would store another text for this value.
+CONTEXT:  SQL statement "UPDATE public.dv SET doc = jsonb_build_object('a', 1) WHERE id = 1"
+PL/pgSQL function inline_code_block line 1 at SQL statement
+-- The part of a cold write that DuckDB evaluates, its condition and a decoupled
+-- INSERT's source, gets the rewrite a read DuckDB runs gets: a stored document
+-- compares with a constant as text, a value DuckDB computes through json(), an
+-- operator DuckDB lacks becomes DuckDB's function, and an ordering or an
+-- untranslated operator is refused.
+EXPLAIN (COSTS OFF, VERBOSE)
+DELETE FROM public.events WHERE ts < '2019-01-01'::timestamptz AND data = '{"b":1,   "a":2}';
+                                                                                                       QUERY PLAN                                                                                                        
+-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result
+   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'DELETE FROM ice.default.events   WHERE ((ts < ''2019-01-01 00:00:00+00''::timestamptz) AND ((data)::text = (''{"a": 2, "b": 1}''::json)::text))'::text)
+(2 rows)
+
+EXPLAIN (COSTS OFF, VERBOSE)
+DELETE FROM public.events WHERE ts < '2019-01-01'::timestamptz AND data -> 'k' = '{"b": 1}';
+                                                                                                                          QUERY PLAN                                                                                                                          
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result
+   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'DELETE FROM ice.default.events   WHERE ((ts < ''2019-01-01 00:00:00+00''::timestamptz) AND ((json(((data -> ''k''::text))::json))::text = (json((''{"b": 1}''::json)::json))::text))'::text)
+(2 rows)
+
+EXPLAIN (COSTS OFF, VERBOSE)
+UPDATE public.events SET note = 'x' WHERE ts < '2019-01-01'::timestamptz AND data ? 'k';
+                                                                                                                                                                                                                                                      QUERY PLAN                                                                                                                                                                                                                                                      
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result
+   Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET note = ''x''::text   WHERE ((ts < ''2019-01-01 00:00:00+00''::timestamptz) AND (json_exists((data)::json, (''/k''::text)::varchar) OR json_contains(((((''{"\u0000":''::text || (data)::text) || ''}''::text))::json)::json, ((''{"\u0000":["k"]}''::text)::json)::json) OR json_contains(((((''{"\u0000":''::text || (data)::text) || ''}''::text))::json)::json, ((''{"\u0000":"k"}''::text)::json)::json)))'::text)
+(2 rows)
+
+EXPLAIN (COSTS OFF, VERBOSE)
+INSERT INTO public.dv SELECT id, doc FROM public.src WHERE doc = '{"a": 1}';
+                                                                                                                                         QUERY PLAN                                                                                                                                          
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result
+   Output: _exec_iceberg_with_claim('ice.default.dv'::text, 'INSERT INTO ice.default.dv (id, doc)  SELECT pglocal.public.src.id,             pglocal.public.src.doc            FROM pglocal.public.src           WHERE ((pglocal.public.src.doc)::text = (''{"a": 1}''::json)::text)'::text)
+(2 rows)
+
+DELETE FROM public.events WHERE ts < '2019-01-01'::timestamptz AND data > '9';
+ERROR:  coldfront: > on a jsonb value is not supported on a tiered or decoupled view
+HINT:  This statement runs in DuckDB, which sorts jsonb values by their text, not in jsonb's order. For example, the text 10 sorts before 9.
+DELETE FROM public.events WHERE ts < '2019-01-01'::timestamptz AND data || '{}' = '{}';
+ERROR:  coldfront: || on a jsonb value is not supported on a tiered or decoupled view
+DELETE FROM public.events WHERE ts < '2019-01-01'::timestamptz AND ARRAY[data] = ARRAY['{}'::jsonb];
+ERROR:  coldfront: = on an array or a row that holds jsonb is not supported on a tiered or decoupled view
+HINT:  This statement runs in DuckDB, which compares the jsonb they hold by its text. Compare the jsonb values one by one.
+-- The DuckDB statement names pg_duckdb's functions as DuckDB knows them,
+-- whatever the session's search_path.
+SET search_path = pg_catalog;
+EXPLAIN (COSTS OFF, VERBOSE)
+DELETE FROM public.events WHERE ts < '2019-01-01'::timestamptz AND data -> 'k' = '{"b": 1}';
+                                                                                                                               QUERY PLAN                                                                                                                               
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result
+   Output: coldfront._exec_iceberg_with_claim('ice.default.events'::text, 'DELETE FROM ice.default.events   WHERE ((ts < ''2019-01-01 00:00:00+00''::timestamptz) AND ((json(((data -> ''k''::text))::json))::text = (json((''{"b": 1}''::json)::json))::text))'::text)
+(2 rows)
+
+RESET search_path;
+-- The key or path of ?, ?|, ?& and #> in a cold write must be a constant: the
+-- rewrite needs its value, and a cold write's parameters are bound as it runs.
+PREPARE dk(text) AS DELETE FROM public.events WHERE ts < '2019-01-01'::timestamptz AND data ? $1;
+ERROR:  ? on a tiered or decoupled view needs its path or key as a constant, or as a bound parameter in a read
+-- On both tiers the hot half keeps PostgreSQL's comparison and the cold half gets
+-- the rewrite; a move of the partition column reads its cold rows with the
+-- rewritten condition.
+EXPLAIN (COSTS OFF, VERBOSE)
+UPDATE public.events SET note = 'x' WHERE id = 7 AND data = '{"a": 1}';
+                                                                                             QUERY PLAN                                                                                              
+-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Nested Loop
+   Output: h.id, h.ts, h.data, h.alt, h.note, h.j
+   CTE coldfront_hot
+     ->  Update on public._events
+           Output: _events.id, _events.ts, _events.data, _events.alt, _events.note, _events.j
+           ->  Seq Scan on public._events
+                 Output: 'x'::text, _events.ctid
+                 Filter: ((_events.id = 7) AND (_events.data = '{"a": 1}'::jsonb))
+   CTE coldfront_cold
+     ->  Result
+           Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET note = ''x''::text   WHERE ((id = 7) AND ((data)::text = (''{"a": 1}''::json)::text))'::text)
+   ->  CTE Scan on coldfront_hot h
+         Output: h.id, h.ts, h.data, h.alt, h.note, h.j
+   ->  CTE Scan on coldfront_cold c
+         Output: c._exec_iceberg_with_claim
+(15 rows)
+
+EXPLAIN (COSTS OFF, VERBOSE)
+UPDATE public.events SET ts = ts + interval '1 day' WHERE data = '{"a": 1}';
+                                                                                          QUERY PLAN                                                                                          
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Result
+   Output: _cross_tier_move('public'::text, 'events'::text, '(data = ''{"a": 1}''::jsonb)'::text, '(ts + ''@ 1 day''::interval)'::text, '((data)::text = (''{"a": 1}''::jsonb)::text)'::text)
+(2 rows)
+
+-- Cleanup.
+DELETE FROM coldfront.tiered_views;
+DELETE FROM coldfront.archive_watermark;
+DROP VIEW public.events, public.dv;
+DROP TABLE public._events, public._dv, public.src;
+DROP DOMAIN public.jdoc;

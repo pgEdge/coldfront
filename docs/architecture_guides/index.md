@@ -111,7 +111,7 @@ The following table describes each component, its role, and its license:
 |-----------|------|---------|
 | PostgreSQL 16+ | Provides heap storage and range partitioning for the tiered hot tier. ColdFront works uniformly on PG 16, 17, and 18, because the cold-tier secret is a DuckDB persistent secret loaded at instance init, with no version-gated mechanism. | PostgreSQL |
 | pg_duckdb | Runs DuckDB in-process for Iceberg reads, writes, and analytics; the build is pg_duckdb at commit c04e6a2 (PR #1025) on DuckDB 1.5.4. The bundled `duckdb-iceberg` includes the bakery-aware commit-refresh patch (async parquet overlap, no 409); see [Cold-Write Strategy](#cold-write-strategy-stock-vs-patched-duckdb-iceberg). ColdFront also applies brotli's fix for CVE-2026-111497 to the DuckDB that pg_duckdb compiles, because no DuckDB release up to and including 2.0.0 has that fix; see [Patching DuckDB](../installation.md#patching-duckdb). | MIT |
-| coldfront | This PGXS C extension's `post_parse_analyze_hook` rewrites INSERT/UPDATE/DELETE/MERGE on registered views to the correct tier and, on a SELECT DuckDB will run, the spellings DuckDB lacks (`date_bin`, `::jsonb`, the JSON builders, the JSON operators); `planner_hook` folds bound parameters into such a read; `ProcessUtility_hook` handles DDL; the hook lazily ATTACHes the Iceberg catalog on the first query touching a tiered view. | PostgreSQL |
+| coldfront | This PGXS C extension's `post_parse_analyze_hook` rewrites INSERT/UPDATE/DELETE/MERGE on registered views to the correct tier and, on a SELECT DuckDB will run, the spellings DuckDB lacks (`date_bin`, `jsonb_array_length`, the JSON builders, the JSON operators) and `pg_typeof`; `planner_hook` folds bound parameters into such a read, rewrites its `jsonb` comparisons and refuses what DuckDB would answer differently, and casts the `json` that pg_duckdb returns back to `jsonb`; `ProcessUtility_hook` handles DDL; the hook lazily ATTACHes the Iceberg catalog on the first query touching a tiered view. | PostgreSQL |
 | Lakekeeper | Provides the Iceberg REST catalog as a single Rust binary. | Apache 2.0 |
 | S3-compatible store or Azure ADLS Gen2 | Stores the cold data; any S3-compatible store works, including SeaweedFS, MinIO, AWS S3, and GCS, and Azure ADLS Gen2 works through `set_storage_secret_azure`. | Varies |
 | Archiver (tiered mode) | Moves rows from hot to cold; this Go binary is a thin SQL orchestrator that cron invokes. | PostgreSQL |
@@ -268,10 +268,10 @@ go through `_exec_iceberg_with_claim` (see
 
 The same parse-analyze hook prepares a `SELECT` that DuckDB will run, wherever
 in the statement the view is named (a CTE, a sub-select, a set-operation
-branch): `date_bin`, the `::jsonb` cast, `jsonb_array_length` and the JSON
-builders (`jsonb_build_object`, `jsonb_agg` and their `json_` twins) are
-rewritten into spellings both engines accept (see
-[Supported Column Types](../supported_types.md)). The hook also rewrites the
+branch): `date_bin`, `jsonb_array_length` and the JSON builders
+(`jsonb_build_object`, `jsonb_agg` and their `json_` twins) are rewritten into
+spellings both engines accept, and `pg_typeof` into the name of the type
+PostgreSQL resolved (see [Supported Column Types](../supported_types.md)). The hook also rewrites the
 JSON operators DuckDB lacks (`#>`, `#>>`, `?`, `?|`, `?&`, `@>`, `<@`) into
 DuckDB's JSON functions. A `planner_hook` folds bound parameters into such a
 read before pg_duckdb plans it when a parameter sits where DuckDB cannot type a
@@ -280,10 +280,15 @@ function); the plan cache's generic-plan build, which has no values, gets a
 PostgreSQL plan priced above any custom plan, so under the plan cache's
 cost-based selection the read is planned from its values on every execution.
 When an operand of those JSON operators holds a bound parameter, the
-parse-analyze hook leaves the rewrite to the `planner_hook`. The parse-analyze
-hook keeps `#>` and `#>>`, and turns the other operators into
-`coldfront._jsonb_*` stand-ins that PostgreSQL can parse. The `planner_hook`
-then folds the read's bound parameters and rewrites those operators.
+parse-analyze hook leaves the operator as written. The `planner_hook` then
+folds the read's bound parameters and rewrites those operators. The
+`planner_hook` also compares `jsonb` values in a read that pg_duckdb will run,
+as the text PostgreSQL renders or through DuckDB's `json()` function where
+DuckDB computes a value, and refuses what DuckDB would answer differently, such
+as an ordering of `jsonb` values; the cold half of a write gets the same
+rewrite. The same hook adds a cast above pg_duckdb's scan for each column
+the statement types as `jsonb`, because pg_duckdb returns DuckDB's JSON as
+`json`.
 `plan_cache_mode = force_generic_plan` bypasses that selection and picks the
 value-less generic plan, which fails with `only works with DuckDB execution`
 (see [Supported Column Types](../supported_types.md)).
@@ -559,17 +564,21 @@ The cross-cutting limitations are:
   ATTACH itself is lazy, so there is no per-session setup (see
   [Session Setup](#session-setup)).
 
-- `jsonb` reads as `json` through the view, unless the read is rerouted to the
-  hot heap: DuckDB has no native `jsonb`, and pg_duckdb takes over any query
-  that references a DuckDB read (all-or-nothing plan takeover), so the cold
-  branch cannot produce a PG `jsonb` directly. The view generator casts `jsonb`
-  columns to DuckDB-safe `json` on both sides: hot emits `"col"::json`, cold
-  emits `r['col']::json`, the UNION unifies on `json`. The `->>` and `->`
-  operators reach DuckDB unchanged. ColdFront's read rewrite translates the
-  JSON operators that DuckDB lacks. For the operator list and the `data::jsonb`
-  cast rule, see [Supported Column Types](../supported_types.md). Storage in
-  Iceberg remains VARCHAR (Iceberg has no JSON type either). The cold sink
-  sends the incoming value as its text form.
+- DuckDB runs the `jsonb` operations of a cold or cross-tier read on JSON
+  text: DuckDB has no native `jsonb`, and pg_duckdb takes over any query that
+  references a DuckDB read (all-or-nothing plan takeover). The view generator
+  casts a `jsonb` column to `jsonb` on both sides, so PostgreSQL types the
+  column as `jsonb`. A temporary type alias, created in the backend's DuckDB
+  instance at the lazy attach, resolves the name `jsonb` to DuckDB's JSON
+  type. pg_duckdb returns DuckDB's JSON as `json`, and a cast above its scan
+  hands PostgreSQL `jsonb`. The `->>` and `->` operators reach DuckDB
+  unchanged. ColdFront's read rewrite translates the JSON operators that
+  DuckDB lacks, and compares `jsonb` values as the text PostgreSQL renders or
+  through DuckDB's `json()` function where DuckDB computes a value.
+  For the operator list and the comparison rules, see
+  [Supported Column Types](../supported_types.md). Storage in Iceberg remains
+  VARCHAR (Iceberg has no JSON type either). The cold sink sends the incoming
+  value as its text form.
 
 - Lakekeeper remote signing may not work with all S3-compatible stores; the
   workaround is `ACCESS_DELEGATION_MODE NONE` with a direct DuckDB S3 secret.
@@ -580,10 +589,9 @@ The cross-cutting limitations are:
   DuckDB-only functions). Once pg_duckdb takes over, the whole statement runs
   in DuckDB; there is no cost-based hot-vs-cold split per predicate. The one
   exception is a single-table read whose WHERE proves `ts >= cutoff`: the hook
-  rewrites it to read the hot heap in plain PostgreSQL, which returns native
-  `jsonb`. Other hot-only queries can target `_events` directly (native PG, no
-  `pg_duckdb` roundtrip); queries that need cross-tier semantics go through the
-  view.
+  rewrites it to read the hot heap in plain PostgreSQL. Other hot-only queries
+  can target `_events` directly (native PG, no `pg_duckdb` roundtrip); queries
+  that need cross-tier semantics go through the view.
 
 - Query execution is single-node: a query runs on the PG backend it landed on.
   `pg_duckdb` does not distribute the DuckDB plan across nodes. Replication

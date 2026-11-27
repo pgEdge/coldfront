@@ -50,9 +50,9 @@ EXPLAIN (COSTS OFF, VERBOSE)
                  ->  Subquery Scan on r
                        Output: r.coldfront_batch, r.*
                        ->  WindowAgg
-                             Output: (nextval('_events_id_seq'::regclass)), coldfront_source_1.ts, ('new'::text), coldfront_source_1.data, ((row_number() OVER (?) - 1) / (current_setting('coldfront.cold_write_batch_size'::text))::integer)
+                             Output: (nextval('_events_id_seq'::regclass)), coldfront_source_1.ts, ('new'::text), ((coldfront_source_1.data)::text), ((row_number() OVER (?) - 1) / (current_setting('coldfront.cold_write_batch_size'::text))::integer)
                              ->  CTE Scan on coldfront_source coldfront_source_1
-                                   Output: nextval('_events_id_seq'::regclass), coldfront_source_1.ts, 'new'::text, coldfront_source_1.data
+                                   Output: nextval('_events_id_seq'::regclass), coldfront_source_1.ts, 'new'::text, (coldfront_source_1.data)::text
                                    Filter: (coldfront_source_1.ts < 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
    InitPlan 4
      ->  Aggregate

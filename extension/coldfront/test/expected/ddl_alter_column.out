@@ -33,7 +33,7 @@ ALTER VIEW public.events OWNER TO ddl_alter_owner;
 ALTER TABLE public._events ADD COLUMN bad inet;
 ERROR:  coldfront: column "bad": PG type inet has no Iceberg-compatible mapping. Supported: bigint, integer, smallint, real, double precision, boolean, timestamptz, timestamp, date, time, uuid, text, varchar(N), char(N), bytea, numeric(P,S), jsonb, json, interval, vector(N), halfvec(N), and one-dimensional arrays of those types except timestamptz, jsonb, json, interval and the vector types. inet/cidr/oid unsupported (store IP data as text, oid values as bigint); sparsevec unsupported (keep it in the hot tier)
 CONTEXT:  PL/pgSQL function _iceberg_storage_type(text,text) line 67 at RAISE
-PL/pgSQL function _mirror_iceberg_alter(text,text,jsonb) line 60 at assignment
+PL/pgSQL function _mirror_iceberg_alter(text,text,jsonb) line 78 at assignment
 SQL statement "SELECT coldfront._mirror_iceberg_alter('ice.default.events', 'public._events', jsonb_build_array(jsonb_build_object('op', 'add', 'col', 'bad')))"
 SELECT attname FROM pg_attribute
  WHERE attrelid = 'public._events'::regclass AND attnum > 0 AND NOT attisdropped
@@ -44,6 +44,21 @@ SELECT attname FROM pg_attribute
  ts
  status
 (3 rows)
+
+-- A column cannot become jsonb: its cold rows keep their text as written, and
+-- ColdFront compares jsonb as the text PostgreSQL renders. The hot ALTER rolls
+-- back with the refusal, so status stays text.
+ALTER TABLE public._events ALTER COLUMN status TYPE jsonb USING to_jsonb(status);
+ERROR:  coldfront: column "status" of a tiered or decoupled table cannot change to jsonb
+DETAIL:  Its cold rows keep the text they were written in, and ColdFront compares jsonb as the text PostgreSQL renders.
+CONTEXT:  PL/pgSQL function _mirror_iceberg_alter(text,text,jsonb) line 44 at RAISE
+SQL statement "SELECT coldfront._mirror_iceberg_alter('ice.default.events', 'public._events', jsonb_build_array(jsonb_build_object('op', 'type', 'col', 'status')))"
+SELECT format_type(atttypid, atttypmod) AS status_type FROM pg_attribute
+ WHERE attrelid = 'public._events'::regclass AND attname = 'status';
+ status_type 
+-------------
+ text
+(1 row)
 
 -- 2. Apply-worker path: the mirror is a no-op (the shared catalog was already
 --    evolved by the originator), but the per-node view is rebuilt to follow every

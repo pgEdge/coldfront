@@ -30,20 +30,20 @@ INSERT INTO public._events VALUES (1, '2026-01-01 00:05+00', 'work_mem', '4MB'),
 -- an object, a FILTERed aggregate, and a json_ (not jsonb_) aggregate of scalars.
 EXPLAIN (COSTS OFF, VERBOSE)
 SELECT jsonb_build_object('name', name, 'value', setting)::text AS details FROM public.events;
-                                                                                                                               QUERY PLAN                                                                                                                                
--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                                QUERY PLAN                                                                                                                                
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Seq Scan on public._events
-   Output: ((concat('{'::text, (to_json('name'::text))::text, ':'::text, COALESCE((to_json(_events.name))::text, 'null'::text), ','::text, (to_json('value'::text))::text, ':'::text, COALESCE((to_json(_events.setting))::text, 'null'::text), '}'::text))::json)::text
+   Output: ((concat('{'::text, (to_json('name'::text))::text, ':'::text, COALESCE((to_json(_events.name))::text, 'null'::text), ','::text, (to_json('value'::text))::text, ':'::text, COALESCE((to_json(_events.setting))::text, 'null'::text), '}'::text))::jsonb)::text
 (2 rows)
 
 EXPLAIN (COSTS OFF, VERBOSE)
 SELECT jsonb_build_object('count', count(*),
                           'changes', jsonb_agg(jsonb_build_object('name', name, 'value', setting) ORDER BY name))::text
 FROM public.events;
-                                                                                                                                                                                                                                                                  QUERY PLAN                                                                                                                                                                                                                                                                   
------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                                                                                                                                                                        QUERY PLAN                                                                                                                                                                                                                                                                        
+----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Aggregate
-   Output: ((concat('{'::text, (to_json('count'::text))::text, ':'::text, COALESCE((to_json(count(*)))::text, 'null'::text), ','::text, (to_json('changes'::text))::text, ':'::text, COALESCE((to_json(array_agg((concat('{'::text, (to_json('name'::text))::text, ':'::text, COALESCE((to_json(_events.name))::text, 'null'::text), ','::text, (to_json('value'::text))::text, ':'::text, COALESCE((to_json(_events.setting))::text, 'null'::text), '}'::text))::json ORDER BY _events.name)))::text, 'null'::text), '}'::text))::json)::text
+   Output: ((concat('{'::text, (to_json('count'::text))::text, ':'::text, COALESCE((to_json(count(*)))::text, 'null'::text), ','::text, (to_json('changes'::text))::text, ':'::text, COALESCE(((to_json(array_agg((concat('{'::text, (to_json('name'::text))::text, ':'::text, COALESCE((to_json(_events.name))::text, 'null'::text), ','::text, (to_json('value'::text))::text, ':'::text, COALESCE((to_json(_events.setting))::text, 'null'::text), '}'::text))::jsonb ORDER BY _events.name)))::jsonb)::text, 'null'::text), '}'::text))::jsonb)::text
    ->  Sort
          Output: _events.name, _events.setting
          Sort Key: _events.name
@@ -53,10 +53,10 @@ FROM public.events;
 
 EXPLAIN (COSTS OFF, VERBOSE)
 SELECT jsonb_agg(name) FILTER (WHERE setting IS NOT NULL) FROM public.events;
-                                       QUERY PLAN                                        
------------------------------------------------------------------------------------------
+                                            QUERY PLAN                                            
+--------------------------------------------------------------------------------------------------
  Aggregate
-   Output: to_json(array_agg(_events.name) FILTER (WHERE (_events.setting IS NOT NULL)))
+   Output: (to_json(array_agg(_events.name) FILTER (WHERE (_events.setting IS NOT NULL))))::jsonb
    ->  Seq Scan on public._events
          Output: _events.id, _events.ts, _events.name, _events.setting
 (4 rows)
@@ -81,9 +81,9 @@ SELECT jsonb_build_object('count', count(*),
                           'changes', jsonb_agg(jsonb_build_object('name', name, 'value', setting) ORDER BY name))::text AS details
 FROM public.events \gset
 SELECT :'details' AS rewritten_read;
-                                                         rewritten_read                                                          
----------------------------------------------------------------------------------------------------------------------------------
- {"count":3,"changes":[{"name":"app_name","value":"o'neil"},{"name":"max_conn","value":null},{"name":"work_mem","value":"4MB"}]}
+                                                                rewritten_read                                                                 
+-----------------------------------------------------------------------------------------------------------------------------------------------
+ {"count": 3, "changes": [{"name": "app_name", "value": "o'neil"}, {"name": "max_conn", "value": null}, {"name": "work_mem", "value": "4MB"}]}
 (1 row)
 
 SELECT :'details'::jsonb = jsonb_build_object('count', count(*),
@@ -121,11 +121,11 @@ SELECT jsonb_build_object('name', name, 'value', setting) ->> 'value' AS value F
 -- in DuckDB, whichever branch names the view.
 WITH changes AS (SELECT name, setting FROM public.events)
 SELECT jsonb_build_object('name', name)::text FROM changes ORDER BY 1;
- jsonb_build_object  
----------------------
- {"name":"app_name"}
- {"name":"max_conn"}
- {"name":"work_mem"}
+  jsonb_build_object  
+----------------------
+ {"name": "app_name"}
+ {"name": "max_conn"}
+ {"name": "work_mem"}
 (3 rows)
 
 -- (C) Parity against the live DuckDB: it executes the rewritten read (force_execution
