@@ -2186,9 +2186,8 @@ cf_json_builder_mutator(Node *node, void *ctx)
                     (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                      errmsg("coldfront: this comparison of jsonb values is not supported on a "
                             "tiered or decoupled view"),
-                     errhint("When the comparison is the WHERE clause or one of its AND-ed "
-                             "conditions, write it inside an EXISTS (SELECT 1 FROM ... WHERE ...) "
-                             "sub-select.")));
+                     errhint("This statement runs in DuckDB, and ColdFront cannot rewrite this "
+                             "comparison for it.")));
         if (rewrote)
         {
             jc->changed = true;

@@ -152,16 +152,16 @@ ERROR:  coldfront: @> on a jsonb value is not supported on a tiered or decoupled
 SELECT id FROM public.jdocs WHERE doc IN (SELECT doc FROM public.jdocs WHERE id <= 2
                                           UNION SELECT doc FROM public.jdocs WHERE id = 5);
 ERROR:  coldfront: this comparison of jsonb values is not supported on a tiered or decoupled view
-HINT:  When the comparison is the WHERE clause or one of its AND-ed conditions, write it inside an EXISTS (SELECT 1 FROM ... WHERE ...) sub-select.
+HINT:  This statement runs in DuckDB, and ColdFront cannot rewrite this comparison for it.
 SELECT id FROM public.jdocs WHERE doc IN (VALUES ('{"k": 2}'::jsonb));
 ERROR:  coldfront: this comparison of jsonb values is not supported on a tiered or decoupled view
-HINT:  When the comparison is the WHERE clause or one of its AND-ed conditions, write it inside an EXISTS (SELECT 1 FROM ... WHERE ...) sub-select.
+HINT:  This statement runs in DuckDB, and ColdFront cannot rewrite this comparison for it.
 SELECT id FROM public.jdocs WHERE (id, doc) IN (SELECT id, doc FROM public.jdocs);
 ERROR:  coldfront: this comparison of jsonb values is not supported on a tiered or decoupled view
-HINT:  When the comparison is the WHERE clause or one of its AND-ed conditions, write it inside an EXISTS (SELECT 1 FROM ... WHERE ...) sub-select.
+HINT:  This statement runs in DuckDB, and ColdFront cannot rewrite this comparison for it.
 SELECT id FROM public.jdocs WHERE doc @> ANY (SELECT doc FROM public.jdocs WHERE id = 1);
 ERROR:  coldfront: this comparison of jsonb values is not supported on a tiered or decoupled view
-HINT:  When the comparison is the WHERE clause or one of its AND-ed conditions, write it inside an EXISTS (SELECT 1 FROM ... WHERE ...) sub-select.
+HINT:  This statement runs in DuckDB, and ColdFront cannot rewrite this comparison for it.
 -- An IN list whose operand is volatile is refused too: comparing the operand
 -- with each element would evaluate it once per element.
 SELECT count(*) FROM public.jdocs WHERE CASE WHEN random() < 0.5 THEN '0'::jsonb ELSE '1'::jsonb END IN ('0'::jsonb, '1'::jsonb);
@@ -250,7 +250,7 @@ SELECT public.jdocs_same($q$SELECT id FROM %1$s WHERE doc IN (SELECT DISTINCT do
 -- One whose HAVING or ORDER BY also names the column is refused.
 SELECT id FROM public.jdocs WHERE doc IN (SELECT doc FROM public.jdocs GROUP BY doc HAVING doc ->> 't' = 'x');
 ERROR:  coldfront: this comparison of jsonb values is not supported on a tiered or decoupled view
-HINT:  When the comparison is the WHERE clause or one of its AND-ed conditions, write it inside an EXISTS (SELECT 1 FROM ... WHERE ...) sub-select.
+HINT:  This statement runs in DuckDB, and ColdFront cannot rewrite this comparison for it.
 -- A cursor's statement reads the view as a SELECT does.
 BEGIN;
 DECLARE c CURSOR FOR SELECT id, pg_typeof(id) AS t, doc = '{"t":"x","k":1}' AS eq FROM public.jdocs WHERE id <= 3 ORDER BY id;

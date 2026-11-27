@@ -182,11 +182,9 @@ The following rules apply to the other statements that compare `jsonb` values:
 - ColdFront refuses `IN (SELECT ...)` over a `UNION` or a `VALUES` list, one
   whose sub-select groups or de-duplicates the compared column and has a
   `HAVING` or an `ORDER BY`, and a row comparison such as
-  `(id, doc) IN (SELECT ...)`. When such a comparison is the `WHERE` clause or
-  one of its `AND`-ed conditions, write it inside an `EXISTS` sub-select.
-  ColdFront also refuses `= ANY` of a `jsonb[]` value, an `IN` list whose
-  operand is volatile, such as one that calls `random()`, and another `jsonb`
-  operator, such as `@>`, under `ANY` or `ALL`.
+  `(id, doc) IN (SELECT ...)`. ColdFront also refuses `= ANY` of a `jsonb[]`
+  value, an `IN` list whose operand is volatile, such as one that calls
+  `random()`, and another `jsonb` operator, such as `@>`, under `ANY` or `ALL`.
 
 ColdFront also rewrites the JSON operators that DuckDB lacks into DuckDB's JSON
 functions, which return PostgreSQL's answers. The rewrite covers:
