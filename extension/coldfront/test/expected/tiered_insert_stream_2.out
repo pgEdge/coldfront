@@ -398,9 +398,9 @@ EXPLAIN (COSTS OFF, VERBOSE)
                  ->  Subquery Scan on r
                        Output: r.coldfront_batch, r.*
                        ->  WindowAgg
-                             Output: (nextval('_cf_stream_id_seq'::regclass)), coldfront_source_1.ts, coldfront_source_1.status, (7), (NULL::jsonb), (NULL::bytea), (NULL::integer[]), ((row_number() OVER (?) - 1) / (current_setting('coldfront.cold_write_batch_size'::text))::integer)
+                             Output: (nextval('_cf_stream_id_seq'::regclass)), coldfront_source_1.ts, coldfront_source_1.status, (7), (NULL::text), (NULL::bytea), (NULL::integer[]), ((row_number() OVER (?) - 1) / (current_setting('coldfront.cold_write_batch_size'::text))::integer)
                              ->  CTE Scan on coldfront_source coldfront_source_1
-                                   Output: nextval('_cf_stream_id_seq'::regclass), coldfront_source_1.ts, coldfront_source_1.status, 7, NULL::jsonb, NULL::bytea, NULL::integer[]
+                                   Output: nextval('_cf_stream_id_seq'::regclass), coldfront_source_1.ts, coldfront_source_1.status, 7, NULL::text, NULL::bytea, NULL::integer[]
                                    Filter: (coldfront_source_1.ts < 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
    InitPlan 4
      ->  Aggregate
@@ -436,9 +436,9 @@ EXPLAIN (COSTS OFF, VERBOSE)
                  ->  Subquery Scan on r
                        Output: r.coldfront_batch, r.*
                        ->  WindowAgg
-                             Output: (nextval('_cf_stream_id_seq'::regclass)), coldfront_source_1.ts, coldfront_source_1.status, (7), (NULL::jsonb), (NULL::bytea), (NULL::integer[]), ((row_number() OVER (?) - 1) / (current_setting('coldfront.cold_write_batch_size'::text))::integer)
+                             Output: (nextval('_cf_stream_id_seq'::regclass)), coldfront_source_1.ts, coldfront_source_1.status, (7), (NULL::text), (NULL::bytea), (NULL::integer[]), ((row_number() OVER (?) - 1) / (current_setting('coldfront.cold_write_batch_size'::text))::integer)
                              ->  CTE Scan on coldfront_source coldfront_source_1
-                                   Output: nextval('_cf_stream_id_seq'::regclass), coldfront_source_1.ts, coldfront_source_1.status, 7, NULL::jsonb, NULL::bytea, NULL::integer[]
+                                   Output: nextval('_cf_stream_id_seq'::regclass), coldfront_source_1.ts, coldfront_source_1.status, 7, NULL::text, NULL::bytea, NULL::integer[]
                                    Filter: (coldfront_source_1.ts < 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
    InitPlan 4
      ->  Aggregate
@@ -475,9 +475,9 @@ EXPLAIN (COSTS OFF, VERBOSE)
                  ->  Subquery Scan on r
                        Output: r.coldfront_batch, r.*
                        ->  WindowAgg
-                             Output: (nextval('_cf_stream_id_seq'::regclass)), coldfront_source_1.ts, coldfront_source_1.status, (7), (NULL::jsonb), (NULL::bytea), (NULL::integer[]), ((row_number() OVER (?) - 1) / (current_setting('coldfront.cold_write_batch_size'::text))::integer)
+                             Output: (nextval('_cf_stream_id_seq'::regclass)), coldfront_source_1.ts, coldfront_source_1.status, (7), (NULL::text), (NULL::bytea), (NULL::integer[]), ((row_number() OVER (?) - 1) / (current_setting('coldfront.cold_write_batch_size'::text))::integer)
                              ->  CTE Scan on coldfront_source coldfront_source_1
-                                   Output: nextval('_cf_stream_id_seq'::regclass), coldfront_source_1.ts, coldfront_source_1.status, 7, NULL::jsonb, NULL::bytea, NULL::integer[]
+                                   Output: nextval('_cf_stream_id_seq'::regclass), coldfront_source_1.ts, coldfront_source_1.status, 7, NULL::text, NULL::bytea, NULL::integer[]
                                    Filter: (coldfront_source_1.ts < 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
    InitPlan 4
      ->  Aggregate
@@ -514,9 +514,9 @@ EXPLAIN (COSTS OFF, VERBOSE)
                  ->  Subquery Scan on r
                        Output: r.coldfront_batch, r.*
                        ->  WindowAgg
-                             Output: (nextval('_cf_stream_id_seq'::regclass)), coldfront_source_1.ts, coldfront_source_1.status, (7), (NULL::jsonb), (NULL::bytea), (NULL::integer[]), ((row_number() OVER (?) - 1) / (current_setting('coldfront.cold_write_batch_size'::text))::integer)
+                             Output: (nextval('_cf_stream_id_seq'::regclass)), coldfront_source_1.ts, coldfront_source_1.status, (7), (NULL::text), (NULL::bytea), (NULL::integer[]), ((row_number() OVER (?) - 1) / (current_setting('coldfront.cold_write_batch_size'::text))::integer)
                              ->  CTE Scan on coldfront_source coldfront_source_1
-                                   Output: nextval('_cf_stream_id_seq'::regclass), coldfront_source_1.ts, coldfront_source_1.status, 7, NULL::jsonb, NULL::bytea, NULL::integer[]
+                                   Output: nextval('_cf_stream_id_seq'::regclass), coldfront_source_1.ts, coldfront_source_1.status, 7, NULL::text, NULL::bytea, NULL::integer[]
                                    Filter: (coldfront_source_1.ts < 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
    InitPlan 4
      ->  Aggregate
@@ -553,9 +553,9 @@ EXPLAIN (COSTS OFF, VERBOSE)
                  ->  Subquery Scan on r
                        Output: r.coldfront_batch, r.*
                        ->  WindowAgg
-                             Output: (nextval('_cf_stream_id_seq'::regclass)), coldfront_source_1.ts, coldfront_source_1.status, (7), (NULL::jsonb), (NULL::bytea), (NULL::integer[]), ((row_number() OVER (?) - 1) / (current_setting('coldfront.cold_write_batch_size'::text))::integer)
+                             Output: (nextval('_cf_stream_id_seq'::regclass)), coldfront_source_1.ts, coldfront_source_1.status, (7), (NULL::text), (NULL::bytea), (NULL::integer[]), ((row_number() OVER (?) - 1) / (current_setting('coldfront.cold_write_batch_size'::text))::integer)
                              ->  CTE Scan on coldfront_source coldfront_source_1
-                                   Output: nextval('_cf_stream_id_seq'::regclass), coldfront_source_1.ts, coldfront_source_1.status, 7, NULL::jsonb, NULL::bytea, NULL::integer[]
+                                   Output: nextval('_cf_stream_id_seq'::regclass), coldfront_source_1.ts, coldfront_source_1.status, 7, NULL::text, NULL::bytea, NULL::integer[]
                                    Filter: (coldfront_source_1.ts < 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
    InitPlan 4
      ->  Aggregate
@@ -593,9 +593,9 @@ EXPLAIN (COSTS OFF, VERBOSE)
                  ->  Subquery Scan on r
                        Output: r.coldfront_batch, r.*
                        ->  WindowAgg
-                             Output: (nextval('_cf_stream_id_seq'::regclass)), coldfront_source_1.ts, coldfront_source_1.status, (7), (NULL::jsonb), (NULL::bytea), (NULL::integer[]), ((row_number() OVER (?) - 1) / (current_setting('coldfront.cold_write_batch_size'::text))::integer)
+                             Output: (nextval('_cf_stream_id_seq'::regclass)), coldfront_source_1.ts, coldfront_source_1.status, (7), (NULL::text), (NULL::bytea), (NULL::integer[]), ((row_number() OVER (?) - 1) / (current_setting('coldfront.cold_write_batch_size'::text))::integer)
                              ->  CTE Scan on coldfront_source coldfront_source_1
-                                   Output: nextval('_cf_stream_id_seq'::regclass), coldfront_source_1.ts, coldfront_source_1.status, 7, NULL::jsonb, NULL::bytea, NULL::integer[]
+                                   Output: nextval('_cf_stream_id_seq'::regclass), coldfront_source_1.ts, coldfront_source_1.status, 7, NULL::text, NULL::bytea, NULL::integer[]
                                    Filter: (coldfront_source_1.ts < 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
    InitPlan 4
      ->  Aggregate
@@ -639,9 +639,9 @@ EXPLAIN (COSTS OFF, VERBOSE)
                  ->  Subquery Scan on r
                        Output: r.coldfront_batch, r.*
                        ->  WindowAgg
-                             Output: (nextval('_cf_stream_id_seq'::regclass)), coldfront_source_1.ts, coldfront_source_1.status, (7), (NULL::jsonb), (NULL::bytea), (NULL::integer[]), ((row_number() OVER (?) - 1) / (current_setting('coldfront.cold_write_batch_size'::text))::integer)
+                             Output: (nextval('_cf_stream_id_seq'::regclass)), coldfront_source_1.ts, coldfront_source_1.status, (7), (NULL::text), (NULL::bytea), (NULL::integer[]), ((row_number() OVER (?) - 1) / (current_setting('coldfront.cold_write_batch_size'::text))::integer)
                              ->  CTE Scan on coldfront_source coldfront_source_1
-                                   Output: nextval('_cf_stream_id_seq'::regclass), coldfront_source_1.ts, coldfront_source_1.status, 7, NULL::jsonb, NULL::bytea, NULL::integer[]
+                                   Output: nextval('_cf_stream_id_seq'::regclass), coldfront_source_1.ts, coldfront_source_1.status, 7, NULL::text, NULL::bytea, NULL::integer[]
                                    Filter: (coldfront_source_1.ts < 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
    InitPlan 4
      ->  Aggregate
@@ -679,9 +679,9 @@ EXPLAIN (COSTS OFF, VERBOSE)
                  ->  Subquery Scan on r
                        Output: r.coldfront_batch, r.*
                        ->  WindowAgg
-                             Output: (nextval('_cf_stream_id_seq'::regclass)), coldfront_source_1.ts, coldfront_source_1.status, (7), (NULL::jsonb), (NULL::bytea), (NULL::integer[]), ((row_number() OVER (?) - 1) / (current_setting('coldfront.cold_write_batch_size'::text))::integer)
+                             Output: (nextval('_cf_stream_id_seq'::regclass)), coldfront_source_1.ts, coldfront_source_1.status, (7), (NULL::text), (NULL::bytea), (NULL::integer[]), ((row_number() OVER (?) - 1) / (current_setting('coldfront.cold_write_batch_size'::text))::integer)
                              ->  CTE Scan on coldfront_source coldfront_source_1
-                                   Output: nextval('_cf_stream_id_seq'::regclass), coldfront_source_1.ts, coldfront_source_1.status, 7, NULL::jsonb, NULL::bytea, NULL::integer[]
+                                   Output: nextval('_cf_stream_id_seq'::regclass), coldfront_source_1.ts, coldfront_source_1.status, 7, NULL::text, NULL::bytea, NULL::integer[]
                                    Filter: (coldfront_source_1.ts < 'Sun Mar 01 00:00:00 2026 UTC'::timestamp with time zone)
    InitPlan 4
      ->  Aggregate

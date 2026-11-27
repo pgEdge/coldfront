@@ -27,9 +27,9 @@ REGRESS     = load_order update_unregistered_view update_heap_table \
               schema_collision drop_iceberg_table \
               read_date_bin read_json_builders read_param_fold registry_snapshot \
               type_map hot_guard adopt_type_map adopt_read_only adopt_iceberg_table \
-              cold_write_json_agg duckdb_temp_dir \
+              cold_write_json_agg cold_write_jsonb_form duckdb_temp_dir \
               vector_centroids vector_type_map vector_cold_render array_cold_render vector_param_render vector_ops vector_probe vector_status vector_multicolumn \
-              duckdb_keyword_name partition_clause failed_txn_block tiered_insert_single_pass tiered_view_no_trigger copy_tiered_view param_in_subquery merge_on_view delete_without_where update_from_without_alias settings_registered ensure_replicated read_inner_product read_json_operators \
+              duckdb_keyword_name partition_clause failed_txn_block tiered_insert_single_pass tiered_view_no_trigger copy_tiered_view param_in_subquery merge_on_view delete_without_where update_from_without_alias settings_registered ensure_replicated read_inner_product read_json_operators read_jsonb_type \
               async_write_before_claim tiered_insert_stream cold_render_canonical tiered_insert_isolation clustered_append_generation \
               whitespace_in_value extract_field_quoting create_iceberg_namespace
 REGRESS_OPTS = --inputdir=test --outputdir=test

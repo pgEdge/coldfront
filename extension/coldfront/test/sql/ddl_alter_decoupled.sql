@@ -46,7 +46,7 @@ SELECT has_table_privilege('dk_reader', 'public.dk', 'SELECT') AS can_select,
        has_table_privilege('dk_reader', 'public.dk', 'INSERT') AS can_insert,
        pg_get_userbyid(relowner) AS owner
   FROM pg_class WHERE oid = 'public.dk'::regclass;
-SELECT iceberg_table, is_iceberg_only, is_writable, vec_columns
+SELECT iceberg_table, is_iceberg_only, is_writable, is_adopted, vec_columns
   FROM coldfront.tiered_views WHERE schema_name = 'public' AND relname = 'dk';
 
 -- What an Iceberg column cannot take is refused, as is a type with no mapping
@@ -103,15 +103,34 @@ SELECT coldfront._register_iceberg_view('public', 'dkr', '"ice"."default"."dkr"'
 ALTER TABLE public.dkr ADD COLUMN note text;
 ALTER TABLE public.dkr RENAME COLUMN id TO ident;
 
+-- An adopted table takes no jsonb column, added or retyped: another engine may
+-- write it, and ColdFront compares jsonb as the text PostgreSQL writes. No
+-- table takes a column retyped to jsonb, whose stored text is as written. Its
+-- other column changes go through and leave it adopted, and a table ColdFront
+-- created takes an added jsonb column.
+SELECT coldfront._register_iceberg_view('public', 'dka', '"ice"."default"."dka"',
+    '[{"name": "id", "cast": "bigint"}, {"name": "doc", "cast": "json"}]', '{}', true, true);
+ALTER TABLE public.dka ADD COLUMN meta jsonb;
+ALTER TABLE public.dka ALTER COLUMN doc TYPE jsonb;
+ALTER TABLE public.dk ALTER COLUMN doc TYPE jsonb;
+SET session_replication_role = replica;
+ALTER TABLE public.dka ADD COLUMN note text;
+ALTER TABLE public.dk ADD COLUMN meta jsonb;
+ALTER TABLE public.dk DROP COLUMN meta;
+SET session_replication_role = DEFAULT;
+SELECT relname, is_adopted FROM coldfront.tiered_views
+ WHERE schema_name = 'public' AND relname IN ('dk', 'dka') ORDER BY relname;
+
 -- Nothing refused changed a view.
 SELECT attrelid::regclass AS view, string_agg(attname, ', ' ORDER BY attnum) AS columns
-  FROM pg_attribute WHERE attrelid IN ('public.dk'::regclass, 'public.dkv'::regclass, 'public.dkr'::regclass)
+  FROM pg_attribute WHERE attrelid IN ('public.dk'::regclass, 'public.dkv'::regclass, 'public.dkr'::regclass,
+                     'public.dka'::regclass)
    AND attnum > 0
  GROUP BY attrelid ORDER BY 1;
 
 -- Cleanup. Unregister first: the DDL hook blocks DROP of a registered view.
-DELETE FROM coldfront.tiered_views WHERE schema_name = 'public' AND relname IN ('dk', 'dkv', 'dkr');
-DROP VIEW public.dk, public.dkv, public.dkr;
+DELETE FROM coldfront.tiered_views WHERE schema_name = 'public' AND relname IN ('dk', 'dkv', 'dkr', 'dka');
+DROP VIEW public.dk, public.dkv, public.dkr, public.dka;
 DROP ROLE dk_member;
 DROP ROLE dk_reader;
 DROP ROLE dk_owner;

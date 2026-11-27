@@ -100,20 +100,25 @@ SELECT d AS duckdb_type,
  ORDER BY ord;
 
 -- A p_types override wins only where it maps to the observed storage type, and
--- the view then casts to the override's surface: json for jsonb, real[] for a
+-- the view then casts to the override's surface: json for json, real[] for a
 -- pgvector type, the observed type where the override stores as it does
 -- already. An override for another column changes nothing here.
-SELECT coldfront._adopt_column_type('meta', 'VARCHAR', '{"meta":"jsonb"}'::jsonb)      AS jsonb_over_varchar,
+SELECT coldfront._adopt_column_type('meta', 'VARCHAR', '{"meta":"json"}'::jsonb)       AS json_over_varchar,
        coldfront._adopt_column_type('ts',   'TIMESTAMP WITH TIME ZONE',
                                     '{"ts":"timestamptz"}'::jsonb)                     AS tstz_spellings_agree,
        coldfront._adopt_column_type('amt',  'DECIMAL(12, 2)', '{"amt":"numeric(12,2)"}'::jsonb) AS decimal_whitespace,
        coldfront._adopt_column_type('emb',  'FLOAT[]', '{"emb":"vector(3)"}'::jsonb)    AS vector_over_float_list,
        coldfront._adopt_column_type('n',    'INTEGER', '{"n":"smallint"}'::jsonb)       AS smallint_over_integer,
-       coldfront._adopt_column_type('other','VARCHAR', '{"meta":"jsonb"}'::jsonb)       AS override_for_another_column;
+       coldfront._adopt_column_type('other','VARCHAR', '{"meta":"json"}'::jsonb)        AS override_for_another_column;
 
 -- An override that would reinterpret the stored bytes is refused, and the
 -- message names the column, the override, and both storage types.
 SELECT coldfront._adopt_column_type('amount', 'DECIMAL(12,2)', '{"amount":"bigint"}'::jsonb);
+
+-- jsonb is refused in any spelling: ColdFront compares jsonb as the text
+-- PostgreSQL renders it in, and another engine may have written the table.
+SELECT coldfront._adopt_column_type('meta', 'VARCHAR', '{"meta":"jsonb"}'::jsonb);
+SELECT coldfront._adopt_column_type('meta', 'VARCHAR', '{"meta":" JSONB "}'::jsonb);
 
 -- An unmappable column is refused by name whether or not p_types mentions it.
 SELECT coldfront._adopt_column_type('payload', 'STRUCT(x INTEGER)', NULL);

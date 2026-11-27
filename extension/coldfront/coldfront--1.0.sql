@@ -30,6 +30,10 @@ CREATE TABLE coldfront.tiered_views (
     -- existing catalog without p_writable, where reading someone else's lake
     -- must not become writing it by accident. Reads never consult it.
     is_writable     boolean NOT NULL DEFAULT true,
+    -- True for a table adopt_iceberg_table brought in from the catalog. Another
+    -- engine may write such a table, so it takes no jsonb column: ColdFront
+    -- compares jsonb values as the text PostgreSQL writes.
+    is_adopted      boolean NOT NULL DEFAULT false,
     -- The table's vector columns, in the order the Iceberg schema declares their
     -- cluster columns, or NULL when it has none. Recorded at registration because it
     -- cannot be derived afterwards in either mode: the view exposes real[] rather
@@ -318,6 +322,21 @@ BEGIN
 END;
 $$;
 
+-- A view casts a jsonb column to jsonb, and pg_duckdb (c04e6a2) hands that cast,
+-- and every jsonb constant, to DuckDB under the name jsonb, which DuckDB (v1.5.4)
+-- has no type for. The alias makes the name DuckDB's JSON type in this backend's
+-- DuckDB instance. TEMPORARY, because pg_duckdb refuses a transaction that
+-- changes a DuckDB catalog and writes a PostgreSQL table, and the statement that
+-- first needs the alias may write one; DuckDB's temporary catalog is exempt.
+-- raw_query reports its result as a NOTICE, which the function keeps from the
+-- client.
+CREATE FUNCTION coldfront._ensure_jsonb_alias() RETURNS void
+LANGUAGE plpgsql SET client_min_messages = warning AS $$
+BEGIN
+  PERFORM duckdb.raw_query('CREATE TEMPORARY TYPE IF NOT EXISTS jsonb AS JSON');
+END;
+$$;
+
 -- ensure_attached() issues ATTACH IF NOT EXISTS for the Lakekeeper catalog
 -- using the coldfront.warehouse and coldfront.lakekeeper_endpoint GUCs. Called
 -- lazily by the extension hook (coldfront.c) on the first query in a session
@@ -332,6 +351,9 @@ DECLARE
   ep   text := current_setting('coldfront.lakekeeper_endpoint', true);
   mode text := coldfront._attach_delegation_mode();
 BEGIN
+  -- Outside the warehouse check: a read needs the alias whether or not a catalog
+  -- is attached.
+  PERFORM coldfront._ensure_jsonb_alias();
   IF wh IS NOT NULL AND wh <> '' AND ep IS NOT NULL AND ep <> '' THEN
     -- iceberg (and avro transitively) are auto-installed/auto-loaded by
     -- pg_duckdb when this ATTACH (TYPE ICEBERG, ...) fires, gated by
@@ -964,7 +986,9 @@ CREATE TYPE coldfront._cold_sink_state AS (
 -- DuckDB positional VALUES tuple in attnum order. bytea is rebuilt with
 -- from_hex from its hex digits, a vector is cast to FLOAT[], an array becomes a
 -- DuckDB list of its elements' literals, a NULL is NULL, everything else is a
--- quoted literal DuckDB coerces to the storage type. Each vector's cluster column leads the tuple
+-- quoted literal DuckDB coerces to the storage type. A json or jsonb column is
+-- its text in the row (_canonical_jsonb), so a JSON null is the literal 'null'
+-- and only a NULL column is NULL. Each vector's cluster column leads the tuple
 -- (_vec_list_prefix), derived from that row's own vector literal.
 CREATE FUNCTION coldfront._cold_row_literal(
     p_payload jsonb, p_cols text[], p_types text[], p_schema text, p_view text
@@ -1019,7 +1043,7 @@ CREATE FUNCTION coldfront._cold_sink_sql(
 LANGUAGE sql IMMUTABLE AS $$
     SELECT format(
         'SELECT coldfront._cold_sink(%1$L, %2$L, b.tuples, b.n) AS n '
-        'FROM (SELECT string_agg(''('' || coldfront._cold_row_literal(coldfront._canonical_jsonb(r), %3$L::text[], %4$L::text[], %1$L, %2$L) || '')'', '', '') AS tuples, '
+        'FROM (SELECT string_agg(''('' || coldfront._cold_row_literal(coldfront._canonical_jsonb(r.*), %3$L::text[], %4$L::text[], %1$L, %2$L) || '')'', '', '') AS tuples, '
                      'count(*) AS n '
                 'FROM (SELECT r0.*, (row_number() OVER () - 1) / current_setting(''coldfront.cold_write_batch_size'')::int AS coldfront_batch '
                       'FROM (%5$s) AS r0) AS r '
@@ -1190,7 +1214,9 @@ $$;
 -- analyze hook detects the move (partition column in
 -- SET, cutoff present, coldfront.allow_mixed_writes on), deparses the user WHERE
 -- (p_where) and the new partition-column value e (p_newpc) over the VIEW's columns,
--- and installs `SELECT coldfront._cross_tier_move(schema, view, where, e)` as the
+-- and the WHERE again as a read DuckDB runs takes it (p_cold_where, the read
+-- rewrite's comparisons and refusals), and installs
+-- `SELECT coldfront._cross_tier_move(schema, view, where, e, cold_where)` as the
 -- statement — so this runs at top level, in the user's one transaction.
 --
 -- It is the mixed-tier-update shape (hot tier = plain PG, cold tier = one
@@ -1219,7 +1245,7 @@ $$;
 -- the OLD primary key; old/new keys differ (the partition column changed) so it
 -- never hits a just-inserted row.
 CREATE FUNCTION coldfront._cross_tier_move(
-    p_view_schema text, p_view_name text, p_where text, p_newpc text
+    p_view_schema text, p_view_name text, p_where text, p_newpc text, p_cold_where text
 ) RETURNS void
 LANGUAGE plpgsql AS $fn$
 DECLARE
@@ -1233,6 +1259,7 @@ DECLARE
     v_pc          text;          -- quoted partition column
     v_cols        text;          -- heap col list (all live cols), quoted
     v_cold_read   text;          -- cold read projection: r[col]::cast AS col
+    v_moved       text;          -- a captured row's columns, a json or jsonb one as its text
     v_has_ident   boolean;
     v_inner       text;          -- "SELECT v_cold_read FROM duckdb.query(...) AS t(r) WHERE r[pc] < cut"
     full_cols     text[];
@@ -1281,6 +1308,8 @@ BEGIN
     -- (the cold read projection r[col]::cast AS col) derive from the
     -- arrays, mirroring _rebuild_tiered_view's casts (one source of truth via
     -- _iceberg_view_cast_type / _iceberg_storage_type; view cast, else storage).
+    -- v_moved is the list a moved row is captured through: a json or jsonb
+    -- column as its text, which _canonical_jsonb then holds as one string.
     SELECT array_agg(a.attname ORDER BY a.attnum),
            array_agg(format_type(a.atttypid, a.atttypmod) ORDER BY a.attnum),
            bool_or(a.attidentity <> '')
@@ -1294,8 +1323,10 @@ BEGIN
            string_agg(format('r[%L]::%s AS %I', col,
                              COALESCE(NULLIF(coldfront._iceberg_view_cast_type(typ), ''),
                                       coldfront._iceberg_storage_type(typ)), col),
-                      ', ' ORDER BY ord)
-    INTO v_cols, v_cold_read
+                      ', ' ORDER BY ord),
+           string_agg(CASE WHEN typ IN ('json', 'jsonb') THEN format('%1$I::text AS %1$I', col)
+                           ELSE quote_ident(col) END, ', ' ORDER BY ord)
+    INTO v_cols, v_cold_read, v_moved
     FROM unnest(full_cols, full_types) WITH ORDINALITY AS u(col, typ, ord);
     SELECT array_agg(a.attname ORDER BY x.ord),
            array_agg(coldfront._iceberg_storage_type(format_type(a.atttypid, a.atttypmod)) ORDER BY x.ord)
@@ -1329,7 +1360,7 @@ BEGIN
     -- single-key FOR VALUES FROM ('lo') TO ('hi') rendering; no regex).
     EXECUTE format(
         'SELECT array_agg(DISTINCT (%2$s)::timestamptz) FROM ( %1$s ) s WHERE (%3$s) AND (%2$s) >= %4$s',
-        v_inner, p_newpc, p_where, v_cut_lit) INTO v_targets;
+        v_inner, p_newpc, p_cold_where, v_cut_lit) INTO v_targets;
     EXECUTE format(
         'SELECT array_agg(DISTINCT (%6$s)::timestamptz) FROM %1$I.%2$I WHERE (%5$s) AND %3$s >= %4$s AND (%6$s) >= %4$s',
         v_hot_schema, v_hot_relname, v_pc, v_cut_lit, p_where, p_newpc) INTO v_hot_targets;
@@ -1364,8 +1395,8 @@ BEGIN
     -- re-added to Iceberg with the new ts; rows crossing to hot are added to the
     -- heap. cf_new_ts is computed in the cursor so e is evaluated once per row.
     OPEN cur FOR EXECUTE format(
-        'SELECT s.*, (%2$s) AS cf_new_ts FROM ( %1$s ) s WHERE (%3$s)',
-        v_inner, p_newpc, p_where);
+        'SELECT %4$s, (%2$s) AS cf_new_ts FROM ( %1$s ) s WHERE (%3$s)',
+        v_inner, p_newpc, p_cold_where, v_moved);
     LOOP
         FETCH cur INTO rec;
         EXIT WHEN NOT FOUND;
@@ -1393,8 +1424,8 @@ BEGIN
     -- read-then-delete window for a concurrent heap writer to race. cf_new_ts is
     -- computed over the deleted row, exactly as the cold cursor above does.
     FOR rec IN EXECUTE format(
-        'DELETE FROM %1$I.%2$I h WHERE (%5$s) AND %3$s >= %4$s AND (%6$s) < %4$s RETURNING h.*, (%6$s) AS cf_new_ts',
-        v_hot_schema, v_hot_relname, v_pc, v_cut_lit, p_where, p_newpc)
+        'DELETE FROM %1$I.%2$I h WHERE (%5$s) AND %3$s >= %4$s AND (%6$s) < %4$s RETURNING %7$s, (%6$s) AS cf_new_ts',
+        v_hot_schema, v_hot_relname, v_pc, v_cut_lit, p_where, p_newpc, v_moved)
     LOOP
         payload := coldfront._canonical_jsonb(rec);
         ins_arr := ins_arr || ('(' || coldfront._move_row_literal(payload, full_cols, full_types, v_partcol,
@@ -1449,7 +1480,8 @@ $$;
 -- (quote_nullable) that PG coerces to the heap column type on INSERT (so bytea hex
 -- and jsonb text round-trip with no per-type handling), except an array, which
 -- the payload holds as a jsonb list and the heap takes as PostgreSQL array text.
--- p_types are the heap columns' types, so a jsonb column's own list stays jsonb.
+-- p_types are the heap columns' types. A json or jsonb column is its text in
+-- the payload, whatever the document holds.
 -- NULL stays NULL.
 CREATE FUNCTION coldfront._move_pg_row_literal(
     p_payload jsonb, p_cols text[], p_types text[], p_partcol text
@@ -2675,22 +2707,6 @@ BEGIN
 END;
 $$;
 
--- Stand-ins for the jsonb operators ?, ?|, ?& and @> on a read DuckDB runs when an
--- operand holds a bound parameter. The read rewrite turns each operator into
--- DuckDB's JSON functions and needs the operand's value to do so, which only the
--- planner has; until then the stand-in keeps the rewritten read valid for
--- PostgreSQL, which has these operators on jsonb alone where the read has json,
--- and the planner hook rewrites it once the value is bound. Each body gives the
--- operator's own answer.
-CREATE OR REPLACE FUNCTION coldfront._jsonb_exists(json, text)
-RETURNS boolean LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1::jsonb ? $2 $$;
-CREATE OR REPLACE FUNCTION coldfront._jsonb_exists_any(json, text[])
-RETURNS boolean LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1::jsonb ?| $2 $$;
-CREATE OR REPLACE FUNCTION coldfront._jsonb_exists_all(json, text[])
-RETURNS boolean LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1::jsonb ?& $2 $$;
-CREATE OR REPLACE FUNCTION coldfront._jsonb_contains(json, json)
-RETURNS boolean LANGUAGE sql IMMUTABLE STRICT AS $$ SELECT $1::jsonb @> $2::jsonb $$;
-
 -- ============================================================================
 -- Canonical text. A value that leaves the caller's session as text (a cold
 -- write's rendered parameter, a streamed row's text column, a cold VARCHAR
@@ -2720,7 +2736,10 @@ $$;
 
 -- A row for the cold sink: to_jsonb under fixed settings, the interval in ISO
 -- 8601, which _render_cold_value reads back in the caller's session and
--- renders in the shape above.
+-- renders in the shape above. Whoever builds the row casts a json or jsonb
+-- column to text first (cf_cold_cast in the C hook, _cross_tier_move): merged
+-- into the row's jsonb, a JSON null would read as a NULL column and ->> would
+-- take the quotes off a JSON string.
 CREATE FUNCTION coldfront._canonical_jsonb(p anyelement) RETURNS jsonb
 LANGUAGE sql STABLE STRICT
 SET DateStyle = 'ISO, YMD' SET IntervalStyle = iso_8601 SET extra_float_digits = 3 AS $$
@@ -2906,9 +2925,9 @@ $$;
 --
 -- Lossier than the forward map, because Iceberg records no PG type: several PG
 -- types share one storage type, and a column comes back as whichever one that
--- storage type reads as natively. A jsonb column created by coldfront adopts
--- as text; adopt_iceberg_table's p_types restores it, accepted only when the
--- override maps to the observed storage type.
+-- storage type reads as natively. A json or jsonb column created by coldfront
+-- adopts as text; adopt_iceberg_table's p_types reads it as json, accepted only
+-- when the override maps to the observed storage type.
 --
 -- Two spellings reach here for the same type. _iceberg_storage_type returns
 -- REAL and TIMESTAMPTZ and keeps the caller's DECIMAL whitespace, while DESCRIBE
@@ -2996,7 +3015,8 @@ LANGUAGE sql IMMUTABLE STRICT AS $$
                 THEN coldfront._iceberg_view_cast_type(left(t, -2)) || '[]'
             ELSE ''
         END
-        WHEN t IN ('jsonb', 'json') THEN 'json'  -- DuckDB has no jsonb, surface as json
+        -- DuckDB resolves jsonb through the alias _ensure_jsonb_alias creates.
+        WHEN t IN ('jsonb', 'json') THEN t
         WHEN t = 'interval'         THEN 'interval'
         -- PG has no bare "double" type, so the view's cold cast r['col']::DOUBLE
         -- (the Iceberg storage name) won't parse. Surface via "double precision".
@@ -3200,6 +3220,7 @@ $$;
 --              casts the column to, which is the type the column reads as.
 --   p_vec_cols the vector columns those cluster columns belong to, or '{}'.
 --   p_writable whether the hook rewrites DML on the view or refuses it.
+--   p_adopted  whether adopt_iceberg_table brought the table in from the catalog.
 --
 -- The view reads the table as duckdb.query('SELECT * FROM <ref>'): the catalog's
 -- table entry, whose scan includes the transaction's own pending data and
@@ -3212,7 +3233,8 @@ CREATE OR REPLACE FUNCTION coldfront._register_iceberg_view(
     p_ice_ref  text,
     p_columns  jsonb,
     p_vec_cols text[],
-    p_writable boolean
+    p_writable boolean,
+    p_adopted  boolean DEFAULT false
 ) RETURNS void
 LANGUAGE plpgsql AS $$
 DECLARE
@@ -3232,14 +3254,15 @@ BEGIN
     -- is_iceberg_only=true tells the C post_parse_analyze hook to short-circuit
     -- classify_tier to TIER_COLD for any INSERT/UPDATE/DELETE on this view, and
     -- is_writable decides whether it rewrites them at all.
-    INSERT INTO coldfront.tiered_views (schema_name, relname, hot_table, iceberg_table, partition_col, is_iceberg_only, is_writable, vec_columns)
-    VALUES (p_schema, p_relname, NULL, p_ice_ref, NULL, true, p_writable, NULLIF(p_vec_cols, '{}'))
+    INSERT INTO coldfront.tiered_views (schema_name, relname, hot_table, iceberg_table, partition_col, is_iceberg_only, is_writable, is_adopted, vec_columns)
+    VALUES (p_schema, p_relname, NULL, p_ice_ref, NULL, true, p_writable, p_adopted, NULLIF(p_vec_cols, '{}'))
     ON CONFLICT (schema_name, relname) DO UPDATE SET
         hot_table       = NULL,
         iceberg_table   = EXCLUDED.iceberg_table,
         partition_col   = NULL,
         is_iceberg_only = true,
         is_writable     = EXCLUDED.is_writable,
+        is_adopted      = EXCLUDED.is_adopted,
         vec_columns     = EXCLUDED.vec_columns;
 END;
 $$;
@@ -3309,10 +3332,14 @@ $$;
 -- An override is accepted only where it maps to the type the catalog already
 -- stores. Both sides of that comparison run through the reverse map, because the
 -- two spell some types differently, so this compares types rather than
--- spellings. The view then casts to the override's surface type (json for jsonb,
+-- spellings. The view then casts to the override's surface type (json for json,
 -- real[] for a pgvector type) or, where the override stores as the observed type
 -- does already, to the observed type: an override changes what a column reads
 -- as; it cannot reinterpret the stored bytes.
+--
+-- jsonb is refused. ColdFront compares jsonb values as the text PostgreSQL
+-- renders them in, which is what it writes, and an adopted table may hold text
+-- another engine wrote.
 CREATE OR REPLACE FUNCTION coldfront._adopt_column_type(
     p_column      text,
     p_duckdb_type text,
@@ -3325,6 +3352,10 @@ DECLARE
 BEGIN
     IF v_override IS NULL THEN
         RETURN v_observed;
+    END IF;
+    IF lower(trim(v_override)) = 'jsonb' THEN
+        RAISE EXCEPTION 'coldfront.adopt_iceberg_table: p_types gives column "%" the type jsonb, which an adopted column cannot have', p_column
+            USING HINT = 'Give it json. jsonb compares as the text PostgreSQL writes, and another engine may have written this table.';
     END IF;
     IF coldfront._pg_type_from_iceberg(coldfront._iceberg_storage_type(v_override))
        IS DISTINCT FROM v_observed THEN
@@ -3351,8 +3382,8 @@ $$;
 --
 -- The schema is read from the catalog rather than declared, which is what makes
 -- one call enough, and it is lossier than declaring it: Iceberg records no PG
--- type, so a jsonb column created by coldfront adopts as text and data->>'k'
--- stops working until p_types says otherwise.
+-- type, so a json or jsonb column created by coldfront adopts as text and
+-- data->>'k' stops working until p_types gives it json.
 --
 -- Adoption binds a name once. A second call under a registered name is refused
 -- whatever its arguments; to arm writes or change an override, release the table
@@ -3468,7 +3499,7 @@ BEGIN
     END IF;
 
     PERFORM coldfront._register_iceberg_view(p_schema, p_table, v_ice,
-                                             v_cols, v_vec_cols, p_writable);
+                                             v_cols, v_vec_cols, p_writable, true);
 
     RAISE NOTICE 'coldfront: adopted % as %.% (% columns, %)%',
         v_ice, p_schema, p_table, v_n,
@@ -5136,8 +5167,11 @@ $$;
 --
 -- p_hot_table NULL is a decoupled table, which PostgreSQL holds no columns of:
 -- each add and type action carries the declared type instead, and a table
--- adopted read-only and a vector column, whose cluster columns the view does not
--- show, are refused.
+-- adopted read-only, a vector column, whose cluster columns the view does not
+-- show, and a jsonb column on an adopted table are refused.
+-- On either kind of table a column changed to jsonb is refused: its cold rows
+-- keep the text they were written in, and a jsonb comparison reads the stored
+-- text as PostgreSQL's rendering.
 CREATE FUNCTION coldfront._mirror_iceberg_alter(
     p_iceberg_table text,
     p_hot_table     text,
@@ -5155,12 +5189,20 @@ DECLARE
     ddl           text := '';
 BEGIN
     IF p_hot_table IS NULL THEN
-        SELECT schema_name, relname, is_writable, coalesce(vec_columns, '{}') AS vec_columns
+        SELECT schema_name, relname, is_writable, is_adopted, coalesce(vec_columns, '{}') AS vec_columns
           INTO v_reg
           FROM coldfront.tiered_views WHERE iceberg_table = p_iceberg_table AND is_iceberg_only;
         IF NOT v_reg.is_writable THEN
             RAISE EXCEPTION 'coldfront: "%.%" is adopted read-only', v_reg.schema_name, v_reg.relname
                 USING HINT = 'Release it with coldfront.release_iceberg_table() and adopt again with p_writable => true to change its columns.';
+        END IF;
+        SELECT a.act->>'col' INTO col FROM jsonb_array_elements(p_actions) AS a(act)
+         WHERE v_reg.is_adopted AND a.act->>'type' = 'jsonb'
+         LIMIT 1;
+        IF FOUND THEN
+            RAISE EXCEPTION 'coldfront: column "%" of "%.%" cannot be jsonb, because the table is adopted',
+                col, v_reg.schema_name, v_reg.relname
+                USING HINT = 'Give it json. jsonb compares as the text PostgreSQL writes, and another engine may write this table.';
         END IF;
         SELECT a.act->>'col' INTO col FROM jsonb_array_elements(p_actions) AS a(act)
          WHERE a.act->>'col' = ANY (v_reg.vec_columns)
@@ -5170,6 +5212,16 @@ BEGIN
             RAISE EXCEPTION 'coldfront: column "%" of "%.%" is a vector column, which ALTER TABLE does not add or change on a decoupled table',
                 col, v_reg.schema_name, v_reg.relname;
         END IF;
+    END IF;
+    SELECT a.act->>'col' INTO col FROM jsonb_array_elements(p_actions) AS a(act)
+     WHERE a.act->>'op' = 'type'
+       AND coalesce(a.act->>'type',
+                    (SELECT format_type(t.atttypid, t.atttypmod) FROM pg_attribute t
+                      WHERE t.attrelid = p_hot_table::regclass AND t.attname = a.act->>'col')) = 'jsonb'
+     LIMIT 1;
+    IF FOUND THEN
+        RAISE EXCEPTION 'coldfront: column "%" of a tiered or decoupled table cannot change to jsonb', col
+            USING DETAIL = 'Its cold rows keep the text they were written in, and ColdFront compares jsonb as the text PostgreSQL renders.';
     END IF;
 
     -- Apply worker: the shared catalog was already evolved by the originator.
@@ -5281,7 +5333,8 @@ BEGIN
     DELETE FROM coldfront.tiered_views WHERE schema_name = p_schema AND relname = p_relname;
     EXECUTE format('DROP VIEW %I.%I', p_schema, p_relname);
     PERFORM coldfront._register_iceberg_view(p_schema, p_relname, v_reg.iceberg_table, v_cols,
-                                             coalesce(v_reg.vec_columns, '{}'), v_reg.is_writable);
+                                             coalesce(v_reg.vec_columns, '{}'), v_reg.is_writable,
+                                             v_reg.is_adopted);
     EXECUTE v_acl;
 END;
 $$;

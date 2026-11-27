@@ -50,12 +50,12 @@ A few supported types need a closer look:
   such as a decoupled `INSERT` or a cold `UPDATE`, because DuckDB's decimal has
   no `NaN`.
 - `char(N)` is stored and read as `varchar`. Values, comparisons, and
-  `length()` round-trip losslessly, but a cold read comes back unpadded
-  with `pg_typeof varchar`, because pg_duckdb has no fixed-length `char`
-  type. Use `text` or `varchar` if blank-padded display matters.
-- `json` and `jsonb` are stored as `varchar` in Iceberg (no native
-  primitive); reads come back as DuckDB's `json`, not the rich PG `jsonb`
-  type, because Iceberg-backed reads run entirely in DuckDB.
+  `length()` round-trip losslessly, but a cold read comes back unpadded as
+  `character varying`, because pg_duckdb has no fixed-length `char` type. Use
+  `text` or `varchar` if blank-padded display matters.
+- `json` and `jsonb` are stored as `varchar` in Iceberg, which has no JSON
+  primitive. A read returns a `jsonb` column as `jsonb` and a `json` column
+  as `json`.
 - `interval` is stored as `varchar` in Iceberg, as `<months> months <days>
   days <seconds> seconds`, the text PostgreSQL and DuckDB both read as the
   same value; it is view-cast back to the rich PG type on read.
@@ -100,14 +100,87 @@ List every `numeric` column, `numeric` array and array column of your source
 table the same way; a count of `0` means that the write stores those columns
 unchanged.
 
-Queries like `data->>'key'` and `data->'key'` work against `jsonb`, and
-ColdFront translates the `::jsonb` cast, `jsonb_array_length`,
-`jsonb_build_object` / `jsonb_agg` (and their `json_` twins, which DuckDB
-also lacks) and `date_bin` on read: the builders become the `concat` /
-`to_json` / `array_agg` form both engines evaluate identically (the result
-is JSON-equal to jsonb's rendering, in compact form and in argument order),
-and `date_bin` becomes DuckDB's `time_bucket`, which takes the same
-arguments and agrees on every fixed-width bucket.
+Queries like `data->>'key'` and `data->'key'` work against `jsonb`. In a read
+that DuckDB runs, a `jsonb` column, a `::jsonb` cast and the results of `->`,
+`#>`, `jsonb_build_object` and `jsonb_agg` are `jsonb`, as they are on a
+PostgreSQL table, and PostgreSQL receives each such value as `jsonb`.
+PostgreSQL receives an `array_agg` of such values as `jsonb[]`.
+ColdFront translates `jsonb_array_length`, `jsonb_build_object` / `jsonb_agg`
+(and their `json_` twins, which DuckDB also lacks) and `date_bin` on read: the
+builders become a `concat` / `to_json` / `array_agg` form both engines
+evaluate, and `date_bin` becomes DuckDB's `time_bucket`, which takes the same
+arguments and agrees on every fixed-width bucket. The `pg_typeof` function
+names the type PostgreSQL resolved for its argument, as `text`, so compare it
+with a string such as `'integer'` rather than a `regtype`. ColdFront refuses it
+over a set-returning expression, such as `pg_typeof(generate_series(1, 2))`.
+
+DuckDB holds a `jsonb` value as JSON text, and ColdFront stores each `jsonb`
+value as the text PostgreSQL renders it in. A stored document therefore
+compares with another stored document, a constant or a parameter as that text.
+A value that DuckDB computes, such as the result of `->`, `#>`,
+`jsonb_build_object` or a `::jsonb` cast of text, compares through DuckDB's
+`json()` function, which removes the white space between tokens. The `=` and
+`<>` operators, `IS DISTINCT FROM`, `NULLIF`, an `IN` list, `IN (SELECT ...)`
+and a simple `CASE` return PostgreSQL's answers, with three differences:
+
+- Two numbers that differ only in scale, such as `1` and `1.0`, compare as
+  unequal, as they fall in separate groups in `DISTINCT`, `GROUP BY` and
+  `UNION`.
+- The `json()` function reads a decimal as a double precision number, so
+  where one side is a value that DuckDB computes, two decimals that are equal
+  at double precision compare as equal.
+- An object that DuckDB builds keeps its keys in the order it was given them,
+  and keeps a repeated key, where `jsonb` sorts its keys and keeps the last of
+  a repeated one. Such an object comes from a `::jsonb` cast of text, or from
+  `jsonb_build_object` with a key that is not a constant, so it can compare as
+  unequal to a stored document with the same keys and values. A stored
+  document, a constant, and a `jsonb_build_object` whose keys are all
+  constants compare as PostgreSQL compares them.
+
+A cold write stores only the text PostgreSQL renders. The value that a cold
+`INSERT`, `UPDATE` or `MERGE` assigns to a `jsonb` column must therefore be a
+constant, a `jsonb` parameter, a `jsonb` column of a table or of a tiered or
+decoupled view, or a `CASE` or `COALESCE` that picks one of those. ColdFront
+refuses any other value with an error that names the column, because DuckDB
+would compute the value and store DuckDB's text. The refused values include
+`jsonb_build_object('a', 1)`, `data || '{"seen": true}'` and a `::jsonb` cast
+of text. An `UPDATE` of the hot tier and a tiered `INSERT` accept any value,
+because PostgreSQL computes the value there.
+
+DuckDB also evaluates the condition of a cold `UPDATE`, `DELETE` or `MERGE`
+and the source of a decoupled `INSERT`. These compare `jsonb` values as a read
+that DuckDB runs does, and ColdFront refuses in them what it refuses in such a
+read, as the following rules describe. A cold write therefore changes the rows
+that a read with the same condition returns. ColdFront also refuses an
+`ALTER TABLE` that changes a column of a tiered or decoupled table to `jsonb`,
+because the cold rows keep the text they were written in.
+
+An adopted JSON column reads as `json`, and ColdFront refuses `jsonb` for an
+adopted table. For the reason, see
+[Adopting a Table That Already Exists in the Catalog](usage_decoupled.md#adopting-a-table-that-already-exists-in-the-catalog).
+
+The following rules apply to the other statements that compare `jsonb` values:
+
+- `DISTINCT`, `GROUP BY` and `UNION` group values by their text, so two
+  stored documents fall in one group when PostgreSQL renders them identically.
+  A value that DuckDB computes falls in another group than an equal stored
+  document or constant.
+- ColdFront refuses every ordering of a value that holds `jsonb`, because
+  DuckDB orders such values by their text: an `ORDER BY` at any level, in a
+  window or in an aggregate, the `<`, `<=`, `>` and `>=` operators, `GREATEST`
+  and `LEAST`, `min` and `max`, and a row comparison. A value holds `jsonb`
+  when it is a `jsonb` value, or an array, a row or a domain over one.
+- ColdFront refuses `=`, `<>` and `IS DISTINCT FROM` on an array or a row that
+  holds `jsonb`, because DuckDB compares its `jsonb` parts by their text;
+  compare the `jsonb` values one by one.
+- ColdFront refuses a join that names a `jsonb` column in `USING`, and a
+  `NATURAL` join over one; write the join condition with `ON`.
+- ColdFront refuses `IN (SELECT ...)` over a `UNION` or a `VALUES` list, one
+  whose sub-select groups or de-duplicates the compared column and has a
+  `HAVING` or an `ORDER BY`, and a row comparison such as
+  `(id, doc) IN (SELECT ...)`; write such a comparison with `EXISTS`.
+  ColdFront also refuses `= ANY` of a `jsonb[]` value, and another `jsonb`
+  operator, such as `@>`, under `ANY` or `ALL`.
 
 ColdFront also rewrites the JSON operators that DuckDB lacks into DuckDB's JSON
 functions, which return PostgreSQL's answers. The rewrite covers:
@@ -119,24 +192,35 @@ functions, which return PostgreSQL's answers. The rewrite covers:
 - the `jsonb_contains` and `jsonb_contained` functions.
 
 A path or key for these operators and functions must be a constant or a bound
-parameter, not a column. A path can hold at most eight negative, signed or
-zero-padded index elements, such as `-1`, `+1` or `01`. PostgreSQL has no
-`json` form of `?`, `?|`, `?&`, `@>` and `<@`, only a `jsonb` one. Cast the
-view's `json` column to `jsonb` first, as in `data::jsonb ? 'k'`. Two kinds of
-result differ from PostgreSQL's. DuckDB writes a returned container or number
-in its own form, such as `{"b":"c"}`, or `1.5` for `1.50`. The `->>` operator
-returns values in the same form. The `@>` and `<@` operators never match an
-integer against the same value written as a decimal. For example, a stored
-`{"p": 10.0}` does not contain `{"p": 10}`, because DuckDB compares JSON
-numbers by kind. ColdFront does not support most other jsonb functions on
-tiered or decoupled data, such as `jsonb_typeof`, `jsonb_set`, `jsonb_path_*`,
-`jsonb_each` and `jsonb_object_keys`. DuckDB either lacks these functions, or
-its function of the same name differs in signature or result.
+parameter, not a column, and in a cold write it must be a constant. A path can
+hold at most eight negative, signed or zero-padded index elements, such as
+`-1`, `+1` or `01`. Two kinds of result differ from PostgreSQL's. The `->>` and
+`#>>` operators return a container as DuckDB writes it, such as `{"b":"c"}`,
+and DuckDB writes an extracted number in its own form, such as `1.5` for
+`1.50`. The `@>` and `<@` operators never match an integer against the same
+value written as a decimal. For example, a stored `{"p": 10.0}` does not
+contain `{"p": 10}`, because DuckDB compares JSON numbers by kind. Inside the
+query, `::text` of an extracted or built value returns DuckDB's compact text,
+such as `{"b":1}`; the value PostgreSQL receives is `jsonb` and renders as
+PostgreSQL renders it.
 
-These limits apply only to reads that go through a tiered or iceberg-only view,
-which pg_duckdb plans entirely in DuckDB. Ordinary (non-tiered) PostgreSQL
-tables are untouched by ColdFront and keep full jsonb support, as does the hot
-partition table itself.
+ColdFront refuses any other `jsonb` operator or function in a read of tiered
+or decoupled data, such as `||`, `-`, `#-`, `jsonb_typeof`, `jsonb_set`,
+`jsonb_path_*`, `jsonb_each`, `jsonb_object_keys` and a cast of `jsonb` to a
+number or `boolean`, with an error that names the operator or function.
+DuckDB either lacks these, or answers differently: its `||` concatenates the
+text of the two documents.
+
+These limits apply only to statements that DuckDB runs: the reads of a tiered
+or iceberg-only view that reach the cold tier, and the part of a cold write
+that DuckDB evaluates. In a read that PostgreSQL runs itself, such as a read
+rerouted to the hot partitions or a read of a tiered view before its first
+archive, PostgreSQL compares and orders `jsonb` values itself. ColdFront
+refuses no ordering in such a read, and none of the operators and functions
+in the paragraph above. A read that uses an operator or function the rewrite
+turns into DuckDB's, such as `?` or `date_bin`, runs in DuckDB. Ordinary
+(non-tiered) PostgreSQL tables are untouched by ColdFront and keep full jsonb
+support, as does the hot partition table itself.
 
 Bound parameters (`$1` from a prepared statement, a driver's extended protocol,
 or a plpgsql variable) work in such reads. DuckDB types most placeholders from
@@ -145,8 +229,9 @@ with several overloads (`time_bucket`'s origin, so `date_bin`'s) or any
 argument of a table function (`generate_series`) it cannot, so ColdFront plans
 such a read from the bound values on every execution instead of caching a
 generic plan. The rewrite of `#>`, `#>>`, `?`, `?|`, `?&`, `@>` and `<@` also
-needs the value of any parameter in an operand. ColdFront plans such a read
-from the bound values on every execution as well. Under
+needs the value of any parameter in an operand, and pg_duckdb cannot hand a
+`jsonb` parameter to DuckDB. ColdFront plans such reads from the bound values
+on every execution as well. Under
 `plan_cache_mode = force_generic_plan` those reads cannot run: the forced
 generic plan has no values and fails with `only works with DuckDB execution`.
 
@@ -154,9 +239,8 @@ A hot-only read is the exception. When a `SELECT` reads a tiered view directly
 (no join, CTE, or sub-query) and its `WHERE` provably restricts to the hot
 tier, ColdFront rewrites it to read the hot partition table in plain
 PostgreSQL: the full jsonb operator and function set works, and the query skips
-DuckDB entirely. Such a read returns `data` as native `jsonb` rather than the
-view's `json`. Reads that span tiers, are cold-only, or reach the view through
-a join or sub-query stay in DuckDB, where the limits above apply.
+DuckDB entirely. Reads that span tiers, are cold-only, or reach the view
+through a join or sub-query stay in DuckDB, where the limits above apply.
 
 ## Supported Array Types
 

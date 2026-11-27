@@ -39,6 +39,13 @@ SELECT attname FROM pg_attribute
  WHERE attrelid = 'public._events'::regclass AND attnum > 0 AND NOT attisdropped
  ORDER BY attnum;
 
+-- A column cannot become jsonb: its cold rows keep their text as written, and
+-- ColdFront compares jsonb as the text PostgreSQL renders. The hot ALTER rolls
+-- back with the refusal, so status stays text.
+ALTER TABLE public._events ALTER COLUMN status TYPE jsonb USING to_jsonb(status);
+SELECT format_type(atttypid, atttypmod) AS status_type FROM pg_attribute
+ WHERE attrelid = 'public._events'::regclass AND attname = 'status';
+
 -- 2. Apply-worker path: the mirror is a no-op (the shared catalog was already
 --    evolved by the originator), but the per-node view is rebuilt to follow every
 --    column change. No live Iceberg needed.

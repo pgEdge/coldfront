@@ -8,16 +8,19 @@ that differ from native PostgreSQL, and a few naming and infrastructure
 requirements. Keep the following in mind when running tiered or decoupled
 tables:
 
-- `jsonb` reads come back as `json`. The `->`/`->>` operators work, and
-  ColdFront translates the `::jsonb` cast, `jsonb_array_length`,
+- A `jsonb` column reads as `jsonb`, and DuckDB runs the read. The `->`/`->>`
+  operators work, and ColdFront translates `jsonb_array_length`,
   `jsonb_build_object` / `jsonb_agg` and `date_bin`. ColdFront also rewrites
   the `#>`, `#>>`, `?`, `?|`, `?&`, `@>` and `<@` operators and the functions
   behind them. A path or key for these operators must be a constant or a bound
   parameter. The `@>` and `<@` operators never match an integer against the
-  same value written as a decimal. Other jsonb operators and functions are
-  unsupported on cold or cross-tier reads. A hot-only read of the view runs in
-  PostgreSQL with full jsonb (see
-  [Supported Column Types](supported_types.md)).
+  same value written as a decimal. A comparison of two `jsonb` values differs
+  from PostgreSQL's in three cases. A join `USING` a `jsonb` column is
+  refused; write the condition with `ON`. ColdFront refuses every ordering of
+  `jsonb` values, `=` on an array that holds `jsonb`, and every other jsonb
+  operator and function on cold or cross-tier reads and in the condition of a
+  cold write, such as `||`. A hot-only read of the view runs in PostgreSQL
+  with full jsonb (see [Supported Column Types](supported_types.md)).
 - A read through a view, and a cross-tier move of the partition column, run
   their statement through pg_duckdb, which renders an interval literal in the
   session's `IntervalStyle`. DuckDB reads the `postgres_verbose` style whatever
@@ -158,6 +161,11 @@ tables:
   warehouse creation otherwise fails with HTTP 409 ("This endpoint does not
   support BlobStorageEvents or SoftDelete"). Disable those features on the
   storage account before using it as a cold tier.
+- A cold write refuses a `jsonb` value that PostgreSQL did not render, such as
+  one built with `jsonb_build_object` or computed from the row, and an
+  `ALTER TABLE` refuses to change a column to `jsonb`, because ColdFront
+  stores `jsonb` as the text PostgreSQL renders. For the rules, see
+  [Supported Column Types](supported_types.md).
 - A cold-tier write that reads an ordinary PostgreSQL table, such as an
   `UPDATE ... FROM` or a `MERGE` from one, stores a `numeric` `NaN` from that
   table as `NULL` and stores an array renumbered to start at 1, with no error.

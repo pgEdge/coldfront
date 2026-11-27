@@ -111,6 +111,10 @@ notes:
 | ALTER TABLE | `ALTER TABLE <view> ADD COLUMN <col> <type>`, `DROP COLUMN <col>`, `ALTER COLUMN <col> TYPE <type>` or `RENAME COLUMN <col> TO <new>` | The hook applies the change to the Iceberg table through the bakery and rebuilds the view from its own columns plus the change, keeping its owner and table-level grants; only the owner, or a role holding its privileges, can make the change, and the hook rebuilds the view as the extension's owner. A type change is limited to the widening duckdb-iceberg accepts, and an array column cannot be added. A vector column, a table adopted read-only, a default, constraint, collation, storage or compression option on an added column, a `USING` or `COLLATE` clause on a type change, and a subcommand other than a column change in the same statement are refused, and an object built on the view makes the change fail. |
 | DROP TABLE | `SELECT coldfront.drop_iceberg_table('<schema>', '<name>', <purge>)` | The function removes the wrapper view and every registration row, vector configuration included. A raw `DROP TABLE` through `duckdb.raw_query` drops only the catalog table and leaves those rows behind. |
 
+The value that an `INSERT`, `UPDATE` or `MERGE` assigns to a `jsonb` column
+follows one more rule, which keeps the stored text the one PostgreSQL renders.
+For the rule, see [Supported Column Types](supported_types.md).
+
 ### What Does Not Work
 
 The following table shows attempts that fail and the reason for each:
@@ -148,9 +152,9 @@ and how each reads back:
 | `date` / `time without time zone` | `DATE` / `TIME` | Identical |
 | `uuid` | `UUID` | Identical |
 | `bytea` | `BLOB` | Identical |
-| `text` / `varchar(N)` / `char(N)` | `VARCHAR` | The value is unbounded, the declared length is not enforced, and `char(N)` returns unpadded (`pg_typeof varchar`). |
+| `text` / `varchar(N)` / `char(N)` | `VARCHAR` | The value is unbounded, the declared length is not enforced, and `char(N)` returns unpadded as `character varying`. |
 | `numeric(P,S)` (P ≤ 38) | `DECIMAL(P,S)` | Identical |
-| `jsonb` / `json` | `VARCHAR` | The view casts the value back to `json` (not `jsonb`, because Iceberg has no JSON primitive). |
+| `jsonb` / `json` | `VARCHAR` | The view casts the value back to the type the column declares. |
 | `interval` | `VARCHAR` | The view casts the value back to `interval`. |
 | `vector(N)` / `halfvec(N)` | `FLOAT[]` (list of float) | The column reads back as `real[]`. |
 | A one-dimensional array of a type above, except `timestamptz`, `jsonb`, `json`, `interval` and the vector types | A list of the element's storage type | The column reads back as an array of the element's type; `smallint[]` reads as `integer[]`, and `varchar(N)[]` and `char(N)[]` read as `character varying[]`. |
@@ -254,7 +258,7 @@ The helper performs the following steps:
     ```
 
     The projection wraps the struct accessor so applications see flat columns.
-    Each column is cast to its view type where one exists (`json` for `jsonb`,
+    Each column is cast to its view type where one exists (`jsonb`, `json`,
     `interval`, `double precision`, `bytea`, `real[]` for vectors, and
     `text[]`, `double precision[]` and `bytea[]` for those arrays), and to its
     storage type otherwise, so a `text` column reads as `character varying`.
@@ -285,8 +289,8 @@ Writes through the wrapper view behave as follows:
 - A `DELETE` removes the row from Iceberg.
 - A `ROLLBACK` of an `INSERT`/`UPDATE` inside `BEGIN` undoes the Iceberg
   snapshot, so the row count after the transaction matches the count before it.
-- A jsonb column round-trips through Parquet `VARCHAR` storage and reads as PG
-  `json` via the wrapper view's cast (`data->>'k'` works).
+- A jsonb column round-trips through Parquet `VARCHAR` storage and reads as
+  `jsonb` through the wrapper view's cast (`data->>'k'` works).
 
 The helper inherits the following limit from the platform:
 
@@ -364,14 +368,15 @@ column and the Iceberg type, or for a list of a type with no mapping, that
 element type, except for `timestamptz_ns` and `geography`, which duckdb-iceberg
 refuses itself, with its own error, when the table loads.
 
-`p_types` sets the type a column reads as, so a `jsonb` column that ColdFront
-created adopts as `jsonb` rather than `text`:
+`p_types` sets the type a column reads as, so a JSON column adopts as `json`
+rather than `text`. ColdFront refuses a `jsonb` override, for the reason in
+[Adopting a Table That Already Exists in the Catalog](usage_decoupled.md#adopting-a-table-that-already-exists-in-the-catalog):
 
 ```sql
 SELECT coldfront.adopt_iceberg_table(
     'public', 'orders', 'lake',
     p_writable => true,
-    p_types    => '{"meta":"jsonb"}'::jsonb);
+    p_types    => '{"meta":"json"}'::jsonb);
 ```
 
 An override is accepted only where it maps to the storage type the catalog
@@ -398,6 +403,9 @@ Reads never consult the flag. `vector_train()` and `drop_iceberg_table()`
 refuse a read-only relation too, since each rewrites or destroys the Iceberg
 table. The archiver and `create_iceberg_table()` set the flag; adoption
 defaults it to false.
+
+Adoption also sets the row's `is_adopted` flag, and ColdFront refuses an
+`ALTER TABLE` that gives a marked table a `jsonb` column.
 
 ### One Relation per Iceberg Table
 

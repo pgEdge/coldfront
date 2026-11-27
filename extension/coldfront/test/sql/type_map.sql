@@ -35,8 +35,8 @@ CREATE TABLE type_map_probe (
 
 -- The storage type, and the cast the view applies where the storage type is not
 -- the type the column reads as: smallint widens to INTEGER, which is its own
--- surface; DOUBLE and BLOB are not PostgreSQL spellings; json and interval are
--- stored as text and cast back.
+-- surface; DOUBLE and BLOB are not PostgreSQL spellings; json, jsonb and interval
+-- are stored as text and cast back.
 SELECT a.attname,
        format_type(a.atttypid, a.atttypmod)                                    AS format_type,
        coldfront._iceberg_storage_type(format_type(a.atttypid, a.atttypmod))   AS storage,

@@ -217,12 +217,12 @@ VALUES ('public', 'kw_events', 'public._kw_events', 'ice.default.kw_events', 'ts
 ALTER TABLE public._kw_events ADD COLUMN by int;
 ERROR:  coldfront: column "by": DuckDB cannot parse this name, which pg_duckdb passes to it unquoted (https://github.com/duckdb/pg_duckdb/issues/1019); rename the column
 CONTEXT:  PL/pgSQL function _require_duckdb_name(text,text) line 6 at RAISE
-PL/pgSQL function _mirror_iceberg_alter(text,text,jsonb) line 60 at assignment
+PL/pgSQL function _mirror_iceberg_alter(text,text,jsonb) line 78 at assignment
 SQL statement "SELECT coldfront._mirror_iceberg_alter('ice.default.kw_events', 'public._kw_events', jsonb_build_array(jsonb_build_object('op', 'add', 'col', 'by')))"
 ALTER TABLE public._kw_events RENAME COLUMN id TO at;
 ERROR:  coldfront: column "at": DuckDB cannot parse this name, which pg_duckdb passes to it unquoted (https://github.com/duckdb/pg_duckdb/issues/1019); rename the column
 CONTEXT:  PL/pgSQL function _require_duckdb_name(text,text) line 6 at RAISE
-PL/pgSQL function _mirror_iceberg_alter(text,text,jsonb) line 70 at assignment
+PL/pgSQL function _mirror_iceberg_alter(text,text,jsonb) line 88 at assignment
 SQL statement "SELECT coldfront._mirror_iceberg_alter('ice.default.kw_events', 'public._kw_events', jsonb_build_array(jsonb_build_object('op', 'rename', 'col', 'id', 'newcol', 'at')))"
 ALTER VIEW public.kw_events RENAME TO qualify;
 ERROR:  coldfront: table "qualify": DuckDB cannot parse this name, which pg_duckdb passes to it unquoted (https://github.com/duckdb/pg_duckdb/issues/1019); rename the table

@@ -25,20 +25,20 @@ SET coldfront.allow_mixed_writes = on;
 -- _cross_tier_move call carrying the deparsed WHERE and new-ts expression.
 EXPLAIN (COSTS OFF, VERBOSE)
   UPDATE public.events SET ts = '2026-06-18 10:00:00+00' WHERE status = 'x';
-                                                                           QUERY PLAN                                                                           
-----------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                           QUERY PLAN                                                                                           
+------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
-   Output: _cross_tier_move('public'::text, 'events'::text, '(status = ''x''::text)'::text, '''Thu Jun 18 10:00:00 2026 UTC''::timestamp with time zone'::text)
+   Output: _cross_tier_move('public'::text, 'events'::text, '(status = ''x''::text)'::text, '''Thu Jun 18 10:00:00 2026 UTC''::timestamp with time zone'::text, '(status = ''x''::text)'::text)
 (2 rows)
 
 -- (2) Row-dependent new ts (ts + interval), tier-deterministic WHERE: same shape;
 -- the new-ts expression is the interval arithmetic over the partition column.
 EXPLAIN (COSTS OFF, VERBOSE)
   UPDATE public.events SET ts = ts + interval '6 months' WHERE ts < '2026-02-01+00';
-                                                                                  QUERY PLAN                                                                                  
-------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                                                                       QUERY PLAN                                                                                                                        
+---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
  Result
-   Output: _cross_tier_move('public'::text, 'events'::text, '(ts < ''Sun Feb 01 00:00:00 2026 UTC''::timestamp with time zone)'::text, '(ts + ''@ 6 mons''::interval)'::text)
+   Output: _cross_tier_move('public'::text, 'events'::text, '(ts < ''Sun Feb 01 00:00:00 2026 UTC''::timestamp with time zone)'::text, '(ts + ''@ 6 mons''::interval)'::text, '(ts < ''Sun Feb 01 00:00:00 2026 UTC''::timestamp with time zone)'::text)
 (2 rows)
 
 -- (3) Rejections at parse-analyze (no tier write):

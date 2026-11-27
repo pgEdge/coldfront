@@ -1,9 +1,10 @@
 -- A JSON aggregate on the cold write path. DuckDB has neither jsonb_agg nor
 -- json_agg, and its json_group_array is a macro that refuses the ORDER BY an
 -- aggregate carries, so the rewrite target is to_json(array_agg(...)): both
--- engines have those, and array_agg keeps the ORDER BY. The substitution adds a
--- closing paren at the aggregate's own, which is what the map's `wrap` flag
--- does. Two halves:
+-- engines have those, and array_agg keeps the ORDER BY. The cold half of the
+-- write gets the read rewrite, which builds that form. The values here go to a
+-- json column, which takes the text DuckDB computes; a cold write refuses such a
+-- value for a jsonb column (cold_write_jsonb_form). Two halves:
 --   (A) white-box: the deparsed cold SQL carries to_json(array_agg(...)) for an
 --       UPDATE (with and without ORDER BY) and for an INSERT ... SELECT.
 --   (B) parity: DuckDB accepts the target and rejects what it replaces.
@@ -17,7 +18,7 @@ SET TIME ZONE 'UTC';
 SET coldfront.warehouse = '';
 SET coldfront.lakekeeper_endpoint = '';
 
-CREATE TABLE public._events (id int, ts timestamptz, data jsonb);
+CREATE TABLE public._events (id int, ts timestamptz, data jsonb, j json);
 CREATE VIEW public.events AS SELECT * FROM public._events;
 CREATE TABLE public.src (k text);
 INSERT INTO public.src VALUES ('b'), ('a');
@@ -29,31 +30,29 @@ VALUES ('public', 'events', '2026-03-01'::timestamptz);
 -- (A1) Cold UPDATE, aggregate carrying ORDER BY: the ORDER BY rides along inside
 -- array_agg, which is an aggregate in DuckDB (json_group_array is not).
 EXPLAIN (COSTS OFF, VERBOSE)
-UPDATE public.events SET data = (SELECT jsonb_agg(k ORDER BY k) FROM public.src)
+UPDATE public.events SET j = (SELECT jsonb_agg(k ORDER BY k)::json FROM public.src)
 WHERE ts < '2019-01-01'::timestamptz;
 
 -- (A2) Cold UPDATE, no ORDER BY.
 EXPLAIN (COSTS OFF, VERBOSE)
-UPDATE public.events SET data = (SELECT jsonb_agg(k) FROM public.src)
+UPDATE public.events SET j = (SELECT jsonb_agg(k)::json FROM public.src)
 WHERE ts < '2019-01-01'::timestamptz;
 
--- (A3) The json_ spelling reaches DuckDB the same way: the catch-all leaves it
--- alone (no jsonb token), so it needs its own entry.
+-- (A3) The json_ spelling takes the same rewrite.
 EXPLAIN (COSTS OFF, VERBOSE)
-UPDATE public.events SET data = (SELECT json_agg(k)::jsonb FROM public.src)
+UPDATE public.events SET j = (SELECT json_agg(k) FROM public.src)
 WHERE ts < '2019-01-01'::timestamptz;
 
 -- (A4) INSERT ... SELECT: the source runs in PostgreSQL, once, so the aggregate
 -- stays jsonb_agg and both halves read its result.
 EXPLAIN (COSTS OFF, VERBOSE)
 INSERT INTO public.events
-SELECT 9, '2019-01-01'::timestamptz, jsonb_agg(k ORDER BY k) FROM public.src;
+SELECT 9, '2019-01-01'::timestamptz, jsonb_agg(k ORDER BY k), NULL FROM public.src;
 
--- (A5) An aggregate nested inside an object builder: the added paren must land
--- at the aggregate's own close, leaving the builder's intact.
+-- (A5) An aggregate nested inside an object builder: each is rewritten in place.
 EXPLAIN (COSTS OFF, VERBOSE)
 UPDATE public.events
-SET data = (SELECT jsonb_build_object('all', jsonb_agg(k ORDER BY k)) FROM public.src)
+SET j = (SELECT jsonb_build_object('all', jsonb_agg(k ORDER BY k))::json FROM public.src)
 WHERE ts < '2019-01-01'::timestamptz;
 
 -- (A6) A hot-tier UPDATE is plain PostgreSQL DML: jsonb_agg stays, and the
@@ -64,23 +63,21 @@ WHERE ts >= '2026-06-01'::timestamptz;
 
 -- (A7) The aggregate's name inside a string literal is not a call: left intact.
 EXPLAIN (COSTS OFF, VERBOSE)
-UPDATE public.events SET data = to_jsonb('jsonb_agg(x)'::text)
+UPDATE public.events SET j = to_jsonb('jsonb_agg(x) ' || id)::json
 WHERE ts < '2019-01-01'::timestamptz;
 
 -- (A8) The reverse nesting of (A5): a builder inside the aggregate, with an
--- operator applied to the builder's result. The builder's own paren also counts
--- toward the depth, so the added paren still lands at the aggregate's close,
--- keeping the operator and the ORDER BY inside array_agg.
+-- operator applied to the builder's result, which stays inside array_agg with
+-- the ORDER BY.
 EXPLAIN (COSTS OFF, VERBOSE)
 UPDATE public.events
-SET data = (SELECT jsonb_agg(jsonb_build_object('k', k) ->> 'k' ORDER BY k) FROM public.src)
+SET j = (SELECT jsonb_agg(jsonb_build_object('k', k) ->> 'k' ORDER BY k)::json FROM public.src)
 WHERE ts < '2019-01-01'::timestamptz;
 
 -- (B) Parity against the live DuckDB: the target is accepted (ordered and not),
 -- and both spellings it replaces are rejected. A void row = accepted.
 SELECT duckdb.raw_query($$ SELECT to_json(array_agg(x ORDER BY x)) FROM (VALUES ('b'),('a')) v(x) $$);
 SELECT duckdb.raw_query($$ SELECT to_json(array_agg(x)) FROM (VALUES ('b'),('a')) v(x) $$);
-SELECT duckdb.raw_query($$ SELECT to_json(array_agg(json_object('k', x) ->> 'k' ORDER BY x)) FROM (VALUES ('b'),('a')) v(x) $$);
 SELECT duckdb.raw_query($$ SELECT json_agg(x) FROM (VALUES ('a')) v(x) $$);
 SELECT duckdb.raw_query($$ SELECT jsonb_agg(x) FROM (VALUES ('a')) v(x) $$);
 -- json_group_array is why the target is not that: a macro cannot take ORDER BY.

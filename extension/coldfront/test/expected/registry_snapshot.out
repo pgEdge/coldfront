@@ -88,10 +88,10 @@ EXPLAIN (COSTS OFF, VERBOSE)
 SELECT jsonb_build_object('status', e.status)::text AS details
 FROM public.events e, public.plain_a a, public.plain_b b
 WHERE a.k = b.k;
-                                                                         QUERY PLAN                                                                          
--------------------------------------------------------------------------------------------------------------------------------------------------------------
+                                                                          QUERY PLAN                                                                          
+--------------------------------------------------------------------------------------------------------------------------------------------------------------
  Seq Scan on public._events
-   Output: ((concat('{'::text, (to_json('status'::text))::text, ':'::text, COALESCE((to_json(_events.status))::text, 'null'::text), '}'::text))::json)::text
+   Output: ((concat('{'::text, (to_json('status'::text))::text, ':'::text, COALESCE((to_json(_events.status))::text, 'null'::text), '}'::text))::jsonb)::text
 (2 rows)
 
 -- A statement naming only unregistered views is left alone entirely.

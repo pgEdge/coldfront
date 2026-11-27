@@ -93,17 +93,16 @@ starts with an idempotent bootstrap, executed once before the per-partition
 loop: rename the source table, recreate the unified view, and register the view
 in `coldfront.tiered_views`. Until the first cutover sets a watermark, the view
 reads the hot table alone; after it, the view is a UNION with the watermark as
-its cutoff, and both branches cast every column to its view type (`jsonb` to
-`json`):
+its cutoff, and both branches cast every column to its view type:
 
 ```sql
 ALTER TABLE events RENAME TO _events;
 
 CREATE OR REPLACE VIEW events AS
-  SELECT "id"::bigint, "ts"::timestamptz, "status"::text, "data"::json FROM _events
+  SELECT "id"::bigint, "ts"::timestamptz, "status"::text, "data"::jsonb FROM _events
   WHERE "ts" >= '2026-03-01'::timestamptz
   UNION ALL
-  SELECT r['id']::bigint, r['ts']::timestamptz, r['status']::text, r['data']::json
+  SELECT r['id']::bigint, r['ts']::timestamptz, r['status']::text, r['data']::jsonb
   FROM duckdb.query('SELECT * FROM ice.public.events') AS t(r)
   WHERE r['ts'] < '2026-03-01'::timestamptz;
 ```
@@ -534,6 +533,18 @@ Before anything is archived (no cutoff) every row is hot, so a partition-column
 `UPDATE` is a plain hot `UPDATE` whether `coldfront.allow_mixed_writes` is on
 or off.
 
+The cold half of a write has one more rule, for the value it assigns to a
+`jsonb` column. A read compares stored `jsonb` as the text PostgreSQL renders,
+and DuckDB cannot produce that text: it keeps the keys of a built object in the
+order given, and reads an extracted decimal as a double. A constant, a bound
+parameter, a `jsonb` column, and a `CASE` or `COALESCE` that picks one of them
+are that text already, and the hook refuses any other value with an error that
+names the column. The cold half also gets the read rewrite that a read DuckDB
+runs gets (see [Supported Column Types](supported_types.md)): its condition
+compares `jsonb` values as such a read does, and an ordering of them is
+refused. A cross-tier move reads its cold rows with that rewritten condition
+and runs the hot side with the condition as written.
+
 ## Write Modes: Strict vs Permissive (`allow_mixed_writes`)
 
 When the predicate is AMBIGUOUS the hook picks one of two behaviors from the
@@ -718,8 +729,8 @@ not make deletes less expensive.
 ## Tiered-Specific Limitations
 
 These are specific to the dual-tier model. Cross-cutting limitations (the
-planner-level takeover, jsonb-as-json, single-node execution, S3 compatibility,
-one-time secret setup) are in the
+planner-level takeover, jsonb handling, single-node execution, S3
+compatibility, one-time secret setup) are in the
 [Known Limitations](architecture_guides/index.md#known-limitations) section of the
 Architecture overview.
 

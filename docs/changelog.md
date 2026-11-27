@@ -26,6 +26,52 @@ this project adheres to
 - Without the Iceberg namespace of its schema,
   `coldfront.create_iceberg_table()` fails with the error
   `Schema with name "<schema>" does not exist` in place of HTTP 404.
+- A read that DuckDB runs refuses an ordering of `jsonb` values, such as an
+  `ORDER BY` or the `<` operator, with a hint that DuckDB sorts them by their
+  text. It also refuses `=` on an array or a row that holds `jsonb`, and a
+  `jsonb` operator or function that ColdFront does not translate, such as `||`
+  or `jsonb_typeof`, with an error that names it; DuckDB ran `||` as a
+  concatenation of the two documents' text. A read that PostgreSQL runs itself
+  refuses none of these.
+- On a read that DuckDB runs, `pg_typeof` names the type PostgreSQL resolved
+  for its argument, as `text`, such as `character varying` where it named
+  DuckDB's `varchar`.
+- `coldfront.adopt_iceberg_table()` restores a JSON column as `json` and
+  refuses a `jsonb` override in `p_types`, and an `ALTER TABLE` on an adopted
+  table refuses a `jsonb` column, because ColdFront compares `jsonb` values as
+  the text PostgreSQL writes and another engine may write an adopted table.
+  `coldfront.tiered_views` has an `is_adopted` column that marks one.
+- A cold `INSERT`, `UPDATE` or `MERGE` refuses a `jsonb` value that PostgreSQL
+  did not render, such as the result of `jsonb_build_object`, `||`, `->` or a
+  `::jsonb` cast of text, with an error that names the column. DuckDB stored
+  such a value with its keys unsorted, its white space removed and its
+  decimals at double precision, so the value compared and grouped as a
+  different one. A constant, a parameter, a `jsonb` column, and a `CASE` or
+  `COALESCE` that picks one of them are accepted.
+- The condition of a cold `UPDATE`, `DELETE` or `MERGE`, and the source of a
+  decoupled `INSERT`, compare `jsonb` values as a read that DuckDB runs does,
+  and refuse an ordering of `jsonb` values, so a cold write changes the rows
+  that a read with the same condition returns.
+- `ALTER TABLE` refuses to change a column of a tiered or decoupled table to
+  `jsonb`, because the cold rows keep the text they were written in.
+
+### Fixed
+
+- A `jsonb` column of a tiered or decoupled table reads as `jsonb`; it read as
+  `json`. The `=` and `<>` operators, `IS DISTINCT FROM`, `DISTINCT`,
+  `GROUP BY` and `UNION` work on the column, on a `::jsonb` cast, and on the
+  results of `jsonb_agg` and `jsonb_build_object`, which failed with
+  `operator does not exist: json = json`
+  ([Supported Column Types](supported_types.md) lists the comparisons that
+  differ from PostgreSQL's).
+- A `json` or `jsonb` value keeps its form when a tiered `INSERT` writes the
+  cold rows through `coldfront._cold_sink`, and when an `UPDATE` of the
+  partition column moves the row. Those writes stored a JSON string without
+  its quotes, which made the row unreadable, stored a JSON `null` as `NULL`,
+  and stored a `json` document as `jsonb` renders it.
+- `jsonb_build_object` and `json_build_object` accept a string literal as a
+  value on a read that DuckDB runs, which failed with
+  `could not determine polymorphic type because input has type unknown`.
 
 ## [1.0.0-beta4] - 2026-11-17
 

@@ -133,7 +133,7 @@ ERROR:  canceling statement due to lock timeout
 CONTEXT:  SQL statement "SELECT pg_advisory_xact_lock(hashtext('coldfront_iceberg:' || p_iceberg_ref))"
 PL/pgSQL function _take_iceberg_claim(text) line 13 at PERFORM
 SQL statement "SELECT coldfront._take_iceberg_claim(v_iceberg)"
-PL/pgSQL function _cross_tier_move(text,text,text,text) line 134 at PERFORM
+PL/pgSQL function _cross_tier_move(text,text,text,text,text) line 139 at PERFORM
 -- (6) The cold stream: a tiered INSERT whose source streams is one DuckDB
 --     write in the statement, and the claim at COMMIT meets the lock. The
 --     stream's second session connects to the regress database.
