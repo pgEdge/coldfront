@@ -534,6 +534,6 @@ If something failed, work through the following checklist:
   `set_storage_secret_azure()` has the right `AccountName` and `AccountKey`.
 - Check that the namespace `public` exists in Lakekeeper before
   `create_iceberg_table` runs. Without the namespace, the decoupled create
-  fails with HTTP 404.
+  fails with the error `Schema with name "public" does not exist`.
 - Check that the key is a long-term key, not an SSO or temporary session-token
   credential (S3-family backends).

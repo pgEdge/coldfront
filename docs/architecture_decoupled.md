@@ -99,6 +99,7 @@ notes:
 | Operation | Path | Notes |
 |---|---|---|
 | Lazy catalog ATTACH | The C hook calls `ensure_attached()` on the first query that touches a tiered view. | The ATTACH costs one round-trip on the first Iceberg query per session. |
+| Namespace create | `SELECT coldfront.create_iceberg_namespace('<ns>')` | The namespace reaches the catalog when the transaction commits, so the call runs in a transaction of its own before the first `CREATE TABLE` in the namespace. |
 | CREATE TABLE | `SELECT duckdb.raw_query('CREATE TABLE ice.<ns>.<name> (...)')` | The statement is DuckDB SQL in attached-catalog syntax. |
 | INSERT | The C hook rewrites an `INSERT INTO <view>` whose source is `VALUES (…)`, `SELECT … FROM <pg_table>` or `SELECT … FROM generate_series(…)` to one `SELECT coldfront._exec_iceberg_with_claim(<ref>, 'INSERT INTO ice.<ns>.<name> …')`. Source-table references get the prefix `pglocal.<schema>.<table>`, so DuckDB's `postgres` extension streams the source via libpq into the Iceberg writer. That attachment needs `coldfront.local_pg_dsn` (see [Bootstrap Sequence](#bootstrap-sequence)). A `WITH` entry that modifies data is refused, because DuckDB 1.5 has no data-modifying `WITH`. An `INSERT` nested in a `WITH` entry is rewritten in place when it reads no other entry, since DuckDB does not see them. | Each INSERT produces a single Iceberg snapshot, regardless of row count. |
 | UPDATE | The hook rewrites `UPDATE <view> SET … WHERE …` to `SELECT coldfront._exec_iceberg_with_claim(<ref>, 'UPDATE ice.<ns>.<name> SET ... WHERE ...')`. | Iceberg applies the update as merge-on-read. |
@@ -182,8 +183,17 @@ needs `r['col']` accessor, every write needs a
 `duckdb.raw_query('… DuckDB SQL …')` envelope. To make an Iceberg-only
 table as easy to use as a PG table, ColdFront ships a single helper that
 provisions an Iceberg-only table together with a PG-side wrapper view and a
-registry row that makes the C hook to handle every DML on the view. After that,
-applications use **plain PG syntax** against the named relation:
+registry row that makes the C hook to handle every DML on the view.
+
+The table's schema needs its Iceberg namespace first, created in a transaction
+that commits before the helper runs:
+
+```sql
+SELECT coldfront.create_iceberg_namespace('public');
+```
+
+After the helper runs, applications use **plain PG syntax** against the named
+relation:
 
 ```sql
 SELECT coldfront.create_iceberg_table(
@@ -213,12 +223,17 @@ first `INSERT`, a time transform on a column that is not a timestamp or date
 (for `hour`, not a timestamp), `coldfront._partition_clause()` makes at the
 same point, while no table exists yet.
 
+The helper needs the Iceberg namespace `ice.<schema>` in the catalog before it
+runs. `coldfront.create_iceberg_namespace()` creates the namespace with
+`duckdb.raw_query('CREATE SCHEMA IF NOT EXISTS "ice"."public"')`, in a
+transaction of its own. The pinned duckdb-iceberg build sends a namespace
+create when the DuckDB transaction commits and a table create when the
+statement runs, and Lakekeeper refuses a table in a namespace it does not
+have, so one transaction cannot create a namespace and its first table.
+
 The helper performs the following steps:
 
-1. Creates the Iceberg namespace against Lakekeeper, idempotently, with
-    `duckdb.raw_query('CREATE SCHEMA IF NOT EXISTS ice."public"')`.
-
-2. Creates the Iceberg table with the following statement:
+1. Creates the Iceberg table with the following statement:
 
     ```sql
     duckdb.raw_query('CREATE TABLE ice.public.<name> (col1 STORAGE_TYPE, …) PARTITIONED BY (…)')
@@ -230,7 +245,7 @@ The helper performs the following steps:
     [Supported Column Types](#supported-column-types) above) raises before any
     DDL is issued.
 
-3. Creates the wrapper view with the following statement:
+2. Creates the wrapper view with the following statement:
 
     ```sql
     CREATE OR REPLACE VIEW <schema>.<name> AS
@@ -248,7 +263,7 @@ The helper performs the following steps:
     `ICEBERG_SCAN` plan with identical Parquet predicate pushdown, so there is
     no performance cost.
 
-4. Registers the row in `coldfront.tiered_views` with `is_iceberg_only = true`.
+3. Registers the row in `coldfront.tiered_views` with `is_iceberg_only = true`.
     The C-side `post_parse_analyze_hook` reads this flag and short-circuits
     `classify_tier()` to `TIER_COLD` for any `INSERT`/`UPDATE`/`DELETE` on the
     wrapper view, regardless of WHERE clause or watermark - so every write

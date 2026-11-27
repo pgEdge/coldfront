@@ -82,6 +82,7 @@ extension's non-hook surface (third table below) and register no view.
 | `array_cold_render` | `_render_cold_value` renders an array as a DuckDB list of its elements' own literals, exact for text a list cast would misread and for `bytea` under either `bytea_output`; `_cold_list` refuses an array that is not a one-dimensional list from 1, naming the column, or saying a bound parameter holds it; `_render_cold_param` renders a bound array parameter the same way; a tiered `INSERT`'s cold half checks each array column and a cold write renders an array parameter (`EXPLAIN VERBOSE`); pg_duckdb loses a numeric array's precision in `CREATE TABLE ... USING duckdb` (the archiver's `text[]` export's reason); `_move_pg_row_literal` turns a jsonb list back into PostgreSQL array text |
 | `adopt_iceberg_table` | what adoption refuses before it reads a catalog (arguments, a PG schema that does not exist, a name already taken, a reference already registered, no catalog configured), the wrapper view and registry row it ends in, and its inverse `release_iceberg_table` |
 | `extract_field_quoting` | pg_duckdb's deparse quotes an `EXTRACT` field name (`docker/pg_duckdb-extract-field-quoting.patch`): a crafted field is refused instead of running as SQL on DuckDB, and a plain field runs on DuckDB |
+| `create_iceberg_namespace` | `create_iceberg_namespace` refuses a null or empty name before it reaches the catalog |
 
 ## Why `coldfront.warehouse = ''` here (and only here)
 

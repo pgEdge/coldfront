@@ -243,7 +243,7 @@ else
     \"storage-credential\":{\"type\":\"s3\",\"credential-type\":\"access-key\",\"aws-access-key-id\":\"admin\",\"aws-secret-access-key\":\"adminsecret\"}
   }"
 fi
-create_warehouse_and_seed "$LK_IP" "$WH_BODY"   # POST warehouse + seed 'default' namespace (ci/lib.sh)
+create_warehouse "$LK_IP" "$WH_BODY"   # POST warehouse (ci/lib.sh)
 
 if [ "$REGRESS" = 1 ]; then
     step "vanilla: pg_regress installcheck (unit layer)"

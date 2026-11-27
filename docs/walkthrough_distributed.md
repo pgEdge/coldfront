@@ -206,6 +206,10 @@ SELECT sub_name  FROM spock.subscription;              -- one per node
 
 ### Writing on One Node, Reading on the Other
 
+A lake-native table requires the Iceberg namespace named after its schema; the
+setup seeded the `public` namespace. Without the namespace,
+`coldfront.create_iceberg_table()` fails.
+
 Use the following call to create a lake-native table on `db1`, and then run the
 same call on `db2`. The call is idempotent, and the registry is keyed by table
 name, so each node ends up with an identical local view:

@@ -396,9 +396,8 @@ ensure_coldfront_setup() {
 # ensure_warehouse_and_namespace <lk_url>: bootstrap Lakekeeper, then POST
 # warehouse 'wh' (retrying until config?warehouse=wh resolves: the POST validates
 # its S3 profile against SeaweedFS and 4xx/5xxs until the S3 endpoint is live) and
-# create the LK_NS namespace. Seeding it is required, not cosmetic: DuckDB defers
-# an Iceberg CREATE SCHEMA to COMMIT while POSTing CREATE TABLE eagerly, so
-# create_iceberg_table 404s unless the namespace is already committed. Shared
+# create the LK_NS namespace. Seeding it is required, not cosmetic:
+# create_iceberg_table fails unless the catalog already has the namespace. Shared
 # by phase_a_bringup (single-node) and mesh_bringup (2-node); both seed the same
 # warehouse against their own Lakekeeper on the SeaweedFS at http://seaweedfs:8333.
 ensure_warehouse_and_namespace() {
@@ -1078,11 +1077,9 @@ demo_decoupled() {
         read -rp "Press Enter to create the lake-native table..." </dev/tty
         echo ""
     fi
-    # The Iceberg namespace is pre-seeded in Phase A. DuckDB 1.5.x defers an
-    # Iceberg CREATE SCHEMA to COMMIT but POSTs CREATE TABLE eagerly, so
-    # create_iceberg_table (both in ONE plpgsql txn) would 404 on a cold
-    # warehouse. With the namespace already committed this no-ops; the loop is a
-    # thin safety net in case seeding raced the warehouse.
+    # The Iceberg namespace is pre-seeded in Phase A, and create_iceberg_table
+    # fails without it. The loop is a thin safety net in case seeding raced the
+    # warehouse.
     local i ok=0
     for i in 1 2 3 4 5; do
         pg "SELECT coldfront.create_iceberg_table('public','events_lake','[{\"name\":\"id\",\"type\":\"bigint\"},{\"name\":\"ts\",\"type\":\"timestamptz\"},{\"name\":\"status\",\"type\":\"text\"},{\"name\":\"data\",\"type\":\"jsonb\"}]'::jsonb);" >/dev/null 2>&1
