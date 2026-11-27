@@ -152,16 +152,16 @@ ERROR:  coldfront: @> on a jsonb value is not supported on a tiered or decoupled
 SELECT id FROM public.jdocs WHERE doc IN (SELECT doc FROM public.jdocs WHERE id <= 2
                                           UNION SELECT doc FROM public.jdocs WHERE id = 5);
 ERROR:  coldfront: this comparison of jsonb values is not supported on a tiered or decoupled view
-HINT:  In a WHERE condition that is not under NOT, write the comparison inside an EXISTS (SELECT 1 FROM ... WHERE ...) sub-select.
+HINT:  When the comparison is the WHERE clause or one of its AND-ed conditions, write it inside an EXISTS (SELECT 1 FROM ... WHERE ...) sub-select.
 SELECT id FROM public.jdocs WHERE doc IN (VALUES ('{"k": 2}'::jsonb));
 ERROR:  coldfront: this comparison of jsonb values is not supported on a tiered or decoupled view
-HINT:  In a WHERE condition that is not under NOT, write the comparison inside an EXISTS (SELECT 1 FROM ... WHERE ...) sub-select.
+HINT:  When the comparison is the WHERE clause or one of its AND-ed conditions, write it inside an EXISTS (SELECT 1 FROM ... WHERE ...) sub-select.
 SELECT id FROM public.jdocs WHERE (id, doc) IN (SELECT id, doc FROM public.jdocs);
 ERROR:  coldfront: this comparison of jsonb values is not supported on a tiered or decoupled view
-HINT:  In a WHERE condition that is not under NOT, write the comparison inside an EXISTS (SELECT 1 FROM ... WHERE ...) sub-select.
+HINT:  When the comparison is the WHERE clause or one of its AND-ed conditions, write it inside an EXISTS (SELECT 1 FROM ... WHERE ...) sub-select.
 SELECT id FROM public.jdocs WHERE doc @> ANY (SELECT doc FROM public.jdocs WHERE id = 1);
 ERROR:  coldfront: this comparison of jsonb values is not supported on a tiered or decoupled view
-HINT:  In a WHERE condition that is not under NOT, write the comparison inside an EXISTS (SELECT 1 FROM ... WHERE ...) sub-select.
+HINT:  When the comparison is the WHERE clause or one of its AND-ed conditions, write it inside an EXISTS (SELECT 1 FROM ... WHERE ...) sub-select.
 -- An IN list whose operand is volatile is refused too: comparing the operand
 -- with each element would evaluate it once per element.
 SELECT count(*) FROM public.jdocs WHERE CASE WHEN random() < 0.5 THEN '0'::jsonb ELSE '1'::jsonb END IN ('0'::jsonb, '1'::jsonb);
@@ -250,7 +250,7 @@ SELECT public.jdocs_same($q$SELECT id FROM %1$s WHERE doc IN (SELECT DISTINCT do
 -- One whose HAVING or ORDER BY also names the column is refused.
 SELECT id FROM public.jdocs WHERE doc IN (SELECT doc FROM public.jdocs GROUP BY doc HAVING doc ->> 't' = 'x');
 ERROR:  coldfront: this comparison of jsonb values is not supported on a tiered or decoupled view
-HINT:  In a WHERE condition that is not under NOT, write the comparison inside an EXISTS (SELECT 1 FROM ... WHERE ...) sub-select.
+HINT:  When the comparison is the WHERE clause or one of its AND-ed conditions, write it inside an EXISTS (SELECT 1 FROM ... WHERE ...) sub-select.
 -- A cursor's statement reads the view as a SELECT does.
 BEGIN;
 DECLARE c CURSOR FOR SELECT id, pg_typeof(id) AS t, doc = '{"t":"x","k":1}' AS eq FROM public.jdocs WHERE id <= 3 ORDER BY id;
@@ -377,13 +377,11 @@ SELECT public.jdocs_same($q$SELECT id FROM %1$s WHERE doc = jsonb_build_object('
  t                    | t                   | t
 (1 row)
 
--- The value of a repeated key that jsonb drops is still evaluated, as
--- PostgreSQL evaluates it, here raising an error.
+-- A repeated key whose earlier value is not a constant is refused: PostgreSQL
+-- evaluates that value and keeps the last one, and DuckDB would keep both.
 SELECT jsonb_build_object('k', name::int, 'k', 1) FROM public.jdocs WHERE id = 1;
-ERROR:  (PGDuckDB/Duckdb_ExecCustomScan_Cpp) Conversion Error: Could not convert string 'a' to INT32 when casting from source column name
-
-LINE 1: ...(to_json('k'::text))::text, ':'::text, COALESCE((to_json((name)::integer))::text, 'null'::text), ','::text, (to_json('k...
-                                                                          ^
+ERROR:  coldfront: jsonb_build_object with a repeated key whose earlier value is not a constant is not supported on a tiered or decoupled view
+HINT:  This statement runs in DuckDB, which keeps every value of a repeated key, where jsonb keeps the last. Give each key once.
 -- A jsonb parameter compares as a constant does, through seven executions, which
 -- cross the plan cache's switch from custom to generic planning after the fifth.
 PREPARE by_doc(jsonb) AS
@@ -566,6 +564,25 @@ EXECUTE hot_dk('{"o": {"b": 1}}');
 
 DEALLOCATE hot_dk;
 DROP TABLE jhot_ids;
+-- A read of the view that PostgreSQL runs answers pg_typeof itself, as a regtype
+-- whose argument it evaluates. A rewrite that hands the read to DuckDB, here
+-- date_bin's time_bucket, makes pg_typeof name the type PostgreSQL resolved.
+SELECT pg_typeof(e.doc)::oid = 'jsonb'::regtype::oid AS hot_typeof_oid, pg_typeof(pg_typeof(e.doc)) AS hot_typeof_type
+  FROM public.jhot e JOIN public.jhot_flag f ON f.id = e.id WHERE e.id = 1;
+ hot_typeof_oid | hot_typeof_type 
+----------------+-----------------
+ t              | regtype
+(1 row)
+
+SELECT pg_typeof(1 / (e.id - e.id)) FROM public.jhot e JOIN public.jhot_flag f ON f.id = e.id WHERE e.id = 1;
+ERROR:  division by zero
+SELECT pg_typeof(e.doc) AS hot_duckdb_typeof FROM public.jhot e JOIN public.jhot_flag f ON f.id = e.id
+ WHERE e.id = 1 AND date_bin('1 day', e.ts, TIMESTAMPTZ '2000-01-01 00:00+00') IS NOT NULL;
+ hot_duckdb_typeof 
+-------------------
+ jsonb
+(1 row)
+
 DROP VIEW public.jhot_flag;
 DELETE FROM coldfront.tiered_views WHERE schema_name = 'public' AND relname = 'jhot';
 DROP VIEW public.jhot;
@@ -795,7 +812,8 @@ ROLLBACK;
 EXPLAIN (COSTS OFF, VERBOSE) DECLARE ec SCROLL CURSOR FOR SELECT doc FROM public.jdocs \g /dev/null
 -- (K) A read PostgreSQL runs itself, here of a registered view over a heap table
 -- that calls no DuckDB function, is answered as on the heap: PostgreSQL compares
--- and orders jsonb as jsonb, and has every jsonb operator.
+-- and orders jsonb as jsonb, has every jsonb operator, and builds an object with
+-- a repeated key.
 CREATE VIEW public.jdocs_pg AS SELECT id, name, doc FROM public._jdocs;
 INSERT INTO coldfront.tiered_views(schema_name, relname, iceberg_table, is_iceberg_only)
 VALUES ('public', 'jdocs_pg', 'ice.default.jdocs_pg', true);
@@ -808,10 +826,12 @@ SELECT (SELECT array_agg(id) FROM (SELECT id FROM public.jdocs_pg ORDER BY doc, 
        (SELECT count(*) FROM public.jdocs_pg WHERE doc = '{"n": 1.0}')
      = (SELECT count(*) FROM public._jdocs WHERE doc = '{"n": 1.0}') AS pg_equal,
        (SELECT count(*) FROM public.jdocs_pg WHERE doc IN ('{"n": 1}', '{"t":"x","k":1}'))
-     = (SELECT count(*) FROM public._jdocs WHERE doc IN ('{"n": 1}', '{"t":"x","k":1}')) AS pg_in_list;
- pg_order_by | pg_less_than | pg_concat | pg_equal | pg_in_list 
--------------+--------------+-----------+----------+------------
- t           | t            | t         | t        | t
+     = (SELECT count(*) FROM public._jdocs WHERE doc IN ('{"n": 1}', '{"t":"x","k":1}')) AS pg_in_list,
+       (SELECT count(*) FROM public.jdocs_pg WHERE jsonb_build_object('k', id, 'k', 1) = '{"k": 1}')
+     = (SELECT count(*) FROM public._jdocs WHERE jsonb_build_object('k', id, 'k', 1) = '{"k": 1}') AS pg_repeated_key;
+ pg_order_by | pg_less_than | pg_concat | pg_equal | pg_in_list | pg_repeated_key 
+-------------+--------------+-----------+----------+------------+-----------------
+ t           | t            | t         | t        | t          | t
 (1 row)
 
 DELETE FROM coldfront.tiered_views WHERE schema_name = 'public' AND relname = 'jdocs_pg';

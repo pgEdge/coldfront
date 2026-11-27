@@ -229,8 +229,8 @@ SELECT public.jdocs_same($q$SELECT id FROM %1$s WHERE doc = jsonb_build_object('
        public.jdocs_same($q$SELECT id FROM %1$s WHERE doc = jsonb_build_object('k', 9, 't', 'x', 'k', 1) ORDER BY id$q$) AS built_duplicate_key,
        public.jdocs_same($q$SELECT id FROM %1$s WHERE id <= 2 AND jsonb_build_object('aa', 1, 'b', 2) = '{"aa": 1, "b": 2}'
                              ORDER BY id$q$) AS built_key_length_order;
--- The value of a repeated key that jsonb drops is still evaluated, as
--- PostgreSQL evaluates it, here raising an error.
+-- A repeated key whose earlier value is not a constant is refused: PostgreSQL
+-- evaluates that value and keeps the last one, and DuckDB would keep both.
 SELECT jsonb_build_object('k', name::int, 'k', 1) FROM public.jdocs WHERE id = 1;
 -- A jsonb parameter compares as a constant does, through seven executions, which
 -- cross the plan cache's switch from custom to generic planning after the fifth.
@@ -340,6 +340,14 @@ PREPARE hot_dk(jsonb) AS
 EXECUTE hot_dk('{"o": {"b": 1}}');
 DEALLOCATE hot_dk;
 DROP TABLE jhot_ids;
+-- A read of the view that PostgreSQL runs answers pg_typeof itself, as a regtype
+-- whose argument it evaluates. A rewrite that hands the read to DuckDB, here
+-- date_bin's time_bucket, makes pg_typeof name the type PostgreSQL resolved.
+SELECT pg_typeof(e.doc)::oid = 'jsonb'::regtype::oid AS hot_typeof_oid, pg_typeof(pg_typeof(e.doc)) AS hot_typeof_type
+  FROM public.jhot e JOIN public.jhot_flag f ON f.id = e.id WHERE e.id = 1;
+SELECT pg_typeof(1 / (e.id - e.id)) FROM public.jhot e JOIN public.jhot_flag f ON f.id = e.id WHERE e.id = 1;
+SELECT pg_typeof(e.doc) AS hot_duckdb_typeof FROM public.jhot e JOIN public.jhot_flag f ON f.id = e.id
+ WHERE e.id = 1 AND date_bin('1 day', e.ts, TIMESTAMPTZ '2000-01-01 00:00+00') IS NOT NULL;
 DROP VIEW public.jhot_flag;
 DELETE FROM coldfront.tiered_views WHERE schema_name = 'public' AND relname = 'jhot';
 DROP VIEW public.jhot;
@@ -451,7 +459,8 @@ EXPLAIN (COSTS OFF, VERBOSE) DECLARE ec SCROLL CURSOR FOR SELECT doc FROM public
 
 -- (K) A read PostgreSQL runs itself, here of a registered view over a heap table
 -- that calls no DuckDB function, is answered as on the heap: PostgreSQL compares
--- and orders jsonb as jsonb, and has every jsonb operator.
+-- and orders jsonb as jsonb, has every jsonb operator, and builds an object with
+-- a repeated key.
 CREATE VIEW public.jdocs_pg AS SELECT id, name, doc FROM public._jdocs;
 INSERT INTO coldfront.tiered_views(schema_name, relname, iceberg_table, is_iceberg_only)
 VALUES ('public', 'jdocs_pg', 'ice.default.jdocs_pg', true);
@@ -464,7 +473,9 @@ SELECT (SELECT array_agg(id) FROM (SELECT id FROM public.jdocs_pg ORDER BY doc, 
        (SELECT count(*) FROM public.jdocs_pg WHERE doc = '{"n": 1.0}')
      = (SELECT count(*) FROM public._jdocs WHERE doc = '{"n": 1.0}') AS pg_equal,
        (SELECT count(*) FROM public.jdocs_pg WHERE doc IN ('{"n": 1}', '{"t":"x","k":1}'))
-     = (SELECT count(*) FROM public._jdocs WHERE doc IN ('{"n": 1}', '{"t":"x","k":1}')) AS pg_in_list;
+     = (SELECT count(*) FROM public._jdocs WHERE doc IN ('{"n": 1}', '{"t":"x","k":1}')) AS pg_in_list,
+       (SELECT count(*) FROM public.jdocs_pg WHERE jsonb_build_object('k', id, 'k', 1) = '{"k": 1}')
+     = (SELECT count(*) FROM public._jdocs WHERE jsonb_build_object('k', id, 'k', 1) = '{"k": 1}') AS pg_repeated_key;
 DELETE FROM coldfront.tiered_views WHERE schema_name = 'public' AND relname = 'jdocs_pg';
 DROP VIEW public.jdocs_pg;
 

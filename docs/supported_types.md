@@ -109,10 +109,12 @@ ColdFront translates `jsonb_array_length`, `jsonb_build_object` / `jsonb_agg`
 (and their `json_` twins, which DuckDB also lacks) and `date_bin` on read: the
 builders become a `concat` / `to_json` / `array_agg` form both engines
 evaluate, and `date_bin` becomes DuckDB's `time_bucket`, which takes the same
-arguments and agrees on every fixed-width bucket. The `pg_typeof` function
-names the type PostgreSQL resolved for its argument, as `text`, so compare it
-with a string such as `'integer'` rather than a `regtype`. ColdFront refuses it
-over a set-returning expression, such as `pg_typeof(generate_series(1, 2))`.
+arguments and agrees on every fixed-width bucket. In a read that DuckDB runs,
+the `pg_typeof` function names the type PostgreSQL resolved for its argument,
+as `text`, so compare it with a string such as `'integer'` rather than a
+`regtype`; ColdFront refuses it there over a set-returning expression, such as
+`pg_typeof(generate_series(1, 2))`. A read that PostgreSQL runs itself returns
+the `regtype` that `pg_typeof` returns on a table.
 
 DuckDB holds a `jsonb` value as JSON text, and ColdFront stores each `jsonb`
 value as the text PostgreSQL renders it in. A stored document therefore
@@ -131,13 +133,13 @@ and a simple `CASE` return PostgreSQL's answers, with three differences:
   at double precision compare as equal.
 - An object that DuckDB builds keeps its keys in the order it was given them,
   and keeps a repeated key, where `jsonb` sorts its keys and keeps the last of
-  a repeated one. Such an object comes from a `::jsonb` cast of text, from
-  `jsonb_build_object` with a key that is not a constant, or from
-  `jsonb_build_object` with a repeated key whose earlier value is not a
-  constant, which DuckDB still evaluates. Such an object can compare as
+  a repeated one. Such an object comes from a `::jsonb` cast of text, or from
+  `jsonb_build_object` with a key that is not a constant, so it can compare as
   unequal to a stored document with the same keys and values. A stored
-  document, a constant, and any other `jsonb_build_object` whose keys are all
-  constants compare as PostgreSQL compares them.
+  document, a constant, and a `jsonb_build_object` whose keys are all
+  constants compare as PostgreSQL compares them. ColdFront refuses a
+  `jsonb_build_object` that repeats a key when a value before the last one is
+  not a constant.
 
 A cold write stores only the text PostgreSQL renders. The value that a cold
 `INSERT`, `UPDATE` or `MERGE` assigns to a `jsonb` column must therefore be a
@@ -180,11 +182,11 @@ The following rules apply to the other statements that compare `jsonb` values:
 - ColdFront refuses `IN (SELECT ...)` over a `UNION` or a `VALUES` list, one
   whose sub-select groups or de-duplicates the compared column and has a
   `HAVING` or an `ORDER BY`, and a row comparison such as
-  `(id, doc) IN (SELECT ...)`. In a `WHERE` condition that is not under `NOT`,
-  write such a comparison inside an `EXISTS` sub-select. ColdFront also
-  refuses `= ANY` of a `jsonb[]` value, an `IN` list whose operand is
-  volatile, such as one that calls `random()`, and another `jsonb` operator,
-  such as `@>`, under `ANY` or `ALL`.
+  `(id, doc) IN (SELECT ...)`. When such a comparison is the `WHERE` clause or
+  one of its `AND`-ed conditions, write it inside an `EXISTS` sub-select.
+  ColdFront also refuses `= ANY` of a `jsonb[]` value, an `IN` list whose
+  operand is volatile, such as one that calls `random()`, and another `jsonb`
+  operator, such as `@>`, under `ANY` or `ALL`.
 
 ColdFront also rewrites the JSON operators that DuckDB lacks into DuckDB's JSON
 functions, which return PostgreSQL's answers. The rewrite covers:

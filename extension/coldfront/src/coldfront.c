@@ -303,6 +303,8 @@ static void as_caller(Oid save_uid, int save_sec, int nest);
 static bool has_extern_param_walker(Node *node, void *ctx);
 /* Defined with the read-shape checks: a node resolved through the grouping RTE. */
 static Node *cf_unwrap_group_var(Query *query, Node *node);
+/* Defined with the planner hook: will pg_duckdb run the statement? */
+static bool cf_runs_in_duckdb(Query *query);
 
 /*
  * Re-entrancy guard for the DDL hook. _rebuild_tiered_view issues CREATE VIEW /
@@ -1032,10 +1034,12 @@ normalize_casts_for_duckdb(const char *sql)
  * rejects a NULL key. The text DuckDB builds holds the same JSON as jsonb's
  * rendering and is not the same text: jsonb pads punctuation and this is compact.
  * jsonb also sorts keys and keeps the last of a repeated one, which
- * jsonb_build_object's pairs follow when every key is a constant and every value
- * dropped is a constant (cf_jsonb_key_order); otherwise they stay in argument
- * order, as json_build_object's always do. Pairing keys with values is exact on
- * the argument List; the emitted function OIDs come from the catalog, once per backend.
+ * jsonb_build_object's pairs follow when every key is a constant
+ * (cf_jsonb_key_order); otherwise they stay in argument order, as
+ * json_build_object's always do. A repeated key whose dropped value is not a
+ * constant is left to PostgreSQL, and refused where DuckDB runs the read. Pairing
+ * keys with values is exact on the argument List; the emitted function OIDs come
+ * from the catalog, once per backend.
  * A VARIADIC array argument cannot be paired and is left alone.
  */
 /* defer: the parse-analyze pass, which keeps a json operator whose operand holds a
@@ -1043,8 +1047,10 @@ normalize_casts_for_duckdb(const char *sql)
  * jsonb comparison nor refuses anything. The planner hook's pass and the cold
  * half of a write (defer false) run only where DuckDB runs the statement, and do
  * both.
- * qs: the query levels the mutator is inside, innermost first. */
-typedef struct { bool changed; bool defer; List *qs; } JsonBuilderCtx;
+ * qs: the query levels the mutator is inside, innermost first.
+ * keep_typeof: leave pg_typeof as written, and set saw_typeof on meeting one
+ * (cf_normalize_read). */
+typedef struct { bool changed; bool defer; List *qs; bool keep_typeof; bool saw_typeof; } JsonBuilderCtx;
 
 static Oid cf_to_json_oid       = InvalidOid;
 static Oid cf_concat_oid        = InvalidOid;
@@ -1142,8 +1148,8 @@ cf_json_key(Node *k)
 /* The arguments of a jsonb_build_object call as jsonb keeps the pairs, when every
  * key is a constant; otherwise the arguments as given. jsonb itself builds the
  * object of each key and its position, which gives its key order and the last of
- * a repeated key. A repeated key whose dropped value is not a constant also gives
- * the arguments as given, so that value is still evaluated. */
+ * a repeated key. NIL for a repeated key whose dropped value is not a constant:
+ * PostgreSQL evaluates that value, and the object DuckDB builds would keep it. */
 static List *
 cf_jsonb_key_order(List *args)
 {
@@ -1178,7 +1184,7 @@ cf_jsonb_key_order(List *args)
         }
     for (i = 1; i < n; i += 2)
         if (!IsA(list_nth(args, i), Const) && !list_member_ptr(out, list_nth(args, i)))
-            return args;
+            return NIL;
     return out;
 }
 
@@ -1190,8 +1196,6 @@ cf_json_object(List *args, Oid restype)
     ListCell *lc;
     int       i   = 0;
 
-    if (restype == JSONBOID)
-        args = cf_jsonb_key_order(args);
     foreach(lc, args)
     {
         Node *a = (Node *) lfirst(lc);
@@ -2025,9 +2029,24 @@ cf_json_builder_mutator(Node *node, void *ctx)
         if (!f->funcvariadic &&
             cf_is_pg_catalog_func(f->funcid, "jsonb_build_object", "json_build_object"))
         {
+            List *args = f->funcresulttype == JSONBOID ? cf_jsonb_key_order(f->args) : f->args;
+
+            /* A read PostgreSQL runs builds such an object as written. */
+            if (args == NIL && f->args != NIL)
+            {
+                if (!jc->defer)
+                    ereport(ERROR,
+                            (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+                             errmsg("coldfront: jsonb_build_object with a repeated key whose earlier "
+                                    "value is not a constant is not supported on a tiered or "
+                                    "decoupled view"),
+                             errhint("This statement runs in DuckDB, which keeps every value of a "
+                                     "repeated key, where jsonb keeps the last. Give each key once.")));
+                return (Node *) f;
+            }
             cf_resolve_json_builder_oids();
             jc->changed = true;
-            return cf_json_object(f->args, f->funcresulttype);
+            return cf_json_object(args, f->funcresulttype);
         }
         /* DuckDB has json_array_length and no jsonb_array_length. */
         if (list_length(f->args) == 1 &&
@@ -2050,7 +2069,8 @@ cf_json_builder_mutator(Node *node, void *ctx)
          * (varchar, blob, json). A pg_duckdb placeholder type means PostgreSQL has
          * none, and DuckDB names that one. The text it becomes is not pg_typeof's
          * regtype: the reparse resolves the parse-time pass's, and pg_duckdb takes
-         * a result column's type from DuckDB's answer. */
+         * a result column's type from DuckDB's answer. A read PostgreSQL runs keeps
+         * pg_typeof (keep_typeof). */
         if (list_length(f->args) == 1 && f->funcid == F_PG_TYPEOF &&
             getExtensionOfObject(TypeRelationId, exprType(linitial(f->args))) !=
             get_extension_oid("pg_duckdb", false))
@@ -2060,6 +2080,11 @@ cf_json_builder_mutator(Node *node, void *ctx)
             CaseExpr *c;
             NullTest *t;
 
+            if (jc->keep_typeof)
+            {
+                jc->saw_typeof = true;
+                return (Node *) f;
+            }
             /* A set-returning argument sets the number of rows, which a constant
              * cannot keep, and CASE cannot hold it. */
             if (expression_returns_set(arg))
@@ -2161,8 +2186,9 @@ cf_json_builder_mutator(Node *node, void *ctx)
                     (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                      errmsg("coldfront: this comparison of jsonb values is not supported on a "
                             "tiered or decoupled view"),
-                     errhint("In a WHERE condition that is not under NOT, write the comparison "
-                             "inside an EXISTS (SELECT 1 FROM ... WHERE ...) sub-select.")));
+                     errhint("When the comparison is the WHERE clause or one of its AND-ed "
+                             "conditions, write it inside an EXISTS (SELECT 1 FROM ... WHERE ...) "
+                             "sub-select.")));
         if (rewrote)
         {
             jc->changed = true;
@@ -4290,6 +4316,9 @@ cf_try_reroute_hot_read(Query *query)
  * result is deparsed and reparsed in place. Every rewrite but pg_typeof's keeps
  * the type its expression had, so the reparse resolves the caller's operators as
  * the first parse did; pg_typeof becomes text, because DuckDB has no regtype.
+ * A read PostgreSQL runs, such as one of a registered view with no watermark yet,
+ * keeps pg_typeof, so the pass leaves it until the other rewrites are done, and
+ * redoes itself with it when DuckDB runs the result.
  * Nothing to rewrite ⇒ the query is left untouched (the common case: ->>/->
  * operators and plain reads never reparse). The planner hook's pass rewrites the
  * jsonb comparisons and refuses what DuckDB would answer differently, where DuckDB
@@ -4298,10 +4327,15 @@ cf_try_reroute_hot_read(Query *query)
 static void
 cf_normalize_read(Query *query)
 {
-    JsonBuilderCtx jc   = { false, true };
+    JsonBuilderCtx jc   = { false, true, NIL, true, false };
     Query         *tree = (Query *) cf_json_builder_mutator((Node *) query, &jc);
     ColdParamSet   ps;
 
+    if (jc.saw_typeof && cf_runs_in_duckdb(tree))
+    {
+        jc.keep_typeof = false;
+        tree = (Query *) cf_json_builder_mutator((Node *) query, &jc);
+    }
     if (!jc.changed)
         return;
     collect_cold_params(query, &ps);
@@ -7530,7 +7564,8 @@ cf_return_jsonb(Query *parse, PlannedStmt *stmt)
 /* True if the query, at any level, reads a table pg_duckdb keeps in DuckDB or calls
  * a function or aggregate pg_duckdb declares (ctx: its extension OID): in FROM, a
  * cold read's duckdb.query or read_parquet; in an expression, the read rewrite's
- * time_bucket or json(). pg_duckdb runs such a statement in DuckDB. */
+ * time_bucket or json(). pg_duckdb runs such a statement in DuckDB. A view the
+ * parse-analyze pass sees unexpanded counts by its body. */
 static bool
 cf_calls_duckdb(Node *node, void *ctx)
 {
@@ -7539,8 +7574,22 @@ cf_calls_duckdb(Node *node, void *ctx)
     if (node == NULL)
         return false;
     if (IsA(node, RangeTblEntry))
-        return ((RangeTblEntry *) node)->rtekind == RTE_RELATION &&
-               cf_is_duckdb_table(((RangeTblEntry *) node)->relid);
+    {
+        RangeTblEntry *rte = (RangeTblEntry *) node;
+        Relation       rel;
+        bool           calls;
+
+        if (rte->rtekind != RTE_RELATION)
+            return false;
+        if (cf_is_duckdb_table(rte->relid))
+            return true;
+        if (get_rel_relkind(rte->relid) != RELKIND_VIEW)
+            return false;
+        rel   = relation_open(rte->relid, AccessShareLock);
+        calls = cf_calls_duckdb((Node *) get_view_query(rel), ctx);
+        relation_close(rel, AccessShareLock);
+        return calls;
+    }
     if (IsA(node, FuncExpr) &&
         getExtensionOfObject(ProcedureRelationId, ((FuncExpr *) node)->funcid) == ext)
         return true;
@@ -7550,6 +7599,19 @@ cf_calls_duckdb(Node *node, void *ctx)
     if (IsA(node, Query))
         return query_tree_walker((Query *) node, cf_calls_duckdb, ctx, QTW_EXAMINE_RTES_BEFORE);
     return expression_tree_walker(node, cf_calls_duckdb, ctx);
+}
+
+/* True when pg_duckdb will run the statement: duckdb.force_execution is on, or
+ * the statement calls DuckDB (cf_calls_duckdb). */
+static bool
+cf_runs_in_duckdb(Query *query)
+{
+    Oid         ext   = get_extension_oid("pg_duckdb", true);
+    const char *force = GetConfigOption("duckdb.force_execution", true, false);
+
+    return OidIsValid(ext) &&
+           ((force != NULL && strcmp(force, "on") == 0) ||  /* nosemgrep */
+            query_tree_walker(query, cf_calls_duckdb, &ext, QTW_EXAMINE_RTES_BEFORE));
 }
 
 static PlannedStmt *
@@ -7579,13 +7641,10 @@ coldfront_planner(Query *parse, const char *query_string, int cursor_options,
      * reads its hot table alone, and PostgreSQL runs such a statement as written. */
     if (reads)
     {
-        NeedsValueCtx  nv    = { get_extension_oid("pg_duckdb", true), false };
-        JsonBuilderCtx jc    = { false, false };
-        const char    *force = GetConfigOption("duckdb.force_execution", true, false);
+        NeedsValueCtx  nv = { get_extension_oid("pg_duckdb", true), false };
+        JsonBuilderCtx jc = { false, false };
 
-        if (OidIsValid(nv.duckdb_ext) &&
-            ((force != NULL && strcmp(force, "on") == 0) ||  /* nosemgrep */
-             query_tree_walker(parse, cf_calls_duckdb, &nv.duckdb_ext, QTW_EXAMINE_RTES_BEFORE)))
+        if (cf_runs_in_duckdb(parse))
         {
             if (query_tree_walker(parse, has_extern_param_walker, NULL, 0) &&
                 query_tree_walker(parse, param_needs_value_walker, &nv, QTW_EXAMINE_RTES_BEFORE))
