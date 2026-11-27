@@ -131,10 +131,12 @@ and a simple `CASE` return PostgreSQL's answers, with three differences:
   at double precision compare as equal.
 - An object that DuckDB builds keeps its keys in the order it was given them,
   and keeps a repeated key, where `jsonb` sorts its keys and keeps the last of
-  a repeated one. Such an object comes from a `::jsonb` cast of text, or from
-  `jsonb_build_object` with a key that is not a constant, so it can compare as
+  a repeated one. Such an object comes from a `::jsonb` cast of text, from
+  `jsonb_build_object` with a key that is not a constant, or from
+  `jsonb_build_object` with a repeated key whose earlier value is not a
+  constant, which DuckDB still evaluates. Such an object can compare as
   unequal to a stored document with the same keys and values. A stored
-  document, a constant, and a `jsonb_build_object` whose keys are all
+  document, a constant, and any other `jsonb_build_object` whose keys are all
   constants compare as PostgreSQL compares them.
 
 A cold write stores only the text PostgreSQL renders. The value that a cold
@@ -178,9 +180,11 @@ The following rules apply to the other statements that compare `jsonb` values:
 - ColdFront refuses `IN (SELECT ...)` over a `UNION` or a `VALUES` list, one
   whose sub-select groups or de-duplicates the compared column and has a
   `HAVING` or an `ORDER BY`, and a row comparison such as
-  `(id, doc) IN (SELECT ...)`; write such a comparison with `EXISTS`.
-  ColdFront also refuses `= ANY` of a `jsonb[]` value, and another `jsonb`
-  operator, such as `@>`, under `ANY` or `ALL`.
+  `(id, doc) IN (SELECT ...)`. In a `WHERE` condition that is not under `NOT`,
+  write such a comparison inside an `EXISTS` sub-select. ColdFront also
+  refuses `= ANY` of a `jsonb[]` value, an `IN` list whose operand is
+  volatile, such as one that calls `random()`, and another `jsonb` operator,
+  such as `@>`, under `ANY` or `ALL`.
 
 ColdFront also rewrites the JSON operators that DuckDB lacks into DuckDB's JSON
 functions, which return PostgreSQL's answers. The rewrite covers:

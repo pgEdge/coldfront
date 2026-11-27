@@ -152,17 +152,21 @@ ERROR:  coldfront: @> on a jsonb value is not supported on a tiered or decoupled
 SELECT id FROM public.jdocs WHERE doc IN (SELECT doc FROM public.jdocs WHERE id <= 2
                                           UNION SELECT doc FROM public.jdocs WHERE id = 5);
 ERROR:  coldfront: this comparison of jsonb values is not supported on a tiered or decoupled view
-HINT:  Write it as EXISTS (SELECT 1 FROM ... WHERE x = y).
+HINT:  In a WHERE condition that is not under NOT, write the comparison inside an EXISTS (SELECT 1 FROM ... WHERE ...) sub-select.
 SELECT id FROM public.jdocs WHERE doc IN (VALUES ('{"k": 2}'::jsonb));
 ERROR:  coldfront: this comparison of jsonb values is not supported on a tiered or decoupled view
-HINT:  Write it as EXISTS (SELECT 1 FROM ... WHERE x = y).
+HINT:  In a WHERE condition that is not under NOT, write the comparison inside an EXISTS (SELECT 1 FROM ... WHERE ...) sub-select.
 SELECT id FROM public.jdocs WHERE (id, doc) IN (SELECT id, doc FROM public.jdocs);
 ERROR:  coldfront: this comparison of jsonb values is not supported on a tiered or decoupled view
-HINT:  Write it as EXISTS (SELECT 1 FROM ... WHERE x = y).
+HINT:  In a WHERE condition that is not under NOT, write the comparison inside an EXISTS (SELECT 1 FROM ... WHERE ...) sub-select.
 SELECT id FROM public.jdocs WHERE doc @> ANY (SELECT doc FROM public.jdocs WHERE id = 1);
 ERROR:  coldfront: this comparison of jsonb values is not supported on a tiered or decoupled view
-HINT:  Write it as EXISTS (SELECT 1 FROM ... WHERE x = y).
--- The same comparison written with EXISTS is rewritten and answers as PostgreSQL.
+HINT:  In a WHERE condition that is not under NOT, write the comparison inside an EXISTS (SELECT 1 FROM ... WHERE ...) sub-select.
+-- An IN list whose operand is volatile is refused too: comparing the operand
+-- with each element would evaluate it once per element.
+SELECT count(*) FROM public.jdocs WHERE CASE WHEN random() < 0.5 THEN '0'::jsonb ELSE '1'::jsonb END IN ('0'::jsonb, '1'::jsonb);
+ERROR:  coldfront: = on a jsonb value is not supported on a tiered or decoupled view
+-- An equality written with EXISTS is rewritten and answers as PostgreSQL.
 SELECT public.jdocs_same($q$SELECT id FROM %1$s a WHERE EXISTS (SELECT 1 FROM %1$s b WHERE b.id IN (1, 2) AND b.doc = a.doc)
                              ORDER BY id$q$) AS exists_subquery;
  exists_subquery 
@@ -246,7 +250,7 @@ SELECT public.jdocs_same($q$SELECT id FROM %1$s WHERE doc IN (SELECT DISTINCT do
 -- One whose HAVING or ORDER BY also names the column is refused.
 SELECT id FROM public.jdocs WHERE doc IN (SELECT doc FROM public.jdocs GROUP BY doc HAVING doc ->> 't' = 'x');
 ERROR:  coldfront: this comparison of jsonb values is not supported on a tiered or decoupled view
-HINT:  Write it as EXISTS (SELECT 1 FROM ... WHERE x = y).
+HINT:  In a WHERE condition that is not under NOT, write the comparison inside an EXISTS (SELECT 1 FROM ... WHERE ...) sub-select.
 -- A cursor's statement reads the view as a SELECT does.
 BEGIN;
 DECLARE c CURSOR FOR SELECT id, pg_typeof(id) AS t, doc = '{"t":"x","k":1}' AS eq FROM public.jdocs WHERE id <= 3 ORDER BY id;
@@ -373,6 +377,13 @@ SELECT public.jdocs_same($q$SELECT id FROM %1$s WHERE doc = jsonb_build_object('
  t                    | t                   | t
 (1 row)
 
+-- The value of a repeated key that jsonb drops is still evaluated, as
+-- PostgreSQL evaluates it, here raising an error.
+SELECT jsonb_build_object('k', name::int, 'k', 1) FROM public.jdocs WHERE id = 1;
+ERROR:  (PGDuckDB/Duckdb_ExecCustomScan_Cpp) Conversion Error: Could not convert string 'a' to INT32 when casting from source column name
+
+LINE 1: ...(to_json('k'::text))::text, ':'::text, COALESCE((to_json((name)::integer))::text, 'null'::text), ','::text, (to_json('k...
+                                                                          ^
 -- A jsonb parameter compares as a constant does, through seven executions, which
 -- cross the plan cache's switch from custom to generic planning after the fifth.
 PREPARE by_doc(jsonb) AS
@@ -601,8 +612,9 @@ SELECT atttypid::regtype AS copied_as FROM pg_attribute
  jsonb
 (1 row)
 
-SELECT count(*) = (SELECT count(*) FROM public._jdocs) AND bool_and(c.doc IS NOT DISTINCT FROM h.doc) AS copy_matches
-  FROM public.jdocs_copy c JOIN public._jdocs h USING (id);
+SELECT NOT EXISTS ((SELECT id, doc FROM public.jdocs_copy EXCEPT ALL SELECT id, doc FROM public._jdocs)
+                   UNION ALL
+                   (SELECT id, doc FROM public._jdocs EXCEPT ALL SELECT id, doc FROM public.jdocs_copy)) AS copy_matches;
  copy_matches 
 --------------
  t

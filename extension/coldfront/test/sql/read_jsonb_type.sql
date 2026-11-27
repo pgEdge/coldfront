@@ -109,7 +109,10 @@ SELECT id FROM public.jdocs WHERE doc IN (SELECT doc FROM public.jdocs WHERE id 
 SELECT id FROM public.jdocs WHERE doc IN (VALUES ('{"k": 2}'::jsonb));
 SELECT id FROM public.jdocs WHERE (id, doc) IN (SELECT id, doc FROM public.jdocs);
 SELECT id FROM public.jdocs WHERE doc @> ANY (SELECT doc FROM public.jdocs WHERE id = 1);
--- The same comparison written with EXISTS is rewritten and answers as PostgreSQL.
+-- An IN list whose operand is volatile is refused too: comparing the operand
+-- with each element would evaluate it once per element.
+SELECT count(*) FROM public.jdocs WHERE CASE WHEN random() < 0.5 THEN '0'::jsonb ELSE '1'::jsonb END IN ('0'::jsonb, '1'::jsonb);
+-- An equality written with EXISTS is rewritten and answers as PostgreSQL.
 SELECT public.jdocs_same($q$SELECT id FROM %1$s a WHERE EXISTS (SELECT 1 FROM %1$s b WHERE b.id IN (1, 2) AND b.doc = a.doc)
                              ORDER BY id$q$) AS exists_subquery;
 
@@ -226,6 +229,9 @@ SELECT public.jdocs_same($q$SELECT id FROM %1$s WHERE doc = jsonb_build_object('
        public.jdocs_same($q$SELECT id FROM %1$s WHERE doc = jsonb_build_object('k', 9, 't', 'x', 'k', 1) ORDER BY id$q$) AS built_duplicate_key,
        public.jdocs_same($q$SELECT id FROM %1$s WHERE id <= 2 AND jsonb_build_object('aa', 1, 'b', 2) = '{"aa": 1, "b": 2}'
                              ORDER BY id$q$) AS built_key_length_order;
+-- The value of a repeated key that jsonb drops is still evaluated, as
+-- PostgreSQL evaluates it, here raising an error.
+SELECT jsonb_build_object('k', name::int, 'k', 1) FROM public.jdocs WHERE id = 1;
 -- A jsonb parameter compares as a constant does, through seven executions, which
 -- cross the plan cache's switch from custom to generic planning after the fifth.
 PREPARE by_doc(jsonb) AS
@@ -372,8 +378,9 @@ RESET duckdb.unsafe_allow_execution_inside_functions;
 CREATE TABLE public.jdocs_copy AS SELECT id, doc FROM public.jdocs;
 SELECT atttypid::regtype AS copied_as FROM pg_attribute
  WHERE attrelid = 'public.jdocs_copy'::regclass AND attname = 'doc';
-SELECT count(*) = (SELECT count(*) FROM public._jdocs) AND bool_and(c.doc IS NOT DISTINCT FROM h.doc) AS copy_matches
-  FROM public.jdocs_copy c JOIN public._jdocs h USING (id);
+SELECT NOT EXISTS ((SELECT id, doc FROM public.jdocs_copy EXCEPT ALL SELECT id, doc FROM public._jdocs)
+                   UNION ALL
+                   (SELECT id, doc FROM public._jdocs EXCEPT ALL SELECT id, doc FROM public.jdocs_copy)) AS copy_matches;
 -- The text a client is sent is PostgreSQL's rendering of the jsonb.
 SELECT id, doc FROM public.jdocs WHERE id IN (1, 5) ORDER BY id;
 SELECT id, doc FROM public._jdocs WHERE id IN (1, 5) ORDER BY id;

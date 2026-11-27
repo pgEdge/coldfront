@@ -1032,10 +1032,10 @@ normalize_casts_for_duckdb(const char *sql)
  * rejects a NULL key. The text DuckDB builds holds the same JSON as jsonb's
  * rendering and is not the same text: jsonb pads punctuation and this is compact.
  * jsonb also sorts keys and keeps the last of a repeated one, which
- * jsonb_build_object's pairs follow when every key is a constant
- * (cf_jsonb_key_order); otherwise they stay in argument order, as
- * json_build_object's always do. Pairing keys with values is exact on the
- * argument List; the emitted function OIDs come from the catalog, once per backend.
+ * jsonb_build_object's pairs follow when every key is a constant and every value
+ * dropped is a constant (cf_jsonb_key_order); otherwise they stay in argument
+ * order, as json_build_object's always do. Pairing keys with values is exact on
+ * the argument List; the emitted function OIDs come from the catalog, once per backend.
  * A VARIADIC array argument cannot be paired and is left alone.
  */
 /* defer: the parse-analyze pass, which keeps a json operator whose operand holds a
@@ -1142,7 +1142,8 @@ cf_json_key(Node *k)
 /* The arguments of a jsonb_build_object call as jsonb keeps the pairs, when every
  * key is a constant; otherwise the arguments as given. jsonb itself builds the
  * object of each key and its position, which gives its key order and the last of
- * a repeated key. */
+ * a repeated key. A repeated key whose dropped value is not a constant also gives
+ * the arguments as given, so that value is still evaluated. */
 static List *
 cf_jsonb_key_order(List *args)
 {
@@ -1175,6 +1176,9 @@ cf_jsonb_key_order(List *args)
             i   = DatumGetInt32(DirectFunctionCall1(numeric_int4, NumericGetDatum(v.val.numeric)));
             out = lappend(lappend(out, list_nth(args, i)), list_nth(args, i + 1));
         }
+    for (i = 1; i < n; i += 2)
+        if (!IsA(list_nth(args, i), Const) && !list_member_ptr(out, list_nth(args, i)))
+            return args;
     return out;
 }
 
@@ -1684,7 +1688,8 @@ cf_jsonb_compare(OpExpr *op, List *qs)
 }
 
 /* The rewrite of a jsonb = ANY or <> ALL over ARRAY[…], which an IN list is, or
- * NULL. */
+ * NULL. A volatile left operand gets NULL, because comparing it with each
+ * element would evaluate it once per element. */
 static Node *
 cf_jsonb_compare_any(ScalarArrayOpExpr *sa, List *qs)
 {
@@ -1693,7 +1698,8 @@ cf_jsonb_compare_any(ScalarArrayOpExpr *sa, List *qs)
     List       *tests = NIL;
     ListCell   *lc;
 
-    if (cmp == NULL || !IsA(arr, ArrayExpr) || arr->multidims || arr->elements == NIL)
+    if (cmp == NULL || !IsA(arr, ArrayExpr) || arr->multidims || arr->elements == NIL ||
+        contain_volatile_functions(linitial(sa->args)))
         return NULL;
     foreach(lc, arr->elements)
         tests = lappend(tests, cf_json_compare(cmp, copyObject(linitial(sa->args)), lfirst(lc), qs));
@@ -2155,7 +2161,8 @@ cf_json_builder_mutator(Node *node, void *ctx)
                     (errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
                      errmsg("coldfront: this comparison of jsonb values is not supported on a "
                             "tiered or decoupled view"),
-                     errhint("Write it as EXISTS (SELECT 1 FROM ... WHERE x = y).")));
+                     errhint("In a WHERE condition that is not under NOT, write the comparison "
+                             "inside an EXISTS (SELECT 1 FROM ... WHERE ...) sub-select.")));
         if (rewrote)
         {
             jc->changed = true;
