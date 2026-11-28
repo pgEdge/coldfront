@@ -166,7 +166,7 @@ Settings live in two places:
 - `postgresql.conf` holds the server settings:
     - You must set `shared_preload_libraries`, `coldfront.warehouse`, and
       `coldfront.lakekeeper_endpoint` on each server.
-    - `shared_preload_libraries` must include `pg_duckdb` and `coldfront`.
+    - `shared_preload_libraries` must list `pg_duckdb` before `coldfront`.
     - You must also set `snowflake.node` and `coldfront.loopback_dsn` on each
       node of a Spock mesh.
 - Tables in the `coldfront` schema hold additional parameters:

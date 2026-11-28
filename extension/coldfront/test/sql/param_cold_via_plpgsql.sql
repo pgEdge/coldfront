@@ -64,7 +64,7 @@ PREPARE cold_like(text) AS
 EXPLAIN (COSTS OFF, VERBOSE) EXECUTE cold_like('x');
 
 -- (6) dual-tier (ambiguous predicate on a non-partition column) with a param:
--- the cold CTE leg uses format(...); the hot CTE leg keeps native $1.
+-- the cold call uses format(...); the hot statement keeps native $1.
 PREPARE dual_upd(text) AS
   UPDATE public.events SET status = $1 WHERE id = 1;
 EXPLAIN (COSTS OFF, VERBOSE) EXECUTE dual_upd('x');

@@ -26,14 +26,15 @@ CREATE EXTENSION IF NOT EXISTS coldfront;
 --     non-superuser LocalFileSystem block) and the R-A bakery coordination
 --     functions (read spock.* / pg_stat_replication + loop back the claim, so a
 --     non-superuser writer drives the mesh serializer with the right privilege).
---     _exec_iceberg_with_claim is deliberately ABSENT — it stays INVOKER (it runs
---     caller-provided cold DML, which must execute with the caller's privileges).
+--     _exec_iceberg_with_claim and _exec_dual_cold are deliberately ABSENT: they
+--     stay INVOKER (they run caller-provided cold DML, which must execute with
+--     the caller's privileges).
 SELECT proname, prosecdef, array_to_string(proconfig, ', ') AS proconfig
 FROM pg_proc
 WHERE pronamespace = 'coldfront'::regnamespace
   AND proname IN ('ensure_attached', 'ensure_pg_attached',
                   '_claim_iceberg_lock',
-                  '_exec_iceberg_with_claim')
+                  '_exec_iceberg_with_claim', '_exec_dual_cold')
 ORDER BY proname;
 
 -- (2) the endpoint/DSN GUCs the elevated helpers and the loopback trust are

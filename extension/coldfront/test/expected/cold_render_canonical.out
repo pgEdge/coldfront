@@ -168,10 +168,6 @@ BIGINT
 4
 
 
- id | ts | iv | x | d 
-----+----+----+---+---
-(0 rows)
-
 SELECT iv, count(*) FROM public.cf_canon_cold GROUP BY iv ORDER BY iv;
                 iv                 | count 
 -----------------------------------+-------

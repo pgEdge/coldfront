@@ -28,24 +28,18 @@ SHOW coldfront.allow_mixed_writes;
 SET coldfront.allow_mixed_writes = on;
 EXPLAIN (COSTS OFF, VERBOSE)
   UPDATE public.events SET status = 'x' WHERE id = 1;
-                                                                     QUERY PLAN                                                                      
------------------------------------------------------------------------------------------------------------------------------------------------------
- Nested Loop
-   Output: h.id, h.ts, h.status
-   CTE coldfront_hot
-     ->  Update on public._events
-           Output: _events.id, _events.ts, _events.status
-           ->  Seq Scan on public._events
-                 Output: 'x'::text, _events.ctid
-                 Filter: (_events.id = 1)
+                                                                         QUERY PLAN                                                                         
+------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Update on public._events
    CTE coldfront_cold
-     ->  Result
-           Output: _exec_iceberg_with_claim('ice.default.events'::text, 'UPDATE ice.default.events SET status = ''x''::text   WHERE (id = 1)'::text)
-   ->  CTE Scan on coldfront_cold c
-         Output: c._exec_iceberg_with_claim
-   ->  CTE Scan on coldfront_hot h
-         Output: h.id, h.ts, h.status
-(15 rows)
+     ->  Update on coldfront._dummy_dml_target
+           ->  Seq Scan on coldfront._dummy_dml_target
+                 Output: _dummy_dml_target.anchor, _dummy_dml_target.ctid
+                 Filter: (_exec_dual_cold('ice.default.events'::text, 'UPDATE ice.default.events SET status = ''x''::text   WHERE (id = 1)'::text) IS NULL)
+   ->  Seq Scan on public._events
+         Output: 'x'::text, _events.ctid
+         Filter: (_events.id = 1)
+(9 rows)
 
 -- Strict: same statement → ERROR
 SET coldfront.allow_mixed_writes = off;

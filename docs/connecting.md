@@ -21,7 +21,7 @@ grant_app_access grants only the minimum the cold path needs:
 - SET on the duckdb.unsafe_allow_execution_inside_functions parameter.
 - schema USAGE.
 - `SELECT` on the registry and the watermark table.
-- DML on the dual-write anchor table.
+- `SELECT` and `UPDATE` on the dual-write anchor table.
 - DML on every registered view and the hot table behind it.
 - USAGE and `SELECT` on the hot table's sequences.
 

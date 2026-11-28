@@ -44,18 +44,16 @@ UPDATE coldfront.archive_watermark SET cutoff_time = '2018-01-01'::timestamptz
  WHERE table_name = 'events';
 EXPLAIN (COSTS OFF)
   UPDATE public.events SET status = 'y' WHERE ts < '2019-01-01'::timestamptz;
-                                       QUERY PLAN                                        
------------------------------------------------------------------------------------------
- Nested Loop
-   CTE coldfront_hot
-     ->  Update on _events
-           ->  Seq Scan on _events
-                 Filter: (ts < 'Tue Jan 01 00:00:00 2019 UTC'::timestamp with time zone)
+                                                                                            QUERY PLAN                                                                                            
+--------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+ Update on _events
    CTE coldfront_cold
-     ->  Result
-   ->  CTE Scan on coldfront_cold c
-   ->  CTE Scan on coldfront_hot h
-(9 rows)
+     ->  Update on _dummy_dml_target
+           ->  Seq Scan on _dummy_dml_target
+                 Filter: (_exec_dual_cold('ice.default.events'::text, 'UPDATE ice.default.events SET status = ''y''::text   WHERE (ts < ''2019-01-01 00:00:00+00''::timestamptz)'::text) IS NULL)
+   ->  Seq Scan on _events
+         Filter: (ts < 'Tue Jan 01 00:00:00 2019 UTC'::timestamp with time zone)
+(7 rows)
 
 ROLLBACK;
 -- (B) The watermark joins by (schema_name, table_name), the key it is stored

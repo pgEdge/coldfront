@@ -664,8 +664,9 @@ Update the archived row through the same table using the captured id:
 UPDATE events SET status = 'corrected' WHERE id = 1;
 ```
 
-The statement prints an empty result set, `(0 rows)`, instead of `UPDATE 1`.
-The next query shows that the row changed. Read the row back immediately:
+The statement prints `UPDATE 0` instead of `UPDATE 1`, because the count
+covers hot rows only. The next query shows that the row changed. Read the row
+back immediately:
 
 ```sql {"interpreter":"psql postgresql://coldfront@localhost:5432/coldfront?options=-cclient_min_messages%3Dwarning -v ON_ERROR_STOP=1 -P pager=off -f"}
 SELECT id, ts, status FROM events WHERE id = 1;

@@ -91,19 +91,21 @@ CREATE TABLE IF NOT EXISTS coldfront.archive_watermark (
 
 -- coldfront._dummy_dml_target — a permanent, single-row DUMMY table whose data is
 -- meaningless and which is NEVER written to. It exists for exactly one structural
--- reason, used ONLY in a narrow case:
+-- reason:
 --
 -- Cold-tier DML is rewritten (in the parse-analyze hook) into a call to
 -- coldfront._exec_iceberg_with_claim(...). At the top level that call is wrapped
 -- in a plain SELECT — fine, the client discards the row. But inside a plpgsql
 -- function / DO block / trigger, plpgsql rejects a bare result-returning SELECT
 -- ("query has no destination for result data"); it only accepts a statement
--- whose command tag is a DML (INSERT/UPDATE/DELETE) returning no rows. So ONLY
--- when the hook detects it is running inside plpgsql, it wraps the cold call as a
--- DML over this table:
+-- whose command tag is a DML (INSERT/UPDATE/DELETE) returning no rows. So when
+-- the hook detects it is running inside plpgsql, and in every dual-tier write, it
+-- wraps the cold call as a DML over this table:
 --
 --   UPDATE coldfront._dummy_dml_target SET anchor = anchor
 --    WHERE coldfront._exec_iceberg_with_claim(...) IS NULL
+--
+-- (a dual-tier write calls coldfront._exec_dual_cold(...) there)
 --
 -- That is a DML (plpgsql accepts it), and the cold call runs exactly once — in
 -- the WHERE qual, evaluated against the single row. _exec_iceberg_with_claim
@@ -111,7 +113,9 @@ CREATE TABLE IF NOT EXISTS coldfront.archive_watermark (
 -- rows: the row is never updated -> no new tuple version, no dead tuple, no WAL,
 -- no bloat, no vacuum, EVER. The table is a pure command-tag carrier. (In
 -- dual-tier and tiered-INSERT rewrites the same UPDATE rides in a data-modifying
--- WITH-CTE, which PostgreSQL always runs to completion even when unreferenced.)
+-- WITH-CTE, which PostgreSQL always runs to completion even when unreferenced.
+-- A dual-tier rewrite has that shape at the top level too, so its cold half
+-- runs when its hot half matches no rows.)
 --
 -- LOGGED on purpose: on a read-only standby an in-plpgsql cold write is then
 -- rejected cleanly at executor start ("cannot execute UPDATE in a read-only
@@ -119,8 +123,8 @@ CREATE TABLE IF NOT EXISTS coldfront.archive_watermark (
 -- replica. The 0-row UPDATE writes no WAL, so LOGGED costs nothing here.
 --
 -- Node-local: each node's CREATE EXTENSION seeds its own single row; it is never
--- added to a replication set. Referenced ONLY by the in-plpgsql rewrite branch —
--- top-level cold DML never names it.
+-- added to a replication set. Referenced by the in-plpgsql rewrite branch and by
+-- every dual-tier write, but never by a top-level cold-only write.
 CREATE TABLE coldfront._dummy_dml_target (anchor boolean NOT NULL DEFAULT true);
 INSERT INTO coldfront._dummy_dml_target DEFAULT VALUES;
 
@@ -519,7 +523,7 @@ BEGIN
   -- coldfront schema + registry read + the dual-write anchor table.
   EXECUTE format('GRANT USAGE ON SCHEMA coldfront TO %s', tgt);
   EXECUTE format('GRANT SELECT ON coldfront.tiered_views, coldfront.archive_watermark, coldfront.vector_config TO %s', tgt);
-  EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON coldfront._dummy_dml_target TO %s', tgt);
+  EXECUTE format('GRANT SELECT, UPDATE ON coldfront._dummy_dml_target TO %s', tgt);
 
   -- EXECUTE on the runtime cold-path functions only (allow-list mirrors coldfront.c).
   FOR r IN
@@ -527,7 +531,7 @@ BEGIN
     FROM pg_proc p
     WHERE p.pronamespace = 'coldfront'::regnamespace
       AND p.proname IN ('ensure_attached', 'ensure_pg_attached', 'ensure_stream_attached',
-                        '_exec_iceberg_with_claim',
+                        '_exec_iceberg_with_claim', '_exec_dual_cold',
                         -- the tiered INSERT's cold stream, its snapshot and its execution-time check
                         '_tiered_cold_stream', '_stream_snapshot', '_written_in_xact',
                         -- the tiered INSERT's cold sink, its statement and its row renderer
@@ -1703,8 +1707,8 @@ BEGIN
 
     -- GLOBAL LOCK ORDER, step 2 — now A. lock_timeout is the circuit breaker on
     -- the ACCESS EXCLUSIVE acquisition ONLY (not the bakery above): if a writer
-    -- still holds RowExclusive (took A before B — the dual-tier CTE order is
-    -- undefined), this proc aborts in p_lock_timeout_ms, frees B, and the Go
+    -- still holds RowExclusive (took A before B, as a dual-tier write's hot
+    -- half does), this proc aborts in p_lock_timeout_ms, frees B, and the Go
     -- harness retries. lock_timeout (100ms) < deadlock_timeout (1s) so the
     -- cutover, never the writer, yields first.
     EXECUTE format('SET LOCAL lock_timeout = %L', p_lock_timeout_ms || 'ms');
@@ -4632,6 +4636,21 @@ BEGIN
         PERFORM coldfront._take_iceberg_claim(p_iceberg_table);
         PERFORM duckdb.raw_query(p_sql);
     END IF;
+END;
+$$;
+
+-- _exec_dual_cold runs the cold half of a dual-tier UPDATE or DELETE. That
+-- statement writes both tiers, so each run clears pg_duckdb's pre-commit
+-- mixed-write check, including a run of a plan saved in an earlier
+-- transaction (a prepared statement, a PL/pgSQL function's cached plan), which
+-- is not planned again, so coldfront_planner does not see it. SET LOCAL in the
+-- body, not a SET clause on the function, because the setting has to last
+-- until COMMIT.
+CREATE FUNCTION coldfront._exec_dual_cold(p_iceberg_table text, p_sql text)
+RETURNS void LANGUAGE plpgsql AS $$
+BEGIN
+    SET LOCAL duckdb.unsafe_allow_mixed_transactions = on;
+    PERFORM coldfront._exec_iceberg_with_claim(p_iceberg_table, p_sql);
 END;
 $$;
 
