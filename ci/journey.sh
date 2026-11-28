@@ -1428,11 +1428,14 @@ EOSQL
     q "$HOST" "DELETE FROM public.tcmx WHERE id = 2 AND $range;" >/dev/null
     assert_eq "TC-286: a mixed-tier DELETE of a row only the cold tier holds" "0" \
         "$(q "$HOST" "SELECT count(*) FROM public.tcmx WHERE id = 2;")"
-    # Row 1 is cold and row 10 hot; each statement runs on its own, so the
-    # EXECUTE and the second call reuse a plan parsed in an earlier transaction.
+    # Row 1 is cold and row 10 hot. Each session forces a generic plan and
+    # builds it outside the block, so the EXECUTE and the second call run a plan
+    # made in an earlier transaction without planning it again.
     local both="SELECT string_agg(note, '|' ORDER BY id) FROM public.tcmx WHERE id IN (1, 10);"
     qf "$HOST" <<'EOSQL' >/dev/null 2>&1
+SET plan_cache_mode = force_generic_plan;
 PREPARE tcmx_set(text) AS UPDATE public.tcmx SET note = $1 WHERE id IN (1, 10);
+EXECUTE tcmx_set('warm');
 BEGIN;
 EXECUTE tcmx_set('prepared');
 COMMIT;
@@ -1440,6 +1443,7 @@ EOSQL
     assert_eq "TC-287: a prepared mixed-tier UPDATE commits inside a transaction block" \
         "prepared|prepared" "$(q "$HOST" "$both")"
     qf "$HOST" <<'EOSQL' >/dev/null 2>&1
+SET plan_cache_mode = force_generic_plan;
 CREATE FUNCTION public.tcmx_set(t text) RETURNS void LANGUAGE plpgsql
     AS $f$ BEGIN UPDATE public.tcmx SET note = t WHERE id IN (1, 10); END $f$;
 SELECT public.tcmx_set('first');
