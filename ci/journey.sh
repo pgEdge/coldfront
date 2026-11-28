@@ -5812,6 +5812,13 @@ story_app_privilege() {
     assert_eq "grant_app_access('japp') succeeds (one call)" "" "$(echo "$onboard" | grep -iE 'error' || true)"
     assert_eq "app role is NOT a superuser"           "off" "$(q "$HOST" "SET ROLE japp; SELECT current_setting('is_superuser');" | tail -1)"
     assert_eq "app role lacks pg_read_server_files"   "f"   "$(q "$HOST" "SELECT pg_has_role('japp','pg_read_server_files','MEMBER');")"
+    # The carrier's one row makes a dual-tier write's cold half run once, so the
+    # role can neither add a row nor remove it (each statement touches none).
+    local denied
+    denied=$( { q_may "$HOST" "SET ROLE japp; INSERT INTO coldfront._dummy_dml_target SELECT true WHERE false;"
+                q_may "$HOST" "SET ROLE japp; DELETE FROM coldfront._dummy_dml_target WHERE false;"; } \
+              | grep -c 'permission denied' || true)
+    assert_eq "app role can neither add nor remove the dual-write carrier's row" "2" "$denied"
     assert_eq "app role reads tiered hot+cold (== superuser)" "$total" "$(q "$HOST" "SET ROLE japp; SELECT count(*) FROM events;" | tail -1)"
     q "$HOST" "SET ROLE japp; INSERT INTO events (ts,status,data) VALUES (date_trunc('month',now()) - interval '4 months' + interval '17 days' + interval '9 hours','japp_priv','{}');" >/dev/null 2>&1
     assert_eq "app role cold write landed (read-your-write)" "1" "$(q "$HOST" "SELECT count(*) FROM events WHERE status='japp_priv';")"

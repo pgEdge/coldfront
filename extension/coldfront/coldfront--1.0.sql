@@ -523,7 +523,7 @@ BEGIN
   -- coldfront schema + registry read + the dual-write anchor table.
   EXECUTE format('GRANT USAGE ON SCHEMA coldfront TO %s', tgt);
   EXECUTE format('GRANT SELECT ON coldfront.tiered_views, coldfront.archive_watermark, coldfront.vector_config TO %s', tgt);
-  EXECUTE format('GRANT SELECT, INSERT, UPDATE, DELETE ON coldfront._dummy_dml_target TO %s', tgt);
+  EXECUTE format('GRANT SELECT, UPDATE ON coldfront._dummy_dml_target TO %s', tgt);
 
   -- EXECUTE on the runtime cold-path functions only (allow-list mirrors coldfront.c).
   FOR r IN
