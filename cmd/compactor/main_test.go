@@ -60,27 +60,37 @@ func TestNewClaimer_ConnectsOnFirstClaimOnly(t *testing.T) {
 }
 
 // checkFlags refuses, by flag name, a target size below 1 MiB or one whose byte
-// count overflows int64, and an orphan age of 0 or less.
+// count overflows int64, an orphan age of 0 or less, an expire-retain-last below
+// 1 (retaining 0 snapshots could expire the current one), and a negative
+// expire-older-than (0s is valid — it selects every snapshot for expiry).
 func TestCheckFlags_RefusesValuesTheCompactorCannotHonour(t *testing.T) {
 	const sizeErr = "--target-size-mb must be between 1 and 8796093022207, got "
+	const defRetain = 1
+	const defOlder = 168 * time.Hour
 	cases := []struct {
-		name      string
-		targetMB  int64
-		orphanAge time.Duration
-		want      string
+		name       string
+		targetMB   int64
+		orphanAge  time.Duration
+		retainLast int
+		olderThan  time.Duration
+		want       string
 	}{
-		{"zero size", 0, 72 * time.Hour, sizeErr + "0"},
-		{"negative size", -5, 72 * time.Hour, sizeErr + "-5"},
-		{"size whose bytes overflow", 8796093022208, 72 * time.Hour, sizeErr + "8796093022208"},
-		{"zero orphan age", 128, 0, "--orphan-age must be positive, got 0s"},
-		{"negative orphan age", 128, -time.Hour, "--orphan-age must be positive, got -1h0m0s"},
-		{"defaults", 128, 72 * time.Hour, ""},
-		{"smallest values", 1, time.Second, ""},
-		{"largest size", 8796093022207, 72 * time.Hour, ""},
+		{"zero size", 0, 72 * time.Hour, defRetain, defOlder, sizeErr + "0"},
+		{"negative size", -5, 72 * time.Hour, defRetain, defOlder, sizeErr + "-5"},
+		{"size whose bytes overflow", 8796093022208, 72 * time.Hour, defRetain, defOlder, sizeErr + "8796093022208"},
+		{"zero orphan age", 128, 0, defRetain, defOlder, "--orphan-age must be positive, got 0s"},
+		{"negative orphan age", 128, -time.Hour, defRetain, defOlder, "--orphan-age must be positive, got -1h0m0s"},
+		{"zero retain-last", 128, 72 * time.Hour, 0, defOlder, "--expire-retain-last must be at least 1, got 0"},
+		{"negative retain-last", 128, 72 * time.Hour, -1, defOlder, "--expire-retain-last must be at least 1, got -1"},
+		{"negative older-than", 128, 72 * time.Hour, defRetain, -time.Hour, "--expire-older-than must not be negative, got -1h0m0s"},
+		{"defaults", 128, 72 * time.Hour, defRetain, defOlder, ""},
+		{"smallest values", 1, time.Second, 1, 0, ""},
+		{"zero older-than is valid (expire all)", 128, 72 * time.Hour, defRetain, 0, ""},
+		{"largest size", 8796093022207, 72 * time.Hour, defRetain, defOlder, ""},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			err := checkFlags(c.targetMB, c.orphanAge)
+			err := checkFlags(c.targetMB, c.orphanAge, c.retainLast, c.olderThan)
 			if c.want == "" {
 				if err != nil {
 					t.Fatalf("refused valid values: %v", err)
